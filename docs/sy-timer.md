@@ -939,6 +939,27 @@ type RecurringOptions struct {
 
 func ScheduleRecurring(ctx context.Context, opts RecurringOptions) (TimerID, error)
 
+### 14.3 Estado del SDK Rust
+
+En el estado actual del runtime:
+
+- la superficie rica y tipada de `SY.timer` está implementada en `fluxbee-go-sdk`
+- `fluxbee_sdk` (Rust) todavía **no** expone un módulo `timer` equivalente
+
+Eso no es un accidente de diseño ni una decisión de largo plazo: es una deuda explícita de paridad de SDK.
+
+El objetivo correcto para el SDK Rust es replicar:
+
+- helpers tipados de tiempo (`now`, `now_in`, `convert`, `parse`, `format`, `help`)
+- cliente tipado de scheduling (`schedule`, `schedule_in`, `schedule_recurring`, `get`, `list`, `cancel`, `reschedule`, `purge_owner`)
+- parseo de `TIMER_RESPONSE`
+- parseo de `TIMER_FIRED`
+- errores y validación client-side comparables al SDK Go
+
+El backlog formal de ese trabajo queda en [sdk_tasks.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/onworking%20COA/sdk_tasks.md) bajo la sección `RUST-TIMER-SDK`.
+
+**Decisión de alcance:** esta paridad del SDK Rust no implica que `SY.orchestrator` deba usar `SY.timer` para su funcionamiento base en v1. El trabajo es primero de capacidad del SDK y de soporte a nuevos consumidores Rust, no de re-arquitectura del control-plane.
+
 // --- Gestión ---
 func Cancel(ctx context.Context, id TimerID) error
 func Reschedule(ctx context.Context, id TimerID, newFireAt time.Time) error

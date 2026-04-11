@@ -21,6 +21,25 @@ func TestNewTimerClientDerivesLocalTimerNodeName(t *testing.T) {
 	}
 }
 
+func TestNewTimerClientNormalizesInvalidRetrySchedule(t *testing.T) {
+	client, err := NewTimerClient(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 1), state: &connectionState{connected: true}},
+		&NodeReceiver{rx: make(chan receivedMessage, 1), state: &connectionState{connected: true}},
+		TimerClientConfig{TimeRetrySchedule: []time.Duration{0, -time.Second}},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+	if len(client.timeRetrySchedule) != len(defaultTimeRetrySchedule) {
+		t.Fatalf("unexpected retry schedule length: %v", client.timeRetrySchedule)
+	}
+	for i, want := range defaultTimeRetrySchedule {
+		if client.timeRetrySchedule[i] != want {
+			t.Fatalf("unexpected retry schedule[%d]: got=%s want=%s", i, client.timeRetrySchedule[i], want)
+		}
+	}
+}
+
 func TestTimerClientNowUsesTimerResponse(t *testing.T) {
 	tx := make(chan []byte, 1)
 	rx := make(chan receivedMessage, 1)
@@ -314,6 +333,20 @@ func TestTimerClientNowReturnsTypedUnreachableErrorAfterRetries(t *testing.T) {
 	}
 }
 
+func TestTimerClientNowInRejectsEmptyTimezone(t *testing.T) {
+	client, err := NewTimerClient(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 1), state: &connectionState{connected: true}},
+		&NodeReceiver{rx: make(chan receivedMessage, 1), state: &connectionState{connected: true}},
+		TimerClientConfig{},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+	if _, err := client.NowIn(context.Background(), "   "); err == nil {
+		t.Fatalf("expected timezone validation error")
+	}
+}
+
 func TestParseFiredEventParsesPayload(t *testing.T) {
 	payload, err := json.Marshal(map[string]any{
 		"timer_uuid":               "timer-1",
@@ -355,6 +388,40 @@ func TestScheduleInRejectsBelowMinimumClientSide(t *testing.T) {
 	respErr, ok := err.(*SystemResponseError)
 	if !ok || respErr.Code != "TIMER_BELOW_MINIMUM" {
 		t.Fatalf("unexpected error: %T %+v", err, err)
+	}
+}
+
+func TestScheduleRejectsMissedWithinWithoutFireIfWithin(t *testing.T) {
+	client, err := NewTimerClient(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 1), state: &connectionState{connected: true}},
+		&NodeReceiver{rx: make(chan receivedMessage, 1), state: &connectionState{connected: true}},
+		TimerClientConfig{},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+	within := int64(5000)
+	_, err = client.ScheduleIn(context.Background(), time.Minute, ScheduleOptions{
+		MissedPolicy:   MissedPolicyFire,
+		MissedWithinMS: &within,
+	})
+	if err == nil {
+		t.Fatalf("expected missed_within validation error")
+	}
+}
+
+func TestScheduleRecurringRejectsInvalidCronShape(t *testing.T) {
+	client, err := NewTimerClient(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 1), state: &connectionState{connected: true}},
+		&NodeReceiver{rx: make(chan receivedMessage, 1), state: &connectionState{connected: true}},
+		TimerClientConfig{},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+	_, err = client.ScheduleRecurring(context.Background(), RecurringOptions{CronSpec: "* * * * * *"})
+	if err == nil {
+		t.Fatalf("expected cron validation error")
 	}
 }
 
@@ -507,6 +574,20 @@ func TestCancelReturnsNilOnSuccessfulTimerResponse(t *testing.T) {
 	}
 }
 
+func TestCancelRejectsEmptyTimerID(t *testing.T) {
+	client, err := NewTimerClient(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 1), state: &connectionState{connected: true}},
+		&NodeReceiver{rx: make(chan receivedMessage, 1), state: &connectionState{connected: true}},
+		TimerClientConfig{},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+	if err := client.Cancel(context.Background(), TimerID("   ")); err == nil {
+		t.Fatalf("expected empty timer id validation error")
+	}
+}
+
 func TestRescheduleReturnsNilOnSuccessfulTimerResponse(t *testing.T) {
 	tx := make(chan []byte, 1)
 	rx := make(chan receivedMessage, 1)
@@ -551,6 +632,43 @@ func TestRescheduleReturnsNilOnSuccessfulTimerResponse(t *testing.T) {
 
 	if err := client.Reschedule(context.Background(), TimerID("timer-1"), time.Now().UTC().Add(2*time.Hour)); err != nil {
 		t.Fatalf("reschedule: %v", err)
+	}
+}
+
+func TestListRejectsInvalidFilters(t *testing.T) {
+	client, err := NewTimerClient(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 1), state: &connectionState{connected: true}},
+		&NodeReceiver{rx: make(chan receivedMessage, 1), state: &connectionState{connected: true}},
+		TimerClientConfig{},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+	if _, err := client.List(context.Background(), ListFilter{StatusFilter: "weird"}); err == nil {
+		t.Fatalf("expected invalid status filter error")
+	}
+	if _, err := client.List(context.Background(), ListFilter{Limit: MaxTimerListLimit + 1}); err == nil {
+		t.Fatalf("expected limit validation error")
+	}
+}
+
+func TestTimeFormattingOpsRejectEmptyFields(t *testing.T) {
+	client, err := NewTimerClient(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 1), state: &connectionState{connected: true}},
+		&NodeReceiver{rx: make(chan receivedMessage, 1), state: &connectionState{connected: true}},
+		TimerClientConfig{},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+	if _, err := client.Convert(context.Background(), 1775577600000, " "); err == nil {
+		t.Fatalf("expected convert validation error")
+	}
+	if _, err := client.Parse(context.Background(), "", "2006-01-02", "UTC"); err == nil {
+		t.Fatalf("expected parse validation error")
+	}
+	if _, err := client.Format(context.Background(), 1775577600000, "", "UTC"); err == nil {
+		t.Fatalf("expected format validation error")
 	}
 }
 

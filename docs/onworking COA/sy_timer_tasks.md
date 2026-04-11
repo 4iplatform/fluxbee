@@ -200,11 +200,11 @@ Current status after extraction:
   - `Get`
   - `ListMine`
   - `Help`
-- [ ] SYT-S2-T3. Implement client-side validation:
+- [x] SYT-S2-T3. Implement client-side validation:
   - minimum 60s
   - mutually exclusive absolute vs relative scheduling fields
   - recurring validation shape
-- [ ] SYT-S2-T4. Implement retry policy for time operations as defined by the spec.
+- [x] SYT-S2-T4. Implement retry policy for time operations as defined by the spec.
 - [x] SYT-S2-T5. Implement `ParseFiredEvent(msg)` helper.
 - [ ] SYT-S2-T6. Add tests/golden fixtures for SDK wire compatibility.
 
@@ -212,9 +212,22 @@ Current status:
 
 - implemented client calls so far: `Now`, `NowIn`, `Convert`, `Parse`, `Format`, `Help`
 - implemented scheduling calls: `Schedule`, `ScheduleIn`, `ScheduleRecurring`, `Cancel`, `Reschedule`, `Get`, `ListMine`
-- implemented time-operation retry budget for the currently supported direct time calls
+- implemented client-side validation for:
+  - minimum 60s
+  - `missed_policy` / `missed_within_ms`
+  - empty timer ids
+  - recurring cron shape (5-field v1 contract)
+  - list filters (`status_filter`, `limit`)
+  - required fields for timezone/time formatting operations
+- implemented normalized retry policy for direct time operations with the v1 schedule:
+  - `100ms`
+  - `300ms`
+  - `1s`
 - implemented `ParseFiredEvent(msg)`
-- remaining SDK work before the node binary: tighten client-side validation and broaden retry semantics from direct time calls to the final desired scope
+- remaining SDK work before Rust parity:
+  - wire-compat fixtures/golden tests
+  - explicit versioning/compatibility policy
+  - wire-compat tests against the Rust contract
 
 ---
 

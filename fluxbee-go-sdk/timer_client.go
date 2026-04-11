@@ -14,6 +14,12 @@ const (
 	MsgTimerFired = "TIMER_FIRED"
 )
 
+var defaultTimeRetrySchedule = []time.Duration{
+	100 * time.Millisecond,
+	300 * time.Millisecond,
+	time.Second,
+}
+
 type TimerID string
 
 type MissedPolicy string
@@ -102,10 +108,7 @@ func NewTimerClient(sender *NodeSender, receiver *NodeReceiver, cfg TimerClientC
 			return nil, err
 		}
 	}
-	retries := cfg.TimeRetrySchedule
-	if len(retries) == 0 {
-		retries = []time.Duration{100 * time.Millisecond, 300 * time.Millisecond, time.Second}
-	}
+	retries := normalizedTimeRetrySchedule(cfg.TimeRetrySchedule)
 	return &TimerClient{
 		sender:            sender,
 		receiver:          receiver,
@@ -123,8 +126,11 @@ func (c *TimerClient) Now(ctx context.Context) (*TimerNowResult, error) {
 }
 
 func (c *TimerClient) NowIn(ctx context.Context, tz string) (*TimerNowInResult, error) {
+	if strings.TrimSpace(tz) == "" {
+		return nil, fmt.Errorf("tz must be non-empty")
+	}
 	var out TimerNowInResult
-	if err := c.callTimeOperation(ctx, "TIMER_NOW_IN", map[string]any{"tz": tz}, &out); err != nil {
+	if err := c.callTimeOperation(ctx, "TIMER_NOW_IN", map[string]any{"tz": strings.TrimSpace(tz)}, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -166,16 +172,13 @@ func ParseFiredEvent(msg Message) (*FiredEvent, error) {
 
 func (c *TimerClient) callTimeOperation(ctx context.Context, verb string, payload any, out any) error {
 	var lastErr error
-	attempts := len(c.timeRetrySchedule)
-	if attempts == 0 {
-		attempts = 1
-	}
-	for attempt := 0; attempt < attempts; attempt++ {
+	retries := normalizedTimeRetrySchedule(c.timeRetrySchedule)
+	for _, timeout := range retries {
 		msg, err := c.buildRequest(verb, payload)
 		if err != nil {
 			return err
 		}
-		attemptCtx, cancel := context.WithTimeout(ctx, c.timeRetrySchedule[attempt])
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 		resp, err := RequestSystemRPC(attemptCtx, c.sender, c.receiver, msg, MsgTimerResponse)
 		cancel()
 		if err == nil {
@@ -197,7 +200,7 @@ func (c *TimerClient) callTimeOperation(ctx context.Context, verb string, payloa
 		ResponseMsg: MsgTimerResponse,
 		Verb:        verb,
 		Code:        "TIMER_UNREACHABLE",
-		Message:     fmt.Sprintf("SY.timer did not respond after %d attempts: %v", attempts, lastErr),
+		Message:     fmt.Sprintf("SY.timer did not respond after %d attempts: %v", len(retries), lastErr),
 	}
 }
 
@@ -222,4 +225,20 @@ func localTimerNodeName(fullName string) (string, error) {
 		return "", fmt.Errorf("sender full name must include hive suffix")
 	}
 	return "SY.timer@" + hive, nil
+}
+
+func normalizedTimeRetrySchedule(schedule []time.Duration) []time.Duration {
+	if len(schedule) == 0 {
+		return append([]time.Duration(nil), defaultTimeRetrySchedule...)
+	}
+	normalized := make([]time.Duration, 0, len(schedule))
+	for _, timeout := range schedule {
+		if timeout > 0 {
+			normalized = append(normalized, timeout)
+		}
+	}
+	if len(normalized) == 0 {
+		return append([]time.Duration(nil), defaultTimeRetrySchedule...)
+	}
+	return normalized
 }

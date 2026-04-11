@@ -60,3 +60,100 @@ Regla operativa acordada:
   - documentar esto como contrato explícito
 - [ ] GO-SDK-9. Portar readers SHM adicionales que hoy siguen faltando respecto del runtime Rust, empezando por los casos con valor real para nodos Go.
 - [ ] GO-SDK-10. Revisar el surface público del SDK Go y estabilizar política de versionado/compatibilidad para terceros.
+
+## Backlog explícito - `fluxbee_sdk` (Rust) para `SY.timer`
+
+Objetivo:
+- llevar al SDK Rust la misma capacidad funcional de integración con `SY.timer` que hoy existe en `fluxbee-go-sdk`
+- evitar que `SY.timer` quede como una capacidad “solo Go”
+- dejar un surface tipado y reutilizable para `WF.*`, `AI.*`, `IO.*` y futuros nodos Rust
+
+Decisiones ya tomadas:
+- `SY.orchestrator` no adopta `SY.timer` internamente en v1 para su control-plane base
+- este trabajo es **paridad de SDK**, no un cambio de arquitectura del orchestrator
+- la fuente autoritativa sigue siendo el contrato wire del nodo `SY.timer` documentado en `docs/sy-timer.md`
+
+### RUST-TIMER-SDK - Base de contrato y surface público
+
+- [ ] RUST-TIMER-SDK-1. Crear módulo canónico `timer` dentro de `crates/fluxbee_sdk/src/`.
+- [ ] RUST-TIMER-SDK-2. Exponerlo desde [lib.rs](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/lib.rs) y [prelude.rs](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/prelude.rs).
+- [ ] RUST-TIMER-SDK-3. Congelar constantes de wire:
+  - `TIMER_HELP`
+  - `TIMER_NOW`
+  - `TIMER_NOW_IN`
+  - `TIMER_CONVERT`
+  - `TIMER_PARSE`
+  - `TIMER_FORMAT`
+  - `TIMER_SCHEDULE`
+  - `TIMER_SCHEDULE_RECURRING`
+  - `TIMER_GET`
+  - `TIMER_LIST`
+  - `TIMER_CANCEL`
+  - `TIMER_RESCHEDULE`
+  - `TIMER_PURGE_OWNER`
+  - `TIMER_FIRED`
+  - `TIMER_RESPONSE`
+- [ ] RUST-TIMER-SDK-4. Definir tipos Rust serializables/deserializables para:
+  - `TimerId`
+  - `TimerInfo`
+  - `FiredEvent`
+  - `MissedPolicy`
+  - `TimerListFilter`
+  - `TimerHelpDescriptor`
+  - request/response payloads por verbo
+- [ ] RUST-TIMER-SDK-5. Definir un error canónico del cliente (`TimerClientError`) que separe:
+  - error de transporte
+  - timeout / unreachable
+  - respuesta de servicio con `code/message`
+  - payload inválido / contrato roto
+
+### RUST-TIMER-SDK - Helpers de transporte
+
+- [ ] RUST-TIMER-SDK-6. Implementar builder helpers para requests `system` dirigidos a `SY.timer@<hive>`.
+- [ ] RUST-TIMER-SDK-7. Implementar parser helpers para `TIMER_RESPONSE`.
+- [ ] RUST-TIMER-SDK-8. Implementar parser helper para `TIMER_FIRED` recibido como evento `system`.
+- [ ] RUST-TIMER-SDK-9. Reusar la normalización/correlación existente del SDK Rust en lugar de duplicar lógica de envelope.
+- [ ] RUST-TIMER-SDK-10. Resolver naming del target timer desde `hive_id` con helper canónico, sin hardcodes dispersos.
+
+### RUST-TIMER-SDK - Cliente tipado
+
+- [ ] RUST-TIMER-SDK-11. Implementar `TimerClient` sobre `NodeSender`.
+- [ ] RUST-TIMER-SDK-12. Implementar operaciones de tiempo:
+  - `now`
+  - `now_in`
+  - `convert`
+  - `parse`
+  - `format`
+  - `help`
+- [ ] RUST-TIMER-SDK-13. Implementar operaciones de timers:
+  - `schedule`
+  - `schedule_in`
+  - `schedule_recurring`
+  - `get`
+  - `list`
+  - `cancel`
+  - `reschedule`
+  - `purge_owner`
+- [ ] RUST-TIMER-SDK-14. Definir retry policy mínima para operaciones de tiempo, alineada con la semántica ya documentada para Go.
+- [ ] RUST-TIMER-SDK-15. Definir validación client-side mínima:
+  - mínimo de 60s
+  - exclusividad entre campos absolutos/relativos
+  - shape recurrente
+  - `missed_policy` / `missed_within_ms`
+
+### RUST-TIMER-SDK - Tests y compatibilidad
+
+- [ ] RUST-TIMER-SDK-16. Agregar tests unitarios de serialize/deserialize del contrato.
+- [ ] RUST-TIMER-SDK-17. Agregar golden tests o fixtures wire compatibles con `SY.timer`.
+- [ ] RUST-TIMER-SDK-18. Cruzar compatibilidad semántica con el cliente Go para:
+  - errores
+  - helpers de tiempo
+  - responses de list/get/schedule
+- [ ] RUST-TIMER-SDK-19. Agregar un cliente fake/test harness para nodos Rust que quieran testear lógica basada en tiempo sin depender de un hive real.
+- [ ] RUST-TIMER-SDK-20. Documentar ejemplos mínimos de uso desde nodos Rust y workflows Rust.
+
+### Notas de alcance
+
+- Esto no obliga a que `SY.admin` o `SY.orchestrator` usen el cliente Rust de `SY.timer` de inmediato.
+- El primer objetivo es que el SDK Rust tenga paridad suficiente para cualquier consumidor Rust nuevo.
+- Después de eso recién conviene evaluar adopciones puntuales en bins existentes.

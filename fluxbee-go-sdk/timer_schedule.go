@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
 const MinTimerDuration = time.Minute
+const MaxTimerListLimit = 1000
 
 type ScheduleOptions struct {
 	TargetL2Name   string
@@ -69,23 +71,20 @@ func (c *TimerClient) ScheduleIn(ctx context.Context, d time.Duration, opts Sche
 }
 
 func (c *TimerClient) ScheduleRecurring(ctx context.Context, opts RecurringOptions) (TimerID, error) {
-	if opts.CronSpec == "" {
-		return "", fmt.Errorf("cron_spec must be non-empty")
-	}
-	if err := validateMissedPolicy(opts.MissedPolicy, opts.MissedWithinMS); err != nil {
+	if err := validateRecurringOptions(opts); err != nil {
 		return "", err
 	}
 	payload := map[string]any{
-		"cron_spec": opts.CronSpec,
+		"cron_spec": strings.TrimSpace(opts.CronSpec),
 	}
-	if opts.CronTZ != "" {
-		payload["cron_tz"] = opts.CronTZ
+	if cronTZ := strings.TrimSpace(opts.CronTZ); cronTZ != "" {
+		payload["cron_tz"] = cronTZ
 	}
-	if opts.TargetL2Name != "" {
-		payload["target_l2_name"] = opts.TargetL2Name
+	if target := strings.TrimSpace(opts.TargetL2Name); target != "" {
+		payload["target_l2_name"] = target
 	}
-	if opts.ClientRef != "" {
-		payload["client_ref"] = opts.ClientRef
+	if clientRef := strings.TrimSpace(opts.ClientRef); clientRef != "" {
+		payload["client_ref"] = clientRef
 	}
 	if opts.Payload != nil {
 		payload["payload"] = opts.Payload
@@ -103,6 +102,9 @@ func (c *TimerClient) ScheduleRecurring(ctx context.Context, opts RecurringOptio
 }
 
 func (c *TimerClient) Cancel(ctx context.Context, id TimerID) error {
+	if err := validateTimerID(id); err != nil {
+		return err
+	}
 	msg, err := c.buildRequest("TIMER_CANCEL", map[string]any{"timer_uuid": string(id)})
 	if err != nil {
 		return err
@@ -122,6 +124,9 @@ func (c *TimerClient) Cancel(ctx context.Context, id TimerID) error {
 }
 
 func (c *TimerClient) Reschedule(ctx context.Context, id TimerID, newFireAt time.Time) error {
+	if err := validateTimerID(id); err != nil {
+		return err
+	}
 	if err := validateAbsoluteScheduleTime(newFireAt); err != nil {
 		return err
 	}
@@ -147,6 +152,9 @@ func (c *TimerClient) Reschedule(ctx context.Context, id TimerID, newFireAt time
 }
 
 func (c *TimerClient) Get(ctx context.Context, id TimerID) (*TimerInfo, error) {
+	if err := validateTimerID(id); err != nil {
+		return nil, err
+	}
 	msg, err := c.buildRequest("TIMER_GET", map[string]any{"timer_uuid": string(id)})
 	if err != nil {
 		return nil, err
@@ -170,12 +178,15 @@ func (c *TimerClient) Get(ctx context.Context, id TimerID) (*TimerInfo, error) {
 }
 
 func (c *TimerClient) List(ctx context.Context, filter ListFilter) ([]TimerInfo, error) {
-	payloadMap := map[string]any{}
-	if filter.OwnerL2Name != "" {
-		payloadMap["owner_l2_name"] = filter.OwnerL2Name
+	if err := validateListFilter(filter); err != nil {
+		return nil, err
 	}
-	if filter.StatusFilter != "" {
-		payloadMap["status_filter"] = filter.StatusFilter
+	payloadMap := map[string]any{}
+	if owner := strings.TrimSpace(filter.OwnerL2Name); owner != "" {
+		payloadMap["owner_l2_name"] = owner
+	}
+	if status := strings.TrimSpace(filter.StatusFilter); status != "" {
+		payloadMap["status_filter"] = status
 	}
 	if filter.Limit > 0 {
 		payloadMap["limit"] = filter.Limit
@@ -238,10 +249,16 @@ func validateRelativeScheduleDuration(d time.Duration) error {
 
 func validateMissedPolicy(policy MissedPolicy, withinMS *int64) error {
 	if policy == "" {
+		if withinMS != nil {
+			return fmt.Errorf("missed_within_ms requires missed_policy=fire_if_within")
+		}
 		return nil
 	}
 	switch policy {
 	case MissedPolicyFire, MissedPolicyDrop:
+		if withinMS != nil {
+			return fmt.Errorf("missed_within_ms is only valid when missed_policy=fire_if_within")
+		}
 		return nil
 	case MissedPolicyFireIfWithin:
 		if withinMS == nil || *withinMS <= 0 {
@@ -257,11 +274,11 @@ func schedulePayload(base map[string]any, opts ScheduleOptions) (map[string]any,
 	if err := validateMissedPolicy(opts.MissedPolicy, opts.MissedWithinMS); err != nil {
 		return nil, err
 	}
-	if opts.TargetL2Name != "" {
-		base["target_l2_name"] = opts.TargetL2Name
+	if target := strings.TrimSpace(opts.TargetL2Name); target != "" {
+		base["target_l2_name"] = target
 	}
-	if opts.ClientRef != "" {
-		base["client_ref"] = opts.ClientRef
+	if clientRef := strings.TrimSpace(opts.ClientRef); clientRef != "" {
+		base["client_ref"] = clientRef
 	}
 	if opts.Payload != nil {
 		base["payload"] = opts.Payload
@@ -314,4 +331,37 @@ func (t *TimerInfo) UnmarshalJSON(data []byte) error {
 	t.Payload = aux.Payload
 	t.Metadata = aux.Metadata
 	return nil
+}
+
+func validateRecurringOptions(opts RecurringOptions) error {
+	cronSpec := strings.TrimSpace(opts.CronSpec)
+	if cronSpec == "" {
+		return fmt.Errorf("cron_spec must be non-empty")
+	}
+	if len(strings.Fields(cronSpec)) != 5 {
+		return fmt.Errorf("cron_spec must use standard 5-field cron syntax")
+	}
+	return validateMissedPolicy(opts.MissedPolicy, opts.MissedWithinMS)
+}
+
+func validateTimerID(id TimerID) error {
+	if strings.TrimSpace(string(id)) == "" {
+		return fmt.Errorf("timer_id must be non-empty")
+	}
+	return nil
+}
+
+func validateListFilter(filter ListFilter) error {
+	if filter.Limit < 0 {
+		return fmt.Errorf("limit must be >= 0")
+	}
+	if filter.Limit > MaxTimerListLimit {
+		return fmt.Errorf("limit must be <= %d", MaxTimerListLimit)
+	}
+	switch strings.TrimSpace(filter.StatusFilter) {
+	case "", "pending", "fired", "canceled", "all":
+		return nil
+	default:
+		return fmt.Errorf("invalid status_filter: %s", filter.StatusFilter)
+	}
 }
