@@ -4,6 +4,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use chrono::{SecondsFormat, TimeZone, Utc};
@@ -509,7 +511,7 @@ async fn main() -> Result<(), OrchestratorError> {
     let runtime_manifest = load_runtime_manifest();
     let system_allowed_origins = load_system_allowed_origins(&hive.hive_id);
     tracing::info!(allowed = ?system_allowed_origins, "system message origin allowlist loaded");
-    let state = OrchestratorState {
+    let state = Arc::new(OrchestratorState {
         hive_id: hive.hive_id.clone(),
         is_motherbee,
         started_at: Instant::now(),
@@ -531,7 +533,7 @@ async fn main() -> Result<(), OrchestratorError> {
         blob: blob_runtime.clone(),
         dist: dist_runtime,
         blob_sync_last_desired: Mutex::new(blob_runtime),
-    };
+    });
     tracing::info!(
         blob_enabled = state.blob.enabled,
         blob_path = %state.blob.path.display(),
@@ -580,10 +582,23 @@ async fn main() -> Result<(), OrchestratorError> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut watchdog = time::interval(Duration::from_secs(5));
+    let watchdog_running = Arc::new(AtomicBool::new(false));
     loop {
         tokio::select! {
             _ = watchdog.tick() => {
-                watchdog_tick(&state).await;
+                if watchdog_running
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    let watchdog_state = Arc::clone(&state);
+                    let watchdog_flag = Arc::clone(&watchdog_running);
+                    tokio::spawn(async move {
+                        watchdog_tick(&watchdog_state).await;
+                        watchdog_flag.store(false, Ordering::SeqCst);
+                    });
+                } else {
+                    tracing::debug!("skipping watchdog tick while previous run still active");
+                }
             }
             _ = sigterm.recv() => {
                 tracing::warn!("SIGTERM received; shutting down");
