@@ -60,6 +60,7 @@ func newTestService(t *testing.T) (*Service, chan []byte) {
 
 func TestRespondTimerSchedulePersistsOwnedTimer(t *testing.T) {
 	service, tx := newTestService(t)
+	service.scheduler = newTimerScheduler(service)
 	fireInMS := int64((time.Minute).Milliseconds())
 	msg := mustBuildSystemMessage(t, map[string]any{
 		"fire_in_ms": fireInMS,
@@ -79,6 +80,10 @@ func TestRespondTimerSchedulePersistsOwnedTimer(t *testing.T) {
 	}
 	if row.OwnerL2Name != "WF.demo@motherbee" || row.TargetL2Name != "WF.demo@motherbee" {
 		t.Fatalf("unexpected stored ownership: %+v", row)
+	}
+	timerUUID, fireAtUTCMS := mustPeekScheduledTimer(t, service.scheduler)
+	if timerUUID != *response.TimerUUID || fireAtUTCMS != row.FireAtUTC {
+		t.Fatalf("unexpected scheduled heap entry: uuid=%s fire_at=%d row=%+v", timerUUID, fireAtUTCMS, row)
 	}
 }
 
@@ -161,6 +166,7 @@ func TestRespondTimerCancelMarksTimerCanceled(t *testing.T) {
 
 func TestRespondTimerRescheduleUpdatesFireAt(t *testing.T) {
 	service, tx := newTestService(t)
+	service.scheduler = newTimerScheduler(service)
 	insertOwnedTimer(t, service.db, timerRow{
 		UUID:         "timer-1",
 		OwnerL2Name:  "WF.demo@motherbee",
@@ -192,10 +198,15 @@ func TestRespondTimerRescheduleUpdatesFireAt(t *testing.T) {
 	if row.FireAtUTC != newFireAt {
 		t.Fatalf("unexpected fire_at after reschedule: %+v", row)
 	}
+	timerUUID, fireAtUTCMS := mustPeekScheduledTimer(t, service.scheduler)
+	if timerUUID != "timer-1" || fireAtUTCMS != newFireAt {
+		t.Fatalf("unexpected rescheduled heap entry: uuid=%s fire_at=%d", timerUUID, fireAtUTCMS)
+	}
 }
 
 func TestRespondTimerScheduleRecurringPersistsCronFields(t *testing.T) {
 	service, tx := newTestService(t)
+	service.scheduler = newTimerScheduler(service)
 	msg := mustBuildSystemMessage(t, map[string]any{
 		"cron_spec": "0 9 * * MON",
 		"cron_tz":   "America/Argentina/Buenos_Aires",
@@ -218,6 +229,10 @@ func TestRespondTimerScheduleRecurringPersistsCronFields(t *testing.T) {
 	}
 	if !row.CronTZ.Valid || row.CronTZ.String != "America/Argentina/Buenos_Aires" {
 		t.Fatalf("unexpected cron_tz: %+v", row)
+	}
+	timerUUID, fireAtUTCMS := mustPeekScheduledTimer(t, service.scheduler)
+	if timerUUID != *response.TimerUUID || fireAtUTCMS != row.FireAtUTC {
+		t.Fatalf("unexpected recurring heap entry: uuid=%s fire_at=%d row=%+v", timerUUID, fireAtUTCMS, row)
 	}
 }
 
@@ -491,4 +506,18 @@ func mustReadResponsePayload(t *testing.T, tx chan []byte) []byte {
 		t.Fatalf("decode sent message: %v", err)
 	}
 	return msg.Payload
+}
+
+func mustPeekScheduledTimer(t *testing.T, scheduler *timerScheduler) (string, int64) {
+	t.Helper()
+	if scheduler == nil {
+		t.Fatal("scheduler is nil")
+	}
+	scheduler.mu.Lock()
+	defer scheduler.mu.Unlock()
+	if len(scheduler.items) == 0 {
+		t.Fatal("scheduler heap is empty")
+	}
+	entry := scheduler.items[0]
+	return entry.timerUUID, entry.fireAtUTC
 }

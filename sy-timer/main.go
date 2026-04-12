@@ -440,7 +440,7 @@ func (s *Service) respondTimerSchedule(incoming fluxbeesdk.Message) error {
 	if err := insertTimer(context.Background(), s.db, row); err != nil {
 		return s.sendTimerError(incoming, "TIMER_SCHEDULE", "TIMER_STORAGE_ERROR", err.Error())
 	}
-	s.signalScheduler()
+	s.enqueueTimer(timerID, fireAtUTCMS)
 	logEvent("timer_scheduled", map[string]any{
 		"timer_uuid":      timerID,
 		"owner_l2_name":   ownerL2,
@@ -526,7 +526,7 @@ func (s *Service) respondTimerScheduleRecurring(incoming fluxbeesdk.Message) err
 	if err := insertTimer(context.Background(), s.db, row); err != nil {
 		return s.sendTimerError(incoming, "TIMER_SCHEDULE_RECURRING", "TIMER_STORAGE_ERROR", err.Error())
 	}
-	s.signalScheduler()
+	s.enqueueTimer(timerID, fireAtUTCMS)
 	logEvent("timer_scheduled", map[string]any{
 		"timer_uuid":      timerID,
 		"owner_l2_name":   ownerL2,
@@ -692,7 +692,7 @@ func (s *Service) respondTimerReschedule(incoming fluxbeesdk.Message) error {
 	if err := updateTimer(context.Background(), s.db, *row); err != nil {
 		return s.sendTimerError(incoming, "TIMER_RESCHEDULE", "TIMER_STORAGE_ERROR", err.Error())
 	}
-	s.signalScheduler()
+	s.enqueueTimer(row.UUID, fireAtUTCMS)
 	logEvent("timer_rescheduled", map[string]any{
 		"timer_uuid":      row.UUID,
 		"owner_l2_name":   row.OwnerL2Name,
@@ -772,6 +772,14 @@ func (s *Service) signalScheduler() {
 	if s.scheduler != nil {
 		s.scheduler.signal()
 	}
+}
+
+func (s *Service) enqueueTimer(timerUUID string, fireAtUTCMS int64) {
+	if s.scheduler != nil {
+		s.scheduler.push(timerUUID, fireAtUTCMS)
+		return
+	}
+	s.signalScheduler()
 }
 
 func loadLocation(raw string) (*time.Location, error) {
