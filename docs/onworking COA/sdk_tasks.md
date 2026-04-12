@@ -93,9 +93,9 @@ Decisiones ya tomadas:
 
 ### RUST-TIMER-SDK - Base de contrato y surface público
 
-- [ ] RUST-TIMER-SDK-1. Crear módulo canónico `timer` dentro de `crates/fluxbee_sdk/src/`.
-- [ ] RUST-TIMER-SDK-2. Exponerlo desde [lib.rs](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/lib.rs) y [prelude.rs](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/prelude.rs).
-- [ ] RUST-TIMER-SDK-3. Congelar constantes de wire:
+- [x] RUST-TIMER-SDK-1. Crear módulo canónico `timer` dentro de `crates/fluxbee_sdk/src/`.
+- [x] RUST-TIMER-SDK-2. Exponerlo desde [lib.rs](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/lib.rs) y [prelude.rs](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/prelude.rs).
+- [x] RUST-TIMER-SDK-3. Congelar constantes de wire:
   - `TIMER_HELP`
   - `TIMER_NOW`
   - `TIMER_NOW_IN`
@@ -111,7 +111,7 @@ Decisiones ya tomadas:
   - `TIMER_PURGE_OWNER`
   - `TIMER_FIRED`
   - `TIMER_RESPONSE`
-- [ ] RUST-TIMER-SDK-4. Definir tipos Rust serializables/deserializables para:
+- [x] RUST-TIMER-SDK-4. Definir tipos Rust serializables/deserializables para:
   - `TimerId`
   - `TimerInfo`
   - `FiredEvent`
@@ -119,7 +119,7 @@ Decisiones ya tomadas:
   - `TimerListFilter`
   - `TimerHelpDescriptor`
   - request/response payloads por verbo
-- [ ] RUST-TIMER-SDK-5. Definir un error canónico del cliente (`TimerClientError`) que separe:
+- [x] RUST-TIMER-SDK-5. Definir un error canónico del cliente (`TimerClientError`) que separe:
   - error de transporte
   - timeout / unreachable
   - respuesta de servicio con `code/message`
@@ -132,6 +132,21 @@ Decisiones ya tomadas:
 - [ ] RUST-TIMER-SDK-8. Implementar parser helper para `TIMER_FIRED` recibido como evento `system`.
 - [ ] RUST-TIMER-SDK-9. Reusar la normalización/correlación existente del SDK Rust en lugar de duplicar lógica de envelope.
 - [ ] RUST-TIMER-SDK-10. Resolver naming del target timer desde `hive_id` con helper canónico, sin hardcodes dispersos.
+
+Estado actual del módulo Rust `timer`:
+
+- nuevo archivo canónico: [timer.rs](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/timer.rs)
+- exports ya disponibles desde [lib.rs](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/lib.rs) y [prelude.rs](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/prelude.rs)
+- contrato base ya cubierto:
+  - constantes `TIMER_*`
+  - enums (`TimerKind`, `TimerStatus`, `TimerStatusFilter`, `MissedPolicy`)
+  - ids / info / fired event
+  - payloads de request/response por verbo
+  - `TimerHelpDescriptor`
+  - `TimerClientError`
+- verificación actual:
+  - `cargo check -p fluxbee-sdk`
+  - `cargo test -p fluxbee-sdk timer`
 
 ### RUST-TIMER-SDK - Cliente tipado
 
