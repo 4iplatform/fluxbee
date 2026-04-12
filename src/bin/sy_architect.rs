@@ -2754,8 +2754,11 @@ fn translate_scmd(
     local_hive_id: &str,
     parsed: ParsedScmd,
 ) -> Result<AdminTranslation, ArchitectError> {
-    let segments: Vec<&str> = parsed
-        .path
+    let (path_only, raw_query) = match parsed.path.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (parsed.path.as_str(), None),
+    };
+    let segments: Vec<&str> = path_only
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect();
@@ -3052,6 +3055,102 @@ fn translate_scmd(
             target_hive: (*hive_id).to_string(),
             params: json!({}),
         }),
+        ("GET", ["hives", hive_id, "timer", "help"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "timer_help".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({}),
+        }),
+        ("GET", ["hives", hive_id, "timer", "timers"]) => {
+            let mut params = json!({});
+            if let Some(query) = raw_query {
+                for pair in query.split('&').filter(|segment| !segment.is_empty()) {
+                    let (key, value) = match pair.split_once('=') {
+                        Some(parts) => parts,
+                        None => continue,
+                    };
+                    if value.is_empty() {
+                        continue;
+                    }
+                    match key {
+                        "owner_l2_name" => params["owner_l2_name"] = Value::String(value.to_string()),
+                        "status_filter" => params["status_filter"] = Value::String(value.to_string()),
+                        "limit" => {
+                            if let Ok(limit) = value.parse::<u64>() {
+                                params["limit"] = json!(limit);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "timer_list".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("GET", ["hives", hive_id, "timer", "timers", timer_uuid]) => Ok(AdminTranslation {
+            admin_target,
+            action: "timer_get".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({ "timer_uuid": timer_uuid }),
+        }),
+        ("GET", ["hives", hive_id, "timer", "now"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "timer_now".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({}),
+        }),
+        ("POST", ["hives", hive_id, "timer", "now-in"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for timer now-in must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "timer_now_in".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("POST", ["hives", hive_id, "timer", "convert"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for timer convert must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "timer_convert".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("POST", ["hives", hive_id, "timer", "parse"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for timer parse must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "timer_parse".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("POST", ["hives", hive_id, "timer", "format"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for timer format must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "timer_format".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
         ("POST", ["hives", hive_id, "opa", "policy", "check"]) => {
             let params = parsed.body.unwrap_or_else(|| json!({}));
             if !params.is_object() {
