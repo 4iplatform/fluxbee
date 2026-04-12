@@ -98,9 +98,11 @@
       color: var(--text-light);
       font-size: 0.82rem;
       font-weight: 500;
-      cursor: default;
-      user-select: none;
+      text-decoration: none;
+      cursor: pointer;
+      transition: color 0.15s;
     }
+    .github-nav:hover { color: var(--text); }
     .github-nav svg { flex-shrink: 0; }
     .pill-soon {
       font-size: 0.62rem;
@@ -400,9 +402,11 @@
       font-size: 0.83rem;
       font-weight: 500;
       color: var(--text-light);
-      cursor: default;
-      user-select: none;
+      text-decoration: none;
+      cursor: pointer;
+      transition: color 0.15s, border-color 0.15s;
     }
+    .oss-chip:hover { color: var(--text); border-color: #ccc; }
 
     /* ─────────────── WAITLIST ─────────────── */
     .waitlist-wrap { max-width: 540px; margin: 0 auto; text-align: center; }
@@ -519,14 +523,13 @@
       </ul>
 
       <div class="nav-right">
-        <span class="github-nav" title="Repository coming soon">
+        <a href="https://github.com/4iplatform/fluxbee" target="_blank" rel="noopener noreferrer" class="github-nav" title="View on GitHub">
           <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
             <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/>
           </svg>
           <span class="github-label">GitHub</span>
-          <span class="pill-soon">coming soon</span>
-        </span>
-        <a href="#waitlist" class="btn-nav">Join the Waitlist</a>
+        </a>
+        <a href="#waitlist" class="btn-nav">Become a Collaborator</a>
       </div>
     </div>
   </nav>
@@ -547,7 +550,7 @@
       </p>
       <div class="hero-actions">
         <a href="#waitlist" class="btn-primary">
-          Join the Waitlist
+          Become a Collaborator
           <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none"
                stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>
@@ -695,33 +698,33 @@
         <div class="oss-text">
           <h3>4iplatform / fluxbee</h3>
           <p>
-            The repository is in active development — we're hardening the pilot before
-            opening it up. Star it to follow progress and get notified when it goes public.
-            Contributions, integrations, and self-hosted deployments welcome.
+            The repository is live and open. Explore the code, open issues, submit PRs,
+            or build integrations on top of the core.
+            Contributions and self-hosted deployments welcome.
           </p>
           <div class="oss-chips">
-            <span class="oss-chip">
+            <a href="https://github.com/4iplatform/fluxbee" target="_blank" rel="noopener noreferrer" class="oss-chip">
               <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
                 <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/>
               </svg>
               github.com/4iplatform/fluxbee
-              <span class="pill-soon">coming soon</span>
-            </span>
+            </a>
           </div>
         </div>
       </div>
     </div>
   </section>
 
-  <!-- ─────────────── WAITLIST ─────────────── -->
+  <!-- ─────────────── COLLABORATE ─────────────── -->
   <section id="waitlist">
     <div class="container">
       <div class="waitlist-wrap">
-        <span class="label">Early Access</span>
-        <h2>Be first to run Archi</h2>
+        <span class="label">Collaborate</span>
+        <h2>Become a collaborator</h2>
         <p class="sub-desc">
-          We're onboarding a small pilot group. Leave your email and we'll reach out
-          when your slot is ready.
+          The repo is public — anyone can explore and fork. Collaborators get direct
+          commit access and work alongside the core team. Leave your email and we'll
+          reach out.
         </p>
         <form id="waitlist-form" onsubmit="submitWaitlist(event)" novalidate>
           <div class="form-row">
@@ -732,9 +735,9 @@
               autocomplete="email"
               required
             />
-            <button type="submit" id="waitlist-btn">Request Access</button>
+            <button type="submit" id="waitlist-btn">Apply as Collaborator</button>
           </div>
-          <p class="form-note">No spam. Pilot access only. Unsubscribe anytime.</p>
+          <p class="form-note">No spam. We'll only reach out about collaboration. Unsubscribe anytime.</p>
           <div id="form-msg" class="form-msg" role="status" aria-live="polite"></div>
         </form>
       </div>
