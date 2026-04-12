@@ -366,7 +366,7 @@ Current status:
 - [x] SYT-S8-T6. Add orchestrator startup/shutdown/watchdog handling for `sy-timer`.
 - [x] SYT-S8-T7. Add node cleanup hook from orchestrator:
   - `TIMER_PURGE_OWNER` before node teardown
-- [ ] SYT-S8-T8. Decide whether orchestrator itself should use `SY.timer` for any internal delayed actions in v1 or not.
+- [x] SYT-S8-T8. Decide whether orchestrator itself should use `SY.timer` for any internal delayed actions in v1 or not.
 
 Current status:
 
@@ -380,6 +380,9 @@ Current status:
   - shutdown sequence
   - worker bootstrap unit generation
 - node teardown now triggers `TIMER_PURGE_OWNER` best-effort before instance removal / purge, and includes the result in the orchestrator response payload
+- `SY.orchestrator` does **not** use `SY.timer` internally in v1:
+  - this is explicitly deferred to v2
+  - the pilot keeps orchestrator timing logic local to avoid extra control-plane coupling
 
 ### SYT-S9 — Admin and operator visibility
 
@@ -448,6 +451,12 @@ Current status:
 - [x] SYT-S11-T7. Restart/replay tests against persisted SQLite.
 - [ ] SYT-S11-T8. Orchestrator teardown test for `TIMER_PURGE_OWNER`.
 - [x] SYT-S11-T9. Go SDK tests for all currently implemented typed client helpers.
+
+Manual live validation now also exists through Rust examples:
+
+- [examples/timer_client.rs](/Users/cagostino/Documents/GitHub/fluxbee/examples/timer_client.rs) for one-shot schedule -> fire -> final state
+- [examples/timer_recurring.rs](/Users/cagostino/Documents/GitHub/fluxbee/examples/timer_recurring.rs) for recurring first fire -> requeue -> cancel cleanup
+- [examples/timer_restart.rs](/Users/cagostino/Documents/GitHub/fluxbee/examples/timer_restart.rs) for replay/restart validation with a manual `sy-timer` restart between schedule and fire
 
 ---
 

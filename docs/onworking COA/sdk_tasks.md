@@ -226,6 +226,17 @@ Estado actual del cliente Rust `SY.timer`:
     - hace `get` + `list_mine`
     - espera `TIMER_FIRED`
     - vuelve a consultar hasta confirmar `status=fired`
+- ejemplos vivos adicionales ya disponibles:
+  - [examples/timer_recurring.rs](/Users/cagostino/Documents/GitHub/fluxbee/examples/timer_recurring.rs)
+    - agenda un recurrente dirigido a sí mismo
+    - espera un primer `TIMER_FIRED`
+    - confirma requeue a `pending` con `fire_count=1`
+    - cancela el timer para cleanup
+  - [examples/timer_restart.rs](/Users/cagostino/Documents/GitHub/fluxbee/examples/timer_restart.rs)
+    - agenda un one-shot dirigido a sí mismo
+    - deja explícito el paso manual de reinicio de `sy-timer`
+    - espera `TIMER_FIRED` después del restart
+    - confirma `status=fired` tras replay/restart
 
 ### RUST-TIMER-SDK - Tests y compatibilidad
 
