@@ -869,6 +869,10 @@ async fn handle_message(
         return Ok(());
     };
 
+    // L2-LOOKUP-5 / L2-LOOKUP-7: stamp the authoritative L2 name, overwriting
+    // anything the sender may have set.
+    msg.routing.src_l2_name = Some(src_handle.name.clone());
+
     if msg.routing.ttl == 0 {
         send_ttl_exceeded_to(&msg, &src_handle.sender, router_uuid)?;
         return Ok(());
@@ -2968,6 +2972,11 @@ async fn handle_peer_message(
         }
         return Ok(());
     };
+
+    // L2-LOOKUP-5 / L2-LOOKUP-7: stamp the authoritative L2 name resolved from
+    // peer_nodes, overwriting anything the forwarding router may have set.
+    msg.routing.src_l2_name = Some(src_node.name.clone());
+
     let _ = refresh_lsa(
         lsa_reader,
         lsa_snapshot,

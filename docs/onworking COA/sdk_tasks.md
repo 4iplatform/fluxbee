@@ -300,11 +300,11 @@ Decisión tomada:
 
 ### L2-LOOKUP-2 - Router como autoridad de identidad
 
-- [ ] L2-LOOKUP-4. Hacer que el router asocie `uuid -> l2_name` de forma estable en la sesión/conexión del peer al aceptar `HELLO` / `ANNOUNCE`.
-- [ ] L2-LOOKUP-5. Estampar `routing.src_l2_name` en toda entrega router -> nodo.
-- [ ] L2-LOOKUP-6. Preservar `routing.src` y `routing.src_l2_name` correctamente en forwarding router -> router -> nodo.
-- [ ] L2-LOOKUP-7. Ignorar o sobrescribir cualquier `src_l2_name` provisto por el sender.
-- [ ] L2-LOOKUP-8. Revisar todos los paths de entrega:
+- [x] L2-LOOKUP-4. Hacer que el router asocie `uuid -> l2_name` de forma estable en la sesión/conexión del peer al aceptar `HELLO` / `ANNOUNCE`.
+- [x] L2-LOOKUP-5. Estampar `routing.src_l2_name` en toda entrega router -> nodo.
+- [x] L2-LOOKUP-6. Preservar `routing.src` y `routing.src_l2_name` correctamente en forwarding router -> router -> nodo.
+- [x] L2-LOOKUP-7. Ignorar o sobrescribir cualquier `src_l2_name` provisto por el sender.
+- [x] L2-LOOKUP-8. Revisar todos los paths de entrega:
   - unicast local
   - system local
   - respuestas correlacionadas
