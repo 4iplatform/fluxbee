@@ -1545,6 +1545,7 @@ async fn handle_impersonation_chat(
     let msg = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Resolve,
             ttl: 16,
             trace_id: trace_id.clone(),
@@ -3077,8 +3078,12 @@ fn translate_scmd(
                         continue;
                     }
                     match key {
-                        "owner_l2_name" => params["owner_l2_name"] = Value::String(value.to_string()),
-                        "status_filter" => params["status_filter"] = Value::String(value.to_string()),
+                        "owner_l2_name" => {
+                            params["owner_l2_name"] = Value::String(value.to_string())
+                        }
+                        "status_filter" => {
+                            params["status_filter"] = Value::String(value.to_string())
+                        }
                         "limit" => {
                             if let Ok(limit) = value.parse::<u64>() {
                                 params["limit"] = json!(limit);

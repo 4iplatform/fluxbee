@@ -6,6 +6,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use chrono::{SecondsFormat, TimeZone, Utc};
@@ -1243,6 +1245,7 @@ async fn send_admin_forbidden(
     let reply = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(msg.routing.src.clone()),
             ttl: 16,
             trace_id: msg.routing.trace_id.clone(),
@@ -1486,6 +1489,7 @@ async fn handle_admin(
     let reply = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(msg.routing.src.clone()),
             ttl: 16,
             trace_id: msg.routing.trace_id.clone(),
@@ -2767,6 +2771,7 @@ async fn send_system_action_response(
     let reply = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(request.routing.src.clone()),
             ttl: 16,
             trace_id: request.routing.trace_id.clone(),
@@ -7033,6 +7038,7 @@ async fn send_config_response(
     let reply = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(request.routing.src.clone()),
             ttl: 16,
             trace_id: request.routing.trace_id.clone(),
@@ -8611,6 +8617,7 @@ async fn send_node_config_changed_signal(
     let msg = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(node_name.to_string()),
             ttl: 16,
             trace_id: Uuid::new_v4().to_string(),
@@ -9736,6 +9743,7 @@ async fn relay_system_action(
     let request = Message {
         routing: Routing {
             src: relay_sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(destination.to_string()),
             ttl: 16,
             trace_id: trace_id.clone(),
@@ -11930,7 +11938,7 @@ async fn purge_owner_timers_before_teardown(
     owner_l2_name: &str,
 ) -> serde_json::Value {
     let timer_node = ensure_l2_name("SY.timer", target_hive);
-    match relay_system_action(
+    match relay_system_action_for_timer_purge(
         state,
         &timer_node,
         "TIMER_PURGE_OWNER",
@@ -11967,6 +11975,55 @@ async fn purge_owner_timers_before_teardown(
             "message": err.to_string(),
         }),
     }
+}
+
+async fn relay_system_action_for_timer_purge(
+    state: &OrchestratorState,
+    destination: &str,
+    request_msg: &str,
+    response_msg: &str,
+    payload: serde_json::Value,
+    forward_timeout: Duration,
+) -> Result<serde_json::Value, OrchestratorError> {
+    #[cfg(test)]
+    {
+        if let Some(result) = take_test_timer_purge_relay_result() {
+            return result.map_err(|message| message.into());
+        }
+    }
+    relay_system_action(
+        state,
+        destination,
+        request_msg,
+        response_msg,
+        payload,
+        forward_timeout,
+    )
+    .await
+}
+
+#[cfg(test)]
+type TestTimerPurgeRelayResult = Result<serde_json::Value, String>;
+
+#[cfg(test)]
+fn test_timer_purge_relay_slot() -> &'static StdMutex<Option<TestTimerPurgeRelayResult>> {
+    static SLOT: OnceLock<StdMutex<Option<TestTimerPurgeRelayResult>>> = OnceLock::new();
+    SLOT.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn set_test_timer_purge_relay_result(result: TestTimerPurgeRelayResult) {
+    *test_timer_purge_relay_slot()
+        .lock()
+        .expect("test timer purge relay lock") = Some(result);
+}
+
+#[cfg(test)]
+fn take_test_timer_purge_relay_result() -> Option<TestTimerPurgeRelayResult> {
+    test_timer_purge_relay_slot()
+        .lock()
+        .expect("test timer purge relay lock")
+        .take()
 }
 
 fn execute_on_hive(
@@ -15760,6 +15817,55 @@ blob:
         assert!(second_node_dir.exists());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn purge_owner_timers_before_teardown_returns_ok_payload_with_deleted_count() {
+        let state = sample_orchestrator_state_for_tests();
+        set_test_timer_purge_relay_result(Ok(serde_json::json!({
+            "ok": true,
+            "verb": "TIMER_PURGE_OWNER",
+            "deleted_count": 2
+        })));
+
+        let out =
+            purge_owner_timers_before_teardown(&state, "motherbee", "WF.demo.cleanup@motherbee")
+                .await;
+
+        assert_eq!(out["status"], "ok");
+        assert_eq!(out["target"], serde_json::json!("SY.timer@motherbee"));
+        assert_eq!(
+            out["owner_l2_name"],
+            serde_json::json!("WF.demo.cleanup@motherbee")
+        );
+        assert_eq!(out["deleted_count"], serde_json::json!(2));
+        assert_eq!(
+            out["payload"]["verb"],
+            serde_json::json!("TIMER_PURGE_OWNER")
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_owner_timers_before_teardown_surfaces_relay_error() {
+        let state = sample_orchestrator_state_for_tests();
+        set_test_timer_purge_relay_result(Err(
+            "system forward timeout msg=TIMER_PURGE_OWNER response=TIMER_RESPONSE".to_string(),
+        ));
+
+        let out =
+            purge_owner_timers_before_teardown(&state, "motherbee", "WF.demo.cleanup@motherbee")
+                .await;
+
+        assert_eq!(out["status"], "error");
+        assert_eq!(out["target"], serde_json::json!("SY.timer@motherbee"));
+        assert_eq!(
+            out["owner_l2_name"],
+            serde_json::json!("WF.demo.cleanup@motherbee")
+        );
+        assert!(out["message"]
+            .as_str()
+            .expect("error message")
+            .contains("TIMER_PURGE_OWNER"));
     }
 
     #[test]

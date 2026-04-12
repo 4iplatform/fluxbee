@@ -5237,6 +5237,7 @@ mod tests {
         let mut first = Message {
             routing: Routing {
                 src: Uuid::new_v4().to_string(),
+                src_l2_name: None,
                 dst: Destination::Resolve,
                 ttl: 16,
                 trace_id: Uuid::new_v4().to_string(),
@@ -5256,6 +5257,7 @@ mod tests {
         let mut second = Message {
             routing: Routing {
                 src: Uuid::new_v4().to_string(),
+                src_l2_name: None,
                 dst: Destination::Resolve,
                 ttl: 16,
                 trace_id: Uuid::new_v4().to_string(),
@@ -5277,6 +5279,7 @@ mod tests {
         let mut msg = Message {
             routing: Routing {
                 src: Uuid::new_v4().to_string(),
+                src_l2_name: None,
                 dst: Destination::Resolve,
                 ttl: 16,
                 trace_id: Uuid::new_v4().to_string(),
@@ -5300,6 +5303,7 @@ mod tests {
         Message {
             routing: Routing {
                 src: Uuid::new_v4().to_string(),
+                src_l2_name: None,
                 dst: Destination::Resolve,
                 ttl: 16,
                 trace_id: Uuid::new_v4().to_string(),

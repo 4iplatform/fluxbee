@@ -55,8 +55,7 @@ pub async fn connect_example_node(
         config_dir,
         version: "1.0".to_string(),
     };
-    let (sender, receiver) =
-        connect_with_retry(&node_config, StdDuration::from_secs(1)).await?;
+    let (sender, receiver) = connect_with_retry(&node_config, StdDuration::from_secs(1)).await?;
     Ok((sender, receiver, uuid_mode))
 }
 
@@ -110,9 +109,7 @@ pub async fn wait_for_timer_fired(
             Err(_) => {
                 println!(
                     "ignoring message kind={} msg={:?} trace_id={}",
-                    incoming.meta.msg_type,
-                    incoming.meta.msg,
-                    incoming.routing.trace_id
+                    incoming.meta.msg_type, incoming.meta.msg, incoming.routing.trace_id
                 );
             }
         }

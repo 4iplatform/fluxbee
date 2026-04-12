@@ -1,7 +1,7 @@
 # JSON Router - 10 Identity and Layer 3 (ILK)
 
-**Status:** v1.15  
-**Date:** 2026-02-01  
+**Status:** v1.16  
+**Date:** 2026-04-12  
 **Audience:** IO, AI, WF node developers, L3 routing
 
 ---
@@ -11,7 +11,7 @@
 | Layer | Identifies | Format | Resolver | Location |
 |-------|------------|--------|----------|----------|
 | **L1** | Connection/Socket | UUID | Router (FIB) | routing.src/dst |
-| **L2** | Process/Node | `TYPE.name@hive` | Router (SHM lookup) | routing.dst or meta.target |
+| **L2** | Process/Node | `TYPE.name@hive` | Router (authoritative stamp) | routing.src_l2_name, routing.dst, meta.target |
 | **L3** | Interlocutor | `ilk:<uuid>` | OPA (reads meta) | meta.src_ilk/dst_ilk |
 
 ---
@@ -83,6 +83,7 @@ ilk:tenant-acme (tenant)
 {
   "routing": {
     "src": "uuid-node-io-whatsapp",
+    "src_l2_name": "IO.whatsapp@motherbee",
     "dst": null,
     "ttl": 16,
     "trace_id": "uuid-trace"
@@ -118,6 +119,16 @@ ilk:tenant-acme (tenant)
 ### 3.2 Tenant is derived, not sent
 
 The message does NOT carry `tenant`. OPA derives it from `src_ilk`:
+
+### 3.3 L1 -> L2 visibility for consumers
+
+The router is the authority for the L2 identity of the message origin.
+
+Rules:
+- nodes receive `routing.src` as the canonical L1 UUID of the origin
+- nodes receive `routing.src_l2_name` as the canonical L2 name of the same origin
+- nodes should not perform SHM or filesystem lookup to derive the sender L2 during normal message handling
+- any value supplied by a sender in `routing.src_l2_name` must be ignored and overwritten by the router
 
 ```rego
 # OPA reads tenant from identity table

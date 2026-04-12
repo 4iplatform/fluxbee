@@ -14,6 +14,8 @@ pub struct Message {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Routing {
     pub src: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src_l2_name: Option<String>,
     #[serde(deserialize_with = "deserialize_dst")]
     pub dst: Destination,
     pub ttl: u8,
@@ -339,6 +341,7 @@ pub fn build_system_message(
     Message {
         routing: Routing {
             src: src.to_string(),
+            src_l2_name: None,
             dst,
             ttl,
             trace_id: trace_id.to_string(),
@@ -550,5 +553,54 @@ where
         Value::String(s) if s == "broadcast" => Ok(Destination::Broadcast),
         Value::String(s) => Ok(Destination::Unicast(s)),
         _ => Err(serde::de::Error::custom("invalid dst")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_system_message_omits_src_l2_name_on_outbound_messages() {
+        let msg = build_system_message(
+            "src-uuid-1",
+            Destination::Unicast("dst-uuid-1".to_string()),
+            16,
+            "trace-1",
+            MSG_ECHO,
+            json!({}),
+        );
+        assert_eq!(msg.routing.src_l2_name, None);
+
+        let encoded = serde_json::to_value(&msg).expect("serialize");
+        let routing = encoded
+            .get("routing")
+            .and_then(Value::as_object)
+            .expect("routing object");
+        assert!(!routing.contains_key("src_l2_name"));
+    }
+
+    #[test]
+    fn routing_parses_router_stamped_src_l2_name() {
+        let raw = json!({
+            "routing": {
+                "src": "src-uuid-1",
+                "src_l2_name": "WF.demo@motherbee",
+                "dst": "dst-uuid-1",
+                "ttl": 16,
+                "trace_id": "trace-1"
+            },
+            "meta": {
+                "type": "system",
+                "msg": "HELLO"
+            },
+            "payload": {}
+        });
+
+        let msg: Message = serde_json::from_value(raw).expect("deserialize message");
+        assert_eq!(
+            msg.routing.src_l2_name.as_deref(),
+            Some("WF.demo@motherbee")
+        );
     }
 }

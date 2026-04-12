@@ -36,9 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "manual step: restart sy-timer before the fire deadline to validate replay/restart:\n  sudo systemctl restart sy-timer"
     );
-    println!(
-        "the example will keep waiting for TIMER_FIRED and then confirm final state."
-    );
+    println!("the example will keep waiting for TIMER_FIRED and then confirm final state.");
 
     let fired_event = timer_example::wait_for_timer_fired(
         &sender,

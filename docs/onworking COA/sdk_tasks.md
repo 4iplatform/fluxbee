@@ -274,3 +274,90 @@ Estado actual después de `RUST-TIMER-SDK-16..20`:
     - [timer_client.rs](/Users/cagostino/Documents/GitHub/fluxbee/examples/timer_client.rs)
     - [timer_recurring.rs](/Users/cagostino/Documents/GitHub/fluxbee/examples/timer_recurring.rs)
     - [timer_restart.rs](/Users/cagostino/Documents/GitHub/fluxbee/examples/timer_restart.rs)
+
+## Backlog explícito - Resolución canónica `L1 UUID -> L2`
+
+Objetivo:
+- eliminar por completo el lookup `uuid -> L2` desde SHM o archivos del lado nodo
+- mover la responsabilidad al router como fuente autoritativa del origen real del mensaje
+- hacer que todo nodo reciba `routing.src` y `routing.src_l2_name` ya estampados por router
+
+Decisión tomada:
+- no queda legacy
+- no se mantiene fallback a `state/nodes`
+- no se mantiene lookup por SHM del lado consumidor
+- el router siempre entrega el mensaje final y por lo tanto es quien debe estampar `src_l2_name`
+
+### L2-LOOKUP-1 - Contrato de envelope
+
+- [x] L2-LOOKUP-1. Extender el envelope wire para incluir `routing.src_l2_name`.
+- [x] L2-LOOKUP-2. Documentar semántica explícita:
+  - `routing.src` sigue siendo UUID/L1 canónico
+  - `routing.src_l2_name` es L2 canónico del origen real
+  - el sender no controla este campo
+  - el router lo limpia y lo vuelve a escribir
+- [x] L2-LOOKUP-3. Actualizar ejemplos del envelope y fixtures base del protocolo.
+
+### L2-LOOKUP-2 - Router como autoridad de identidad
+
+- [ ] L2-LOOKUP-4. Hacer que el router asocie `uuid -> l2_name` de forma estable en la sesión/conexión del peer al aceptar `HELLO` / `ANNOUNCE`.
+- [ ] L2-LOOKUP-5. Estampar `routing.src_l2_name` en toda entrega router -> nodo.
+- [ ] L2-LOOKUP-6. Preservar `routing.src` y `routing.src_l2_name` correctamente en forwarding router -> router -> nodo.
+- [ ] L2-LOOKUP-7. Ignorar o sobrescribir cualquier `src_l2_name` provisto por el sender.
+- [ ] L2-LOOKUP-8. Revisar todos los paths de entrega:
+  - unicast local
+  - system local
+  - respuestas correlacionadas
+  - eventos emitidos por nodos del sistema
+  - forwarding entre routers
+  - errores de transporte (`UNREACHABLE`, `TTL_EXCEEDED`) cuando aplique
+
+### L2-LOOKUP-3 - SDK Rust
+
+- [ ] L2-LOOKUP-9. Extender el envelope/protocol del SDK Rust con `routing.src_l2_name`.
+- [ ] L2-LOOKUP-10. Agregar helper canónico para consumidores:
+  - `message.source_l2_name()`
+- [ ] L2-LOOKUP-11. Reemplazar en el SDK Rust cualquier necesidad futura de lookup por SHM del lado nodo.
+- [ ] L2-LOOKUP-12. Agregar tests de parse/serialize y compatibilidad del nuevo envelope.
+
+### L2-LOOKUP-4 - SDK Go
+
+- [ ] L2-LOOKUP-13. Extender el envelope/protocol del SDK Go con `routing.src_l2_name`.
+- [ ] L2-LOOKUP-14. Agregar helper canónico equivalente para consumidores Go.
+- [ ] L2-LOOKUP-15. Remover el lookup `uuid -> L2` por SHM para mensajes recibidos.
+- [ ] L2-LOOKUP-16. Mantener solo las capacidades de conexión/lifecycle necesarias; el SDK Go deja de exponer resolución de remitente por SHM como camino normal.
+- [ ] L2-LOOKUP-17. Actualizar tests wire y fixtures del SDK Go.
+
+### L2-LOOKUP-5 - Migración de nodos y cleanup
+
+- [ ] L2-LOOKUP-18. Migrar `SY.timer` para usar `routing.src_l2_name` en ownership/auth y eliminar la resolución `routing.src -> L2`.
+- [ ] L2-LOOKUP-19. Inventariar y migrar otros nodos que dependan de lookup de origen a L2.
+- [ ] L2-LOOKUP-20. Eliminar del repo las rutas legacy basadas en:
+  - `state/nodes`
+  - `uuid_persistence_dir` como lookup de remitente
+  - lectura SHM desde consumidores solo para obtener el L2 del origen
+
+### L2-LOOKUP-6 - Test matrix de seguridad y compatibilidad
+
+- [ ] L2-LOOKUP-21. Agregar spoof test:
+  - el sender intenta mandar `src_l2_name` falso
+  - el router lo sobrescribe
+- [ ] L2-LOOKUP-22. Agregar test local end-to-end:
+  - receptor observa `routing.src` UUID correcto
+  - receptor observa `routing.src_l2_name` L2 correcto
+- [ ] L2-LOOKUP-23. Agregar test inter-router end-to-end con preservación del origen real.
+- [ ] L2-LOOKUP-24. Revalidar `SY.timer` con ownership/auth usando exclusivamente `src_l2_name`.
+- [ ] L2-LOOKUP-25. Revalidar compatibilidad SDK Rust / SDK Go con fixtures actualizados del envelope.
+
+Orden recomendado:
+1. `L2-LOOKUP-1..3`
+2. `L2-LOOKUP-4..8`
+3. `L2-LOOKUP-9..17`
+4. `L2-LOOKUP-18..20`
+5. `L2-LOOKUP-21..25`
+
+Resultado esperado:
+- cualquier nodo puede conocer el L2 real del remitente sin hacer lookup propio
+- el router queda como única autoridad del `src_l2_name`
+- SHM deja de ser interfaz pública para nodos
+- desaparece la deuda transversal nacida durante el trabajo de `SY.timer`

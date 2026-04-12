@@ -109,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let msg = Message {
             routing: Routing {
                 src: sender.uuid().to_string(),
+                src_l2_name: None,
                 dst: Destination::Broadcast,
                 ttl: 16,
                 trace_id: Uuid::new_v4().to_string(),
@@ -136,6 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let msg = Message {
                 routing: Routing {
                     src: sender.uuid().to_string(),
+                    src_l2_name: None,
                     dst: Destination::Resolve,
                     ttl: 1,
                     trace_id: Uuid::new_v4().to_string(),
@@ -173,6 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let msg = Message {
             routing: Routing {
                 src: sender.uuid().to_string(),
+                src_l2_name: None,
                 dst: dst.clone(),
                 ttl: 1,
                 trace_id: Uuid::new_v4().to_string(),

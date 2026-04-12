@@ -194,6 +194,7 @@ mod tests {
         Message {
             routing: Routing {
                 src: "src-node".to_string(),
+                src_l2_name: None,
                 dst: Destination::Unicast("dst-node".to_string()),
                 ttl: 16,
                 trace_id: Uuid::new_v4().to_string(),

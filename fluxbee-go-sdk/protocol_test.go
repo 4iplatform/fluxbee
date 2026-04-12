@@ -81,4 +81,29 @@ func TestBuildSystemBroadcastUsesBroadcastDestination(t *testing.T) {
 	if msg.Routing.TTL != 2 {
 		t.Fatalf("unexpected ttl: %d", msg.Routing.TTL)
 	}
+	if msg.Routing.SrcL2Name != nil {
+		t.Fatalf("outbound message must not set src_l2_name: %+v", msg.Routing)
+	}
+}
+
+func TestRoutingSrcL2NameRoundtrip(t *testing.T) {
+	raw := []byte(`{
+		"routing": {
+			"src": "src-uuid-1",
+			"src_l2_name": "WF.demo@motherbee",
+			"dst": "dst-uuid-1",
+			"ttl": 16,
+			"trace_id": "trace-1"
+		},
+		"meta": { "type": "system", "msg": "HELLO" },
+		"payload": {}
+	}`)
+
+	var msg Message
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		t.Fatalf("unmarshal message: %v", err)
+	}
+	if msg.Routing.SrcL2Name == nil || *msg.Routing.SrcL2Name != "WF.demo@motherbee" {
+		t.Fatalf("unexpected src_l2_name: %+v", msg.Routing)
+	}
 }

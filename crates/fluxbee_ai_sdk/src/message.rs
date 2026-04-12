@@ -10,6 +10,7 @@ pub fn build_reply_routing(msg: &Message, src_uuid: &str) -> Routing {
 
     Routing {
         src: src_uuid.to_string(),
+        src_l2_name: None,
         dst,
         ttl: msg.routing.ttl.max(1),
         trace_id: msg.routing.trace_id.clone(),

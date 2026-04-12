@@ -644,12 +644,14 @@ impl<'a> TimerClient<'a> {
         normalize_schedule_payload(&mut payload);
         validate_schedule_payload(&payload, MSG_TIMER_SCHEDULE)?;
         let response = self
-            .call_ok_response(MSG_TIMER_SCHEDULE, serde_json::to_value(payload)?, self.rpc_timeout)
+            .call_ok_response(
+                MSG_TIMER_SCHEDULE,
+                serde_json::to_value(payload)?,
+                self.rpc_timeout,
+            )
             .await?;
         response.timer_uuid.ok_or_else(|| {
-            TimerClientError::ContractViolation(
-                "timer response missing timer_uuid".to_string(),
-            )
+            TimerClientError::ContractViolation("timer response missing timer_uuid".to_string())
         })
     }
 
@@ -677,9 +679,7 @@ impl<'a> TimerClient<'a> {
             )
             .await?;
         response.timer_uuid.ok_or_else(|| {
-            TimerClientError::ContractViolation(
-                "timer response missing timer_uuid".to_string(),
-            )
+            TimerClientError::ContractViolation("timer response missing timer_uuid".to_string())
         })
     }
 
@@ -693,7 +693,11 @@ impl<'a> TimerClient<'a> {
             ..TimerGetPayload::default()
         };
         let response: TimerGetResponse = self
-            .call_decode(MSG_TIMER_GET, serde_json::to_value(payload)?, self.rpc_timeout)
+            .call_decode(
+                MSG_TIMER_GET,
+                serde_json::to_value(payload)?,
+                self.rpc_timeout,
+            )
             .await?;
         Ok(response.timer)
     }
@@ -704,8 +708,12 @@ impl<'a> TimerClient<'a> {
     ) -> Result<TimerListResponse, TimerClientError> {
         normalize_list_filter(&mut filter);
         validate_list_filter(&filter)?;
-        self.call_decode(MSG_TIMER_LIST, serde_json::to_value(filter)?, self.rpc_timeout)
-            .await
+        self.call_decode(
+            MSG_TIMER_LIST,
+            serde_json::to_value(filter)?,
+            self.rpc_timeout,
+        )
+        .await
     }
 
     pub async fn list_mine(
@@ -726,8 +734,12 @@ impl<'a> TimerClient<'a> {
             timer_uuid: validate_timer_id(timer_id.into())?,
             ..TimerCancelPayload::default()
         };
-        self.call_ok_response(MSG_TIMER_CANCEL, serde_json::to_value(payload)?, self.rpc_timeout)
-            .await
+        self.call_ok_response(
+            MSG_TIMER_CANCEL,
+            serde_json::to_value(payload)?,
+            self.rpc_timeout,
+        )
+        .await
     }
 
     pub async fn reschedule(
@@ -778,13 +790,13 @@ impl<'a> TimerClient<'a> {
                 Err(err) => return Err(err),
             }
         }
-        Err(last_error.unwrap_or_else(|| {
-            TimerClientError::ServiceError {
+        Err(
+            last_error.unwrap_or_else(|| TimerClientError::ServiceError {
                 verb: verb.to_string(),
                 code: "TIMER_UNREACHABLE".to_string(),
                 message: "SY.timer did not respond after retry schedule".to_string(),
-            }
-        }))
+            }),
+        )
     }
 
     async fn call_decode<T>(
@@ -882,9 +894,7 @@ impl<'a> TimerClient<'a> {
 }
 
 impl TimerTestHarness {
-    pub fn new(
-        full_name: &str,
-    ) -> (NodeSender, NodeReceiver, Self) {
+    pub fn new(full_name: &str) -> (NodeSender, NodeReceiver, Self) {
         let (outbound_tx, outbound_rx) = mpsc::channel(16);
         let (inbound_tx, inbound_rx) = mpsc::channel(16);
         let state = Arc::new(ConnectionState::new_connected());
@@ -907,11 +917,11 @@ impl TimerTestHarness {
     }
 
     pub async fn next_request(&mut self) -> Result<Message, TimerClientError> {
-        let frame = self
-            .outbound_rx
-            .recv()
-            .await
-            .ok_or_else(|| TimerClientError::ContractViolation("timer test harness outbound queue closed".to_string()))?;
+        let frame = self.outbound_rx.recv().await.ok_or_else(|| {
+            TimerClientError::ContractViolation(
+                "timer test harness outbound queue closed".to_string(),
+            )
+        })?;
         Ok(serde_json::from_slice(&frame)?)
     }
 
@@ -930,6 +940,7 @@ impl TimerTestHarness {
         self.send_message(Message {
             routing: Routing {
                 src: "timer-node-uuid".to_string(),
+                src_l2_name: None,
                 dst: Destination::Unicast(request.routing.src.clone()),
                 ttl: 16,
                 trace_id: request.routing.trace_id.clone(),
@@ -945,14 +956,11 @@ impl TimerTestHarness {
         .await
     }
 
-    pub async fn send_unreachable(
-        &self,
-        request: &Message,
-        reason: &str,
-    ) -> Result<(), NodeError> {
+    pub async fn send_unreachable(&self, request: &Message, reason: &str) -> Result<(), NodeError> {
         self.send_message(Message {
             routing: Routing {
                 src: "router".to_string(),
+                src_l2_name: None,
                 dst: Destination::Unicast(request.routing.src.clone()),
                 ttl: 1,
                 trace_id: request.routing.trace_id.clone(),
@@ -979,6 +987,7 @@ impl TimerTestHarness {
         self.send_message(Message {
             routing: Routing {
                 src: "SY.timer@motherbee".to_string(),
+                src_l2_name: Some("SY.timer@motherbee".to_string()),
                 dst: Destination::Unicast(dst_uuid.to_string()),
                 ttl: 16,
                 trace_id: trace_id.to_string(),
@@ -1159,9 +1168,7 @@ fn local_timer_node_name(full_name: &str) -> Result<String, TimerClientError> {
         ));
     }
     let (_, hive_id) = full_name.split_once('@').ok_or_else(|| {
-        TimerClientError::InvalidRequest(
-            "sender full name must include hive suffix".to_string(),
-        )
+        TimerClientError::InvalidRequest("sender full name must include hive suffix".to_string())
     })?;
     timer_node_name(hive_id)
 }
@@ -1175,7 +1182,10 @@ fn default_rpc_timeout(timeout: Duration) -> Duration {
 }
 
 fn normalized_time_retry_schedule(schedule: Vec<Duration>) -> Vec<Duration> {
-    let normalized: Vec<_> = schedule.into_iter().filter(|timeout| !timeout.is_zero()).collect();
+    let normalized: Vec<_> = schedule
+        .into_iter()
+        .filter(|timeout| !timeout.is_zero())
+        .collect();
     if normalized.is_empty() {
         TIMER_DEFAULT_TIME_RETRY_SCHEDULE_MS
             .into_iter()
@@ -1296,9 +1306,7 @@ fn validate_recurring_payload(
     Ok(())
 }
 
-fn validate_reschedule_payload(
-    payload: &TimerReschedulePayload,
-) -> Result<(), TimerClientError> {
+fn validate_reschedule_payload(payload: &TimerReschedulePayload) -> Result<(), TimerClientError> {
     validate_timer_id(payload.timer_uuid.clone())?;
     let has_absolute = payload.new_fire_at_utc_ms.is_some();
     let has_relative = payload.new_fire_in_ms.is_some();
@@ -1368,16 +1376,14 @@ fn validate_missed_policy(
         MissedPolicy::Fire | MissedPolicy::Drop => {
             if missed_within_ms.is_some() {
                 return Err(TimerClientError::InvalidRequest(
-                    "missed_within_ms is only valid with missed_policy=fire_if_within"
-                        .to_string(),
+                    "missed_within_ms is only valid with missed_policy=fire_if_within".to_string(),
                 ));
             }
         }
         MissedPolicy::FireIfWithin => {
             if missed_within_ms.unwrap_or_default() == 0 {
                 return Err(TimerClientError::InvalidRequest(
-                    "missed_within_ms must be set when missed_policy=fire_if_within"
-                        .to_string(),
+                    "missed_within_ms must be set when missed_policy=fire_if_within".to_string(),
                 ));
             }
         }
@@ -1503,7 +1509,9 @@ mod tests {
         let msg = build_timer_system_request("src-uuid", "motherbee", MSG_TIMER_NOW, json!({}))
             .expect("build timer request");
         assert_eq!(msg.routing.src, "src-uuid");
-        assert!(matches!(msg.routing.dst, Destination::Unicast(ref dst) if dst == "SY.timer@motherbee"));
+        assert!(
+            matches!(msg.routing.dst, Destination::Unicast(ref dst) if dst == "SY.timer@motherbee")
+        );
         assert_eq!(msg.routing.ttl, 1);
         assert_eq!(msg.meta.msg_type, SYSTEM_KIND);
         assert_eq!(msg.meta.msg.as_deref(), Some(MSG_TIMER_NOW));
@@ -1515,6 +1523,7 @@ mod tests {
         let message = Message {
             routing: Routing {
                 src: "src".to_string(),
+                src_l2_name: None,
                 dst: Destination::Broadcast,
                 ttl: 1,
                 trace_id: "trace".to_string(),
@@ -1545,10 +1554,7 @@ mod tests {
             &sender,
             &mut receiver,
             TimerClientConfig {
-                time_retry_schedule: vec![
-                    Duration::from_millis(10),
-                    Duration::from_millis(20),
-                ],
+                time_retry_schedule: vec![Duration::from_millis(10), Duration::from_millis(20)],
                 ..TimerClientConfig::default()
             },
         )

@@ -133,10 +133,7 @@ async fn schedule_and_inspect(
     println!(
         "list_mine count={} contains_timer={}",
         listed.count,
-        listed
-            .timers
-            .iter()
-            .any(|timer| timer.uuid == timer_id)
+        listed.timers.iter().any(|timer| timer.uuid == timer_id)
     );
 
     Ok(timer_id)
@@ -205,9 +202,7 @@ async fn wait_for_timer_fired(
             Err(_) => {
                 println!(
                     "ignoring message kind={} msg={:?} trace_id={}",
-                    incoming.meta.msg_type,
-                    incoming.meta.msg,
-                    incoming.routing.trace_id
+                    incoming.meta.msg_type, incoming.meta.msg, incoming.routing.trace_id
                 );
             }
         }

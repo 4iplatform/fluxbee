@@ -12,10 +12,11 @@ type Message struct {
 }
 
 type Routing struct {
-	Src     string      `json:"src"`
-	Dst     Destination `json:"dst"`
-	TTL     uint8       `json:"ttl"`
-	TraceID string      `json:"trace_id"`
+	Src       string      `json:"src"`
+	SrcL2Name *string     `json:"src_l2_name,omitempty"`
+	Dst       Destination `json:"dst"`
+	TTL       uint8       `json:"ttl"`
+	TraceID   string      `json:"trace_id"`
 }
 
 type destinationKind uint8

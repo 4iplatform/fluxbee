@@ -2,8 +2,8 @@
 mod timer_example;
 
 use fluxbee_sdk::{
-    TimerClient, TimerClientConfig, TimerId, TimerInfo, TimerScheduleRecurringPayload,
-    TimerStatus, TimerStatusFilter,
+    TimerClient, TimerClientConfig, TimerId, TimerInfo, TimerScheduleRecurringPayload, TimerStatus,
+    TimerStatusFilter,
 };
 use serde_json::json;
 use tokio::time::{sleep, Duration};
@@ -48,9 +48,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fired_event.is_last_fire,
     );
 
-    let requeued_state =
-        wait_for_recurring_requeued_state(&sender, &mut receiver, &timer_id, fired_event.actual_fire_at_utc_ms)
-            .await?;
+    let requeued_state = wait_for_recurring_requeued_state(
+        &sender,
+        &mut receiver,
+        &timer_id,
+        fired_event.actual_fire_at_utc_ms,
+    )
+    .await?;
     println!(
         "confirmed recurring timer requeued uuid={} status={:?} fire_count={} next_fire_at_utc_ms={}",
         requeued_state.uuid.as_str(),
@@ -60,7 +64,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     cancel_and_confirm(&sender, &mut receiver, &timer_id).await?;
-    println!("confirmed recurring timer canceled uuid={}", timer_id.as_str());
+    println!(
+        "confirmed recurring timer canceled uuid={}",
+        timer_id.as_str()
+    );
 
     Ok(())
 }
@@ -159,7 +166,9 @@ async fn wait_for_recurring_requeued_state(
     Err(format!(
         "recurring timer {} did not converge to requeued pending state; last_state={:?}",
         timer_id.as_str(),
-        last_info.as_ref().map(|value| (value.status, value.fire_count, value.fire_at_utc_ms))
+        last_info
+            .as_ref()
+            .map(|value| (value.status, value.fire_count, value.fire_at_utc_ms))
     )
     .into())
 }
@@ -186,5 +195,9 @@ async fn cancel_and_confirm(
             return Ok(());
         }
     }
-    Err(format!("recurring timer {} did not converge to canceled state", timer_id.as_str()).into())
+    Err(format!(
+        "recurring timer {} did not converge to canceled state",
+        timer_id.as_str()
+    )
+    .into())
 }

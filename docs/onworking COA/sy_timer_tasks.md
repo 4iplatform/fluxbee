@@ -449,7 +449,7 @@ Current status:
 - [x] SYT-S11-T5. Unit tests for time conversion/parse/format operations.
 - [x] SYT-S11-T6. Integration tests for schedule -> fire -> recurrent reschedule path.
 - [x] SYT-S11-T7. Restart/replay tests against persisted SQLite.
-- [ ] SYT-S11-T8. Orchestrator teardown test for `TIMER_PURGE_OWNER`.
+- [x] SYT-S11-T8. Orchestrator teardown test for `TIMER_PURGE_OWNER`.
 - [x] SYT-S11-T9. Go SDK tests for all currently implemented typed client helpers.
 
 Manual live validation now also exists through Rust examples:
@@ -457,6 +457,7 @@ Manual live validation now also exists through Rust examples:
 - [examples/timer_client.rs](/Users/cagostino/Documents/GitHub/fluxbee/examples/timer_client.rs) for one-shot schedule -> fire -> final state
 - [examples/timer_recurring.rs](/Users/cagostino/Documents/GitHub/fluxbee/examples/timer_recurring.rs) for recurring first fire -> requeue -> cancel cleanup
 - [examples/timer_restart.rs](/Users/cagostino/Documents/GitHub/fluxbee/examples/timer_restart.rs) for replay/restart validation with a manual `sy-timer` restart between schedule and fire
+- orchestrator teardown coverage now includes the `TIMER_PURGE_OWNER` cleanup hook and validates both successful purge payload mapping and relay failure surfacing in [sy_orchestrator.rs](/Users/cagostino/Documents/GitHub/fluxbee/src/bin/sy_orchestrator.rs)
 
 ---
 

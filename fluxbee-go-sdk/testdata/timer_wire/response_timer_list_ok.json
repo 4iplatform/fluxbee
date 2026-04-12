@@ -1,6 +1,7 @@
 {
   "routing": {
     "src": "timer-node-uuid",
+    "src_l2_name": "SY.timer@motherbee",
     "dst": "src-uuid-1",
     "ttl": 16,
     "trace_id": "trace-list-1"

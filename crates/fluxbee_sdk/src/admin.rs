@@ -135,6 +135,7 @@ pub async fn admin_command(
     let msg = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(admin_target.to_string()),
             ttl: 16,
             trace_id: trace_id.clone(),
@@ -352,6 +353,7 @@ mod tests {
         Message {
             routing: Routing {
                 src: "src".to_string(),
+                src_l2_name: None,
                 dst: Destination::Unicast("dst".to_string()),
                 ttl: 16,
                 trace_id: "trace-test".to_string(),

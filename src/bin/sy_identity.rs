@@ -2996,6 +2996,7 @@ async fn send_system_response(
     let reply = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(request.routing.src.clone()),
             ttl: 16,
             trace_id: request.routing.trace_id.clone(),

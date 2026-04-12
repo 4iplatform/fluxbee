@@ -14,13 +14,13 @@ func TestTimerWireScheduleRequestMatchesGoldenFixture(t *testing.T) {
 		"SY.timer@motherbee",
 		"TIMER_SCHEDULE",
 		map[string]any{
-			"fire_in_ms":      int64(120000),
-			"target_l2_name":  "WF.demo@motherbee",
-			"client_ref":      "demo-timeout",
-			"payload":         map[string]any{"kind": "timeout"},
-			"missed_policy":   "fire_if_within",
+			"fire_in_ms":       int64(120000),
+			"target_l2_name":   "WF.demo@motherbee",
+			"client_ref":       "demo-timeout",
+			"payload":          map[string]any{"kind": "timeout"},
+			"missed_policy":    "fire_if_within",
 			"missed_within_ms": int64(600000),
-			"metadata":        map[string]any{"note": "created by fixture"},
+			"metadata":         map[string]any{"note": "created by fixture"},
 		},
 		"trace-schedule-1",
 		SystemEnvelopeOptions{},
@@ -113,6 +113,11 @@ func TestTimerWireGoldenFixturesUseRustProtocolEnvelopeFields(t *testing.T) {
 		}
 		if _, exists := routing["trace_id"]; !exists {
 			t.Fatalf("%s missing routing.trace_id", name)
+		}
+		if name != "request_schedule_in.json" {
+			if _, exists := routing["src_l2_name"]; !exists {
+				t.Fatalf("%s missing routing.src_l2_name", name)
+			}
 		}
 	}
 }

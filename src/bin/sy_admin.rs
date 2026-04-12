@@ -524,6 +524,7 @@ async fn broadcast_config_changed(
     let msg = Message {
         routing: Routing {
             src: client.sender.uuid().to_string(),
+            src_l2_name: None,
             dst,
             ttl: 16,
             trace_id: Uuid::new_v4().to_string(),
@@ -774,6 +775,7 @@ async fn send_admin_command_response(
     let response = Message {
         routing: Routing {
             src: client.sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(request_msg.routing.src.clone()),
             ttl: 16,
             trace_id: request_msg.routing.trace_id.clone(),
@@ -2317,15 +2319,20 @@ async fn handle_hive_paths(
         }
         ("GET", ["timer", "timers"]) => {
             let mut payload = serde_json::json!({});
-            if let Some(owner_l2_name) = query.get("owner_l2_name").filter(|value| !value.is_empty())
+            if let Some(owner_l2_name) =
+                query.get("owner_l2_name").filter(|value| !value.is_empty())
             {
                 payload["owner_l2_name"] = serde_json::json!(owner_l2_name);
             }
-            if let Some(status_filter) = query.get("status_filter").filter(|value| !value.is_empty())
+            if let Some(status_filter) =
+                query.get("status_filter").filter(|value| !value.is_empty())
             {
                 payload["status_filter"] = serde_json::json!(status_filter);
             }
-            if let Some(limit) = query.get("limit").and_then(|value| value.parse::<u64>().ok()) {
+            if let Some(limit) = query
+                .get("limit")
+                .and_then(|value| value.parse::<u64>().ok())
+            {
                 payload["limit"] = serde_json::json!(limit);
             }
             let (status, resp) =
@@ -2381,8 +2388,7 @@ async fn handle_hive_paths(
                 serde_json::from_slice(body)?
             };
             let (status, resp) =
-                handle_timer_rpc(ctx, client, "timer_parse", "TIMER_PARSE", payload, hive)
-                    .await?;
+                handle_timer_rpc(ctx, client, "timer_parse", "TIMER_PARSE", payload, hive).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["timer", "format"]) => {
@@ -3818,16 +3824,8 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             "IANA timezone name, for example America/Argentina/Buenos_Aires.",
         )],
         "timer_convert" => vec![
-            admin_action_body_field(
-                "instant_utc_ms",
-                "i64",
-                "UTC instant in unix milliseconds.",
-            ),
-            admin_action_body_field(
-                "to_tz",
-                "string",
-                "IANA timezone name to convert into.",
-            ),
+            admin_action_body_field("instant_utc_ms", "i64", "UTC instant in unix milliseconds."),
+            admin_action_body_field("to_tz", "string", "IANA timezone name to convert into."),
         ],
         "timer_parse" => vec![
             admin_action_body_field("input", "string", "Input date/time text to parse."),
@@ -3835,11 +3833,7 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field("tz", "string", "IANA timezone applied to the parsed input."),
         ],
         "timer_format" => vec![
-            admin_action_body_field(
-                "instant_utc_ms",
-                "i64",
-                "UTC instant in unix milliseconds.",
-            ),
+            admin_action_body_field("instant_utc_ms", "i64", "UTC instant in unix milliseconds."),
             admin_action_body_field("layout", "string", "Go time layout used for formatting."),
             admin_action_body_field("tz", "string", "IANA timezone used for rendering."),
         ],
@@ -4521,6 +4515,7 @@ async fn handle_send_node_message(
     let message = Message {
         routing: Routing {
             src: client.sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(node_name.clone()),
             ttl,
             trace_id: trace_id.clone(),
@@ -5154,6 +5149,7 @@ async fn send_admin_request(
     let msg = Message {
         routing: Routing {
             src: client.sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(dst.clone()),
             ttl: 16,
             trace_id: trace_id.clone(),
@@ -5240,6 +5236,7 @@ async fn send_system_request_with_meta(
     let msg = Message {
         routing: Routing {
             src: client.sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(target.to_string()),
             ttl,
             trace_id: trace_id.clone(),
@@ -5647,6 +5644,7 @@ async fn send_opa_query(
     let msg = Message {
         routing: Routing {
             src: client.sender.uuid().to_string(),
+            src_l2_name: None,
             dst,
             ttl: 16,
             trace_id: Uuid::new_v4().to_string(),
@@ -6108,6 +6106,7 @@ mod tests {
         tx.send(Message {
             routing: Routing {
                 src: "SY.opa.rules@motherbee".to_string(),
+                src_l2_name: Some("SY.opa.rules@motherbee".to_string()),
                 dst: Destination::Unicast("SY.admin@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-opa-config".to_string(),
@@ -6145,6 +6144,7 @@ mod tests {
         tx.send(Message {
             routing: Routing {
                 src: "SY.opa.rules@motherbee".to_string(),
+                src_l2_name: Some("SY.opa.rules@motherbee".to_string()),
                 dst: Destination::Unicast("SY.admin@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-opa-query".to_string(),
