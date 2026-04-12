@@ -240,17 +240,37 @@ Estado actual del cliente Rust `SY.timer`:
 
 ### RUST-TIMER-SDK - Tests y compatibilidad
 
-- [ ] RUST-TIMER-SDK-16. Agregar tests unitarios de serialize/deserialize del contrato.
-- [ ] RUST-TIMER-SDK-17. Agregar golden tests o fixtures wire compatibles con `SY.timer`.
-- [ ] RUST-TIMER-SDK-18. Cruzar compatibilidad semántica con el cliente Go para:
+- [x] RUST-TIMER-SDK-16. Agregar tests unitarios de serialize/deserialize del contrato.
+- [x] RUST-TIMER-SDK-17. Agregar golden tests o fixtures wire compatibles con `SY.timer`.
+- [x] RUST-TIMER-SDK-18. Cruzar compatibilidad semántica con el cliente Go para:
   - errores
   - helpers de tiempo
   - responses de list/get/schedule
-- [ ] RUST-TIMER-SDK-19. Agregar un cliente fake/test harness para nodos Rust que quieran testear lógica basada en tiempo sin depender de un hive real.
-- [ ] RUST-TIMER-SDK-20. Documentar ejemplos mínimos de uso desde nodos Rust y workflows Rust.
+- [x] RUST-TIMER-SDK-19. Agregar un cliente fake/test harness para nodos Rust que quieran testear lógica basada en tiempo sin depender de un hive real.
+- [x] RUST-TIMER-SDK-20. Documentar ejemplos mínimos de uso desde nodos Rust y workflows Rust.
 
 ### Notas de alcance
 
 - Esto no obliga a que `SY.admin` o `SY.orchestrator` usen el cliente Rust de `SY.timer` de inmediato.
 - El primer objetivo es que el SDK Rust tenga paridad suficiente para cualquier consumidor Rust nuevo.
 - Después de eso recién conviene evaluar adopciones puntuales en bins existentes.
+
+Estado actual después de `RUST-TIMER-SDK-16..20`:
+
+- tests de contrato y compatibilidad agregados en [timer.rs](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/timer.rs):
+  - serialize/deserialize de ids / enums / responses
+  - retry schedule de time ops alineada con Go
+  - parse de fixtures wire compartidas con el SDK Go
+- compatibilidad wire anclada a los fixtures ya usados por `fluxbee-go-sdk`:
+  - [request_schedule_in.json](/Users/cagostino/Documents/GitHub/fluxbee/fluxbee-go-sdk/testdata/timer_wire/request_schedule_in.json)
+  - [response_timer_list_ok.json](/Users/cagostino/Documents/GitHub/fluxbee/fluxbee-go-sdk/testdata/timer_wire/response_timer_list_ok.json)
+  - [response_timer_error.json](/Users/cagostino/Documents/GitHub/fluxbee/fluxbee-go-sdk/testdata/timer_wire/response_timer_error.json)
+  - [event_timer_fired.json](/Users/cagostino/Documents/GitHub/fluxbee/fluxbee-go-sdk/testdata/timer_wire/event_timer_fired.json)
+- harness público disponible para tests de nodos Rust sin hive real:
+  - `TimerTestHarness` en [timer.rs](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/timer.rs)
+- documentación/descubrimiento mínimo disponible vía:
+  - module docs en [timer.rs](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/timer.rs)
+  - examples vivos:
+    - [timer_client.rs](/Users/cagostino/Documents/GitHub/fluxbee/examples/timer_client.rs)
+    - [timer_recurring.rs](/Users/cagostino/Documents/GitHub/fluxbee/examples/timer_recurring.rs)
+    - [timer_restart.rs](/Users/cagostino/Documents/GitHub/fluxbee/examples/timer_restart.rs)

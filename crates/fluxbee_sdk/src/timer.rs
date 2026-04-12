@@ -1,15 +1,28 @@
+//! Typed SDK support for [`SY.timer`](crate::timer::TIMER_NODE_KIND).
+//!
+//! Minimal live examples are available in:
+//! - `examples/timer_client.rs`
+//! - `examples/timer_recurring.rs`
+//! - `examples/timer_restart.rs`
+//!
+//! For unit tests that should not depend on a real hive, use [`TimerTestHarness`]
+//! to drive a real [`TimerClient`] over a scripted in-memory transport.
+
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant as TokioInstant};
 use uuid::Uuid;
 
 use crate::protocol::{
-    build_system_message, Destination, Message, TtlExceededPayload,
+    build_system_message, Destination, Message, Meta, Routing, TtlExceededPayload,
     UnreachablePayload, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
+use crate::split::{ConnectionInfo, ConnectionState};
 use crate::{NodeError, NodeReceiver, NodeSender};
 
 pub const TIMER_NODE_KIND: &str = "SY.timer";
@@ -506,6 +519,13 @@ pub struct TimerClient<'a> {
     time_retry_schedule: Vec<Duration>,
 }
 
+/// Scripted in-memory transport for testing [`TimerClient`] and timer-aware Rust nodes
+/// without a live hive or a running `SY.timer`.
+pub struct TimerTestHarness {
+    outbound_rx: mpsc::Receiver<Vec<u8>>,
+    inbound_tx: mpsc::Sender<Result<Message, NodeError>>,
+}
+
 impl<'a> TimerClient<'a> {
     pub fn new(
         sender: &'a NodeSender,
@@ -858,6 +878,120 @@ impl<'a> TimerClient<'a> {
                 return Ok(incoming);
             }
         }
+    }
+}
+
+impl TimerTestHarness {
+    pub fn new(
+        full_name: &str,
+    ) -> (NodeSender, NodeReceiver, Self) {
+        let (outbound_tx, outbound_rx) = mpsc::channel(16);
+        let (inbound_tx, inbound_rx) = mpsc::channel(16);
+        let state = Arc::new(ConnectionState::new_connected());
+        let info = Arc::new(ConnectionInfo::new(
+            "src-uuid".to_string(),
+            full_name.to_string(),
+            7,
+            state,
+        ));
+        let sender = NodeSender::new(outbound_tx, Arc::clone(&info));
+        let receiver = NodeReceiver::new(inbound_rx, info);
+        (
+            sender,
+            receiver,
+            Self {
+                outbound_rx,
+                inbound_tx,
+            },
+        )
+    }
+
+    pub async fn next_request(&mut self) -> Result<Message, TimerClientError> {
+        let frame = self
+            .outbound_rx
+            .recv()
+            .await
+            .ok_or_else(|| TimerClientError::ContractViolation("timer test harness outbound queue closed".to_string()))?;
+        Ok(serde_json::from_slice(&frame)?)
+    }
+
+    pub async fn send_message(&self, message: Message) -> Result<(), NodeError> {
+        self.inbound_tx
+            .send(Ok(message))
+            .await
+            .map_err(|_| NodeError::Disconnected)
+    }
+
+    pub async fn send_timer_response(
+        &self,
+        request: &Message,
+        payload: Value,
+    ) -> Result<(), NodeError> {
+        self.send_message(Message {
+            routing: Routing {
+                src: "timer-node-uuid".to_string(),
+                dst: Destination::Unicast(request.routing.src.clone()),
+                ttl: 16,
+                trace_id: request.routing.trace_id.clone(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(MSG_TIMER_RESPONSE.to_string()),
+                action: Some(MSG_TIMER_RESPONSE.to_string()),
+                ..Meta::default()
+            },
+            payload,
+        })
+        .await
+    }
+
+    pub async fn send_unreachable(
+        &self,
+        request: &Message,
+        reason: &str,
+    ) -> Result<(), NodeError> {
+        self.send_message(Message {
+            routing: Routing {
+                src: "router".to_string(),
+                dst: Destination::Unicast(request.routing.src.clone()),
+                ttl: 1,
+                trace_id: request.routing.trace_id.clone(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(MSG_UNREACHABLE.to_string()),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({
+                "original_dst": request.routing.dst,
+                "reason": reason,
+            }),
+        })
+        .await
+    }
+
+    pub async fn send_timer_fired(
+        &self,
+        dst_uuid: &str,
+        trace_id: &str,
+        event: &FiredEvent,
+    ) -> Result<(), NodeError> {
+        self.send_message(Message {
+            routing: Routing {
+                src: "SY.timer@motherbee".to_string(),
+                dst: Destination::Unicast(dst_uuid.to_string()),
+                ttl: 16,
+                trace_id: trace_id.to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(MSG_TIMER_FIRED.to_string()),
+                action: Some(MSG_TIMER_FIRED.to_string()),
+                ..Meta::default()
+            },
+            payload: serde_json::to_value(event).map_err(NodeError::Json)?,
+        })
+        .await
     }
 }
 
@@ -1309,6 +1443,7 @@ mod tests {
     use super::*;
     use crate::protocol::{Meta, Routing};
     use serde_json::json;
+    use std::path::PathBuf;
 
     #[test]
     fn timer_id_serializes_transparently() {
@@ -1321,6 +1456,19 @@ mod tests {
         let encoded =
             serde_json::to_string(&TimerStatusFilter::Pending).expect("serialize status filter");
         assert_eq!(encoded, "\"pending\"");
+    }
+
+    #[test]
+    fn timer_default_time_retry_schedule_matches_go_semantics() {
+        let schedule = normalized_time_retry_schedule(vec![]);
+        assert_eq!(
+            schedule,
+            vec![
+                Duration::from_millis(100),
+                Duration::from_millis(300),
+                Duration::from_millis(1_000),
+            ]
+        );
     }
 
     #[test]
@@ -1384,7 +1532,7 @@ mod tests {
 
     #[test]
     fn timer_client_new_derives_local_target() {
-        let (sender, mut receiver, _, _) = test_transport("WF.demo@motherbee");
+        let (sender, mut receiver, _) = TimerTestHarness::new("WF.demo@motherbee");
         let client = TimerClient::new(&sender, &mut receiver, TimerClientConfig::default())
             .expect("new timer client");
         assert_eq!(client.target(), "SY.timer@motherbee");
@@ -1392,8 +1540,7 @@ mod tests {
 
     #[tokio::test]
     async fn timer_client_now_retries_after_unreachable() {
-        let (sender, mut receiver, mut outbound_rx, inbound_tx) =
-            test_transport("WF.demo@motherbee");
+        let (sender, mut receiver, mut harness) = TimerTestHarness::new("WF.demo@motherbee");
         let mut client = TimerClient::new(
             &sender,
             &mut receiver,
@@ -1408,47 +1555,25 @@ mod tests {
         .expect("new timer client");
 
         tokio::spawn(async move {
-            let first = next_request(&mut outbound_rx).await;
-            let unreachable = Message {
-                routing: Routing {
-                    src: "router".to_string(),
-                    dst: Destination::Unicast(first.routing.src.clone()),
-                    ttl: 1,
-                    trace_id: first.routing.trace_id.clone(),
-                },
-                meta: Meta {
-                    msg_type: SYSTEM_KIND.to_string(),
-                    msg: Some(MSG_UNREACHABLE.to_string()),
-                    ..Meta::default()
-                },
-                payload: json!({
-                    "original_dst": "SY.timer@motherbee",
-                    "reason": "temporary"
-                }),
-            };
-            inbound_tx.send(Ok(unreachable)).await.expect("send unreachable");
+            let first = harness.next_request().await.expect("first request");
+            harness
+                .send_unreachable(&first, "temporary")
+                .await
+                .expect("send unreachable");
 
-            let second = next_request(&mut outbound_rx).await;
-            let response = Message {
-                routing: Routing {
-                    src: "timer-uuid".to_string(),
-                    dst: Destination::Unicast(second.routing.src.clone()),
-                    ttl: 1,
-                    trace_id: second.routing.trace_id.clone(),
-                },
-                meta: Meta {
-                    msg_type: SYSTEM_KIND.to_string(),
-                    msg: Some(MSG_TIMER_RESPONSE.to_string()),
-                    ..Meta::default()
-                },
-                payload: json!({
-                    "ok": true,
-                    "verb": "TIMER_NOW",
-                    "now_utc_ms": 1775577600000_i64,
-                    "now_utc_iso": "2026-04-06T12:00:00Z"
-                }),
-            };
-            inbound_tx.send(Ok(response)).await.expect("send timer response");
+            let second = harness.next_request().await.expect("second request");
+            harness
+                .send_timer_response(
+                    &second,
+                    json!({
+                        "ok": true,
+                        "verb": "TIMER_NOW",
+                        "now_utc_ms": 1775577600000_i64,
+                        "now_utc_iso": "2026-04-06T12:00:00Z"
+                    }),
+                )
+                .await
+                .expect("send timer response");
         });
 
         let result = client.now().await.expect("timer now");
@@ -1458,7 +1583,7 @@ mod tests {
 
     #[tokio::test]
     async fn timer_client_schedule_in_rejects_below_minimum() {
-        let (sender, mut receiver, _, _) = test_transport("WF.demo@motherbee");
+        let (sender, mut receiver, _) = TimerTestHarness::new("WF.demo@motherbee");
         let mut client = TimerClient::new(&sender, &mut receiver, TimerClientConfig::default())
             .expect("new timer client");
 
@@ -1474,42 +1599,33 @@ mod tests {
 
     #[tokio::test]
     async fn timer_client_get_parses_timer_info() {
-        let (sender, mut receiver, mut outbound_rx, inbound_tx) =
-            test_transport("WF.demo@motherbee");
+        let (sender, mut receiver, mut harness) = TimerTestHarness::new("WF.demo@motherbee");
         let mut client = TimerClient::new(&sender, &mut receiver, TimerClientConfig::default())
             .expect("new timer client");
 
         tokio::spawn(async move {
-            let request = next_request(&mut outbound_rx).await;
-            let response = Message {
-                routing: Routing {
-                    src: "timer-uuid".to_string(),
-                    dst: Destination::Unicast(request.routing.src.clone()),
-                    ttl: 1,
-                    trace_id: request.routing.trace_id.clone(),
-                },
-                meta: Meta {
-                    msg_type: SYSTEM_KIND.to_string(),
-                    msg: Some(MSG_TIMER_RESPONSE.to_string()),
-                    ..Meta::default()
-                },
-                payload: json!({
-                    "ok": true,
-                    "verb": "TIMER_GET",
-                    "timer": {
-                        "uuid": "timer-1",
-                        "owner_l2_name": "WF.demo@motherbee",
-                        "target_l2_name": "WF.demo@motherbee",
-                        "kind": "oneshot",
-                        "fire_at_utc_ms": 1775577600000_i64,
-                        "missed_policy": "fire",
-                        "status": "pending",
-                        "created_at_utc_ms": 1775574000000_i64,
-                        "fire_count": 0_u64
-                    }
-                }),
-            };
-            inbound_tx.send(Ok(response)).await.expect("send timer response");
+            let request = harness.next_request().await.expect("request");
+            harness
+                .send_timer_response(
+                    &request,
+                    json!({
+                        "ok": true,
+                        "verb": "TIMER_GET",
+                        "timer": {
+                            "uuid": "timer-1",
+                            "owner_l2_name": "WF.demo@motherbee",
+                            "target_l2_name": "WF.demo@motherbee",
+                            "kind": "oneshot",
+                            "fire_at_utc_ms": 1775577600000_i64,
+                            "missed_policy": "fire",
+                            "status": "pending",
+                            "created_at_utc_ms": 1775574000000_i64,
+                            "fire_count": 0_u64
+                        }
+                    }),
+                )
+                .await
+                .expect("send timer response");
         });
 
         let timer = client.get("timer-1").await.expect("get timer");
@@ -1519,47 +1635,38 @@ mod tests {
 
     #[tokio::test]
     async fn timer_client_list_mine_injects_sender_owner() {
-        let (sender, mut receiver, mut outbound_rx, inbound_tx) =
-            test_transport("WF.demo@motherbee");
+        let (sender, mut receiver, mut harness) = TimerTestHarness::new("WF.demo@motherbee");
         let mut client = TimerClient::new(&sender, &mut receiver, TimerClientConfig::default())
             .expect("new timer client");
 
         tokio::spawn(async move {
-            let request = next_request(&mut outbound_rx).await;
+            let request = harness.next_request().await.expect("request");
             assert_eq!(
                 request.payload.get("owner_l2_name").and_then(Value::as_str),
                 Some("WF.demo@motherbee")
             );
-            let response = Message {
-                routing: Routing {
-                    src: "timer-uuid".to_string(),
-                    dst: Destination::Unicast(request.routing.src.clone()),
-                    ttl: 1,
-                    trace_id: request.routing.trace_id.clone(),
-                },
-                meta: Meta {
-                    msg_type: SYSTEM_KIND.to_string(),
-                    msg: Some(MSG_TIMER_RESPONSE.to_string()),
-                    ..Meta::default()
-                },
-                payload: json!({
-                    "ok": true,
-                    "verb": "TIMER_LIST",
-                    "count": 1_u64,
-                    "timers": [{
-                        "uuid": "timer-1",
-                        "owner_l2_name": "WF.demo@motherbee",
-                        "target_l2_name": "WF.demo@motherbee",
-                        "kind": "oneshot",
-                        "fire_at_utc_ms": 1775577600000_i64,
-                        "missed_policy": "fire",
-                        "status": "pending",
-                        "created_at_utc_ms": 1775574000000_i64,
-                        "fire_count": 0_u64
-                    }]
-                }),
-            };
-            inbound_tx.send(Ok(response)).await.expect("send timer list");
+            harness
+                .send_timer_response(
+                    &request,
+                    json!({
+                        "ok": true,
+                        "verb": "TIMER_LIST",
+                        "count": 1_u64,
+                        "timers": [{
+                            "uuid": "timer-1",
+                            "owner_l2_name": "WF.demo@motherbee",
+                            "target_l2_name": "WF.demo@motherbee",
+                            "kind": "oneshot",
+                            "fire_at_utc_ms": 1775577600000_i64,
+                            "missed_policy": "fire",
+                            "status": "pending",
+                            "created_at_utc_ms": 1775574000000_i64,
+                            "fire_count": 0_u64
+                        }]
+                    }),
+                )
+                .await
+                .expect("send timer list");
         });
 
         let response = client
@@ -1574,33 +1681,95 @@ mod tests {
         assert_eq!(response.timers[0].uuid.as_str(), "timer-1");
     }
 
-    fn test_transport(
-        full_name: &str,
-    ) -> (
-        NodeSender,
-        NodeReceiver,
-        tokio::sync::mpsc::Receiver<Vec<u8>>,
-        tokio::sync::mpsc::Sender<Result<Message, NodeError>>,
-    ) {
-        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(8);
-        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(8);
-        let state = std::sync::Arc::new(crate::split::ConnectionState::new_connected());
-        let info = std::sync::Arc::new(crate::split::ConnectionInfo::new(
-            "src-uuid".to_string(),
-            full_name.to_string(),
-            7,
-            state,
-        ));
-        (
-            NodeSender::new(outbound_tx, std::sync::Arc::clone(&info)),
-            NodeReceiver::new(inbound_rx, info),
-            outbound_rx,
-            inbound_tx,
+    #[test]
+    fn timer_schedule_request_matches_go_fixture() {
+        let fixture = read_fixture_message("request_schedule_in.json");
+        let payload: TimerSchedulePayload =
+            serde_json::from_value(fixture.payload.clone()).expect("decode schedule payload");
+        let mut request = build_timer_system_request_with_target(
+            "src-uuid-1",
+            "SY.timer@motherbee",
+            MSG_TIMER_SCHEDULE,
+            serde_json::to_value(payload).expect("re-encode schedule payload"),
         )
+        .expect("build timer request");
+        request.routing.trace_id = "trace-schedule-1".to_string();
+        assert_eq!(
+            serde_json::to_value(request).expect("encode request"),
+            read_fixture_value("request_schedule_in.json")
+        );
     }
 
-    async fn next_request(outbound_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>) -> Message {
-        let frame = outbound_rx.recv().await.expect("outbound frame");
-        serde_json::from_slice(&frame).expect("decode outbound message")
+    #[test]
+    fn timer_list_response_matches_go_fixture() {
+        let fixture = read_fixture_message("response_timer_list_ok.json");
+        let response = parse_timer_list_response(&fixture).expect("parse list response");
+        assert!(response.ok);
+        assert_eq!(response.verb, "TIMER_LIST");
+        assert_eq!(response.count, 1);
+        assert_eq!(response.timers[0].uuid.as_str(), "timer-1");
+        assert_eq!(response.timers[0].status, TimerStatus::Pending);
+    }
+
+    #[test]
+    fn timer_error_response_matches_go_fixture() {
+        let fixture = read_fixture_message("response_timer_error.json");
+        let response = parse_timer_response(&fixture).expect("parse timer response");
+        let err = timer_response_service_error(&response).expect("service error");
+        assert!(matches!(
+            err,
+            TimerClientError::ServiceError { ref verb, ref code, ref message }
+            if verb == "TIMER_CANCEL" && code == "TIMER_NOT_FOUND" && message == "timer does not exist"
+        ));
+    }
+
+    #[test]
+    fn timer_fired_event_matches_go_fixture() {
+        let fixture = read_fixture_message("event_timer_fired.json");
+        let event = parse_timer_fired_event(&fixture).expect("parse fired event");
+        assert_eq!(event.timer_uuid.as_str(), "timer-1");
+        assert_eq!(event.kind, TimerKind::Oneshot);
+        assert!(event.is_last_fire);
+    }
+
+    #[tokio::test]
+    async fn timer_test_harness_drives_timer_client_without_hive() {
+        let (sender, mut receiver, mut harness) = TimerTestHarness::new("WF.demo@motherbee");
+        let mut client = TimerClient::new(&sender, &mut receiver, TimerClientConfig::default())
+            .expect("new timer client");
+
+        tokio::spawn(async move {
+            let request = harness.next_request().await.expect("request");
+            harness
+                .send_timer_response(
+                    &request,
+                    json!({
+                        "ok": true,
+                        "verb": "TIMER_NOW",
+                        "now_utc_ms": 1775577600000_i64,
+                        "now_utc_iso": "2026-04-06T12:00:00Z"
+                    }),
+                )
+                .await
+                .expect("send response");
+        });
+
+        let result = client.now().await.expect("timer now");
+        assert_eq!(result.now_utc_iso, "2026-04-06T12:00:00Z");
+    }
+
+    fn read_fixture_message(name: &str) -> Message {
+        serde_json::from_value(read_fixture_value(name)).expect("decode fixture message")
+    }
+
+    fn read_fixture_value(name: &str) -> Value {
+        let raw = std::fs::read_to_string(fixture_path(name)).expect("read fixture");
+        serde_json::from_str(&raw).expect("decode fixture json")
+    }
+
+    fn fixture_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fluxbee-go-sdk/testdata/timer_wire")
+            .join(name)
     }
 }
