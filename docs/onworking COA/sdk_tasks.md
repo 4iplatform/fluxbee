@@ -218,6 +218,14 @@ Estado actual del cliente Rust `SY.timer`:
 - verificación actual:
   - `cargo check -p fluxbee-sdk`
   - `cargo test -p fluxbee-sdk timer`
+- ejemplo vivo mínimo ya disponible:
+  - [examples/timer_client.rs](/Users/cagostino/Documents/GitHub/fluxbee/examples/timer_client.rs)
+  - flujo:
+    - conecta un nodo Rust efímero
+    - crea un one-shot dirigido a sí mismo
+    - hace `get` + `list_mine`
+    - espera `TIMER_FIRED`
+    - vuelve a consultar hasta confirmar `status=fired`
 
 ### RUST-TIMER-SDK - Tests y compatibilidad
 
