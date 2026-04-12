@@ -147,7 +147,7 @@ Recommended order:
 - [x] SYT-S1-T7. Move the current SDK code from `sy-opa-rules/sdk` into the formal SDK layout.
 - [x] SYT-S1-T8. Define stable package naming and import path for Go consumers.
 - [x] SYT-S1-T9. Add module README and first-party/third-party usage guidance.
-- [ ] SYT-S1-T10. Define versioning/compatibility policy for the Go SDK.
+- [x] SYT-S1-T10. Define versioning/compatibility policy for the Go SDK.
 - [x] SYT-S1-T11. Add wire-compatibility tests against the Rust SDK contract.
 - [x] SYT-S1-T12. Leave a compatibility migration path for `SY.opa.rules` while imports move to the formal SDK.
 - [x] SYT-S1-T13. Replace the temporary local `uuid_persistence_dir`-based UUID->L2 resolver with the canonical runtime identity resolution path shared with the rest of the platform.
@@ -233,8 +233,13 @@ Current status:
   - `meta.type`
   - `routing.trace_id`
   - no legacy `msg_type` field in fixtures
-- remaining SDK work before Rust parity:
-  - explicit versioning/compatibility policy
+- documented and frozen for the Go SDK:
+  - v1 versioning/compatibility policy
+  - multiple-router-per-hive semantics
+  - stable public surface intended for first-party and third-party consumers
+- remaining Go SDK work beyond Rust parity:
+  - possible `ANNOUNCE.shm_name` extension
+  - additional SHM readers with standalone value
 
 ---
 

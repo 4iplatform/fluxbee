@@ -54,12 +54,30 @@ Regla operativa acordada:
   - exponerlo en `NodeSender` / `NodeReceiver`
   - usar ese router efectivo para abrir `state/<router_l2_name>/identity.yaml` y su SHM
 - [ ] GO-SDK-7. Revisar si conviene extender `ANNOUNCE` con `shm_name` explícito para evitar lectura adicional de `identity.yaml`.
-- [ ] GO-SDK-8. Revisar el modelo de múltiples routers por hive y congelar semántica para consumidores SDK:
+- [x] GO-SDK-8. Revisar el modelo de múltiples routers por hive y congelar semántica para consumidores SDK:
   - un nodo puede conectarse a cualquier router local
   - la router SHM sigue siendo per-router, no una vista fusionada por hive
   - documentar esto como contrato explícito
 - [ ] GO-SDK-9. Portar readers SHM adicionales que hoy siguen faltando respecto del runtime Rust, empezando por los casos con valor real para nodos Go.
-- [ ] GO-SDK-10. Revisar el surface público del SDK Go y estabilizar política de versionado/compatibilidad para terceros.
+- [x] GO-SDK-10. Revisar el surface público del SDK Go y estabilizar política de versionado/compatibilidad para terceros.
+
+Estado actual del cierre del SDK Go:
+
+- la semántica de múltiples routers por hive quedó congelada en el README del SDK:
+  - el router efectivo es el informado por `ANNOUNCE.router_name`
+  - la SHM usada para `uuid -> L2` es la de ese router efectivo
+  - la SHM del router no es una vista fusionada por hive
+- la política de compatibilidad v1 también quedó fijada en el README:
+  - fixes patch-level backward compatible
+  - adiciones permitidas sin romper callers
+  - cambios wire-breaking solo con spec + fixtures + migración coordinada
+- el surface público estable para v1 quedó explícito:
+  - lifecycle
+  - envelope/protocol
+  - RPC helpers
+  - control-plane helpers
+  - `HELP`
+  - `SY.timer`
 
 ## Backlog explícito - `fluxbee_sdk` (Rust) para `SY.timer`
 
