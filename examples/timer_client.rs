@@ -12,6 +12,7 @@ use tracing_subscriber::EnvFilter;
 
 const DEFAULT_DELAY_SECS: u64 = 65;
 const POST_FIRE_STATUS_ATTEMPTS: usize = 10;
+const UUID_MODE_ENV: &str = "JSR_TIMER_EXAMPLE_UUID_MODE";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,6 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|raw| raw.parse::<u64>())
         .transpose()?
         .unwrap_or(DEFAULT_DELAY_SECS);
+    let uuid_mode = example_uuid_mode();
 
     let config_dir = PathBuf::from(json_router::paths::CONFIG_DIR);
     let socket_dir = PathBuf::from(json_router::paths::ROUTER_SOCKET_DIR);
@@ -41,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         name: node_name,
         router_socket: socket_dir,
         uuid_persistence_dir: nodes_dir,
-        uuid_mode: NodeUuidMode::Ephemeral,
+        uuid_mode,
         config_dir,
         version: "1.0".to_string(),
     };
@@ -49,10 +51,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (sender, mut receiver) =
         connect_with_retry(&node_config, StdDuration::from_secs(1)).await?;
     println!(
-        "connected as {} (uuid={}, vpn={})",
+        "connected as {} (uuid={}, vpn={}, uuid_mode={:?})",
         sender.full_name(),
         sender.uuid(),
         receiver.vpn_id(),
+        uuid_mode,
     );
 
     let timer_id = schedule_and_inspect(&sender, &mut receiver, delay_secs).await?;
@@ -109,7 +112,8 @@ async fn schedule_and_inspect(
                 ..TimerSchedulePayload::default()
             },
         )
-        .await?;
+        .await
+        .map_err(explain_schedule_error)?;
 
     let current = client.get(timer_id.clone()).await?;
     println!(
@@ -136,6 +140,35 @@ async fn schedule_and_inspect(
     );
 
     Ok(timer_id)
+}
+
+fn example_uuid_mode() -> NodeUuidMode {
+    match std::env::var(UUID_MODE_ENV)
+        .unwrap_or_else(|_| "persistent".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "ephemeral" => NodeUuidMode::Ephemeral,
+        _ => NodeUuidMode::Persistent,
+    }
+}
+
+fn explain_schedule_error(err: fluxbee_sdk::TimerClientError) -> Box<dyn std::error::Error> {
+    match err {
+        fluxbee_sdk::TimerClientError::ServiceError {
+            verb,
+            code,
+            message,
+        } if code == "TIMER_INTERNAL" && message.contains("/var/lib/fluxbee/state/nodes") => {
+            format!(
+                "{verb} failed because the target SY.timer still looks up requester UUIDs via legacy state files. \
+Rebuild/restart sy-timer on the host to pick up the router SHM resolver, or rerun this example with the default persistent UUID mode."
+            )
+            .into()
+        }
+        other => other.into(),
+    }
 }
 
 async fn wait_for_timer_fired(
