@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use uuid::Uuid;
 
+use crate::protocol::{
+    build_system_message, Destination, Message, TtlExceededPayload,
+    UnreachablePayload, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
+};
 use crate::NodeError;
 
 pub const TIMER_NODE_KIND: &str = "SY.timer";
@@ -467,9 +472,167 @@ pub enum TimerClientError {
     ContractViolation(String),
 }
 
+pub fn timer_node_name(hive_id: &str) -> Result<String, TimerClientError> {
+    let hive_id = hive_id.trim();
+    if hive_id.is_empty() {
+        return Err(TimerClientError::InvalidRequest(
+            "hive_id must be non-empty".to_string(),
+        ));
+    }
+    Ok(format!("{TIMER_NODE_KIND}@{hive_id}"))
+}
+
+pub fn build_timer_system_request(
+    src_uuid: &str,
+    hive_id: &str,
+    verb: &str,
+    payload: Value,
+) -> Result<Message, TimerClientError> {
+    build_timer_system_request_with_target(src_uuid, &timer_node_name(hive_id)?, verb, payload)
+}
+
+pub fn build_timer_system_request_with_target(
+    src_uuid: &str,
+    target_node: &str,
+    verb: &str,
+    payload: Value,
+) -> Result<Message, TimerClientError> {
+    let src_uuid = src_uuid.trim();
+    if src_uuid.is_empty() {
+        return Err(TimerClientError::InvalidRequest(
+            "src_uuid must be non-empty".to_string(),
+        ));
+    }
+    let target_node = target_node.trim();
+    if target_node.is_empty() {
+        return Err(TimerClientError::InvalidRequest(
+            "target_node must be non-empty".to_string(),
+        ));
+    }
+    let verb = verb.trim();
+    if verb.is_empty() {
+        return Err(TimerClientError::InvalidRequest(
+            "verb must be non-empty".to_string(),
+        ));
+    }
+    let trace_id = Uuid::new_v4().to_string();
+    let mut message = build_system_message(
+        src_uuid,
+        Destination::Unicast(target_node.to_string()),
+        1,
+        &trace_id,
+        verb,
+        payload,
+    );
+    message.meta.action = Some(verb.to_string());
+    Ok(message)
+}
+
+pub fn is_timer_response_message(msg: &Message) -> bool {
+    msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_TIMER_RESPONSE)
+}
+
+pub fn parse_timer_response(msg: &Message) -> Result<TimerResponse, TimerClientError> {
+    if !is_timer_response_message(msg) {
+        return Err(TimerClientError::InvalidResponse(
+            "message is not TIMER_RESPONSE".to_string(),
+        ));
+    }
+    Ok(serde_json::from_value(msg.payload.clone())?)
+}
+
+pub fn parse_timer_get_response(msg: &Message) -> Result<TimerGetResponse, TimerClientError> {
+    if !is_timer_response_message(msg) {
+        return Err(TimerClientError::InvalidResponse(
+            "message is not TIMER_RESPONSE".to_string(),
+        ));
+    }
+    Ok(serde_json::from_value(msg.payload.clone())?)
+}
+
+pub fn parse_timer_list_response(msg: &Message) -> Result<TimerListResponse, TimerClientError> {
+    if !is_timer_response_message(msg) {
+        return Err(TimerClientError::InvalidResponse(
+            "message is not TIMER_RESPONSE".to_string(),
+        ));
+    }
+    Ok(serde_json::from_value(msg.payload.clone())?)
+}
+
+pub fn parse_timer_help_response(msg: &Message) -> Result<TimerHelpDescriptor, TimerClientError> {
+    if !is_timer_response_message(msg) {
+        return Err(TimerClientError::InvalidResponse(
+            "message is not TIMER_RESPONSE".to_string(),
+        ));
+    }
+    Ok(serde_json::from_value(msg.payload.clone())?)
+}
+
+pub fn parse_timer_fired_event(msg: &Message) -> Result<FiredEvent, TimerClientError> {
+    if msg.meta.msg_type != SYSTEM_KIND || msg.meta.msg.as_deref() != Some(MSG_TIMER_FIRED) {
+        return Err(TimerClientError::InvalidResponse(
+            "message is not TIMER_FIRED".to_string(),
+        ));
+    }
+    Ok(serde_json::from_value(msg.payload.clone())?)
+}
+
+pub fn timer_response_service_error(response: &TimerResponse) -> Option<TimerClientError> {
+    if response.ok {
+        return None;
+    }
+    if let Some(error) = &response.error {
+        return Some(TimerClientError::ServiceError {
+            verb: response.verb.clone().unwrap_or_default(),
+            code: error.code.clone(),
+            message: error.message.clone(),
+        });
+    }
+    Some(TimerClientError::ContractViolation(
+        "timer response marked not ok without error detail".to_string(),
+    ))
+}
+
+pub fn map_timer_transport_message(msg: &Message) -> Option<TimerClientError> {
+    if msg.meta.msg_type != SYSTEM_KIND {
+        return None;
+    }
+    match msg.meta.msg.as_deref() {
+        Some(MSG_UNREACHABLE) => {
+            let payload = serde_json::from_value::<UnreachablePayload>(msg.payload.clone()).ok();
+            Some(TimerClientError::Unreachable {
+                reason: payload
+                    .as_ref()
+                    .map(|value| value.reason.clone())
+                    .unwrap_or_default(),
+                original_dst: payload
+                    .as_ref()
+                    .map(|value| value.original_dst.clone())
+                    .unwrap_or_default(),
+            })
+        }
+        Some(MSG_TTL_EXCEEDED) => {
+            let payload = serde_json::from_value::<TtlExceededPayload>(msg.payload.clone()).ok();
+            Some(TimerClientError::TtlExceeded {
+                original_dst: payload
+                    .as_ref()
+                    .map(|value| value.original_dst.clone())
+                    .unwrap_or_default(),
+                last_hop: payload
+                    .as_ref()
+                    .map(|value| value.last_hop.clone())
+                    .unwrap_or_default(),
+            })
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{Meta, Routing};
+    use serde_json::json;
 
     #[test]
     fn timer_id_serializes_transparently() {
@@ -501,5 +664,45 @@ mod tests {
             decoded.error.as_ref().map(|err| err.code.as_str()),
             Some("TIMER_NOT_FOUND")
         );
+    }
+
+    #[test]
+    fn timer_node_name_uses_canonical_l2() {
+        assert_eq!(
+            timer_node_name("motherbee").expect("timer node name"),
+            "SY.timer@motherbee"
+        );
+    }
+
+    #[test]
+    fn build_timer_system_request_uses_system_envelope() {
+        let msg = build_timer_system_request("src-uuid", "motherbee", MSG_TIMER_NOW, json!({}))
+            .expect("build timer request");
+        assert_eq!(msg.routing.src, "src-uuid");
+        assert!(matches!(msg.routing.dst, Destination::Unicast(ref dst) if dst == "SY.timer@motherbee"));
+        assert_eq!(msg.routing.ttl, 1);
+        assert_eq!(msg.meta.msg_type, SYSTEM_KIND);
+        assert_eq!(msg.meta.msg.as_deref(), Some(MSG_TIMER_NOW));
+        assert_eq!(msg.meta.action.as_deref(), Some(MSG_TIMER_NOW));
+    }
+
+    #[test]
+    fn parse_timer_fired_event_rejects_non_timer_fired() {
+        let message = Message {
+            routing: Routing {
+                src: "src".to_string(),
+                dst: Destination::Broadcast,
+                ttl: 1,
+                trace_id: "trace".to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(MSG_TIMER_RESPONSE.to_string()),
+                ..Meta::default()
+            },
+            payload: json!({}),
+        };
+        let err = parse_timer_fired_event(&message).expect_err("should reject non TIMER_FIRED");
+        assert!(matches!(err, TimerClientError::InvalidResponse(_)));
     }
 }

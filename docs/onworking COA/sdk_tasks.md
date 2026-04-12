@@ -127,11 +127,11 @@ Decisiones ya tomadas:
 
 ### RUST-TIMER-SDK - Helpers de transporte
 
-- [ ] RUST-TIMER-SDK-6. Implementar builder helpers para requests `system` dirigidos a `SY.timer@<hive>`.
-- [ ] RUST-TIMER-SDK-7. Implementar parser helpers para `TIMER_RESPONSE`.
-- [ ] RUST-TIMER-SDK-8. Implementar parser helper para `TIMER_FIRED` recibido como evento `system`.
-- [ ] RUST-TIMER-SDK-9. Reusar la normalización/correlación existente del SDK Rust en lugar de duplicar lógica de envelope.
-- [ ] RUST-TIMER-SDK-10. Resolver naming del target timer desde `hive_id` con helper canónico, sin hardcodes dispersos.
+- [x] RUST-TIMER-SDK-6. Implementar builder helpers para requests `system` dirigidos a `SY.timer@<hive>`.
+- [x] RUST-TIMER-SDK-7. Implementar parser helpers para `TIMER_RESPONSE`.
+- [x] RUST-TIMER-SDK-8. Implementar parser helper para `TIMER_FIRED` recibido como evento `system`.
+- [x] RUST-TIMER-SDK-9. Reusar la normalización/correlación existente del SDK Rust en lugar de duplicar lógica de envelope.
+- [x] RUST-TIMER-SDK-10. Resolver naming del target timer desde `hive_id` con helper canónico, sin hardcodes dispersos.
 
 Estado actual del módulo Rust `timer`:
 
@@ -144,6 +144,17 @@ Estado actual del módulo Rust `timer`:
   - payloads de request/response por verbo
   - `TimerHelpDescriptor`
   - `TimerClientError`
+- helpers de transporte ya cubiertos:
+  - `timer_node_name(...)`
+  - `build_timer_system_request(...)`
+  - `build_timer_system_request_with_target(...)`
+  - `parse_timer_response(...)`
+  - `parse_timer_get_response(...)`
+  - `parse_timer_list_response(...)`
+  - `parse_timer_help_response(...)`
+  - `parse_timer_fired_event(...)`
+  - `timer_response_service_error(...)`
+  - `map_timer_transport_message(...)`
 - verificación actual:
   - `cargo check -p fluxbee-sdk`
   - `cargo test -p fluxbee-sdk timer`
