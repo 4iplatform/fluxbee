@@ -161,15 +161,15 @@ Estado actual del módulo Rust `timer`:
 
 ### RUST-TIMER-SDK - Cliente tipado
 
-- [ ] RUST-TIMER-SDK-11. Implementar `TimerClient` sobre `NodeSender`.
-- [ ] RUST-TIMER-SDK-12. Implementar operaciones de tiempo:
+- [x] RUST-TIMER-SDK-11. Implementar `TimerClient` sobre `NodeSender`.
+- [x] RUST-TIMER-SDK-12. Implementar operaciones de tiempo:
   - `now`
   - `now_in`
   - `convert`
   - `parse`
   - `format`
   - `help`
-- [ ] RUST-TIMER-SDK-13. Implementar operaciones de timers:
+- [x] RUST-TIMER-SDK-13. Implementar operaciones de timers:
   - `schedule`
   - `schedule_in`
   - `schedule_recurring`
@@ -178,12 +178,46 @@ Estado actual del módulo Rust `timer`:
   - `cancel`
   - `reschedule`
   - `purge_owner`
-- [ ] RUST-TIMER-SDK-14. Definir retry policy mínima para operaciones de tiempo, alineada con la semántica ya documentada para Go.
-- [ ] RUST-TIMER-SDK-15. Definir validación client-side mínima:
+- [x] RUST-TIMER-SDK-14. Definir retry policy mínima para operaciones de tiempo, alineada con la semántica ya documentada para Go.
+- [x] RUST-TIMER-SDK-15. Definir validación client-side mínima:
   - mínimo de 60s
   - exclusividad entre campos absolutos/relativos
   - shape recurrente
   - `missed_policy` / `missed_within_ms`
+
+Estado actual del cliente Rust `SY.timer`:
+
+- `TimerClient` y `TimerClientConfig` ya existen en [timer.rs](/Users/cagostino/Documents/GitHub/fluxbee/crates/fluxbee_sdk/src/timer.rs).
+- surface implementado:
+  - `help`
+  - `now`
+  - `now_in`
+  - `convert`
+  - `parse`
+  - `format`
+  - `schedule`
+  - `schedule_in`
+  - `schedule_recurring`
+  - `get`
+  - `list`
+  - `list_mine`
+  - `cancel`
+  - `reschedule`
+  - `purge_owner`
+- validaciones ya activas:
+  - mínimo de 60s
+  - exclusividad `fire_at_utc_ms` / `fire_in_ms`
+  - exclusividad `new_fire_at_utc_ms` / `new_fire_in_ms`
+  - cron recurrente de 5 campos
+  - `timer_uuid` no vacío
+  - `owner_l2_name` / `target_l2_name` como L2 canónico
+  - reglas de `missed_policy` / `missed_within_ms`
+- retry policy de time ops ya activa:
+  - default `100ms / 300ms / 1s`
+  - solo para `now`, `now_in`, `convert`, `parse`, `format`
+- verificación actual:
+  - `cargo check -p fluxbee-sdk`
+  - `cargo test -p fluxbee-sdk timer`
 
 ### RUST-TIMER-SDK - Tests y compatibilidad
 

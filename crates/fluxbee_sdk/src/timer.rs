@@ -1,12 +1,16 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use tokio::time::{Duration, Instant as TokioInstant};
 use uuid::Uuid;
 
 use crate::protocol::{
     build_system_message, Destination, Message, TtlExceededPayload,
     UnreachablePayload, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
-use crate::NodeError;
+use crate::{NodeError, NodeReceiver, NodeSender};
 
 pub const TIMER_NODE_KIND: &str = "SY.timer";
 pub const TIMER_NODE_FAMILY: &str = "SY";
@@ -30,6 +34,8 @@ pub const MSG_TIMER_RESPONSE: &str = "TIMER_RESPONSE";
 pub const TIMER_MIN_DURATION_MS: u64 = 60_000;
 pub const TIMER_LIST_DEFAULT_LIMIT: u32 = 100;
 pub const TIMER_LIST_MAX_LIMIT: u32 = 1000;
+pub const TIMER_DEFAULT_RPC_TIMEOUT_MS: u64 = 5_000;
+pub const TIMER_DEFAULT_TIME_RETRY_SCHEDULE_MS: [u64; 3] = [100, 300, 1_000];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(transparent)]
@@ -472,6 +478,389 @@ pub enum TimerClientError {
     ContractViolation(String),
 }
 
+#[derive(Debug, Clone)]
+pub struct TimerClientConfig {
+    pub timer_target: Option<String>,
+    pub rpc_timeout: Duration,
+    pub time_retry_schedule: Vec<Duration>,
+}
+
+impl Default for TimerClientConfig {
+    fn default() -> Self {
+        Self {
+            timer_target: None,
+            rpc_timeout: Duration::from_millis(TIMER_DEFAULT_RPC_TIMEOUT_MS),
+            time_retry_schedule: TIMER_DEFAULT_TIME_RETRY_SCHEDULE_MS
+                .into_iter()
+                .map(Duration::from_millis)
+                .collect(),
+        }
+    }
+}
+
+pub struct TimerClient<'a> {
+    sender: &'a NodeSender,
+    receiver: &'a mut NodeReceiver,
+    timer_target: String,
+    rpc_timeout: Duration,
+    time_retry_schedule: Vec<Duration>,
+}
+
+impl<'a> TimerClient<'a> {
+    pub fn new(
+        sender: &'a NodeSender,
+        receiver: &'a mut NodeReceiver,
+        config: TimerClientConfig,
+    ) -> Result<Self, TimerClientError> {
+        let timer_target = match config.timer_target {
+            Some(target) if !target.trim().is_empty() => target.trim().to_string(),
+            _ => local_timer_node_name(sender.full_name())?,
+        };
+        Ok(Self {
+            sender,
+            receiver,
+            timer_target,
+            rpc_timeout: default_rpc_timeout(config.rpc_timeout),
+            time_retry_schedule: normalized_time_retry_schedule(config.time_retry_schedule),
+        })
+    }
+
+    pub fn target(&self) -> &str {
+        self.timer_target.as_str()
+    }
+
+    pub fn sender(&self) -> &NodeSender {
+        self.sender
+    }
+
+    pub async fn help(&mut self) -> Result<TimerHelpDescriptor, TimerClientError> {
+        self.call_decode(MSG_TIMER_HELP, Value::Object(Map::new()), self.rpc_timeout)
+            .await
+    }
+
+    pub async fn now(&mut self) -> Result<TimerNowResult, TimerClientError> {
+        self.call_time_operation(MSG_TIMER_NOW, Value::Object(Map::new()))
+            .await
+    }
+
+    pub async fn now_in(
+        &mut self,
+        mut payload: TimerNowInPayload,
+    ) -> Result<TimerNowInResult, TimerClientError> {
+        payload.tz = trim_owned(payload.tz);
+        if payload.tz.is_empty() {
+            return Err(TimerClientError::InvalidRequest(
+                "tz must be non-empty".to_string(),
+            ));
+        }
+        self.call_time_operation(MSG_TIMER_NOW_IN, serde_json::to_value(payload)?)
+            .await
+    }
+
+    pub async fn convert(
+        &mut self,
+        mut payload: TimerConvertPayload,
+    ) -> Result<TimerConvertResult, TimerClientError> {
+        payload.to_tz = trim_owned(payload.to_tz);
+        if payload.to_tz.is_empty() {
+            return Err(TimerClientError::InvalidRequest(
+                "to_tz must be non-empty".to_string(),
+            ));
+        }
+        self.call_time_operation(MSG_TIMER_CONVERT, serde_json::to_value(payload)?)
+            .await
+    }
+
+    pub async fn parse(
+        &mut self,
+        mut payload: TimerParsePayload,
+    ) -> Result<TimerParseResult, TimerClientError> {
+        payload.input = trim_owned(payload.input);
+        payload.layout = trim_owned(payload.layout);
+        payload.tz = trim_owned(payload.tz);
+        if payload.input.is_empty() {
+            return Err(TimerClientError::InvalidRequest(
+                "input must be non-empty".to_string(),
+            ));
+        }
+        if payload.layout.is_empty() {
+            return Err(TimerClientError::InvalidRequest(
+                "layout must be non-empty".to_string(),
+            ));
+        }
+        if payload.tz.is_empty() {
+            return Err(TimerClientError::InvalidRequest(
+                "tz must be non-empty".to_string(),
+            ));
+        }
+        self.call_time_operation(MSG_TIMER_PARSE, serde_json::to_value(payload)?)
+            .await
+    }
+
+    pub async fn format(
+        &mut self,
+        mut payload: TimerFormatPayload,
+    ) -> Result<TimerFormatResult, TimerClientError> {
+        payload.layout = trim_owned(payload.layout);
+        payload.tz = trim_owned(payload.tz);
+        if payload.layout.is_empty() {
+            return Err(TimerClientError::InvalidRequest(
+                "layout must be non-empty".to_string(),
+            ));
+        }
+        if payload.tz.is_empty() {
+            return Err(TimerClientError::InvalidRequest(
+                "tz must be non-empty".to_string(),
+            ));
+        }
+        self.call_time_operation(MSG_TIMER_FORMAT, serde_json::to_value(payload)?)
+            .await
+    }
+
+    pub async fn schedule(
+        &mut self,
+        mut payload: TimerSchedulePayload,
+    ) -> Result<TimerId, TimerClientError> {
+        normalize_schedule_payload(&mut payload);
+        validate_schedule_payload(&payload, MSG_TIMER_SCHEDULE)?;
+        let response = self
+            .call_ok_response(MSG_TIMER_SCHEDULE, serde_json::to_value(payload)?, self.rpc_timeout)
+            .await?;
+        response.timer_uuid.ok_or_else(|| {
+            TimerClientError::ContractViolation(
+                "timer response missing timer_uuid".to_string(),
+            )
+        })
+    }
+
+    pub async fn schedule_in(
+        &mut self,
+        duration: Duration,
+        mut payload: TimerSchedulePayload,
+    ) -> Result<TimerId, TimerClientError> {
+        payload.fire_at_utc_ms = None;
+        payload.fire_in_ms = Some(duration.as_millis() as u64);
+        self.schedule(payload).await
+    }
+
+    pub async fn schedule_recurring(
+        &mut self,
+        mut payload: TimerScheduleRecurringPayload,
+    ) -> Result<TimerId, TimerClientError> {
+        normalize_recurring_payload(&mut payload);
+        validate_recurring_payload(&payload)?;
+        let response = self
+            .call_ok_response(
+                MSG_TIMER_SCHEDULE_RECURRING,
+                serde_json::to_value(payload)?,
+                self.rpc_timeout,
+            )
+            .await?;
+        response.timer_uuid.ok_or_else(|| {
+            TimerClientError::ContractViolation(
+                "timer response missing timer_uuid".to_string(),
+            )
+        })
+    }
+
+    pub async fn get(
+        &mut self,
+        timer_id: impl Into<TimerId>,
+    ) -> Result<TimerInfo, TimerClientError> {
+        let timer_uuid = validate_timer_id(timer_id.into())?;
+        let payload = TimerGetPayload {
+            timer_uuid,
+            ..TimerGetPayload::default()
+        };
+        let response: TimerGetResponse = self
+            .call_decode(MSG_TIMER_GET, serde_json::to_value(payload)?, self.rpc_timeout)
+            .await?;
+        Ok(response.timer)
+    }
+
+    pub async fn list(
+        &mut self,
+        mut filter: TimerListFilter,
+    ) -> Result<TimerListResponse, TimerClientError> {
+        normalize_list_filter(&mut filter);
+        validate_list_filter(&filter)?;
+        self.call_decode(MSG_TIMER_LIST, serde_json::to_value(filter)?, self.rpc_timeout)
+            .await
+    }
+
+    pub async fn list_mine(
+        &mut self,
+        mut filter: TimerListFilter,
+    ) -> Result<TimerListResponse, TimerClientError> {
+        if filter.owner_l2_name.is_none() {
+            filter.owner_l2_name = Some(self.sender.full_name().to_string());
+        }
+        self.list(filter).await
+    }
+
+    pub async fn cancel(
+        &mut self,
+        timer_id: impl Into<TimerId>,
+    ) -> Result<TimerResponse, TimerClientError> {
+        let payload = TimerCancelPayload {
+            timer_uuid: validate_timer_id(timer_id.into())?,
+            ..TimerCancelPayload::default()
+        };
+        self.call_ok_response(MSG_TIMER_CANCEL, serde_json::to_value(payload)?, self.rpc_timeout)
+            .await
+    }
+
+    pub async fn reschedule(
+        &mut self,
+        mut payload: TimerReschedulePayload,
+    ) -> Result<TimerResponse, TimerClientError> {
+        normalize_reschedule_payload(&mut payload);
+        validate_reschedule_payload(&payload)?;
+        self.call_ok_response(
+            MSG_TIMER_RESCHEDULE,
+            serde_json::to_value(payload)?,
+            self.rpc_timeout,
+        )
+        .await
+    }
+
+    pub async fn purge_owner(
+        &mut self,
+        owner_l2_name: &str,
+    ) -> Result<TimerResponse, TimerClientError> {
+        let owner_l2_name = trim_owned(owner_l2_name.to_string());
+        validate_canonical_l2_name("owner_l2_name", &owner_l2_name)?;
+        let payload = TimerPurgeOwnerPayload {
+            owner_l2_name,
+            ..TimerPurgeOwnerPayload::default()
+        };
+        self.call_ok_response(
+            MSG_TIMER_PURGE_OWNER,
+            serde_json::to_value(payload)?,
+            self.rpc_timeout,
+        )
+        .await
+    }
+
+    async fn call_time_operation<T>(
+        &mut self,
+        verb: &str,
+        payload: Value,
+    ) -> Result<T, TimerClientError>
+    where
+        T: DeserializeOwned,
+    {
+        let mut last_error = None;
+        for timeout in self.time_retry_schedule.clone() {
+            match self.call_decode::<T>(verb, payload.clone(), timeout).await {
+                Ok(value) => return Ok(value),
+                Err(err) if should_retry_time_operation(&err) => last_error = Some(err),
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            TimerClientError::ServiceError {
+                verb: verb.to_string(),
+                code: "TIMER_UNREACHABLE".to_string(),
+                message: "SY.timer did not respond after retry schedule".to_string(),
+            }
+        }))
+    }
+
+    async fn call_decode<T>(
+        &mut self,
+        verb: &str,
+        payload: Value,
+        timeout: Duration,
+    ) -> Result<T, TimerClientError>
+    where
+        T: DeserializeOwned,
+    {
+        let message = self.request_once(verb, payload, timeout).await?;
+        let response = parse_timer_response(&message)?;
+        if let Some(err) = timer_response_service_error(&response) {
+            return Err(err);
+        }
+        Ok(serde_json::from_value(message.payload)?)
+    }
+
+    async fn call_ok_response(
+        &mut self,
+        verb: &str,
+        payload: Value,
+        timeout: Duration,
+    ) -> Result<TimerResponse, TimerClientError> {
+        let message = self.request_once(verb, payload, timeout).await?;
+        let response = parse_timer_response(&message)?;
+        if let Some(err) = timer_response_service_error(&response) {
+            return Err(err);
+        }
+        Ok(response)
+    }
+
+    async fn request_once(
+        &mut self,
+        verb: &str,
+        payload: Value,
+        timeout: Duration,
+    ) -> Result<Message, TimerClientError> {
+        let request = build_timer_system_request_with_target(
+            self.sender.uuid(),
+            self.timer_target.as_str(),
+            verb,
+            payload,
+        )?;
+        let trace_id = request.routing.trace_id.clone();
+        self.sender.send(request).await?;
+        self.wait_timer_response(verb, &trace_id, timeout).await
+    }
+
+    async fn wait_timer_response(
+        &mut self,
+        verb: &str,
+        trace_id: &str,
+        timeout: Duration,
+    ) -> Result<Message, TimerClientError> {
+        let timeout = default_rpc_timeout(timeout);
+        let deadline = TokioInstant::now() + timeout;
+        loop {
+            let now = TokioInstant::now();
+            if now >= deadline {
+                return Err(TimerClientError::Timeout {
+                    response_msg: MSG_TIMER_RESPONSE.to_string(),
+                    trace_id: trace_id.to_string(),
+                    target: self.timer_target.clone(),
+                    verb: verb.to_string(),
+                    timeout_ms: timeout.as_millis() as u64,
+                });
+            }
+            let remaining = deadline - now;
+            let incoming = match self.receiver.recv_timeout(remaining).await {
+                Ok(message) => message,
+                Err(NodeError::Timeout) => {
+                    return Err(TimerClientError::Timeout {
+                        response_msg: MSG_TIMER_RESPONSE.to_string(),
+                        trace_id: trace_id.to_string(),
+                        target: self.timer_target.clone(),
+                        verb: verb.to_string(),
+                        timeout_ms: timeout.as_millis() as u64,
+                    })
+                }
+                Err(err) => return Err(TimerClientError::Node(err)),
+            };
+            if incoming.routing.trace_id != trace_id {
+                continue;
+            }
+            if let Some(err) = map_timer_transport_message(&incoming) {
+                return Err(err);
+            }
+            if is_timer_response_message(&incoming) {
+                return Ok(incoming);
+            }
+        }
+    }
+}
+
 pub fn timer_node_name(hive_id: &str) -> Result<String, TimerClientError> {
     let hive_id = hive_id.trim();
     if hive_id.is_empty() {
@@ -628,6 +1017,293 @@ pub fn map_timer_transport_message(msg: &Message) -> Option<TimerClientError> {
     }
 }
 
+fn local_timer_node_name(full_name: &str) -> Result<String, TimerClientError> {
+    let full_name = full_name.trim();
+    if full_name.is_empty() {
+        return Err(TimerClientError::InvalidRequest(
+            "cannot derive local timer node name from empty sender full name".to_string(),
+        ));
+    }
+    let (_, hive_id) = full_name.split_once('@').ok_or_else(|| {
+        TimerClientError::InvalidRequest(
+            "sender full name must include hive suffix".to_string(),
+        )
+    })?;
+    timer_node_name(hive_id)
+}
+
+fn default_rpc_timeout(timeout: Duration) -> Duration {
+    if timeout.is_zero() {
+        Duration::from_millis(TIMER_DEFAULT_RPC_TIMEOUT_MS)
+    } else {
+        timeout
+    }
+}
+
+fn normalized_time_retry_schedule(schedule: Vec<Duration>) -> Vec<Duration> {
+    let normalized: Vec<_> = schedule.into_iter().filter(|timeout| !timeout.is_zero()).collect();
+    if normalized.is_empty() {
+        TIMER_DEFAULT_TIME_RETRY_SCHEDULE_MS
+            .into_iter()
+            .map(Duration::from_millis)
+            .collect()
+    } else {
+        normalized
+    }
+}
+
+fn should_retry_time_operation(error: &TimerClientError) -> bool {
+    matches!(
+        error,
+        TimerClientError::Timeout { .. }
+            | TimerClientError::Unreachable { .. }
+            | TimerClientError::TtlExceeded { .. }
+    )
+}
+
+fn trim_owned(value: String) -> String {
+    value.trim().to_string()
+}
+
+fn normalize_schedule_payload(payload: &mut TimerSchedulePayload) {
+    payload.target_l2_name = payload
+        .target_l2_name
+        .take()
+        .map(trim_owned)
+        .filter(|value| !value.is_empty());
+    payload.client_ref = payload
+        .client_ref
+        .take()
+        .map(trim_owned)
+        .filter(|value| !value.is_empty());
+}
+
+fn normalize_recurring_payload(payload: &mut TimerScheduleRecurringPayload) {
+    payload.cron_spec = trim_owned(payload.cron_spec.clone());
+    payload.cron_tz = payload
+        .cron_tz
+        .take()
+        .map(trim_owned)
+        .filter(|value| !value.is_empty());
+    payload.target_l2_name = payload
+        .target_l2_name
+        .take()
+        .map(trim_owned)
+        .filter(|value| !value.is_empty());
+    payload.client_ref = payload
+        .client_ref
+        .take()
+        .map(trim_owned)
+        .filter(|value| !value.is_empty());
+}
+
+fn normalize_reschedule_payload(payload: &mut TimerReschedulePayload) {
+    payload.timer_uuid = TimerId(trim_owned(payload.timer_uuid.0.clone()));
+}
+
+fn normalize_list_filter(filter: &mut TimerListFilter) {
+    filter.owner_l2_name = filter
+        .owner_l2_name
+        .take()
+        .map(trim_owned)
+        .filter(|value| !value.is_empty());
+}
+
+fn validate_schedule_payload(
+    payload: &TimerSchedulePayload,
+    verb: &str,
+) -> Result<(), TimerClientError> {
+    let has_absolute = payload.fire_at_utc_ms.is_some();
+    let has_relative = payload.fire_in_ms.is_some();
+    match (has_absolute, has_relative) {
+        (true, true) | (false, false) => {
+            return Err(TimerClientError::InvalidRequest(
+                "exactly one of fire_at_utc_ms or fire_in_ms must be set".to_string(),
+            ))
+        }
+        _ => {}
+    }
+    if let Some(target_l2_name) = payload.target_l2_name.as_deref() {
+        validate_canonical_l2_name("target_l2_name", target_l2_name)?;
+    }
+    validate_missed_policy(verb, payload.missed_policy, payload.missed_within_ms)?;
+    if let Some(fire_at_utc_ms) = payload.fire_at_utc_ms {
+        validate_absolute_schedule_time(verb, fire_at_utc_ms)?;
+    }
+    if let Some(fire_in_ms) = payload.fire_in_ms {
+        validate_relative_schedule_duration(verb, fire_in_ms)?;
+    }
+    Ok(())
+}
+
+fn validate_recurring_payload(
+    payload: &TimerScheduleRecurringPayload,
+) -> Result<(), TimerClientError> {
+    if payload.cron_spec.trim().is_empty() {
+        return Err(TimerClientError::InvalidRequest(
+            "cron_spec must be non-empty".to_string(),
+        ));
+    }
+    if payload.cron_spec.split_whitespace().count() != 5 {
+        return Err(service_error(
+            MSG_TIMER_SCHEDULE_RECURRING,
+            "TIMER_INVALID_CRON",
+            "cron_spec must be a 5-field cron expression",
+        ));
+    }
+    if let Some(target_l2_name) = payload.target_l2_name.as_deref() {
+        validate_canonical_l2_name("target_l2_name", target_l2_name)?;
+    }
+    validate_missed_policy(
+        MSG_TIMER_SCHEDULE_RECURRING,
+        payload.missed_policy,
+        payload.missed_within_ms,
+    )?;
+    Ok(())
+}
+
+fn validate_reschedule_payload(
+    payload: &TimerReschedulePayload,
+) -> Result<(), TimerClientError> {
+    validate_timer_id(payload.timer_uuid.clone())?;
+    let has_absolute = payload.new_fire_at_utc_ms.is_some();
+    let has_relative = payload.new_fire_in_ms.is_some();
+    match (has_absolute, has_relative) {
+        (true, true) | (false, false) => {
+            return Err(TimerClientError::InvalidRequest(
+                "exactly one of new_fire_at_utc_ms or new_fire_in_ms must be set".to_string(),
+            ))
+        }
+        _ => {}
+    }
+    if let Some(fire_at_utc_ms) = payload.new_fire_at_utc_ms {
+        validate_absolute_schedule_time(MSG_TIMER_RESCHEDULE, fire_at_utc_ms)?;
+    }
+    if let Some(fire_in_ms) = payload.new_fire_in_ms {
+        validate_relative_schedule_duration(MSG_TIMER_RESCHEDULE, fire_in_ms)?;
+    }
+    Ok(())
+}
+
+fn validate_list_filter(filter: &TimerListFilter) -> Result<(), TimerClientError> {
+    if let Some(owner_l2_name) = filter.owner_l2_name.as_deref() {
+        validate_canonical_l2_name("owner_l2_name", owner_l2_name)?;
+    }
+    if let Some(limit) = filter.limit {
+        if limit == 0 || limit > TIMER_LIST_MAX_LIMIT {
+            return Err(TimerClientError::InvalidRequest(format!(
+                "limit must be between 1 and {}",
+                TIMER_LIST_MAX_LIMIT
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_timer_id(timer_id: TimerId) -> Result<TimerId, TimerClientError> {
+    let timer_id = TimerId(trim_owned(timer_id.0));
+    if timer_id.is_empty() {
+        return Err(TimerClientError::InvalidRequest(
+            "timer_uuid must be non-empty".to_string(),
+        ));
+    }
+    Ok(timer_id)
+}
+
+fn validate_canonical_l2_name(field: &str, value: &str) -> Result<(), TimerClientError> {
+    let value = value.trim();
+    let Some((node, hive)) = value.split_once('@') else {
+        return Err(TimerClientError::InvalidRequest(format!(
+            "{field} must be a canonical L2 name"
+        )));
+    };
+    if node.trim().is_empty() || hive.trim().is_empty() {
+        return Err(TimerClientError::InvalidRequest(format!(
+            "{field} must be a canonical L2 name"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_missed_policy(
+    verb: &str,
+    missed_policy: Option<MissedPolicy>,
+    missed_within_ms: Option<u64>,
+) -> Result<(), TimerClientError> {
+    match missed_policy.unwrap_or_default() {
+        MissedPolicy::Fire | MissedPolicy::Drop => {
+            if missed_within_ms.is_some() {
+                return Err(TimerClientError::InvalidRequest(
+                    "missed_within_ms is only valid with missed_policy=fire_if_within"
+                        .to_string(),
+                ));
+            }
+        }
+        MissedPolicy::FireIfWithin => {
+            if missed_within_ms.unwrap_or_default() == 0 {
+                return Err(TimerClientError::InvalidRequest(
+                    "missed_within_ms must be set when missed_policy=fire_if_within"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    if verb == MSG_TIMER_SCHEDULE || verb == MSG_TIMER_SCHEDULE_RECURRING {
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn validate_absolute_schedule_time(
+    verb: &str,
+    fire_at_utc_ms: i64,
+) -> Result<(), TimerClientError> {
+    let min_fire_at = now_epoch_ms() + TIMER_MIN_DURATION_MS as i64;
+    if fire_at_utc_ms < min_fire_at {
+        return Err(service_error(
+            verb,
+            "TIMER_BELOW_MINIMUM",
+            &format!(
+                "minimum timer duration is {} seconds",
+                TIMER_MIN_DURATION_MS / 1000
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_relative_schedule_duration(
+    verb: &str,
+    fire_in_ms: u64,
+) -> Result<(), TimerClientError> {
+    if fire_in_ms < TIMER_MIN_DURATION_MS {
+        return Err(service_error(
+            verb,
+            "TIMER_BELOW_MINIMUM",
+            &format!(
+                "minimum timer duration is {} seconds",
+                TIMER_MIN_DURATION_MS / 1000
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn now_epoch_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn service_error(verb: &str, code: &str, message: &str) -> TimerClientError {
+    TimerClientError::ServiceError {
+        verb: verb.to_string(),
+        code: code.to_string(),
+        message: message.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,5 +1380,227 @@ mod tests {
         };
         let err = parse_timer_fired_event(&message).expect_err("should reject non TIMER_FIRED");
         assert!(matches!(err, TimerClientError::InvalidResponse(_)));
+    }
+
+    #[test]
+    fn timer_client_new_derives_local_target() {
+        let (sender, mut receiver, _, _) = test_transport("WF.demo@motherbee");
+        let client = TimerClient::new(&sender, &mut receiver, TimerClientConfig::default())
+            .expect("new timer client");
+        assert_eq!(client.target(), "SY.timer@motherbee");
+    }
+
+    #[tokio::test]
+    async fn timer_client_now_retries_after_unreachable() {
+        let (sender, mut receiver, mut outbound_rx, inbound_tx) =
+            test_transport("WF.demo@motherbee");
+        let mut client = TimerClient::new(
+            &sender,
+            &mut receiver,
+            TimerClientConfig {
+                time_retry_schedule: vec![
+                    Duration::from_millis(10),
+                    Duration::from_millis(20),
+                ],
+                ..TimerClientConfig::default()
+            },
+        )
+        .expect("new timer client");
+
+        tokio::spawn(async move {
+            let first = next_request(&mut outbound_rx).await;
+            let unreachable = Message {
+                routing: Routing {
+                    src: "router".to_string(),
+                    dst: Destination::Unicast(first.routing.src.clone()),
+                    ttl: 1,
+                    trace_id: first.routing.trace_id.clone(),
+                },
+                meta: Meta {
+                    msg_type: SYSTEM_KIND.to_string(),
+                    msg: Some(MSG_UNREACHABLE.to_string()),
+                    ..Meta::default()
+                },
+                payload: json!({
+                    "original_dst": "SY.timer@motherbee",
+                    "reason": "temporary"
+                }),
+            };
+            inbound_tx.send(Ok(unreachable)).await.expect("send unreachable");
+
+            let second = next_request(&mut outbound_rx).await;
+            let response = Message {
+                routing: Routing {
+                    src: "timer-uuid".to_string(),
+                    dst: Destination::Unicast(second.routing.src.clone()),
+                    ttl: 1,
+                    trace_id: second.routing.trace_id.clone(),
+                },
+                meta: Meta {
+                    msg_type: SYSTEM_KIND.to_string(),
+                    msg: Some(MSG_TIMER_RESPONSE.to_string()),
+                    ..Meta::default()
+                },
+                payload: json!({
+                    "ok": true,
+                    "verb": "TIMER_NOW",
+                    "now_utc_ms": 1775577600000_i64,
+                    "now_utc_iso": "2026-04-06T12:00:00Z"
+                }),
+            };
+            inbound_tx.send(Ok(response)).await.expect("send timer response");
+        });
+
+        let result = client.now().await.expect("timer now");
+        assert_eq!(result.now_utc_ms, 1_775_577_600_000);
+        assert_eq!(result.now_utc_iso, "2026-04-06T12:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn timer_client_schedule_in_rejects_below_minimum() {
+        let (sender, mut receiver, _, _) = test_transport("WF.demo@motherbee");
+        let mut client = TimerClient::new(&sender, &mut receiver, TimerClientConfig::default())
+            .expect("new timer client");
+
+        let err = client
+            .schedule_in(Duration::from_secs(30), TimerSchedulePayload::default())
+            .await
+            .expect_err("below minimum should fail");
+        assert!(matches!(
+            err,
+            TimerClientError::ServiceError { ref code, .. } if code == "TIMER_BELOW_MINIMUM"
+        ));
+    }
+
+    #[tokio::test]
+    async fn timer_client_get_parses_timer_info() {
+        let (sender, mut receiver, mut outbound_rx, inbound_tx) =
+            test_transport("WF.demo@motherbee");
+        let mut client = TimerClient::new(&sender, &mut receiver, TimerClientConfig::default())
+            .expect("new timer client");
+
+        tokio::spawn(async move {
+            let request = next_request(&mut outbound_rx).await;
+            let response = Message {
+                routing: Routing {
+                    src: "timer-uuid".to_string(),
+                    dst: Destination::Unicast(request.routing.src.clone()),
+                    ttl: 1,
+                    trace_id: request.routing.trace_id.clone(),
+                },
+                meta: Meta {
+                    msg_type: SYSTEM_KIND.to_string(),
+                    msg: Some(MSG_TIMER_RESPONSE.to_string()),
+                    ..Meta::default()
+                },
+                payload: json!({
+                    "ok": true,
+                    "verb": "TIMER_GET",
+                    "timer": {
+                        "uuid": "timer-1",
+                        "owner_l2_name": "WF.demo@motherbee",
+                        "target_l2_name": "WF.demo@motherbee",
+                        "kind": "oneshot",
+                        "fire_at_utc_ms": 1775577600000_i64,
+                        "missed_policy": "fire",
+                        "status": "pending",
+                        "created_at_utc_ms": 1775574000000_i64,
+                        "fire_count": 0_u64
+                    }
+                }),
+            };
+            inbound_tx.send(Ok(response)).await.expect("send timer response");
+        });
+
+        let timer = client.get("timer-1").await.expect("get timer");
+        assert_eq!(timer.uuid.as_str(), "timer-1");
+        assert_eq!(timer.owner_l2_name, "WF.demo@motherbee");
+    }
+
+    #[tokio::test]
+    async fn timer_client_list_mine_injects_sender_owner() {
+        let (sender, mut receiver, mut outbound_rx, inbound_tx) =
+            test_transport("WF.demo@motherbee");
+        let mut client = TimerClient::new(&sender, &mut receiver, TimerClientConfig::default())
+            .expect("new timer client");
+
+        tokio::spawn(async move {
+            let request = next_request(&mut outbound_rx).await;
+            assert_eq!(
+                request.payload.get("owner_l2_name").and_then(Value::as_str),
+                Some("WF.demo@motherbee")
+            );
+            let response = Message {
+                routing: Routing {
+                    src: "timer-uuid".to_string(),
+                    dst: Destination::Unicast(request.routing.src.clone()),
+                    ttl: 1,
+                    trace_id: request.routing.trace_id.clone(),
+                },
+                meta: Meta {
+                    msg_type: SYSTEM_KIND.to_string(),
+                    msg: Some(MSG_TIMER_RESPONSE.to_string()),
+                    ..Meta::default()
+                },
+                payload: json!({
+                    "ok": true,
+                    "verb": "TIMER_LIST",
+                    "count": 1_u64,
+                    "timers": [{
+                        "uuid": "timer-1",
+                        "owner_l2_name": "WF.demo@motherbee",
+                        "target_l2_name": "WF.demo@motherbee",
+                        "kind": "oneshot",
+                        "fire_at_utc_ms": 1775577600000_i64,
+                        "missed_policy": "fire",
+                        "status": "pending",
+                        "created_at_utc_ms": 1775574000000_i64,
+                        "fire_count": 0_u64
+                    }]
+                }),
+            };
+            inbound_tx.send(Ok(response)).await.expect("send timer list");
+        });
+
+        let response = client
+            .list_mine(TimerListFilter {
+                status_filter: Some(TimerStatusFilter::Pending),
+                limit: Some(100),
+                ..TimerListFilter::default()
+            })
+            .await
+            .expect("list mine");
+        assert_eq!(response.count, 1);
+        assert_eq!(response.timers[0].uuid.as_str(), "timer-1");
+    }
+
+    fn test_transport(
+        full_name: &str,
+    ) -> (
+        NodeSender,
+        NodeReceiver,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+        tokio::sync::mpsc::Sender<Result<Message, NodeError>>,
+    ) {
+        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(8);
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(8);
+        let state = std::sync::Arc::new(crate::split::ConnectionState::new_connected());
+        let info = std::sync::Arc::new(crate::split::ConnectionInfo::new(
+            "src-uuid".to_string(),
+            full_name.to_string(),
+            7,
+            state,
+        ));
+        (
+            NodeSender::new(outbound_tx, std::sync::Arc::clone(&info)),
+            NodeReceiver::new(inbound_rx, info),
+            outbound_rx,
+            inbound_tx,
+        )
+    }
+
+    async fn next_request(outbound_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>) -> Message {
+        let frame = outbound_rx.recv().await.expect("outbound frame");
+        serde_json::from_slice(&frame).expect("decode outbound message")
     }
 }
