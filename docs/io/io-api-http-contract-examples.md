@@ -10,9 +10,9 @@
 
 Este documento complementa la especificacion general de `IO.api` con:
 
-- el contrato de `POST /messages`;
+- el contrato de `POST /`;
 - la respuesta esperada del endpoint;
-- el comportamiento de `GET /schema`;
+- el comportamiento de `GET /`;
 - ejemplos minimos por `subject_mode`;
 - el camino de attachments desde dia 0.
 
@@ -25,12 +25,19 @@ La especificacion general sigue siendo la fuente de verdad sobre arquitectura, e
 ### 2.1 Endpoint principal
 
 ```text
-POST /messages
+POST /
 ```
 
 ### 2.2 Endpoint de introspeccion
 
 ```text
+GET /
+```
+
+Aliases legacy compatibles:
+
+```text
+POST /messages
 GET /schema
 ```
 
@@ -60,7 +67,7 @@ No autentica automaticamente al sujeto conversacional salvo que la instancia est
 
 ---
 
-## 3. Respuesta general de `POST /messages`
+## 3. Respuesta general de `POST /`
 
 `IO.api` no espera el resultado final del procesamiento dentro de Fluxbee, pero `subject_mode = explicit_subject` puede esperar la etapa de identity antes de devolver respuesta.
 
@@ -209,11 +216,11 @@ Notas:
 
 ---
 
-## 4. `GET /schema`
+## 4. `GET /`
 
 ## 4.1 Objetivo
 
-`GET /schema` devuelve el contrato efectivo de la instancia actual.
+`GET /` devuelve el contrato efectivo de la instancia actual.
 
 No debe devolver una union abstracta de todos los modos del runtime.
 
@@ -326,7 +333,7 @@ No debe devolver una union abstracta de todos los modos del runtime.
 
 ---
 
-## 5. Shape normativo de `POST /messages` en `application/json`
+## 5. Shape normativo de `POST /` en `application/json`
 
 ## 5.1 Envelope comun
 
@@ -754,13 +761,14 @@ No define todavia:
 
 ## 14. Decisiones cerradas por este documento
 
-1. `POST /messages` es el endpoint de ingreso normativo.
-2. `GET /schema` es el endpoint normativo de introspeccion.
-3. `POST /messages` responde `202 Accepted` al aceptar el request; en `explicit_subject` esa aceptacion ocurre solo despues de la etapa de identity.
+1. `POST /` es el endpoint de ingreso normativo.
+2. `GET /` es el endpoint normativo de introspeccion.
+3. `POST /` responde `202 Accepted` al aceptar el request; en `explicit_subject` esa aceptacion ocurre solo despues de la etapa de identity.
 4. `application/json` y `multipart/form-data` son los content types minimos soportados.
 5. `multipart/form-data` es el camino normativo para attachments binarios.
 6. `explicit_subject` y `caller_is_subject` son los modos de sujeto normativos de v1.
-7. El contrato efectivo de la instancia se obtiene por configuracion y se refleja en `GET /schema`.
-8. `GET /schema` describe el contrato efectivo de la instancia.
+7. El contrato efectivo de la instancia se obtiene por configuracion y se refleja en `GET /`.
+8. `GET /` describe el contrato efectivo de la instancia.
+9. `POST /messages` y `GET /schema` pueden mantenerse como aliases legacy compatibles.
 9. Los attachments deben materializarse como blobs y viajar internamente como `blob_ref`.
 10. La credencial Bearer autentica al caller del endpoint.

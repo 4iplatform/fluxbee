@@ -272,7 +272,10 @@ mod tests {
 
     fn assert_no_legacy_context_ich(msg: &fluxbee_sdk::protocol::Message) {
         let legacy = msg.meta.context.as_ref().and_then(|ctx| ctx.get("ich"));
-        assert!(legacy.is_none(), "legacy meta.context.ich should not be present");
+        assert!(
+            legacy.is_none(),
+            "legacy meta.context.ich should not be present"
+        );
     }
 
     #[tokio::test]

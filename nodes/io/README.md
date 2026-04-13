@@ -5,7 +5,7 @@ This subtree hosts IO crates isolated from core routing/AI crates.
 ## Crates
 
 - `crates/io-common`: shared IO helpers (dedup, identity lookup, io context, inbound relay/sessionization).
-- `crates/io-api`: generic HTTP ingress IO node (`GET /schema`, `POST /messages`, auth bearer, relay, attachments/blob).
+- `crates/io-api`: generic HTTP ingress IO node (`GET /`, `POST /`, auth bearer, relay, attachments/blob; legacy aliases: `GET /schema`, `POST /messages`).
 - `crates/io-sim`: simulation IO node for local/Linux E2E tests (stdin/--once inbound, log-only outbound).
 - `crates/io-slack`: Slack IO node (Socket Mode inbound, Web API outbound).
 

@@ -49,8 +49,9 @@ Por lo tanto:
 
 `IO.api` es responsable de:
 
-- exponer `POST /messages`;
-- exponer `GET /schema`;
+- exponer `POST /` como endpoint principal de ingreso;
+- exponer `GET /` como endpoint principal de introspeccion;
+- mantener `POST /messages` y `GET /schema` como aliases legacy compatibles;
 - autenticar y autorizar al caller externo;
 - validar el request segun el contrato efectivo de la instancia;
 - construir un `ResolveOrCreateInput` segun el `subject_mode` de la instancia;
@@ -122,7 +123,7 @@ Regla:
 
 ### 2.5 Endpoint parcialmente sincronico segun `subject_mode`
 
-`POST /messages` no espera el resultado final del sistema, pero tampoco es completamente asincrono en todos los modos.
+`POST /` no espera el resultado final del sistema, pero tampoco es completamente asincrono en todos los modos.
 
 Regla normativa:
 
@@ -174,9 +175,9 @@ El nodo arranco, pero todavia no tiene configuracion efectiva suficiente para ac
 
 En este estado:
 
-- debe exponer `GET /schema`;
-- no debe aceptar `POST /messages`;
-- debe responder `503 Service Unavailable` con `error_code=node_not_configured` en `POST /messages`.
+- debe exponer `GET /`;
+- no debe aceptar `POST /` para trafico de negocio;
+- debe responder `503 Service Unavailable` con `error_code=node_not_configured` en `POST /`.
 
 ### 4.2 CONFIGURED
 
@@ -189,8 +190,8 @@ La configuracion es invalida o insuficiente para operar correctamente.
 En este estado:
 
 - debe seguir vivo;
-- debe exponer `GET /schema`;
-- no debe aceptar `POST /messages`;
+- debe exponer `GET /`;
+- no debe aceptar `POST /`;
 - debe reportar explicitamente el motivo del fallo en schema/status/control plane.
 
 ---
@@ -335,7 +336,7 @@ El nodo no debe loggear en claro:
 
 En v1, `subject_mode` es configuracion de instancia, no switch por request.
 
-La instancia concreta elige uno y `GET /schema` debe reflejarlo.
+La instancia concreta elige uno y `GET /` debe reflejarlo.
 
 ### 7.2 `explicit_subject`
 
@@ -421,12 +422,17 @@ No es obligatorio para v1.
 
 ### 8.1 Endpoints obligatorios en v1
 
+- `POST /`
+- `GET /`
+
+Aliases legacy compatibles:
+
 - `POST /messages`
 - `GET /schema`
 
-### 8.2 Naturaleza de `POST /messages`
+### 8.2 Naturaleza de `POST /`
 
-`POST /messages` tiene comportamiento distinto segun `subject_mode`.
+`POST /` tiene comportamiento distinto segun `subject_mode`.
 
 #### `caller_is_subject`
 
@@ -492,11 +498,11 @@ Tratamiento recomendado:
 
 ---
 
-## 9. `GET /schema`
+## 9. `GET /`
 
 ### 9.1 Objetivo
 
-`GET /schema` debe describir el contrato efectivo de la instancia en ejecucion.
+`GET /` debe describir el contrato efectivo de la instancia en ejecucion.
 
 No debe devolver una union ambigua de todos los modos posibles del runtime.
 
@@ -515,11 +521,11 @@ En estado configurado, debe devolver al menos:
 - metadata de attachments;
 - metadata de relay;
 - metadata de secretos redacted;
-- informacion suficiente para construir un `CONFIG_SET` valido o para integrar contra `POST /messages`.
+- informacion suficiente para construir un `CONFIG_SET` valido o para integrar contra `POST /`.
 
 ### 9.3 Relacion con Control Plane
 
-`GET /schema` es introspeccion HTTP del contrato de ingreso.
+`GET /` es introspeccion HTTP del contrato de ingreso.
 
 No reemplaza:
 
@@ -689,9 +695,10 @@ Sin incluir payload sensible completo ni secretos.
 8. Debe distinguir caller autenticado de sujeto conversacional.
 9. Debe soportar `explicit_subject` y `caller_is_subject` en v1.
 10. `subject_mode` es configuracion de instancia, no switch por request en v1.
-11. Debe exponer `POST /messages` y `GET /schema`.
-12. `POST /messages` es asincrono y responde `202 Accepted` cuando acepta el ingreso.
-13. `GET /schema` describe el contrato efectivo de la instancia.
+11. Debe exponer `POST /` y `GET /`.
+12. `POST /` es asincrono y responde `202 Accepted` cuando acepta el ingreso.
+13. `GET /` describe el contrato efectivo de la instancia.
+14. `POST /messages` y `GET /schema` pueden mantenerse como aliases legacy.
 14. Debe soportar attachments desde dia 0.
 15. El camino recomendado para attachments es `multipart/form-data`.
 16. Internamente, los archivos deben convertirse a blobs canonicos.
@@ -720,8 +727,8 @@ Sin incluir payload sensible completo ni secretos.
 
 - runtime `IO.api`
 - configuracion de instancia
-- `POST /messages`
-- `GET /schema`
+- `POST /`
+- `GET /`
 - auth `api_key`
 - `subject_mode=explicit_subject`
 - `subject_mode=caller_is_subject`

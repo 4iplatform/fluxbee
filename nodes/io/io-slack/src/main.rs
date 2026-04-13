@@ -1534,8 +1534,8 @@ async fn collect_slack_blob_attachments(
 #[cfg(test)]
 mod tests {
     use super::{
-        default_slack_allowed_mimes, extract_runtime_relay_config, slack_relay_policy_from_config,
-        build_system_reply, SlackRelayConfig,
+        build_system_reply, default_slack_allowed_mimes, extract_runtime_relay_config,
+        slack_relay_policy_from_config, SlackRelayConfig,
     };
     use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing};
     use serde_json::json;
@@ -1669,13 +1669,19 @@ mod tests {
             payload: json!({}),
         };
 
-        let reply = build_system_reply(&incoming, "IO.slack.test@motherbee", "PONG", json!({ "ok": true }));
+        let reply = build_system_reply(
+            &incoming,
+            "IO.slack.test@motherbee",
+            "PONG",
+            json!({ "ok": true }),
+        );
 
         assert_eq!(reply.meta.ich.as_deref(), Some("slack://U123"));
         assert_eq!(reply.meta.thread_id.as_deref(), Some("thread:canonical-1"));
         assert_eq!(reply.meta.thread_seq, Some(7));
         assert_eq!(
-            reply.meta
+            reply
+                .meta
                 .context
                 .as_ref()
                 .and_then(|ctx| ctx.get("io"))

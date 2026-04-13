@@ -365,6 +365,7 @@ async fn main() -> Result<()> {
 
 async fn run_http_server(listener: TcpListener, state: Arc<HttpState>) -> Result<()> {
     let app = Router::new()
+        .route("/", get(get_schema).post(post_messages))
         .route("/schema", get(get_schema))
         .route("/messages", post(post_messages))
         .with_state(state);
