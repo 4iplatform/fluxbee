@@ -215,31 +215,49 @@ build_spawn_config_json() {
     return
   fi
 
-  python3 - <<PY | sanitize_config_json
+  local raw_cfg
+  raw_cfg="$(
+    LISTEN_ADDRESS="$LISTEN_ADDRESS" \
+    LISTEN_PORT="$LISTEN_PORT" \
+    DST_NODE="$DST_NODE" \
+    BLOB_ROOT="$BLOB_ROOT" \
+    IDENTITY_TARGET="$IDENTITY_TARGET" \
+    IDENTITY_TIMEOUT_MS="$IDENTITY_TIMEOUT_MS" \
+    python3 - <<'PY'
 import json
+import os
+
+listen_address = os.environ.get("LISTEN_ADDRESS", "")
+listen_port = os.environ.get("LISTEN_PORT", "")
+dst_node = os.environ.get("DST_NODE", "")
+blob_root = os.environ.get("BLOB_ROOT", "")
+identity_target = os.environ.get("IDENTITY_TARGET", "")
+identity_timeout_ms = os.environ.get("IDENTITY_TIMEOUT_MS", "")
 
 cfg = {
 }
 
-if "${LISTEN_ADDRESS}" and "${LISTEN_PORT}":
+if listen_address and listen_port:
     cfg["listen"] = {
-        "address": "${LISTEN_ADDRESS}",
-        "port": int("${LISTEN_PORT}")
+        "address": listen_address,
+        "port": int(listen_port)
     }
-elif "${LISTEN_ADDRESS}" or "${LISTEN_PORT}":
+elif listen_address or listen_port:
     raise SystemExit("listen.address and listen.port must be provided together")
 
-if "${DST_NODE}":
-    cfg.setdefault("io", {})["dst_node"] = "${DST_NODE}"
-if "${BLOB_ROOT}":
-    cfg.setdefault("blob", {})["path"] = "${BLOB_ROOT}"
-if "${IDENTITY_TARGET}":
-    cfg["identity_target"] = "${IDENTITY_TARGET}"
-if "${IDENTITY_TIMEOUT_MS}":
-    cfg["identity_timeout_ms"] = int("${IDENTITY_TIMEOUT_MS}")
+if dst_node:
+    cfg.setdefault("io", {})["dst_node"] = dst_node
+if blob_root:
+    cfg.setdefault("blob", {})["path"] = blob_root
+if identity_target:
+    cfg["identity_target"] = identity_target
+if identity_timeout_ms:
+    cfg["identity_timeout_ms"] = int(identity_timeout_ms)
 
 print(json.dumps(cfg, separators=(",", ":")))
 PY
+  )"
+  sanitize_config_json <<<"$raw_cfg"
 }
 
 fetch_existing_config_json() {
@@ -460,6 +478,7 @@ if [[ -z "$TENANT_ID" && -z "${ORCH_DEFAULT_TENANT_ID:-}" ]]; then
 fi
 
 spawn_cfg_json="$(build_spawn_config_json)"
+log "step=spawn_config config=$spawn_cfg_json"
 
 spawn_payload="$(NODE_NAME="$NODE_NAME" RUNTIME="$RUNTIME" RUNTIME_VERSION="$RUNTIME_VERSION" TENANT_ID="$TENANT_ID" SPAWN_CFG_JSON="$spawn_cfg_json" python3 - <<'PY'
 import json
