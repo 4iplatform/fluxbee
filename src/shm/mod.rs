@@ -1073,6 +1073,16 @@ impl ConfigRegionReader {
         read_config_snapshot(header, self.mmap.as_ref(), &self.layout)
     }
 
+    pub fn read_header(&self) -> Option<ConfigHeaderSnapshot> {
+        let header = self.header_ref()?;
+        Some(ConfigHeaderSnapshot {
+            static_route_count: header.static_route_count,
+            vpn_assignment_count: header.vpn_assignment_count,
+            config_version: header.config_version,
+            heartbeat: header.heartbeat,
+        })
+    }
+
     fn header_ref(&self) -> Option<&ConfigHeader> {
         header_ref::<ConfigHeader>(self.mmap.as_ref(), self.layout.header_offset)
     }

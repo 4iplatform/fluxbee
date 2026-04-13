@@ -133,27 +133,27 @@ if [[ "${SKIP_BUILD:-}" != "1" ]]; then
   fi
 fi
 
-if [[ -d "$ROOT_DIR/sy-opa-rules" ]]; then
+if [[ -d "$ROOT_DIR/go/sy-opa-rules" ]]; then
   if [[ "${SKIP_BUILD:-}" == "1" || "${SKIP_GO_BUILD:-}" == "1" ]]; then
     echo "SKIP_BUILD/SKIP_GO_BUILD set; skipping sy-opa-rules build."
   elif ! command -v go >/dev/null 2>&1; then
     echo "Warning: go not found. Skipping sy-opa-rules build." >&2
   else
     echo "Building sy-opa-rules (Go)..."
-    rm -f "$ROOT_DIR/sy-opa-rules/sy-opa-rules"
-    (cd "$ROOT_DIR/sy-opa-rules" && go build -o sy-opa-rules .)
+    rm -f "$ROOT_DIR/go/sy-opa-rules/sy-opa-rules"
+    (cd "$ROOT_DIR/go/sy-opa-rules" && go build -o sy-opa-rules .)
   fi
 fi
 
-if [[ -d "$ROOT_DIR/sy-timer" ]]; then
+if [[ -d "$ROOT_DIR/go/sy-timer" ]]; then
   if [[ "${SKIP_BUILD:-}" == "1" || "${SKIP_GO_BUILD:-}" == "1" ]]; then
     echo "SKIP_BUILD/SKIP_GO_BUILD set; skipping sy-timer build."
   elif ! command -v go >/dev/null 2>&1; then
     echo "Warning: go not found. Skipping sy-timer build." >&2
   else
     echo "Building sy-timer (Go)..."
-    rm -f "$ROOT_DIR/sy-timer/sy-timer"
-    (cd "$ROOT_DIR/sy-timer" && go build -o sy-timer .)
+    rm -f "$ROOT_DIR/go/sy-timer/sy-timer"
+    (cd "$ROOT_DIR/go/sy-timer" && go build -o sy-timer .)
   fi
 fi
 
@@ -231,23 +231,23 @@ sy_cognition_bin="$(pick_bin sy_cognition)" || { echo "Missing binary: $BIN_DIR/
 sy_policy_bin="$(pick_bin sy_policy)" || { echo "Missing binary: $BIN_DIR/sy_policy" >&2; missing=1; }
 sy_frontdesk_gov_bin="$(pick_bin sy-frontdesk-gov)" || { echo "Missing binary: $BIN_DIR/sy-frontdesk-gov" >&2; missing=1; }
 sy_opa_rules_bin=""
-if [[ -f "$ROOT_DIR/sy-opa-rules/sy-opa-rules" ]]; then
-  sy_opa_rules_bin="$ROOT_DIR/sy-opa-rules/sy-opa-rules"
+if [[ -f "$ROOT_DIR/go/sy-opa-rules/sy-opa-rules" ]]; then
+  sy_opa_rules_bin="$ROOT_DIR/go/sy-opa-rules/sy-opa-rules"
 elif sy_opa_rules_bin="$(pick_bin sy_opa_rules || true)"; then
   :
 fi
 if [[ -z "${sy_opa_rules_bin:-}" ]]; then
-  echo "Missing binary: $ROOT_DIR/sy-opa-rules/sy-opa-rules or $BIN_DIR/sy_opa_rules" >&2
+  echo "Missing binary: $ROOT_DIR/go/sy-opa-rules/sy-opa-rules or $BIN_DIR/sy_opa_rules" >&2
   missing=1
 fi
 sy_timer_bin=""
-if [[ -f "$ROOT_DIR/sy-timer/sy-timer" ]]; then
-  sy_timer_bin="$ROOT_DIR/sy-timer/sy-timer"
+if [[ -f "$ROOT_DIR/go/sy-timer/sy-timer" ]]; then
+  sy_timer_bin="$ROOT_DIR/go/sy-timer/sy-timer"
 elif sy_timer_bin="$(pick_bin sy_timer || true)"; then
   :
 fi
 if [[ -z "${sy_timer_bin:-}" ]]; then
-  echo "Missing binary: $ROOT_DIR/sy-timer/sy-timer or $BIN_DIR/sy_timer" >&2
+  echo "Missing binary: $ROOT_DIR/go/sy-timer/sy-timer or $BIN_DIR/sy_timer" >&2
   missing=1
 fi
 

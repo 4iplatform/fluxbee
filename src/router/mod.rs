@@ -3525,20 +3525,13 @@ async fn refresh_config(
 ) -> Option<ConfigSnapshot> {
     let mut last_snapshot = None;
     for attempt in 0..2 {
-        let snapshot = {
-            let mut reader = config_reader.lock().await;
-            if force && attempt == 0 {
-                *reader = None;
-            }
-            if reader.is_none() {
-                if let Ok(new_reader) =
-                    ConfigRegionReader::open_read_only(&format!("/jsr-config-{}", hive_id))
-                {
-                    *reader = Some(new_reader);
-                }
-            }
-            reader.as_ref().and_then(|r| r.read_snapshot())
-        };
+        let snapshot = read_config_snapshot_for_routing(
+            config_reader,
+            hive_id,
+            HEARTBEAT_STALE_MS,
+            force && attempt == 0,
+        )
+        .await;
         let Some(snapshot) = snapshot else {
             return None;
         };
@@ -3601,6 +3594,39 @@ async fn refresh_config(
         break;
     }
     last_snapshot
+}
+
+async fn read_config_snapshot_for_routing(
+    config_reader: &Arc<Mutex<Option<ConfigRegionReader>>>,
+    hive_id: &str,
+    stale_after_ms: u64,
+    force_reopen: bool,
+) -> Option<ConfigSnapshot> {
+    let shm_name = format!("/jsr-config-{}", hive_id);
+    let now = now_epoch_ms();
+    let mut guard = config_reader.lock().await;
+
+    if force_reopen {
+        *guard = None;
+    }
+
+    let needs_reopen = match guard.as_ref() {
+        None => true,
+        Some(reader) => match reader.read_header() {
+            Some(header) => now.saturating_sub(header.heartbeat) > stale_after_ms,
+            None => true,
+        },
+    };
+    if needs_reopen {
+        *guard = ConfigRegionReader::open_read_only(&shm_name).ok();
+    }
+
+    if let Some(snapshot) = guard.as_ref().and_then(|reader| reader.read_snapshot()) {
+        return Some(snapshot);
+    }
+
+    *guard = ConfigRegionReader::open_read_only(&shm_name).ok();
+    guard.as_ref().and_then(|reader| reader.read_snapshot())
 }
 
 async fn apply_opa_reload(
@@ -6024,6 +6050,75 @@ mod tests {
         );
 
         cleanup(&shm_name);
+    }
+
+    #[tokio::test]
+    async fn config_reader_reopens_after_shm_recreation_when_old_reader_is_stale() {
+        use nix::sys::mman::shm_unlink;
+        use std::ffi::CString;
+
+        let hive_id = format!("cfgtest-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let shm_name = format!("/jsr-config-{}", hive_id);
+        let cleanup = |name: &str| {
+            if let Ok(cstr) = CString::new(name) {
+                let _ = shm_unlink(cstr.as_c_str());
+            }
+        };
+        cleanup(&shm_name);
+
+        let make_route = |prefix: &str| {
+            let mut entry = crate::shm::StaticRouteEntry {
+                prefix: [0; 256],
+                prefix_len: 0,
+                match_kind: MATCH_PREFIX,
+                action: ACTION_FORWARD,
+                next_hop_hive: [0; 32],
+                next_hop_hive_len: 0,
+                _pad: [0; 3],
+                metric: 1,
+                priority: 1,
+                flags: FLAG_ACTIVE,
+                installed_at: 1,
+                _reserved: [0; 8],
+            };
+            entry.prefix_len = copy_bytes_with_len(&mut entry.prefix, prefix) as u16;
+            entry.next_hop_hive_len =
+                copy_bytes_with_len(&mut entry.next_hop_hive, "worker") as u8;
+            entry
+        };
+
+        let mut writer =
+            crate::shm::ConfigRegionWriter::open_or_create(&shm_name, Uuid::new_v4(), &hive_id)
+                .expect("create config writer");
+        writer
+            .write_static_routes(&[make_route("old.")], true)
+            .expect("write initial config snapshot");
+
+        let stale_reader =
+            ConfigRegionReader::open_read_only(&shm_name).expect("open stale config reader");
+        let shared_reader = Arc::new(Mutex::new(Some(stale_reader)));
+
+        cleanup(&shm_name);
+
+        let mut replacement_writer =
+            crate::shm::ConfigRegionWriter::open_or_create(&shm_name, Uuid::new_v4(), &hive_id)
+                .expect("create replacement config writer");
+        replacement_writer
+            .write_static_routes(&[make_route("fresh.")], true)
+            .expect("write replacement config snapshot");
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let snapshot = read_config_snapshot_for_routing(&shared_reader, &hive_id, 1, false)
+            .await
+            .expect("router should reopen stale config reader");
+        assert_eq!(snapshot.routes.len(), 1);
+        let prefix_len = snapshot.routes[0].prefix_len as usize;
+        assert_eq!(
+            std::str::from_utf8(&snapshot.routes[0].prefix[..prefix_len]).expect("utf8 prefix"),
+            "fresh.",
+            "router must reopen jsr-config and observe the replacement snapshot"
+        );
     }
 
     #[tokio::test]
