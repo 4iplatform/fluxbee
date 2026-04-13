@@ -384,7 +384,7 @@ func (s *Service) respondTimerSchedule(incoming fluxbeesdk.Message) error {
 	if err := json.Unmarshal(incoming.Payload, &req); err != nil {
 		return s.sendTimerError(incoming, "TIMER_SCHEDULE", "TIMER_INVALID_PAYLOAD", err.Error())
 	}
-	ownerL2, err := s.resolveSourceL2Name(incoming.Routing.Src)
+	ownerL2, err := s.resolveSourceL2NameFromMsg(incoming)
 	if err != nil {
 		return s.sendTimerError(incoming, "TIMER_SCHEDULE", "TIMER_INTERNAL", err.Error())
 	}
@@ -465,7 +465,7 @@ func (s *Service) respondTimerScheduleRecurring(incoming fluxbeesdk.Message) err
 	if err := json.Unmarshal(incoming.Payload, &req); err != nil {
 		return s.sendTimerError(incoming, "TIMER_SCHEDULE_RECURRING", "TIMER_INVALID_PAYLOAD", err.Error())
 	}
-	ownerL2, err := s.resolveSourceL2Name(incoming.Routing.Src)
+	ownerL2, err := s.resolveSourceL2NameFromMsg(incoming)
 	if err != nil {
 		return s.sendTimerError(incoming, "TIMER_SCHEDULE_RECURRING", "TIMER_INTERNAL", err.Error())
 	}
@@ -620,7 +620,7 @@ func (s *Service) respondTimerCancel(incoming fluxbeesdk.Message) error {
 	if strings.TrimSpace(req.TimerUUID) == "" {
 		return s.sendTimerError(incoming, "TIMER_CANCEL", "TIMER_INVALID_PAYLOAD", "timer_uuid must be non-empty")
 	}
-	ownerL2, err := s.resolveSourceL2Name(incoming.Routing.Src)
+	ownerL2, err := s.resolveSourceL2NameFromMsg(incoming)
 	if err != nil {
 		return s.sendTimerError(incoming, "TIMER_CANCEL", "TIMER_INTERNAL", err.Error())
 	}
@@ -664,7 +664,7 @@ func (s *Service) respondTimerReschedule(incoming fluxbeesdk.Message) error {
 	if strings.TrimSpace(req.TimerUUID) == "" {
 		return s.sendTimerError(incoming, "TIMER_RESCHEDULE", "TIMER_INVALID_PAYLOAD", "timer_uuid must be non-empty")
 	}
-	ownerL2, err := s.resolveSourceL2Name(incoming.Routing.Src)
+	ownerL2, err := s.resolveSourceL2NameFromMsg(incoming)
 	if err != nil {
 		return s.sendTimerError(incoming, "TIMER_RESCHEDULE", "TIMER_INTERNAL", err.Error())
 	}
@@ -713,7 +713,7 @@ func (s *Service) respondTimerPurgeOwner(incoming fluxbeesdk.Message) error {
 	if err := json.Unmarshal(incoming.Payload, &req); err != nil {
 		return s.sendTimerError(incoming, "TIMER_PURGE_OWNER", "TIMER_INVALID_PAYLOAD", err.Error())
 	}
-	requesterL2, err := s.resolveSourceL2Name(incoming.Routing.Src)
+	requesterL2, err := s.resolveSourceL2NameFromMsg(incoming)
 	if err != nil {
 		return s.sendTimerError(incoming, "TIMER_PURGE_OWNER", "TIMER_INTERNAL", err.Error())
 	}
@@ -797,15 +797,23 @@ func nullableJSONValue(value string) any {
 	return value
 }
 
-func (s *Service) resolveSourceL2Name(sourceUUID string) (string, error) {
+// resolveSourceL2NameFromMsg returns the canonical L2 name of the sender.
+// It reads routing.src_l2_name stamped by the router on delivery.
+// Falls back to the SHM-based resolver only when the stamp is absent (e.g.
+// during the transition window before all routers in the hive are updated).
+func (s *Service) resolveSourceL2NameFromMsg(incoming fluxbeesdk.Message) (string, error) {
+	if name := incoming.SourceL2Name(); name != "" {
+		return name, nil
+	}
+	// Fallback: SHM lookup for routers that have not yet been updated.
 	if s.resolvePeerL2Name != nil {
-		return s.resolvePeerL2Name(sourceUUID)
+		return s.resolvePeerL2Name(incoming.Routing.Src)
 	}
 	_, hive, ok := strings.Cut(s.nodeName, "@")
 	if !ok || strings.TrimSpace(hive) == "" {
 		return "", fmt.Errorf("service node name missing hive suffix")
 	}
-	return fluxbeesdk.ResolvePeerL2Name(sourceUUID, fluxbeesdk.PeerIdentityResolver{
+	return fluxbeesdk.ResolvePeerL2Name(incoming.Routing.Src, fluxbeesdk.PeerIdentityResolver{
 		ConfigDir:  configDir,
 		StateDir:   stateDir,
 		HiveID:     hive,

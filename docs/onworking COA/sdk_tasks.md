@@ -322,11 +322,11 @@ Decisión tomada:
 
 ### L2-LOOKUP-4 - SDK Go
 
-- [ ] L2-LOOKUP-13. Extender el envelope/protocol del SDK Go con `routing.src_l2_name`.
-- [ ] L2-LOOKUP-14. Agregar helper canónico equivalente para consumidores Go.
-- [ ] L2-LOOKUP-15. Remover el lookup `uuid -> L2` por SHM para mensajes recibidos.
-- [ ] L2-LOOKUP-16. Mantener solo las capacidades de conexión/lifecycle necesarias; el SDK Go deja de exponer resolución de remitente por SHM como camino normal.
-- [ ] L2-LOOKUP-17. Actualizar tests wire y fixtures del SDK Go.
+- [x] L2-LOOKUP-13. Extender el envelope/protocol del SDK Go con `routing.src_l2_name`.
+- [x] L2-LOOKUP-14. Agregar helper canónico equivalente para consumidores Go.
+- [x] L2-LOOKUP-15. Remover el lookup `uuid -> L2` por SHM para mensajes recibidos.
+- [x] L2-LOOKUP-16. Mantener solo las capacidades de conexión/lifecycle necesarias; el SDK Go deja de exponer resolución de remitente por SHM como camino normal.
+- [x] L2-LOOKUP-17. Actualizar tests wire y fixtures del SDK Go.
 
 ### L2-LOOKUP-5 - Migración de nodos y cleanup
 

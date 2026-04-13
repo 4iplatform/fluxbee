@@ -205,6 +205,20 @@ const (
 	ScopeGlobal              = "global"
 )
 
+// SourceL2Name returns the canonical L2 name of the sender as stamped by the
+// router on delivery. Node code should read sender identity from here rather
+// than performing any router SHM lookup.
+//
+// Returns an empty string when the field is absent, which only happens for
+// messages constructed locally before sending or for router-generated control
+// messages (UNREACHABLE, TTL_EXCEEDED, ANNOUNCE).
+func (m *Message) SourceL2Name() string {
+	if m.Routing.SrcL2Name == nil {
+		return ""
+	}
+	return *m.Routing.SrcL2Name
+}
+
 func MarshalPayload(value any) (json.RawMessage, error) {
 	if raw, ok := value.(json.RawMessage); ok {
 		return raw, nil

@@ -33,6 +33,16 @@ const (
 	routerSeqlockReadTimeout        = 5 * time.Millisecond
 )
 
+// PeerIdentityResolver resolves a peer UUID to its canonical L2 name by
+// reading the local router SHM directly.
+//
+// Deprecated for received-message identity: since the router now stamps
+// routing.src_l2_name on every delivery, node code should call
+// Message.SourceL2Name() instead of using this resolver for incoming messages.
+//
+// This type is retained for use cases that require out-of-band UUID→L2
+// resolution (e.g. SY.timer ownership enforcement for messages that arrived
+// before the stamp was available, or diagnostic tooling).
 type PeerIdentityResolver struct {
 	ConfigDir     string
 	StateDir      string
