@@ -259,6 +259,34 @@ pub(crate) fn extract_runtime_dst_node(effective_config: Option<&Value>) -> Opti
         .map(ToString::to_string)
 }
 
+pub(crate) fn extract_runtime_listen_addr(
+    effective_config: Option<&Value>,
+    default_listen_addr: &str,
+) -> String {
+    let Some(listen) = effective_config
+        .and_then(|cfg| cfg.get("listen"))
+        .and_then(Value::as_object)
+    else {
+        return default_listen_addr.to_string();
+    };
+
+    let address = listen
+        .get("address")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let port = listen.get("port").and_then(|value| match value {
+        Value::Number(number) => number.as_u64().and_then(|raw| u16::try_from(raw).ok()),
+        Value::String(text) => text.parse::<u16>().ok(),
+        _ => None,
+    });
+
+    match (address, port) {
+        (Some(address), Some(port)) => format!("{address}:{port}"),
+        _ => default_listen_addr.to_string(),
+    }
+}
+
 pub(crate) fn load_spawn_config(node_name: &str) -> Result<SpawnConfig> {
     let path = managed_node_config_path(node_name)
         .map_err(|err| anyhow::anyhow!("failed to resolve managed config path: {err}"))?;
@@ -367,4 +395,36 @@ fn json_get_path<'a>(root: &'a Value, dotted_path: &str) -> Option<&'a Value> {
         current = current.get(segment)?;
     }
     Some(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_runtime_listen_addr;
+
+    #[test]
+    fn extract_runtime_listen_addr_prefers_effective_config() {
+        let effective = serde_json::json!({
+            "listen": {
+                "address": "127.0.0.1",
+                "port": 18081
+            }
+        });
+
+        let addr = extract_runtime_listen_addr(Some(&effective), "127.0.0.1:8080");
+
+        assert_eq!(addr, "127.0.0.1:18081");
+    }
+
+    #[test]
+    fn extract_runtime_listen_addr_falls_back_when_incomplete() {
+        let effective = serde_json::json!({
+            "listen": {
+                "address": "127.0.0.1"
+            }
+        });
+
+        let addr = extract_runtime_listen_addr(Some(&effective), "127.0.0.1:8080");
+
+        assert_eq!(addr, "127.0.0.1:8080");
+    }
 }

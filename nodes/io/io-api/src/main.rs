@@ -61,7 +61,7 @@ use attachments::{
 use auth::{authenticate_bearer, extract_bearer_token, prepare_runtime_api_config};
 use config::{
     api_relay_policy, api_relay_policy_from_config, extract_runtime_dst_node,
-    extract_runtime_relay_config,
+    extract_runtime_listen_addr, extract_runtime_relay_config,
 };
 use http::{accepted_response, api_error};
 use schema::{
@@ -168,12 +168,35 @@ struct ParsedHttpMessage {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = Config::from_env()?;
+    let mut config = Config::from_env()?;
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         tracing_subscriber::EnvFilter::new("info,io_api=debug,fluxbee_sdk=info")
     });
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
+
+    let mut boot_state = bootstrap_io_control_plane_state(&config.state_dir, &config.node_name)
+        .unwrap_or_else(|err| {
+            tracing::warn!(
+                error = %err,
+                state_dir = %config.state_dir.display(),
+                node_name = %config.node_name,
+                "failed to bootstrap IO control-plane state; using UNCONFIGURED"
+            );
+            IoControlPlaneState::default()
+        });
+    let boot_listen_addr =
+        extract_runtime_listen_addr(boot_state.effective_config.as_ref(), &config.listen_addr);
+    if boot_listen_addr != config.listen_addr {
+        tracing::info!(
+            node_name = %config.node_name,
+            previous_listen = %config.listen_addr,
+            effective_listen = %boot_listen_addr,
+            config_source = %boot_state.config_source.as_str(),
+            "io-api boot listen overridden from effective config"
+        );
+        config.listen_addr = boot_listen_addr;
+    }
 
     tracing::info!(
         node_name = %config.node_name,
@@ -214,17 +237,6 @@ async fn main() -> Result<()> {
     ));
 
     let adapter_contract: Arc<dyn IoAdapterConfigContract> = Arc::new(IoApiAdapterConfigContract);
-    let mut boot_state = bootstrap_io_control_plane_state(&config.state_dir, &config.node_name)
-        .unwrap_or_else(|err| {
-            tracing::warn!(
-                error = %err,
-                state_dir = %config.state_dir.display(),
-                node_name = %config.node_name,
-                "failed to bootstrap IO control-plane state; using UNCONFIGURED"
-            );
-            IoControlPlaneState::default()
-        });
-
     let auth_registry = Arc::new(RwLock::new(ApiAuthRegistry::default()));
     if let Some(effective) = boot_state.effective_config.clone() {
         match prepare_runtime_api_config(&config.node_name, &effective, None) {
