@@ -53,12 +53,15 @@ Regla operativa acordada:
   - persistir `ANNOUNCE.router_name` en el estado de conexión
   - exponerlo en `NodeSender` / `NodeReceiver`
   - usar ese router efectivo para abrir `state/<router_l2_name>/identity.yaml` y su SHM
-- [ ] GO-SDK-7. Revisar si conviene extender `ANNOUNCE` con `shm_name` explícito para evitar lectura adicional de `identity.yaml`.
+- [~] GO-SDK-7. ~~Revisar si conviene extender `ANNOUNCE` con `shm_name` explícito para evitar lectura adicional de `identity.yaml`.~~
+  - **CANCELADO — código muerto.** Esta tarea era una optimización de `PeerIdentityResolver` (que leía `identity.yaml` para encontrar el nombre del SHM del router). Con la migración L2-LOOKUP completada, ningún nodo del repo llama ya a `PeerIdentityResolver` — el stamp `routing.src_l2_name` del router reemplaza por completo esa necesidad. No hay nada que optimizar porque el path ya no existe en producción.
+  - **Trabajo real pendiente: eliminar `identity.go`, `identity_linux.go`, `identity_other.go` del SDK Go.** No tienen callers en todo el repo (ni en código productivo ni en tests). Son código muerto limpio.
 - [x] GO-SDK-8. Revisar el modelo de múltiples routers por hive y congelar semántica para consumidores SDK:
   - un nodo puede conectarse a cualquier router local
   - la router SHM sigue siendo per-router, no una vista fusionada por hive
   - documentar esto como contrato explícito
-- [ ] GO-SDK-9. Portar readers SHM adicionales que hoy siguen faltando respecto del runtime Rust, empezando por los casos con valor real para nodos Go.
+- [~] GO-SDK-9. ~~Portar readers SHM adicionales que hoy siguen faltando respecto del runtime Rust, empezando por los casos con valor real para nodos Go.~~
+  - **CANCELADO — objetivo logrado por otro camino.** La paridad con Rust en cuanto a resolución de identidad de sender ya fue alcanzada mediante el stamp `routing.src_l2_name` en el router, no mediante readers SHM adicionales. El único reader SHM que existía en Go (`identity.go`) tampoco tiene callers. No hay ningún nodo Go activo que necesite leer SHM directamente para obtener identidad de sender.
 - [x] GO-SDK-10. Revisar el surface público del SDK Go y estabilizar política de versionado/compatibilidad para terceros.
 
 Estado actual del cierre del SDK Go:
