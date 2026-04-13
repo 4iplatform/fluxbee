@@ -309,12 +309,20 @@ async fn main() -> Result<()> {
         blob_payload_cfg,
     });
 
-    let http_listener = TcpListener::bind(&config.listen_addr)
-        .await
-        .map_err(|err| {
-            anyhow::anyhow!("failed to bind HTTP listener {}: {err}", config.listen_addr)
-        })?;
-    let http_task = tokio::spawn(run_http_server(http_listener, http_state.clone()));
+    let http_task = match try_bind_http_listener(
+        &config.node_name,
+        &config.listen_addr,
+        control_plane.clone(),
+        control_metrics.clone(),
+    )
+    .await
+    {
+        Some(http_listener) => Some(tokio::spawn(run_http_server(
+            http_listener,
+            http_state.clone(),
+        ))),
+        None => None,
+    };
     let relay_flush_task = tokio::spawn(run_relay_flush_loop(
         relay,
         sender.clone(),
@@ -335,7 +343,11 @@ async fn main() -> Result<()> {
         http_state_ref_for_runtime_updates(config.node_name.clone(), http_state),
     ));
 
-    let _ = tokio::join!(http_task, relay_flush_task, control_task);
+    if let Some(http_task) = http_task {
+        let _ = tokio::join!(http_task, relay_flush_task, control_task);
+    } else {
+        let _ = tokio::join!(relay_flush_task, control_task);
+    }
     Ok(())
 }
 
@@ -347,6 +359,40 @@ async fn run_http_server(listener: TcpListener, state: Arc<HttpState>) -> Result
     tracing::info!(addr = %listener.local_addr()?, "io-api http listener ready");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn try_bind_http_listener(
+    node_name: &str,
+    listen_addr: &str,
+    control_plane: Arc<RwLock<IoControlPlaneState>>,
+    control_metrics: Arc<IoControlPlaneMetrics>,
+) -> Option<TcpListener> {
+    match TcpListener::bind(listen_addr).await {
+        Ok(listener) => Some(listener),
+        Err(err) => {
+            let err_text = format!("failed to bind HTTP listener {listen_addr}: {err}");
+            {
+                let mut state = control_plane.write().await;
+                state.current_state = IoNodeLifecycleState::FailedConfig;
+                state.last_error = Some(IoControlPlaneErrorInfo {
+                    code: "listener_bind_failed".to_string(),
+                    message: err_text.clone(),
+                });
+            }
+            control_metrics.record_config_set_error(
+                IoNodeLifecycleState::FailedConfig.as_str(),
+                0,
+                "listener_bind_failed",
+            );
+            tracing::warn!(
+                node_name = %node_name,
+                listen_addr = %listen_addr,
+                error = %err,
+                "io-api http listener bind failed; node stays alive for control-plane recovery"
+            );
+            None
+        }
+    }
 }
 
 async fn run_router_control_loop(
