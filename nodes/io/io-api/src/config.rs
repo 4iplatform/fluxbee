@@ -211,7 +211,7 @@ impl Config {
                             &["blob.max_blob_bytes", "io.blob.max_blob_bytes"],
                         )
                     })
-                    .unwrap_or(IoBlobRuntimeConfig::default().max_blob_bytes),
+                    .or(IoBlobRuntimeConfig::default().max_blob_bytes),
                 text_v1: IoBlobRuntimeConfig::default().text_v1,
                 resolve_retry: IoBlobRuntimeConfig::default().resolve_retry,
             },
@@ -277,7 +277,7 @@ pub(crate) fn load_spawn_config(node_name: &str) -> Result<SpawnConfig> {
     Ok(SpawnConfig { path, doc })
 }
 
-fn extract_runtime_relay_config(
+pub(crate) fn extract_runtime_relay_config(
     effective_config: Option<&Value>,
     defaults: &ApiRelayConfig,
 ) -> Result<ApiRelayConfig> {

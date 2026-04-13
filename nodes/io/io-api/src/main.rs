@@ -10,17 +10,13 @@ mod subject;
 use anyhow::Result;
 use axum::body::to_bytes;
 use axum::extract::{FromRequest, Multipart, Request, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND};
-use fluxbee_sdk::{
-    build_node_secret_record, connect, load_node_secret_record_with_root,
-    save_node_secret_record_with_root, try_handle_default_node_status, NodeConfig,
-    NodeSecretWriteOptions, NodeUuidMode,
-};
+use fluxbee_sdk::{connect, try_handle_default_node_status, NodeConfig, NodeUuidMode};
 use io_common::identity::{
     IdentityProvisioner, IdentityResolver, ResolveOrCreateInput, ShmIdentityResolver,
 };
@@ -48,25 +44,23 @@ use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig, 
 use io_common::relay::{
     AssembledTurn, InMemoryRelayStore, RelayBuffer, RelayDecision, RelayFlushHints, RelayFragment,
 };
-use io_common::text_v1_blob::{build_text_v1_inbound_payload, IoTextBlobConfig};
-use serde_json::{Map, Value};
+use io_common::text_v1_blob::{
+    build_text_v1_inbound_payload, IoBlobRuntimeConfig, IoTextBlobConfig,
+};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
-use uuid::Uuid;
 
 use attachments::{
     collect_multipart_blob_attachments, effective_blob_payload_cfg, map_blob_error_to_http,
 };
-use auth::{
-    authenticate_bearer, extract_bearer_token, load_runtime_api_registry,
-    materialize_inline_api_keys, prepare_runtime_api_config, ApiAuthRegistry, ApiKeyRuntime,
-    AuthMatch,
-};
+use auth::{authenticate_bearer, extract_bearer_token, prepare_runtime_api_config};
 use config::{
-    api_relay_policy, api_relay_policy_from_config, extract_runtime_dst_node, load_spawn_config,
+    api_relay_policy, api_relay_policy_from_config, extract_runtime_dst_node,
+    extract_runtime_relay_config,
 };
 use http::{accepted_response, api_error};
 use schema::{
@@ -1308,6 +1302,12 @@ fn now_epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::header::AUTHORIZATION;
+    use fluxbee_sdk::{
+        build_node_secret_record, load_node_secret_record_with_root,
+        save_node_secret_record_with_root, NodeSecretWriteOptions,
+    };
+    use serde_json::Map;
 
     fn temp_root(label: &str) -> PathBuf {
         let now_ms = std::time::SystemTime::now()
