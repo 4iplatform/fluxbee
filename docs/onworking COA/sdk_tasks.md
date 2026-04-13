@@ -339,15 +339,15 @@ Decisión tomada:
 
 ### L2-LOOKUP-6 - Test matrix de seguridad y compatibilidad
 
-- [ ] L2-LOOKUP-21. Agregar spoof test:
+- [x] L2-LOOKUP-21. Agregar spoof test:
   - el sender intenta mandar `src_l2_name` falso
   - el router lo sobrescribe
-- [ ] L2-LOOKUP-22. Agregar test local end-to-end:
+- [x] L2-LOOKUP-22. Agregar test local end-to-end:
   - receptor observa `routing.src` UUID correcto
   - receptor observa `routing.src_l2_name` L2 correcto
-- [ ] L2-LOOKUP-23. Agregar test inter-router end-to-end con preservación del origen real.
-- [ ] L2-LOOKUP-24. Revalidar `SY.timer` con ownership/auth usando exclusivamente `src_l2_name`.
-- [ ] L2-LOOKUP-25. Revalidar compatibilidad SDK Rust / SDK Go con fixtures actualizados del envelope.
+- [x] L2-LOOKUP-23. Agregar test inter-router end-to-end con preservación del origen real.
+- [x] L2-LOOKUP-24. Revalidar `SY.timer` con ownership/auth usando exclusivamente `src_l2_name`.
+- [x] L2-LOOKUP-25. Revalidar compatibilidad SDK Rust / SDK Go con fixtures actualizados del envelope.
 
 Orden recomendado:
 1. `L2-LOOKUP-1..3`

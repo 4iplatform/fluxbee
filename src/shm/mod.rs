@@ -3584,13 +3584,13 @@ mod tests {
                         title: "Urgent billing dispute".to_string(),
                         intensity: 7,
                     }],
-                    truncated: MemoryPackageTruncated {
+                    truncated: Some(MemoryPackageTruncated {
                         applied: false,
                         dropped_contexts: 0,
                         dropped_reasons: 0,
                         dropped_memories: 0,
                         dropped_episodes: 0,
-                    },
+                    }),
                 },
             }],
         };

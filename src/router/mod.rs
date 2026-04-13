@@ -5474,4 +5474,303 @@ mod tests {
             Some(old_src.as_str())
         );
     }
+
+    // L2-LOOKUP-21: Spoof test — sender-supplied src_l2_name is overwritten by the router.
+    #[tokio::test]
+    async fn router_overwrites_spoofed_src_l2_name() {
+        let sender_uuid = Uuid::new_v4();
+        let receiver_uuid = Uuid::new_v4();
+
+        let (sender_tx, _sender_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut g = nodes.lock().await;
+            g.insert(
+                sender_uuid,
+                NodeHandle {
+                    name: "WF.demo@motherbee".to_string(),
+                    vpn_id: 0,
+                    sender: sender_tx,
+                    connected_at: 0,
+                },
+            );
+            g.insert(
+                receiver_uuid,
+                NodeHandle {
+                    name: "SY.orchestrator@motherbee".to_string(),
+                    vpn_id: 0,
+                    sender: receiver_tx,
+                    connected_at: 0,
+                },
+            );
+        }
+
+        let msg = Message {
+            routing: Routing {
+                src: sender_uuid.to_string(),
+                src_l2_name: Some("ATTACKER@evil".to_string()),
+                dst: Destination::Unicast(receiver_uuid.to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+
+        handle_message(
+            &msg,
+            &nodes,
+            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new())),
+            &Arc::new(Mutex::new(HashMap::<String, WanPeer>::new())),
+            &Arc::new(Mutex::new(OpaResolver::new())),
+            &Arc::new(Mutex::new(BroadcastCache::new())),
+            &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+            &Arc::new(Mutex::new(HashMap::<String, u64>::new())),
+            "motherbee",
+            "SY.frontdesk.gov@motherbee",
+            Uuid::new_v4(),
+            false,
+            &Arc::new(Mutex::new(None)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let delivered = receiver_rx
+            .try_recv()
+            .expect("message should be delivered");
+        let delivered_msg: Message = serde_json::from_slice(&delivered).unwrap();
+        assert_eq!(
+            delivered_msg.routing.src_l2_name.as_deref(),
+            Some("WF.demo@motherbee"),
+            "router must overwrite spoofed src_l2_name with the authenticated NodeHandle name"
+        );
+    }
+
+    // L2-LOOKUP-22: Local end-to-end — receiver observes correct src UUID and src_l2_name.
+    #[tokio::test]
+    async fn local_delivery_stamps_correct_src_uuid_and_l2_name() {
+        let sender_uuid = Uuid::new_v4();
+        let receiver_uuid = Uuid::new_v4();
+
+        let (sender_tx, _sender_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut g = nodes.lock().await;
+            g.insert(
+                sender_uuid,
+                NodeHandle {
+                    name: "IO.webchat@motherbee".to_string(),
+                    vpn_id: 0,
+                    sender: sender_tx,
+                    connected_at: 0,
+                },
+            );
+            g.insert(
+                receiver_uuid,
+                NodeHandle {
+                    name: "WF.pipeline@motherbee".to_string(),
+                    vpn_id: 0,
+                    sender: receiver_tx,
+                    connected_at: 0,
+                },
+            );
+        }
+
+        let msg = Message {
+            routing: Routing {
+                src: sender_uuid.to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast(receiver_uuid.to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({"hello": "world"}),
+        };
+
+        handle_message(
+            &msg,
+            &nodes,
+            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new())),
+            &Arc::new(Mutex::new(HashMap::<String, WanPeer>::new())),
+            &Arc::new(Mutex::new(OpaResolver::new())),
+            &Arc::new(Mutex::new(BroadcastCache::new())),
+            &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+            &Arc::new(Mutex::new(HashMap::<String, u64>::new())),
+            "motherbee",
+            "SY.frontdesk.gov@motherbee",
+            Uuid::new_v4(),
+            false,
+            &Arc::new(Mutex::new(None)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let delivered = receiver_rx
+            .try_recv()
+            .expect("message should be delivered");
+        let delivered_msg: Message = serde_json::from_slice(&delivered).unwrap();
+        assert_eq!(
+            delivered_msg.routing.src,
+            sender_uuid.to_string(),
+            "delivered message must carry the original sender UUID"
+        );
+        assert_eq!(
+            delivered_msg.routing.src_l2_name.as_deref(),
+            Some("IO.webchat@motherbee"),
+            "delivered message must carry the L2 name stamped by the router"
+        );
+    }
+
+    // L2-LOOKUP-23: Inter-router end-to-end — src_l2_name is stamped from peer_nodes,
+    // preserving the real origin even if the forwarding router sent a different value.
+    #[tokio::test]
+    async fn inter_router_delivery_stamps_src_l2_name_from_peer_nodes() {
+        use nix::sys::mman::shm_unlink;
+        use std::ffi::CString;
+
+        let id = Uuid::new_v4().simple().to_string();
+        let shm_name = format!("/rt-l2-{}", &id[..8]);
+        let cleanup = |name: &str| {
+            if let Ok(cstr) = CString::new(name) {
+                let _ = shm_unlink(cstr.as_c_str());
+            }
+        };
+        cleanup(&shm_name);
+
+        let peer_sender_uuid = Uuid::new_v4();
+        let peer_router_uuid = Uuid::new_v4();
+        let local_receiver_uuid = Uuid::new_v4();
+
+        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        // Local node that will receive the forwarded message.
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut g = nodes.lock().await;
+            g.insert(
+                local_receiver_uuid,
+                NodeHandle {
+                    name: "SY.orchestrator@motherbee".to_string(),
+                    vpn_id: 0,
+                    sender: receiver_tx,
+                    connected_at: 0,
+                },
+            );
+        }
+
+        // peer_nodes maps the remote sender UUID to its L2 name as known by this router.
+        let peer_nodes: Arc<Mutex<HashMap<Uuid, PeerNode>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut g = peer_nodes.lock().await;
+            g.insert(
+                peer_sender_uuid,
+                PeerNode {
+                    uuid: peer_sender_uuid,
+                    name: "WF.external@worker-hive".to_string(),
+                    vpn_id: 0,
+                    router_uuid: peer_router_uuid,
+                },
+            );
+        }
+
+        // peer_uuid is registered in peers so TTL/unreachable replies have somewhere to go.
+        let (peer_tx, _peer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let peers: Arc<Mutex<HashMap<Uuid, PeerHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        peers
+            .lock()
+            .await
+            .insert(peer_router_uuid, PeerHandle { sender: peer_tx });
+
+        // Message arrives from the remote peer with no src_l2_name set (router will stamp it).
+        let msg = Message {
+            routing: Routing {
+                src: peer_sender_uuid.to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast(local_receiver_uuid.to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+
+        let router_uuid = Uuid::new_v4();
+        let shm_writer = RouterRegionWriter::open_or_create(
+            &shm_name,
+            router_uuid,
+            "motherbee",
+            "RT.main@motherbee",
+            false,
+        )
+        .expect("create test shm");
+        let shm = Arc::new(Mutex::new(shm_writer));
+
+        handle_peer_message(
+            &msg,
+            &peer_router_uuid,
+            &peers,
+            &peer_nodes,
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
+            &nodes,
+            &Arc::new(Mutex::new(HashMap::<String, WanPeer>::new())),
+            &Arc::new(Mutex::new(None::<ConfigRegionReader>)),
+            &Arc::new(Mutex::new(None::<LsaRegionReader>)),
+            &Arc::new(Mutex::new(Vec::<StaticRoute>::new())),
+            &Arc::new(Mutex::new(Vec::<VpnAssignment>::new())),
+            &Arc::new(Mutex::new(0u64)),
+            &shm,
+            &Arc::new(Mutex::new(OpaResolver::new())),
+            &Arc::new(Mutex::new(None::<OpaRegionReader>)),
+            &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+            "motherbee",
+            "SY.frontdesk.gov@motherbee",
+            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            router_uuid,
+            false,
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(HashMap::<String, u64>::new())),
+        )
+        .await
+        .unwrap();
+
+        cleanup(&shm_name);
+
+        let delivered = receiver_rx
+            .try_recv()
+            .expect("message should be delivered to local node");
+        let delivered_msg: Message = serde_json::from_slice(&delivered).unwrap();
+        assert_eq!(
+            delivered_msg.routing.src,
+            peer_sender_uuid.to_string(),
+            "delivered message must preserve the original sender UUID from the remote hive"
+        );
+        assert_eq!(
+            delivered_msg.routing.src_l2_name.as_deref(),
+            Some("WF.external@worker-hive"),
+            "delivered message must carry the L2 name from this router's peer_nodes, not whatever the remote router sent"
+        );
+    }
 }
