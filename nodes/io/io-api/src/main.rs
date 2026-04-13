@@ -1525,6 +1525,7 @@ mod tests {
         build_node_secret_record, load_node_secret_record_with_root,
         save_node_secret_record_with_root, NodeSecretWriteOptions,
     };
+    use fluxbee_sdk::{compute_thread_id, ThreadIdInput};
     use serde_json::Map;
 
     fn temp_root(label: &str) -> PathBuf {
@@ -1805,6 +1806,21 @@ mod tests {
         assert_eq!(parsed.identity_input.tenant_hint.as_deref(), Some("acme"));
         assert_eq!(parsed.io_context.conversation.id, "conv-1");
         assert_eq!(parsed.io_context.message.id, "crm-msg-1");
+        assert_eq!(parsed.io_context.channel, "api");
+        assert_eq!(parsed.io_context.sender.id, "crm:123");
+        assert_eq!(parsed.io_context.entrypoint.id, "127.0.0.1");
+        assert_eq!(
+            parsed.io_context.conversation.thread_id.as_deref(),
+            Some(
+                compute_thread_id(ThreadIdInput::PersistentChannel {
+                    channel_type: "api",
+                    entrypoint_id: Some("127.0.0.1"),
+                    conversation_id: "conv-1",
+                })
+                .expect("thread id")
+                .as_str()
+            )
+        );
         assert!(parsed.relay_final);
         assert_eq!(
             parsed.explicit_subject_mode,
@@ -1913,7 +1929,20 @@ mod tests {
             parsed.identity_input.tenant_hint.as_deref(),
             Some("tenant-a")
         );
+        assert_eq!(parsed.io_context.channel, "api");
         assert_eq!(parsed.io_context.sender.id, "caller-1");
+        assert_eq!(
+            parsed.io_context.conversation.thread_id.as_deref(),
+            Some(
+                compute_thread_id(ThreadIdInput::PersistentChannel {
+                    channel_type: "api",
+                    entrypoint_id: Some("127.0.0.1"),
+                    conversation_id: "caller-1",
+                })
+                .expect("thread id")
+                .as_str()
+            )
+        );
     }
 
     #[test]

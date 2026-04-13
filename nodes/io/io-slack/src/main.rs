@@ -1535,8 +1535,9 @@ async fn collect_slack_blob_attachments(
 mod tests {
     use super::{
         default_slack_allowed_mimes, extract_runtime_relay_config, slack_relay_policy_from_config,
-        SlackRelayConfig,
+        build_system_reply, SlackRelayConfig,
     };
+    use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing};
     use serde_json::json;
 
     #[test]
@@ -1634,6 +1635,54 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "io.relay.max_open_sessions must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn build_system_reply_preserves_canonical_conversation_carrier() {
+        let incoming = WireMessage {
+            routing: Routing {
+                src: "node-src".to_string(),
+                dst: Destination::Resolve,
+                ttl: 16,
+                trace_id: "trace-1".to_string(),
+            },
+            meta: Meta {
+                msg_type: "system".to_string(),
+                msg: Some("PING".to_string()),
+                src_ilk: Some("ilk:src".to_string()),
+                dst_ilk: Some("ilk:dst".to_string()),
+                ich: Some("slack://U123".to_string()),
+                thread_id: Some("thread:canonical-1".to_string()),
+                thread_seq: Some(7),
+                context: Some(json!({
+                    "io": {
+                        "reply_target": {
+                            "kind": "slack_post",
+                            "address": "C123",
+                            "params": { "thread_ts": "171234.567" }
+                        }
+                    }
+                })),
+                ..Meta::default()
+            },
+            payload: json!({}),
+        };
+
+        let reply = build_system_reply(&incoming, "IO.slack.test@motherbee", "PONG", json!({ "ok": true }));
+
+        assert_eq!(reply.meta.ich.as_deref(), Some("slack://U123"));
+        assert_eq!(reply.meta.thread_id.as_deref(), Some("thread:canonical-1"));
+        assert_eq!(reply.meta.thread_seq, Some(7));
+        assert_eq!(
+            reply.meta
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("io"))
+                .and_then(|io| io.get("reply_target"))
+                .and_then(|target| target.get("address"))
+                .and_then(|value| value.as_str()),
+            Some("C123")
         );
     }
 }
