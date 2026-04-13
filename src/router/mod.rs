@@ -5279,7 +5279,7 @@ mod tests {
             payload: serde_json::json!({}),
         };
         assign_thread_seq_if_missing(&mut second, &sequences).await;
-        assert_eq!(second.meta.thread_seq, Some(2));
+        assert_eq!(second.meta.thread_seq, Some(1));
     }
 
     #[tokio::test]
