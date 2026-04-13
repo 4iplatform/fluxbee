@@ -62,9 +62,7 @@ No autentica automaticamente al sujeto conversacional salvo que la instancia est
 
 ## 3. Respuesta general de `POST /messages`
 
-`IO.api` es un endpoint de ingress asincrono.
-
-No espera el resultado final del procesamiento dentro de Fluxbee.
+`IO.api` no espera el resultado final del procesamiento dentro de Fluxbee, pero `subject_mode = explicit_subject` puede esperar la etapa de identity antes de devolver respuesta.
 
 ### 3.1 Caso exitoso
 
@@ -72,7 +70,7 @@ Si el request:
 
 - fue autenticado;
 - valido schema;
-- fue aceptado por la instancia;
+- supero la etapa de identity requerida por el `subject_mode` efectivo;
 - y pudo ingresar al flujo interno del nodo;
 
 el endpoint debe responder:
@@ -88,6 +86,7 @@ Body sugerido:
   "status": "accepted",
   "request_id": "req_01JXYZ...",
   "trace_id": "4c66b54c-9d53-4b44-8eb0-c9f88f8f4c1e",
+  "ilk": "ilk:3e47407a-cd56-4790-8044-aa118e3e3dfc",
   "relay_status": "held",
   "node_name": "IO.api.frontdesk@worker-220"
 }
@@ -97,6 +96,7 @@ Notas:
 
 - `request_id` es identificador HTTP local del nodo;
 - `trace_id` es el identificador de correlacion del mensaje interno;
+- en `explicit_subject`, `ilk` debe devolverse cuando identity resolvio o creo exitosamente el sujeto;
 - `relay_status` puede ser:
   - `held`
   - `flushed_immediately`
@@ -141,7 +141,49 @@ Notas:
 {
   "status": "error",
   "error_code": "invalid_payload",
-  "error_message": "Field 'subject' is required for subject_mode=explicit_subject"
+  "error_message": "Payload does not define a valid explicit subject identification mode"
+}
+```
+
+#### ILK inexistente
+
+```http
+404 Not Found
+```
+
+```json
+{
+  "status": "error",
+  "error_code": "ilk_does_not_exist",
+  "error_message": "The provided ILK does not exist"
+}
+```
+
+#### Timeout de identity
+
+```http
+504 Gateway Timeout
+```
+
+```json
+{
+  "status": "error",
+  "error_code": "identity_timeout",
+  "error_message": "Identity did not respond in time"
+}
+```
+
+#### Identity unavailable
+
+```http
+503 Service Unavailable
+```
+
+```json
+{
+  "status": "error",
+  "error_code": "identity_unavailable",
+  "error_message": "Identity is currently unavailable"
 }
 ```
 
@@ -219,14 +261,20 @@ No debe devolver una union abstracta de todos los modos del runtime.
     ]
   },
   "required_fields": {
-    "json": ["subject", "message"],
+    "json": ["message"],
     "multipart": ["metadata"]
   },
   "subject": {
-    "required": true,
+    "required": false,
     "allowed": true,
-    "lookup_key_field": "external_user_id",
-    "optional_identity_candidates": ["display_name", "email", "tenant_hint"]
+    "modes": ["by_ilk", "by_data"],
+    "by_ilk": {
+      "field": "subject.ilk"
+    },
+    "by_data": {
+      "lookup_key_field": "subject.external_user_id",
+      "optional_identity_candidates": ["display_name", "email", "tenant_hint"]
+    }
   },
   "attachments": {
     "supported": true,
@@ -365,20 +413,31 @@ Ejemplo tipico:
 
 ```json
 {
+  "ilk": "ilk:123 opcional",
   "external_user_id": "crm:client-12345",
   "display_name": "Juan Perez",
   "email": "juan@acme.com",
-  "tenant_hint": "acme"
+  "tenant_hint": "acme",
+  "phone": "+5491155551234"
 }
 ```
 
 Reglas:
 
-- `external_user_id` es obligatorio en v1;
+- si `ilk` viene no vacio, el request entra en modo `by_ilk`;
+- en `by_ilk`, si ademas llegan `display_name`, `email`, `tenant_hint` u otros campos, se aceptan pero se ignoran;
+- si `ilk` no viene o viene vacio, el request entra en modo `by_data`;
+- en `by_data`, la validacion minima requerida es:
+  - `external_user_id`
+  - `display_name`
+  - `email`
+  - `tenant_hint`
+- `phone` y otros datos adicionales pueden venir como complemento;
+- esos datos adicionales no crean automaticamente un `ICH` nuevo ni vinculan otro canal;
 - `display_name`, `email` y `tenant_hint` son identity candidates auxiliares;
-- el nodo usa estos datos para construir `ResolveOrCreateInput` y delega al pipeline comun de identidad.
+- el nodo usa estos datos para hablar con identity antes de emitir al router.
 
-## 6.3 Ejemplo JSON minimo
+## 6.3 Ejemplo JSON minimo por `by_ilk`
 
 ```http
 POST /messages
@@ -389,7 +448,7 @@ Content-Type: application/json
 ```json
 {
   "subject": {
-    "external_user_id": "crm:client-12345"
+    "ilk": "ilk:3e47407a-cd56-4790-8044-aa118e3e3dfc"
   },
   "message": {
     "text": "Necesito ayuda con mi alta"
@@ -397,7 +456,7 @@ Content-Type: application/json
 }
 ```
 
-## 6.4 Ejemplo JSON recomendado
+## 6.4 Ejemplo JSON recomendado por `by_data`
 
 ```json
 {
@@ -424,11 +483,43 @@ Content-Type: application/json
 El nodo debe:
 
 1. autenticar al caller;
-2. validar `subject`;
-3. construir `ResolveOrCreateInput`;
-4. delegar identity al pipeline comun `io-common`;
-5. aplicar relay si corresponde;
-6. publicar un mensaje `text/v1` al router.
+2. determinar si el request esta en `by_ilk` o `by_data`;
+3. validar el modo elegido;
+4. consultar a identity y esperar respuesta;
+5. solo si identity responde exito, aplicar relay si corresponde;
+6. publicar un mensaje `text/v1` al router;
+7. devolver respuesta HTTP exitosa solo despues de esa etapa.
+
+## 6.6 Errores tipicos de `explicit_subject`
+
+- `subject_identification_mode_invalid`
+- `subject_data_incomplete`
+- `ilk_does_not_exist`
+- `identity_unavailable`
+- `identity_timeout`
+
+Mapeo recomendado:
+
+- `ilk_does_not_exist` -> `404 Not Found`
+- `identity_timeout` -> `504 Gateway Timeout`
+- `identity_unavailable` -> `503 Service Unavailable`
+
+## 6.7 Respuesta exitosa en `by_data`
+
+Cuando `by_data` resuelve un sujeto existente o crea uno nuevo, la respuesta HTTP exitosa debe incluir el `ilk` efectivo:
+
+```json
+{
+  "status": "accepted",
+  "request_id": "req_01JXYZ...",
+  "trace_id": "4c66b54c-9d53-4b44-8eb0-c9f88f8f4c1e",
+  "ilk": "ilk:3e47407a-cd56-4790-8044-aa118e3e3dfc",
+  "relay_status": "flushed_immediately",
+  "node_name": "IO.api.frontdesk@worker-220"
+}
+```
+
+El codigo de exito recomendado sigue siendo `202 Accepted` tambien en `explicit_subject`, para mantener semantica uniforme de ingress.
 
 ---
 
@@ -665,7 +756,7 @@ No define todavia:
 
 1. `POST /messages` es el endpoint de ingreso normativo.
 2. `GET /schema` es el endpoint normativo de introspeccion.
-3. `POST /messages` responde `202 Accepted` al aceptar el request, sin esperar el resultado final del sistema.
+3. `POST /messages` responde `202 Accepted` al aceptar el request; en `explicit_subject` esa aceptacion ocurre solo despues de la etapa de identity.
 4. `application/json` y `multipart/form-data` son los content types minimos soportados.
 5. `multipart/form-data` es el camino normativo para attachments binarios.
 6. `explicit_subject` y `caller_is_subject` son los modos de sujeto normativos de v1.

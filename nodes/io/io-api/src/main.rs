@@ -40,6 +40,7 @@ use io_common::io_control_plane_logging::{
 };
 use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
 use io_common::io_control_plane_store::persist_io_control_plane_state;
+use io_common::provision::strict_provision_ilk;
 use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig, RouterInbox};
 use io_common::relay::{
     AssembledTurn, InMemoryRelayStore, RelayBuffer, RelayDecision, RelayFlushHints, RelayFragment,
@@ -67,7 +68,7 @@ use schema::{
     build_configured_schema, build_unconfigured_schema, extract_accepted_content_types,
     extract_max_request_bytes, extract_subject_mode, lifecycle_status,
 };
-use subject::{api_relay_key, parse_json_message_request};
+use subject::{api_relay_key, parse_json_message_request, ExplicitSubjectMode};
 
 #[derive(Clone)]
 struct Config {
@@ -129,6 +130,8 @@ struct HttpState {
     sender: fluxbee_sdk::NodeSender,
     identity: Arc<dyn IdentityResolver>,
     provisioner: Arc<dyn IdentityProvisioner>,
+    router_inbox: Arc<Mutex<RouterInbox>>,
+    identity_provision_cfg: IdentityProvisionConfig,
     inbound: Arc<Mutex<InboundProcessor>>,
     relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
     blob_toolkit: Arc<fluxbee_sdk::blob::BlobToolkit>,
@@ -160,6 +163,7 @@ struct ParsedHttpMessage {
     io_context: IoContext,
     payload: Value,
     relay_final: bool,
+    explicit_subject_mode: Option<subject::ExplicitSubjectMode>,
 }
 
 #[tokio::main]
@@ -199,13 +203,14 @@ async fn main() -> Result<()> {
 
     let inbox = Arc::new(Mutex::new(RouterInbox::new(receiver)));
     let identity: Arc<dyn IdentityResolver> = Arc::new(ShmIdentityResolver::new(&config.island_id));
+    let identity_provision_cfg = IdentityProvisionConfig {
+        target: config.identity_target.clone(),
+        timeout: Duration::from_millis(config.identity_timeout_ms),
+    };
     let provisioner: Arc<dyn IdentityProvisioner> = Arc::new(FluxbeeIdentityProvisioner::new(
         sender.clone(),
         inbox.clone(),
-        IdentityProvisionConfig {
-            target: config.identity_target.clone(),
-            timeout: Duration::from_millis(config.identity_timeout_ms),
-        },
+        identity_provision_cfg.clone(),
     ));
 
     let adapter_contract: Arc<dyn IoAdapterConfigContract> = Arc::new(IoApiAdapterConfigContract);
@@ -296,6 +301,8 @@ async fn main() -> Result<()> {
         sender: sender.clone(),
         identity: identity.clone(),
         provisioner: provisioner.clone(),
+        router_inbox: inbox.clone(),
+        identity_provision_cfg: identity_provision_cfg.clone(),
         inbound: inbound.clone(),
         relay: relay.clone(),
         blob_toolkit,
@@ -567,6 +574,29 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
             Ok(value) => value,
             Err((status, code, message)) => return api_error(status, code, message),
         };
+        let response_ilk = match parsed.explicit_subject_mode.as_ref() {
+            Some(ExplicitSubjectMode::ByIlk { .. }) => {
+                tracing::info!(
+                    node_name = %state.node_name,
+                    path = %request_path,
+                    "io-api explicit_subject by_ilk requested but not implemented yet"
+                );
+                return api_error(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "subject_ilk_not_implemented",
+                    "explicit_subject by_ilk is not implemented yet in IO.api",
+                );
+            }
+            Some(ExplicitSubjectMode::ByData) => {
+                match resolve_explicit_subject_ilk_for_http(state.as_ref(), &parsed.identity_input)
+                    .await
+                {
+                    Ok(src_ilk) => Some(src_ilk),
+                    Err((status, code, message)) => return api_error(status, code, message),
+                }
+            }
+            None => None,
+        };
         let text = parsed
             .payload
             .get("content")
@@ -589,9 +619,13 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
             build_api_relay_fragment(&state.node_name, &parsed, metadata.clone(), &auth_match);
 
         return match state.relay.lock().await.handle_fragment(relay_fragment) {
-            RelayDecision::Hold => {
-                accepted_response(&state.node_name, parsed.request_id, None, "held")
-            }
+            RelayDecision::Hold => accepted_response(
+                &state.node_name,
+                parsed.request_id,
+                None,
+                "held",
+                response_ilk.as_deref(),
+            ),
             RelayDecision::FlushNow(turn) => {
                 let trace_id = dispatch_assembled_turn_for_http(
                     state.sender.clone(),
@@ -607,6 +641,7 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
                     parsed.request_id,
                     trace_id,
                     "flushed_immediately",
+                    response_ilk.as_deref(),
                 )
             }
             RelayDecision::DropDuplicate => accepted_response(
@@ -614,6 +649,7 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
                 parsed.request_id,
                 None,
                 "duplicate_dropped",
+                response_ilk.as_deref(),
             ),
             RelayDecision::RejectCapacity => {
                 let outcome = state
@@ -639,6 +675,7 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
                     parsed.request_id,
                     trace_id,
                     "flushed_immediately",
+                    response_ilk.as_deref(),
                 )
             }
             RelayDecision::DropExpired => api_error(
@@ -682,6 +719,29 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
         Ok(value) => value,
         Err((status, code, message)) => return api_error(status, code, message),
     };
+    let response_ilk = match parsed.explicit_subject_mode.as_ref() {
+        Some(ExplicitSubjectMode::ByIlk { .. }) => {
+            tracing::info!(
+                node_name = %state.node_name,
+                path = %request_path,
+                "io-api explicit_subject by_ilk requested but not implemented yet"
+            );
+            return api_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "subject_ilk_not_implemented",
+                "explicit_subject by_ilk is not implemented yet in IO.api",
+            );
+        }
+        Some(ExplicitSubjectMode::ByData) => {
+            match resolve_explicit_subject_ilk_for_http(state.as_ref(), &parsed.identity_input)
+                .await
+            {
+                Ok(src_ilk) => Some(src_ilk),
+                Err((status, code, message)) => return api_error(status, code, message),
+            }
+        }
+        None => None,
+    };
     tracing::debug!(
         node_name = %state.node_name,
         path = %request_path,
@@ -695,7 +755,13 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
         build_api_relay_fragment(&state.node_name, &parsed, envelope.clone(), &auth_match);
 
     match state.relay.lock().await.handle_fragment(relay_fragment) {
-        RelayDecision::Hold => accepted_response(&state.node_name, parsed.request_id, None, "held"),
+        RelayDecision::Hold => accepted_response(
+            &state.node_name,
+            parsed.request_id,
+            None,
+            "held",
+            response_ilk.as_deref(),
+        ),
         RelayDecision::FlushNow(turn) => {
             let trace_id = dispatch_assembled_turn_for_http(
                 state.sender.clone(),
@@ -711,6 +777,7 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
                 parsed.request_id,
                 trace_id,
                 "flushed_immediately",
+                response_ilk.as_deref(),
             )
         }
         RelayDecision::DropDuplicate => accepted_response(
@@ -718,6 +785,7 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
             parsed.request_id,
             None,
             "duplicate_dropped",
+            response_ilk.as_deref(),
         ),
         RelayDecision::RejectCapacity => {
             let outcome = state
@@ -743,6 +811,7 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
                 parsed.request_id,
                 trace_id,
                 "flushed_immediately",
+                response_ilk.as_deref(),
             )
         }
         RelayDecision::DropExpired => api_error(
@@ -1118,6 +1187,96 @@ fn content_type_matches_any(content_type: &str, accepted: &[String]) -> bool {
     accepted
         .iter()
         .any(|candidate| content_type.starts_with(candidate))
+}
+
+async fn resolve_explicit_subject_ilk_for_http(
+    state: &HttpState,
+    identity_input: &ResolveOrCreateInput,
+) -> std::result::Result<String, (StatusCode, &'static str, String)> {
+    match state
+        .identity
+        .lookup(&identity_input.channel, &identity_input.external_id)
+    {
+        Ok(Some(src_ilk)) => {
+            tracing::info!(
+                channel = %identity_input.channel,
+                external_id = %identity_input.external_id,
+                src_ilk = %src_ilk,
+                "io-api explicit_subject identity lookup hit"
+            );
+            state.identity.remember(
+                &identity_input.channel,
+                &identity_input.external_id,
+                &src_ilk,
+            );
+            return Ok(src_ilk);
+        }
+        Ok(None) => {
+            tracing::debug!(
+                channel = %identity_input.channel,
+                external_id = %identity_input.external_id,
+                "io-api explicit_subject identity lookup miss"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = ?err,
+                channel = %identity_input.channel,
+                external_id = %identity_input.external_id,
+                "io-api explicit_subject identity lookup error; trying strict provision"
+            );
+        }
+    }
+
+    let src_ilk = strict_provision_ilk(
+        &state.sender,
+        state.router_inbox.clone(),
+        &state.identity_provision_cfg,
+        state.identity_provision_cfg.target.as_str(),
+        identity_input,
+    )
+    .await
+    .map_err(map_identity_error_to_http)?;
+
+    tracing::info!(
+        channel = %identity_input.channel,
+        external_id = %identity_input.external_id,
+        src_ilk = %src_ilk,
+        "io-api explicit_subject identity provisioned"
+    );
+    state.identity.remember(
+        &identity_input.channel,
+        &identity_input.external_id,
+        &src_ilk,
+    );
+    Ok(src_ilk)
+}
+
+fn map_identity_error_to_http(
+    err: io_common::identity::IdentityError,
+) -> (StatusCode, &'static str, String) {
+    match err {
+        io_common::identity::IdentityError::Timeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "identity_timeout",
+            "Identity did not respond in time".to_string(),
+        ),
+        io_common::identity::IdentityError::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "identity_unavailable",
+            "Identity is currently unavailable".to_string(),
+        ),
+        io_common::identity::IdentityError::Miss => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "identity_unavailable",
+            "Identity did not return a usable result".to_string(),
+        ),
+        io_common::identity::IdentityError::Other(message) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "identity_unavailable",
+            format!("Identity request failed: {message}"),
+        ),
+    }
 }
 
 fn build_api_relay_fragment(
@@ -1564,6 +1723,7 @@ mod tests {
             "subject": {
                 "external_user_id": "crm:123",
                 "display_name": "Juan Perez",
+                "email": "juan@example.com",
                 "tenant_hint": "acme"
             },
             "message": {
@@ -1588,6 +1748,63 @@ mod tests {
         assert_eq!(parsed.io_context.conversation.id, "conv-1");
         assert_eq!(parsed.io_context.message.id, "crm-msg-1");
         assert!(parsed.relay_final);
+        assert_eq!(
+            parsed.explicit_subject_mode,
+            Some(ExplicitSubjectMode::ByData)
+        );
+    }
+
+    #[test]
+    fn parse_json_message_request_accepts_explicit_subject_by_ilk() {
+        let effective = configured_effective("explicit_subject");
+        let auth_match = AuthMatch {
+            key_id: "partner1".to_string(),
+            caller_identity: None,
+        };
+        let envelope = serde_json::json!({
+            "subject": {
+                "ilk": "ilk:abc-123",
+                "display_name": "Ignored Name",
+                "email": "ignored@example.com",
+                "tenant_hint": "ignored-tenant"
+            },
+            "message": {
+                "text": "hola"
+            }
+        });
+
+        let parsed =
+            parse_json_message_request(&envelope, &effective, &auth_match, false).expect("parsed");
+        assert_eq!(parsed.identity_input.external_id, "ilk:abc-123");
+        assert_eq!(
+            parsed.explicit_subject_mode,
+            Some(ExplicitSubjectMode::ByIlk {
+                ilk: "ilk:abc-123".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_json_message_request_rejects_incomplete_explicit_subject_by_data() {
+        let effective = configured_effective("explicit_subject");
+        let auth_match = AuthMatch {
+            key_id: "partner1".to_string(),
+            caller_identity: None,
+        };
+        let envelope = serde_json::json!({
+            "subject": {
+                "external_user_id": "crm:123",
+                "display_name": "Juan Perez"
+            },
+            "message": {
+                "text": "hola"
+            }
+        });
+
+        let err = parse_json_message_request(&envelope, &effective, &auth_match, false)
+            .expect_err("must reject incomplete by_data");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.1, "subject_data_incomplete");
     }
 
     #[test]
@@ -1650,7 +1867,10 @@ mod tests {
         };
         let envelope = serde_json::json!({
             "subject": {
-                "external_user_id": "crm:123"
+                "external_user_id": "crm:123",
+                "display_name": "Juan Perez",
+                "email": "juan@example.com",
+                "tenant_hint": "acme"
             },
             "message": {
                 "text": ""
@@ -1660,5 +1880,9 @@ mod tests {
         let parsed =
             parse_json_message_request(&envelope, &effective, &auth_match, true).expect("parsed");
         assert_eq!(parsed.identity_input.external_id, "crm:123");
+        assert_eq!(
+            parsed.explicit_subject_mode,
+            Some(ExplicitSubjectMode::ByData)
+        );
     }
 }

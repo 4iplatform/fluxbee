@@ -8,6 +8,12 @@ use uuid::Uuid;
 
 use crate::{AuthMatch, ParsedHttpMessage};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExplicitSubjectMode {
+    ByIlk { ilk: String },
+    ByData,
+}
+
 pub(crate) fn parse_json_message_request(
     envelope: &Value,
     effective: &Value,
@@ -46,69 +52,137 @@ pub(crate) fn parse_json_message_request(
 
     let subject = envelope.get("subject");
     let caller_identity = auth_match.caller_identity.as_ref();
-    let (external_user_id, display_name, email, tenant_hint) = if subject_mode == "explicit_subject"
-    {
-        let subject_obj = subject.and_then(Value::as_object).ok_or_else(|| {
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid_payload",
-                "Field 'subject' is required for subject_mode=explicit_subject".to_string(),
-            )
-        })?;
-        let external_user_id = subject_obj
-            .get("external_user_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
+    let (external_user_id, display_name, email, tenant_hint, explicit_subject_mode) =
+        if subject_mode == "explicit_subject" {
+            let subject_obj = subject.and_then(Value::as_object).ok_or_else(|| {
                 (
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "invalid_payload",
-                    "Field 'subject.external_user_id' is required".to_string(),
+                    "Field 'subject' is required for subject_mode=explicit_subject".to_string(),
                 )
-            })?
-            .to_string();
-        (
-            external_user_id,
-            subject_obj.get("display_name").cloned(),
-            subject_obj.get("email").cloned(),
-            subject_obj.get("tenant_hint").cloned(),
-        )
-    } else {
-        if subject.is_some() {
-            return Err((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid_payload",
-                "Field 'subject' is not allowed for subject_mode=caller_is_subject".to_string(),
-            ));
-        }
-        let caller = caller_identity.and_then(Value::as_object).ok_or_else(|| {
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid_payload",
-                "Authenticated caller does not define caller_identity".to_string(),
-            )
-        })?;
-        let external_user_id = caller
-            .get("external_user_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
+            })?;
+            let subject_ilk = subject_obj
+                .get("ilk")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            if let Some(ilk) = subject_ilk {
+                let external_user_id = subject_obj
+                    .get("external_user_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| ilk.clone());
+                (
+                    external_user_id,
+                    subject_obj.get("display_name").cloned(),
+                    subject_obj.get("email").cloned(),
+                    subject_obj.get("tenant_hint").cloned(),
+                    Some(ExplicitSubjectMode::ByIlk { ilk }),
+                )
+            } else {
+                let external_user_id = subject_obj
+                    .get("external_user_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "subject_data_incomplete",
+                    "Field 'subject.external_user_id' is required for explicit_subject by_data"
+                        .to_string(),
+                )
+                    })?
+                    .to_string();
+                let display_name = subject_obj
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| Value::String(value.to_string()))
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "subject_data_incomplete",
+                            "Field 'subject.display_name' is required for explicit_subject by_data"
+                                .to_string(),
+                        )
+                    })?;
+                let email = subject_obj
+                    .get("email")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| Value::String(value.to_string()))
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "subject_data_incomplete",
+                            "Field 'subject.email' is required for explicit_subject by_data"
+                                .to_string(),
+                        )
+                    })?;
+                let tenant_hint = subject_obj
+                    .get("tenant_hint")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| Value::String(value.to_string()))
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "subject_data_incomplete",
+                            "Field 'subject.tenant_hint' is required for explicit_subject by_data"
+                                .to_string(),
+                        )
+                    })?;
+                (
+                    external_user_id,
+                    Some(display_name),
+                    Some(email),
+                    Some(tenant_hint),
+                    Some(ExplicitSubjectMode::ByData),
+                )
+            }
+        } else {
+            if subject.is_some() {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_payload",
+                    "Field 'subject' is not allowed for subject_mode=caller_is_subject".to_string(),
+                ));
+            }
+            let caller = caller_identity.and_then(Value::as_object).ok_or_else(|| {
                 (
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "invalid_payload",
-                    "Authenticated caller is missing external_user_id".to_string(),
+                    "Authenticated caller does not define caller_identity".to_string(),
                 )
-            })?
-            .to_string();
-        (
-            external_user_id,
-            caller.get("display_name").cloned(),
-            caller.get("email").cloned(),
-            caller.get("tenant_hint").cloned(),
-        )
-    };
+            })?;
+            let external_user_id = caller
+                .get("external_user_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "invalid_payload",
+                        "Authenticated caller is missing external_user_id".to_string(),
+                    )
+                })?
+                .to_string();
+            (
+                external_user_id,
+                caller.get("display_name").cloned(),
+                caller.get("email").cloned(),
+                caller.get("tenant_hint").cloned(),
+                None,
+            )
+        };
 
     let request_id = format!("req_{}", Uuid::new_v4().simple());
     let external_message_id = message
@@ -160,6 +234,13 @@ pub(crate) fn parse_json_message_request(
     }
     if let Some(value) = email.clone() {
         attributes.insert("email".to_string(), value);
+    }
+    if let Some(value) = subject
+        .and_then(Value::as_object)
+        .and_then(|subject| subject.get("phone"))
+        .cloned()
+    {
+        attributes.insert("phone".to_string(), value);
     }
     if let Some(metadata) = envelope
         .get("options")
@@ -230,6 +311,7 @@ pub(crate) fn parse_json_message_request(
             .and_then(|relay| relay.get("final"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        explicit_subject_mode,
     })
 }
 

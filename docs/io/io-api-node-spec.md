@@ -91,15 +91,18 @@ Ambos pueden coincidir o no.
 
 ### 2.3 Identidad por pipeline comun de IO
 
-`IO.api` no implementa una orquestacion de identidad separada del resto de los nodos IO.
+`IO.api` no implementa una source of truth de identidad separada del resto de los nodos IO.
 
-La regla normativa es la misma que para cualquier `IO.*`:
+Sin embargo, para `subject_mode = explicit_subject`, el contrato HTTP puede exigir una resolucion de identidad sincronica antes de devolver respuesta HTTP.
 
-1. construir `ResolveOrCreateInput` a partir del request;
-2. ejecutar `lookup -> provision_on_miss -> forward` mediante `io-common`;
-3. si lookup/provision falla o timeout, forward con `meta.src_ilk = null`.
+Regla normativa:
 
-`IO.api` puede recibir datos de identidad en el payload, pero eso solo afecta como construye el input al pipeline comun. No lo convierte en source of truth de identidad.
+1. el nodo autentica al caller;
+2. en `caller_is_subject`, mantiene el comportamiento asincrono de ingress;
+3. en `explicit_subject`, determina el modo de identificacion desde el payload;
+4. en `explicit_subject`, no devuelve respuesta exitosa ni emite al router hasta conocer el resultado de identity para ese request.
+
+Esto no convierte a `IO.api` en source of truth de identidad. Sigue delegando a identity, pero cambia el punto en el que responde HTTP.
 
 ### 2.4 Relay pre-router
 
@@ -117,18 +120,16 @@ Regla:
 - `window_ms > 0` implica consolidacion;
 - `window_ms = 0` implica passthrough inmediato.
 
-### 2.5 Endpoint asincrono
+### 2.5 Endpoint parcialmente sincronico segun `subject_mode`
 
-`POST /messages` no espera el resultado final del sistema.
+`POST /messages` no espera el resultado final del sistema, pero tampoco es completamente asincrono en todos los modos.
 
-Responde cuando:
+Regla normativa:
 
-- el caller fue autenticado;
-- el request fue validado;
-- el nodo acepto el ingreso;
-- el mensaje fue retenido por relay o emitido hacia el sistema.
+- `caller_is_subject`: mantiene respuesta asincrona de ingress;
+- `explicit_subject`: espera el resultado de la etapa de identity requerida por el request antes de devolver respuesta HTTP.
 
-No responde con el resultado final del AI/frontdesk/workflow.
+En ningun caso responde con el resultado final del AI/frontdesk/workflow.
 
 ---
 
@@ -338,15 +339,63 @@ La instancia concreta elige uno y `GET /schema` debe reflejarlo.
 
 ### 7.2 `explicit_subject`
 
-El request incluye explicitamente los datos del sujeto final.
+El request incluye explicitamente la informacion del sujeto final.
 
 Es el modo recomendado para integradores de servicio que hablan en nombre de multiples personas.
 
+`explicit_subject` admite dos modos de identificacion por payload:
+
+- `by_ilk`: el request incluye `subject.ilk`;
+- `by_data`: el request no incluye `subject.ilk` util y la identidad se intenta resolver/provisionar a partir de datos del sujeto.
+
 Reglas:
 
-- `subject.external_user_id` es la referencia estable minima del sujeto para lookup/provision;
-- `subject.display_name`, `subject.email` y `subject.tenant_hint` son identity candidates auxiliares;
-- esos campos pueden alimentar el `ResolveOrCreateInput`, pero no reemplazan a `SY.identity`.
+- el objeto `subject` sigue siendo el carrier normativo del sujeto explicito;
+- dentro de `subject`, los campos de identidad pasan a ser opcionales a nivel de shape;
+- el request debe caer en uno de los dos modos validos;
+- si `subject.ilk` viene no vacio, el request entra en `by_ilk`;
+- si `subject.ilk` no viene o viene vacio, el request entra en `by_data`;
+- esos campos alimentan a identity, pero no reemplazan a `SY.identity`.
+
+#### 7.2.1 Modo `by_ilk`
+
+Cuando `subject.ilk` viene con un valor no vacio:
+
+- `IO.api` debe consultar a identity si ese ILK existe;
+- si existe, puede continuar el flujo y responder exito;
+- si no existe, debe rechazar el request;
+- en este modo no debe hacer provision por datos del sujeto.
+- si el payload incluye ademas `display_name`, `email`, `tenant_hint` u otros campos de identidad, esos campos se aceptan pero se ignoran completamente en este modo.
+
+#### 7.2.2 Modo `by_data`
+
+Cuando `subject.ilk` no esta presente o viene vacio:
+
+- `IO.api` debe validar primero que existan los campos minimos requeridos para identity;
+- si esos campos faltan o vienen vacios, debe rechazar el request;
+- si la validacion minima pasa, debe consultar a identity y esperar el resultado;
+- solo si identity responde exito el nodo puede emitir al router y devolver respuesta HTTP exitosa.
+
+Para `IO.api` se cierra, por ahora, esta validacion minima de `by_data`:
+
+- `subject.external_user_id`
+- `subject.display_name`
+- `subject.email`
+- `subject.tenant_hint`
+
+Lectura:
+
+- esta decision toma como referencia el flujo de register ya usado en el repo, donde `name` y `email` son obligatorios y `tenant_hint` participa de la resolucion/creacion de tenant;
+- `IO.api` adopta un contrato mas estricto y exige tambien `tenant_hint` para `by_data`;
+- pueden admitirse campos adicionales, por ejemplo `phone`, pero no reemplazan a los minimos obligatorios.
+
+Si el payload incluye `phone` u otro dato adicional:
+
+- se trata como dato de identidad complementario;
+- puede formar parte del payload hacia identity cuando el adapter implemente esa llamada;
+- no crea automaticamente un `ICH` nuevo;
+- no vincula automaticamente ese telefono a otro canal como WhatsApp o telefonia;
+- el `ICH` canonico de `IO.api` sigue siendo el del canal `api` y su referencia estable de ingreso.
 
 ### 7.3 `caller_is_subject`
 
@@ -375,30 +424,71 @@ No es obligatorio para v1.
 - `POST /messages`
 - `GET /schema`
 
-### 8.2 Naturaleza asincrona de `POST /messages`
+### 8.2 Naturaleza de `POST /messages`
 
-`POST /messages` debe ser asincrono.
+`POST /messages` tiene comportamiento distinto segun `subject_mode`.
 
-Respuesta recomendada:
+#### `caller_is_subject`
+
+Mantiene la semantica asincrona:
+
+- autentica;
+- valida;
+- acepta el ingress;
+- devuelve `202 Accepted` cuando el request fue retenido por relay o emitido hacia el sistema.
+
+#### `explicit_subject`
+
+Tiene una etapa sincronica previa:
+
+- autentica;
+- valida el modo de identificacion del payload;
+- consulta a identity;
+- solo si esa etapa es exitosa puede emitir al router y devolver respuesta HTTP exitosa.
+
+La respuesta exitosa recomendada sigue siendo:
 
 - `202 Accepted`
 
-cuando el request fue:
+pero solo despues de la etapa de identity de `explicit_subject`.
 
-- autenticado;
-- validado;
-- aceptado por la instancia;
-- retenido por relay o enviado al sistema.
+En `explicit_subject`, la respuesta HTTP exitosa debe incluir ademas el `ilk` efectivo resuelto o creado, para permitir que el integrador lo reutilice en requests futuros.
+
+Se mantiene `202 Accepted` tambien en `explicit_subject`, incluso cuando identity ya fue resuelta antes de responder, porque sigue siendo el codigo mas estandar para un ingress que acepta y publica trabajo dentro del sistema sin prometer resultado final de negocio.
 
 ### 8.3 Codigos de error recomendados
 
 - `400 Bad Request`
 - `401 Unauthorized`
 - `403 Forbidden`
+- `404 Not Found` para `ilk_does_not_exist`
 - `413 Payload Too Large`
 - `415 Unsupported Media Type`
 - `422 Unprocessable Entity`
 - `503 Service Unavailable`
+- `504 Gateway Timeout`
+
+### 8.4 Tipificacion inicial de errores HTTP
+
+Errores que conviene estandarizar desde esta fase:
+
+- `invalid_json`
+- `unauthorized`
+- `node_not_configured`
+- `invalid_payload`
+- `subject_identification_mode_invalid`
+- `subject_data_incomplete`
+- `ilk_does_not_exist`
+- `identity_unavailable`
+- `identity_timeout`
+- `unsupported_attachment_mime`
+- `attachment_too_large`
+- `attachments_too_large`
+
+Tratamiento recomendado:
+
+- `identity_timeout`: `504 Gateway Timeout`, cuando identity no responde dentro del tiempo esperado;
+- `identity_unavailable`: `503 Service Unavailable`, cuando identity esta inalcanzable, devuelve `UNREACHABLE`/`TTL_EXCEEDED` o el adapter no puede establecer la llamada requerida.
 
 ---
 

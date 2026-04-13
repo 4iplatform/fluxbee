@@ -7,25 +7,32 @@ pub(crate) fn accepted_response(
     request_id: String,
     trace_id: Option<String>,
     relay_status: &str,
+    ilk: Option<&str>,
 ) -> Response {
     tracing::debug!(
         node_name = %node_name,
         request_id = %request_id,
         trace_id = ?trace_id,
         relay_status = %relay_status,
+        ilk = ?ilk,
         "io-api request accepted"
     );
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({
-            "status": "accepted",
-            "request_id": request_id,
-            "trace_id": trace_id,
-            "relay_status": relay_status,
-            "node_name": node_name,
-        })),
-    )
-        .into_response()
+    let mut body = serde_json::json!({
+        "status": "accepted",
+        "request_id": request_id,
+        "trace_id": trace_id,
+        "relay_status": relay_status,
+        "node_name": node_name,
+    });
+    if let Some(ilk) = ilk {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "ilk".to_string(),
+                serde_json::Value::String(ilk.to_string()),
+            );
+        }
+    }
+    (StatusCode::ACCEPTED, Json(body)).into_response()
 }
 
 pub(crate) fn api_error(
