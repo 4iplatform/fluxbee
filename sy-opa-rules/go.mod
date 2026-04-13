@@ -3,6 +3,7 @@ module github.com/4iplatform/json-router/sy-opa-rules
 go 1.21
 
 require (
+	github.com/4iplatform/json-router/fluxbee-go-sdk v0.0.0
 	github.com/google/uuid v1.6.0
 	github.com/open-policy-agent/opa v0.68.0
 	golang.org/x/sys v0.23.0
@@ -38,3 +39,5 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	sigs.k8s.io/yaml v1.4.0 // indirect
 )
+
+replace github.com/4iplatform/json-router/fluxbee-go-sdk => ../fluxbee-go-sdk

@@ -24,7 +24,7 @@ import (
 	"time"
 	"unsafe"
 
-	fluxbeesdk "github.com/4iplatform/json-router/sy-opa-rules/sdk"
+	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 	"github.com/google/uuid"
 	"github.com/open-policy-agent/opa/compile"
 	"golang.org/x/sys/unix"

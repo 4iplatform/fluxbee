@@ -112,25 +112,28 @@ const CORE_SYNC_RESTART_ORDER: &[&str] = &[
     "sy-storage",
     "sy-cognition",
     "sy-policy",
+    "sy-timer",
     "sy-frontdesk-gov",
     "sy-orchestrator",
 ];
-const WORKER_MIN_CORE_COMPONENTS: [&str; 7] = [
+const WORKER_MIN_CORE_COMPONENTS: [&str; 8] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
     "sy-identity",
     "sy-cognition",
     "sy-policy",
+    "sy-timer",
     "sy-orchestrator",
 ];
-const WORKER_BOOTSTRAP_CORE_COMPONENTS: [&str; 7] = [
+const WORKER_BOOTSTRAP_CORE_COMPONENTS: [&str; 8] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
     "sy-identity",
     "sy-cognition",
     "sy-policy",
+    "sy-timer",
     "sy-orchestrator",
 ];
 const DEFAULT_BLOB_ENABLED: bool = true;
@@ -423,7 +426,7 @@ struct SystemUpdateRequest {
     runtime_version: Option<String>,
 }
 
-const MOTHERBEE_CRITICAL_SERVICES: [&str; 10] = [
+const MOTHERBEE_CRITICAL_SERVICES: [&str; 11] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
@@ -433,15 +436,17 @@ const MOTHERBEE_CRITICAL_SERVICES: [&str; 10] = [
     "sy-storage",
     "sy-cognition",
     "sy-policy",
+    "sy-timer",
     "sy-frontdesk-gov",
 ];
-const WORKER_CRITICAL_SERVICES: [&str; 6] = [
+const WORKER_CRITICAL_SERVICES: [&str; 7] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
     "sy-identity",
     "sy-cognition",
     "sy-policy",
+    "sy-timer",
 ];
 
 #[tokio::main]
@@ -661,12 +666,13 @@ async fn bootstrap_local(
             "sy-storage",
             "sy-cognition",
             "sy-policy",
+            "sy-timer",
             "sy-frontdesk-gov",
         ]);
         services
     } else {
         let mut services = LEGACY_ALIGNED_SERVICE_UNITS.to_vec();
-        services.extend(["sy-cognition", "sy-policy"]);
+        services.extend(["sy-cognition", "sy-policy", "sy-timer"]);
         services
     };
     if identity_available() {
@@ -1022,6 +1028,7 @@ async fn wait_for_sy_nodes(
     if policy_available() {
         required.push("SY.policy");
     }
+    required.push("SY.timer");
     let start = Instant::now();
     let mut last_missing: Vec<String> = required.iter().map(|name| (*name).to_string()).collect();
     loop {
@@ -1168,6 +1175,7 @@ async fn shutdown_sequence(state: &OrchestratorState) {
 
     let mut shutdown_services = vec![
         "sy-frontdesk-gov",
+        "sy-timer",
         "sy-policy",
         "sy-cognition",
         "sy-storage",
@@ -7083,7 +7091,7 @@ fn get_hive(_state_dir: &Path, hive_id: &str) -> Result<serde_json::Value, Orche
 }
 
 fn remove_hive_cleanup_script() -> &'static str {
-    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-cognition sy-policy sy-orchestrator sy-admin sy-architect sy-storage sy-frontdesk-gov fluxbee-syncthing; do \
+    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-cognition sy-policy sy-timer sy-orchestrator sy-admin sy-architect sy-storage sy-frontdesk-gov fluxbee-syncthing; do \
 systemctl stop --no-block \"$s\" >/dev/null 2>&1 || true; \
 systemctl disable \"$s\" >/dev/null 2>&1 || true; \
 systemctl kill -s KILL \"$s\" >/dev/null 2>&1 || true; \
@@ -11646,6 +11654,16 @@ async fn kill_node_flow(
         }
     }
 
+    let timer_purge = if purge_instance {
+        if let Some(node_name) = validated_node_name.as_ref() {
+            Some(purge_owner_timers_before_teardown(state, &target_hive, node_name).await)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     match execute_on_hive(state, &target_hive, &cmd, "kill_node") {
         Ok(()) => {
             let mut response = serde_json::json!({
@@ -11658,6 +11676,9 @@ async fn kill_node_flow(
                 "force": force,
                 "purge_instance": purge_instance,
             });
+            if let Some(timer_purge) = timer_purge {
+                response["timer_purge"] = timer_purge;
+            }
             if purge_instance {
                 if let Some(node_name) = validated_node_name.as_ref() {
                     match remove_node_instance_dir_with_root(node_name, &node_files_root()) {
@@ -11849,6 +11870,7 @@ async fn remove_node_instance_flow(
         });
     }
 
+    let timer_purge = purge_owner_timers_before_teardown(state, &target_hive, &node_name).await;
     match remove_node_instance_dir_with_root(&node_name, &node_files_root()) {
         Ok((removed_path, removed_kind_dir)) => serde_json::json!({
             "status": "ok",
@@ -11858,6 +11880,7 @@ async fn remove_node_instance_flow(
             "unit": unit,
             "removed_path": removed_path.display().to_string(),
             "removed_kind_dir": removed_kind_dir,
+            "timer_purge": timer_purge,
         }),
         Err(err) => {
             if err.to_string() == "NODE_NOT_FOUND" {
@@ -11868,6 +11891,7 @@ async fn remove_node_instance_flow(
                     "target": target_hive,
                     "node_name": node_name,
                     "unit": unit,
+                    "timer_purge": timer_purge,
                 })
             } else {
                 serde_json::json!({
@@ -11877,9 +11901,55 @@ async fn remove_node_instance_flow(
                     "target": target_hive,
                     "node_name": node_name,
                     "unit": unit,
+                    "timer_purge": timer_purge,
                 })
             }
         }
+    }
+}
+
+async fn purge_owner_timers_before_teardown(
+    state: &OrchestratorState,
+    target_hive: &str,
+    owner_l2_name: &str,
+) -> serde_json::Value {
+    let timer_node = ensure_l2_name("SY.timer", target_hive);
+    match relay_system_action(
+        state,
+        &timer_node,
+        "TIMER_PURGE_OWNER",
+        "TIMER_RESPONSE",
+        serde_json::json!({
+            "owner_l2_name": owner_l2_name,
+        }),
+        Duration::from_secs(3),
+    )
+    .await
+    {
+        Ok(payload) => {
+            let status = if payload
+                .get("ok")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                "ok"
+            } else {
+                "error"
+            };
+            serde_json::json!({
+                "status": status,
+                "target": timer_node,
+                "owner_l2_name": owner_l2_name,
+                "deleted_count": payload.get("deleted_count").cloned().unwrap_or(serde_json::Value::Null),
+                "payload": payload,
+            })
+        }
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "target": timer_node,
+            "owner_l2_name": owner_l2_name,
+            "message": err.to_string(),
+        }),
     }
 }
 
@@ -13369,6 +13439,7 @@ async fn add_hive_flow(
     let has_identity_source = core_manifest.components.contains_key("sy-identity");
     let has_cognition_source = core_manifest.components.contains_key("sy-cognition");
     let has_policy_source = core_manifest.components.contains_key("sy-policy");
+    let has_timer_source = core_manifest.components.contains_key("sy-timer");
 
     let core_deploy_started_at = now_epoch_ms();
     let core_deploy_started = Instant::now();
@@ -13552,6 +13623,9 @@ async fn add_hive_flow(
     }
     if has_policy_source {
         worker_units.push(("sy-policy", "/usr/bin/sy-policy"));
+    }
+    if has_timer_source {
+        worker_units.push(("sy-timer", "/usr/bin/sy-timer"));
     }
 
     for (name, exec_path) in &worker_units {

@@ -1,5 +1,7 @@
 /target
 /.DS_Store
+docs/website/api/.env
+docs/website/api/node_modules/
 # Visual Studio 2015/2017 cache/options directory
 .vs/
 nodes/io/target

@@ -1,0 +1,10 @@
+{
+  "name": "fluxbee-waitlist-api",
+  "version": "1.0.0",
+  "description": "Minimal waitlist backend — posts signups to Slack",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {}
+}

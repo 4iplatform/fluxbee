@@ -57,6 +57,19 @@ if [[ -d "$ROOT_DIR/sy-opa-rules" ]]; then
   fi
 fi
 
+if [[ -d "$ROOT_DIR/sy-timer" ]]; then
+  if [[ "${SKIP_BUILD:-}" == "1" || "${SKIP_GO_BUILD:-}" == "1" ]]; then
+    echo "SKIP_BUILD/SKIP_GO_BUILD set; skipping sy-timer build."
+  elif [[ -x "$ROOT_DIR/sy-timer/sy-timer" && "${FORCE_GO_BUILD:-}" != "1" ]]; then
+    echo "sy-timer binary already exists; skipping Go build (set FORCE_GO_BUILD=1 to rebuild)."
+  elif ! command -v go >/dev/null 2>&1; then
+    echo "Warning: go not found. Skipping sy-timer build." >&2
+  else
+    echo "Building sy-timer (Go)..."
+    (cd "$ROOT_DIR/sy-timer" && go build -o sy-timer .)
+  fi
+fi
+
 sudo install -d "$CONFIG_DIR"
 sudo install -d "$STATE_DIR"
 sudo install -d -m 0700 "$STATE_DIR/ssh"
@@ -129,6 +142,16 @@ if [[ -z "${sy_opa_rules_bin:-}" ]]; then
   echo "Missing binary: $ROOT_DIR/sy-opa-rules/sy-opa-rules or $BIN_DIR/sy_opa_rules" >&2
   missing=1
 fi
+sy_timer_bin=""
+if [[ -f "$ROOT_DIR/sy-timer/sy-timer" ]]; then
+  sy_timer_bin="$ROOT_DIR/sy-timer/sy-timer"
+elif sy_timer_bin="$(pick_bin sy_timer || true)"; then
+  :
+fi
+if [[ -z "${sy_timer_bin:-}" ]]; then
+  echo "Missing binary: $ROOT_DIR/sy-timer/sy-timer or $BIN_DIR/sy_timer" >&2
+  missing=1
+fi
 
 if [[ "$missing" -eq 1 ]]; then
   echo "Build them first (e.g. cargo build --release --bins) or set BIN_DIR to where they exist." >&2
@@ -145,6 +168,7 @@ sudo install -m 0755 "$sy_identity_bin" /usr/bin/sy-identity
 sudo install -m 0755 "$sy_cognition_bin" /usr/bin/sy-cognition
 sudo install -m 0755 "$sy_policy_bin" /usr/bin/sy-policy
 sudo install -m 0755 "$sy_opa_rules_bin" /usr/bin/sy-opa-rules
+sudo install -m 0755 "$sy_timer_bin" /usr/bin/sy-timer
 sudo install -m 0755 "$sy_frontdesk_gov_bin" /usr/bin/sy-frontdesk-gov
 
 echo "Updating core source repo in $STATE_DIR/dist/core/bin..."
@@ -158,6 +182,7 @@ sudo install -m 0755 "$sy_identity_bin" "$STATE_DIR/dist/core/bin/sy-identity"
 sudo install -m 0755 "$sy_cognition_bin" "$STATE_DIR/dist/core/bin/sy-cognition"
 sudo install -m 0755 "$sy_policy_bin" "$STATE_DIR/dist/core/bin/sy-policy"
 sudo install -m 0755 "$sy_opa_rules_bin" "$STATE_DIR/dist/core/bin/sy-opa-rules"
+sudo install -m 0755 "$sy_timer_bin" "$STATE_DIR/dist/core/bin/sy-timer"
 sudo install -m 0755 "$sy_frontdesk_gov_bin" "$STATE_DIR/dist/core/bin/sy-frontdesk-gov"
 
 rt_gateway_sha="$(sha256sum "$STATE_DIR/dist/core/bin/rt-gateway" | awk '{print $1}')"
@@ -178,6 +203,8 @@ sy_cognition_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-cognition" | awk '{pr
 sy_cognition_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-cognition")"
 sy_policy_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-policy" | awk '{print $1}')"
 sy_policy_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-policy")"
+sy_timer_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-timer" | awk '{print $1}')"
+sy_timer_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-timer")"
 sy_frontdesk_gov_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-frontdesk-gov" | awk '{print $1}')"
 sy_frontdesk_gov_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-frontdesk-gov")"
 core_version="${FLUXBEE_CORE_VERSION:-dev}"
@@ -207,6 +234,7 @@ cat >"$core_manifest_tmp" <<EOF
     "sy-storage": {"service": "sy-storage", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_storage_sha", "size": $sy_storage_size},
     "sy-cognition": {"service": "sy-cognition", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_cognition_sha", "size": $sy_cognition_size},
     "sy-policy": {"service": "sy-policy", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_policy_sha", "size": $sy_policy_size},
+    "sy-timer": {"service": "sy-timer", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_timer_sha", "size": $sy_timer_size},
     "sy-frontdesk-gov": {"service": "sy-frontdesk-gov", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_frontdesk_gov_sha", "size": $sy_frontdesk_gov_size}
   }
 }
@@ -258,6 +286,7 @@ verify_core_component "sy-orchestrator" "$sy_orch_sha" "$sy_orch_size"
 verify_core_component "sy-storage" "$sy_storage_sha" "$sy_storage_size"
 verify_core_component "sy-cognition" "$sy_cognition_sha" "$sy_cognition_size"
 verify_core_component "sy-policy" "$sy_policy_sha" "$sy_policy_size"
+verify_core_component "sy-timer" "$sy_timer_sha" "$sy_timer_size"
 verify_core_component "sy-frontdesk-gov" "$sy_frontdesk_gov_sha" "$sy_frontdesk_gov_size"
 echo "Core binaries verification passed."
 
@@ -427,6 +456,7 @@ install_unit "sy-storage" "/usr/bin/sy-storage"
 install_unit "sy-identity" "/usr/bin/sy-identity"
 install_unit "sy-cognition" "/usr/bin/sy-cognition"
 install_unit "sy-policy" "/usr/bin/sy-policy"
+install_unit "sy-timer" "/usr/bin/sy-timer"
 install_unit "sy-frontdesk-gov" "/usr/bin/sy-frontdesk-gov"
 sudo systemctl daemon-reload
 

@@ -2,14 +2,14 @@
 
 **Status:** draft / canonical for current alignment scope  
 **Date:** 2026-04-08  
-**Scope:** `SY.config.routes`, `SY.opa.rules`  
-**Purpose:** provide the explicit node action catalogs that `SY.admin` can rely on as the operator-facing contract for these aligned legacy nodes.
+**Scope:** `SY.config.routes`, `SY.opa.rules`, `SY.timer`  
+**Purpose:** provide the explicit node action catalogs that `SY.admin` can rely on as the operator-facing contract for these aligned and newly formalized system nodes.
 
 ---
 
 ## 1) Contract intent
 
-For both nodes in this document:
+For the nodes in this document:
 
 - `SY.admin` is the canonical operator entrypoint.
 - The node-local surface described here is the contract that `SY.admin` targets.
@@ -177,7 +177,7 @@ Interpretation rule:
 
 Current implementation reference:
 - [main.go](/Users/cagostino/Documents/GitHub/fluxbee/sy-opa-rules/main.go)
-- [sdk](/Users/cagostino/Documents/GitHub/fluxbee/sy-opa-rules/sdk)
+- [fluxbee-go-sdk](/Users/cagostino/Documents/GitHub/fluxbee/fluxbee-go-sdk)
 
 ### 3.1 Node role
 
@@ -286,9 +286,101 @@ Interpretation rule:
 
 ---
 
-## 4) What `SY.admin` may assume
+## 4) `SY.timer`
 
-For both nodes, `SY.admin` may rely on:
+Current implementation reference:
+- [main.go](/Users/cagostino/Documents/GitHub/fluxbee/sy-timer/main.go)
+- [sy-timer.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/sy-timer.md)
+
+### 4.1 Node role
+
+`SY.timer` owns:
+- persistent one-shot timers
+- persistent recurring timers
+- authoritative time/timezone utility operations
+- owner-bound timer mutation semantics
+- open read visibility for timer inspection inside the local hive
+
+### 4.2 Canonical operator entrypoint
+
+Operator visibility for this node is exposed through `SY.admin`.
+
+`SY.admin` actions that target this node:
+- `timer_help`
+- `timer_get`
+- `timer_list`
+- `timer_now`
+- `timer_now_in`
+- `timer_convert`
+- `timer_parse`
+- `timer_format`
+
+### 4.3 Read-only admin surface in v1
+
+These actions are intentionally exposed through `SY.admin` in v1 because they are read-only or stateless:
+
+- `timer_help`
+  - purpose: introspect the node capability surface
+  - transport category: `system`
+  - canonical reply: `TIMER_RESPONSE`
+
+- `timer_get`
+  - purpose: read one timer by `timer_uuid`
+  - transport category: `system`
+  - canonical reply: `TIMER_RESPONSE`
+
+- `timer_list`
+  - purpose: list timers in the local hive
+  - transport category: `system`
+  - optional request filters:
+    - `owner_l2_name`
+    - `status_filter`
+    - `limit`
+  - canonical reply: `TIMER_RESPONSE`
+
+- `timer_now`
+- `timer_now_in`
+- `timer_convert`
+- `timer_parse`
+- `timer_format`
+  - purpose: authoritative time/timezone utility operations
+  - transport category: `system`
+  - canonical reply: `TIMER_RESPONSE`
+
+### 4.4 Direct SDK-first surface
+
+The primary interaction model for `SY.timer` is still direct node-to-node SDK usage.
+
+Owner-bound mutation actions remain outside `SY.admin` in v1:
+- `TIMER_SCHEDULE`
+- `TIMER_SCHEDULE_RECURRING`
+- `TIMER_CANCEL`
+- `TIMER_RESCHEDULE`
+
+Additional node-local actions:
+- `TIMER_GET`
+- `TIMER_LIST`
+- `TIMER_HELP`
+- `TIMER_PURGE_OWNER`
+- `NODE_STATUS_GET`
+
+Interpretation rule:
+- use `SY.admin` for operator visibility and stateless time utilities
+- use the SDK directly for owner-bound scheduling and mutation flows
+- reserve `TIMER_PURGE_OWNER` to `SY.orchestrator@<local-hive>`
+
+### 4.5 `TIMER_FIRED` semantics
+
+- `TIMER_FIRED` is a `system` event emitted by `SY.timer` to `target_l2_name`
+- it is fire-and-forget in v1
+- `SY.timer` does not wait for an application ack
+- no dead-letter queue or automatic retry is provided by the platform in v1
+
+---
+
+## 5) What `SY.admin` may assume
+
+For the nodes in this document, `SY.admin` may rely on:
 
 - canonical operator entrypoint ownership
 - stable action names listed in this document
@@ -303,7 +395,7 @@ For both nodes, `SY.admin` may rely on:
 
 ---
 
-## 5) Out of scope here
+## 6) Out of scope here
 
 - redesigning route/VPN domain semantics
 - redesigning OPA business semantics
