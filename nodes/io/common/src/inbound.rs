@@ -270,6 +270,11 @@ mod tests {
         );
     }
 
+    fn assert_no_legacy_context_ich(msg: &fluxbee_sdk::protocol::Message) {
+        let legacy = msg.meta.context.as_ref().and_then(|ctx| ctx.get("ich"));
+        assert!(legacy.is_none(), "legacy meta.context.ich should not be present");
+    }
+
     #[tokio::test]
     async fn dedup_drops_second_message() {
         let mut p = InboundProcessor::new("node", InboundConfig::default());
@@ -311,6 +316,8 @@ mod tests {
         };
         assert_eq!(msg.meta.src_ilk, None);
         assert_no_legacy_context_src_ilk(&msg);
+        assert_eq!(msg.meta.ich.as_deref(), Some("slack://U"));
+        assert_no_legacy_context_ich(&msg);
         let stats = p.stats();
         assert_eq!(stats.identity_lookup_misses, 1);
         assert_eq!(stats.identity_fallback_null, 1);
@@ -335,6 +342,7 @@ mod tests {
             panic!("unexpected outcome: {o:?}");
         };
         assert_eq!(msg.meta.thread_id, expected_thread_id);
+        assert_eq!(msg.meta.ich.as_deref(), Some("slack://U"));
         let legacy_context_thread_id = msg
             .meta
             .context
@@ -342,6 +350,7 @@ mod tests {
             .and_then(|ctx| ctx.get("thread_id"))
             .and_then(|v| v.as_str());
         assert_eq!(legacy_context_thread_id, None);
+        assert_no_legacy_context_ich(&msg);
     }
 
     #[tokio::test]
@@ -363,6 +372,7 @@ mod tests {
             panic!("unexpected outcome: {o:?}");
         };
         assert_eq!(msg.meta.thread_id, expected_thread_id);
+        assert_eq!(msg.meta.ich.as_deref(), Some("slack://U"));
         let legacy_context_thread_id = msg
             .meta
             .context
@@ -370,6 +380,7 @@ mod tests {
             .and_then(|ctx| ctx.get("thread_id"))
             .and_then(|v| v.as_str());
         assert_eq!(legacy_context_thread_id, None);
+        assert_no_legacy_context_ich(&msg);
     }
 
     #[tokio::test]
@@ -396,6 +407,8 @@ mod tests {
             .as_deref()
             .is_some_and(|value| value.starts_with("ilk:mock:")));
         assert_no_legacy_context_src_ilk(&msg);
+        assert_eq!(msg.meta.ich.as_deref(), Some("slack://U456"));
+        assert_no_legacy_context_ich(&msg);
 
         let rt = msg
             .meta
@@ -499,6 +512,8 @@ mod tests {
         };
         assert_eq!(msg.meta.src_ilk.as_deref(), Some("ilk:provisional:test"));
         assert_no_legacy_context_src_ilk(&msg);
+        assert_eq!(msg.meta.ich.as_deref(), Some("slack://U"));
+        assert_no_legacy_context_ich(&msg);
         let stats = p.stats();
         assert_eq!(stats.identity_lookup_misses, 1);
         assert_eq!(stats.identity_provision_success, 1);
@@ -527,6 +542,8 @@ mod tests {
         };
         assert_eq!(msg.meta.src_ilk, None);
         assert_no_legacy_context_src_ilk(&msg);
+        assert_eq!(msg.meta.ich.as_deref(), Some("slack://U"));
+        assert_no_legacy_context_ich(&msg);
         let stats = p.stats();
         assert_eq!(stats.identity_lookup_misses, 1);
         assert_eq!(stats.identity_provision_errors, 1);
@@ -558,6 +575,8 @@ mod tests {
         };
         assert_eq!(msg.meta.src_ilk.as_deref(), Some("ilk:hit:test"));
         assert_no_legacy_context_src_ilk(&msg);
+        assert_eq!(msg.meta.ich.as_deref(), Some("slack://U"));
+        assert_no_legacy_context_ich(&msg);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let stats = p.stats();
         assert_eq!(stats.identity_lookup_hits, 1);

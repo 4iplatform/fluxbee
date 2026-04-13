@@ -32,6 +32,7 @@ pub fn build_user_message(
         "dst_ilk".to_string(),
         dst_ilk.clone().map(Value::String).unwrap_or(Value::Null),
     );
+    let ich = extract_ich_from_context_obj(&context_obj);
     let thread_id = extract_thread_id_from_context_obj(&context_obj);
     // Keep thread_id only in canonical meta.thread_id carrier.
     context_obj.remove("thread_id");
@@ -50,6 +51,7 @@ pub fn build_user_message(
             msg: None,
             src_ilk,
             dst_ilk,
+            ich,
             thread_id,
             scope: None,
             target: None,
@@ -73,6 +75,22 @@ fn extract_thread_id_from_context_obj(context_obj: &Map<String, Value>) -> Optio
         .map(ToString::to_string)
 }
 
+fn extract_ich_from_context_obj(context_obj: &Map<String, Value>) -> Option<String> {
+    let io = context_obj.get("io")?;
+    let channel = io
+        .get("channel")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let sender_id = io
+        .get("sender")
+        .and_then(|sender| sender.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(format!("{channel}://{sender_id}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +110,9 @@ mod tests {
                 "io": {
                     "conversation": {
                         "thread_id": "thread:canonical-io"
+                    },
+                    "sender": {
+                        "id": "U123"
                     }
                 }
             }),
@@ -99,6 +120,7 @@ mod tests {
         );
 
         assert_eq!(msg.meta.thread_id.as_deref(), Some("thread:canonical-io"));
+        assert_eq!(msg.meta.ich.as_deref(), None);
         assert_eq!(
             msg.meta
                 .context
@@ -125,6 +147,41 @@ mod tests {
         );
 
         assert_eq!(msg.meta.thread_id, None);
+    }
+
+    #[test]
+    fn build_user_message_promotes_ich_from_io_channel_and_sender() {
+        let msg = build_user_message(
+            "src-node",
+            Some("AI.echo@motherbee".to_string()),
+            DEFAULT_TTL,
+            "trace-1".to_string(),
+            Some("ilk:src".to_string()),
+            None,
+            json!({
+                "io": {
+                    "channel": "slack",
+                    "sender": {
+                        "id": "U456"
+                    },
+                    "conversation": {
+                        "thread_id": "thread:canonical-io"
+                    }
+                }
+            }),
+            json!({"type":"text","content":"hi"}),
+        );
+
+        assert_eq!(msg.meta.ich.as_deref(), Some("slack://U456"));
+        assert_eq!(msg.meta.thread_id.as_deref(), Some("thread:canonical-io"));
+        assert_eq!(
+            msg.meta
+                .context
+                .as_ref()
+                .and_then(|ctx| ctx.get("ich"))
+                .and_then(Value::as_str),
+            None
+        );
     }
 }
 
