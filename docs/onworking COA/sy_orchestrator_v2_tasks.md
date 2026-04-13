@@ -130,12 +130,13 @@ Fuente de verdad funcional: `docs/onworking/SY.orchestrator — Spec de Cambios 
 
 ### ORCH-L2-1 — Migrar auth de comandos de sistema
 
-- [ ] ORCH-L2-1-T1. En `handle_system_message`, reemplazar `resolve_system_source_name_with_retry(state, &msg.routing.src)` por lectura directa de `msg.routing.src_l2_name`.
-- [ ] ORCH-L2-1-T2. Eliminar `resolve_system_source_name_with_retry`.
-- [ ] ORCH-L2-1-T3. Eliminar `source_name_from_snapshot` (SHM reader para identidad de sender).
-- [ ] ORCH-L2-1-T4. Eliminar `source_name_from_lsa_snapshot` (LSA reader para identidad de sender).
-- [ ] ORCH-L2-1-T5. Actualizar logs: reemplazar `source_uuid` + `source_name` por `src_l2_name` directamente.
-- [ ] ORCH-L2-1-T6. Verificar que el campo `src_l2_name` en el payload de error (`"source_name"`) sigue siendo informativo o simplificarlo.
-- [ ] ORCH-L2-1-T7. Test negativo: mensaje sin `src_l2_name` (campo `None`) debe rechazarse con `FORBIDDEN` igual que hoy.
-- [ ] ORCH-L2-1-T8. Test positivo: mensaje con `src_l2_name = "SY.admin@<hive>"` debe pasar auth.
-- [ ] ORCH-L2-1-T9. Confirmar que no quedan otros call sites de `resolve_system_source_name_with_retry` en el archivo.
+- [x] ORCH-L2-1-T1. En `handle_system_message`, reemplazar `resolve_system_source_name_with_retry(state, &msg.routing.src)` por lectura directa de `msg.routing.src_l2_name`.
+- [x] ORCH-L2-1-T2. Eliminar `resolve_system_source_name_with_retry`.
+- [x] ORCH-L2-1-T3. Eliminar `source_name_from_snapshot` (SHM reader para identidad de sender).
+- [x] ORCH-L2-1-T4. Eliminar `source_name_from_lsa_snapshot` (LSA reader para identidad de sender).
+- [x] ORCH-L2-1-T5. Actualizar logs: reemplazar `source_uuid` + `source_name` por `src_l2_name` directamente.
+- [x] ORCH-L2-1-T6. Verificar que el campo `src_l2_name` en el payload de error (`"source_name"`) sigue siendo informativo o simplificarlo.
+  - Resultado: simplificado a `src_uuid` + `src_l2_name`; se elimina `source_name` del payload de error.
+- [x] ORCH-L2-1-T7. Test negativo: mensaje sin `src_l2_name` (campo `None`) debe rechazarse con `FORBIDDEN` igual que hoy.
+- [x] ORCH-L2-1-T8. Test positivo: mensaje con `src_l2_name = "SY.admin@<hive>"` debe pasar auth.
+- [x] ORCH-L2-1-T9. Confirmar que no quedan otros call sites de `resolve_system_source_name_with_retry` en el archivo.

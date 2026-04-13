@@ -1536,29 +1536,17 @@ async fn handle_system_message(
             | "ADD_HIVE_FINALIZE"
             | "REMOVE_HIVE_CLEANUP"
     ) {
-        let source_name = resolve_system_source_name_with_retry(state, &msg.routing.src).await;
-        let is_allowed = source_name.as_deref().is_some_and(|name| {
-            state.system_allowed_origins.contains(name)
-                || name.starts_with("SY.orchestrator@")
-                || name.starts_with("SY.orchestrator.")
-                || name.starts_with("SY.admin@")
-                || name.starts_with("WF.orch.diag@")
-        });
+        let src_l2_name = msg.routing.src_l2_name.as_deref();
+        let is_allowed = is_allowed_system_source_name(state, src_l2_name);
         if !is_allowed {
             tracing::warn!(
                 action = action,
-                source_uuid = %msg.routing.src,
-                source_name = ?source_name,
+                src_uuid = %msg.routing.src,
+                src_l2_name = ?src_l2_name,
                 allowed = ?state.system_allowed_origins,
                 "blocked system message from unauthorized origin"
             );
-            let payload = serde_json::json!({
-                "status": "error",
-                "error_code": "FORBIDDEN",
-                "message": "system action origin not allowed",
-                "source_uuid": msg.routing.src,
-                "source_name": source_name,
-            });
+            let payload = forbidden_system_source_payload(msg, src_l2_name);
             match action {
                 "SYSTEM_UPDATE" => {
                     let _ =
@@ -1764,6 +1752,27 @@ async fn handle_system_message(
         _ => {}
     }
     Ok(())
+}
+
+fn is_allowed_system_source_name(state: &OrchestratorState, src_l2_name: Option<&str>) -> bool {
+    let Some(name) = src_l2_name.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    state.system_allowed_origins.contains(name)
+        || name.starts_with("SY.orchestrator@")
+        || name.starts_with("SY.orchestrator.")
+        || name.starts_with("SY.admin@")
+        || name.starts_with("WF.orch.diag@")
+}
+
+fn forbidden_system_source_payload(msg: &Message, src_l2_name: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "status": "error",
+        "error_code": "FORBIDDEN",
+        "message": "system action origin not allowed",
+        "src_uuid": msg.routing.src,
+        "src_l2_name": src_l2_name,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -2696,62 +2705,6 @@ fn load_system_allowed_origins(hive_id: &str) -> HashSet<String> {
             }
         })
         .collect()
-}
-
-async fn resolve_system_source_name_with_retry(
-    state: &OrchestratorState,
-    source_uuid: &str,
-) -> Option<String> {
-    let uuid = Uuid::parse_str(source_uuid).ok()?;
-    let start = Instant::now();
-    loop {
-        if let Ok(snapshot) = load_router_snapshot(state) {
-            if let Some(name) = source_name_from_snapshot(&snapshot, uuid) {
-                return Some(name);
-            }
-        }
-        if let Ok(snapshot) = load_lsa_snapshot(state) {
-            if let Some(name) = source_name_from_lsa_snapshot(&snapshot, uuid) {
-                return Some(name);
-            }
-        }
-        if start.elapsed() >= Duration::from_secs(2) {
-            return None;
-        }
-        time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
-fn source_name_from_snapshot(snapshot: &ShmSnapshot, source_uuid: Uuid) -> Option<String> {
-    for entry in &snapshot.nodes {
-        if entry.name_len == 0 {
-            continue;
-        }
-        let Ok(entry_uuid) = Uuid::from_slice(&entry.uuid) else {
-            continue;
-        };
-        if entry_uuid == source_uuid {
-            return Some(node_name(entry));
-        }
-    }
-    None
-}
-
-fn source_name_from_lsa_snapshot(snapshot: &LsaSnapshot, source_uuid: Uuid) -> Option<String> {
-    for entry in &snapshot.nodes {
-        if entry.name_len == 0 {
-            continue;
-        }
-        let Ok(entry_uuid) = Uuid::from_slice(&entry.uuid) else {
-            continue;
-        };
-        if entry_uuid == source_uuid {
-            let len = entry.name_len as usize;
-            let name = String::from_utf8_lossy(&entry.name[..len]).into_owned();
-            return Some(name);
-        }
-    }
-    None
 }
 
 async fn send_system_action_response(
@@ -15723,6 +15676,59 @@ blob:
             dist: sample_dist_config(),
             blob_sync_last_desired: Mutex::new(sample_blob_config()),
         }
+    }
+
+    #[test]
+    fn system_source_without_src_l2_name_is_rejected() {
+        let state = sample_orchestrator_state_for_tests();
+        assert!(!is_allowed_system_source_name(&state, None));
+        assert!(!is_allowed_system_source_name(&state, Some("")));
+        assert!(!is_allowed_system_source_name(&state, Some("   ")));
+    }
+
+    #[test]
+    fn system_source_with_allowed_src_l2_name_passes_auth() {
+        let mut state = sample_orchestrator_state_for_tests();
+        state
+            .system_allowed_origins
+            .insert("SY.admin@motherbee".to_string());
+
+        assert!(is_allowed_system_source_name(
+            &state,
+            Some("SY.admin@motherbee")
+        ));
+        assert!(is_allowed_system_source_name(
+            &state,
+            Some("WF.orch.diag@motherbee")
+        ));
+    }
+
+    #[test]
+    fn forbidden_system_source_payload_uses_src_l2_name_field() {
+        let msg = Message {
+            routing: Routing {
+                src: "src-uuid-1".to_string(),
+                src_l2_name: Some("SY.admin@motherbee".to_string()),
+                dst: Destination::Unicast("SY.orchestrator@motherbee".to_string()),
+                ttl: 16,
+                trace_id: "trace-1".to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some("SYSTEM_UPDATE".to_string()),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+
+        let payload = forbidden_system_source_payload(&msg, msg.routing.src_l2_name.as_deref());
+        assert_eq!(payload["error_code"], "FORBIDDEN");
+        assert_eq!(payload["src_uuid"], serde_json::json!("src-uuid-1"));
+        assert_eq!(
+            payload["src_l2_name"],
+            serde_json::json!("SY.admin@motherbee")
+        );
+        assert!(payload.get("source_name").is_none());
     }
 
     #[tokio::test]

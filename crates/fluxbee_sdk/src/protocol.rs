@@ -659,7 +659,10 @@ mod tests {
             json!({"key": "value"}),
         );
         let encoded = serde_json::to_string(&msg).expect("serialize");
-        assert!(!encoded.contains("src_l2_name"), "field must be absent when None");
+        assert!(
+            !encoded.contains("src_l2_name"),
+            "field must be absent when None"
+        );
 
         let decoded: Message = serde_json::from_str(&encoded).expect("deserialize");
         assert_eq!(decoded.routing.src, "uuid-sender");
@@ -681,7 +684,10 @@ mod tests {
             "payload": {}
         });
         let msg: Message = serde_json::from_value(raw).expect("deserialize");
-        assert_eq!(msg.routing.src_l2_name.as_deref(), Some("IO.webchat@hivename"));
+        assert_eq!(
+            msg.routing.src_l2_name.as_deref(),
+            Some("IO.webchat@hivename")
+        );
 
         let re_encoded = serde_json::to_value(&msg).expect("re-serialize");
         let re_field = re_encoded["routing"]["src_l2_name"].as_str();

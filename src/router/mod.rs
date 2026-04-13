@@ -5544,9 +5544,7 @@ mod tests {
         .await
         .unwrap();
 
-        let delivered = receiver_rx
-            .try_recv()
-            .expect("message should be delivered");
+        let delivered = receiver_rx.try_recv().expect("message should be delivered");
         let delivered_msg: Message = serde_json::from_slice(&delivered).unwrap();
         assert_eq!(
             delivered_msg.routing.src_l2_name.as_deref(),
@@ -5624,9 +5622,7 @@ mod tests {
         .await
         .unwrap();
 
-        let delivered = receiver_rx
-            .try_recv()
-            .expect("message should be delivered");
+        let delivered = receiver_rx.try_recv().expect("message should be delivered");
         let delivered_msg: Message = serde_json::from_slice(&delivered).unwrap();
         assert_eq!(
             delivered_msg.routing.src,
@@ -5678,8 +5674,7 @@ mod tests {
         }
 
         // peer_nodes maps the remote sender UUID to its L2 name as known by this router.
-        let peer_nodes: Arc<Mutex<HashMap<Uuid, PeerNode>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let peer_nodes: Arc<Mutex<HashMap<Uuid, PeerNode>>> = Arc::new(Mutex::new(HashMap::new()));
         {
             let mut g = peer_nodes.lock().await;
             g.insert(
