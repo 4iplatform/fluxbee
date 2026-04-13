@@ -314,11 +314,11 @@ Decisión tomada:
 
 ### L2-LOOKUP-3 - SDK Rust
 
-- [ ] L2-LOOKUP-9. Extender el envelope/protocol del SDK Rust con `routing.src_l2_name`.
-- [ ] L2-LOOKUP-10. Agregar helper canónico para consumidores:
+- [x] L2-LOOKUP-9. Extender el envelope/protocol del SDK Rust con `routing.src_l2_name`.
+- [x] L2-LOOKUP-10. Agregar helper canónico para consumidores:
   - `message.source_l2_name()`
-- [ ] L2-LOOKUP-11. Reemplazar en el SDK Rust cualquier necesidad futura de lookup por SHM del lado nodo.
-- [ ] L2-LOOKUP-12. Agregar tests de parse/serialize y compatibilidad del nuevo envelope.
+- [x] L2-LOOKUP-11. Reemplazar en el SDK Rust cualquier necesidad futura de lookup por SHM del lado nodo.
+- [x] L2-LOOKUP-12. Agregar tests de parse/serialize y compatibilidad del nuevo envelope.
 
 ### L2-LOOKUP-4 - SDK Go
 
