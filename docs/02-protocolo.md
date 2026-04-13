@@ -50,6 +50,13 @@ Reglas:
 - en mensajes emitidos por un nodo hacia el router, `src_l2_name` puede omitirse
 - en mensajes entregados por el router a un nodo, `src_l2_name` debe reflejar el L2 canónico del origen real
 
+Semántica de forwarding:
+- `routing.src` siempre identifica el UUID L1 del emisor original, no el del router intermedio.
+- en entrega local, el router estampa `src_l2_name` desde la sesión autenticada del nodo origen.
+- en `router -> router -> nodo`, cada router receptor vuelve a estampar `src_l2_name` usando su tabla autoritativa de `peer_nodes` para ese mismo `routing.src`.
+- el valor visible para el nodo destino debe representar siempre al origen real del mensaje, no al gateway ni al hop intermedio.
+- si un router no puede asociar `routing.src` con un peer autenticado, no debe tratar un `src_l2_name` recibido desde la red como dato confiable.
+
 ### 2.1 Valores de `dst`
 
 | Valor | Comportamiento |

@@ -130,6 +130,17 @@ Rules:
 - nodes should not perform SHM or filesystem lookup to derive the sender L2 during normal message handling
 - any value supplied by a sender in `routing.src_l2_name` must be ignored and overwritten by the router
 
+Forwarding and WAN behavior:
+- `routing.src` remains the L1 UUID of the original sender across hops.
+- a local delivery is stamped from the authenticated local node session.
+- an inter-router delivery is stamped again by the receiving router from its `peer_nodes` view of that same source UUID.
+- the destination node must observe the original sender identity (`src` + `src_l2_name`), not the identity of the forwarding router.
+- `src_l2_name` is therefore a router-authenticated transport fact, not an application-supplied hint.
+
+Operational consequence:
+- consumers can authorize, log and attribute ownership from `routing.src_l2_name` without doing per-message lookup.
+- SHM and filesystem identity state remain router/runtime internals and are not part of the normal node-facing contract.
+
 ```rego
 # OPA reads tenant from identity table
 tenant := data.identity[input.meta.src_ilk].tenant_ilk
