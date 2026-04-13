@@ -6,7 +6,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"testing"
 	"time"
 
@@ -41,19 +40,10 @@ func newTestService(t *testing.T) (*Service, chan []byte) {
 	t.Helper()
 	db := openTestTimerDB(t)
 	tx := make(chan []byte, 8)
-	peerMap := map[string]string{
-		"11111111-1111-1111-1111-111111111111": "WF.demo@motherbee",
-	}
 	service := &Service{
 		sender:   &stubSender{uuid: "timer-node-uuid", fullName: "SY.timer@motherbee", tx: tx},
 		nodeName: "SY.timer@motherbee",
 		db:       db,
-		resolvePeerL2Name: func(sourceUUID string) (string, error) {
-			if name, ok := peerMap[sourceUUID]; ok {
-				return name, nil
-			}
-			return "", fmt.Errorf("source uuid %s not found", sourceUUID)
-		},
 	}
 	return service, tx
 }
@@ -391,16 +381,6 @@ func TestRespondTimerPurgeOwnerRequiresLocalOrchestrator(t *testing.T) {
 
 func TestRespondTimerPurgeOwnerDeletesTimersForOwner(t *testing.T) {
 	service, tx := newTestService(t)
-	service.resolvePeerL2Name = func(sourceUUID string) (string, error) {
-		switch sourceUUID {
-		case "11111111-1111-1111-1111-111111111111":
-			return "WF.demo@motherbee", nil
-		case "33333333-3333-3333-3333-333333333333":
-			return "SY.orchestrator@motherbee", nil
-		default:
-			return "", fmt.Errorf("source uuid %s not found", sourceUUID)
-		}
-	}
 
 	insertOwnedTimer(t, service.db, timerRow{
 		UUID:         "timer-owned-1",
@@ -436,17 +416,11 @@ func TestRespondTimerPurgeOwnerDeletesTimersForOwner(t *testing.T) {
 		CreatedAtUTC: time.Now().UTC().UnixMilli(),
 	})
 
-	msg, err := fluxbeesdk.BuildSystemMessage(
-		"33333333-3333-3333-3333-333333333333",
-		fluxbeesdk.UnicastDestination("SY.timer@motherbee"),
-		16,
-		uuid.NewString(),
-		"TIMER_PURGE_OWNER",
+	msg := mustBuildSystemMessageAs(t,
 		map[string]any{"owner_l2_name": "WF.demo@motherbee"},
+		"TIMER_PURGE_OWNER",
+		"SY.orchestrator@motherbee",
 	)
-	if err != nil {
-		t.Fatalf("build purge message: %v", err)
-	}
 	if err := service.respondTimerPurgeOwner(msg); err != nil {
 		t.Fatalf("purge owner: %v", err)
 	}
@@ -474,6 +448,11 @@ func insertOwnedTimer(t *testing.T, db *sql.DB, row timerRow) {
 
 func mustBuildSystemMessage(t *testing.T, payload any, verb string) fluxbeesdk.Message {
 	t.Helper()
+	return mustBuildSystemMessageAs(t, payload, verb, "WF.demo@motherbee")
+}
+
+func mustBuildSystemMessageAs(t *testing.T, payload any, verb, srcL2Name string) fluxbeesdk.Message {
+	t.Helper()
 	msg, err := fluxbeesdk.BuildSystemMessage(
 		"11111111-1111-1111-1111-111111111111",
 		fluxbeesdk.UnicastDestination("SY.timer@motherbee"),
@@ -485,6 +464,7 @@ func mustBuildSystemMessage(t *testing.T, payload any, verb string) fluxbeesdk.M
 	if err != nil {
 		t.Fatalf("build message: %v", err)
 	}
+	msg.Routing.SrcL2Name = &srcL2Name
 	return msg
 }
 

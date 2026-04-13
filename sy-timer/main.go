@@ -23,9 +23,8 @@ import (
 const (
 	version             = "1.0"
 	defaultNodeBaseName = "SY.timer"
-	configDir           = "/etc/fluxbee"
-	stateDir            = "/var/lib/fluxbee/state"
-	routerSockDir       = "/var/run/fluxbee/routers"
+	configDir     = "/etc/fluxbee"
+	routerSockDir = "/var/run/fluxbee/routers"
 )
 
 var uuidPersistenceDir = "/var/lib/fluxbee/state/nodes"
@@ -34,7 +33,6 @@ type messageSender interface {
 	Send(fluxbeesdk.Message) error
 	UUID() string
 	FullName() string
-	RouterName() string
 }
 
 type messageReceiver interface {
@@ -42,14 +40,13 @@ type messageReceiver interface {
 }
 
 type Service struct {
-	sender            messageSender
-	receiver          messageReceiver
-	nodeName          string
-	instanceDir       string
-	dbPath            string
-	db                *sql.DB
-	resolvePeerL2Name func(string) (string, error)
-	scheduler         *timerScheduler
+	sender      messageSender
+	receiver    messageReceiver
+	nodeName    string
+	instanceDir string
+	dbPath      string
+	db          *sql.DB
+	scheduler   *timerScheduler
 }
 
 type timerNowInRequest struct {
@@ -798,27 +795,14 @@ func nullableJSONValue(value string) any {
 }
 
 // resolveSourceL2NameFromMsg returns the canonical L2 name of the sender.
-// It reads routing.src_l2_name stamped by the router on delivery.
-// Falls back to the SHM-based resolver only when the stamp is absent (e.g.
-// during the transition window before all routers in the hive are updated).
+// It reads routing.src_l2_name stamped authoritatively by the router on delivery.
+// Returns an error if the stamp is absent — all messages from live routers must
+// carry this field.
 func (s *Service) resolveSourceL2NameFromMsg(incoming fluxbeesdk.Message) (string, error) {
 	if name := incoming.SourceL2Name(); name != "" {
 		return name, nil
 	}
-	// Fallback: SHM lookup for routers that have not yet been updated.
-	if s.resolvePeerL2Name != nil {
-		return s.resolvePeerL2Name(incoming.Routing.Src)
-	}
-	_, hive, ok := strings.Cut(s.nodeName, "@")
-	if !ok || strings.TrimSpace(hive) == "" {
-		return "", fmt.Errorf("service node name missing hive suffix")
-	}
-	return fluxbeesdk.ResolvePeerL2Name(incoming.Routing.Src, fluxbeesdk.PeerIdentityResolver{
-		ConfigDir:  configDir,
-		StateDir:   stateDir,
-		HiveID:     hive,
-		RouterName: s.sender.RouterName(),
-	})
+	return "", fmt.Errorf("routing.src_l2_name missing from incoming message (src=%s)", incoming.Routing.Src)
 }
 
 func (s *Service) localOrchestratorL2Name() string {

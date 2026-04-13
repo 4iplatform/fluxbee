@@ -330,9 +330,9 @@ Decisión tomada:
 
 ### L2-LOOKUP-5 - Migración de nodos y cleanup
 
-- [ ] L2-LOOKUP-18. Migrar `SY.timer` para usar `routing.src_l2_name` en ownership/auth y eliminar la resolución `routing.src -> L2`.
-- [ ] L2-LOOKUP-19. Inventariar y migrar otros nodos que dependan de lookup de origen a L2.
-- [ ] L2-LOOKUP-20. Eliminar del repo las rutas legacy basadas en:
+- [x] L2-LOOKUP-18. Migrar `SY.timer` para usar `routing.src_l2_name` en ownership/auth y eliminar la resolución `routing.src -> L2`.
+- [x] L2-LOOKUP-19. Inventariar y migrar otros nodos que dependan de lookup de origen a L2.
+- [x] L2-LOOKUP-20. Eliminar del repo las rutas legacy basadas en:
   - `state/nodes`
   - `uuid_persistence_dir` como lookup de remitente
   - lectura SHM desde consumidores solo para obtener el L2 del origen
