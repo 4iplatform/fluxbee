@@ -1302,6 +1302,7 @@ fn now_epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::{load_runtime_api_registry, materialize_inline_api_keys};
     use axum::http::header::AUTHORIZATION;
     use fluxbee_sdk::{
         build_node_secret_record, load_node_secret_record_with_root,
