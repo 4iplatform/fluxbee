@@ -28,6 +28,15 @@ Options:
   --blob-root <path>           Convenience: set blob.path in spawn config
   --identity-target <name>     Convenience: add identity_target to spawn config
   --identity-timeout-ms <ms>   Convenience: add identity_timeout_ms to spawn config
+  --api-key <token>            Apply business config via CONFIG_SET with this bearer token
+                               (default: $API_KEY from environment if set)
+  --api-key-id <id>            key_id for auth.api_keys[] (default: support-main)
+  --relay-window-ms <ms>       io.relay.window_ms for CONFIG_SET (default: 300000)
+  --relay-max-open-sessions <n>
+                               io.relay.max_open_sessions (default: 10000)
+  --relay-max-fragments <n>    io.relay.max_fragments_per_session (default: 8)
+  --relay-max-bytes <n>        io.relay.max_bytes_per_session (default: 262144)
+  --skip-config-set            Skip CONFIG_SET/restart/schema validation step
   --spawn                      Force spawn step (requires --node-name and config source)
   --update-existing            Existing node code update: reuse current config + restart unit (spawn only if unit missing)
   --skip-spawn                 Skip spawn step (default unless --node-name is set)
@@ -72,6 +81,13 @@ DST_NODE=""
 BLOB_ROOT=""
 IDENTITY_TARGET=""
 IDENTITY_TIMEOUT_MS=""
+API_KEY_VALUE="${API_KEY:-}"
+API_KEY_ID="support-main"
+RELAY_WINDOW_MS="300000"
+RELAY_MAX_OPEN_SESSIONS="10000"
+RELAY_MAX_FRAGMENTS="8"
+RELAY_MAX_BYTES="262144"
+SKIP_CONFIG_SET=0
 DO_SPAWN=0
 FORCE_SKIP_SPAWN=0
 KILL_FIRST=0
@@ -103,6 +119,13 @@ while [[ $# -gt 0 ]]; do
     --blob-root) BLOB_ROOT="${2:-}"; shift 2 ;;
     --identity-target) IDENTITY_TARGET="${2:-}"; shift 2 ;;
     --identity-timeout-ms) IDENTITY_TIMEOUT_MS="${2:-}"; shift 2 ;;
+    --api-key) API_KEY_VALUE="${2:-}"; shift 2 ;;
+    --api-key-id) API_KEY_ID="${2:-}"; shift 2 ;;
+    --relay-window-ms) RELAY_WINDOW_MS="${2:-}"; shift 2 ;;
+    --relay-max-open-sessions) RELAY_MAX_OPEN_SESSIONS="${2:-}"; shift 2 ;;
+    --relay-max-fragments) RELAY_MAX_FRAGMENTS="${2:-}"; shift 2 ;;
+    --relay-max-bytes) RELAY_MAX_BYTES="${2:-}"; shift 2 ;;
+    --skip-config-set) SKIP_CONFIG_SET=1; shift ;;
     --spawn) DO_SPAWN=1; shift ;;
     --update-existing) UPDATE_EXISTING=1; shift ;;
     --skip-spawn) FORCE_SKIP_SPAWN=1; shift ;;
@@ -215,15 +238,13 @@ build_spawn_config_json() {
     return
   fi
 
-  local raw_cfg
-  raw_cfg="$(
-    LISTEN_ADDRESS="$LISTEN_ADDRESS" \
-    LISTEN_PORT="$LISTEN_PORT" \
-    DST_NODE="$DST_NODE" \
-    BLOB_ROOT="$BLOB_ROOT" \
-    IDENTITY_TARGET="$IDENTITY_TARGET" \
-    IDENTITY_TIMEOUT_MS="$IDENTITY_TIMEOUT_MS" \
-    python3 - <<'PY'
+  LISTEN_ADDRESS="$LISTEN_ADDRESS" \
+  LISTEN_PORT="$LISTEN_PORT" \
+  DST_NODE="$DST_NODE" \
+  BLOB_ROOT="$BLOB_ROOT" \
+  IDENTITY_TARGET="$IDENTITY_TARGET" \
+  IDENTITY_TIMEOUT_MS="$IDENTITY_TIMEOUT_MS" \
+  python3 - <<'PY'
 import json
 import os
 
@@ -256,8 +277,6 @@ if identity_timeout_ms:
 
 print(json.dumps(cfg, separators=(",", ":")))
 PY
-  )"
-  sanitize_config_json <<<"$raw_cfg"
 }
 
 fetch_existing_config_json() {
@@ -335,6 +354,198 @@ restart_existing_unit_if_present() {
   fi
 
   log "restart_skipped unit_not_found=$unit"
+  return 1
+}
+
+next_config_version() {
+  python3 - <<'PY'
+import time
+print(int(time.time() * 1000))
+PY
+}
+
+build_runtime_config_json() {
+  local effective_dst_node="${DST_NODE:-resolve}"
+  CONFIG_LISTEN_ADDRESS="$LISTEN_ADDRESS" \
+  CONFIG_LISTEN_PORT="$LISTEN_PORT" \
+  CONFIG_API_KEY="$API_KEY_VALUE" \
+  CONFIG_API_KEY_ID="$API_KEY_ID" \
+  CONFIG_DST_NODE="$effective_dst_node" \
+  CONFIG_RELAY_WINDOW_MS="$RELAY_WINDOW_MS" \
+  CONFIG_RELAY_MAX_OPEN_SESSIONS="$RELAY_MAX_OPEN_SESSIONS" \
+  CONFIG_RELAY_MAX_FRAGMENTS="$RELAY_MAX_FRAGMENTS" \
+  CONFIG_RELAY_MAX_BYTES="$RELAY_MAX_BYTES" \
+  python3 - <<'PY'
+import json
+import os
+
+payload = {
+    "listen": {
+        "address": os.environ["CONFIG_LISTEN_ADDRESS"],
+        "port": int(os.environ["CONFIG_LISTEN_PORT"]),
+    },
+    "auth": {
+        "mode": "api_key",
+        "api_keys": [
+            {
+                "key_id": os.environ["CONFIG_API_KEY_ID"],
+                "token": os.environ["CONFIG_API_KEY"],
+            }
+        ],
+    },
+    "ingress": {
+        "subject_mode": "explicit_subject",
+        "accepted_content_types": [
+            "application/json",
+            "multipart/form-data",
+        ],
+        "max_request_bytes": 262144,
+        "max_attachments_per_request": 4,
+        "max_attachment_size_bytes": 10485760,
+        "max_total_attachment_bytes": 20971520,
+        "allowed_mime_types": [
+            "image/png",
+            "image/jpeg",
+            "application/pdf",
+            "text/plain",
+            "application/json",
+        ],
+    },
+    "io": {
+        "dst_node": os.environ["CONFIG_DST_NODE"],
+        "relay": {
+            "window_ms": int(os.environ["CONFIG_RELAY_WINDOW_MS"]),
+            "max_open_sessions": int(os.environ["CONFIG_RELAY_MAX_OPEN_SESSIONS"]),
+            "max_fragments_per_session": int(os.environ["CONFIG_RELAY_MAX_FRAGMENTS"]),
+            "max_bytes_per_session": int(os.environ["CONFIG_RELAY_MAX_BYTES"]),
+        },
+    },
+}
+
+print(json.dumps(payload, separators=(",", ":")))
+PY
+}
+
+apply_runtime_config() {
+  if [[ "$SKIP_CONFIG_SET" == "1" ]]; then
+    log "config_set_skipped explicit_flag=1"
+    return 0
+  fi
+  if [[ -z "$NODE_NAME" ]]; then
+    log "config_set_skipped reason=node_name_missing"
+    return 0
+  fi
+  if [[ -z "$LISTEN_ADDRESS" || -z "$LISTEN_PORT" ]]; then
+    log "config_set_skipped reason=listen_missing"
+    return 0
+  fi
+  if [[ -z "$API_KEY_VALUE" ]]; then
+    log "config_set_skipped reason=api_key_missing set=--api-key_or_env_API_KEY"
+    return 0
+  fi
+
+  local config_version runtime_config payload resp status error_code
+  config_version="$(next_config_version)"
+  runtime_config="$(build_runtime_config_json)"
+  log "step=config_set config_version=$config_version relay_window_ms=$RELAY_WINDOW_MS dst_node=${DST_NODE:-resolve}"
+
+  payload="$(
+    NODE_NAME="$NODE_NAME" \
+    CONFIG_VERSION="$config_version" \
+    RUNTIME_CONFIG_JSON="$runtime_config" \
+    python3 - <<'PY'
+import json
+import os
+
+print(json.dumps({
+    "requested_by": "deploy-io-api.sh",
+    "schema_version": 1,
+    "config_version": int(os.environ["CONFIG_VERSION"]),
+    "apply_mode": "replace",
+    "config": json.loads(os.environ["RUNTIME_CONFIG_JSON"]),
+}, separators=(",", ":")))
+PY
+  )"
+
+  resp="$(curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/control/config-set" \
+    -H "Content-Type: application/json" \
+    -d "$payload" | tee -a "$LOG_FILE")"
+
+  status="$(RAW_JSON="$resp" python3 - <<'PY'
+import json
+import os
+import sys
+raw = (os.environ.get("RAW_JSON") or "").strip()
+try:
+    data = json.loads(raw)
+except Exception:
+    print("invalid_json")
+    sys.exit(0)
+print(data.get("status", ""))
+PY
+)"
+
+  error_code="$(RAW_JSON="$resp" python3 - <<'PY'
+import json
+import os
+import sys
+raw = (os.environ.get("RAW_JSON") or "").strip()
+try:
+    data = json.loads(raw)
+except Exception:
+    print("")
+    sys.exit(0)
+print(data.get("error_code") or "")
+PY
+)"
+
+  if [[ "$status" == "ok" ]]; then
+    log "config_set_ok config_version=$config_version"
+    return 0
+  fi
+  if [[ "$error_code" == "TIMEOUT" ]]; then
+    log "config_set_timeout config_version=$config_version continuing_with_restart_and_probe=1"
+    return 0
+  fi
+
+  log "config_set_failed status=${status:-unknown} error_code=${error_code:-none}"
+  return 1
+}
+
+probe_schema_ready() {
+  if [[ -z "$LISTEN_ADDRESS" || -z "$LISTEN_PORT" ]]; then
+    log "schema_probe_skipped reason=listen_missing"
+    return 0
+  fi
+
+  local url="http://$LISTEN_ADDRESS:$LISTEN_PORT/schema"
+  local attempt body status
+  for attempt in $(seq 1 20); do
+    body="$(curl -sS "$url" 2>/dev/null || true)"
+    status="$(RAW_JSON="$body" python3 - <<'PY'
+import json
+import os
+import sys
+raw = (os.environ.get("RAW_JSON") or "").strip()
+if not raw:
+    print("")
+    sys.exit(0)
+try:
+    data = json.loads(raw)
+except Exception:
+    print("")
+    sys.exit(0)
+print(data.get("status") or "")
+PY
+)"
+    if [[ "$status" == "configured" ]]; then
+      log "schema_probe_ok url=$url attempt=$attempt"
+      return 0
+    fi
+    sleep 1
+  done
+
+  log "schema_probe_failed url=$url"
   return 1
 }
 
@@ -456,14 +667,14 @@ fi
 if [[ "$DO_SPAWN" != "1" ]]; then
   if [[ "$UPDATE_EXISTING" == "1" && -n "$NODE_NAME" ]]; then
     if restart_existing_unit_if_present "$NODE_NAME"; then
-      log "deploy completed (publish+update+restart) node_name=$NODE_NAME"
-      exit 0
+      log "update_existing: existing unit found; proceeding to config_set/restart node_name=$NODE_NAME"
+    else
+      DO_SPAWN=1
+      REUSE_EXISTING_CONFIG=1
+      log "update_existing: unit missing, falling back to spawn node_name=$NODE_NAME"
     fi
-    DO_SPAWN=1
-    REUSE_EXISTING_CONFIG=1
-    log "update_existing: unit missing, falling back to spawn node_name=$NODE_NAME"
   else
-    log "deploy completed (publish+update). spawn skipped."
+    log "deploy completed (publish+update). spawn/config skipped."
     exit 0
   fi
 fi
@@ -473,14 +684,15 @@ if [[ -z "$NODE_NAME" ]]; then
   exit 1
 fi
 
-if [[ -z "$TENANT_ID" && -z "${ORCH_DEFAULT_TENANT_ID:-}" ]]; then
-  log "warning: spawn may fail with IDENTITY_REGISTER_FAILED because tenant_id is missing; set --tenant-id or ORCH_DEFAULT_TENANT_ID"
-fi
+if [[ "$DO_SPAWN" == "1" ]]; then
+  if [[ -z "$TENANT_ID" && -z "${ORCH_DEFAULT_TENANT_ID:-}" ]]; then
+    log "warning: spawn may fail with IDENTITY_REGISTER_FAILED because tenant_id is missing; set --tenant-id or ORCH_DEFAULT_TENANT_ID"
+  fi
 
-spawn_cfg_json="$(build_spawn_config_json)"
-log "step=spawn_config config=$spawn_cfg_json"
+  spawn_cfg_json="$(build_spawn_config_json)"
+  log "step=spawn_config config=$spawn_cfg_json"
 
-spawn_payload="$(NODE_NAME="$NODE_NAME" RUNTIME="$RUNTIME" RUNTIME_VERSION="$RUNTIME_VERSION" TENANT_ID="$TENANT_ID" SPAWN_CFG_JSON="$spawn_cfg_json" python3 - <<'PY'
+  spawn_payload="$(NODE_NAME="$NODE_NAME" RUNTIME="$RUNTIME" RUNTIME_VERSION="$RUNTIME_VERSION" TENANT_ID="$TENANT_ID" SPAWN_CFG_JSON="$spawn_cfg_json" python3 - <<'PY'
 import json
 import os
 cfg = json.loads(os.environ["SPAWN_CFG_JSON"])
@@ -501,17 +713,17 @@ print(json.dumps(payload, separators=(",", ":")))
 PY
 )"
 
-if [[ "$KILL_FIRST" == "1" ]]; then
-  log "step=kill_first node_name=$NODE_NAME"
-  curl -sS -X DELETE "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME" | tee -a "$LOG_FILE" >/dev/null || true
-fi
+  if [[ "$KILL_FIRST" == "1" ]]; then
+    log "step=kill_first node_name=$NODE_NAME"
+    curl -sS -X DELETE "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME" | tee -a "$LOG_FILE" >/dev/null || true
+  fi
 
-log "step=spawn node_name=$NODE_NAME"
-spawn_resp="$(curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes" \
-  -H "Content-Type: application/json" \
-  -d "$spawn_payload" | tee -a "$LOG_FILE")"
+  log "step=spawn node_name=$NODE_NAME"
+  spawn_resp="$(curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes" \
+    -H "Content-Type: application/json" \
+    -d "$spawn_payload" | tee -a "$LOG_FILE")"
 
-spawn_status="$(RAW_JSON="$spawn_resp" python3 - <<'PY'
+  spawn_status="$(RAW_JSON="$spawn_resp" python3 - <<'PY'
 import json
 import os
 import sys
@@ -525,7 +737,7 @@ print(d.get("status",""))
 PY
 )"
 
-spawn_error_code="$(RAW_JSON="$spawn_resp" python3 - <<'PY'
+  spawn_error_code="$(RAW_JSON="$spawn_resp" python3 - <<'PY'
 import json
 import os
 import sys
@@ -539,16 +751,18 @@ print(d.get("error_code") or (d.get("payload") or {}).get("error_code") or "")
 PY
 )"
 
-if [[ "$spawn_status" != "ok" ]]; then
-  if [[ "$spawn_error_code" == "NODE_ALREADY_EXISTS" && "$UPDATE_EXISTING" == "1" ]]; then
-    log "spawn_node_already_exists; trying restart_existing for update flow"
-    if restart_existing_unit_if_present "$NODE_NAME"; then
-      log "deploy completed (publish+update+restart) node_name=$NODE_NAME"
-      exit 0
+  if [[ "$spawn_status" != "ok" ]]; then
+    if [[ "$spawn_error_code" == "NODE_ALREADY_EXISTS" && "$UPDATE_EXISTING" == "1" ]]; then
+      log "spawn_node_already_exists; continuing with config_set/restart for update flow"
+    else
+      log "spawn_failed status=${spawn_status:-unknown}"
+      exit 1
     fi
   fi
-  log "spawn_failed status=${spawn_status:-unknown}"
-  exit 1
 fi
 
-log "deploy completed (publish+update+spawn) node_name=$NODE_NAME"
+apply_runtime_config
+restart_existing_unit_if_present "$NODE_NAME"
+probe_schema_ready
+
+log "deploy completed (publish+update+spawn+config_set+restart) node_name=$NODE_NAME"
