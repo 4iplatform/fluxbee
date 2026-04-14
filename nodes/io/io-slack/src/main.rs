@@ -1179,6 +1179,7 @@ fn build_slack_relay_fragment(
             tenant_hint: Some(team_id.to_string()),
             attributes: serde_json::json!({ "team_id": team_id }),
         },
+        dst_node_override: None,
         flush_hints: RelayFlushHints::default(),
     }
 }
