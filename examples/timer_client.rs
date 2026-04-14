@@ -14,6 +14,14 @@ const DEFAULT_DELAY_SECS: u64 = 65;
 const POST_FIRE_STATUS_ATTEMPTS: usize = 10;
 const UUID_MODE_ENV: &str = "JSR_TIMER_EXAMPLE_UUID_MODE";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExampleMode {
+    Fire,
+    CancelByClientRef,
+    RescheduleByClientRef,
+    IdempotentClientRef,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cfg!(not(target_os = "linux")) {
@@ -26,11 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::new(log_level))
         .init();
 
-    let delay_secs = std::env::args()
-        .nth(1)
-        .map(|raw| raw.parse::<u64>())
-        .transpose()?
-        .unwrap_or(DEFAULT_DELAY_SECS);
+    let (mode, delay_secs) = parse_args()?;
     let uuid_mode = example_uuid_mode();
 
     let config_dir = PathBuf::from(json_router::paths::CONFIG_DIR);
@@ -58,25 +62,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         uuid_mode,
     );
 
-    let timer_id = schedule_and_inspect(&sender, &mut receiver, delay_secs).await?;
-    println!("scheduled timer_uuid={}", timer_id.as_str());
+    match mode {
+        ExampleMode::Fire => {
+            let client_ref = format!("rust-example-{}", unix_now_ms());
+            let timer_id =
+                schedule_and_inspect(&sender, &mut receiver, delay_secs, &client_ref).await?;
+            println!("scheduled timer_uuid={} client_ref={}", timer_id.as_str(), client_ref);
 
-    let fired_event = wait_for_timer_fired(&sender, &mut receiver, &timer_id, delay_secs).await?;
-    println!(
-        "received TIMER_FIRED timer_uuid={} actual_fire_at_utc_ms={} fire_count={}",
-        fired_event.timer_uuid.as_str(),
-        fired_event.actual_fire_at_utc_ms,
-        fired_event.fire_count,
-    );
+            let fired_event =
+                wait_for_timer_fired(&sender, &mut receiver, &timer_id, delay_secs).await?;
+            println!(
+                "received TIMER_FIRED timer_uuid={} actual_fire_at_utc_ms={} fire_count={}",
+                fired_event.timer_uuid.as_str(),
+                fired_event.actual_fire_at_utc_ms,
+                fired_event.fire_count,
+            );
 
-    let final_state = wait_for_fired_state(&sender, &mut receiver, &timer_id).await?;
-    println!(
-        "confirmed final timer state uuid={} status={:?} fire_count={} last_fired_at={:?}",
-        final_state.uuid.as_str(),
-        final_state.status,
-        final_state.fire_count,
-        final_state.last_fired_at_utc_ms,
-    );
+            let final_state = wait_for_fired_state(&sender, &mut receiver, &timer_id).await?;
+            println!(
+                "confirmed final timer state uuid={} status={:?} fire_count={} last_fired_at={:?}",
+                final_state.uuid.as_str(),
+                final_state.status,
+                final_state.fire_count,
+                final_state.last_fired_at_utc_ms,
+            );
+        }
+        ExampleMode::CancelByClientRef => {
+            run_cancel_by_client_ref(&sender, &mut receiver, delay_secs).await?;
+        }
+        ExampleMode::RescheduleByClientRef => {
+            run_reschedule_by_client_ref(&sender, &mut receiver, delay_secs).await?;
+        }
+        ExampleMode::IdempotentClientRef => {
+            run_idempotent_client_ref(&sender, &mut receiver, delay_secs).await?;
+        }
+    }
 
     Ok(())
 }
@@ -85,6 +105,7 @@ async fn schedule_and_inspect(
     sender: &NodeSender,
     receiver: &mut NodeReceiver,
     delay_secs: u64,
+    client_ref: &str,
 ) -> Result<TimerId, Box<dyn std::error::Error>> {
     let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
     let now = client.now().await?;
@@ -100,7 +121,7 @@ async fn schedule_and_inspect(
             Duration::from_secs(delay_secs),
             TimerSchedulePayload {
                 target_l2_name: Some(sender.full_name().to_string()),
-                client_ref: Some(format!("rust-example-{}", now.now_utc_ms)),
+                client_ref: Some(client_ref.to_string()),
                 payload: json!({
                     "source": "examples/timer_client.rs",
                     "kind": "self_targeted_one_shot",
@@ -137,6 +158,133 @@ async fn schedule_and_inspect(
     );
 
     Ok(timer_id)
+}
+
+async fn run_cancel_by_client_ref(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    delay_secs: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client_ref = format!("rust-cancel-example-{}", unix_now_ms());
+    let timer_id = schedule_and_inspect(sender, receiver, delay_secs, &client_ref).await?;
+    println!(
+        "scheduled timer_uuid={} client_ref={} for cancel-by-client_ref flow",
+        timer_id.as_str(),
+        client_ref
+    );
+
+    let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
+    let response = client.cancel_by_client_ref(client_ref.as_str()).await?;
+    println!("cancel response found={:?} status={:?}", response.found, response.status);
+    let final_state = wait_for_status(sender, receiver, timer_id.as_ref(), TimerStatus::Canceled).await?;
+    println!(
+        "confirmed canceled timer state uuid={} status={:?}",
+        final_state.uuid.as_str(),
+        final_state.status,
+    );
+    Ok(())
+}
+
+async fn run_reschedule_by_client_ref(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    delay_secs: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client_ref = format!("rust-reschedule-example-{}", unix_now_ms());
+    let timer_id = schedule_and_inspect(sender, receiver, delay_secs, &client_ref).await?;
+    let original = {
+        let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
+        client.get(timer_id.clone()).await?
+    };
+    let new_fire_at = original.fire_at_utc_ms + 120_000;
+    let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
+    let response = client
+        .reschedule_by_client_ref(client_ref.as_str(), new_fire_at)
+        .await?;
+    println!(
+        "reschedule response found={:?} fire_at_utc_ms={:?}",
+        response.found, response.fire_at_utc_ms
+    );
+    let updated = wait_for_fire_at(sender, receiver, timer_id.as_ref(), new_fire_at).await?;
+    println!(
+        "confirmed rescheduled timer uuid={} new_fire_at_utc_ms={}",
+        updated.uuid.as_str(),
+        updated.fire_at_utc_ms,
+    );
+    Ok(())
+}
+
+async fn run_idempotent_client_ref(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    delay_secs: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client_ref = format!("rust-idempotent-example-{}", unix_now_ms());
+    let first = schedule_and_inspect(sender, receiver, delay_secs, &client_ref).await?;
+    let second = schedule_and_inspect(sender, receiver, delay_secs, &client_ref).await?;
+    println!(
+        "idempotent schedule first_uuid={} second_uuid={} same={}",
+        first.as_str(),
+        second.as_str(),
+        first == second
+    );
+    if first != second {
+        return Err("idempotent schedule returned different timer uuids".into());
+    }
+    let listed = {
+        let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
+        client
+            .list_mine(TimerListFilter {
+                limit: Some(20),
+                ..TimerListFilter::default()
+            })
+            .await?
+    };
+    let matching: Vec<_> = listed
+        .timers
+        .iter()
+        .filter(|timer| timer.client_ref.as_deref() == Some(client_ref.as_str()))
+        .collect();
+    println!(
+        "idempotent list_mine matching_client_ref={} count={}",
+        client_ref,
+        matching.len()
+    );
+    if matching.len() != 1 {
+        return Err(format!(
+            "expected exactly one pending timer for client_ref {}, got {}",
+            client_ref,
+            matching.len()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn parse_args() -> Result<(ExampleMode, u64), Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1);
+    let first = args.next();
+    match first.as_deref() {
+        None => Ok((ExampleMode::Fire, DEFAULT_DELAY_SECS)),
+        Some(raw) if raw.chars().all(|c| c.is_ascii_digit()) => {
+            Ok((ExampleMode::Fire, raw.parse::<u64>()?))
+        }
+        Some("fire") => Ok((ExampleMode::Fire, parse_delay_arg(args.next())?)),
+        Some("cancel") => Ok((ExampleMode::CancelByClientRef, parse_delay_arg(args.next())?)),
+        Some("reschedule") => Ok((ExampleMode::RescheduleByClientRef, parse_delay_arg(args.next())?)),
+        Some("idempotent") => Ok((ExampleMode::IdempotentClientRef, parse_delay_arg(args.next())?)),
+        Some(other) => Err(format!(
+            "unknown mode {other}. expected one of: fire, cancel, reschedule, idempotent"
+        )
+        .into()),
+    }
+}
+
+fn parse_delay_arg(raw: Option<String>) -> Result<u64, Box<dyn std::error::Error>> {
+    Ok(raw
+        .map(|value| value.parse::<u64>())
+        .transpose()?
+        .unwrap_or(DEFAULT_DELAY_SECS))
 }
 
 fn example_uuid_mode() -> NodeUuidMode {
@@ -244,6 +392,81 @@ async fn wait_for_fired_state(
         last_info.as_ref().map(|value| value.status)
     )
     .into())
+}
+
+async fn wait_for_status(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    timer_id: &str,
+    expected: TimerStatus,
+) -> Result<TimerInfo, Box<dyn std::error::Error>> {
+    let mut last_info = None;
+    for delay in [
+        Duration::from_millis(0),
+        Duration::from_millis(100),
+        Duration::from_millis(250),
+        Duration::from_millis(500),
+        Duration::from_millis(750),
+        Duration::from_secs(1),
+    ] {
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
+        let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
+        let info = client.get(TimerId::from(timer_id)).await?;
+        if info.status == expected {
+            return Ok(info);
+        }
+        last_info = Some(info);
+    }
+    Err(format!(
+        "timer {} did not converge to status {:?}; last_status={:?}",
+        timer_id,
+        expected,
+        last_info.as_ref().map(|value| value.status)
+    )
+    .into())
+}
+
+async fn wait_for_fire_at(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    timer_id: &str,
+    expected_fire_at: i64,
+) -> Result<TimerInfo, Box<dyn std::error::Error>> {
+    let mut last_info = None;
+    for delay in [
+        Duration::from_millis(0),
+        Duration::from_millis(100),
+        Duration::from_millis(250),
+        Duration::from_millis(500),
+        Duration::from_millis(750),
+        Duration::from_secs(1),
+    ] {
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
+        let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
+        let info = client.get(TimerId::from(timer_id)).await?;
+        if info.fire_at_utc_ms == expected_fire_at {
+            return Ok(info);
+        }
+        last_info = Some(info);
+    }
+    Err(format!(
+        "timer {} did not converge to fire_at_utc_ms={}; last={:?}",
+        timer_id,
+        expected_fire_at,
+        last_info.as_ref().map(|value| value.fire_at_utc_ms)
+    )
+    .into())
+}
+
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 async fn connect_with_retry(

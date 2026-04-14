@@ -137,8 +137,9 @@ For full context, see `wf_v1_tasks.md` Resolved 1 and `docs/wf-v1.md` §10.2.
 - [x] Validation matches Go SDK and protocol semantics exactly
 
 ### SYT11-SDK-3 — Document the new pattern
-- [ ] Update SDK README with example: schedule with client_ref, cancel by client_ref without waiting for response
-- [ ] Note that this is the recommended pattern for any client that needs to operate on timers asynchronously (WF, future systems with similar needs)
+
+- [x] Update SDK README with example: schedule with client_ref, cancel by client_ref without waiting for response (Go SDK README has the example; Rust SDK timer.rs module doc has full annotated example)
+- [x] Note that this is the recommended pattern for any client that needs to operate on timers asynchronously (documented in both SDKs)
 
 ---
 
