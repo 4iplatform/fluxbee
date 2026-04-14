@@ -22,6 +22,8 @@ type TimerResponse struct {
 	FireAtUTCMS  *int64         `json:"fire_at_utc_ms,omitempty"`
 	Status       *string        `json:"status,omitempty"`
 	DeletedCount *int64         `json:"deleted_count,omitempty"`
+	AlreadyExisted *bool        `json:"already_existed,omitempty"`
+	Found        *bool          `json:"found,omitempty"`
 	Error        *TimerError    `json:"error,omitempty"`
 	Extra        map[string]any `json:"-"`
 }
@@ -57,7 +59,7 @@ func (r *TimerResponse) UnmarshalJSON(data []byte) error {
 	}
 	*r = TimerResponse(out)
 	r.Extra = map[string]any{}
-	for _, key := range []string{"ok", "verb", "timer_uuid", "fire_at_utc_ms", "status", "deleted_count", "error"} {
+	for _, key := range []string{"ok", "verb", "timer_uuid", "fire_at_utc_ms", "status", "deleted_count", "already_existed", "found", "error"} {
 		delete(raw, key)
 	}
 	for k, v := range raw {

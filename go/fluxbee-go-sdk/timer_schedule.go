@@ -109,6 +109,22 @@ func (c *TimerClient) Cancel(ctx context.Context, id TimerID) error {
 	if err != nil {
 		return err
 	}
+	return c.cancelWithMessage(ctx, msg)
+}
+
+func (c *TimerClient) CancelByClientRef(ctx context.Context, clientRef string) error {
+	clientRef, err := validateClientRef(clientRef)
+	if err != nil {
+		return err
+	}
+	msg, err := c.buildRequest("TIMER_CANCEL", map[string]any{"client_ref": clientRef})
+	if err != nil {
+		return err
+	}
+	return c.cancelWithMessage(ctx, msg)
+}
+
+func (c *TimerClient) cancelWithMessage(ctx context.Context, msg Message) error {
 	resp, err := RequestSystemRPC(ctx, c.sender, c.receiver, msg, MsgTimerResponse)
 	if err != nil {
 		return err
@@ -137,6 +153,28 @@ func (c *TimerClient) Reschedule(ctx context.Context, id TimerID, newFireAt time
 	if err != nil {
 		return err
 	}
+	return c.rescheduleWithMessage(ctx, msg)
+}
+
+func (c *TimerClient) RescheduleByClientRef(ctx context.Context, clientRef string, newFireAt time.Time) error {
+	clientRef, err := validateClientRef(clientRef)
+	if err != nil {
+		return err
+	}
+	if err := validateAbsoluteScheduleTime(newFireAt); err != nil {
+		return err
+	}
+	msg, err := c.buildRequest("TIMER_RESCHEDULE", map[string]any{
+		"client_ref":         clientRef,
+		"new_fire_at_utc_ms": newFireAt.UTC().UnixMilli(),
+	})
+	if err != nil {
+		return err
+	}
+	return c.rescheduleWithMessage(ctx, msg)
+}
+
+func (c *TimerClient) rescheduleWithMessage(ctx context.Context, msg Message) error {
 	resp, err := RequestSystemRPC(ctx, c.sender, c.receiver, msg, MsgTimerResponse)
 	if err != nil {
 		return err
@@ -159,6 +197,22 @@ func (c *TimerClient) Get(ctx context.Context, id TimerID) (*TimerInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	return c.getWithMessage(ctx, msg)
+}
+
+func (c *TimerClient) GetByClientRef(ctx context.Context, clientRef string) (*TimerInfo, error) {
+	clientRef, err := validateClientRef(clientRef)
+	if err != nil {
+		return nil, err
+	}
+	msg, err := c.buildRequest("TIMER_GET", map[string]any{"client_ref": clientRef})
+	if err != nil {
+		return nil, err
+	}
+	return c.getWithMessage(ctx, msg)
+}
+
+func (c *TimerClient) getWithMessage(ctx context.Context, msg Message) (*TimerInfo, error) {
 	resp, err := RequestSystemRPC(ctx, c.sender, c.receiver, msg, MsgTimerResponse)
 	if err != nil {
 		return nil, err
@@ -278,6 +332,9 @@ func schedulePayload(base map[string]any, opts ScheduleOptions) (map[string]any,
 		base["target_l2_name"] = target
 	}
 	if clientRef := strings.TrimSpace(opts.ClientRef); clientRef != "" {
+		if _, err := validateClientRef(clientRef); err != nil {
+			return nil, err
+		}
 		base["client_ref"] = clientRef
 	}
 	if opts.Payload != nil {
@@ -341,6 +398,11 @@ func validateRecurringOptions(opts RecurringOptions) error {
 	if len(strings.Fields(cronSpec)) != 5 {
 		return fmt.Errorf("cron_spec must use standard 5-field cron syntax")
 	}
+	if clientRef := strings.TrimSpace(opts.ClientRef); clientRef != "" {
+		if _, err := validateClientRef(clientRef); err != nil {
+			return err
+		}
+	}
 	return validateMissedPolicy(opts.MissedPolicy, opts.MissedWithinMS)
 }
 
@@ -349,6 +411,17 @@ func validateTimerID(id TimerID) error {
 		return fmt.Errorf("timer_id must be non-empty")
 	}
 	return nil
+}
+
+func validateClientRef(clientRef string) (string, error) {
+	clientRef = strings.TrimSpace(clientRef)
+	if clientRef == "" {
+		return "", fmt.Errorf("client_ref must be non-empty")
+	}
+	if len(clientRef) > 255 {
+		return "", fmt.Errorf("client_ref must be at most 255 characters")
+	}
+	return clientRef, nil
 }
 
 func validateListFilter(filter ListFilter) error {

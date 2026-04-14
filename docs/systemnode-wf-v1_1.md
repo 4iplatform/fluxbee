@@ -238,7 +238,7 @@ Each `WF.*` node is an independent Go process that:
 - **`fluxbee-go-sdk`** — router connection, message envelope, identity resolution, timer client, admin command helpers.
 - **`cel-go`** — guard expression evaluation.
 - **`modernc.org/sqlite` or `mattn/go-sqlite3`** — persistence.
-- **SY.timer** — all scheduled events lasting ≥ 60 seconds.
+- **SY.timer v1.1 or later** — all scheduled events lasting ≥ 60 seconds. WF v1 requires SY.timer v1.1, which extends v1.0 with `client_ref`-based lookup for `TIMER_CANCEL`, `TIMER_RESCHEDULE`, and `TIMER_GET`. See section 10.2 for why.
 - **Go native `time`, `context`** — internal runtime plumbing timeouts (sub-60s internal to the node, never part of the workflow logic).
 
 ### 7.2 File layout
@@ -448,9 +448,10 @@ Emits an L2 unicast message to a target.
     "msg": "INVOICE_CREATE_REQUEST"
   },
   "payload": {
-    "customer_id": "state.customer_id",
-    "items": "state.items",
-    "currency": "state.currency"
+    "customer_id": { "$ref": "state.customer_id" },
+    "items": { "$ref": "state.items" },
+    "currency": { "$ref": "state.currency" },
+    "literal_note": "Invoice created by automated workflow"
   }
 }
 ```
@@ -462,15 +463,52 @@ Fields:
 | `target` | L2 name of the target node. Validated syntactically at load. |
 | `meta.msg` | The `meta.msg` field of the outgoing message. |
 | `meta.type` | Defaults to `"system"`. Can be overridden to `"user"` for user-facing messages. |
-| `payload` | JSON object. String values in the form `"state.foo"` or `"input.foo"` or `"event.payload.foo"` are substituted at action execution time. |
+| `payload` | JSON object. See payload substitution rules below. |
 
-Substitution happens via a simple path expression: `state.customer_id` reads the `customer_id` variable from the instance state at the moment of execution. This is not CEL; it is a literal path lookup. If the path does not resolve, the field is omitted from the outgoing payload.
+**Payload substitution rules.**
+
+The payload object is a regular JSON object with one special construct: any value that is an object with exactly one key `$ref` is treated as a path lookup, not a literal value. Everything else is a literal.
+
+The `$ref` value is a path expression of the form `<root>.<field>[.<subfield>...]` where `<root>` is one of:
+
+- `input` — the original event that created the instance
+- `state` — the current workflow variables
+- `event` — the incoming event being processed in the current transition
+
+Examples:
+
+```json
+{
+  "$ref": "input.customer_id"
+}
+```
+Resolves to the value of `customer_id` from the original trigger event.
+
+```json
+{
+  "$ref": "state.items"
+}
+```
+Resolves to the array of items stored in the instance state. The resolved value can be of any JSON type — string, number, object, or array. The substitution preserves the type of the source.
+
+```json
+{
+  "$ref": "event.payload.invoice_id"
+}
+```
+Resolves a nested field from the current event's payload.
+
+If the path does not resolve (the field does not exist), the field is **omitted from the outgoing payload**. The runtime logs a warning but does not fail the action. This is intentional: workflows must tolerate optional fields.
+
+The `$ref` form is **not** CEL. It is a literal path lookup, processed by simple field traversal at action execution time. CEL is used only in guards and in `set_variable` values. The two paths are intentionally separate.
+
+Literal values that happen to look like paths (`"state.foo"` as a literal string) are unambiguous in this scheme: a string is always a literal string. Only the `{"$ref": ...}` object form triggers substitution.
 
 The action emits the message and moves on. It does not wait for a response. Responses arrive as separate incoming events, processed by normal transition evaluation.
 
 ### 10.2 `schedule_timer`
 
-Programs a timer via `SY.timer`. See section 11 for full semantics.
+Programs a timer via `SY.timer`. See section 11 for full semantics of how timers fit into WF.
 
 ```json
 {
@@ -485,12 +523,31 @@ Fields:
 
 | Field | Description |
 |---|---|
-| `timer_key` | A stable identifier for this timer within the instance, used to cancel or reschedule it later. Not a timer UUID — the runtime maps it to one. |
+| `timer_key` | A stable identifier for this timer within the instance. Must be unique within an instance. Used to cancel or reschedule it later. |
 | `fire_in` | Duration string (`"30m"`, `"2h"`, `"1d"`). Minimum 60s. |
 | `fire_at` | Alternative to `fire_in`. ISO 8601 absolute UTC timestamp. |
 | `missed_policy` | Forwarded to SY.timer. `"fire"`, `"drop"`, or `"fire_if_within"` with `missed_within_ms`. |
 
-The timer is registered with `target = this WF node` and `payload = { instance_id: ..., timer_key: ... }`. When it fires, the runtime routes the `TIMER_FIRED` event to the correct instance.
+**Identification through `client_ref`.**
+
+When the WF runtime sends `TIMER_SCHEDULE` to SY.timer, it constructs a stable `client_ref` of the form:
+
+```
+wf:<instance_id>::<timer_key>
+```
+
+For example: `wf:wfi:abc-123::invoice_data_timeout`.
+
+This `client_ref` is the canonical identifier of the timer for all subsequent operations from the WF — `cancel_timer` and `reschedule_timer` both look up the timer by `client_ref`, not by the SY.timer-generated UUID. This is important because:
+
+- `client_ref` is **deterministic** at scheduling time — the WF knows it before SY.timer responds.
+- Subsequent operations (cancel/reschedule) can be issued **immediately** without waiting for the SY.timer response with the UUID. There is no race window where the timer is scheduled but not yet known to the WF.
+- After a crash and restart, the WF can recover its mapping just by knowing the `(instance_id, timer_key)` pair, without consulting any local index of UUIDs.
+- If a re-execution after crash schedules the same timer twice, SY.timer detects the duplicate `client_ref` and treats the second call as idempotent (returns the existing timer instead of creating a duplicate).
+
+This dependency on `client_ref` semantics requires `SY.timer v1.1` to support lookup operations (`TIMER_CANCEL`, `TIMER_RESCHEDULE`, `TIMER_GET`) by `client_ref` in addition to `timer_uuid`. WF v1 will not work against SY.timer v1.0 without this extension.
+
+The runtime does not block waiting for the `TIMER_SCHEDULE_RESPONSE`. It logs the schedule action immediately as ok=true and continues with the next action. The response arrives later as a normal incoming event (`TIMER_SCHEDULE_RESPONSE`) — for v1 the runtime can ignore it for tracking purposes, since the `client_ref` is sufficient for all subsequent operations.
 
 ### 10.3 `cancel_timer`
 
@@ -503,7 +560,7 @@ Cancels a timer previously scheduled by this instance.
 }
 ```
 
-Looks up the timer UUID by `(instance_id, timer_key)` and calls `TIMER_CANCEL` on SY.timer. If the timer has already fired or was never scheduled, the cancel is a no-op.
+The runtime constructs the `client_ref` as `wf:<instance_id>::<timer_key>` and sends `TIMER_CANCEL` to SY.timer using that `client_ref`. SY.timer resolves it to the underlying timer and cancels it. If the timer has already fired, the cancel is a no-op. If no timer with that `client_ref` exists, the cancel is also a no-op (logged as warning, not an error).
 
 ### 10.4 `reschedule_timer`
 
@@ -517,7 +574,7 @@ Changes the fire time of an existing scheduled timer.
 }
 ```
 
-Useful for SLAs that reset when the customer responds (the heartbeat pattern). If the timer has already fired, returns no-op.
+Looks up by `client_ref` as in `cancel_timer`. Useful for SLAs that reset when the customer responds (the heartbeat pattern). If the timer has already fired, returns no-op.
 
 ### 10.5 `set_variable`
 
@@ -589,7 +646,22 @@ When SY.timer fires, the `TIMER_FIRED` event arrives at the WF node with this pa
 
 ### 11.3 Timer cleanup on instance termination
 
-When an instance enters a terminal state, the runtime automatically iterates its registered timers and calls `TIMER_CANCEL` on each one, to avoid orphaned timer fires. This is part of the built-in cleanup and does not require a workflow to do it explicitly.
+When an instance enters a terminal state, the runtime automatically iterates its registered timers and calls `TIMER_CANCEL` on each one (by `client_ref`), to avoid orphaned timer fires. This is part of the built-in cleanup and does not require a workflow to do it explicitly.
+
+### 11.4 Recovery and timer reconciliation after restart
+
+When the WF node restarts, it must reconcile its view of timers with SY.timer's view, because there is a window where SY.timer may have fired timers while the WF was down, or where the WF's local state about scheduled timers may have drifted from reality.
+
+The recovery flow is:
+
+1. The WF loads its persisted instances and their state.
+2. For each running instance, the WF queries `SY.timer` with `TIMER_LIST` filtered by `owner = this WF node`. This returns all timers SY.timer currently knows about for this WF.
+3. The WF cross-references the returned timers (by `client_ref`) against its expected timers per instance state.
+4. **For timers that exist in SY.timer but the WF expected to have already cancelled** (because the instance moved to a state that no longer needs them): the WF sends `TIMER_CANCEL` to clean them up. This handles the case where the WF crashed after transitioning but before cleaning up the previous state's timers.
+5. **For timers whose `fire_at` is in the past** (they should have already fired but the WF never received `TIMER_FIRED`, either because the WF was down or the message was lost): the WF synthetically injects a local `TIMER_FIRED` event for that timer into the corresponding instance, applying the timer's `missed_policy`. After processing the synthetic event, the WF sends `TIMER_CANCEL` to SY.timer for that `client_ref` to prevent SY.timer from also firing it later.
+6. **For timers that the WF expected to exist but SY.timer doesn't know about**: log warning and treat the timer as "missing". The instance state is kept; if the WF logic depends on that timer, it will eventually discover the inconsistency through other means (e.g. waiting forever in a state that should have timed out).
+
+This recovery flow gives the WF authority over its own timer state across restarts. The WF does not blindly trust SY.timer's `missed_policy` to handle missed timers — instead, it actively reconciles, processes missed timers locally, and cleans up SY.timer to maintain consistency. The reason is that the WF needs to update its instance state when a timer fires, and only the WF can do that — SY.timer firing a timer in the WF's absence is fire-and-forget, the WF would never see it.
 
 ## 12. Soft abort
 
@@ -767,6 +839,45 @@ When an incoming event looks like a trigger (no `instance_id` correlation and pa
 6. Run entry actions of the initial state.
 7. Persist.
 8. Release mutex.
+
+### 14.4 Execution model and crash semantics: at-least-once
+
+The WF runtime executes transitions following an **act-then-persist** model with **at-least-once** delivery guarantees on actions. This is a deliberate design choice. The implications matter for anyone building nodes that are targets of a WF:
+
+The execution order within a transition is: run exit_actions of source state → run transition actions → run entry_actions of target state → persist new state. If the runtime crashes in the middle of this sequence (after some actions executed but before the new state is persisted), the next restart will recover the instance in its **previous** state and re-execute the transition from the beginning. Some actions may have already executed before the crash; they will execute again.
+
+This means **side effects from a transition can occur more than once** in the case of a crash. Specifically:
+
+- A `send_message` action may send the same message twice. The destination node will see two messages with the same content and the same `meta.trace_id` (the runtime preserves the trace_id across re-executions for exactly this reason).
+- A `schedule_timer` action may attempt to schedule the same timer twice. SY.timer detects the duplicate via the deterministic `client_ref` (`wf:<instance_id>::<timer_key>`) and returns the existing timer instead of creating a new one. This is naturally idempotent.
+- A `cancel_timer` action is idempotent by design (cancelling an already-cancelled or non-existent timer is a no-op).
+- A `set_variable` action has no external side effect; re-execution simply re-assigns the same value.
+
+**The contract for nodes that receive messages from a WF is: be idempotent.** When a WF sends `INVOICE_CREATE_REQUEST` to `IO.quickbooks`, the IO node should use `meta.trace_id` as an idempotency key — if it sees two requests with the same trace_id, it must treat the second as a no-op and return the same response as the first.
+
+This is the same pattern that applies to other distributed systems with at-least-once delivery (Kafka consumers, AWS SQS, etc.). The runtime guarantees the action will execute **at least once**; the destination's responsibility is to make repeated execution safe.
+
+The alternative — guaranteeing exactly-once through write-ahead logging of pending actions — was considered and rejected for v1 as too complex for the value it provides. If a target node truly cannot tolerate duplicate messages, it should implement deduplication via trace_id at its own boundary. The runtime is explicit and honest about its semantics rather than promising guarantees it cannot keep.
+
+### 14.5 Event correlation: which instance does this event belong to?
+
+When an event arrives at the WF node, the runtime must decide whether it is for an existing instance, a new instance, or invalid. The resolution order is strict:
+
+1. **If `meta.msg == "TIMER_FIRED"` and `event.user_payload.instance_id` is present**: the event is for the existing instance with that `instance_id`. If the instance does not exist (terminated, expired, never existed), log "orphaned timer" and discard.
+
+2. **If `meta.thread_id` is present and matches an existing instance**: the event is for that instance. This is the standard mechanism for response messages from AI / IO nodes that the WF previously contacted via `send_message`. The WF runtime sets `meta.thread_id = instance_id` on outgoing `send_message` actions, and target nodes are expected to copy this value to the `meta.thread_id` of their response.
+
+3. **If neither of the above matches**: try to interpret the event as a new instance trigger. Validate the payload against the workflow's `input_schema`. If valid, create a new instance with this event as the trigger. If invalid, respond with `INVALID_INPUT` error.
+
+This order is fixed in v1 and not configurable. It reflects the reality of how messages flow in Fluxbee:
+
+- Timer events have explicit instance correlation in their payload.
+- Response messages preserve thread context via thread_id.
+- Trigger messages either carry a fresh thread_id or no correlation at all.
+
+**Contract for nodes responding to a WF**: when you receive a message from a WF (typically a `send_message` action), copy `meta.thread_id` into the `meta.thread_id` of your response. This is how the WF correlates your response with the instance that asked the question. If you don't preserve thread_id, your response will be treated as a new instance trigger, which is almost certainly not what you want.
+
+This contract is implicit in many systems (HTTP correlation IDs, RPC call IDs, etc.) but here it is explicit and load-bearing. The WF cannot work without it.
 
 ## 15. WF_HELP and self-description
 
@@ -1074,9 +1185,9 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
           "target": "AI.billing-validator@motherbee",
           "meta": { "msg": "VALIDATE_INVOICE_DATA" },
           "payload": {
-            "customer_id": "input.customer_id",
-            "items": "input.items",
-            "currency": "input.currency"
+            "customer_id": { "$ref": "input.customer_id" },
+            "items": { "$ref": "input.items" },
+            "currency": { "$ref": "input.currency" }
           }
         },
         {
@@ -1126,9 +1237,9 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
           "target": "AI.billing-responder@motherbee",
           "meta": { "msg": "REQUEST_MISSING_INVOICE_DATA" },
           "payload": {
-            "originator_channel": "input.originator_channel",
-            "originator_ilk": "input.originator_ilk",
-            "missing_fields": "state.missing_fields"
+            "originator_channel": { "$ref": "input.originator_channel" },
+            "originator_ilk": { "$ref": "input.originator_ilk" },
+            "missing_fields": { "$ref": "state.missing_fields" }
           }
         },
         {
@@ -1170,9 +1281,9 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
           "target": "IO.quickbooks@motherbee",
           "meta": { "msg": "INVOICE_CREATE_REQUEST" },
           "payload": {
-            "customer_id": "input.customer_id",
-            "items": "input.items",
-            "currency": "input.currency"
+            "customer_id": { "$ref": "input.customer_id" },
+            "items": { "$ref": "input.items" },
+            "currency": { "$ref": "input.currency" }
           }
         },
         {
@@ -1223,10 +1334,10 @@ Duration: minutes to hours. Deterministic in every decision. Side effects are re
           "target": "AI.billing-responder@motherbee",
           "meta": { "msg": "DELIVER_INVOICE_TO_CUSTOMER" },
           "payload": {
-            "originator_channel": "input.originator_channel",
-            "originator_ilk": "input.originator_ilk",
-            "invoice_id": "state.invoice_id",
-            "invoice_link": "state.invoice_link"
+            "originator_channel": { "$ref": "input.originator_channel" },
+            "originator_ilk": { "$ref": "input.originator_ilk" },
+            "invoice_id": { "$ref": "state.invoice_id" },
+            "invoice_link": { "$ref": "state.invoice_link" }
           }
         },
         {
@@ -1341,6 +1452,11 @@ This is the Archi-first loop in action: self-describing nodes, simple OPA rules 
 | Runtime timers via Go native | Sub-60s plumbing stays invisible to workflow authors |
 | SQLite per node, monolithic | Same pattern as SY.timer, consistent with Fluxbee |
 | Soft abort only in v1 | Rollback and compensation are complex, deferred |
+| `$ref` wrapper for payload substitution | Avoids ambiguity between literal strings and path lookups; supports any JSON type |
+| `client_ref` deterministic timer identification | Eliminates race window between schedule and operation; requires SY.timer v1.1 |
+| At-least-once with downstream idempotency | Honest contract; alternative (exactly-once with WAL) too complex for v1 |
+| Strict event correlation order | Timer first, then thread_id, then new instance — predictable, no ambiguity |
+| WF owns timer recovery on restart | The WF is the only one that can update instance state when a timer fires; reconciliation is its responsibility |
 | No override from admin (read-only) | If a WF is stuck, fix the code and redeploy; never patch runtime state |
 | Authorization enforced in OPA, consuming identity v2 primitives (`ilk_type`, `registration_status`, L2 name patterns) | Centralized policy, no authorization logic in the WF runtime, agnostic to future identity evolution |
 | Archi-first format | LLM consumers dominate the author base; humans are observers |

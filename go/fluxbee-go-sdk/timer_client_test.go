@@ -574,6 +574,61 @@ func TestCancelReturnsNilOnSuccessfulTimerResponse(t *testing.T) {
 	}
 }
 
+func TestCancelByClientRefUsesClientRefPayload(t *testing.T) {
+	tx := make(chan []byte, 1)
+	rx := make(chan receivedMessage, 1)
+	client, err := NewTimerClient(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
+		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
+		TimerClientConfig{},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+
+	go func() {
+		frame := <-tx
+		var request Message
+		if err := json.Unmarshal(frame, &request); err != nil {
+			t.Errorf("unmarshal request: %v", err)
+			return
+		}
+		if stringValue(request.Meta.Msg) != "TIMER_CANCEL" {
+			t.Errorf("unexpected request verb: %q", stringValue(request.Meta.Msg))
+			return
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(request.Payload, &payload); err != nil {
+			t.Errorf("unmarshal request payload: %v", err)
+			return
+		}
+		if payload["client_ref"] != "wf:demo::timeout" {
+			t.Errorf("unexpected cancel client_ref payload: %+v", payload)
+			return
+		}
+		response, err := BuildSystemResponse(
+			&request,
+			"timer-uuid",
+			MsgTimerResponse,
+			map[string]any{
+				"ok":    true,
+				"verb":  "TIMER_CANCEL",
+				"found": true,
+			},
+			SystemEnvelopeOptions{},
+		)
+		if err != nil {
+			t.Errorf("build response: %v", err)
+			return
+		}
+		rx <- receivedMessage{msg: response}
+	}()
+
+	if err := client.CancelByClientRef(context.Background(), "wf:demo::timeout"); err != nil {
+		t.Fatalf("cancel by client_ref: %v", err)
+	}
+}
+
 func TestCancelRejectsEmptyTimerID(t *testing.T) {
 	client, err := NewTimerClient(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 1), state: &connectionState{connected: true}},
@@ -632,6 +687,63 @@ func TestRescheduleReturnsNilOnSuccessfulTimerResponse(t *testing.T) {
 
 	if err := client.Reschedule(context.Background(), TimerID("timer-1"), time.Now().UTC().Add(2*time.Hour)); err != nil {
 		t.Fatalf("reschedule: %v", err)
+	}
+}
+
+func TestRescheduleByClientRefUsesClientRefPayload(t *testing.T) {
+	tx := make(chan []byte, 1)
+	rx := make(chan receivedMessage, 1)
+	client, err := NewTimerClient(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
+		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
+		TimerClientConfig{},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+
+	go func() {
+		frame := <-tx
+		var request Message
+		if err := json.Unmarshal(frame, &request); err != nil {
+			t.Errorf("unmarshal request: %v", err)
+			return
+		}
+		if stringValue(request.Meta.Msg) != "TIMER_RESCHEDULE" {
+			t.Errorf("unexpected request verb: %q", stringValue(request.Meta.Msg))
+			return
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(request.Payload, &payload); err != nil {
+			t.Errorf("unmarshal request payload: %v", err)
+			return
+		}
+		if payload["client_ref"] != "wf:demo::timeout" {
+			t.Errorf("unexpected reschedule client_ref payload: %+v", payload)
+			return
+		}
+		response, err := BuildSystemResponse(
+			&request,
+			"timer-uuid",
+			MsgTimerResponse,
+			map[string]any{
+				"ok":             true,
+				"verb":           "TIMER_RESCHEDULE",
+				"timer_uuid":     "timer-1",
+				"fire_at_utc_ms": int64(1775577600000),
+				"found":          true,
+			},
+			SystemEnvelopeOptions{},
+		)
+		if err != nil {
+			t.Errorf("build response: %v", err)
+			return
+		}
+		rx <- receivedMessage{msg: response}
+	}()
+
+	if err := client.RescheduleByClientRef(context.Background(), "wf:demo::timeout", time.Now().UTC().Add(2*time.Hour)); err != nil {
+		t.Fatalf("reschedule by client_ref: %v", err)
 	}
 }
 
@@ -726,6 +838,72 @@ func TestGetParsesTimerInfo(t *testing.T) {
 		t.Fatalf("get timer: %v", err)
 	}
 	if info.UUID != "timer-1" || info.OwnerL2Name != "WF.demo@motherbee" {
+		t.Fatalf("unexpected timer info: %+v", info)
+	}
+}
+
+func TestGetByClientRefUsesClientRefPayload(t *testing.T) {
+	tx := make(chan []byte, 1)
+	rx := make(chan receivedMessage, 1)
+	client, err := NewTimerClient(
+		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
+		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
+		TimerClientConfig{},
+	)
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+
+	go func() {
+		frame := <-tx
+		var request Message
+		if err := json.Unmarshal(frame, &request); err != nil {
+			t.Errorf("unmarshal request: %v", err)
+			return
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(request.Payload, &payload); err != nil {
+			t.Errorf("unmarshal request payload: %v", err)
+			return
+		}
+		if payload["client_ref"] != "wf:demo::timeout" {
+			t.Errorf("unexpected get client_ref payload: %+v", payload)
+			return
+		}
+		response, err := BuildSystemResponse(
+			&request,
+			"timer-uuid",
+			MsgTimerResponse,
+			map[string]any{
+				"ok":   true,
+				"verb": "TIMER_GET",
+				"timer": map[string]any{
+					"uuid":              "timer-1",
+					"owner_l2_name":     "WF.demo@motherbee",
+					"target_l2_name":    "WF.demo@motherbee",
+					"kind":              "oneshot",
+					"fire_at_utc_ms":    int64(1775577600000),
+					"missed_policy":     "fire",
+					"status":            "pending",
+					"created_at_utc_ms": int64(1775574000000),
+					"fire_count":        int64(0),
+					"payload":           map[string]any{},
+				},
+			},
+			SystemEnvelopeOptions{},
+		)
+		if err != nil {
+			t.Errorf("build response: %v", err)
+			return
+		}
+		rx <- receivedMessage{msg: response}
+	}()
+
+	info, err := client.GetByClientRef(context.Background(), "wf:demo::timeout")
+	if err != nil {
+		t.Fatalf("get by client_ref: %v", err)
+	}
+	if info.UUID != "timer-1" {
 		t.Fatalf("unexpected timer info: %+v", info)
 	}
 }

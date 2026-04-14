@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	timerSchemaVersion      = 1
+	timerSchemaVersion      = 2
 	defaultHistoryRetention = 7 * 24 * time.Hour
 	defaultListLimit        = 100
 	maxListLimit            = 1000
@@ -60,6 +60,10 @@ func openTimerDB(path string) (*sql.DB, error) {
 }
 
 func ensureTimerSchema(db *sql.DB) error {
+	var userVersion int
+	if err := db.QueryRow(`PRAGMA user_version;`).Scan(&userVersion); err != nil {
+		return err
+	}
 	if _, err := db.Exec(`
 CREATE TABLE IF NOT EXISTS timers (
     uuid                TEXT PRIMARY KEY,
@@ -91,6 +95,15 @@ CREATE TABLE IF NOT EXISTS timers (
 	for _, stmt := range indexes {
 		if _, err := db.Exec(stmt); err != nil {
 			return err
+		}
+	}
+	if userVersion < 2 {
+		if _, err := db.Exec(`
+CREATE UNIQUE INDEX IF NOT EXISTS idx_timers_owner_clientref_pending
+ON timers(owner_l2_name, client_ref)
+WHERE client_ref IS NOT NULL AND status='pending';
+`); err != nil {
+			return fmt.Errorf("create unique pending client_ref index: %w", err)
 		}
 	}
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version=%d;", timerSchemaVersion)); err != nil {
@@ -153,6 +166,25 @@ SELECT uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_
        missed_policy, missed_within_ms, payload, metadata, status, created_at_utc, last_fired_at_utc, fire_count
 FROM timers WHERE uuid=?
 `, timerUUID).Scan(
+		&row.UUID, &row.OwnerL2Name, &row.TargetL2Name, &row.ClientRef, &row.Kind, &row.FireAtUTC, &row.CronSpec, &row.CronTZ,
+		&row.MissedPolicy, &row.MissedWithinMS, &row.Payload, &row.Metadata, &row.Status, &row.CreatedAtUTC, &row.LastFiredAtUTC, &row.FireCount,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &row, nil
+}
+
+func findPendingTimerByClientRef(ctx context.Context, db *sql.DB, ownerL2Name, clientRef string) (*timerRow, error) {
+	var row timerRow
+	err := db.QueryRowContext(ctx, `
+SELECT uuid, owner_l2_name, target_l2_name, client_ref, kind, fire_at_utc, cron_spec, cron_tz,
+       missed_policy, missed_within_ms, payload, metadata, status, created_at_utc, last_fired_at_utc, fire_count
+FROM timers
+WHERE owner_l2_name=? AND client_ref=? AND status='pending'
+ORDER BY created_at_utc DESC
+LIMIT 1
+`, ownerL2Name, clientRef).Scan(
 		&row.UUID, &row.OwnerL2Name, &row.TargetL2Name, &row.ClientRef, &row.Kind, &row.FireAtUTC, &row.CronSpec, &row.CronTZ,
 		&row.MissedPolicy, &row.MissedWithinMS, &row.Payload, &row.Metadata, &row.Status, &row.CreatedAtUTC, &row.LastFiredAtUTC, &row.FireCount,
 	)
@@ -375,4 +407,13 @@ func nullableInt64(value sql.NullInt64) any {
 		return value.Int64
 	}
 	return nil
+}
+
+func isPendingClientRefUniqueViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "idx_timers_owner_clientref_pending") ||
+		strings.Contains(message, "UNIQUE constraint failed: timers.owner_l2_name, timers.client_ref")
 }

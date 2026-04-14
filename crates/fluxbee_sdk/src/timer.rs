@@ -363,7 +363,10 @@ pub struct TimerScheduleRecurringPayload {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct TimerGetPayload {
-    pub timer_uuid: TimerId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timer_uuid: Option<TimerId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ref: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -382,14 +385,20 @@ pub struct TimerListPayload {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct TimerCancelPayload {
-    pub timer_uuid: TimerId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timer_uuid: Option<TimerId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ref: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct TimerReschedulePayload {
-    pub timer_uuid: TimerId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timer_uuid: Option<TimerId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_fire_at_utc_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -425,6 +434,10 @@ pub struct TimerResponse {
     pub status: Option<TimerStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub already_existed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub found: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<TimerErrorDetail>,
     #[serde(flatten)]
@@ -689,7 +702,25 @@ impl<'a> TimerClient<'a> {
     ) -> Result<TimerInfo, TimerClientError> {
         let timer_uuid = validate_timer_id(timer_id.into())?;
         let payload = TimerGetPayload {
-            timer_uuid,
+            timer_uuid: Some(timer_uuid),
+            ..TimerGetPayload::default()
+        };
+        let response: TimerGetResponse = self
+            .call_decode(
+                MSG_TIMER_GET,
+                serde_json::to_value(payload)?,
+                self.rpc_timeout,
+            )
+            .await?;
+        Ok(response.timer)
+    }
+
+    pub async fn get_by_client_ref(
+        &mut self,
+        client_ref: impl Into<String>,
+    ) -> Result<TimerInfo, TimerClientError> {
+        let payload = TimerGetPayload {
+            client_ref: Some(validate_client_ref(client_ref.into())?),
             ..TimerGetPayload::default()
         };
         let response: TimerGetResponse = self
@@ -731,7 +762,23 @@ impl<'a> TimerClient<'a> {
         timer_id: impl Into<TimerId>,
     ) -> Result<TimerResponse, TimerClientError> {
         let payload = TimerCancelPayload {
-            timer_uuid: validate_timer_id(timer_id.into())?,
+            timer_uuid: Some(validate_timer_id(timer_id.into())?),
+            ..TimerCancelPayload::default()
+        };
+        self.call_ok_response(
+            MSG_TIMER_CANCEL,
+            serde_json::to_value(payload)?,
+            self.rpc_timeout,
+        )
+        .await
+    }
+
+    pub async fn cancel_by_client_ref(
+        &mut self,
+        client_ref: impl Into<String>,
+    ) -> Result<TimerResponse, TimerClientError> {
+        let payload = TimerCancelPayload {
+            client_ref: Some(validate_client_ref(client_ref.into())?),
             ..TimerCancelPayload::default()
         };
         self.call_ok_response(
@@ -746,6 +793,26 @@ impl<'a> TimerClient<'a> {
         &mut self,
         mut payload: TimerReschedulePayload,
     ) -> Result<TimerResponse, TimerClientError> {
+        normalize_reschedule_payload(&mut payload);
+        validate_reschedule_payload(&payload)?;
+        self.call_ok_response(
+            MSG_TIMER_RESCHEDULE,
+            serde_json::to_value(payload)?,
+            self.rpc_timeout,
+        )
+        .await
+    }
+
+    pub async fn reschedule_by_client_ref(
+        &mut self,
+        client_ref: impl Into<String>,
+        new_fire_at_utc_ms: i64,
+    ) -> Result<TimerResponse, TimerClientError> {
+        let mut payload = TimerReschedulePayload {
+            client_ref: Some(validate_client_ref(client_ref.into())?),
+            new_fire_at_utc_ms: Some(new_fire_at_utc_ms),
+            ..TimerReschedulePayload::default()
+        };
         normalize_reschedule_payload(&mut payload);
         validate_reschedule_payload(&payload)?;
         self.call_ok_response(
@@ -1242,7 +1309,16 @@ fn normalize_recurring_payload(payload: &mut TimerScheduleRecurringPayload) {
 }
 
 fn normalize_reschedule_payload(payload: &mut TimerReschedulePayload) {
-    payload.timer_uuid = TimerId(trim_owned(payload.timer_uuid.0.clone()));
+    payload.timer_uuid = payload
+        .timer_uuid
+        .take()
+        .map(|timer_id| TimerId(trim_owned(timer_id.0)))
+        .filter(|timer_id| !timer_id.is_empty());
+    payload.client_ref = payload
+        .client_ref
+        .take()
+        .map(trim_owned)
+        .filter(|value| !value.is_empty());
 }
 
 fn normalize_list_filter(filter: &mut TimerListFilter) {
@@ -1307,7 +1383,12 @@ fn validate_recurring_payload(
 }
 
 fn validate_reschedule_payload(payload: &TimerReschedulePayload) -> Result<(), TimerClientError> {
-    validate_timer_id(payload.timer_uuid.clone())?;
+    validate_timer_selector(
+        payload.timer_uuid.clone(),
+        payload.client_ref.clone(),
+        "timer_uuid",
+        "client_ref",
+    )?;
     let has_absolute = payload.new_fire_at_utc_ms.is_some();
     let has_relative = payload.new_fire_in_ms.is_some();
     match (has_absolute, has_relative) {
@@ -1350,6 +1431,40 @@ fn validate_timer_id(timer_id: TimerId) -> Result<TimerId, TimerClientError> {
         ));
     }
     Ok(timer_id)
+}
+
+fn validate_client_ref(client_ref: String) -> Result<String, TimerClientError> {
+    let client_ref = trim_owned(client_ref);
+    if client_ref.is_empty() {
+        return Err(TimerClientError::InvalidRequest(
+            "client_ref must be non-empty".to_string(),
+        ));
+    }
+    if client_ref.len() > 255 {
+        return Err(TimerClientError::InvalidRequest(
+            "client_ref must be at most 255 characters".to_string(),
+        ));
+    }
+    Ok(client_ref)
+}
+
+fn validate_timer_selector(
+    timer_uuid: Option<TimerId>,
+    client_ref: Option<String>,
+    timer_uuid_field: &str,
+    client_ref_field: &str,
+) -> Result<(), TimerClientError> {
+    if let Some(timer_id) = timer_uuid {
+        validate_timer_id(timer_id)?;
+        return Ok(());
+    }
+    if let Some(client_ref) = client_ref {
+        validate_client_ref(client_ref)?;
+        return Ok(());
+    }
+    Err(TimerClientError::InvalidRequest(format!(
+        "either {timer_uuid_field} or {client_ref_field} must be set"
+    )))
 }
 
 fn validate_canonical_l2_name(field: &str, value: &str) -> Result<(), TimerClientError> {
@@ -1764,6 +1879,118 @@ mod tests {
         assert_eq!(result.now_utc_iso, "2026-04-06T12:00:00Z");
     }
 
+    #[tokio::test]
+    async fn timer_client_get_by_client_ref_uses_client_ref_payload() {
+        let (sender, mut receiver, mut harness) = TimerTestHarness::new("WF.demo@motherbee");
+        let mut client = TimerClient::new(&sender, &mut receiver, TimerClientConfig::default())
+            .expect("new timer client");
+
+        tokio::spawn(async move {
+            let request = harness.next_request().await.expect("request");
+            assert_eq!(request.meta.msg.as_deref(), Some(MSG_TIMER_GET));
+            assert_eq!(
+                request.payload.get("client_ref").and_then(Value::as_str),
+                Some("wf:demo::timeout")
+            );
+            harness
+                .send_timer_response(
+                    &request,
+                    json!({
+                        "ok": true,
+                        "verb": "TIMER_GET",
+                        "timer": {
+                            "uuid": "timer-1",
+                            "owner_l2_name": "WF.demo@motherbee",
+                            "target_l2_name": "WF.demo@motherbee",
+                            "kind": "oneshot",
+                            "fire_at_utc_ms": 1775577600000_i64,
+                            "missed_policy": "fire",
+                            "status": "pending",
+                            "created_at_utc_ms": 1775574000000_i64,
+                            "fire_count": 0_u64,
+                            "payload": {}
+                        }
+                    }),
+                )
+                .await
+                .expect("send response");
+        });
+
+        let timer = client
+            .get_by_client_ref("wf:demo::timeout")
+            .await
+            .expect("get by client_ref");
+        assert_eq!(timer.uuid.as_str(), "timer-1");
+    }
+
+    #[tokio::test]
+    async fn timer_client_cancel_by_client_ref_uses_client_ref_payload() {
+        let (sender, mut receiver, mut harness) = TimerTestHarness::new("WF.demo@motherbee");
+        let mut client = TimerClient::new(&sender, &mut receiver, TimerClientConfig::default())
+            .expect("new timer client");
+
+        tokio::spawn(async move {
+            let request = harness.next_request().await.expect("request");
+            assert_eq!(request.meta.msg.as_deref(), Some(MSG_TIMER_CANCEL));
+            assert_eq!(
+                request.payload.get("client_ref").and_then(Value::as_str),
+                Some("wf:demo::timeout")
+            );
+            harness
+                .send_timer_response(
+                    &request,
+                    json!({
+                        "ok": true,
+                        "verb": "TIMER_CANCEL",
+                        "found": true
+                    }),
+                )
+                .await
+                .expect("send response");
+        });
+
+        let response = client
+            .cancel_by_client_ref("wf:demo::timeout")
+            .await
+            .expect("cancel by client_ref");
+        assert_eq!(response.found, Some(true));
+    }
+
+    #[tokio::test]
+    async fn timer_client_reschedule_by_client_ref_uses_client_ref_payload() {
+        let (sender, mut receiver, mut harness) = TimerTestHarness::new("WF.demo@motherbee");
+        let mut client = TimerClient::new(&sender, &mut receiver, TimerClientConfig::default())
+            .expect("new timer client");
+
+        tokio::spawn(async move {
+            let request = harness.next_request().await.expect("request");
+            assert_eq!(request.meta.msg.as_deref(), Some(MSG_TIMER_RESCHEDULE));
+            assert_eq!(
+                request.payload.get("client_ref").and_then(Value::as_str),
+                Some("wf:demo::timeout")
+            );
+            harness
+                .send_timer_response(
+                    &request,
+                    json!({
+                        "ok": true,
+                        "verb": "TIMER_RESCHEDULE",
+                        "timer_uuid": "timer-1",
+                        "fire_at_utc_ms": 1775577600000_i64,
+                        "found": true
+                    }),
+                )
+                .await
+                .expect("send response");
+        });
+
+        let response = client
+            .reschedule_by_client_ref("wf:demo::timeout", now_epoch_ms() + 120_000)
+            .await
+            .expect("reschedule by client_ref");
+        assert_eq!(response.found, Some(true));
+    }
+
     fn read_fixture_message(name: &str) -> Message {
         serde_json::from_value(read_fixture_value(name)).expect("decode fixture message")
     }
@@ -1775,7 +2002,7 @@ mod tests {
 
     fn fixture_path(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fluxbee-go-sdk/testdata/timer_wire")
+            .join("../../go/fluxbee-go-sdk/testdata/timer_wire")
             .join(name)
     }
 }

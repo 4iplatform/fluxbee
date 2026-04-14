@@ -101,8 +101,19 @@ func TestRespondTimerGetAllowsReadingForeignTimer(t *testing.T) {
 	}
 }
 
-func TestRespondTimerGetRejectsUnknownSourceUUID(t *testing.T) {
+func TestRespondTimerGetByUUIDAllowsMissingSourceL2Name(t *testing.T) {
 	service, tx := newTestService(t)
+	insertOwnedTimer(t, service.db, timerRow{
+		UUID:         "timer-1",
+		OwnerL2Name:  "AI.other@motherbee",
+		TargetL2Name: "AI.other@motherbee",
+		Kind:         "oneshot",
+		FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
+		MissedPolicy: "fire",
+		Payload:      `{}`,
+		Status:       "pending",
+		CreatedAtUTC: time.Now().UTC().UnixMilli(),
+	})
 	msg, err := fluxbeesdk.BuildSystemMessage(
 		"22222222-2222-2222-2222-222222222222",
 		fluxbeesdk.UnicastDestination("SY.timer@motherbee"),
@@ -115,11 +126,43 @@ func TestRespondTimerGetRejectsUnknownSourceUUID(t *testing.T) {
 		t.Fatalf("build message: %v", err)
 	}
 	if err := service.respondTimerGet(msg); err != nil {
-		t.Fatalf("get timer with unknown source: %v", err)
+		t.Fatalf("get timer by uuid without src_l2_name: %v", err)
 	}
 	response := mustReadTimerResponse(t, tx)
-	if response.OK || response.Error == nil || response.Error.Code != "TIMER_INTERNAL" {
-		t.Fatalf("unexpected unknown source response: %+v", response)
+	if !response.OK || response.Verb != "TIMER_GET" {
+		t.Fatalf("unexpected get response: %+v", response)
+	}
+}
+
+func TestRespondTimerScheduleReturnsExistingPendingTimerByClientRef(t *testing.T) {
+	service, tx := newTestService(t)
+	service.scheduler = newTimerScheduler(service)
+	fireInMS := int64(time.Minute.Milliseconds())
+	msg := mustBuildSystemMessage(t, map[string]any{
+		"fire_in_ms": fireInMS,
+		"client_ref": "wf:demo::timeout",
+	}, "TIMER_SCHEDULE")
+
+	if err := service.respondTimerSchedule(msg); err != nil {
+		t.Fatalf("first schedule: %v", err)
+	}
+	first := mustReadTimerResponse(t, tx)
+	if !first.OK || first.TimerUUID == nil {
+		t.Fatalf("unexpected first schedule response: %+v", first)
+	}
+	if err := service.respondTimerSchedule(msg); err != nil {
+		t.Fatalf("second schedule: %v", err)
+	}
+	second := mustReadTimerResponse(t, tx)
+	if !second.OK || second.TimerUUID == nil {
+		t.Fatalf("unexpected second schedule response: %+v", second)
+	}
+	if *first.TimerUUID != *second.TimerUUID {
+		t.Fatalf("expected idempotent schedule to reuse timer uuid: first=%s second=%s", *first.TimerUUID, *second.TimerUUID)
+	}
+	alreadyExisted, ok := second.Extra["already_existed"].(bool)
+	if !ok || !alreadyExisted {
+		t.Fatalf("expected already_existed=true, got %+v", second.Extra)
 	}
 }
 
@@ -151,6 +194,54 @@ func TestRespondTimerCancelMarksTimerCanceled(t *testing.T) {
 	}
 	if row.Status != "canceled" {
 		t.Fatalf("expected canceled status, got %+v", row)
+	}
+}
+
+func TestRespondTimerCancelByClientRefMarksTimerCanceled(t *testing.T) {
+	service, tx := newTestService(t)
+	insertOwnedTimer(t, service.db, timerRow{
+		UUID:         "timer-1",
+		OwnerL2Name:  "WF.demo@motherbee",
+		TargetL2Name: "WF.demo@motherbee",
+		ClientRef:    sql.NullString{String: "wf:demo::timeout", Valid: true},
+		Kind:         "oneshot",
+		FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
+		MissedPolicy: "fire",
+		Payload:      `{}`,
+		Status:       "pending",
+		CreatedAtUTC: time.Now().UTC().UnixMilli(),
+	})
+
+	msg := mustBuildSystemMessage(t, map[string]any{"client_ref": "wf:demo::timeout"}, "TIMER_CANCEL")
+	if err := service.respondTimerCancel(msg); err != nil {
+		t.Fatalf("cancel timer by client_ref: %v", err)
+	}
+	response := mustReadTimerResponse(t, tx)
+	if !response.OK {
+		t.Fatalf("unexpected cancel by client_ref response: %+v", response)
+	}
+	row, err := getTimer(context.Background(), service.db, "timer-1")
+	if err != nil {
+		t.Fatalf("get canceled timer: %v", err)
+	}
+	if row.Status != "canceled" {
+		t.Fatalf("expected canceled status, got %+v", row)
+	}
+}
+
+func TestRespondTimerCancelByClientRefReturnsFoundFalseWhenMissing(t *testing.T) {
+	service, tx := newTestService(t)
+	msg := mustBuildSystemMessage(t, map[string]any{"client_ref": "wf:demo::missing"}, "TIMER_CANCEL")
+	if err := service.respondTimerCancel(msg); err != nil {
+		t.Fatalf("cancel missing timer by client_ref: %v", err)
+	}
+	response := mustReadTimerResponse(t, tx)
+	if !response.OK {
+		t.Fatalf("unexpected cancel missing response: %+v", response)
+	}
+	found, ok := response.Extra["found"].(bool)
+	if !ok || found {
+		t.Fatalf("expected found=false, got %+v", response.Extra)
 	}
 }
 
@@ -191,6 +282,43 @@ func TestRespondTimerRescheduleUpdatesFireAt(t *testing.T) {
 	timerUUID, fireAtUTCMS := mustPeekScheduledTimer(t, service.scheduler)
 	if timerUUID != "timer-1" || fireAtUTCMS != newFireAt {
 		t.Fatalf("unexpected rescheduled heap entry: uuid=%s fire_at=%d", timerUUID, fireAtUTCMS)
+	}
+}
+
+func TestRespondTimerRescheduleByClientRefUpdatesFireAt(t *testing.T) {
+	service, tx := newTestService(t)
+	service.scheduler = newTimerScheduler(service)
+	insertOwnedTimer(t, service.db, timerRow{
+		UUID:         "timer-1",
+		OwnerL2Name:  "WF.demo@motherbee",
+		TargetL2Name: "WF.demo@motherbee",
+		ClientRef:    sql.NullString{String: "wf:demo::timeout", Valid: true},
+		Kind:         "oneshot",
+		FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
+		MissedPolicy: "fire",
+		Payload:      `{}`,
+		Status:       "pending",
+		CreatedAtUTC: time.Now().UTC().UnixMilli(),
+	})
+	newFireAt := time.Now().UTC().Add(2 * time.Hour).UnixMilli()
+	msg := mustBuildSystemMessage(t, map[string]any{
+		"client_ref":         "wf:demo::timeout",
+		"new_fire_at_utc_ms": newFireAt,
+	}, "TIMER_RESCHEDULE")
+
+	if err := service.respondTimerReschedule(msg); err != nil {
+		t.Fatalf("reschedule timer by client_ref: %v", err)
+	}
+	response := mustReadTimerResponse(t, tx)
+	if !response.OK {
+		t.Fatalf("unexpected reschedule by client_ref response: %+v", response)
+	}
+	row, err := getTimer(context.Background(), service.db, "timer-1")
+	if err != nil {
+		t.Fatalf("get rescheduled timer: %v", err)
+	}
+	if row.FireAtUTC != newFireAt {
+		t.Fatalf("unexpected fire_at after reschedule: %+v", row)
 	}
 }
 
@@ -304,6 +432,31 @@ func TestRespondTimerListReturnsAllTimersByDefault(t *testing.T) {
 	}
 	if payload.Count != 2 {
 		t.Fatalf("unexpected list payload: %+v", payload)
+	}
+}
+
+func TestRespondTimerGetByClientRefUsesOwnerScopedLookup(t *testing.T) {
+	service, tx := newTestService(t)
+	insertOwnedTimer(t, service.db, timerRow{
+		UUID:         "timer-owned",
+		OwnerL2Name:  "WF.demo@motherbee",
+		TargetL2Name: "WF.demo@motherbee",
+		ClientRef:    sql.NullString{String: "wf:demo::timeout", Valid: true},
+		Kind:         "oneshot",
+		FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
+		MissedPolicy: "fire",
+		Payload:      `{}`,
+		Status:       "pending",
+		CreatedAtUTC: time.Now().UTC().UnixMilli(),
+	})
+
+	msg := mustBuildSystemMessage(t, map[string]any{"client_ref": "wf:demo::timeout"}, "TIMER_GET")
+	if err := service.respondTimerGet(msg); err != nil {
+		t.Fatalf("get timer by client_ref: %v", err)
+	}
+	response := mustReadTimerResponse(t, tx)
+	if !response.OK {
+		t.Fatalf("unexpected get by client_ref response: %+v", response)
 	}
 }
 

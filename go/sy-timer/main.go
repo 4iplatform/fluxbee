@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	version             = "1.0"
+	version             = "1.1"
 	defaultNodeBaseName = "SY.timer"
 	configDir     = "/etc/fluxbee"
 	routerSockDir = "/var/run/fluxbee/routers"
@@ -93,11 +93,13 @@ type timerScheduleRecurringRequest struct {
 }
 
 type timerCancelRequest struct {
-	TimerUUID string `json:"timer_uuid"`
+	TimerUUID string `json:"timer_uuid,omitempty"`
+	ClientRef string `json:"client_ref,omitempty"`
 }
 
 type timerRescheduleRequest struct {
-	TimerUUID      string `json:"timer_uuid"`
+	TimerUUID      string `json:"timer_uuid,omitempty"`
+	ClientRef      string `json:"client_ref,omitempty"`
 	NewFireAtUTCMS *int64 `json:"new_fire_at_utc_ms,omitempty"`
 	NewFireInMS    *int64 `json:"new_fire_in_ms,omitempty"`
 }
@@ -110,6 +112,11 @@ type timerListRequest struct {
 
 type timerPurgeOwnerRequest struct {
 	OwnerL2Name string `json:"owner_l2_name"`
+}
+
+type timerReference struct {
+	TimerUUID string
+	ClientRef string
 }
 
 func main() {
@@ -346,12 +353,12 @@ func (s *Service) respondTimerHelp(incoming fluxbeesdk.Message) error {
 		version,
 		"System node providing persistent timers and authoritative time/timezone services.",
 		[]fluxbeesdk.HelpOperationDescriptor{
-			{Verb: "TIMER_SCHEDULE", Description: "Create a one-shot timer.", RequiredFields: []string{"fire_at_utc_ms OR fire_in_ms"}, OptionalFields: []string{"target_l2_name", "client_ref", "payload", "missed_policy", "missed_within_ms", "metadata"}},
-			{Verb: "TIMER_SCHEDULE_RECURRING", Description: "Create a recurring timer from a 5-field cron expression.", RequiredFields: []string{"cron_spec"}, OptionalFields: []string{"cron_tz", "target_l2_name", "client_ref", "payload", "missed_policy", "missed_within_ms", "metadata"}},
-			{Verb: "TIMER_GET", Description: "Read one timer by uuid. Read access is open within the local hive.", RequiredFields: []string{"timer_uuid"}},
+			{Verb: "TIMER_SCHEDULE", Description: "Create a one-shot timer. If client_ref already matches an active owned timer, return the existing timer instead of creating a duplicate.", RequiredFields: []string{"fire_at_utc_ms OR fire_in_ms"}, OptionalFields: []string{"target_l2_name", "client_ref", "payload", "missed_policy", "missed_within_ms", "metadata"}},
+			{Verb: "TIMER_SCHEDULE_RECURRING", Description: "Create a recurring timer from a 5-field cron expression. If client_ref already matches an active owned timer, return the existing timer instead of creating a duplicate.", RequiredFields: []string{"cron_spec"}, OptionalFields: []string{"cron_tz", "target_l2_name", "client_ref", "payload", "missed_policy", "missed_within_ms", "metadata"}},
+			{Verb: "TIMER_GET", Description: "Read one timer by uuid, or read the caller's active timer by client_ref.", RequiredFields: []string{"timer_uuid OR client_ref"}},
 			{Verb: "TIMER_LIST", Description: "List timers in the local hive, optionally filtered by owner.", OptionalFields: []string{"owner_l2_name", "status_filter", "limit"}},
-			{Verb: "TIMER_CANCEL", Description: "Cancel a pending owned timer.", RequiredFields: []string{"timer_uuid"}},
-			{Verb: "TIMER_RESCHEDULE", Description: "Reschedule a pending one-shot timer owned by the requester.", RequiredFields: []string{"timer_uuid", "new_fire_at_utc_ms OR new_fire_in_ms"}},
+			{Verb: "TIMER_CANCEL", Description: "Cancel a pending owned timer by uuid or client_ref.", RequiredFields: []string{"timer_uuid OR client_ref"}},
+			{Verb: "TIMER_RESCHEDULE", Description: "Reschedule a pending one-shot timer owned by the requester, by uuid or client_ref.", RequiredFields: []string{"timer_uuid OR client_ref", "new_fire_at_utc_ms OR new_fire_in_ms"}},
 			{Verb: "TIMER_PURGE_OWNER", Description: "Delete every timer owned by a node. Reserved to SY.orchestrator.", RequiredFields: []string{"owner_l2_name"}},
 			{Verb: "TIMER_NOW", Description: "Return current UTC time."},
 			{Verb: "TIMER_NOW_IN", Description: "Return current time in a requested IANA timezone.", RequiredFields: []string{"tz"}},
@@ -411,8 +418,21 @@ func (s *Service) respondTimerSchedule(incoming fluxbeesdk.Message) error {
 	if len(metadata) > 0 && !json.Valid(metadata) {
 		return s.sendTimerError(incoming, "TIMER_SCHEDULE", "TIMER_INVALID_PAYLOAD", "metadata must be valid JSON")
 	}
-	timerID := uuid.NewString()
 	nowUTCMS := time.Now().UTC().UnixMilli()
+	clientRef, err := normalizeClientRef(req.ClientRef)
+	if err != nil {
+		return s.sendTimerError(incoming, "TIMER_SCHEDULE", "TIMER_INVALID_PAYLOAD", err.Error())
+	}
+	if clientRef != "" {
+		existing, err := findPendingTimerByClientRef(context.Background(), s.db, ownerL2, clientRef)
+		if err != nil && err != sql.ErrNoRows {
+			return s.sendTimerError(incoming, "TIMER_SCHEDULE", "TIMER_STORAGE_ERROR", err.Error())
+		}
+		if err == nil && existing != nil {
+			return s.sendTimerScheduleExistingResponse(incoming, "TIMER_SCHEDULE", *existing, true)
+		}
+	}
+	timerID := uuid.NewString()
 	row := timerRow{
 		UUID:         timerID,
 		OwnerL2Name:  ownerL2,
@@ -425,8 +445,8 @@ func (s *Service) respondTimerSchedule(incoming fluxbeesdk.Message) error {
 		CreatedAtUTC: nowUTCMS,
 		FireCount:    0,
 	}
-	if req.ClientRef != nil && strings.TrimSpace(*req.ClientRef) != "" {
-		row.ClientRef = sql.NullString{String: strings.TrimSpace(*req.ClientRef), Valid: true}
+	if clientRef != "" {
+		row.ClientRef = sql.NullString{String: clientRef, Valid: true}
 	}
 	if req.MissedWithinMS != nil {
 		row.MissedWithinMS = sql.NullInt64{Int64: *req.MissedWithinMS, Valid: true}
@@ -435,6 +455,12 @@ func (s *Service) respondTimerSchedule(incoming fluxbeesdk.Message) error {
 		row.Metadata = sql.NullString{String: string(metadata), Valid: true}
 	}
 	if err := insertTimer(context.Background(), s.db, row); err != nil {
+		if clientRef != "" && isPendingClientRefUniqueViolation(err) {
+			existing, lookupErr := findPendingTimerByClientRef(context.Background(), s.db, ownerL2, clientRef)
+			if lookupErr == nil && existing != nil {
+				return s.sendTimerScheduleExistingResponse(incoming, "TIMER_SCHEDULE", *existing, true)
+			}
+		}
 		return s.sendTimerError(incoming, "TIMER_SCHEDULE", "TIMER_STORAGE_ERROR", err.Error())
 	}
 	s.enqueueTimer(timerID, fireAtUTCMS)
@@ -450,10 +476,11 @@ func (s *Service) respondTimerSchedule(incoming fluxbeesdk.Message) error {
 		"has_metadata":    row.Metadata.Valid,
 	})
 	return s.sendTimerResponse(incoming, map[string]any{
-		"ok":             true,
-		"verb":           "TIMER_SCHEDULE",
-		"timer_uuid":     timerID,
-		"fire_at_utc_ms": fireAtUTCMS,
+		"ok":              true,
+		"verb":            "TIMER_SCHEDULE",
+		"timer_uuid":      timerID,
+		"fire_at_utc_ms":  fireAtUTCMS,
+		"already_existed": false,
 	})
 }
 
@@ -495,8 +522,21 @@ func (s *Service) respondTimerScheduleRecurring(incoming fluxbeesdk.Message) err
 	if len(metadata) > 0 && !json.Valid(metadata) {
 		return s.sendTimerError(incoming, "TIMER_SCHEDULE_RECURRING", "TIMER_INVALID_PAYLOAD", "metadata must be valid JSON")
 	}
-	timerID := uuid.NewString()
 	nowUTCMS := time.Now().UTC().UnixMilli()
+	clientRef, err := normalizeClientRef(req.ClientRef)
+	if err != nil {
+		return s.sendTimerError(incoming, "TIMER_SCHEDULE_RECURRING", "TIMER_INVALID_PAYLOAD", err.Error())
+	}
+	if clientRef != "" {
+		existing, err := findPendingTimerByClientRef(context.Background(), s.db, ownerL2, clientRef)
+		if err != nil && err != sql.ErrNoRows {
+			return s.sendTimerError(incoming, "TIMER_SCHEDULE_RECURRING", "TIMER_STORAGE_ERROR", err.Error())
+		}
+		if err == nil && existing != nil {
+			return s.sendTimerScheduleExistingResponse(incoming, "TIMER_SCHEDULE_RECURRING", *existing, true)
+		}
+	}
+	timerID := uuid.NewString()
 	row := timerRow{
 		UUID:         timerID,
 		OwnerL2Name:  ownerL2,
@@ -511,8 +551,8 @@ func (s *Service) respondTimerScheduleRecurring(incoming fluxbeesdk.Message) err
 		CreatedAtUTC: nowUTCMS,
 		FireCount:    0,
 	}
-	if req.ClientRef != nil && strings.TrimSpace(*req.ClientRef) != "" {
-		row.ClientRef = sql.NullString{String: strings.TrimSpace(*req.ClientRef), Valid: true}
+	if clientRef != "" {
+		row.ClientRef = sql.NullString{String: clientRef, Valid: true}
 	}
 	if req.MissedWithinMS != nil {
 		row.MissedWithinMS = sql.NullInt64{Int64: *req.MissedWithinMS, Valid: true}
@@ -521,6 +561,12 @@ func (s *Service) respondTimerScheduleRecurring(incoming fluxbeesdk.Message) err
 		row.Metadata = sql.NullString{String: string(metadata), Valid: true}
 	}
 	if err := insertTimer(context.Background(), s.db, row); err != nil {
+		if clientRef != "" && isPendingClientRefUniqueViolation(err) {
+			existing, lookupErr := findPendingTimerByClientRef(context.Background(), s.db, ownerL2, clientRef)
+			if lookupErr == nil && existing != nil {
+				return s.sendTimerScheduleExistingResponse(incoming, "TIMER_SCHEDULE_RECURRING", *existing, true)
+			}
+		}
 		return s.sendTimerError(incoming, "TIMER_SCHEDULE_RECURRING", "TIMER_STORAGE_ERROR", err.Error())
 	}
 	s.enqueueTimer(timerID, fireAtUTCMS)
@@ -537,10 +583,11 @@ func (s *Service) respondTimerScheduleRecurring(incoming fluxbeesdk.Message) err
 		"has_metadata":    row.Metadata.Valid,
 	})
 	return s.sendTimerResponse(incoming, map[string]any{
-		"ok":             true,
-		"verb":           "TIMER_SCHEDULE_RECURRING",
-		"timer_uuid":     timerID,
-		"fire_at_utc_ms": fireAtUTCMS,
+		"ok":              true,
+		"verb":            "TIMER_SCHEDULE_RECURRING",
+		"timer_uuid":      timerID,
+		"fire_at_utc_ms":  fireAtUTCMS,
+		"already_existed": false,
 	})
 }
 
@@ -549,10 +596,11 @@ func (s *Service) respondTimerGet(incoming fluxbeesdk.Message) error {
 	if err := json.Unmarshal(incoming.Payload, &req); err != nil {
 		return s.sendTimerError(incoming, "TIMER_GET", "TIMER_INVALID_PAYLOAD", err.Error())
 	}
-	if strings.TrimSpace(req.TimerUUID) == "" {
-		return s.sendTimerError(incoming, "TIMER_GET", "TIMER_INVALID_PAYLOAD", "timer_uuid must be non-empty")
+	ref, err := timerReferenceFromRequest(req.TimerUUID, req.ClientRef)
+	if err != nil {
+		return s.sendTimerError(incoming, "TIMER_GET", "TIMER_INVALID_PAYLOAD", err.Error())
 	}
-	row, err := getTimer(context.Background(), s.db, req.TimerUUID)
+	row, err := s.resolveTimerForGet(context.Background(), incoming, ref)
 	if err == sql.ErrNoRows {
 		return s.sendTimerError(incoming, "TIMER_GET", "TIMER_NOT_FOUND", "timer not found")
 	}
@@ -614,22 +662,23 @@ func (s *Service) respondTimerCancel(incoming fluxbeesdk.Message) error {
 	if err := json.Unmarshal(incoming.Payload, &req); err != nil {
 		return s.sendTimerError(incoming, "TIMER_CANCEL", "TIMER_INVALID_PAYLOAD", err.Error())
 	}
-	if strings.TrimSpace(req.TimerUUID) == "" {
-		return s.sendTimerError(incoming, "TIMER_CANCEL", "TIMER_INVALID_PAYLOAD", "timer_uuid must be non-empty")
-	}
-	ownerL2, err := s.resolveSourceL2NameFromMsg(incoming)
+	ref, err := timerReferenceFromRequest(req.TimerUUID, req.ClientRef)
 	if err != nil {
-		return s.sendTimerError(incoming, "TIMER_CANCEL", "TIMER_INTERNAL", err.Error())
+		return s.sendTimerError(incoming, "TIMER_CANCEL", "TIMER_INVALID_PAYLOAD", err.Error())
 	}
-	row, err := getTimer(context.Background(), s.db, req.TimerUUID)
+	row, foundByUUID, err := s.resolveOwnedTimerForMutation(context.Background(), incoming, ref)
+	if err == sql.ErrNoRows && !foundByUUID {
+		return s.sendTimerResponse(incoming, map[string]any{
+			"ok":    true,
+			"verb":  "TIMER_CANCEL",
+			"found": false,
+		})
+	}
 	if err == sql.ErrNoRows {
 		return s.sendTimerError(incoming, "TIMER_CANCEL", "TIMER_NOT_FOUND", "timer not found")
 	}
 	if err != nil {
-		return s.sendTimerError(incoming, "TIMER_CANCEL", "TIMER_STORAGE_ERROR", err.Error())
-	}
-	if row.OwnerL2Name != ownerL2 {
-		return s.sendTimerError(incoming, "TIMER_CANCEL", "TIMER_NOT_OWNER", "timer does not belong to requester")
+		return s.sendTimerError(incoming, "TIMER_CANCEL", timerStorageOrInternalCode(err), err.Error())
 	}
 	if row.Status == "fired" {
 		return s.sendTimerError(incoming, "TIMER_CANCEL", "TIMER_ALREADY_FIRED", "timer already fired")
@@ -650,6 +699,7 @@ func (s *Service) respondTimerCancel(incoming fluxbeesdk.Message) error {
 		"verb":       "TIMER_CANCEL",
 		"timer_uuid": row.UUID,
 		"status":     row.Status,
+		"found":      true,
 	})
 }
 
@@ -658,22 +708,19 @@ func (s *Service) respondTimerReschedule(incoming fluxbeesdk.Message) error {
 	if err := json.Unmarshal(incoming.Payload, &req); err != nil {
 		return s.sendTimerError(incoming, "TIMER_RESCHEDULE", "TIMER_INVALID_PAYLOAD", err.Error())
 	}
-	if strings.TrimSpace(req.TimerUUID) == "" {
-		return s.sendTimerError(incoming, "TIMER_RESCHEDULE", "TIMER_INVALID_PAYLOAD", "timer_uuid must be non-empty")
-	}
-	ownerL2, err := s.resolveSourceL2NameFromMsg(incoming)
+	ref, err := timerReferenceFromRequest(req.TimerUUID, req.ClientRef)
 	if err != nil {
-		return s.sendTimerError(incoming, "TIMER_RESCHEDULE", "TIMER_INTERNAL", err.Error())
+		return s.sendTimerError(incoming, "TIMER_RESCHEDULE", "TIMER_INVALID_PAYLOAD", err.Error())
 	}
-	row, err := getTimer(context.Background(), s.db, req.TimerUUID)
+	row, foundByUUID, err := s.resolveOwnedTimerForMutation(context.Background(), incoming, ref)
 	if err == sql.ErrNoRows {
+		if !foundByUUID {
+			return s.sendTimerError(incoming, "TIMER_RESCHEDULE", "TIMER_NOT_FOUND", "timer not found")
+		}
 		return s.sendTimerError(incoming, "TIMER_RESCHEDULE", "TIMER_NOT_FOUND", "timer not found")
 	}
 	if err != nil {
-		return s.sendTimerError(incoming, "TIMER_RESCHEDULE", "TIMER_STORAGE_ERROR", err.Error())
-	}
-	if row.OwnerL2Name != ownerL2 {
-		return s.sendTimerError(incoming, "TIMER_RESCHEDULE", "TIMER_NOT_OWNER", "timer does not belong to requester")
+		return s.sendTimerError(incoming, "TIMER_RESCHEDULE", timerStorageOrInternalCode(err), err.Error())
 	}
 	if row.Kind == "recurring" {
 		return s.sendTimerError(incoming, "TIMER_RESCHEDULE", "TIMER_RECURRING_NOT_RESCHEDULABLE", "recurring timers cannot be rescheduled in v1")
@@ -702,6 +749,7 @@ func (s *Service) respondTimerReschedule(incoming fluxbeesdk.Message) error {
 		"verb":           "TIMER_RESCHEDULE",
 		"timer_uuid":     row.UUID,
 		"fire_at_utc_ms": fireAtUTCMS,
+		"found":          true,
 	})
 }
 
@@ -808,6 +856,97 @@ func (s *Service) resolveSourceL2NameFromMsg(incoming fluxbeesdk.Message) (strin
 func (s *Service) localOrchestratorL2Name() string {
 	_, hive, _ := strings.Cut(s.nodeName, "@")
 	return fmt.Sprintf("SY.orchestrator@%s", hive)
+}
+
+func timerReferenceFromRequest(timerUUID, clientRef string) (timerReference, error) {
+	ref := timerReference{
+		TimerUUID: strings.TrimSpace(timerUUID),
+		ClientRef: strings.TrimSpace(clientRef),
+	}
+	switch {
+	case ref.TimerUUID != "":
+		return ref, nil
+	case ref.ClientRef != "":
+		if len(ref.ClientRef) > 255 {
+			return timerReference{}, fmt.Errorf("client_ref must be at most 255 characters")
+		}
+		return ref, nil
+	default:
+		return timerReference{}, fmt.Errorf("either timer_uuid or client_ref must be provided")
+	}
+}
+
+func normalizeClientRef(clientRef *string) (string, error) {
+	if clientRef == nil {
+		return "", nil
+	}
+	trimmed := strings.TrimSpace(*clientRef)
+	if trimmed == "" {
+		return "", nil
+	}
+	if len(trimmed) > 255 {
+		return "", fmt.Errorf("client_ref must be at most 255 characters")
+	}
+	return trimmed, nil
+}
+
+func (s *Service) resolveTimerForGet(ctx context.Context, incoming fluxbeesdk.Message, ref timerReference) (*timerRow, error) {
+	if ref.TimerUUID != "" {
+		return getTimer(ctx, s.db, ref.TimerUUID)
+	}
+	ownerL2, err := s.resolveSourceL2NameFromMsg(incoming)
+	if err != nil {
+		return nil, err
+	}
+	return findPendingTimerByClientRef(ctx, s.db, ownerL2, ref.ClientRef)
+}
+
+func (s *Service) resolveOwnedTimerForMutation(ctx context.Context, incoming fluxbeesdk.Message, ref timerReference) (*timerRow, bool, error) {
+	ownerL2, err := s.resolveSourceL2NameFromMsg(incoming)
+	if err != nil {
+		return nil, ref.TimerUUID != "", err
+	}
+	var row *timerRow
+	if ref.TimerUUID != "" {
+		row, err = getTimer(ctx, s.db, ref.TimerUUID)
+	} else {
+		row, err = findPendingTimerByClientRef(ctx, s.db, ownerL2, ref.ClientRef)
+	}
+	if err != nil {
+		return nil, ref.TimerUUID != "", err
+	}
+	if row.OwnerL2Name != ownerL2 {
+		return nil, ref.TimerUUID != "", fmt.Errorf("timer does not belong to requester")
+	}
+	return row, ref.TimerUUID != "", nil
+}
+
+func (s *Service) sendTimerScheduleExistingResponse(incoming fluxbeesdk.Message, verb string, row timerRow, alreadyExisted bool) error {
+	return s.sendTimerResponse(incoming, map[string]any{
+		"ok":              true,
+		"verb":            verb,
+		"timer_uuid":      row.UUID,
+		"fire_at_utc_ms":  row.FireAtUTC,
+		"already_existed": alreadyExisted,
+	})
+}
+
+func timerStorageOrInternalCode(err error) string {
+	if err == nil {
+		return "TIMER_STORAGE_ERROR"
+	}
+	switch err {
+	case sql.ErrNoRows:
+		return "TIMER_NOT_FOUND"
+	default:
+		if strings.Contains(err.Error(), "routing.src_l2_name missing") {
+			return "TIMER_INTERNAL"
+		}
+		if strings.Contains(err.Error(), "does not belong to requester") {
+			return "TIMER_NOT_OWNER"
+		}
+		return "TIMER_STORAGE_ERROR"
+	}
 }
 
 func scheduleFireAt(req timerScheduleRequest) (int64, error) {

@@ -38,6 +38,13 @@ func TestEnsureTimerSchemaCreatesTableAndIndexes(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("timers table missing")
 	}
+
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_timers_owner_clientref_pending'`).Scan(&count); err != nil {
+		t.Fatalf("check unique pending client_ref index: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("pending client_ref index missing")
+	}
 }
 
 func TestInsertGetAndListTimer(t *testing.T) {
@@ -73,6 +80,76 @@ func TestInsertGetAndListTimer(t *testing.T) {
 	}
 	if len(items) != 1 || items[0].UUID != "timer-1" {
 		t.Fatalf("unexpected listed timers: %+v", items)
+	}
+}
+
+func TestFindPendingTimerByClientRefReturnsOnlyActiveTimer(t *testing.T) {
+	db := openTestTimerDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC().UnixMilli()
+	if err := insertTimer(ctx, db, timerRow{
+		UUID:         "timer-fired",
+		OwnerL2Name:  "WF.demo@motherbee",
+		TargetL2Name: "WF.demo@motherbee",
+		ClientRef:    sql.NullString{String: "wf:demo::timeout", Valid: true},
+		Kind:         "oneshot",
+		FireAtUTC:    now - 60_000,
+		MissedPolicy: "fire",
+		Payload:      `{}`,
+		Status:       "fired",
+		CreatedAtUTC: now - 120_000,
+		FireCount:    1,
+	}); err != nil {
+		t.Fatalf("insert fired timer: %v", err)
+	}
+	if err := insertTimer(ctx, db, timerRow{
+		UUID:         "timer-pending",
+		OwnerL2Name:  "WF.demo@motherbee",
+		TargetL2Name: "WF.demo@motherbee",
+		ClientRef:    sql.NullString{String: "wf:demo::timeout", Valid: true},
+		Kind:         "oneshot",
+		FireAtUTC:    now + 60_000,
+		MissedPolicy: "fire",
+		Payload:      `{}`,
+		Status:       "pending",
+		CreatedAtUTC: now,
+		FireCount:    0,
+	}); err != nil {
+		t.Fatalf("insert pending timer: %v", err)
+	}
+
+	row, err := findPendingTimerByClientRef(ctx, db, "WF.demo@motherbee", "wf:demo::timeout")
+	if err != nil {
+		t.Fatalf("find pending timer by client_ref: %v", err)
+	}
+	if row.UUID != "timer-pending" {
+		t.Fatalf("unexpected pending timer: %+v", row)
+	}
+}
+
+func TestPendingClientRefUniqueIndexRejectsDuplicateActiveTimers(t *testing.T) {
+	db := openTestTimerDB(t)
+	ctx := context.Background()
+	row := timerRow{
+		UUID:         "timer-1",
+		OwnerL2Name:  "WF.demo@motherbee",
+		TargetL2Name: "WF.demo@motherbee",
+		ClientRef:    sql.NullString{String: "wf:demo::timeout", Valid: true},
+		Kind:         "oneshot",
+		FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
+		MissedPolicy: "fire",
+		Payload:      `{}`,
+		Status:       "pending",
+		CreatedAtUTC: time.Now().UTC().UnixMilli(),
+		FireCount:    0,
+	}
+	if err := insertTimer(ctx, db, row); err != nil {
+		t.Fatalf("insert first timer: %v", err)
+	}
+	row.UUID = "timer-2"
+	row.CreatedAtUTC++
+	if err := insertTimer(ctx, db, row); !isPendingClientRefUniqueViolation(err) {
+		t.Fatalf("expected pending client_ref unique violation, got %v", err)
 	}
 }
 
