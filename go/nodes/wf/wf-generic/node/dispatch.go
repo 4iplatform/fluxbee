@@ -116,11 +116,11 @@ func handleWFGetInstance(ctx context.Context, msg sdk.Message, rt *NodeRuntime) 
 		LogLimit   int    `json:"log_limit"`
 	}
 	if err := json.Unmarshal(msg.Payload, &req); err != nil || req.InstanceID == "" {
-		return sendErrorReply(ctx, msg, "INVALID_REQUEST", "instance_id required", rt)
+		return sendErrorReply(ctx, msg, MsgWFGetInstanceResponse, "INVALID_REQUEST", "instance_id required", rt)
 	}
 	row, err := rt.Store.GetInstance(ctx, req.InstanceID)
 	if err != nil {
-		return sendErrorReply(ctx, msg, "INSTANCE_NOT_FOUND", err.Error(), rt)
+		return sendErrorReply(ctx, msg, MsgWFGetInstanceResponse, "INSTANCE_NOT_FOUND", err.Error(), rt)
 	}
 	limit := req.LogLimit
 	if limit <= 0 {
@@ -150,7 +150,7 @@ func handleWFListInstances(ctx context.Context, msg sdk.Message, rt *NodeRuntime
 	}
 	rows, err := rt.Store.ListInstances(ctx, req.Status, req.Limit, req.CreatedAfterMS)
 	if err != nil {
-		return sendErrorReply(ctx, msg, "STORE_ERROR", err.Error(), rt)
+		return sendErrorReply(ctx, msg, MsgWFListInstancesResponse, "STORE_ERROR", err.Error(), rt)
 	}
 	payload := map[string]any{
 		"ok":        true,
@@ -166,7 +166,7 @@ func handleWFCancelInstance(ctx context.Context, msg sdk.Message, rt *NodeRuntim
 		Reason     string `json:"reason"`
 	}
 	if err := json.Unmarshal(msg.Payload, &req); err != nil || req.InstanceID == "" {
-		return sendErrorReply(ctx, msg, "INVALID_REQUEST", "instance_id required", rt)
+		return sendErrorReply(ctx, msg, MsgWFCancelInstanceResponse, "INVALID_REQUEST", "instance_id required", rt)
 	}
 
 	inst, ok := rt.Registry.Get(req.InstanceID)
@@ -174,24 +174,24 @@ func handleWFCancelInstance(ctx context.Context, msg sdk.Message, rt *NodeRuntim
 		// Check if it exists but is already terminated
 		row, err := rt.Store.GetInstance(ctx, req.InstanceID)
 		if err != nil {
-			return sendErrorReply(ctx, msg, "INSTANCE_NOT_FOUND", fmt.Sprintf("instance %q not found", req.InstanceID), rt)
+			return sendErrorReply(ctx, msg, MsgWFCancelInstanceResponse, "INSTANCE_NOT_FOUND", fmt.Sprintf("instance %q not found", req.InstanceID), rt)
 		}
 		if row.Status != "running" && row.Status != "cancelling" {
-			return sendErrorReply(ctx, msg, "INSTANCE_ALREADY_TERMINATED",
+			return sendErrorReply(ctx, msg, MsgWFCancelInstanceResponse, "INSTANCE_ALREADY_TERMINATED",
 				fmt.Sprintf("instance %q is already %s", req.InstanceID, row.Status), rt)
 		}
-		return sendErrorReply(ctx, msg, "INSTANCE_NOT_FOUND", "instance not in active registry", rt)
+		return sendErrorReply(ctx, msg, MsgWFCancelInstanceResponse, "INSTANCE_NOT_FOUND", "instance not in active registry", rt)
 	}
 
 	inst.Lock()
 	defer inst.Unlock()
 
 	if inst.Status == "cancelling" {
-		return sendErrorReply(ctx, msg, "INSTANCE_CANCELLING",
+		return sendErrorReply(ctx, msg, MsgWFCancelInstanceResponse, "INSTANCE_CANCELLING",
 			fmt.Sprintf("instance %q is already being cancelled", req.InstanceID), rt)
 	}
 	if inst.Status != "running" {
-		return sendErrorReply(ctx, msg, "INSTANCE_ALREADY_TERMINATED",
+		return sendErrorReply(ctx, msg, MsgWFCancelInstanceResponse, "INSTANCE_ALREADY_TERMINATED",
 			fmt.Sprintf("instance %q is already %s", req.InstanceID, inst.Status), rt)
 	}
 
@@ -223,29 +223,15 @@ func sendReply(ctx context.Context, orig sdk.Message, replyMsg string, payload a
 	if rt.ActCtx.Dispatcher == nil {
 		return nil
 	}
-	raw, err := sdk.MarshalPayload(payload)
+	resp, err := sdk.BuildSystemResponse(&orig, rt.NodeUUID, replyMsg, payload, sdk.SystemEnvelopeOptions{})
 	if err != nil {
 		return err
-	}
-	replyMsgCopy := replyMsg
-	resp := sdk.Message{
-		Routing: sdk.Routing{
-			Src:     rt.ActCtx.Dispatcher.NodeL2Name(),
-			Dst:     sdk.UnicastDestination(orig.Routing.Src),
-			TTL:     16,
-			TraceID: orig.Routing.TraceID,
-		},
-		Meta: sdk.Meta{
-			MsgType: "system",
-			Msg:     &replyMsgCopy,
-		},
-		Payload: raw,
 	}
 	return rt.ActCtx.Dispatcher.SendMsg(resp)
 }
 
-func sendErrorReply(ctx context.Context, orig sdk.Message, code, detail string, rt *NodeRuntime) error {
-	return sendReply(ctx, orig, code, map[string]any{
+func sendErrorReply(ctx context.Context, orig sdk.Message, responseMsg, code, detail string, rt *NodeRuntime) error {
+	return sendReply(ctx, orig, responseMsg, map[string]any{
 		"ok":     false,
 		"error":  code,
 		"detail": detail,

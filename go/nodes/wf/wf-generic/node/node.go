@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
@@ -19,6 +21,11 @@ type Config struct {
 	SYTimerL2Name          string `json:"sy_timer_l2_name"`
 	GCRetentionDays        int    `json:"gc_retention_days"`
 	GCIntervalSeconds      int    `json:"gc_interval_seconds"`
+	System                 *ManagedSystemConfig `json:"_system,omitempty"`
+}
+
+type ManagedSystemConfig struct {
+	NodeName string `json:"node_name,omitempty"`
 }
 
 // LoadConfig reads and validates a config.json file.
@@ -49,6 +56,40 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.GCIntervalSeconds = 3600
 	}
 	return &cfg, nil
+}
+
+func ResolveManagedNodeName(cfg *Config) (string, error) {
+	if cfg != nil && cfg.System != nil && strings.TrimSpace(cfg.System.NodeName) != "" {
+		return strings.TrimSpace(cfg.System.NodeName), nil
+	}
+	value := strings.TrimSpace(os.Getenv("FLUXBEE_NODE_NAME"))
+	if value != "" {
+		return value, nil
+	}
+	return "", fmt.Errorf("managed node name unavailable: set _system.node_name in config or FLUXBEE_NODE_NAME in environment")
+}
+
+func ManagedConfigPathFromEnv() (string, error) {
+	nodeName := strings.TrimSpace(os.Getenv("FLUXBEE_NODE_NAME"))
+	if nodeName == "" {
+		return "", fmt.Errorf("FLUXBEE_NODE_NAME is not set")
+	}
+	kind := managedNodeKind(nodeName)
+	if kind == "" {
+		return "", fmt.Errorf("cannot derive node kind from %q", nodeName)
+	}
+	return filepath.Join("/var/lib/fluxbee/nodes", kind, nodeName, "config.json"), nil
+}
+
+func managedNodeKind(nodeName string) string {
+	base := strings.TrimSpace(nodeName)
+	if at := strings.Index(base, "@"); at >= 0 {
+		base = base[:at]
+	}
+	if dot := strings.Index(base, "."); dot >= 0 {
+		base = base[:dot]
+	}
+	return strings.TrimSpace(base)
 }
 
 // RunOptions is the full set of options for node.Run().

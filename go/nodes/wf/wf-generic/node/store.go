@@ -373,6 +373,21 @@ SELECT instance_id, timer_key, scheduled_at_ms, fire_at_ms
 FROM wf_instance_timers WHERE instance_id = ?;`, instanceID)
 }
 
+// GetTimerForInstance returns the timer row for a specific instance/timer_key.
+func (s *Store) GetTimerForInstance(ctx context.Context, instanceID, timerKey string) (TimerRow, bool, error) {
+	rows, err := s.queryTimers(ctx, `
+SELECT instance_id, timer_key, scheduled_at_ms, fire_at_ms
+FROM wf_instance_timers
+WHERE instance_id = ? AND timer_key = ?;`, instanceID, timerKey)
+	if err != nil {
+		return TimerRow{}, false, err
+	}
+	if len(rows) == 0 {
+		return TimerRow{}, false, nil
+	}
+	return rows[0], true, nil
+}
+
 // ListAllExpectedTimers returns all timer entries across all instances (used at boot recovery).
 func (s *Store) ListAllExpectedTimers(ctx context.Context) ([]TimerRow, error) {
 	return s.queryTimers(ctx, `

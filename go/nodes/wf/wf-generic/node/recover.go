@@ -122,7 +122,20 @@ func Recover(ctx context.Context, def *WorkflowDefinition, store *Store, reg *In
 				}
 				inst.Unlock()
 			}
-			// Cancel in SY.timer to prevent double-firing.
+			currentRow, existsAfterTransition, err := store.GetTimerForInstance(ctx, row.InstanceID, row.TimerKey)
+			if err != nil {
+				log.Printf("recover: reload timer row %s/%s: %v", row.InstanceID, row.TimerKey, err)
+			}
+			if existsAfterTransition && (currentRow.FireAtMS != row.FireAtMS || currentRow.ScheduledAtMS != row.ScheduledAtMS) {
+				log.Printf("recover: timer %s/%s was re-scheduled during synthetic fire, keeping new timer", row.InstanceID, row.TimerKey)
+				delete(syView, ref)
+				continue
+			}
+			if !existsAfterTransition {
+				delete(syView, ref)
+				continue
+			}
+			// Cancel in SY.timer to prevent double-firing of the old pending timer.
 			if err := actx.Timer.CancelByClientRef(ctx, ref); err != nil {
 				log.Printf("recover: cancel past timer %s: %v", ref, err)
 			}

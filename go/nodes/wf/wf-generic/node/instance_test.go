@@ -15,6 +15,7 @@ import (
 type mockDispatcher struct {
 	sent    []sdk.Message
 	l2name  string
+	uuid    string
 	sendErr error
 }
 
@@ -26,6 +27,12 @@ func (m *mockDispatcher) SendMsg(msg sdk.Message) error {
 	return nil
 }
 func (m *mockDispatcher) NodeL2Name() string { return m.l2name }
+func (m *mockDispatcher) NodeUUID() string {
+	if m.uuid == "" {
+		return "wf-uuid-test"
+	}
+	return m.uuid
+}
 
 type mockTimerSender struct {
 	scheduled    []string // clientRefs scheduled
@@ -94,7 +101,7 @@ func TestInstanceCreationRunsEntryActions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load def: %v", err)
 	}
-	disp := &mockDispatcher{l2name: "WF.invoice@motherbee"}
+	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-1"}
 	timer := &mockTimerSender{}
 	actx := makeActx(t, disp, timer)
 
@@ -118,6 +125,9 @@ func TestInstanceCreationRunsEntryActions(t *testing.T) {
 	// entry_actions has: send_message + schedule_timer
 	if len(disp.sent) != 1 {
 		t.Fatalf("expected 1 send_message, got %d", len(disp.sent))
+	}
+	if got := disp.sent[0].Routing.Src; got != "wf-uuid-1" {
+		t.Fatalf("send_message should use node uuid as routing.src, got %q", got)
 	}
 	if len(timer.scheduled) != 1 {
 		t.Fatalf("expected 1 schedule_timer, got %d", len(timer.scheduled))
@@ -160,6 +170,88 @@ func TestRunTransitionTakesFirstMatchingGuard(t *testing.T) {
 	if inst.TerminatedAtMS == nil {
 		t.Error("TerminatedAtMS should be set after terminal state")
 	}
+}
+
+func TestCreateAndDispatchRejectsPayloadThatViolatesInputSchema(t *testing.T) {
+	def, err := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
+	if err != nil {
+		t.Fatalf("load def: %v", err)
+	}
+	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-2"}
+	actx := makeActx(t, disp, &mockTimerSender{})
+	reg := NewInstanceRegistry()
+
+	msg := msgWithNameAndPayload("INVOICE_START", map[string]any{
+		"wrong_field": "missing required customer_id",
+	})
+	msg.Routing.Src = "src-uuid-1"
+
+	err = CorrelateAndDispatch(context.Background(), msg, reg, def, actx.Store, actx)
+	if err != nil {
+		t.Fatalf("CorrelateAndDispatch: %v", err)
+	}
+	if reg.Count() != 0 {
+		t.Fatalf("invalid payload should not create an instance")
+	}
+	if len(disp.sent) != 1 {
+		t.Fatalf("expected one error reply, got %d", len(disp.sent))
+	}
+	if got := derefString(disp.sent[0].Meta.Msg); got != "INVALID_INPUT" {
+		t.Fatalf("expected INVALID_INPUT error msg, got %q", got)
+	}
+}
+
+func TestWFGetInstanceInvalidRequestUsesResponseVerbAndUUIDSrc(t *testing.T) {
+	def, err := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
+	if err != nil {
+		t.Fatalf("load def: %v", err)
+	}
+	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-3"}
+	actx := makeActx(t, disp, &mockTimerSender{})
+	rt := &NodeRuntime{
+		Def:      def,
+		DefJSON:  validWorkflowJSON(),
+		Registry: NewInstanceRegistry(),
+		Store:    actx.Store,
+		ActCtx:   actx,
+		NodeUUID: "wf-uuid-3",
+	}
+
+	msgName := MsgWFGetInstance
+	msg := sdk.Message{
+		Routing: sdk.Routing{
+			Src:     "caller-uuid-1",
+			Dst:     sdk.UnicastDestination("WF.invoice@motherbee"),
+			TTL:     16,
+			TraceID: "trace-get-1",
+		},
+		Meta: sdk.Meta{
+			MsgType: "system",
+			Msg:     &msgName,
+		},
+		Payload: json.RawMessage(`{}`),
+	}
+
+	if err := Dispatch(context.Background(), msg, rt); err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	if len(disp.sent) != 1 {
+		t.Fatalf("expected one error reply, got %d", len(disp.sent))
+	}
+	reply := disp.sent[0]
+	if got := derefString(reply.Meta.Msg); got != MsgWFGetInstanceResponse {
+		t.Fatalf("expected response verb %q, got %q", MsgWFGetInstanceResponse, got)
+	}
+	if reply.Routing.Src != "wf-uuid-3" {
+		t.Fatalf("expected routing.src to use node uuid, got %q", reply.Routing.Src)
+	}
+}
+
+func derefString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func TestRunTransitionNoMatchLogsUnhandled(t *testing.T) {

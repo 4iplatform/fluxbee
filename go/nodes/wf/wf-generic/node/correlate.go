@@ -103,11 +103,14 @@ func dispatchToInstance(ctx context.Context, inst *WFInstance, msg sdk.Message, 
 // createAndDispatch validates the input, creates a new instance, and runs its
 // initial entry_actions.
 func createAndDispatch(ctx context.Context, msg sdk.Message, reg *InstanceRegistry, def *WorkflowDefinition, store *Store, actx ActionContext) error {
-	var input map[string]any
+	input := map[string]any{}
 	if len(msg.Payload) > 0 {
 		if err := json.Unmarshal(msg.Payload, &input); err != nil {
 			return sendErrorResponse(ctx, msg, "INVALID_INPUT", "payload is not a JSON object", actx)
 		}
+	}
+	if err := validateInputPayload(def, input); err != nil {
+		return sendErrorResponse(ctx, msg, "INVALID_INPUT", err.Error(), actx)
 	}
 
 	instanceID := newInstanceID()
@@ -171,7 +174,6 @@ func sendErrorResponse(ctx context.Context, msg sdk.Message, code, detail string
 	if actx.Dispatcher == nil {
 		return nil
 	}
-	src := actx.Dispatcher.NodeL2Name()
 	replyTo := msg.Routing.Src
 	if replyTo == "" {
 		return nil
@@ -184,7 +186,7 @@ func sendErrorResponse(ctx context.Context, msg sdk.Message, code, detail string
 	msgName := code
 	resp := sdk.Message{
 		Routing: sdk.Routing{
-			Src:     src,
+			Src:     actx.Dispatcher.NodeUUID(),
 			Dst:     sdk.UnicastDestination(replyTo),
 			TTL:     16,
 			TraceID: msg.Routing.TraceID,

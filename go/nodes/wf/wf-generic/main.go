@@ -9,7 +9,15 @@ import (
 	"os/signal"
 	"syscall"
 
+	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 	"github.com/4iplatform/json-router/nodes/wf/wf-generic/node"
+)
+
+const (
+	version             = "1.0"
+	configDir           = "/etc/fluxbee"
+	routerSockDir       = "/var/run/fluxbee/routers"
+	uuidPersistenceDir  = "/var/lib/fluxbee/state/nodes"
 )
 
 func main() {
@@ -18,8 +26,12 @@ func main() {
 	flag.Parse()
 
 	if configPath == "" {
-		fmt.Fprintln(os.Stderr, "missing required --config flag")
-		os.Exit(2)
+		derived, err := node.ManagedConfigPathFromEnv()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "missing required --config flag and could not derive managed config path: %v\n", err)
+			os.Exit(2)
+		}
+		configPath = derived
 	}
 
 	cfg, err := node.LoadConfig(configPath)
@@ -30,8 +42,21 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	nodeName, err := node.ResolveManagedNodeName(cfg)
+	if err != nil {
+		log.Fatalf("wf-generic: %v", err)
+	}
+
 	if err := node.Run(ctx, node.RunOptions{
 		Config: cfg,
+		SDKConfig: &sdk.NodeConfig{
+			Name:               nodeName,
+			RouterSocket:       routerSockDir,
+			UUIDPersistenceDir: uuidPersistenceDir,
+			UUIDMode:           sdk.NodeUuidPersistent,
+			ConfigDir:          configDir,
+			Version:            version,
+		},
 	}); err != nil {
 		log.Fatalf("wf-generic: %v", err)
 	}

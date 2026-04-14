@@ -32,6 +32,7 @@ type WorkflowDefinition struct {
 	InitialState    string            `json:"initial_state"`
 	TerminalStates  []string          `json:"terminal_states"`
 	States          []StateDefinition `json:"states"`
+	inputValidator  *jsonschema.Schema `json:"-"`
 }
 
 type StateDefinition struct {
@@ -123,9 +124,11 @@ func ValidateDefinition(def *WorkflowDefinition, clock ClockFunc) error {
 	if len(def.InputSchema) == 0 {
 		return &LoadError{Path: "input_schema", Message: "must not be empty"}
 	}
-	if err := validateJSONSchema(def.InputSchema); err != nil {
+	inputValidator, err := compileJSONSchema(def.InputSchema)
+	if err != nil {
 		return &LoadError{Path: "input_schema", Message: err.Error()}
 	}
+	def.inputValidator = inputValidator
 	if len(def.States) == 0 {
 		return &LoadError{Path: "states", Message: "must contain at least one state"}
 	}
@@ -190,21 +193,37 @@ func ValidateDefinition(def *WorkflowDefinition, clock ClockFunc) error {
 	return nil
 }
 
-func validateJSONSchema(schema map[string]any) error {
+func compileJSONSchema(schema map[string]any) (*jsonschema.Schema, error) {
 	data, err := json.Marshal(schema)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(data))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	compiler := jsonschema.NewCompiler()
 	if err := compiler.AddResource("wf-input-schema.json", doc); err != nil {
-		return err
+		return nil, err
 	}
-	_, err = compiler.Compile("wf-input-schema.json")
-	return err
+	return compiler.Compile("wf-input-schema.json")
+}
+
+func validateInputPayload(def *WorkflowDefinition, input map[string]any) error {
+	if def == nil {
+		return fmt.Errorf("workflow definition is nil")
+	}
+	if input == nil {
+		input = map[string]any{}
+	}
+	if def.inputValidator == nil {
+		inputValidator, err := compileJSONSchema(def.InputSchema)
+		if err != nil {
+			return err
+		}
+		def.inputValidator = inputValidator
+	}
+	return def.inputValidator.Validate(input)
 }
 
 func validateActions(path string, actions []ActionDefinition, clock ClockFunc) error {

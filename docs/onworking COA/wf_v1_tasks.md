@@ -239,7 +239,7 @@ go/nodes/wf/wf-generic/
 - [x] Terminal state → cancel all timers, set terminated_at, set status
 
 ### WF-INST-4 — Soft abort
-- [ ] On `WF_CANCEL_INSTANCE` (in dispatch.go):
+- [x] On `WF_CANCEL_INSTANCE` (in dispatch.go):
   - Acquire instance mutex
   - If already terminal: respond with `INSTANCE_ALREADY_TERMINATED`
   - If already cancelling: respond with `INSTANCE_CANCELLING`
@@ -433,7 +433,7 @@ go/nodes/wf/wf-generic/
 
 ### WF-BUILD-2 — Orchestrator awareness
 - [ ] Verify orchestrator can spawn `WF.*` nodes using `wf-generic` binary + `--config` pointing to the per-node workflow definition
-- [ ] Node family prefix `WF.` recognized in orchestrator config (review `sy_orchestrator_v2_tasks.md` for spawn patterns)
+- [x] Node family prefix `WF.` recognized in orchestrator config (review `sy_orchestrator_v2_tasks.md` for spawn patterns)
 
 ---
 

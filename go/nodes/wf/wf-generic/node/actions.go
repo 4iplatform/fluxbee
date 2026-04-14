@@ -16,6 +16,7 @@ import (
 type Dispatcher interface {
 	SendMsg(msg sdk.Message) error
 	NodeL2Name() string
+	NodeUUID() string
 }
 
 // TimerSender abstracts SY.timer operations (testable without a real SY.timer).
@@ -87,10 +88,7 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 		traceID = event.Routing.TraceID
 	}
 
-	src := ""
-	if actx.Dispatcher != nil {
-		src = actx.Dispatcher.NodeL2Name()
-	}
+	src := actx.Dispatcher.NodeUUID()
 
 	msgNameCopy := msgName
 	threadIDCopy := threadID
@@ -285,6 +283,10 @@ func (d *SDKDispatcher) SendMsg(msg sdk.Message) error {
 
 func (d *SDKDispatcher) NodeL2Name() string {
 	return d.sender.FullName()
+}
+
+func (d *SDKDispatcher) NodeUUID() string {
+	return d.sender.UUID()
 }
 
 // SDKTimerSender wraps *sdk.TimerClient to implement TimerSender.

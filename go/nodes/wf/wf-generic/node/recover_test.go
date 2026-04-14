@@ -152,6 +152,109 @@ func TestRecoverCaseB_PastTimer_SyntheticFireAndCancel(t *testing.T) {
 	}
 }
 
+func TestRecoverCaseB_DoesNotCancelNewTimerWhenSyntheticFireReschedulesSameKey(t *testing.T) {
+	def, err := LoadDefinitionBytes([]byte(workflowJSONWithTimerRefire()), "", fixedClock)
+	if err != nil {
+		t.Fatalf("load def: %v", err)
+	}
+	pastMS := int64(1776099000000)
+	ref := timerClientRef("wfi:b2", "invoice_timeout")
+
+	timer := &mockTimerLister{
+		timerList: []sdk.TimerInfo{timerInfo(ref, pastMS)},
+	}
+	actx := makeRecoverActx(t, timer)
+	reg := NewInstanceRegistry()
+
+	inst := WFInstanceRow{
+		InstanceID: "wfi:b2", WorkflowType: "invoice",
+		Status: "running", CurrentState: "waiting_timeout",
+		InputJSON: `{"customer_id":"c1"}`, StateJSON: `{}`,
+		CreatedAtMS: 1000, UpdatedAtMS: 1000,
+	}
+	_ = actx.Store.CreateInstance(context.Background(), inst)
+	_ = actx.Store.RegisterTimer(context.Background(), "wfi:b2", "invoice_timeout", 1000, pastMS)
+
+	if err := Recover(context.Background(), def, actx.Store, reg, actx, RecoverOptions{OwnerL2Name: "WF.invoice@motherbee"}); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	if len(timer.cancelled) != 0 {
+		t.Fatalf("re-scheduled timer should not be cancelled during recovery, got %v", timer.cancelled)
+	}
+	rows, err := actx.Store.ListTimersForInstance(context.Background(), "wfi:b2")
+	if err != nil {
+		t.Fatalf("ListTimersForInstance: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected re-scheduled timer row to remain, got %d", len(rows))
+	}
+	if rows[0].FireAtMS == pastMS {
+		t.Fatalf("expected timer row to be updated after re-schedule")
+	}
+}
+
+func workflowJSONWithTimerRefire() string {
+	return `{
+  "wf_schema_version": "1",
+  "workflow_type": "invoice",
+  "description": "re-schedules timeout on timer fire",
+  "input_schema": {
+    "type": "object",
+    "required": ["customer_id"],
+    "properties": {
+      "customer_id": { "type": "string" }
+    }
+  },
+  "initial_state": "waiting_timeout",
+  "terminal_states": ["completed", "failed", "cancelled"],
+  "states": [
+    {
+      "name": "waiting_timeout",
+      "description": "waits",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": [
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "true",
+          "target_state": "waiting_timeout",
+          "actions": [
+            {
+              "type": "schedule_timer",
+              "timer_key": "invoice_timeout",
+              "fire_in": "5m",
+              "missed_policy": "fire"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "completed",
+      "description": "done",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": []
+    },
+    {
+      "name": "failed",
+      "description": "failed",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": []
+    },
+    {
+      "name": "cancelled",
+      "description": "cancelled",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": []
+    }
+  ]
+}`
+}
+
 func TestRecoverCaseC_MissingInSYTimer_DeletesLocalRow(t *testing.T) {
 	def, _ := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
 	timer := &mockTimerLister{timerList: []sdk.TimerInfo{}} // SY.timer has nothing
