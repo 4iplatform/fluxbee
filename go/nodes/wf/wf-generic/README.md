@@ -65,53 +65,72 @@ cargo run --example wf_client -- cancel WF.invoice@motherbee <instance_id>
 
 ## Runbook managed por orchestrator
 
-1. Instalar el binario base:
+El modelo correcto de plataforma es:
+
+- `wf.engine` como runtime base
+- `wf.invoice` como package `workflow` con `runtime_base = wf.engine`
+- `WF.invoice@motherbee` como instancia managed creada por `SY.admin` / `SY.orchestrator`
+
+`wf-generic` soporta ambos caminos:
+
+- config explícita con `workflow_definition_path` para smoke/local dev
+- package-native usando `_system.package_path/flow/definition.json` cuando corre como workflow package
+
+Para v1, la config de `WF.*` es boot-time only. No hay `CONFIG_SET/CONFIG_CHANGED` live.
+
+### 1. Publicar el runtime base `wf.engine`
+
+Instalar el binario base:
 
 ```bash
 cd ~/fluxbee
 bash scripts/install.sh
 ```
 
-2. Publicar el runtime base `wf.engine` en dist:
+Publicar el runtime base `wf.engine` en dist:
 
 ```bash
 cd ~/fluxbee
 bash scripts/publish-wf-runtime.sh --version 0.1.0 --set-current --sudo
 ```
 
-3. Materializar la definición del workflow en el instance dir:
+### 2. Publicar el package workflow `wf.invoice`
 
 ```bash
-sudo mkdir -p /var/lib/fluxbee/nodes/WF/WF.invoice@motherbee
-sudo cp /home/administrator/fluxbee/go/nodes/wf/examples/wf.invoice.json \
-  /var/lib/fluxbee/nodes/WF/WF.invoice@motherbee/wf.invoice.json
+cd ~/fluxbee
+bash scripts/publish-wf-invoice-package.sh --version 0.1.0 --deploy motherbee
 ```
 
-4. Spawn managed vía `SY.admin`/`SY.orchestrator`:
+### 3. Spawn managed vía `SY.admin`/`SY.orchestrator`
 
 ```bash
 curl -sS -X POST "http://127.0.0.1:8080/hives/motherbee/nodes" \
   -H "Content-Type: application/json" \
   -d '{
     "node_name": "WF.invoice@motherbee",
-    "runtime": "wf.engine",
+    "runtime": "wf.invoice",
     "runtime_version": "current",
+    "tenant_id": "tnt:REEMPLAZAR",
     "config": {
-      "workflow_definition_path": "/var/lib/fluxbee/nodes/WF/WF.invoice@motherbee/wf.invoice.json",
-      "db_path": "/var/lib/fluxbee/nodes/WF/WF.invoice@motherbee/wf_instances.db",
-      "sy_timer_l2_name": "SY.timer@motherbee"
+      "tenant_id": "tnt:REEMPLAZAR"
     }
   }' | jq
 ```
 
-5. Verificar estado:
+Notas:
+
+- `workflow_definition_path` ya no hace falta; el runtime la resuelve desde `_system.package_path/flow/definition.json`
+- `db_path` por default queda en el instance dir: `wf_instances.db`
+- `sy_timer_l2_name` por default se deriva como `SY.timer@<hive>`
+
+### 4. Verificar estado
 
 ```bash
 curl -sS "http://127.0.0.1:8080/hives/motherbee/nodes/WF.invoice@motherbee/status" | jq
 curl -sS "http://127.0.0.1:8080/hives/motherbee/nodes/WF.invoice@motherbee/config" | jq
 ```
 
-6. Probar flujo con el cliente de ejemplo:
+### 5. Probar flujo con el cliente de ejemplo
 
 ```bash
 cd ~/fluxbee

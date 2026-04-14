@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -16,12 +17,12 @@ import (
 
 // Config is the runtime configuration for a wf-generic node instance.
 type Config struct {
-	WorkflowDefinitionPath string `json:"workflow_definition_path"`
-	DBPath                 string `json:"db_path"`
-	SYTimerL2Name          string `json:"sy_timer_l2_name"`
-	TenantID               string `json:"tenant_id,omitempty"`
-	GCRetentionDays        int    `json:"gc_retention_days"`
-	GCIntervalSeconds      int    `json:"gc_interval_seconds"`
+	WorkflowDefinitionPath string               `json:"workflow_definition_path"`
+	DBPath                 string               `json:"db_path"`
+	SYTimerL2Name          string               `json:"sy_timer_l2_name"`
+	TenantID               string               `json:"tenant_id,omitempty"`
+	GCRetentionDays        int                  `json:"gc_retention_days"`
+	GCIntervalSeconds      int                  `json:"gc_interval_seconds"`
 	System                 *ManagedSystemConfig `json:"_system,omitempty"`
 }
 
@@ -52,19 +53,13 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config %q: %w", path, err)
 	}
 	var cfg Config
-	dec := json.NewDecoder(bytesReader(payload))
+	dec := json.NewDecoder(bytes.NewReader(payload))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse config %q: %w", path, err)
 	}
-	if cfg.WorkflowDefinitionPath == "" {
-		return nil, fmt.Errorf("config: workflow_definition_path is required")
-	}
-	if cfg.DBPath == "" {
-		return nil, fmt.Errorf("config: db_path is required")
-	}
-	if cfg.SYTimerL2Name == "" {
-		return nil, fmt.Errorf("config: sy_timer_l2_name is required")
+	if err := finalizeConfig(&cfg, path); err != nil {
+		return nil, err
 	}
 	if cfg.GCRetentionDays <= 0 {
 		cfg.GCRetentionDays = 7
@@ -73,6 +68,50 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.GCIntervalSeconds = 3600
 	}
 	return &cfg, nil
+}
+
+func finalizeConfig(cfg *Config, configPath string) error {
+	if cfg == nil {
+		return fmt.Errorf("config must be non-nil")
+	}
+
+	cfg.WorkflowDefinitionPath = strings.TrimSpace(cfg.WorkflowDefinitionPath)
+	cfg.DBPath = strings.TrimSpace(cfg.DBPath)
+	cfg.SYTimerL2Name = strings.TrimSpace(cfg.SYTimerL2Name)
+	cfg.TenantID = strings.TrimSpace(cfg.TenantID)
+	if cfg.System != nil {
+		cfg.System.NodeName = strings.TrimSpace(cfg.System.NodeName)
+		cfg.System.HiveID = strings.TrimSpace(cfg.System.HiveID)
+		cfg.System.PackagePath = strings.TrimSpace(cfg.System.PackagePath)
+		cfg.System.TenantID = strings.TrimSpace(cfg.System.TenantID)
+		if cfg.TenantID == "" {
+			cfg.TenantID = cfg.System.TenantID
+		}
+	}
+
+	if cfg.WorkflowDefinitionPath == "" {
+		if pkgPath := managedPackagePath(cfg); pkgPath != "" {
+			cfg.WorkflowDefinitionPath = filepath.Join(pkgPath, "flow", "definition.json")
+		}
+	}
+	if cfg.DBPath == "" && configPath != "" {
+		cfg.DBPath = filepath.Join(filepath.Dir(configPath), "wf_instances.db")
+	}
+	if cfg.SYTimerL2Name == "" {
+		if hiveID := managedHiveID(cfg); hiveID != "" {
+			cfg.SYTimerL2Name = "SY.timer@" + hiveID
+		}
+	}
+	if cfg.WorkflowDefinitionPath == "" {
+		return fmt.Errorf("config: workflow_definition_path is required")
+	}
+	if cfg.DBPath == "" {
+		return fmt.Errorf("config: db_path is required")
+	}
+	if cfg.SYTimerL2Name == "" {
+		return fmt.Errorf("config: sy_timer_l2_name is required")
+	}
+	return nil
 }
 
 func extractConfigPayload(data []byte) ([]byte, error) {
@@ -123,11 +162,7 @@ func extractConfigPayload(data []byte) ([]byte, error) {
 }
 
 func ResolveManagedNodeName(cfg *Config) (string, error) {
-	if cfg != nil && cfg.System != nil && strings.TrimSpace(cfg.System.NodeName) != "" {
-		return strings.TrimSpace(cfg.System.NodeName), nil
-	}
-	value := strings.TrimSpace(os.Getenv("FLUXBEE_NODE_NAME"))
-	if value != "" {
+	if value := managedNodeName(cfg); value != "" {
 		return value, nil
 	}
 	return "", fmt.Errorf("managed node name unavailable: set _system.node_name in config or FLUXBEE_NODE_NAME in environment")
@@ -154,6 +189,35 @@ func managedNodeKind(nodeName string) string {
 		base = base[:dot]
 	}
 	return strings.TrimSpace(base)
+}
+
+func managedNodeName(cfg *Config) string {
+	if cfg != nil && cfg.System != nil && cfg.System.NodeName != "" {
+		return cfg.System.NodeName
+	}
+	return strings.TrimSpace(os.Getenv("FLUXBEE_NODE_NAME"))
+}
+
+func managedHiveID(cfg *Config) string {
+	if cfg != nil && cfg.System != nil && cfg.System.HiveID != "" {
+		return cfg.System.HiveID
+	}
+	nodeName := managedNodeName(cfg)
+	if nodeName == "" {
+		return ""
+	}
+	_, hiveID, ok := strings.Cut(nodeName, "@")
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(hiveID)
+}
+
+func managedPackagePath(cfg *Config) string {
+	if cfg == nil || cfg.System == nil {
+		return ""
+	}
+	return cfg.System.PackagePath
 }
 
 // RunOptions is the full set of options for node.Run().
@@ -233,13 +297,10 @@ func Run(ctx context.Context, opts RunOptions) error {
 		nodeUUID = sender.UUID()
 		dispatcher = NewSDKDispatcher(sender)
 
-		timerClient, err := sdk.NewTimerClient(sender, receiver, sdk.TimerClientConfig{
-			TimerNode: cfg.SYTimerL2Name,
-		})
+		timerSender, err = NewSDKTimerSender(sender, receiver, cfg.SYTimerL2Name)
 		if err != nil {
-			return fmt.Errorf("create timer client: %w", err)
+			return fmt.Errorf("create timer sender: %w", err)
 		}
-		timerSender = NewSDKTimerSender(timerClient)
 
 		// Recovery
 		reg := NewInstanceRegistry()
@@ -289,23 +350,4 @@ func Run(ctx context.Context, opts RunOptions) error {
 	// No SDK config — just validate definition and return (useful for tests / dry-run)
 	log.Printf("wf: no SDK config, exiting after definition load")
 	return nil
-}
-
-// bytesReader is a thin wrapper to avoid importing bytes in this file.
-func bytesReader(data []byte) interface{ Read([]byte) (int, error) } {
-	return &byteReader{data: data}
-}
-
-type byteReader struct {
-	data []byte
-	pos  int
-}
-
-func (r *byteReader) Read(p []byte) (int, error) {
-	if r.pos >= len(r.data) {
-		return 0, fmt.Errorf("EOF")
-	}
-	n := copy(p, r.data[r.pos:])
-	r.pos += n
-	return n, nil
 }

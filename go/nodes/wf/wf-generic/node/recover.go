@@ -139,7 +139,7 @@ func Recover(ctx context.Context, def *WorkflowDefinition, store *Store, reg *In
 				continue
 			}
 			// Cancel in SY.timer to prevent double-firing of the old pending timer.
-			if err := actx.Timer.CancelByClientRef(ctx, ref); err != nil {
+			if err := actx.Timer.CancelByClientRefConfirmed(ctx, ref); err != nil {
 				log.Printf("recover: cancel past timer %s: %v", ref, err)
 			}
 			_ = store.DeleteTimer(ctx, row.InstanceID, row.TimerKey)
@@ -162,7 +162,7 @@ func Recover(ctx context.Context, def *WorkflowDefinition, store *Store, reg *In
 			continue
 		}
 		log.Printf("recover: orphaned timer %s (instance %s), cancelling in SY.timer", ref, instanceID)
-		if err := actx.Timer.CancelByClientRef(ctx, ref); err != nil {
+		if err := actx.Timer.CancelByClientRefConfirmed(ctx, ref); err != nil {
 			log.Printf("recover: cancel orphan %s: %v", ref, err)
 		}
 		_ = t.UUID // suppress unused warning

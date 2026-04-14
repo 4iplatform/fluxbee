@@ -24,6 +24,7 @@ type TimerSender interface {
 	ScheduleIn(ctx context.Context, d time.Duration, opts sdk.ScheduleOptions) (sdk.TimerID, error)
 	Schedule(ctx context.Context, fireAt time.Time, opts sdk.ScheduleOptions) (sdk.TimerID, error)
 	CancelByClientRef(ctx context.Context, clientRef string) error
+	CancelByClientRefConfirmed(ctx context.Context, clientRef string) error
 	RescheduleByClientRef(ctx context.Context, clientRef string, newFireAt time.Time) error
 	List(ctx context.Context, filter sdk.ListFilter) ([]sdk.TimerInfo, error)
 }
@@ -291,31 +292,162 @@ func (d *SDKDispatcher) NodeUUID() string {
 
 // SDKTimerSender wraps *sdk.TimerClient to implement TimerSender.
 type SDKTimerSender struct {
-	client *sdk.TimerClient
+	sender     *sdk.NodeSender
+	timerNode  string
+	syncClient *sdk.TimerClient
 }
 
-func NewSDKTimerSender(client *sdk.TimerClient) *SDKTimerSender {
-	return &SDKTimerSender{client: client}
+func NewSDKTimerSender(sender *sdk.NodeSender, receiver *sdk.NodeReceiver, timerNode string) (*SDKTimerSender, error) {
+	timerNode = strings.TrimSpace(timerNode)
+	if timerNode == "" {
+		_, hiveID, ok := strings.Cut(strings.TrimSpace(sender.FullName()), "@")
+		if !ok || strings.TrimSpace(hiveID) == "" {
+			return nil, fmt.Errorf("cannot derive local timer node name from sender %q", sender.FullName())
+		}
+		timerNode = "SY.timer@" + strings.TrimSpace(hiveID)
+	}
+	client, err := sdk.NewTimerClient(sender, receiver, sdk.TimerClientConfig{
+		TimerNode: timerNode,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &SDKTimerSender{
+		sender:     sender,
+		timerNode:  timerNode,
+		syncClient: client,
+	}, nil
 }
 
 func (t *SDKTimerSender) ScheduleIn(ctx context.Context, d time.Duration, opts sdk.ScheduleOptions) (sdk.TimerID, error) {
-	return t.client.ScheduleIn(ctx, d, opts)
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if d < sdk.MinTimerDuration {
+		return "", fmt.Errorf("minimum timer duration is %d seconds", int(sdk.MinTimerDuration.Seconds()))
+	}
+	payload := map[string]any{
+		"fire_in_ms": d.Milliseconds(),
+	}
+	if err := applyScheduleOptions(payload, opts); err != nil {
+		return "", err
+	}
+	return "", t.sendTimerRequest("TIMER_SCHEDULE", payload)
 }
 
 func (t *SDKTimerSender) Schedule(ctx context.Context, fireAt time.Time, opts sdk.ScheduleOptions) (sdk.TimerID, error) {
-	return t.client.Schedule(ctx, fireAt, opts)
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if fireAt.IsZero() {
+		return "", fmt.Errorf("fire_at must be non-zero")
+	}
+	if time.Until(fireAt) < sdk.MinTimerDuration {
+		return "", fmt.Errorf("minimum timer duration is %d seconds", int(sdk.MinTimerDuration.Seconds()))
+	}
+	payload := map[string]any{
+		"fire_at_utc_ms": fireAt.UTC().UnixMilli(),
+	}
+	if err := applyScheduleOptions(payload, opts); err != nil {
+		return "", err
+	}
+	return "", t.sendTimerRequest("TIMER_SCHEDULE", payload)
 }
 
 func (t *SDKTimerSender) CancelByClientRef(ctx context.Context, clientRef string) error {
-	return t.client.CancelByClientRef(ctx, clientRef)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	clientRef = strings.TrimSpace(clientRef)
+	if clientRef == "" {
+		return fmt.Errorf("client_ref must be non-empty")
+	}
+	return t.sendTimerRequest("TIMER_CANCEL", map[string]any{"client_ref": clientRef})
+}
+
+func (t *SDKTimerSender) CancelByClientRefConfirmed(ctx context.Context, clientRef string) error {
+	return t.syncClient.CancelByClientRef(ctx, clientRef)
 }
 
 func (t *SDKTimerSender) RescheduleByClientRef(ctx context.Context, clientRef string, newFireAt time.Time) error {
-	return t.client.RescheduleByClientRef(ctx, clientRef, newFireAt)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	clientRef = strings.TrimSpace(clientRef)
+	if clientRef == "" {
+		return fmt.Errorf("client_ref must be non-empty")
+	}
+	if newFireAt.IsZero() {
+		return fmt.Errorf("new_fire_at must be non-zero")
+	}
+	return t.sendTimerRequest("TIMER_RESCHEDULE", map[string]any{
+		"client_ref":         clientRef,
+		"new_fire_at_utc_ms": newFireAt.UTC().UnixMilli(),
+	})
 }
 
 func (t *SDKTimerSender) List(ctx context.Context, filter sdk.ListFilter) ([]sdk.TimerInfo, error) {
-	return t.client.List(ctx, filter)
+	return t.syncClient.List(ctx, filter)
+}
+
+func (t *SDKTimerSender) sendTimerRequest(verb string, payload map[string]any) error {
+	msg, err := sdk.BuildSystemRequest(
+		t.sender.UUID(),
+		t.timerNode,
+		verb,
+		payload,
+		uuid.NewString(),
+		sdk.SystemEnvelopeOptions{},
+	)
+	if err != nil {
+		return err
+	}
+	return t.sender.Send(msg)
+}
+
+func applyScheduleOptions(payload map[string]any, opts sdk.ScheduleOptions) error {
+	if err := validateTimerMissedPolicy(opts.MissedPolicy, opts.MissedWithinMS); err != nil {
+		return err
+	}
+	if target := strings.TrimSpace(opts.TargetL2Name); target != "" {
+		payload["target_l2_name"] = target
+	}
+	if clientRef := strings.TrimSpace(opts.ClientRef); clientRef != "" {
+		payload["client_ref"] = clientRef
+	}
+	if opts.Payload != nil {
+		payload["payload"] = opts.Payload
+	}
+	if opts.Metadata != nil {
+		payload["metadata"] = opts.Metadata
+	}
+	if opts.MissedPolicy != "" {
+		payload["missed_policy"] = string(opts.MissedPolicy)
+	}
+	if opts.MissedWithinMS != nil {
+		payload["missed_within_ms"] = *opts.MissedWithinMS
+	}
+	return nil
+}
+
+func validateTimerMissedPolicy(policy sdk.MissedPolicy, withinMS *int64) error {
+	switch policy {
+	case "":
+		if withinMS != nil {
+			return fmt.Errorf("missed_within_ms requires missed_policy=fire_if_within")
+		}
+	case sdk.MissedPolicyFire, sdk.MissedPolicyDrop:
+		if withinMS != nil {
+			return fmt.Errorf("missed_within_ms is only valid when missed_policy=fire_if_within")
+		}
+	case sdk.MissedPolicyFireIfWithin:
+		if withinMS == nil || *withinMS <= 0 {
+			return fmt.Errorf("missed_within_ms must be set when missed_policy=fire_if_within")
+		}
+	default:
+		return fmt.Errorf("invalid missed_policy: %s", policy)
+	}
+	return nil
 }
 
 // compileValueExpr is a thin alias used in set_variable; reuses compileGuard

@@ -432,9 +432,14 @@ go/nodes/wf/wf-generic/
 - [x] Install to `$STATE_DIR/dist/core/bin/wf-generic`
 
 ### WF-BUILD-2 — Orchestrator awareness
-- [ ] Verify orchestrator can spawn `WF.*` nodes using `wf-generic` binary + `--config` pointing to the per-node workflow definition
+- [x] `wf-generic` accepts the managed `config.json` written by orchestrator (`config_version`, `_system.*`, wrapped/top-level fields)
+- [x] `wf-generic` derives `workflow_definition_path` from `_system.package_path/flow/definition.json` when running as a workflow package
+- [x] `wf-generic` derives sane managed defaults for `db_path` and `sy_timer_l2_name`
+- [x] `WF` timer actions are fire-and-forget in the runtime hot path; confirmed calls remain only in recovery
+- [ ] Verify orchestrator can spawn `WF.*` nodes from a canonical workflow package (`runtime = wf.invoice`, `runtime_base = wf.engine`)
 - [x] Node family prefix `WF.` recognized in orchestrator config (review `sy_orchestrator_v2_tasks.md` for spawn patterns)
 - [x] Added `scripts/publish-wf-runtime.sh` to publish the WF base runtime as `wf.engine`
+- [x] Added `scripts/publish-wf-invoice-package.sh` and package fixture `go/nodes/wf/examples/packages/wf.invoice/`
 
 ---
 
@@ -514,6 +519,8 @@ The following points were raised during planning and resolved before implementat
 
 3. **Action type registry.** Maintain a single map of `action_type → handler` in `actions.go`. Both `WF-DEF-2` (load-time validation) and `WF-INST-3` (execution) use the same registry. Adding a new action type means one place to edit.
 
-4. **The WF runtime never blocks waiting for a SY.timer response.** Always fire-and-forget. The use of `client_ref` makes this safe.
+4. **The WF runtime never blocks waiting for a SY.timer response in the hot path.** `schedule_timer`, `cancel_timer`, and `reschedule_timer` are fire-and-forget and use `client_ref` as the canonical handle. Recovery is the only place that still does confirmed timer calls.
 
 5. **`meta.trace_id` is the idempotency key for outbound actions.** When re-executing a transition after a crash, re-use the same trace_id from the original event. The WF runtime needs to persist the trace_id of the currently-processing event so it can re-use it on recovery.
+
+6. **WF v1 is boot-time config only.** No live `CONFIG_GET` / `CONFIG_SET` / `CONFIG_CHANGED` support is required for the first cut. Config changes apply by restart / respawn.

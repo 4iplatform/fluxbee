@@ -35,11 +35,11 @@ func (m *mockDispatcher) NodeUUID() string {
 }
 
 type mockTimerSender struct {
-	scheduled    []string // clientRefs scheduled
-	cancelled    []string // clientRefs cancelled
-	rescheduled  []string // clientRefs rescheduled
-	scheduleErr  error
-	cancelErr    error
+	scheduled   []string // clientRefs scheduled
+	cancelled   []string // clientRefs cancelled
+	rescheduled []string // clientRefs rescheduled
+	scheduleErr error
+	cancelErr   error
 }
 
 func (m *mockTimerSender) ScheduleIn(_ context.Context, d time.Duration, opts sdk.ScheduleOptions) (sdk.TimerID, error) {
@@ -51,6 +51,10 @@ func (m *mockTimerSender) Schedule(_ context.Context, _ time.Time, opts sdk.Sche
 	return sdk.TimerID("mock-uuid"), m.scheduleErr
 }
 func (m *mockTimerSender) CancelByClientRef(_ context.Context, ref string) error {
+	m.cancelled = append(m.cancelled, ref)
+	return m.cancelErr
+}
+func (m *mockTimerSender) CancelByClientRefConfirmed(_ context.Context, ref string) error {
 	m.cancelled = append(m.cancelled, ref)
 	return m.cancelErr
 }

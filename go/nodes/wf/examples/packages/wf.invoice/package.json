@@ -1,0 +1,8 @@
+{
+  "name": "wf.invoice",
+  "version": "0.1.0",
+  "type": "workflow",
+  "description": "Canonical WF.invoice workflow package",
+  "runtime_base": "wf.engine",
+  "config_template": "config/default-config.json"
+}
