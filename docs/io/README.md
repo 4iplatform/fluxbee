@@ -6,8 +6,16 @@ This folder contains IO-related specifications imported from `D:\repos\slack-nod
 
 - `nodos_io_spec.md`
 - `io-common.md`
+- `io-api-node-spec.md`
+- `io-api-http-contract-examples.md`
 - `io-slack.md`
 - `io-slack-tasks.md`
+
+## Current adapters covered here
+
+- `IO.slack`
+- `IO.api`
+- shared `io-common`
 
 ## Adaptation note (important)
 

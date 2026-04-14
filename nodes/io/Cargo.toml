@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "common",
+  "io-api",
   "io-sim",
   "io-slack",
 ]
@@ -13,6 +14,7 @@ license = "UNLICENSED"
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
+axum = { version = "0.7", features = ["multipart"] }
 fluxbee-sdk = { path = "../../crates/fluxbee_sdk" }
 futures-util = "0.3"
 regex = "1"

@@ -117,59 +117,74 @@ impl FluxbeeIdentityProvisioner {
         target: &str,
         input: &ResolveOrCreateInput,
     ) -> Result<String, IdentityError> {
-        let normalized_channel = normalize_identity_field(&input.channel, true);
-        let normalized_address = normalize_identity_field(&input.external_id, true);
-        let trace_id = Uuid::new_v4().to_string();
-        let req = WireMessage {
-            routing: Routing {
-                src: self.sender.uuid().to_string(),
-                dst: Destination::Unicast(target.to_string()),
-                ttl: 16,
-                trace_id: trace_id.clone(),
-            },
-            meta: Meta {
-                msg_type: SYSTEM_KIND.to_string(),
-                msg: Some(MSG_ILK_PROVISION.to_string()),
-                src_ilk: None,
-                scope: None,
-                target: None,
-                action: None,
-                priority: None,
-                context: None,
-                ..Meta::default()
-            },
-            payload: serde_json::json!({
-                "ich_id": stable_ich_id(&normalized_channel, &normalized_address),
-                "channel_type": normalized_channel,
-                "address": normalized_address,
-            }),
-        };
-        self.sender
-            .send(req)
-            .await
-            .map_err(|_| IdentityError::Unavailable)?;
-        tracing::debug!(
-            trace_id = %trace_id,
-            target = %target,
-            channel = %normalized_channel,
-            address = %normalized_address,
-            "identity provision request sent"
-        );
-
-        let msg = {
-            let mut inbox = self.inbox.lock().await;
-            inbox
-                .recv_for_trace_id(&trace_id, self.config.timeout)
-                .await?
-        };
-        tracing::debug!(
-            trace_id = %trace_id,
-            target = %target,
-            response_msg = %msg.meta.msg.as_deref().unwrap_or(""),
-            "identity provision response matched"
-        );
-        parse_provision_response(msg)
+        strict_provision_ilk(
+            &self.sender,
+            self.inbox.clone(),
+            &self.config,
+            target,
+            input,
+        )
+        .await
     }
+}
+
+pub async fn strict_provision_ilk(
+    sender: &NodeSender,
+    inbox: Arc<Mutex<RouterInbox>>,
+    config: &IdentityProvisionConfig,
+    target: &str,
+    input: &ResolveOrCreateInput,
+) -> Result<String, IdentityError> {
+    let normalized_channel = normalize_identity_field(&input.channel, true);
+    let normalized_address = normalize_identity_field(&input.external_id, true);
+    let trace_id = Uuid::new_v4().to_string();
+    let req = WireMessage {
+        routing: Routing {
+            src: sender.uuid().to_string(),
+            dst: Destination::Unicast(target.to_string()),
+            ttl: 16,
+            trace_id: trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(MSG_ILK_PROVISION.to_string()),
+            src_ilk: None,
+            scope: None,
+            target: None,
+            action: None,
+            priority: None,
+            context: None,
+            ..Meta::default()
+        },
+        payload: serde_json::json!({
+            "ich_id": stable_ich_id(&normalized_channel, &normalized_address),
+            "channel_type": normalized_channel,
+            "address": normalized_address,
+        }),
+    };
+    sender
+        .send(req)
+        .await
+        .map_err(|_| IdentityError::Unavailable)?;
+    tracing::debug!(
+        trace_id = %trace_id,
+        target = %target,
+        channel = %normalized_channel,
+        address = %normalized_address,
+        "identity provision request sent"
+    );
+
+    let msg = {
+        let mut inbox = inbox.lock().await;
+        inbox.recv_for_trace_id(&trace_id, config.timeout).await?
+    };
+    tracing::debug!(
+        trace_id = %trace_id,
+        target = %target,
+        response_msg = %msg.meta.msg.as_deref().unwrap_or(""),
+        "identity provision response matched"
+    );
+    parse_provision_response(msg)
 }
 
 #[async_trait]

@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
+use fluxbee_sdk::{compute_thread_id, ThreadIdInput};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use fluxbee_sdk::{compute_thread_id, ThreadIdInput};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IoContext {
@@ -187,7 +187,10 @@ mod tests {
             conversation_id: "C789",
         })
         .expect("thread id");
-        assert_eq!(io.conversation.thread_id.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            io.conversation.thread_id.as_deref(),
+            Some(expected.as_str())
+        );
         assert_eq!(
             io.reply_target
                 .params
@@ -207,6 +210,9 @@ mod tests {
             native_thread_id: "171234.567",
         })
         .expect("thread id");
-        assert_eq!(io.conversation.thread_id.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            io.conversation.thread_id.as_deref(),
+            Some(expected.as_str())
+        );
     }
 }

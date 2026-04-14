@@ -535,7 +535,10 @@ mod tests {
         let mut config = base_config();
         config.sim_thread_id = Some("thread:manual".to_string());
 
-        assert_eq!(resolve_sim_thread_id(&config).as_deref(), Some("thread:manual"));
+        assert_eq!(
+            resolve_sim_thread_id(&config).as_deref(),
+            Some("thread:manual")
+        );
     }
 
     #[test]
@@ -549,6 +552,9 @@ mod tests {
         })
         .expect("thread id");
 
-        assert_eq!(resolve_sim_thread_id(&config).as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            resolve_sim_thread_id(&config).as_deref(),
+            Some(expected.as_str())
+        );
     }
 }

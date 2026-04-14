@@ -19,6 +19,10 @@ impl IoAdapterConfigContract for IoSlackAdapterConfigContract {
     fn optional_fields(&self) -> &'static [&'static str] {
         &[
             "config.io.dst_node",
+            "config.io.relay.window_ms",
+            "config.io.relay.max_open_sessions",
+            "config.io.relay.max_fragments_per_session",
+            "config.io.relay.max_bytes_per_session",
             "config.identity.target",
             "config.identity.timeout_ms",
             "config.io.blob.*",
@@ -80,6 +84,25 @@ impl IoAdapterConfigContract for IoSlackAdapterConfigContract {
             io_obj
                 .entry("dst_node".to_string())
                 .or_insert(Value::String("resolve".to_string()));
+            ensure_optional_object_member(io_obj, "relay", "io.relay")?;
+            if let Some(relay) = io_obj.get("relay").and_then(Value::as_object) {
+                validate_optional_non_negative_integer(relay, "window_ms", "io.relay.window_ms")?;
+                validate_optional_positive_integer(
+                    relay,
+                    "max_open_sessions",
+                    "io.relay.max_open_sessions",
+                )?;
+                validate_optional_positive_integer(
+                    relay,
+                    "max_fragments_per_session",
+                    "io.relay.max_fragments_per_session",
+                )?;
+                validate_optional_positive_integer(
+                    relay,
+                    "max_bytes_per_session",
+                    "io.relay.max_bytes_per_session",
+                )?;
+            }
         }
 
         Ok(Value::Object(cfg))
@@ -162,6 +185,58 @@ fn has_non_empty_string(map: &Map<String, Value>, key: &str) -> bool {
         .map(str::trim)
         .map(|v| !v.is_empty())
         .unwrap_or(false)
+}
+
+fn ensure_optional_object_member(
+    root: &Map<String, Value>,
+    field: &str,
+    label: &str,
+) -> Result<(), IoAdapterConfigError> {
+    if !root.contains_key(field) {
+        return Ok(());
+    }
+    if root.get(field).and_then(Value::as_object).is_none() {
+        return Err(IoAdapterConfigError::InvalidConfig(format!(
+            "{label} must be an object when present"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_optional_non_negative_integer(
+    root: &Map<String, Value>,
+    field: &str,
+    label: &str,
+) -> Result<(), IoAdapterConfigError> {
+    if !root.contains_key(field) {
+        return Ok(());
+    }
+    if !matches!(root.get(field), Some(Value::Number(number)) if number.as_u64().is_some()) {
+        return Err(IoAdapterConfigError::InvalidConfig(format!(
+            "{label} must be a non-negative integer"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_optional_positive_integer(
+    root: &Map<String, Value>,
+    field: &str,
+    label: &str,
+) -> Result<(), IoAdapterConfigError> {
+    if !root.contains_key(field) {
+        return Ok(());
+    }
+    let is_positive = root
+        .get(field)
+        .and_then(Value::as_u64)
+        .is_some_and(|value| value > 0);
+    if !is_positive {
+        return Err(IoAdapterConfigError::InvalidConfig(format!(
+            "{label} must be a positive integer"
+        )));
+    }
+    Ok(())
 }
 
 fn redact_secret_field(map: &mut Map<String, Value>, key: &str) {
@@ -264,5 +339,59 @@ mod tests {
         assert_eq!(descriptors.len(), 2);
         assert!(descriptors[0].configured);
         assert!(descriptors[1].configured);
+    }
+
+    #[test]
+    fn validate_materialize_accepts_relay_config_surface() {
+        let contract = IoSlackAdapterConfigContract;
+        let out = contract
+            .validate_and_materialize(&json!({
+                "slack": {
+                    "app_token_ref": "env:SLACK_APP_TOKEN",
+                    "bot_token_ref": "env:SLACK_BOT_TOKEN"
+                },
+                "io": {
+                    "relay": {
+                        "window_ms": 2500,
+                        "max_open_sessions": 2000,
+                        "max_fragments_per_session": 6,
+                        "max_bytes_per_session": 131072
+                    }
+                }
+            }))
+            .expect("must accept relay config");
+        assert_eq!(
+            out.get("io")
+                .and_then(Value::as_object)
+                .and_then(|io| io.get("relay"))
+                .and_then(Value::as_object)
+                .and_then(|relay| relay.get("window_ms"))
+                .and_then(Value::as_u64),
+            Some(2500)
+        );
+    }
+
+    #[test]
+    fn validate_materialize_rejects_invalid_relay_limits() {
+        let contract = IoSlackAdapterConfigContract;
+        let err = contract
+            .validate_and_materialize(&json!({
+                "slack": {
+                    "app_token_ref": "env:SLACK_APP_TOKEN",
+                    "bot_token_ref": "env:SLACK_BOT_TOKEN"
+                },
+                "io": {
+                    "relay": {
+                        "max_open_sessions": 0
+                    }
+                }
+            }))
+            .expect_err("must reject zero max_open_sessions");
+        assert_eq!(
+            err,
+            IoAdapterConfigError::InvalidConfig(
+                "io.relay.max_open_sessions must be a positive integer".to_string()
+            )
+        );
     }
 }

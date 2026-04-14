@@ -131,6 +131,7 @@ async fn run_loop(sender: &NodeSender, receiver: &mut NodeReceiver) -> Result<()
                         "probe_step": probe_step,
                         "handled_by": sender.full_name(),
                     })),
+                    ..Meta::default()
                 },
                 payload: json!({
                     "status": "ok",

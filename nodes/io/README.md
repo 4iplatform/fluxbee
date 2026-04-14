@@ -4,7 +4,8 @@ This subtree hosts IO crates isolated from core routing/AI crates.
 
 ## Crates
 
-- `crates/io-common`: shared IO helpers (dedup, identity lookup, io context).
+- `crates/io-common`: shared IO helpers (dedup, identity lookup, io context, inbound relay/sessionization).
+- `crates/io-api`: generic HTTP ingress IO node (`GET /`, `POST /`, auth bearer, relay, attachments/blob; legacy aliases: `GET /schema`, `POST /messages`).
 - `crates/io-sim`: simulation IO node for local/Linux E2E tests (stdin/--once inbound, log-only outbound).
 - `crates/io-slack`: Slack IO node (Socket Mode inbound, Web API outbound).
 
@@ -26,6 +27,18 @@ This installs `/usr/bin/io-slack`, `/usr/bin/io-sim` and systemd units:
 - `fluxbee-io-slack.service`
 - `fluxbee-io-sim.service`
 
+`IO.api` has its own local install helper:
+
+```bash
+bash scripts/install-io-api.sh --node-name IO.api.local@motherbee
+```
+
+This installs:
+- `/usr/bin/io-api`
+- `/etc/fluxbee/io-api.env`
+- managed bootstrap config under `/var/lib/fluxbee/nodes/IO/<node_name>/config.json`
+- `fluxbee-io-api.service`
+
 ## Publish runtime (orchestrator v2 canonical flow)
 
 For rollout via `SYSTEM_UPDATE` + `SPAWN_NODE`, publish IO runtimes into
@@ -43,6 +56,12 @@ Publish `IO.sim`:
 bash scripts/publish-io-runtime.sh --kind sim --version 0.1.0 --set-current --sudo
 ```
 
+Publish `IO.api`:
+
+```bash
+bash scripts/publish-io-api-runtime.sh --version 0.1.0 --set-current --sudo
+```
+
 Generic publish helper:
 
 ```bash
@@ -58,8 +77,29 @@ Use those values with:
 
 Deploy runbook:
 - `docs/io/io-slack-deploy-runbook.md`
+- `docs/onworking NOE/io-api-runtime-validation-runbook.md`
+
+Deploy helper for `IO.api`:
+
+```bash
+bash scripts/deploy-io-api.sh --base http://127.0.0.1:8080 --hive-id motherbee --version 0.1.0 --node-name IO.api.frontdesk@motherbee --update-existing --sync-hint --sudo
+```
 
 ## Run (linux target expected in production)
+
+### IO.api
+
+Managed runtime note:
+
+- `io-api` expects `FLUXBEE_NODE_NAME` and managed `config.json` under `/var/lib/fluxbee/nodes/IO/<node_name>/config.json`
+- the process can boot with bootstrap config that is empty or minimal and remain non-configured until `CONFIG_SET`
+- canonical runtime/business config stays in `CONFIG_GET` / `CONFIG_SET`
+
+Useful helpers:
+
+- `scripts/publish-io-api-runtime.sh`
+- `scripts/deploy-io-api.sh`
+- `scripts/install-io-api.sh`
 
 Required env vars:
 
@@ -87,9 +127,29 @@ Optional env vars:
 - `DEDUP_TTL_MS` (default `600000`)
 - `DEDUP_MAX_ENTRIES` (default `50000`)
 - `IO_SLACK_DST_NODE` (optional fixed unicast destination, e.g. `AI.chat@sandbox`; if omitted uses `resolve`; keep fixed dst for test/recovery only, not production baseline)
-- `SLACK_SESSION_WINDOW_MS` (default `0` to disable)
-- `SLACK_SESSION_MAX_SESSIONS` (default `10000`)
-- `SLACK_SESSION_MAX_FRAGMENTS` (default `8`)
+
+Relay note:
+
+- relay config now belongs to formal node config under `config.io.relay.*`
+- relevant keys:
+  - `config.io.relay.window_ms`
+  - `config.io.relay.max_open_sessions`
+  - `config.io.relay.max_fragments_per_session`
+  - `config.io.relay.max_bytes_per_session`
+- `config.io.relay.window_ms=0` means relay passthrough
+- `config.io.relay.window_ms>0` means short-window consolidation before the router
+- `IO.slack` no longer owns a private `SlackSessionizer`
+- `SLACK_SESSION_*` remains only as temporary compatibility fallback for unmanaged/local env boot, not as canonical runtime surface for spawned nodes
+
+Logging note:
+
+- canonical runtime publish defaults include `io_common=debug`, so relay event logs should show in `journalctl`
+- local installs via `install-io.sh` only show those debug logs if `/etc/fluxbee/io-slack.env` defines `RUST_LOG`
+
+`IO.api` logging note:
+
+- `publish-io-api-runtime.sh` publishes `start.sh` with default `RUST_LOG=info,io_api=debug,io_common=debug,fluxbee_sdk=info`
+- `install-io-api.sh` writes the same default into `/etc/fluxbee/io-api.env`
 
 Identity behavior is provision-on-miss by default in current IO nodes (no mode flag required).
 

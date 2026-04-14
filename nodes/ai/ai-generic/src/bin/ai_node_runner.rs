@@ -22,7 +22,7 @@ use fluxbee_ai_sdk::{
 };
 use fluxbee_sdk::node_client::NodeError;
 use fluxbee_sdk::protocol::{
-    Destination, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
+    Destination, MemoryPackage, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_secret_record, load_node_secret_record, load_node_secret_record_with_root,
@@ -1047,6 +1047,8 @@ impl AiNode for GenericAiNode {
         } else {
             (extract_text(&msg.payload).unwrap_or_default(), None)
         };
+        let cognition_block = render_memory_package_prompt_block(msg.meta.memory_package.as_ref());
+        let input = inject_memory_package_into_text_input(&input, cognition_block.as_deref());
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
             tracing::info!(
                 node_name = %self.node_name,
@@ -1054,6 +1056,7 @@ impl AiNode for GenericAiNode {
                 src_ilk = ?behavior_ctx.src_ilk,
                 sender = ?incoming_sender_hint(&msg),
                 thread_id = ?behavior_ctx.thread_id,
+                memory_package = msg.meta.memory_package.is_some(),
                 input_len = input.len(),
                 input_preview = %text_preview(&input, 240),
                 "incoming user message"
@@ -1065,7 +1068,10 @@ impl AiNode for GenericAiNode {
                 let input_parts = if openai.multimodal {
                     if let Some(resolved) = resolved_user_input.as_ref() {
                         match build_openai_user_content_parts(resolved).await {
-                            Ok(parts) => Some(parts),
+                            Ok(parts) => Some(inject_memory_package_into_input_parts(
+                                parts,
+                                cognition_block.as_deref(),
+                            )),
                             Err(err) => {
                                 tracing::warn!(
                                     node_name = %self.node_name,
@@ -5227,6 +5233,96 @@ fn text_preview(text: &str, max_chars: usize) -> String {
     out
 }
 
+fn render_memory_package_prompt_block(memory_package: Option<&MemoryPackage>) -> Option<String> {
+    let package = memory_package?;
+    let mut lines = Vec::new();
+    lines.push("Conversation memory:".to_string());
+    lines.push(format!("Thread: {}", package.thread_id));
+    if let Some(context) = package.dominant_context.as_ref() {
+        lines.push(format!("Dominant context: {}", context.label));
+    }
+    if let Some(reason) = package.dominant_reason.as_ref() {
+        lines.push(format!("Dominant reason: {}", reason.label));
+    }
+
+    let context_labels = package
+        .contexts
+        .iter()
+        .take(4)
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    if !context_labels.is_empty() {
+        lines.push(format!("Contexts: {}", context_labels.join(", ")));
+    }
+
+    let reason_labels = package
+        .reasons
+        .iter()
+        .take(4)
+        .map(|item| item.label.as_str())
+        .collect::<Vec<_>>();
+    if !reason_labels.is_empty() {
+        lines.push(format!("Reasons: {}", reason_labels.join(", ")));
+    }
+
+    let memory_labels = package
+        .memories
+        .iter()
+        .take(3)
+        .map(|item| item.summary.as_str())
+        .collect::<Vec<_>>();
+    if !memory_labels.is_empty() {
+        lines.push(format!("Memories: {}", memory_labels.join(", ")));
+    }
+
+    if let Some(truncated) = package.truncated.as_ref() {
+        let mut truncated_fields = Vec::new();
+        if truncated.dropped_contexts > 0 {
+            truncated_fields.push(format!("contexts={}", truncated.dropped_contexts));
+        }
+        if truncated.dropped_reasons > 0 {
+            truncated_fields.push(format!("reasons={}", truncated.dropped_reasons));
+        }
+        if truncated.dropped_memories > 0 {
+            truncated_fields.push(format!("memories={}", truncated.dropped_memories));
+        }
+        if truncated.dropped_episodes > 0 {
+            truncated_fields.push(format!("episodes={}", truncated.dropped_episodes));
+        }
+        if !truncated_fields.is_empty() {
+            lines.push(format!("Truncated fields: {}", truncated_fields.join(", ")));
+        }
+    }
+
+    Some(lines.join("\n"))
+}
+
+fn inject_memory_package_into_text_input(input: &str, cognition_block: Option<&str>) -> String {
+    let Some(block) = cognition_block.filter(|value| !value.trim().is_empty()) else {
+        return input.to_string();
+    };
+    if input.trim().is_empty() {
+        return block.to_string();
+    }
+    format!("{block}\n\nCurrent user message:\n{input}")
+}
+
+fn inject_memory_package_into_input_parts(
+    mut parts: Vec<Value>,
+    cognition_block: Option<&str>,
+) -> Vec<Value> {
+    let Some(block) = cognition_block.filter(|value| !value.trim().is_empty()) else {
+        return parts;
+    };
+    let mut enriched = Vec::with_capacity(parts.len() + 1);
+    enriched.push(json!({
+        "type": "input_text",
+        "text": block,
+    }));
+    enriched.append(&mut parts);
+    enriched
+}
+
 #[allow(dead_code)]
 fn require_src_ilk(ctx: &BehaviorContext) -> fluxbee_ai_sdk::Result<&str> {
     ctx.src_ilk
@@ -5238,6 +5334,9 @@ fn require_src_ilk(ctx: &BehaviorContext) -> fluxbee_ai_sdk::Result<&str> {
 mod tests {
     use super::*;
     use fluxbee_ai_sdk::{Destination, Meta, Routing};
+    use fluxbee_sdk::protocol::{
+        MemoryContextSummary, MemoryPackage, MemoryReasonSummary, MemorySummary,
+    };
     use std::fs;
     use std::sync::Arc;
     use std::sync::{Mutex, OnceLock};
@@ -5447,6 +5546,77 @@ mod tests {
             },
             payload: json!({"type":"text","content":"hola"}),
         }
+    }
+
+    fn sample_memory_package() -> MemoryPackage {
+        MemoryPackage {
+            package_version: 2,
+            thread_id: "thread:canonical-1".to_string(),
+            dominant_context: Some(MemoryContextSummary {
+                context_id: "context:1".to_string(),
+                label: "refund dispute".to_string(),
+                weight: 3.0,
+            }),
+            dominant_reason: Some(MemoryReasonSummary {
+                reason_id: "reason:1".to_string(),
+                label: "confrontational pushback".to_string(),
+                weight: 2.0,
+            }),
+            contexts: vec![MemoryContextSummary {
+                context_id: "context:1".to_string(),
+                label: "refund dispute".to_string(),
+                weight: 3.0,
+            }],
+            reasons: vec![MemoryReasonSummary {
+                reason_id: "reason:1".to_string(),
+                label: "confrontational pushback".to_string(),
+                weight: 2.0,
+            }],
+            memories: vec![MemorySummary {
+                memory_id: "memory:1".to_string(),
+                summary: "charged twice previously".to_string(),
+                weight: 0.92,
+                dominant_context_id: Some("context:1".to_string()),
+                dominant_reason_id: Some("reason:1".to_string()),
+            }],
+            episodes: vec![],
+            truncated: None,
+        }
+    }
+
+    #[test]
+    fn render_memory_package_prompt_block_returns_none_when_absent() {
+        assert!(render_memory_package_prompt_block(None).is_none());
+    }
+
+    #[test]
+    fn inject_memory_package_into_text_input_prefixes_cognition_block() {
+        let block = render_memory_package_prompt_block(Some(&sample_memory_package()))
+            .expect("memory block");
+        let enriched =
+            inject_memory_package_into_text_input("please help with this refund", Some(&block));
+        assert!(enriched.contains("Conversation memory:"));
+        assert!(enriched.contains("Dominant context: refund dispute"));
+        assert!(enriched.contains("Current user message:\nplease help with this refund"));
+    }
+
+    #[test]
+    fn inject_memory_package_into_input_parts_adds_leading_text_part() {
+        let block = render_memory_package_prompt_block(Some(&sample_memory_package()))
+            .expect("memory block");
+        let enriched = inject_memory_package_into_input_parts(
+            vec![json!({"type":"input_text","text":"hello"})],
+            Some(&block),
+        );
+        assert_eq!(enriched.len(), 2);
+        assert_eq!(
+            enriched[0].get("text").and_then(Value::as_str),
+            Some(block.as_str())
+        );
+        assert_eq!(
+            enriched[1].get("text").and_then(Value::as_str),
+            Some("hello")
+        );
     }
 
     #[test]

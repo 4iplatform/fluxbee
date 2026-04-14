@@ -307,6 +307,7 @@ async fn send_probe(
                 "probe_id": probe_id,
                 "probe_step": step,
             })),
+            ..Meta::default()
         },
         payload,
     };
