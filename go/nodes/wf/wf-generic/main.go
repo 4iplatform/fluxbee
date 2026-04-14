@@ -6,31 +6,33 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/4iplatform/json-router/nodes/wf/wf-generic/node"
 )
 
 func main() {
-	var definitionPath string
-	flag.StringVar(&definitionPath, "definition", "", "path to workflow definition JSON")
+	var configPath string
+	flag.StringVar(&configPath, "config", "", "path to config.json")
 	flag.Parse()
 
-	if definitionPath == "" {
-		fmt.Fprintln(os.Stderr, "missing required -definition flag")
+	if configPath == "" {
+		fmt.Fprintln(os.Stderr, "missing required --config flag")
 		os.Exit(2)
 	}
 
-	runtime, err := node.Run(context.Background(), node.RunOptions{
-		DefinitionPath: definitionPath,
-	})
+	cfg, err := node.LoadConfig(configPath)
 	if err != nil {
 		log.Fatalf("wf-generic: %v", err)
 	}
 
-	log.Printf(
-		"wf-generic loaded workflow_type=%s states=%d terminal_states=%d",
-		runtime.Definition.WorkflowType,
-		len(runtime.Definition.States),
-		len(runtime.Definition.TerminalStates),
-	)
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	if err := node.Run(ctx, node.RunOptions{
+		Config: cfg,
+	}); err != nil {
+		log.Fatalf("wf-generic: %v", err)
+	}
 }

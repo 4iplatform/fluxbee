@@ -1,12 +1,16 @@
 package node
 
 import (
+	"context"
+	"log"
 	"time"
 
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 )
+
+const guardEvalTimeout = 10 * time.Millisecond
 
 type ClockFunc func() time.Time
 
@@ -35,6 +39,48 @@ func newGuardEnv(clock ClockFunc) (*cel.Env, error) {
 		),
 	)
 }
+
+// EvalGuard evaluates a compiled guard program with a 10ms timeout.
+// Returns false (never true) on timeout or evaluation error.
+func EvalGuard(program cel.Program, input, state, event map[string]any) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), guardEvalTimeout)
+	defer cancel()
+
+	type result struct {
+		val ref.Val
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		val, _, err := program.Eval(map[string]any{
+			"input": input,
+			"state": state,
+			"event": event,
+		})
+		ch <- result{val, err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		log.Printf("wf: guard eval timed out after %s", guardEvalTimeout)
+		return false
+	case r := <-ch:
+		if r.err != nil {
+			log.Printf("wf: guard eval error: %v", r.err)
+			return false
+		}
+		boolVal, ok := r.val.(types.Bool)
+		if !ok {
+			log.Printf("wf: guard eval returned non-bool type %T", r.val)
+			return false
+		}
+		if !bool(boolVal) {
+			return false
+		}
+		return true
+	}
+}
+
 
 func compileGuard(expr string, clock ClockFunc) (cel.Program, error) {
 	env, err := newGuardEnv(clock)
