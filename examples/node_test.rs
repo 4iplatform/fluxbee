@@ -4,7 +4,7 @@ use fluxbee_sdk::protocol::{
     build_echo, build_echo_reply, build_time_sync, build_withdraw, Destination, Message, Meta,
     Routing, TimeSyncPayload, MSG_OPA_RELOAD, SYSTEM_KIND,
 };
-use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
+use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender, NodeUuidMode};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         name: node_name.to_string(),
         router_socket,
         uuid_persistence_dir: nodes_dir,
+        uuid_mode: NodeUuidMode::Persistent,
         config_dir,
         version: "1.0".to_string(),
     };
@@ -79,8 +80,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(msg) => {
                     let summary = payload_summary(&msg.payload);
                     println!(
-                        "received: kind={} msg={:?} src={} dst={:?} payload={}",
-                        msg.meta.msg_type, msg.meta.msg, msg.routing.src, msg.routing.dst, summary
+                        "received: kind={} msg={:?} src={} src_l2_name={:?} dst={:?} payload={}",
+                        msg.meta.msg_type,
+                        msg.meta.msg,
+                        msg.routing.src,
+                        msg.routing.src_l2_name,
+                        msg.routing.dst,
+                        summary
                     );
                 }
                 Err(err) => {
@@ -109,6 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let msg = Message {
             routing: Routing {
                 src: sender.uuid().to_string(),
+                src_l2_name: None,
                 dst: Destination::Broadcast,
                 ttl: 16,
                 trace_id: Uuid::new_v4().to_string(),
@@ -136,6 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let msg = Message {
                 routing: Routing {
                     src: sender.uuid().to_string(),
+                    src_l2_name: None,
                     dst: Destination::Resolve,
                     ttl: 1,
                     trace_id: Uuid::new_v4().to_string(),
@@ -173,6 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let msg = Message {
             routing: Routing {
                 src: sender.uuid().to_string(),
+                src_l2_name: None,
                 dst: dst.clone(),
                 ttl: 1,
                 trace_id: Uuid::new_v4().to_string(),

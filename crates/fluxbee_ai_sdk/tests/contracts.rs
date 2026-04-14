@@ -9,6 +9,7 @@ fn sample_message() -> Message {
     Message {
         routing: Routing {
             src: "node-src-123".to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast("AI.echo@dev".to_string()),
             ttl: 5,
             trace_id: "trace-abc".to_string(),

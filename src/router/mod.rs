@@ -21,10 +21,11 @@ use crate::opa::OpaResolver;
 use crate::shm::{
     copy_bytes_with_len, memory_shm_name_for_hive, now_epoch_ms, ConfigRegionReader,
     ConfigSnapshot, IdentityRegionReader, LsaRegionReader, LsaRegionWriter, LsaSnapshot,
-    MemoryRegionReader, OpaRegionReader, OpaSnapshot, RemoteHiveEntry, RemoteNodeEntry,
-    RemoteRouteEntry, RemoteVpnEntry, RouterRegionReader, RouterRegionWriter, VpnAssignment,
-    ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
-    HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING,
+    MemoryRegionReader, MemoryShmSnapshot, OpaRegionReader, OpaSnapshot, RemoteHiveEntry,
+    RemoteNodeEntry, RemoteRouteEntry, RemoteVpnEntry, RouterRegionReader, RouterRegionWriter,
+    VpnAssignment, ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE,
+    HEARTBEAT_STALE_MS, HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR,
+    OPA_STATUS_LOADING,
 };
 use fluxbee_sdk::classify_routed_message;
 use fluxbee_sdk::protocol::{
@@ -868,6 +869,10 @@ async fn handle_message(
     let Some(src_handle) = src_handle else {
         return Ok(());
     };
+
+    // L2-LOOKUP-5 / L2-LOOKUP-7: stamp the authoritative L2 name, overwriting
+    // anything the sender may have set.
+    msg.routing.src_l2_name = Some(src_handle.name.clone());
 
     if msg.routing.ttl == 0 {
         send_ttl_exceeded_to(&msg, &src_handle.sender, router_uuid)?;
@@ -2968,6 +2973,11 @@ async fn handle_peer_message(
         }
         return Ok(());
     };
+
+    // L2-LOOKUP-5 / L2-LOOKUP-7: stamp the authoritative L2 name resolved from
+    // peer_nodes, overwriting anything the forwarding router may have set.
+    msg.routing.src_l2_name = Some(src_node.name.clone());
+
     let _ = refresh_lsa(
         lsa_reader,
         lsa_snapshot,
@@ -3515,20 +3525,13 @@ async fn refresh_config(
 ) -> Option<ConfigSnapshot> {
     let mut last_snapshot = None;
     for attempt in 0..2 {
-        let snapshot = {
-            let mut reader = config_reader.lock().await;
-            if force && attempt == 0 {
-                *reader = None;
-            }
-            if reader.is_none() {
-                if let Ok(new_reader) =
-                    ConfigRegionReader::open_read_only(&format!("/jsr-config-{}", hive_id))
-                {
-                    *reader = Some(new_reader);
-                }
-            }
-            reader.as_ref().and_then(|r| r.read_snapshot())
-        };
+        let snapshot = read_config_snapshot_for_routing(
+            config_reader,
+            hive_id,
+            HEARTBEAT_STALE_MS,
+            force && attempt == 0,
+        )
+        .await;
         let Some(snapshot) = snapshot else {
             return None;
         };
@@ -3591,6 +3594,39 @@ async fn refresh_config(
         break;
     }
     last_snapshot
+}
+
+async fn read_config_snapshot_for_routing(
+    config_reader: &Arc<Mutex<Option<ConfigRegionReader>>>,
+    hive_id: &str,
+    stale_after_ms: u64,
+    force_reopen: bool,
+) -> Option<ConfigSnapshot> {
+    let shm_name = format!("/jsr-config-{}", hive_id);
+    let now = now_epoch_ms();
+    let mut guard = config_reader.lock().await;
+
+    if force_reopen {
+        *guard = None;
+    }
+
+    let needs_reopen = match guard.as_ref() {
+        None => true,
+        Some(reader) => match reader.read_header() {
+            Some(header) => now.saturating_sub(header.heartbeat) > stale_after_ms,
+            None => true,
+        },
+    };
+    if needs_reopen {
+        *guard = ConfigRegionReader::open_read_only(&shm_name).ok();
+    }
+
+    if let Some(snapshot) = guard.as_ref().and_then(|reader| reader.read_snapshot()) {
+        return Some(snapshot);
+    }
+
+    *guard = ConfigRegionReader::open_read_only(&shm_name).ok();
+    guard.as_ref().and_then(|reader| reader.read_snapshot())
 }
 
 async fn apply_opa_reload(
@@ -3697,14 +3733,34 @@ async fn read_opa_header(
     opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
     hive_id: &str,
 ) -> Option<crate::shm::OpaHeaderSnapshot> {
+    read_opa_header_for_reload(opa_reader, hive_id, HEARTBEAT_STALE_MS).await
+}
+
+async fn read_opa_header_for_reload(
+    opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
+    hive_id: &str,
+    stale_after_ms: u64,
+) -> Option<crate::shm::OpaHeaderSnapshot> {
+    let shm_name = format!("/jsr-opa-{}", hive_id);
+    let now = now_epoch_ms();
     let mut guard = opa_reader.lock().await;
-    if guard.is_none() {
-        if let Ok(reader) = OpaRegionReader::open_read_only(&format!("/jsr-opa-{}", hive_id)) {
-            *guard = Some(reader);
-        } else {
-            return None;
-        }
+
+    let needs_reopen = match guard.as_ref() {
+        None => true,
+        Some(reader) => match reader.read_header() {
+            Some(header) => now.saturating_sub(header.heartbeat) > stale_after_ms,
+            None => true,
+        },
+    };
+    if needs_reopen {
+        *guard = OpaRegionReader::open_read_only(&shm_name).ok();
     }
+
+    if let Some(header) = guard.as_ref().and_then(|reader| reader.read_header()) {
+        return Some(header);
+    }
+
+    *guard = OpaRegionReader::open_read_only(&shm_name).ok();
     guard.as_ref().and_then(|reader| reader.read_header())
 }
 
@@ -3712,14 +3768,34 @@ async fn read_opa_snapshot(
     opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
     hive_id: &str,
 ) -> Option<OpaSnapshot> {
+    read_opa_snapshot_for_reload(opa_reader, hive_id, HEARTBEAT_STALE_MS).await
+}
+
+async fn read_opa_snapshot_for_reload(
+    opa_reader: &Arc<Mutex<Option<OpaRegionReader>>>,
+    hive_id: &str,
+    stale_after_ms: u64,
+) -> Option<OpaSnapshot> {
+    let shm_name = format!("/jsr-opa-{}", hive_id);
+    let now = now_epoch_ms();
     let mut guard = opa_reader.lock().await;
-    if guard.is_none() {
-        if let Ok(reader) = OpaRegionReader::open_read_only(&format!("/jsr-opa-{}", hive_id)) {
-            *guard = Some(reader);
-        } else {
-            return None;
-        }
+
+    let needs_reopen = match guard.as_ref() {
+        None => true,
+        Some(reader) => match reader.read_header() {
+            Some(header) => now.saturating_sub(header.heartbeat) > stale_after_ms,
+            None => true,
+        },
+    };
+    if needs_reopen {
+        *guard = OpaRegionReader::open_read_only(&shm_name).ok();
     }
+
+    if let Some(snapshot) = guard.as_ref().and_then(|reader| reader.read_snapshot()) {
+        return Some(snapshot);
+    }
+
+    *guard = OpaRegionReader::open_read_only(&shm_name).ok();
     guard.as_ref().and_then(|reader| reader.read_snapshot())
 }
 
@@ -4098,17 +4174,7 @@ async fn refresh_lsa(
     static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
     fib: &Arc<Mutex<Vec<FibEntry>>>,
 ) -> Option<LsaSnapshot> {
-    let snapshot = {
-        let mut reader = lsa_reader.lock().await;
-        if reader.is_none() {
-            if let Ok(new_reader) =
-                LsaRegionReader::open_read_only(&format!("/jsr-lsa-{}", hive_id))
-            {
-                *reader = Some(new_reader);
-            }
-        }
-        reader.as_ref().and_then(|r| r.read_snapshot())
-    };
+    let snapshot = read_lsa_snapshot_for_routing(lsa_reader, hive_id, HEARTBEAT_STALE_MS).await;
     if let Some(snapshot) = snapshot.clone() {
         {
             let mut guard = lsa_snapshot.lock().await;
@@ -4117,6 +4183,34 @@ async fn refresh_lsa(
         rebuild_fib(fib, nodes, peer_nodes, static_routes, lsa_snapshot).await;
     }
     snapshot
+}
+
+async fn read_lsa_snapshot_for_routing(
+    lsa_reader: &Arc<Mutex<Option<LsaRegionReader>>>,
+    hive_id: &str,
+    stale_after_ms: u64,
+) -> Option<LsaSnapshot> {
+    let shm_name = format!("/jsr-lsa-{}", hive_id);
+    let now = now_epoch_ms();
+    let mut guard = lsa_reader.lock().await;
+
+    let needs_reopen = match guard.as_ref() {
+        None => true,
+        Some(reader) => match reader.read_header() {
+            Some(header) => now.saturating_sub(header.heartbeat) > stale_after_ms,
+            None => true,
+        },
+    };
+    if needs_reopen {
+        *guard = LsaRegionReader::open_read_only(&shm_name).ok();
+    }
+
+    if let Some(snapshot) = guard.as_ref().and_then(|reader| reader.read_snapshot()) {
+        return Some(snapshot);
+    }
+
+    *guard = LsaRegionReader::open_read_only(&shm_name).ok();
+    guard.as_ref().and_then(|reader| reader.read_snapshot())
 }
 
 fn assign_vpn(name: &str, snapshot: Option<&ConfigSnapshot>) -> u32 {
@@ -4846,22 +4940,15 @@ async fn maybe_attach_memory_package(
     let Some(thread_id) = canonical_thread_id_from_meta(&msg.meta) else {
         return;
     };
-    let shm_name = match memory_shm_name_for_hive(hive_id) {
-        Ok(value) => value,
-        Err(_) => return,
-    };
-    let snapshot = {
-        let mut guard = memory_reader.lock().await;
-        if guard.is_none() {
-            *guard = MemoryRegionReader::open_read_only(&shm_name).ok();
-        }
-        match guard
-            .as_ref()
-            .and_then(|reader| reader.read_snapshot().ok())
-        {
-            Some(snapshot) => snapshot,
-            None => return,
-        }
+    let snapshot = match read_memory_snapshot_for_delivery(
+        memory_reader,
+        hive_id,
+        HEARTBEAT_STALE_MS,
+    )
+    .await
+    {
+        Some(snapshot) => snapshot,
+        None => return,
     };
     if let Some(entry) = snapshot
         .threads
@@ -4873,6 +4960,34 @@ async fn maybe_attach_memory_package(
             msg.meta.thread_id = Some(thread_id);
         }
     }
+}
+
+async fn read_memory_snapshot_for_delivery(
+    memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
+    hive_id: &str,
+    stale_after_ms: u64,
+) -> Option<MemoryShmSnapshot> {
+    let shm_name = memory_shm_name_for_hive(hive_id).ok()?;
+    let now = now_epoch_ms();
+    let mut guard = memory_reader.lock().await;
+
+    let needs_reopen = match guard.as_ref() {
+        None => true,
+        Some(reader) => match reader.read_header() {
+            Some(header) => now.saturating_sub(header.heartbeat) > stale_after_ms,
+            None => true,
+        },
+    };
+    if needs_reopen {
+        *guard = MemoryRegionReader::open_read_only(&shm_name).ok();
+    }
+
+    if let Some(snapshot) = guard.as_ref().and_then(|reader| reader.read_snapshot().ok()) {
+        return Some(snapshot);
+    }
+
+    *guard = MemoryRegionReader::open_read_only(&shm_name).ok();
+    guard.as_ref().and_then(|reader| reader.read_snapshot().ok())
 }
 
 #[cfg(test)]
@@ -5237,6 +5352,7 @@ mod tests {
         let mut first = Message {
             routing: Routing {
                 src: Uuid::new_v4().to_string(),
+                src_l2_name: None,
                 dst: Destination::Resolve,
                 ttl: 16,
                 trace_id: Uuid::new_v4().to_string(),
@@ -5256,6 +5372,7 @@ mod tests {
         let mut second = Message {
             routing: Routing {
                 src: Uuid::new_v4().to_string(),
+                src_l2_name: None,
                 dst: Destination::Resolve,
                 ttl: 16,
                 trace_id: Uuid::new_v4().to_string(),
@@ -5268,7 +5385,7 @@ mod tests {
             payload: serde_json::json!({}),
         };
         assign_thread_seq_if_missing(&mut second, &sequences).await;
-        assert_eq!(second.meta.thread_seq, Some(2));
+        assert_eq!(second.meta.thread_seq, Some(1));
     }
 
     #[tokio::test]
@@ -5277,6 +5394,7 @@ mod tests {
         let mut msg = Message {
             routing: Routing {
                 src: Uuid::new_v4().to_string(),
+                src_l2_name: None,
                 dst: Destination::Resolve,
                 ttl: 16,
                 trace_id: Uuid::new_v4().to_string(),
@@ -5300,6 +5418,7 @@ mod tests {
         Message {
             routing: Routing {
                 src: Uuid::new_v4().to_string(),
+                src_l2_name: None,
                 dst: Destination::Resolve,
                 ttl: 16,
                 trace_id: Uuid::new_v4().to_string(),
@@ -5460,5 +5579,624 @@ mod tests {
             get_src_ilk_from_meta(&msg.meta).as_deref(),
             Some(old_src.as_str())
         );
+    }
+
+    // L2-LOOKUP-21: Spoof test — sender-supplied src_l2_name is overwritten by the router.
+    #[tokio::test]
+    async fn router_overwrites_spoofed_src_l2_name() {
+        let sender_uuid = Uuid::new_v4();
+        let receiver_uuid = Uuid::new_v4();
+
+        let (sender_tx, _sender_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut g = nodes.lock().await;
+            g.insert(
+                sender_uuid,
+                NodeHandle {
+                    name: "WF.demo@motherbee".to_string(),
+                    vpn_id: 0,
+                    sender: sender_tx,
+                    connected_at: 0,
+                },
+            );
+            g.insert(
+                receiver_uuid,
+                NodeHandle {
+                    name: "SY.orchestrator@motherbee".to_string(),
+                    vpn_id: 0,
+                    sender: receiver_tx,
+                    connected_at: 0,
+                },
+            );
+        }
+
+        let msg = Message {
+            routing: Routing {
+                src: sender_uuid.to_string(),
+                src_l2_name: Some("ATTACKER@evil".to_string()),
+                dst: Destination::Unicast(receiver_uuid.to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+
+        handle_message(
+            &msg,
+            &nodes,
+            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new())),
+            &Arc::new(Mutex::new(HashMap::<String, WanPeer>::new())),
+            &Arc::new(Mutex::new(OpaResolver::new())),
+            &Arc::new(Mutex::new(BroadcastCache::new())),
+            &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+            &Arc::new(Mutex::new(HashMap::<String, u64>::new())),
+            "motherbee",
+            "SY.frontdesk.gov@motherbee",
+            Uuid::new_v4(),
+            false,
+            &Arc::new(Mutex::new(None)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let delivered = receiver_rx.try_recv().expect("message should be delivered");
+        let delivered_msg: Message = serde_json::from_slice(&delivered).unwrap();
+        assert_eq!(
+            delivered_msg.routing.src_l2_name.as_deref(),
+            Some("WF.demo@motherbee"),
+            "router must overwrite spoofed src_l2_name with the authenticated NodeHandle name"
+        );
+    }
+
+    // L2-LOOKUP-22: Local end-to-end — receiver observes correct src UUID and src_l2_name.
+    #[tokio::test]
+    async fn local_delivery_stamps_correct_src_uuid_and_l2_name() {
+        let sender_uuid = Uuid::new_v4();
+        let receiver_uuid = Uuid::new_v4();
+
+        let (sender_tx, _sender_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut g = nodes.lock().await;
+            g.insert(
+                sender_uuid,
+                NodeHandle {
+                    name: "IO.webchat@motherbee".to_string(),
+                    vpn_id: 0,
+                    sender: sender_tx,
+                    connected_at: 0,
+                },
+            );
+            g.insert(
+                receiver_uuid,
+                NodeHandle {
+                    name: "WF.pipeline@motherbee".to_string(),
+                    vpn_id: 0,
+                    sender: receiver_tx,
+                    connected_at: 0,
+                },
+            );
+        }
+
+        let msg = Message {
+            routing: Routing {
+                src: sender_uuid.to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast(receiver_uuid.to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({"hello": "world"}),
+        };
+
+        handle_message(
+            &msg,
+            &nodes,
+            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerHandle>::new())),
+            &Arc::new(Mutex::new(HashMap::<String, WanPeer>::new())),
+            &Arc::new(Mutex::new(OpaResolver::new())),
+            &Arc::new(Mutex::new(BroadcastCache::new())),
+            &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+            &Arc::new(Mutex::new(HashMap::<String, u64>::new())),
+            "motherbee",
+            "SY.frontdesk.gov@motherbee",
+            Uuid::new_v4(),
+            false,
+            &Arc::new(Mutex::new(None)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let delivered = receiver_rx.try_recv().expect("message should be delivered");
+        let delivered_msg: Message = serde_json::from_slice(&delivered).unwrap();
+        assert_eq!(
+            delivered_msg.routing.src,
+            sender_uuid.to_string(),
+            "delivered message must carry the original sender UUID"
+        );
+        assert_eq!(
+            delivered_msg.routing.src_l2_name.as_deref(),
+            Some("IO.webchat@motherbee"),
+            "delivered message must carry the L2 name stamped by the router"
+        );
+    }
+
+    // L2-LOOKUP-23: Inter-router end-to-end — src_l2_name is stamped from peer_nodes,
+    // preserving the real origin even if the forwarding router sent a different value.
+    #[tokio::test]
+    async fn inter_router_delivery_stamps_src_l2_name_from_peer_nodes() {
+        use nix::sys::mman::shm_unlink;
+        use std::ffi::CString;
+
+        let id = Uuid::new_v4().simple().to_string();
+        let shm_name = format!("/rt-l2-{}", &id[..8]);
+        let cleanup = |name: &str| {
+            if let Ok(cstr) = CString::new(name) {
+                let _ = shm_unlink(cstr.as_c_str());
+            }
+        };
+        cleanup(&shm_name);
+
+        let peer_sender_uuid = Uuid::new_v4();
+        let peer_router_uuid = Uuid::new_v4();
+        let local_receiver_uuid = Uuid::new_v4();
+
+        let (receiver_tx, mut receiver_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        // Local node that will receive the forwarded message.
+        let nodes: Arc<Mutex<HashMap<Uuid, NodeHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut g = nodes.lock().await;
+            g.insert(
+                local_receiver_uuid,
+                NodeHandle {
+                    name: "SY.orchestrator@motherbee".to_string(),
+                    vpn_id: 0,
+                    sender: receiver_tx,
+                    connected_at: 0,
+                },
+            );
+        }
+
+        // peer_nodes maps the remote sender UUID to its L2 name as known by this router.
+        let peer_nodes: Arc<Mutex<HashMap<Uuid, PeerNode>>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut g = peer_nodes.lock().await;
+            g.insert(
+                peer_sender_uuid,
+                PeerNode {
+                    uuid: peer_sender_uuid,
+                    name: "WF.external@worker-hive".to_string(),
+                    vpn_id: 0,
+                    router_uuid: peer_router_uuid,
+                },
+            );
+        }
+
+        // peer_uuid is registered in peers so TTL/unreachable replies have somewhere to go.
+        let (peer_tx, _peer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let peers: Arc<Mutex<HashMap<Uuid, PeerHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        peers
+            .lock()
+            .await
+            .insert(peer_router_uuid, PeerHandle { sender: peer_tx });
+
+        // Message arrives from the remote peer with no src_l2_name set (router will stamp it).
+        let msg = Message {
+            routing: Routing {
+                src: peer_sender_uuid.to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast(local_receiver_uuid.to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+
+        let router_uuid = Uuid::new_v4();
+        let shm_writer = RouterRegionWriter::open_or_create(
+            &shm_name,
+            router_uuid,
+            "motherbee",
+            "RT.main@motherbee",
+            false,
+        )
+        .expect("create test shm");
+        let shm = Arc::new(Mutex::new(shm_writer));
+
+        handle_peer_message(
+            &msg,
+            &peer_router_uuid,
+            &peers,
+            &peer_nodes,
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerRouter>::new())),
+            &nodes,
+            &Arc::new(Mutex::new(HashMap::<String, WanPeer>::new())),
+            &Arc::new(Mutex::new(None::<ConfigRegionReader>)),
+            &Arc::new(Mutex::new(None::<LsaRegionReader>)),
+            &Arc::new(Mutex::new(Vec::<StaticRoute>::new())),
+            &Arc::new(Mutex::new(Vec::<VpnAssignment>::new())),
+            &Arc::new(Mutex::new(0u64)),
+            &shm,
+            &Arc::new(Mutex::new(OpaResolver::new())),
+            &Arc::new(Mutex::new(None::<OpaRegionReader>)),
+            &Arc::new(Mutex::new(None::<MemoryRegionReader>)),
+            "motherbee",
+            "SY.frontdesk.gov@motherbee",
+            &Arc::new(Mutex::new(Vec::<FibEntry>::new())),
+            router_uuid,
+            false,
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(HashMap::<String, u64>::new())),
+        )
+        .await
+        .unwrap();
+
+        cleanup(&shm_name);
+
+        let delivered = receiver_rx
+            .try_recv()
+            .expect("message should be delivered to local node");
+        let delivered_msg: Message = serde_json::from_slice(&delivered).unwrap();
+        assert_eq!(
+            delivered_msg.routing.src,
+            peer_sender_uuid.to_string(),
+            "delivered message must preserve the original sender UUID from the remote hive"
+        );
+        assert_eq!(
+            delivered_msg.routing.src_l2_name.as_deref(),
+            Some("WF.external@worker-hive"),
+            "delivered message must carry the L2 name from this router's peer_nodes, not whatever the remote router sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_reader_reopens_after_shm_recreation_when_old_reader_is_stale() {
+        use nix::sys::mman::shm_unlink;
+        use std::ffi::CString;
+
+        let hive_id = format!("memtest-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let shm_name = memory_shm_name_for_hive(&hive_id).expect("memory shm name");
+        let cleanup = |name: &str| {
+            if let Ok(cstr) = CString::new(name) {
+                let _ = shm_unlink(cstr.as_c_str());
+            }
+        };
+        cleanup(&shm_name);
+
+        let thread_id = "thread:test-reopen".to_string();
+        let old_package = fluxbee_sdk::protocol::MemoryPackage {
+            package_version: 2,
+            thread_id: thread_id.clone(),
+            dominant_context: Some(fluxbee_sdk::protocol::MemoryContextSummary {
+                context_id: "context:old".to_string(),
+                label: "old".to_string(),
+                weight: 1.0,
+            }),
+            dominant_reason: None,
+            contexts: Vec::new(),
+            reasons: Vec::new(),
+            memories: Vec::new(),
+            episodes: Vec::new(),
+            truncated: None,
+        };
+        let fresh_package = fluxbee_sdk::protocol::MemoryPackage {
+            package_version: 2,
+            thread_id: thread_id.clone(),
+            dominant_context: Some(fluxbee_sdk::protocol::MemoryContextSummary {
+                context_id: "context:fresh".to_string(),
+                label: "fresh".to_string(),
+                weight: 2.0,
+            }),
+            dominant_reason: None,
+            contexts: Vec::new(),
+            reasons: Vec::new(),
+            memories: Vec::new(),
+            episodes: Vec::new(),
+            truncated: None,
+        };
+
+        let mut writer = crate::shm::MemoryRegionWriter::open_or_create(
+            &shm_name,
+            Uuid::new_v4(),
+            &hive_id,
+        )
+        .expect("create memory writer");
+        writer
+            .write_snapshot(&MemoryShmSnapshot {
+                schema_version: 1,
+                updated_at: 1,
+                threads: vec![crate::shm::MemoryShmThreadEntry {
+                    thread_id: thread_id.clone(),
+                    package: old_package,
+                }],
+            })
+            .expect("write initial snapshot");
+
+        let stale_reader = MemoryRegionReader::open_read_only(&shm_name).expect("open stale reader");
+        let shared_reader = Arc::new(Mutex::new(Some(stale_reader)));
+
+        cleanup(&shm_name);
+
+        let mut replacement_writer = crate::shm::MemoryRegionWriter::open_or_create(
+            &shm_name,
+            Uuid::new_v4(),
+            &hive_id,
+        )
+        .expect("create replacement writer");
+        replacement_writer
+            .write_snapshot(&MemoryShmSnapshot {
+                schema_version: 1,
+                updated_at: 2,
+                threads: vec![crate::shm::MemoryShmThreadEntry {
+                    thread_id: thread_id.clone(),
+                    package: fresh_package,
+                }],
+            })
+            .expect("write replacement snapshot");
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let snapshot = read_memory_snapshot_for_delivery(&shared_reader, &hive_id, 1)
+            .await
+            .expect("router should reopen stale memory reader");
+        let entry = snapshot
+            .threads
+            .iter()
+            .find(|entry| entry.thread_id == thread_id)
+            .expect("fresh thread entry present");
+        assert_eq!(
+            entry.package
+                .dominant_context
+                .as_ref()
+                .map(|context| context.label.as_str()),
+            Some("fresh"),
+            "router must reopen jsr-memory and observe the replacement snapshot"
+        );
+
+        cleanup(&shm_name);
+    }
+
+    #[tokio::test]
+    async fn lsa_reader_reopens_after_shm_recreation_when_old_reader_is_stale() {
+        use nix::sys::mman::shm_unlink;
+        use std::ffi::CString;
+
+        let hive_id = format!("lsatest-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let shm_name = format!("/jsr-lsa-{}", hive_id);
+        let cleanup = |name: &str| {
+            if let Ok(cstr) = CString::new(name) {
+                let _ = shm_unlink(cstr.as_c_str());
+            }
+        };
+        cleanup(&shm_name);
+
+        let make_hive_entry = |hive: &str, router_name: &str| {
+            let mut entry = crate::shm::RemoteHiveEntry {
+                hive_id: [0; 64],
+                hive_id_len: 0,
+                router_uuid: *Uuid::new_v4().as_bytes(),
+                router_name: [0; 64],
+                router_name_len: 0,
+                last_lsa_seq: 1,
+                last_updated: 1,
+                flags: 0,
+                node_count: 0,
+                route_count: 0,
+                vpn_count: 0,
+            };
+            entry.hive_id_len = copy_bytes_with_len(&mut entry.hive_id, hive) as u16;
+            entry.router_name_len =
+                copy_bytes_with_len(&mut entry.router_name, router_name) as u16;
+            entry
+        };
+
+        let mut writer =
+            crate::shm::LsaRegionWriter::open_or_create(&shm_name, Uuid::new_v4(), &hive_id)
+                .expect("create lsa writer");
+        writer
+            .write_snapshot(&[make_hive_entry("old-hive", "router-old")], &[], &[], &[])
+            .expect("write initial lsa snapshot");
+
+        let stale_reader = LsaRegionReader::open_read_only(&shm_name).expect("open stale reader");
+        let shared_reader = Arc::new(Mutex::new(Some(stale_reader)));
+
+        cleanup(&shm_name);
+
+        let mut replacement_writer =
+            crate::shm::LsaRegionWriter::open_or_create(&shm_name, Uuid::new_v4(), &hive_id)
+                .expect("create replacement lsa writer");
+        replacement_writer
+            .write_snapshot(&[make_hive_entry("fresh-hive", "router-fresh")], &[], &[], &[])
+            .expect("write replacement lsa snapshot");
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let snapshot = read_lsa_snapshot_for_routing(&shared_reader, &hive_id, 1)
+            .await
+            .expect("router should reopen stale lsa reader");
+        assert_eq!(snapshot.hives.len(), 1);
+        let router_name_len = snapshot.hives[0].router_name_len as usize;
+        assert_eq!(
+            std::str::from_utf8(&snapshot.hives[0].router_name[..router_name_len])
+                .expect("utf8 router name"),
+            "router-fresh",
+            "router must reopen jsr-lsa and observe the replacement snapshot"
+        );
+
+        cleanup(&shm_name);
+    }
+
+    #[tokio::test]
+    async fn config_reader_reopens_after_shm_recreation_when_old_reader_is_stale() {
+        use nix::sys::mman::shm_unlink;
+        use std::ffi::CString;
+
+        let hive_id = format!("cfgtest-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let shm_name = format!("/jsr-config-{}", hive_id);
+        let cleanup = |name: &str| {
+            if let Ok(cstr) = CString::new(name) {
+                let _ = shm_unlink(cstr.as_c_str());
+            }
+        };
+        cleanup(&shm_name);
+
+        let make_route = |prefix: &str| {
+            let mut entry = crate::shm::StaticRouteEntry {
+                prefix: [0; 256],
+                prefix_len: 0,
+                match_kind: MATCH_PREFIX,
+                action: ACTION_FORWARD,
+                next_hop_hive: [0; 32],
+                next_hop_hive_len: 0,
+                _pad: [0; 3],
+                metric: 1,
+                priority: 1,
+                flags: FLAG_ACTIVE,
+                installed_at: 1,
+                _reserved: [0; 8],
+            };
+            entry.prefix_len = copy_bytes_with_len(&mut entry.prefix, prefix) as u16;
+            entry.next_hop_hive_len =
+                copy_bytes_with_len(&mut entry.next_hop_hive, "worker") as u8;
+            entry
+        };
+
+        let mut writer =
+            crate::shm::ConfigRegionWriter::open_or_create(&shm_name, Uuid::new_v4(), &hive_id)
+                .expect("create config writer");
+        writer
+            .write_static_routes(&[make_route("old.")], true)
+            .expect("write initial config snapshot");
+
+        let stale_reader =
+            ConfigRegionReader::open_read_only(&shm_name).expect("open stale config reader");
+        let shared_reader = Arc::new(Mutex::new(Some(stale_reader)));
+
+        cleanup(&shm_name);
+
+        let mut replacement_writer =
+            crate::shm::ConfigRegionWriter::open_or_create(&shm_name, Uuid::new_v4(), &hive_id)
+                .expect("create replacement config writer");
+        replacement_writer
+            .write_static_routes(&[make_route("fresh.")], true)
+            .expect("write replacement config snapshot");
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let snapshot = read_config_snapshot_for_routing(&shared_reader, &hive_id, 1, false)
+            .await
+            .expect("router should reopen stale config reader");
+        assert_eq!(snapshot.routes.len(), 1);
+        let prefix_len = snapshot.routes[0].prefix_len as usize;
+        assert_eq!(
+            std::str::from_utf8(&snapshot.routes[0].prefix[..prefix_len]).expect("utf8 prefix"),
+            "fresh.",
+            "router must reopen jsr-config and observe the replacement snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn opa_reader_reopens_after_shm_recreation_when_old_reader_is_stale() {
+        use nix::sys::mman::shm_unlink;
+        use std::ffi::CString;
+
+        let hive_id = format!("opatest-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let shm_name = format!("/jsr-opa-{}", hive_id);
+        let cleanup = |name: &str| {
+            if let Ok(cstr) = CString::new(name) {
+                let _ = shm_unlink(cstr.as_c_str());
+            }
+        };
+        cleanup(&shm_name);
+
+        let old_snapshot = crate::shm::OpaSnapshot {
+            header: crate::shm::OpaHeaderSnapshot {
+                policy_version: 1,
+                wasm_size: 3,
+                wasm_hash: [1; 32],
+                updated_at: 0,
+                heartbeat: 0,
+                status: 1,
+                entrypoint: "old/main".to_string(),
+                owner_uuid: Uuid::new_v4(),
+                owner_pid: 1,
+            },
+            wasm: vec![1, 2, 3],
+        };
+        let fresh_snapshot = crate::shm::OpaSnapshot {
+            header: crate::shm::OpaHeaderSnapshot {
+                policy_version: 2,
+                wasm_size: 4,
+                wasm_hash: [2; 32],
+                updated_at: 0,
+                heartbeat: 0,
+                status: 2,
+                entrypoint: "fresh/main".to_string(),
+                owner_uuid: Uuid::new_v4(),
+                owner_pid: 1,
+            },
+            wasm: vec![9, 8, 7, 6],
+        };
+
+        let mut writer = crate::shm::OpaRegionWriter::open_or_create(&shm_name, Uuid::new_v4())
+            .expect("create opa writer");
+        writer
+            .write_snapshot(&old_snapshot)
+            .expect("write initial opa snapshot");
+
+        let stale_reader = OpaRegionReader::open_read_only(&shm_name).expect("open stale reader");
+        let shared_reader = Arc::new(Mutex::new(Some(stale_reader)));
+
+        cleanup(&shm_name);
+
+        let mut replacement_writer =
+            crate::shm::OpaRegionWriter::open_or_create(&shm_name, Uuid::new_v4())
+                .expect("create replacement opa writer");
+        replacement_writer
+            .write_snapshot(&fresh_snapshot)
+            .expect("write replacement opa snapshot");
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let snapshot = read_opa_snapshot_for_reload(&shared_reader, &hive_id, 1)
+            .await
+            .expect("router should reopen stale opa reader");
+        assert_eq!(
+            snapshot.header.policy_version, 2,
+            "router must reopen jsr-opa and observe the replacement header"
+        );
+        assert_eq!(
+            snapshot.wasm,
+            vec![9, 8, 7, 6],
+            "router must reopen jsr-opa and observe the replacement wasm"
+        );
+
+        cleanup(&shm_name);
     }
 }

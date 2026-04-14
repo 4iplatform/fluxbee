@@ -641,6 +641,16 @@ pub struct OpaHeaderSnapshot {
     pub owner_pid: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct MemoryHeaderSnapshot {
+    pub data_size: u32,
+    pub thread_count: u32,
+    pub updated_at: u64,
+    pub heartbeat: u64,
+    pub owner_uuid: Uuid,
+    pub owner_pid: u32,
+}
+
 pub struct RouterRegionWriter {
     name: String,
     mmap: MmapMut,
@@ -680,6 +690,11 @@ pub struct LsaRegionReader {
 pub struct OpaRegionReader {
     name: String,
     mmap: Mmap,
+}
+
+pub struct OpaRegionWriter {
+    name: String,
+    mmap: MmapMut,
 }
 
 pub struct IdentityRegionWriter {
@@ -725,6 +740,12 @@ impl SeqHeader for ConfigHeader {
 }
 
 impl SeqHeader for LsaHeader {
+    fn seq(&mut self) -> &mut AtomicU64 {
+        &mut self.seq
+    }
+}
+
+impl SeqHeader for OpaHeader {
     fn seq(&mut self) -> &mut AtomicU64 {
         &mut self.seq
     }
@@ -1052,6 +1073,16 @@ impl ConfigRegionReader {
         read_config_snapshot(header, self.mmap.as_ref(), &self.layout)
     }
 
+    pub fn read_header(&self) -> Option<ConfigHeaderSnapshot> {
+        let header = self.header_ref()?;
+        Some(ConfigHeaderSnapshot {
+            static_route_count: header.static_route_count,
+            vpn_assignment_count: header.vpn_assignment_count,
+            config_version: header.config_version,
+            heartbeat: header.heartbeat,
+        })
+    }
+
     fn header_ref(&self) -> Option<&ConfigHeader> {
         header_ref::<ConfigHeader>(self.mmap.as_ref(), self.layout.header_offset)
     }
@@ -1206,8 +1237,85 @@ impl LsaRegionReader {
         read_lsa_snapshot(header, self.mmap.as_ref(), &self.layout)
     }
 
+    pub fn read_header(&self) -> Option<LsaHeaderSnapshot> {
+        let header = self.header_ref()?;
+        read_lsa_header_snapshot(header)
+    }
+
     fn header_ref(&self) -> Option<&LsaHeader> {
         header_ref::<LsaHeader>(self.mmap.as_ref(), self.layout.header_offset)
+    }
+}
+
+impl OpaRegionWriter {
+    pub fn open_or_create(name: &str, owner_uuid: Uuid) -> Result<Self, ShmError> {
+        validate_name(name)?;
+        let mut mmap = open_or_create_region(name, opa_region_len(), |mmap| {
+            initialize_opa_header(mmap, owner_uuid);
+        })?;
+        normalize_seq_header::<OpaHeader>(&mut mmap, 0, "opa shm")?;
+        Ok(Self {
+            name: name.to_string(),
+            mmap,
+        })
+    }
+
+    pub fn read_snapshot(&self) -> Option<OpaSnapshot> {
+        let header = self.header_ref()?;
+        read_opa_snapshot(header, self.mmap.as_ref())
+    }
+
+    pub fn update_heartbeat(&mut self) {
+        if let Some(header) = self.header_mut() {
+            let _write_guard = SeqlockWriteGuard::new(&header.seq);
+            header.heartbeat = now_epoch_ms();
+        }
+    }
+
+    pub fn write_snapshot(&mut self, snapshot: &OpaSnapshot) -> Result<(), ShmError> {
+        if snapshot.wasm.len() > OPA_MAX_WASM_SIZE {
+            return Err(ShmError::ValueTooLong {
+                len: snapshot.wasm.len(),
+                max: OPA_MAX_WASM_SIZE,
+            });
+        }
+        if snapshot.header.entrypoint.len() > 64 {
+            return Err(ShmError::ValueTooLong {
+                len: snapshot.header.entrypoint.len(),
+                max: 64,
+            });
+        }
+
+        let header = self.header_mut().ok_or(ShmError::InvalidHeader)?;
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
+        header.policy_version = snapshot.header.policy_version;
+        header.wasm_size = snapshot.wasm.len() as u32;
+        header._pad0 = 0;
+        header.wasm_hash = snapshot.header.wasm_hash;
+        header.updated_at = now_epoch_ms();
+        header.heartbeat = header.updated_at;
+        header.status = snapshot.header.status;
+        header._pad1 = 0;
+        header.entrypoint = [0; 64];
+        header.entrypoint_len =
+            copy_bytes_with_len(&mut header.entrypoint, &snapshot.header.entrypoint) as u16;
+
+        let header_size = size_of::<OpaHeader>();
+        let data = self
+            .mmap
+            .get_mut(header_size..header_size + OPA_MAX_WASM_SIZE)
+            .ok_or(ShmError::InvalidHeader)?;
+        data.fill(0);
+        data[..snapshot.wasm.len()].copy_from_slice(&snapshot.wasm);
+        Ok(())
+    }
+
+    fn header_ref(&self) -> Option<&OpaHeader> {
+        header_ref::<OpaHeader>(self.mmap.as_ref(), 0)
+    }
+
+    fn header_mut(&mut self) -> Option<&mut OpaHeader> {
+        header_mut::<OpaHeader>(&mut self.mmap, 0)
     }
 }
 
@@ -1934,6 +2042,18 @@ impl MemoryRegionReader {
         read_memory_snapshot(header, self.mmap.as_ref(), &self.layout)
     }
 
+    pub fn read_header(&self) -> Option<MemoryHeaderSnapshot> {
+        let header = self.header_ref()?;
+        Some(MemoryHeaderSnapshot {
+            data_size: header.data_size,
+            thread_count: header.thread_count,
+            updated_at: header.updated_at,
+            heartbeat: header.heartbeat,
+            owner_uuid: Uuid::from_bytes(header.owner_uuid),
+            owner_pid: header.owner_pid,
+        })
+    }
+
     fn header_ref(&self) -> Option<&MemoryHeader> {
         header_ref::<MemoryHeader>(self.mmap.as_ref(), self.layout.header_offset)
     }
@@ -2414,6 +2534,28 @@ fn initialize_lsa_header(mmap: &mut MmapMut, gateway_uuid: Uuid, hive_id: &str) 
     }
 }
 
+fn initialize_opa_header(mmap: &mut MmapMut, owner_uuid: Uuid) {
+    if let Some(header) = header_mut::<OpaHeader>(mmap, 0) {
+        header.magic = OPA_MAGIC;
+        header.version = OPA_VERSION;
+        header.seq = AtomicU64::new(0);
+        header.policy_version = 0;
+        header.wasm_size = 0;
+        header._pad0 = 0;
+        header.wasm_hash = [0; 32];
+        header.updated_at = now_epoch_ms();
+        header.heartbeat = header.updated_at;
+        header.status = 0;
+        header._pad1 = 0;
+        header.entrypoint = [0; 64];
+        header.entrypoint_len = 0;
+        header.owner_uuid = *owner_uuid.as_bytes();
+        header.owner_pid = std::process::id();
+        header._pad2 = 0;
+        header._reserved = [0; 20];
+    }
+}
+
 fn initialize_identity_header(
     mmap: &mut MmapMut,
     owner_uuid: Uuid,
@@ -2616,6 +2758,33 @@ fn read_lsa_snapshot(
                 routes: route_snapshot,
                 vpns: vpn_snapshot,
             });
+        }
+    }
+}
+
+fn read_lsa_header_snapshot(header: &LsaHeader) -> Option<LsaHeaderSnapshot> {
+    let start = Instant::now();
+    loop {
+        if start.elapsed() > Duration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
+            return None;
+        }
+        let s1 = header.seq.load(Ordering::Acquire);
+        if s1 & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        atomic::fence(Ordering::Acquire);
+        let snapshot = LsaHeaderSnapshot {
+            hive_count: header.hive_count,
+            total_node_count: header.total_node_count,
+            total_route_count: header.total_route_count,
+            total_vpn_count: header.total_vpn_count,
+            heartbeat: header.heartbeat,
+        };
+        atomic::fence(Ordering::Acquire);
+        let s2 = header.seq.load(Ordering::Acquire);
+        if s1 == s2 {
+            return Some(snapshot);
         }
     }
 }
@@ -3584,13 +3753,13 @@ mod tests {
                         title: "Urgent billing dispute".to_string(),
                         intensity: 7,
                     }],
-                    truncated: MemoryPackageTruncated {
+                    truncated: Some(MemoryPackageTruncated {
                         applied: false,
                         dropped_contexts: 0,
                         dropped_reasons: 0,
                         dropped_memories: 0,
                         dropped_episodes: 0,
-                    },
+                    }),
                 },
             }],
         };

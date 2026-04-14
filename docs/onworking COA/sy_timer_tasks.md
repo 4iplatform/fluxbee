@@ -147,8 +147,8 @@ Recommended order:
 - [x] SYT-S1-T7. Move the current SDK code from `sy-opa-rules/sdk` into the formal SDK layout.
 - [x] SYT-S1-T8. Define stable package naming and import path for Go consumers.
 - [x] SYT-S1-T9. Add module README and first-party/third-party usage guidance.
-- [ ] SYT-S1-T10. Define versioning/compatibility policy for the Go SDK.
-- [ ] SYT-S1-T11. Add wire-compatibility tests against the Rust SDK contract.
+- [x] SYT-S1-T10. Define versioning/compatibility policy for the Go SDK.
+- [x] SYT-S1-T11. Add wire-compatibility tests against the Rust SDK contract.
 - [x] SYT-S1-T12. Leave a compatibility migration path for `SY.opa.rules` while imports move to the formal SDK.
 - [x] SYT-S1-T13. Replace the temporary local `uuid_persistence_dir`-based UUID->L2 resolver with the canonical runtime identity resolution path shared with the rest of the platform.
 
@@ -200,21 +200,46 @@ Current status after extraction:
   - `Get`
   - `ListMine`
   - `Help`
-- [ ] SYT-S2-T3. Implement client-side validation:
+- [x] SYT-S2-T3. Implement client-side validation:
   - minimum 60s
   - mutually exclusive absolute vs relative scheduling fields
   - recurring validation shape
-- [ ] SYT-S2-T4. Implement retry policy for time operations as defined by the spec.
+- [x] SYT-S2-T4. Implement retry policy for time operations as defined by the spec.
 - [x] SYT-S2-T5. Implement `ParseFiredEvent(msg)` helper.
-- [ ] SYT-S2-T6. Add tests/golden fixtures for SDK wire compatibility.
+- [x] SYT-S2-T6. Add tests/golden fixtures for SDK wire compatibility.
 
 Current status:
 
 - implemented client calls so far: `Now`, `NowIn`, `Convert`, `Parse`, `Format`, `Help`
 - implemented scheduling calls: `Schedule`, `ScheduleIn`, `ScheduleRecurring`, `Cancel`, `Reschedule`, `Get`, `ListMine`
-- implemented time-operation retry budget for the currently supported direct time calls
+- implemented client-side validation for:
+  - minimum 60s
+  - `missed_policy` / `missed_within_ms`
+  - empty timer ids
+  - recurring cron shape (5-field v1 contract)
+  - list filters (`status_filter`, `limit`)
+  - required fields for timezone/time formatting operations
+- implemented normalized retry policy for direct time operations with the v1 schedule:
+  - `100ms`
+  - `300ms`
+  - `1s`
 - implemented `ParseFiredEvent(msg)`
-- remaining SDK work before the node binary: tighten client-side validation and broaden retry semantics from direct time calls to the final desired scope
+- added JSON fixtures / golden tests for:
+  - canonical `TIMER_SCHEDULE` request wire shape
+  - `TIMER_RESPONSE` success payloads
+  - `TIMER_RESPONSE` error payloads
+  - `TIMER_FIRED` event payloads
+- added explicit wire-compat checks against the current Rust/runtime envelope contract:
+  - `meta.type`
+  - `routing.trace_id`
+  - no legacy `msg_type` field in fixtures
+- documented and frozen for the Go SDK:
+  - v1 versioning/compatibility policy
+  - multiple-router-per-hive semantics
+  - stable public surface intended for first-party and third-party consumers
+- remaining Go SDK work beyond Rust parity:
+  - possible `ANNOUNCE.shm_name` extension
+  - additional SHM readers with standalone value
 
 ---
 
@@ -227,7 +252,7 @@ Current status:
 - [x] SYT-S3-T3. Use canonical node instance dir under `/var/lib/fluxbee/nodes/SY/SY.timer@<hive>/`.
 - [x] SYT-S3-T4. Open/create `timers.db` on startup.
 - [x] SYT-S3-T5. Enable SQLite WAL mode and define safe startup/shutdown semantics.
-- [ ] SYT-S3-T6. Add structured logging conventions for timer lifecycle and fire events.
+- [x] SYT-S3-T6. Add structured logging conventions for timer lifecycle and fire events.
 
 Current status:
 
@@ -341,7 +366,7 @@ Current status:
 - [x] SYT-S8-T6. Add orchestrator startup/shutdown/watchdog handling for `sy-timer`.
 - [x] SYT-S8-T7. Add node cleanup hook from orchestrator:
   - `TIMER_PURGE_OWNER` before node teardown
-- [ ] SYT-S8-T8. Decide whether orchestrator itself should use `SY.timer` for any internal delayed actions in v1 or not.
+- [x] SYT-S8-T8. Decide whether orchestrator itself should use `SY.timer` for any internal delayed actions in v1 or not.
 
 Current status:
 
@@ -355,6 +380,9 @@ Current status:
   - shutdown sequence
   - worker bootstrap unit generation
 - node teardown now triggers `TIMER_PURGE_OWNER` best-effort before instance removal / purge, and includes the result in the orchestrator response payload
+- `SY.orchestrator` does **not** use `SY.timer` internally in v1:
+  - this is explicitly deferred to v2
+  - the pilot keeps orchestrator timing logic local to avoid extra control-plane coupling
 
 ### SYT-S9 — Admin and operator visibility
 
@@ -414,15 +442,22 @@ Current status:
 
 ### SYT-S11 — Test matrix
 
-- [ ] SYT-S11-T1. Unit tests for all request validators.
-- [ ] SYT-S11-T2. Unit tests for cron parsing and minimum interval enforcement.
-- [ ] SYT-S11-T3. Unit tests for missed-policy handling.
-- [ ] SYT-S11-T4. Unit tests for ownership and forbidden access.
-- [ ] SYT-S11-T5. Unit tests for time conversion/parse/format operations.
-- [ ] SYT-S11-T6. Integration tests for schedule -> fire -> recurrent reschedule path.
-- [ ] SYT-S11-T7. Restart/replay tests against persisted SQLite.
-- [ ] SYT-S11-T8. Orchestrator teardown test for `TIMER_PURGE_OWNER`.
-- [ ] SYT-S11-T9. Go SDK tests for all typed client helpers.
+- [x] SYT-S11-T1. Unit tests for request validators.
+- [x] SYT-S11-T2. Unit tests for cron parsing and minimum interval enforcement.
+- [x] SYT-S11-T3. Unit tests for missed-policy handling.
+- [x] SYT-S11-T4. Unit tests for ownership and forbidden access.
+- [x] SYT-S11-T5. Unit tests for time conversion/parse/format operations.
+- [x] SYT-S11-T6. Integration tests for schedule -> fire -> recurrent reschedule path.
+- [x] SYT-S11-T7. Restart/replay tests against persisted SQLite.
+- [x] SYT-S11-T8. Orchestrator teardown test for `TIMER_PURGE_OWNER`.
+- [x] SYT-S11-T9. Go SDK tests for all currently implemented typed client helpers.
+
+Manual live validation now also exists through Rust examples:
+
+- [examples/timer_client.rs](/Users/cagostino/Documents/GitHub/fluxbee/examples/timer_client.rs) for one-shot schedule -> fire -> final state
+- [examples/timer_recurring.rs](/Users/cagostino/Documents/GitHub/fluxbee/examples/timer_recurring.rs) for recurring first fire -> requeue -> cancel cleanup
+- [examples/timer_restart.rs](/Users/cagostino/Documents/GitHub/fluxbee/examples/timer_restart.rs) for replay/restart validation with a manual `sy-timer` restart between schedule and fire
+- orchestrator teardown coverage now includes the `TIMER_PURGE_OWNER` cleanup hook and validates both successful purge payload mapping and relay failure surfacing in [sy_orchestrator.rs](/Users/cagostino/Documents/GitHub/fluxbee/src/bin/sy_orchestrator.rs)
 
 ---
 

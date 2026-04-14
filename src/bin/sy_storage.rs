@@ -2865,6 +2865,7 @@ fn build_system_reply(
     Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(incoming.routing.src.clone()),
             ttl: incoming.routing.ttl.max(1),
             trace_id: incoming.routing.trace_id.clone(),

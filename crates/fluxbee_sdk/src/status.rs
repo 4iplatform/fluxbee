@@ -53,6 +53,7 @@ pub async fn try_handle_default_node_status(
     let response = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(incoming.routing.src.clone()),
             ttl: 16,
             trace_id: incoming.routing.trace_id.clone(),

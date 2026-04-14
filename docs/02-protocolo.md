@@ -1,7 +1,7 @@
 # JSON Router - 02 Protocolo de Mensajes
 
-**Estado:** v1.21  
-**Fecha:** 2026-03-15  
+**Estado:** v1.22  
+**Fecha:** 2026-04-12  
 **Audiencia:** Desarrolladores de librería de nodo, desarrolladores de nodos
 
 ---
@@ -28,6 +28,7 @@ Usado por el router para decisiones de capa 1. El router DEBE poder tomar decisi
 {
   "routing": {
     "src": "uuid-origen",
+    "src_l2_name": "WF.demo@motherbee",
     "dst": "uuid-destino | nombre-l2@hive | null | \"broadcast\"",
     "ttl": 16,
     "trace_id": "uuid-correlación"
@@ -38,9 +39,23 @@ Usado por el router para decisiones de capa 1. El router DEBE poder tomar decisi
 | Campo | Tipo | Obligatorio | Descripción |
 |-------|------|-------------|-------------|
 | `src` | UUID | Sí | Nodo origen del mensaje |
+| `src_l2_name` | string | En entrega router -> nodo | Nombre L2 canónico del origen real, estampado por router |
 | `dst` | UUID, nombre L2, "broadcast", o null | Sí | Unicast (UUID o nombre) / Broadcast / Resolve via OPA |
 | `ttl` | int | Sí | Time-to-live, decrementa por hop WAN y broadcast |
 | `trace_id` | UUID | Sí | ID de correlación para trazabilidad |
+
+Reglas:
+- el sender no controla `routing.src_l2_name`
+- el router DEBE ignorar o sobrescribir cualquier `src_l2_name` provisto por el sender
+- en mensajes emitidos por un nodo hacia el router, `src_l2_name` puede omitirse
+- en mensajes entregados por el router a un nodo, `src_l2_name` debe reflejar el L2 canónico del origen real
+
+Semántica de forwarding:
+- `routing.src` siempre identifica el UUID L1 del emisor original, no el del router intermedio.
+- en entrega local, el router estampa `src_l2_name` desde la sesión autenticada del nodo origen.
+- en `router -> router -> nodo`, cada router receptor vuelve a estampar `src_l2_name` usando su tabla autoritativa de `peer_nodes` para ese mismo `routing.src`.
+- el valor visible para el nodo destino debe representar siempre al origen real del mensaje, no al gateway ni al hop intermedio.
+- si un router no puede asociar `routing.src` con un peer autenticado, no debe tratar un `src_l2_name` recibido desde la red como dato confiable.
 
 ### 2.1 Valores de `dst`
 
@@ -238,6 +253,8 @@ pub struct Message {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Routing {
     pub src: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src_l2_name: Option<String>,
     #[serde(deserialize_with = "deserialize_dst")]
     pub dst: Destination,
     pub ttl: u8,

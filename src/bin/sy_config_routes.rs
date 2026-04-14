@@ -12,10 +12,9 @@ use fluxbee_sdk::protocol::{
     MSG_CONFIG_SET, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    build_node_config_response_message, connect, parse_node_config_request, NodeConfig,
-    NodeConfigControlRequest, NodeConfigSetPayload, NodeReceiver, NodeSender,
-    NODE_CONFIG_APPLY_MODE_REPLACE, NODE_CONFIG_CONTROL_TARGET,
-    try_handle_default_node_status,
+    build_node_config_response_message, connect, parse_node_config_request,
+    try_handle_default_node_status, NodeConfig, NodeConfigControlRequest, NodeConfigSetPayload,
+    NodeReceiver, NodeSender, NODE_CONFIG_APPLY_MODE_REPLACE, NODE_CONFIG_CONTROL_TARGET,
 };
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, ConfigRegionWriter, StaticRouteEntry, VpnAssignment,
@@ -510,6 +509,7 @@ async fn send_config_response(
     let reply = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(request.routing.src.clone()),
             ttl: 16,
             trace_id: request.routing.trace_id.clone(),
@@ -695,6 +695,7 @@ async fn handle_admin_action(
     let reply = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(msg.routing.src.clone()),
             ttl: 16,
             trace_id: msg.routing.trace_id.clone(),

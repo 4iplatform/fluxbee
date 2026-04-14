@@ -1,0 +1,263 @@
+{
+  "wf_schema_version": "1",
+  "workflow_type": "invoice",
+  "description": "Manages the full lifecycle of an invoice: data collection, validation, sending, and completion.",
+  "input_schema": {
+    "type": "object",
+    "required": ["customer_id", "amount_cents"],
+    "properties": {
+      "customer_id": { "type": "string" },
+      "amount_cents": { "type": "integer", "minimum": 1 },
+      "currency": { "type": "string", "default": "USD" },
+      "due_date": { "type": "string", "description": "ISO 8601 date, e.g. 2026-05-01" }
+    }
+  },
+  "initial_state": "collecting_data",
+  "terminal_states": ["completed", "failed", "cancelled"],
+  "states": [
+    {
+      "name": "collecting_data",
+      "description": "Requests invoice data from the accounting system and sets a collection timeout.",
+      "entry_actions": [
+        {
+          "type": "send_message",
+          "target": "IO.quickbooks@motherbee",
+          "meta": { "msg": "INVOICE_CREATE_REQUEST" },
+          "payload": {
+            "customer_id": { "$ref": "input.customer_id" },
+            "amount_cents": { "$ref": "input.amount_cents" },
+            "currency": { "$ref": "input.currency" }
+          }
+        },
+        {
+          "type": "schedule_timer",
+          "timer_key": "collection_timeout",
+          "fire_in": "30m",
+          "missed_policy": "fire"
+        }
+      ],
+      "exit_actions": [
+        {
+          "type": "cancel_timer",
+          "timer_key": "collection_timeout"
+        }
+      ],
+      "transitions": [
+        {
+          "event_match": { "msg": "INVOICE_CREATE_RESPONSE" },
+          "guard": "event.payload.ok == true",
+          "target_state": "validating",
+          "actions": [
+            {
+              "type": "set_variable",
+              "name": "invoice_id",
+              "value": "event.payload.invoice_id"
+            },
+            {
+              "type": "set_variable",
+              "name": "collected_at",
+              "value": "now()"
+            }
+          ]
+        },
+        {
+          "event_match": { "msg": "INVOICE_CREATE_RESPONSE" },
+          "guard": "event.payload.ok == false",
+          "target_state": "failed",
+          "actions": [
+            {
+              "type": "set_variable",
+              "name": "failure_reason",
+              "value": "event.payload.error"
+            }
+          ]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.payload.timer_key == 'collection_timeout'",
+          "target_state": "failed",
+          "actions": [
+            {
+              "type": "set_variable",
+              "name": "failure_reason",
+              "value": "'collection_timeout'"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "validating",
+      "description": "Validates the collected invoice data and sets a validation timeout.",
+      "entry_actions": [
+        {
+          "type": "send_message",
+          "target": "IO.validator@motherbee",
+          "meta": { "msg": "INVOICE_VALIDATE_REQUEST" },
+          "payload": {
+            "invoice_id": { "$ref": "state.invoice_id" },
+            "customer_id": { "$ref": "input.customer_id" },
+            "amount_cents": { "$ref": "input.amount_cents" }
+          }
+        },
+        {
+          "type": "schedule_timer",
+          "timer_key": "validation_timeout",
+          "fire_in": "10m",
+          "missed_policy": "fire"
+        }
+      ],
+      "exit_actions": [
+        {
+          "type": "cancel_timer",
+          "timer_key": "validation_timeout"
+        }
+      ],
+      "transitions": [
+        {
+          "event_match": { "msg": "INVOICE_VALIDATE_RESPONSE" },
+          "guard": "event.payload.valid == true",
+          "target_state": "sending",
+          "actions": [
+            {
+              "type": "set_variable",
+              "name": "validated_at",
+              "value": "now()"
+            }
+          ]
+        },
+        {
+          "event_match": { "msg": "INVOICE_VALIDATE_RESPONSE" },
+          "guard": "event.payload.valid == false",
+          "target_state": "failed",
+          "actions": [
+            {
+              "type": "set_variable",
+              "name": "failure_reason",
+              "value": "event.payload.reason"
+            }
+          ]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.payload.timer_key == 'validation_timeout'",
+          "target_state": "failed",
+          "actions": [
+            {
+              "type": "set_variable",
+              "name": "failure_reason",
+              "value": "'validation_timeout'"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "sending",
+      "description": "Sends the validated invoice to the customer and awaits delivery confirmation.",
+      "entry_actions": [
+        {
+          "type": "send_message",
+          "target": "IO.email@motherbee",
+          "meta": { "msg": "INVOICE_SEND_REQUEST" },
+          "payload": {
+            "invoice_id": { "$ref": "state.invoice_id" },
+            "customer_id": { "$ref": "input.customer_id" },
+            "amount_cents": { "$ref": "input.amount_cents" },
+            "currency": { "$ref": "input.currency" }
+          }
+        },
+        {
+          "type": "schedule_timer",
+          "timer_key": "send_timeout",
+          "fire_in": "5m",
+          "missed_policy": "fire"
+        }
+      ],
+      "exit_actions": [
+        {
+          "type": "cancel_timer",
+          "timer_key": "send_timeout"
+        }
+      ],
+      "transitions": [
+        {
+          "event_match": { "msg": "INVOICE_SEND_RESPONSE" },
+          "guard": "event.payload.delivered == true",
+          "target_state": "completed",
+          "actions": [
+            {
+              "type": "set_variable",
+              "name": "sent_at",
+              "value": "now()"
+            }
+          ]
+        },
+        {
+          "event_match": { "msg": "INVOICE_SEND_RESPONSE" },
+          "guard": "event.payload.delivered == false",
+          "target_state": "failed",
+          "actions": [
+            {
+              "type": "set_variable",
+              "name": "failure_reason",
+              "value": "'send_failed'"
+            }
+          ]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.payload.timer_key == 'send_timeout'",
+          "target_state": "failed",
+          "actions": [
+            {
+              "type": "set_variable",
+              "name": "failure_reason",
+              "value": "'send_timeout'"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "completed",
+      "description": "Invoice delivered successfully.",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": []
+    },
+    {
+      "name": "failed",
+      "description": "Invoice processing failed.",
+      "entry_actions": [
+        {
+          "type": "send_message",
+          "target": "IO.notifications@motherbee",
+          "meta": { "msg": "INVOICE_FAILED_NOTIFICATION" },
+          "payload": {
+            "customer_id": { "$ref": "input.customer_id" },
+            "failure_reason": { "$ref": "state.failure_reason" }
+          }
+        }
+      ],
+      "exit_actions": [],
+      "transitions": []
+    },
+    {
+      "name": "cancelled",
+      "description": "Invoice cancelled by operator.",
+      "entry_actions": [
+        {
+          "type": "send_message",
+          "target": "IO.notifications@motherbee",
+          "meta": { "msg": "INVOICE_CANCELLED_NOTIFICATION" },
+          "payload": {
+            "customer_id": { "$ref": "input.customer_id" }
+          }
+        }
+      ],
+      "exit_actions": [],
+      "transitions": []
+    }
+  ]
+}

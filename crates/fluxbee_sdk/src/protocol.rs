@@ -14,6 +14,8 @@ pub struct Message {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Routing {
     pub src: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src_l2_name: Option<String>,
     #[serde(deserialize_with = "deserialize_dst")]
     pub dst: Destination,
     pub ttl: u8,
@@ -297,6 +299,18 @@ pub struct LsaVpn {
     pub vpn_id: u32,
 }
 
+impl Message {
+    /// Returns the L2 canonical name of the sender as stamped by the router.
+    ///
+    /// This field is set authoritatively by the local router on every delivery;
+    /// node code should read it here rather than performing any SHM lookup.
+    /// Returns `None` only when the message was not yet delivered by a router
+    /// (e.g. messages constructed locally before sending).
+    pub fn source_l2_name(&self) -> Option<&str> {
+        self.routing.src_l2_name.as_deref()
+    }
+}
+
 pub const SYSTEM_KIND: &str = "system";
 
 pub const MSG_HELLO: &str = "HELLO";
@@ -339,6 +353,7 @@ pub fn build_system_message(
     Message {
         routing: Routing {
             src: src.to_string(),
+            src_l2_name: None,
             dst,
             ttl,
             trace_id: trace_id.to_string(),
@@ -550,5 +565,151 @@ where
         Value::String(s) if s == "broadcast" => Ok(Destination::Broadcast),
         Value::String(s) => Ok(Destination::Unicast(s)),
         _ => Err(serde::de::Error::custom("invalid dst")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_system_message_omits_src_l2_name_on_outbound_messages() {
+        let msg = build_system_message(
+            "src-uuid-1",
+            Destination::Unicast("dst-uuid-1".to_string()),
+            16,
+            "trace-1",
+            MSG_ECHO,
+            json!({}),
+        );
+        assert_eq!(msg.routing.src_l2_name, None);
+
+        let encoded = serde_json::to_value(&msg).expect("serialize");
+        let routing = encoded
+            .get("routing")
+            .and_then(Value::as_object)
+            .expect("routing object");
+        assert!(!routing.contains_key("src_l2_name"));
+    }
+
+    #[test]
+    fn routing_parses_router_stamped_src_l2_name() {
+        let raw = json!({
+            "routing": {
+                "src": "src-uuid-1",
+                "src_l2_name": "WF.demo@motherbee",
+                "dst": "dst-uuid-1",
+                "ttl": 16,
+                "trace_id": "trace-1"
+            },
+            "meta": {
+                "type": "system",
+                "msg": "HELLO"
+            },
+            "payload": {}
+        });
+
+        let msg: Message = serde_json::from_value(raw).expect("deserialize message");
+        assert_eq!(
+            msg.routing.src_l2_name.as_deref(),
+            Some("WF.demo@motherbee")
+        );
+    }
+
+    // L2-LOOKUP-10: source_l2_name() helper
+    #[test]
+    fn source_l2_name_returns_stamped_value() {
+        let raw = json!({
+            "routing": {
+                "src": "abc-uuid",
+                "src_l2_name": "AI.chat@motherbee",
+                "dst": "dst-uuid",
+                "ttl": 16,
+                "trace_id": "trace-x"
+            },
+            "meta": { "type": "system", "msg": "ECHO" },
+            "payload": {}
+        });
+        let msg: Message = serde_json::from_value(raw).expect("deserialize");
+        assert_eq!(msg.source_l2_name(), Some("AI.chat@motherbee"));
+    }
+
+    #[test]
+    fn source_l2_name_returns_none_when_absent() {
+        let msg = build_system_message(
+            "abc-uuid",
+            Destination::Unicast("dst-uuid".to_string()),
+            16,
+            "trace-x",
+            MSG_ECHO,
+            json!({}),
+        );
+        assert_eq!(msg.source_l2_name(), None);
+    }
+
+    // L2-LOOKUP-12: wire compatibility — src_l2_name absent in serialized output when None
+    #[test]
+    fn serialize_roundtrip_without_src_l2_name() {
+        let msg = build_system_message(
+            "uuid-sender",
+            Destination::Unicast("uuid-dst".to_string()),
+            8,
+            "trace-rt",
+            MSG_ECHO,
+            json!({"key": "value"}),
+        );
+        let encoded = serde_json::to_string(&msg).expect("serialize");
+        assert!(
+            !encoded.contains("src_l2_name"),
+            "field must be absent when None"
+        );
+
+        let decoded: Message = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded.routing.src, "uuid-sender");
+        assert_eq!(decoded.routing.src_l2_name, None);
+        assert_eq!(decoded.routing.ttl, 8);
+    }
+
+    #[test]
+    fn serialize_roundtrip_with_src_l2_name() {
+        let raw = json!({
+            "routing": {
+                "src": "uuid-sender",
+                "src_l2_name": "IO.webchat@hivename",
+                "dst": "uuid-dst",
+                "ttl": 8,
+                "trace_id": "trace-rt2"
+            },
+            "meta": { "type": "system", "msg": "ECHO" },
+            "payload": {}
+        });
+        let msg: Message = serde_json::from_value(raw).expect("deserialize");
+        assert_eq!(
+            msg.routing.src_l2_name.as_deref(),
+            Some("IO.webchat@hivename")
+        );
+
+        let re_encoded = serde_json::to_value(&msg).expect("re-serialize");
+        let re_field = re_encoded["routing"]["src_l2_name"].as_str();
+        assert_eq!(re_field, Some("IO.webchat@hivename"));
+    }
+
+    #[test]
+    fn messages_without_src_l2_name_field_deserialize_cleanly() {
+        // Wire messages from older nodes or the router itself (UNREACHABLE, HELLO) will
+        // never carry src_l2_name — they must still parse without errors.
+        let raw = json!({
+            "routing": {
+                "src": "uuid-router",
+                "dst": "uuid-dst",
+                "ttl": 16,
+                "trace_id": "trace-old"
+            },
+            "meta": { "type": "system", "msg": "UNREACHABLE" },
+            "payload": { "original_dst": "uuid-x", "reason": "NODE_NOT_FOUND" }
+        });
+        let msg: Message = serde_json::from_value(raw).expect("deserialize");
+        assert_eq!(msg.routing.src_l2_name, None);
+        assert_eq!(msg.source_l2_name(), None);
     }
 }

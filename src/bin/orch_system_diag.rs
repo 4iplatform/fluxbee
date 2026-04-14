@@ -170,6 +170,7 @@ async fn send_system_message(
     let message = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst,
             ttl: 16,
             trace_id: trace_id.clone(),

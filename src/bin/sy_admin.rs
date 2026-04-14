@@ -130,6 +130,15 @@ impl AdminRouterClient {
                 let _ = tx.send(msg);
                 return;
             }
+            tracing::debug!(
+                trace_id = %msg.routing.trace_id,
+                msg_type = %msg.meta.msg_type,
+                msg = ?msg.meta.msg,
+                action = ?msg.meta.action,
+                src = %msg.routing.src,
+                dst = ?msg.routing.dst,
+                "sy.admin saw admin/system message without pending waiter"
+            );
         }
         if msg.meta.msg_type == "admin" && msg.meta.msg.as_deref() == Some(MSG_ADMIN_COMMAND) {
             let _ = self.internal_admin_tx.send(msg);
@@ -515,6 +524,7 @@ async fn broadcast_config_changed(
     let msg = Message {
         routing: Routing {
             src: client.sender.uuid().to_string(),
+            src_l2_name: None,
             dst,
             ttl: 16,
             trace_id: Uuid::new_v4().to_string(),
@@ -765,6 +775,7 @@ async fn send_admin_command_response(
     let response = Message {
         routing: Routing {
             src: client.sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(request_msg.routing.src.clone()),
             ttl: 16,
             trace_id: request_msg.routing.trace_id.clone(),
@@ -2308,15 +2319,20 @@ async fn handle_hive_paths(
         }
         ("GET", ["timer", "timers"]) => {
             let mut payload = serde_json::json!({});
-            if let Some(owner_l2_name) = query.get("owner_l2_name").filter(|value| !value.is_empty())
+            if let Some(owner_l2_name) =
+                query.get("owner_l2_name").filter(|value| !value.is_empty())
             {
                 payload["owner_l2_name"] = serde_json::json!(owner_l2_name);
             }
-            if let Some(status_filter) = query.get("status_filter").filter(|value| !value.is_empty())
+            if let Some(status_filter) =
+                query.get("status_filter").filter(|value| !value.is_empty())
             {
                 payload["status_filter"] = serde_json::json!(status_filter);
             }
-            if let Some(limit) = query.get("limit").and_then(|value| value.parse::<u64>().ok()) {
+            if let Some(limit) = query
+                .get("limit")
+                .and_then(|value| value.parse::<u64>().ok())
+            {
                 payload["limit"] = serde_json::json!(limit);
             }
             let (status, resp) =
@@ -2372,8 +2388,7 @@ async fn handle_hive_paths(
                 serde_json::from_slice(body)?
             };
             let (status, resp) =
-                handle_timer_rpc(ctx, client, "timer_parse", "TIMER_PARSE", payload, hive)
-                    .await?;
+                handle_timer_rpc(ctx, client, "timer_parse", "TIMER_PARSE", payload, hive).await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["timer", "format"]) => {
@@ -2670,13 +2685,6 @@ fn drift_alerts_payload_from_query(query: &HashMap<String, String>) -> serde_jso
     payload
 }
 
-fn load_node_uuid(dir: &Path, base_name: &str) -> Result<String, AdminError> {
-    let path = dir.join(format!("{base_name}.uuid"));
-    let data = fs::read_to_string(&path)?;
-    let uuid = Uuid::parse_str(data.trim())?;
-    Ok(uuid.to_string())
-}
-
 fn is_mother_role(role: Option<&str>) -> bool {
     matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee")
 }
@@ -2759,11 +2767,25 @@ fn value_string_field(value: &serde_json::Value, field: &str) -> Option<String> 
 }
 
 fn payload_error_code(payload: &serde_json::Value) -> Option<String> {
-    value_string_field(payload, "error_code")
+    value_string_field(payload, "error_code").or_else(|| {
+        payload
+            .get("error")
+            .and_then(|value| value.get("code"))
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+    })
 }
 
 fn payload_error_detail(payload: &serde_json::Value) -> Option<String> {
-    value_string_field(payload, "error_detail").or_else(|| value_string_field(payload, "message"))
+    value_string_field(payload, "error_detail")
+        .or_else(|| value_string_field(payload, "message"))
+        .or_else(|| {
+            payload
+                .get("error")
+                .and_then(|value| value.get("message"))
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+        })
 }
 
 async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
@@ -3044,6 +3066,16 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
 
 fn is_ok_status(status: Option<&str>) -> bool {
     matches!(status, Some(value) if value.eq_ignore_ascii_case("ok") || value.eq_ignore_ascii_case("not_found"))
+}
+
+fn payload_is_ok(payload: &serde_json::Value) -> bool {
+    if is_ok_status(payload.get("status").and_then(|v| v.as_str())) {
+        return true;
+    }
+    payload
+        .get("ok")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 async fn respond_json(
@@ -3792,16 +3824,8 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             "IANA timezone name, for example America/Argentina/Buenos_Aires.",
         )],
         "timer_convert" => vec![
-            admin_action_body_field(
-                "instant_utc_ms",
-                "i64",
-                "UTC instant in unix milliseconds.",
-            ),
-            admin_action_body_field(
-                "to_tz",
-                "string",
-                "IANA timezone name to convert into.",
-            ),
+            admin_action_body_field("instant_utc_ms", "i64", "UTC instant in unix milliseconds."),
+            admin_action_body_field("to_tz", "string", "IANA timezone name to convert into."),
         ],
         "timer_parse" => vec![
             admin_action_body_field("input", "string", "Input date/time text to parse."),
@@ -3809,11 +3833,7 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field("tz", "string", "IANA timezone applied to the parsed input."),
         ],
         "timer_format" => vec![
-            admin_action_body_field(
-                "instant_utc_ms",
-                "i64",
-                "UTC instant in unix milliseconds.",
-            ),
+            admin_action_body_field("instant_utc_ms", "i64", "UTC instant in unix milliseconds."),
             admin_action_body_field("layout", "string", "Go time layout used for formatting."),
             admin_action_body_field("tz", "string", "IANA timezone used for rendering."),
         ],
@@ -4495,6 +4515,7 @@ async fn handle_send_node_message(
     let message = Message {
         routing: Routing {
             src: client.sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(node_name.clone()),
             ttl,
             trace_id: trace_id.clone(),
@@ -5107,16 +5128,11 @@ fn build_admin_request(
     } else {
         format!("{}@{}", base, route_hive)
     };
-    let unicast = if target.ends_with(&format!("@{}", ctx.hive_id)) {
-        load_node_uuid(&ctx.state_dir.join("nodes"), base).ok()
-    } else {
-        None
-    };
     AdminRequest {
         action: action.to_string(),
         payload,
         target,
-        unicast,
+        unicast: None,
     }
 }
 
@@ -5133,7 +5149,8 @@ async fn send_admin_request(
     let msg = Message {
         routing: Routing {
             src: client.sender.uuid().to_string(),
-            dst: Destination::Unicast(dst),
+            src_l2_name: None,
+            dst: Destination::Unicast(dst.clone()),
             ttl: 16,
             trace_id: trace_id.clone(),
         },
@@ -5219,6 +5236,7 @@ async fn send_system_request_with_meta(
     let msg = Message {
         routing: Routing {
             src: client.sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(target.to_string()),
             ttl,
             trace_id: trace_id.clone(),
@@ -5338,8 +5356,7 @@ fn build_admin_http_response(
 ) -> (u16, String) {
     match response {
         Ok(payload) => {
-            let status = payload.get("status").and_then(|v| v.as_str());
-            if is_ok_status(status) {
+            if payload_is_ok(&payload) {
                 return (
                     200,
                     serde_json::json!({
@@ -5627,6 +5644,7 @@ async fn send_opa_query(
     let msg = Message {
         routing: Routing {
             src: client.sender.uuid().to_string(),
+            src_l2_name: None,
             dst,
             ttl: 16,
             trace_id: Uuid::new_v4().to_string(),
@@ -6088,6 +6106,7 @@ mod tests {
         tx.send(Message {
             routing: Routing {
                 src: "SY.opa.rules@motherbee".to_string(),
+                src_l2_name: Some("SY.opa.rules@motherbee".to_string()),
                 dst: Destination::Unicast("SY.admin@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-opa-config".to_string(),
@@ -6125,6 +6144,7 @@ mod tests {
         tx.send(Message {
             routing: Routing {
                 src: "SY.opa.rules@motherbee".to_string(),
+                src_l2_name: Some("SY.opa.rules@motherbee".to_string()),
                 dst: Destination::Unicast("SY.admin@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-opa-query".to_string(),
@@ -6242,5 +6262,22 @@ mod tests {
                 { "name": "limit", "type": "u32", "description": "Optional result limit. Defaults inside SY.timer and is capped there." }
             ])
         );
+    }
+
+    #[test]
+    fn build_admin_http_response_accepts_timer_ok_boolean_contract() {
+        let payload = json!({
+            "ok": true,
+            "verb": "TIMER_LIST",
+            "count": 0,
+            "timers": []
+        });
+
+        let (status, body) = build_admin_http_response("timer_list", Ok(payload));
+        let body_json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+
+        assert_eq!(status, 200);
+        assert_eq!(body_json["status"], json!("ok"));
+        assert_eq!(body_json["error_code"], serde_json::Value::Null);
     }
 }

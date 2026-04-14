@@ -621,6 +621,7 @@ impl GovIdentityBridge {
         let req = Message {
             routing: Routing {
                 src,
+                src_l2_name: None,
                 dst: Destination::Unicast(target.to_string()),
                 ttl: 16,
                 trace_id: trace_id.clone(),
@@ -3989,6 +3990,7 @@ mod tests {
         Message {
             routing: Routing {
                 src: "SY.orchestrator@motherbee".to_string(),
+                src_l2_name: None,
                 dst: Destination::Unicast("SY.frontdesk.gov@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-123".to_string(),
@@ -4166,6 +4168,7 @@ mod tests {
         Message {
             routing: Routing {
                 src: "IO.sim.local@motherbee".to_string(),
+                src_l2_name: None,
                 dst: Destination::Unicast("SY.frontdesk.gov@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-user-123".to_string(),
@@ -4313,6 +4316,7 @@ mod tests {
         let msg = Message {
             routing: Routing {
                 src: "SY.admin@motherbee".to_string(),
+                src_l2_name: None,
                 dst: Destination::Unicast("AI.chat@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-config-123".to_string(),

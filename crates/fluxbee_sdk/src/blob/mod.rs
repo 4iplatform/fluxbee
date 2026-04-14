@@ -399,6 +399,7 @@ impl BlobToolkit {
                 let message = Message {
                     routing: Routing {
                         src: sender.uuid().to_string(),
+                        src_l2_name: None,
                         dst: Destination::Unicast(target.clone()),
                         ttl: 16,
                         trace_id: trace_id.clone(),

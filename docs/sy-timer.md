@@ -1,7 +1,7 @@
 # SY.timer — Nodo del Sistema
 
-**Estado:** v1.0 implemented / aligned with current runtime
-**Fecha:** 2026-04-08
+**Estado:** v1.1 implemented / aligned with current runtime
+**Fecha:** 2026-04-13
 **Audiencia:** Desarrolladores de nodos, autores de workflows, ops/SRE
 
 ---
@@ -19,7 +19,7 @@ Forma parte de la familia de nodos del sistema, junto con `SY.storage`, `SY.admi
 
 **No es un sistema de tiempo real.** `SY.timer` está diseñado para workflows, cognición, agentes y automatización. La granularidad mínima de un timer es **60 segundos**, la precisión de disparo es *best-effort* con tolerancia del orden de segundos, y la carga esperada es de hasta ~10.000 timers concurrentes por hive.
 
-**Ownership estricto por nombre L2 para mutaciones.** Cada nodo puede crear, cancelar y reschedulear sus propios timers. La lectura (`TIMER_GET`, `TIMER_LIST`) es abierta dentro del hive. La única excepción de mutación administrativa es `SY.orchestrator`, que puede invocar `TIMER_PURGE_OWNER` como parte del teardown de un nodo. La resolución `routing.src (UUID) -> nombre L2` se realiza a través del runtime/SDK Go leyendo la SHM del router local al que el nodo quedó efectivamente conectado según el `ANNOUNCE`, no por heurística local del nodo ni por archivos `.uuid`.
+**Ownership estricto por nombre L2 para mutaciones.** Cada nodo puede crear, cancelar y reschedulear sus propios timers. La lectura (`TIMER_GET`, `TIMER_LIST`) es abierta dentro del hive. La única excepción de mutación administrativa es `SY.orchestrator`, que puede invocar `TIMER_PURGE_OWNER` como parte del teardown de un nodo. La identidad efectiva del requester se toma de `routing.src_l2_name`, estampado autoritativamente por el router al entregar el mensaje. `SY.timer` no resuelve ownership por SHM ni por archivos `.uuid`.
 
 ---
 
@@ -67,7 +67,7 @@ Las operaciones owner-bound de mutación siguen fuera de `SY.admin` y se mantien
 - `TIMER_CANCEL`
 - `TIMER_RESCHEDULE`
 
-`TIMER_GET` y `TIMER_LIST` sí pueden exponerse por `SY.admin` porque la lectura es abierta en v1. La razón para mantener scheduling y mutaciones fuera de admin es arquitectónica: `SY.timer` autoriza esas operaciones por identidad efectiva del requester (`routing.src` resuelto a L2), y `SY.admin` no actúa como proxy transparente de ownership.
+`TIMER_GET` y `TIMER_LIST` sí pueden exponerse por `SY.admin` porque la lectura es abierta en v1. La razón para mantener scheduling y mutaciones fuera de admin es arquitectónica: `SY.timer` autoriza esas operaciones por identidad efectiva del requester (`routing.src_l2_name`, estampado por router), y `SY.admin` no actúa como proxy transparente de ownership.
 
 Nodos futuros con interacción directa (por ejemplo `WF.*`, `SY.policy`, capabilities invocables) deben implementar su propia operación `HELP` equivalente. La generalización del protocolo, los campos comunes y el naming se formalizarán en un documento aparte cuando aparezca el segundo o tercer caso.
 
@@ -199,6 +199,9 @@ CREATE TABLE timers (
 CREATE INDEX idx_timers_owner ON timers(owner_l2_name);
 CREATE INDEX idx_timers_fire_at ON timers(fire_at_utc) WHERE status='pending';
 CREATE INDEX idx_timers_status ON timers(status);
+CREATE UNIQUE INDEX idx_timers_owner_clientref_pending
+ON timers(owner_l2_name, client_ref)
+WHERE client_ref IS NOT NULL AND status='pending';
 ```
 
 **Notas:**
@@ -241,9 +244,9 @@ Todos los mensajes siguen el envelope estándar de Fluxbee:
 |---|---|
 | `TIMER_SCHEDULE` | Crear timer one-shot |
 | `TIMER_SCHEDULE_RECURRING` | Crear timer recurrente (cron) |
-| `TIMER_CANCEL` | Cancelar timer propio |
-| `TIMER_RESCHEDULE` | Modificar `fire_at` de timer propio pendiente |
-| `TIMER_GET` | Obtener un timer por uuid |
+| `TIMER_CANCEL` | Cancelar timer propio por `timer_uuid` o `client_ref` |
+| `TIMER_RESCHEDULE` | Modificar `fire_at` de timer propio pendiente por `timer_uuid` o `client_ref` |
+| `TIMER_GET` | Obtener un timer por `timer_uuid`, o el timer activo propio por `client_ref` |
 | `TIMER_LIST` | Listar timers del hive, opcionalmente filtrados por owner |
 | `TIMER_NOW` | Obtener instante actual en UTC |
 | `TIMER_NOW_IN` | Obtener instante actual en timezone especificada |
@@ -261,7 +264,7 @@ Todos los mensajes siguen el envelope estándar de Fluxbee:
 
 ### 7.1 `TIMER_SCHEDULE`
 
-Crea un timer one-shot.
+Crea un timer one-shot. Si llega con `client_ref` y ya existe un timer activo del mismo owner con esa referencia, la operación es idempotente y devuelve el timer existente.
 
 **Request:**
 
@@ -292,8 +295,8 @@ Crea un timer one-shot.
 |---|---|---|
 | `fire_at_utc_ms` | sí* | Instante absoluto UTC en ms. Alternativa a `fire_in_ms`. |
 | `fire_in_ms` | sí* | Duración relativa desde `now()`. Alternativa a `fire_at_utc_ms`. |
-| `target_l2_name` | no | Nombre L2 del nodo a notificar. Default: el propio requester, resuelto server-side desde `routing.src` mediante el runtime/SDK. |
-| `client_ref` | no | Etiqueta amigable definida por el cliente. |
+| `target_l2_name` | no | Nombre L2 del nodo a notificar. Default: el propio requester, derivado desde `routing.src_l2_name`. |
+| `client_ref` | no | Identificador opcional definido por el cliente. Si se reusa sobre un timer activo del mismo owner, `TIMER_SCHEDULE` devuelve el timer existente en vez de crear otro. |
 | `payload` | no | JSON arbitrario que se incluirá en `TIMER_FIRED.payload.user_payload`. |
 | `missed_policy` | no | `"fire"` (default), `"drop"`, o `"fire_if_within"`. |
 | `missed_within_ms` | condicional | Obligatorio si `missed_policy="fire_if_within"`. |
@@ -316,7 +319,8 @@ Crea un timer one-shot.
     "ok": true,
     "verb": "TIMER_SCHEDULE",
     "timer_uuid": "9d8c6f4b-2f4d-4ad4-b5f4-8d8d9d9d0001",
-    "fire_at_utc_ms": 1775577600000
+    "fire_at_utc_ms": 1775577600000,
+    "already_existed": false
   }
 }
 ```
@@ -354,7 +358,7 @@ Crea un timer recurrente con sintaxis cron estándar.
 - Intervalo entre disparos debe ser `>= 60s`. Error `TIMER_BELOW_MINIMUM`.
 - `cron_tz` debe ser una zona IANA válida. Error `TIMER_INVALID_TIMEZONE`.
 
-**Response OK:** igual que `TIMER_SCHEDULE`, con el `fire_at_utc_ms` del **próximo** disparo computado.
+**Response OK:** igual que `TIMER_SCHEDULE`, con el `fire_at_utc_ms` del **próximo** disparo computado y `already_existed` indicando si el timer activo ya existía para ese `client_ref`.
 
 ### 7.3 `TIMER_CANCEL`
 
@@ -365,9 +369,22 @@ Crea un timer recurrente con sintaxis cron estándar.
 }
 ```
 
-Validación: el `owner_l2_name` del timer debe coincidir con el nombre L2 resuelto desde `routing.src`. Si no: `TIMER_NOT_OWNER`.
+También puede invocarse con:
 
-Si el timer ya fue disparado (`status = 'fired'`): `TIMER_ALREADY_FIRED`. Si no existe: `TIMER_NOT_FOUND`.
+```json
+{
+  "meta": { "msg": "TIMER_CANCEL" },
+  "payload": { "client_ref": "wf:instance-123::sla_timeout" }
+}
+```
+
+Si vienen ambos campos, `timer_uuid` gana.
+
+Validación: el `owner_l2_name` del timer debe coincidir con `routing.src_l2_name` para verbos de mutación. Si no: `TIMER_NOT_OWNER`.
+
+Si el timer ya fue disparado (`status = 'fired'`): `TIMER_ALREADY_FIRED`.
+- Por `timer_uuid`, si no existe: `TIMER_NOT_FOUND`.
+- Por `client_ref`, si no existe un timer activo del requester: respuesta `ok=true, found=false`.
 
 **Response OK:**
 ```json
@@ -376,7 +393,8 @@ Si el timer ya fue disparado (`status = 'fired'`): `TIMER_ALREADY_FIRED`. Si no 
     "ok": true,
     "verb": "TIMER_CANCEL",
     "timer_uuid": "9d8c6f4b-...",
-    "status": "canceled"
+    "status": "canceled",
+    "found": true
   }
 }
 ```
@@ -397,6 +415,18 @@ Modifica el `fire_at` de un timer one-shot pendiente.
 
 Alternativamente, `new_fire_in_ms` relativo a `now()`.
 
+También puede identificar el timer por `client_ref` del owner activo:
+
+```json
+{
+  "meta": { "msg": "TIMER_RESCHEDULE" },
+  "payload": {
+    "client_ref": "wf:instance-123::sla_timeout",
+    "new_fire_in_ms": 120000
+  }
+}
+```
+
 Validación: mismo ownership check. Solo aplica a timers en `status='pending'`. Para timers recurrentes no se permite reschedule en v1 (cancelar y recrear). Error `TIMER_RECURRING_NOT_RESCHEDULABLE`.
 
 El mínimo de 60s se aplica al `new_fire_at` también.
@@ -407,6 +437,15 @@ El mínimo de 60s se aplica al `new_fire_at` también.
 {
   "meta": { "msg": "TIMER_GET" },
   "payload": { "timer_uuid": "9d8c6f4b-..." }
+}
+```
+
+También puede consultarse el timer activo propio por `client_ref`:
+
+```json
+{
+  "meta": { "msg": "TIMER_GET" },
+  "payload": { "client_ref": "wf:instance-123::sla_timeout" }
 }
 ```
 
@@ -438,7 +477,9 @@ El mínimo de 60s se aplica al `new_fire_at` también.
 }
 ```
 
-Lectura abierta dentro del hive. No requiere ownership del requester.
+Lectura por `timer_uuid`: abierta dentro del hive. No requiere ownership del requester.
+
+Lectura por `client_ref`: owner-scoped. `SY.timer` busca solo dentro de `(routing.src_l2_name, client_ref)` y devuelve `TIMER_NOT_FOUND` si no existe un timer activo del requester con esa referencia.
 
 ### 7.6 `TIMER_LIST`
 
@@ -817,6 +858,30 @@ SY.admin (HTTP request)
 
 El orchestrator debe llamar a `TIMER_PURGE_OWNER` **antes** de matar el proceso del nodo, para evitar la condición de carrera donde el nodo recibe un `TIMER_FIRED` justo mientras está siendo terminado. Si `SY.timer` está caído en ese momento, el orchestrator debe proceder con el borrado igualmente y loggear el fallo; los timers huérfanos serán descartados naturalmente cuando sus eventos `TIMER_FIRED` no encuentren target (y eventualmente podrán ser limpiados manualmente).
 
+### 12.4 Migración de schema v1.0 → v1.1
+
+La extensión v1.1 es **completamente backward compatible**. No se eliminan ni modifican columnas ni verbos existentes. El único cambio de schema es la adición de un índice único parcial:
+
+```sql
+CREATE UNIQUE INDEX idx_timers_owner_clientref_pending
+ON timers(owner_l2_name, client_ref)
+WHERE client_ref IS NOT NULL AND status = 'pending';
+```
+
+Este índice se crea automáticamente en el arranque si `PRAGMA user_version` es menor a 2. Los clientes v1.0 que no pasen `client_ref` siguen funcionando sin ningún cambio.
+
+**Check previo recomendado antes de deployar v1.1 sobre una DB existente:**
+
+```sql
+SELECT owner_l2_name, client_ref, COUNT(*)
+FROM timers
+WHERE client_ref IS NOT NULL AND status = 'pending'
+GROUP BY owner_l2_name, client_ref
+HAVING COUNT(*) > 1;
+```
+
+Si esta query no devuelve filas, la migración procede sin fricción. Si devuelve filas, hay duplicados de `client_ref` activos que no deberían existir en un uso normal de v1.0 (donde `client_ref` era solo metadata decorativa); revisarlos manualmente antes de continuar. El nodo falla con error explícito si el índice no puede crearse.
+
 ---
 
 ## 13. Sintaxis Cron Soportada
@@ -862,6 +927,8 @@ Para nodos `WF.*`, `AI.*`, `IO.*` y futuros nodos Go, el patrón recomendado es:
 4. procesar `TIMER_FIRED` como mensaje `system` normal en el handler del nodo
 
 En v1 este es el camino primario de integración. `SY.admin` aporta visibilidad read-only y utilidades de tiempo, pero la semántica owner-bound de scheduling y mutaciones sigue siendo de uso directo por SDK.
+
+**Nota de transporte:** el `fluxbee-go-sdk` emite estas requests directas como `system` unicast local con TTL default `1`, porque el destino esperado es siempre el `SY.timer@<hive-local>` del mismo hive. Los ejemplos de envelope en esta spec son ilustrativos del shape; el contrato canónico para clientes SDK queda fijado además por los golden tests del SDK.
 
 Ejemplo mínimo:
 
@@ -938,6 +1005,27 @@ type RecurringOptions struct {
 }
 
 func ScheduleRecurring(ctx context.Context, opts RecurringOptions) (TimerID, error)
+
+### 14.3 Estado del SDK Rust
+
+En el estado actual del runtime:
+
+- la superficie rica y tipada de `SY.timer` está implementada en `fluxbee-go-sdk`
+- `fluxbee_sdk` (Rust) todavía **no** expone un módulo `timer` equivalente
+
+Eso no es un accidente de diseño ni una decisión de largo plazo: es una deuda explícita de paridad de SDK.
+
+El objetivo correcto para el SDK Rust es replicar:
+
+- helpers tipados de tiempo (`now`, `now_in`, `convert`, `parse`, `format`, `help`)
+- cliente tipado de scheduling (`schedule`, `schedule_in`, `schedule_recurring`, `get`, `list`, `cancel`, `reschedule`, `purge_owner`)
+- parseo de `TIMER_RESPONSE`
+- parseo de `TIMER_FIRED`
+- errores y validación client-side comparables al SDK Go
+
+El backlog formal de ese trabajo queda en [sdk_tasks.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/onworking%20COA/sdk_tasks.md) bajo la sección `RUST-TIMER-SDK`.
+
+**Decisión de alcance:** esta paridad del SDK Rust no implica que `SY.orchestrator` deba usar `SY.timer` para su funcionamiento base en v1. El trabajo es primero de capacidad del SDK y de soporte a nuevos consumidores Rust, no de re-arquitectura del control-plane.
 
 // --- Gestión ---
 func Cancel(ctx context.Context, id TimerID) error

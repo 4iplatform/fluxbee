@@ -232,6 +232,7 @@ fn build_node_config_message(
     Ok(Message {
         routing: Routing {
             src: src_uuid.to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(target_node.to_string()),
             ttl: normalize_ttl(options.ttl),
             trace_id: trace_id.to_string(),
@@ -259,6 +260,7 @@ fn build_reply_routing(msg: &Message, src_uuid: &str) -> Routing {
 
     Routing {
         src: src_uuid.to_string(),
+        src_l2_name: None,
         dst,
         ttl: normalize_ttl(msg.routing.ttl),
         trace_id: msg.routing.trace_id.clone(),
@@ -382,6 +384,7 @@ mod tests {
         let msg = Message {
             routing: Routing {
                 src: "runtime-1".to_string(),
+                src_l2_name: None,
                 dst: Destination::Unicast("caller-1".to_string()),
                 ttl: 16,
                 trace_id: "trace-4".to_string(),

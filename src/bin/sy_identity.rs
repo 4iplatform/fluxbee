@@ -25,15 +25,13 @@ use fluxbee_sdk::{
 };
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, IchEntry, IdentityRegionLimits, IdentityRegionWriter,
-    IlkAliasEntry, IlkEntry, LsaRegionReader, LsaSnapshot, NodeEntry, RouterRegionReader,
-    ShmSnapshot, TenantEntry, VocabularyEntry, FLAG_ACTIVE, ICH_ADDRESS_MAX_LEN,
-    ICH_CHANNEL_TYPE_MAX_LEN,
+    IlkAliasEntry, IlkEntry, TenantEntry, VocabularyEntry, FLAG_ACTIVE,
+    ICH_ADDRESS_MAX_LEN, ICH_CHANNEL_TYPE_MAX_LEN,
 };
 
 type IdentityError = Box<dyn std::error::Error + Send + Sync>;
 const PRIMARY_HIVE_ID: &str = "motherbee";
 
-const DEFAULT_GATEWAY_NAME: &str = "RT.gateway";
 const DEFAULT_DEFAULT_TENANT_NAME: &str = "fluxbee";
 const DEFAULT_MERGE_ALIAS_TTL_SECS: u64 = 3600;
 const ALIAS_GC_INTERVAL_SECS: u64 = 30;
@@ -174,16 +172,6 @@ struct IdentitySyncSection {
 struct DatabaseSection {
     #[serde(default)]
     url: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RouterIdentityFile {
-    shm: RouterIdentityShm,
-}
-
-#[derive(Debug, Deserialize)]
-struct RouterIdentityShm {
-    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1002,8 +990,6 @@ impl IdentityStore {
 
 struct IdentityRuntime {
     hive_id: String,
-    state_dir: PathBuf,
-    gateway_name: String,
     is_primary: bool,
     db_config: Option<PgConfig>,
     merge_alias_ttl_secs: u64,
@@ -1018,7 +1004,7 @@ struct IdentityRuntime {
 impl IdentityRuntime {
     fn new(
         hive: &HiveFile,
-        state_dir: PathBuf,
+        _state_dir: PathBuf,
         is_primary: bool,
         db_config: Option<PgConfig>,
     ) -> Self {
@@ -1069,17 +1055,8 @@ impl IdentityRuntime {
             .and_then(|cfg| cfg.merge_alias_ttl_secs)
             .unwrap_or(DEFAULT_MERGE_ALIAS_TTL_SECS);
 
-        let gateway_name = hive
-            .wan
-            .as_ref()
-            .and_then(|wan| wan.gateway_name.clone())
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_GATEWAY_NAME.to_string());
-
         Self {
             hive_id: hive.hive_id.clone(),
-            state_dir,
-            gateway_name,
             is_primary,
             db_config,
             merge_alias_ttl_secs,
@@ -1105,27 +1082,21 @@ impl IdentityRuntime {
         };
         let action_started = Instant::now();
         let trace_id = msg.routing.trace_id.clone();
+        let src_l2_name = msg.routing.src_l2_name.as_deref();
 
-        let source_name = self.resolve_source_name_with_retry(&msg.routing.src).await;
         if action == MSG_ILK_PROVISION {
             tracing::info!(
                 action,
                 trace_id = %trace_id,
-                source_uuid = %msg.routing.src,
-                source_name = source_name.as_deref().unwrap_or("<unknown>"),
+                src_uuid = %msg.routing.src,
+                src_l2_name = src_l2_name.unwrap_or("<unknown>"),
                 payload = %msg.payload,
                 "identity received ILK_PROVISION request"
             );
         }
-        if !self.is_authorized(action, source_name.as_deref()) {
-            let payload = json!({
-                "status": "error",
-                "error_code": "UNAUTHORIZED_REGISTRAR",
-                "message": "source not authorized for action",
-                "action": action,
-                "source_uuid": msg.routing.src,
-                "source_name": source_name,
-            });
+        if !self.is_authorized(action, src_l2_name) {
+            let payload =
+                unauthorized_identity_source_payload(action, &msg.routing.src, src_l2_name);
             send_system_response(sender, msg, response_name(action), payload).await?;
             return Ok(Vec::new());
         }
@@ -1713,46 +1684,6 @@ impl IdentityRuntime {
             .any(|candidate| prefixes.iter().any(|prefix| candidate.starts_with(prefix)))
     }
 
-    async fn resolve_source_name_with_retry(&self, source_uuid: &str) -> Option<String> {
-        let uuid = Uuid::parse_str(source_uuid).ok()?;
-        let started = Instant::now();
-
-        loop {
-            if let Ok(snapshot) = self.load_router_snapshot() {
-                if let Some(name) = source_name_from_snapshot(&snapshot, uuid) {
-                    return Some(name);
-                }
-            }
-            if let Ok(snapshot) = self.load_lsa_snapshot() {
-                if let Some(name) = source_name_from_lsa_snapshot(&snapshot, uuid) {
-                    return Some(name);
-                }
-            }
-            if started.elapsed() >= Duration::from_secs(2) {
-                return None;
-            }
-            time::sleep(Duration::from_millis(25)).await;
-        }
-    }
-
-    fn load_router_snapshot(&self) -> Result<ShmSnapshot, IdentityError> {
-        let router_l2_name = ensure_l2_name(&self.gateway_name, &self.hive_id);
-        let identity_path = self.state_dir.join(router_l2_name).join("identity.yaml");
-        let data = fs::read_to_string(identity_path)?;
-        let identity: RouterIdentityFile = serde_yaml::from_str(&data)?;
-        let reader = RouterRegionReader::open_read_only(&identity.shm.name)?;
-        reader
-            .read_snapshot()
-            .ok_or_else(|| "router shm snapshot unavailable".into())
-    }
-
-    fn load_lsa_snapshot(&self) -> Result<LsaSnapshot, IdentityError> {
-        let shm_name = format!("/jsr-lsa-{}", self.hive_id);
-        let reader = LsaRegionReader::open_read_only(&shm_name)?;
-        reader
-            .read_snapshot()
-            .ok_or_else(|| "lsa shm snapshot unavailable".into())
-    }
 }
 
 fn configured_identity_frontdesk_node_name(hive: &HiveFile) -> Option<String> {
@@ -2996,6 +2927,7 @@ async fn send_system_response(
     let reply = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(request.routing.src.clone()),
             ttl: 16,
             trace_id: request.routing.trace_id.clone(),
@@ -3032,40 +2964,19 @@ async fn connect_with_retry(
     }
 }
 
-fn source_name_from_snapshot(snapshot: &ShmSnapshot, source_uuid: Uuid) -> Option<String> {
-    for entry in &snapshot.nodes {
-        if entry.name_len == 0 {
-            continue;
-        }
-        let Ok(entry_uuid) = Uuid::from_slice(&entry.uuid) else {
-            continue;
-        };
-        if entry_uuid == source_uuid {
-            return Some(node_name(entry));
-        }
-    }
-    None
-}
-
-fn source_name_from_lsa_snapshot(snapshot: &LsaSnapshot, source_uuid: Uuid) -> Option<String> {
-    for entry in &snapshot.nodes {
-        if entry.name_len == 0 {
-            continue;
-        }
-        let Ok(entry_uuid) = Uuid::from_slice(&entry.uuid) else {
-            continue;
-        };
-        if entry_uuid == source_uuid {
-            let len = entry.name_len as usize;
-            return Some(String::from_utf8_lossy(&entry.name[..len]).into_owned());
-        }
-    }
-    None
-}
-
-fn node_name(entry: &NodeEntry) -> String {
-    let len = entry.name_len as usize;
-    String::from_utf8_lossy(&entry.name[..len]).into_owned()
+fn unauthorized_identity_source_payload(
+    action: &str,
+    src_uuid: &str,
+    src_l2_name: Option<&str>,
+) -> Value {
+    json!({
+        "status": "error",
+        "error_code": "UNAUTHORIZED_REGISTRAR",
+        "message": "source not authorized for action",
+        "action": action,
+        "src_uuid": src_uuid,
+        "src_l2_name": src_l2_name,
+    })
 }
 
 fn error_payload(error_code: &str, message: &str) -> Value {
@@ -4315,6 +4226,34 @@ mod tests {
         assert!(runtime.is_authorized(MSG_ILK_REGISTER, Some("SY.frontdesk.gov@motherbee")));
         assert!(runtime.is_authorized(MSG_ILK_ADD_CHANNEL, Some("SY.frontdesk.gov@motherbee")));
         assert!(runtime.is_authorized(MSG_TNT_CREATE, Some("SY.frontdesk.gov@motherbee")));
+    }
+
+    #[test]
+    fn identity_runtime_rejects_missing_src_l2_name_for_protected_actions() {
+        let hive = test_hive(Some("SY.frontdesk.gov@motherbee"));
+        let runtime = IdentityRuntime::new(&hive, PathBuf::from("/tmp"), true, None);
+
+        assert!(!runtime.is_authorized(MSG_ILK_REGISTER, None));
+        assert!(!runtime.is_authorized(MSG_TNT_CREATE, None));
+    }
+
+    #[test]
+    fn unauthorized_identity_source_payload_uses_src_l2_name_field() {
+        let payload = unauthorized_identity_source_payload(
+            MSG_ILK_REGISTER,
+            "11111111-1111-1111-1111-111111111111",
+            Some("WF.example@motherbee"),
+        );
+
+        assert_eq!(
+            payload.get("src_uuid").and_then(Value::as_str),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(
+            payload.get("src_l2_name").and_then(Value::as_str),
+            Some("WF.example@motherbee")
+        );
+        assert!(payload.get("source_name").is_none());
     }
 
     #[test]

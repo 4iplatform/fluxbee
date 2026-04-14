@@ -4,6 +4,10 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use chrono::{SecondsFormat, TimeZone, Utc};
@@ -509,7 +513,7 @@ async fn main() -> Result<(), OrchestratorError> {
     let runtime_manifest = load_runtime_manifest();
     let system_allowed_origins = load_system_allowed_origins(&hive.hive_id);
     tracing::info!(allowed = ?system_allowed_origins, "system message origin allowlist loaded");
-    let state = OrchestratorState {
+    let state = Arc::new(OrchestratorState {
         hive_id: hive.hive_id.clone(),
         is_motherbee,
         started_at: Instant::now(),
@@ -531,7 +535,7 @@ async fn main() -> Result<(), OrchestratorError> {
         blob: blob_runtime.clone(),
         dist: dist_runtime,
         blob_sync_last_desired: Mutex::new(blob_runtime),
-    };
+    });
     tracing::info!(
         blob_enabled = state.blob.enabled,
         blob_path = %state.blob.path.display(),
@@ -580,10 +584,23 @@ async fn main() -> Result<(), OrchestratorError> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut watchdog = time::interval(Duration::from_secs(5));
+    let watchdog_running = Arc::new(AtomicBool::new(false));
     loop {
         tokio::select! {
             _ = watchdog.tick() => {
-                watchdog_tick(&state).await;
+                if watchdog_running
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    let watchdog_state = Arc::clone(&state);
+                    let watchdog_flag = Arc::clone(&watchdog_running);
+                    tokio::spawn(async move {
+                        watchdog_tick(&watchdog_state).await;
+                        watchdog_flag.store(false, Ordering::SeqCst);
+                    });
+                } else {
+                    tracing::debug!("skipping watchdog tick while previous run still active");
+                }
             }
             _ = sigterm.recv() => {
                 tracing::warn!("SIGTERM received; shutting down");
@@ -1228,6 +1245,7 @@ async fn send_admin_forbidden(
     let reply = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(msg.routing.src.clone()),
             ttl: 16,
             trace_id: msg.routing.trace_id.clone(),
@@ -1355,9 +1373,10 @@ async fn handle_admin(
         "run_node" => run_node_flow(state, &msg.payload).await,
         "kill_node" => kill_node_flow(state, &msg.payload).await,
         "list_hives" => {
+            let hives = list_hives(state)?;
             serde_json::json!({
                 "status": "ok",
-                "hives": list_hives(state)?,
+                "hives": hives,
             })
         }
         "get_hive" => {
@@ -1470,6 +1489,7 @@ async fn handle_admin(
     let reply = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(msg.routing.src.clone()),
             ttl: 16,
             trace_id: msg.routing.trace_id.clone(),
@@ -1516,29 +1536,17 @@ async fn handle_system_message(
             | "ADD_HIVE_FINALIZE"
             | "REMOVE_HIVE_CLEANUP"
     ) {
-        let source_name = resolve_system_source_name_with_retry(state, &msg.routing.src).await;
-        let is_allowed = source_name.as_deref().is_some_and(|name| {
-            state.system_allowed_origins.contains(name)
-                || name.starts_with("SY.orchestrator@")
-                || name.starts_with("SY.orchestrator.")
-                || name.starts_with("SY.admin@")
-                || name.starts_with("WF.orch.diag@")
-        });
+        let src_l2_name = msg.routing.src_l2_name.as_deref();
+        let is_allowed = is_allowed_system_source_name(state, src_l2_name);
         if !is_allowed {
             tracing::warn!(
                 action = action,
-                source_uuid = %msg.routing.src,
-                source_name = ?source_name,
+                src_uuid = %msg.routing.src,
+                src_l2_name = ?src_l2_name,
                 allowed = ?state.system_allowed_origins,
                 "blocked system message from unauthorized origin"
             );
-            let payload = serde_json::json!({
-                "status": "error",
-                "error_code": "FORBIDDEN",
-                "message": "system action origin not allowed",
-                "source_uuid": msg.routing.src,
-                "source_name": source_name,
-            });
+            let payload = forbidden_system_source_payload(msg, src_l2_name);
             match action {
                 "SYSTEM_UPDATE" => {
                     let _ =
@@ -1744,6 +1752,27 @@ async fn handle_system_message(
         _ => {}
     }
     Ok(())
+}
+
+fn is_allowed_system_source_name(state: &OrchestratorState, src_l2_name: Option<&str>) -> bool {
+    let Some(name) = src_l2_name.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    state.system_allowed_origins.contains(name)
+        || name.starts_with("SY.orchestrator@")
+        || name.starts_with("SY.orchestrator.")
+        || name.starts_with("SY.admin@")
+        || name.starts_with("WF.orch.diag@")
+}
+
+fn forbidden_system_source_payload(msg: &Message, src_l2_name: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "status": "error",
+        "error_code": "FORBIDDEN",
+        "message": "system action origin not allowed",
+        "src_uuid": msg.routing.src,
+        "src_l2_name": src_l2_name,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -2678,62 +2707,6 @@ fn load_system_allowed_origins(hive_id: &str) -> HashSet<String> {
         .collect()
 }
 
-async fn resolve_system_source_name_with_retry(
-    state: &OrchestratorState,
-    source_uuid: &str,
-) -> Option<String> {
-    let uuid = Uuid::parse_str(source_uuid).ok()?;
-    let start = Instant::now();
-    loop {
-        if let Ok(snapshot) = load_router_snapshot(state) {
-            if let Some(name) = source_name_from_snapshot(&snapshot, uuid) {
-                return Some(name);
-            }
-        }
-        if let Ok(snapshot) = load_lsa_snapshot(state) {
-            if let Some(name) = source_name_from_lsa_snapshot(&snapshot, uuid) {
-                return Some(name);
-            }
-        }
-        if start.elapsed() >= Duration::from_secs(2) {
-            return None;
-        }
-        time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
-fn source_name_from_snapshot(snapshot: &ShmSnapshot, source_uuid: Uuid) -> Option<String> {
-    for entry in &snapshot.nodes {
-        if entry.name_len == 0 {
-            continue;
-        }
-        let Ok(entry_uuid) = Uuid::from_slice(&entry.uuid) else {
-            continue;
-        };
-        if entry_uuid == source_uuid {
-            return Some(node_name(entry));
-        }
-    }
-    None
-}
-
-fn source_name_from_lsa_snapshot(snapshot: &LsaSnapshot, source_uuid: Uuid) -> Option<String> {
-    for entry in &snapshot.nodes {
-        if entry.name_len == 0 {
-            continue;
-        }
-        let Ok(entry_uuid) = Uuid::from_slice(&entry.uuid) else {
-            continue;
-        };
-        if entry_uuid == source_uuid {
-            let len = entry.name_len as usize;
-            let name = String::from_utf8_lossy(&entry.name[..len]).into_owned();
-            return Some(name);
-        }
-    }
-    None
-}
-
 async fn send_system_action_response(
     sender: &NodeSender,
     request: &Message,
@@ -2751,6 +2724,7 @@ async fn send_system_action_response(
     let reply = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(request.routing.src.clone()),
             ttl: 16,
             trace_id: request.routing.trace_id.clone(),
@@ -7017,6 +6991,7 @@ async fn send_config_response(
     let reply = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(request.routing.src.clone()),
             ttl: 16,
             trace_id: request.routing.trace_id.clone(),
@@ -8595,6 +8570,7 @@ async fn send_node_config_changed_signal(
     let msg = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(node_name.to_string()),
             ttl: 16,
             trace_id: Uuid::new_v4().to_string(),
@@ -9720,6 +9696,7 @@ async fn relay_system_action(
     let request = Message {
         routing: Routing {
             src: relay_sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(destination.to_string()),
             ttl: 16,
             trace_id: trace_id.clone(),
@@ -11914,7 +11891,7 @@ async fn purge_owner_timers_before_teardown(
     owner_l2_name: &str,
 ) -> serde_json::Value {
     let timer_node = ensure_l2_name("SY.timer", target_hive);
-    match relay_system_action(
+    match relay_system_action_for_timer_purge(
         state,
         &timer_node,
         "TIMER_PURGE_OWNER",
@@ -11951,6 +11928,55 @@ async fn purge_owner_timers_before_teardown(
             "message": err.to_string(),
         }),
     }
+}
+
+async fn relay_system_action_for_timer_purge(
+    state: &OrchestratorState,
+    destination: &str,
+    request_msg: &str,
+    response_msg: &str,
+    payload: serde_json::Value,
+    forward_timeout: Duration,
+) -> Result<serde_json::Value, OrchestratorError> {
+    #[cfg(test)]
+    {
+        if let Some(result) = take_test_timer_purge_relay_result() {
+            return result.map_err(|message| message.into());
+        }
+    }
+    relay_system_action(
+        state,
+        destination,
+        request_msg,
+        response_msg,
+        payload,
+        forward_timeout,
+    )
+    .await
+}
+
+#[cfg(test)]
+type TestTimerPurgeRelayResult = Result<serde_json::Value, String>;
+
+#[cfg(test)]
+fn test_timer_purge_relay_slot() -> &'static StdMutex<Option<TestTimerPurgeRelayResult>> {
+    static SLOT: OnceLock<StdMutex<Option<TestTimerPurgeRelayResult>>> = OnceLock::new();
+    SLOT.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn set_test_timer_purge_relay_result(result: TestTimerPurgeRelayResult) {
+    *test_timer_purge_relay_slot()
+        .lock()
+        .expect("test timer purge relay lock") = Some(result);
+}
+
+#[cfg(test)]
+fn take_test_timer_purge_relay_result() -> Option<TestTimerPurgeRelayResult> {
+    test_timer_purge_relay_slot()
+        .lock()
+        .expect("test timer purge relay lock")
+        .take()
 }
 
 fn execute_on_hive(
@@ -15652,6 +15678,59 @@ blob:
         }
     }
 
+    #[test]
+    fn system_source_without_src_l2_name_is_rejected() {
+        let state = sample_orchestrator_state_for_tests();
+        assert!(!is_allowed_system_source_name(&state, None));
+        assert!(!is_allowed_system_source_name(&state, Some("")));
+        assert!(!is_allowed_system_source_name(&state, Some("   ")));
+    }
+
+    #[test]
+    fn system_source_with_allowed_src_l2_name_passes_auth() {
+        let mut state = sample_orchestrator_state_for_tests();
+        state
+            .system_allowed_origins
+            .insert("SY.admin@motherbee".to_string());
+
+        assert!(is_allowed_system_source_name(
+            &state,
+            Some("SY.admin@motherbee")
+        ));
+        assert!(is_allowed_system_source_name(
+            &state,
+            Some("WF.orch.diag@motherbee")
+        ));
+    }
+
+    #[test]
+    fn forbidden_system_source_payload_uses_src_l2_name_field() {
+        let msg = Message {
+            routing: Routing {
+                src: "src-uuid-1".to_string(),
+                src_l2_name: Some("SY.admin@motherbee".to_string()),
+                dst: Destination::Unicast("SY.orchestrator@motherbee".to_string()),
+                ttl: 16,
+                trace_id: "trace-1".to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some("SYSTEM_UPDATE".to_string()),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+
+        let payload = forbidden_system_source_payload(&msg, msg.routing.src_l2_name.as_deref());
+        assert_eq!(payload["error_code"], "FORBIDDEN");
+        assert_eq!(payload["src_uuid"], serde_json::json!("src-uuid-1"));
+        assert_eq!(
+            payload["src_l2_name"],
+            serde_json::json!("SY.admin@motherbee")
+        );
+        assert!(payload.get("source_name").is_none());
+    }
+
     #[tokio::test]
     async fn remove_runtime_version_flow_returns_busy_when_lifecycle_lock_is_held() {
         let state = sample_orchestrator_state_for_tests();
@@ -15744,6 +15823,55 @@ blob:
         assert!(second_node_dir.exists());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn purge_owner_timers_before_teardown_returns_ok_payload_with_deleted_count() {
+        let state = sample_orchestrator_state_for_tests();
+        set_test_timer_purge_relay_result(Ok(serde_json::json!({
+            "ok": true,
+            "verb": "TIMER_PURGE_OWNER",
+            "deleted_count": 2
+        })));
+
+        let out =
+            purge_owner_timers_before_teardown(&state, "motherbee", "WF.demo.cleanup@motherbee")
+                .await;
+
+        assert_eq!(out["status"], "ok");
+        assert_eq!(out["target"], serde_json::json!("SY.timer@motherbee"));
+        assert_eq!(
+            out["owner_l2_name"],
+            serde_json::json!("WF.demo.cleanup@motherbee")
+        );
+        assert_eq!(out["deleted_count"], serde_json::json!(2));
+        assert_eq!(
+            out["payload"]["verb"],
+            serde_json::json!("TIMER_PURGE_OWNER")
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_owner_timers_before_teardown_surfaces_relay_error() {
+        let state = sample_orchestrator_state_for_tests();
+        set_test_timer_purge_relay_result(Err(
+            "system forward timeout msg=TIMER_PURGE_OWNER response=TIMER_RESPONSE".to_string(),
+        ));
+
+        let out =
+            purge_owner_timers_before_teardown(&state, "motherbee", "WF.demo.cleanup@motherbee")
+                .await;
+
+        assert_eq!(out["status"], "error");
+        assert_eq!(out["target"], serde_json::json!("SY.timer@motherbee"));
+        assert_eq!(
+            out["owner_l2_name"],
+            serde_json::json!("WF.demo.cleanup@motherbee")
+        );
+        assert!(out["message"]
+            .as_str()
+            .expect("error message")
+            .contains("TIMER_PURGE_OWNER"));
     }
 
     #[test]
