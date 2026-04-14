@@ -1483,6 +1483,7 @@ fn build_system_reply(
     WireMessage {
         routing: Routing {
             src: control_src.to_string(),
+            src_l2_name: None,
             dst,
             ttl: incoming.routing.ttl.max(1),
             trace_id: incoming.routing.trace_id.clone(),

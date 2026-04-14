@@ -1645,6 +1645,7 @@ mod tests {
         let incoming = WireMessage {
             routing: Routing {
                 src: "node-src".to_string(),
+                src_l2_name: None,
                 dst: Destination::Resolve,
                 ttl: 16,
                 trace_id: "trace-1".to_string(),
@@ -2447,6 +2448,7 @@ fn build_system_reply(
     WireMessage {
         routing: Routing {
             src: control_src.to_string(),
+            src_l2_name: None,
             dst,
             ttl: incoming.routing.ttl.max(1),
             trace_id: incoming.routing.trace_id.clone(),
