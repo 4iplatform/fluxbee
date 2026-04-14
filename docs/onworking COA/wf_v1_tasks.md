@@ -69,14 +69,15 @@ This dependency is hard:
 ## 4) Module setup
 
 ### WF-SETUP-1 — go.mod for wf-generic
-- [ ] Create `go/nodes/wf/wf-generic/go.mod`
+- [x] Create `go/nodes/wf/wf-generic/go.mod`
   - module: `github.com/4iplatform/json-router/nodes/wf/wf-generic`
   - go version: 1.25.0
   - require: `fluxbee-go-sdk`, `modernc.org/sqlite`, `github.com/google/cel-go`, `github.com/google/uuid`
   - replace: `github.com/4iplatform/json-router/fluxbee-go-sdk => ../../../fluxbee-go-sdk`
-- [ ] Run `go mod tidy` to resolve indirect deps
+- [x] Run `go mod tidy` to resolve indirect deps
 
 ### WF-SETUP-2 — Directory structure
+- [x] Create the initial `wf-generic` scaffold (`main.go`, `node/`, placeholder runtime files)
 ```
 go/nodes/wf/wf-generic/
 ├── go.mod
@@ -101,41 +102,41 @@ go/nodes/wf/wf-generic/
 ## 5) Workflow definition types and load-time validation
 
 ### WF-DEF-1 — Go structs for workflow definition
-- [ ] `WorkflowDefinition` struct covering all fields in spec §8.1
-- [ ] `StateDefinition` (name, description, entry_actions, exit_actions, transitions)
-- [ ] `TransitionDefinition` (event_match, guard, target_state, actions)
-- [ ] `ActionDefinition` (type + typed union for each action type)
-- [ ] `EventMatch` (msg, optionally type)
-- [ ] JSON deserialization with strict unknown-field rejection
+- [x] `WorkflowDefinition` struct covering all fields in spec §8.1
+- [x] `StateDefinition` (name, description, entry_actions, exit_actions, transitions)
+- [x] `TransitionDefinition` (event_match, guard, target_state, actions)
+- [x] `ActionDefinition` (type + typed union for each action type)
+- [x] `EventMatch` (msg, optionally type)
+- [x] JSON deserialization with strict unknown-field rejection
 
 ### WF-DEF-2 — Load-time validation (spec §8.5)
-- [ ] Check 1: JSON structure valid per `wf_schema_version`
-- [ ] Check 2: `input_schema` is valid JSON Schema (use `github.com/santhosh-tekuri/jsonschema` or equivalent)
-- [ ] Check 3: `initial_state` exists in states
-- [ ] Check 4: all `terminal_states` exist in states
-- [ ] Check 5: every `target_state` in every transition exists in states
-- [ ] Check 6: every guard CEL expression compiles against typed environment
-- [ ] Check 7: every action has known type and valid params (action type registry in `actions.go`)
-- [ ] Check 8: `send_message` targets are syntactically valid L2 names
-- [ ] Check 9: `schedule_timer` durations ≥ 60s
-- [ ] Check 10: `set_variable` names are valid identifiers
-- [ ] Check 11: `$ref` paths in `send_message` payloads are syntactically valid (root is `input`, `state`, or `event`)
-- [ ] Return typed load error with path to offending element on any failure
+- [x] Check 1: JSON structure valid per `wf_schema_version`
+- [x] Check 2: `input_schema` is valid JSON Schema (use `github.com/santhosh-tekuri/jsonschema` or equivalent)
+- [x] Check 3: `initial_state` exists in states
+- [x] Check 4: all `terminal_states` exist in states
+- [x] Check 5: every `target_state` in every transition exists in states
+- [x] Check 6: every guard CEL expression compiles against typed environment
+- [x] Check 7: every action has known type and valid params (action type registry in `actions.go`)
+- [x] Check 8: `send_message` targets are syntactically valid L2 names
+- [x] Check 9: `schedule_timer` durations ≥ 60s
+- [x] Check 10: `set_variable` names are valid identifiers
+- [x] Check 11: `$ref` paths in `send_message` payloads are syntactically valid (root is `input`, `state`, or `event`)
+- [x] Return typed load error with path to offending element on any failure
 
 ---
 
 ## 6) CEL integration
 
 ### WF-CEL-1 — CEL environment
-- [ ] Build `cel.Env` with three implicit variables:
+- [x] Build `cel.Env` with three implicit variables:
   - `input` — typed from `input_schema` (map[string]any in v1, typed registry in future)
   - `state` — `map_type(string, dyn)` (dynamic)
   - `event` — `map_type(string, dyn)` (the incoming message envelope)
-- [ ] Register built-in `now()` function returning current UTC unix milliseconds
+- [x] Register built-in `now()` function returning current UTC unix milliseconds
   - **Source:** Go `time.Now().UnixMilli()` (LOCAL process time, NOT SY.timer)
   - **Injectable for tests** via clock function passed to environment builder
   - Document explicitly that this is local time, not authoritative hive time
-- [ ] Compile all guards at load time; store compiled `cel.Program` per transition
+- [x] Compile all guards at load time; store compiled `cel.Program` per transition
 
 ### WF-CEL-2 — Guard evaluation
 - [ ] Evaluate guard program with 10ms timeout (spec §9.3)
