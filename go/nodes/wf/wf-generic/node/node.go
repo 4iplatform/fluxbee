@@ -70,34 +70,38 @@ func extractConfigPayload(data []byte) ([]byte, error) {
 	}
 
 	configPayload, hasWrappedConfig := raw["config"]
-	_, hasTopLevelConfigVersion := raw["config_version"]
-	if !hasWrappedConfig && !hasTopLevelConfigVersion {
-		return data, nil
+	if !hasWrappedConfig {
+		if _, hasTopLevelConfigVersion := raw["config_version"]; !hasTopLevelConfigVersion {
+			return data, nil
+		}
 	}
 
-	var cfgMap map[string]json.RawMessage
+	cfgMap := make(map[string]json.RawMessage)
 	if hasWrappedConfig {
 		if err := json.Unmarshal(configPayload, &cfgMap); err != nil {
 			return nil, fmt.Errorf("parse wrapped config payload: %w", err)
 		}
-	} else {
-		cfgMap = make(map[string]json.RawMessage, len(raw))
-		for key, value := range raw {
-			if key == "config_version" {
-				continue
-			}
+	}
+
+	for _, key := range []string{
+		"workflow_definition_path",
+		"db_path",
+		"sy_timer_l2_name",
+		"gc_retention_days",
+		"gc_interval_seconds",
+		"tenant_id",
+		"_system",
+	} {
+		if _, ok := cfgMap[key]; ok {
+			continue
+		}
+		if value, exists := raw[key]; exists {
 			cfgMap[key] = value
 		}
 	}
-	if _, ok := cfgMap["_system"]; !ok {
-		if system, exists := raw["_system"]; exists {
-			cfgMap["_system"] = system
-		}
-	}
-	if _, ok := cfgMap["tenant_id"]; !ok {
-		if tenantID, exists := raw["tenant_id"]; exists {
-			cfgMap["tenant_id"] = tenantID
-		}
+
+	if len(cfgMap) == 0 {
+		return data, nil
 	}
 	merged, err := json.Marshal(cfgMap)
 	if err != nil {

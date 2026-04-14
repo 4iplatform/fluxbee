@@ -84,6 +84,37 @@ func TestLoadConfigAcceptsWrappedConfigEnvelope(t *testing.T) {
 	}
 }
 
+func TestLoadConfigIgnoresOrchestratorMetadataEnvelope(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	data := `{
+  "config_version": 1,
+  "managed_by": "SY.orchestrator",
+  "runtime": "wf.engine",
+  "runtime_version": "0.1.0",
+  "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e",
+  "_system": {
+    "node_name": "WF.invoice@motherbee"
+  },
+  "workflow_definition_path": "/tmp/wf.invoice.json",
+  "db_path": "/tmp/wf.db",
+  "sy_timer_l2_name": "SY.timer@motherbee"
+}`
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.WorkflowDefinitionPath != "/tmp/wf.invoice.json" {
+		t.Fatalf("unexpected workflow_definition_path %q", cfg.WorkflowDefinitionPath)
+	}
+	if cfg.DBPath != "/tmp/wf.db" {
+		t.Fatalf("unexpected db_path %q", cfg.DBPath)
+	}
+}
+
 func TestManagedConfigPathFromEnv(t *testing.T) {
 	t.Setenv("FLUXBEE_NODE_NAME", "WF.invoice@motherbee")
 	got, err := ManagedConfigPathFromEnv()
