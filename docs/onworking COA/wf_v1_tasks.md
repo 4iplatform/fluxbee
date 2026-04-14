@@ -434,6 +434,7 @@ go/nodes/wf/wf-generic/
 ### WF-BUILD-2 — Orchestrator awareness
 - [ ] Verify orchestrator can spawn `WF.*` nodes using `wf-generic` binary + `--config` pointing to the per-node workflow definition
 - [x] Node family prefix `WF.` recognized in orchestrator config (review `sy_orchestrator_v2_tasks.md` for spawn patterns)
+- [x] Added `scripts/publish-wf-runtime.sh` to publish the WF base runtime as `wf.engine`
 
 ---
 
