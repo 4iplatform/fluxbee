@@ -26,7 +26,19 @@ type Config struct {
 }
 
 type ManagedSystemConfig struct {
-	NodeName string `json:"node_name,omitempty"`
+	ManagedBy      string `json:"managed_by,omitempty"`
+	NodeName       string `json:"node_name,omitempty"`
+	HiveID         string `json:"hive_id,omitempty"`
+	RelaunchOnBoot bool   `json:"relaunch_on_boot,omitempty"`
+	ConfigVersion  uint64 `json:"config_version,omitempty"`
+	CreatedAtMS    int64  `json:"created_at_ms,omitempty"`
+	UpdatedAtMS    int64  `json:"updated_at_ms,omitempty"`
+	Runtime        string `json:"runtime,omitempty"`
+	RuntimeVersion string `json:"runtime_version,omitempty"`
+	RuntimeBase    string `json:"runtime_base,omitempty"`
+	PackagePath    string `json:"package_path,omitempty"`
+	IlkID          string `json:"ilk_id,omitempty"`
+	TenantID       string `json:"tenant_id,omitempty"`
 }
 
 // LoadConfig reads and validates a config.json file.
