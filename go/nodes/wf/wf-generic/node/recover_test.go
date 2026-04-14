@@ -13,9 +13,11 @@ type mockTimerLister struct {
 	mockTimerSender
 	timerList []sdk.TimerInfo
 	listErr   error
+	lastFilter sdk.ListFilter
 }
 
-func (m *mockTimerLister) List(_ context.Context, _ sdk.ListFilter) ([]sdk.TimerInfo, error) {
+func (m *mockTimerLister) List(_ context.Context, filter sdk.ListFilter) ([]sdk.TimerInfo, error) {
+	m.lastFilter = filter
 	return m.timerList, m.listErr
 }
 
@@ -69,6 +71,9 @@ func TestRecoverLoadsRunningInstances(t *testing.T) {
 	}
 	if _, ok := reg.Get("wfi:recover-1"); !ok {
 		t.Error("wfi:recover-1 not in registry")
+	}
+	if timer.lastFilter.Limit != sdk.MaxTimerListLimit {
+		t.Fatalf("expected recover TIMER_LIST limit=%d, got %d", sdk.MaxTimerListLimit, timer.lastFilter.Limit)
 	}
 }
 

@@ -61,7 +61,7 @@ func Recover(ctx context.Context, def *WorkflowDefinition, store *Store, reg *In
 		syTimers, listErr = actx.Timer.List(ctx, sdk.ListFilter{
 			OwnerL2Name:  opts.OwnerL2Name,
 			StatusFilter: "pending",
-			Limit:        10000,
+			Limit:        sdk.MaxTimerListLimit,
 		})
 		if listErr == nil {
 			break
@@ -77,6 +77,9 @@ func Recover(ctx context.Context, def *WorkflowDefinition, store *Store, reg *In
 	}
 	if listErr != nil {
 		return fmt.Errorf("recover: TIMER_LIST failed after %d attempts: %w (hard dependency)", opts.MaxRetries, listErr)
+	}
+	if len(syTimers) == sdk.MaxTimerListLimit {
+		log.Printf("recover: TIMER_LIST reached max limit=%d for owner=%s; reconciliation may be truncated", sdk.MaxTimerListLimit, opts.OwnerL2Name)
 	}
 
 	// Build a clientRef → TimerInfo index from SY.timer's view.
