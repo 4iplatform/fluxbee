@@ -437,7 +437,6 @@ go/nodes/wf/wf-generic/
 - [x] Added `scripts/publish-wf-runtime.sh` to publish the WF base runtime as `wf.engine`
 
 ---
-w
 
 ## 16) Reference workflow
 
