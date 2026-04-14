@@ -351,6 +351,7 @@ async fn process_one_inbound(
             ResolveOrCreateInput {
                 channel: config.sim_channel.clone(),
                 external_id: config.sim_sender_id.clone(),
+                src_ilk_override: None,
                 tenant_id: None,
                 tenant_hint: config.sim_tenant_hint.clone(),
                 attributes: serde_json::json!({

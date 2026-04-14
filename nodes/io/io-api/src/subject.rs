@@ -297,6 +297,10 @@ pub(crate) fn parse_json_message_request(
         identity_input: ResolveOrCreateInput {
             channel: "api".to_string(),
             external_id: external_user_id.clone(),
+            src_ilk_override: explicit_subject_mode.as_ref().and_then(|mode| match mode {
+                ExplicitSubjectMode::ByIlk { ilk } => Some(ilk.clone()),
+                ExplicitSubjectMode::ByData => None,
+            }),
             tenant_id: Some(auth_match.tenant_id.clone()),
             tenant_hint: None,
             attributes: Value::Object(attributes),

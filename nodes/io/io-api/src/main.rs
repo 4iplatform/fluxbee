@@ -15,7 +15,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use fluxbee_sdk::identity::tenant_exists_in_hive_id;
+use fluxbee_sdk::identity::{ilk_exists_in_hive_id, tenant_exists_in_hive_id};
 use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{connect, try_handle_default_node_status, NodeConfig, NodeUuidMode};
 use io_common::identity::{
@@ -653,17 +653,13 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
             Err((status, code, message)) => return api_error(status, code, message),
         };
         let response_ilk = match parsed.explicit_subject_mode.as_ref() {
-            Some(ExplicitSubjectMode::ByIlk { .. }) => {
-                tracing::info!(
-                    node_name = %state.node_name,
-                    path = %request_path,
-                    "io-api explicit_subject by_ilk requested but not implemented yet"
-                );
-                return api_error(
-                    StatusCode::NOT_IMPLEMENTED,
-                    "subject_ilk_not_implemented",
-                    "explicit_subject by_ilk is not implemented yet in IO.api",
-                );
+            Some(ExplicitSubjectMode::ByIlk { ilk }) => {
+                if let Err((status, code, message)) =
+                    validate_explicit_subject_ilk(state.hive_id.as_str(), ilk)
+                {
+                    return api_error(status, code, message);
+                }
+                Some(ilk.clone())
             }
             Some(ExplicitSubjectMode::ByData) => {
                 match resolve_explicit_subject_ilk_for_http(state.as_ref(), &parsed.identity_input)
@@ -798,17 +794,13 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
         Err((status, code, message)) => return api_error(status, code, message),
     };
     let response_ilk = match parsed.explicit_subject_mode.as_ref() {
-        Some(ExplicitSubjectMode::ByIlk { .. }) => {
-            tracing::info!(
-                node_name = %state.node_name,
-                path = %request_path,
-                "io-api explicit_subject by_ilk requested but not implemented yet"
-            );
-            return api_error(
-                StatusCode::NOT_IMPLEMENTED,
-                "subject_ilk_not_implemented",
-                "explicit_subject by_ilk is not implemented yet in IO.api",
-            );
+        Some(ExplicitSubjectMode::ByIlk { ilk }) => {
+            if let Err((status, code, message)) =
+                validate_explicit_subject_ilk(state.hive_id.as_str(), ilk)
+            {
+                return api_error(status, code, message);
+            }
+            Some(ilk.clone())
         }
         Some(ExplicitSubjectMode::ByData) => {
             match resolve_explicit_subject_ilk_for_http(state.as_ref(), &parsed.identity_input)
@@ -1377,6 +1369,25 @@ fn validate_authenticated_tenant(
     }
 }
 
+fn validate_explicit_subject_ilk(
+    hive_id: &str,
+    ilk_id: &str,
+) -> std::result::Result<(), (StatusCode, &'static str, String)> {
+    match ilk_exists_in_hive_id(hive_id, ilk_id) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((
+            StatusCode::NOT_FOUND,
+            "ilk_does_not_exist",
+            format!("Requested subject ILK '{ilk_id}' does not exist"),
+        )),
+        Err(err) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "identity_unavailable",
+            format!("Unable to validate requested subject ILK: {err}"),
+        )),
+    }
+}
+
 fn build_api_relay_fragment(
     node_name: &str,
     parsed: &ParsedHttpMessage,
@@ -1920,6 +1931,10 @@ mod tests {
         let parsed =
             parse_json_message_request(&envelope, &effective, &auth_match, false).expect("parsed");
         assert_eq!(parsed.identity_input.external_id, "ilk:abc-123");
+        assert_eq!(
+            parsed.identity_input.src_ilk_override.as_deref(),
+            Some("ilk:abc-123")
+        );
         assert_eq!(
             parsed.identity_input.tenant_id.as_deref(),
             Some("tnt:partner1")

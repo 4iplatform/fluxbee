@@ -14,6 +14,8 @@ pub struct IdentityLookupInput {
     pub channel: String,
     pub external_id: String,
     #[serde(default)]
+    pub src_ilk_override: Option<String>,
+    #[serde(default)]
     pub tenant_id: Option<String>,
     #[serde(default)]
     pub tenant_hint: Option<String>,
