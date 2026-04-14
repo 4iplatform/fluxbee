@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::time::Duration as StdDuration;
 
-use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
+use fluxbee_sdk::protocol::{
+    Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
+};
 use fluxbee_sdk::{connect, NodeConfig, NodeError, NodeReceiver, NodeSender, NodeUuidMode};
 use serde_json::{json, Value};
 use tokio::time::{sleep, Duration};
@@ -32,6 +34,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match mode {
         "start" => {
             let customer_id = args.get(3).map(|s| s.as_str()).unwrap_or("cust-001");
+            let amount_cents = args
+                .get(4)
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(25_000);
             let trace_id = Uuid::new_v4().to_string();
             sender
                 .send(build_targeted_message(
@@ -39,13 +45,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     target,
                     "user",
                     None,
-                    json!({ "customer_id": customer_id }),
+                    json!({
+                        "customer_id": customer_id,
+                        "amount_cents": amount_cents,
+                        "currency": "USD"
+                    }),
                     &trace_id,
                 ))
                 .await?;
             println!(
-                "sent workflow start target={} customer_id={} trace_id={}",
-                target, customer_id, trace_id
+                "sent workflow start target={} customer_id={} amount_cents={} trace_id={}",
+                target, customer_id, amount_cents, trace_id
             );
         }
         "list" => {
@@ -181,9 +191,32 @@ async fn await_response(
         if msg.routing.trace_id != trace_id {
             continue;
         }
-        if msg.meta.msg_type != SYSTEM_KIND || msg.meta.msg.as_deref() != Some(response_msg) {
-            continue;
+        if msg.meta.msg_type == SYSTEM_KIND {
+            match msg.meta.msg.as_deref() {
+                Some(kind) if kind == response_msg => return Ok(msg),
+                Some(MSG_UNREACHABLE) => {
+                    return Err(format!(
+                        "router returned UNREACHABLE: {}",
+                        serde_json::to_string_pretty(&msg.payload)?
+                    )
+                    .into())
+                }
+                Some(MSG_TTL_EXCEEDED) => {
+                    return Err(format!(
+                        "router returned TTL_EXCEEDED: {}",
+                        serde_json::to_string_pretty(&msg.payload)?
+                    )
+                    .into())
+                }
+                Some(other) => {
+                    return Err(format!(
+                        "received unexpected system response {other}: {}",
+                        serde_json::to_string_pretty(&msg.payload)?
+                    )
+                    .into())
+                }
+                None => {}
+            }
         }
-        return Ok(msg);
     }
 }

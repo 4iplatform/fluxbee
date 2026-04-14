@@ -67,7 +67,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let client_ref = format!("rust-example-{}", unix_now_ms());
             let timer_id =
                 schedule_and_inspect(&sender, &mut receiver, delay_secs, &client_ref).await?;
-            println!("scheduled timer_uuid={} client_ref={}", timer_id.as_str(), client_ref);
+            println!(
+                "scheduled timer_uuid={} client_ref={}",
+                timer_id.as_str(),
+                client_ref
+            );
 
             let fired_event =
                 wait_for_timer_fired(&sender, &mut receiver, &timer_id, delay_secs).await?;
@@ -175,8 +179,12 @@ async fn run_cancel_by_client_ref(
 
     let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
     let response = client.cancel_by_client_ref(client_ref.as_str()).await?;
-    println!("cancel response found={:?} status={:?}", response.found, response.status);
-    let final_state = wait_for_status(sender, receiver, timer_id.as_ref(), TimerStatus::Canceled).await?;
+    println!(
+        "cancel response found={:?} status={:?}",
+        response.found, response.status
+    );
+    let final_state =
+        wait_for_status(sender, receiver, timer_id.as_ref(), TimerStatus::Canceled).await?;
     println!(
         "confirmed canceled timer state uuid={} status={:?}",
         final_state.uuid.as_str(),
@@ -270,9 +278,18 @@ fn parse_args() -> Result<(ExampleMode, u64), Box<dyn std::error::Error>> {
             Ok((ExampleMode::Fire, raw.parse::<u64>()?))
         }
         Some("fire") => Ok((ExampleMode::Fire, parse_delay_arg(args.next())?)),
-        Some("cancel") => Ok((ExampleMode::CancelByClientRef, parse_delay_arg(args.next())?)),
-        Some("reschedule") => Ok((ExampleMode::RescheduleByClientRef, parse_delay_arg(args.next())?)),
-        Some("idempotent") => Ok((ExampleMode::IdempotentClientRef, parse_delay_arg(args.next())?)),
+        Some("cancel") => Ok((
+            ExampleMode::CancelByClientRef,
+            parse_delay_arg(args.next())?,
+        )),
+        Some("reschedule") => Ok((
+            ExampleMode::RescheduleByClientRef,
+            parse_delay_arg(args.next())?,
+        )),
+        Some("idempotent") => Ok((
+            ExampleMode::IdempotentClientRef,
+            parse_delay_arg(args.next())?,
+        )),
         Some(other) => Err(format!(
             "unknown mode {other}. expected one of: fire, cancel, reschedule, idempotent"
         )

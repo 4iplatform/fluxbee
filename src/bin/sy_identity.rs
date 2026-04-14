@@ -25,8 +25,8 @@ use fluxbee_sdk::{
 };
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, IchEntry, IdentityRegionLimits, IdentityRegionWriter,
-    IlkAliasEntry, IlkEntry, TenantEntry, VocabularyEntry, FLAG_ACTIVE,
-    ICH_ADDRESS_MAX_LEN, ICH_CHANNEL_TYPE_MAX_LEN,
+    IlkAliasEntry, IlkEntry, TenantEntry, VocabularyEntry, FLAG_ACTIVE, ICH_ADDRESS_MAX_LEN,
+    ICH_CHANNEL_TYPE_MAX_LEN,
 };
 
 type IdentityError = Box<dyn std::error::Error + Send + Sync>;
@@ -1683,7 +1683,6 @@ impl IdentityRuntime {
             .iter()
             .any(|candidate| prefixes.iter().any(|prefix| candidate.starts_with(prefix)))
     }
-
 }
 
 fn configured_identity_frontdesk_node_name(hive: &HiveFile) -> Option<String> {

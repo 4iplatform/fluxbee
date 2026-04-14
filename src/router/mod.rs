@@ -4940,16 +4940,11 @@ async fn maybe_attach_memory_package(
     let Some(thread_id) = canonical_thread_id_from_meta(&msg.meta) else {
         return;
     };
-    let snapshot = match read_memory_snapshot_for_delivery(
-        memory_reader,
-        hive_id,
-        HEARTBEAT_STALE_MS,
-    )
-    .await
-    {
-        Some(snapshot) => snapshot,
-        None => return,
-    };
+    let snapshot =
+        match read_memory_snapshot_for_delivery(memory_reader, hive_id, HEARTBEAT_STALE_MS).await {
+            Some(snapshot) => snapshot,
+            None => return,
+        };
     if let Some(entry) = snapshot
         .threads
         .iter()
@@ -4982,12 +4977,17 @@ async fn read_memory_snapshot_for_delivery(
         *guard = MemoryRegionReader::open_read_only(&shm_name).ok();
     }
 
-    if let Some(snapshot) = guard.as_ref().and_then(|reader| reader.read_snapshot().ok()) {
+    if let Some(snapshot) = guard
+        .as_ref()
+        .and_then(|reader| reader.read_snapshot().ok())
+    {
         return Some(snapshot);
     }
 
     *guard = MemoryRegionReader::open_read_only(&shm_name).ok();
-    guard.as_ref().and_then(|reader| reader.read_snapshot().ok())
+    guard
+        .as_ref()
+        .and_then(|reader| reader.read_snapshot().ok())
 }
 
 #[cfg(test)]
@@ -5921,12 +5921,9 @@ mod tests {
             truncated: None,
         };
 
-        let mut writer = crate::shm::MemoryRegionWriter::open_or_create(
-            &shm_name,
-            Uuid::new_v4(),
-            &hive_id,
-        )
-        .expect("create memory writer");
+        let mut writer =
+            crate::shm::MemoryRegionWriter::open_or_create(&shm_name, Uuid::new_v4(), &hive_id)
+                .expect("create memory writer");
         writer
             .write_snapshot(&MemoryShmSnapshot {
                 schema_version: 1,
@@ -5938,17 +5935,15 @@ mod tests {
             })
             .expect("write initial snapshot");
 
-        let stale_reader = MemoryRegionReader::open_read_only(&shm_name).expect("open stale reader");
+        let stale_reader =
+            MemoryRegionReader::open_read_only(&shm_name).expect("open stale reader");
         let shared_reader = Arc::new(Mutex::new(Some(stale_reader)));
 
         cleanup(&shm_name);
 
-        let mut replacement_writer = crate::shm::MemoryRegionWriter::open_or_create(
-            &shm_name,
-            Uuid::new_v4(),
-            &hive_id,
-        )
-        .expect("create replacement writer");
+        let mut replacement_writer =
+            crate::shm::MemoryRegionWriter::open_or_create(&shm_name, Uuid::new_v4(), &hive_id)
+                .expect("create replacement writer");
         replacement_writer
             .write_snapshot(&MemoryShmSnapshot {
                 schema_version: 1,
@@ -5971,7 +5966,8 @@ mod tests {
             .find(|entry| entry.thread_id == thread_id)
             .expect("fresh thread entry present");
         assert_eq!(
-            entry.package
+            entry
+                .package
                 .dominant_context
                 .as_ref()
                 .map(|context| context.label.as_str()),
@@ -6011,8 +6007,7 @@ mod tests {
                 vpn_count: 0,
             };
             entry.hive_id_len = copy_bytes_with_len(&mut entry.hive_id, hive) as u16;
-            entry.router_name_len =
-                copy_bytes_with_len(&mut entry.router_name, router_name) as u16;
+            entry.router_name_len = copy_bytes_with_len(&mut entry.router_name, router_name) as u16;
             entry
         };
 
@@ -6032,7 +6027,12 @@ mod tests {
             crate::shm::LsaRegionWriter::open_or_create(&shm_name, Uuid::new_v4(), &hive_id)
                 .expect("create replacement lsa writer");
         replacement_writer
-            .write_snapshot(&[make_hive_entry("fresh-hive", "router-fresh")], &[], &[], &[])
+            .write_snapshot(
+                &[make_hive_entry("fresh-hive", "router-fresh")],
+                &[],
+                &[],
+                &[],
+            )
             .expect("write replacement lsa snapshot");
 
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -6082,8 +6082,7 @@ mod tests {
                 _reserved: [0; 8],
             };
             entry.prefix_len = copy_bytes_with_len(&mut entry.prefix, prefix) as u16;
-            entry.next_hop_hive_len =
-                copy_bytes_with_len(&mut entry.next_hop_hive, "worker") as u8;
+            entry.next_hop_hive_len = copy_bytes_with_len(&mut entry.next_hop_hive, "worker") as u8;
             entry
         };
 
