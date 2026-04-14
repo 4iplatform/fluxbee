@@ -5269,7 +5269,7 @@ fn render_memory_package_prompt_block(memory_package: Option<&MemoryPackage>) ->
         .memories
         .iter()
         .take(3)
-        .map(|item| item.label.as_str())
+        .map(|item| item.summary.as_str())
         .collect::<Vec<_>>();
     if !memory_labels.is_empty() {
         lines.push(format!("Memories: {}", memory_labels.join(", ")));
@@ -5277,17 +5277,17 @@ fn render_memory_package_prompt_block(memory_package: Option<&MemoryPackage>) ->
 
     if let Some(truncated) = package.truncated.as_ref() {
         let mut truncated_fields = Vec::new();
-        if truncated.contexts {
-            truncated_fields.push("contexts");
+        if truncated.dropped_contexts > 0 {
+            truncated_fields.push(format!("contexts={}", truncated.dropped_contexts));
         }
-        if truncated.reasons {
-            truncated_fields.push("reasons");
+        if truncated.dropped_reasons > 0 {
+            truncated_fields.push(format!("reasons={}", truncated.dropped_reasons));
         }
-        if truncated.memories {
-            truncated_fields.push("memories");
+        if truncated.dropped_memories > 0 {
+            truncated_fields.push(format!("memories={}", truncated.dropped_memories));
         }
-        if truncated.episodes {
-            truncated_fields.push("episodes");
+        if truncated.dropped_episodes > 0 {
+            truncated_fields.push(format!("episodes={}", truncated.dropped_episodes));
         }
         if !truncated_fields.is_empty() {
             lines.push(format!("Truncated fields: {}", truncated_fields.join(", ")));
@@ -5574,8 +5574,10 @@ mod tests {
             }],
             memories: vec![MemorySummary {
                 memory_id: "memory:1".to_string(),
-                label: "charged twice previously".to_string(),
-                score: 0.92,
+                summary: "charged twice previously".to_string(),
+                weight: 0.92,
+                dominant_context_id: Some("context:1".to_string()),
+                dominant_reason_id: Some("reason:1".to_string()),
             }],
             episodes: vec![],
             truncated: None,
