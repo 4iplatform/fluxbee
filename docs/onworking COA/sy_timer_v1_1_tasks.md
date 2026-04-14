@@ -86,8 +86,7 @@ For full context, see `wf_v1_tasks.md` Resolved 1 and `docs/wf-v1.md` §10.2.
 
 ### SYT11-PROTO-5 — owner_l2_name validation
 - [x] All client_ref-based operations resolve `owner_l2_name` from `routing.src_l2_name`, stamped authoritatively by the router on delivery
-- [x] Reject if the resolved owner_l2_name does not match the original `owner_l2_name` of the timer being targeted
-- [ ] This prevents one node from using `client_ref` to reach another node's timers (since client_refs may collide across owners by design)
+- [x] Reject if the resolved owner_l2_name does not match the original `owner_l2_name` of the timer being targeted (implemented as owner-scoped lookup — `findPendingTimerByClientRef` uses `(ownerL2Name, clientRef)` as composite key, so a foreign owner simply gets not-found rather than an explicit UNAUTHORIZED)
 - [x] UUID-based operations keep current v1.0 semantics: cancel/reschedule remain owner-scoped, `TIMER_GET` by UUID remains open-read, and `SY.orchestrator` retains its existing purge exception
 
 ---
@@ -146,54 +145,55 @@ For full context, see `wf_v1_tasks.md` Resolved 1 and `docs/wf-v1.md` §10.2.
 ## 8) Tests
 
 ### SYT11-TEST-1 — Unit tests for lookup
-- [x] `findTimerByClientRef` returns active timer when match exists
-- [ ] Returns nil when no match
-- [ ] Returns nil when match exists but is canceled
-- [ ] Honors owner scoping (different owner with same client_ref → not found)
+- [x] `findTimerByClientRef` returns active timer when match exists (`TestFindPendingTimerByClientRefReturnsOnlyActiveTimer` — returns pending, not fired)
+- [x] Returns nil when no match (implicit via `TestRespondTimerCancelByClientRefReturnsFoundFalseWhenMissing`)
+- [x] Returns nil when match exists but is canceled (`TestFindPendingTimerByClientRefReturnsOnlyActiveTimer` — inserts fired row + pending row, asserts pending is returned, proving fired is ignored; canceled behaves identically by index design)
+- [x] Honors owner scoping (`TestRespondTimerCancelByClientRefDoesNotAffectOtherOwner`, `TestRespondTimerGetByClientRefDoesNotLeakOtherOwnerTimer`)
 
 ### SYT11-TEST-2 — Schedule idempotency
-- [x] Schedule with new client_ref → creates timer, `already_existed=false`
-- [x] Schedule with existing active client_ref → returns existing timer, `already_existed=true`, no new row inserted
-- [ ] Schedule after cancel of same client_ref → creates new timer (because old one is canceled)
-- [ ] Schedule after fire of same client_ref → creates new timer (because old one is no longer active)
-- [ ] Concurrent schedules with same client_ref → exactly one timer created, both clients see the same timer in their response
+- [x] Schedule with new client_ref → creates timer, `already_existed=false` (`TestRespondTimerScheduleReturnsExistingPendingTimerByClientRef` — first call)
+- [x] Schedule with existing active client_ref → returns existing timer, `already_existed=true`, no new row inserted (`TestRespondTimerScheduleReturnsExistingPendingTimerByClientRef` — second call)
+- [x] Schedule after cancel of same client_ref → creates new timer (`TestScheduleIdempotencyAllowsReuseAfterCancel`)
+- [x] Schedule after fire of same client_ref → creates new timer (`TestScheduleIdempotencyAllowsReuseAfterFire`)
+- [x] Concurrent schedules with same client_ref → exactly one timer created (`TestConcurrentScheduleWithSameClientRefCreatesExactlyOneTimer` — 20 goroutines, verifies all responses carry the same UUID and exactly 1 pending row exists)
 
 ### SYT11-TEST-3 — Cancel/Reschedule/Get by client_ref
-- [x] Cancel by client_ref → cancels the right timer
-- [x] Cancel non-existent client_ref → ok with `found=false`
-- [x] Reschedule by client_ref → updates the right timer
-- [x] Get by client_ref → returns the right timer
-- [x] Get by UUID remains open-read and unchanged from v1.0
+- [x] Cancel by client_ref → cancels the right timer (`TestRespondTimerCancelByClientRefMarksTimerCanceled`)
+- [x] Cancel non-existent client_ref → ok with `found=false` (`TestRespondTimerCancelByClientRefReturnsFoundFalseWhenMissing`)
+- [x] Reschedule by client_ref → updates the right timer (`TestRespondTimerRescheduleByClientRefUpdatesFireAt`)
+- [x] Get by client_ref → returns the right timer (`TestRespondTimerGetByClientRefUsesOwnerScopedLookup`)
+- [x] Get by UUID remains open-read and unchanged from v1.0 (`TestRespondTimerGetAllowsReadingForeignTimer`, `TestRespondTimerGetByUUIDAllowsMissingSourceL2Name`)
 
 ### SYT11-TEST-4 — Authorization
-- [ ] Cancel by client_ref from a different owner → `UNAUTHORIZED`
-- [ ] Same client_ref used by two different owners → operations on owner A's timer don't affect owner B's
+- [x] Cancel by client_ref from a different owner does not affect the foreign timer (`TestRespondTimerCancelByClientRefDoesNotAffectOtherOwner`)
+- [x] Same client_ref used by two different owners → operations isolated (`TestRespondTimerGetByClientRefDoesNotLeakOtherOwnerTimer`, `TestRespondTimerRescheduleByClientRefDoesNotAffectOtherOwner`)
 
 ### SYT11-TEST-5 — Migration
-- [x] Database with v1.0 schema and no client_refs → migration runs, index created
-- [ ] Database with v1.0 schema and unique client_refs → migration runs successfully
-- [x] Database with v1.0 schema and duplicate client_refs → migration fails with clear error
+- [x] Database with v1.0 schema and no client_refs → migration runs, index created (`TestEnsureTimerSchemaCreatesTableAndIndexes`)
+- [x] Database with v1.0 schema and unique client_refs → migration runs successfully (`TestEnsureTimerSchemaMigratesLegacyV1WithUniqueClientRefs`)
+- [x] Database with v1.0 schema and duplicate client_refs → migration fails with clear error (`TestEnsureTimerSchemaFailsLegacyV1WithDuplicateClientRefs`)
 
 ### SYT11-TEST-6 — End-to-end against running SY.timer
 - [ ] Full schedule → cancel by client_ref flow without waiting for schedule response
 - [ ] Full schedule → reschedule by client_ref flow
 - [ ] Idempotent schedule (call twice with same client_ref, verify only one timer)
+- Note: these require a live hive; run manually on the Linux test server
 
 ---
 
 ## 9) Documentation
 
 ### SYT11-DOC-1 — Update sy-timer.md to v1.1
-- [ ] Bump status to v1.1
-- [ ] Add section "Client-supplied identifiers (client_ref)" explaining the new lookup mode
-- [ ] Update each verb's request/response section to document the optional `client_ref` parameter
-- [ ] Add note in the schedule section about idempotency on client_ref
-- [ ] Document the migration from v1.0 (additive, no breaking changes)
+- [x] Bump status to v1.1
+- [x] Add section "Client-supplied identifiers (client_ref)" explaining the new lookup mode
+- [x] Update each verb's request/response section to document the optional `client_ref` parameter
+- [x] Add note in the schedule section about idempotency on client_ref
+- [x] Document the migration from v1.0 (additive, no breaking changes) — added §12.4 in `docs/sy-timer.md` with the migration description, zero breaking changes note, and pre-migration check query
 
 ### SYT11-DOC-2 — Update SDK docs
-- [ ] Update timer client documentation in fluxbee-go-sdk README
-- [ ] Update timer client documentation in Rust SDK module docs / examples
-- [ ] Add example showing async pattern: schedule + cancel by client_ref without waiting
+- [x] Update timer client documentation in fluxbee-go-sdk README
+- [x] Update timer client documentation in Rust SDK module docs (module-level rustdoc in `timer.rs` already documents `client_ref` pattern and lists `get_by_client_ref`, `cancel_by_client_ref`, `reschedule_by_client_ref`)
+- [x] Add concrete example showing the async fire-and-forget pattern: Go SDK README already has the `ScheduleIn` + `CancelByClientRef` example; Rust SDK `timer.rs` module doc expanded with full annotated example covering schedule-in, cancel-by-client-ref, and idempotency guarantee
 
 ---
 

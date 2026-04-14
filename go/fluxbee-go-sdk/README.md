@@ -9,11 +9,10 @@ Current v1 scope:
 - node handshake helpers
 - node config control-plane helpers
 - default node status helpers
-- local peer UUID -> L2 resolution through the SHM of the router that actually accepted the node connection (`ANNOUNCE.router_name`)
 - direct `system` request/reply RPC helpers
 - canonical `HELP` descriptor types
 - base `TIMER_RESPONSE` parsing helpers
-- typed `SY.timer` client surface for time operations, scheduling, reads, cancel/reschedule and `TIMER_FIRED` parsing
+- typed `SY.timer` client surface for time operations, scheduling, reads, cancel/reschedule by `timer_uuid` or `client_ref`, and `TIMER_FIRED` parsing
 
 First-party consumers:
 
@@ -49,7 +48,7 @@ The Go SDK now assumes the same runtime model that the Rust router implements:
 
 - a node may connect to **any local router** in the hive
 - the effective router is the one announced back in `ANNOUNCE.router_name`
-- requester identity resolution for local `uuid -> L2` uses the SHM of that effective router
+- the router stamps `routing.src_l2_name` on delivered messages
 - router SHM is **per-router**, not a hive-wide merged node table
 
 Implications for consumers:
@@ -58,7 +57,7 @@ Implications for consumers:
 - do not assume one router per hive
 - do not assume reading one router SHM gives a merged view of the whole hive
 
-This is sufficient for `SY.timer` because it is one-per-hive and only needs requester identity for the router it is actually attached to.
+This is sufficient for `SY.timer` because requester ownership now comes from router-stamped `routing.src_l2_name`, not from SDK-side SHM lookup.
 
 ## Stable public surface for v1
 
@@ -87,8 +86,48 @@ The v1 stable surface is:
   - `CONFIG_SET`
   - `CONFIG_RESPONSE`
   - default node status helpers
-- identity resolution behavior used by `SY.timer`
 - `HELP` descriptor types/helpers
 - `SY.timer` client/types/helpers
+
+## SY.timer client patterns
+
+Recommended usage in v1.1:
+
+- schedule with an optional deterministic `client_ref`
+- operate later by `client_ref` instead of waiting for the schedule response UUID
+- keep UUID-based methods when the caller already has a concrete timer id
+
+Available helper methods:
+
+- `Schedule`
+- `ScheduleIn`
+- `ScheduleRecurring`
+- `Get`
+- `GetByClientRef`
+- `Cancel`
+- `CancelByClientRef`
+- `Reschedule`
+- `RescheduleByClientRef`
+- `List`
+- `ListMine`
+- `Help`
+
+Typical async pattern:
+
+```go
+clientRef := "wf:instance-123::sla_timeout"
+
+_, err := timerClient.ScheduleIn(ctx, time.Hour, sdk.ScheduleOptions{
+    ClientRef: clientRef,
+})
+if err != nil {
+    return err
+}
+
+// Later, without needing the timer UUID:
+if err := timerClient.CancelByClientRef(ctx, clientRef); err != nil {
+    return err
+}
+```
 
 Everything else should be treated as implementation support unless it is later documented here as part of the stable surface.

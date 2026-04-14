@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -457,6 +458,214 @@ func TestRespondTimerGetByClientRefUsesOwnerScopedLookup(t *testing.T) {
 	response := mustReadTimerResponse(t, tx)
 	if !response.OK {
 		t.Fatalf("unexpected get by client_ref response: %+v", response)
+	}
+}
+
+func TestRespondTimerCancelByClientRefDoesNotAffectOtherOwner(t *testing.T) {
+	service, tx := newTestService(t)
+	insertOwnedTimer(t, service.db, timerRow{
+		UUID:         "timer-owned",
+		OwnerL2Name:  "AI.other@motherbee",
+		TargetL2Name: "AI.other@motherbee",
+		ClientRef:    sql.NullString{String: "wf:shared::timeout", Valid: true},
+		Kind:         "oneshot",
+		FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
+		MissedPolicy: "fire",
+		Payload:      `{}`,
+		Status:       "pending",
+		CreatedAtUTC: time.Now().UTC().UnixMilli(),
+	})
+
+	msg := mustBuildSystemMessage(t, map[string]any{"client_ref": "wf:shared::timeout"}, "TIMER_CANCEL")
+	if err := service.respondTimerCancel(msg); err != nil {
+		t.Fatalf("cancel foreign timer by client_ref: %v", err)
+	}
+	response := mustReadTimerResponse(t, tx)
+	if !response.OK {
+		t.Fatalf("unexpected foreign cancel response: %+v", response)
+	}
+	found, ok := response.Extra["found"].(bool)
+	if !ok || found {
+		t.Fatalf("expected found=false, got %+v", response.Extra)
+	}
+	row, err := getTimer(context.Background(), service.db, "timer-owned")
+	if err != nil {
+		t.Fatalf("get foreign timer: %v", err)
+	}
+	if row.Status != "pending" {
+		t.Fatalf("foreign timer should remain pending, got %+v", row)
+	}
+}
+
+func TestRespondTimerGetByClientRefDoesNotLeakOtherOwnerTimer(t *testing.T) {
+	service, tx := newTestService(t)
+	insertOwnedTimer(t, service.db, timerRow{
+		UUID:         "timer-owned",
+		OwnerL2Name:  "AI.other@motherbee",
+		TargetL2Name: "AI.other@motherbee",
+		ClientRef:    sql.NullString{String: "wf:shared::timeout", Valid: true},
+		Kind:         "oneshot",
+		FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
+		MissedPolicy: "fire",
+		Payload:      `{}`,
+		Status:       "pending",
+		CreatedAtUTC: time.Now().UTC().UnixMilli(),
+	})
+
+	msg := mustBuildSystemMessage(t, map[string]any{"client_ref": "wf:shared::timeout"}, "TIMER_GET")
+	if err := service.respondTimerGet(msg); err != nil {
+		t.Fatalf("get foreign timer by client_ref: %v", err)
+	}
+	response := mustReadTimerResponse(t, tx)
+	if response.OK || response.Error == nil || response.Error.Code != "TIMER_NOT_FOUND" {
+		t.Fatalf("unexpected foreign get response: %+v", response)
+	}
+}
+
+func TestRespondTimerRescheduleByClientRefDoesNotAffectOtherOwner(t *testing.T) {
+	service, tx := newTestService(t)
+	insertOwnedTimer(t, service.db, timerRow{
+		UUID:         "timer-owned",
+		OwnerL2Name:  "AI.other@motherbee",
+		TargetL2Name: "AI.other@motherbee",
+		ClientRef:    sql.NullString{String: "wf:shared::timeout", Valid: true},
+		Kind:         "oneshot",
+		FireAtUTC:    time.Now().UTC().Add(time.Hour).UnixMilli(),
+		MissedPolicy: "fire",
+		Payload:      `{}`,
+		Status:       "pending",
+		CreatedAtUTC: time.Now().UTC().UnixMilli(),
+	})
+
+	msg := mustBuildSystemMessage(t, map[string]any{
+		"client_ref":         "wf:shared::timeout",
+		"new_fire_at_utc_ms": time.Now().UTC().Add(2 * time.Hour).UnixMilli(),
+	}, "TIMER_RESCHEDULE")
+	if err := service.respondTimerReschedule(msg); err != nil {
+		t.Fatalf("reschedule foreign timer by client_ref: %v", err)
+	}
+	response := mustReadTimerResponse(t, tx)
+	if response.OK || response.Error == nil || response.Error.Code != "TIMER_NOT_FOUND" {
+		t.Fatalf("unexpected foreign reschedule response: %+v", response)
+	}
+}
+
+func TestScheduleIdempotencyAllowsReuseAfterCancel(t *testing.T) {
+	service, tx := newTestService(t)
+	service.scheduler = newTimerScheduler(service)
+	fireInMS := int64(time.Minute.Milliseconds())
+
+	// First schedule: creates the timer.
+	msg := mustBuildSystemMessage(t, map[string]any{
+		"fire_in_ms": fireInMS,
+		"client_ref": "wf:demo::step-timeout",
+	}, "TIMER_SCHEDULE")
+	if err := service.respondTimerSchedule(msg); err != nil {
+		t.Fatalf("first schedule: %v", err)
+	}
+	first := mustReadTimerResponse(t, tx)
+	if !first.OK || first.TimerUUID == nil {
+		t.Fatalf("unexpected first schedule response: %+v", first)
+	}
+
+	// Cancel by client_ref.
+	cancelMsg := mustBuildSystemMessage(t, map[string]any{"client_ref": "wf:demo::step-timeout"}, "TIMER_CANCEL")
+	if err := service.respondTimerCancel(cancelMsg); err != nil {
+		t.Fatalf("cancel by client_ref: %v", err)
+	}
+	if resp := mustReadTimerResponse(t, tx); !resp.OK {
+		t.Fatalf("unexpected cancel response: %+v", resp)
+	}
+
+	// Second schedule with same client_ref after cancel: must create a new timer, not return the old one.
+	if err := service.respondTimerSchedule(msg); err != nil {
+		t.Fatalf("second schedule after cancel: %v", err)
+	}
+	second := mustReadTimerResponse(t, tx)
+	if !second.OK || second.TimerUUID == nil {
+		t.Fatalf("unexpected second schedule response: %+v", second)
+	}
+	if *first.TimerUUID == *second.TimerUUID {
+		t.Fatalf("expected new timer uuid after cancel, got same: %s", *first.TimerUUID)
+	}
+	if alreadyExisted, _ := second.Extra["already_existed"].(bool); alreadyExisted {
+		t.Fatalf("expected already_existed=false after cancel reuse, got true")
+	}
+}
+
+func TestConcurrentScheduleWithSameClientRefCreatesExactlyOneTimer(t *testing.T) {
+	service, _ := newTestService(t)
+	service.scheduler = newTimerScheduler(service)
+	fireInMS := int64(time.Minute.Milliseconds())
+
+	const goroutines = 20
+	results := make(chan *fluxbeesdk.TimerResponse, goroutines)
+	txAll := make(chan []byte, goroutines)
+
+	// Replace the shared tx channel with one large enough to receive all responses.
+	service.sender = &stubSender{
+		uuid:     "timer-node-uuid",
+		fullName: "SY.timer@motherbee",
+		tx:       txAll,
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			msg := mustBuildSystemMessage(t, map[string]any{
+				"fire_in_ms": fireInMS,
+				"client_ref": "wf:demo::concurrent-key",
+			}, "TIMER_SCHEDULE")
+			if err := service.respondTimerSchedule(msg); err != nil {
+				t.Errorf("concurrent schedule: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Collect all responses.
+	close(txAll)
+	for frame := range txAll {
+		var msg fluxbeesdk.Message
+		if err := json.Unmarshal(frame, &msg); err != nil {
+			t.Fatalf("decode sent message: %v", err)
+		}
+		var resp fluxbeesdk.TimerResponse
+		if err := json.Unmarshal(msg.Payload, &resp); err != nil {
+			t.Fatalf("decode timer response: %v", err)
+		}
+		results <- &resp
+	}
+	close(results)
+
+	var uuids []string
+	for resp := range results {
+		if !resp.OK || resp.TimerUUID == nil {
+			t.Fatalf("unexpected response: %+v", resp)
+		}
+		uuids = append(uuids, *resp.TimerUUID)
+	}
+	if len(uuids) != goroutines {
+		t.Fatalf("expected %d responses, got %d", goroutines, len(uuids))
+	}
+
+	// All responses must carry the same timer UUID — exactly one timer was created.
+	first := uuids[0]
+	for _, u := range uuids[1:] {
+		if u != first {
+			t.Fatalf("concurrent schedules produced different timer UUIDs: %s vs %s", first, u)
+		}
+	}
+
+	// Exactly one pending row must exist in the database.
+	rows, err := listTimers(context.Background(), service.db, "WF.demo@motherbee", "pending", 100)
+	if err != nil {
+		t.Fatalf("list pending timers: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected exactly 1 pending timer after concurrent schedules, got %d", len(rows))
 	}
 }
 

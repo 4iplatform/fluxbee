@@ -5,6 +5,45 @@
 //! - `examples/timer_recurring.rs`
 //! - `examples/timer_restart.rs`
 //!
+//! ## Async fire-and-forget pattern with `client_ref` (v1.1)
+//!
+//! `SY.timer` v1.1 supports deterministic client-owned identifiers via `client_ref`.
+//! The key property: a client can schedule a timer and immediately cancel or
+//! reschedule it by `client_ref` **without waiting for `TIMER_SCHEDULE_RESPONSE`**
+//! to obtain the server-generated UUID. This is essential for event-loop clients
+//! like `WF.*` nodes that must not block their receive loop.
+//!
+//! ```rust,ignore
+//! // Schedule an SLA timeout. The client_ref is deterministic and known
+//! // before the response arrives.
+//! let client_ref = format!("wf:{}::sla_timeout", instance_id);
+//!
+//! let _timer_id = client
+//!     .schedule_in(
+//!         120_000, // 2 minutes in ms
+//!         ScheduleOptions {
+//!             client_ref: Some(client_ref.clone()),
+//!             payload: serde_json::json!({ "instance_id": instance_id }),
+//!             ..Default::default()
+//!         },
+//!     )
+//!     .await?;
+//!
+//! // Later — e.g. when the step completes before the timeout — cancel by
+//! // client_ref without needing to track the UUID.
+//! client.cancel_by_client_ref(&client_ref).await?;
+//! ```
+//!
+//! Scheduling with the same `client_ref` while a pending timer already exists
+//! is idempotent: `SY.timer` returns the existing timer with `already_existed: true`
+//! instead of creating a duplicate. This makes crash-recovery safe: a node that
+//! restarts and re-schedules its timers will not accumulate duplicates.
+//!
+//! The typed client exposes the full `client_ref` surface through:
+//! - [`TimerClient::get_by_client_ref`]
+//! - [`TimerClient::cancel_by_client_ref`]
+//! - [`TimerClient::reschedule_by_client_ref`]
+//!
 //! For unit tests that should not depend on a real hive, use [`TimerTestHarness`]
 //! to drive a real [`TimerClient`] over a scripted in-memory transport.
 
