@@ -1101,6 +1101,7 @@ async fn run_inbound_socket_mode(
                     ResolveOrCreateInput {
                         channel: "slack".to_string(),
                         external_id: slack_external_id(&config.node_name, &user),
+                        tenant_id: None,
                         tenant_hint: Some(team_id.to_string()),
                         attributes: serde_json::json!({ "team_id": team_id }),
                     },
@@ -1170,6 +1171,7 @@ fn build_slack_relay_fragment(
         identity_input: ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: slack_external_id(node_name, user),
+            tenant_id: None,
             tenant_hint: Some(team_id.to_string()),
             attributes: serde_json::json!({ "team_id": team_id }),
         },

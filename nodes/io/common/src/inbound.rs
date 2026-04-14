@@ -286,6 +286,7 @@ mod tests {
         let input = ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: "T:U".to_string(),
+            tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
         };
@@ -308,6 +309,7 @@ mod tests {
         let input = ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: "T:U".to_string(),
+            tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
         };
@@ -335,6 +337,7 @@ mod tests {
         let input = ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: "T:U".to_string(),
+            tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
         };
@@ -365,6 +368,7 @@ mod tests {
         let input = ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: "T:U".to_string(),
+            tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
         };
@@ -394,6 +398,7 @@ mod tests {
         let input = ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: "T123:U456".to_string(),
+            tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
         };
@@ -502,6 +507,7 @@ mod tests {
         let input = ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: "T:U".to_string(),
+            tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
         };
@@ -532,6 +538,7 @@ mod tests {
         let input = ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: "T:U".to_string(),
+            tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
         };
@@ -565,6 +572,7 @@ mod tests {
         let input = ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: "T:U".to_string(),
+            tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
         };

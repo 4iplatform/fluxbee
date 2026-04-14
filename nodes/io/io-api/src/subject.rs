@@ -263,6 +263,7 @@ pub(crate) fn parse_json_message_request(
         identity_input: ResolveOrCreateInput {
             channel: "api".to_string(),
             external_id: external_user_id.clone(),
+            tenant_id: None,
             tenant_hint: tenant_hint
                 .as_ref()
                 .and_then(Value::as_str)

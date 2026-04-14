@@ -666,6 +666,7 @@ mod tests {
             identity_input: ResolveOrCreateInput {
                 channel: "slack".to_string(),
                 external_id: "T1:U1".to_string(),
+                tenant_id: None,
                 tenant_hint: Some("T1".to_string()),
                 attributes: serde_json::json!({ "team_id": "T1" }),
             },
