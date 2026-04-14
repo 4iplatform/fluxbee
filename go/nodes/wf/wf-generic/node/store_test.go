@@ -2,6 +2,8 @@ package node
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -13,6 +15,28 @@ func openTestStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	return s
+}
+
+func TestOpenStoreCreatesParentDirectory(t *testing.T) {
+	base := t.TempDir()
+	path := filepath.Join(base, "nested", "wf", "wf.db")
+
+	if _, err := os.Stat(filepath.Dir(path)); !os.IsNotExist(err) {
+		t.Fatalf("expected parent dir to be absent before OpenStore, err=%v", err)
+	}
+
+	store, err := OpenStore(path)
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	if _, err := os.Stat(filepath.Dir(path)); err != nil {
+		t.Fatalf("expected parent dir to exist after OpenStore: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected db file to exist after OpenStore: %v", err)
+	}
 }
 
 // --- Instance roundtrip ---
@@ -301,4 +325,3 @@ func TestStoreTimerUpsertUpdatesFireAt(t *testing.T) {
 		t.Fatalf("expected fire_at_ms=5000, got %v", timers)
 	}
 }
-
