@@ -164,6 +164,7 @@ struct SpawnConfig {
 struct ParsedHttpMessage {
     request_id: String,
     identity_input: ResolveOrCreateInput,
+    dst_node_override: Option<String>,
     io_context: IoContext,
     payload: Value,
     relay_final: bool,
@@ -734,6 +735,7 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
                         state.identity.as_ref(),
                         Some(state.provisioner.as_ref()),
                         parsed.identity_input,
+                        parsed.dst_node_override,
                         parsed.io_context,
                         parsed.payload,
                     )
@@ -867,6 +869,7 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
                     state.identity.as_ref(),
                     Some(state.provisioner.as_ref()),
                     parsed.identity_input,
+                    parsed.dst_node_override,
                     parsed.io_context,
                     parsed.payload,
                 )
@@ -1421,6 +1424,7 @@ fn build_api_relay_fragment(
         })),
         io_context: parsed.io_context.clone(),
         identity_input: parsed.identity_input.clone(),
+        dst_node_override: parsed.dst_node_override.clone(),
         flush_hints: RelayFlushHints {
             final_fragment: parsed.relay_final,
         },
@@ -1854,6 +1858,9 @@ mod tests {
                 "relay": {
                     "final": true
                 },
+                "routing": {
+                    "dst_node": "AI.chat@motherbee"
+                },
                 "metadata": {
                     "conversation_id": "conv-1"
                 }
@@ -1891,6 +1898,10 @@ mod tests {
         assert_eq!(parsed.io_context.sender.id, "crm:123");
         assert_eq!(parsed.io_context.entrypoint.id, "127.0.0.1");
         assert_eq!(
+            parsed.dst_node_override.as_deref(),
+            Some("AI.chat@motherbee")
+        );
+        assert_eq!(
             parsed.io_context.conversation.thread_id.as_deref(),
             Some(
                 compute_thread_id(ThreadIdInput::PersistentChannel {
@@ -1907,6 +1918,36 @@ mod tests {
             parsed.explicit_subject_mode,
             Some(ExplicitSubjectMode::ByData)
         );
+    }
+
+    #[test]
+    fn parse_json_message_request_rejects_invalid_routing_dst_node() {
+        let effective = configured_effective("explicit_subject");
+        let auth_match = AuthMatch {
+            key_id: "partner1".to_string(),
+            tenant_id: "tnt:partner1".to_string(),
+            caller_identity: None,
+        };
+        let envelope = serde_json::json!({
+            "subject": {
+                "external_user_id": "crm:123",
+                "display_name": "Juan Perez",
+                "email": "juan@example.com"
+            },
+            "message": {
+                "text": "hola"
+            },
+            "options": {
+                "routing": {
+                    "dst_node": 123
+                }
+            }
+        });
+
+        let err = parse_json_message_request(&envelope, &effective, &auth_match, false)
+            .expect_err("must reject non-string dst_node");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.1, "invalid_payload");
     }
 
     #[test]

@@ -93,6 +93,7 @@ impl InboundProcessor {
         identity: &dyn IdentityResolver,
         provisioner: Option<&dyn IdentityProvisioner>,
         identity_input: ResolveOrCreateInput,
+        dst_node_override: Option<String>,
         io_context: IoContext,
         payload: Value,
     ) -> InboundOutcome {
@@ -107,6 +108,7 @@ impl InboundProcessor {
             identity,
             provisioner,
             identity_input,
+            dst_node_override,
             wrap_in_meta_context(&io_context),
             payload,
         )
@@ -130,6 +132,7 @@ impl InboundProcessor {
             identity,
             provisioner,
             turn.identity_input,
+            turn.dst_node_override,
             turn.meta_context,
             turn.payload,
         )
@@ -141,6 +144,7 @@ impl InboundProcessor {
         identity: &dyn IdentityResolver,
         provisioner: Option<&dyn IdentityProvisioner>,
         identity_input: ResolveOrCreateInput,
+        dst_node_override: Option<String>,
         meta_context: Value,
         payload: Value,
     ) -> InboundOutcome {
@@ -240,7 +244,7 @@ impl InboundProcessor {
 
         InboundOutcome::SendNow(build_user_message(
             &self.node_uuid,
-            self.dst_node.clone(),
+            dst_node_override.or_else(|| self.dst_node.clone()),
             self.ttl,
             trace_id,
             src_ilk,
@@ -307,11 +311,11 @@ mod tests {
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
         let o1 = p
-            .process_inbound(&id, None, input.clone(), io.clone(), payload.clone())
+            .process_inbound(&id, None, input.clone(), None, io.clone(), payload.clone())
             .await;
         assert!(matches!(o1, InboundOutcome::SendNow(_)));
 
-        let o2 = p.process_inbound(&id, None, input, io, payload).await;
+        let o2 = p.process_inbound(&id, None, input, None, io, payload).await;
         assert!(matches!(o2, InboundOutcome::DroppedDuplicate));
     }
 
@@ -330,7 +334,7 @@ mod tests {
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
-        let o = p.process_inbound(&id, None, input, io, payload).await;
+        let o = p.process_inbound(&id, None, input, None, io, payload).await;
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
         };
@@ -359,7 +363,7 @@ mod tests {
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
-        let o = p.process_inbound(&id, None, input, io, payload).await;
+        let o = p.process_inbound(&id, None, input, None, io, payload).await;
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
         };
@@ -391,7 +395,7 @@ mod tests {
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
-        let o = p.process_inbound(&id, None, input, io, payload).await;
+        let o = p.process_inbound(&id, None, input, None, io, payload).await;
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
         };
@@ -422,7 +426,7 @@ mod tests {
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
-        let o = p.process_inbound(&id, None, input, io, payload).await;
+        let o = p.process_inbound(&id, None, input, None, io, payload).await;
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
         };
@@ -533,7 +537,7 @@ mod tests {
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
         let o = p
-            .process_inbound(&id, Some(&provisioner), input, io, payload)
+            .process_inbound(&id, Some(&provisioner), input, None, io, payload)
             .await;
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
@@ -565,7 +569,7 @@ mod tests {
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
         let o = p
-            .process_inbound(&id, Some(&provisioner), input, io, payload)
+            .process_inbound(&id, Some(&provisioner), input, None, io, payload)
             .await;
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
@@ -600,7 +604,7 @@ mod tests {
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
         let o = p
-            .process_inbound(&id, Some(&provisioner), input, io, payload)
+            .process_inbound(&id, Some(&provisioner), input, None, io, payload)
             .await;
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
@@ -636,7 +640,7 @@ mod tests {
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
         let o = p
-            .process_inbound(&id, Some(&provisioner), input, io, payload)
+            .process_inbound(&id, Some(&provisioner), input, None, io, payload)
             .await;
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");

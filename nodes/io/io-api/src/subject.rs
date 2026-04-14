@@ -204,6 +204,7 @@ pub(crate) fn parse_json_message_request(
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(|| external_user_id.clone());
+    let dst_node_override = extract_dst_node_override(envelope)?;
     let thread_id = compute_thread_id(ThreadIdInput::PersistentChannel {
         channel_type: "api",
         entrypoint_id: Some(
@@ -305,6 +306,7 @@ pub(crate) fn parse_json_message_request(
             tenant_hint: None,
             attributes: Value::Object(attributes),
         },
+        dst_node_override,
         io_context: IoContext {
             channel: "api".to_string(),
             entrypoint: PartyRef {
@@ -349,6 +351,45 @@ pub(crate) fn parse_json_message_request(
             .unwrap_or(false),
         explicit_subject_mode,
     })
+}
+
+fn extract_dst_node_override(
+    envelope: &Value,
+) -> std::result::Result<Option<String>, (StatusCode, &'static str, String)> {
+    let Some(options) = envelope.get("options") else {
+        return Ok(None);
+    };
+    let Some(options_obj) = options.as_object() else {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_payload",
+            "Field 'options' must be an object when present".to_string(),
+        ));
+    };
+    let Some(routing) = options_obj.get("routing") else {
+        return Ok(None);
+    };
+    let Some(routing_obj) = routing.as_object() else {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_payload",
+            "Field 'options.routing' must be an object when present".to_string(),
+        ));
+    };
+    let Some(dst_node) = routing_obj.get("dst_node") else {
+        return Ok(None);
+    };
+    let Some(dst_node) = dst_node.as_str().map(str::trim) else {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_payload",
+            "Field 'options.routing.dst_node' must be a string when present".to_string(),
+        ));
+    };
+    if dst_node.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(dst_node.to_string()))
 }
 
 pub(crate) fn api_relay_key(

@@ -1106,6 +1106,7 @@ async fn run_inbound_socket_mode(
                         tenant_hint: Some(team_id.to_string()),
                         attributes: serde_json::json!({ "team_id": team_id }),
                     },
+                    None,
                     io_ctx,
                     payload,
                 )
