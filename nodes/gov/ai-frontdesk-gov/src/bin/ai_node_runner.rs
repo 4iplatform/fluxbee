@@ -29,6 +29,10 @@ use fluxbee_sdk::{
 };
 use fluxbee_sdk::{MSG_ILK_REGISTER, MSG_TNT_CREATE};
 use gov_common::{
+    frontdesk_contract::{
+        frontdesk_result_payload, parse_frontdesk_handoff_payload, FrontdeskHandoffPayload,
+        FrontdeskResultPayload, FRONTDESK_RESULT_PAYLOAD_TYPE,
+    },
     gov_identity_config_from_env, identity_error_to_tool_payload, looks_like_tenant_id,
     resolve_tenant_id_for_register, tenant_resolution_source, GovIdentityConfig,
     GOV_IDENTITY_TENANT_ID_ENV,
@@ -52,7 +56,7 @@ const FRONTDESK_DEFAULT_SYSTEM_PROMPT: &str = r#"
 You are SY.frontdesk.gov.
 
 Goal:
-- Collect required identity fields: name, email, tenant_hint.
+- Collect required identity fields: name, email.
 - Use thread_state_* to keep progress.
 - On positive confirmation, call ilk_register and close.
 
@@ -62,7 +66,8 @@ State schema (data):
   "collected": {
     "name": null|string,
     "email": null|string,
-    "tenant_hint": null|string
+    "phone": null|string,
+    "company_name": null|string
   },
   "register_attempted": false,
   "register_error": null
@@ -70,7 +75,7 @@ State schema (data):
 
 Mandatory flow:
 1) On every user turn, call thread_state_get first.
-2) Extract and merge any new values for name/email/tenant_hint.
+2) Extract and merge any new values for name/email/phone/company_name.
 3) If state changed, call thread_state_put immediately.
 4) If any required field is missing, ask ONLY missing fields.
 5) If all required fields are present and status is not completed/completed_error:
@@ -80,7 +85,8 @@ Mandatory flow:
 
 Extraction rules:
 - If message contains an email pattern, map it to email.
-- If message mentions tenant/tenant_hint/company/org, prioritize tenant_hint.
+- If message mentions phone or celular, map it to phone when clear.
+- If message mentions company/org/empresa, map it to company_name when clear.
 - If only one field is missing, treat concise user answer as that field unless clearly contradictory.
 
 Confirmation normalization:
@@ -92,7 +98,7 @@ STRICT NO-LOOP RULE:
   - If register_attempted==false:
     a) Call ilk_register with:
        - src_ilk (from context)
-       - identity_candidate {name,email,tenant_hint}
+       - identity_candidate {name,email,phone}
     b) If tool returns status=ok:
        - call thread_state_delete
        - send final success message
@@ -768,6 +774,42 @@ struct BehaviorContext {
     src_ilk: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+struct FrontdeskThreadState {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    collected: FrontdeskCollectedState,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(default)]
+    registration_status: Option<String>,
+    #[serde(default)]
+    register_attempted: bool,
+    #[serde(default)]
+    register_error: Option<FrontdeskRegisterErrorState>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct FrontdeskCollectedState {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    phone: Option<String>,
+    #[serde(default)]
+    company_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct FrontdeskRegisterErrorState {
+    #[serde(default)]
+    error_code: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PersistedImmediateMemoryRecord {
     #[serde(default)]
@@ -937,6 +979,14 @@ impl AiNode for GenericAiNode {
             src_ilk: extract_src_ilk(&msg),
         };
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
+            if self.mode == RunnerMode::Gov {
+                if let Some(handoff) = parse_frontdesk_handoff_payload(&msg.payload) {
+                    return Ok(Some(
+                        self.handle_frontdesk_handoff(&msg, &behavior_ctx, handoff)
+                            .await?,
+                    ));
+                }
+            }
             let src_ilk_source = src_ilk_source(&msg);
             if behavior_ctx.src_ilk.is_none() {
                 tracing::warn!(
@@ -994,6 +1044,12 @@ impl AiNode for GenericAiNode {
                 "incoming user message"
             );
         }
+        let prior_frontdesk_state =
+            if self.mode == RunnerMode::Gov && msg.meta.msg_type.eq_ignore_ascii_case("user") {
+                Some(self.load_frontdesk_thread_state(&behavior_ctx).await?)
+            } else {
+                None
+            };
         let output = match &behavior {
             NodeBehavior::Echo => format!("Echo: {input}"),
             NodeBehavior::OpenAiChat(openai) => {
@@ -1083,6 +1139,17 @@ impl AiNode for GenericAiNode {
                 }
             }
         };
+
+        if self.mode == RunnerMode::Gov && msg.meta.msg_type.eq_ignore_ascii_case("user") {
+            let payload = self
+                .build_frontdesk_result_for_conversation(
+                    &behavior_ctx,
+                    output,
+                    prior_frontdesk_state.flatten(),
+                )
+                .await?;
+            return Ok(Some(build_frontdesk_result_reply(&msg, payload)?));
+        }
 
         let payload = build_text_response(output)?;
         Ok(Some(build_reply_message_runtime_src(&msg, payload)))
@@ -1366,6 +1433,281 @@ impl GenericAiNode {
         };
         registry.register(Arc::new(tool))?;
         Ok(())
+    }
+
+    async fn load_frontdesk_thread_state(
+        &self,
+        ctx: &BehaviorContext,
+    ) -> fluxbee_ai_sdk::Result<Option<FrontdeskThreadState>> {
+        let (Some(store), Some(src_ilk)) = (&self.thread_state_store, ctx.src_ilk.as_deref())
+        else {
+            return Ok(None);
+        };
+        let record = store.get(src_ilk).await?;
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let state = serde_json::from_value::<FrontdeskThreadState>(record.data).map_err(|err| {
+            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+                "invalid_frontdesk_thread_state: {err}"
+            ))
+        })?;
+        Ok(Some(state))
+    }
+
+    async fn store_frontdesk_thread_state(
+        &self,
+        ctx: &BehaviorContext,
+        state: &FrontdeskThreadState,
+    ) -> fluxbee_ai_sdk::Result<()> {
+        let (Some(store), Some(src_ilk)) = (&self.thread_state_store, ctx.src_ilk.as_deref())
+        else {
+            return Ok(());
+        };
+        let payload = serde_json::to_value(state).map_err(|err| {
+            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+                "serialize_frontdesk_thread_state_failed: {err}"
+            ))
+        })?;
+        store.put(src_ilk, payload, None).await
+    }
+
+    async fn delete_frontdesk_thread_state(
+        &self,
+        ctx: &BehaviorContext,
+    ) -> fluxbee_ai_sdk::Result<()> {
+        let (Some(store), Some(src_ilk)) = (&self.thread_state_store, ctx.src_ilk.as_deref())
+        else {
+            return Ok(());
+        };
+        store.delete(src_ilk).await
+    }
+
+    async fn handle_frontdesk_handoff(
+        &self,
+        msg: &Message,
+        ctx: &BehaviorContext,
+        handoff: FrontdeskHandoffPayload,
+    ) -> fluxbee_ai_sdk::Result<Message> {
+        let mut result = frontdesk_result_payload(
+            "error",
+            "INVALID_REQUEST",
+            "No pude procesar el handoff de registro.",
+        );
+        result.error_code = Some("invalid_request".to_string());
+        result.error_detail = Some("Unsupported handoff payload".to_string());
+        result.ilk_id = ctx.src_ilk.clone();
+
+        if handoff.operation != "complete_registration" {
+            result.human_message = "La operación solicitada no está soportada.".to_string();
+            result.error_detail = Some(format!(
+                "Unsupported frontdesk handoff operation: {}",
+                handoff.operation
+            ));
+            return build_frontdesk_result_reply(msg, result);
+        }
+
+        let previous_state = self.load_frontdesk_thread_state(ctx).await?;
+        let mut name = handoff
+            .subject
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                previous_state
+                    .as_ref()
+                    .and_then(|state| state.collected.name.clone())
+            });
+        let mut email = handoff
+            .subject
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                previous_state
+                    .as_ref()
+                    .and_then(|state| state.collected.email.clone())
+            });
+        let phone = handoff
+            .subject
+            .phone
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                previous_state
+                    .as_ref()
+                    .and_then(|state| state.collected.phone.clone())
+            });
+        let company_name = handoff
+            .subject
+            .company_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                previous_state
+                    .as_ref()
+                    .and_then(|state| state.collected.company_name.clone())
+            });
+        let tenant_id = handoff
+            .tenant_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                previous_state
+                    .as_ref()
+                    .and_then(|state| state.tenant_id.clone())
+            });
+
+        let missing_fields = frontdesk_missing_fields(name.as_deref(), email.as_deref());
+        if !missing_fields.is_empty() {
+            let state = FrontdeskThreadState {
+                status: Some("collecting".to_string()),
+                collected: FrontdeskCollectedState {
+                    name: name.take(),
+                    email: email.take(),
+                    phone,
+                    company_name,
+                },
+                tenant_id: tenant_id.clone(),
+                registration_status: previous_state
+                    .as_ref()
+                    .and_then(|state| state.registration_status.clone())
+                    .or(Some("temporary".to_string())),
+                register_attempted: false,
+                register_error: None,
+            };
+            self.store_frontdesk_thread_state(ctx, &state).await?;
+            let mut payload = frontdesk_result_payload(
+                "needs_input",
+                "MISSING_REQUIRED_FIELDS",
+                frontdesk_missing_fields_message(&missing_fields),
+            );
+            payload.missing_fields = missing_fields;
+            payload.ilk_id = ctx.src_ilk.clone();
+            payload.tenant_id = tenant_id;
+            payload.registration_status = Some("temporary".to_string());
+            return build_frontdesk_result_reply(msg, payload);
+        }
+
+        let tool = IlkRegisterTool {
+            scoped_src_ilk: ctx.src_ilk.clone(),
+            default_tenant_id: self.resolve_effective_tenant_id(),
+            identity: self.gov_identity.clone(),
+            bridge: self.gov_identity_bridge.clone(),
+        };
+        let registered_name = name
+            .clone()
+            .expect("validated handoff name should be present");
+        let registered_email = email
+            .clone()
+            .expect("validated handoff email should be present");
+        let register_arguments = json!({
+            "src_ilk": ctx.src_ilk.clone().unwrap_or_default(),
+            "identity_candidate": {
+                "name": registered_name,
+                "email": registered_email,
+                "phone": phone,
+                "tenant_hint": Value::Null
+            },
+            "tenant_id": tenant_id,
+            "thread_id": ctx.thread_id.clone()
+        });
+        let register_payload = tool.call(register_arguments).await?;
+        let result =
+            build_frontdesk_result_from_register_response(&register_payload, ctx.src_ilk.clone());
+        if result.status == "ok" {
+            self.delete_frontdesk_thread_state(ctx).await?;
+        } else {
+            let state = FrontdeskThreadState {
+                status: Some("completed_error".to_string()),
+                collected: FrontdeskCollectedState {
+                    name,
+                    email,
+                    phone,
+                    company_name,
+                },
+                tenant_id: result.tenant_id.clone(),
+                registration_status: result.registration_status.clone(),
+                register_attempted: true,
+                register_error: Some(FrontdeskRegisterErrorState {
+                    error_code: result.error_code.clone(),
+                    message: result
+                        .error_detail
+                        .clone()
+                        .or(Some(result.human_message.clone())),
+                }),
+            };
+            self.store_frontdesk_thread_state(ctx, &state).await?;
+        }
+        build_frontdesk_result_reply(msg, result)
+    }
+
+    async fn build_frontdesk_result_for_conversation(
+        &self,
+        ctx: &BehaviorContext,
+        human_message: String,
+        prior_state: Option<FrontdeskThreadState>,
+    ) -> fluxbee_ai_sdk::Result<FrontdeskResultPayload> {
+        let after_state = self.load_frontdesk_thread_state(ctx).await?;
+        if let Some(state) = after_state {
+            if state.status.as_deref() == Some("completed") {
+                let mut payload = frontdesk_result_payload("ok", "ALREADY_COMPLETE", human_message);
+                payload.ilk_id = ctx.src_ilk.clone();
+                payload.tenant_id = state.tenant_id.clone();
+                payload.registration_status = state
+                    .registration_status
+                    .clone()
+                    .or(Some("complete".to_string()));
+                return Ok(payload);
+            }
+            if state.status.as_deref() == Some("completed_error") {
+                let mut payload =
+                    frontdesk_result_payload("error", "REGISTER_FAILED", human_message);
+                payload.ilk_id = ctx.src_ilk.clone();
+                payload.tenant_id = state.tenant_id.clone();
+                payload.registration_status = state.registration_status.clone();
+                payload.error_code = state
+                    .register_error
+                    .as_ref()
+                    .and_then(|error| error.error_code.clone());
+                payload.error_detail = state
+                    .register_error
+                    .as_ref()
+                    .and_then(|error| error.message.clone());
+                return Ok(payload);
+            }
+
+            let missing_fields = frontdesk_missing_fields(
+                state.collected.name.as_deref(),
+                state.collected.email.as_deref(),
+            );
+            let mut payload =
+                frontdesk_result_payload("needs_input", "MISSING_REQUIRED_FIELDS", human_message);
+            payload.missing_fields = missing_fields;
+            payload.ilk_id = ctx.src_ilk.clone();
+            payload.tenant_id = state.tenant_id.clone();
+            payload.registration_status = state
+                .registration_status
+                .clone()
+                .or(Some("temporary".to_string()));
+            return Ok(payload);
+        }
+
+        let mut payload = frontdesk_result_payload("ok", "REGISTERED", human_message);
+        payload.ilk_id = ctx.src_ilk.clone();
+        payload.tenant_id = prior_state.and_then(|state| state.tenant_id);
+        payload.registration_status = Some("complete".to_string());
+        Ok(payload)
     }
 
     async fn resolve_openai_api_key(&self, openai: &OpenAiChatRuntime) -> Option<String> {
@@ -3713,6 +4055,94 @@ fn openai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Val
     }
 }
 
+fn build_frontdesk_result_reply(
+    msg: &Message,
+    payload: FrontdeskResultPayload,
+) -> fluxbee_ai_sdk::Result<Message> {
+    let value = payload.to_value().map_err(|err| {
+        fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+            "frontdesk_result_serialize_failed: {err}"
+        ))
+    })?;
+    Ok(build_reply_message_runtime_src(msg, value))
+}
+
+fn frontdesk_missing_fields(name: Option<&str>, email: Option<&str>) -> Vec<String> {
+    let mut missing = Vec::new();
+    if name.map(|value| value.trim().is_empty()).unwrap_or(true) {
+        missing.push("display_name".to_string());
+    }
+    if email.map(|value| value.trim().is_empty()).unwrap_or(true) {
+        missing.push("email".to_string());
+    }
+    missing
+}
+
+fn frontdesk_missing_fields_message(missing_fields: &[String]) -> String {
+    match missing_fields {
+        [field] if field == "display_name" => {
+            "Necesito tu nombre para continuar con el registro.".to_string()
+        }
+        [field] if field == "email" => {
+            "Necesito tu email para continuar con el registro.".to_string()
+        }
+        _ => "Necesito tu nombre y tu email para continuar con el registro.".to_string(),
+    }
+}
+
+fn build_frontdesk_result_from_register_response(
+    register_payload: &Value,
+    src_ilk: Option<String>,
+) -> FrontdeskResultPayload {
+    let status = register_payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("error");
+    if status.eq_ignore_ascii_case("ok") {
+        let mut payload =
+            frontdesk_result_payload("ok", "REGISTERED", "Registro completado correctamente.");
+        payload.ilk_id = src_ilk.or_else(|| {
+            register_payload
+                .get("identity_payload")
+                .and_then(|value| value.get("ilk_id"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        });
+        payload.tenant_id = register_payload
+            .get("identity_payload")
+            .and_then(|value| value.get("tenant_id"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        payload.registration_status = Some("complete".to_string());
+        return payload;
+    }
+
+    let error_code = register_payload
+        .get("error_code")
+        .and_then(Value::as_str)
+        .unwrap_or("IDENTITY_ERROR");
+    let result_code = match error_code {
+        "UNREACHABLE" | "TIMEOUT" | "TTL_EXCEEDED" | "NOT_PRIMARY" | "IDENTITY_ERROR" => {
+            "IDENTITY_UNAVAILABLE"
+        }
+        "INVALID_REQUEST" | "missing_src_ilk" | "invalid_identity_candidate" => "INVALID_REQUEST",
+        _ => "REGISTER_FAILED",
+    };
+    let mut payload = frontdesk_result_payload(
+        "error",
+        result_code,
+        "No pude completar el registro en este momento.",
+    );
+    payload.error_code = Some(error_code.to_string());
+    payload.error_detail = register_payload
+        .get("message")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    payload.ilk_id = src_ilk;
+    payload.registration_status = Some("temporary".to_string());
+    payload
+}
+
 fn parse_openai_status_error(message: &str) -> Option<(u16, String)> {
     let marker = "openai error status=";
     let idx = message.find(marker)?;
@@ -4159,6 +4589,89 @@ mod tests {
             Some(true)
         );
         std::env::remove_var("OPENAI_API_KEY_MISSING_FOR_TEST");
+    }
+
+    #[tokio::test]
+    async fn frontdesk_handoff_incomplete_returns_frontdesk_result() {
+        let mut node = test_node();
+        {
+            let mut state = node.control_plane.write().await;
+            state.current_state = NodeLifecycleState::Configured;
+        }
+
+        let mut msg = sample_user_request_with_context(
+            json!({ "thread_id": "frontdesk-thread-1" }),
+            Some("ilk:11111111-1111-4111-8111-111111111111"),
+        );
+        msg.payload = json!({
+            "type": "frontdesk_handoff",
+            "schema_version": 1,
+            "operation": "complete_registration",
+            "subject": {
+                "display_name": "Juan Perez"
+            }
+        });
+
+        let response = node
+            .on_message(msg)
+            .await
+            .expect("handoff should not fail")
+            .expect("response should exist");
+        assert_eq!(
+            response.payload.get("type").and_then(Value::as_str),
+            Some(FRONTDESK_RESULT_PAYLOAD_TYPE)
+        );
+        assert_eq!(
+            response.payload.get("status").and_then(Value::as_str),
+            Some("needs_input")
+        );
+        assert_eq!(
+            response.payload.get("result_code").and_then(Value::as_str),
+            Some("MISSING_REQUIRED_FIELDS")
+        );
+        assert_eq!(
+            response
+                .payload
+                .get("missing_fields")
+                .and_then(Value::as_array)
+                .and_then(|fields| fields.first())
+                .and_then(Value::as_str),
+            Some("email")
+        );
+    }
+
+    #[tokio::test]
+    async fn gov_user_echo_returns_frontdesk_result_payload() {
+        let mut node = test_node();
+        {
+            let mut state = node.control_plane.write().await;
+            state.current_state = NodeLifecycleState::Configured;
+        }
+        {
+            let mut behavior = node.behavior.write().await;
+            *behavior = Some(NodeBehavior::Echo);
+        }
+
+        let msg = sample_user_request_with_context(
+            json!({ "thread_id": "frontdesk-thread-2" }),
+            Some("ilk:11111111-1111-4111-8111-111111111111"),
+        );
+        let response = node
+            .on_message(msg)
+            .await
+            .expect("on_message should not fail")
+            .expect("response should exist");
+        assert_eq!(
+            response.payload.get("type").and_then(Value::as_str),
+            Some(FRONTDESK_RESULT_PAYLOAD_TYPE)
+        );
+        assert_eq!(
+            response
+                .payload
+                .get("human_message")
+                .and_then(Value::as_str),
+            Some("Echo: hola")
+        );
     }
 
     fn sample_user_request_with_context(
