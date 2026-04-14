@@ -157,6 +157,18 @@ if [[ -d "$ROOT_DIR/go/sy-timer" ]]; then
   fi
 fi
 
+if [[ -d "$ROOT_DIR/go/nodes/wf/wf-generic" ]]; then
+  if [[ "${SKIP_BUILD:-}" == "1" || "${SKIP_GO_BUILD:-}" == "1" ]]; then
+    echo "SKIP_BUILD/SKIP_GO_BUILD set; skipping wf-generic build."
+  elif ! command -v go >/dev/null 2>&1; then
+    echo "Warning: go not found. Skipping wf-generic build." >&2
+  else
+    echo "Building wf-generic (Go)..."
+    rm -f "$ROOT_DIR/go/nodes/wf/wf-generic/wf-generic"
+    (cd "$ROOT_DIR/go/nodes/wf/wf-generic" && go build -o wf-generic .)
+  fi
+fi
+
 sudo install -d "$CONFIG_DIR"
 sudo install -d "$STATE_DIR"
 sudo install -d -m 0700 "$STATE_DIR/ssh"
@@ -250,6 +262,18 @@ if [[ -z "${sy_timer_bin:-}" ]]; then
   echo "Missing binary: $ROOT_DIR/go/sy-timer/sy-timer or $BIN_DIR/sy_timer" >&2
   missing=1
 fi
+wf_generic_bin=""
+if [[ -f "$ROOT_DIR/go/nodes/wf/wf-generic/wf-generic" ]]; then
+  wf_generic_bin="$ROOT_DIR/go/nodes/wf/wf-generic/wf-generic"
+elif wf_generic_bin="$(pick_bin wf-generic || true)"; then
+  :
+elif wf_generic_bin="$(pick_bin wf_generic || true)"; then
+  :
+fi
+if [[ -z "${wf_generic_bin:-}" ]]; then
+  echo "Missing binary: $ROOT_DIR/go/nodes/wf/wf-generic/wf-generic or $BIN_DIR/wf-generic or $BIN_DIR/wf_generic" >&2
+  missing=1
+fi
 
 if [[ "$missing" -eq 1 ]]; then
   echo "Build them first (e.g. cargo build --release --bins) or set BIN_DIR to where they exist." >&2
@@ -268,6 +292,7 @@ sudo install -m 0755 "$sy_policy_bin" /usr/bin/sy-policy
 sudo install -m 0755 "$sy_opa_rules_bin" /usr/bin/sy-opa-rules
 sudo install -m 0755 "$sy_timer_bin" /usr/bin/sy-timer
 sudo install -m 0755 "$sy_frontdesk_gov_bin" /usr/bin/sy-frontdesk-gov
+sudo install -m 0755 "$wf_generic_bin" /usr/bin/wf-generic
 
 echo "Updating core source repo in $STATE_DIR/dist/core/bin..."
 sudo install -m 0755 "$json_router_bin" "$STATE_DIR/dist/core/bin/rt-gateway"
@@ -282,6 +307,7 @@ sudo install -m 0755 "$sy_policy_bin" "$STATE_DIR/dist/core/bin/sy-policy"
 sudo install -m 0755 "$sy_opa_rules_bin" "$STATE_DIR/dist/core/bin/sy-opa-rules"
 sudo install -m 0755 "$sy_timer_bin" "$STATE_DIR/dist/core/bin/sy-timer"
 sudo install -m 0755 "$sy_frontdesk_gov_bin" "$STATE_DIR/dist/core/bin/sy-frontdesk-gov"
+sudo install -m 0755 "$wf_generic_bin" "$STATE_DIR/dist/core/bin/wf-generic"
 
 rt_gateway_sha="$(sha256sum "$STATE_DIR/dist/core/bin/rt-gateway" | awk '{print $1}')"
 rt_gateway_size="$(stat -c %s "$STATE_DIR/dist/core/bin/rt-gateway")"
@@ -305,6 +331,8 @@ sy_timer_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-timer" | awk '{print $1}'
 sy_timer_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-timer")"
 sy_frontdesk_gov_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-frontdesk-gov" | awk '{print $1}')"
 sy_frontdesk_gov_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-frontdesk-gov")"
+wf_generic_sha="$(sha256sum "$STATE_DIR/dist/core/bin/wf-generic" | awk '{print $1}')"
+wf_generic_size="$(stat -c %s "$STATE_DIR/dist/core/bin/wf-generic")"
 core_version="${FLUXBEE_CORE_VERSION:-dev}"
 if [[ -n "${FLUXBEE_CORE_BUILD_ID:-}" ]]; then
   core_build_id="$FLUXBEE_CORE_BUILD_ID"
@@ -333,7 +361,8 @@ cat >"$core_manifest_tmp" <<EOF
     "sy-cognition": {"service": "sy-cognition", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_cognition_sha", "size": $sy_cognition_size},
     "sy-policy": {"service": "sy-policy", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_policy_sha", "size": $sy_policy_size},
     "sy-timer": {"service": "sy-timer", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_timer_sha", "size": $sy_timer_size},
-    "sy-frontdesk-gov": {"service": "sy-frontdesk-gov", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_frontdesk_gov_sha", "size": $sy_frontdesk_gov_size}
+    "sy-frontdesk-gov": {"service": "sy-frontdesk-gov", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_frontdesk_gov_sha", "size": $sy_frontdesk_gov_size},
+    "wf-generic": {"service": "wf-generic", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$wf_generic_sha", "size": $wf_generic_size}
   }
 }
 EOF
@@ -386,6 +415,7 @@ verify_core_component "sy-cognition" "$sy_cognition_sha" "$sy_cognition_size"
 verify_core_component "sy-policy" "$sy_policy_sha" "$sy_policy_size"
 verify_core_component "sy-timer" "$sy_timer_sha" "$sy_timer_size"
 verify_core_component "sy-frontdesk-gov" "$sy_frontdesk_gov_sha" "$sy_frontdesk_gov_size"
+verify_core_component "wf-generic" "$wf_generic_sha" "$wf_generic_size"
 echo "Core binaries verification passed."
 
 seeded_syncthing_vendor=0

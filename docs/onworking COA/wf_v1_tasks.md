@@ -457,16 +457,16 @@ go/nodes/wf/wf-generic/
 ## 15) Build and install integration
 
 ### WF-BUILD-1 — scripts/install.sh
-- [ ] Add build block for `go/nodes/wf/wf-generic/`:
+- [x] Add build block for `go/nodes/wf/wf-generic/`:
   ```bash
   if [[ -d "$ROOT_DIR/go/nodes/wf/wf-generic" ]]; then
     ...
     (cd "$ROOT_DIR/go/nodes/wf/wf-generic" && go build -o wf-generic .)
   fi
   ```
-- [ ] Add binary check: look for `$ROOT_DIR/go/nodes/wf/wf-generic/wf-generic`
-- [ ] Install binary to `/usr/bin/wf-generic`
-- [ ] Install to `$STATE_DIR/dist/core/bin/wf-generic`
+- [x] Add binary check: look for `$ROOT_DIR/go/nodes/wf/wf-generic/wf-generic`
+- [x] Install binary to `/usr/bin/wf-generic`
+- [x] Install to `$STATE_DIR/dist/core/bin/wf-generic`
 
 ### WF-BUILD-2 — Orchestrator awareness
 - [ ] Verify orchestrator can spawn `WF.*` nodes using `wf-generic` binary + `--config` pointing to the per-node workflow definition
