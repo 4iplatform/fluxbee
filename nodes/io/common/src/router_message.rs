@@ -40,6 +40,7 @@ pub fn build_user_message(
     Message {
         routing: Routing {
             src: src_node_uuid.to_string(),
+            src_l2_name: None,
             dst: dst_node_uuid
                 .map(Destination::Unicast)
                 .unwrap_or(Destination::Resolve),
