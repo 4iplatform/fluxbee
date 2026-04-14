@@ -35,7 +35,6 @@ impl IoAdapterConfigContract for IoApiAdapterConfigContract {
             "config.auth.api_keys[].caller_identity.external_user_id",
             "config.auth.api_keys[].caller_identity.display_name",
             "config.auth.api_keys[].caller_identity.email",
-            "config.auth.api_keys[].caller_identity.tenant_hint",
             "config.node.*",
             "config.runtime.*",
         ]
@@ -47,6 +46,7 @@ impl IoAdapterConfigContract for IoApiAdapterConfigContract {
             "Inline API keys must be materialized to local secrets.json by IO.api runtime.",
             "CONFIG_GET and CONFIG_RESPONSE must redact secret-bearing fields.",
             "v1 supports auth.mode=api_key only.",
+            "Each API key must declare a tenant_id; IO.api derives the effective tenant from the authenticated key.",
         ]
     }
 
@@ -300,6 +300,7 @@ fn validate_api_keys(
             ));
         };
         require_non_empty_string(entry_obj, "key_id", "auth.api_keys[].key_id")?;
+        require_non_empty_string(entry_obj, "tenant_id", "auth.api_keys[].tenant_id")?;
         let has_secret = has_non_empty_string(entry_obj, "token")
             || has_non_empty_string(entry_obj, "token_ref");
         if !has_secret {
@@ -446,7 +447,7 @@ mod tests {
                 "auth": {
                     "mode": "api_key",
                     "api_keys": [
-                        { "key_id": "partner1", "token_ref": "env:PARTNER1_KEY" }
+                        { "key_id": "partner1", "tenant_id": "tnt:partner1", "token_ref": "env:PARTNER1_KEY" }
                     ]
                 },
                 "ingress": {
@@ -466,6 +467,32 @@ mod tests {
     }
 
     #[test]
+    fn validate_materialize_requires_tenant_id_per_api_key() {
+        let contract = IoApiAdapterConfigContract;
+        let err = contract
+            .validate_and_materialize(&json!({
+                "listen": { "address": "127.0.0.1", "port": 8080 },
+                "auth": {
+                    "mode": "api_key",
+                    "api_keys": [
+                        { "key_id": "partner1", "token_ref": "env:PARTNER1_KEY" }
+                    ]
+                },
+                "ingress": {
+                    "subject_mode": "explicit_subject",
+                    "accepted_content_types": ["application/json"]
+                }
+            }))
+            .expect_err("must fail");
+        assert_eq!(
+            err,
+            IoAdapterConfigError::InvalidConfig(
+                "auth.api_keys[].tenant_id is required".to_string()
+            )
+        );
+    }
+
+    #[test]
     fn validate_materialize_requires_caller_identity_for_caller_is_subject() {
         let contract = IoApiAdapterConfigContract;
         let err = contract
@@ -474,7 +501,7 @@ mod tests {
                 "auth": {
                     "mode": "api_key",
                     "api_keys": [
-                        { "key_id": "caller1", "token_ref": "env:CALLER1_KEY" }
+                        { "key_id": "caller1", "tenant_id": "tnt:caller1", "token_ref": "env:CALLER1_KEY" }
                     ]
                 },
                 "ingress": {

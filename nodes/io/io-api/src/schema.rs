@@ -25,7 +25,8 @@ pub(crate) fn build_configured_schema(
             "required": true,
             "allowed": true,
             "lookup_key_field": "external_user_id",
-            "optional_identity_candidates": ["display_name", "email", "tenant_hint"]
+            "tenant_source": "authenticated_api_key",
+            "optional_identity_candidates": ["display_name", "email", "company_name", "attributes"]
         })
     } else {
         serde_json::json!({

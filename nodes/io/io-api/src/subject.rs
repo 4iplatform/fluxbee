@@ -52,7 +52,7 @@ pub(crate) fn parse_json_message_request(
 
     let subject = envelope.get("subject");
     let caller_identity = auth_match.caller_identity.as_ref();
-    let (external_user_id, display_name, email, tenant_hint, explicit_subject_mode) =
+    let (external_user_id, display_name, email, explicit_subject_mode) =
         if subject_mode == "explicit_subject" {
             let subject_obj = subject.and_then(Value::as_object).ok_or_else(|| {
                 (
@@ -61,6 +61,22 @@ pub(crate) fn parse_json_message_request(
                     "Field 'subject' is required for subject_mode=explicit_subject".to_string(),
                 )
             })?;
+            if subject_obj.contains_key("tenant_id") {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_payload",
+                    "Field 'subject.tenant_id' is not allowed; tenant is derived from the API key"
+                        .to_string(),
+                ));
+            }
+            if subject_obj.contains_key("tenant_hint") {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_payload",
+                    "Field 'subject.tenant_hint' is not allowed; tenant is derived from the API key"
+                        .to_string(),
+                ));
+            }
             let subject_ilk = subject_obj
                 .get("ilk")
                 .and_then(Value::as_str)
@@ -79,7 +95,6 @@ pub(crate) fn parse_json_message_request(
                     external_user_id,
                     subject_obj.get("display_name").cloned(),
                     subject_obj.get("email").cloned(),
-                    subject_obj.get("tenant_hint").cloned(),
                     Some(ExplicitSubjectMode::ByIlk { ilk }),
                 )
             } else {
@@ -125,25 +140,10 @@ pub(crate) fn parse_json_message_request(
                                 .to_string(),
                         )
                     })?;
-                let tenant_hint = subject_obj
-                    .get("tenant_hint")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(|value| Value::String(value.to_string()))
-                    .ok_or_else(|| {
-                        (
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            "subject_data_incomplete",
-                            "Field 'subject.tenant_hint' is required for explicit_subject by_data"
-                                .to_string(),
-                        )
-                    })?;
                 (
                     external_user_id,
                     Some(display_name),
                     Some(email),
-                    Some(tenant_hint),
                     Some(ExplicitSubjectMode::ByData),
                 )
             }
@@ -179,7 +179,6 @@ pub(crate) fn parse_json_message_request(
                 external_user_id,
                 caller.get("display_name").cloned(),
                 caller.get("email").cloned(),
-                caller.get("tenant_hint").cloned(),
                 None,
             )
         };
@@ -235,12 +234,47 @@ pub(crate) fn parse_json_message_request(
     if let Some(value) = email.clone() {
         attributes.insert("email".to_string(), value);
     }
+    if let Some(company_name) = subject
+        .and_then(Value::as_object)
+        .and_then(|subject| subject.get("company_name"))
+    {
+        let Some(company_name) = company_name
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_payload",
+                "Field 'subject.company_name' must be a non-empty string when present".to_string(),
+            ));
+        };
+        attributes.insert(
+            "company_name".to_string(),
+            Value::String(company_name.to_string()),
+        );
+    }
     if let Some(value) = subject
         .and_then(Value::as_object)
         .and_then(|subject| subject.get("phone"))
         .cloned()
     {
         attributes.insert("phone".to_string(), value);
+    }
+    if let Some(subject_attributes) = subject
+        .and_then(Value::as_object)
+        .and_then(|subject| subject.get("attributes"))
+    {
+        let Some(subject_attributes_obj) = subject_attributes.as_object() else {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_payload",
+                "Field 'subject.attributes' must be an object when present".to_string(),
+            ));
+        };
+        for (key, value) in subject_attributes_obj {
+            attributes.insert(key.clone(), value.clone());
+        }
     }
     if let Some(metadata) = envelope
         .get("options")
@@ -263,11 +297,8 @@ pub(crate) fn parse_json_message_request(
         identity_input: ResolveOrCreateInput {
             channel: "api".to_string(),
             external_id: external_user_id.clone(),
-            tenant_id: None,
-            tenant_hint: tenant_hint
-                .as_ref()
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
+            tenant_id: Some(auth_match.tenant_id.clone()),
+            tenant_hint: None,
             attributes: Value::Object(attributes),
         },
         io_context: IoContext {

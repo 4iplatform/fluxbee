@@ -16,7 +16,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND};
-use fluxbee_sdk::{connect, try_handle_default_node_status, NodeConfig, NodeUuidMode};
+use fluxbee_sdk::{
+    connect, tenant_exists_in_hive_id, try_handle_default_node_status, NodeConfig, NodeUuidMode,
+};
 use io_common::identity::{
     IdentityProvisioner, IdentityResolver, ResolveOrCreateInput, ShmIdentityResolver,
 };
@@ -117,12 +119,14 @@ struct ApiAuthRegistry {
 #[derive(Debug, Clone)]
 struct ApiKeyRuntime {
     key_id: String,
+    tenant_id: String,
     token: String,
     caller_identity: Option<Value>,
 }
 
 #[derive(Clone)]
 struct HttpState {
+    hive_id: String,
     node_name: String,
     control_plane: Arc<RwLock<IoControlPlaneState>>,
     adapter_contract: Arc<dyn IoAdapterConfigContract>,
@@ -148,6 +152,7 @@ struct RuntimeUpdateHandles {
 #[derive(Debug, Clone)]
 struct AuthMatch {
     key_id: String,
+    tenant_id: String,
     caller_identity: Option<Value>,
 }
 
@@ -306,6 +311,7 @@ async fn main() -> Result<()> {
     let control_src = sender.full_name().to_string();
 
     let http_state = Arc::new(HttpState {
+        hive_id: config.island_id.clone(),
         node_name: config.node_name.clone(),
         control_plane: control_plane.clone(),
         adapter_contract: adapter_contract.clone(),
@@ -560,6 +566,19 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
             );
         }
     };
+    if let Err((status, code, message)) =
+        validate_authenticated_tenant(state.hive_id.as_str(), auth_match.tenant_id.as_str())
+    {
+        tracing::warn!(
+            node_name = %state.node_name,
+            path = %request_path,
+            key_id = %auth_match.key_id,
+            tenant_id = %auth_match.tenant_id,
+            error_code = code,
+            "io-api request rejected: authenticated key tenant is invalid"
+        );
+        return api_error(status, code, message);
+    }
 
     let content_type = headers
         .get(CONTENT_TYPE)
@@ -571,6 +590,7 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
         node_name = %state.node_name,
         path = %request_path,
         key_id = %auth_match.key_id,
+        tenant_id = %auth_match.tenant_id,
         content_type = %content_type,
         "io-api request authenticated"
     );
@@ -805,6 +825,7 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
         node_name = %state.node_name,
         path = %request_path,
         key_id = %auth_match.key_id,
+        tenant_id = %auth_match.tenant_id,
         subject_mode = extract_subject_mode(Some(effective)).unwrap_or_else(|| "unknown".to_string()),
         relay_final = parsed.relay_final,
         "io-api json payload accepted"
@@ -1338,6 +1359,25 @@ fn map_identity_error_to_http(
     }
 }
 
+fn validate_authenticated_tenant(
+    hive_id: &str,
+    tenant_id: &str,
+) -> std::result::Result<(), (StatusCode, &'static str, String)> {
+    match tenant_exists_in_hive_id(hive_id, tenant_id) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((
+            StatusCode::FORBIDDEN,
+            "tenant_not_found",
+            format!("Authenticated API key tenant '{tenant_id}' does not exist"),
+        )),
+        Err(err) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "identity_unavailable",
+            format!("Unable to validate authenticated API key tenant: {err}"),
+        )),
+    }
+}
+
 fn build_api_relay_fragment(
     node_name: &str,
     parsed: &ParsedHttpMessage,
@@ -1599,6 +1639,7 @@ mod tests {
                 "api_keys": [
                     {
                         "key_id": "partner 1",
+                        "tenant_id": "tnt:partner1",
                         "token_ref": "local_file:io_api_key__partner_1",
                         "caller_identity": {
                             "external_user_id": "caller-1"
@@ -1614,6 +1655,7 @@ mod tests {
 
         assert_eq!(registry.keys.len(), 1);
         assert_eq!(registry.keys[0].key_id, "partner 1");
+        assert_eq!(registry.keys[0].tenant_id, "tnt:partner1");
         assert_eq!(registry.keys[0].token, "secret-2");
         assert_eq!(
             registry.keys[0]
@@ -1638,6 +1680,7 @@ mod tests {
                 "api_keys": [
                     {
                         "key_id": "partner1",
+                        "tenant_id": "tnt:partner1",
                         "token_ref": "local_file:io_api_key__partner1",
                         "caller_identity": {
                             "external_user_id": "caller-1",
@@ -1674,6 +1717,7 @@ mod tests {
         let registry = Arc::new(RwLock::new(ApiAuthRegistry {
             keys: vec![ApiKeyRuntime {
                 key_id: "partner1".to_string(),
+                tenant_id: "tnt:partner1".to_string(),
                 token: "secret-token".to_string(),
                 caller_identity: Some(serde_json::json!({
                     "external_user_id": "caller-1"
@@ -1685,6 +1729,7 @@ mod tests {
             .await
             .expect("auth match");
         assert_eq!(auth.key_id, "partner1");
+        assert_eq!(auth.tenant_id, "tnt:partner1");
         assert_eq!(
             auth.caller_identity
                 .as_ref()
@@ -1778,6 +1823,7 @@ mod tests {
         let effective = configured_effective("explicit_subject");
         let auth_match = AuthMatch {
             key_id: "partner1".to_string(),
+            tenant_id: "tnt:partner1".to_string(),
             caller_identity: None,
         };
         let envelope = serde_json::json!({
@@ -1785,7 +1831,10 @@ mod tests {
                 "external_user_id": "crm:123",
                 "display_name": "Juan Perez",
                 "email": "juan@example.com",
-                "tenant_hint": "acme"
+                "company_name": "ACME Support",
+                "attributes": {
+                    "crm_customer_id": "crm-123"
+                }
             },
             "message": {
                 "text": "hola",
@@ -1805,7 +1854,27 @@ mod tests {
             parse_json_message_request(&envelope, &effective, &auth_match, false).expect("parsed");
         assert_eq!(parsed.identity_input.channel, "api");
         assert_eq!(parsed.identity_input.external_id, "crm:123");
-        assert_eq!(parsed.identity_input.tenant_hint.as_deref(), Some("acme"));
+        assert_eq!(
+            parsed.identity_input.tenant_id.as_deref(),
+            Some("tnt:partner1")
+        );
+        assert_eq!(parsed.identity_input.tenant_hint, None);
+        assert_eq!(
+            parsed
+                .identity_input
+                .attributes
+                .get("company_name")
+                .and_then(Value::as_str),
+            Some("ACME Support")
+        );
+        assert_eq!(
+            parsed
+                .identity_input
+                .attributes
+                .get("crm_customer_id")
+                .and_then(Value::as_str),
+            Some("crm-123")
+        );
         assert_eq!(parsed.io_context.conversation.id, "conv-1");
         assert_eq!(parsed.io_context.message.id, "crm-msg-1");
         assert_eq!(parsed.io_context.channel, "api");
@@ -1835,14 +1904,14 @@ mod tests {
         let effective = configured_effective("explicit_subject");
         let auth_match = AuthMatch {
             key_id: "partner1".to_string(),
+            tenant_id: "tnt:partner1".to_string(),
             caller_identity: None,
         };
         let envelope = serde_json::json!({
             "subject": {
                 "ilk": "ilk:abc-123",
                 "display_name": "Ignored Name",
-                "email": "ignored@example.com",
-                "tenant_hint": "ignored-tenant"
+                "email": "ignored@example.com"
             },
             "message": {
                 "text": "hola"
@@ -1852,6 +1921,10 @@ mod tests {
         let parsed =
             parse_json_message_request(&envelope, &effective, &auth_match, false).expect("parsed");
         assert_eq!(parsed.identity_input.external_id, "ilk:abc-123");
+        assert_eq!(
+            parsed.identity_input.tenant_id.as_deref(),
+            Some("tnt:partner1")
+        );
         assert_eq!(
             parsed.explicit_subject_mode,
             Some(ExplicitSubjectMode::ByIlk {
@@ -1865,6 +1938,7 @@ mod tests {
         let effective = configured_effective("explicit_subject");
         let auth_match = AuthMatch {
             key_id: "partner1".to_string(),
+            tenant_id: "tnt:partner1".to_string(),
             caller_identity: None,
         };
         let envelope = serde_json::json!({
@@ -1888,6 +1962,7 @@ mod tests {
         let effective = configured_effective("caller_is_subject");
         let auth_match = AuthMatch {
             key_id: "partner1".to_string(),
+            tenant_id: "tnt:partner1".to_string(),
             caller_identity: Some(serde_json::json!({
                 "external_user_id": "caller-1"
             })),
@@ -1912,10 +1987,10 @@ mod tests {
         let effective = configured_effective("caller_is_subject");
         let auth_match = AuthMatch {
             key_id: "partner1".to_string(),
+            tenant_id: "tnt:partner1".to_string(),
             caller_identity: Some(serde_json::json!({
                 "external_user_id": "caller-1",
-                "display_name": "Caller One",
-                "tenant_hint": "tenant-a"
+                "display_name": "Caller One"
             })),
         };
         let envelope = serde_json::json!({
@@ -1928,9 +2003,10 @@ mod tests {
             parse_json_message_request(&envelope, &effective, &auth_match, false).expect("parsed");
         assert_eq!(parsed.identity_input.external_id, "caller-1");
         assert_eq!(
-            parsed.identity_input.tenant_hint.as_deref(),
-            Some("tenant-a")
+            parsed.identity_input.tenant_id.as_deref(),
+            Some("tnt:partner1")
         );
+        assert_eq!(parsed.identity_input.tenant_hint, None);
         assert_eq!(parsed.io_context.channel, "api");
         assert_eq!(parsed.io_context.sender.id, "caller-1");
         assert_eq!(
@@ -1952,14 +2028,14 @@ mod tests {
         let effective = configured_effective("explicit_subject");
         let auth_match = AuthMatch {
             key_id: "partner1".to_string(),
+            tenant_id: "tnt:partner1".to_string(),
             caller_identity: None,
         };
         let envelope = serde_json::json!({
             "subject": {
                 "external_user_id": "crm:123",
                 "display_name": "Juan Perez",
-                "email": "juan@example.com",
-                "tenant_hint": "acme"
+                "email": "juan@example.com"
             },
             "message": {
                 "text": ""
@@ -1973,5 +2049,57 @@ mod tests {
             parsed.explicit_subject_mode,
             Some(ExplicitSubjectMode::ByData)
         );
+    }
+
+    #[test]
+    fn parse_json_message_request_rejects_subject_tenant_hint() {
+        let effective = configured_effective("explicit_subject");
+        let auth_match = AuthMatch {
+            key_id: "partner1".to_string(),
+            tenant_id: "tnt:partner1".to_string(),
+            caller_identity: None,
+        };
+        let envelope = serde_json::json!({
+            "subject": {
+                "external_user_id": "crm:123",
+                "display_name": "Juan Perez",
+                "email": "juan@example.com",
+                "tenant_hint": "acme"
+            },
+            "message": {
+                "text": "hola"
+            }
+        });
+
+        let err = parse_json_message_request(&envelope, &effective, &auth_match, false)
+            .expect_err("must reject tenant_hint");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.1, "invalid_payload");
+    }
+
+    #[test]
+    fn parse_json_message_request_rejects_subject_tenant_id() {
+        let effective = configured_effective("explicit_subject");
+        let auth_match = AuthMatch {
+            key_id: "partner1".to_string(),
+            tenant_id: "tnt:partner1".to_string(),
+            caller_identity: None,
+        };
+        let envelope = serde_json::json!({
+            "subject": {
+                "external_user_id": "crm:123",
+                "display_name": "Juan Perez",
+                "email": "juan@example.com",
+                "tenant_id": "tnt:other"
+            },
+            "message": {
+                "text": "hola"
+            }
+        });
+
+        let err = parse_json_message_request(&envelope, &effective, &auth_match, false)
+            .expect_err("must reject tenant_id");
+        assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.1, "invalid_payload");
     }
 }
