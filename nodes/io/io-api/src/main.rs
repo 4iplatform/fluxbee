@@ -15,10 +15,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use fluxbee_sdk::identity::tenant_exists_in_hive_id;
 use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND};
-use fluxbee_sdk::{
-    connect, tenant_exists_in_hive_id, try_handle_default_node_status, NodeConfig, NodeUuidMode,
-};
+use fluxbee_sdk::{connect, try_handle_default_node_status, NodeConfig, NodeUuidMode};
 use io_common::identity::{
     IdentityProvisioner, IdentityResolver, ResolveOrCreateInput, ShmIdentityResolver,
 };
