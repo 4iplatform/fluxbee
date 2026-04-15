@@ -437,7 +437,7 @@ go/nodes/wf/wf-generic/
 - [x] `wf-generic` derives `workflow_definition_path` from `_system.package_path/flow/definition.json` when running as a workflow package
 - [x] `wf-generic` derives sane managed defaults for `db_path` and `sy_timer_l2_name`
 - [x] `WF` timer actions are fire-and-forget in the runtime hot path; confirmed calls remain only in recovery
-- [ ] Verify orchestrator can spawn `WF.*` nodes from a canonical workflow package (`runtime = wf.invoice`, `runtime_base = wf.engine`)
+- [x] Verify orchestrator can spawn `WF.*` nodes from a canonical workflow package (`runtime = wf.invoice`, `runtime_base = wf.engine`)
 - [x] Node family prefix `WF.` recognized in orchestrator config (review `sy_orchestrator_v2_tasks.md` for spawn patterns)
 - [x] Added `scripts/publish-wf-runtime.sh` to publish the WF base runtime as `wf.engine`
 - [x] Added `scripts/publish-wf-invoice-package.sh` and package fixture `go/nodes/wf/examples/packages/wf.invoice/`
@@ -525,3 +525,5 @@ The following points were raised during planning and resolved before implementat
 5. **`meta.trace_id` is the idempotency key for outbound actions.** When re-executing a transition after a crash, re-use the same trace_id from the original event. The WF runtime needs to persist the trace_id of the currently-processing event so it can re-use it on recovery.
 
 6. **WF v1 supports standard `CONFIG_GET` / `CONFIG_SET`, but config remains boot-time only.** `CONFIG_SET` persists the effective config and responds `restart_required`; live reload via `CONFIG_CHANGED` is still out of scope for v1.
+
+7. **Archi/Admin path for WF config is canonical now.** `GET /hives/{hive}/nodes/{node_name}/config` reads the persisted managed `config.json`, while `POST /hives/{hive}/nodes/{node_name}/control/config-get|config-set` is the live WF node control-plane path. For `WF v1`, `CONFIG_SET` is persist-only and requires restart.

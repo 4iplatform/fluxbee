@@ -1506,6 +1506,8 @@ These are not arbitrary — they reflect what a sane workflow should stay within
 | Control plane (CONFIG_GET/SET) | `node-config-control-plane-spec.md` |
 | Conceptual model for claims (future) | `fluxbee_identity_claims_normative_model.md` |
 
+Operational note: for managed `WF.*` nodes, `GET /hives/{hive}/nodes/{node_name}/config` reads the persisted effective `config.json`, while `POST /hives/{hive}/nodes/{node_name}/control/config-get` / `config-set` is the live node-owned control-plane path. In `WF v1`, `CONFIG_SET` is boot-time only and returns `restart_required`.
+
 ---
 
 ## Appendix: Glossary

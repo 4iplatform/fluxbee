@@ -4196,10 +4196,10 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
             r#"curl -X POST /hives/motherbee/nodes/SY.admin@motherbee/messages -d '{"msg_type":"PING","payload":{"ping":true}}'"#
         }
         "node_control_config_get" => {
-            r#"curl -X POST /hives/motherbee/nodes/SY.identity@motherbee/control/config-get -d '{"requested_by":"archi"}'"#
+            r#"curl -X POST /hives/motherbee/nodes/WF.invoice@motherbee/control/config-get -d '{"requested_by":"archi"}'"#
         }
         "node_control_config_set" => {
-            r#"curl -X POST /hives/motherbee/nodes/SY.identity@motherbee/control/config-set -d '{"node_name":"SY.identity@motherbee","schema_version":1,"config_version":1,"apply_mode":"replace","config":{"database":{"postgres_url":"postgresql://fluxbee:secret@127.0.0.1:5432/fluxbee"}}}'"#
+            r#"curl -X POST /hives/motherbee/nodes/WF.invoice@motherbee/control/config-set -d '{"schema_version":1,"config_version":2,"apply_mode":"replace","config":{"sy_timer_l2_name":"SY.timer@motherbee"}}'"#
         }
         "list_ilks" => "curl -X GET /hives/motherbee/identity/ilks",
         "get_ilk" => {
@@ -4302,10 +4302,11 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "node_control_config_get" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
-            "This is the canonical live control-plane discovery path for nodes that expose CONFIG_GET, including AI.*, IO.*, SY.storage, SY.identity, SY.cognition, and SY.config.routes.",
+            "This is the canonical live control-plane discovery path for nodes that expose CONFIG_GET, including AI.*, IO.*, WF.*, SY.storage, SY.identity, SY.cognition, and SY.config.routes.",
             "Admin forwards CONFIG_GET over L2 unicast and returns the node's CONFIG_RESPONSE.",
             "Use this when you need the node-defined live contract, dynamic config view, or secret metadata; not when a plain stored config.json read is enough.",
             "The node defines the response contract and config schema; SY.admin only standardizes transport.",
+            "For WF.* v1, this returns the live workflow-node contract and effective config view; use GET /hives/{hive}/nodes/{node_name}/config when you want the persisted managed config.json or package metadata instead.",
             "For SY.storage, this is the canonical way to inspect the redacted DB secret contract and its effective source/persistence metadata.",
             "For SY.identity, this is the canonical way to inspect the redacted primary DB secret contract and degraded/bootstrap state.",
             "For SY.cognition, this is the canonical way to inspect semantic_tagger config, degraded_semantics_policy, AI secret redaction, and runtime counters for semantic/narrative processing.",
@@ -4314,9 +4315,11 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "node_control_config_set" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The node_name path segment should be a fully-qualified Fluxbee node name.",
-            "This is the canonical live control-plane mutation path for nodes that expose CONFIG_SET, including AI.*, IO.*, SY.storage, SY.identity, SY.cognition, and SY.config.routes.",
+            "This is the canonical live control-plane mutation path for nodes that expose CONFIG_SET, including AI.*, IO.*, WF.*, SY.storage, SY.identity, SY.cognition, and SY.config.routes.",
             "Admin forwards CONFIG_SET over L2 unicast and returns the node's CONFIG_RESPONSE.",
             "The payload.config object is node-defined and is not interpreted by SY.admin.",
+            "For WF.* v1, CONFIG_SET is persist-only and returns restart_required; it does not hot-apply CONFIG_CHANGED.",
+            "For WF.* v1, do not mutate _system through CONFIG_SET. Managed package/runtime metadata remains owned by orchestrator.",
             "For SY.storage v1, the canonical secret field is config.database.postgres_url and the apply is persist-only until sy-storage is restarted.",
             "For SY.identity v1, the canonical secret field is config.database.postgres_url and the apply is persist-only until sy-identity is restarted.",
             "For SY.cognition, the canonical AI secret field is config.secrets.openai.api_key and semantic controls live under config.semantic_tagger.*.",
