@@ -4958,7 +4958,7 @@ mod tests {
 
     #[test]
     fn materialize_effective_config_defaults_injects_frontdesk_prompt_when_missing() {
-        let config = materialize_effective_config_defaults(
+        let config = materialize_effective_defaults(
             "SY.frontdesk.gov@motherbee",
             EffectiveConfigDocument {
                 behavior: EffectiveBehaviorSection {
@@ -4974,6 +4974,7 @@ mod tests {
             .behavior
             .instructions
             .as_ref()
+            .and_then(Value::as_object)
             .and_then(|value| value.get("value"))
             .and_then(Value::as_str);
         assert_eq!(
