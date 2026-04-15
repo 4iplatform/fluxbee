@@ -1222,8 +1222,10 @@ func (c *RouterClient) LastPeer() string {
 
 func (c *RouterClient) Run(service *Service) {
 	backoff := 100 * time.Millisecond
-	for {
-		sender, receiver, err := fluxbeesdk.Connect(fluxbeesdk.NodeConfig{
+	var sender *fluxbeesdk.NodeSender
+	var receiver *fluxbeesdk.NodeReceiver
+	for sender == nil || receiver == nil {
+		connectedSender, connectedReceiver, err := fluxbeesdk.Connect(fluxbeesdk.NodeConfig{
 			Name:               c.nodeName,
 			RouterSocket:       routerSockDir,
 			UUIDPersistenceDir: nodesDir,
@@ -1237,28 +1239,44 @@ func (c *RouterClient) Run(service *Service) {
 			backoff = nextBackoff(backoff)
 			continue
 		}
-		c.mu.Lock()
-		c.sender = sender
-		c.mu.Unlock()
-		if sender.UUID() != c.nodeUUID.String() {
-			log.Printf("router sdk uuid differs from bootstrap uuid sdk=%s bootstrap=%s", sender.UUID(), c.nodeUUID)
-		}
-		backoff = 100 * time.Millisecond
-		go c.forwardOutgoing(sender)
+		sender = connectedSender
+		receiver = connectedReceiver
+	}
+	c.mu.Lock()
+	c.sender = sender
+	c.mu.Unlock()
+	if sender.UUID() != c.nodeUUID.String() {
+		log.Printf("router sdk uuid differs from bootstrap uuid sdk=%s bootstrap=%s", sender.UUID(), c.nodeUUID)
+	}
+	log.Printf("connected to router as %s", sender.FullName())
+	go c.forwardOutgoing(sender)
 
-		for {
-			msg, err := receiver.Recv(context.Background())
-			if err != nil {
+	disconnected := false
+	for {
+		msg, err := receiver.Recv(context.Background())
+		if err != nil {
+			if receiver.IsConnected() {
+				log.Printf("router recv error while connected: %v", err)
 				time.Sleep(200 * time.Millisecond)
 				continue
 			}
-			if msg.Routing.Src != "" {
-				c.mu.Lock()
-				c.lastDst = msg.Routing.Src
-				c.mu.Unlock()
+			if !disconnected {
+				disconnected = true
+				log.Printf("router disconnected; waiting for sdk reconnect: %v", err)
 			}
-			service.handleMessage(msg)
+			time.Sleep(200 * time.Millisecond)
+			continue
 		}
+		if disconnected {
+			disconnected = false
+			log.Printf("router reconnected via sdk as %s", receiver.FullName())
+		}
+		if msg.Routing.Src != "" {
+			c.mu.Lock()
+			c.lastDst = msg.Routing.Src
+			c.mu.Unlock()
+		}
+		service.handleMessage(msg)
 	}
 }
 
