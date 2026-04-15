@@ -56,6 +56,8 @@ type connectionState struct {
 	mu         sync.RWMutex
 	connected  bool
 	routerName string
+	fullName   string
+	vpnID      uint32
 }
 
 type HiveFile struct {
@@ -74,6 +76,18 @@ func (s *connectionState) SetRouterName(value string) {
 	s.routerName = strings.TrimSpace(value)
 }
 
+func (s *connectionState) SetAnnounce(payload *NodeAnnouncePayload) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if payload == nil {
+		return
+	}
+	s.connected = true
+	s.routerName = strings.TrimSpace(payload.RouterName)
+	s.fullName = strings.TrimSpace(payload.Name)
+	s.vpnID = payload.VpnID
+}
+
 func (s *connectionState) IsConnected() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -84,6 +98,18 @@ func (s *connectionState) RouterName() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.routerName
+}
+
+func (s *connectionState) FullName() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.fullName
+}
+
+func (s *connectionState) VpnID() uint32 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.vpnID
 }
 
 func Connect(cfg NodeConfig) (*NodeSender, *NodeReceiver, error) {
@@ -109,8 +135,7 @@ func Connect(cfg NodeConfig) (*NodeSender, *NodeReceiver, error) {
 		return nil, nil, err
 	}
 
-	state.SetConnected(true)
-	state.SetRouterName(announce.RouterName)
+	state.SetAnnounce(announce)
 	go connectionManager(cfg, baseName, fullName, nodeID.String(), tx, rx, state)
 
 	sender := &NodeSender{
@@ -156,6 +181,9 @@ func (s *NodeSender) UUID() string {
 }
 
 func (s *NodeSender) FullName() string {
+	if value := s.state.FullName(); value != "" {
+		return value
+	}
 	return s.fullName
 }
 
@@ -185,10 +213,16 @@ func (r *NodeReceiver) UUID() string {
 }
 
 func (r *NodeReceiver) FullName() string {
+	if value := r.state.FullName(); value != "" {
+		return value
+	}
 	return r.fullName
 }
 
 func (r *NodeReceiver) VpnID() uint32 {
+	if value := r.state.VpnID(); value != 0 {
+		return value
+	}
 	return r.vpnID
 }
 
@@ -211,9 +245,9 @@ func connectionManager(cfg NodeConfig, baseName, fullName, uuidValue string, tx 
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
-		state.SetConnected(true)
-		state.SetRouterName(announce.RouterName)
+		state.SetAnnounce(announce)
 
+		stop := make(chan struct{})
 		done := make(chan struct{}, 2)
 		go func() {
 			defer func() { done <- struct{}{} }()
@@ -221,8 +255,12 @@ func connectionManager(cfg NodeConfig, baseName, fullName, uuidValue string, tx 
 				frame, err := ReadFrame(conn)
 				if err != nil {
 					select {
-					case rx <- receivedMessage{err: err}:
+					case <-stop:
 					default:
+						select {
+						case rx <- receivedMessage{err: err}:
+						default:
+						}
 					}
 					state.SetConnected(false)
 					return
@@ -247,17 +285,24 @@ func connectionManager(cfg NodeConfig, baseName, fullName, uuidValue string, tx 
 		}()
 		go func() {
 			defer func() { done <- struct{}{} }()
-			for frame := range tx {
-				if err := WriteFrame(conn, frame); err != nil {
-					state.SetConnected(false)
+			for {
+				select {
+				case <-stop:
 					return
+				case frame := <-tx:
+					if err := WriteFrame(conn, frame); err != nil {
+						state.SetConnected(false)
+						return
+					}
 				}
 			}
 		}()
 
 		<-done
 		state.SetConnected(false)
+		close(stop)
 		_ = conn.Close()
+		<-done
 		time.Sleep(500 * time.Millisecond)
 	}
 }

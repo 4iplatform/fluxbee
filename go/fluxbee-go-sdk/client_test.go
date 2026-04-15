@@ -137,3 +137,31 @@ func TestConnectionStateTracksRouterName(t *testing.T) {
 		t.Fatalf("unexpected trimmed router name: %q", got)
 	}
 }
+
+func TestConnectionStateSetAnnounceUpdatesVisibleNodeMetadata(t *testing.T) {
+	var state connectionState
+	state.SetAnnounce(&NodeAnnouncePayload{
+		Name:       "WF.invoice@motherbee",
+		VpnID:      9,
+		RouterName: "rt-gateway@motherbee",
+	})
+
+	sender := &NodeSender{fullName: "stale-name", state: &state}
+	receiver := &NodeReceiver{fullName: "stale-name", vpnID: 1, state: &state}
+
+	if got := sender.FullName(); got != "WF.invoice@motherbee" {
+		t.Fatalf("sender FullName: got %q", got)
+	}
+	if got := receiver.FullName(); got != "WF.invoice@motherbee" {
+		t.Fatalf("receiver FullName: got %q", got)
+	}
+	if got := receiver.VpnID(); got != 9 {
+		t.Fatalf("receiver VpnID: got %d", got)
+	}
+	if got := sender.RouterName(); got != "rt-gateway@motherbee" {
+		t.Fatalf("sender RouterName: got %q", got)
+	}
+	if !receiver.IsConnected() {
+		t.Fatalf("receiver should report connected after announce")
+	}
+}
