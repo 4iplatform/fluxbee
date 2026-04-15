@@ -150,6 +150,8 @@ pub struct RelayFragment {
     pub io_context: IoContext,
     pub identity_input: ResolveOrCreateInput,
     #[serde(default)]
+    pub dst_node_override: Option<String>,
+    #[serde(default)]
     pub flush_hints: RelayFlushHints,
 }
 
@@ -182,6 +184,7 @@ pub struct RelaySession {
     pub raws: Vec<Value>,
     pub io_context: IoContext,
     pub identity_input: ResolveOrCreateInput,
+    pub dst_node_override: Option<String>,
     pub dropped_duplicates: u64,
     pub dropped_over_limit: u64,
 }
@@ -208,6 +211,7 @@ pub struct AssembledTurn {
     pub reason: FlushReason,
     pub io_context: IoContext,
     pub identity_input: ResolveOrCreateInput,
+    pub dst_node_override: Option<String>,
     pub payload: Value,
     pub meta_context: Value,
     pub parts: usize,
@@ -553,6 +557,7 @@ where
             raws: Vec::new(),
             io_context: fragment.io_context.clone(),
             identity_input: fragment.identity_input.clone(),
+            dst_node_override: fragment.dst_node_override.clone(),
             dropped_duplicates: 0,
             dropped_over_limit: 0,
         }
@@ -581,6 +586,7 @@ where
             reason: FlushReason::Manual,
             io_context: fragment.io_context,
             identity_input: fragment.identity_input,
+            dst_node_override: fragment.dst_node_override,
             payload,
             meta_context,
             parts: 1,
@@ -608,6 +614,7 @@ where
             reason,
             io_context: session.io_context,
             identity_input: session.identity_input,
+            dst_node_override: session.dst_node_override,
             payload,
             meta_context,
             parts: relay_metadata.parts,
@@ -666,9 +673,12 @@ mod tests {
             identity_input: ResolveOrCreateInput {
                 channel: "slack".to_string(),
                 external_id: "T1:U1".to_string(),
+                src_ilk_override: None,
+                tenant_id: None,
                 tenant_hint: Some("T1".to_string()),
                 attributes: serde_json::json!({ "team_id": "T1" }),
             },
+            dst_node_override: None,
             flush_hints: RelayFlushHints::default(),
         }
     }

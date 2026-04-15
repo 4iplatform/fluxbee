@@ -720,6 +720,72 @@ pub fn resolve_ilk_from_hive_config(
     resolve_ilk_from_hive_id(&hive_id, channel_type, address, tenant_id)
 }
 
+/// Check whether a tenant exists in identity SHM by canonical tenant id (`tenant:<uuid>`).
+pub fn tenant_exists_in_shm_name(
+    identity_shm_name: &str,
+    tenant_id: &str,
+) -> Result<bool, IdentityShmError> {
+    let tenant_uuid = parse_prefixed_uuid(tenant_id, "tenant")?;
+    let reader = match open_identity_shm_reader(identity_shm_name) {
+        Ok(reader) => reader,
+        Err(err) if is_permission_lookup_unavailable(&err) => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    match reader.tenant_exists(tenant_uuid.into_bytes()) {
+        Ok(exists) => Ok(exists),
+        Err(err) if is_permission_lookup_unavailable(&err) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+/// Check whether a tenant exists for one hive by canonical tenant id (`tenant:<uuid>`).
+pub fn tenant_exists_in_hive_id(hive_id: &str, tenant_id: &str) -> Result<bool, IdentityShmError> {
+    let shm_name = identity_shm_name_for_hive(hive_id)?;
+    tenant_exists_in_shm_name(&shm_name, tenant_id)
+}
+
+/// Check whether a tenant exists using `hive.yaml` from config dir.
+pub fn tenant_exists_in_hive_config(
+    config_dir: &Path,
+    tenant_id: &str,
+) -> Result<bool, IdentityShmError> {
+    let hive_id = load_hive_id(config_dir)?;
+    tenant_exists_in_hive_id(&hive_id, tenant_id)
+}
+
+/// Check whether an ILK exists in identity SHM by canonical ilk id (`ilk:<uuid>`).
+pub fn ilk_exists_in_shm_name(
+    identity_shm_name: &str,
+    ilk_id: &str,
+) -> Result<bool, IdentityShmError> {
+    let ilk_uuid = parse_prefixed_uuid(ilk_id, "ilk")?;
+    let reader = match open_identity_shm_reader(identity_shm_name) {
+        Ok(reader) => reader,
+        Err(err) if is_permission_lookup_unavailable(&err) => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    match reader.ilk_exists(ilk_uuid.into_bytes()) {
+        Ok(exists) => Ok(exists),
+        Err(err) if is_permission_lookup_unavailable(&err) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+/// Check whether an ILK exists for one hive by canonical ilk id (`ilk:<uuid>`).
+pub fn ilk_exists_in_hive_id(hive_id: &str, ilk_id: &str) -> Result<bool, IdentityShmError> {
+    let shm_name = identity_shm_name_for_hive(hive_id)?;
+    ilk_exists_in_shm_name(&shm_name, ilk_id)
+}
+
+/// Check whether an ILK exists using `hive.yaml` from config dir.
+pub fn ilk_exists_in_hive_config(
+    config_dir: &Path,
+    ilk_id: &str,
+) -> Result<bool, IdentityShmError> {
+    let hive_id = load_hive_id(config_dir)?;
+    ilk_exists_in_hive_id(&hive_id, ilk_id)
+}
+
 /// List active ICH entries from identity SHM together with their candidate ILKs.
 pub fn list_ich_options_from_shm_name(
     identity_shm_name: &str,
@@ -772,6 +838,18 @@ impl IdentityShmReader {
         let header = header_ref::<IdentityHeader>(self.mmap.as_ref(), self.layout.header_offset)
             .ok_or(IdentityShmError::InvalidShmHeader)?;
         read_ich_options_from_region(header, self.mmap.as_ref(), &self.layout)
+    }
+
+    fn tenant_exists(&self, tenant_id: [u8; 16]) -> Result<bool, IdentityShmError> {
+        let header = header_ref::<IdentityHeader>(self.mmap.as_ref(), self.layout.header_offset)
+            .ok_or(IdentityShmError::InvalidShmHeader)?;
+        read_tenant_exists_from_region(header, self.mmap.as_ref(), &self.layout, tenant_id)
+    }
+
+    fn ilk_exists(&self, ilk_id: [u8; 16]) -> Result<bool, IdentityShmError> {
+        let header = header_ref::<IdentityHeader>(self.mmap.as_ref(), self.layout.header_offset)
+            .ok_or(IdentityShmError::InvalidShmHeader)?;
+        read_ilk_exists_from_region(header, self.mmap.as_ref(), &self.layout, ilk_id)
     }
 }
 
@@ -940,6 +1018,79 @@ fn read_ich_options_from_region(
         let s2 = header.seq.load(Ordering::Acquire);
         if s1 == s2 {
             return Ok(build_ich_options(&ilk_snapshot, &ich_snapshot));
+        }
+    }
+}
+
+fn read_tenant_exists_from_region(
+    header: &IdentityHeader,
+    mmap: &[u8],
+    layout: &IdentityRegionLayout,
+    tenant_id: [u8; 16],
+) -> Result<bool, IdentityShmError> {
+    let start = StdInstant::now();
+    loop {
+        if start.elapsed() > StdDuration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
+            return Err(IdentityShmError::SeqLockTimeout);
+        }
+        let s1 = header.seq.load(Ordering::Acquire);
+        if s1 & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        atomic::fence(Ordering::Acquire);
+
+        let max_tenants = usize::min(
+            header.tenant_count as usize,
+            layout.limits.max_tenants as usize,
+        );
+        let tenants = read_slice::<TenantEntry>(
+            mmap,
+            layout.tenant_offset,
+            layout.limits.max_tenants as usize,
+        )
+        .ok_or(IdentityShmError::InvalidShmHeader)?;
+        let exists = tenants[..max_tenants]
+            .iter()
+            .any(|entry| entry.flags & FLAG_ACTIVE != 0 && entry.tenant_id == tenant_id);
+
+        atomic::fence(Ordering::Acquire);
+        let s2 = header.seq.load(Ordering::Acquire);
+        if s1 == s2 {
+            return Ok(exists);
+        }
+    }
+}
+
+fn read_ilk_exists_from_region(
+    header: &IdentityHeader,
+    mmap: &[u8],
+    layout: &IdentityRegionLayout,
+    ilk_id: [u8; 16],
+) -> Result<bool, IdentityShmError> {
+    let start = StdInstant::now();
+    loop {
+        if start.elapsed() > StdDuration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
+            return Err(IdentityShmError::SeqLockTimeout);
+        }
+        let s1 = header.seq.load(Ordering::Acquire);
+        if s1 & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        atomic::fence(Ordering::Acquire);
+
+        let max_ilks = usize::min(header.ilk_count as usize, layout.limits.max_ilks as usize);
+        let ilks = read_slice::<IlkEntry>(mmap, layout.ilk_offset, layout.limits.max_ilks as usize)
+            .ok_or(IdentityShmError::InvalidShmHeader)?;
+        let exists = ilks[..max_ilks]
+            .iter()
+            .any(|entry| entry.flags & FLAG_ACTIVE != 0 && entry.ilk_id == ilk_id);
+
+        atomic::fence(Ordering::Acquire);
+        let s2 = header.seq.load(Ordering::Acquire);
+        if s1 == s2 {
+            return Ok(exists);
         }
     }
 }
@@ -1219,6 +1370,15 @@ fn is_prefixed_uuid(value: &str, prefix: &str) -> bool {
     Uuid::parse_str(&trimmed[expected.len()..]).is_ok()
 }
 
+fn parse_prefixed_uuid(value: &str, prefix: &str) -> Result<Uuid, IdentityShmError> {
+    let trimmed = value.trim();
+    let expected = format!("{prefix}:");
+    if !trimmed.starts_with(&expected) {
+        return Err(IdentityShmError::InvalidChannelInput);
+    }
+    Uuid::parse_str(&trimmed[expected.len()..]).map_err(|_| IdentityShmError::InvalidChannelInput)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1370,11 +1530,140 @@ mod tests {
         );
     }
 
+    #[test]
+    fn read_tenant_exists_returns_true_for_active_tenant() {
+        let header = IdentityHeader {
+            magic: IDENTITY_MAGIC,
+            version: IDENTITY_VERSION,
+            seq: AtomicU64::new(0),
+            tenant_count: 1,
+            ilk_count: 0,
+            ich_count: 0,
+            ich_mapping_count: 0,
+            vocabulary_count: 0,
+            ilk_alias_count: 0,
+            max_ilks: 1,
+            max_tenants: 1,
+            max_ichs: 4,
+            max_ich_mappings: 8,
+            max_vocabulary: 0,
+            max_ilk_aliases: 0,
+            updated_at: 0,
+            heartbeat: 0,
+            owner_uuid: [0; 16],
+            owner_pid: 0,
+            is_primary: 1,
+            _pad0: [0; 3],
+            hive_id: [0; 64],
+            hive_id_len: 0,
+            _reserved: [0; 6],
+        };
+        let tenant = TenantEntry {
+            tenant_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440010")
+                .unwrap()
+                .into_bytes(),
+            name: encode_fixed::<128>("ACME"),
+            domain: [0; 128],
+            status: 1,
+            flags: FLAG_ACTIVE,
+            _pad0: [0; 5],
+            max_ilks: 10,
+            created_at: 0,
+            updated_at: 0,
+            _reserved: [0; 8],
+        };
+        let layout = layout_identity(IdentityRegionLimits {
+            max_ilks: 1,
+            max_tenants: 1,
+            max_vocabulary: 0,
+            max_ilk_aliases: 0,
+        });
+        let mut mmap = vec![0u8; layout.total_len];
+        write_struct(&mut mmap, layout.header_offset, &header);
+        write_struct(&mut mmap, layout.tenant_offset, &tenant);
+
+        let exists =
+            read_tenant_exists_from_region(&header, &mmap, &layout, tenant.tenant_id).unwrap();
+        assert!(exists);
+    }
+
+    #[test]
+    fn read_ilk_exists_returns_true_for_active_ilk() {
+        let header = IdentityHeader {
+            magic: IDENTITY_MAGIC,
+            version: IDENTITY_VERSION,
+            seq: AtomicU64::new(0),
+            tenant_count: 0,
+            ilk_count: 1,
+            ich_count: 0,
+            ich_mapping_count: 0,
+            vocabulary_count: 0,
+            ilk_alias_count: 0,
+            max_ilks: 1,
+            max_tenants: 1,
+            max_ichs: 4,
+            max_ich_mappings: 8,
+            max_vocabulary: 0,
+            max_ilk_aliases: 0,
+            updated_at: 0,
+            heartbeat: 0,
+            owner_uuid: [0; 16],
+            owner_pid: 0,
+            is_primary: 1,
+            _pad0: [0; 3],
+            hive_id: [0; 64],
+            hive_id_len: 0,
+            _reserved: [0; 6],
+        };
+        let ilk = IlkEntry {
+            ilk_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440020")
+                .unwrap()
+                .into_bytes(),
+            ilk_type: SHM_ILK_TYPE_HUMAN,
+            registration_status: SHM_REG_STATUS_COMPLETE,
+            flags: FLAG_ACTIVE,
+            tenant_id: [0; 16],
+            display_name: encode_fixed::<128>("Alice"),
+            handler_node: [0; 128],
+            ich_offset: 0,
+            ich_count: 0,
+            _pad0: [0; 2],
+            roles_offset: 0,
+            roles_len: 0,
+            _pad1: [0; 2],
+            capabilities_offset: 0,
+            capabilities_len: 0,
+            _pad2: [0; 2],
+            created_at: 0,
+            updated_at: 0,
+            _reserved: [0; 8],
+        };
+        let layout = layout_identity(IdentityRegionLimits {
+            max_ilks: 1,
+            max_tenants: 1,
+            max_vocabulary: 0,
+            max_ilk_aliases: 0,
+        });
+        let mut mmap = vec![0u8; layout.total_len];
+        write_struct(&mut mmap, layout.header_offset, &header);
+        write_struct(&mut mmap, layout.ilk_offset, &ilk);
+
+        let exists = read_ilk_exists_from_region(&header, &mmap, &layout, ilk.ilk_id).unwrap();
+        assert!(exists);
+    }
+
     fn encode_fixed<const N: usize>(value: &str) -> [u8; N] {
         let mut out = [0u8; N];
         let bytes = value.as_bytes();
         let len = bytes.len().min(N);
         out[..len].copy_from_slice(&bytes[..len]);
         out
+    }
+
+    fn write_struct<T>(buffer: &mut [u8], offset: usize, value: &T) {
+        let size = size_of::<T>();
+        let end = offset + size;
+        let src = unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), size) };
+        buffer[offset..end].copy_from_slice(src);
     }
 }

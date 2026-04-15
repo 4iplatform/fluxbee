@@ -93,6 +93,7 @@ impl InboundProcessor {
         identity: &dyn IdentityResolver,
         provisioner: Option<&dyn IdentityProvisioner>,
         identity_input: ResolveOrCreateInput,
+        dst_node_override: Option<String>,
         io_context: IoContext,
         payload: Value,
     ) -> InboundOutcome {
@@ -107,6 +108,7 @@ impl InboundProcessor {
             identity,
             provisioner,
             identity_input,
+            dst_node_override,
             wrap_in_meta_context(&io_context),
             payload,
         )
@@ -130,6 +132,7 @@ impl InboundProcessor {
             identity,
             provisioner,
             turn.identity_input,
+            turn.dst_node_override,
             turn.meta_context,
             turn.payload,
         )
@@ -141,11 +144,24 @@ impl InboundProcessor {
         identity: &dyn IdentityResolver,
         provisioner: Option<&dyn IdentityProvisioner>,
         identity_input: ResolveOrCreateInput,
+        dst_node_override: Option<String>,
         meta_context: Value,
         payload: Value,
     ) -> InboundOutcome {
         let trace_id = new_trace_id();
-        let mut src_ilk =
+        let mut src_ilk = if let Some(src_ilk_override) = identity_input
+            .src_ilk_override
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            tracing::debug!(
+                channel = %identity_input.channel,
+                external_id = %identity_input.external_id,
+                src_ilk = %src_ilk_override,
+                "identity src_ilk override used"
+            );
+            Some(src_ilk_override.clone())
+        } else {
             match identity.lookup(&identity_input.channel, &identity_input.external_id) {
                 Ok(Some(src_ilk)) => {
                     self.stats.identity_lookup_hits += 1;
@@ -176,7 +192,8 @@ impl InboundProcessor {
                     );
                     None
                 }
-            };
+            }
+        };
 
         if src_ilk.is_none() && self.provision_on_miss {
             if let Some(provisioner) = provisioner {
@@ -227,7 +244,7 @@ impl InboundProcessor {
 
         InboundOutcome::SendNow(build_user_message(
             &self.node_uuid,
-            self.dst_node.clone(),
+            dst_node_override.or_else(|| self.dst_node.clone()),
             self.ttl,
             trace_id,
             src_ilk,
@@ -286,17 +303,19 @@ mod tests {
         let input = ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: "T:U".to_string(),
+            src_ilk_override: None,
+            tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
         let o1 = p
-            .process_inbound(&id, None, input.clone(), io.clone(), payload.clone())
+            .process_inbound(&id, None, input.clone(), None, io.clone(), payload.clone())
             .await;
         assert!(matches!(o1, InboundOutcome::SendNow(_)));
 
-        let o2 = p.process_inbound(&id, None, input, io, payload).await;
+        let o2 = p.process_inbound(&id, None, input, None, io, payload).await;
         assert!(matches!(o2, InboundOutcome::DroppedDuplicate));
     }
 
@@ -308,12 +327,14 @@ mod tests {
         let input = ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: "T:U".to_string(),
+            src_ilk_override: None,
+            tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
-        let o = p.process_inbound(&id, None, input, io, payload).await;
+        let o = p.process_inbound(&id, None, input, None, io, payload).await;
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
         };
@@ -335,12 +356,14 @@ mod tests {
         let input = ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: "T:U".to_string(),
+            src_ilk_override: None,
+            tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
-        let o = p.process_inbound(&id, None, input, io, payload).await;
+        let o = p.process_inbound(&id, None, input, None, io, payload).await;
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
         };
@@ -365,12 +388,14 @@ mod tests {
         let input = ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: "T:U".to_string(),
+            src_ilk_override: None,
+            tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
-        let o = p.process_inbound(&id, None, input, io, payload).await;
+        let o = p.process_inbound(&id, None, input, None, io, payload).await;
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
         };
@@ -394,12 +419,14 @@ mod tests {
         let input = ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: "T123:U456".to_string(),
+            src_ilk_override: None,
+            tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
-        let o = p.process_inbound(&id, None, input, io, payload).await;
+        let o = p.process_inbound(&id, None, input, None, io, payload).await;
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
         };
@@ -502,13 +529,15 @@ mod tests {
         let input = ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: "T:U".to_string(),
+            src_ilk_override: None,
+            tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
         let o = p
-            .process_inbound(&id, Some(&provisioner), input, io, payload)
+            .process_inbound(&id, Some(&provisioner), input, None, io, payload)
             .await;
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
@@ -532,13 +561,15 @@ mod tests {
         let input = ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: "T:U".to_string(),
+            src_ilk_override: None,
+            tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
         let o = p
-            .process_inbound(&id, Some(&provisioner), input, io, payload)
+            .process_inbound(&id, Some(&provisioner), input, None, io, payload)
             .await;
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
@@ -565,13 +596,15 @@ mod tests {
         let input = ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: "T:U".to_string(),
+            src_ilk_override: None,
+            tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
         let o = p
-            .process_inbound(&id, Some(&provisioner), input, io, payload)
+            .process_inbound(&id, Some(&provisioner), input, None, io, payload)
             .await;
         let InboundOutcome::SendNow(msg) = o else {
             panic!("unexpected outcome: {o:?}");
@@ -585,5 +618,34 @@ mod tests {
         assert_eq!(stats.identity_lookup_hits, 1);
         assert_eq!(stats.identity_provision_success, 0);
         assert_eq!(stats.identity_fallback_null, 0);
+    }
+
+    #[tokio::test]
+    async fn src_ilk_override_bypasses_lookup_and_provision() {
+        let mut p = InboundProcessor::new("node", InboundConfig::default());
+        let id = AlwaysMiss;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provisioner = CountingProvisioner {
+            calls: Arc::clone(&calls),
+        };
+        let io = slack_inbound_io_context("T", "U", "C", None, "Ev1");
+        let input = ResolveOrCreateInput {
+            channel: "slack".to_string(),
+            external_id: "T:U".to_string(),
+            src_ilk_override: Some("ilk:override:test".to_string()),
+            tenant_id: None,
+            tenant_hint: None,
+            attributes: serde_json::json!({}),
+        };
+        let payload = serde_json::json!({ "type": "text", "content": "hi" });
+
+        let o = p
+            .process_inbound(&id, Some(&provisioner), input, None, io, payload)
+            .await;
+        let InboundOutcome::SendNow(msg) = o else {
+            panic!("unexpected outcome: {o:?}");
+        };
+        assert_eq!(msg.meta.src_ilk.as_deref(), Some("ilk:override:test"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

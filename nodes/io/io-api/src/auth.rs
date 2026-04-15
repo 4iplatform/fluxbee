@@ -30,6 +30,7 @@ pub(crate) async fn authenticate_bearer(
     registry.keys.iter().find_map(|entry| {
         (entry.token == token).then(|| AuthMatch {
             key_id: entry.key_id.clone(),
+            tenant_id: entry.tenant_id.clone(),
             caller_identity: entry.caller_identity.clone(),
         })
     })
@@ -129,9 +130,16 @@ pub(crate) fn load_runtime_api_registry(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("config.auth.api_keys[].key_id is required"))?;
+        let tenant_id = entry_obj
+            .get("tenant_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("config.auth.api_keys[].tenant_id is required"))?;
         let token = resolve_api_key_token(node_name, entry_obj, &mut secret_record, secret_root)?;
         registry.keys.push(ApiKeyRuntime {
             key_id: key_id.to_string(),
+            tenant_id: tenant_id.to_string(),
             token,
             caller_identity: entry_obj.get("caller_identity").cloned(),
         });

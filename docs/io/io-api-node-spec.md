@@ -87,6 +87,7 @@ Sin embargo, una instancia concreta debe exponer un contrato HTTP efectivo y det
 
 - caller autenticado: la entidad que invoca el endpoint HTTP;
 - sujeto conversacional efectivo: la entidad que sera representada internamente como sujeto del mensaje.
+- tenant efectivo: el tenant derivado de la API key autenticada.
 
 Ambos pueden coincidir o no.
 
@@ -311,6 +312,18 @@ Eso permite:
 - separacion de consumidores;
 - revocacion selectiva.
 
+### 6.4.1 Tenant scoping de API keys
+
+En `IO.api`, cada API key debe declarar explicitamente un `tenant_id`.
+
+Reglas:
+
+- la autenticacion valida el token;
+- la autorizacion deriva el tenant efectivo desde la key autenticada;
+- `IO.api` debe validar fail-closed que ese `tenant_id` exista;
+- si el tenant de la key no existe, el request debe rechazarse;
+- el request HTTP no define tenancy propia.
+
 ### 6.5 TLS
 
 Fuera de dev, el acceso al endpoint debe ocurrir sobre:
@@ -365,8 +378,9 @@ Cuando `subject.ilk` viene con un valor no vacio:
 - `IO.api` debe consultar a identity si ese ILK existe;
 - si existe, puede continuar el flujo y responder exito;
 - si no existe, debe rechazar el request;
-- en este modo no debe hacer provision por datos del sujeto.
-- si el payload incluye ademas `display_name`, `email`, `tenant_hint` u otros campos de identidad, esos campos se aceptan pero se ignoran completamente en este modo.
+- en este modo no debe hacer provision por datos del sujeto;
+- el pipeline interno debe usar ese `ilk` como `src_ilk` efectivo sin volver a resolverlo por `(channel, external_id)`;
+- si el payload incluye ademas `display_name`, `email`, `company_name` u otros campos de identidad, esos campos se aceptan pero se ignoran completamente en este modo.
 
 #### 7.2.2 Modo `by_data`
 
@@ -382,12 +396,10 @@ Para `IO.api` se cierra, por ahora, esta validacion minima de `by_data`:
 - `subject.external_user_id`
 - `subject.display_name`
 - `subject.email`
-- `subject.tenant_hint`
 
 Lectura:
 
-- esta decision toma como referencia el flujo de register ya usado en el repo, donde `name` y `email` son obligatorios y `tenant_hint` participa de la resolucion/creacion de tenant;
-- `IO.api` adopta un contrato mas estricto y exige tambien `tenant_hint` para `by_data`;
+- el tenant ya no se toma del body sino de la API key autenticada;
 - pueden admitirse campos adicionales, por ejemplo `phone`, pero no reemplazan a los minimos obligatorios.
 
 Si el payload incluye `phone` u otro dato adicional:
@@ -397,6 +409,17 @@ Si el payload incluye `phone` u otro dato adicional:
 - no crea automaticamente un `ICH` nuevo;
 - no vincula automaticamente ese telefono a otro canal como WhatsApp o telefonia;
 - el `ICH` canonico de `IO.api` sigue siendo el del canal `api` y su referencia estable de ingreso.
+
+Campos opcionales de metadata admitidos en `by_data`:
+
+- `subject.company_name`
+- `subject.attributes`
+
+Reglas:
+
+- `company_name` es metadata del humano o de su compania, no tenancy;
+- `attributes` debe ser un objeto y permite metadata adicional extensible;
+- `subject.tenant_id` y `subject.tenant_hint` no son validos en `IO.api`.
 
 ### 7.3 `caller_is_subject`
 
@@ -480,6 +503,7 @@ Errores que conviene estandarizar desde esta fase:
 
 - `invalid_json`
 - `unauthorized`
+- `tenant_not_found`
 - `node_not_configured`
 - `invalid_payload`
 - `subject_identification_mode_invalid`
@@ -521,6 +545,7 @@ En estado configurado, debe devolver al menos:
 - metadata de attachments;
 - metadata de relay;
 - metadata de secretos redacted;
+- fuente del tenant del request cuando aplique;
 - informacion suficiente para construir un `CONFIG_SET` valido o para integrar contra `POST /`.
 
 ### 9.3 Relacion con Control Plane
@@ -570,6 +595,7 @@ Reglas:
 
 - `message` es obligatorio;
 - `subject` puede ser obligatorio, opcional o invalido segun `subject_mode`;
+- `options.routing.dst_node` puede overridear el destino Fluxbee por request;
 - debe existir al menos uno de:
   - `message.text`
   - uno o mas attachments
@@ -706,6 +732,9 @@ Sin incluir payload sensible completo ni secretos.
 18. La configuracion del relay sigue `config.io.relay.*`.
 19. La configuracion runtime/business del nodo sigue `CONFIG_GET` / `CONFIG_SET`.
 20. Los carriers del mensaje interno deben seguir el protocolo real vigente del repo.
+21. Cada API key de `IO.api` es tenant-scoped y define el tenant efectivo del request.
+22. `tenant_hint` deja de ser parte del contrato HTTP de `IO.api`.
+23. `company_name` y `attributes` se tratan como metadata, no como tenancy.
 
 ---
 

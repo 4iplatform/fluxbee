@@ -1101,9 +1101,12 @@ async fn run_inbound_socket_mode(
                     ResolveOrCreateInput {
                         channel: "slack".to_string(),
                         external_id: slack_external_id(&config.node_name, &user),
+                        src_ilk_override: None,
+                        tenant_id: None,
                         tenant_hint: Some(team_id.to_string()),
                         attributes: serde_json::json!({ "team_id": team_id }),
                     },
+                    None,
                     io_ctx,
                     payload,
                 )
@@ -1170,6 +1173,8 @@ fn build_slack_relay_fragment(
         identity_input: ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: slack_external_id(node_name, user),
+            src_ilk_override: None,
+            tenant_id: None,
             tenant_hint: Some(team_id.to_string()),
             attributes: serde_json::json!({ "team_id": team_id }),
         },
@@ -1643,6 +1648,7 @@ mod tests {
         let incoming = WireMessage {
             routing: Routing {
                 src: "node-src".to_string(),
+                src_l2_name: None,
                 dst: Destination::Resolve,
                 ttl: 16,
                 trace_id: "trace-1".to_string(),
@@ -2445,6 +2451,7 @@ fn build_system_reply(
     WireMessage {
         routing: Routing {
             src: control_src.to_string(),
+            src_l2_name: None,
             dst,
             ttl: incoming.routing.ttl.max(1),
             trace_id: incoming.routing.trace_id.clone(),

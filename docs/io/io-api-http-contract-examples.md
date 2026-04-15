@@ -138,6 +138,20 @@ Notas:
 }
 ```
 
+#### Tenant de la key inexistente
+
+```http
+403 Forbidden
+```
+
+```json
+{
+  "status": "error",
+  "error_code": "tenant_not_found",
+  "error_message": "Authenticated API key tenant 'tnt:acme' does not exist"
+}
+```
+
 #### Payload semantico invalido
 
 ```http
@@ -268,20 +282,15 @@ No debe devolver una union abstracta de todos los modos del runtime.
     ]
   },
   "required_fields": {
-    "json": ["message"],
+    "json": ["subject", "message"],
     "multipart": ["metadata"]
   },
   "subject": {
     "required": false,
     "allowed": true,
-    "modes": ["by_ilk", "by_data"],
-    "by_ilk": {
-      "field": "subject.ilk"
-    },
-    "by_data": {
-      "lookup_key_field": "subject.external_user_id",
-      "optional_identity_candidates": ["display_name", "email", "tenant_hint"]
-    }
+    "lookup_key_field": "external_user_id",
+    "tenant_source": "authenticated_api_key",
+    "optional_identity_candidates": ["display_name", "email", "company_name", "attributes"]
   },
   "attachments": {
     "supported": true,
@@ -348,6 +357,9 @@ No debe devolver una union abstracta de todos los modos del runtime.
     "relay": {
       "final": false
     },
+    "routing": {
+      "dst_node": "AI.chat@motherbee"
+    },
     "metadata": {
       "source_system": "crm-dotnet"
     }
@@ -360,6 +372,8 @@ Reglas:
 - `subject` puede ser obligatorio, opcional o invalido segun `subject_mode`;
 - `message` es obligatorio;
 - `options` es opcional;
+- `options.routing.dst_node` es opcional y, si viene, overridea el `config.io.dst_node` efectivo para ese request;
+- si `options.routing.dst_node` falta o viene vacio, el nodo usa su `dst_node` configurado y, si tampoco existe, cae en `resolve`;
 - `options.metadata` es metadata auxiliar del integrador y no reemplaza campos de protocolo Fluxbee.
 
 ## 5.2 Campos de `message`
@@ -390,6 +404,9 @@ Reglas:
   "relay": {
     "final": false
   },
+  "routing": {
+    "dst_node": "AI.chat@motherbee"
+  },
   "metadata": {
     "source_system": "crm-dotnet",
     "tags": ["frontdesk", "api"]
@@ -401,6 +418,8 @@ Reglas:
 
 - `relay.final=true` puede usarse como hint al relay comun;
 - no se incluye `relay.bypass` como contrato normativo v1 hasta definir politica clara por instancia;
+- `routing.dst_node` permite fijar un destino Fluxbee puntual para ese request sin reconfigurar la instancia;
+- `routing.dst_node` debe ser string cuando esta presente;
 - `metadata` es informacion auxiliar del integrador.
 
 ---
@@ -424,24 +443,28 @@ Ejemplo tipico:
   "external_user_id": "crm:client-12345",
   "display_name": "Juan Perez",
   "email": "juan@acme.com",
-  "tenant_hint": "acme",
-  "phone": "+5491155551234"
+  "company_name": "Acme Support",
+  "phone": "+5491155551234",
+  "attributes": {
+    "crm_customer_id": "crm:client-12345"
+  }
 }
 ```
 
 Reglas:
 
 - si `ilk` viene no vacio, el request entra en modo `by_ilk`;
-- en `by_ilk`, si ademas llegan `display_name`, `email`, `tenant_hint` u otros campos, se aceptan pero se ignoran;
+- en `by_ilk`, si ademas llegan `display_name`, `email`, `company_name` u otros campos, se aceptan pero se ignoran;
 - si `ilk` no viene o viene vacio, el request entra en modo `by_data`;
 - en `by_data`, la validacion minima requerida es:
   - `external_user_id`
   - `display_name`
   - `email`
-  - `tenant_hint`
 - `phone` y otros datos adicionales pueden venir como complemento;
 - esos datos adicionales no crean automaticamente un `ICH` nuevo ni vinculan otro canal;
-- `display_name`, `email` y `tenant_hint` son identity candidates auxiliares;
+- `display_name` y `email` son identity candidates auxiliares;
+- `company_name` y `attributes` son metadata;
+- `subject.tenant_id` y `subject.tenant_hint` no son validos;
 - el nodo usa estos datos para hablar con identity antes de emitir al router.
 
 ## 6.3 Ejemplo JSON minimo por `by_ilk`
@@ -471,7 +494,10 @@ Content-Type: application/json
     "external_user_id": "crm:client-12345",
     "display_name": "Juan Perez",
     "email": "juan@acme.com",
-    "tenant_hint": "acme"
+    "company_name": "Acme Support",
+    "attributes": {
+      "crm_customer_id": "crm:client-12345"
+    }
   },
   "message": {
     "text": "Necesito ayuda con mi alta",
@@ -598,8 +624,7 @@ El request multipart debe contener:
   "subject": {
     "external_user_id": "crm:client-12345",
     "display_name": "Juan Perez",
-    "email": "juan@acme.com",
-    "tenant_hint": "acme"
+    "email": "juan@acme.com"
   },
   "message": {
     "text": "Adjunto documentacion",
