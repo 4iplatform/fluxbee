@@ -94,6 +94,15 @@ pub struct IdentityIchOption {
     pub ilks: Vec<IdentityIlkOption>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ResolvedIdentityOption {
+    pub ich_id: String,
+    pub channel_type: String,
+    pub address: String,
+    pub is_primary: bool,
+    pub ilk: IdentityIlkOption,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
     #[error("node error: {0}")]
@@ -705,6 +714,51 @@ pub fn resolve_ilk_from_hive_config(
     resolve_ilk_from_hive_id(&hive_id, channel_type, address)
 }
 
+/// Resolve the full identity option from identity SHM by `(channel_type, address)`.
+/// Returns the matched ICH plus canonical ILK metadata when found.
+pub fn resolve_identity_option_from_shm_name(
+    identity_shm_name: &str,
+    channel_type: &str,
+    address: &str,
+) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
+    let normalized_channel = channel_type.trim().to_ascii_lowercase();
+    let normalized_address = address.trim().to_ascii_lowercase();
+    if normalized_channel.is_empty() || normalized_address.is_empty() {
+        return Err(IdentityShmError::InvalidChannelInput);
+    }
+    let reader = match open_identity_shm_reader(identity_shm_name) {
+        Ok(reader) => reader,
+        Err(err) if is_permission_lookup_unavailable(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let resolved = match reader.resolve_identity_option(&normalized_channel, &normalized_address) {
+        Ok(value) => value,
+        Err(err) if is_permission_lookup_unavailable(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    Ok(resolved)
+}
+
+/// Resolve the full identity option via explicit hive id (`/jsr-identity-<hive_id>`).
+pub fn resolve_identity_option_from_hive_id(
+    hive_id: &str,
+    channel_type: &str,
+    address: &str,
+) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
+    let shm_name = identity_shm_name_for_hive(hive_id)?;
+    resolve_identity_option_from_shm_name(&shm_name, channel_type, address)
+}
+
+/// Resolve the full identity option using `hive.yaml` from config dir.
+pub fn resolve_identity_option_from_hive_config(
+    config_dir: &Path,
+    channel_type: &str,
+    address: &str,
+) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
+    let hive_id = load_hive_id(config_dir)?;
+    resolve_identity_option_from_hive_id(&hive_id, channel_type, address)
+}
+
 /// Check whether a tenant exists in identity SHM by canonical tenant id (`tenant:<uuid>`).
 pub fn tenant_exists_in_shm_name(
     identity_shm_name: &str,
@@ -821,6 +875,22 @@ impl IdentityShmReader {
         let header = header_ref::<IdentityHeader>(self.mmap.as_ref(), self.layout.header_offset)
             .ok_or(IdentityShmError::InvalidShmHeader)?;
         read_ich_options_from_region(header, self.mmap.as_ref(), &self.layout)
+    }
+
+    fn resolve_identity_option(
+        &self,
+        channel_type: &str,
+        address: &str,
+    ) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
+        let header = header_ref::<IdentityHeader>(self.mmap.as_ref(), self.layout.header_offset)
+            .ok_or(IdentityShmError::InvalidShmHeader)?;
+        read_resolved_identity_option_from_region(
+            header,
+            self.mmap.as_ref(),
+            &self.layout,
+            channel_type,
+            address,
+        )
     }
 
     fn tenant_exists(&self, tenant_id: [u8; 16]) -> Result<bool, IdentityShmError> {
@@ -1004,6 +1074,52 @@ fn read_ich_options_from_region(
     }
 }
 
+fn read_resolved_identity_option_from_region(
+    header: &IdentityHeader,
+    mmap: &[u8],
+    layout: &IdentityRegionLayout,
+    channel_type: &str,
+    address: &str,
+) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
+    let start = StdInstant::now();
+    loop {
+        if start.elapsed() > StdDuration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
+            return Err(IdentityShmError::SeqLockTimeout);
+        }
+        let s1 = header.seq.load(Ordering::Acquire);
+        if s1 & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        atomic::fence(Ordering::Acquire);
+
+        let mappings = read_slice::<IchMappingEntry>(
+            mmap,
+            layout.ich_mapping_offset,
+            layout.limits.max_ich_mappings() as usize,
+        )
+        .ok_or(IdentityShmError::InvalidShmHeader)?;
+        let mapping = resolve_ich_mapping_details_from_entries(mappings, channel_type, address);
+
+        let max_ilks = usize::min(header.ilk_count as usize, layout.limits.max_ilks as usize);
+        let max_ichs = usize::min(header.ich_count as usize, layout.limits.max_ichs() as usize);
+        let ilks = read_slice::<IlkEntry>(mmap, layout.ilk_offset, layout.limits.max_ilks as usize)
+            .ok_or(IdentityShmError::InvalidShmHeader)?;
+        let ichs =
+            read_slice::<IchEntry>(mmap, layout.ich_offset, layout.limits.max_ichs() as usize)
+                .ok_or(IdentityShmError::InvalidShmHeader)?;
+        let resolved = mapping.and_then(|(ich_id, ilk_id)| {
+            build_resolved_identity_option(&ilks[..max_ilks], &ichs[..max_ichs], ich_id, ilk_id)
+        });
+
+        atomic::fence(Ordering::Acquire);
+        let s2 = header.seq.load(Ordering::Acquire);
+        if s1 == s2 {
+            return Ok(resolved);
+        }
+    }
+}
+
 fn read_tenant_exists_from_region(
     header: &IdentityHeader,
     mmap: &[u8],
@@ -1097,6 +1213,15 @@ fn resolve_ich_mapping_from_entries(
     channel_type: &str,
     address: &str,
 ) -> Option<[u8; 16]> {
+    resolve_ich_mapping_details_from_entries(mappings, channel_type, address)
+        .map(|(_, ilk_id)| ilk_id)
+}
+
+fn resolve_ich_mapping_details_from_entries(
+    mappings: &[IchMappingEntry],
+    channel_type: &str,
+    address: &str,
+) -> Option<([u8; 16], [u8; 16])> {
     if mappings.is_empty() {
         return None;
     }
@@ -1117,7 +1242,7 @@ fn resolve_ich_mapping_from_entries(
             && fixed_str_matches(&entry.channel_type, channel_type)
             && fixed_str_matches(&entry.address, address)
         {
-            return Some(entry.ilk_id);
+            return Some((entry.ich_id, entry.ilk_id));
         }
         idx = (idx + 1) % table_len;
     }
@@ -1235,6 +1360,44 @@ fn build_ich_options(ilks: &[IlkEntry], ichs: &[IchEntry]) -> Vec<IdentityIchOpt
             .then_with(|| a.ich_id.cmp(&b.ich_id))
     });
     out
+}
+
+fn build_resolved_identity_option(
+    ilks: &[IlkEntry],
+    ichs: &[IchEntry],
+    ich_id: [u8; 16],
+    ilk_id: [u8; 16],
+) -> Option<ResolvedIdentityOption> {
+    let ilk = ilks
+        .iter()
+        .find(|entry| entry.flags & FLAG_ACTIVE != 0 && entry.ilk_id == ilk_id)?;
+    let ich = ichs.iter().find(|entry| {
+        entry.flags & FLAG_ACTIVE != 0 && entry.ich_id == ich_id && entry.ilk_id == ilk_id
+    })?;
+    let channel_type = fixed_str_to_string(&ich.channel_type);
+    let address = fixed_str_to_string(&ich.address);
+    if channel_type.is_empty() || address.is_empty() {
+        return None;
+    }
+    Some(ResolvedIdentityOption {
+        ich_id: prefixed_uuid_from_bytes("ich", ich.ich_id),
+        channel_type,
+        address,
+        is_primary: ich.is_primary != 0,
+        ilk: IdentityIlkOption {
+            ilk_id: prefixed_uuid_from_bytes("ilk", ilk.ilk_id),
+            display_name: {
+                let value = fixed_str_to_string(&ilk.display_name);
+                (!value.is_empty()).then_some(value)
+            },
+            handler_node: {
+                let value = fixed_str_to_string(&ilk.handler_node);
+                (!value.is_empty()).then_some(value)
+            },
+            registration_status: registration_status_from_shm(ilk.registration_status),
+            ilk_type: ilk_type_from_shm(ilk.ilk_type),
+        },
+    })
 }
 
 fn compute_ich_hash(channel_type: &str, address: &str) -> u64 {
@@ -1494,6 +1657,60 @@ mod tests {
             options[0].ilks[1].ilk_id,
             "ilk:550e8400-e29b-41d4-a716-446655440001"
         );
+    }
+
+    #[test]
+    fn build_resolved_identity_option_returns_exact_match_metadata() {
+        let ilk = IlkEntry {
+            ilk_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
+                .unwrap()
+                .into_bytes(),
+            ilk_type: SHM_ILK_TYPE_HUMAN,
+            registration_status: SHM_REG_STATUS_TEMPORARY,
+            flags: FLAG_ACTIVE,
+            tenant_id: [0; 16],
+            display_name: encode_fixed::<128>("Alice"),
+            handler_node: encode_fixed::<128>("SY.frontdesk.gov@motherbee"),
+            ich_offset: 0,
+            ich_count: 0,
+            _pad0: [0; 2],
+            roles_offset: 0,
+            roles_len: 0,
+            _pad1: [0; 2],
+            capabilities_offset: 0,
+            capabilities_len: 0,
+            _pad2: [0; 2],
+            created_at: 0,
+            updated_at: 0,
+            _reserved: [0; 8],
+        };
+        let ich = IchEntry {
+            ich_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440010")
+                .unwrap()
+                .into_bytes(),
+            ilk_id: ilk.ilk_id,
+            channel_type: encode_fixed::<ICH_CHANNEL_TYPE_MAX_LEN>("api"),
+            address: encode_fixed::<ICH_ADDRESS_MAX_LEN>("crm:123"),
+            flags: FLAG_ACTIVE,
+            is_primary: 1,
+            _pad0: [0; 5],
+            added_at: 0,
+            _reserved: [0; 16],
+        };
+
+        let resolved = build_resolved_identity_option(&[ilk], &[ich], ich.ich_id, ilk.ilk_id)
+            .expect("resolved");
+
+        assert_eq!(resolved.ich_id, "ich:550e8400-e29b-41d4-a716-446655440010");
+        assert_eq!(resolved.channel_type, "api");
+        assert_eq!(resolved.address, "crm:123");
+        assert!(resolved.is_primary);
+        assert_eq!(
+            resolved.ilk.ilk_id,
+            "ilk:550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(resolved.ilk.registration_status, "temporary");
+        assert_eq!(resolved.ilk.display_name.as_deref(), Some("Alice"));
     }
 
     #[test]

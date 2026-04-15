@@ -15,7 +15,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use fluxbee_sdk::identity::{ilk_exists_in_hive_id, tenant_exists_in_hive_id};
+use fluxbee_sdk::identity::{
+    ilk_exists_in_hive_id, resolve_identity_option_from_hive_id, tenant_exists_in_hive_id,
+};
 use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{connect, try_handle_default_node_status, NodeConfig, NodeUuidMode};
 use io_common::frontdesk_contract::{
@@ -183,6 +185,12 @@ struct FrontdeskResolvedRequest {
     src_ilk: String,
     payload: FrontdeskHandoffPayload,
     dst_node: String,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedExplicitSubject {
+    src_ilk: String,
+    registration_status: Option<String>,
 }
 
 #[tokio::main]
@@ -707,20 +715,23 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
             Ok(value) => value,
             Err((status, code, message)) => return api_error(status, code, message),
         };
-        let response_ilk = match parsed.explicit_subject_mode.as_ref() {
+        let resolved_subject = match parsed.explicit_subject_mode.as_ref() {
             Some(ExplicitSubjectMode::ByIlk { ilk }) => {
                 if let Err((status, code, message)) =
                     validate_explicit_subject_ilk(state.hive_id.as_str(), ilk)
                 {
                     return api_error(status, code, message);
                 }
-                Some(ilk.clone())
+                Some(ResolvedExplicitSubject {
+                    src_ilk: ilk.clone(),
+                    registration_status: None,
+                })
             }
             Some(ExplicitSubjectMode::ByData) => {
-                match resolve_explicit_subject_ilk_for_http(state.as_ref(), &parsed.identity_input)
+                match resolve_explicit_subject_for_http(state.as_ref(), &parsed.identity_input)
                     .await
                 {
-                    Ok(src_ilk) => Some(src_ilk),
+                    Ok(subject) => Some(subject),
                     Err((status, code, message)) => return api_error(status, code, message),
                 }
             }
@@ -744,10 +755,16 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
             }
         };
         let parsed = ParsedHttpMessage { payload, ..parsed };
-        if let Some(dst_node) =
-            resolved_dst_node(&parsed, effective).filter(|value| is_frontdesk_node(value))
+        let response_ilk = resolved_subject
+            .as_ref()
+            .map(|value| value.src_ilk.as_str());
+        let resolved_dst = resolved_dst_node(&parsed, effective);
+        if let Some(dst_node) = resolved_dst
+            .as_deref()
+            .filter(|value| is_frontdesk_node(value))
+            .map(ToString::to_string)
         {
-            let Some(src_ilk) = response_ilk.as_deref() else {
+            let Some(src_ilk) = response_ilk else {
                 return api_error(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "invalid_payload",
@@ -764,78 +781,42 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
                 Ok(value) => value,
                 Err((status, code, message)) => return api_error(status, code, message),
             };
-            return dispatch_frontdesk_handoff_for_http(&state, &parsed, frontdesk).await;
+            let frontdesk_result =
+                match request_frontdesk_handoff_for_http(&state, &parsed, frontdesk).await {
+                    Ok(value) => value,
+                    Err(response) => return response,
+                };
+            return frontdesk_result_response(frontdesk_result);
         }
-        let relay_fragment =
-            build_api_relay_fragment(&state.node_name, &parsed, metadata.clone(), &auth_match);
-
-        return match state.relay.lock().await.handle_fragment(relay_fragment) {
-            RelayDecision::Hold => accepted_response(
+        if requires_frontdesk_intermediate(&parsed, resolved_subject.as_ref()) {
+            let Some(src_ilk) = response_ilk else {
+                return api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_payload",
+                    "Frontdesk handoff requires an explicit subject ILK",
+                );
+            };
+            let frontdesk = match build_frontdesk_handoff_request(
                 &state.node_name,
-                parsed.request_id,
-                None,
-                "held",
-                response_ilk.as_deref(),
-            ),
-            RelayDecision::FlushNow(turn) => {
-                let trace_id = dispatch_assembled_turn_for_http(
-                    state.sender.clone(),
-                    state.identity.as_ref(),
-                    state.provisioner.as_ref(),
-                    state.inbound.clone(),
-                    turn,
-                    "relay immediate flush",
-                )
-                .await;
-                accepted_response(
-                    &state.node_name,
-                    parsed.request_id,
-                    trace_id,
-                    "flushed_immediately",
-                    response_ilk.as_deref(),
-                )
+                &parsed,
+                &metadata,
+                src_ilk,
+                default_frontdesk_node(state.hive_id.as_str()),
+            ) {
+                Ok(value) => value,
+                Err((status, code, message)) => return api_error(status, code, message),
+            };
+            let frontdesk_result =
+                match request_frontdesk_handoff_for_http(&state, &parsed, frontdesk).await {
+                    Ok(value) => value,
+                    Err(response) => return response,
+                };
+            if frontdesk_result.status != "ok" {
+                return frontdesk_result_response(frontdesk_result);
             }
-            RelayDecision::DropDuplicate => accepted_response(
-                &state.node_name,
-                parsed.request_id,
-                None,
-                "duplicate_dropped",
-                response_ilk.as_deref(),
-            ),
-            RelayDecision::RejectCapacity => {
-                let outcome = state
-                    .inbound
-                    .lock()
-                    .await
-                    .process_inbound(
-                        state.identity.as_ref(),
-                        Some(state.provisioner.as_ref()),
-                        parsed.identity_input,
-                        parsed.dst_node_override,
-                        parsed.io_context,
-                        parsed.payload,
-                    )
-                    .await;
-                let trace_id = send_inbound_outcome(
-                    state.sender.clone(),
-                    outcome,
-                    "relay fail-open direct inbound",
-                )
-                .await;
-                accepted_response(
-                    &state.node_name,
-                    parsed.request_id,
-                    trace_id,
-                    "flushed_immediately",
-                    response_ilk.as_deref(),
-                )
-            }
-            RelayDecision::DropExpired => api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "relay_unavailable",
-                "Relay session expired before request could be accepted",
-            ),
-        };
+        }
+        return route_http_message(&state, parsed, metadata.clone(), &auth_match, response_ilk)
+            .await;
     }
 
     let body_limit = extract_max_request_bytes(Some(effective));
@@ -871,20 +852,21 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
         Ok(value) => value,
         Err((status, code, message)) => return api_error(status, code, message),
     };
-    let response_ilk = match parsed.explicit_subject_mode.as_ref() {
+    let resolved_subject = match parsed.explicit_subject_mode.as_ref() {
         Some(ExplicitSubjectMode::ByIlk { ilk }) => {
             if let Err((status, code, message)) =
                 validate_explicit_subject_ilk(state.hive_id.as_str(), ilk)
             {
                 return api_error(status, code, message);
             }
-            Some(ilk.clone())
+            Some(ResolvedExplicitSubject {
+                src_ilk: ilk.clone(),
+                registration_status: None,
+            })
         }
         Some(ExplicitSubjectMode::ByData) => {
-            match resolve_explicit_subject_ilk_for_http(state.as_ref(), &parsed.identity_input)
-                .await
-            {
-                Ok(src_ilk) => Some(src_ilk),
+            match resolve_explicit_subject_for_http(state.as_ref(), &parsed.identity_input).await {
+                Ok(subject) => Some(subject),
                 Err((status, code, message)) => return api_error(status, code, message),
             }
         }
@@ -900,10 +882,16 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
         "io-api json payload accepted"
     );
 
-    if let Some(dst_node) =
-        resolved_dst_node(&parsed, effective).filter(|value| is_frontdesk_node(value))
+    let response_ilk = resolved_subject
+        .as_ref()
+        .map(|value| value.src_ilk.as_str());
+    let resolved_dst = resolved_dst_node(&parsed, effective);
+    if let Some(dst_node) = resolved_dst
+        .as_deref()
+        .filter(|value| is_frontdesk_node(value))
+        .map(ToString::to_string)
     {
-        let Some(src_ilk) = response_ilk.as_deref() else {
+        let Some(src_ilk) = response_ilk else {
             return api_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "invalid_payload",
@@ -920,79 +908,42 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
             Ok(value) => value,
             Err((status, code, message)) => return api_error(status, code, message),
         };
-        return dispatch_frontdesk_handoff_for_http(&state, &parsed, frontdesk).await;
+        let frontdesk_result =
+            match request_frontdesk_handoff_for_http(&state, &parsed, frontdesk).await {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+        return frontdesk_result_response(frontdesk_result);
     }
 
-    let relay_fragment =
-        build_api_relay_fragment(&state.node_name, &parsed, envelope.clone(), &auth_match);
-
-    match state.relay.lock().await.handle_fragment(relay_fragment) {
-        RelayDecision::Hold => accepted_response(
+    if requires_frontdesk_intermediate(&parsed, resolved_subject.as_ref()) {
+        let Some(src_ilk) = response_ilk else {
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_payload",
+                "Frontdesk handoff requires an explicit subject ILK",
+            );
+        };
+        let frontdesk = match build_frontdesk_handoff_request(
             &state.node_name,
-            parsed.request_id,
-            None,
-            "held",
-            response_ilk.as_deref(),
-        ),
-        RelayDecision::FlushNow(turn) => {
-            let trace_id = dispatch_assembled_turn_for_http(
-                state.sender.clone(),
-                state.identity.as_ref(),
-                state.provisioner.as_ref(),
-                state.inbound.clone(),
-                turn,
-                "relay immediate flush",
-            )
-            .await;
-            accepted_response(
-                &state.node_name,
-                parsed.request_id,
-                trace_id,
-                "flushed_immediately",
-                response_ilk.as_deref(),
-            )
+            &parsed,
+            &envelope,
+            src_ilk,
+            default_frontdesk_node(state.hive_id.as_str()),
+        ) {
+            Ok(value) => value,
+            Err((status, code, message)) => return api_error(status, code, message),
+        };
+        let frontdesk_result =
+            match request_frontdesk_handoff_for_http(&state, &parsed, frontdesk).await {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+        if frontdesk_result.status != "ok" {
+            return frontdesk_result_response(frontdesk_result);
         }
-        RelayDecision::DropDuplicate => accepted_response(
-            &state.node_name,
-            parsed.request_id,
-            None,
-            "duplicate_dropped",
-            response_ilk.as_deref(),
-        ),
-        RelayDecision::RejectCapacity => {
-            let outcome = state
-                .inbound
-                .lock()
-                .await
-                .process_inbound(
-                    state.identity.as_ref(),
-                    Some(state.provisioner.as_ref()),
-                    parsed.identity_input,
-                    parsed.dst_node_override,
-                    parsed.io_context,
-                    parsed.payload,
-                )
-                .await;
-            let trace_id = send_inbound_outcome(
-                state.sender.clone(),
-                outcome,
-                "relay fail-open direct inbound",
-            )
-            .await;
-            accepted_response(
-                &state.node_name,
-                parsed.request_id,
-                trace_id,
-                "flushed_immediately",
-                response_ilk.as_deref(),
-            )
-        }
-        RelayDecision::DropExpired => api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "relay_unavailable",
-            "Relay session expired before request could be accepted",
-        ),
     }
+    route_http_message(&state, parsed, envelope.clone(), &auth_match, response_ilk).await
 }
 
 async fn handle_io_control_plane_message(
@@ -1362,27 +1313,32 @@ fn content_type_matches_any(content_type: &str, accepted: &[String]) -> bool {
         .any(|candidate| content_type.starts_with(candidate))
 }
 
-async fn resolve_explicit_subject_ilk_for_http(
+async fn resolve_explicit_subject_for_http(
     state: &HttpState,
     identity_input: &ResolveOrCreateInput,
-) -> std::result::Result<String, (StatusCode, &'static str, String)> {
-    match state
-        .identity
-        .lookup(&identity_input.channel, &identity_input.external_id)
-    {
-        Ok(Some(src_ilk)) => {
+) -> std::result::Result<ResolvedExplicitSubject, (StatusCode, &'static str, String)> {
+    match resolve_identity_option_from_hive_id(
+        state.hive_id.as_str(),
+        &identity_input.channel,
+        &identity_input.external_id,
+    ) {
+        Ok(Some(resolved)) => {
             tracing::info!(
                 channel = %identity_input.channel,
                 external_id = %identity_input.external_id,
-                src_ilk = %src_ilk,
+                src_ilk = %resolved.ilk.ilk_id,
+                registration_status = %resolved.ilk.registration_status,
                 "io-api explicit_subject identity lookup hit"
             );
             state.identity.remember(
                 &identity_input.channel,
                 &identity_input.external_id,
-                &src_ilk,
+                &resolved.ilk.ilk_id,
             );
-            return Ok(src_ilk);
+            return Ok(ResolvedExplicitSubject {
+                src_ilk: resolved.ilk.ilk_id,
+                registration_status: Some(resolved.ilk.registration_status),
+            });
         }
         Ok(None) => {
             tracing::debug!(
@@ -1392,12 +1348,11 @@ async fn resolve_explicit_subject_ilk_for_http(
             );
         }
         Err(err) => {
-            tracing::warn!(
-                error = ?err,
-                channel = %identity_input.channel,
-                external_id = %identity_input.external_id,
-                "io-api explicit_subject identity lookup error; trying strict provision"
-            );
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "identity_unavailable",
+                format!("Unable to resolve subject identity details: {err}"),
+            ));
         }
     }
 
@@ -1422,7 +1377,10 @@ async fn resolve_explicit_subject_ilk_for_http(
         &identity_input.external_id,
         &src_ilk,
     );
-    Ok(src_ilk)
+    Ok(ResolvedExplicitSubject {
+        src_ilk,
+        registration_status: Some("temporary".to_string()),
+    })
 }
 
 fn map_identity_error_to_http(
@@ -1478,9 +1436,25 @@ fn resolved_dst_node(parsed: &ParsedHttpMessage, effective: &Value) -> Option<St
         .or_else(|| extract_runtime_dst_node(Some(effective)))
 }
 
+fn default_frontdesk_node(hive_id: &str) -> String {
+    format!("SY.frontdesk.gov@{hive_id}")
+}
+
 fn is_frontdesk_node(dst_node: &str) -> bool {
     let normalized = dst_node.trim();
     normalized == "SY.frontdesk.gov" || normalized.starts_with("SY.frontdesk.gov@")
+}
+
+fn requires_frontdesk_intermediate(
+    parsed: &ParsedHttpMessage,
+    resolved_subject: Option<&ResolvedExplicitSubject>,
+) -> bool {
+    matches!(
+        parsed.explicit_subject_mode,
+        Some(ExplicitSubjectMode::ByData)
+    ) && resolved_subject
+        .and_then(|value| value.registration_status.as_deref())
+        .is_some_and(|value| !value.eq_ignore_ascii_case("complete"))
 }
 
 fn build_frontdesk_handoff_request(
@@ -1591,11 +1565,11 @@ fn build_frontdesk_handoff_request(
     })
 }
 
-async fn dispatch_frontdesk_handoff_for_http(
+async fn request_frontdesk_handoff_for_http(
     state: &Arc<HttpState>,
     parsed: &ParsedHttpMessage,
     frontdesk: FrontdeskResolvedRequest,
-) -> Response {
+) -> Result<io_common::frontdesk_contract::FrontdeskResultPayload, Response> {
     let trace_id = io_common::router_message::new_trace_id();
     let thread_id = parsed.io_context.conversation.thread_id.clone();
     let context = serde_json::json!({
@@ -1635,21 +1609,21 @@ async fn dispatch_frontdesk_handoff_for_http(
             .await
             .remove(trace_id.as_str());
         tracing::warn!(error = ?err, %trace_id, "failed to send frontdesk handoff to router");
-        return api_error(
+        return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "router_unavailable",
             "Unable to send frontdesk handoff to router",
-        );
+        ));
     }
 
     let reply = match tokio::time::timeout(state.identity_provision_cfg.timeout, rx).await {
         Ok(Ok(reply)) => reply,
         Ok(Err(_)) => {
-            return api_error(
+            return Err(api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "frontdesk_unavailable",
                 "Frontdesk reply waiter closed unexpectedly",
-            );
+            ));
         }
         Err(_) => {
             state
@@ -1657,21 +1631,100 @@ async fn dispatch_frontdesk_handoff_for_http(
                 .lock()
                 .await
                 .remove(trace_id.as_str());
-            return api_error(
+            return Err(api_error(
                 StatusCode::GATEWAY_TIMEOUT,
                 "frontdesk_timeout",
                 "Frontdesk did not respond in time",
-            );
+            ));
         }
     };
     let Some(frontdesk_result) = parse_frontdesk_result_payload(&reply.payload) else {
-        return api_error(
+        return Err(api_error(
             StatusCode::BAD_GATEWAY,
             "invalid_frontdesk_response",
             "Frontdesk did not return a valid frontdesk_result payload",
-        );
+        ));
     };
-    frontdesk_result_response(frontdesk_result)
+    Ok(frontdesk_result)
+}
+
+async fn route_http_message(
+    state: &Arc<HttpState>,
+    parsed: ParsedHttpMessage,
+    raw_payload: Value,
+    auth_match: &AuthMatch,
+    response_ilk: Option<&str>,
+) -> Response {
+    let relay_fragment =
+        build_api_relay_fragment(&state.node_name, &parsed, raw_payload, auth_match);
+
+    match state.relay.lock().await.handle_fragment(relay_fragment) {
+        RelayDecision::Hold => accepted_response(
+            &state.node_name,
+            parsed.request_id,
+            None,
+            "held",
+            response_ilk,
+        ),
+        RelayDecision::FlushNow(turn) => {
+            let trace_id = dispatch_assembled_turn_for_http(
+                state.sender.clone(),
+                state.identity.as_ref(),
+                state.provisioner.as_ref(),
+                state.inbound.clone(),
+                turn,
+                "relay immediate flush",
+            )
+            .await;
+            accepted_response(
+                &state.node_name,
+                parsed.request_id,
+                trace_id,
+                "flushed_immediately",
+                response_ilk,
+            )
+        }
+        RelayDecision::DropDuplicate => accepted_response(
+            &state.node_name,
+            parsed.request_id,
+            None,
+            "duplicate_dropped",
+            response_ilk,
+        ),
+        RelayDecision::RejectCapacity => {
+            let outcome = state
+                .inbound
+                .lock()
+                .await
+                .process_inbound(
+                    state.identity.as_ref(),
+                    Some(state.provisioner.as_ref()),
+                    parsed.identity_input,
+                    parsed.dst_node_override,
+                    parsed.io_context,
+                    parsed.payload,
+                )
+                .await;
+            let trace_id = send_inbound_outcome(
+                state.sender.clone(),
+                outcome,
+                "relay fail-open direct inbound",
+            )
+            .await;
+            accepted_response(
+                &state.node_name,
+                parsed.request_id,
+                trace_id,
+                "flushed_immediately",
+                response_ilk,
+            )
+        }
+        RelayDecision::DropExpired => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "relay_unavailable",
+            "Relay session expired before request could be accepted",
+        ),
+    }
 }
 
 fn validate_explicit_subject_ilk(
@@ -2322,6 +2375,66 @@ mod tests {
         )
         .expect_err("frontdesk handoff should reject by_ilk");
         assert_eq!(err.1, "invalid_payload");
+    }
+
+    #[test]
+    fn requires_frontdesk_intermediate_for_by_data_when_subject_is_temporary() {
+        let effective = configured_effective("explicit_subject");
+        let auth_match = AuthMatch {
+            key_id: "partner1".to_string(),
+            tenant_id: "tnt:partner1".to_string(),
+            caller_identity: None,
+        };
+        let envelope = serde_json::json!({
+            "subject": {
+                "external_user_id": "crm:123",
+                "display_name": "Juan Perez",
+                "email": "juan@example.com"
+            },
+            "message": {
+                "text": "hola"
+            }
+        });
+        let parsed =
+            parse_json_message_request(&envelope, &effective, &auth_match, false).expect("parsed");
+
+        assert!(requires_frontdesk_intermediate(
+            &parsed,
+            Some(&ResolvedExplicitSubject {
+                src_ilk: "ilk:test".to_string(),
+                registration_status: Some("temporary".to_string()),
+            })
+        ));
+    }
+
+    #[test]
+    fn requires_frontdesk_intermediate_skips_complete_subjects() {
+        let effective = configured_effective("explicit_subject");
+        let auth_match = AuthMatch {
+            key_id: "partner1".to_string(),
+            tenant_id: "tnt:partner1".to_string(),
+            caller_identity: None,
+        };
+        let envelope = serde_json::json!({
+            "subject": {
+                "external_user_id": "crm:123",
+                "display_name": "Juan Perez",
+                "email": "juan@example.com"
+            },
+            "message": {
+                "text": "hola"
+            }
+        });
+        let parsed =
+            parse_json_message_request(&envelope, &effective, &auth_match, false).expect("parsed");
+
+        assert!(!requires_frontdesk_intermediate(
+            &parsed,
+            Some(&ResolvedExplicitSubject {
+                src_ilk: "ilk:test".to_string(),
+                registration_status: Some("complete".to_string()),
+            })
+        ));
     }
 
     #[test]

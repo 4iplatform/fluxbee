@@ -89,10 +89,8 @@ mod tests {
 
     #[test]
     fn frontdesk_needs_input_maps_to_unprocessable_entity() {
-        let response = frontdesk_result_response(sample_payload(
-            "needs_input",
-            "MISSING_REQUIRED_FIELDS",
-        ));
+        let response =
+            frontdesk_result_response(sample_payload("needs_input", "MISSING_REQUIRED_FIELDS"));
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 

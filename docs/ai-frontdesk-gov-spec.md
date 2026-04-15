@@ -259,6 +259,27 @@ Deben:
 - consumir el bloque estructurado completo;
 - usar `status`, `result_code`, `missing_fields`, `error_code`, `error_detail`, `ilk_id`, `tenant_id`, `registration_status`.
 
+## 11. Lifecycle operativo actual
+
+En el estado actual del repo, `SY.frontdesk.gov` debe operarse como singleton canonico por hive.
+
+Implicancias practicas:
+
+- en updates rutinarios no conviene borrar el nodo;
+- en updates rutinarios no conviene respawnearlo como si fuera un `IO.*` comun;
+- en updates rutinarios no conviene pisar su config operativa si el objetivo es solo cambiar runtime;
+- el camino conservador actual es:
+  - publicar runtime
+  - ejecutar `SYSTEM_UPDATE` targeted para `SY.frontdesk.gov`
+  - reiniciar la unit existente del nodo
+
+Delete + spawn limpio quedan reservados para:
+
+- reinstalacion deliberada;
+- validacion de bootstrap;
+- recuperacion de estado roto;
+- pruebas controladas donde sea explicito que se acepta perder config local o secrets temporales.
+
 ### 10.3 `IO.api`
 
 `IO.api` debe:

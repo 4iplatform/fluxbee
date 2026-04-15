@@ -56,11 +56,12 @@ Por lo tanto:
 - validar el request segun el contrato efectivo de la instancia;
 - construir un `ResolveOrCreateInput` segun el `subject_mode` de la instancia;
 - delegar la resolucion/provision de identidad al pipeline comun de `io-common`;
-- construir `frontdesk_handoff` cuando el destino efectivo es `SY.frontdesk.gov`;
+- decidir si el sujeto requiere regularizacion por `SY.frontdesk.gov` segun su estado de registro;
+- construir `frontdesk_handoff` cuando esa regularizacion sea necesaria;
 - construir un mensaje `text/v1` canonico;
 - pasar por el relay comun;
 - enviar al router por `fluxbee_sdk::NodeSender::send`;
-- consumir `frontdesk_result` de forma sincronica cuando el destino efectivo es `SY.frontdesk.gov`.
+- consumir `frontdesk_result` de forma sincronica cuando el request necesita regularizacion por frontdesk.
 
 ### 1.2 No-responsabilidades
 
@@ -490,15 +491,17 @@ Se mantiene `202 Accepted` tambien en `explicit_subject`, incluso cuando identit
 
 Excepcion cerrada de esta version:
 
-- si el destino efectivo del request es `SY.frontdesk.gov`, `IO.api` puede esperar el `frontdesk_result` y responder con ese payload estructurado;
-- en ese camino, `IO.api` ya no responde `202 Accepted`, sino el resultado estructurado que devuelve frontdesk.
+- si el sujeto de `explicit_subject by_data` no esta registrado completamente, `IO.api` debe intermediar un `frontdesk_handoff` antes de continuar al `dst_final`;
+- si ese handoff devuelve `needs_input` o `error`, `IO.api` responde con el `frontdesk_result` estructurado;
+- si devuelve `ok`, `IO.api` continua el mensaje original al `dst_final` y responde `202 Accepted`;
+- si el caller fija explicitamente `dst_node = SY.frontdesk.gov`, `IO.api` conserva un camino tecnico/terminal que responde directamente con `frontdesk_result`.
 
-### 8.3 Matriz de respuestas HTTP segun destino efectivo
+### 8.3 Matriz de respuestas HTTP segun regularizacion frontdesk y destino efectivo
 
 `IO.api` tiene dos familias de respuesta:
 
 - camino normal de ingress via router;
-- camino estructurado sincronico cuando el destino efectivo es `SY.frontdesk.gov`.
+- camino estructurado sincronico cuando frontdesk bloquea la continuacion o cuando el request apunta explicitamente a `SY.frontdesk.gov`.
 
 #### 8.3.1 Camino normal via router
 
@@ -508,30 +511,50 @@ Si el request no apunta efectivamente a `SY.frontdesk.gov`, `IO.api` mantiene se
 - no espera resultado final de negocio;
 - el body de exito incluye metadatos de aceptacion como `request_id`, `trace_id`, `ilk` y `relay_status`.
 
-#### 8.3.2 Camino especial `SY.frontdesk.gov`
+#### 8.3.2 Camino con regularizacion por frontdesk
 
-Si el destino efectivo es `SY.frontdesk.gov`, `IO.api` deja el modo `202 Accepted` y mapea la respuesta estructurada de frontdesk a HTTP.
+Si `IO.api` detecta que el sujeto de `explicit_subject by_data` no esta registrado completamente, debe:
+
+1. construir `frontdesk_handoff`;
+2. enviarlo a `SY.frontdesk.gov@<hive>`;
+3. esperar `frontdesk_result`;
+4. decidir si continua o no el mensaje original al `dst_final`.
 
 Casos normativos:
 
-- `frontdesk_result.status = "ok"` -> `200 OK`
+- `frontdesk_result.status = "ok"` -> continuar el mensaje original al `dst_final` y responder `202 Accepted`
 - `frontdesk_result.status = "needs_input"` -> `422 Unprocessable Entity`
 - `frontdesk_result.status = "error"` y `result_code = "INVALID_REQUEST"` -> `422 Unprocessable Entity`
 - `frontdesk_result.status = "error"` y `result_code = "IDENTITY_UNAVAILABLE"` -> `503 Service Unavailable`
 - `frontdesk_result.status = "error"` y `result_code = "REGISTER_FAILED"` -> `502 Bad Gateway`
 - `frontdesk_result.status = "error"` con cualquier otro `result_code` -> `502 Bad Gateway`
 
-El body devuelto por `IO.api` en este camino es el `frontdesk_result` canonical, no el envelope `accepted` del ingress comun.
+El body devuelto por `IO.api` en este camino depende del resultado:
+
+- `ok` -> envelope `accepted` del ingress comun;
+- `needs_input` / `error` -> `frontdesk_result` canonical.
 
 En particular, `needs_input` no se trata como exito HTTP en `IO.api`, porque el modo API no continua conversacionalmente ni puede completar el registro interactuando con el caller.
 
-#### 8.3.3 Errores de transporte o integracion en el camino frontdesk
+#### 8.3.3 Camino tecnico con `dst_node = SY.frontdesk.gov`
 
-Si el destino efectivo es `SY.frontdesk.gov`, tambien existen errores previos o laterales al `frontdesk_result`:
+Si el caller fija explicitamente `options.routing.dst_node = "SY.frontdesk.gov@..."`, `IO.api` conserva un camino tecnico/terminal:
+
+- construye `frontdesk_handoff`;
+- espera `frontdesk_result`;
+- responde directamente con ese payload estructurado;
+- no reinyecta luego el mensaje original a otro `dst_final`.
+
+Este camino sirve para debug, validacion o integraciones muy especificas, pero no es el flujo canonico de producto.
+
+#### 8.3.4 Errores de transporte o integracion en el camino frontdesk
+
+Si existe handoff a frontdesk, tambien existen errores previos o laterales al `frontdesk_result`:
 
 - timeout esperando la reply de frontdesk -> `504 Gateway Timeout` con `error_code = "frontdesk_timeout"`
 - reply recibida pero con payload no parseable como `frontdesk_result` -> `502 Bad Gateway` con `error_code = "invalid_frontdesk_response"`
 - imposibilidad de enviar el handoff al router o indisponibilidad del canal de salida -> `503 Service Unavailable` con `error_code = "router_unavailable"`
+- cierre inesperado del waiter de reply antes de recibir respuesta valida -> `503 Service Unavailable` con `error_code = "frontdesk_unavailable"`
 
 Estos casos no representan resultado funcional de frontdesk; representan fallo de transporte o correlacion del handoff.
 
@@ -564,6 +587,7 @@ Errores que conviene estandarizar desde esta fase:
 - `frontdesk_timeout`
 - `invalid_frontdesk_response`
 - `router_unavailable`
+- `frontdesk_unavailable`
 - `unsupported_attachment_mime`
 - `attachment_too_large`
 - `attachments_too_large`
@@ -649,7 +673,8 @@ Reglas:
 - `message` es obligatorio;
 - `subject` puede ser obligatorio, opcional o invalido segun `subject_mode`;
 - `options.routing.dst_node` puede overridear el destino Fluxbee por request;
-- si `options.routing.dst_node` apunta a `SY.frontdesk.gov`, el request entra en el camino especial de handoff estructurado;
+- `options.routing.dst_node` define el `dst_final` del request cuando viene presente;
+- `IO.api` puede intermediar frontdesk antes de llegar a ese `dst_final` si el sujeto no esta completo;
 - debe existir al menos uno de:
   - `message.text`
   - uno o mas attachments
@@ -712,7 +737,7 @@ Primero pasa por el relay comun de `io-common`.
 
 ### 13.5 Camino especial de `frontdesk_handoff`
 
-Cuando el destino efectivo es `SY.frontdesk.gov`, `IO.api` usa un contrato distinto:
+Cuando `IO.api` detecta que el sujeto de `explicit_subject by_data` no esta registrado completamente, usa un contrato interno distinto antes de continuar al `dst_final`:
 
 - `payload.type = "frontdesk_handoff"`
 - `payload.schema_version = 1`
@@ -731,7 +756,8 @@ En este camino:
 
 - no se usa `text/v1` como payload hacia frontdesk;
 - `IO.api` espera la respuesta `frontdesk_result`;
-- y devuelve ese resultado estructurado por HTTP.
+- si `frontdesk_result.status = "ok"`, continua luego el mensaje original al `dst_final`;
+- si `frontdesk_result.status = "needs_input"` o `error`, devuelve ese resultado estructurado por HTTP.
 
 ---
 
