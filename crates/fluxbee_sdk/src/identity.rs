@@ -759,12 +759,12 @@ pub fn resolve_identity_option_from_hive_config(
     resolve_identity_option_from_hive_id(&hive_id, channel_type, address)
 }
 
-/// Check whether a tenant exists in identity SHM by canonical tenant id (`tenant:<uuid>`).
+/// Check whether a tenant exists in identity SHM by canonical tenant id (`tnt:<uuid>`).
 pub fn tenant_exists_in_shm_name(
     identity_shm_name: &str,
     tenant_id: &str,
 ) -> Result<bool, IdentityShmError> {
-    let tenant_uuid = parse_prefixed_uuid(tenant_id, "tenant")?;
+    let tenant_uuid = parse_prefixed_uuid(tenant_id, "tnt")?;
     let reader = match open_identity_shm_reader(identity_shm_name) {
         Ok(reader) => reader,
         Err(err) if is_permission_lookup_unavailable(&err) => return Ok(false),
@@ -777,7 +777,7 @@ pub fn tenant_exists_in_shm_name(
     }
 }
 
-/// Check whether a tenant exists for one hive by canonical tenant id (`tenant:<uuid>`).
+/// Check whether a tenant exists for one hive by canonical tenant id (`tnt:<uuid>`).
 pub fn tenant_exists_in_hive_id(hive_id: &str, tenant_id: &str) -> Result<bool, IdentityShmError> {
     let shm_name = identity_shm_name_for_hive(hive_id)?;
     tenant_exists_in_shm_name(&shm_name, tenant_id)
@@ -1768,6 +1768,16 @@ mod tests {
         let exists =
             read_tenant_exists_from_region(&header, &mmap, &layout, tenant.tenant_id).unwrap();
         assert!(exists);
+    }
+
+    #[test]
+    fn parse_prefixed_uuid_accepts_tnt_prefix_for_tenants() {
+        let parsed = parse_prefixed_uuid("tnt:550e8400-e29b-41d4-a716-446655440010", "tnt")
+            .expect("tenant uuid");
+        assert_eq!(
+            parsed,
+            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440010").unwrap()
+        );
     }
 
     #[test]

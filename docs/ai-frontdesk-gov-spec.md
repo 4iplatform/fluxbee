@@ -271,7 +271,7 @@ Implicancias practicas:
 - el camino conservador actual es:
   - publicar runtime
   - ejecutar `SYSTEM_UPDATE` targeted para `SY.frontdesk.gov`
-  - reiniciar la unit existente del nodo
+  - reiniciar el servicio singleton existente, normalmente `sy-frontdesk-gov.service`
 
 Delete + spawn limpio quedan reservados para:
 
@@ -285,8 +285,10 @@ Delete + spawn limpio quedan reservados para:
 `IO.api` debe:
 
 - construir `frontdesk_handoff`;
-- enviar por `dst` explicito a `SY.frontdesk.gov`;
-- consumir `frontdesk_result` y mapearlo a su respuesta HTTP.
+- usar `SY.frontdesk.gov` como paso intermedio cuando el sujeto no esta registrado completamente;
+- consumir `frontdesk_result` y:
+- si `status = "ok"`, permitir que el mensaje original continue al `dst_final`;
+- si `status = "needs_input"` o `error`, mapearlo a la respuesta HTTP de `IO.api`.
 
 ## 11. Configuracion y operacion
 
