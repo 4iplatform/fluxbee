@@ -527,3 +527,287 @@ The following points were raised during planning and resolved before implementat
 6. **WF v1 supports standard `CONFIG_GET` / `CONFIG_SET`, but config remains boot-time only.** `CONFIG_SET` persists the effective config and responds `restart_required`; live reload via `CONFIG_CHANGED` is still out of scope for v1.
 
 7. **Archi/Admin path for WF config is canonical now.** `GET /hives/{hive}/nodes/{node_name}/config` reads the persisted managed `config.json`, while `POST /hives/{hive}/nodes/{node_name}/control/config-get|config-set` is the live WF node control-plane path. For `WF v1`, `CONFIG_SET` is persist-only and requires restart.
+
+---
+
+## End-to-end validation runbook
+
+This is the operator checklist to validate `WF v1` from a clean host state using the canonical managed path.
+
+### 1. Clean previous instance/runtime state
+
+Delete the previous managed node instance if it exists:
+
+```bash
+curl -sS -X DELETE "http://127.0.0.1:8080/hives/motherbee/nodes/WF.invoice@motherbee" \
+  -H "Content-Type: application/json" \
+  -d '{"force":true,"purge_instance":true}' | jq
+```
+
+If the instance directory is still present, remove it:
+
+```bash
+sudo rm -rf /var/lib/fluxbee/nodes/WF/WF.invoice@motherbee
+```
+
+Optional: clean published workflow package/runtime copies if you want a full republish test:
+
+```bash
+sudo rm -rf /var/lib/fluxbee/dist/runtimes/wf.invoice
+sudo rm -rf /var/lib/fluxbee/dist/runtimes/wf.engine
+```
+
+### 2. Install/rebuild the Go binary
+
+```bash
+cd ~/fluxbee
+bash scripts/install.sh
+```
+
+Expected result:
+- `/usr/bin/wf-generic` exists
+- `/var/lib/fluxbee/dist/core/bin/wf-generic` exists
+
+### 3. Publish the runtime base and canonical workflow package
+
+Publish the base runtime:
+
+```bash
+cd ~/fluxbee
+bash scripts/publish-wf-runtime.sh --version 0.1.0 --set-current --sudo
+```
+
+Publish the canonical package:
+
+```bash
+cd ~/fluxbee
+bash scripts/publish-wf-invoice-package.sh --version 0.1.0 --deploy motherbee
+```
+
+Expected result:
+- runtime base published as `wf.engine`
+- workflow package published as `wf.invoice`
+- package files exist under `/var/lib/fluxbee/dist/runtimes/wf.invoice/0.1.0/`
+
+Quick check:
+
+```bash
+sudo find /var/lib/fluxbee/dist/runtimes/wf.invoice/0.1.0 -maxdepth 3 -type f | sort
+sudo cat /var/lib/fluxbee/dist/runtimes/wf.invoice/0.1.0/package.json
+```
+
+### 4. Spawn the managed node instance
+
+Use a valid tenant from the target hive:
+
+```bash
+TENANT_ID="tnt:REPLACE_ME"
+
+curl -sS -X POST "http://127.0.0.1:8080/hives/motherbee/nodes" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"node_name\": \"WF.invoice@motherbee\",
+    \"runtime\": \"wf.invoice\",
+    \"runtime_version\": \"current\",
+    \"tenant_id\": \"$TENANT_ID\",
+    \"config\": {
+      \"tenant_id\": \"$TENANT_ID\"
+    }
+  }" | jq
+```
+
+Expected result:
+- `status = "ok"`
+- resolved runtime is `wf.invoice`
+- resolved version is `0.1.0` (or the version you published)
+
+### 5. Verify managed runtime state
+
+```bash
+curl -sS "http://127.0.0.1:8080/hives/motherbee/nodes/WF.invoice@motherbee/status" | jq
+curl -sS "http://127.0.0.1:8080/hives/motherbee/nodes/WF.invoice@motherbee/config" | jq
+sudo journalctl -u fluxbee-node-WF.invoice-motherbee -n 100 --no-pager
+```
+
+Expected result:
+- `lifecycle_state = RUNNING`
+- `runtime.name = "wf.invoice"`
+- `_system.runtime_base = "wf.engine"`
+- `_system.package_path` points to the published package
+- journal shows `wf: loaded definition workflow_type=invoice` and `wf: entering receive loop`
+
+### 6. Verify live node config control-plane
+
+Persisted managed config:
+
+```bash
+curl -sS "http://127.0.0.1:8080/hives/motherbee/nodes/WF.invoice@motherbee/config" | jq
+```
+
+Live node-owned config contract:
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8080/hives/motherbee/nodes/WF.invoice@motherbee/control/config-get" \
+  -H "Content-Type: application/json" \
+  -d '{"requested_by":"archi"}' | jq
+```
+
+Persist-only config change:
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8080/hives/motherbee/nodes/WF.invoice@motherbee/control/config-set" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "schema_version": 1,
+    "config_version": 2,
+    "apply_mode": "replace",
+    "config": {
+      "sy_timer_l2_name": "SY.timer@motherbee"
+    }
+  }' | jq
+```
+
+Expected result:
+- `CONFIG_GET` returns `CONFIG_RESPONSE`
+- `CONFIG_SET` returns `CONFIG_RESPONSE`
+- `restart_required = true`
+- no hot apply is expected
+
+Restart after `CONFIG_SET`:
+
+```bash
+sudo systemctl restart fluxbee-node-WF.invoice-motherbee
+curl -sS "http://127.0.0.1:8080/hives/motherbee/nodes/WF.invoice@motherbee/status" | jq
+```
+
+### 7. Start a real workflow instance
+
+Use the example client:
+
+```bash
+cd ~/fluxbee
+cargo run --example wf_client -- start WF.invoice@motherbee cust-001 25000
+sleep 2
+cargo run --example wf_client -- list WF.invoice@motherbee
+```
+
+Expected result:
+- one instance exists
+- `workflow_type = "invoice"`
+- `status = "running"`
+- `current_state = "collecting_data"`
+- `input_json` includes `customer_id`, `amount_cents`, and `currency`
+
+### 8. Inspect the created instance
+
+Replace `<instance_id>` with the value returned by `list`.
+
+```bash
+cd ~/fluxbee
+cargo run --example wf_client -- get WF.invoice@motherbee <instance_id>
+```
+
+Expected result:
+- instance state is `collecting_data`
+- log shows at least:
+  - `send_message to IO.quickbooks@motherbee`
+  - `schedule_timer`
+
+### 9. Validate that the workflow really scheduled a timer in SY.timer
+
+The `WF.invoice` definition schedules `collection_timeout` for `30m` in `collecting_data`.
+
+Check the timer catalog:
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8080/hives/motherbee/timer/timers" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "owner_l2_name": "WF.invoice@motherbee",
+    "status_filter": "pending",
+    "limit": 100
+  }' | jq
+```
+
+Expected result:
+- one pending timer owned by `WF.invoice@motherbee`
+- it corresponds to the workflow instance that is in `collecting_data`
+- the underlying logical timer key is `collection_timeout`
+
+### 10. Validate immediate cancel semantics
+
+Cancel the instance:
+
+```bash
+cd ~/fluxbee
+cargo run --example wf_client -- cancel WF.invoice@motherbee <instance_id>
+sleep 2
+cargo run --example wf_client -- get WF.invoice@motherbee <instance_id>
+cargo run --example wf_client -- list WF.invoice@motherbee
+```
+
+Expected result:
+- cancel response returns `ok = true`
+- instance transitions immediately to terminal `cancelled`
+- it should not remain stuck in `cancelling`
+- the instance log should include the forced cancel path
+
+Verify the timer was cleaned up:
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8080/hives/motherbee/timer/timers" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "owner_l2_name": "WF.invoice@motherbee",
+    "status_filter": "pending",
+    "limit": 100
+  }' | jq
+```
+
+Expected result:
+- no pending timer remains for the cancelled instance
+
+### 11. Optional: validate timer-driven failure path
+
+The canonical `WF.invoice` definition contains three real timeouts:
+- `collection_timeout = 30m`
+- `validation_timeout = 10m`
+- `send_timeout = 5m`
+
+Without real IO responders, the simplest timer-based validation is:
+- start an instance
+- do not send any response from downstream IO nodes
+- wait until `collection_timeout` fires
+- then verify the instance moved to `failed`
+
+Commands:
+
+```bash
+cd ~/fluxbee
+cargo run --example wf_client -- start WF.invoice@motherbee cust-timeout 25000
+cargo run --example wf_client -- list WF.invoice@motherbee
+```
+
+Then, after the timeout window elapsed, inspect the instance again:
+
+```bash
+cd ~/fluxbee
+cargo run --example wf_client -- get WF.invoice@motherbee <instance_id>
+```
+
+Expected result:
+- terminal state `failed`
+- `failure_reason = "collection_timeout"`
+
+### 12. Important limitation of the current admin test surface
+
+`WF.invoice` can progress to `validating`, `sending`, and `completed` only when it receives correlated response events preserving the workflow `thread_id = instance_id`.
+
+Today, `SY.admin`'s generic `send_node_message` debug path does **not** expose `meta.thread_id`, so it is **not** enough to manually fake:
+- `INVOICE_CREATE_RESPONSE`
+- `INVOICE_VALIDATE_RESPONSE`
+- `INVOICE_SEND_RESPONSE`
+
+Therefore:
+- full happy-path completion to `completed` requires either real downstream responders (`IO.quickbooks`, `IO.validator`, `IO.email`) or a debug sender that can preserve `meta.thread_id`
+- the checks above are the canonical validations available today without extending admin
