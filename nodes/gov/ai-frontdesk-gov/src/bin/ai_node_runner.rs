@@ -774,7 +774,7 @@ struct BehaviorContext {
     src_ilk: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct FrontdeskThreadState {
     #[serde(default)]
     status: Option<String>,
@@ -790,7 +790,7 @@ struct FrontdeskThreadState {
     register_error: Option<FrontdeskRegisterErrorState>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct FrontdeskCollectedState {
     #[serde(default)]
     name: Option<String>,
@@ -802,7 +802,7 @@ struct FrontdeskCollectedState {
     company_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct FrontdeskRegisterErrorState {
     #[serde(default)]
     error_code: Option<String>,
@@ -4551,7 +4551,7 @@ mod tests {
     async fn openai_chat_missing_api_key_returns_error_payload_instead_of_fatal() {
         let _guard = env_lock().lock().expect("env lock");
         std::env::remove_var("OPENAI_API_KEY_MISSING_FOR_TEST");
-        let mut node = test_node();
+        let node = test_node();
         {
             let mut state = node.control_plane.write().await;
             state.current_state = NodeLifecycleState::Configured;
@@ -4593,7 +4593,7 @@ mod tests {
 
     #[tokio::test]
     async fn frontdesk_handoff_incomplete_returns_frontdesk_result() {
-        let mut node = test_node();
+        let node = test_node();
         {
             let mut state = node.control_plane.write().await;
             state.current_state = NodeLifecycleState::Configured;
@@ -4642,7 +4642,7 @@ mod tests {
 
     #[tokio::test]
     async fn gov_user_echo_returns_frontdesk_result_payload() {
-        let mut node = test_node();
+        let node = test_node();
         {
             let mut state = node.control_plane.write().await;
             state.current_state = NodeLifecycleState::Configured;
