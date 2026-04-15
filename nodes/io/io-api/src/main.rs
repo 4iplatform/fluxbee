@@ -18,6 +18,10 @@ use axum::{Json, Router};
 use fluxbee_sdk::identity::{ilk_exists_in_hive_id, tenant_exists_in_hive_id};
 use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{connect, try_handle_default_node_status, NodeConfig, NodeUuidMode};
+use io_common::frontdesk_contract::{
+    parse_frontdesk_result_payload, FrontdeskHandoffPayload, FrontdeskHandoffSubject,
+    FRONTDESK_HANDOFF_PAYLOAD_TYPE, FRONTDESK_SCHEMA_VERSION_V1,
+};
 use io_common::identity::{
     IdentityProvisioner, IdentityResolver, ResolveOrCreateInput, ShmIdentityResolver,
 };
@@ -50,10 +54,12 @@ use io_common::text_v1_blob::{
     build_text_v1_inbound_payload, IoBlobRuntimeConfig, IoTextBlobConfig,
 };
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tokio::sync::{Mutex, RwLock};
 
 use attachments::{
@@ -64,7 +70,7 @@ use config::{
     api_relay_policy, api_relay_policy_from_config, extract_runtime_dst_node,
     extract_runtime_listen_addr, extract_runtime_relay_config,
 };
-use http::{accepted_response, api_error};
+use http::{accepted_response, api_error, frontdesk_result_response};
 use schema::{
     build_configured_schema, build_unconfigured_schema, extract_accepted_content_types,
     extract_max_request_bytes, extract_subject_mode, lifecycle_status,
@@ -134,6 +140,7 @@ struct HttpState {
     identity: Arc<dyn IdentityResolver>,
     provisioner: Arc<dyn IdentityProvisioner>,
     router_inbox: Arc<Mutex<RouterInbox>>,
+    pending_router_replies: Arc<Mutex<HashMap<String, oneshot::Sender<WireMessage>>>>,
     identity_provision_cfg: IdentityProvisionConfig,
     inbound: Arc<Mutex<InboundProcessor>>,
     relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
@@ -169,6 +176,13 @@ struct ParsedHttpMessage {
     payload: Value,
     relay_final: bool,
     explicit_subject_mode: Option<subject::ExplicitSubjectMode>,
+}
+
+#[derive(Debug, Clone)]
+struct FrontdeskResolvedRequest {
+    src_ilk: String,
+    payload: FrontdeskHandoffPayload,
+    dst_node: String,
 }
 
 #[tokio::main]
@@ -230,6 +244,7 @@ async fn main() -> Result<()> {
     );
 
     let inbox = Arc::new(Mutex::new(RouterInbox::new(receiver)));
+    let pending_router_replies = Arc::new(Mutex::new(HashMap::new()));
     let identity: Arc<dyn IdentityResolver> = Arc::new(ShmIdentityResolver::new(&config.island_id));
     let identity_provision_cfg = IdentityProvisionConfig {
         target: config.identity_target.clone(),
@@ -320,6 +335,7 @@ async fn main() -> Result<()> {
         identity: identity.clone(),
         provisioner: provisioner.clone(),
         router_inbox: inbox.clone(),
+        pending_router_replies: pending_router_replies.clone(),
         identity_provision_cfg: identity_provision_cfg.clone(),
         inbound: inbound.clone(),
         relay: relay.clone(),
@@ -358,6 +374,7 @@ async fn main() -> Result<()> {
         control_metrics,
         adapter_contract,
         auth_registry,
+        pending_router_replies,
         http_state_ref_for_runtime_updates(config.node_name.clone(), http_state),
     ));
 
@@ -424,6 +441,7 @@ async fn run_router_control_loop(
     control_metrics: Arc<IoControlPlaneMetrics>,
     adapter_contract: Arc<dyn IoAdapterConfigContract>,
     auth_registry: Arc<RwLock<ApiAuthRegistry>>,
+    pending_router_replies: Arc<Mutex<HashMap<String, oneshot::Sender<WireMessage>>>>,
     runtime_updates: RuntimeUpdateHandles,
 ) -> Result<()> {
     loop {
@@ -457,12 +475,48 @@ async fn run_router_control_loop(
             continue;
         }
 
+        if deliver_pending_router_reply(&pending_router_replies, msg).await {
+            continue;
+        }
+    }
+}
+
+async fn deliver_pending_router_reply(
+    pending_router_replies: &Arc<Mutex<HashMap<String, oneshot::Sender<WireMessage>>>>,
+    msg: WireMessage,
+) -> bool {
+    let trace_id = msg.routing.trace_id.clone();
+    let msg_type = msg.meta.msg_type.clone();
+    let msg_name = msg.meta.msg.clone();
+    let maybe_waiter = pending_router_replies
+        .lock()
+        .await
+        .remove(trace_id.as_str());
+    if let Some(waiter) = maybe_waiter {
+        if waiter.send(msg).is_err() {
+            tracing::debug!(
+                trace_id = %trace_id,
+                msg_type = %msg_type,
+                msg = %msg_name.as_deref().unwrap_or(""),
+                "io-api dropped router reply because request waiter closed"
+            );
+        } else {
+            tracing::debug!(
+                trace_id = %trace_id,
+                msg_type = %msg_type,
+                msg = %msg_name.as_deref().unwrap_or(""),
+                "io-api delivered router reply to pending http request"
+            );
+        }
+        true
+    } else {
         tracing::debug!(
-            msg_type = %msg.meta.msg_type,
-            msg = %msg.meta.msg.as_deref().unwrap_or(""),
-            trace_id = %msg.routing.trace_id,
+            trace_id = %trace_id,
+            msg_type = %msg_type,
+            msg = %msg_name.as_deref().unwrap_or(""),
             "io-api ignored non-control-plane router message"
         );
+        false
     }
 }
 
@@ -690,6 +744,28 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
             }
         };
         let parsed = ParsedHttpMessage { payload, ..parsed };
+        if let Some(dst_node) =
+            resolved_dst_node(&parsed, effective).filter(|value| is_frontdesk_node(value))
+        {
+            let Some(src_ilk) = response_ilk.as_deref() else {
+                return api_error(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_payload",
+                    "Frontdesk handoff requires an explicit subject ILK",
+                );
+            };
+            let frontdesk = match build_frontdesk_handoff_request(
+                &state.node_name,
+                &parsed,
+                &metadata,
+                src_ilk,
+                dst_node,
+            ) {
+                Ok(value) => value,
+                Err((status, code, message)) => return api_error(status, code, message),
+            };
+            return dispatch_frontdesk_handoff_for_http(&state, &parsed, frontdesk).await;
+        }
         let relay_fragment =
             build_api_relay_fragment(&state.node_name, &parsed, metadata.clone(), &auth_match);
 
@@ -823,6 +899,29 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
         relay_final = parsed.relay_final,
         "io-api json payload accepted"
     );
+
+    if let Some(dst_node) =
+        resolved_dst_node(&parsed, effective).filter(|value| is_frontdesk_node(value))
+    {
+        let Some(src_ilk) = response_ilk.as_deref() else {
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_payload",
+                "Frontdesk handoff requires an explicit subject ILK",
+            );
+        };
+        let frontdesk = match build_frontdesk_handoff_request(
+            &state.node_name,
+            &parsed,
+            &envelope,
+            src_ilk,
+            dst_node,
+        ) {
+            Ok(value) => value,
+            Err((status, code, message)) => return api_error(status, code, message),
+        };
+        return dispatch_frontdesk_handoff_for_http(&state, &parsed, frontdesk).await;
+    }
 
     let relay_fragment =
         build_api_relay_fragment(&state.node_name, &parsed, envelope.clone(), &auth_match);
@@ -1372,6 +1471,209 @@ fn validate_authenticated_tenant(
     }
 }
 
+fn resolved_dst_node(parsed: &ParsedHttpMessage, effective: &Value) -> Option<String> {
+    parsed
+        .dst_node_override
+        .clone()
+        .or_else(|| extract_runtime_dst_node(Some(effective)))
+}
+
+fn is_frontdesk_node(dst_node: &str) -> bool {
+    let normalized = dst_node.trim();
+    normalized == "SY.frontdesk.gov" || normalized.starts_with("SY.frontdesk.gov@")
+}
+
+fn build_frontdesk_handoff_request(
+    node_name: &str,
+    parsed: &ParsedHttpMessage,
+    raw_payload: &Value,
+    src_ilk: &str,
+    dst_node: String,
+) -> std::result::Result<FrontdeskResolvedRequest, (StatusCode, &'static str, String)> {
+    if !matches!(
+        parsed.explicit_subject_mode,
+        Some(ExplicitSubjectMode::ByData)
+    ) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_payload",
+            "Frontdesk handoff requires explicit_subject by_data".to_string(),
+        ));
+    }
+
+    let subject = raw_payload
+        .get("subject")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_payload",
+                "Field 'subject' is required for frontdesk handoff".to_string(),
+            )
+        })?;
+    let display_name = subject
+        .get("display_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "subject_data_incomplete",
+                "Field 'subject.display_name' is required for frontdesk handoff".to_string(),
+            )
+        })?;
+    let email = subject
+        .get("email")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "subject_data_incomplete",
+                "Field 'subject.email' is required for frontdesk handoff".to_string(),
+            )
+        })?;
+
+    let phone = subject
+        .get("phone")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let company_name = subject
+        .get("company_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let attributes = subject
+        .get("attributes")
+        .and_then(Value::as_object)
+        .cloned();
+    let thread_id = parsed
+        .io_context
+        .conversation
+        .thread_id
+        .clone()
+        .ok_or_else(|| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_payload",
+                "Frontdesk handoff requires a canonical thread_id".to_string(),
+            )
+        })?;
+    let payload = FrontdeskHandoffPayload {
+        payload_type: FRONTDESK_HANDOFF_PAYLOAD_TYPE.to_string(),
+        schema_version: FRONTDESK_SCHEMA_VERSION_V1,
+        operation: "complete_registration".to_string(),
+        subject: FrontdeskHandoffSubject {
+            display_name: Some(display_name),
+            email: Some(email),
+            phone,
+            company_name,
+            attributes,
+        },
+        tenant_id: parsed.identity_input.tenant_id.clone(),
+        context: Some(serde_json::json!({
+            "source_node": node_name,
+            "request_id": parsed.request_id,
+            "external_user_id": parsed.identity_input.external_id,
+        })),
+    };
+    Ok(FrontdeskResolvedRequest {
+        src_ilk: src_ilk.to_string(),
+        payload,
+        dst_node,
+    })
+}
+
+async fn dispatch_frontdesk_handoff_for_http(
+    state: &Arc<HttpState>,
+    parsed: &ParsedHttpMessage,
+    frontdesk: FrontdeskResolvedRequest,
+) -> Response {
+    let trace_id = io_common::router_message::new_trace_id();
+    let thread_id = parsed.io_context.conversation.thread_id.clone();
+    let context = serde_json::json!({
+        "io": {
+            "channel": parsed.io_context.channel,
+            "entrypoint": parsed.io_context.entrypoint,
+            "sender": parsed.io_context.sender,
+            "conversation": {
+                "kind": parsed.io_context.conversation.kind,
+                "id": parsed.io_context.conversation.id,
+                "thread_id": thread_id,
+            },
+            "message": parsed.io_context.message,
+            "reply_target": parsed.io_context.reply_target,
+        }
+    });
+    let msg = io_common::router_message::build_user_message(
+        state.sender.uuid().to_string().as_str(),
+        Some(frontdesk.dst_node),
+        16,
+        trace_id.clone(),
+        Some(frontdesk.src_ilk),
+        None,
+        context,
+        serde_json::to_value(frontdesk.payload).expect("frontdesk handoff payload"),
+    );
+    let (tx, rx) = oneshot::channel();
+    state
+        .pending_router_replies
+        .lock()
+        .await
+        .insert(trace_id.clone(), tx);
+    if let Err(err) = state.sender.send(msg).await {
+        state
+            .pending_router_replies
+            .lock()
+            .await
+            .remove(trace_id.as_str());
+        tracing::warn!(error = ?err, %trace_id, "failed to send frontdesk handoff to router");
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "router_unavailable",
+            "Unable to send frontdesk handoff to router",
+        );
+    }
+
+    let reply = match tokio::time::timeout(state.identity_provision_cfg.timeout, rx).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(_)) => {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "frontdesk_unavailable",
+                "Frontdesk reply waiter closed unexpectedly",
+            );
+        }
+        Err(_) => {
+            state
+                .pending_router_replies
+                .lock()
+                .await
+                .remove(trace_id.as_str());
+            return api_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "frontdesk_timeout",
+                "Frontdesk did not respond in time",
+            );
+        }
+    };
+    let Some(frontdesk_result) = parse_frontdesk_result_payload(&reply.payload) else {
+        return api_error(
+            StatusCode::BAD_GATEWAY,
+            "invalid_frontdesk_response",
+            "Frontdesk did not return a valid frontdesk_result payload",
+        );
+    };
+    frontdesk_result_response(frontdesk_result)
+}
+
 fn validate_explicit_subject_ilk(
     hive_id: &str,
     ilk_id: &str,
@@ -1918,6 +2220,108 @@ mod tests {
             parsed.explicit_subject_mode,
             Some(ExplicitSubjectMode::ByData)
         );
+    }
+
+    #[test]
+    fn build_frontdesk_handoff_request_uses_subject_data_and_tenant() {
+        let effective = configured_effective("explicit_subject");
+        let auth_match = AuthMatch {
+            key_id: "partner1".to_string(),
+            tenant_id: "tnt:partner1".to_string(),
+            caller_identity: None,
+        };
+        let envelope = serde_json::json!({
+            "subject": {
+                "external_user_id": "crm:123",
+                "display_name": "Juan Perez",
+                "email": "juan@example.com",
+                "phone": "+5491100000001",
+                "company_name": "ACME Support",
+                "attributes": {
+                    "crm_customer_id": "crm-123"
+                }
+            },
+            "message": {
+                "text": "hola",
+                "external_message_id": "crm-msg-1"
+            },
+            "options": {
+                "metadata": {
+                    "conversation_id": "conv-1"
+                }
+            }
+        });
+        let parsed =
+            parse_json_message_request(&envelope, &effective, &auth_match, false).expect("parsed");
+
+        let handoff = build_frontdesk_handoff_request(
+            "IO.api.support@motherbee",
+            &parsed,
+            &envelope,
+            "ilk:test:123",
+            "SY.frontdesk.gov@motherbee".to_string(),
+        )
+        .expect("handoff");
+
+        assert_eq!(handoff.src_ilk, "ilk:test:123");
+        assert_eq!(handoff.dst_node, "SY.frontdesk.gov@motherbee");
+        assert_eq!(handoff.payload.payload_type, FRONTDESK_HANDOFF_PAYLOAD_TYPE);
+        assert_eq!(handoff.payload.operation, "complete_registration");
+        assert_eq!(
+            handoff.payload.subject.display_name.as_deref(),
+            Some("Juan Perez")
+        );
+        assert_eq!(
+            handoff.payload.subject.email.as_deref(),
+            Some("juan@example.com")
+        );
+        assert_eq!(
+            handoff.payload.subject.phone.as_deref(),
+            Some("+5491100000001")
+        );
+        assert_eq!(
+            handoff.payload.subject.company_name.as_deref(),
+            Some("ACME Support")
+        );
+        assert_eq!(handoff.payload.tenant_id.as_deref(), Some("tnt:partner1"));
+        assert_eq!(
+            handoff
+                .payload
+                .context
+                .as_ref()
+                .and_then(|value| value.get("external_user_id"))
+                .and_then(Value::as_str),
+            Some("crm:123")
+        );
+    }
+
+    #[test]
+    fn build_frontdesk_handoff_request_rejects_non_by_data() {
+        let effective = configured_effective("explicit_subject");
+        let auth_match = AuthMatch {
+            key_id: "partner1".to_string(),
+            tenant_id: "tnt:partner1".to_string(),
+            caller_identity: None,
+        };
+        let envelope = serde_json::json!({
+            "subject": {
+                "ilk": "ilk:123"
+            },
+            "message": {
+                "text": "hola"
+            }
+        });
+        let parsed =
+            parse_json_message_request(&envelope, &effective, &auth_match, false).expect("parsed");
+        let err = build_frontdesk_handoff_request(
+            "IO.api.support@motherbee",
+            &parsed,
+            &envelope,
+            "ilk:123",
+            "SY.frontdesk.gov@motherbee".to_string(),
+        )
+        .expect_err("frontdesk handoff should reject by_ilk");
+        assert_eq!(err.1, "invalid_payload");
     }
 
     #[test]

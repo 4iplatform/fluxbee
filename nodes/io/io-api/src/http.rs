@@ -1,6 +1,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use io_common::frontdesk_contract::FrontdeskResultPayload;
 
 pub(crate) fn accepted_response(
     node_name: &str,
@@ -49,4 +50,17 @@ pub(crate) fn api_error(
         })),
     )
         .into_response()
+}
+
+pub(crate) fn frontdesk_result_response(payload: FrontdeskResultPayload) -> Response {
+    let status = match (payload.status.as_str(), payload.result_code.as_str()) {
+        ("ok", _) => StatusCode::OK,
+        ("needs_input", _) => StatusCode::OK,
+        ("error", "INVALID_REQUEST") => StatusCode::UNPROCESSABLE_ENTITY,
+        ("error", "IDENTITY_UNAVAILABLE") => StatusCode::SERVICE_UNAVAILABLE,
+        ("error", "REGISTER_FAILED") => StatusCode::BAD_GATEWAY,
+        ("error", _) => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::OK,
+    };
+    (status, Json(payload)).into_response()
 }
