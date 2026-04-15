@@ -4768,7 +4768,16 @@ mod tests {
 
     #[test]
     fn extract_thread_id_does_not_read_legacy_meta_context() {
-        let msg = sample_user_request_with_context(json!({ "thread_id": "legacy-thread-1" }), None);
+        let msg = sample_user_request_with_context(
+            json!({
+                "io": {
+                    "conversation": {
+                        "thread_id": "legacy-thread-1"
+                    }
+                }
+            }),
+            None,
+        );
         assert_eq!(extract_thread_id(&msg), None);
     }
 
