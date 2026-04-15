@@ -88,6 +88,8 @@ The v1 stable surface is:
   - default node status helpers
 - `HELP` descriptor types/helpers
 - `SY.timer` client/types/helpers
+- identity SHM lookup:
+  - `LookupIlkByChannel`
 
 ## SY.timer client patterns
 
@@ -129,5 +131,32 @@ if err := timerClient.CancelByClientRef(ctx, clientRef); err != nil {
     return err
 }
 ```
+
+## Identity SHM lookup
+
+IO nodes can resolve a `(hiveID, tenantID, channelType, address)` tuple to an ILK ID directly from the identity shared memory region — no socket round-trip required:
+
+```go
+ilkID, found, err := sdk.LookupIlkByChannel(hiveID, tenantID, channelType, address)
+if err != nil {
+    // Fatal I/O or mapping failure — treat as unavailable.
+}
+if !found {
+    // ILK not yet provisioned for this channel; send ILK_PROVISION.
+}
+// ilkID is in "ilk:<uuid>" format, ready for meta.src_ilk.
+```
+
+Parameters:
+
+- `hiveID` — raw hive identifier (e.g. `"prod-hive-1"`), no prefix
+- `tenantID` — `"tnt:<uuid>"` format; pass `""` to match the default tenant (zero bytes)
+- `channelType` / `address` — normalized to lowercase before lookup (matching writer behavior)
+
+Requirements:
+
+- Requires `IDENTITY_VERSION=3` in the SHM region. Older regions (version ≤ 2) return `(_, false, nil)` without error.
+- The SHM file must exist at `/dev/shm/jsr-identity-<hiveID>`. A missing file is treated as not-found (`false, nil`), not an error.
+- Uses a 50 ms seqlock timeout. If the writer holds the lock for longer, the call returns `(_, false, nil)` rather than blocking.
 
 Everything else should be treated as implementation support unless it is later documented here as part of the stable surface.

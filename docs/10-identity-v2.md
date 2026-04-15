@@ -602,7 +602,7 @@ The layout uses fixed-size arrays based on configured MAX_* limits. The region s
 │ (MAX_ICHS = MAX_ILKS * 4, assumes avg 4 channels per ILK)      │
 ├────────────────────────────────────────────────────────────────┤
 │ IchMappingEntry[MAX_ICH_MAPPINGS]                               │
-│ Hash-indexed lookup: hash(channel_type, address) → ich_id       │
+│ Hash-indexed lookup: hash(channel_type, address, tenant_id) → ich_id │
 │ (MAX_ICH_MAPPINGS = MAX_ICHS * 2, for hash table load factor)  │
 ├────────────────────────────────────────────────────────────────┤
 │ IlkAliasEntry[MAX_ILK_ALIASES]                                   │
@@ -618,7 +618,7 @@ The layout uses fixed-size arrays based on configured MAX_* limits. The region s
 
 ```rust
 pub const IDENTITY_MAGIC: u32 = 0x4A534944;  // "JSID"
-pub const IDENTITY_VERSION: u32 = 2;
+pub const IDENTITY_VERSION: u32 = 3;
 
 // Configurable limits (defaults)
 pub const DEFAULT_MAX_ILKS: u32 = 1_000_000;
@@ -722,17 +722,18 @@ pub struct IchEntry {
 // Total: 384 bytes
 
 /// Hash-indexed lookup for fast ICH resolution by IO nodes.
-/// IO computes hash(channel_type, address) and probes this table
+/// IO computes hash(channel_type, address, tenant_id) and probes this table
 /// with linear probing to find the matching ich_id → ilk_id.
 #[repr(C)]
 pub struct IchMappingEntry {
-    pub hash: u64,                    // hash(channel_type, address)
+    pub hash: u64,                    // hash(channel_type, address, tenant_id)
     pub channel_type: [u8; 32],      // For collision verification
     pub address: [u8; 256],          // For collision verification
     pub ich_id: [u8; 16],            // Resolved ICH
     pub ilk_id: [u8; 16],            // Resolved ILK (shortcut, avoids second lookup)
+    pub tenant_id: [u8; 16],         // Owning tenant UUID raw bytes (part of lookup key)
     pub flags: u16,                  // OCCUPIED / TOMBSTONE
-    pub _reserved: [u8; 54],
+    pub _reserved: [u8; 38],
 }
 // Total: 384 bytes
 
@@ -787,12 +788,13 @@ data.identity[ilk].registration_status
 
 ### 11.7 Reader: IO Nodes
 
-IO nodes resolve (channel_type, address) → ILK using the hash-indexed IchMappingEntry table:
+IO nodes resolve (channel_type, address, tenant_id) → ILK using the hash-indexed IchMappingEntry table:
 
 ```rust
-fn resolve_ilk_for_channel(&self, channel_type: &str, address: &str) -> Option<[u8; 16]> {
+fn resolve_ilk_for_channel(&self, channel_type: &str, address: &str, tenant_id: &str) -> Option<[u8; 16]> {
     let shm = self.identity_region.as_ref()?;
-    let hash = compute_ich_hash(channel_type, address);
+    let tenant_bytes = tenant_id_to_bytes(tenant_id);
+    let hash = compute_ich_hash(channel_type, address, tenant_bytes);
     let table_size = shm.header.max_ich_mappings as usize;
     let mut idx = (hash as usize) % table_size;
 
@@ -811,7 +813,8 @@ fn resolve_ilk_for_channel(&self, channel_type: &str, address: &str) -> Option<[
         if entry.flags & ICH_MAP_FLAG_OCCUPIED != 0
             && entry.hash == hash
             && equal_fixed_str(&entry.channel_type, channel_type)
-            && equal_fixed_str(&entry.address, address) {
+            && equal_fixed_str(&entry.address, address)
+            && entry.tenant_id == tenant_bytes {
             return Some(entry.ilk_id);
         }
         idx = (idx + 1) % table_size;
@@ -845,7 +848,8 @@ Creates a temporary ILK for an unknown ICH. Sent by IO nodes when they encounter
   "payload": {
     "ich_id": "ich:a1b2c3d4-5678-90ab-cdef-1234567890ab",
     "channel_type": "whatsapp",
-    "address": "+5491155551234"
+    "address": "+5491155551234",
+    "tenant_id": "tnt:550e8400-e29b-41d4-a716-446655440000"  // optional; defaults to default_tenant when absent
   }
 }
 ```
@@ -1332,7 +1336,7 @@ When this spec is adopted, the following documents should be updated:
 ```rust
 // Identity SHM
 pub const IDENTITY_MAGIC: u32 = 0x4A534944;  // "JSID"
-pub const IDENTITY_VERSION: u32 = 2;
+pub const IDENTITY_VERSION: u32 = 3;
 
 // Defaults (configurable in hive.yaml)
 pub const DEFAULT_MAX_ILKS: u32 = 1_000_000;
