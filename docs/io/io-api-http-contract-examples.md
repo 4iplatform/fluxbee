@@ -222,6 +222,173 @@ Notas:
 }
 ```
 
+### 3.3 Excepcion: destino `SY.frontdesk.gov`
+
+Si el destino efectivo del request es `SY.frontdesk.gov`, `IO.api` responde con el payload estructurado que devuelva frontdesk.
+
+Matriz resumida:
+
+- `frontdesk_result.status = "ok"` -> `200 OK`
+- `frontdesk_result.status = "needs_input"` -> `422 Unprocessable Entity`
+- `frontdesk_result.status = "error"` y `result_code = "INVALID_REQUEST"` -> `422 Unprocessable Entity`
+- `frontdesk_result.status = "error"` y `result_code = "IDENTITY_UNAVAILABLE"` -> `503 Service Unavailable`
+- `frontdesk_result.status = "error"` y `result_code = "REGISTER_FAILED"` -> `502 Bad Gateway`
+- timeout esperando reply de frontdesk -> `504 Gateway Timeout`
+- payload de reply invalido -> `502 Bad Gateway`
+- fallo de transporte hacia router/frontdesk -> `503 Service Unavailable`
+
+Caso `needs_input`:
+
+```http
+422 Unprocessable Entity
+```
+
+```json
+{
+  "type": "frontdesk_result",
+  "schema_version": 1,
+  "status": "needs_input",
+  "result_code": "MISSING_REQUIRED_FIELDS",
+  "human_message": "Necesito tu email para continuar.",
+  "missing_fields": ["email"],
+  "error_code": null,
+  "error_detail": null,
+  "ilk_id": "ilk:123",
+  "tenant_id": "tnt:acme",
+  "registration_status": "temporary"
+}
+```
+
+Caso `ok`:
+
+```http
+200 OK
+```
+
+```json
+{
+  "type": "frontdesk_result",
+  "schema_version": 1,
+  "status": "ok",
+  "result_code": "REGISTERED",
+  "human_message": "Registro completado correctamente.",
+  "missing_fields": [],
+  "error_code": null,
+  "error_detail": null,
+  "ilk_id": "ilk:123",
+  "tenant_id": "tnt:acme",
+  "registration_status": "complete"
+}
+```
+
+Caso `error` por request invalido de frontdesk:
+
+```http
+422 Unprocessable Entity
+```
+
+```json
+{
+  "type": "frontdesk_result",
+  "schema_version": 1,
+  "status": "error",
+  "result_code": "INVALID_REQUEST",
+  "human_message": "No pude procesar el registro con los datos recibidos.",
+  "missing_fields": [],
+  "error_code": "invalid_request",
+  "error_detail": "display_name is required",
+  "ilk_id": null,
+  "tenant_id": "tnt:acme",
+  "registration_status": "not_started"
+}
+```
+
+Caso `error` por identity unavailable reportado por frontdesk:
+
+```http
+503 Service Unavailable
+```
+
+```json
+{
+  "type": "frontdesk_result",
+  "schema_version": 1,
+  "status": "error",
+  "result_code": "IDENTITY_UNAVAILABLE",
+  "human_message": "No puedo completar el registro en este momento.",
+  "missing_fields": [],
+  "error_code": "identity_unavailable",
+  "error_detail": "SY.identity did not respond",
+  "ilk_id": null,
+  "tenant_id": "tnt:acme",
+  "registration_status": "temporary"
+}
+```
+
+Caso `error` por fallo de registro:
+
+```http
+502 Bad Gateway
+```
+
+```json
+{
+  "type": "frontdesk_result",
+  "schema_version": 1,
+  "status": "error",
+  "result_code": "REGISTER_FAILED",
+  "human_message": "No pude completar el alta.",
+  "missing_fields": [],
+  "error_code": "register_failed",
+  "error_detail": "ILK_REGISTER returned failure",
+  "ilk_id": "ilk:123",
+  "tenant_id": "tnt:acme",
+  "registration_status": "temporary"
+}
+```
+
+Caso timeout esperando `frontdesk_result`:
+
+```http
+504 Gateway Timeout
+```
+
+```json
+{
+  "status": "error",
+  "error_code": "frontdesk_timeout",
+  "error_message": "Timed out waiting for frontdesk reply"
+}
+```
+
+Caso payload invalido en la reply de frontdesk:
+
+```http
+502 Bad Gateway
+```
+
+```json
+{
+  "status": "error",
+  "error_code": "invalid_frontdesk_response",
+  "error_message": "Frontdesk reply did not match frontdesk_result contract"
+}
+```
+
+Caso fallo de transporte hacia router/frontdesk:
+
+```http
+503 Service Unavailable
+```
+
+```json
+{
+  "status": "error",
+  "error_code": "router_unavailable",
+  "error_message": "Unable to dispatch request to router/frontdesk"
+}
+```
+
 #### Payload demasiado grande
 
 ```http
@@ -553,6 +720,46 @@ Cuando `by_data` resuelve un sujeto existente o crea uno nuevo, la respuesta HTT
 ```
 
 El codigo de exito recomendado sigue siendo `202 Accepted` tambien en `explicit_subject`, para mantener semantica uniforme de ingress.
+
+## 6.8 Desvio explicito a frontdesk
+
+Si `options.routing.dst_node` apunta a `SY.frontdesk.gov`, `IO.api` deja de usar el camino normal de `202 Accepted` y usa el contrato estructurado de frontdesk.
+
+Ejemplo de request:
+
+```json
+{
+  "subject": {
+    "external_user_id": "crm:client-12345",
+    "display_name": "Juan Perez",
+    "email": "juan@acme.com",
+    "company_name": "Acme Support",
+    "attributes": {
+      "crm_customer_id": "crm:client-12345"
+    }
+  },
+  "message": {
+    "text": "Necesito ayuda con mi alta",
+    "external_message_id": "crm-msg-998877"
+  },
+  "options": {
+    "routing": {
+      "dst_node": "SY.frontdesk.gov@motherbee"
+    },
+    "metadata": {
+      "source_system": "crm-dotnet"
+    }
+  }
+}
+```
+
+Comportamiento esperado:
+
+1. `IO.api` resuelve/provisiona `src_ilk`
+2. construye `frontdesk_handoff`
+3. envia el handoff a `SY.frontdesk.gov`
+4. espera `frontdesk_result`
+5. responde HTTP con ese payload estructurado
 
 ---
 

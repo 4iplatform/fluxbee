@@ -55,7 +55,7 @@ pub(crate) fn api_error(
 pub(crate) fn frontdesk_result_response(payload: FrontdeskResultPayload) -> Response {
     let status = match (payload.status.as_str(), payload.result_code.as_str()) {
         ("ok", _) => StatusCode::OK,
-        ("needs_input", _) => StatusCode::OK,
+        ("needs_input", _) => StatusCode::UNPROCESSABLE_ENTITY,
         ("error", "INVALID_REQUEST") => StatusCode::UNPROCESSABLE_ENTITY,
         ("error", "IDENTITY_UNAVAILABLE") => StatusCode::SERVICE_UNAVAILABLE,
         ("error", "REGISTER_FAILED") => StatusCode::BAD_GATEWAY,
@@ -63,4 +63,41 @@ pub(crate) fn frontdesk_result_response(payload: FrontdeskResultPayload) -> Resp
         _ => StatusCode::OK,
     };
     (status, Json(payload)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::frontdesk_result_response;
+    use axum::http::StatusCode;
+    use io_common::frontdesk_contract::FrontdeskResultPayload;
+
+    fn sample_payload(status: &str, result_code: &str) -> FrontdeskResultPayload {
+        FrontdeskResultPayload {
+            schema_version: 1,
+            status: status.to_string(),
+            result_code: result_code.to_string(),
+            human_message: "message".to_string(),
+            missing_fields: Vec::new(),
+            error_code: None,
+            error_detail: None,
+            ilk_id: None,
+            tenant_id: Some("tnt:acme".to_string()),
+            registration_status: Some("temporary".to_string()),
+        }
+    }
+
+    #[test]
+    fn frontdesk_needs_input_maps_to_unprocessable_entity() {
+        let response = frontdesk_result_response(sample_payload(
+            "needs_input",
+            "MISSING_REQUIRED_FIELDS",
+        ));
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn frontdesk_ok_maps_to_ok() {
+        let response = frontdesk_result_response(sample_payload("ok", "REGISTERED"));
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

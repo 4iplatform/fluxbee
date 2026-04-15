@@ -56,9 +56,11 @@ Por lo tanto:
 - validar el request segun el contrato efectivo de la instancia;
 - construir un `ResolveOrCreateInput` segun el `subject_mode` de la instancia;
 - delegar la resolucion/provision de identidad al pipeline comun de `io-common`;
+- construir `frontdesk_handoff` cuando el destino efectivo es `SY.frontdesk.gov`;
 - construir un mensaje `text/v1` canonico;
 - pasar por el relay comun;
-- enviar al router por `fluxbee_sdk::NodeSender::send`.
+- enviar al router por `fluxbee_sdk::NodeSender::send`;
+- consumir `frontdesk_result` de forma sincronica cuando el destino efectivo es `SY.frontdesk.gov`.
 
 ### 1.2 No-responsabilidades
 
@@ -88,6 +90,7 @@ Sin embargo, una instancia concreta debe exponer un contrato HTTP efectivo y det
 - caller autenticado: la entidad que invoca el endpoint HTTP;
 - sujeto conversacional efectivo: la entidad que sera representada internamente como sujeto del mensaje.
 - tenant efectivo: el tenant derivado de la API key autenticada.
+- destino efectivo del request: el `dst_node` configurado o overrideado por request.
 
 Ambos pueden coincidir o no.
 
@@ -131,7 +134,7 @@ Regla normativa:
 - `caller_is_subject`: mantiene respuesta asincrona de ingress;
 - `explicit_subject`: espera el resultado de la etapa de identity requerida por el request antes de devolver respuesta HTTP.
 
-En ningun caso responde con el resultado final del AI/frontdesk/workflow.
+En ningun caso responde con el resultado final del AI/frontdesk/workflow, salvo la excepcion estructurada del camino `SY.frontdesk.gov` definida en la seccion de contrato HTTP.
 
 ---
 
@@ -485,7 +488,54 @@ En `explicit_subject`, la respuesta HTTP exitosa debe incluir ademas el `ilk` ef
 
 Se mantiene `202 Accepted` tambien en `explicit_subject`, incluso cuando identity ya fue resuelta antes de responder, porque sigue siendo el codigo mas estandar para un ingress que acepta y publica trabajo dentro del sistema sin prometer resultado final de negocio.
 
-### 8.3 Codigos de error recomendados
+Excepcion cerrada de esta version:
+
+- si el destino efectivo del request es `SY.frontdesk.gov`, `IO.api` puede esperar el `frontdesk_result` y responder con ese payload estructurado;
+- en ese camino, `IO.api` ya no responde `202 Accepted`, sino el resultado estructurado que devuelve frontdesk.
+
+### 8.3 Matriz de respuestas HTTP segun destino efectivo
+
+`IO.api` tiene dos familias de respuesta:
+
+- camino normal de ingress via router;
+- camino estructurado sincronico cuando el destino efectivo es `SY.frontdesk.gov`.
+
+#### 8.3.1 Camino normal via router
+
+Si el request no apunta efectivamente a `SY.frontdesk.gov`, `IO.api` mantiene semantica de ingress:
+
+- responde `202 Accepted` cuando autentico, valido el payload, resolvio identity si hacia falta y pudo publicar o retener el mensaje internamente;
+- no espera resultado final de negocio;
+- el body de exito incluye metadatos de aceptacion como `request_id`, `trace_id`, `ilk` y `relay_status`.
+
+#### 8.3.2 Camino especial `SY.frontdesk.gov`
+
+Si el destino efectivo es `SY.frontdesk.gov`, `IO.api` deja el modo `202 Accepted` y mapea la respuesta estructurada de frontdesk a HTTP.
+
+Casos normativos:
+
+- `frontdesk_result.status = "ok"` -> `200 OK`
+- `frontdesk_result.status = "needs_input"` -> `422 Unprocessable Entity`
+- `frontdesk_result.status = "error"` y `result_code = "INVALID_REQUEST"` -> `422 Unprocessable Entity`
+- `frontdesk_result.status = "error"` y `result_code = "IDENTITY_UNAVAILABLE"` -> `503 Service Unavailable`
+- `frontdesk_result.status = "error"` y `result_code = "REGISTER_FAILED"` -> `502 Bad Gateway`
+- `frontdesk_result.status = "error"` con cualquier otro `result_code` -> `502 Bad Gateway`
+
+El body devuelto por `IO.api` en este camino es el `frontdesk_result` canonical, no el envelope `accepted` del ingress comun.
+
+En particular, `needs_input` no se trata como exito HTTP en `IO.api`, porque el modo API no continua conversacionalmente ni puede completar el registro interactuando con el caller.
+
+#### 8.3.3 Errores de transporte o integracion en el camino frontdesk
+
+Si el destino efectivo es `SY.frontdesk.gov`, tambien existen errores previos o laterales al `frontdesk_result`:
+
+- timeout esperando la reply de frontdesk -> `504 Gateway Timeout` con `error_code = "frontdesk_timeout"`
+- reply recibida pero con payload no parseable como `frontdesk_result` -> `502 Bad Gateway` con `error_code = "invalid_frontdesk_response"`
+- imposibilidad de enviar el handoff al router o indisponibilidad del canal de salida -> `503 Service Unavailable` con `error_code = "router_unavailable"`
+
+Estos casos no representan resultado funcional de frontdesk; representan fallo de transporte o correlacion del handoff.
+
+### 8.4 Codigos de error recomendados
 
 - `400 Bad Request`
 - `401 Unauthorized`
@@ -497,7 +547,7 @@ Se mantiene `202 Accepted` tambien en `explicit_subject`, incluso cuando identit
 - `503 Service Unavailable`
 - `504 Gateway Timeout`
 
-### 8.4 Tipificacion inicial de errores HTTP
+### 8.5 Tipificacion inicial de errores HTTP
 
 Errores que conviene estandarizar desde esta fase:
 
@@ -511,6 +561,9 @@ Errores que conviene estandarizar desde esta fase:
 - `ilk_does_not_exist`
 - `identity_unavailable`
 - `identity_timeout`
+- `frontdesk_timeout`
+- `invalid_frontdesk_response`
+- `router_unavailable`
 - `unsupported_attachment_mime`
 - `attachment_too_large`
 - `attachments_too_large`
@@ -596,6 +649,7 @@ Reglas:
 - `message` es obligatorio;
 - `subject` puede ser obligatorio, opcional o invalido segun `subject_mode`;
 - `options.routing.dst_node` puede overridear el destino Fluxbee por request;
+- si `options.routing.dst_node` apunta a `SY.frontdesk.gov`, el request entra en el camino especial de handoff estructurado;
 - debe existir al menos uno de:
   - `message.text`
   - uno o mas attachments
@@ -655,6 +709,29 @@ El mensaje debe salir al router por `fluxbee_sdk::NodeSender::send`.
 El mensaje construido no se envia inmediatamente al router si la politica de relay indica consolidacion.
 
 Primero pasa por el relay comun de `io-common`.
+
+### 13.5 Camino especial de `frontdesk_handoff`
+
+Cuando el destino efectivo es `SY.frontdesk.gov`, `IO.api` usa un contrato distinto:
+
+- `payload.type = "frontdesk_handoff"`
+- `payload.schema_version = 1`
+- `payload.operation = "complete_registration"`
+- `payload.subject.*` con los datos del humano
+- `payload.tenant_id` con el tenant derivado de la API key
+- `payload.context` con metadata de integracion
+
+El carrier conserva:
+
+- `meta.src_ilk`
+- `meta.thread_id`
+- `meta.context.io.*`
+
+En este camino:
+
+- no se usa `text/v1` como payload hacia frontdesk;
+- `IO.api` espera la respuesta `frontdesk_result`;
+- y devuelve ese resultado estructurado por HTTP.
 
 ---
 
