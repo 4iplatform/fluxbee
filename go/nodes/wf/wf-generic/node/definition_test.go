@@ -75,6 +75,23 @@ func TestValidateDefinitionRejectsInvalidRefSyntax(t *testing.T) {
 	assertLoadErrorContains(t, err, "states[0].entry_actions[0].payload.customer_id.$ref")
 }
 
+func TestValidateInputPayloadAcceptsNumericFields(t *testing.T) {
+	// Regression: JSON numbers decoded as float64/int must pass input_schema validation.
+	// The schema used here requires customer_id (string) and allows additional properties.
+	def, err := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
+	if err != nil {
+		t.Fatalf("LoadDefinitionBytes: %v", err)
+	}
+	input := map[string]any{
+		"customer_id":  "cust-001",
+		"amount_cents": float64(25000), // JSON numbers arrive as float64
+		"currency":     "USD",
+	}
+	if err := validateInputPayload(def, input); err != nil {
+		t.Fatalf("validateInputPayload: unexpected error: %v", err)
+	}
+}
+
 func TestParseWorkflowDurationSupportsDays(t *testing.T) {
 	got, err := parseWorkflowDuration("1d")
 	if err != nil {
