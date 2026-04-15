@@ -115,7 +115,9 @@ Estado actual:
 - `IO.api` ya es tenant-scoped por API key.
 - `tenant_hint` ya no forma parte del contrato HTTP.
 - `by_ilk` ya no esta bloqueado como `not_implemented`.
-- `IO.api` ya construye `frontdesk_handoff` y consume `frontdesk_result` cuando el destino es `SY.frontdesk.gov`.
+- `IO.api` ya puede resolver metadata canonica del sujeto desde SHM por `(channel, external_id)`.
+- `IO.api` ya usa `registration_status` para decidir si intermedia `SY.frontdesk.gov`.
+- `IO.api` ya puede continuar luego al `dst_final` cuando frontdesk devuelve `ok`.
 - el pendiente principal de `IO.api` paso a ser validacion funcional real del flujo end-to-end.
 
 ---
@@ -155,7 +157,7 @@ Archivos tocados:
 - [x] Separar explicitamente en frontdesk:
 - [x] modo `register_automatic` via handoff estructurado deterministico
 - [x] modo conversacional
-- [ ] Asegurar que el camino API `by_data` use `register_automatic` cuando ya tiene datos minimos validos.
+- [x] Asegurar que el camino API `by_data` use `register_automatic` cuando ya tiene datos minimos validos.
 - [x] Evitar que frontdesk vuelva a resolver tenancy desde hints textuales en el handoff estructurado.
 - [x] Hacer que frontdesk complete `ILK_REGISTER` con `tenant_id` ya resuelto cuando viene en handoff.
 - [x] Implementar el output canonico unico `payload.type = "frontdesk_result"`.
@@ -205,7 +207,7 @@ Archivos tocados:
 
 Pendiente principal:
 
-- validar el comportamiento real `IO.api -> SY.frontdesk.gov -> frontdesk_result` con requests E2E.
+- validar el comportamiento real `IO.api -> SY.frontdesk.gov -> dst_final` con requests E2E.
 
 ---
 
