@@ -1321,7 +1321,7 @@ async fn resolve_explicit_subject_for_http(
         state.hive_id.as_str(),
         &identity_input.channel,
         &identity_input.external_id,
-        &identity_input.tenant_id,
+        identity_input.tenant_id.as_deref().unwrap_or(""),
     ) {
         Ok(Some(resolved)) => {
             tracing::info!(
