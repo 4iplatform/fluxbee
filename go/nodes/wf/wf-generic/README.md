@@ -76,7 +76,11 @@ El modelo correcto de plataforma es:
 - config explícita con `workflow_definition_path` para smoke/local dev
 - package-native usando `_system.package_path/flow/definition.json` cuando corre como workflow package
 
-Para v1, la config de `WF.*` es boot-time only. No hay `CONFIG_SET/CONFIG_CHANGED` live.
+Para v1, `WF.*` expone el contrato estándar `CONFIG_GET` / `CONFIG_SET`, pero la config sigue siendo boot-time only:
+
+- `CONFIG_GET` devuelve la effective config persistida y el contract del nodo
+- `CONFIG_SET` persiste la nueva config y responde `restart_required`
+- `CONFIG_CHANGED` live/hot reload no está implementado en v1
 
 ### 1. Publicar el runtime base `wf.engine`
 

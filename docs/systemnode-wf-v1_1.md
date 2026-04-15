@@ -687,10 +687,10 @@ On receiving `WF_CANCEL_INSTANCE`:
 
 1. The runtime acquires the instance mutex.
 2. If the instance is already in a terminal state, responds with `INSTANCE_ALREADY_TERMINATED`.
-3. Otherwise, marks the instance as `cancelling`, logs the cancellation reason.
-4. On the next event that would trigger a transition for this instance, instead of evaluating the transition, the runtime transitions to the terminal state `cancelled` directly.
-5. Entry actions of `cancelled` run as normal (typical: a cleanup `send_message` to notify the originator).
-6. All timers for this instance are cancelled as part of cleanup.
+3. Otherwise, logs the cancellation reason and forces an immediate transition to the terminal state `cancelled`.
+4. The transition order is the normal one: `exit_actions` of the current state run first, then `entry_actions` of `cancelled`.
+5. All timers for this instance are cancelled as part of terminal cleanup.
+6. The terminal state is persisted before the `WF_CANCEL_INSTANCE_RESPONSE` is sent.
 
 ### 12.3 What is NOT undone
 
@@ -702,7 +702,7 @@ On receiving `WF_CANCEL_INSTANCE`:
 
 ### 12.4 Races
 
-If `WF_CANCEL_INSTANCE` arrives while the instance is in the middle of a transition (the mutex is held by the evaluator), the cancel waits on the mutex and applies once the current transition completes. The next event after that will see the `cancelling` flag and terminate.
+If `WF_CANCEL_INSTANCE` arrives while the instance is in the middle of a transition (the mutex is held by the evaluator), the cancel waits on the mutex and applies once the current transition completes. Once it acquires the mutex, it immediately performs the forced transition to `cancelled`.
 
 ## 13. Persistence
 

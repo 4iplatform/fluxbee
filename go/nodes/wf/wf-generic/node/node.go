@@ -242,12 +242,13 @@ type RunOptions struct {
 func Run(ctx context.Context, opts RunOptions) error {
 	// --- Config ---
 	cfg := opts.Config
+	configPath := opts.ConfigPath
 	if cfg == nil {
-		if opts.ConfigPath == "" {
+		if configPath == "" {
 			return fmt.Errorf("either ConfigPath or Config is required")
 		}
 		var err error
-		cfg, err = LoadConfig(opts.ConfigPath)
+		cfg, err = LoadConfig(configPath)
 		if err != nil {
 			return err
 		}
@@ -328,6 +329,9 @@ func Run(ctx context.Context, opts RunOptions) error {
 			Store:      store,
 			ActCtx:     actx,
 			NodeUUID:   nodeUUID,
+			NodeName:   sender.FullName(),
+			Config:     cloneConfig(cfg),
+			ConfigPath: configPath,
 			VersionStr: "1.0",
 		}
 

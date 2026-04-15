@@ -1,9 +1,14 @@
 package node
 
 import (
+	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
 
 func TestLoadConfigAcceptsManagedSystemBlock(t *testing.T) {
@@ -179,4 +184,237 @@ func TestManagedConfigPathFromEnv(t *testing.T) {
 	if got != want {
 		t.Fatalf("expected %q, got %q", want, got)
 	}
+}
+
+func TestWFConfigGetReturnsStandardConfigResponse(t *testing.T) {
+	cfg := &Config{
+		WorkflowDefinitionPath: "/pkg/wf.invoice/flow/definition.json",
+		DBPath:                 "/var/lib/fluxbee/nodes/WF/WF.invoice@motherbee/wf_instances.db",
+		SYTimerL2Name:          "SY.timer@motherbee",
+		TenantID:               "tnt:test-1",
+		GCRetentionDays:        7,
+		GCIntervalSeconds:      3600,
+		System: &ManagedSystemConfig{
+			NodeName:      "WF.invoice@motherbee",
+			HiveID:        "motherbee",
+			ConfigVersion: 4,
+			PackagePath:   "/pkg/wf.invoice",
+		},
+	}
+	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-cfg-get"}
+	actx := makeActx(t, disp, &mockTimerSender{})
+	rt := &NodeRuntime{
+		Def:        mustLoadValidDefinition(t),
+		DefJSON:    validWorkflowJSON(),
+		Registry:   NewInstanceRegistry(),
+		Store:      actx.Store,
+		ActCtx:     actx,
+		NodeUUID:   "wf-uuid-cfg-get",
+		NodeName:   "WF.invoice@motherbee",
+		Config:     cloneConfig(cfg),
+		ConfigPath: filepath.Join(t.TempDir(), "config.json"),
+	}
+
+	request, err := sdk.BuildNodeConfigGetMessage(
+		"caller-uuid-1",
+		"WF.invoice@motherbee",
+		sdk.NodeConfigGetPayload{NodeName: "WF.invoice@motherbee"},
+		sdk.NodeConfigEnvelopeOptions{},
+		"trace-config-get-1",
+	)
+	if err != nil {
+		t.Fatalf("BuildNodeConfigGetMessage: %v", err)
+	}
+
+	if err := Dispatch(context.Background(), request, rt); err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	if len(disp.sent) != 1 {
+		t.Fatalf("expected one CONFIG_RESPONSE, got %d", len(disp.sent))
+	}
+	if got := derefString(disp.sent[0].Meta.Msg); got != sdk.MSGConfigResponse {
+		t.Fatalf("expected %q, got %q", sdk.MSGConfigResponse, got)
+	}
+	resp, err := sdk.ParseNodeConfigResponse(&disp.sent[0])
+	if err != nil {
+		t.Fatalf("ParseNodeConfigResponse: %v", err)
+	}
+	if !resp.OK {
+		t.Fatalf("expected ok response, got %+v", resp)
+	}
+	if resp.NodeName != "WF.invoice@motherbee" {
+		t.Fatalf("unexpected node_name %q", resp.NodeName)
+	}
+}
+
+func TestWFConfigSetPersistsManagedConfigAndRequiresRestart(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	initialConfig := `{
+  "config_version": 4,
+  "managed_by": "SY.orchestrator",
+  "workflow_definition_path": "/pkg/wf.invoice/flow/definition.json",
+  "db_path": "/var/lib/fluxbee/nodes/WF/WF.invoice@motherbee/wf_instances.db",
+  "sy_timer_l2_name": "SY.timer@motherbee",
+  "gc_retention_days": 7,
+  "gc_interval_seconds": 3600,
+  "_system": {
+    "node_name": "WF.invoice@motherbee",
+    "hive_id": "motherbee",
+    "package_path": "/pkg/wf.invoice",
+    "config_version": 4
+  }
+}`
+	if err := os.WriteFile(configPath, []byte(initialConfig), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-cfg-set"}
+	actx := makeActx(t, disp, &mockTimerSender{})
+	rt := &NodeRuntime{
+		Def:        mustLoadValidDefinition(t),
+		DefJSON:    validWorkflowJSON(),
+		Registry:   NewInstanceRegistry(),
+		Store:      actx.Store,
+		ActCtx:     actx,
+		NodeUUID:   "wf-uuid-cfg-set",
+		NodeName:   "WF.invoice@motherbee",
+		Config:     cfg,
+		ConfigPath: configPath,
+	}
+
+	request, err := sdk.BuildNodeConfigSetMessage(
+		"caller-uuid-2",
+		"WF.invoice@motherbee",
+		sdk.NodeConfigSetPayload{
+			NodeName:      "WF.invoice@motherbee",
+			SchemaVersion: 1,
+			ConfigVersion: 5,
+			ApplyMode:     sdk.NodeConfigApplyModeReplace,
+			Config: map[string]any{
+				"workflow_definition_path": "/pkg/wf.invoice/flow/definition.json",
+				"db_path":                 "/var/lib/fluxbee/nodes/WF/WF.invoice@motherbee/new.db",
+				"sy_timer_l2_name":        "SY.timer@motherbee",
+				"gc_retention_days":       14,
+				"gc_interval_seconds":     900,
+			},
+		},
+		sdk.NodeConfigEnvelopeOptions{},
+		"trace-config-set-1",
+	)
+	if err != nil {
+		t.Fatalf("BuildNodeConfigSetMessage: %v", err)
+	}
+
+	if err := Dispatch(context.Background(), request, rt); err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	resp, err := sdk.ParseNodeConfigResponse(&disp.sent[0])
+	if err != nil {
+		t.Fatalf("ParseNodeConfigResponse: %v", err)
+	}
+	if !resp.OK {
+		t.Fatalf("expected ok CONFIG_SET response, got %+v", resp)
+	}
+	if state := derefString(resp.State); state != "restart_required" {
+		t.Fatalf("expected state restart_required, got %q", state)
+	}
+	if version := *resp.ConfigVersion; version != 5 {
+		t.Fatalf("expected config_version 5, got %d", version)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read persisted config: %v", err)
+	}
+	text := string(data)
+	if !strings.Contains(text, `"managed_by": "SY.orchestrator"`) {
+		t.Fatalf("expected top-level orchestrator metadata to be preserved, got %s", text)
+	}
+	if !strings.Contains(text, `"db_path": "/var/lib/fluxbee/nodes/WF/WF.invoice@motherbee/new.db"`) {
+		t.Fatalf("expected new db_path in persisted config, got %s", text)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("json.Unmarshal persisted config: %v", err)
+	}
+	if got := int(raw["config_version"].(float64)); got != 5 {
+		t.Fatalf("expected top-level config_version 5, got %d", got)
+	}
+}
+
+func TestWFConfigSetRejectsSystemMutation(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	initialConfig := `{
+  "_system": {
+    "node_name": "WF.invoice@motherbee",
+    "hive_id": "motherbee",
+    "package_path": "/pkg/wf.invoice",
+    "config_version": 1
+  }
+}`
+	if err := os.WriteFile(configPath, []byte(initialConfig), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-cfg-set-reject"}
+	actx := makeActx(t, disp, &mockTimerSender{})
+	rt := &NodeRuntime{
+		Def:        mustLoadValidDefinition(t),
+		DefJSON:    validWorkflowJSON(),
+		Registry:   NewInstanceRegistry(),
+		Store:      actx.Store,
+		ActCtx:     actx,
+		NodeUUID:   "wf-uuid-cfg-set-reject",
+		NodeName:   "WF.invoice@motherbee",
+		Config:     cfg,
+		ConfigPath: configPath,
+	}
+
+	request, err := sdk.BuildNodeConfigSetMessage(
+		"caller-uuid-3",
+		"WF.invoice@motherbee",
+		sdk.NodeConfigSetPayload{
+			NodeName:      "WF.invoice@motherbee",
+			SchemaVersion: 1,
+			ConfigVersion: 2,
+			ApplyMode:     sdk.NodeConfigApplyModeReplace,
+			Config: map[string]any{
+				"_system": map[string]any{"node_name": "WF.evil@motherbee"},
+			},
+		},
+		sdk.NodeConfigEnvelopeOptions{},
+		"trace-config-set-2",
+	)
+	if err != nil {
+		t.Fatalf("BuildNodeConfigSetMessage: %v", err)
+	}
+
+	if err := Dispatch(context.Background(), request, rt); err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	resp, err := sdk.ParseNodeConfigResponse(&disp.sent[0])
+	if err != nil {
+		t.Fatalf("ParseNodeConfigResponse: %v", err)
+	}
+	if resp.OK {
+		t.Fatalf("expected CONFIG_SET rejection, got %+v", resp)
+	}
+}
+
+func mustLoadValidDefinition(t *testing.T) *WorkflowDefinition {
+	t.Helper()
+	def, err := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
+	if err != nil {
+		t.Fatalf("LoadDefinitionBytes: %v", err)
+	}
+	return def
 }

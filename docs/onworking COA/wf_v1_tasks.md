@@ -32,7 +32,7 @@ One binary, parameterized by a workflow definition JSON. Deployed as many instan
 - **Timers:** all workflow-visible timers go through SY.timer. Internal timeouts use Go primitives.
 - **No compensation in v1.** No rollback, no sagas, no subworkflows.
 - **Restart recovery:** load `wf_instances` WHERE status IN ('running','cancelling') + reconcile timers with SY.timer (see WF-RECOVER-1 for full reconciliation flow).
-- **Soft abort:** `WF_CANCEL_INSTANCE` sets status = 'cancelling'; next event evaluation for that instance transitions to 'cancelled'.
+- **Soft abort:** `WF_CANCEL_INSTANCE` forces an immediate transition to `cancelled`: run `exit_actions` of the current state, then `entry_actions` of `cancelled`, then persist terminal state and cleanup timers.
 - **Timer cleanup on termination:** automatic TIMER_CANCEL for all registered timers when an instance reaches a terminal state.
 - **Log cap:** 100 entries per instance, FIFO.
 - **Retention GC:** periodic sweep of terminated instances older than 7 days (configurable via config.json).
@@ -242,10 +242,11 @@ go/nodes/wf/wf-generic/
 - [x] On `WF_CANCEL_INSTANCE` (in dispatch.go):
   - Acquire instance mutex
   - If already terminal: respond with `INSTANCE_ALREADY_TERMINATED`
-  - If already cancelling: respond with `INSTANCE_CANCELLING`
-  - Set status = 'cancelling', log reason
-  - Release mutex (transition happens on next event)
-- [x] When cancelling instance receives any event: immediately transition to 'cancelled' (handled in RunTransition)
+  - Log cancellation reason
+  - Force transition immediately to `cancelled`
+  - Execute `exit_actions` of the current state, then `entry_actions` of `cancelled`
+  - Persist terminal state and cleanup timers before responding
+- [x] Legacy `cancelling` rows still reconcile at recovery, but live cancel path no longer waits for a next event
 
 ---
 
@@ -523,4 +524,4 @@ The following points were raised during planning and resolved before implementat
 
 5. **`meta.trace_id` is the idempotency key for outbound actions.** When re-executing a transition after a crash, re-use the same trace_id from the original event. The WF runtime needs to persist the trace_id of the currently-processing event so it can re-use it on recovery.
 
-6. **WF v1 is boot-time config only.** No live `CONFIG_GET` / `CONFIG_SET` / `CONFIG_CHANGED` support is required for the first cut. Config changes apply by restart / respawn.
+6. **WF v1 supports standard `CONFIG_GET` / `CONFIG_SET`, but config remains boot-time only.** `CONFIG_SET` persists the effective config and responds `restart_required`; live reload via `CONFIG_CHANGED` is still out of scope for v1.

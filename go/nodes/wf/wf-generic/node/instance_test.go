@@ -251,6 +251,91 @@ func TestWFGetInstanceInvalidRequestUsesResponseVerbAndUUIDSrc(t *testing.T) {
 	}
 }
 
+func TestWFCancelInstanceTransitionsImmediatelyToCancelled(t *testing.T) {
+	def, err := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
+	if err != nil {
+		t.Fatalf("load def: %v", err)
+	}
+	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-cancel-now"}
+	timer := &mockTimerSender{}
+	actx := makeActx(t, disp, timer)
+	reg := NewInstanceRegistry()
+
+	inst := NewInstance(def, "wfi:cancel-now", def.WorkflowType, map[string]any{"customer_id": "cust-1"}, fixedClock)
+	row, _ := inst.ToRow(fixedClock)
+	if err := actx.Store.CreateInstance(context.Background(), row); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if err := actx.Store.RegisterTimer(context.Background(), inst.InstanceID, "invoice_timeout", nowMS(fixedClock), nowMS(fixedClock)+60000); err != nil {
+		t.Fatalf("RegisterTimer: %v", err)
+	}
+	reg.Add(inst)
+
+	rt := &NodeRuntime{
+		Def:      def,
+		DefJSON:  validWorkflowJSON(),
+		Registry: reg,
+		Store:    actx.Store,
+		ActCtx:   actx,
+		NodeUUID: "wf-uuid-cancel-now",
+		NodeName: "WF.invoice@motherbee",
+	}
+
+	msgName := MsgWFCancelInstance
+	msg := sdk.Message{
+		Routing: sdk.Routing{
+			Src:     "caller-uuid-cancel",
+			Dst:     sdk.UnicastDestination("WF.invoice@motherbee"),
+			TTL:     16,
+			TraceID: "trace-cancel-now-1",
+		},
+		Meta: sdk.Meta{
+			MsgType: "system",
+			Msg:     &msgName,
+		},
+		Payload: json.RawMessage(`{"instance_id":"wfi:cancel-now","reason":"operator request"}`),
+	}
+
+	if err := Dispatch(context.Background(), msg, rt); err != nil {
+		t.Fatalf("Dispatch cancel: %v", err)
+	}
+	rowAfter, err := actx.Store.GetInstance(context.Background(), inst.InstanceID)
+	if err != nil {
+		t.Fatalf("GetInstance: %v", err)
+	}
+	if rowAfter.Status != "cancelled" {
+		t.Fatalf("expected cancelled status, got %q", rowAfter.Status)
+	}
+	if rowAfter.CurrentState != "cancelled" {
+		t.Fatalf("expected cancelled state, got %q", rowAfter.CurrentState)
+	}
+	if _, ok := reg.Get(inst.InstanceID); ok {
+		t.Fatalf("expected instance to be removed from active registry")
+	}
+	expectedRef := timerClientRef(inst.InstanceID, "invoice_timeout")
+	foundCancel := false
+	for _, ref := range timer.cancelled {
+		if ref == expectedRef {
+			foundCancel = true
+			break
+		}
+	}
+	if !foundCancel {
+		t.Fatalf("expected timer %q to be cancelled, got %v", expectedRef, timer.cancelled)
+	}
+	reply := disp.sent[len(disp.sent)-1]
+	if got := derefString(reply.Meta.Msg); got != MsgWFCancelInstanceResponse {
+		t.Fatalf("expected cancel response verb, got %q", got)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(reply.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal reply payload: %v", err)
+	}
+	if payload["status"] != "cancelled" {
+		t.Fatalf("expected reply status cancelled, got %#v", payload["status"])
+	}
+}
+
 func derefString(value *string) string {
 	if value == nil {
 		return ""

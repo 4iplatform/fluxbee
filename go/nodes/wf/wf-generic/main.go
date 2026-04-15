@@ -48,6 +48,7 @@ func main() {
 	}
 
 	if err := node.Run(ctx, node.RunOptions{
+		ConfigPath: configPath,
 		Config: cfg,
 		SDKConfig: &sdk.NodeConfig{
 			Name:               nodeName,

@@ -36,6 +36,9 @@ type NodeRuntime struct {
 	Store      *Store
 	ActCtx     ActionContext
 	NodeUUID   string
+	NodeName   string
+	Config     *Config
+	ConfigPath string
 	VersionStr string
 }
 
@@ -49,6 +52,12 @@ func Dispatch(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
 	switch {
 	case sdk.IsNodeStatusGetMessage(&msg):
 		return handleNodeStatusGet(ctx, msg, rt)
+
+	case sdk.IsNodeConfigGetMessage(&msg):
+		return handleNodeConfigGet(ctx, msg, rt)
+
+	case sdk.IsNodeConfigSetMessage(&msg):
+		return handleNodeConfigSet(ctx, msg, rt)
 
 	case msgName == MsgWFHelp:
 		return handleWFHelp(ctx, msg, rt)
@@ -86,6 +95,41 @@ func handleNodeStatusGet(ctx context.Context, msg sdk.Message, rt *NodeRuntime) 
 		return err
 	}
 	return rt.ActCtx.Dispatcher.SendMsg(resp)
+}
+
+func handleNodeConfigGet(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
+	reqMsg, err := sdk.ParseNodeConfigRequest(&msg)
+	if err != nil || reqMsg == nil || reqMsg.Get == nil {
+		return sendNodeConfigResponse(ctx, msg, wfConfigErrorPayload(rt.NodeName, "INVALID_CONFIG_GET", errorString(err, "invalid CONFIG_GET request"), configVersion(rt.Config)), rt)
+	}
+	req := reqMsg.Get
+	if req.NodeName != "" && rt.NodeName != "" && req.NodeName != rt.NodeName {
+		return sendNodeConfigResponse(ctx, msg, wfConfigErrorPayload(rt.NodeName, "INVALID_CONFIG_GET", fmt.Sprintf("request node_name %q does not match runtime node %q", req.NodeName, rt.NodeName), configVersion(rt.Config)), rt)
+	}
+	return sendNodeConfigResponse(ctx, msg, buildWFConfigGetPayload(rt.NodeName, rt.Config), rt)
+}
+
+func handleNodeConfigSet(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
+	reqMsg, err := sdk.ParseNodeConfigRequest(&msg)
+	if err != nil || reqMsg == nil || reqMsg.Set == nil {
+		return sendNodeConfigResponse(ctx, msg, wfConfigErrorPayload(rt.NodeName, "INVALID_CONFIG_SET", errorString(err, "invalid CONFIG_SET request"), configVersion(rt.Config)), rt)
+	}
+	req := reqMsg.Set
+	if req.NodeName != "" && rt.NodeName != "" && req.NodeName != rt.NodeName {
+		return sendNodeConfigResponse(ctx, msg, wfConfigErrorPayload(rt.NodeName, "INVALID_CONFIG_SET", fmt.Sprintf("request node_name %q does not match runtime node %q", req.NodeName, rt.NodeName), req.ConfigVersion), rt)
+	}
+	if rt.Config == nil || rt.ConfigPath == "" {
+		return sendNodeConfigResponse(ctx, msg, wfConfigErrorPayload(rt.NodeName, "CONFIG_UNAVAILABLE", "runtime config path is unavailable", req.ConfigVersion), rt)
+	}
+
+	payload, nextCfg, applyErr := applyWFConfigSet(rt.ConfigPath, rt.NodeName, rt.Config, req)
+	if applyErr != nil {
+		return sendNodeConfigResponse(ctx, msg, wfConfigErrorPayload(rt.NodeName, "CONFIG_WRITE_FAILED", applyErr.Error(), req.ConfigVersion), rt)
+	}
+	if nextCfg != nil {
+		rt.Config = nextCfg
+	}
+	return sendNodeConfigResponse(ctx, msg, payload, rt)
 }
 
 func handleWFHelp(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
@@ -171,7 +215,6 @@ func handleWFCancelInstance(ctx context.Context, msg sdk.Message, rt *NodeRuntim
 
 	inst, ok := rt.Registry.Get(req.InstanceID)
 	if !ok {
-		// Check if it exists but is already terminated
 		row, err := rt.Store.GetInstance(ctx, req.InstanceID)
 		if err != nil {
 			return sendErrorReply(ctx, msg, MsgWFCancelInstanceResponse, "INSTANCE_NOT_FOUND", fmt.Sprintf("instance %q not found", req.InstanceID), rt)
@@ -186,19 +229,9 @@ func handleWFCancelInstance(ctx context.Context, msg sdk.Message, rt *NodeRuntim
 	inst.Lock()
 	defer inst.Unlock()
 
-	if inst.Status == "cancelling" {
-		return sendErrorReply(ctx, msg, MsgWFCancelInstanceResponse, "INSTANCE_CANCELLING",
-			fmt.Sprintf("instance %q is already being cancelled", req.InstanceID), rt)
-	}
-	if inst.Status != "running" {
+	if inst.Status != "running" && inst.Status != "cancelling" {
 		return sendErrorReply(ctx, msg, MsgWFCancelInstanceResponse, "INSTANCE_ALREADY_TERMINATED",
 			fmt.Sprintf("instance %q is already %s", req.InstanceID, inst.Status), rt)
-	}
-
-	inst.Status = "cancelling"
-	if err := rt.Store.UpdateInstance(ctx, mustToRow(inst, rt.ActCtx.Clock)); err != nil {
-		inst.Status = "running" // rollback in-memory
-		return fmt.Errorf("cancel instance %q: persist: %w", req.InstanceID, err)
 	}
 
 	_ = rt.Store.AppendLog(ctx, WFLogEntry{
@@ -208,11 +241,15 @@ func handleWFCancelInstance(ctx context.Context, msg sdk.Message, rt *NodeRuntim
 		Summary:    fmt.Sprintf("cancel requested: %s", req.Reason),
 		OK:         true,
 	})
+	if err := inst.runCancelTransition(ctx, msg, rt.ActCtx); err != nil {
+		return fmt.Errorf("cancel instance %q: transition to cancelled: %w", req.InstanceID, err)
+	}
+	rt.Registry.Remove(req.InstanceID)
 
 	payload := map[string]any{
 		"ok":          true,
 		"instance_id": req.InstanceID,
-		"status":      "cancelling",
+		"status":      "cancelled",
 	}
 	return sendReply(ctx, msg, MsgWFCancelInstanceResponse, payload, rt)
 }
@@ -230,12 +267,30 @@ func sendReply(ctx context.Context, orig sdk.Message, replyMsg string, payload a
 	return rt.ActCtx.Dispatcher.SendMsg(resp)
 }
 
+func sendNodeConfigResponse(ctx context.Context, orig sdk.Message, payload any, rt *NodeRuntime) error {
+	if rt.ActCtx.Dispatcher == nil {
+		return nil
+	}
+	resp, err := sdk.BuildNodeConfigResponseMessage(&orig, rt.NodeUUID, payload)
+	if err != nil {
+		return err
+	}
+	return rt.ActCtx.Dispatcher.SendMsg(resp)
+}
+
 func sendErrorReply(ctx context.Context, orig sdk.Message, responseMsg, code, detail string, rt *NodeRuntime) error {
 	return sendReply(ctx, orig, responseMsg, map[string]any{
 		"ok":     false,
 		"error":  code,
 		"detail": detail,
 	}, rt)
+}
+
+func errorString(err error, fallback string) string {
+	if err == nil {
+		return fallback
+	}
+	return err.Error()
 }
 
 func stateNames(def *WorkflowDefinition) []string {
