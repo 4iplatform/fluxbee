@@ -729,15 +729,17 @@ pub fn resolve_ilk_from_hive_config(
     resolve_ilk_from_hive_id(&hive_id, channel_type, address, tenant_id)
 }
 
-/// Resolve the full identity option from identity SHM by `(channel_type, address)`.
+/// Resolve the full identity option from identity SHM by `(channel_type, address, tenant_id)`.
 /// Returns the matched ICH plus canonical ILK metadata when found.
 pub fn resolve_identity_option_from_shm_name(
     identity_shm_name: &str,
     channel_type: &str,
     address: &str,
+    tenant_id: &str,
 ) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
     let normalized_channel = channel_type.trim().to_ascii_lowercase();
     let normalized_address = address.trim().to_ascii_lowercase();
+    let normalized_tenant = tenant_id.trim().to_ascii_lowercase();
     if normalized_channel.is_empty() || normalized_address.is_empty() {
         return Err(IdentityShmError::InvalidChannelInput);
     }
@@ -746,7 +748,11 @@ pub fn resolve_identity_option_from_shm_name(
         Err(err) if is_permission_lookup_unavailable(&err) => return Ok(None),
         Err(err) => return Err(err),
     };
-    let resolved = match reader.resolve_identity_option(&normalized_channel, &normalized_address) {
+    let resolved = match reader.resolve_identity_option(
+        &normalized_channel,
+        &normalized_address,
+        &normalized_tenant,
+    ) {
         Ok(value) => value,
         Err(err) if is_permission_lookup_unavailable(&err) => return Ok(None),
         Err(err) => return Err(err),
@@ -754,24 +760,28 @@ pub fn resolve_identity_option_from_shm_name(
     Ok(resolved)
 }
 
-/// Resolve the full identity option via explicit hive id (`/jsr-identity-<hive_id>`).
+/// Resolve the full identity option via explicit hive id (`/jsr-identity-<hive_id>`)
+/// using tenant-aware ICH lookup.
 pub fn resolve_identity_option_from_hive_id(
     hive_id: &str,
     channel_type: &str,
     address: &str,
+    tenant_id: &str,
 ) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
     let shm_name = identity_shm_name_for_hive(hive_id)?;
-    resolve_identity_option_from_shm_name(&shm_name, channel_type, address)
+    resolve_identity_option_from_shm_name(&shm_name, channel_type, address, tenant_id)
 }
 
-/// Resolve the full identity option using `hive.yaml` from config dir.
+/// Resolve the full identity option using `hive.yaml` from config dir
+/// using tenant-aware ICH lookup.
 pub fn resolve_identity_option_from_hive_config(
     config_dir: &Path,
     channel_type: &str,
     address: &str,
+    tenant_id: &str,
 ) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
     let hive_id = load_hive_id(config_dir)?;
-    resolve_identity_option_from_hive_id(&hive_id, channel_type, address)
+    resolve_identity_option_from_hive_id(&hive_id, channel_type, address, tenant_id)
 }
 
 /// Check whether a tenant exists in identity SHM by canonical tenant id (`tnt:<uuid>`).
@@ -898,6 +908,7 @@ impl IdentityShmReader {
         &self,
         channel_type: &str,
         address: &str,
+        tenant_id: &str,
     ) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
         let header = header_ref::<IdentityHeader>(self.mmap.as_ref(), self.layout.header_offset)
             .ok_or(IdentityShmError::InvalidShmHeader)?;
@@ -907,6 +918,7 @@ impl IdentityShmReader {
             &self.layout,
             channel_type,
             address,
+            tenant_id,
         )
     }
 
@@ -1098,6 +1110,7 @@ fn read_resolved_identity_option_from_region(
     layout: &IdentityRegionLayout,
     channel_type: &str,
     address: &str,
+    tenant_id: &str,
 ) -> Result<Option<ResolvedIdentityOption>, IdentityShmError> {
     let start = StdInstant::now();
     loop {
@@ -1117,7 +1130,8 @@ fn read_resolved_identity_option_from_region(
             layout.limits.max_ich_mappings() as usize,
         )
         .ok_or(IdentityShmError::InvalidShmHeader)?;
-        let mapping = resolve_ich_mapping_details_from_entries(mappings, channel_type, address);
+        let mapping =
+            resolve_ich_mapping_details_from_entries(mappings, channel_type, address, tenant_id);
 
         let max_ilks = usize::min(header.ilk_count as usize, layout.limits.max_ilks as usize);
         let max_ichs = usize::min(header.ich_count as usize, layout.limits.max_ichs() as usize);
@@ -1232,7 +1246,7 @@ fn resolve_ich_mapping_from_entries(
     address: &str,
     tenant_id: &str,
 ) -> Option<[u8; 16]> {
-    resolve_ich_mapping_details_from_entries(mappings, channel_type, address)
+    resolve_ich_mapping_details_from_entries(mappings, channel_type, address, tenant_id)
         .map(|(_, ilk_id)| ilk_id)
 }
 
@@ -1240,6 +1254,7 @@ fn resolve_ich_mapping_details_from_entries(
     mappings: &[IchMappingEntry],
     channel_type: &str,
     address: &str,
+    tenant_id: &str,
 ) -> Option<([u8; 16], [u8; 16])> {
     if mappings.is_empty() {
         return None;
@@ -1421,7 +1436,7 @@ fn build_resolved_identity_option(
     })
 }
 
-fn compute_ich_hash(channel_type: &str, address: &str) -> u64 {
+fn compute_ich_hash(channel_type: &str, address: &str, tenant_id: [u8; 16]) -> u64 {
     const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
     let mut hash = FNV_OFFSET_BASIS;
