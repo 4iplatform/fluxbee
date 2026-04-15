@@ -81,9 +81,40 @@ func Dispatch(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
 		log.Printf("wf: %s received (informational, no action needed)", msgName)
 		return nil
 
+	case shouldIgnoreInfrastructureMessage(msg):
+		log.Printf("wf: ignoring infrastructure message type=%s msg=%q trace_id=%s", msg.Meta.MsgType, msgName, msg.Routing.TraceID)
+		return nil
+
 	default:
 		// All other messages: correlate to existing instance or create new one
 		return CorrelateAndDispatch(ctx, msg, rt.Registry, rt.Def, rt.Store, rt.ActCtx)
+	}
+}
+
+func shouldIgnoreInfrastructureMessage(msg sdk.Message) bool {
+	if msg.Meta.MsgType != sdk.SYSTEMKind {
+		return false
+	}
+	msgName := ""
+	if msg.Meta.Msg != nil {
+		msgName = *msg.Meta.Msg
+	}
+	switch msgName {
+	case "",
+		sdk.MSGHello,
+		sdk.MSGAnnounce,
+		sdk.MSGWithdraw,
+		sdk.MSGEcho,
+		sdk.MSGEchoReply,
+		sdk.MSGUnreachable,
+		sdk.MSGTTLExceeded,
+		sdk.MSGConfigResponse,
+		sdk.MSGNodeStatusGetResponse,
+		sdk.MsgTimerResponse,
+		sdk.MsgTimerHelp:
+		return true
+	default:
+		return false
 	}
 }
 

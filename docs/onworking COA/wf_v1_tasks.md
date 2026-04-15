@@ -720,13 +720,7 @@ The `WF.invoice` definition schedules `collection_timeout` for `30m` in `collect
 Check the timer catalog:
 
 ```bash
-curl -sS -X POST "http://127.0.0.1:8080/hives/motherbee/timer/timers" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "owner_l2_name": "WF.invoice@motherbee",
-    "status_filter": "pending",
-    "limit": 100
-  }' | jq
+curl -sS -X GET "http://127.0.0.1:8080/hives/motherbee/timer/timers?owner_l2_name=WF.invoice@motherbee&status_filter=pending&limit=100" | jq
 ```
 
 Expected result:
@@ -755,13 +749,7 @@ Expected result:
 Verify the timer was cleaned up:
 
 ```bash
-curl -sS -X POST "http://127.0.0.1:8080/hives/motherbee/timer/timers" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "owner_l2_name": "WF.invoice@motherbee",
-    "status_filter": "pending",
-    "limit": 100
-  }' | jq
+curl -sS -X GET "http://127.0.0.1:8080/hives/motherbee/timer/timers?owner_l2_name=WF.invoice@motherbee&status_filter=pending&limit=100" | jq
 ```
 
 Expected result:

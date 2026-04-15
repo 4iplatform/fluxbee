@@ -336,6 +336,102 @@ func TestWFCancelInstanceTransitionsImmediatelyToCancelled(t *testing.T) {
 	}
 }
 
+func TestDispatchIgnoresInfrastructureSystemMessages(t *testing.T) {
+	def, err := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
+	if err != nil {
+		t.Fatalf("load def: %v", err)
+	}
+	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-ignore"}
+	timer := &mockTimerSender{}
+	actx := makeActx(t, disp, timer)
+	rt := &NodeRuntime{
+		Def:      def,
+		DefJSON:  validWorkflowJSON(),
+		Registry: NewInstanceRegistry(),
+		Store:    actx.Store,
+		ActCtx:   actx,
+		NodeUUID: "wf-uuid-ignore",
+		NodeName: "WF.invoice@motherbee",
+	}
+
+	msgName := sdk.MSGUnreachable
+	msg := sdk.Message{
+		Routing: sdk.Routing{
+			Src:     "router-uuid",
+			Dst:     sdk.UnicastDestination("WF.invoice@motherbee"),
+			TTL:     16,
+			TraceID: "trace-ignore-unreachable-1",
+		},
+		Meta: sdk.Meta{
+			MsgType: sdk.SYSTEMKind,
+			Msg:     &msgName,
+		},
+		Payload: json.RawMessage(`{"original_dst":"router-uuid","reason":"NODE_NOT_FOUND"}`),
+	}
+
+	if err := Dispatch(context.Background(), msg, rt); err != nil {
+		t.Fatalf("Dispatch UNREACHABLE: %v", err)
+	}
+	if len(disp.sent) != 0 {
+		t.Fatalf("expected no replies for ignored infrastructure message, got %d", len(disp.sent))
+	}
+	rows, err := actx.Store.ListInstances(context.Background(), "", 10, 0)
+	if err != nil {
+		t.Fatalf("ListInstances: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("expected no instances created, got %d", len(rows))
+	}
+}
+
+func TestDispatchIgnoresTimerResponseSystemMessages(t *testing.T) {
+	def, err := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
+	if err != nil {
+		t.Fatalf("load def: %v", err)
+	}
+	disp := &mockDispatcher{l2name: "WF.invoice@motherbee", uuid: "wf-uuid-ignore-timer"}
+	timer := &mockTimerSender{}
+	actx := makeActx(t, disp, timer)
+	rt := &NodeRuntime{
+		Def:      def,
+		DefJSON:  validWorkflowJSON(),
+		Registry: NewInstanceRegistry(),
+		Store:    actx.Store,
+		ActCtx:   actx,
+		NodeUUID: "wf-uuid-ignore-timer",
+		NodeName: "WF.invoice@motherbee",
+	}
+
+	msgName := sdk.MsgTimerResponse
+	msg := sdk.Message{
+		Routing: sdk.Routing{
+			Src:     "SY.timer@motherbee",
+			Dst:     sdk.UnicastDestination("WF.invoice@motherbee"),
+			TTL:     16,
+			TraceID: "trace-ignore-timer-response-1",
+		},
+		Meta: sdk.Meta{
+			MsgType: sdk.SYSTEMKind,
+			Msg:     &msgName,
+		},
+		Payload: json.RawMessage(`{"ok":false,"verb":"TIMER_LIST","error":{"code":"TIMER_INTERNAL","message":"boom"}}`),
+	}
+
+	if err := Dispatch(context.Background(), msg, rt); err != nil {
+		t.Fatalf("Dispatch TIMER_RESPONSE: %v", err)
+	}
+	if len(disp.sent) != 0 {
+		t.Fatalf("expected no replies for ignored TIMER_RESPONSE, got %d", len(disp.sent))
+	}
+	rows, err := actx.Store.ListInstances(context.Background(), "", 10, 0)
+	if err != nil {
+		t.Fatalf("ListInstances: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("expected no instances created, got %d", len(rows))
+	}
+}
+
 func derefString(value *string) string {
 	if value == nil {
 		return ""
