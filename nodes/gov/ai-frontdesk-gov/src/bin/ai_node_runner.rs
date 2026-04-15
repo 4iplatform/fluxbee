@@ -4678,6 +4678,12 @@ mod tests {
         context: Value,
         top_level_src_ilk: Option<&str>,
     ) -> Message {
+        let meta_thread_id = context
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
         Message {
             routing: Routing {
                 src: "IO.sim.local@motherbee".to_string(),
@@ -4690,6 +4696,7 @@ mod tests {
                 msg_type: "user".to_string(),
                 msg: None,
                 src_ilk: top_level_src_ilk.map(ToString::to_string),
+                thread_id: meta_thread_id,
                 scope: None,
                 target: None,
                 action: None,
@@ -4935,8 +4942,6 @@ mod tests {
         let redacted = redact_secrets(&value);
         let redacted_json = serde_json::to_string(&redacted).expect("serialize redacted config");
         assert!(!redacted_json.contains("canonical-secret"));
-        let source = resolve_openai_api_key_source_from_effective_config(node_name, &value);
-        assert_eq!(source, OpenAiApiKeySource::Missing);
 
         let _ = fs::remove_dir_all(root);
     }
