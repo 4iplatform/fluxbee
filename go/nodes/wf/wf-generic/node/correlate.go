@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
@@ -56,6 +57,17 @@ func CorrelateAndDispatch(ctx context.Context, msg sdk.Message, reg *InstanceReg
 	if msg.Meta.Msg != nil {
 		msgName = *msg.Meta.Msg
 	}
+	log.Printf(
+		"wf: correlate inbound type=%s msg=%q src_uuid=%s src_l2=%q thread_id=%q trace_id=%s target=%q payload=%s",
+		msg.Meta.MsgType,
+		msgName,
+		msg.Routing.Src,
+		msg.SourceL2Name(),
+		derefStringPtr(msg.Meta.ThreadID),
+		msg.Routing.TraceID,
+		derefStringPtr(msg.Meta.Target),
+		payloadPreview(msg.Payload),
+	)
 
 	// 1. TIMER_FIRED: correlate by instance_id in timer payload
 	if msgName == sdk.MsgTimerFired {
@@ -76,6 +88,7 @@ func CorrelateAndDispatch(ctx context.Context, msg sdk.Message, reg *InstanceReg
 	if msg.Meta.ThreadID != nil && *msg.Meta.ThreadID != "" {
 		threadID := *msg.Meta.ThreadID
 		if inst, ok := reg.Get(threadID); ok {
+			log.Printf("wf: correlate matched thread_id=%s instance_id=%s", threadID, inst.InstanceID)
 			return dispatchToInstance(ctx, inst, msg, reg, actx)
 		}
 	}
@@ -106,15 +119,25 @@ func createAndDispatch(ctx context.Context, msg sdk.Message, reg *InstanceRegist
 	input := map[string]any{}
 	if len(msg.Payload) > 0 {
 		if err := json.Unmarshal(msg.Payload, &input); err != nil {
+			log.Printf("wf: create rejected trace_id=%s reason=payload_not_object payload=%s", msg.Routing.TraceID, payloadPreview(msg.Payload))
 			return sendErrorResponse(ctx, msg, "INVALID_INPUT", "payload is not a JSON object", actx)
 		}
 	}
 	if err := validateInputPayload(def, input); err != nil {
+		log.Printf("wf: create rejected trace_id=%s reason=invalid_input detail=%v input=%s", msg.Routing.TraceID, err, payloadPreview(msg.Payload))
 		return sendErrorResponse(ctx, msg, "INVALID_INPUT", err.Error(), actx)
 	}
 
 	instanceID := newInstanceID()
 	inst := NewInstance(def, instanceID, def.WorkflowType, input, actx.Clock)
+	log.Printf(
+		"wf: create accepted instance_id=%s workflow_type=%s initial_state=%s trace_id=%s src_l2=%q",
+		instanceID,
+		def.WorkflowType,
+		def.InitialState,
+		msg.Routing.TraceID,
+		msg.SourceL2Name(),
+	)
 
 	// Persist before running entry_actions (act-then-persist model: trace_id first)
 	inst.CurrentTraceID = msg.Routing.TraceID
@@ -125,6 +148,7 @@ func createAndDispatch(ctx context.Context, msg sdk.Message, reg *InstanceRegist
 	if err := store.CreateInstance(ctx, row); err != nil {
 		return fmt.Errorf("create instance: store: %w", err)
 	}
+	log.Printf("wf: create persisted instance_id=%s state=%s status=%s", instanceID, inst.CurrentState, inst.Status)
 
 	reg.Add(inst)
 
@@ -134,6 +158,7 @@ func createAndDispatch(ctx context.Context, msg sdk.Message, reg *InstanceRegist
 	// Run initial state entry_actions
 	initialState := inst.findState(def.InitialState)
 	if initialState != nil {
+		log.Printf("wf: create running entry_actions instance_id=%s state=%s actions=%d", instanceID, initialState.Name, len(initialState.EntryActions))
 		inst.executeActions(ctx, initialState.EntryActions, msg, actx)
 	}
 
@@ -141,6 +166,14 @@ func createAndDispatch(ctx context.Context, msg sdk.Message, reg *InstanceRegist
 	inst.CurrentTraceID = ""
 	if err := store.UpdateInstance(ctx, mustToRow(inst, actx.Clock)); err != nil {
 		log.Printf("instance %s: persist after creation: %v", instanceID, err)
+	} else {
+		log.Printf(
+			"wf: create finalized instance_id=%s state=%s status=%s terminated=%t",
+			instanceID,
+			inst.CurrentState,
+			inst.Status,
+			inst.TerminatedAtMS != nil,
+		)
 	}
 
 	return nil
@@ -178,6 +211,14 @@ func sendErrorResponse(ctx context.Context, msg sdk.Message, code, detail string
 	if replyTo == "" {
 		return nil
 	}
+	log.Printf(
+		"wf: sending error response code=%s detail=%q reply_to=%s trace_id=%s src_l2=%q",
+		code,
+		detail,
+		replyTo,
+		msg.Routing.TraceID,
+		msg.SourceL2Name(),
+	)
 	payload, _ := sdk.MarshalPayload(map[string]any{
 		"ok":     false,
 		"error":  code,
@@ -198,4 +239,23 @@ func sendErrorResponse(ctx context.Context, msg sdk.Message, code, detail string
 		Payload: payload,
 	}
 	return actx.Dispatcher.SendMsg(resp)
+}
+
+func derefStringPtr(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func payloadPreview(raw []byte) string {
+	if len(raw) == 0 {
+		return "{}"
+	}
+	const maxLen = 240
+	text := strings.TrimSpace(string(raw))
+	if len(text) <= maxLen {
+		return text
+	}
+	return text[:maxLen] + "...(truncated)"
 }
