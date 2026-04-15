@@ -115,7 +115,8 @@ Estado actual:
 - `IO.api` ya es tenant-scoped por API key.
 - `tenant_hint` ya no forma parte del contrato HTTP.
 - `by_ilk` ya no esta bloqueado como `not_implemented`.
-- el consumer no conversacional de `frontdesk_result` sigue pendiente.
+- `IO.api` ya construye `frontdesk_handoff` y consume `frontdesk_result` cuando el destino es `SY.frontdesk.gov`.
+- el pendiente principal de `IO.api` paso a ser validacion funcional real del flujo end-to-end.
 
 ---
 
@@ -188,14 +189,15 @@ Estado actual:
 - `SY.frontdesk.gov` ya acepta `payload.type = "frontdesk_handoff"` y `payload.type = "text"`.
 - el handoff estructurado ya sigue una via deterministica y devuelve `frontdesk_result`.
 - el camino conversacional ya devuelve `frontdesk_result` en lugar de `text/v1`.
-- quedan pendientes la validacion en Linux y el refinamiento fino de algunos `result_code` conversacionales.
+- validado en Linux con `cargo test -p sy-frontdesk-gov`.
+- quedan pendientes el refinamiento fino de algunos `result_code` conversacionales y la validacion funcional real del handoff.
 
 ---
 
 ## 6. Consumidores de `frontdesk_result`
 
 - [x] Ajustar nodos conversacionales para leer `human_message` desde `frontdesk_result`.
-- [ ] Ajustar nodos no conversacionales para consumir el bloque estructurado de `frontdesk_result`.
+- [x] Ajustar nodos no conversacionales para consumir el bloque estructurado de `frontdesk_result`.
 
 Archivos tocados:
 
@@ -203,7 +205,7 @@ Archivos tocados:
 
 Pendiente principal:
 
-- `IO.api` debe construir `frontdesk_handoff` y consumir `frontdesk_result`.
+- validar el comportamiento real `IO.api -> SY.frontdesk.gov -> frontdesk_result` con requests E2E.
 
 ---
 
@@ -213,11 +215,11 @@ Pendiente principal:
 - [x] Actualizar `docs/io/io-api-http-contract-examples.md`.
 - [x] Actualizar el runbook operativo/validacion de `IO.api`.
 - [x] Actualizar checklist y documentos onworking de multitenant / handoff.
-- [ ] Actualizar documentacion formal de `SY.frontdesk.gov` para:
-- [ ] `register_automatic`
-- [ ] `frontdesk_handoff`
-- [ ] `frontdesk_result`
-- [ ] reemplazo de `text/v1` como salida canonica
+- [x] Actualizar documentacion formal de `SY.frontdesk.gov` para:
+- [x] `register_automatic`
+- [x] `frontdesk_handoff`
+- [x] `frontdesk_result`
+- [x] reemplazo de `text/v1` como salida canonica
 - [x] Dejar explicito en docs:
 - [x] el tenant sale de la API key
 - [x] `tenant_hint` ya no existe en `IO.api`
@@ -239,8 +241,8 @@ Pendiente documental:
 - [x] `cargo test -p io-slack` en Linux
 - [x] `cargo test -p io-api` en Linux
 - [x] `cargo test -p io-sim` en Linux
-- [ ] `cargo test -p sy-frontdesk-gov` en Linux
-- [ ] `cargo test` en `nodes/gov/common` en Linux
+- [x] `cargo test -p sy-frontdesk-gov` en Linux
+- [x] `cargo test` en `nodes/gov/common` en Linux
 
 Nota:
 
@@ -264,9 +266,12 @@ Nota:
 
 ## 10. Proximo corte de trabajo
 
-- [ ] Conectar `IO.api` para construir `frontdesk_handoff` cuando corresponda.
-- [ ] Conectar `IO.api` para consumir `frontdesk_result` y exponerlo por HTTP sin asumir canal conversacional.
-- [ ] Correr tests de `sy-frontdesk-gov` en Linux.
+- [ ] Ejecutar validacion E2E real de `IO.api -> SY.frontdesk.gov`.
+- [ ] Verificar mapping HTTP de `frontdesk_result` para:
+- [ ] `ok`
+- [ ] `needs_input`
+- [ ] `error`
+- [ ] Ajustar warnings menores restantes (`unused variable` / `dead_code`) si se decide limpiar.
 - [ ] Actualizar spec formal de `SY.frontdesk.gov`.
 - [ ] Revaluar el gap de core si `ILK_PROVISION` agrega `tenant_id`.
 
@@ -277,6 +282,6 @@ Nota:
 - [x] Bloque 1: helpers SHM en `fluxbee_sdk`
 - [ ] Bloque 2: pipeline tenant-aware en `io-common`
 - [x] Bloque 3: auth + contrato en `IO.api`
-- [~] Bloque 4: handoff y registro en `SY.frontdesk.gov`
+- [x] Bloque 4: handoff y registro base en `SY.frontdesk.gov`
 - [ ] Bloque 5: documentacion formal de `SY.frontdesk.gov`
 - [ ] Bloque 6: validacion final E2E

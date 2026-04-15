@@ -73,6 +73,7 @@ mod tests {
 
     fn sample_payload(status: &str, result_code: &str) -> FrontdeskResultPayload {
         FrontdeskResultPayload {
+            payload_type: "frontdesk_result".to_string(),
             schema_version: 1,
             status: status.to_string(),
             result_code: result_code.to_string(),

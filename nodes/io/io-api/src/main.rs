@@ -1554,7 +1554,7 @@ fn build_frontdesk_handoff_request(
         .get("attributes")
         .and_then(Value::as_object)
         .cloned();
-    let thread_id = parsed
+    let _thread_id = parsed
         .io_context
         .conversation
         .thread_id
