@@ -38,10 +38,12 @@ pub use cognition::{
 pub use identity::{
     identity_shm_name_for_hive, identity_system_call, identity_system_call_ok,
     list_ich_options_from_hive_config, list_ich_options_from_hive_id,
-    list_ich_options_from_shm_name, load_hive_id, provision_ilk, resolve_ilk_from_hive_config,
-    resolve_ilk_from_hive_id, resolve_ilk_from_shm_name, IdentityError, IdentityIchOption,
-    IdentityIlkOption, IdentityShmError, IdentitySystemRequest, IdentitySystemResult,
-    IlkProvisionRequest, IlkProvisionResult, MSG_IDENTITY_METRICS, MSG_ILK_ADD_CHANNEL,
+    list_ich_options_from_shm_name, load_hive_id, provision_ilk,
+    resolve_identity_option_from_hive_config, resolve_identity_option_from_hive_id,
+    resolve_identity_option_from_shm_name, resolve_ilk_from_hive_config, resolve_ilk_from_hive_id,
+    resolve_ilk_from_shm_name, IdentityError, IdentityIchOption, IdentityIlkOption,
+    IdentityShmError, IdentitySystemRequest, IdentitySystemResult, IlkProvisionRequest,
+    IlkProvisionResult, ResolvedIdentityOption, MSG_IDENTITY_METRICS, MSG_ILK_ADD_CHANNEL,
     MSG_ILK_PROVISION, MSG_ILK_REGISTER, MSG_ILK_UPDATE, MSG_TNT_APPROVE, MSG_TNT_CREATE,
 };
 pub use managed_node::{

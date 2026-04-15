@@ -163,10 +163,8 @@ pub async fn strict_provision_ilk(
             "address": normalized_address,
         }),
     };
-    sender
-        .send(req)
-        .await
-        .map_err(|_| IdentityError::Unavailable)?;
+    let mut inbox = inbox.lock().await;
+    sender.send(req).await.map_err(|_| IdentityError::Unavailable)?;
     tracing::debug!(
         trace_id = %trace_id,
         target = %target,
@@ -175,10 +173,7 @@ pub async fn strict_provision_ilk(
         "identity provision request sent"
     );
 
-    let msg = {
-        let mut inbox = inbox.lock().await;
-        inbox.recv_for_trace_id(&trace_id, config.timeout).await?
-    };
+    let msg = inbox.recv_for_trace_id(&trace_id, config.timeout).await?;
     tracing::debug!(
         trace_id = %trace_id,
         target = %target,

@@ -1,3 +1,5 @@
+pub mod frontdesk_contract;
+
 use std::path::PathBuf;
 use std::time::Duration;
 

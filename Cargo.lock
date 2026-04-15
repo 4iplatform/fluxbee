@@ -2306,6 +2306,7 @@ name = "gov-common"
 version = "0.1.0"
 dependencies = [
  "fluxbee-sdk",
+ "serde",
  "serde_json",
  "uuid",
 ]

@@ -222,6 +222,185 @@ Notas:
 }
 ```
 
+### 3.3 Excepcion: regularizacion por `SY.frontdesk.gov`
+
+Si `IO.api` detecta que el sujeto de `explicit_subject by_data` no esta registrado completamente, intermedia `SY.frontdesk.gov` antes de continuar al `dst_final`.
+
+Matriz resumida:
+
+- `frontdesk_result.status = "ok"` -> `202 Accepted` despues de continuar el mensaje original al `dst_final`
+- `frontdesk_result.status = "needs_input"` -> `422 Unprocessable Entity`
+- `frontdesk_result.status = "error"` y `result_code = "INVALID_REQUEST"` -> `422 Unprocessable Entity`
+- `frontdesk_result.status = "error"` y `result_code = "IDENTITY_UNAVAILABLE"` -> `503 Service Unavailable`
+- `frontdesk_result.status = "error"` y `result_code = "REGISTER_FAILED"` -> `502 Bad Gateway`
+- timeout esperando reply de frontdesk -> `504 Gateway Timeout`
+- payload de reply invalido -> `502 Bad Gateway`
+- fallo de transporte hacia router/frontdesk -> `503 Service Unavailable`
+- cierre inesperado del waiter de reply -> `503 Service Unavailable`
+
+Caso `needs_input`:
+
+```http
+422 Unprocessable Entity
+```
+
+```json
+{
+  "type": "frontdesk_result",
+  "schema_version": 1,
+  "status": "needs_input",
+  "result_code": "MISSING_REQUIRED_FIELDS",
+  "human_message": "Necesito tu email para continuar.",
+  "missing_fields": ["email"],
+  "error_code": null,
+  "error_detail": null,
+  "ilk_id": "ilk:123",
+  "tenant_id": "tnt:acme",
+  "registration_status": "temporary"
+}
+```
+
+Caso `ok`:
+
+```http
+202 Accepted
+```
+
+```json
+{
+  "ilk_id": "ilk:123",
+  "node_name": "IO.api.support@motherbee",
+  "relay_status": "flushed_immediately",
+  "request_id": "req_01JXYZ...",
+  "status": "accepted",
+  "trace_id": "4c66b54c-9d53-4b44-8eb0-c9f88f8f4c1e"
+}
+```
+
+En este caso, `IO.api` ya recibio `frontdesk_result.status = "ok"` internamente y luego continuo el mensaje original al `dst_final`.
+
+Caso `error` por request invalido de frontdesk:
+
+```http
+422 Unprocessable Entity
+```
+
+```json
+{
+  "type": "frontdesk_result",
+  "schema_version": 1,
+  "status": "error",
+  "result_code": "INVALID_REQUEST",
+  "human_message": "No pude procesar el registro con los datos recibidos.",
+  "missing_fields": [],
+  "error_code": "invalid_request",
+  "error_detail": "display_name is required",
+  "ilk_id": null,
+  "tenant_id": "tnt:acme",
+  "registration_status": "not_started"
+}
+```
+
+Caso `error` por identity unavailable reportado por frontdesk:
+
+```http
+503 Service Unavailable
+```
+
+```json
+{
+  "type": "frontdesk_result",
+  "schema_version": 1,
+  "status": "error",
+  "result_code": "IDENTITY_UNAVAILABLE",
+  "human_message": "No puedo completar el registro en este momento.",
+  "missing_fields": [],
+  "error_code": "identity_unavailable",
+  "error_detail": "SY.identity did not respond",
+  "ilk_id": null,
+  "tenant_id": "tnt:acme",
+  "registration_status": "temporary"
+}
+```
+
+Caso `error` por fallo de registro:
+
+```http
+502 Bad Gateway
+```
+
+```json
+{
+  "type": "frontdesk_result",
+  "schema_version": 1,
+  "status": "error",
+  "result_code": "REGISTER_FAILED",
+  "human_message": "No pude completar el alta.",
+  "missing_fields": [],
+  "error_code": "register_failed",
+  "error_detail": "ILK_REGISTER returned failure",
+  "ilk_id": "ilk:123",
+  "tenant_id": "tnt:acme",
+  "registration_status": "temporary"
+}
+```
+
+Caso timeout esperando `frontdesk_result`:
+
+```http
+504 Gateway Timeout
+```
+
+```json
+{
+  "status": "error",
+  "error_code": "frontdesk_timeout",
+  "error_message": "Timed out waiting for frontdesk reply"
+}
+```
+
+Caso payload invalido en la reply de frontdesk:
+
+```http
+502 Bad Gateway
+```
+
+```json
+{
+  "status": "error",
+  "error_code": "invalid_frontdesk_response",
+  "error_message": "Frontdesk reply did not match frontdesk_result contract"
+}
+```
+
+Caso fallo de transporte hacia router/frontdesk:
+
+```http
+503 Service Unavailable
+```
+
+```json
+{
+  "status": "error",
+  "error_code": "router_unavailable",
+  "error_message": "Unable to dispatch request to router/frontdesk"
+}
+```
+
+Caso cierre inesperado del waiter de frontdesk:
+
+```http
+503 Service Unavailable
+```
+
+```json
+{
+  "status": "error",
+  "error_code": "frontdesk_unavailable",
+  "error_message": "Frontdesk reply waiter closed unexpectedly"
+}
+```
+
 #### Payload demasiado grande
 
 ```http
@@ -553,6 +732,58 @@ Cuando `by_data` resuelve un sujeto existente o crea uno nuevo, la respuesta HTT
 ```
 
 El codigo de exito recomendado sigue siendo `202 Accepted` tambien en `explicit_subject`, para mantener semantica uniforme de ingress.
+
+## 6.8 Regularizacion automatica via frontdesk
+
+Si `IO.api` detecta que el sujeto de `explicit_subject by_data` sigue `temporary`, hace handoff automatico a frontdesk antes de continuar al `dst_final`.
+
+Ejemplo de request:
+
+```json
+{
+  "subject": {
+    "external_user_id": "crm:client-12345",
+    "display_name": "Juan Perez",
+    "email": "juan@acme.com",
+    "company_name": "Acme Support",
+    "attributes": {
+      "crm_customer_id": "crm:client-12345"
+    }
+  },
+  "message": {
+    "text": "Necesito ayuda con mi alta",
+    "external_message_id": "crm-msg-998877"
+  },
+  "options": {
+    "routing": {
+      "dst_node": "AI.chat@motherbee"
+    },
+    "metadata": {
+      "source_system": "crm-dotnet"
+    }
+  }
+}
+```
+
+Comportamiento esperado:
+
+1. `IO.api` resuelve/provisiona `src_ilk`
+2. si el sujeto sigue `temporary`, construye `frontdesk_handoff`
+3. envia el handoff a `SY.frontdesk.gov`
+4. espera `frontdesk_result`
+5. si `frontdesk_result.status = "ok"`, continua luego el mensaje original a `AI.chat@motherbee` y responde `202 Accepted`
+6. si `frontdesk_result.status = "needs_input"` o `error`, responde con ese payload estructurado
+
+## 6.9 Camino tecnico con `dst_node = SY.frontdesk.gov`
+
+Si el caller fija explicitamente `options.routing.dst_node = "SY.frontdesk.gov@..."`, `IO.api` conserva un camino tecnico/terminal:
+
+1. construye `frontdesk_handoff`
+2. envia el handoff a `SY.frontdesk.gov`
+3. espera `frontdesk_result`
+4. responde HTTP con ese payload estructurado
+
+Ese camino sirve para debug y validacion puntual, no como flujo canonico de producto.
 
 ---
 
