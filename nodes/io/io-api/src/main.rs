@@ -1572,6 +1572,8 @@ async fn request_frontdesk_handoff_for_http(
 ) -> Result<io_common::frontdesk_contract::FrontdeskResultPayload, Response> {
     let trace_id = io_common::router_message::new_trace_id();
     let thread_id = parsed.io_context.conversation.thread_id.clone();
+    let frontdesk_src_ilk = frontdesk.src_ilk.clone();
+    let frontdesk_node = frontdesk.dst_node.clone();
     let context = serde_json::json!({
         "io": {
             "channel": parsed.io_context.channel,
@@ -1607,8 +1609,8 @@ async fn request_frontdesk_handoff_for_http(
 
     tracing::debug!(
         %trace_id,
-        frontdesk_src_ilk = %frontdesk.src_ilk,
-        frontdesk_node = %frontdesk.dst_node,
+        frontdesk_src_ilk = %frontdesk_src_ilk,
+        frontdesk_node = %frontdesk_node,
         timeout_ms = state.identity_provision_cfg.timeout.as_millis() as u64,
         "io-api waiting for frontdesk_result via router inbox"
     );
