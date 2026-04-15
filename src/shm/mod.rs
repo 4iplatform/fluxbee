@@ -27,7 +27,7 @@ pub const OPA_VERSION: u32 = 1;
 pub const OPA_MAX_WASM_SIZE: usize = 4 * 1024 * 1024;
 
 pub const IDENTITY_MAGIC: u32 = 0x4A534944; // "JSID"
-pub const IDENTITY_VERSION: u32 = 2;
+pub const IDENTITY_VERSION: u32 = 3;
 pub const MEMORY_MAGIC: u32 = 0x4A534D4D; // "JSMM"
 pub const MEMORY_VERSION: u32 = 1;
 pub const MEMORY_MAX_DATA_SIZE: usize = 4 * 1024 * 1024;
@@ -389,8 +389,9 @@ pub struct IchMappingEntry {
     pub address: [u8; ICH_ADDRESS_MAX_LEN],
     pub ich_id: [u8; 16],
     pub ilk_id: [u8; 16],
+    pub tenant_id: [u8; 16],
     pub flags: u16,
-    pub _reserved: [u8; 54],
+    pub _reserved: [u8; 38],
 }
 
 #[repr(C)]
@@ -1522,6 +1523,7 @@ impl IdentityRegionWriter {
         address: &str,
         ich_id: [u8; 16],
         ilk_id: [u8; 16],
+        tenant_id: [u8; 16],
     ) -> Result<(), ShmError> {
         if channel_type.len() > ICH_CHANNEL_TYPE_MAX_LEN {
             return Err(ShmError::ValueTooLong {
@@ -1538,10 +1540,10 @@ impl IdentityRegionWriter {
         let (header, _tenants, _ilks, _ichs, mappings, _aliases, _vocabulary) =
             identity_header_and_entries_mut(&mut self.mmap, &self.layout)
                 .ok_or(ShmError::InvalidHeader)?;
-        let hash = compute_ich_hash(channel_type, address);
+        let hash = compute_ich_hash(channel_type, address, tenant_id);
         let _write_guard = SeqlockWriteGuard::new(&header.seq);
         let result =
-            upsert_ich_mapping_entry(mappings, hash, channel_type, address, ich_id, ilk_id);
+            upsert_ich_mapping_entry(mappings, hash, channel_type, address, ich_id, ilk_id, tenant_id);
         if let Ok(inserted) = result {
             if inserted {
                 header.ich_mapping_count = header.ich_mapping_count.saturating_add(1);
@@ -1729,11 +1731,12 @@ impl IdentityRegionWriter {
                     }
                     let inserted = upsert_ich_mapping_entry(
                         mappings,
-                        compute_ich_hash(&channel_type, &address),
+                        compute_ich_hash(&channel_type, &address, ilk.tenant_id),
                         &channel_type,
                         &address,
                         entry.ich_id,
                         entry.ilk_id,
+                        ilk.tenant_id,
                     )?;
                     if inserted {
                         header.ich_mapping_count = header.ich_mapping_count.saturating_add(1);
@@ -1838,13 +1841,14 @@ impl IdentityRegionWriter {
         &mut self,
         channel_type: &str,
         address: &str,
+        tenant_id: [u8; 16],
     ) -> Result<bool, ShmError> {
         let (header, _tenants, _ilks, _ichs, mappings, _aliases, _vocabulary) =
             identity_header_and_entries_mut(&mut self.mmap, &self.layout)
                 .ok_or(ShmError::InvalidHeader)?;
-        let hash = compute_ich_hash(channel_type, address);
+        let hash = compute_ich_hash(channel_type, address, tenant_id);
         let _write_guard = SeqlockWriteGuard::new(&header.seq);
-        let removed = remove_ich_mapping_entry(mappings, hash, channel_type, address);
+        let removed = remove_ich_mapping_entry(mappings, hash, channel_type, address, tenant_id);
         if removed {
             header.ich_mapping_count = header.ich_mapping_count.saturating_sub(1);
             header.updated_at = now_epoch_ms();
@@ -1857,6 +1861,7 @@ impl IdentityRegionWriter {
         &self,
         channel_type: &str,
         address: &str,
+        tenant_id: [u8; 16],
     ) -> Option<([u8; 16], [u8; 16])> {
         let header = self.header_ref()?;
         resolve_ich_mapping_from_region(
@@ -1865,6 +1870,7 @@ impl IdentityRegionWriter {
             &self.layout,
             channel_type,
             address,
+            tenant_id,
         )
     }
 
@@ -1951,6 +1957,7 @@ impl IdentityRegionReader {
         &self,
         channel_type: &str,
         address: &str,
+        tenant_id: [u8; 16],
     ) -> Option<([u8; 16], [u8; 16])> {
         let header = self.header_ref()?;
         resolve_ich_mapping_from_region(
@@ -1959,6 +1966,7 @@ impl IdentityRegionReader {
             &self.layout,
             channel_type,
             address,
+            tenant_id,
         )
     }
 
@@ -2137,7 +2145,7 @@ pub fn copy_bytes_with_len(dst: &mut [u8], src: &str) -> usize {
     len
 }
 
-pub fn compute_ich_hash(channel_type: &str, address: &str) -> u64 {
+pub fn compute_ich_hash(channel_type: &str, address: &str, tenant_id: [u8; 16]) -> u64 {
     // FNV-1a 64-bit, deterministic across processes/hives.
     const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
@@ -2152,6 +2160,13 @@ pub fn compute_ich_hash(channel_type: &str, address: &str) -> u64 {
     hash = hash.wrapping_mul(FNV_PRIME);
     for b in address.as_bytes() {
         hash ^= *b as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    // Second delimiter + tenant_id bytes.
+    hash ^= 0xfe;
+    hash = hash.wrapping_mul(FNV_PRIME);
+    for b in tenant_id {
+        hash ^= b as u64;
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
@@ -2927,6 +2942,7 @@ fn resolve_ich_mapping_from_region(
     layout: &IdentityRegionLayout,
     channel_type: &str,
     address: &str,
+    tenant_id: [u8; 16],
 ) -> Option<([u8; 16], [u8; 16])> {
     let start = Instant::now();
     loop {
@@ -2944,7 +2960,7 @@ fn resolve_ich_mapping_from_region(
             layout.ich_mapping_offset,
             layout.limits.max_ich_mappings() as usize,
         )?;
-        let resolved = resolve_ich_mapping_from_entries(mappings, channel_type, address);
+        let resolved = resolve_ich_mapping_from_entries(mappings, channel_type, address, tenant_id);
         atomic::fence(Ordering::Acquire);
         let s2 = header.seq.load(Ordering::Acquire);
         if s1 == s2 {
@@ -3326,6 +3342,7 @@ fn upsert_ich_mapping_entry(
     address: &str,
     ich_id: [u8; 16],
     ilk_id: [u8; 16],
+    tenant_id: [u8; 16],
 ) -> Result<bool, ShmError> {
     let table_len = mappings.len();
     if table_len == 0 {
@@ -3347,6 +3364,7 @@ fn upsert_ich_mapping_entry(
                 address,
                 ich_id,
                 ilk_id,
+                tenant_id,
             );
             return Ok(true);
         }
@@ -3358,6 +3376,7 @@ fn upsert_ich_mapping_entry(
         }
         if flags & ICH_MAP_FLAG_OCCUPIED != 0
             && mappings[idx].hash == hash
+            && mappings[idx].tenant_id == tenant_id
             && fixed_str_matches(&mappings[idx].channel_type, channel_type)
             && fixed_str_matches(&mappings[idx].address, address)
         {
@@ -3368,6 +3387,7 @@ fn upsert_ich_mapping_entry(
                 address,
                 ich_id,
                 ilk_id,
+                tenant_id,
             );
             return Ok(false);
         }
@@ -3381,6 +3401,7 @@ fn upsert_ich_mapping_entry(
             address,
             ich_id,
             ilk_id,
+            tenant_id,
         );
         return Ok(true);
     }
@@ -3393,6 +3414,7 @@ fn remove_ich_mapping_entry(
     hash: u64,
     channel_type: &str,
     address: &str,
+    tenant_id: [u8; 16],
 ) -> bool {
     let table_len = mappings.len();
     if table_len == 0 {
@@ -3413,6 +3435,7 @@ fn remove_ich_mapping_entry(
             && mappings[idx].hash == hash
             && fixed_str_matches(&mappings[idx].channel_type, channel_type)
             && fixed_str_matches(&mappings[idx].address, address)
+            && mappings[idx].tenant_id == tenant_id
         {
             mappings[idx] = empty_ich_mapping_entry();
             mappings[idx].hash = hash;
@@ -3428,12 +3451,13 @@ fn resolve_ich_mapping_from_entries(
     mappings: &[IchMappingEntry],
     channel_type: &str,
     address: &str,
+    tenant_id: [u8; 16],
 ) -> Option<([u8; 16], [u8; 16])> {
     let table_len = mappings.len();
     if table_len == 0 {
         return None;
     }
-    let hash = compute_ich_hash(channel_type, address);
+    let hash = compute_ich_hash(channel_type, address, tenant_id);
     let start = (hash as usize) % table_len;
 
     for probe in 0..table_len {
@@ -3450,6 +3474,7 @@ fn resolve_ich_mapping_from_entries(
             && entry.hash == hash
             && fixed_str_matches(&entry.channel_type, channel_type)
             && fixed_str_matches(&entry.address, address)
+            && entry.tenant_id == tenant_id
         {
             return Some((entry.ich_id, entry.ilk_id));
         }
@@ -3465,6 +3490,7 @@ fn write_ich_mapping_entry(
     address: &str,
     ich_id: [u8; 16],
     ilk_id: [u8; 16],
+    tenant_id: [u8; 16],
 ) {
     *entry = empty_ich_mapping_entry();
     entry.hash = hash;
@@ -3472,6 +3498,7 @@ fn write_ich_mapping_entry(
     copy_bytes_with_len(&mut entry.address, address);
     entry.ich_id = ich_id;
     entry.ilk_id = ilk_id;
+    entry.tenant_id = tenant_id;
     entry.flags = ICH_MAP_FLAG_OCCUPIED;
 }
 
@@ -3659,8 +3686,9 @@ fn empty_ich_mapping_entry() -> IchMappingEntry {
         address: [0u8; ICH_ADDRESS_MAX_LEN],
         ich_id: [0u8; 16],
         ilk_id: [0u8; 16],
+        tenant_id: [0u8; 16],
         flags: 0,
-        _reserved: [0u8; 54],
+        _reserved: [0u8; 38],
     }
 }
 
@@ -3818,34 +3846,35 @@ mod tests {
         let ich_b = [3u8; 16];
         let ilk_b = [4u8; 16];
 
+        let tenant = [0u8; 16];
         writer
-            .upsert_ich_mapping(channel, address, ich_a, ilk_a)
+            .upsert_ich_mapping(channel, address, ich_a, ilk_a, tenant)
             .expect("insert mapping");
         let snap = writer.read_snapshot().expect("snapshot");
         assert_eq!(snap.header.ich_mapping_count, 1);
         assert_eq!(
-            writer.resolve_ich_mapping(channel, address),
+            writer.resolve_ich_mapping(channel, address, tenant),
             Some((ich_a, ilk_a))
         );
 
         writer
-            .upsert_ich_mapping(channel, address, ich_b, ilk_b)
+            .upsert_ich_mapping(channel, address, ich_b, ilk_b, tenant)
             .expect("update mapping");
         let snap = writer.read_snapshot().expect("snapshot");
         assert_eq!(snap.header.ich_mapping_count, 1);
         assert_eq!(
-            writer.resolve_ich_mapping(channel, address),
+            writer.resolve_ich_mapping(channel, address, tenant),
             Some((ich_b, ilk_b))
         );
 
         assert!(writer
-            .remove_ich_mapping(channel, address)
+            .remove_ich_mapping(channel, address, tenant)
             .expect("remove mapping"));
         let snap = writer.read_snapshot().expect("snapshot");
         assert_eq!(snap.header.ich_mapping_count, 0);
-        assert_eq!(writer.resolve_ich_mapping(channel, address), None);
+        assert_eq!(writer.resolve_ich_mapping(channel, address, tenant), None);
         assert!(!writer
-            .remove_ich_mapping(channel, address)
+            .remove_ich_mapping(channel, address, tenant)
             .expect("remove missing mapping"));
 
         cleanup_shm(&name);
@@ -3865,12 +3894,13 @@ mod tests {
         let table_len = limits.max_ich_mappings() as usize;
         let channel = "whatsapp";
         let first = "slot-a";
-        let bucket = (compute_ich_hash(channel, first) as usize) % table_len;
+        let tenant = [0u8; 16];
+        let bucket = (compute_ich_hash(channel, first, tenant) as usize) % table_len;
 
         let mut colliders = vec![first.to_string()];
         for i in 0..100_000u32 {
             let candidate = format!("slot-{i}");
-            if (compute_ich_hash(channel, &candidate) as usize) % table_len == bucket {
+            if (compute_ich_hash(channel, &candidate, tenant) as usize) % table_len == bucket {
                 colliders.push(candidate);
                 if colliders.len() > table_len {
                     break;
@@ -3888,7 +3918,7 @@ mod tests {
 
         for (idx, address) in colliders.iter().take(table_len).enumerate() {
             writer
-                .upsert_ich_mapping(channel, address, [idx as u8; 16], [200u8 + idx as u8; 16])
+                .upsert_ich_mapping(channel, address, [idx as u8; 16], [200u8 + idx as u8; 16], tenant)
                 .expect("fill table");
         }
         assert_eq!(
@@ -3901,12 +3931,12 @@ mod tests {
         );
 
         let overflow =
-            writer.upsert_ich_mapping(channel, &colliders[table_len], [250u8; 16], [251u8; 16]);
+            writer.upsert_ich_mapping(channel, &colliders[table_len], [250u8; 16], [251u8; 16], tenant);
         assert!(matches!(overflow, Err(ShmError::SlotFull)));
 
-        assert!(writer.remove_ich_mapping(channel, first).expect("remove A"));
+        assert!(writer.remove_ich_mapping(channel, first, tenant).expect("remove A"));
         writer
-            .upsert_ich_mapping(channel, &colliders[table_len], [12u8; 16], [13u8; 16])
+            .upsert_ich_mapping(channel, &colliders[table_len], [12u8; 16], [13u8; 16], tenant)
             .expect("insert B");
         assert_eq!(
             writer
@@ -3917,7 +3947,7 @@ mod tests {
             table_len
         );
         assert_eq!(
-            writer.resolve_ich_mapping(channel, &colliders[table_len]),
+            writer.resolve_ich_mapping(channel, &colliders[table_len], tenant),
             Some(([12u8; 16], [13u8; 16]))
         );
 
@@ -3992,7 +4022,7 @@ mod tests {
             .replace_ich_entries_for_ilk(ilk_id, &[ich])
             .expect("replace ich entries");
         writer
-            .upsert_ich_mapping("io.test.demo", "addr-1", ich_id, ilk_id)
+            .upsert_ich_mapping("io.test.demo", "addr-1", ich_id, ilk_id, tenant_id)
             .expect("upsert mapping");
 
         let alias = IlkAliasEntry {
@@ -4011,7 +4041,7 @@ mod tests {
         assert_eq!(snap.header.ilk_alias_count, 1);
         assert_eq!(snap.header.ich_mapping_count, 1);
         assert_eq!(
-            writer.resolve_ich_mapping("io.test.demo", "addr-1"),
+            writer.resolve_ich_mapping("io.test.demo", "addr-1", tenant_id),
             Some((ich_id, ilk_id))
         );
 
@@ -4031,7 +4061,7 @@ mod tests {
         assert_eq!(snap.header.ich_count, 0);
         assert_eq!(snap.header.ilk_alias_count, 0);
         assert_eq!(snap.header.ich_mapping_count, 0);
-        assert_eq!(writer.resolve_ich_mapping("io.test.demo", "addr-1"), None);
+        assert_eq!(writer.resolve_ich_mapping("io.test.demo", "addr-1", tenant_id), None);
 
         cleanup_shm(&name);
     }
@@ -4048,13 +4078,14 @@ mod tests {
         let mut writer =
             IdentityRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox", true, limits)
                 .expect("open identity region");
+        let tenant = [0u8; 16];
         writer
-            .upsert_ich_mapping("whatsapp", "+549111111", [1u8; 16], [2u8; 16])
+            .upsert_ich_mapping("whatsapp", "+549111111", [1u8; 16], [2u8; 16], tenant)
             .expect("upsert mapping");
 
         let reader = IdentityRegionReader::open_read_only_auto(&name).expect("open auto reader");
         assert_eq!(
-            reader.resolve_ich_mapping("whatsapp", "+549111111"),
+            reader.resolve_ich_mapping("whatsapp", "+549111111", tenant),
             Some(([1u8; 16], [2u8; 16]))
         );
 
@@ -4075,7 +4106,7 @@ mod tests {
             IdentityRegionWriter::open_or_create(&name, Uuid::new_v4(), "sandbox", true, limits)
                 .expect("open identity region");
         writer
-            .upsert_ich_mapping("whatsapp", "+549111111", [1u8; 16], [2u8; 16])
+            .upsert_ich_mapping("whatsapp", "+549111111", [1u8; 16], [2u8; 16], [0u8; 16])
             .expect("seed mapping");
 
         let tenant = TenantEntry {
@@ -4139,7 +4170,7 @@ mod tests {
         assert_eq!(snap.header.ich_count, 1);
         assert_eq!(snap.header.ilk_alias_count, 1);
         assert_eq!(snap.header.ich_mapping_count, 0);
-        assert_eq!(writer.resolve_ich_mapping("whatsapp", "+549111111"), None);
+        assert_eq!(writer.resolve_ich_mapping("whatsapp", "+549111111", [0u8; 16]), None);
 
         cleanup_shm(&name);
     }

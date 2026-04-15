@@ -22,6 +22,7 @@ async fn main() -> Result<(), DynError> {
     let config_dir = PathBuf::from(env_or("IO_TEST_CONFIG_DIR", "/etc/fluxbee"));
     let channel_type = env_or("IO_TEST_CHANNEL_TYPE", "io.test");
     let address = env_or("IO_TEST_ADDRESS", "io.test.default");
+    let tenant_id = env_or("IO_TEST_TENANT_ID", "");
     let allow_provision = env_bool("IO_TEST_ALLOW_PROVISION", false);
     let provision_timeout_ms = env_u64("IO_TEST_PROVISION_TIMEOUT_MS", 8_000);
     let post_provision_wait_ms = env_u64("IO_TEST_POST_PROVISION_WAIT_MS", 5_000);
@@ -31,7 +32,7 @@ async fn main() -> Result<(), DynError> {
     let mut mode = "lookup_hit".to_string();
     let mut provision_trace_id: Option<String> = None;
     let mut identity_target: Option<String> = None;
-    let lookup = resolve_ilk_from_hive_config(&config_dir, &channel_type, &address);
+    let lookup = resolve_ilk_from_hive_config(&config_dir, &channel_type, &address, &tenant_id);
     let ilk_id = match lookup {
         Ok(Some(existing)) => existing,
         Ok(None) if !allow_provision => {
@@ -65,6 +66,7 @@ async fn main() -> Result<(), DynError> {
                 &ich_id,
                 &channel_type,
                 &address,
+                &tenant_id,
                 Duration::from_millis(provision_timeout_ms),
                 env_opt("IO_TEST_IDENTITY_FALLBACK_TARGET"),
             )
@@ -72,7 +74,7 @@ async fn main() -> Result<(), DynError> {
             let _ = sender.close().await;
             provision_trace_id = Some(provisioned.trace_id.clone());
             identity_target = Some(provisioned.target);
-            wait_for_lookup_hit(&config_dir, &channel_type, &address, post_provision_wait_ms)
+            wait_for_lookup_hit(&config_dir, &channel_type, &address, &tenant_id, post_provision_wait_ms)
                 .await?
                 .unwrap_or(provisioned.ilk_id)
         }
@@ -106,6 +108,7 @@ async fn main() -> Result<(), DynError> {
                 &ich_id,
                 &channel_type,
                 &address,
+                &tenant_id,
                 Duration::from_millis(provision_timeout_ms),
                 env_opt("IO_TEST_IDENTITY_FALLBACK_TARGET"),
             )
@@ -113,7 +116,7 @@ async fn main() -> Result<(), DynError> {
             let _ = sender.close().await;
             provision_trace_id = Some(provisioned.trace_id.clone());
             identity_target = Some(provisioned.target);
-            wait_for_lookup_hit(&config_dir, &channel_type, &address, post_provision_wait_ms)
+            wait_for_lookup_hit(&config_dir, &channel_type, &address, &tenant_id, post_provision_wait_ms)
                 .await?
                 .unwrap_or(provisioned.ilk_id)
         }
@@ -147,6 +150,7 @@ async fn wait_for_lookup_hit(
     config_dir: &PathBuf,
     channel_type: &str,
     address: &str,
+    tenant_id: &str,
     max_wait_ms: u64,
 ) -> Result<Option<String>, DynError> {
     if max_wait_ms == 0 {
@@ -154,7 +158,7 @@ async fn wait_for_lookup_hit(
     }
     let deadline = Instant::now() + Duration::from_millis(max_wait_ms);
     loop {
-        match resolve_ilk_from_hive_config(config_dir, channel_type, address) {
+        match resolve_ilk_from_hive_config(config_dir, channel_type, address, tenant_id) {
             Ok(Some(ilk)) => return Ok(Some(ilk)),
             Ok(None) => {}
             Err(err) if is_lookup_unavailable(&err) => {
@@ -227,9 +231,11 @@ async fn provision_ilk_with_fallback(
     ich_id: &str,
     channel_type: &str,
     address: &str,
+    tenant_id: &str,
     timeout: Duration,
     fallback_target: Option<String>,
 ) -> Result<ProvisionOutcome, DynError> {
+    let tenant_id_opt = if tenant_id.trim().is_empty() { None } else { Some(tenant_id) };
     let first = provision_ilk(
         sender,
         receiver,
@@ -238,6 +244,7 @@ async fn provision_ilk_with_fallback(
             ich_id,
             channel_type,
             address,
+            tenant_id: tenant_id_opt,
             timeout,
         },
     )
@@ -279,6 +286,7 @@ async fn provision_ilk_with_fallback(
                     ich_id,
                     channel_type,
                     address,
+                    tenant_id: tenant_id_opt,
                     timeout,
                 },
             )
@@ -320,6 +328,7 @@ async fn provision_ilk_with_fallback(
                     ich_id,
                     channel_type,
                     address,
+                    tenant_id: tenant_id_opt,
                     timeout,
                 },
             )

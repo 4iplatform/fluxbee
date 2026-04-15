@@ -180,6 +180,8 @@ struct IlkProvisionRequest {
     ich_id: String,
     channel_type: String,
     address: String,
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,8 +299,8 @@ struct AliasRecord {
 struct IdentityStore {
     tenants: HashMap<String, TenantRecord>,
     ilks: HashMap<String, IlkRecord>,
-    // (channel_type_lower, address_lower) -> ilk_id
-    ich_lookup: HashMap<(String, String), String>,
+    // (channel_type_lower, address_lower, tenant_id_lower) -> ilk_id
+    ich_lookup: HashMap<(String, String, String), String>,
     aliases: HashMap<String, AliasRecord>,
 }
 
@@ -531,7 +533,12 @@ impl IdentityStore {
         validate_max_len("channel_type", &req.channel_type, ICH_CHANNEL_TYPE_MAX_LEN)?;
         validate_max_len("address", &req.address, ICH_ADDRESS_MAX_LEN)?;
 
-        let key = canonical_ich_key(&req.channel_type, &req.address);
+        let tenant_id = req
+            .tenant_id
+            .clone()
+            .or_else(|| self.default_tenant_id())
+            .ok_or_else(|| "missing default tenant".to_string())?;
+        let key = canonical_ich_key(&req.channel_type, &req.address, &tenant_id);
         if let Some(existing) = self.ich_lookup.get(&key) {
             let status = self
                 .ilks
@@ -546,9 +553,6 @@ impl IdentityStore {
         }
 
         let ilk_id = format!("ilk:{}", Uuid::new_v4());
-        let tenant_id = self
-            .default_tenant_id()
-            .ok_or_else(|| "missing default tenant".to_string())?;
 
         let ilk = IlkRecord {
             ilk_id: ilk_id.clone(),
@@ -659,7 +663,7 @@ impl IdentityStore {
             return Err("ILK_NOT_FOUND".to_string());
         }
 
-        let key = canonical_ich_key(&req.channel.channel_type, &req.channel.address);
+        let key = canonical_ich_key(&req.channel.channel_type, &req.channel.address, &target.tenant_id);
         self.ich_lookup.insert(key, canonical_ilk_id.clone());
 
         let already = target
@@ -687,10 +691,11 @@ impl IdentityStore {
                 return Err("INVALID_MERGE_SOURCE".to_string());
             }
 
+            let source_tenant_id = source.tenant_id.clone();
             let source_channels = source.channels.clone();
-            let source_keys: Vec<(String, String)> = source_channels
+            let source_keys: Vec<(String, String, String)> = source_channels
                 .iter()
-                .map(|ch| canonical_ich_key(&ch.channel_type, &ch.address))
+                .map(|ch| canonical_ich_key(&ch.channel_type, &ch.address, &source_tenant_id))
                 .collect();
 
             let canonical = self
@@ -745,7 +750,7 @@ impl IdentityStore {
 
         for ch in &req.add_channels {
             validate_channel_input(ch)?;
-            let key = canonical_ich_key(&ch.channel_type, &ch.address);
+            let key = canonical_ich_key(&ch.channel_type, &ch.address, &entry.tenant_id);
             self.ich_lookup.insert(key, req.ilk_id.clone());
             let exists = entry.channels.iter().any(|c| c.ich_id == ch.ich_id);
             if !exists {
@@ -939,7 +944,7 @@ impl IdentityStore {
                 continue;
             }
             for channel in &ilk.channels {
-                let key = canonical_ich_key(&channel.channel_type, &channel.address);
+                let key = canonical_ich_key(&channel.channel_type, &channel.address, &ilk.tenant_id);
                 store.ich_lookup.insert(key, ilk_id.clone());
             }
         }
@@ -961,7 +966,7 @@ impl IdentityStore {
                     .retain(|_, mapped_ilk| mapped_ilk != &ilk_id);
                 if ilk.deleted_at_ms.is_none() {
                     for channel in &ilk.channels {
-                        let key = canonical_ich_key(&channel.channel_type, &channel.address);
+                        let key = canonical_ich_key(&channel.channel_type, &channel.address, &ilk.tenant_id);
                         self.ich_lookup.insert(key, ilk_id.clone());
                     }
                 }
@@ -2122,7 +2127,7 @@ fn sync_identity_shm_mappings(
         tenant_entries.push(entry);
     }
 
-    let mut channel_to_ich: HashMap<(String, String), [u8; 16]> = HashMap::new();
+    let mut channel_to_ich: HashMap<(String, String, String), [u8; 16]> = HashMap::new();
     let mut ilk_ids: Vec<String> = store.ilks.keys().cloned().collect();
     ilk_ids.sort_unstable();
     for ilk_id in ilk_ids {
@@ -2179,7 +2184,10 @@ fn sync_identity_shm_mappings(
             copy_bytes_with_len(&mut ich_entry.address, &address);
             ich_entries.push(ich_entry);
             ich_count = ich_count.saturating_add(1);
-            channel_to_ich.insert((channel_type, address), *ich_uuid.as_bytes());
+            channel_to_ich.insert(
+                (channel_type, address, ilk.tenant_id.trim().to_ascii_lowercase()),
+                *ich_uuid.as_bytes(),
+            );
         }
 
         let mut ilk_entry = IlkEntry {
@@ -2255,12 +2263,12 @@ fn sync_identity_shm_mappings(
     )?;
 
     let mut mapped_channels = 0u64;
-    let mut lookup_keys: Vec<(String, String)> = store.ich_lookup.keys().cloned().collect();
+    let mut lookup_keys: Vec<(String, String, String)> = store.ich_lookup.keys().cloned().collect();
     lookup_keys.sort_unstable();
-    for (channel_type, address) in lookup_keys {
+    for (channel_type, address, tenant_id_key) in lookup_keys {
         let Some(ilk_id) = store
             .ich_lookup
-            .get(&(channel_type.clone(), address.clone()))
+            .get(&(channel_type.clone(), address.clone(), tenant_id_key.clone()))
         else {
             continue;
         };
@@ -2269,7 +2277,7 @@ fn sync_identity_shm_mappings(
             continue;
         };
         let Some(ich_id) = channel_to_ich
-            .get(&(channel_type.clone(), address.clone()))
+            .get(&(channel_type.clone(), address.clone(), tenant_id_key.clone()))
             .copied()
         else {
             tracing::warn!(
@@ -2280,9 +2288,23 @@ fn sync_identity_shm_mappings(
             );
             continue;
         };
-        if let Err(err) =
-            writer.upsert_ich_mapping(&channel_type, &address, ich_id, *ilk_uuid.as_bytes())
-        {
+        let Some(ilk_record) = store.ilks.get(ilk_id) else {
+            continue;
+        };
+        let Ok(tenant_uuid) = parse_prefixed_uuid(&ilk_record.tenant_id, "tnt") else {
+            tracing::warn!(
+                ilk_id = %ilk_id,
+                "skipping invalid tenant_id during identity shm mapping sync"
+            );
+            continue;
+        };
+        if let Err(err) = writer.upsert_ich_mapping(
+            &channel_type,
+            &address,
+            ich_id,
+            *ilk_uuid.as_bytes(),
+            *tenant_uuid.as_bytes(),
+        ) {
             tracing::warn!(
                 ilk_id = %ilk_id,
                 channel_type = %channel_type,
@@ -2425,6 +2447,7 @@ fn apply_identity_shm_delta(
         }
         IdentityDelta::IlkUpsert { ilk } => {
             let ilk_uuid = parse_prefixed_uuid(&ilk.ilk_id, "ilk")?;
+            let tenant_uuid = parse_prefixed_uuid(&ilk.tenant_id, "tnt")?;
             writer.upsert_ilk_entry(ilk_entry_from_record(ilk)?)?;
             writer.clear_ich_mappings_for_ilk(*ilk_uuid.as_bytes())?;
             let ich_entries = ich_entries_from_ilk_record(ilk)?;
@@ -2437,6 +2460,7 @@ fn apply_identity_shm_delta(
                     &address,
                     entry.ich_id,
                     *ilk_uuid.as_bytes(),
+                    *tenant_uuid.as_bytes(),
                 )?;
             }
         }
@@ -3037,10 +3061,11 @@ fn map_unique_constraint_code(constraint: &str) -> &'static str {
     }
 }
 
-fn canonical_ich_key(channel_type: &str, address: &str) -> (String, String) {
+fn canonical_ich_key(channel_type: &str, address: &str, tenant_id: &str) -> (String, String, String) {
     (
         channel_type.trim().to_ascii_lowercase(),
         address.trim().to_ascii_lowercase(),
+        tenant_id.trim().to_ascii_lowercase(),
     )
 }
 
@@ -3605,7 +3630,7 @@ ORDER BY added_at ASC
                 ilk.channels.push(channel.clone());
             }
             if ilk.deleted_at_ms.is_none() {
-                let key = canonical_ich_key(&channel.channel_type, &channel.address);
+                let key = canonical_ich_key(&channel.channel_type, &channel.address, &ilk.tenant_id);
                 store.ich_lookup.insert(key, ilk_id.clone());
             }
         }

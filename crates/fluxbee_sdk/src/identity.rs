@@ -29,7 +29,7 @@ pub const MSG_TNT_CREATE: &str = "TNT_CREATE";
 pub const MSG_TNT_APPROVE: &str = "TNT_APPROVE";
 pub const MSG_IDENTITY_METRICS: &str = "IDENTITY_METRICS";
 const IDENTITY_MAGIC: u32 = 0x4A534944; // "JSID"
-const IDENTITY_VERSION: u32 = 2;
+const IDENTITY_VERSION: u32 = 3;
 const REGION_ALIGNMENT: usize = 64;
 const ICH_CHANNEL_TYPE_MAX_LEN: usize = 32;
 const ICH_ADDRESS_MAX_LEN: usize = 256;
@@ -50,6 +50,7 @@ pub struct IlkProvisionRequest<'a> {
     pub ich_id: &'a str,
     pub channel_type: &'a str,
     pub address: &'a str,
+    pub tenant_id: Option<&'a str>,
     pub timeout: Duration,
 }
 
@@ -313,8 +314,9 @@ struct IchMappingEntry {
     address: [u8; ICH_ADDRESS_MAX_LEN],
     ich_id: [u8; 16],
     ilk_id: [u8; 16],
+    tenant_id: [u8; 16],
     flags: u16,
-    _reserved: [u8; 54],
+    _reserved: [u8; 38],
 }
 
 #[repr(C)]
@@ -485,6 +487,19 @@ pub async fn provision_ilk(
             "ich_id, channel_type and address must be non-empty".to_string(),
         ));
     }
+    let mut payload = json!({
+        "ich_id": ich_id,
+        "channel_type": channel_type,
+        "address": address,
+    });
+    if let Some(tid) = request
+        .tenant_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        payload["tenant_id"] = json!(tid);
+    }
     let call = identity_system_call(
         sender,
         receiver,
@@ -492,11 +507,7 @@ pub async fn provision_ilk(
             target,
             fallback_target: None,
             action: MSG_ILK_PROVISION,
-            payload: json!({
-                "ich_id": ich_id,
-                "channel_type": channel_type,
-                "address": address,
-            }),
+            payload,
             timeout: request.timeout,
         },
     )
@@ -660,15 +671,17 @@ pub fn load_hive_id(config_dir: &Path) -> Result<String, IdentityShmError> {
     Ok(hive_id)
 }
 
-/// Resolve ILK from identity SHM by `(channel_type, address)`.
+/// Resolve ILK from identity SHM by `(channel_type, address, tenant_id)`.
 /// Returns canonical external format (`ilk:<uuid-v4>`) when found.
 pub fn resolve_ilk_from_shm_name(
     identity_shm_name: &str,
     channel_type: &str,
     address: &str,
+    tenant_id: &str,
 ) -> Result<Option<String>, IdentityShmError> {
     let normalized_channel = channel_type.trim().to_ascii_lowercase();
     let normalized_address = address.trim().to_ascii_lowercase();
+    let normalized_tenant = tenant_id.trim().to_ascii_lowercase();
     if normalized_channel.is_empty() || normalized_address.is_empty() {
         return Err(IdentityShmError::InvalidChannelInput);
     }
@@ -677,7 +690,7 @@ pub fn resolve_ilk_from_shm_name(
         Err(err) if is_permission_lookup_unavailable(&err) => return Ok(None),
         Err(err) => return Err(err),
     };
-    let ilk = match reader.resolve_ich_mapping(&normalized_channel, &normalized_address) {
+    let ilk = match reader.resolve_ich_mapping(&normalized_channel, &normalized_address, &normalized_tenant) {
         Ok(ilk) => ilk,
         Err(err) if is_permission_lookup_unavailable(&err) => return Ok(None),
         Err(err) => return Err(err),
@@ -690,9 +703,10 @@ pub fn resolve_ilk_from_hive_id(
     hive_id: &str,
     channel_type: &str,
     address: &str,
+    tenant_id: &str,
 ) -> Result<Option<String>, IdentityShmError> {
     let shm_name = identity_shm_name_for_hive(hive_id)?;
-    resolve_ilk_from_shm_name(&shm_name, channel_type, address)
+    resolve_ilk_from_shm_name(&shm_name, channel_type, address, tenant_id)
 }
 
 /// Resolve ILK using `hive.yaml` from config dir.
@@ -700,9 +714,10 @@ pub fn resolve_ilk_from_hive_config(
     config_dir: &Path,
     channel_type: &str,
     address: &str,
+    tenant_id: &str,
 ) -> Result<Option<String>, IdentityShmError> {
     let hive_id = load_hive_id(config_dir)?;
-    resolve_ilk_from_hive_id(&hive_id, channel_type, address)
+    resolve_ilk_from_hive_id(&hive_id, channel_type, address, tenant_id)
 }
 
 /// List active ICH entries from identity SHM together with their candidate ILKs.
@@ -739,6 +754,7 @@ impl IdentityShmReader {
         &self,
         channel_type: &str,
         address: &str,
+        tenant_id: &str,
     ) -> Result<Option<[u8; 16]>, IdentityShmError> {
         let header = header_ref::<IdentityHeader>(self.mmap.as_ref(), self.layout.header_offset)
             .ok_or(IdentityShmError::InvalidShmHeader)?;
@@ -748,6 +764,7 @@ impl IdentityShmReader {
             &self.layout,
             channel_type,
             address,
+            tenant_id,
         )
     }
 
@@ -845,6 +862,7 @@ fn resolve_ich_mapping_from_region(
     layout: &IdentityRegionLayout,
     channel_type: &str,
     address: &str,
+    tenant_id: &str,
 ) -> Result<Option<[u8; 16]>, IdentityShmError> {
     let start = StdInstant::now();
     let mut odd_seq_spins = 0u64;
@@ -880,7 +898,7 @@ fn resolve_ich_mapping_from_region(
             layout.limits.max_ich_mappings() as usize,
         )
         .ok_or(IdentityShmError::InvalidShmHeader)?;
-        let resolved = resolve_ich_mapping_from_entries(mappings, channel_type, address);
+        let resolved = resolve_ich_mapping_from_entries(mappings, channel_type, address, tenant_id);
         atomic::fence(Ordering::Acquire);
         let s2 = header.seq.load(Ordering::Acquire);
         if s1 == s2 {
@@ -945,11 +963,13 @@ fn resolve_ich_mapping_from_entries(
     mappings: &[IchMappingEntry],
     channel_type: &str,
     address: &str,
+    tenant_id: &str,
 ) -> Option<[u8; 16]> {
     if mappings.is_empty() {
         return None;
     }
-    let hash = compute_ich_hash(channel_type, address);
+    let tenant_bytes = tenant_id_to_bytes(tenant_id);
+    let hash = compute_ich_hash(channel_type, address, tenant_bytes);
     let table_len = mappings.len();
     let mut idx = (hash as usize) % table_len;
     for _ in 0..table_len {
@@ -965,6 +985,7 @@ fn resolve_ich_mapping_from_entries(
             && entry.hash == hash
             && fixed_str_matches(&entry.channel_type, channel_type)
             && fixed_str_matches(&entry.address, address)
+            && entry.tenant_id == tenant_bytes
         {
             return Some(entry.ilk_id);
         }
@@ -1086,7 +1107,7 @@ fn build_ich_options(ilks: &[IlkEntry], ichs: &[IchEntry]) -> Vec<IdentityIchOpt
     out
 }
 
-fn compute_ich_hash(channel_type: &str, address: &str) -> u64 {
+fn compute_ich_hash(channel_type: &str, address: &str, tenant_id: [u8; 16]) -> u64 {
     const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
     let mut hash = FNV_OFFSET_BASIS;
@@ -1100,7 +1121,20 @@ fn compute_ich_hash(channel_type: &str, address: &str) -> u64 {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(FNV_PRIME);
     }
+    hash ^= 0xfe;
+    hash = hash.wrapping_mul(FNV_PRIME);
+    for b in tenant_id {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
     hash
+}
+
+/// Convert a prefixed UUID string (`tnt:<uuid>`) to raw bytes, or return zeroes.
+fn tenant_id_to_bytes(tenant_id: &str) -> [u8; 16] {
+    let s = tenant_id.trim();
+    let s = s.strip_prefix("tnt:").unwrap_or(s);
+    Uuid::parse_str(s).map(|u| *u.as_bytes()).unwrap_or([0u8; 16])
 }
 
 fn layout_identity(limits: IdentityRegionLimits) -> IdentityRegionLayout {
