@@ -10,7 +10,7 @@ use std::future;
 use tar::{Archive, Builder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -65,7 +65,9 @@ struct AdminContext {
 }
 
 struct AdminRouterClient {
-    sender: NodeSender,
+    sender: RwLock<NodeSender>,
+    node_config: NodeConfig,
+    reconnect_delay: Duration,
     pending_admin: Mutex<HashMap<String, oneshot::Sender<Message>>>,
     system_tx: broadcast::Sender<Message>,
     query_tx: broadcast::Sender<Message>,
@@ -73,12 +75,14 @@ struct AdminRouterClient {
 }
 
 impl AdminRouterClient {
-    fn new(sender: NodeSender) -> Self {
+    fn new(sender: NodeSender, node_config: NodeConfig, reconnect_delay: Duration) -> Self {
         let (system_tx, _) = broadcast::channel(256);
         let (query_tx, _) = broadcast::channel(256);
         let (internal_admin_tx, _) = broadcast::channel(256);
         Self {
-            sender,
+            sender: RwLock::new(sender),
+            node_config,
+            reconnect_delay,
             pending_admin: Mutex::new(HashMap::new()),
             system_tx,
             query_tx,
@@ -90,13 +94,19 @@ impl AdminRouterClient {
         config: NodeConfig,
         delay: Duration,
     ) -> Result<Arc<Self>, fluxbee_sdk::NodeError> {
+        let (sender, receiver) = Self::connect_once_with_retry(&config, delay).await?;
+        let client = Arc::new(Self::new(sender, config, delay));
+        client.start(receiver);
+        Ok(client)
+    }
+
+    async fn connect_once_with_retry(
+        config: &NodeConfig,
+        delay: Duration,
+    ) -> Result<(NodeSender, NodeReceiver), fluxbee_sdk::NodeError> {
         loop {
-            match connect(&config).await {
-                Ok((sender, receiver)) => {
-                    let client = Arc::new(Self::new(sender));
-                    client.start(receiver);
-                    return Ok(client);
-                }
+            match connect(config).await {
+                Ok(result) => return Ok(result),
                 Err(err) => {
                     tracing::warn!("connect failed: {err}");
                     time::sleep(delay).await;
@@ -118,9 +128,27 @@ impl AdminRouterClient {
                 Ok(msg) => self.dispatch(msg).await,
                 Err(err) => {
                     tracing::warn!("router recv error: {err}");
+                    let (new_sender, new_receiver) =
+                        match Self::connect_once_with_retry(&self.node_config, self.reconnect_delay)
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(reconnect_err) => {
+                                tracing::warn!("router reconnect failed: {reconnect_err}");
+                                continue;
+                            }
+                        };
+                    let node_name = new_sender.full_name().to_string();
+                    *self.sender.write().await = new_sender;
+                    receiver = new_receiver;
+                    tracing::info!(node_name = %node_name, "sy.admin reconnected to router");
                 }
             }
         }
+    }
+
+    async fn sender_snapshot(&self) -> NodeSender {
+        self.sender.read().await.clone()
     }
 
     async fn dispatch(&self, msg: Message) {
@@ -517,13 +545,14 @@ async fn broadcast_config_changed(
     config: serde_json::Value,
     target_hive: Option<String>,
 ) -> Result<(), AdminError> {
+    let sender = client.sender_snapshot().await;
     let dst = match target_hive {
         Some(hive) => Destination::Unicast(format!("SY.opa.rules@{}", hive)),
         None => Destination::Broadcast,
     };
     let msg = Message {
         routing: Routing {
-            src: client.sender.uuid().to_string(),
+            src: sender.uuid().to_string(),
             src_l2_name: None,
             dst,
             ttl: 16,
@@ -548,7 +577,7 @@ async fn broadcast_config_changed(
             config,
         })?,
     };
-    client.sender.send(msg).await?;
+    sender.send(msg).await?;
     tracing::info!(
         subsystem = subsystem,
         action = action.as_deref().unwrap_or(""),
@@ -758,6 +787,7 @@ async fn send_admin_command_response(
     error_detail: Option<serde_json::Value>,
     request_id: Option<String>,
 ) -> Result<(), AdminError> {
+    let sender = client.sender_snapshot().await;
     let action_class = classify_admin_action(action);
     let (action_result, result_origin) =
         derive_action_outcome(action_class, Some(status), error_code.as_deref());
@@ -774,7 +804,7 @@ async fn send_admin_command_response(
 
     let response = Message {
         routing: Routing {
-            src: client.sender.uuid().to_string(),
+            src: sender.uuid().to_string(),
             src_l2_name: None,
             dst: Destination::Unicast(request_msg.routing.src.clone()),
             ttl: 16,
@@ -796,7 +826,7 @@ async fn send_admin_command_response(
         },
         payload: body,
     };
-    client.sender.send(response).await?;
+    sender.send(response).await?;
     Ok(())
 }
 
@@ -4481,6 +4511,7 @@ async fn handle_send_node_message(
     payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
+    let sender = client.sender_snapshot().await;
     let req: DebugNodeMessageRequest = serde_json::from_value(payload)?;
     let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
     let node_name = req.node_name.trim().to_string();
@@ -4517,7 +4548,7 @@ async fn handle_send_node_message(
     let msg_type = req.msg_type.trim().to_string();
     let message = Message {
         routing: Routing {
-            src: client.sender.uuid().to_string(),
+            src: sender.uuid().to_string(),
             src_l2_name: None,
             dst: Destination::Unicast(node_name.clone()),
             ttl,
@@ -4536,7 +4567,7 @@ async fn handle_send_node_message(
         },
         payload: req.payload,
     };
-    client.sender.send(message).await?;
+    sender.send(message).await?;
     Ok((
         200,
         serde_json::json!({
@@ -5144,6 +5175,7 @@ async fn send_admin_request(
     request: AdminRequest,
     timeout_window: Duration,
 ) -> Result<serde_json::Value, AdminError> {
+    let sender = client.sender_snapshot().await;
     let dst = request
         .unicast
         .clone()
@@ -5151,7 +5183,7 @@ async fn send_admin_request(
     let trace_id = Uuid::new_v4().to_string();
     let msg = Message {
         routing: Routing {
-            src: client.sender.uuid().to_string(),
+            src: sender.uuid().to_string(),
             src_l2_name: None,
             dst: Destination::Unicast(dst.clone()),
             ttl: 16,
@@ -5173,7 +5205,7 @@ async fn send_admin_request(
     };
     let (tx, rx) = oneshot::channel::<Message>();
     client.enqueue_admin_waiter(trace_id.clone(), tx).await;
-    client.sender.send(msg).await?;
+    sender.send(msg).await?;
 
     use tokio::time::{timeout, Instant};
     let deadline = Instant::now() + timeout_window;
@@ -5235,10 +5267,11 @@ async fn send_system_request_with_meta(
 ) -> Result<serde_json::Value, AdminError> {
     use tokio::time::timeout;
 
+    let sender = client.sender_snapshot().await;
     let trace_id = Uuid::new_v4().to_string();
     let msg = Message {
         routing: Routing {
-            src: client.sender.uuid().to_string(),
+            src: sender.uuid().to_string(),
             src_l2_name: None,
             dst: Destination::Unicast(target.to_string()),
             ttl,
@@ -5261,7 +5294,7 @@ async fn send_system_request_with_meta(
 
     let (tx, rx) = oneshot::channel::<Message>();
     client.enqueue_admin_waiter(trace_id.clone(), tx).await;
-    client.sender.send(msg).await?;
+    sender.send(msg).await?;
 
     let msg = match timeout(timeout_window, rx).await {
         Ok(Ok(msg)) => msg,
@@ -5637,6 +5670,7 @@ async fn send_opa_query(
     action: &str,
     target: Option<String>,
 ) -> Result<Vec<OpaQueryEntry>, AdminError> {
+    let sender = client.sender_snapshot().await;
     let target_pattern = target
         .as_deref()
         .map(|hive| format!("SY.opa.rules@{}", hive));
@@ -5646,7 +5680,7 @@ async fn send_opa_query(
     };
     let msg = Message {
         routing: Routing {
-            src: client.sender.uuid().to_string(),
+            src: sender.uuid().to_string(),
             src_l2_name: None,
             dst,
             ttl: 16,
@@ -5665,7 +5699,7 @@ async fn send_opa_query(
         },
         payload: serde_json::json!({}),
     };
-    client.sender.send(msg).await?;
+    sender.send(msg).await?;
 
     let expected = expected_hive_sets(ctx, target.as_deref()).effective;
     let mut receiver = client.subscribe_query();
