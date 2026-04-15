@@ -200,7 +200,9 @@ impl IdentityResolver for ShmIdentityResolver {
 
         #[cfg(unix)]
         {
-            match fluxbee_sdk::resolve_ilk_from_hive_id(&self.hive_id, channel, external_id) {
+            // Legacy resolver path has no tenant input yet; pass empty tenant to preserve
+            // miss-only behavior until callers use the newer tenant-aware lookup helpers.
+            match fluxbee_sdk::resolve_ilk_from_hive_id(&self.hive_id, channel, external_id, "") {
                 Ok(Some(src_ilk)) => {
                     self.cache_put(channel, external_id, &src_ilk);
                     Ok(Some(src_ilk))
