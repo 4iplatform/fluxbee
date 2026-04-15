@@ -1598,6 +1598,7 @@ async fn request_frontdesk_handoff_for_http(
         context,
         serde_json::to_value(frontdesk.payload).expect("frontdesk handoff payload"),
     );
+    let mut inbox = state.router_inbox.lock().await;
     if let Err(err) = state.sender.send(msg).await {
         tracing::warn!(error = ?err, %trace_id, "failed to send frontdesk handoff to router");
         return Err(api_error(
@@ -1615,46 +1616,43 @@ async fn request_frontdesk_handoff_for_http(
         "io-api waiting for frontdesk_result via router inbox"
     );
 
-    let reply = {
-        let mut inbox = state.router_inbox.lock().await;
-        match inbox
-            .recv_for_trace_id(&trace_id, state.identity_provision_cfg.timeout)
-            .await
-        {
-            Ok(reply) => reply,
-            Err(io_common::identity::IdentityError::Timeout) => {
-                return Err(api_error(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "frontdesk_timeout",
-                    "Frontdesk did not respond in time",
-                ));
-            }
-            Err(io_common::identity::IdentityError::Unavailable) => {
-                return Err(api_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "frontdesk_unavailable",
-                    "Frontdesk reply waiter closed unexpectedly",
-                ));
-            }
-            Err(io_common::identity::IdentityError::Miss) => {
-                return Err(api_error(
-                    StatusCode::BAD_GATEWAY,
-                    "frontdesk_unavailable",
-                    "Frontdesk reply was not found in router inbox",
-                ));
-            }
-            Err(io_common::identity::IdentityError::Other(err)) => {
-                tracing::warn!(
-                    %trace_id,
-                    error = %err,
-                    "failed while waiting for frontdesk reply from router inbox"
-                );
-                return Err(api_error(
-                    StatusCode::BAD_GATEWAY,
-                    "frontdesk_unavailable",
-                    "Failed while waiting for frontdesk reply",
-                ));
-            }
+    let reply = match inbox
+        .recv_for_trace_id(&trace_id, state.identity_provision_cfg.timeout)
+        .await
+    {
+        Ok(reply) => reply,
+        Err(io_common::identity::IdentityError::Timeout) => {
+            return Err(api_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "frontdesk_timeout",
+                "Frontdesk did not respond in time",
+            ));
+        }
+        Err(io_common::identity::IdentityError::Unavailable) => {
+            return Err(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "frontdesk_unavailable",
+                "Frontdesk reply waiter closed unexpectedly",
+            ));
+        }
+        Err(io_common::identity::IdentityError::Miss) => {
+            return Err(api_error(
+                StatusCode::BAD_GATEWAY,
+                "frontdesk_unavailable",
+                "Frontdesk reply was not found in router inbox",
+            ));
+        }
+        Err(io_common::identity::IdentityError::Other(err)) => {
+            tracing::warn!(
+                %trace_id,
+                error = %err,
+                "failed while waiting for frontdesk reply from router inbox"
+            );
+            return Err(api_error(
+                StatusCode::BAD_GATEWAY,
+                "frontdesk_unavailable",
+                "Failed while waiting for frontdesk reply",
+            ));
         }
     };
 
