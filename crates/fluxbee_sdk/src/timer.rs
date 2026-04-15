@@ -586,7 +586,10 @@ impl<'a> TimerClient<'a> {
     ) -> Result<Self, TimerClientError> {
         let timer_target = match config.timer_target {
             Some(target) if !target.trim().is_empty() => target.trim().to_string(),
-            _ => local_timer_node_name(sender.full_name())?,
+            _ => {
+                let full_name = sender.full_name();
+                local_timer_node_name(full_name.as_ref())?
+            }
         };
         Ok(Self {
             sender,
@@ -1008,6 +1011,7 @@ impl TimerTestHarness {
             "src-uuid".to_string(),
             full_name.to_string(),
             7,
+            "router-test".to_string(),
             state,
         ));
         let sender = NodeSender::new(outbound_tx, Arc::clone(&info));

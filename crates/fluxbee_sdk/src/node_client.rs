@@ -6,7 +6,6 @@ use serde::Deserialize;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
 use uuid::Uuid;
 
@@ -61,14 +60,8 @@ struct HiveFile {
 
 pub async fn connect(config: &NodeConfig) -> Result<(NodeSender, NodeReceiver), NodeError> {
     let parts = connect_parts(config).await?;
-    let info = Arc::new(ConnectionInfo::new(
-        parts.uuid.to_string(),
-        parts.full_name.clone(),
-        parts.vpn_id,
-        Arc::clone(&parts.state),
-    ));
-    let sender = NodeSender::new(parts.tx, Arc::clone(&info));
-    let receiver = NodeReceiver::new(parts.rx, info);
+    let sender = NodeSender::new(parts.tx, Arc::clone(&parts.info));
+    let receiver = NodeReceiver::new(parts.rx, parts.info);
     Ok((sender, receiver))
 }
 
@@ -81,12 +74,7 @@ pub async fn connect_with_client_config(
 struct ConnectedParts {
     tx: mpsc::Sender<Vec<u8>>,
     rx: mpsc::Receiver<Result<Message, NodeError>>,
-    uuid: Uuid,
-    full_name: String,
-    vpn_id: u32,
-    router_name: String,
-    state: Arc<ConnectionState>,
-    manager_task: JoinHandle<()>,
+    info: Arc<ConnectionInfo>,
 }
 
 async fn connect_parts(config: &NodeConfig) -> Result<ConnectedParts, NodeError> {
@@ -95,6 +83,13 @@ async fn connect_parts(config: &NodeConfig) -> Result<ConnectedParts, NodeError>
     let uuid = resolve_uuid(config.uuid_mode, &config.uuid_persistence_dir, &base_name)?;
 
     let state = Arc::new(ConnectionState::new_connected());
+    let info = Arc::new(ConnectionInfo::new(
+        uuid.to_string(),
+        full_name.clone(),
+        0,
+        String::new(),
+        Arc::clone(&state),
+    ));
     let (app_tx, internal_rx) = mpsc::channel::<Vec<u8>>(256);
     let (internal_tx, app_rx) = mpsc::channel::<Result<Message, NodeError>>(256);
     let shared_rx = Arc::new(Mutex::new(internal_rx));
@@ -107,22 +102,23 @@ async fn connect_parts(config: &NodeConfig) -> Result<ConnectedParts, NodeError>
         full_name: full_name.clone(),
         version: config.version.clone(),
     };
-    let manager_task = tokio::spawn(connection_manager_loop(
+    let _manager_task = tokio::spawn(connection_manager_loop(
         manager_cfg,
+        Arc::clone(&info),
         Arc::clone(&state),
         Arc::clone(&shared_rx),
         internal_tx,
         Some(announce_tx),
     ));
 
-    let payload = match announce_rx.await {
+    match announce_rx.await {
         Ok(Ok(payload)) => payload,
         Ok(Err(err)) => {
-            manager_task.abort();
+            _manager_task.abort();
             return Err(err);
         }
         Err(_) => {
-            manager_task.abort();
+            _manager_task.abort();
             return Err(NodeError::HandshakeFailed("announce channel closed".into()));
         }
     };
@@ -130,12 +126,7 @@ async fn connect_parts(config: &NodeConfig) -> Result<ConnectedParts, NodeError>
     Ok(ConnectedParts {
         tx: app_tx,
         rx: app_rx,
-        uuid,
-        full_name: payload.name,
-        vpn_id: payload.vpn_id,
-        router_name: payload.router_name,
-        state,
-        manager_task,
+        info,
     })
 }
 
@@ -149,6 +140,7 @@ struct ManagerConfig {
 
 async fn connection_manager_loop(
     cfg: ManagerConfig,
+    info: Arc<ConnectionInfo>,
     state: Arc<ConnectionState>,
     app_tx_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     app_rx_tx: mpsc::Sender<Result<Message, NodeError>>,
@@ -165,6 +157,7 @@ async fn connection_manager_loop(
         match connect_stream(&cfg.router_socket, &cfg.base_name).await {
             Ok(mut stream) => match perform_handshake(&mut stream, &cfg).await {
                 Ok(announce) => {
+                    info.update_from_announce(&announce);
                     if let Some(tx) = announce_tx.take() {
                         let _ = tx.send(Ok(announce));
                     }
