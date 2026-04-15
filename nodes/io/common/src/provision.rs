@@ -54,6 +54,12 @@ impl RouterInbox {
         loop {
             let now = Instant::now();
             if now >= deadline {
+                tracing::warn!(
+                    %trace_id,
+                    timeout_ms = timeout.as_millis() as u64,
+                    backlog_len = self.backlog.len(),
+                    "router inbox timed out waiting for trace_id"
+                );
                 return Err(IdentityError::Timeout);
             }
             if let Some(idx) = self
@@ -61,18 +67,53 @@ impl RouterInbox {
                 .iter()
                 .position(|msg| msg.routing.trace_id == trace_id)
             {
+                tracing::debug!(
+                    %trace_id,
+                    backlog_len = self.backlog.len(),
+                    "router inbox matched trace_id from backlog"
+                );
                 return Ok(self.backlog.remove(idx).expect("backlog idx"));
             }
             let remaining = deadline.saturating_duration_since(now);
             match self.receiver.recv_timeout(remaining).await {
                 Ok(msg) => {
+                    let incoming_trace_id = msg.routing.trace_id.clone();
+                    let incoming_msg = msg.meta.msg.clone();
                     if msg.routing.trace_id == trace_id {
+                        tracing::debug!(
+                            %trace_id,
+                            msg = %incoming_msg.as_deref().unwrap_or(""),
+                            "router inbox matched trace_id from receiver"
+                        );
                         return Ok(msg);
                     }
+                    tracing::debug!(
+                        %trace_id,
+                        incoming_trace_id = %incoming_trace_id,
+                        msg = %incoming_msg.as_deref().unwrap_or(""),
+                        backlog_len = self.backlog.len(),
+                        "router inbox received different trace_id while waiting; moved to backlog"
+                    );
                     self.backlog.push_back(msg);
                 }
-                Err(NodeError::Timeout) => return Err(IdentityError::Timeout),
-                Err(_) => return Err(IdentityError::Unavailable),
+                Err(NodeError::Timeout) => {
+                    tracing::warn!(
+                        %trace_id,
+                        timeout_ms = timeout.as_millis() as u64,
+                        backlog_len = self.backlog.len(),
+                        "router receiver timed out while waiting for trace_id"
+                    );
+                    return Err(IdentityError::Timeout);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %trace_id,
+                        error = %err,
+                        backlog_len = self.backlog.len(),
+                        "router receiver failed while waiting for trace_id"
+                    );
+                    return Err(IdentityError::Unavailable);
+                }
             }
         }
     }
