@@ -27,10 +27,7 @@ func (s *Service) DeleteWorkflow(req DeleteWorkflowRequest) (*DeleteWorkflowResu
 		return nil, err
 	}
 
-	if !req.Force && snapshot.ConfigExists {
-		if snapshot.Timeout {
-			return nil, WfRulesError{Code: "INSTANCES_UNKNOWN", Detail: "wf node did not respond to instance count query"}
-		}
+	if !req.Force && snapshot.ConfigExists && !snapshot.Timeout {
 		if snapshot.ActiveInstances != nil && *snapshot.ActiveInstances > 0 {
 			return nil, WfRulesError{Code: "INSTANCES_ACTIVE", Detail: fmt.Sprintf("wf node still has %d running instances", *snapshot.ActiveInstances)}
 		}
