@@ -35,8 +35,9 @@ type ManagedSystemConfig struct {
 	CreatedAtMS    int64  `json:"created_at_ms,omitempty"`
 	UpdatedAtMS    int64  `json:"updated_at_ms,omitempty"`
 	Runtime        string `json:"runtime,omitempty"`
-	RuntimeVersion string `json:"runtime_version,omitempty"`
-	RuntimeBase    string `json:"runtime_base,omitempty"`
+	RuntimeVersion          string `json:"runtime_version,omitempty"`
+	RequestedRuntimeVersion string `json:"requested_runtime_version,omitempty"`
+	RuntimeBase             string `json:"runtime_base,omitempty"`
 	PackagePath    string `json:"package_path,omitempty"`
 	IlkID          string `json:"ilk_id,omitempty"`
 	TenantID       string `json:"tenant_id,omitempty"`
