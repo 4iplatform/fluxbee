@@ -1331,11 +1331,7 @@ async fn resolve_explicit_subject_for_http(
                 registration_status = %resolved.ilk.registration_status,
                 "io-api explicit_subject identity lookup hit"
             );
-            state.identity.remember(
-                &identity_input.channel,
-                &identity_input.external_id,
-                &resolved.ilk.ilk_id,
-            );
+            state.identity.remember(identity_input, &resolved.ilk.ilk_id);
             return Ok(ResolvedExplicitSubject {
                 src_ilk: resolved.ilk.ilk_id,
                 registration_status: Some(resolved.ilk.registration_status),
@@ -1373,11 +1369,7 @@ async fn resolve_explicit_subject_for_http(
         src_ilk = %src_ilk,
         "io-api explicit_subject identity provisioned"
     );
-    state.identity.remember(
-        &identity_input.channel,
-        &identity_input.external_id,
-        &src_ilk,
-    );
+    state.identity.remember(identity_input, &src_ilk);
     Ok(ResolvedExplicitSubject {
         src_ilk,
         registration_status: Some("temporary".to_string()),

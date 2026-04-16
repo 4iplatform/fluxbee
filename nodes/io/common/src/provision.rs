@@ -179,6 +179,23 @@ pub async fn strict_provision_ilk(
     let normalized_channel = normalize_identity_field(&input.channel, true);
     let normalized_address = normalize_identity_field(&input.external_id, true);
     let trace_id = Uuid::new_v4().to_string();
+    let mut payload = serde_json::json!({
+        "ich_id": stable_ich_id(
+            &normalized_channel,
+            &normalized_address,
+            input.tenant_id.as_deref().unwrap_or(""),
+        ),
+        "channel_type": normalized_channel,
+        "address": normalized_address,
+    });
+    if let Some(tenant_id) = input
+        .tenant_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        payload["tenant_id"] = serde_json::json!(tenant_id);
+    }
     let req = WireMessage {
         routing: Routing {
             src: sender.uuid().to_string(),
@@ -198,11 +215,7 @@ pub async fn strict_provision_ilk(
             context: None,
             ..Meta::default()
         },
-        payload: serde_json::json!({
-            "ich_id": stable_ich_id(&normalized_channel, &normalized_address),
-            "channel_type": normalized_channel,
-            "address": normalized_address,
-        }),
+        payload,
     };
     let mut inbox = inbox.lock().await;
     sender.send(req).await.map_err(|_| IdentityError::Unavailable)?;
@@ -289,10 +302,16 @@ fn parse_provision_response(msg: WireMessage) -> Result<String, IdentityError> {
     ))
 }
 
-fn stable_ich_id(channel: &str, external_id: &str) -> String {
+fn stable_ich_id(channel: &str, external_id: &str, tenant_id: &str) -> String {
     // Canonical identity ids in Fluxbee use prefixed UUIDs (`ich:<uuid>`).
-    // We derive a deterministic UUIDv5 from `(channel, external_id)`.
-    let key = format!("{channel}:{external_id}");
+    // Include tenant in the UUIDv5 seed so equivalent `(channel, external_id)`
+    // pairs in different tenants never collide.
+    let key = format!(
+        "{}:{}:{}",
+        tenant_id.trim().to_ascii_lowercase(),
+        channel,
+        external_id
+    );
     let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, key.as_bytes());
     format!("ich:{uuid}")
 }
@@ -312,15 +331,22 @@ mod tests {
 
     #[test]
     fn stable_ich_id_is_deterministic() {
-        let a = stable_ich_id("sim-new", "user.provision.abc1");
-        let b = stable_ich_id("sim-new", "user.provision.abc1");
+        let a = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a");
+        let b = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a");
         assert_eq!(a, b);
     }
 
     #[test]
     fn stable_ich_id_changes_when_input_changes() {
-        let a = stable_ich_id("sim-new", "user.provision.abc1");
-        let b = stable_ich_id("sim-new", "user.provision.abc2");
+        let a = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a");
+        let b = stable_ich_id("sim-new", "user.provision.abc2", "tnt:tenant-a");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn stable_ich_id_changes_when_tenant_changes() {
+        let a = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a");
+        let b = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-b");
         assert_ne!(a, b);
     }
 }

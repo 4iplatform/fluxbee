@@ -39,8 +39,8 @@ pub enum IdentityError {
 
 pub trait IdentityResolver: Send + Sync {
     fn as_any(&self) -> &dyn Any;
-    fn lookup(&self, channel: &str, external_id: &str) -> Result<Option<String>, IdentityError>;
-    fn remember(&self, _channel: &str, _external_id: &str, _src_ilk: &str) {}
+    fn lookup(&self, input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError>;
+    fn remember(&self, _input: &ResolveOrCreateInput, _src_ilk: &str) {}
 }
 
 #[async_trait]
@@ -84,14 +84,14 @@ impl IdentityResolver for DisabledIdentityResolver {
         self
     }
 
-    fn lookup(&self, _channel: &str, _external_id: &str) -> Result<Option<String>, IdentityError> {
+    fn lookup(&self, _input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError> {
         Ok(None)
     }
 }
 
 #[derive(Default)]
 pub struct MockIdentityResolver {
-    map: Mutex<HashMap<(String, String), String>>,
+    map: Mutex<HashMap<(String, String, String), String>>,
 }
 
 impl MockIdentityResolver {
@@ -105,9 +105,18 @@ impl IdentityResolver for MockIdentityResolver {
         self
     }
 
-    fn lookup(&self, channel: &str, external_id: &str) -> Result<Option<String>, IdentityError> {
+    fn lookup(&self, input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError> {
         let mut map = self.map.lock().map_err(|_| IdentityError::Unavailable)?;
-        let key = (channel.to_string(), external_id.to_string());
+        let key = (
+            input
+                .tenant_id
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase(),
+            input.channel.to_string(),
+            input.external_id.to_string(),
+        );
         let src_ilk = map
             .entry(key)
             .or_insert_with(|| format!("ilk:mock:{}", Uuid::new_v4()))
@@ -122,7 +131,7 @@ pub struct ShmIdentityResolver {
     external_id_max_len: usize,
     hive_id: String,
     cache_ttl: Duration,
-    cache: Mutex<HashMap<(String, String), CacheEntry>>,
+    cache: Mutex<HashMap<(String, String, String), CacheEntry>>,
 }
 
 #[derive(Debug)]
@@ -146,8 +155,12 @@ impl ShmIdentityResolver {
         }
     }
 
-    fn cache_get(&self, channel: &str, external_id: &str) -> Option<String> {
-        let key = (channel.to_string(), external_id.to_string());
+    fn cache_get(&self, tenant_id: &str, channel: &str, external_id: &str) -> Option<String> {
+        let key = (
+            tenant_id.trim().to_ascii_lowercase(),
+            channel.to_string(),
+            external_id.to_string(),
+        );
         let mut guard = self.cache.lock().ok()?;
         let Some(entry) = guard.get(&key) else {
             return None;
@@ -159,13 +172,17 @@ impl ShmIdentityResolver {
         Some(entry.src_ilk.clone())
     }
 
-    fn cache_put(&self, channel: &str, external_id: &str, src_ilk: &str) {
+    fn cache_put(&self, tenant_id: &str, channel: &str, external_id: &str, src_ilk: &str) {
         if src_ilk.trim().is_empty() {
             return;
         }
         if let Ok(mut guard) = self.cache.lock() {
             guard.insert(
-                (channel.to_string(), external_id.to_string()),
+                (
+                    tenant_id.trim().to_ascii_lowercase(),
+                    channel.to_string(),
+                    external_id.to_string(),
+                ),
                 CacheEntry {
                     src_ilk: src_ilk.to_string(),
                     expires_at: Instant::now() + self.cache_ttl,
@@ -180,7 +197,10 @@ impl IdentityResolver for ShmIdentityResolver {
         self
     }
 
-    fn lookup(&self, channel: &str, external_id: &str) -> Result<Option<String>, IdentityError> {
+    fn lookup(&self, input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError> {
+        let channel = input.channel.as_str();
+        let external_id = input.external_id.as_str();
+        let tenant_id = input.tenant_id.as_deref().unwrap_or("");
         if channel.len() > self.channel_type_max_len || external_id.len() > self.external_id_max_len
         {
             return Ok(None);
@@ -188,23 +208,26 @@ impl IdentityResolver for ShmIdentityResolver {
         if self.hive_id.is_empty() {
             return Ok(None);
         }
-        if let Some(cached) = self.cache_get(channel, external_id) {
+        if let Some(cached) = self.cache_get(tenant_id, channel, external_id) {
             return Ok(Some(cached));
         }
 
         #[cfg(not(unix))]
         {
-            let _ = (channel, external_id);
+            let _ = (channel, external_id, tenant_id);
             return Ok(None);
         }
 
         #[cfg(unix)]
         {
-            // Legacy resolver path has no tenant input yet; pass empty tenant to preserve
-            // miss-only behavior until callers use the newer tenant-aware lookup helpers.
-            match fluxbee_sdk::resolve_ilk_from_hive_id(&self.hive_id, channel, external_id, "") {
+            match fluxbee_sdk::resolve_ilk_from_hive_id(
+                &self.hive_id,
+                channel,
+                external_id,
+                tenant_id,
+            ) {
                 Ok(Some(src_ilk)) => {
-                    self.cache_put(channel, external_id, &src_ilk);
+                    self.cache_put(tenant_id, channel, external_id, &src_ilk);
                     Ok(Some(src_ilk))
                 }
                 Ok(None) => Ok(None),
@@ -213,7 +236,44 @@ impl IdentityResolver for ShmIdentityResolver {
         }
     }
 
-    fn remember(&self, channel: &str, external_id: &str, src_ilk: &str) {
-        self.cache_put(channel, external_id, src_ilk);
+    fn remember(&self, input: &ResolveOrCreateInput, src_ilk: &str) {
+        self.cache_put(
+            input.tenant_id.as_deref().unwrap_or(""),
+            &input.channel,
+            &input.external_id,
+            src_ilk,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(tenant_id: Option<&str>) -> ResolveOrCreateInput {
+        ResolveOrCreateInput {
+            channel: "api".to_string(),
+            external_id: "user-123".to_string(),
+            src_ilk_override: None,
+            tenant_id: tenant_id.map(ToString::to_string),
+            tenant_hint: None,
+            attributes: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn mock_resolver_reuses_same_tenant_lookup() {
+        let resolver = MockIdentityResolver::new();
+        let a = resolver.lookup(&input(Some("tnt:tenant-a"))).unwrap();
+        let b = resolver.lookup(&input(Some("tnt:tenant-a"))).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn mock_resolver_separates_same_identity_across_tenants() {
+        let resolver = MockIdentityResolver::new();
+        let a = resolver.lookup(&input(Some("tnt:tenant-a"))).unwrap();
+        let b = resolver.lookup(&input(Some("tnt:tenant-b"))).unwrap();
+        assert_ne!(a, b);
     }
 }
