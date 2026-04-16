@@ -18,7 +18,7 @@ type orchestratorClient interface {
 	RunNode(ctx context.Context, targetNode, nodeName, runtimeName, version string, config map[string]any) (map[string]any, error)
 	StartNode(ctx context.Context, targetNode, nodeName string) (map[string]any, error)
 	RestartNode(ctx context.Context, targetNode, nodeName string) (map[string]any, error)
-	SetNodeConfig(ctx context.Context, targetNode, nodeName string, config map[string]any, notify bool) (map[string]any, error)
+	SetNodeConfig(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding, notify bool) (map[string]any, error)
 	KillNode(ctx context.Context, targetNode, nodeName string, force, purgeInstance bool) (map[string]any, error)
 }
 
@@ -90,13 +90,21 @@ func (c *l2OrchestratorClient) RestartNode(ctx context.Context, targetNode, node
 	})
 }
 
-func (c *l2OrchestratorClient) SetNodeConfig(ctx context.Context, targetNode, nodeName string, config map[string]any, notify bool) (map[string]any, error) {
-	return c.request(ctx, targetNode, "NODE_CONFIG_SET", "NODE_CONFIG_SET_RESPONSE", map[string]any{
+func (c *l2OrchestratorClient) SetNodeConfig(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding, notify bool) (map[string]any, error) {
+	payload := map[string]any{
 		"node_name": nodeName,
 		"config":    config,
 		"notify":    notify,
 		"replace":   false,
-	})
+	}
+	if binding != nil {
+		payload["runtime"] = binding.Runtime
+		payload["runtime_version"] = binding.RuntimeVersion
+		payload["requested_runtime_version"] = binding.RequestedRuntimeVersion
+		payload["runtime_base"] = binding.RuntimeBase
+		payload["package_path"] = binding.PackagePath
+	}
+	return c.request(ctx, targetNode, "NODE_CONFIG_SET", "NODE_CONFIG_SET_RESPONSE", payload)
 }
 
 func (c *l2OrchestratorClient) KillNode(ctx context.Context, targetNode, nodeName string, force, purgeInstance bool) (map[string]any, error) {

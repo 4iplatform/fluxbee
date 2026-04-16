@@ -85,13 +85,13 @@ When `SY.orchestrator` spawns or rebinds a WF node, it resolves the runtime vers
 
 - `runtime = "wf.<workflow_name>"`
 - `requested_version`
-- `resolved_version`
+- `runtime_version`
 - `runtime_base = "wf.engine"`
-- `package_path = "/var/lib/fluxbee/dist/runtimes/wf.<workflow_name>/<resolved_version>"`
+- `package_path = "/var/lib/fluxbee/dist/runtimes/wf.<workflow_name>/<runtime_version>"`
 
 This binding is **fixed for that node instance** until an explicit rollout changes it. A plain process restart must not silently move a node from version `N` to version `N+1` just because `current` changed in `dist`.
 
-Publishing a newer package version to `dist` and moving the runtime manifest `current` pointer does **not** by itself deploy that version to an already-existing WF node. Deployment happens only when the managed node binding is explicitly updated (`resolved_version`, `package_path`) and the node is restarted. Until that explicit rebind succeeds, crash recovery or automatic process restart continues to use the previously persisted binding.
+Publishing a newer package version to `dist` and moving the runtime manifest `current` pointer does **not** by itself deploy that version to an already-existing WF node. Deployment happens only when the managed node binding is explicitly updated (`runtime_version`, `package_path`) and the node is restarted. Until that explicit rebind succeeds, crash recovery or automatic process restart continues to use the previously persisted binding.
 
 ### 3.3 State directories
 
@@ -464,7 +464,7 @@ When a definition is applied (compile_apply or apply operations):
 6. Build the new managed config preserving operational fields (`tenant_id`, `sy_timer_l2_name`, `gc_retention_days`, `gc_interval_seconds`, and any other node-owned operational settings) without embedding workflow code.
 7. Send the config + node operations to `SY.orchestrator@<hive>`:
    - **If the WF node already exists:**
-     a. `set_node_config` (or equivalent) with the updated operational config and runtime binding to `runtime = "wf.<workflow_name>"`, `resolved_version = <version>`.
+     a. `set_node_config` (or equivalent) with the updated operational config and runtime binding to `runtime = "wf.<workflow_name>"`, `runtime_version = <version>`.
      b. `restart_node` for `WF.<workflow_name>@<hive>`.
    - **If the WF node does not exist and `auto_spawn: true`:**
      a. `run_node` for `WF.<workflow_name>@<hive>` with runtime `wf.<workflow_name>`, version `<version>`, and the managed operational config.
@@ -477,7 +477,7 @@ When a definition is applied (compile_apply or apply operations):
 - sy.wf-rules **never writes to the filesystem under `/var/lib/fluxbee/nodes/`**. The orchestrator owns that directory tree and is the only system node that writes there. sy.wf-rules operates exclusively via L2 messages to the orchestrator for managed node lifecycle/config.
 - The workflow definition does **not** live in the managed node `config.json`. The executable code artifact lives in the workflow package, and `wf-generic` reads it from `_system.package_path/flow/definition.json` at boot.
 - On updates to an existing workflow, operational fields (gc, timer, tenant, etc.) are preserved from the existing managed `config.json`. The workflow code changes by publishing a new package version and rebinding/restarting the node, not by mutating top-level `workflow_definition`.
-- Publication state and deployment state are intentionally different. A package may already exist in `dist` with a newer version while the WF node still runs the older `resolved_version` recorded in its managed config. The node only changes versions after the explicit rebind/restart sequence completes successfully.
+- Publication state and deployment state are intentionally different. A package may already exist in `dist` with a newer version while the WF node still runs the older `runtime_version` recorded in its managed config. The node only changes versions after the explicit rebind/restart sequence completes successfully.
 
 ### 7.1 Managed config.json format for WF nodes
 
@@ -493,7 +493,7 @@ The `config.json` that the orchestrator writes for a WF node follows this shape:
     "node_name": "WF.invoice@motherbee",
     "runtime": "wf.invoice",
     "requested_version": "3",
-    "resolved_version": "3",
+    "runtime_version": "3",
     "runtime_base": "wf.engine",
     "package_path": "/var/lib/fluxbee/dist/runtimes/wf.invoice/3"
   }
@@ -519,7 +519,7 @@ The `wf-generic` binary, at boot, reads `_system.package_path` from the managed 
 
 **Crash/autorestart semantics:**
 
-- If the WF node crashes on its own before sy.wf-rules completes the explicit rebind/restart sequence, automatic process restart must continue using the existing managed config and its current `_system.resolved_version` / `_system.package_path`.
+- If the WF node crashes on its own before sy.wf-rules completes the explicit rebind/restart sequence, automatic process restart must continue using the existing managed config and its current `_system.runtime_version` / `_system.package_path`.
 - In other words, a crash between "package version `N+1` published to `dist`" and "managed config rebound to `N+1`" must restart the node on version `N`, not on `N+1`.
 - Moving the runtime manifest `current` pointer in `dist` is publication state only. It is not deployment state for an already-existing node.
 
@@ -557,7 +557,7 @@ Retention policy in v1:
 
 - keep the package version referenced by `current/`
 - keep the package version referenced by `backup/`
-- keep any package version still referenced by a live or persisted WF node instance (`resolved_version`)
+- keep any package version still referenced by a live or persisted WF node instance (`runtime_version`)
 - purge older package versions for that workflow when they are no longer current, no longer backup, and no longer referenced by any node instance
 
 This makes the workflow source/versioning central in `SY.wf-rules`, while keeping executable artifacts in `dist` aligned with the standard runtime model of Fluxbee.

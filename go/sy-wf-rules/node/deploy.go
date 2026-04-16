@@ -68,19 +68,14 @@ func (s *Service) deployPublishedWorkflow(workflowName string, autoSpawn bool, p
 
 	ctx, cancel := context.WithTimeout(context.Background(), orchestratorRPCTimeout)
 	defer cancel()
-	_, err := s.orchestrator.GetNodeConfig(ctx, s.cfg.OrchestratorTarget, nodeName)
+	existingConfigPayload, err := s.orchestrator.GetNodeConfig(ctx, s.cfg.OrchestratorTarget, nodeName)
 	if err == nil {
-		patch := map[string]any{
-			"_system": map[string]any{
-				"runtime":         pkg.RuntimeName,
-				"runtime_version": pkg.Version,
-				"runtime_base":    workflowRuntimeBase,
-				"package_path":    pkg.PackagePath,
-			},
-		}
+		existingConfig := configMapFromNodeConfigPayload(existingConfigPayload)
+		config := s.buildManagedWFConfig(existingConfig)
+		binding := buildManagedRuntimeBinding(pkg)
 		ctx, cancel = context.WithTimeout(context.Background(), orchestratorRPCTimeout)
 		defer cancel()
-		if _, err := s.orchestrator.SetNodeConfig(ctx, s.cfg.OrchestratorTarget, nodeName, patch, false); err != nil {
+		if _, err := s.orchestrator.SetNodeConfig(ctx, s.cfg.OrchestratorTarget, nodeName, config, &binding, false); err != nil {
 			return WFNodeActionResult{
 					NodeName: nodeName,
 					Action:   "restart_failed",
@@ -132,7 +127,8 @@ func (s *Service) deployPublishedWorkflow(workflowName string, autoSpawn bool, p
 	ctx, cancel = context.WithTimeout(context.Background(), orchestratorRPCTimeout)
 	defer cancel()
 	runtimeName := pkg.RuntimeName
-	_, err = s.orchestrator.RunNode(ctx, s.cfg.OrchestratorTarget, nodeName, runtimeName, pkg.Version, map[string]any{})
+	config := s.buildManagedWFConfig(nil)
+	_, err = s.orchestrator.RunNode(ctx, s.cfg.OrchestratorTarget, nodeName, runtimeName, pkg.Version, config)
 	if err != nil {
 		return WFNodeActionResult{
 				NodeName: nodeName,

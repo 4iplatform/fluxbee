@@ -50,6 +50,7 @@ func (s *Service) ApplyWorkflow(req ApplyRequest) (*ApplyResult, error) {
 	if err != nil {
 		return nil, WfRulesError{Code: "PACKAGE_PUBLISH_FAILED", Detail: err.Error()}
 	}
+	_ = s.PurgeWorkflowPackages(workflowName, true)
 	return &ApplyResult{
 		Current: *currentMeta,
 		Package: *publish,

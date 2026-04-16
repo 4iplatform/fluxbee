@@ -448,7 +448,8 @@ go/nodes/wf/wf-generic/
 - [ ] In `CONFIG_SET`, reject attempts to mutate `workflow_definition_path` when the node is running as a managed workflow package
 - [ ] Keep rejecting `_system` mutations via `CONFIG_SET`; managed runtime/package metadata remains orchestrator-owned
 - [ ] Update `CONFIG_GET` / effective config response so the package-native source of truth is visible and `workflow_definition_path` is not presented as the primary operator-facing control in managed mode
-- [ ] Reuse the shared `go/pkg/wfcel` package for guard validation / CEL environment setup so `sy.wf-rules` and `wf-generic` cannot drift
+- [x] Reuse the shared `go/pkg/wfcel` package for guard validation / CEL environment setup so `sy.wf-rules` and `wf-generic` cannot drift
+- [x] `WF_LIST_INSTANCES` with `limit = 0` means unbounded count/listing so `SY.wf-rules` can query active instances safely
 - [ ] Add tests covering:
   - managed package mode resolves definition from `_system.package_path`
   - `CONFIG_SET` in managed package mode refuses `workflow_definition_path` mutation

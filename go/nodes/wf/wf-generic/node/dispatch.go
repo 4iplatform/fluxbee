@@ -220,7 +220,7 @@ func handleWFListInstances(ctx context.Context, msg sdk.Message, rt *NodeRuntime
 		CreatedAfterMS int64  `json:"created_after_ms"`
 	}
 	_ = json.Unmarshal(msg.Payload, &req)
-	if req.Limit <= 0 {
+	if req.Limit < 0 {
 		req.Limit = 50
 	}
 	rows, err := rt.Store.ListInstances(ctx, req.Status, req.Limit, req.CreatedAfterMS)

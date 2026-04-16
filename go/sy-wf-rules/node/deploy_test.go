@@ -11,7 +11,7 @@ type fakeOrchestratorClient struct {
 	runNodeFunc       func(ctx context.Context, targetNode, nodeName, runtimeName, version string, config map[string]any) (map[string]any, error)
 	startNodeFunc     func(ctx context.Context, targetNode, nodeName string) (map[string]any, error)
 	restartNodeFunc   func(ctx context.Context, targetNode, nodeName string) (map[string]any, error)
-	setNodeConfigFunc func(ctx context.Context, targetNode, nodeName string, config map[string]any, notify bool) (map[string]any, error)
+	setNodeConfigFunc func(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding, notify bool) (map[string]any, error)
 	killNodeFunc      func(ctx context.Context, targetNode, nodeName string, force, purgeInstance bool) (map[string]any, error)
 	runCalls          int
 	restartCalls      int
@@ -48,10 +48,10 @@ func (f *fakeOrchestratorClient) RestartNode(ctx context.Context, targetNode, no
 	return map[string]any{"status": "ok"}, nil
 }
 
-func (f *fakeOrchestratorClient) SetNodeConfig(ctx context.Context, targetNode, nodeName string, config map[string]any, notify bool) (map[string]any, error) {
+func (f *fakeOrchestratorClient) SetNodeConfig(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding, notify bool) (map[string]any, error) {
 	f.setConfigCalls++
 	if f.setNodeConfigFunc != nil {
-		return f.setNodeConfigFunc(ctx, targetNode, nodeName, config, notify)
+		return f.setNodeConfigFunc(ctx, targetNode, nodeName, config, binding, notify)
 	}
 	return map[string]any{"status": "ok"}, nil
 }
@@ -78,6 +78,15 @@ func TestApplyWorkflowAndDeployAutoSpawnFirstDeploy(t *testing.T) {
 		}
 		if runtimeName != "wf.invoice" || version != "1" {
 			t.Fatalf("unexpected runtime bind %q %q", runtimeName, version)
+		}
+		if config["sy_timer_l2_name"] != "SY.timer@motherbee" {
+			t.Fatalf("unexpected sy_timer_l2_name %#v", config["sy_timer_l2_name"])
+		}
+		if config["gc_retention_days"] != defaultWFGCRetentionDays {
+			t.Fatalf("unexpected gc_retention_days %#v", config["gc_retention_days"])
+		}
+		if config["gc_interval_seconds"] != defaultWFGCIntervalSeconds {
+			t.Fatalf("unexpected gc_interval_seconds %#v", config["gc_interval_seconds"])
 		}
 		return map[string]any{"status": "ok"}, nil
 	}
@@ -137,10 +146,15 @@ func TestApplyWorkflowAndDeployExistingNodeLeavesDeploymentDeferred(t *testing.T
 	svc := newTestService(t)
 	fake := &fakeOrchestratorClient{}
 	var gotPatch map[string]any
+	var gotBinding *managedRuntimeBinding
 	fake.getNodeConfigFunc = func(ctx context.Context, targetNode, nodeName string) (map[string]any, error) {
 		return map[string]any{
 			"status": "ok",
 			"config": map[string]any{
+				"tenant_id":           "tnt:test",
+				"sy_timer_l2_name":    "SY.timer@motherbee",
+				"gc_retention_days":   14,
+				"gc_interval_seconds": 900,
 				"_system": map[string]any{
 					"runtime":         "wf.invoice",
 					"runtime_version": "1",
@@ -149,8 +163,9 @@ func TestApplyWorkflowAndDeployExistingNodeLeavesDeploymentDeferred(t *testing.T
 			},
 		}, nil
 	}
-	fake.setNodeConfigFunc = func(ctx context.Context, targetNode, nodeName string, config map[string]any, notify bool) (map[string]any, error) {
+	fake.setNodeConfigFunc = func(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding, notify bool) (map[string]any, error) {
 		gotPatch = config
+		gotBinding = binding
 		if notify {
 			t.Fatalf("expected notify=false")
 		}
@@ -192,9 +207,23 @@ func TestApplyWorkflowAndDeployExistingNodeLeavesDeploymentDeferred(t *testing.T
 	if fake.setConfigCalls != 1 || fake.restartCalls != 1 {
 		t.Fatalf("expected one set_config and one restart, got set=%d restart=%d", fake.setConfigCalls, fake.restartCalls)
 	}
-	system, _ := gotPatch["_system"].(map[string]any)
-	if system["runtime"] != "wf.invoice" || system["runtime_version"] != "1" {
-		t.Fatalf("unexpected _system patch %#v", system)
+	if _, ok := gotPatch["_system"]; ok {
+		t.Fatalf("did not expect _system in config patch: %#v", gotPatch["_system"])
+	}
+	if gotPatch["tenant_id"] != "tnt:test" || gotPatch["gc_retention_days"] != 14 || gotPatch["gc_interval_seconds"] != 900 {
+		t.Fatalf("unexpected preserved config %#v", gotPatch)
+	}
+	if gotBinding == nil {
+		t.Fatalf("expected runtime binding")
+	}
+	if gotBinding.Runtime != "wf.invoice" || gotBinding.RuntimeVersion != "1" {
+		t.Fatalf("unexpected runtime binding %#v", gotBinding)
+	}
+	if gotBinding.RuntimeBase != workflowRuntimeBase {
+		t.Fatalf("unexpected runtime base %#v", gotBinding.RuntimeBase)
+	}
+	if gotBinding.RequestedRuntimeVersion != "1" || gotBinding.PackagePath == "" {
+		t.Fatalf("unexpected runtime binding details %#v", gotBinding)
 	}
 }
 

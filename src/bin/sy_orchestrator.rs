@@ -10920,6 +10920,24 @@ async fn set_node_config_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
 ) -> serde_json::Value {
+    let parse_optional_string_field = |field: &str| -> Result<Option<String>, String> {
+        match payload.get(field) {
+            Some(value) if value.is_null() => Ok(None),
+            Some(value) => value
+                .as_str()
+                .map(|value| {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                })
+                .ok_or_else(|| format!("invalid {field}: expected string")),
+            None => Ok(None),
+        }
+    };
+
     let mut target_hive = target_hive_from_payload(payload, &state.hive_id);
     let raw_node_name = payload
         .get("node_name")
@@ -10995,6 +11013,67 @@ async fn set_node_config_flow(
         .get("notify")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    let runtime_patch = match parse_optional_string_field("runtime") {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err,
+                "target": target_hive,
+                "node_name": node_name,
+            });
+        }
+    };
+    let runtime_version_patch = match parse_optional_string_field("runtime_version") {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err,
+                "target": target_hive,
+                "node_name": node_name,
+            });
+        }
+    };
+    let requested_runtime_version_patch =
+        match parse_optional_string_field("requested_runtime_version") {
+            Ok(value) => value,
+            Err(err) => {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "INVALID_REQUEST",
+                    "message": err,
+                    "target": target_hive,
+                    "node_name": node_name,
+                });
+            }
+        };
+    let runtime_base_patch = match parse_optional_string_field("runtime_base") {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err,
+                "target": target_hive,
+                "node_name": node_name,
+            });
+        }
+    };
+    let package_path_patch = match parse_optional_string_field("package_path") {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err,
+                "target": target_hive,
+                "node_name": node_name,
+            });
+        }
+    };
 
     let path = match node_effective_config_path(state, &node_name) {
         Ok(path) => path,
@@ -11082,6 +11161,27 @@ async fn set_node_config_flow(
             "created_at_ms".to_string(),
             serde_json::json!(now_epoch_ms()),
         );
+    }
+    if let Some(runtime) = runtime_patch {
+        system.insert("runtime".to_string(), serde_json::json!(runtime));
+    }
+    if let Some(runtime_version) = runtime_version_patch {
+        system.insert(
+            "runtime_version".to_string(),
+            serde_json::json!(runtime_version),
+        );
+    }
+    if let Some(requested_runtime_version) = requested_runtime_version_patch {
+        system.insert(
+            "requested_runtime_version".to_string(),
+            serde_json::json!(requested_runtime_version),
+        );
+    }
+    if let Some(runtime_base) = runtime_base_patch {
+        system.insert("runtime_base".to_string(), serde_json::json!(runtime_base));
+    }
+    if let Some(package_path) = package_path_patch {
+        system.insert("package_path".to_string(), serde_json::json!(package_path));
     }
     config_obj.insert("_system".to_string(), serde_json::Value::Object(system));
 

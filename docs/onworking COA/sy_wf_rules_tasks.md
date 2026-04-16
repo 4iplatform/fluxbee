@@ -32,7 +32,7 @@ One binary, one instance per hive, managing all workflows for that hive.
 - **Runtime execution model:** `WF.<workflow_name>@<hive>` runs as runtime `wf.<workflow_name>`, with `runtime_base = "wf.engine"`.
 - **WF code delivery:** `wf-generic` reads `flow/definition.json` from `_system.package_path` at boot.
 - **No inline workflow code in managed config:** `workflow_definition` is not persisted in node `config.json`.
-- **Instance binding:** `_system.resolved_version` / `_system.package_path` is fixed until explicit rollout.
+- **Instance binding:** `_system.runtime_version` / `_system.package_path` is fixed until explicit rollout.
 - **Publication vs deployment:** publishing a newer package to `dist` does not deploy it by itself.
 - **Crash/autorestart semantics:** if a WF node crashes before explicit rebind/restart completes, it restarts on the previously persisted binding.
 - **Operations:** `compile`, `compile_apply`, `apply`, `rollback`, `delete_workflow`, `get_workflow`, `get_status`, `list_workflows`.
@@ -231,7 +231,7 @@ go/sy-wf-rules/
 - [x] Build package directory contents from `current/definition.json` + metadata
 - [x] Generate `flow/definition.json`
 - [x] Generate `package.json`
-- [ ] Support optional `config/default-config.json` if needed
+- [x] Support optional `config/default-config.json` if needed
 
 ### WFRULES-PKG-3 — Publish through standard install/publish path
 - [ ] Reuse standard Fluxbee package install/publish implementation
@@ -247,21 +247,21 @@ go/sy-wf-rules/
   - success/failure detail
 
 ### WFRULES-PKG-5 — Retention and purge
-- [ ] Enumerate versions under `dist/runtimes/wf.<workflow_name>/`
-- [ ] Keep:
+- [x] Enumerate versions under `dist/runtimes/wf.<workflow_name>/`
+- [x] Keep:
   - version referenced by `current/`
   - version referenced by `backup/`
   - any version still referenced by a live or persisted WF node instance
-- [ ] Purge older unreferenced versions
-- [ ] Never purge a version still bound in managed config
+- [x] Purge older unreferenced versions
+- [x] Never purge a version still bound in managed config
 
 ### WFRULES-PKG-6 — Tests
-- [ ] Publish creates expected package layout
-- [ ] Version number matches workflow metadata version
-- [ ] Purge keeps `current`
-- [ ] Purge keeps `backup`
-- [ ] Purge keeps externally referenced version
-- [ ] Purge deletes safe stale version
+- [x] Publish creates expected package layout
+- [x] Version number matches workflow metadata version
+- [x] Purge keeps `current`
+- [x] Purge keeps `backup`
+- [x] Purge keeps externally referenced version
+- [x] Purge deletes safe stale version
 
 ---
 
@@ -282,11 +282,11 @@ go/sy-wf-rules/
 ### WFRULES-ORCH-3 — Managed config update client
 - [x] Implement `SetNodeConfig(nodeL2Name string, config map[string]any)`
 - [x] This is the rebind step for an existing WF node
-- [ ] Managed config must carry:
+- [x] Managed config must carry:
   - operational fields
   - `_system.runtime`
   - `_system.requested_version`
-  - `_system.resolved_version`
+  - `_system.runtime_version`
   - `_system.runtime_base`
   - `_system.package_path`
 
@@ -300,15 +300,15 @@ go/sy-wf-rules/
 - [x] Tolerate `NODE_NOT_FOUND`
 
 ### WFRULES-ORCH-6 — Build managed WF config
-- [ ] Implement builder for managed WF config
-- [ ] Preserve operational fields from existing config when present:
+- [x] Implement builder for managed WF config
+- [x] Preserve operational fields from existing config when present:
   - `tenant_id`
   - `sy_timer_l2_name`
   - `gc_retention_days`
   - `gc_interval_seconds`
   - other node-owned operational fields
-- [ ] Do not embed workflow source in config
-- [ ] Always bind the concrete package version in `_system`
+- [x] Do not embed workflow source in config
+- [x] Always bind the concrete package version in `_system`
 
 ### WFRULES-ORCH-7 — Explicit rollout sequence
 - [x] Implement rollout helper for existing WF node:
@@ -354,23 +354,23 @@ go/sy-wf-rules/
 ## 9) WF node query integration
 
 ### WFRULES-WF-1 — Active instance query client
-- [ ] Implement `QueryActiveInstances(wfNodeL2Name string)`
-- [ ] Send `WF_LIST_INSTANCES`
-- [ ] Payload:
+- [x] Implement `QueryActiveInstances(wfNodeL2Name string)`
+- [x] Send `WF_LIST_INSTANCES`
+- [x] Payload:
   - `status_filter = "running"`
   - `limit = 0`
-- [ ] Timeout: 2 seconds
+- [x] Timeout: 2 seconds
 
 ### WFRULES-WF-2 — Reachability semantics
-- [ ] On timeout/unreachable:
+- [x] On timeout/unreachable:
   - `reachable = false`
   - do not assume zero instances
-- [ ] Use this behavior in `get_status`, `list_workflows`, and `delete_workflow`
+- [x] Use this behavior in `get_status`, `list_workflows`, and `delete_workflow`
 
 ### WFRULES-WF-3 — Tests
-- [ ] Reachable response returns count
-- [ ] Timeout marks node unreachable
-- [ ] Delete path refuses with `INSTANCES_UNKNOWN` when unreachable
+- [x] Reachable response returns count
+- [x] Timeout marks node unreachable
+- [x] Delete path refuses with `INSTANCES_UNKNOWN` when unreachable
 
 ---
 
@@ -415,23 +415,23 @@ go/sy-wf-rules/
 - [x] Return rollback response
 
 ### WFRULES-OP-5 — delete_workflow
-- [ ] Require `workflow_name`
-- [ ] Parse `force`
-- [ ] If `force=false`:
+- [x] Require `workflow_name`
+- [x] Parse `force`
+- [x] If `force=false`:
   - query active instances
   - unreachable => `INSTANCES_UNKNOWN`
   - count > 0 => `INSTANCES_ACTIVE`
-- [ ] Kill WF node through orchestrator lifecycle path
-- [ ] Request managed instance cleanup through orchestrator/admin standard path
-- [ ] Delete local workflow state
-- [ ] Purge package versions no longer referenced
-- [ ] Return delete response
+- [x] Kill WF node through orchestrator lifecycle path
+- [x] Request managed instance cleanup through orchestrator/admin standard path
+- [x] Delete local workflow state
+- [x] Purge package versions no longer referenced
+- [x] Return delete response
 
 ### WFRULES-OP-6 — State consistency on partial failure
-- [ ] If package publish fails, do not proceed to rollout
-- [ ] If publish succeeds but rollout fails, keep `current/` and `backup/` consistent
-- [ ] Return partial success shape with `wf_node.action = "restart_failed"`
-- [ ] Do not pretend deployment occurred if only publication succeeded
+- [x] If package publish fails, do not proceed to rollout
+- [x] If publish succeeds but rollout fails, keep `current/` and `backup/` consistent
+- [x] Return partial success shape with `wf_node.action = "restart_failed"`
+- [x] Do not pretend deployment occurred if only publication succeeded
 
 ---
 
@@ -442,25 +442,25 @@ go/sy-wf-rules/
 - [x] `WORKFLOW_NOT_FOUND` if absent
 
 ### WFRULES-QRY-2 — get_status
-- [ ] Return:
+- [x] Return:
   - current version/hash
   - staged version if present
   - last error
   - WF node status
   - active instances or timeout marker
-- [ ] Include enough status to distinguish:
+- [x] Include enough status to distinguish:
   - package current version in `SY.wf-rules`
   - deployed node reachability
 
 ### WFRULES-QRY-3 — list_workflows
-- [ ] Enumerate workflows from local state
-- [ ] For each:
+- [x] Enumerate workflows from local state
+- [x] For each:
   - read current metadata
   - query WF node status / active instances
 
 ### WFRULES-QRY-4 — Optional deployment visibility
-- [ ] Expose, when available, the currently deployed/resolved version from managed config
-- [ ] This is useful to show publication state vs deployment state
+- [x] Expose, when available, the currently deployed/resolved version from managed config
+- [x] This is useful to show publication state vs deployment state
 
 ---
 
@@ -520,32 +520,32 @@ go/sy-wf-rules/
 ## 14) Admin integration (`SY.admin`)
 
 ### WFRULES-ADM-1 — `/admin/wf-rules/compile`
-- [ ] Forward to `SY.wf-rules` as `CONFIG_SET operation=compile`
+- [x] Forward to `SY.wf-rules` as `CONFIG_SET operation=compile`
 
 ### WFRULES-ADM-2 — `/admin/wf-rules/compile-apply`
-- [ ] Forward to `SY.wf-rules` as `CONFIG_SET operation=compile_apply`
+- [x] Forward to `SY.wf-rules` as `CONFIG_SET operation=compile_apply`
 
 ### WFRULES-ADM-3 — `/admin/wf-rules/apply`
-- [ ] Forward to `SY.wf-rules` as `CONFIG_SET operation=apply`
+- [x] Forward to `SY.wf-rules` as `CONFIG_SET operation=apply`
 
 ### WFRULES-ADM-4 — `/admin/wf-rules/rollback`
-- [ ] Forward to `SY.wf-rules` as `CONFIG_SET operation=rollback`
+- [x] Forward to `SY.wf-rules` as `CONFIG_SET operation=rollback`
 
 ### WFRULES-ADM-5 — `/admin/wf-rules/delete`
-- [ ] Forward to `SY.wf-rules` as command `delete_workflow`
+- [x] Forward to `SY.wf-rules` as command `delete_workflow`
 
 ### WFRULES-ADM-6 — `/admin/wf-rules/{name}`
-- [ ] Forward as query `get_workflow`
+- [x] Forward as query `get_workflow`
 
 ### WFRULES-ADM-7 — `/admin/wf-rules/{name}/status`
-- [ ] Forward as query `get_status`
+- [x] Forward as query `get_status`
 
 ### WFRULES-ADM-8 — `/admin/wf-rules`
-- [ ] Forward as query `list_workflows`
+- [x] Forward as query `list_workflows`
 
 ### WFRULES-ADM-9 — Preserve gateway-only role
-- [ ] Do not move compile/apply/publish logic into `SY.admin`
-- [ ] Admin remains proxy/control-plane only
+- [x] Do not move compile/apply/publish logic into `SY.admin`
+- [x] Admin remains proxy/control-plane only
 
 ---
 
@@ -588,16 +588,16 @@ go/sy-wf-rules/
 - [x] Rollback republishes/restores package if required
 
 ### WFRULES-TEST-8 — delete
-- [ ] Unreachable WF node => `INSTANCES_UNKNOWN`
-- [ ] Active instances => `INSTANCES_ACTIVE`
-- [ ] Force delete cleans local state
-- [ ] Force delete purges unreferenced packages
+- [x] Unreachable WF node => `INSTANCES_UNKNOWN`
+- [x] Active instances => `INSTANCES_ACTIVE`
+- [x] Force delete cleans local state
+- [x] Force delete purges unreferenced packages
 
 ### WFRULES-TEST-9 — retention and purge
-- [ ] Keeps `current`
-- [ ] Keeps `backup`
-- [ ] Keeps externally referenced deployed version
-- [ ] Purges stale version
+- [x] Keeps `current`
+- [x] Keeps `backup`
+- [x] Keeps externally referenced deployed version
+- [x] Purges stale version
 
 ### WFRULES-TEST-10 — publication vs deployment state
 - [x] Package published but rollout not complete leaves old deployed version intact
@@ -605,31 +605,44 @@ go/sy-wf-rules/
 
 ### WFRULES-TEST-11 — query handlers
 - [x] `get_workflow`
-- [ ] `get_status`
-- [ ] `list_workflows`
-- [ ] deployment status visibility when available
+- [x] `get_status`
+- [x] `list_workflows`
+- [x] deployment status visibility when available
 
 ### WFRULES-TEST-12 — Admin proxy
-- [ ] Each Admin endpoint forwards correct L2 message
+- [x] Request contracts/docs cover all `wf-rules` Admin endpoints
+- [x] Hive/target normalization is tested
+- [x] Admin response envelope accepts `sy.wf-rules` ok/error payload shapes
+- [ ] End-to-end forwarding of each Admin endpoint through router to L2 remains to be added
 
 ---
 
 ## 16) Installation
 
 ### WFRULES-INSTALL-1 — Binary/install script
-- [ ] Add `sy-wf-rules` to `scripts/install.sh`
-- [ ] Ensure state dir exists
+- [x] Add `sy-wf-rules` to `scripts/install.sh`
+- [x] Ensure state dir exists
 
 ### WFRULES-INSTALL-2 — Service wiring
-- [ ] Add `sy-wf-rules.service`
-- [ ] Follow same service pattern as other SY nodes
+- [x] Add `sy-wf-rules.service`
+- [x] Follow same service pattern as other SY nodes
 
 ### WFRULES-INSTALL-3 — Identity registration
-- [ ] Register with `SY.identity` at boot following standard SY node behavior
+- [ ] Confirm and document the standard core `SY.*` identity behavior for `sy-wf-rules`
+- [ ] Do not add a special `ILK_REGISTER` path unless the rest of the core `SY.*` services already do it
 
 ---
 
-## 17) Suggested implementation order
+## 17) Cleanup backlog
+
+### WFRULES-CLEANUP-1 — `_system` version field convergence
+- [x] Align docs, tasks, and code on one canonical field name for deployed workflow package version
+- [x] Remove the remaining mismatch between `_system.resolved_version` in spec/task wording and `_system.runtime_version` in current core implementation
+- [x] Keep publication state vs deployment state wording explicit after the naming cleanup
+
+---
+
+## 18) Suggested implementation order
 
 1. **WFRULES-CEL-1 -> WFRULES-CEL-6**
 2. **WFRULES-SETUP-1 -> WFRULES-SETUP-3**
@@ -650,7 +663,7 @@ go/sy-wf-rules/
 
 ---
 
-## 18) Ready-to-code checkpoint
+## 19) Ready-to-code checkpoint
 
 This task file assumes the specification in `docs/sy-wf-rules-spec.md` is the only normative guide.
 

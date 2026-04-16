@@ -84,6 +84,7 @@ INSTALL_RESTART_SERVICES=(
   "rt-gateway"
   "sy-config-routes"
   "sy-opa-rules"
+  "sy-wf-rules"
   "sy-admin"
   "sy-architect"
   "sy-storage"
@@ -157,6 +158,18 @@ if [[ -d "$ROOT_DIR/go/sy-timer" ]]; then
   fi
 fi
 
+if [[ -d "$ROOT_DIR/go/sy-wf-rules" ]]; then
+  if [[ "${SKIP_BUILD:-}" == "1" || "${SKIP_GO_BUILD:-}" == "1" ]]; then
+    echo "SKIP_BUILD/SKIP_GO_BUILD set; skipping sy-wf-rules build."
+  elif ! command -v go >/dev/null 2>&1; then
+    echo "Warning: go not found. Skipping sy-wf-rules build." >&2
+  else
+    echo "Building sy-wf-rules (Go)..."
+    rm -f "$ROOT_DIR/go/sy-wf-rules/sy-wf-rules"
+    (cd "$ROOT_DIR/go/sy-wf-rules" && go build -o sy-wf-rules .)
+  fi
+fi
+
 if [[ -d "$ROOT_DIR/go/nodes/wf/wf-generic" ]]; then
   if [[ "${SKIP_BUILD:-}" == "1" || "${SKIP_GO_BUILD:-}" == "1" ]]; then
     echo "SKIP_BUILD/SKIP_GO_BUILD set; skipping wf-generic build."
@@ -178,6 +191,7 @@ sudo install -d "$STATE_DIR/opa"
 sudo install -d "$STATE_DIR/opa/current"
 sudo install -d "$STATE_DIR/opa/staged"
 sudo install -d "$STATE_DIR/opa/backup"
+sudo install -d "$STATE_DIR/wf-rules"
 sudo install -d "$STATE_DIR/modules"
 sudo install -d "$STATE_DIR/blob"
 sudo install -d "$STATE_DIR/syncthing"
@@ -262,6 +276,16 @@ if [[ -z "${sy_timer_bin:-}" ]]; then
   echo "Missing binary: $ROOT_DIR/go/sy-timer/sy-timer or $BIN_DIR/sy_timer" >&2
   missing=1
 fi
+sy_wf_rules_bin=""
+if [[ -f "$ROOT_DIR/go/sy-wf-rules/sy-wf-rules" ]]; then
+  sy_wf_rules_bin="$ROOT_DIR/go/sy-wf-rules/sy-wf-rules"
+elif sy_wf_rules_bin="$(pick_bin sy_wf_rules || true)"; then
+  :
+fi
+if [[ -z "${sy_wf_rules_bin:-}" ]]; then
+  echo "Missing binary: $ROOT_DIR/go/sy-wf-rules/sy-wf-rules or $BIN_DIR/sy_wf_rules" >&2
+  missing=1
+fi
 wf_generic_bin=""
 if [[ -f "$ROOT_DIR/go/nodes/wf/wf-generic/wf-generic" ]]; then
   wf_generic_bin="$ROOT_DIR/go/nodes/wf/wf-generic/wf-generic"
@@ -291,6 +315,7 @@ sudo install -m 0755 "$sy_cognition_bin" /usr/bin/sy-cognition
 sudo install -m 0755 "$sy_policy_bin" /usr/bin/sy-policy
 sudo install -m 0755 "$sy_opa_rules_bin" /usr/bin/sy-opa-rules
 sudo install -m 0755 "$sy_timer_bin" /usr/bin/sy-timer
+sudo install -m 0755 "$sy_wf_rules_bin" /usr/bin/sy-wf-rules
 sudo install -m 0755 "$sy_frontdesk_gov_bin" /usr/bin/sy-frontdesk-gov
 sudo install -m 0755 "$wf_generic_bin" /usr/bin/wf-generic
 
@@ -306,6 +331,7 @@ sudo install -m 0755 "$sy_cognition_bin" "$STATE_DIR/dist/core/bin/sy-cognition"
 sudo install -m 0755 "$sy_policy_bin" "$STATE_DIR/dist/core/bin/sy-policy"
 sudo install -m 0755 "$sy_opa_rules_bin" "$STATE_DIR/dist/core/bin/sy-opa-rules"
 sudo install -m 0755 "$sy_timer_bin" "$STATE_DIR/dist/core/bin/sy-timer"
+sudo install -m 0755 "$sy_wf_rules_bin" "$STATE_DIR/dist/core/bin/sy-wf-rules"
 sudo install -m 0755 "$sy_frontdesk_gov_bin" "$STATE_DIR/dist/core/bin/sy-frontdesk-gov"
 sudo install -m 0755 "$wf_generic_bin" "$STATE_DIR/dist/core/bin/wf-generic"
 
@@ -329,6 +355,8 @@ sy_policy_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-policy" | awk '{print $1
 sy_policy_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-policy")"
 sy_timer_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-timer" | awk '{print $1}')"
 sy_timer_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-timer")"
+sy_wf_rules_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-wf-rules" | awk '{print $1}')"
+sy_wf_rules_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-wf-rules")"
 sy_frontdesk_gov_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-frontdesk-gov" | awk '{print $1}')"
 sy_frontdesk_gov_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-frontdesk-gov")"
 wf_generic_sha="$(sha256sum "$STATE_DIR/dist/core/bin/wf-generic" | awk '{print $1}')"
@@ -361,6 +389,7 @@ cat >"$core_manifest_tmp" <<EOF
     "sy-cognition": {"service": "sy-cognition", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_cognition_sha", "size": $sy_cognition_size},
     "sy-policy": {"service": "sy-policy", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_policy_sha", "size": $sy_policy_size},
     "sy-timer": {"service": "sy-timer", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_timer_sha", "size": $sy_timer_size},
+    "sy-wf-rules": {"service": "sy-wf-rules", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_wf_rules_sha", "size": $sy_wf_rules_size},
     "sy-frontdesk-gov": {"service": "sy-frontdesk-gov", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_frontdesk_gov_sha", "size": $sy_frontdesk_gov_size},
     "wf-generic": {"service": "wf-generic", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$wf_generic_sha", "size": $wf_generic_size}
   }
@@ -414,6 +443,7 @@ verify_core_component "sy-storage" "$sy_storage_sha" "$sy_storage_size"
 verify_core_component "sy-cognition" "$sy_cognition_sha" "$sy_cognition_size"
 verify_core_component "sy-policy" "$sy_policy_sha" "$sy_policy_size"
 verify_core_component "sy-timer" "$sy_timer_sha" "$sy_timer_size"
+verify_core_component "sy-wf-rules" "$sy_wf_rules_sha" "$sy_wf_rules_size"
 verify_core_component "sy-frontdesk-gov" "$sy_frontdesk_gov_sha" "$sy_frontdesk_gov_size"
 verify_core_component "wf-generic" "$wf_generic_sha" "$wf_generic_size"
 echo "Core binaries verification passed."
@@ -585,6 +615,7 @@ install_unit "sy-identity" "/usr/bin/sy-identity"
 install_unit "sy-cognition" "/usr/bin/sy-cognition"
 install_unit "sy-policy" "/usr/bin/sy-policy"
 install_unit "sy-timer" "/usr/bin/sy-timer"
+install_unit "sy-wf-rules" "/usr/bin/sy-wf-rules"
 install_unit "sy-frontdesk-gov" "/usr/bin/sy-frontdesk-gov"
 sudo systemctl daemon-reload
 

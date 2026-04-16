@@ -23,6 +23,15 @@ type GetWorkflowRequest struct {
 	WorkflowName string `json:"workflow_name"`
 }
 
+type GetStatusRequest struct {
+	WorkflowName string `json:"workflow_name"`
+}
+
+type DeleteWorkflowRequest struct {
+	WorkflowName string `json:"workflow_name"`
+	Force        bool   `json:"force,omitempty"`
+}
+
 type WfRulesMetadata struct {
 	Version         uint64 `json:"version"`
 	Hash            string `json:"hash"`

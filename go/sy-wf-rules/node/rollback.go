@@ -42,6 +42,7 @@ func (s *Service) RollbackWorkflow(req RollbackRequest) (*RollbackResult, error)
 	if err != nil {
 		return nil, WfRulesError{Code: "PACKAGE_PUBLISH_FAILED", Detail: err.Error()}
 	}
+	_ = s.PurgeWorkflowPackages(workflowName, true)
 	return &RollbackResult{
 		Current: *currentMeta,
 		Package: *publish,

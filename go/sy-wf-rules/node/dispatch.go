@@ -94,6 +94,26 @@ func (s *Service) handleCommand(msg fluxbeesdk.Message) {
 			payload["warning"] = result.Warning
 		}
 		s.sendCommandResponse(msg, action, payload)
+	case "delete_workflow":
+		var req DeleteWorkflowRequest
+		if err := json.Unmarshal(msg.Payload, &req); err != nil {
+			s.sendCommandResponse(msg, action, map[string]any{
+				"status":       "error",
+				"error_code":   "INVALID_CONFIG_SET",
+				"error_detail": err.Error(),
+			})
+			return
+		}
+		result, err := s.DeleteWorkflow(req)
+		if err != nil {
+			s.sendCommandResponse(msg, action, commandErrorPayload(err))
+			return
+		}
+		s.sendCommandResponse(msg, action, map[string]any{
+			"status":  "ok",
+			"deleted": result.Deleted,
+			"wf_node": result.WFNode,
+		})
 	}
 }
 
@@ -128,20 +148,68 @@ func (s *Service) handleQuery(msg fluxbeesdk.Message) {
 		})
 		return
 	case "list_workflows":
-		workflows, err := s.store.ListWorkflows()
+		workflows, err := s.ListWorkflowStatuses()
 		if err != nil {
 			s.sendQueryResponse(msg, action, map[string]any{
 				"status":       "error",
-				"error_code":   "STORE_ERROR",
+				"error_code":   "WFRULES_ERROR",
 				"error_detail": err.Error(),
 			})
 			return
 		}
+		items := make([]map[string]any, 0, len(workflows))
+		for _, workflow := range workflows {
+			items = append(items, map[string]any{
+				"workflow_name":     workflow.WorkflowName,
+				"current_version":   formatOptionalUint64(workflow.CurrentVersion),
+				"current_hash":      workflow.CurrentHash,
+				"published_version": workflow.PublishedVersion,
+				"deployed_version":  workflow.DeployedVersion,
+				"wf_node_running":   workflow.WFNodeRunning,
+				"active_instances":  formatOptionalInt(workflow.ActiveInstances),
+				"wf_node_timeout":   workflow.WFNodeTimeout,
+			})
+		}
 		s.sendQueryResponse(msg, action, map[string]any{
 			"status":    "ok",
 			"hive":      s.cfg.HiveID,
-			"workflows": workflows,
+			"workflows": items,
 		})
+	case "get_status":
+		var req GetStatusRequest
+		if len(msg.Payload) > 0 {
+			if err := json.Unmarshal(msg.Payload, &req); err != nil {
+				s.sendQueryResponse(msg, action, map[string]any{
+					"status":       "error",
+					"error_code":   "INVALID_CONFIG_SET",
+					"error_detail": err.Error(),
+				})
+				return
+			}
+		}
+		statusView, err := s.GetWorkflowStatus(req)
+		if err != nil {
+			s.sendQueryResponse(msg, action, commandErrorPayload(err))
+			return
+		}
+		payload := map[string]any{
+			"status":            "ok",
+			"hive":              s.cfg.HiveID,
+			"workflow_name":     statusView.WorkflowName,
+			"current_version":   formatOptionalUint64(statusView.CurrentVersion),
+			"current_hash":      statusView.CurrentHash,
+			"staged_version":    formatOptionalUint64(statusView.StagedVersion),
+			"last_error":        statusView.LastError,
+			"published_version": statusView.PublishedVersion,
+			"wf_node": map[string]any{
+				"node_name":        statusView.WFNode.NodeName,
+				"running":          statusView.WFNode.Running,
+				"active_instances": formatOptionalInt(statusView.WFNode.ActiveInstances),
+				"wf_node_timeout":  statusView.WFNode.Timeout,
+				"deployed_version": statusView.WFNode.RuntimeVersion,
+			},
+		}
+		s.sendQueryResponse(msg, action, payload)
 	}
 }
 
@@ -491,4 +559,35 @@ func stringValue(value *string) string {
 func stringValueFromMap(values map[string]any, key string) string {
 	raw, _ := values[key].(string)
 	return raw
+}
+
+func intValueFromMap(values map[string]any, key string) int {
+	switch value := values[key].(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	case uint64:
+		return int(value)
+	default:
+		return 0
+	}
+}
+
+func configMapFromNodeConfigPayload(payload map[string]any) map[string]any {
+	config, _ := payload["config"].(map[string]any)
+	if config == nil {
+		return map[string]any{}
+	}
+	return config
+}
+
+func stringValueFromMapMap(values map[string]any, outerKey, innerKey string) string {
+	raw, _ := values[outerKey].(map[string]any)
+	if raw == nil {
+		return ""
+	}
+	return stringValueFromMap(raw, innerKey)
 }

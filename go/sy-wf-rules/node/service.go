@@ -28,6 +28,7 @@ type Service struct {
 	sender       sender
 	receiver     receiver
 	orchestrator orchestratorClient
+	wfNodes      wfNodeClient
 	clock        ClockFunc
 }
 
@@ -41,6 +42,7 @@ func NewService(cfg NodeConfig, snd sender, rcv receiver, clock ClockFunc) *Serv
 		sender:       snd,
 		receiver:     rcv,
 		orchestrator: newOrchestratorClient(snd, rcv),
+		wfNodes:      newWFNodeClient(snd, rcv),
 		clock:        clock,
 	}
 }
