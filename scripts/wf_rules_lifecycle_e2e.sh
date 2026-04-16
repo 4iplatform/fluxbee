@@ -389,7 +389,7 @@ fi
 if [[ "$SKIP_ROLLBACK" != "1" ]]; then
   step "6. rollback (restore v1)"
 
-  resp="$(wf_post "/rollback" "{\"workflow_name\":\"$WF_NAME\"}")"
+  resp="$(wf_post "/rollback" "{\"workflow_name\":\"$WF_NAME\",\"auto_spawn\":$AUTO_SPAWN}")"
   echo "  response: $resp"
 
   ok="$(json_get "$resp" "payload.ok")"
@@ -411,11 +411,11 @@ step "7. delete (force=false)"
 resp="$(wf_post "/delete" "{\"workflow_name\":\"$WF_NAME\",\"force\":false}")"
 echo "  response: $resp"
 
-ok="$(json_get "$resp" "payload.ok")"
+delete_status="$(json_get "$resp" "payload.status")"
 deleted="$(json_get "$resp" "payload.deleted")"
 
-assert_eq "ok"      "$ok"      "true"
-assert_eq "deleted" "$deleted" "true"
+assert_eq "status"  "$delete_status" "ok"
+assert_eq "deleted" "$deleted"       "true"
 
 # verify it's gone
 resp="$(wf_get "?workflow_name=$WF_NAME")"
