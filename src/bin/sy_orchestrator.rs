@@ -1777,6 +1777,7 @@ fn is_allowed_system_source_name(state: &OrchestratorState, src_l2_name: Option<
         || name.starts_with("SY.orchestrator@")
         || name.starts_with("SY.orchestrator.")
         || name.starts_with("SY.admin@")
+        || name.starts_with("SY.wf-rules@")
         || name.starts_with("WF.orch.diag@")
 }
 

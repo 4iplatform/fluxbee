@@ -236,8 +236,8 @@ cleanup() {
   echo
   echo "── cleanup: deleting $WF_NAME (force=true) ──"
   resp="$(wf_post "/delete" "{\"workflow_name\":\"$WF_NAME\",\"force\":true}" 2>/dev/null || true)"
-  ok="$(json_get "$resp" "ok")"
-  deleted="$(json_get "$resp" "deleted")"
+  ok="$(json_get "$resp" "payload.ok")"
+  deleted="$(json_get "$resp" "payload.deleted")"
   if [[ "$deleted" == "true" || "$ok" == "true" ]]; then
     echo "  cleaned up $WF_NAME"
   else
@@ -266,11 +266,11 @@ print(json.dumps({
 resp="$(wf_post "/compile" "$body")"
 echo "  response: $resp"
 
-ok="$(json_get "$resp" "ok")"
-state="$(json_get "$resp" "state")"
-staged_version="$(json_get "$resp" "effective_config.staged.version")"
-staged_hash="$(json_get "$resp" "effective_config.staged.hash")"
-guard_count="$(json_get "$resp" "effective_config.staged.guard_count")"
+ok="$(json_get "$resp" "payload.ok")"
+state="$(json_get "$resp" "payload.state")"
+staged_version="$(json_get "$resp" "payload.effective_config.staged.version")"
+staged_hash="$(json_get "$resp" "payload.effective_config.staged.hash")"
+guard_count="$(json_get "$resp" "payload.effective_config.staged.guard_count")"
 
 assert_eq  "ok"            "$ok"    "true"
 assert_eq  "state"         "$state" "configured"
@@ -286,9 +286,9 @@ body="{\"workflow_name\":\"$WF_NAME\",\"auto_spawn\":$AUTO_SPAWN}"
 resp="$(wf_post "/apply" "$body")"
 echo "  response: $resp"
 
-ok="$(json_get "$resp" "ok")"
-current_version="$(json_get "$resp" "effective_config.current.version")"
-wf_node_action="$(json_get "$resp" "wf_node.action")"
+ok="$(json_get "$resp" "payload.ok")"
+current_version="$(json_get "$resp" "payload.effective_config.current.version")"
+wf_node_action="$(json_get "$resp" "payload.wf_node.action")"
 
 assert_eq "ok"              "$ok"          "true"
 assert_nonempty "current.version" "$current_version"
@@ -309,8 +309,8 @@ resp="$(wf_get "?workflow_name=$WF_NAME")"
 echo "  response: $(echo "$resp" | python3 -c "import json,sys; d=json.load(sys.stdin); d.pop('definition',None); print(json.dumps(d))" 2>/dev/null || echo "$resp")"
 
 status="$(json_get "$resp" "status")"
-wf_name="$(json_get "$resp" "workflow_name")"
-version="$(json_get "$resp" "version")"
+wf_name="$(json_get "$resp" "payload.workflow_name")"
+version="$(json_get "$resp" "payload.version")"
 
 assert_eq "status"          "$status"  "ok"
 assert_eq "workflow_name"   "$wf_name" "$WF_NAME"
@@ -326,7 +326,7 @@ if [[ "$AUTO_SPAWN" == "true" && "$WF_NODE_WAIT_SECS" -gt 0 ]]; then
   deadline=$((SECONDS + WF_NODE_WAIT_SECS))
   while [[ $SECONDS -lt $deadline ]]; do
     resp="$(wf_get "/status?workflow_name=$WF_NAME")"
-    running="$(json_get "$resp" "wf_node.running")"
+    running="$(json_get "$resp" "payload.wf_node.running")"
     if [[ "$running" == "true" ]]; then break; fi
     sleep 2
   done
@@ -336,16 +336,16 @@ resp="$(wf_get "/status?workflow_name=$WF_NAME")"
 echo "  response: $resp"
 
 status="$(json_get "$resp" "status")"
-current_v="$(json_get "$resp" "current_version")"
-current_hash="$(json_get "$resp" "current_hash")"
+current_v="$(json_get "$resp" "payload.current_version")"
+current_hash="$(json_get "$resp" "payload.current_hash")"
 
 assert_eq "status"          "$status"    "ok"
 assert_eq "current_version" "$current_v" "$V1"
 assert_nonempty "current_hash" "$current_hash"
 
 if [[ "$AUTO_SPAWN" == "true" ]]; then
-  running="$(json_get "$resp" "wf_node.running")"
-  node_name="$(json_get "$resp" "wf_node.node_name")"
+  running="$(json_get "$resp" "payload.wf_node.running")"
+  node_name="$(json_get "$resp" "payload.wf_node.node_name")"
   assert_eq "wf_node.running" "$running" "true"
   assert_contains "wf_node.node_name" "$node_name" "WF.$WF_NAME@"
 fi
@@ -356,18 +356,19 @@ step "5. compile_apply v2 (update definition)"
 
 body="$(python3 -c "
 import json, sys
+auto_spawn = '$AUTO_SPAWN' == 'true'
 print(json.dumps({
     'workflow_name': '$WF_NAME',
     'definition': json.loads(sys.stdin.read()),
-    'auto_spawn': $(echo "$AUTO_SPAWN"),
+    'auto_spawn': auto_spawn,
 }))" < <(definition_v2))"
 
 resp="$(wf_post "" "$body")"
 echo "  response: $resp"
 
-ok="$(json_get "$resp" "ok")"
-current_version="$(json_get "$resp" "effective_config.current.version")"
-wf_node_action="$(json_get "$resp" "wf_node.action")"
+ok="$(json_get "$resp" "payload.ok")"
+current_version="$(json_get "$resp" "payload.effective_config.current.version")"
+wf_node_action="$(json_get "$resp" "payload.wf_node.action")"
 
 assert_eq "ok"             "$ok"   "true"
 assert_nonempty "current.version" "$current_version"
@@ -391,14 +392,14 @@ if [[ "$SKIP_ROLLBACK" != "1" ]]; then
   resp="$(wf_post "/rollback" "{\"workflow_name\":\"$WF_NAME\"}")"
   echo "  response: $resp"
 
-  ok="$(json_get "$resp" "ok")"
-  rolled_version="$(json_get "$resp" "effective_config.current.version")"
+  ok="$(json_get "$resp" "payload.ok")"
+  rolled_version="$(json_get "$resp" "payload.effective_config.current.version")"
 
   assert_eq "ok" "$ok" "true"
   assert_eq "rolled back to v1" "$rolled_version" "$V1"
 
   if [[ "$AUTO_SPAWN" == "true" ]]; then
-    wf_node_action="$(json_get "$resp" "wf_node.action")"
+    wf_node_action="$(json_get "$resp" "payload.wf_node.action")"
     assert_eq "wf_node.action (rollback)" "$wf_node_action" "restarted"
   fi
 fi
@@ -410,8 +411,8 @@ step "7. delete (force=false)"
 resp="$(wf_post "/delete" "{\"workflow_name\":\"$WF_NAME\",\"force\":false}")"
 echo "  response: $resp"
 
-ok="$(json_get "$resp" "ok")"
-deleted="$(json_get "$resp" "deleted")"
+ok="$(json_get "$resp" "payload.ok")"
+deleted="$(json_get "$resp" "payload.deleted")"
 
 assert_eq "ok"      "$ok"      "true"
 assert_eq "deleted" "$deleted" "true"
