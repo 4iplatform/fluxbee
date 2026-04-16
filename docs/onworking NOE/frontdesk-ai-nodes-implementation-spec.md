@@ -6,6 +6,12 @@
 > - `AI.common` y `SY.frontdesk.gov` como runtimes diferenciados,
 > - `SY.frontdesk.gov` apoyado en `nodes/gov/common` + SDKs,
 > - `mode=gov` queda como mecanismo transicional.
+>
+> Nota 2026-04-16:
+> Este documento queda historico.
+> La especificacion formal vigente de `SY.frontdesk.gov` es:
+> [docs/ai-frontdesk-gov-spec.md](d:/repos/json-router/docs/ai-frontdesk-gov-spec.md)
+> En caso de diferencia, prevalece esa spec formal.
 
 > Objetivo: definir **qué hay que cambiar** (no el orden) para:
 > 1) habilitar `SY.frontdesk.gov` como **AI Node** con capacidad de completar identidad vía Identity,

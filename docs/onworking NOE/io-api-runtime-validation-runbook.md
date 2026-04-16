@@ -1711,3 +1711,29 @@ Se considera recuperado cuando `rt-gateway` vuelve a mostrar:
 - `node registered ... name=SY.frontdesk.gov@motherbee`
 
 Despues de ese reinicio, las pruebas tenant-aware volvieron a responder `202 Accepted`.
+
+### 25.16. Validacion final de `by_ilk`
+
+Con el ajuste final en `IO.api`, el modo `explicit_subject by_ilk` quedo validado en Linux para ambos casos canonicos:
+
+- `by_ilk` con ILK existente:
+  - HTTP `202 Accepted`
+  - la respuesta conserva el mismo `ilk` pedido
+- `by_ilk` con ILK inexistente:
+  - HTTP `404 Not Found`
+  - `error_code = "ilk_does_not_exist"`
+
+Resultado observado final para ILK inexistente:
+
+```json
+{
+  "error_code": "ilk_does_not_exist",
+  "error_message": "Requested subject ILK 'ilk:no-existe' does not exist",
+  "status": "error"
+}
+```
+
+Lectura correcta:
+
+- `IO.api` ya no expone ese caso como `identity_unavailable`;
+- el contrato HTTP queda alineado con la semantica esperada de validacion canonica de ILK inexistente.
