@@ -99,4 +99,22 @@ mod tests {
         let response = frontdesk_result_response(sample_payload("ok", "REGISTERED"));
         assert_eq!(response.status(), StatusCode::OK);
     }
+
+    #[test]
+    fn frontdesk_error_invalid_request_maps_to_unprocessable_entity() {
+        let response = frontdesk_result_response(sample_payload("error", "INVALID_REQUEST"));
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn frontdesk_error_identity_unavailable_maps_to_service_unavailable() {
+        let response = frontdesk_result_response(sample_payload("error", "IDENTITY_UNAVAILABLE"));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn frontdesk_error_register_failed_maps_to_bad_gateway() {
+        let response = frontdesk_result_response(sample_payload("error", "REGISTER_FAILED"));
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
 }

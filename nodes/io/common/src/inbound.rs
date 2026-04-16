@@ -162,7 +162,7 @@ impl InboundProcessor {
             );
             Some(src_ilk_override.clone())
         } else {
-            match identity.lookup(&identity_input.channel, &identity_input.external_id) {
+            match identity.lookup(&identity_input) {
                 Ok(Some(src_ilk)) => {
                     self.stats.identity_lookup_hits += 1;
                     tracing::debug!(
@@ -206,11 +206,7 @@ impl InboundProcessor {
                             src_ilk = %provisioned_ilk,
                             "identity provisioned on miss"
                         );
-                        identity.remember(
-                            &identity_input.channel,
-                            &identity_input.external_id,
-                            &provisioned_ilk,
-                        );
+                        identity.remember(&identity_input, &provisioned_ilk);
                         src_ilk = Some(provisioned_ilk);
                     }
                     Ok(None) => {
@@ -270,11 +266,7 @@ mod tests {
             self
         }
 
-        fn lookup(
-            &self,
-            _channel: &str,
-            _external_id: &str,
-        ) -> Result<Option<String>, IdentityError> {
+        fn lookup(&self, _input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError> {
             Ok(None)
         }
     }
@@ -496,11 +488,7 @@ mod tests {
             self
         }
 
-        fn lookup(
-            &self,
-            _channel: &str,
-            _external_id: &str,
-        ) -> Result<Option<String>, IdentityError> {
+        fn lookup(&self, _input: &ResolveOrCreateInput) -> Result<Option<String>, IdentityError> {
             Ok(Some("ilk:hit:test".to_string()))
         }
     }

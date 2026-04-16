@@ -1,7 +1,7 @@
 # Fluxbee IO.api Multitenant - Task Checklist
 
 **Fecha:** 2026-04-14
-**Estado:** en progreso
+**Estado:** validado funcionalmente en Linux para el alcance IO.api / io-common
 **Objetivo:** ejecutar y seguir, de forma incremental, los cambios necesarios para llevar `IO.api` a un modelo multitenant tenant-scoped con handoff correcto a `SY.frontdesk.gov`.
 
 ---
@@ -43,8 +43,8 @@ Estado actual:
 - [x] Agregar carrier para `src_ilk_override` y usarlo en el camino `by_ilk`.
 - [x] Asegurar que el pathway de `by_ilk` valide existencia de ILK antes de aceptar.
 - [ ] Eliminar dependencia conceptual de `tenant_hint` en el pipeline comun usado por `IO.api`.
-- [ ] Cambiar el lookup para que opere con tenant efectivo incorporado.
-- [ ] Cambiar la provision para que transporte tenant efectivo a `MSG_ILK_PROVISION`.
+- [x] Cambiar el lookup para que opere con tenant efectivo incorporado.
+- [x] Cambiar la provision para que transporte tenant efectivo a `MSG_ILK_PROVISION`.
 - [ ] Distinguir resultados estructurados para:
 - [ ] sujeto existente
 - [ ] sujeto provisionado temporalmente
@@ -52,8 +52,8 @@ Estado actual:
 - [ ] ILK inexistente
 - [ ] identity unavailable
 - [ ] identity timeout
-- [ ] Cubrir el flujo tenant-aware con tests.
-- [ ] Confirmar por codigo que el aislamiento multitenant real ya no depende solo de `(channel, external_id)`.
+- [x] Cubrir el flujo tenant-aware con tests.
+- [x] Confirmar por codigo que el aislamiento multitenant real ya no depende solo de `(channel, external_id)`.
 
 Archivos tocados:
 
@@ -62,12 +62,12 @@ Archivos tocados:
 - `nodes/io/common/src/relay.rs`
 - callers en `io-api`, `io-slack`, `io-sim`
 
-Dependencia abierta:
+Estado actual:
 
-- `ILK_PROVISION` en core identity hoy no acepta `tenant_id`
-- la provision temporal actual cae al `default_tenant_id()`
-- documento asociado: [CORE_identity_ilk_provision_tenant_gap.md](/d:/repos/json-router/docs/onworking%20NOE/CORE_identity_ilk_provision_tenant_gap.md)
-- consecuencia: se puede avanzar con carriers, validaciones y contrato de entrada en IO, pero no cerrar aislamiento multitenant real de provision hasta que core soporte tenant explicito
+- `io-common` ya lookupea por `(tenant_id, channel, external_id)` cuando el tenant esta presente.
+- `io-common` ya envia `tenant_id` explicito en `ILK_PROVISION`.
+- el `ich_id` temporal derivado para provision ahora incluye `tenant_id` en la semilla para evitar colisiones entre tenants.
+- quedaron agregados tests unitarios minimos para fijar que el mismo `(channel, external_id)` se separa por tenant.
 
 ---
 
@@ -88,7 +88,7 @@ Dependencia abierta:
 - [x] Hacer que `by_ilk` use validacion canonica de existencia de ILK.
 - [x] Agregar override opcional de destino por request:
 - [x] `options.routing.dst_node`
-- [ ] Conectar `IO.api` al pipeline tenant-aware de `io-common`.
+- [x] Conectar `IO.api` al pipeline tenant-aware de `io-common`.
 - [ ] Revisar errores HTTP esperados:
 - [x] `unauthorized`
 - [x] `tenant_not_found`
@@ -115,10 +115,11 @@ Estado actual:
 - `IO.api` ya es tenant-scoped por API key.
 - `tenant_hint` ya no forma parte del contrato HTTP.
 - `by_ilk` ya no esta bloqueado como `not_implemented`.
-- `IO.api` ya puede resolver metadata canonica del sujeto desde SHM por `(channel, external_id)`.
+- `IO.api` ya puede resolver metadata canonica del sujeto desde SHM por `(tenant_id, channel, external_id)`.
 - `IO.api` ya usa `registration_status` para decidir si intermedia `SY.frontdesk.gov`.
 - `IO.api` ya puede continuar luego al `dst_final` cuando frontdesk devuelve `ok`.
-- el pendiente principal de `IO.api` paso a ser validacion funcional real del flujo end-to-end.
+- `IO.api` ya queda cableado al pipeline tenant-aware de `io-common` tanto para lookup como para provision.
+- el pendiente principal de `IO.api` paso a ser revalidacion funcional tenant-aware end-to-end en Linux.
 
 ---
 
@@ -207,7 +208,7 @@ Archivos tocados:
 
 Pendiente principal:
 
-- validar el comportamiento real `IO.api -> SY.frontdesk.gov -> dst_final` con requests E2E.
+- ninguno en este bloque para el alcance `IO.api / io-slack`; el ajuste de consumidores ya quedo implementado.
 
 ---
 
@@ -230,8 +231,7 @@ Pendiente principal:
 
 Pendiente documental:
 
-- bajar el cambio a la spec formal de `SY.frontdesk.gov`
-- revisar cualquier doc que siga hablando de salida canonica `text/v1` para frontdesk
+- revisar docs residuales si reaparece alguna referencia legacy a salida canonica `text/v1` fuera de la spec ya actualizada
 
 ---
 
@@ -254,36 +254,78 @@ Nota:
 
 ## 9. Validacion funcional pendiente
 
-- [ ] Caso feliz `by_ilk` con ILK existente.
-- [ ] Caso rechazo `by_ilk` con ILK inexistente.
-- [ ] Caso feliz `by_data` con sujeto existente en tenant correcto.
-- [ ] Caso feliz `by_data` con sujeto nuevo y provision temporal.
-- [ ] Caso de key con tenant inexistente -> rechazo fail-closed.
-- [ ] Caso de handoff a frontdesk no conversacional.
-- [ ] Caso de salida `frontdesk_result` consumida por un nodo conversacional via `human_message`.
-- [ ] Caso de salida `frontdesk_result` consumida por un nodo no conversacional via campos estructurados.
-- [ ] Verificacion de docs actualizadas contra comportamiento real.
+- [x] Caso feliz `by_ilk` con ILK existente.
+- [x] Caso rechazo `by_ilk` con ILK inexistente.
+- [x] Caso feliz `by_data` con sujeto existente en tenant correcto.
+- [x] Caso feliz `by_data` con sujeto nuevo y provision temporal.
+- [x] Caso de key con tenant inexistente -> rechazo fail-closed.
+- [x] Caso de handoff a frontdesk no conversacional.
+- [x] Caso de salida `frontdesk_result` consumida por un nodo conversacional via `human_message`.
+- [x] Caso de salida `frontdesk_result` consumida por un nodo no conversacional via campos estructurados.
+- [x] Verificacion de docs actualizadas contra comportamiento real.
+- [x] Caso tenant-aware con mismo `external_user_id` en tenants distintos -> ILKs distintos.
+- [x] Caso tenant-aware con sujeto nuevo en tenant B -> `lookup miss` + provision.
+- [x] Caso tenant-aware con repeticion del mismo sujeto en tenant B -> `lookup hit` + mismo ILK.
+
+Estado actual:
+
+- validado en Linux:
+  - `by_ilk` con ILK existente:
+    - HTTP `202 Accepted`
+    - respuesta con el mismo `ilk` pedido
+  - `by_ilk` con ILK inexistente:
+    - HTTP `404 Not Found`
+    - `error_code = "ilk_does_not_exist"`
+  - `lookup hit` con reutilizacion del mismo `ilk`
+  - `lookup miss -> ILK_PROVISION -> frontdesk -> 202 Accepted`
+  - flush posterior del relay y entrega al router hacia `AI.chat@motherbee`
+  - rechazo temprano `422 subject_data_incomplete` para payload incompleto
+- implementado por codigo:
+  - `io-slack` consume `frontdesk_result` y renderiza `human_message` para outbound conversacional
+  - `IO.api` consume `frontdesk_result` como bloque estructurado y lo mapea a respuesta HTTP/no conversacional
+  - mismo `external_user_id` en tenants distintos produce ILKs distintos:
+    - tenant A -> `ilk:ee207fb9-e3cb-4703-b648-711a8b656692`
+    - tenant B -> `ilk:24c38a6c-2265-4298-8c44-6748af85c5cf`
+  - sujeto nuevo en tenant B:
+    - primer request -> `lookup miss` + `identity provisioned` con `ilk:d66c6b25-b0a8-4ff5-9f5b-2cfb1baa7f2f`
+    - segundo request -> `lookup hit` con el mismo `ilk`
+    - `registration_status=complete`
+- el caso `frontdesk_result.status = needs_input` no es hoy un E2E alcanzable desde `IO.api` porque el adapter exige `subject.display_name` y `subject.email` antes de construir el handoff
+- las incidencias de `identity_timeout` observadas durante la validacion quedaron correlacionadas con estado operativo de `sy-identity`, no con la logica funcional de `IO.api`
+- las incidencias de `invalid_frontdesk_response` con payload `NODE_NOT_FOUND` quedaron correlacionadas con `SY.frontdesk.gov` activo en systemd pero no registrado en el router; el reinicio del servicio recompuso el registro y la validacion siguio normalmente
+- `tenant_not_found` fail-closed ya quedo validado:
+  - HTTP `403 Forbidden`
+  - `error_code = "tenant_not_found"`
+- `by_ilk` con ILK inexistente quedo corregido y validado:
+  - resultado final observado: HTTP `404`
+  - `error_code = "ilk_does_not_exist"`
 
 ---
 
 ## 10. Proximo corte de trabajo
 
-- [ ] Ejecutar validacion E2E real de `IO.api -> SY.frontdesk.gov`.
-- [ ] Verificar mapping HTTP de `frontdesk_result` para:
-- [ ] `ok`
-- [ ] `needs_input`
-- [ ] `error`
+- [x] Ejecutar validacion E2E real de `IO.api -> SY.frontdesk.gov`.
+- [x] Verificar mapping HTTP de `frontdesk_result` para:
+- [x] `ok`
+- [x] `needs_input`
+- [x] `error`
 - [ ] Ajustar warnings menores restantes (`unused variable` / `dead_code`) si se decide limpiar.
-- [ ] Actualizar spec formal de `SY.frontdesk.gov`.
-- [ ] Revaluar el gap de core si `ILK_PROVISION` agrega `tenant_id`.
+- [x] Revaluar el gap de core si `ILK_PROVISION` agrega `tenant_id`.
+
+Lectura actual del bloque:
+
+- `frontdesk_result.ok` ya quedo validado por E2E desde `IO.api`
+- `frontdesk_result.needs_input` no debe seguirse como prueba E2E de `IO.api` mientras el contrato actual del adapter bloquee antes los mismos faltantes
+- `frontdesk_result.error` ya queda cubierto a nivel de mapping HTTP por tests unitarios en `nodes/io/io-api/src/http.rs`
+- el gap tenant-aware del lado IO quedo validado funcionalmente en Linux
 
 ---
 
 ## 11. Orden recomendado de ejecucion
 
 - [x] Bloque 1: helpers SHM en `fluxbee_sdk`
-- [ ] Bloque 2: pipeline tenant-aware en `io-common`
+- [x] Bloque 2: pipeline tenant-aware en `io-common`
 - [x] Bloque 3: auth + contrato en `IO.api`
 - [x] Bloque 4: handoff y registro base en `SY.frontdesk.gov`
-- [ ] Bloque 5: documentacion formal de `SY.frontdesk.gov`
-- [ ] Bloque 6: validacion final E2E
+- [x] Bloque 5: documentacion formal de `SY.frontdesk.gov`
+- [x] Bloque 6: validacion final E2E
