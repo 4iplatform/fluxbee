@@ -608,6 +608,18 @@ go/sy-wf-rules/
 - [x] Admin response envelope accepts `sy.wf-rules` ok/error payload shapes
 - [ ] **PENDING:** End-to-end forwarding test of each Admin endpoint through router to L2 (requires integration test harness)
 
+### WFRULES-TEST-13 — E2E lifecycle test on real server (2026-04-16) ✓
+
+- [x] `scripts/wf_rules_lifecycle_e2e.sh` created and passes **26/26** on real server
+- [x] Covers: compile → apply (auto_spawn) → get_workflow → get_status → compile_apply v2 → rollback → delete
+- [x] Script publishes `wf.engine` runtime at start (`publish-wf-runtime.sh --skip-build`)
+- [x] Validated fixes merged during this session:
+  - `requested_runtime_version` added to `ManagedSystemConfig` in `wf-generic` (was crashing with DisallowUnknownFields)
+  - `SY.wf-rules@` added to orchestrator allowed origins (`is_allowed_system_source_name`)
+  - `tenant_id` flows through request payload (not hardcoded in service unit)
+  - Delete tolerates WF node timeout (`force=false` no longer blocked by `INSTANCES_UNKNOWN`)
+  - Rollback sends `auto_spawn` flag correctly
+
 ---
 
 ## 16) Installation
