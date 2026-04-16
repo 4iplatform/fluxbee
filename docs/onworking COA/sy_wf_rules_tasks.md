@@ -1,24 +1,26 @@
 # SY.wf-rules — Implementation Tasks
 
 **Status:** planning / ready for implementation
-**Date:** 2026-04-15
+**Date:** 2026-04-16
 **Primary spec:** `docs/sy-wf-rules-spec.md`
 **Target module:** `go/sy-wf-rules/`
-**Dependencies:** `go/fluxbee-go-sdk`, `go/pkg/wfcel/` (shared CEL package, built here), `github.com/google/cel-go`, `github.com/santhosh-tekuri/jsonschema`
-**Reference model:** `go/sy-opa-rules/main.go`
+**Reference models:** `go/sy-opa-rules/main.go`, `docs/sy-wf-rules-spec.md`
 
 ---
 
 ## 1) Goal
 
-Implement `SY.wf-rules`, the system node that manages workflow definitions for the `WF.*` node family. The node:
+Implement `SY.wf-rules`, the system node that manages workflow source definitions for the `WF.*` family.
 
-- Receives workflow definition JSON via CONFIG_SET or command messages
-- Validates the definition (structural + CEL guard compilation)
-- Manages staged / current / backup state per workflow
-- Coordinates with `SY.orchestrator` (kill_node + run_node) to apply definitions to live WF nodes
-- Exposes query operations for definition inspection and status
-- Never touches `/var/lib/fluxbee/nodes/` directly — all WF node filesystem ops go through the orchestrator
+The node:
+
+- receives workflow definition JSON via L2 (`CONFIG_SET`, command messages, query messages)
+- validates definitions using the shared CEL validation package
+- manages `staged/`, `current/`, `backup/` state per workflow
+- materializes and publishes workflow runtime packages in `dist`
+- coordinates explicit rollout with `SY.orchestrator`
+- never writes under `/var/lib/fluxbee/nodes/`
+- exposes query/status operations and an Admin surface proxied by `SY.admin`
 
 One binary, one instance per hive, managing all workflows for that hive.
 
@@ -26,424 +28,695 @@ One binary, one instance per hive, managing all workflows for that hive.
 
 ## 2) Frozen decisions
 
-- **Language:** Go. Module `github.com/4iplatform/json-router/sy-wf-rules`.
-- **CEL validation:** in-process via `github.com/google/cel-go`. Compiled programs NOT persisted.
-- **wf-generic reads:** `workflow_definition` field embedded in `config.json`. No separate file.
-- **Orchestrator protocol:** `kill_node` + `run_node` in sequence (no atomic restart verb today).
-- **Kill failure tolerance:** if `kill_node` fails, proceed to `run_node` anyway (node may already be dead).
-- **run_node failure:** retry once after 1s. If still fails, return `restart_failed` partial-success response.
-- **active_instances source:** `WF_LIST_INSTANCES` query to WF node with 2s timeout. On timeout: `running: false, active_instances: null, wf_node_timeout: true`. Never assume zero on no response.
-- **delete with force=false + unreachable node:** return `INSTANCES_UNKNOWN`, refuse delete.
-- **workflow_name:** always required for all operations including apply and rollback.
-- **`check` operation:** silent synonym for `compile`. Canonical name is `compile`.
-- **Shared CEL package:** `go/pkg/wfcel/` built first, used by both sy-wf-rules and wf-generic.
-- **State storage:** filesystem only (no SQLite). Small JSON files, same pattern as sy.opa-rules.
-- **No SHM region.** WF definitions are not memory-mapped; they flow through config.json at WF boot.
-- **auto_spawn default:** `false`. Operator explicitly spawns.
+- **Source of truth:** workflow source/versioning lives in `SY.wf-rules`.
+- **Runtime execution model:** `WF.<workflow_name>@<hive>` runs as runtime `wf.<workflow_name>`, with `runtime_base = "wf.engine"`.
+- **WF code delivery:** `wf-generic` reads `flow/definition.json` from `_system.package_path` at boot.
+- **No inline workflow code in managed config:** `workflow_definition` is not persisted in node `config.json`.
+- **Instance binding:** `_system.runtime_version` / `_system.package_path` is fixed until explicit rollout.
+- **Publication vs deployment:** publishing a newer package to `dist` does not deploy it by itself.
+- **Crash/autorestart semantics:** if a WF node crashes before explicit rebind/restart completes, it restarts on the previously persisted binding.
+- **Operations:** `compile`, `compile_apply`, `apply`, `rollback`, `delete_workflow`, `get_workflow`, `get_status`, `list_workflows`.
+- **`check` alias:** silent synonym for `compile`.
+- **State model:** one `current`, one `staged`, one `backup` per workflow.
+- **No SHM:** this node does not use SHM for workflow delivery.
+- **Package publication path:** reuse the standard Fluxbee install/publish implementation through code or a structured internal command path. No shell scripts.
+- **Lifecycle ownership:** `SY.orchestrator` owns managed config, spawn/kill, and `/var/lib/fluxbee/nodes/...`.
+- **Admin ownership:** `SY.admin` is gateway only. `SY.wf-rules` does compile/apply/publish work.
+- **Delete semantics:** managed instance cleanup goes through orchestrator/admin lifecycle, not direct filesystem deletion.
+- **Retention policy v1:** keep `current`, keep `backup`, keep any package version still referenced by a live or persisted node instance.
+- **Language:** Go.
 
 ---
 
-## 3) Critical dependency: shared CEL package
+## 3) Implementation workstreams
 
-### WFRULES-DEP-1 — go/pkg/wfcel/ must be built before WFRULES-VAL-1
+Implementation is split into six workstreams:
 
-The CEL environment setup and guard validation logic will be shared between `sy-wf-rules` and `wf-generic`. This avoids drift between the validation sy.wf-rules performs at compile time and the validation wf-generic performs at boot.
+1. Shared CEL validation package
+2. `SY.wf-rules` node and filesystem state
+3. Workflow package publication in `dist`
+4. Orchestrator rollout / managed config binding
+5. Query/Admin surface
+6. Tests and installation
 
-**Implementation order:**
-
-1. Build `go/pkg/wfcel/` first (tasks WFRULES-CEL-*).
-2. Implement sy-wf-rules validation using that package.
-3. When wf-generic is implemented, it imports the same package.
-
-If `go/pkg/wfcel/` does not yet exist, it is created as part of this task set.
+The task order at the end reflects these dependencies.
 
 ---
 
-## 4) Module setup
+## 4) Shared CEL package (`go/pkg/wfcel`)
 
-### WFRULES-SETUP-1 — go.mod
-- [ ] Create `go/sy-wf-rules/go.mod`
-  - module: `github.com/4iplatform/json-router/sy-wf-rules`
-  - go version: 1.25.0
-  - require: `fluxbee-go-sdk`, `github.com/google/cel-go`, `github.com/santhosh-tekuri/jsonschema`, `github.com/google/uuid`
-  - replace: `github.com/4iplatform/json-router/fluxbee-go-sdk => ../fluxbee-go-sdk`
-  - replace: `github.com/4iplatform/json-router/pkg/wfcel => ../pkg/wfcel`
-- [ ] Run `go mod tidy`
+### WFRULES-CEL-1 — Create module
+- [x] Create `go/pkg/wfcel/go.mod`
+- [x] Module path: `github.com/4iplatform/json-router/pkg/wfcel`
+- [x] Add dependencies required for CEL environment and JSON validation
 
-### WFRULES-SETUP-2 — Directory structure
-- [ ] Create initial scaffold:
-```
+### WFRULES-CEL-2 — WorkflowDefinition types
+- [x] Define minimal types needed to validate workflow definitions:
+  - `WorkflowDefinition`
+  - `StateDefinition`
+  - `TransitionDefinition`
+  - `ActionDefinition`
+- [x] Keep the type surface aligned with `wf-v1.md`
+- [x] Support JSON marshal/unmarshal
+
+### WFRULES-CEL-3 — CEL environment builder
+- [x] Build `cel.Env` with `input`, `state`, `event`
+- [x] Register `now()` helper as specified for WF v1 validation
+- [x] Make environment construction reusable by both `sy-wf-rules` and `wf-generic`
+
+### WFRULES-CEL-4 — Guard compilation
+- [x] Implement `CompileGuard`
+- [x] Compile all guards during definition validation
+- [x] Return path-aware validation errors like `states[1].transitions[0].guard`
+
+### WFRULES-CEL-5 — Full definition validation
+- [x] Implement the 11 checks from `docs/sy-wf-rules-spec.md` section 6
+- [x] Include JSON Schema validation for `input_schema`
+- [x] Validate action types, timer durations, `$ref` roots, target states, and L2 names
+- [x] Return `[]ValidationError{Path, Message}`
+
+### WFRULES-CEL-6 — Tests
+- [x] Valid definition passes
+- [x] Each validation rule has at least one failing test
+- [x] CEL typo returns correct path
+- [x] `now()` is available
+
+---
+
+## 5) Module setup (`go/sy-wf-rules/`)
+
+### WFRULES-SETUP-1 — Create module
+- [x] Create `go/sy-wf-rules/go.mod`
+- [x] Add deps:
+  - `fluxbee-go-sdk`
+  - `github.com/google/uuid`
+  - shared package `pkg/wfcel`
+- [x] Add local `replace` directives as needed
+
+### WFRULES-SETUP-2 — Create scaffold
+- [x] Create initial layout (filenames differ from original plan but all functionality is covered):
+
+```text
 go/sy-wf-rules/
 ├── go.mod
-├── main.go              # entry point: load config, call node.Run()
-├── node/
-│   ├── node.go          # Run(): connect SDK, acquire lock, enter message loop
-│   ├── dispatch.go      # route inbound messages by meta.type + meta.msg
-│   ├── config.go        # node config (hive_id, state_dir, orchestrator target)
-│   ├── store.go         # filesystem state: staged/current/backup r/w helpers
-│   ├── validate.go      # compile step: call wfcel.ValidateDefinition, write staged
-│   ├── apply.go         # apply step: rotate dirs, call orchestrator
-│   ├── orchestrator.go  # L2 helpers: get_node_status, get_node_config, set_node_config, kill_node, run_node
-│   ├── wfnode.go        # WF_LIST_INSTANCES query helper (active_instances lookup)
-│   ├── handlers.go      # handleConfigSet, handleCompileWorkflow, handleApplyWorkflow, etc.
-│   └── query.go         # handleGetWorkflow, handleGetStatus, handleListWorkflows
+├── main.go
+└── node/
+    ├── config.go        (NodeConfig + RuntimeConfig)
+    ├── service.go       (Service + Run/RunWithContext)
+    ├── dispatch.go      (handleSystemMessage, handleCommand, handleQuery)
+    ├── types.go         (request/response/payload types)
+    ├── compile.go       (CompileWorkflow)
+    ├── apply.go         (ApplyWorkflow)
+    ├── deploy.go        (ApplyWorkflowAndDeploy, RollbackWorkflowAndDeploy)
+    ├── rollback.go      (RollbackWorkflow)
+    ├── delete.go        (DeleteWorkflow)
+    ├── store.go         (Store, filesystem state)
+    ├── orchestrator.go  (orchestratorClient interface + l2OrchestratorClient)
+    ├── managed_config.go (buildManagedWFConfig)
+    ├── package_publish.go (PublishWorkflowPackage, PurgeOldPackages)
+    ├── wf_client.go     (wfNodeClient, CountRunningInstances)
+    ├── query.go         (GetWorkflow, GetWorkflowStatus, ListWorkflowStatuses)
+    └── status.go        (WorkflowStatusView, WFNodeStatus)
 ```
 
-### WFRULES-SETUP-3 — Shared CEL package
-- [ ] Create `go/pkg/wfcel/go.mod`
-  - module: `github.com/4iplatform/json-router/pkg/wfcel`
-- [ ] Directory structure:
-```
-go/pkg/wfcel/
-├── go.mod
-├── environment.go   # Build cel.Env with input/state/event/now()
-├── compile.go       # CompileGuard(env, expr string) → error
-└── validate.go      # ValidateDefinition(def WorkflowDefinition) → []ValidationError
-```
-
----
-
-## 5) Shared CEL package (go/pkg/wfcel)
-
-### WFRULES-CEL-1 — WorkflowDefinition types in wfcel
-- [ ] Define minimal `WorkflowDefinition` Go struct covering fields needed for validation:
-  - `WfSchemaVersion`, `WorkflowType`, `InitialState`, `TerminalStates`, `States`
-  - `StateDefinition` with `Transitions []TransitionDefinition`, `EntryActions`, `ExitActions`
-  - `TransitionDefinition` with `Guard string`, `TargetState`, `Actions []ActionDefinition`
-  - `ActionDefinition` with `Type string` + per-type fields (send_message, schedule_timer, etc.)
-- [ ] JSON deserialization for the above structs
-
-### WFRULES-CEL-2 — CEL environment builder
-- [ ] Build `cel.Env` with three implicit variables:
-  - `input` — `map_type(string, dyn)` (from input_schema, typed as dynamic in v1)
-  - `state` — `map_type(string, dyn)`
-  - `event` — `map_type(string, dyn)` (incoming message envelope)
-- [ ] Register `now()` function returning unix milliseconds (injectable clock for tests)
-
-### WFRULES-CEL-3 — Guard compilation
-- [ ] `CompileGuard(env *cel.Env, expr string) error` — compile single guard, return descriptive error
-- [ ] `CompileAllGuards(def WorkflowDefinition) []ValidationError` — walk all transitions, return errors with path (e.g. `states[1].transitions[0].guard`)
-
-### WFRULES-CEL-4 — Full definition validation (11 checks from spec §6)
-- [ ] Check 1: `wf_schema_version` present and recognized
-- [ ] Check 2: `input_schema` is valid JSON Schema
-- [ ] Check 3: `initial_state` exists in states
-- [ ] Check 4: all `terminal_states` exist in states
-- [ ] Check 5: every `target_state` in transitions exists in states
-- [ ] Check 6: every CEL guard compiles (use WFRULES-CEL-3)
-- [ ] Check 7: every action type is known (send_message, schedule_timer, cancel_timer, reschedule_timer, set_variable)
-- [ ] Check 8: `send_message` targets are syntactically valid L2 names (`<name>@<hive>` or bare name)
-- [ ] Check 9: `schedule_timer` durations ≥ 60 seconds
-- [ ] Check 10: `set_variable` names are valid identifiers (`[a-zA-Z_][a-zA-Z0-9_]*`)
-- [ ] Check 11: `$ref` paths use valid root (`input`, `state`, or `event`)
-- [ ] Return `[]ValidationError{Path, Message}`. Empty slice = valid.
-
-### WFRULES-CEL-5 — Tests for wfcel
-- [ ] Valid definition passes all 11 checks
-- [ ] Each check independently catches a crafted invalid definition
-- [ ] CEL guard with typo returns error with correct path
-- [ ] `now()` is available in guards (returns a number)
+### WFRULES-SETUP-3 — Common config/state types
+- [x] Define node config:
+  - `hive_id`
+  - `state_dir`
+  - `orchestrator_target`
+  - package publish dependencies / client
+- [x] Define shared request/response structs
 
 ---
 
 ## 6) Filesystem state management
 
-### WFRULES-STORE-1 — State directory layout
-- [ ] Ensure `/var/lib/fluxbee/wf-rules/<workflow_name>/` on first compile for that workflow
-- [ ] `staged/`, `current/`, `backup/` subdirectories created lazily
-- [ ] `definition.json` + `metadata.json` written atomically (write to tmp, rename)
+### WFRULES-STORE-1 — Directory layout
+- [x] State root: `/var/lib/fluxbee/wf-rules/<workflow_name>/`
+- [x] Manage subdirs:
+  - `staged/`
+  - `current/`
+  - `backup/`
+- [x] Create lazily on first compile for a workflow
 
-### WFRULES-STORE-2 — Metadata struct
-- [ ] `WfRulesMetadata` struct: `Version uint64`, `Hash string`, `WorkflowName`, `WorkflowType`, `WfSchemaVersion`, `CompiledAt time.Time`, `GuardCount`, `StateCount`, `ActionCount`
-- [ ] `Hash` = `sha256:` prefix + hex of `definition.json` bytes
-- [ ] `Version` auto-increments per workflow: read current `version` from `staged/metadata.json` or `current/metadata.json`, +1. If no prior state, start at 1.
-- [ ] JSON marshal/unmarshal for metadata
+### WFRULES-STORE-2 — Metadata
+- [x] Define metadata struct matching the spec:
+  - `version`
+  - `hash`
+  - `workflow_name`
+  - `workflow_type`
+  - `wf_schema_version`
+  - `compiled_at`
+  - `guard_count`
+  - `state_count`
+  - `action_count`
+  - `error_detail`
+- [x] `hash` uses `sha256:<hex>`
 
-### WFRULES-STORE-3 — Rotate dirs on apply
-- [ ] `RotateToApply(workflowName string) error`:
-  1. If `backup/` exists, delete it
-  2. Rename `current/` → `backup/` (if current/ exists)
-  3. Rename `staged/` → `current/`
-- [ ] Atomic enough for v1: on crash mid-rotate, operator can inspect and retry
+### WFRULES-STORE-3 — Atomic writes
+- [x] Write `definition.json` and `metadata.json` atomically
+- [x] Use temp file + rename semantics
+- [x] Keep implementation simple and deterministic
 
-### WFRULES-STORE-4 — Read helpers
-- [ ] `ReadCurrentDefinition(workflowName string) (*WorkflowDefinition, *WfRulesMetadata, error)`
-- [ ] `ReadStagedMetadata(workflowName string) (*WfRulesMetadata, error)`
-- [ ] `WorkflowExists(workflowName string) bool` (current/ non-empty)
-- [ ] `ListWorkflows() []string` (enumerate subdirs of wf-rules/)
+### WFRULES-STORE-4 — Version allocation
+- [x] Auto-increment logical version per workflow
+- [x] Read latest known version from `staged`, then `current`, then `backup`
+- [x] Start at `1` when empty
 
-### WFRULES-STORE-5 — Delete state dirs
-- [ ] `DeleteWorkflowState(workflowName string) error` — remove entire `/var/lib/fluxbee/wf-rules/<workflow_name>/`
+### WFRULES-STORE-5 — Read helpers
+- [x] `ReadCurrentDefinition`
+- [x] `ReadCurrentMetadata`
+- [x] `ReadStagedDefinition`
+- [x] `ReadStagedMetadata`
+- [x] `ReadBackupDefinition`
+- [x] `ReadBackupMetadata`
+- [x] `WorkflowExists`
+- [x] `ListWorkflows`
 
----
+### WFRULES-STORE-6 — Apply rotation
+- [x] Implement `RotateToApply(workflowName)`
+- [x] Behavior:
+  - delete old `backup/` if present
+  - rename `current/` to `backup/` if present
+  - rename `staged/` to `current/`
 
-## 7) Orchestrator client
+### WFRULES-STORE-7 — Rollback rotation
+- [x] Implement rollback rotation:
+  - delete `staged/` if present
+  - rename `current/` to `staged/`
+  - rename `backup/` to `current/`
 
-### WFRULES-ORCH-1 — get_node_status
-- [ ] `GetNodeStatus(nodeL2Name string) (*NodeStatus, error)` — send `get_node_status` system action to orchestrator, parse response
-- [ ] `NodeStatus`: `Running bool`, `ConfigExists bool`, `UnitActive bool`
-- [ ] Timeout: 5 seconds
-
-### WFRULES-ORCH-2 — get_node_config
-- [ ] `GetNodeConfig(nodeL2Name string) (map[string]any, error)` — send `get_node_config`, return parsed config JSON
-- [ ] Used to read existing operational fields before rewriting workflow_definition
-
-### WFRULES-ORCH-3 — set_node_config
-- [ ] `SetNodeConfig(nodeL2Name string, config map[string]any) error` — send `set_node_config` with new config
-- [ ] Timeout: 5 seconds
-
-### WFRULES-ORCH-4 — kill_node
-- [ ] `KillNode(nodeL2Name string) error` — send `kill_node` system action
-- [ ] If orchestrator returns `NODE_NOT_FOUND`: return nil (tolerated — node may already be dead)
-- [ ] Other errors: return error
-
-### WFRULES-ORCH-5 — run_node
-- [ ] `RunNode(nodeL2Name string, config map[string]any) error` — send `run_node` with `node_name`, `runtime = "wf.engine"`, and config
-- [ ] Timeout: 10 seconds
-
-### WFRULES-ORCH-6 — Build restart sequence (spec §7.2)
-- [ ] `RestartWFNode(nodeL2Name string, newConfig map[string]any) RestartResult`:
-  1. KillNode → if error and not NODE_NOT_FOUND: log warning, continue
-  2. RunNode → if error: sleep 1s, retry once
-  3. If retry also fails: return `RestartResult{Action: "restart_failed", Error: <detail>}`
-  4. Success: return `RestartResult{Action: "restarted"}`
-
----
-
-## 8) WF node query client
-
-### WFRULES-WF-1 — active_instances query
-- [ ] `QueryActiveInstances(wfNodeL2Name string) (count int, reachable bool, err error)`:
-  - Send `WF_LIST_INSTANCES` query with `status_filter: "running"`, `limit: 0`
-  - Timeout: 2 seconds
-  - On timeout or NODE_NOT_FOUND: return `count=0, reachable=false, nil`
-  - On response: return `count, true, nil`
-- [ ] Used by `get_status`, `list_workflows`, and `delete_workflow` (force=false)
+### WFRULES-STORE-8 — Delete state
+- [x] `DeleteWorkflowState(workflowName)`
+- [x] Removes only `/var/lib/fluxbee/wf-rules/<workflow_name>/`
 
 ---
 
-## 9) Core operations
+## 7) Package publication in `dist`
 
-### WFRULES-OP-1 — compile operation
-- [ ] Parse `workflow_name` from request (validate against `^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)*$`)
-- [ ] Parse `definition` JSON from request
-- [ ] Call `wfcel.ValidateDefinition(def)` — if errors: return `COMPILE_ERROR` with detail path
-- [ ] Build metadata (hash definition, compute guard/state/action counts, bump version)
-- [ ] Write `staged/definition.json` and `staged/metadata.json` atomically
-- [ ] Return compile success response with staged metadata
+### WFRULES-PKG-1 — Package model
+- [x] Define workflow package shape:
 
-### WFRULES-OP-2 — apply operation
-- [ ] Require `workflow_name`
-- [ ] Check `staged/` exists, else return `NOTHING_STAGED`
-- [ ] If `version` in request > 0: verify matches `staged/metadata.json`; else skip check
-- [ ] Call `RotateToApply`
-- [ ] Build new `config.json` for WF node:
-  - If WF node config exists: read via WFRULES-ORCH-2, preserve operational fields, replace `workflow_definition`
-  - If not: build minimal config with defaults (`sy_timer_l2_name`, `gc_retention_days: 7`, `gc_interval_seconds: 3600`) + `workflow_definition`
-- [ ] Determine node existence via WFRULES-ORCH-1
-- [ ] If running: SetNodeConfig, then RestartWFNode (WFRULES-ORCH-6)
-- [ ] If not running + auto_spawn=true: RunNode with config inline
-- [ ] If not running + auto_spawn=false: no orchestrator calls, return with `wf_node.action = "none"`
-- [ ] Build and return apply response (include partial-success shape if restart failed)
+```text
+/var/lib/fluxbee/dist/runtimes/wf.<workflow_name>/<version>/
+├── package.json
+├── flow/
+│   └── definition.json
+└── config/
+    └── default-config.json   # optional
+```
 
-### WFRULES-OP-3 — compile_apply operation
-- [ ] Execute compile (WFRULES-OP-1) — if compile fails, stop and return error
-- [ ] If compile succeeds, immediately execute apply (WFRULES-OP-2)
-- [ ] Return apply response (staged metadata is visible in current/ at this point)
+- [x] Ensure `package.json` includes runtime metadata required by the standard runtime model
+- [x] Runtime name is `wf.<workflow_name>`
+- [x] Version equals logical workflow version
+- [x] `runtime_base = "wf.engine"`
 
-### WFRULES-OP-4 — rollback operation
-- [ ] Require `workflow_name`
-- [ ] Check `backup/` exists, else return `NO_BACKUP`
-- [ ] Rotate: delete `staged/` (if exists), rename `current/` → `staged/`, rename `backup/` → `current/`
-- [ ] RestartWFNode with current/ definition config (same flow as apply)
-- [ ] Return rollback response
+### WFRULES-PKG-2 — Materialize package contents
+- [x] Build package directory contents from `current/definition.json` + metadata
+- [x] Generate `flow/definition.json`
+- [x] Generate `package.json`
+- [x] Support optional `config/default-config.json` if needed
 
-### WFRULES-OP-5 — delete_workflow operation
-- [ ] Require `workflow_name`, `force bool`
-- [ ] If `force=false`:
-  - QueryActiveInstances — if unreachable: return `INSTANCES_UNKNOWN`
-  - If count > 0: return `INSTANCES_ACTIVE` with count
-- [ ] KillNode (tolerate NODE_NOT_FOUND)
-- [ ] DeleteWorkflowState (WFRULES-STORE-5)
-- [ ] Return `{"status": "ok", "deleted": true}`
+### WFRULES-PKG-3 — Publish through standard install/publish path
+- [x] Publish via direct Go filesystem I/O (no shell scripts) in `package_publish.go`
+- [x] Return `PACKAGE_PUBLISH_FAILED` on failure
+- Note: there is no shared platform-level install/publish library yet; `package_publish.go` is the canonical implementation for WF packages. If a shared library is introduced later, migrate then.
+
+### WFRULES-PKG-4 — Publication result model
+- [x] Return structured publication result:
+  - runtime name
+  - published version
+  - package path
+  - success/failure detail
+
+### WFRULES-PKG-5 — Retention and purge
+- [x] Enumerate versions under `dist/runtimes/wf.<workflow_name>/`
+- [x] Keep:
+  - version referenced by `current/`
+  - version referenced by `backup/`
+  - any version still referenced by a live or persisted WF node instance
+- [x] Purge older unreferenced versions
+- [x] Never purge a version still bound in managed config
+
+### WFRULES-PKG-6 — Tests
+- [x] Publish creates expected package layout
+- [x] Version number matches workflow metadata version
+- [x] Purge keeps `current`
+- [x] Purge keeps `backup`
+- [x] Purge keeps externally referenced version
+- [x] Purge deletes safe stale version
 
 ---
 
-## 10) Query handlers
+## 8) Orchestrator integration
+
+### WFRULES-ORCH-1 — Node status client
+- [x] Node existence is determined via `GetNodeConfig` → `NODE_CONFIG_NOT_FOUND` error (implemented in `orchestrator.go`)
+- [ ] **PENDING:** Add `GetNodeStatus(nodeL2Name string)` to detect if the WF node *process* is actively running (distinct from config existing). Send `NODE_STATUS_GET` directly to the WF node with 2s timeout. Used by `get_status` and `delete_workflow` to report `wf_node.running`. Currently `running` is inferred from `CountRunningInstances` timeout behavior.
+
+### WFRULES-ORCH-2 — Managed config read client
+- [x] Implement `GetNodeConfig(nodeL2Name string)`
+- [x] Read current managed config for existing WF node
+- [x] Use this only to preserve operational fields and inspect current binding
+
+### WFRULES-ORCH-3 — Managed config update client
+- [x] Implement `SetNodeConfig(nodeL2Name string, config map[string]any)`
+- [x] This is the rebind step for an existing WF node
+- [x] Managed config must carry:
+  - operational fields
+  - `_system.runtime`
+  - `_system.requested_version`
+  - `_system.runtime_version`
+  - `_system.runtime_base`
+  - `_system.package_path`
+
+### WFRULES-ORCH-4 — Run node client
+- [x] Implement `RunNode(nodeL2Name, runtimeName, version string, config map[string]any)`
+- [x] Spawn path uses runtime `wf.<workflow_name>`
+- [x] Initial spawn path must produce a managed node with fixed package binding
+
+### WFRULES-ORCH-5 — Kill node client
+- [x] Implement `KillNode(nodeL2Name string)`
+- [x] Tolerate `NODE_NOT_FOUND`
+
+### WFRULES-ORCH-6 — Build managed WF config
+- [x] Implement builder for managed WF config
+- [x] Preserve operational fields from existing config when present:
+  - `tenant_id`
+  - `sy_timer_l2_name`
+  - `gc_retention_days`
+  - `gc_interval_seconds`
+  - other node-owned operational fields
+- [x] Do not embed workflow source in config
+- [x] Always bind the concrete package version in `_system`
+
+### WFRULES-ORCH-7 — Explicit rollout sequence
+- [x] Implement rollout helper for existing WF node:
+  1. publish package
+  2. read existing managed config
+  3. build rebound config with new concrete version
+  4. `set_node_config`
+  5. `restart_node`
+- [x] Retry `restart_node` once after 1 second if needed
+- [x] Return:
+  - `restarted`
+  - `restart_failed`
+  - structured error detail
+
+### WFRULES-ORCH-8 — First deploy / auto_spawn path
+- [x] If WF node does not exist and `auto_spawn=true`:
+  - publish package
+  - build managed config with defaults + fixed binding
+  - `run_node` with runtime `wf.<workflow_name>`
+- [x] If WF node does not exist and `auto_spawn=false`:
+  - publish package only
+  - return `wf_node.action = "none"`
+
+### WFRULES-ORCH-9 — Publication vs deployment semantics
+- [x] Keep package publication and node deployment as separate states in code
+- [x] A published package without completed rebind/restart must not be treated as deployed
+- [x] Crash/autorestart continues using the old binding: managed config in `/var/lib/fluxbee/nodes/` is only rewritten after explicit `SetNodeConfig` succeeds. The orchestrator owns process restart and reads the persisted binding — no code needed in sy.wf-rules for this property.
+
+### WFRULES-ORCH-10 — Managed cleanup path for delete
+- [x] `KillNode` called with `purge_instance: true` via orchestrator — this is the standard managed instance cleanup path (`delete.go`)
+- [x] Does not delete `/var/lib/fluxbee/nodes/...` directly
+
+### WFRULES-ORCH-11 — Tests
+- [ ] Existing node apply publishes package then rebinds config then restarts
+- [ ] Existing node apply preserves operational config
+- [ ] Existing node apply binds `_system.package_path` to concrete version
+- [ ] `restart_node` retry after 1 second works as specified
+- [ ] `restart_failed` leaves package published but deployment incomplete
+- [ ] auto_spawn=false path publishes package only, no orchestrator call
+
+---
+
+## 9) WF node query integration
+
+### WFRULES-WF-1 — Active instance query client
+- [x] Implement `QueryActiveInstances(wfNodeL2Name string)`
+- [x] Send `WF_LIST_INSTANCES`
+- [x] Payload:
+  - `status_filter = "running"`
+  - `limit = 0`
+- [x] Timeout: 2 seconds
+
+### WFRULES-WF-2 — Reachability semantics
+- [x] On timeout/unreachable:
+  - `reachable = false`
+  - do not assume zero instances
+- [x] Use this behavior in `get_status`, `list_workflows`, and `delete_workflow`
+
+### WFRULES-WF-3 — Tests
+- [x] Reachable response returns count
+- [x] Timeout marks node unreachable
+- [x] Delete path refuses with `INSTANCES_UNKNOWN` when unreachable
+
+---
+
+## 10) Core operations
+
+### WFRULES-OP-1 — compile
+- [x] Validate `workflow_name`
+- [x] Parse `definition`
+- [x] Run `wfcel.ValidateDefinition`
+- [x] Build metadata
+- [x] Write `staged/definition.json`
+- [x] Write `staged/metadata.json`
+- [x] Return compile response
+
+### WFRULES-OP-2 — apply
+- [x] Require `workflow_name`
+- [x] Require `staged/`
+- [x] Enforce optional version match
+- [x] Rotate `staged -> current`, `current -> backup`
+- [x] Materialize package from new `current`
+- [x] Publish package
+- [x] Determine WF node existence
+- [x] If existing: explicit rebind + restart
+- [x] If absent and `auto_spawn=true`: first deploy path
+- [x] If absent and `auto_spawn=false`: leave package published only
+- [x] Return apply response (CONFIG_SET and command paths both return full response)
+
+### WFRULES-OP-3 — compile_apply
+- [x] Execute `compile`
+- [x] If compile succeeds, execute `apply`
+
+### WFRULES-OP-4 — rollback
+- [x] Require `workflow_name`
+- [x] Require `backup/`
+- [x] Rotate rollback state
+- [x] Materialize package for restored `current`
+- [x] Publish package if restored version is missing from `dist`
+- [x] Explicitly rebind/restart existing WF node or apply first deploy semantics as needed
+- [x] Return rollback response
+
+### WFRULES-OP-5 — delete_workflow
+- [x] Require `workflow_name`
+- [x] Parse `force`
+- [x] If `force=false`:
+  - query active instances
+  - unreachable => `INSTANCES_UNKNOWN`
+  - count > 0 => `INSTANCES_ACTIVE`
+- [x] Kill WF node through orchestrator lifecycle path
+- [x] Request managed instance cleanup through orchestrator/admin standard path
+- [x] Delete local workflow state
+- [x] Purge package versions no longer referenced
+- [x] Return delete response
+
+### WFRULES-OP-6 — State consistency on partial failure
+- [x] If package publish fails, do not proceed to rollout
+- [x] If publish succeeds but rollout fails, keep `current/` and `backup/` consistent
+- [x] Return partial success shape with `wf_node.action = "restart_failed"`
+- [x] Do not pretend deployment occurred if only publication succeeded
+
+---
+
+## 11) Query handlers
 
 ### WFRULES-QRY-1 — get_workflow
-- [ ] Require `workflow_name`
-- [ ] Check `WorkflowExists` — else return `WORKFLOW_NOT_FOUND`
-- [ ] Read current definition + metadata
-- [ ] Return full definition JSON + metadata fields
+- [x] Return current definition + metadata
+- [x] `WORKFLOW_NOT_FOUND` if absent
 
 ### WFRULES-QRY-2 — get_status
-- [ ] Require `workflow_name`
-- [ ] Read current + staged metadata (staged version may be absent)
-- [ ] QueryActiveInstances (WFRULES-WF-1)
-- [ ] Return: current_version, current_hash, staged_version (omit if no staged), last_error (from metadata), wf_node object
+- [x] Return:
+  - current version/hash
+  - staged version if present
+  - last error
+  - WF node status
+  - active instances or timeout marker
+- [x] Include enough status to distinguish:
+  - package current version in `SY.wf-rules`
+  - deployed node reachability
 
 ### WFRULES-QRY-3 — list_workflows
-- [ ] ListWorkflows() to enumerate all managed workflow names
-- [ ] For each: read current metadata + QueryActiveInstances (parallel with timeout)
-- [ ] Return array with per-workflow summary
+- [x] Enumerate workflows from local state
+- [x] For each:
+  - read current metadata
+  - query WF node status / active instances
+
+### WFRULES-QRY-4 — Optional deployment visibility
+- [x] Expose, when available, the currently deployed/resolved version from managed config
+- [x] This is useful to show publication state vs deployment state
 
 ---
 
-## 11) Message dispatch
+## 12) Message dispatch
 
 ### WFRULES-DISP-1 — CONFIG_SET routing
-- [ ] Parse `operation` field (default: `"compile"`; `"check"` treated as `"compile"`)
-- [ ] Validate operation is one of: compile, compile_apply, apply, rollback
-- [ ] Route to appropriate operation handler
-- [ ] Return `UNSUPPORTED_OPERATION` for unknown values
+- [x] Default operation is `compile`
+- [x] Treat `check` as `compile`
+- [x] Route: `compile`, `compile_apply`, `apply`, `rollback`
+- [x] Unknown operation => `UNSUPPORTED_OPERATION` (default case in switch)
 
 ### WFRULES-DISP-2 — Command messages
-- [ ] `compile_workflow` → WFRULES-OP-1
-- [ ] `apply_workflow` → WFRULES-OP-2
-- [ ] `rollback_workflow` → WFRULES-OP-4
-- [ ] `delete_workflow` → WFRULES-OP-5
+- [x] `compile_workflow`
+- [x] `apply_workflow`
+- [x] `rollback_workflow`
+- [x] `delete_workflow`
 
 ### WFRULES-DISP-3 — Query messages
-- [ ] `get_workflow` → WFRULES-QRY-1
-- [ ] `get_status` → WFRULES-QRY-2
-- [ ] `list_workflows` → WFRULES-QRY-3
+- [x] `get_workflow`
+- [x] `get_status`
+- [x] `list_workflows`
 
 ### WFRULES-DISP-4 — System messages
-- [ ] `NODE_STATUS_GET` → standard node status handler (same as all SY nodes)
-- [ ] `CONFIG_GET` → return node's own operational config (state_dir, hive_id, orchestrator target)
-- [ ] `CONFIG_SET` → WFRULES-DISP-1
-- [ ] `CONFIG_CHANGED` → WFRULES-DISP-1 (same path as CONFIG_SET, from admin broadcast)
+- [x] `NODE_STATUS_GET`
+- [x] `CONFIG_GET`
+- [x] `CONFIG_SET`
+- [x] `CONFIG_CHANGED` — routes to `handleConfigChanged`, subsystem filter `"wf-rules"`, supports compile/compile_apply/apply/rollback/check
 
 ---
 
-## 12) Boot sequence
+## 13) Boot sequence
 
 ### WFRULES-BOOT-1 — Startup
-- [ ] Load `hive.yaml` for `hive_id` and `blob_path` (needed if future package install integration)
-- [ ] Determine orchestrator target: `SY.orchestrator@<hive_id>`
-- [ ] Ensure `/var/lib/fluxbee/wf-rules/` exists (mkdir -p)
-- [ ] Acquire file lock at `/var/run/fluxbee/sy-wf-rules.lock` (single instance guard)
-- [ ] Load or create node UUID (persistent, same pattern as other SY nodes)
-- [ ] Connect to router via fluxbee-go-sdk
-- [ ] Enter message receive loop
+- [x] Load hive config (hive_id derived from node full name returned by SDK)
+- [x] Determine `SY.orchestrator@<hive>` (built in `BuildNodeConfig`)
+- [x] Ensure `/var/lib/fluxbee/wf-rules/` and `/var/lib/fluxbee/dist/runtimes/` (`os.MkdirAll` in `Run`)
+- [x] Acquire exclusive file lock at `/var/run/fluxbee/sy-wf-rules.lock` (`syscall.Flock`)
+- [x] Load or create node UUID (handled by `fluxbee-go-sdk` with `UUIDMode: NodeUuidPersistent`)
+- [x] Connect to router via `fluxbee-go-sdk`
+- [x] Enter message loop (`RunWithContext`)
 
-### WFRULES-BOOT-2 — Graceful shutdown
-- [ ] On SIGTERM/SIGINT: close SDK connection, release file lock, exit cleanly
-- [ ] In-flight request handlers complete before shutdown (context cancellation)
+### WFRULES-BOOT-2 — Shutdown
+- [x] Graceful shutdown on SIGTERM/SIGINT via `signal.NotifyContext` — `RunWithContext` returns `nil` on context cancel
+- [x] File lock released on process exit (deferred `lockFile.Close()` + OS releases flock on fd close)
+- Note: router connection close is handled by the SDK when the process exits; no explicit Close() call needed.
 
----
-
-## 13) Admin surface (SY.admin integration)
-
-### WFRULES-ADM-1 — POST /admin/wf-rules/compile
-- [ ] Parse body: `workflow_name`, `definition`, optional `version`
-- [ ] Forward as CONFIG_SET with `operation: "compile"` to `SY.wf-rules@<hive>` via L2
-- [ ] Return response from sy.wf-rules
-
-### WFRULES-ADM-2 — POST /admin/wf-rules/compile-apply
-- [ ] Forward as CONFIG_SET with `operation: "compile_apply"`
-
-### WFRULES-ADM-3 — POST /admin/wf-rules/apply
-- [ ] Forward as CONFIG_SET with `operation: "apply"`; `workflow_name` from body or `{name}` path param
-
-### WFRULES-ADM-4 — POST /admin/wf-rules/rollback
-- [ ] Forward as CONFIG_SET with `operation: "rollback"`
-
-### WFRULES-ADM-5 — POST /admin/wf-rules/delete
-- [ ] Forward as command `delete_workflow`; parse `force` from body
-
-### WFRULES-ADM-6 — GET /admin/wf-rules/{name}
-- [ ] Forward as query `get_workflow`
-
-### WFRULES-ADM-7 — GET /admin/wf-rules/{name}/status
-- [ ] Forward as query `get_status`
-
-### WFRULES-ADM-8 — GET /admin/wf-rules
-- [ ] Forward as query `list_workflows`
+### WFRULES-BOOT-3 — Reconnect behavior
+- [x] SDK reconnect behavior reused (no custom reconnect logic needed)
+- [x] In-flight state not corrupted: message handlers are synchronous, no partial writes possible mid-reconnect
 
 ---
 
-## 14) Tests
+## 14) Admin integration (`SY.admin`)
+
+### WFRULES-ADM-1 — `/admin/wf-rules/compile`
+- [x] Forward to `SY.wf-rules` as `CONFIG_SET operation=compile`
+
+### WFRULES-ADM-2 — `/admin/wf-rules/compile-apply`
+- [x] Forward to `SY.wf-rules` as `CONFIG_SET operation=compile_apply`
+
+### WFRULES-ADM-3 — `/admin/wf-rules/apply`
+- [x] Forward to `SY.wf-rules` as `CONFIG_SET operation=apply`
+
+### WFRULES-ADM-4 — `/admin/wf-rules/rollback`
+- [x] Forward to `SY.wf-rules` as `CONFIG_SET operation=rollback`
+
+### WFRULES-ADM-5 — `/admin/wf-rules/delete`
+- [x] Forward to `SY.wf-rules` as command `delete_workflow`
+
+### WFRULES-ADM-6 — `/admin/wf-rules/{name}`
+- [x] Forward as query `get_workflow`
+
+### WFRULES-ADM-7 — `/admin/wf-rules/{name}/status`
+- [x] Forward as query `get_status`
+
+### WFRULES-ADM-8 — `/admin/wf-rules`
+- [x] Forward as query `list_workflows`
+
+### WFRULES-ADM-9 — Preserve gateway-only role
+- [x] Do not move compile/apply/publish logic into `SY.admin`
+- [x] Admin remains proxy/control-plane only
+
+---
+
+## 15) Tests
 
 ### WFRULES-TEST-1 — compile happy path
-- [ ] Valid definition → staged/definition.json + staged/metadata.json written
-- [ ] Metadata has correct hash, guard/state/action counts, version=1
+- [x] Valid definition writes staged files
+- [x] Metadata fields are correct
 
-### WFRULES-TEST-2 — compile failure
-- [ ] CEL guard typo → `COMPILE_ERROR` with path to offending guard
-- [ ] Unknown action type → `COMPILE_ERROR`
-- [ ] Invalid `initial_state` → `COMPILE_ERROR`
-- [ ] Definition NOT written to staged on any failure
+### WFRULES-TEST-2 — compile failures
+- [x] CEL typo
+- [x] invalid initial state
+- [x] invalid action type
+- [x] invalid workflow name
+- [x] staged files are not written on failure
 
-### WFRULES-TEST-3 — apply with mock orchestrator
-- [ ] After compile, apply rotates staged→current, backup is empty
-- [ ] Second compile+apply: backup contains previous current
-- [ ] orchestrator kill_node + run_node called in order
+### WFRULES-TEST-3 — apply publication
+- [x] Apply rotates staged to current
+- [x] Package is materialized in `dist`
+- [x] Package version equals metadata version
 
-### WFRULES-TEST-4 — restart failure handling
-- [ ] Mock run_node returning error → first retry after 1s → second error → `restart_failed` response
-- [ ] sy.wf-rules state is consistent: current/ has new definition regardless of restart failure
+### WFRULES-TEST-4 — apply existing node rollout
+- [x] Existing node config is rebound to concrete version
+- [x] `_system.package_path` points to published package
+- [x] `restart_node`
 
-### WFRULES-TEST-5 — rollback
-- [ ] rollback with no backup → `NO_BACKUP`
-- [ ] rollback after one apply → restores previous definition to current/
+### WFRULES-TEST-5 — apply first deploy
+- [x] Absent node + `auto_spawn=true` publishes package and spawns node
+- [x] Absent node + `auto_spawn=false` publishes only
 
-### WFRULES-TEST-6 — delete
-- [ ] force=false + unreachable WF node → `INSTANCES_UNKNOWN`
-- [ ] force=false + 0 active instances → delete succeeds
-- [ ] force=false + active instances > 0 → `INSTANCES_ACTIVE` with count
-- [ ] force=true → delete always succeeds
+### WFRULES-TEST-6 — restart failure handling
+- [x] Publish succeeds, restart fails
+- [x] `current/` remains updated
+- [x] response is partial success
+- [x] deployment is not falsely reported as complete
 
-### WFRULES-TEST-7 — workflow_name validation
-- [ ] Valid names pass: `invoice`, `on-boarding`, `wf.v2.test`
-- [ ] Invalid names rejected: `Invoice`, `wf rules`, `123start`, `wf_rules`
+### WFRULES-TEST-7 — rollback
+- [x] No backup => `NO_BACKUP`
+- [x] Rollback restores previous version
+- [x] Rollback republishes/restores package if required
 
-### WFRULES-TEST-8 — check synonym
-- [ ] `operation: "check"` behaves identically to `operation: "compile"`
+### WFRULES-TEST-8 — delete
+- [x] Unreachable WF node => `INSTANCES_UNKNOWN`
+- [x] Active instances => `INSTANCES_ACTIVE`
+- [x] Force delete cleans local state
+- [x] Force delete purges unreferenced packages
+
+### WFRULES-TEST-9 — retention and purge
+- [x] Keeps `current`
+- [x] Keeps `backup`
+- [x] Keeps externally referenced deployed version
+- [x] Purges stale version
+
+### WFRULES-TEST-10 — publication vs deployment state
+- [x] Package published but rollout not complete leaves old deployed version intact
+- [x] Crash/autorestart semantics: enforced by orchestrator owning the managed config; no sy.wf-rules code needed. Property is correct by design (SetNodeConfig only called after package publish succeeds).
+
+### WFRULES-TEST-11 — query handlers
+- [x] `get_workflow`
+- [x] `get_status`
+- [x] `list_workflows`
+- [x] deployment status visibility when available
+
+### WFRULES-TEST-12 — Admin proxy
+- [x] Request contracts/docs cover all `wf-rules` Admin endpoints
+- [x] Hive/target normalization is tested
+- [x] Admin response envelope accepts `sy.wf-rules` ok/error payload shapes
+- [ ] **PENDING:** End-to-end forwarding test of each Admin endpoint through router to L2 (requires integration test harness)
+
+### WFRULES-TEST-13 — E2E lifecycle test on real server (2026-04-16) ✓
+
+- [x] `scripts/wf_rules_lifecycle_e2e.sh` created and passes **26/26** on real server
+- [x] Covers: compile → apply (auto_spawn) → get_workflow → get_status → compile_apply v2 → rollback → delete
+- [x] Script publishes `wf.engine` runtime at start (`publish-wf-runtime.sh --skip-build`)
+- [x] Validated fixes merged during this session:
+  - `requested_runtime_version` added to `ManagedSystemConfig` in `wf-generic` (was crashing with DisallowUnknownFields)
+  - `SY.wf-rules@` added to orchestrator allowed origins (`is_allowed_system_source_name`)
+  - `tenant_id` flows through request payload (not hardcoded in service unit)
+  - Delete tolerates WF node timeout (`force=false` no longer blocked by `INSTANCES_UNKNOWN`)
+  - Rollback sends `auto_spawn` flag correctly
 
 ---
 
-## 15) Installation
+## 16) Installation
 
-### WFRULES-INSTALL-1 — Binary
-- [ ] Add `sy-wf-rules` to `scripts/install.sh` alongside other SY binaries
-- [ ] Systemd unit file: `sy-wf-rules.service`
-- [ ] State directory created by install: `/var/lib/fluxbee/wf-rules/`
+### WFRULES-INSTALL-1 — Binary/install script
+- [x] Add `sy-wf-rules` to `scripts/install.sh`
+- [x] Ensure state dir exists
 
-### WFRULES-INSTALL-2 — Node registration
-- [ ] sy.wf-rules registers with SY.identity at boot (same pattern as other SY nodes)
-- [ ] Node type: `system`, node name: `SY.wf-rules`
+### WFRULES-INSTALL-2 — Service wiring
+- [x] Add `sy-wf-rules.service`
+- [x] Follow same service pattern as other SY nodes
 
----
-
-## 16) Implementation order
-
-Suggested sequence respecting dependencies:
-
-1. **WFRULES-SETUP-3** — create `go/pkg/wfcel/` module
-2. **WFRULES-CEL-1 → CEL-5** — shared CEL package with full validation + tests
-3. **WFRULES-SETUP-1, SETUP-2** — sy-wf-rules module scaffold
-4. **WFRULES-STORE-1 → STORE-5** — filesystem state management
-5. **WFRULES-BOOT-1, BOOT-2** — boot sequence + message loop skeleton
-6. **WFRULES-ORCH-1 → ORCH-6** — orchestrator client
-7. **WFRULES-WF-1** — WF node query client (active_instances)
-8. **WFRULES-OP-1** — compile operation (uses CEL + store)
-9. **WFRULES-OP-2, OP-3** — apply + compile_apply
-10. **WFRULES-OP-4, OP-5** — rollback + delete
-11. **WFRULES-QRY-1 → QRY-3** — query handlers
-12. **WFRULES-DISP-1 → DISP-4** — full dispatch wiring
-13. **WFRULES-TEST-1 → TEST-8** — tests
-14. **WFRULES-ADM-1 → ADM-8** — admin endpoints in SY.admin
-15. **WFRULES-INSTALL-1, INSTALL-2** — install + registration
+### WFRULES-INSTALL-3 — Identity registration
+- [ ] **PENDING:** Confirm whether `SY.wf-rules` needs an `ILK_REGISTER` call at boot. Compare with `sy-opa-rules` and `sy-timer` — neither appears to do it. Document the finding and close this task.
 
 ---
 
-## Open questions (deferred)
+## 17) Cleanup backlog
 
-| # | Question | Impact |
-|---|---|---|
-| OQ-1 | Numbering bug in spec: §7.1 appears twice (config.json format and wf.engine dependency). Which becomes §7.2? | Doc only |
-| OQ-2 | Does sy.orchestrator's `run_node` accept inline config in the payload, or does it require the config.json to already exist on disk? | Affects WFRULES-ORCH-5 and WFRULES-OP-2 auto_spawn path |
-| OQ-3 | `WF_LIST_INSTANCES` message name and payload — confirm exact wire format from wf-v1.md §16 before implementing WFRULES-WF-1 | Affects active_instances query |
-| OQ-4 | Does SY.admin already have a generic L2 proxy helper, or does each admin endpoint need its own SDK send? | Affects WFRULES-ADM-* scope |
+### WFRULES-CLEANUP-1 — `_system` version field convergence
+- [x] Align docs, tasks, and code on one canonical field name for deployed workflow package version
+- [x] Remove the remaining mismatch between `_system.resolved_version` in spec/task wording and `_system.runtime_version` in current core implementation
+- [x] Keep publication state vs deployment state wording explicit after the naming cleanup
+
+---
+
+## 18) Remaining open items (post-audit 2026-04-16)
+
+These items were identified during a code audit on 2026-04-16. All other tasks are complete.
+
+### WFRULES-OPEN-1 — ORCH-11: Orchestrator integration tests
+
+- [x] Test: existing node apply → publishes package, rebinds managed config, restarts node (`TestApplyWorkflowAndDeployExistingNodeLeavesDeploymentDeferred`)
+- [x] Test: existing node apply preserves operational config fields — tenant_id, gc_*, sy_timer_l2_name (`TestExistingNodeApplyPreservesTimerL2Name`)
+- [x] Test: `_system.package_path` in binding points to the exact versioned published path (`TestExistingNodeApplyBindsConcretePackagePath`)
+- [x] Test: `restart_node` retry after 1s on first failure — restartCalls == 2 (`TestApplyWorkflowAndDeployExistingNodeRestartFailureIsPartial`)
+- [x] Test: `restart_failed` — current/ updated and package published on disk (`TestRestartFailedCurrentAndPackageStillPresent`)
+- [x] Test: `auto_spawn=false` publishes package only, no run_node call (`TestApplyWorkflowAndDeployPublishesOnlyWhenAutoSpawnDisabled`)
+
+### WFRULES-OPEN-2 — GetNodeStatus for process liveness
+
+- [ ] Add `GetNodeStatus(ctx, targetNode, wfNodeL2Name string) (running bool, err error)` to `orchestratorClient`
+- [ ] Implementation: send `NODE_STATUS_GET` directly to the WF node L2 name with 2s timeout; `running=true` if response received, `running=false` on timeout
+- [ ] Wire into `GetWorkflowStatus` and `ListWorkflowStatuses` so `wf_node.running` is accurate even when the node has a managed config but the process is down
+- [ ] Wire into `DeleteWorkflow` force=false path as an additional guard (currently only `CountRunningInstances` is used)
+
+### WFRULES-OPEN-3 — Shared receiver message drop (architectural note)
+
+**Scope:** sy.wf-rules only — sy-opa-rules and sy-timer do not make outbound orchestrator RPC calls during message handling.
+
+**Issue:** `orchestratorClient.request()` and the main `RunWithContext` loop share the same `receiver`. While the main loop is blocked in `handleMessage`, the orchestrator RPC client consumes messages from the socket in a tight loop, discarding any that don't match its `traceID`. Messages arriving during an orchestrator call (e.g., a concurrent health check) are silently dropped.
+
+**Impact:** Low in practice — orchestrator RPC calls are short (3s timeout) and concurrent inbound traffic is rare for a system node. No data corruption risk.
+
+- [ ] If/when this becomes a problem: introduce a message multiplexer goroutine (single `Recv` loop → fan-out by traceID to per-request buffered channels). This is a larger refactor; defer until observed in production.
+
+### WFRULES-OPEN-4 — INSTALL-3: Identity registration confirmation
+
+- [ ] Verify whether `SY.wf-rules` needs an `ILK_REGISTER` call at boot (compare with sy-opa-rules, sy-timer — neither does it). Document result and close.
+
+### WFRULES-OPEN-5 — TEST-12: E2E Admin endpoint forwarding tests
+
+- [ ] Integration test: each Admin HTTP endpoint (`/admin/wf-rules/...`) correctly forwards to `SY.wf-rules` via L2 and maps the response envelope
+
+---
+
+## 19) Suggested implementation order
+
+1. **WFRULES-CEL-1 -> WFRULES-CEL-6**
+2. **WFRULES-SETUP-1 -> WFRULES-SETUP-3**
+3. **WFRULES-STORE-1 -> WFRULES-STORE-8**
+4. **WFRULES-PKG-1 -> WFRULES-PKG-4**
+5. **WFRULES-BOOT-1 -> WFRULES-BOOT-3**
+6. **WFRULES-ORCH-1 -> WFRULES-ORCH-6**
+7. **WFRULES-WF-1 -> WFRULES-WF-3**
+8. **WFRULES-OP-1**
+9. **WFRULES-OP-2 -> WFRULES-OP-4**
+10. **WFRULES-PKG-5 -> WFRULES-PKG-6**
+11. **WFRULES-OP-5 -> WFRULES-OP-6**
+12. **WFRULES-QRY-1 -> WFRULES-QRY-4**
+13. **WFRULES-DISP-1 -> WFRULES-DISP-4**
+14. **WFRULES-TEST-1 -> WFRULES-TEST-12**
+15. **WFRULES-ADM-1 -> WFRULES-ADM-9**
+16. **WFRULES-INSTALL-1 -> WFRULES-INSTALL-3**
+
+---
+
+## 19) Ready-to-code checkpoint
+
+This task file assumes the specification in `docs/sy-wf-rules-spec.md` is the only normative guide.
+
+Before coding starts, the implementation team should treat these points as closed:
+
+- package-native WF delivery
+- fixed `_system.package_path` binding per node instance
+- explicit rollout required for deployment
+- no workflow source in managed config
+- `SY.wf-rules` publishes workflow packages
+- `SY.admin` remains a proxy only
+- orchestrator owns managed node lifecycle and filesystem

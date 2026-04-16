@@ -1,0 +1,75 @@
+package node
+
+import (
+	"encoding/json"
+	"fmt"
+	"regexp"
+
+	wfcel "github.com/4iplatform/json-router/pkg/wfcel"
+)
+
+var workflowNamePattern = regexp.MustCompile(`^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)*$`)
+
+type ClockFunc = wfcel.ClockFunc
+
+type CompileRequest struct {
+	WorkflowName string `json:"workflow_name"`
+	Definition   any    `json:"definition"`
+	Version      uint64 `json:"version,omitempty"`
+	AutoSpawn    bool   `json:"auto_spawn,omitempty"`
+	TenantID     string `json:"tenant_id,omitempty"`
+}
+
+type GetWorkflowRequest struct {
+	WorkflowName string `json:"workflow_name"`
+}
+
+type GetStatusRequest struct {
+	WorkflowName string `json:"workflow_name"`
+}
+
+type DeleteWorkflowRequest struct {
+	WorkflowName string `json:"workflow_name"`
+	Force        bool   `json:"force,omitempty"`
+}
+
+type WfRulesMetadata struct {
+	Version         uint64 `json:"version"`
+	Hash            string `json:"hash"`
+	WorkflowName    string `json:"workflow_name"`
+	WorkflowType    string `json:"workflow_type"`
+	WFSchemaVersion string `json:"wf_schema_version"`
+	CompiledAt      string `json:"compiled_at"`
+	GuardCount      int    `json:"guard_count"`
+	StateCount      int    `json:"state_count"`
+	ActionCount     int    `json:"action_count"`
+	ErrorDetail     string `json:"error_detail"`
+}
+
+type WFConfigChangedPayload struct {
+	Subsystem    string `json:"subsystem"`
+	Action       string `json:"action"`
+	WorkflowName string `json:"workflow_name"`
+	AutoApply    *bool  `json:"auto_apply,omitempty"`
+	AutoSpawn    bool   `json:"auto_spawn,omitempty"`
+	Version      uint64 `json:"version,omitempty"`
+	TenantID     string `json:"tenant_id,omitempty"`
+	Definition   any    `json:"definition,omitempty"`
+}
+
+type WfRulesError struct {
+	Code   string
+	Detail string
+}
+
+func (e WfRulesError) Error() string {
+	if e.Detail == "" {
+		return e.Code
+	}
+	return fmt.Sprintf("%s: %s", e.Code, e.Detail)
+}
+
+func mustMarshalJSON(value any) json.RawMessage {
+	raw, _ := json.Marshal(value)
+	return raw
+}

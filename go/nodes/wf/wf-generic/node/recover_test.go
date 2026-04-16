@@ -11,8 +11,8 @@ import (
 // mockTimerLister extends mockTimerSender with a configurable List response.
 type mockTimerLister struct {
 	mockTimerSender
-	timerList []sdk.TimerInfo
-	listErr   error
+	timerList  []sdk.TimerInfo
+	listErr    error
 	lastFilter sdk.ListFilter
 }
 

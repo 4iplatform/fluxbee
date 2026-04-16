@@ -125,11 +125,11 @@ func buildWFConfigGetPayload(nodeName string, cfg *Config) map[string]any {
 		"config_version": version,
 		"effective_config": map[string]any{
 			"workflow_definition_path": stringOrEmpty(cfg, func(c *Config) string { return c.WorkflowDefinitionPath }),
-			"db_path":                 stringOrEmpty(cfg, func(c *Config) string { return c.DBPath }),
-			"sy_timer_l2_name":        stringOrEmpty(cfg, func(c *Config) string { return c.SYTimerL2Name }),
-			"tenant_id":               stringOrEmpty(cfg, func(c *Config) string { return c.TenantID }),
-			"gc_retention_days":       intOrZero(cfg, func(c *Config) int { return c.GCRetentionDays }),
-			"gc_interval_seconds":     intOrZero(cfg, func(c *Config) int { return c.GCIntervalSeconds }),
+			"db_path":                  stringOrEmpty(cfg, func(c *Config) string { return c.DBPath }),
+			"sy_timer_l2_name":         stringOrEmpty(cfg, func(c *Config) string { return c.SYTimerL2Name }),
+			"tenant_id":                stringOrEmpty(cfg, func(c *Config) string { return c.TenantID }),
+			"gc_retention_days":        intOrZero(cfg, func(c *Config) int { return c.GCRetentionDays }),
+			"gc_interval_seconds":      intOrZero(cfg, func(c *Config) int { return c.GCIntervalSeconds }),
 		},
 		"contract": map[string]any{
 			"supports":         []string{sdk.MSGConfigGet, sdk.MSGConfigSet},

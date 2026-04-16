@@ -8,7 +8,6 @@ import (
 	"time"
 
 	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
-	"github.com/google/cel-go/cel"
 	"github.com/google/uuid"
 )
 
@@ -452,4 +451,3 @@ func validateTimerMissedPolicy(policy sdk.MissedPolicy, withinMS *int64) error {
 
 // compileValueExpr is a thin alias used in set_variable; reuses compileGuard
 // since both compile CEL expressions in the same environment.
-var _ = cel.Program(nil) // keep cel import alive

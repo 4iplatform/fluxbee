@@ -74,9 +74,15 @@ async fn main() -> Result<(), DynError> {
             let _ = sender.close().await;
             provision_trace_id = Some(provisioned.trace_id.clone());
             identity_target = Some(provisioned.target);
-            wait_for_lookup_hit(&config_dir, &channel_type, &address, &tenant_id, post_provision_wait_ms)
-                .await?
-                .unwrap_or(provisioned.ilk_id)
+            wait_for_lookup_hit(
+                &config_dir,
+                &channel_type,
+                &address,
+                &tenant_id,
+                post_provision_wait_ms,
+            )
+            .await?
+            .unwrap_or(provisioned.ilk_id)
         }
         Err(err) if allow_provision && is_lookup_unavailable(&err) => {
             mode = "provisioned_lookup_unavailable".to_string();
@@ -116,9 +122,15 @@ async fn main() -> Result<(), DynError> {
             let _ = sender.close().await;
             provision_trace_id = Some(provisioned.trace_id.clone());
             identity_target = Some(provisioned.target);
-            wait_for_lookup_hit(&config_dir, &channel_type, &address, &tenant_id, post_provision_wait_ms)
-                .await?
-                .unwrap_or(provisioned.ilk_id)
+            wait_for_lookup_hit(
+                &config_dir,
+                &channel_type,
+                &address,
+                &tenant_id,
+                post_provision_wait_ms,
+            )
+            .await?
+            .unwrap_or(provisioned.ilk_id)
         }
         Err(err) => return Err(err.into()),
     };
@@ -235,7 +247,11 @@ async fn provision_ilk_with_fallback(
     timeout: Duration,
     fallback_target: Option<String>,
 ) -> Result<ProvisionOutcome, DynError> {
-    let tenant_id_opt = if tenant_id.trim().is_empty() { None } else { Some(tenant_id) };
+    let tenant_id_opt = if tenant_id.trim().is_empty() {
+        None
+    } else {
+        Some(tenant_id)
+    };
     let first = provision_ilk(
         sender,
         receiver,

@@ -128,16 +128,18 @@ impl AdminRouterClient {
                 Ok(msg) => self.dispatch(msg).await,
                 Err(err) => {
                     tracing::warn!("router recv error: {err}");
-                    let (new_sender, new_receiver) =
-                        match Self::connect_once_with_retry(&self.node_config, self.reconnect_delay)
-                            .await
-                        {
-                            Ok(result) => result,
-                            Err(reconnect_err) => {
-                                tracing::warn!("router reconnect failed: {reconnect_err}");
-                                continue;
-                            }
-                        };
+                    let (new_sender, new_receiver) = match Self::connect_once_with_retry(
+                        &self.node_config,
+                        self.reconnect_delay,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(reconnect_err) => {
+                            tracing::warn!("router reconnect failed: {reconnect_err}");
+                            continue;
+                        }
+                    };
                     let node_name = new_sender.full_name().to_string();
                     *self.sender.write().await = new_sender;
                     receiver = new_receiver;
@@ -152,7 +154,10 @@ impl AdminRouterClient {
     }
 
     async fn dispatch(&self, msg: Message) {
-        if msg.meta.msg_type == "admin" || msg.meta.msg_type == SYSTEM_KIND {
+        if matches!(
+            msg.meta.msg_type.as_str(),
+            "admin" | SYSTEM_KIND | "command" | "command_response" | "query" | "query_response"
+        ) {
             let mut pending = self.pending_admin.lock().await;
             if let Some(tx) = pending.remove(&msg.routing.trace_id) {
                 let _ = tx.send(msg);
@@ -383,6 +388,14 @@ struct OpaRequest {
     version: Option<u64>,
     #[serde(default)]
     action: Option<String>,
+    #[serde(default, alias = "target")]
+    hive: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WfRulesRequest {
+    #[serde(flatten)]
+    payload: serde_json::Map<String, serde_json::Value>,
     #[serde(default, alias = "target")]
     hive: Option<String>,
 }
@@ -845,6 +858,8 @@ enum InternalActionRoute {
     Inventory,
     OpaHttp(OpaAction),
     OpaQuery(&'static str),
+    WfRulesHttp(WfRulesAction),
+    WfRulesQuery(&'static str),
     TimerRpc(&'static str),
 }
 
@@ -856,7 +871,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "4";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "5";
 
 const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
@@ -1142,6 +1157,54 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "wf_rules_compile_apply",
+        route: InternalActionRoute::WfRulesHttp(WfRulesAction::CompileApply),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "wf_rules_compile",
+        route: InternalActionRoute::WfRulesHttp(WfRulesAction::Compile),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "wf_rules_apply",
+        route: InternalActionRoute::WfRulesHttp(WfRulesAction::Apply),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "wf_rules_rollback",
+        route: InternalActionRoute::WfRulesHttp(WfRulesAction::Rollback),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "wf_rules_delete",
+        route: InternalActionRoute::WfRulesHttp(WfRulesAction::Delete),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "wf_rules_get_workflow",
+        route: InternalActionRoute::WfRulesQuery("get_workflow"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "wf_rules_get_status",
+        route: InternalActionRoute::WfRulesQuery("get_status"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "wf_rules_list_workflows",
+        route: InternalActionRoute::WfRulesQuery("list_workflows"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "timer_help",
         route: InternalActionRoute::TimerRpc("TIMER_HELP"),
         requires_target: true,
@@ -1267,6 +1330,18 @@ async fn dispatch_internal_admin_command(
             let hive = resolve_internal_action_hive(action, target, &params);
             handle_opa_query(ctx, client, query_action, hive.clone()).await?
         }
+        InternalActionRoute::WfRulesHttp(wf_action) => {
+            let hive = resolve_internal_action_hive(action, target, &params);
+            let req = parse_internal_wf_rules_request(params, hive)
+                .map_err(|detail| -> AdminError { detail.into() })?;
+            handle_wf_rules_http(ctx, client, req, wf_action).await?
+        }
+        InternalActionRoute::WfRulesQuery(query_action) => {
+            let hive = resolve_internal_action_hive(action, target, &params);
+            let req = parse_internal_wf_rules_request(params, hive)
+                .map_err(|detail| -> AdminError { detail.into() })?;
+            handle_wf_rules_query(ctx, client, query_action, req).await?
+        }
         InternalActionRoute::TimerRpc(timer_msg) => {
             let hive = resolve_internal_action_hive(action, target, &params);
             let Some(hive_id) = hive else {
@@ -1384,6 +1459,28 @@ fn parse_internal_opa_request(
     Ok(req)
 }
 
+fn parse_internal_wf_rules_request(
+    params: serde_json::Value,
+    default_hive: Option<String>,
+) -> Result<WfRulesRequest, String> {
+    if !params.is_null() && !params.is_object() {
+        return Err("invalid params: expected JSON object for wf-rules action".to_string());
+    }
+    let mut req = if params.is_null() {
+        WfRulesRequest {
+            payload: serde_json::Map::new(),
+            hive: None,
+        }
+    } else {
+        serde_json::from_value::<WfRulesRequest>(params)
+            .map_err(|err| format!("invalid wf-rules params: {err}"))?
+    };
+    if req.hive.is_none() {
+        req.hive = default_hive;
+    }
+    Ok(req)
+}
+
 fn internal_invalid_request(action: &str, detail: &str) -> InternalAdminDispatchResult {
     InternalAdminDispatchResult {
         http_status: 400,
@@ -1404,6 +1501,44 @@ enum OpaAction {
     Apply,
     Rollback,
     Check,
+}
+
+#[derive(Clone, Copy)]
+enum WfRulesAction {
+    Compile,
+    CompileApply,
+    Apply,
+    Rollback,
+    Delete,
+}
+
+impl WfRulesAction {
+    fn operation(&self) -> Option<&'static str> {
+        match self {
+            WfRulesAction::Compile => Some("compile"),
+            WfRulesAction::CompileApply => Some("compile_apply"),
+            WfRulesAction::Apply => Some("apply"),
+            WfRulesAction::Rollback => Some("rollback"),
+            WfRulesAction::Delete => None,
+        }
+    }
+
+    fn command(&self) -> Option<&'static str> {
+        match self {
+            WfRulesAction::Delete => Some("delete_workflow"),
+            _ => None,
+        }
+    }
+
+    fn action_name(&self) -> &'static str {
+        match self {
+            WfRulesAction::Compile => "compile",
+            WfRulesAction::CompileApply => "compile_apply",
+            WfRulesAction::Apply => "apply",
+            WfRulesAction::Rollback => "rollback",
+            WfRulesAction::Delete => "delete_workflow",
+        }
+    }
 }
 
 impl OpaAction {
@@ -1917,6 +2052,51 @@ async fn handle_http(
             let (status, resp) = handle_opa_query(ctx, client, "get_status", target).await?;
             respond_json(stream, status, &resp).await?;
         }
+        ("POST", "/wf-rules") => {
+            let req: WfRulesRequest = serde_json::from_slice(&body)?;
+            let (status, resp) =
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::CompileApply).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("POST", "/wf-rules/compile") => {
+            let req: WfRulesRequest = serde_json::from_slice(&body)?;
+            let (status, resp) =
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Compile).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("POST", "/wf-rules/apply") => {
+            let req: WfRulesRequest = serde_json::from_slice(&body)?;
+            let (status, resp) =
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Apply).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("POST", "/wf-rules/rollback") => {
+            let req: WfRulesRequest = serde_json::from_slice(&body)?;
+            let (status, resp) =
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Rollback).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("POST", "/wf-rules/delete") => {
+            let req: WfRulesRequest = serde_json::from_slice(&body)?;
+            let (status, resp) =
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Delete).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("GET", "/wf-rules") => {
+            let req = wf_rules_request_from_query(query, Some(ctx.hive_id.clone()));
+            let action = if req.payload.contains_key("workflow_name") {
+                "get_workflow"
+            } else {
+                "list_workflows"
+            };
+            let (status, resp) = handle_wf_rules_query(ctx, client, action, req).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("GET", "/wf-rules/status") => {
+            let req = wf_rules_request_from_query(query, Some(ctx.hive_id.clone()));
+            let (status, resp) = handle_wf_rules_query(ctx, client, "get_status", req).await?;
+            respond_json(stream, status, &resp).await?;
+        }
         _ => {
             let _ = headers;
             respond_json(stream, 404, r#"{"error":"not_found"}"#).await?;
@@ -2333,6 +2513,61 @@ async fn handle_hive_paths(
         }
         ("GET", ["opa", "status"]) => {
             let (status, resp) = handle_opa_query(ctx, client, "get_status", Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["wf-rules"]) => {
+            let req: WfRulesRequest = serde_json::from_slice(body)?;
+            let mut req = req;
+            req.hive = Some(hive);
+            let (status, resp) =
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::CompileApply).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["wf-rules", "compile"]) => {
+            let req: WfRulesRequest = serde_json::from_slice(body)?;
+            let mut req = req;
+            req.hive = Some(hive);
+            let (status, resp) =
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Compile).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["wf-rules", "apply"]) => {
+            let req: WfRulesRequest = serde_json::from_slice(body)?;
+            let mut req = req;
+            req.hive = Some(hive);
+            let (status, resp) =
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Apply).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["wf-rules", "rollback"]) => {
+            let req: WfRulesRequest = serde_json::from_slice(body)?;
+            let mut req = req;
+            req.hive = Some(hive);
+            let (status, resp) =
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Rollback).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["wf-rules", "delete"]) => {
+            let req: WfRulesRequest = serde_json::from_slice(body)?;
+            let mut req = req;
+            req.hive = Some(hive);
+            let (status, resp) =
+                handle_wf_rules_http(ctx, client, req, WfRulesAction::Delete).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["wf-rules"]) => {
+            let req = wf_rules_request_from_query(query.clone(), Some(hive));
+            let action = if req.payload.contains_key("workflow_name") {
+                "get_workflow"
+            } else {
+                "list_workflows"
+            };
+            let (status, resp) = handle_wf_rules_query(ctx, client, action, req).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["wf-rules", "status"]) => {
+            let req = wf_rules_request_from_query(query.clone(), Some(hive));
+            let (status, resp) = handle_wf_rules_query(ctx, client, "get_status", req).await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["timer", "help"]) => {
@@ -2756,12 +2991,21 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "WAN_NOT_AUTHORIZED"
         | "NODE_INSTANCE_RUNNING"
         | "NODE_NOT_CONFIGURED"
+        | "NOTHING_STAGED"
+        | "NO_BACKUP"
+        | "INSTANCES_ACTIVE"
+        | "INSTANCES_UNKNOWN"
         | "STALE_CONFIG_VERSION"
         | "RUNTIME_IN_USE"
         | "RUNTIME_HAS_DEPENDENTS"
         | "RUNTIME_CURRENT_CONFLICT"
         | "BUSY" => 409,
-        "COMPILE_ERROR" | "INVALID_CONFIG" | "UNSUPPORTED_APPLY_MODE" => 422,
+        "COMPILE_ERROR"
+        | "INVALID_CONFIG"
+        | "UNSUPPORTED_APPLY_MODE"
+        | "PACKAGE_PUBLISH_FAILED" => 422,
+        "INVALID_WORKFLOW_NAME" | "INVALID_CONFIG_SET" | "UNSUPPORTED_OPERATION" => 400,
+        "WORKFLOW_NOT_FOUND" => 404,
         "NOT_IMPLEMENTED" => 501,
         "SERVICE_FAILED"
         | "SPAWN_FAILED"
@@ -2774,6 +3018,8 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "RUNTIME_COMMAND_FAILED"
         | "RUNTIME_UNAVAILABLE"
         | "RUNTIME_REMOVE_FAILED"
+        | "ORCHESTRATOR_ERROR"
+        | "RESTART_FAILED"
         | "TRANSPORT_ERROR" => 502,
         "SHM_NOT_FOUND" | "RUNTIME_MANIFEST_MISSING" | "MISSING_WAN_LISTEN" => 503,
         _ => 500,
@@ -2809,6 +3055,13 @@ fn payload_error_code(payload: &serde_json::Value) -> Option<String> {
 fn payload_error_detail(payload: &serde_json::Value) -> Option<String> {
     value_string_field(payload, "error_detail")
         .or_else(|| value_string_field(payload, "message"))
+        .or_else(|| {
+            payload
+                .get("error")
+                .and_then(|value| value.get("detail"))
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+        })
         .or_else(|| {
             payload
                 .get("error")
@@ -3272,6 +3525,189 @@ async fn handle_opa_query(
     Ok(build_opa_query_response(ctx, action, responses, target))
 }
 
+async fn handle_wf_rules_http(
+    ctx: &AdminContext,
+    client: &AdminRouterClient,
+    req: WfRulesRequest,
+    action: WfRulesAction,
+) -> Result<(u16, String), AdminError> {
+    let target_hive = normalize_wf_rules_target(req.hive.clone(), &ctx.hive_id);
+    let target_node = format!("SY.wf-rules@{}", target_hive);
+    let response = if let Some(operation) = action.operation() {
+        let mut payload = req.payload;
+        payload.insert("operation".to_string(), serde_json::json!(operation));
+        send_system_request_with_meta(
+            client,
+            &target_node,
+            "CONFIG_SET",
+            "CONFIG_RESPONSE",
+            serde_json::json!({
+                "node_name": target_node,
+                "schema_version": 1,
+                "config_version": 0,
+                "apply_mode": "replace",
+                "config": serde_json::Value::Object(payload),
+            }),
+            16,
+            None,
+            None,
+            Some(target_node.clone()),
+            Some("CONFIG_SET".to_string()),
+            None,
+            admin_action_timeout(action.action_name()),
+        )
+        .await
+    } else if let Some(command) = action.command() {
+        send_l2_action_request(
+            client,
+            &target_node,
+            "command",
+            command,
+            serde_json::Value::Object(req.payload),
+            admin_action_timeout(action.action_name()),
+        )
+        .await
+    } else {
+        Err("unsupported wf-rules action".into())
+    };
+    Ok(build_admin_http_response(action.action_name(), response))
+}
+
+async fn handle_wf_rules_query(
+    _ctx: &AdminContext,
+    client: &AdminRouterClient,
+    action: &str,
+    req: WfRulesRequest,
+) -> Result<(u16, String), AdminError> {
+    let target_hive = normalize_wf_rules_target(req.hive.clone(), "");
+    let target_node = if target_hive.is_empty() {
+        return Err("wf-rules target hive is required".into());
+    } else {
+        format!("SY.wf-rules@{}", target_hive)
+    };
+    let response = send_l2_action_request(
+        client,
+        &target_node,
+        "query",
+        action,
+        serde_json::Value::Object(req.payload),
+        admin_action_timeout(action),
+    )
+    .await;
+    Ok(build_admin_http_response(action, response))
+}
+
+fn wf_rules_request_from_query(
+    mut query: HashMap<String, String>,
+    default_hive: Option<String>,
+) -> WfRulesRequest {
+    let explicit_hive = query.remove("hive");
+    let explicit_target = query.remove("target");
+    let hive = explicit_hive.or(explicit_target).or(default_hive);
+    WfRulesRequest {
+        payload: query
+            .into_iter()
+            .map(|(key, value)| (key, serde_json::json!(value)))
+            .collect(),
+        hive,
+    }
+}
+
+fn normalize_wf_rules_target(target: Option<String>, fallback_hive: &str) -> String {
+    target
+        .and_then(|value| {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("broadcast") {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+        .unwrap_or_else(|| fallback_hive.to_string())
+}
+
+async fn send_l2_action_request(
+    client: &AdminRouterClient,
+    target: &str,
+    msg_type: &str,
+    action: &str,
+    payload: serde_json::Value,
+    timeout_window: Duration,
+) -> Result<serde_json::Value, AdminError> {
+    use tokio::time::timeout;
+
+    let sender = client.sender_snapshot().await;
+    let trace_id = Uuid::new_v4().to_string();
+    let msg = Message {
+        routing: Routing {
+            src: sender.uuid().to_string(),
+            src_l2_name: None,
+            dst: Destination::Unicast(target.to_string()),
+            ttl: 16,
+            trace_id: trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: msg_type.to_string(),
+            action: Some(action.to_string()),
+            target: Some(target.to_string()),
+            action_class: classify_admin_action(action),
+            ..Meta::default()
+        },
+        payload,
+    };
+    let (tx, rx) = oneshot::channel::<Message>();
+    client.enqueue_admin_waiter(trace_id.clone(), tx).await;
+    sender.send(msg).await?;
+
+    let msg = match timeout(timeout_window, rx).await {
+        Ok(Ok(msg)) => msg,
+        Ok(Err(_)) => return Err("l2 action response channel closed".into()),
+        Err(_) => {
+            client.drop_admin_waiter(&trace_id).await;
+            return Err(format!(
+                "l2 action timeout msg_type={} action={} target={} timeout_secs={}",
+                msg_type,
+                action,
+                target,
+                timeout_window.as_secs()
+            )
+            .into());
+        }
+    };
+
+    if matches!(
+        msg.meta.msg.as_deref(),
+        Some("UNREACHABLE" | "TTL_EXCEEDED")
+    ) {
+        let system_msg = msg.meta.msg.as_deref().unwrap_or("");
+        return Err(format!("router returned {} for target={}", system_msg, target).into());
+    }
+
+    let response_msg_type = msg.meta.msg_type.as_str();
+    let expected_ok = match msg_type {
+        "command" => response_msg_type == "command" || response_msg_type == "command_response",
+        "query" => response_msg_type == "query" || response_msg_type == "query_response",
+        _ => false,
+    };
+    if !expected_ok {
+        return Err(format!(
+            "invalid response type for {}: expected {} got {}",
+            action, msg_type, response_msg_type
+        )
+        .into());
+    }
+    let action_matches = msg.meta.action.as_deref() == Some(action)
+        || msg.meta.msg.as_deref() == Some(&format!("{}_RESPONSE", action.to_uppercase()));
+    if !action_matches {
+        return Err(format!(
+            "invalid response action for {}: got action={:?} msg={:?}",
+            action, msg.meta.action, msg.meta.msg
+        )
+        .into());
+    }
+    Ok(msg.payload)
+}
+
 async fn handle_timer_rpc(
     _ctx: &AdminContext,
     client: &AdminRouterClient,
@@ -3395,6 +3831,8 @@ fn build_admin_action_doc(spec: &InternalActionSpec) -> serde_json::Value {
         InternalActionRoute::Inventory => ("inventory", None),
         InternalActionRoute::OpaHttp(_) => ("opa_http", None),
         InternalActionRoute::OpaQuery(canonical) => ("opa_query", Some(canonical)),
+        InternalActionRoute::WfRulesHttp(_) => ("wf_rules_http", None),
+        InternalActionRoute::WfRulesQuery(canonical) => ("wf_rules_query", Some(canonical)),
         InternalActionRoute::TimerRpc(canonical) => ("timer_rpc", Some(canonical)),
     };
     serde_json::json!({
@@ -3434,6 +3872,11 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "opa_compile"
             | "opa_apply"
             | "opa_rollback"
+            | "wf_rules_compile_apply"
+            | "wf_rules_compile"
+            | "wf_rules_apply"
+            | "wf_rules_rollback"
+            | "wf_rules_delete"
     )
 }
 
@@ -3494,6 +3937,9 @@ fn admin_action_summary(action: &str) -> &'static str {
         "get_drift_alerts" => "List historical drift alerts for one hive.",
         "opa_get_policy" => "Read current OPA policy text for a hive.",
         "opa_get_status" => "Read OPA status for a hive.",
+        "wf_rules_get_workflow" => "Read the current workflow definition managed by SY.wf-rules for a hive.",
+        "wf_rules_get_status" => "Read workflow status from SY.wf-rules for a hive.",
+        "wf_rules_list_workflows" => "List workflows managed by SY.wf-rules for a hive.",
         "timer_help" => "Read the self-described SY.timer capability catalog for a hive.",
         "timer_get" => "Read one timer by uuid from SY.timer for a hive.",
         "timer_list" => "List timers from SY.timer for a hive, optionally filtered by owner.",
@@ -3521,6 +3967,11 @@ fn admin_action_summary(action: &str) -> &'static str {
         "opa_compile" => "Compile OPA policy.",
         "opa_apply" => "Apply OPA policy.",
         "opa_rollback" => "Rollback OPA policy.",
+        "wf_rules_compile_apply" => "Compile and apply a workflow definition through SY.wf-rules.",
+        "wf_rules_compile" => "Compile a workflow definition without applying it.",
+        "wf_rules_apply" => "Apply the staged workflow definition.",
+        "wf_rules_rollback" => "Rollback to the backup workflow definition.",
+        "wf_rules_delete" => "Delete a managed workflow through SY.wf-rules.",
         _ => "Admin action.",
     }
 }
@@ -3567,6 +4018,9 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "get_drift_alerts" => vec!["GET /hives/{hive}/drift-alerts"],
         "opa_get_policy" => vec!["GET /hives/{hive}/opa/policy"],
         "opa_get_status" => vec!["GET /hives/{hive}/opa/status"],
+        "wf_rules_get_workflow" => vec!["GET /hives/{hive}/wf-rules"],
+        "wf_rules_get_status" => vec!["GET /hives/{hive}/wf-rules/status"],
+        "wf_rules_list_workflows" => vec!["GET /hives/{hive}/wf-rules"],
         "timer_help" => vec!["GET /hives/{hive}/timer/help"],
         "timer_get" => vec!["GET /hives/{hive}/timer/timers/{timer_uuid}"],
         "timer_list" => vec!["GET /hives/{hive}/timer/timers"],
@@ -3594,6 +4048,11 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "opa_compile" => vec!["POST /hives/{hive}/opa/policy/compile"],
         "opa_apply" => vec!["POST /hives/{hive}/opa/policy/apply"],
         "opa_rollback" => vec!["POST /hives/{hive}/opa/policy/rollback"],
+        "wf_rules_compile_apply" => vec!["POST /hives/{hive}/wf-rules"],
+        "wf_rules_compile" => vec!["POST /hives/{hive}/wf-rules/compile"],
+        "wf_rules_apply" => vec!["POST /hives/{hive}/wf-rules/apply"],
+        "wf_rules_rollback" => vec!["POST /hives/{hive}/wf-rules/rollback"],
+        "wf_rules_delete" => vec!["POST /hives/{hive}/wf-rules/delete"],
         _ => Vec::new(),
     }
 }
@@ -3645,10 +4104,12 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
         )],
         "list_nodes" | "list_ilks" | "get_versions" | "list_runtimes" | "list_routes"
         | "list_vpns" | "get_deployments" | "get_drift_alerts" | "opa_get_policy"
-        | "opa_get_status" | "timer_help" | "timer_list" | "timer_now" | "timer_now_in"
-        | "timer_convert" | "timer_parse" | "timer_format" | "update" | "sync_hint"
-        | "opa_compile_apply"
-        | "opa_compile" | "opa_apply" | "opa_rollback" | "opa_check" => vec![
+        | "opa_get_status" | "wf_rules_get_workflow" | "wf_rules_get_status"
+        | "wf_rules_list_workflows" | "timer_help" | "timer_list" | "timer_now"
+        | "timer_now_in" | "timer_convert" | "timer_parse" | "timer_format" | "update"
+        | "sync_hint" | "opa_compile_apply" | "opa_compile" | "opa_apply"
+        | "opa_rollback" | "opa_check" | "wf_rules_compile_apply" | "wf_rules_compile"
+        | "wf_rules_apply" | "wf_rules_rollback" | "wf_rules_delete" => vec![
             admin_action_path_param(
             "hive",
             "string",
@@ -3753,6 +4214,11 @@ fn admin_action_body_required(action: &str) -> bool {
             | "opa_compile_apply"
             | "opa_compile"
             | "opa_apply"
+            | "wf_rules_compile_apply"
+            | "wf_rules_compile"
+            | "wf_rules_apply"
+            | "wf_rules_rollback"
+            | "wf_rules_delete"
             | "opa_check"
             | "timer_now_in"
             | "timer_convert"
@@ -3837,6 +4303,19 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             "rego",
             "string",
             "OPA rego source text.",
+        )],
+        "wf_rules_compile_apply" | "wf_rules_compile" => vec![
+            admin_action_body_field("workflow_name", "string", "Workflow logical name."),
+            admin_action_body_field("definition", "object", "Workflow definition JSON."),
+        ],
+        "wf_rules_apply"
+        | "wf_rules_rollback"
+        | "wf_rules_get_workflow"
+        | "wf_rules_get_status"
+        | "wf_rules_delete" => vec![admin_action_body_field(
+            "workflow_name",
+            "string",
+            "Workflow logical name.",
         )],
         "opa_apply" => vec![admin_action_body_field(
             "version",
@@ -4057,6 +4536,59 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             "string",
             "Optional explicit hive override for OPA broadcast targeting.",
         )],
+        "wf_rules_compile_apply" | "wf_rules_compile" => vec![
+            admin_action_body_field(
+                "auto_spawn",
+                "bool",
+                "When true, spawn the WF node if it does not exist after apply.",
+            ),
+            admin_action_body_field(
+                "version",
+                "u64",
+                "Optional explicit workflow version/idempotency check.",
+            ),
+            admin_action_body_field(
+                "hive",
+                "string",
+                "Optional explicit hive override for SY.wf-rules target.",
+            ),
+        ],
+        "wf_rules_apply" | "wf_rules_rollback" => vec![
+            admin_action_body_field(
+                "auto_spawn",
+                "bool",
+                "When true, allow first deploy spawn if the WF node does not exist.",
+            ),
+            admin_action_body_field(
+                "version",
+                "u64",
+                "Optional staged version guard for apply.",
+            ),
+            admin_action_body_field(
+                "hive",
+                "string",
+                "Optional explicit hive override for SY.wf-rules target.",
+            ),
+        ],
+        "wf_rules_delete" => vec![
+            admin_action_body_field(
+                "force",
+                "bool",
+                "Force delete even if active instances exist.",
+            ),
+            admin_action_body_field(
+                "hive",
+                "string",
+                "Optional explicit hive override for SY.wf-rules target.",
+            ),
+        ],
+        "wf_rules_get_workflow" | "wf_rules_get_status" | "wf_rules_list_workflows" => vec![
+            admin_action_body_field(
+                "hive",
+                "string",
+                "Optional explicit hive override for SY.wf-rules target.",
+            ),
+        ],
         "remove_runtime_version" => vec![admin_action_body_field(
             "test_hold_ms",
             "u64",
@@ -4191,6 +4723,39 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         "opa_rollback" => serde_json::json!({
             "version": 11
         }),
+        "wf_rules_compile_apply" | "wf_rules_compile" => serde_json::json!({
+            "workflow_name": "invoice",
+            "definition": {
+                "wf_schema_version": "1",
+                "workflow_type": "invoice",
+                "description": "Issues an invoice",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "customer_id": {"type": "string"}
+                    }
+                },
+                "initial_state": "collecting_data",
+                "terminal_states": ["completed"],
+                "states": []
+            },
+            "auto_spawn": true
+        }),
+        "wf_rules_apply" => serde_json::json!({
+            "workflow_name": "invoice",
+            "auto_spawn": true
+        }),
+        "wf_rules_rollback" => serde_json::json!({
+            "workflow_name": "invoice",
+            "auto_spawn": true
+        }),
+        "wf_rules_delete" => serde_json::json!({
+            "workflow_name": "invoice",
+            "force": false
+        }),
+        "wf_rules_get_workflow" | "wf_rules_get_status" => serde_json::json!({
+            "workflow_name": "invoice"
+        }),
         "remove_runtime_version" => serde_json::json!({
             "test_hold_ms": 250
         }),
@@ -4297,6 +4862,28 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         }
         "opa_check" => {
             r#"curl -X POST /hives/motherbee/opa/policy/check -d '{"rego":"package router\n\ndefault target = null\n","entrypoint":"router/target"}'"#
+        }
+        "wf_rules_get_workflow" => {
+            "curl -X GET '/hives/motherbee/wf-rules?workflow_name=invoice'"
+        }
+        "wf_rules_get_status" => {
+            "curl -X GET '/hives/motherbee/wf-rules/status?workflow_name=invoice'"
+        }
+        "wf_rules_list_workflows" => "curl -X GET /hives/motherbee/wf-rules",
+        "wf_rules_compile_apply" => {
+            r#"curl -X POST /hives/motherbee/wf-rules -d '{"workflow_name":"invoice","definition":{"wf_schema_version":"1","workflow_type":"invoice","description":"Issues an invoice","input_schema":{"type":"object","properties":{"customer_id":{"type":"string"}}},"initial_state":"collecting_data","terminal_states":["completed"],"states":[]},"auto_spawn":true}'"#
+        }
+        "wf_rules_compile" => {
+            r#"curl -X POST /hives/motherbee/wf-rules/compile -d '{"workflow_name":"invoice","definition":{"wf_schema_version":"1","workflow_type":"invoice","description":"Issues an invoice","input_schema":{"type":"object","properties":{"customer_id":{"type":"string"}}},"initial_state":"collecting_data","terminal_states":["completed"],"states":[]}}'"#
+        }
+        "wf_rules_apply" => {
+            r#"curl -X POST /hives/motherbee/wf-rules/apply -d '{"workflow_name":"invoice","auto_spawn":true}'"#
+        }
+        "wf_rules_rollback" => {
+            r#"curl -X POST /hives/motherbee/wf-rules/rollback -d '{"workflow_name":"invoice","auto_spawn":true}'"#
+        }
+        "wf_rules_delete" => {
+            r#"curl -X POST /hives/motherbee/wf-rules/delete -d '{"workflow_name":"invoice","force":false}'"#
         }
         _ => return None,
     };
@@ -4411,6 +4998,22 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "opa_rollback" => vec![
             "If version is omitted, rollback uses the implementation default (currently 0).",
+        ],
+        "wf_rules_compile_apply" | "wf_rules_compile" => vec![
+            "workflow_name and definition are required.",
+            "SY.admin forwards this to SY.wf-rules using the node CONFIG_SET contract.",
+        ],
+        "wf_rules_apply" | "wf_rules_rollback" => vec![
+            "workflow_name is required.",
+            "SY.admin forwards this to SY.wf-rules using the node CONFIG_SET contract.",
+        ],
+        "wf_rules_delete" => vec![
+            "workflow_name is required.",
+            "Delete is a direct command to SY.wf-rules, not a node CONFIG_SET operation.",
+        ],
+        "wf_rules_get_workflow" | "wf_rules_get_status" | "wf_rules_list_workflows" => vec![
+            "These are direct query operations against SY.wf-rules.",
+            "GET /hives/{hive}/wf-rules without workflow_name lists workflows; with workflow_name it returns the current definition.",
         ],
         "set_storage" => vec![
             "This persists the local storage path in hive.yaml on the target hive.",
@@ -6316,5 +6919,206 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body_json["status"], json!("ok"));
         assert_eq!(body_json["error_code"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn wf_rules_compile_action_doc_is_registered_as_wf_rules_http() {
+        let spec =
+            resolve_internal_action_spec("wf_rules_compile").expect("wf_rules_compile must exist");
+        let doc = build_admin_action_doc(spec);
+
+        assert_eq!(doc["action"], json!("wf_rules_compile"));
+        assert_eq!(doc["handler"], json!("wf_rules_http"));
+        assert_eq!(doc["canonical_action"], serde_json::Value::Null);
+        assert_eq!(doc["read_only"], json!(false));
+        assert_eq!(doc["requires_target"], json!(false));
+    }
+
+    #[test]
+    fn wf_rules_get_status_action_doc_is_registered_as_wf_rules_query() {
+        let spec = resolve_internal_action_spec("wf_rules_get_status")
+            .expect("wf_rules_get_status must exist");
+        let doc = build_admin_action_doc(spec);
+
+        assert_eq!(doc["action"], json!("wf_rules_get_status"));
+        assert_eq!(doc["handler"], json!("wf_rules_query"));
+        assert_eq!(doc["canonical_action"], json!("get_status"));
+        assert_eq!(doc["read_only"], json!(true));
+    }
+
+    #[test]
+    fn wf_rules_compile_request_contract_exposes_expected_body_fields() {
+        let contract = admin_action_request_contract("wf_rules_compile");
+
+        assert_eq!(contract["method"], json!("POST"));
+        assert_eq!(
+            contract["path_patterns"],
+            json!(["POST /hives/{hive}/wf-rules/compile"])
+        );
+        assert_eq!(
+            contract["body"]["required_fields"],
+            json!([
+                { "name": "workflow_name", "type": "string", "description": "Workflow logical name." },
+                { "name": "definition", "type": "object", "description": "Workflow definition JSON." }
+            ])
+        );
+        let optional_fields = contract["body"]["optional_fields"]
+            .as_array()
+            .expect("optional_fields must be an array");
+        assert_eq!(optional_fields.len(), 3);
+        assert!(optional_fields.iter().any(|field| {
+            field["name"] == json!("hive")
+                && field["type"] == json!("string")
+                && field["description"]
+                    == json!("Optional explicit hive override for SY.wf-rules target.")
+        }));
+        assert!(optional_fields.iter().any(|field| {
+            field["name"] == json!("auto_spawn")
+                && field["type"] == json!("bool")
+                && field["description"]
+                    == json!("When true, spawn the WF node if it does not exist after apply.")
+        }));
+        assert!(optional_fields.iter().any(|field| {
+            field["name"] == json!("version")
+                && field["type"] == json!("u64")
+                && field["description"]
+                    == json!("Optional explicit workflow version/idempotency check.")
+        }));
+    }
+
+    #[test]
+    fn wf_rules_status_request_contract_exposes_query_fields() {
+        let contract = admin_action_request_contract("wf_rules_get_status");
+
+        assert_eq!(contract["method"], json!("GET"));
+        assert_eq!(
+            contract["path_patterns"],
+            json!(["GET /hives/{hive}/wf-rules/status"])
+        );
+        assert_eq!(
+            contract["body"]["required_fields"],
+            json!([
+                { "name": "workflow_name", "type": "string", "description": "Workflow logical name." }
+            ])
+        );
+        let optional_fields = contract["body"]["optional_fields"]
+            .as_array()
+            .expect("optional_fields must be an array");
+        assert_eq!(optional_fields.len(), 1);
+        assert_eq!(optional_fields[0]["name"], json!("hive"));
+        assert_eq!(optional_fields[0]["type"], json!("string"));
+        assert_eq!(
+            optional_fields[0]["description"],
+            json!("Optional explicit hive override for SY.wf-rules target.")
+        );
+    }
+
+    #[test]
+    fn wf_rules_request_from_query_uses_default_hive_and_removes_target_keys() {
+        let req = wf_rules_request_from_query(
+            HashMap::from([
+                ("workflow_name".to_string(), "invoice".to_string()),
+                ("hive".to_string(), "worker-22".to_string()),
+                ("target".to_string(), "ignored-target".to_string()),
+            ]),
+            Some("motherbee".to_string()),
+        );
+
+        assert_eq!(req.hive.as_deref(), Some("worker-22"));
+        assert_eq!(req.payload["workflow_name"], json!("invoice"));
+        assert!(!req.payload.contains_key("hive"));
+        assert!(!req.payload.contains_key("target"));
+    }
+
+    #[test]
+    fn wf_rules_request_from_query_falls_back_to_default_hive() {
+        let req = wf_rules_request_from_query(
+            HashMap::from([("workflow_name".to_string(), "invoice".to_string())]),
+            Some("motherbee".to_string()),
+        );
+
+        assert_eq!(req.hive.as_deref(), Some("motherbee"));
+        assert_eq!(req.payload["workflow_name"], json!("invoice"));
+    }
+
+    #[test]
+    fn normalize_wf_rules_target_treats_blank_and_broadcast_as_missing() {
+        assert_eq!(
+            normalize_wf_rules_target(Some("broadcast".to_string()), "motherbee"),
+            "motherbee"
+        );
+        assert_eq!(
+            normalize_wf_rules_target(Some("  ".to_string()), "motherbee"),
+            "motherbee"
+        );
+        assert_eq!(
+            normalize_wf_rules_target(Some("worker-22".to_string()), "motherbee"),
+            "worker-22"
+        );
+    }
+
+    #[test]
+    fn parse_internal_wf_rules_request_rejects_non_object_payload() {
+        let err = parse_internal_wf_rules_request(json!("bad"), Some("motherbee".to_string()))
+            .expect_err("non-object params must fail");
+
+        assert!(err.contains("expected JSON object"));
+    }
+
+    #[test]
+    fn parse_internal_wf_rules_request_injects_default_hive() {
+        let req = parse_internal_wf_rules_request(
+            json!({
+                "workflow_name": "invoice",
+                "definition": { "wf_schema_version": "1" }
+            }),
+            Some("motherbee".to_string()),
+        )
+        .expect("valid wf-rules request");
+
+        assert_eq!(req.hive.as_deref(), Some("motherbee"));
+        assert_eq!(req.payload["workflow_name"], json!("invoice"));
+        assert_eq!(req.payload["definition"]["wf_schema_version"], json!("1"));
+    }
+
+    #[test]
+    fn build_admin_http_response_accepts_sy_wf_rules_ok_boolean_contract() {
+        let payload = json!({
+            "ok": true,
+            "node_name": "SY.wf-rules@motherbee",
+            "wf_node": { "action": "restarted", "status": "ok" }
+        });
+
+        let (status, body) = build_admin_http_response("wf_rules_apply", Ok(payload));
+        let body_json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+
+        assert_eq!(status, 200);
+        assert_eq!(body_json["status"], json!("ok"));
+        assert_eq!(
+            body_json["payload"]["wf_node"]["action"],
+            json!("restarted")
+        );
+    }
+
+    #[test]
+    fn build_admin_http_response_maps_sy_wf_rules_error_payload() {
+        let payload = json!({
+            "ok": false,
+            "error": {
+                "code": "INSTANCES_ACTIVE",
+                "detail": "workflow has running instances"
+            }
+        });
+
+        let (status, body) = build_admin_http_response("wf_rules_delete", Ok(payload));
+        let body_json: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+
+        assert_eq!(status, 409);
+        assert_eq!(body_json["status"], json!("error"));
+        assert_eq!(body_json["error_code"], json!("INSTANCES_ACTIVE"));
+        assert_eq!(
+            body_json["error_detail"],
+            json!("workflow has running instances")
+        );
     }
 }
