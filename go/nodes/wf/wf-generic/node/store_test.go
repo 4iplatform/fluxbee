@@ -182,11 +182,11 @@ func TestStoreLogCapEnforced(t *testing.T) {
 	// Insert 105 entries
 	for i := 0; i < 105; i++ {
 		entry := WFLogEntry{
-			InstanceID:  "wfi:logtest",
-			LoggedAtMS:  1776100000000 + int64(i),
-			ActionType:  "send_message",
-			Summary:     "msg",
-			OK:          true,
+			InstanceID: "wfi:logtest",
+			LoggedAtMS: 1776100000000 + int64(i),
+			ActionType: "send_message",
+			Summary:    "msg",
+			OK:         true,
 		}
 		if err := s.AppendLog(ctx, entry); err != nil {
 			t.Fatalf("AppendLog #%d: %v", i, err)

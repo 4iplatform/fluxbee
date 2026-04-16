@@ -442,6 +442,19 @@ go/nodes/wf/wf-generic/
 - [x] Added `scripts/publish-wf-runtime.sh` to publish the WF base runtime as `wf.engine`
 - [x] Added `scripts/publish-wf-invoice-package.sh` and package fixture `go/nodes/wf/examples/packages/wf.invoice/`
 
+### WF-BUILD-3 — Package-native contract hardening
+- [ ] Treat `workflow_definition_path` as compatibility/local-dev input only, not as the canonical managed-runtime contract
+- [ ] In managed package mode (`_system.package_path` present), document and enforce that workflow code comes from `_system.package_path/flow/definition.json`
+- [ ] In `CONFIG_SET`, reject attempts to mutate `workflow_definition_path` when the node is running as a managed workflow package
+- [ ] Keep rejecting `_system` mutations via `CONFIG_SET`; managed runtime/package metadata remains orchestrator-owned
+- [ ] Update `CONFIG_GET` / effective config response so the package-native source of truth is visible and `workflow_definition_path` is not presented as the primary operator-facing control in managed mode
+- [ ] Reuse the shared `go/pkg/wfcel` package for guard validation / CEL environment setup so `sy.wf-rules` and `wf-generic` cannot drift
+- [ ] Add tests covering:
+  - managed package mode resolves definition from `_system.package_path`
+  - `CONFIG_SET` in managed package mode refuses `workflow_definition_path` mutation
+  - `CONFIG_GET` in managed package mode clearly reflects package-native binding
+  - local-dev / smoke mode with explicit `workflow_definition_path` still works when no managed package binding exists
+
 ---
 
 ## 16) Reference workflow

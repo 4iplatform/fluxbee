@@ -9,7 +9,6 @@ import (
 	"sync"
 
 	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
-	"github.com/google/cel-go/cel"
 )
 
 // WFInstance is the in-memory representation of a running workflow instance.
@@ -139,12 +138,11 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 		if !matchesEvent(t.EventMatch, event) {
 			continue
 		}
-		program, ok := t.program.(cel.Program)
-		if !ok || program == nil {
+		if t.Program == nil {
 			log.Printf("instance %s: transition %d has no compiled program, skipping", inst.InstanceID, i)
 			continue
 		}
-		if EvalGuard(program, inst.Input, inst.StateVars, eventMap) {
+		if EvalGuard(t.Program, inst.Input, inst.StateVars, eventMap) {
 			chosen = t
 			break
 		}

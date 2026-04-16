@@ -12,9 +12,9 @@
 
 `SY.wf-rules` is a system node that manages workflow definitions for the `WF.*` node family, following the same operational model as `SY.opa-rules` manages OPA policies.
 
-The operator (human, Archi, or any authorized node) sends workflow definition code (JSON with CEL guards) to `SY.wf-rules`. The node validates the definition, compiles CEL guards, stages it, and on apply promotes it to current and coordinates with `SY.orchestrator` to restart the corresponding WF node.
+The operator (human, Archi, or any authorized node) sends workflow definition code (JSON with CEL guards) to `SY.wf-rules`. The node validates the definition, compiles CEL guards, stages it, and on apply promotes it to current, materializes a standard workflow package, installs/publishes that package into `dist`, and coordinates with `SY.orchestrator` to restart or spawn the corresponding WF node.
 
-The operator never creates packages, never writes shell scripts, never touches the filesystem. The workflow definition is treated as **code that the system compiles and runs**, exactly like Rego policies in `SY.opa-rules`.
+The operator never creates packages manually, never writes shell scripts, never touches the filesystem. The workflow definition is treated as **code that the system compiles and runs**, exactly like Rego policies in `SY.opa-rules`. The packaging step is an internal implementation detail of `SY.wf-rules`, not an operator concern.
 
 ---
 
@@ -32,11 +32,11 @@ The differences are structural, not stylistic:
 | Aspect | SY.opa-rules | SY.wf-rules |
 |---|---|---|
 | Input code | Rego text | Workflow definition JSON |
-| Compilation output | WASM binary | Validated definition + compiled CEL programs (persisted as the original JSON; CEL is re-compiled at WF node boot) |
-| Distribution mechanism | SHM region read by routers | Filesystem + orchestrator restart of WF node |
+| Compilation output | WASM binary | Validated definition + workflow package (`flow/definition.json`; CEL is re-compiled at WF node boot) |
+| Distribution mechanism | SHM region read by routers | Standard runtime/package install in `dist` + orchestrator restart/spawn of WF node |
 | Scope | One policy per hive | Multiple workflows per hive (one per workflow_name) |
-| Consumer | Router (reads SHM directly) | wf-generic node (reads definition from config at boot) |
-| Post-apply notification | Broadcast OPA_RELOAD | Command to SY.orchestrator to restart the specific WF node |
+| Consumer | Router (reads SHM directly) | wf-generic node (reads definition from `_system.package_path/flow/definition.json` at boot) |
+| Post-apply notification | Broadcast OPA_RELOAD | Command to SY.orchestrator to rebind/restart the specific WF node |
 
 ---
 
@@ -63,6 +63,35 @@ When a new definition is applied:
 5. Existing instances in SQLite continue using the definition they were born with (frozen by hash — this is handled by wf-generic internally, not by sy.wf-rules).
 
 The user perceives always-latest. The system preserves running instances transparently. This is the decision documented in the conversation of 2026-04-15.
+
+### 3.4 Workflow package and fixed instance binding
+
+`SY.wf-rules` is the source of truth for workflow code and versioning. `WF.*` nodes do not receive workflow code through `CONFIG_SET`, and `SY.orchestrator` does not own the workflow source.
+
+On each successful apply, `SY.wf-rules` materializes a standard workflow package:
+
+```
+/var/lib/fluxbee/dist/runtimes/wf.<workflow_name>/<version>/
+├── package.json
+├── flow/
+│   └── definition.json
+└── config/
+    └── default-config.json   # optional
+```
+
+The package version is the same monotonic logical version managed by `SY.wf-rules`.
+
+When `SY.orchestrator` spawns or rebinds a WF node, it resolves the runtime version and persists it into the managed node config under `_system`, including:
+
+- `runtime = "wf.<workflow_name>"`
+- `requested_version`
+- `resolved_version`
+- `runtime_base = "wf.engine"`
+- `package_path = "/var/lib/fluxbee/dist/runtimes/wf.<workflow_name>/<resolved_version>"`
+
+This binding is **fixed for that node instance** until an explicit rollout changes it. A plain process restart must not silently move a node from version `N` to version `N+1` just because `current` changed in `dist`.
+
+Publishing a newer package version to `dist` and moving the runtime manifest `current` pointer does **not** by itself deploy that version to an already-existing WF node. Deployment happens only when the managed node binding is explicitly updated (`resolved_version`, `package_path`) and the node is restarted. Until that explicit rebind succeeds, crash recovery or automatic process restart continues to use the previously persisted binding.
 
 ### 3.3 State directories
 
@@ -100,7 +129,7 @@ One directory tree per workflow_name. Created on first `compile` for that workfl
 }
 ```
 
-The `version` is an auto-incrementing integer managed by `SY.wf-rules`, not by the user. Each successful compile bumps the version. The user can optionally pass a version in the request (for idempotency checks), but if omitted, the system increments automatically.
+The `version` is an auto-incrementing integer managed by `SY.wf-rules`, not by the user. Each successful compile bumps the version. The same version number is used for the workflow package published in `dist`. The user can optionally pass a version in the request (for idempotency checks), but if omitted, the system increments automatically.
 
 ---
 
@@ -428,48 +457,57 @@ If any check fails, the definition is NOT staged. The response includes the erro
 When a definition is applied (compile_apply or apply operations):
 
 1. Rotate sy.wf-rules state directories: `current/ → backup/`, `staged/ → current/`.
-2. Determine the target WF node name: `WF.<workflow_name>@<hive>`.
-3. Read the current `config.json` of the WF node (if it exists, via orchestrator query).
-4. Build the new `config.json` preserving operational fields (`sy_timer_l2_name`, `gc_retention_days`, `gc_interval_seconds`) and replacing the `workflow_definition` field with the new definition.
-5. Send the config + node operations to `SY.orchestrator@<hive>`:
-   - **If the WF node is already running:**
-     a. `set_node_config` (or equivalent) with the new `config.json` contents.
+2. Determine the target workflow runtime name: `wf.<workflow_name>`.
+3. Materialize and install/publish the workflow package for the new version into `dist/runtimes/wf.<workflow_name>/<version>/`.
+4. Determine the target WF node name: `WF.<workflow_name>@<hive>`.
+5. Read the current managed `config.json` of the WF node (if it exists, via orchestrator query).
+6. Build the new managed config preserving operational fields (`tenant_id`, `sy_timer_l2_name`, `gc_retention_days`, `gc_interval_seconds`, and any other node-owned operational settings) without embedding workflow code.
+7. Send the config + node operations to `SY.orchestrator@<hive>`:
+   - **If the WF node already exists:**
+     a. `set_node_config` (or equivalent) with the updated operational config and runtime binding to `runtime = "wf.<workflow_name>"`, `resolved_version = <version>`.
      b. `kill_node` for `WF.<workflow_name>@<hive>`.
-     c. `run_node` for `WF.<workflow_name>@<hive>` with runtime `wf.engine`.
+     c. `run_node` for `WF.<workflow_name>@<hive>` with runtime `wf.<workflow_name>` and version `<version>`.
    - **If the WF node does not exist and `auto_spawn: true`:**
-     a. `run_node` for `WF.<workflow_name>@<hive>` with runtime `wf.engine` and the new config inline (the orchestrator creates the managed directory and the config.json as part of spawn).
+     a. `run_node` for `WF.<workflow_name>@<hive>` with runtime `wf.<workflow_name>`, version `<version>`, and the managed operational config.
    - **If the WF node does not exist and `auto_spawn: false`:**
-     a. No orchestrator calls. Definition is stored only in sy.wf-rules `current/`.
+     a. No orchestrator lifecycle calls. Definition/package is stored and published, but no node is started.
      b. Response includes `"wf_node": { "action": "none", "reason": "auto_spawn disabled" }`.
 
 **Important properties of this design:**
 
-- sy.wf-rules **never writes to the filesystem under `/var/lib/fluxbee/nodes/`**. The orchestrator owns that directory tree and is the only system node that writes there. sy.wf-rules operates exclusively via L2 messages to the orchestrator.
-- The `workflow_definition` lives as a field inside `config.json`, not as a separate file. This is the contract between sy.wf-rules, the orchestrator, and wf-generic. The wf-generic binary reads its `config.json` at boot and finds the definition as a top-level field.
-- On updates to an existing workflow, operational fields (gc, timer, etc.) are preserved from the existing `config.json`. Only `workflow_definition` is replaced. If the operator had customized operational settings via direct CONFIG_SET to the WF node, those customizations persist through workflow definition updates.
+- sy.wf-rules **never writes to the filesystem under `/var/lib/fluxbee/nodes/`**. The orchestrator owns that directory tree and is the only system node that writes there. sy.wf-rules operates exclusively via L2 messages to the orchestrator for managed node lifecycle/config.
+- The workflow definition does **not** live in the managed node `config.json`. The executable code artifact lives in the workflow package, and `wf-generic` reads it from `_system.package_path/flow/definition.json` at boot.
+- On updates to an existing workflow, operational fields (gc, timer, tenant, etc.) are preserved from the existing managed `config.json`. The workflow code changes by publishing a new package version and rebinding/restarting the node, not by mutating top-level `workflow_definition`.
+- Publication state and deployment state are intentionally different. A package may already exist in `dist` with a newer version while the WF node still runs the older `resolved_version` recorded in its managed config. The node only changes versions after the explicit rebind/restart sequence completes successfully.
 
-### 7.1 config.json format for WF nodes
+### 7.1 Managed config.json format for WF nodes
 
 The `config.json` that the orchestrator writes for a WF node follows this shape:
 
 ```json
 {
+  "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e",
   "sy_timer_l2_name": "SY.timer@motherbee",
   "gc_retention_days": 7,
   "gc_interval_seconds": 3600,
-  "workflow_definition": {
-    "wf_schema_version": "1",
-    "workflow_type": "invoice",
-    "description": "Issues an invoice...",
-    "input_schema": { ... },
-    "initial_state": "validating_data",
-    "terminal_states": ["completed", "failed", "cancelled"],
-    "states": [ ... ]
+  "_system": {
+    "node_name": "WF.invoice@motherbee",
+    "runtime": "wf.invoice",
+    "requested_version": "3",
+    "resolved_version": "3",
+    "runtime_base": "wf.engine",
+    "package_path": "/var/lib/fluxbee/dist/runtimes/wf.invoice/3"
   }
 }
 ```
 
-The `workflow_definition` is the complete JSON as defined in wf-v1.md §8. The wf-generic binary, at boot, reads `config.json` and uses this field directly — no separate file, no path indirection.
+The workflow definition itself is stored in the package:
+
+```text
+/var/lib/fluxbee/dist/runtimes/wf.invoice/3/flow/definition.json
+```
+
+The `wf-generic` binary, at boot, reads `_system.package_path` from the managed config and then loads `flow/definition.json` from that package directory. The `_system.package_path` binding is fixed for that node instance until an explicit rollout changes it.
 
 ### 7.2 Kill + run semantics (no atomic restart)
 
@@ -481,6 +519,12 @@ The `workflow_definition` is the complete JSON as defined in wf-v1.md §8. The w
 - If `kill_node` succeeds but `run_node` fails: sy.wf-rules retries `run_node` once after a 1-second delay. If the retry also fails, sy.wf-rules gives up and returns the apply result with `"wf_node": { "action": "restart_failed", "error": "<detail>" }`. The node remains dead until manual intervention.
 - If both `kill_node` and `run_node` succeed: `"wf_node": { "action": "restarted", "status": "ok" }`.
 
+**Crash/autorestart semantics:**
+
+- If the WF node crashes on its own before sy.wf-rules completes the explicit rebind/restart sequence, automatic process restart must continue using the existing managed config and its current `_system.resolved_version` / `_system.package_path`.
+- In other words, a crash between "package version `N+1` published to `dist`" and "managed config rebound to `N+1`" must restart the node on version `N`, not on `N+1`.
+- Moving the runtime manifest `current` pointer in `dist` is publication state only. It is not deployment state for an already-existing node.
+
 **State consistency on restart failure:**
 
 Even if the node restart fails, sy.wf-rules internal state is consistent:
@@ -488,16 +532,39 @@ Even if the node restart fails, sy.wf-rules internal state is consistent:
 - The previous definition is in `backup/`.
 - A subsequent `rollback` operation works normally (swaps current ↔ backup and attempts another restart).
 - A subsequent `apply` retry attempts the restart again with the new definition already in current.
+- If the old WF node process crashes during this window and the host restarts it automatically, it comes back with the previously bound version from managed config until the rollout succeeds.
 
 The operator sees a clear failure in the response and can decide next steps: investigate why the node won't spawn, rollback to the previous definition, or intervene manually.
 
 **Future improvement:** if sy.orchestrator later gains an atomic `restart_node` verb, sy.wf-rules can adopt it and eliminate the two-step race. This is a backward-compatible improvement; the current two-step approach continues to work until replaced.
 
-### 7.1 Dependency: wf.engine runtime must be installed
+### 7.2 Dependency: wf.engine runtime base must be installed
 
-`SY.wf-rules` does NOT install the `wf.engine` runtime (the `wf-generic` binary). That binary must already be available in the dist as a pre-installed runtime (installed via `install.sh` or `publish-wf-runtime.sh`). `SY.wf-rules` only manages the workflow definitions that parameterize that runtime.
+`SY.wf-rules` does NOT build or install the `wf.engine` base runtime (the `wf-generic` binary). That base runtime must already be available in `dist` as a pre-installed runtime (installed via `install.sh` or `publish-wf-runtime.sh`). `SY.wf-rules` only manages the workflow packages `wf.<workflow_name>` that run on top of that base runtime.
 
-If `SY.orchestrator` reports that `wf.engine` is not available when asked to spawn, `SY.wf-rules` returns error `RUNTIME_NOT_AVAILABLE`.
+If `SY.orchestrator` reports that `wf.engine` is not available when asked to spawn a `wf.<workflow_name>` package, `SY.wf-rules` returns error `RUNTIME_NOT_AVAILABLE`.
+
+### 7.3 Package publication and retention
+
+`SY.wf-rules` is the only component that publishes workflow packages for `WF.*`.
+
+On each successful apply, `SY.wf-rules` generates and installs a new package version:
+
+- runtime name: `wf.<workflow_name>`
+- version: the same monotonic logical version managed in `metadata.json`
+- type: `workflow`
+- runtime_base: `wf.engine`
+
+The package install/publication must reuse the standard Fluxbee package install pipeline. `SY.wf-rules` must not shell out to ad hoc scripts; it should invoke a shared install/publish implementation through code or a structured internal command path.
+
+Retention policy in v1:
+
+- keep the package version referenced by `current/`
+- keep the package version referenced by `backup/`
+- keep any package version still referenced by a live or persisted WF node instance (`resolved_version`)
+- purge older package versions for that workflow when they are no longer current, no longer backup, and no longer referenced by any node instance
+
+This makes the workflow source/versioning central in `SY.wf-rules`, while keeping executable artifacts in `dist` aligned with the standard runtime model of Fluxbee.
 
 ---
 
@@ -508,8 +575,9 @@ The `delete_workflow` command removes a workflow entirely:
 1. If `force: false`: query `SY.orchestrator` for the node status. If the WF node has active instances (`status = running` with `active_instances > 0`), refuse with `INSTANCES_ACTIVE` error.
 2. If `force: true` or no active instances:
    - Send `NODE_KILL` to `SY.orchestrator` for `WF.<workflow_name>@<hive>`.
+   - Request managed instance cleanup through the standard orchestrator/admin lifecycle path (equivalent to `purge_instance=true` / `remove_node_instance`).
    - Remove the state directories for that workflow: `/var/lib/fluxbee/wf-rules/<workflow_name>/`.
-   - Remove the managed node directory: `/var/lib/fluxbee/nodes/WF/WF.<workflow_name>@<hive>/`.
+   - Remove package versions in `dist` for that workflow that are no longer referenced by any node instance.
    - Respond with `"status": "ok", "deleted": true`.
 
 This is a destructive operation. Active instances are lost if `force: true`. There is no undo.
@@ -559,6 +627,7 @@ All endpoints use the standard admin authentication. The body for POST endpoints
 - **JSON Schema validation:** `github.com/santhosh-tekuri/jsonschema` or equivalent
 - **SDK:** `fluxbee-go-sdk` for router connection
 - **Filesystem:** direct file I/O for state directories (no SQLite — definitions are small JSON files, same pattern as sy.opa-rules)
+- **Package install/publish:** reuse the standard Fluxbee install/publish implementation through code or structured internal command path (no shell scripts)
 
 ### 11.2 Binary and installation
 
@@ -606,6 +675,7 @@ Both `sy-wf-rules` and `wf-generic` import this package.
 | `INSTANCES_ACTIVE` | Delete refused because WF node has active instances (and force=false). |
 | `INSTANCES_UNKNOWN` | Delete refused because WF node did not respond to instance count query within timeout (and force=false). Cannot confirm zero instances. |
 | `RUNTIME_NOT_AVAILABLE` | wf.engine runtime not installed in dist; cannot spawn. |
+| `PACKAGE_PUBLISH_FAILED` | sy.wf-rules could not materialize/install the workflow package in dist. |
 | `ORCHESTRATOR_ERROR` | Communication with SY.orchestrator failed. |
 | `RESTART_FAILED` | Node kill succeeded but subsequent run_node failed twice. Node is dead. Operator intervention required. |
 | `KILL_FAILED` | kill_node failed. Unusual — typically means the orchestrator is itself in error. |
@@ -625,7 +695,9 @@ Both `sy-wf-rules` and `wf-generic` import this package.
 | Restart WF node on apply (no hot-reload) | Consistent with WF v1 decision; atomic and simple; recovery handles instances |
 | kill_node + run_node instead of atomic restart | sy.orchestrator does not expose restart verb; two-step is acceptable; future improvement if orchestrator gains atomic restart |
 | sy.wf-rules never writes filesystem under /var/lib/fluxbee/nodes | Orchestrator owns that directory tree; clean ownership boundary |
-| workflow_definition embedded in config.json of WF node | Single source of truth for wf-generic at boot; no separate file to coordinate |
+| Workflow source owned by sy.wf-rules, executable artifact owned by dist | Clean separation of source, artifact, and lifecycle; aligns WF with standard Fluxbee runtime model |
+| wf-generic reads from `_system.package_path` | Managed config binds each node instance to a fixed package version until explicit rollout |
+| Package version equals sy.wf-rules logical version | Operator-facing status/rollback remains simple; no second version namespace |
 | delete_workflow with force flag | Explicit destructive operation; not hidden in normal flow |
 | No SHM region | WF definitions consumed via filesystem, not real-time memory-mapped |
 | OPA rules managed separately | Separation of concerns; sy.opa-rules owns routing policy |
@@ -638,7 +710,7 @@ Both `sy-wf-rules` and `wf-generic` import this package.
 ## 14. What is NOT in v1
 
 - Hot-reload of workflow definitions (restart only).
-- Version history beyond current + backup.
+- Version history beyond current + backup (plus retained package versions still referenced by live nodes).
 - Diff between versions.
 - Automated OPA rule generation for new workflows.
 - Multi-hive distribution from sy.wf-rules (each hive has its own sy.wf-rules managing its own workflows).

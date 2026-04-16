@@ -165,13 +165,13 @@ func handleNodeConfigSet(ctx context.Context, msg sdk.Message, rt *NodeRuntime) 
 
 func handleWFHelp(ctx context.Context, msg sdk.Message, rt *NodeRuntime) error {
 	payload := map[string]any{
-		"ok":            true,
-		"workflow_type": rt.Def.WorkflowType,
-		"description":   rt.Def.Description,
-		"initial_state": rt.Def.InitialState,
-		"states":        stateNames(rt.Def),
+		"ok":              true,
+		"workflow_type":   rt.Def.WorkflowType,
+		"description":     rt.Def.Description,
+		"initial_state":   rt.Def.InitialState,
+		"states":          stateNames(rt.Def),
 		"terminal_states": rt.Def.TerminalStates,
-		"input_schema":  rt.Def.InputSchema,
+		"input_schema":    rt.Def.InputSchema,
 	}
 	return sendReply(ctx, msg, MsgWFHelpResponse, payload, rt)
 }
