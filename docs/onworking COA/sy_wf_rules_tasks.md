@@ -281,7 +281,7 @@ go/sy-wf-rules/
 
 ### WFRULES-ORCH-3 — Managed config update client
 - [x] Implement `SetNodeConfig(nodeL2Name string, config map[string]any)`
-- [ ] This is the rebind step for an existing WF node
+- [x] This is the rebind step for an existing WF node
 - [ ] Managed config must carry:
   - operational fields
   - `_system.runtime`
@@ -311,23 +311,17 @@ go/sy-wf-rules/
 - [ ] Always bind the concrete package version in `_system`
 
 ### WFRULES-ORCH-7 — Explicit rollout sequence
-- [ ] Implement rollout helper for existing WF node:
+- [x] Implement rollout helper for existing WF node:
   1. publish package
   2. read existing managed config
   3. build rebound config with new concrete version
   4. `set_node_config`
-  5. `kill_node`
-  6. `run_node`
-- [ ] Retry `run_node` once after 1 second if needed
-- [ ] Return:
+  5. `restart_node`
+- [x] Retry `restart_node` once after 1 second if needed
+- [x] Return:
   - `restarted`
   - `restart_failed`
   - structured error detail
-
-Current blocker:
-- `run_node` is fail-closed when `config.json` already exists (`NODE_ALREADY_EXISTS`)
-- current orchestrator API does not expose a safe `start_node` / `restart_node` verb for existing managed nodes
-- therefore `sy.wf-rules` currently detects the existing-node case and leaves the new version published but not deployed
 
 ### WFRULES-ORCH-8 — First deploy / auto_spawn path
 - [x] If WF node does not exist and `auto_spawn=true`:
@@ -399,7 +393,7 @@ Current blocker:
 - [x] Materialize package from new `current`
 - [x] Publish package
 - [x] Determine WF node existence
-- [ ] If existing:
+- [x] If existing:
   - explicit rebind + restart
 - [x] If absent and `auto_spawn=true`:
   - first deploy path
@@ -417,7 +411,7 @@ Current blocker:
 - [x] Rotate rollback state
 - [x] Materialize package for restored `current`
 - [x] Publish package if restored version is missing from `dist`
-- [ ] Explicitly rebind/restart existing WF node or apply first deploy semantics as needed
+- [x] Explicitly rebind/restart existing WF node or apply first deploy semantics as needed
 - [x] Return rollback response
 
 ### WFRULES-OP-5 — delete_workflow
@@ -574,9 +568,9 @@ Current blocker:
 - [x] Package version equals metadata version
 
 ### WFRULES-TEST-4 — apply existing node rollout
-- [ ] Existing node config is rebound to concrete version
-- [ ] `_system.package_path` points to published package
-- [ ] `kill_node` then `run_node`
+- [x] Existing node config is rebound to concrete version
+- [x] `_system.package_path` points to published package
+- [x] `restart_node`
 
 ### WFRULES-TEST-5 — apply first deploy
 - [x] Absent node + `auto_spawn=true` publishes package and spawns node
@@ -584,9 +578,9 @@ Current blocker:
 
 ### WFRULES-TEST-6 — restart failure handling
 - [x] Publish succeeds, restart fails
-- [ ] `current/` remains updated
+- [x] `current/` remains updated
 - [x] response is partial success
-- [ ] deployment is not falsely reported as complete
+- [x] deployment is not falsely reported as complete
 
 ### WFRULES-TEST-7 — rollback
 - [x] No backup => `NO_BACKUP`

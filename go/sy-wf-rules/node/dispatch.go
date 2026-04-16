@@ -44,6 +44,56 @@ func (s *Service) handleCommand(msg fluxbeesdk.Message) {
 			"guard_count": meta.GuardCount,
 			"state_count": meta.StateCount,
 		})
+	case "apply_workflow":
+		var req ApplyRequest
+		if err := json.Unmarshal(msg.Payload, &req); err != nil {
+			s.sendCommandResponse(msg, action, map[string]any{
+				"status":       "error",
+				"error_code":   "INVALID_CONFIG_SET",
+				"error_detail": err.Error(),
+			})
+			return
+		}
+		result, err := s.ApplyWorkflowAndDeploy(req)
+		if err != nil {
+			s.sendCommandResponse(msg, action, commandErrorPayload(err))
+			return
+		}
+		payload := map[string]any{
+			"status":  "ok",
+			"version": result.Current.Version,
+			"current": buildMetadataSnapshot(result.Current),
+			"wf_node": result.WFNode,
+		}
+		if result.Warning != "" {
+			payload["warning"] = result.Warning
+		}
+		s.sendCommandResponse(msg, action, payload)
+	case "rollback_workflow":
+		var req RollbackRequest
+		if err := json.Unmarshal(msg.Payload, &req); err != nil {
+			s.sendCommandResponse(msg, action, map[string]any{
+				"status":       "error",
+				"error_code":   "INVALID_CONFIG_SET",
+				"error_detail": err.Error(),
+			})
+			return
+		}
+		result, err := s.RollbackWorkflowAndDeploy(req)
+		if err != nil {
+			s.sendCommandResponse(msg, action, commandErrorPayload(err))
+			return
+		}
+		payload := map[string]any{
+			"status":  "ok",
+			"version": result.Current.Version,
+			"current": buildMetadataSnapshot(result.Current),
+			"wf_node": result.WFNode,
+		}
+		if result.Warning != "" {
+			payload["warning"] = result.Warning
+		}
+		s.sendCommandResponse(msg, action, payload)
 	}
 }
 
@@ -122,7 +172,7 @@ func (s *Service) handleNodeConfigGet(msg fluxbeesdk.Message) {
 			"target":               fluxbeesdk.NodeConfigControlTarget,
 			"schema_version":       1,
 			"apply_modes":          []string{fluxbeesdk.NodeConfigApplyModeReplace},
-			"supported_operations": []string{"check", "compile"},
+			"supported_operations": []string{"check", "compile", "compile_apply", "apply", "rollback"},
 		},
 	}
 	s.sendNodeConfigResponse(msg, response)
@@ -175,7 +225,134 @@ func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
 	if operation == "check" {
 		operation = "compile"
 	}
-	if operation != "compile" {
+	switch operation {
+	case "compile":
+		compileReq, err := decodeCompileRequestFromMap(configMap)
+		if err != nil {
+			s.sendNodeConfigResponse(msg, map[string]any{
+				"ok":        false,
+				"node_name": s.nodeName(),
+				"state":     "error",
+				"error": map[string]any{
+					"code":   "INVALID_CONFIG_SET",
+					"detail": err.Error(),
+				},
+			})
+			return
+		}
+		meta, err := s.CompileWorkflow(compileReq)
+		if err != nil {
+			s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, err))
+			return
+		}
+		s.sendNodeConfigResponse(msg, map[string]any{
+			"ok":             true,
+			"node_name":      s.nodeName(),
+			"state":          "configured",
+			"schema_version": req.SchemaVersion,
+			"config_version": meta.Version,
+			"effective_config": map[string]any{
+				"staged": buildMetadataSnapshot(*meta),
+			},
+		})
+	case "apply":
+		var applyReq ApplyRequest
+		raw, err := json.Marshal(configMap)
+		if err != nil {
+			s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, WfRulesError{Code: "INVALID_CONFIG_SET", Detail: err.Error()}))
+			return
+		}
+		if err := json.Unmarshal(raw, &applyReq); err != nil {
+			s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, WfRulesError{Code: "INVALID_CONFIG_SET", Detail: err.Error()}))
+			return
+		}
+		result, err := s.ApplyWorkflowAndDeploy(applyReq)
+		if err != nil {
+			s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, err))
+			return
+		}
+		payload := map[string]any{
+			"ok":             true,
+			"node_name":      s.nodeName(),
+			"state":          "configured",
+			"schema_version": req.SchemaVersion,
+			"config_version": result.Current.Version,
+			"effective_config": map[string]any{
+				"current": buildMetadataSnapshot(result.Current),
+			},
+			"wf_node": result.WFNode,
+		}
+		if result.Warning != "" {
+			payload["warning"] = result.Warning
+		}
+		s.sendNodeConfigResponse(msg, payload)
+	case "rollback":
+		var rollbackReq RollbackRequest
+		raw, err := json.Marshal(configMap)
+		if err != nil {
+			s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, WfRulesError{Code: "INVALID_CONFIG_SET", Detail: err.Error()}))
+			return
+		}
+		if err := json.Unmarshal(raw, &rollbackReq); err != nil {
+			s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, WfRulesError{Code: "INVALID_CONFIG_SET", Detail: err.Error()}))
+			return
+		}
+		result, err := s.RollbackWorkflowAndDeploy(rollbackReq)
+		if err != nil {
+			s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, err))
+			return
+		}
+		payload := map[string]any{
+			"ok":             true,
+			"node_name":      s.nodeName(),
+			"state":          "configured",
+			"schema_version": req.SchemaVersion,
+			"config_version": result.Current.Version,
+			"effective_config": map[string]any{
+				"current": buildMetadataSnapshot(result.Current),
+			},
+			"wf_node": result.WFNode,
+		}
+		if result.Warning != "" {
+			payload["warning"] = result.Warning
+		}
+		s.sendNodeConfigResponse(msg, payload)
+	case "compile_apply":
+		compileReq, err := decodeCompileRequestFromMap(configMap)
+		if err != nil {
+			s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, WfRulesError{Code: "INVALID_CONFIG_SET", Detail: err.Error()}))
+			return
+		}
+		meta, err := s.CompileWorkflow(compileReq)
+		if err != nil {
+			s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, err))
+			return
+		}
+		result, err := s.ApplyWorkflowAndDeploy(ApplyRequest{
+			WorkflowName: compileReq.WorkflowName,
+			Version:      meta.Version,
+			AutoSpawn:    compileReq.AutoSpawn,
+		})
+		if err != nil {
+			s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, err))
+			return
+		}
+		payload := map[string]any{
+			"ok":             true,
+			"node_name":      s.nodeName(),
+			"state":          "configured",
+			"schema_version": req.SchemaVersion,
+			"config_version": result.Current.Version,
+			"effective_config": map[string]any{
+				"current": buildMetadataSnapshot(result.Current),
+			},
+			"wf_node": result.WFNode,
+		}
+		if result.Warning != "" {
+			payload["warning"] = result.Warning
+		}
+		s.sendNodeConfigResponse(msg, payload)
+	default:
 		s.sendNodeConfigResponse(msg, map[string]any{
 			"ok":        false,
 			"node_name": s.nodeName(),
@@ -185,36 +362,7 @@ func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
 				"detail": fmt.Sprintf("operation %q not implemented yet", operation),
 			},
 		})
-		return
 	}
-	compileReq, err := decodeCompileRequestFromMap(configMap)
-	if err != nil {
-		s.sendNodeConfigResponse(msg, map[string]any{
-			"ok":        false,
-			"node_name": s.nodeName(),
-			"state":     "error",
-			"error": map[string]any{
-				"code":   "INVALID_CONFIG_SET",
-				"detail": err.Error(),
-			},
-		})
-		return
-	}
-	meta, err := s.CompileWorkflow(compileReq)
-	if err != nil {
-		s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, err))
-		return
-	}
-	s.sendNodeConfigResponse(msg, map[string]any{
-		"ok":             true,
-		"node_name":      s.nodeName(),
-		"state":          "configured",
-		"schema_version": req.SchemaVersion,
-		"config_version": meta.Version,
-		"effective_config": map[string]any{
-			"staged": buildMetadataSnapshot(*meta),
-		},
-	})
 }
 
 func (s *Service) sendNodeConfigResponse(request fluxbeesdk.Message, payload map[string]any) {

@@ -9,6 +9,7 @@ import (
 type ApplyRequest struct {
 	WorkflowName string `json:"workflow_name"`
 	Version      uint64 `json:"version,omitempty"`
+	AutoSpawn    bool   `json:"auto_spawn,omitempty"`
 }
 
 type ApplyResult struct {

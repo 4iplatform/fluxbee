@@ -16,6 +16,7 @@ type CompileRequest struct {
 	WorkflowName string `json:"workflow_name"`
 	Definition   any    `json:"definition"`
 	Version      uint64 `json:"version,omitempty"`
+	AutoSpawn    bool   `json:"auto_spawn,omitempty"`
 }
 
 type GetWorkflowRequest struct {

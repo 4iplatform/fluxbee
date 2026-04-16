@@ -272,7 +272,7 @@ Note: if a request arrives with `operation: "check"`, it is treated as a synonym
   "wf_node": {
     "node_name": "WF.invoice@motherbee",
     "action": "restart_failed",
-    "error": "run_node failed after kill_node: <detail from orchestrator>"
+    "error": "restart_node failed after explicit rebind: <detail from orchestrator>"
   },
   "warning": "Definition applied to current/. WF node failed to restart. Retry apply or rollback."
 }
@@ -465,8 +465,7 @@ When a definition is applied (compile_apply or apply operations):
 7. Send the config + node operations to `SY.orchestrator@<hive>`:
    - **If the WF node already exists:**
      a. `set_node_config` (or equivalent) with the updated operational config and runtime binding to `runtime = "wf.<workflow_name>"`, `resolved_version = <version>`.
-     b. `kill_node` for `WF.<workflow_name>@<hive>`.
-     c. `run_node` for `WF.<workflow_name>@<hive>` with runtime `wf.<workflow_name>` and version `<version>`.
+     b. `restart_node` for `WF.<workflow_name>@<hive>`.
    - **If the WF node does not exist and `auto_spawn: true`:**
      a. `run_node` for `WF.<workflow_name>@<hive>` with runtime `wf.<workflow_name>`, version `<version>`, and the managed operational config.
    - **If the WF node does not exist and `auto_spawn: false`:**
@@ -509,15 +508,14 @@ The workflow definition itself is stored in the package:
 
 The `wf-generic` binary, at boot, reads `_system.package_path` from the managed config and then loads `flow/definition.json` from that package directory. The `_system.package_path` binding is fixed for that node instance until an explicit rollout changes it.
 
-### 7.2 Kill + run semantics (no atomic restart)
+### 7.2 Restart semantics for existing nodes
 
-`SY.orchestrator` in its current state does not expose an atomic `restart_node` verb. The restart is implemented by sy.wf-rules as a two-step sequence: `kill_node` followed by `run_node`. Each step is a separate L2 request with its own response.
+`SY.orchestrator` exposes `restart_node` for existing managed instances. `SY.wf-rules` uses it after the explicit rebind step (`set_node_config`) so the WF node restarts against the newly bound concrete package version.
 
 **Failure handling:**
 
-- If `kill_node` fails (node was already dead, or orchestrator error): log warning, proceed to `run_node` anyway. This tolerates the case where the node died on its own between sy.wf-rules' last observation and the kill attempt.
-- If `kill_node` succeeds but `run_node` fails: sy.wf-rules retries `run_node` once after a 1-second delay. If the retry also fails, sy.wf-rules gives up and returns the apply result with `"wf_node": { "action": "restart_failed", "error": "<detail>" }`. The node remains dead until manual intervention.
-- If both `kill_node` and `run_node` succeed: `"wf_node": { "action": "restarted", "status": "ok" }`.
+- If `restart_node` fails: sy.wf-rules retries `restart_node` once after a 1-second delay. If the retry also fails, sy.wf-rules gives up and returns the apply result with `"wf_node": { "action": "restart_failed", "error": "<detail>" }`.
+- If `restart_node` succeeds: `"wf_node": { "action": "restarted", "status": "ok" }`.
 
 **Crash/autorestart semantics:**
 
@@ -534,9 +532,7 @@ Even if the node restart fails, sy.wf-rules internal state is consistent:
 - A subsequent `apply` retry attempts the restart again with the new definition already in current.
 - If the old WF node process crashes during this window and the host restarts it automatically, it comes back with the previously bound version from managed config until the rollout succeeds.
 
-The operator sees a clear failure in the response and can decide next steps: investigate why the node won't spawn, rollback to the previous definition, or intervene manually.
-
-**Future improvement:** if sy.orchestrator later gains an atomic `restart_node` verb, sy.wf-rules can adopt it and eliminate the two-step race. This is a backward-compatible improvement; the current two-step approach continues to work until replaced.
+The operator sees a clear failure in the response and can decide next steps: investigate why the node won't restart, rollback to the previous definition, or intervene manually.
 
 ### 7.2 Dependency: wf.engine runtime base must be installed
 
@@ -677,7 +673,7 @@ Both `sy-wf-rules` and `wf-generic` import this package.
 | `RUNTIME_NOT_AVAILABLE` | wf.engine runtime not installed in dist; cannot spawn. |
 | `PACKAGE_PUBLISH_FAILED` | sy.wf-rules could not materialize/install the workflow package in dist. |
 | `ORCHESTRATOR_ERROR` | Communication with SY.orchestrator failed. |
-| `RESTART_FAILED` | Node kill succeeded but subsequent run_node failed twice. Node is dead. Operator intervention required. |
+| `RESTART_FAILED` | Node rebind succeeded but `restart_node` failed twice. Deployment is incomplete. |
 | `KILL_FAILED` | kill_node failed. Unusual — typically means the orchestrator is itself in error. |
 | `INVALID_WORKFLOW_NAME` | workflow_name does not match naming regex. |
 | `INVALID_CONFIG_SET` | CONFIG_SET payload malformed. |
@@ -693,7 +689,7 @@ Both `sy-wf-rules` and `wf-generic` import this package.
 | Always-latest, no explicit versioning | Simple model; frozen-by-hash in wf-generic handles instances transparently |
 | CEL compiled in sy.wf-rules but NOT persisted | Avoids cross-binary compatibility; wf-generic recompiles at boot |
 | Restart WF node on apply (no hot-reload) | Consistent with WF v1 decision; atomic and simple; recovery handles instances |
-| kill_node + run_node instead of atomic restart | sy.orchestrator does not expose restart verb; two-step is acceptable; future improvement if orchestrator gains atomic restart |
+| restart_node after explicit rebind | sy.orchestrator exposes restart for existing managed instances, which matches the fixed-binding deployment model more cleanly than re-spawn |
 | sy.wf-rules never writes filesystem under /var/lib/fluxbee/nodes | Orchestrator owns that directory tree; clean ownership boundary |
 | Workflow source owned by sy.wf-rules, executable artifact owned by dist | Clean separation of source, artifact, and lifecycle; aligns WF with standard Fluxbee runtime model |
 | wf-generic reads from `_system.package_path` | Managed config binds each node instance to a fixed package version until explicit rollout |

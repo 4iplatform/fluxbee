@@ -1370,6 +1370,8 @@ async fn handle_admin(
         "get_node_state" => get_node_state_flow(state, &msg.payload).await,
         "get_node_status" => get_node_status_flow(state, &msg.payload).await,
         "set_node_config" => set_node_config_flow(sender, state, &msg.payload).await,
+        "start_node" => start_node_flow(state, &msg.payload).await,
+        "restart_node" => restart_node_flow(state, &msg.payload).await,
         "run_node" => run_node_flow(state, &msg.payload).await,
         "kill_node" => kill_node_flow(state, &msg.payload).await,
         "list_hives" => {
@@ -1709,6 +1711,16 @@ async fn handle_system_message(
             tracing::info!(result = %result, "NODE_STATUS_GET processed");
             let _ =
                 send_system_action_response(sender, msg, "NODE_STATUS_GET_RESPONSE", result).await;
+        }
+        Some("START_NODE") => {
+            let result = start_node_flow(state, &msg.payload).await;
+            tracing::info!(result = %result, "START_NODE processed");
+            let _ = send_system_action_response(sender, msg, "START_NODE_RESPONSE", result).await;
+        }
+        Some("RESTART_NODE") => {
+            let result = restart_node_flow(state, &msg.payload).await;
+            tracing::info!(result = %result, "RESTART_NODE processed");
+            let _ = send_system_action_response(sender, msg, "RESTART_NODE_RESPONSE", result).await;
         }
         Some("GET_VERSIONS") => {
             let result = get_versions_flow(state, &msg.payload).await;
@@ -4729,41 +4741,15 @@ fn persisted_custom_nodes_with_root(
                 Ok(value) => value,
                 Err(_) => continue,
             };
-            let Some(system) = config.get("_system").and_then(|value| value.as_object()) else {
-                continue;
-            };
-            let Some(runtime) = system
-                .get("runtime")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
-                continue;
-            };
-            let Some(runtime_version) = system
-                .get("runtime_version")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
-                continue;
-            };
-            let relaunch_on_boot = system
-                .get("relaunch_on_boot")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
-            if !relaunch_on_boot {
-                continue;
-            }
-
-            nodes.push(PersistedManagedNode {
-                node_name,
-                kind,
-                runtime: runtime.to_string(),
-                runtime_version: runtime_version.to_string(),
+            if let Some(node) = persisted_managed_node_from_config_value(
+                &node_name,
+                &kind,
                 config_path,
-                relaunch_on_boot,
-            });
+                &config,
+                true,
+            )? {
+                nodes.push(node);
+            }
         }
     }
 
@@ -4775,6 +4761,50 @@ fn persisted_custom_nodes(
     _state: &OrchestratorState,
 ) -> Result<Vec<PersistedManagedNode>, OrchestratorError> {
     persisted_custom_nodes_with_root(&node_files_root())
+}
+
+fn persisted_managed_node_from_config_value(
+    node_name: &str,
+    kind: &str,
+    config_path: PathBuf,
+    config: &serde_json::Value,
+    require_relaunch_on_boot: bool,
+) -> Result<Option<PersistedManagedNode>, OrchestratorError> {
+    let Some(system) = config.get("_system").and_then(|value| value.as_object()) else {
+        return Ok(None);
+    };
+    let Some(runtime) = system
+        .get("runtime")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(runtime_version) = system
+        .get("runtime_version")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let relaunch_on_boot = system
+        .get("relaunch_on_boot")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if require_relaunch_on_boot && !relaunch_on_boot {
+        return Ok(None);
+    }
+
+    Ok(Some(PersistedManagedNode {
+        node_name: node_name.to_string(),
+        kind: kind.to_string(),
+        runtime: runtime.to_string(),
+        runtime_version: runtime_version.to_string(),
+        config_path,
+        relaunch_on_boot,
+    }))
 }
 
 async fn list_nodes_flow(
@@ -11480,6 +11510,354 @@ async fn run_node_flow(
     }
 }
 
+#[derive(Debug, Clone)]
+struct ManagedNodeLaunchPlan {
+    node: PersistedManagedNode,
+    unit: String,
+    runtime_key: String,
+    resolved_version: String,
+    entrypoint: RuntimeSpawnEntrypoint,
+}
+
+fn managed_node_launch_plan(
+    state: &OrchestratorState,
+    node_name: &str,
+) -> Result<ManagedNodeLaunchPlan, serde_json::Value> {
+    if !managed_reconcile_candidate_allowed(node_name) {
+        return Err(serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": format!("managed lifecycle does not support node '{}'", node_name),
+            "node_name": node_name,
+        }));
+    }
+    let config_path = match node_effective_config_path(state, node_name) {
+        Ok(path) => path,
+        Err(err) => {
+            return Err(serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+                "node_name": node_name,
+            }));
+        }
+    };
+    if !config_path.exists() {
+        return Err(serde_json::json!({
+            "status": "error",
+            "error_code": "NODE_CONFIG_NOT_FOUND",
+            "message": "effective config file not found",
+            "node_name": node_name,
+            "path": config_path.display().to_string(),
+        }));
+    }
+    let config = match load_node_effective_config(&config_path) {
+        Ok(value) => value,
+        Err(err) => {
+            return Err(serde_json::json!({
+                "status": "error",
+                "error_code": "NODE_CONFIG_READ_FAILED",
+                "message": err.to_string(),
+                "node_name": node_name,
+                "path": config_path.display().to_string(),
+            }));
+        }
+    };
+    let node = match persisted_managed_node_from_config_value(
+        node_name,
+        &node_kind_from_name(node_name),
+        config_path.clone(),
+        &config,
+        false,
+    ) {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return Err(serde_json::json!({
+                "status": "error",
+                "error_code": "NODE_CONFIG_INVALID",
+                "message": "managed config is missing _system.runtime or _system.runtime_version",
+                "node_name": node_name,
+                "path": config_path.display().to_string(),
+            }));
+        }
+        Err(err) => {
+            return Err(serde_json::json!({
+                "status": "error",
+                "error_code": "NODE_CONFIG_INVALID",
+                "message": err.to_string(),
+                "node_name": node_name,
+                "path": config_path.display().to_string(),
+            }));
+        }
+    };
+
+    let manifest = match load_runtime_manifest_result() {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => {
+            return Err(serde_json::json!({
+                "status": "error",
+                "error_code": "RUNTIME_MANIFEST_MISSING",
+                "message": "runtime manifest not found",
+                "node_name": node_name,
+            }));
+        }
+        Err(err) => {
+            return Err(serde_json::json!({
+                "status": "error",
+                "error_code": "MANIFEST_INVALID",
+                "message": err.to_string(),
+                "node_name": node_name,
+            }));
+        }
+    };
+    let runtime_key = match resolve_runtime_key(&manifest, &node.runtime) {
+        Ok(value) => value,
+        Err(err) => {
+            return Err(serde_json::json!({
+                "status": "error",
+                "error_code": "RUNTIME_NOT_AVAILABLE",
+                "message": err.to_string(),
+                "node_name": node_name,
+                "runtime": node.runtime,
+            }));
+        }
+    };
+    let resolved_version =
+        match resolve_runtime_version(&manifest, &runtime_key, &node.runtime_version) {
+            Ok(value) => value,
+            Err(err) => {
+                return Err(serde_json::json!({
+                    "status": "error",
+                    "error_code": "RUNTIME_NOT_AVAILABLE",
+                    "message": err.to_string(),
+                    "node_name": node_name,
+                    "runtime": runtime_key,
+                    "runtime_version": node.runtime_version,
+                }));
+            }
+        };
+    let entrypoint =
+        match resolve_runtime_spawn_entrypoint(&manifest, &runtime_key, &resolved_version) {
+            Ok(value) => value,
+            Err(err) => {
+                return Err(serde_json::json!({
+                    "status": "error",
+                    "error_code": err.error_code(),
+                    "message": err.message(),
+                    "node_name": node_name,
+                    "runtime": runtime_key,
+                    "runtime_version": resolved_version,
+                }));
+            }
+        };
+
+    let preflight_error = if let Some(runtime_base) = entrypoint.runtime_base.as_deref() {
+        runtime_base_start_script_preflight(
+            &runtime_key,
+            &resolved_version,
+            runtime_base,
+            &entrypoint.script_version,
+            &entrypoint.script_path,
+            &state.hive_id,
+            &node.node_name,
+        )
+        .err()
+    } else {
+        runtime_start_script_preflight(
+            &entrypoint.script_runtime,
+            &entrypoint.script_version,
+            &entrypoint.script_path,
+            &state.hive_id,
+            &node.node_name,
+        )
+        .err()
+    };
+    if let Some(payload) = preflight_error {
+        return Err(payload);
+    }
+
+    Ok(ManagedNodeLaunchPlan {
+        unit: unit_from_node_name(&node.node_name),
+        node,
+        runtime_key,
+        resolved_version,
+        entrypoint,
+    })
+}
+
+fn managed_node_start_command(plan: &ManagedNodeLaunchPlan) -> String {
+    format!(
+        "systemctl reset-failed {unit} || true; {run_cmd}",
+        unit = shell_single_quote(&plan.unit),
+        run_cmd = build_managed_node_run_command(
+            &plan.unit,
+            &plan.node.node_name,
+            &plan.entrypoint.script_path
+        ),
+    )
+}
+
+fn managed_node_restart_command(plan: &ManagedNodeLaunchPlan, unit_active: bool) -> String {
+    let run_cmd = build_managed_node_run_command(
+        &plan.unit,
+        &plan.node.node_name,
+        &plan.entrypoint.script_path,
+    );
+    if unit_active {
+        format!(
+            "systemctl restart {unit} || (systemctl reset-failed {unit} || true; sleep 1; {run_cmd})",
+            unit = shell_single_quote(&plan.unit),
+            run_cmd = run_cmd,
+        )
+    } else {
+        managed_node_start_command(plan)
+    }
+}
+
+async fn start_or_restart_node_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+    restart: bool,
+) -> serde_json::Value {
+    let mut target_hive = target_hive_from_payload(payload, &state.hive_id);
+    let raw_node_name = payload
+        .get("node_name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if raw_node_name.is_empty() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": "missing node_name",
+        });
+    }
+    if let Some((_, hive)) = raw_node_name.rsplit_once('@') {
+        if !hive.trim().is_empty() {
+            target_hive = hive.trim().to_string();
+        }
+    }
+    let node_name = match validate_existing_node_name_literal(raw_node_name) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+            });
+        }
+    };
+
+    let request_msg = if restart {
+        "RESTART_NODE"
+    } else {
+        "START_NODE"
+    };
+    let response_msg = if restart {
+        "RESTART_NODE_RESPONSE"
+    } else {
+        "START_NODE_RESPONSE"
+    };
+
+    if target_hive != state.hive_id {
+        let mut forwarded_payload = payload.clone();
+        if let Some(obj) = forwarded_payload.as_object_mut() {
+            obj.insert("target".to_string(), serde_json::json!(target_hive));
+            obj.insert("node_name".to_string(), serde_json::json!(node_name));
+        }
+        return match forward_system_action_to_hive(
+            state,
+            &target_hive,
+            request_msg,
+            response_msg,
+            forwarded_payload,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => serde_json::json!({
+                "status": "error",
+                "error_code": if restart { "RESTART_FAILED" } else { "START_FAILED" },
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+            }),
+        };
+    }
+
+    let plan = match managed_node_launch_plan(state, &node_name) {
+        Ok(value) => value,
+        Err(payload) => return payload,
+    };
+    let unit_active = systemd_unit_is_active(&plan.unit).unwrap_or(false);
+    let visible_in_router = local_inventory_has_node(state, &plan.node.node_name);
+
+    if !restart && (unit_active || visible_in_router) {
+        return serde_json::json!({
+            "status": "ok",
+            "state": "already_running",
+            "target": target_hive,
+            "hive": target_hive,
+            "node_name": plan.node.node_name,
+            "runtime": plan.runtime_key,
+            "version": plan.resolved_version,
+            "requested_version": plan.node.runtime_version,
+            "unit": plan.unit,
+            "visible_in_router": visible_in_router,
+        });
+    }
+
+    let cmd = if restart {
+        managed_node_restart_command(&plan, unit_active)
+    } else {
+        managed_node_start_command(&plan)
+    };
+    let label = if restart {
+        "restart_node"
+    } else {
+        "start_node"
+    };
+    match execute_on_hive(state, &target_hive, &cmd, label) {
+        Ok(()) => serde_json::json!({
+            "status": "ok",
+            "state": if restart { "restarted" } else { "started" },
+            "target": target_hive,
+            "hive": target_hive,
+            "node_name": plan.node.node_name,
+            "runtime": plan.runtime_key,
+            "version": plan.resolved_version,
+            "requested_version": plan.node.runtime_version,
+            "unit": plan.unit,
+            "visible_in_router": visible_in_router,
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "error_code": if restart { "RESTART_FAILED" } else { "START_FAILED" },
+            "message": err.to_string(),
+            "target": target_hive,
+            "node_name": plan.node.node_name,
+            "runtime": plan.runtime_key,
+            "version": plan.resolved_version,
+            "requested_version": plan.node.runtime_version,
+            "unit": plan.unit,
+        }),
+    }
+}
+
+async fn start_node_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    start_or_restart_node_flow(state, payload, false).await
+}
+
+async fn restart_node_flow(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    start_or_restart_node_flow(state, payload, true).await
+}
+
 async fn kill_node_flow(
     state: &OrchestratorState,
     payload: &serde_json::Value,
@@ -15650,6 +16028,64 @@ blob:
             serde_json::json!("ai.child.config")
         );
         assert_eq!(dependents[1]["runtime"], serde_json::json!("wf.child.flow"));
+    }
+
+    #[test]
+    fn persisted_managed_node_from_config_value_allows_manual_start_without_relaunch_flag() {
+        let config_path = PathBuf::from("/tmp/fluxbee-test/WF.invoice@motherbee/config.json");
+        let config = serde_json::json!({
+            "_system": {
+                "runtime": "wf.invoice",
+                "runtime_version": "4",
+                "relaunch_on_boot": false
+            }
+        });
+
+        let node = persisted_managed_node_from_config_value(
+            "WF.invoice@motherbee",
+            "WF",
+            config_path.clone(),
+            &config,
+            false,
+        )
+        .expect("helper should parse config")
+        .expect("node should be present");
+
+        assert_eq!(node.node_name, "WF.invoice@motherbee");
+        assert_eq!(node.kind, "WF");
+        assert_eq!(node.runtime, "wf.invoice");
+        assert_eq!(node.runtime_version, "4");
+        assert_eq!(node.config_path, config_path);
+        assert!(!node.relaunch_on_boot);
+    }
+
+    #[test]
+    fn managed_node_restart_command_uses_systemd_restart_with_systemd_run_fallback() {
+        let plan = ManagedNodeLaunchPlan {
+            node: PersistedManagedNode {
+                node_name: "WF.invoice@motherbee".to_string(),
+                kind: "WF".to_string(),
+                runtime: "wf.invoice".to_string(),
+                runtime_version: "4".to_string(),
+                config_path: PathBuf::from("/tmp/config.json"),
+                relaunch_on_boot: true,
+            },
+            unit: unit_from_node_name("WF.invoice@motherbee"),
+            runtime_key: "wf.invoice".to_string(),
+            resolved_version: "4".to_string(),
+            entrypoint: RuntimeSpawnEntrypoint {
+                script_runtime: "wf.engine".to_string(),
+                script_version: "1.0.0".to_string(),
+                script_path: "/var/lib/fluxbee/dist/runtimes/wf.engine/1.0.0/bin/start.sh"
+                    .to_string(),
+                runtime_base: Some("wf.engine".to_string()),
+            },
+        };
+
+        let command = managed_node_restart_command(&plan, true);
+        assert!(command.contains("systemctl restart"));
+        assert!(command.contains("systemd-run --unit"));
+        assert!(command.contains("FLUXBEE_NODE_NAME='WF.invoice@motherbee'"));
     }
 
     fn sample_orchestrator_state_for_tests() -> OrchestratorState {

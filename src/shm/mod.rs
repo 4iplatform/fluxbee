@@ -1542,8 +1542,15 @@ impl IdentityRegionWriter {
                 .ok_or(ShmError::InvalidHeader)?;
         let hash = compute_ich_hash(channel_type, address, tenant_id);
         let _write_guard = SeqlockWriteGuard::new(&header.seq);
-        let result =
-            upsert_ich_mapping_entry(mappings, hash, channel_type, address, ich_id, ilk_id, tenant_id);
+        let result = upsert_ich_mapping_entry(
+            mappings,
+            hash,
+            channel_type,
+            address,
+            ich_id,
+            ilk_id,
+            tenant_id,
+        );
         if let Ok(inserted) = result {
             if inserted {
                 header.ich_mapping_count = header.ich_mapping_count.saturating_add(1);
@@ -3918,7 +3925,13 @@ mod tests {
 
         for (idx, address) in colliders.iter().take(table_len).enumerate() {
             writer
-                .upsert_ich_mapping(channel, address, [idx as u8; 16], [200u8 + idx as u8; 16], tenant)
+                .upsert_ich_mapping(
+                    channel,
+                    address,
+                    [idx as u8; 16],
+                    [200u8 + idx as u8; 16],
+                    tenant,
+                )
                 .expect("fill table");
         }
         assert_eq!(
@@ -3930,13 +3943,26 @@ mod tests {
             table_len
         );
 
-        let overflow =
-            writer.upsert_ich_mapping(channel, &colliders[table_len], [250u8; 16], [251u8; 16], tenant);
+        let overflow = writer.upsert_ich_mapping(
+            channel,
+            &colliders[table_len],
+            [250u8; 16],
+            [251u8; 16],
+            tenant,
+        );
         assert!(matches!(overflow, Err(ShmError::SlotFull)));
 
-        assert!(writer.remove_ich_mapping(channel, first, tenant).expect("remove A"));
+        assert!(writer
+            .remove_ich_mapping(channel, first, tenant)
+            .expect("remove A"));
         writer
-            .upsert_ich_mapping(channel, &colliders[table_len], [12u8; 16], [13u8; 16], tenant)
+            .upsert_ich_mapping(
+                channel,
+                &colliders[table_len],
+                [12u8; 16],
+                [13u8; 16],
+                tenant,
+            )
             .expect("insert B");
         assert_eq!(
             writer
@@ -4061,7 +4087,10 @@ mod tests {
         assert_eq!(snap.header.ich_count, 0);
         assert_eq!(snap.header.ilk_alias_count, 0);
         assert_eq!(snap.header.ich_mapping_count, 0);
-        assert_eq!(writer.resolve_ich_mapping("io.test.demo", "addr-1", tenant_id), None);
+        assert_eq!(
+            writer.resolve_ich_mapping("io.test.demo", "addr-1", tenant_id),
+            None
+        );
 
         cleanup_shm(&name);
     }
@@ -4170,7 +4199,10 @@ mod tests {
         assert_eq!(snap.header.ich_count, 1);
         assert_eq!(snap.header.ilk_alias_count, 1);
         assert_eq!(snap.header.ich_mapping_count, 0);
-        assert_eq!(writer.resolve_ich_mapping("whatsapp", "+549111111", [0u8; 16]), None);
+        assert_eq!(
+            writer.resolve_ich_mapping("whatsapp", "+549111111", [0u8; 16]),
+            None
+        );
 
         cleanup_shm(&name);
     }

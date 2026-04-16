@@ -128,16 +128,18 @@ impl AdminRouterClient {
                 Ok(msg) => self.dispatch(msg).await,
                 Err(err) => {
                     tracing::warn!("router recv error: {err}");
-                    let (new_sender, new_receiver) =
-                        match Self::connect_once_with_retry(&self.node_config, self.reconnect_delay)
-                            .await
-                        {
-                            Ok(result) => result,
-                            Err(reconnect_err) => {
-                                tracing::warn!("router reconnect failed: {reconnect_err}");
-                                continue;
-                            }
-                        };
+                    let (new_sender, new_receiver) = match Self::connect_once_with_retry(
+                        &self.node_config,
+                        self.reconnect_delay,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(reconnect_err) => {
+                            tracing::warn!("router reconnect failed: {reconnect_err}");
+                            continue;
+                        }
+                    };
                     let node_name = new_sender.full_name().to_string();
                     *self.sender.write().await = new_sender;
                     receiver = new_receiver;

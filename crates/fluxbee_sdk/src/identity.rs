@@ -699,7 +699,11 @@ pub fn resolve_ilk_from_shm_name(
         Err(err) if is_permission_lookup_unavailable(&err) => return Ok(None),
         Err(err) => return Err(err),
     };
-    let ilk = match reader.resolve_ich_mapping(&normalized_channel, &normalized_address, &normalized_tenant) {
+    let ilk = match reader.resolve_ich_mapping(
+        &normalized_channel,
+        &normalized_address,
+        &normalized_tenant,
+    ) {
         Ok(ilk) => ilk,
         Err(err) if is_permission_lookup_unavailable(&err) => return Ok(None),
         Err(err) => return Err(err),
@@ -1463,7 +1467,9 @@ fn compute_ich_hash(channel_type: &str, address: &str, tenant_id: [u8; 16]) -> u
 fn tenant_id_to_bytes(tenant_id: &str) -> [u8; 16] {
     let s = tenant_id.trim();
     let s = s.strip_prefix("tnt:").unwrap_or(s);
-    Uuid::parse_str(s).map(|u| *u.as_bytes()).unwrap_or([0u8; 16])
+    Uuid::parse_str(s)
+        .map(|u| *u.as_bytes())
+        .unwrap_or([0u8; 16])
 }
 
 fn layout_identity(limits: IdentityRegionLimits) -> IdentityRegionLayout {

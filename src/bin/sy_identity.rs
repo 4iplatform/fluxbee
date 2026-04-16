@@ -663,7 +663,11 @@ impl IdentityStore {
             return Err("ILK_NOT_FOUND".to_string());
         }
 
-        let key = canonical_ich_key(&req.channel.channel_type, &req.channel.address, &target.tenant_id);
+        let key = canonical_ich_key(
+            &req.channel.channel_type,
+            &req.channel.address,
+            &target.tenant_id,
+        );
         self.ich_lookup.insert(key, canonical_ilk_id.clone());
 
         let already = target
@@ -944,7 +948,8 @@ impl IdentityStore {
                 continue;
             }
             for channel in &ilk.channels {
-                let key = canonical_ich_key(&channel.channel_type, &channel.address, &ilk.tenant_id);
+                let key =
+                    canonical_ich_key(&channel.channel_type, &channel.address, &ilk.tenant_id);
                 store.ich_lookup.insert(key, ilk_id.clone());
             }
         }
@@ -966,7 +971,11 @@ impl IdentityStore {
                     .retain(|_, mapped_ilk| mapped_ilk != &ilk_id);
                 if ilk.deleted_at_ms.is_none() {
                     for channel in &ilk.channels {
-                        let key = canonical_ich_key(&channel.channel_type, &channel.address, &ilk.tenant_id);
+                        let key = canonical_ich_key(
+                            &channel.channel_type,
+                            &channel.address,
+                            &ilk.tenant_id,
+                        );
                         self.ich_lookup.insert(key, ilk_id.clone());
                     }
                 }
@@ -2185,7 +2194,11 @@ fn sync_identity_shm_mappings(
             ich_entries.push(ich_entry);
             ich_count = ich_count.saturating_add(1);
             channel_to_ich.insert(
-                (channel_type, address, ilk.tenant_id.trim().to_ascii_lowercase()),
+                (
+                    channel_type,
+                    address,
+                    ilk.tenant_id.trim().to_ascii_lowercase(),
+                ),
                 *ich_uuid.as_bytes(),
             );
         }
@@ -2266,9 +2279,10 @@ fn sync_identity_shm_mappings(
     let mut lookup_keys: Vec<(String, String, String)> = store.ich_lookup.keys().cloned().collect();
     lookup_keys.sort_unstable();
     for (channel_type, address, tenant_id_key) in lookup_keys {
-        let Some(ilk_id) = store
-            .ich_lookup
-            .get(&(channel_type.clone(), address.clone(), tenant_id_key.clone()))
+        let Some(ilk_id) =
+            store
+                .ich_lookup
+                .get(&(channel_type.clone(), address.clone(), tenant_id_key.clone()))
         else {
             continue;
         };
@@ -3061,7 +3075,11 @@ fn map_unique_constraint_code(constraint: &str) -> &'static str {
     }
 }
 
-fn canonical_ich_key(channel_type: &str, address: &str, tenant_id: &str) -> (String, String, String) {
+fn canonical_ich_key(
+    channel_type: &str,
+    address: &str,
+    tenant_id: &str,
+) -> (String, String, String) {
     (
         channel_type.trim().to_ascii_lowercase(),
         address.trim().to_ascii_lowercase(),
@@ -3630,7 +3648,8 @@ ORDER BY added_at ASC
                 ilk.channels.push(channel.clone());
             }
             if ilk.deleted_at_ms.is_none() {
-                let key = canonical_ich_key(&channel.channel_type, &channel.address, &ilk.tenant_id);
+                let key =
+                    canonical_ich_key(&channel.channel_type, &channel.address, &ilk.tenant_id);
                 store.ich_lookup.insert(key, ilk_id.clone());
             }
         }

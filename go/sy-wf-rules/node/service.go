@@ -23,11 +23,12 @@ type receiver interface {
 }
 
 type Service struct {
-	cfg      NodeConfig
-	store    *Store
-	sender   sender
-	receiver receiver
-	clock    ClockFunc
+	cfg          NodeConfig
+	store        *Store
+	sender       sender
+	receiver     receiver
+	orchestrator orchestratorClient
+	clock        ClockFunc
 }
 
 func NewService(cfg NodeConfig, snd sender, rcv receiver, clock ClockFunc) *Service {
@@ -35,11 +36,12 @@ func NewService(cfg NodeConfig, snd sender, rcv receiver, clock ClockFunc) *Serv
 		clock = func() time.Time { return time.Now().UTC() }
 	}
 	return &Service{
-		cfg:      cfg,
-		store:    NewStore(cfg.StateDir),
-		sender:   snd,
-		receiver: rcv,
-		clock:    clock,
+		cfg:          cfg,
+		store:        NewStore(cfg.StateDir),
+		sender:       snd,
+		receiver:     rcv,
+		orchestrator: newOrchestratorClient(snd, rcv),
+		clock:        clock,
 	}
 }
 
