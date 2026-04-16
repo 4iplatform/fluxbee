@@ -1,7 +1,7 @@
 # Fluxbee IO.api Multitenant - Task Checklist
 
 **Fecha:** 2026-04-14
-**Estado:** en progreso
+**Estado:** validado funcionalmente en Linux para el alcance IO.api / io-common
 **Objetivo:** ejecutar y seguir, de forma incremental, los cambios necesarios para llevar `IO.api` a un modelo multitenant tenant-scoped con handoff correcto a `SY.frontdesk.gov`.
 
 ---
@@ -255,7 +255,7 @@ Nota:
 
 ## 9. Validacion funcional pendiente
 
-- [ ] Caso feliz `by_ilk` con ILK existente.
+- [x] Caso feliz `by_ilk` con ILK existente.
 - [ ] Caso rechazo `by_ilk` con ILK inexistente.
 - [x] Caso feliz `by_data` con sujeto existente en tenant correcto.
 - [x] Caso feliz `by_data` con sujeto nuevo y provision temporal.
@@ -264,16 +264,38 @@ Nota:
 - [ ] Caso de salida `frontdesk_result` consumida por un nodo conversacional via `human_message`.
 - [ ] Caso de salida `frontdesk_result` consumida por un nodo no conversacional via campos estructurados.
 - [x] Verificacion de docs actualizadas contra comportamiento real.
+- [x] Caso tenant-aware con mismo `external_user_id` en tenants distintos -> ILKs distintos.
+- [x] Caso tenant-aware con sujeto nuevo en tenant B -> `lookup miss` + provision.
+- [x] Caso tenant-aware con repeticion del mismo sujeto en tenant B -> `lookup hit` + mismo ILK.
 
 Estado actual:
 
 - validado en Linux:
+  - `by_ilk` con ILK existente:
+    - HTTP `202 Accepted`
+    - respuesta con el mismo `ilk` pedido
   - `lookup hit` con reutilizacion del mismo `ilk`
   - `lookup miss -> ILK_PROVISION -> frontdesk -> 202 Accepted`
   - flush posterior del relay y entrega al router hacia `AI.chat@motherbee`
   - rechazo temprano `422 subject_data_incomplete` para payload incompleto
+  - mismo `external_user_id` en tenants distintos produce ILKs distintos:
+    - tenant A -> `ilk:ee207fb9-e3cb-4703-b648-711a8b656692`
+    - tenant B -> `ilk:24c38a6c-2265-4298-8c44-6748af85c5cf`
+  - sujeto nuevo en tenant B:
+    - primer request -> `lookup miss` + `identity provisioned` con `ilk:d66c6b25-b0a8-4ff5-9f5b-2cfb1baa7f2f`
+    - segundo request -> `lookup hit` con el mismo `ilk`
+    - `registration_status=complete`
 - el caso `frontdesk_result.status = needs_input` no es hoy un E2E alcanzable desde `IO.api` porque el adapter exige `subject.display_name` y `subject.email` antes de construir el handoff
 - las incidencias de `identity_timeout` observadas durante la validacion quedaron correlacionadas con estado operativo de `sy-identity`, no con la logica funcional de `IO.api`
+- las incidencias de `invalid_frontdesk_response` con payload `NODE_NOT_FOUND` quedaron correlacionadas con `SY.frontdesk.gov` activo en systemd pero no registrado en el router; el reinicio del servicio recompuso el registro y la validacion siguio normalmente
+- `tenant_not_found` fail-closed ya quedo validado:
+  - HTTP `403 Forbidden`
+  - `error_code = "tenant_not_found"`
+- `by_ilk` con ILK inexistente sigue abierto:
+  - resultado observado: HTTP `503`
+  - `error_code = "identity_unavailable"`
+  - detalle: `invalid channel input: channel_type/address must be non-empty`
+  - lectura correcta: hoy no esta devolviendo el rechazo canonico `ilk_does_not_exist`
 
 ---
 
@@ -286,20 +308,21 @@ Estado actual:
 - [ ] `error`
 - [ ] Ajustar warnings menores restantes (`unused variable` / `dead_code`) si se decide limpiar.
 - [ ] Actualizar spec formal de `SY.frontdesk.gov`.
-- [ ] Revaluar el gap de core si `ILK_PROVISION` agrega `tenant_id`.
+- [x] Revaluar el gap de core si `ILK_PROVISION` agrega `tenant_id`.
 
 Lectura actual del bloque:
 
 - `frontdesk_result.ok` ya quedo validado por E2E desde `IO.api`
 - `frontdesk_result.needs_input` no debe seguirse como prueba E2E de `IO.api` mientras el contrato actual del adapter bloquee antes los mismos faltantes
 - `frontdesk_result.error` sigue pendiente solo si se decide cubrir una falla real de registro / identity desde el lado GOV
+- el gap tenant-aware del lado IO quedo validado funcionalmente en Linux
 
 ---
 
 ## 11. Orden recomendado de ejecucion
 
 - [x] Bloque 1: helpers SHM en `fluxbee_sdk`
-- [ ] Bloque 2: pipeline tenant-aware en `io-common`
+- [x] Bloque 2: pipeline tenant-aware en `io-common`
 - [x] Bloque 3: auth + contrato en `IO.api`
 - [x] Bloque 4: handoff y registro base en `SY.frontdesk.gov`
 - [ ] Bloque 5: documentacion formal de `SY.frontdesk.gov`

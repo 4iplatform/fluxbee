@@ -17,6 +17,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use fluxbee_sdk::identity::{
     ilk_exists_in_hive_id, resolve_identity_option_from_hive_id, tenant_exists_in_hive_id,
+    IdentityShmError,
 };
 use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{connect, try_handle_default_node_status, NodeConfig, NodeUuidMode};
@@ -1754,6 +1755,11 @@ fn validate_explicit_subject_ilk(
             "ilk_does_not_exist",
             format!("Requested subject ILK '{ilk_id}' does not exist"),
         )),
+        Err(IdentityShmError::InvalidChannelInput) => Err((
+            StatusCode::NOT_FOUND,
+            "ilk_does_not_exist",
+            format!("Requested subject ILK '{ilk_id}' does not exist"),
+        )),
         Err(err) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "identity_unavailable",
@@ -2689,5 +2695,13 @@ mod tests {
             .expect_err("must reject tenant_id");
         assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(err.1, "invalid_payload");
+    }
+
+    #[test]
+    fn validate_explicit_subject_ilk_maps_invalid_ilk_to_not_found() {
+        let err = validate_explicit_subject_ilk("motherbee", "ilk:no-existe")
+            .expect_err("invalid ilk must fail");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.1, "ilk_does_not_exist");
     }
 }

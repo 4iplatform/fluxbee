@@ -1640,3 +1640,74 @@ Por lo tanto, la validacion funcional de `IO.api` debe considerarse cerrada con:
 2. `lookup miss -> ILK_PROVISION -> frontdesk -> continue -> 202`;
 3. rechazo temprano `subject_data_incomplete` para payload incompleto;
 4. flush posterior del relay y entrega al router hacia el `dst_final`.
+
+### 25.14. Validacion tenant-aware real por API key
+
+Con el contrato tenant-scoped actual, la validacion importante no es solo que `IO.api` llegue a frontdesk, sino que no colisione identidad entre tenants cuando se repite el mismo `(channel, external_user_id)`.
+
+Resultado validado en Linux:
+
+- tenant A:
+  - API key asociada a `tnt:43d576a3-d712-4d91-9245-5d5463dd693e`
+  - `external_user_id = support:tenant-split-001`
+  - `ilk = ilk:ee207fb9-e3cb-4703-b648-711a8b656692`
+- tenant B:
+  - API key asociada a `tnt:3436cce7-c1ba-407a-add1-e6322add4e39`
+  - mismo `external_user_id = support:tenant-split-001`
+  - `ilk = ilk:24c38a6c-2265-4298-8c44-6748af85c5cf`
+
+Lectura correcta:
+
+- el mismo `external_user_id` ya no colisiona entre tenants;
+- `IO.api` y `io-common` resuelven/provisionan por `(tenant_id, channel, external_user_id)`;
+- el aislamiento multitenant real del lado IO quedo validado.
+
+Validacion adicional ejecutada:
+
+- tenant B, sujeto nuevo `support:tenant-b-new-002`:
+  - primer request:
+    - `lookup miss`
+    - `identity provisioned`
+    - `ilk = ilk:d66c6b25-b0a8-4ff5-9f5b-2cfb1baa7f2f`
+  - segundo request:
+    - `lookup hit`
+    - mismo `ilk = ilk:d66c6b25-b0a8-4ff5-9f5b-2cfb1baa7f2f`
+    - `registration_status = complete`
+
+Eso cierra:
+
+1. lookup tenant-aware;
+2. provision tenant-aware;
+3. no colision cross-tenant;
+4. reutilizacion correcta del mismo ILK dentro del tenant.
+
+### 25.15. Incidencia operativa observada en `SY.frontdesk.gov`
+
+Durante la validacion tenant-aware aparecio este patron:
+
+- `sy-frontdesk-gov.service` figuraba `active` en systemd;
+- pero `rt-gateway` devolvia `UNREACHABLE` con:
+  - `reason = "NODE_NOT_FOUND"`
+  - `original_dst = "SY.frontdesk.gov@motherbee"`
+- `IO.api` lo exponia como:
+  - `502 Bad Gateway`
+  - `error_code = "invalid_frontdesk_response"`
+
+Lectura correcta:
+
+- no era un bug funcional nuevo de `IO.api`;
+- `SY.frontdesk.gov` estaba vivo para systemd pero no registrado efectivamente en el router.
+
+Remedio operativo validado:
+
+```bash
+sudo systemctl restart sy-frontdesk-gov.service
+sudo journalctl -u rt-gateway --since "5 min ago" --no-pager | rg -n "SY.frontdesk.gov@motherbee|hello received|node registered"
+```
+
+Se considera recuperado cuando `rt-gateway` vuelve a mostrar:
+
+- `hello received`
+- `node registered ... name=SY.frontdesk.gov@motherbee`
+
+Despues de ese reinicio, las pruebas tenant-aware volvieron a responder `202 Accepted`.
