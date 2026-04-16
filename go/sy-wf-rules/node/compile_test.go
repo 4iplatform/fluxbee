@@ -78,10 +78,53 @@ func newTestService(t *testing.T) *Service {
 		NodeName:           "SY.wf-rules@motherbee",
 		OrchestratorTarget: "SY.orchestrator@motherbee",
 		StateDir:           t.TempDir(),
+		DistRuntimeRoot:    filepath.Join(t.TempDir(), "dist", "runtimes"),
 	}
 	return NewService(cfg, nil, nil, func() time.Time {
 		return time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
 	})
+}
+
+func TestApplyWorkflowRotatesAndPublishesPackage(t *testing.T) {
+	svc := newTestService(t)
+	if _, err := svc.CompileWorkflow(CompileRequest{
+		WorkflowName: "invoice",
+		Definition:   validWorkflowDefinition(),
+	}); err != nil {
+		t.Fatalf("CompileWorkflow: %v", err)
+	}
+	result, err := svc.ApplyWorkflow(ApplyRequest{WorkflowName: "invoice"})
+	if err != nil {
+		t.Fatalf("ApplyWorkflow: %v", err)
+	}
+	if result.Current.Version != 1 {
+		t.Fatalf("unexpected current version %d", result.Current.Version)
+	}
+	if _, err := os.Stat(filepath.Join(svc.store.Root(), "invoice", "current", "metadata.json")); err != nil {
+		t.Fatalf("missing current metadata: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "1", "package.json")); err != nil {
+		t.Fatalf("missing package.json: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "1", "flow", "definition.json")); err != nil {
+		t.Fatalf("missing flow/definition.json: %v", err)
+	}
+	manifestPath := filepath.Join(svc.cfg.DistRuntimeRoot, "manifest.json")
+	manifestBytes, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	if !strings.Contains(string(manifestBytes), `"wf.invoice"`) {
+		t.Fatalf("manifest missing runtime entry: %s", string(manifestBytes))
+	}
+}
+
+func TestApplyWorkflowRequiresStaged(t *testing.T) {
+	svc := newTestService(t)
+	_, err := svc.ApplyWorkflow(ApplyRequest{WorkflowName: "invoice"})
+	if err == nil || !strings.Contains(err.Error(), "NOTHING_STAGED") {
+		t.Fatalf("expected NOTHING_STAGED, got %v", err)
+	}
 }
 
 func validWorkflowDefinition() map[string]any {

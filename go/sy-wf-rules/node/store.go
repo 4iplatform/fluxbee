@@ -66,6 +66,30 @@ func (s *Store) WriteStaged(workflowName string, definitionBytes []byte, meta Wf
 	return s.WriteSlot(workflowName, "staged", definitionBytes, meta)
 }
 
+func (s *Store) ReadCurrentMetadata(workflowName string) (*WfRulesMetadata, error) {
+	return s.ReadMetadata(workflowName, "current")
+}
+
+func (s *Store) ReadStagedMetadata(workflowName string) (*WfRulesMetadata, error) {
+	return s.ReadMetadata(workflowName, "staged")
+}
+
+func (s *Store) ReadBackupMetadata(workflowName string) (*WfRulesMetadata, error) {
+	return s.ReadMetadata(workflowName, "backup")
+}
+
+func (s *Store) ReadCurrentDefinition(workflowName string) ([]byte, error) {
+	return s.ReadDefinitionBytes(workflowName, "current")
+}
+
+func (s *Store) ReadStagedDefinition(workflowName string) ([]byte, error) {
+	return s.ReadDefinitionBytes(workflowName, "staged")
+}
+
+func (s *Store) ReadBackupDefinition(workflowName string) ([]byte, error) {
+	return s.ReadDefinitionBytes(workflowName, "backup")
+}
+
 func (s *Store) ReadMetadata(workflowName, slot string) (*WfRulesMetadata, error) {
 	data, err := os.ReadFile(s.metadataPath(workflowName, slot))
 	if err != nil {
@@ -123,6 +147,52 @@ func (s *Store) ListWorkflows() ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+func (s *Store) RotateToApply(workflowName string) error {
+	workflowDir := s.workflowDir(workflowName)
+	if err := os.MkdirAll(workflowDir, 0o755); err != nil {
+		return err
+	}
+	backupDir := s.slotDir(workflowName, "backup")
+	currentDir := s.slotDir(workflowName, "current")
+	stagedDir := s.slotDir(workflowName, "staged")
+
+	if _, err := os.Stat(stagedDir); err != nil {
+		return err
+	}
+	_ = os.RemoveAll(backupDir)
+	if _, err := os.Stat(currentDir); err == nil {
+		if err := os.Rename(currentDir, backupDir); err != nil {
+			return err
+		}
+	}
+	return os.Rename(stagedDir, currentDir)
+}
+
+func (s *Store) RotateToRollback(workflowName string) error {
+	workflowDir := s.workflowDir(workflowName)
+	if err := os.MkdirAll(workflowDir, 0o755); err != nil {
+		return err
+	}
+	backupDir := s.slotDir(workflowName, "backup")
+	currentDir := s.slotDir(workflowName, "current")
+	stagedDir := s.slotDir(workflowName, "staged")
+
+	if _, err := os.Stat(backupDir); err != nil {
+		return err
+	}
+	_ = os.RemoveAll(stagedDir)
+	if _, err := os.Stat(currentDir); err == nil {
+		if err := os.Rename(currentDir, stagedDir); err != nil {
+			return err
+		}
+	}
+	return os.Rename(backupDir, currentDir)
+}
+
+func (s *Store) DeleteWorkflowState(workflowName string) error {
+	return os.RemoveAll(s.workflowDir(workflowName))
 }
 
 func HashDefinition(definitionBytes []byte) string {

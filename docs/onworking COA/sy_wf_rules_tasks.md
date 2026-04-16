@@ -180,38 +180,38 @@ go/sy-wf-rules/
 - [x] Start at `1` when empty
 
 ### WFRULES-STORE-5 — Read helpers
-- [ ] `ReadCurrentDefinition`
-- [ ] `ReadCurrentMetadata`
-- [ ] `ReadStagedDefinition`
+- [x] `ReadCurrentDefinition`
+- [x] `ReadCurrentMetadata`
+- [x] `ReadStagedDefinition`
 - [x] `ReadStagedMetadata`
-- [ ] `ReadBackupDefinition`
-- [ ] `ReadBackupMetadata`
+- [x] `ReadBackupDefinition`
+- [x] `ReadBackupMetadata`
 - [x] `WorkflowExists`
 - [x] `ListWorkflows`
 
 ### WFRULES-STORE-6 — Apply rotation
-- [ ] Implement `RotateToApply(workflowName)`
-- [ ] Behavior:
+- [x] Implement `RotateToApply(workflowName)`
+- [x] Behavior:
   - delete old `backup/` if present
   - rename `current/` to `backup/` if present
   - rename `staged/` to `current/`
 
 ### WFRULES-STORE-7 — Rollback rotation
-- [ ] Implement rollback rotation:
+- [x] Implement rollback rotation:
   - delete `staged/` if present
   - rename `current/` to `staged/`
   - rename `backup/` to `current/`
 
 ### WFRULES-STORE-8 — Delete state
-- [ ] `DeleteWorkflowState(workflowName)`
-- [ ] Removes only `/var/lib/fluxbee/wf-rules/<workflow_name>/`
+- [x] `DeleteWorkflowState(workflowName)`
+- [x] Removes only `/var/lib/fluxbee/wf-rules/<workflow_name>/`
 
 ---
 
 ## 7) Package publication in `dist`
 
 ### WFRULES-PKG-1 — Package model
-- [ ] Define workflow package shape:
+- [x] Define workflow package shape:
 
 ```text
 /var/lib/fluxbee/dist/runtimes/wf.<workflow_name>/<version>/
@@ -222,15 +222,15 @@ go/sy-wf-rules/
     └── default-config.json   # optional
 ```
 
-- [ ] Ensure `package.json` includes runtime metadata required by the standard runtime model
-- [ ] Runtime name is `wf.<workflow_name>`
-- [ ] Version equals logical workflow version
-- [ ] `runtime_base = "wf.engine"`
+- [x] Ensure `package.json` includes runtime metadata required by the standard runtime model
+- [x] Runtime name is `wf.<workflow_name>`
+- [x] Version equals logical workflow version
+- [x] `runtime_base = "wf.engine"`
 
 ### WFRULES-PKG-2 — Materialize package contents
-- [ ] Build package directory contents from `current/definition.json` + metadata
-- [ ] Generate `flow/definition.json`
-- [ ] Generate `package.json`
+- [x] Build package directory contents from `current/definition.json` + metadata
+- [x] Generate `flow/definition.json`
+- [x] Generate `package.json`
 - [ ] Support optional `config/default-config.json` if needed
 
 ### WFRULES-PKG-3 — Publish through standard install/publish path
@@ -240,7 +240,7 @@ go/sy-wf-rules/
 - [ ] Return `PACKAGE_PUBLISH_FAILED` on failure
 
 ### WFRULES-PKG-4 — Publication result model
-- [ ] Return structured publication result:
+- [x] Return structured publication result:
   - runtime name
   - published version
   - package path
@@ -387,12 +387,12 @@ go/sy-wf-rules/
 - [x] Return compile response
 
 ### WFRULES-OP-2 — apply
-- [ ] Require `workflow_name`
-- [ ] Require `staged/`
-- [ ] Enforce optional version match
-- [ ] Rotate `staged -> current`, `current -> backup`
-- [ ] Materialize package from new `current`
-- [ ] Publish package
+- [x] Require `workflow_name`
+- [x] Require `staged/`
+- [x] Enforce optional version match
+- [x] Rotate `staged -> current`, `current -> backup`
+- [x] Materialize package from new `current`
+- [x] Publish package
 - [ ] Determine WF node existence
 - [ ] If existing:
   - explicit rebind + restart
@@ -407,11 +407,11 @@ go/sy-wf-rules/
 - [ ] If compile succeeds, execute `apply`
 
 ### WFRULES-OP-4 — rollback
-- [ ] Require `workflow_name`
-- [ ] Require `backup/`
-- [ ] Rotate rollback state
-- [ ] Materialize package for restored `current`
-- [ ] Publish package if restored version is missing from `dist`
+- [x] Require `workflow_name`
+- [x] Require `backup/`
+- [x] Rotate rollback state
+- [x] Materialize package for restored `current`
+- [x] Publish package if restored version is missing from `dist`
 - [ ] Explicitly rebind/restart existing WF node or apply first deploy semantics as needed
 - [ ] Return rollback response
 
@@ -439,8 +439,8 @@ go/sy-wf-rules/
 ## 11) Query handlers
 
 ### WFRULES-QRY-1 — get_workflow
-- [ ] Return current definition + metadata
-- [ ] `WORKFLOW_NOT_FOUND` if absent
+- [x] Return current definition + metadata
+- [x] `WORKFLOW_NOT_FOUND` if absent
 
 ### WFRULES-QRY-2 — get_status
 - [ ] Return:
@@ -484,7 +484,7 @@ go/sy-wf-rules/
 - [ ] `delete_workflow`
 
 ### WFRULES-DISP-3 — Query messages
-- [ ] `get_workflow`
+- [x] `get_workflow`
 - [ ] `get_status`
 - [x] `list_workflows`
 
@@ -564,9 +564,9 @@ go/sy-wf-rules/
 - [x] staged files are not written on failure
 
 ### WFRULES-TEST-3 — apply publication
-- [ ] Apply rotates staged to current
-- [ ] Package is materialized in `dist`
-- [ ] Package version equals metadata version
+- [x] Apply rotates staged to current
+- [x] Package is materialized in `dist`
+- [x] Package version equals metadata version
 
 ### WFRULES-TEST-4 — apply existing node rollout
 - [ ] Existing node config is rebound to concrete version
@@ -584,9 +584,9 @@ go/sy-wf-rules/
 - [ ] deployment is not falsely reported as complete
 
 ### WFRULES-TEST-7 — rollback
-- [ ] No backup => `NO_BACKUP`
-- [ ] Rollback restores previous version
-- [ ] Rollback republishes/restores package if required
+- [x] No backup => `NO_BACKUP`
+- [x] Rollback restores previous version
+- [x] Rollback republishes/restores package if required
 
 ### WFRULES-TEST-8 — delete
 - [ ] Unreachable WF node => `INSTANCES_UNKNOWN`
@@ -605,7 +605,7 @@ go/sy-wf-rules/
 - [ ] Crash/autorestart semantics modeled as old binding until explicit rollout succeeds
 
 ### WFRULES-TEST-11 — query handlers
-- [ ] `get_workflow`
+- [x] `get_workflow`
 - [ ] `get_status`
 - [ ] `list_workflows`
 - [ ] deployment status visibility when available

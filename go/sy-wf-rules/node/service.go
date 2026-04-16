@@ -55,11 +55,14 @@ func Run(runtimeCfg RuntimeConfig) error {
 	if err != nil {
 		return err
 	}
-	cfg, err := BuildNodeConfig(sender.FullName(), runtimeCfg.StateDir)
+	cfg, err := BuildNodeConfig(sender.FullName(), runtimeCfg.StateDir, runtimeCfg.DistRuntimeRoot)
 	if err != nil {
 		return err
 	}
 	if err := os.MkdirAll(cfg.StateDir, 0o755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(cfg.DistRuntimeRoot, 0o755); err != nil {
 		return err
 	}
 	return NewService(cfg, sender, receiver, nil).Run()

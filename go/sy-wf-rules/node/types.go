@@ -18,6 +18,10 @@ type CompileRequest struct {
 	Version      uint64 `json:"version,omitempty"`
 }
 
+type GetWorkflowRequest struct {
+	WorkflowName string `json:"workflow_name"`
+}
+
 type WfRulesMetadata struct {
 	Version         uint64 `json:"version"`
 	Hash            string `json:"hash"`

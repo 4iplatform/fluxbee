@@ -50,6 +50,33 @@ func (s *Service) handleCommand(msg fluxbeesdk.Message) {
 func (s *Service) handleQuery(msg fluxbeesdk.Message) {
 	action := strings.ToLower(stringValue(msg.Meta.Action))
 	switch action {
+	case "get_workflow":
+		var req GetWorkflowRequest
+		if len(msg.Payload) > 0 {
+			if err := json.Unmarshal(msg.Payload, &req); err != nil {
+				s.sendQueryResponse(msg, action, map[string]any{
+					"status":       "error",
+					"error_code":   "INVALID_CONFIG_SET",
+					"error_detail": err.Error(),
+				})
+				return
+			}
+		}
+		workflow, err := s.GetWorkflow(req)
+		if err != nil {
+			s.sendQueryResponse(msg, action, commandErrorPayload(err))
+			return
+		}
+		s.sendQueryResponse(msg, action, map[string]any{
+			"status":        "ok",
+			"hive":          s.cfg.HiveID,
+			"workflow_name": workflow.Metadata.WorkflowName,
+			"version":       workflow.Metadata.Version,
+			"hash":          workflow.Metadata.Hash,
+			"compiled_at":   workflow.Metadata.CompiledAt,
+			"definition":    workflow.Definition,
+		})
+		return
 	case "list_workflows":
 		workflows, err := s.store.ListWorkflows()
 		if err != nil {

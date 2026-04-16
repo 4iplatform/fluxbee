@@ -62,3 +62,31 @@ func TestStoreListWorkflows(t *testing.T) {
 		t.Fatalf("unexpected workflows %#v", got)
 	}
 }
+
+func TestStoreRotateToApply(t *testing.T) {
+	store := NewStore(t.TempDir())
+	_ = store.WriteSlot("invoice", "current", []byte("{\"v\":1}\n"), WfRulesMetadata{Version: 1})
+	_ = store.WriteSlot("invoice", "staged", []byte("{\"v\":2}\n"), WfRulesMetadata{Version: 2})
+	if err := store.RotateToApply("invoice"); err != nil {
+		t.Fatalf("RotateToApply: %v", err)
+	}
+	current, err := store.ReadCurrentMetadata("invoice")
+	if err != nil || current.Version != 2 {
+		t.Fatalf("unexpected current %#v err=%v", current, err)
+	}
+	backup, err := store.ReadBackupMetadata("invoice")
+	if err != nil || backup.Version != 1 {
+		t.Fatalf("unexpected backup %#v err=%v", backup, err)
+	}
+}
+
+func TestStoreDeleteWorkflowState(t *testing.T) {
+	store := NewStore(t.TempDir())
+	_ = store.WriteSlot("invoice", "current", []byte("{\"v\":1}\n"), WfRulesMetadata{Version: 1})
+	if err := store.DeleteWorkflowState("invoice"); err != nil {
+		t.Fatalf("DeleteWorkflowState: %v", err)
+	}
+	if store.WorkflowExists("invoice") {
+		t.Fatalf("workflow state should be deleted")
+	}
+}
