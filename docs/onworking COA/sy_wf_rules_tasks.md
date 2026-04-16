@@ -275,12 +275,12 @@ go/sy-wf-rules/
   - config exists or not
 
 ### WFRULES-ORCH-2 — Managed config read client
-- [ ] Implement `GetNodeConfig(nodeL2Name string)`
-- [ ] Read current managed config for existing WF node
-- [ ] Use this only to preserve operational fields and inspect current binding
+- [x] Implement `GetNodeConfig(nodeL2Name string)`
+- [x] Read current managed config for existing WF node
+- [x] Use this only to preserve operational fields and inspect current binding
 
 ### WFRULES-ORCH-3 — Managed config update client
-- [ ] Implement `SetNodeConfig(nodeL2Name string, config map[string]any)`
+- [x] Implement `SetNodeConfig(nodeL2Name string, config map[string]any)`
 - [ ] This is the rebind step for an existing WF node
 - [ ] Managed config must carry:
   - operational fields
@@ -291,13 +291,13 @@ go/sy-wf-rules/
   - `_system.package_path`
 
 ### WFRULES-ORCH-4 — Run node client
-- [ ] Implement `RunNode(nodeL2Name, runtimeName, version string, config map[string]any)`
-- [ ] Spawn path uses runtime `wf.<workflow_name>`
-- [ ] Initial spawn path must produce a managed node with fixed package binding
+- [x] Implement `RunNode(nodeL2Name, runtimeName, version string, config map[string]any)`
+- [x] Spawn path uses runtime `wf.<workflow_name>`
+- [x] Initial spawn path must produce a managed node with fixed package binding
 
 ### WFRULES-ORCH-5 — Kill node client
-- [ ] Implement `KillNode(nodeL2Name string)`
-- [ ] Tolerate `NODE_NOT_FOUND`
+- [x] Implement `KillNode(nodeL2Name string)`
+- [x] Tolerate `NODE_NOT_FOUND`
 
 ### WFRULES-ORCH-6 — Build managed WF config
 - [ ] Implement builder for managed WF config
@@ -324,18 +324,23 @@ go/sy-wf-rules/
   - `restart_failed`
   - structured error detail
 
+Current blocker:
+- `run_node` is fail-closed when `config.json` already exists (`NODE_ALREADY_EXISTS`)
+- current orchestrator API does not expose a safe `start_node` / `restart_node` verb for existing managed nodes
+- therefore `sy.wf-rules` currently detects the existing-node case and leaves the new version published but not deployed
+
 ### WFRULES-ORCH-8 — First deploy / auto_spawn path
-- [ ] If WF node does not exist and `auto_spawn=true`:
+- [x] If WF node does not exist and `auto_spawn=true`:
   - publish package
   - build managed config with defaults + fixed binding
   - `run_node` with runtime `wf.<workflow_name>`
-- [ ] If WF node does not exist and `auto_spawn=false`:
+- [x] If WF node does not exist and `auto_spawn=false`:
   - publish package only
   - return `wf_node.action = "none"`
 
 ### WFRULES-ORCH-9 — Publication vs deployment semantics
-- [ ] Keep package publication and node deployment as separate states in code
-- [ ] A published package without completed rebind/restart must not be treated as deployed
+- [x] Keep package publication and node deployment as separate states in code
+- [x] A published package without completed rebind/restart must not be treated as deployed
 - [ ] Crash/autorestart must continue using the old binding until rollout completes
 
 ### WFRULES-ORCH-10 — Managed cleanup path for delete
@@ -393,18 +398,18 @@ go/sy-wf-rules/
 - [x] Rotate `staged -> current`, `current -> backup`
 - [x] Materialize package from new `current`
 - [x] Publish package
-- [ ] Determine WF node existence
+- [x] Determine WF node existence
 - [ ] If existing:
   - explicit rebind + restart
-- [ ] If absent and `auto_spawn=true`:
+- [x] If absent and `auto_spawn=true`:
   - first deploy path
-- [ ] If absent and `auto_spawn=false`:
+- [x] If absent and `auto_spawn=false`:
   - leave package published only
 - [ ] Return apply response
 
 ### WFRULES-OP-3 — compile_apply
-- [ ] Execute `compile`
-- [ ] If compile succeeds, execute `apply`
+- [x] Execute `compile`
+- [x] If compile succeeds, execute `apply`
 
 ### WFRULES-OP-4 — rollback
 - [x] Require `workflow_name`
@@ -413,7 +418,7 @@ go/sy-wf-rules/
 - [x] Materialize package for restored `current`
 - [x] Publish package if restored version is missing from `dist`
 - [ ] Explicitly rebind/restart existing WF node or apply first deploy semantics as needed
-- [ ] Return rollback response
+- [x] Return rollback response
 
 ### WFRULES-OP-5 — delete_workflow
 - [ ] Require `workflow_name`
@@ -470,7 +475,7 @@ go/sy-wf-rules/
 ### WFRULES-DISP-1 — CONFIG_SET routing
 - [x] Default operation is `compile`
 - [x] Treat `check` as `compile`
-- [ ] Route:
+- [x] Route:
   - `compile`
   - `compile_apply`
   - `apply`
@@ -479,8 +484,8 @@ go/sy-wf-rules/
 
 ### WFRULES-DISP-2 — Command messages
 - [x] `compile_workflow`
-- [ ] `apply_workflow`
-- [ ] `rollback_workflow`
+- [x] `apply_workflow`
+- [x] `rollback_workflow`
 - [ ] `delete_workflow`
 
 ### WFRULES-DISP-3 — Query messages
@@ -574,13 +579,13 @@ go/sy-wf-rules/
 - [ ] `kill_node` then `run_node`
 
 ### WFRULES-TEST-5 — apply first deploy
-- [ ] Absent node + `auto_spawn=true` publishes package and spawns node
-- [ ] Absent node + `auto_spawn=false` publishes only
+- [x] Absent node + `auto_spawn=true` publishes package and spawns node
+- [x] Absent node + `auto_spawn=false` publishes only
 
 ### WFRULES-TEST-6 — restart failure handling
-- [ ] Publish succeeds, restart fails
+- [x] Publish succeeds, restart fails
 - [ ] `current/` remains updated
-- [ ] response is partial success
+- [x] response is partial success
 - [ ] deployment is not falsely reported as complete
 
 ### WFRULES-TEST-7 — rollback
@@ -601,7 +606,7 @@ go/sy-wf-rules/
 - [ ] Purges stale version
 
 ### WFRULES-TEST-10 — publication vs deployment state
-- [ ] Package published but rollout not complete leaves old deployed version intact
+- [x] Package published but rollout not complete leaves old deployed version intact
 - [ ] Crash/autorestart semantics modeled as old binding until explicit rollout succeeds
 
 ### WFRULES-TEST-11 — query handlers
