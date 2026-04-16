@@ -45,6 +45,16 @@ type WfRulesMetadata struct {
 	ErrorDetail     string `json:"error_detail"`
 }
 
+type WFConfigChangedPayload struct {
+	Subsystem    string `json:"subsystem"`
+	Action       string `json:"action"`
+	WorkflowName string `json:"workflow_name"`
+	AutoApply    *bool  `json:"auto_apply,omitempty"`
+	AutoSpawn    bool   `json:"auto_spawn,omitempty"`
+	Version      uint64 `json:"version,omitempty"`
+	Definition   any    `json:"definition,omitempty"`
+}
+
 type WfRulesError struct {
 	Code   string
 	Detail string

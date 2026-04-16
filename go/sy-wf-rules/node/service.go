@@ -4,13 +4,18 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
 
-const timeRFC3339 = time.RFC3339
+const (
+	timeRFC3339 = time.RFC3339
+	lockPath    = "/var/run/fluxbee/sy-wf-rules.lock"
+)
 
 type sender interface {
 	Send(fluxbeesdk.Message) error
@@ -48,6 +53,21 @@ func NewService(cfg NodeConfig, snd sender, rcv receiver, clock ClockFunc) *Serv
 }
 
 func Run(runtimeCfg RuntimeConfig) error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := os.MkdirAll("/var/run/fluxbee", 0o755); err != nil {
+		return fmt.Errorf("create lock dir: %w", err)
+	}
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return fmt.Errorf("open lock file: %w", err)
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return fmt.Errorf("sy-wf-rules already running (lock held): %w", err)
+	}
+
 	sender, receiver, err := fluxbeesdk.Connect(fluxbeesdk.NodeConfig{
 		Name:               runtimeCfg.NodeBaseName,
 		RouterSocket:       runtimeCfg.RouterSocketDir,
@@ -69,16 +89,23 @@ func Run(runtimeCfg RuntimeConfig) error {
 	if err := os.MkdirAll(cfg.DistRuntimeRoot, 0o755); err != nil {
 		return err
 	}
-	return NewService(cfg, sender, receiver, nil).Run()
+	return NewService(cfg, sender, receiver, nil).RunWithContext(ctx)
 }
 
 func (s *Service) Run() error {
+	return s.RunWithContext(context.Background())
+}
+
+func (s *Service) RunWithContext(ctx context.Context) error {
 	if s.receiver == nil {
 		return fmt.Errorf("receiver is required")
 	}
 	for {
-		msg, err := s.receiver.Recv(context.Background())
+		msg, err := s.receiver.Recv(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			return err
 		}
 		s.handleMessage(msg)

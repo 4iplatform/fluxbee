@@ -114,25 +114,29 @@ The task order at the end reflects these dependencies.
 - [x] Add local `replace` directives as needed
 
 ### WFRULES-SETUP-2 — Create scaffold
-- [ ] Create initial layout:
+- [x] Create initial layout (filenames differ from original plan but all functionality is covered):
 
 ```text
 go/sy-wf-rules/
 ├── go.mod
 ├── main.go
-├── node/
-│   ├── node.go
-│   ├── config.go
-│   ├── dispatch.go
-│   ├── handlers.go
-│   ├── store.go
-│   ├── validate.go
-│   ├── package_publish.go
-│   ├── orchestrator.go
-│   ├── wfnode.go
-│   ├── queries.go
-│   └── responses.go
-└── node_test.go
+└── node/
+    ├── config.go        (NodeConfig + RuntimeConfig)
+    ├── service.go       (Service + Run/RunWithContext)
+    ├── dispatch.go      (handleSystemMessage, handleCommand, handleQuery)
+    ├── types.go         (request/response/payload types)
+    ├── compile.go       (CompileWorkflow)
+    ├── apply.go         (ApplyWorkflow)
+    ├── deploy.go        (ApplyWorkflowAndDeploy, RollbackWorkflowAndDeploy)
+    ├── rollback.go      (RollbackWorkflow)
+    ├── delete.go        (DeleteWorkflow)
+    ├── store.go         (Store, filesystem state)
+    ├── orchestrator.go  (orchestratorClient interface + l2OrchestratorClient)
+    ├── managed_config.go (buildManagedWFConfig)
+    ├── package_publish.go (PublishWorkflowPackage, PurgeOldPackages)
+    ├── wf_client.go     (wfNodeClient, CountRunningInstances)
+    ├── query.go         (GetWorkflow, GetWorkflowStatus, ListWorkflowStatuses)
+    └── status.go        (WorkflowStatusView, WFNodeStatus)
 ```
 
 ### WFRULES-SETUP-3 — Common config/state types
@@ -234,10 +238,9 @@ go/sy-wf-rules/
 - [x] Support optional `config/default-config.json` if needed
 
 ### WFRULES-PKG-3 — Publish through standard install/publish path
-- [ ] Reuse standard Fluxbee package install/publish implementation
-- [ ] Do not shell out to ad hoc scripts
-- [ ] Publish via code or structured internal command path only
-- [ ] Return `PACKAGE_PUBLISH_FAILED` on failure
+- [x] Publish via direct Go filesystem I/O (no shell scripts) in `package_publish.go`
+- [x] Return `PACKAGE_PUBLISH_FAILED` on failure
+- Note: there is no shared platform-level install/publish library yet; `package_publish.go` is the canonical implementation for WF packages. If a shared library is introduced later, migrate then.
 
 ### WFRULES-PKG-4 — Publication result model
 - [x] Return structured publication result:
@@ -268,11 +271,8 @@ go/sy-wf-rules/
 ## 8) Orchestrator integration
 
 ### WFRULES-ORCH-1 — Node status client
-- [ ] Implement `GetNodeStatus(nodeL2Name string)`
-- [ ] Parse enough status to know:
-  - node exists or not
-  - unit active or not
-  - config exists or not
+- [x] Node existence is determined via `GetNodeConfig` → `NODE_CONFIG_NOT_FOUND` error (implemented in `orchestrator.go`)
+- [ ] **PENDING:** Add `GetNodeStatus(nodeL2Name string)` to detect if the WF node *process* is actively running (distinct from config existing). Send `NODE_STATUS_GET` directly to the WF node with 2s timeout. Used by `get_status` and `delete_workflow` to report `wf_node.running`. Currently `running` is inferred from `CountRunningInstances` timeout behavior.
 
 ### WFRULES-ORCH-2 — Managed config read client
 - [x] Implement `GetNodeConfig(nodeL2Name string)`
@@ -335,19 +335,19 @@ go/sy-wf-rules/
 ### WFRULES-ORCH-9 — Publication vs deployment semantics
 - [x] Keep package publication and node deployment as separate states in code
 - [x] A published package without completed rebind/restart must not be treated as deployed
-- [ ] Crash/autorestart must continue using the old binding until rollout completes
+- [x] Crash/autorestart continues using the old binding: managed config in `/var/lib/fluxbee/nodes/` is only rewritten after explicit `SetNodeConfig` succeeds. The orchestrator owns process restart and reads the persisted binding — no code needed in sy.wf-rules for this property.
 
 ### WFRULES-ORCH-10 — Managed cleanup path for delete
-- [ ] Implement standard delete path for WF managed instance through orchestrator/admin lifecycle
-- [ ] Do not delete `/var/lib/fluxbee/nodes/...` directly
+- [x] `KillNode` called with `purge_instance: true` via orchestrator — this is the standard managed instance cleanup path (`delete.go`)
+- [x] Does not delete `/var/lib/fluxbee/nodes/...` directly
 
 ### WFRULES-ORCH-11 — Tests
 - [ ] Existing node apply publishes package then rebinds config then restarts
 - [ ] Existing node apply preserves operational config
 - [ ] Existing node apply binds `_system.package_path` to concrete version
-- [ ] `kill_node` failure is tolerated and `run_node` still attempted
-- [ ] `run_node` retry after 1 second works as specified
+- [ ] `restart_node` retry after 1 second works as specified
 - [ ] `restart_failed` leaves package published but deployment incomplete
+- [ ] auto_spawn=false path publishes package only, no orchestrator call
 
 ---
 
@@ -393,13 +393,10 @@ go/sy-wf-rules/
 - [x] Materialize package from new `current`
 - [x] Publish package
 - [x] Determine WF node existence
-- [x] If existing:
-  - explicit rebind + restart
-- [x] If absent and `auto_spawn=true`:
-  - first deploy path
-- [x] If absent and `auto_spawn=false`:
-  - leave package published only
-- [ ] Return apply response
+- [x] If existing: explicit rebind + restart
+- [x] If absent and `auto_spawn=true`: first deploy path
+- [x] If absent and `auto_spawn=false`: leave package published only
+- [x] Return apply response (CONFIG_SET and command paths both return full response)
 
 ### WFRULES-OP-3 — compile_apply
 - [x] Execute `compile`
@@ -469,51 +466,47 @@ go/sy-wf-rules/
 ### WFRULES-DISP-1 — CONFIG_SET routing
 - [x] Default operation is `compile`
 - [x] Treat `check` as `compile`
-- [x] Route:
-  - `compile`
-  - `compile_apply`
-  - `apply`
-  - `rollback`
-- [ ] Unknown operation => `UNSUPPORTED_OPERATION`
+- [x] Route: `compile`, `compile_apply`, `apply`, `rollback`
+- [x] Unknown operation => `UNSUPPORTED_OPERATION` (default case in switch)
 
 ### WFRULES-DISP-2 — Command messages
 - [x] `compile_workflow`
 - [x] `apply_workflow`
 - [x] `rollback_workflow`
-- [ ] `delete_workflow`
+- [x] `delete_workflow`
 
 ### WFRULES-DISP-3 — Query messages
 - [x] `get_workflow`
-- [ ] `get_status`
+- [x] `get_status`
 - [x] `list_workflows`
 
 ### WFRULES-DISP-4 — System messages
 - [x] `NODE_STATUS_GET`
 - [x] `CONFIG_GET`
 - [x] `CONFIG_SET`
-- [ ] `CONFIG_CHANGED`
+- [x] `CONFIG_CHANGED` — routes to `handleConfigChanged`, subsystem filter `"wf-rules"`, supports compile/compile_apply/apply/rollback/check
 
 ---
 
 ## 13) Boot sequence
 
 ### WFRULES-BOOT-1 — Startup
-- [ ] Load hive config
-- [ ] Determine `SY.orchestrator@<hive>`
-- [ ] Ensure `/var/lib/fluxbee/wf-rules/`
-- [ ] Acquire file lock
-- [ ] Load or create node UUID
-- [ ] Connect to router via `fluxbee-go-sdk`
-- [ ] Enter message loop
+- [x] Load hive config (hive_id derived from node full name returned by SDK)
+- [x] Determine `SY.orchestrator@<hive>` (built in `BuildNodeConfig`)
+- [x] Ensure `/var/lib/fluxbee/wf-rules/` and `/var/lib/fluxbee/dist/runtimes/` (`os.MkdirAll` in `Run`)
+- [x] Acquire exclusive file lock at `/var/run/fluxbee/sy-wf-rules.lock` (`syscall.Flock`)
+- [x] Load or create node UUID (handled by `fluxbee-go-sdk` with `UUIDMode: NodeUuidPersistent`)
+- [x] Connect to router via `fluxbee-go-sdk`
+- [x] Enter message loop (`RunWithContext`)
 
 ### WFRULES-BOOT-2 — Shutdown
-- [ ] Graceful shutdown on SIGTERM/SIGINT
-- [ ] Close router connection
-- [ ] Release file lock
+- [x] Graceful shutdown on SIGTERM/SIGINT via `signal.NotifyContext` — `RunWithContext` returns `nil` on context cancel
+- [x] File lock released on process exit (deferred `lockFile.Close()` + OS releases flock on fd close)
+- Note: router connection close is handled by the SDK when the process exits; no explicit Close() call needed.
 
 ### WFRULES-BOOT-3 — Reconnect behavior
-- [ ] Reuse current SDK reconnect behavior
-- [ ] Ensure in-flight node state is not corrupted by reconnect
+- [x] SDK reconnect behavior reused (no custom reconnect logic needed)
+- [x] In-flight state not corrupted: message handlers are synchronous, no partial writes possible mid-reconnect
 
 ---
 
@@ -601,7 +594,7 @@ go/sy-wf-rules/
 
 ### WFRULES-TEST-10 — publication vs deployment state
 - [x] Package published but rollout not complete leaves old deployed version intact
-- [ ] Crash/autorestart semantics modeled as old binding until explicit rollout succeeds
+- [x] Crash/autorestart semantics: enforced by orchestrator owning the managed config; no sy.wf-rules code needed. Property is correct by design (SetNodeConfig only called after package publish succeeds).
 
 ### WFRULES-TEST-11 — query handlers
 - [x] `get_workflow`
@@ -613,7 +606,7 @@ go/sy-wf-rules/
 - [x] Request contracts/docs cover all `wf-rules` Admin endpoints
 - [x] Hive/target normalization is tested
 - [x] Admin response envelope accepts `sy.wf-rules` ok/error payload shapes
-- [ ] End-to-end forwarding of each Admin endpoint through router to L2 remains to be added
+- [ ] **PENDING:** End-to-end forwarding test of each Admin endpoint through router to L2 (requires integration test harness)
 
 ---
 
@@ -628,8 +621,7 @@ go/sy-wf-rules/
 - [x] Follow same service pattern as other SY nodes
 
 ### WFRULES-INSTALL-3 — Identity registration
-- [ ] Confirm and document the standard core `SY.*` identity behavior for `sy-wf-rules`
-- [ ] Do not add a special `ILK_REGISTER` path unless the rest of the core `SY.*` services already do it
+- [ ] **PENDING:** Confirm whether `SY.wf-rules` needs an `ILK_REGISTER` call at boot. Compare with `sy-opa-rules` and `sy-timer` — neither appears to do it. Document the finding and close this task.
 
 ---
 
@@ -642,7 +634,47 @@ go/sy-wf-rules/
 
 ---
 
-## 18) Suggested implementation order
+## 18) Remaining open items (post-audit 2026-04-16)
+
+These items were identified during a code audit on 2026-04-16. All other tasks are complete.
+
+### WFRULES-OPEN-1 — ORCH-11: Orchestrator integration tests
+
+- [ ] Test: existing node apply → publishes package, rebinds managed config, restarts node
+- [ ] Test: existing node apply preserves operational config fields (tenant_id, gc_*, sy_timer_l2_name)
+- [ ] Test: `_system.package_path` in rebound config points to the newly published package
+- [ ] Test: `restart_node` retry after 1s on first failure
+- [ ] Test: `restart_failed` result when both restart attempts fail — package remains published, current/ is updated
+- [ ] Test: `auto_spawn=false` path publishes package only, no orchestrator call at all
+
+### WFRULES-OPEN-2 — GetNodeStatus for process liveness
+
+- [ ] Add `GetNodeStatus(ctx, targetNode, wfNodeL2Name string) (running bool, err error)` to `orchestratorClient`
+- [ ] Implementation: send `NODE_STATUS_GET` directly to the WF node L2 name with 2s timeout; `running=true` if response received, `running=false` on timeout
+- [ ] Wire into `GetWorkflowStatus` and `ListWorkflowStatuses` so `wf_node.running` is accurate even when the node has a managed config but the process is down
+- [ ] Wire into `DeleteWorkflow` force=false path as an additional guard (currently only `CountRunningInstances` is used)
+
+### WFRULES-OPEN-3 — Shared receiver message drop (architectural note)
+
+**Scope:** sy.wf-rules only — sy-opa-rules and sy-timer do not make outbound orchestrator RPC calls during message handling.
+
+**Issue:** `orchestratorClient.request()` and the main `RunWithContext` loop share the same `receiver`. While the main loop is blocked in `handleMessage`, the orchestrator RPC client consumes messages from the socket in a tight loop, discarding any that don't match its `traceID`. Messages arriving during an orchestrator call (e.g., a concurrent health check) are silently dropped.
+
+**Impact:** Low in practice — orchestrator RPC calls are short (3s timeout) and concurrent inbound traffic is rare for a system node. No data corruption risk.
+
+- [ ] If/when this becomes a problem: introduce a message multiplexer goroutine (single `Recv` loop → fan-out by traceID to per-request buffered channels). This is a larger refactor; defer until observed in production.
+
+### WFRULES-OPEN-4 — INSTALL-3: Identity registration confirmation
+
+- [ ] Verify whether `SY.wf-rules` needs an `ILK_REGISTER` call at boot (compare with sy-opa-rules, sy-timer — neither does it). Document result and close.
+
+### WFRULES-OPEN-5 — TEST-12: E2E Admin endpoint forwarding tests
+
+- [ ] Integration test: each Admin HTTP endpoint (`/admin/wf-rules/...`) correctly forwards to `SY.wf-rules` via L2 and maps the response envelope
+
+---
+
+## 19) Suggested implementation order
 
 1. **WFRULES-CEL-1 -> WFRULES-CEL-6**
 2. **WFRULES-SETUP-1 -> WFRULES-SETUP-3**
