@@ -22,6 +22,8 @@ AUTO_SPAWN="${AUTO_SPAWN:-true}"
 WF_NODE_WAIT_SECS="${WF_NODE_WAIT_SECS:-10}"
 SKIP_ROLLBACK="${SKIP_ROLLBACK:-0}"
 TENANT_ID="${TENANT_ID:-${WFRULES_TENANT_ID:-}}"
+WF_ENGINE_VERSION="${WF_ENGINE_VERSION:-0.1.0}"
+SKIP_PUBLISH_WF_ENGINE="${SKIP_PUBLISH_WF_ENGINE:-0}"
 
 PASS=0
 FAIL=0
@@ -249,6 +251,19 @@ trap cleanup EXIT
 
 require_cmd curl
 require_cmd python3
+
+# ── publish wf.engine runtime ──────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ "$SKIP_PUBLISH_WF_ENGINE" != "1" ]]; then
+  echo "Publishing wf.engine@$WF_ENGINE_VERSION runtime..."
+  bash "$SCRIPT_DIR/publish-wf-runtime.sh" \
+    --version "$WF_ENGINE_VERSION" \
+    --set-current \
+    --sudo
+  echo "  wf.engine runtime published."
+fi
 
 echo "SY.wf-rules lifecycle e2e"
 echo "  BASE=$BASE  HIVE=$HIVE_ID  WF=$WF_NAME"
