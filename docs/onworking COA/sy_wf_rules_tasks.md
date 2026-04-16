@@ -640,12 +640,12 @@ These items were identified during a code audit on 2026-04-16. All other tasks a
 
 ### WFRULES-OPEN-1 — ORCH-11: Orchestrator integration tests
 
-- [ ] Test: existing node apply → publishes package, rebinds managed config, restarts node
-- [ ] Test: existing node apply preserves operational config fields (tenant_id, gc_*, sy_timer_l2_name)
-- [ ] Test: `_system.package_path` in rebound config points to the newly published package
-- [ ] Test: `restart_node` retry after 1s on first failure
-- [ ] Test: `restart_failed` result when both restart attempts fail — package remains published, current/ is updated
-- [ ] Test: `auto_spawn=false` path publishes package only, no orchestrator call at all
+- [x] Test: existing node apply → publishes package, rebinds managed config, restarts node (`TestApplyWorkflowAndDeployExistingNodeLeavesDeploymentDeferred`)
+- [x] Test: existing node apply preserves operational config fields — tenant_id, gc_*, sy_timer_l2_name (`TestExistingNodeApplyPreservesTimerL2Name`)
+- [x] Test: `_system.package_path` in binding points to the exact versioned published path (`TestExistingNodeApplyBindsConcretePackagePath`)
+- [x] Test: `restart_node` retry after 1s on first failure — restartCalls == 2 (`TestApplyWorkflowAndDeployExistingNodeRestartFailureIsPartial`)
+- [x] Test: `restart_failed` — current/ updated and package published on disk (`TestRestartFailedCurrentAndPackageStillPresent`)
+- [x] Test: `auto_spawn=false` publishes package only, no run_node call (`TestApplyWorkflowAndDeployPublishesOnlyWhenAutoSpawnDisabled`)
 
 ### WFRULES-OPEN-2 — GetNodeStatus for process liveness
 

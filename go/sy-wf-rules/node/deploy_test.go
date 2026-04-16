@@ -3,6 +3,8 @@ package node
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -299,5 +301,133 @@ func TestApplyWorkflowAndDeployExistingNodeRestartFailureIsPartial(t *testing.T)
 	}
 	if fake.restartCalls != 2 {
 		t.Fatalf("expected one retry, got %d restart calls", fake.restartCalls)
+	}
+}
+
+// TestExistingNodeApplyPreservesTimerL2Name verifies that sy_timer_l2_name and
+// all operational fields are forwarded to SetNodeConfig exactly as read from
+// the existing managed config — no field is silently dropped.
+func TestExistingNodeApplyPreservesTimerL2Name(t *testing.T) {
+	svc := newTestService(t)
+	fake := &fakeOrchestratorClient{}
+	var gotPatch map[string]any
+	fake.getNodeConfigFunc = func(ctx context.Context, targetNode, nodeName string) (map[string]any, error) {
+		return map[string]any{
+			"status": "ok",
+			"config": map[string]any{
+				"tenant_id":           "tnt:abc123",
+				"sy_timer_l2_name":    "SY.timer@motherbee",
+				"gc_retention_days":   30,
+				"gc_interval_seconds": 1800,
+			},
+		}, nil
+	}
+	fake.setNodeConfigFunc = func(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding, notify bool) (map[string]any, error) {
+		gotPatch = config
+		return map[string]any{"status": "ok"}, nil
+	}
+	svc.orchestrator = fake
+
+	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
+		t.Fatalf("CompileWorkflow: %v", err)
+	}
+	if _, err := svc.ApplyWorkflowAndDeploy(ApplyRequest{WorkflowName: "invoice"}); err != nil {
+		t.Fatalf("ApplyWorkflowAndDeploy: %v", err)
+	}
+	if gotPatch["tenant_id"] != "tnt:abc123" {
+		t.Fatalf("tenant_id not preserved: %#v", gotPatch["tenant_id"])
+	}
+	if gotPatch["sy_timer_l2_name"] != "SY.timer@motherbee" {
+		t.Fatalf("sy_timer_l2_name not preserved: %#v", gotPatch["sy_timer_l2_name"])
+	}
+	if gotPatch["gc_retention_days"] != 30 {
+		t.Fatalf("gc_retention_days not preserved: %#v", gotPatch["gc_retention_days"])
+	}
+	if gotPatch["gc_interval_seconds"] != 1800 {
+		t.Fatalf("gc_interval_seconds not preserved: %#v", gotPatch["gc_interval_seconds"])
+	}
+	if _, hasSystem := gotPatch["_system"]; hasSystem {
+		t.Fatalf("_system must not appear in config patch (belongs in binding): %#v", gotPatch["_system"])
+	}
+}
+
+// TestExistingNodeApplyBindsConcretePackagePath verifies that the runtime
+// binding sent to SetNodeConfig references the exact versioned package directory
+// that was just published, not a wildcard or "current" pointer.
+func TestExistingNodeApplyBindsConcretePackagePath(t *testing.T) {
+	svc := newTestService(t)
+	fake := &fakeOrchestratorClient{}
+	var gotBinding *managedRuntimeBinding
+	fake.getNodeConfigFunc = func(ctx context.Context, targetNode, nodeName string) (map[string]any, error) {
+		return map[string]any{"status": "ok", "config": map[string]any{}}, nil
+	}
+	fake.setNodeConfigFunc = func(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding, notify bool) (map[string]any, error) {
+		gotBinding = binding
+		return map[string]any{"status": "ok"}, nil
+	}
+	svc.orchestrator = fake
+
+	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
+		t.Fatalf("CompileWorkflow: %v", err)
+	}
+	result, err := svc.ApplyWorkflowAndDeploy(ApplyRequest{WorkflowName: "invoice"})
+	if err != nil {
+		t.Fatalf("ApplyWorkflowAndDeploy: %v", err)
+	}
+	if gotBinding == nil {
+		t.Fatal("expected runtime binding to be set")
+	}
+	version := fmt.Sprintf("%d", result.Current.Version)
+	expectedPath := filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", version)
+	if gotBinding.PackagePath != expectedPath {
+		t.Fatalf("package_path = %q, want %q", gotBinding.PackagePath, expectedPath)
+	}
+	if gotBinding.Runtime != "wf.invoice" {
+		t.Fatalf("runtime = %q, want %q", gotBinding.Runtime, "wf.invoice")
+	}
+	if gotBinding.RuntimeVersion != version {
+		t.Fatalf("runtime_version = %q, want %q", gotBinding.RuntimeVersion, version)
+	}
+	if _, err := os.Stat(gotBinding.PackagePath); err != nil {
+		t.Fatalf("bound package_path does not exist on disk: %v", err)
+	}
+}
+
+// TestRestartFailedCurrentAndPackageStillPresent verifies the partial-success
+// invariant: if restart_node fails on both attempts, sy.wf-rules must still
+// have rotated current/ to the new definition and published the package to
+// dist — the deployment is incomplete but the source of truth is consistent.
+func TestRestartFailedCurrentAndPackageStillPresent(t *testing.T) {
+	svc := newTestService(t)
+	fake := &fakeOrchestratorClient{}
+	fake.getNodeConfigFunc = func(ctx context.Context, targetNode, nodeName string) (map[string]any, error) {
+		return map[string]any{"status": "ok", "config": map[string]any{}}, nil
+	}
+	fake.restartNodeFunc = func(ctx context.Context, targetNode, nodeName string) (map[string]any, error) {
+		return nil, fmt.Errorf("RESTART_FAILED: node is unresponsive")
+	}
+	svc.orchestrator = fake
+
+	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
+		t.Fatalf("CompileWorkflow: %v", err)
+	}
+	result, err := svc.ApplyWorkflowAndDeploy(ApplyRequest{WorkflowName: "invoice"})
+	if err != nil {
+		t.Fatalf("ApplyWorkflowAndDeploy: %v", err)
+	}
+	if result.WFNode.Action != "restart_failed" {
+		t.Fatalf("expected restart_failed, got %q", result.WFNode.Action)
+	}
+
+	// current/ must hold the new definition.
+	if _, err := os.Stat(filepath.Join(svc.store.Root(), "invoice", "current", "metadata.json")); err != nil {
+		t.Fatalf("current/metadata.json missing after restart_failed: %v", err)
+	}
+
+	// Package must be published in dist — a subsequent rollout retry can use it.
+	version := fmt.Sprintf("%d", result.Current.Version)
+	pkgPath := filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", version)
+	if _, err := os.Stat(filepath.Join(pkgPath, "flow", "definition.json")); err != nil {
+		t.Fatalf("dist package flow/definition.json missing after restart_failed: %v", err)
 	}
 }
