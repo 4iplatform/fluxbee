@@ -90,7 +90,44 @@ func TestApplyWorkflowAndDeployAutoSpawnFirstDeploy(t *testing.T) {
 		if config["gc_interval_seconds"] != defaultWFGCIntervalSeconds {
 			t.Fatalf("unexpected gc_interval_seconds %#v", config["gc_interval_seconds"])
 		}
+		if config["tenant_id"] != "tnt:request" {
+			t.Fatalf("unexpected tenant_id %#v", config["tenant_id"])
+		}
 		return map[string]any{"status": "ok"}, nil
+	}
+	svc.orchestrator = fake
+
+	if _, err := svc.CompileWorkflow(CompileRequest{
+		WorkflowName: "invoice",
+		Definition:   validWorkflowDefinition(),
+	}); err != nil {
+		t.Fatalf("CompileWorkflow: %v", err)
+	}
+	result, err := svc.ApplyWorkflowAndDeploy(ApplyRequest{
+		WorkflowName: "invoice",
+		AutoSpawn:    true,
+		TenantID:     "tnt:request",
+	})
+	if err != nil {
+		t.Fatalf("ApplyWorkflowAndDeploy: %v", err)
+	}
+	if result.WFNode.Action != "restarted" || result.WFNode.Status != "ok" {
+		t.Fatalf("unexpected wf_node %#v", result.WFNode)
+	}
+	if fake.runCalls != 1 {
+		t.Fatalf("expected one run_node call, got %d", fake.runCalls)
+	}
+}
+
+func TestApplyWorkflowAndDeployDoesNotFallbackToSpawnOnConfigLookupTimeout(t *testing.T) {
+	svc := newTestService(t)
+	fake := &fakeOrchestratorClient{}
+	fake.getNodeConfigFunc = func(ctx context.Context, targetNode, nodeName string) (map[string]any, error) {
+		return nil, context.DeadlineExceeded
+	}
+	fake.runNodeFunc = func(ctx context.Context, targetNode, nodeName, runtimeName, version string, config map[string]any) (map[string]any, error) {
+		t.Fatalf("RunNode must not be called after config lookup timeout")
+		return nil, nil
 	}
 	svc.orchestrator = fake
 
@@ -107,11 +144,14 @@ func TestApplyWorkflowAndDeployAutoSpawnFirstDeploy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ApplyWorkflowAndDeploy: %v", err)
 	}
-	if result.WFNode.Action != "restarted" || result.WFNode.Status != "ok" {
+	if result.WFNode.Action != "none" || result.WFNode.Reason != "orchestrator query failed" {
 		t.Fatalf("unexpected wf_node %#v", result.WFNode)
 	}
-	if fake.runCalls != 1 {
-		t.Fatalf("expected one run_node call, got %d", fake.runCalls)
+	if result.Warning == "" {
+		t.Fatalf("expected warning")
+	}
+	if fake.runCalls != 0 {
+		t.Fatalf("expected no run_node calls, got %d", fake.runCalls)
 	}
 }
 

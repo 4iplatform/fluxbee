@@ -10,6 +10,7 @@ type ApplyRequest struct {
 	WorkflowName string `json:"workflow_name"`
 	Version      uint64 `json:"version,omitempty"`
 	AutoSpawn    bool   `json:"auto_spawn,omitempty"`
+	TenantID     string `json:"tenant_id,omitempty"`
 }
 
 type ApplyResult struct {

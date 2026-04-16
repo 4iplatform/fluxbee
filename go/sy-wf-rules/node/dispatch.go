@@ -60,6 +60,7 @@ func (s *Service) handleConfigChanged(msg fluxbeesdk.Message) {
 			WorkflowName: wfName,
 			Version:      meta.Version,
 			AutoSpawn:    payload.AutoSpawn,
+			TenantID:     payload.TenantID,
 		}); err != nil {
 			log.Printf("sy-wf-rules: CONFIG_CHANGED compile_apply failed (apply) for %q: %v", wfName, err)
 		}
@@ -68,12 +69,14 @@ func (s *Service) handleConfigChanged(msg fluxbeesdk.Message) {
 			WorkflowName: wfName,
 			Version:      payload.Version,
 			AutoSpawn:    payload.AutoSpawn,
+			TenantID:     payload.TenantID,
 		}); err != nil {
 			log.Printf("sy-wf-rules: CONFIG_CHANGED apply failed for %q: %v", wfName, err)
 		}
 	case "rollback":
 		if _, err := s.RollbackWorkflowAndDeploy(RollbackRequest{
 			WorkflowName: wfName,
+			TenantID:     payload.TenantID,
 		}); err != nil {
 			log.Printf("sy-wf-rules: CONFIG_CHANGED rollback failed for %q: %v", wfName, err)
 		}
@@ -463,6 +466,7 @@ func (s *Service) handleNodeConfigSet(msg fluxbeesdk.Message) {
 			WorkflowName: compileReq.WorkflowName,
 			Version:      meta.Version,
 			AutoSpawn:    compileReq.AutoSpawn,
+			TenantID:     compileReq.TenantID,
 		})
 		if err != nil {
 			s.sendNodeConfigResponse(msg, configErrorPayload(s.nodeName(), req.SchemaVersion, req.ConfigVersion, err))

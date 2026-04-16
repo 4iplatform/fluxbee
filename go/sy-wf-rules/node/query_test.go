@@ -133,6 +133,32 @@ func TestGetWorkflowStatusTreatsWFTimeoutAsNonFatal(t *testing.T) {
 	}
 }
 
+func TestGetWorkflowStatusTreatsOrchestratorTimeoutAsNonFatal(t *testing.T) {
+	svc := newTestService(t)
+	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
+		t.Fatalf("CompileWorkflow: %v", err)
+	}
+	if _, err := svc.ApplyWorkflow(ApplyRequest{WorkflowName: "invoice"}); err != nil {
+		t.Fatalf("ApplyWorkflow: %v", err)
+	}
+	svc.orchestrator = &fakeOrchestratorClient{
+		getNodeConfigFunc: func(_ context.Context, targetNode, nodeName string) (map[string]any, error) {
+			return nil, context.DeadlineExceeded
+		},
+	}
+
+	status, err := svc.GetWorkflowStatus(GetStatusRequest{WorkflowName: "invoice"})
+	if err != nil {
+		t.Fatalf("GetWorkflowStatus: %v", err)
+	}
+	if status.CurrentVersion == nil || *status.CurrentVersion != 1 {
+		t.Fatalf("unexpected current version %#v", status.CurrentVersion)
+	}
+	if !status.WFNode.Timeout || status.WFNode.Running || status.WFNode.ConfigExists {
+		t.Fatalf("unexpected wf node snapshot %#v", status.WFNode)
+	}
+}
+
 func TestListWorkflowStatusesReturnsStructuredItems(t *testing.T) {
 	svc := newTestService(t)
 	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {

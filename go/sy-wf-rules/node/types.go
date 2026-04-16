@@ -17,6 +17,7 @@ type CompileRequest struct {
 	Definition   any    `json:"definition"`
 	Version      uint64 `json:"version,omitempty"`
 	AutoSpawn    bool   `json:"auto_spawn,omitempty"`
+	TenantID     string `json:"tenant_id,omitempty"`
 }
 
 type GetWorkflowRequest struct {
@@ -52,6 +53,7 @@ type WFConfigChangedPayload struct {
 	AutoApply    *bool  `json:"auto_apply,omitempty"`
 	AutoSpawn    bool   `json:"auto_spawn,omitempty"`
 	Version      uint64 `json:"version,omitempty"`
+	TenantID     string `json:"tenant_id,omitempty"`
 	Definition   any    `json:"definition,omitempty"`
 }
 

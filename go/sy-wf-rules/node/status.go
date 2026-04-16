@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -107,6 +108,10 @@ func (s *Service) inspectWFNode(ctx context.Context, workflowName string, queryI
 		if actionErr, ok := err.(*orchestratorActionError); ok && actionErr.Code == "NODE_CONFIG_NOT_FOUND" {
 			return snapshot, nil
 		}
+		if isRPCTimeout(ctx, err) {
+			snapshot.Timeout = true
+			return snapshot, nil
+		}
 		return snapshot, WfRulesError{Code: "ORCHESTRATOR_ERROR", Detail: err.Error()}
 	}
 	snapshot.ConfigExists = true
@@ -126,6 +131,19 @@ func (s *Service) inspectWFNode(ctx context.Context, workflowName string, queryI
 	snapshot.Running = true
 	snapshot.ActiveInstances = intPtr(count)
 	return snapshot, nil
+}
+
+func isRPCTimeout(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "context deadline exceeded")
 }
 
 func (s *Service) boundRuntimeVersionForWorkflow(workflowName string) (string, error) {

@@ -33,7 +33,7 @@ func (s *Service) ApplyWorkflowAndDeploy(req ApplyRequest) (*ApplyExecutionResul
 	if err != nil {
 		return nil, err
 	}
-	wfNode, warning := s.deployPublishedWorkflow(req.WorkflowName, req.AutoSpawn, result.Package)
+	wfNode, warning := s.deployPublishedWorkflow(req.WorkflowName, req.AutoSpawn, req.TenantID, result.Package)
 	return &ApplyExecutionResult{
 		Current: result.Current,
 		Package: result.Package,
@@ -47,7 +47,7 @@ func (s *Service) RollbackWorkflowAndDeploy(req RollbackRequest) (*RollbackExecu
 	if err != nil {
 		return nil, err
 	}
-	wfNode, warning := s.deployPublishedWorkflow(req.WorkflowName, req.AutoSpawn, result.Package)
+	wfNode, warning := s.deployPublishedWorkflow(req.WorkflowName, req.AutoSpawn, req.TenantID, result.Package)
 	return &RollbackExecutionResult{
 		Current: result.Current,
 		Package: result.Package,
@@ -56,7 +56,7 @@ func (s *Service) RollbackWorkflowAndDeploy(req RollbackRequest) (*RollbackExecu
 	}, nil
 }
 
-func (s *Service) deployPublishedWorkflow(workflowName string, autoSpawn bool, pkg PackagePublishResult) (WFNodeActionResult, string) {
+func (s *Service) deployPublishedWorkflow(workflowName string, autoSpawn bool, tenantID string, pkg PackagePublishResult) (WFNodeActionResult, string) {
 	nodeName := fmt.Sprintf("WF.%s@%s", workflowName, s.cfg.HiveID)
 	if s.orchestrator == nil {
 		return WFNodeActionResult{
@@ -71,7 +71,7 @@ func (s *Service) deployPublishedWorkflow(workflowName string, autoSpawn bool, p
 	existingConfigPayload, err := s.orchestrator.GetNodeConfig(ctx, s.cfg.OrchestratorTarget, nodeName)
 	if err == nil {
 		existingConfig := configMapFromNodeConfigPayload(existingConfigPayload)
-		config := s.buildManagedWFConfig(existingConfig)
+		config := s.buildManagedWFConfig(existingConfig, tenantID)
 		binding := buildManagedRuntimeBinding(pkg)
 		ctx, cancel = context.WithTimeout(context.Background(), orchestratorRPCTimeout)
 		defer cancel()
@@ -114,6 +114,14 @@ func (s *Service) deployPublishedWorkflow(workflowName string, autoSpawn bool, p
 				},
 				"Package published, but sy.wf-rules could not determine current node state from orchestrator."
 		}
+	} else if err != nil {
+		return WFNodeActionResult{
+				NodeName: nodeName,
+				Action:   "none",
+				Reason:   "orchestrator query failed",
+				Error:    err.Error(),
+			},
+			"Package published, but sy.wf-rules could not determine current node state from orchestrator."
 	}
 
 	if !autoSpawn {
@@ -127,7 +135,7 @@ func (s *Service) deployPublishedWorkflow(workflowName string, autoSpawn bool, p
 	ctx, cancel = context.WithTimeout(context.Background(), orchestratorRPCTimeout)
 	defer cancel()
 	runtimeName := pkg.RuntimeName
-	config := s.buildManagedWFConfig(nil)
+	config := s.buildManagedWFConfig(nil, tenantID)
 	_, err = s.orchestrator.RunNode(ctx, s.cfg.OrchestratorTarget, nodeName, runtimeName, pkg.Version, config)
 	if err != nil {
 		return WFNodeActionResult{

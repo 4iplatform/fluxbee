@@ -21,6 +21,7 @@ WF_NAME="${WF_NAME:-test-wf-rules}"
 AUTO_SPAWN="${AUTO_SPAWN:-true}"
 WF_NODE_WAIT_SECS="${WF_NODE_WAIT_SECS:-10}"
 SKIP_ROLLBACK="${SKIP_ROLLBACK:-0}"
+TENANT_ID="${TENANT_ID:-${WFRULES_TENANT_ID:-}}"
 
 PASS=0
 FAIL=0
@@ -251,6 +252,9 @@ require_cmd python3
 
 echo "SY.wf-rules lifecycle e2e"
 echo "  BASE=$BASE  HIVE=$HIVE_ID  WF=$WF_NAME"
+if [[ -n "$TENANT_ID" ]]; then
+  echo "  TENANT_ID=$TENANT_ID"
+fi
 
 # ── STEP 1: compile only (validate + stage, no apply) ─────────────────────
 
@@ -261,6 +265,7 @@ import json, sys
 print(json.dumps({
     'workflow_name': '$WF_NAME',
     'definition': json.loads(sys.stdin.read()),
+    **({'tenant_id': '$TENANT_ID'} if '$TENANT_ID' else {}),
 }))" < <(definition_v1))"
 
 resp="$(wf_post "/compile" "$body")"
@@ -282,7 +287,13 @@ assert_nonempty "staged.guard_count" "$guard_count"
 
 step "2. apply (auto_spawn=$AUTO_SPAWN)"
 
-body="{\"workflow_name\":\"$WF_NAME\",\"auto_spawn\":$AUTO_SPAWN}"
+body="$(python3 -c "
+import json
+payload = {'workflow_name': '$WF_NAME', 'auto_spawn': '$AUTO_SPAWN' == 'true'}
+if '$TENANT_ID':
+    payload['tenant_id'] = '$TENANT_ID'
+print(json.dumps(payload))
+")"
 resp="$(wf_post "/apply" "$body")"
 echo "  response: $resp"
 
@@ -361,6 +372,7 @@ print(json.dumps({
     'workflow_name': '$WF_NAME',
     'definition': json.loads(sys.stdin.read()),
     'auto_spawn': auto_spawn,
+    **({'tenant_id': '$TENANT_ID'} if '$TENANT_ID' else {}),
 }))" < <(definition_v2))"
 
 resp="$(wf_post "" "$body")"
@@ -389,7 +401,13 @@ fi
 if [[ "$SKIP_ROLLBACK" != "1" ]]; then
   step "6. rollback (restore v1)"
 
-  resp="$(wf_post "/rollback" "{\"workflow_name\":\"$WF_NAME\",\"auto_spawn\":$AUTO_SPAWN}")"
+  resp="$(wf_post "/rollback" "$(python3 -c "
+import json
+payload = {'workflow_name': '$WF_NAME', 'auto_spawn': '$AUTO_SPAWN' == 'true'}
+if '$TENANT_ID':
+    payload['tenant_id'] = '$TENANT_ID'
+print(json.dumps(payload))
+")")"
   echo "  response: $resp"
 
   ok="$(json_get "$resp" "payload.ok")"

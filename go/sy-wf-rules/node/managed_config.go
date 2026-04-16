@@ -15,7 +15,7 @@ type managedRuntimeBinding struct {
 	PackagePath             string
 }
 
-func (s *Service) buildManagedWFConfig(existing map[string]any) map[string]any {
+func (s *Service) buildManagedWFConfig(existing map[string]any, tenantID string) map[string]any {
 	cfg := map[string]any{}
 	for key, value := range existing {
 		if key == "_system" {
@@ -32,8 +32,12 @@ func (s *Service) buildManagedWFConfig(existing map[string]any) map[string]any {
 	if intValueFromMap(cfg, "gc_interval_seconds") <= 0 {
 		cfg["gc_interval_seconds"] = defaultWFGCIntervalSeconds
 	}
-	if stringValueFromMap(cfg, "tenant_id") == "" && s.cfg.TenantID != "" {
-		cfg["tenant_id"] = s.cfg.TenantID
+	effectiveTenantID := tenantID
+	if effectiveTenantID == "" {
+		effectiveTenantID = s.cfg.TenantID
+	}
+	if stringValueFromMap(cfg, "tenant_id") == "" && effectiveTenantID != "" {
+		cfg["tenant_id"] = effectiveTenantID
 	}
 	return cfg
 }

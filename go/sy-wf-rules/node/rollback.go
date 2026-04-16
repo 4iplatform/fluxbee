@@ -9,6 +9,7 @@ import (
 type RollbackRequest struct {
 	WorkflowName string `json:"workflow_name"`
 	AutoSpawn    bool   `json:"auto_spawn,omitempty"`
+	TenantID     string `json:"tenant_id,omitempty"`
 }
 
 type RollbackResult struct {
