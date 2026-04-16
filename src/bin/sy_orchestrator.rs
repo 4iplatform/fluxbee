@@ -117,6 +117,7 @@ const CORE_SYNC_RESTART_ORDER: &[&str] = &[
     "sy-cognition",
     "sy-policy",
     "sy-timer",
+    "sy-wf-rules",
     "sy-frontdesk-gov",
     "sy-orchestrator",
 ];
@@ -684,12 +685,13 @@ async fn bootstrap_local(
             "sy-cognition",
             "sy-policy",
             "sy-timer",
+            "sy-wf-rules",
             "sy-frontdesk-gov",
         ]);
         services
     } else {
         let mut services = LEGACY_ALIGNED_SERVICE_UNITS.to_vec();
-        services.extend(["sy-cognition", "sy-policy", "sy-timer"]);
+        services.extend(["sy-cognition", "sy-policy", "sy-timer", "sy-wf-rules"]);
         services
     };
     if identity_available() {
@@ -1192,6 +1194,7 @@ async fn shutdown_sequence(state: &OrchestratorState) {
 
     let mut shutdown_services = vec![
         "sy-frontdesk-gov",
+        "sy-wf-rules",
         "sy-timer",
         "sy-policy",
         "sy-cognition",
@@ -7096,7 +7099,7 @@ fn get_hive(_state_dir: &Path, hive_id: &str) -> Result<serde_json::Value, Orche
 }
 
 fn remove_hive_cleanup_script() -> &'static str {
-    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-cognition sy-policy sy-timer sy-orchestrator sy-admin sy-architect sy-storage sy-frontdesk-gov fluxbee-syncthing; do \
+    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-cognition sy-policy sy-timer sy-wf-rules sy-orchestrator sy-admin sy-architect sy-storage sy-frontdesk-gov fluxbee-syncthing; do \
 systemctl stop --no-block \"$s\" >/dev/null 2>&1 || true; \
 systemctl disable \"$s\" >/dev/null 2>&1 || true; \
 systemctl kill -s KILL \"$s\" >/dev/null 2>&1 || true; \
@@ -13944,6 +13947,7 @@ async fn add_hive_flow(
     let has_cognition_source = core_manifest.components.contains_key("sy-cognition");
     let has_policy_source = core_manifest.components.contains_key("sy-policy");
     let has_timer_source = core_manifest.components.contains_key("sy-timer");
+    let has_wf_rules_source = core_manifest.components.contains_key("sy-wf-rules");
 
     let core_deploy_started_at = now_epoch_ms();
     let core_deploy_started = Instant::now();
@@ -14130,6 +14134,9 @@ async fn add_hive_flow(
     }
     if has_timer_source {
         worker_units.push(("sy-timer", "/usr/bin/sy-timer"));
+    }
+    if has_wf_rules_source {
+        worker_units.push(("sy-wf-rules", "/usr/bin/sy-wf-rules"));
     }
 
     for (name, exec_path) in &worker_units {
