@@ -66,8 +66,6 @@ struct AdminContext {
 
 struct AdminRouterClient {
     sender: RwLock<NodeSender>,
-    node_config: NodeConfig,
-    reconnect_delay: Duration,
     pending_admin: Mutex<HashMap<String, oneshot::Sender<Message>>>,
     system_tx: broadcast::Sender<Message>,
     query_tx: broadcast::Sender<Message>,
@@ -75,14 +73,12 @@ struct AdminRouterClient {
 }
 
 impl AdminRouterClient {
-    fn new(sender: NodeSender, node_config: NodeConfig, reconnect_delay: Duration) -> Self {
+    fn new(sender: NodeSender) -> Self {
         let (system_tx, _) = broadcast::channel(256);
         let (query_tx, _) = broadcast::channel(256);
         let (internal_admin_tx, _) = broadcast::channel(256);
         Self {
             sender: RwLock::new(sender),
-            node_config,
-            reconnect_delay,
             pending_admin: Mutex::new(HashMap::new()),
             system_tx,
             query_tx,
@@ -95,7 +91,7 @@ impl AdminRouterClient {
         delay: Duration,
     ) -> Result<Arc<Self>, fluxbee_sdk::NodeError> {
         let (sender, receiver) = Self::connect_once_with_retry(&config, delay).await?;
-        let client = Arc::new(Self::new(sender, config, delay));
+        let client = Arc::new(Self::new(sender));
         client.start(receiver);
         Ok(client)
     }
@@ -122,29 +118,18 @@ impl AdminRouterClient {
         });
     }
 
-    async fn recv_loop(self: Arc<Self>, mut receiver: NodeReceiver) {
+    async fn recv_loop(self: Arc<Self>, receiver: NodeReceiver) {
+        let mut receiver = receiver;
         loop {
             match receiver.recv().await {
                 Ok(msg) => self.dispatch(msg).await,
                 Err(err) => {
-                    tracing::warn!("router recv error: {err}");
+                    tracing::warn!(error = %err, "router connection interrupted; reconnect is handled internally");
                     self.drain_pending_waiters().await;
-                    let (new_sender, new_receiver) = match Self::connect_once_with_retry(
-                        &self.node_config,
-                        self.reconnect_delay,
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(reconnect_err) => {
-                            tracing::warn!("router reconnect failed: {reconnect_err}");
-                            continue;
-                        }
-                    };
-                    let node_name = new_sender.full_name().to_string();
-                    *self.sender.write().await = new_sender;
-                    receiver = new_receiver;
-                    tracing::info!(node_name = %node_name, "sy.admin reconnected to router");
+                    // The SDK's connection_manager_loop reconnects transparently and resumes
+                    // sending to the same NodeReceiver channel. Creating a second connection
+                    // here with the same persistent UUID would register a competing node that
+                    // steals messages but has no dispatch loop, causing ADMIN_COMMAND timeouts.
                 }
             }
         }
