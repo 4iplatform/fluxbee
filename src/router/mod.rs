@@ -809,12 +809,16 @@ async fn handle_node(
     }
 
     {
-        let mut shm = shm.lock().await;
-        let _ = shm.unregister_node(node_uuid);
-    }
-    {
         let mut nodes = nodes.lock().await;
-        nodes.remove(&node_uuid);
+        if let Some(handle) = nodes.get(&node_uuid) {
+            if handle.connected_at == connected_at {
+                nodes.remove(&node_uuid);
+                let mut shm = shm.lock().await;
+                let _ = shm.unregister_node(node_uuid);
+            } else {
+                tracing::info!(node = %node_uuid, "skipping stale cleanup; node already reconnected");
+            }
+        }
     }
     rebuild_fib(&fib, &nodes, &peer_nodes, &static_routes, &lsa_snapshot).await;
     if is_gateway {
