@@ -3845,6 +3845,8 @@ fn build_admin_action_doc(spec: &InternalActionSpec) -> serde_json::Value {
         "confirmation_required": admin_action_requires_confirmation(spec.action),
         "summary": admin_action_summary(spec.action),
         "path_patterns": path_patterns,
+        "path_patterns_are_templates": true,
+        "execution_preference": "example_scmd",
         "request_contract": admin_action_request_contract(spec.action),
     })
 }
@@ -4070,6 +4072,8 @@ fn admin_action_request_contract(action: &str) -> serde_json::Value {
         "transport": "http_via_sy_admin",
         "method": admin_action_primary_method(action),
         "path_patterns": path_patterns,
+        "path_patterns_are_templates": true,
+        "execution_preference": "example_scmd",
         "path_params": admin_action_path_params(action),
         "body": {
             "kind": if has_body { "json_object" } else { "none" },
@@ -6986,6 +6990,8 @@ mod tests {
         assert_eq!(doc["canonical_action"], serde_json::Value::Null);
         assert_eq!(doc["read_only"], json!(false));
         assert_eq!(doc["requires_target"], json!(false));
+        assert_eq!(doc["path_patterns_are_templates"], json!(true));
+        assert_eq!(doc["execution_preference"], json!("example_scmd"));
     }
 
     #[test]
@@ -7049,6 +7055,8 @@ mod tests {
             contract["path_patterns"],
             json!(["GET /hives/{hive}/wf-rules/status"])
         );
+        assert_eq!(contract["path_patterns_are_templates"], json!(true));
+        assert_eq!(contract["execution_preference"], json!("example_scmd"));
         assert_eq!(
             contract["body"]["required_fields"],
             json!([
