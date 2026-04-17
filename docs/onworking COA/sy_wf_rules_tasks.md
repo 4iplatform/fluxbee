@@ -689,7 +689,8 @@ Status: closed.
 
 ### WFRULES-OPEN-5 — TEST-12: E2E Admin endpoint forwarding tests
 
-- [ ] Integration test: each Admin HTTP endpoint (`/admin/wf-rules/...`) correctly forwards to `SY.wf-rules` via L2 and maps the response envelope
+- [x] Script created: `scripts/wf_rules_admin_forwarding_e2e.sh`
+- [ ] Live run on server: each Admin HTTP endpoint (`/admin/wf-rules/...`) correctly forwards to `SY.wf-rules` via L2 and maps the response envelope
 
 ---
 

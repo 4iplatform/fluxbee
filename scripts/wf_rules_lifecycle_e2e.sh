@@ -27,6 +27,7 @@ SKIP_PUBLISH_WF_ENGINE="${SKIP_PUBLISH_WF_ENGINE:-0}"
 
 PASS=0
 FAIL=0
+DELETED_IN_MAIN_FLOW=0
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -236,6 +237,9 @@ EOF
 # ── cleanup on exit ────────────────────────────────────────────────────────
 
 cleanup() {
+  if [[ "$DELETED_IN_MAIN_FLOW" == "1" ]]; then
+    return
+  fi
   echo
   echo "── cleanup: deleting $WF_NAME (force=true) ──"
   resp="$(wf_post "/delete" "{\"workflow_name\":\"$WF_NAME\",\"force\":true}" 2>/dev/null || true)"
@@ -449,6 +453,7 @@ deleted="$(json_get "$resp" "payload.deleted")"
 
 assert_eq "status"  "$delete_status" "ok"
 assert_eq "deleted" "$deleted"       "true"
+DELETED_IN_MAIN_FLOW=1
 
 # verify it's gone
 resp="$(wf_get "?workflow_name=$WF_NAME")"
