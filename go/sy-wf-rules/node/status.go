@@ -13,6 +13,8 @@ type wfNodeSnapshot struct {
 	ConfigExists    bool
 	RuntimeVersion  string
 	Running         bool
+	StatusReachable bool
+	HealthState     string
 	ActiveInstances *int
 	Timeout         bool
 }
@@ -28,14 +30,16 @@ type WorkflowStatusView struct {
 }
 
 type ListedWorkflowStatus struct {
-	WorkflowName     string
-	CurrentVersion   *uint64
-	CurrentHash      string
-	PublishedVersion *string
-	WFNodeRunning    bool
-	ActiveInstances  *int
-	WFNodeTimeout    bool
-	DeployedVersion  string
+	WorkflowName      string
+	CurrentVersion    *uint64
+	CurrentHash       string
+	PublishedVersion  *string
+	WFNodeRunning     bool
+	WFNodeReachable   bool
+	WFNodeHealthState string
+	ActiveInstances   *int
+	WFNodeTimeout     bool
+	DeployedVersion   string
 }
 
 func (s *Service) GetWorkflowStatus(req GetStatusRequest) (*WorkflowStatusView, error) {
@@ -89,6 +93,8 @@ func (s *Service) ListWorkflowStatuses() ([]ListedWorkflowStatus, error) {
 			return nil, err
 		}
 		item.WFNodeRunning = snapshot.Running
+		item.WFNodeReachable = snapshot.StatusReachable
+		item.WFNodeHealthState = snapshot.HealthState
 		item.ActiveInstances = snapshot.ActiveInstances
 		item.WFNodeTimeout = snapshot.Timeout
 		item.DeployedVersion = snapshot.RuntimeVersion
@@ -119,6 +125,17 @@ func (s *Service) inspectWFNode(rpcCtx context.Context, workflowName string, que
 	if !queryInstances || s.wfNodes == nil {
 		return snapshot, nil
 	}
+	statusProbe, err := s.wfNodes.GetNodeStatus(rpcCtx, nodeName)
+	if err != nil {
+		if isRPCTimeout(rpcCtx, err) {
+			snapshot.Timeout = true
+			return snapshot, nil
+		}
+		return snapshot, nil
+	}
+	snapshot.Running = true
+	snapshot.StatusReachable = true
+	snapshot.HealthState = statusProbe.HealthState
 	count, err := s.wfNodes.CountRunningInstances(rpcCtx, nodeName)
 	if err != nil {
 		if rpcCtx.Err() != nil {
@@ -128,7 +145,6 @@ func (s *Service) inspectWFNode(rpcCtx context.Context, workflowName string, que
 		snapshot.Timeout = true
 		return snapshot, nil
 	}
-	snapshot.Running = true
 	snapshot.ActiveInstances = intPtr(count)
 	return snapshot, nil
 }

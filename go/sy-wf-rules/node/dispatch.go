@@ -226,14 +226,16 @@ func (s *Service) handleQuery(msg fluxbeesdk.Message) {
 		items := make([]map[string]any, 0, len(workflows))
 		for _, workflow := range workflows {
 			items = append(items, map[string]any{
-				"workflow_name":     workflow.WorkflowName,
-				"current_version":   formatOptionalUint64(workflow.CurrentVersion),
-				"current_hash":      workflow.CurrentHash,
-				"published_version": workflow.PublishedVersion,
-				"deployed_version":  workflow.DeployedVersion,
-				"wf_node_running":   workflow.WFNodeRunning,
-				"active_instances":  formatOptionalInt(workflow.ActiveInstances),
-				"wf_node_timeout":   workflow.WFNodeTimeout,
+				"workflow_name":        workflow.WorkflowName,
+				"current_version":      formatOptionalUint64(workflow.CurrentVersion),
+				"current_hash":         workflow.CurrentHash,
+				"published_version":    workflow.PublishedVersion,
+				"deployed_version":     workflow.DeployedVersion,
+				"wf_node_running":      workflow.WFNodeRunning,
+				"wf_node_reachable":    workflow.WFNodeReachable,
+				"wf_node_health_state": workflow.WFNodeHealthState,
+				"active_instances":     formatOptionalInt(workflow.ActiveInstances),
+				"wf_node_timeout":      workflow.WFNodeTimeout,
 			})
 		}
 		s.sendQueryResponse(msg, action, map[string]any{
@@ -268,11 +270,13 @@ func (s *Service) handleQuery(msg fluxbeesdk.Message) {
 			"last_error":        statusView.LastError,
 			"published_version": statusView.PublishedVersion,
 			"wf_node": map[string]any{
-				"node_name":        statusView.WFNode.NodeName,
-				"running":          statusView.WFNode.Running,
-				"active_instances": formatOptionalInt(statusView.WFNode.ActiveInstances),
-				"wf_node_timeout":  statusView.WFNode.Timeout,
-				"deployed_version": statusView.WFNode.RuntimeVersion,
+				"node_name":         statusView.WFNode.NodeName,
+				"running":           statusView.WFNode.Running,
+				"status_reachable":  statusView.WFNode.StatusReachable,
+				"health_state":      statusView.WFNode.HealthState,
+				"active_instances":  formatOptionalInt(statusView.WFNode.ActiveInstances),
+				"wf_node_timeout":   statusView.WFNode.Timeout,
+				"deployed_version":  statusView.WFNode.RuntimeVersion,
 			},
 		}
 		s.sendQueryResponse(msg, action, payload)

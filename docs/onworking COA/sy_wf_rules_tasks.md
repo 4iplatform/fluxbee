@@ -653,7 +653,7 @@ go/sy-wf-rules/
 
 These are the only items still meaningfully open after implementation and real-server validation.
 
-Note: `WFRULES-OPEN-1` and `WFRULES-OPEN-4` are kept below only as closed audit history. The actual remaining pending items are `WFRULES-OPEN-2`, `WFRULES-OPEN-3`, and `WFRULES-OPEN-5`.
+Note: `WFRULES-OPEN-1`, `WFRULES-OPEN-4`, and `WFRULES-OPEN-5` are kept below only as closed audit history. The actual remaining pending item is `WFRULES-OPEN-3`.
 
 ### WFRULES-OPEN-1 — ORCH-11: Orchestrator integration tests
 
@@ -669,9 +669,12 @@ Status: closed.
 
 ### WFRULES-OPEN-2 — GetNodeStatus for process liveness
 
-- [ ] Optional observability improvement only: add direct `NODE_STATUS_GET` probing of the WF node L2 name with 2s timeout
-- [ ] Wire into `GetWorkflowStatus` and `ListWorkflowStatuses` if we later want to distinguish "process alive but idle" from "node unreachable"
-- [ ] Keep out of the critical path unless production needs it; current status/delete behavior is already acceptable on the current infra
+- [x] Add direct `NODE_STATUS_GET` probing of the WF node L2 name with 2s timeout
+- [x] Wire into `GetWorkflowStatus` so `running` reflects direct node reachability instead of only `WF_LIST_INSTANCES`
+- [x] Keep `active_instances` sourced from `WF_LIST_INSTANCES` and `deployed_version` sourced from managed config
+- [x] Expose additive observability fields in `wf_node`: `status_reachable` and `health_state`
+
+Status: closed.
 
 ### WFRULES-OPEN-3 — Shared receiver message drop (architectural note)
 
@@ -690,7 +693,9 @@ Status: closed.
 ### WFRULES-OPEN-5 — TEST-12: E2E Admin endpoint forwarding tests
 
 - [x] Script created: `scripts/wf_rules_admin_forwarding_e2e.sh`
-- [ ] Live run on server: each Admin HTTP endpoint (`/admin/wf-rules/...`) correctly forwards to `SY.wf-rules` via L2 and maps the response envelope
+- [x] Live run on server: each Admin HTTP endpoint (`/admin/wf-rules/...`) correctly forwards to `SY.wf-rules` via L2 and maps the response envelope
+
+Status: closed.
 
 ---
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 	"github.com/google/uuid"
@@ -12,7 +13,12 @@ import (
 const wfNodeRPCTimeout = 2 * orchestratorRPCTimeout / 3
 
 type wfNodeClient interface {
+	GetNodeStatus(ctx context.Context, nodeName string) (wfNodeStatusProbe, error)
 	CountRunningInstances(ctx context.Context, nodeName string) (int, error)
+}
+
+type wfNodeStatusProbe struct {
+	HealthState string
 }
 
 type l2WFNodeClient struct {
@@ -25,6 +31,57 @@ func newWFNodeClient(snd sender, rcv receiver) wfNodeClient {
 		return nil
 	}
 	return &l2WFNodeClient{sender: snd, receiver: rcv}
+}
+
+func (c *l2WFNodeClient) GetNodeStatus(rpcCtx context.Context, nodeName string) (wfNodeStatusProbe, error) {
+	if c == nil || c.sender == nil || c.receiver == nil {
+		return wfNodeStatusProbe{}, fmt.Errorf("wf node client unavailable")
+	}
+	traceID := uuid.NewString()
+	request, err := fluxbeesdk.BuildSystemRequest(
+		c.sender.UUID(),
+		nodeName,
+		fluxbeesdk.MSGNodeStatusGet,
+		map[string]any{
+			"node_name": nodeName,
+		},
+		traceID,
+		fluxbeesdk.SystemEnvelopeOptions{},
+	)
+	if err != nil {
+		return wfNodeStatusProbe{}, err
+	}
+	if err := c.sender.Send(request); err != nil {
+		return wfNodeStatusProbe{}, err
+	}
+	for {
+		msg, err := c.receiver.Recv(rpcCtx)
+		if err != nil {
+			return wfNodeStatusProbe{}, err
+		}
+		if msg.Routing.TraceID != traceID {
+			continue
+		}
+		if msg.Meta.MsgType != fluxbeesdk.SYSTEMKind || stringValue(msg.Meta.Msg) != fluxbeesdk.MSGNodeStatusGetResponse {
+			continue
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(msg.Payload, &decoded); err != nil {
+			return wfNodeStatusProbe{}, err
+		}
+		status := strings.TrimSpace(stringValueFromMap(decoded, "status"))
+		if status != "" && status != "ok" {
+			code := stringValueFromMap(decoded, "error_code")
+			detail := stringValueFromMap(decoded, "error_detail")
+			if code == "" && detail == "" {
+				return wfNodeStatusProbe{}, fmt.Errorf("wf node returned unsuccessful node status response")
+			}
+			return wfNodeStatusProbe{}, WfRulesError{Code: code, Detail: detail}
+		}
+		return wfNodeStatusProbe{
+			HealthState: strings.TrimSpace(stringValueFromMap(decoded, "health_state")),
+		}, nil
+	}
 }
 
 func (c *l2WFNodeClient) CountRunningInstances(rpcCtx context.Context, nodeName string) (int, error) {
