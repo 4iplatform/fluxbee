@@ -5317,4 +5317,53 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn frontdesk_structured_response_payload_omits_error_code_on_success() {
+        let payload = FrontdeskResultPayload {
+            payload_type: FRONTDESK_RESULT_PAYLOAD_TYPE.to_string(),
+            schema_version: 1,
+            status: "ok".to_string(),
+            result_code: "REGISTERED".to_string(),
+            human_message: "Registro completado correctamente.".to_string(),
+            missing_fields: Vec::new(),
+            error_code: None,
+            error_detail: None,
+            ilk_id: Some("ilk:test".to_string()),
+            tenant_id: Some("tnt:test".to_string()),
+            registration_status: Some("complete".to_string()),
+        };
+
+        let structured = frontdesk_structured_response_payload(&payload);
+        assert_eq!(structured.get("success").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            structured.get("human_message").and_then(Value::as_str),
+            Some("Registro completado correctamente.")
+        );
+        assert!(structured.get("error_code").is_none());
+    }
+
+    #[test]
+    fn frontdesk_structured_response_payload_maps_error_code_on_failure() {
+        let payload = FrontdeskResultPayload {
+            payload_type: FRONTDESK_RESULT_PAYLOAD_TYPE.to_string(),
+            schema_version: 1,
+            status: "error".to_string(),
+            result_code: "REGISTER_FAILED".to_string(),
+            human_message: "No pude completar el registro.".to_string(),
+            missing_fields: Vec::new(),
+            error_code: Some("register_failed".to_string()),
+            error_detail: None,
+            ilk_id: Some("ilk:test".to_string()),
+            tenant_id: Some("tnt:test".to_string()),
+            registration_status: Some("temporary".to_string()),
+        };
+
+        let structured = frontdesk_structured_response_payload(&payload);
+        assert_eq!(structured.get("success").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            structured.get("error_code").and_then(Value::as_str),
+            Some("register_failed")
+        );
+    }
 }

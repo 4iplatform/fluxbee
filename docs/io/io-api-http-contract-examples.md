@@ -228,17 +228,40 @@ Si `IO.api` detecta que el sujeto de `explicit_subject by_data` no esta registra
 
 Matriz resumida:
 
-- `frontdesk_result.status = "ok"` -> `202 Accepted` despues de continuar el mensaje original al `dst_final`
-- `frontdesk_result.status = "needs_input"` -> `422 Unprocessable Entity`
-- `frontdesk_result.status = "error"` y `result_code = "INVALID_REQUEST"` -> `422 Unprocessable Entity`
-- `frontdesk_result.status = "error"` y `result_code = "IDENTITY_UNAVAILABLE"` -> `503 Service Unavailable`
-- `frontdesk_result.status = "error"` y `result_code = "REGISTER_FAILED"` -> `502 Bad Gateway`
+- `success = true` -> `202 Accepted` despues de continuar el mensaje original al `dst_final`
+- `success = false` y `error_code = "missing_required_fields"` -> `422 Unprocessable Entity`
+- `success = false` y `error_code = "invalid_request"` -> `422 Unprocessable Entity`
+- `success = false` y `error_code = "identity_unavailable"` -> `503 Service Unavailable`
+- `success = false` y `error_code = "register_failed"` -> `502 Bad Gateway`
 - timeout esperando reply de frontdesk -> `504 Gateway Timeout`
 - payload de reply invalido -> `502 Bad Gateway`
 - fallo de transporte hacia router/frontdesk -> `503 Service Unavailable`
 - cierre inesperado del waiter de reply -> `503 Service Unavailable`
 
-Caso `needs_input`:
+Contract hop-by-hop usado por `IO.api` en este camino:
+
+```json
+{
+  "kind": "json_object_v1",
+  "required": ["success", "human_message"],
+  "properties": {
+    "success": { "type": "boolean" },
+    "human_message": { "type": "string" },
+    "error_code": {
+      "type": "string",
+      "enum": [
+        "missing_required_fields",
+        "invalid_request",
+        "identity_unavailable",
+        "register_failed",
+        "unknown"
+      ]
+    }
+  }
+}
+```
+
+Caso `missing_required_fields`:
 
 ```http
 422 Unprocessable Entity
@@ -246,17 +269,9 @@ Caso `needs_input`:
 
 ```json
 {
-  "type": "frontdesk_result",
-  "schema_version": 1,
-  "status": "needs_input",
-  "result_code": "MISSING_REQUIRED_FIELDS",
+  "success": false,
   "human_message": "Necesito tu email para continuar.",
-  "missing_fields": ["email"],
-  "error_code": null,
-  "error_detail": null,
-  "ilk_id": "ilk:123",
-  "tenant_id": "tnt:acme",
-  "registration_status": "temporary"
+  "error_code": "missing_required_fields"
 }
 ```
 
@@ -277,7 +292,7 @@ Caso `ok`:
 }
 ```
 
-En este caso, `IO.api` ya recibio `frontdesk_result.status = "ok"` internamente y luego continuo el mensaje original al `dst_final`.
+En este caso, `IO.api` ya recibio `success = true` internamente y luego continuo el mensaje original al `dst_final`.
 
 Caso `error` por request invalido de frontdesk:
 
@@ -287,17 +302,9 @@ Caso `error` por request invalido de frontdesk:
 
 ```json
 {
-  "type": "frontdesk_result",
-  "schema_version": 1,
-  "status": "error",
-  "result_code": "INVALID_REQUEST",
+  "success": false,
   "human_message": "No pude procesar el registro con los datos recibidos.",
-  "missing_fields": [],
-  "error_code": "invalid_request",
-  "error_detail": "display_name is required",
-  "ilk_id": null,
-  "tenant_id": "tnt:acme",
-  "registration_status": "not_started"
+  "error_code": "invalid_request"
 }
 ```
 
@@ -309,17 +316,9 @@ Caso `error` por identity unavailable reportado por frontdesk:
 
 ```json
 {
-  "type": "frontdesk_result",
-  "schema_version": 1,
-  "status": "error",
-  "result_code": "IDENTITY_UNAVAILABLE",
+  "success": false,
   "human_message": "No puedo completar el registro en este momento.",
-  "missing_fields": [],
-  "error_code": "identity_unavailable",
-  "error_detail": "SY.identity did not respond",
-  "ilk_id": null,
-  "tenant_id": "tnt:acme",
-  "registration_status": "temporary"
+  "error_code": "identity_unavailable"
 }
 ```
 
@@ -331,21 +330,13 @@ Caso `error` por fallo de registro:
 
 ```json
 {
-  "type": "frontdesk_result",
-  "schema_version": 1,
-  "status": "error",
-  "result_code": "REGISTER_FAILED",
+  "success": false,
   "human_message": "No pude completar el alta.",
-  "missing_fields": [],
-  "error_code": "register_failed",
-  "error_detail": "ILK_REGISTER returned failure",
-  "ilk_id": "ilk:123",
-  "tenant_id": "tnt:acme",
-  "registration_status": "temporary"
+  "error_code": "register_failed"
 }
 ```
 
-Caso timeout esperando `frontdesk_result`:
+Caso timeout esperando respuesta estructurada de frontdesk:
 
 ```http
 504 Gateway Timeout
@@ -369,7 +360,7 @@ Caso payload invalido en la reply de frontdesk:
 {
   "status": "error",
   "error_code": "invalid_frontdesk_response",
-  "error_message": "Frontdesk reply did not match frontdesk_result contract"
+  "error_message": "Frontdesk did not return a valid structured response payload"
 }
 ```
 
@@ -770,9 +761,10 @@ Comportamiento esperado:
 1. `IO.api` resuelve/provisiona `src_ilk`
 2. si el sujeto sigue `temporary`, construye `frontdesk_handoff`
 3. envia el handoff a `SY.frontdesk.gov`
-4. espera `frontdesk_result`
-5. si `frontdesk_result.status = "ok"`, continua luego el mensaje original a `AI.chat@motherbee` y responde `202 Accepted`
-6. si `frontdesk_result.status = "needs_input"` o `error`, responde con ese payload estructurado
+4. adjunta `meta.context.response_envelope`
+5. espera respuesta estructurada compatible
+6. si `success = true`, continua luego el mensaje original a `AI.chat@motherbee` y responde `202 Accepted`
+7. si `success = false`, responde con ese payload estructurado
 
 ## 6.9 Camino tecnico con `dst_node = SY.frontdesk.gov`
 
@@ -780,8 +772,9 @@ Si el caller fija explicitamente `options.routing.dst_node = "SY.frontdesk.gov@.
 
 1. construye `frontdesk_handoff`
 2. envia el handoff a `SY.frontdesk.gov`
-3. espera `frontdesk_result`
-4. responde HTTP con ese payload estructurado
+3. agrega `meta.context.response_envelope`
+4. espera respuesta estructurada compatible
+5. responde HTTP con ese payload estructurado
 
 Ese camino sirve para debug y validacion puntual, no como flujo canonico de producto.
 

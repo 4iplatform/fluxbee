@@ -82,58 +82,58 @@ La secuencia propuesta busca:
   - input parts / multimodal
   - output constraint
 - [x] RER-R2.2 Definir una estructura interna equivalente a `ModelInputData` / request preparado por turno.
-- [ ] RER-R2.3 Identificar el punto exacto del runtime donde hoy se construye el request al modelo.
-- [ ] RER-R2.4 Introducir un hook interno equivalente a `call_model_input_filter`.
-- [ ] RER-R2.5 Garantizar que ese hook pueda leer metadata del mensaje Fluxbee antes del model call.
-- [ ] RER-R2.6 Garantizar que la capacidad nueva no rompa el camino actual sin envelope.
+- [x] RER-R2.3 Identificar el punto exacto del runtime donde hoy se construye el request al modelo.
+- [x] RER-R2.4 Introducir un hook interno equivalente a `call_model_input_filter`.
+- [x] RER-R2.5 Garantizar que ese hook pueda leer metadata del mensaje Fluxbee antes del model call.
+- [x] RER-R2.6 Garantizar que la capacidad nueva no rompa el camino actual sin envelope.
 
 ---
 
 ## Fase 3 - Structured outputs en el port Rust
 
-- [ ] RER-R3.0 Relevar en `agents-sdk-python` la implementación de structured outputs / output schema relevante para este caso antes de diseñar el port Rust.
-- [ ] RER-R3.1 Extender el request del LLM para soportar output schema / response format.
-- [ ] RER-R3.2 Agregar una abstracción de schema estructurado reutilizable dentro de `fluxbee_ai_sdk`.
-- [ ] RER-R3.3 Implementar la traducción `response_envelope -> output schema` para `kind = json_object_v1`.
-- [ ] RER-R3.3.b Definir si `final_response_contract` reutiliza exactamente el mismo shape/validator que `response_envelope`.
-- [ ] RER-R3.4 Integrar esa traducción con `OpenAiResponsesClient`.
-- [ ] RER-R3.5 Mantener un fallback limpio cuando el provider/path no soporte schema estructurado.
-- [ ] RER-R3.6 Validar la respuesta estructurada antes de devolverla al nodo consumidor.
-- [ ] RER-R3.7 Definir el error canónico cuando el modelo devuelve JSON inválido o incompleto.
+- [x] RER-R3.0 Relevar en `agents-sdk-python` la implementación de structured outputs / output schema relevante para este caso antes de diseñar el port Rust.
+- [x] RER-R3.1 Extender el request del LLM para soportar output schema / response format.
+- [x] RER-R3.2 Agregar una abstracción de schema estructurado reutilizable dentro de `fluxbee_ai_sdk`.
+- [x] RER-R3.3 Implementar la traducción `response_envelope -> output schema` para `kind = json_object_v1`.
+- [x] RER-R3.3.b Definir si `final_response_contract` reutiliza exactamente el mismo shape/validator que `response_envelope`.
+- [x] RER-R3.4 Integrar esa traducción con `OpenAiResponsesClient`.
+- [x] RER-R3.5 Mantener un fallback limpio cuando el provider/path no soporte schema estructurado.
+- [x] RER-R3.6 Validar la respuesta estructurada antes de devolverla al nodo consumidor.
+- [x] RER-R3.7 Definir el error canónico cuando el modelo devuelve JSON inválido o incompleto.
 
 ---
 
 ## Fase 4 - Lectura de envelope desde mensajes Fluxbee
 
-- [ ] RER-R4.1 Implementar extracción segura de `meta.context.response_envelope` desde `Message`.
-- [ ] RER-R4.1.b Implementar extracción segura de `meta.context.final_response_contract` desde `Message`.
-- [ ] RER-R4.2 Definir helper compartido para resolver envelope desde `meta.context`.
-- [ ] RER-R4.3 Asegurar que replies del AI SDK no destruyan metadata necesaria para el consumer si debe conservarse.
+- [x] RER-R4.1 Implementar extracción segura de `meta.context.response_envelope` desde `Message`.
+- [x] RER-R4.1.b Implementar extracción segura de `meta.context.final_response_contract` desde `Message`.
+- [x] RER-R4.2 Definir helper compartido para resolver envelope desde `meta.context`.
+- [x] RER-R4.3 Asegurar que replies del AI SDK no destruyan metadata necesaria para el consumer si debe conservarse.
 - [ ] RER-R4.4 Definir explícitamente qué parte del `meta.context.io` vuelve en la respuesta y qué parte no.
 - [ ] RER-R4.5 Evitar que `response_envelope` se mezcle con `reply_target` u otra metadata operacional no relacionada.
-- [ ] RER-R4.6 Definir y aplicar regla de no propagación automática de `response_envelope`.
-- [ ] RER-R4.7 Definir cuándo `final_response_contract` se preserva localmente y cuándo puede reenviarse como contexto pasivo.
+- [x] RER-R4.6 Definir y aplicar regla de no propagación automática de `response_envelope`.
+- [x] RER-R4.7 Definir cuándo `final_response_contract` se preserva localmente y cuándo puede reenviarse como contexto pasivo.
 
 ---
 
 ## Fase 5 - Fallback textual controlado
 
-- [ ] RER-R5.1 Definir el formato exacto de la instrucción dinámica que se inyecta cuando no hay structured outputs reales.
-- [ ] RER-R5.2 Garantizar que esa instrucción se agregue como instrucción de sistema/runtime, no dentro del user text.
-- [ ] RER-R5.3 Mantener esa instrucción breve, estable y derivada del envelope.
-- [ ] RER-R5.4 Definir criterios para decidir cuándo usar schema real vs fallback textual.
-- [ ] RER-R5.5 Agregar trazabilidad/logs para saber qué camino usó cada request.
+- [x] RER-R5.1 Definir el formato exacto de la instrucción dinámica que se inyecta cuando no hay structured outputs reales.
+- [x] RER-R5.2 Garantizar que esa instrucción se agregue como instrucción de sistema/runtime, no dentro del user text.
+- [x] RER-R5.3 Mantener esa instrucción breve, estable y derivada del envelope.
+- [x] RER-R5.4 Definir criterios para decidir cuándo usar schema real vs fallback textual.
+- [x] RER-R5.5 Agregar trazabilidad/logs para saber qué camino usó cada request.
 
 ---
 
 ## Fase 6 - Helpers en `io-common`
 
-- [ ] RER-R6.1 Agregar helper para setear `meta.context.response_envelope`.
-- [ ] RER-R6.1.b Agregar helper para setear `meta.context.final_response_contract`.
-- [ ] RER-R6.2 Agregar helper para leer/parsing del envelope desde mensajes recibidos.
-- [ ] RER-R6.3 Agregar validación mínima del shape del envelope del lado IO.
-- [ ] RER-R6.4 Agregar helper para parsear respuesta JSON estructurada esperada por el consumer.
-- [ ] RER-R6.5 Definir errores canónicos de `io-common` para:
+- [x] RER-R6.1 Agregar helper para setear `meta.context.response_envelope`.
+- [x] RER-R6.1.b Agregar helper para setear `meta.context.final_response_contract`.
+- [x] RER-R6.2 Agregar helper para leer/parsing del envelope desde mensajes recibidos.
+- [x] RER-R6.3 Agregar validación mínima del shape del envelope del lado IO.
+- [x] RER-R6.4 Agregar helper para parsear respuesta JSON estructurada esperada por el consumer.
+- [x] RER-R6.5 Definir errores canónicos de `io-common` para:
   - envelope inválido
   - respuesta inválida
   - respuesta incompatible con el envelope esperado
@@ -142,54 +142,87 @@ La secuencia propuesta busca:
 
 ## Fase 7 - Integración en `IO.api`
 
-- [ ] RER-R7.1 Definir en qué path exacto `IO.api` decide que necesita envelope.
-- [ ] RER-R7.2 Construir el envelope para el caso síncrono de regularización de identidad.
-- [ ] RER-R7.3 Adjuntar ese envelope al mensaje hacia el nodo target sin mezclarlo con payload de negocio.
+- [x] RER-R7.1 Definir en qué path exacto `IO.api` decide que necesita envelope.
+- [x] RER-R7.2 Construir el envelope para el caso síncrono de regularización de identidad.
+- [x] RER-R7.3 Adjuntar ese envelope al mensaje hacia el nodo target sin mezclarlo con payload de negocio.
 - [ ] RER-R7.3.b Preservar `final_response_contract` cuando `IO.api` espere una respuesta final recompuesta tras hops intermedios.
-- [ ] RER-R7.4 Esperar la respuesta y parsearla con helpers de `io-common`.
-- [ ] RER-R7.5 Mapear la respuesta estructurada al contrato HTTP de `IO.api`.
-- [ ] RER-R7.6 Mantener el caso v1 con status HTTP acotados, sin expandir todavía la taxonomía fina.
-- [ ] RER-R7.7 Asegurar que `IO.api` no asuma soporte universal del envelope en cualquier nodo target.
+- [x] RER-R7.4 Esperar la respuesta y parsearla con helpers de `io-common`.
+- [x] RER-R7.5 Mapear la respuesta estructurada al contrato HTTP de `IO.api`.
+- [x] RER-R7.6 Mantener el caso v1 con status HTTP acotados, sin expandir todavía la taxonomía fina.
+- [x] RER-R7.7 Asegurar que `IO.api` no asuma soporte universal del envelope en cualquier nodo target.
 
 ---
 
 ## Fase 8 - Primer caso validado con `SY.frontdesk.gov`
 
-- [ ] RER-R8.1 Definir el envelope concreto que `IO.api` le pedirá a frontdesk en el caso síncrono.
-- [ ] RER-R8.2 Ajustar `SY.frontdesk.gov` para que, cuando reciba envelope, produzca respuesta compatible.
-- [ ] RER-R8.3 Mantener texto libre cuando no haya envelope.
-- [ ] RER-R8.4 Asegurar que este cambio no toque todavía `frontdesk_handoff`.
-- [ ] RER-R8.5 Definir qué comportamiento tiene frontdesk si recibe envelope inválido.
-- [ ] RER-R8.6 Definir qué comportamiento tiene frontdesk si no puede cumplir el envelope pedido.
+- [x] RER-R8.1 Definir el envelope concreto que `IO.api` le pedirá a frontdesk en el caso síncrono.
+- [x] RER-R8.2 Ajustar `SY.frontdesk.gov` para que, cuando reciba envelope, produzca respuesta compatible.
+- [x] RER-R8.3 Mantener texto libre cuando no haya envelope.
+- [x] RER-R8.4 Asegurar que este cambio no toque todavía `frontdesk_handoff`.
+- [x] RER-R8.5 Definir qué comportamiento tiene frontdesk si recibe envelope inválido.
+- [x] RER-R8.6 Definir qué comportamiento tiene frontdesk si no puede cumplir el envelope pedido.
 - [ ] RER-R8.7 Definir cómo preserva `final_response_contract` un nodo orquestador que hace delegación antes de responder.
 
 ---
 
 ## Fase 9 - Tests
 
-- [ ] RER-R9.1 Agregar tests unitarios del parser/validator de envelope.
+- [x] RER-R9.1 Agregar tests unitarios del parser/validator de envelope.
 - [ ] RER-R9.2 Agregar tests del hook dinámico de preparación de model input.
-- [ ] RER-R9.3 Agregar tests de traducción envelope -> output schema.
-- [ ] RER-R9.4 Agregar tests del fallback textual sin structured outputs.
-- [ ] RER-R9.5 Agregar tests de integración del `OpenAiResponsesClient` con response format estructurado.
-- [ ] RER-R9.6 Agregar tests de `io-common` para set/get/parse de envelope.
-- [ ] RER-R9.7 Agregar tests de `IO.api` para el caso sync con envelope.
-- [ ] RER-R9.8 Agregar tests de `SY.frontdesk.gov` con:
+- [x] RER-R9.3 Agregar tests de traducción envelope -> output schema.
+- [x] RER-R9.4 Agregar tests del fallback textual sin structured outputs.
+- [x] RER-R9.5 Agregar tests de integración del `OpenAiResponsesClient` con response format estructurado.
+- [x] RER-R9.6 Agregar tests de `io-common` para set/get/parse de envelope.
+- [x] RER-R9.7 Agregar tests de `IO.api` para el caso sync con envelope.
+- [x] RER-R9.8 Agregar tests de `SY.frontdesk.gov` con:
   - envelope presente
   - envelope ausente
   - envelope inválido
-- [ ] RER-R9.9 Agregar una validación E2E mínima `IO.api -> frontdesk -> IO.api`.
+- [x] RER-R9.9 Agregar una validación E2E mínima `IO.api -> frontdesk -> IO.api`.
 
 ---
 
 ## Fase 10 - Documentación y rollout
 
-- [ ] RER-R10.1 Actualizar la spec de runtime AI para reflejar el nuevo modelo interno.
-- [ ] RER-R10.2 Actualizar `io-common` con la nueva metadata `response_envelope`.
-- [ ] RER-R10.3 Actualizar `IO.api` con el nuevo caso sync basado en envelope.
-- [ ] RER-R10.4 Revisar y actualizar la spec formal de `SY.frontdesk.gov` si el cambio de contrato queda cerrado.
-- [ ] RER-R10.5 Documentar explícitamente que la adopción es opt-in por nodo/runtime.
-- [ ] RER-R10.6 Dejar checklist operativo de rollout para nodos migrados.
+- [x] RER-R10.1 Actualizar la spec de runtime AI para reflejar el nuevo modelo interno.
+- [x] RER-R10.2 Actualizar `io-common` con la nueva metadata `response_envelope`.
+- [x] RER-R10.3 Actualizar `IO.api` con el nuevo caso sync basado en envelope.
+- [x] RER-R10.4 Revisar y actualizar la spec formal de `SY.frontdesk.gov` si el cambio de contrato queda cerrado.
+- [x] RER-R10.5 Documentar explícitamente que la adopción es opt-in por nodo/runtime.
+- [x] RER-R10.6 Dejar checklist operativo de rollout para nodos migrados.
+
+---
+
+## Validación E2E realizada
+
+Fecha: 2026-04-17
+
+Caso validado:
+
+- `IO.api.support@motherbee -> SY.frontdesk.gov@motherbee -> IO.api.support@motherbee`
+- request HTTP con `subject.external_user_id` nuevo
+- segundo request HTTP con el mismo `external_user_id`
+
+Resultado observado:
+
+- primer request:
+  - `IO.api` registra `identity lookup miss`
+  - `IO.api` envía request síncrono a `SY.frontdesk.gov`
+  - `SY.frontdesk.gov` ejecuta `ILK_REGISTER` contra `SY.identity`
+  - `IO.api` recibe respuesta estructurada válida
+  - el request HTTP continúa a su `dst_node` final y responde `202 Accepted`
+- segundo request:
+  - `IO.api` registra `identity lookup hit`
+  - `registration_status=complete`
+  - no vuelve a llamar a `SY.frontdesk.gov`
+  - el request HTTP continúa directo al `dst_node` final y responde `202 Accepted`
+
+Conclusión:
+
+- el primer corte quedó validado para el caso real de regularización síncrona de identidad;
+- el envelope se aplicó correctamente en el hop `IO.api -> SY.frontdesk.gov`;
+- la respuesta estructurada volvió válida a `IO.api`;
+- el bypass de frontdesk en requests posteriores con identidad ya regularizada funcionó como se esperaba.
 
 ---
 

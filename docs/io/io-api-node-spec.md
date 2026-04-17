@@ -61,7 +61,8 @@ Por lo tanto:
 - construir un mensaje `text/v1` canonico;
 - pasar por el relay comun;
 - enviar al router por `fluxbee_sdk::NodeSender::send`;
-- consumir `frontdesk_result` de forma sincronica cuando el request necesita regularizacion por frontdesk.
+- adjuntar `meta.context.response_envelope` cuando el hop a frontdesk requiere respuesta estructurada;
+- consumir respuesta estructurada síncrona de frontdesk sobre payload `text` cuando el request necesita regularizacion por frontdesk.
 
 ### 1.2 No-responsabilidades
 
@@ -492,9 +493,9 @@ Se mantiene `202 Accepted` tambien en `explicit_subject`, incluso cuando identit
 Excepcion cerrada de esta version:
 
 - si el sujeto de `explicit_subject by_data` no esta registrado completamente, `IO.api` debe intermediar un `frontdesk_handoff` antes de continuar al `dst_final`;
-- si ese handoff devuelve `needs_input` o `error`, `IO.api` responde con el `frontdesk_result` estructurado;
+- si ese handoff devuelve un resultado estructurado no exitoso, `IO.api` responde con el envelope HTTP de frontdesk;
 - si devuelve `ok`, `IO.api` continua el mensaje original al `dst_final` y responde `202 Accepted`;
-- si el caller fija explicitamente `dst_node = SY.frontdesk.gov`, `IO.api` conserva un camino tecnico/terminal que responde directamente con `frontdesk_result`.
+- si el caller fija explicitamente `dst_node = SY.frontdesk.gov`, `IO.api` conserva un camino tecnico/terminal que responde directamente con ese mismo envelope estructurado.
 
 ### 8.3 Matriz de respuestas HTTP segun regularizacion frontdesk y destino efectivo
 
@@ -517,22 +518,25 @@ Si `IO.api` detecta que el sujeto de `explicit_subject by_data` no esta registra
 
 1. construir `frontdesk_handoff`;
 2. enviarlo a `SY.frontdesk.gov@<hive>`;
-3. esperar `frontdesk_result`;
+3. esperar respuesta estructurada compatible con el envelope enviado;
 4. decidir si continua o no el mensaje original al `dst_final`.
 
 Casos normativos:
 
-- `frontdesk_result.status = "ok"` -> continuar el mensaje original al `dst_final` y responder `202 Accepted`
-- `frontdesk_result.status = "needs_input"` -> `422 Unprocessable Entity`
-- `frontdesk_result.status = "error"` y `result_code = "INVALID_REQUEST"` -> `422 Unprocessable Entity`
-- `frontdesk_result.status = "error"` y `result_code = "IDENTITY_UNAVAILABLE"` -> `503 Service Unavailable`
-- `frontdesk_result.status = "error"` y `result_code = "REGISTER_FAILED"` -> `502 Bad Gateway`
-- `frontdesk_result.status = "error"` con cualquier otro `result_code` -> `502 Bad Gateway`
+- `success = true` -> continuar el mensaje original al `dst_final` y responder `202 Accepted`
+- `success = false` y `error_code = "missing_required_fields"` -> `422 Unprocessable Entity`
+- `success = false` y `error_code = "invalid_request"` -> `422 Unprocessable Entity`
+- `success = false` y `error_code = "identity_unavailable"` -> `503 Service Unavailable`
+- `success = false` y `error_code = "register_failed"` -> `502 Bad Gateway`
+- `success = false` con cualquier otro `error_code` o sin `error_code` -> `502 Bad Gateway`
 
 El body devuelto por `IO.api` en este camino depende del resultado:
 
 - `ok` -> envelope `accepted` del ingress comun;
-- `needs_input` / `error` -> `frontdesk_result` canonical.
+- `success = false` -> envelope estructurado HTTP de frontdesk:
+  - `success`
+  - `human_message`
+  - `error_code`
 
 En particular, `needs_input` no se trata como exito HTTP en `IO.api`, porque el modo API no continua conversacionalmente ni puede completar el registro interactuando con el caller.
 
@@ -541,7 +545,8 @@ En particular, `needs_input` no se trata como exito HTTP en `IO.api`, porque el 
 Si el caller fija explicitamente `options.routing.dst_node = "SY.frontdesk.gov@..."`, `IO.api` conserva un camino tecnico/terminal:
 
 - construye `frontdesk_handoff`;
-- espera `frontdesk_result`;
+- agrega `meta.context.response_envelope`;
+- espera respuesta estructurada compatible;
 - responde directamente con ese payload estructurado;
 - no reinyecta luego el mensaje original a otro `dst_final`.
 
@@ -552,7 +557,7 @@ Este camino sirve para debug, validacion o integraciones muy especificas, pero n
 Si existe handoff a frontdesk, tambien existen errores previos o laterales al `frontdesk_result`:
 
 - timeout esperando la reply de frontdesk -> `504 Gateway Timeout` con `error_code = "frontdesk_timeout"`
-- reply recibida pero con payload no parseable como `frontdesk_result` -> `502 Bad Gateway` con `error_code = "invalid_frontdesk_response"`
+- reply recibida pero con payload no parseable como respuesta estructurada valida -> `502 Bad Gateway` con `error_code = "invalid_frontdesk_response"`
 - imposibilidad de enviar el handoff al router o indisponibilidad del canal de salida -> `503 Service Unavailable` con `error_code = "router_unavailable"`
 - cierre inesperado del waiter de reply antes de recibir respuesta valida -> `503 Service Unavailable` con `error_code = "frontdesk_unavailable"`
 
@@ -755,9 +760,39 @@ El carrier conserva:
 En este camino:
 
 - no se usa `text/v1` como payload hacia frontdesk;
-- `IO.api` espera la respuesta `frontdesk_result`;
-- si `frontdesk_result.status = "ok"`, continua luego el mensaje original al `dst_final`;
-- si `frontdesk_result.status = "needs_input"` o `error`, devuelve ese resultado estructurado por HTTP.
+- `IO.api` agrega `meta.context.response_envelope` al mensaje hacia frontdesk;
+- `IO.api` espera una reply `payload.type = "text"` con JSON estructurado compatible con ese envelope;
+- si `success = true`, continua luego el mensaje original al `dst_final`;
+- si `success = false`, devuelve ese resultado estructurado por HTTP.
+
+Envelope concreto validado en este primer corte:
+
+```json
+{
+  "kind": "json_object_v1",
+  "required": ["success", "human_message"],
+  "properties": {
+    "success": { "type": "boolean" },
+    "human_message": { "type": "string" },
+    "error_code": {
+      "type": "string",
+      "enum": [
+        "missing_required_fields",
+        "invalid_request",
+        "identity_unavailable",
+        "register_failed",
+        "unknown"
+      ]
+    }
+  }
+}
+```
+
+Regla de semántica:
+
+- `error_code` es opcional por ausencia;
+- en v1 no debe enviarse como `null`;
+- si el campo está presente, debe ser `string`.
 
 ---
 

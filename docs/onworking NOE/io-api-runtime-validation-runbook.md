@@ -1510,9 +1510,10 @@ Esta prueba valida el flujo canonico:
 - resuelve/provisiona `src_ilk`
 - si el sujeto no esta completo, construye `frontdesk_handoff`
 - envia a `SY.frontdesk.gov`
-- espera `frontdesk_result`
-- si `status = "ok"`, continua el mensaje original al `dst_final` y responde `202 Accepted`
-- si `status = "needs_input"` o `error`, devuelve ese resultado estructurado por HTTP
+- adjunta `meta.context.response_envelope`
+- espera respuesta estructurada compatible con ese envelope
+- si `success = true`, continua el mensaje original al `dst_final` y responde `202 Accepted`
+- si `success = false`, devuelve ese resultado estructurado por HTTP
 
 Request de ejemplo:
 
@@ -1546,26 +1547,18 @@ curl -sS -X POST "http://$LISTEN_ADDRESS:$LISTEN_PORT/" \
 
 Resultado esperado:
 
-- si frontdesk devuelve `needs_input` o `error`, no debe devolver `202 Accepted`
-- en esos casos debe devolver directamente un `frontdesk_result`
-- si `status = "needs_input"`, el status HTTP esperado es `422 Unprocessable Entity`
-- si `status = "ok"`, el status HTTP esperado es `202 Accepted` y debe existir `trace_id` del mensaje continuado al `dst_final`
+- si frontdesk devuelve una respuesta estructurada no exitosa, no debe devolver `202 Accepted`
+- en esos casos debe devolver directamente el envelope estructurado de frontdesk
+- si `error_code = "missing_required_fields"`, el status HTTP esperado es `422 Unprocessable Entity`
+- si `success = true`, el status HTTP esperado es `202 Accepted`
 
-Shape esperado cuando frontdesk bloquea la continuacion (`needs_input` / `error`):
+Shape esperado del envelope cuando frontdesk bloquea la continuacion:
 
 ```json
 {
-  "type": "frontdesk_result",
-  "schema_version": 1,
-  "status": "needs_input|ok|error",
-  "result_code": "...",
+  "success": false,
   "human_message": "...",
-  "missing_fields": [],
-  "error_code": null,
-  "error_detail": null,
-  "ilk_id": "ilk:...",
-  "tenant_id": "tnt:...",
-  "registration_status": "temporary|complete"
+  "error_code": "missing_required_fields|invalid_request|identity_unavailable|register_failed|unknown"
 }
 ```
 
@@ -1600,19 +1593,19 @@ Que valida esta prueba:
 
 1. `IO.api` decide regularizacion por estado del sujeto y no por `dst=frontdesk`
 2. `IO.api` construye `frontdesk_handoff`
-3. `SY.frontdesk.gov` responde con `frontdesk_result`
+3. `SY.frontdesk.gov` responde con payload `text` estructurado compatible con el envelope pedido
 4. `IO.api` correlaciona la reply por `trace_id`
-5. si frontdesk devuelve `ok`, el mensaje original continua al `dst_final`
-6. si frontdesk devuelve `needs_input` o `error`, el resultado estructurado vuelve correctamente por HTTP
+5. si frontdesk devuelve `success = true`, el mensaje original continua al `dst_final`
+6. si frontdesk devuelve `success = false`, el resultado estructurado vuelve correctamente por HTTP
 
-### 25.13. Estado real de `needs_input` con el contrato actual de `IO.api`
+### 25.13. Estado real de `missing_required_fields` con el contrato actual de `IO.api`
 
-Aunque `SY.frontdesk.gov` implementa `frontdesk_result.status = "needs_input"`, ese estado no es hoy un caso E2E alcanzable desde el contrato HTTP vigente de `IO.api`.
+Aunque `SY.frontdesk.gov` puede materializar `missing_required_fields` en su envelope estructurado, ese caso no es hoy un E2E alcanzable desde el contrato HTTP vigente de `IO.api`.
 
 Motivo:
 
 - `IO.api` exige `subject.display_name` y `subject.email` antes de construir el `frontdesk_handoff`;
-- `SY.frontdesk.gov` devuelve `needs_input` justamente cuando faltan `name` o `email` en el handoff estructurado.
+- ese mismo faltante queda bloqueado antes de llegar a `SY.frontdesk.gov`.
 
 Consecuencia:
 
@@ -1623,7 +1616,7 @@ Consecuencia:
 
 Lectura correcta para validacion:
 
-- `needs_input` sigue siendo parte del contrato formal de `SY.frontdesk.gov`;
+- `missing_required_fields` sigue siendo un resultado funcional posible de `SY.frontdesk.gov`;
 - pero no debe exigirse como prueba E2E de `IO.api` mientras el contrato actual de `explicit_subject by_data` requiera esos mismos campos minimos;
 - el rechazo correcto desde `IO.api` para ese caso es `subject_data_incomplete`.
 

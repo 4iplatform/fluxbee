@@ -807,10 +807,76 @@ fn loop_item_to_openai_input(item: FunctionLoopItem) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
     use serde_json::json;
 
     use super::*;
     use crate::function_calling::FunctionToolResult;
+
+    fn spawn_single_response_server(
+        response_body: Value,
+    ) -> (String, mpsc::Receiver<Value>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, rx) = mpsc::channel();
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut header_end = None;
+            let mut content_length = 0usize;
+
+            loop {
+                let n = stream.read(&mut chunk).expect("read request");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+
+                if header_end.is_none() {
+                    if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+                        let end = pos + 4;
+                        header_end = Some(end);
+                        let headers = String::from_utf8_lossy(&buf[..end]);
+                        for line in headers.lines() {
+                            let lower = line.to_ascii_lowercase();
+                            if let Some(value) = lower.strip_prefix("content-length:") {
+                                content_length = value.trim().parse::<usize>().expect("content length");
+                            }
+                        }
+                    }
+                }
+
+                if let Some(end) = header_end {
+                    if buf.len() >= end + content_length {
+                        break;
+                    }
+                }
+            }
+
+            let header_end = header_end.expect("header end");
+            let body_bytes = &buf[header_end..header_end + content_length];
+            let body_value: Value = serde_json::from_slice(body_bytes).expect("json request body");
+            tx.send(body_value).expect("send captured body");
+
+            let response_json = serde_json::to_vec(&response_body).expect("serialize response");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_json.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response head");
+            stream.write_all(&response_json).expect("write response body");
+        });
+
+        (format!("http://{}", addr), rx, handle)
+    }
 
     #[test]
     fn assistant_items_are_serialized_as_output_text() {
@@ -992,6 +1058,51 @@ mod tests {
     }
 
     #[test]
+    fn validate_structured_output_rejects_optional_null_value() {
+        let spec = OutputSchemaSpec::new(
+            "final_output",
+            json!({
+                "type":"object",
+                "properties":{
+                    "success":{"type":"boolean"},
+                    "human_message":{"type":"string"},
+                    "error_code":{"type":"string"}
+                },
+                "required":["success","human_message"],
+                "additionalProperties": false
+            }),
+            true,
+        )
+        .expect("schema should be valid");
+        let err = validate_structured_output(
+            r#"{"success":true,"human_message":"ok","error_code":null}"#,
+            &spec,
+        )
+        .expect_err("optional null should fail");
+        assert!(matches!(err, AiSdkError::InvalidStructuredOutput { .. }));
+    }
+
+    #[test]
+    fn validate_structured_output_rejects_enum_mismatch() {
+        let spec = OutputSchemaSpec::new(
+            "final_output",
+            json!({
+                "type":"object",
+                "properties":{
+                    "status":{"type":"string","enum":["ok","error"]}
+                },
+                "required":["status"],
+                "additionalProperties": false
+            }),
+            true,
+        )
+        .expect("schema should be valid");
+        let err = validate_structured_output(r#"{"status":"weird"}"#, &spec)
+            .expect_err("enum mismatch should fail");
+        assert!(matches!(err, AiSdkError::InvalidStructuredOutput { .. }));
+    }
+
+    #[test]
     fn build_output_schema_fallback_instruction_mentions_fields_and_required() {
         let spec = OutputSchemaSpec::new(
             "final_output",
@@ -1014,5 +1125,71 @@ mod tests {
         assert!(instruction.contains("human_message:string"));
         assert!(instruction.contains("Required fields: success, human_message"));
         assert!(instruction.contains("error_code:string(missing_data|unknown)"));
+        assert!(instruction.contains("Do not include markdown fences or extra text"));
+        assert!(instruction.contains("Do not include properties outside this schema"));
+    }
+
+    #[tokio::test]
+    async fn openai_responses_client_sends_json_schema_when_output_schema_present() {
+        let (base_url, body_rx, handle) = spawn_single_response_server(json!({
+            "output_text": "{\"ok\":true}"
+        }));
+        let client = OpenAiResponsesClient::new("test-key").with_base_url(base_url);
+        let request = LlmRequest {
+            model: "gpt-4.1-mini".to_string(),
+            system: Some("sys".to_string()),
+            input: "hola".to_string(),
+            input_parts: None,
+            output_schema: Some(
+                OutputSchemaSpec::new(
+                    "final_output",
+                    json!({
+                        "type":"object",
+                        "properties":{"ok":{"type":"boolean"}},
+                        "required":["ok"],
+                        "additionalProperties": false
+                    }),
+                    true,
+                )
+                .expect("schema"),
+            ),
+            max_output_tokens: Some(64),
+            model_settings: None,
+        };
+
+        let response = client.generate(request).await.expect("generate should succeed");
+        assert_eq!(response.content, "{\"ok\":true}");
+
+        let body = body_rx.recv().expect("captured body");
+        assert_eq!(body["model"], "gpt-4.1-mini");
+        assert_eq!(body["text"]["format"]["type"], "json_schema");
+        assert_eq!(body["text"]["format"]["name"], "final_output");
+        assert_eq!(body["text"]["format"]["strict"], true);
+        assert_eq!(body["text"]["format"]["schema"]["properties"]["ok"]["type"], "boolean");
+        handle.join().expect("server thread");
+    }
+
+    #[tokio::test]
+    async fn openai_responses_client_omits_json_schema_when_output_schema_absent() {
+        let (base_url, body_rx, handle) = spawn_single_response_server(json!({
+            "output_text": "plain text"
+        }));
+        let client = OpenAiResponsesClient::new("test-key").with_base_url(base_url);
+        let request = LlmRequest {
+            model: "gpt-4.1-mini".to_string(),
+            system: Some("sys".to_string()),
+            input: "hola".to_string(),
+            input_parts: None,
+            output_schema: None,
+            max_output_tokens: Some(64),
+            model_settings: None,
+        };
+
+        let response = client.generate(request).await.expect("generate should succeed");
+        assert_eq!(response.content, "plain text");
+
+        let body = body_rx.recv().expect("captured body");
+        assert!(body.get("text").is_none());
+        handle.join().expect("server thread");
     }
 }

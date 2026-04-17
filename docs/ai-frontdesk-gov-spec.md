@@ -12,7 +12,7 @@ Su funcion es:
 - completar registro humano cuando el caso ya trae datos suficientes;
 - continuar el flujo conversacional cuando todavia faltan datos;
 - ejecutar el upgrade via `ILK_REGISTER`;
-- responder siempre con un payload canonico de aplicacion.
+- responder con contrato de aplicacion compatible con el consumidor actual.
 
 No reemplaza a un `AI.*` generalista.
 
@@ -37,14 +37,15 @@ Regla operativa:
 - reutiliza estado por `src_ilk`;
 - completa o corrige los datos minimos del humano;
 - llama a `ilk_register` cuando el caso ya esta listo;
-- responde siempre con `payload.type = "frontdesk_result"`.
+- responde por defecto con `payload.type = "frontdesk_result"`;
+- cuando recibe `meta.context.response_envelope`, puede responder con `payload.type = "text"` estructurado compatible con ese envelope.
 
 No debe:
 
 - escribir directo en la identity DB;
 - inventar tenants o ILKs;
 - volver a inferir tenancy desde hints textuales cuando el handoff ya trae `tenant_id`;
-- emitir `text/v1` como contrato canonico de salida.
+- asumir que todos los consumidores requieren el mismo contrato de salida.
 
 ## 4. Inputs oficiales
 
@@ -178,7 +179,7 @@ Regla:
 
 ## 8. Output canonico
 
-Toda salida de `SY.frontdesk.gov` debe usar:
+Salida por defecto cuando no hay envelope:
 
 - `meta.type = "user"`
 - `payload.type = "frontdesk_result"`
@@ -218,6 +219,45 @@ Campos obligatorios cuando se conocen:
 - `tenant_id`
 - `registration_status`
 
+## 8.1 Output estructurado opt-in por envelope
+
+Cuando el mensaje entrante trae `meta.context.response_envelope`, `SY.frontdesk.gov` puede responder con:
+
+- `meta.type = "user"`
+- `payload.type = "text"`
+- `payload.content = "<json estructurado>"`
+
+En este primer corte, el shape soportado y validado es:
+
+```json
+{
+  "success": true,
+  "human_message": "Registro completado correctamente."
+}
+```
+
+o, si hubo bloqueo/error funcional:
+
+```json
+{
+  "success": false,
+  "human_message": "No pude completar el registro en este momento.",
+  "error_code": "register_failed"
+}
+```
+
+Reglas:
+
+- el envelope es opt-in y hop-by-hop;
+- si no existe envelope, frontdesk mantiene `frontdesk_result` como salida por defecto;
+- `error_code` es opcional por ausencia;
+- `error_code` no debe emitirse como `null` en v1;
+- en este corte, frontdesk solo declara soporte explícito para:
+  - `success:boolean`
+  - `human_message:string`
+  - `error_code:string`
+- si el envelope es inválido o pide un shape que frontdesk no puede cumplir, debe fallar con `invalid_response_contract`.
+
 ## 9. Semantica de resultado
 
 Estados cerrados:
@@ -250,14 +290,14 @@ Deben:
 
 - entender `frontdesk_result`;
 - extraer `human_message`;
-- no asumir salida `text/v1`.
+- no asumir una única forma de salida si el hop usa envelope.
 
 ### 10.2 Consumidores no conversacionales
 
 Deben:
 
-- consumir el bloque estructurado completo;
-- usar `status`, `result_code`, `missing_fields`, `error_code`, `error_detail`, `ilk_id`, `tenant_id`, `registration_status`.
+- si no usan envelope, consumir el bloque `frontdesk_result` completo;
+- si usan envelope, consumir la respuesta estructurada definida por ese hop.
 
 ## 11. Lifecycle operativo actual
 
@@ -286,9 +326,10 @@ Delete + spawn limpio quedan reservados para:
 
 - construir `frontdesk_handoff`;
 - usar `SY.frontdesk.gov` como paso intermedio cuando el sujeto no esta registrado completamente;
-- consumir `frontdesk_result` y:
-- si `status = "ok"`, permitir que el mensaje original continue al `dst_final`;
-- si `status = "needs_input"` o `error`, mapearlo a la respuesta HTTP de `IO.api`.
+- agregar `meta.context.response_envelope` para el hop síncrono de regularización;
+- consumir la respuesta estructurada resultante y:
+- si `success = true`, permitir que el mensaje original continue al `dst_final`;
+- si `success = false`, mapearla a la respuesta HTTP de `IO.api`.
 
 ## 11. Configuracion y operacion
 

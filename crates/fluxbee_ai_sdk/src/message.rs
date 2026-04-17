@@ -441,4 +441,47 @@ mod tests {
             .expect("schema should exist");
         assert_eq!(spec.json_schema()["properties"]["ok"]["type"], "boolean");
     }
+
+    #[test]
+    fn resolve_final_response_contract_output_schema_reads_and_translates() {
+        let meta = Meta {
+            context: Some(json!({
+                "final_response_contract":{
+                    "kind":"json_object_v1",
+                    "required":["status"],
+                    "properties":{"status":{"type":"string","enum":["ok","error"]}}
+                }
+            })),
+            ..Meta::default()
+        };
+        let spec = resolve_final_response_contract_output_schema(&meta)
+            .expect("ok")
+            .expect("schema should exist");
+        assert_eq!(spec.json_schema()["properties"]["status"]["type"], "string");
+        assert_eq!(spec.json_schema()["properties"]["status"]["enum"], json!(["ok", "error"]));
+    }
+
+    #[test]
+    fn response_contract_to_output_schema_spec_rejects_unsupported_property_type() {
+        assert!(matches!(
+            response_contract_to_output_schema_spec(&json!({
+                "kind":"json_object_v1",
+                "required":["items"],
+                "properties":{"items":{"type":"array"}}
+            })),
+            Err(AiSdkError::InvalidResponseContract { .. })
+        ));
+    }
+
+    #[test]
+    fn response_contract_to_output_schema_spec_rejects_non_string_enum_values() {
+        assert!(matches!(
+            response_contract_to_output_schema_spec(&json!({
+                "kind":"json_object_v1",
+                "required":["status"],
+                "properties":{"status":{"type":"string","enum":["ok", 1]}}
+            })),
+            Err(AiSdkError::InvalidResponseContract { .. })
+        ));
+    }
 }

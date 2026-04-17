@@ -169,6 +169,52 @@ Propiedades requeridas:
 - La primera implementación activa usa store `memory`; durable queda como evolución posterior sin cambiar el contrato del adapter.
 - El relay deja trazabilidad en `meta.context.io.relay.*`.
 
+### 2.3.1 Response contracts hop-by-hop
+
+`io-common` expone además helpers comunes para contratos de respuesta estructurada entre hops.
+
+Carriers vigentes:
+
+- `meta.context.response_envelope`
+- `meta.context.final_response_contract`
+
+Reglas:
+
+- `response_envelope` define el shape esperado para la respuesta del hop actual;
+- `final_response_contract` preserva, cuando hace falta, el shape esperado para la respuesta final de una operación compuesta;
+- `response_envelope` no se propaga automáticamente a hops intermedios;
+- `final_response_contract` no debe imponerse al hop siguiente como obligación de formato;
+- copiar `meta.context` completo sin filtrar esos campos se considera incorrecto.
+
+Shape v1:
+
+- `kind = "json_object_v1"`
+- objeto top-level flat
+- tipos permitidos por propiedad:
+  - `string`
+  - `boolean`
+  - `integer`
+  - `number`
+- `enum` solo para `string`
+- `required` define campos obligatorios
+- un campo presente en `properties` pero ausente de `required` es opcional
+
+Regla importante de semántica:
+
+- en v1, opcional significa "puede no estar";
+- opcional no significa "puede venir como `null`";
+- si un campo existe en la respuesta, debe respetar el tipo declarado en el contract.
+
+Responsabilidades comunes de `io-common` en este punto:
+
+- set/get de `response_envelope` y `final_response_contract`;
+- validación mínima del contract;
+- parseo y validación de respuestas estructuradas canónicas sobre payload `text`;
+- errores canónicos para:
+  - contract inválido
+  - `meta.context` inválido
+  - respuesta estructurada inválida
+
 ### 2.4 Retry y errores
 - Clasificación de errores (retryable / non-retryable / rate_limited).
 - Circuit breaker opcional.
@@ -478,6 +524,5 @@ Pipeline normativo:
 
 El MVP usa memoria para estado tecnico local (dedup/sessions/outbox).
 IO no es source of truth; la persistencia canonica permanece en core (Router/Storage/Identity).
-
 
 

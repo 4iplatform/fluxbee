@@ -595,6 +595,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_structured_response_text_rejects_optional_null_value() {
+        let err = parse_structured_response_text(
+            r#"{"success":true,"human_message":"ok","error_code":null}"#,
+            &sample_response_contract(),
+        )
+        .expect_err("optional field present as null should fail");
+        assert!(matches!(err, IoResponseContractError::InvalidStructuredResponse(_)));
+    }
+
+    #[test]
+    fn parse_structured_response_text_rejects_unexpected_property() {
+        let err = parse_structured_response_text(
+            r#"{"success":true,"human_message":"ok","extra":"nope"}"#,
+            &sample_response_contract(),
+        )
+        .expect_err("unexpected property should fail");
+        assert!(matches!(err, IoResponseContractError::InvalidStructuredResponse(_)));
+    }
+
+    #[test]
     fn parse_structured_response_payload_reads_text_payload() {
         let payload = json!({
             "type": "text",

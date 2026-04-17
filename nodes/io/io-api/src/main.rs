@@ -2496,6 +2496,28 @@ mod tests {
                 .and_then(Value::as_str),
             Some("string")
         );
+        assert_eq!(
+            contract
+                .get("properties")
+                .and_then(|value| value.get("error_code"))
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str),
+            Some("string")
+        );
+        assert_eq!(
+            contract
+                .get("properties")
+                .and_then(|value| value.get("error_code"))
+                .and_then(|value| value.get("enum"))
+                .cloned(),
+            Some(serde_json::json!([
+                "missing_required_fields",
+                "invalid_request",
+                "identity_unavailable",
+                "register_failed",
+                "unknown"
+            ]))
+        );
     }
 
     #[test]
@@ -2552,6 +2574,32 @@ mod tests {
                 .and_then(Value::as_str),
             Some("string")
         );
+    }
+
+    #[test]
+    fn frontdesk_io_api_envelope_accepts_success_without_error_code() {
+        let value = serde_json::json!({
+            "success": true,
+            "human_message": "Registro completado correctamente."
+        });
+        let parsed: FrontdeskIoApiEnvelope =
+            serde_json::from_value(value).expect("success envelope should deserialize");
+        assert!(parsed.success);
+        assert_eq!(parsed.human_message, "Registro completado correctamente.");
+        assert_eq!(parsed.error_code, None);
+    }
+
+    #[test]
+    fn frontdesk_io_api_envelope_accepts_error_with_error_code() {
+        let value = serde_json::json!({
+            "success": false,
+            "human_message": "No pude completar el registro.",
+            "error_code": "register_failed"
+        });
+        let parsed: FrontdeskIoApiEnvelope =
+            serde_json::from_value(value).expect("error envelope should deserialize");
+        assert!(!parsed.success);
+        assert_eq!(parsed.error_code.as_deref(), Some("register_failed"));
     }
 
     #[test]
