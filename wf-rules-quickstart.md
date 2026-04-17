@@ -16,9 +16,12 @@ bash scripts/publish-wf-runtime.sh --version 0.1.0 --set-current --sudo
 ```bash
 export BASE="http://127.0.0.1:8080"
 export HIVE="motherbee"
+export TENANT_ID="tnt:REEMPLAZAR"
 ```
 
 Todos los endpoints usan el prefijo `$BASE/hives/$HIVE/wf-rules`.
+
+`TENANT_ID` se usa en el **first deploy** cuando `auto_spawn: true` y el nodo `WF.<workflow_name>@<hive>` todavía no existe. No se propaga por variable de entorno del servicio `sy.wf-rules`; debe viajar en el request.
 
 ---
 
@@ -323,10 +326,10 @@ Promueve la definición validada de staged a current, genera el package, y spawn
 ```bash
 curl -sS -X POST "$BASE/hives/$HIVE/wf-rules/apply" \
   -H "Content-Type: application/json" \
-  -d '{"workflow_name": "invoice", "auto_spawn": true}' | jq .
+  -d "{\"workflow_name\":\"invoice\",\"tenant_id\":\"$TENANT_ID\",\"auto_spawn\":true}" | jq .
 ```
 
-`auto_spawn: true` hace que el nodo `WF.invoice@motherbee` se cree automáticamente si no existe. Si ya existe, se reinicia con la nueva versión.
+`auto_spawn: true` hace que el nodo `WF.invoice@motherbee` se cree automáticamente si no existe. Si ya existe, se reinicia con la nueva versión. En el primer caso, `tenant_id` es obligatorio.
 
 Respuesta esperada:
 ```json
@@ -354,7 +357,8 @@ Para iteración rápida: valida y despliega de una sola vez.
 curl -sS -X POST "$BASE/hives/$HIVE/wf-rules" \
   -H "Content-Type: application/json" \
   -d "$(jq -n --arg wf invoice --slurpfile def invoice-workflow.json \
-    '{workflow_name: $wf, definition: $def[0], auto_spawn: true}')" | jq .
+    --arg tenant_id "$TENANT_ID" \
+    '{workflow_name: $wf, definition: $def[0], auto_spawn: true, tenant_id: $tenant_id}')" | jq .
 ```
 
 Este es el comando más usado durante desarrollo. Equivale a `compile` + `apply` en secuencia.
@@ -576,13 +580,13 @@ Las transiciones se evalúan en orden de declaración. La primera cuyo `event_ma
    → corregir errores de CEL o de estructura
 
 3. Desplegar:
-   curl -X POST .../wf-rules/apply -d '{workflow_name, auto_spawn: true}'
+   curl -X POST .../wf-rules/apply -d '{workflow_name, tenant_id, auto_spawn: true}'
    → el nodo WF arranca
 
 4. Probar enviando mensajes al nodo WF
 
 5. Iterar: editar JSON → compile_apply (paso 2+3 juntos)
-   curl -X POST .../wf-rules -d '{workflow_name, definition, auto_spawn: true}'
+   curl -X POST .../wf-rules -d '{workflow_name, definition, tenant_id, auto_spawn: true}'
 
 6. Si algo sale mal: rollback
    curl -X POST .../wf-rules/rollback -d '{workflow_name}'

@@ -140,6 +140,7 @@ func TestApplyWorkflowAndDeployDoesNotFallbackToSpawnOnConfigLookupTimeout(t *te
 	result, err := svc.ApplyWorkflowAndDeploy(ApplyRequest{
 		WorkflowName: "invoice",
 		AutoSpawn:    true,
+		TenantID:     "tnt:request",
 	})
 	if err != nil {
 		t.Fatalf("ApplyWorkflowAndDeploy: %v", err)
@@ -178,6 +179,42 @@ func TestApplyWorkflowAndDeployPublishesOnlyWhenAutoSpawnDisabled(t *testing.T) 
 	}
 	if result.WFNode.Action != "none" || result.WFNode.Reason != "auto_spawn disabled" {
 		t.Fatalf("unexpected wf_node %#v", result.WFNode)
+	}
+	if fake.runCalls != 0 {
+		t.Fatalf("expected no run_node calls, got %d", fake.runCalls)
+	}
+}
+
+func TestApplyWorkflowAndDeployRequiresTenantForFirstDeploy(t *testing.T) {
+	svc := newTestService(t)
+	fake := &fakeOrchestratorClient{}
+	fake.getNodeConfigFunc = func(ctx context.Context, targetNode, nodeName string) (map[string]any, error) {
+		return nil, &orchestratorActionError{Status: "error", Code: "NODE_CONFIG_NOT_FOUND", Message: "missing"}
+	}
+	fake.runNodeFunc = func(ctx context.Context, targetNode, nodeName, runtimeName, version string, config map[string]any) (map[string]any, error) {
+		t.Fatalf("RunNode must not be called without tenant_id on first deploy")
+		return nil, nil
+	}
+	svc.orchestrator = fake
+
+	if _, err := svc.CompileWorkflow(CompileRequest{
+		WorkflowName: "invoice",
+		Definition:   validWorkflowDefinition(),
+	}); err != nil {
+		t.Fatalf("CompileWorkflow: %v", err)
+	}
+	result, err := svc.ApplyWorkflowAndDeploy(ApplyRequest{
+		WorkflowName: "invoice",
+		AutoSpawn:    true,
+	})
+	if err != nil {
+		t.Fatalf("ApplyWorkflowAndDeploy: %v", err)
+	}
+	if result.WFNode.Action != "none" || result.WFNode.Reason != "tenant_id required for first deploy" {
+		t.Fatalf("unexpected wf_node %#v", result.WFNode)
+	}
+	if result.Warning == "" {
+		t.Fatalf("expected warning")
 	}
 	if fake.runCalls != 0 {
 		t.Fatalf("expected no run_node calls, got %d", fake.runCalls)
@@ -233,6 +270,7 @@ func TestApplyWorkflowAndDeployExistingNodeLeavesDeploymentDeferred(t *testing.T
 	result, err := svc.ApplyWorkflowAndDeploy(ApplyRequest{
 		WorkflowName: "invoice",
 		AutoSpawn:    true,
+		TenantID:     "tnt:request",
 	})
 	if err != nil {
 		t.Fatalf("ApplyWorkflowAndDeploy: %v", err)
@@ -289,6 +327,7 @@ func TestApplyWorkflowAndDeploySurfacesSpawnFailureAsPartial(t *testing.T) {
 	result, err := svc.ApplyWorkflowAndDeploy(ApplyRequest{
 		WorkflowName: "invoice",
 		AutoSpawn:    true,
+		TenantID:     "tnt:request",
 	})
 	if err != nil {
 		t.Fatalf("ApplyWorkflowAndDeploy: %v", err)

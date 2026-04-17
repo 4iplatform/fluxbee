@@ -182,6 +182,7 @@ Note: if a request arrives with `operation: "check"`, it is treated as a synonym
 {
   "operation": "compile_apply",
   "workflow_name": "invoice",
+  "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e",
   "definition": {
     "wf_schema_version": "1",
     "workflow_type": "invoice",
@@ -200,6 +201,7 @@ Note: if a request arrives with `operation: "check"`, it is treated as a synonym
 |---|---|---|---|
 | `operation` | string | No (default: "compile") | One of: compile, compile_apply, apply, rollback |
 | `workflow_name` | string | **Yes, always** | Name of the workflow. Determines node name `WF.<workflow_name>@<hive>`. Required for all operations including apply and rollback. |
+| `tenant_id` | string | Conditionally required | Required for the **first deploy** of a workflow when `auto_spawn=true` and the target `WF.<workflow_name>@<hive>` node does not exist yet. On rollout of an already-managed WF node, `sy.wf-rules` preserves the existing managed `tenant_id` and does not require the field again. |
 | `definition` | object | Yes for compile/compile_apply | The full workflow definition JSON per wf-v1.md §8. |
 | `auto_spawn` | bool | No (default: false) | If true and the WF node doesn't exist yet, ask orchestrator to spawn it after apply. |
 | `version` | uint64 | No | If provided, used for idempotency check. If 0, auto-increment. |
@@ -468,6 +470,7 @@ When a definition is applied (compile_apply or apply operations):
      b. `restart_node` for `WF.<workflow_name>@<hive>`.
    - **If the WF node does not exist and `auto_spawn: true`:**
      a. `run_node` for `WF.<workflow_name>@<hive>` with runtime `wf.<workflow_name>`, version `<version>`, and the managed operational config.
+     b. `tenant_id` must be present explicitly in the request payload used by `sy.wf-rules` for that first deploy. `SY.wf-rules` must not depend on a service-local environment variable for tenant propagation.
    - **If the WF node does not exist and `auto_spawn: false`:**
      a. No orchestrator lifecycle calls. Definition/package is stored and published, but no node is started.
      b. Response includes `"wf_node": { "action": "none", "reason": "auto_spawn disabled" }`.
@@ -478,6 +481,7 @@ When a definition is applied (compile_apply or apply operations):
 - The workflow definition does **not** live in the managed node `config.json`. The executable code artifact lives in the workflow package, and `wf-generic` reads it from `_system.package_path/flow/definition.json` at boot.
 - On updates to an existing workflow, operational fields (gc, timer, tenant, etc.) are preserved from the existing managed `config.json`. The workflow code changes by publishing a new package version and rebinding/restarting the node, not by mutating top-level `workflow_definition`.
 - Publication state and deployment state are intentionally different. A package may already exist in `dist` with a newer version while the WF node still runs the older `runtime_version` recorded in its managed config. The node only changes versions after the explicit rebind/restart sequence completes successfully.
+- The only environment-level tenant fallback relevant to this path is `ORCH_DEFAULT_TENANT_ID` inside `SY.orchestrator`, which remains a platform escape hatch. `SY.wf-rules` itself must not rely on a local `tenant_id` environment variable.
 
 ### 7.1 Managed config.json format for WF nodes
 

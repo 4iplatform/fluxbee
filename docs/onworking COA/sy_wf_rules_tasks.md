@@ -272,7 +272,7 @@ go/sy-wf-rules/
 
 ### WFRULES-ORCH-1 — Node status client
 - [x] Node existence is determined via `GetNodeConfig` → `NODE_CONFIG_NOT_FOUND` error (implemented in `orchestrator.go`)
-- [ ] **PENDING:** Add `GetNodeStatus(nodeL2Name string)` to detect if the WF node *process* is actively running (distinct from config existing). Send `NODE_STATUS_GET` directly to the WF node with 2s timeout. Used by `get_status` and `delete_workflow` to report `wf_node.running`. Currently `running` is inferred from `CountRunningInstances` timeout behavior.
+- [ ] **OPTIONAL / non-blocking:** Add direct `NODE_STATUS_GET` probing of the WF node L2 name to distinguish "managed config exists" from "process is alive but idle". Current implementation already reports useful reachability via `WF_LIST_INSTANCES` timeout behavior and is aligned with the current infra.
 
 ### WFRULES-ORCH-2 — Managed config read client
 - [x] Implement `GetNodeConfig(nodeL2Name string)`
@@ -342,12 +342,12 @@ go/sy-wf-rules/
 - [x] Does not delete `/var/lib/fluxbee/nodes/...` directly
 
 ### WFRULES-ORCH-11 — Tests
-- [ ] Existing node apply publishes package then rebinds config then restarts
-- [ ] Existing node apply preserves operational config
-- [ ] Existing node apply binds `_system.package_path` to concrete version
-- [ ] `restart_node` retry after 1 second works as specified
-- [ ] `restart_failed` leaves package published but deployment incomplete
-- [ ] auto_spawn=false path publishes package only, no orchestrator call
+- [x] Existing node apply publishes package then rebinds config then restarts
+- [x] Existing node apply preserves operational config
+- [x] Existing node apply binds `_system.package_path` to concrete version
+- [x] `restart_node` retry after 1 second works as specified
+- [x] `restart_failed` leaves package published but deployment incomplete
+- [x] auto_spawn=false path publishes package only, no orchestrator call
 
 ---
 
@@ -566,7 +566,8 @@ go/sy-wf-rules/
 - [x] `restart_node`
 
 ### WFRULES-TEST-5 — apply first deploy
-- [x] Absent node + `auto_spawn=true` publishes package and spawns node
+- [x] Absent node + `auto_spawn=true` publishes package and spawns node when `tenant_id` is provided explicitly
+- [x] Absent node + `auto_spawn=true` without `tenant_id` returns partial result and does not call `run_node`
 - [x] Absent node + `auto_spawn=false` publishes only
 
 ### WFRULES-TEST-6 — restart failure handling
@@ -617,6 +618,7 @@ go/sy-wf-rules/
   - `requested_runtime_version` added to `ManagedSystemConfig` in `wf-generic` (was crashing with DisallowUnknownFields)
   - `SY.wf-rules@` added to orchestrator allowed origins (`is_allowed_system_source_name`)
   - `tenant_id` flows through request payload (not hardcoded in service unit)
+  - `WFRULES_TENANT_ID` fallback removed from `sy.wf-rules`; first deploy requires explicit `tenant_id` in request, existing-node rollout preserves managed `tenant_id`
   - Delete tolerates WF node timeout (`force=false` no longer blocked by `INSTANCES_UNKNOWN`)
   - Rollback sends `auto_spawn` flag correctly
 
@@ -633,7 +635,8 @@ go/sy-wf-rules/
 - [x] Follow same service pattern as other SY nodes
 
 ### WFRULES-INSTALL-3 — Identity registration
-- [ ] **PENDING:** Confirm whether `SY.wf-rules` needs an `ILK_REGISTER` call at boot. Compare with `sy-opa-rules` and `sy-timer` — neither appears to do it. Document the finding and close this task.
+- [x] No special `ILK_REGISTER` call is needed at boot for `SY.wf-rules`
+- [x] Follow the same core `SY.*` startup pattern as `sy-opa-rules` and `sy-timer`: connect to router and serve; identity registration for managed WF nodes happens during orchestrator spawn, not during `SY.wf-rules` boot
 
 ---
 
@@ -648,7 +651,9 @@ go/sy-wf-rules/
 
 ## 18) Remaining open items (post-audit 2026-04-16)
 
-These items were identified during a code audit on 2026-04-16. All other tasks are complete.
+These are the only items still meaningfully open after implementation and real-server validation.
+
+Note: `WFRULES-OPEN-1` and `WFRULES-OPEN-4` are kept below only as closed audit history. The actual remaining pending items are `WFRULES-OPEN-2`, `WFRULES-OPEN-3`, and `WFRULES-OPEN-5`.
 
 ### WFRULES-OPEN-1 — ORCH-11: Orchestrator integration tests
 
@@ -658,13 +663,15 @@ These items were identified during a code audit on 2026-04-16. All other tasks a
 - [x] Test: `restart_node` retry after 1s on first failure — restartCalls == 2 (`TestApplyWorkflowAndDeployExistingNodeRestartFailureIsPartial`)
 - [x] Test: `restart_failed` — current/ updated and package published on disk (`TestRestartFailedCurrentAndPackageStillPresent`)
 - [x] Test: `auto_spawn=false` publishes package only, no run_node call (`TestApplyWorkflowAndDeployPublishesOnlyWhenAutoSpawnDisabled`)
+- [x] Test: first deploy without `tenant_id` does not call `run_node` and returns partial result (`TestApplyWorkflowAndDeployRequiresTenantForFirstDeploy`)
+
+Status: closed.
 
 ### WFRULES-OPEN-2 — GetNodeStatus for process liveness
 
-- [ ] Add `GetNodeStatus(ctx, targetNode, wfNodeL2Name string) (running bool, err error)` to `orchestratorClient`
-- [ ] Implementation: send `NODE_STATUS_GET` directly to the WF node L2 name with 2s timeout; `running=true` if response received, `running=false` on timeout
-- [ ] Wire into `GetWorkflowStatus` and `ListWorkflowStatuses` so `wf_node.running` is accurate even when the node has a managed config but the process is down
-- [ ] Wire into `DeleteWorkflow` force=false path as an additional guard (currently only `CountRunningInstances` is used)
+- [ ] Optional observability improvement only: add direct `NODE_STATUS_GET` probing of the WF node L2 name with 2s timeout
+- [ ] Wire into `GetWorkflowStatus` and `ListWorkflowStatuses` if we later want to distinguish "process alive but idle" from "node unreachable"
+- [ ] Keep out of the critical path unless production needs it; current status/delete behavior is already acceptable on the current infra
 
 ### WFRULES-OPEN-3 — Shared receiver message drop (architectural note)
 
@@ -678,7 +685,7 @@ These items were identified during a code audit on 2026-04-16. All other tasks a
 
 ### WFRULES-OPEN-4 — INSTALL-3: Identity registration confirmation
 
-- [ ] Verify whether `SY.wf-rules` needs an `ILK_REGISTER` call at boot (compare with sy-opa-rules, sy-timer — neither does it). Document result and close.
+- [x] Closed: `SY.wf-rules` follows the normal core `SY.*` boot path and does not perform `ILK_REGISTER` at boot. Managed WF node identity registration belongs to orchestrator spawn.
 
 ### WFRULES-OPEN-5 — TEST-12: E2E Admin endpoint forwarding tests
 

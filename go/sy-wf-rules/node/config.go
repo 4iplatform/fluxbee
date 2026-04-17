@@ -2,7 +2,6 @@ package node
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -31,7 +30,6 @@ type NodeConfig struct {
 	OrchestratorTarget string
 	StateDir           string
 	DistRuntimeRoot    string
-	TenantID           string
 }
 
 func DefaultRuntimeConfig() RuntimeConfig {
@@ -60,16 +58,11 @@ func BuildNodeConfig(fullNodeName string, stateDir string, distRuntimeRoot strin
 	if strings.TrimSpace(distRuntimeRoot) == "" {
 		distRuntimeRoot = defaultDistRoot
 	}
-	tenantID := strings.TrimSpace(os.Getenv("WFRULES_TENANT_ID"))
-	if tenantID == "" {
-		tenantID = strings.TrimSpace(os.Getenv("ORCH_DEFAULT_TENANT_ID"))
-	}
 	return NodeConfig{
 		HiveID:             strings.TrimSpace(hiveID),
 		NodeName:           fullNodeName,
 		OrchestratorTarget: fmt.Sprintf("SY.orchestrator@%s", strings.TrimSpace(hiveID)),
 		StateDir:           filepath.Clean(stateDir),
 		DistRuntimeRoot:    filepath.Clean(distRuntimeRoot),
-		TenantID:           tenantID,
 	}, nil
 }

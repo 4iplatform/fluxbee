@@ -32,12 +32,8 @@ func (s *Service) buildManagedWFConfig(existing map[string]any, tenantID string)
 	if intValueFromMap(cfg, "gc_interval_seconds") <= 0 {
 		cfg["gc_interval_seconds"] = defaultWFGCIntervalSeconds
 	}
-	effectiveTenantID := tenantID
-	if effectiveTenantID == "" {
-		effectiveTenantID = s.cfg.TenantID
-	}
-	if stringValueFromMap(cfg, "tenant_id") == "" && effectiveTenantID != "" {
-		cfg["tenant_id"] = effectiveTenantID
+	if stringValueFromMap(cfg, "tenant_id") == "" && tenantID != "" {
+		cfg["tenant_id"] = tenantID
 	}
 	return cfg
 }

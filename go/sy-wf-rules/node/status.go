@@ -57,9 +57,9 @@ func (s *Service) GetWorkflowStatus(req GetStatusRequest) (*WorkflowStatusView, 
 	if published := s.currentPublishedVersion(workflowName); published != "" {
 		view.PublishedVersion = stringPtr(published)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), wfNodeRPCTimeout)
+	rpcCtx, cancel := context.WithTimeout(context.Background(), wfNodeRPCTimeout)
 	defer cancel()
-	snapshot, err := s.inspectWFNode(ctx, workflowName, true)
+	snapshot, err := s.inspectWFNode(rpcCtx, workflowName, true)
 	if err != nil {
 		return nil, err
 	}
@@ -82,8 +82,8 @@ func (s *Service) ListWorkflowStatuses() ([]ListedWorkflowStatus, error) {
 		if published := s.currentPublishedVersion(workflowName); published != "" {
 			item.PublishedVersion = stringPtr(published)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), wfNodeRPCTimeout)
-		snapshot, err := s.inspectWFNode(ctx, workflowName, true)
+		rpcCtx, cancel := context.WithTimeout(context.Background(), wfNodeRPCTimeout)
+		snapshot, err := s.inspectWFNode(rpcCtx, workflowName, true)
 		cancel()
 		if err != nil {
 			return nil, err
@@ -97,18 +97,18 @@ func (s *Service) ListWorkflowStatuses() ([]ListedWorkflowStatus, error) {
 	return out, nil
 }
 
-func (s *Service) inspectWFNode(ctx context.Context, workflowName string, queryInstances bool) (wfNodeSnapshot, error) {
+func (s *Service) inspectWFNode(rpcCtx context.Context, workflowName string, queryInstances bool) (wfNodeSnapshot, error) {
 	nodeName := fmt.Sprintf("WF.%s@%s", workflowName, s.cfg.HiveID)
 	snapshot := wfNodeSnapshot{NodeName: nodeName}
 	if s.orchestrator == nil {
 		return snapshot, nil
 	}
-	configPayload, err := s.orchestrator.GetNodeConfig(ctx, s.cfg.OrchestratorTarget, nodeName)
+	configPayload, err := s.orchestrator.GetNodeConfig(rpcCtx, s.cfg.OrchestratorTarget, nodeName)
 	if err != nil {
 		if actionErr, ok := err.(*orchestratorActionError); ok && actionErr.Code == "NODE_CONFIG_NOT_FOUND" {
 			return snapshot, nil
 		}
-		if isRPCTimeout(ctx, err) {
+		if isRPCTimeout(rpcCtx, err) {
 			snapshot.Timeout = true
 			return snapshot, nil
 		}
@@ -119,9 +119,9 @@ func (s *Service) inspectWFNode(ctx context.Context, workflowName string, queryI
 	if !queryInstances || s.wfNodes == nil {
 		return snapshot, nil
 	}
-	count, err := s.wfNodes.CountRunningInstances(ctx, nodeName)
+	count, err := s.wfNodes.CountRunningInstances(rpcCtx, nodeName)
 	if err != nil {
-		if ctx.Err() != nil {
+		if rpcCtx.Err() != nil {
 			snapshot.Timeout = true
 			return snapshot, nil
 		}
@@ -133,23 +133,23 @@ func (s *Service) inspectWFNode(ctx context.Context, workflowName string, queryI
 	return snapshot, nil
 }
 
-func isRPCTimeout(ctx context.Context, err error) bool {
+func isRPCTimeout(rpcCtx context.Context, err error) bool {
 	if err == nil {
 		return false
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return true
 	}
-	if ctx != nil && ctx.Err() != nil {
+	if rpcCtx != nil && rpcCtx.Err() != nil {
 		return true
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "context deadline exceeded")
 }
 
 func (s *Service) boundRuntimeVersionForWorkflow(workflowName string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), orchestratorRPCTimeout)
+	rpcCtx, cancel := context.WithTimeout(context.Background(), orchestratorRPCTimeout)
 	defer cancel()
-	snapshot, err := s.inspectWFNode(ctx, workflowName, false)
+	snapshot, err := s.inspectWFNode(rpcCtx, workflowName, false)
 	if err != nil {
 		return "", err
 	}

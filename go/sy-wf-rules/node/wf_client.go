@@ -27,7 +27,7 @@ func newWFNodeClient(snd sender, rcv receiver) wfNodeClient {
 	return &l2WFNodeClient{sender: snd, receiver: rcv}
 }
 
-func (c *l2WFNodeClient) CountRunningInstances(ctx context.Context, nodeName string) (int, error) {
+func (c *l2WFNodeClient) CountRunningInstances(rpcCtx context.Context, nodeName string) (int, error) {
 	if c == nil || c.sender == nil || c.receiver == nil {
 		return 0, fmt.Errorf("wf node client unavailable")
 	}
@@ -50,7 +50,7 @@ func (c *l2WFNodeClient) CountRunningInstances(ctx context.Context, nodeName str
 		return 0, err
 	}
 	for {
-		msg, err := c.receiver.Recv(ctx)
+		msg, err := c.receiver.Recv(rpcCtx)
 		if err != nil {
 			return 0, err
 		}

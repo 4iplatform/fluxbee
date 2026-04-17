@@ -66,16 +66,16 @@ func (s *Service) deployPublishedWorkflow(workflowName string, autoSpawn bool, t
 		}, "Package published, but orchestrator client is unavailable. Deployment did not run."
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), orchestratorRPCTimeout)
+	rpcCtx, cancel := context.WithTimeout(context.Background(), orchestratorRPCTimeout)
 	defer cancel()
-	existingConfigPayload, err := s.orchestrator.GetNodeConfig(ctx, s.cfg.OrchestratorTarget, nodeName)
+	existingConfigPayload, err := s.orchestrator.GetNodeConfig(rpcCtx, s.cfg.OrchestratorTarget, nodeName)
 	if err == nil {
 		existingConfig := configMapFromNodeConfigPayload(existingConfigPayload)
 		config := s.buildManagedWFConfig(existingConfig, tenantID)
 		binding := buildManagedRuntimeBinding(pkg)
-		ctx, cancel = context.WithTimeout(context.Background(), orchestratorRPCTimeout)
+		rpcCtx, cancel = context.WithTimeout(context.Background(), orchestratorRPCTimeout)
 		defer cancel()
-		if _, err := s.orchestrator.SetNodeConfig(ctx, s.cfg.OrchestratorTarget, nodeName, config, &binding, false); err != nil {
+		if _, err := s.orchestrator.SetNodeConfig(rpcCtx, s.cfg.OrchestratorTarget, nodeName, config, &binding, false); err != nil {
 			return WFNodeActionResult{
 					NodeName: nodeName,
 					Action:   "restart_failed",
@@ -83,13 +83,13 @@ func (s *Service) deployPublishedWorkflow(workflowName string, autoSpawn bool, t
 				},
 				"Package published, but sy.wf-rules could not rebind the existing node config."
 		}
-		ctx, cancel = context.WithTimeout(context.Background(), orchestratorRPCTimeout)
+		rpcCtx, cancel = context.WithTimeout(context.Background(), orchestratorRPCTimeout)
 		defer cancel()
-		if _, err := s.orchestrator.RestartNode(ctx, s.cfg.OrchestratorTarget, nodeName); err != nil {
+		if _, err := s.orchestrator.RestartNode(rpcCtx, s.cfg.OrchestratorTarget, nodeName); err != nil {
 			time.Sleep(1 * time.Second)
-			ctx, cancel = context.WithTimeout(context.Background(), orchestratorRPCTimeout)
+			rpcCtx, cancel = context.WithTimeout(context.Background(), orchestratorRPCTimeout)
 			defer cancel()
-			if _, retryErr := s.orchestrator.RestartNode(ctx, s.cfg.OrchestratorTarget, nodeName); retryErr != nil {
+			if _, retryErr := s.orchestrator.RestartNode(rpcCtx, s.cfg.OrchestratorTarget, nodeName); retryErr != nil {
 				return WFNodeActionResult{
 						NodeName: nodeName,
 						Action:   "restart_failed",
@@ -131,12 +131,21 @@ func (s *Service) deployPublishedWorkflow(workflowName string, autoSpawn bool, t
 			Reason:   "auto_spawn disabled",
 		}, ""
 	}
+	if tenantID == "" {
+		return WFNodeActionResult{
+				NodeName: nodeName,
+				Action:   "none",
+				Reason:   "tenant_id required for first deploy",
+				Error:    "first deploy of a managed WF node requires explicit tenant_id in the request",
+			},
+			"Package published, but first deploy was skipped because tenant_id is required."
+	}
 
-	ctx, cancel = context.WithTimeout(context.Background(), orchestratorRPCTimeout)
+	rpcCtx, cancel = context.WithTimeout(context.Background(), orchestratorRPCTimeout)
 	defer cancel()
 	runtimeName := pkg.RuntimeName
 	config := s.buildManagedWFConfig(nil, tenantID)
-	_, err = s.orchestrator.RunNode(ctx, s.cfg.OrchestratorTarget, nodeName, runtimeName, pkg.Version, config)
+	_, err = s.orchestrator.RunNode(rpcCtx, s.cfg.OrchestratorTarget, nodeName, runtimeName, pkg.Version, config)
 	if err != nil {
 		return WFNodeActionResult{
 				NodeName: nodeName,
