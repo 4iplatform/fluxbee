@@ -392,12 +392,16 @@ Response:
   "wf_node": {
     "node_name": "WF.invoice@motherbee",
     "running": true,
+    "status_reachable": true,
+    "health_state": "HEALTHY",
     "active_instances": 12
   }
 }
 ```
 
-**How `active_instances` is obtained:** sy.wf-rules sends a `WF_LIST_INSTANCES` query (wf-v1.md §16) to `WF.<workflow_name>@<hive>` with `status_filter: "running"` and `limit: 0`. The response includes `count`. Timeout: 2 seconds. If the WF node does not respond within the timeout (node down, overloaded, or not spawned), sy.wf-rules returns `"running": false, "active_instances": null, "wf_node_timeout": true`. This does not fail the get_status query — the workflow metadata from sy.wf-rules' own state directories is always returned regardless of node availability.
+`running` / `status_reachable` / `health_state` are obtained from a direct `NODE_STATUS_GET` probe to `WF.<workflow_name>@<hive>` with a 2-second timeout. This is the standard node-level liveness/health signal.
+
+**How `active_instances` is obtained:** sy.wf-rules sends a `WF_LIST_INSTANCES` query (wf-v1.md §16) to `WF.<workflow_name>@<hive>` with `status_filter: "running"` and `limit: 0`. The response includes `count`. Timeout: 2 seconds. If the WF node does not respond within the timeout (node down, overloaded, or not spawned), sy.wf-rules returns `"wf_node_timeout": true`. This does not fail the get_status query — the workflow metadata from sy.wf-rules' own state directories is always returned regardless of node availability.
 
 For `delete_workflow` with `force: false`, the same mechanism is used to check for active instances. If the node does not respond within timeout, the delete is refused with error `INSTANCES_UNKNOWN` — sy.wf-rules does not assume zero instances when it cannot confirm.
 ```
@@ -417,6 +421,8 @@ Response:
       "current_version": 4,
       "current_hash": "sha256:abc...",
       "wf_node_running": true,
+      "wf_node_reachable": true,
+      "wf_node_health_state": "HEALTHY",
       "active_instances": 12
     },
     {
@@ -424,6 +430,8 @@ Response:
       "current_version": 1,
       "current_hash": "sha256:def...",
       "wf_node_running": true,
+      "wf_node_reachable": true,
+      "wf_node_health_state": "HEALTHY",
       "active_instances": 3
     }
   ]

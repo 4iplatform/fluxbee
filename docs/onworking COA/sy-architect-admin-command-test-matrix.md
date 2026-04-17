@@ -60,6 +60,8 @@ TEST_ROUTE_PREFIX=AI.chat.
 TEST_VPN_PATTERN=worker-*
 TEST_ILK=ilk:550e8400-e29b-41d4-a716-446655440000
 TEST_OPA_VERSION=12
+TEST_WF_NAME=test-wf-rules-archi
+TEST_TENANT_ID=tnt:43d576a3-d712-4d91-9245-5d5463dd693e
 ```
 
 ## 4. Read-Only / Discovery
@@ -429,6 +431,49 @@ SCMD: curl -X POST /hives/motherbee/opa/policy/check -d '{"rego":"package router
 - check:
   - valida rego sin aplicar
 
+### 4.6 WF rules read / status
+
+[x] `wf_rules_get_workflow`
+
+- curl:
+```bash
+curl -sS "$BASE/hives/$LOCAL_HIVE/wf-rules?workflow_name=$TEST_WF_NAME"
+```
+- SCMD:
+```text
+SCMD: curl -X GET /hives/motherbee/wf-rules?workflow_name=test-wf-rules-archi
+```
+- check:
+  - devuelve la definición actual y metadata
+
+[x] `wf_rules_get_status`
+
+- curl:
+```bash
+curl -sS "$BASE/hives/$LOCAL_HIVE/wf-rules/status?workflow_name=$TEST_WF_NAME"
+```
+- SCMD:
+```text
+SCMD: curl -X GET /hives/motherbee/wf-rules/status?workflow_name=test-wf-rules-archi
+```
+- check:
+  - incluye `current_version`, `published_version`
+  - incluye `wf_node.running`, `wf_node.status_reachable`, `wf_node.health_state`
+
+[x] `wf_rules_list_workflows`
+
+- curl:
+```bash
+curl -sS "$BASE/hives/$LOCAL_HIVE/wf-rules"
+```
+- SCMD:
+```text
+SCMD: curl -X GET /hives/motherbee/wf-rules
+```
+- check:
+  - lista workflows manejados por `SY.wf-rules`
+  - incluye `wf_node_running`, `wf_node_reachable`, `wf_node_health_state`
+
 ## 5. Mutations
 
 Nota:
@@ -724,6 +769,84 @@ SCMD: curl -X POST /hives/motherbee/opa/policy/rollback -d '{"version":11}'
 - check:
   - luego `GET /hives/motherbee/opa/status`
 
+[ ] `wf_rules_compile`
+
+- curl:
+```bash
+curl -sS -X POST "$BASE/hives/$LOCAL_HIVE/wf-rules/compile" \
+  -H 'Content-Type: application/json' \
+  -d "{\"workflow_name\":\"$TEST_WF_NAME\",\"definition\":{\"wf_schema_version\":\"1\",\"workflow_type\":\"$TEST_WF_NAME\",\"description\":\"archi wf compile test\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"request_id\":{\"type\":\"string\"}}},\"initial_state\":\"pending\",\"terminal_states\":[\"done\"],\"states\":[{\"name\":\"pending\",\"description\":\"pending\",\"entry_actions\":[],\"exit_actions\":[],\"transitions\":[{\"event_match\":{\"msg\":\"OK\"},\"guard\":\"true\",\"target_state\":\"done\",\"actions\":[]}]},{\"name\":\"done\",\"description\":\"done\",\"entry_actions\":[],\"exit_actions\":[],\"transitions\":[]}]}}"
+```
+- SCMD:
+```text
+SCMD: curl -X POST /hives/motherbee/wf-rules/compile -d '{"workflow_name":"test-wf-rules-archi","definition":{"wf_schema_version":"1","workflow_type":"test-wf-rules-archi","description":"archi wf compile test","input_schema":{"type":"object","properties":{"request_id":{"type":"string"}}},"initial_state":"pending","terminal_states":["done"],"states":[{"name":"pending","description":"pending","entry_actions":[],"exit_actions":[],"transitions":[{"event_match":{"msg":"OK"},"guard":"true","target_state":"done","actions":[]}]},{"name":"done","description":"done","entry_actions":[],"exit_actions":[],"transitions":[]}]}}'
+```
+- check:
+  - respuesta `ok`
+  - luego `GET /hives/motherbee/wf-rules/status?workflow_name=test-wf-rules-archi`
+
+[ ] `wf_rules_apply`
+
+- curl:
+```bash
+curl -sS -X POST "$BASE/hives/$LOCAL_HIVE/wf-rules/apply" \
+  -H 'Content-Type: application/json' \
+  -d "{\"workflow_name\":\"$TEST_WF_NAME\",\"auto_spawn\":true,\"tenant_id\":\"$TEST_TENANT_ID\"}"
+```
+- SCMD:
+```text
+SCMD: curl -X POST /hives/motherbee/wf-rules/apply -d '{"workflow_name":"test-wf-rules-archi","auto_spawn":true,"tenant_id":"tnt:43d576a3-d712-4d91-9245-5d5463dd693e"}'
+```
+- check:
+  - `wf_node.action = restarted`
+  - luego `GET /hives/motherbee/wf-rules/status?workflow_name=test-wf-rules-archi`
+
+[ ] `wf_rules_compile_apply`
+
+- curl:
+```bash
+curl -sS -X POST "$BASE/hives/$LOCAL_HIVE/wf-rules" \
+  -H 'Content-Type: application/json' \
+  -d "{\"workflow_name\":\"$TEST_WF_NAME\",\"definition\":{\"wf_schema_version\":\"1\",\"workflow_type\":\"$TEST_WF_NAME\",\"description\":\"archi wf compile_apply test\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"request_id\":{\"type\":\"string\"}}},\"initial_state\":\"pending\",\"terminal_states\":[\"done\"],\"states\":[{\"name\":\"pending\",\"description\":\"pending\",\"entry_actions\":[],\"exit_actions\":[],\"transitions\":[{\"event_match\":{\"msg\":\"OK\"},\"guard\":\"true\",\"target_state\":\"done\",\"actions\":[]}]},{\"name\":\"done\",\"description\":\"done\",\"entry_actions\":[],\"exit_actions\":[],\"transitions\":[]}]},\"auto_spawn\":true,\"tenant_id\":\"$TEST_TENANT_ID\"}"
+```
+- SCMD:
+```text
+SCMD: curl -X POST /hives/motherbee/wf-rules -d '{"workflow_name":"test-wf-rules-archi","definition":{"wf_schema_version":"1","workflow_type":"test-wf-rules-archi","description":"archi wf compile_apply test","input_schema":{"type":"object","properties":{"request_id":{"type":"string"}}},"initial_state":"pending","terminal_states":["done"],"states":[{"name":"pending","description":"pending","entry_actions":[],"exit_actions":[],"transitions":[{"event_match":{"msg":"OK"},"guard":"true","target_state":"done","actions":[]}]},{"name":"done","description":"done","entry_actions":[],"exit_actions":[],"transitions":[]}]},"auto_spawn":true,"tenant_id":"tnt:43d576a3-d712-4d91-9245-5d5463dd693e"}'
+```
+- check:
+  - compile + apply + restart en una sola operación
+
+[ ] `wf_rules_rollback`
+
+- curl:
+```bash
+curl -sS -X POST "$BASE/hives/$LOCAL_HIVE/wf-rules/rollback" \
+  -H 'Content-Type: application/json' \
+  -d "{\"workflow_name\":\"$TEST_WF_NAME\",\"auto_spawn\":true,\"tenant_id\":\"$TEST_TENANT_ID\"}"
+```
+- SCMD:
+```text
+SCMD: curl -X POST /hives/motherbee/wf-rules/rollback -d '{"workflow_name":"test-wf-rules-archi","auto_spawn":true,"tenant_id":"tnt:43d576a3-d712-4d91-9245-5d5463dd693e"}'
+```
+- check:
+  - vuelve a la definición backup
+  - reinicia el `WF.*`
+
+[ ] `wf_rules_delete`
+
+- curl:
+```bash
+curl -sS -X POST "$BASE/hives/$LOCAL_HIVE/wf-rules/delete" \
+  -H 'Content-Type: application/json' \
+  -d "{\"workflow_name\":\"$TEST_WF_NAME\",\"force\":false}"
+```
+- SCMD:
+```text
+SCMD: curl -X POST /hives/motherbee/wf-rules/delete -d '{"workflow_name":"test-wf-rules-archi","force":false}'
+```
+- check:
+  - elimina el workflow y el managed WF node asociado si corresponde
+
 ## 6. Coverage Summary
 
 Acciones actualmente cubiertas por `SY.architect` vía SCMD/traducción:
@@ -745,6 +868,8 @@ Acciones actualmente cubiertas por `SY.architect` vía SCMD/traducción:
 - `get_storage`, `set_storage`
 - `update`, `sync_hint`
 - `opa_compile_apply`, `opa_compile`, `opa_apply`, `opa_rollback`, `opa_check`, `opa_get_policy`, `opa_get_status`
+- `wf_rules_compile_apply`, `wf_rules_compile`, `wf_rules_apply`, `wf_rules_rollback`, `wf_rules_delete`
+- `wf_rules_get_workflow`, `wf_rules_get_status`, `wf_rules_list_workflows`
 
 ## 7. What Is Still Fragile
 

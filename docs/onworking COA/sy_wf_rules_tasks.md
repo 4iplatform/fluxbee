@@ -1,6 +1,6 @@
 # SY.wf-rules — Implementation Tasks
 
-**Status:** planning / ready for implementation
+**Status:** implemented / validated on real server
 **Date:** 2026-04-16
 **Primary spec:** `docs/sy-wf-rules-spec.md`
 **Target module:** `go/sy-wf-rules/`
@@ -649,11 +649,9 @@ go/sy-wf-rules/
 
 ---
 
-## 18) Remaining open items (post-audit 2026-04-16)
+## 18) Closed audit items (post-audit 2026-04-17)
 
-These are the only items still meaningfully open after implementation and real-server validation.
-
-Note: `WFRULES-OPEN-1` through `WFRULES-OPEN-5` are kept below only as closed audit history. There are no remaining implementation blockers in this file.
+All former open items are now closed. They are kept below as audit history only.
 
 ### WFRULES-OPEN-1 — ORCH-11: Orchestrator integration tests
 

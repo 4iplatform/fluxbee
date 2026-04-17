@@ -23,6 +23,16 @@ Todos los endpoints usan el prefijo `$BASE/hives/$HIVE/wf-rules`.
 
 `TENANT_ID` se usa en el **first deploy** cuando `auto_spawn: true` y el nodo `WF.<workflow_name>@<hive>` todavía no existe. No se propaga por variable de entorno del servicio `sy.wf-rules`; debe viajar en el request.
 
+Si operás vía `SY.admin`/Archi, la superficie se descubre con:
+
+```bash
+curl -sS "$BASE/admin/actions/wf_rules_compile_apply"
+curl -sS "$BASE/admin/actions/wf_rules_get_status"
+curl -sS "$BASE/admin/actions/wf_rules_list_workflows"
+```
+
+Eso expone el `request_contract`, el ejemplo canónico y el `example_scmd` que debería usar Archi.
+
 ---
 
 ## 1. Escribir la definición del workflow

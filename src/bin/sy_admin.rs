@@ -4536,11 +4536,33 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             "string",
             "Optional explicit hive override for OPA broadcast targeting.",
         )],
-        "wf_rules_compile_apply" | "wf_rules_compile" => vec![
+        "wf_rules_compile_apply" => vec![
             admin_action_body_field(
                 "auto_spawn",
                 "bool",
                 "When true, spawn the WF node if it does not exist after apply.",
+            ),
+            admin_action_body_field(
+                "tenant_id",
+                "string",
+                "Required for first deploy when auto_spawn=true and the WF node does not already exist.",
+            ),
+            admin_action_body_field(
+                "version",
+                "u64",
+                "Optional explicit workflow version/idempotency check.",
+            ),
+            admin_action_body_field(
+                "hive",
+                "string",
+                "Optional explicit hive override for SY.wf-rules target.",
+            ),
+        ],
+        "wf_rules_compile" => vec![
+            admin_action_body_field(
+                "auto_spawn",
+                "bool",
+                "Accepted for symmetry with compile_apply but ignored because compile does not deploy.",
             ),
             admin_action_body_field(
                 "version",
@@ -4558,6 +4580,11 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "auto_spawn",
                 "bool",
                 "When true, allow first deploy spawn if the WF node does not exist.",
+            ),
+            admin_action_body_field(
+                "tenant_id",
+                "string",
+                "Required for first deploy when auto_spawn=true and the WF node does not already exist.",
             ),
             admin_action_body_field(
                 "version",
@@ -4723,7 +4750,7 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         "opa_rollback" => serde_json::json!({
             "version": 11
         }),
-        "wf_rules_compile_apply" | "wf_rules_compile" => serde_json::json!({
+        "wf_rules_compile_apply" => serde_json::json!({
             "workflow_name": "invoice",
             "definition": {
                 "wf_schema_version": "1",
@@ -4739,15 +4766,35 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
                 "terminal_states": ["completed"],
                 "states": []
             },
-            "auto_spawn": true
+            "auto_spawn": true,
+            "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
+        }),
+        "wf_rules_compile" => serde_json::json!({
+            "workflow_name": "invoice",
+            "definition": {
+                "wf_schema_version": "1",
+                "workflow_type": "invoice",
+                "description": "Issues an invoice",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "customer_id": {"type": "string"}
+                    }
+                },
+                "initial_state": "collecting_data",
+                "terminal_states": ["completed"],
+                "states": []
+            }
         }),
         "wf_rules_apply" => serde_json::json!({
             "workflow_name": "invoice",
-            "auto_spawn": true
+            "auto_spawn": true,
+            "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
         }),
         "wf_rules_rollback" => serde_json::json!({
             "workflow_name": "invoice",
-            "auto_spawn": true
+            "auto_spawn": true,
+            "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
         }),
         "wf_rules_delete" => serde_json::json!({
             "workflow_name": "invoice",
@@ -4871,16 +4918,16 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         }
         "wf_rules_list_workflows" => "curl -X GET /hives/motherbee/wf-rules",
         "wf_rules_compile_apply" => {
-            r#"curl -X POST /hives/motherbee/wf-rules -d '{"workflow_name":"invoice","definition":{"wf_schema_version":"1","workflow_type":"invoice","description":"Issues an invoice","input_schema":{"type":"object","properties":{"customer_id":{"type":"string"}}},"initial_state":"collecting_data","terminal_states":["completed"],"states":[]},"auto_spawn":true}'"#
+            r#"curl -X POST /hives/motherbee/wf-rules -d '{"workflow_name":"invoice","definition":{"wf_schema_version":"1","workflow_type":"invoice","description":"Issues an invoice","input_schema":{"type":"object","properties":{"customer_id":{"type":"string"}}},"initial_state":"collecting_data","terminal_states":["completed"],"states":[]},"auto_spawn":true,"tenant_id":"tnt:43d576a3-d712-4d91-9245-5d5463dd693e"}'"#
         }
         "wf_rules_compile" => {
             r#"curl -X POST /hives/motherbee/wf-rules/compile -d '{"workflow_name":"invoice","definition":{"wf_schema_version":"1","workflow_type":"invoice","description":"Issues an invoice","input_schema":{"type":"object","properties":{"customer_id":{"type":"string"}}},"initial_state":"collecting_data","terminal_states":["completed"],"states":[]}}'"#
         }
         "wf_rules_apply" => {
-            r#"curl -X POST /hives/motherbee/wf-rules/apply -d '{"workflow_name":"invoice","auto_spawn":true}'"#
+            r#"curl -X POST /hives/motherbee/wf-rules/apply -d '{"workflow_name":"invoice","auto_spawn":true,"tenant_id":"tnt:43d576a3-d712-4d91-9245-5d5463dd693e"}'"#
         }
         "wf_rules_rollback" => {
-            r#"curl -X POST /hives/motherbee/wf-rules/rollback -d '{"workflow_name":"invoice","auto_spawn":true}'"#
+            r#"curl -X POST /hives/motherbee/wf-rules/rollback -d '{"workflow_name":"invoice","auto_spawn":true,"tenant_id":"tnt:43d576a3-d712-4d91-9245-5d5463dd693e"}'"#
         }
         "wf_rules_delete" => {
             r#"curl -X POST /hives/motherbee/wf-rules/delete -d '{"workflow_name":"invoice","force":false}'"#
@@ -4999,13 +5046,20 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "opa_rollback" => vec![
             "If version is omitted, rollback uses the implementation default (currently 0).",
         ],
-        "wf_rules_compile_apply" | "wf_rules_compile" => vec![
+        "wf_rules_compile_apply" => vec![
             "workflow_name and definition are required.",
             "SY.admin forwards this to SY.wf-rules using the node CONFIG_SET contract.",
+            "tenant_id is required on the first deploy when auto_spawn=true and no managed WF node exists yet.",
+        ],
+        "wf_rules_compile" => vec![
+            "workflow_name and definition are required.",
+            "SY.admin forwards this to SY.wf-rules using the node CONFIG_SET contract.",
+            "compile validates and stages only; it never deploys, so tenant_id is not relevant here.",
         ],
         "wf_rules_apply" | "wf_rules_rollback" => vec![
             "workflow_name is required.",
             "SY.admin forwards this to SY.wf-rules using the node CONFIG_SET contract.",
+            "tenant_id is only needed for first deploy when auto_spawn=true; existing-node rollout preserves the managed tenant_id.",
         ],
         "wf_rules_delete" => vec![
             "workflow_name is required.",
@@ -6976,7 +7030,7 @@ mod tests {
             field["name"] == json!("auto_spawn")
                 && field["type"] == json!("bool")
                 && field["description"]
-                    == json!("When true, spawn the WF node if it does not exist after apply.")
+                    == json!("Accepted for symmetry with compile_apply but ignored because compile does not deploy.")
         }));
         assert!(optional_fields.iter().any(|field| {
             field["name"] == json!("version")
