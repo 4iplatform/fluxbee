@@ -170,9 +170,11 @@ async fn connection_manager_loop(
                         tokio::spawn(tx_loop(write_half, Arc::clone(&app_tx_rx), tx_state));
                     tokio::select! {
                         _ = &mut rx_task => {
+                            tracing::warn!(node = %cfg.full_name, "sdk: rx_task ended — aborting tx_task, will reconnect");
                             tx_task.abort();
                         }
                         _ = &mut tx_task => {
+                            tracing::warn!(node = %cfg.full_name, "sdk: tx_task ended — aborting rx_task, will reconnect");
                             rx_task.abort();
                         }
                     }
@@ -272,6 +274,7 @@ async fn rx_loop(
             },
             Ok(None) => {
                 state.set_connected(false);
+                tracing::debug!("sdk: rx_loop EOF — router closed its write half");
                 let _ = tx
                     .send(Err(NodeError::Io(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
@@ -282,6 +285,7 @@ async fn rx_loop(
             }
             Err(err) => {
                 state.set_connected(false);
+                tracing::warn!(error = %err, "sdk: rx_loop read error");
                 let _ = tx.send(Err(NodeError::Io(err))).await;
                 break;
             }
@@ -301,13 +305,15 @@ async fn tx_loop(
         };
         match frame {
             Some(frame) => {
-                if write_frame(&mut socket, &frame).await.is_err() {
+                if let Err(err) = write_frame(&mut socket, &frame).await {
                     state.set_connected(false);
+                    tracing::warn!(error = %err, frame_len = frame.len(), "sdk: tx_loop write_frame failed");
                     break;
                 }
             }
             None => {
                 state.set_connected(false);
+                tracing::debug!("sdk: tx_loop channel closed (NodeSender dropped)");
                 break;
             }
         }

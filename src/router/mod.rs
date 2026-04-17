@@ -510,7 +510,7 @@ async fn handle_node(
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             if let Err(err) = write_frame(&mut writer, &frame).await {
-                tracing::warn!("node write error: {err}");
+                tracing::warn!(error = %err, frame_len = frame.len(), "router: node write error");
                 break;
             }
         }
@@ -804,7 +804,10 @@ async fn handle_node(
                     tracing::warn!("received invalid message frame");
                 }
             }
-            None => break,
+            None => {
+                tracing::info!(node = %node_uuid, "router: node closed connection (EOF)");
+                break;
+            }
         }
     }
 
