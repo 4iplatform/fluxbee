@@ -4166,12 +4166,19 @@ fn frontdesk_structured_response_payload(payload: &FrontdeskResultPayload) -> Va
             _ => "unknown",
         })
     };
-
-    json!({
-        "success": success,
-        "human_message": payload.human_message,
-        "error_code": error_code,
-    })
+    let mut obj = serde_json::Map::new();
+    obj.insert("success".to_string(), Value::Bool(success));
+    obj.insert(
+        "human_message".to_string(),
+        Value::String(payload.human_message.clone()),
+    );
+    if let Some(error_code) = error_code {
+        obj.insert(
+            "error_code".to_string(),
+            Value::String(error_code.to_string()),
+        );
+    }
+    Value::Object(obj)
 }
 
 fn frontdesk_missing_fields(name: Option<&str>, email: Option<&str>) -> Vec<String> {
@@ -4878,7 +4885,7 @@ mod tests {
             structured.get("human_message").and_then(Value::as_str),
             Some("Echo: hola")
         );
-        assert_eq!(structured.get("error_code"), Some(&Value::Null));
+        assert!(structured.get("error_code").is_none());
     }
 
     #[tokio::test]
