@@ -128,6 +128,7 @@ impl AdminRouterClient {
                 Ok(msg) => self.dispatch(msg).await,
                 Err(err) => {
                     tracing::warn!("router recv error: {err}");
+                    self.drain_pending_waiters().await;
                     let (new_sender, new_receiver) = match Self::connect_once_with_retry(
                         &self.node_config,
                         self.reconnect_delay,
@@ -194,6 +195,11 @@ impl AdminRouterClient {
     async fn drop_admin_waiter(&self, trace_id: &str) {
         let mut pending = self.pending_admin.lock().await;
         pending.remove(trace_id);
+    }
+
+    async fn drain_pending_waiters(&self) {
+        let mut pending = self.pending_admin.lock().await;
+        pending.clear();
     }
 
     fn subscribe_system(&self) -> broadcast::Receiver<Message> {
