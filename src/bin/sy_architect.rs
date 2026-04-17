@@ -9,19 +9,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arrow_array::{Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Request, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{Method, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::any;
 use axum::{Json, Router};
 use fluxbee_ai_sdk::{
+    build_openai_user_content_parts, resolve_model_input_from_payload_with_options,
     extract_text, ConversationSummary, FunctionCallingConfig, FunctionCallingRunner,
     FunctionRunInput, FunctionTool, FunctionToolDefinition, FunctionToolProvider,
     FunctionToolRegistry, ImmediateConversationMemory, ImmediateInteraction,
     ImmediateInteractionKind, ImmediateOperation, ImmediateRole, ModelSettings,
+    ModelInputOptions,
     OpenAiResponsesClient,
 };
+use fluxbee_sdk::blob::{BlobConfig, BlobRef, BlobToolkit};
 use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
 use fluxbee_sdk::{
@@ -54,6 +57,10 @@ const CHAT_SESSION_PROFILES_TABLE: &str = "session_profiles";
 const CHAT_MODE_OPERATOR: &str = "operator";
 const CHAT_MODE_IMPERSONATION: &str = "impersonation";
 const ARCHITECT_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
+const ARCHITECT_MAX_ATTACHMENTS: usize = 8;
+const ARCHITECT_MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+const ARCHITECT_MAX_ATTACHMENT_UPLOAD_BYTES: usize =
+    ARCHITECT_MAX_ATTACHMENTS * ARCHITECT_MAX_ATTACHMENT_BYTES + (2 * 1024 * 1024);
 const ARCHI_SYSTEM_PROMPT: &str = r#"You are archi, the Fluxbee system architect.
 
 Operate as a concise technical assistant for the Fluxbee control plane.
@@ -106,11 +113,17 @@ struct HiveFile {
     hive_id: String,
     architect: Option<ArchitectSection>,
     ai_providers: Option<AiProvidersSection>,
+    blob: Option<BlobSection>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ArchitectSection {
     listen: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlobSection {
+    path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -195,6 +208,8 @@ struct ArchitectComponentStatus {
 struct ChatRequest {
     session_id: Option<String>,
     message: String,
+    #[serde(default)]
+    attachments: Vec<ChatAttachmentRef>,
 }
 
 #[derive(Debug, Serialize)]
@@ -204,6 +219,27 @@ struct ChatResponse {
     output: Value,
     session_id: Option<String>,
     session_title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ChatAttachmentRef {
+    attachment_id: String,
+    blob_ref: BlobRef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct UploadedAttachment {
+    attachment_id: String,
+    filename: String,
+    mime: String,
+    size: u64,
+    blob_ref: BlobRef,
+}
+
+#[derive(Debug, Serialize)]
+struct AttachmentUploadResponse {
+    status: String,
+    attachments: Vec<UploadedAttachment>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -754,9 +790,13 @@ async fn main() -> Result<(), ArchitectError> {
         .route("/healthz", any(dynamic_handler))
         .route("/api/status", any(dynamic_handler))
         .route("/api/chat", any(dynamic_handler))
+        .route("/api/attachments", any(dynamic_handler))
         .route("/api/sessions", any(dynamic_handler))
         .route("/api/sessions/*path", any(dynamic_handler))
         .route("/*path", any(dynamic_handler))
+        .layer(DefaultBodyLimit::max(
+            ARCHITECT_MAX_ATTACHMENT_UPLOAD_BYTES,
+        ))
         .with_state(Arc::clone(&state));
 
     let listener = TcpListener::bind(&listen).await?;
@@ -1015,6 +1055,172 @@ async fn root_handler(State(state): State<Arc<ArchitectState>>) -> Html<String> 
     Html(architect_index_html(&state))
 }
 
+fn architect_blob_root(state: &ArchitectState) -> Result<PathBuf, ArchitectError> {
+    let hive = load_hive(&state.config_dir)?;
+    if let Some(path) = hive
+        .blob
+        .as_ref()
+        .and_then(|blob| blob.path.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(PathBuf::from(path));
+    }
+    if let Ok(path) = std::env::var("FLUXBEE_BLOB_ROOT") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+    if let Ok(path) = std::env::var("BLOB_ROOT") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+    Ok(BlobConfig::default().blob_root)
+}
+
+fn architect_blob_toolkit(state: &ArchitectState) -> Result<BlobToolkit, ArchitectError> {
+    let mut cfg = BlobConfig::default();
+    cfg.blob_root = architect_blob_root(state)?;
+    BlobToolkit::new(cfg).map_err(|err| -> ArchitectError {
+        format!("failed to initialize blob toolkit for archi attachments: {err}").into()
+    })
+}
+
+fn normalize_attachment_mime(
+    provided: Option<&str>,
+    filename: &str,
+) -> Option<String> {
+    let provided = provided
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    if provided.is_some() {
+        return provided;
+    }
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())?;
+    let mime = match extension.as_str() {
+        "txt" => "text/plain",
+        "md" => "text/markdown",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "pdf" => "application/pdf",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
+fn architect_attachment_mime_supported(mime: &str) -> bool {
+    matches!(
+        mime,
+        "text/plain"
+            | "text/markdown"
+            | "text/csv"
+            | "application/json"
+            | "application/pdf"
+            | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            | "image/png"
+            | "image/jpeg"
+            | "image/webp"
+            | "image/gif"
+    )
+}
+
+async fn handle_attachment_upload(
+    state: &ArchitectState,
+    request: Request,
+) -> Result<AttachmentUploadResponse, ArchitectError> {
+    let mut multipart = Multipart::from_request(request, state)
+        .await
+        .map_err(|err| format!("invalid multipart upload: {err}"))?;
+    let toolkit = architect_blob_toolkit(state)?;
+    let mut attachments = Vec::new();
+    let mut files_seen = 0usize;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| format!("failed to read multipart field: {err}"))?
+    {
+        let Some(filename) = field
+            .file_name()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+        else {
+            continue;
+        };
+
+        files_seen += 1;
+        if files_seen > ARCHITECT_MAX_ATTACHMENTS {
+            return Err(format!(
+                "too many attachments: max {} files per upload",
+                ARCHITECT_MAX_ATTACHMENTS
+            )
+            .into());
+        }
+
+        let mime =
+            normalize_attachment_mime(field.content_type(), &filename).ok_or_else(|| {
+                format!("unsupported attachment mime for '{filename}'")
+            })?;
+        if !architect_attachment_mime_supported(&mime) {
+            return Err(format!("unsupported attachment mime: {mime}").into());
+        }
+
+        let data = field
+            .bytes()
+            .await
+            .map_err(|err| format!("failed to read uploaded file '{filename}': {err}"))?;
+        if data.is_empty() {
+            return Err(format!("attachment '{filename}' is empty").into());
+        }
+        if data.len() > ARCHITECT_MAX_ATTACHMENT_BYTES {
+            return Err(format!(
+                "attachment '{}' exceeds max size {} bytes",
+                filename, ARCHITECT_MAX_ATTACHMENT_BYTES
+            )
+            .into());
+        }
+
+        let blob_ref = toolkit
+            .put_bytes(data.as_ref(), &filename, &mime)
+            .and_then(|blob_ref| {
+                toolkit.promote(&blob_ref)?;
+                Ok(blob_ref)
+            })
+            .map_err(|err| format!("failed to persist attachment '{filename}': {err}"))?;
+        attachments.push(UploadedAttachment {
+            attachment_id: format!("att_{}", Uuid::new_v4().simple()),
+            filename,
+            mime,
+            size: blob_ref.size,
+            blob_ref,
+        });
+    }
+
+    if attachments.is_empty() {
+        return Err("multipart upload did not contain any file fields".into());
+    }
+
+    Ok(AttachmentUploadResponse {
+        status: "ok".to_string(),
+        attachments,
+    })
+}
+
 async fn dynamic_handler(
     State(state): State<Arc<ArchitectState>>,
     uri: Uri,
@@ -1161,8 +1367,18 @@ async fn dynamic_handler(
                         .into_response()
                 }
             };
-            let out = handle_chat_message(&state, req.session_id, req.message).await;
+            let out = handle_chat_message(&state, req.session_id, req.message, req.attachments).await;
             Json(out).into_response()
+        }
+        (Method::POST, _) if is_attachments_path(path) => {
+            match handle_attachment_upload(&state, request).await {
+                Ok(response) => Json(response).into_response(),
+                Err(err) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": err.to_string() })),
+                )
+                    .into_response(),
+            }
         }
         (Method::GET, _) if !is_api_path(path) => {
             Html(architect_index_html(&state)).into_response()
@@ -1175,6 +1391,7 @@ async fn handle_chat_message(
     state: &ArchitectState,
     session_id: Option<String>,
     message: String,
+    attachments: Vec<ChatAttachmentRef>,
 ) -> ChatResponse {
     let (resolved_session_id, mut session) =
         match resolve_chat_session(state, session_id, None).await {
@@ -1354,7 +1571,7 @@ async fn handle_chat_message(
             },
         }
     } else {
-        match handle_ai_chat(state, &session, message.trim()).await {
+        match handle_ai_chat(state, &session, message.trim(), &attachments).await {
             Ok(output) => ChatResponse {
                 status: "ok".to_string(),
                 mode: "chat".to_string(),
@@ -1380,7 +1597,9 @@ async fn handle_chat_message(
     if new_title != session.title {
         session.title = new_title;
     }
-    if let Err(err) = persist_chat_exchange(state, &mut session, message, &response).await {
+    if let Err(err) =
+        persist_chat_exchange(state, &mut session, message, &attachments, &response).await
+    {
         tracing::warn!(error = %err, session_id = %resolved_session_id, "failed to persist chat exchange");
     }
 
@@ -1394,6 +1613,7 @@ async fn handle_ai_chat(
     state: &ArchitectState,
     session: &ChatSessionRecord,
     input: &str,
+    attachments: &[ChatAttachmentRef],
 ) -> Result<Value, ArchitectError> {
     let runtime = state
         .ai_runtime
@@ -1421,13 +1641,47 @@ async fn handle_ai_chat(
         runtime.model_settings.clone(),
     );
     let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
+    let current_user_parts = if attachments.is_empty() {
+        None
+    } else {
+        let payload = TextV1Payload::new(
+            input,
+            attachments
+                .iter()
+                .map(|attachment| attachment.blob_ref.clone())
+                .collect(),
+        )
+        .to_value()
+        .map_err(|err| -> ArchitectError {
+            format!("failed to build text payload with attachments: {err}").into()
+        })?;
+        let resolved = resolve_model_input_from_payload_with_options(
+            &payload,
+            &ModelInputOptions {
+                multimodal: true,
+                max_attachments: ARCHITECT_MAX_ATTACHMENTS,
+                max_attachment_bytes: ARCHITECT_MAX_ATTACHMENT_BYTES as u64,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|err| -> ArchitectError {
+            format!("failed to resolve attachment payload for model input: {err}").into()
+        })?;
+        Some(build_openai_user_content_parts(&resolved).await.map_err(
+            |err| -> ArchitectError {
+                format!("failed to build OpenAI input parts from attachments: {err}").into()
+            },
+        )?)
+    };
+
     let result = runner
         .run_with_input(
             &model,
             &tools,
             FunctionRunInput {
                 current_user_message: input.to_string(),
-                current_user_parts: None,
+                current_user_parts,
                 immediate_memory: Some(memory),
             },
         )
@@ -1928,6 +2182,59 @@ fn message_focus_text(message: &PersistedChatMessage) -> Option<String> {
         .map(|content| preview_text(&content, 180))
 }
 
+fn persisted_message_attachments(message: &PersistedChatMessage) -> Vec<UploadedAttachment> {
+    message
+        .metadata
+        .get("attachments")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items.iter()
+                .filter_map(|item| serde_json::from_value::<UploadedAttachment>(item.clone()).ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn render_user_message_with_attachment_summary(
+    content: &str,
+    attachments: &[ChatAttachmentRef],
+) -> String {
+    if attachments.is_empty() {
+        return content.to_string();
+    }
+    let mut lines = Vec::new();
+    if !content.trim().is_empty() {
+        lines.push(content.trim().to_string());
+    }
+    lines.extend(attachments.iter().map(|attachment| {
+        format!(
+            "Attachment: {} ({}, {} bytes)",
+            attachment.blob_ref.filename_original,
+            attachment.blob_ref.mime,
+            attachment.blob_ref.size
+        )
+    }));
+    lines.join("\n")
+}
+
+fn render_persisted_user_message(message: &PersistedChatMessage) -> String {
+    let attachments = persisted_message_attachments(message);
+    if attachments.is_empty() {
+        return message.content.clone();
+    }
+    let mut lines = Vec::new();
+    if !message.content.trim().is_empty() {
+        lines.push(message.content.trim().to_string());
+    }
+    lines.extend(attachments.iter().map(|attachment| {
+        format!(
+            "Attachment: {} ({}, {} bytes)",
+            attachment.filename, attachment.mime, attachment.size
+        )
+    }));
+    lines.join("\n")
+}
+
 fn is_low_signal_control_text(content: &str) -> bool {
     matches!(
         content.trim().to_ascii_uppercase().as_str(),
@@ -1955,7 +2262,8 @@ fn immediate_interaction_from_message(
         }
     }
 
-    let content = message.content.trim();
+    let rendered_content = render_persisted_user_message(message);
+    let content = rendered_content.trim();
     if content.is_empty() {
         return None;
     }
@@ -4252,6 +4560,7 @@ async fn persist_chat_exchange(
     state: &ArchitectState,
     session: &mut ChatSessionRecord,
     user_message: String,
+    attachments: &[ChatAttachmentRef],
     response: &ChatResponse,
 ) -> Result<(), ArchitectError> {
     let _guard = state.chat_lock.lock().await;
@@ -4261,6 +4570,23 @@ async fn persist_chat_exchange(
 
     let now = now_epoch_ms();
     let user_message = sanitize_user_message_for_persistence(&user_message);
+    let user_metadata = if attachments.is_empty() {
+        json!({ "kind": "text" })
+    } else {
+        json!({
+            "kind": "text_with_attachments",
+            "attachments": attachments
+                .iter()
+                .map(|attachment| json!({
+                    "attachment_id": attachment.attachment_id,
+                    "filename": attachment.blob_ref.filename_original,
+                    "mime": attachment.blob_ref.mime,
+                    "size": attachment.blob_ref.size,
+                    "blob_ref": attachment.blob_ref,
+                }))
+                .collect::<Vec<_>>(),
+        })
+    };
     let user_row = ChatMessageRecord {
         message_id: Uuid::new_v4().to_string(),
         session_id: session.session_id.clone(),
@@ -4268,7 +4594,7 @@ async fn persist_chat_exchange(
         content: user_message.clone(),
         timestamp_ms: now,
         mode: "text".to_string(),
-        metadata_json: json!({ "kind": "text" }).to_string(),
+        metadata_json: user_metadata.to_string(),
         seq: session.message_count + 1,
     };
     append_message_record(&messages, &user_row).await?;
@@ -4281,7 +4607,8 @@ async fn persist_chat_exchange(
     if suppress_response_row {
         session.message_count += 1;
         session.last_activity_at_ms = now;
-        session.last_message_preview = preview_text(&user_message, 88);
+        session.last_message_preview =
+            preview_text(&render_user_message_with_attachment_summary(&user_message, attachments), 88);
         upsert_session_record(&sessions, session).await?;
         return Ok(());
     }
@@ -5375,6 +5702,10 @@ fn is_chat_path(path: &str) -> bool {
     path == "/api/chat" || path.ends_with("/api/chat")
 }
 
+fn is_attachments_path(path: &str) -> bool {
+    path == "/api/attachments" || path.ends_with("/api/attachments")
+}
+
 fn is_identity_ich_options_path(path: &str) -> bool {
     path == "/api/identity/ich-options" || path.ends_with("/api/identity/ich-options")
 }
@@ -6296,6 +6627,78 @@ fn architect_index_html(state: &ArchitectState) -> String {
       display: grid;
       gap: 8px;
     }}
+    .attachment-draft {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      min-height: 0;
+    }}
+    .attachment-draft:empty {{
+      display: none;
+    }}
+    .attachment-chip {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      max-width: 100%;
+      padding: 8px 10px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: var(--panel-soft);
+      color: var(--text);
+      font-size: 0.78rem;
+      line-height: 1.3;
+    }}
+    .attachment-chip-name {{
+      font-weight: 700;
+      word-break: break-word;
+    }}
+    .attachment-chip-meta {{
+      color: var(--muted);
+      font-size: 0.74rem;
+    }}
+    .attachment-chip-remove {{
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      padding: 0;
+      min-width: auto;
+      font-size: 1rem;
+      line-height: 1;
+      box-shadow: none;
+    }}
+    .attachment-chip-remove:hover {{
+      color: var(--text);
+    }}
+    .message-attachments {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }}
+    .message-attachment {{
+      display: inline-flex;
+      flex-direction: column;
+      gap: 2px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: #fbfcfe;
+      min-width: 0;
+      max-width: 100%;
+    }}
+    .message-attachment-name {{
+      font-size: 0.76rem;
+      font-weight: 700;
+      color: var(--text);
+      word-break: break-word;
+    }}
+    .message-attachment-meta {{
+      font-size: 0.72rem;
+      color: var(--muted);
+      word-break: break-word;
+    }}
     .composer-input-shell {{
       position: relative;
     }}
@@ -6305,7 +6708,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       resize: vertical;
       border: 1px solid var(--line);
       border-radius: 22px;
-      padding: 16px 128px 16px 20px;
+      padding: 16px 172px 16px 20px;
       font: inherit;
       background: var(--panel);
       color: var(--text);
@@ -6345,6 +6748,17 @@ fn architect_index_html(state: &ArchitectState) -> String {
       min-width: 96px;
       padding: 12px 20px;
       box-shadow: 0 10px 24px rgba(23, 23, 23, 0.14);
+    }}
+    #attach {{
+      min-width: auto;
+      padding: 10px 14px;
+      background: var(--panel-soft);
+      color: var(--text);
+      border: 1px solid var(--line);
+      box-shadow: none;
+    }}
+    #attach:hover {{
+      background: #eaf0fb;
     }}
     button:disabled {{
       opacity: 0.6;
@@ -6478,9 +6892,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
         <div id="messages" class="messages"></div>
         <div class="composer">
           <div class="composer-box">
+            <input id="attachment-input" type="file" multiple hidden />
+            <div id="attachment-draft" class="attachment-draft"></div>
             <div class="composer-input-shell">
               <textarea id="input" placeholder="Message or SCMD. Try: SCMD: help"></textarea>
               <div class="composer-actions">
+                <button id="attach" type="button">Attach</button>
                 <button id="send">Send</button>
               </div>
             </div>
@@ -6553,6 +6970,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const base = rawPath === "" ? "" : rawPath;
     const statusUrl = (base || "") + "/api/status";
     const chatUrl = (base || "") + "/api/chat";
+    const attachmentsUrl = (base || "") + "/api/attachments";
     const sessionsUrl = (base || "") + "/api/sessions";
     const identityIchOptionsUrl = (base || "") + "/api/identity/ich-options";
     const currentSessionStorageKey = "sy.architect.currentSession.{hive}";
@@ -6562,6 +6980,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const sessionRefreshHiddenMs = 8000;
     const messages = document.getElementById("messages");
     const input = document.getElementById("input");
+    const attach = document.getElementById("attach");
+    const attachmentInput = document.getElementById("attachment-input");
+    const attachmentDraft = document.getElementById("attachment-draft");
     const send = document.getElementById("send");
     const newChatOperator = document.getElementById("new-chat-operator");
     const newChatImpersonation = document.getElementById("new-chat-impersonation");
@@ -6587,6 +7008,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const confirmCancel = document.getElementById("confirm-cancel");
     const confirmAccept = document.getElementById("confirm-accept");
     let currentSessionId = null;
+    let currentSessionMode = "operator";
     let currentSessionRevision = "";
     let sessionsCache = [];
     let pendingIndicator = null;
@@ -6596,6 +7018,113 @@ fn architect_index_html(state: &ArchitectState) -> String {
     let sessionRefreshTimer = null;
     let sessionRefreshInFlight = false;
     let confirmResolver = null;
+    let pendingAttachments = [];
+    function formatBytes(value) {{
+      const size = Number(value || 0);
+      if (!Number.isFinite(size) || size <= 0) return "0 B";
+      if (size < 1024) return String(size) + " B";
+      if (size < 1024 * 1024) return (size / 1024).toFixed(1).replace(/\.0$/, "") + " KB";
+      return (size / (1024 * 1024)).toFixed(1).replace(/\.0$/, "") + " MB";
+    }}
+    function attachmentDisplayName(entry) {{
+      if (!entry) return "attachment";
+      return entry.filename || entry.name || "attachment";
+    }}
+    function attachmentDisplayMime(entry) {{
+      if (!entry) return "application/octet-stream";
+      return entry.mime || entry.type || "application/octet-stream";
+    }}
+    function clearPendingAttachments() {{
+      pendingAttachments = [];
+      if (attachmentInput) {{
+        attachmentInput.value = "";
+      }}
+      renderAttachmentDraft();
+    }}
+    function removePendingAttachment(index) {{
+      pendingAttachments = pendingAttachments.filter((_, idx) => idx !== index);
+      renderAttachmentDraft();
+    }}
+    function renderAttachmentDraft() {{
+      attachmentDraft.innerHTML = "";
+      pendingAttachments.forEach((entry, index) => {{
+        const chip = document.createElement("div");
+        const name = document.createElement("div");
+        const meta = document.createElement("div");
+        const remove = document.createElement("button");
+        chip.className = "attachment-chip";
+        name.className = "attachment-chip-name";
+        meta.className = "attachment-chip-meta";
+        remove.className = "attachment-chip-remove";
+        remove.type = "button";
+        remove.setAttribute("aria-label", "Remove attachment");
+        remove.innerHTML = "&times;";
+        name.textContent = attachmentDisplayName(entry.file);
+        meta.textContent = attachmentDisplayMime(entry.file) + " \u00B7 " + formatBytes(entry.file && entry.file.size);
+        remove.addEventListener("click", () => removePendingAttachment(index));
+        chip.appendChild(name);
+        chip.appendChild(meta);
+        chip.appendChild(remove);
+        attachmentDraft.appendChild(chip);
+      }});
+    }}
+    async function uploadPendingAttachments() {{
+      if (!pendingAttachments.length) {{
+        return [];
+      }}
+      const form = new FormData();
+      pendingAttachments.forEach((entry) => {{
+        if (entry && entry.file) {{
+          form.append("file", entry.file, entry.file.name || "attachment");
+        }}
+      }});
+      if (currentSessionId) {{
+        form.append("session_id", currentSessionId);
+      }}
+      const res = await fetch(attachmentsUrl, {{
+        method: "POST",
+        body: form
+      }});
+      const data = await res.json().catch(() => ({{ status: "error", error: "attachment upload failed" }}));
+      if (!res.ok || !data || data.status !== "ok") {{
+        const error = data && (data.error || data.error_detail) ? (data.error || data.error_detail) : "attachment upload failed";
+        throw new Error(error);
+      }}
+      return Array.isArray(data.attachments) ? data.attachments.map((item) => ({{
+        attachment_id: item.attachment_id,
+        blob_ref: item.blob_ref
+      }})) : [];
+    }}
+    function buildMessageBody(text, attachments) {{
+      const hasText = typeof text === "string" && text.length > 0;
+      const hasAttachments = Array.isArray(attachments) && attachments.length > 0;
+      if (!hasAttachments) {{
+        return hasText ? text : "";
+      }}
+      const shell = document.createElement("div");
+      if (hasText) {{
+        const textNode = document.createElement("div");
+        textNode.textContent = text;
+        shell.appendChild(textNode);
+      }}
+      const list = document.createElement("div");
+      list.className = "message-attachments";
+      attachments.forEach((entry) => {{
+        const card = document.createElement("div");
+        const name = document.createElement("div");
+        const meta = document.createElement("div");
+        card.className = "message-attachment";
+        name.className = "message-attachment-name";
+        meta.className = "message-attachment-meta";
+        name.textContent = attachmentDisplayName(entry);
+        meta.textContent = attachmentDisplayMime(entry) + " \u00B7 " + formatBytes(entry && entry.size);
+        card.appendChild(name);
+        card.appendChild(meta);
+        list.appendChild(card);
+      }});
+      shell.appendChild(list);
+      return shell;
+    }}
     function describeIchOption(option) {{
       if (!option) return "";
       const primary = option.is_primary ? " \u00B7 primary" : "";
@@ -7034,7 +7563,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
       const role = message.role === "architect" ? "architect" : message.role === "system" ? "system" : "user";
       const label = metadata.kind === "router_message" && metadata.label ? String(metadata.label) : null;
-      addMessage(role, message.content || "", label);
+      const attachments = Array.isArray(metadata.attachments) ? metadata.attachments : [];
+      addMessage(role, buildMessageBody(message.content || "", attachments), label);
     }}
     function isDestructiveMessage(message) {{
       const trimmed = String(message || "").trim();
@@ -7052,6 +7582,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       messages.innerHTML = "";
       if (!preserveComposer) {{
         input.value = "";
+        clearPendingAttachments();
       }}
     }}
     function formatSessionMeta(session) {{
@@ -7306,6 +7837,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       const session = detail && detail.session ? detail.session : null;
       const sessionId = session && session.session_id ? session.session_id : null;
       currentSessionId = sessionId;
+      currentSessionMode = sessionModeLabel(session);
       currentSessionRevision = sessionRevision(detail);
       if (sessionId) {{
         localStorage.setItem(currentSessionStorageKey, sessionId);
@@ -7422,9 +7954,24 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     async function submit() {{
       const message = input.value.trim();
-      if (!message) return;
+      if (!message && !pendingAttachments.length) return;
       if (!currentSessionId) {{
         await createSession();
+      }}
+      if (pendingAttachments.length) {{
+        const trimmed = String(message || "").trim();
+        if (!trimmed) {{
+          addMessage("system", "Attachments require a message.");
+          return;
+        }}
+        if (currentSessionMode !== "operator") {{
+          addMessage("system", "Attachments are only supported in operator chat mode.");
+          return;
+        }}
+        if (trimmed.startsWith("SCMD:") || trimmed === "CONFIRM" || trimmed === "CANCEL") {{
+          addMessage("system", "Attachments are not supported for SCMD, CONFIRM, or CANCEL.");
+          return;
+        }}
       }}
       if (isDestructiveMessage(message)) {{
         const confirmed = await openConfirmModal({{
@@ -7436,19 +7983,23 @@ fn architect_index_html(state: &ArchitectState) -> String {
         }});
         if (!confirmed) return;
       }}
-      addMessage("user", message);
+      const draftFiles = pendingAttachments.map((entry) => entry.file).filter(Boolean);
+      addMessage("user", buildMessageBody(message, draftFiles));
       const pendingLabel = message.trim().startsWith("SCMD:") || message.trim() === "CONFIRM"
         ? "System"
         : "archi";
       const pendingText = pendingLabel === "System" ? "Executing action" : "Thinking";
       showPendingIndicator(pendingLabel, pendingText);
       input.value = "";
+      renderAttachmentDraft();
       send.disabled = true;
+      attach.disabled = true;
       try {{
+        const attachments = await uploadPendingAttachments();
         const res = await fetch(chatUrl, {{
           method: "POST",
           headers: {{ "Content-Type": "application/json" }},
-          body: JSON.stringify({{ session_id: currentSessionId, message }})
+          body: JSON.stringify({{ session_id: currentSessionId, message, attachments }})
         }});
         const data = await res.json();
         if (data.session_id) {{
@@ -7459,6 +8010,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         if (!(data && data.output && data.output.suppress_echo === true)) {{
           renderResponsePayload(data.status === "ok" ? "architect" : "system", data);
         }}
+        clearPendingAttachments();
         await refreshSessionList(currentSessionId);
         await refreshCurrentSession({{ force: true }});
       }} catch (err) {{
@@ -7467,9 +8019,20 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }} finally {{
         hidePendingIndicator();
         send.disabled = false;
+        attach.disabled = false;
         refreshStatus({{ force: true }});
       }}
     }}
+    attach.addEventListener("click", () => {{
+      attachmentInput.click();
+    }});
+    attachmentInput.addEventListener("change", (event) => {{
+      const files = Array.from(event.target && event.target.files ? event.target.files : []);
+      if (!files.length) return;
+      pendingAttachments = pendingAttachments.concat(files.map((file) => ({{ file }})));
+      attachmentInput.value = "";
+      renderAttachmentDraft();
+    }});
     send.addEventListener("click", submit);
     clearHistory.addEventListener("click", () => {{
       clearAllHistory().catch((err) => {{
@@ -7596,6 +8159,17 @@ fn architect_index_html(state: &ArchitectState) -> String {
 mod tests {
     use super::*;
 
+    fn sample_blob_ref(filename: &str, mime: &str, size: u64) -> BlobRef {
+        BlobRef {
+            ref_type: "blob_ref".to_string(),
+            blob_name: format!("blob_{}_0123456789abcdef", filename.replace('.', "_")),
+            size,
+            mime: mime.to_string(),
+            filename_original: filename.to_string(),
+            spool_day: "2026-04-17".to_string(),
+        }
+    }
+
     fn parse(raw: &str) -> ParsedScmd {
         parse_scmd(raw).expect("scmd should parse")
     }
@@ -7656,5 +8230,48 @@ mod tests {
                 "definition": { "wf_schema_version": "1" }
             })
         );
+    }
+
+    #[test]
+    fn render_user_message_with_attachment_summary_includes_attachment_lines() {
+        let summary = render_user_message_with_attachment_summary(
+            "revisa esto",
+            &[ChatAttachmentRef {
+                attachment_id: "att_1".to_string(),
+                blob_ref: sample_blob_ref("invoice.pdf", "application/pdf", 182233),
+            }],
+        );
+
+        assert!(summary.contains("revisa esto"));
+        assert!(summary.contains("Attachment: invoice.pdf (application/pdf, 182233 bytes)"));
+    }
+
+    #[test]
+    fn immediate_interaction_from_message_includes_persisted_attachment_summary() {
+        let message = PersistedChatMessage {
+            message_id: "msg_1".to_string(),
+            session_id: "sess_1".to_string(),
+            role: "user".to_string(),
+            content: "revisa esto".to_string(),
+            timestamp_ms: 0,
+            mode: "text".to_string(),
+            metadata: json!({
+                "kind": "text_with_attachments",
+                "attachments": [{
+                    "attachment_id": "att_1",
+                    "filename": "invoice.pdf",
+                    "mime": "application/pdf",
+                    "size": 182233,
+                    "blob_ref": sample_blob_ref("invoice.pdf", "application/pdf", 182233),
+                }]
+            }),
+        };
+
+        let interaction =
+            immediate_interaction_from_message(&message).expect("interaction should exist");
+        assert!(interaction.content.contains("revisa esto"));
+        assert!(interaction
+            .content
+            .contains("Attachment: invoice.pdf (application/pdf, 182233 bytes)"));
     }
 }

@@ -549,25 +549,76 @@ If OPA or config routes by L1 UUID in some paths, the impersonation may not work
 ### 8.1 Flow
 
 ```
-User clicks 📎 → selects file → file uploads via HTTP multipart to architect
+User clicks 📎 → selects file → file is staged in the composer
+User sends a normal operator chat turn
+Archi uploads the staged files via HTTP multipart to architect
+Architect persists them as blobs and sends BlobRef-backed multimodal input to the model
 
 Architect:
-  1. Receives file via HTTP.
+  1. Receives file via HTTP `POST /api/attachments`.
   2. Uses blob toolkit: put() → promote().
-  3. Creates BlobRef.
-  4. Includes BlobRef in the next AI message context or ADMIN_COMMAND.
+  3. Creates BlobRef + safe attachment metadata.
+  4. Includes BlobRef in the next AI chat turn context.
 ```
+
+`POST /api/chat` remains JSON-only. The browser sends:
+
+- `message`
+- `session_id`
+- `attachments[]` with stable attachment descriptors returned by `/api/attachments`
+
+Current-turn attachments are passed to the model as multimodal `input_file` / `input_image` parts. Previous turns are not replayed as live file parts in v1; they are summarized textually in recent-memory reconstruction.
 
 ### 8.2 Use Cases
 
-- Upload prompt assets or packaging inputs as part of build/publish workflows.
-- Upload a runtime package (zip) for publishing.
-- Upload configuration files.
-- Upload test data for IO impersonation scenarios.
+- Attach documents or images to an operator chat turn so the model can inspect them.
+- Review prompt assets, specs, configs, CSV/JSON data, and screenshots directly from the Archi UI.
+
+This capability is for **operator AI chat mode**. It is explicitly out of scope in v1 for:
+
+- `SCMD`
+- `CONFIRM` / `CANCEL`
+- impersonation/debug dispatch
 
 ### 8.3 Storage
 
 Files go through the standard blob pipeline: staging → active in `/var/lib/fluxbee/blob/`. The architect uses `fluxbee_sdk::blob` for all operations.
+
+Session persistence stores only safe metadata:
+
+- filename
+- mime
+- size
+- `blob_ref`
+
+Raw bytes are not stored in chat history rows.
+
+### 8.4 Supported Types And Limits
+
+Supported MIME families in v1:
+
+- `text/plain`
+- `text/markdown`
+- `text/csv`
+- `application/json`
+- `application/pdf`
+- `application/vnd.openxmlformats-officedocument.wordprocessingml.document`
+- `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
+- `image/png`
+- `image/jpeg`
+- `image/webp`
+- `image/gif`
+
+Limits in v1:
+
+- max 8 attachments per upload
+- max 10 MB per file
+- uploads are browser-staged and removable before send
+
+Blob lifecycle is intentionally simple in v1:
+
+- deleting a chat session does not delete blobs
+- blob GC remains the cleanup mechanism
 
 ---
 
