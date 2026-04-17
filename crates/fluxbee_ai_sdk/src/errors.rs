@@ -16,6 +16,10 @@ pub enum AiSdkError {
     Http(#[from] reqwest::Error),
     #[error("protocol error: {0}")]
     Protocol(String),
+    #[error("invalid response contract: {detail}")]
+    InvalidResponseContract { detail: String },
+    #[error("invalid structured output: {detail}")]
+    InvalidStructuredOutput { detail: String },
     #[error("artifact MIME not allowed: {mime}")]
     ArtifactMimeNotAllowed { mime: String },
     #[error("artifact filename invalid: {detail}")]
@@ -55,6 +59,8 @@ impl AiSdkError {
             AiSdkError::Payload(_) => false,
             AiSdkError::Json(_) => false,
             AiSdkError::Protocol(_) => false,
+            AiSdkError::InvalidResponseContract { .. } => false,
+            AiSdkError::InvalidStructuredOutput { .. } => false,
             AiSdkError::ArtifactMimeNotAllowed { .. } => false,
             AiSdkError::ArtifactFilenameInvalid { .. } => false,
         }

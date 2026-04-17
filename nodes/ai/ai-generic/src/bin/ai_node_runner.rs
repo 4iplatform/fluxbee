@@ -11,11 +11,12 @@ use async_trait::async_trait;
 use base64::Engine;
 use fluxbee_ai_sdk::router_client::{RouterReader, RouterWriter};
 use fluxbee_ai_sdk::{
-    build_ai_behavior_response, build_openai_user_content_parts, build_reply_message_runtime_src,
-    extract_text, resolve_model_input_from_payload_with_options, AiBehaviorOutput, AiFinalOutput,
-    AiNode, AiNodeConfig, AiUserArtifact, FunctionCallingConfig, FunctionCallingRunner,
-    FunctionLoopItem, FunctionLoopRunResult, FunctionRunInput, FunctionTool,
-    FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry,
+    build_ai_behavior_response, build_openai_user_content_parts, build_output_schema_fallback_instruction,
+    build_reply_message_runtime_src, extract_text, resolve_model_input_from_payload_with_options,
+    resolve_response_envelope_output_schema, AiBehaviorOutput, AiFinalOutput, AiNode,
+    AiNodeConfig, AiUserArtifact, FunctionCallingConfig, FunctionCallingRunner, FunctionLoopItem,
+    FunctionLoopRunResult, FunctionRunInput, FunctionTool, FunctionToolDefinition,
+    FunctionToolProvider, FunctionToolRegistry,
     ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelInputOptions,
     ModelSettings, NodeRuntime, OpenAiResponsesClient, ResolvedModelInput, RetryPolicy,
     RouterClient, RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,
@@ -545,6 +546,7 @@ impl GovIdentityBridge {
         let req = Message {
             routing: Routing {
                 src,
+                src_l2_name: None,
                 dst: Destination::Unicast(target.to_string()),
                 ttl: 16,
                 trace_id: trace_id.clone(),
@@ -1092,7 +1094,7 @@ impl AiNode for GenericAiNode {
                     None
                 };
                 match self
-                    .run_openai_chat(openai, input, input_parts, &behavior_ctx)
+                    .run_openai_chat(openai, input, input_parts, &behavior_ctx, &msg.meta)
                     .await
                 {
                     Ok(output) => output,
@@ -1178,6 +1180,7 @@ impl GenericAiNode {
         input: String,
         input_parts: Option<Vec<Value>>,
         ctx: &BehaviorContext,
+        meta: &Meta,
     ) -> fluxbee_ai_sdk::Result<AiBehaviorOutput> {
         let api_key = self.resolve_openai_api_key(openai).await.ok_or_else(|| {
             fluxbee_ai_sdk::errors::AiSdkError::Protocol(
@@ -1189,11 +1192,35 @@ impl GenericAiNode {
         if let Some(base_url) = &openai.base_url {
             client = client.with_base_url(base_url.clone());
         }
+        let output_schema = resolve_response_envelope_output_schema(meta)?;
         let tool_registry = self.build_tool_registry(ctx)?;
+        let tool_count = tool_registry.definitions().len();
+        let output_contract_mode = match (output_schema.as_ref(), tool_count > 0) {
+            (Some(_), true) => "fallback_instruction",
+            (Some(_), false) => "structured_output",
+            (None, _) => "free_text",
+        };
+        tracing::info!(
+            node_name = %self.node_name,
+            thread_id = ?ctx.thread_id,
+            src_ilk = ?ctx.src_ilk,
+            tool_count,
+            output_contract_mode,
+            output_schema_name = ?output_schema.as_ref().map(|schema| schema.name()),
+            "openai chat request prepared"
+        );
         if !tool_registry.definitions().is_empty() {
+            let system = match (&openai.instructions, &output_schema) {
+                (Some(base), Some(schema)) => Some(format!(
+                    "{base}\n\n{}",
+                    build_output_schema_fallback_instruction(schema)?
+                )),
+                (None, Some(schema)) => Some(build_output_schema_fallback_instruction(schema)?),
+                (base, None) => base.clone(),
+            };
             let model = client.clone().function_model(
                 openai.model.clone(),
-                openai.instructions.clone(),
+                system,
                 openai.model_settings.clone(),
             );
             let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
@@ -1234,6 +1261,7 @@ impl GenericAiNode {
             system: openai.instructions.clone(),
             input,
             input_parts,
+            output_schema,
             max_output_tokens: None,
             model_settings: Some(openai.model_settings.clone()),
         };
@@ -5351,6 +5379,7 @@ mod tests {
         Message {
             routing: Routing {
                 src: "SY.orchestrator@motherbee".to_string(),
+                src_l2_name: None,
                 dst: Destination::Unicast("SY.frontdesk.gov@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-123".to_string(),
@@ -5529,6 +5558,7 @@ mod tests {
         Message {
             routing: Routing {
                 src: "IO.sim.local@motherbee".to_string(),
+                src_l2_name: None,
                 dst: Destination::Unicast("SY.frontdesk.gov@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-user-123".to_string(),
@@ -6048,6 +6078,7 @@ mod tests {
         let msg = Message {
             routing: Routing {
                 src: "SY.admin@motherbee".to_string(),
+                src_l2_name: None,
                 dst: Destination::Unicast("AI.chat@motherbee".to_string()),
                 ttl: 16,
                 trace_id: "trace-config-123".to_string(),

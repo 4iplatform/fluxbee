@@ -22,8 +22,8 @@ use fluxbee_sdk::identity::{
 use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{connect, try_handle_default_node_status, NodeConfig, NodeUuidMode};
 use io_common::frontdesk_contract::{
-    parse_frontdesk_result_payload, FrontdeskHandoffPayload, FrontdeskHandoffSubject,
-    FRONTDESK_HANDOFF_PAYLOAD_TYPE, FRONTDESK_SCHEMA_VERSION_V1,
+    FrontdeskHandoffPayload, FrontdeskHandoffSubject, FRONTDESK_HANDOFF_PAYLOAD_TYPE,
+    FRONTDESK_SCHEMA_VERSION_V1,
 };
 use io_common::identity::{
     IdentityProvisioner, IdentityResolver, ResolveOrCreateInput, ShmIdentityResolver,
@@ -33,7 +33,9 @@ use io_common::io_adapter_config::{
     apply_adapter_config_replace, build_io_adapter_contract_payload, IoAdapterConfigContract,
 };
 use io_common::io_api_adapter_config::IoApiAdapterConfigContract;
-use io_common::io_context::IoContext;
+use io_common::io_context::{
+    parse_structured_response_payload, set_response_envelope, IoContext,
+};
 use io_common::io_control_plane::{
     build_io_config_get_response_payload, build_io_config_response_message,
     build_io_config_set_error_payload, build_io_config_set_ok_payload,
@@ -56,6 +58,7 @@ use io_common::relay::{
 use io_common::text_v1_blob::{
     build_text_v1_inbound_payload, IoBlobRuntimeConfig, IoTextBlobConfig,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -73,7 +76,7 @@ use config::{
     api_relay_policy, api_relay_policy_from_config, extract_runtime_dst_node,
     extract_runtime_listen_addr, extract_runtime_relay_config,
 };
-use http::{accepted_response, api_error, frontdesk_result_response};
+use http::{accepted_response, api_error, frontdesk_result_response, FrontdeskHttpEnvelope};
 use schema::{
     build_configured_schema, build_unconfigured_schema, extract_accepted_content_types,
     extract_max_request_bytes, extract_subject_mode, lifecycle_status,
@@ -186,6 +189,14 @@ struct FrontdeskResolvedRequest {
     src_ilk: String,
     payload: FrontdeskHandoffPayload,
     dst_node: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FrontdeskIoApiEnvelope {
+    success: bool,
+    human_message: String,
+    #[serde(default)]
+    error_code: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -812,7 +823,7 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
                     Ok(value) => value,
                     Err(response) => return response,
                 };
-            if frontdesk_result.status != "ok" {
+            if !frontdesk_result.success {
                 return frontdesk_result_response(frontdesk_result);
             }
         }
@@ -940,7 +951,7 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
                 Ok(value) => value,
                 Err(response) => return response,
             };
-        if frontdesk_result.status != "ok" {
+        if !frontdesk_result.success {
             return frontdesk_result_response(frontdesk_result);
         }
     }
@@ -1563,25 +1574,23 @@ async fn request_frontdesk_handoff_for_http(
     state: &Arc<HttpState>,
     parsed: &ParsedHttpMessage,
     frontdesk: FrontdeskResolvedRequest,
-) -> Result<io_common::frontdesk_contract::FrontdeskResultPayload, Response> {
+) -> Result<FrontdeskHttpEnvelope, Response> {
     let trace_id = io_common::router_message::new_trace_id();
-    let thread_id = parsed.io_context.conversation.thread_id.clone();
     let frontdesk_src_ilk = frontdesk.src_ilk.clone();
     let frontdesk_node = frontdesk.dst_node.clone();
-    let context = serde_json::json!({
-        "io": {
-            "channel": parsed.io_context.channel,
-            "entrypoint": parsed.io_context.entrypoint,
-            "sender": parsed.io_context.sender,
-            "conversation": {
-                "kind": parsed.io_context.conversation.kind,
-                "id": parsed.io_context.conversation.id,
-                "thread_id": thread_id,
-            },
-            "message": parsed.io_context.message,
-            "reply_target": parsed.io_context.reply_target,
-        }
-    });
+    let response_envelope = frontdesk_http_response_contract();
+    let context = build_frontdesk_request_context(parsed, &response_envelope).map_err(|err| {
+        tracing::warn!(
+            %trace_id,
+            error = %err,
+            "failed to build frontdesk response envelope context"
+        );
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid_response_contract",
+            "Unable to build frontdesk response contract",
+        )
+    })?;
     let msg = io_common::router_message::build_user_message(
         state.sender.uuid().to_string().as_str(),
         Some(frontdesk.dst_node),
@@ -1607,7 +1616,7 @@ async fn request_frontdesk_handoff_for_http(
         frontdesk_src_ilk = %frontdesk_src_ilk,
         frontdesk_node = %frontdesk_node,
         timeout_ms = state.identity_provision_cfg.timeout.as_millis() as u64,
-        "io-api waiting for frontdesk_result via router inbox"
+        "io-api waiting for structured frontdesk reply via router inbox"
     );
 
     let reply = match inbox
@@ -1650,19 +1659,83 @@ async fn request_frontdesk_handoff_for_http(
         }
     };
 
-    let Some(frontdesk_result) = parse_frontdesk_result_payload(&reply.payload) else {
-        tracing::warn!(
-            %trace_id,
-            payload = %reply.payload,
-            "frontdesk reply did not contain a valid frontdesk_result payload"
-        );
-        return Err(api_error(
-            StatusCode::BAD_GATEWAY,
-            "invalid_frontdesk_response",
-            "Frontdesk did not return a valid frontdesk_result payload",
-        ));
-    };
-    Ok(frontdesk_result)
+    let structured = parse_structured_response_payload(&reply.payload, &response_envelope)
+        .map_err(|err| {
+            tracing::warn!(
+                %trace_id,
+                payload = %reply.payload,
+                error = %err,
+                "frontdesk reply did not contain a valid structured response payload"
+            );
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "invalid_frontdesk_response",
+                "Frontdesk did not return a valid structured response payload",
+            )
+        })?;
+    let frontdesk_result: FrontdeskIoApiEnvelope =
+        serde_json::from_value(Value::Object(structured)).map_err(|err| {
+            tracing::warn!(
+                %trace_id,
+                error = %err,
+                "frontdesk structured reply could not be materialized"
+            );
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "invalid_frontdesk_response",
+                "Frontdesk returned an incompatible structured response",
+            )
+        })?;
+
+    Ok(FrontdeskHttpEnvelope {
+        success: frontdesk_result.success,
+        human_message: frontdesk_result.human_message,
+        error_code: frontdesk_result.error_code,
+    })
+}
+
+fn frontdesk_http_response_contract() -> Value {
+    serde_json::json!({
+        "kind": "json_object_v1",
+        "required": ["success", "human_message"],
+        "properties": {
+            "success": { "type": "boolean" },
+            "human_message": { "type": "string" },
+            "error_code": {
+                "type": "string",
+                "enum": [
+                    "missing_required_fields",
+                    "invalid_request",
+                    "identity_unavailable",
+                    "register_failed",
+                    "unknown"
+                ]
+            }
+        }
+    })
+}
+
+fn build_frontdesk_request_context(
+    parsed: &ParsedHttpMessage,
+    response_envelope: &Value,
+) -> Result<Value, io_common::io_context::IoResponseContractError> {
+    set_response_envelope(
+        Some(serde_json::json!({
+            "io": {
+                "channel": parsed.io_context.channel,
+                "entrypoint": parsed.io_context.entrypoint,
+                "sender": parsed.io_context.sender,
+                "conversation": {
+                    "kind": parsed.io_context.conversation.kind,
+                    "id": parsed.io_context.conversation.id,
+                    "thread_id": parsed.io_context.conversation.thread_id,
+                },
+                "message": parsed.io_context.message,
+                "reply_target": parsed.io_context.reply_target,
+            }
+        })),
+        response_envelope.clone(),
+    )
 }
 
 async fn route_http_message(
@@ -2397,6 +2470,88 @@ mod tests {
         )
         .expect_err("frontdesk handoff should reject by_ilk");
         assert_eq!(err.1, "invalid_payload");
+    }
+
+    #[test]
+    fn frontdesk_http_response_contract_has_expected_shape() {
+        let contract = frontdesk_http_response_contract();
+        assert_eq!(contract.get("kind").and_then(Value::as_str), Some("json_object_v1"));
+        assert_eq!(
+            contract.get("required").cloned(),
+            Some(serde_json::json!(["success", "human_message"]))
+        );
+        assert_eq!(
+            contract
+                .get("properties")
+                .and_then(|value| value.get("success"))
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str),
+            Some("boolean")
+        );
+        assert_eq!(
+            contract
+                .get("properties")
+                .and_then(|value| value.get("human_message"))
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str),
+            Some("string")
+        );
+    }
+
+    #[test]
+    fn build_frontdesk_request_context_attaches_response_envelope() {
+        let effective = configured_effective("explicit_subject");
+        let auth_match = AuthMatch {
+            key_id: "partner1".to_string(),
+            tenant_id: "tnt:partner1".to_string(),
+            caller_identity: None,
+        };
+        let envelope = serde_json::json!({
+            "subject": {
+                "external_user_id": "crm:123",
+                "display_name": "Juan Perez",
+                "email": "juan@example.com"
+            },
+            "message": {
+                "text": "hola",
+                "external_message_id": "crm-msg-1"
+            },
+            "options": {
+                "metadata": {
+                    "conversation_id": "conv-1"
+                }
+            }
+        });
+        let parsed =
+            parse_json_message_request(&envelope, &effective, &auth_match, false).expect("parsed");
+
+        let context = build_frontdesk_request_context(&parsed, &frontdesk_http_response_contract())
+            .expect("context");
+
+        assert_eq!(
+            context
+                .get("io")
+                .and_then(|value| value.get("conversation"))
+                .and_then(|value| value.get("thread_id"))
+                .and_then(Value::as_str),
+            parsed.io_context.conversation.thread_id.as_deref()
+        );
+        assert_eq!(
+            context
+                .get("response_envelope")
+                .and_then(|value| value.get("kind"))
+                .and_then(Value::as_str),
+            Some("json_object_v1")
+        );
+        assert_eq!(
+            context
+                .get("response_envelope")
+                .and_then(|value| value.get("properties"))
+                .and_then(|value| value.get("error_code"))
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str),
+            Some("string")
+        );
     }
 
     #[test]

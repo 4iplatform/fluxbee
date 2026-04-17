@@ -1,7 +1,15 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use io_common::frontdesk_contract::FrontdeskResultPayload;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FrontdeskHttpEnvelope {
+    pub success: bool,
+    pub human_message: String,
+    #[serde(default)]
+    pub error_code: Option<String>,
+}
 
 pub(crate) fn accepted_response(
     node_name: &str,
@@ -52,69 +60,67 @@ pub(crate) fn api_error(
         .into_response()
 }
 
-pub(crate) fn frontdesk_result_response(payload: FrontdeskResultPayload) -> Response {
-    let status = match (payload.status.as_str(), payload.result_code.as_str()) {
-        ("ok", _) => StatusCode::OK,
-        ("needs_input", _) => StatusCode::UNPROCESSABLE_ENTITY,
-        ("error", "INVALID_REQUEST") => StatusCode::UNPROCESSABLE_ENTITY,
-        ("error", "IDENTITY_UNAVAILABLE") => StatusCode::SERVICE_UNAVAILABLE,
-        ("error", "REGISTER_FAILED") => StatusCode::BAD_GATEWAY,
-        ("error", _) => StatusCode::BAD_GATEWAY,
-        _ => StatusCode::OK,
+pub(crate) fn frontdesk_result_response(payload: FrontdeskHttpEnvelope) -> Response {
+    let status = match (payload.success, payload.error_code.as_deref()) {
+        (true, _) => StatusCode::OK,
+        (false, Some("missing_required_fields")) => StatusCode::UNPROCESSABLE_ENTITY,
+        (false, Some("invalid_request")) => StatusCode::UNPROCESSABLE_ENTITY,
+        (false, Some("identity_unavailable")) => StatusCode::SERVICE_UNAVAILABLE,
+        (false, Some("register_failed")) => StatusCode::BAD_GATEWAY,
+        (false, Some(_)) => StatusCode::BAD_GATEWAY,
+        (false, None) => StatusCode::BAD_GATEWAY,
     };
     (status, Json(payload)).into_response()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::frontdesk_result_response;
+    use super::{frontdesk_result_response, FrontdeskHttpEnvelope};
     use axum::http::StatusCode;
-    use io_common::frontdesk_contract::FrontdeskResultPayload;
 
-    fn sample_payload(status: &str, result_code: &str) -> FrontdeskResultPayload {
-        FrontdeskResultPayload {
-            payload_type: "frontdesk_result".to_string(),
-            schema_version: 1,
-            status: status.to_string(),
-            result_code: result_code.to_string(),
+    fn sample_payload(success: bool, error_code: Option<&str>) -> FrontdeskHttpEnvelope {
+        FrontdeskHttpEnvelope {
+            success,
             human_message: "message".to_string(),
-            missing_fields: Vec::new(),
-            error_code: None,
-            error_detail: None,
-            ilk_id: None,
-            tenant_id: Some("tnt:acme".to_string()),
-            registration_status: Some("temporary".to_string()),
+            error_code: error_code.map(ToString::to_string),
         }
     }
 
     #[test]
     fn frontdesk_needs_input_maps_to_unprocessable_entity() {
-        let response =
-            frontdesk_result_response(sample_payload("needs_input", "MISSING_REQUIRED_FIELDS"));
+        let response = frontdesk_result_response(sample_payload(
+            false,
+            Some("missing_required_fields"),
+        ));
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[test]
     fn frontdesk_ok_maps_to_ok() {
-        let response = frontdesk_result_response(sample_payload("ok", "REGISTERED"));
+        let response = frontdesk_result_response(sample_payload(true, None));
         assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]
     fn frontdesk_error_invalid_request_maps_to_unprocessable_entity() {
-        let response = frontdesk_result_response(sample_payload("error", "INVALID_REQUEST"));
+        let response =
+            frontdesk_result_response(sample_payload(false, Some("invalid_request")));
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[test]
     fn frontdesk_error_identity_unavailable_maps_to_service_unavailable() {
-        let response = frontdesk_result_response(sample_payload("error", "IDENTITY_UNAVAILABLE"));
+        let response = frontdesk_result_response(sample_payload(
+            false,
+            Some("identity_unavailable"),
+        ));
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
     fn frontdesk_error_register_failed_maps_to_bad_gateway() {
-        let response = frontdesk_result_response(sample_payload("error", "REGISTER_FAILED"));
+        let response =
+            frontdesk_result_response(sample_payload(false, Some("register_failed")));
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     }
 }

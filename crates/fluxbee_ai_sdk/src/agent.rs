@@ -78,6 +78,7 @@ impl Agent {
             system: self.instructions.clone(),
             input,
             input_parts: None,
+            output_schema: None,
             max_output_tokens: None,
             model_settings: Some(self.model_settings.clone()),
         }

@@ -20,8 +20,17 @@ pub struct LlmRequest {
     pub input: String,
     #[serde(default)]
     pub input_parts: Option<Vec<Value>>,
+    #[serde(default)]
+    pub output_schema: Option<OutputSchemaSpec>,
     pub max_output_tokens: Option<u32>,
     pub model_settings: Option<ModelSettings>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OutputSchemaSpec {
+    pub name: String,
+    pub schema: Value,
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +49,100 @@ pub struct ModelSettings {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub max_output_tokens: Option<u32>,
+}
+
+impl OutputSchemaSpec {
+    pub fn new(name: impl Into<String>, schema: Value, strict: bool) -> Result<Self> {
+        let spec = Self {
+            name: name.into(),
+            schema,
+            strict,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn json_schema(&self) -> &Value {
+        &self.schema
+    }
+
+    pub fn strict(&self) -> bool {
+        self.strict
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            return Err(AiSdkError::InvalidResponseContract {
+                detail: "schema name is required".to_string(),
+            });
+        }
+        if !self.schema.is_object() {
+            return Err(AiSdkError::InvalidResponseContract {
+                detail: "schema must be a JSON object".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+pub fn build_output_schema_fallback_instruction(output_schema: &OutputSchemaSpec) -> Result<String> {
+    output_schema.validate()?;
+    let schema_obj = output_schema
+        .json_schema()
+        .as_object()
+        .ok_or_else(|| AiSdkError::InvalidResponseContract {
+            detail: "schema must be a JSON object".to_string(),
+        })?;
+    let properties = schema_obj
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or_else(|| AiSdkError::InvalidResponseContract {
+            detail: "object schema.properties is required".to_string(),
+        })?;
+    let required = schema_obj
+        .get("required")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AiSdkError::InvalidResponseContract {
+            detail: "object schema.required is required".to_string(),
+        })?;
+
+    let mut field_specs = Vec::with_capacity(properties.len());
+    for (name, value) in properties {
+        let field_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AiSdkError::InvalidResponseContract {
+                detail: format!("schema.type is required for field '{name}'"),
+            })?;
+        let mut part = format!("{name}:{field_type}");
+        if let Some(enum_values) = value.get("enum").and_then(Value::as_array) {
+            let joined = enum_values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("|");
+            if !joined.is_empty() {
+                part.push('(');
+                part.push_str(&joined);
+                part.push(')');
+            }
+        }
+        field_specs.push(part);
+    }
+
+    let required_fields = required
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let fields = field_specs.join(", ");
+    Ok(format!(
+        "Return only valid JSON. Do not include markdown fences or extra text. The top-level value must be an object with exactly these fields: {fields}. Required fields: {required_fields}. Do not include properties outside this schema."
+    ))
 }
 
 #[async_trait]
@@ -182,6 +285,12 @@ impl LlmClient for OpenAiResponsesClient {
             "temperature": temperature,
             "top_p": top_p,
         });
+        let mut body = body;
+        if let Some(output_schema) = &request.output_schema {
+            body["text"] = json!({
+                "format": build_openai_response_format(output_schema)?,
+            });
+        }
 
         let auth = format!("Bearer {}", self.api_key);
         let response = self
@@ -221,6 +330,11 @@ impl LlmClient for OpenAiResponsesClient {
             })
             .ok_or_else(|| AiSdkError::Protocol("responses payload missing text output".into()))?;
 
+        let text = match &request.output_schema {
+            Some(output_schema) => validate_structured_output(&text, output_schema)?,
+            None => text,
+        };
+
         Ok(LlmResponse { content: text })
     }
 }
@@ -244,6 +358,194 @@ fn build_openai_input_items(request: &LlmRequest) -> Vec<Value> {
         "content": user_content,
     }));
     input
+}
+
+fn build_openai_response_format(output_schema: &OutputSchemaSpec) -> Result<Value> {
+    output_schema.validate()?;
+    Ok(json!({
+        "type": "json_schema",
+        "name": output_schema.name(),
+        "schema": output_schema.json_schema(),
+        "strict": output_schema.strict(),
+    }))
+}
+
+fn validate_structured_output(raw: &str, output_schema: &OutputSchemaSpec) -> Result<String> {
+    let candidate = extract_json_candidate(raw)?;
+    let parsed: Value = serde_json::from_str(&candidate).map_err(|err| {
+        AiSdkError::InvalidStructuredOutput {
+            detail: format!("json_parse_error: {err}"),
+        }
+    })?;
+    validate_value_against_schema(&parsed, output_schema.json_schema())?;
+    serde_json::to_string(&parsed).map_err(AiSdkError::from)
+}
+
+fn extract_json_candidate(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AiSdkError::InvalidStructuredOutput {
+            detail: "empty_response".to_string(),
+        });
+    }
+
+    if let Some(stripped) = trimmed.strip_prefix("```") {
+        let stripped = stripped.trim_start_matches(|c| c != '\n');
+        let stripped = stripped.strip_prefix('\n').unwrap_or(stripped);
+        let stripped = stripped.strip_suffix("```").unwrap_or(stripped);
+        let inner = stripped.trim();
+        if inner.is_empty() {
+            return Err(AiSdkError::InvalidStructuredOutput {
+                detail: "empty_json_fence".to_string(),
+            });
+        }
+        return Ok(inner.to_string());
+    }
+
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return Ok(trimmed.to_string());
+    }
+
+    match (trimmed.find('{'), trimmed.rfind('}')) {
+        (Some(start), Some(end)) if start < end => Ok(trimmed[start..=end].to_string()),
+        _ => Err(AiSdkError::InvalidStructuredOutput {
+            detail: "json_candidate_not_found".to_string(),
+        }),
+    }
+}
+
+fn validate_value_against_schema(value: &Value, schema: &Value) -> Result<()> {
+    let schema_obj = schema.as_object().ok_or_else(|| AiSdkError::InvalidResponseContract {
+        detail: "schema must be a JSON object".to_string(),
+    })?;
+    let schema_type = schema_obj
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AiSdkError::InvalidResponseContract {
+            detail: "schema.type is required".to_string(),
+        })?;
+
+    match schema_type {
+        "object" => validate_object_against_schema(value, schema_obj),
+        other => Err(AiSdkError::InvalidResponseContract {
+            detail: format!("unsupported schema root type: {other}"),
+        }),
+    }
+}
+
+fn validate_object_against_schema(
+    value: &Value,
+    schema_obj: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    let obj = value.as_object().ok_or_else(|| AiSdkError::InvalidStructuredOutput {
+        detail: "root_not_object".to_string(),
+    })?;
+    let properties = schema_obj
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or_else(|| AiSdkError::InvalidResponseContract {
+            detail: "object schema.properties is required".to_string(),
+        })?;
+    let required = schema_obj
+        .get("required")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AiSdkError::InvalidResponseContract {
+            detail: "object schema.required is required".to_string(),
+        })?;
+
+    for field in required {
+        let field_name = field.as_str().ok_or_else(|| AiSdkError::InvalidResponseContract {
+            detail: "schema.required entries must be strings".to_string(),
+        })?;
+        if !properties.contains_key(field_name) {
+            return Err(AiSdkError::InvalidResponseContract {
+                detail: format!("required field '{field_name}' missing from schema.properties"),
+            });
+        }
+        if !obj.contains_key(field_name) {
+            return Err(AiSdkError::InvalidStructuredOutput {
+                detail: format!("missing_required_field:{field_name}"),
+            });
+        }
+    }
+
+    let additional_properties = schema_obj
+        .get("additionalProperties")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if !additional_properties {
+        for key in obj.keys() {
+            if !properties.contains_key(key) {
+                return Err(AiSdkError::InvalidStructuredOutput {
+                    detail: format!("unexpected_property:{key}"),
+                });
+            }
+        }
+    }
+
+    for (key, field_value) in obj {
+        if let Some(field_schema) = properties.get(key) {
+            validate_field_against_schema(key, field_value, field_schema)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_field_against_schema(field_name: &str, value: &Value, schema: &Value) -> Result<()> {
+    let schema_obj = schema.as_object().ok_or_else(|| AiSdkError::InvalidResponseContract {
+        detail: format!("schema for field '{field_name}' must be an object"),
+    })?;
+    let field_type =
+        schema_obj
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AiSdkError::InvalidResponseContract {
+                detail: format!("schema.type is required for field '{field_name}'"),
+            })?;
+
+    let type_matches = match field_type {
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        other => {
+            return Err(AiSdkError::InvalidResponseContract {
+                detail: format!("unsupported field type '{other}' for field '{field_name}'"),
+            });
+        }
+    };
+    if !type_matches {
+        return Err(AiSdkError::InvalidStructuredOutput {
+            detail: format!("type_mismatch:{field_name}:{field_type}"),
+        });
+    }
+
+    if let Some(enum_values) = schema_obj.get("enum") {
+        let enum_items = enum_values
+            .as_array()
+            .ok_or_else(|| AiSdkError::InvalidResponseContract {
+                detail: format!("enum for field '{field_name}' must be an array"),
+            })?;
+        if field_type != "string" {
+            return Err(AiSdkError::InvalidResponseContract {
+                detail: format!("enum is only supported for string field '{field_name}'"),
+            });
+        }
+        let field_value = value
+            .as_str()
+            .ok_or_else(|| AiSdkError::InvalidStructuredOutput {
+                detail: format!("type_mismatch:{field_name}:string"),
+            })?;
+        let matches = enum_items.iter().any(|candidate| candidate.as_str() == Some(field_value));
+        if !matches {
+            return Err(AiSdkError::InvalidStructuredOutput {
+                detail: format!("enum_mismatch:{field_name}"),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -569,6 +871,7 @@ mod tests {
             system: Some("sys".to_string()),
             input: "hola".to_string(),
             input_parts: None,
+            output_schema: None,
             max_output_tokens: None,
             model_settings: None,
         };
@@ -588,6 +891,7 @@ mod tests {
                 json!({"type":"input_text","text":"texto"}),
                 json!({"type":"input_image","image_url":"data:image/png;base64,AAA"}),
             ]),
+            output_schema: None,
             max_output_tokens: None,
             model_settings: None,
         };
@@ -595,5 +899,120 @@ mod tests {
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["content"][0]["type"], "input_text");
         assert_eq!(input[0]["content"][1]["type"], "input_image");
+    }
+
+    #[test]
+    fn build_openai_response_format_uses_json_schema_shape() {
+        let spec = OutputSchemaSpec::new(
+            "final_output",
+            json!({
+                "type":"object",
+                "properties":{"ok":{"type":"boolean"}},
+                "required":["ok"],
+                "additionalProperties": false
+            }),
+            true,
+        )
+        .expect("schema should be valid");
+        let format = build_openai_response_format(&spec).expect("format should build");
+        assert_eq!(format["type"], "json_schema");
+        assert_eq!(format["name"], "final_output");
+        assert_eq!(format["strict"], true);
+        assert_eq!(format["schema"]["type"], "object");
+    }
+
+    #[test]
+    fn validate_structured_output_accepts_valid_object() {
+        let spec = OutputSchemaSpec::new(
+            "final_output",
+            json!({
+                "type":"object",
+                "properties":{
+                    "success":{"type":"boolean"},
+                    "human_message":{"type":"string"},
+                    "error_code":{"type":"string", "enum":["missing_data","unknown"]}
+                },
+                "required":["success","human_message"],
+                "additionalProperties": false
+            }),
+            true,
+        )
+        .expect("schema should be valid");
+        let out = validate_structured_output(
+            r#"{"success":true,"human_message":"ok","error_code":"unknown"}"#,
+            &spec,
+        )
+        .expect("output should validate");
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).expect("json"),
+            json!({"success":true,"human_message":"ok","error_code":"unknown"})
+        );
+    }
+
+    #[test]
+    fn output_schema_new_rejects_non_object_schema() {
+        let err = OutputSchemaSpec::new("final_output", json!("bad"), true)
+            .expect_err("schema should fail");
+        assert!(matches!(err, AiSdkError::InvalidResponseContract { .. }));
+    }
+
+    #[test]
+    fn validate_structured_output_rejects_unexpected_property() {
+        let spec = OutputSchemaSpec::new(
+            "final_output",
+            json!({
+                "type":"object",
+                "properties":{"ok":{"type":"boolean"}},
+                "required":["ok"],
+                "additionalProperties": false
+            }),
+            true,
+        )
+        .expect("schema should be valid");
+        let err = validate_structured_output(r#"{"ok":true,"extra":"bad"}"#, &spec)
+            .expect_err("output should fail");
+        assert!(matches!(err, AiSdkError::InvalidStructuredOutput { .. }));
+    }
+
+    #[test]
+    fn validate_structured_output_rejects_invalid_json() {
+        let spec = OutputSchemaSpec::new(
+            "final_output",
+            json!({
+                "type":"object",
+                "properties":{"ok":{"type":"boolean"}},
+                "required":["ok"],
+                "additionalProperties": false
+            }),
+            true,
+        )
+        .expect("schema should be valid");
+        let err = validate_structured_output("not json", &spec).expect_err("output should fail");
+        assert!(matches!(err, AiSdkError::InvalidStructuredOutput { .. }));
+    }
+
+    #[test]
+    fn build_output_schema_fallback_instruction_mentions_fields_and_required() {
+        let spec = OutputSchemaSpec::new(
+            "final_output",
+            json!({
+                "type":"object",
+                "properties":{
+                    "success":{"type":"boolean"},
+                    "human_message":{"type":"string"},
+                    "error_code":{"type":"string","enum":["missing_data","unknown"]}
+                },
+                "required":["success","human_message"],
+                "additionalProperties": false
+            }),
+            true,
+        )
+        .expect("schema should be valid");
+        let instruction =
+            build_output_schema_fallback_instruction(&spec).expect("instruction should build");
+        assert!(instruction.contains("success:boolean"));
+        assert!(instruction.contains("human_message:string"));
+        assert!(instruction.contains("Required fields: success, human_message"));
+        assert!(instruction.contains("error_code:string(missing_data|unknown)"));
     }
 }

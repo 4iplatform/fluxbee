@@ -26,11 +26,16 @@ pub use immediate_memory::{
     ImmediateInteractionKind, ImmediateOperation, ImmediateRole,
 };
 pub use llm::{
-    LlmClient, LlmRequest, LlmResponse, LlmStreamEvent, MockLlmClient, ModelSettings,
-    OpenAiFunctionCallingModel, OpenAiResponsesClient,
+    build_output_schema_fallback_instruction, LlmClient, LlmRequest, LlmResponse,
+    LlmStreamEvent, MockLlmClient, ModelSettings, OpenAiFunctionCallingModel,
+    OpenAiResponsesClient, OutputSchemaSpec,
 };
 pub use message::{
-    build_reply_message, build_reply_message_runtime_src, build_reply_routing, Destination,
+    build_reply_message, build_reply_message_runtime_src,
+    build_reply_message_runtime_src_with_options, build_reply_message_with_options,
+    build_reply_routing, Destination, ReplyContextOptions,
+    extract_final_response_contract, extract_response_envelope,
+    resolve_final_response_contract_output_schema, resolve_response_envelope_output_schema,
     Message, Meta, Routing,
 };
 pub use node_trait::AiNode;

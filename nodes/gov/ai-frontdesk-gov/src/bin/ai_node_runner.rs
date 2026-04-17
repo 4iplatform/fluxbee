@@ -10,7 +10,8 @@ use async_trait::async_trait;
 use fluxbee_ai_sdk::router_client::{RouterReader, RouterWriter};
 use fluxbee_ai_sdk::{
     build_openai_user_content_parts, build_reply_message_runtime_src, build_text_response,
-    extract_text, resolve_model_input_from_payload_with_options, AiNode, AiNodeConfig,
+    extract_response_envelope, extract_text, resolve_model_input_from_payload_with_options, AiNode,
+    AiNodeConfig,
     FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
     FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry,
     ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelInputOptions,
@@ -1206,6 +1207,7 @@ impl GenericAiNode {
             system: openai.instructions.clone(),
             input,
             input_parts,
+            output_schema: None,
             max_output_tokens: None,
             model_settings: Some(openai.model_settings.clone()),
         };
@@ -4059,12 +4061,117 @@ fn build_frontdesk_result_reply(
     msg: &Message,
     payload: FrontdeskResultPayload,
 ) -> fluxbee_ai_sdk::Result<Message> {
-    let value = payload.to_value().map_err(|err| {
-        fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
-            "frontdesk_result_serialize_failed: {err}"
-        ))
-    })?;
+    let value = if let Some(contract) = extract_response_envelope(&msg.meta)? {
+        validate_frontdesk_response_envelope(&contract)?;
+        build_text_response(serde_json::to_string(&frontdesk_structured_response_payload(
+            &payload,
+        ))?)?
+    } else {
+        payload.to_value().map_err(|err| {
+            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+                "frontdesk_result_serialize_failed: {err}"
+            ))
+        })?
+    };
     Ok(build_reply_message_runtime_src(msg, value))
+}
+
+fn validate_frontdesk_response_envelope(contract: &Value) -> fluxbee_ai_sdk::Result<()> {
+    let contract_obj =
+        contract
+            .as_object()
+            .ok_or_else(|| fluxbee_ai_sdk::errors::AiSdkError::InvalidResponseContract {
+                detail: "response envelope must be a JSON object".to_string(),
+            })?;
+    let kind = contract_obj
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fluxbee_ai_sdk::errors::AiSdkError::InvalidResponseContract {
+            detail: "response envelope.kind is required".to_string(),
+        })?;
+    if kind != "json_object_v1" {
+        return Err(fluxbee_ai_sdk::errors::AiSdkError::InvalidResponseContract {
+            detail: format!("unsupported response envelope kind: {kind}"),
+        });
+    }
+
+    let properties = contract_obj
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or_else(|| fluxbee_ai_sdk::errors::AiSdkError::InvalidResponseContract {
+            detail: "response envelope.properties is required".to_string(),
+        })?;
+    let required = contract_obj
+        .get("required")
+        .and_then(Value::as_array)
+        .ok_or_else(|| fluxbee_ai_sdk::errors::AiSdkError::InvalidResponseContract {
+            detail: "response envelope.required is required".to_string(),
+        })?;
+
+    for field in required {
+        let field_name =
+            field
+                .as_str()
+                .ok_or_else(|| fluxbee_ai_sdk::errors::AiSdkError::InvalidResponseContract {
+                    detail: "response envelope.required entries must be strings".to_string(),
+                })?;
+        if !properties.contains_key(field_name) {
+            return Err(fluxbee_ai_sdk::errors::AiSdkError::InvalidResponseContract {
+                detail: format!(
+                    "required field '{field_name}' is missing from response envelope.properties"
+                ),
+            });
+        }
+    }
+
+    for (field_name, field_schema) in properties {
+        let field_obj = field_schema.as_object().ok_or_else(|| {
+            fluxbee_ai_sdk::errors::AiSdkError::InvalidResponseContract {
+                detail: format!("response envelope.properties.{field_name} must be an object"),
+            }
+        })?;
+        let field_type = field_obj.get("type").and_then(Value::as_str).ok_or_else(|| {
+            fluxbee_ai_sdk::errors::AiSdkError::InvalidResponseContract {
+                detail: format!("response envelope.properties.{field_name}.type is required"),
+            }
+        })?;
+        let supported = match field_name.as_str() {
+            "success" => field_type == "boolean",
+            "human_message" => field_type == "string",
+            "error_code" => field_type == "string",
+            _ => false,
+        };
+        if !supported {
+            return Err(fluxbee_ai_sdk::errors::AiSdkError::InvalidResponseContract {
+                detail: format!(
+                    "frontdesk cannot satisfy response envelope field '{field_name}' with type '{field_type}'"
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn frontdesk_structured_response_payload(payload: &FrontdeskResultPayload) -> Value {
+    let success = payload.status == "ok";
+    let error_code = if success {
+        None
+    } else {
+        Some(match payload.result_code.as_str() {
+            "MISSING_REQUIRED_FIELDS" => "missing_required_fields",
+            "INVALID_REQUEST" => "invalid_request",
+            "IDENTITY_UNAVAILABLE" => "identity_unavailable",
+            "REGISTER_FAILED" => "register_failed",
+            _ => "unknown",
+        })
+    };
+
+    json!({
+        "success": success,
+        "human_message": payload.human_message,
+        "error_code": error_code,
+    })
 }
 
 fn frontdesk_missing_fields(name: Option<&str>, email: Option<&str>) -> Vec<String> {
@@ -4641,6 +4748,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frontdesk_handoff_with_response_envelope_returns_structured_text_payload() {
+        let node = test_node();
+        {
+            let mut state = node.control_plane.write().await;
+            state.current_state = NodeLifecycleState::Configured;
+        }
+
+        let mut msg = sample_user_request_with_context(
+            json!({
+                "thread_id": "frontdesk-thread-structured-1",
+                "response_envelope": {
+                    "kind": "json_object_v1",
+                    "required": ["success", "human_message"],
+                    "properties": {
+                        "success": { "type": "boolean" },
+                        "human_message": { "type": "string" },
+                        "error_code": { "type": "string" }
+                    }
+                }
+            }),
+            Some("ilk:11111111-1111-4111-8111-111111111111"),
+        );
+        msg.payload = json!({
+            "type": "frontdesk_handoff",
+            "schema_version": 1,
+            "operation": "complete_registration",
+            "subject": {
+                "display_name": "Juan Perez"
+            }
+        });
+
+        let response = node
+            .on_message(msg)
+            .await
+            .expect("handoff should not fail")
+            .expect("response should exist");
+        assert_eq!(
+            response.payload.get("type").and_then(Value::as_str),
+            Some("text")
+        );
+        let content = extract_text(&response.payload).expect("structured text");
+        let structured: Value = serde_json::from_str(&content).expect("valid structured json");
+        assert_eq!(structured.get("success").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            structured.get("error_code").and_then(Value::as_str),
+            Some("missing_required_fields")
+        );
+        assert_eq!(
+            structured.get("human_message").and_then(Value::as_str),
+            Some("Necesito tu email para continuar con el registro.")
+        );
+    }
+
+    #[tokio::test]
     async fn gov_user_echo_returns_frontdesk_result_payload() {
         let node = test_node();
         {
@@ -4672,6 +4833,121 @@ mod tests {
                 .and_then(Value::as_str),
             Some("Echo: hola")
         );
+    }
+
+    #[tokio::test]
+    async fn gov_user_echo_with_response_envelope_returns_structured_text_payload() {
+        let node = test_node();
+        {
+            let mut state = node.control_plane.write().await;
+            state.current_state = NodeLifecycleState::Configured;
+        }
+        {
+            let mut behavior = node.behavior.write().await;
+            *behavior = Some(NodeBehavior::Echo);
+        }
+
+        let msg = sample_user_request_with_context(
+            json!({
+                "thread_id": "frontdesk-thread-structured-2",
+                "response_envelope": {
+                    "kind": "json_object_v1",
+                    "required": ["success", "human_message"],
+                    "properties": {
+                        "success": { "type": "boolean" },
+                        "human_message": { "type": "string" },
+                        "error_code": { "type": "string" }
+                    }
+                }
+            }),
+            Some("ilk:11111111-1111-4111-8111-111111111111"),
+        );
+        let response = node
+            .on_message(msg)
+            .await
+            .expect("on_message should not fail")
+            .expect("response should exist");
+        assert_eq!(
+            response.payload.get("type").and_then(Value::as_str),
+            Some("text")
+        );
+        let content = extract_text(&response.payload).expect("structured text");
+        let structured: Value = serde_json::from_str(&content).expect("valid structured json");
+        assert_eq!(structured.get("success").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            structured.get("human_message").and_then(Value::as_str),
+            Some("Echo: hola")
+        );
+        assert_eq!(structured.get("error_code"), Some(&Value::Null));
+    }
+
+    #[tokio::test]
+    async fn frontdesk_rejects_invalid_response_envelope() {
+        let node = test_node();
+        {
+            let mut state = node.control_plane.write().await;
+            state.current_state = NodeLifecycleState::Configured;
+        }
+        {
+            let mut behavior = node.behavior.write().await;
+            *behavior = Some(NodeBehavior::Echo);
+        }
+
+        let msg = sample_user_request_with_context(
+            json!({
+                "thread_id": "frontdesk-thread-invalid-envelope",
+                "response_envelope": {
+                    "kind": "json_object_v1",
+                    "required": ["success"]
+                }
+            }),
+            Some("ilk:11111111-1111-4111-8111-111111111111"),
+        );
+        let err = node
+            .on_message(msg)
+            .await
+            .expect_err("invalid envelope should fail");
+        assert!(matches!(
+            err,
+            fluxbee_ai_sdk::errors::AiSdkError::InvalidResponseContract { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn frontdesk_rejects_unfulfillable_response_envelope() {
+        let node = test_node();
+        {
+            let mut state = node.control_plane.write().await;
+            state.current_state = NodeLifecycleState::Configured;
+        }
+        {
+            let mut behavior = node.behavior.write().await;
+            *behavior = Some(NodeBehavior::Echo);
+        }
+
+        let msg = sample_user_request_with_context(
+            json!({
+                "thread_id": "frontdesk-thread-unfulfillable-envelope",
+                "response_envelope": {
+                    "kind": "json_object_v1",
+                    "required": ["success", "human_message", "missing_fields"],
+                    "properties": {
+                        "success": { "type": "boolean" },
+                        "human_message": { "type": "string" },
+                        "missing_fields": { "type": "string" }
+                    }
+                }
+            }),
+            Some("ilk:11111111-1111-4111-8111-111111111111"),
+        );
+        let err = node
+            .on_message(msg)
+            .await
+            .expect_err("unfulfillable envelope should fail");
+        assert!(matches!(
+            err,
+            fluxbee_ai_sdk::errors::AiSdkError::InvalidResponseContract { .. }
+        ));
     }
 
     fn sample_user_request_with_context(
