@@ -20,15 +20,18 @@ func (s *Service) DeleteWorkflow(req DeleteWorkflowRequest) (*DeleteWorkflowResu
 		return nil, WfRulesError{Code: "WORKFLOW_NOT_FOUND", Detail: fmt.Sprintf("workflow %q not found", workflowName)}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), wfNodeRPCTimeout)
+	rpcCtx, cancel := context.WithTimeout(context.Background(), wfNodeRPCTimeout)
 	defer cancel()
-	snapshot, err := s.inspectWFNode(ctx, workflowName, true)
+	snapshot, err := s.inspectWFNode(rpcCtx, workflowName, true)
 	if err != nil {
 		return nil, err
 	}
 
-	if !req.Force && snapshot.ConfigExists && !snapshot.Timeout {
-		if snapshot.ActiveInstances != nil && *snapshot.ActiveInstances > 0 {
+	if !req.Force {
+		if snapshot.Timeout {
+			return nil, WfRulesError{Code: "INSTANCES_UNKNOWN", Detail: "cannot confirm active instances because wf node status timed out"}
+		}
+		if snapshot.ConfigExists && snapshot.ActiveInstances != nil && *snapshot.ActiveInstances > 0 {
 			return nil, WfRulesError{Code: "INSTANCES_ACTIVE", Detail: fmt.Sprintf("wf node still has %d running instances", *snapshot.ActiveInstances)}
 		}
 	}
@@ -45,9 +48,9 @@ func (s *Service) DeleteWorkflow(req DeleteWorkflowRequest) (*DeleteWorkflowResu
 		if s.orchestrator == nil {
 			return nil, WfRulesError{Code: "ORCHESTRATOR_ERROR", Detail: "orchestrator client unavailable"}
 		}
-		ctx, cancel = context.WithTimeout(context.Background(), orchestratorRPCTimeout)
+		rpcCtx, cancel = context.WithTimeout(context.Background(), orchestratorRPCTimeout)
 		defer cancel()
-		if _, err := s.orchestrator.KillNode(ctx, s.cfg.OrchestratorTarget, snapshot.NodeName, true, true); err != nil {
+		if _, err := s.orchestrator.KillNode(rpcCtx, s.cfg.OrchestratorTarget, snapshot.NodeName, true, true); err != nil {
 			return nil, WfRulesError{Code: "ORCHESTRATOR_ERROR", Detail: err.Error()}
 		}
 		result.WFNode = WFNodeActionResult{

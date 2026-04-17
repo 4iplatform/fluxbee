@@ -32,6 +32,7 @@ type Service struct {
 	store        *Store
 	sender       sender
 	receiver     receiver
+	mux          *messageMux
 	orchestrator orchestratorClient
 	wfNodes      wfNodeClient
 	clock        ClockFunc
@@ -41,13 +42,15 @@ func NewService(cfg NodeConfig, snd sender, rcv receiver, clock ClockFunc) *Serv
 	if clock == nil {
 		clock = func() time.Time { return time.Now().UTC() }
 	}
+	mux := newMessageMux(rcv)
 	return &Service{
 		cfg:          cfg,
 		store:        NewStore(cfg.StateDir),
 		sender:       snd,
 		receiver:     rcv,
-		orchestrator: newOrchestratorClient(snd, rcv),
-		wfNodes:      newWFNodeClient(snd, rcv),
+		mux:          mux,
+		orchestrator: newOrchestratorClient(snd, mux),
+		wfNodes:      newWFNodeClient(snd, mux),
 		clock:        clock,
 	}
 }
@@ -97,11 +100,12 @@ func (s *Service) Run() error {
 }
 
 func (s *Service) RunWithContext(ctx context.Context) error {
-	if s.receiver == nil {
-		return fmt.Errorf("receiver is required")
+	if s.mux == nil {
+		return fmt.Errorf("message mux is required")
 	}
+	go s.mux.Run(ctx)
 	for {
-		msg, err := s.receiver.Recv(ctx)
+		msg, err := s.mux.NextMessage(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil

@@ -45,7 +45,15 @@ func TestGetWorkflowRequiresCurrentDefinition(t *testing.T) {
 }
 
 type fakeWFNodeClient struct {
+	getNodeStatusFunc         func(nodeName string) (wfNodeStatusProbe, error)
 	countRunningInstancesFunc func(nodeName string) (int, error)
+}
+
+func (f *fakeWFNodeClient) GetNodeStatus(_ context.Context, nodeName string) (wfNodeStatusProbe, error) {
+	if f.getNodeStatusFunc != nil {
+		return f.getNodeStatusFunc(nodeName)
+	}
+	return wfNodeStatusProbe{HealthState: "HEALTHY"}, nil
 }
 
 func (f *fakeWFNodeClient) CountRunningInstances(_ context.Context, nodeName string) (int, error) {
@@ -78,6 +86,12 @@ func TestGetWorkflowStatusReturnsNodeState(t *testing.T) {
 		},
 	}
 	svc.wfNodes = &fakeWFNodeClient{
+		getNodeStatusFunc: func(nodeName string) (wfNodeStatusProbe, error) {
+			if nodeName != "WF.invoice@motherbee" {
+				t.Fatalf("unexpected node %q", nodeName)
+			}
+			return wfNodeStatusProbe{HealthState: "HEALTHY"}, nil
+		},
 		countRunningInstancesFunc: func(nodeName string) (int, error) {
 			if nodeName != "WF.invoice@motherbee" {
 				t.Fatalf("unexpected node %q", nodeName)
@@ -96,12 +110,12 @@ func TestGetWorkflowStatusReturnsNodeState(t *testing.T) {
 	if status.WFNode.ActiveInstances == nil || *status.WFNode.ActiveInstances != 12 {
 		t.Fatalf("unexpected active instances %#v", status.WFNode.ActiveInstances)
 	}
-	if !status.WFNode.Running || status.WFNode.RuntimeVersion != "1" {
+	if !status.WFNode.Running || !status.WFNode.StatusReachable || status.WFNode.HealthState != "HEALTHY" || status.WFNode.RuntimeVersion != "1" {
 		t.Fatalf("unexpected wf node snapshot %#v", status.WFNode)
 	}
 }
 
-func TestGetWorkflowStatusTreatsWFTimeoutAsNonFatal(t *testing.T) {
+func TestGetWorkflowStatusTreatsInstanceQueryTimeoutAsNonFatal(t *testing.T) {
 	svc := newTestService(t)
 	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
 		t.Fatalf("CompileWorkflow: %v", err)
@@ -119,6 +133,9 @@ func TestGetWorkflowStatusTreatsWFTimeoutAsNonFatal(t *testing.T) {
 		},
 	}
 	svc.wfNodes = &fakeWFNodeClient{
+		getNodeStatusFunc: func(nodeName string) (wfNodeStatusProbe, error) {
+			return wfNodeStatusProbe{HealthState: "HEALTHY"}, nil
+		},
 		countRunningInstancesFunc: func(nodeName string) (int, error) {
 			return 0, errors.New("timeout")
 		},
@@ -128,8 +145,78 @@ func TestGetWorkflowStatusTreatsWFTimeoutAsNonFatal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetWorkflowStatus: %v", err)
 	}
-	if !status.WFNode.Timeout || status.WFNode.Running || status.WFNode.ActiveInstances != nil {
+	if !status.WFNode.Timeout || !status.WFNode.Running || !status.WFNode.StatusReachable || status.WFNode.ActiveInstances != nil {
 		t.Fatalf("unexpected wf node snapshot %#v", status.WFNode)
+	}
+}
+
+func TestGetWorkflowStatusTreatsNodeStatusTimeoutAsNonFatal(t *testing.T) {
+	svc := newTestService(t)
+	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
+		t.Fatalf("CompileWorkflow: %v", err)
+	}
+	svc.orchestrator = &fakeOrchestratorClient{
+		getNodeConfigFunc: func(_ context.Context, targetNode, nodeName string) (map[string]any, error) {
+			return map[string]any{
+				"status": "ok",
+				"config": map[string]any{
+					"_system": map[string]any{
+						"runtime_version": "1",
+					},
+				},
+			}, nil
+		},
+	}
+	svc.wfNodes = &fakeWFNodeClient{
+		getNodeStatusFunc: func(nodeName string) (wfNodeStatusProbe, error) {
+			return wfNodeStatusProbe{}, context.DeadlineExceeded
+		},
+	}
+
+	status, err := svc.GetWorkflowStatus(GetStatusRequest{WorkflowName: "invoice"})
+	if err != nil {
+		t.Fatalf("GetWorkflowStatus: %v", err)
+	}
+	if !status.WFNode.Timeout || status.WFNode.Running || status.WFNode.StatusReachable || status.WFNode.ActiveInstances != nil {
+		t.Fatalf("unexpected wf node snapshot %#v", status.WFNode)
+	}
+}
+
+func TestGetWorkflowStatusUsesNodeStatusForRunningEvenWhenInstanceQueryTimesOut(t *testing.T) {
+	svc := newTestService(t)
+	if _, err := svc.CompileWorkflow(CompileRequest{WorkflowName: "invoice", Definition: validWorkflowDefinition()}); err != nil {
+		t.Fatalf("CompileWorkflow: %v", err)
+	}
+	svc.orchestrator = &fakeOrchestratorClient{
+		getNodeConfigFunc: func(_ context.Context, targetNode, nodeName string) (map[string]any, error) {
+			return map[string]any{
+				"status": "ok",
+				"config": map[string]any{
+					"_system": map[string]any{
+						"runtime_version": "1",
+					},
+				},
+			}, nil
+		},
+	}
+	svc.wfNodes = &fakeWFNodeClient{
+		getNodeStatusFunc: func(nodeName string) (wfNodeStatusProbe, error) {
+			return wfNodeStatusProbe{HealthState: "HEALTHY"}, nil
+		},
+		countRunningInstancesFunc: func(nodeName string) (int, error) {
+			return 0, errors.New("timeout")
+		},
+	}
+
+	status, err := svc.GetWorkflowStatus(GetStatusRequest{WorkflowName: "invoice"})
+	if err != nil {
+		t.Fatalf("GetWorkflowStatus: %v", err)
+	}
+	if !status.WFNode.Running || !status.WFNode.StatusReachable || status.WFNode.HealthState != "HEALTHY" {
+		t.Fatalf("unexpected wf node snapshot %#v", status.WFNode)
+	}
+	if !status.WFNode.Timeout || status.WFNode.ActiveInstances != nil {
+		t.Fatalf("unexpected instance timeout snapshot %#v", status.WFNode)
 	}
 }
 
@@ -180,6 +267,9 @@ func TestListWorkflowStatusesReturnsStructuredItems(t *testing.T) {
 		},
 	}
 	svc.wfNodes = &fakeWFNodeClient{
+		getNodeStatusFunc: func(nodeName string) (wfNodeStatusProbe, error) {
+			return wfNodeStatusProbe{HealthState: "HEALTHY"}, nil
+		},
 		countRunningInstancesFunc: func(nodeName string) (int, error) {
 			return 3, nil
 		},
@@ -192,7 +282,7 @@ func TestListWorkflowStatusesReturnsStructuredItems(t *testing.T) {
 	if len(items) != 1 {
 		t.Fatalf("unexpected item count %d", len(items))
 	}
-	if items[0].WorkflowName != "invoice" || !items[0].WFNodeRunning {
+	if items[0].WorkflowName != "invoice" || !items[0].WFNodeRunning || !items[0].WFNodeReachable || items[0].WFNodeHealthState != "HEALTHY" {
 		t.Fatalf("unexpected item %#v", items[0])
 	}
 	if items[0].ActiveInstances == nil || *items[0].ActiveInstances != 3 {

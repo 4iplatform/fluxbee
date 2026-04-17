@@ -50,23 +50,23 @@ func (e *orchestratorActionError) Error() string {
 
 type l2OrchestratorClient struct {
 	sender   sender
-	receiver receiver
+	receiver rpcReceiver
 }
 
-func newOrchestratorClient(snd sender, rcv receiver) orchestratorClient {
+func newOrchestratorClient(snd sender, rcv rpcReceiver) orchestratorClient {
 	if snd == nil || rcv == nil {
 		return nil
 	}
 	return &l2OrchestratorClient{sender: snd, receiver: rcv}
 }
 
-func (c *l2OrchestratorClient) GetNodeConfig(ctx context.Context, targetNode, nodeName string) (map[string]any, error) {
-	return c.request(ctx, targetNode, "NODE_CONFIG_GET", "NODE_CONFIG_GET_RESPONSE", map[string]any{
+func (c *l2OrchestratorClient) GetNodeConfig(rpcCtx context.Context, targetNode, nodeName string) (map[string]any, error) {
+	return c.request(rpcCtx, targetNode, "NODE_CONFIG_GET", "NODE_CONFIG_GET_RESPONSE", map[string]any{
 		"node_name": nodeName,
 	})
 }
 
-func (c *l2OrchestratorClient) RunNode(ctx context.Context, targetNode, nodeName, runtimeName, version string, config map[string]any) (map[string]any, error) {
+func (c *l2OrchestratorClient) RunNode(rpcCtx context.Context, targetNode, nodeName, runtimeName, version string, config map[string]any) (map[string]any, error) {
 	payload := map[string]any{
 		"node_name":       nodeName,
 		"runtime":         runtimeName,
@@ -75,22 +75,22 @@ func (c *l2OrchestratorClient) RunNode(ctx context.Context, targetNode, nodeName
 	if config != nil {
 		payload["config"] = config
 	}
-	return c.request(ctx, targetNode, "SPAWN_NODE", "SPAWN_NODE_RESPONSE", payload)
+	return c.request(rpcCtx, targetNode, "SPAWN_NODE", "SPAWN_NODE_RESPONSE", payload)
 }
 
-func (c *l2OrchestratorClient) StartNode(ctx context.Context, targetNode, nodeName string) (map[string]any, error) {
-	return c.request(ctx, targetNode, "START_NODE", "START_NODE_RESPONSE", map[string]any{
+func (c *l2OrchestratorClient) StartNode(rpcCtx context.Context, targetNode, nodeName string) (map[string]any, error) {
+	return c.request(rpcCtx, targetNode, "START_NODE", "START_NODE_RESPONSE", map[string]any{
 		"node_name": nodeName,
 	})
 }
 
-func (c *l2OrchestratorClient) RestartNode(ctx context.Context, targetNode, nodeName string) (map[string]any, error) {
-	return c.request(ctx, targetNode, "RESTART_NODE", "RESTART_NODE_RESPONSE", map[string]any{
+func (c *l2OrchestratorClient) RestartNode(rpcCtx context.Context, targetNode, nodeName string) (map[string]any, error) {
+	return c.request(rpcCtx, targetNode, "RESTART_NODE", "RESTART_NODE_RESPONSE", map[string]any{
 		"node_name": nodeName,
 	})
 }
 
-func (c *l2OrchestratorClient) SetNodeConfig(ctx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding, notify bool) (map[string]any, error) {
+func (c *l2OrchestratorClient) SetNodeConfig(rpcCtx context.Context, targetNode, nodeName string, config map[string]any, binding *managedRuntimeBinding, notify bool) (map[string]any, error) {
 	payload := map[string]any{
 		"node_name": nodeName,
 		"config":    config,
@@ -104,22 +104,27 @@ func (c *l2OrchestratorClient) SetNodeConfig(ctx context.Context, targetNode, no
 		payload["runtime_base"] = binding.RuntimeBase
 		payload["package_path"] = binding.PackagePath
 	}
-	return c.request(ctx, targetNode, "NODE_CONFIG_SET", "NODE_CONFIG_SET_RESPONSE", payload)
+	return c.request(rpcCtx, targetNode, "NODE_CONFIG_SET", "NODE_CONFIG_SET_RESPONSE", payload)
 }
 
-func (c *l2OrchestratorClient) KillNode(ctx context.Context, targetNode, nodeName string, force, purgeInstance bool) (map[string]any, error) {
-	return c.request(ctx, targetNode, "KILL_NODE", "KILL_NODE_RESPONSE", map[string]any{
+func (c *l2OrchestratorClient) KillNode(rpcCtx context.Context, targetNode, nodeName string, force, purgeInstance bool) (map[string]any, error) {
+	return c.request(rpcCtx, targetNode, "KILL_NODE", "KILL_NODE_RESPONSE", map[string]any{
 		"node_name":      nodeName,
 		"force":          force,
 		"purge_instance": purgeInstance,
 	})
 }
 
-func (c *l2OrchestratorClient) request(ctx context.Context, targetNode, requestMsg, responseMsg string, payload map[string]any) (map[string]any, error) {
+func (c *l2OrchestratorClient) request(rpcCtx context.Context, targetNode, requestMsg, responseMsg string, payload map[string]any) (map[string]any, error) {
 	if c == nil || c.sender == nil || c.receiver == nil {
 		return nil, fmt.Errorf("orchestrator client unavailable")
 	}
 	traceID := uuid.NewString()
+	responseCh, cancelTrace, err := c.receiver.SubscribeTrace(traceID)
+	if err != nil {
+		return nil, err
+	}
+	defer cancelTrace()
 	request, err := fluxbeesdk.BuildSystemRequest(
 		c.sender.UUID(),
 		targetNode,
@@ -134,33 +139,34 @@ func (c *l2OrchestratorClient) request(ctx context.Context, targetNode, requestM
 	if err := c.sender.Send(request); err != nil {
 		return nil, err
 	}
-	for {
-		msg, err := c.receiver.Recv(ctx)
-		if err != nil {
-			return nil, err
+	var msg fluxbeesdk.Message
+	select {
+	case <-rpcCtx.Done():
+		return nil, rpcCtx.Err()
+	case item := <-responseCh:
+		if item.err != nil {
+			return nil, item.err
 		}
-		if msg.Routing.TraceID != traceID {
-			continue
-		}
-		if msg.Meta.MsgType != fluxbeesdk.SYSTEMKind || stringValue(msg.Meta.Msg) != responseMsg {
-			continue
-		}
-		var decoded map[string]any
-		if err := json.Unmarshal(msg.Payload, &decoded); err != nil {
-			return nil, err
-		}
-		status := strings.TrimSpace(stringValueFromMap(decoded, "status"))
-		if status == "" {
-			status = "error"
-		}
-		if status != "ok" && status != "not_found" {
-			return nil, &orchestratorActionError{
-				Status:  status,
-				Code:    stringValueFromMap(decoded, "error_code"),
-				Message: stringValueFromMap(decoded, "message"),
-				Payload: decoded,
-			}
-		}
-		return decoded, nil
+		msg = item.msg
 	}
+	if msg.Meta.MsgType != fluxbeesdk.SYSTEMKind || stringValue(msg.Meta.Msg) != responseMsg {
+		return nil, fmt.Errorf("unexpected orchestrator response %q", stringValue(msg.Meta.Msg))
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(msg.Payload, &decoded); err != nil {
+		return nil, err
+	}
+	status := strings.TrimSpace(stringValueFromMap(decoded, "status"))
+	if status == "" {
+		status = "error"
+	}
+	if status != "ok" && status != "not_found" {
+		return nil, &orchestratorActionError{
+			Status:  status,
+			Code:    stringValueFromMap(decoded, "error_code"),
+			Message: stringValueFromMap(decoded, "message"),
+			Payload: decoded,
+		}
+	}
+	return decoded, nil
 }
