@@ -365,12 +365,7 @@ async fn main() -> Result<(), StorageError> {
                 let msg = match received {
                     Ok(msg) => msg,
                     Err(err) => {
-                        tracing::warn!(error = %err, "sy.storage recv error; reconnecting");
-                        let (new_sender, new_receiver) =
-                            connect_with_retry(&node_config, Duration::from_secs(1)).await?;
-                        sender = new_sender;
-                        receiver = new_receiver;
-                        tracing::info!(node_name = %sender.full_name(), "sy.storage reconnected to router");
+                        tracing::warn!(error = %err, "sy.storage connection interrupted; reconnect handled internally");
                         continue;
                     }
                 };

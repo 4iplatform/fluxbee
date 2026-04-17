@@ -121,15 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let msg = match msg {
                     Ok(msg) => msg,
                     Err(err) => {
-                        tracing::warn!("recv error: {err} (reconnecting)");
-                        let (new_sender, new_receiver) = connect_with_retry(
-                            &node_config,
-                            Duration::from_secs(1),
-                        )
-                        .await?;
-                        sender = new_sender;
-                        receiver = new_receiver;
-                        tracing::info!("reconnected to router");
+                        tracing::warn!(error = %err, "sy.config-routes connection interrupted; reconnect handled internally");
                         continue;
                     }
                 };

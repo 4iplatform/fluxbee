@@ -17,12 +17,12 @@ use uuid::Uuid;
 
 use fluxbee_sdk::nats::{NatsClient, NatsRequestEnvelope, NatsResponseEnvelope};
 use fluxbee_sdk::protocol::{
-    ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SCOPE_GLOBAL,
-    SYSTEM_KIND,
+    ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED,
+    MSG_NODE_STATUS_GET, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    classify_admin_action, classify_system_message, connect, derive_action_outcome, ClientConfig,
-    NodeConfig, NodeReceiver, NodeSender,
+    classify_admin_action, classify_system_message, connect, derive_action_outcome,
+    try_handle_default_node_status, ClientConfig, NodeConfig, NodeReceiver, NodeSender,
 };
 use json_router::shm::{
     now_epoch_ms, LsaRegionReader, RemoteHiveEntry, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
@@ -158,6 +158,11 @@ impl AdminRouterClient {
                 dst = ?msg.routing.dst,
                 "sy.admin saw admin/system message without pending waiter"
             );
+        }
+        if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_NODE_STATUS_GET) {
+            let sender = self.sender.read().await.clone();
+            let _ = try_handle_default_node_status(&sender, &msg).await;
+            return;
         }
         if msg.meta.msg_type == "admin" && msg.meta.msg.as_deref() == Some(MSG_ADMIN_COMMAND) {
             let _ = self.internal_admin_tx.send(msg);

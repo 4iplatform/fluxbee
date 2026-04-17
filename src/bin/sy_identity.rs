@@ -1963,11 +1963,7 @@ async fn main() -> Result<(), IdentityError> {
                 let msg = match received {
                     Ok(msg) => msg,
                     Err(err) => {
-                        tracing::warn!(error = %err, "recv error; reconnecting");
-                        let (new_sender, new_receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
-                        sender = new_sender;
-                        receiver = new_receiver;
-                        tracing::info!("reconnected to router");
+                        tracing::warn!(error = %err, "sy.identity connection interrupted; reconnect handled internally");
                         continue;
                     }
                 };
