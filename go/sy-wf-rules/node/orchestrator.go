@@ -50,10 +50,10 @@ func (e *orchestratorActionError) Error() string {
 
 type l2OrchestratorClient struct {
 	sender   sender
-	receiver receiver
+	receiver rpcReceiver
 }
 
-func newOrchestratorClient(snd sender, rcv receiver) orchestratorClient {
+func newOrchestratorClient(snd sender, rcv rpcReceiver) orchestratorClient {
 	if snd == nil || rcv == nil {
 		return nil
 	}
@@ -120,6 +120,11 @@ func (c *l2OrchestratorClient) request(rpcCtx context.Context, targetNode, reque
 		return nil, fmt.Errorf("orchestrator client unavailable")
 	}
 	traceID := uuid.NewString()
+	responseCh, cancelTrace, err := c.receiver.SubscribeTrace(traceID)
+	if err != nil {
+		return nil, err
+	}
+	defer cancelTrace()
 	request, err := fluxbeesdk.BuildSystemRequest(
 		c.sender.UUID(),
 		targetNode,
@@ -134,33 +139,34 @@ func (c *l2OrchestratorClient) request(rpcCtx context.Context, targetNode, reque
 	if err := c.sender.Send(request); err != nil {
 		return nil, err
 	}
-	for {
-		msg, err := c.receiver.Recv(rpcCtx)
-		if err != nil {
-			return nil, err
+	var msg fluxbeesdk.Message
+	select {
+	case <-rpcCtx.Done():
+		return nil, rpcCtx.Err()
+	case item := <-responseCh:
+		if item.err != nil {
+			return nil, item.err
 		}
-		if msg.Routing.TraceID != traceID {
-			continue
-		}
-		if msg.Meta.MsgType != fluxbeesdk.SYSTEMKind || stringValue(msg.Meta.Msg) != responseMsg {
-			continue
-		}
-		var decoded map[string]any
-		if err := json.Unmarshal(msg.Payload, &decoded); err != nil {
-			return nil, err
-		}
-		status := strings.TrimSpace(stringValueFromMap(decoded, "status"))
-		if status == "" {
-			status = "error"
-		}
-		if status != "ok" && status != "not_found" {
-			return nil, &orchestratorActionError{
-				Status:  status,
-				Code:    stringValueFromMap(decoded, "error_code"),
-				Message: stringValueFromMap(decoded, "message"),
-				Payload: decoded,
-			}
-		}
-		return decoded, nil
+		msg = item.msg
 	}
+	if msg.Meta.MsgType != fluxbeesdk.SYSTEMKind || stringValue(msg.Meta.Msg) != responseMsg {
+		return nil, fmt.Errorf("unexpected orchestrator response %q", stringValue(msg.Meta.Msg))
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(msg.Payload, &decoded); err != nil {
+		return nil, err
+	}
+	status := strings.TrimSpace(stringValueFromMap(decoded, "status"))
+	if status == "" {
+		status = "error"
+	}
+	if status != "ok" && status != "not_found" {
+		return nil, &orchestratorActionError{
+			Status:  status,
+			Code:    stringValueFromMap(decoded, "error_code"),
+			Message: stringValueFromMap(decoded, "message"),
+			Payload: decoded,
+		}
+	}
+	return decoded, nil
 }

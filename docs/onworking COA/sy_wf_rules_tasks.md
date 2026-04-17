@@ -653,7 +653,7 @@ go/sy-wf-rules/
 
 These are the only items still meaningfully open after implementation and real-server validation.
 
-Note: `WFRULES-OPEN-1`, `WFRULES-OPEN-4`, and `WFRULES-OPEN-5` are kept below only as closed audit history. The actual remaining pending item is `WFRULES-OPEN-3`.
+Note: `WFRULES-OPEN-1` through `WFRULES-OPEN-5` are kept below only as closed audit history. There are no remaining implementation blockers in this file.
 
 ### WFRULES-OPEN-1 — ORCH-11: Orchestrator integration tests
 
@@ -678,13 +678,17 @@ Status: closed.
 
 ### WFRULES-OPEN-3 — Shared receiver message drop (architectural note)
 
-**Scope:** sy.wf-rules only — sy-opa-rules and sy-timer do not make outbound orchestrator RPC calls during message handling.
+**Scope:** sy.wf-rules only — sy-opa-rules and sy-timer do not make outbound orchestrator RPC calls during message handling in the same way.
 
-**Issue:** `orchestratorClient.request()` and the main `RunWithContext` loop share the same `receiver`. While the main loop is blocked in `handleMessage`, the orchestrator RPC client consumes messages from the socket in a tight loop, discarding any that don't match its `traceID`. Messages arriving during an orchestrator call (e.g., a concurrent health check) are silently dropped.
+**Issue:** `orchestratorClient.request()` and the main `RunWithContext` loop originally shared the same `receiver`. While the main loop was blocked in `handleMessage`, the RPC client could consume unrelated messages from the socket and drop them if the `traceID` did not match.
 
-**Impact:** Low in practice — orchestrator RPC calls are short (3s timeout) and concurrent inbound traffic is rare for a system node. No data corruption risk.
+**Resolution implemented:** `sy.wf-rules` now uses a local message multiplexer:
+- [x] single goroutine performs `Recv()` from the socket
+- [x] fan-out by `traceID` to per-RPC channels
+- [x] non-RPC messages continue to the main service loop
+- [x] added regression test covering “RPC response + unrelated inbound message” without dropping the unrelated message
 
-- [ ] If/when this becomes a problem: introduce a message multiplexer goroutine (single `Recv` loop → fan-out by traceID to per-request buffered channels). This is a larger refactor; defer until observed in production.
+Status: closed.
 
 ### WFRULES-OPEN-4 — INSTALL-3: Identity registration confirmation
 
