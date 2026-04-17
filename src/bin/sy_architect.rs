@@ -2745,6 +2745,24 @@ fn env_timeout_secs(name: &str) -> Option<u64> {
         .filter(|value| *value > 0)
 }
 
+fn scmd_query_params(raw_query: Option<&str>) -> serde_json::Map<String, Value> {
+    let mut params = serde_json::Map::new();
+    let Some(query) = raw_query else {
+        return params;
+    };
+    for pair in query.split('&').filter(|segment| !segment.is_empty()) {
+        let (key, value) = match pair.split_once('=') {
+            Some(parts) => parts,
+            None => continue,
+        };
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        params.insert(key.to_string(), Value::String(value.to_string()));
+    }
+    params
+}
+
 fn architect_admin_action_timeout(action: &str) -> Duration {
     match action {
         "add_hive" => {
@@ -2946,6 +2964,92 @@ fn translate_scmd(
             target_hive: (*hive_id).to_string(),
             params: json!({}),
         }),
+        ("GET", ["hives", hive_id, "wf-rules"]) => {
+            let params = Value::Object(scmd_query_params(raw_query));
+            let action = if params
+                .get("workflow_name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some()
+            {
+                "wf_rules_get_workflow"
+            } else {
+                "wf_rules_list_workflows"
+            };
+            Ok(AdminTranslation {
+                admin_target,
+                action: action.to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("GET", ["hives", hive_id, "wf-rules", "status"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "wf_rules_get_status".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: Value::Object(scmd_query_params(raw_query)),
+        }),
+        ("POST", ["hives", hive_id, "wf-rules"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for wf_rules compile_apply must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "wf_rules_compile_apply".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("POST", ["hives", hive_id, "wf-rules", "compile"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for wf_rules compile must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "wf_rules_compile".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("POST", ["hives", hive_id, "wf-rules", "apply"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for wf_rules apply must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "wf_rules_apply".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("POST", ["hives", hive_id, "wf-rules", "rollback"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for wf_rules rollback must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "wf_rules_rollback".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("POST", ["hives", hive_id, "wf-rules", "delete"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for wf_rules delete must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "wf_rules_delete".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
         ("GET", ["hives", hive_id, "runtimes"]) => Ok(AdminTranslation {
             admin_target,
             action: "list_runtimes".to_string(),
@@ -7486,4 +7590,71 @@ fn architect_index_html(state: &ArchitectState) -> String {
         node = state.node_name,
         hive = state.hive_id,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(raw: &str) -> ParsedScmd {
+        parse_scmd(raw).expect("scmd should parse")
+    }
+
+    #[test]
+    fn translate_wf_rules_list_workflows_scmd() {
+        let translated =
+            translate_scmd("motherbee", parse("curl -X GET /hives/motherbee/wf-rules"))
+                .expect("translation should succeed");
+
+        assert_eq!(translated.action, "wf_rules_list_workflows");
+        assert_eq!(translated.target_hive, "motherbee");
+        assert_eq!(translated.params, json!({}));
+    }
+
+    #[test]
+    fn translate_wf_rules_get_workflow_scmd() {
+        let translated = translate_scmd(
+            "motherbee",
+            parse("curl -X GET /hives/motherbee/wf-rules?workflow_name=invoice"),
+        )
+        .expect("translation should succeed");
+
+        assert_eq!(translated.action, "wf_rules_get_workflow");
+        assert_eq!(translated.target_hive, "motherbee");
+        assert_eq!(translated.params, json!({ "workflow_name": "invoice" }));
+    }
+
+    #[test]
+    fn translate_wf_rules_get_status_scmd() {
+        let translated = translate_scmd(
+            "motherbee",
+            parse("curl -X GET /hives/motherbee/wf-rules/status?workflow_name=invoice"),
+        )
+        .expect("translation should succeed");
+
+        assert_eq!(translated.action, "wf_rules_get_status");
+        assert_eq!(translated.target_hive, "motherbee");
+        assert_eq!(translated.params, json!({ "workflow_name": "invoice" }));
+    }
+
+    #[test]
+    fn translate_wf_rules_compile_apply_scmd() {
+        let translated = translate_scmd(
+            "motherbee",
+            parse(
+                r#"curl -X POST /hives/motherbee/wf-rules -d '{"workflow_name":"invoice","definition":{"wf_schema_version":"1"}}'"#,
+            ),
+        )
+        .expect("translation should succeed");
+
+        assert_eq!(translated.action, "wf_rules_compile_apply");
+        assert_eq!(translated.target_hive, "motherbee");
+        assert_eq!(
+            translated.params,
+            json!({
+                "workflow_name": "invoice",
+                "definition": { "wf_schema_version": "1" }
+            })
+        );
+    }
 }
