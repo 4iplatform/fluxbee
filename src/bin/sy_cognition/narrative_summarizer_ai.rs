@@ -62,6 +62,7 @@ pub(super) async fn run_narrative_summarizer_ai(
             top_p: None,
             max_output_tokens: Some(220),
         }),
+        output_schema: None,
     };
 
     let client = OpenAiResponsesClient::new(input.api_key);

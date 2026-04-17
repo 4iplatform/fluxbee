@@ -56,6 +56,7 @@ pub(super) async fn run_semantic_tagger_ai(
             top_p: None,
             max_output_tokens: Some(256),
         }),
+        output_schema: None,
     };
 
     let client = OpenAiResponsesClient::new(input.api_key);
