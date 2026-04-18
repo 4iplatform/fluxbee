@@ -19,12 +19,14 @@ pub fn build_text_response(content: impl Into<String>) -> Result<Value> {
 
 const DEFAULT_MAX_ATTACHMENTS: usize = 8;
 const DEFAULT_MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
+const DEFAULT_MAX_ATTACHMENT_TEXT_CHARS: usize = 100_000;
 
 #[derive(Debug, Clone)]
 pub struct ModelInputOptions {
     pub multimodal: bool,
     pub max_attachments: usize,
     pub max_attachment_bytes: u64,
+    pub max_attachment_text_chars: usize,
     pub resolve_retry: Option<ResolveRetryConfig>,
     pub blob_root: Option<PathBuf>,
 }
@@ -35,6 +37,7 @@ impl Default for ModelInputOptions {
             multimodal: false,
             max_attachments: DEFAULT_MAX_ATTACHMENTS,
             max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
+            max_attachment_text_chars: DEFAULT_MAX_ATTACHMENT_TEXT_CHARS,
             resolve_retry: None,
             blob_root: None,
         }
@@ -75,12 +78,14 @@ pub struct ResolvedModelInput {
 #[derive(Debug, Clone)]
 pub struct OpenAiUserContentOptions {
     pub image_detail: Option<String>,
+    pub max_text_chars: usize,
 }
 
 impl Default for OpenAiUserContentOptions {
     fn default() -> Self {
         Self {
             image_detail: Some("auto".to_string()),
+            max_text_chars: DEFAULT_MAX_ATTACHMENT_TEXT_CHARS,
         }
     }
 }
@@ -113,7 +118,7 @@ pub async fn build_openai_user_content_parts_with_options(
                     "Attachment ({}, {}):\n{}",
                     attachment.blob_ref.filename_original,
                     attachment.blob_ref.mime,
-                    truncate_chars(text, 4000)
+                    truncate_chars(text, options.max_text_chars)
                 )
             }));
             continue;
@@ -341,7 +346,7 @@ pub async fn resolve_model_input_from_payload_with_options(
             .and_then(|resolved| resolved.text_content.as_ref())
         {
             block.push('\n');
-            block.push_str(&truncate_chars(text, 4000));
+            block.push_str(&truncate_chars(text, options.max_attachment_text_chars));
         }
         block.push_str("\n[attachment_end]");
         attachment_blocks.push(block);
@@ -1008,6 +1013,7 @@ mod tests {
         };
         let opts = OpenAiUserContentOptions {
             image_detail: Some("high".to_string()),
+            ..Default::default()
         };
         let parts = build_openai_user_content_parts_with_options(&input, &opts)
             .await
