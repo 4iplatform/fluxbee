@@ -103,6 +103,7 @@ Rules:
   - CEL guard variables: `input` (creation event payload), `state` (workflow variables set by set_variable), `event` (current message — `event.payload` for user data, `event.user_payload` for timer metadata).
   - `tenant_id` is required on the first deploy when `auto_spawn: true` and the `WF.<name>@<hive>` node does not yet exist. Look it up from existing nodes or ask the operator.
 - For mutations, use the write tool only to stage the action. Then instruct the operator to reply CONFIRM or CANCEL. Do not claim the mutation ran before confirmation.
+- When calling the write tool for actions that require a body, always include the complete body in the tool call. For `wf_rules_compile_apply`, build and embed the full `definition` object directly in the body argument — never omit it, never ask the user to paste it separately. If the definition comes from an attachment, construct it from that content and pass it inline.
 - Do not claim actions were executed unless they actually were.
 - If information is missing, say what is missing.
 - Keep answers useful for administrators and developers."#;
@@ -543,7 +544,7 @@ impl FunctionTool for ArchitectSystemWriteTool {
                     },
                     "body": {
                         "type": "object",
-                        "description": "Optional JSON object payload."
+                        "description": "JSON body payload. Required whenever the action needs a body (e.g., wf_rules_compile_apply needs workflow_name and definition; opa_compile_apply needs rego; add_hive needs hive_id). Build this object completely from available context — for WF definitions, embed the full definition object here directly. Never omit the body on the assumption the system will supply it."
                     }
                 },
                 "required": ["method", "path"]
