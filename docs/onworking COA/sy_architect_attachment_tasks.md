@@ -345,7 +345,7 @@ Acceptance:
 
 - session reload preserves attachment visibility
 
-- [ ] `ARCHI-ATTACH-10` — Logging and redaction pass
+- [x] `ARCHI-ATTACH-10` — Logging and redaction pass
 
 - Ensure uploads are not logged as raw data
 - Ensure persisted message sanitization does not dump secrets accidentally
@@ -355,7 +355,7 @@ Acceptance:
 
 - logs contain filenames/blob refs at most, never raw payload bytes
 
-- [ ] `ARCHI-ATTACH-11` — Tests
+- [x] `ARCHI-ATTACH-11` — Tests
 
 - Unit tests for:
   - upload contract validation

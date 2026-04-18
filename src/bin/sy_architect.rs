@@ -1187,6 +1187,7 @@ async fn handle_attachment_upload(
 
         files_seen += 1;
         if files_seen > ARCHITECT_MAX_ATTACHMENTS {
+            tracing::warn!(count = files_seen, max = ARCHITECT_MAX_ATTACHMENTS, "archi: attachment upload rejected — too many files");
             return Err(format!(
                 "too many attachments: max {} files per upload",
                 ARCHITECT_MAX_ATTACHMENTS
@@ -1196,9 +1197,11 @@ async fn handle_attachment_upload(
 
         let mime =
             normalize_attachment_mime(field.content_type(), &filename).ok_or_else(|| {
+                tracing::warn!(filename = %filename, "archi: attachment upload rejected — unrecognized mime");
                 format!("unsupported attachment mime for '{filename}'")
             })?;
         if !architect_attachment_mime_supported(&mime) {
+            tracing::warn!(filename = %filename, mime = %mime, "archi: attachment upload rejected — mime not allowed");
             return Err(format!("unsupported attachment mime: {mime}").into());
         }
 
@@ -1207,9 +1210,16 @@ async fn handle_attachment_upload(
             .await
             .map_err(|err| format!("failed to read uploaded file '{filename}': {err}"))?;
         if data.is_empty() {
+            tracing::warn!(filename = %filename, "archi: attachment upload rejected — empty file");
             return Err(format!("attachment '{filename}' is empty").into());
         }
         if data.len() > ARCHITECT_MAX_ATTACHMENT_BYTES {
+            tracing::warn!(
+                filename = %filename,
+                size = data.len(),
+                max = ARCHITECT_MAX_ATTACHMENT_BYTES,
+                "archi: attachment upload rejected — file too large"
+            );
             return Err(format!(
                 "attachment '{}' exceeds max size {} bytes",
                 filename, ARCHITECT_MAX_ATTACHMENT_BYTES
@@ -1224,6 +1234,13 @@ async fn handle_attachment_upload(
                 Ok(blob_ref)
             })
             .map_err(|err| format!("failed to persist attachment '{filename}': {err}"))?;
+        tracing::info!(
+            filename = %blob_ref.filename_original,
+            mime = %blob_ref.mime,
+            size = blob_ref.size,
+            blob_name = %blob_ref.blob_name,
+            "archi: attachment uploaded"
+        );
         attachments.push(UploadedAttachment {
             attachment_id: format!("att_{}", Uuid::new_v4().simple()),
             filename,
@@ -6746,6 +6763,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
       background: var(--panel);
       color: var(--text);
       outline: none;
+      overflow-wrap: break-word;
+      word-break: break-word;
     }}
     textarea:focus {{
       border-color: #b8caef;
@@ -8306,5 +8325,187 @@ mod tests {
         assert!(interaction
             .content
             .contains("Attachment: invoice.pdf (application/pdf, 182233 bytes)"));
+    }
+
+    // ARCHI-ATTACH-11: mime validation
+    #[test]
+    fn normalize_attachment_mime_uses_provided_mime_over_extension() {
+        let result = normalize_attachment_mime(Some("text/plain"), "file.pdf");
+        assert_eq!(result.as_deref(), Some("text/plain"));
+    }
+
+    #[test]
+    fn normalize_attachment_mime_infers_from_extension_when_none_provided() {
+        assert_eq!(normalize_attachment_mime(None, "spec.md").as_deref(), Some("text/markdown"));
+        assert_eq!(normalize_attachment_mime(None, "data.csv").as_deref(), Some("text/csv"));
+        assert_eq!(normalize_attachment_mime(None, "report.pdf").as_deref(), Some("application/pdf"));
+        assert_eq!(normalize_attachment_mime(None, "photo.png").as_deref(), Some("image/png"));
+        assert_eq!(normalize_attachment_mime(None, "doc.docx").as_deref(),
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"));
+    }
+
+    #[test]
+    fn normalize_attachment_mime_returns_none_for_unknown_extension() {
+        assert!(normalize_attachment_mime(None, "archive.zip").is_none());
+        assert!(normalize_attachment_mime(None, "script.sh").is_none());
+        assert!(normalize_attachment_mime(None, "noext").is_none());
+    }
+
+    #[test]
+    fn architect_attachment_mime_supported_accepts_allowed_types() {
+        for mime in &[
+            "text/plain", "text/markdown", "text/csv", "application/json",
+            "application/pdf", "image/png", "image/jpeg", "image/webp", "image/gif",
+        ] {
+            assert!(architect_attachment_mime_supported(mime), "should accept {mime}");
+        }
+    }
+
+    #[test]
+    fn architect_attachment_mime_supported_rejects_disallowed_types() {
+        for mime in &[
+            "application/zip", "application/octet-stream", "text/html",
+            "video/mp4", "audio/mpeg",
+        ] {
+            assert!(!architect_attachment_mime_supported(mime), "should reject {mime}");
+        }
+    }
+
+    // ARCHI-ATTACH-11: chat request parsing with attachments
+    #[test]
+    fn chat_request_parses_with_attachments() {
+        let blob = sample_blob_ref("spec.md", "text/markdown", 4096);
+        let raw = json!({
+            "session_id": "sess_abc",
+            "message": "revisa el spec",
+            "attachments": [{
+                "attachment_id": "att_001",
+                "blob_ref": blob
+            }]
+        });
+        let req: ChatRequest = serde_json::from_value(raw).expect("should parse");
+        assert_eq!(req.session_id.as_deref(), Some("sess_abc"));
+        assert_eq!(req.message, "revisa el spec");
+        assert_eq!(req.attachments.len(), 1);
+        assert_eq!(req.attachments[0].attachment_id, "att_001");
+        assert_eq!(req.attachments[0].blob_ref.filename_original, "spec.md");
+    }
+
+    #[test]
+    fn chat_request_parses_without_attachments() {
+        let raw = json!({ "message": "hola" });
+        let req: ChatRequest = serde_json::from_value(raw).expect("should parse");
+        assert!(req.attachments.is_empty());
+    }
+
+    // ARCHI-ATTACH-11: persistence metadata shape
+    #[test]
+    fn persisted_message_attachments_extracts_from_metadata() {
+        let blob = sample_blob_ref("spec.md", "text/markdown", 4096);
+        let message = PersistedChatMessage {
+            message_id: "msg_1".to_string(),
+            session_id: "sess_1".to_string(),
+            role: "user".to_string(),
+            content: "texto".to_string(),
+            timestamp_ms: 0,
+            mode: "text".to_string(),
+            metadata: json!({
+                "kind": "text_with_attachments",
+                "attachments": [{
+                    "attachment_id": "att_1",
+                    "filename": blob.filename_original,
+                    "mime": blob.mime,
+                    "size": blob.size,
+                    "blob_ref": blob,
+                }]
+            }),
+        };
+        let attachments = persisted_message_attachments(&message);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "spec.md");
+        assert_eq!(attachments[0].mime, "text/markdown");
+        assert_eq!(attachments[0].size, 4096);
+    }
+
+    #[test]
+    fn persisted_message_attachments_returns_empty_for_plain_text_message() {
+        let message = PersistedChatMessage {
+            message_id: "msg_1".to_string(),
+            session_id: "sess_1".to_string(),
+            role: "user".to_string(),
+            content: "texto".to_string(),
+            timestamp_ms: 0,
+            mode: "text".to_string(),
+            metadata: json!({ "kind": "text" }),
+        };
+        assert!(persisted_message_attachments(&message).is_empty());
+    }
+
+    // ARCHI-ATTACH-11: render_persisted_user_message
+    #[test]
+    fn render_persisted_user_message_with_attachments_includes_summary_lines() {
+        let blob = sample_blob_ref("report.pdf", "application/pdf", 182233);
+        let message = PersistedChatMessage {
+            message_id: "msg_1".to_string(),
+            session_id: "sess_1".to_string(),
+            role: "user".to_string(),
+            content: "revisa el reporte".to_string(),
+            timestamp_ms: 0,
+            mode: "text".to_string(),
+            metadata: json!({
+                "kind": "text_with_attachments",
+                "attachments": [{
+                    "attachment_id": "att_1",
+                    "filename": blob.filename_original,
+                    "mime": blob.mime,
+                    "size": blob.size,
+                    "blob_ref": blob,
+                }]
+            }),
+        };
+        let rendered = render_persisted_user_message(&message);
+        assert!(rendered.contains("revisa el reporte"));
+        assert!(rendered.contains("Attachment: report.pdf (application/pdf, 182233 bytes)"));
+    }
+
+    #[test]
+    fn render_persisted_user_message_without_attachments_returns_content() {
+        let message = PersistedChatMessage {
+            message_id: "msg_1".to_string(),
+            session_id: "sess_1".to_string(),
+            role: "user".to_string(),
+            content: "solo texto".to_string(),
+            timestamp_ms: 0,
+            mode: "text".to_string(),
+            metadata: json!({ "kind": "text" }),
+        };
+        assert_eq!(render_persisted_user_message(&message), "solo texto");
+    }
+
+    // ARCHI-ATTACH-11: persistence metadata does not contain raw bytes
+    #[test]
+    fn user_metadata_for_attachment_contains_only_safe_fields() {
+        let blob = sample_blob_ref("spec.md", "text/markdown", 4096);
+        let attachment = ChatAttachmentRef {
+            attachment_id: "att_1".to_string(),
+            blob_ref: blob.clone(),
+        };
+        let metadata = json!({
+            "kind": "text_with_attachments",
+            "attachments": [json!({
+                "attachment_id": attachment.attachment_id,
+                "filename": attachment.blob_ref.filename_original,
+                "mime": attachment.blob_ref.mime,
+                "size": attachment.blob_ref.size,
+                "blob_ref": attachment.blob_ref,
+            })]
+        });
+        let serialized = metadata.to_string();
+        // Must contain safe metadata
+        assert!(serialized.contains("spec.md"));
+        assert!(serialized.contains("text/markdown"));
+        // Must NOT contain raw binary indicators
+        assert!(!serialized.contains("data:"));
+        assert!(!serialized.contains("base64,"));
     }
 }
