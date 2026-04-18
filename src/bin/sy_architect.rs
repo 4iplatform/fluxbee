@@ -104,6 +104,11 @@ Rules:
   - `tenant_id` is required on the first deploy when `auto_spawn: true` and the `WF.<name>@<hive>` node does not yet exist. Look it up from existing nodes or ask the operator.
 - For mutations, use the write tool only to stage the action. Then instruct the operator to reply CONFIRM or CANCEL. Do not claim the mutation ran before confirmation.
 - When calling the write tool for actions that require a body, always include the complete body in the tool call. For `wf_rules_compile_apply`, build and embed the full `definition` object directly in the body argument — never omit it, never ask the user to paste it separately. If the definition comes from an attachment, construct it from that content and pass it inline.
+- Use specialized write tools for large-body mutations instead of `fluxbee_system_write`:
+  - `fluxbee_deploy_workflow` — for `wf_rules_compile_apply` when passing a full workflow `definition` object.
+  - `fluxbee_deploy_opa_policy` — for `opa_compile_apply` when passing a full OPA `rego` source.
+  - `fluxbee_set_node_config` — for `node_control_config_set` when passing a large node `config` object. Always do CONFIG_GET first to read the current `config_version`.
+  - Use `fluxbee_system_write` only for mutations whose body is small and fits cleanly as an inline JSON object (route adds, vpn adds, kill_node, rollback, delete, etc.).
 - Do not claim actions were executed unless they actually were.
 - If information is missing, say what is missing.
 - Keep answers useful for administrators and developers."#;
@@ -415,9 +420,10 @@ impl ArchitectAdminReadToolsProvider {
 impl FunctionToolProvider for ArchitectAdminReadToolsProvider {
     fn register_tools(&self, registry: &mut FunctionToolRegistry) -> fluxbee_ai_sdk::Result<()> {
         registry.register(Arc::new(ArchitectSystemGetTool::new(self.context.clone())))?;
-        registry.register(Arc::new(ArchitectSystemWriteTool::new(
-            self.context.clone(),
-        )))
+        registry.register(Arc::new(ArchitectSystemWriteTool::new(self.context.clone())))?;
+        registry.register(Arc::new(ArchitectDeployWorkflowTool::new(self.context.clone())))?;
+        registry.register(Arc::new(ArchitectDeployOpaPolicyTool::new(self.context.clone())))?;
+        registry.register(Arc::new(ArchitectSetNodeConfigTool::new(self.context.clone())))
     }
 }
 
@@ -553,16 +559,7 @@ impl FunctionTool for ArchitectSystemWriteTool {
     }
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
-        let session_id = self
-            .context
-            .session_id
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                fluxbee_ai_sdk::AiSdkError::Protocol(
-                    "fluxbee_system_write requires a live chat session".to_string(),
-                )
-            })?;
+        let session_id = require_session_id(&self.context, "fluxbee_system_write")?;
         let method = arguments
             .get("method")
             .and_then(Value::as_str)
@@ -604,133 +601,508 @@ impl FunctionTool for ArchitectSystemWriteTool {
                 translation.action
             )));
         }
-        validate_mutating_translation_contract(&self.context, &translation).await?;
-
         let preview_command = format!("SCMD: {raw}");
-        let operation_id = Uuid::new_v4().to_string();
-        let scope_id = operation_scope_id(session_id);
-        let normalized_params = normalize_json(&translation.params);
-        let params_json =
-            serde_json::to_string(&normalized_params).unwrap_or_else(|_| "{}".to_string());
-        let params_hash_value = params_hash(&translation.params);
-        if let Some(mut existing) = find_equivalent_operation_with_context(
-            &self.context,
-            session_id,
-            &translation.action,
-            &translation.target_hive,
-            &params_hash_value,
-        )
+        stage_admin_write(&self.context, session_id, translation, &preview_command, &raw_arguments).await
+    }
+}
+
+// ---- ArchitectDeployWorkflowTool -------------------------------------------
+//
+// Specialized write tool that accepts the WF definition as named first-class
+// parameters instead of a generic body object. This sidesteps the model's
+// reluctance to embed large nested JSON in a generic `body` argument while
+// still routing through the identical staging / confirmation flow.
+//
+// Adding more specialized tools follows the same pattern:
+//   1. Create a struct + impl FunctionTool
+//   2. Register it in ArchitectAdminReadToolsProvider::register_tools
+
+struct ArchitectDeployWorkflowTool {
+    context: ArchitectAdminToolContext,
+}
+
+impl ArchitectDeployWorkflowTool {
+    fn new(context: ArchitectAdminToolContext) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl FunctionTool for ArchitectDeployWorkflowTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "fluxbee_deploy_workflow".to_string(),
+            description: format!(
+                "Compile and deploy a WF workflow definition on hive {} through SY.wf-rules. \
+                Stages the deploy for user confirmation (CONFIRM / CANCEL). \
+                Use this instead of fluxbee_system_write when the definition object is large — \
+                pass each field as a named parameter so the full definition can be provided inline.",
+                self.context.hive_id,
+            ),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["workflow_name", "definition"],
+                "properties": {
+                    "hive": {
+                        "type": "string",
+                        "description": "Target hive id. Defaults to the local hive when omitted."
+                    },
+                    "workflow_name": {
+                        "type": "string",
+                        "description": "Workflow logical name, e.g. 'response_dispatch'."
+                    },
+                    "definition": {
+                        "type": "object",
+                        "description": "Complete WF v1 workflow definition object (wf_schema_version, workflow_type, states, etc.)."
+                    },
+                    "auto_spawn": {
+                        "type": "boolean",
+                        "description": "When true, spawn the WF node automatically if it does not exist after apply."
+                    },
+                    "tenant_id": {
+                        "type": "string",
+                        "description": "Required for the first deploy when auto_spawn=true and the WF node does not yet exist."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let session_id = require_session_id(&self.context, "fluxbee_deploy_workflow")?;
+        let hive = arguments
+            .get("hive")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.context.hive_id)
+            .to_string();
+        let workflow_name = arguments
+            .get("workflow_name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(
+                    "fluxbee_deploy_workflow requires 'workflow_name'".to_string(),
+                )
+            })?
+            .to_string();
+        let definition = arguments
+            .get("definition")
+            .filter(|v| v.is_object())
+            .cloned()
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(
+                    "fluxbee_deploy_workflow requires 'definition' as a JSON object".to_string(),
+                )
+            })?;
+
+        let mut body = json!({
+            "workflow_name": workflow_name,
+            "definition": definition,
+        });
+        if let Some(auto_spawn) = arguments.get("auto_spawn") {
+            body["auto_spawn"] = auto_spawn.clone();
+        }
+        if let Some(tenant_id) = arguments
+            .get("tenant_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            body["tenant_id"] = json!(tenant_id);
+        }
+
+        let translation = AdminTranslation {
+            admin_target: format!("SY.admin@{hive}"),
+            action: "wf_rules_compile_apply".to_string(),
+            target_hive: hive.clone(),
+            params: body.clone(),
+        };
+        let body_str = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
+        let preview_command = format!("SCMD: curl -X POST /hives/{hive}/wf-rules -d '{body_str}'");
+        let tool_arguments = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
+        stage_admin_write(&self.context, session_id, translation, &preview_command, &tool_arguments).await
+    }
+}
+
+// ---- ArchitectDeployOpaPolicyTool -------------------------------------------
+//
+// Accepts OPA rego source as a named string parameter instead of embedding it
+// inside the generic `body` object. OPA rego can be arbitrarily large.
+
+struct ArchitectDeployOpaPolicyTool {
+    context: ArchitectAdminToolContext,
+}
+
+impl ArchitectDeployOpaPolicyTool {
+    fn new(context: ArchitectAdminToolContext) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl FunctionTool for ArchitectDeployOpaPolicyTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "fluxbee_deploy_opa_policy".to_string(),
+            description: format!(
+                "Compile and apply an OPA policy on hive {} through SY.opa-rules. \
+                Stages the deploy for user confirmation (CONFIRM / CANCEL). \
+                Use this instead of fluxbee_system_write when the rego source is large.",
+                self.context.hive_id,
+            ),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["rego"],
+                "properties": {
+                    "hive": {
+                        "type": "string",
+                        "description": "Target hive id. Defaults to the local hive when omitted."
+                    },
+                    "rego": {
+                        "type": "string",
+                        "description": "Complete OPA rego source text."
+                    },
+                    "entrypoint": {
+                        "type": "string",
+                        "description": "OPA entrypoint. Defaults to 'router/target' when omitted."
+                    },
+                    "version": {
+                        "type": "integer",
+                        "description": "Optional explicit version. A new version is assigned automatically when omitted."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let session_id = require_session_id(&self.context, "fluxbee_deploy_opa_policy")?;
+        let hive = arguments
+            .get("hive")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.context.hive_id)
+            .to_string();
+        let rego = arguments
+            .get("rego")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(
+                    "fluxbee_deploy_opa_policy requires 'rego'".to_string(),
+                )
+            })?
+            .to_string();
+
+        let mut body = json!({ "rego": rego });
+        if let Some(entrypoint) = arguments
+            .get("entrypoint")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            body["entrypoint"] = json!(entrypoint);
+        }
+        if let Some(version) = arguments.get("version").filter(|v| v.is_number()) {
+            body["version"] = version.clone();
+        }
+
+        let translation = AdminTranslation {
+            admin_target: format!("SY.admin@{hive}"),
+            action: "opa_compile_apply".to_string(),
+            target_hive: hive.clone(),
+            params: body.clone(),
+        };
+        let rego_preview = if rego.len() > 120 {
+            format!("{}...", &rego[..120])
+        } else {
+            rego.clone()
+        };
+        let preview_command = format!(
+            "SCMD: curl -X POST /hives/{hive}/opa/policy -d '{{\"rego\":\"{rego_preview}\",…}}'"
+        );
+        let tool_arguments = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
+        stage_admin_write(&self.context, session_id, translation, &preview_command, &tool_arguments).await
+    }
+}
+
+// ---- ArchitectSetNodeConfigTool ---------------------------------------------
+//
+// Accepts the node config object as a named first-class parameter for
+// node_control_config_set. The `config` field is fully node-defined and can be
+// arbitrarily large (AI.chat prompts, WF node config, IO adapter config, etc.).
+
+struct ArchitectSetNodeConfigTool {
+    context: ArchitectAdminToolContext,
+}
+
+impl ArchitectSetNodeConfigTool {
+    fn new(context: ArchitectAdminToolContext) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl FunctionTool for ArchitectSetNodeConfigTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "fluxbee_set_node_config".to_string(),
+            description: format!(
+                "Send a CONFIG_SET to a node on hive {} via node_control_config_set. \
+                Stages the mutation for user confirmation (CONFIRM / CANCEL). \
+                Use this instead of fluxbee_system_write when the config object is large \
+                (AI node prompts, WF node config, IO adapter config, etc.). \
+                Always do a CONFIG_GET first to read the current config_version before calling this.",
+                self.context.hive_id,
+            ),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["node_name", "config"],
+                "properties": {
+                    "hive": {
+                        "type": "string",
+                        "description": "Target hive id. Defaults to the local hive when omitted."
+                    },
+                    "node_name": {
+                        "type": "string",
+                        "description": "Fully-qualified node name, e.g. 'AI.chat@motherbee'."
+                    },
+                    "config": {
+                        "type": "object",
+                        "description": "Node-defined config payload. Content is node-specific and not interpreted by SY.admin."
+                    },
+                    "config_version": {
+                        "type": "integer",
+                        "description": "Monotonic config version. Use the value from CONFIG_GET + 1. Defaults to 1 when the node has no prior config."
+                    },
+                    "schema_version": {
+                        "type": "integer",
+                        "description": "Schema version understood by the node. Defaults to 1."
+                    },
+                    "apply_mode": {
+                        "type": "string",
+                        "enum": ["replace", "merge"],
+                        "description": "Apply mode. 'replace' is the standard mode for most nodes."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let session_id = require_session_id(&self.context, "fluxbee_set_node_config")?;
+        let hive = arguments
+            .get("hive")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.context.hive_id)
+            .to_string();
+        let node_name = arguments
+            .get("node_name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(
+                    "fluxbee_set_node_config requires 'node_name'".to_string(),
+                )
+            })?
+            .to_string();
+        let config = arguments
+            .get("config")
+            .filter(|v| v.is_object())
+            .cloned()
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(
+                    "fluxbee_set_node_config requires 'config' as a JSON object".to_string(),
+                )
+            })?;
+        let schema_version = arguments
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
+        let config_version = arguments
+            .get("config_version")
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
+        let apply_mode = arguments
+            .get("apply_mode")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("replace")
+            .to_string();
+
+        let body = json!({
+            "node_name": node_name,
+            "schema_version": schema_version,
+            "config_version": config_version,
+            "apply_mode": apply_mode,
+            "config": config,
+        });
+        let translation = AdminTranslation {
+            admin_target: format!("SY.admin@{hive}"),
+            action: "node_control_config_set".to_string(),
+            target_hive: hive.clone(),
+            params: body,
+        };
+        let preview_command = format!(
+            "SCMD: curl -X POST /hives/{hive}/nodes/{node_name}/control/config-set -d '{{…config…}}'"
+        );
+        let tool_arguments = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
+        stage_admin_write(&self.context, session_id, translation, &preview_command, &tool_arguments).await
+    }
+}
+
+// ---- shared staging helper --------------------------------------------------
+
+async fn stage_admin_write(
+    context: &ArchitectAdminToolContext,
+    session_id: &str,
+    translation: AdminTranslation,
+    preview_command: &str,
+    tool_arguments: &str,
+) -> fluxbee_ai_sdk::Result<Value> {
+    validate_mutating_translation_contract(context, &translation).await?;
+
+    let operation_id = Uuid::new_v4().to_string();
+    let scope_id = operation_scope_id(session_id);
+    let normalized_params = normalize_json(&translation.params);
+    let params_json =
+        serde_json::to_string(&normalized_params).unwrap_or_else(|_| "{}".to_string());
+    let params_hash_value = params_hash(&translation.params);
+    if let Some(mut existing) = find_equivalent_operation_with_context(
+        context,
+        session_id,
+        &translation.action,
+        &translation.target_hive,
+        &params_hash_value,
+    )
+    .await
+    .map_err(|err| {
+        fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+            "failed to inspect prior operations: {err}"
+        ))
+    })? {
+        if existing.status == "timeout_unknown" && translation.action == "add_hive" {
+            let params = normalized_params.clone();
+            if let Some(hive_id) = params.get("hive_id").and_then(Value::as_str) {
+                let output = execute_admin_translation_with_context(
+                    context,
+                    AdminTranslation {
+                        admin_target: format!("SY.admin@{}", context.hive_id),
+                        action: "get_hive".to_string(),
+                        target_hive: context.hive_id.clone(),
+                        params: json!({ "hive_id": hive_id }),
+                    },
+                    "tool.reconcile",
+                )
+                .await
+                .map_err(|err| {
+                    fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                        "failed to reconcile prior timeout: {err}"
+                    ))
+                })?;
+                if output
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(|value| value.eq_ignore_ascii_case("ok"))
+                    .unwrap_or(false)
+                {
+                    existing.status = "succeeded_after_timeout".to_string();
+                    existing.updated_at_ms = now_epoch_ms();
+                    existing.completed_at_ms = existing.updated_at_ms;
+                    existing.error_summary.clear();
+                    save_operation_with_context(context, &existing)
+                        .await
+                        .map_err(|err| {
+                            fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                                "failed to persist reconciled operation: {err}"
+                            ))
+                        })?;
+                    return Err(fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                        "A previous add_hive operation already completed after a timeout for hive '{}'. Do not retry blindly; inspect the hive state first.",
+                        hive_id
+                    )));
+                }
+            }
+        }
+        return Err(fluxbee_ai_sdk::AiSdkError::Protocol(
+            operation_error_message(&existing),
+        ));
+    }
+    let created_at_ms = now_epoch_ms();
+    let operation = ChatOperationRecord {
+        operation_id: operation_id.clone(),
+        session_id: session_id.to_string(),
+        scope_id,
+        origin: "ai_write_stage".to_string(),
+        action: translation.action.clone(),
+        target_hive: translation.target_hive.clone(),
+        params_json: params_json.clone(),
+        params_hash: params_hash_value,
+        preview_command: preview_command.to_string(),
+        status: "pending_confirm".to_string(),
+        created_at_ms,
+        updated_at_ms: created_at_ms,
+        dispatched_at_ms: 0,
+        completed_at_ms: 0,
+        request_id: String::new(),
+        trace_id: String::new(),
+        error_summary: String::new(),
+    };
+    save_operation_with_context(context, &operation)
         .await
         .map_err(|err| {
             fluxbee_ai_sdk::AiSdkError::Protocol(format!(
-                "failed to inspect prior operations: {err}"
+                "failed to persist staged operation: {err}"
             ))
-        })? {
-            if existing.status == "timeout_unknown" && translation.action == "add_hive" {
-                let params = normalized_params.clone();
-                if let Some(hive_id) = params.get("hive_id").and_then(Value::as_str) {
-                    let output = execute_admin_translation_with_context(
-                        &self.context,
-                        AdminTranslation {
-                            admin_target: format!("SY.admin@{}", self.context.hive_id),
-                            action: "get_hive".to_string(),
-                            target_hive: self.context.hive_id.clone(),
-                            params: json!({ "hive_id": hive_id }),
-                        },
-                        "tool.reconcile",
-                    )
-                    .await
-                    .map_err(|err| {
-                        fluxbee_ai_sdk::AiSdkError::Protocol(format!(
-                            "failed to reconcile prior timeout: {err}"
-                        ))
-                    })?;
-                    if output
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .map(|value| value.eq_ignore_ascii_case("ok"))
-                        .unwrap_or(false)
-                    {
-                        existing.status = "succeeded_after_timeout".to_string();
-                        existing.updated_at_ms = now_epoch_ms();
-                        existing.completed_at_ms = existing.updated_at_ms;
-                        existing.error_summary.clear();
-                        save_operation_with_context(&self.context, &existing)
-                            .await
-                            .map_err(|err| {
-                                fluxbee_ai_sdk::AiSdkError::Protocol(format!(
-                                    "failed to persist reconciled operation: {err}"
-                                ))
-                            })?;
-                        return Err(fluxbee_ai_sdk::AiSdkError::Protocol(format!(
-                            "A previous add_hive operation already completed after a timeout for hive '{}'. Do not retry blindly; inspect the hive state first.",
-                            hive_id
-                        )));
-                    }
-                }
-            }
-            return Err(fluxbee_ai_sdk::AiSdkError::Protocol(
-                operation_error_message(&existing),
-            ));
-        }
-        let created_at_ms = now_epoch_ms();
-        let operation = ChatOperationRecord {
-            operation_id: operation_id.clone(),
-            session_id: session_id.to_string(),
-            scope_id,
-            origin: "ai_write_stage".to_string(),
-            action: translation.action.clone(),
-            target_hive: translation.target_hive.clone(),
-            params_json: params_json.clone(),
-            params_hash: params_hash_value,
-            preview_command: preview_command.clone(),
-            status: "pending_confirm".to_string(),
-            created_at_ms,
-            updated_at_ms: created_at_ms,
-            dispatched_at_ms: 0,
-            completed_at_ms: 0,
-            request_id: String::new(),
-            trace_id: String::new(),
-            error_summary: String::new(),
-        };
-        save_operation_with_context(&self.context, &operation)
-            .await
-            .map_err(|err| {
-                fluxbee_ai_sdk::AiSdkError::Protocol(format!(
-                    "failed to persist staged operation: {err}"
-                ))
-            })?;
-        let pending = PendingAdminAction {
-            operation_id: operation_id.clone(),
-            translation: translation.clone(),
-            preview_command: preview_command.clone(),
-            created_at_ms,
-        };
-        self.context
-            .pending_actions
-            .lock()
-            .await
-            .insert(session_id.to_string(), pending);
-        tracing::info!(
-            session_id = %session_id,
-            action = %translation.action,
-            target_hive = %translation.target_hive,
-            tool_arguments = %raw_arguments,
-            operation_id = %operation_id,
-            preview_command = %preview_command,
-            params = %params_json,
-            "sy.architect staged admin write"
-        );
+        })?;
+    let pending = PendingAdminAction {
+        operation_id: operation_id.clone(),
+        translation: translation.clone(),
+        preview_command: preview_command.to_string(),
+        created_at_ms,
+    };
+    context
+        .pending_actions
+        .lock()
+        .await
+        .insert(session_id.to_string(), pending);
+    tracing::info!(
+        session_id = %session_id,
+        action = %translation.action,
+        target_hive = %translation.target_hive,
+        tool_arguments = %tool_arguments,
+        operation_id = %operation_id,
+        preview_command = %preview_command,
+        params = %params_json,
+        "sy.architect staged admin write"
+    );
 
-        Ok(json!({
-            "operation_id": operation_id,
-            "pending_confirmation": true,
-            "requires_confirmation": true,
-            "action": translation.action,
-            "preview_command": preview_command,
-            "message": "Mutation prepared. Reply CONFIRM to execute it or CANCEL to discard it."
-        }))
-    }
+    Ok(json!({
+        "operation_id": operation_id,
+        "pending_confirmation": true,
+        "requires_confirmation": true,
+        "action": translation.action,
+        "preview_command": preview_command,
+        "message": "Mutation prepared. Reply CONFIRM to execute it or CANCEL to discard it."
+    }))
+}
+
+fn require_session_id<'a>(
+    context: &'a ArchitectAdminToolContext,
+    tool_name: &str,
+) -> fluxbee_ai_sdk::Result<&'a str> {
+    context
+        .session_id
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                "{tool_name} requires a live chat session"
+            ))
+        })
 }
 
 #[tokio::main]
