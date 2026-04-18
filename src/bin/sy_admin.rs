@@ -835,9 +835,6 @@ async fn send_admin_command_response(
         },
         payload: body,
     };
-    if let Ok(approx_bytes) = serde_json::to_vec(&response) {
-        tracing::info!(action = %action, bytes = approx_bytes.len(), "admin: sending ADMIN_COMMAND_RESPONSE");
-    }
     sender.send(response).await?;
     Ok(())
 }

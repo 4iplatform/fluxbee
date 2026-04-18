@@ -510,7 +510,11 @@ async fn handle_node(
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             if let Err(err) = write_frame(&mut writer, &frame).await {
-                tracing::warn!(error = %err, frame_len = frame.len(), "router: node write error");
+                if err.kind() == std::io::ErrorKind::InvalidData {
+                    tracing::error!(frame_len = frame.len(), max = 128 * 1024, "FRAME_TOO_LARGE — router rejected oversized frame to node; disconnecting");
+                } else {
+                    tracing::warn!(error = %err, frame_len = frame.len(), "router: node write error");
+                }
                 break;
             }
         }
@@ -634,9 +638,22 @@ async fn handle_node(
     }
 
     loop {
-        match read_frame(&mut reader).await? {
-            Some(frame) => {
-                if let Ok(mut msg) = serde_json::from_slice::<Message>(&frame) {
+        let frame = match read_frame(&mut reader).await {
+            Ok(Some(f)) => f,
+            Ok(None) => {
+                tracing::info!(node = %node_uuid, "router: node closed connection (EOF)");
+                break;
+            }
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::InvalidData {
+                    tracing::error!(node = %node_uuid, error = %err, "FRAME_TOO_LARGE — node sent oversized frame; disconnecting");
+                }
+                return Err(err.into());
+            }
+        };
+        {
+            let frame = frame;
+            if let Ok(mut msg) = serde_json::from_slice::<Message>(&frame) {
                     assign_thread_seq_if_missing(&mut msg, &thread_sequences).await;
                     tracing::info!(
                         src = %msg.routing.src,
@@ -800,13 +817,8 @@ async fn handle_node(
                         snapshot.as_ref(),
                     )
                     .await?;
-                } else {
-                    tracing::warn!("received invalid message frame");
-                }
-            }
-            None => {
-                tracing::info!(node = %node_uuid, "router: node closed connection (EOF)");
-                break;
+            } else {
+                tracing::warn!("received invalid message frame");
             }
         }
     }

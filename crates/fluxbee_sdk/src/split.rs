@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::node_client::NodeError;
 use crate::protocol::NodeAnnouncePayload;
+use crate::socket::connection::MAX_FRAME_SIZE;
 use crate::protocol::{build_withdraw, Destination, Message};
 use crate::send_normalization::normalize_outbound_message;
 
@@ -120,6 +121,14 @@ impl NodeSender {
     pub async fn send(&self, msg: Message) -> Result<(), NodeError> {
         let msg = normalize_outbound_message(msg);
         let data = serde_json::to_vec(&msg)?;
+        if data.len() > MAX_FRAME_SIZE {
+            tracing::error!(
+                frame_len = data.len(),
+                max = MAX_FRAME_SIZE,
+                "FRAME_TOO_LARGE — message rejected before send; fix the sending node"
+            );
+            return Err(NodeError::MessageTooLarge { size: data.len(), max: MAX_FRAME_SIZE });
+        }
         self.tx.send(data).await.map_err(|_| {
             self.info.state.set_connected(false);
             NodeError::Disconnected

@@ -44,6 +44,7 @@ impl AiSdkError {
                 NodeError::Uuid(_) => false,
                 NodeError::InvalidAnnounce => false,
                 NodeError::HandshakeFailed(_) => false,
+                NodeError::MessageTooLarge { .. } => false,
             },
             AiSdkError::Http(err) => err.is_timeout() || err.is_connect() || err.is_request(),
             AiSdkError::Blob(err) => matches!(

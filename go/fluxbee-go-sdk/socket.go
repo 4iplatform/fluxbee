@@ -6,7 +6,7 @@ import (
 	"io"
 )
 
-const maxFrameSize = 64 * 1024
+const maxFrameSize = 128 * 1024
 
 func ReadFrame(r io.Reader) ([]byte, error) {
 	var lenBuf [4]byte
