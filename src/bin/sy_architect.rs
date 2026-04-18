@@ -2854,6 +2854,11 @@ fn admin_action_allows_ai_write(action: &str) -> bool {
             | "opa_compile"
             | "opa_apply"
             | "opa_rollback"
+            | "wf_rules_compile_apply"
+            | "wf_rules_compile"
+            | "wf_rules_apply"
+            | "wf_rules_rollback"
+            | "wf_rules_delete"
     )
 }
 
