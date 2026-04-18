@@ -40,7 +40,7 @@ use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -177,9 +177,10 @@ struct ArchitectState {
     chat_lock: Arc<Mutex<()>>,
     pending_actions: Arc<Mutex<HashMap<String, PendingAdminAction>>>,
     router_sender: Arc<Mutex<Option<NodeSender>>>,
+    cached_status: Arc<RwLock<ArchitectStatus>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ArchitectStatus {
     status: String,
     hive_id: String,
@@ -196,7 +197,7 @@ struct ArchitectStatus {
     error: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ArchitectComponentStatus {
     key: String,
     label: String,
@@ -754,6 +755,21 @@ async fn main() -> Result<(), ArchitectError> {
         })
         .unwrap_or_else(|| DEFAULT_ARCHITECT_LISTEN.to_string());
 
+    let initial_status = ArchitectStatus {
+        status: "loading".to_string(),
+        hive_id: hive.hive_id.clone(),
+        node_name: node_name.clone(),
+        router_connected: false,
+        admin_available: false,
+        inventory_updated_at: None,
+        total_hives: None,
+        hives_alive: None,
+        hives_stale: None,
+        total_nodes: None,
+        nodes_by_status: BTreeMap::new(),
+        components: default_component_statuses(),
+        error: None,
+    };
     let state = Arc::new(ArchitectState {
         hive_id: hive.hive_id.clone(),
         node_name: node_name.clone(),
@@ -767,6 +783,7 @@ async fn main() -> Result<(), ArchitectError> {
         chat_lock: Arc::new(Mutex::new(())),
         pending_actions: Arc::new(Mutex::new(HashMap::new())),
         router_sender: Arc::new(Mutex::new(None)),
+        cached_status: Arc::new(RwLock::new(initial_status)),
     });
 
     ensure_chat_storage(&state).await?;
@@ -783,6 +800,11 @@ async fn main() -> Result<(), ArchitectError> {
     let router_state = Arc::clone(&state);
     tokio::spawn(async move {
         router_connect_loop(node_config, router_state).await;
+    });
+
+    let refresh_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        status_refresh_loop(refresh_state).await;
     });
 
     let app = Router::new()
@@ -1231,7 +1253,7 @@ async fn dynamic_handler(
     match (method, path) {
         (Method::GET, _) if is_favicon_path(path) => serve_favicon(path),
         (Method::GET, _) if is_status_path(path) => {
-            let status = build_architect_status(&state).await;
+            let status = state.cached_status.read().await.clone();
             Json(status).into_response()
         }
         (Method::GET, _) if is_identity_ich_options_path(path) => {
@@ -3966,6 +3988,17 @@ async fn execute_admin_translation_with_context(
         "request_id": out.request_id,
         "trace_id": out.trace_id,
     }))
+}
+
+const STATUS_REFRESH_INTERVAL_SECS: u64 = 30;
+
+
+async fn status_refresh_loop(state: Arc<ArchitectState>) {
+    loop {
+        let fresh = build_architect_status(&state).await;
+        *state.cached_status.write().await = fresh;
+        time::sleep(Duration::from_secs(STATUS_REFRESH_INTERVAL_SECS)).await;
+    }
 }
 
 async fn build_architect_status(state: &ArchitectState) -> ArchitectStatus {
