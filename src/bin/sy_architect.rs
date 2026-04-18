@@ -94,6 +94,7 @@ Rules:
 - For `wf_rules_list_workflows`, use `GET /hives/{hive}/wf-rules` with a concrete hive id and no `workflow_name`.
 - For `wf_rules_get_workflow`, use `GET /hives/{hive}/wf-rules?workflow_name=...`.
 - For `wf_rules_get_status`, use `GET /hives/{hive}/wf-rules/status?workflow_name=...`.
+- WF `workflow_name` must match `^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)*$` — lowercase, digits, hyphens, dot-segments. Underscores are rejected. Convert snake_case names to kebab-case (e.g. `response_dispatch` → `response-dispatch`).
 - When building a WF workflow `definition` object for `wf_rules_compile_apply` or `wf_rules_compile`, the required schema is:
   - Top-level: `wf_schema_version: "1"`, `workflow_type` (string, matches workflow_name), `description`, `input_schema` (JSON Schema of the event that creates instances), `initial_state`, `terminal_states: [...]`, `states: [...]`.
   - Each state: `name`, `description`, `entry_actions: []`, `exit_actions: []`, `transitions: []`.
@@ -647,7 +648,7 @@ impl FunctionTool for ArchitectDeployWorkflowTool {
                     },
                     "workflow_name": {
                         "type": "string",
-                        "description": "Workflow logical name, e.g. 'response_dispatch'."
+                        "description": "Workflow logical name. Must be lowercase letters, digits, hyphens, and optional dot-separated segments only — e.g. 'response-dispatch' or 'billing.invoice'. Underscores are not valid."
                     },
                     "definition": {
                         "type": "object",

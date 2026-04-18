@@ -5048,11 +5048,13 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "wf_rules_compile_apply" => vec![
             "workflow_name and definition are required.",
+            "workflow_name must match ^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*$ — lowercase letters, digits, hyphens, and dot-separated segments only. Underscores are not allowed.",
             "SY.admin forwards this to SY.wf-rules using the node CONFIG_SET contract.",
             "tenant_id is required on the first deploy when auto_spawn=true and no managed WF node exists yet.",
         ],
         "wf_rules_compile" => vec![
             "workflow_name and definition are required.",
+            "workflow_name must match ^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*)*$ — lowercase letters, digits, hyphens, and dot-separated segments only. Underscores are not allowed.",
             "SY.admin forwards this to SY.wf-rules using the node CONFIG_SET contract.",
             "compile validates and stages only; it never deploys, so tenant_id is not relevant here.",
         ],
