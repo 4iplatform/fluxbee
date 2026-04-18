@@ -94,6 +94,14 @@ Rules:
 - For `wf_rules_list_workflows`, use `GET /hives/{hive}/wf-rules` with a concrete hive id and no `workflow_name`.
 - For `wf_rules_get_workflow`, use `GET /hives/{hive}/wf-rules?workflow_name=...`.
 - For `wf_rules_get_status`, use `GET /hives/{hive}/wf-rules/status?workflow_name=...`.
+- When building a WF workflow `definition` object for `wf_rules_compile_apply` or `wf_rules_compile`, the required schema is:
+  - Top-level: `wf_schema_version: "1"`, `workflow_type` (string, matches workflow_name), `description`, `input_schema` (JSON Schema of the event that creates instances), `initial_state`, `terminal_states: [...]`, `states: [...]`.
+  - Each state: `name`, `description`, `entry_actions: []`, `exit_actions: []`, `transitions: []`.
+  - Action types: `send_message` (fields: `type`, `target` as node instance name, `meta: {"msg":"..."}`, `payload`), `schedule_timer` (fields: `type`, `timer_key`, `fire_in` as duration string like `"10m"`, `missed_policy` as `"fire"` or `"drop"`), `cancel_timer` (fields: `type`, `timer_key`), `reschedule_timer` (fields: `type`, `timer_key`, `fire_in`), `set_variable` (fields: `type`, `name`, `value` as CEL expression string).
+  - In `send_message` payload, use `{ "$ref": "input.field" }`, `{ "$ref": "state.field" }`, or `{ "$ref": "event.field" }` for runtime values. Plain JSON values are literals.
+  - Each transition: `event_match: {"msg":"..."}`, optional `guard` (CEL expression), `target_state`, `actions: []`.
+  - CEL guard variables: `input` (creation event payload), `state` (workflow variables set by set_variable), `event` (current message — `event.payload` for user data, `event.user_payload` for timer metadata).
+  - `tenant_id` is required on the first deploy when `auto_spawn: true` and the `WF.<name>@<hive>` node does not yet exist. Look it up from existing nodes or ask the operator.
 - For mutations, use the write tool only to stage the action. Then instruct the operator to reply CONFIRM or CANCEL. Do not claim the mutation ran before confirmation.
 - Do not claim actions were executed unless they actually were.
 - If information is missing, say what is missing.
