@@ -105,9 +105,9 @@ Rules:
 - For mutations, use the write tool only to stage the action. Then instruct the operator to reply CONFIRM or CANCEL. Do not claim the mutation ran before confirmation.
 - When calling the write tool for actions that require a body, always include the complete body in the tool call. For `wf_rules_compile_apply`, build and embed the full `definition` object directly in the body argument — never omit it, never ask the user to paste it separately. If the definition comes from an attachment, construct it from that content and pass it inline.
 - Use specialized write tools for large-body mutations instead of `fluxbee_system_write`:
-  - `fluxbee_deploy_workflow` — for `wf_rules_compile_apply` when passing a full workflow `definition` object.
-  - `fluxbee_deploy_opa_policy` — for `opa_compile_apply` when passing a full OPA `rego` source.
-  - `fluxbee_set_node_config` — for `node_control_config_set` when passing a large node `config` object. Always do CONFIG_GET first to read the current `config_version`.
+  - `fluxbee_deploy_workflow` — for `wf_rules_compile_apply` when passing a full workflow `definition`. Pass the definition object in `definition`, or if that is not possible, serialize it to a JSON string and pass it in `definition_json`.
+  - `fluxbee_deploy_opa_policy` — for `opa_compile_apply` when passing a full OPA `rego` source string.
+  - `fluxbee_set_node_config` — for `node_control_config_set` when passing a large node `config` object. Pass the config in `config`, or serialize to a JSON string and pass in `config_json`. Always do CONFIG_GET first to read the current `config_version`.
   - Use `fluxbee_system_write` only for mutations whose body is small and fits cleanly as an inline JSON object (route adds, vpn adds, kill_node, rollback, delete, etc.).
 - Do not claim actions were executed unless they actually were.
 - If information is missing, say what is missing.
@@ -608,14 +608,11 @@ impl FunctionTool for ArchitectSystemWriteTool {
 
 // ---- ArchitectDeployWorkflowTool -------------------------------------------
 //
-// Specialized write tool that accepts the WF definition as named first-class
-// parameters instead of a generic body object. This sidesteps the model's
-// reluctance to embed large nested JSON in a generic `body` argument while
-// still routing through the identical staging / confirmation flow.
-//
-// Adding more specialized tools follows the same pattern:
-//   1. Create a struct + impl FunctionTool
-//   2. Register it in ArchitectAdminReadToolsProvider::register_tools
+// Specialized write tool for wf_rules_compile_apply.
+// Accepts the definition as either a JSON object (`definition`) or a
+// JSON-encoded string (`definition_json`). The string path exists because the
+// model readily produces large JSON as text but may refuse to embed it as a
+// nested object in a tool call argument. Both paths produce identical behavior.
 
 struct ArchitectDeployWorkflowTool {
     context: ArchitectAdminToolContext,
@@ -635,14 +632,14 @@ impl FunctionTool for ArchitectDeployWorkflowTool {
             description: format!(
                 "Compile and deploy a WF workflow definition on hive {} through SY.wf-rules. \
                 Stages the deploy for user confirmation (CONFIRM / CANCEL). \
-                Use this instead of fluxbee_system_write when the definition object is large — \
-                pass each field as a named parameter so the full definition can be provided inline.",
+                Pass the definition as a JSON object in `definition` OR as a JSON-encoded string \
+                in `definition_json` — use whichever form the model can emit cleanly.",
                 self.context.hive_id,
             ),
             parameters_json_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["workflow_name", "definition"],
+                "required": ["workflow_name"],
                 "properties": {
                     "hive": {
                         "type": "string",
@@ -654,7 +651,11 @@ impl FunctionTool for ArchitectDeployWorkflowTool {
                     },
                     "definition": {
                         "type": "object",
-                        "description": "Complete WF v1 workflow definition object (wf_schema_version, workflow_type, states, etc.)."
+                        "description": "Complete WF v1 workflow definition object. Use this when the object can be passed directly."
+                    },
+                    "definition_json": {
+                        "type": "string",
+                        "description": "Alternative to `definition`: the complete WF v1 definition serialized as a JSON string. Use this when passing the object directly is not possible."
                     },
                     "auto_spawn": {
                         "type": "boolean",
@@ -687,14 +688,11 @@ impl FunctionTool for ArchitectDeployWorkflowTool {
                 )
             })?
             .to_string();
-        let definition = arguments
-            .get("definition")
-            .filter(|v| v.is_object())
-            .cloned()
-            .ok_or_else(|| {
-                fluxbee_ai_sdk::AiSdkError::Protocol(
-                    "fluxbee_deploy_workflow requires 'definition' as a JSON object".to_string(),
-                )
+        let definition = resolve_json_object_param(&arguments, "definition", "definition_json")
+            .map_err(|err| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                    "fluxbee_deploy_workflow: {err}"
+                ))
             })?;
 
         let mut body = json!({
@@ -871,7 +869,11 @@ impl FunctionTool for ArchitectSetNodeConfigTool {
                     },
                     "config": {
                         "type": "object",
-                        "description": "Node-defined config payload. Content is node-specific and not interpreted by SY.admin."
+                        "description": "Node-defined config payload. Content is node-specific and not interpreted by SY.admin. Use this when the object can be passed directly."
+                    },
+                    "config_json": {
+                        "type": "string",
+                        "description": "Alternative to `config`: the node config serialized as a JSON string. Use this when passing the object directly is not possible."
                     },
                     "config_version": {
                         "type": "integer",
@@ -909,14 +911,11 @@ impl FunctionTool for ArchitectSetNodeConfigTool {
                 )
             })?
             .to_string();
-        let config = arguments
-            .get("config")
-            .filter(|v| v.is_object())
-            .cloned()
-            .ok_or_else(|| {
-                fluxbee_ai_sdk::AiSdkError::Protocol(
-                    "fluxbee_set_node_config requires 'config' as a JSON object".to_string(),
-                )
+        let config = resolve_json_object_param(&arguments, "config", "config_json")
+            .map_err(|err| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                    "fluxbee_set_node_config: {err}"
+                ))
             })?;
         let schema_version = arguments
             .get("schema_version")
@@ -1103,6 +1102,32 @@ fn require_session_id<'a>(
                 "{tool_name} requires a live chat session"
             ))
         })
+}
+
+// Resolves a JSON object parameter from either a direct object field or a
+// JSON-encoded string field. The string path exists for cases where the model
+// refuses to pass large nested JSON as an object argument but can pass it as
+// a string.
+fn resolve_json_object_param(
+    arguments: &Value,
+    object_key: &str,
+    string_key: &str,
+) -> Result<Value, String> {
+    if let Some(obj) = arguments.get(object_key).filter(|v| v.is_object()) {
+        return Ok(obj.clone());
+    }
+    if let Some(s) = arguments
+        .get(string_key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return serde_json::from_str(s).map_err(|err| {
+            format!("'{string_key}' is not valid JSON: {err}")
+        });
+    }
+    Err(format!(
+        "one of '{object_key}' (object) or '{string_key}' (JSON string) is required"
+    ))
 }
 
 #[tokio::main]
