@@ -2185,16 +2185,25 @@ async fn handle_executor_plan_request(
             session_id: Some(resolved_session_id.clone()),
             session_title: Some(session.title.clone()),
         },
-        Err(err) => ChatResponse {
-            status: "error".to_string(),
-            mode: "executor".to_string(),
-            output: json!({
-                "error": err.to_string(),
-                "execution_id": execution_id,
-            }),
-            session_id: Some(resolved_session_id.clone()),
-            session_title: Some(session.title.clone()),
-        },
+        Err(err) => {
+            let error_text = err.to_string();
+            let phase = if error_text.starts_with("executor plan validation failed:") {
+                Some("admin_validate")
+            } else {
+                None
+            };
+            ChatResponse {
+                status: "error".to_string(),
+                mode: "executor".to_string(),
+                output: json!({
+                    "error": error_text,
+                    "execution_id": execution_id,
+                    "phase": phase,
+                }),
+                session_id: Some(resolved_session_id.clone()),
+                session_title: Some(session.title.clone()),
+            }
+        }
     };
 
     let plan_text = render_executor_plan_submission(&execution_id, &req.plan);

@@ -264,7 +264,7 @@ resp="$(executor_post "$(plan_invalid)")"
 echo "  response: $resp"
 assert_eq "status" "$(json_get "$resp" "status")" "error"
 assert_eq "mode" "$(json_get "$resp" "mode")" "executor"
-assert_eq "phase" "$(json_get "$resp" "output.phase")" "architect_precheck"
+assert_eq "phase" "$(json_get "$resp" "output.phase")" "admin_validate"
 assert_contains "error mentions missing hive" "$(json_get "$resp" "output.error")" "missing required field 'hive'"
 
 echo
