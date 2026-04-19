@@ -47,6 +47,7 @@ const ADMIN_EXECUTOR_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
 const ADMIN_EXECUTOR_DEFAULT_CATALOG_MODE: &str = "full";
 const ADMIN_EXECUTOR_PLAN_KIND: &str = "executor_plan";
 const ADMIN_EXECUTOR_PLAN_VERSION: &str = "0.1";
+const ADMIN_EXECUTOR_SCHEMA_OVERRIDE_ACTIONS: &[&str] = &["get_admin_action_help"];
 const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "list_admin_actions",
     "get_admin_action_help",
@@ -184,6 +185,8 @@ struct AdminExecutorStepEvent {
     tool_name: Option<String>,
     tool_args_preview: Option<serde_json::Value>,
     result_preview: Option<serde_json::Value>,
+    error_code: Option<String>,
+    error_source: Option<String>,
     error_message: Option<String>,
 }
 
@@ -195,7 +198,18 @@ struct AdminExecutorRunSummary {
     completed_steps: usize,
     failed_step_id: Option<String>,
     failed_step_action: Option<String>,
+    failure: Option<AdminExecutorFailure>,
+    log_path: Option<String>,
     final_message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AdminExecutorFailure {
+    code: String,
+    detail: String,
+    source: String,
+    step_id: Option<String>,
+    step_action: Option<String>,
 }
 
 #[derive(Clone)]
@@ -684,6 +698,13 @@ fn admin_executor_config_path(hive_id: &str) -> PathBuf {
     admin_executor_node_dir(hive_id).join("config.json")
 }
 
+fn admin_executor_log_dir(state_dir: &Path, hive_id: &str) -> PathBuf {
+    state_dir
+        .join("admin-executor")
+        .join(hive_id)
+        .join("executions")
+}
+
 fn load_admin_executor_node_config(
     hive_id: &str,
 ) -> Result<Option<AdminExecutorNodeConfigFile>, AdminError> {
@@ -879,7 +900,33 @@ fn admin_contract_field_schema(field: &serde_json::Value) -> serde_json::Value {
     schema
 }
 
+fn build_admin_executor_override_definition(
+    spec: &InternalActionSpec,
+) -> Option<FunctionToolDefinition> {
+    match spec.action {
+        "get_admin_action_help" => Some(FunctionToolDefinition {
+            name: spec.action.to_string(),
+            description: admin_action_summary(spec.action).to_string(),
+            parameters_json_schema: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "Admin action name, for example add_hive."
+                    }
+                },
+                "required": ["action"]
+            }),
+        }),
+        _ => None,
+    }
+}
+
 fn build_admin_executor_function_definition(spec: &InternalActionSpec) -> FunctionToolDefinition {
+    if let Some(definition) = build_admin_executor_override_definition(spec) {
+        return definition;
+    }
     let mut properties = serde_json::Map::new();
     let mut required = Vec::<String>::new();
 
@@ -922,6 +969,59 @@ fn build_admin_executor_function_catalog(
         .into_iter()
         .map(build_admin_executor_function_definition)
         .collect()
+}
+
+fn redact_executor_log_value(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut redacted = serde_json::Map::new();
+            for (key, entry) in map {
+                let lower = key.to_ascii_lowercase();
+                if matches!(
+                    lower.as_str(),
+                    "api_key" | "token" | "secret" | "password" | "authorization"
+                ) {
+                    redacted.insert(
+                        key.clone(),
+                        serde_json::Value::String(NODE_SECRET_REDACTION_TOKEN.to_string()),
+                    );
+                } else {
+                    redacted.insert(key.clone(), redact_executor_log_value(entry));
+                }
+            }
+            serde_json::Value::Object(redacted)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(redact_executor_log_value).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
+fn persist_admin_executor_run_log(
+    ctx: &AdminContext,
+    execution_id: &str,
+    request: &AdminExecutorRunRequest,
+    events: &[AdminExecutorStepEvent],
+    summary: &AdminExecutorRunSummary,
+) -> Result<String, AdminError> {
+    let dir = admin_executor_log_dir(&ctx.state_dir, &ctx.hive_id);
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{execution_id}.json"));
+    let body = serde_json::json!({
+        "execution_id": execution_id,
+        "request": {
+            "execution_id": request.execution_id,
+            "plan": redact_executor_log_value(&serde_json::to_value(&request.plan).unwrap_or_else(|_| serde_json::json!({}))),
+            "executor_options": redact_executor_log_value(&serde_json::to_value(&request.executor_options).unwrap_or_else(|_| serde_json::json!({}))),
+            "labels": redact_executor_log_value(&serde_json::to_value(&request.labels).unwrap_or_else(|_| serde_json::json!({}))),
+        },
+        "events": redact_executor_log_value(&serde_json::to_value(events).unwrap_or_else(|_| serde_json::json!([]))),
+        "summary": redact_executor_log_value(&serde_json::to_value(summary).unwrap_or_else(|_| serde_json::json!({}))),
+        "written_at": now_epoch_ms(),
+    });
+    fs::write(&path, serde_json::to_vec_pretty(&body)?)?;
+    Ok(path.display().to_string())
 }
 
 fn parse_executor_plan(params: serde_json::Value) -> Result<AdminExecutorPlan, String> {
@@ -1464,7 +1564,10 @@ impl FunctionTool for AdminExecutorHelpTool {
             &self.client,
             "get_admin_action_help",
             None,
-            serde_json::json!({ "action": requested_action }),
+            serde_json::json!({
+                "action": requested_action,
+                "action_name": requested_action
+            }),
         )
         .await
         .map_err(|err| fluxbee_ai_sdk::AiSdkError::Protocol(err.to_string()))?;
@@ -1497,7 +1600,7 @@ fn build_executor_step_events_from_result(
     step_index: usize,
     step: &AdminExecutorPlanStep,
     result: &fluxbee_ai_sdk::function_calling::FunctionLoopRunResult,
-) -> (Vec<AdminExecutorStepEvent>, bool, Option<String>) {
+) -> (Vec<AdminExecutorStepEvent>, bool, Option<AdminExecutorFailure>) {
     let mut events = vec![
         AdminExecutorStepEvent {
             execution_id: execution_id.to_string(),
@@ -1510,6 +1613,8 @@ fn build_executor_step_events_from_result(
             tool_name: None,
             tool_args_preview: None,
             result_preview: None,
+            error_code: None,
+            error_source: None,
             error_message: None,
         },
         AdminExecutorStepEvent {
@@ -1523,11 +1628,13 @@ fn build_executor_step_events_from_result(
             tool_name: None,
             tool_args_preview: Some(step.args.clone()),
             result_preview: None,
+            error_code: None,
+            error_source: None,
             error_message: None,
         },
     ];
     let mut action_called = false;
-    let mut failure = None;
+    let mut failure = None::<AdminExecutorFailure>;
     for item in &result.items {
         if let FunctionLoopItem::ToolResult {
             result: tool_result,
@@ -1544,18 +1651,48 @@ fn build_executor_step_events_from_result(
             if tool_name == step.action {
                 action_called = true;
             }
-            let error_message = if tool_result.is_error {
+            let (error_code, error_source, error_message) = if tool_result.is_error {
                 let detail = tool_result
                     .output
                     .get("error_detail")
                     .cloned()
                     .unwrap_or_else(|| tool_result.output.clone());
-                Some(detail.to_string())
+                let detail_text = detail.to_string();
+                let code = tool_result
+                    .output
+                    .get("error_code")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| {
+                        if tool_name == "get_admin_action_help" {
+                            "HELP_LOOKUP_FAILED".to_string()
+                        } else {
+                            "ADMIN_ACTION_FAILED".to_string()
+                        }
+                    });
+                let source = if tool_name == "get_admin_action_help" {
+                    "help_ambiguity".to_string()
+                } else {
+                    "admin_action_failure".to_string()
+                };
+                (Some(code), Some(source), Some(detail_text))
             } else {
-                None
+                (None, None, None)
             };
             if tool_result.is_error && failure.is_none() {
-                failure = error_message.clone();
+                failure = Some(AdminExecutorFailure {
+                    code: error_code
+                        .clone()
+                        .unwrap_or_else(|| "ADMIN_ACTION_FAILED".to_string()),
+                    detail: error_message
+                        .clone()
+                        .unwrap_or_else(|| "executor tool failed".to_string()),
+                    source: error_source
+                        .clone()
+                        .unwrap_or_else(|| "admin_action_failure".to_string()),
+                    step_id: Some(step.id.clone()),
+                    step_action: Some(step.action.clone()),
+                });
             }
             events.push(AdminExecutorStepEvent {
                 execution_id: execution_id.to_string(),
@@ -1568,15 +1705,23 @@ fn build_executor_step_events_from_result(
                 tool_name: Some(tool_name),
                 tool_args_preview: Some(tool_result.arguments.clone()),
                 result_preview: Some(tool_result.output.clone()),
+                error_code,
+                error_source,
                 error_message,
             });
         }
     }
     if !action_called && failure.is_none() {
-        failure = Some(format!(
-            "executor finished step '{}' without calling '{}'",
-            step.id, step.action
-        ));
+        failure = Some(AdminExecutorFailure {
+            code: "EXECUTOR_NO_ACTION_CALL".to_string(),
+            detail: format!(
+                "executor finished step '{}' without calling '{}'",
+                step.id, step.action
+            ),
+            source: "validation".to_string(),
+            step_id: Some(step.id.clone()),
+            step_action: Some(step.action.clone()),
+        });
         events.push(AdminExecutorStepEvent {
             execution_id: execution_id.to_string(),
             step_id: step.id.clone(),
@@ -1588,7 +1733,9 @@ fn build_executor_step_events_from_result(
             tool_name: Some(step.action.clone()),
             tool_args_preview: Some(step.args.clone()),
             result_preview: None,
-            error_message: failure.clone(),
+            error_code: Some("EXECUTOR_NO_ACTION_CALL".to_string()),
+            error_source: Some("validation".to_string()),
+            error_message: failure.as_ref().map(|value| value.detail.clone()),
         });
     }
     (events, action_called && failure.is_none(), failure)
@@ -1612,6 +1759,7 @@ async fn execute_admin_executor_plan(
     let mut completed_steps = 0usize;
     let mut failed_step_id = None::<String>;
     let mut failed_step_action = None::<String>;
+    let mut last_failure = None::<AdminExecutorFailure>;
 
     for (index, step) in request.plan.execution.steps.iter().enumerate() {
         if request.executor_options.dry_run {
@@ -1626,6 +1774,8 @@ async fn execute_admin_executor_plan(
                 tool_name: Some(step.action.clone()),
                 tool_args_preview: Some(step.args.clone()),
                 result_preview: None,
+                error_code: None,
+                error_source: None,
                 error_message: None,
             });
             completed_steps += 1;
@@ -1689,6 +1839,7 @@ async fn execute_admin_executor_plan(
             completed_steps += 1;
             continue;
         }
+        last_failure = failure.clone();
         failed_step_id = Some(step.id.clone());
         failed_step_action = Some(step.action.clone());
         if request.plan.execution.stop_on_error {
@@ -1703,7 +1854,9 @@ async fn execute_admin_executor_plan(
                 tool_name: Some(step.action.clone()),
                 tool_args_preview: Some(step.args.clone()),
                 result_preview: None,
-                error_message: failure,
+                error_code: failure.as_ref().map(|value| value.code.clone()),
+                error_source: failure.as_ref().map(|value| value.source.clone()),
+                error_message: failure.as_ref().map(|value| value.detail.clone()),
             });
             break;
         }
@@ -1714,13 +1867,15 @@ async fn execute_admin_executor_plan(
     } else {
         "done"
     };
-    let summary = AdminExecutorRunSummary {
+    let mut summary = AdminExecutorRunSummary {
         execution_id: request.execution_id.clone(),
         status: status.to_string(),
         total_steps: request.plan.execution.steps.len(),
         completed_steps,
         failed_step_id: failed_step_id.clone(),
         failed_step_action: failed_step_action.clone(),
+        failure: last_failure.clone(),
+        log_path: None,
         final_message: if let Some(step_id) = failed_step_id.as_deref() {
             format!("Execution stopped at step '{step_id}'")
         } else if request.executor_options.dry_run {
@@ -1729,6 +1884,23 @@ async fn execute_admin_executor_plan(
             "Execution completed successfully".to_string()
         },
     };
+    if status == "failed" && summary.failure.is_none() {
+        summary.failure = Some(AdminExecutorFailure {
+            code: "EXECUTION_FAILED".to_string(),
+            detail: summary.final_message.clone(),
+            source: "admin_action_failure".to_string(),
+            step_id: failed_step_id.clone(),
+            step_action: failed_step_action.clone(),
+        });
+    }
+    summary.log_path = persist_admin_executor_run_log(
+        ctx,
+        &request.execution_id,
+        request,
+        &all_events,
+        &summary,
+    )
+    .ok();
 
     Ok(serde_json::json!({
         "status": summary.status,
@@ -5020,6 +5192,7 @@ fn build_admin_executor_function_catalog_response(
                 "catalog_mode": mode,
                 "registry_version": INTERNAL_ACTION_REGISTRY_VERSION,
                 "function_count": catalog.len(),
+                "override_actions": ADMIN_EXECUTOR_SCHEMA_OVERRIDE_ACTIONS,
                 "functions": catalog,
             },
             "error_code": serde_json::Value::Null,
@@ -6685,7 +6858,8 @@ async fn handle_admin_command(
 ) -> Result<(u16, String), AdminError> {
     if matches!(action, "get_admin_action_help") {
         let action_name = payload
-            .get("action_name")
+            .get("action")
+            .or_else(|| payload.get("action_name"))
             .and_then(|value| value.as_str())
             .unwrap_or_default();
         return Ok(build_admin_action_help_response(action_name));
@@ -8824,6 +8998,47 @@ mod tests {
         .expect_err("invalid actions must fail");
 
         assert!(err.to_string().contains("invalid action"));
+    }
+
+    #[test]
+    fn admin_executor_help_definition_uses_action_override() {
+        let spec =
+            resolve_internal_action_spec("get_admin_action_help").expect("help action present");
+        let definition = build_admin_executor_function_definition(spec);
+
+        assert_eq!(definition.name, "get_admin_action_help");
+        assert_eq!(
+            definition.parameters_json_schema["required"],
+            json!(["action"])
+        );
+        assert!(definition.parameters_json_schema["properties"]["action"].is_object());
+        assert!(definition.parameters_json_schema["properties"]["action_name"].is_null());
+    }
+
+    #[test]
+    fn redact_executor_log_value_redacts_secret_like_fields() {
+        let value = json!({
+            "api_key": "sk-live",
+            "nested": {
+                "token": "tok-123",
+                "safe": "ok"
+            },
+            "list": [
+                { "password": "pw" },
+                { "safe": "item" }
+            ]
+        });
+
+        let redacted = redact_executor_log_value(&value);
+
+        assert_eq!(redacted["api_key"], json!(NODE_SECRET_REDACTION_TOKEN));
+        assert_eq!(redacted["nested"]["token"], json!(NODE_SECRET_REDACTION_TOKEN));
+        assert_eq!(redacted["nested"]["safe"], json!("ok"));
+        assert_eq!(
+            redacted["list"][0]["password"],
+            json!(NODE_SECRET_REDACTION_TOKEN)
+        );
+        assert_eq!(redacted["list"][1]["safe"], json!("item"));
     }
 
     #[test]

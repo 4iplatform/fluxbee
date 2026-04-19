@@ -78,7 +78,7 @@ Acceptance:
   - Any failing step stops the plan when `stop_on_error=true`.
   - Admin timeout/unavailable must stop execution clearly.
 
-- [ ] `EXEC-PILOT-B5` Implement auxiliary read/help call restrictions.
+- [x] `EXEC-PILOT-B5` Implement auxiliary read/help call restrictions.
   - Allowed:
     - `get_admin_action_help`
     - read-only admin actions needed to resolve infra-obvious values
@@ -106,7 +106,7 @@ Acceptance:
   - required fields
   - enums where available
 
-- [ ] `EXEC-PILOT-C3` Define manual overrides for actions whose schemas cannot yet be generated cleanly.
+- [x] `EXEC-PILOT-C3` Define manual overrides for actions whose schemas cannot yet be generated cleanly.
   - Keep the override set explicit and small.
   - Document which actions still need generation improvements.
 
@@ -194,7 +194,7 @@ Acceptance:
 - [x] `EXEC-PILOT-F2` Encode the infrastructure-obvious refinement rule in the executor prompt.
   - Only fill values explicitly allowed by `executor_fill`.
 
-- [ ] `EXEC-PILOT-F3` Keep `SY.architect` prompt focused on host behavior.
+- [x] `EXEC-PILOT-F3` Keep `SY.architect` prompt focused on host behavior.
   - Archi coordinates and renders
   - Admin executes
 
@@ -206,7 +206,7 @@ Acceptance:
 
 ## 8. Phase G — Errors And Observability
 
-- [ ] `EXEC-PILOT-G1` Add rich structured execution errors from `SY.admin`.
+- [x] `EXEC-PILOT-G1` Add rich structured execution errors from `SY.admin`.
   - action name
   - step id
   - code
@@ -217,12 +217,12 @@ Acceptance:
     - admin action failure
     - timeout/control-plane failure
 
-- [ ] `EXEC-PILOT-G2` Add execution log storage for pilot sessions.
+- [x] `EXEC-PILOT-G2` Add execution log storage for pilot sessions.
   - request
   - step events
   - final result
 
-- [ ] `EXEC-PILOT-G3` Ensure logs and persisted records are redacted where needed.
+- [x] `EXEC-PILOT-G3` Ensure logs and persisted records are redacted where needed.
   - no secrets
   - no sensitive payload dumps unless intentionally allowed
 
@@ -262,15 +262,15 @@ Acceptance:
 
 ## 10. Phase I — End-To-End Validation
 
-- [ ] `EXEC-PILOT-I1` E2E: read-only execution plan succeeds.
+- [x] `EXEC-PILOT-I1` E2E: read-only execution plan succeeds.
   - example: `get_runtime`, `list_nodes`
 
-- [ ] `EXEC-PILOT-I2` E2E: mutating plan succeeds.
+- [x] `EXEC-PILOT-I2` E2E: mutating plan succeeds.
   - example: `add_route`
 
 - [ ] `EXEC-PILOT-I3` E2E: help lookup path is exercised.
 
-- [ ] `EXEC-PILOT-I4` E2E: invalid plan fails before execution.
+- [x] `EXEC-PILOT-I4` E2E: invalid plan fails before execution.
 
 - [ ] `EXEC-PILOT-I5` E2E: `SY.admin` timeout/failure stops the execution visibly.
 

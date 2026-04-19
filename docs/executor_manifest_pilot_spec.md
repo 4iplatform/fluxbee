@@ -489,6 +489,8 @@ For each event, the host should be able to render at least:
 - `tool_args_preview`
 - `result_preview`
 - `error_message` if any
+- optional `error_code`
+- optional `error_source`
 
 ### 10.3 Event source
 
@@ -683,6 +685,14 @@ That path is separate from:
 - attachment upload
 
 Its purpose is only to ingest an external `executor_plan`, create or reuse a session, invoke `SY.admin`, and persist/render the execution result.
+
+Pilot implementation may also persist a redacted execution log on the `SY.admin` side containing:
+
+- incoming execution request
+- step events
+- final summary
+
+If present, the final summary may expose a `log_path` for operator/debug use.
 
 Current implementation direction for the pilot:
 
