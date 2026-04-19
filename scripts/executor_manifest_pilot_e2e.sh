@@ -144,7 +144,7 @@ plan_add_route() {
           "args": {
             "hive": "$HIVE_ID",
             "prefix": "$ROUTE_PREFIX",
-            "action": "next_hop_hive",
+            "action": "FORWARD",
             "next_hop_hive": "$NEXT_HOP_HIVE"
           }
         }

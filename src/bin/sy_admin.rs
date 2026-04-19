@@ -1579,14 +1579,20 @@ fn admin_executor_prompt(step: &AdminExecutorPlanStep, plan: &AdminExecutorPlan)
     format!(
         "You are the Fluxbee executor specialist running inside SY.admin.\n\
 Execute exactly one declared step from the provided executor plan.\n\
+\n\
+Execution sequence (mandatory):\n\
+1. Call get_admin_action_help for the current step.action to read the exact contract, field semantics, valid values, and defaults.\n\
+2. Using the help response, verify that step.args satisfies the required fields and that you understand every optional field in the schema.\n\
+3. Call the exact function named by step.action using only the arguments from step.args. Do not add any field not present in step.args unless it is explicitly listed in step.executor_fill.allowed.\n\
+4. If after reading the help a required field is still missing or an argument value is invalid, stop and report failure. Do not invent values.\n\
+\n\
 Rules:\n\
+- Always call get_admin_action_help before executing. It is not optional.\n\
 - Call the exact function named by step.action.\n\
 - Do not rename actions.\n\
 - Do not add steps.\n\
 - Do not change declared values from step.args.\n\
-- You may only provide extra fields if they are explicitly allowed by step.executor_fill.allowed.\n\
-- If help lookup is available and the contract is unclear, call get_admin_action_help for this step action only.\n\
-- If the step remains ambiguous or incomplete, stop without inventing values.\n\
+- Do not supply optional fields that are not in step.args, even with zero or empty values, unless they are in step.executor_fill.allowed.\n\
 - Keep the execution deterministic.\n\
 Current step JSON:\n{}\n\
 Plan metadata:\n{}",
@@ -5710,7 +5716,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         "set_storage" => "Persist storage configuration changes.",
         "add_hive" => "Create a hive and bootstrap it.",
         "remove_hive" => "Remove a hive.",
-        "add_route" => "Add a route rule to a hive.",
+        "add_route" => "Add a route rule to a hive. Route action must be FORWARD (forward to next_hop_hive) or DROP. match_kind defaults to PREFIX when omitted. priority defaults to 100 when omitted.",
         "delete_route" => "Delete a route rule from a hive.",
         "add_vpn" => "Add a VPN pattern to a hive.",
         "delete_vpn" => "Delete a VPN pattern from a hive.",
@@ -5998,11 +6004,11 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             "Fully-qualified node name to start.",
         )],
         "add_route" => vec![
-            admin_action_body_field("prefix", "string", "Route prefix, for example AI.chat."),
+            admin_action_body_field("prefix", "string", "Route prefix matched against message destinations, for example AI.chat or tenant.acme."),
             admin_action_body_field(
                 "action",
                 "string",
-                "Routing action, typically next_hop_hive or similar route mode.",
+                "Routing action. Must be FORWARD (forward matching traffic to the hive named in next_hop_hive) or DROP (silently drop matching traffic). Case-sensitive.",
             ),
         ],
         "add_vpn" => vec![
@@ -6160,14 +6166,26 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             ),
         ],
         "add_route" => vec![
-            admin_action_body_field("match_kind", "string", "Optional route match kind."),
+            admin_action_body_field(
+                "match_kind",
+                "string",
+                "How to match the prefix. Accepted values: PREFIX (default, matches any destination starting with the prefix), EXACT (matches the destination exactly), GLOB (glob pattern match). Omit this field to use PREFIX. Do not pass an empty string — it is invalid.",
+            ),
             admin_action_body_field(
                 "next_hop_hive",
                 "string",
-                "Next-hop hive when the route action needs one.",
+                "Destination hive name to forward traffic to. Required when action is FORWARD. Must be the exact hive name as registered in the cluster. Omit when action is DROP.",
             ),
-            admin_action_body_field("metric", "u32", "Optional route metric."),
-            admin_action_body_field("priority", "u16", "Optional route priority."),
+            admin_action_body_field(
+                "metric",
+                "u32",
+                "Route metric used for tie-breaking between routes with the same prefix and priority. Default is 0 when omitted. Lower metric is preferred.",
+            ),
+            admin_action_body_field(
+                "priority",
+                "u16",
+                "Route evaluation priority. Higher value means higher priority and earlier evaluation. Default is 100 when omitted. Do not pass 0 unless intentionally setting the lowest possible priority.",
+            ),
         ],
         "add_vpn" => vec![
             admin_action_body_field("match_kind", "string", "Optional VPN match kind."),
