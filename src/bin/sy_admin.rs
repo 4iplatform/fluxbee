@@ -205,6 +205,22 @@ impl AdminRouterClient {
     }
 
     async fn dispatch(&self, msg: Message) {
+        if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_NODE_STATUS_GET)
+        {
+            let sender = self.sender.read().await.clone();
+            let _ = try_handle_default_node_status(&sender, &msg).await;
+            return;
+        }
+        if msg.meta.msg_type == SYSTEM_KIND
+            && matches!(msg.meta.msg.as_deref(), Some("CONFIG_GET" | "CONFIG_SET"))
+        {
+            let _ = self.system_command_tx.send(msg);
+            return;
+        }
+        if msg.meta.msg_type == "admin" && msg.meta.msg.as_deref() == Some(MSG_ADMIN_COMMAND) {
+            let _ = self.internal_admin_tx.send(msg);
+            return;
+        }
         if matches!(
             msg.meta.msg_type.as_str(),
             "admin" | SYSTEM_KIND | "command" | "command_response" | "query" | "query_response"
@@ -223,22 +239,6 @@ impl AdminRouterClient {
                 dst = ?msg.routing.dst,
                 "sy.admin saw admin/system message without pending waiter"
             );
-        }
-        if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_NODE_STATUS_GET)
-        {
-            let sender = self.sender.read().await.clone();
-            let _ = try_handle_default_node_status(&sender, &msg).await;
-            return;
-        }
-        if msg.meta.msg_type == SYSTEM_KIND
-            && matches!(msg.meta.msg.as_deref(), Some("CONFIG_GET" | "CONFIG_SET"))
-        {
-            let _ = self.system_command_tx.send(msg);
-            return;
-        }
-        if msg.meta.msg_type == "admin" && msg.meta.msg.as_deref() == Some(MSG_ADMIN_COMMAND) {
-            let _ = self.internal_admin_tx.send(msg);
-            return;
         }
         if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some("CONFIG_RESPONSE") {
             let _ = self.system_tx.send(msg);
