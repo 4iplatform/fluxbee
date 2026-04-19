@@ -1582,9 +1582,8 @@ Execute exactly one declared step from the provided executor plan.\n\
 \n\
 Execution sequence (mandatory):\n\
 1. Call get_admin_action_help for the current step.action to read the exact contract, field semantics, valid values, and defaults.\n\
-2. Using the help response, verify that step.args satisfies the required fields and that you understand every optional field in the schema.\n\
-3. Call the exact function named by step.action using only the arguments from step.args. Do not add any field not present in step.args unless it is explicitly listed in step.executor_fill.allowed.\n\
-4. If after reading the help a required field is still missing or an argument value is invalid, stop and report failure. Do not invent values.\n\
+2. Using the help response, verify that step.args provides all required fields with valid values. If a required field is missing or a value is invalid, stop and report failure.\n\
+3. Call the exact function named by step.action with exactly the arguments in step.args, and nothing else — unless a field is explicitly listed in step.executor_fill.allowed.\n\
 \n\
 Rules:\n\
 - Always call get_admin_action_help before executing. It is not optional.\n\
@@ -1592,7 +1591,9 @@ Rules:\n\
 - Do not rename actions.\n\
 - Do not add steps.\n\
 - Do not change declared values from step.args.\n\
-- Do not supply optional fields that are not in step.args, even with zero or empty values, unless they are in step.executor_fill.allowed.\n\
+- The help tells you what fields exist and what they mean. It does not authorize you to add them. Only pass what is in step.args.\n\
+- Do not pass defaults, zero values, or empty strings for optional fields that are absent from step.args. The infrastructure applies its own defaults — your job is to pass exactly what the plan declared.\n\
+- Fields in step.executor_fill.allowed are the only exception: those may be added if the help confirms they are safe and their values are derivable from current infrastructure, not from design intent.\n\
 - Keep the execution deterministic.\n\
 Current step JSON:\n{}\n\
 Plan metadata:\n{}",
@@ -6431,7 +6432,7 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         }),
         "add_route" => serde_json::json!({
             "prefix": "AI.chat.",
-            "action": "next_hop_hive",
+            "action": "FORWARD",
             "next_hop_hive": "worker-220"
         }),
         "delete_route" => serde_json::json!({
@@ -6630,7 +6631,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         }
         "list_routes" => "curl -X GET /hives/motherbee/routes",
         "add_route" => {
-            r#"curl -X POST /hives/motherbee/routes -d '{"prefix":"AI.chat.","action":"next_hop_hive","next_hop_hive":"worker-220"}'"#
+            r#"curl -X POST /hives/motherbee/routes -d '{"prefix":"AI.chat.","action":"FORWARD","next_hop_hive":"worker-220"}'"#
         }
         "delete_route" => "curl -X DELETE /hives/motherbee/routes/AI.chat.",
         "list_vpns" => "curl -X GET /hives/motherbee/vpns",
