@@ -1575,6 +1575,118 @@ impl FunctionTool for AdminExecutorHelpTool {
     }
 }
 
+struct PlanStepReviewTool {
+    issues: Arc<tokio::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl FunctionTool for PlanStepReviewTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "report_step_issue".to_string(),
+            description: "Report issues found in the step args. Call this only if the step args are invalid or incomplete according to the action contract. Do not call it if the step is valid.".to_string(),
+            parameters_json_schema: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "issues": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of specific issues found. Each issue should name the field and explain the problem."
+                    }
+                },
+                "required": ["issues"]
+            }),
+        }
+    }
+
+    async fn call(
+        &self,
+        arguments: serde_json::Value,
+    ) -> fluxbee_ai_sdk::Result<serde_json::Value> {
+        let issues: Vec<String> = arguments
+            .get("issues")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        *self.issues.lock().await = issues;
+        Ok(serde_json::json!({"acknowledged": true}))
+    }
+}
+
+async fn semantic_review_executor_plan(
+    runtime: &AdminExecutorAiRuntime,
+    plan: &AdminExecutorPlan,
+) -> Result<(), String> {
+    let mut all_issues: Vec<String> = Vec::new();
+
+    for step in &plan.execution.steps {
+        let (_status, help_json) = build_admin_action_help_response(&step.action);
+        let help_text = help_json;
+
+        let step_issues = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let mut tools = FunctionToolRegistry::new();
+        tools
+            .register(Arc::new(PlanStepReviewTool {
+                issues: step_issues.clone(),
+            }))
+            .map_err(|e| e.to_string())?;
+
+        let prompt = format!(
+            "You are a Fluxbee plan reviewer.\n\
+Review the executor plan step below against the action help contract.\n\
+If the step args are invalid or incomplete — missing required fields, invalid field values, conditional requirements not satisfied — call report_step_issue with a list of specific issues.\n\
+If the step args are correct and complete, do not call report_step_issue.\n\
+\n\
+Action help contract:\n{}\n\
+\n\
+Step to review:\n{}",
+            help_text,
+            serde_json::to_string_pretty(step).unwrap_or_default()
+        );
+
+        let model = runtime.client.clone().function_model(
+            runtime.model.clone(),
+            Some(prompt),
+            runtime.model_settings.clone(),
+        );
+        let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
+        let _ = runner
+            .run_with_input(
+                &model,
+                &tools,
+                FunctionRunInput {
+                    current_user_message: format!(
+                        "Review step '{}' ({}).",
+                        step.id, step.action
+                    ),
+                    current_user_parts: None,
+                    immediate_memory: None,
+                },
+            )
+            .await;
+
+        let issues = step_issues.lock().await.clone();
+        for issue in issues {
+            all_issues.push(format!("step '{}' ({}): {}", step.id, step.action, issue));
+        }
+    }
+
+    if all_issues.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "semantic review found {} issue(s):\n{}",
+            all_issues.len(),
+            all_issues.join("\n")
+        ))
+    }
+}
+
 fn admin_executor_prompt(step: &AdminExecutorPlanStep, plan: &AdminExecutorPlan) -> String {
     format!(
         "You are the Fluxbee executor specialist running inside SY.admin.\n\
@@ -2547,6 +2659,22 @@ async fn dispatch_internal_admin_command(
                 Ok(plan) => plan,
                 Err(detail) => return Ok(internal_invalid_request(action, &detail)),
             };
+            let runtime = ctx.executor_runtime.lock().await.clone();
+            if let Some(runtime) = runtime {
+                if let Err(detail) =
+                    semantic_review_executor_plan(&runtime, &plan).await
+                {
+                    return Ok(InternalAdminDispatchResult {
+                        http_status: 422,
+                        envelope: serde_json::json!({
+                            "status": "error",
+                            "action": action,
+                            "error_code": "PLAN_REVIEW_FAILED",
+                            "error_detail": detail,
+                        }),
+                    });
+                }
+            }
             return Ok(InternalAdminDispatchResult {
                 http_status: 200,
                 envelope: serde_json::json!({
@@ -6768,7 +6896,19 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Use them when you want the route/VPN lists in the legacy admin surface.",
             "For the node-owned live config contract, use node_control_config_get against SY.config.routes instead.",
         ],
-        "add_route" | "delete_route" | "add_vpn" | "delete_vpn" => vec![
+        "add_route" => vec![
+            "These are SY.config.routes domain mutation actions exposed as admin commands.",
+            "They mutate one route/VPN rule at a time and preserve the legacy operational surface.",
+            "For HTTP delete calls, the identifier lives in the final path segment; internal admin commands may still carry it in payload.",
+            "Use node_control_config_set against SY.config.routes only when you want the node-owned live config replace path instead of one explicit domain mutation.",
+            "The 'action' field controls how matching traffic is handled. Valid values are FORWARD and DROP only. Case-sensitive.",
+            "When action=FORWARD, next_hop_hive is required and must be the exact name of the destination hive.",
+            "When action=DROP, next_hop_hive must be omitted.",
+            "match_kind defaults to PREFIX when omitted. Valid values: PREFIX, EXACT, GLOB. An empty string is invalid.",
+            "priority defaults to 100 when omitted. Higher value means higher priority. Do not pass 0 unless intentionally setting lowest priority.",
+            "metric defaults to 0 when omitted. Used only for tie-breaking between routes with the same prefix and priority.",
+        ],
+        "delete_route" | "add_vpn" | "delete_vpn" => vec![
             "These are SY.config.routes domain mutation actions exposed as admin commands.",
             "They mutate one route/VPN rule at a time and preserve the legacy operational surface.",
             "For HTTP delete calls, the identifier lives in the final path segment; internal admin commands may still carry it in payload.",
