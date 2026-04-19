@@ -9,9 +9,9 @@ use uuid::Uuid;
 
 use crate::node_client::NodeError;
 use crate::protocol::NodeAnnouncePayload;
-use crate::socket::connection::MAX_FRAME_SIZE;
 use crate::protocol::{build_withdraw, Destination, Message};
 use crate::send_normalization::normalize_outbound_message;
+use crate::socket::connection::MAX_FRAME_SIZE;
 
 pub(crate) struct ConnectionState {
     connected: AtomicBool,
@@ -127,7 +127,10 @@ impl NodeSender {
                 max = MAX_FRAME_SIZE,
                 "FRAME_TOO_LARGE — message rejected before send; fix the sending node"
             );
-            return Err(NodeError::MessageTooLarge { size: data.len(), max: MAX_FRAME_SIZE });
+            return Err(NodeError::MessageTooLarge {
+                size: data.len(),
+                max: MAX_FRAME_SIZE,
+            });
         }
         self.tx.send(data).await.map_err(|_| {
             self.info.state.set_connected(false);

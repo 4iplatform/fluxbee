@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,14 +16,18 @@ use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+use fluxbee_ai_sdk::{FunctionToolDefinition, ModelSettings, OpenAiResponsesClient};
 use fluxbee_sdk::nats::{NatsClient, NatsRequestEnvelope, NatsResponseEnvelope};
 use fluxbee_sdk::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED,
     MSG_NODE_STATUS_GET, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    classify_admin_action, classify_system_message, connect, derive_action_outcome,
-    try_handle_default_node_status, ClientConfig, NodeConfig, NodeReceiver, NodeSender,
+    build_node_config_response_message, build_node_secret_record, classify_admin_action,
+    classify_system_message, connect, derive_action_outcome, load_node_secret_record_with_root,
+    redacted_node_secret_record, save_node_secret_record_with_root, try_handle_default_node_status,
+    ClientConfig, NodeConfig, NodeReceiver, NodeSecretDescriptor, NodeSecretError,
+    NodeSecretRecord, NodeSecretWriteOptions, NodeSender, NODE_SECRET_REDACTION_TOKEN,
 };
 use json_router::shm::{
     now_epoch_ms, LsaRegionReader, RemoteHiveEntry, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
@@ -32,6 +37,23 @@ type AdminError = Box<dyn std::error::Error + Send + Sync>;
 const PRIMARY_HIVE_ID: &str = "motherbee";
 const MSG_ADMIN_COMMAND: &str = "ADMIN_COMMAND";
 const MSG_ADMIN_COMMAND_RESPONSE: &str = "ADMIN_COMMAND_RESPONSE";
+const DEFAULT_ADMIN_EXECUTOR_MODEL: &str = "gpt-5.4-mini";
+const ADMIN_EXECUTOR_CONFIG_SCHEMA_VERSION: u32 = 1;
+const ADMIN_EXECUTOR_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
+const ADMIN_EXECUTOR_DEFAULT_CATALOG_MODE: &str = "full";
+const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
+    "list_admin_actions",
+    "get_admin_action_help",
+    "get_runtime",
+    "list_nodes",
+    "add_route",
+    "delete_route",
+    "add_vpn",
+    "delete_vpn",
+    "run_node",
+    "set_node_config",
+    "get_node_status",
+];
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -52,16 +74,56 @@ struct WanSection {
     authorized_hives: Option<Vec<String>>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+struct AiProvidersSection {
+    openai: Option<OpenAiSection>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+struct OpenAiSection {
+    api_key: Option<String>,
+    default_model: Option<String>,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+struct AdminExecutorCatalogConfig {
+    mode: Option<String>,
+    actions: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+struct AdminExecutorNodeConfigFile {
+    #[serde(default = "default_admin_executor_schema_version")]
+    schema_version: u32,
+    #[serde(default)]
+    config_version: u64,
+    ai_providers: Option<AiProvidersSection>,
+    catalog: Option<AdminExecutorCatalogConfig>,
+}
+
+#[derive(Clone)]
+struct AdminExecutorAiRuntime {
+    model: String,
+    model_settings: ModelSettings,
+    client: OpenAiResponsesClient,
+}
+
 #[derive(Clone)]
 struct AdminContext {
     config_dir: PathBuf,
     state_dir: PathBuf,
     socket_dir: PathBuf,
+    node_name: String,
     hive_id: String,
     authorized_hives: Vec<String>,
     nats_endpoint: String,
     nats_client: Arc<NatsClient>,
     command_lock: Arc<Mutex<()>>,
+    executor_runtime: Arc<Mutex<Option<AdminExecutorAiRuntime>>>,
+    executor_configured: Arc<AtomicBool>,
 }
 
 struct AdminRouterClient {
@@ -70,6 +132,7 @@ struct AdminRouterClient {
     system_tx: broadcast::Sender<Message>,
     query_tx: broadcast::Sender<Message>,
     internal_admin_tx: broadcast::Sender<Message>,
+    system_command_tx: broadcast::Sender<Message>,
 }
 
 impl AdminRouterClient {
@@ -77,12 +140,14 @@ impl AdminRouterClient {
         let (system_tx, _) = broadcast::channel(256);
         let (query_tx, _) = broadcast::channel(256);
         let (internal_admin_tx, _) = broadcast::channel(256);
+        let (system_command_tx, _) = broadcast::channel(256);
         Self {
             sender: RwLock::new(sender),
             pending_admin: Mutex::new(HashMap::new()),
             system_tx,
             query_tx,
             internal_admin_tx,
+            system_command_tx,
         }
     }
 
@@ -159,9 +224,16 @@ impl AdminRouterClient {
                 "sy.admin saw admin/system message without pending waiter"
             );
         }
-        if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_NODE_STATUS_GET) {
+        if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_NODE_STATUS_GET)
+        {
             let sender = self.sender.read().await.clone();
             let _ = try_handle_default_node_status(&sender, &msg).await;
+            return;
+        }
+        if msg.meta.msg_type == SYSTEM_KIND
+            && matches!(msg.meta.msg.as_deref(), Some("CONFIG_GET" | "CONFIG_SET"))
+        {
+            let _ = self.system_command_tx.send(msg);
             return;
         }
         if msg.meta.msg_type == "admin" && msg.meta.msg.as_deref() == Some(MSG_ADMIN_COMMAND) {
@@ -202,6 +274,10 @@ impl AdminRouterClient {
 
     fn subscribe_internal_admin(&self) -> broadcast::Receiver<Message> {
         self.internal_admin_tx.subscribe()
+    }
+
+    fn subscribe_system_commands(&self) -> broadcast::Receiver<Message> {
+        self.system_command_tx.subscribe()
     }
 }
 
@@ -328,17 +404,25 @@ async fn main() -> Result<(), AdminError> {
     let http_tx = broadcast_tx.clone();
     let nats_client = Arc::new(NatsClient::from_client_config(&client_config)?);
     let command_lock = Arc::new(Mutex::new(()));
+    let node_name = admin_node_name(&hive.hive_id);
+    let initial_executor_runtime = build_admin_executor_ai_runtime(&hive.hive_id, &node_name)?;
+    let executor_configured = Arc::new(AtomicBool::new(initial_executor_runtime.is_some()));
+    let executor_runtime = Arc::new(Mutex::new(initial_executor_runtime));
     let http_ctx = AdminContext {
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),
         socket_dir: socket_dir.clone(),
+        node_name,
         hive_id,
         authorized_hives,
         nats_endpoint: nats_client.endpoint().to_string(),
         nats_client,
         command_lock,
+        executor_runtime,
+        executor_configured,
     };
     let internal_ctx = http_ctx.clone();
+    let system_ctx = http_ctx.clone();
     let http_client = router_client.clone();
     tokio::spawn(async move {
         if let Err(err) = run_http_server(&admin_listen, &http_tx, http_ctx, http_client).await {
@@ -355,6 +439,12 @@ async fn main() -> Result<(), AdminError> {
     let internal_rx = router_client.subscribe_internal_admin();
     tokio::spawn(async move {
         run_internal_admin_loop(internal_ctx, internal_client, internal_rx).await;
+    });
+
+    let system_client = router_client.clone();
+    let system_rx = router_client.subscribe_system_commands();
+    tokio::spawn(async move {
+        run_system_command_loop(system_ctx, system_client, system_rx).await;
     });
 
     future::pending::<()>().await;
@@ -485,6 +575,266 @@ where
 fn load_hive(config_dir: &Path) -> Result<HiveFile, AdminError> {
     let data = fs::read_to_string(config_dir.join("hive.yaml"))?;
     Ok(serde_yaml::from_str(&data)?)
+}
+
+fn default_admin_executor_schema_version() -> u32 {
+    ADMIN_EXECUTOR_CONFIG_SCHEMA_VERSION
+}
+
+fn admin_node_name(hive_id: &str) -> String {
+    format!("SY.admin@{hive_id}")
+}
+
+fn admin_nodes_root() -> PathBuf {
+    json_router::paths::storage_root_dir().join("nodes")
+}
+
+fn admin_executor_node_dir(hive_id: &str) -> PathBuf {
+    admin_nodes_root().join("SY").join(admin_node_name(hive_id))
+}
+
+fn admin_executor_config_path(hive_id: &str) -> PathBuf {
+    admin_executor_node_dir(hive_id).join("config.json")
+}
+
+fn load_admin_executor_node_config(
+    hive_id: &str,
+) -> Result<Option<AdminExecutorNodeConfigFile>, AdminError> {
+    let path = admin_executor_config_path(hive_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path)?;
+    let parsed = serde_json::from_str(&raw)?;
+    Ok(Some(parsed))
+}
+
+fn save_admin_executor_node_config(
+    hive_id: &str,
+    config: &AdminExecutorNodeConfigFile,
+) -> Result<PathBuf, AdminError> {
+    let path = admin_executor_config_path(hive_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, serde_json::to_vec_pretty(config)?)?;
+    Ok(path)
+}
+
+fn load_admin_secret_record(node_name: &str) -> Result<Option<NodeSecretRecord>, AdminError> {
+    match load_node_secret_record_with_root(node_name, admin_nodes_root()) {
+        Ok(record) => Ok(Some(record)),
+        Err(NodeSecretError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(Box::new(err)),
+    }
+}
+
+fn merged_admin_executor_openai_section(
+    config: Option<&AdminExecutorNodeConfigFile>,
+    secrets: Option<&NodeSecretRecord>,
+) -> Option<OpenAiSection> {
+    let config_openai = config
+        .and_then(|cfg| cfg.ai_providers.as_ref())
+        .and_then(|providers| providers.openai.clone());
+    let secret_api_key = secrets
+        .and_then(|record| record.secrets.get(ADMIN_EXECUTOR_LOCAL_SECRET_KEY_OPENAI))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    match config_openai {
+        Some(cfg) => Some(OpenAiSection {
+            api_key: secret_api_key,
+            default_model: cfg.default_model,
+            max_tokens: cfg.max_tokens,
+            temperature: cfg.temperature,
+            top_p: cfg.top_p,
+        }),
+        None => secret_api_key.map(|api_key| OpenAiSection {
+            api_key: Some(api_key),
+            default_model: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+        }),
+    }
+}
+
+fn build_admin_executor_ai_runtime(
+    hive_id: &str,
+    node_name: &str,
+) -> Result<Option<AdminExecutorAiRuntime>, AdminError> {
+    let config = load_admin_executor_node_config(hive_id)?;
+    let secrets = load_admin_secret_record(node_name)?;
+    let openai = merged_admin_executor_openai_section(config.as_ref(), secrets.as_ref());
+    let Some(openai) = openai else {
+        return Ok(None);
+    };
+    let Some(api_key) = openai
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let model = openai
+        .default_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_ADMIN_EXECUTOR_MODEL)
+        .to_string();
+    Ok(Some(AdminExecutorAiRuntime {
+        model,
+        model_settings: ModelSettings {
+            temperature: openai.temperature,
+            top_p: openai.top_p,
+            max_output_tokens: openai.max_tokens,
+        },
+        client: OpenAiResponsesClient::new(api_key.to_string()),
+    }))
+}
+
+async fn refresh_admin_executor_ai_runtime(ctx: &AdminContext) -> Result<bool, AdminError> {
+    let runtime = build_admin_executor_ai_runtime(&ctx.hive_id, &ctx.node_name)?;
+    ctx.executor_configured
+        .store(runtime.is_some(), Ordering::Relaxed);
+    *ctx.executor_runtime.lock().await = runtime;
+    Ok(ctx.executor_configured.load(Ordering::Relaxed))
+}
+
+fn admin_executor_catalog_mode(config: Option<&AdminExecutorNodeConfigFile>) -> String {
+    config
+        .and_then(|cfg| cfg.catalog.as_ref())
+        .and_then(|catalog| catalog.mode.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(ADMIN_EXECUTOR_DEFAULT_CATALOG_MODE)
+        .to_string()
+}
+
+fn executor_visible_action_specs(
+    config: Option<&AdminExecutorNodeConfigFile>,
+) -> Vec<&'static InternalActionSpec> {
+    let mode = admin_executor_catalog_mode(config);
+    let configured_actions: HashSet<&str> = config
+        .and_then(|cfg| cfg.catalog.as_ref())
+        .and_then(|catalog| catalog.actions.as_ref())
+        .map(|actions| {
+            actions
+                .iter()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let allowlist: Option<HashSet<&str>> = match mode.as_str() {
+        "subset" if configured_actions.is_empty() => {
+            Some(ADMIN_EXECUTOR_PILOT_ACTIONS.iter().copied().collect())
+        }
+        "subset" => Some(configured_actions),
+        _ => None,
+    };
+
+    INTERNAL_ACTION_REGISTRY
+        .iter()
+        .filter(|spec| {
+            allowlist
+                .as_ref()
+                .map(|set| set.contains(spec.action))
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
+fn admin_contract_field_schema(field: &serde_json::Value) -> serde_json::Value {
+    let field_type = field
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("string");
+    let description = field
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if let Some(enum_values) = field_type
+        .strip_prefix("enum(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let values: Vec<serde_json::Value> = enum_values
+            .split('|')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| serde_json::Value::String(value.to_string()))
+            .collect();
+        return serde_json::json!({
+            "type": "string",
+            "enum": values,
+            "description": description,
+        });
+    }
+    let schema_type = match field_type {
+        "bool" => "boolean",
+        "u16" | "u32" | "u64" | "i64" => "integer",
+        "f32" | "f64" => "number",
+        "object" => "object",
+        _ => "string",
+    };
+    let mut schema = serde_json::json!({
+        "type": schema_type,
+        "description": description,
+    });
+    if schema_type == "object" {
+        schema["additionalProperties"] = serde_json::Value::Bool(true);
+    }
+    schema
+}
+
+fn build_admin_executor_function_definition(spec: &InternalActionSpec) -> FunctionToolDefinition {
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::<String>::new();
+
+    for field in admin_action_path_params(spec.action) {
+        if let Some(name) = field.get("name").and_then(serde_json::Value::as_str) {
+            properties.insert(name.to_string(), admin_contract_field_schema(&field));
+            required.push(name.to_string());
+        }
+    }
+    for field in admin_action_body_required_fields(spec.action) {
+        if let Some(name) = field.get("name").and_then(serde_json::Value::as_str) {
+            properties.insert(name.to_string(), admin_contract_field_schema(&field));
+            if !required.iter().any(|existing| existing == name) {
+                required.push(name.to_string());
+            }
+        }
+    }
+    for field in admin_action_body_optional_fields(spec.action) {
+        if let Some(name) = field.get("name").and_then(serde_json::Value::as_str) {
+            properties.insert(name.to_string(), admin_contract_field_schema(&field));
+        }
+    }
+
+    FunctionToolDefinition {
+        name: spec.action.to_string(),
+        description: admin_action_summary(spec.action).to_string(),
+        parameters_json_schema: serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": properties,
+            "required": required,
+        }),
+    }
+}
+
+fn build_admin_executor_function_catalog(
+    config: Option<&AdminExecutorNodeConfigFile>,
+) -> Vec<FunctionToolDefinition> {
+    executor_visible_action_specs(config)
+        .into_iter()
+        .map(build_admin_executor_function_definition)
+        .collect()
 }
 
 fn config_changed_version_channel(subsystem: &str) -> &'static str {
@@ -659,6 +1009,57 @@ async fn run_internal_admin_loop(
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
+}
+
+async fn run_system_command_loop(
+    ctx: AdminContext,
+    client: Arc<AdminRouterClient>,
+    mut rx: broadcast::Receiver<Message>,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(msg) => {
+                if let Err(err) = handle_system_command(&ctx, &client, &msg).await {
+                    tracing::warn!(error = %err, "system command handling failed");
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(
+                    skipped = skipped,
+                    "system command loop lagged; dropping stale commands"
+                );
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+async fn handle_system_command(
+    ctx: &AdminContext,
+    client: &Arc<AdminRouterClient>,
+    msg: &Message,
+) -> Result<(), AdminError> {
+    if msg.meta.msg_type != SYSTEM_KIND {
+        return Ok(());
+    }
+    let Some(command) = msg.meta.msg.as_deref() else {
+        return Ok(());
+    };
+    let sender = client.sender_snapshot().await;
+    match command {
+        "CONFIG_GET" => {
+            let payload = build_admin_executor_config_get_payload(ctx)?;
+            let response = build_node_config_response_message(msg, sender.uuid(), payload);
+            sender.send(response).await?;
+        }
+        "CONFIG_SET" => {
+            let payload = apply_admin_executor_config_set(ctx, msg).await?;
+            let response = build_node_config_response_message(msg, sender.uuid(), payload);
+            sender.send(response).await?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 async fn handle_internal_admin_command(
@@ -1756,6 +2157,10 @@ async fn handle_http(
         ("GET", "/admin/actions") => {
             let (status, resp) =
                 handle_admin_query(ctx, client, "list_admin_actions", None).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("GET", "/admin/executor/functions") => {
+            let (status, resp) = build_admin_executor_function_catalog_response(ctx)?;
             respond_json(stream, status, &resp).await?;
         }
         ("GET", path) if path.starts_with("/admin/actions/") => {
@@ -3815,6 +4220,401 @@ fn build_admin_action_help_response(action_name: &str) -> (u16, String) {
         })
         .to_string(),
     )
+}
+
+fn build_admin_executor_function_catalog_response(
+    ctx: &AdminContext,
+) -> Result<(u16, String), AdminError> {
+    let node_config = load_admin_executor_node_config(&ctx.hive_id)?;
+    let catalog = build_admin_executor_function_catalog(node_config.as_ref());
+    let mode = admin_executor_catalog_mode(node_config.as_ref());
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "action": "admin_executor_function_catalog",
+            "payload": {
+                "node_name": ctx.node_name,
+                "catalog_mode": mode,
+                "registry_version": INTERNAL_ACTION_REGISTRY_VERSION,
+                "function_count": catalog.len(),
+                "functions": catalog,
+            },
+            "error_code": serde_json::Value::Null,
+            "error_detail": serde_json::Value::Null,
+        })
+        .to_string(),
+    ))
+}
+
+fn extract_admin_executor_openai_api_key(
+    payload: &serde_json::Value,
+) -> Result<Option<String>, AdminError> {
+    let config_root = payload.get("config").unwrap_or(payload);
+    if let Some(value) = config_root
+        .get("ai_providers")
+        .and_then(|providers| providers.get("openai"))
+        .and_then(|openai| openai.get("api_key"))
+        .and_then(serde_json::Value::as_str)
+    {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err("admin executor config-set received an empty OpenAI api_key".into());
+        }
+        return Ok(Some(trimmed.to_string()));
+    }
+    Ok(None)
+}
+
+fn merge_admin_executor_local_config(
+    existing: Option<AdminExecutorNodeConfigFile>,
+    payload: &serde_json::Value,
+) -> Result<(AdminExecutorNodeConfigFile, bool), AdminError> {
+    let mut merged = existing.unwrap_or_default();
+    if merged.schema_version == 0 {
+        merged.schema_version = ADMIN_EXECUTOR_CONFIG_SCHEMA_VERSION;
+    }
+    let mut changed = false;
+    let config_root = payload.get("config").unwrap_or(payload);
+
+    if let Some(openai) = config_root
+        .get("ai_providers")
+        .and_then(|providers| providers.get("openai"))
+        .and_then(serde_json::Value::as_object)
+    {
+        let provider = merged
+            .ai_providers
+            .get_or_insert_with(AiProvidersSection::default);
+        let openai_cfg = provider.openai.get_or_insert_with(OpenAiSection::default);
+        if let Some(value) = openai.get("default_model") {
+            openai_cfg.default_model = value
+                .as_str()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToString::to_string);
+            changed = true;
+        }
+        if let Some(value) = openai.get("max_tokens") {
+            openai_cfg.max_tokens = value.as_u64().map(|v| v as u32);
+            changed = true;
+        }
+        if let Some(value) = openai.get("temperature") {
+            openai_cfg.temperature = value.as_f64().map(|v| v as f32);
+            changed = true;
+        }
+        if let Some(value) = openai.get("top_p") {
+            openai_cfg.top_p = value.as_f64().map(|v| v as f32);
+            changed = true;
+        }
+    }
+
+    if let Some(catalog) = config_root
+        .get("catalog")
+        .and_then(serde_json::Value::as_object)
+    {
+        let catalog_cfg = merged
+            .catalog
+            .get_or_insert_with(AdminExecutorCatalogConfig::default);
+        if let Some(value) = catalog.get("mode") {
+            let mode = value
+                .as_str()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .ok_or("config.catalog.mode must be a non-empty string")?;
+            if mode != "full" && mode != "subset" {
+                return Err("config.catalog.mode must be 'full' or 'subset'".into());
+            }
+            catalog_cfg.mode = Some(mode.to_string());
+            changed = true;
+        }
+        if let Some(value) = catalog.get("actions") {
+            let values = value
+                .as_array()
+                .ok_or("config.catalog.actions must be an array of admin action names")?;
+            let mut actions = Vec::new();
+            for entry in values {
+                let action = entry
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .ok_or("config.catalog.actions entries must be non-empty strings")?;
+                resolve_internal_action_spec(action).map_err(|err| {
+                    format!("config.catalog.actions contains invalid action '{action}': {err}")
+                })?;
+                actions.push(action.to_string());
+            }
+            catalog_cfg.actions = Some(actions);
+            changed = true;
+        }
+    }
+
+    Ok((merged, changed))
+}
+
+fn build_admin_executor_config_get_payload(
+    ctx: &AdminContext,
+) -> Result<serde_json::Value, AdminError> {
+    let node_config = load_admin_executor_node_config(&ctx.hive_id)?;
+    let secret_record = load_admin_secret_record(&ctx.node_name)?;
+    let merged = merged_admin_executor_openai_section(node_config.as_ref(), secret_record.as_ref());
+    let config_version = node_config
+        .as_ref()
+        .map(|cfg| cfg.config_version)
+        .unwrap_or(0);
+    let schema_version = node_config
+        .as_ref()
+        .map(|cfg| cfg.schema_version)
+        .unwrap_or(ADMIN_EXECUTOR_CONFIG_SCHEMA_VERSION);
+    let configured = merged
+        .as_ref()
+        .and_then(|openai| openai.api_key.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    let api_key_source = if secret_record
+        .as_ref()
+        .and_then(|record| record.secrets.get(ADMIN_EXECUTOR_LOCAL_SECRET_KEY_OPENAI))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        "local_file"
+    } else {
+        "missing"
+    };
+    let mut descriptor = NodeSecretDescriptor::new(
+        "config.ai_providers.openai.api_key",
+        ADMIN_EXECUTOR_LOCAL_SECRET_KEY_OPENAI,
+    );
+    descriptor.required = true;
+    descriptor.configured = configured;
+    descriptor.persistence = "local_file".to_string();
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "node_name": ctx.node_name,
+        "state": if configured { "configured" } else { "missing_secret" },
+        "schema_version": schema_version,
+        "config_version": config_version,
+        "config": {
+            "ai_providers": {
+                "openai": {
+                    "api_key": if configured { serde_json::Value::String(NODE_SECRET_REDACTION_TOKEN.to_string()) } else { serde_json::Value::Null },
+                    "default_model": merged.as_ref().and_then(|openai| openai.default_model.clone()).map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+                    "max_tokens": merged.as_ref().and_then(|openai| openai.max_tokens.map(serde_json::Value::from)).unwrap_or(serde_json::Value::Null),
+                    "temperature": merged.as_ref().and_then(|openai| openai.temperature.map(serde_json::Value::from)).unwrap_or(serde_json::Value::Null),
+                    "top_p": merged.as_ref().and_then(|openai| openai.top_p.map(serde_json::Value::from)).unwrap_or(serde_json::Value::Null)
+                }
+            },
+            "catalog": {
+                "mode": admin_executor_catalog_mode(node_config.as_ref()),
+                "actions": node_config
+                    .as_ref()
+                    .and_then(|cfg| cfg.catalog.as_ref())
+                    .and_then(|catalog| catalog.actions.clone())
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null)
+            }
+        },
+        "contract": {
+            "node_family": "SY",
+            "node_kind": "SY.admin",
+            "supports": ["CONFIG_GET", "CONFIG_SET"],
+            "required_fields": ["config.ai_providers.openai.api_key"],
+            "optional_fields": [
+                "config.ai_providers.openai.default_model",
+                "config.ai_providers.openai.max_tokens",
+                "config.ai_providers.openai.temperature",
+                "config.ai_providers.openai.top_p",
+                "config.catalog.mode",
+                "config.catalog.actions"
+            ],
+            "secrets": [descriptor],
+            "notes": [
+                "This is the standard node CONFIG_GET/SET surface for the SY.admin executor runtime.",
+                "OpenAI secrets are stored in local secrets.json and always returned redacted.",
+                "Catalog mode defaults to full. Use subset only when intentionally constraining the executor-visible action set."
+            ]
+        },
+        "secret_record": secret_record.map(|record| redacted_node_secret_record(&record)),
+        "api_key_source": api_key_source,
+        "function_count": build_admin_executor_function_catalog(node_config.as_ref()).len()
+    }))
+}
+
+fn admin_executor_config_error_response(
+    ctx: &AdminContext,
+    code: &str,
+    message: &str,
+) -> Result<serde_json::Value, AdminError> {
+    let base = build_admin_executor_config_get_payload(ctx)?;
+    Ok(base
+        .as_object()
+        .cloned()
+        .map(|mut value| {
+            value.insert("ok".to_string(), serde_json::Value::Bool(false));
+            value.insert(
+                "error".to_string(),
+                serde_json::json!({
+                    "code": code,
+                    "message": message
+                }),
+            );
+            serde_json::Value::Object(value)
+        })
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "ok": false,
+                "node_name": ctx.node_name,
+                "state": "error",
+                "error": {
+                    "code": code,
+                    "message": message
+                }
+            })
+        }))
+}
+
+async fn apply_admin_executor_config_set(
+    ctx: &AdminContext,
+    msg: &Message,
+) -> Result<serde_json::Value, AdminError> {
+    let requested_node_name = msg
+        .payload
+        .get("node_name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("config-set requires node_name")?;
+    if requested_node_name != ctx.node_name {
+        return admin_executor_config_error_response(
+            ctx,
+            "invalid_config",
+            "config-set node_name does not match this node",
+        );
+    }
+    if let Some(apply_mode) = msg
+        .payload
+        .get("apply_mode")
+        .and_then(serde_json::Value::as_str)
+    {
+        if !apply_mode.trim().eq_ignore_ascii_case("replace") {
+            return admin_executor_config_error_response(
+                ctx,
+                "unsupported_apply_mode",
+                "SY.admin executor currently supports only apply_mode=replace",
+            );
+        }
+    }
+
+    let api_key = match extract_admin_executor_openai_api_key(&msg.payload) {
+        Ok(value) => value,
+        Err(err) => {
+            return admin_executor_config_error_response(ctx, "invalid_config", &err.to_string());
+        }
+    };
+    let current_config = load_admin_executor_node_config(&ctx.hive_id)?;
+    let current_version = current_config
+        .as_ref()
+        .map(|cfg| cfg.config_version)
+        .unwrap_or(0);
+    let (mut merged_config, config_changed) =
+        match merge_admin_executor_local_config(current_config, &msg.payload) {
+            Ok(value) => value,
+            Err(err) => {
+                return admin_executor_config_error_response(
+                    ctx,
+                    "invalid_config",
+                    &err.to_string(),
+                );
+            }
+        };
+    if api_key.is_none() && !config_changed {
+        return admin_executor_config_error_response(
+            ctx,
+            "invalid_config",
+            "config-set requires config.ai_providers.openai.api_key or another executor config field",
+        );
+    }
+
+    merged_config.schema_version = msg
+        .payload
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value as u32)
+        .unwrap_or(ADMIN_EXECUTOR_CONFIG_SCHEMA_VERSION);
+    merged_config.config_version = msg
+        .payload
+        .get("config_version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| current_version.saturating_add(1));
+
+    let _ = save_admin_executor_node_config(&ctx.hive_id, &merged_config)?;
+
+    let stored_openai_secret = if let Some(api_key) = api_key {
+        let mut secrets = load_admin_secret_record(&ctx.node_name)?
+            .map(|record| record.secrets)
+            .unwrap_or_default();
+        secrets.insert(
+            ADMIN_EXECUTOR_LOCAL_SECRET_KEY_OPENAI.to_string(),
+            serde_json::Value::String(api_key),
+        );
+        let record = build_node_secret_record(
+            secrets,
+            &NodeSecretWriteOptions {
+                updated_by_ilk: msg
+                    .payload
+                    .get("requested_by")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string),
+                updated_by_label: Some("SY.admin".to_string()),
+                trace_id: Some(msg.routing.trace_id.clone()),
+            },
+        );
+        save_node_secret_record_with_root(&ctx.node_name, admin_nodes_root(), &record)
+            .map_err(|err| -> AdminError { Box::new(err) })?;
+        true
+    } else {
+        false
+    };
+
+    let configured = refresh_admin_executor_ai_runtime(ctx).await?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "node_name": ctx.node_name,
+        "state": if configured { "configured" } else { "missing_secret" },
+        "schema_version": merged_config.schema_version,
+        "config_version": merged_config.config_version,
+        "apply_mode": "replace",
+        "config": {
+            "ai_providers": {
+                "openai": {
+                    "api_key": if configured { serde_json::Value::String(NODE_SECRET_REDACTION_TOKEN.to_string()) } else { serde_json::Value::Null },
+                    "default_model": merged_config.ai_providers.as_ref().and_then(|p| p.openai.as_ref()).and_then(|o| o.default_model.clone()).map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+                    "max_tokens": merged_config.ai_providers.as_ref().and_then(|p| p.openai.as_ref()).and_then(|o| o.max_tokens.map(serde_json::Value::from)).unwrap_or(serde_json::Value::Null),
+                    "temperature": merged_config.ai_providers.as_ref().and_then(|p| p.openai.as_ref()).and_then(|o| o.temperature.map(serde_json::Value::from)).unwrap_or(serde_json::Value::Null),
+                    "top_p": merged_config.ai_providers.as_ref().and_then(|p| p.openai.as_ref()).and_then(|o| o.top_p.map(serde_json::Value::from)).unwrap_or(serde_json::Value::Null)
+                }
+            },
+            "catalog": {
+                "mode": admin_executor_catalog_mode(Some(&merged_config)),
+                "actions": merged_config.catalog.as_ref().and_then(|catalog| catalog.actions.clone()).map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
+            }
+        },
+        "stored_secrets": if stored_openai_secret {
+            serde_json::json!([{
+                "field": "config.ai_providers.openai.api_key",
+                "storage_key": ADMIN_EXECUTOR_LOCAL_SECRET_KEY_OPENAI,
+                "value_redacted": true
+            }])
+        } else {
+            serde_json::json!([])
+        },
+        "message": "SY.admin executor config persisted through CONFIG_SET."
+    }))
 }
 
 fn build_admin_action_doc(spec: &InternalActionSpec) -> serde_json::Value {
@@ -7180,5 +7980,67 @@ mod tests {
             body_json["error_detail"],
             json!("workflow has running instances")
         );
+    }
+
+    #[test]
+    fn admin_executor_function_definition_uses_strict_runtime_contract() {
+        let spec = resolve_internal_action_spec("get_runtime").expect("get_runtime action");
+        let definition = build_admin_executor_function_definition(spec);
+
+        assert_eq!(definition.name, "get_runtime");
+        assert_eq!(
+            definition.parameters_json_schema["additionalProperties"],
+            json!(false)
+        );
+        assert_eq!(
+            definition.parameters_json_schema["required"],
+            json!(["hive", "runtime"])
+        );
+        assert_eq!(
+            definition.parameters_json_schema["properties"]["hive"]["type"],
+            json!("string")
+        );
+        assert_eq!(
+            definition.parameters_json_schema["properties"]["runtime"]["type"],
+            json!("string")
+        );
+    }
+
+    #[test]
+    fn admin_executor_subset_mode_falls_back_to_pilot_allowlist() {
+        let config = AdminExecutorNodeConfigFile {
+            catalog: Some(AdminExecutorCatalogConfig {
+                mode: Some("subset".to_string()),
+                actions: None,
+            }),
+            ..AdminExecutorNodeConfigFile::default()
+        };
+
+        let actions: Vec<&str> = executor_visible_action_specs(Some(&config))
+            .into_iter()
+            .map(|spec| spec.action)
+            .collect();
+
+        assert!(actions.contains(&"get_runtime"));
+        assert!(actions.contains(&"run_node"));
+        assert!(!actions.contains(&"wf_rules_compile_apply"));
+    }
+
+    #[test]
+    fn merge_admin_executor_local_config_rejects_unknown_catalog_action() {
+        let err = merge_admin_executor_local_config(
+            None,
+            &json!({
+                "config": {
+                    "catalog": {
+                        "mode": "subset",
+                        "actions": ["definitely_not_real"]
+                    }
+                }
+            }),
+        )
+        .expect_err("invalid actions must fail");
+
+        assert!(err.to_string().contains("invalid action"));
     }
 }

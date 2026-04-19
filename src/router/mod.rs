@@ -511,7 +511,11 @@ async fn handle_node(
         while let Some(frame) = rx.recv().await {
             if let Err(err) = write_frame(&mut writer, &frame).await {
                 if err.kind() == std::io::ErrorKind::InvalidData {
-                    tracing::error!(frame_len = frame.len(), max = 128 * 1024, "FRAME_TOO_LARGE — router rejected oversized frame to node; disconnecting");
+                    tracing::error!(
+                        frame_len = frame.len(),
+                        max = 128 * 1024,
+                        "FRAME_TOO_LARGE — router rejected oversized frame to node; disconnecting"
+                    );
                 } else {
                     tracing::warn!(error = %err, frame_len = frame.len(), "router: node write error");
                 }
@@ -654,169 +658,169 @@ async fn handle_node(
         {
             let frame = frame;
             if let Ok(mut msg) = serde_json::from_slice::<Message>(&frame) {
-                    assign_thread_seq_if_missing(&mut msg, &thread_sequences).await;
-                    tracing::info!(
-                        src = %msg.routing.src,
-                        dst = ?msg.routing.dst,
-                        msg_type = %msg.meta.msg_type,
-                        msg = ?msg.meta.msg,
-                        "message received"
-                    );
-                    maybe_publish_turn(&nats_publisher, &nats_publish_errors, &msg);
-                    if msg.meta.msg_type == SYSTEM_KIND {
-                        if msg.meta.msg.as_deref() == Some(MSG_WITHDRAW) {
-                            break;
+                assign_thread_seq_if_missing(&mut msg, &thread_sequences).await;
+                tracing::info!(
+                    src = %msg.routing.src,
+                    dst = ?msg.routing.dst,
+                    msg_type = %msg.meta.msg_type,
+                    msg = ?msg.meta.msg,
+                    "message received"
+                );
+                maybe_publish_turn(&nats_publisher, &nats_publish_errors, &msg);
+                if msg.meta.msg_type == SYSTEM_KIND {
+                    if msg.meta.msg.as_deref() == Some(MSG_WITHDRAW) {
+                        break;
+                    }
+                    if msg.meta.msg.as_deref() == Some(MSG_CONFIG_CHANGED) {
+                        let _ = refresh_config(
+                            &config_reader,
+                            &static_routes,
+                            &vpn_rules,
+                            &config_version,
+                            hive_id,
+                            &nodes,
+                            &peer_nodes,
+                            &shm,
+                            &fib,
+                            &lsa_snapshot,
+                            true,
+                        )
+                        .await;
+                        tracing::info!("config changed applied");
+                        if msg
+                            .meta
+                            .action
+                            .as_deref()
+                            .is_some_and(|v| v == "compile" || v == "apply" || v == "rollback")
+                        {
+                            let version = msg
+                                .payload
+                                .get("version")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            tracing::info!(
+                                action = ?msg.meta.action,
+                                version = version,
+                                "opa config changed received"
+                            );
                         }
-                        if msg.meta.msg.as_deref() == Some(MSG_CONFIG_CHANGED) {
-                            let _ = refresh_config(
-                                &config_reader,
-                                &static_routes,
-                                &vpn_rules,
-                                &config_version,
+                        let src_uuid = Uuid::parse_str(&msg.routing.src).ok();
+                        let local_senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = {
+                            let nodes_guard = nodes.lock().await;
+                            nodes_guard
+                                .iter()
+                                .filter_map(|(uuid, handle)| {
+                                    if src_uuid.is_some_and(|value| value == *uuid) {
+                                        None
+                                    } else {
+                                        Some(handle.sender.clone())
+                                    }
+                                })
+                                .collect()
+                        };
+                        if !local_senders.is_empty() {
+                            let data = serde_json::to_vec(&msg)?;
+                            for sender in local_senders {
+                                let _ = sender.send(data.clone());
+                            }
+                            tracing::info!("config changed forwarded to local nodes");
+                        }
+                        if msg.routing.ttl >= 2 {
+                            broadcast_to_peers(&peers, &msg).await?;
+                            tracing::info!("config changed forwarded to peers");
+                        }
+                        if is_gateway {
+                            let _ = broadcast_lsa_direct(
+                                router_uuid,
+                                router_name,
                                 hive_id,
                                 &nodes,
                                 &peer_nodes,
-                                &shm,
-                                &fib,
-                                &lsa_snapshot,
-                                true,
+                                &static_routes,
+                                &vpn_rules,
+                                &wan_peers,
+                                &lsa_seq,
                             )
                             .await;
-                            tracing::info!("config changed applied");
-                            if msg
-                                .meta
-                                .action
-                                .as_deref()
-                                .is_some_and(|v| v == "compile" || v == "apply" || v == "rollback")
-                            {
-                                let version = msg
-                                    .payload
-                                    .get("version")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                tracing::info!(
-                                    action = ?msg.meta.action,
-                                    version = version,
-                                    "opa config changed received"
-                                );
-                            }
-                            let src_uuid = Uuid::parse_str(&msg.routing.src).ok();
-                            let local_senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = {
-                                let nodes_guard = nodes.lock().await;
-                                nodes_guard
-                                    .iter()
-                                    .filter_map(|(uuid, handle)| {
-                                        if src_uuid.is_some_and(|value| value == *uuid) {
-                                            None
-                                        } else {
-                                            Some(handle.sender.clone())
-                                        }
-                                    })
-                                    .collect()
-                            };
-                            if !local_senders.is_empty() {
-                                let data = serde_json::to_vec(&msg)?;
-                                for sender in local_senders {
-                                    let _ = sender.send(data.clone());
-                                }
-                                tracing::info!("config changed forwarded to local nodes");
-                            }
-                            if msg.routing.ttl >= 2 {
-                                broadcast_to_peers(&peers, &msg).await?;
-                                tracing::info!("config changed forwarded to peers");
-                            }
-                            if is_gateway {
-                                let _ = broadcast_lsa_direct(
-                                    router_uuid,
-                                    router_name,
-                                    hive_id,
-                                    &nodes,
-                                    &peer_nodes,
-                                    &static_routes,
-                                    &vpn_rules,
-                                    &wan_peers,
-                                    &lsa_seq,
-                                )
-                                .await;
-                            }
-                            continue;
                         }
-                        if msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD) {
-                            let payload: OpaReloadPayload =
-                                serde_json::from_value(msg.payload.clone())?;
-                            apply_opa_reload(&opa, &opa_reader, &shm, hive_id, &payload).await;
-                            let src_uuid = Uuid::parse_str(&msg.routing.src).ok();
-                            let local_senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = {
-                                let nodes_guard = nodes.lock().await;
-                                nodes_guard
-                                    .iter()
-                                    .filter_map(|(uuid, handle)| {
-                                        if src_uuid.is_some_and(|value| value == *uuid) {
-                                            None
-                                        } else {
-                                            Some(handle.sender.clone())
-                                        }
-                                    })
-                                    .collect()
-                            };
-                            if !local_senders.is_empty() {
-                                let data = serde_json::to_vec(&msg)?;
-                                for sender in local_senders {
-                                    let _ = sender.send(data.clone());
-                                }
-                                tracing::info!("opa reload forwarded to local nodes");
-                            }
-                            if msg.routing.ttl >= 2 {
-                                broadcast_to_peers(&peers, &msg).await?;
-                                tracing::info!("opa reload forwarded to peers");
-                            }
-                            continue;
-                        }
+                        continue;
                     }
-                    let snapshot = refresh_config(
-                        &config_reader,
-                        &static_routes,
-                        &vpn_rules,
-                        &config_version,
-                        hive_id,
-                        &nodes,
-                        &peer_nodes,
-                        &shm,
-                        &fib,
-                        &lsa_snapshot,
-                        false,
-                    )
-                    .await;
-                    let _ = refresh_lsa(
-                        &lsa_reader,
-                        &lsa_snapshot,
-                        hive_id,
-                        &nodes,
-                        &peer_nodes,
-                        &static_routes,
-                        &fib,
-                    )
-                    .await;
-                    handle_message(
-                        &msg,
-                        &nodes,
-                        &fib,
-                        &peer_nodes,
-                        &peer_routers,
-                        &peers,
-                        &wan_peers,
-                        &opa,
-                        &broadcast_cache,
-                        &memory_reader,
-                        &thread_sequences,
-                        &hive_id,
-                        identity_frontdesk_node_name,
-                        router_uuid,
-                        is_gateway,
-                        &lsa_snapshot,
-                        snapshot.as_ref(),
-                    )
-                    .await?;
+                    if msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD) {
+                        let payload: OpaReloadPayload =
+                            serde_json::from_value(msg.payload.clone())?;
+                        apply_opa_reload(&opa, &opa_reader, &shm, hive_id, &payload).await;
+                        let src_uuid = Uuid::parse_str(&msg.routing.src).ok();
+                        let local_senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = {
+                            let nodes_guard = nodes.lock().await;
+                            nodes_guard
+                                .iter()
+                                .filter_map(|(uuid, handle)| {
+                                    if src_uuid.is_some_and(|value| value == *uuid) {
+                                        None
+                                    } else {
+                                        Some(handle.sender.clone())
+                                    }
+                                })
+                                .collect()
+                        };
+                        if !local_senders.is_empty() {
+                            let data = serde_json::to_vec(&msg)?;
+                            for sender in local_senders {
+                                let _ = sender.send(data.clone());
+                            }
+                            tracing::info!("opa reload forwarded to local nodes");
+                        }
+                        if msg.routing.ttl >= 2 {
+                            broadcast_to_peers(&peers, &msg).await?;
+                            tracing::info!("opa reload forwarded to peers");
+                        }
+                        continue;
+                    }
+                }
+                let snapshot = refresh_config(
+                    &config_reader,
+                    &static_routes,
+                    &vpn_rules,
+                    &config_version,
+                    hive_id,
+                    &nodes,
+                    &peer_nodes,
+                    &shm,
+                    &fib,
+                    &lsa_snapshot,
+                    false,
+                )
+                .await;
+                let _ = refresh_lsa(
+                    &lsa_reader,
+                    &lsa_snapshot,
+                    hive_id,
+                    &nodes,
+                    &peer_nodes,
+                    &static_routes,
+                    &fib,
+                )
+                .await;
+                handle_message(
+                    &msg,
+                    &nodes,
+                    &fib,
+                    &peer_nodes,
+                    &peer_routers,
+                    &peers,
+                    &wan_peers,
+                    &opa,
+                    &broadcast_cache,
+                    &memory_reader,
+                    &thread_sequences,
+                    &hive_id,
+                    identity_frontdesk_node_name,
+                    router_uuid,
+                    is_gateway,
+                    &lsa_snapshot,
+                    snapshot.as_ref(),
+                )
+                .await?;
             } else {
                 tracing::warn!("received invalid message frame");
             }

@@ -115,12 +115,11 @@ pub fn response_contract_to_output_schema_spec(contract: &Value) -> Result<Outpu
             detail: "response contract must be a JSON object".to_string(),
         })?;
 
-    let kind = obj
-        .get("kind")
-        .and_then(Value::as_str)
-        .ok_or_else(|| AiSdkError::InvalidResponseContract {
+    let kind = obj.get("kind").and_then(Value::as_str).ok_or_else(|| {
+        AiSdkError::InvalidResponseContract {
             detail: "response contract.kind is required".to_string(),
-        })?;
+        }
+    })?;
     if kind != "json_object_v1" {
         return Err(AiSdkError::InvalidResponseContract {
             detail: format!("unsupported response contract kind: {kind}"),
@@ -156,9 +155,11 @@ pub fn response_contract_to_output_schema_spec(contract: &Value) -> Result<Outpu
     let mut schema_properties = serde_json::Map::with_capacity(properties.len());
 
     for field in required {
-        let field_name = field.as_str().ok_or_else(|| AiSdkError::InvalidResponseContract {
-            detail: "response contract.required entries must be strings".to_string(),
-        })?;
+        let field_name = field
+            .as_str()
+            .ok_or_else(|| AiSdkError::InvalidResponseContract {
+                detail: "response contract.required entries must be strings".to_string(),
+            })?;
         if field_name.trim().is_empty() {
             return Err(AiSdkError::InvalidResponseContract {
                 detail: "response contract.required must not contain empty names".to_string(),
@@ -175,20 +176,18 @@ pub fn response_contract_to_output_schema_spec(contract: &Value) -> Result<Outpu
     }
 
     for (field_name, field_schema) in properties {
-        let field_obj = field_schema
-            .as_object()
-            .ok_or_else(|| AiSdkError::InvalidResponseContract {
-                detail: format!("response contract.properties.{field_name} must be an object"),
-            })?;
-        let field_type =
-            field_obj
-                .get("type")
-                .and_then(Value::as_str)
+        let field_obj =
+            field_schema
+                .as_object()
                 .ok_or_else(|| AiSdkError::InvalidResponseContract {
-                    detail: format!(
-                        "response contract.properties.{field_name}.type is required"
-                    ),
+                    detail: format!("response contract.properties.{field_name} must be an object"),
                 })?;
+        let field_type = field_obj
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AiSdkError::InvalidResponseContract {
+                detail: format!("response contract.properties.{field_name}.type is required"),
+            })?;
         match field_type {
             "string" | "boolean" | "integer" | "number" => {}
             other => {
@@ -246,9 +245,11 @@ fn extract_context_object_field(meta: &Meta, field: &str) -> Result<Option<Value
     let Some(context) = meta.context.as_ref() else {
         return Ok(None);
     };
-    let obj = context.as_object().ok_or_else(|| AiSdkError::InvalidResponseContract {
-        detail: "meta.context must be a JSON object".to_string(),
-    })?;
+    let obj = context
+        .as_object()
+        .ok_or_else(|| AiSdkError::InvalidResponseContract {
+            detail: "meta.context must be a JSON object".to_string(),
+        })?;
     match obj.get(field) {
         None => Ok(None),
         Some(value) if value.is_object() => Ok(Some(value.clone())),
@@ -303,7 +304,9 @@ mod tests {
         };
         assert_eq!(
             extract_final_response_contract(&meta).expect("ok"),
-            Some(json!({"kind":"json_object_v1","properties":{"ok":{"type":"boolean"}},"required":["ok"]}))
+            Some(
+                json!({"kind":"json_object_v1","properties":{"ok":{"type":"boolean"}},"required":["ok"]})
+            )
         );
     }
 
@@ -392,7 +395,10 @@ mod tests {
         assert_eq!(spec.name(), "final_output");
         assert_eq!(spec.strict(), true);
         assert_eq!(spec.json_schema()["type"], "object");
-        assert_eq!(spec.json_schema()["required"], json!(["success", "human_message"]));
+        assert_eq!(
+            spec.json_schema()["required"],
+            json!(["success", "human_message"])
+        );
         assert_eq!(
             spec.json_schema()["properties"]["error_code"]["enum"],
             json!(["missing_data", "unknown"])
@@ -458,7 +464,10 @@ mod tests {
             .expect("ok")
             .expect("schema should exist");
         assert_eq!(spec.json_schema()["properties"]["status"]["type"], "string");
-        assert_eq!(spec.json_schema()["properties"]["status"]["enum"], json!(["ok", "error"]));
+        assert_eq!(
+            spec.json_schema()["properties"]["status"]["enum"],
+            json!(["ok", "error"])
+        );
     }
 
     #[test]

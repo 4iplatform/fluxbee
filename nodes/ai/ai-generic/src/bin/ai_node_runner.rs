@@ -11,12 +11,12 @@ use async_trait::async_trait;
 use base64::Engine;
 use fluxbee_ai_sdk::router_client::{RouterReader, RouterWriter};
 use fluxbee_ai_sdk::{
-    build_ai_behavior_response, build_openai_user_content_parts, build_output_schema_fallback_instruction,
-    build_reply_message_runtime_src, extract_text, resolve_model_input_from_payload_with_options,
-    resolve_response_envelope_output_schema, AiBehaviorOutput, AiFinalOutput, AiNode,
-    AiNodeConfig, AiUserArtifact, FunctionCallingConfig, FunctionCallingRunner, FunctionLoopItem,
-    FunctionLoopRunResult, FunctionRunInput, FunctionTool, FunctionToolDefinition,
-    FunctionToolProvider, FunctionToolRegistry,
+    build_ai_behavior_response, build_openai_user_content_parts,
+    build_output_schema_fallback_instruction, build_reply_message_runtime_src, extract_text,
+    resolve_model_input_from_payload_with_options, resolve_response_envelope_output_schema,
+    AiBehaviorOutput, AiFinalOutput, AiNode, AiNodeConfig, AiUserArtifact, FunctionCallingConfig,
+    FunctionCallingRunner, FunctionLoopItem, FunctionLoopRunResult, FunctionRunInput, FunctionTool,
+    FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry,
     ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelInputOptions,
     ModelSettings, NodeRuntime, OpenAiResponsesClient, ResolvedModelInput, RetryPolicy,
     RouterClient, RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,

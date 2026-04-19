@@ -89,14 +89,15 @@ impl OutputSchemaSpec {
     }
 }
 
-pub fn build_output_schema_fallback_instruction(output_schema: &OutputSchemaSpec) -> Result<String> {
+pub fn build_output_schema_fallback_instruction(
+    output_schema: &OutputSchemaSpec,
+) -> Result<String> {
     output_schema.validate()?;
-    let schema_obj = output_schema
-        .json_schema()
-        .as_object()
-        .ok_or_else(|| AiSdkError::InvalidResponseContract {
+    let schema_obj = output_schema.json_schema().as_object().ok_or_else(|| {
+        AiSdkError::InvalidResponseContract {
             detail: "schema must be a JSON object".to_string(),
-        })?;
+        }
+    })?;
     let properties = schema_obj
         .get("properties")
         .and_then(Value::as_object)
@@ -112,12 +113,11 @@ pub fn build_output_schema_fallback_instruction(output_schema: &OutputSchemaSpec
 
     let mut field_specs = Vec::with_capacity(properties.len());
     for (name, value) in properties {
-        let field_type = value
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AiSdkError::InvalidResponseContract {
+        let field_type = value.get("type").and_then(Value::as_str).ok_or_else(|| {
+            AiSdkError::InvalidResponseContract {
                 detail: format!("schema.type is required for field '{name}'"),
-            })?;
+            }
+        })?;
         let mut part = format!("{name}:{field_type}");
         if let Some(enum_values) = value.get("enum").and_then(Value::as_array) {
             let joined = enum_values
@@ -372,11 +372,10 @@ fn build_openai_response_format(output_schema: &OutputSchemaSpec) -> Result<Valu
 
 fn validate_structured_output(raw: &str, output_schema: &OutputSchemaSpec) -> Result<String> {
     let candidate = extract_json_candidate(raw)?;
-    let parsed: Value = serde_json::from_str(&candidate).map_err(|err| {
-        AiSdkError::InvalidStructuredOutput {
+    let parsed: Value =
+        serde_json::from_str(&candidate).map_err(|err| AiSdkError::InvalidStructuredOutput {
             detail: format!("json_parse_error: {err}"),
-        }
-    })?;
+        })?;
     validate_value_against_schema(&parsed, output_schema.json_schema())?;
     serde_json::to_string(&parsed).map_err(AiSdkError::from)
 }
@@ -415,9 +414,11 @@ fn extract_json_candidate(raw: &str) -> Result<String> {
 }
 
 fn validate_value_against_schema(value: &Value, schema: &Value) -> Result<()> {
-    let schema_obj = schema.as_object().ok_or_else(|| AiSdkError::InvalidResponseContract {
-        detail: "schema must be a JSON object".to_string(),
-    })?;
+    let schema_obj = schema
+        .as_object()
+        .ok_or_else(|| AiSdkError::InvalidResponseContract {
+            detail: "schema must be a JSON object".to_string(),
+        })?;
     let schema_type = schema_obj
         .get("type")
         .and_then(Value::as_str)
@@ -437,9 +438,11 @@ fn validate_object_against_schema(
     value: &Value,
     schema_obj: &serde_json::Map<String, Value>,
 ) -> Result<()> {
-    let obj = value.as_object().ok_or_else(|| AiSdkError::InvalidStructuredOutput {
-        detail: "root_not_object".to_string(),
-    })?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| AiSdkError::InvalidStructuredOutput {
+            detail: "root_not_object".to_string(),
+        })?;
     let properties = schema_obj
         .get("properties")
         .and_then(Value::as_object)
@@ -454,9 +457,11 @@ fn validate_object_against_schema(
         })?;
 
     for field in required {
-        let field_name = field.as_str().ok_or_else(|| AiSdkError::InvalidResponseContract {
-            detail: "schema.required entries must be strings".to_string(),
-        })?;
+        let field_name = field
+            .as_str()
+            .ok_or_else(|| AiSdkError::InvalidResponseContract {
+                detail: "schema.required entries must be strings".to_string(),
+            })?;
         if !properties.contains_key(field_name) {
             return Err(AiSdkError::InvalidResponseContract {
                 detail: format!("required field '{field_name}' missing from schema.properties"),
@@ -493,16 +498,17 @@ fn validate_object_against_schema(
 }
 
 fn validate_field_against_schema(field_name: &str, value: &Value, schema: &Value) -> Result<()> {
-    let schema_obj = schema.as_object().ok_or_else(|| AiSdkError::InvalidResponseContract {
-        detail: format!("schema for field '{field_name}' must be an object"),
-    })?;
-    let field_type =
-        schema_obj
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AiSdkError::InvalidResponseContract {
-                detail: format!("schema.type is required for field '{field_name}'"),
-            })?;
+    let schema_obj = schema
+        .as_object()
+        .ok_or_else(|| AiSdkError::InvalidResponseContract {
+            detail: format!("schema for field '{field_name}' must be an object"),
+        })?;
+    let field_type = schema_obj
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AiSdkError::InvalidResponseContract {
+            detail: format!("schema.type is required for field '{field_name}'"),
+        })?;
 
     let type_matches = match field_type {
         "string" => value.is_string(),
@@ -522,11 +528,12 @@ fn validate_field_against_schema(field_name: &str, value: &Value, schema: &Value
     }
 
     if let Some(enum_values) = schema_obj.get("enum") {
-        let enum_items = enum_values
-            .as_array()
-            .ok_or_else(|| AiSdkError::InvalidResponseContract {
-                detail: format!("enum for field '{field_name}' must be an array"),
-            })?;
+        let enum_items =
+            enum_values
+                .as_array()
+                .ok_or_else(|| AiSdkError::InvalidResponseContract {
+                    detail: format!("enum for field '{field_name}' must be an array"),
+                })?;
         if field_type != "string" {
             return Err(AiSdkError::InvalidResponseContract {
                 detail: format!("enum is only supported for string field '{field_name}'"),
@@ -537,7 +544,9 @@ fn validate_field_against_schema(field_name: &str, value: &Value, schema: &Value
             .ok_or_else(|| AiSdkError::InvalidStructuredOutput {
                 detail: format!("type_mismatch:{field_name}:string"),
             })?;
-        let matches = enum_items.iter().any(|candidate| candidate.as_str() == Some(field_value));
+        let matches = enum_items
+            .iter()
+            .any(|candidate| candidate.as_str() == Some(field_value));
         if !matches {
             return Err(AiSdkError::InvalidStructuredOutput {
                 detail: format!("enum_mismatch:{field_name}"),
@@ -846,7 +855,8 @@ mod tests {
                         for line in headers.lines() {
                             let lower = line.to_ascii_lowercase();
                             if let Some(value) = lower.strip_prefix("content-length:") {
-                                content_length = value.trim().parse::<usize>().expect("content length");
+                                content_length =
+                                    value.trim().parse::<usize>().expect("content length");
                             }
                         }
                     }
@@ -872,7 +882,9 @@ mod tests {
             stream
                 .write_all(response.as_bytes())
                 .expect("write response head");
-            stream.write_all(&response_json).expect("write response body");
+            stream
+                .write_all(&response_json)
+                .expect("write response body");
         });
 
         (format!("http://{}", addr), rx, handle)
@@ -1157,7 +1169,10 @@ mod tests {
             model_settings: None,
         };
 
-        let response = client.generate(request).await.expect("generate should succeed");
+        let response = client
+            .generate(request)
+            .await
+            .expect("generate should succeed");
         assert_eq!(response.content, "{\"ok\":true}");
 
         let body = body_rx.recv().expect("captured body");
@@ -1165,7 +1180,10 @@ mod tests {
         assert_eq!(body["text"]["format"]["type"], "json_schema");
         assert_eq!(body["text"]["format"]["name"], "final_output");
         assert_eq!(body["text"]["format"]["strict"], true);
-        assert_eq!(body["text"]["format"]["schema"]["properties"]["ok"]["type"], "boolean");
+        assert_eq!(
+            body["text"]["format"]["schema"]["properties"]["ok"]["type"],
+            "boolean"
+        );
         handle.join().expect("server thread");
     }
 
@@ -1185,7 +1203,10 @@ mod tests {
             model_settings: None,
         };
 
-        let response = client.generate(request).await.expect("generate should succeed");
+        let response = client
+            .generate(request)
+            .await
+            .expect("generate should succeed");
         assert_eq!(response.content, "plain text");
 
         let body = body_rx.recv().expect("captured body");

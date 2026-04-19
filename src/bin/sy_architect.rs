@@ -16,13 +16,11 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::any;
 use axum::{Json, Router};
 use fluxbee_ai_sdk::{
-    build_openai_user_content_parts, resolve_model_input_from_payload_with_options,
-    extract_text, ConversationSummary, FunctionCallingConfig, FunctionCallingRunner,
-    FunctionRunInput, FunctionTool, FunctionToolDefinition, FunctionToolProvider,
-    FunctionToolRegistry, ImmediateConversationMemory, ImmediateInteraction,
-    ImmediateInteractionKind, ImmediateOperation, ImmediateRole, ModelSettings,
-    ModelInputOptions,
-    OpenAiResponsesClient,
+    build_openai_user_content_parts, extract_text, resolve_model_input_from_payload_with_options,
+    ConversationSummary, FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput,
+    FunctionTool, FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry,
+    ImmediateConversationMemory, ImmediateInteraction, ImmediateInteractionKind,
+    ImmediateOperation, ImmediateRole, ModelInputOptions, ModelSettings, OpenAiResponsesClient,
 };
 use fluxbee_sdk::blob::{BlobConfig, BlobRef, BlobToolkit};
 use fluxbee_sdk::payload::TextV1Payload;
@@ -422,10 +420,18 @@ impl ArchitectAdminReadToolsProvider {
 impl FunctionToolProvider for ArchitectAdminReadToolsProvider {
     fn register_tools(&self, registry: &mut FunctionToolRegistry) -> fluxbee_ai_sdk::Result<()> {
         registry.register(Arc::new(ArchitectSystemGetTool::new(self.context.clone())))?;
-        registry.register(Arc::new(ArchitectSystemWriteTool::new(self.context.clone())))?;
-        registry.register(Arc::new(ArchitectDeployWorkflowTool::new(self.context.clone())))?;
-        registry.register(Arc::new(ArchitectDeployOpaPolicyTool::new(self.context.clone())))?;
-        registry.register(Arc::new(ArchitectSetNodeConfigTool::new(self.context.clone())))
+        registry.register(Arc::new(ArchitectSystemWriteTool::new(
+            self.context.clone(),
+        )))?;
+        registry.register(Arc::new(ArchitectDeployWorkflowTool::new(
+            self.context.clone(),
+        )))?;
+        registry.register(Arc::new(ArchitectDeployOpaPolicyTool::new(
+            self.context.clone(),
+        )))?;
+        registry.register(Arc::new(ArchitectSetNodeConfigTool::new(
+            self.context.clone(),
+        )))
     }
 }
 
@@ -604,7 +610,14 @@ impl FunctionTool for ArchitectSystemWriteTool {
             )));
         }
         let preview_command = format!("SCMD: {raw}");
-        stage_admin_write(&self.context, session_id, translation, &preview_command, &raw_arguments).await
+        stage_admin_write(
+            &self.context,
+            session_id,
+            translation,
+            &preview_command,
+            &raw_arguments,
+        )
+        .await
     }
 }
 
@@ -692,9 +705,7 @@ impl FunctionTool for ArchitectDeployWorkflowTool {
             .to_string();
         let definition = resolve_json_object_param(&arguments, "definition", "definition_json")
             .map_err(|err| {
-                fluxbee_ai_sdk::AiSdkError::Protocol(format!(
-                    "fluxbee_deploy_workflow: {err}"
-                ))
+                fluxbee_ai_sdk::AiSdkError::Protocol(format!("fluxbee_deploy_workflow: {err}"))
             })?;
 
         let mut body = json!({
@@ -721,7 +732,14 @@ impl FunctionTool for ArchitectDeployWorkflowTool {
         let body_str = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
         let preview_command = format!("SCMD: curl -X POST /hives/{hive}/wf-rules -d '{body_str}'");
         let tool_arguments = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
-        stage_admin_write(&self.context, session_id, translation, &preview_command, &tool_arguments).await
+        stage_admin_write(
+            &self.context,
+            session_id,
+            translation,
+            &preview_command,
+            &tool_arguments,
+        )
+        .await
     }
 }
 
@@ -823,7 +841,14 @@ impl FunctionTool for ArchitectDeployOpaPolicyTool {
             "SCMD: curl -X POST /hives/{hive}/opa/policy -d '{{\"rego\":\"{rego_preview}\",…}}'"
         );
         let tool_arguments = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
-        stage_admin_write(&self.context, session_id, translation, &preview_command, &tool_arguments).await
+        stage_admin_write(
+            &self.context,
+            session_id,
+            translation,
+            &preview_command,
+            &tool_arguments,
+        )
+        .await
     }
 }
 
@@ -913,11 +938,9 @@ impl FunctionTool for ArchitectSetNodeConfigTool {
                 )
             })?
             .to_string();
-        let config = resolve_json_object_param(&arguments, "config", "config_json")
-            .map_err(|err| {
-                fluxbee_ai_sdk::AiSdkError::Protocol(format!(
-                    "fluxbee_set_node_config: {err}"
-                ))
+        let config =
+            resolve_json_object_param(&arguments, "config", "config_json").map_err(|err| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(format!("fluxbee_set_node_config: {err}"))
             })?;
         let schema_version = arguments
             .get("schema_version")
@@ -951,7 +974,14 @@ impl FunctionTool for ArchitectSetNodeConfigTool {
             "SCMD: curl -X POST /hives/{hive}/nodes/{node_name}/control/config-set -d '{{…config…}}'"
         );
         let tool_arguments = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
-        stage_admin_write(&self.context, session_id, translation, &preview_command, &tool_arguments).await
+        stage_admin_write(
+            &self.context,
+            session_id,
+            translation,
+            &preview_command,
+            &tool_arguments,
+        )
+        .await
     }
 }
 
@@ -981,9 +1011,7 @@ async fn stage_admin_write(
     )
     .await
     .map_err(|err| {
-        fluxbee_ai_sdk::AiSdkError::Protocol(format!(
-            "failed to inspect prior operations: {err}"
-        ))
+        fluxbee_ai_sdk::AiSdkError::Protocol(format!("failed to inspect prior operations: {err}"))
     })? {
         if existing.status == "timeout_unknown" && translation.action == "add_hive" {
             let params = normalized_params.clone();
@@ -1123,9 +1151,8 @@ fn resolve_json_object_param(
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
     {
-        return serde_json::from_str(s).map_err(|err| {
-            format!("'{string_key}' is not valid JSON: {err}")
-        });
+        return serde_json::from_str(s)
+            .map_err(|err| format!("'{string_key}' is not valid JSON: {err}"));
     }
     Err(format!(
         "one of '{object_key}' (object) or '{string_key}' (JSON string) is required"
@@ -1224,9 +1251,7 @@ async fn main() -> Result<(), ArchitectError> {
         .route("/api/sessions", any(dynamic_handler))
         .route("/api/sessions/*path", any(dynamic_handler))
         .route("/*path", any(dynamic_handler))
-        .layer(DefaultBodyLimit::max(
-            ARCHITECT_MAX_ATTACHMENT_UPLOAD_BYTES,
-        ))
+        .layer(DefaultBodyLimit::max(ARCHITECT_MAX_ATTACHMENT_UPLOAD_BYTES))
         .with_state(Arc::clone(&state));
 
     let listener = TcpListener::bind(&listen).await?;
@@ -1519,10 +1544,7 @@ fn architect_blob_toolkit(state: &ArchitectState) -> Result<BlobToolkit, Archite
     })
 }
 
-fn normalize_attachment_mime(
-    provided: Option<&str>,
-    filename: &str,
-) -> Option<String> {
+fn normalize_attachment_mime(provided: Option<&str>, filename: &str) -> Option<String> {
     let provided = provided
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -1595,7 +1617,11 @@ async fn handle_attachment_upload(
 
         files_seen += 1;
         if files_seen > ARCHITECT_MAX_ATTACHMENTS {
-            tracing::warn!(count = files_seen, max = ARCHITECT_MAX_ATTACHMENTS, "archi: attachment upload rejected — too many files");
+            tracing::warn!(
+                count = files_seen,
+                max = ARCHITECT_MAX_ATTACHMENTS,
+                "archi: attachment upload rejected — too many files"
+            );
             return Err(format!(
                 "too many attachments: max {} files per upload",
                 ARCHITECT_MAX_ATTACHMENTS
@@ -1814,7 +1840,8 @@ async fn dynamic_handler(
                         .into_response()
                 }
             };
-            let out = handle_chat_message(&state, req.session_id, req.message, req.attachments).await;
+            let out =
+                handle_chat_message(&state, req.session_id, req.message, req.attachments).await;
             Json(out).into_response()
         }
         (Method::POST, _) if is_attachments_path(path) => {
@@ -2088,39 +2115,40 @@ async fn handle_ai_chat(
         runtime.model_settings.clone(),
     );
     let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
-    let current_user_parts = if attachments.is_empty() {
-        None
-    } else {
-        let payload = TextV1Payload::new(
-            input,
-            attachments
-                .iter()
-                .map(|attachment| attachment.blob_ref.clone())
-                .collect(),
-        )
-        .to_value()
-        .map_err(|err| -> ArchitectError {
-            format!("failed to build text payload with attachments: {err}").into()
-        })?;
-        let resolved = resolve_model_input_from_payload_with_options(
-            &payload,
-            &ModelInputOptions {
-                multimodal: true,
-                max_attachments: ARCHITECT_MAX_ATTACHMENTS,
-                max_attachment_bytes: ARCHITECT_MAX_ATTACHMENT_BYTES as u64,
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(|err| -> ArchitectError {
-            format!("failed to resolve attachment payload for model input: {err}").into()
-        })?;
-        Some(build_openai_user_content_parts(&resolved).await.map_err(
-            |err| -> ArchitectError {
-                format!("failed to build OpenAI input parts from attachments: {err}").into()
-            },
-        )?)
-    };
+    let current_user_parts =
+        if attachments.is_empty() {
+            None
+        } else {
+            let payload = TextV1Payload::new(
+                input,
+                attachments
+                    .iter()
+                    .map(|attachment| attachment.blob_ref.clone())
+                    .collect(),
+            )
+            .to_value()
+            .map_err(|err| -> ArchitectError {
+                format!("failed to build text payload with attachments: {err}").into()
+            })?;
+            let resolved = resolve_model_input_from_payload_with_options(
+                &payload,
+                &ModelInputOptions {
+                    multimodal: true,
+                    max_attachments: ARCHITECT_MAX_ATTACHMENTS,
+                    max_attachment_bytes: ARCHITECT_MAX_ATTACHMENT_BYTES as u64,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|err| -> ArchitectError {
+                format!("failed to resolve attachment payload for model input: {err}").into()
+            })?;
+            Some(build_openai_user_content_parts(&resolved).await.map_err(
+                |err| -> ArchitectError {
+                    format!("failed to build OpenAI input parts from attachments: {err}").into()
+                },
+            )?)
+        };
 
     let result = runner
         .run_with_input(
@@ -2635,7 +2663,8 @@ fn persisted_message_attachments(message: &PersistedChatMessage) -> Vec<Uploaded
         .get("attachments")
         .and_then(Value::as_array)
         .map(|items| {
-            items.iter()
+            items
+                .iter()
                 .filter_map(|item| serde_json::from_value::<UploadedAttachment>(item.clone()).ok())
                 .collect::<Vec<_>>()
         })
@@ -4422,7 +4451,6 @@ async fn execute_admin_translation_with_context(
 
 const STATUS_REFRESH_INTERVAL_SECS: u64 = 30;
 
-
 async fn status_refresh_loop(state: Arc<ArchitectState>) {
     loop {
         let fresh = build_architect_status(&state).await;
@@ -5070,8 +5098,10 @@ async fn persist_chat_exchange(
     if suppress_response_row {
         session.message_count += 1;
         session.last_activity_at_ms = now;
-        session.last_message_preview =
-            preview_text(&render_user_message_with_attachment_summary(&user_message, attachments), 88);
+        session.last_message_preview = preview_text(
+            &render_user_message_with_attachment_summary(&user_message, attachments),
+            88,
+        );
         upsert_session_record(&sessions, session).await?;
         return Ok(());
     }
@@ -8749,12 +8779,26 @@ mod tests {
 
     #[test]
     fn normalize_attachment_mime_infers_from_extension_when_none_provided() {
-        assert_eq!(normalize_attachment_mime(None, "spec.md").as_deref(), Some("text/markdown"));
-        assert_eq!(normalize_attachment_mime(None, "data.csv").as_deref(), Some("text/csv"));
-        assert_eq!(normalize_attachment_mime(None, "report.pdf").as_deref(), Some("application/pdf"));
-        assert_eq!(normalize_attachment_mime(None, "photo.png").as_deref(), Some("image/png"));
-        assert_eq!(normalize_attachment_mime(None, "doc.docx").as_deref(),
-            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"));
+        assert_eq!(
+            normalize_attachment_mime(None, "spec.md").as_deref(),
+            Some("text/markdown")
+        );
+        assert_eq!(
+            normalize_attachment_mime(None, "data.csv").as_deref(),
+            Some("text/csv")
+        );
+        assert_eq!(
+            normalize_attachment_mime(None, "report.pdf").as_deref(),
+            Some("application/pdf")
+        );
+        assert_eq!(
+            normalize_attachment_mime(None, "photo.png").as_deref(),
+            Some("image/png")
+        );
+        assert_eq!(
+            normalize_attachment_mime(None, "doc.docx").as_deref(),
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        );
     }
 
     #[test]
@@ -8767,20 +8811,36 @@ mod tests {
     #[test]
     fn architect_attachment_mime_supported_accepts_allowed_types() {
         for mime in &[
-            "text/plain", "text/markdown", "text/csv", "application/json",
-            "application/pdf", "image/png", "image/jpeg", "image/webp", "image/gif",
+            "text/plain",
+            "text/markdown",
+            "text/csv",
+            "application/json",
+            "application/pdf",
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "image/gif",
         ] {
-            assert!(architect_attachment_mime_supported(mime), "should accept {mime}");
+            assert!(
+                architect_attachment_mime_supported(mime),
+                "should accept {mime}"
+            );
         }
     }
 
     #[test]
     fn architect_attachment_mime_supported_rejects_disallowed_types() {
         for mime in &[
-            "application/zip", "application/octet-stream", "text/html",
-            "video/mp4", "audio/mpeg",
+            "application/zip",
+            "application/octet-stream",
+            "text/html",
+            "video/mp4",
+            "audio/mpeg",
         ] {
-            assert!(!architect_attachment_mime_supported(mime), "should reject {mime}");
+            assert!(
+                !architect_attachment_mime_supported(mime),
+                "should reject {mime}"
+            );
         }
     }
 
