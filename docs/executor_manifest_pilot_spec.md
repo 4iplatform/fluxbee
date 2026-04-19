@@ -672,6 +672,27 @@ The execution path remains:
 - `SY.architect` sends an execution request to `SY.admin`
 - `SY.admin` runs the executor against the real admin action surface
 
+Pilot host ingress in `SY.architect` may use a dedicated API path such as:
+
+- `POST /api/executor/plan`
+
+That path is separate from:
+
+- normal operator chat
+- SCMD
+- attachment upload
+
+Its purpose is only to ingest an external `executor_plan`, create or reuse a session, invoke `SY.admin`, and persist/render the execution result.
+
+Current implementation direction for the pilot:
+
+- internal request contract lives in `SY.admin` as executor-specific internal admin commands
+- `executor_validate_plan`
+- `executor_execute_plan`
+
+These are internal host-to-admin execution contracts.
+They are **not** part of the normal operator-facing admin action catalog.
+
 ---
 
 ## 14. MVP Boundaries

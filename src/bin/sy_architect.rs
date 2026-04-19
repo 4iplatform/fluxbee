@@ -227,6 +227,18 @@ struct ChatRequest {
     attachments: Vec<ChatAttachmentRef>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ExecutorPlanRequest {
+    session_id: Option<String>,
+    execution_id: Option<String>,
+    title: Option<String>,
+    plan: Value,
+    #[serde(default)]
+    executor_options: Value,
+    #[serde(default)]
+    labels: Value,
+}
+
 #[derive(Debug, Serialize)]
 struct ChatResponse {
     status: String,
@@ -1247,6 +1259,7 @@ async fn main() -> Result<(), ArchitectError> {
         .route("/healthz", any(dynamic_handler))
         .route("/api/status", any(dynamic_handler))
         .route("/api/chat", any(dynamic_handler))
+        .route("/api/executor/plan", any(dynamic_handler))
         .route("/api/attachments", any(dynamic_handler))
         .route("/api/sessions", any(dynamic_handler))
         .route("/api/sessions/*path", any(dynamic_handler))
@@ -1844,6 +1857,30 @@ async fn dynamic_handler(
                 handle_chat_message(&state, req.session_id, req.message, req.attachments).await;
             Json(out).into_response()
         }
+        (Method::POST, _) if is_executor_plan_path(path) => {
+            let body = match axum::body::to_bytes(request.into_body(), 4 * 1024 * 1024).await {
+                Ok(body) => body,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": format!("invalid body: {err}") })),
+                    )
+                        .into_response()
+                }
+            };
+            let req: ExecutorPlanRequest = match serde_json::from_slice(&body) {
+                Ok(req) => req,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": format!("invalid json: {err}") })),
+                    )
+                        .into_response()
+                }
+            };
+            let out = handle_executor_plan_request(&state, req).await;
+            Json(out).into_response()
+        }
         (Method::POST, _) if is_attachments_path(path) => {
             match handle_attachment_upload(&state, request).await {
                 Ok(response) => Json(response).into_response(),
@@ -2075,6 +2112,91 @@ async fn handle_chat_message(
         persist_chat_exchange(state, &mut session, message, &attachments, &response).await
     {
         tracing::warn!(error = %err, session_id = %resolved_session_id, "failed to persist chat exchange");
+    }
+
+    ChatResponse {
+        session_title: Some(session.title),
+        ..response
+    }
+}
+
+async fn handle_executor_plan_request(
+    state: &ArchitectState,
+    req: ExecutorPlanRequest,
+) -> ChatResponse {
+    let (resolved_session_id, mut session) =
+        match resolve_chat_session(state, req.session_id, req.title.clone()).await {
+            Ok(values) => values,
+            Err(err) => {
+                return ChatResponse {
+                    status: "error".to_string(),
+                    mode: "executor".to_string(),
+                    output: json!({ "error": format!("session unavailable: {err}") }),
+                    session_id: None,
+                    session_title: None,
+                }
+            }
+        };
+
+    let execution_id = req
+        .execution_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let plan = match validate_architect_executor_plan_shape(&req.plan) {
+        Ok(plan) => plan,
+        Err(err) => {
+            let response = ChatResponse {
+                status: "error".to_string(),
+                mode: "executor".to_string(),
+                output: json!({
+                    "error": err.to_string(),
+                    "execution_id": execution_id,
+                    "phase": "architect_precheck",
+                }),
+                session_id: Some(resolved_session_id.clone()),
+                session_title: Some(session.title.clone()),
+            };
+            let plan_text = render_executor_plan_submission(&execution_id, &req.plan);
+            let _ = persist_chat_exchange(state, &mut session, plan_text, &[], &response).await;
+            return response;
+        }
+    };
+
+    let context = admin_tool_context(state, Some(&resolved_session_id));
+    let response = match execute_executor_plan_with_context(
+        &context,
+        execution_id.clone(),
+        plan,
+        req.executor_options,
+        req.labels,
+    )
+    .await
+    {
+        Ok(output) => ChatResponse {
+            status: chat_status_from_command_output(&output),
+            mode: "executor".to_string(),
+            output,
+            session_id: Some(resolved_session_id.clone()),
+            session_title: Some(session.title.clone()),
+        },
+        Err(err) => ChatResponse {
+            status: "error".to_string(),
+            mode: "executor".to_string(),
+            output: json!({
+                "error": err.to_string(),
+                "execution_id": execution_id,
+            }),
+            session_id: Some(resolved_session_id.clone()),
+            session_title: Some(session.title.clone()),
+        },
+    };
+
+    let plan_text = render_executor_plan_submission(&execution_id, &req.plan);
+    if let Err(err) = persist_chat_exchange(state, &mut session, plan_text, &[], &response).await {
+        tracing::warn!(error = %err, session_id = %resolved_session_id, "failed to persist executor plan exchange");
     }
 
     ChatResponse {
@@ -3554,6 +3676,9 @@ fn scmd_query_params(raw_query: Option<&str>) -> serde_json::Map<String, Value> 
 
 fn architect_admin_action_timeout(action: &str) -> Duration {
     match action {
+        "executor_validate_plan" | "executor_execute_plan" => Duration::from_secs(
+            env_timeout_secs("JSR_ADMIN_EXECUTOR_TIMEOUT_SECS").unwrap_or(120),
+        ),
         "add_hive" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS").unwrap_or(180))
         }
@@ -3568,6 +3693,50 @@ fn architect_admin_action_timeout(action: &str) -> Duration {
         }
         _ => Duration::from_secs(env_timeout_secs("JSR_ADMIN_ORCH_TIMEOUT_SECS").unwrap_or(30)),
     }
+}
+
+fn validate_architect_executor_plan_shape(plan: &Value) -> Result<Value, ArchitectError> {
+    let obj = plan
+        .as_object()
+        .ok_or_else(|| -> ArchitectError { "executor plan must be a JSON object".into() })?;
+    let kind = obj
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .ok_or_else(|| -> ArchitectError { "executor plan requires string field 'kind'".into() })?;
+    if kind != "executor_plan" {
+        return Err(format!("unsupported executor plan kind '{kind}'").into());
+    }
+    let version = obj
+        .get("plan_version")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .ok_or_else(|| -> ArchitectError {
+            "executor plan requires string field 'plan_version'".into()
+        })?;
+    if version.is_empty() {
+        return Err("executor plan plan_version must be non-empty".into());
+    }
+    let execution = obj
+        .get("execution")
+        .and_then(Value::as_object)
+        .ok_or_else(|| -> ArchitectError { "executor plan requires object field 'execution'".into() })?;
+    let steps = execution
+        .get("steps")
+        .and_then(Value::as_array)
+        .ok_or_else(|| -> ArchitectError {
+            "executor plan execution.steps must be an array".into()
+        })?;
+    if steps.is_empty() {
+        return Err("executor plan execution.steps must not be empty".into());
+    }
+    Ok(plan.clone())
+}
+
+fn render_executor_plan_submission(execution_id: &str, plan: &Value) -> String {
+    let pretty = serde_json::to_string_pretty(plan)
+        .unwrap_or_else(|_| serde_json::to_string(plan).unwrap_or_else(|_| "{}".to_string()));
+    format!("EXECUTOR_PLAN {execution_id}\n{pretty}")
 }
 
 fn translate_scmd(
@@ -4379,14 +4548,92 @@ async fn execute_admin_translation_with_context(
     translation: AdminTranslation,
     purpose: &str,
 ) -> Result<Value, ArchitectError> {
+    execute_admin_action_with_context(
+        context,
+        &translation.admin_target,
+        &translation.action,
+        Some(&translation.target_hive),
+        translation.params,
+        purpose,
+    )
+    .await
+}
+
+async fn execute_executor_plan_with_context(
+    context: &ArchitectAdminToolContext,
+    execution_id: String,
+    plan: Value,
+    executor_options: Value,
+    labels: Value,
+) -> Result<Value, ArchitectError> {
+    let admin_target = format!("SY.admin@{}", context.hive_id);
+    let validate_output = execute_admin_action_with_context(
+        context,
+        &admin_target,
+        "executor_validate_plan",
+        None,
+        plan.clone(),
+        "executor.validate",
+    )
+    .await?;
+    let validate_status = validate_output
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("error");
+    if !validate_status.eq_ignore_ascii_case("ok") {
+        return Err(format!(
+            "executor plan validation failed: {}",
+            response_detail_text(&validate_output).unwrap_or_else(|| "unknown validation error".to_string())
+        )
+        .into());
+    }
+
+    let execute_output = execute_admin_action_with_context(
+        context,
+        &admin_target,
+        "executor_execute_plan",
+        None,
+        json!({
+            "execution_id": execution_id,
+            "plan": plan,
+            "executor_options": if executor_options.is_object() { executor_options } else { json!({}) },
+            "labels": if labels.is_object() { labels } else { json!({}) }
+        }),
+        "executor.run",
+    )
+    .await?;
+    Ok(json!({
+        "status": execute_output.get("status").cloned().unwrap_or_else(|| json!("error")),
+        "action": "executor_execute_plan",
+        "payload": execute_output.get("payload").cloned().unwrap_or(Value::Null),
+        "validation": validate_output.get("payload").cloned().unwrap_or(Value::Null),
+        "error_code": execute_output.get("error_code").cloned().unwrap_or(Value::Null),
+        "error_detail": execute_output.get("error_detail").cloned().unwrap_or(Value::Null),
+        "message": execute_output
+            .get("payload")
+            .and_then(|payload| payload.get("summary"))
+            .and_then(|summary| summary.get("final_message"))
+            .and_then(Value::as_str)
+            .unwrap_or("Executor plan finished"),
+    }))
+}
+
+async fn execute_admin_action_with_context(
+    context: &ArchitectAdminToolContext,
+    admin_target: &str,
+    action: &str,
+    target: Option<&str>,
+    params: Value,
+    purpose: &str,
+) -> Result<Value, ArchitectError> {
     let params_json =
-        serde_json::to_string(&translation.params).unwrap_or_else(|_| "{}".to_string());
-    let timeout = architect_admin_action_timeout(&translation.action);
+        serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string());
+    let timeout = architect_admin_action_timeout(action);
     tracing::info!(
         purpose = %purpose,
-        admin_target = %translation.admin_target,
-        action = %translation.action,
-        target_hive = %translation.target_hive,
+        admin_target = %admin_target,
+        action = %action,
+        target_hive = ?target,
         timeout_ms = timeout.as_millis(),
         params = %params_json,
         "sy.architect dispatching admin action"
@@ -4404,10 +4651,10 @@ async fn execute_admin_translation_with_context(
         &sender,
         &mut receiver,
         AdminCommandRequest {
-            admin_target: &translation.admin_target,
-            action: &translation.action,
-            target: Some(&translation.target_hive),
-            params: translation.params,
+            admin_target,
+            action,
+            target,
+            params,
             request_id: None,
             timeout,
         },
@@ -4416,9 +4663,9 @@ async fn execute_admin_translation_with_context(
     .map_err(|err| -> ArchitectError {
         tracing::warn!(
             purpose = %purpose,
-            admin_target = %translation.admin_target,
-            action = %translation.action,
-            target_hive = %translation.target_hive,
+            admin_target = %admin_target,
+            action = %action,
+            target_hive = ?target,
             error = %err,
             "sy.architect admin action failed"
         );
@@ -4427,9 +4674,9 @@ async fn execute_admin_translation_with_context(
     let payload_json = serde_json::to_string(&out.payload).unwrap_or_else(|_| "null".to_string());
     tracing::info!(
         purpose = %purpose,
-        admin_target = %translation.admin_target,
-        action = %translation.action,
-        target_hive = %translation.target_hive,
+        admin_target = %admin_target,
+        action = %action,
+        target_hive = ?target,
         status = %out.status,
         error_code = ?out.error_code,
         error_detail = ?out.error_detail,
@@ -6193,6 +6440,10 @@ fn is_status_path(path: &str) -> bool {
 
 fn is_chat_path(path: &str) -> bool {
     path == "/api/chat" || path.ends_with("/api/chat")
+}
+
+fn is_executor_plan_path(path: &str) -> bool {
+    path == "/api/executor/plan" || path.ends_with("/api/executor/plan")
 }
 
 fn is_attachments_path(path: &str) -> bool {

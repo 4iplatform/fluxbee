@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,11 @@ use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use fluxbee_ai_sdk::{FunctionToolDefinition, ModelSettings, OpenAiResponsesClient};
+use async_trait::async_trait;
+use fluxbee_ai_sdk::{
+    FunctionCallingConfig, FunctionCallingRunner, FunctionLoopItem, FunctionRunInput, FunctionTool,
+    FunctionToolDefinition, FunctionToolRegistry, ModelSettings, OpenAiResponsesClient,
+};
 use fluxbee_sdk::nats::{NatsClient, NatsRequestEnvelope, NatsResponseEnvelope};
 use fluxbee_sdk::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED,
@@ -41,6 +45,8 @@ const DEFAULT_ADMIN_EXECUTOR_MODEL: &str = "gpt-5.4-mini";
 const ADMIN_EXECUTOR_CONFIG_SCHEMA_VERSION: u32 = 1;
 const ADMIN_EXECUTOR_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
 const ADMIN_EXECUTOR_DEFAULT_CATALOG_MODE: &str = "full";
+const ADMIN_EXECUTOR_PLAN_KIND: &str = "executor_plan";
+const ADMIN_EXECUTOR_PLAN_VERSION: &str = "0.1";
 const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "list_admin_actions",
     "get_admin_action_help",
@@ -109,6 +115,87 @@ struct AdminExecutorAiRuntime {
     model: String,
     model_settings: ModelSettings,
     client: OpenAiResponsesClient,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminExecutorPlan {
+    plan_version: String,
+    kind: String,
+    metadata: serde_json::Map<String, serde_json::Value>,
+    execution: AdminExecutorPlanExecution,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminExecutorPlanExecution {
+    strict: bool,
+    stop_on_error: bool,
+    allow_help_lookup: bool,
+    steps: Vec<AdminExecutorPlanStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminExecutorPlanStep {
+    id: String,
+    action: String,
+    args: serde_json::Value,
+    #[serde(default)]
+    executor_fill: Option<AdminExecutorFill>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct AdminExecutorFill {
+    #[serde(default)]
+    allowed: Vec<String>,
+    #[serde(default)]
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminExecutorRunRequest {
+    execution_id: String,
+    plan: AdminExecutorPlan,
+    #[serde(default)]
+    executor_options: AdminExecutorRunOptions,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct AdminExecutorRunOptions {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AdminExecutorStepEvent {
+    execution_id: String,
+    step_id: String,
+    step_index: usize,
+    step_action: String,
+    status: String,
+    timestamp: u64,
+    summary: String,
+    tool_name: Option<String>,
+    tool_args_preview: Option<serde_json::Value>,
+    result_preview: Option<serde_json::Value>,
+    error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AdminExecutorRunSummary {
+    execution_id: String,
+    status: String,
+    total_steps: usize,
+    completed_steps: usize,
+    failed_step_id: Option<String>,
+    failed_step_action: Option<String>,
+    final_message: String,
 }
 
 #[derive(Clone)]
@@ -837,6 +924,263 @@ fn build_admin_executor_function_catalog(
         .collect()
 }
 
+fn parse_executor_plan(params: serde_json::Value) -> Result<AdminExecutorPlan, String> {
+    let plan = serde_json::from_value::<AdminExecutorPlan>(params)
+        .map_err(|err| format!("invalid executor_plan: {err}"))?;
+    validate_executor_plan(&plan)?;
+    Ok(plan)
+}
+
+fn validate_executor_plan(plan: &AdminExecutorPlan) -> Result<(), String> {
+    if plan.plan_version.trim() != ADMIN_EXECUTOR_PLAN_VERSION {
+        return Err(format!(
+            "unsupported plan_version '{}'; expected {}",
+            plan.plan_version, ADMIN_EXECUTOR_PLAN_VERSION
+        ));
+    }
+    if plan.kind.trim() != ADMIN_EXECUTOR_PLAN_KIND {
+        return Err(format!(
+            "invalid kind '{}'; expected {}",
+            plan.kind, ADMIN_EXECUTOR_PLAN_KIND
+        ));
+    }
+    if plan.execution.steps.is_empty() {
+        return Err("execution.steps must contain at least one step".to_string());
+    }
+    let mut seen_ids = HashSet::new();
+    for (index, step) in plan.execution.steps.iter().enumerate() {
+        let step_label = format!("execution.steps[{index}]");
+        let step_id = step.id.trim();
+        if step_id.is_empty() {
+            return Err(format!("{step_label}.id must be non-empty"));
+        }
+        if !seen_ids.insert(step_id.to_string()) {
+            return Err(format!("duplicate step id '{}'", step.id));
+        }
+        let action = step.action.trim();
+        if action.is_empty() {
+            return Err(format!("{step_label}.action must be non-empty"));
+        }
+        let spec = resolve_internal_action_spec(action)
+            .map_err(|detail| format!("{step_label}.action {detail}: '{action}'"))?;
+        let function_schema = build_admin_executor_function_definition(spec).parameters_json_schema;
+        validate_value_against_schema(&step.args, &function_schema, &format!("{step_label}.args"))?;
+        validate_executor_fill(step, &function_schema, &step_label)?;
+    }
+    Ok(())
+}
+
+fn validate_executor_fill(
+    step: &AdminExecutorPlanStep,
+    action_schema: &serde_json::Value,
+    step_label: &str,
+) -> Result<(), String> {
+    let Some(fill) = step.executor_fill.as_ref() else {
+        return Ok(());
+    };
+    let properties = action_schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| format!("{step_label}.args schema is missing properties"))?;
+    let mut seen = HashSet::new();
+    for field in &fill.allowed {
+        let name = field.trim();
+        if name.is_empty() {
+            return Err(format!(
+                "{step_label}.executor_fill.allowed contains empty field"
+            ));
+        }
+        if !seen.insert(name.to_string()) {
+            return Err(format!(
+                "{step_label}.executor_fill.allowed contains duplicate field '{}'",
+                field
+            ));
+        }
+        if !properties.contains_key(name) {
+            return Err(format!(
+                "{step_label}.executor_fill.allowed references unknown field '{}'",
+                field
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_value_against_schema(
+    value: &serde_json::Value,
+    schema: &serde_json::Value,
+    path: &str,
+) -> Result<(), String> {
+    let schema_obj = schema
+        .as_object()
+        .ok_or_else(|| format!("{path}: schema must be an object"))?;
+    let schema_type = schema_obj
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{path}: schema.type is required"))?;
+    match schema_type {
+        "object" => validate_object_against_schema(value, schema_obj, path),
+        "array" => validate_array_against_schema(value, schema_obj, path),
+        "string" | "boolean" | "integer" | "number" | "null" => {
+            validate_scalar_against_schema(value, schema_obj, path)
+        }
+        other => Err(format!("{path}: unsupported schema type '{other}'")),
+    }
+}
+
+fn validate_object_against_schema(
+    value: &serde_json::Value,
+    schema_obj: &serde_json::Map<String, serde_json::Value>,
+    path: &str,
+) -> Result<(), String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| format!("{path}: expected object"))?;
+    let properties = schema_obj
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let required = schema_obj
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for field in required {
+        let field_name = field
+            .as_str()
+            .ok_or_else(|| format!("{path}: required entries must be strings"))?;
+        if !obj.contains_key(field_name) {
+            return Err(format!("{path}: missing required field '{field_name}'"));
+        }
+    }
+    let additional_properties = schema_obj
+        .get("additionalProperties")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    if !additional_properties {
+        for key in obj.keys() {
+            if !properties.contains_key(key) {
+                return Err(format!("{path}: unexpected field '{key}'"));
+            }
+        }
+    }
+    for (key, field_value) in obj {
+        if let Some(field_schema) = properties.get(key) {
+            validate_value_against_schema(field_value, field_schema, &format!("{path}.{key}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_array_against_schema(
+    value: &serde_json::Value,
+    schema_obj: &serde_json::Map<String, serde_json::Value>,
+    path: &str,
+) -> Result<(), String> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| format!("{path}: expected array"))?;
+    let Some(item_schema) = schema_obj.get("items") else {
+        return Ok(());
+    };
+    for (index, item) in items.iter().enumerate() {
+        validate_value_against_schema(item, item_schema, &format!("{path}[{index}]"))?;
+    }
+    Ok(())
+}
+
+fn validate_scalar_against_schema(
+    value: &serde_json::Value,
+    schema_obj: &serde_json::Map<String, serde_json::Value>,
+    path: &str,
+) -> Result<(), String> {
+    let field_type = schema_obj
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{path}: schema.type is required"))?;
+    let type_matches = match field_type {
+        "string" => value.is_string(),
+        "boolean" => value.is_boolean(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        "null" => value.is_null(),
+        other => return Err(format!("{path}: unsupported scalar type '{other}'")),
+    };
+    if !type_matches {
+        return Err(format!("{path}: expected {field_type}"));
+    }
+    if let Some(enum_values) = schema_obj.get("enum").and_then(serde_json::Value::as_array) {
+        if !enum_values.iter().any(|candidate| candidate == value) {
+            return Err(format!("{path}: value is outside enum"));
+        }
+    }
+    Ok(())
+}
+
+fn merge_executor_step_arguments(
+    step: &AdminExecutorPlanStep,
+    call_args: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let plan_args = step
+        .args
+        .as_object()
+        .ok_or_else(|| format!("step '{}' args must be an object", step.id))?;
+    let call_args = call_args
+        .as_object()
+        .ok_or_else(|| format!("step '{}' tool arguments must be an object", step.id))?;
+    let mut merged = serde_json::Map::new();
+    let allowed_fill: HashSet<&str> = step
+        .executor_fill
+        .as_ref()
+        .map(|fill| fill.allowed.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    for (key, value) in plan_args {
+        if let Some(call_value) = call_args.get(key) {
+            if call_value != value {
+                return Err(format!(
+                    "step '{}' attempted to change declared arg '{}'",
+                    step.id, key
+                ));
+            }
+        }
+        merged.insert(key.clone(), value.clone());
+    }
+    for (key, value) in call_args {
+        if plan_args.contains_key(key) {
+            continue;
+        }
+        if !allowed_fill.contains(key.as_str()) {
+            return Err(format!(
+                "step '{}' supplied undeclared arg '{}' not allowed by executor_fill",
+                step.id, key
+            ));
+        }
+        merged.insert(key.clone(), value.clone());
+    }
+    Ok(serde_json::Value::Object(merged))
+}
+
+fn executor_dispatch_target_and_params(
+    spec: &InternalActionSpec,
+    arguments: &serde_json::Value,
+) -> Result<(Option<String>, serde_json::Value), String> {
+    let mut params = arguments
+        .as_object()
+        .cloned()
+        .ok_or_else(|| format!("action '{}' expects object arguments", spec.action))?;
+    let target = if spec.requires_target {
+        params
+            .remove("hive")
+            .and_then(|value| value.as_str().map(str::to_string))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    } else {
+        None
+    };
+    Ok((target, serde_json::Value::Object(params)))
+}
+
 fn config_changed_version_channel(subsystem: &str) -> &'static str {
     match subsystem {
         // routes + vpn share version stream because SY.config.routes keeps one config version.
@@ -1032,6 +1376,366 @@ async fn run_system_command_loop(
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
+}
+
+struct AdminExecutorStepTool {
+    ctx: AdminContext,
+    client: Arc<AdminRouterClient>,
+    step: AdminExecutorPlanStep,
+    definition: FunctionToolDefinition,
+}
+
+#[async_trait]
+impl FunctionTool for AdminExecutorStepTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        self.definition.clone()
+    }
+
+    async fn call(
+        &self,
+        arguments: serde_json::Value,
+    ) -> fluxbee_ai_sdk::Result<serde_json::Value> {
+        validate_value_against_schema(
+            &arguments,
+            &self.definition.parameters_json_schema,
+            &format!("step '{}'", self.step.id),
+        )
+        .map_err(fluxbee_ai_sdk::AiSdkError::Protocol)?;
+        let merged_args = merge_executor_step_arguments(&self.step, &arguments)
+            .map_err(fluxbee_ai_sdk::AiSdkError::Protocol)?;
+        let spec = resolve_internal_action_spec(&self.step.action)
+            .map_err(|detail| fluxbee_ai_sdk::AiSdkError::Protocol(detail.to_string()))?;
+        let (target, params) = executor_dispatch_target_and_params(spec, &merged_args)
+            .map_err(fluxbee_ai_sdk::AiSdkError::Protocol)?;
+        let internal = dispatch_internal_admin_command(
+            &self.ctx,
+            &self.client,
+            &self.step.action,
+            target.as_deref(),
+            params,
+        )
+        .await
+        .map_err(|err| fluxbee_ai_sdk::AiSdkError::Protocol(err.to_string()))?;
+        Ok(internal.envelope)
+    }
+}
+
+struct AdminExecutorHelpTool {
+    ctx: AdminContext,
+    client: Arc<AdminRouterClient>,
+    step: AdminExecutorPlanStep,
+    definition: FunctionToolDefinition,
+}
+
+#[async_trait]
+impl FunctionTool for AdminExecutorHelpTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        self.definition.clone()
+    }
+
+    async fn call(
+        &self,
+        arguments: serde_json::Value,
+    ) -> fluxbee_ai_sdk::Result<serde_json::Value> {
+        validate_value_against_schema(
+            &arguments,
+            &self.definition.parameters_json_schema,
+            &format!("help for step '{}'", self.step.id),
+        )
+        .map_err(fluxbee_ai_sdk::AiSdkError::Protocol)?;
+        let requested_action = arguments
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(
+                    "get_admin_action_help requires non-empty action".to_string(),
+                )
+            })?;
+        if requested_action != self.step.action {
+            return Err(fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                "help lookup for step '{}' may only target '{}'",
+                self.step.id, self.step.action
+            )));
+        }
+        let internal = dispatch_internal_admin_command(
+            &self.ctx,
+            &self.client,
+            "get_admin_action_help",
+            None,
+            serde_json::json!({ "action": requested_action }),
+        )
+        .await
+        .map_err(|err| fluxbee_ai_sdk::AiSdkError::Protocol(err.to_string()))?;
+        Ok(internal.envelope)
+    }
+}
+
+fn admin_executor_prompt(step: &AdminExecutorPlanStep, plan: &AdminExecutorPlan) -> String {
+    format!(
+        "You are the Fluxbee executor specialist running inside SY.admin.\n\
+Execute exactly one declared step from the provided executor plan.\n\
+Rules:\n\
+- Call the exact function named by step.action.\n\
+- Do not rename actions.\n\
+- Do not add steps.\n\
+- Do not change declared values from step.args.\n\
+- You may only provide extra fields if they are explicitly allowed by step.executor_fill.allowed.\n\
+- If help lookup is available and the contract is unclear, call get_admin_action_help for this step action only.\n\
+- If the step remains ambiguous or incomplete, stop without inventing values.\n\
+- Keep the execution deterministic.\n\
+Current step JSON:\n{}\n\
+Plan metadata:\n{}",
+        serde_json::to_string_pretty(step).unwrap_or_else(|_| "{}".to_string()),
+        serde_json::to_string_pretty(&plan.metadata).unwrap_or_else(|_| "{}".to_string())
+    )
+}
+
+fn build_executor_step_events_from_result(
+    execution_id: &str,
+    step_index: usize,
+    step: &AdminExecutorPlanStep,
+    result: &fluxbee_ai_sdk::function_calling::FunctionLoopRunResult,
+) -> (Vec<AdminExecutorStepEvent>, bool, Option<String>) {
+    let mut events = vec![
+        AdminExecutorStepEvent {
+            execution_id: execution_id.to_string(),
+            step_id: step.id.clone(),
+            step_index,
+            step_action: step.action.clone(),
+            status: "queued".to_string(),
+            timestamp: now_epoch_ms(),
+            summary: format!("Step {} queued", step.id),
+            tool_name: None,
+            tool_args_preview: None,
+            result_preview: None,
+            error_message: None,
+        },
+        AdminExecutorStepEvent {
+            execution_id: execution_id.to_string(),
+            step_id: step.id.clone(),
+            step_index,
+            step_action: step.action.clone(),
+            status: "running".to_string(),
+            timestamp: now_epoch_ms(),
+            summary: format!("Running {}", step.action),
+            tool_name: None,
+            tool_args_preview: Some(step.args.clone()),
+            result_preview: None,
+            error_message: None,
+        },
+    ];
+    let mut action_called = false;
+    let mut failure = None;
+    for item in &result.items {
+        if let FunctionLoopItem::ToolResult {
+            result: tool_result,
+        } = item
+        {
+            let tool_name = tool_result.name.clone();
+            let status = if tool_name == "get_admin_action_help" {
+                "help_lookup"
+            } else if tool_result.is_error {
+                "failed"
+            } else {
+                "done"
+            };
+            if tool_name == step.action {
+                action_called = true;
+            }
+            let error_message = if tool_result.is_error {
+                let detail = tool_result
+                    .output
+                    .get("error_detail")
+                    .cloned()
+                    .unwrap_or_else(|| tool_result.output.clone());
+                Some(detail.to_string())
+            } else {
+                None
+            };
+            if tool_result.is_error && failure.is_none() {
+                failure = error_message.clone();
+            }
+            events.push(AdminExecutorStepEvent {
+                execution_id: execution_id.to_string(),
+                step_id: step.id.clone(),
+                step_index,
+                step_action: step.action.clone(),
+                status: status.to_string(),
+                timestamp: now_epoch_ms(),
+                summary: format!("{} -> {}", tool_name, status),
+                tool_name: Some(tool_name),
+                tool_args_preview: Some(tool_result.arguments.clone()),
+                result_preview: Some(tool_result.output.clone()),
+                error_message,
+            });
+        }
+    }
+    if !action_called && failure.is_none() {
+        failure = Some(format!(
+            "executor finished step '{}' without calling '{}'",
+            step.id, step.action
+        ));
+        events.push(AdminExecutorStepEvent {
+            execution_id: execution_id.to_string(),
+            step_id: step.id.clone(),
+            step_index,
+            step_action: step.action.clone(),
+            status: "failed".to_string(),
+            timestamp: now_epoch_ms(),
+            summary: format!("{} was never called", step.action),
+            tool_name: Some(step.action.clone()),
+            tool_args_preview: Some(step.args.clone()),
+            result_preview: None,
+            error_message: failure.clone(),
+        });
+    }
+    (events, action_called && failure.is_none(), failure)
+}
+
+async fn execute_admin_executor_plan(
+    ctx: &AdminContext,
+    client: &Arc<AdminRouterClient>,
+    request: &AdminExecutorRunRequest,
+) -> Result<serde_json::Value, AdminError> {
+    validate_executor_plan(&request.plan).map_err(|detail| -> AdminError { detail.into() })?;
+    let runtime = ctx
+        .executor_runtime
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| -> AdminError {
+            "SY.admin executor is not configured with a valid OpenAI key".into()
+        })?;
+    let mut all_events = Vec::<AdminExecutorStepEvent>::new();
+    let mut completed_steps = 0usize;
+    let mut failed_step_id = None::<String>;
+    let mut failed_step_action = None::<String>;
+
+    for (index, step) in request.plan.execution.steps.iter().enumerate() {
+        if request.executor_options.dry_run {
+            all_events.push(AdminExecutorStepEvent {
+                execution_id: request.execution_id.clone(),
+                step_id: step.id.clone(),
+                step_index: index,
+                step_action: step.action.clone(),
+                status: "done".to_string(),
+                timestamp: now_epoch_ms(),
+                summary: "Dry-run: validated only".to_string(),
+                tool_name: Some(step.action.clone()),
+                tool_args_preview: Some(step.args.clone()),
+                result_preview: None,
+                error_message: None,
+            });
+            completed_steps += 1;
+            continue;
+        }
+
+        let step_spec = resolve_internal_action_spec(&step.action)
+            .map_err(|detail| -> AdminError { format!("step '{}': {detail}", step.id).into() })?;
+        let mut tools = FunctionToolRegistry::new();
+        tools
+            .register(Arc::new(AdminExecutorStepTool {
+                ctx: ctx.clone(),
+                client: client.clone(),
+                step: step.clone(),
+                definition: build_admin_executor_function_definition(step_spec),
+            }))
+            .map_err(|err| -> AdminError {
+                format!("executor tool registration failed: {err}").into()
+            })?;
+        if request.plan.execution.allow_help_lookup {
+            let help_spec = resolve_internal_action_spec("get_admin_action_help")
+                .map_err(|detail| -> AdminError { detail.into() })?;
+            tools
+                .register(Arc::new(AdminExecutorHelpTool {
+                    ctx: ctx.clone(),
+                    client: client.clone(),
+                    step: step.clone(),
+                    definition: build_admin_executor_function_definition(help_spec),
+                }))
+                .map_err(|err| -> AdminError {
+                    format!("executor help tool registration failed: {err}").into()
+                })?;
+        }
+
+        let model = runtime.client.clone().function_model(
+            runtime.model.clone(),
+            Some(admin_executor_prompt(step, &request.plan)),
+            runtime.model_settings.clone(),
+        );
+        let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
+        let result = runner
+            .run_with_input(
+                &model,
+                &tools,
+                FunctionRunInput {
+                    current_user_message: format!(
+                        "Execute step '{}' ({}) using the provided plan and tool contract.",
+                        step.id, step.action
+                    ),
+                    current_user_parts: None,
+                    immediate_memory: None,
+                },
+            )
+            .await
+            .map_err(|err| -> AdminError { format!("executor model run failed: {err}").into() })?;
+
+        let (mut step_events, step_ok, failure) =
+            build_executor_step_events_from_result(&request.execution_id, index, step, &result);
+        all_events.append(&mut step_events);
+        if step_ok {
+            completed_steps += 1;
+            continue;
+        }
+        failed_step_id = Some(step.id.clone());
+        failed_step_action = Some(step.action.clone());
+        if request.plan.execution.stop_on_error {
+            all_events.push(AdminExecutorStepEvent {
+                execution_id: request.execution_id.clone(),
+                step_id: step.id.clone(),
+                step_index: index,
+                step_action: step.action.clone(),
+                status: "stopped".to_string(),
+                timestamp: now_epoch_ms(),
+                summary: "Execution stopped after failure".to_string(),
+                tool_name: Some(step.action.clone()),
+                tool_args_preview: Some(step.args.clone()),
+                result_preview: None,
+                error_message: failure,
+            });
+            break;
+        }
+    }
+
+    let status = if failed_step_id.is_some() {
+        "failed"
+    } else {
+        "done"
+    };
+    let summary = AdminExecutorRunSummary {
+        execution_id: request.execution_id.clone(),
+        status: status.to_string(),
+        total_steps: request.plan.execution.steps.len(),
+        completed_steps,
+        failed_step_id: failed_step_id.clone(),
+        failed_step_action: failed_step_action.clone(),
+        final_message: if let Some(step_id) = failed_step_id.as_deref() {
+            format!("Execution stopped at step '{step_id}'")
+        } else if request.executor_options.dry_run {
+            "Dry-run completed successfully".to_string()
+        } else {
+            "Execution completed successfully".to_string()
+        },
+    };
+
+    Ok(serde_json::json!({
+        "status": summary.status,
+        "execution_id": request.execution_id,
+        "events": all_events,
+        "summary": summary,
+    }))
 }
 
 async fn handle_system_command(
@@ -1653,11 +2357,89 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
 
 async fn dispatch_internal_admin_command(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &Arc<AdminRouterClient>,
     action: &str,
     target: Option<&str>,
     params: serde_json::Value,
 ) -> Result<InternalAdminDispatchResult, AdminError> {
+    match action {
+        "executor_validate_plan" => {
+            let plan = match parse_executor_plan(params) {
+                Ok(plan) => plan,
+                Err(detail) => return Ok(internal_invalid_request(action, &detail)),
+            };
+            return Ok(InternalAdminDispatchResult {
+                http_status: 200,
+                envelope: serde_json::json!({
+                    "status": "ok",
+                    "action": action,
+                    "payload": {
+                        "ok": true,
+                        "kind": plan.kind,
+                        "plan_version": plan.plan_version,
+                        "step_count": plan.execution.steps.len(),
+                    }
+                }),
+            });
+        }
+        "executor_execute_plan" => {
+            if target.is_some() {
+                return Ok(internal_invalid_request(
+                    action,
+                    "payload.target is not used for executor_execute_plan",
+                ));
+            }
+            let request = match serde_json::from_value::<AdminExecutorRunRequest>(params) {
+                Ok(request) => request,
+                Err(err) => {
+                    return Ok(internal_invalid_request(
+                        action,
+                        &format!("invalid executor request: {err}"),
+                    ))
+                }
+            };
+            let payload = match execute_admin_executor_plan(ctx, client, &request).await {
+                Ok(payload) => payload,
+                Err(err) => {
+                    return Ok(InternalAdminDispatchResult {
+                        http_status: 409,
+                        envelope: serde_json::json!({
+                            "status": "error",
+                            "action": action,
+                            "payload": serde_json::Value::Null,
+                            "error_code": "EXECUTOR_UNAVAILABLE",
+                            "error_detail": err.to_string(),
+                        }),
+                    })
+                }
+            };
+            return Ok(InternalAdminDispatchResult {
+                http_status: if payload.get("status").and_then(serde_json::Value::as_str)
+                    == Some("done")
+                {
+                    200
+                } else {
+                    409
+                },
+                envelope: serde_json::json!({
+                    "status": if payload.get("status").and_then(serde_json::Value::as_str) == Some("done") { "ok" } else { "error" },
+                    "action": action,
+                    "payload": payload,
+                    "error_code": if payload.get("status").and_then(serde_json::Value::as_str) == Some("done") { serde_json::Value::Null } else { serde_json::json!("EXECUTION_FAILED") },
+                    "error_detail": if payload.get("status").and_then(serde_json::Value::as_str) == Some("done") {
+                        serde_json::Value::Null
+                    } else {
+                        payload
+                            .get("summary")
+                            .and_then(|summary| summary.get("final_message"))
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!("execution failed"))
+                    }
+                }),
+            });
+        }
+        _ => {}
+    }
     let spec = match resolve_internal_action_spec(action) {
         Ok(route) => route,
         Err(detail) => return Ok(internal_invalid_request(action, detail)),
@@ -8042,5 +8824,106 @@ mod tests {
         .expect_err("invalid actions must fail");
 
         assert!(err.to_string().contains("invalid action"));
+    }
+
+    #[test]
+    fn executor_plan_validation_accepts_runtime_plan() {
+        let plan = parse_executor_plan(json!({
+            "plan_version": "0.1",
+            "kind": "executor_plan",
+            "metadata": {
+                "name": "pilot_route_setup",
+                "target_hive": "motherbee"
+            },
+            "execution": {
+                "strict": true,
+                "stop_on_error": true,
+                "allow_help_lookup": true,
+                "steps": [{
+                    "id": "s1",
+                    "action": "get_runtime",
+                    "args": {
+                        "hive": "motherbee",
+                        "runtime": "AI.chat"
+                    }
+                }]
+            }
+        }))
+        .expect("valid executor plan");
+
+        assert_eq!(plan.kind, "executor_plan");
+        assert_eq!(plan.execution.steps.len(), 1);
+        assert_eq!(plan.execution.steps[0].action, "get_runtime");
+    }
+
+    #[test]
+    fn executor_plan_validation_rejects_unknown_action() {
+        let err = parse_executor_plan(json!({
+            "plan_version": "0.1",
+            "kind": "executor_plan",
+            "metadata": {},
+            "execution": {
+                "strict": true,
+                "stop_on_error": true,
+                "allow_help_lookup": true,
+                "steps": [{
+                    "id": "s1",
+                    "action": "definitely_not_real",
+                    "args": {}
+                }]
+            }
+        }))
+        .expect_err("unknown action must fail");
+
+        assert!(err.contains("unknown action"));
+    }
+
+    #[test]
+    fn executor_plan_validation_rejects_schema_drift() {
+        let err = parse_executor_plan(json!({
+            "plan_version": "0.1",
+            "kind": "executor_plan",
+            "metadata": {},
+            "execution": {
+                "strict": true,
+                "stop_on_error": true,
+                "allow_help_lookup": true,
+                "steps": [{
+                    "id": "s1",
+                    "action": "get_runtime",
+                    "args": {
+                        "target": "motherbee",
+                        "runtime_name": "AI.chat"
+                    }
+                }]
+            }
+        }))
+        .expect_err("drifted arg names must fail");
+
+        assert!(err.contains("missing required field 'hive'"));
+    }
+
+    #[test]
+    fn executor_step_argument_merge_rejects_changes_to_declared_values() {
+        let step = AdminExecutorPlanStep {
+            id: "s1".to_string(),
+            action: "get_runtime".to_string(),
+            args: json!({
+                "hive": "motherbee",
+                "runtime": "AI.chat"
+            }),
+            executor_fill: None,
+        };
+
+        let err = merge_executor_step_arguments(
+            &step,
+            &json!({
+                "hive": "otherbee",
+                "runtime": "AI.chat"
+            }),
+        )
+        .expect_err("declared arg mutation must fail");
+
+        assert!(err.contains("attempted to change declared arg 'hive'"));
     }
 }

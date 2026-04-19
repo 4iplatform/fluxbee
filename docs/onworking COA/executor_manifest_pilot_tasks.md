@@ -23,7 +23,7 @@ This task list is only for the pilot execution layer, not for the full manifest/
 
 ## 2. Phase A — Plan Contract
 
-- [ ] `EXEC-PILOT-A1` Define the `executor_plan` JSON schema in code.
+- [x] `EXEC-PILOT-A1` Define the `executor_plan` JSON schema in code.
   - Validate:
     - `plan_version`
     - `kind=executor_plan`
@@ -34,14 +34,14 @@ This task list is only for the pilot execution layer, not for the full manifest/
     - `execution.steps[]`
   - Reject unknown top-level fields.
 
-- [ ] `EXEC-PILOT-A2` Validate `steps[].action` against the current admin action registry.
+- [x] `EXEC-PILOT-A2` Validate `steps[].action` against the current admin action registry.
   - Fail early if the plan references an unknown admin action.
 
-- [ ] `EXEC-PILOT-A3` Validate `steps[].args` shape against the executor-visible function schema for that action.
+- [x] `EXEC-PILOT-A3` Validate `steps[].args` shape against the executor-visible function schema for that action.
   - `args` must use real admin argument names.
   - No executor-only aliases such as `target` if the action contract uses `hive`.
 
-- [ ] `EXEC-PILOT-A4` Define and validate `executor_fill`.
+- [x] `EXEC-PILOT-A4` Define and validate `executor_fill`.
   - Explicit allowlist only.
   - No executor-side architectural choices.
 
@@ -54,18 +54,18 @@ Acceptance:
 
 ## 3. Phase B — `SY.admin` Executor Runtime
 
-- [ ] `EXEC-PILOT-B1` Add executor mode/runtime entrypoint inside `SY.admin`.
+- [x] `EXEC-PILOT-B1` Add executor mode/runtime entrypoint inside `SY.admin`.
   - Separate it clearly from normal HTTP admin handling.
   - Do not turn `SY.admin` into a chat host.
 
-- [ ] `EXEC-PILOT-B2` Define the internal execution request contract from `SY.architect` to `SY.admin`.
+- [x] `EXEC-PILOT-B2` Define the internal execution request contract from `SY.architect` to `SY.admin`.
   - Include:
     - execution/session id
     - plan payload
     - executor options
     - optional operator/context labels
 
-- [ ] `EXEC-PILOT-B3` Define the execution response/event contract from `SY.admin` back to `SY.architect`.
+- [x] `EXEC-PILOT-B3` Define the execution response/event contract from `SY.admin` back to `SY.architect`.
   - Include:
     - `queued`
     - `running`
@@ -74,7 +74,7 @@ Acceptance:
     - `failed`
     - `stopped`
 
-- [ ] `EXEC-PILOT-B4` Implement stop-on-error behavior in `SY.admin`.
+- [x] `EXEC-PILOT-B4` Implement stop-on-error behavior in `SY.admin`.
   - Any failing step stops the plan when `stop_on_error=true`.
   - Admin timeout/unavailable must stop execution clearly.
 
@@ -140,7 +140,7 @@ Acceptance:
     - optional timeout / token caps
   - Current shape also includes optional catalog mode/action allowlist.
 
-- [ ] `EXEC-PILOT-D4` Ensure `SY.admin` fails closed when executor mode is requested without a valid OpenAI key.
+- [x] `EXEC-PILOT-D4` Ensure `SY.admin` fails closed when executor mode is requested without a valid OpenAI key.
   - Clear error
   - No partial execution
 
@@ -155,25 +155,25 @@ Acceptance:
 
 ## 6. Phase E — `SY.architect` Host Integration
 
-- [ ] `EXEC-PILOT-E1` Add plan ingestion flow to `SY.architect`.
+- [x] `EXEC-PILOT-E1` Add plan ingestion flow to `SY.architect`.
   - Receive external `executor_plan`
   - validate schema
   - create execution session
 
-- [ ] `EXEC-PILOT-E2` Send the execution request to `SY.admin`.
+- [x] `EXEC-PILOT-E2` Send the execution request to `SY.admin`.
   - `SY.architect` should not own the executor function catalog.
 
-- [ ] `EXEC-PILOT-E3` Render step-by-step execution events in chat/history.
+- [x] `EXEC-PILOT-E3` Render step-by-step execution events in chat/history.
   - Visible progression per step
   - clear stop point on failure
 
-- [ ] `EXEC-PILOT-E4` Render final execution summary in the chat.
+- [x] `EXEC-PILOT-E4` Render final execution summary in the chat.
   - total steps
   - completed steps
   - failed step
   - key result/error
 
-- [ ] `EXEC-PILOT-E5` Keep this mode separate from normal SCMD and normal Archi chat.
+- [x] `EXEC-PILOT-E5` Keep this mode separate from normal SCMD and normal Archi chat.
 
 Acceptance:
 
@@ -184,14 +184,14 @@ Acceptance:
 
 ## 7. Phase F — Prompting
 
-- [ ] `EXEC-PILOT-F1` Add a narrow executor prompt inside `SY.admin`.
+- [x] `EXEC-PILOT-F1` Add a narrow executor prompt inside `SY.admin`.
   - Execute only declared steps
   - No renamed actions
   - No step reordering
   - No invented required values
   - Use help only as support
 
-- [ ] `EXEC-PILOT-F2` Encode the infrastructure-obvious refinement rule in the executor prompt.
+- [x] `EXEC-PILOT-F2` Encode the infrastructure-obvious refinement rule in the executor prompt.
   - Only fill values explicitly allowed by `executor_fill`.
 
 - [ ] `EXEC-PILOT-F3` Keep `SY.architect` prompt focused on host behavior.
