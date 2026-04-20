@@ -9078,7 +9078,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
       const delay = immediate ? 0 : (document.hidden ? sessionRefreshHiddenMs : sessionRefreshActiveMs);
       scheduleSessionRefresh(delay);
     }}
+    let submitInFlight = false;
     async function submit() {{
+      if (submitInFlight) return;
       const message = input.value.trim();
       if (!message && !pendingAttachments.length) return;
       if (!currentSessionId) {{
@@ -9120,6 +9122,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       renderAttachmentDraft();
       send.disabled = true;
       attach.disabled = true;
+      submitInFlight = true;
       try {{
         const attachments = await uploadPendingAttachments();
         const res = await fetch(chatUrl, {{
@@ -9142,6 +9145,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         hidePendingIndicator();
         addMessage("system", "Request failed: " + err);
       }} finally {{
+        submitInFlight = false;
         hidePendingIndicator();
         send.disabled = false;
         attach.disabled = false;
