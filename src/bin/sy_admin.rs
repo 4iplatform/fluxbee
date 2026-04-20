@@ -1120,10 +1120,25 @@ fn validate_value_against_schema(
     let schema_obj = schema
         .as_object()
         .ok_or_else(|| format!("{path}: schema must be an object"))?;
-    let schema_type = schema_obj
+    let type_entry = schema_obj
         .get("type")
-        .and_then(serde_json::Value::as_str)
         .ok_or_else(|| format!("{path}: schema.type is required"))?;
+    // type can be a string ("string") or an array (["string", "null"])
+    let (schema_type, nullable) = if let Some(s) = type_entry.as_str() {
+        (s, false)
+    } else if let Some(arr) = type_entry.as_array() {
+        let nullable = arr.iter().any(|v| v.as_str() == Some("null"));
+        let primary = arr
+            .iter()
+            .find_map(|v| v.as_str().filter(|s| *s != "null"))
+            .ok_or_else(|| format!("{path}: schema.type array has no non-null type"))?;
+        (primary, nullable)
+    } else {
+        return Err(format!("{path}: schema.type must be a string or array"));
+    };
+    if nullable && value.is_null() {
+        return Ok(());
+    }
     match schema_type {
         "object" => validate_object_against_schema(value, schema_obj, path),
         "array" => validate_array_against_schema(value, schema_obj, path),
