@@ -62,7 +62,9 @@ Por lo tanto:
 - pasar por el relay comun;
 - enviar al router por `fluxbee_sdk::NodeSender::send`;
 - adjuntar `meta.context.response_envelope` cuando el hop a frontdesk requiere respuesta estructurada;
-- consumir respuesta estructurada síncrona de frontdesk sobre payload `text` cuando el request necesita regularizacion por frontdesk.
+- consumir respuesta estructurada síncrona de frontdesk sobre payload `text` cuando el request necesita regularizacion por frontdesk;
+- adjuntar `meta.context.io.reply_target` cuando la integracion autenticada requiere callback final;
+- entregar callbacks finales por `webhook_post` cuando vuelve un mensaje terminal con `reply_target` preservado.
 
 ### 1.2 No-responsabilidades
 
@@ -226,7 +228,7 @@ Una instancia no debe pasar a `CONFIGURED` si falta alguno de estos grupos:
 Ademas:
 
 - si `auth.mode = api_key`, debe existir al menos una credencial activa valida;
-- si a futuro `outbound.mode = webhook`, debe existir configuracion valida de webhook.
+- si una integracion exige callback final (`final_reply_required=true`), debe existir configuracion valida de webhook para esa integracion.
 
 ### 5.3 Secrets
 
@@ -243,8 +245,8 @@ Reglas vigentes:
 Ejemplos de secretos de `IO.api`:
 
 - API keys inbound;
-- secretos HMAC futuros;
-- credenciales de webhook outbound futuras.
+- secretos HMAC de webhook outbound;
+- referencias locales de firma HMAC por integracion.
 
 ### 5.4 Ownership model de API keys en `IO.api`
 
@@ -257,6 +259,41 @@ Para `IO.api`, v1 cierra explicitamente este reparto de responsabilidades:
 - `CONFIG_GET` y `CONFIG_RESPONSE` nunca deben devolver el valor crudo.
 
 Lectura operativa:
+
+### 5.5 Modelo de configuracion de integraciones
+
+`IO.api` ya implementa el modelo:
+
+- `auth.api_keys[*]`
+- `integrations[*]`
+
+Reglas:
+
+- cada API key autentica al caller inbound;
+- cada API key resuelve exactamente un `integration_id`;
+- la integracion resuelta define la politica de callback final;
+- la configuracion de webhook outbound pertenece a la integracion, no al body del request.
+
+Campos minimos actuales:
+
+- `auth.api_keys[*].key_id`
+- `auth.api_keys[*].tenant_id`
+- `auth.api_keys[*].integration_id`
+- `auth.api_keys[*].token` o `token_ref`
+- `integrations[*].integration_id`
+- `integrations[*].tenant_id`
+- `integrations[*].final_reply_required`
+- `integrations[*].webhook.enabled`
+- `integrations[*].webhook.url`
+- `integrations[*].webhook.secret_ref`
+- `integrations[*].webhook.timeout_ms`
+- `integrations[*].webhook.max_retries`
+- `integrations[*].webhook.initial_backoff_ms`
+- `integrations[*].webhook.max_backoff_ms`
+
+Regla importante:
+
+- `IO.api` no acepta `webhook_url`, `webhook_secret` ni override equivalente dentro del request HTTP de ingreso.
 
 - `architect`, un operador humano o una futura herramienta admin pueden decidir que keys deben existir;
 - el nodo no genera API keys;
@@ -554,7 +591,7 @@ Este camino sirve para debug, validacion o integraciones muy especificas, pero n
 
 #### 8.3.4 Errores de transporte o integracion en el camino frontdesk
 
-Si existe handoff a frontdesk, tambien existen errores previos o laterales al `frontdesk_result`:
+Si existe handoff a frontdesk, tambien existen errores previos o laterales a la respuesta estructurada esperada:
 
 - timeout esperando la reply de frontdesk -> `504 Gateway Timeout` con `error_code = "frontdesk_timeout"`
 - reply recibida pero con payload no parseable como respuesta estructurada valida -> `502 Bad Gateway` con `error_code = "invalid_frontdesk_response"`
@@ -796,11 +833,28 @@ Regla de semántica:
 
 ---
 
-## 14. Outbound futuro
+## 14. Webhook outbound final
 
-El foco inicial es ingress.
+`IO.api` mantiene `POST /` asincronico con `202 Accepted`.
 
-Se deja previsto outbound por webhook como fase posterior, pero no es obligatorio para la primera entrega.
+El callback final se resuelve despues, cuando vuelve un mensaje terminal hacia `IO.api` con:
+
+- `meta.context.io.reply_target.kind = "webhook_post"`
+- `reply_target.address = integration_id`
+
+Propiedades actuales de v1:
+
+- contrato externo propio de webhook, no exposicion cruda del payload interno de Fluxbee;
+- HMAC `SHA256` por integracion;
+- exito solo ante `2xx`;
+- retries acotados en memoria por proceso;
+- sin durabilidad cross-restart;
+- attachments inline con `content_base64`;
+- si el payload terminal no puede materializarse, se degrada a `result.status = "error"`.
+
+Pendiente deliberado en v1:
+
+- falta cerrar una politica formal del limite global del body HTTP webhook ya materializado.
 
 ---
 
@@ -834,7 +888,9 @@ Para soportar multiples contratos simultaneos se recomienda levantar multiples i
 - attachments recibidos;
 - bytes ingresados;
 - errores de blob;
-- errores outbound futuros.
+- errores outbound webhook;
+- retries outbound webhook;
+- deliveries outbound agotados.
 
 Logs recomendados:
 
@@ -873,15 +929,18 @@ Sin incluir payload sensible completo ni secretos.
 21. Cada API key de `IO.api` es tenant-scoped y define el tenant efectivo del request.
 22. `tenant_hint` deja de ser parte del contrato HTTP de `IO.api`.
 23. `company_name` y `attributes` se tratan como metadata, no como tenancy.
+24. El callback final v1 usa `meta.context.io.reply_target` con `kind = "webhook_post"`.
+25. El webhook outbound se resuelve por integracion autenticada (`integration_id`), no por request.
+26. El contrato saliente del webhook es externo a Fluxbee y no reutiliza crudo el payload canónico interno.
+27. Los attachments outbound de v1 se entregan inline como `content_base64`.
+28. El delivery outbound v1 es best-effort en memoria con HMAC y retries acotados.
 
 ---
 
 ## 18. Fuera de alcance para esta version
 
-- detalle exhaustivo del contrato de webhook outbound;
 - `mapped_subject` completo;
 - HMAC y mTLS como auth obligatoria;
-- firma detallada de callbacks outbound;
 - policy/OPA especifica para `IO.api`;
 - persistencia historica de respuestas outbound;
 - discovery remoto dinamico de mappings externos de sujetos.
@@ -903,7 +962,7 @@ Sin incluir payload sensible completo ni secretos.
 - `multipart/form-data`
 - attachments -> `blob_ref`
 - relay comun de `io-common`
-- sin outbound aun
+- sin callback final
 
 ### Fase 2
 

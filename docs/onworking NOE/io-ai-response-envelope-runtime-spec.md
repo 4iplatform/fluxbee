@@ -5,6 +5,14 @@ Audiencia: desarrollo runtime AI, desarrollo de nodos IO, arquitectura
 Alcance inicial: `IO.api` + `SY.frontdesk.gov`  
 Dirección de diseño: usar capacidades ya existentes en OpenAI Agents SDK / Responses path antes que inventar un mecanismo propio distinto
 
+Nota de deprecacion:
+
+- `frontdesk_result` debe leerse en esta spec como contrato custom legacy que se buscó reemplazar;
+- no es salida vigente recomendada de `SY.frontdesk.gov`;
+- el estado objetivo y actual de este corte es:
+  - sin envelope: `text`
+  - con envelope: `text` estructurado
+
 Estado de implementación del primer corte:
 
 - runtime AI compartido con lectura de `meta.context.response_envelope` y `meta.context.final_response_contract`

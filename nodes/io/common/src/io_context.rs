@@ -238,6 +238,34 @@ pub struct SlackPostTarget {
     pub workspace_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebhookPostTarget {
+    pub integration_id: String,
+    pub tenant_id: String,
+    pub request_id: String,
+    pub trace_id: String,
+    pub reply_mode: String,
+}
+
+pub fn build_webhook_post_reply_target(
+    integration_id: &str,
+    tenant_id: &str,
+    request_id: &str,
+    trace_id: &str,
+) -> ReplyTarget {
+    ReplyTarget {
+        kind: "webhook_post".to_string(),
+        address: integration_id.to_string(),
+        params: serde_json::json!({
+            "integration_id": integration_id,
+            "tenant_id": tenant_id,
+            "request_id": request_id,
+            "trace_id": trace_id,
+            "reply_mode": "final_only"
+        }),
+    }
+}
+
 pub fn extract_slack_post_target(meta_context: &Value) -> Option<SlackPostTarget> {
     let rt = extract_reply_target(meta_context)?;
     if rt.kind != "slack_post" {
@@ -257,6 +285,51 @@ pub fn extract_slack_post_target(meta_context: &Value) -> Option<SlackPostTarget
         channel_id: rt.address,
         thread_ts,
         workspace_id,
+    })
+}
+
+pub fn extract_webhook_post_target(meta_context: &Value) -> Option<WebhookPostTarget> {
+    let rt = extract_reply_target(meta_context)?;
+    if rt.kind != "webhook_post" {
+        return None;
+    }
+    let integration_id = rt
+        .params
+        .get("integration_id")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())?
+        .to_string();
+    let tenant_id = rt
+        .params
+        .get("tenant_id")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())?
+        .to_string();
+    let request_id = rt
+        .params
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())?
+        .to_string();
+    let trace_id = rt
+        .params
+        .get("trace_id")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())?
+        .to_string();
+    let reply_mode = rt
+        .params
+        .get("reply_mode")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .unwrap_or("final_only")
+        .to_string();
+    Some(WebhookPostTarget {
+        integration_id,
+        tenant_id,
+        request_id,
+        trace_id,
+        reply_mode,
     })
 }
 
@@ -478,6 +551,48 @@ mod tests {
                 channel_id: "C789".to_string(),
                 thread_ts: None,
                 workspace_id: Some("T123".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn build_and_extract_webhook_post_target_roundtrip() {
+        let io = IoContext {
+            channel: "api".to_string(),
+            entrypoint: PartyRef {
+                kind: "io_api_instance".to_string(),
+                id: "127.0.0.1".to_string(),
+            },
+            sender: PartyRef {
+                kind: "api_subject".to_string(),
+                id: "crm:123".to_string(),
+            },
+            conversation: ConversationRef {
+                kind: "api_conversation".to_string(),
+                id: "conv-1".to_string(),
+                thread_id: Some("thread-1".to_string()),
+            },
+            message: MessageRef {
+                id: "msg-1".to_string(),
+                timestamp: None,
+            },
+            reply_target: build_webhook_post_reply_target(
+                "int_acme_portal",
+                "tnt:acme",
+                "req_123",
+                "trace-123",
+            ),
+        };
+        let meta = wrap_in_meta_context(&io);
+        let extracted = extract_webhook_post_target(&meta).expect("webhook target");
+        assert_eq!(
+            extracted,
+            WebhookPostTarget {
+                integration_id: "int_acme_portal".to_string(),
+                tenant_id: "tnt:acme".to_string(),
+                request_id: "req_123".to_string(),
+                trace_id: "trace-123".to_string(),
+                reply_mode: "final_only".to_string(),
             }
         );
     }

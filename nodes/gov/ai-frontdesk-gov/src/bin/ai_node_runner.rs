@@ -4066,11 +4066,7 @@ fn build_frontdesk_result_reply(
             &frontdesk_structured_response_payload(&payload),
         )?)?
     } else {
-        payload.to_value().map_err(|err| {
-            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
-                "frontdesk_result_serialize_failed: {err}"
-            ))
-        })?
+        build_text_response(payload.human_message.clone())?
     };
     Ok(build_reply_message_runtime_src(msg, value))
 }
@@ -4716,7 +4712,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn frontdesk_handoff_incomplete_returns_frontdesk_result() {
+    async fn frontdesk_handoff_incomplete_returns_text_payload_without_envelope() {
         let node = test_node();
         {
             let mut state = node.control_plane.write().await;
@@ -4743,24 +4739,11 @@ mod tests {
             .expect("response should exist");
         assert_eq!(
             response.payload.get("type").and_then(Value::as_str),
-            Some(FRONTDESK_RESULT_PAYLOAD_TYPE)
+            Some("text")
         );
         assert_eq!(
-            response.payload.get("status").and_then(Value::as_str),
-            Some("needs_input")
-        );
-        assert_eq!(
-            response.payload.get("result_code").and_then(Value::as_str),
-            Some("MISSING_REQUIRED_FIELDS")
-        );
-        assert_eq!(
-            response
-                .payload
-                .get("missing_fields")
-                .and_then(Value::as_array)
-                .and_then(|fields| fields.first())
-                .and_then(Value::as_str),
-            Some("email")
+            extract_text(&response.payload).as_deref(),
+            Some("Necesito tu email para continuar con el registro.")
         );
     }
 
@@ -4822,7 +4805,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gov_user_echo_returns_frontdesk_result_payload() {
+    async fn gov_user_echo_returns_text_payload_without_envelope() {
         let node = test_node();
         {
             let mut state = node.control_plane.write().await;
@@ -4844,15 +4827,9 @@ mod tests {
             .expect("response should exist");
         assert_eq!(
             response.payload.get("type").and_then(Value::as_str),
-            Some(FRONTDESK_RESULT_PAYLOAD_TYPE)
+            Some("text")
         );
-        assert_eq!(
-            response
-                .payload
-                .get("human_message")
-                .and_then(Value::as_str),
-            Some("Echo: hola")
-        );
+        assert_eq!(extract_text(&response.payload).as_deref(), Some("Echo: hola"));
     }
 
     #[tokio::test]

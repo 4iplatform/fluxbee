@@ -2,7 +2,9 @@ use axum::http::StatusCode;
 use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::{compute_thread_id, ThreadIdInput};
 use io_common::identity::ResolveOrCreateInput;
-use io_common::io_context::{ConversationRef, IoContext, MessageRef, PartyRef, ReplyTarget};
+use io_common::io_context::{
+    build_webhook_post_reply_target, ConversationRef, IoContext, MessageRef, PartyRef, ReplyTarget,
+};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -292,6 +294,7 @@ pub(crate) fn parse_json_message_request(
             format!("Unable to build text/v1 payload: {err}"),
         )
     })?;
+    let reply_target = build_reply_target(auth_match, &request_id, &request_id, effective);
 
     Ok(ParsedHttpMessage {
         request_id,
@@ -331,16 +334,7 @@ pub(crate) fn parse_json_message_request(
                 id: external_message_id,
                 timestamp,
             },
-            reply_target: ReplyTarget {
-                kind: "io_api_noop".to_string(),
-                address: effective
-                    .get("listen")
-                    .and_then(|listen| listen.get("address"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("api")
-                    .to_string(),
-                params: serde_json::json!({}),
-            },
+            reply_target,
         },
         payload: text_payload,
         relay_final: envelope
@@ -351,6 +345,32 @@ pub(crate) fn parse_json_message_request(
             .unwrap_or(false),
         explicit_subject_mode,
     })
+}
+
+fn build_reply_target(
+    auth_match: &AuthMatch,
+    request_id: &str,
+    trace_id: &str,
+    effective: &Value,
+) -> ReplyTarget {
+    if auth_match.webhook_enabled {
+        return build_webhook_post_reply_target(
+            &auth_match.integration_id,
+            &auth_match.tenant_id,
+            request_id,
+            trace_id,
+        );
+    }
+    ReplyTarget {
+        kind: "io_api_noop".to_string(),
+        address: effective
+            .get("listen")
+            .and_then(|listen| listen.get("address"))
+            .and_then(Value::as_str)
+            .unwrap_or("api")
+            .to_string(),
+        params: serde_json::json!({}),
+    }
 }
 
 fn extract_dst_node_override(

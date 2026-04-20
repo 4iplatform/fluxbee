@@ -1,5 +1,12 @@
 # IO.api + SY.frontdesk.gov - Deploy y E2E operativo
 
+> Nota de deprecacion:
+> las referencias operativas históricas a `frontdesk_result` en este runbook deben leerse como legacy.
+> Estado actual:
+> - sin envelope, `SY.frontdesk.gov` responde `text`
+> - con envelope, responde `text` estructurado
+> - `frontdesk_result` ya no es contrato de salida vigente para los hops IO
+
 **Fecha:** 2026-04-15  
 **Estado:** runbook operativo para Linux  
 **Objetivo:** dejar un camino unico para:

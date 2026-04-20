@@ -31,6 +31,12 @@ pub(crate) async fn authenticate_bearer(
         (entry.token == token).then(|| AuthMatch {
             key_id: entry.key_id.clone(),
             tenant_id: entry.tenant_id.clone(),
+            integration_id: entry.integration_id.clone(),
+            webhook_enabled: registry
+                .integrations
+                .get(&entry.integration_id)
+                .and_then(|integration| integration.webhook.as_ref())
+                .is_some(),
             caller_identity: entry.caller_identity.clone(),
         })
     })
@@ -118,6 +124,63 @@ pub(crate) fn load_runtime_api_registry(
     let mut registry = ApiAuthRegistry::default();
     let mut secret_record: Option<NodeSecretRecord> = None;
 
+    if let Some(integrations) = effective.get("integrations").and_then(Value::as_array) {
+        for entry in integrations {
+            let Some(entry_obj) = entry.as_object() else {
+                return Err(anyhow::anyhow!("config.integrations[] entries must be objects"));
+            };
+            let integration_id = entry_obj
+                .get("integration_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("config.integrations[].integration_id is required"))?;
+            let tenant_id = entry_obj
+                .get("tenant_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("config.integrations[].tenant_id is required"))?;
+            let final_reply_required = entry_obj
+                .get("final_reply_required")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "config.integrations[].final_reply_required is required"
+                ))?;
+            let webhook = entry_obj
+                .get("webhook")
+                .and_then(Value::as_object)
+                .and_then(|webhook| {
+                    if !webhook.get("enabled").and_then(Value::as_bool).unwrap_or(false) {
+                        return None;
+                    }
+                    Some(crate::WebhookRuntime {
+                        url: webhook.get("url")?.as_str()?.to_string(),
+                        secret_ref: webhook.get("secret_ref")?.as_str()?.to_string(),
+                        timeout_ms: webhook.get("timeout_ms").and_then(Value::as_u64).unwrap_or(5000),
+                        max_retries: webhook.get("max_retries").and_then(Value::as_u64).unwrap_or(5),
+                        initial_backoff_ms: webhook
+                            .get("initial_backoff_ms")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(1000),
+                        max_backoff_ms: webhook
+                            .get("max_backoff_ms")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(30000),
+                    })
+                });
+            registry.integrations.insert(
+                integration_id.to_string(),
+                crate::IntegrationRuntime {
+                    integration_id: integration_id.to_string(),
+                    tenant_id: tenant_id.to_string(),
+                    final_reply_required,
+                    webhook,
+                },
+            );
+        }
+    }
+
     for entry in api_keys {
         let Some(entry_obj) = entry.as_object() else {
             return Err(anyhow::anyhow!(
@@ -136,10 +199,17 @@ pub(crate) fn load_runtime_api_registry(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("config.auth.api_keys[].tenant_id is required"))?;
+        let integration_id = entry_obj
+            .get("integration_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("config.auth.api_keys[].integration_id is required"))?;
         let token = resolve_api_key_token(node_name, entry_obj, &mut secret_record, secret_root)?;
         registry.keys.push(ApiKeyRuntime {
             key_id: key_id.to_string(),
             tenant_id: tenant_id.to_string(),
+            integration_id: integration_id.to_string(),
             token,
             caller_identity: entry_obj.get("caller_identity").cloned(),
         });
@@ -189,6 +259,30 @@ fn resolve_api_key_token(
 
     Err(anyhow::anyhow!(
         "unsupported secret reference '{reference}' for config.auth.api_keys[].token_ref"
+    ))
+}
+
+pub(crate) fn resolve_secret_reference(
+    node_name: &str,
+    reference: &str,
+    secret_root: Option<&Path>,
+) -> Result<String> {
+    let reference = reference.trim();
+    if let Some(var) = reference.strip_prefix("env:") {
+        return env(var)
+            .ok_or_else(|| anyhow::anyhow!("unresolved env secret reference '{reference}'"));
+    }
+    if let Some(storage_key) = reference.strip_prefix("local_file:") {
+        let record = load_or_default_secret_record(node_name, secret_root)?;
+        return record
+            .secrets
+            .get(storage_key)
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .ok_or_else(|| anyhow::anyhow!("missing local secret '{storage_key}'"));
+    }
+    Err(anyhow::anyhow!(
+        "unsupported secret reference '{reference}'"
     ))
 }
 

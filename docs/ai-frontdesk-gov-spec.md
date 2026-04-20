@@ -2,6 +2,13 @@
 
 Estado: vigente
 
+> Nota de deprecacion:
+> `frontdesk_result` queda deprecado como contrato de salida de `SY.frontdesk.gov`.
+> Estado actual:
+> - sin envelope, frontdesk responde `payload.type = "text"`
+> - con `meta.context.response_envelope`, responde `payload.type = "text"` con JSON estructurado
+> Las menciones a `frontdesk_result` en documentos viejos o notas historicas deben leerse como legacy/superseded.
+
 ## 1. Rol
 
 `SY.frontdesk.gov` es el nodo especializado de identity/onboarding del sistema.
@@ -37,7 +44,7 @@ Regla operativa:
 - reutiliza estado por `src_ilk`;
 - completa o corrige los datos minimos del humano;
 - llama a `ilk_register` cuando el caso ya esta listo;
-- responde por defecto con `payload.type = "frontdesk_result"`;
+- responde por defecto con `payload.type = "text"`;
 - cuando recibe `meta.context.response_envelope`, puede responder con `payload.type = "text"` estructurado compatible con ese envelope.
 
 No debe:
@@ -143,7 +150,7 @@ Regla:
 - no abre conversacion innecesaria;
 - mergea con estado previo si corresponde;
 - si ya tiene el minimo completo, intenta registrar;
-- si sigue incompleto, responde `frontdesk_result` con `needs_input`.
+- si sigue incompleto, responde `text` con el mensaje humano correspondiente.
 
 ### 6.2 Conversacional
 
@@ -154,7 +161,7 @@ Regla:
 - puede recolectar datos faltantes;
 - puede pedir confirmacion;
 - ante confirmacion positiva llama `ilk_register`;
-- debe responder con `frontdesk_result`, no con `text/v1`.
+- responde con `text`.
 
 ## 7. Tool de completacion
 
@@ -177,47 +184,26 @@ Regla:
 - en handoff estructurado, si `tenant_id` viene, se usa ese tenant para `ILK_REGISTER`;
 - en conversacional, la resolucion de tenant sigue la logica vigente del nodo.
 
-## 8. Output canonico
+## 8. Output por defecto
 
 Salida por defecto cuando no hay envelope:
 
 - `meta.type = "user"`
-- `payload.type = "frontdesk_result"`
+- `payload.type = "text"`
 
-Shape canonico:
+Shape canónico mínimo:
 
 ```json
 {
-  "type": "frontdesk_result",
-  "schema_version": 1,
-  "status": "needs_input",
-  "result_code": "MISSING_REQUIRED_FIELDS",
-  "human_message": "Necesito tu email para continuar.",
-  "missing_fields": ["email"],
-  "error_code": null,
-  "error_detail": null,
-  "ilk_id": "ilk:...",
-  "tenant_id": "tnt:...",
-  "registration_status": "temporary"
+  "type": "text",
+  "content": "Necesito tu email para continuar."
 }
 ```
 
-Campos obligatorios:
+Regla:
 
-- `type`
-- `schema_version`
-- `status`
-- `result_code`
-- `human_message`
-- `missing_fields`
-- `error_code`
-- `error_detail`
-
-Campos obligatorios cuando se conocen:
-
-- `ilk_id`
-- `tenant_id`
-- `registration_status`
+- sin envelope, frontdesk no debe exponer un payload estructurado custom como contrato obligatorio del consumidor;
+- el mensaje humano debe salir como texto normal.
 
 ## 8.1 Output estructurado opt-in por envelope
 
@@ -249,7 +235,7 @@ o, si hubo bloqueo/error funcional:
 Reglas:
 
 - el envelope es opt-in y hop-by-hop;
-- si no existe envelope, frontdesk mantiene `frontdesk_result` como salida por defecto;
+- si no existe envelope, frontdesk responde `text` normal;
 - `error_code` es opcional por ausencia;
 - `error_code` no debe emitirse como `null` en v1;
 - en este corte, frontdesk solo declara soporte explícito para:
@@ -288,15 +274,14 @@ Estados cerrados:
 
 Deben:
 
-- entender `frontdesk_result`;
-- extraer `human_message`;
+- tratar la salida default de frontdesk como texto normal;
 - no asumir una única forma de salida si el hop usa envelope.
 
 ### 10.2 Consumidores no conversacionales
 
 Deben:
 
-- si no usan envelope, consumir el bloque `frontdesk_result` completo;
+- si no usan envelope, consumir texto normal;
 - si usan envelope, consumir la respuesta estructurada definida por ese hop.
 
 ## 11. Lifecycle operativo actual

@@ -6,6 +6,7 @@ mod config;
 mod http;
 mod schema;
 mod subject;
+mod webhook;
 
 use anyhow::Result;
 use axum::body::to_bytes;
@@ -82,6 +83,7 @@ use schema::{
     extract_max_request_bytes, extract_subject_mode, lifecycle_status,
 };
 use subject::{api_relay_key, parse_json_message_request, ExplicitSubjectMode};
+use webhook::maybe_deliver_webhook_outbound;
 
 #[derive(Clone)]
 struct Config {
@@ -125,14 +127,34 @@ impl Default for ApiRelayConfig {
 #[derive(Debug, Clone, Default)]
 struct ApiAuthRegistry {
     keys: Vec<ApiKeyRuntime>,
+    integrations: HashMap<String, IntegrationRuntime>,
 }
 
 #[derive(Debug, Clone)]
 struct ApiKeyRuntime {
     key_id: String,
     tenant_id: String,
+    integration_id: String,
     token: String,
     caller_identity: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct IntegrationRuntime {
+    integration_id: String,
+    tenant_id: String,
+    final_reply_required: bool,
+    webhook: Option<WebhookRuntime>,
+}
+
+#[derive(Debug, Clone)]
+struct WebhookRuntime {
+    url: String,
+    secret_ref: String,
+    timeout_ms: u64,
+    max_retries: u64,
+    initial_backoff_ms: u64,
+    max_backoff_ms: u64,
 }
 
 #[derive(Clone)]
@@ -142,6 +164,7 @@ struct HttpState {
     control_plane: Arc<RwLock<IoControlPlaneState>>,
     adapter_contract: Arc<dyn IoAdapterConfigContract>,
     auth_registry: Arc<RwLock<ApiAuthRegistry>>,
+    webhook_http: reqwest::Client,
     sender: fluxbee_sdk::NodeSender,
     identity: Arc<dyn IdentityResolver>,
     provisioner: Arc<dyn IdentityProvisioner>,
@@ -165,6 +188,8 @@ struct RuntimeUpdateHandles {
 struct AuthMatch {
     key_id: String,
     tenant_id: String,
+    integration_id: String,
+    webhook_enabled: bool,
     caller_identity: Option<Value>,
 }
 
@@ -351,6 +376,7 @@ async fn main() -> Result<()> {
         control_plane: control_plane.clone(),
         adapter_contract: adapter_contract.clone(),
         auth_registry: auth_registry.clone(),
+        webhook_http: reqwest::Client::new(),
         sender: sender.clone(),
         identity: identity.clone(),
         provisioner: provisioner.clone(),
@@ -395,7 +421,8 @@ async fn main() -> Result<()> {
         adapter_contract,
         auth_registry,
         pending_router_replies,
-        http_state_ref_for_runtime_updates(config.node_name.clone(), http_state),
+        http_state_ref_for_runtime_updates(config.node_name.clone(), http_state.clone()),
+        http_state.clone(),
     ));
 
     if let Some(http_task) = http_task {
@@ -463,6 +490,7 @@ async fn run_router_control_loop(
     auth_registry: Arc<RwLock<ApiAuthRegistry>>,
     pending_router_replies: Arc<Mutex<HashMap<String, oneshot::Sender<WireMessage>>>>,
     runtime_updates: RuntimeUpdateHandles,
+    http_state: Arc<HttpState>,
 ) -> Result<()> {
     loop {
         let maybe_msg = inbox
@@ -495,7 +523,11 @@ async fn run_router_control_loop(
             continue;
         }
 
-        if deliver_pending_router_reply(&pending_router_replies, msg).await {
+        if deliver_pending_router_reply(&pending_router_replies, msg.clone()).await {
+            continue;
+        }
+
+        if maybe_deliver_webhook_outbound(&http_state, &msg).await {
             continue;
         }
     }
@@ -665,6 +697,8 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
         path = %request_path,
         key_id = %auth_match.key_id,
         tenant_id = %auth_match.tenant_id,
+        integration_id = %auth_match.integration_id,
+        webhook_enabled = auth_match.webhook_enabled,
         content_type = %content_type,
         "io-api request authenticated"
     );
@@ -715,6 +749,8 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
             node_name = %state.node_name,
             path = %request_path,
             key_id = %auth_match.key_id,
+            integration_id = %auth_match.integration_id,
+            webhook_enabled = auth_match.webhook_enabled,
             attachment_count = attachments.len(),
             "io-api multipart payload accepted"
         );
@@ -889,6 +925,8 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
         path = %request_path,
         key_id = %auth_match.key_id,
         tenant_id = %auth_match.tenant_id,
+        integration_id = %auth_match.integration_id,
+        webhook_enabled = auth_match.webhook_enabled,
         subject_mode = extract_subject_mode(Some(effective)).unwrap_or_else(|| "unknown".to_string()),
         relay_final = parsed.relay_final,
         "io-api json payload accepted"
@@ -2045,6 +2083,16 @@ mod tests {
         root
     }
 
+    fn sample_auth_match() -> AuthMatch {
+        AuthMatch {
+            key_id: "partner1".to_string(),
+            tenant_id: "tnt:partner1".to_string(),
+            integration_id: "int_partner1".to_string(),
+            webhook_enabled: true,
+            caller_identity: None,
+        }
+    }
+
     #[test]
     fn materialize_inline_api_key_moves_secret_to_local_file_ref() {
         let root = temp_root("materialize");
@@ -2053,6 +2101,7 @@ mod tests {
                 "api_keys": [
                     {
                         "key_id": "partner-1",
+                        "integration_id": "int_partner_1",
                         "token": "secret-1"
                     }
                 ]
@@ -2104,13 +2153,26 @@ mod tests {
                     {
                         "key_id": "partner 1",
                         "tenant_id": "tnt:partner1",
+                        "integration_id": "int_partner1",
                         "token_ref": "local_file:io_api_key__partner_1",
                         "caller_identity": {
                             "external_user_id": "caller-1"
                         }
                     }
                 ]
-            }
+            },
+            "integrations": [
+                {
+                    "integration_id": "int_partner1",
+                    "tenant_id": "tnt:partner1",
+                    "final_reply_required": true,
+                    "webhook": {
+                        "enabled": true,
+                        "url": "https://example.com/webhook",
+                        "secret_ref": "local_file:io_api_webhook__partner1"
+                    }
+                }
+            ]
         });
 
         let registry =
@@ -2120,7 +2182,15 @@ mod tests {
         assert_eq!(registry.keys.len(), 1);
         assert_eq!(registry.keys[0].key_id, "partner 1");
         assert_eq!(registry.keys[0].tenant_id, "tnt:partner1");
+        assert_eq!(registry.keys[0].integration_id, "int_partner1");
         assert_eq!(registry.keys[0].token, "secret-2");
+        assert_eq!(
+            registry
+                .integrations
+                .get("int_partner1")
+                .map(|integration| integration.final_reply_required),
+            Some(true)
+        );
         assert_eq!(
             registry.keys[0]
                 .caller_identity
@@ -2145,6 +2215,7 @@ mod tests {
                     {
                         "key_id": "partner1",
                         "tenant_id": "tnt:partner1",
+                        "integration_id": "int_partner1",
                         "token_ref": "local_file:io_api_key__partner1",
                         "caller_identity": {
                             "external_user_id": "caller-1",
@@ -2157,6 +2228,22 @@ mod tests {
                 "subject_mode": subject_mode,
                 "accepted_content_types": ["application/json"]
             },
+            "integrations": [
+                {
+                    "integration_id": "int_partner1",
+                    "tenant_id": "tnt:partner1",
+                    "final_reply_required": true,
+                    "webhook": {
+                        "enabled": true,
+                        "url": "https://example.com/webhook",
+                        "secret_ref": "local_file:io_api_webhook__partner1",
+                        "timeout_ms": 5000,
+                        "max_retries": 5,
+                        "initial_backoff_ms": 1000,
+                        "max_backoff_ms": 30000
+                    }
+                }
+            ],
             "io": {
                 "dst_node": "resolve"
             }
@@ -2182,11 +2269,28 @@ mod tests {
             keys: vec![ApiKeyRuntime {
                 key_id: "partner1".to_string(),
                 tenant_id: "tnt:partner1".to_string(),
+                integration_id: "int_partner1".to_string(),
                 token: "secret-token".to_string(),
                 caller_identity: Some(serde_json::json!({
                     "external_user_id": "caller-1"
                 })),
             }],
+            integrations: HashMap::from([(
+                "int_partner1".to_string(),
+                IntegrationRuntime {
+                    integration_id: "int_partner1".to_string(),
+                    tenant_id: "tnt:partner1".to_string(),
+                    final_reply_required: true,
+                    webhook: Some(WebhookRuntime {
+                        url: "https://example.com/webhook".to_string(),
+                        secret_ref: "local_file:io_api_webhook__partner1".to_string(),
+                        timeout_ms: 5000,
+                        max_retries: 5,
+                        initial_backoff_ms: 1000,
+                        max_backoff_ms: 30000,
+                    }),
+                },
+            )]),
         }));
 
         let auth = authenticate_bearer(&registry, "secret-token")
@@ -2194,6 +2298,8 @@ mod tests {
             .expect("auth match");
         assert_eq!(auth.key_id, "partner1");
         assert_eq!(auth.tenant_id, "tnt:partner1");
+        assert_eq!(auth.integration_id, "int_partner1");
+        assert!(auth.webhook_enabled);
         assert_eq!(
             auth.caller_identity
                 .as_ref()
@@ -2285,11 +2391,7 @@ mod tests {
     #[test]
     fn parse_json_message_request_accepts_explicit_subject() {
         let effective = configured_effective("explicit_subject");
-        let auth_match = AuthMatch {
-            key_id: "partner1".to_string(),
-            tenant_id: "tnt:partner1".to_string(),
-            caller_identity: None,
-        };
+        let auth_match = sample_auth_match();
         let envelope = serde_json::json!({
             "subject": {
                 "external_user_id": "crm:123",
@@ -2368,16 +2470,37 @@ mod tests {
             parsed.explicit_subject_mode,
             Some(ExplicitSubjectMode::ByData)
         );
+        assert_eq!(parsed.io_context.reply_target.kind, "webhook_post");
+        assert_eq!(parsed.io_context.reply_target.address, "int_partner1");
+    }
+
+    #[test]
+    fn parse_json_message_request_uses_noop_reply_target_when_webhook_disabled() {
+        let effective = configured_effective("explicit_subject");
+        let auth_match = AuthMatch {
+            webhook_enabled: false,
+            ..sample_auth_match()
+        };
+        let envelope = serde_json::json!({
+            "subject": {
+                "external_user_id": "crm:123",
+                "display_name": "Juan Perez",
+                "email": "juan@example.com"
+            },
+            "message": {
+                "text": "hola"
+            }
+        });
+
+        let parsed =
+            parse_json_message_request(&envelope, &effective, &auth_match, false).expect("parsed");
+        assert_eq!(parsed.io_context.reply_target.kind, "io_api_noop");
     }
 
     #[test]
     fn build_frontdesk_handoff_request_uses_subject_data_and_tenant() {
         let effective = configured_effective("explicit_subject");
-        let auth_match = AuthMatch {
-            key_id: "partner1".to_string(),
-            tenant_id: "tnt:partner1".to_string(),
-            caller_identity: None,
-        };
+        let auth_match = sample_auth_match();
         let envelope = serde_json::json!({
             "subject": {
                 "external_user_id": "crm:123",
@@ -2446,11 +2569,7 @@ mod tests {
     #[test]
     fn build_frontdesk_handoff_request_rejects_non_by_data() {
         let effective = configured_effective("explicit_subject");
-        let auth_match = AuthMatch {
-            key_id: "partner1".to_string(),
-            tenant_id: "tnt:partner1".to_string(),
-            caller_identity: None,
-        };
+        let auth_match = sample_auth_match();
         let envelope = serde_json::json!({
             "subject": {
                 "ilk": "ilk:123"
@@ -2523,11 +2642,7 @@ mod tests {
     #[test]
     fn build_frontdesk_request_context_attaches_response_envelope() {
         let effective = configured_effective("explicit_subject");
-        let auth_match = AuthMatch {
-            key_id: "partner1".to_string(),
-            tenant_id: "tnt:partner1".to_string(),
-            caller_identity: None,
-        };
+        let auth_match = sample_auth_match();
         let envelope = serde_json::json!({
             "subject": {
                 "external_user_id": "crm:123",
@@ -2605,11 +2720,7 @@ mod tests {
     #[test]
     fn requires_frontdesk_intermediate_for_by_data_when_subject_is_temporary() {
         let effective = configured_effective("explicit_subject");
-        let auth_match = AuthMatch {
-            key_id: "partner1".to_string(),
-            tenant_id: "tnt:partner1".to_string(),
-            caller_identity: None,
-        };
+        let auth_match = sample_auth_match();
         let envelope = serde_json::json!({
             "subject": {
                 "external_user_id": "crm:123",
@@ -2635,11 +2746,7 @@ mod tests {
     #[test]
     fn requires_frontdesk_intermediate_skips_complete_subjects() {
         let effective = configured_effective("explicit_subject");
-        let auth_match = AuthMatch {
-            key_id: "partner1".to_string(),
-            tenant_id: "tnt:partner1".to_string(),
-            caller_identity: None,
-        };
+        let auth_match = sample_auth_match();
         let envelope = serde_json::json!({
             "subject": {
                 "external_user_id": "crm:123",
@@ -2665,11 +2772,7 @@ mod tests {
     #[test]
     fn parse_json_message_request_rejects_invalid_routing_dst_node() {
         let effective = configured_effective("explicit_subject");
-        let auth_match = AuthMatch {
-            key_id: "partner1".to_string(),
-            tenant_id: "tnt:partner1".to_string(),
-            caller_identity: None,
-        };
+        let auth_match = sample_auth_match();
         let envelope = serde_json::json!({
             "subject": {
                 "external_user_id": "crm:123",
@@ -2695,11 +2798,7 @@ mod tests {
     #[test]
     fn parse_json_message_request_accepts_explicit_subject_by_ilk() {
         let effective = configured_effective("explicit_subject");
-        let auth_match = AuthMatch {
-            key_id: "partner1".to_string(),
-            tenant_id: "tnt:partner1".to_string(),
-            caller_identity: None,
-        };
+        let auth_match = sample_auth_match();
         let envelope = serde_json::json!({
             "subject": {
                 "ilk": "ilk:abc-123",
@@ -2733,11 +2832,7 @@ mod tests {
     #[test]
     fn parse_json_message_request_rejects_incomplete_explicit_subject_by_data() {
         let effective = configured_effective("explicit_subject");
-        let auth_match = AuthMatch {
-            key_id: "partner1".to_string(),
-            tenant_id: "tnt:partner1".to_string(),
-            caller_identity: None,
-        };
+        let auth_match = sample_auth_match();
         let envelope = serde_json::json!({
             "subject": {
                 "external_user_id": "crm:123",
@@ -2758,11 +2853,10 @@ mod tests {
     fn parse_json_message_request_rejects_subject_for_caller_is_subject() {
         let effective = configured_effective("caller_is_subject");
         let auth_match = AuthMatch {
-            key_id: "partner1".to_string(),
-            tenant_id: "tnt:partner1".to_string(),
             caller_identity: Some(serde_json::json!({
                 "external_user_id": "caller-1"
             })),
+            ..sample_auth_match()
         };
         let envelope = serde_json::json!({
             "subject": {
@@ -2783,12 +2877,11 @@ mod tests {
     fn parse_json_message_request_uses_authenticated_caller() {
         let effective = configured_effective("caller_is_subject");
         let auth_match = AuthMatch {
-            key_id: "partner1".to_string(),
-            tenant_id: "tnt:partner1".to_string(),
             caller_identity: Some(serde_json::json!({
                 "external_user_id": "caller-1",
                 "display_name": "Caller One"
             })),
+            ..sample_auth_match()
         };
         let envelope = serde_json::json!({
             "message": {
@@ -2823,11 +2916,7 @@ mod tests {
     #[test]
     fn parse_json_message_request_allows_empty_text_when_attachments_exist() {
         let effective = configured_effective("explicit_subject");
-        let auth_match = AuthMatch {
-            key_id: "partner1".to_string(),
-            tenant_id: "tnt:partner1".to_string(),
-            caller_identity: None,
-        };
+        let auth_match = sample_auth_match();
         let envelope = serde_json::json!({
             "subject": {
                 "external_user_id": "crm:123",
@@ -2851,11 +2940,7 @@ mod tests {
     #[test]
     fn parse_json_message_request_rejects_subject_tenant_hint() {
         let effective = configured_effective("explicit_subject");
-        let auth_match = AuthMatch {
-            key_id: "partner1".to_string(),
-            tenant_id: "tnt:partner1".to_string(),
-            caller_identity: None,
-        };
+        let auth_match = sample_auth_match();
         let envelope = serde_json::json!({
             "subject": {
                 "external_user_id": "crm:123",
@@ -2877,11 +2962,7 @@ mod tests {
     #[test]
     fn parse_json_message_request_rejects_subject_tenant_id() {
         let effective = configured_effective("explicit_subject");
-        let auth_match = AuthMatch {
-            key_id: "partner1".to_string(),
-            tenant_id: "tnt:partner1".to_string(),
-            caller_identity: None,
-        };
+        let auth_match = sample_auth_match();
         let envelope = serde_json::json!({
             "subject": {
                 "external_user_id": "crm:123",

@@ -1504,6 +1504,12 @@ Esperado:
 
 ### 25.12. Prueba E2E con regularizacion automatica por `SY.frontdesk.gov`
 
+> Nota de deprecacion:
+> cualquier referencia previa en este runbook a `frontdesk_result` como salida vigente de frontdesk debe considerarse legacy.
+> En el estado actual:
+> - sin envelope, frontdesk responde `text`
+> - con envelope, frontdesk responde `text` estructurado
+
 Esta prueba valida el flujo canonico:
 
 - `IO.api`

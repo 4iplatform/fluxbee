@@ -263,6 +263,23 @@ Cada vez que el Nodo IO recibe un mensaje o evento desde el exterior:
 La resolución de destino outbound es por `meta.context.io.reply_target` (contrato IO Context).
 No depende de un resolver de identidad adicional en `io-common`.
 
+Para el caso hoy implementado de `IO.api`:
+
+- `reply_target.kind = "webhook_post"`
+- `reply_target.address = integration_id`
+- `reply_target.params` mínimos:
+  - `integration_id`
+  - `tenant_id`
+  - `request_id`
+  - `trace_id`
+  - `reply_mode = "final_only"`
+
+Reglas:
+
+- `reply_target` no debe transportar `webhook.url`;
+- `reply_target` no debe transportar secretos ni headers firmados;
+- el nodo emisor outbound real resuelve esos datos al momento de entregar.
+
 ---
 
 ## Fuera de alcance de io-common
@@ -340,6 +357,22 @@ Elementos clave:
 - `propagate_io_context(inbound -> outbound)`
 
 > Nota: el contenido exacto por canal se modela vía `reply_target.kind` y `reply_target.params`.
+
+Caso hoy implementado en el repo:
+
+- `webhook_post`
+  - `address = integration_id`
+  - `params.integration_id`
+  - `params.tenant_id`
+  - `params.request_id`
+  - `params.trace_id`
+  - `params.reply_mode = "final_only"`
+
+Semántica:
+
+- `reply_target` identifica el canal de entrega y la correlación mínima;
+- no reemplaza la configuración real del canal;
+- no debe copiar secretos ni configuración sensible al data plane del mensaje.
 
 
 ## 5. Estado y almacenamiento (dentro del IO)
@@ -524,5 +557,4 @@ Pipeline normativo:
 
 El MVP usa memoria para estado tecnico local (dedup/sessions/outbox).
 IO no es source of truth; la persistencia canonica permanece en core (Router/Storage/Identity).
-
 

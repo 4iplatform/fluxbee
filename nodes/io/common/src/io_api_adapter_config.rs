@@ -27,6 +27,7 @@ impl IoAdapterConfigContract for IoApiAdapterConfigContract {
             "config.io.relay.max_open_sessions",
             "config.io.relay.max_fragments_per_session",
             "config.io.relay.max_bytes_per_session",
+            "config.auth.api_keys[].integration_id",
             "config.ingress.max_request_bytes",
             "config.ingress.max_attachments_per_request",
             "config.ingress.max_attachment_size_bytes",
@@ -35,6 +36,16 @@ impl IoAdapterConfigContract for IoApiAdapterConfigContract {
             "config.auth.api_keys[].caller_identity.external_user_id",
             "config.auth.api_keys[].caller_identity.display_name",
             "config.auth.api_keys[].caller_identity.email",
+            "config.integrations[].integration_id",
+            "config.integrations[].tenant_id",
+            "config.integrations[].final_reply_required",
+            "config.integrations[].webhook.enabled",
+            "config.integrations[].webhook.url",
+            "config.integrations[].webhook.secret_ref",
+            "config.integrations[].webhook.timeout_ms",
+            "config.integrations[].webhook.max_retries",
+            "config.integrations[].webhook.initial_backoff_ms",
+            "config.integrations[].webhook.max_backoff_ms",
             "config.node.*",
             "config.runtime.*",
         ]
@@ -47,6 +58,7 @@ impl IoAdapterConfigContract for IoApiAdapterConfigContract {
             "CONFIG_GET and CONFIG_RESPONSE must redact secret-bearing fields.",
             "v1 supports auth.mode=api_key only.",
             "Each API key must declare a tenant_id; IO.api derives the effective tenant from the authenticated key.",
+            "Each API key must declare an integration_id; IO.api resolves outbound webhook policy from that integration.",
         ]
     }
 
@@ -86,6 +98,7 @@ impl IoAdapterConfigContract for IoApiAdapterConfigContract {
             ));
         }
         validate_api_keys(auth, cfg.get("ingress").and_then(Value::as_object))?;
+        validate_integrations(auth, &cfg)?;
 
         let ingress = cfg
             .get_mut("ingress")
@@ -301,6 +314,11 @@ fn validate_api_keys(
         };
         require_non_empty_string(entry_obj, "key_id", "auth.api_keys[].key_id")?;
         require_non_empty_string(entry_obj, "tenant_id", "auth.api_keys[].tenant_id")?;
+        require_non_empty_string(
+            entry_obj,
+            "integration_id",
+            "auth.api_keys[].integration_id",
+        )?;
         let has_secret = has_non_empty_string(entry_obj, "token")
             || has_non_empty_string(entry_obj, "token_ref");
         if !has_secret {
@@ -334,6 +352,167 @@ fn validate_api_keys(
             ));
         }
     }
+    Ok(())
+}
+
+fn validate_integrations(
+    auth: &Map<String, Value>,
+    root: &Map<String, Value>,
+) -> Result<(), IoAdapterConfigError> {
+    let mut integrations_by_id: Map<String, Value> = Map::new();
+    if let Some(entries) = root.get("integrations") {
+        let entries = entries.as_array().ok_or_else(|| {
+            IoAdapterConfigError::InvalidConfig("integrations must be an array when present".to_string())
+        })?;
+        for entry in entries {
+            let entry_obj = entry.as_object().ok_or_else(|| {
+                IoAdapterConfigError::InvalidConfig(
+                    "integrations entries must be objects".to_string(),
+                )
+            })?;
+            require_non_empty_string(entry_obj, "integration_id", "integrations[].integration_id")?;
+            require_non_empty_string(entry_obj, "tenant_id", "integrations[].tenant_id")?;
+            if !matches!(entry_obj.get("final_reply_required"), Some(Value::Bool(_))) {
+                return Err(IoAdapterConfigError::InvalidConfig(
+                    "integrations[].final_reply_required is required and must be boolean"
+                        .to_string(),
+                ));
+            }
+            let integration_id = entry_obj
+                .get("integration_id")
+                .and_then(Value::as_str)
+                .expect("validated integration_id")
+                .trim()
+                .to_string();
+            if integrations_by_id.contains_key(&integration_id) {
+                return Err(IoAdapterConfigError::InvalidConfig(format!(
+                    "duplicate integrations[].integration_id '{integration_id}'"
+                )));
+            }
+            validate_webhook_block(entry_obj)?;
+            integrations_by_id.insert(integration_id, Value::Object(entry_obj.clone()));
+        }
+    }
+
+    let api_keys = auth
+        .get("api_keys")
+        .and_then(Value::as_array)
+        .expect("validated api_keys");
+    for entry in api_keys {
+        let entry_obj = entry.as_object().expect("validated api key object");
+        let integration_id = entry_obj
+            .get("integration_id")
+            .and_then(Value::as_str)
+            .expect("validated integration_id")
+            .trim();
+        let tenant_id = entry_obj
+            .get("tenant_id")
+            .and_then(Value::as_str)
+            .expect("validated tenant_id")
+            .trim();
+        let integration = integrations_by_id.get(integration_id).ok_or_else(|| {
+            IoAdapterConfigError::InvalidConfig(format!(
+                "auth.api_keys[].integration_id '{integration_id}' does not exist in integrations[]"
+            ))
+        })?;
+        let integration_obj = integration.as_object().expect("integration object");
+        let integration_tenant = integration_obj
+            .get("tenant_id")
+            .and_then(Value::as_str)
+            .expect("validated integration tenant")
+            .trim();
+        if integration_tenant != tenant_id {
+            return Err(IoAdapterConfigError::InvalidConfig(format!(
+                "integration '{integration_id}' tenant_id does not match auth.api_keys[].tenant_id"
+            )));
+        }
+        let final_reply_required = integration_obj
+            .get("final_reply_required")
+            .and_then(Value::as_bool)
+            .expect("validated final_reply_required");
+        let webhook_enabled = integration_obj
+            .get("webhook")
+            .and_then(Value::as_object)
+            .and_then(|webhook| webhook.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if final_reply_required && !webhook_enabled {
+            return Err(IoAdapterConfigError::InvalidConfig(format!(
+                "integration '{integration_id}' has final_reply_required=true but webhook.enabled=false"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_webhook_block(entry_obj: &Map<String, Value>) -> Result<(), IoAdapterConfigError> {
+    let final_reply_required = entry_obj
+        .get("final_reply_required")
+        .and_then(Value::as_bool)
+        .expect("validated final_reply_required");
+
+    let Some(webhook_value) = entry_obj.get("webhook") else {
+        if final_reply_required {
+            return Err(IoAdapterConfigError::InvalidConfig(
+                "integrations[].webhook is required when final_reply_required=true".to_string(),
+            ));
+        }
+        return Ok(());
+    };
+    let webhook = webhook_value.as_object().ok_or_else(|| {
+        IoAdapterConfigError::InvalidConfig(
+            "integrations[].webhook must be an object when present".to_string(),
+        )
+    })?;
+    if !matches!(webhook.get("enabled"), Some(Value::Bool(_))) {
+        return Err(IoAdapterConfigError::InvalidConfig(
+            "integrations[].webhook.enabled is required and must be boolean".to_string(),
+        ));
+    }
+    let enabled = webhook
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .expect("validated webhook enabled");
+    if !enabled {
+        return Ok(());
+    }
+    require_non_empty_string(webhook, "url", "integrations[].webhook.url")?;
+    let url = webhook
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .expect("validated webhook url");
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(IoAdapterConfigError::InvalidConfig(
+            "integrations[].webhook.url must be absolute".to_string(),
+        ));
+    }
+    require_non_empty_string(
+        webhook,
+        "secret_ref",
+        "integrations[].webhook.secret_ref",
+    )?;
+    validate_optional_positive_integer(
+        webhook,
+        "timeout_ms",
+        "integrations[].webhook.timeout_ms",
+    )?;
+    validate_optional_non_negative_integer(
+        webhook,
+        "max_retries",
+        "integrations[].webhook.max_retries",
+    )?;
+    validate_optional_positive_integer(
+        webhook,
+        "initial_backoff_ms",
+        "integrations[].webhook.initial_backoff_ms",
+    )?;
+    validate_optional_positive_integer(
+        webhook,
+        "max_backoff_ms",
+        "integrations[].webhook.max_backoff_ms",
+    )?;
     Ok(())
 }
 
@@ -447,13 +626,26 @@ mod tests {
                 "auth": {
                     "mode": "api_key",
                     "api_keys": [
-                        { "key_id": "partner1", "tenant_id": "tnt:partner1", "token_ref": "env:PARTNER1_KEY" }
+                        {
+                            "key_id": "partner1",
+                            "tenant_id": "tnt:partner1",
+                            "integration_id": "int_partner1",
+                            "token_ref": "env:PARTNER1_KEY"
+                        }
                     ]
                 },
                 "ingress": {
                     "subject_mode": "explicit_subject",
                     "accepted_content_types": ["application/json", "multipart/form-data"]
                 },
+                "integrations": [
+                    {
+                        "integration_id": "int_partner1",
+                        "tenant_id": "tnt:partner1",
+                        "final_reply_required": false,
+                        "webhook": { "enabled": false }
+                    }
+                ],
                 "io": {}
             }))
             .expect("must pass");
@@ -493,6 +685,120 @@ mod tests {
     }
 
     #[test]
+    fn validate_materialize_requires_integration_id_per_api_key() {
+        let contract = IoApiAdapterConfigContract;
+        let err = contract
+            .validate_and_materialize(&json!({
+                "listen": { "address": "127.0.0.1", "port": 8080 },
+                "auth": {
+                    "mode": "api_key",
+                    "api_keys": [
+                        { "key_id": "partner1", "tenant_id": "tnt:partner1", "token_ref": "env:PARTNER1_KEY" }
+                    ]
+                },
+                "ingress": {
+                    "subject_mode": "explicit_subject",
+                    "accepted_content_types": ["application/json"]
+                },
+                "integrations": [
+                    {
+                        "integration_id": "int_partner1",
+                        "tenant_id": "tnt:partner1",
+                        "final_reply_required": false,
+                        "webhook": { "enabled": false }
+                    }
+                ]
+            }))
+            .expect_err("must fail");
+        assert_eq!(
+            err,
+            IoAdapterConfigError::InvalidConfig(
+                "auth.api_keys[].integration_id is required".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn validate_materialize_requires_matching_integration() {
+        let contract = IoApiAdapterConfigContract;
+        let err = contract
+            .validate_and_materialize(&json!({
+                "listen": { "address": "127.0.0.1", "port": 8080 },
+                "auth": {
+                    "mode": "api_key",
+                    "api_keys": [
+                        {
+                            "key_id": "partner1",
+                            "tenant_id": "tnt:partner1",
+                            "integration_id": "int_missing",
+                            "token_ref": "env:PARTNER1_KEY"
+                        }
+                    ]
+                },
+                "ingress": {
+                    "subject_mode": "explicit_subject",
+                    "accepted_content_types": ["application/json"]
+                },
+                "integrations": [
+                    {
+                        "integration_id": "int_partner1",
+                        "tenant_id": "tnt:partner1",
+                        "final_reply_required": false,
+                        "webhook": { "enabled": false }
+                    }
+                ]
+            }))
+            .expect_err("must fail");
+        assert_eq!(
+            err,
+            IoAdapterConfigError::InvalidConfig(
+                "auth.api_keys[].integration_id 'int_missing' does not exist in integrations[]".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn validate_materialize_accepts_integrations_with_enabled_webhook() {
+        let contract = IoApiAdapterConfigContract;
+        contract
+            .validate_and_materialize(&json!({
+                "listen": { "address": "127.0.0.1", "port": 8080 },
+                "auth": {
+                    "mode": "api_key",
+                    "api_keys": [
+                        {
+                            "key_id": "partner1",
+                            "tenant_id": "tnt:partner1",
+                            "integration_id": "int_partner1",
+                            "token_ref": "env:PARTNER1_KEY"
+                        }
+                    ]
+                },
+                "ingress": {
+                    "subject_mode": "explicit_subject",
+                    "accepted_content_types": ["application/json"]
+                },
+                "integrations": [
+                    {
+                        "integration_id": "int_partner1",
+                        "tenant_id": "tnt:partner1",
+                        "final_reply_required": true,
+                        "webhook": {
+                            "enabled": true,
+                            "url": "https://example.com/webhook",
+                            "secret_ref": "local_file:io_api_webhook__partner1",
+                            "timeout_ms": 5000,
+                            "max_retries": 5,
+                            "initial_backoff_ms": 1000,
+                            "max_backoff_ms": 30000
+                        }
+                    }
+                ]
+            }))
+            .expect("must pass");
+    }
+
+    #[test]
     fn validate_materialize_requires_caller_identity_for_caller_is_subject() {
         let contract = IoApiAdapterConfigContract;
         let err = contract
@@ -501,13 +807,26 @@ mod tests {
                 "auth": {
                     "mode": "api_key",
                     "api_keys": [
-                        { "key_id": "caller1", "tenant_id": "tnt:caller1", "token_ref": "env:CALLER1_KEY" }
+                        {
+                            "key_id": "caller1",
+                            "tenant_id": "tnt:caller1",
+                            "integration_id": "int_caller1",
+                            "token_ref": "env:CALLER1_KEY"
+                        }
                     ]
                 },
                 "ingress": {
                     "subject_mode": "caller_is_subject",
                     "accepted_content_types": ["application/json"]
-                }
+                },
+                "integrations": [
+                    {
+                        "integration_id": "int_caller1",
+                        "tenant_id": "tnt:caller1",
+                        "final_reply_required": false,
+                        "webhook": { "enabled": false }
+                    }
+                ]
             }))
             .expect_err("must fail");
         assert_eq!(

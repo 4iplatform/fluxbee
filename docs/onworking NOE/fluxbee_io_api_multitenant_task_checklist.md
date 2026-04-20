@@ -4,6 +4,15 @@
 **Estado:** validado funcionalmente en Linux para el alcance IO.api / io-common
 **Objetivo:** ejecutar y seguir, de forma incremental, los cambios necesarios para llevar `IO.api` a un modelo multitenant tenant-scoped con handoff correcto a `SY.frontdesk.gov`.
 
+> Nota de deprecacion 2026-04-20:
+> Este checklist conserva referencias historicas a `frontdesk_result`.
+> Deben leerse como legacy.
+> Estado actual:
+> - `frontdesk_handoff` sigue vigente como input
+> - `frontdesk_result` queda deprecado como output
+> - `IO.api` ya no depende de `frontdesk_result`
+> - `IO.slack` ya no depende de `frontdesk_result`
+
 ---
 
 ## 0. Criterio de avance

@@ -6,7 +6,6 @@ use fluxbee_sdk::{
     connect, managed_node_config_path, NodeConfig, NodeSender, NodeUuidMode, FLUXBEE_NODE_NAME_ENV,
 };
 use futures_util::{SinkExt, StreamExt};
-use io_common::frontdesk_contract::parse_frontdesk_result_payload;
 use io_common::identity::{
     IdentityProvisioner, IdentityResolver, ResolveOrCreateInput, ShmIdentityResolver,
 };
@@ -1846,40 +1845,6 @@ async fn run_outbound_loop(
         };
 
         let mut sent_any = false;
-        if let Some(frontdesk_result) = parse_frontdesk_result_payload(&msg.payload) {
-            let human_message = if frontdesk_result.human_message.trim().is_empty() {
-                format!(
-                    "Frontdesk devolvió {} ({}) sin mensaje humano.",
-                    frontdesk_result.status, frontdesk_result.result_code
-                )
-            } else {
-                frontdesk_result.human_message.clone()
-            };
-            tracing::debug!(
-                trace_id = %msg.routing.trace_id,
-                result_code = %frontdesk_result.result_code,
-                status = %frontdesk_result.status,
-                "rendering frontdesk_result for slack outbound"
-            );
-            if let Err(error) = slack
-                .post_message(
-                    &target.channel_id,
-                    human_message.as_str(),
-                    target.thread_ts.as_deref(),
-                    None,
-                )
-                .await
-            {
-                tracing::warn!(error = ?error, "failed to send slack frontdesk_result message");
-            } else {
-                sent_any = true;
-            }
-        }
-
-        if sent_any {
-            continue;
-        }
-
         match resolve_text_v1_for_outbound(
             blob_toolkit.as_ref(),
             &blob_payload_cfg,
