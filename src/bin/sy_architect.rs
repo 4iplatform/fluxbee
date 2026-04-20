@@ -2710,14 +2710,116 @@ async fn build_session_immediate_memory(
     let recent_messages = load_session_messages(&messages_table, &session.session_id).await?;
     let operations = load_session_operations(&operations_table, &session.session_id).await?;
     let summary = build_conversation_summary(session, &recent_messages, &operations);
+    let recent_interactions =
+        recent_messages_to_immediate_with_blobs(state, recent_messages).await;
 
     Ok(ImmediateConversationMemory {
         thread_id: none_if_empty(&session.thread_id),
         scope_id: session_scope_id(session),
         summary: Some(summary),
-        recent_interactions: recent_messages_to_immediate(recent_messages),
+        recent_interactions,
         active_operations: operations_to_immediate(&session.session_id, operations),
     })
+}
+
+async fn recent_messages_to_immediate_with_blobs(
+    state: &ArchitectState,
+    messages: Vec<PersistedChatMessage>,
+) -> Vec<ImmediateInteraction> {
+    let mut pairs: Vec<(PersistedChatMessage, ImmediateInteraction)> = messages
+        .into_iter()
+        .filter_map(|msg| {
+            immediate_interaction_from_message(&msg).map(|interaction| (msg, interaction))
+        })
+        .collect();
+    let start = pairs.len().saturating_sub(10);
+    pairs.drain(0..start);
+
+    let mut attachment_budget = 3usize;
+    for (msg, interaction) in pairs.iter_mut().rev() {
+        if attachment_budget == 0 {
+            break;
+        }
+        if interaction.role != ImmediateRole::User {
+            continue;
+        }
+        let attachments = persisted_message_attachments(msg);
+        if attachments.is_empty() {
+            continue;
+        }
+        if let Ok(enriched) =
+            enrich_interaction_with_blob_content(state, &interaction.content, &attachments).await
+        {
+            interaction.content = enriched;
+        }
+        attachment_budget -= 1;
+    }
+
+    pairs.into_iter().map(|(_, interaction)| interaction).collect()
+}
+
+async fn enrich_interaction_with_blob_content(
+    state: &ArchitectState,
+    base_content: &str,
+    attachments: &[UploadedAttachment],
+) -> Result<String, ArchitectError> {
+    const MAX_ATTACHMENT_CHARS: usize = 6000;
+    let toolkit = architect_blob_toolkit(state)?;
+    let mut parts = Vec::new();
+    if !base_content.trim().is_empty() {
+        parts.push(base_content.to_string());
+    }
+    for attachment in attachments {
+        let path = toolkit.resolve(&attachment.blob_ref);
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(_) => {
+                parts.push(format!(
+                    "[Attachment: {} — not available in blob store]",
+                    attachment.filename
+                ));
+                continue;
+            }
+        };
+        let is_text = attachment.mime.starts_with("text/")
+            || matches!(
+                attachment.mime.as_str(),
+                "application/json"
+                    | "application/xml"
+                    | "application/javascript"
+                    | "application/x-yaml"
+                    | "application/x-toml"
+            )
+            || (!attachment.mime.starts_with("image/")
+                && !attachment.mime.starts_with("audio/")
+                && !attachment.mime.starts_with("video/")
+                && bytes.iter().take(512).all(|&b| b != 0));
+        if is_text {
+            let text = String::from_utf8_lossy(&bytes);
+            let char_count = text.chars().count();
+            let (body, truncated) = if char_count > MAX_ATTACHMENT_CHARS {
+                let s: String = text.chars().take(MAX_ATTACHMENT_CHARS).collect();
+                (s, true)
+            } else {
+                (text.into_owned(), false)
+            };
+            let label = if truncated {
+                format!(
+                    "[Attachment: {} ({} bytes, showing first {} chars)]",
+                    attachment.filename, attachment.size, MAX_ATTACHMENT_CHARS
+                )
+            } else {
+                format!("[Attachment: {}]", attachment.filename)
+            };
+            parts.push(format!("{label}\n{body}"));
+        } else {
+            parts.push(format!(
+                "[Attachment: {} ({}, {} bytes) — binary content not included in context]",
+                attachment.filename, attachment.mime, attachment.size
+            ));
+        }
+    }
+    Ok(parts.join("\n\n"))
 }
 
 fn build_conversation_summary(
