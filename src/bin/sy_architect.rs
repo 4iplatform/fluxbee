@@ -8474,9 +8474,14 @@ fn architect_index_html(state: &ArchitectState) -> String {
       subtitleEl.className = "exec-subtitle";
       const completedSteps = summary.completed_steps != null ? summary.completed_steps : null;
       const totalSteps = summary.total_steps != null ? summary.total_steps : null;
-      subtitleEl.textContent = (completedSteps != null && totalSteps != null)
+      const stepsText = (completedSteps != null && totalSteps != null)
         ? completedSteps + " / " + totalSteps + " steps"
         : (executionId ? executionId.slice(0, 8) : "");
+      const finalMessage = summary.final_message || (isError ? output.error || "" : "");
+      const failedStep = summary.failed_step_id
+        ? " · failed at " + summary.failed_step_id + (summary.failed_step_action ? " (" + summary.failed_step_action + ")" : "")
+        : "";
+      subtitleEl.textContent = stepsText + (finalMessage ? " · " + finalMessage : "") + failedStep;
       titleBlock.appendChild(titleEl);
       titleBlock.appendChild(subtitleEl);
       const badge = document.createElement("div");
