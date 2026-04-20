@@ -946,7 +946,13 @@ fn build_admin_executor_function_definition(spec: &InternalActionSpec) -> Functi
     }
     for field in admin_action_body_optional_fields(spec.action) {
         if let Some(name) = field.get("name").and_then(serde_json::Value::as_str) {
-            properties.insert(name.to_string(), admin_contract_field_schema(&field));
+            let mut field_schema = admin_contract_field_schema(&field);
+            // Optional fields are nullable: the model passes null when the plan does not
+            // declare a value, signaling "use infrastructure default."
+            if let Some(type_str) = field_schema.get("type").and_then(|v| v.as_str()).map(str::to_string) {
+                field_schema["type"] = serde_json::json!([type_str, "null"]);
+            }
+            properties.insert(name.to_string(), field_schema);
         }
     }
 
@@ -1221,6 +1227,7 @@ fn validate_scalar_against_schema(
 fn merge_executor_step_arguments(
     step: &AdminExecutorPlanStep,
     call_args: &serde_json::Value,
+    function_schema: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let plan_args = step
         .args
@@ -1235,9 +1242,14 @@ fn merge_executor_step_arguments(
         .as_ref()
         .map(|fill| fill.allowed.iter().map(String::as_str).collect())
         .unwrap_or_default();
+    let schema_required: HashSet<&str> = function_schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
     for (key, value) in plan_args {
         if let Some(call_value) = call_args.get(key) {
-            if call_value != value {
+            if call_value != value && !call_value.is_null() {
                 return Err(format!(
                     "step '{}' attempted to change declared arg '{}'",
                     step.id, key
@@ -1248,6 +1260,10 @@ fn merge_executor_step_arguments(
     }
     for (key, value) in call_args {
         if plan_args.contains_key(key) {
+            continue;
+        }
+        // null on an optional field means "use infrastructure default" — omit from dispatch
+        if value.is_null() && !schema_required.contains(key.as_str()) {
             continue;
         }
         if !allowed_fill.contains(key.as_str()) {
@@ -1501,8 +1517,9 @@ impl FunctionTool for AdminExecutorStepTool {
             &format!("step '{}'", self.step.id),
         )
         .map_err(fluxbee_ai_sdk::AiSdkError::Protocol)?;
-        let merged_args = merge_executor_step_arguments(&self.step, &arguments)
-            .map_err(fluxbee_ai_sdk::AiSdkError::Protocol)?;
+        let merged_args =
+            merge_executor_step_arguments(&self.step, &arguments, &self.definition.parameters_json_schema)
+                .map_err(fluxbee_ai_sdk::AiSdkError::Protocol)?;
         let spec = resolve_internal_action_spec(&self.step.action)
             .map_err(|detail| fluxbee_ai_sdk::AiSdkError::Protocol(detail.to_string()))?;
         let (target, params) = executor_dispatch_target_and_params(spec, &merged_args)
@@ -1703,9 +1720,9 @@ Rules:\n\
 - Do not rename actions.\n\
 - Do not add steps.\n\
 - Do not change declared values from step.args.\n\
-- The help tells you what fields exist and what they mean. It does not authorize you to add them. Only pass what is in step.args.\n\
-- Do not pass defaults, zero values, or empty strings for optional fields that are absent from step.args. The infrastructure applies its own defaults — your job is to pass exactly what the plan declared.\n\
-- Fields in step.executor_fill.allowed are the only exception: those may be added if the help confirms they are safe and their values are derivable from current infrastructure, not from design intent.\n\
+- For every optional field in the function schema that is NOT present in step.args: pass null. Do not invent a value, do not pass a default, pass null.\n\
+- For required fields missing from step.args: stop and report failure. Do not invent values.\n\
+- Fields in step.executor_fill.allowed may be passed with a real value only if the help confirms the value is derivable from current infrastructure state.\n\
 - Keep the execution deterministic.\n\
 Current step JSON:\n{}\n\
 Plan metadata:\n{}",
@@ -9289,12 +9306,23 @@ mod tests {
             executor_fill: None,
         };
 
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "hive": {"type": "string"},
+                "runtime": {"type": "string"}
+            },
+            "required": ["hive", "runtime"]
+        });
+
         let err = merge_executor_step_arguments(
             &step,
             &json!({
                 "hive": "otherbee",
                 "runtime": "AI.chat"
             }),
+            &schema,
         )
         .expect_err("declared arg mutation must fail");
 
