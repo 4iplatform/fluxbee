@@ -46,6 +46,16 @@ func (r *InstanceRegistry) Count() int {
 	return len(r.instances)
 }
 
+func (r *InstanceRegistry) All() []*WFInstance {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]*WFInstance, 0, len(r.instances))
+	for _, inst := range r.instances {
+		out = append(out, inst)
+	}
+	return out
+}
+
 // CorrelateAndDispatch routes an inbound message to the correct instance
 // or triggers new instance creation. It implements the strict correlation order:
 //
@@ -102,8 +112,11 @@ func dispatchToInstance(ctx context.Context, inst *WFInstance, msg sdk.Message, 
 	inst.Lock()
 	defer inst.Unlock()
 
-	if err := inst.RunTransition(ctx, msg, actx); err != nil {
+	if err := inst.RunTransition(ctx, msg, actx, nil); err != nil {
 		return fmt.Errorf("instance %s: run transition: %w", inst.InstanceID, err)
+	}
+	if err := inst.drainInternalEvents(ctx, actx); err != nil {
+		return fmt.Errorf("instance %s: drain internal events: %w", inst.InstanceID, err)
 	}
 
 	// If the instance reached a terminal state, remove from the active registry
@@ -157,14 +170,25 @@ func createAndDispatch(ctx context.Context, msg sdk.Message, reg *InstanceRegist
 
 	// Run initial state entry_actions
 	initialState := inst.findState(def.InitialState)
+	var emitted []InternalEventRow
 	if initialState != nil {
 		log.Printf("wf: create running entry_actions instance_id=%s state=%s actions=%d", instanceID, initialState.Name, len(initialState.EntryActions))
-		inst.executeActions(ctx, initialState.EntryActions, msg, actx)
+		inst.executeActions(ctx, initialState.EntryActions, msg, actx, &emitted)
+		if inst.isTerminalState(initialState.Name) {
+			now := nowMS(actx.Clock)
+			inst.Status = terminalStatus(initialState.Name, inst.def.TerminalStates)
+			inst.TerminatedAtMS = &now
+			inst.cancelAllTimers(ctx, actx)
+			emitted = nil
+		}
 	}
 
 	// Persist updated state (clears trace_id, records any state_json changes)
 	inst.CurrentTraceID = ""
-	if err := store.UpdateInstance(ctx, mustToRow(inst, actx.Clock)); err != nil {
+	if err := store.CommitInstanceMutation(ctx, mustToRow(inst, actx.Clock), InstanceCommitMutation{
+		EnqueueInternalEvents: emitted,
+		ClearInternalEvents:   inst.TerminatedAtMS != nil,
+	}); err != nil {
 		log.Printf("instance %s: persist after creation: %v", instanceID, err)
 	} else {
 		log.Printf(
@@ -174,6 +198,12 @@ func createAndDispatch(ctx context.Context, msg sdk.Message, reg *InstanceRegist
 			inst.Status,
 			inst.TerminatedAtMS != nil,
 		)
+	}
+	if err := inst.drainInternalEvents(ctx, actx); err != nil {
+		log.Printf("instance %s: drain internal events after create: %v", instanceID, err)
+	}
+	if inst.Status != "running" && inst.Status != "cancelling" {
+		reg.Remove(inst.InstanceID)
 	}
 
 	return nil

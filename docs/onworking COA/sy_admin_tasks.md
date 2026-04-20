@@ -215,8 +215,8 @@ Ejes:
 |------|---------------|----------------------|-------------------|
 | `CORE + singleton` | **Mayormente resuelto** | bootstrap escribe units persistentes en `/etc/systemd/system`, hace `daemon-reload`, habilita y arranca bootstrap units; `SYSTEM_UPDATE` cubre rollout core | terminar de dejar explí­cita la semántica completa de lifecycle REST para core cuando corresponda |
 | `CORE + instanciado` | **Resuelto para v1 con excepción explí­cita** | `run_node` rechaza `SY.*` y `RT.gateway`; `RT.<otro>` se permite como runtime gestionado publicado | revisar sólo si en el futuro se quiere modelar más core por este camino |
-| `CUSTOM + singleton` | **Mayormente resuelto** | package `full_runtime/config_only/workflow`, publish/install, `--deploy`, readiness, spawn, config persistida, inventario de instancias, `remove` real de instancia, reboot/reconcile validado E2E | cleanup documental y decisión separada sobre `CORE + instanciado` |
-| `CUSTOM + instanciado` | **Mayormente resuelto** | runtime único con múltiples `node_name`, `config.json` por instancia, `_system` inyectado, `kill_node/get_node_*` por nombre, inventario persistente, remove real, reboot/reconcile validado E2E | cleanup documental y reglas finas si aparece algún caso borde |
+| `CUSTOM + singleton` | **Mayormente resuelto** | package `full_runtime/config_only/workflow`, publish/install, `--deploy`, readiness, spawn, config persistida, inventario de instancias, `remove` real de instancia, reboot/reconcile validado E2E | publicación/materialización canónica por admin/Archi y deprecación de `fluxbee-publish` se siguen en `docs/onworking COA/runtime_package_publish_tasks.md` |
+| `CUSTOM + instanciado` | **Mayormente resuelto** | runtime único con múltiples `node_name`, `config.json` por instancia, `_system` inyectado, `kill_node/get_node_*` por nombre, inventario persistente, remove real, reboot/reconcile validado E2E | publicación/materialización canónica por admin/Archi y deprecación de `fluxbee-publish` se siguen en `docs/onworking COA/runtime_package_publish_tasks.md` |
 
 ### Observabilidad identity por admin
 

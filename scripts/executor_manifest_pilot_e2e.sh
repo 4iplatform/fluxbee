@@ -3,7 +3,7 @@ set -euo pipefail
 
 ARCHI_BASE="${ARCHI_BASE:-http://127.0.0.1:3000}"
 HIVE_ID="${HIVE_ID:-motherbee}"
-SESSION_ID="${SESSION_ID:-}"
+SESSION_ID="${SESSION_ID:-$(python3 -c 'import uuid; print(uuid.uuid4())')}"
 ROUTE_PREFIX="${ROUTE_PREFIX:-tenant.executor-pilot.$(date +%s).}"
 NEXT_HOP_HIVE="${NEXT_HOP_HIVE:-southbee}"
 
@@ -88,6 +88,7 @@ plan_read_only() {
   cat <<EOF
 {
   "title": "executor pilot read only",
+  "session_id": "$SESSION_ID",
   "plan": {
     "plan_version": "0.1",
     "kind": "executor_plan",
@@ -126,6 +127,7 @@ plan_add_route() {
   cat <<EOF
 {
   "title": "executor pilot add route",
+  "session_id": "$SESSION_ID",
   "plan": {
     "plan_version": "0.1",
     "kind": "executor_plan",
@@ -159,6 +161,7 @@ plan_delete_route() {
   cat <<EOF
 {
   "title": "executor pilot delete route",
+  "session_id": "$SESSION_ID",
   "plan": {
     "plan_version": "0.1",
     "kind": "executor_plan",
@@ -190,6 +193,7 @@ plan_invalid() {
   cat <<EOF
 {
   "title": "executor pilot invalid",
+  "session_id": "$SESSION_ID",
   "plan": {
     "plan_version": "0.1",
     "kind": "executor_plan",
@@ -232,6 +236,7 @@ require_cmd python3
 echo "Executor manifest pilot E2E"
 echo "  ARCHI_BASE=$ARCHI_BASE  HIVE=$HIVE_ID"
 echo "  ROUTE_PREFIX=$ROUTE_PREFIX  NEXT_HOP_HIVE=$NEXT_HOP_HIVE"
+echo "  SESSION_ID=$SESSION_ID"
 
 step "1. read-only plan succeeds"
 resp="$(executor_post "$(plan_read_only)")"

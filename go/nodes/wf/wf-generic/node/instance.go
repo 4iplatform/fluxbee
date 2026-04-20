@@ -116,10 +116,10 @@ func (inst *WFInstance) Unlock() { inst.mu.Unlock() }
 //  2. Determine the transition to take.
 //  3. Execute actions (exit → transition → entry).
 //  4. Persist new state.
-func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, actx ActionContext) error {
+func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, actx ActionContext, consumedInternalEventID *int64) error {
 	// Fast-path: cancelling → immediate transition to 'cancelled'
 	if inst.Status == "cancelling" {
-		return inst.runCancelTransition(ctx, event, actx)
+		return inst.runCancelTransition(ctx, event, actx, consumedInternalEventID)
 	}
 
 	// Find the current state definition
@@ -150,14 +150,23 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 
 	if chosen == nil {
 		// Log unhandled event and return without state change
+		now := nowMS(actx.Clock)
 		_ = actx.Store.AppendLog(ctx, WFLogEntry{
 			InstanceID:  inst.InstanceID,
-			LoggedAtMS:  nowMS(actx.Clock),
+			LoggedAtMS:  now,
 			ActionType:  "event",
 			Summary:     fmt.Sprintf("unhandled event %s in state %s", msgName(event), inst.CurrentState),
 			OK:          false,
 			ErrorDetail: "no matching transition",
 		})
+		if consumedInternalEventID != nil {
+			inst.UpdatedAtMS = now
+			if err := actx.Store.CommitInstanceMutation(ctx, mustToRow(inst, actx.Clock), InstanceCommitMutation{
+				ConsumedInternalEventID: consumedInternalEventID,
+			}); err != nil {
+				return fmt.Errorf("consume unhandled internal event %d: %w", *consumedInternalEventID, err)
+			}
+		}
 		return nil
 	}
 
@@ -173,8 +182,9 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 	}
 
 	// Step 2: execute exit_actions → transition.actions → entry_actions
-	inst.executeActions(ctx, stateDef.ExitActions, event, actx)
-	inst.executeActions(ctx, chosen.Actions, event, actx)
+	var emitted []InternalEventRow
+	inst.executeActions(ctx, stateDef.ExitActions, event, actx, &emitted)
+	inst.executeActions(ctx, chosen.Actions, event, actx, &emitted)
 
 	// Step 3: apply set_variable actions to StateVars before entry_actions fire
 	// (already done inline in executeActions via set_variable handler)
@@ -183,7 +193,7 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 	prevState := inst.CurrentState
 	inst.CurrentState = chosen.TargetState
 
-	inst.executeActions(ctx, targetStateDef.EntryActions, event, actx)
+	inst.executeActions(ctx, targetStateDef.EntryActions, event, actx, &emitted)
 
 	// Step 4: persist new state
 	inst.CurrentTraceID = ""
@@ -196,9 +206,14 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 		inst.TerminatedAtMS = &now
 		// Cancel all registered timers
 		inst.cancelAllTimers(ctx, actx)
+		emitted = nil
 	}
 
-	if err := actx.Store.UpdateInstance(ctx, mustToRow(inst, actx.Clock)); err != nil {
+	if err := actx.Store.CommitInstanceMutation(ctx, mustToRow(inst, actx.Clock), InstanceCommitMutation{
+		ConsumedInternalEventID: consumedInternalEventID,
+		EnqueueInternalEvents:   emitted,
+		ClearInternalEvents:     isTerminal,
+	}); err != nil {
 		return fmt.Errorf("persist transition %s→%s: %w", prevState, inst.CurrentState, err)
 	}
 
@@ -213,7 +228,7 @@ func (inst *WFInstance) RunTransition(ctx context.Context, event sdk.Message, ac
 	return nil
 }
 
-func (inst *WFInstance) runCancelTransition(ctx context.Context, event sdk.Message, actx ActionContext) error {
+func (inst *WFInstance) runCancelTransition(ctx context.Context, event sdk.Message, actx ActionContext, consumedInternalEventID *int64) error {
 	cancelledState := inst.findState("cancelled")
 	if cancelledState == nil {
 		// Fallback: just mark as cancelled
@@ -221,7 +236,10 @@ func (inst *WFInstance) runCancelTransition(ctx context.Context, event sdk.Messa
 		inst.Status = "cancelled"
 		inst.TerminatedAtMS = &now
 		inst.CurrentTraceID = ""
-		return actx.Store.UpdateInstance(ctx, mustToRow(inst, actx.Clock))
+		return actx.Store.CommitInstanceMutation(ctx, mustToRow(inst, actx.Clock), InstanceCommitMutation{
+			ConsumedInternalEventID: consumedInternalEventID,
+			ClearInternalEvents:     true,
+		})
 	}
 
 	prevState := inst.CurrentState
@@ -231,11 +249,12 @@ func (inst *WFInstance) runCancelTransition(ctx context.Context, event sdk.Messa
 	}
 
 	// Run current state's exit_actions then cancelled entry_actions
+	var emitted []InternalEventRow
 	if stateDef := inst.findState(prevState); stateDef != nil {
-		inst.executeActions(ctx, stateDef.ExitActions, event, actx)
+		inst.executeActions(ctx, stateDef.ExitActions, event, actx, &emitted)
 	}
 	inst.CurrentState = "cancelled"
-	inst.executeActions(ctx, cancelledState.EntryActions, event, actx)
+	inst.executeActions(ctx, cancelledState.EntryActions, event, actx, &emitted)
 
 	now := nowMS(actx.Clock)
 	inst.Status = "cancelled"
@@ -243,15 +262,18 @@ func (inst *WFInstance) runCancelTransition(ctx context.Context, event sdk.Messa
 	inst.CurrentTraceID = ""
 	inst.cancelAllTimers(ctx, actx)
 
-	return actx.Store.UpdateInstance(ctx, mustToRow(inst, actx.Clock))
+	return actx.Store.CommitInstanceMutation(ctx, mustToRow(inst, actx.Clock), InstanceCommitMutation{
+		ConsumedInternalEventID: consumedInternalEventID,
+		ClearInternalEvents:     true,
+	})
 }
 
 // executeActions runs a slice of actions, logging each result.
 // Action failures are logged but do NOT halt execution.
-func (inst *WFInstance) executeActions(ctx context.Context, actions []ActionDefinition, event sdk.Message, actx ActionContext) {
+func (inst *WFInstance) executeActions(ctx context.Context, actions []ActionDefinition, event sdk.Message, actx ActionContext, emitted *[]InternalEventRow) {
 	for i, action := range actions {
 		path := fmt.Sprintf("action[%d]", i)
-		err := executeAction(ctx, path, action, inst, event, actx)
+		err := executeAction(ctx, path, action, inst, event, actx, emitted)
 		ok := err == nil
 		detail := ""
 		if err != nil {
@@ -262,11 +284,31 @@ func (inst *WFInstance) executeActions(ctx context.Context, actions []ActionDefi
 			InstanceID:  inst.InstanceID,
 			LoggedAtMS:  nowMS(actx.Clock),
 			ActionType:  action.Type,
-			Summary:     fmt.Sprintf("%s to %s", action.Type, action.Target),
+			Summary:     actionSummary(action),
 			OK:          ok,
 			ErrorDetail: detail,
 		})
 	}
+}
+
+func (inst *WFInstance) drainInternalEvents(ctx context.Context, actx ActionContext) error {
+	for inst.Status == "running" || inst.Status == "cancelling" {
+		row, ok, err := actx.Store.GetNextInternalEvent(ctx, inst.InstanceID)
+		if err != nil {
+			return fmt.Errorf("load internal event: %w", err)
+		}
+		if !ok {
+			return nil
+		}
+		msg, err := buildInternalEventMessage(row)
+		if err != nil {
+			return fmt.Errorf("build internal event %d: %w", row.EventID, err)
+		}
+		if err := inst.RunTransition(ctx, msg, actx, &row.EventID); err != nil {
+			return fmt.Errorf("run internal event %d: %w", row.EventID, err)
+		}
+	}
+	return nil
 }
 
 func (inst *WFInstance) cancelAllTimers(ctx context.Context, actx ActionContext) {
@@ -358,6 +400,51 @@ func msgName(msg sdk.Message) string {
 		return *msg.Meta.Msg
 	}
 	return "(no msg)"
+}
+
+func buildInternalEventMessage(row InternalEventRow) (sdk.Message, error) {
+	msgName := row.MsgName
+	threadID := row.InstanceID
+	payload := []byte(row.PayloadJSON)
+	if len(payload) == 0 {
+		payload = []byte(`{}`)
+	}
+	if !json.Valid(payload) {
+		return sdk.Message{}, fmt.Errorf("invalid payload_json for internal event %d", row.EventID)
+	}
+	return sdk.Message{
+		Routing: sdk.Routing{
+			TraceID: row.TraceID,
+		},
+		Meta: sdk.Meta{
+			MsgType:  row.MsgType,
+			Msg:      &msgName,
+			ThreadID: &threadID,
+		},
+		Payload: payload,
+	}, nil
+}
+
+func actionSummary(action ActionDefinition) string {
+	switch action.Type {
+	case "send_message":
+		if action.Target != "" {
+			return fmt.Sprintf("send_message to %s", action.Target)
+		}
+	case "emit_internal_event":
+		if action.Meta != nil && action.Meta.Msg != "" {
+			return fmt.Sprintf("emit_internal_event %s", action.Meta.Msg)
+		}
+	case "schedule_timer", "cancel_timer", "reschedule_timer":
+		if action.TimerKey != "" {
+			return fmt.Sprintf("%s %s", action.Type, action.TimerKey)
+		}
+	case "set_variable":
+		if action.Name != "" {
+			return fmt.Sprintf("set_variable %s", action.Name)
+		}
+	}
+	return action.Type
 }
 
 func mustToRow(inst *WFInstance, clock ClockFunc) WFInstanceRow {

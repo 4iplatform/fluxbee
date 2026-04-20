@@ -596,11 +596,68 @@ The `value` is a CEL expression evaluated in the same environment as guards. Com
 
 The result replaces the variable. If the variable did not exist, it is created. There is no type checking across assignments.
 
-### 10.6 What is NOT in v1
+### 10.6 `emit_internal_event`
+
+Queues a synthetic event for the **same instance**. This is a local runtime primitive: it does not send a router message, does not require `SY.timer`, and does not create a new instance.
+
+```json
+{
+  "type": "emit_internal_event",
+  "meta": {
+    "msg": "INTERNAL_COMPLETE"
+  },
+  "payload": {
+    "result": { "$ref": "state.result" }
+  }
+}
+```
+
+Fields:
+
+| Field | Description |
+|---|---|
+| `meta.msg` | The `meta.msg` field of the internal synthetic event. Required. |
+| `meta.type` | Defaults to `"system"`. Can be overridden if the workflow needs a different internal classification. |
+| `payload` | JSON object, using the same `$ref` substitution rules as `send_message`. |
+
+**Not a timer, not a router message.**
+
+`emit_internal_event` is neither workflow time nor runtime housekeeping time. It is an immediate causal step inside the workflow runtime. The event is bound to the current instance at creation time and bypasses normal router correlation entirely.
+
+**Durable queue semantics.**
+
+When `emit_internal_event` executes:
+
+1. The runtime resolves the payload against the current `(input, state, event)`.
+2. It materializes an internal event object in memory.
+3. When the transition commits, the internal event is persisted into the instance's internal event queue atomically with the new instance state.
+4. After that commit succeeds, the runtime drains the queue for that instance FIFO and processes each queued internal event as a normal event against the same transition engine.
+
+This ordering is intentional. The runtime must never process an internal event that was not durably committed, and must never lose a committed internal event across restart.
+
+**Visibility to guards and actions.**
+
+When the queued internal event is processed, it is presented through the normal `event` object available to guards and `set_variable` expressions:
+
+- `event.msg`
+- `event.type`
+- `event.payload`
+- `event.trace_id`
+
+From the point of view of the workflow definition, an internal event behaves like any other event. The only difference is where it comes from.
+
+**Trace semantics.**
+
+An internal event inherits the `trace_id` of the currently-processing event. If the runtime crashes after committing the internal event but before draining it, recovery resumes with the same `trace_id`.
+
+**Terminal behavior.**
+
+If an instance reaches a terminal state, any queued internal events for that instance are discarded as part of terminal cleanup.
+
+### 10.7 What is NOT in v1
 
 The following action types are intentionally excluded from v1 and reserved for future versions:
 
-- `emit_internal_event` — generate a synthetic event to process in the same instance
 - `call_capability` — higher-level wrapper for request/response with a node
 - `compensate` — sagas and rollback
 - `spawn_subworkflow` — child workflows
@@ -618,6 +675,8 @@ WF has two distinct kinds of time, handled differently:
 **Workflow time** — timers that are part of the workflow logic. "Wait 30 minutes for customer response". "Escalate in 2 hours". "Close at end of month". These are always handled via `SY.timer` and go through the `schedule_timer` / `cancel_timer` / `reschedule_timer` actions. Minimum duration: 60 seconds, enforced by SY.timer.
 
 **Runtime time** — timers internal to the node's own implementation. Socket read timeouts, debounce delays, internal task timeouts. These are handled with Go native primitives (`time.After`, `context.WithTimeout`, `time.Ticker`) and never touch SY.timer. They are invisible to workflow authors and do not participate in the workflow logic.
+
+**Internal events are not time.** `emit_internal_event` does not wait and does not schedule anything. It appends a durable synthetic event to the current instance's internal queue, and the runtime drains that queue immediately after the current transition commits (or at recovery if the node crashed before draining it).
 
 The rule is clean: if a timer is visible in the workflow definition, it goes through SY.timer. If a timer exists only inside the runtime's own implementation for its own housekeeping, it uses Go native primitives.
 
@@ -708,7 +767,7 @@ If `WF_CANCEL_INSTANCE` arrives while the instance is in the middle of a transit
 
 ### 13.1 What is stored
 
-Per WF node, a single SQLite file `wf_instances.db` contains three tables:
+Per WF node, a single SQLite file `wf_instances.db` contains four tables:
 
 **`wf_definitions`** — frozen workflow definitions.
 
@@ -767,12 +826,31 @@ Each log entry is one action execution: type (`send_message`, `set_variable`, et
 
 Cap per instance: 100 entries, FIFO. Older entries are pruned when adding new ones. When the instance terminates, its log is preserved until the instance itself is GC'd (retention default 7 days, configurable).
 
+**`wf_internal_events`** — durable FIFO queue of internal synthetic events emitted by `emit_internal_event` and not yet consumed.
+
+```sql
+CREATE TABLE wf_internal_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id TEXT NOT NULL,
+    msg_type TEXT NOT NULL,
+    msg_name TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    trace_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX idx_internal_events_instance ON wf_internal_events(instance_id, event_id ASC);
+```
+
+These rows are transient runtime state, not history. They exist only until the corresponding internal event is consumed or the instance terminates.
+
 ### 13.2 What is NOT stored
 
 - Full transition history with CEL evaluation details — too verbose, not needed for the documented introspection use cases.
 - Intermediate snapshots of `state` per transition — only the current `state_json` is kept.
 - Raw incoming messages — only the derivative log entries.
 - Outgoing messages beyond their log entry — the message itself is not saved.
+- Consumed internal events — only pending internal events remain in `wf_internal_events`; once consumed, they are deleted.
 
 If deep debugging is needed during development, the debug log at the process level (journal) has more detail. The persisted data is the minimum for operational introspection and replay.
 
@@ -790,7 +868,8 @@ When a WF node restarts:
 2. Loads all `wf_definitions` into memory.
 3. Loads all instances with `status IN ('running', 'cancelling')` into memory.
 4. For each instance, checks its registered timers in SY.timer (via `TIMER_LIST` filtered by owner) and reconciles: expired timers that are fire-policy get processed now, valid timers stay valid, cancelled timers are ignored.
-5. Enters the receive loop.
+5. Drains any pending internal events for each recovered instance, in FIFO order, until each queue is empty or the instance becomes terminal.
+6. Enters the receive loop.
 
 Completed / cancelled / failed instances remain in the database for read-only introspection but are not loaded into memory.
 
@@ -827,6 +906,8 @@ Handlers:
 - `TIMER_FIRED` — routes to instance by `user_payload.instance_id`, or treats as new trigger.
 - Any other `meta.msg` — attempts to match against an existing instance by `meta.thread_id` or similar correlation, or if it matches the `input_schema`, creates a new instance.
 
+Internal events emitted by `emit_internal_event` do **not** enter through this inbound loop. They are already bound to a specific instance and are drained from that instance's durable internal queue by the runtime itself.
+
 ### 14.3 Instance creation
 
 When an incoming event looks like a trigger (no `instance_id` correlation and payload matches the `input_schema`):
@@ -837,14 +918,15 @@ When an incoming event looks like a trigger (no `instance_id` correlation and pa
 4. Create instance row with `current_state = initial_state`, `status = "running"`, `state_json = {}`, `input_json = <payload>`.
 5. Acquire the per-instance mutex.
 6. Run entry actions of the initial state.
-7. Persist.
-8. Release mutex.
+7. Persist the updated instance state together with any newly-emitted internal events.
+8. Drain the instance's internal event queue until empty or terminal.
+9. Release mutex.
 
 ### 14.4 Execution model and crash semantics: at-least-once
 
 The WF runtime executes transitions following an **act-then-persist** model with **at-least-once** delivery guarantees on actions. This is a deliberate design choice. The implications matter for anyone building nodes that are targets of a WF:
 
-The execution order within a transition is: run exit_actions of source state → run transition actions → run entry_actions of target state → persist new state. If the runtime crashes in the middle of this sequence (after some actions executed but before the new state is persisted), the next restart will recover the instance in its **previous** state and re-execute the transition from the beginning. Some actions may have already executed before the crash; they will execute again.
+The execution order within a transition is: run exit_actions of source state → run transition actions → run entry_actions of target state → persist new state and any emitted internal events → drain the internal queue. If the runtime crashes in the middle of this sequence (after some actions executed but before the new state is persisted), the next restart will recover the instance in its **previous** state and re-execute the transition from the beginning. Some actions may have already executed before the crash; they will execute again.
 
 This means **side effects from a transition can occur more than once** in the case of a crash. Specifically:
 
@@ -852,6 +934,7 @@ This means **side effects from a transition can occur more than once** in the ca
 - A `schedule_timer` action may attempt to schedule the same timer twice. SY.timer detects the duplicate via the deterministic `client_ref` (`wf:<instance_id>::<timer_key>`) and returns the existing timer instead of creating a new one. This is naturally idempotent.
 - A `cancel_timer` action is idempotent by design (cancelling an already-cancelled or non-existent timer is a no-op).
 - A `set_variable` action has no external side effect; re-execution simply re-assigns the same value.
+- An `emit_internal_event` action is not external I/O. The internal event becomes visible for execution only after it is durably committed with the instance state. If the crash happens after commit but before drain, recovery resumes from the queued internal event; if the crash happens before commit, the internal event does not exist yet.
 
 **The contract for nodes that receive messages from a WF is: be idempotent.** When a WF sends `INVOICE_CREATE_REQUEST` to `IO.quickbooks`, the IO node should use `meta.trace_id` as an idempotency key — if it sees two requests with the same trace_id, it must treat the second as a no-op and return the same response as the first.
 
@@ -868,6 +951,8 @@ When an event arrives at the WF node, the runtime must decide whether it is for 
 2. **If `meta.thread_id` is present and matches an existing instance**: the event is for that instance. This is the standard mechanism for response messages from AI / IO nodes that the WF previously contacted via `send_message`. The WF runtime sets `meta.thread_id = instance_id` on outgoing `send_message` actions, and target nodes are expected to copy this value to the `meta.thread_id` of their response.
 
 3. **If neither of the above matches**: try to interpret the event as a new instance trigger. Validate the payload against the workflow's `input_schema`. If valid, create a new instance with this event as the trigger. If invalid, respond with `INVALID_INPUT` error.
+
+`emit_internal_event` is outside this correlation order. Once committed, it is already attached to a specific instance in `wf_internal_events` and is consumed from there directly by the runtime.
 
 This order is fixed in v1 and not configurable. It reflects the reality of how messages flow in Fluxbee:
 

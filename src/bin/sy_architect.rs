@@ -2063,6 +2063,71 @@ async fn handle_chat_message(
             session_id: Some(resolved_session_id.clone()),
             session_title: Some(session.title.clone()),
         }
+    } else if let Some(plan_value) = try_extract_executor_plan_json(trimmed_message) {
+        let execution_id = Uuid::new_v4().to_string();
+        let plan = match validate_architect_executor_plan_shape(&plan_value) {
+            Ok(p) => p,
+            Err(err) => {
+                let response = ChatResponse {
+                    status: "error".to_string(),
+                    mode: "executor".to_string(),
+                    output: json!({
+                        "error": err.to_string(),
+                        "execution_id": execution_id,
+                        "phase": "architect_precheck",
+                    }),
+                    session_id: Some(resolved_session_id.clone()),
+                    session_title: Some(session.title.clone()),
+                };
+                if let Err(err) =
+                    persist_chat_exchange(state, &mut session, message, &attachments, &response)
+                        .await
+                {
+                    tracing::warn!(error = %err, "failed to persist executor plan exchange");
+                }
+                return ChatResponse {
+                    session_title: Some(session.title),
+                    ..response
+                };
+            }
+        };
+        let context = admin_tool_context(state, Some(&resolved_session_id));
+        match execute_executor_plan_with_context(
+            &context,
+            execution_id.clone(),
+            plan,
+            json!({}),
+            json!({}),
+        )
+        .await
+        {
+            Ok(output) => ChatResponse {
+                status: chat_status_from_command_output(&output),
+                mode: "executor".to_string(),
+                output,
+                session_id: Some(resolved_session_id.clone()),
+                session_title: Some(session.title.clone()),
+            },
+            Err(err) => {
+                let error_text = err.to_string();
+                let phase = if error_text.starts_with("executor plan validation failed:") {
+                    Some("admin_validate")
+                } else {
+                    None
+                };
+                ChatResponse {
+                    status: "error".to_string(),
+                    mode: "executor".to_string(),
+                    output: json!({
+                        "error": error_text,
+                        "execution_id": execution_id,
+                        "phase": phase,
+                    }),
+                    session_id: Some(resolved_session_id.clone()),
+                    session_title: Some(session.title.clone()),
+                }
+            }
+        }
     } else if session.chat_mode == CHAT_MODE_IMPERSONATION {
         match handle_impersonation_chat(state, &session, message.trim()).await {
             Ok(output) => ChatResponse {
@@ -2645,14 +2710,116 @@ async fn build_session_immediate_memory(
     let recent_messages = load_session_messages(&messages_table, &session.session_id).await?;
     let operations = load_session_operations(&operations_table, &session.session_id).await?;
     let summary = build_conversation_summary(session, &recent_messages, &operations);
+    let recent_interactions =
+        recent_messages_to_immediate_with_blobs(state, recent_messages).await;
 
     Ok(ImmediateConversationMemory {
         thread_id: none_if_empty(&session.thread_id),
         scope_id: session_scope_id(session),
         summary: Some(summary),
-        recent_interactions: recent_messages_to_immediate(recent_messages),
+        recent_interactions,
         active_operations: operations_to_immediate(&session.session_id, operations),
     })
+}
+
+async fn recent_messages_to_immediate_with_blobs(
+    state: &ArchitectState,
+    messages: Vec<PersistedChatMessage>,
+) -> Vec<ImmediateInteraction> {
+    let mut pairs: Vec<(PersistedChatMessage, ImmediateInteraction)> = messages
+        .into_iter()
+        .filter_map(|msg| {
+            immediate_interaction_from_message(&msg).map(|interaction| (msg, interaction))
+        })
+        .collect();
+    let start = pairs.len().saturating_sub(10);
+    pairs.drain(0..start);
+
+    let mut attachment_budget = 3usize;
+    for (msg, interaction) in pairs.iter_mut().rev() {
+        if attachment_budget == 0 {
+            break;
+        }
+        if interaction.role != ImmediateRole::User {
+            continue;
+        }
+        let attachments = persisted_message_attachments(msg);
+        if attachments.is_empty() {
+            continue;
+        }
+        if let Ok(enriched) =
+            enrich_interaction_with_blob_content(state, &interaction.content, &attachments).await
+        {
+            interaction.content = enriched;
+        }
+        attachment_budget -= 1;
+    }
+
+    pairs.into_iter().map(|(_, interaction)| interaction).collect()
+}
+
+async fn enrich_interaction_with_blob_content(
+    state: &ArchitectState,
+    base_content: &str,
+    attachments: &[UploadedAttachment],
+) -> Result<String, ArchitectError> {
+    const MAX_ATTACHMENT_CHARS: usize = 6000;
+    let toolkit = architect_blob_toolkit(state)?;
+    let mut parts = Vec::new();
+    if !base_content.trim().is_empty() {
+        parts.push(base_content.to_string());
+    }
+    for attachment in attachments {
+        let path = toolkit.resolve(&attachment.blob_ref);
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(_) => {
+                parts.push(format!(
+                    "[Attachment: {} — not available in blob store]",
+                    attachment.filename
+                ));
+                continue;
+            }
+        };
+        let is_text = attachment.mime.starts_with("text/")
+            || matches!(
+                attachment.mime.as_str(),
+                "application/json"
+                    | "application/xml"
+                    | "application/javascript"
+                    | "application/x-yaml"
+                    | "application/x-toml"
+            )
+            || (!attachment.mime.starts_with("image/")
+                && !attachment.mime.starts_with("audio/")
+                && !attachment.mime.starts_with("video/")
+                && bytes.iter().take(512).all(|&b| b != 0));
+        if is_text {
+            let text = String::from_utf8_lossy(&bytes);
+            let char_count = text.chars().count();
+            let (body, truncated) = if char_count > MAX_ATTACHMENT_CHARS {
+                let s: String = text.chars().take(MAX_ATTACHMENT_CHARS).collect();
+                (s, true)
+            } else {
+                (text.into_owned(), false)
+            };
+            let label = if truncated {
+                format!(
+                    "[Attachment: {} ({} bytes, showing first {} chars)]",
+                    attachment.filename, attachment.size, MAX_ATTACHMENT_CHARS
+                )
+            } else {
+                format!("[Attachment: {}]", attachment.filename)
+            };
+            parts.push(format!("{label}\n{body}"));
+        } else {
+            parts.push(format!(
+                "[Attachment: {} ({}, {} bytes) — binary content not included in context]",
+                attachment.filename, attachment.mime, attachment.size
+            ));
+        }
+    }
+    Ok(parts.join("\n\n"))
 }
 
 fn build_conversation_summary(
@@ -3407,6 +3574,7 @@ fn admin_action_allows_ai_write(action: &str) -> bool {
         action,
         "add_hive"
             | "remove_hive"
+            | "publish_runtime_package"
             | "add_route"
             | "delete_route"
             | "add_vpn"
@@ -3707,6 +3875,19 @@ fn architect_admin_action_timeout(action: &str) -> Duration {
     }
 }
 
+fn try_extract_executor_plan_json(message: &str) -> Option<Value> {
+    let trimmed = message.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let value: Value = serde_json::from_str(trimmed).ok()?;
+    if value.get("kind").and_then(Value::as_str) == Some("executor_plan") {
+        Some(value)
+    } else {
+        None
+    }
+}
+
 fn validate_architect_executor_plan_shape(plan: &Value) -> Result<Value, ArchitectError> {
     let obj = plan
         .as_object()
@@ -3778,6 +3959,20 @@ fn translate_scmd(
             target_hive: local_hive_id.to_string(),
             params: json!({ "action_name": action_name }),
         }),
+        ("POST", ["admin", "runtime-packages", "publish"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err(
+                    "SCMD body for publish_runtime_package must be a JSON object".into(),
+                );
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "publish_runtime_package".to_string(),
+                target_hive: local_hive_id.to_string(),
+                params,
+            })
+        }
         ("GET", ["hive", "status"]) => Ok(AdminTranslation {
             admin_target,
             action: "hive_status".to_string(),
@@ -5287,7 +5482,20 @@ async fn resolve_chat_session(
         if let Some(session) = load_session_record(&sessions, &profiles, &session_id).await? {
             return Ok((session_id, session));
         }
-        return Err(format!("session not found: {session_id}").into());
+        let now = now_epoch_ms();
+        let record = ChatSessionRecord {
+            session_id: session_id.clone(),
+            title: sanitize_session_title(title.as_deref()),
+            agent: "architect".to_string(),
+            created_at_ms: now,
+            last_activity_at_ms: now,
+            message_count: 0,
+            last_message_preview: String::new(),
+            ..default_session_profile()
+        };
+        upsert_session_record(&sessions, &record).await?;
+        upsert_session_profile_record(&profiles, &session_profile_from_record(&record)).await?;
+        return Ok((session_id, record));
     }
 
     let now = now_epoch_ms();
@@ -7253,6 +7461,129 @@ fn architect_index_html(state: &ArchitectState) -> String {
     .result-section summary::-webkit-details-marker {{
       display: none;
     }}
+    .exec-shell {{
+      display: grid;
+      gap: 10px;
+    }}
+    .exec-head {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }}
+    .exec-title {{
+      font-size: 0.94rem;
+      font-weight: 700;
+      color: var(--text);
+    }}
+    .exec-subtitle {{
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-top: 2px;
+    }}
+    .exec-steps {{
+      display: grid;
+      gap: 6px;
+    }}
+    .exec-step {{
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      overflow: hidden;
+    }}
+    .exec-step-head {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 13px;
+      cursor: pointer;
+      user-select: none;
+    }}
+    .exec-step-head:hover {{
+      background: rgba(0,0,0,0.02);
+    }}
+    .exec-step-icon {{
+      font-size: 0.78rem;
+      width: 16px;
+      text-align: center;
+      flex-shrink: 0;
+    }}
+    .exec-step-name {{
+      font-size: 0.85rem;
+      font-weight: 700;
+      color: var(--text);
+      flex: 1;
+    }}
+    .exec-step-id {{
+      font-size: 0.75rem;
+      color: var(--muted);
+      font-family: monospace;
+    }}
+    .exec-step-badge {{
+      font-size: 0.72rem;
+      font-weight: 700;
+      border-radius: 999px;
+      padding: 2px 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }}
+    .exec-step-badge.ok {{
+      background: var(--success-soft);
+      color: var(--success);
+    }}
+    .exec-step-badge.warn {{
+      background: var(--warning-soft);
+      color: var(--warning);
+    }}
+    .exec-step-badge.muted {{
+      background: #f0f2f6;
+      color: var(--muted);
+    }}
+    .exec-step-body {{
+      padding: 0 13px 11px 37px;
+      display: grid;
+      gap: 6px;
+    }}
+    .exec-step-args {{
+      font-size: 0.78rem;
+      color: var(--muted);
+      font-family: monospace;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }}
+    .exec-step-preview {{
+      font-size: 0.80rem;
+      color: var(--muted);
+      line-height: 1.45;
+    }}
+    .exec-step-error {{
+      font-size: 0.82rem;
+      color: var(--warning);
+      line-height: 1.45;
+    }}
+    .exec-step details {{
+      border-top: 1px dashed rgba(210, 218, 232, 0.9);
+      padding-top: 8px;
+      margin-top: 4px;
+    }}
+    .exec-step summary {{
+      cursor: pointer;
+      color: var(--accent);
+      font-size: 0.76rem;
+      font-weight: 700;
+      list-style: none;
+    }}
+    .exec-step summary::-webkit-details-marker {{
+      display: none;
+    }}
+    .exec-error-block {{
+      border: 1px solid var(--warning-soft);
+      border-radius: 12px;
+      padding: 10px 13px;
+      font-size: 0.82rem;
+      color: var(--warning);
+      line-height: 1.5;
+    }}
     .result-pre {{
       margin: 0;
       padding: 12px 13px;
@@ -8250,6 +8581,169 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }});
       return shell;
     }}
+    function renderExecutorResult(data) {{
+      const output = data && data.output ? data.output : {{}};
+      const payload = output.payload || {{}};
+      const summary = payload.summary || {{}};
+      const events = Array.isArray(payload.events) ? payload.events : [];
+      const executionId = payload.execution_id || output.execution_id || "";
+      const overallStatus = summary.status || (data.status === "ok" ? "done" : "error");
+      const isError = data.status !== "ok" || overallStatus === "failed" || overallStatus === "stopped";
+
+      const shell = document.createElement("div");
+      shell.className = "exec-shell";
+
+      // header
+      const head = document.createElement("div");
+      head.className = "exec-head";
+      const titleBlock = document.createElement("div");
+      const titleEl = document.createElement("div");
+      titleEl.className = "exec-title";
+      titleEl.textContent = "executor plan";
+      const subtitleEl = document.createElement("div");
+      subtitleEl.className = "exec-subtitle";
+      const completedSteps = summary.completed_steps != null ? summary.completed_steps : null;
+      const totalSteps = summary.total_steps != null ? summary.total_steps : null;
+      const stepsText = (completedSteps != null && totalSteps != null)
+        ? completedSteps + " / " + totalSteps + " steps"
+        : (executionId ? executionId.slice(0, 8) : "");
+      const finalMessage = summary.final_message || (isError ? output.error || "" : "");
+      const failedStep = summary.failed_step_id
+        ? " · failed at " + summary.failed_step_id + (summary.failed_step_action ? " (" + summary.failed_step_action + ")" : "")
+        : "";
+      subtitleEl.textContent = stepsText + (finalMessage ? " · " + finalMessage : "") + failedStep;
+      titleBlock.appendChild(titleEl);
+      titleBlock.appendChild(subtitleEl);
+      const badge = document.createElement("div");
+      badge.className = "result-status " + (isError ? "warn" : "ok");
+      badge.textContent = overallStatus;
+      head.appendChild(titleBlock);
+      head.appendChild(badge);
+      shell.appendChild(head);
+
+      // if validation/pre-execution error
+      if (data.status !== "ok" && output.error) {{
+        const errBlock = document.createElement("div");
+        errBlock.className = "exec-error-block";
+        const phase = output.phase ? "[" + output.phase + "] " : "";
+        errBlock.textContent = phase + output.error;
+        shell.appendChild(errBlock);
+        appendMessage("architect", "archi", shell);
+        return;
+      }}
+
+      // group events by step_id — keep only the last terminal event per step
+      const stepMap = new Map();
+      const stepOrder = [];
+      for (const ev of events) {{
+        const sid = ev.step_id || "_";
+        if (!stepMap.has(sid)) {{
+          stepMap.set(sid, []);
+          stepOrder.push(sid);
+        }}
+        stepMap.get(sid).push(ev);
+      }}
+
+      if (stepOrder.length > 0) {{
+        const stepsEl = document.createElement("div");
+        stepsEl.className = "exec-steps";
+
+        for (const sid of stepOrder) {{
+          const evs = stepMap.get(sid);
+          // pick terminal event (done/failed/stopped), fall back to last
+          const terminal = evs.slice().reverse().find((e) =>
+            ["done", "failed", "stopped"].includes(e.status)
+          ) || evs[evs.length - 1];
+          // running event has the final args
+          const runningEv = evs.find((e) => e.status === "running");
+          const hasHelp = evs.some((e) => e.status === "help_lookup");
+
+          const stepEl = document.createElement("div");
+          stepEl.className = "exec-step";
+
+          // step head (always visible, click to toggle body)
+          const stepHead = document.createElement("div");
+          stepHead.className = "exec-step-head";
+          const icon = document.createElement("div");
+          icon.className = "exec-step-icon";
+          const termStatus = terminal ? terminal.status : "unknown";
+          icon.textContent = termStatus === "done" ? "✓" : termStatus === "failed" ? "✗" : "·";
+          const nameEl = document.createElement("div");
+          nameEl.className = "exec-step-name";
+          nameEl.textContent = (terminal && terminal.step_action) || sid;
+          const idEl = document.createElement("div");
+          idEl.className = "exec-step-id";
+          idEl.textContent = sid;
+          const stepBadge = document.createElement("div");
+          stepBadge.className = "exec-step-badge " + (termStatus === "done" ? "ok" : termStatus === "failed" || termStatus === "stopped" ? "warn" : "muted");
+          stepBadge.textContent = termStatus;
+          stepHead.appendChild(icon);
+          stepHead.appendChild(nameEl);
+          stepHead.appendChild(idEl);
+          if (hasHelp) {{
+            const helpChip = document.createElement("div");
+            helpChip.className = "exec-step-badge muted";
+            helpChip.textContent = "help";
+            stepHead.appendChild(helpChip);
+          }}
+          stepHead.appendChild(stepBadge);
+
+          // step body (collapsed by default unless error)
+          const stepBody = document.createElement("div");
+          stepBody.className = "exec-step-body";
+          let bodyVisible = termStatus === "failed" || termStatus === "stopped";
+
+          // args
+          const argsVal = (runningEv && runningEv.tool_args_preview) || (terminal && terminal.tool_args_preview);
+          if (argsVal && typeof argsVal === "object" && Object.keys(argsVal).length > 0) {{
+            const argsEl = document.createElement("div");
+            argsEl.className = "exec-step-args";
+            argsEl.textContent = Object.entries(argsVal)
+              .filter(([, v]) => v != null)
+              .map(([k, v]) => k + ": " + (typeof v === "object" ? JSON.stringify(v) : v))
+              .join("\n");
+            stepBody.appendChild(argsEl);
+          }}
+
+          // error message
+          if (terminal && terminal.error_message) {{
+            const errEl = document.createElement("div");
+            errEl.className = "exec-step-error";
+            errEl.textContent = terminal.error_message;
+            stepBody.appendChild(errEl);
+          }}
+
+          // result preview (expandable)
+          const resultVal = terminal && terminal.result_preview;
+          if (resultVal) {{
+            const details = document.createElement("details");
+            const sumEl = document.createElement("summary");
+            sumEl.textContent = "Show result";
+            const pre = document.createElement("pre");
+            pre.className = "result-pre";
+            pre.textContent = typeof resultVal === "string" ? resultVal : JSON.stringify(resultVal, null, 2);
+            details.appendChild(sumEl);
+            details.appendChild(pre);
+            stepBody.appendChild(details);
+          }}
+
+          stepEl.appendChild(stepHead);
+          if (stepBody.children.length > 0) {{
+            if (!bodyVisible) {{
+              stepBody.style.display = "none";
+            }}
+            stepHead.addEventListener("click", () => {{
+              stepBody.style.display = stepBody.style.display === "none" ? "" : "none";
+            }});
+            stepEl.appendChild(stepBody);
+          }}
+          stepsEl.appendChild(stepEl);
+        }}
+        shell.appendChild(stepsEl);
+      }}
+
+      appendMessage("architect", "archi", shell);
+    }}
     function renderCommandResult(kind, mode, data) {{
       const shell = document.createElement("div");
       const head = document.createElement("div");
@@ -8294,6 +8788,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
       appendMessage(kind, kind === "architect" ? "archi" : "System", shell);
     }}
     function renderResponsePayload(kind, data) {{
+      if (data && data.mode === "executor") {{
+        renderExecutorResult(data);
+        return;
+      }}
       const output = data && data.output ? data.output : null;
       if (data && data.mode === "chat" && output && typeof output.message === "string" && output.message.trim()) {{
         const toolSummary = createToolSummarySection(output.tool_results);
@@ -8710,7 +9208,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
       const delay = immediate ? 0 : (document.hidden ? sessionRefreshHiddenMs : sessionRefreshActiveMs);
       scheduleSessionRefresh(delay);
     }}
+    let submitInFlight = false;
     async function submit() {{
+      if (submitInFlight) return;
       const message = input.value.trim();
       if (!message && !pendingAttachments.length) return;
       if (!currentSessionId) {{
@@ -8752,6 +9252,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       renderAttachmentDraft();
       send.disabled = true;
       attach.disabled = true;
+      submitInFlight = true;
       try {{
         const attachments = await uploadPendingAttachments();
         const res = await fetch(chatUrl, {{
@@ -8770,11 +9271,11 @@ fn architect_index_html(state: &ArchitectState) -> String {
         }}
         clearPendingAttachments();
         await refreshSessionList(currentSessionId);
-        await refreshCurrentSession({{ force: true }});
       }} catch (err) {{
         hidePendingIndicator();
         addMessage("system", "Request failed: " + err);
       }} finally {{
+        submitInFlight = false;
         hidePendingIndicator();
         send.disabled = false;
         attach.disabled = false;
@@ -8988,6 +9489,32 @@ mod tests {
                 "definition": { "wf_schema_version": "1" }
             })
         );
+    }
+
+    #[test]
+    fn translate_publish_runtime_package_scmd() {
+        let translated = translate_scmd(
+            "motherbee",
+            parse(
+                r#"curl -X POST /admin/runtime-packages/publish -d '{"source":{"kind":"bundle_upload","blob_path":"packages/incoming/ai-support-demo-0.1.0.zip"},"sync_to":["worker-220"],"update_to":["worker-220"]}'"#,
+            ),
+        )
+        .expect("translation should succeed");
+
+        assert_eq!(translated.action, "publish_runtime_package");
+        assert_eq!(translated.target_hive, "motherbee");
+        assert_eq!(
+            translated.params,
+            json!({
+                "source": {
+                    "kind": "bundle_upload",
+                    "blob_path": "packages/incoming/ai-support-demo-0.1.0.zip"
+                },
+                "sync_to": ["worker-220"],
+                "update_to": ["worker-220"]
+            })
+        );
+        assert!(admin_action_allows_ai_write("publish_runtime_package"));
     }
 
     #[test]

@@ -2920,6 +2920,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wasmtime",
+ "zip",
 ]
 
 [[package]]

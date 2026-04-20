@@ -115,14 +115,16 @@ func Recover(ctx context.Context, def *WorkflowDefinition, store *Store, reg *In
 			if !ok {
 				log.Printf("recover: instance %s not in registry, skipping synthetic fire", row.InstanceID)
 			} else {
-				synthMsg := buildSyntheticTimerFired(row.InstanceID, row.TimerKey, ref, syTimer, actx.Clock)
-				inst.Lock()
-				if err := inst.RunTransition(ctx, synthMsg, actx); err != nil {
-					log.Printf("recover: synthetic TIMER_FIRED for %s/%s: %v", row.InstanceID, row.TimerKey, err)
-				}
-				if inst.Status != "running" && inst.Status != "cancelling" {
-					reg.Remove(inst.InstanceID)
-				}
+					synthMsg := buildSyntheticTimerFired(row.InstanceID, row.TimerKey, ref, syTimer, actx.Clock)
+					inst.Lock()
+					if err := inst.RunTransition(ctx, synthMsg, actx, nil); err != nil {
+						log.Printf("recover: synthetic TIMER_FIRED for %s/%s: %v", row.InstanceID, row.TimerKey, err)
+					} else if err := inst.drainInternalEvents(ctx, actx); err != nil {
+						log.Printf("recover: drain internal events after synthetic TIMER_FIRED for %s/%s: %v", row.InstanceID, row.TimerKey, err)
+					}
+					if inst.Status != "running" && inst.Status != "cancelling" {
+						reg.Remove(inst.InstanceID)
+					}
 				inst.Unlock()
 			}
 			currentRow, existsAfterTransition, err := store.GetTimerForInstance(ctx, row.InstanceID, row.TimerKey)
@@ -166,6 +168,18 @@ func Recover(ctx context.Context, def *WorkflowDefinition, store *Store, reg *In
 			log.Printf("recover: cancel orphan %s: %v", ref, err)
 		}
 		_ = t.UUID // suppress unused warning
+	}
+
+	// 6. Drain any pending internal events for recovered instances.
+	for _, inst := range reg.All() {
+		inst.Lock()
+		if err := inst.drainInternalEvents(ctx, actx); err != nil {
+			log.Printf("recover: drain internal events for %s: %v", inst.InstanceID, err)
+		}
+		if inst.Status != "running" && inst.Status != "cancelling" {
+			reg.Remove(inst.InstanceID)
+		}
+		inst.Unlock()
 	}
 
 	log.Printf("recover: reconciliation complete")

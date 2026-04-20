@@ -284,6 +284,56 @@ go/nodes/wf/wf-generic/
 - [x] Write result into `inst.StateVars[name]`
 - [x] Persisted as part of the transition's atomic state update
 
+### WF-ACT-6 — `emit_internal_event` (durable intra-instance event queue)
+- [x] Extend workflow spec / definition schema with action type:
+  ```json
+  {
+    "type": "emit_internal_event",
+    "meta": { "msg": "INTERNAL_COMPLETE", "type": "system" },
+    "payload": { "result": { "$ref": "state.result" } }
+  }
+  ```
+- [x] Reuse `meta` + `payload` shape from `send_message`; no `target`, no router hop, no SY.timer dependency
+- [x] Load-time validation:
+  - `meta.msg` required
+  - `meta.type` optional, defaults to `"system"`
+  - `payload` validated with the same `$ref` rules as `send_message`
+- [x] Extend `ActionDefinition` / action execution to recognize `emit_internal_event`
+- [x] During action execution, resolve payload against `(input, state, event)` and materialize an internal event in memory; do **not** dispatch it immediately
+- [x] Add durable SQLite table `wf_internal_events`
+  - required columns: `event_id`, `instance_id`, `msg_type`, `msg_name`, `payload_json`, `trace_id`, `created_at_ms`
+  - FIFO ordering by `event_id`
+- [x] Add store methods:
+  - `EnqueueInternalEvents(...)`
+  - `ListInternalEvents(instanceID)`
+  - `DeleteInternalEvent(instanceID, eventID)`
+  - `ListAllInternalEvents()` for recovery
+- [x] Raise WF schema/user_version and add migration for `wf_internal_events`
+- [x] Refactor transition persistence so the following commit atomically in one SQLite transaction:
+  - update `wf_instances`
+  - insert newly-emitted internal events
+  - delete the consumed internal event if current transition came from the internal queue
+  - apply terminal cleanup metadata
+- [x] Refactor initial-state creation finalize step so emitted internal events from `initial_state.entry_actions` are committed atomically with the instance update
+- [x] Add a per-instance internal drain loop:
+  - after a successful commit, load next pending internal event for that instance
+  - build synthetic `sdk.Message` locally
+  - run normal transition evaluation against that event under the same instance mutex
+  - repeat until queue empty or instance becomes terminal
+- [x] Internal synthetic events must be visible to guards and actions through the normal `event` object (`event.msg`, `event.type`, `event.payload`, `event.trace_id`)
+- [x] Trace semantics:
+  - emitted internal event inherits the currently-processing `trace_id`
+  - crash re-execution must preserve the same `trace_id` for the same emitted internal event
+- [x] Recovery:
+  - on boot, load pending internal events for running/cancelling instances
+  - drain each instance's internal queue before entering steady-state receive loop
+  - preserve FIFO order within an instance
+- [x] Terminal behavior:
+  - when an instance becomes terminal, remaining queued internal events for that instance must be deleted as part of terminal cleanup
+- [x] Failure model:
+  - `emit_internal_event` generation is local runtime work, not best-effort external I/O
+  - if the runtime cannot persist the emitted event, the transition must fail its commit and remain recoverable from the pre-transition state
+
 ---
 
 ## 11) Inbound message dispatch
@@ -389,6 +439,11 @@ go/nodes/wf/wf-generic/
 - [x] TIMER_FIRED with client_ref correlates to correct instance
 - [x] CurrentTraceID cleared after transition completes (crash recovery support)
 - [x] set_variable action writes to StateVars
+- [x] `emit_internal_event` from transition.actions advances the same instance without external input
+- [x] `emit_internal_event` from target `entry_actions` is queued and drained after commit
+- [x] Multiple emitted internal events preserve FIFO order within one instance
+- [x] Internal events are evaluated with the normal `event` object visible to guards / `set_variable`
+- [x] Terminal transition clears remaining queued internal events for that instance
 
 ### WF-TEST-5 — Store unit tests
 - [x] Insert + retrieve instance roundtrip
@@ -400,6 +455,9 @@ go/nodes/wf/wf-generic/
 - [x] Timer index CRUD (register, list, delete)
 - [x] Timer upsert updates fire_at on re-registration
 - [x] ListAllExpectedTimers across multiple instances
+- [x] Internal event queue CRUD (enqueue, list FIFO, delete consumed)
+- [ ] Internal event queue rows participate correctly in schema migration
+- [x] Atomic commit test: instance update + internal event enqueue/delete commit together
 
 ### WF-TEST-6 — Restart recovery unit tests (in-memory SQLite + mock timer client)
 - [x] Persist running instance → simulate restart → instance in registry
@@ -410,6 +468,9 @@ go/nodes/wf/wf-generic/
 - [x] Cancelling instance: timers skipped in reconciliation, not treated as orphans
 - [x] Recovery idempotent: run twice, same end state, no spurious cancels
 - [x] TIMER_LIST failure → error returned (hard dependency enforced)
+- [x] Pending internal events are loaded and drained on restart before steady-state receive loop
+- [x] Crash after queueing internal event but before draining it → restart resumes and processes it exactly once from durable queue
+- [ ] Crash during consumption transition leaves instance + internal queue in a recoverable pre-commit state
 
 ### WF-TEST-7 — Integration test against real SY.timer v1.1
 - [ ] End-to-end: WF.invoice instance through complete flow with real SY.timer

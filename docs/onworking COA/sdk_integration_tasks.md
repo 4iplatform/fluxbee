@@ -11,9 +11,9 @@ Estado:
   - Pregunta abierta: eso es policy deseada o sólo un default demasiado estricto para integraciones SDK?
   - Esta tarea es de diseño; no está tratada todavía como bug obligatorio.
 
-- [ ] Publish por API: evaluar endpoint HTTP de upload/staging para que `fluxbee-publish` pueda ser reemplazable por llamada API completa.
-  - No bloquea operación actual.
-  - Queda como mejora de producto/herramientas.
+- [x] Publish por API deja de tratarse como mejora suelta y pasa a workstream dedicado.
+  - Seguimiento consolidado en `docs/onworking COA/runtime_package_publish_tasks.md`.
+  - Alcance absorbido: publish/materialize por API, integración con Archi y deprecación de `fluxbee-publish`.
 
 ## Hechos
 

@@ -272,7 +272,7 @@ func handleWFCancelInstance(ctx context.Context, msg sdk.Message, rt *NodeRuntim
 		Summary:    fmt.Sprintf("cancel requested: %s", req.Reason),
 		OK:         true,
 	})
-	if err := inst.runCancelTransition(ctx, msg, rt.ActCtx); err != nil {
+	if err := inst.runCancelTransition(ctx, msg, rt.ActCtx, nil); err != nil {
 		return fmt.Errorf("cancel instance %q: transition to cancelled: %w", req.InstanceID, err)
 	}
 	rt.Registry.Remove(req.InstanceID)

@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	wfSchemaVersion = 1
+	wfSchemaVersion = 2
 	maxLogEntries   = 100
 )
 
@@ -48,6 +48,23 @@ type TimerRow struct {
 	TimerKey      string
 	ScheduledAtMS int64
 	FireAtMS      int64
+}
+
+// InternalEventRow is a queued synthetic event emitted by an instance and not yet consumed.
+type InternalEventRow struct {
+	EventID     int64
+	InstanceID  string
+	MsgType     string
+	MsgName     string
+	PayloadJSON string
+	TraceID     string
+	CreatedAtMS int64
+}
+
+type InstanceCommitMutation struct {
+	ConsumedInternalEventID *int64
+	EnqueueInternalEvents   []InternalEventRow
+	ClearInternalEvents     bool
 }
 
 // Store is the SQLite-backed persistence layer for a single WF node.
@@ -138,6 +155,16 @@ func ensureWFSchema(db *sql.DB) error {
     fire_at_ms     INTEGER NOT NULL,
     PRIMARY KEY (instance_id, timer_key)
 );`,
+		`CREATE TABLE IF NOT EXISTS wf_internal_events (
+    event_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id    TEXT NOT NULL,
+    msg_type       TEXT NOT NULL,
+    msg_name       TEXT NOT NULL,
+    payload_json   TEXT NOT NULL,
+    trace_id       TEXT NOT NULL,
+    created_at_ms  INTEGER NOT NULL
+);`,
+		`CREATE INDEX IF NOT EXISTS idx_wfie_instance ON wf_internal_events(instance_id, event_id ASC);`,
 	}
 
 	for _, stmt := range stmts {
@@ -237,6 +264,60 @@ WHERE instance_id = ?;`,
 		inst.Status, inst.CurrentState, inst.StateJSON, inst.CurrentTraceID,
 		inst.UpdatedAtMS, inst.TerminatedAtMS, inst.InstanceID)
 	return err
+}
+
+// CommitInstanceMutation atomically persists the instance row and internal-event queue changes.
+func (s *Store) CommitInstanceMutation(ctx context.Context, inst WFInstanceRow, mutation InstanceCommitMutation) error {
+	if mutation.ClearInternalEvents && len(mutation.EnqueueInternalEvents) > 0 {
+		return fmt.Errorf("cannot enqueue internal events while clear_internal_events is set")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `
+UPDATE wf_instances SET
+    status           = ?,
+    current_state    = ?,
+    state_json       = ?,
+    current_trace_id = ?,
+    updated_at_ms    = ?,
+    terminated_at_ms = ?
+WHERE instance_id = ?;`,
+		inst.Status, inst.CurrentState, inst.StateJSON, inst.CurrentTraceID,
+		inst.UpdatedAtMS, inst.TerminatedAtMS, inst.InstanceID); err != nil {
+		return err
+	}
+
+	if mutation.ClearInternalEvents {
+		if _, err := tx.ExecContext(ctx, `
+DELETE FROM wf_internal_events WHERE instance_id = ?;`, inst.InstanceID); err != nil {
+			return err
+		}
+	} else if mutation.ConsumedInternalEventID != nil {
+		if _, err := tx.ExecContext(ctx, `
+DELETE FROM wf_internal_events WHERE instance_id = ? AND event_id = ?;`,
+			inst.InstanceID, *mutation.ConsumedInternalEventID); err != nil {
+			return err
+		}
+	}
+
+	for _, ev := range mutation.EnqueueInternalEvents {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO wf_internal_events (instance_id, msg_type, msg_name, payload_json, trace_id, created_at_ms)
+VALUES (?, ?, ?, ?, ?, ?);`,
+			ev.InstanceID, ev.MsgType, ev.MsgName, ev.PayloadJSON, ev.TraceID, ev.CreatedAtMS); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // LoadRunningInstances returns all instances with status 'running' or 'cancelling'.
@@ -351,6 +432,96 @@ LIMIT ?;`, instanceID, limit)
 	return out, rows.Err()
 }
 
+// --- Internal Event Queue ---
+
+// EnqueueInternalEvents appends durable internal events for an instance in FIFO order.
+func (s *Store) EnqueueInternalEvents(ctx context.Context, events []InternalEventRow) error {
+	if len(events) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, ev := range events {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO wf_internal_events (instance_id, msg_type, msg_name, payload_json, trace_id, created_at_ms)
+VALUES (?, ?, ?, ?, ?, ?);`,
+			ev.InstanceID, ev.MsgType, ev.MsgName, ev.PayloadJSON, ev.TraceID, ev.CreatedAtMS); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// GetNextInternalEvent returns the oldest pending internal event for an instance.
+func (s *Store) GetNextInternalEvent(ctx context.Context, instanceID string) (InternalEventRow, bool, error) {
+	rows, err := s.queryInternalEvents(ctx, `
+SELECT event_id, instance_id, msg_type, msg_name, payload_json, trace_id, created_at_ms
+FROM wf_internal_events
+WHERE instance_id = ?
+ORDER BY event_id ASC
+LIMIT 1;`, instanceID)
+	if err != nil {
+		return InternalEventRow{}, false, err
+	}
+	if len(rows) == 0 {
+		return InternalEventRow{}, false, nil
+	}
+	return rows[0], true, nil
+}
+
+// ListInternalEvents returns all pending internal events for an instance in FIFO order.
+func (s *Store) ListInternalEvents(ctx context.Context, instanceID string) ([]InternalEventRow, error) {
+	return s.queryInternalEvents(ctx, `
+SELECT event_id, instance_id, msg_type, msg_name, payload_json, trace_id, created_at_ms
+FROM wf_internal_events
+WHERE instance_id = ?
+ORDER BY event_id ASC;`, instanceID)
+}
+
+// ListAllInternalEvents returns all pending internal events across instances.
+func (s *Store) ListAllInternalEvents(ctx context.Context) ([]InternalEventRow, error) {
+	return s.queryInternalEvents(ctx, `
+SELECT event_id, instance_id, msg_type, msg_name, payload_json, trace_id, created_at_ms
+FROM wf_internal_events
+ORDER BY instance_id ASC, event_id ASC;`)
+}
+
+// DeleteInternalEvent removes a queued internal event by id.
+func (s *Store) DeleteInternalEvent(ctx context.Context, instanceID string, eventID int64) error {
+	_, err := s.db.ExecContext(ctx, `
+DELETE FROM wf_internal_events WHERE instance_id = ? AND event_id = ?;`,
+		instanceID, eventID)
+	return err
+}
+
+func (s *Store) queryInternalEvents(ctx context.Context, query string, args ...any) ([]InternalEventRow, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []InternalEventRow
+	for rows.Next() {
+		var r InternalEventRow
+		if err := rows.Scan(
+			&r.EventID,
+			&r.InstanceID,
+			&r.MsgType,
+			&r.MsgName,
+			&r.PayloadJSON,
+			&r.TraceID,
+			&r.CreatedAtMS,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // --- Timer Index ---
 
 // RegisterTimer records a timer that this WF instance has scheduled with SY.timer.
@@ -447,6 +618,9 @@ WHERE terminated_at_ms IS NOT NULL AND terminated_at_ms < ?;`, cutoffMS)
 			return 0, err
 		}
 		if _, err := s.db.ExecContext(ctx, `DELETE FROM wf_instance_timers WHERE instance_id = ?;`, id); err != nil {
+			return 0, err
+		}
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM wf_internal_events WHERE instance_id = ?;`, id); err != nil {
 			return 0, err
 		}
 		if _, err := s.db.ExecContext(ctx, `DELETE FROM wf_instances WHERE instance_id = ?;`, id); err != nil {
