@@ -9138,7 +9138,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
         }}
         clearPendingAttachments();
         await refreshSessionList(currentSessionId);
-        await refreshCurrentSession({{ force: true }});
       }} catch (err) {{
         hidePendingIndicator();
         addMessage("system", "Request failed: " + err);
