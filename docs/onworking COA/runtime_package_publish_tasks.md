@@ -172,6 +172,7 @@ Optional follow-up operations after publish:
 - [x] RPP-D2. Support `inline_package` requests from manifests/execution plans.
   - `publish_runtime_package` is now a native executor-plan action with documented `inline_package` examples.
   - `sy_architect` now exposes `fluxbee_publish_runtime_package` for large inline file maps.
+  - Package materialization can now be delegated internally to the new `infrastructure` specialist via `fluxbee_infrastructure_specialist`, producing an internal infrastructure artifact whose `payload.publish_request` feeds publish.
 - [x] RPP-D3. Support `bundle_upload` requests from manifests/execution plans.
   - Executor-plan docs now include canonical `bundle_upload` step shape with `blob_path`.
   - `fluxbee_publish_runtime_package` also supports bundle sources via `source` / `source_json`.

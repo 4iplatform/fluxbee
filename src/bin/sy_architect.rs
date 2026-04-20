@@ -59,6 +59,8 @@ const ARCHITECT_MAX_ATTACHMENTS: usize = 8;
 const ARCHITECT_MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 const ARCHITECT_MAX_ATTACHMENT_UPLOAD_BYTES: usize =
     ARCHITECT_MAX_ATTACHMENTS * ARCHITECT_MAX_ATTACHMENT_BYTES + (2 * 1024 * 1024);
+const ARCHITECT_INTERNAL_ARTIFACT_KIND_INFRASTRUCTURE: &str = "infrastructure";
+const ARCHITECT_INFRA_ARTIFACT_RUNTIME_PACKAGE_SOURCE: &str = "runtime_package_source";
 const ARCHI_SYSTEM_PROMPT: &str = r#"You are archi, the Fluxbee system architect.
 
 Operate as a concise technical assistant for the Fluxbee control plane.
@@ -108,14 +110,45 @@ Rules:
 - For mutations, use the write tool only to stage the action. Then instruct the operator to reply CONFIRM or CANCEL. Do not claim the mutation ran before confirmation.
 - When calling the write tool for actions that require a body, always include the complete body in the tool call. For `wf_rules_compile_apply`, build and embed the full `definition` object directly in the body argument — never omit it, never ask the user to paste it separately. If the definition comes from an attachment, construct it from that content and pass it inline.
 - Use specialized write tools for large-body mutations instead of `fluxbee_system_write`:
+  - `fluxbee_infrastructure_specialist` — when you need an internal infrastructure artifact for complex materialization work. Use this first for runtime package assembly instead of handcrafting large package file maps in the host turn.
   - `fluxbee_deploy_workflow` — for `wf_rules_compile_apply` when passing a full workflow `definition`. Pass the definition object in `definition`, or if that is not possible, serialize it to a JSON string and pass it in `definition_json`.
   - `fluxbee_deploy_opa_policy` — for `opa_compile_apply` when passing a full OPA `rego` source string.
   - `fluxbee_publish_runtime_package` — for `publish_runtime_package` when passing a large `inline_package` file map or a complete package source object. Pass the source in `source`, or serialize it to JSON and pass it in `source_json`.
   - `fluxbee_set_node_config` — for `node_control_config_set` when passing a large node `config` object. Pass the config in `config`, or serialize to a JSON string and pass in `config_json`. Always do CONFIG_GET first to read the current `config_version`.
+  - For runtime package assembly specifically, prefer this sequence: `fluxbee_infrastructure_specialist` to generate the internal infrastructure artifact, then `fluxbee_publish_runtime_package` using the artifact's `payload.publish_request`.
   - Use `fluxbee_system_write` only for mutations whose body is small and fits cleanly as an inline JSON object (route adds, vpn adds, kill_node, rollback, delete, etc.).
 - Do not claim actions were executed unless they actually were.
 - If information is missing, say what is missing.
 - Keep answers useful for administrators and developers."#;
+const ARCHITECT_INFRASTRUCTURE_SPECIALIST_PROMPT: &str = r#"You are the infrastructure specialist inside SY.architect.
+
+Your job is to materialize infrastructure-focused internal artifacts for the host architect.
+
+Current supported artifact type:
+- runtime_package_source
+
+For runtime_package_source:
+- produce an internal infrastructure artifact payload that helps publish a runtime package
+- prefer shapes directly reusable by SY.admin publish_runtime_package
+- when the request clearly targets a generated/config package, prefer source.kind=inline_package
+- when the request clearly targets an uploaded zip bundle, prefer source.kind=bundle_upload
+- do not invent lifecycle execution; only include sync_to/update_to if the request explicitly or mechanically implies them
+- do not invent tenant ids, hive ids, runtime names, versions, prompts, or package files unless they are given or derivable from the request
+- when data is missing, keep the artifact partial and list the missing items in notes
+
+Return ONLY one JSON object with this exact top-level shape:
+{
+  "summary": "short summary",
+  "publish_request": { ... direct body for publish_runtime_package ... },
+  "notes": ["..."]
+}
+
+Rules:
+- Output JSON only. No markdown fences.
+- publish_request must be an object.
+- For inline_package, publish_request.source.files must be a string map.
+- For bundle_upload, publish_request.source.blob_path must be relative to blob root.
+- Keep notes concise and operational."#;
 const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
   <rect width="64" height="64" rx="16" fill="#ffffff"/>
   <path d="M18 33c0-8 6.5-14.5 14.5-14.5S47 25 47 33s-6.5 14.5-14.5 14.5S18 41 18 33Z" fill="#0070F3" opacity="0.14"/>
@@ -177,6 +210,7 @@ struct ArchitectAdminToolContext {
     config_dir: PathBuf,
     state_dir: PathBuf,
     socket_dir: PathBuf,
+    ai_runtime: Arc<Mutex<Option<ArchitectAiRuntime>>>,
     session_id: Option<String>,
     chat_lock: Arc<Mutex<()>>,
     pending_actions: Arc<Mutex<HashMap<String, PendingAdminAction>>>,
@@ -439,6 +473,9 @@ impl FunctionToolProvider for ArchitectAdminReadToolsProvider {
         registry.register(Arc::new(ArchitectSystemWriteTool::new(
             self.context.clone(),
         )))?;
+        registry.register(Arc::new(ArchitectInfrastructureSpecialistTool::new(
+            self.context.clone(),
+        )))?;
         registry.register(Arc::new(ArchitectDeployWorkflowTool::new(
             self.context.clone(),
         )))?;
@@ -451,6 +488,109 @@ impl FunctionToolProvider for ArchitectAdminReadToolsProvider {
         registry.register(Arc::new(ArchitectSetNodeConfigTool::new(
             self.context.clone(),
         )))
+    }
+}
+
+// ---- ArchitectInfrastructureSpecialistTool ---------------------------------
+//
+// Internal multi-AI specialist for infrastructure materialization work that is
+// too detailed to keep in the host prompt. The first supported artifact is the
+// runtime package source used by publish_runtime_package.
+
+struct ArchitectInfrastructureSpecialistTool {
+    context: ArchitectAdminToolContext,
+}
+
+impl ArchitectInfrastructureSpecialistTool {
+    fn new(context: ArchitectAdminToolContext) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl FunctionTool for ArchitectInfrastructureSpecialistTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "fluxbee_infrastructure_specialist".to_string(),
+            description: format!(
+                "Call the internal infrastructure specialist inside SY.architect on hive {}. \
+                Use this when package assembly or other infrastructure materialization is too \
+                complex to keep in the host prompt. The current supported artifact_type is \
+                runtime_package_source. The tool returns an internal infrastructure artifact \
+                whose payload.publish_request is intended to feed publish_runtime_package.",
+                self.context.hive_id,
+            ),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["artifact_type", "task"],
+                "properties": {
+                    "artifact_type": {
+                        "type": "string",
+                        "enum": [ARCHITECT_INFRA_ARTIFACT_RUNTIME_PACKAGE_SOURCE],
+                        "description": "Infrastructure artifact type to materialize."
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "Short statement of what the specialist should produce."
+                    },
+                    "request": {
+                        "type": "object",
+                        "description": "Structured specialist input. For runtime_package_source, include the package intent, runtime metadata, file content requirements, and any deploy hints."
+                    },
+                    "request_json": {
+                        "type": "string",
+                        "description": "Alternative to request: the specialist input serialized as JSON."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let artifact_type = arguments
+            .get("artifact_type")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(
+                    "fluxbee_infrastructure_specialist requires 'artifact_type'".to_string(),
+                )
+            })?;
+        let task = arguments
+            .get("task")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(
+                    "fluxbee_infrastructure_specialist requires 'task'".to_string(),
+                )
+            })?;
+        if artifact_type != ARCHITECT_INFRA_ARTIFACT_RUNTIME_PACKAGE_SOURCE {
+            return Err(fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                "unsupported infrastructure artifact_type '{}'",
+                artifact_type
+            )));
+        }
+        let request =
+            resolve_json_object_param(&arguments, "request", "request_json").map_err(|err| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                    "fluxbee_infrastructure_specialist: {err}"
+                ))
+            })?;
+
+        let specialist_output =
+            run_infrastructure_specialist_with_context(&self.context, artifact_type, task, &request)
+                .await
+                .map_err(|err| fluxbee_ai_sdk::AiSdkError::Protocol(err.to_string()))?;
+
+        Ok(json!({
+            "status": "ok",
+            "artifact": specialist_output,
+            "message": "Infrastructure artifact generated."
+        }))
     }
 }
 
@@ -1249,6 +1389,61 @@ async fn stage_admin_write(
     }))
 }
 
+async fn run_infrastructure_specialist_with_context(
+    context: &ArchitectAdminToolContext,
+    artifact_type: &str,
+    task: &str,
+    request: &Value,
+) -> Result<Value, ArchitectError> {
+    let runtime = context
+        .ai_runtime
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| -> ArchitectError {
+            "AI provider not configured for the infrastructure specialist.".to_string().into()
+        })?;
+    let prompt = ARCHITECT_INFRASTRUCTURE_SPECIALIST_PROMPT.to_string();
+    let model = runtime.client.clone().function_model(
+        runtime.model.clone(),
+        Some(prompt),
+        runtime.model_settings.clone(),
+    );
+    let tools = FunctionToolRegistry::new();
+    let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
+    let request_text = serde_json::to_string_pretty(&json!({
+        "artifact_type": artifact_type,
+        "task": task,
+        "request": request,
+    }))
+    .map_err(|err| -> ArchitectError {
+        format!("failed to serialize infrastructure specialist request: {err}").into()
+    })?;
+    let result = runner
+        .run_with_input(
+            &model,
+            &tools,
+            FunctionRunInput {
+                current_user_message: request_text,
+                current_user_parts: None,
+                immediate_memory: None,
+            },
+        )
+        .await
+        .map_err(|err| -> ArchitectError {
+            format!("infrastructure specialist request failed: {err}").into()
+        })?;
+    let raw = result
+        .final_assistant_text
+        .ok_or_else(|| -> ArchitectError {
+            "infrastructure specialist returned no final text".to_string().into()
+        })?;
+    let parsed = parse_json_value_from_text(&raw).map_err(|err| -> ArchitectError {
+        format!("infrastructure specialist returned invalid JSON: {err}").into()
+    })?;
+    build_infrastructure_artifact(artifact_type, task, parsed)
+}
+
 fn require_session_id<'a>(
     context: &'a ArchitectAdminToolContext,
     tool_name: &str,
@@ -1287,6 +1482,74 @@ fn resolve_json_object_param(
     Err(format!(
         "one of '{object_key}' (object) or '{string_key}' (JSON string) is required"
     ))
+}
+
+fn extract_json_candidate(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(stripped) = trimmed.strip_prefix("```") {
+        let stripped = stripped.trim_start_matches(|c| c != '\n');
+        let stripped = stripped.strip_prefix('\n').unwrap_or(stripped);
+        let stripped = stripped.strip_suffix("```").unwrap_or(stripped);
+        return stripped.trim().to_string();
+    }
+
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return trimmed.to_string();
+    }
+
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        return trimmed[start..=end].to_string();
+    }
+
+    trimmed.to_string()
+}
+
+fn parse_json_value_from_text(raw: &str) -> Result<Value, String> {
+    let candidate = extract_json_candidate(raw);
+    serde_json::from_str(&candidate).map_err(|err| err.to_string())
+}
+
+fn build_infrastructure_artifact(
+    artifact_type: &str,
+    task: &str,
+    payload: Value,
+) -> Result<Value, ArchitectError> {
+    let payload_obj = payload
+        .as_object()
+        .ok_or_else(|| -> ArchitectError { "infrastructure specialist payload must be an object".into() })?;
+    let summary = payload_obj
+        .get("summary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Infrastructure artifact generated.")
+        .to_string();
+    let publish_request = payload_obj
+        .get("publish_request")
+        .filter(|value| value.is_object())
+        .cloned()
+        .ok_or_else(|| -> ArchitectError {
+            "infrastructure specialist payload must include object field 'publish_request'"
+                .to_string()
+                .into()
+        })?;
+    let notes = payload_obj
+        .get("notes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(json!({
+        "kind": ARCHITECT_INTERNAL_ARTIFACT_KIND_INFRASTRUCTURE,
+        "artifact_type": artifact_type,
+        "specialist": "infrastructure",
+        "task": task,
+        "summary": summary,
+        "payload": {
+            "publish_request": publish_request,
+            "notes": notes,
+        }
+    }))
 }
 
 #[tokio::main]
@@ -1554,6 +1817,7 @@ fn admin_tool_context(
         config_dir: state.config_dir.clone(),
         state_dir: state.state_dir.clone(),
         socket_dir: state.socket_dir.clone(),
+        ai_runtime: Arc::clone(&state.ai_runtime),
         session_id: session_id.map(str::to_string),
         chat_lock: Arc::clone(&state.chat_lock),
         pending_actions: Arc::clone(&state.pending_actions),
@@ -9546,6 +9810,65 @@ mod tests {
 
     fn parse(raw: &str) -> ParsedScmd {
         parse_scmd(raw).expect("scmd should parse")
+    }
+
+    #[test]
+    fn parse_json_value_from_text_accepts_json_code_fence() {
+        let parsed = parse_json_value_from_text(
+            "```json\n{\"summary\":\"ok\",\"publish_request\":{\"source\":{\"kind\":\"bundle_upload\",\"blob_path\":\"packages/incoming/demo.zip\"}},\"notes\":[]}\n```",
+        )
+        .expect("parse fenced json");
+
+        assert_eq!(
+            parsed,
+            json!({
+                "summary": "ok",
+                "publish_request": {
+                    "source": {
+                        "kind": "bundle_upload",
+                        "blob_path": "packages/incoming/demo.zip"
+                    }
+                },
+                "notes": []
+            })
+        );
+    }
+
+    #[test]
+    fn build_infrastructure_artifact_wraps_publish_request() {
+        let artifact = build_infrastructure_artifact(
+            ARCHITECT_INFRA_ARTIFACT_RUNTIME_PACKAGE_SOURCE,
+            "materialize package source",
+            json!({
+                "summary": "Prepared inline package source.",
+                "publish_request": {
+                    "source": {
+                        "kind": "inline_package",
+                        "files": {
+                            "package.json": "{}"
+                        }
+                    },
+                    "sync_to": ["worker-220"]
+                },
+                "notes": ["runtime_base still required"]
+            }),
+        )
+        .expect("build infrastructure artifact");
+
+        assert_eq!(artifact["kind"], json!("infrastructure"));
+        assert_eq!(
+            artifact["artifact_type"],
+            json!("runtime_package_source")
+        );
+        assert_eq!(artifact["specialist"], json!("infrastructure"));
+        assert_eq!(
+            artifact["payload"]["publish_request"]["sync_to"],
+            json!(["worker-220"])
+        );
+        assert_eq!(
+            artifact["payload"]["notes"],
+            json!(["runtime_base still required"])
+        );
     }
 
     #[test]
