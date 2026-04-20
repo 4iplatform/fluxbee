@@ -325,3 +325,120 @@ func TestStoreTimerUpsertUpdatesFireAt(t *testing.T) {
 		t.Fatalf("expected fire_at_ms=5000, got %v", timers)
 	}
 }
+
+func TestStoreInternalEventQueueCRUD(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	events := []InternalEventRow{
+		{
+			InstanceID:  "wfi:int",
+			MsgType:     "system",
+			MsgName:     "FIRST",
+			PayloadJSON: `{"value":"one"}`,
+			TraceID:     "trace-1",
+			CreatedAtMS: 1000,
+		},
+		{
+			InstanceID:  "wfi:int",
+			MsgType:     "system",
+			MsgName:     "SECOND",
+			PayloadJSON: `{"value":"two"}`,
+			TraceID:     "trace-1",
+			CreatedAtMS: 1001,
+		},
+	}
+	if err := s.EnqueueInternalEvents(ctx, events); err != nil {
+		t.Fatalf("EnqueueInternalEvents: %v", err)
+	}
+
+	got, err := s.ListInternalEvents(ctx, "wfi:int")
+	if err != nil {
+		t.Fatalf("ListInternalEvents: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 internal events, got %d", len(got))
+	}
+	if got[0].MsgName != "FIRST" || got[1].MsgName != "SECOND" {
+		t.Fatalf("unexpected FIFO order: %#v", got)
+	}
+
+	if err := s.DeleteInternalEvent(ctx, "wfi:int", got[0].EventID); err != nil {
+		t.Fatalf("DeleteInternalEvent: %v", err)
+	}
+	got, err = s.ListInternalEvents(ctx, "wfi:int")
+	if err != nil {
+		t.Fatalf("ListInternalEvents after delete: %v", err)
+	}
+	if len(got) != 1 || got[0].MsgName != "SECOND" {
+		t.Fatalf("expected only SECOND to remain, got %#v", got)
+	}
+}
+
+func TestStoreCommitInstanceMutationConsumesAndEnqueuesInternalEventsAtomically(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	inst := WFInstanceRow{
+		InstanceID:   "wfi:commit",
+		WorkflowType: "invoice",
+		Status:       "running",
+		CurrentState: "collecting_data",
+		InputJSON:    `{}`,
+		StateJSON:    `{}`,
+		CreatedAtMS:  1000,
+		UpdatedAtMS:  1000,
+	}
+	if err := s.CreateInstance(ctx, inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if err := s.EnqueueInternalEvents(ctx, []InternalEventRow{{
+		InstanceID:  inst.InstanceID,
+		MsgType:     "system",
+		MsgName:     "OLD",
+		PayloadJSON: `{}`,
+		TraceID:     "trace-old",
+		CreatedAtMS: 1000,
+	}}); err != nil {
+		t.Fatalf("EnqueueInternalEvents: %v", err)
+	}
+	pending, err := s.ListInternalEvents(ctx, inst.InstanceID)
+	if err != nil {
+		t.Fatalf("ListInternalEvents: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 pending internal event, got %d", len(pending))
+	}
+
+	inst.CurrentState = "next_state"
+	inst.StateJSON = `{"ok":true}`
+	inst.UpdatedAtMS = 2000
+	if err := s.CommitInstanceMutation(ctx, inst, InstanceCommitMutation{
+		ConsumedInternalEventID: &pending[0].EventID,
+		EnqueueInternalEvents: []InternalEventRow{{
+			InstanceID:  inst.InstanceID,
+			MsgType:     "system",
+			MsgName:     "NEW",
+			PayloadJSON: `{"value":"fresh"}`,
+			TraceID:     "trace-new",
+			CreatedAtMS: 2000,
+		}},
+	}); err != nil {
+		t.Fatalf("CommitInstanceMutation: %v", err)
+	}
+
+	gotInst, err := s.GetInstance(ctx, inst.InstanceID)
+	if err != nil {
+		t.Fatalf("GetInstance: %v", err)
+	}
+	if gotInst.CurrentState != "next_state" {
+		t.Fatalf("expected state next_state, got %q", gotInst.CurrentState)
+	}
+	gotEvents, err := s.ListInternalEvents(ctx, inst.InstanceID)
+	if err != nil {
+		t.Fatalf("ListInternalEvents after commit: %v", err)
+	}
+	if len(gotEvents) != 1 || gotEvents[0].MsgName != "NEW" {
+		t.Fatalf("expected only NEW internal event after commit, got %#v", gotEvents)
+	}
+}

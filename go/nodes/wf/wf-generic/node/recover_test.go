@@ -403,3 +403,59 @@ func TestRecoverTimerListFailureReturnsError(t *testing.T) {
 		t.Fatal("expected error when TIMER_LIST fails")
 	}
 }
+
+func TestRecoverDrainsPendingInternalEvents(t *testing.T) {
+	def, err := LoadDefinitionBytes([]byte(workflowJSONWithInternalTransition()), "", fixedClock)
+	if err != nil {
+		t.Fatalf("load def: %v", err)
+	}
+	timer := &mockTimerLister{}
+	actx := makeRecoverActx(t, timer)
+	reg := NewInstanceRegistry()
+
+	inst := WFInstanceRow{
+		InstanceID:   "wfi:recover-internal",
+		WorkflowType: "internal-transition",
+		Status:       "running",
+		CurrentState: "waiting_internal",
+		InputJSON:    `{"customer_id":"c1"}`,
+		StateJSON:    `{}`,
+		CreatedAtMS:  1000,
+		UpdatedAtMS:  1000,
+	}
+	if err := actx.Store.CreateInstance(context.Background(), inst); err != nil {
+		t.Fatalf("CreateInstance: %v", err)
+	}
+	if err := actx.Store.EnqueueInternalEvents(context.Background(), []InternalEventRow{{
+		InstanceID:  inst.InstanceID,
+		MsgType:     "system",
+		MsgName:     "INTERNAL_READY",
+		PayloadJSON: `{"value":"ready"}`,
+		TraceID:     "trace-recover-internal",
+		CreatedAtMS: 1000,
+	}}); err != nil {
+		t.Fatalf("EnqueueInternalEvents: %v", err)
+	}
+
+	if err := Recover(context.Background(), def, actx.Store, reg, actx, RecoverOptions{OwnerL2Name: "WF.invoice@motherbee"}); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+
+	if reg.Count() != 0 {
+		t.Fatalf("expected completed instance to be removed from registry, got %d", reg.Count())
+	}
+	row, err := actx.Store.GetInstance(context.Background(), inst.InstanceID)
+	if err != nil {
+		t.Fatalf("GetInstance: %v", err)
+	}
+	if row.Status != "completed" || row.CurrentState != "completed" {
+		t.Fatalf("expected completed row after recover, got status=%q state=%q", row.Status, row.CurrentState)
+	}
+	events, err := actx.Store.ListInternalEvents(context.Background(), inst.InstanceID)
+	if err != nil {
+		t.Fatalf("ListInternalEvents: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("expected internal queue to be drained on recover, got %d", len(events))
+	}
+}

@@ -78,6 +78,19 @@ func TestValidateDefinitionRejectsInvalidRefSyntax(t *testing.T) {
 	assertErrorContains(t, err, "states[0].entry_actions[0].payload.customer_id.$ref")
 }
 
+func TestValidateDefinitionAcceptsEmitInternalEvent(t *testing.T) {
+	data := strings.Replace(validWorkflowJSON(), `"entry_actions": [],`, `"entry_actions": [{"type":"emit_internal_event","meta":{"msg":"INTERNAL_READY"},"payload":{"value":"ok"}}],`, 1)
+	if _, err := LoadDefinitionBytes([]byte(data), "", fixedClock); err != nil {
+		t.Fatalf("expected emit_internal_event to validate, got %v", err)
+	}
+}
+
+func TestValidateDefinitionRejectsEmitInternalEventWithoutMsg(t *testing.T) {
+	data := strings.Replace(validWorkflowJSON(), `"entry_actions": [],`, `"entry_actions": [{"type":"emit_internal_event","meta":{},"payload":{"value":"ok"}}],`, 1)
+	_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+	assertErrorContains(t, err, "states[1].entry_actions[0].meta.msg")
+}
+
 func TestValidateInputPayloadAcceptsNumericFields(t *testing.T) {
 	def, err := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
 	if err != nil {

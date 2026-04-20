@@ -124,7 +124,8 @@ func TestInstanceCreationRunsEntryActions(t *testing.T) {
 	if initialState == nil {
 		t.Fatalf("initial state not found")
 	}
-	inst.executeActions(context.Background(), initialState.EntryActions, msgWithName("START"), actx)
+	var emitted []InternalEventRow
+	inst.executeActions(context.Background(), initialState.EntryActions, msgWithName("START"), actx, &emitted)
 
 	// entry_actions has: send_message + schedule_timer
 	if len(disp.sent) != 1 {
@@ -159,7 +160,7 @@ func TestRunTransitionTakesFirstMatchingGuard(t *testing.T) {
 	})
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), event, actx)
+	err = inst.RunTransition(context.Background(), event, actx, nil)
 	inst.Unlock()
 
 	if err != nil {
@@ -454,7 +455,7 @@ func TestRunTransitionNoMatchLogsUnhandled(t *testing.T) {
 	event := msgWithName("UNKNOWN_EVENT")
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), event, actx)
+	err = inst.RunTransition(context.Background(), event, actx, nil)
 	inst.Unlock()
 
 	if err != nil {
@@ -496,7 +497,7 @@ func TestRunTransitionGuardFalseNoTransition(t *testing.T) {
 	event := msgWithNameAndPayload("DATA_VALIDATION_RESPONSE", map[string]any{"complete": false})
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), event, actx)
+	err = inst.RunTransition(context.Background(), event, actx, nil)
 	inst.Unlock()
 
 	if err != nil {
@@ -520,7 +521,7 @@ func TestRunTransitionCancellingGoesToCancelled(t *testing.T) {
 	_ = actx.Store.CreateInstance(context.Background(), row)
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), msgWithName("ANYTHING"), actx)
+	err = inst.RunTransition(context.Background(), msgWithName("ANYTHING"), actx, nil)
 	inst.Unlock()
 
 	if err != nil {
@@ -553,7 +554,7 @@ func TestTerminalStateCleansCancelledTimers(t *testing.T) {
 	event := msgWithNameAndPayload("DATA_VALIDATION_RESPONSE", map[string]any{"complete": true})
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), event, actx)
+	err = inst.RunTransition(context.Background(), event, actx, nil)
 	inst.Unlock()
 
 	if err != nil {
@@ -591,7 +592,7 @@ func TestActionFailureDoesNotHaltTransition(t *testing.T) {
 	event := msgWithNameAndPayload("DATA_VALIDATION_RESPONSE", map[string]any{"complete": true})
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), event, actx)
+	err = inst.RunTransition(context.Background(), event, actx, nil)
 	inst.Unlock()
 
 	if err != nil {
@@ -617,7 +618,7 @@ func TestSetVariableUpdatesStateVars(t *testing.T) {
 	event := msgWithNameAndPayload("DATA_VALIDATION_RESPONSE", map[string]any{"complete": true})
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), event, actx)
+	err = inst.RunTransition(context.Background(), event, actx, nil)
 	inst.Unlock()
 
 	if err != nil {
@@ -727,7 +728,7 @@ func TestTraceIDPreservedAcrossTransition(t *testing.T) {
 	}
 
 	inst.Lock()
-	err = inst.RunTransition(context.Background(), event, actx)
+	err = inst.RunTransition(context.Background(), event, actx, nil)
 	inst.Unlock()
 
 	if err != nil {
@@ -739,7 +740,419 @@ func TestTraceIDPreservedAcrossTransition(t *testing.T) {
 	}
 }
 
+func TestRunTransitionEmitInternalEventAdvancesSameInstance(t *testing.T) {
+	def, err := LoadDefinitionBytes([]byte(workflowJSONWithInternalTransition()), "", fixedClock)
+	if err != nil {
+		t.Fatalf("load def: %v", err)
+	}
+	actx := makeActx(t, &mockDispatcher{l2name: "WF.internal@motherbee"}, &mockTimerSender{})
+
+	inst := NewInstance(def, "wfi:int-1", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	row, _ := inst.ToRow(fixedClock)
+	_ = actx.Store.CreateInstance(context.Background(), row)
+
+	inst.Lock()
+	err = inst.RunTransition(context.Background(), msgWithName("START"), actx, nil)
+	if err == nil {
+		err = inst.drainInternalEvents(context.Background(), actx)
+	}
+	inst.Unlock()
+
+	if err != nil {
+		t.Fatalf("internal event transition: %v", err)
+	}
+	if inst.CurrentState != "completed" {
+		t.Fatalf("expected completed, got %s", inst.CurrentState)
+	}
+	if got := inst.StateVars["seen"]; got != "ready" {
+		t.Fatalf("expected seen=ready, got %#v", got)
+	}
+	events, err := actx.Store.ListInternalEvents(context.Background(), inst.InstanceID)
+	if err != nil {
+		t.Fatalf("ListInternalEvents: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("expected empty internal queue, got %d", len(events))
+	}
+}
+
+func TestCreateAndDispatchDrainsInitialInternalEvent(t *testing.T) {
+	def, err := LoadDefinitionBytes([]byte(workflowJSONWithInitialInternalEvent()), "", fixedClock)
+	if err != nil {
+		t.Fatalf("load def: %v", err)
+	}
+	disp := &mockDispatcher{l2name: "WF.initial@motherbee", uuid: "wf-uuid-initial"}
+	actx := makeActx(t, disp, &mockTimerSender{})
+	reg := NewInstanceRegistry()
+
+	msg := msgWithNameAndPayload("INITIAL_TRIGGER", map[string]any{"customer_id": "c1"})
+	if err := CorrelateAndDispatch(context.Background(), msg, reg, def, actx.Store, actx); err != nil {
+		t.Fatalf("CorrelateAndDispatch: %v", err)
+	}
+	if reg.Count() != 0 {
+		t.Fatalf("completed instance should not remain in active registry")
+	}
+	rows, err := actx.Store.ListInstances(context.Background(), "completed", 10, 0)
+	if err != nil {
+		t.Fatalf("ListInstances: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected one completed instance, got %d", len(rows))
+	}
+}
+
+func TestInternalEventsPreserveFIFOOrder(t *testing.T) {
+	def, err := LoadDefinitionBytes([]byte(workflowJSONWithTwoInternalEvents()), "", fixedClock)
+	if err != nil {
+		t.Fatalf("load def: %v", err)
+	}
+	actx := makeActx(t, &mockDispatcher{l2name: "WF.fifo@motherbee"}, &mockTimerSender{})
+
+	inst := NewInstance(def, "wfi:int-fifo", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	row, _ := inst.ToRow(fixedClock)
+	_ = actx.Store.CreateInstance(context.Background(), row)
+
+	inst.Lock()
+	err = inst.RunTransition(context.Background(), msgWithName("START"), actx, nil)
+	if err == nil {
+		err = inst.drainInternalEvents(context.Background(), actx)
+	}
+	inst.Unlock()
+
+	if err != nil {
+		t.Fatalf("FIFO transition: %v", err)
+	}
+	if inst.CurrentState != "completed" {
+		t.Fatalf("expected completed, got %s", inst.CurrentState)
+	}
+	if got := inst.StateVars["first_seen"]; got != "first" {
+		t.Fatalf("expected first_seen=first, got %#v", got)
+	}
+	if got := inst.StateVars["second_seen"]; got != "second" {
+		t.Fatalf("expected second_seen=second, got %#v", got)
+	}
+}
+
+func TestEmitInternalEventFromTargetEntryActionsIsDrainedAfterCommit(t *testing.T) {
+	def, err := LoadDefinitionBytes([]byte(workflowJSONWithTargetEntryInternalEvent()), "", fixedClock)
+	if err != nil {
+		t.Fatalf("load def: %v", err)
+	}
+	actx := makeActx(t, &mockDispatcher{l2name: "WF.entry@motherbee"}, &mockTimerSender{})
+
+	inst := NewInstance(def, "wfi:int-entry", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	row, _ := inst.ToRow(fixedClock)
+	_ = actx.Store.CreateInstance(context.Background(), row)
+
+	inst.Lock()
+	err = inst.RunTransition(context.Background(), msgWithName("START"), actx, nil)
+	if err == nil {
+		err = inst.drainInternalEvents(context.Background(), actx)
+	}
+	inst.Unlock()
+
+	if err != nil {
+		t.Fatalf("target entry internal event: %v", err)
+	}
+	if inst.CurrentState != "completed" {
+		t.Fatalf("expected completed, got %s", inst.CurrentState)
+	}
+	if got := inst.StateVars["entry_seen"]; got != "entered" {
+		t.Fatalf("expected entry_seen=entered, got %#v", got)
+	}
+}
+
+func TestTerminalTransitionClearsQueuedInternalEvents(t *testing.T) {
+	def, err := LoadDefinitionBytes([]byte(validWorkflowJSON()), "", fixedClock)
+	if err != nil {
+		t.Fatalf("load def: %v", err)
+	}
+	actx := makeActx(t, &mockDispatcher{l2name: "WF.invoice@motherbee"}, &mockTimerSender{})
+
+	inst := NewInstance(def, "wfi:clear-queue", def.WorkflowType, map[string]any{"customer_id": "c1"}, fixedClock)
+	row, _ := inst.ToRow(fixedClock)
+	_ = actx.Store.CreateInstance(context.Background(), row)
+	if err := actx.Store.EnqueueInternalEvents(context.Background(), []InternalEventRow{{
+		InstanceID:  inst.InstanceID,
+		MsgType:     "system",
+		MsgName:     "SHOULD_BE_DROPPED",
+		PayloadJSON: `{}`,
+		TraceID:     "trace-drop",
+		CreatedAtMS: nowMS(fixedClock),
+	}}); err != nil {
+		t.Fatalf("EnqueueInternalEvents: %v", err)
+	}
+
+	inst.Lock()
+	err = inst.RunTransition(context.Background(), msgWithNameAndPayload("DATA_VALIDATION_RESPONSE", map[string]any{"complete": true}), actx, nil)
+	inst.Unlock()
+
+	if err != nil {
+		t.Fatalf("RunTransition: %v", err)
+	}
+	events, err := actx.Store.ListInternalEvents(context.Background(), inst.InstanceID)
+	if err != nil {
+		t.Fatalf("ListInternalEvents: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("expected terminal cleanup to clear internal events, got %d", len(events))
+	}
+}
+
 // errSendFailed is a sentinel error for mock dispatcher failures.
 var errSendFailed = fmt.Errorf("mock send failure")
 
 func strPtr(s string) *string { return &s }
+
+func workflowJSONWithInternalTransition() string {
+	return `{
+  "wf_schema_version": "1",
+  "workflow_type": "internal-transition",
+  "description": "emit internal event from transition",
+  "input_schema": {
+    "type": "object",
+    "required": ["customer_id"],
+    "properties": {
+      "customer_id": { "type": "string" }
+    }
+  },
+  "initial_state": "waiting_start",
+  "terminal_states": ["completed"],
+  "states": [
+    {
+      "name": "waiting_start",
+      "description": "waits for start",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": [
+        {
+          "event_match": { "msg": "START" },
+          "guard": "true",
+          "target_state": "waiting_internal",
+          "actions": [
+            {
+              "type": "emit_internal_event",
+              "meta": { "msg": "INTERNAL_READY" },
+              "payload": { "value": "ready" }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "waiting_internal",
+      "description": "waits for internal event",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": [
+        {
+          "event_match": { "msg": "INTERNAL_READY" },
+          "guard": "event.payload.value == 'ready'",
+          "target_state": "completed",
+          "actions": [
+            { "type": "set_variable", "name": "seen", "value": "event.payload.value" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "completed",
+      "description": "done",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": []
+    }
+  ]
+}`
+}
+
+func workflowJSONWithInitialInternalEvent() string {
+	return `{
+  "wf_schema_version": "1",
+  "workflow_type": "initial-internal",
+  "description": "emit internal event from initial entry actions",
+  "input_schema": {
+    "type": "object",
+    "required": ["customer_id"],
+    "properties": {
+      "customer_id": { "type": "string" }
+    }
+  },
+  "initial_state": "booting",
+  "terminal_states": ["completed"],
+  "states": [
+    {
+      "name": "booting",
+      "description": "boots",
+      "entry_actions": [
+        {
+          "type": "emit_internal_event",
+          "meta": { "msg": "AUTO_CONTINUE" },
+          "payload": { "value": "booted" }
+        }
+      ],
+      "exit_actions": [],
+      "transitions": [
+        {
+          "event_match": { "msg": "AUTO_CONTINUE" },
+          "guard": "event.payload.value == 'booted'",
+          "target_state": "completed",
+          "actions": []
+        }
+      ]
+    },
+    {
+      "name": "completed",
+      "description": "done",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": []
+    }
+  ]
+}`
+}
+
+func workflowJSONWithTwoInternalEvents() string {
+	return `{
+  "wf_schema_version": "1",
+  "workflow_type": "fifo-internal",
+  "description": "multiple internal events preserve order",
+  "input_schema": {
+    "type": "object",
+    "required": ["customer_id"],
+    "properties": {
+      "customer_id": { "type": "string" }
+    }
+  },
+  "initial_state": "waiting_start",
+  "terminal_states": ["completed"],
+  "states": [
+    {
+      "name": "waiting_start",
+      "description": "wait start",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": [
+        {
+          "event_match": { "msg": "START" },
+          "guard": "true",
+          "target_state": "waiting_internal",
+          "actions": [
+            {
+              "type": "emit_internal_event",
+              "meta": { "msg": "FIRST" },
+              "payload": { "order": "first" }
+            },
+            {
+              "type": "emit_internal_event",
+              "meta": { "msg": "SECOND" },
+              "payload": { "order": "second" }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "waiting_internal",
+      "description": "wait internal",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": [
+        {
+          "event_match": { "msg": "FIRST" },
+          "guard": "event.payload.order == 'first'",
+          "target_state": "after_first",
+          "actions": [
+            { "type": "set_variable", "name": "first_seen", "value": "event.payload.order" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "after_first",
+      "description": "after first",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": [
+        {
+          "event_match": { "msg": "SECOND" },
+          "guard": "state.first_seen == 'first' && event.payload.order == 'second'",
+          "target_state": "completed",
+          "actions": [
+            { "type": "set_variable", "name": "second_seen", "value": "event.payload.order" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "completed",
+      "description": "done",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": []
+    }
+  ]
+}`
+}
+
+func workflowJSONWithTargetEntryInternalEvent() string {
+	return `{
+  "wf_schema_version": "1",
+  "workflow_type": "entry-internal",
+  "description": "target entry emits internal event",
+  "input_schema": {
+    "type": "object",
+    "required": ["customer_id"],
+    "properties": {
+      "customer_id": { "type": "string" }
+    }
+  },
+  "initial_state": "waiting_start",
+  "terminal_states": ["completed"],
+  "states": [
+    {
+      "name": "waiting_start",
+      "description": "wait start",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": [
+        {
+          "event_match": { "msg": "START" },
+          "guard": "true",
+          "target_state": "entered",
+          "actions": []
+        }
+      ]
+    },
+    {
+      "name": "entered",
+      "description": "entered",
+      "entry_actions": [
+        {
+          "type": "emit_internal_event",
+          "meta": { "msg": "ENTRY_READY" },
+          "payload": { "value": "entered" }
+        }
+      ],
+      "exit_actions": [],
+      "transitions": [
+        {
+          "event_match": { "msg": "ENTRY_READY" },
+          "guard": "event.payload.value == 'entered'",
+          "target_state": "completed",
+          "actions": [
+            { "type": "set_variable", "name": "entry_seen", "value": "event.payload.value" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "completed",
+      "description": "done",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": []
+    }
+  ]
+}`
+}

@@ -38,10 +38,12 @@ type ActionContext struct {
 
 // executeAction executes a single action definition.
 // Errors are returned for logging by the caller; they do NOT halt the transition.
-func executeAction(ctx context.Context, path string, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) error {
+func executeAction(ctx context.Context, path string, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext, emitted *[]InternalEventRow) error {
 	switch action.Type {
 	case "send_message":
 		return execSendMessage(ctx, action, inst, event, actx)
+	case "emit_internal_event":
+		return execEmitInternalEvent(action, inst, event, actx, emitted)
 	case "schedule_timer":
 		return execScheduleTimer(ctx, action, inst, event, actx)
 	case "cancel_timer":
@@ -53,6 +55,46 @@ func executeAction(ctx context.Context, path string, action ActionDefinition, in
 	default:
 		return fmt.Errorf("%s: unknown action type %q", path, action.Type)
 	}
+}
+
+func execEmitInternalEvent(action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext, emitted *[]InternalEventRow) error {
+	if emitted == nil {
+		return fmt.Errorf("emit_internal_event: no event sink configured")
+	}
+
+	eventMap := messageToMap(event)
+	resolvedPayload, err := Resolve(action.Payload, inst.Input, inst.StateVars, eventMap)
+	if err != nil {
+		return fmt.Errorf("emit_internal_event: resolve payload: %w", err)
+	}
+
+	payloadJSON, err := marshalJSON(resolvedPayload)
+	if err != nil {
+		return fmt.Errorf("emit_internal_event: marshal payload: %w", err)
+	}
+
+	msgType := "system"
+	if action.Meta != nil && action.Meta.Type != "" {
+		msgType = action.Meta.Type
+	}
+	msgName := ""
+	if action.Meta != nil {
+		msgName = action.Meta.Msg
+	}
+	traceID := inst.CurrentTraceID
+	if traceID == "" {
+		traceID = event.Routing.TraceID
+	}
+
+	*emitted = append(*emitted, InternalEventRow{
+		InstanceID:  inst.InstanceID,
+		MsgType:     msgType,
+		MsgName:     msgName,
+		PayloadJSON: payloadJSON,
+		TraceID:     traceID,
+		CreatedAtMS: nowMS(actx.Clock),
+	})
+	return nil
 }
 
 func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) error {

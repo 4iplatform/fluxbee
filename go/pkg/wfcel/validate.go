@@ -207,6 +207,14 @@ func validateAction(path string, action ActionDefinition, clock ClockFunc) Valid
 			errs = append(errs, ValidationError{Path: path + ".meta.type", Message: `must be "system" or "user" when present`})
 		}
 		errs = append(errs, validateRefPayload(path+".payload", action.Payload)...)
+	case "emit_internal_event":
+		if action.Meta == nil || strings.TrimSpace(action.Meta.Msg) == "" {
+			errs = append(errs, ValidationError{Path: path + ".meta.msg", Message: "must not be empty"})
+		}
+		if action.Meta != nil && action.Meta.Type != "" && action.Meta.Type != "system" && action.Meta.Type != "user" {
+			errs = append(errs, ValidationError{Path: path + ".meta.type", Message: `must be "system" or "user" when present`})
+		}
+		errs = append(errs, validateRefPayload(path+".payload", action.Payload)...)
 	case "schedule_timer":
 		if strings.TrimSpace(action.TimerKey) == "" {
 			errs = append(errs, ValidationError{Path: path + ".timer_key", Message: "must not be empty"})
