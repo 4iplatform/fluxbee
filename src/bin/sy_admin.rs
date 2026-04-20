@@ -61,6 +61,9 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "get_admin_action_help",
     "get_runtime",
     "list_nodes",
+    "publish_runtime_package",
+    "sync_hint",
+    "update",
     "add_route",
     "delete_route",
     "add_vpn",
@@ -931,6 +934,26 @@ fn admin_contract_field_schema(field: &serde_json::Value) -> serde_json::Value {
             "enum": values,
             "description": description,
         });
+    }
+    if let Some(item_type) = field_type.strip_suffix("[]") {
+        let item_schema_type = match item_type {
+            "bool" => "boolean",
+            "u16" | "u32" | "u64" | "i64" => "integer",
+            "f32" | "f64" => "number",
+            "object" => "object",
+            _ => "string",
+        };
+        let mut schema = serde_json::json!({
+            "type": "array",
+            "items": {
+                "type": item_schema_type,
+            },
+            "description": description,
+        });
+        if item_schema_type == "object" {
+            schema["items"]["additionalProperties"] = serde_json::Value::Bool(true);
+        }
+        return schema;
     }
     let schema_type = match field_type {
         "bool" => "boolean",
@@ -10056,6 +10079,9 @@ mod tests {
             .map(|spec| spec.action)
             .collect();
 
+        assert!(actions.contains(&"publish_runtime_package"));
+        assert!(actions.contains(&"sync_hint"));
+        assert!(actions.contains(&"update"));
         assert!(actions.contains(&"get_runtime"));
         assert!(actions.contains(&"run_node"));
         assert!(!actions.contains(&"wf_rules_compile_apply"));
@@ -10148,6 +10174,52 @@ mod tests {
         assert_eq!(plan.kind, "executor_plan");
         assert_eq!(plan.execution.steps.len(), 1);
         assert_eq!(plan.execution.steps[0].action, "get_runtime");
+    }
+
+    #[test]
+    fn executor_plan_validation_accepts_publish_runtime_lifecycle_plan() {
+        let plan = parse_executor_plan(json!({
+            "plan_version": "0.1",
+            "kind": "executor_plan",
+            "metadata": {
+                "name": "publish-and-run-support-demo",
+                "target_hive": "motherbee"
+            },
+            "execution": {
+                "strict": true,
+                "stop_on_error": true,
+                "allow_help_lookup": true,
+                "steps": [
+                    {
+                        "id": "s1",
+                        "action": "publish_runtime_package",
+                        "args": {
+                            "source": {
+                                "kind": "bundle_upload",
+                                "blob_path": "packages/incoming/ai-support-demo-0.1.0.zip"
+                            },
+                            "sync_to": ["worker-220"],
+                            "update_to": ["worker-220"]
+                        }
+                    },
+                    {
+                        "id": "s2",
+                        "action": "run_node",
+                        "args": {
+                            "hive": "worker-220",
+                            "node_name": "AI.support.demo@worker-220",
+                            "runtime": "ai.support.demo",
+                            "runtime_version": "current"
+                        }
+                    }
+                ]
+            }
+        }))
+        .expect("valid publish lifecycle executor plan");
+
+        assert_eq!(plan.execution.steps.len(), 2);
+        assert_eq!(plan.execution.steps[0].action, "publish_runtime_package");
+        assert_eq!(plan.execution.steps[1].action, "run_node");
     }
 
     #[test]

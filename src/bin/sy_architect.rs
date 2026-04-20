@@ -110,6 +110,7 @@ Rules:
 - Use specialized write tools for large-body mutations instead of `fluxbee_system_write`:
   - `fluxbee_deploy_workflow` — for `wf_rules_compile_apply` when passing a full workflow `definition`. Pass the definition object in `definition`, or if that is not possible, serialize it to a JSON string and pass it in `definition_json`.
   - `fluxbee_deploy_opa_policy` — for `opa_compile_apply` when passing a full OPA `rego` source string.
+  - `fluxbee_publish_runtime_package` — for `publish_runtime_package` when passing a large `inline_package` file map or a complete package source object. Pass the source in `source`, or serialize it to JSON and pass it in `source_json`.
   - `fluxbee_set_node_config` — for `node_control_config_set` when passing a large node `config` object. Pass the config in `config`, or serialize to a JSON string and pass in `config_json`. Always do CONFIG_GET first to read the current `config_version`.
   - Use `fluxbee_system_write` only for mutations whose body is small and fits cleanly as an inline JSON object (route adds, vpn adds, kill_node, rollback, delete, etc.).
 - Do not claim actions were executed unless they actually were.
@@ -442,6 +443,9 @@ impl FunctionToolProvider for ArchitectAdminReadToolsProvider {
             self.context.clone(),
         )))?;
         registry.register(Arc::new(ArchitectDeployOpaPolicyTool::new(
+            self.context.clone(),
+        )))?;
+        registry.register(Arc::new(ArchitectPublishRuntimePackageTool::new(
             self.context.clone(),
         )))?;
         registry.register(Arc::new(ArchitectSetNodeConfigTool::new(
@@ -855,6 +859,117 @@ impl FunctionTool for ArchitectDeployOpaPolicyTool {
         let preview_command = format!(
             "SCMD: curl -X POST /hives/{hive}/opa/policy -d '{{\"rego\":\"{rego_preview}\",…}}'"
         );
+        let tool_arguments = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
+        stage_admin_write(
+            &self.context,
+            session_id,
+            translation,
+            &preview_command,
+            &tool_arguments,
+        )
+        .await
+    }
+}
+
+// ---- ArchitectPublishRuntimePackageTool -------------------------------------
+//
+// Accepts the publish source as a named first-class parameter for
+// publish_runtime_package. The `source` object can be large, especially for
+// inline_package file maps generated from manifests/plans.
+
+struct ArchitectPublishRuntimePackageTool {
+    context: ArchitectAdminToolContext,
+}
+
+impl ArchitectPublishRuntimePackageTool {
+    fn new(context: ArchitectAdminToolContext) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl FunctionTool for ArchitectPublishRuntimePackageTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "fluxbee_publish_runtime_package".to_string(),
+            description: format!(
+                "Publish a runtime package through SY.admin on hive {}. \
+                Stages the publish for user confirmation (CONFIRM / CANCEL). \
+                Use this instead of fluxbee_system_write when the package source is large, \
+                especially for inline_package file maps. Pass the source as a JSON object in \
+                `source` OR as a JSON-encoded string in `source_json`.",
+                self.context.hive_id,
+            ),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "hive": {
+                        "type": "string",
+                        "description": "Admin hive id. Defaults to the local hive. Publication is motherbee-only in the current implementation."
+                    },
+                    "source": {
+                        "type": "object",
+                        "description": "Complete publish source object. Supported kinds are inline_package and bundle_upload. For inline_package, include the full files map under source.files."
+                    },
+                    "source_json": {
+                        "type": "string",
+                        "description": "Alternative to `source`: the complete source object serialized as JSON. Use this when passing the object directly is not possible."
+                    },
+                    "set_current": {
+                        "type": "boolean",
+                        "description": "Optional current-pointer intent. Only true or omission is supported in the current implementation."
+                    },
+                    "sync_to": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional hives that should receive sync_hint(channel=dist) after publish."
+                    },
+                    "update_to": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional hives that should receive update(category=runtime) for the newly published runtime/version."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let session_id = require_session_id(&self.context, "fluxbee_publish_runtime_package")?;
+        let hive = arguments
+            .get("hive")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.context.hive_id)
+            .to_string();
+        let source =
+            resolve_json_object_param(&arguments, "source", "source_json").map_err(|err| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                    "fluxbee_publish_runtime_package: {err}"
+                ))
+            })?;
+
+        let mut body = json!({ "source": source });
+        if let Some(set_current) = arguments.get("set_current").filter(|v| v.is_boolean()) {
+            body["set_current"] = set_current.clone();
+        }
+        if let Some(sync_to) = arguments.get("sync_to").filter(|v| v.is_array()) {
+            body["sync_to"] = sync_to.clone();
+        }
+        if let Some(update_to) = arguments.get("update_to").filter(|v| v.is_array()) {
+            body["update_to"] = update_to.clone();
+        }
+
+        let translation = AdminTranslation {
+            admin_target: format!("SY.admin@{hive}"),
+            action: "publish_runtime_package".to_string(),
+            target_hive: hive.clone(),
+            params: body,
+        };
+        let preview_command =
+            "SCMD: curl -X POST /admin/runtime-packages/publish -d '{…package source…}'"
+                .to_string();
         let tool_arguments = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
         stage_admin_write(
             &self.context,
@@ -9431,6 +9546,23 @@ mod tests {
 
     fn parse(raw: &str) -> ParsedScmd {
         parse_scmd(raw).expect("scmd should parse")
+    }
+
+    #[test]
+    fn resolve_json_object_param_accepts_json_string() {
+        let value = json!({
+            "source_json": "{\"kind\":\"bundle_upload\",\"blob_path\":\"packages/incoming/demo.zip\"}"
+        });
+
+        let resolved =
+            resolve_json_object_param(&value, "source", "source_json").expect("resolve source");
+        assert_eq!(
+            resolved,
+            json!({
+                "kind": "bundle_upload",
+                "blob_path": "packages/incoming/demo.zip"
+            })
+        );
     }
 
     #[test]

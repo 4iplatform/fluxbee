@@ -357,6 +357,118 @@ Forbidden examples:
 - deciding merge vs replace unless the plan already declared it
 - inventing runtime names, workflow names, or node names
 
+### 7.5 Package publish steps use the native admin action shape
+
+Runtime publication does not use a separate plan vocabulary. The step uses the
+exact `publish_runtime_package` admin action and passes the real request body in
+`args`.
+
+That means:
+
+- the step action is `publish_runtime_package`
+- `args.source.kind` is either `inline_package` or `bundle_upload`
+- `args.sync_to` and `args.update_to` are explicit lifecycle intents, not
+  implicit executor behavior
+- spawn/restart remains a later explicit step such as `run_node`
+
+Minimal `inline_package` example:
+
+```json
+{
+  "id": "s1",
+  "action": "publish_runtime_package",
+  "args": {
+    "source": {
+      "kind": "inline_package",
+      "files": {
+        "package.json": "{\n  \"name\": \"ai.support.demo\",\n  \"version\": \"0.1.0\",\n  \"type\": \"config_only\",\n  \"runtime_base\": \"ai.generic\"\n}",
+        "config/default-config.json": "{\n  \"tenant_id\": \"tnt:demo\"\n}",
+        "assets/prompts/system.txt": "You are a support agent."
+      }
+    },
+    "sync_to": ["worker-220"],
+    "update_to": ["worker-220"]
+  }
+}
+```
+
+Minimal `bundle_upload` example:
+
+```json
+{
+  "id": "s1",
+  "action": "publish_runtime_package",
+  "args": {
+    "source": {
+      "kind": "bundle_upload",
+      "blob_path": "packages/incoming/ai-frontdesk-1.0.0.zip"
+    },
+    "sync_to": ["worker-220"],
+    "update_to": ["worker-220"]
+  }
+}
+```
+
+### 7.6 Runtime lifecycle composition stays explicit
+
+For runtime publication plans, the lifecycle is still modeled in ordered steps:
+
+1. `publish_runtime_package`
+2. optional post-publish convergence declared in that same step via `sync_to`
+   and `update_to`
+3. `run_node` or `restart_node`
+
+The executor must not infer spawn from publish success.
+
+Example:
+
+```json
+{
+  "plan_version": "0.1",
+  "kind": "executor_plan",
+  "metadata": {
+    "name": "publish-and-run-support-demo",
+    "target_hive": "motherbee"
+  },
+  "execution": {
+    "strict": true,
+    "stop_on_error": true,
+    "allow_help_lookup": true,
+    "steps": [
+      {
+        "id": "s1",
+        "action": "publish_runtime_package",
+        "args": {
+          "source": {
+            "kind": "inline_package",
+            "files": {
+              "package.json": "{\n  \"name\": \"ai.support.demo\",\n  \"version\": \"0.1.0\",\n  \"type\": \"config_only\",\n  \"runtime_base\": \"ai.generic\"\n}",
+              "config/default-config.json": "{\n  \"tenant_id\": \"tnt:demo\"\n}",
+              "assets/prompts/system.txt": "You are a support agent."
+            }
+          },
+          "sync_to": ["worker-220"],
+          "update_to": ["worker-220"]
+        }
+      },
+      {
+        "id": "s2",
+        "action": "run_node",
+        "args": {
+          "hive": "worker-220",
+          "node_name": "AI.support.demo@worker-220",
+          "runtime": "ai.support.demo",
+          "runtime_version": "current",
+          "config": {
+            "tenant_id": "tnt:demo"
+          }
+        }
+      }
+    ]
+  }
+}
+```
+
 ---
 
 ## 8. Execution Rules

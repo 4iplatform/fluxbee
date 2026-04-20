@@ -168,19 +168,19 @@ Optional follow-up operations after publish:
 - [x] RPP-D1. Add Archi-facing tool/action for publishing runtime packages.
   - `sy_architect` translates `POST /admin/runtime-packages/publish` to `publish_runtime_package`.
   - The generic mutating admin tool allowlist now permits `publish_runtime_package`.
-- [ ] RPP-D2. Support `inline_package` requests from manifests/execution plans.
-  - generated config/assets/files for instance-oriented nodes
-- [ ] RPP-D3. Support `bundle_upload` requests from manifests/execution plans.
-  - bundle reference/token/path
-- [ ] RPP-D4. Define manifest/execution-plan task shape for publish.
-  - desired runtime name
-  - desired version
-  - source mode
-  - target hives for deploy/update
-- [ ] RPP-D5. Ensure Archi composes the lifecycle explicitly:
-  - publish
-  - sync/update
-  - spawn/restart
+  - `SY.admin` executor pilot/subset catalog now includes `publish_runtime_package`, `sync_hint`, `update`, and `run_node` so plans can compose the lifecycle without extra catalog overrides.
+- [x] RPP-D2. Support `inline_package` requests from manifests/execution plans.
+  - `publish_runtime_package` is now a native executor-plan action with documented `inline_package` examples.
+  - `sy_architect` now exposes `fluxbee_publish_runtime_package` for large inline file maps.
+- [x] RPP-D3. Support `bundle_upload` requests from manifests/execution plans.
+  - Executor-plan docs now include canonical `bundle_upload` step shape with `blob_path`.
+  - `fluxbee_publish_runtime_package` also supports bundle sources via `source` / `source_json`.
+- [x] RPP-D4. Define manifest/execution-plan task shape for publish.
+  - The canonical plan step is `action = "publish_runtime_package"` with native admin args.
+  - Shape is documented with `source.kind`, `sync_to`, and `update_to`.
+- [x] RPP-D5. Ensure Archi composes the lifecycle explicitly:
+  - Documented canonical sequence: publish -> declared sync/update intent -> run_node/restart_node.
+  - No implicit spawn from publish success.
 - [ ] RPP-D6. Update solution-manifest/execution-plan docs to stop referencing `fluxbee-publish` as the operator path.
 
 ### Phase E - Service Integration
