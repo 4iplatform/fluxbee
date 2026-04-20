@@ -5365,7 +5365,20 @@ async fn resolve_chat_session(
         if let Some(session) = load_session_record(&sessions, &profiles, &session_id).await? {
             return Ok((session_id, session));
         }
-        return Err(format!("session not found: {session_id}").into());
+        let now = now_epoch_ms();
+        let record = ChatSessionRecord {
+            session_id: session_id.clone(),
+            title: sanitize_session_title(title.as_deref()),
+            agent: "architect".to_string(),
+            created_at_ms: now,
+            last_activity_at_ms: now,
+            message_count: 0,
+            last_message_preview: String::new(),
+            ..default_session_profile()
+        };
+        upsert_session_record(&sessions, &record).await?;
+        upsert_session_profile_record(&profiles, &session_profile_from_record(&record)).await?;
+        return Ok((session_id, record));
     }
 
     let now = now_epoch_ms();
