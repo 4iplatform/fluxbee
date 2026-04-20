@@ -1216,10 +1216,18 @@ fn validate_scalar_against_schema(
     schema_obj: &serde_json::Map<String, serde_json::Value>,
     path: &str,
 ) -> Result<(), String> {
-    let field_type = schema_obj
+    let type_entry = schema_obj
         .get("type")
-        .and_then(serde_json::Value::as_str)
         .ok_or_else(|| format!("{path}: schema.type is required"))?;
+    let field_type = if let Some(s) = type_entry.as_str() {
+        s
+    } else if let Some(arr) = type_entry.as_array() {
+        arr.iter()
+            .find_map(|v| v.as_str().filter(|s| *s != "null"))
+            .ok_or_else(|| format!("{path}: schema.type array has no non-null type"))?
+    } else {
+        return Err(format!("{path}: schema.type must be a string or array"));
+    };
     let type_matches = match field_type {
         "string" => value.is_string(),
         "boolean" => value.is_boolean(),
