@@ -3574,6 +3574,7 @@ fn admin_action_allows_ai_write(action: &str) -> bool {
         action,
         "add_hive"
             | "remove_hive"
+            | "publish_runtime_package"
             | "add_route"
             | "delete_route"
             | "add_vpn"
@@ -3958,6 +3959,20 @@ fn translate_scmd(
             target_hive: local_hive_id.to_string(),
             params: json!({ "action_name": action_name }),
         }),
+        ("POST", ["admin", "runtime-packages", "publish"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err(
+                    "SCMD body for publish_runtime_package must be a JSON object".into(),
+                );
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "publish_runtime_package".to_string(),
+                target_hive: local_hive_id.to_string(),
+                params,
+            })
+        }
         ("GET", ["hive", "status"]) => Ok(AdminTranslation {
             admin_target,
             action: "hive_status".to_string(),
@@ -9474,6 +9489,32 @@ mod tests {
                 "definition": { "wf_schema_version": "1" }
             })
         );
+    }
+
+    #[test]
+    fn translate_publish_runtime_package_scmd() {
+        let translated = translate_scmd(
+            "motherbee",
+            parse(
+                r#"curl -X POST /admin/runtime-packages/publish -d '{"source":{"kind":"bundle_upload","blob_path":"packages/incoming/ai-support-demo-0.1.0.zip"},"sync_to":["worker-220"],"update_to":["worker-220"]}'"#,
+            ),
+        )
+        .expect("translation should succeed");
+
+        assert_eq!(translated.action, "publish_runtime_package");
+        assert_eq!(translated.target_hive, "motherbee");
+        assert_eq!(
+            translated.params,
+            json!({
+                "source": {
+                    "kind": "bundle_upload",
+                    "blob_path": "packages/incoming/ai-support-demo-0.1.0.zip"
+                },
+                "sync_to": ["worker-220"],
+                "update_to": ["worker-220"]
+            })
+        );
+        assert!(admin_action_allows_ai_write("publish_runtime_package"));
     }
 
     #[test]

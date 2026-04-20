@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::Cursor;
+use std::io::{self, Cursor};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+use zip::ZipArchive;
 
 use async_trait::async_trait;
 use fluxbee_ai_sdk::{
@@ -33,12 +35,18 @@ use fluxbee_sdk::{
     ClientConfig, NodeConfig, NodeReceiver, NodeSecretDescriptor, NodeSecretError,
     NodeSecretRecord, NodeSecretWriteOptions, NodeSender, NODE_SECRET_REDACTION_TOKEN,
 };
+use json_router::runtime_package::{
+    install_validated_package, validate_package, DIST_RUNTIME_MANIFEST_PATH, DIST_RUNTIME_ROOT_DIR,
+};
+use json_router::runtime_manifest::{write_runtime_manifest_file_atomic, RuntimeManifest};
 use json_router::shm::{
     now_epoch_ms, LsaRegionReader, RemoteHiveEntry, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
 };
+use sha2::{Digest, Sha256};
 
 type AdminError = Box<dyn std::error::Error + Send + Sync>;
 const PRIMARY_HIVE_ID: &str = "motherbee";
+const DEFAULT_BLOB_ROOT: &str = "/var/lib/fluxbee/blob";
 const MSG_ADMIN_COMMAND: &str = "ADMIN_COMMAND";
 const MSG_ADMIN_COMMAND_RESPONSE: &str = "ADMIN_COMMAND_RESPONSE";
 const DEFAULT_ADMIN_EXECUTOR_MODEL: &str = "gpt-5.4-mini";
@@ -68,6 +76,7 @@ struct HiveFile {
     role: Option<String>,
     admin: Option<AdminSection>,
     wan: Option<WanSection>,
+    blob: Option<BlobSection>,
     storage: Option<StorageSection>,
 }
 
@@ -79,6 +88,11 @@ struct AdminSection {
 #[derive(Debug, Deserialize)]
 struct WanSection {
     authorized_hives: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlobSection {
+    path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -217,6 +231,7 @@ struct AdminContext {
     config_dir: PathBuf,
     state_dir: PathBuf,
     socket_dir: PathBuf,
+    blob_root: PathBuf,
     node_name: String,
     hive_id: String,
     authorized_hives: Vec<String>,
@@ -225,6 +240,28 @@ struct AdminContext {
     command_lock: Arc<Mutex<()>>,
     executor_runtime: Arc<Mutex<Option<AdminExecutorAiRuntime>>>,
     executor_configured: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PublishRuntimePackageSource {
+    InlinePackage {
+        files: BTreeMap<String, String>,
+    },
+    BundleUpload {
+        blob_path: String,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PublishRuntimePackageRequest {
+    source: PublishRuntimePackageSource,
+    #[serde(default)]
+    set_current: Option<bool>,
+    #[serde(default)]
+    sync_to: Vec<String>,
+    #[serde(default)]
+    update_to: Vec<String>,
 }
 
 struct AdminRouterClient {
@@ -456,6 +493,7 @@ async fn main() -> Result<(), AdminError> {
 
     let hive = load_hive(&config_dir)?;
     let hive_id = hive.hive_id.clone();
+    let blob_root = configured_blob_root(&hive);
     let authorized_hives = hive
         .wan
         .as_ref()
@@ -513,6 +551,7 @@ async fn main() -> Result<(), AdminError> {
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),
         socket_dir: socket_dir.clone(),
+        blob_root,
         node_name,
         hive_id,
         authorized_hives,
@@ -676,6 +715,16 @@ where
 fn load_hive(config_dir: &Path) -> Result<HiveFile, AdminError> {
     let data = fs::read_to_string(config_dir.join("hive.yaml"))?;
     Ok(serde_yaml::from_str(&data)?)
+}
+
+fn configured_blob_root(hive: &HiveFile) -> PathBuf {
+    hive.blob
+        .as_ref()
+        .and_then(|blob| blob.path.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_BLOB_ROOT))
 }
 
 fn default_admin_executor_schema_version() -> u32 {
@@ -2303,7 +2352,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "5";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "6";
 
 const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
@@ -2327,6 +2376,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "get_admin_action_help",
         route: InternalActionRoute::Command("get_admin_action_help"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "publish_runtime_package",
+        route: InternalActionRoute::Command("publish_runtime_package"),
         requires_target: false,
         allow_legacy_hive_id: false,
     },
@@ -3290,6 +3345,17 @@ async fn handle_http(
         }
         ("GET", "/admin/executor/functions") => {
             let (status, resp) = build_admin_executor_function_catalog_response(ctx)?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("POST", "/admin/runtime-packages/publish") => {
+            let payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(&body)?
+            };
+            let (status, resp) =
+                handle_admin_command(ctx, client, "publish_runtime_package", payload, None)
+                    .await?;
             respond_json(stream, status, &resp).await?;
         }
         ("GET", path) if path.starts_with("/admin/actions/") => {
@@ -4509,9 +4575,14 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         return 502;
     }
     match code.as_str() {
-        "INVALID_REQUEST" | "INVALID_ADDRESS" | "INVALID_ARCHIVE" | "INVALID_HIVE_ID" => 400,
+        "INVALID_REQUEST"
+        | "INVALID_ADDRESS"
+        | "INVALID_ARCHIVE"
+        | "INVALID_HIVE_ID"
+        | "INVALID_ZIP" => 400,
         "NOT_FOUND"
         | "NODE_NOT_FOUND"
+        | "BLOB_NOT_FOUND"
         | "RUNTIME_NOT_AVAILABLE"
         | "RUNTIME_NOT_FOUND"
         | "RUNTIME_VERSION_NOT_FOUND" => 404,
@@ -4532,6 +4603,7 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "BUSY" => 409,
         "COMPILE_ERROR"
         | "INVALID_CONFIG"
+        | "INVALID_PACKAGE_LAYOUT"
         | "UNSUPPORTED_APPLY_MODE"
         | "PACKAGE_PUBLISH_FAILED" => 422,
         "INVALID_WORKFLOW_NAME" | "INVALID_CONFIG_SET" | "UNSUPPORTED_OPERATION" => 400,
@@ -5781,6 +5853,7 @@ fn admin_action_is_read_only(action: &str) -> bool {
     !matches!(
         action,
         "add_hive"
+            | "publish_runtime_package"
             | "remove_hive"
             | "add_route"
             | "delete_route"
@@ -5811,7 +5884,8 @@ fn admin_action_is_read_only(action: &str) -> bool {
 fn admin_action_requires_confirmation(action: &str) -> bool {
     matches!(
         action,
-        "remove_hive"
+        "publish_runtime_package"
+            | "remove_hive"
             | "delete_route"
             | "delete_vpn"
             | "kill_node"
@@ -5833,6 +5907,7 @@ fn admin_action_summary(action: &str) -> &'static str {
     match action {
         "list_admin_actions" => "List the dynamic admin action catalog and help metadata.",
         "get_admin_action_help" => "Return help metadata for one admin action.",
+        "publish_runtime_package" => "Publish one runtime package into dist/manifest on motherbee.",
         "hive_status" => "Read the local hive status summary.",
         "list_hives" => "List all known hives.",
         "get_hive" => "Read one hive definition.",
@@ -5908,6 +5983,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
     match action {
         "list_admin_actions" => vec!["GET /admin/actions"],
         "get_admin_action_help" => vec!["GET /admin/actions/{action}"],
+        "publish_runtime_package" => vec!["POST /admin/runtime-packages/publish"],
         "hive_status" => vec!["GET /hive/status"],
         "list_hives" => vec!["GET /hives"],
         "get_hive" => vec!["GET /hives/{hive}"],
@@ -6027,6 +6103,7 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             "string",
             "Admin action name, for example add_hive.",
         )],
+        "publish_runtime_package" => Vec::new(),
         "get_hive" | "remove_hive" => vec![admin_action_path_param(
             "hive",
             "string",
@@ -6133,6 +6210,7 @@ fn admin_action_body_required(action: &str) -> bool {
     matches!(
         action,
         "add_hive"
+            | "publish_runtime_package"
             | "run_node"
             | "add_route"
             | "add_vpn"
@@ -6167,6 +6245,11 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
                 "WAN or bootstrap address reachable from motherbee.",
             ),
         ],
+        "publish_runtime_package" => vec![admin_action_body_field(
+            "source",
+            "object",
+            "Runtime package source descriptor. Supports source.kind=inline_package and source.kind=bundle_upload.",
+        )],
         "run_node" => vec![admin_action_body_field(
             "node_name",
             "string",
@@ -6282,6 +6365,23 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
 
 fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
     match action {
+        "publish_runtime_package" => vec![
+            admin_action_body_field(
+                "set_current",
+                "bool",
+                "Optional current-pointer intent. Only true or omission is supported in the current implementation.",
+            ),
+            admin_action_body_field(
+                "sync_to",
+                "string[]",
+                "Optional hives that should receive sync_hint(channel=dist) after publish.",
+            ),
+            admin_action_body_field(
+                "update_to",
+                "string[]",
+                "Optional hives that should receive update(category=runtime) for the newly published runtime/version.",
+            ),
+        ],
         "add_hive" => vec![
             admin_action_body_field(
                 "harden_ssh",
@@ -6586,6 +6686,15 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
 
 fn admin_action_example_payload(action: &str) -> serde_json::Value {
     match action {
+        "publish_runtime_package" => serde_json::json!({
+            "source": {
+                "kind": "bundle_upload",
+                "blob_path": "packages/incoming/ai-support-demo-0.1.0.zip"
+            },
+            "set_current": true,
+            "sync_to": ["worker-220"],
+            "update_to": ["worker-220"]
+        }),
         "add_hive" => serde_json::json!({
             "hive_id": "worker-220",
             "address": "192.168.8.220"
@@ -6756,6 +6865,9 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
     let text = match action {
         "list_admin_actions" => "curl -X GET /admin/actions",
         "get_admin_action_help" => "curl -X GET /admin/actions/add_hive",
+        "publish_runtime_package" => {
+            r#"curl -X POST /admin/runtime-packages/publish -d '{"source":{"kind":"bundle_upload","blob_path":"packages/incoming/ai-support-demo-0.1.0.zip"},"set_current":true,"sync_to":["worker-220"],"update_to":["worker-220"]}'"#
+        }
         "hive_status" => "curl -X GET /hive/status",
         "list_hives" => "curl -X GET /hives",
         "get_hive" => "curl -X GET /hives/worker-220",
@@ -6881,6 +6993,13 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
 
 fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
     match action {
+        "publish_runtime_package" => vec![
+            "Motherbee-only operation.",
+            "Supported source kinds: inline_package and bundle_upload.",
+            "bundle_upload resolves blob_path relative to the configured blob root in hive.yaml.",
+            "Publishing mutates dist/manifest but does not spawn nodes.",
+            "Optional sync_to runs sync_hint(channel=dist) after publish; optional update_to runs update(category=runtime) scoped to the new runtime/version.",
+        ],
         "add_hive" | "remove_hive" => vec![
             "Motherbee-only operation.",
             "For HTTP usage the hive id is in the body for add_hive and in the path for remove_hive.",
@@ -7048,6 +7167,729 @@ fn admin_action_body_field(name: &str, value_type: &str, description: &str) -> s
     })
 }
 
+fn runtime_package_staging_root(state_dir: &Path) -> PathBuf {
+    state_dir.join("runtime-package-staging")
+}
+
+fn runtime_package_safe_rel_path(raw: &str) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("inline package contains empty file path".to_string());
+    }
+    let rel = PathBuf::from(trimmed);
+    if rel.is_absolute() {
+        return Err(format!(
+            "inline package file path must be relative (got '{}')",
+            trimmed
+        ));
+    }
+    if rel
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "inline package file path must not contain '..' (got '{}')",
+            trimmed
+        ));
+    }
+    Ok(rel)
+}
+
+fn runtime_package_safe_blob_rel_path(raw: &str) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("bundle_upload requires a non-empty blob_path".to_string());
+    }
+    let rel = PathBuf::from(trimmed);
+    if rel.is_absolute() {
+        return Err(format!(
+            "bundle_upload blob_path must be relative to blob root (got '{}')",
+            trimmed
+        ));
+    }
+    if rel
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "bundle_upload blob_path must not contain '..' (got '{}')",
+            trimmed
+        ));
+    }
+    Ok(rel)
+}
+
+fn normalize_publish_follow_up_hives(raw: &[String], field_name: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for value in raw {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(format!("{field_name} must not contain empty hive ids"));
+        }
+        if seen.insert(trimmed.to_string()) {
+            out.push(trimmed.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn materialize_inline_runtime_package(
+    files: &BTreeMap<String, String>,
+    staging_root: &Path,
+) -> Result<PathBuf, String> {
+    if files.is_empty() {
+        return Err("inline package requires at least one file".to_string());
+    }
+    let package_root = staging_root.join(format!("inline-{}", Uuid::new_v4().simple()));
+    fs::create_dir_all(&package_root).map_err(|err| {
+        format!(
+            "failed to create inline package staging dir '{}': {}",
+            package_root.display(),
+            err
+        )
+    })?;
+
+    for (raw_path, contents) in files {
+        let rel = runtime_package_safe_rel_path(raw_path)?;
+        let full_path = package_root.join(&rel);
+        let Some(parent) = full_path.parent() else {
+            let _ = fs::remove_dir_all(&package_root);
+            return Err(format!(
+                "inline package file path has no parent '{}'",
+                raw_path
+            ));
+        };
+        fs::create_dir_all(parent).map_err(|err| {
+            let _ = fs::remove_dir_all(&package_root);
+            format!(
+                "failed to create inline package parent '{}' for '{}': {}",
+                parent.display(),
+                raw_path,
+                err
+            )
+        })?;
+        fs::write(&full_path, contents).map_err(|err| {
+            let _ = fs::remove_dir_all(&package_root);
+            format!(
+                "failed to write inline package file '{}' : {}",
+                full_path.display(),
+                err
+            )
+        })?;
+    }
+
+    if !package_root.join("package.json").is_file() {
+        let _ = fs::remove_dir_all(&package_root);
+        return Err("inline package must include package.json at package root".to_string());
+    }
+
+    Ok(package_root)
+}
+
+fn materialize_bundle_runtime_package(
+    blob_root: &Path,
+    blob_path: &str,
+    staging_root: &Path,
+) -> Result<(PathBuf, PathBuf), String> {
+    let rel_blob_path = runtime_package_safe_blob_rel_path(blob_path)?;
+    let bundle_path = blob_root.join(&rel_blob_path);
+    if !bundle_path.is_file() {
+        return Err(format!(
+            "bundle blob not found '{}'",
+            bundle_path.display()
+        ));
+    }
+
+    let extraction_root = staging_root.join(format!("bundle-{}", Uuid::new_v4().simple()));
+    fs::create_dir_all(&extraction_root).map_err(|err| {
+        format!(
+            "failed to create bundle staging dir '{}': {}",
+            extraction_root.display(),
+            err
+        )
+    })?;
+
+    let archive_file = match fs::File::open(&bundle_path) {
+        Ok(file) => file,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&extraction_root);
+            return Err(format!(
+                "failed to open bundle zip '{}' : {}",
+                bundle_path.display(),
+                err
+            ));
+        }
+    };
+    let mut archive = match ZipArchive::new(archive_file) {
+        Ok(archive) => archive,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&extraction_root);
+            return Err(format!(
+                "invalid zip at '{}' : {}",
+                bundle_path.display(),
+                err
+            ));
+        }
+    };
+
+    let mut root_dir_name: Option<String> = None;
+    for index in 0..archive.len() {
+        let mut entry = match archive.by_index(index) {
+            Ok(entry) => entry,
+            Err(err) => {
+                let _ = fs::remove_dir_all(&extraction_root);
+                return Err(format!(
+                    "failed to read zip entry #{index} from '{}' : {}",
+                    bundle_path.display(),
+                    err
+                ));
+            }
+        };
+
+        let enclosed = match entry.enclosed_name().map(|path| path.to_path_buf()) {
+            Some(path) if !path.as_os_str().is_empty() => path,
+            _ => {
+                let _ = fs::remove_dir_all(&extraction_root);
+                return Err(format!(
+                    "bundle_upload zip contains unsafe entry paths '{}'",
+                    bundle_path.display()
+                ));
+            }
+        };
+
+        let mut components = enclosed.components();
+        let first = match components.next() {
+            Some(std::path::Component::Normal(component)) => component.to_string_lossy().to_string(),
+            _ => {
+                let _ = fs::remove_dir_all(&extraction_root);
+                return Err("bundle_upload zip must contain a single root directory".to_string());
+            }
+        };
+        if let Some(expected) = root_dir_name.as_deref() {
+            if expected != first {
+                let _ = fs::remove_dir_all(&extraction_root);
+                return Err("bundle_upload zip must contain exactly one root directory".to_string());
+            }
+        } else {
+            root_dir_name = Some(first);
+        }
+
+        if !entry.is_dir() && components.as_path().as_os_str().is_empty() {
+            let _ = fs::remove_dir_all(&extraction_root);
+            return Err(
+                "bundle_upload zip must contain files under a single root directory".to_string(),
+            );
+        }
+
+        let output_path = extraction_root.join(&enclosed);
+        if entry.is_dir() {
+            if let Err(err) = fs::create_dir_all(&output_path) {
+                let _ = fs::remove_dir_all(&extraction_root);
+                return Err(format!(
+                    "failed to create extracted directory '{}' : {}",
+                    output_path.display(),
+                    err
+                ));
+            }
+            continue;
+        }
+
+        let Some(parent) = output_path.parent() else {
+            let _ = fs::remove_dir_all(&extraction_root);
+            return Err(format!(
+                "failed to resolve parent directory for extracted file '{}'",
+                output_path.display()
+            ));
+        };
+        if let Err(err) = fs::create_dir_all(parent) {
+            let _ = fs::remove_dir_all(&extraction_root);
+            return Err(format!(
+                "failed to create extracted parent '{}' : {}",
+                parent.display(),
+                err
+            ));
+        }
+
+        let mut output_file = match fs::File::create(&output_path) {
+            Ok(file) => file,
+            Err(err) => {
+                let _ = fs::remove_dir_all(&extraction_root);
+                return Err(format!(
+                    "failed to create extracted file '{}' : {}",
+                    output_path.display(),
+                    err
+                ));
+            }
+        };
+        if let Err(err) = io::copy(&mut entry, &mut output_file) {
+            let _ = fs::remove_dir_all(&extraction_root);
+            return Err(format!(
+                "failed to extract zip entry '{}' : {}",
+                output_path.display(),
+                err
+            ));
+        }
+        if let Some(mode) = entry.unix_mode() {
+            if let Err(err) = fs::set_permissions(&output_path, fs::Permissions::from_mode(mode)) {
+                let _ = fs::remove_dir_all(&extraction_root);
+                return Err(format!(
+                    "failed to set extracted file permissions '{}' : {}",
+                    output_path.display(),
+                    err
+                ));
+            }
+        }
+    }
+
+    let Some(root_dir_name) = root_dir_name else {
+        let _ = fs::remove_dir_all(&extraction_root);
+        return Err("bundle_upload zip is empty".to_string());
+    };
+    let package_root = extraction_root.join(root_dir_name);
+    if !package_root.join("package.json").is_file() {
+        let _ = fs::remove_dir_all(&extraction_root);
+        return Err("bundle_upload zip must contain package.json at the root directory".to_string());
+    }
+
+    Ok((package_root, bundle_path))
+}
+
+fn publish_runtime_package_inline(
+    package_files: &BTreeMap<String, String>,
+    staging_root: &Path,
+    dist_root: &Path,
+    manifest_path: &Path,
+) -> Result<serde_json::Value, String> {
+    let package_root = materialize_inline_runtime_package(package_files, staging_root)?;
+    let validated = match validate_package(&package_root, None) {
+        Ok(validated) => validated,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&package_root);
+            return Err(err);
+        }
+    };
+    let install = match install_validated_package(&validated, dist_root, manifest_path) {
+        Ok(install) => install,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&package_root);
+            return Err(err);
+        }
+    };
+    let _ = fs::remove_dir_all(&package_root);
+    Ok(serde_json::json!({
+        "source_kind": "inline_package",
+        "runtime_name": install.runtime_name,
+        "runtime_version": install.runtime_version,
+        "package_type": install.package_type,
+        "installed_path": install.installed_path.display().to_string(),
+        "manifest_path": install.manifest_path.display().to_string(),
+        "manifest_version": install.manifest_version,
+        "copied_files": install.copied_files,
+        "copied_bytes": install.copied_bytes,
+    }))
+}
+
+fn publish_runtime_package_bundle(
+    blob_root: &Path,
+    blob_path: &str,
+    staging_root: &Path,
+    dist_root: &Path,
+    manifest_path: &Path,
+) -> Result<serde_json::Value, String> {
+    let (package_root, bundle_file) =
+        materialize_bundle_runtime_package(blob_root, blob_path, staging_root)?;
+    let extraction_root = package_root
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| package_root.clone());
+    let validated = match validate_package(&package_root, None) {
+        Ok(validated) => validated,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&extraction_root);
+            return Err(err);
+        }
+    };
+    let install = match install_validated_package(&validated, dist_root, manifest_path) {
+        Ok(install) => install,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&extraction_root);
+            return Err(err);
+        }
+    };
+    let _ = fs::remove_dir_all(&extraction_root);
+    let _ = fs::remove_file(&bundle_file);
+    Ok(serde_json::json!({
+        "source_kind": "bundle_upload",
+        "blob_path": blob_path,
+        "runtime_name": install.runtime_name,
+        "runtime_version": install.runtime_version,
+        "package_type": install.package_type,
+        "installed_path": install.installed_path.display().to_string(),
+        "manifest_path": install.manifest_path.display().to_string(),
+        "manifest_version": install.manifest_version,
+        "copied_files": install.copied_files,
+        "copied_bytes": install.copied_bytes,
+    }))
+}
+
+fn local_runtime_manifest_meta_from_file(path: &Path) -> Result<(u64, String), String> {
+    let raw = fs::read(path).map_err(|err| {
+        format!(
+            "failed to read runtime manifest '{}' for follow-up: {}",
+            path.display(),
+            err
+        )
+    })?;
+    let manifest_json: serde_json::Value = serde_json::from_slice(&raw).map_err(|err| {
+        format!(
+            "failed to parse runtime manifest '{}' for follow-up: {}",
+            path.display(),
+            err
+        )
+    })?;
+    let version = manifest_json
+        .get("version")
+        .and_then(|value| value.as_u64())
+        .or_else(|| {
+            manifest_json
+                .get("version")
+                .and_then(|value| value.as_str())
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .ok_or_else(|| {
+            format!(
+                "runtime manifest '{}' missing numeric version for follow-up",
+                path.display()
+            )
+        })?;
+    let mut hasher = Sha256::new();
+    hasher.update(&raw);
+    Ok((version, format!("{:x}", hasher.finalize())))
+}
+
+fn parse_admin_envelope(body: &str, action: &str) -> Result<serde_json::Value, String> {
+    serde_json::from_str(body).map_err(|err| {
+        format!(
+            "failed to parse {action} response envelope from local handler: {} body={}",
+            err, body
+        )
+    })
+}
+
+async fn run_publish_runtime_package_follow_up(
+    ctx: &AdminContext,
+    client: &AdminRouterClient,
+    runtime_name: &str,
+    runtime_version: &str,
+    manifest_version: u64,
+    manifest_hash: &str,
+    sync_to: &[String],
+    update_to: &[String],
+) -> Result<(u16, String, serde_json::Value), AdminError> {
+    let mut sync_results = Vec::new();
+    let mut update_results = Vec::new();
+    let mut overall_http_status = 200u16;
+    let mut overall_status = "ok".to_string();
+
+    for hive in sync_to {
+        let (http_status, body) = handle_hive_sync_hint_command(
+            ctx,
+            client,
+            hive.clone(),
+            serde_json::json!({
+                "channel": "dist",
+                "wait_for_idle": true,
+                "timeout_ms": 30_000u64,
+            }),
+        )
+        .await?;
+        let envelope = parse_admin_envelope(&body, "sync_hint")?;
+        let step_status = envelope
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("error");
+        if step_status == "error" && overall_status != "error" {
+            overall_status = "error".to_string();
+            overall_http_status = http_status;
+        } else if step_status == "sync_pending" && overall_status == "ok" {
+            overall_status = "sync_pending".to_string();
+            overall_http_status = 202;
+        }
+        sync_results.push(serde_json::json!({
+            "hive": hive,
+            "http_status": http_status,
+            "response": envelope,
+        }));
+    }
+
+    for hive in update_to {
+        let (http_status, body) = handle_hive_update_command(
+            ctx,
+            client,
+            hive.clone(),
+            serde_json::json!({
+                "category": "runtime",
+                "manifest_version": manifest_version,
+                "manifest_hash": manifest_hash,
+                "runtime": runtime_name,
+                "runtime_version": runtime_version,
+            }),
+        )
+        .await?;
+        let envelope = parse_admin_envelope(&body, "update")?;
+        let step_status = envelope
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("error");
+        if step_status == "error" && overall_status != "error" {
+            overall_status = "error".to_string();
+            overall_http_status = http_status;
+        } else if step_status == "sync_pending" && overall_status == "ok" {
+            overall_status = "sync_pending".to_string();
+            overall_http_status = 202;
+        }
+        update_results.push(serde_json::json!({
+            "hive": hive,
+            "http_status": http_status,
+            "response": envelope,
+        }));
+    }
+
+    Ok((
+        overall_http_status,
+        overall_status,
+        serde_json::json!({
+            "requested": {
+                "sync_to": sync_to,
+                "update_to": update_to,
+            },
+            "sync_hint": sync_results,
+            "update": update_results,
+        }),
+    ))
+}
+
+async fn handle_publish_runtime_package(
+    ctx: &AdminContext,
+    client: &AdminRouterClient,
+    payload: serde_json::Value,
+) -> Result<(u16, String), AdminError> {
+    if ctx.hive_id != PRIMARY_HIVE_ID {
+        return Ok((
+            409,
+            serde_json::json!({
+                "status": "error",
+                "action": "publish_runtime_package",
+                "payload": serde_json::Value::Null,
+                "error_code": "NOT_PRIMARY",
+                "error_detail": "publish_runtime_package is motherbee-only",
+            })
+            .to_string(),
+        ));
+    }
+
+    let req: PublishRuntimePackageRequest = match serde_json::from_value(payload) {
+        Ok(req) => req,
+        Err(err) => {
+            return Ok((
+                400,
+                serde_json::json!({
+                    "status": "error",
+                    "action": "publish_runtime_package",
+                    "payload": serde_json::Value::Null,
+                    "error_code": "INVALID_REQUEST",
+                    "error_detail": format!("invalid publish runtime package request: {err}"),
+                })
+                .to_string(),
+            ))
+        }
+    };
+
+    if matches!(req.set_current, Some(false)) {
+        return Ok((
+            400,
+            serde_json::json!({
+                "status": "error",
+                "action": "publish_runtime_package",
+                "payload": serde_json::Value::Null,
+                "error_code": "INVALID_REQUEST",
+                "error_detail": "set_current=false is not supported yet",
+            })
+            .to_string(),
+        ));
+    }
+
+    let manifest_path = PathBuf::from(DIST_RUNTIME_MANIFEST_PATH);
+    if !manifest_path.exists() {
+        return Ok((
+            409,
+            serde_json::json!({
+                "status": "error",
+                "action": "publish_runtime_package",
+                "payload": serde_json::Value::Null,
+                "error_code": "RUNTIME_NOT_AVAILABLE",
+                "error_detail": format!(
+                    "runtime manifest missing at '{}' (initialize dist first)",
+                    manifest_path.display()
+                ),
+            })
+            .to_string(),
+        ));
+    }
+
+    let staging_root = runtime_package_staging_root(&ctx.state_dir);
+    fs::create_dir_all(&staging_root)?;
+    let sync_to = match normalize_publish_follow_up_hives(&req.sync_to, "sync_to") {
+        Ok(hives) => hives,
+        Err(err) => {
+            return Ok((
+                400,
+                serde_json::json!({
+                    "status": "error",
+                    "action": "publish_runtime_package",
+                    "payload": serde_json::Value::Null,
+                    "error_code": "INVALID_REQUEST",
+                    "error_detail": err,
+                })
+                .to_string(),
+            ))
+        }
+    };
+    let update_to = match normalize_publish_follow_up_hives(&req.update_to, "update_to") {
+        Ok(hives) => hives,
+        Err(err) => {
+            return Ok((
+                400,
+                serde_json::json!({
+                    "status": "error",
+                    "action": "publish_runtime_package",
+                    "payload": serde_json::Value::Null,
+                    "error_code": "INVALID_REQUEST",
+                    "error_detail": err,
+                })
+                .to_string(),
+            ))
+        }
+    };
+
+    let publish_result = match &req.source {
+        PublishRuntimePackageSource::InlinePackage { files } => publish_runtime_package_inline(
+            files,
+            &staging_root,
+            Path::new(DIST_RUNTIME_ROOT_DIR),
+            &manifest_path,
+        ),
+        PublishRuntimePackageSource::BundleUpload { blob_path } => publish_runtime_package_bundle(
+            &ctx.blob_root,
+            blob_path,
+            &staging_root,
+            Path::new(DIST_RUNTIME_ROOT_DIR),
+            &manifest_path,
+        ),
+    };
+
+    match publish_result {
+        Ok(mut result) => {
+            let (manifest_version, manifest_hash) = match local_runtime_manifest_meta_from_file(&manifest_path)
+            {
+                Ok(meta) => meta,
+                Err(err) => {
+                    return Ok((
+                        502,
+                        serde_json::json!({
+                            "status": "error",
+                            "action": "publish_runtime_package",
+                            "payload": serde_json::Value::Null,
+                            "error_code": "SERVICE_FAILED",
+                            "error_detail": err,
+                        })
+                        .to_string(),
+                    ))
+                }
+            };
+            let runtime_name = result
+                .get("runtime_name")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let runtime_version = result
+                .get("runtime_version")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("manifest_version".to_string(), serde_json::json!(manifest_version));
+                obj.insert("manifest_hash".to_string(), serde_json::json!(manifest_hash));
+            }
+
+            let (http_status, status, follow_up) = run_publish_runtime_package_follow_up(
+                ctx,
+                client,
+                &runtime_name,
+                &runtime_version,
+                manifest_version,
+                &manifest_hash,
+                &sync_to,
+                &update_to,
+            )
+            .await?;
+            if let Some(obj) = result.as_object_mut() {
+                obj.insert("follow_up".to_string(), follow_up);
+            }
+
+            let error_detail = if status == "error" {
+                serde_json::json!("publish succeeded but one or more follow-up operations failed")
+            } else {
+                serde_json::Value::Null
+            };
+            Ok((
+                http_status,
+                serde_json::json!({
+                    "status": status,
+                    "action": "publish_runtime_package",
+                    "payload": result,
+                    "error_code": if status == "error" { serde_json::json!("SERVICE_FAILED") } else { serde_json::Value::Null },
+                    "error_detail": error_detail,
+                })
+                .to_string(),
+            ))
+        }
+        Err(err) => {
+            let error_code = if err.contains("bundle blob not found") {
+                "BLOB_NOT_FOUND"
+            } else if err.contains("invalid zip") {
+                "INVALID_ZIP"
+            } else if err.contains("single root directory")
+                || err.contains("package.json at the root directory")
+            {
+                "INVALID_PACKAGE_LAYOUT"
+            } else if err.contains("already exists") {
+                "VERSION_MISMATCH"
+            } else if err.contains("package.json invalid")
+                || err.contains("package validation failed")
+                || err.contains("inline package")
+                || err.contains("bundle_upload")
+            {
+                "INVALID_REQUEST"
+            } else {
+                "SERVICE_FAILED"
+            };
+            Ok((
+                error_code_to_http_status(error_code),
+                serde_json::json!({
+                    "status": "error",
+                    "action": "publish_runtime_package",
+                    "payload": serde_json::Value::Null,
+                    "error_code": error_code,
+                    "error_detail": err,
+                })
+                .to_string(),
+            ))
+        }
+    }
+}
+
 async fn handle_admin_command(
     ctx: &AdminContext,
     client: &AdminRouterClient,
@@ -7062,6 +7904,9 @@ async fn handle_admin_command(
             .and_then(|value| value.as_str())
             .unwrap_or_default();
         return Ok(build_admin_action_help_response(action_name));
+    }
+    if matches!(action, "publish_runtime_package") {
+        return handle_publish_runtime_package(ctx, client, payload).await;
     }
     if matches!(action, "send_node_message") {
         return handle_send_node_message(ctx, client, payload, hive).await;
@@ -8687,7 +9532,42 @@ fn build_opa_query_response(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::broadcast;
+    use zip::write::FileOptions;
+
+    fn test_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("{prefix}-{nanos}"));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn write_test_bundle(
+        bundle_path: &Path,
+        entries: &[(&str, &str, Option<u32>)],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(parent) = bundle_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = fs::File::create(bundle_path)?;
+        let mut zip = zip::ZipWriter::new(file);
+        for (path, contents, mode) in entries {
+            let mut options =
+                FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            if let Some(mode) = mode {
+                options = options.unix_permissions(*mode);
+            }
+            zip.start_file(*path, options)?;
+            zip.write_all(contents.as_bytes())?;
+        }
+        zip.finish()?;
+        Ok(())
+    }
 
     #[test]
     fn internal_response_payload_value_prefers_payload_field() {
@@ -9350,5 +10230,318 @@ mod tests {
         .expect_err("declared arg mutation must fail");
 
         assert!(err.contains("attempted to change declared arg 'hive'"));
+    }
+
+    #[test]
+    fn publish_runtime_package_action_is_registered() {
+        let spec =
+            resolve_internal_action_spec("publish_runtime_package").expect("action must exist");
+        assert!(!spec.requires_target);
+        assert_eq!(
+            admin_action_path_patterns("publish_runtime_package"),
+            vec!["POST /admin/runtime-packages/publish"]
+        );
+    }
+
+    #[test]
+    fn normalize_publish_follow_up_hives_dedupes_and_trims() {
+        let out = normalize_publish_follow_up_hives(
+            &[
+                " worker-220 ".to_string(),
+                "worker-220".to_string(),
+                "worker-221".to_string(),
+            ],
+            "sync_to",
+        )
+        .expect("normalize follow-up hives");
+        assert_eq!(out, vec!["worker-220", "worker-221"]);
+    }
+
+    #[test]
+    fn local_runtime_manifest_meta_from_file_returns_version_and_hash() {
+        let dir = test_temp_dir("sy-admin-manifest-meta");
+        let manifest_path = dir.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            "{\n  \"schema_version\": 1,\n  \"version\": 1711111111111,\n  \"runtimes\": {}\n}",
+        )
+        .expect("write manifest");
+
+        let (version, hash) =
+            local_runtime_manifest_meta_from_file(&manifest_path).expect("load local manifest meta");
+        assert_eq!(version, 1711111111111);
+        assert_eq!(hash.len(), 64);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn materialize_inline_runtime_package_rejects_parent_dir_component() {
+        let staging_root = test_temp_dir("sy-admin-inline-bad-path");
+        let err = materialize_inline_runtime_package(
+            &BTreeMap::from([("../escape".to_string(), "bad".to_string())]),
+            &staging_root,
+        )
+        .expect_err("parent dir path must fail");
+        assert!(err.contains("must not contain '..'"), "err={err}");
+        let _ = fs::remove_dir_all(staging_root);
+    }
+
+    #[test]
+    fn publish_runtime_package_inline_installs_runtime_and_updates_manifest() {
+        let staging_root = test_temp_dir("sy-admin-inline-stage");
+        let dist_root = test_temp_dir("sy-admin-inline-dist");
+        let runtimes_root = dist_root.join("runtimes");
+        fs::create_dir_all(&runtimes_root).expect("create runtimes root");
+        let manifest_path = runtimes_root.join("manifest.json");
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-04-20T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({
+                "ai.generic": {
+                    "available": ["1.0.0"],
+                    "current": "1.0.0",
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+        write_runtime_manifest_file_atomic(&manifest_path, &manifest, false)
+            .expect("seed manifest");
+
+        let result = publish_runtime_package_inline(
+            &BTreeMap::from([
+                (
+                    "package.json".to_string(),
+                    "{\n  \"name\": \"ai.support.demo\",\n  \"version\": \"0.1.0\",\n  \"type\": \"config_only\",\n  \"runtime_base\": \"ai.generic\"\n}".to_string(),
+                ),
+                (
+                    "config/default-config.json".to_string(),
+                    "{\n  \"tenant_id\": \"tnt:demo\"\n}".to_string(),
+                ),
+                (
+                    "assets/prompts/system.txt".to_string(),
+                    "You are a support agent.".to_string(),
+                ),
+            ]),
+            &staging_root,
+            &runtimes_root,
+            &manifest_path,
+        )
+        .expect("publish inline package");
+
+        assert_eq!(result["source_kind"], json!("inline_package"));
+        assert_eq!(result["runtime_name"], json!("ai.support.demo"));
+        assert_eq!(result["runtime_version"], json!("0.1.0"));
+        assert_eq!(result["package_type"], json!("config_only"));
+
+        let installed_package = runtimes_root.join("ai.support.demo/0.1.0/package.json");
+        assert!(installed_package.exists(), "installed package.json missing");
+
+        let manifest_raw = fs::read_to_string(&manifest_path).expect("read manifest");
+        let manifest_json: serde_json::Value =
+            serde_json::from_str(&manifest_raw).expect("parse manifest");
+        assert_eq!(
+            manifest_json["runtimes"]["ai.support.demo"]["current"],
+            json!("0.1.0")
+        );
+        assert_eq!(
+            manifest_json["runtimes"]["ai.support.demo"]["type"],
+            json!("config_only")
+        );
+        assert_eq!(
+            manifest_json["runtimes"]["ai.support.demo"]["runtime_base"],
+            json!("ai.generic")
+        );
+
+        let _ = fs::remove_dir_all(staging_root);
+        let _ = fs::remove_dir_all(dist_root);
+    }
+
+    #[test]
+    fn publish_runtime_package_bundle_rejects_missing_blob() {
+        let blob_root = test_temp_dir("sy-admin-bundle-missing-blob");
+        let staging_root = test_temp_dir("sy-admin-bundle-missing-stage");
+        let dist_root = test_temp_dir("sy-admin-bundle-missing-dist");
+        let runtimes_root = dist_root.join("runtimes");
+        fs::create_dir_all(&runtimes_root).expect("create runtimes root");
+        let manifest_path = runtimes_root.join("manifest.json");
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-04-20T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({}),
+            hash: None,
+        };
+        write_runtime_manifest_file_atomic(&manifest_path, &manifest, false)
+            .expect("seed manifest");
+
+        let err = publish_runtime_package_bundle(
+            &blob_root,
+            "packages/incoming/missing.zip",
+            &staging_root,
+            &runtimes_root,
+            &manifest_path,
+        )
+        .expect_err("missing blob bundle must fail");
+        assert!(err.contains("bundle blob not found"), "err={err}");
+
+        let _ = fs::remove_dir_all(blob_root);
+        let _ = fs::remove_dir_all(staging_root);
+        let _ = fs::remove_dir_all(dist_root);
+    }
+
+    #[test]
+    fn publish_runtime_package_bundle_rejects_invalid_zip() {
+        let blob_root = test_temp_dir("sy-admin-bundle-badzip-blob");
+        let staging_root = test_temp_dir("sy-admin-bundle-badzip-stage");
+        let dist_root = test_temp_dir("sy-admin-bundle-badzip-dist");
+        let runtimes_root = dist_root.join("runtimes");
+        fs::create_dir_all(&runtimes_root).expect("create runtimes root");
+        let manifest_path = runtimes_root.join("manifest.json");
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-04-20T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({}),
+            hash: None,
+        };
+        write_runtime_manifest_file_atomic(&manifest_path, &manifest, false)
+            .expect("seed manifest");
+
+        let bundle_path = blob_root.join("packages/incoming/not-a-zip.zip");
+        fs::create_dir_all(bundle_path.parent().expect("bundle parent")).expect("create blob dir");
+        fs::write(&bundle_path, "this is not a zip").expect("write invalid zip");
+
+        let err = publish_runtime_package_bundle(
+            &blob_root,
+            "packages/incoming/not-a-zip.zip",
+            &staging_root,
+            &runtimes_root,
+            &manifest_path,
+        )
+        .expect_err("invalid zip must fail");
+        assert!(err.contains("invalid zip"), "err={err}");
+        assert!(bundle_path.exists(), "invalid zip should remain in blob");
+
+        let _ = fs::remove_dir_all(blob_root);
+        let _ = fs::remove_dir_all(staging_root);
+        let _ = fs::remove_dir_all(dist_root);
+    }
+
+    #[test]
+    fn publish_runtime_package_bundle_rejects_invalid_layout() {
+        let blob_root = test_temp_dir("sy-admin-bundle-layout-blob");
+        let staging_root = test_temp_dir("sy-admin-bundle-layout-stage");
+        let dist_root = test_temp_dir("sy-admin-bundle-layout-dist");
+        let runtimes_root = dist_root.join("runtimes");
+        fs::create_dir_all(&runtimes_root).expect("create runtimes root");
+        let manifest_path = runtimes_root.join("manifest.json");
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-04-20T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({}),
+            hash: None,
+        };
+        write_runtime_manifest_file_atomic(&manifest_path, &manifest, false)
+            .expect("seed manifest");
+
+        let bundle_path = blob_root.join("packages/incoming/invalid-layout.zip");
+        write_test_bundle(
+            &bundle_path,
+            &[
+                ("root-a/package.json", "{\n  \"name\": \"ai.bad.demo\",\n  \"version\": \"0.1.0\",\n  \"type\": \"config_only\",\n  \"runtime_base\": \"ai.generic\"\n}", Some(0o644)),
+                ("root-b/config/default-config.json", "{\n  \"tenant_id\": \"tnt:bad\"\n}", Some(0o644)),
+            ],
+        )
+        .expect("write invalid layout bundle");
+
+        let err = publish_runtime_package_bundle(
+            &blob_root,
+            "packages/incoming/invalid-layout.zip",
+            &staging_root,
+            &runtimes_root,
+            &manifest_path,
+        )
+        .expect_err("invalid layout must fail");
+        assert!(
+            err.contains("single root directory") || err.contains("exactly one root directory"),
+            "err={err}"
+        );
+        assert!(bundle_path.exists(), "invalid layout bundle should remain in blob");
+
+        let _ = fs::remove_dir_all(blob_root);
+        let _ = fs::remove_dir_all(staging_root);
+        let _ = fs::remove_dir_all(dist_root);
+    }
+
+    #[test]
+    fn publish_runtime_package_bundle_installs_runtime_and_removes_blob() {
+        let blob_root = test_temp_dir("sy-admin-bundle-ok-blob");
+        let staging_root = test_temp_dir("sy-admin-bundle-ok-stage");
+        let dist_root = test_temp_dir("sy-admin-bundle-ok-dist");
+        let runtimes_root = dist_root.join("runtimes");
+        fs::create_dir_all(&runtimes_root).expect("create runtimes root");
+        let manifest_path = runtimes_root.join("manifest.json");
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-04-20T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({}),
+            hash: None,
+        };
+        write_runtime_manifest_file_atomic(&manifest_path, &manifest, false)
+            .expect("seed manifest");
+
+        let bundle_path = blob_root.join("packages/incoming/ai-full-demo-0.2.0.zip");
+        write_test_bundle(
+            &bundle_path,
+            &[
+                ("ai.full.demo/package.json", "{\n  \"name\": \"ai.full.demo\",\n  \"version\": \"0.2.0\",\n  \"type\": \"full_runtime\",\n  \"entry_point\": \"bin/start.sh\"\n}", Some(0o644)),
+                ("ai.full.demo/bin/start.sh", "#!/bin/sh\necho ready\n", Some(0o755)),
+            ],
+        )
+        .expect("write valid full runtime bundle");
+
+        let result = publish_runtime_package_bundle(
+            &blob_root,
+            "packages/incoming/ai-full-demo-0.2.0.zip",
+            &staging_root,
+            &runtimes_root,
+            &manifest_path,
+        )
+        .expect("publish bundle package");
+
+        assert_eq!(result["source_kind"], json!("bundle_upload"));
+        assert_eq!(result["runtime_name"], json!("ai.full.demo"));
+        assert_eq!(result["runtime_version"], json!("0.2.0"));
+        assert_eq!(result["package_type"], json!("full_runtime"));
+
+        let installed_start = runtimes_root.join("ai.full.demo/0.2.0/bin/start.sh");
+        assert!(installed_start.exists(), "installed start.sh missing");
+        let installed_mode = fs::metadata(&installed_start)
+            .expect("read installed start metadata")
+            .permissions()
+            .mode();
+        assert_eq!(installed_mode & 0o111, 0o111, "start.sh must remain executable");
+        assert!(!bundle_path.exists(), "successful publish should remove blob bundle");
+
+        let manifest_raw = fs::read_to_string(&manifest_path).expect("read manifest");
+        let manifest_json: serde_json::Value =
+            serde_json::from_str(&manifest_raw).expect("parse manifest");
+        assert_eq!(
+            manifest_json["runtimes"]["ai.full.demo"]["current"],
+            json!("0.2.0")
+        );
+        assert_eq!(
+            manifest_json["runtimes"]["ai.full.demo"]["type"],
+            json!("full_runtime")
+        );
+
+        let _ = fs::remove_dir_all(blob_root);
+        let _ = fs::remove_dir_all(staging_root);
+        let _ = fs::remove_dir_all(dist_root);
     }
 }
