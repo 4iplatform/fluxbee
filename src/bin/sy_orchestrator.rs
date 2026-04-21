@@ -37,8 +37,8 @@ use fluxbee_sdk::{
 use json_router::{
     runtime_manifest::{
         load_runtime_manifest_from_paths as load_runtime_manifest_paths_shared,
-        parse_runtime_manifest_file as parse_runtime_manifest_file_shared,
-        RuntimeManifest, RuntimeManifestEntry,
+        parse_runtime_manifest_file as parse_runtime_manifest_file_shared, RuntimeManifest,
+        RuntimeManifestEntry,
     },
     shm::{
         now_epoch_ms, LsaRegionReader, LsaSnapshot, NodeEntry, RemoteHiveEntry, RemoteNodeEntry,
@@ -3179,26 +3179,22 @@ fn vendor_syncthing_component() -> Result<Option<VendorManifestComponent>, Orche
 }
 
 fn resolve_syncthing_vendor_source_path() -> Result<PathBuf, OrchestratorError> {
-    if let Some(component) = vendor_syncthing_component()? {
-        if let Some(path) = local_vendor_component_path(&component.path) {
-            return Ok(path);
-        }
+    let Some(component) = vendor_syncthing_component()? else {
+        return Err(format!(
+            "vendor manifest missing at '{}' or missing 'syncthing' component; run scripts/install.sh",
+            DIST_VENDOR_MANIFEST_PATH
+        )
+        .into());
+    };
+    let Some(path) = local_vendor_component_path(&component.path) else {
         let primary = Path::new(DIST_VENDOR_ROOT_DIR).join(&component.path);
         return Err(format!(
-            "vendor manifest syncthing path missing at '{}'",
+            "vendor manifest syncthing path missing at '{}'; run scripts/install.sh",
             primary.display()
         )
         .into());
-    }
-    let fallback = PathBuf::from(DIST_SYNCTHING_VENDOR_SOURCE_PATH);
-    if fallback.exists() {
-        return Ok(fallback);
-    }
-    Err(format!(
-        "syncthing vendor binary missing at '{}' and vendor manifest is absent",
-        DIST_SYNCTHING_VENDOR_SOURCE_PATH
-    )
-    .into())
+    };
+    Ok(path)
 }
 
 fn local_syncthing_vendor_hash() -> Result<Option<String>, OrchestratorError> {
@@ -17050,7 +17046,8 @@ blob:
 
     #[test]
     fn ensure_node_effective_config_on_spawn_with_roots_persists_config_only_runtime_metadata() {
-        let root = std::env::temp_dir().join(format!("fluxbee-spawn-config-only-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("fluxbee-spawn-config-only-{}", Uuid::new_v4()));
         let runtimes_root = root.join("runtimes");
         let nodes_root = root.join("nodes");
         let runtime = "ai.billing";
@@ -17100,17 +17097,32 @@ blob:
         .expect("spawn config write should succeed");
 
         assert_eq!(out["status"], serde_json::json!("ok"));
-        let config_path = nodes_root.join("AI").join("AI.billing@worker-220").join("config.json");
+        let config_path = nodes_root
+            .join("AI")
+            .join("AI.billing@worker-220")
+            .join("config.json");
         let config_raw = fs::read_to_string(&config_path).expect("read config");
         let config: serde_json::Value = serde_json::from_str(&config_raw).expect("parse config");
         assert_eq!(config["region"], serde_json::json!("ar"));
         assert_eq!(config["temperature"], serde_json::json!(0.9));
         assert_eq!(config["model"], serde_json::json!("gpt-5"));
         assert_eq!(config["tenant_id"], serde_json::json!("tnt:request"));
-        assert_eq!(config["_system"]["runtime"], serde_json::json!("ai.billing"));
-        assert_eq!(config["_system"]["runtime_version"], serde_json::json!("2.1.0"));
-        assert_eq!(config["_system"]["runtime_base"], serde_json::json!("ai.generic"));
-        assert_eq!(config["_system"]["package_path"], serde_json::json!(package_path));
+        assert_eq!(
+            config["_system"]["runtime"],
+            serde_json::json!("ai.billing")
+        );
+        assert_eq!(
+            config["_system"]["runtime_version"],
+            serde_json::json!("2.1.0")
+        );
+        assert_eq!(
+            config["_system"]["runtime_base"],
+            serde_json::json!("ai.generic")
+        );
+        assert_eq!(
+            config["_system"]["package_path"],
+            serde_json::json!(package_path)
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -17167,17 +17179,32 @@ blob:
         .expect("workflow spawn config write should succeed");
 
         assert_eq!(out["status"], serde_json::json!("ok"));
-        let config_path = nodes_root.join("WF").join("WF.invoice@worker-220").join("config.json");
+        let config_path = nodes_root
+            .join("WF")
+            .join("WF.invoice@worker-220")
+            .join("config.json");
         let config_raw = fs::read_to_string(&config_path).expect("read config");
         let config: serde_json::Value = serde_json::from_str(&config_raw).expect("parse config");
-        assert_eq!(config["sy_timer_l2_name"], serde_json::json!("SY.timer@worker-220"));
+        assert_eq!(
+            config["sy_timer_l2_name"],
+            serde_json::json!("SY.timer@worker-220")
+        );
         assert_eq!(config["gc_retention_days"], serde_json::json!(14));
         assert_eq!(config["gc_interval_seconds"], serde_json::json!(60));
         assert_eq!(config["tenant_id"], serde_json::json!("tnt:wf"));
-        assert_eq!(config["_system"]["runtime"], serde_json::json!("wf.invoice"));
+        assert_eq!(
+            config["_system"]["runtime"],
+            serde_json::json!("wf.invoice")
+        );
         assert_eq!(config["_system"]["runtime_version"], serde_json::json!("7"));
-        assert_eq!(config["_system"]["runtime_base"], serde_json::json!("wf.engine"));
-        assert_eq!(config["_system"]["package_path"], serde_json::json!(package_path));
+        assert_eq!(
+            config["_system"]["runtime_base"],
+            serde_json::json!("wf.engine")
+        );
+        assert_eq!(
+            config["_system"]["package_path"],
+            serde_json::json!(package_path)
+        );
 
         let _ = fs::remove_dir_all(root);
     }

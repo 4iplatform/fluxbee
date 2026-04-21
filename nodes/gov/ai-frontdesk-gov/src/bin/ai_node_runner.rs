@@ -4829,7 +4829,10 @@ mod tests {
             response.payload.get("type").and_then(Value::as_str),
             Some("text")
         );
-        assert_eq!(extract_text(&response.payload).as_deref(), Some("Echo: hola"));
+        assert_eq!(
+            extract_text(&response.payload).as_deref(),
+            Some("Echo: hola")
+        );
     }
 
     #[tokio::test]

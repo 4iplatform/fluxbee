@@ -471,23 +471,74 @@ if [[ -z "$candidate_syncthing_vendor" ]]; then
   done
 fi
 
-if [[ -n "$candidate_syncthing_vendor" ]]; then
-  sudo install -m 0755 "$candidate_syncthing_vendor" "$STATE_DIR/dist/vendor/syncthing/syncthing"
-  seeded_syncthing_vendor=1
-  echo "Seeded Syncthing vendor binary from $candidate_syncthing_vendor"
+if [[ -d "$STATE_DIR/vendor/syncthing" ]]; then
+  echo "Removing legacy vendor source dir $STATE_DIR/vendor/syncthing"
+  sudo rm -rf "$STATE_DIR/vendor/syncthing"
 fi
 
-if [[ "$seeded_syncthing_vendor" -eq 0 ]] && command -v syncthing >/dev/null 2>&1; then
-  syncthing_cmd="$(command -v syncthing)"
-  if [[ -x "$syncthing_cmd" ]]; then
-    sudo install -m 0755 "$syncthing_cmd" "$STATE_DIR/dist/vendor/syncthing/syncthing"
-    seeded_syncthing_vendor=1
-    echo "Seeded Syncthing vendor binary from $syncthing_cmd"
-  fi
+if [[ -f "$STATE_DIR/vendor/manifest.json" ]]; then
+  echo "Removing legacy vendor manifest $STATE_DIR/vendor/manifest.json"
+  sudo rm -f "$STATE_DIR/vendor/manifest.json"
 fi
-if [[ "$seeded_syncthing_vendor" -eq 0 ]]; then
-  echo "Warning: Syncthing vendor binary not found in vendor/. Put it at vendor/syncthing/syncthing or vendor/<bundle>/syncthing, or install syncthing before running orchestrator blob sync." >&2
+
+if [[ -z "$candidate_syncthing_vendor" ]]; then
+  echo "ERROR: Syncthing vendor binary not found in repo vendor/. Expected vendor/syncthing/syncthing or vendor/<bundle>/syncthing." >&2
+  exit 1
 fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "ERROR: python3 is required to write dist/vendor/manifest.json" >&2
+  exit 1
+fi
+
+if ! command -v sha256sum >/dev/null 2>&1; then
+  echo "ERROR: sha256sum is required to write dist/vendor/manifest.json" >&2
+  exit 1
+fi
+
+sudo install -m 0755 "$candidate_syncthing_vendor" "$STATE_DIR/dist/vendor/syncthing/syncthing"
+seeded_syncthing_vendor=1
+echo "Seeded Syncthing vendor binary from $candidate_syncthing_vendor"
+
+syncthing_vendor_sha="$(sha256sum "$candidate_syncthing_vendor" | awk '{print $1}')"
+syncthing_vendor_size="$(stat -c %s "$candidate_syncthing_vendor")"
+syncthing_vendor_version="$("$candidate_syncthing_vendor" --version 2>/dev/null | head -n1 | sed -n 's/.*v\([0-9][^[:space:]]*\).*/\1/p')"
+if [[ -z "$syncthing_vendor_version" ]]; then
+  syncthing_vendor_version="$(basename "$(dirname "$candidate_syncthing_vendor")" | sed -n 's/.*-v\([0-9][A-Za-z0-9.+-]*\)$/\1/p')"
+fi
+if [[ -z "$syncthing_vendor_version" ]]; then
+  syncthing_vendor_version="repo-seeded"
+fi
+
+vendor_manifest_tmp="$(mktemp)"
+cat <<EOF | python3 - "$syncthing_vendor_sha" "$syncthing_vendor_size" "$syncthing_vendor_version" >"$vendor_manifest_tmp"
+import json
+import sys
+import time
+
+sha = sys.argv[1]
+size = int(sys.argv[2])
+version = sys.argv[3]
+
+doc = {
+    "schema_version": 1,
+    "version": int(time.time() * 1000),
+    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "components": {
+        "syncthing": {
+            "upstream_version": version,
+            "hash": f"sha256:{sha}",
+            "size": size,
+            "path": "syncthing/syncthing",
+        }
+    },
+}
+
+print(json.dumps(doc, indent=2, sort_keys=True))
+EOF
+sudo install -m 0644 "$vendor_manifest_tmp" "$STATE_DIR/dist/vendor/manifest.json"
+rm -f "$vendor_manifest_tmp"
+echo "Updated vendor manifest at $STATE_DIR/dist/vendor/manifest.json"
 
 if [[ "$SEED_RUNTIME_FIXTURE" == "1" ]]; then
   echo "Seeding runtime fixture in $STATE_DIR/dist/runtimes: $RUNTIME_FIXTURE_NAME@$RUNTIME_FIXTURE_VERSION"

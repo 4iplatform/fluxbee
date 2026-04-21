@@ -10,9 +10,9 @@ use json_router::runtime_manifest::{
     RuntimeManifestEntry,
 };
 use json_router::runtime_package::{
-    build_dry_run_plan, install_validated_package, package_type_label, update_runtime_manifest_with_package,
-    validate_package, PackageMetadata, PackageType, ValidatedPackage,
-    DIST_RUNTIME_MANIFEST_PATH, DIST_RUNTIME_ROOT_DIR,
+    build_dry_run_plan, install_validated_package, package_type_label,
+    update_runtime_manifest_with_package, validate_package, PackageMetadata, PackageType,
+    ValidatedPackage, DIST_RUNTIME_MANIFEST_PATH, DIST_RUNTIME_ROOT_DIR,
 };
 use sha2::{Digest, Sha256};
 

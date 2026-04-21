@@ -581,10 +581,14 @@ impl FunctionTool for ArchitectInfrastructureSpecialistTool {
                 ))
             })?;
 
-        let specialist_output =
-            run_infrastructure_specialist_with_context(&self.context, artifact_type, task, &request)
-                .await
-                .map_err(|err| fluxbee_ai_sdk::AiSdkError::Protocol(err.to_string()))?;
+        let specialist_output = run_infrastructure_specialist_with_context(
+            &self.context,
+            artifact_type,
+            task,
+            &request,
+        )
+        .await
+        .map_err(|err| fluxbee_ai_sdk::AiSdkError::Protocol(err.to_string()))?;
 
         Ok(json!({
             "status": "ok",
@@ -1401,7 +1405,9 @@ async fn run_infrastructure_specialist_with_context(
         .await
         .clone()
         .ok_or_else(|| -> ArchitectError {
-            "AI provider not configured for the infrastructure specialist.".to_string().into()
+            "AI provider not configured for the infrastructure specialist."
+                .to_string()
+                .into()
         })?;
     let prompt = ARCHITECT_INFRASTRUCTURE_SPECIALIST_PROMPT.to_string();
     let model = runtime.client.clone().function_model(
@@ -1436,7 +1442,9 @@ async fn run_infrastructure_specialist_with_context(
     let raw = result
         .final_assistant_text
         .ok_or_else(|| -> ArchitectError {
-            "infrastructure specialist returned no final text".to_string().into()
+            "infrastructure specialist returned no final text"
+                .to_string()
+                .into()
         })?;
     let parsed = parse_json_value_from_text(&raw).map_err(|err| -> ArchitectError {
         format!("infrastructure specialist returned invalid JSON: {err}").into()
@@ -1514,9 +1522,9 @@ fn build_infrastructure_artifact(
     task: &str,
     payload: Value,
 ) -> Result<Value, ArchitectError> {
-    let payload_obj = payload
-        .as_object()
-        .ok_or_else(|| -> ArchitectError { "infrastructure specialist payload must be an object".into() })?;
+    let payload_obj = payload.as_object().ok_or_else(|| -> ArchitectError {
+        "infrastructure specialist payload must be an object".into()
+    })?;
     let summary = payload_obj
         .get("summary")
         .and_then(Value::as_str)
@@ -3089,8 +3097,7 @@ async fn build_session_immediate_memory(
     let recent_messages = load_session_messages(&messages_table, &session.session_id).await?;
     let operations = load_session_operations(&operations_table, &session.session_id).await?;
     let summary = build_conversation_summary(session, &recent_messages, &operations);
-    let recent_interactions =
-        recent_messages_to_immediate_with_blobs(state, recent_messages).await;
+    let recent_interactions = recent_messages_to_immediate_with_blobs(state, recent_messages).await;
 
     Ok(ImmediateConversationMemory {
         thread_id: none_if_empty(&session.thread_id),
@@ -3134,7 +3141,10 @@ async fn recent_messages_to_immediate_with_blobs(
         attachment_budget -= 1;
     }
 
-    pairs.into_iter().map(|(_, interaction)| interaction).collect()
+    pairs
+        .into_iter()
+        .map(|(_, interaction)| interaction)
+        .collect()
 }
 
 async fn enrich_interaction_with_blob_content(
@@ -4237,9 +4247,9 @@ fn scmd_query_params(raw_query: Option<&str>) -> serde_json::Map<String, Value> 
 
 fn architect_admin_action_timeout(action: &str) -> Duration {
     match action {
-        "executor_validate_plan" | "executor_execute_plan" => Duration::from_secs(
-            env_timeout_secs("JSR_ADMIN_EXECUTOR_TIMEOUT_SECS").unwrap_or(120),
-        ),
+        "executor_validate_plan" | "executor_execute_plan" => {
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_EXECUTOR_TIMEOUT_SECS").unwrap_or(120))
+        }
         "add_hive" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS").unwrap_or(180))
         }
@@ -4291,10 +4301,12 @@ fn validate_architect_executor_plan_shape(plan: &Value) -> Result<Value, Archite
     if version.is_empty() {
         return Err("executor plan plan_version must be non-empty".into());
     }
-    let execution = obj
-        .get("execution")
-        .and_then(Value::as_object)
-        .ok_or_else(|| -> ArchitectError { "executor plan requires object field 'execution'".into() })?;
+    let execution =
+        obj.get("execution")
+            .and_then(Value::as_object)
+            .ok_or_else(|| -> ArchitectError {
+                "executor plan requires object field 'execution'".into()
+            })?;
     let steps = execution
         .get("steps")
         .and_then(Value::as_array)
@@ -4343,9 +4355,7 @@ fn translate_scmd(
         ("POST", ["admin", "runtime-packages", "publish"]) => {
             let params = parsed.body.unwrap_or_else(|| json!({}));
             if !params.is_object() {
-                return Err(
-                    "SCMD body for publish_runtime_package must be a JSON object".into(),
-                );
+                return Err("SCMD body for publish_runtime_package must be a JSON object".into());
             }
             Ok(AdminTranslation {
                 admin_target,
@@ -5197,7 +5207,8 @@ async fn execute_executor_plan_with_context(
     if !validate_status.eq_ignore_ascii_case("ok") {
         return Err(format!(
             "executor plan validation failed: {}",
-            response_detail_text(&validate_output).unwrap_or_else(|| "unknown validation error".to_string())
+            response_detail_text(&validate_output)
+                .unwrap_or_else(|| "unknown validation error".to_string())
         )
         .into());
     }
@@ -5240,8 +5251,7 @@ async fn execute_admin_action_with_context(
     params: Value,
     purpose: &str,
 ) -> Result<Value, ArchitectError> {
-    let params_json =
-        serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string());
+    let params_json = serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string());
     let timeout = architect_admin_action_timeout(action);
     tracing::info!(
         purpose = %purpose,
@@ -9892,10 +9902,7 @@ mod tests {
         .expect("build infrastructure artifact");
 
         assert_eq!(artifact["kind"], json!("infrastructure"));
-        assert_eq!(
-            artifact["artifact_type"],
-            json!("runtime_package_source")
-        );
+        assert_eq!(artifact["artifact_type"], json!("runtime_package_source"));
         assert_eq!(artifact["specialist"], json!("infrastructure"));
         assert_eq!(
             artifact["payload"]["publish_request"]["sync_to"],

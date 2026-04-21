@@ -499,7 +499,12 @@ fn collect_normalized_package_entries(
                 rel_path: rel_string,
                 mode: 0o755,
             });
-            collect_normalized_package_entries(package_dir, &child_path, effective_version, entries)?;
+            collect_normalized_package_entries(
+                package_dir,
+                &child_path,
+                effective_version,
+                entries,
+            )?;
             continue;
         }
         if !file_type.is_file() {
@@ -538,10 +543,8 @@ fn installed_package_matches(
     target_dir: &Path,
     effective_version: &str,
 ) -> Result<bool, String> {
-    Ok(
-        normalized_package_entries(source_dir, effective_version)?
-            == normalized_package_entries(target_dir, effective_version)?,
-    )
+    Ok(normalized_package_entries(source_dir, effective_version)?
+        == normalized_package_entries(target_dir, effective_version)?)
 }
 
 fn install_package_files_atomic(
@@ -774,8 +777,11 @@ pub fn install_validated_package(
     let target_dir = dist_runtime_root
         .join(&validated.metadata.name)
         .join(&validated.effective_version);
-    let install_outcome =
-        install_package_files_atomic(&validated.package_dir, &target_dir, &validated.effective_version)?;
+    let install_outcome = install_package_files_atomic(
+        &validated.package_dir,
+        &target_dir,
+        &validated.effective_version,
+    )?;
     let installed_new_files = matches!(install_outcome, InstallPackageOutcome::Installed(_));
     let copy_stats = match install_outcome {
         InstallPackageOutcome::Installed(copy_stats) => {

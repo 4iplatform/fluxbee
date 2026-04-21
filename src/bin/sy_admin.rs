@@ -36,12 +36,12 @@ use fluxbee_sdk::{
     ClientConfig, NodeConfig, NodeReceiver, NodeSecretDescriptor, NodeSecretError,
     NodeSecretRecord, NodeSecretWriteOptions, NodeSender, NODE_SECRET_REDACTION_TOKEN,
 };
-use json_router::runtime_package::{
-    install_validated_package, validate_package, DIST_RUNTIME_MANIFEST_PATH, DIST_RUNTIME_ROOT_DIR,
-};
 use json_router::runtime_manifest::{
     load_runtime_manifest_from_paths, runtime_manifest_write_v2_gate_enabled_from_env,
     write_runtime_manifest_file_atomic, RuntimeManifest, RuntimeManifestEntry,
+};
+use json_router::runtime_package::{
+    install_validated_package, validate_package, DIST_RUNTIME_MANIFEST_PATH, DIST_RUNTIME_ROOT_DIR,
 };
 use json_router::shm::{
     now_epoch_ms, LsaRegionReader, RemoteHiveEntry, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
@@ -254,12 +254,8 @@ struct AdminContext {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PublishRuntimePackageSource {
-    InlinePackage {
-        files: BTreeMap<String, String>,
-    },
-    BundleUpload {
-        blob_path: String,
-    },
+    InlinePackage { files: BTreeMap<String, String> },
+    BundleUpload { blob_path: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1027,7 +1023,11 @@ fn build_admin_executor_function_definition(spec: &InternalActionSpec) -> Functi
             let mut field_schema = admin_contract_field_schema(&field);
             // Optional fields are nullable: the model passes null when the plan does not
             // declare a value, signaling "use infrastructure default."
-            if let Some(type_str) = field_schema.get("type").and_then(|v| v.as_str()).map(str::to_string) {
+            if let Some(type_str) = field_schema
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+            {
                 field_schema["type"] = serde_json::json!([type_str, "null"]);
             }
             properties.insert(name.to_string(), field_schema);
@@ -1618,9 +1618,12 @@ impl FunctionTool for AdminExecutorStepTool {
             &format!("step '{}'", self.step.id),
         )
         .map_err(fluxbee_ai_sdk::AiSdkError::Protocol)?;
-        let merged_args =
-            merge_executor_step_arguments(&self.step, &arguments, &self.definition.parameters_json_schema)
-                .map_err(fluxbee_ai_sdk::AiSdkError::Protocol)?;
+        let merged_args = merge_executor_step_arguments(
+            &self.step,
+            &arguments,
+            &self.definition.parameters_json_schema,
+        )
+        .map_err(fluxbee_ai_sdk::AiSdkError::Protocol)?;
         let spec = resolve_internal_action_spec(&self.step.action)
             .map_err(|detail| fluxbee_ai_sdk::AiSdkError::Protocol(detail.to_string()))?;
         let (target, params) = executor_dispatch_target_and_params(spec, &merged_args)
@@ -1778,10 +1781,7 @@ Step to review:\n{}",
                 &model,
                 &tools,
                 FunctionRunInput {
-                    current_user_message: format!(
-                        "Review step '{}' ({}).",
-                        step.id, step.action
-                    ),
+                    current_user_message: format!("Review step '{}' ({}).", step.id, step.action),
                     current_user_parts: None,
                     immediate_memory: None,
                 },
@@ -1837,7 +1837,11 @@ fn build_executor_step_events_from_result(
     step_index: usize,
     step: &AdminExecutorPlanStep,
     result: &fluxbee_ai_sdk::function_calling::FunctionLoopRunResult,
-) -> (Vec<AdminExecutorStepEvent>, bool, Option<AdminExecutorFailure>) {
+) -> (
+    Vec<AdminExecutorStepEvent>,
+    bool,
+    Option<AdminExecutorFailure>,
+) {
     let mut events = vec![
         AdminExecutorStepEvent {
             execution_id: execution_id.to_string(),
@@ -2130,14 +2134,9 @@ async fn execute_admin_executor_plan(
             step_action: failed_step_action.clone(),
         });
     }
-    summary.log_path = persist_admin_executor_run_log(
-        ctx,
-        &request.execution_id,
-        request,
-        &all_events,
-        &summary,
-    )
-    .ok();
+    summary.log_path =
+        persist_admin_executor_run_log(ctx, &request.execution_id, request, &all_events, &summary)
+            .ok();
 
     Ok(serde_json::json!({
         "status": summary.status,
@@ -2797,9 +2796,7 @@ async fn dispatch_internal_admin_command(
             };
             let runtime = ctx.executor_runtime.lock().await.clone();
             if let Some(runtime) = runtime {
-                if let Err(detail) =
-                    semantic_review_executor_plan(&runtime, &plan).await
-                {
+                if let Err(detail) = semantic_review_executor_plan(&runtime, &plan).await {
                     return Ok(InternalAdminDispatchResult {
                         http_status: 422,
                         envelope: serde_json::json!({
@@ -3395,8 +3392,7 @@ async fn handle_http(
                 serde_json::from_slice(&body)?
             };
             let (status, resp) =
-                handle_admin_command(ctx, client, "publish_runtime_package", payload, None)
-                    .await?;
+                handle_admin_command(ctx, client, "publish_runtime_package", payload, None).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("GET", path) if path.starts_with("/admin/actions/") => {
@@ -4642,10 +4638,7 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         return 502;
     }
     match code.as_str() {
-        "INVALID_REQUEST"
-        | "INVALID_ADDRESS"
-        | "INVALID_ARCHIVE"
-        | "INVALID_HIVE_ID"
+        "INVALID_REQUEST" | "INVALID_ADDRESS" | "INVALID_ARCHIVE" | "INVALID_HIVE_ID"
         | "INVALID_ZIP" => 400,
         "NOT_FOUND"
         | "NODE_NOT_FOUND"
@@ -6293,7 +6286,7 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
 fn admin_action_body_required(action: &str) -> bool {
     matches!(
         action,
-            "add_hive"
+        "add_hive"
             | "publish_runtime_package"
             | "run_node"
             | "start_node"
@@ -7328,7 +7321,10 @@ fn runtime_package_safe_blob_rel_path(raw: &str) -> Result<PathBuf, String> {
     Ok(rel)
 }
 
-fn normalize_publish_follow_up_hives(raw: &[String], field_name: &str) -> Result<Vec<String>, String> {
+fn normalize_publish_follow_up_hives(
+    raw: &[String],
+    field_name: &str,
+) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for value in raw {
@@ -7404,10 +7400,7 @@ fn materialize_bundle_runtime_package(
     let rel_blob_path = runtime_package_safe_blob_rel_path(blob_path)?;
     let bundle_path = blob_root.join(&rel_blob_path);
     if !bundle_path.is_file() {
-        return Err(format!(
-            "bundle blob not found '{}'",
-            bundle_path.display()
-        ));
+        return Err(format!("bundle blob not found '{}'", bundle_path.display()));
     }
 
     let extraction_root = staging_root.join(format!("bundle-{}", Uuid::new_v4().simple()));
@@ -7469,7 +7462,9 @@ fn materialize_bundle_runtime_package(
 
         let mut components = enclosed.components();
         let first = match components.next() {
-            Some(std::path::Component::Normal(component)) => component.to_string_lossy().to_string(),
+            Some(std::path::Component::Normal(component)) => {
+                component.to_string_lossy().to_string()
+            }
             _ => {
                 let _ = fs::remove_dir_all(&extraction_root);
                 return Err("bundle_upload zip must contain a single root directory".to_string());
@@ -7558,7 +7553,9 @@ fn materialize_bundle_runtime_package(
     let package_root = extraction_root.join(root_dir_name);
     if !package_root.join("package.json").is_file() {
         let _ = fs::remove_dir_all(&extraction_root);
-        return Err("bundle_upload zip must contain package.json at the root directory".to_string());
+        return Err(
+            "bundle_upload zip must contain package.json at the root directory".to_string(),
+        );
     }
 
     Ok((package_root, bundle_path))
@@ -7711,7 +7708,10 @@ fn runtime_manifest_entry_map_local(
     let mut out = BTreeMap::new();
     for (runtime, value) in runtimes {
         if !valid_runtime_token(runtime) {
-            return Err(format!("runtime manifest invalid runtime name '{}'", runtime));
+            return Err(format!(
+                "runtime manifest invalid runtime name '{}'",
+                runtime
+            ));
         }
         let entry = serde_json::from_value::<RuntimeManifestEntry>(value.clone())
             .map_err(|err| format!("runtime manifest invalid entry for '{}': {}", runtime, err))?;
@@ -7762,8 +7762,14 @@ fn runtime_dependents_summary_local(
         }));
     }
     dependents.sort_by(|a, b| {
-        let a_runtime = a.get("runtime").and_then(|value| value.as_str()).unwrap_or("");
-        let b_runtime = b.get("runtime").and_then(|value| value.as_str()).unwrap_or("");
+        let a_runtime = a
+            .get("runtime")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let b_runtime = b
+            .get("runtime")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         a_runtime.cmp(b_runtime)
     });
     Ok(dependents)
@@ -7932,13 +7938,15 @@ async fn query_runtime_usage_global_visible(
     Ok(payload
         .get("usage_global_visible")
         .cloned()
-        .unwrap_or_else(|| serde_json::json!({
-            "scope": "global_visible",
-            "status": "ok",
-            "in_use": false,
-            "running_count": 0,
-            "running_nodes": [],
-        })))
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "scope": "global_visible",
+                "status": "ok",
+                "in_use": false,
+                "running_count": 0,
+                "running_nodes": [],
+            })
+        }))
 }
 
 fn parse_admin_envelope(body: &str, action: &str) -> Result<serde_json::Value, String> {
@@ -8164,23 +8172,23 @@ async fn handle_publish_runtime_package(
 
     match publish_result {
         Ok(mut result) => {
-            let (manifest_version, manifest_hash) = match local_runtime_manifest_meta_from_file(&manifest_path)
-            {
-                Ok(meta) => meta,
-                Err(err) => {
-                    return Ok((
-                        502,
-                        serde_json::json!({
-                            "status": "error",
-                            "action": "publish_runtime_package",
-                            "payload": serde_json::Value::Null,
-                            "error_code": "SERVICE_FAILED",
-                            "error_detail": err,
-                        })
-                        .to_string(),
-                    ))
-                }
-            };
+            let (manifest_version, manifest_hash) =
+                match local_runtime_manifest_meta_from_file(&manifest_path) {
+                    Ok(meta) => meta,
+                    Err(err) => {
+                        return Ok((
+                            502,
+                            serde_json::json!({
+                                "status": "error",
+                                "action": "publish_runtime_package",
+                                "payload": serde_json::Value::Null,
+                                "error_code": "SERVICE_FAILED",
+                                "error_detail": err,
+                            })
+                            .to_string(),
+                        ))
+                    }
+                };
             let runtime_name = result
                 .get("runtime_name")
                 .and_then(|value| value.as_str())
@@ -8192,8 +8200,14 @@ async fn handle_publish_runtime_package(
                 .unwrap_or_default()
                 .to_string();
             if let Some(obj) = result.as_object_mut() {
-                obj.insert("manifest_version".to_string(), serde_json::json!(manifest_version));
-                obj.insert("manifest_hash".to_string(), serde_json::json!(manifest_hash));
+                obj.insert(
+                    "manifest_version".to_string(),
+                    serde_json::json!(manifest_version),
+                );
+                obj.insert(
+                    "manifest_hash".to_string(),
+                    serde_json::json!(manifest_hash),
+                );
             }
 
             let (http_status, status, follow_up) = run_publish_runtime_package_follow_up(
@@ -8434,7 +8448,14 @@ async fn handle_remove_runtime_version(
         ));
     }
 
-    let usage_global = match query_runtime_usage_global_visible(ctx, client, runtime, runtime_version).await {
+    let usage_global = match query_runtime_usage_global_visible(
+        ctx,
+        client,
+        runtime,
+        runtime_version,
+    )
+    .await
+    {
         Ok(value) => value,
         Err(err) => {
             return Ok((
@@ -8509,38 +8530,39 @@ async fn handle_remove_runtime_version(
         ));
     }
 
-    let updated_manifest = match remove_runtime_version_from_manifest_local(&manifest, runtime, runtime_version) {
-        Ok(value) => value,
-        Err(err) if err == "RUNTIME_CURRENT_CONFLICT" => {
-            return Ok((
-                409,
-                serde_json::json!({
-                    "status": "error",
-                    "action": "remove_runtime_version",
-                    "payload": serde_json::Value::Null,
-                    "error_code": "RUNTIME_CURRENT_CONFLICT",
-                    "error_detail": format!(
-                        "cannot delete current version '{}' for runtime '{}'",
-                        runtime_version, runtime
-                    ),
-                })
-                .to_string(),
-            ));
-        }
-        Err(err) => {
-            return Ok((
-                409,
-                serde_json::json!({
-                    "status": "error",
-                    "action": "remove_runtime_version",
-                    "payload": serde_json::Value::Null,
-                    "error_code": "RUNTIME_REMOVE_FAILED",
-                    "error_detail": err,
-                })
-                .to_string(),
-            ));
-        }
-    };
+    let updated_manifest =
+        match remove_runtime_version_from_manifest_local(&manifest, runtime, runtime_version) {
+            Ok(value) => value,
+            Err(err) if err == "RUNTIME_CURRENT_CONFLICT" => {
+                return Ok((
+                    409,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": "remove_runtime_version",
+                        "payload": serde_json::Value::Null,
+                        "error_code": "RUNTIME_CURRENT_CONFLICT",
+                        "error_detail": format!(
+                            "cannot delete current version '{}' for runtime '{}'",
+                            runtime_version, runtime
+                        ),
+                    })
+                    .to_string(),
+                ));
+            }
+            Err(err) => {
+                return Ok((
+                    409,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": "remove_runtime_version",
+                        "payload": serde_json::Value::Null,
+                        "error_code": "RUNTIME_REMOVE_FAILED",
+                        "error_detail": err,
+                    })
+                    .to_string(),
+                ));
+            }
+        };
 
     let quarantined = match quarantine_runtime_version_dir_local(runtime, runtime_version) {
         Ok(value) => value,
@@ -8611,23 +8633,23 @@ async fn handle_remove_runtime_version(
         false
     };
 
-    let (manifest_version, manifest_hash) = match local_runtime_manifest_meta_from_file(manifest_path)
-    {
-        Ok(meta) => meta,
-        Err(err) => {
-            return Ok((
-                502,
-                serde_json::json!({
-                    "status": "error",
-                    "action": "remove_runtime_version",
-                    "payload": serde_json::Value::Null,
-                    "error_code": "SERVICE_FAILED",
-                    "error_detail": err,
-                })
-                .to_string(),
-            ));
-        }
-    };
+    let (manifest_version, manifest_hash) =
+        match local_runtime_manifest_meta_from_file(manifest_path) {
+            Ok(meta) => meta,
+            Err(err) => {
+                return Ok((
+                    502,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": "remove_runtime_version",
+                        "payload": serde_json::Value::Null,
+                        "error_code": "SERVICE_FAILED",
+                        "error_detail": err,
+                    })
+                    .to_string(),
+                ));
+            }
+        };
 
     Ok((
         200,
@@ -10898,7 +10920,10 @@ mod tests {
         let redacted = redact_executor_log_value(&value);
 
         assert_eq!(redacted["api_key"], json!(NODE_SECRET_REDACTION_TOKEN));
-        assert_eq!(redacted["nested"]["token"], json!(NODE_SECRET_REDACTION_TOKEN));
+        assert_eq!(
+            redacted["nested"]["token"],
+            json!(NODE_SECRET_REDACTION_TOKEN)
+        );
         assert_eq!(redacted["nested"]["safe"], json!("ok"));
         assert_eq!(
             redacted["list"][0]["password"],
@@ -11118,8 +11143,8 @@ mod tests {
         )
         .expect("write manifest");
 
-        let (version, hash) =
-            local_runtime_manifest_meta_from_file(&manifest_path).expect("load local manifest meta");
+        let (version, hash) = local_runtime_manifest_meta_from_file(&manifest_path)
+            .expect("load local manifest meta");
         assert_eq!(version, 1711111111111);
         assert_eq!(hash.len(), 64);
 
@@ -11286,20 +11311,12 @@ mod tests {
             ),
         ]);
 
-        let first = publish_runtime_package_inline(
-            &files,
-            &staging_root,
-            &runtimes_root,
-            &manifest_path,
-        )
-        .expect("first inline publish");
-        let second = publish_runtime_package_inline(
-            &files,
-            &staging_root,
-            &runtimes_root,
-            &manifest_path,
-        )
-        .expect("second inline publish should be idempotent");
+        let first =
+            publish_runtime_package_inline(&files, &staging_root, &runtimes_root, &manifest_path)
+                .expect("first inline publish");
+        let second =
+            publish_runtime_package_inline(&files, &staging_root, &runtimes_root, &manifest_path)
+                .expect("second inline publish should be idempotent");
 
         assert_eq!(first["runtime_name"], json!("ai.support.demo"));
         assert_eq!(second["runtime_name"], json!("ai.support.demo"));
@@ -11478,7 +11495,10 @@ mod tests {
             err.contains("single root directory") || err.contains("exactly one root directory"),
             "err={err}"
         );
-        assert!(bundle_path.exists(), "invalid layout bundle should remain in blob");
+        assert!(
+            bundle_path.exists(),
+            "invalid layout bundle should remain in blob"
+        );
 
         let _ = fs::remove_dir_all(blob_root);
         let _ = fs::remove_dir_all(staging_root);
@@ -11533,8 +11553,15 @@ mod tests {
             .expect("read installed start metadata")
             .permissions()
             .mode();
-        assert_eq!(installed_mode & 0o111, 0o111, "start.sh must remain executable");
-        assert!(!bundle_path.exists(), "successful publish should remove blob bundle");
+        assert_eq!(
+            installed_mode & 0o111,
+            0o111,
+            "start.sh must remain executable"
+        );
+        assert!(
+            !bundle_path.exists(),
+            "successful publish should remove blob bundle"
+        );
 
         let manifest_raw = fs::read_to_string(&manifest_path).expect("read manifest");
         let manifest_json: serde_json::Value =
