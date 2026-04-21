@@ -26,6 +26,7 @@
 - [Design Principles](#design-principles)
 - [Current Status](#current-status)
 - [Getting Started](#getting-started)
+- [Creating a Node from Scratch](#creating-a-node-from-scratch)
 - [SY.admin API](#syadmin-api)
 - [Infrastructure Reference](#infrastructure-reference)
 - [SDK Development](#sdk-development)
@@ -270,6 +271,271 @@ This is a working system with ongoing spec/doc alignment. Core routing, SHM regi
 ## Getting Started
 
 See the [Technical Specification](./docs/) for complete details. This README explains the system and concepts. For how to run, build, and develop locally, see [`DEVELOPMENT.md`](./DEVELOPMENT.md).
+
+---
+
+## Creating a Node from Scratch
+
+This section walks through the complete lifecycle of creating a new Fluxbee node: from an empty directory to a running agent inside the hive. No prior knowledge of the internal packaging format is required.
+
+### The three node types at a glance
+
+| Type | When to use | Needs compilation? |
+|---|---|---|
+| `full_runtime` | You write a custom binary (Rust, Go, etc.) and it runs as its own process | Yes |
+| `config_only` | You only need to configure an existing runtime — change the prompt, model, thresholds | No |
+| `workflow` | You define a workflow that runs on top of an existing workflow engine | No |
+
+Start with `config_only` if you just want to create a new agent persona on top of `ai.generic`. Use `full_runtime` when you are writing a new binary from scratch.
+
+---
+
+### Step 1 — Scaffold the package directory
+
+`fluxbee-scaffold` creates the correct directory structure and `package.json` for you so you don't have to remember the format.
+
+**Config-only agent** (most common for a new AI persona):
+
+```bash
+./target/release/fluxbee-scaffold \
+  --name ai.soporte.billing \
+  --type config_only \
+  --base ai.generic
+```
+
+**Full runtime** (custom binary):
+
+```bash
+./target/release/fluxbee-scaffold \
+  --name sy.frontdesk.gov \
+  --type full_runtime \
+  --version 1.0.0
+```
+
+**Workflow**:
+
+```bash
+./target/release/fluxbee-scaffold \
+  --name wf.onboarding.standard \
+  --type workflow \
+  --base wf.engine
+```
+
+The tool creates a directory named after the runtime in the current folder. Example output for `config_only`:
+
+```
+ai.soporte.billing/
+├── package.json
+├── assets/
+│   └── prompts/
+│       └── system.txt       ← your agent's system prompt
+└── config/
+    └── default-config.json  ← model settings and defaults
+```
+
+**Runtime naming rules:** lowercase letters, digits, dots, and hyphens only. Dots separate segments (e.g. `ai.soporte.billing`, `wf.onboarding.v2`).
+
+---
+
+### Step 2 — Edit the files
+
+Open the scaffolded directory and customize the placeholder content.
+
+#### `package.json`
+
+Generated automatically. You normally only need to update `description` and `version`. Example for a config-only package:
+
+```json
+{
+  "name": "ai.soporte.billing",
+  "version": "1.0.0",
+  "type": "config_only",
+  "description": "Billing support agent for Acme Corp",
+  "runtime_base": "ai.generic",
+  "config_template": "config/default-config.json"
+}
+```
+
+#### `assets/prompts/system.txt` (config_only / full_runtime)
+
+Write the system prompt your agent will use. The base runtime loads it from `_system.package_path` at startup.
+
+```
+You are a billing support specialist for Acme Corp.
+You handle refunds, payment inquiries, and invoice disputes.
+Always respond in the customer's language.
+```
+
+#### `config/default-config.json`
+
+Defines default runtime settings. These are merged with any config the operator provides at spawn time (operator config takes precedence):
+
+```json
+{
+  "model": "gpt-4o",
+  "temperature": 0.3,
+  "max_tokens": 4096
+}
+```
+
+#### `bin/start.sh` (full_runtime only)
+
+The scaffold generates a placeholder. Replace it with the actual entry point to your binary:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$(dirname "${BASH_SOURCE[0]}")/my-binary"
+```
+
+Then copy your compiled binary into `bin/`:
+
+```bash
+cargo build --release --bin my-binary
+cp target/release/my-binary ai.my.node/bin/my-binary
+chmod 0755 ai.my.node/bin/my-binary ai.my.node/bin/start.sh
+```
+
+#### `flow/definition.json` (workflow only)
+
+Define the steps, timeout, and escalation behavior:
+
+```json
+{
+  "steps": ["greeting", "collect_data", "verify", "confirm"],
+  "timeout_secs": 300,
+  "on_timeout": "escalate"
+}
+```
+
+---
+
+### Step 3 — Zip the package
+
+Once the directory is ready, create a zip from inside it so the paths in the archive are relative (no leading directory wrapper):
+
+```bash
+cd ai.soporte.billing
+zip -r ../ai.soporte.billing-1.0.0.zip .
+cd ..
+```
+
+The resulting `ai.soporte.billing-1.0.0.zip` is the file you upload.
+
+---
+
+### Step 4 — Upload and publish via Archi
+
+Open Archi in your browser (default `http://127.0.0.1:3000`).
+
+In the left sidebar, scroll to the **Publish Package** panel at the bottom.
+
+1. Click the drop zone (or drag the `.zip` file onto it).
+2. Select the zip you created in Step 3.
+3. Optionally configure:
+   - **Set as current** — make this version the default for new spawns (checked by default).
+   - **Sync to hive** — comma-separated hive IDs to push `dist` to after publish (e.g. `worker-220`).
+   - **Update on hive** — comma-separated hive IDs to trigger `SYSTEM_UPDATE` on after sync.
+4. Click **Publish**.
+
+Archi uploads the zip, sends it to `SY.admin`, which validates the package, installs it under `/var/lib/fluxbee/dist/runtimes/<name>/<version>/`, and updates `manifest.json`.
+
+A success response shows the installed path, manifest version, and follow-up status.
+
+---
+
+### Step 5 — Verify the package is ready
+
+Check that the runtime was published and is ready on the target hive:
+
+```bash
+BASE="http://127.0.0.1:8080"
+HIVE="worker-220"
+RUNTIME="ai.soporte.billing"
+
+# list all runtimes and their readiness
+curl -sS "$BASE/hives/$HIVE/versions" | jq .
+
+# check one runtime specifically
+curl -sS "$BASE/hives/$HIVE/runtimes/$RUNTIME" | jq .
+```
+
+Expected response for a healthy `config_only` package:
+
+```json
+{
+  "runtime_present": true,
+  "start_sh_executable": true,
+  "base_runtime_ready": true
+}
+```
+
+For `full_runtime`, `base_runtime_ready` is always `true` and not meaningful.
+
+If `runtime_present` is `false`, the sync has not converged yet. Wait a few seconds and retry, or trigger a manual sync:
+
+```bash
+curl -sS -X POST "$BASE/hives/$HIVE/sync-hint" \
+  -H "Content-Type: application/json" \
+  -d '{"channel":"dist","folder_id":"fluxbee-dist","wait_for_idle":true,"timeout_ms":30000}'
+```
+
+---
+
+### Step 6 — Spawn the node
+
+Once the runtime is ready, spawn an instance of the node on the target hive:
+
+```bash
+BASE="http://127.0.0.1:8080"
+HIVE="worker-220"
+
+curl -sS -X POST "$BASE/hives/$HIVE/nodes" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "node_name": "AI.soporte.billing.l1",
+    "runtime": "ai.soporte.billing",
+    "runtime_version": "current",
+    "config": {
+      "api_key": "sk-...",
+      "tenant_id": "tnt:12345678-..."
+    }
+  }'
+```
+
+The `config` block here overrides the defaults from `config/default-config.json`. The orchestrator merges them in order: template defaults → request config → forced `_system` fields.
+
+---
+
+### Step 7 — Confirm it is running
+
+```bash
+NODE="AI.soporte.billing.l1"
+
+curl -sS "$BASE/hives/$HIVE/nodes/$NODE/status" | jq .payload.node_status.lifecycle_state
+# → "running"
+
+curl -sS "$BASE/hives/$HIVE/nodes/$NODE/config" | jq .payload.config._system
+# shows runtime, runtime_version, runtime_base, package_path
+```
+
+For `config_only` and `workflow` nodes, `_system.package_path` points to the installed package directory in `dist`. The running process reads its assets (prompts, flow definitions, scripts) from that path.
+
+---
+
+### Quick reference
+
+| Task | Command / Where |
+|---|---|
+| Scaffold new package | `fluxbee-scaffold --name <name> --type <type> [--base <base>]` |
+| Zip for upload | `cd <name> && zip -r ../<name>-<version>.zip .` |
+| Upload & publish | Archi → Publish Package panel (left sidebar) |
+| Check readiness | `GET /hives/<hive>/runtimes/<name>` |
+| Spawn node | `POST /hives/<hive>/nodes` |
+| Node status | `GET /hives/<hive>/nodes/<node>/status` |
+| Kill node | `DELETE /hives/<hive>/nodes/<node>` |
+
+For the complete packaging contract (all three types, `inline_package` source, error codes, manifest format), see [`docs/runtime-packaging-cli-spec.md`](docs/runtime-packaging-cli-spec.md).
 
 ---
 
