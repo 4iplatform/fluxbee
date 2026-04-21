@@ -3499,7 +3499,7 @@ fn syncthing_unit_contents(blob: &BlobRuntimeConfig, service_user: &str) -> Stri
     let service_group =
         linux_user_primary_group(service_user).unwrap_or_else(|| service_user.to_string());
     format!(
-        "[Unit]\nDescription=Fluxbee Syncthing (blob sync)\nAfter=network.target\n\n[Service]\nType=simple\nUser={}\nGroup={}\nWorkingDirectory={}\nEnvironment=HOME={}\nUMask=0027\nExecStart={} --no-browser --no-restart --home={} --gui-address=127.0.0.1:{}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
+        "[Unit]\nDescription=Fluxbee Syncthing (blob sync)\nAfter=network.target\n\n[Service]\nType=simple\nUser={}\nGroup={}\nWorkingDirectory={}\nEnvironment=HOME={}\nUMask=0027\nExecStart={} --no-browser --no-restart --no-upgrade --home={} --gui-address=127.0.0.1:{}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
         service_user,
         service_group,
         blob.sync_data_dir.display(),

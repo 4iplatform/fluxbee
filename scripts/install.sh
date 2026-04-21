@@ -10,6 +10,7 @@ INSTALL_OWNER="${INSTALL_OWNER:-${SUDO_USER:-$USER}}"
 RESTART_ORCHESTRATOR_AFTER_INSTALL="${RESTART_ORCHESTRATOR_AFTER_INSTALL:-1}"
 CLEAN_RUNTIME_VOLATILE_ON_INSTALL="${CLEAN_RUNTIME_VOLATILE_ON_INSTALL:-1}"
 SEED_RUNTIME_FIXTURE="${SEED_RUNTIME_FIXTURE:-1}"
+RESEED_SYNCTHING_CONFIG_ON_INSTALL="${RESEED_SYNCTHING_CONFIG_ON_INSTALL:-0}"
 RUNTIME_FIXTURE_NAME="${RUNTIME_FIXTURE_NAME:-wf.orch.diag}"
 RUNTIME_FIXTURE_VERSION="${RUNTIME_FIXTURE_VERSION:-0.0.1}"
 RUNTIME_FIXTURE_SLEEP_SECS="${RUNTIME_FIXTURE_SLEEP_SECS:-3600}"
@@ -466,6 +467,27 @@ echo "Core binaries verification passed."
 
 seeded_syncthing_vendor=0
 candidate_syncthing_vendor=""
+candidate_syncthing_config=""
+
+for candidate in \
+  "$ROOT_DIR/vendor/syncthing/config.xml" \
+  "$ROOT_DIR/vendor/syncthing/linux-amd64/config.xml" \
+  "$ROOT_DIR/vendor/syncthing-linux-amd64-v2.0.14/config.xml"
+do
+  if [[ -f "$candidate" ]]; then
+    candidate_syncthing_config="$candidate"
+    break
+  fi
+done
+
+if [[ -z "$candidate_syncthing_config" ]]; then
+  for candidate in "$ROOT_DIR"/vendor/*/config.xml; do
+    if [[ -f "$candidate" ]]; then
+      candidate_syncthing_config="$candidate"
+      break
+    fi
+  done
+fi
 
 for candidate in \
   "$ROOT_DIR/vendor/syncthing/syncthing" \
@@ -502,6 +524,11 @@ if [[ -z "$candidate_syncthing_vendor" ]]; then
   exit 1
 fi
 
+if [[ -z "$candidate_syncthing_config" ]]; then
+  echo "ERROR: Syncthing vendor config template not found in repo vendor/. Expected vendor/syncthing/config.xml or vendor/<bundle>/config.xml." >&2
+  exit 1
+fi
+
 if ! command -v python3 >/dev/null 2>&1; then
   echo "ERROR: python3 is required to write dist/vendor/manifest.json" >&2
   exit 1
@@ -515,10 +542,14 @@ fi
 sudo install -m 0755 "$candidate_syncthing_vendor" "$STATE_DIR/dist/vendor/syncthing/syncthing"
 seeded_syncthing_vendor=1
 echo "Seeded Syncthing vendor binary from $candidate_syncthing_vendor"
+sudo install -m 0644 "$candidate_syncthing_config" "$STATE_DIR/dist/vendor/syncthing/config.xml"
+echo "Seeded Syncthing vendor config from $candidate_syncthing_config"
 
 syncthing_vendor_sha="$(sha256sum "$candidate_syncthing_vendor" | awk '{print $1}')"
 syncthing_vendor_size="$(stat -c %s "$candidate_syncthing_vendor")"
 syncthing_vendor_version="$("$candidate_syncthing_vendor" --version 2>/dev/null | head -n1 | sed -n 's/.*v\([0-9][^[:space:]]*\).*/\1/p')"
+syncthing_config_sha="$(sha256sum "$candidate_syncthing_config" | awk '{print $1}')"
+syncthing_config_size="$(stat -c %s "$candidate_syncthing_config")"
 if [[ -z "$syncthing_vendor_version" ]]; then
   syncthing_vendor_version="$(basename "$(dirname "$candidate_syncthing_vendor")" | sed -n 's/.*-v\([0-9][A-Za-z0-9.+-]*\)$/\1/p')"
 fi
@@ -527,7 +558,7 @@ if [[ -z "$syncthing_vendor_version" ]]; then
 fi
 
 vendor_manifest_tmp="$(mktemp)"
-cat <<EOF | python3 - "$syncthing_vendor_sha" "$syncthing_vendor_size" "$syncthing_vendor_version" >"$vendor_manifest_tmp"
+cat <<EOF | python3 - "$syncthing_vendor_sha" "$syncthing_vendor_size" "$syncthing_vendor_version" "$syncthing_config_sha" "$syncthing_config_size" >"$vendor_manifest_tmp"
 import json
 import sys
 import time
@@ -535,6 +566,8 @@ import time
 sha = sys.argv[1]
 size = int(sys.argv[2])
 version = sys.argv[3]
+config_sha = sys.argv[4]
+config_size = int(sys.argv[5])
 
 doc = {
     "schema_version": 1,
@@ -546,6 +579,11 @@ doc = {
             "hash": f"sha256:{sha}",
             "size": size,
             "path": "syncthing/syncthing",
+        },
+        "syncthing_config": {
+            "hash": f"sha256:{config_sha}",
+            "size": config_size,
+            "path": "syncthing/config.xml",
         }
     },
 }
@@ -555,6 +593,144 @@ EOF
 sudo install -m 0644 "$vendor_manifest_tmp" "$STATE_DIR/dist/vendor/manifest.json"
 rm -f "$vendor_manifest_tmp"
 echo "Updated vendor manifest at $STATE_DIR/dist/vendor/manifest.json"
+
+previous_syncthing_config=""
+if [[ -f "$STATE_DIR/syncthing/config.xml" && "$RESEED_SYNCTHING_CONFIG_ON_INSTALL" == "1" ]]; then
+  previous_syncthing_config="$STATE_DIR/syncthing/config.xml.bak.$(date +%s)"
+  echo "Backing up existing managed Syncthing config to $previous_syncthing_config"
+  sudo cp "$STATE_DIR/syncthing/config.xml" "$previous_syncthing_config"
+  sudo chown fluxbee:fluxbee "$previous_syncthing_config"
+  sudo chmod 0640 "$previous_syncthing_config"
+  sudo rm -f "$STATE_DIR/syncthing/config.xml"
+fi
+
+if [[ ! -f "$STATE_DIR/syncthing/config.xml" ]]; then
+  echo "Bootstrapping managed Syncthing home from vendored template..."
+  sudo -u fluxbee HOME="$STATE_DIR/syncthing" "$candidate_syncthing_vendor" generate --home "$STATE_DIR/syncthing" >/dev/null
+  syncthing_seed_tmp="$(mktemp)"
+  python3 - "$STATE_DIR/syncthing/config.xml" "$candidate_syncthing_config" "$previous_syncthing_config" >"$syncthing_seed_tmp" <<'EOF'
+import secrets
+import sys
+import xml.etree.ElementTree as ET
+
+generated_path = sys.argv[1]
+template_path = sys.argv[2]
+previous_path = sys.argv[3]
+
+generated_tree = ET.parse(generated_path)
+generated_root = generated_tree.getroot()
+template_tree = ET.parse(template_path)
+template_root = template_tree.getroot()
+previous_root = None
+if previous_path:
+    try:
+        previous_root = ET.parse(previous_path).getroot()
+    except Exception:
+        previous_root = None
+
+local_devices = [elem for elem in generated_root.findall("device")]
+local_device_id = None
+if local_devices:
+    local_device_id = local_devices[0].attrib.get("id", "").strip() or None
+
+existing_folder_device_ids = {}
+if previous_root is not None:
+    existing_device_ids = {
+        (elem.attrib.get("id", "") or "").strip() for elem in local_devices
+    }
+    for elem in previous_root.findall("device"):
+        device_id = (elem.attrib.get("id", "") or "").strip()
+        if device_id and device_id not in existing_device_ids:
+            local_devices.append(elem)
+            existing_device_ids.add(device_id)
+    for folder in previous_root.findall("folder"):
+        folder_id = (folder.attrib.get("id", "") or "").strip()
+        if not folder_id:
+            continue
+        existing_folder_device_ids[folder_id] = [
+            (elem.attrib.get("id", "") or "").strip()
+            for elem in folder.findall("device")
+            if (elem.attrib.get("id", "") or "").strip()
+        ]
+
+for tag in ("folder", "device", "gui", "ldap", "options", "defaults"):
+    for elem in list(generated_root.findall(tag)):
+        generated_root.remove(elem)
+
+generated_root.attrib.clear()
+generated_root.attrib.update(template_root.attrib)
+
+for child in list(template_root):
+    generated_root.append(child)
+
+for device in local_devices:
+    generated_root.insert(0, device)
+
+if local_device_id:
+    for folder in generated_root.findall("folder"):
+        folder_device_ids = {
+            (elem.attrib.get("id", "") or "").strip() for elem in folder.findall("device")
+        }
+        if local_device_id not in folder_device_ids:
+            ET.SubElement(
+                folder,
+                "device",
+                {
+                    "id": local_device_id,
+                    "introducedBy": "",
+                },
+            )
+        for device_id in existing_folder_device_ids.get(folder.attrib.get("id", "").strip(), []):
+            if device_id not in folder_device_ids and device_id != local_device_id:
+                ET.SubElement(
+                    folder,
+                    "device",
+                    {
+                        "id": device_id,
+                        "introducedBy": "",
+                    },
+                )
+    defaults_folder = generated_root.find("./defaults/folder")
+    if defaults_folder is not None:
+        folder_device_ids = {
+            (elem.attrib.get("id", "") or "").strip()
+            for elem in defaults_folder.findall("device")
+        }
+        if local_device_id not in folder_device_ids:
+            ET.SubElement(
+                defaults_folder,
+                "device",
+                {
+                    "id": local_device_id,
+                    "introducedBy": "",
+                },
+            )
+
+gui = generated_root.find("gui")
+if gui is not None:
+    apikey = gui.find("apikey")
+    previous_apikey = None
+    if previous_root is not None:
+        previous_gui = previous_root.find("gui")
+        if previous_gui is not None:
+            previous_apikey = previous_gui.findtext("apikey")
+            if previous_apikey is not None:
+                previous_apikey = previous_apikey.strip() or None
+    if apikey is not None:
+        if previous_apikey:
+            apikey.text = previous_apikey
+        elif (apikey.text or "").strip() == "__FLUXBEE_SYNCTHING_API_KEY__":
+            apikey.text = secrets.token_urlsafe(24)
+
+ET.indent(generated_tree, space="    ")
+generated_tree.write(sys.stdout.buffer, encoding="utf-8", xml_declaration=False)
+EOF
+  sudo install -o fluxbee -g fluxbee -m 0640 "$syncthing_seed_tmp" "$STATE_DIR/syncthing/config.xml"
+  rm -f "$syncthing_seed_tmp"
+  echo "Seeded managed Syncthing config at $STATE_DIR/syncthing/config.xml"
+else
+  echo "Preserving existing managed Syncthing config at $STATE_DIR/syncthing/config.xml"
+fi
 
 if [[ "$SEED_RUNTIME_FIXTURE" == "1" ]]; then
   echo "Seeding runtime fixture in $STATE_DIR/dist/runtimes: $RUNTIME_FIXTURE_NAME@$RUNTIME_FIXTURE_VERSION"

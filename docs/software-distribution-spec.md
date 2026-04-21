@@ -439,10 +439,11 @@ El orchestrator gestiona Syncthing como cualquier servicio:
 
 ```
 Bootstrap (motherbee o add_hive):
-  1. Copiar binario a /opt/fluxbee/bin/syncthing
-  2. Arrancar con: syncthing --no-upgrade -home /var/lib/fluxbee/syncthing/
-  3. Primer arranque genera: Device ID, cert TLS, config.xml, database
-  4. Orchestrator configura via REST API (folder, devices, discovery off)
+  1. Sembrar binario y `config.xml` template desde el repo vendor hacia dist/vendor
+  2. Bootstrap inicial del home gestionado (`/var/lib/fluxbee/syncthing`) usando ese template
+  3. Arrancar con: syncthing --no-upgrade -home /var/lib/fluxbee/syncthing/
+  4. Primer arranque genera: Device ID, cert TLS y database sobre el home ya sembrado
+  5. Orchestrator configura via REST API / reconciliación local (folder, devices, discovery off)
 
 Runtime:
   - Health check via GET /rest/noauth/health
