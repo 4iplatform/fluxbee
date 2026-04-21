@@ -169,10 +169,10 @@ Optional follow-up operations after publish:
   - Resolves `blob_path` relative to the configured blob root.
   - Extracts zip bundles into admin staging with traversal/layout checks.
   - Validates and installs through the shared runtime package core.
-- [ ] RPP-C4. Enforce lifecycle serialization with the correct ownership boundary.
+- [x] RPP-C4. Enforce lifecycle serialization with the correct ownership boundary.
   - Do not rely on a shared inter-process lock as the architectural answer.
-  - Keep stage-1 publication serialized under `SY.admin`.
-  - Move remaining stage-1 runtime mutation paths out of `SY.orchestrator` before calling this closed.
+  - Stage-1 publication stays serialized under `SY.admin`.
+  - `remove_runtime_version` moved out of `SY.orchestrator`; stage-1 runtime mutation paths now live under `SY.admin`.
 - [x] RPP-C5. Restrict package publication writes to `motherbee`.
   - `publish_runtime_package` rejects non-`motherbee` execution with `NOT_PRIMARY`.
 - [x] RPP-C6. Return canonical admin envelope with publish details.
@@ -218,9 +218,9 @@ Optional follow-up operations after publish:
   - This keeps Archi-produced instance packages on the same orchestrator path already used for runtime-base packages.
 - [x] RPP-E4. Keep publish and node lifecycle responsibilities separate in code boundaries.
   - `SY.admin` owns package publication/materialization into `dist` and manifest mutation.
+  - `SY.admin` also owns published-version deletion via `remove_runtime_version`.
   - `SY.orchestrator` continues to own `sync_hint`, `update`, `run_node`, `restart_node`, and managed config persistence.
   - `SY.wf-rules` now composes those two responsibilities instead of reimplementing install/write logic locally.
-  - Remaining cleanup: `remove_runtime_version` still lives in `SY.orchestrator` and should move to `SY.admin` to match this boundary completely.
 
 ### Phase F - Tests
 
@@ -242,7 +242,7 @@ Optional follow-up operations after publish:
   - missing runtime base
   - base runtime not ready
   - duplicate version with different content
-  - publish while lifecycle lock is held
+  - publish from non-`motherbee`
 - [ ] RPP-F6. E2E Archi plan flow.
   - manifest/execution plan publishes package
   - deploys it

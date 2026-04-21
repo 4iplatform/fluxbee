@@ -3959,6 +3959,8 @@ fn admin_action_allows_ai_write(action: &str) -> bool {
             | "add_vpn"
             | "delete_vpn"
             | "run_node"
+            | "start_node"
+            | "restart_node"
             | "kill_node"
             | "remove_node_instance"
             | "remove_runtime_version"
@@ -4456,6 +4458,32 @@ fn translate_scmd(
             Ok(AdminTranslation {
                 admin_target,
                 action: "run_node".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("POST", ["hives", hive_id, "nodes", node_name, "start"]) => {
+            let mut params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for start_node must be a JSON object".into());
+            }
+            params["node_name"] = json!(node_name);
+            Ok(AdminTranslation {
+                admin_target,
+                action: "start_node".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("POST", ["hives", hive_id, "nodes", node_name, "restart"]) => {
+            let mut params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for restart_node must be a JSON object".into());
+            }
+            params["node_name"] = json!(node_name);
+            Ok(AdminTranslation {
+                admin_target,
+                action: "restart_node".to_string(),
                 target_hive: (*hive_id).to_string(),
                 params,
             })
@@ -9978,6 +10006,25 @@ mod tests {
             })
         );
         assert!(admin_action_allows_ai_write("publish_runtime_package"));
+    }
+
+    #[test]
+    fn translate_restart_node_scmd() {
+        let translated = translate_scmd(
+            "motherbee",
+            parse(r#"curl -X POST /hives/worker-220/nodes/AI.chat@worker-220/restart -d '{}'"#),
+        )
+        .expect("translation should succeed");
+
+        assert_eq!(translated.action, "restart_node");
+        assert_eq!(translated.target_hive, "worker-220");
+        assert_eq!(
+            translated.params,
+            json!({
+                "node_name": "AI.chat@worker-220"
+            })
+        );
+        assert!(admin_action_allows_ai_write("restart_node"));
     }
 
     #[test]

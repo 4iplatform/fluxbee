@@ -72,6 +72,8 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "delete_route",
     "add_vpn",
     "delete_vpn",
+    "start_node",
+    "restart_node",
     "run_node",
     "set_node_config",
     "get_node_status",
@@ -2515,6 +2517,18 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "start_node",
+        route: InternalActionRoute::Command("start_node"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "restart_node",
+        route: InternalActionRoute::Command("restart_node"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "kill_node",
         route: InternalActionRoute::Command("kill_node"),
         requires_target: true,
@@ -3864,6 +3878,32 @@ async fn handle_hive_paths(
             };
             let (status, resp) =
                 handle_admin_command(ctx, client, "run_node", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["nodes", name, "start"]) => {
+            let mut payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            if payload.get("node_name").is_none() {
+                payload["node_name"] = serde_json::Value::String(decode_percent(name));
+            }
+            let (status, resp) =
+                handle_admin_command(ctx, client, "start_node", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["nodes", name, "restart"]) => {
+            let mut payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            if payload.get("node_name").is_none() {
+                payload["node_name"] = serde_json::Value::String(decode_percent(name));
+            }
+            let (status, resp) =
+                handle_admin_command(ctx, client, "restart_node", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("DELETE", ["nodes", name]) => {
@@ -5888,6 +5928,8 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "add_vpn"
             | "delete_vpn"
             | "run_node"
+            | "start_node"
+            | "restart_node"
             | "kill_node"
             | "remove_node_instance"
             | "remove_runtime_version"
@@ -5958,7 +6000,9 @@ fn admin_action_summary(action: &str) -> &'static str {
         "get_versions" => "Read core and runtime versions for one hive.",
         "list_runtimes" => "List runtimes for one hive.",
         "get_runtime" => "Read one runtime definition in a hive.",
-        "remove_runtime_version" => "Delete one runtime version from a hive.",
+        "remove_runtime_version" => {
+            "Delete one published runtime version from motherbee dist/manifest."
+        }
         "list_routes" => "List route rules for a hive.",
         "list_vpns" => "List VPN patterns for a hive.",
         "get_storage" => "Read storage configuration and status.",
@@ -5980,7 +6024,9 @@ fn admin_action_summary(action: &str) -> &'static str {
         "timer_parse" => "Parse a date/time string through SY.timer for a hive.",
         "timer_format" => "Format a UTC instant through SY.timer for a hive.",
         "opa_check" => "Validate OPA policy text without applying it.",
-        "run_node" => "Start a node in a hive.",
+        "run_node" => "Create and start a new managed node instance in a hive.",
+        "start_node" => "Start an existing persisted managed node instance in a hive.",
+        "restart_node" => "Restart an existing managed node instance in a hive.",
         "kill_node" => "Stop a node in a hive. Optional purge_instance also removes its persisted instance directory.",
         "remove_node_instance" => "Delete a node instance from disk/runtime state.",
         "send_node_message" => "Send a system message to a node.",
@@ -6063,6 +6109,8 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "timer_format" => vec!["POST /hives/{hive}/timer/format"],
         "opa_check" => vec!["POST /hives/{hive}/opa/policy/check"],
         "run_node" => vec!["POST /hives/{hive}/nodes"],
+        "start_node" => vec!["POST /hives/{hive}/nodes/{node_name}/start"],
+        "restart_node" => vec!["POST /hives/{hive}/nodes/{node_name}/restart"],
         "kill_node" => vec!["DELETE /hives/{hive}/nodes/{node_name}"],
         "remove_node_instance" => vec!["DELETE /hives/{hive}/nodes/{node_name}/instance"],
         "send_node_message" => vec!["POST /hives/{hive}/nodes/{node_name}/messages"],
@@ -6202,8 +6250,16 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
         "run_node" => vec![admin_action_path_param(
             "hive",
             "string",
-            "Target hive where the node should start.",
+            "Target hive where the node should be created and started.",
         )],
+        "start_node" | "restart_node" => vec![
+            admin_action_path_param("hive", "string", "Target hive id in the URL path."),
+            admin_action_path_param(
+                "node_name",
+                "string",
+                "Fully-qualified node name for the persisted instance.",
+            ),
+        ],
         "add_route" => vec![admin_action_path_param(
             "hive",
             "string",
@@ -6237,9 +6293,11 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
 fn admin_action_body_required(action: &str) -> bool {
     matches!(
         action,
-        "add_hive"
+            "add_hive"
             | "publish_runtime_package"
             | "run_node"
+            | "start_node"
+            | "restart_node"
             | "add_route"
             | "add_vpn"
             | "set_node_config"
@@ -6731,6 +6789,12 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "node_name": "AI.chat@motherbee",
             "runtime_version": "current"
         }),
+        "start_node" => serde_json::json!({
+            "node_name": "AI.chat@motherbee"
+        }),
+        "restart_node" => serde_json::json!({
+            "node_name": "AI.chat@motherbee"
+        }),
         "kill_node" => serde_json::json!({
             "force": false,
             "purge_instance": true
@@ -6910,6 +6974,12 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "run_node" => {
             r#"curl -X POST /hives/motherbee/nodes -d '{"node_name":"AI.chat@motherbee","runtime_version":"current"}'"#
         }
+        "start_node" => {
+            r#"curl -X POST /hives/motherbee/nodes/AI.chat@motherbee/start -d '{"node_name":"AI.chat@motherbee"}'"#
+        }
+        "restart_node" => {
+            r#"curl -X POST /hives/motherbee/nodes/AI.chat@motherbee/restart -d '{"node_name":"AI.chat@motherbee"}'"#
+        }
         "kill_node" => {
             r#"curl -X DELETE /hives/motherbee/nodes/AI.chat@motherbee -d '{"force":false,"purge_instance":true}'"#
         }
@@ -7038,8 +7108,19 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "For node software versions, use GET /versions or GET /hives/{hive}/versions and map node names to core/runtime entries.",
         ],
         "run_node" => vec![
+            "Use this only when creating/spawning a new managed instance.",
             "runtime can be omitted when it is derivable from node_name.",
             "For internal ADMIN_COMMAND dispatch, the hive target is encoded via payload.target; in HTTP it comes from /hives/{hive}.",
+        ],
+        "start_node" => vec![
+            "Use this when the persisted managed node instance already exists and needs to be started again.",
+            "This reuses the stored config.json and runtime metadata instead of creating a new instance.",
+            "The hive target comes from the /hives/{hive} path in HTTP.",
+        ],
+        "restart_node" => vec![
+            "Use this when the managed node instance already exists and should be restarted.",
+            "If the transient systemd unit is missing or inactive, orchestrator can fall back to the start path for the persisted instance.",
+            "The hive target comes from the /hives/{hive} path in HTTP.",
         ],
         "kill_node" | "remove_node_instance" | "set_node_config" | "send_node_message" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
@@ -9281,6 +9362,8 @@ fn build_admin_request(
         }
         "list_nodes"
         | "run_node"
+        | "start_node"
+        | "restart_node"
         | "kill_node"
         | "remove_node_instance"
         | "hive_status"
@@ -9603,6 +9686,8 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
         action,
         "list_nodes"
             | "run_node"
+            | "start_node"
+            | "restart_node"
             | "kill_node"
             | "remove_node_instance"
             | "hive_status"
@@ -9693,6 +9778,8 @@ fn is_node_scoped_action(action: &str) -> bool {
     matches!(
         action,
         "run_node"
+            | "start_node"
+            | "restart_node"
             | "kill_node"
             | "remove_node_instance"
             | "get_node_config"
@@ -9716,6 +9803,7 @@ fn admin_payload_contract_error(action: &str, payload: &serde_json::Value) -> Op
                 None
             }
         }
+        "start_node" | "restart_node" => payload.get("name").map(|_| ("name", "node_name")),
         "kill_node" => payload.get("name").map(|_| ("name", "node_name")),
         "remove_node_instance" => payload.get("name").map(|_| ("name", "node_name")),
         _ => None,
@@ -10754,6 +10842,8 @@ mod tests {
         assert!(actions.contains(&"sync_hint"));
         assert!(actions.contains(&"update"));
         assert!(actions.contains(&"get_runtime"));
+        assert!(actions.contains(&"start_node"));
+        assert!(actions.contains(&"restart_node"));
         assert!(actions.contains(&"run_node"));
         assert!(!actions.contains(&"wf_rules_compile_apply"));
     }
@@ -10983,6 +11073,24 @@ mod tests {
         assert_eq!(
             admin_action_path_patterns("publish_runtime_package"),
             vec!["POST /admin/runtime-packages/publish"]
+        );
+    }
+
+    #[test]
+    fn managed_lifecycle_actions_are_registered() {
+        let start_spec = resolve_internal_action_spec("start_node").expect("start_node must exist");
+        let restart_spec =
+            resolve_internal_action_spec("restart_node").expect("restart_node must exist");
+
+        assert!(start_spec.requires_target);
+        assert!(restart_spec.requires_target);
+        assert_eq!(
+            admin_action_path_patterns("start_node"),
+            vec!["POST /hives/{hive}/nodes/{node_name}/start"]
+        );
+        assert_eq!(
+            admin_action_path_patterns("restart_node"),
+            vec!["POST /hives/{hive}/nodes/{node_name}/restart"]
         );
     }
 
