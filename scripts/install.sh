@@ -610,7 +610,7 @@ if [[ ! -f "$STATE_DIR/syncthing/config.xml" ]]; then
   sudo HOME="$STATE_DIR/syncthing" "$STATE_DIR/dist/vendor/syncthing/syncthing" generate --home "$STATE_DIR/syncthing" >/dev/null
   sudo chown -R fluxbee:fluxbee "$STATE_DIR/syncthing"
   syncthing_seed_tmp="$(mktemp)"
-  python3 - "$STATE_DIR/syncthing/config.xml" "$candidate_syncthing_config" "$previous_syncthing_config" >"$syncthing_seed_tmp" <<'EOF'
+  sudo python3 - "$STATE_DIR/syncthing/config.xml" "$candidate_syncthing_config" "$previous_syncthing_config" >"$syncthing_seed_tmp" <<'EOF'
 import secrets
 import sys
 import xml.etree.ElementTree as ET
