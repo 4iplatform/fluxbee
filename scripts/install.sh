@@ -581,6 +581,7 @@ doc = {
             "path": "syncthing/syncthing",
         },
         "syncthing_config": {
+            "upstream_version": version,
             "hash": f"sha256:{config_sha}",
             "size": config_size,
             "path": "syncthing/config.xml",
@@ -606,7 +607,8 @@ fi
 
 if [[ ! -f "$STATE_DIR/syncthing/config.xml" ]]; then
   echo "Bootstrapping managed Syncthing home from vendored template..."
-  sudo -u fluxbee HOME="$STATE_DIR/syncthing" "$candidate_syncthing_vendor" generate --home "$STATE_DIR/syncthing" >/dev/null
+  sudo HOME="$STATE_DIR/syncthing" "$STATE_DIR/dist/vendor/syncthing/syncthing" generate --home "$STATE_DIR/syncthing" >/dev/null
+  sudo chown -R fluxbee:fluxbee "$STATE_DIR/syncthing"
   syncthing_seed_tmp="$(mktemp)"
   python3 - "$STATE_DIR/syncthing/config.xml" "$candidate_syncthing_config" "$previous_syncthing_config" >"$syncthing_seed_tmp" <<'EOF'
 import secrets
