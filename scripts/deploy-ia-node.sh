@@ -183,12 +183,17 @@ log() {
   echo "[$(date -Iseconds)] $msg" | tee -a "$LOG_FILE"
 }
 
+log_stderr() {
+  local msg="$1"
+  echo "[$(date -Iseconds)] $msg" | tee -a "$LOG_FILE" >&2
+}
+
 fetch_existing_config_json() {
   if [[ -z "$NODE_NAME" ]]; then
     echo "Error: --reuse-existing-config requires --node-name" >&2
     exit 1
   fi
-  log "step=get_existing_config node_name=$NODE_NAME"
+  log_stderr "step=get_existing_config node_name=$NODE_NAME"
   local raw
   raw="$(curl -sS -X GET "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/config" | tee -a "$LOG_FILE")"
   RAW_CONFIG_RESPONSE="$raw" python3 - <<'PY'
