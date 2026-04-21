@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# PUB-T23 E2E (config_only):
-# 1) publish base full_runtime
-# 2) publish config_only using runtime_base
+# PUB-T23 E2E (canonical publish path):
+# 1) publish base full_runtime via bundle_upload
+# 2) publish config_only via inline_package using runtime_base
 # 3) deploy + spawn config_only on target hive
 #
 # Usage:
@@ -31,15 +31,19 @@ NODE_NAME="${NODE_NAME:-WF.publish.config.$TEST_ID}"
 MANIFEST_PATH="/var/lib/fluxbee/dist/runtimes/manifest.json"
 DIST_BASE_RUNTIME_DIR="/var/lib/fluxbee/dist/runtimes/$BASE_RUNTIME_NAME"
 DIST_CONFIG_RUNTIME_DIR="/var/lib/fluxbee/dist/runtimes/$CONFIG_RUNTIME_NAME"
-PUBLISH_BIN="$ROOT_DIR/target/release/fluxbee-publish"
 DIAG_BIN="$ROOT_DIR/target/release/inventory_hold_diag"
+BLOB_ROOT="${BLOB_ROOT:-/var/lib/fluxbee/blob}"
+BLOB_REL_BASE="${BLOB_REL_BASE:-packages/incoming}"
 
 tmpdir="$(mktemp -d)"
 base_pkg_dir="$tmpdir/base_pkg"
 cfg_pkg_dir="$tmpdir/cfg_pkg"
 manifest_backup="$tmpdir/manifest.backup.json"
-publish_base_log="$tmpdir/publish_base.log"
-publish_cfg_log="$tmpdir/publish_cfg.log"
+publish_base_body="$tmpdir/publish_base.json"
+publish_cfg_body="$tmpdir/publish_cfg.json"
+base_bundle_zip="$tmpdir/base_bundle.zip"
+base_bundle_blob_rel="$BLOB_REL_BASE/$BASE_RUNTIME_NAME-$BASE_RUNTIME_VERSION.zip"
+base_bundle_blob_abs="$BLOB_ROOT/$base_bundle_blob_rel"
 versions_body="$tmpdir/versions.json"
 spawn_body="$tmpdir/spawn.json"
 status_body="$tmpdir/status.json"
@@ -52,6 +56,7 @@ cleanup() {
   if [[ -f "$manifest_backup" ]]; then
     as_root_local install -m 0644 "$manifest_backup" "$MANIFEST_PATH" >/dev/null 2>&1 || true
   fi
+  as_root_local rm -f "$base_bundle_blob_abs" >/dev/null 2>&1 || true
   as_root_local rm -rf "$DIST_BASE_RUNTIME_DIR" >/dev/null 2>&1 || true
   as_root_local rm -rf "$DIST_CONFIG_RUNTIME_DIR" >/dev/null 2>&1 || true
   as_root_local rm -rf "$tmpdir" >/dev/null 2>&1 || true
@@ -313,7 +318,7 @@ create_base_package_fixture() {
   cat >"$base_pkg_dir/package.json" <<EOF
 {
   "name": "$BASE_RUNTIME_NAME",
-  "version": "0.0.1",
+  "version": "$BASE_RUNTIME_VERSION",
   "type": "full_runtime",
   "description": "PUB-T23 base runtime fixture",
   "config_template": "config/default-config.json",
@@ -346,7 +351,7 @@ create_config_package_fixture() {
   cat >"$cfg_pkg_dir/package.json" <<EOF
 {
   "name": "$CONFIG_RUNTIME_NAME",
-  "version": "0.0.1",
+  "version": "$CONFIG_RUNTIME_VERSION",
   "type": "config_only",
   "description": "PUB-T23 config-only fixture",
   "runtime_base": "$BASE_RUNTIME_NAME",
@@ -365,50 +370,109 @@ hello from config-only fixture
 EOF
 }
 
-run_publish() {
-  local pkg_path="$1"
-  local version="$2"
-  local out_log="$3"
-  as_root_local env \
-    FLUXBEE_PUBLISH_BASE="$BASE" \
-    FLUXBEE_PUBLISH_MOTHER_HIVE_ID="$MOTHER_HIVE_ID" \
-    "$PUBLISH_BIN" "$pkg_path" --version "$version" --deploy "$HIVE_ID" \
-    | tee "$out_log"
+create_zip_bundle() {
+  local src_dir="$1"
+  local out_zip="$2"
+  local root_name="$3"
+  python3 - "$src_dir" "$out_zip" "$root_name" <<'PY'
+import os
+import sys
+import zipfile
+
+src_dir, out_zip, root_name = sys.argv[1:4]
+with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    for dirpath, _, filenames in os.walk(src_dir):
+        rel_dir = os.path.relpath(dirpath, src_dir)
+        for filename in filenames:
+            src_path = os.path.join(dirpath, filename)
+            arc_rel = filename if rel_dir == "." else os.path.join(rel_dir, filename)
+            arcname = os.path.join(root_name, arc_rel)
+            zf.write(src_path, arcname)
+PY
 }
 
-extract_and_validate_deploy_summary() {
-  local out_log="$1"
+stage_base_bundle_in_blob() {
+  local blob_dir
+  blob_dir="$(dirname "$base_bundle_blob_abs")"
+  as_root_local mkdir -p "$blob_dir"
+  as_root_local install -m 0644 "$base_bundle_zip" "$base_bundle_blob_abs"
+}
+
+publish_bundle_runtime() {
+  local blob_rel="$1"
+  local out_body="$2"
+  local payload
+  payload="$(cat <<EOF
+{"source":{"kind":"bundle_upload","blob_path":"$blob_rel"},"sync_to":["$HIVE_ID"],"update_to":["$HIVE_ID"]}
+EOF
+)"
+  http_call "POST" "$BASE/admin/runtime-packages/publish" "$out_body" "$payload"
+}
+
+publish_inline_runtime() {
+  local pkg_dir="$1"
+  local out_body="$2"
+  local payload
+  payload="$(python3 - "$pkg_dir" "$HIVE_ID" <<'PY'
+import json
+import os
+import sys
+
+pkg_dir = sys.argv[1]
+target_hive = sys.argv[2]
+files = {}
+for dirpath, _, filenames in os.walk(pkg_dir):
+    for filename in filenames:
+        path = os.path.join(dirpath, filename)
+        rel = os.path.relpath(path, pkg_dir).replace(os.sep, "/")
+        with open(path, "r", encoding="utf-8") as f:
+            files[rel] = f.read()
+
+print(json.dumps({
+    "source": {
+        "kind": "inline_package",
+        "files": files,
+    },
+    "sync_to": [target_hive],
+    "update_to": [target_hive],
+}, separators=(",", ":")))
+PY
+)"
+  http_call "POST" "$BASE/admin/runtime-packages/publish" "$out_body" "$payload"
+}
+
+extract_and_validate_publish_summary() {
+  local body_file="$1"
   local label="$2"
-  if ! grep -q "sync_hint_status=" "$out_log"; then
-    echo "FAIL[$label]: publish output missing deploy summary" >&2
-    cat "$out_log" >&2 || true
+  local top_status sync_hint_status update_status update_error_code manifest_version
+  top_status="$(json_get_file "status" "$body_file")"
+  if [[ "$top_status" != "ok" && "$top_status" != "sync_pending" ]]; then
+    echo "FAIL[$label]: publish request failed top_status='$top_status'" >&2
+    cat "$body_file" >&2 || true
     exit 1
   fi
-  local deploy_line sync_hint_status update_status update_error_code
-  deploy_line="$(grep -E 'sync_hint_status=' "$out_log" | tail -n1)"
-  sync_hint_status="$(echo "$deploy_line" | sed -n 's/.*sync_hint_status=\([^ ]*\).*/\1/p')"
-  update_status="$(echo "$deploy_line" | sed -n 's/.*update_status=\([^ ]*\).*/\1/p')"
-  update_error_code="$(echo "$deploy_line" | sed -n 's/.*update_error_code=\(.*\)$/\1/p')"
+  sync_hint_status="$(json_get_file "payload.follow_up.sync_hint.0.response.status" "$body_file")"
+  update_status="$(json_get_file "payload.follow_up.update.0.response.status" "$body_file")"
+  update_error_code="$(json_get_file "payload.follow_up.update.0.response.error_code" "$body_file")"
+  manifest_version="$(json_get_file "payload.manifest_version" "$body_file")"
   if [[ "$DEPLOY_STRICT" == "1" ]]; then
     if [[ "$sync_hint_status" == "error" ]]; then
       echo "FAIL[$label]: strict deploy requires sync_hint_status != error" >&2
-      cat "$out_log" >&2 || true
+      cat "$body_file" >&2 || true
       exit 1
     fi
     if [[ "$update_status" == "error" ]]; then
       echo "FAIL[$label]: strict deploy requires update_status != error (code='$update_error_code')" >&2
-      cat "$out_log" >&2 || true
+      cat "$body_file" >&2 || true
       exit 1
     fi
   fi
-  local manifest_version
-  manifest_version="$(sed -n 's/.*Manifest: .* (version=\([0-9][0-9]*\)).*/\1/p' "$out_log" | tail -n1)"
-  if [[ -z "$manifest_version" ]]; then
-    echo "FAIL[$label]: unable to parse manifest version from publish output" >&2
-    cat "$out_log" >&2 || true
+  if [[ ! "$manifest_version" =~ ^[0-9]+$ ]]; then
+    echo "FAIL[$label]: invalid manifest_version='$manifest_version'" >&2
+    cat "$body_file" >&2 || true
     exit 1
   fi
-  echo "$sync_hint_status|$update_status|$update_error_code|$manifest_version"
+  echo "${sync_hint_status:-unknown}|${update_status:-unknown}|${update_error_code:-}|$manifest_version"
 }
 
 require_cmd curl
@@ -424,27 +488,32 @@ fi
 
 echo "PUB-T23 config_only E2E: BASE=$BASE HIVE_ID=$HIVE_ID MOTHER_HIVE_ID=$MOTHER_HIVE_ID BASE_RUNTIME=$BASE_RUNTIME_NAME@$BASE_RUNTIME_VERSION CONFIG_RUNTIME=$CONFIG_RUNTIME_NAME@$CONFIG_RUNTIME_VERSION NODE=$NODE_NAME"
 
-echo "Step 1/13: build binaries (fluxbee-publish + inventory_hold_diag)"
-(cd "$ROOT_DIR" && cargo build --release --bin fluxbee-publish --bin inventory_hold_diag >/dev/null)
-if [[ ! -x "$PUBLISH_BIN" ]]; then
-  echo "FAIL: publish binary missing at '$PUBLISH_BIN'" >&2
-  exit 1
-fi
+echo "Step 1/14: build binaries (inventory_hold_diag)"
+(cd "$ROOT_DIR" && cargo build --release --bin inventory_hold_diag >/dev/null)
 if [[ ! -x "$DIAG_BIN" ]]; then
   echo "FAIL: inventory_hold_diag binary missing at '$DIAG_BIN'" >&2
   exit 1
 fi
 
-echo "Step 2/13: backup manifest + create package fixtures (base + config_only)"
+echo "Step 2/14: backup manifest + create package fixtures (base + config_only)"
 as_root_local install -m 0644 "$MANIFEST_PATH" "$manifest_backup"
 create_base_package_fixture
 create_config_package_fixture
 
-echo "Step 3/13: publish base full_runtime with deploy"
-run_publish "$base_pkg_dir" "$BASE_RUNTIME_VERSION" "$publish_base_log"
+echo "Step 3/14: build base bundle zip and stage it in blob root"
+create_zip_bundle "$base_pkg_dir" "$base_bundle_zip" "$BASE_RUNTIME_NAME"
+stage_base_bundle_in_blob
 
-echo "Step 4/13: validate base deploy summary"
-base_deploy="$(extract_and_validate_deploy_summary "$publish_base_log" "base")"
+echo "Step 4/14: publish base full_runtime through SY.admin bundle_upload"
+publish_base_http="$(publish_bundle_runtime "$base_bundle_blob_rel" "$publish_base_body")"
+if [[ "$publish_base_http" != "200" && "$publish_base_http" != "202" ]]; then
+  echo "FAIL[base]: unexpected http=$publish_base_http" >&2
+  cat "$publish_base_body" >&2 || true
+  exit 1
+fi
+
+echo "Step 5/14: validate base publish summary"
+base_deploy="$(extract_and_validate_publish_summary "$publish_base_body" "base")"
 base_sync_hint_status="${base_deploy%%|*}"
 base_rest="${base_deploy#*|}"
 base_update_status="${base_rest%%|*}"
@@ -452,14 +521,19 @@ base_rest="${base_rest#*|}"
 base_update_error_code="${base_rest%%|*}"
 base_manifest_version="${base_rest#*|}"
 
-echo "Step 5/13: wait base runtime readiness on target"
+echo "Step 6/14: wait base runtime readiness on target"
 wait_runtime_readiness_full "$BASE_RUNTIME_NAME" "$BASE_RUNTIME_VERSION"
 
-echo "Step 6/13: publish config_only runtime with deploy"
-run_publish "$cfg_pkg_dir" "$CONFIG_RUNTIME_VERSION" "$publish_cfg_log"
+echo "Step 7/14: publish config_only runtime through SY.admin inline_package"
+publish_cfg_http="$(publish_inline_runtime "$cfg_pkg_dir" "$publish_cfg_body")"
+if [[ "$publish_cfg_http" != "200" && "$publish_cfg_http" != "202" ]]; then
+  echo "FAIL[config]: unexpected http=$publish_cfg_http" >&2
+  cat "$publish_cfg_body" >&2 || true
+  exit 1
+fi
 
-echo "Step 7/13: validate config_only deploy summary"
-cfg_deploy="$(extract_and_validate_deploy_summary "$publish_cfg_log" "config")"
+echo "Step 8/14: validate config_only publish summary"
+cfg_deploy="$(extract_and_validate_publish_summary "$publish_cfg_body" "config")"
 cfg_sync_hint_status="${cfg_deploy%%|*}"
 cfg_rest="${cfg_deploy#*|}"
 cfg_update_status="${cfg_rest%%|*}"
@@ -467,10 +541,10 @@ cfg_rest="${cfg_rest#*|}"
 cfg_update_error_code="${cfg_rest%%|*}"
 cfg_manifest_version="${cfg_rest#*|}"
 
-echo "Step 8/13: wait config_only readiness (including base_runtime_ready)"
+echo "Step 9/14: wait config_only readiness (including base_runtime_ready)"
 wait_runtime_readiness_config "$CONFIG_RUNTIME_NAME" "$CONFIG_RUNTIME_VERSION" "$cfg_manifest_version"
 
-echo "Step 9/13: spawn node with config_only runtime"
+echo "Step 10/14: spawn node with config_only runtime"
 spawn_http="$(spawn_node)"
 spawn_status="$(json_get_file "status" "$spawn_body")"
 if [[ "$spawn_http" != "200" || "$spawn_status" != "ok" ]]; then
@@ -479,16 +553,16 @@ if [[ "$spawn_http" != "200" || "$spawn_status" != "ok" ]]; then
   exit 1
 fi
 
-echo "Step 10/13: wait node lifecycle RUNNING (or STARTING active) and runtime resolution"
+echo "Step 11/14: wait node lifecycle RUNNING (or STARTING active) and runtime resolution"
 lifecycle_observed="$(wait_node_active_with_runtime "$CONFIG_RUNTIME_NAME" "$CONFIG_RUNTIME_VERSION")"
 
-echo "Step 11/13: verify _system.runtime_base and _system.package_path"
+echo "Step 12/14: verify _system.runtime_base and _system.package_path"
 package_path_observed="$(assert_node_system_runtime_base)"
 
-echo "Step 12/13: cleanup node"
+echo "Step 13/14: cleanup node"
 http_call "DELETE" "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME" "$kill_body" '{"force":true}' >/dev/null || true
 
-echo "Step 13/13: summary"
+echo "Step 14/14: summary"
 echo "status=ok"
 echo "hive_id=$HIVE_ID"
 echo "base_runtime=$BASE_RUNTIME_NAME@$BASE_RUNTIME_VERSION"

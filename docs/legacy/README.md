@@ -500,7 +500,9 @@ Hive-scoped endpoints:
 | `POST` | `/hives/{hive}/vpns` | Add/update VPN rule on hive |
 | `DELETE` | `/hives/{hive}/vpns/{pattern}` | Delete VPN rule by pattern |
 | `GET` | `/hives/{hive}/nodes` | List nodes on hive |
-| `POST` | `/hives/{hive}/nodes` | Spawn node on hive |
+| `POST` | `/hives/{hive}/nodes` | Create/spawn a new managed node instance on hive |
+| `POST` | `/hives/{hive}/nodes/{name}/start` | Start an existing persisted managed node instance |
+| `POST` | `/hives/{hive}/nodes/{name}/restart` | Restart an existing managed node instance |
 | `DELETE` | `/hives/{hive}/nodes/{name}` | Kill node on hive |
 | `GET` | `/hives/{hive}/nodes/{name}/status` | Canonical node status (lifecycle/health/config/process) |
 | `GET` | `/hives/{hive}/nodes/{name}/config` | Read node effective config |
@@ -526,6 +528,10 @@ Hive-scoped endpoints:
 
 Note:
 - Router operations are managed as node lifecycle (`RT.*`) via `/hives/{hive}/nodes`.
+- Managed node lifecycle is now explicit:
+  - `run_node` creates a new persisted instance
+  - `start_node` starts an existing persisted instance
+  - `restart_node` restarts an existing instance and may fall back to start when the transient unit is absent
 - `GET /deployments` and `GET /hives/{hive}/deployments` are history views, not a list of currently running deployments.
 - `GET /drift-alerts` and `GET /hives/{hive}/drift-alerts` are history views, not a live health snapshot.
 - History responses may include `target_hives_detail[*].present` and `workers[*].hive_present` so removed hives remain visible as history.

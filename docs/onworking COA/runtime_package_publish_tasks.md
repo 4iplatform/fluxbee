@@ -238,11 +238,18 @@ Optional follow-up operations after publish:
 - [ ] RPP-F4. E2E publish -> sync/update -> spawn for:
   - `full_runtime` via `bundle_upload`
   - `config_only` via `inline_package`
+  - Canonical E2E harnesses are now prepared in:
+    - `scripts/runtime_packaging_pub_t22_e2e.sh` for direct `full_runtime` publish via `SY.admin` `bundle_upload`
+    - `scripts/runtime_packaging_pub_t23_e2e.sh` for `full_runtime` base + `config_only` publish via `SY.admin` `bundle_upload` + `inline_package`
+  - Pending: execute them against a real motherbee/worker setup and capture final pass/fail.
 - [ ] RPP-F5. E2E negative matrix.
   - missing runtime base
   - base runtime not ready
   - duplicate version with different content
   - publish from non-`motherbee`
+  - Canonical negative harness migration started in `scripts/runtime_packaging_pub_t25_e2e.sh`.
+  - Covered there now: missing runtime base, unknown base runtime, base runtime present in manifest but not materialized/ready.
+  - Pending in a canonical E2E harness: duplicate version conflict and publish from non-`motherbee`.
 - [ ] RPP-F6. E2E Archi plan flow.
   - manifest/execution plan publishes package
   - deploys it

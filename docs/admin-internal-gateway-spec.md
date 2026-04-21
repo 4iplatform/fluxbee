@@ -218,6 +218,8 @@ Implementación actual:
 | `GET /hives/{id}/versions` | `get_versions` | `handle_admin_query` |
 | `GET /hives/{id}/nodes` | `list_nodes` | `handle_admin_query` |
 | `POST /hives/{id}/nodes` | `run_node` | `handle_admin_command` |
+| `POST /hives/{id}/nodes/{name}/start` | `start_node` | `handle_admin_command` |
+| `POST /hives/{id}/nodes/{name}/restart` | `restart_node` | `handle_admin_command` |
 | `DELETE /hives/{id}/nodes/{name}` | `kill_node` | `handle_admin_command` (`purge_instance=true` también limpia el instance dir persistido) |
 | `DELETE /hives/{id}/nodes/{name}/instance` | `remove_node_instance` | `handle_admin_command` |
 | `GET /hives/{id}/nodes/{name}/status` | `get_node_status` | `handle_admin_command` |
@@ -295,7 +297,7 @@ Params:
 
 ## 8. Routing and precedence details
 
-Para `run_node/kill_node/get_node_*`:
+Para `run_node/start_node/restart_node/kill_node/get_node_*`:
 
 1. si `params.node_name` trae `@hive`, ese hive manda
 2. si `target` difiere, se ignora (warning)
@@ -304,6 +306,12 @@ Para `run_node/kill_node/get_node_*`:
 
 Ejemplo:
 - `target=motherbee` + `node_name="WF.x@worker-220"` -> destino real `worker-220`
+
+Semántica de lifecycle:
+
+- `run_node`: crea/spawn una instancia managed nueva; falla si la instancia persistida ya existe.
+- `start_node`: arranca una instancia managed persistida existente.
+- `restart_node`: reinicia una instancia existente; si la unit transient no está activa o no existe, el orchestrator puede converger por el mismo camino que `start_node`.
 
 ---
 

@@ -47,16 +47,14 @@ DIST_MISSING_BASE_RUNTIME_DIR="/var/lib/fluxbee/dist/runtimes/$MISSING_BASE_RUNT
 DIST_UNKNOWN_BASE_RUNTIME_DIR="/var/lib/fluxbee/dist/runtimes/$UNKNOWN_BASE_RUNTIME_NAME"
 DIST_MISSING_START_RUNTIME_DIR="/var/lib/fluxbee/dist/runtimes/$MISSING_START_RUNTIME_NAME"
 DIST_MISSING_START_BASE_RUNTIME_DIR="/var/lib/fluxbee/dist/runtimes/$MISSING_START_BASE_RUNTIME_NAME"
-PUBLISH_BIN="$ROOT_DIR/target/release/fluxbee-publish"
-
 tmpdir="$(mktemp -d)"
 missing_pkg_dir="$tmpdir/missing_base_pkg"
 unknown_pkg_dir="$tmpdir/unknown_base_pkg"
 missing_start_pkg_dir="$tmpdir/missing_start_pkg"
 manifest_backup="$tmpdir/manifest.backup.json"
-publish_missing_log="$tmpdir/publish_missing.log"
-publish_unknown_log="$tmpdir/publish_unknown.log"
-publish_missing_start_log="$tmpdir/publish_missing_start.log"
+publish_missing_body="$tmpdir/publish_missing.json"
+publish_unknown_body="$tmpdir/publish_unknown.json"
+publish_missing_start_body="$tmpdir/publish_missing_start.json"
 versions_body="$tmpdir/versions.json"
 spawn_unknown_body="$tmpdir/spawn_unknown.json"
 spawn_missing_start_body="$tmpdir/spawn_missing_start.json"
@@ -370,7 +368,7 @@ create_missing_base_package_fixture() {
   cat >"$missing_pkg_dir/package.json" <<EOF
 {
   "name": "$MISSING_BASE_RUNTIME_NAME",
-  "version": "0.0.1",
+  "version": "$MISSING_BASE_RUNTIME_VERSION",
   "type": "config_only",
   "description": "PUB-T25 missing runtime_base fixture",
   "config_template": "config/default-config.json"
@@ -393,7 +391,7 @@ create_unknown_base_package_fixture() {
   cat >"$unknown_pkg_dir/package.json" <<EOF
 {
   "name": "$UNKNOWN_BASE_RUNTIME_NAME",
-  "version": "0.0.1",
+  "version": "$UNKNOWN_BASE_RUNTIME_VERSION",
   "type": "config_only",
   "description": "PUB-T25 unknown runtime_base fixture",
   "runtime_base": "$UNKNOWN_BASE_RUNTIME_REF",
@@ -417,7 +415,7 @@ create_missing_start_package_fixture() {
   cat >"$missing_start_pkg_dir/package.json" <<EOF
 {
   "name": "$MISSING_START_RUNTIME_NAME",
-  "version": "0.0.1",
+  "version": "$MISSING_START_RUNTIME_VERSION",
   "type": "config_only",
   "description": "PUB-T25 base runtime missing start.sh fixture",
   "runtime_base": "$MISSING_START_BASE_RUNTIME_NAME",
@@ -436,65 +434,82 @@ base runtime missing start.sh fixture
 EOF
 }
 
-run_publish_expect_success() {
-  local pkg_path="$1"
-  local version="$2"
-  local out_log="$3"
-  as_root_local env \
-    FLUXBEE_PUBLISH_BASE="$BASE" \
-    FLUXBEE_PUBLISH_MOTHER_HIVE_ID="$MOTHER_HIVE_ID" \
-    "$PUBLISH_BIN" "$pkg_path" --version "$version" --deploy "$HIVE_ID" \
-    | tee "$out_log"
+publish_inline_runtime() {
+  local pkg_dir="$1"
+  local out_body="$2"
+  local payload
+  payload="$(python3 - "$pkg_dir" "$HIVE_ID" <<'PY'
+import json
+import os
+import sys
+
+pkg_dir = sys.argv[1]
+target_hive = sys.argv[2]
+files = {}
+for dirpath, _, filenames in os.walk(pkg_dir):
+    for filename in filenames:
+        path = os.path.join(dirpath, filename)
+        rel = os.path.relpath(path, pkg_dir).replace(os.sep, "/")
+        with open(path, "r", encoding="utf-8") as f:
+            files[rel] = f.read()
+
+print(json.dumps({
+    "source": {
+        "kind": "inline_package",
+        "files": files,
+    },
+    "sync_to": [target_hive],
+    "update_to": [target_hive],
+}, separators=(",", ":")))
+PY
+)"
+  http_call "POST" "$BASE/admin/runtime-packages/publish" "$out_body" "$payload"
 }
 
-run_publish_expect_failure() {
-  local pkg_path="$1"
-  local version="$2"
-  local out_log="$3"
-  set +e
-  as_root_local env \
-    FLUXBEE_PUBLISH_BASE="$BASE" \
-    FLUXBEE_PUBLISH_MOTHER_HIVE_ID="$MOTHER_HIVE_ID" \
-    "$PUBLISH_BIN" "$pkg_path" --version "$version" >"$out_log" 2>&1
-  local rc=$?
-  set -e
-  if [[ "$rc" -eq 0 ]]; then
-    echo "FAIL: publish unexpectedly succeeded for invalid package '$pkg_path'" >&2
-    cat "$out_log" >&2 || true
-    exit 1
+assert_publish_error() {
+  local expected_http="$1"
+  local expected_error_code="$2"
+  local response_file="$3"
+  local actual_http="$4"
+  local status_value code_value
+  status_value="$(json_get_file "status" "$response_file")"
+  code_value="$(json_get_file "error_code" "$response_file")"
+  if [[ "$actual_http" != "$expected_http" || "$status_value" != "error" || "$code_value" != "$expected_error_code" ]]; then
+    echo "FAIL: expected publish error http=$expected_http code=$expected_error_code, got http=$actual_http status=$status_value code=$code_value" >&2
+    cat "$response_file" >&2 || true
+    return 1
   fi
 }
 
-extract_and_validate_deploy_summary() {
-  local out_log="$1"
+extract_and_validate_publish_summary() {
+  local body_file="$1"
   local label="$2"
-  if ! grep -q "sync_hint_status=" "$out_log"; then
-    echo "FAIL[$label]: publish output missing deploy summary" >&2
-    cat "$out_log" >&2 || true
+  local top_status sync_hint_status update_status update_error_code manifest_version
+  top_status="$(json_get_file "status" "$body_file")"
+  if [[ "$top_status" != "ok" && "$top_status" != "sync_pending" ]]; then
+    echo "FAIL[$label]: publish request failed top_status='$top_status'" >&2
+    cat "$body_file" >&2 || true
     exit 1
   fi
-  local deploy_line sync_hint_status update_status update_error_code
-  deploy_line="$(grep -E 'sync_hint_status=' "$out_log" | tail -n1)"
-  sync_hint_status="$(echo "$deploy_line" | sed -n 's/.*sync_hint_status=\([^ ]*\).*/\1/p')"
-  update_status="$(echo "$deploy_line" | sed -n 's/.*update_status=\([^ ]*\).*/\1/p')"
-  update_error_code="$(echo "$deploy_line" | sed -n 's/.*update_error_code=\(.*\)$/\1/p')"
+  sync_hint_status="$(json_get_file "payload.follow_up.sync_hint.0.response.status" "$body_file")"
+  update_status="$(json_get_file "payload.follow_up.update.0.response.status" "$body_file")"
+  update_error_code="$(json_get_file "payload.follow_up.update.0.response.error_code" "$body_file")"
   if [[ "$DEPLOY_STRICT" == "1" ]]; then
     if [[ "$sync_hint_status" == "error" ]]; then
       echo "FAIL[$label]: strict deploy requires sync_hint_status != error" >&2
-      cat "$out_log" >&2 || true
+      cat "$body_file" >&2 || true
       exit 1
     fi
     if [[ "$update_status" == "error" ]]; then
       echo "FAIL[$label]: strict deploy requires update_status != error (code='$update_error_code')" >&2
-      cat "$out_log" >&2 || true
+      cat "$body_file" >&2 || true
       exit 1
     fi
   fi
-  local manifest_version
-  manifest_version="$(sed -n 's/.*Manifest: .* (version=\([0-9][0-9]*\)).*/\1/p' "$out_log" | tail -n1)"
-  if [[ -z "$manifest_version" ]]; then
-    echo "FAIL[$label]: unable to parse manifest version from publish output" >&2
-    cat "$out_log" >&2 || true
+  manifest_version="$(json_get_file "payload.manifest_version" "$body_file")"
+  if [[ ! "$manifest_version" =~ ^[0-9]+$ ]]; then
+    echo "FAIL[$label]: invalid manifest_version='$manifest_version'" >&2
+    cat "$body_file" >&2 || true
     exit 1
   fi
   echo "$sync_hint_status|$update_status|$update_error_code|$manifest_version"
@@ -517,7 +532,6 @@ spawn_missing_start() {
 require_cmd curl
 require_cmd jq
 require_cmd python3
-require_cmd cargo
 validate_tenant_id "$TENANT_ID"
 
 if [[ "$HIVE_ID" != "$MOTHER_HIVE_ID" ]]; then
@@ -533,30 +547,29 @@ fi
 
 echo "PUB-T25 negative E2E: BASE=$BASE HIVE_ID=$HIVE_ID MOTHER_HIVE_ID=$MOTHER_HIVE_ID UNKNOWN_RUNTIME=$UNKNOWN_BASE_RUNTIME_NAME@$UNKNOWN_BASE_RUNTIME_VERSION MISSING_START_RUNTIME=$MISSING_START_RUNTIME_NAME@$MISSING_START_RUNTIME_VERSION"
 
-echo "Step 1/11: build binary (fluxbee-publish)"
-(cd "$ROOT_DIR" && cargo build --release --bin fluxbee-publish >/dev/null)
-if [[ ! -x "$PUBLISH_BIN" ]]; then
-  echo "FAIL: publish binary missing at '$PUBLISH_BIN'" >&2
-  exit 1
-fi
-
-echo "Step 2/11: backup manifest + create negative package fixtures"
+echo "Step 1/11: backup manifest + create negative package fixtures"
 as_root_local install -m 0644 "$MANIFEST_PATH" "$manifest_backup"
 create_missing_base_package_fixture
 create_unknown_base_package_fixture
 create_missing_start_package_fixture
 
-echo "Step 3/11: missing runtime_base publish must fail validation"
-run_publish_expect_failure "$missing_pkg_dir" "$MISSING_BASE_RUNTIME_VERSION" "$publish_missing_log"
-if ! grep -q "runtime_base is required for config_only" "$publish_missing_log"; then
+echo "Step 2/11: missing runtime_base publish must fail validation"
+publish_missing_http="$(publish_inline_runtime "$missing_pkg_dir" "$publish_missing_body")"
+assert_publish_error "400" "INVALID_REQUEST" "$publish_missing_body" "$publish_missing_http"
+if ! grep -q "runtime_base is required for config_only" "$publish_missing_body"; then
   echo "FAIL: missing runtime_base error not found in publish output" >&2
-  cat "$publish_missing_log" >&2 || true
+  cat "$publish_missing_body" >&2 || true
   exit 1
 fi
 
-echo "Step 4/11: publish unknown runtime_base package with deploy"
-run_publish_expect_success "$unknown_pkg_dir" "$UNKNOWN_BASE_RUNTIME_VERSION" "$publish_unknown_log"
-unknown_deploy="$(extract_and_validate_deploy_summary "$publish_unknown_log" "unknown-base")"
+echo "Step 3/11: publish unknown runtime_base package with deploy follow-up"
+publish_unknown_http="$(publish_inline_runtime "$unknown_pkg_dir" "$publish_unknown_body")"
+if [[ "$publish_unknown_http" != "200" && "$publish_unknown_http" != "202" ]]; then
+  echo "FAIL[unknown-base]: unexpected http=$publish_unknown_http" >&2
+  cat "$publish_unknown_body" >&2 || true
+  exit 1
+fi
+unknown_deploy="$(extract_and_validate_publish_summary "$publish_unknown_body" "unknown-base")"
 unknown_sync_hint_status="${unknown_deploy%%|*}"
 unknown_rest="${unknown_deploy#*|}"
 unknown_update_status="${unknown_rest%%|*}"
@@ -564,23 +577,29 @@ unknown_rest="${unknown_rest#*|}"
 unknown_update_error_code="${unknown_rest%%|*}"
 unknown_manifest_version="${unknown_rest#*|}"
 
-echo "Step 5/11: unknown runtime_base readiness must stay package-present but base-not-ready"
+echo "Step 4/11: unknown runtime_base readiness must stay package-present but base-not-ready"
 wait_runtime_readiness_negative "$UNKNOWN_BASE_RUNTIME_NAME" "$UNKNOWN_BASE_RUNTIME_VERSION" "$unknown_manifest_version"
 
-echo "Step 6/11: unknown runtime_base spawn must fail with BASE_RUNTIME_NOT_AVAILABLE"
+echo "Step 5/11: unknown runtime_base spawn must fail with BASE_RUNTIME_NOT_AVAILABLE"
 spawn_unknown_base
 assert_spawn_error "500" "BASE_RUNTIME_NOT_AVAILABLE" "$spawn_unknown_body"
 
-echo "Step 7/11: publish dependent package for missing base start.sh case"
-run_publish_expect_success "$missing_start_pkg_dir" "$MISSING_START_RUNTIME_VERSION" "$publish_missing_start_log"
-missing_start_deploy="$(extract_and_validate_deploy_summary "$publish_missing_start_log" "missing-start")"
+echo "Step 6/11: publish dependent package for missing base start.sh case"
+publish_missing_start_http="$(publish_inline_runtime "$missing_start_pkg_dir" "$publish_missing_start_body")"
+if [[ "$publish_missing_start_http" != "200" && "$publish_missing_start_http" != "202" ]]; then
+  echo "FAIL[missing-start]: unexpected http=$publish_missing_start_http" >&2
+  cat "$publish_missing_start_body" >&2 || true
+  exit 1
+fi
+missing_start_deploy="$(extract_and_validate_publish_summary "$publish_missing_start_body" "missing-start")"
 missing_start_sync_hint_status="${missing_start_deploy%%|*}"
 missing_start_rest="${missing_start_deploy#*|}"
 missing_start_update_status="${missing_start_rest%%|*}"
 missing_start_rest="${missing_start_rest#*|}"
 missing_start_update_error_code="${missing_start_rest%%|*}"
+missing_start_publish_manifest_version="${missing_start_rest#*|}"
 
-echo "Step 8/11: inject base runtime into manifest without materializing start.sh"
+echo "Step 7/11: inject base runtime into manifest without materializing start.sh"
 as_root_local rm -rf "$DIST_MISSING_START_BASE_RUNTIME_DIR"
 set_manifest_runtime_entry "$MISSING_START_BASE_RUNTIME_NAME" "$MISSING_START_BASE_RUNTIME_VERSION" "full_runtime"
 manifest_version_and_hash "$meta_file"
@@ -590,12 +609,15 @@ missing_start_manifest_hash="${meta[1]}"
 wait_sync_hint_ok "$sync_hint_body"
 wait_update_ok_or_sync_pending "$missing_start_manifest_version" "$missing_start_manifest_hash" "$update_body"
 
-echo "Step 9/11: missing-start readiness must stay package-present but base-not-ready"
+echo "Step 8/11: missing-start readiness must stay package-present but base-not-ready"
 wait_runtime_readiness_negative "$MISSING_START_RUNTIME_NAME" "$MISSING_START_RUNTIME_VERSION" "$missing_start_manifest_version"
 
-echo "Step 10/11: spawn must fail with BASE_RUNTIME_NOT_PRESENT"
+echo "Step 9/11: spawn must fail with BASE_RUNTIME_NOT_PRESENT"
 spawn_missing_start
 assert_spawn_error "500" "BASE_RUNTIME_NOT_PRESENT" "$spawn_missing_start_body"
+
+echo "Step 10/11: note remaining negative cases"
+echo "note=publish from non-motherbee and version-conflict negative cases require separate harness and remain pending in RPP-F5"
 
 echo "Step 11/11: summary"
 echo "status=ok"
@@ -613,4 +635,5 @@ echo "base_missing_start_spawn_error=BASE_RUNTIME_NOT_PRESENT"
 echo "missing_start_sync_hint_status=$missing_start_sync_hint_status"
 echo "missing_start_update_status=$missing_start_update_status"
 echo "missing_start_update_error_code=$missing_start_update_error_code"
+echo "missing_start_publish_manifest_version=$missing_start_publish_manifest_version"
 echo "runtime packaging PUB-T25 negative E2E passed."
