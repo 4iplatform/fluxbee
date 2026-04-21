@@ -412,15 +412,36 @@ Define the steps, timeout, and escalation behavior:
 
 ### Step 3 — Zip the package
 
-Once the directory is ready, create a zip from inside it so the paths in the archive are relative (no leading directory wrapper):
+Use `fluxbee-scaffold pack` to validate and zip the package in one step. It reads `name` and `version` from `package.json` and writes `<name>-<version>.zip` next to the package directory by default.
+
+**Config-only or workflow** (no binary needed):
 
 ```bash
-cd ai.soporte.billing
-zip -r ../ai.soporte.billing-1.0.0.zip .
-cd ..
+fluxbee-scaffold pack ./ai.soporte.billing
+# → ai.soporte.billing-1.0.0.zip
 ```
 
-The resulting `ai.soporte.billing-1.0.0.zip` is the file you upload.
+**Full runtime** — pass the compiled binary with `--binary`. It gets copied as `bin/start.sh` before zipping:
+
+```bash
+cargo build --release --bin sy-frontdesk-gov
+fluxbee-scaffold pack ./sy.frontdesk.gov --binary ./target/release/sy-frontdesk-gov
+# → sy.frontdesk.gov-1.0.0.zip
+```
+
+Custom output path:
+
+```bash
+fluxbee-scaffold pack ./ai.soporte.billing --output ./dist/ai.soporte.billing-1.0.0.zip
+```
+
+`pack` will error if:
+
+- `full_runtime` and `bin/start.sh` is missing (you forgot `--binary`)
+- `workflow` and the `flow/` directory is absent
+- `package.json` is missing or malformed
+
+The resulting zip is the file you upload in Step 4.
 
 ---
 
@@ -527,8 +548,9 @@ For `config_only` and `workflow` nodes, `_system.package_path` points to the ins
 
 | Task | Command / Where |
 |---|---|
-| Scaffold new package | `fluxbee-scaffold --name <name> --type <type> [--base <base>]` |
-| Zip for upload | `cd <name> && zip -r ../<name>-<version>.zip .` |
+| Scaffold new package | `fluxbee-scaffold new --name <name> --type <type> [--base <base>]` |
+| Zip for upload (config/workflow) | `fluxbee-scaffold pack ./<name>` |
+| Zip for upload (full_runtime) | `fluxbee-scaffold pack ./<name> --binary ./target/release/<bin>` |
 | Upload & publish | Archi → Publish Package panel (left sidebar) |
 | Check readiness | `GET /hives/<hive>/runtimes/<name>` |
 | Spawn node | `POST /hives/<hive>/nodes` |
