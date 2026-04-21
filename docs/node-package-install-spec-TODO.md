@@ -410,17 +410,23 @@ Each step is a separate SCMD action. Archi chains them as needed, with error han
 
 ## 8. What fluxbee-publish becomes
 
-The existing `fluxbee-publish` CLI continues to work for operators with direct filesystem access. It is the "local install" path that bypasses blob and admin:
+Update 2026-04-21:
+
+- the canonical publish path is now `SY.admin` `publish_runtime_package`
+- Archi/executor plans use that same action
+- `fluxbee-publish` remains only as a deprecated local compatibility wrapper over the shared core
+
+The existing `fluxbee-publish` CLI can still work for operators with direct filesystem access, but it is no longer the recommended primary path:
 
 ```bash
 fluxbee-publish ./my-classifier-0.1.0.zip --set-current
 ```
 
-Internally, `fluxbee-publish` does the same steps as the admin endpoint (validate, copy to dist, update manifest), but directly on the local filesystem without going through HTTP.
+Internally, `fluxbee-publish` uses the same shared validation/install core as the admin endpoint, but runs it locally without going through the canonical system action.
 
 The admin endpoint reuses the same validation and install logic as `fluxbee-publish`, extracted into a shared library. There is NO duplication of validation rules between the two paths.
 
-Over time, `fluxbee-publish` may be deprecated in favor of the admin endpoint for all installs, but for now both coexist.
+`fluxbee-publish` is now deprecated as the primary operator path. It remains only as a migration/debugging tool while docs and workflows converge on admin/Archi publish.
 
 ---
 

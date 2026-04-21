@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::future;
 use tar::{Archive, Builder};
@@ -38,7 +39,10 @@ use fluxbee_sdk::{
 use json_router::runtime_package::{
     install_validated_package, validate_package, DIST_RUNTIME_MANIFEST_PATH, DIST_RUNTIME_ROOT_DIR,
 };
-use json_router::runtime_manifest::{write_runtime_manifest_file_atomic, RuntimeManifest};
+use json_router::runtime_manifest::{
+    load_runtime_manifest_from_paths, runtime_manifest_write_v2_gate_enabled_from_env,
+    write_runtime_manifest_file_atomic, RuntimeManifest, RuntimeManifestEntry,
+};
 use json_router::shm::{
     now_epoch_ms, LsaRegionReader, RemoteHiveEntry, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
 };
@@ -7592,6 +7596,270 @@ fn local_runtime_manifest_meta_from_file(path: &Path) -> Result<(u64, String), S
     Ok((version, format!("{:x}", hasher.finalize())))
 }
 
+fn valid_runtime_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
+fn sanitize_runtime_suffix(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn load_local_runtime_manifest() -> Result<Option<RuntimeManifest>, String> {
+    load_runtime_manifest_from_paths(&[PathBuf::from(DIST_RUNTIME_MANIFEST_PATH)])
+}
+
+fn runtime_manifest_entry_map_local(
+    manifest: &RuntimeManifest,
+) -> Result<BTreeMap<String, RuntimeManifestEntry>, String> {
+    let runtimes = manifest
+        .runtimes
+        .as_object()
+        .ok_or_else(|| "runtime manifest invalid: runtimes must be object".to_string())?;
+    let mut out = BTreeMap::new();
+    for (runtime, value) in runtimes {
+        if !valid_runtime_token(runtime) {
+            return Err(format!("runtime manifest invalid runtime name '{}'", runtime));
+        }
+        let entry = serde_json::from_value::<RuntimeManifestEntry>(value.clone())
+            .map_err(|err| format!("runtime manifest invalid entry for '{}': {}", runtime, err))?;
+        out.insert(runtime.to_string(), entry);
+    }
+    Ok(out)
+}
+
+fn runtime_versions_from_manifest_entry_local(entry: &RuntimeManifestEntry) -> Vec<String> {
+    let mut out: Vec<String> = entry
+        .available
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| valid_runtime_token(value))
+        .map(|value| value.to_string())
+        .collect();
+    if let Some(current) = entry
+        .current
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| valid_runtime_token(value))
+    {
+        if !out.iter().any(|value| value == current) {
+            out.push(current.to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn runtime_dependents_summary_local(
+    manifest: &RuntimeManifest,
+    runtime: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let runtimes = runtime_manifest_entry_map_local(manifest)?;
+    let mut dependents = Vec::new();
+    for (name, entry) in runtimes {
+        if entry.runtime_base.as_deref().map(str::trim) != Some(runtime) {
+            continue;
+        }
+        dependents.push(serde_json::json!({
+            "runtime": name,
+            "current": entry.current,
+            "available": runtime_versions_from_manifest_entry_local(&entry),
+            "type": entry.package_type,
+            "runtime_base": entry.runtime_base,
+        }));
+    }
+    dependents.sort_by(|a, b| {
+        let a_runtime = a.get("runtime").and_then(|value| value.as_str()).unwrap_or("");
+        let b_runtime = b.get("runtime").and_then(|value| value.as_str()).unwrap_or("");
+        a_runtime.cmp(b_runtime)
+    });
+    Ok(dependents)
+}
+
+fn next_runtime_manifest_version_ms(now_ms: u64, current_manifest_version: u64) -> u64 {
+    if now_ms > current_manifest_version {
+        now_ms
+    } else {
+        current_manifest_version + 1
+    }
+}
+
+fn remove_runtime_version_from_manifest_local(
+    manifest: &RuntimeManifest,
+    runtime: &str,
+    runtime_version: &str,
+) -> Result<RuntimeManifest, String> {
+    let mut updated = manifest.clone();
+    let runtime_entries = updated
+        .runtimes
+        .as_object_mut()
+        .ok_or_else(|| "runtime manifest invalid: runtimes must be object".to_string())?;
+    let entry_value = runtime_entries
+        .get(runtime)
+        .cloned()
+        .ok_or_else(|| format!("runtime '{}' not found", runtime))?;
+    let mut entry = serde_json::from_value::<RuntimeManifestEntry>(entry_value)
+        .map_err(|err| format!("runtime manifest invalid entry for '{}': {}", runtime, err))?;
+
+    let current = entry.current.as_deref().map(str::trim).unwrap_or("");
+    if runtime_version == "current" || (!current.is_empty() && current == runtime_version) {
+        return Err("RUNTIME_CURRENT_CONFLICT".to_string());
+    }
+
+    let version_exists = runtime_versions_from_manifest_entry_local(&entry)
+        .iter()
+        .any(|value| value == runtime_version);
+    if !version_exists {
+        return Err(format!(
+            "version '{}' not available for runtime '{}'",
+            runtime_version, runtime
+        ));
+    }
+
+    entry
+        .available
+        .retain(|value| value.trim() != runtime_version);
+    if entry.available.is_empty() && current.is_empty() {
+        runtime_entries.remove(runtime);
+    } else {
+        runtime_entries.insert(
+            runtime.to_string(),
+            serde_json::to_value(entry).map_err(|err| {
+                format!(
+                    "runtime manifest remove failed: serialize runtime '{}' failed: {}",
+                    runtime, err
+                )
+            })?,
+        );
+    }
+
+    let now_ms_i64 = Utc::now().timestamp_millis();
+    let now_ms = u64::try_from(now_ms_i64).map_err(|_| {
+        format!(
+            "runtime manifest remove failed: invalid clock value {}",
+            now_ms_i64
+        )
+    })?;
+    updated.version = next_runtime_manifest_version_ms(now_ms, updated.version);
+    updated.updated_at = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
+    updated.hash = None;
+    Ok(updated)
+}
+
+fn quarantine_runtime_version_dir_local(
+    runtime: &str,
+    runtime_version: &str,
+) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let runtime_dir = Path::new(DIST_RUNTIME_ROOT_DIR).join(runtime);
+    let version_dir = runtime_dir.join(runtime_version);
+    if !version_dir.exists() {
+        return Ok(None);
+    }
+    let quarantine = runtime_dir.join(format!(
+        ".removing-{}-{}",
+        sanitize_runtime_suffix(runtime_version),
+        Uuid::new_v4().simple()
+    ));
+    fs::rename(&version_dir, &quarantine).map_err(|err| {
+        format!(
+            "failed to quarantine runtime version dir '{}' -> '{}': {}",
+            version_dir.display(),
+            quarantine.display(),
+            err
+        )
+    })?;
+    Ok(Some((version_dir, quarantine)))
+}
+
+fn restore_quarantined_runtime_version_dir_local(
+    original: &Path,
+    quarantine: &Path,
+) -> Result<(), String> {
+    fs::rename(quarantine, original).map_err(|err| {
+        format!(
+            "failed to restore quarantined runtime version dir '{}' -> '{}': {}",
+            quarantine.display(),
+            original.display(),
+            err
+        )
+    })
+}
+
+fn finalize_quarantined_runtime_version_dir_local(
+    runtime: &str,
+    quarantine: &Path,
+) -> Result<bool, String> {
+    fs::remove_dir_all(quarantine).map_err(|err| {
+        format!(
+            "failed to remove quarantined runtime version dir '{}': {}",
+            quarantine.display(),
+            err
+        )
+    })?;
+    let runtime_dir = Path::new(DIST_RUNTIME_ROOT_DIR).join(runtime);
+    let runtime_dir_empty = runtime_dir
+        .read_dir()
+        .map(|mut read| read.next().is_none())
+        .unwrap_or(false);
+    if runtime_dir_empty {
+        fs::remove_dir(&runtime_dir).map_err(|err| {
+            format!(
+                "failed to remove empty runtime dir '{}': {}",
+                runtime_dir.display(),
+                err
+            )
+        })?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+async fn query_runtime_usage_global_visible(
+    ctx: &AdminContext,
+    client: &AdminRouterClient,
+    runtime: &str,
+    runtime_version: &str,
+) -> Result<serde_json::Value, String> {
+    let request = build_admin_request(
+        ctx,
+        "get_runtime",
+        serde_json::json!({
+            "runtime": runtime,
+            "runtime_version": runtime_version,
+        }),
+        Some(ctx.hive_id.clone()),
+    );
+    let payload = send_admin_request(client, request, admin_action_timeout("get_runtime"))
+        .await
+        .map_err(|err| err.to_string())?;
+    if !payload_is_ok(&payload) {
+        return Err(payload_error_detail(&payload)
+            .unwrap_or_else(|| "failed to query runtime usage".to_string()));
+    }
+    Ok(payload
+        .get("usage_global_visible")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({
+            "scope": "global_visible",
+            "status": "ok",
+            "in_use": false,
+            "running_count": 0,
+            "running_nodes": [],
+        })))
+}
+
 fn parse_admin_envelope(body: &str, action: &str) -> Result<serde_json::Value, String> {
     serde_json::from_str(body).map_err(|err| {
         format!(
@@ -7916,6 +8184,403 @@ async fn handle_publish_runtime_package(
     }
 }
 
+async fn handle_remove_runtime_version(
+    ctx: &AdminContext,
+    client: &AdminRouterClient,
+    payload: serde_json::Value,
+    hive: Option<String>,
+) -> Result<(u16, String), AdminError> {
+    let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
+    if ctx.hive_id != PRIMARY_HIVE_ID || target_hive != PRIMARY_HIVE_ID {
+        return Ok((
+            409,
+            serde_json::json!({
+                "status": "error",
+                "action": "remove_runtime_version",
+                "payload": serde_json::Value::Null,
+                "error_code": "NOT_PRIMARY",
+                "error_detail": "remove_runtime_version is motherbee-only",
+            })
+            .to_string(),
+        ));
+    }
+
+    let runtime = payload
+        .get("runtime")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if runtime.is_empty() || !valid_runtime_token(runtime) {
+        return Ok((
+            400,
+            serde_json::json!({
+                "status": "error",
+                "action": "remove_runtime_version",
+                "payload": serde_json::Value::Null,
+                "error_code": "INVALID_REQUEST",
+                "error_detail": "missing or invalid runtime",
+            })
+            .to_string(),
+        ));
+    }
+    let runtime_version = payload
+        .get("runtime_version")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if runtime_version.is_empty() || !valid_runtime_token(runtime_version) {
+        return Ok((
+            400,
+            serde_json::json!({
+                "status": "error",
+                "action": "remove_runtime_version",
+                "payload": serde_json::Value::Null,
+                "error_code": "INVALID_REQUEST",
+                "error_detail": "missing or invalid runtime_version",
+            })
+            .to_string(),
+        ));
+    }
+    if let Some(hold_ms) = payload
+        .get("test_hold_ms")
+        .and_then(|value| value.as_u64())
+        .filter(|value| *value > 0)
+    {
+        tracing::info!(
+            runtime = runtime,
+            runtime_version = runtime_version,
+            test_hold_ms = hold_ms,
+            "runtime delete diagnostic hold active"
+        );
+        time::sleep(Duration::from_millis(hold_ms)).await;
+    }
+
+    let manifest = match load_local_runtime_manifest() {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => {
+            return Ok((
+                409,
+                serde_json::json!({
+                    "status": "error",
+                    "action": "remove_runtime_version",
+                    "payload": serde_json::Value::Null,
+                    "error_code": "RUNTIME_MANIFEST_MISSING",
+                    "error_detail": "runtime manifest not found",
+                })
+                .to_string(),
+            ));
+        }
+        Err(err) => {
+            return Ok((
+                409,
+                serde_json::json!({
+                    "status": "error",
+                    "action": "remove_runtime_version",
+                    "payload": serde_json::Value::Null,
+                    "error_code": "MANIFEST_INVALID",
+                    "error_detail": err,
+                })
+                .to_string(),
+            ));
+        }
+    };
+
+    let runtime_map = match runtime_manifest_entry_map_local(&manifest) {
+        Ok(map) => map,
+        Err(err) => {
+            return Ok((
+                409,
+                serde_json::json!({
+                    "status": "error",
+                    "action": "remove_runtime_version",
+                    "payload": serde_json::Value::Null,
+                    "error_code": "MANIFEST_INVALID",
+                    "error_detail": err,
+                })
+                .to_string(),
+            ));
+        }
+    };
+    let Some(entry) = runtime_map.get(runtime) else {
+        return Ok((
+            404,
+            serde_json::json!({
+                "status": "error",
+                "action": "remove_runtime_version",
+                "payload": serde_json::Value::Null,
+                "error_code": "RUNTIME_NOT_FOUND",
+                "error_detail": format!("runtime '{}' not found", runtime),
+            })
+            .to_string(),
+        ));
+    };
+
+    let current = entry.current.as_deref().map(str::trim).unwrap_or("");
+    if runtime_version == "current" || (!current.is_empty() && current == runtime_version) {
+        return Ok((
+            409,
+            serde_json::json!({
+                "status": "error",
+                "action": "remove_runtime_version",
+                "payload": serde_json::Value::Null,
+                "error_code": "RUNTIME_CURRENT_CONFLICT",
+                "error_detail": format!(
+                    "cannot delete current version '{}' for runtime '{}'",
+                    current, runtime
+                ),
+            })
+            .to_string(),
+        ));
+    }
+
+    let version_exists = runtime_versions_from_manifest_entry_local(entry)
+        .iter()
+        .any(|value| value == runtime_version);
+    if !version_exists {
+        return Ok((
+            404,
+            serde_json::json!({
+                "status": "error",
+                "action": "remove_runtime_version",
+                "payload": serde_json::Value::Null,
+                "error_code": "RUNTIME_VERSION_NOT_FOUND",
+                "error_detail": format!(
+                    "version '{}' not available for runtime '{}'",
+                    runtime_version, runtime
+                ),
+            })
+            .to_string(),
+        ));
+    }
+
+    let usage_global = match query_runtime_usage_global_visible(ctx, client, runtime, runtime_version).await {
+        Ok(value) => value,
+        Err(err) => {
+            return Ok((
+                409,
+                serde_json::json!({
+                    "status": "error",
+                    "action": "remove_runtime_version",
+                    "payload": serde_json::Value::Null,
+                    "error_code": "RUNTIME_REMOVE_FAILED",
+                    "error_detail": format!("failed to resolve visible runtime usage before delete: {}", err),
+                })
+                .to_string(),
+            ));
+        }
+    };
+    let running_nodes = usage_global
+        .get("running_nodes")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if !running_nodes.is_empty() {
+        return Ok((
+            409,
+            serde_json::json!({
+                "status": "error",
+                "action": "remove_runtime_version",
+                "payload": {
+                    "usage_global_visible": usage_global,
+                },
+                "error_code": "RUNTIME_IN_USE",
+                "error_detail": format!(
+                    "runtime '{}' version '{}' is still running in visible inventory",
+                    runtime, runtime_version
+                ),
+            })
+            .to_string(),
+        ));
+    }
+
+    let dependents = match runtime_dependents_summary_local(&manifest, runtime) {
+        Ok(value) => value,
+        Err(err) => {
+            return Ok((
+                409,
+                serde_json::json!({
+                    "status": "error",
+                    "action": "remove_runtime_version",
+                    "payload": serde_json::Value::Null,
+                    "error_code": "MANIFEST_INVALID",
+                    "error_detail": err,
+                })
+                .to_string(),
+            ));
+        }
+    };
+    if !dependents.is_empty() {
+        return Ok((
+            409,
+            serde_json::json!({
+                "status": "error",
+                "action": "remove_runtime_version",
+                "payload": {
+                    "dependents": dependents,
+                },
+                "error_code": "RUNTIME_HAS_DEPENDENTS",
+                "error_detail": format!(
+                    "runtime '{}' has published dependents; remove dependent runtimes first",
+                    runtime
+                ),
+            })
+            .to_string(),
+        ));
+    }
+
+    let updated_manifest = match remove_runtime_version_from_manifest_local(&manifest, runtime, runtime_version) {
+        Ok(value) => value,
+        Err(err) if err == "RUNTIME_CURRENT_CONFLICT" => {
+            return Ok((
+                409,
+                serde_json::json!({
+                    "status": "error",
+                    "action": "remove_runtime_version",
+                    "payload": serde_json::Value::Null,
+                    "error_code": "RUNTIME_CURRENT_CONFLICT",
+                    "error_detail": format!(
+                        "cannot delete current version '{}' for runtime '{}'",
+                        runtime_version, runtime
+                    ),
+                })
+                .to_string(),
+            ));
+        }
+        Err(err) => {
+            return Ok((
+                409,
+                serde_json::json!({
+                    "status": "error",
+                    "action": "remove_runtime_version",
+                    "payload": serde_json::Value::Null,
+                    "error_code": "RUNTIME_REMOVE_FAILED",
+                    "error_detail": err,
+                })
+                .to_string(),
+            ));
+        }
+    };
+
+    let quarantined = match quarantine_runtime_version_dir_local(runtime, runtime_version) {
+        Ok(value) => value,
+        Err(err) => {
+            return Ok((
+                409,
+                serde_json::json!({
+                    "status": "error",
+                    "action": "remove_runtime_version",
+                    "payload": serde_json::Value::Null,
+                    "error_code": "RUNTIME_REMOVE_FAILED",
+                    "error_detail": err,
+                })
+                .to_string(),
+            ));
+        }
+    };
+
+    let manifest_path = Path::new(DIST_RUNTIME_MANIFEST_PATH);
+    let write_v2_gate_enabled = runtime_manifest_write_v2_gate_enabled_from_env();
+    if let Err(err) =
+        write_runtime_manifest_file_atomic(manifest_path, &updated_manifest, write_v2_gate_enabled)
+    {
+        if let Some((original, quarantine)) = quarantined.as_ref() {
+            let _ = restore_quarantined_runtime_version_dir_local(original, quarantine);
+        }
+        return Ok((
+            409,
+            serde_json::json!({
+                "status": "error",
+                "action": "remove_runtime_version",
+                "payload": serde_json::Value::Null,
+                "error_code": "RUNTIME_REMOVE_FAILED",
+                "error_detail": format!("failed to update runtime manifest: {}", err),
+            })
+            .to_string(),
+        ));
+    }
+
+    let removed_runtime_dir = if let Some((original, quarantine)) = quarantined.as_ref() {
+        match finalize_quarantined_runtime_version_dir_local(runtime, quarantine) {
+            Ok(removed_runtime_dir) => removed_runtime_dir,
+            Err(err) => {
+                let rollback_manifest = write_runtime_manifest_file_atomic(
+                    manifest_path,
+                    &manifest,
+                    write_v2_gate_enabled,
+                );
+                let rollback_fs =
+                    restore_quarantined_runtime_version_dir_local(original, quarantine);
+                return Ok((
+                    409,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": "remove_runtime_version",
+                        "payload": {
+                            "rollback_manifest": rollback_manifest.err(),
+                            "rollback_fs": rollback_fs.err(),
+                        },
+                        "error_code": "RUNTIME_REMOVE_FAILED",
+                        "error_detail": format!("failed to finalize runtime dir removal: {}", err),
+                    })
+                    .to_string(),
+                ));
+            }
+        }
+    } else {
+        false
+    };
+
+    let (manifest_version, manifest_hash) = match local_runtime_manifest_meta_from_file(manifest_path)
+    {
+        Ok(meta) => meta,
+        Err(err) => {
+            return Ok((
+                502,
+                serde_json::json!({
+                    "status": "error",
+                    "action": "remove_runtime_version",
+                    "payload": serde_json::Value::Null,
+                    "error_code": "SERVICE_FAILED",
+                    "error_detail": err,
+                })
+                .to_string(),
+            ));
+        }
+    };
+
+    Ok((
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "action": "remove_runtime_version",
+            "payload": {
+                "owner_hive": ctx.hive_id,
+                "runtime": runtime,
+                "removed_version": runtime_version,
+                "current": updated_manifest
+                    .runtimes
+                    .get(runtime)
+                    .and_then(|value| value.get("current"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "manifest_version": manifest_version,
+                "manifest_hash": manifest_hash,
+                "removed_path": Path::new(DIST_RUNTIME_ROOT_DIR)
+                    .join(runtime)
+                    .join(runtime_version)
+                    .display()
+                    .to_string(),
+                "removed_runtime_dir": removed_runtime_dir,
+                "convergence_status": "owner_updated",
+                "usage_global_visible": usage_global,
+            },
+            "error_code": serde_json::Value::Null,
+            "error_detail": serde_json::Value::Null,
+        })
+        .to_string(),
+    ))
+}
+
 async fn handle_admin_command(
     ctx: &AdminContext,
     client: &AdminRouterClient,
@@ -7933,6 +8598,9 @@ async fn handle_admin_command(
     }
     if matches!(action, "publish_runtime_package") {
         return handle_publish_runtime_package(ctx, client, payload).await;
+    }
+    if matches!(action, "remove_runtime_version") {
+        return handle_remove_runtime_version(ctx, client, payload, hive).await;
     }
     if matches!(action, "send_node_message") {
         return handle_send_node_message(ctx, client, payload, hive).await;
@@ -10348,6 +11016,54 @@ mod tests {
         assert_eq!(hash.len(), 64);
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remove_runtime_version_from_manifest_local_removes_non_current_version() {
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-03-16T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({
+                "ai.test.gov": {
+                    "available": ["0.9.0", "1.0.0"],
+                    "current": "1.0.0",
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+
+        let updated = remove_runtime_version_from_manifest_local(&manifest, "ai.test.gov", "0.9.0")
+            .expect("remove");
+        let entry = updated
+            .runtimes
+            .get("ai.test.gov")
+            .expect("runtime entry must remain");
+        assert_eq!(entry["current"], serde_json::json!("1.0.0"));
+        assert_eq!(entry["available"], serde_json::json!(["1.0.0"]));
+        assert!(updated.version > manifest.version);
+    }
+
+    #[test]
+    fn remove_runtime_version_from_manifest_local_rejects_current_version() {
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-03-16T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({
+                "ai.test.gov": {
+                    "available": ["1.0.0"],
+                    "current": "1.0.0",
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+
+        let err = remove_runtime_version_from_manifest_local(&manifest, "ai.test.gov", "1.0.0")
+            .expect_err("current delete must fail");
+        assert_eq!(err, "RUNTIME_CURRENT_CONFLICT");
     }
 
     #[test]

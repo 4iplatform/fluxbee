@@ -27,6 +27,15 @@ The target operating model is:
 - `SY.orchestrator` continues to own `sync-hint`, `update`, `run_node`, `restart_node`, `kill_node`.
 - `fluxbee-publish` becomes deprecated and stops being the canonical path.
 
+Ownership split for this workstream:
+
+1. Stage 1: publication
+   - owner: `SY.admin`
+   - responsibilities: validate, materialize/install into `dist`, mutate `manifest.json`, publish/delete versions on `motherbee`
+2. Stage 2+: activation/execution
+   - owner: `SY.orchestrator`
+   - responsibilities: `sync_hint`, `SYSTEM_UPDATE`, readiness, `run_node`, `restart_node`, `kill_node`, local runtime convergence on already published versions
+
 ---
 
 ## 2. Scope Decisions
@@ -90,26 +99,30 @@ Optional follow-up operations after publish:
 
 ### Phase A - Contract and Ownership
 
-- [ ] RPP-A1. Freeze the canonical publish contract in docs.
+- [x] RPP-A1. Freeze the canonical publish contract in docs.
   - One action family, two source modes.
   - Publish is distinct from spawn.
   - `motherbee` is sole owner of `dist` writes.
-- [ ] RPP-A2. Define the request schema for `inline_package`.
+  - `docs/runtime-packaging-cli-spec.md` now documents `publish_runtime_package` as the canonical contract.
+- [x] RPP-A2. Define the request schema for `inline_package`.
   - package metadata
   - package file map
   - optional `set_current`
   - optional `deploy_to` / `update_to`
-- [ ] RPP-A3. Define the request schema for `bundle_upload`.
+  - Canonical request shape documented under the current system publish path.
+- [x] RPP-A3. Define the request schema for `bundle_upload`.
   - bundle locator
   - optional expected runtime name/version
   - optional `set_current`
   - optional `deploy_to` / `update_to`
-- [ ] RPP-A4. Define the canonical response schema.
+  - Canonical request shape documented under the current system publish path.
+- [x] RPP-A4. Define the canonical response schema.
   - validated package metadata
   - install path
   - manifest version/hash
   - requested follow-up operations and their status
-- [ ] RPP-A5. Define error codes for publication.
+  - Canonical success envelope documented with structured publish payload.
+- [x] RPP-A5. Define error codes for publication.
   - invalid package layout
   - validation failure
   - runtime base missing/unavailable
@@ -117,13 +130,16 @@ Optional follow-up operations after publish:
   - busy/locked
   - source bundle missing
   - unsupported source kind
+  - Stable error families documented in `docs/runtime-packaging-cli-spec.md`.
 
 ### Phase B - Shared Publish/Install Core
 
 - [x] RPP-B1. Extract shared validation/install logic from `fluxbee-publish` into reusable library code.
   - Implemented in Rust as `src/runtime_package.rs`.
   - `fluxbee-publish` now consumes the shared core instead of owning validation/install logic inline.
-- [ ] RPP-B2. Make shared code support both filesystem package dirs and extracted/materialized staging dirs.
+- [x] RPP-B2. Make shared code support both filesystem package dirs and extracted/materialized staging dirs.
+  - Shared `validate_package` operates over any package directory path.
+  - `SY.admin` now materializes both `inline_package` and extracted `bundle_upload` sources into staging dirs before reusing the same shared validation/install path.
 - [x] RPP-B3. Keep one implementation for:
   - package validation
   - permission normalization
@@ -153,7 +169,10 @@ Optional follow-up operations after publish:
   - Resolves `blob_path` relative to the configured blob root.
   - Extracts zip bundles into admin staging with traversal/layout checks.
   - Validates and installs through the shared runtime package core.
-- [ ] RPP-C4. Enforce lifecycle serialization with the same runtime lifecycle lock semantics.
+- [ ] RPP-C4. Enforce lifecycle serialization with the correct ownership boundary.
+  - Do not rely on a shared inter-process lock as the architectural answer.
+  - Keep stage-1 publication serialized under `SY.admin`.
+  - Move remaining stage-1 runtime mutation paths out of `SY.orchestrator` before calling this closed.
 - [x] RPP-C5. Restrict package publication writes to `motherbee`.
   - `publish_runtime_package` rejects non-`motherbee` execution with `NOT_PRIMARY`.
 - [x] RPP-C6. Return canonical admin envelope with publish details.
@@ -201,6 +220,7 @@ Optional follow-up operations after publish:
   - `SY.admin` owns package publication/materialization into `dist` and manifest mutation.
   - `SY.orchestrator` continues to own `sync_hint`, `update`, `run_node`, `restart_node`, and managed config persistence.
   - `SY.wf-rules` now composes those two responsibilities instead of reimplementing install/write logic locally.
+  - Remaining cleanup: `remove_runtime_version` still lives in `SY.orchestrator` and should move to `SY.admin` to match this boundary completely.
 
 ### Phase F - Tests
 
@@ -230,13 +250,16 @@ Optional follow-up operations after publish:
 
 ### Phase G - Deprecation and Cleanup
 
-- [ ] RPP-G1. Mark `fluxbee-publish` deprecated in docs and operator guidance.
-- [ ] RPP-G2. Stop using `fluxbee-publish` as the canonical reference in examples/runbooks.
-- [ ] RPP-G3. Decide whether CLI remains as:
+- [x] RPP-G1. Mark `fluxbee-publish` deprecated in docs and operator guidance.
+- [x] RPP-G2. Stop using `fluxbee-publish` as the canonical reference in examples/runbooks.
+- [x] RPP-G3. Decide whether CLI remains as:
   - thin wrapper over shared core during migration, or
   - fully retired binary
-- [ ] RPP-G4. Update troubleshooting/runbooks to reference admin/Archi publish path.
-- [ ] RPP-G5. Remove scattered “publish by API later” backlog items once this workstream is in progress.
+  - Decision: CLI remains as a deprecated thin wrapper over the shared core during migration/debugging.
+- [x] RPP-G4. Update troubleshooting/runbooks to reference admin/Archi publish path.
+  - `docs/runtime-packaging-cli-spec.md`, `docs/node-package-install-spec-TODO.md`, and `docs/legacy/README.md` now point to the admin/Archi publish path as canonical.
+- [x] RPP-G5. Remove scattered “publish by API later” backlog items once this workstream is in progress.
+  - Legacy docs that described admin/HTTP publish as deferred now state that the system publish path is implemented.
 
 ---
 

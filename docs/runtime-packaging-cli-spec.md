@@ -1,7 +1,7 @@
-# Runtime Packaging and Install CLI
+# Runtime Packaging and Publish Paths
 
-**Status:** Draft v1.1
-**Date:** 2026-03-16
+**Status:** Transitional v1.2
+**Date:** 2026-04-21
 **Audience:** Developers building node runtimes, orchestrator, and operational tooling
 **Parent specs:** `runtime-lifecycle-spec.md`, `software-distribution-spec.md`, `node-spawn-config-spec.md`
 
@@ -13,8 +13,135 @@ Publishing a new runtime today requires manual SSH access to motherbee, creating
 
 This document defines:
 1. A standard package format for all node types.
-2. A CLI tool (`fluxbee-publish`) that validates and installs packages.
-3. Changes to orchestrator to support all package types at spawn time.
+2. The canonical system publish path through `SY.admin` / Archi.
+3. The transitional role of `fluxbee-publish` as a deprecated compatibility wrapper over the same shared core.
+4. Changes to orchestrator to support all package types at spawn time.
+
+### 1.1 Current Status
+
+As of 2026-04-21, the canonical publish path is no longer the CLI.
+
+- Canonical path: `SY.admin` action `publish_runtime_package`
+- Canonical HTTP path: `POST /admin/runtime-packages/publish`
+- Canonical planner/orchestrator path: Archi composes `publish_runtime_package -> sync/update -> run_node`
+- `fluxbee-publish` remains available only as a transitional thin wrapper over the shared publish/install core
+- `fluxbee-publish` is deprecated as the primary operator path and should not be used as the canonical example in new docs or plans
+
+### 1.2 Canonical Publish Contract
+
+The current system contract is:
+
+- publish and spawn are separate lifecycle stages
+- `motherbee` is the sole writer of `dist/runtimes` and `manifest.json`
+- source modes are `inline_package` and `bundle_upload`
+- optional follow-up is limited to `sync_hint(channel=dist)` and `update(category=runtime)`
+- there is no implicit spawn or restart on publish success
+
+### 1.3 Ownership Boundary
+
+The publish path is split from execution on purpose:
+
+- `SY.admin` owns publication on `motherbee`
+  - validate
+  - materialize/install into `dist`
+  - mutate `manifest.json`
+  - declare one version published
+- `SY.orchestrator` owns activation/execution after publication
+  - `sync_hint`
+  - `SYSTEM_UPDATE`
+  - readiness verification
+  - `run_node` / `restart_node` / `kill_node`
+
+This means new versions do not enter the execution side until publication has completed. `SYSTEM_UPDATE` is the signal that a hive should materialize and verify already-published software; it does not publish new versions by itself.
+
+#### 1.2.1 Request Shape
+
+`publish_runtime_package` accepts:
+
+```json
+{
+  "source": {
+    "kind": "inline_package",
+    "files": {
+      "package.json": "{...}",
+      "config/default-config.json": "{...}"
+    }
+  },
+  "set_current": true,
+  "sync_to": ["worker-220"],
+  "update_to": ["worker-220"]
+}
+```
+
+or:
+
+```json
+{
+  "source": {
+    "kind": "bundle_upload",
+    "blob_path": "packages/incoming/ai-support-demo-0.1.0.zip"
+  },
+  "set_current": true,
+  "sync_to": ["worker-220"],
+  "update_to": ["worker-220"]
+}
+```
+
+Field rules:
+
+| Field | Required | Description |
+|------|----------|-------------|
+| `source.kind` | Yes | `inline_package` or `bundle_upload` |
+| `source.files` | Required for `inline_package` | Relative file map materialized into a staging package dir |
+| `source.blob_path` | Required for `bundle_upload` | Relative path under configured blob root to a zip bundle |
+| `set_current` | Optional | Only `true` or omission is currently supported |
+| `sync_to` | Optional | Hives that should receive `sync_hint(channel=dist)` after publish |
+| `update_to` | Optional | Hives that should receive `update(category=runtime)` for the published runtime/version |
+
+#### 1.2.2 Success Envelope
+
+Success returns the canonical admin envelope with a structured publish payload:
+
+```json
+{
+  "status": "ok",
+  "action": "publish_runtime_package",
+  "payload": {
+    "source_kind": "inline_package",
+    "runtime_name": "ai.support.demo",
+    "runtime_version": "0.1.0",
+    "package_type": "config_only",
+    "installed_path": "/var/lib/fluxbee/dist/runtimes/ai.support.demo/0.1.0",
+    "manifest_path": "/var/lib/fluxbee/dist/runtimes/manifest.json",
+    "manifest_version": 1760000000000,
+    "manifest_hash": "sha256:...",
+    "copied_files": 4,
+    "copied_bytes": 1024,
+    "follow_up": {
+      "sync_hint": [],
+      "update": []
+    }
+  },
+  "error_code": null,
+  "error_detail": null
+}
+```
+
+#### 1.2.3 Error Codes
+
+The canonical publish path uses these stable error families:
+
+| Error code | Meaning |
+|-----------|---------|
+| `INVALID_REQUEST` | malformed payload, bad source shape, invalid relative paths |
+| `NOT_PRIMARY` | publish attempted outside `motherbee` |
+| `RUNTIME_NOT_AVAILABLE` | manifest missing or required runtime/base runtime not available |
+| `VERSION_CONFLICT` | same runtime/version already exists with different contents |
+| `VERSION_MISMATCH` | explicit version/install mismatch that is not idempotent success |
+| `BUSY` | runtime lifecycle mutation is temporarily unavailable due to owner-side serialization or in-flight maintenance |
+| `SERVICE_FAILED` | internal staging/install/manifest/follow-up failure |
+
+The path-specific validation detail remains in `error_detail`.
 
 ---
 
@@ -26,7 +153,7 @@ This document defines:
 | `config_only` | Config template + assets (prompts, data files) | Uses an existing base runtime's `bin/start.sh` | A support agent using the generic `ai.generic` runtime with a specific prompt |
 | `workflow` | Flow definition + optional scripts | Uses the WF engine runtime's `bin/start.sh` | An onboarding workflow running on `wf.engine` |
 
-All three types use the same package format and the same CLI to publish.
+All three types use the same package format. The canonical publish path is `publish_runtime_package`; the CLI uses the same shared core but is no longer the primary path.
 
 ---
 
@@ -145,11 +272,13 @@ my-onboarding-flow/
 
 ---
 
-## 4. CLI Tool: `fluxbee-publish`
+## 4. Legacy CLI: `fluxbee-publish`
 
 ### 4.1 Purpose
 
-Validates a package directory and publishes it to the local dist on motherbee. Runs on motherbee only (needs filesystem access to `/var/lib/fluxbee/dist/`).
+`fluxbee-publish` remains available as a deprecated compatibility tool for operators with direct filesystem access to motherbee.
+
+It validates a package directory and publishes it to the local dist on motherbee, but it is no longer the canonical system interface. New automation should use `publish_runtime_package` through `SY.admin` or Archi.
 
 ### 4.2 Usage
 
@@ -920,19 +1049,18 @@ fluxbee-publish ./package --deploy worker-220
 
 ---
 
-## 12. Future: HTTP Upload (Deferred)
+## 12. Current System Publish Path
 
-When the system needs to accept packages from remote callers (AI architect node, CI/CD pipeline), an HTTP upload endpoint will be added to SY.admin:
+The system publish path is now implemented.
 
-```
-POST /runtimes/publish
-Content-Type: multipart/form-data
-Body: zip file + metadata
-```
+- `SY.admin` exposes `publish_runtime_package`
+- HTTP callers use `POST /admin/runtime-packages/publish`
+- Archi/executor plans use the same action directly
+- `bundle_upload` uses blob-backed zip staging
+- `inline_package` uses structured file materialization
+- both source modes reuse the same validation/install core as `fluxbee-publish`
 
-This endpoint will unpack the zip, validate the same way as the CLI, and call the same install logic. The CLI and the HTTP endpoint will share the validation and installation code.
-
-For now, the CLI is sufficient for development and piloting.
+`fluxbee-publish` remains available only as a transitional local wrapper over that shared core. It is no longer the reference path for new operator flows or AI-driven deployment plans.
 
 ---
 
@@ -940,8 +1068,8 @@ For now, the CLI is sufficient for development and piloting.
 
 | Spec | Relationship |
 |------|-------------|
-| `runtime-lifecycle-spec.md` | CLI automates stages 1-2 (publish + manifest update). Stage 3-4 unchanged |
+| `runtime-lifecycle-spec.md` | Publish is stage 1, followed by distribute/update/spawn. `publish_runtime_package` is the canonical stage-1 path |
 | `software-distribution-spec.md` | Dist layout extended with package.json and three types |
 | `node-spawn-config-spec.md` | Config layering at spawn uses template from package |
 | `system-inventory-spec.md` | Published runtimes visible in inventory after deploy |
-| `admin-internal-gateway-spec.md` | Future: AI architect can publish via ADMIN_COMMAND + staging |
+| `sy-architect-spec.md` | Archi composes `publish_runtime_package` and later lifecycle steps through executor plans |

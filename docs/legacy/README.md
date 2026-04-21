@@ -119,11 +119,11 @@ The normal operator flow is:
 
 1. Build your node binary.
 2. Package it as a Fluxbee runtime.
-3. Publish it with `fluxbee-publish` on motherbee.
-4. Let `--deploy` propagate `dist` and trigger `SYSTEM_UPDATE` on the target hive.
+3. Publish it through `SY.admin` `publish_runtime_package` on motherbee.
+4. Let publish request `sync_hint + update` for the target hive, or run those steps explicitly.
 5. Spawn the node through `SY.admin`.
 
-This is the path validated by the runtime packaging E2E suite (`PUB-T22` through `PUB-T26`).
+`fluxbee-publish` still exists as a deprecated local wrapper for migration/debugging, but it is no longer the canonical operator path.
 
 #### Package types
 
@@ -208,20 +208,30 @@ cat >"$PKG_DIR/config/default-config.json" <<'EOF'
 }
 EOF
 
-# 3) publish on motherbee and deploy to target hive
-FLUXBEE_PUBLISH_BASE="$BASE" \
-FLUXBEE_PUBLISH_MOTHER_HIVE_ID="$MOTHER_HIVE" \
-target/release/fluxbee-publish "$PKG_DIR" \
-  --version "$RUNTIME_VERSION" \
-  --deploy "$TARGET_HIVE"
+# 3) stage a bundle in blob and publish on motherbee
+zip -r "$PKG_DIR.zip" "$PKG_DIR"
+# example staging step omitted here; the resulting blob path is used below
+curl -sS -X POST "$BASE/admin/runtime-packages/publish" \
+  -H 'Content-Type: application/json' \
+  -d @- <<EOF
+{
+  "source": {
+    "kind": "bundle_upload",
+    "blob_path": "packages/incoming/ai-my-node-1.0.0.zip"
+  },
+  "set_current": true,
+  "sync_to": ["$TARGET_HIVE"],
+  "update_to": ["$TARGET_HIVE"]
+}
+EOF
 ```
 
-`fluxbee-publish` does the following:
+`publish_runtime_package` does the following:
 
 - validates the package layout
 - installs it under `/var/lib/fluxbee/dist/runtimes/<name>/<version>`
 - updates `/var/lib/fluxbee/dist/runtimes/manifest.json`
-- when `--deploy` is present, sends `sync-hint + update` to the target hive
+- when `sync_to` / `update_to` are present, sends `sync-hint + update` to the target hive
 
 Important:
 
@@ -315,7 +325,7 @@ For the full packaging contract and examples of all three package types, see:
 
 #### Low-level fallback: manual `dist` / manifest editing
 
-Manual editing of `/var/lib/fluxbee/dist/runtimes` and `manifest.json` is still possible for debugging, but it is no longer the recommended operator path. Prefer `fluxbee-publish` unless you are diagnosing a broken rollout or reproducing a low-level runtime lifecycle issue.
+Manual editing of `/var/lib/fluxbee/dist/runtimes` and `manifest.json` is still possible for debugging, but it is no longer the recommended operator path. Prefer `publish_runtime_package` through `SY.admin` or Archi unless you are diagnosing a broken rollout or reproducing a low-level runtime lifecycle issue.
 
 For a low-level operational rollout (manual `dist` + `sync-hint` + `update` + run node), see:
 - `docs/14-runtime-rollout-motherbee.md`

@@ -30,6 +30,25 @@ This document defines the canonical lifecycle with clear contracts at each stage
 
 **Invariant:** A node CANNOT be spawned on a worker unless that worker has completed stage 3 (UPDATE) with status `ok` for the target runtime and version. This is the core guarantee that eliminates FR-08.
 
+### 2.1 Ownership By Stage
+
+The lifecycle is intentionally split into two ownership domains:
+
+1. Publication
+   - Stage 1 (`PUBLISH`)
+   - Owner: `SY.admin`
+   - Responsibilities: validate package, materialize/install into `dist`, mutate `manifest.json`, and declare that a version is published on `motherbee`
+2. Activation / execution
+   - Stages 2, 3, and 4 (`DISTRIBUTE`, `UPDATE`, `SPAWN`)
+   - Owner: `SY.orchestrator`
+   - Responsibilities: converge local copies, verify readiness, and run/maintain nodes from already published versions
+
+Operationally this means:
+
+- a version is not visible to execution flows until publication has finished on `motherbee`
+- `SY.orchestrator` is the owner of readiness and node execution, not of package publication
+- `SYSTEM_UPDATE` is part of the activation/execution side of the lifecycle: it makes published versions usable on a hive, but does not itself publish new versions
+
 ---
 
 ## 3. Stage 1 — PUBLISH (Motherbee)
