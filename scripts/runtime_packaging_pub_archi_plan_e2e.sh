@@ -48,6 +48,7 @@ publish_plan_body="$tmpdir/archi_publish_plan.json"
 publish_plan_resp="$tmpdir/archi_publish_response.json"
 spawn_plan_body="$tmpdir/archi_spawn_plan.json"
 spawn_plan_resp="$tmpdir/archi_spawn_response.json"
+publish_follow_up_json="$tmpdir/publish_follow_up.json"
 
 cleanup() {
   local _ec=$?
@@ -263,6 +264,18 @@ stage_bundle_in_blob() {
 }
 
 write_publish_plan() {
+  if [[ "$HIVE_ID" == "$MOTHER_HIVE_ID" ]]; then
+    cat >"$publish_follow_up_json" <<'EOF'
+{}
+EOF
+  else
+    cat >"$publish_follow_up_json" <<EOF
+{
+  "sync_to": ["$HIVE_ID"],
+  "update_to": ["$HIVE_ID"]
+}
+EOF
+  fi
   cat >"$publish_plan_body" <<EOF
 {
   "title": "runtime package publish via archi executor",
@@ -286,9 +299,18 @@ write_publish_plan() {
             "source": {
               "kind": "bundle_upload",
               "blob_path": "$bundle_blob_rel"
-            },
-            "sync_to": ["$HIVE_ID"],
-            "update_to": ["$HIVE_ID"]
+            }$(python3 - "$publish_follow_up_json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+for key in ("sync_to", "update_to"):
+    if key in data:
+        print(f',\n            "{key}": {json.dumps(data[key])}', end="")
+PY
+)
           }
         }
       ]

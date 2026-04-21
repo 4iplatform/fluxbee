@@ -1612,16 +1612,16 @@ impl FunctionTool for AdminExecutorStepTool {
         &self,
         arguments: serde_json::Value,
     ) -> fluxbee_ai_sdk::Result<serde_json::Value> {
-        validate_value_against_schema(
-            &arguments,
-            &self.definition.parameters_json_schema,
-            &format!("step '{}'", self.step.id),
-        )
-        .map_err(fluxbee_ai_sdk::AiSdkError::Protocol)?;
         let merged_args = merge_executor_step_arguments(
             &self.step,
             &arguments,
             &self.definition.parameters_json_schema,
+        )
+        .map_err(fluxbee_ai_sdk::AiSdkError::Protocol)?;
+        validate_value_against_schema(
+            &merged_args,
+            &self.definition.parameters_json_schema,
+            &format!("step '{}'", self.step.id),
         )
         .map_err(fluxbee_ai_sdk::AiSdkError::Protocol)?;
         let spec = resolve_internal_action_spec(&self.step.action)
@@ -11109,6 +11109,46 @@ mod tests {
         .expect_err("declared arg mutation must fail");
 
         assert!(err.contains("attempted to change declared arg 'hive'"));
+    }
+
+    #[test]
+    fn executor_step_argument_merge_keeps_required_publish_source() {
+        let step = AdminExecutorPlanStep {
+            id: "s1".to_string(),
+            action: "publish_runtime_package".to_string(),
+            args: json!({
+                "source": {
+                    "kind": "bundle_upload",
+                    "blob_path": "packages/incoming/demo.zip"
+                },
+                "sync_to": ["worker-220"],
+                "update_to": ["worker-220"]
+            }),
+            executor_fill: None,
+        };
+
+        let schema = build_admin_executor_function_definition(
+            resolve_internal_action_spec("publish_runtime_package").expect("action must exist"),
+        )
+        .parameters_json_schema;
+
+        let merged = merge_executor_step_arguments(
+            &step,
+            &json!({
+                "sync_to": ["worker-220"],
+                "update_to": ["worker-220"],
+                "set_current": null
+            }),
+            &schema,
+        )
+        .expect("merge must preserve declared required fields");
+
+        validate_value_against_schema(&merged, &schema, "step 's1'")
+            .expect("merged args must still satisfy publish schema");
+        assert_eq!(
+            merged["source"]["blob_path"],
+            json!("packages/incoming/demo.zip")
+        );
     }
 
     #[test]
