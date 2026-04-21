@@ -308,6 +308,17 @@ struct AttachmentUploadResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct PackagePublishRequest {
+    blob_name: String,
+    #[serde(default)]
+    set_current: Option<bool>,
+    #[serde(default)]
+    sync_to: Vec<String>,
+    #[serde(default)]
+    update_to: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateSessionRequest {
     title: Option<String>,
     chat_mode: Option<String>,
@@ -1649,6 +1660,7 @@ async fn main() -> Result<(), ArchitectError> {
         .route("/api/status", any(dynamic_handler))
         .route("/api/chat", any(dynamic_handler))
         .route("/api/executor/plan", any(dynamic_handler))
+        .route("/api/package/publish", any(dynamic_handler))
         .route("/api/attachments", any(dynamic_handler))
         .route("/api/sessions", any(dynamic_handler))
         .route("/api/sessions/*path", any(dynamic_handler))
@@ -2271,6 +2283,30 @@ async fn dynamic_handler(
             let out = handle_executor_plan_request(&state, req).await;
             Json(out).into_response()
         }
+        (Method::POST, _) if is_package_publish_path(path) => {
+            let body = match axum::body::to_bytes(request.into_body(), 1024 * 1024).await {
+                Ok(b) => b,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": format!("invalid body: {err}") })),
+                    )
+                        .into_response()
+                }
+            };
+            let req: PackagePublishRequest = match serde_json::from_slice(&body) {
+                Ok(r) => r,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": format!("invalid json: {err}") })),
+                    )
+                        .into_response()
+                }
+            };
+            let out = handle_package_publish_request(&state, req).await;
+            Json(out).into_response()
+        }
         (Method::POST, _) if is_attachments_path(path) => {
             match handle_attachment_upload(&state, request).await {
                 Ok(response) => Json(response).into_response(),
@@ -2666,6 +2702,44 @@ async fn handle_executor_plan_request(
     ChatResponse {
         session_title: Some(session.title),
         ..response
+    }
+}
+
+async fn handle_package_publish_request(
+    state: &ArchitectState,
+    req: PackagePublishRequest,
+) -> Value {
+    let blob_name = req.blob_name.trim().to_string();
+    if blob_name.is_empty() {
+        return json!({ "status": "error", "error": "blob_name is required" });
+    }
+    let set_current = req.set_current.unwrap_or(true);
+    let translation = AdminTranslation {
+        admin_target: format!("SY.admin@{}", state.hive_id),
+        action: "publish_runtime_package".to_string(),
+        target_hive: state.hive_id.clone(),
+        params: json!({
+            "source": {
+                "kind": "bundle_upload",
+                "blob_path": blob_name
+            },
+            "set_current": set_current,
+            "sync_to": req.sync_to,
+            "update_to": req.update_to
+        }),
+    };
+    match execute_admin_translation(state, translation).await {
+        Ok(output) => json!({
+            "status": output.get("status").and_then(|v| v.as_str()).unwrap_or("ok"),
+            "action": "publish_runtime_package",
+            "payload": output.get("payload").cloned().unwrap_or(Value::Null),
+            "error": output.get("error_detail").or_else(|| output.get("error")).cloned()
+        }),
+        Err(err) => json!({
+            "status": "error",
+            "action": "publish_runtime_package",
+            "error": err.to_string()
+        }),
     }
 }
 
@@ -7095,6 +7169,10 @@ fn is_attachments_path(path: &str) -> bool {
     path == "/api/attachments" || path.ends_with("/api/attachments")
 }
 
+fn is_package_publish_path(path: &str) -> bool {
+    path == "/api/package/publish" || path.ends_with("/api/package/publish")
+}
+
 fn is_identity_ich_options_path(path: &str) -> bool {
     path == "/api/identity/ich-options" || path.ends_with("/api/identity/ich-options")
 }
@@ -7369,8 +7447,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
     .history-mode {{
       display: inline-flex;
       align-items: center;
-      gap: 6px;
-      margin-top: 8px;
+      gap: 5px;
+      margin-top: 5px;
       flex-wrap: wrap;
     }}
     .mode-badge {{
@@ -7428,12 +7506,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     .history-list {{
       display: grid;
-      gap: 10px;
+      gap: 7px;
     }}
     .history-card {{
       position: relative;
-      padding: 14px 14px 13px;
-      border-radius: 18px;
+      padding: 10px 12px 9px;
+      border-radius: 14px;
       border: 1px solid var(--line);
       background: var(--panel-alt);
       cursor: pointer;
@@ -7472,9 +7550,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
       gap: 10px;
     }}
     .history-name {{
-      font-size: 0.95rem;
+      font-size: 0.87rem;
       font-weight: 700;
-      margin-bottom: 3px;
+      margin-bottom: 2px;
       max-width: 100%;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -7483,14 +7561,14 @@ fn architect_index_html(state: &ArchitectState) -> String {
     .history-meta,
     .meta-grid {{
       color: var(--muted);
-      font-size: 0.82rem;
+      font-size: 0.76rem;
       line-height: 1.45;
     }}
     .history-meta {{
       display: flex;
       flex-wrap: wrap;
       align-items: center;
-      gap: 6px;
+      gap: 4px;
       min-width: 0;
     }}
     .history-meta-sep {{
@@ -7503,13 +7581,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
       white-space: nowrap;
     }}
     .history-preview {{
-      margin-top: 8px;
+      margin-top: 5px;
       color: var(--text);
-      font-size: 0.82rem;
+      font-size: 0.78rem;
       line-height: 1.4;
       max-width: 100%;
       display: -webkit-box;
-      -webkit-line-clamp: 2;
+      -webkit-line-clamp: 1;
       -webkit-box-orient: vertical;
       overflow: hidden;
     }}
@@ -7561,6 +7639,121 @@ fn architect_index_html(state: &ArchitectState) -> String {
     .meta-grid strong {{
       color: var(--text);
       font-weight: 700;
+    }}
+    .publish-panel {{
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+      display: grid;
+      gap: 8px;
+    }}
+    .publish-panel-head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }}
+    .publish-panel-title {{
+      font-size: 0.76rem;
+      font-weight: 800;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }}
+    .publish-drop {{
+      border: 1.5px dashed var(--line);
+      border-radius: 12px;
+      padding: 12px 10px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 120ms, background 120ms;
+      background: #fbfcfe;
+    }}
+    .publish-drop:hover, .publish-drop.dragover {{
+      border-color: var(--accent);
+      background: #f0f5ff;
+    }}
+    .publish-drop-label {{
+      font-size: 0.80rem;
+      color: var(--muted);
+      pointer-events: none;
+    }}
+    .publish-drop-link {{
+      color: var(--accent);
+      font-weight: 700;
+    }}
+    .publish-filename {{
+      font-size: 0.78rem;
+      font-weight: 700;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+    .publish-options {{
+      display: grid;
+      gap: 7px;
+    }}
+    .publish-label {{
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.80rem;
+      color: var(--text);
+      cursor: pointer;
+    }}
+    .publish-input {{
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 7px 10px;
+      font: inherit;
+      font-size: 0.80rem;
+      color: var(--text);
+      background: #fff;
+      outline: none;
+      box-sizing: border-box;
+    }}
+    .publish-input:focus {{
+      border-color: #b8caef;
+      box-shadow: 0 0 0 3px rgba(69,117,220,0.10);
+    }}
+    .publish-btn {{
+      width: 100%;
+      padding: 8px 12px;
+      border-radius: 10px;
+      border: none;
+      background: var(--accent);
+      color: #fff;
+      font: inherit;
+      font-size: 0.82rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: opacity 120ms;
+    }}
+    .publish-btn:disabled {{
+      opacity: 0.5;
+      cursor: not-allowed;
+    }}
+    .publish-btn:hover:not(:disabled) {{
+      opacity: 0.88;
+    }}
+    .publish-result {{
+      font-size: 0.78rem;
+      line-height: 1.45;
+      border-radius: 10px;
+      padding: 8px 10px;
+      display: none;
+    }}
+    .publish-result.ok {{
+      background: var(--success-soft);
+      color: var(--success);
+      display: block;
+    }}
+    .publish-result.err {{
+      background: var(--warning-soft);
+      color: var(--warning);
+      display: block;
     }}
     .modal-backdrop {{
       position: fixed;
@@ -8395,6 +8588,23 @@ fn architect_index_html(state: &ArchitectState) -> String {
           <div><strong>Node</strong>: {node}</div>
           <div><strong>Modes</strong>: operator, impersonation, SCMD</div>
         </div>
+        <div class="publish-panel">
+          <div class="publish-panel-head">
+            <div class="publish-panel-title">Publish Package</div>
+          </div>
+          <div id="publish-drop" class="publish-drop">
+            <input id="publish-file-input" type="file" accept=".zip" hidden />
+            <div class="publish-drop-label">Drop .zip or <span class="publish-drop-link">browse</span></div>
+          </div>
+          <div id="publish-options" class="publish-options" style="display:none">
+            <div id="publish-filename" class="publish-filename"></div>
+            <label class="publish-label"><input type="checkbox" id="publish-set-current" checked /> Set as current version</label>
+            <input id="publish-sync-to" class="publish-input" type="text" placeholder="sync_to hives (comma-separated)" autocomplete="off" />
+            <input id="publish-update-to" class="publish-input" type="text" placeholder="update_to hives (comma-separated)" autocomplete="off" />
+            <button id="publish-btn" class="publish-btn" type="button">Publish</button>
+          </div>
+          <div id="publish-result" class="publish-result"></div>
+        </div>
       </aside>
       <div class="shell">
         <div class="shell-head">
@@ -8514,6 +8724,15 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const impersonationIlk = document.getElementById("impersonation-ilk");
     const impersonationThreadId = document.getElementById("impersonation-thread-id");
     const impersonationError = document.getElementById("impersonation-error");
+    const publishDrop = document.getElementById("publish-drop");
+    const publishFileInput = document.getElementById("publish-file-input");
+    const publishOptions = document.getElementById("publish-options");
+    const publishFilename = document.getElementById("publish-filename");
+    const publishSetCurrent = document.getElementById("publish-set-current");
+    const publishSyncTo = document.getElementById("publish-sync-to");
+    const publishUpdateTo = document.getElementById("publish-update-to");
+    const publishBtn = document.getElementById("publish-btn");
+    const publishResult = document.getElementById("publish-result");
     const confirmModal = document.getElementById("confirm-modal");
     const confirmModalKicker = document.getElementById("confirm-modal-kicker");
     const confirmModalTitle = document.getElementById("confirm-modal-title");
@@ -9718,6 +9937,86 @@ fn architect_index_html(state: &ArchitectState) -> String {
       renderAttachmentDraft();
     }});
     send.addEventListener("click", submit);
+
+    // ── Publish Package panel ──────────────────────────────────
+    let publishSelectedFile = null;
+    function publishSetFile(file) {{
+      if (!file || !file.name.endsWith(".zip")) {{
+        publishResult.className = "publish-result err";
+        publishResult.textContent = "Only .zip files are supported.";
+        return;
+      }}
+      publishSelectedFile = file;
+      publishFilename.textContent = file.name;
+      publishOptions.style.display = "";
+      publishResult.className = "publish-result";
+      publishResult.textContent = "";
+    }}
+    publishDrop.addEventListener("click", () => {{ publishFileInput.click(); }});
+    publishDrop.addEventListener("dragover", (e) => {{ e.preventDefault(); publishDrop.classList.add("dragover"); }});
+    publishDrop.addEventListener("dragleave", () => {{ publishDrop.classList.remove("dragover"); }});
+    publishDrop.addEventListener("drop", (e) => {{
+      e.preventDefault();
+      publishDrop.classList.remove("dragover");
+      const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (file) publishSetFile(file);
+    }});
+    publishFileInput.addEventListener("change", (e) => {{
+      const file = e.target && e.target.files && e.target.files[0];
+      publishFileInput.value = "";
+      if (file) publishSetFile(file);
+    }});
+    publishBtn.addEventListener("click", async () => {{
+      if (!publishSelectedFile) return;
+      publishBtn.disabled = true;
+      publishResult.className = "publish-result";
+      publishResult.textContent = "Uploading...";
+      try {{
+        const formData = new FormData();
+        formData.append("file", publishSelectedFile, publishSelectedFile.name);
+        const uploadRes = await fetch("/api/attachments", {{ method: "POST", body: formData }});
+        const uploadData = await uploadRes.json();
+        if (!uploadRes.ok || !uploadData.attachments || !uploadData.attachments.length) {{
+          throw new Error(uploadData.error || "Upload failed");
+        }}
+        const blobName = uploadData.attachments[0].blob_ref && uploadData.attachments[0].blob_ref.blob_name;
+        if (!blobName) throw new Error("No blob_name in upload response");
+        publishResult.textContent = "Publishing...";
+        const syncTo = publishSyncTo.value.trim().split(",").map((s) => s.trim()).filter(Boolean);
+        const updateTo = publishUpdateTo.value.trim().split(",").map((s) => s.trim()).filter(Boolean);
+        const pubRes = await fetch("/api/package/publish", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{
+            blob_name: blobName,
+            set_current: publishSetCurrent.checked,
+            sync_to: syncTo,
+            update_to: updateTo
+          }})
+        }});
+        const pubData = await pubRes.json();
+        if (pubData.status === "ok" || pubData.status === "ok") {{
+          const p = pubData.payload || {{}};
+          const name = p.runtime_name || "";
+          const ver = p.runtime_version || "";
+          publishResult.className = "publish-result ok";
+          publishResult.textContent = "Published" + (name ? ": " + name + (ver ? " v" + ver : "") : "") + " ✓";
+          publishOptions.style.display = "none";
+          publishSelectedFile = null;
+        }} else {{
+          const errMsg = pubData.error || (pubData.payload && pubData.payload.error_detail) || "Publish failed";
+          publishResult.className = "publish-result err";
+          publishResult.textContent = typeof errMsg === "string" ? errMsg : JSON.stringify(errMsg);
+        }}
+      }} catch (err) {{
+        publishResult.className = "publish-result err";
+        publishResult.textContent = "Error: " + err;
+      }} finally {{
+        publishBtn.disabled = false;
+      }}
+    }});
+    // ──────────────────────────────────────────────────────────
+
     clearHistory.addEventListener("click", () => {{
       clearAllHistory().catch((err) => {{
         addMessage("system", "Clear history failed: " + err);
