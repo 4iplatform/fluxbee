@@ -41,6 +41,19 @@ stop_install_service() {
   fi
 }
 
+ensure_fluxbee_system_user() {
+  if id -u fluxbee >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Creating system user 'fluxbee' for managed services..."
+  sudo useradd \
+    --system \
+    --home-dir "$STATE_DIR/syncthing" \
+    --create-home \
+    --shell /usr/sbin/nologin \
+    fluxbee
+}
+
 cleanup_router_shm_from_identities() {
   if [[ ! -d "$STATE_ROOT_DIR" ]]; then
     return 0
@@ -207,6 +220,9 @@ sudo install -d "$STATE_DIR/dist/vendor/syncthing"
 sudo install -d "$RUN_DIR"
 sudo install -d "$RUN_DIR/routers"
 sudo install -d "$STATE_ROOT_DIR"
+ensure_fluxbee_system_user
+sudo chown -R fluxbee:fluxbee "$STATE_DIR/syncthing"
+sudo chown -R fluxbee:fluxbee "$STATE_DIR/blob"
 
 if [[ "$CLEAN_RUNTIME_VOLATILE_ON_INSTALL" == "1" ]]; then
   stop_install_service "sy-orchestrator"
@@ -717,6 +733,7 @@ if [[ "$APPLY_DEV_OWNERSHIP" == "1" ]]; then
   echo "Applying ownership for test/dev user: $INSTALL_OWNER"
   sudo chown -R "$INSTALL_OWNER":"$INSTALL_OWNER" "$CONFIG_DIR" "$STATE_DIR" "$RUN_DIR"
   sudo chown "$INSTALL_OWNER":"$INSTALL_OWNER" "$CONFIG_DIR/sy-config-routes.yaml" "$CONFIG_DIR/hive.yaml" 2>/dev/null || true
+  sudo chown -R fluxbee:fluxbee "$STATE_DIR/syncthing" "$STATE_DIR/blob"
 fi
 
 echo "Installed config to $CONFIG_DIR, binaries to /usr/bin, core source repo to $STATE_DIR/dist/core/bin, systemd units, and runtime directories."
