@@ -67,6 +67,7 @@ func (f *fakeOrchestratorClient) KillNode(ctx context.Context, targetNode, nodeN
 
 func TestApplyWorkflowAndDeployAutoSpawnFirstDeploy(t *testing.T) {
 	svc := newTestService(t)
+	fakeAdmin, _ := svc.admin.(*fakeAdminClient)
 	fake := &fakeOrchestratorClient{}
 	fake.getNodeConfigFunc = func(ctx context.Context, targetNode, nodeName string) (map[string]any, error) {
 		return nil, &orchestratorActionError{Status: "error", Code: "NODE_CONFIG_NOT_FOUND", Message: "missing"}
@@ -116,6 +117,15 @@ func TestApplyWorkflowAndDeployAutoSpawnFirstDeploy(t *testing.T) {
 	}
 	if fake.runCalls != 1 {
 		t.Fatalf("expected one run_node call, got %d", fake.runCalls)
+	}
+	if fakeAdmin == nil || fakeAdmin.publishCalls != 1 {
+		t.Fatalf("expected one canonical admin publish call, got %#v", fakeAdmin)
+	}
+	if _, ok := fakeAdmin.lastPackageFiles["flow/definition.json"]; !ok {
+		t.Fatalf("expected flow/definition.json in published package")
+	}
+	if _, ok := fakeAdmin.lastPackageFiles["config/default-config.json"]; !ok {
+		t.Fatalf("expected config/default-config.json in published package")
 	}
 }
 

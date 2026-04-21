@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -80,9 +81,15 @@ func newTestService(t *testing.T) *Service {
 		StateDir:           t.TempDir(),
 		DistRuntimeRoot:    filepath.Join(t.TempDir(), "dist", "runtimes"),
 	}
-	return NewService(cfg, nil, nil, func() time.Time {
+	svc := NewService(cfg, nil, nil, func() time.Time {
 		return time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
 	})
+	svc.admin = &fakeAdminClient{
+		publishRuntimePackageFunc: func(_ context.Context, packageFiles map[string]string) (*PackagePublishResult, error) {
+			return installWorkflowPackageViaFakeAdmin(svc, packageFiles)
+		},
+	}
+	return svc
 }
 
 func TestApplyWorkflowRotatesAndPublishesPackage(t *testing.T) {

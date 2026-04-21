@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -35,17 +36,21 @@ type runtimeManifestEntry struct {
 }
 
 func (s *Service) PublishWorkflowPackage(workflowName string, meta WfRulesMetadata, definitionBytes []byte) (*PackagePublishResult, error) {
+	packageFiles, err := buildWorkflowPackageFiles(s.cfg.HiveID, workflowName, meta, definitionBytes)
+	if err != nil {
+		return nil, err
+	}
+	if s.admin == nil {
+		return nil, fmt.Errorf("admin client unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), adminRPCTimeout)
+	defer cancel()
+	return s.admin.PublishRuntimePackage(ctx, packageFiles)
+}
+
+func buildWorkflowPackageFiles(hiveID, workflowName string, meta WfRulesMetadata, definitionBytes []byte) (map[string]string, error) {
 	runtimeName := "wf." + workflowName
 	version := strconv.FormatUint(meta.Version, 10)
-	packageDir := filepath.Join(s.cfg.DistRuntimeRoot, runtimeName, version)
-	flowDir := filepath.Join(packageDir, "flow")
-	configDir := filepath.Join(packageDir, "config")
-	if err := os.MkdirAll(flowDir, 0o755); err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(configDir, 0o755); err != nil {
-		return nil, err
-	}
 
 	packageJSON := map[string]any{
 		"name":         runtimeName,
@@ -59,14 +64,8 @@ func (s *Service) PublishWorkflowPackage(workflowName string, meta WfRulesMetada
 		return nil, err
 	}
 	packageBytes = append(packageBytes, '\n')
-	if err := writeFileAtomic(filepath.Join(packageDir, "package.json"), packageBytes, 0o644); err != nil {
-		return nil, err
-	}
-	if err := writeFileAtomic(filepath.Join(flowDir, "definition.json"), definitionBytes, 0o644); err != nil {
-		return nil, err
-	}
 	defaultConfig := map[string]any{
-		"sy_timer_l2_name":    fmt.Sprintf("SY.timer@%s", s.cfg.HiveID),
+		"sy_timer_l2_name":    fmt.Sprintf("SY.timer@%s", hiveID),
 		"gc_retention_days":   defaultWFGCRetentionDays,
 		"gc_interval_seconds": defaultWFGCIntervalSeconds,
 	}
@@ -75,8 +74,30 @@ func (s *Service) PublishWorkflowPackage(workflowName string, meta WfRulesMetada
 		return nil, err
 	}
 	defaultConfigBytes = append(defaultConfigBytes, '\n')
-	if err := writeFileAtomic(filepath.Join(configDir, "default-config.json"), defaultConfigBytes, 0o644); err != nil {
+	return map[string]string{
+		"package.json":               string(packageBytes),
+		"flow/definition.json":       string(definitionBytes),
+		"config/default-config.json": string(defaultConfigBytes),
+	}, nil
+}
+
+func (s *Service) publishWorkflowPackageLocal(workflowName string, meta WfRulesMetadata, definitionBytes []byte) (*PackagePublishResult, error) {
+	runtimeName := workflowRuntimeName(workflowName)
+	version := strconv.FormatUint(meta.Version, 10)
+	packageFiles, err := buildWorkflowPackageFiles(s.cfg.HiveID, workflowName, meta, definitionBytes)
+	if err != nil {
 		return nil, err
+	}
+	packageDir := filepath.Join(s.cfg.DistRuntimeRoot, runtimeName, version)
+	for relPath, contents := range packageFiles {
+		targetPath := filepath.Join(packageDir, filepath.FromSlash(relPath))
+		parentDir := filepath.Dir(targetPath)
+		if err := os.MkdirAll(parentDir, 0o755); err != nil {
+			return nil, err
+		}
+		if err := writeFileAtomic(targetPath, []byte(contents), 0o644); err != nil {
+			return nil, err
+		}
 	}
 	if err := s.updateRuntimeManifest(runtimeName, version); err != nil {
 		return nil, err

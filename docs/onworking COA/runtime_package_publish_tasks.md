@@ -188,10 +188,19 @@ Optional follow-up operations after publish:
 
 ### Phase E - Service Integration
 
-- [ ] RPP-E1. Make `SY.wf-rules` reuse the shared publish/install core instead of owning a divergent install path.
-- [ ] RPP-E2. Verify published workflow packages still bind cleanly through orchestrator package-aware spawn.
-- [ ] RPP-E3. Verify non-WF instance-oriented packages produced by Archi can be spawned with existing orchestrator runtime-base logic.
-- [ ] RPP-E4. Keep publish and node lifecycle responsibilities separate in code boundaries.
+- [x] RPP-E1. Make `SY.wf-rules` reuse the shared publish/install core instead of owning a divergent install path.
+  - `SY.wf-rules` now publishes workflow packages through `SY.admin` `publish_runtime_package` using `inline_package`.
+  - The old local package writer remains only as test support; production `PublishWorkflowPackage` no longer writes `dist`/`manifest` directly.
+- [x] RPP-E2. Verify published workflow packages still bind cleanly through orchestrator package-aware spawn.
+  - `sy_orchestrator` tests now cover workflow runtime-base resolution, workflow materialization/preflight, and persisted config generation with `_system.runtime_base` + `_system.package_path`.
+  - `sy-wf-rules` deploy tests assert the canonical path remains: publish package through `SY.admin`, then bind/restart or auto-spawn through orchestrator.
+- [x] RPP-E3. Verify non-WF instance-oriented packages produced by Archi can be spawned with existing orchestrator runtime-base logic.
+  - `sy_orchestrator` tests now cover `config_only` runtime-base resolution, base-runtime preflight, and persisted spawn config for package-aware managed nodes.
+  - This keeps Archi-produced instance packages on the same orchestrator path already used for runtime-base packages.
+- [x] RPP-E4. Keep publish and node lifecycle responsibilities separate in code boundaries.
+  - `SY.admin` owns package publication/materialization into `dist` and manifest mutation.
+  - `SY.orchestrator` continues to own `sync_hint`, `update`, `run_node`, `restart_node`, and managed config persistence.
+  - `SY.wf-rules` now composes those two responsibilities instead of reimplementing install/write logic locally.
 
 ### Phase F - Tests
 

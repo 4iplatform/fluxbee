@@ -8315,11 +8315,45 @@ fn node_instance_dir(node_name: &str) -> Result<PathBuf, OrchestratorError> {
     Ok(node_files_root().join(node_kind).join(node_name))
 }
 
+fn node_instance_dir_with_root(
+    node_name: &str,
+    nodes_root: &Path,
+) -> Result<PathBuf, OrchestratorError> {
+    let local = node_name
+        .rsplit_once('@')
+        .map(|(local, _)| local)
+        .unwrap_or(node_name)
+        .trim();
+    if !valid_node_local_name(local) {
+        return Err(format!("invalid node_name local part '{}'", local).into());
+    }
+    if let Some((_, hive)) = node_name.rsplit_once('@') {
+        let hive = hive.trim();
+        if !valid_hive_id(hive) {
+            return Err(format!("invalid node_name hive part '{}'", hive).into());
+        }
+    }
+    let node_kind = local
+        .split('.')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("invalid node_name '{}': missing kind prefix", node_name))?;
+    Ok(nodes_root.join(node_kind).join(node_name))
+}
+
 fn node_effective_config_path(
     _state: &OrchestratorState,
     node_name: &str,
 ) -> Result<PathBuf, OrchestratorError> {
     Ok(node_instance_dir(node_name)?.join("config.json"))
+}
+
+fn node_effective_config_path_with_root(
+    node_name: &str,
+    nodes_root: &Path,
+) -> Result<PathBuf, OrchestratorError> {
+    Ok(node_instance_dir_with_root(node_name, nodes_root)?.join("config.json"))
 }
 
 fn runtime_package_dir_with_root(runtimes_root: &Path, runtime: &str, version: &str) -> PathBuf {
@@ -8537,12 +8571,40 @@ fn ensure_node_effective_config_on_spawn(
     package_path: Option<&str>,
     ilk_id: Option<&str>,
 ) -> Result<serde_json::Value, OrchestratorError> {
-    let path = node_effective_config_path(state, node_name)?;
+    ensure_node_effective_config_on_spawn_with_roots(
+        state,
+        payload,
+        node_name,
+        target_hive,
+        runtime,
+        runtime_version,
+        runtime_base,
+        package_path,
+        ilk_id,
+        Path::new(DIST_RUNTIME_ROOT_DIR),
+        &node_files_root(),
+    )
+}
+
+fn ensure_node_effective_config_on_spawn_with_roots(
+    _state: &OrchestratorState,
+    payload: &serde_json::Value,
+    node_name: &str,
+    target_hive: &str,
+    runtime: &str,
+    runtime_version: &str,
+    runtime_base: Option<&str>,
+    package_path: Option<&str>,
+    ilk_id: Option<&str>,
+    runtimes_root: &Path,
+    nodes_root: &Path,
+) -> Result<serde_json::Value, OrchestratorError> {
+    let path = node_effective_config_path_with_root(node_name, nodes_root)?;
     if path.exists() {
         return Err(format!("node config already exists: {}", path.display()).into());
     }
 
-    let template = load_runtime_config_template(runtime, runtime_version)?;
+    let template = load_runtime_config_template_with_root(runtime, runtime_version, runtimes_root)?;
     let request_patch = parse_config_patch(payload, "config")?;
     let resolved_tenant_id = resolve_tenant_id_for_node(payload);
     let mut config = assemble_spawn_config_map(template, request_patch, resolved_tenant_id, None);
@@ -9432,7 +9494,22 @@ fn runtime_materialization_summary_for_entry(
     entry: &RuntimeManifestEntry,
     runtime_entries: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> serde_json::Value {
-    let detail = runtime_materialization_for_entry(runtime, entry, runtime_entries, None);
+    runtime_materialization_summary_for_entry_with_root(runtime, entry, runtime_entries, None)
+}
+
+fn runtime_materialization_summary_for_entry_with_root(
+    runtime: &str,
+    entry: &RuntimeManifestEntry,
+    runtime_entries: Option<&serde_json::Map<String, serde_json::Value>>,
+    runtimes_root: Option<&Path>,
+) -> serde_json::Value {
+    let detail = runtime_materialization_for_entry_with_root(
+        runtime,
+        entry,
+        runtime_entries,
+        runtimes_root.unwrap_or(Path::new(DIST_RUNTIME_ROOT_DIR)),
+        None,
+    );
     let versions = detail
         .get("versions")
         .and_then(|value| value.as_object())
@@ -16521,7 +16598,7 @@ blob:
         );
         assert_eq!(
             managed_spawn_disallowed_reason("SY.frontdesk.gov@motherbee"),
-            None
+            Some("managed spawn does not support SY.* nodes")
         );
     }
 
@@ -17371,7 +17448,8 @@ blob:
             serde_json::json!("missing_start_script")
         );
 
-        let summary = runtime_materialization_summary_for_entry(runtime, &entry, None);
+        let summary =
+            runtime_materialization_summary_for_entry_with_root(runtime, &entry, None, Some(&root));
         assert_eq!(summary["current_materialized"], serde_json::json!(false));
         assert_eq!(
             summary["current_blocking_reason"],
@@ -17480,6 +17558,140 @@ blob:
             .expect_err("parent traversal must fail");
         let msg = err.to_string();
         assert!(msg.contains("must not contain parent traversal"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_node_effective_config_on_spawn_with_roots_persists_config_only_runtime_metadata() {
+        let root = std::env::temp_dir().join(format!("fluxbee-spawn-config-only-{}", Uuid::new_v4()));
+        let runtimes_root = root.join("runtimes");
+        let nodes_root = root.join("nodes");
+        let runtime = "ai.billing";
+        let version = "2.1.0";
+        let package_dir = runtimes_root.join(runtime).join(version);
+        fs::create_dir_all(package_dir.join("config")).expect("create package config dir");
+        fs::write(
+            package_dir.join("package.json"),
+            r#"{
+  "name": "ai.billing",
+  "version": "2.1.0",
+  "type": "config_only",
+  "runtime_base": "ai.generic"
+}"#,
+        )
+        .expect("write package.json");
+        fs::write(
+            package_dir.join("config/default-config.json"),
+            r#"{
+  "region": "ar",
+  "temperature": 0.2
+}"#,
+        )
+        .expect("write default config");
+
+        let state = sample_orchestrator_state_for_tests();
+        let package_path = package_dir.display().to_string();
+        let out = ensure_node_effective_config_on_spawn_with_roots(
+            &state,
+            &serde_json::json!({
+                "tenant_id": "tnt:request",
+                "config": {
+                    "temperature": 0.9,
+                    "model": "gpt-5"
+                }
+            }),
+            "AI.billing@worker-220",
+            "worker-220",
+            runtime,
+            version,
+            Some("ai.generic"),
+            Some(&package_path),
+            Some("ilk:11111111-1111-1111-1111-111111111111"),
+            &runtimes_root,
+            &nodes_root,
+        )
+        .expect("spawn config write should succeed");
+
+        assert_eq!(out["status"], serde_json::json!("ok"));
+        let config_path = nodes_root.join("AI").join("AI.billing@worker-220").join("config.json");
+        let config_raw = fs::read_to_string(&config_path).expect("read config");
+        let config: serde_json::Value = serde_json::from_str(&config_raw).expect("parse config");
+        assert_eq!(config["region"], serde_json::json!("ar"));
+        assert_eq!(config["temperature"], serde_json::json!(0.9));
+        assert_eq!(config["model"], serde_json::json!("gpt-5"));
+        assert_eq!(config["tenant_id"], serde_json::json!("tnt:request"));
+        assert_eq!(config["_system"]["runtime"], serde_json::json!("ai.billing"));
+        assert_eq!(config["_system"]["runtime_version"], serde_json::json!("2.1.0"));
+        assert_eq!(config["_system"]["runtime_base"], serde_json::json!("ai.generic"));
+        assert_eq!(config["_system"]["package_path"], serde_json::json!(package_path));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ensure_node_effective_config_on_spawn_with_roots_persists_workflow_package_metadata() {
+        let root = std::env::temp_dir().join(format!("fluxbee-spawn-workflow-{}", Uuid::new_v4()));
+        let runtimes_root = root.join("runtimes");
+        let nodes_root = root.join("nodes");
+        let runtime = "wf.invoice";
+        let version = "7";
+        let package_dir = runtimes_root.join(runtime).join(version);
+        fs::create_dir_all(package_dir.join("config")).expect("create package config dir");
+        fs::write(
+            package_dir.join("package.json"),
+            r#"{
+  "name": "wf.invoice",
+  "version": "7",
+  "type": "workflow",
+  "runtime_base": "wf.engine"
+}"#,
+        )
+        .expect("write package.json");
+        fs::write(
+            package_dir.join("config/default-config.json"),
+            r#"{
+  "sy_timer_l2_name": "SY.timer@worker-220",
+  "gc_retention_days": 14,
+  "gc_interval_seconds": 900
+}"#,
+        )
+        .expect("write default config");
+
+        let state = sample_orchestrator_state_for_tests();
+        let package_path = package_dir.display().to_string();
+        let out = ensure_node_effective_config_on_spawn_with_roots(
+            &state,
+            &serde_json::json!({
+                "tenant_id": "tnt:wf",
+                "config": {
+                    "gc_interval_seconds": 60
+                }
+            }),
+            "WF.invoice@worker-220",
+            "worker-220",
+            runtime,
+            version,
+            Some("wf.engine"),
+            Some(&package_path),
+            Some("ilk:22222222-2222-2222-2222-222222222222"),
+            &runtimes_root,
+            &nodes_root,
+        )
+        .expect("workflow spawn config write should succeed");
+
+        assert_eq!(out["status"], serde_json::json!("ok"));
+        let config_path = nodes_root.join("WF").join("WF.invoice@worker-220").join("config.json");
+        let config_raw = fs::read_to_string(&config_path).expect("read config");
+        let config: serde_json::Value = serde_json::from_str(&config_raw).expect("parse config");
+        assert_eq!(config["sy_timer_l2_name"], serde_json::json!("SY.timer@worker-220"));
+        assert_eq!(config["gc_retention_days"], serde_json::json!(14));
+        assert_eq!(config["gc_interval_seconds"], serde_json::json!(60));
+        assert_eq!(config["tenant_id"], serde_json::json!("tnt:wf"));
+        assert_eq!(config["_system"]["runtime"], serde_json::json!("wf.invoice"));
+        assert_eq!(config["_system"]["runtime_version"], serde_json::json!("7"));
+        assert_eq!(config["_system"]["runtime_base"], serde_json::json!("wf.engine"));
+        assert_eq!(config["_system"]["package_path"], serde_json::json!(package_path));
 
         let _ = fs::remove_dir_all(root);
     }
