@@ -1763,6 +1763,12 @@ Review the executor plan step below against the action help contract.\n\
 If the step args are invalid or incomplete — missing required fields, invalid field values, conditional requirements not satisfied — call report_step_issue with a list of specific issues.\n\
 If the step args are correct and complete, do not call report_step_issue.\n\
 \n\
+Important review rules:\n\
+- Validate only against the executable request contract: path params, required_fields, optional_fields, documented enums, and documented conditional requirements.\n\
+- Do not invent extra acknowledgement, confirmation, approval, or consent fields unless they appear explicitly in the request contract.\n\
+- `confirmation_required=true` is operator/UI metadata, not a step.args field requirement.\n\
+- Do not reject a step for lacking a confirm/ack field when the request contract does not define one.\n\
+\n\
 Action help contract:\n{}\n\
 \n\
 Step to review:\n{}",
