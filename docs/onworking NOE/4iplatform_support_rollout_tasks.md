@@ -620,6 +620,128 @@ Recomendación para este rollout:
 - [ ] D2. Verificar `GET /` de la instancia.
 - [ ] D3. Guardar la API key para el servicio .NET.
 
+Para `CONFIG_SET`, usar un `config_version` monotónico basado en epoch ms del momento actual:
+
+```bash
+CONFIG_VERSION="$(date +%s%3N)"
+```
+
+Si el entorno no soporta `date +%s%3N`:
+
+```bash
+CONFIG_VERSION="$(python3 - <<'PY'
+import time
+print(int(time.time() * 1000))
+PY
+)"
+```
+
+Importante:
+
+- en `IO.api`, el `config_version` válido para `CONFIG_SET` no debe tomarse de `GET /nodes/{name}/status` ni de `GET /nodes/{name}/config`, porque esos endpoints pueden reflejar solo la capa persistida del nodo;
+- el valor correcto es el `current_config_version` de la capa runtime/control-plane;
+- la fuente correcta para leerlo es `POST /hives/{hive}/nodes/{node}/control/config-get`;
+- si `control/config-get` timeouta, usar el `current_config_version` que aparezca en los logs del nodo y enviar `current + 1`.
+
+Chequeo recomendado antes de aplicar `CONFIG_SET`:
+
+```bash
+curl -sS -X POST \
+  "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/control/config-get" \
+  -H "Content-Type: application/json" \
+  -d '{"requested_by":"manual-rollout"}' | jq .
+```
+
+Si ese endpoint no responde a tiempo, fallback operativo:
+
+```bash
+sudo journalctl -u fluxbee-node-IO.api.support-motherbee.service --since "10 min ago" --no-pager \
+  | rg "CONFIG_GET served|stale config_version|CONFIG_SET applied"
+```
+
+Ejemplo recomendado de `CONFIG_SET`:
+
+```bash
+BASE="http://127.0.0.1:8080"
+HIVE_ID="motherbee"
+NODE_NAME="IO.api.support@motherbee"
+
+LISTEN_ADDRESS="127.0.0.1"
+LISTEN_PORT="18081"
+
+TENANT_ID="tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
+API_KEY_ID="4iplatform-main"
+INTEGRATION_ID="int_4iplatform_support"
+API_KEY="fb_api_4iplatform_001"
+
+CONFIG_VERSION="1777000000006"
+
+curl -sS -X POST \
+  "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/control/config-set" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"requested_by\": \"manual-rollout\",
+    \"schema_version\": 1,
+    \"config_version\": $CONFIG_VERSION,
+    \"apply_mode\": \"replace\",
+    \"config\": {
+      \"listen\": {
+        \"address\": \"$LISTEN_ADDRESS\",
+        \"port\": $LISTEN_PORT
+      },
+      \"tenant_id\": \"$TENANT_ID\",
+      \"auth\": {
+        \"mode\": \"api_key\",
+        \"api_keys\": [
+          {
+            \"key_id\": \"$API_KEY_ID\",
+            \"tenant_id\": \"$TENANT_ID\",
+            \"integration_id\": \"$INTEGRATION_ID\",
+            \"token\": \"$API_KEY\"
+          }
+        ]
+      },
+      \"integrations\": [
+        {
+          \"integration_id\": \"$INTEGRATION_ID\",
+          \"tenant_id\": \"$TENANT_ID\",
+          \"final_reply_required\": false,
+          \"webhook\": {
+            \"enabled\": false
+          }
+        }
+      ],
+      \"ingress\": {
+        \"subject_mode\": \"explicit_subject\",
+        \"accepted_content_types\": [
+          \"application/json\",
+          \"multipart/form-data\"
+        ],
+        \"max_request_bytes\": 262144,
+        \"max_attachments_per_request\": 4,
+        \"max_attachment_size_bytes\": 10485760,
+        \"max_total_attachment_bytes\": 20971520,
+        \"allowed_mime_types\": [
+          \"image/png\",
+          \"image/jpeg\",
+          \"application/pdf\",
+          \"text/plain\",
+          \"application/json\"
+        ]
+      },
+      \"io\": {
+        \"dst_node\": \"resolve\",
+        \"relay\": {
+          \"window_ms\": 300000,
+          \"max_open_sessions\": 10000,
+          \"max_fragments_per_session\": 8,
+          \"max_bytes_per_session\": 262144
+        }
+      }
+    }
+  }" | jq .
+```
+
 ---
 
 ## 7. Fase E - Contrato HTTP para el servicio .NET
