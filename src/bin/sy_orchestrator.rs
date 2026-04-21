@@ -9801,7 +9801,7 @@ async fn get_node_config_flow(
             target_hive = hive.trim().to_string();
         }
     }
-    let node_name = match validate_existing_node_name_literal(raw_node_name) {
+    let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -9904,7 +9904,7 @@ async fn get_node_state_flow(
             target_hive = hive.trim().to_string();
         }
     }
-    let node_name = match validate_existing_node_name_literal(raw_node_name) {
+    let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -10192,7 +10192,7 @@ async fn get_node_status_flow(
             target_hive = hive.trim().to_string();
         }
     }
-    let node_name = match validate_existing_node_name_literal(raw_node_name) {
+    let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -10577,7 +10577,7 @@ async fn set_node_config_flow(
             target_hive = hive.trim().to_string();
         }
     }
-    let node_name = match validate_existing_node_name_literal(raw_node_name) {
+    let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -11458,7 +11458,7 @@ async fn start_or_restart_node_flow(
             target_hive = hive.trim().to_string();
         }
     }
-    let node_name = match validate_existing_node_name_literal(raw_node_name) {
+    let node_name = match normalize_node_name_for_target(raw_node_name, &target_hive) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
@@ -11609,7 +11609,7 @@ async fn kill_node_flow(
     let validated_node_name = if node_name.is_empty() {
         None
     } else {
-        match validate_existing_node_name_literal(&node_name) {
+        match normalize_node_name_for_target(&node_name, &target_hive) {
             Ok(value) => Some(value),
             Err(err) => {
                 return serde_json::json!({
@@ -11861,7 +11861,7 @@ async fn remove_node_instance_flow(
         }
     }
 
-    let node_name = match validate_existing_node_name_literal(&node_name) {
+    let node_name = match normalize_node_name_for_target(&node_name, &target_hive) {
         Ok(value) => value,
         Err(err) => {
             return serde_json::json!({
