@@ -4616,6 +4616,7 @@ fn is_mother_role(role: Option<&str>) -> bool {
 fn http_status_line(status: u16) -> &'static str {
     match status {
         200 => "HTTP/1.1 200 OK",
+        202 => "HTTP/1.1 202 Accepted",
         400 => "HTTP/1.1 400 Bad Request",
         404 => "HTTP/1.1 404 Not Found",
         409 => "HTTP/1.1 409 Conflict",
@@ -10812,6 +10813,11 @@ mod tests {
             body_json["payload"]["wf_node"]["action"],
             json!("restarted")
         );
+    }
+
+    #[test]
+    fn http_status_line_supports_accepted() {
+        assert_eq!(http_status_line(202), "HTTP/1.1 202 Accepted");
     }
 
     #[test]
