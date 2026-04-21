@@ -6501,6 +6501,11 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "string",
                 "Runtime version. Defaults to current.",
             ),
+            admin_action_body_field(
+                "tenant_id",
+                "string",
+                "Optional tenant id for identity-aware first spawn. Required by runtimes that need tenant-scoped identity during initial instance creation.",
+            ),
             admin_action_body_field("unit", "string", "Optional unit suffix override."),
             admin_action_body_field(
                 "config",
@@ -11016,7 +11021,8 @@ mod tests {
                             "hive": "worker-220",
                             "node_name": "AI.support.demo@worker-220",
                             "runtime": "ai.support.demo",
-                            "runtime_version": "current"
+                            "runtime_version": "current",
+                            "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
                         }
                     }
                 ]
@@ -11027,6 +11033,38 @@ mod tests {
         assert_eq!(plan.execution.steps.len(), 2);
         assert_eq!(plan.execution.steps[0].action, "publish_runtime_package");
         assert_eq!(plan.execution.steps[1].action, "run_node");
+    }
+
+    #[test]
+    fn executor_plan_validation_accepts_run_node_tenant_id() {
+        let plan = parse_executor_plan(json!({
+            "plan_version": "0.1",
+            "kind": "executor_plan",
+            "metadata": {
+                "name": "spawn-with-tenant",
+                "target_hive": "motherbee"
+            },
+            "execution": {
+                "strict": true,
+                "stop_on_error": true,
+                "allow_help_lookup": true,
+                "steps": [{
+                    "id": "s1",
+                    "action": "run_node",
+                    "args": {
+                        "hive": "motherbee",
+                        "node_name": "AI.support.demo@motherbee",
+                        "runtime": "ai.support.demo",
+                        "runtime_version": "current",
+                        "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
+                    }
+                }]
+            }
+        }))
+        .expect("run_node tenant_id must be accepted by executor plan schema");
+
+        assert_eq!(plan.execution.steps.len(), 1);
+        assert_eq!(plan.execution.steps[0].args["tenant_id"], json!("tnt:43d576a3-d712-4d91-9245-5d5463dd693e"));
     }
 
     #[test]
