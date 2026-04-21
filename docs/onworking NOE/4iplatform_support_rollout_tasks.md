@@ -534,8 +534,14 @@ Como esta integración no necesita webhook:
 
 Recomendado:
 
-- `integration_id = "int_4iplatform_whatsapp"`
+- `integration_id = "int_4iplatform_support"`
 - `key_id = "4iplatform-main"`
+
+Decisión operativa para este rollout:
+
+- si el tenant dedicado `4iPlatform` todavía no existe/aprueba, usar el tenant real ya disponible del entorno:
+  - `tnt:43d576a3-d712-4d91-9245-5d5463dd693e`
+- cuando exista el tenant dedicado `4iPlatform`, mover la API key y la integración a ese tenant sin cambiar el contrato HTTP del servicio .NET.
 
 ### D.2 Decisiones de routing
 
@@ -562,16 +568,16 @@ Recomendación para este rollout:
     "api_keys": [
       {
         "key_id": "4iplatform-main",
-        "tenant_id": "tnt:XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX",
-        "integration_id": "int_4iplatform_whatsapp",
+        "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e",
+        "integration_id": "int_4iplatform_support",
         "token": "fb_api_4iplatform_001"
       }
     ]
   },
   "integrations": [
     {
-      "integration_id": "int_4iplatform_whatsapp",
-      "tenant_id": "tnt:XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX",
+      "integration_id": "int_4iplatform_support",
+      "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e",
       "final_reply_required": false,
       "webhook": {
         "enabled": false
@@ -620,13 +626,28 @@ Recomendación para este rollout:
 
 ### E.1 Reglas
 
-El request debe ir a:
+Sin adjuntos binarios:
 
 ```http
 POST /
 Authorization: Bearer <API_KEY>
 Content-Type: application/json
 ```
+
+Con adjuntos binarios:
+
+```http
+POST /
+Authorization: Bearer <API_KEY>
+Content-Type: multipart/form-data
+```
+
+Reglas:
+
+- el tenant no viaja en el body; lo determina la API key configurada en `IO.api`;
+- usar `application/json` solo cuando no haya binarios;
+- usar `multipart/form-data` cuando haya uno o más adjuntos;
+- en multipart, la parte `metadata` lleva el JSON canónico y las demás partes son archivos.
 
 ### E.2 Shape recomendado
 
@@ -739,6 +760,84 @@ var body = new
     }
 };
 ```
+
+### E.7 Ejemplo .NET con attachments
+
+Cuando haya adjuntos, el servicio .NET debe enviar `multipart/form-data`.
+
+Shape:
+
+- parte `metadata`: JSON UTF-8 con el mismo contrato del ejemplo anterior
+- una o más partes archivo
+
+Ejemplo:
+
+```csharp
+using System.Net.Http.Headers;
+using System.Text;
+
+using var client = new HttpClient();
+client.DefaultRequestHeaders.Authorization =
+    new AuthenticationHeaderValue("Bearer", apiKey);
+
+var metadata = """
+{
+  "subject": {
+    "external_user_id": "wa:+5491155551234",
+    "display_name": "Juan Perez",
+    "email": "juan@empresa.com",
+    "company_name": "Empresa SA",
+    "phone": "+5491155551234",
+    "attributes": {
+      "source_channel": "whatsapp",
+      "provider": "4iplatform",
+      "provider_user_id": "whatsapp-user-123",
+      "provider_chat_id": "whatsapp-chat-456"
+    }
+  },
+  "message": {
+    "text": "Adjunto documentacion",
+    "external_message_id": "wamid.HBgL....",
+    "timestamp": "2026-04-21T12:34:56Z"
+  },
+  "options": {
+    "routing": {
+      "dst_node": "AI.support.rep@motherbee"
+    },
+    "metadata": {
+      "source_system": "4iplatform-whatsapp-bridge",
+      "source_channel": "whatsapp"
+    }
+  }
+}
+""";
+
+using var form = new MultipartFormDataContent();
+form.Add(
+    new StringContent(metadata, Encoding.UTF8, "application/json"),
+    "metadata"
+);
+
+var pdfBytes = await File.ReadAllBytesAsync("/path/documentacion.pdf");
+var pdf = new ByteArrayContent(pdfBytes);
+pdf.Headers.ContentType = new MediaTypeHeaderValue("application/pdf");
+form.Add(pdf, "file1", "documentacion.pdf");
+
+var imageBytes = await File.ReadAllBytesAsync("/path/captura.png");
+var image = new ByteArrayContent(imageBytes);
+image.Headers.ContentType = new MediaTypeHeaderValue("image/png");
+form.Add(image, "file2", "captura.png");
+
+var response = await client.PostAsync("http://127.0.0.1:18081/", form);
+```
+
+Observaciones:
+
+- los nombres `file1`, `file2`, etc. no son semánticos para `IO.api`; cualquier parte distinta de `metadata` se trata como attachment;
+- no hace falta fabricar `attachments[]` del lado .NET;
+- `IO.api` valida MIME/tamaño/cantidad, materializa blobs y arma el `text/v1` interno;
+- si el request trae solo adjuntos, igual conviene mandar un `message.text` corto que dé contexto humano;
+- para attachments binarios, este es el camino normativo; no usar JSON con binarios inline.
 
 ---
 
