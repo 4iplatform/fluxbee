@@ -1952,34 +1952,189 @@ fn build_executor_step_events_from_result(
             });
         }
     }
-    if !action_called && failure.is_none() {
-        failure = Some(AdminExecutorFailure {
-            code: "EXECUTOR_NO_ACTION_CALL".to_string(),
-            detail: format!(
-                "executor finished step '{}' without calling '{}'",
-                step.id, step.action
-            ),
-            source: "validation".to_string(),
+    (events, action_called, failure)
+}
+
+async fn execute_admin_executor_step_fallback(
+    ctx: &AdminContext,
+    client: &Arc<AdminRouterClient>,
+    execution_id: &str,
+    step_index: usize,
+    step: &AdminExecutorPlanStep,
+) -> (AdminExecutorStepEvent, Option<AdminExecutorFailure>) {
+    let timestamp = now_epoch_ms();
+    let failure_from_detail = |detail: String, source: &str| AdminExecutorFailure {
+        code: "EXECUTOR_NO_ACTION_CALL".to_string(),
+        detail,
+        source: source.to_string(),
+        step_id: Some(step.id.clone()),
+        step_action: Some(step.action.clone()),
+    };
+
+    let spec = match resolve_internal_action_spec(&step.action) {
+        Ok(spec) => spec,
+        Err(detail) => {
+            let failure = failure_from_detail(detail.to_string(), "validation");
+            return (
+                AdminExecutorStepEvent {
+                    execution_id: execution_id.to_string(),
+                    step_id: step.id.clone(),
+                    step_index,
+                    step_action: step.action.clone(),
+                    status: "failed".to_string(),
+                    timestamp,
+                    summary: format!("{} -> failed", step.action),
+                    tool_name: Some(step.action.clone()),
+                    tool_args_preview: Some(step.args.clone()),
+                    result_preview: None,
+                    error_code: Some(failure.code.clone()),
+                    error_source: Some(failure.source.clone()),
+                    error_message: Some(failure.detail.clone()),
+                },
+                Some(failure),
+            );
+        }
+    };
+    let (target, params) = match executor_dispatch_target_and_params(spec, &step.args) {
+        Ok(values) => values,
+        Err(detail) => {
+            let failure = failure_from_detail(detail, "validation");
+            return (
+                AdminExecutorStepEvent {
+                    execution_id: execution_id.to_string(),
+                    step_id: step.id.clone(),
+                    step_index,
+                    step_action: step.action.clone(),
+                    status: "failed".to_string(),
+                    timestamp,
+                    summary: format!("{} -> failed", step.action),
+                    tool_name: Some(step.action.clone()),
+                    tool_args_preview: Some(step.args.clone()),
+                    result_preview: None,
+                    error_code: Some(failure.code.clone()),
+                    error_source: Some(failure.source.clone()),
+                    error_message: Some(failure.detail.clone()),
+                },
+                Some(failure),
+            );
+        }
+    };
+    let (_http_status, body) = match handle_admin_command(
+        ctx,
+        client,
+        &step.action,
+        params,
+        target,
+    )
+    .await
+    {
+        Ok(values) => values,
+        Err(err) => {
+            let failure = failure_from_detail(err.to_string(), "admin_action_failure");
+            return (
+                AdminExecutorStepEvent {
+                    execution_id: execution_id.to_string(),
+                    step_id: step.id.clone(),
+                    step_index,
+                    step_action: step.action.clone(),
+                    status: "failed".to_string(),
+                    timestamp,
+                    summary: format!("{} -> failed", step.action),
+                    tool_name: Some(step.action.clone()),
+                    tool_args_preview: Some(step.args.clone()),
+                    result_preview: None,
+                    error_code: Some(failure.code.clone()),
+                    error_source: Some(failure.source.clone()),
+                    error_message: Some(failure.detail.clone()),
+                },
+                Some(failure),
+            );
+        }
+    };
+    let internal = match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(envelope) => envelope,
+        Err(err) => {
+            let failure =
+                failure_from_detail(format!("invalid fallback envelope json: {err}"), "validation");
+            return (
+                AdminExecutorStepEvent {
+                    execution_id: execution_id.to_string(),
+                    step_id: step.id.clone(),
+                    step_index,
+                    step_action: step.action.clone(),
+                    status: "failed".to_string(),
+                    timestamp,
+                    summary: format!("{} -> failed", step.action),
+                    tool_name: Some(step.action.clone()),
+                    tool_args_preview: Some(step.args.clone()),
+                    result_preview: Some(serde_json::json!({ "raw_body": body })),
+                    error_code: Some(failure.code.clone()),
+                    error_source: Some(failure.source.clone()),
+                    error_message: Some(failure.detail.clone()),
+                },
+                Some(failure),
+            );
+        }
+    };
+
+    let status = internal
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("error");
+    if status.eq_ignore_ascii_case("error") {
+        let failure = AdminExecutorFailure {
+            code: internal
+                .get("error_code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("ADMIN_ACTION_FAILED")
+                .to_string(),
+            detail: internal
+                .get("error_detail")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("executor fallback dispatch failed")
+                .to_string(),
+            source: "admin_action_failure".to_string(),
             step_id: Some(step.id.clone()),
             step_action: Some(step.action.clone()),
-        });
-        events.push(AdminExecutorStepEvent {
-            execution_id: execution_id.to_string(),
-            step_id: step.id.clone(),
-            step_index,
-            step_action: step.action.clone(),
-            status: "failed".to_string(),
-            timestamp: now_epoch_ms(),
-            summary: format!("{} was never called", step.action),
-            tool_name: Some(step.action.clone()),
-            tool_args_preview: Some(step.args.clone()),
-            result_preview: None,
-            error_code: Some("EXECUTOR_NO_ACTION_CALL".to_string()),
-            error_source: Some("validation".to_string()),
-            error_message: failure.as_ref().map(|value| value.detail.clone()),
-        });
+        };
+        (
+            AdminExecutorStepEvent {
+                execution_id: execution_id.to_string(),
+                step_id: step.id.clone(),
+                step_index,
+                step_action: step.action.clone(),
+                status: "failed".to_string(),
+                timestamp,
+                summary: format!("{} -> failed (fallback dispatch)", step.action),
+                tool_name: Some(step.action.clone()),
+                tool_args_preview: Some(step.args.clone()),
+                result_preview: Some(internal),
+                error_code: Some(failure.code.clone()),
+                error_source: Some(failure.source.clone()),
+                error_message: Some(failure.detail.clone()),
+            },
+            Some(failure),
+        )
+    } else {
+        (
+            AdminExecutorStepEvent {
+                execution_id: execution_id.to_string(),
+                step_id: step.id.clone(),
+                step_index,
+                step_action: step.action.clone(),
+                status: "done".to_string(),
+                timestamp,
+                summary: format!("{} -> done (fallback dispatch)", step.action),
+                tool_name: Some(step.action.clone()),
+                tool_args_preview: Some(step.args.clone()),
+                result_preview: Some(internal),
+                error_code: None,
+                error_source: None,
+                error_message: None,
+            },
+            None,
+        )
     }
-    (events, action_called && failure.is_none(), failure)
 }
 
 async fn execute_admin_executor_plan(
@@ -2073,10 +2228,22 @@ async fn execute_admin_executor_plan(
             .await
             .map_err(|err| -> AdminError { format!("executor model run failed: {err}").into() })?;
 
-        let (mut step_events, step_ok, failure) =
+        let (mut step_events, action_called, mut failure) =
             build_executor_step_events_from_result(&request.execution_id, index, step, &result);
+        if !action_called && failure.is_none() {
+            let (fallback_event, fallback_failure) = execute_admin_executor_step_fallback(
+                ctx,
+                client,
+                &request.execution_id,
+                index,
+                step,
+            )
+            .await;
+            step_events.push(fallback_event);
+            failure = fallback_failure;
+        }
         all_events.append(&mut step_events);
-        if step_ok {
+        if failure.is_none() {
             completed_steps += 1;
             continue;
         }
