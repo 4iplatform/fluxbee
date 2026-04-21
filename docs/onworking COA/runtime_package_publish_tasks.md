@@ -135,9 +135,9 @@ Optional follow-up operations after publish:
   - Shared core preserves existing manifest v2 gate/write behavior.
 - [x] RPP-B5. Expose publish result as structured data instead of CLI-only text output.
   - Shared structs now expose validated package metadata, dry-run plan, and install result.
-- [ ] RPP-B6. Add idempotency/conflict behavior in shared core.
-  - same version + same content -> idempotent success
-  - same version + different content -> explicit conflict
+- [x] RPP-B6. Add idempotency/conflict behavior in shared core.
+  - Shared core now treats `same version + same normalized contents` as idempotent success.
+  - Shared core now rejects `same version + different contents` as an explicit install conflict.
 
 ### Phase C - `SY.admin` Publish Actions
 
@@ -182,7 +182,9 @@ Optional follow-up operations after publish:
 - [x] RPP-D5. Ensure Archi composes the lifecycle explicitly:
   - Documented canonical sequence: publish -> declared sync/update intent -> run_node/restart_node.
   - No implicit spawn from publish success.
-- [ ] RPP-D6. Update solution-manifest/execution-plan docs to stop referencing `fluxbee-publish` as the operator path.
+- [x] RPP-D6. Update solution-manifest/execution-plan docs to stop referencing `fluxbee-publish` as the operator path.
+  - Executor-plan spec now documents `publish_runtime_package` as the canonical plan action.
+  - Solution-manifest reconciliation docs now point to `publish_runtime_package` instead of `fluxbee-publish`.
 
 ### Phase E - Service Integration
 
@@ -193,8 +195,9 @@ Optional follow-up operations after publish:
 
 ### Phase F - Tests
 
-- [ ] RPP-F1. Unit tests for shared validation/install core after extraction.
-- [ ] RPP-F2. Admin tests for `inline_package`.
+- [x] RPP-F1. Unit tests for shared validation/install core after extraction.
+  - Added shared-core tests for idempotent re-publish and explicit conflict on divergent content.
+- [x] RPP-F2. Admin tests for `inline_package`.
   - happy path
   - invalid file layout
   - conflict/idempotency

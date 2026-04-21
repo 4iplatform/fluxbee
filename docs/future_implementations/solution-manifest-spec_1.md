@@ -466,7 +466,7 @@ When architect applies a manifest, it does NOT execute it as a script. It reconc
    - Check network configuration
 
 3. RUNTIMES
-   - Check published runtimes → fluxbee-publish for missing ones
+   - Check published runtimes → `publish_runtime_package` for missing ones
    - Check versions → update if newer version in manifest
    - Sync to workers → sync-hint + update
 

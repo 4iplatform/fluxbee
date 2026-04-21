@@ -73,6 +73,25 @@ struct CopyStats {
     bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InstallPackageOutcome {
+    Installed(CopyStats),
+    AlreadyInstalled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum NormalizedPackageEntry {
+    Dir {
+        rel_path: String,
+        mode: u32,
+    },
+    File {
+        rel_path: String,
+        mode: u32,
+        bytes: Vec<u8>,
+    },
+}
+
 fn runtime_name_regex() -> Regex {
     Regex::new(r"^[a-z][a-z0-9]*(\.[a-z0-9]+)*$").expect("valid runtime name regex")
 }
@@ -318,6 +337,14 @@ fn first_component_is_bin(rel_path: &Path) -> bool {
         .is_some_and(|c| c.as_os_str() == "bin")
 }
 
+fn normalized_file_mode(rel_path: &Path) -> u32 {
+    if first_component_is_bin(rel_path) {
+        0o755
+    } else {
+        0o644
+    }
+}
+
 fn copy_tree_with_permissions(
     source_root: &Path,
     current_source: &Path,
@@ -422,12 +449,119 @@ fn copy_tree_with_permissions(
     Ok(())
 }
 
-fn install_package_files_atomic(source_dir: &Path, target_dir: &Path) -> Result<CopyStats, String> {
+fn normalized_package_json_bytes(path: &Path, effective_version: &str) -> Result<Vec<u8>, String> {
+    let raw = fs::read_to_string(path)
+        .map_err(|err| format!("read '{}' failed: {}", path.display(), err))?;
+    let mut value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("parse '{}' failed: {}", path.display(), err))?;
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| format!("package json '{}' is not an object", path.display()))?;
+    obj.insert("version".to_string(), serde_json::json!(effective_version));
+    serde_json::to_vec_pretty(&value)
+        .map_err(|err| format!("serialize '{}' failed: {}", path.display(), err))
+}
+
+fn collect_normalized_package_entries(
+    package_dir: &Path,
+    current_dir: &Path,
+    effective_version: &str,
+    entries: &mut Vec<NormalizedPackageEntry>,
+) -> Result<(), String> {
+    let mut children = fs::read_dir(current_dir)
+        .map_err(|err| format!("read directory '{}' failed: {}", current_dir.display(), err))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("read entry in '{}' failed: {}", current_dir.display(), err))?;
+    children.sort_by_key(|entry| entry.file_name());
+
+    for child in children {
+        let child_path = child.path();
+        let rel_path = child_path.strip_prefix(package_dir).map_err(|err| {
+            format!(
+                "strip prefix '{}' from '{}' failed: {}",
+                package_dir.display(),
+                child_path.display(),
+                err
+            )
+        })?;
+        let rel_string = rel_path.to_string_lossy().replace('\\', "/");
+        let file_type = child
+            .file_type()
+            .map_err(|err| format!("read file type '{}' failed: {}", child_path.display(), err))?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "symlink is not allowed in package '{}'",
+                child_path.display()
+            ));
+        }
+        if file_type.is_dir() {
+            entries.push(NormalizedPackageEntry::Dir {
+                rel_path: rel_string,
+                mode: 0o755,
+            });
+            collect_normalized_package_entries(package_dir, &child_path, effective_version, entries)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            return Err(format!(
+                "unsupported filesystem entry '{}'",
+                child_path.display()
+            ));
+        }
+        let bytes = if rel_path == Path::new("package.json") {
+            normalized_package_json_bytes(&child_path, effective_version)?
+        } else {
+            fs::read(&child_path)
+                .map_err(|err| format!("read '{}' failed: {}", child_path.display(), err))?
+        };
+        entries.push(NormalizedPackageEntry::File {
+            rel_path: rel_string,
+            mode: normalized_file_mode(rel_path),
+            bytes,
+        });
+    }
+
+    Ok(())
+}
+
+fn normalized_package_entries(
+    package_dir: &Path,
+    effective_version: &str,
+) -> Result<Vec<NormalizedPackageEntry>, String> {
+    let mut entries = Vec::new();
+    collect_normalized_package_entries(package_dir, package_dir, effective_version, &mut entries)?;
+    Ok(entries)
+}
+
+fn installed_package_matches(
+    source_dir: &Path,
+    target_dir: &Path,
+    effective_version: &str,
+) -> Result<bool, String> {
+    Ok(
+        normalized_package_entries(source_dir, effective_version)?
+            == normalized_package_entries(target_dir, effective_version)?,
+    )
+}
+
+fn install_package_files_atomic(
+    source_dir: &Path,
+    target_dir: &Path,
+    effective_version: &str,
+) -> Result<InstallPackageOutcome, String> {
     if target_dir.exists() {
-        return Err(format!(
-            "install failed: target runtime version already exists '{}'",
-            target_dir.display()
-        ));
+        return match installed_package_matches(source_dir, target_dir, effective_version) {
+            Ok(true) => Ok(InstallPackageOutcome::AlreadyInstalled),
+            Ok(false) => Err(format!(
+                "install conflict: target runtime version already exists with different contents '{}'",
+                target_dir.display()
+            )),
+            Err(err) => Err(format!(
+                "install failed: existing target inspection '{}' failed: {}",
+                target_dir.display(),
+                err
+            )),
+        };
     }
     let parent = target_dir.parent().ok_or_else(|| {
         format!(
@@ -482,7 +616,7 @@ fn install_package_files_atomic(source_dir: &Path, target_dir: &Path) -> Result<
             err
         ));
     }
-    Ok(stats)
+    Ok(InstallPackageOutcome::Installed(stats))
 }
 
 fn apply_installed_package_json_version(target_dir: &Path, version: &str) -> Result<(), String> {
@@ -572,19 +706,35 @@ pub fn update_runtime_manifest_with_package(
 
     let existing = runtime_map.get(&validated.metadata.name).cloned();
     let mut entry = match existing {
-        Some(value) => runtime_entry_from_value(&value)?,
+        Some(ref value) => runtime_entry_from_value(value)?,
         None => RuntimeManifestEntry::default(),
     };
+    let mut changed = existing.is_none();
     if !entry
         .available
         .iter()
         .any(|v| v == &validated.effective_version)
     {
         entry.available.push(validated.effective_version.clone());
+        changed = true;
     }
-    entry.current = Some(validated.effective_version.clone());
-    entry.package_type = Some(package_type_label(validated.package_type).to_string());
-    entry.runtime_base = validated.metadata.runtime_base.clone();
+    if entry.current.as_deref() != Some(validated.effective_version.as_str()) {
+        entry.current = Some(validated.effective_version.clone());
+        changed = true;
+    }
+    let desired_package_type = package_type_label(validated.package_type).to_string();
+    if entry.package_type.as_deref() != Some(desired_package_type.as_str()) {
+        entry.package_type = Some(desired_package_type);
+        changed = true;
+    }
+    if entry.runtime_base != validated.metadata.runtime_base {
+        entry.runtime_base = validated.metadata.runtime_base.clone();
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(manifest.version);
+    }
 
     runtime_map.insert(
         validated.metadata.name.clone(),
@@ -624,24 +774,34 @@ pub fn install_validated_package(
     let target_dir = dist_runtime_root
         .join(&validated.metadata.name)
         .join(&validated.effective_version);
-    let copy_stats = install_package_files_atomic(&validated.package_dir, &target_dir)?;
-    if let Err(err) =
-        apply_installed_package_json_version(&target_dir, &validated.effective_version)
-    {
-        let _ = fs::remove_dir_all(&target_dir);
-        return Err(err);
-    }
+    let install_outcome =
+        install_package_files_atomic(&validated.package_dir, &target_dir, &validated.effective_version)?;
+    let installed_new_files = matches!(install_outcome, InstallPackageOutcome::Installed(_));
+    let copy_stats = match install_outcome {
+        InstallPackageOutcome::Installed(copy_stats) => {
+            if let Err(err) =
+                apply_installed_package_json_version(&target_dir, &validated.effective_version)
+            {
+                let _ = fs::remove_dir_all(&target_dir);
+                return Err(err);
+            }
+            copy_stats
+        }
+        InstallPackageOutcome::AlreadyInstalled => CopyStats::default(),
+    };
     let manifest_version = match update_runtime_manifest_with_package(manifest_path, validated) {
         Ok(version) => version,
         Err(err) => {
-            let rollback = fs::remove_dir_all(&target_dir);
-            if let Err(rollback_err) = rollback {
-                return Err(format!(
-                    "{}; rollback failed for '{}': {}",
-                    err,
-                    target_dir.display(),
-                    rollback_err
-                ));
+            if installed_new_files {
+                let rollback = fs::remove_dir_all(&target_dir);
+                if let Err(rollback_err) = rollback {
+                    return Err(format!(
+                        "{}; rollback failed for '{}': {}",
+                        err,
+                        target_dir.display(),
+                        rollback_err
+                    ));
+                }
             }
             return Err(err);
         }
@@ -656,4 +816,117 @@ pub fn install_validated_package(
         copied_files: copy_stats.files,
         copied_bytes: copy_stats.bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime_manifest::{write_runtime_manifest_file_atomic, RuntimeManifest};
+
+    fn test_temp_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("runtime-package-{label}-{}", Uuid::new_v4()))
+    }
+
+    fn write_file(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent");
+        }
+        fs::write(path, contents).expect("write file");
+    }
+
+    fn make_executable(path: &Path) {
+        let mut perms = fs::metadata(path).expect("stat file").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).expect("chmod file");
+    }
+
+    #[test]
+    fn install_validated_package_is_idempotent_for_same_contents() {
+        let package_dir = test_temp_dir("idempotent-src");
+        write_file(
+            &package_dir.join("package.json"),
+            "{\n  \"name\": \"sy.frontdesk.gov\",\n  \"version\": \"1.0.0\",\n  \"type\": \"full_runtime\"\n}",
+        );
+        let start_sh = package_dir.join("bin/start.sh");
+        write_file(&start_sh, "#!/usr/bin/env bash\necho ok\n");
+        make_executable(&start_sh);
+
+        let dist_root = test_temp_dir("idempotent-dist");
+        let runtimes_root = dist_root.join("runtimes");
+        fs::create_dir_all(&runtimes_root).expect("create runtimes root");
+        let manifest_path = runtimes_root.join("manifest.json");
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-04-20T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({
+                "sy.frontdesk.gov": {
+                    "available": ["1.0.0"],
+                    "current": "1.0.0",
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+        write_runtime_manifest_file_atomic(&manifest_path, &manifest, false)
+            .expect("seed manifest");
+
+        let validated = validate_package(&package_dir, None).expect("validate source");
+        let first = install_validated_package(&validated, &runtimes_root, &manifest_path)
+            .expect("first install");
+        let second = install_validated_package(&validated, &runtimes_root, &manifest_path)
+            .expect("second install should be idempotent");
+
+        assert_eq!(second.runtime_name, "sy.frontdesk.gov");
+        assert_eq!(second.runtime_version, "1.0.0");
+        assert_eq!(second.copied_files, 0);
+        assert_eq!(second.copied_bytes, 0);
+        assert_eq!(second.manifest_version, first.manifest_version);
+
+        let _ = fs::remove_dir_all(package_dir);
+        let _ = fs::remove_dir_all(dist_root);
+    }
+
+    #[test]
+    fn install_validated_package_rejects_existing_target_with_different_contents() {
+        let package_dir = test_temp_dir("conflict-src");
+        write_file(
+            &package_dir.join("package.json"),
+            "{\n  \"name\": \"sy.frontdesk.gov\",\n  \"version\": \"1.0.0\",\n  \"type\": \"full_runtime\"\n}",
+        );
+        let start_sh = package_dir.join("bin/start.sh");
+        write_file(&start_sh, "#!/usr/bin/env bash\necho new\n");
+        make_executable(&start_sh);
+
+        let dist_root = test_temp_dir("conflict-dist");
+        let runtimes_root = dist_root.join("runtimes");
+        let target_dir = runtimes_root.join("sy.frontdesk.gov/1.0.0");
+        fs::create_dir_all(target_dir.join("bin")).expect("create existing target");
+        write_file(
+            &target_dir.join("package.json"),
+            "{\n  \"name\": \"sy.frontdesk.gov\",\n  \"version\": \"1.0.0\",\n  \"type\": \"full_runtime\"\n}",
+        );
+        let installed_start = target_dir.join("bin/start.sh");
+        write_file(&installed_start, "#!/usr/bin/env bash\necho old\n");
+        make_executable(&installed_start);
+
+        let manifest_path = runtimes_root.join("manifest.json");
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-04-20T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({}),
+            hash: None,
+        };
+        write_runtime_manifest_file_atomic(&manifest_path, &manifest, false)
+            .expect("seed manifest");
+
+        let validated = validate_package(&package_dir, None).expect("validate source");
+        let err = install_validated_package(&validated, &runtimes_root, &manifest_path)
+            .expect_err("different contents must conflict");
+        assert!(err.contains("different contents"), "err={err}");
+
+        let _ = fs::remove_dir_all(package_dir);
+        let _ = fs::remove_dir_all(dist_root);
+    }
 }

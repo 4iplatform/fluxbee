@@ -4612,6 +4612,7 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         "HIVE_EXISTS"
         | "MODULE_EXISTS"
         | "VERSION_MISMATCH"
+        | "VERSION_CONFLICT"
         | "WAN_NOT_AUTHORIZED"
         | "NODE_INSTANCE_RUNNING"
         | "NODE_NOT_CONFIGURED"
@@ -7887,6 +7888,8 @@ async fn handle_publish_runtime_package(
                 || err.contains("package.json at the root directory")
             {
                 "INVALID_PACKAGE_LAYOUT"
+            } else if err.contains("install conflict:") || err.contains("different contents") {
+                "VERSION_CONFLICT"
             } else if err.contains("already exists") {
                 "VERSION_MISMATCH"
             } else if err.contains("package.json invalid")
@@ -10426,6 +10429,115 @@ mod tests {
             manifest_json["runtimes"]["ai.support.demo"]["runtime_base"],
             json!("ai.generic")
         );
+
+        let _ = fs::remove_dir_all(staging_root);
+        let _ = fs::remove_dir_all(dist_root);
+    }
+
+    #[test]
+    fn publish_runtime_package_inline_is_idempotent_for_same_contents() {
+        let staging_root = test_temp_dir("sy-admin-inline-idempotent-stage");
+        let dist_root = test_temp_dir("sy-admin-inline-idempotent-dist");
+        let runtimes_root = dist_root.join("runtimes");
+        fs::create_dir_all(&runtimes_root).expect("create runtimes root");
+        let manifest_path = runtimes_root.join("manifest.json");
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-04-20T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({}),
+            hash: None,
+        };
+        write_runtime_manifest_file_atomic(&manifest_path, &manifest, false)
+            .expect("seed manifest");
+
+        let files = BTreeMap::from([
+            (
+                "package.json".to_string(),
+                "{\n  \"name\": \"ai.support.demo\",\n  \"version\": \"0.1.0\",\n  \"type\": \"config_only\",\n  \"runtime_base\": \"ai.generic\"\n}".to_string(),
+            ),
+            (
+                "config/default-config.json".to_string(),
+                "{\n  \"tenant_id\": \"tnt:demo\"\n}".to_string(),
+            ),
+        ]);
+
+        let first = publish_runtime_package_inline(
+            &files,
+            &staging_root,
+            &runtimes_root,
+            &manifest_path,
+        )
+        .expect("first inline publish");
+        let second = publish_runtime_package_inline(
+            &files,
+            &staging_root,
+            &runtimes_root,
+            &manifest_path,
+        )
+        .expect("second inline publish should be idempotent");
+
+        assert_eq!(first["runtime_name"], json!("ai.support.demo"));
+        assert_eq!(second["runtime_name"], json!("ai.support.demo"));
+        assert_eq!(second["runtime_version"], json!("0.1.0"));
+        assert_eq!(second["copied_files"], json!(0));
+        assert_eq!(second["copied_bytes"], json!(0));
+
+        let _ = fs::remove_dir_all(staging_root);
+        let _ = fs::remove_dir_all(dist_root);
+    }
+
+    #[test]
+    fn publish_runtime_package_inline_rejects_conflicting_existing_version() {
+        let staging_root = test_temp_dir("sy-admin-inline-conflict-stage");
+        let dist_root = test_temp_dir("sy-admin-inline-conflict-dist");
+        let runtimes_root = dist_root.join("runtimes");
+        fs::create_dir_all(&runtimes_root).expect("create runtimes root");
+        let manifest_path = runtimes_root.join("manifest.json");
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-04-20T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({}),
+            hash: None,
+        };
+        write_runtime_manifest_file_atomic(&manifest_path, &manifest, false)
+            .expect("seed manifest");
+
+        publish_runtime_package_inline(
+            &BTreeMap::from([
+                (
+                    "package.json".to_string(),
+                    "{\n  \"name\": \"ai.support.demo\",\n  \"version\": \"0.1.0\",\n  \"type\": \"config_only\",\n  \"runtime_base\": \"ai.generic\"\n}".to_string(),
+                ),
+                (
+                    "config/default-config.json".to_string(),
+                    "{\n  \"tenant_id\": \"tnt:demo\"\n}".to_string(),
+                ),
+            ]),
+            &staging_root,
+            &runtimes_root,
+            &manifest_path,
+        )
+        .expect("first inline publish");
+
+        let err = publish_runtime_package_inline(
+            &BTreeMap::from([
+                (
+                    "package.json".to_string(),
+                    "{\n  \"name\": \"ai.support.demo\",\n  \"version\": \"0.1.0\",\n  \"type\": \"config_only\",\n  \"runtime_base\": \"ai.generic\"\n}".to_string(),
+                ),
+                (
+                    "config/default-config.json".to_string(),
+                    "{\n  \"tenant_id\": \"tnt:changed\"\n}".to_string(),
+                ),
+            ]),
+            &staging_root,
+            &runtimes_root,
+            &manifest_path,
+        )
+        .expect_err("changed contents must conflict");
+        assert!(err.contains("different contents"), "err={err}");
 
         let _ = fs::remove_dir_all(staging_root);
         let _ = fs::remove_dir_all(dist_root);

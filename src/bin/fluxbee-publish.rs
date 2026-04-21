@@ -807,8 +807,8 @@ mod tests {
     }
 
     #[test]
-    fn install_validated_package_rejects_existing_target_version() {
-        let package_dir = test_temp_dir("fluxbee-publish-install-existing-src");
+    fn install_validated_package_is_idempotent_for_same_contents() {
+        let package_dir = test_temp_dir("fluxbee-publish-install-idempotent-src");
         write_package_json(
             &package_dir,
             r#"{
@@ -821,10 +821,63 @@ mod tests {
         write_file(&start_sh, "#!/usr/bin/env bash\necho ok\n");
         make_executable(&start_sh);
 
-        let dist_root = test_temp_dir("fluxbee-publish-install-existing-dist");
+        let dist_root = test_temp_dir("fluxbee-publish-install-idempotent-dist");
+        let runtimes_root = dist_root.join("runtimes");
+        let manifest_path = runtimes_root.join("manifest.json");
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-03-16T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({}),
+            hash: None,
+        };
+        write_runtime_manifest_file_atomic(&manifest_path, &manifest, false)
+            .expect("seed manifest");
+
+        let validated = validate_package(&package_dir, None).expect("validate");
+        let first = install_validated_package(&validated, &runtimes_root, &manifest_path)
+            .expect("first install");
+        let second = install_validated_package(&validated, &runtimes_root, &manifest_path)
+            .expect("second install should be idempotent");
+        assert_eq!(second.copied_files, 0);
+        assert_eq!(second.copied_bytes, 0);
+        assert_eq!(second.manifest_version, first.manifest_version);
+
+        let _ = fs::remove_dir_all(package_dir);
+        let _ = fs::remove_dir_all(dist_root);
+    }
+
+    #[test]
+    fn install_validated_package_rejects_existing_target_with_different_contents() {
+        let package_dir = test_temp_dir("fluxbee-publish-install-conflict-src");
+        write_package_json(
+            &package_dir,
+            r#"{
+  "name": "sy.frontdesk.gov",
+  "version": "1.0.0",
+  "type": "full_runtime"
+}"#,
+        );
+        let start_sh = package_dir.join("bin/start.sh");
+        write_file(&start_sh, "#!/usr/bin/env bash\necho new\n");
+        make_executable(&start_sh);
+
+        let dist_root = test_temp_dir("fluxbee-publish-install-conflict-dist");
         let runtimes_root = dist_root.join("runtimes");
         let target_dir = runtimes_root.join("sy.frontdesk.gov/1.0.0");
-        fs::create_dir_all(&target_dir).expect("precreate target");
+        fs::create_dir_all(target_dir.join("bin")).expect("precreate target");
+        write_package_json(
+            &target_dir,
+            r#"{
+  "name": "sy.frontdesk.gov",
+  "version": "1.0.0",
+  "type": "full_runtime"
+}"#,
+        );
+        let existing_start = target_dir.join("bin/start.sh");
+        write_file(&existing_start, "#!/usr/bin/env bash\necho old\n");
+        make_executable(&existing_start);
+
         let manifest_path = runtimes_root.join("manifest.json");
         let manifest = RuntimeManifest {
             schema_version: 1,
@@ -838,8 +891,8 @@ mod tests {
 
         let validated = validate_package(&package_dir, None).expect("validate");
         let err = install_validated_package(&validated, &runtimes_root, &manifest_path)
-            .expect_err("expected existing target error");
-        assert!(err.contains("already exists"), "err={err}");
+            .expect_err("expected existing target conflict");
+        assert!(err.contains("different contents"), "err={err}");
 
         let _ = fs::remove_dir_all(package_dir);
         let _ = fs::remove_dir_all(dist_root);

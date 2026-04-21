@@ -5233,7 +5233,7 @@ async fn execute_admin_action_with_context(
         version: "0.1.0".to_string(),
     };
     let (sender, mut receiver) = connect(&node_config).await?;
-    let out = admin_command(
+    let response = admin_command(
         &sender,
         &mut receiver,
         AdminCommandRequest {
@@ -5245,8 +5245,9 @@ async fn execute_admin_action_with_context(
             timeout,
         },
     )
-    .await
-    .map_err(|err| -> ArchitectError {
+    .await;
+    let _ = sender.close().await;
+    let out = response.map_err(|err| -> ArchitectError {
         tracing::warn!(
             purpose = %purpose,
             admin_target = %admin_target,
@@ -5342,7 +5343,7 @@ async fn fetch_inventory_status_data(
         .map_err(|err| -> ArchitectError { Box::new(err) })?;
     let admin_target = format!("SY.admin@{}", state.hive_id);
 
-    let summary = admin_command(
+    let summary_response = admin_command(
         &sender,
         &mut receiver,
         AdminCommandRequest {
@@ -5354,11 +5355,17 @@ async fn fetch_inventory_status_data(
             timeout: Duration::from_secs(5),
         },
     )
-    .await
-    .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    .await;
+    let summary = match summary_response {
+        Ok(summary) => summary,
+        Err(err) => {
+            let _ = sender.close().await;
+            return Err(Box::new(err));
+        }
+    };
     ensure_admin_ok("inventory summary", &summary)?;
 
-    let hive = admin_command(
+    let hive_response = admin_command(
         &sender,
         &mut receiver,
         AdminCommandRequest {
@@ -5371,7 +5378,8 @@ async fn fetch_inventory_status_data(
         },
     )
     .await;
-    let hive_payload = match hive {
+    let _ = sender.close().await;
+    let hive_payload = match hive_response {
         Ok(result) => {
             if ensure_admin_ok("inventory hive", &result).is_ok() {
                 Some(result.payload)
