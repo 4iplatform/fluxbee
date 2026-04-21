@@ -9656,11 +9656,20 @@ fn build_admin_http_response(
 ) -> (u16, String) {
     match response {
         Ok(payload) => {
+            let status = payload
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("ok");
             if payload_is_ok(&payload) {
+                let http_status = if status.eq_ignore_ascii_case("sync_pending") {
+                    202
+                } else {
+                    200
+                };
                 return (
-                    200,
+                    http_status,
                     serde_json::json!({
-                        "status": "ok",
+                        "status": if status.eq_ignore_ascii_case("sync_pending") { "sync_pending" } else { "ok" },
                         "action": action,
                         "payload": payload,
                         "error_code": serde_json::Value::Null,
