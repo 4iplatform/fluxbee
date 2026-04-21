@@ -469,6 +469,15 @@ Example:
 }
 ```
 
+Canonical runtime-package E2E coverage for this executor path lives in:
+
+- `scripts/runtime_packaging_pub_archi_plan_e2e.sh`
+
+That harness stages a real `bundle_upload`, submits an executor plan with
+`publish_runtime_package`, waits for runtime readiness through the normal admin
+surface, then submits a second executor plan with `run_node` and validates the
+managed node lifecycle.
+
 ---
 
 ## 8. Execution Rules
