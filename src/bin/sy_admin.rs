@@ -5011,7 +5011,13 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
 }
 
 fn is_ok_status(status: Option<&str>) -> bool {
-    matches!(status, Some(value) if value.eq_ignore_ascii_case("ok") || value.eq_ignore_ascii_case("not_found"))
+    matches!(
+        status,
+        Some(value)
+            if value.eq_ignore_ascii_case("ok")
+                || value.eq_ignore_ascii_case("not_found")
+                || value.eq_ignore_ascii_case("sync_pending")
+    )
 }
 
 fn payload_is_ok(payload: &serde_json::Value) -> bool {
