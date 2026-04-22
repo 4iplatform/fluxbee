@@ -1683,9 +1683,18 @@ You do NOT ask questions. You do NOT produce explanations. You call submit_execu
 
 Node names in Fluxbee always include a type prefix followed by a dot, then the instance name, then `@hive`. The prefixes are: `AI.` for AI/language model nodes, `WF.` for workflow nodes, `IO.` for I/O integration nodes, `SY.` for system nodes. Examples: `AI.coa@motherbee`, `WF.router@worker-220`, `IO.slack.main@motherbee`. Never create a `node_name` without its type prefix — a name like `coa@motherbee` is invalid.
 
+## Querying live hive state before generating the plan
+
+Use `query_hive` to read live state from the hive BEFORE generating steps. This is how you find out what runtimes exist, which nodes are running, what routes are configured, etc. Never include read actions (list_runtimes, inventory, etc.) as steps in the executor plan — executor plan args are static, so a step's output cannot feed into another step's args at runtime.
+
+Examples:
+- `query_hive(action="list_runtimes", hive="motherbee")` → see which runtimes are available and materialized
+- `query_hive(action="inventory")` → see which nodes are already running
+- `query_hive(action="get_runtime", hive="motherbee", params={"runtime": "AI.common"})` → verify a specific runtime
+
 ## Choosing a runtime
 
-When you need to pick a runtime for a new node and the context does not specify one, call `get_admin_action_help` with action `list_runtimes` to see what is available on the target hive. Choose the runtime that matches the node type and purpose. Do not reuse the runtime of an existing node (e.g. `AI.chat`) as the base for a different new node unless the task explicitly asks for it.
+When the task requires creating a new node and the runtime is not specified, call `query_hive` with `list_runtimes` to see what is available. Choose the runtime whose name and type match the node being created (e.g. for an AI node, look for AI.* runtimes). Do not reuse the runtime name of an existing node (e.g. `AI.chat`) as the base for a different new node unless explicitly requested.
 
 ## Looking up action schemas
 
@@ -2008,6 +2017,9 @@ async fn run_programmer_with_context(
     tools
         .register(Arc::new(ProgrammerHelpTool { context: context.clone() }))
         .map_err(|e| -> ArchitectError { format!("programmer help tool register: {e}").into() })?;
+    tools
+        .register(Arc::new(ProgrammerLiveQueryTool { context: context.clone() }))
+        .map_err(|e| -> ArchitectError { format!("programmer query tool register: {e}").into() })?;
 
     let input_text = serde_json::to_string_pretty(&json!({
         "task": task,
@@ -2141,6 +2153,99 @@ impl FunctionTool for ProgrammerHelpTool {
             None,
             json!({ "action_name": action_name }),
             "programmer.help_lookup",
+        )
+        .await
+        .map_err(|e| fluxbee_ai_sdk::AiSdkError::Protocol(e.to_string()))
+    }
+}
+
+// Lets the programmer query live hive state (read-only) during plan generation,
+// so it can make informed decisions (e.g. which runtime exists) without embedding
+// read steps in the executor plan.
+struct ProgrammerLiveQueryTool {
+    context: ArchitectAdminToolContext,
+}
+
+const PROGRAMMER_QUERY_ALLOWED_ACTIONS: &[&str] = &[
+    "list_runtimes",
+    "get_runtime",
+    "inventory",
+    "list_nodes",
+    "get_node_status",
+    "get_node_config",
+    "list_routes",
+    "hive_status",
+    "list_versions",
+    "get_versions",
+];
+
+#[async_trait]
+impl FunctionTool for ProgrammerLiveQueryTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        let allowed = PROGRAMMER_QUERY_ALLOWED_ACTIONS.join(", ");
+        FunctionToolDefinition {
+            name: "query_hive".to_string(),
+            description: format!(
+                "Run a read-only admin query against the hive to get live state before generating the plan. \
+                Use this to check which runtimes are available, which nodes are running, what routes exist, etc. \
+                Do NOT use this for mutations — only for reads. Allowed actions: {allowed}."
+            ),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["action"],
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "The read-only admin action to run."
+                    },
+                    "hive": {
+                        "type": "string",
+                        "description": "Target hive. Defaults to the task hive if omitted."
+                    },
+                    "params": {
+                        "type": "object",
+                        "description": "Optional params for the action (e.g. {\"runtime\": \"AI.common\"} for get_runtime)."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let action = arguments
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol("query_hive requires 'action'".to_string())
+            })?
+            .to_string();
+
+        if !PROGRAMMER_QUERY_ALLOWED_ACTIONS.contains(&action.as_str()) {
+            return Err(fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                "query_hive: action '{}' is not allowed — only read-only actions are permitted",
+                action
+            )));
+        }
+
+        let hive = arguments
+            .get("hive")
+            .and_then(Value::as_str)
+            .unwrap_or(&self.context.hive_id)
+            .to_string();
+
+        let params = arguments
+            .get("params")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+
+        execute_admin_action_with_context(
+            &self.context,
+            &format!("SY.admin@{hive}"),
+            &action,
+            Some(&hive),
+            params,
+            "programmer.live_query",
         )
         .await
         .map_err(|e| fluxbee_ai_sdk::AiSdkError::Protocol(e.to_string()))
