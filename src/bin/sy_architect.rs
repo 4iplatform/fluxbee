@@ -9487,6 +9487,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
       border-radius: 10px;
       padding: 8px 10px;
       display: none;
+      white-space: pre-line;
+    }}
+    .publish-result.progress {{
+      background: var(--panel-soft);
+      color: var(--muted);
+      border: 1px solid var(--line);
+      display: block;
     }}
     .publish-result.ok {{
       background: var(--success-soft);
@@ -11686,8 +11693,20 @@ fn architect_index_html(state: &ArchitectState) -> String {
 
     // ── Publish Software panel ─────────────────────────────────
     let publishSelectedFile = null;
+    let publishProgressLines = [];
     function isZipPublishFile(file) {{
       return !!(file && file.name && file.name.toLowerCase().endsWith(".zip"));
+    }}
+    function resetPublishProgress() {{
+      publishProgressLines = [];
+    }}
+    function renderPublishProgress() {{
+      publishResult.className = "publish-result progress";
+      publishResult.textContent = publishProgressLines.join("\n");
+    }}
+    function pushPublishProgress(line) {{
+      publishProgressLines.push(line);
+      renderPublishProgress();
     }}
     function publishSetFile(file) {{
       if (!file) {{
@@ -11702,6 +11721,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       if (publishRelaunchCurrent) publishRelaunchCurrent.checked = false;
       if (publishRelaunchWrap) publishRelaunchWrap.style.display = isZip ? "none" : "";
       publishOptions.style.display = "";
+      resetPublishProgress();
       publishResult.className = "publish-result";
       publishResult.textContent = "";
     }}
@@ -11722,8 +11742,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
     publishBtn.addEventListener("click", async () => {{
       if (!publishSelectedFile) return;
       publishBtn.disabled = true;
-      publishResult.className = "publish-result";
-      publishResult.textContent = "Uploading...";
+      resetPublishProgress();
+      pushPublishProgress("1. Uploading file...");
       try {{
         const formData = new FormData();
         formData.append("file", publishSelectedFile, publishSelectedFile.name);
@@ -11734,7 +11754,17 @@ fn architect_index_html(state: &ArchitectState) -> String {
         }}
         const blobName = uploadData.attachment.blob_ref && uploadData.attachment.blob_ref.blob_name;
         if (!blobName) throw new Error("No blob_name in upload response");
-        publishResult.textContent = "Publishing...";
+        pushPublishProgress("2. Upload complete.");
+        if (uploadData.upload_kind === "bundle_upload") {{
+          pushPublishProgress("3. Publishing ZIP package...");
+        }} else {{
+          pushPublishProgress("3. Resolving runtime from executable name...");
+          pushPublishProgress("4. Building package from executable...");
+          pushPublishProgress("5. Publishing generated package...");
+          if (publishRelaunchCurrent && publishRelaunchCurrent.checked) {{
+            pushPublishProgress("6. Relaunching matching node(s) on this hive if publish succeeds...");
+          }}
+        }}
         let pubRes;
         if (uploadData.upload_kind === "bundle_upload") {{
           pubRes = await fetch(packagePublishUrl, {{
@@ -11772,20 +11802,30 @@ fn architect_index_html(state: &ArchitectState) -> String {
                 + (typeof relaunch.matched_nodes === "number" ? " (" + relaunch.matched_nodes + " node(s))" : "")
             : "";
           publishResult.className = "publish-result ok";
-          publishResult.textContent = "Published" + (name ? ": " + name + (ver ? " v" + ver : "") : "") + summary + relaunchSummary + " ✓";
+          publishResult.textContent =
+            publishProgressLines.join("\n")
+            + "\n"
+            + "Published"
+            + (name ? ": " + name + (ver ? " v" + ver : "") : "")
+            + summary
+            + relaunchSummary
+            + " ✓";
           publishOptions.style.display = "none";
           publishSelectedFile = null;
+          resetPublishProgress();
         }} else {{
           const errMsg = pubData.error
             || (pubData.publish && (pubData.publish.error || (pubData.publish.payload && pubData.publish.payload.error_detail)))
             || (pubData.payload && pubData.payload.error_detail)
             || "Publish failed";
           publishResult.className = "publish-result err";
-          publishResult.textContent = typeof errMsg === "string" ? errMsg : JSON.stringify(errMsg);
+          publishResult.textContent = publishProgressLines.join("\n") + "\nError: " + (typeof errMsg === "string" ? errMsg : JSON.stringify(errMsg));
+          resetPublishProgress();
         }}
       }} catch (err) {{
         publishResult.className = "publish-result err";
-        publishResult.textContent = "Error: " + err;
+        publishResult.textContent = publishProgressLines.join("\n") + "\nError: " + err;
+        resetPublishProgress();
       }} finally {{
         publishBtn.disabled = false;
       }}
