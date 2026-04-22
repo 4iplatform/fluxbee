@@ -3056,6 +3056,20 @@ fn software_blob_path(state: &ArchitectState, blob_name: &str) -> Result<PathBuf
         .join(trimmed))
 }
 
+fn software_blob_rel_path(blob_name: &str) -> Result<String, ArchitectError> {
+    let trimmed = blob_name.trim();
+    if trimmed.is_empty() {
+        return Err("blob_name is required".into());
+    }
+    BlobToolkit::validate_blob_name(trimmed)
+        .map_err(|err| format!("invalid software blob_name '{trimmed}': {err}"))?;
+    Ok(format!(
+        "active/{}/{}",
+        BlobToolkit::prefix(trimmed),
+        trimmed
+    ))
+}
+
 fn load_architect_runtime_manifest() -> Result<Option<RuntimeManifest>, ArchitectError> {
     load_runtime_manifest_from_paths(&[PathBuf::from(DIST_RUNTIME_MANIFEST_PATH)])
         .map_err(|err| err.into())
@@ -4313,6 +4327,15 @@ async fn handle_package_publish_request(
     if blob_name.is_empty() {
         return json!({ "status": "error", "error": "blob_name is required" });
     }
+    let blob_path = match software_blob_rel_path(&blob_name) {
+        Ok(value) => value,
+        Err(err) => {
+            return json!({
+                "status": "error",
+                "error": err.to_string(),
+            });
+        }
+    };
     let set_current = req.set_current.unwrap_or(true);
     let translation = AdminTranslation {
         admin_target: format!("SY.admin@{}", state.hive_id),
@@ -4321,7 +4344,7 @@ async fn handle_package_publish_request(
         params: json!({
             "source": {
                 "kind": "bundle_upload",
-                "blob_path": blob_name
+                "blob_path": blob_path
             },
             "set_current": set_current,
             "sync_to": req.sync_to,
