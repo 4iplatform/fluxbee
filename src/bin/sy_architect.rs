@@ -3091,6 +3091,17 @@ fn architect_runtime_manifest_entry_map(
     Ok(out)
 }
 
+fn runtime_case_variants(
+    entries: &BTreeMap<String, RuntimeManifestEntry>,
+    runtime_name: &str,
+) -> Vec<String> {
+    entries
+        .keys()
+        .filter(|name| name.eq_ignore_ascii_case(runtime_name))
+        .cloned()
+        .collect()
+}
+
 fn sanitize_exec_name(raw: &str, runtime_name: &str) -> String {
     let fallback = runtime_name
         .split('.')
@@ -3390,6 +3401,27 @@ fn resolve_software_publish(
         .as_ref()
         .map(architect_runtime_manifest_entry_map)
         .transpose()?;
+    if let Some(entries) = runtime_entries.as_ref() {
+        let variants = runtime_case_variants(entries, &runtime_name);
+        if variants.len() > 1 {
+            return Err(format!(
+                "runtime naming conflict for '{}': found case variants [{}]. Executable upload pilot stopped to avoid publishing another duplicate runtime; use ZIP publish or clean up legacy naming first",
+                runtime_name,
+                variants.join(", ")
+            )
+            .into());
+        }
+        if let Some(existing_variant) = variants.first() {
+            if existing_variant != &runtime_name {
+                return Err(format!(
+                    "runtime '{}' exists as legacy-cased '{}'. Executable upload pilot currently publishes lowercase runtime names only and would create a duplicate; use ZIP publish or migrate naming first",
+                    runtime_name,
+                    existing_variant
+                )
+                .into());
+            }
+        }
+    }
     let existing_entry = runtime_entries
         .as_ref()
         .and_then(|entries| entries.get(&runtime_name))
@@ -11999,6 +12031,34 @@ mod tests {
             "0.1.4-archi.1776809030"
         );
         assert_eq!(suggest_binary_runtime_version(None, 1776809030), "1.0.0");
+    }
+
+    #[test]
+    fn runtime_case_variants_detects_legacy_conflicts() {
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "IO.api".to_string(),
+            RuntimeManifestEntry {
+                available: vec!["0.1.5".to_string()],
+                current: Some("0.1.5".to_string()),
+                package_type: Some("full_runtime".to_string()),
+                runtime_base: None,
+                extra: BTreeMap::new(),
+            },
+        );
+        entries.insert(
+            "io.api".to_string(),
+            RuntimeManifestEntry {
+                available: vec!["1.0.0".to_string()],
+                current: Some("1.0.0".to_string()),
+                package_type: Some("full_runtime".to_string()),
+                runtime_base: None,
+                extra: BTreeMap::new(),
+            },
+        );
+        let mut variants = runtime_case_variants(&entries, "io.api");
+        variants.sort();
+        assert_eq!(variants, vec!["IO.api".to_string(), "io.api".to_string()]);
     }
 
     #[test]
