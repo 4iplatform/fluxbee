@@ -106,17 +106,15 @@ fn write_file(path: &Path, content: &str) -> Result<(), String> {
         fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create directory '{}': {e}", parent.display()))?;
     }
-    fs::write(path, content)
-        .map_err(|e| format!("failed to write '{}': {e}", path.display()))?;
+    fs::write(path, content).map_err(|e| format!("failed to write '{}': {e}", path.display()))?;
     Ok(())
 }
 
 fn read_package_json(dir: &Path) -> Result<serde_json::Value, String> {
     let path = dir.join("package.json");
-    let raw = fs::read_to_string(&path)
-        .map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
-    serde_json::from_str(&raw)
-        .map_err(|e| format!("invalid JSON in '{}': {e}", path.display()))
+    let raw =
+        fs::read_to_string(&path).map_err(|e| format!("cannot read '{}': {e}", path.display()))?;
+    serde_json::from_str(&raw).map_err(|e| format!("invalid JSON in '{}': {e}", path.display()))
 }
 
 // ── usage ────────────────────────────────────────────────────────────────────
@@ -189,7 +187,9 @@ fn parse_new_args(args: &[String]) -> Result<ScaffoldArgs, String> {
             "--type" => {
                 let v = args.get(i + 1).ok_or("missing value for --type")?;
                 package_type = Some(PackageType::from_str(v).ok_or_else(|| {
-                    format!("unknown package type: '{v}' (valid: full_runtime, config_only, workflow)")
+                    format!(
+                        "unknown package type: '{v}' (valid: full_runtime, config_only, workflow)"
+                    )
                 })?);
                 i += 2;
             }
@@ -215,8 +215,10 @@ fn parse_new_args(args: &[String]) -> Result<ScaffoldArgs, String> {
     validate_runtime_name(&name)?;
     validate_semver(&version)?;
 
-    if matches!(package_type, PackageType::ConfigOnly | PackageType::Workflow)
-        && runtime_base.is_none()
+    if matches!(
+        package_type,
+        PackageType::ConfigOnly | PackageType::Workflow
+    ) && runtime_base.is_none()
     {
         return Err(format!(
             "--base is required for package type '{}'",
@@ -286,7 +288,12 @@ fn parse_args(args: &[String]) -> Result<Subcommand, String> {
                 // top-level flags that look like new's flags — treat as implicit "new"
                 return parse_new_args(&args[i..]).map(Subcommand::New);
             }
-            _ => return Err(format!("unknown subcommand: '{}' (use 'new' or 'pack')", args[i])),
+            _ => {
+                return Err(format!(
+                    "unknown subcommand: '{}' (use 'new' or 'pack')",
+                    args[i]
+                ))
+            }
         }
     }
 
@@ -307,12 +314,14 @@ fn scaffold_full_runtime(pkg_dir: &Path) -> Result<Vec<PathBuf>, String> {
         .map_err(|e| format!("stat bin/start.sh: {e}"))?
         .permissions();
     perms.set_mode(0o755);
-    fs::set_permissions(&start_sh, perms)
-        .map_err(|e| format!("chmod bin/start.sh: {e}"))?;
+    fs::set_permissions(&start_sh, perms).map_err(|e| format!("chmod bin/start.sh: {e}"))?;
     created.push(start_sh);
 
     let prompt = pkg_dir.join("assets/prompts/system.txt");
-    write_file(&prompt, "# System prompt\nReplace with your system prompt.\n")?;
+    write_file(
+        &prompt,
+        "# System prompt\nReplace with your system prompt.\n",
+    )?;
     created.push(prompt);
 
     let config = pkg_dir.join("config/default-config.json");
@@ -439,7 +448,10 @@ fn run_new(args: ScaffoldArgs) -> Result<(), CliError> {
     println!("Done. Next steps:");
     match args.package_type {
         PackageType::FullRuntime => {
-            println!("  1. Add your compiled binary as  {}/bin/start.sh", args.name);
+            println!(
+                "  1. Add your compiled binary as  {}/bin/start.sh",
+                args.name
+            );
             println!("  2. Edit assets and config as needed");
             println!(
                 "  3. fluxbee-scaffold pack ./{} --binary ./target/release/<binary>",
@@ -469,14 +481,14 @@ fn zip_dir_into(src: &Path, zip_writer: &mut zip::ZipWriter<fs::File>) -> Result
 
     let mut stack = vec![src.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = fs::read_dir(&dir)
-            .map_err(|e| format!("read_dir '{}': {e}", dir.display()))?;
+        let entries =
+            fs::read_dir(&dir).map_err(|e| format!("read_dir '{}': {e}", dir.display()))?;
 
         for entry in entries {
             let entry = entry.map_err(|e| format!("dir entry: {e}"))?;
             let path = entry.path();
-            let meta = fs::metadata(&path)
-                .map_err(|e| format!("metadata '{}': {e}", path.display()))?;
+            let meta =
+                fs::metadata(&path).map_err(|e| format!("metadata '{}': {e}", path.display()))?;
 
             // relative path inside the zip (no leading ./)
             let rel = path
@@ -492,8 +504,8 @@ fn zip_dir_into(src: &Path, zip_writer: &mut zip::ZipWriter<fs::File>) -> Result
                 zip_writer
                     .start_file(&zip_path, opts)
                     .map_err(|e| format!("zip start_file '{}': {e}", zip_path))?;
-                let bytes = fs::read(&path)
-                    .map_err(|e| format!("read '{}': {e}", path.display()))?;
+                let bytes =
+                    fs::read(&path).map_err(|e| format!("read '{}': {e}", path.display()))?;
                 zip_writer
                     .write_all(&bytes)
                     .map_err(|e| format!("zip write '{}': {e}", zip_path))?;
@@ -540,15 +552,10 @@ fn run_pack(args: PackArgs) -> Result<(), CliError> {
             return Err(format!("binary not found: '{}'", binary_src.display()).into());
         }
         let bin_dir = pkg_dir.join("bin");
-        fs::create_dir_all(&bin_dir)
-            .map_err(|e| format!("create bin/: {e}"))?;
+        fs::create_dir_all(&bin_dir).map_err(|e| format!("create bin/: {e}"))?;
         let start_sh = bin_dir.join("start.sh");
-        fs::copy(binary_src, &start_sh).map_err(|e| {
-            format!(
-                "copy '{}' → 'bin/start.sh': {e}",
-                binary_src.display()
-            )
-        })?;
+        fs::copy(binary_src, &start_sh)
+            .map_err(|e| format!("copy '{}' → 'bin/start.sh': {e}", binary_src.display()))?;
         let mut perms = fs::metadata(&start_sh)?.permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&start_sh, perms)?;
@@ -561,7 +568,8 @@ fn run_pack(args: PackArgs) -> Result<(), CliError> {
             let start_sh = pkg_dir.join("bin/start.sh");
             if !start_sh.exists() {
                 return Err(
-                    "bin/start.sh not found — pass --binary <path> to copy your compiled binary".into(),
+                    "bin/start.sh not found — pass --binary <path> to copy your compiled binary"
+                        .into(),
                 );
             }
             let mode = fs::metadata(&start_sh)?.permissions().mode();
@@ -581,18 +589,16 @@ fn run_pack(args: PackArgs) -> Result<(), CliError> {
     let zip_path = match &args.output {
         Some(p) => p.clone(),
         None => {
-            let parent = pkg_dir
-                .parent()
-                .unwrap_or_else(|| Path::new("."));
+            let parent = pkg_dir.parent().unwrap_or_else(|| Path::new("."));
             parent.join(format!("{name}-{version}.zip"))
         }
     };
 
-    let zip_file = fs::File::create(&zip_path)
-        .map_err(|e| format!("create '{}': {e}", zip_path.display()))?;
+    let zip_file =
+        fs::File::create(&zip_path).map_err(|e| format!("create '{}': {e}", zip_path.display()))?;
     let mut zip_writer = zip::ZipWriter::new(zip_file);
-    let file_count = zip_dir_into(&pkg_dir, &mut zip_writer)
-        .map_err(|e| -> CliError { e.into() })?;
+    let file_count =
+        zip_dir_into(&pkg_dir, &mut zip_writer).map_err(|e| -> CliError { e.into() })?;
     zip_writer
         .finish()
         .map_err(|e| format!("zip finish: {e}"))?;
@@ -605,7 +611,10 @@ fn run_pack(args: PackArgs) -> Result<(), CliError> {
         zip_bytes / 1024
     );
     println!();
-    println!("Done. Upload {} via Archi Publish Package panel.", zip_path.display());
+    println!(
+        "Done. Upload {} via Archi Publish Package panel.",
+        zip_path.display()
+    );
 
     Ok(())
 }
@@ -664,8 +673,17 @@ mod tests {
 
     #[test]
     fn parse_new_minimal_full_runtime() {
-        let a = parse_args(&prog_args(&["new", "--name", "sy.node.test", "--type", "full_runtime"])).unwrap();
-        let Subcommand::New(a) = a else { panic!("expected New") };
+        let a = parse_args(&prog_args(&[
+            "new",
+            "--name",
+            "sy.node.test",
+            "--type",
+            "full_runtime",
+        ]))
+        .unwrap();
+        let Subcommand::New(a) = a else {
+            panic!("expected New")
+        };
         assert_eq!(a.name, "sy.node.test");
         assert_eq!(a.version, "0.1.0");
         assert_eq!(a.package_type, PackageType::FullRuntime);
@@ -674,28 +692,57 @@ mod tests {
     #[test]
     fn parse_new_implicit_subcommand_compatibility() {
         // old-style: no "new" keyword, flags directly
-        let a = parse_args(&prog_args(&["--name", "sy.node.test", "--type", "full_runtime"])).unwrap();
-        let Subcommand::New(a) = a else { panic!("expected New") };
+        let a = parse_args(&prog_args(&[
+            "--name",
+            "sy.node.test",
+            "--type",
+            "full_runtime",
+        ]))
+        .unwrap();
+        let Subcommand::New(a) = a else {
+            panic!("expected New")
+        };
         assert_eq!(a.name, "sy.node.test");
     }
 
     #[test]
     fn parse_new_config_only_requires_base() {
-        let err = parse_args(&prog_args(&["new", "--name", "ai.billing", "--type", "config_only"]))
-            .unwrap_err();
+        let err = parse_args(&prog_args(&[
+            "new",
+            "--name",
+            "ai.billing",
+            "--type",
+            "config_only",
+        ]))
+        .unwrap_err();
         assert!(err.contains("--base is required"), "err={err}");
     }
 
     #[test]
     fn parse_new_rejects_bad_name() {
-        let err = parse_args(&prog_args(&["new", "--name", "AI.Bad", "--type", "full_runtime"])).unwrap_err();
+        let err = parse_args(&prog_args(&[
+            "new",
+            "--name",
+            "AI.Bad",
+            "--type",
+            "full_runtime",
+        ]))
+        .unwrap_err();
         assert!(err.contains("naming policy"), "err={err}");
     }
 
     #[test]
     fn parse_new_rejects_bad_version() {
-        let err = parse_args(&prog_args(&["new", "--name", "sy.ok", "--type", "full_runtime", "--version", "v1"]))
-            .unwrap_err();
+        let err = parse_args(&prog_args(&[
+            "new",
+            "--name",
+            "sy.ok",
+            "--type",
+            "full_runtime",
+            "--version",
+            "v1",
+        ]))
+        .unwrap_err();
         assert!(err.contains("not valid semver"), "err={err}");
     }
 
@@ -704,7 +751,9 @@ mod tests {
     #[test]
     fn parse_pack_minimal() {
         let a = parse_args(&prog_args(&["pack", "./some/dir"])).unwrap();
-        let Subcommand::Pack(a) = a else { panic!("expected Pack") };
+        let Subcommand::Pack(a) = a else {
+            panic!("expected Pack")
+        };
         assert_eq!(a.package_dir, PathBuf::from("./some/dir"));
         assert!(a.binary.is_none());
         assert!(a.output.is_none());
@@ -713,11 +762,17 @@ mod tests {
     #[test]
     fn parse_pack_with_binary_and_output() {
         let a = parse_args(&prog_args(&[
-            "pack", "./pkg",
-            "--binary", "./target/release/my-bin",
-            "--output", "/tmp/my-pkg.zip",
-        ])).unwrap();
-        let Subcommand::Pack(a) = a else { panic!("expected Pack") };
+            "pack",
+            "./pkg",
+            "--binary",
+            "./target/release/my-bin",
+            "--output",
+            "/tmp/my-pkg.zip",
+        ]))
+        .unwrap();
+        let Subcommand::Pack(a) = a else {
+            panic!("expected Pack")
+        };
         assert_eq!(a.binary.unwrap(), PathBuf::from("./target/release/my-bin"));
         assert_eq!(a.output.unwrap(), PathBuf::from("/tmp/my-pkg.zip"));
     }
@@ -739,7 +794,8 @@ mod tests {
             package_type: PackageType::FullRuntime,
             runtime_base: None,
             output_dir: out.clone(),
-        }).unwrap();
+        })
+        .unwrap();
 
         let pkg = out.join("sy.scaffold.test");
         assert!(pkg.join("package.json").exists());
@@ -747,7 +803,11 @@ mod tests {
         assert!(pkg.join("assets/prompts/system.txt").exists());
         assert!(pkg.join("config/default-config.json").exists());
 
-        let mode = fs::metadata(pkg.join("bin/start.sh")).unwrap().permissions().mode() & 0o777;
+        let mode = fs::metadata(pkg.join("bin/start.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o755);
 
         let _ = fs::remove_dir_all(out);
@@ -762,7 +822,8 @@ mod tests {
             package_type: PackageType::ConfigOnly,
             runtime_base: Some("ai.generic".to_string()),
             output_dir: out.clone(),
-        }).unwrap();
+        })
+        .unwrap();
 
         let pkg = out.join("ai.billing.test");
         assert!(pkg.join("package.json").exists());
@@ -784,7 +845,8 @@ mod tests {
             package_type: PackageType::FullRuntime,
             runtime_base: None,
             output_dir: out.clone(),
-        }).unwrap_err();
+        })
+        .unwrap_err();
         assert!(err.to_string().contains("already exists"), "err={err}");
         let _ = fs::remove_dir_all(out);
     }
@@ -802,7 +864,8 @@ mod tests {
             package_type: PackageType::ConfigOnly,
             runtime_base: Some("ai.generic".to_string()),
             output_dir: out.clone(),
-        }).unwrap();
+        })
+        .unwrap();
 
         let pkg_dir = out.join("ai.pack.test");
         let zip_path = out.join("ai.pack.test-1.2.3.zip");
@@ -811,7 +874,8 @@ mod tests {
             package_dir: pkg_dir.clone(),
             binary: None,
             output: Some(zip_path.clone()),
-        }).unwrap();
+        })
+        .unwrap();
 
         assert!(zip_path.exists());
         assert!(zip_path.metadata().unwrap().len() > 0);
@@ -822,7 +886,10 @@ mod tests {
             .map(|i| archive.by_index(i).unwrap().name().to_string())
             .collect();
         assert!(names.iter().any(|n| n == "package.json"), "names={names:?}");
-        assert!(names.iter().any(|n| n.contains("system.txt")), "names={names:?}");
+        assert!(
+            names.iter().any(|n| n.contains("system.txt")),
+            "names={names:?}"
+        );
 
         let _ = fs::remove_dir_all(out);
     }
@@ -837,7 +904,8 @@ mod tests {
             package_type: PackageType::FullRuntime,
             runtime_base: None,
             output_dir: out.clone(),
-        }).unwrap();
+        })
+        .unwrap();
 
         // create a fake compiled binary
         let fake_bin = out.join("fake-binary");
@@ -851,7 +919,8 @@ mod tests {
             package_dir: out.join("sy.pack.full"),
             binary: Some(fake_bin),
             output: Some(zip_path.clone()),
-        }).unwrap();
+        })
+        .unwrap();
 
         assert!(zip_path.exists());
         let mut archive = zip::ZipArchive::new(fs::File::open(&zip_path).unwrap()).unwrap();
@@ -873,14 +942,19 @@ mod tests {
         fs::write(
             pkg.join("package.json"),
             r#"{"name":"sy.no.start","version":"0.1.0","type":"full_runtime"}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let err = run_pack(PackArgs {
             package_dir: pkg,
             binary: None,
             output: None,
-        }).unwrap_err();
-        assert!(err.to_string().contains("bin/start.sh not found"), "err={err}");
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("bin/start.sh not found"),
+            "err={err}"
+        );
 
         let _ = fs::remove_dir_all(out);
     }
@@ -895,13 +969,15 @@ mod tests {
             package_type: PackageType::ConfigOnly,
             runtime_base: Some("ai.generic".to_string()),
             output_dir: out.clone(),
-        }).unwrap();
+        })
+        .unwrap();
 
         run_pack(PackArgs {
             package_dir: out.join("ai.default.name"),
             binary: None,
             output: None,
-        }).unwrap();
+        })
+        .unwrap();
 
         // default zip should land next to the package dir
         assert!(out.join("ai.default.name-2.0.0.zip").exists());

@@ -250,7 +250,7 @@ Optional follow-up operations after publish:
   - Canonical negative harness migration started in `scripts/runtime_packaging_pub_t25_e2e.sh`.
   - Covered there now and validated on a live setup: missing runtime base, unknown base runtime, base runtime present in manifest but not materialized/ready.
   - Pending in a canonical E2E harness: duplicate version conflict and publish from non-`motherbee`.
-- [ ] RPP-F6. E2E Archi plan flow.
+- [x] RPP-F6. E2E Archi plan flow.
   - manifest/execution plan publishes package
   - deploys it
   - spawns/restarts managed node
@@ -258,6 +258,62 @@ Optional follow-up operations after publish:
   - The harness drives `SY.architect` `/api/executor/plan` with two real execution plans:
     - publish via `publish_runtime_package`
     - spawn via `run_node`
+  - Validated on a live setup through `runtime_packaging_pub_archi_plan_e2e.sh`.
+
+### Phase G - Archi Software Upload Pilot
+
+- [x] RPP-G1. Freeze the pilot UX contract for `zip or executable` upload in Archi.
+  - Keep the current ZIP publish path untouched.
+  - Add a parallel executable upload mechanism in `SY.architect` only.
+  - Do not change `SY.admin`, `SY.orchestrator`, or canonical publish/spawn semantics.
+- [x] RPP-G2. Add a dedicated Archi upload path for software files.
+  - Separate from generic chat attachments.
+  - Accept one `.zip` or one executable-like file per request.
+  - Keep the frontend entry point as one visual "publish software" door.
+- [x] RPP-G3. Implement runtime resolution from uploaded executable name.
+  - Normalize to core runtime naming policy (`lowercase + dots`).
+  - Support pilot shortcuts:
+    - `ai` or `ai-common` -> `ai.common`
+    - `wf` or `wf-common` -> `wf.common`
+    - `io-*` -> `io.*`
+  - Return operator-facing resolution info:
+    - `existing runtime -> new version`
+    - `new runtime -> first version`
+- [x] RPP-G4. For executable uploads, assemble a server-side `full_runtime` package in `SY.architect`.
+  - New runtime:
+    - generate minimal `package.json`
+    - generate `bin/start.sh`
+    - install uploaded executable under `bin/`
+  - Existing runtime:
+    - clone the current published package
+    - preserve package assets and wrapper
+    - replace only the executable payload
+  - Current pilot limitation:
+    - executable replacement on existing runtimes requires one unambiguous binary under `bin/` besides `start.sh`
+- [x] RPP-G5. Publish executable-derived packages through the existing canonical publish path.
+  - `SY.architect` generates an internal ZIP bundle.
+  - `SY.architect` then calls the existing `publish_runtime_package(bundle_upload)` path.
+  - No new publish action in `SY.admin`.
+  - Guard added:
+    - `SY.architect` rejects legacy runtime case-variant conflicts during executable resolution
+    - shared runtime packaging core rejects case-only manifest collisions such as `IO.api` vs `io.api`
+- [x] RPP-G6. Restrict the pilot to `full_runtime`.
+  - Do not support `config_only` or `workflow` through raw executable upload in the pilot.
+  - Reject existing runtimes whose current package is not `full_runtime`.
+- [x] RPP-G7. Add operator-visible publish result summary for executable uploads.
+  - Show resolved runtime name.
+  - Show whether Archi treated the publish as update or first publish.
+  - Show the new version that was generated.
+- [x] RPP-G8. Add optional post-publish relaunch as a separate pilot follow-up.
+  - Do not merge publish and node lifecycle semantics.
+  - If enabled, Archi should restart/start the affected node instance against `current`.
+  - Keep this behind an explicit frontend control.
+  - Implemented:
+    - Archi frontend checkbox on executable uploads
+    - `SY.architect` follow-up that lists matching nodes for the runtime on the current hive and issues `restart_node` or `start_node`
+  - Current pilot scope:
+    - relaunch applies to matching managed nodes on the current Archi hive
+    - no per-node picker yet
   - Pending: execute it against a live Archi + admin setup and capture final pass/fail.
 
 ### Phase G - Deprecation and Cleanup

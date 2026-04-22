@@ -682,6 +682,16 @@ fn next_manifest_version_ms(now_ms: u64, current_manifest_version: u64) -> u64 {
     }
 }
 
+fn runtime_case_conflict(
+    runtime_map: &serde_json::Map<String, serde_json::Value>,
+    runtime_name: &str,
+) -> Option<String> {
+    runtime_map
+        .keys()
+        .find(|existing| existing.as_str() != runtime_name && existing.eq_ignore_ascii_case(runtime_name))
+        .cloned()
+}
+
 pub fn update_runtime_manifest_with_package(
     manifest_path: &Path,
     validated: &ValidatedPackage,
@@ -706,6 +716,12 @@ pub fn update_runtime_manifest_with_package(
             manifest_path.display()
         )
     })?;
+    if let Some(conflict) = runtime_case_conflict(runtime_map, &validated.metadata.name) {
+        return Err(format!(
+            "manifest update failed: runtime '{}' conflicts by case with existing runtime '{}'; normalize runtime names before publishing",
+            validated.metadata.name, conflict
+        ));
+    }
 
     let existing = runtime_map.get(&validated.metadata.name).cloned();
     let mut entry = match existing {
@@ -931,6 +947,47 @@ mod tests {
         let err = install_validated_package(&validated, &runtimes_root, &manifest_path)
             .expect_err("different contents must conflict");
         assert!(err.contains("different contents"), "err={err}");
+
+        let _ = fs::remove_dir_all(package_dir);
+        let _ = fs::remove_dir_all(dist_root);
+    }
+
+    #[test]
+    fn update_runtime_manifest_with_package_rejects_case_only_runtime_conflict() {
+        let package_dir = test_temp_dir("case-conflict-src");
+        write_file(
+            &package_dir.join("package.json"),
+            "{\n  \"name\": \"io.api\",\n  \"version\": \"1.0.0\",\n  \"type\": \"full_runtime\"\n}",
+        );
+        let start_sh = package_dir.join("bin/start.sh");
+        write_file(&start_sh, "#!/usr/bin/env bash\necho ok\n");
+        make_executable(&start_sh);
+
+        let dist_root = test_temp_dir("case-conflict-dist");
+        let runtimes_root = dist_root.join("runtimes");
+        fs::create_dir_all(&runtimes_root).expect("create runtimes root");
+        let manifest_path = runtimes_root.join("manifest.json");
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-04-20T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({
+                "IO.api": {
+                    "available": ["0.1.5"],
+                    "current": "0.1.5",
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+        write_runtime_manifest_file_atomic(&manifest_path, &manifest, false)
+            .expect("seed manifest");
+
+        let validated = validate_package(&package_dir, None).expect("validate source");
+        let err = update_runtime_manifest_with_package(&manifest_path, &validated)
+            .expect_err("case-only runtime conflict must fail");
+        assert!(err.contains("conflicts by case"), "err={err}");
+        assert!(err.contains("IO.api"), "err={err}");
 
         let _ = fs::remove_dir_all(package_dir);
         let _ = fs::remove_dir_all(dist_root);
