@@ -294,6 +294,9 @@ Optional follow-up operations after publish:
   - `SY.architect` generates an internal ZIP bundle.
   - `SY.architect` then calls the existing `publish_runtime_package(bundle_upload)` path.
   - No new publish action in `SY.admin`.
+  - Guard added:
+    - `SY.architect` rejects legacy runtime case-variant conflicts during executable resolution
+    - shared runtime packaging core rejects case-only manifest collisions such as `IO.api` vs `io.api`
 - [x] RPP-G6. Restrict the pilot to `full_runtime`.
   - Do not support `config_only` or `workflow` through raw executable upload in the pilot.
   - Reject existing runtimes whose current package is not `full_runtime`.
