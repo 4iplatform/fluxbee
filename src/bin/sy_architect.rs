@@ -1825,33 +1825,49 @@ impl FunctionTool for ArchitectProgrammerTool {
             };
 
         // Pre-validate the plan against the executor before presenting to the user.
-        // If it fails, retry the programmer once with the validation error as feedback.
+        // execute_admin_action_with_context always returns Ok at the transport level;
+        // we have to check the response body status to know if validation actually passed.
         let admin_target = format!("SY.admin@{}", self.context.hive_id);
-        let output = match execute_admin_action_with_context(
-            &self.context,
-            &admin_target,
-            "executor_validate_plan",
-            None,
-            output.plan.clone(),
-            "programmer.pre_validate",
-        )
-        .await
-        {
-            Ok(_) => output,
-            Err(validation_err) => {
-                tracing::warn!(error = %validation_err, "programmer plan failed pre-validation — retrying with feedback");
-                let feedback_context = format!(
-                    "{}\n\n[FEEDBACK] Your previous plan was rejected by the executor validator with this error: {}\nFix the plan and call submit_executor_plan again.",
-                    user_context, validation_err
-                );
-                run_programmer_with_context(&self.context, &task, &hive, &feedback_context)
-                    .await
-                    .map_err(|e| {
-                        fluxbee_ai_sdk::AiSdkError::Protocol(format!(
-                            "programmer retry failed: {e}"
-                        ))
-                    })?
-            }
+        let validation_error: Option<String> =
+            match execute_admin_action_with_context(
+                &self.context,
+                &admin_target,
+                "executor_validate_plan",
+                None,
+                output.plan.clone(),
+                "programmer.pre_validate",
+            )
+            .await
+            {
+                Err(e) => Some(e.to_string()),
+                Ok(val) => {
+                    if val.get("status").and_then(Value::as_str) != Some("ok") {
+                        Some(
+                            val.get("error_detail")
+                                .and_then(Value::as_str)
+                                .or_else(|| val.get("error_code").and_then(Value::as_str))
+                                .unwrap_or("executor validation failed")
+                                .to_string(),
+                        )
+                    } else {
+                        None
+                    }
+                }
+            };
+
+        let output = if let Some(err) = validation_error {
+            tracing::warn!(error = %err, "programmer plan failed pre-validation — retrying with feedback");
+            let feedback_context = format!(
+                "{}\n\n[FEEDBACK] Your previous plan was rejected by the executor validator with this error: {}\nCall get_admin_action_help for the failing action, then call submit_executor_plan with the corrected plan.",
+                user_context, err
+            );
+            run_programmer_with_context(&self.context, &task, &hive, &feedback_context)
+                .await
+                .map_err(|e| {
+                    fluxbee_ai_sdk::AiSdkError::Protocol(format!("programmer retry failed: {e}"))
+                })?
+        } else {
+            output
         };
 
         let pending = ProgrammerPendingPlan {
