@@ -41,7 +41,41 @@ Observacion operativa de este host Linux:
 
 - en este entorno `SY.frontdesk.gov` corre como servicio singleton `sy-frontdesk-gov.service`;
 - la unidad observada usa `ExecStart=/usr/bin/sy-frontdesk-gov`;
-- por lo tanto, si el runtime publicado en `dist` no impacta el proceso activo, la verificacion real debe hacerse contra ese servicio y ese binario.
+- por lo tanto, `publish runtime + update + restart` no alcanza por sí solo para asegurar que el proceso activo cambió de binario;
+- la verificacion real debe hacerse contra ese servicio y ese binario;
+- si queres que el proceso activo refleje el release nuevo, tenes que instalar el binario actualizado en `/usr/bin/sy-frontdesk-gov` o ejecutar el camino equivalente de `scripts/install.sh`.
+
+Paso a paso completo para este host:
+
+1. publicar `SY.frontdesk.gov` a `dist` y ejecutar `SYSTEM_UPDATE` targeted;
+2. compilar el binario real:
+
+```bash
+cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
+```
+
+3. instalarlo en el path usado por la unidad:
+
+```bash
+sudo install -m 0755 target/release/sy-frontdesk-gov /usr/bin/sy-frontdesk-gov
+```
+
+4. reiniciar el servicio:
+
+```bash
+sudo systemctl restart sy-frontdesk-gov.service
+sudo systemctl status sy-frontdesk-gov.service --no-pager -l
+```
+
+5. validar:
+
+```bash
+curl -sS "$BASE/hives/$HIVE_ID/nodes" | jq '.payload.nodes[] | select(.node_name=="SY.frontdesk.gov@motherbee")'
+sha256sum /usr/bin/sy-frontdesk-gov
+sha256sum "/var/lib/fluxbee/dist/runtimes/SY.frontdesk.gov/$FRONTDESK_VERSION/bin/sy-frontdesk-gov"
+```
+
+Si los hashes no coinciden, el servicio singleton no quedó alineado con el artefacto publicado.
 
 La razon es simple:
 

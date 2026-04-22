@@ -6,7 +6,7 @@ Desplegar y actualizar nodos IA por el camino canónico de Fluxbee:
 
 1. publish runtime en `dist/`
 2. `SYSTEM_UPDATE` en hive destino
-3. `SPAWN_NODE` o restart controlado
+3. `SPAWN_NODE` o restart controlado, segun el tipo de nodo
 
 Incluye dos perfiles:
 - nodo IA común (`AI.common`)
@@ -37,8 +37,12 @@ Decisión de ownership:
 
 Nota operativa vigente para frontdesk:
 - `SY.frontdesk.gov` sigue usando hoy el camino general de deploy de runtimes AI, pero debe leerse como runtime singleton `system-default` por hive.
+- para updates rutinarios, el proceso real esperado es el servicio singleton `sy-frontdesk-gov.service`.
+- en updates rutinarios, el camino correcto conceptual es `publish runtime + SYSTEM_UPDATE targeted + refresh del binario real del singleton + restart del servicio singleton`.
+- `spawn/delete/recreate` de `SY.frontdesk.gov` deben leerse como caminos excepcionales de bootstrap, reinstall o recuperación, no como el flujo normal de update.
 - el prompt funcional base del runtime no debería depender de que el operador lo cargue por `CONFIG_SET`.
 - la key de provider puede seguir entrando temporalmente por `CONFIG_SET` y persistirse en `secrets.json` mientras `CORE` define el modelo final para secretos de un AI de sistema crítico.
+- si el servicio observado usa `ExecStart=/usr/bin/sy-frontdesk-gov`, `publish + SYSTEM_UPDATE + restart` no alcanza por sí solo para cambiar el binario efectivo; primero hay que instalar el binario actualizado en `/usr/bin/sy-frontdesk-gov` o ejecutar el camino equivalente de `scripts/install.sh`.
 
 ---
 
@@ -73,6 +77,8 @@ bash scripts/deploy-ia-node.sh \
 
 ### 4.2 Frontdesk gov
 
+Para update rutinario de frontdesk, publicar runtime y luego alinear el binario que usa el servicio singleton:
+
 ```bash
 bash scripts/deploy-ia-node.sh \
   --base "$BASE" \
@@ -81,13 +87,36 @@ bash scripts/deploy-ia-node.sh \
   --version "0.1.0" \
   --sync-hint \
   --sudo
+
+cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
+sudo install -m 0755 target/release/sy-frontdesk-gov /usr/bin/sy-frontdesk-gov
+sudo systemctl restart sy-frontdesk-gov.service
+sudo systemctl status sy-frontdesk-gov.service --no-pager -l
+sha256sum /usr/bin/sy-frontdesk-gov
+sha256sum /var/lib/fluxbee/dist/runtimes/SY.frontdesk.gov/0.1.0/bin/sy-frontdesk-gov
 ```
+
+Si los hashes no coinciden, el servicio singleton sigue corriendo un binario distinto al runtime publicado.
+
+Si queres usar el camino de instalacion completo del host en vez del update puntual del binario:
+
+```bash
+bash scripts/install.sh
+```
+
+Ese camino tambien actualiza `dist/core/bin` y puede reiniciar otros servicios del core, por lo que debe tratarse como una operacion mas amplia que el update puntual de frontdesk.
 
 ---
 
 ## 5) Spawn de nodo (config opcional)
 
-Ejemplo frontdesk:
+Importante:
+
+- esta sección aplica al lifecycle managed/transient de nodos AI comunes;
+- en `SY.frontdesk.gov`, `spawn` no debe considerarse el camino rutinario de update;
+- usarlo solo para bootstrap explícito, reinstall o recuperación de estado roto.
+
+Ejemplo frontdesk solo para bootstrap controlado:
 
 ```bash
 bash scripts/deploy-ia-node.sh \
@@ -134,6 +163,11 @@ Los flags `--forced-node-name` y `--forced-dynamic-config-dir` quedan solo para 
 
 ## 6) Update de código de nodo existente
 
+Para `AI.common` y nodos managed similares, `--update-existing` sigue siendo el camino operativo esperado.
+
+Para `SY.frontdesk.gov`, no tomar esta sección como camino rutinario por defecto.
+La dirección vigente para frontdesk es singleton por hive, con restart del servicio local.
+
 ```bash
 bash scripts/deploy-ia-node.sh \
   --base "$BASE" \
@@ -151,6 +185,8 @@ bash scripts/deploy-ia-node.sh \
 - update con retries (`targeted` por defecto)
 - `GET config` del nodo actual
 - `DELETE` + `POST` reutilizando esa config
+
+Para frontdesk, usar este camino solo cuando sea explícito que se quiere tratarlo como reinstall/rebootstrap controlado y no como update conservador del singleton operativo.
 
 ### 6.1 Scope recomendado de update
 

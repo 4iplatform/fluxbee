@@ -42,7 +42,7 @@ Options:
   --skip-spawn                 Skip spawn step (default unless --node-name is set)
   --kill-first                 If spawning, call DELETE node before POST node
   --reuse-existing-config      Fetch config from GET /hives/{id}/nodes/{name}/config and reuse it for spawn
-  --update-existing            Shortcut: reuse existing config + kill-first + spawn (requires --node-name)
+  --update-existing            Existing node code update: reuse current config + restart unit (spawn only if unit missing)
   --sync-hint                  Run sync-hint before each update attempt
   --allow-sync-pending         Continue to spawn even if update stays sync_pending
   --update-retries <n>         Retries when update returns sync_pending (default: 8)
@@ -170,8 +170,8 @@ if [[ "$UPDATE_EXISTING" == "1" ]]; then
     echo "Error: --update-existing requires --node-name" >&2
     exit 1
   fi
-  DO_SPAWN=1
-  KILL_FIRST=1
+  DO_SPAWN=0
+  KILL_FIRST=0
   REUSE_EXISTING_CONFIG=1
 fi
 
@@ -183,12 +183,17 @@ log() {
   echo "[$(date -Iseconds)] $msg" | tee -a "$LOG_FILE"
 }
 
+log_stderr() {
+  local msg="$1"
+  echo "[$(date -Iseconds)] $msg" | tee -a "$LOG_FILE" >&2
+}
+
 fetch_existing_config_json() {
   if [[ -z "$NODE_NAME" ]]; then
     echo "Error: --reuse-existing-config requires --node-name" >&2
     exit 1
   fi
-  log "step=get_existing_config node_name=$NODE_NAME"
+  log_stderr "step=get_existing_config node_name=$NODE_NAME"
   local raw
   raw="$(curl -sS -X GET "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/config" | tee -a "$LOG_FILE")"
   RAW_CONFIG_RESPONSE="$raw" python3 - <<'PY'
@@ -227,6 +232,36 @@ if cfg is None:
 
 print(json.dumps(cfg, separators=(",", ":")))
 PY
+}
+
+derive_unit_name() {
+  local node="$1"
+  local base="${node%@*}"
+  local hive="${node##*@}"
+  if [[ "$base" == "$node" ]]; then
+    hive="$HIVE_ID"
+  fi
+  echo "fluxbee-node-${base}-${hive}.service"
+}
+
+restart_existing_unit_if_present() {
+  local node="$1"
+  local unit
+  unit="$(derive_unit_name "$node")"
+  local systemctl_cmd=("systemctl")
+  if [[ "$USE_SUDO" == "1" ]]; then
+    systemctl_cmd=("sudo" "systemctl")
+  fi
+
+  if "${systemctl_cmd[@]}" cat "$unit" >/dev/null 2>&1; then
+    log "step=restart_existing unit=$unit"
+    "${systemctl_cmd[@]}" restart "$unit"
+    log "restart_ok unit=$unit"
+    return 0
+  fi
+
+  log "restart_skipped unit_not_found=$unit"
+  return 1
 }
 
 build_spawn_config_json() {
@@ -451,8 +486,18 @@ if [[ "$UPDATE_STATUS" != "ok" ]]; then
 fi
 
 if [[ "$DO_SPAWN" != "1" ]]; then
-  log "deploy completed (publish+update). spawn skipped."
-  exit 0
+  if [[ "$UPDATE_EXISTING" == "1" && -n "$NODE_NAME" ]]; then
+    if restart_existing_unit_if_present "$NODE_NAME"; then
+      log "deploy completed (publish+update+restart) node_name=$NODE_NAME"
+      exit 0
+    fi
+    DO_SPAWN=1
+    REUSE_EXISTING_CONFIG=1
+    log "update_existing: unit missing, falling back to spawn node_name=$NODE_NAME"
+  else
+    log "deploy completed (publish+update). spawn skipped."
+    exit 0
+  fi
 fi
 
 if [[ -z "$NODE_NAME" ]]; then
@@ -505,7 +550,26 @@ print(d.get("status",""))
 PY
 )"
 
+spawn_error_code="$(SPAWN_RESP="$spawn_resp" python3 - <<'PY'
+import json, os
+raw = (os.environ.get("SPAWN_RESP") or "").strip()
+try:
+    d = json.loads(raw)
+except Exception:
+    print("")
+    sys.exit(0)
+print(d.get("error_code") or (d.get("payload") or {}).get("error_code") or "")
+PY
+)"
+
 if [[ "$spawn_status" != "ok" ]]; then
+  if [[ "$spawn_error_code" == "NODE_ALREADY_EXISTS" && "$UPDATE_EXISTING" == "1" ]]; then
+    log "spawn_node_already_exists; trying restart_existing for update flow"
+    if restart_existing_unit_if_present "$NODE_NAME"; then
+      log "deploy completed (publish+update+restart) node_name=$NODE_NAME"
+      exit 0
+    fi
+  fi
   log "spawn_failed status=${spawn_status:-unknown}"
   exit 1
 fi
