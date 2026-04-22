@@ -1,7 +1,7 @@
 # Fluxbee Executor Plan Pilot Spec
 
 **Status:** draft for implementation  
-**Date:** 2026-04-19  
+**Date:** 2026-04-21  
 **Audience:** `SY.architect`, `SY.admin`, executor/runtime developers  
 **Purpose:** define the pilot implementation of the **last execution stage** of Archi using an AI executor that lives inside `SY.admin`, OpenAI function calling, and a minimal execution-oriented plan.
 

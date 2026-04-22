@@ -17,10 +17,11 @@ use axum::routing::any;
 use axum::{Json, Router};
 use fluxbee_ai_sdk::{
     build_openai_user_content_parts, extract_text, resolve_model_input_from_payload_with_options,
-    ConversationSummary, FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput,
-    FunctionTool, FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry,
-    ImmediateConversationMemory, ImmediateInteraction, ImmediateInteractionKind,
-    ImmediateOperation, ImmediateRole, ModelInputOptions, ModelSettings, OpenAiResponsesClient,
+    ConversationSummary, FunctionCallingConfig, FunctionCallingRunner, FunctionLoopItem,
+    FunctionRunInput, FunctionTool, FunctionToolDefinition, FunctionToolProvider,
+    FunctionToolRegistry, ImmediateConversationMemory, ImmediateInteraction,
+    ImmediateInteractionKind, ImmediateOperation, ImmediateRole, ModelInputOptions, ModelSettings,
+    OpenAiResponsesClient,
 };
 use fluxbee_sdk::blob::{BlobConfig, BlobRef, BlobToolkit};
 use fluxbee_sdk::payload::TextV1Payload;
@@ -117,6 +118,9 @@ Rules:
   - `fluxbee_set_node_config` — for `node_control_config_set` when passing a large node `config` object. Pass the config in `config`, or serialize to a JSON string and pass in `config_json`. Always do CONFIG_GET first to read the current `config_version`.
   - For runtime package assembly specifically, prefer this sequence: `fluxbee_infrastructure_specialist` to generate the internal infrastructure artifact, then `fluxbee_publish_runtime_package` using the artifact's `payload.publish_request`.
   - Use `fluxbee_system_write` only for mutations whose body is small and fits cleanly as an inline JSON object (route adds, vpn adds, kill_node, rollback, delete, etc.).
+  - `fluxbee_programmer` — when the operator wants to deploy, spawn, route, or configure nodes and the intent is clear enough to produce a concrete plan. The programmer translates the task into an executor_plan automatically. After receiving its result, present the `human_summary` to the operator (NOT the raw JSON plan) and ask for confirmation. On CONFIRM the plan executes; on CANCEL it is discarded.
+- Do not call `fluxbee_programmer` for questions, status checks, or exploratory requests. Only call it when the operator has a clear deployment or configuration intent.
+- After `fluxbee_programmer` returns, always show the human_summary and ask: "Shall I proceed?" or similar. Never execute the plan without the operator's CONFIRM.
 - Do not claim actions were executed unless they actually were.
 - If information is missing, say what is missing.
 - Keep answers useful for administrators and developers."#;
@@ -214,7 +218,28 @@ struct ArchitectAdminToolContext {
     session_id: Option<String>,
     chat_lock: Arc<Mutex<()>>,
     pending_actions: Arc<Mutex<HashMap<String, PendingAdminAction>>>,
+    admin_actions_cache: Arc<Mutex<Option<AdminActionsCache>>>,
+    programmer_pending: Arc<Mutex<HashMap<String, ProgrammerPendingPlan>>>,
 }
+
+struct AdminActionsCache {
+    actions: Vec<Value>,
+    fetched_at_ms: u64,
+}
+
+const ADMIN_ACTIONS_CACHE_TTL_MS: u64 = 300_000; // 5 minutes
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProgrammerCookbookEntry {
+    task_pattern: String,
+    trigger: String,
+    steps_pattern: Vec<String>,
+    notes: String,
+    recorded_at_ms: u64,
+}
+
+const PROGRAMMER_COOKBOOK_BLOB_PATH: &str = "cookbook/programmer-v1.json";
+const PROGRAMMER_COOKBOOK_MAX_ENTRIES: usize = 50;
 
 struct ArchitectState {
     hive_id: String,
@@ -230,6 +255,8 @@ struct ArchitectState {
     pending_actions: Arc<Mutex<HashMap<String, PendingAdminAction>>>,
     router_sender: Arc<Mutex<Option<NodeSender>>>,
     cached_status: Arc<RwLock<ArchitectStatus>>,
+    admin_actions_cache: Arc<Mutex<Option<AdminActionsCache>>>,
+    programmer_pending: Arc<Mutex<HashMap<String, ProgrammerPendingPlan>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -468,6 +495,12 @@ struct PendingAdminAction {
     created_at_ms: u64,
 }
 
+struct ProgrammerPendingPlan {
+    plan: Value,
+    cookbook_entry: Option<ProgrammerCookbookEntry>,
+    created_at_ms: u64,
+}
+
 struct ArchitectAdminReadToolsProvider {
     context: ArchitectAdminToolContext,
 }
@@ -497,6 +530,9 @@ impl FunctionToolProvider for ArchitectAdminReadToolsProvider {
             self.context.clone(),
         )))?;
         registry.register(Arc::new(ArchitectSetNodeConfigTool::new(
+            self.context.clone(),
+        )))?;
+        registry.register(Arc::new(ArchitectProgrammerTool::new(
             self.context.clone(),
         )))
     }
@@ -1463,6 +1499,541 @@ async fn run_infrastructure_specialist_with_context(
     build_infrastructure_artifact(artifact_type, task, parsed)
 }
 
+// ── Admin actions cache (PROG-T1/T2) ─────────────────────────────────────────
+
+async fn get_or_refresh_admin_actions(
+    context: &ArchitectAdminToolContext,
+) -> Result<Vec<Value>, ArchitectError> {
+    let now_ms = now_epoch_ms();
+    {
+        let guard = context.admin_actions_cache.lock().await;
+        if let Some(cache) = guard.as_ref() {
+            if now_ms.saturating_sub(cache.fetched_at_ms) < ADMIN_ACTIONS_CACHE_TTL_MS {
+                return Ok(cache.actions.clone());
+            }
+        }
+    }
+
+    let output = execute_admin_action_with_context(
+        context,
+        &format!("SY.admin@{}", context.hive_id),
+        "list_admin_actions",
+        None,
+        json!({}),
+        "programmer.cache_refresh",
+    )
+    .await;
+
+    match output {
+        Ok(val) => {
+            let actions: Vec<Value> = val
+                .get("payload")
+                .and_then(|p| p.get("actions"))
+                .and_then(|a| a.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut guard = context.admin_actions_cache.lock().await;
+            *guard = Some(AdminActionsCache {
+                actions: actions.clone(),
+                fetched_at_ms: now_ms,
+            });
+            Ok(actions)
+        }
+        Err(err) => {
+            // return stale cache if available rather than failing hard
+            let guard = context.admin_actions_cache.lock().await;
+            if let Some(cache) = guard.as_ref() {
+                tracing::warn!(error = %err, "admin actions refresh failed, using stale cache");
+                return Ok(cache.actions.clone());
+            }
+            Err(err)
+        }
+    }
+}
+
+// ── Programmer cookbook (PROG-T5/T6) ─────────────────────────────────────────
+
+fn programmer_cookbook_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("programmer").join("cookbook-v1.json")
+}
+
+// Ensures the cookbook directory exists and the cookbook file is a valid JSON
+// array. If the file is missing, corrupt, or unreadable it is silently reset to
+// an empty array so that a fresh write can succeed.
+fn ensure_programmer_cookbook_dir(state_dir: &Path) {
+    let dir = state_dir.join("programmer");
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(error = %err, path = %dir.display(), "programmer cookbook: could not create directory");
+        return;
+    }
+    let path = programmer_cookbook_path(state_dir);
+    if path.exists() {
+        // Validate: if the file is unreadable or not a JSON array, reset it.
+        let ok = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .map(|v| v.is_array())
+            .unwrap_or(false);
+        if !ok {
+            tracing::warn!(path = %path.display(), "programmer cookbook corrupted — resetting to empty");
+            let _ = std::fs::write(&path, b"[]");
+        }
+    } else {
+        // First run: create an empty cookbook so subsequent reads always succeed.
+        if let Err(err) = std::fs::write(&path, b"[]") {
+            tracing::warn!(error = %err, path = %path.display(), "programmer cookbook: could not create initial file");
+        }
+    }
+}
+
+fn read_programmer_cookbook(state_dir: &Path) -> Vec<ProgrammerCookbookEntry> {
+    let path = programmer_cookbook_path(state_dir);
+    let raw = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(err) => {
+            tracing::warn!(error = %err, path = %path.display(), "programmer cookbook unreadable — starting empty");
+            return vec![];
+        }
+    };
+    serde_json::from_slice::<Vec<ProgrammerCookbookEntry>>(&raw).unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "programmer cookbook parse error — starting empty");
+        vec![]
+    })
+}
+
+fn write_programmer_cookbook(state_dir: &Path, entries: &[ProgrammerCookbookEntry]) {
+    let path = programmer_cookbook_path(state_dir);
+    let json_bytes = match serde_json::to_vec_pretty(entries) {
+        Ok(b) => b,
+        Err(err) => {
+            tracing::warn!(error = %err, "programmer cookbook serialize failed");
+            return;
+        }
+    };
+    // Write to a temp file first, then rename — avoids leaving a corrupt file
+    // on partial write (e.g. process killed mid-write).
+    let tmp_path = path.with_extension("tmp");
+    if let Err(err) = std::fs::write(&tmp_path, &json_bytes) {
+        tracing::warn!(error = %err, path = %tmp_path.display(), "programmer cookbook write failed");
+        return;
+    }
+    if let Err(err) = std::fs::rename(&tmp_path, &path) {
+        tracing::warn!(error = %err, "programmer cookbook rename failed — removing tmp");
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+}
+
+fn append_programmer_cookbook_entry(state_dir: &Path, entry: ProgrammerCookbookEntry) {
+    let mut entries = read_programmer_cookbook(state_dir);
+    entries.push(entry);
+    if entries.len() > PROGRAMMER_COOKBOOK_MAX_ENTRIES {
+        let drop = entries.len() - PROGRAMMER_COOKBOOK_MAX_ENTRIES;
+        entries.drain(0..drop);
+    }
+    write_programmer_cookbook(state_dir, &entries);
+}
+
+// ── Programmer system prompt builder (PROG-T8/T10) ───────────────────────────
+
+const PROGRAMMER_SYSTEM_PROMPT_BASE: &str = r#"You are the programmer agent inside SY.architect.
+
+Your only job is to translate a deployment task description into a valid executor_plan JSON.
+You do NOT interpret user intent — Archi already did that and gave you a clear task.
+You do NOT ask questions. You do NOT produce explanations. You call submit_executor_plan exactly once.
+
+## executor_plan format
+
+```json
+{
+  "plan_version": "0.1",
+  "kind": "executor_plan",
+  "metadata": {
+    "name": "<short_snake_case_name>",
+    "target_hive": "<hive_id>"
+  },
+  "execution": {
+    "strict": true,
+    "stop_on_error": true,
+    "allow_help_lookup": true,
+    "steps": [
+      {
+        "id": "s1",
+        "action": "<action_name>",
+        "args": { ... }
+      }
+    ]
+  }
+}
+```
+
+## Rules
+
+- Use only actions from the AVAILABLE ACTIONS section below. Never invent action names.
+- Every arg field must come from the action's documented schema. Never invent arg fields.
+- Step ids must be unique. Use s1, s2, s3, ... in order.
+- Ordering: publish_runtime_package steps before run_node steps; run_node steps before add_route steps.
+- If the context says a runtime is already published, skip its publish_runtime_package step.
+- If the context says a node is already running, skip its run_node step.
+- target_hive in metadata is the primary hive for this deployment.
+- For multi-hive operations, individual step args carry the specific hive.
+
+## human_summary rules
+
+- Write one paragraph, plain language, no JSON, no commands, no technical field names.
+- Describe what will happen from the operator's perspective.
+- Example: "I'll publish the WF routing runtime on motherbee, then start three nodes on worker-220, and configure the routes so messages from AI.support flow through WF.router to IO.slack and IO.email."
+
+## cookbook_entry rules
+
+- Include only if the pattern is genuinely reusable for future similar tasks.
+- task_pattern: a short abstract description of the task type (not the specific names).
+- trigger: what operator language typically leads to this pattern.
+- steps_pattern: list of action names in order (no specific names, just the action types).
+- notes: constraints, ordering requirements, common mistakes to avoid.
+- Omit cookbook_entry for one-off tasks or tasks with very specific non-reusable parameters.
+"#;
+
+fn build_programmer_prompt(actions: &[Value], cookbook: &[ProgrammerCookbookEntry]) -> String {
+    let mut prompt = PROGRAMMER_SYSTEM_PROMPT_BASE.to_string();
+
+    prompt.push_str("\n## AVAILABLE ACTIONS\n\n");
+    for action in actions {
+        let name = action.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let description = action
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let schema = action.get("request_contract").unwrap_or(&Value::Null);
+        prompt.push_str(&format!("### {name}\n{description}\nSchema: {schema}\n\n"));
+    }
+
+    if !cookbook.is_empty() {
+        prompt.push_str("## COOKBOOK (successful patterns for reference)\n\n");
+        for (i, entry) in cookbook.iter().enumerate().take(10) {
+            prompt.push_str(&format!(
+                "### Pattern {}\nTask: {}\nTrigger: {}\nSteps: {}\nNotes: {}\n\n",
+                i + 1,
+                entry.task_pattern,
+                entry.trigger,
+                entry.steps_pattern.join(" → "),
+                entry.notes
+            ));
+        }
+    }
+
+    prompt
+}
+
+// ── ArchitectProgrammerTool (PROG-T11/T12/T13) ───────────────────────────────
+
+struct ArchitectProgrammerTool {
+    context: ArchitectAdminToolContext,
+}
+
+impl ArchitectProgrammerTool {
+    fn new(context: ArchitectAdminToolContext) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl FunctionTool for ArchitectProgrammerTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "fluxbee_programmer".to_string(),
+            description: format!(
+                "Call the programmer agent to translate a deployment task into an executor_plan. \
+                Pass the task description, target hive, and any known context (existing nodes, \
+                published runtimes). The programmer produces a validated executor_plan and a \
+                human-readable summary. After receiving the result, present the human_summary to \
+                the user and ask for confirmation before executing. Do NOT show the raw JSON plan \
+                unless the user explicitly asks for it. Hive: {}.",
+                self.context.hive_id
+            ),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Clear description of what needs to be deployed or configured. Include node names, runtime names, hive, and topology intent."
+                    },
+                    "hive": {
+                        "type": "string",
+                        "description": "Primary target hive for the deployment."
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Optional. Any known state: which runtimes are already published, which nodes are already running, constraints the programmer should respect."
+                    }
+                },
+                "required": ["task", "hive"]
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let task = arguments
+            .get("task")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(
+                    "fluxbee_programmer requires 'task'".to_string(),
+                )
+            })?
+            .to_string();
+        let hive = arguments
+            .get("hive")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(
+                    "fluxbee_programmer requires 'hive'".to_string(),
+                )
+            })?
+            .to_string();
+        let user_context = arguments
+            .get("context")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let session_id = self
+            .context
+            .session_id
+            .as_deref()
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(
+                    "fluxbee_programmer requires a session context".to_string(),
+                )
+            })?
+            .to_string();
+
+        match run_programmer_with_context(&self.context, &task, &hive, &user_context).await {
+            Ok(output) => {
+                let pending = ProgrammerPendingPlan {
+                    plan: output.plan.clone(),
+                    cookbook_entry: output.cookbook_entry.clone(),
+                    created_at_ms: now_epoch_ms(),
+                };
+                self.context
+                    .programmer_pending
+                    .lock()
+                    .await
+                    .insert(session_id, pending);
+
+                Ok(json!({
+                    "status": "plan_ready",
+                    "human_summary": output.human_summary,
+                    "step_count": output.plan
+                        .get("execution")
+                        .and_then(|e| e.get("steps"))
+                        .and_then(|s| s.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0),
+                }))
+            }
+            Err(err) => Err(fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                "programmer agent failed: {err}"
+            ))),
+        }
+    }
+}
+
+struct ProgrammerOutput {
+    plan: Value,
+    human_summary: String,
+    cookbook_entry: Option<ProgrammerCookbookEntry>,
+}
+
+async fn run_programmer_with_context(
+    context: &ArchitectAdminToolContext,
+    task: &str,
+    hive: &str,
+    user_context: &str,
+) -> Result<ProgrammerOutput, ArchitectError> {
+    let runtime = context
+        .ai_runtime
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| -> ArchitectError {
+            "AI provider not configured for the programmer agent."
+                .to_string()
+                .into()
+        })?;
+
+    let actions = get_or_refresh_admin_actions(context).await.unwrap_or_default();
+    let cookbook = read_programmer_cookbook(&context.state_dir);
+
+    let system_prompt = build_programmer_prompt(&actions, &cookbook);
+
+    // Build the submit_executor_plan function schema
+    let submit_fn = json!({
+        "name": "submit_executor_plan",
+        "description": "Submit the executor plan you have built. Call this exactly once.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "plan": {
+                    "type": "object",
+                    "description": "The complete executor_plan JSON.",
+                    "properties": {
+                        "plan_version": { "type": "string" },
+                        "kind": { "type": "string" },
+                        "metadata": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "target_hive": { "type": "string" }
+                            },
+                            "required": ["name", "target_hive"]
+                        },
+                        "execution": {
+                            "type": "object",
+                            "properties": {
+                                "strict": { "type": "boolean" },
+                                "stop_on_error": { "type": "boolean" },
+                                "allow_help_lookup": { "type": "boolean" },
+                                "steps": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "id": { "type": "string" },
+                                            "action": { "type": "string" },
+                                            "args": { "type": "object" }
+                                        },
+                                        "required": ["id", "action", "args"]
+                                    }
+                                }
+                            },
+                            "required": ["strict", "stop_on_error", "steps"]
+                        }
+                    },
+                    "required": ["plan_version", "kind", "metadata", "execution"]
+                },
+                "human_summary": {
+                    "type": "string",
+                    "description": "One paragraph in plain language describing what this plan does. No JSON, no commands. Archi shows this to the user."
+                },
+                "cookbook_entry": {
+                    "type": "object",
+                    "description": "Optional. A reusable pattern extracted from this plan. Omit if not reusable.",
+                    "properties": {
+                        "task_pattern": { "type": "string" },
+                        "trigger": { "type": "string" },
+                        "steps_pattern": { "type": "array", "items": { "type": "string" } },
+                        "notes": { "type": "string" }
+                    },
+                    "required": ["task_pattern", "trigger", "steps_pattern", "notes"]
+                }
+            },
+            "required": ["plan", "human_summary"]
+        }
+    });
+
+    let model = runtime.client.clone().function_model(
+        runtime.model.clone(),
+        Some(system_prompt),
+        runtime.model_settings.clone(),
+    );
+
+    // Use a minimal tool registry with only submit_executor_plan
+    let mut tools = FunctionToolRegistry::new();
+    let submit_tool = ProgrammerSubmitTool::new(submit_fn);
+    tools
+        .register(Arc::new(submit_tool))
+        .map_err(|e| -> ArchitectError { format!("programmer tool register: {e}").into() })?;
+
+    let input_text = serde_json::to_string_pretty(&json!({
+        "task": task,
+        "hive": hive,
+        "context": user_context,
+    }))
+    .unwrap_or_else(|_| format!("task: {task}\nhive: {hive}"));
+
+    let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
+    let result = runner
+        .run_with_input(
+            &model,
+            &tools,
+            FunctionRunInput {
+                current_user_message: input_text,
+                current_user_parts: None,
+                immediate_memory: None,
+            },
+        )
+        .await
+        .map_err(|e| -> ArchitectError { format!("programmer AI call failed: {e}").into() })?;
+
+    // Extract the submitted plan from the ToolResult item for submit_executor_plan
+    let submitted = result.items.iter().find_map(|item| {
+        if let FunctionLoopItem::ToolResult { result: tr } = item {
+            if tr.name == "submit_executor_plan" && !tr.is_error {
+                return Some(tr.output.clone());
+            }
+        }
+        None
+    });
+
+    let submitted = submitted.ok_or_else(|| -> ArchitectError {
+        "programmer did not call submit_executor_plan".to_string().into()
+    })?;
+
+    let plan = submitted
+        .get("plan")
+        .cloned()
+        .ok_or_else(|| -> ArchitectError { "submit_executor_plan missing 'plan'".to_string().into() })?;
+    let human_summary = submitted
+        .get("human_summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Plan ready.")
+        .to_string();
+    let cookbook_entry = submitted.get("cookbook_entry").and_then(|v| {
+        serde_json::from_value::<ProgrammerCookbookEntry>(v.clone()).ok()
+    });
+
+    // Validate the plan shape before returning
+    validate_architect_executor_plan_shape(&plan)
+        .map_err(|e| -> ArchitectError { format!("programmer plan invalid: {e}").into() })?;
+
+    Ok(ProgrammerOutput {
+        plan,
+        human_summary,
+        cookbook_entry,
+    })
+}
+
+// Minimal shim tool that captures the submit_executor_plan call arguments
+struct ProgrammerSubmitTool {
+    definition_schema: Value,
+}
+
+impl ProgrammerSubmitTool {
+    fn new(schema: Value) -> Self {
+        Self { definition_schema: schema }
+    }
+}
+
+#[async_trait]
+impl FunctionTool for ProgrammerSubmitTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "submit_executor_plan".to_string(),
+            description: "Submit the completed executor plan.".to_string(),
+            parameters_json_schema: self
+                .definition_schema
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        Ok(arguments)
+    }
+}
+
 fn require_session_id<'a>(
     context: &'a ArchitectAdminToolContext,
     tool_name: &str,
@@ -1631,9 +2202,12 @@ async fn main() -> Result<(), ArchitectError> {
         pending_actions: Arc::new(Mutex::new(HashMap::new())),
         router_sender: Arc::new(Mutex::new(None)),
         cached_status: Arc::new(RwLock::new(initial_status)),
+        admin_actions_cache: Arc::new(Mutex::new(None)),
+        programmer_pending: Arc::new(Mutex::new(HashMap::new())),
     });
 
     ensure_chat_storage(&state).await?;
+    ensure_programmer_cookbook_dir(&state.state_dir);
 
     let node_config = NodeConfig {
         name: "SY.architect".to_string(),
@@ -1841,6 +2415,8 @@ fn admin_tool_context(
         session_id: session_id.map(str::to_string),
         chat_lock: Arc::clone(&state.chat_lock),
         pending_actions: Arc::clone(&state.pending_actions),
+        admin_actions_cache: Arc::clone(&state.admin_actions_cache),
+        programmer_pending: Arc::clone(&state.programmer_pending),
     }
 }
 
@@ -2345,7 +2921,47 @@ async fn handle_chat_message(
         };
 
     let trimmed_message = message.trim();
+
     let response = if confirmation_requested(trimmed_message) {
+        // Check programmer_pending before SCMD pending — they are distinct confirmation flows.
+        let programmer_plan = state
+            .programmer_pending
+            .lock()
+            .await
+            .remove(&resolved_session_id);
+        if let Some(prog_pending) = programmer_plan {
+            let tool_ctx = admin_tool_context(state, Some(&resolved_session_id));
+            let execution_id = uuid::Uuid::new_v4().to_string();
+            match execute_executor_plan_with_context(
+                &tool_ctx,
+                execution_id,
+                prog_pending.plan,
+                json!({}),
+                json!({ "origin": "programmer_confirmed" }),
+            )
+            .await
+            {
+                Ok(output) => {
+                    if let Some(entry) = prog_pending.cookbook_entry {
+                        append_programmer_cookbook_entry(&state.state_dir, entry);
+                    }
+                    ChatResponse {
+                        status: "ok".to_string(),
+                        mode: "executor".to_string(),
+                        output,
+                        session_id: Some(resolved_session_id.clone()),
+                        session_title: Some(session.title.clone()),
+                    }
+                }
+                Err(err) => ChatResponse {
+                    status: "error".to_string(),
+                    mode: "executor".to_string(),
+                    output: json!({ "error": err.to_string() }),
+                    session_id: Some(resolved_session_id.clone()),
+                    session_title: Some(session.title.clone()),
+                },
+            }
+        } else {
         match take_pending_action(state, &resolved_session_id).await {
             Some(pending) => {
                 let action_name = pending.translation.action.clone();
@@ -2391,7 +3007,23 @@ async fn handle_chat_message(
                 session_title: Some(session.title.clone()),
             },
         }
+        } // end else (no programmer_pending)
     } else if cancellation_requested(trimmed_message) {
+        let programmer_plan_cancel = state
+            .programmer_pending
+            .lock()
+            .await
+            .remove(&resolved_session_id);
+        if programmer_plan_cancel.is_some() {
+            // programmer_pending was present; discard it
+            ChatResponse {
+                status: "ok".to_string(),
+                mode: "executor".to_string(),
+                output: json!({ "message": "Programmer plan discarded." }),
+                session_id: Some(resolved_session_id.clone()),
+                session_title: Some(session.title.clone()),
+            }
+        } else {
         match clear_pending_action(state, &resolved_session_id).await {
             Some(pending) => {
                 let now = now_epoch_ms();
@@ -2441,6 +3073,7 @@ async fn handle_chat_message(
                 session_title: Some(session.title.clone()),
             },
         }
+        } // end else (no programmer_pending)
     } else if let Some(raw) = message.strip_prefix("SCMD:") {
         match handle_scmd(state, &resolved_session_id, raw.trim()).await {
             Ok(output) => {
