@@ -41,6 +41,7 @@ impl IoAdapterConfigContract for IoApiAdapterConfigContract {
             "config.integrations[].final_reply_required",
             "config.integrations[].webhook.enabled",
             "config.integrations[].webhook.url",
+            "config.integrations[].webhook.secret",
             "config.integrations[].webhook.secret_ref",
             "config.integrations[].webhook.timeout_ms",
             "config.integrations[].webhook.max_retries",
@@ -164,6 +165,17 @@ impl IoAdapterConfigContract for IoApiAdapterConfigContract {
             };
             redact_secret_field(obj, "token");
         }
+        if let Some(integrations) = root.get_mut("integrations").and_then(Value::as_array_mut) {
+            for entry in integrations {
+                let Some(obj) = entry.as_object_mut() else {
+                    continue;
+                };
+                let Some(webhook) = obj.get_mut("webhook").and_then(Value::as_object_mut) else {
+                    continue;
+                };
+                redact_secret_field(webhook, "secret");
+            }
+        }
         redacted
     }
 
@@ -176,7 +188,7 @@ impl IoAdapterConfigContract for IoApiAdapterConfigContract {
             return Vec::new();
         };
 
-        api_keys
+        let mut descriptors: Vec<_> = api_keys
             .iter()
             .filter_map(Value::as_object)
             .filter_map(|entry| {
@@ -193,12 +205,51 @@ impl IoAdapterConfigContract for IoApiAdapterConfigContract {
                     || has_non_empty_string(entry, "token_ref");
                 Some(descriptor)
             })
-            .collect()
+            .collect();
+
+        if let Some(integrations) = effective
+            .and_then(|cfg| cfg.get("integrations"))
+            .and_then(Value::as_array)
+        {
+            descriptors.extend(
+                integrations
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .filter_map(|entry| {
+                        let integration_id =
+                            entry.get("integration_id").and_then(Value::as_str)?.trim();
+                        if integration_id.is_empty() {
+                            return None;
+                        }
+                        let webhook = entry.get("webhook").and_then(Value::as_object)?;
+                        let mut descriptor = NodeSecretDescriptor::new(
+                            format!("config.integrations[{integration_id}].webhook.secret"),
+                            webhook_secret_storage_key(integration_id),
+                        );
+                        descriptor.required = webhook
+                            .get("enabled")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        descriptor.configured = has_non_empty_string(webhook, "secret")
+                            || has_non_empty_string(webhook, "secret_ref");
+                        Some(descriptor)
+                    }),
+            );
+        }
+
+        descriptors
     }
 }
 
 pub fn api_key_storage_key(key_id: &str) -> String {
     format!("io_api_key__{}", sanitize_storage_key_fragment(key_id))
+}
+
+pub fn webhook_secret_storage_key(integration_id: &str) -> String {
+    format!(
+        "io_api_webhook__{}",
+        sanitize_storage_key_fragment(integration_id)
+    )
 }
 
 fn sanitize_storage_key_fragment(value: &str) -> String {
@@ -488,11 +539,13 @@ fn validate_webhook_block(entry_obj: &Map<String, Value>) -> Result<(), IoAdapte
             "integrations[].webhook.url must be absolute".to_string(),
         ));
     }
-    require_non_empty_string(
-        webhook,
-        "secret_ref",
-        "integrations[].webhook.secret_ref",
-    )?;
+    let has_secret = has_non_empty_string(webhook, "secret")
+        || has_non_empty_string(webhook, "secret_ref");
+    if !has_secret {
+        return Err(IoAdapterConfigError::InvalidConfig(
+            "integrations[].webhook requires secret or secret_ref".to_string(),
+        ));
+    }
     validate_optional_positive_integer(
         webhook,
         "timeout_ms",

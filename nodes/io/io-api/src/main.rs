@@ -264,6 +264,7 @@ async fn main() -> Result<()> {
 
     tracing::info!(
         node_name = %config.node_name,
+        runtime_version = %config.node_version,
         island_id = %config.island_id,
         listen = %config.listen_addr,
         router_socket = %config.router_socket.display(),
@@ -519,7 +520,14 @@ async fn run_router_control_loop(
         )
         .await
         {
-            sender.send(response).await?;
+            if let Err(err) = sender.send(response).await {
+                tracing::warn!(
+                    error = ?err,
+                    trace_id = %msg.routing.trace_id,
+                    "failed to send CONFIG_RESPONSE"
+                );
+                return Err(err.into());
+            }
             continue;
         }
 
@@ -1142,6 +1150,13 @@ async fn apply_io_config_set(
     let candidate = match apply_adapter_config_replace(adapter_contract, &payload.config) {
         Ok(cfg) => cfg,
         Err(err) => {
+            tracing::warn!(
+                node_name = node_name,
+                config_version = payload.config_version,
+                error_code = err.code(),
+                error_detail = %err,
+                "CONFIG_SET rejected: invalid adapter config"
+            );
             state.current_state = IoNodeLifecycleState::FailedConfig;
             state.last_error = Some(IoControlPlaneErrorInfo {
                 code: err.code().to_string(),
@@ -2063,7 +2078,7 @@ fn now_epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{load_runtime_api_registry, materialize_inline_api_keys};
+    use crate::auth::{load_runtime_api_registry, materialize_inline_secrets};
     use axum::http::header::AUTHORIZATION;
     use fluxbee_sdk::{
         build_node_secret_record, load_node_secret_record_with_root,
@@ -2109,7 +2124,7 @@ mod tests {
         });
 
         let sanitized =
-            materialize_inline_api_keys("IO.api.demo@motherbee", &config, Some(root.as_path()))
+            materialize_inline_secrets("IO.api.demo@motherbee", &config, Some(root.as_path()))
                 .expect("materialize");
 
         let entry = sanitized
@@ -2130,6 +2145,61 @@ mod tests {
         assert_eq!(
             record.secrets.get("io_api_key__partner-1"),
             Some(&Value::String("secret-1".to_string()))
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn materialize_inline_webhook_secret_moves_secret_to_local_file_ref() {
+        let root = temp_root("webhook-materialize");
+        let config = serde_json::json!({
+            "auth": {
+                "api_keys": [
+                    {
+                        "key_id": "partner-1",
+                        "integration_id": "int_partner_1",
+                        "token_ref": "env:IGNORED"
+                    }
+                ]
+            },
+            "integrations": [
+                {
+                    "integration_id": "int partner 1",
+                    "tenant_id": "tnt:partner1",
+                    "final_reply_required": true,
+                    "webhook": {
+                        "enabled": true,
+                        "url": "https://example.com/webhook",
+                        "secret": "webhook-secret-1"
+                    }
+                }
+            ]
+        });
+
+        let sanitized =
+            materialize_inline_secrets("IO.api.demo@motherbee", &config, Some(root.as_path()))
+                .expect("materialize");
+
+        let webhook = sanitized
+            .get("integrations")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(Value::as_object)
+            .and_then(|entry| entry.get("webhook"))
+            .and_then(Value::as_object)
+            .expect("webhook");
+        assert!(webhook.get("secret").is_none());
+        assert_eq!(
+            webhook.get("secret_ref").and_then(Value::as_str),
+            Some("local_file:io_api_webhook__int_partner_1")
+        );
+
+        let record =
+            load_node_secret_record_with_root("IO.api.demo@motherbee", &root).expect("load record");
+        assert_eq!(
+            record.secrets.get("io_api_webhook__int_partner_1"),
+            Some(&Value::String("webhook-secret-1".to_string()))
         );
 
         let _ = std::fs::remove_dir_all(root);

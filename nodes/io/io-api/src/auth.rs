@@ -5,7 +5,7 @@ use fluxbee_sdk::{
     save_node_secret_record, save_node_secret_record_with_root, NodeSecretError, NodeSecretRecord,
     NodeSecretWriteOptions,
 };
-use io_common::io_api_adapter_config::api_key_storage_key;
+use io_common::io_api_adapter_config::{api_key_storage_key, webhook_secret_storage_key};
 use serde_json::{Map, Value};
 use std::path::Path;
 use std::sync::Arc;
@@ -47,59 +47,97 @@ pub(crate) fn prepare_runtime_api_config(
     effective: &Value,
     secret_root: Option<&Path>,
 ) -> Result<(Value, ApiAuthRegistry)> {
-    let sanitized = materialize_inline_api_keys(node_name, effective, secret_root)?;
+    let sanitized = materialize_inline_secrets(node_name, effective, secret_root)?;
     let registry = load_runtime_api_registry(node_name, &sanitized, secret_root)?;
     Ok((sanitized, registry))
 }
 
-pub(crate) fn materialize_inline_api_keys(
+pub(crate) fn materialize_inline_secrets(
     node_name: &str,
     effective: &Value,
     secret_root: Option<&Path>,
 ) -> Result<Value> {
     let mut sanitized = effective.clone();
-    let api_keys = sanitized
+    let mut secret_record = load_or_default_secret_record(node_name, secret_root)?;
+    let mut secrets_changed = false;
+
+    if let Some(api_keys) = sanitized
         .get_mut("auth")
         .and_then(Value::as_object_mut)
         .and_then(|auth| auth.get_mut("api_keys"))
         .and_then(Value::as_array_mut)
-        .ok_or_else(|| anyhow::anyhow!("missing config.auth.api_keys"))?;
+    {
+        for entry in api_keys {
+            let Some(entry_obj) = entry.as_object_mut() else {
+                return Err(anyhow::anyhow!(
+                    "config.auth.api_keys[] entries must be objects"
+                ));
+            };
+            let key_id = entry_obj
+                .get("key_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("config.auth.api_keys[].key_id is required"))?;
+            let inline_token = entry_obj
+                .get("token")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            let Some(token) = inline_token else {
+                continue;
+            };
 
-    let mut secret_record = load_or_default_secret_record(node_name, secret_root)?;
-    let mut secrets_changed = false;
+            let storage_key = api_key_storage_key(key_id);
+            secret_record
+                .secrets
+                .insert(storage_key.clone(), Value::String(token));
+            entry_obj.remove("token");
+            entry_obj.insert(
+                "token_ref".to_string(),
+                Value::String(format!("local_file:{storage_key}")),
+            );
+            secrets_changed = true;
+        }
+    }
 
-    for entry in api_keys {
-        let Some(entry_obj) = entry.as_object_mut() else {
-            return Err(anyhow::anyhow!(
-                "config.auth.api_keys[] entries must be objects"
-            ));
-        };
-        let key_id = entry_obj
-            .get("key_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("config.auth.api_keys[].key_id is required"))?;
-        let inline_token = entry_obj
-            .get("token")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string);
-        let Some(token) = inline_token else {
-            continue;
-        };
+    if let Some(integrations) = sanitized.get_mut("integrations").and_then(Value::as_array_mut) {
+        for entry in integrations {
+            let Some(entry_obj) = entry.as_object_mut() else {
+                return Err(anyhow::anyhow!("config.integrations[] entries must be objects"));
+            };
+            let integration_id = entry_obj
+                .get("integration_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("config.integrations[].integration_id is required"))?
+                .to_string();
+            let Some(webhook) = entry_obj.get_mut("webhook").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            let inline_secret = webhook
+                .get("secret")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string);
+            let Some(secret) = inline_secret else {
+                continue;
+            };
 
-        let storage_key = api_key_storage_key(key_id);
-        secret_record
-            .secrets
-            .insert(storage_key.clone(), Value::String(token));
-        entry_obj.remove("token");
-        entry_obj.insert(
-            "token_ref".to_string(),
-            Value::String(format!("local_file:{storage_key}")),
-        );
-        secrets_changed = true;
+            let storage_key = webhook_secret_storage_key(&integration_id);
+            secret_record
+                .secrets
+                .insert(storage_key.clone(), Value::String(secret));
+            webhook.remove("secret");
+            webhook.insert(
+                "secret_ref".to_string(),
+                Value::String(format!("local_file:{storage_key}")),
+            );
+            secrets_changed = true;
+        }
     }
 
     if secrets_changed {
