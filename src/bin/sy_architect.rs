@@ -1679,18 +1679,9 @@ You do NOT ask questions. You do NOT produce explanations. You call submit_execu
 - target_hive in metadata is the primary hive for this deployment.
 - For multi-hive operations, individual step args carry the specific hive.
 
-## run_node — required args for a NEW node
+## Looking up action schemas
 
-`run_node` creates and starts a new managed node instance. For a brand-new node, always include:
-- `node_name`: fully-qualified name, e.g. "AI.coa@motherbee"
-- `runtime`: the base runtime name WITHOUT version or hive suffix, e.g. "AI.common" (NOT "AI.common@motherbee")
-- `runtime_version`: use "current" unless a specific version is required
-
-Without `runtime`, run_node has no way to know what to instantiate and the node will be created with no config.
-Example step:
-```json
-{ "id": "s1", "action": "run_node", "args": { "node_name": "AI.coa@motherbee", "runtime": "AI.common", "runtime_version": "current" } }
-```
+Before generating a step for any action you are not fully certain about, call `get_admin_action_help` with the action name. The response contains the exact required and optional fields, their types, and an example. Use it — do not guess arg names or assume fields based on action name alone.
 
 ## human_summary rules
 
@@ -1823,34 +1814,67 @@ impl FunctionTool for ArchitectProgrammerTool {
             })?
             .to_string();
 
-        match run_programmer_with_context(&self.context, &task, &hive, &user_context).await {
-            Ok(output) => {
-                let pending = ProgrammerPendingPlan {
-                    plan: output.plan.clone(),
-                    cookbook_entry: output.cookbook_entry.clone(),
-                    created_at_ms: now_epoch_ms(),
-                };
-                self.context
-                    .programmer_pending
-                    .lock()
-                    .await
-                    .insert(session_id, pending);
+        let output =
+            match run_programmer_with_context(&self.context, &task, &hive, &user_context).await {
+                Ok(o) => o,
+                Err(err) => {
+                    return Err(fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                        "programmer agent failed: {err}"
+                    )))
+                }
+            };
 
-                Ok(json!({
-                    "status": "plan_ready",
-                    "human_summary": output.human_summary,
-                    "step_count": output.plan
-                        .get("execution")
-                        .and_then(|e| e.get("steps"))
-                        .and_then(|s| s.as_array())
-                        .map(|a| a.len())
-                        .unwrap_or(0),
-                }))
+        // Pre-validate the plan against the executor before presenting to the user.
+        // If it fails, retry the programmer once with the validation error as feedback.
+        let admin_target = format!("SY.admin@{}", self.context.hive_id);
+        let output = match execute_admin_action_with_context(
+            &self.context,
+            &admin_target,
+            "executor_validate_plan",
+            None,
+            output.plan.clone(),
+            "programmer.pre_validate",
+        )
+        .await
+        {
+            Ok(_) => output,
+            Err(validation_err) => {
+                tracing::warn!(error = %validation_err, "programmer plan failed pre-validation — retrying with feedback");
+                let feedback_context = format!(
+                    "{}\n\n[FEEDBACK] Your previous plan was rejected by the executor validator with this error: {}\nFix the plan and call submit_executor_plan again.",
+                    user_context, validation_err
+                );
+                run_programmer_with_context(&self.context, &task, &hive, &feedback_context)
+                    .await
+                    .map_err(|e| {
+                        fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                            "programmer retry failed: {e}"
+                        ))
+                    })?
             }
-            Err(err) => Err(fluxbee_ai_sdk::AiSdkError::Protocol(format!(
-                "programmer agent failed: {err}"
-            ))),
-        }
+        };
+
+        let pending = ProgrammerPendingPlan {
+            plan: output.plan.clone(),
+            cookbook_entry: output.cookbook_entry.clone(),
+            created_at_ms: now_epoch_ms(),
+        };
+        self.context
+            .programmer_pending
+            .lock()
+            .await
+            .insert(session_id, pending);
+
+        Ok(json!({
+            "status": "plan_ready",
+            "human_summary": output.human_summary,
+            "step_count": output.plan
+                .get("execution")
+                .and_then(|e| e.get("steps"))
+                .and_then(|s| s.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0),
+        }))
     }
 }
 
@@ -1953,12 +1977,13 @@ async fn run_programmer_with_context(
         runtime.model_settings.clone(),
     );
 
-    // Use a minimal tool registry with only submit_executor_plan
     let mut tools = FunctionToolRegistry::new();
-    let submit_tool = ProgrammerSubmitTool::new(submit_fn);
     tools
-        .register(Arc::new(submit_tool))
+        .register(Arc::new(ProgrammerSubmitTool::new(submit_fn)))
         .map_err(|e| -> ArchitectError { format!("programmer tool register: {e}").into() })?;
+    tools
+        .register(Arc::new(ProgrammerHelpTool { context: context.clone() }))
+        .map_err(|e| -> ArchitectError { format!("programmer help tool register: {e}").into() })?;
 
     let input_text = serde_json::to_string_pretty(&json!({
         "task": task,
@@ -2046,6 +2071,55 @@ impl FunctionTool for ProgrammerSubmitTool {
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
         Ok(arguments)
+    }
+}
+
+// Lets the programmer look up the exact required/optional args for any admin action.
+struct ProgrammerHelpTool {
+    context: ArchitectAdminToolContext,
+}
+
+#[async_trait]
+impl FunctionTool for ProgrammerHelpTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "get_admin_action_help".to_string(),
+            description: "Get the full schema, required args, optional args, and example for an admin action. Call this before generating a step for any action you are not fully certain about.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["action_name"],
+                "properties": {
+                    "action_name": {
+                        "type": "string",
+                        "description": "The admin action name to look up, e.g. 'run_node'."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let action_name = arguments
+            .get("action_name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(
+                    "get_admin_action_help requires 'action_name'".to_string(),
+                )
+            })?
+            .to_string();
+
+        execute_admin_action_with_context(
+            &self.context,
+            &format!("SY.admin@{}", self.context.hive_id),
+            "get_admin_action_help",
+            None,
+            json!({ "action_name": action_name }),
+            "programmer.help_lookup",
+        )
+        .await
+        .map_err(|e| fluxbee_ai_sdk::AiSdkError::Protocol(e.to_string()))
     }
 }
 
