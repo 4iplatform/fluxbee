@@ -12,3 +12,4 @@ nodes/io/target
 /.claude/
 /agents-sdk-python
 .DS_Store
+/local-playground/
