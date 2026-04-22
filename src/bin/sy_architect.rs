@@ -118,9 +118,11 @@ Rules:
   - `fluxbee_set_node_config` — for `node_control_config_set` when passing a large node `config` object. Pass the config in `config`, or serialize to a JSON string and pass in `config_json`. Always do CONFIG_GET first to read the current `config_version`.
   - For runtime package assembly specifically, prefer this sequence: `fluxbee_infrastructure_specialist` to generate the internal infrastructure artifact, then `fluxbee_publish_runtime_package` using the artifact's `payload.publish_request`.
   - Use `fluxbee_system_write` only for mutations whose body is small and fits cleanly as an inline JSON object (route adds, vpn adds, kill_node, rollback, delete, etc.).
-  - `fluxbee_programmer` — when the operator wants to deploy, spawn, route, or configure nodes and the intent is clear enough to produce a concrete plan. The programmer translates the task into an executor_plan automatically. After receiving its result, present the `human_summary` to the operator (NOT the raw JSON plan) and ask for confirmation. On CONFIRM the plan executes; on CANCEL it is discarded.
+  - `fluxbee_programmer` — when the operator wants to deploy, spawn, route, or configure nodes and the intent is clear enough to produce a concrete plan. The programmer translates the task into an executor_plan automatically. After receiving its result, present the `human_summary` to the operator (NOT the raw JSON plan) and wait for the literal word CONFIRM.
 - Do not call `fluxbee_programmer` for questions, status checks, or exploratory requests. Only call it when the operator has a clear deployment or configuration intent.
-- After `fluxbee_programmer` returns, always show the human_summary and ask: "Shall I proceed?" or similar. Never execute the plan without the operator's CONFIRM.
+- After `fluxbee_programmer` returns a plan: call NO more tools. Output ONLY the human_summary and end your message with "Reply **CONFIRM** to execute or **CANCEL** to discard." Stop there. Do not call `fluxbee_programmer` again unless the operator explicitly cancels and starts a new task.
+- "yes", "si", "ok", "sure", "proceed" are NOT CONFIRM. Only the literal word CONFIRM (or "OK CONFIRM") triggers plan execution. If the operator says something other than CONFIRM or CANCEL after you show the summary, remind them to reply CONFIRM or CANCEL.
+- Never call `fluxbee_programmer` more than once per task. If the plan needs adjustment, tell the operator what needs clarification first, then call it once with the complete information.
 - Do not claim actions were executed unless they actually were.
 - If information is missing, say what is missing.
 - Keep answers useful for administrators and developers."#;
@@ -1676,6 +1678,19 @@ You do NOT ask questions. You do NOT produce explanations. You call submit_execu
 - If the context says a node is already running, skip its run_node step.
 - target_hive in metadata is the primary hive for this deployment.
 - For multi-hive operations, individual step args carry the specific hive.
+
+## run_node — required args for a NEW node
+
+`run_node` creates and starts a new managed node instance. For a brand-new node, always include:
+- `node_name`: fully-qualified name, e.g. "AI.coa@motherbee"
+- `runtime`: the base runtime name WITHOUT version or hive suffix, e.g. "AI.common" (NOT "AI.common@motherbee")
+- `runtime_version`: use "current" unless a specific version is required
+
+Without `runtime`, run_node has no way to know what to instantiate and the node will be created with no config.
+Example step:
+```json
+{ "id": "s1", "action": "run_node", "args": { "node_name": "AI.coa@motherbee", "runtime": "AI.common", "runtime_version": "current" } }
+```
 
 ## human_summary rules
 
