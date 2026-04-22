@@ -64,8 +64,9 @@ const CHAT_MODE_IMPERSONATION: &str = "impersonation";
 const ARCHITECT_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
 const ARCHITECT_MAX_ATTACHMENTS: usize = 8;
 const ARCHITECT_MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
-const ARCHITECT_MAX_ATTACHMENT_UPLOAD_BYTES: usize =
-    ARCHITECT_MAX_ATTACHMENTS * ARCHITECT_MAX_ATTACHMENT_BYTES + (2 * 1024 * 1024);
+const ARCHITECT_MAX_SOFTWARE_UPLOAD_BYTES: usize = 128 * 1024 * 1024;
+const ARCHITECT_MAX_MULTIPART_UPLOAD_BYTES: usize =
+    ARCHITECT_MAX_SOFTWARE_UPLOAD_BYTES + (4 * 1024 * 1024);
 const ARCHITECT_INTERNAL_ARTIFACT_KIND_INFRASTRUCTURE: &str = "infrastructure";
 const ARCHITECT_INFRA_ARTIFACT_RUNTIME_PACKAGE_SOURCE: &str = "runtime_package_source";
 const ARCHI_SYSTEM_PROMPT: &str = r#"You are archi, the Fluxbee system architect.
@@ -2510,7 +2511,7 @@ async fn main() -> Result<(), ArchitectError> {
         .route("/api/sessions", any(dynamic_handler))
         .route("/api/sessions/*path", any(dynamic_handler))
         .route("/*path", any(dynamic_handler))
-        .layer(DefaultBodyLimit::max(ARCHITECT_MAX_ATTACHMENT_UPLOAD_BYTES))
+        .layer(DefaultBodyLimit::max(ARCHITECT_MAX_MULTIPART_UPLOAD_BYTES))
         .with_state(Arc::clone(&state));
 
     let listener = TcpListener::bind(&listen).await?;
@@ -3006,10 +3007,10 @@ async fn handle_software_upload(
         if data.is_empty() {
             return Err(format!("software file '{filename}' is empty").into());
         }
-        if data.len() > ARCHITECT_MAX_ATTACHMENT_BYTES {
+        if data.len() > ARCHITECT_MAX_SOFTWARE_UPLOAD_BYTES {
             return Err(format!(
                 "software file '{}' exceeds max size {} bytes",
-                filename, ARCHITECT_MAX_ATTACHMENT_BYTES
+                filename, ARCHITECT_MAX_SOFTWARE_UPLOAD_BYTES
             )
             .into());
         }
