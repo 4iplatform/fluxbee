@@ -3048,19 +3048,11 @@ fn software_blob_path(state: &ArchitectState, blob_name: &str) -> Result<PathBuf
     if trimmed.is_empty() {
         return Err("blob_name is required".into());
     }
-    let stem = trimmed
-        .rsplit_once('.')
-        .map(|(value, _)| value)
-        .unwrap_or(trimmed);
-    let (_, hashish) = stem
-        .rsplit_once('_')
-        .ok_or_else(|| format!("invalid software blob_name '{trimmed}'"))?;
-    if hashish.len() < 4 {
-        return Err(format!("invalid software blob_name '{trimmed}'").into());
-    }
+    BlobToolkit::validate_blob_name(trimmed)
+        .map_err(|err| format!("invalid software blob_name '{trimmed}': {err}"))?;
     Ok(architect_blob_root(state)?
         .join("active")
-        .join(&hashish[..4])
+        .join(BlobToolkit::prefix(trimmed))
         .join(trimmed))
 }
 
