@@ -7,7 +7,7 @@ Usage:
   publish-runtime.sh --runtime <name> --version <version> --binary <path> [options]
 
 Required:
-  --runtime <name>         Runtime key in dist manifest (example: AI.chat, IO.slack)
+  --runtime <name>         Runtime key in dist manifest (example: ai.chat, io.slack)
   --version <version>      Runtime version (example: 0.1.0)
   --binary <path>          Built binary to publish
 

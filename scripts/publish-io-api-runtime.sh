@@ -13,7 +13,7 @@ Required:
   --version <version>      Runtime version (example: 0.1.0)
 
 Options:
-  --runtime <name>         Override runtime key (default: IO.api)
+  --runtime <name>         Override runtime key (default: io.api)
   --binary <path>          Override binary path (default: nodes/io/target/release/io-api)
   --dist-root <path>       Dist root (default: /var/lib/fluxbee/dist)
   --set-current            Set current version in manifest
@@ -24,7 +24,7 @@ EOF
 }
 
 VERSION=""
-RUNTIME="IO.api"
+RUNTIME="io.api"
 BINARY=""
 DIST_ROOT=""
 SET_CURRENT=0
@@ -101,4 +101,4 @@ else
 fi
 rm -f "$tmp_start"
 
-echo "Configured IO.api start.sh default RUST_LOG: $DEFAULT_RUST_LOG"
+echo "Configured io.api start.sh default RUST_LOG: $DEFAULT_RUST_LOG"

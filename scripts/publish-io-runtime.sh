@@ -87,12 +87,12 @@ fi
 
 case "$KIND" in
   slack)
-    default_runtime="IO.slack"
+    default_runtime="io.slack"
     default_binary="$ROOT_DIR/nodes/io/target/release/io-slack"
     build_pkg="io-slack"
     ;;
   sim)
-    default_runtime="IO.sim"
+    default_runtime="io.sim"
     default_binary="$ROOT_DIR/nodes/io/target/release/io-sim"
     build_pkg="io-sim"
     ;;

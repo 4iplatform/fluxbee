@@ -16,7 +16,7 @@ Required:
 
 Options:
   --node-name <name@hive>      If provided, script will also spawn/restart node
-  --runtime <name>             Runtime key (default: IO.api)
+  --runtime <name>             Runtime key (default: io.api)
   --runtime-version <ver>      Runtime version for spawn payload (default: current)
   --update-scope <targeted|global>
                                SYSTEM_UPDATE scope (default: targeted)
@@ -69,7 +69,7 @@ require_cmd() {
 BASE=""
 HIVE_ID=""
 VERSION=""
-RUNTIME="IO.api"
+RUNTIME="io.api"
 RUNTIME_VERSION="current"
 UPDATE_SCOPE="targeted"
 TENANT_ID=""

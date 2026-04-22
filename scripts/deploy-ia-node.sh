@@ -7,12 +7,12 @@ PUBLISH_SCRIPT="$ROOT_DIR/scripts/publish-ia-runtime.sh"
 usage() {
   cat <<'EOF'
 Usage:
-  deploy-ia-node.sh --base <url> --hive-id <id> --runtime <AI.runtime> --version <ver> [options]
+  deploy-ia-node.sh --base <url> --hive-id <id> --runtime <ai.runtime> --version <ver> [options]
 
 Required:
   --base <url>                 Admin API base URL (example: http://127.0.0.1:8080)
   --hive-id <id>               Target hive ID (example: motherbee)
-  --runtime <AI.runtime>       Runtime key (example: AI.common)
+  --runtime <ai.runtime>       Runtime key (example: ai.common)
   --version <ver>              Runtime version to publish (example: 0.1.0)
 
 Options:
@@ -55,7 +55,7 @@ Options:
 
 Notes:
   - Runtime and node_name are different concepts. Example:
-    runtime=AI.common with node_name=AI.chat@motherbee.
+    runtime=ai.common with node_name=AI.chat@motherbee.
   - Script parses manifest_version/manifest_hash from publish output.
   - On update status=sync_pending, it retries according to --update-retries.
   - AI runner source home in repo: nodes/ai/ai-generic

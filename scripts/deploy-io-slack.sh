@@ -57,7 +57,7 @@ require_cmd() {
 BASE=""
 HIVE_ID=""
 VERSION=""
-RUNTIME="IO.slack"
+RUNTIME="io.slack"
 RUNTIME_VERSION="current"
 UPDATE_SCOPE="targeted"
 TENANT_ID=""

@@ -688,7 +688,9 @@ fn runtime_case_conflict(
 ) -> Option<String> {
     runtime_map
         .keys()
-        .find(|existing| existing.as_str() != runtime_name && existing.eq_ignore_ascii_case(runtime_name))
+        .find(|existing| {
+            existing.as_str() != runtime_name && existing.eq_ignore_ascii_case(runtime_name)
+        })
         .cloned()
 }
 

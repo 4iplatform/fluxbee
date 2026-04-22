@@ -7024,14 +7024,15 @@ async fn protect_runtime_versions_from_scope(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             {
-                if let Some(base_entry) = runtimes.get(runtime_base) {
+                let base_runtime_key = resolve_runtime_key_from_map(&runtimes, runtime_base)?;
+                if let Some(base_entry) = runtimes.get(&base_runtime_key) {
                     if let Some(base_version) = base_entry
                         .current
                         .as_deref()
                         .map(str::trim)
                         .filter(|value| !value.is_empty())
                     {
-                        protected.push((runtime_base.to_string(), base_version.to_string()));
+                        protected.push((base_runtime_key, base_version.to_string()));
                     }
                 }
             }
@@ -7216,7 +7217,20 @@ fn verify_runtime_artifact_entry(
                 ));
                 return Ok(());
             }
-            let Some(base_entry) = runtimes.get(base_runtime) else {
+            let base_runtime_key = match resolve_runtime_key_from_map(runtimes, base_runtime) {
+                Ok(value) => value,
+                Err(_) => {
+                    errors.push(format!(
+                        "runtime package runtime_base not available runtime='{}' version='{}' type='{}' runtime_base='{}'",
+                        runtime,
+                        version,
+                        runtime_package_type(entry),
+                        base_runtime
+                    ));
+                    return Ok(());
+                }
+            };
+            let Some(base_entry) = runtimes.get(&base_runtime_key) else {
                 errors.push(format!(
                     "runtime package runtime_base not available runtime='{}' version='{}' type='{}' runtime_base='{}'",
                     runtime,
@@ -7240,7 +7254,7 @@ fn verify_runtime_artifact_entry(
             }
 
             let base_start = runtimes_root
-                .join(base_runtime)
+                .join(&base_runtime_key)
                 .join(base_version)
                 .join("bin/start.sh");
             if !base_start.is_file() {
@@ -7819,7 +7833,7 @@ fn node_runtime_from_name(node_name: &str) -> Option<String> {
     if p0.is_empty() || p1.is_empty() {
         return None;
     }
-    let runtime = format!("{p0}.{p1}");
+    let runtime = format!("{}.{}", p0.to_ascii_lowercase(), p1.to_ascii_lowercase());
     if valid_token(&runtime) {
         Some(runtime)
     } else {
@@ -7926,6 +7940,24 @@ fn runtime_package_metadata(
         )
     })?;
     Ok(Some(metadata))
+}
+
+fn runtime_entry_value_case_insensitive<'a>(
+    entries: &'a serde_json::Map<String, serde_json::Value>,
+    runtime: &str,
+) -> Option<(&'a str, &'a serde_json::Value)> {
+    let trimmed = runtime.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut variants = entries
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(trimmed));
+    let first = variants.next()?;
+    if variants.next().is_some() {
+        return None;
+    }
+    Some((first.0.as_str(), first.1))
 }
 
 fn normalize_runtime_template_relative_path(raw: &str) -> Result<String, OrchestratorError> {
@@ -8283,15 +8315,43 @@ fn resolve_runtime_version(
     Err(format!("version '{requested_version}' not available for runtime '{runtime}'").into())
 }
 
+fn runtime_manifest_case_variants(
+    runtimes: &BTreeMap<String, RuntimeManifestEntry>,
+    runtime: &str,
+) -> Vec<String> {
+    runtimes
+        .keys()
+        .filter(|candidate| candidate.eq_ignore_ascii_case(runtime))
+        .cloned()
+        .collect()
+}
+
+fn resolve_runtime_key_from_map(
+    runtimes: &BTreeMap<String, RuntimeManifestEntry>,
+    runtime: &str,
+) -> Result<String, OrchestratorError> {
+    let trimmed = runtime.trim();
+    if trimmed.is_empty() {
+        return Err("missing runtime".into());
+    }
+    let variants = runtime_manifest_case_variants(runtimes, trimmed);
+    match variants.len() {
+        0 => Err(format!("runtime '{trimmed}' not found in manifest").into()),
+        1 => Ok(variants[0].clone()),
+        _ => Err(format!(
+            "runtime '{}' is ambiguous by case in manifest; variants={:?}",
+            trimmed, variants
+        )
+        .into()),
+    }
+}
+
 fn resolve_runtime_key(
     manifest: &RuntimeManifest,
     runtime: &str,
 ) -> Result<String, OrchestratorError> {
     let runtimes = runtime_manifest_entry_map(manifest)?;
-    if runtimes.contains_key(runtime) {
-        return Ok(runtime.to_string());
-    }
-    Err(format!("runtime '{runtime}' not found in manifest").into())
+    resolve_runtime_key_from_map(&runtimes, runtime)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8409,7 +8469,27 @@ fn resolve_runtime_spawn_entrypoint(
                     reason: format!("invalid runtime_base token '{}'", base),
                 });
             }
-            let base_entry = runtimes.get(base).ok_or_else(|| {
+            let base_runtime_key = match runtime_manifest_case_variants(&runtimes, base).as_slice()
+            {
+                [] => {
+                    return Err(RuntimeSpawnEntrypointError::BaseRuntimeNotAvailable {
+                        runtime: runtime.to_string(),
+                        package_type: package_type.to_string(),
+                        runtime_base: base.to_string(),
+                        reason: "runtime not found in manifest".to_string(),
+                    });
+                }
+                [single] => single.clone(),
+                variants => {
+                    return Err(RuntimeSpawnEntrypointError::BaseRuntimeNotAvailable {
+                        runtime: runtime.to_string(),
+                        package_type: package_type.to_string(),
+                        runtime_base: base.to_string(),
+                        reason: format!("runtime name is ambiguous by case; variants={variants:?}"),
+                    });
+                }
+            };
+            let base_entry = runtimes.get(&base_runtime_key).ok_or_else(|| {
                 RuntimeSpawnEntrypointError::BaseRuntimeNotAvailable {
                     runtime: runtime.to_string(),
                     package_type: package_type.to_string(),
@@ -8437,9 +8517,9 @@ fn resolve_runtime_spawn_entrypoint(
                 });
             }
             (
-                base.to_string(),
+                base_runtime_key.clone(),
                 base_current.to_string(),
-                Some(base.to_string()),
+                Some(base_runtime_key),
             )
         }
         _ => {
@@ -8634,7 +8714,26 @@ fn runtime_spawn_preflight_with_manifest_and_root(
         });
 
     if let Some(runtime_base) = entrypoint.runtime_base.as_deref() {
-        let base_entry = runtime_map.get(runtime_base).ok_or_else(|| {
+        let base_runtime_key =
+            resolve_runtime_key_from_map(&runtime_map, runtime_base).map_err(|_| {
+                serde_json::json!({
+                    "status": "error",
+                    "error_code": "BASE_RUNTIME_NOT_AVAILABLE",
+                    "message": format!("runtime_base '{}' not found in manifest", runtime_base),
+                    "runtime": requested_runtime,
+                    "version": requested_version,
+                    "runtime_base": runtime_base,
+                    "base_version": entrypoint.script_version,
+                    "expected_path": entrypoint.script_path,
+                    "hint": "Publish/materialize the base runtime before spawning this node",
+                    "target": target_hive,
+                    "node_name": node_name,
+                    "requested_runtime_materialization": requested_materialization,
+                    "targeted_runtime_health": targeted_runtime_health,
+                    "global_runtime_health": global_runtime_health,
+                })
+            })?;
+        let base_entry = runtime_map.get(&base_runtime_key).ok_or_else(|| {
             serde_json::json!({
                 "status": "error",
                 "error_code": "BASE_RUNTIME_NOT_AVAILABLE",
@@ -8653,7 +8752,7 @@ fn runtime_spawn_preflight_with_manifest_and_root(
             })
         })?;
         let base_materialization = runtime_materialization_for_entry_with_root(
-            runtime_base,
+            &base_runtime_key,
             base_entry,
             runtime_entries,
             runtimes_root,
@@ -8769,16 +8868,27 @@ fn runtime_readiness_for_entry_with_root(
     let base_start_script = if matches!(package_type, "config_only" | "workflow") {
         if let Some(base_runtime_name) = base_runtime {
             let base_entry = runtime_entries
-                .and_then(|entries| entries.get(base_runtime_name))
-                .and_then(|value| runtime_manifest_entry_from_value(base_runtime_name, value).ok());
+                .and_then(|entries| {
+                    runtime_entry_value_case_insensitive(entries, base_runtime_name)
+                })
+                .and_then(|(resolved_name, value)| {
+                    runtime_manifest_entry_from_value(resolved_name, value)
+                        .ok()
+                        .map(|entry| (resolved_name.to_string(), entry))
+                });
             let base_version = base_entry
                 .as_ref()
-                .and_then(|value| value.current.as_deref())
+                .and_then(|(_, value)| value.current.as_deref())
                 .map(str::trim)
                 .filter(|value| valid_token(value));
             base_version.map(|value| {
                 runtimes_root
-                    .join(base_runtime_name)
+                    .join(
+                        base_entry
+                            .as_ref()
+                            .map(|(name, _)| name.as_str())
+                            .unwrap_or(base_runtime_name),
+                    )
                     .join(value)
                     .join("bin/start.sh")
             })
@@ -8878,13 +8988,17 @@ fn runtime_materialization_for_entry_with_root(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let base_entry = base_runtime_name
-        .and_then(|name| runtime_entries.and_then(|entries| entries.get(name)))
-        .and_then(|value| {
-            base_runtime_name.and_then(|name| runtime_manifest_entry_from_value(name, value).ok())
+        .and_then(|name| {
+            runtime_entries.and_then(|entries| runtime_entry_value_case_insensitive(entries, name))
+        })
+        .and_then(|(resolved_name, value)| {
+            runtime_manifest_entry_from_value(resolved_name, value)
+                .ok()
+                .map(|entry| (resolved_name.to_string(), entry))
         });
     let base_version = base_entry
         .as_ref()
-        .and_then(|value| value.current.as_deref())
+        .and_then(|(_, value)| value.current.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
@@ -8957,15 +9071,16 @@ fn runtime_materialization_for_entry_with_root(
                 );
             }
             "config_only" | "workflow" => {
-                let base_start =
-                    base_runtime_name
-                        .zip(base_version)
-                        .map(|(base_runtime, base_version)| {
-                            runtimes_root
-                                .join(base_runtime)
-                                .join(base_version)
-                                .join("bin/start.sh")
-                        });
+                let base_start = base_entry
+                    .as_ref()
+                    .map(|(base_runtime, _)| base_runtime.as_str())
+                    .zip(base_version)
+                    .map(|(base_runtime, base_version)| {
+                        runtimes_root
+                            .join(base_runtime)
+                            .join(base_version)
+                            .join("bin/start.sh")
+                    });
                 let base_start_present = base_start.as_ref().is_some_and(|path| path.is_file());
                 let base_start_exec = base_start.as_ref().is_some_and(|path| {
                     base_start_present && local_runtime_script_is_executable(path)
@@ -16408,6 +16523,64 @@ blob:
     }
 
     #[test]
+    fn node_runtime_from_name_normalizes_runtime_to_lowercase() {
+        assert_eq!(
+            node_runtime_from_name("AI.chat@motherbee"),
+            Some("ai.chat".to_string())
+        );
+        assert_eq!(
+            node_runtime_from_name("IO.api.support@motherbee"),
+            Some("io.api".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_key_accepts_legacy_casing_when_manifest_is_lowercase() {
+        let manifest = RuntimeManifest {
+            schema_version: 2,
+            version: 1710000002222,
+            updated_at: Some("2026-03-16T00:20:00Z".to_string()),
+            runtimes: serde_json::json!({
+                "ai.common": {
+                    "available": ["0.1.5"],
+                    "current": "0.1.5",
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+
+        let resolved = resolve_runtime_key(&manifest, "AI.common").expect("runtime key");
+        assert_eq!(resolved, "ai.common");
+    }
+
+    #[test]
+    fn resolve_runtime_key_rejects_case_ambiguous_variants() {
+        let manifest = RuntimeManifest {
+            schema_version: 2,
+            version: 1710000002223,
+            updated_at: Some("2026-03-16T00:20:01Z".to_string()),
+            runtimes: serde_json::json!({
+                "IO.api": {
+                    "available": ["0.1.5"],
+                    "current": "0.1.5",
+                    "type": "full_runtime"
+                },
+                "io.api": {
+                    "available": ["1.0.1"],
+                    "current": "1.0.1",
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+
+        let err =
+            resolve_runtime_key(&manifest, "IO.api").expect_err("case-ambiguous runtime must fail");
+        assert!(err.to_string().contains("ambiguous by case"));
+    }
+
+    #[test]
     fn resolve_runtime_spawn_entrypoint_full_runtime_uses_own_start_script() {
         let runtime = "ai.agent.full";
         let version = "1.3.0";
@@ -16765,6 +16938,59 @@ blob:
 
         let errors = verify_runtime_current_artifacts_with_root(&manifest, &root).expect("verify");
         assert!(errors.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verify_runtime_current_artifacts_with_root_accepts_legacy_runtime_base_casing() {
+        let root = std::env::temp_dir().join(format!("fluxbee-verify-{}", Uuid::new_v4()));
+        let runtime = "ai.agent.config";
+        let runtime_version = "2.0.0";
+        let base_runtime_manifest = "ai.generic";
+        let base_runtime_ref = "AI.generic";
+        let base_version = "5.1.0";
+        let base_start = root
+            .join(base_runtime_manifest)
+            .join(base_version)
+            .join("bin/start.sh");
+
+        fs::create_dir_all(root.join(runtime).join(runtime_version)).expect("runtime package dir");
+        fs::create_dir_all(
+            base_start
+                .parent()
+                .expect("base start script parent directory must exist"),
+        )
+        .expect("base bin dir");
+        fs::write(&base_start, "#!/usr/bin/env bash\necho ok\n").expect("write base start.sh");
+        let mut perms = fs::metadata(&base_start)
+            .expect("stat base start.sh")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&base_start, perms).expect("chmod base start.sh");
+
+        let manifest = RuntimeManifest {
+            schema_version: 2,
+            version: 1710000013333,
+            updated_at: Some("2026-03-16T01:55:00Z".to_string()),
+            runtimes: serde_json::json!({
+                runtime: {
+                    "available": [runtime_version],
+                    "current": runtime_version,
+                    "type": "config_only",
+                    "runtime_base": base_runtime_ref
+                },
+                base_runtime_manifest: {
+                    "available": [base_version],
+                    "current": base_version,
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+
+        let errors = verify_runtime_current_artifacts_with_root(&manifest, &root).expect("verify");
+        assert!(errors.is_empty(), "expected no errors, got {:?}", errors);
 
         let _ = fs::remove_dir_all(root);
     }

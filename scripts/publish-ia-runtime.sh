@@ -7,10 +7,10 @@ PUBLISH_SCRIPT="$ROOT_DIR/scripts/publish-runtime.sh"
 usage() {
   cat <<'EOF'
 Usage:
-  publish-ia-runtime.sh --runtime <AI.runtime> --version <version> [options]
+  publish-ia-runtime.sh --runtime <ai.runtime> --version <version> [options]
 
 Required:
-  --runtime <AI.runtime>   Runtime key (example: AI.common)
+  --runtime <ai.runtime>   Runtime key (example: ai.common)
   --version <version>      Runtime version (example: 0.1.0)
 
 Options:
@@ -112,7 +112,7 @@ if [[ "$SKIP_BUILD" != "1" ]]; then
     echo "Error: cargo not found (use --skip-build if binary already exists)" >&2
     exit 1
   fi
-  if [[ "$RUNTIME" == "SY.frontdesk.gov" ]]; then
+  if [[ "$RUNTIME" == "sy.frontdesk.gov" ]]; then
     BINARY="$ROOT_DIR/target/release/sy-frontdesk-gov"
     (cd "$ROOT_DIR" && cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov)
   else
