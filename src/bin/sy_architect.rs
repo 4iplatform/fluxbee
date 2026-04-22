@@ -1679,9 +1679,17 @@ You do NOT ask questions. You do NOT produce explanations. You call submit_execu
 - target_hive in metadata is the primary hive for this deployment.
 - For multi-hive operations, individual step args carry the specific hive.
 
+## Fluxbee node naming convention
+
+Node names in Fluxbee always include a type prefix followed by a dot, then the instance name, then `@hive`. The prefixes are: `AI.` for AI/language model nodes, `WF.` for workflow nodes, `IO.` for I/O integration nodes, `SY.` for system nodes. Examples: `AI.coa@motherbee`, `WF.router@worker-220`, `IO.slack.main@motherbee`. Never create a `node_name` without its type prefix — a name like `coa@motherbee` is invalid.
+
+## Choosing a runtime
+
+When you need to pick a runtime for a new node and the context does not specify one, call `get_admin_action_help` with action `list_runtimes` to see what is available on the target hive. Choose the runtime that matches the node type and purpose. Do not reuse the runtime of an existing node (e.g. `AI.chat`) as the base for a different new node unless the task explicitly asks for it.
+
 ## Looking up action schemas
 
-Before generating a step for any action you are not fully certain about, call `get_admin_action_help` with the action name. The response contains the exact required and optional fields, their types, and an example. Use it — do not guess arg names or assume fields based on action name alone.
+Before generating a step for any action, call `get_admin_action_help` with the action name. The response contains the exact required and optional fields, their types, and an example. Use it — do not guess arg names or assume fields based on action name alone.
 
 ## human_summary rules
 
