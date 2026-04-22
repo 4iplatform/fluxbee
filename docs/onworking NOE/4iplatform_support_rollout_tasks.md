@@ -98,14 +98,26 @@ Nota:
 
 ### 1.6 Webhook outbound
 
-Para esta integración no hace falta webhook.
+Para la integración base .NET, el webhook outbound no era requisito inicial.
 
-Entonces la integración en `IO.api` debe quedar con:
+Durante la validación operativa de este rollout sí se habilitó un callback saliente de prueba para verificar:
 
-- `final_reply_required = false`
-- sin callback final obligatorio
+- entrega final outbound desde `IO.api`;
+- contrato HTTP externo del callback;
+- firma HMAC correcta usando secreto compartido;
+- compatibilidad con un receptor local expuesto por `ngrok`.
 
-Igual sigue siendo recomendable modelar una `integration_id`, porque el contrato actual de `IO.api` ya separa:
+Entonces hay dos estados válidos para esta integración:
+
+1. operativo base:
+   - `final_reply_required = false`
+   - sin callback final obligatorio
+2. modo prueba / validación webhook:
+   - `final_reply_required = true`
+   - `webhook.enabled = true`
+   - callback firmado por HMAC
+
+Sigue siendo recomendable modelar una `integration_id`, porque el contrato actual de `IO.api` ya separa:
 
 - `auth.api_keys[*]`
 - `integrations[*]`
@@ -527,10 +539,17 @@ No conviene avanzar con una API key en `IO.api` hasta tener resuelto un `tenant_
 
 ### D.1 Modelo a usar
 
-Como esta integración no necesita webhook:
+Modelo operativo base:
 
 - `final_reply_required = false`
 - `integration_id` igualmente presente
+
+Modelo de prueba webhook outbound:
+
+- `final_reply_required = true`
+- `webhook.enabled = true`
+- `webhook.url` apuntando al receptor temporal
+- `webhook.secret` o `webhook.secret_ref` según la versión efectiva del runtime
 
 Recomendado:
 
@@ -741,6 +760,43 @@ curl -sS -X POST \
     }
   }" | jq .
 ```
+
+### D.5 Validación específica de webhook outbound
+
+Prueba realizada y validada en local:
+
+- receptor HTTP local simple en `local-playground/webhook-outbound-test/webhook_receiver.py`;
+- exposición temporal vía `ngrok`;
+- `IO.api.support@motherbee` actualizado a runtime `0.1.5`;
+- `CONFIG_SET` con:
+  - `final_reply_required = true`
+  - `webhook.enabled = true`
+  - `integration_id = "int_4iplatform_support"`
+  - `webhook.secret = "abc123"`
+- callback recibido correctamente en el receptor local;
+- firma HMAC validada correctamente (`provided == expected`, `valid = true`).
+
+Headers observados correctamente en el callback:
+
+- `X-Fluxbee-Delivery-Id`
+- `X-Fluxbee-Timestamp`
+- `X-Fluxbee-Signature`
+
+Shape observado correctamente en el body:
+
+- `schema_version`
+- `delivery_id`
+- `event_type = "io.api.final"`
+- `integration_id`
+- `tenant_id`
+- `request`
+- `result`
+- `source`
+
+Nota operativa:
+
+- para acelerar la validación local se usó temporalmente `io.relay.window_ms = 30`;
+- para operación normal ese valor debe volver a `300000`.
 
 ---
 
@@ -970,6 +1026,7 @@ Observaciones:
 - [ ] F3. Verificar que el `ilk` se resuelve/provisiona correctamente.
 - [ ] F4. Verificar que el mensaje llega a `AI.support.rep`.
 - [ ] F5. Verificar que el servicio .NET puede reproducir el mismo request.
+- [x] F6. Verificar webhook outbound firmado contra receptor local de prueba.
 
 Checks mínimos:
 
@@ -990,6 +1047,7 @@ Checks mínimos:
 - [ ] `IO.api` configurado con API key + integración sin webhook
 - [ ] payload de referencia para .NET validado
 - [ ] prueba E2E básica cerrada
+- [x] webhook outbound local validado end-to-end con firma HMAC correcta
 
 ---
 
