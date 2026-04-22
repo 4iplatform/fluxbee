@@ -2025,43 +2025,38 @@ async fn execute_admin_executor_step_fallback(
             );
         }
     };
-    let (_http_status, body) = match handle_admin_command(
-        ctx,
-        client,
-        &step.action,
-        params,
-        target,
-    )
-    .await
-    {
-        Ok(values) => values,
-        Err(err) => {
-            let failure = failure_from_detail(err.to_string(), "admin_action_failure");
-            return (
-                AdminExecutorStepEvent {
-                    execution_id: execution_id.to_string(),
-                    step_id: step.id.clone(),
-                    step_index,
-                    step_action: step.action.clone(),
-                    status: "failed".to_string(),
-                    timestamp,
-                    summary: format!("{} -> failed", step.action),
-                    tool_name: Some(step.action.clone()),
-                    tool_args_preview: Some(step.args.clone()),
-                    result_preview: None,
-                    error_code: Some(failure.code.clone()),
-                    error_source: Some(failure.source.clone()),
-                    error_message: Some(failure.detail.clone()),
-                },
-                Some(failure),
-            );
-        }
-    };
+    let (_http_status, body) =
+        match handle_admin_command(ctx, client, &step.action, params, target).await {
+            Ok(values) => values,
+            Err(err) => {
+                let failure = failure_from_detail(err.to_string(), "admin_action_failure");
+                return (
+                    AdminExecutorStepEvent {
+                        execution_id: execution_id.to_string(),
+                        step_id: step.id.clone(),
+                        step_index,
+                        step_action: step.action.clone(),
+                        status: "failed".to_string(),
+                        timestamp,
+                        summary: format!("{} -> failed", step.action),
+                        tool_name: Some(step.action.clone()),
+                        tool_args_preview: Some(step.args.clone()),
+                        result_preview: None,
+                        error_code: Some(failure.code.clone()),
+                        error_source: Some(failure.source.clone()),
+                        error_message: Some(failure.detail.clone()),
+                    },
+                    Some(failure),
+                );
+            }
+        };
     let internal = match serde_json::from_str::<serde_json::Value>(&body) {
         Ok(envelope) => envelope,
         Err(err) => {
-            let failure =
-                failure_from_detail(format!("invalid fallback envelope json: {err}"), "validation");
+            let failure = failure_from_detail(
+                format!("invalid fallback envelope json: {err}"),
+                "validation",
+            );
             return (
                 AdminExecutorStepEvent {
                     execution_id: execution_id.to_string(),
@@ -11237,7 +11232,10 @@ mod tests {
         .expect("run_node tenant_id must be accepted by executor plan schema");
 
         assert_eq!(plan.execution.steps.len(), 1);
-        assert_eq!(plan.execution.steps[0].args["tenant_id"], json!("tnt:43d576a3-d712-4d91-9245-5d5463dd693e"));
+        assert_eq!(
+            plan.execution.steps[0].args["tenant_id"],
+            json!("tnt:43d576a3-d712-4d91-9245-5d5463dd693e")
+        );
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use std::collections::{hash_map::DefaultHasher, BTreeMap, HashMap};
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -34,6 +36,10 @@ use fluxbee_sdk::{
     NodeSecretWriteOptions, NodeSender, NODE_SECRET_REDACTION_TOKEN,
 };
 use futures::TryStreamExt;
+use json_router::runtime_manifest::{
+    load_runtime_manifest_from_paths, RuntimeManifest, RuntimeManifestEntry,
+};
+use json_router::runtime_package::{DIST_RUNTIME_MANIFEST_PATH, DIST_RUNTIME_ROOT_DIR};
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use serde::{Deserialize, Serialize};
@@ -347,6 +353,40 @@ struct PackagePublishRequest {
     update_to: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct SoftwareUploadResponse {
+    status: String,
+    upload_kind: String,
+    attachment: UploadedAttachment,
+}
+
+#[derive(Debug, Deserialize)]
+struct SoftwarePublishRequest {
+    blob_name: String,
+    #[serde(default)]
+    filename: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SoftwarePublishResolution {
+    upload_kind: String,
+    runtime_name: Option<String>,
+    operation: String,
+    package_type: Option<String>,
+    current_version: Option<String>,
+    next_version: Option<String>,
+    executable_path: Option<String>,
+    summary: String,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedSoftwarePublish {
+    resolution: SoftwarePublishResolution,
+    uploaded_blob_path: PathBuf,
+    generated_exec_filename: String,
+    source_package_dir: Option<PathBuf>,
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateSessionRequest {
     title: Option<String>,
@@ -534,9 +574,7 @@ impl FunctionToolProvider for ArchitectAdminReadToolsProvider {
         registry.register(Arc::new(ArchitectSetNodeConfigTool::new(
             self.context.clone(),
         )))?;
-        registry.register(Arc::new(ArchitectProgrammerTool::new(
-            self.context.clone(),
-        )))
+        registry.register(Arc::new(ArchitectProgrammerTool::new(self.context.clone())))
     }
 }
 
@@ -1845,32 +1883,31 @@ impl FunctionTool for ArchitectProgrammerTool {
         // execute_admin_action_with_context always returns Ok at the transport level;
         // we have to check the response body status to know if validation actually passed.
         let admin_target = format!("SY.admin@{}", self.context.hive_id);
-        let validation_error: Option<String> =
-            match execute_admin_action_with_context(
-                &self.context,
-                &admin_target,
-                "executor_validate_plan",
-                None,
-                output.plan.clone(),
-                "programmer.pre_validate",
-            )
-            .await
-            {
-                Err(e) => Some(e.to_string()),
-                Ok(val) => {
-                    if val.get("status").and_then(Value::as_str) != Some("ok") {
-                        Some(
-                            val.get("error_detail")
-                                .and_then(Value::as_str)
-                                .or_else(|| val.get("error_code").and_then(Value::as_str))
-                                .unwrap_or("executor validation failed")
-                                .to_string(),
-                        )
-                    } else {
-                        None
-                    }
+        let validation_error: Option<String> = match execute_admin_action_with_context(
+            &self.context,
+            &admin_target,
+            "executor_validate_plan",
+            None,
+            output.plan.clone(),
+            "programmer.pre_validate",
+        )
+        .await
+        {
+            Err(e) => Some(e.to_string()),
+            Ok(val) => {
+                if val.get("status").and_then(Value::as_str) != Some("ok") {
+                    Some(
+                        val.get("error_detail")
+                            .and_then(Value::as_str)
+                            .or_else(|| val.get("error_code").and_then(Value::as_str))
+                            .unwrap_or("executor validation failed")
+                            .to_string(),
+                    )
+                } else {
+                    None
                 }
-            };
+            }
+        };
 
         let output = if let Some(err) = validation_error {
             tracing::warn!(error = %err, "programmer plan failed pre-validation — retrying with feedback");
@@ -1934,7 +1971,9 @@ async fn run_programmer_with_context(
                 .into()
         })?;
 
-    let actions = get_or_refresh_admin_actions(context).await.unwrap_or_default();
+    let actions = get_or_refresh_admin_actions(context)
+        .await
+        .unwrap_or_default();
     let cookbook = read_programmer_cookbook(&context.state_dir);
 
     let system_prompt = build_programmer_prompt(&actions, &cookbook);
@@ -2015,10 +2054,14 @@ async fn run_programmer_with_context(
         .register(Arc::new(ProgrammerSubmitTool::new(submit_fn)))
         .map_err(|e| -> ArchitectError { format!("programmer tool register: {e}").into() })?;
     tools
-        .register(Arc::new(ProgrammerHelpTool { context: context.clone() }))
+        .register(Arc::new(ProgrammerHelpTool {
+            context: context.clone(),
+        }))
         .map_err(|e| -> ArchitectError { format!("programmer help tool register: {e}").into() })?;
     tools
-        .register(Arc::new(ProgrammerLiveQueryTool { context: context.clone() }))
+        .register(Arc::new(ProgrammerLiveQueryTool {
+            context: context.clone(),
+        }))
         .map_err(|e| -> ArchitectError { format!("programmer query tool register: {e}").into() })?;
 
     let input_text = serde_json::to_string_pretty(&json!({
@@ -2053,21 +2096,25 @@ async fn run_programmer_with_context(
     });
 
     let submitted = submitted.ok_or_else(|| -> ArchitectError {
-        "programmer did not call submit_executor_plan".to_string().into()
+        "programmer did not call submit_executor_plan"
+            .to_string()
+            .into()
     })?;
 
     let plan = submitted
         .get("plan")
         .cloned()
-        .ok_or_else(|| -> ArchitectError { "submit_executor_plan missing 'plan'".to_string().into() })?;
+        .ok_or_else(|| -> ArchitectError {
+            "submit_executor_plan missing 'plan'".to_string().into()
+        })?;
     let human_summary = submitted
         .get("human_summary")
         .and_then(|v| v.as_str())
         .unwrap_or("Plan ready.")
         .to_string();
-    let cookbook_entry = submitted.get("cookbook_entry").and_then(|v| {
-        serde_json::from_value::<ProgrammerCookbookEntry>(v.clone()).ok()
-    });
+    let cookbook_entry = submitted
+        .get("cookbook_entry")
+        .and_then(|v| serde_json::from_value::<ProgrammerCookbookEntry>(v.clone()).ok());
 
     // Validate the plan shape before returning
     validate_architect_executor_plan_shape(&plan)
@@ -2087,7 +2134,9 @@ struct ProgrammerSubmitTool {
 
 impl ProgrammerSubmitTool {
     fn new(schema: Value) -> Self {
-        Self { definition_schema: schema }
+        Self {
+            definition_schema: schema,
+        }
     }
 }
 
@@ -2454,6 +2503,8 @@ async fn main() -> Result<(), ArchitectError> {
         .route("/api/executor/plan", any(dynamic_handler))
         .route("/api/package/publish", any(dynamic_handler))
         .route("/api/attachments", any(dynamic_handler))
+        .route("/api/software/upload", any(dynamic_handler))
+        .route("/api/software/publish", any(dynamic_handler))
         .route("/api/sessions", any(dynamic_handler))
         .route("/api/sessions/*path", any(dynamic_handler))
         .route("/*path", any(dynamic_handler))
@@ -2903,6 +2954,652 @@ async fn handle_attachment_upload(
     })
 }
 
+fn detect_software_upload_kind(filename: &str) -> &'static str {
+    if filename.trim().to_ascii_lowercase().ends_with(".zip") {
+        "bundle_upload"
+    } else {
+        "binary_full_runtime"
+    }
+}
+
+fn normalize_software_upload_mime(filename: &str) -> String {
+    if detect_software_upload_kind(filename) == "bundle_upload" {
+        "application/zip".to_string()
+    } else {
+        "application/octet-stream".to_string()
+    }
+}
+
+async fn handle_software_upload(
+    state: &ArchitectState,
+    request: Request,
+) -> Result<SoftwareUploadResponse, ArchitectError> {
+    let mut multipart = Multipart::from_request(request, state)
+        .await
+        .map_err(|err| format!("invalid multipart upload: {err}"))?;
+    let toolkit = architect_blob_toolkit(state)?;
+    let mut uploaded: Option<UploadedAttachment> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| format!("failed to read multipart field: {err}"))?
+    {
+        let Some(filename) = field
+            .file_name()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+        else {
+            continue;
+        };
+        if uploaded.is_some() {
+            return Err("software upload accepts exactly one file".into());
+        }
+
+        let data = field
+            .bytes()
+            .await
+            .map_err(|err| format!("failed to read uploaded file '{filename}': {err}"))?;
+        if data.is_empty() {
+            return Err(format!("software file '{filename}' is empty").into());
+        }
+        if data.len() > ARCHITECT_MAX_ATTACHMENT_BYTES {
+            return Err(format!(
+                "software file '{}' exceeds max size {} bytes",
+                filename, ARCHITECT_MAX_ATTACHMENT_BYTES
+            )
+            .into());
+        }
+
+        let mime = normalize_software_upload_mime(&filename);
+        let blob_ref = toolkit
+            .put_bytes(data.as_ref(), &filename, &mime)
+            .and_then(|blob_ref| {
+                toolkit.promote(&blob_ref)?;
+                Ok(blob_ref)
+            })
+            .map_err(|err| format!("failed to persist software file '{filename}': {err}"))?;
+
+        uploaded = Some(UploadedAttachment {
+            attachment_id: format!("soft_{}", Uuid::new_v4().simple()),
+            filename,
+            mime,
+            size: blob_ref.size,
+            blob_ref,
+        });
+    }
+
+    let Some(attachment) = uploaded else {
+        return Err("multipart upload did not contain any file fields".into());
+    };
+    Ok(SoftwareUploadResponse {
+        status: "ok".to_string(),
+        upload_kind: detect_software_upload_kind(&attachment.filename).to_string(),
+        attachment,
+    })
+}
+
+fn software_blob_path(state: &ArchitectState, blob_name: &str) -> Result<PathBuf, ArchitectError> {
+    let trimmed = blob_name.trim();
+    if trimmed.is_empty() {
+        return Err("blob_name is required".into());
+    }
+    let stem = trimmed
+        .rsplit_once('.')
+        .map(|(value, _)| value)
+        .unwrap_or(trimmed);
+    let (_, hashish) = stem
+        .rsplit_once('_')
+        .ok_or_else(|| format!("invalid software blob_name '{trimmed}'"))?;
+    if hashish.len() < 4 {
+        return Err(format!("invalid software blob_name '{trimmed}'").into());
+    }
+    Ok(architect_blob_root(state)?
+        .join("active")
+        .join(&hashish[..4])
+        .join(trimmed))
+}
+
+fn load_architect_runtime_manifest() -> Result<Option<RuntimeManifest>, ArchitectError> {
+    load_runtime_manifest_from_paths(&[PathBuf::from(DIST_RUNTIME_MANIFEST_PATH)])
+        .map_err(|err| err.into())
+}
+
+fn architect_runtime_manifest_entry_map(
+    manifest: &RuntimeManifest,
+) -> Result<BTreeMap<String, RuntimeManifestEntry>, ArchitectError> {
+    let runtimes = manifest
+        .runtimes
+        .as_object()
+        .ok_or_else(|| "runtime manifest invalid: runtimes must be object".to_string())?;
+    let mut out = BTreeMap::new();
+    for (runtime, value) in runtimes {
+        let entry = serde_json::from_value::<RuntimeManifestEntry>(value.clone())
+            .map_err(|err| format!("runtime manifest invalid entry for '{runtime}': {err}"))?;
+        out.insert(runtime.to_string(), entry);
+    }
+    Ok(out)
+}
+
+fn sanitize_exec_name(raw: &str, runtime_name: &str) -> String {
+    let fallback = runtime_name
+        .split('.')
+        .next_back()
+        .unwrap_or("runtime")
+        .replace('.', "-");
+    let trimmed = raw.trim();
+    let candidate = if trimmed.is_empty() {
+        fallback
+    } else {
+        trimmed.to_ascii_lowercase()
+    };
+    let mut out = String::with_capacity(candidate.len());
+    for ch in candidate.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            out.push(ch);
+        } else {
+            out.push('-');
+        }
+    }
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    let out = out.trim_matches('-').trim_matches('.').to_string();
+    if out.is_empty() {
+        "runtime-bin".to_string()
+    } else {
+        out
+    }
+}
+
+fn resolve_runtime_name_from_binary_filename(filename: &str) -> Result<String, ArchitectError> {
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("software filename '{}' is missing a usable stem", filename))?;
+    let lowered = stem.to_ascii_lowercase();
+    let normalized = lowered
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>();
+    let segments: Vec<&str> = normalized
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let Some(prefix) = segments.first().copied() else {
+        return Err(format!(
+            "software filename '{}' does not resolve to a runtime",
+            filename
+        )
+        .into());
+    };
+    match prefix {
+        "ai" => {
+            if segments.len() <= 1 || segments.get(1) == Some(&"common") {
+                Ok("ai.common".to_string())
+            } else {
+                Ok(format!("ai.{}", segments[1..].join(".")))
+            }
+        }
+        "wf" => {
+            if segments.len() <= 1 || segments.get(1) == Some(&"common") {
+                Ok("wf.common".to_string())
+            } else {
+                Ok(format!("wf.{}", segments[1..].join(".")))
+            }
+        }
+        "io" => {
+            if segments.len() <= 1 {
+                Err("io executable upload requires a concrete runtime suffix like io-api or io-slack".into())
+            } else {
+                Ok(format!("io.{}", segments[1..].join(".")))
+            }
+        }
+        _ => Err(format!(
+            "software filename '{}' must start with ai, wf, or io",
+            filename
+        )
+        .into()),
+    }
+}
+
+fn semver_core_triplet(value: &str) -> Option<(u64, u64, u64)> {
+    let core = value.split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn suggest_binary_runtime_version(current: Option<&str>, now_ms: u64) -> String {
+    match current.and_then(semver_core_triplet) {
+        Some((major, minor, patch)) => format!("{major}.{minor}.{}-archi.{now_ms}", patch + 1),
+        None => "1.0.0".to_string(),
+    }
+}
+
+fn infer_single_binary_path(package_dir: &Path) -> Result<String, ArchitectError> {
+    let bin_dir = package_dir.join("bin");
+    if !bin_dir.is_dir() {
+        return Err(format!(
+            "runtime package '{}' missing bin/ directory",
+            package_dir.display()
+        )
+        .into());
+    }
+    let mut candidates = Vec::new();
+    for entry_res in fs::read_dir(&bin_dir)? {
+        let entry = entry_res?;
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if name == "start.sh" {
+            continue;
+        }
+        candidates.push(name.to_string());
+    }
+    candidates.sort();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [single] => Ok(format!("bin/{single}")),
+        [] => Err(format!(
+            "current package '{}' does not contain a single binary candidate under bin/",
+            package_dir.display()
+        )
+        .into()),
+        _ => Err(format!(
+            "current package '{}' has multiple binary candidates under bin/; executable replacement is ambiguous",
+            package_dir.display()
+        )
+        .into()),
+    }
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), ArchitectError> {
+    fs::create_dir_all(dst)?;
+    let permissions = fs::metadata(src)?.permissions();
+    fs::set_permissions(dst, permissions)?;
+    for entry_res in fs::read_dir(src)? {
+        let entry = entry_res?;
+        let source_path = entry.path();
+        let target_path = dst.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_dir_recursive(&source_path, &target_path)?;
+        } else {
+            fs::copy(&source_path, &target_path)?;
+            let perms = fs::metadata(&source_path)?.permissions();
+            fs::set_permissions(&target_path, perms)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_generated_start_script(path: &Path, exec_name: &str) -> Result<(), ArchitectError> {
+    let content = format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR=\"$(cd \"$(dirname \"${{BASH_SOURCE[0]}}\")\" && pwd)\"\nexec \"$SCRIPT_DIR/{exec_name}\" \"$@\"\n"
+    );
+    fs::write(path, content)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+fn write_updated_package_json(
+    package_json_path: &Path,
+    runtime_name: &str,
+    version: &str,
+    preserve_existing: bool,
+) -> Result<(), ArchitectError> {
+    let value = if preserve_existing && package_json_path.exists() {
+        let raw = fs::read_to_string(package_json_path)?;
+        let mut value: serde_json::Value = serde_json::from_str(&raw)?;
+        value["name"] = json!(runtime_name);
+        value["version"] = json!(version);
+        value["type"] = json!("full_runtime");
+        value["runtime_base"] = serde_json::Value::Null;
+        value
+    } else {
+        json!({
+            "name": runtime_name,
+            "version": version,
+            "type": "full_runtime",
+            "runtime_base": null
+        })
+    };
+    let bytes = serde_json::to_vec_pretty(&value)?;
+    fs::write(package_json_path, bytes)?;
+    Ok(())
+}
+
+fn add_dir_to_zip(
+    writer: &mut zip::ZipWriter<std::io::Cursor<Vec<u8>>>,
+    root_dir: &Path,
+    current: &Path,
+    zip_root: &str,
+) -> Result<(), ArchitectError> {
+    let mut entries = fs::read_dir(current)?
+        .map(|entry| entry.map(|value| value.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort();
+    for path in entries {
+        let rel = path
+            .strip_prefix(root_dir)
+            .map_err(|err| format!("failed to compute zip relative path: {err}"))?;
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        let zip_path = format!("{zip_root}/{rel_str}");
+        if path.is_dir() {
+            writer.add_directory(
+                format!("{zip_path}/"),
+                zip::write::FileOptions::default().unix_permissions(0o755),
+            )?;
+            add_dir_to_zip(writer, root_dir, &path, zip_root)?;
+        } else {
+            let bytes = fs::read(&path)?;
+            let mode = fs::metadata(&path)?.permissions().mode() & 0o777;
+            writer.start_file(
+                zip_path,
+                zip::write::FileOptions::default().unix_permissions(mode.max(0o644)),
+            )?;
+            writer.write_all(&bytes)?;
+        }
+    }
+    Ok(())
+}
+
+fn build_runtime_bundle_zip(package_dir: &Path, zip_root: &str) -> Result<Vec<u8>, ArchitectError> {
+    let cursor = std::io::Cursor::new(Vec::<u8>::new());
+    let mut writer = zip::ZipWriter::new(cursor);
+    writer.add_directory(
+        format!("{zip_root}/"),
+        zip::write::FileOptions::default().unix_permissions(0o755),
+    )?;
+    add_dir_to_zip(&mut writer, package_dir, package_dir, zip_root)?;
+    let cursor = writer.finish()?;
+    Ok(cursor.into_inner())
+}
+
+fn resolve_software_publish(
+    state: &ArchitectState,
+    blob_name: &str,
+    filename: Option<&str>,
+) -> Result<ResolvedSoftwarePublish, ArchitectError> {
+    let uploaded_blob_path = software_blob_path(state, blob_name)?;
+    if !uploaded_blob_path.exists() {
+        return Err(format!("uploaded software blob not found for '{}'", blob_name).into());
+    }
+    let uploaded_filename = filename
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| blob_name.to_string());
+    let upload_kind = detect_software_upload_kind(&uploaded_filename).to_string();
+    if upload_kind == "bundle_upload" {
+        return Ok(ResolvedSoftwarePublish {
+            resolution: SoftwarePublishResolution {
+                upload_kind,
+                runtime_name: None,
+                operation: "zip_bundle_publish".to_string(),
+                package_type: None,
+                current_version: None,
+                next_version: None,
+                executable_path: None,
+                summary: "zip bundle -> canonical publish path".to_string(),
+            },
+            uploaded_blob_path,
+            generated_exec_filename: String::new(),
+            source_package_dir: None,
+        });
+    }
+
+    let runtime_name = resolve_runtime_name_from_binary_filename(&uploaded_filename)?;
+    let generated_exec_filename = sanitize_exec_name(
+        Path::new(&uploaded_filename)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("runtime-bin"),
+        &runtime_name,
+    );
+    let manifest = load_architect_runtime_manifest()?;
+    let runtime_entries = manifest
+        .as_ref()
+        .map(architect_runtime_manifest_entry_map)
+        .transpose()?;
+    let existing_entry = runtime_entries
+        .as_ref()
+        .and_then(|entries| entries.get(&runtime_name))
+        .cloned();
+
+    if let Some(entry) = existing_entry {
+        let package_type = entry
+            .package_type
+            .clone()
+            .unwrap_or_else(|| "full_runtime".to_string());
+        if package_type != "full_runtime" {
+            return Err(format!(
+                "runtime '{}' exists but current package type is '{}' (binary upload pilot supports full_runtime only)",
+                runtime_name,
+                package_type
+            )
+            .into());
+        }
+        let current_version = entry.current.clone().ok_or_else(|| {
+            format!(
+                "runtime '{}' exists but has no current version in manifest",
+                runtime_name
+            )
+        })?;
+        let source_package_dir = Path::new(DIST_RUNTIME_ROOT_DIR)
+            .join(&runtime_name)
+            .join(&current_version);
+        if !source_package_dir.is_dir() {
+            return Err(format!(
+                "runtime '{}' current package dir missing '{}'",
+                runtime_name,
+                source_package_dir.display()
+            )
+            .into());
+        }
+        let executable_path = infer_single_binary_path(&source_package_dir)?;
+        let next_version = suggest_binary_runtime_version(Some(&current_version), now_ms());
+        return Ok(ResolvedSoftwarePublish {
+            resolution: SoftwarePublishResolution {
+                upload_kind,
+                runtime_name: Some(runtime_name.clone()),
+                operation: "existing_runtime_new_version".to_string(),
+                package_type: Some(package_type),
+                current_version: Some(current_version),
+                next_version: Some(next_version),
+                executable_path: Some(executable_path),
+                summary: format!("existing runtime -> new version ({runtime_name})"),
+            },
+            uploaded_blob_path,
+            generated_exec_filename,
+            source_package_dir: Some(source_package_dir),
+        });
+    }
+
+    Ok(ResolvedSoftwarePublish {
+        resolution: SoftwarePublishResolution {
+            upload_kind,
+            runtime_name: Some(runtime_name.clone()),
+            operation: "new_runtime_first_version".to_string(),
+            package_type: Some("full_runtime".to_string()),
+            current_version: None,
+            next_version: Some("1.0.0".to_string()),
+            executable_path: Some(format!("bin/{generated_exec_filename}")),
+            summary: format!("new runtime -> first version ({runtime_name})"),
+        },
+        uploaded_blob_path,
+        generated_exec_filename,
+        source_package_dir: None,
+    })
+}
+
+async fn handle_software_publish_request(
+    state: &ArchitectState,
+    req: SoftwarePublishRequest,
+) -> Value {
+    let resolved = match resolve_software_publish(state, &req.blob_name, req.filename.as_deref()) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            return json!({
+                "status": "error",
+                "action": "software_publish",
+                "error": err.to_string()
+            });
+        }
+    };
+
+    if resolved.resolution.upload_kind == "bundle_upload" {
+        let package_out = handle_package_publish_request(
+            state,
+            PackagePublishRequest {
+                blob_name: req.blob_name,
+                set_current: Some(true),
+                sync_to: Vec::new(),
+                update_to: Vec::new(),
+            },
+        )
+        .await;
+        return json!({
+            "status": package_out.get("status").and_then(|value| value.as_str()).unwrap_or("error"),
+            "action": "software_publish",
+            "resolution": resolved.resolution,
+            "publish": package_out,
+        });
+    }
+
+    let runtime_name = match resolved.resolution.runtime_name.clone() {
+        Some(value) => value,
+        None => {
+            return json!({
+                "status": "error",
+                "action": "software_publish",
+                "error": "binary publish resolution missing runtime name"
+            });
+        }
+    };
+    let runtime_version = match resolved.resolution.next_version.clone() {
+        Some(value) => value,
+        None => {
+            return json!({
+                "status": "error",
+                "action": "software_publish",
+                "error": "binary publish resolution missing next version"
+            });
+        }
+    };
+    let executable_path = match resolved.resolution.executable_path.clone() {
+        Some(value) => value,
+        None => {
+            return json!({
+                "status": "error",
+                "action": "software_publish",
+                "error": "binary publish resolution missing executable path"
+            });
+        }
+    };
+
+    let staging_root = state.state_dir.join("software-upload-staging");
+    let bundle_root_name = format!(
+        "{}-{}",
+        runtime_name.replace('.', "-"),
+        runtime_version.replace('.', "-")
+    );
+    let build_dir = staging_root.join(format!("build-{}", Uuid::new_v4().simple()));
+    let package_root = build_dir.join(&bundle_root_name);
+
+    let publish_out = (|| -> Result<String, ArchitectError> {
+        fs::create_dir_all(&package_root)?;
+
+        if let Some(source_package_dir) = resolved.source_package_dir.as_ref() {
+            copy_dir_recursive(source_package_dir, &package_root)?;
+        } else {
+            fs::create_dir_all(package_root.join("bin"))?;
+        }
+
+        write_updated_package_json(
+            &package_root.join("package.json"),
+            &runtime_name,
+            &runtime_version,
+            resolved.source_package_dir.is_some(),
+        )?;
+
+        let exec_target = package_root.join(&executable_path);
+        if let Some(parent) = exec_target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let uploaded_bytes = fs::read(&resolved.uploaded_blob_path)?;
+        fs::write(&exec_target, uploaded_bytes)?;
+        fs::set_permissions(&exec_target, fs::Permissions::from_mode(0o755))?;
+
+        if resolved.source_package_dir.is_none() {
+            write_generated_start_script(
+                &package_root.join("bin/start.sh"),
+                &resolved.generated_exec_filename,
+            )?;
+        }
+
+        let zip_bytes = build_runtime_bundle_zip(&package_root, &bundle_root_name)?;
+        let toolkit = architect_blob_toolkit(state)?;
+        let zip_blob = toolkit.put_bytes(
+            &zip_bytes,
+            &format!("{bundle_root_name}.zip"),
+            "application/zip",
+        )?;
+        toolkit.promote(&zip_blob)?;
+        Ok(zip_blob.blob_name)
+    })();
+
+    match publish_out {
+        Ok(blob_name) => {
+            let publish = handle_package_publish_request(
+                state,
+                PackagePublishRequest {
+                    blob_name,
+                    set_current: Some(true),
+                    sync_to: Vec::new(),
+                    update_to: Vec::new(),
+                },
+            )
+            .await;
+            let _ = fs::remove_dir_all(&build_dir);
+            json!({
+                "status": publish.get("status").and_then(|value| value.as_str()).unwrap_or("error"),
+                "action": "software_publish",
+                "resolution": resolved.resolution,
+                "publish": publish,
+            })
+        }
+        Err(err) => {
+            let _ = fs::remove_dir_all(&build_dir);
+            json!({
+                "status": "error",
+                "action": "software_publish",
+                "resolution": resolved.resolution,
+                "error": err.to_string(),
+            })
+        }
+    }
+}
+
 async fn dynamic_handler(
     State(state): State<Arc<ArchitectState>>,
     uri: Uri,
@@ -3101,6 +3798,40 @@ async fn dynamic_handler(
             let out = handle_package_publish_request(&state, req).await;
             Json(out).into_response()
         }
+        (Method::POST, _) if is_software_upload_path(path) => {
+            match handle_software_upload(&state, request).await {
+                Ok(response) => Json(response).into_response(),
+                Err(err) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": err.to_string() })),
+                )
+                    .into_response(),
+            }
+        }
+        (Method::POST, _) if is_software_publish_path(path) => {
+            let body = match axum::body::to_bytes(request.into_body(), 1024 * 1024).await {
+                Ok(b) => b,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": format!("invalid body: {err}") })),
+                    )
+                        .into_response()
+                }
+            };
+            let req: SoftwarePublishRequest = match serde_json::from_slice(&body) {
+                Ok(r) => r,
+                Err(err) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": format!("invalid json: {err}") })),
+                    )
+                        .into_response()
+                }
+            };
+            let out = handle_software_publish_request(&state, req).await;
+            Json(out).into_response()
+        }
         (Method::POST, _) if is_attachments_path(path) => {
             match handle_attachment_upload(&state, request).await {
                 Ok(response) => Json(response).into_response(),
@@ -3180,51 +3911,51 @@ async fn handle_chat_message(
                 },
             }
         } else {
-        match take_pending_action(state, &resolved_session_id).await {
-            Some(pending) => {
-                let action_name = pending.translation.action.clone();
-                let preview_command = pending.preview_command.clone();
-                let pending_created_at_ms = pending.created_at_ms;
-                let mut output = match execute_tracked_admin_translation(
-                    state,
-                    &resolved_session_id,
-                    "ai_confirmed",
-                    pending.translation,
-                    preview_command.clone(),
-                    Some(pending.operation_id),
-                )
-                .await
-                {
-                    Ok(output) => output,
-                    Err(err) => json!({
-                        "status": "error",
-                        "action": action_name,
-                        "confirmed_command": preview_command,
-                        "error": err.to_string()
+            match take_pending_action(state, &resolved_session_id).await {
+                Some(pending) => {
+                    let action_name = pending.translation.action.clone();
+                    let preview_command = pending.preview_command.clone();
+                    let pending_created_at_ms = pending.created_at_ms;
+                    let mut output = match execute_tracked_admin_translation(
+                        state,
+                        &resolved_session_id,
+                        "ai_confirmed",
+                        pending.translation,
+                        preview_command.clone(),
+                        Some(pending.operation_id),
+                    )
+                    .await
+                    {
+                        Ok(output) => output,
+                        Err(err) => json!({
+                            "status": "error",
+                            "action": action_name,
+                            "confirmed_command": preview_command,
+                            "error": err.to_string()
+                        }),
+                    };
+                    output["confirmed_command"] = Value::String(preview_command);
+                    output["pending_created_at_ms"] = json!(pending_created_at_ms);
+                    output["confirmed_at_ms"] = json!(now_epoch_ms());
+                    let status = chat_status_from_command_output(&output);
+                    ChatResponse {
+                        status,
+                        mode: "scmd".to_string(),
+                        output,
+                        session_id: Some(resolved_session_id.clone()),
+                        session_title: Some(session.title.clone()),
+                    }
+                }
+                None => ChatResponse {
+                    status: "error".to_string(),
+                    mode: "chat".to_string(),
+                    output: json!({
+                        "message": "There is no pending action to confirm in this chat."
                     }),
-                };
-                output["confirmed_command"] = Value::String(preview_command);
-                output["pending_created_at_ms"] = json!(pending_created_at_ms);
-                output["confirmed_at_ms"] = json!(now_epoch_ms());
-                let status = chat_status_from_command_output(&output);
-                ChatResponse {
-                    status,
-                    mode: "scmd".to_string(),
-                    output,
                     session_id: Some(resolved_session_id.clone()),
                     session_title: Some(session.title.clone()),
-                }
+                },
             }
-            None => ChatResponse {
-                status: "error".to_string(),
-                mode: "chat".to_string(),
-                output: json!({
-                    "message": "There is no pending action to confirm in this chat."
-                }),
-                session_id: Some(resolved_session_id.clone()),
-                session_title: Some(session.title.clone()),
-            },
-        }
         } // end else (no programmer_pending)
     } else if cancellation_requested(trimmed_message) {
         let programmer_plan_cancel = state
@@ -3242,55 +3973,55 @@ async fn handle_chat_message(
                 session_title: Some(session.title.clone()),
             }
         } else {
-        match clear_pending_action(state, &resolved_session_id).await {
-            Some(pending) => {
-                let now = now_epoch_ms();
-                let params_json =
-                    serde_json::to_string(&normalize_json(&pending.translation.params))
-                        .unwrap_or_else(|_| "{}".to_string());
-                let record = ChatOperationRecord {
-                    operation_id: pending.operation_id,
-                    session_id: resolved_session_id.clone(),
-                    scope_id: operation_scope_id(&resolved_session_id),
-                    origin: "ai_write_stage".to_string(),
-                    action: pending.translation.action,
-                    target_hive: pending.translation.target_hive,
-                    params_json,
-                    params_hash: params_hash(&pending.translation.params),
-                    preview_command: pending.preview_command.clone(),
-                    status: "canceled".to_string(),
-                    created_at_ms: pending.created_at_ms,
-                    updated_at_ms: now,
-                    dispatched_at_ms: 0,
-                    completed_at_ms: now,
-                    request_id: String::new(),
-                    trace_id: String::new(),
-                    error_summary: String::new(),
-                };
-                let save_result = save_operation(state, &record).await;
-                ChatResponse {
-                    status: "ok".to_string(),
+            match clear_pending_action(state, &resolved_session_id).await {
+                Some(pending) => {
+                    let now = now_epoch_ms();
+                    let params_json =
+                        serde_json::to_string(&normalize_json(&pending.translation.params))
+                            .unwrap_or_else(|_| "{}".to_string());
+                    let record = ChatOperationRecord {
+                        operation_id: pending.operation_id,
+                        session_id: resolved_session_id.clone(),
+                        scope_id: operation_scope_id(&resolved_session_id),
+                        origin: "ai_write_stage".to_string(),
+                        action: pending.translation.action,
+                        target_hive: pending.translation.target_hive,
+                        params_json,
+                        params_hash: params_hash(&pending.translation.params),
+                        preview_command: pending.preview_command.clone(),
+                        status: "canceled".to_string(),
+                        created_at_ms: pending.created_at_ms,
+                        updated_at_ms: now,
+                        dispatched_at_ms: 0,
+                        completed_at_ms: now,
+                        request_id: String::new(),
+                        trace_id: String::new(),
+                        error_summary: String::new(),
+                    };
+                    let save_result = save_operation(state, &record).await;
+                    ChatResponse {
+                        status: "ok".to_string(),
+                        mode: "chat".to_string(),
+                        output: json!({
+                            "message": format!("Pending action discarded: {}", pending.preview_command),
+                            "pending_created_at_ms": pending.created_at_ms,
+                            "operation_id": record.operation_id,
+                            "tracking_saved": save_result.is_ok(),
+                        }),
+                        session_id: Some(resolved_session_id.clone()),
+                        session_title: Some(session.title.clone()),
+                    }
+                }
+                None => ChatResponse {
+                    status: "error".to_string(),
                     mode: "chat".to_string(),
                     output: json!({
-                        "message": format!("Pending action discarded: {}", pending.preview_command),
-                        "pending_created_at_ms": pending.created_at_ms,
-                        "operation_id": record.operation_id,
-                        "tracking_saved": save_result.is_ok(),
+                        "message": "There is no pending action to cancel in this chat."
                     }),
                     session_id: Some(resolved_session_id.clone()),
                     session_title: Some(session.title.clone()),
-                }
+                },
             }
-            None => ChatResponse {
-                status: "error".to_string(),
-                mode: "chat".to_string(),
-                output: json!({
-                    "message": "There is no pending action to cancel in this chat."
-                }),
-                session_id: Some(resolved_session_id.clone()),
-                session_title: Some(session.title.clone()),
-            },
-        }
         } // end else (no programmer_pending)
     } else if let Some(raw) = message.strip_prefix("SCMD:") {
         match handle_scmd(state, &resolved_session_id, raw.trim()).await {
@@ -8024,6 +8755,14 @@ fn is_package_publish_path(path: &str) -> bool {
     path == "/api/package/publish" || path.ends_with("/api/package/publish")
 }
 
+fn is_software_upload_path(path: &str) -> bool {
+    path == "/api/software/upload" || path.ends_with("/api/software/upload")
+}
+
+fn is_software_publish_path(path: &str) -> bool {
+    path == "/api/software/publish" || path.ends_with("/api/software/publish")
+}
+
 fn is_identity_ich_options_path(path: &str) -> bool {
     path == "/api/identity/ich-options" || path.ends_with("/api/identity/ich-options")
 }
@@ -9441,17 +10180,14 @@ fn architect_index_html(state: &ArchitectState) -> String {
         </div>
         <div class="publish-panel">
           <div class="publish-panel-head">
-            <div class="publish-panel-title">Publish Package</div>
+            <div class="publish-panel-title">Publish Software</div>
           </div>
           <div id="publish-drop" class="publish-drop">
-            <input id="publish-file-input" type="file" accept=".zip" hidden />
-            <div class="publish-drop-label">Drop .zip or <span class="publish-drop-link">browse</span></div>
+            <input id="publish-file-input" type="file" hidden />
+            <div class="publish-drop-label">Drop .zip or executable <span class="publish-drop-link">browse</span></div>
           </div>
           <div id="publish-options" class="publish-options" style="display:none">
             <div id="publish-filename" class="publish-filename"></div>
-            <label class="publish-label"><input type="checkbox" id="publish-set-current" checked /> Set as current version</label>
-            <input id="publish-sync-to" class="publish-input" type="text" placeholder="sync_to hives (comma-separated)" autocomplete="off" />
-            <input id="publish-update-to" class="publish-input" type="text" placeholder="update_to hives (comma-separated)" autocomplete="off" />
             <button id="publish-btn" class="publish-btn" type="button">Publish</button>
           </div>
           <div id="publish-result" class="publish-result"></div>
@@ -9546,6 +10282,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const statusUrl = (base || "") + "/api/status";
     const chatUrl = (base || "") + "/api/chat";
     const attachmentsUrl = (base || "") + "/api/attachments";
+    const softwareUploadUrl = (base || "") + "/api/software/upload";
+    const softwarePublishUrl = (base || "") + "/api/software/publish";
+    const packagePublishUrl = (base || "") + "/api/package/publish";
     const sessionsUrl = (base || "") + "/api/sessions";
     const identityIchOptionsUrl = (base || "") + "/api/identity/ich-options";
     const currentSessionStorageKey = "sy.architect.currentSession.{hive}";
@@ -9579,9 +10318,6 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const publishFileInput = document.getElementById("publish-file-input");
     const publishOptions = document.getElementById("publish-options");
     const publishFilename = document.getElementById("publish-filename");
-    const publishSetCurrent = document.getElementById("publish-set-current");
-    const publishSyncTo = document.getElementById("publish-sync-to");
-    const publishUpdateTo = document.getElementById("publish-update-to");
     const publishBtn = document.getElementById("publish-btn");
     const publishResult = document.getElementById("publish-result");
     const confirmModal = document.getElementById("confirm-modal");
@@ -10789,16 +11525,20 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }});
     send.addEventListener("click", submit);
 
-    // ── Publish Package panel ──────────────────────────────────
+    // ── Publish Software panel ─────────────────────────────────
     let publishSelectedFile = null;
+    function isZipPublishFile(file) {{
+      return !!(file && file.name && file.name.toLowerCase().endsWith(".zip"));
+    }}
     function publishSetFile(file) {{
-      if (!file || !file.name.endsWith(".zip")) {{
+      if (!file) {{
         publishResult.className = "publish-result err";
-        publishResult.textContent = "Only .zip files are supported.";
+        publishResult.textContent = "Choose one .zip or executable file.";
         return;
       }}
       publishSelectedFile = file;
-      publishFilename.textContent = file.name;
+      const label = isZipPublishFile(file) ? "ZIP package" : "Executable upload pilot";
+      publishFilename.textContent = file.name + " \u00B7 " + label;
       publishOptions.style.display = "";
       publishResult.className = "publish-result";
       publishResult.textContent = "";
@@ -10825,37 +11565,53 @@ fn architect_index_html(state: &ArchitectState) -> String {
       try {{
         const formData = new FormData();
         formData.append("file", publishSelectedFile, publishSelectedFile.name);
-        const uploadRes = await fetch("/api/attachments", {{ method: "POST", body: formData }});
+        const uploadRes = await fetch(softwareUploadUrl, {{ method: "POST", body: formData }});
         const uploadData = await uploadRes.json();
-        if (!uploadRes.ok || !uploadData.attachments || !uploadData.attachments.length) {{
+        if (!uploadRes.ok || uploadData.status !== "ok" || !uploadData.attachment) {{
           throw new Error(uploadData.error || "Upload failed");
         }}
-        const blobName = uploadData.attachments[0].blob_ref && uploadData.attachments[0].blob_ref.blob_name;
+        const blobName = uploadData.attachment.blob_ref && uploadData.attachment.blob_ref.blob_name;
         if (!blobName) throw new Error("No blob_name in upload response");
         publishResult.textContent = "Publishing...";
-        const syncTo = publishSyncTo.value.trim().split(",").map((s) => s.trim()).filter(Boolean);
-        const updateTo = publishUpdateTo.value.trim().split(",").map((s) => s.trim()).filter(Boolean);
-        const pubRes = await fetch("/api/package/publish", {{
-          method: "POST",
-          headers: {{ "Content-Type": "application/json" }},
-          body: JSON.stringify({{
-            blob_name: blobName,
-            set_current: publishSetCurrent.checked,
-            sync_to: syncTo,
-            update_to: updateTo
-          }})
-        }});
+        let pubRes;
+        if (uploadData.upload_kind === "bundle_upload") {{
+          pubRes = await fetch(packagePublishUrl, {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify({{
+              blob_name: blobName,
+              set_current: true,
+              sync_to: [],
+              update_to: []
+            }})
+          }});
+        }} else {{
+          pubRes = await fetch(softwarePublishUrl, {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify({{
+              blob_name: blobName,
+              filename: uploadData.attachment.filename
+            }})
+          }});
+        }}
         const pubData = await pubRes.json();
-        if (pubData.status === "ok" || pubData.status === "ok") {{
-          const p = pubData.payload || {{}};
-          const name = p.runtime_name || "";
-          const ver = p.runtime_version || "";
+        const effectiveStatus = pubData.status || (pubData.publish && pubData.publish.status) || "error";
+        if (effectiveStatus === "ok" || effectiveStatus === "sync_pending") {{
+          const publishPayload = pubData.payload || (pubData.publish && pubData.publish.payload) || {{}};
+          const resolution = pubData.resolution || null;
+          const name = publishPayload.runtime_name || (resolution && resolution.runtime_name) || "";
+          const ver = publishPayload.runtime_version || (resolution && resolution.next_version) || "";
+          const summary = resolution && resolution.summary ? " \u00B7 " + resolution.summary : "";
           publishResult.className = "publish-result ok";
-          publishResult.textContent = "Published" + (name ? ": " + name + (ver ? " v" + ver : "") : "") + " ✓";
+          publishResult.textContent = "Published" + (name ? ": " + name + (ver ? " v" + ver : "") : "") + summary + " ✓";
           publishOptions.style.display = "none";
           publishSelectedFile = null;
         }} else {{
-          const errMsg = pubData.error || (pubData.payload && pubData.payload.error_detail) || "Publish failed";
+          const errMsg = pubData.error
+            || (pubData.publish && (pubData.publish.error || (pubData.publish.payload && pubData.publish.payload.error_detail)))
+            || (pubData.payload && pubData.payload.error_detail)
+            || "Publish failed";
           publishResult.className = "publish-result err";
           publishResult.textContent = typeof errMsg === "string" ? errMsg : JSON.stringify(errMsg);
         }}
@@ -11006,6 +11762,35 @@ mod tests {
 
     fn parse(raw: &str) -> ParsedScmd {
         parse_scmd(raw).expect("scmd should parse")
+    }
+
+    #[test]
+    fn resolve_runtime_name_from_binary_filename_defaults_ai_and_wf_common() {
+        assert_eq!(
+            resolve_runtime_name_from_binary_filename("ai").expect("ai runtime"),
+            "ai.common"
+        );
+        assert_eq!(
+            resolve_runtime_name_from_binary_filename("wf-common").expect("wf runtime"),
+            "wf.common"
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_name_from_binary_filename_maps_io_segments() {
+        assert_eq!(
+            resolve_runtime_name_from_binary_filename("io-api-support").expect("io runtime"),
+            "io.api.support"
+        );
+    }
+
+    #[test]
+    fn suggest_binary_runtime_version_bumps_patch_with_archi_suffix() {
+        assert_eq!(
+            suggest_binary_runtime_version(Some("0.1.3"), 1776809030),
+            "0.1.4-archi.1776809030"
+        );
+        assert_eq!(suggest_binary_runtime_version(None, 1776809030), "1.0.0");
     }
 
     #[test]
