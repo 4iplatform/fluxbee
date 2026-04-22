@@ -365,6 +365,8 @@ struct SoftwarePublishRequest {
     blob_name: String,
     #[serde(default)]
     filename: Option<String>,
+    #[serde(default)]
+    relaunch_current: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3483,6 +3485,7 @@ async fn handle_software_publish_request(
             "action": "software_publish",
             "resolution": resolved.resolution,
             "publish": package_out,
+            "relaunch": Value::Null,
         });
     }
 
@@ -3581,11 +3584,32 @@ async fn handle_software_publish_request(
             )
             .await;
             let _ = fs::remove_dir_all(&build_dir);
+            let publish_status = publish
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("error");
+            let relaunch = if req.relaunch_current && output_status_is_success(Some(publish_status))
+            {
+                match relaunch_runtime_nodes_with_current(state, &state.hive_id, &runtime_name)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => json!({
+                        "status": "error",
+                        "hive": state.hive_id,
+                        "runtime": runtime_name,
+                        "errors": [err.to_string()],
+                    }),
+                }
+            } else {
+                Value::Null
+            };
             json!({
                 "status": publish.get("status").and_then(|value| value.as_str()).unwrap_or("error"),
                 "action": "software_publish",
                 "resolution": resolved.resolution,
                 "publish": publish,
+                "relaunch": relaunch,
             })
         }
         Err(err) => {
@@ -3595,6 +3619,7 @@ async fn handle_software_publish_request(
                 "action": "software_publish",
                 "resolution": resolved.resolution,
                 "error": err.to_string(),
+                "relaunch": Value::Null,
             })
         }
     }
@@ -4323,6 +4348,118 @@ async fn handle_package_publish_request(
             "error": err.to_string()
         }),
     }
+}
+
+fn output_status_is_success(status: Option<&str>) -> bool {
+    matches!(status, Some("ok") | Some("sync_pending"))
+}
+
+async fn list_nodes_for_hive(
+    state: &ArchitectState,
+    hive_id: &str,
+) -> Result<Vec<Value>, ArchitectError> {
+    let translation = AdminTranslation {
+        admin_target: format!("SY.admin@{}", state.hive_id),
+        action: "list_nodes".to_string(),
+        target_hive: hive_id.to_string(),
+        params: json!({}),
+    };
+    let output = execute_admin_translation(state, translation).await?;
+    let nodes = output
+        .get("payload")
+        .and_then(|value| value.get("nodes"))
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    Ok(nodes)
+}
+
+async fn relaunch_runtime_nodes_with_current(
+    state: &ArchitectState,
+    hive_id: &str,
+    runtime_name: &str,
+) -> Result<Value, ArchitectError> {
+    let nodes = list_nodes_for_hive(state, hive_id).await?;
+    let matching_nodes: Vec<Value> = nodes
+        .into_iter()
+        .filter(|node| {
+            node.get("runtime")
+                .and_then(|value| value.get("name"))
+                .and_then(|value| value.as_str())
+                == Some(runtime_name)
+        })
+        .collect();
+
+    let mut restarted = Vec::new();
+    let mut started = Vec::new();
+    let mut errors = Vec::new();
+
+    for node in matching_nodes {
+        let node_name = match node.get("node_name").and_then(|value| value.as_str()) {
+            Some(value) if !value.trim().is_empty() => value.to_string(),
+            _ => continue,
+        };
+        let lifecycle = node
+            .get("lifecycle_state")
+            .and_then(|value| value.as_str())
+            .or_else(|| node.get("status").and_then(|value| value.as_str()))
+            .unwrap_or("");
+        let action = if lifecycle.eq_ignore_ascii_case("STOPPED") {
+            "start_node"
+        } else {
+            "restart_node"
+        };
+        let translation = AdminTranslation {
+            admin_target: format!("SY.admin@{}", state.hive_id),
+            action: action.to_string(),
+            target_hive: hive_id.to_string(),
+            params: json!({ "node_name": node_name }),
+        };
+        match execute_admin_translation(state, translation).await {
+            Ok(output) => {
+                let step_status = output
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("error");
+                let item = json!({
+                    "node_name": node_name,
+                    "status": step_status,
+                });
+                if output_status_is_success(Some(step_status)) {
+                    if action == "start_node" {
+                        started.push(item);
+                    } else {
+                        restarted.push(item);
+                    }
+                } else {
+                    errors.push(json!({
+                        "node_name": node_name,
+                        "action": action,
+                        "status": step_status,
+                        "error": output.get("error_detail").or_else(|| output.get("error")).cloned().unwrap_or(Value::Null),
+                    }));
+                }
+            }
+            Err(err) => {
+                errors.push(json!({
+                    "node_name": node_name,
+                    "action": action,
+                    "status": "error",
+                    "error": err.to_string(),
+                }));
+            }
+        }
+    }
+
+    Ok(json!({
+        "hive": hive_id,
+        "runtime": runtime_name,
+        "matched_nodes": restarted.len() + started.len() + errors.len(),
+        "restarted": restarted,
+        "started": started,
+        "errors": errors,
+        "status": if errors.is_empty() { "ok" } else { "error" },
+    }))
 }
 
 async fn handle_ai_chat(
@@ -10188,6 +10325,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
           </div>
           <div id="publish-options" class="publish-options" style="display:none">
             <div id="publish-filename" class="publish-filename"></div>
+            <label id="publish-relaunch-wrap" class="publish-label" style="display:none">
+              <input type="checkbox" id="publish-relaunch-current" />
+              Restart or start matching node(s) on this hive after publish
+            </label>
             <button id="publish-btn" class="publish-btn" type="button">Publish</button>
           </div>
           <div id="publish-result" class="publish-result"></div>
@@ -10318,6 +10459,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const publishFileInput = document.getElementById("publish-file-input");
     const publishOptions = document.getElementById("publish-options");
     const publishFilename = document.getElementById("publish-filename");
+    const publishRelaunchWrap = document.getElementById("publish-relaunch-wrap");
+    const publishRelaunchCurrent = document.getElementById("publish-relaunch-current");
     const publishBtn = document.getElementById("publish-btn");
     const publishResult = document.getElementById("publish-result");
     const confirmModal = document.getElementById("confirm-modal");
@@ -11537,8 +11680,11 @@ fn architect_index_html(state: &ArchitectState) -> String {
         return;
       }}
       publishSelectedFile = file;
-      const label = isZipPublishFile(file) ? "ZIP package" : "Executable upload pilot";
+      const isZip = isZipPublishFile(file);
+      const label = isZip ? "ZIP package" : "Executable upload pilot";
       publishFilename.textContent = file.name + " \u00B7 " + label;
+      if (publishRelaunchCurrent) publishRelaunchCurrent.checked = false;
+      if (publishRelaunchWrap) publishRelaunchWrap.style.display = isZip ? "none" : "";
       publishOptions.style.display = "";
       publishResult.className = "publish-result";
       publishResult.textContent = "";
@@ -11591,7 +11737,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
             headers: {{ "Content-Type": "application/json" }},
             body: JSON.stringify({{
               blob_name: blobName,
-              filename: uploadData.attachment.filename
+              filename: uploadData.attachment.filename,
+              relaunch_current: !!(publishRelaunchCurrent && publishRelaunchCurrent.checked)
             }})
           }});
         }}
@@ -11600,11 +11747,16 @@ fn architect_index_html(state: &ArchitectState) -> String {
         if (effectiveStatus === "ok" || effectiveStatus === "sync_pending") {{
           const publishPayload = pubData.payload || (pubData.publish && pubData.publish.payload) || {{}};
           const resolution = pubData.resolution || null;
+          const relaunch = pubData.relaunch || null;
           const name = publishPayload.runtime_name || (resolution && resolution.runtime_name) || "";
           const ver = publishPayload.runtime_version || (resolution && resolution.next_version) || "";
           const summary = resolution && resolution.summary ? " \u00B7 " + resolution.summary : "";
+          const relaunchSummary = relaunch && relaunch !== null && relaunch.status
+            ? " \u00B7 relaunch " + relaunch.status
+                + (typeof relaunch.matched_nodes === "number" ? " (" + relaunch.matched_nodes + " node(s))" : "")
+            : "";
           publishResult.className = "publish-result ok";
-          publishResult.textContent = "Published" + (name ? ": " + name + (ver ? " v" + ver : "") : "") + summary + " ✓";
+          publishResult.textContent = "Published" + (name ? ": " + name + (ver ? " v" + ver : "") : "") + summary + relaunchSummary + " ✓";
           publishOptions.style.display = "none";
           publishSelectedFile = null;
         }} else {{
