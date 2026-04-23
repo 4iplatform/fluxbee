@@ -41,7 +41,8 @@ use json_router::runtime_manifest::{
     write_runtime_manifest_file_atomic, RuntimeManifest, RuntimeManifestEntry,
 };
 use json_router::runtime_package::{
-    install_validated_package, validate_package, DIST_RUNTIME_MANIFEST_PATH, DIST_RUNTIME_ROOT_DIR,
+    install_validated_package_with_options, validate_package, DIST_RUNTIME_MANIFEST_PATH,
+    DIST_RUNTIME_ROOT_DIR,
 };
 use json_router::shm::{
     now_epoch_ms, LsaRegionReader, RemoteHiveEntry, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
@@ -6623,7 +6624,7 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "set_current",
                 "bool",
-                "Optional current-pointer intent. Only true or omission is supported in the current implementation.",
+                "Optional current-pointer intent. When true, promote this version to current. When false, publish it only into available versions.",
             ),
             admin_action_body_field(
                 "sync_to",
@@ -7746,6 +7747,7 @@ fn publish_runtime_package_inline(
     staging_root: &Path,
     dist_root: &Path,
     manifest_path: &Path,
+    set_current: bool,
 ) -> Result<serde_json::Value, String> {
     let package_root = materialize_inline_runtime_package(package_files, staging_root)?;
     let validated = match validate_package(&package_root, None) {
@@ -7755,7 +7757,12 @@ fn publish_runtime_package_inline(
             return Err(err);
         }
     };
-    let install = match install_validated_package(&validated, dist_root, manifest_path) {
+    let install = match install_validated_package_with_options(
+        &validated,
+        dist_root,
+        manifest_path,
+        set_current,
+    ) {
         Ok(install) => install,
         Err(err) => {
             let _ = fs::remove_dir_all(&package_root);
@@ -7782,6 +7789,7 @@ fn publish_runtime_package_bundle(
     staging_root: &Path,
     dist_root: &Path,
     manifest_path: &Path,
+    set_current: bool,
 ) -> Result<serde_json::Value, String> {
     let (package_root, bundle_file) =
         materialize_bundle_runtime_package(blob_root, blob_path, staging_root)?;
@@ -7796,7 +7804,12 @@ fn publish_runtime_package_bundle(
             return Err(err);
         }
     };
-    let install = match install_validated_package(&validated, dist_root, manifest_path) {
+    let install = match install_validated_package_with_options(
+        &validated,
+        dist_root,
+        manifest_path,
+        set_current,
+    ) {
         Ok(install) => install,
         Err(err) => {
             let _ = fs::remove_dir_all(&extraction_root);
@@ -7923,6 +7936,17 @@ fn runtime_versions_from_manifest_entry_local(entry: &RuntimeManifestEntry) -> V
     out
 }
 
+fn can_remove_current_runtime_version_local(
+    entry: &RuntimeManifestEntry,
+    runtime_version: &str,
+) -> bool {
+    let current = entry.current.as_deref().map(str::trim).unwrap_or("");
+    if current.is_empty() || current != runtime_version {
+        return false;
+    }
+    runtime_versions_from_manifest_entry_local(entry) == vec![runtime_version.to_string()]
+}
+
 fn runtime_manifest_case_variants_local(
     runtimes: &BTreeMap<String, RuntimeManifestEntry>,
     runtime: &str,
@@ -8022,7 +8046,13 @@ fn remove_runtime_version_from_manifest_local(
     })?;
 
     let current = entry.current.as_deref().map(str::trim).unwrap_or("");
-    if runtime_version == "current" || (!current.is_empty() && current == runtime_version) {
+    if runtime_version == "current" {
+        return Err("RUNTIME_CURRENT_CONFLICT".to_string());
+    }
+    if !current.is_empty()
+        && current == runtime_version
+        && !can_remove_current_runtime_version_local(&entry, runtime_version)
+    {
         return Err("RUNTIME_CURRENT_CONFLICT".to_string());
     }
 
@@ -8039,7 +8069,10 @@ fn remove_runtime_version_from_manifest_local(
     entry
         .available
         .retain(|value| value.trim() != runtime_version);
-    if entry.available.is_empty() && current.is_empty() {
+    if current == runtime_version {
+        entry.current = None;
+    }
+    if entry.available.is_empty() && entry.current.is_none() {
         runtime_entries.remove(&runtime_key);
     } else {
         runtime_entries.insert(
@@ -8308,20 +8341,6 @@ async fn handle_publish_runtime_package(
         }
     };
 
-    if matches!(req.set_current, Some(false)) {
-        return Ok((
-            400,
-            serde_json::json!({
-                "status": "error",
-                "action": "publish_runtime_package",
-                "payload": serde_json::Value::Null,
-                "error_code": "INVALID_REQUEST",
-                "error_detail": "set_current=false is not supported yet",
-            })
-            .to_string(),
-        ));
-    }
-
     let manifest_path = PathBuf::from(DIST_RUNTIME_MANIFEST_PATH);
     if !manifest_path.exists() {
         return Ok((
@@ -8375,12 +8394,14 @@ async fn handle_publish_runtime_package(
         }
     };
 
+    let set_current = req.set_current.unwrap_or(true);
     let publish_result = match &req.source {
         PublishRuntimePackageSource::InlinePackage { files } => publish_runtime_package_inline(
             files,
             &staging_root,
             Path::new(DIST_RUNTIME_ROOT_DIR),
             &manifest_path,
+            set_current,
         ),
         PublishRuntimePackageSource::BundleUpload { blob_path } => publish_runtime_package_bundle(
             &ctx.blob_root,
@@ -8388,6 +8409,7 @@ async fn handle_publish_runtime_package(
             &staging_root,
             Path::new(DIST_RUNTIME_ROOT_DIR),
             &manifest_path,
+            set_current,
         ),
     };
 
@@ -8648,7 +8670,26 @@ async fn handle_remove_runtime_version(
     };
 
     let current = entry.current.as_deref().map(str::trim).unwrap_or("");
-    if runtime_version == "current" || (!current.is_empty() && current == runtime_version) {
+    if runtime_version == "current" {
+        return Ok((
+            409,
+            serde_json::json!({
+                "status": "error",
+                "action": "remove_runtime_version",
+                "payload": serde_json::Value::Null,
+                "error_code": "RUNTIME_CURRENT_CONFLICT",
+                "error_detail": format!(
+                    "cannot delete current version '{}' for runtime '{}'",
+                    current, runtime
+                ),
+            })
+            .to_string(),
+        ));
+    }
+    if !current.is_empty()
+        && current == runtime_version
+        && !can_remove_current_runtime_version_local(entry, runtime_version)
+    {
         return Ok((
             409,
             serde_json::json!({
@@ -11530,6 +11571,51 @@ mod tests {
     }
 
     #[test]
+    fn remove_runtime_version_from_manifest_local_allows_deleting_sole_current_runtime() {
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-03-16T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({
+                "ai.test.gov": {
+                    "available": ["1.0.0"],
+                    "current": "1.0.0",
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+
+        let updated = remove_runtime_version_from_manifest_local(&manifest, "ai.test.gov", "1.0.0")
+            .expect("remove sole current");
+        assert!(updated.runtimes.get("ai.test.gov").is_none());
+        assert!(updated.version > manifest.version);
+    }
+
+    #[test]
+    fn can_remove_current_runtime_version_local_only_when_sole_version() {
+        let sole = RuntimeManifestEntry {
+            available: vec!["1.0.0".to_string()],
+            current: Some("1.0.0".to_string()),
+            package_type: Some("full_runtime".to_string()),
+            runtime_base: None,
+            extra: BTreeMap::new(),
+        };
+        assert!(can_remove_current_runtime_version_local(&sole, "1.0.0"));
+
+        let multiple = RuntimeManifestEntry {
+            available: vec!["0.9.0".to_string(), "1.0.0".to_string()],
+            current: Some("1.0.0".to_string()),
+            package_type: Some("full_runtime".to_string()),
+            runtime_base: None,
+            extra: BTreeMap::new(),
+        };
+        assert!(!can_remove_current_runtime_version_local(
+            &multiple, "1.0.0"
+        ));
+    }
+
+    #[test]
     fn remove_runtime_version_from_manifest_local_accepts_legacy_runtime_casing() {
         let manifest = RuntimeManifest {
             schema_version: 1,
@@ -11607,6 +11693,7 @@ mod tests {
             &staging_root,
             &runtimes_root,
             &manifest_path,
+            true,
         )
         .expect("publish inline package");
 
@@ -11666,12 +11753,22 @@ mod tests {
             ),
         ]);
 
-        let first =
-            publish_runtime_package_inline(&files, &staging_root, &runtimes_root, &manifest_path)
-                .expect("first inline publish");
-        let second =
-            publish_runtime_package_inline(&files, &staging_root, &runtimes_root, &manifest_path)
-                .expect("second inline publish should be idempotent");
+        let first = publish_runtime_package_inline(
+            &files,
+            &staging_root,
+            &runtimes_root,
+            &manifest_path,
+            true,
+        )
+        .expect("first inline publish");
+        let second = publish_runtime_package_inline(
+            &files,
+            &staging_root,
+            &runtimes_root,
+            &manifest_path,
+            true,
+        )
+        .expect("second inline publish should be idempotent");
 
         assert_eq!(first["runtime_name"], json!("ai.support.demo"));
         assert_eq!(second["runtime_name"], json!("ai.support.demo"));
@@ -11714,6 +11811,7 @@ mod tests {
             &staging_root,
             &runtimes_root,
             &manifest_path,
+            true,
         )
         .expect("first inline publish");
 
@@ -11731,6 +11829,7 @@ mod tests {
             &staging_root,
             &runtimes_root,
             &manifest_path,
+            true,
         )
         .expect_err("changed contents must conflict");
         assert!(err.contains("different contents"), "err={err}");
@@ -11763,6 +11862,7 @@ mod tests {
             &staging_root,
             &runtimes_root,
             &manifest_path,
+            true,
         )
         .expect_err("missing blob bundle must fail");
         assert!(err.contains("bundle blob not found"), "err={err}");
@@ -11800,6 +11900,7 @@ mod tests {
             &staging_root,
             &runtimes_root,
             &manifest_path,
+            true,
         )
         .expect_err("invalid zip must fail");
         assert!(err.contains("invalid zip"), "err={err}");
@@ -11844,6 +11945,7 @@ mod tests {
             &staging_root,
             &runtimes_root,
             &manifest_path,
+            true,
         )
         .expect_err("invalid layout must fail");
         assert!(
@@ -11894,6 +11996,7 @@ mod tests {
             &staging_root,
             &runtimes_root,
             &manifest_path,
+            true,
         )
         .expect("publish bundle package");
 
