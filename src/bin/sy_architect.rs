@@ -4468,6 +4468,25 @@ fn sanitized_redeploy_config(config: &Value) -> Value {
     Value::Object(sanitized)
 }
 
+fn runtime_name_from_node_config_output(output: &Value) -> Option<&str> {
+    output
+        .get("payload")
+        .and_then(|value| value.get("config"))
+        .and_then(|value| value.get("_system"))
+        .and_then(|value| value.get("runtime"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn node_config_from_output(output: &Value) -> Option<Value> {
+    output
+        .get("payload")
+        .and_then(|value| value.get("config"))
+        .cloned()
+        .filter(Value::is_object)
+}
+
 async fn redeploy_runtime_nodes_with_current(
     state: &ArchitectState,
     hive_id: &str,
@@ -4475,32 +4494,46 @@ async fn redeploy_runtime_nodes_with_current(
     preserve_node_config: bool,
 ) -> Result<Value, ArchitectError> {
     let nodes = list_nodes_for_hive(state, hive_id).await?;
-    let matching_nodes: Vec<Value> = nodes
-        .into_iter()
-        .filter(|node| {
-            node.get("runtime")
-                .and_then(|value| value.get("name"))
-                .and_then(|value| value.as_str())
-                == Some(runtime_name)
-        })
-        .collect();
 
     let mut recreated = Vec::new();
     let mut errors = Vec::new();
 
-    for node in matching_nodes {
+    for node in nodes {
         let node_name = match node.get("node_name").and_then(|value| value.as_str()) {
             Some(value) if !value.trim().is_empty() => value.to_string(),
             _ => continue,
         };
-        let config = if preserve_node_config {
-            match get_node_config_for_hive(state, hive_id, &node_name).await {
+        let mut config_output: Option<Value> = None;
+        let resolved_runtime_name = match node
+            .get("runtime")
+            .and_then(|value| value.get("name"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => Some(value.to_string()),
+            None => match get_node_config_for_hive(state, hive_id, &node_name).await {
                 Ok(output) => {
-                    let config = output
-                        .get("payload")
-                        .and_then(|value| value.get("config"))
-                        .cloned()
-                        .unwrap_or(Value::Null);
+                    let runtime = runtime_name_from_node_config_output(&output).map(str::to_string);
+                    if runtime.is_some() {
+                        config_output = Some(output);
+                    }
+                    runtime
+                }
+                Err(_) => None,
+            },
+        };
+        if resolved_runtime_name.as_deref() != Some(runtime_name) {
+            continue;
+        }
+        let config = if preserve_node_config {
+            let output = match config_output.take() {
+                Some(output) => Ok(output),
+                None => get_node_config_for_hive(state, hive_id, &node_name).await,
+            };
+            match output {
+                Ok(output) => {
+                    let config = node_config_from_output(&output).unwrap_or(Value::Null);
                     if !config.is_object() {
                         errors.push(json!({
                             "node_name": node_name,
@@ -12168,6 +12201,40 @@ mod tests {
             "0.1.4-archi.1776809030"
         );
         assert_eq!(suggest_binary_runtime_version(None, 1776809030), "1.0.0");
+    }
+
+    #[test]
+    fn runtime_name_from_node_config_output_extracts_nested_system_runtime() {
+        let output = json!({
+            "payload": {
+                "config": {
+                    "_system": {
+                        "runtime": "io.api"
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            runtime_name_from_node_config_output(&output),
+            Some("io.api")
+        );
+    }
+
+    #[test]
+    fn node_config_from_output_returns_only_object_payloads() {
+        let output = json!({
+            "payload": {
+                "config": {
+                    "_system": {
+                        "runtime": "io.api",
+                        "runtime_version": "1.0.0"
+                    },
+                    "mode": "support"
+                }
+            }
+        });
+        let config = node_config_from_output(&output).expect("object config");
+        assert_eq!(config.get("mode").and_then(Value::as_str), Some("support"));
     }
 
     #[test]
