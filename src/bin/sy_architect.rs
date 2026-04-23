@@ -69,6 +69,7 @@ const ARCHITECT_MAX_MULTIPART_UPLOAD_BYTES: usize =
     ARCHITECT_MAX_SOFTWARE_UPLOAD_BYTES + (4 * 1024 * 1024);
 const ARCHITECT_INTERNAL_ARTIFACT_KIND_INFRASTRUCTURE: &str = "infrastructure";
 const ARCHITECT_INFRA_ARTIFACT_RUNTIME_PACKAGE_SOURCE: &str = "runtime_package_source";
+const STATUS_REFRESH_INTERVAL_SECS: u64 = 60;
 const ARCHI_SYSTEM_PROMPT: &str = r#"You are archi, the Fluxbee system architect.
 
 Operate as a concise technical assistant for the Fluxbee control plane.
@@ -433,6 +434,14 @@ struct SessionListResponse {
 struct SessionDetailResponse {
     session: SessionSummary,
     messages: Vec<PersistedChatMessage>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionMetaResponse {
+    session_id: String,
+    message_count: u64,
+    last_activity_at_ms: u64,
+    revision: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -3732,6 +3741,28 @@ async fn dynamic_handler(
                 Err(err) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({ "error": format!("failed to clear sessions: {err}") })),
+                )
+                    .into_response(),
+            }
+        }
+        (Method::GET, _) if is_session_meta_path(path) => {
+            let Some(session_id) = session_meta_id_from_path(path) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "missing session id" })),
+                )
+                    .into_response();
+            };
+            match load_chat_session_meta(&state, session_id).await {
+                Ok(Some(detail)) => Json(detail).into_response(),
+                Ok(None) => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "session_not_found" })),
+                )
+                    .into_response(),
+                Err(err) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("failed to load session meta: {err}") })),
                 )
                     .into_response(),
             }
@@ -7305,8 +7336,6 @@ async fn execute_admin_action_with_context(
     }))
 }
 
-const STATUS_REFRESH_INTERVAL_SECS: u64 = 30;
-
 async fn status_refresh_loop(state: Arc<ArchitectState>) {
     loop {
         let fresh = build_architect_status(&state).await;
@@ -7781,6 +7810,52 @@ async fn load_chat_session(
         session: session_record_to_summary(&session),
         messages: persisted,
     }))
+}
+
+fn session_revision_string(message_count: u64, last_activity_at_ms: u64) -> String {
+    format!("{message_count}:{last_activity_at_ms}")
+}
+
+async fn load_chat_session_meta(
+    state: &ArchitectState,
+    session_id: &str,
+) -> Result<Option<SessionMetaResponse>, ArchitectError> {
+    let _guard = state.chat_lock.lock().await;
+    let db = open_architect_db(state).await?;
+    let sessions = ensure_sessions_table(&db).await?;
+    let filter = format!("session_id = '{}'", session_id.replace('\'', "''"));
+    let batches = sessions
+        .query()
+        .only_if(filter)
+        .select(Select::columns(&[
+            "session_id",
+            "last_activity_at_ms",
+            "message_count",
+        ]))
+        .execute()
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    for batch in &batches {
+        let session_ids = string_column(batch, "session_id")?;
+        let updated = u64_column(batch, "last_activity_at_ms")?;
+        let counts = u64_column(batch, "message_count")?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let session_id = session_ids.value(0).to_string();
+        let last_activity_at_ms = updated.value(0);
+        let message_count = counts.value(0);
+        return Ok(Some(SessionMetaResponse {
+            revision: session_revision_string(message_count, last_activity_at_ms),
+            session_id,
+            message_count,
+            last_activity_at_ms,
+        }));
+    }
+    Ok(None)
 }
 
 async fn delete_chat_session(
@@ -9055,6 +9130,7 @@ fn is_api_path(path: &str) -> bool {
         || path == "/api/status"
         || path == "/api/chat"
         || path == "/api/sessions"
+        || path.starts_with("/api/session-meta/")
         || path == "/api/identity/ich-options"
         || path.starts_with("/api/sessions/")
         || path.ends_with("/api/status")
@@ -9114,12 +9190,25 @@ fn is_sessions_collection_path(path: &str) -> bool {
     path == "/api/sessions" || path.ends_with("/api/sessions")
 }
 
+fn is_session_meta_path(path: &str) -> bool {
+    path.starts_with("/api/session-meta/") && session_meta_id_from_path(path).is_some()
+}
+
 fn is_session_detail_path(path: &str) -> bool {
-    path.starts_with("/api/sessions/") && session_id_from_path(path).is_some()
+    path.starts_with("/api/sessions/")
+        && !path.ends_with("/meta")
+        && session_id_from_path(path).is_some()
 }
 
 fn session_id_from_path(path: &str) -> Option<&str> {
     path.split("/api/sessions/")
+        .nth(1)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn session_meta_id_from_path(path: &str) -> Option<&str> {
+    path.split("/api/session-meta/")
         .nth(1)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -10629,12 +10718,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const softwarePublishUrl = (base || "") + "/api/software/publish";
     const packagePublishUrl = (base || "") + "/api/package/publish";
     const sessionsUrl = (base || "") + "/api/sessions";
+    const sessionMetaUrl = (base || "") + "/api/session-meta";
     const identityIchOptionsUrl = (base || "") + "/api/identity/ich-options";
     const currentSessionStorageKey = "sy.architect.currentSession.{hive}";
     const statusRefreshActiveMs = 15000;
     const statusRefreshHiddenMs = 60000;
-    const sessionRefreshActiveMs = 2000;
-    const sessionRefreshHiddenMs = 8000;
+    const sessionRefreshActiveMs = 5000;
+    const sessionRefreshHiddenMs = 15000;
     const messages = document.getElementById("messages");
     const input = document.getElementById("input");
     const attach = document.getElementById("attach");
@@ -11685,12 +11775,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
       detail.messages.forEach((message) => renderStoredMessage(message));
     }}
-    async function loadSession(sessionId, existingDetail, showWelcome = false) {{
+    async function loadSession(sessionId, existingDetail, showWelcome = false, preserveComposer = false) {{
       currentSessionId = sessionId;
       renderHistory();
       localStorage.setItem(currentSessionStorageKey, sessionId);
       if (existingDetail) {{
-        renderSession(existingDetail, showWelcome);
+        renderSession(existingDetail, showWelcome, preserveComposer);
         return;
       }}
       const res = await fetch(sessionsUrl + "/" + encodeURIComponent(sessionId), {{ cache: "no-store" }});
@@ -11701,7 +11791,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         throw new Error("session load failed");
       }}
       const detail = await res.json();
-      renderSession(detail, showWelcome);
+      renderSession(detail, showWelcome, preserveComposer);
     }}
     async function refreshCurrentSession(options = {{}}) {{
       const force = !!(options && options.force);
@@ -11710,14 +11800,16 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
       sessionRefreshInFlight = true;
       try {{
-        const res = await fetch(sessionsUrl + "/" + encodeURIComponent(currentSessionId), {{ cache: "no-store" }});
+        const res = await fetch(sessionMetaUrl + "/" + encodeURIComponent(currentSessionId), {{ cache: "no-store" }});
         if (!res.ok) {{
           return;
         }}
         const detail = await res.json();
-        const nextRevision = sessionRevision(detail);
+        const nextRevision = detail && detail.revision
+          ? String(detail.revision)
+          : sessionRevision({{ session: detail || null }});
         if (force || nextRevision !== currentSessionRevision) {{
-          renderSession(detail, false, true);
+          await loadSession(currentSessionId, null, false, true);
           await refreshSessionList(currentSessionId);
         }}
       }} catch (_err) {{
@@ -12235,6 +12327,22 @@ mod tests {
         });
         let config = node_config_from_output(&output).expect("object config");
         assert_eq!(config.get("mode").and_then(Value::as_str), Some("support"));
+    }
+
+    #[test]
+    fn session_revision_string_formats_count_and_timestamp() {
+        assert_eq!(
+            session_revision_string(42, 1777000000000),
+            "42:1777000000000"
+        );
+    }
+
+    #[test]
+    fn session_meta_id_from_path_extracts_id() {
+        assert_eq!(
+            session_meta_id_from_path("/api/session-meta/sess_123"),
+            Some("sess_123")
+        );
     }
 
     #[test]
