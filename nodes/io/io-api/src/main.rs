@@ -2398,7 +2398,7 @@ mod tests {
         );
         assert_eq!(
             schema.get("runtime").and_then(Value::as_str),
-            Some("IO.api")
+            Some("io.api")
         );
         assert!(schema
             .get("required_configuration")

@@ -9,11 +9,11 @@ Desplegar y actualizar nodos IA por el camino canónico de Fluxbee:
 3. `SPAWN_NODE` o restart controlado, segun el tipo de nodo
 
 Incluye dos perfiles:
-- nodo IA común (`AI.common`)
-- frontdesk gov (`SY.frontdesk.gov`)
+- nodo IA común (`ai.common`)
+- frontdesk gov (`sy.frontdesk.gov`)
 
 Importante:
-- la separación de comportamiento es por runtime (`AI.common` vs `SY.frontdesk.gov`), no por flags de modo.
+- la separación de comportamiento es por runtime (`ai.common` vs `sy.frontdesk.gov`), no por flags de modo.
 
 ---
 
@@ -31,12 +31,12 @@ Importante:
 - Spawn sin `--config-json` (genera config base `{}` y usa `tenant_id` como fallback si se pasa por flag).
 
 Decisión de ownership:
-- El prompt/flujo de `SY.frontdesk.gov` pertenece al runtime frontdesk.
-- `AI.common` no debe transportar lógica específica gov/frontdesk.
+- El prompt/flujo de `sy.frontdesk.gov` pertenece al runtime frontdesk.
+- `ai.common` no debe transportar lógica específica gov/frontdesk.
 - El data-plane `text/v1` (incluyendo resolución de `content_ref`/`attachments` y offload de respuesta a `content_ref` por tamaño) pertenece al SDK AI compartido.
 
 Nota operativa vigente para frontdesk:
-- `SY.frontdesk.gov` sigue usando hoy el camino general de deploy de runtimes AI, pero debe leerse como runtime singleton `system-default` por hive.
+- `sy.frontdesk.gov` sigue usando hoy el camino general de deploy de runtimes AI, pero debe leerse como runtime singleton `system-default` por hive.
 - para updates rutinarios, el proceso real esperado es el servicio singleton `sy-frontdesk-gov.service`.
 - en updates rutinarios, el camino correcto conceptual es `publish runtime + SYSTEM_UPDATE targeted + refresh del binario real del singleton + restart del servicio singleton`.
 - `spawn/delete/recreate` de `SY.frontdesk.gov` deben leerse como caminos excepcionales de bootstrap, reinstall o recuperación, no como el flujo normal de update.
@@ -69,7 +69,7 @@ HIVE_ID="motherbee"
 bash scripts/deploy-ia-node.sh \
   --base "$BASE" \
   --hive-id "$HIVE_ID" \
-  --runtime "AI.common" \
+  --runtime "ai.common" \
   --version "0.1.0" \
   --sync-hint \
   --sudo
@@ -83,7 +83,7 @@ Para update rutinario de frontdesk, publicar runtime y luego alinear el binario 
 bash scripts/deploy-ia-node.sh \
   --base "$BASE" \
   --hive-id "$HIVE_ID" \
-  --runtime "SY.frontdesk.gov" \
+  --runtime "sy.frontdesk.gov" \
   --version "0.1.0" \
   --sync-hint \
   --sudo
@@ -93,7 +93,7 @@ sudo install -m 0755 target/release/sy-frontdesk-gov /usr/bin/sy-frontdesk-gov
 sudo systemctl restart sy-frontdesk-gov.service
 sudo systemctl status sy-frontdesk-gov.service --no-pager -l
 sha256sum /usr/bin/sy-frontdesk-gov
-sha256sum /var/lib/fluxbee/dist/runtimes/SY.frontdesk.gov/0.1.0/bin/sy-frontdesk-gov
+sha256sum /var/lib/fluxbee/dist/runtimes/sy.frontdesk.gov/0.1.0/bin/sy-frontdesk-gov
 ```
 
 Si los hashes no coinciden, el servicio singleton sigue corriendo un binario distinto al runtime publicado.
@@ -122,7 +122,7 @@ Ejemplo frontdesk solo para bootstrap controlado:
 bash scripts/deploy-ia-node.sh \
   --base "$BASE" \
   --hive-id "$HIVE_ID" \
-  --runtime "SY.frontdesk.gov" \
+  --runtime "sy.frontdesk.gov" \
   --version "0.1.0" \
   --node-name "SY.frontdesk.gov@$HIVE_ID" \
   --spawn \
@@ -142,7 +142,7 @@ Con el contrato actual de core, `spawn` inyecta `FLUXBEE_NODE_NAME=<node@hive>` 
 bash scripts/deploy-ia-node.sh \
   --base "$BASE" \
   --hive-id "$HIVE_ID" \
-  --runtime "SY.frontdesk.gov" \
+  --runtime "sy.frontdesk.gov" \
   --version "0.1.0" \
   --sync-hint \
   --sudo
@@ -151,7 +151,7 @@ bash scripts/deploy-ia-node.sh \
 bash scripts/deploy-ia-node.sh \
   --base "$BASE" \
   --hive-id "$HIVE_ID" \
-  --runtime "AI.common" \
+  --runtime "ai.common" \
   --version "0.1.0" \
   --sync-hint \
   --sudo
@@ -163,7 +163,7 @@ Los flags `--forced-node-name` y `--forced-dynamic-config-dir` quedan solo para 
 
 ## 6) Update de código de nodo existente
 
-Para `AI.common` y nodos managed similares, `--update-existing` sigue siendo el camino operativo esperado.
+Para `ai.common` y nodos managed similares, `--update-existing` sigue siendo el camino operativo esperado.
 
 Para `SY.frontdesk.gov`, no tomar esta sección como camino rutinario por defecto.
 La dirección vigente para frontdesk es singleton por hive, con restart del servicio local.
@@ -172,7 +172,7 @@ La dirección vigente para frontdesk es singleton por hive, con restart del serv
 bash scripts/deploy-ia-node.sh \
   --base "$BASE" \
   --hive-id "$HIVE_ID" \
-  --runtime "SY.frontdesk.gov" \
+  --runtime "sy.frontdesk.gov" \
   --version "0.1.1" \
   --node-name "SY.frontdesk.gov@$HIVE_ID" \
   --update-existing \
@@ -199,7 +199,7 @@ Ejemplo forzando modo global:
 bash scripts/deploy-ia-node.sh \
   --base "$BASE" \
   --hive-id "$HIVE_ID" \
-  --runtime "AI.common" \
+  --runtime "ai.common" \
   --version "0.1.2" \
   --update-scope global \
   --sync-hint \
@@ -210,9 +210,9 @@ bash scripts/deploy-ia-node.sh \
 
 ## 7) Prompts/config obligatorias
 
-Para `AI.common`, los prompts/config obligatorias pueden versionarse en el `config` del nodo.
+Para `ai.common`, los prompts/config obligatorias pueden versionarse en el `config` del nodo.
 
-Para `SY.frontdesk.gov`, la dirección vigente es distinta:
+Para `sy.frontdesk.gov`, la dirección vigente es distinta:
 - el prompt funcional base pertenece al runtime frontdesk,
 - `CONFIG_SET` queda preferentemente para modelo, timeouts, flags operativos y secrets,
 - no para transportar obligatoriamente todo el prompt funcional del nodo.
@@ -309,7 +309,7 @@ Example (`AI.chat@motherbee`):
 bash scripts/deploy-ia-node.sh \
   --base "http://127.0.0.1:8080" \
   --hive-id "motherbee" \
-  --runtime "AI.chat" \
+  --runtime "ai.chat" \
   --version "0.1.1" \
   --node-name "AI.chat@motherbee" \
   --tenant-id "tnt:43d576a3-d712-4d91-9245-5d5463dd693e" \
@@ -332,7 +332,7 @@ Example (`SY.frontdesk.gov@motherbee`):
 bash scripts/deploy-ia-node.sh \
   --base "http://127.0.0.1:8080" \
   --hive-id "motherbee" \
-  --runtime "SY.frontdesk.gov" \
+  --runtime "sy.frontdesk.gov" \
   --version "0.1.0" \
   --node-name "SY.frontdesk.gov@motherbee" \
   --tenant-id "tnt:43d576a3-d712-4d91-9245-5d5463dd693e" \

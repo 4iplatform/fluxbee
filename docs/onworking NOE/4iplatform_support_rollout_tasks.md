@@ -20,7 +20,7 @@
 
 Resolver en un mismo frente operativo:
 
-1. actualización de runtimes ya instalados (`IO.slack`, `SY.frontdesk.gov`, `AI.*`);
+1. actualización de runtimes ya instalados (`IO.slack`, `sy.frontdesk.gov`, `AI.*`);
 2. release y spawn de un nuevo nodo `AI.support.rep`;
 3. preparación de `IO.api` para recibir requests desde un servicio .NET que reenvía mensajes de WhatsApp;
 4. definición del contrato exacto del request HTTP que ese servicio debe enviar;
@@ -88,13 +88,13 @@ Conclusión:
 
 Camino actual soportado por el repo:
 
-- runtime base: `AI.common`
+- runtime base: `ai.common`
 - nodo concreto: `AI.support.rep@<hive>`
 - prompt/comportamiento del nodo: vía config del nodo (`config.json`/`CONFIG_SET`)
 
 Nota:
 
-- el modelo de package `config_only` existe como dirección documental, pero el camino operativo vigente del repo hoy es `runtime AI.common + config del nodo`.
+- el modelo de package `config_only` existe como dirección documental, pero el camino operativo vigente del repo hoy es `runtime ai.common + config del nodo`.
 
 ### 1.6 Webhook outbound
 
@@ -165,10 +165,10 @@ systemctl cat sy-frontdesk-gov.service
 systemctl show -p MainPID --value sy-frontdesk-gov.service
 ```
 
-### A.2 Actualización de `AI.common`
+### A.2 Actualización de `ai.common`
 
-- [ ] A4. Publicar/updatear runtime `AI.common`.
-- [ ] A5. Reaplicar/updatear nodos `AI.*` instalados que dependan de `AI.common`.
+- [ ] A4. Publicar/updatear runtime `ai.common`.
+- [ ] A5. Reaplicar/updatear nodos `AI.*` instalados que dependan de `ai.common`.
 
 Comando base:
 
@@ -176,7 +176,7 @@ Comando base:
 bash scripts/deploy-ia-node.sh \
   --base "$BASE" \
   --hive-id "$HIVE_ID" \
-  --runtime "AI.common" \
+  --runtime "ai.common" \
   --version "<VERSION>" \
   --sync-hint \
   --sudo
@@ -188,7 +188,7 @@ Para un nodo ya existente:
 bash scripts/deploy-ia-node.sh \
   --base "$BASE" \
   --hive-id "$HIVE_ID" \
-  --runtime "AI.common" \
+  --runtime "ai.common" \
   --version "<VERSION>" \
   --node-name "<AI.NODE@HIVE>" \
   --update-existing \
@@ -205,7 +205,7 @@ HIVE_ID="motherbee"
 bash scripts/deploy-ia-node.sh \
   --base "$BASE" \
   --hive-id "$HIVE_ID" \
-  --runtime "AI.common" \
+  --runtime "ai.common" \
   --version "0.1.3" \
   --node-name "AI.chat@motherbee" \
   --update-existing \
@@ -256,22 +256,22 @@ bash scripts/deploy-io-slack.sh \
   --sudo
 ```
 
-### A.4 Actualización de `SY.frontdesk.gov`
+### A.4 Actualización de `sy.frontdesk.gov`
 
-- [ ] A8. Actualizar `SY.frontdesk.gov`.
+- [ ] A8. Actualizar `sy.frontdesk.gov`.
 - [ ] A9. Validar que el proceso real activo quedó con el binario/runtime esperado.
 
 Camino correcto esperado para este rollout:
 
  version depende del runtime string que quiera publicar. para ver las versiones disponibles:
- `curl -sS "$BASE/hives/$HIVE_ID/runtimes/SY.frontdesk.gov" | jq .`
+ `curl -sS "$BASE/hives/$HIVE_ID/runtimes/sy.frontdesk.gov" | jq .`
 
 ```bash
 FD_VERSION="1.0.0"
 bash scripts/deploy-ia-node.sh \
   --base "$BASE" \
   --hive-id "$HIVE_ID" \
-  --runtime "SY.frontdesk.gov" \
+  --runtime "sy.frontdesk.gov" \
   --version "$FD_VERSION" \
   --sync-hint \
   --sudo
@@ -292,15 +292,15 @@ curl -sS "$BASE/hives/$HIVE_ID/nodes" | jq '.payload.nodes[] | select(.node_name
 
 Importante:
 
-- para updates rutinarios, `SY.frontdesk.gov` debe tratarse como singleton canónico por hive;
+- para updates rutinarios, `sy.frontdesk.gov` debe tratarse como singleton canónico por hive;
 - no conviene usar `--node-name ... --update-existing` como si fuera un `AI.*` / `IO.*` común;
 - delete + spawn limpio quedan reservados para reinstalación deliberada, validación de bootstrap o recuperación de estado roto.
 - en este host puntual, `publish + SYSTEM_UPDATE + restart` no alcanza por sí solo para cambiar el binario efectivo del servicio, porque `sy-frontdesk-gov.service` ejecuta `/usr/bin/sy-frontdesk-gov`.
 
 Camino real completo cuando el servicio singleton usa `/usr/bin/sy-frontdesk-gov`:
 
-1. publicar runtime `SY.frontdesk.gov` en `dist` para mantener el circuito de runtime/manifiesto alineado;
-2. ejecutar `SYSTEM_UPDATE` targeted para `SY.frontdesk.gov`;
+1. publicar runtime `sy.frontdesk.gov` en `dist` para mantener el circuito de runtime/manifiesto alineado;
+2. ejecutar `SYSTEM_UPDATE` targeted para `sy.frontdesk.gov`;
 3. compilar el binario real del servicio:
 
 ```bash
@@ -326,7 +326,7 @@ sudo systemctl status sy-frontdesk-gov.service --no-pager -l
 curl -sS "$BASE/hives/$HIVE_ID/nodes" | jq '.payload.nodes[] | select(.node_name=="SY.frontdesk.gov@motherbee")'
 
 sha256sum /usr/bin/sy-frontdesk-gov
-sha256sum "/var/lib/fluxbee/dist/runtimes/SY.frontdesk.gov/$FD_VERSION/bin/sy-frontdesk-gov"
+sha256sum "/var/lib/fluxbee/dist/runtimes/sy.frontdesk.gov/$FD_VERSION/bin/sy-frontdesk-gov"
 ```
 
 Si los hashes no coinciden, el servicio no quedó corriendo el mismo artefacto que el runtime publicado.
@@ -345,7 +345,7 @@ Alternativa mas amplia:
 - [ ] B1. Definir hive destino.
 - [ ] B2. Fijar nombre del nodo:
   - recomendado: `AI.support.rep@<hive>`
-- [ ] B3. Confirmar que corre sobre runtime `AI.common`.
+- [ ] B3. Confirmar que corre sobre runtime `ai.common`.
 
 ### B.2 Config funcional del nodo
 
@@ -390,7 +390,7 @@ Ejemplo base de config JSON:
 
 ### B.3 Spawn/update del nodo
 
-- [ ] B7. Publicar/updatear `AI.common` si todavía no se hizo.
+- [ ] B7. Publicar/updatear `ai.common` si todavía no se hizo.
 - [ ] B8. Crear archivo `config-json` del nodo.
 - [ ] B9. Ejecutar spawn o update.
 
@@ -472,7 +472,7 @@ Comando base:
 bash scripts/deploy-ia-node.sh \
   --base "$BASE" \
   --hive-id "$HIVE_ID" \
-  --runtime "AI.common" \
+  --runtime "ai.common" \
   --version "<VERSION>" \
   --node-name "AI.support.rep@$HIVE_ID" \
   --tenant-id "<TENANT_ID>" \

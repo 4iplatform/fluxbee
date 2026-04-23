@@ -418,7 +418,7 @@ No debe devolver una union abstracta de todos los modos del runtime.
 {
   "status": "unconfigured",
   "node_name": "IO.api.frontdesk@worker-220",
-  "runtime": "IO.api",
+  "runtime": "io.api",
   "contract_version": 1,
   "effective_schema": null,
   "required_configuration": [
@@ -438,7 +438,7 @@ No debe devolver una union abstracta de todos los modos del runtime.
 {
   "status": "configured",
   "node_name": "IO.api.frontdesk@worker-220",
-  "runtime": "IO.api",
+  "runtime": "io.api",
   "contract_version": 1,
   "auth": {
     "mode": "api_key",
@@ -478,7 +478,7 @@ No debe devolver una union abstracta de todos los modos del runtime.
 {
   "status": "configured",
   "node_name": "IO.api.portal@worker-220",
-  "runtime": "IO.api",
+  "runtime": "io.api",
   "contract_version": 1,
   "auth": {
     "mode": "api_key",

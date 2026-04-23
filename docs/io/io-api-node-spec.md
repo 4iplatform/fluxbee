@@ -4,7 +4,7 @@
 **Fecha:** 2026-04-10
 **Audiencia:** arquitectura, backend, desarrollo, ops, integradores
 **Tipo de nodo:** `IO.*`
-**Runtime recomendado:** `IO.api`
+**Runtime recomendado:** `io.api`
 **Alcance:** nodo IO HTTP/API de proposito general para ingreso de mensajes desde sistemas externos hacia Fluxbee
 
 ---
@@ -148,7 +148,7 @@ En ningun caso responde con el resultado final del AI/frontdesk/workflow, salvo 
 
 Nombre recomendado:
 
-- `IO.api`
+- `io.api`
 
 ### 3.2 Ejemplos de instancia
 
@@ -867,7 +867,7 @@ Pendiente deliberado en v1:
 Cada instancia debe crearse con:
 
 - un `node_name` concreto;
-- el runtime `IO.api`;
+- el runtime `io.api`;
 - su bootstrap config;
 - sus secretos asociados.
 
@@ -951,7 +951,7 @@ Sin incluir payload sensible completo ni secretos.
 
 ### Fase 1
 
-- runtime `IO.api`
+- runtime `io.api`
 - configuracion de instancia
 - `POST /`
 - `GET /`

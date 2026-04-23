@@ -3,7 +3,7 @@ spawn
 bash scripts/deploy-ia-node.sh \
   --base "$BASE" \
   --hive-id "$HIVE_ID" \
-  --runtime "AI.common" \
+  --runtime "ai.common" \
   --version "0.1.3" \
   --node-name "$NODE_NAME" \
   --tenant-id "$TENANT_ID" \

@@ -44,7 +44,7 @@ This installs:
 For rollout via `SYSTEM_UPDATE` + `SPAWN_NODE`, publish IO runtimes into
 `/var/lib/fluxbee/dist/runtimes`.
 
-Publish `IO.slack`:
+Publish `io.slack`:
 
 ```bash
 bash scripts/publish-io-runtime.sh --kind slack --version 0.1.0 --set-current --sudo
@@ -56,7 +56,7 @@ Publish `IO.sim`:
 bash scripts/publish-io-runtime.sh --kind sim --version 0.1.0 --set-current --sudo
 ```
 
-Publish `IO.api`:
+Publish `io.api`:
 
 ```bash
 bash scripts/publish-io-api-runtime.sh --version 0.1.0 --set-current --sudo
@@ -65,7 +65,7 @@ bash scripts/publish-io-api-runtime.sh --version 0.1.0 --set-current --sudo
 Generic publish helper:
 
 ```bash
-bash scripts/publish-runtime.sh --runtime IO.slack --version 0.1.0 --binary nodes/io/target/release/io-slack --set-current --sudo
+bash scripts/publish-runtime.sh --runtime io.slack --version 0.1.0 --binary nodes/io/target/release/io-slack --set-current --sudo
 ```
 
 Expected output includes:

@@ -11,7 +11,7 @@
 **Estado:** runbook operativo para Linux  
 **Objetivo:** dejar un camino unico para:
 
-- actualizar runtime de `SY.frontdesk.gov` sin borrar nodo ni pisar config;
+- actualizar runtime de `sy.frontdesk.gov` sin borrar nodo ni pisar config;
 - reinstalar `IO.api` de forma limpia;
 - aplicar `CONFIG_SET` de `IO.api`;
 - validar `GET /`;
@@ -29,7 +29,7 @@ Este runbook trata a los dos nodos distinto a proposito:
   - update
   - spawn
   - `CONFIG_SET`
-- `SY.frontdesk.gov` se actualiza de forma conservadora:
+- `sy.frontdesk.gov` se actualiza de forma conservadora:
   - publish runtime
   - update
   - restart del servicio singleton existente
@@ -39,7 +39,7 @@ Este runbook trata a los dos nodos distinto a proposito:
 
 Observacion operativa de este host Linux:
 
-- en este entorno `SY.frontdesk.gov` corre como servicio singleton `sy-frontdesk-gov.service`;
+- en este entorno `sy.frontdesk.gov` corre como servicio singleton `sy-frontdesk-gov.service`;
 - la unidad observada usa `ExecStart=/usr/bin/sy-frontdesk-gov`;
 - por lo tanto, `publish runtime + update + restart` no alcanza por sí solo para asegurar que el proceso activo cambió de binario;
 - la verificacion real debe hacerse contra ese servicio y ese binario;
@@ -47,7 +47,7 @@ Observacion operativa de este host Linux:
 
 Paso a paso completo para este host:
 
-1. publicar `SY.frontdesk.gov` a `dist` y ejecutar `SYSTEM_UPDATE` targeted;
+1. publicar `sy.frontdesk.gov` a `dist` y ejecutar `SYSTEM_UPDATE` targeted;
 2. compilar el binario real:
 
 ```bash
@@ -72,7 +72,7 @@ sudo systemctl status sy-frontdesk-gov.service --no-pager -l
 ```bash
 curl -sS "$BASE/hives/$HIVE_ID/nodes" | jq '.payload.nodes[] | select(.node_name=="SY.frontdesk.gov@motherbee")'
 sha256sum /usr/bin/sy-frontdesk-gov
-sha256sum "/var/lib/fluxbee/dist/runtimes/SY.frontdesk.gov/$FRONTDESK_VERSION/bin/sy-frontdesk-gov"
+sha256sum "/var/lib/fluxbee/dist/runtimes/sy.frontdesk.gov/$FRONTDESK_VERSION/bin/sy-frontdesk-gov"
 ```
 
 Si los hashes no coinciden, el servicio singleton no quedó alineado con el artefacto publicado.
@@ -80,7 +80,7 @@ Si los hashes no coinciden, el servicio singleton no quedó alineado con el arte
 La razon es simple:
 
 - `IO.api` hoy se comporta como adapter managed comun;
-- `SY.frontdesk.gov` hoy esta alineado como singleton canonico por hive y no conviene resetearlo en updates rutinarios.
+- `sy.frontdesk.gov` hoy esta alineado como singleton canonico por hive y no conviene resetearlo en updates rutinarios.
 
 ---
 
@@ -89,7 +89,7 @@ La razon es simple:
 Tomadas desde los `Cargo.toml` actuales:
 
 - `IO.api` -> `0.1.0`
-- `SY.frontdesk.gov` -> `0.1.0`
+- `sy.frontdesk.gov` -> `0.1.0`
 
 Se pueden overridear por variable si queres publicar otra version.
 
@@ -204,7 +204,7 @@ deploy_frontdesk_runtime_only() {
   update_body="$(mktemp)"
 
   if ! bash scripts/publish-ia-runtime.sh \
-      --runtime "SY.frontdesk.gov" \
+      --runtime "sy.frontdesk.gov" \
       --version "$FRONTDESK_VERSION" \
       --set-current \
       --sudo >"$publish_log" 2>&1; then
@@ -233,7 +233,7 @@ deploy_frontdesk_runtime_only() {
   "category":"runtime",
   "manifest_version": $manifest_version,
   "manifest_hash": "$manifest_hash",
-  "runtime": "SY.frontdesk.gov",
+  "runtime": "sy.frontdesk.gov",
   "runtime_version": "$FRONTDESK_VERSION"
 }
 JSON

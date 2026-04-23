@@ -49,7 +49,7 @@ pub(crate) fn build_configured_schema(
     serde_json::json!({
         "status": lifecycle_status(&state.current_state),
         "node_name": node_name,
-        "runtime": "IO.api",
+        "runtime": "io.api",
         "contract_version": 1,
         "config_version": state.config_version,
         "auth": {
@@ -87,7 +87,7 @@ pub(crate) fn build_unconfigured_schema(
     serde_json::json!({
         "status": lifecycle_status(&state.current_state),
         "node_name": node_name,
-        "runtime": "IO.api",
+        "runtime": "io.api",
         "contract_version": 1,
         "effective_schema": Value::Null,
         "required_configuration": adapter_contract.required_fields(),

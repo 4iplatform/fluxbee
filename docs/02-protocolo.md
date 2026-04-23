@@ -872,7 +872,7 @@ Request:
     "category": "runtime",
     "manifest_version": 14,
     "manifest_hash": "sha256:a1b2c3...",
-    "runtime": "AI.common",
+    "runtime": "ai.common",
     "runtime_version": "0.1.2"
   }
 }
@@ -912,7 +912,7 @@ Response (`SYSTEM_UPDATE_RESPONSE`):
     "manifest_version": 14,
     "local_manifest_version": 14,
     "local_manifest_hash": "sha256:a1b2c3...",
-    "runtime": "AI.common",
+    "runtime": "ai.common",
     "runtime_version": "0.1.2",
     "readiness_scope": "targeted",
     "targeted_runtime_health": {

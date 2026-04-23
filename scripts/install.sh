@@ -739,18 +739,18 @@ fi
 if [[ "$SEED_AI_COMMON_RUNTIME" == "1" ]]; then
   ai_node_runner_bin="$BIN_DIR/ai_node_runner"
   if [[ -x "$ai_node_runner_bin" ]]; then
-    echo "Seeding AI.common runtime v${AI_COMMON_RUNTIME_VERSION} into $STATE_DIR/dist/runtimes..."
+    echo "Seeding ai.common runtime v${AI_COMMON_RUNTIME_VERSION} into $STATE_DIR/dist/runtimes..."
     bash "$ROOT_DIR/scripts/publish-ia-runtime.sh" \
-      --runtime "AI.common" \
+      --runtime "ai.common" \
       --version "$AI_COMMON_RUNTIME_VERSION" \
       --binary "$ai_node_runner_bin" \
       --dist-root "$STATE_DIR/dist" \
       --set-current \
       --skip-build \
       --sudo
-    echo "AI.common runtime seeded."
+    echo "ai.common runtime seeded."
   else
-    echo "Warning: ai_node_runner binary not found at $ai_node_runner_bin; skipping AI.common seed." >&2
+    echo "Warning: ai_node_runner binary not found at $ai_node_runner_bin; skipping ai.common seed." >&2
   fi
 fi
 

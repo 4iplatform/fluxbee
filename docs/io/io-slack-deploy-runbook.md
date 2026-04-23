@@ -25,7 +25,7 @@ Variables sugeridas:
 ```bash
 BASE="http://127.0.0.1:8080"
 HIVE_ID="motherbee"
-RUNTIME="IO.slack"
+RUNTIME="io.slack"
 VERSION="0.1.0"
 NODE_NAME="IO.slack.T123@$HIVE_ID"
 ```

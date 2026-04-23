@@ -5,7 +5,7 @@ Es un flujo corto para validar runtime + config + multimodal en `AI.chat`.
 
 ## Objetivo
 
-Validar que `AI.chat` (runtime `AI.common`) hoy:
+Validar que `AI.chat` (runtime `ai.common`) hoy:
 
 1. levanta con deploy limpio,
 2. recibe config por `CONFIG_SET`,
@@ -32,7 +32,7 @@ BASE="http://127.0.0.1:8080"
 HIVE_ID="motherbee"
 NODE_NAME="AI.chat@motherbee"
 TENANT_ID="tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
-RUNTIME="AI.common"
+RUNTIME="ai.common"
 VERSION="0.1.1"   # overwrite de version existente
 OPENAI_API_KEY="sk-REPLACE_ME"
 LOG_FILE="/tmp/ai_chat_multimodal_e2e_$(date +%Y%m%d-%H%M%S).log"

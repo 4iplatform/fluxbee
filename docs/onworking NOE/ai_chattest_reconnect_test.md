@@ -8,24 +8,24 @@
 
 ## Objetivo
 
-Levantar un nodo AI normal (no gov) usando runtime `AI.chat@0.1.1` (pisando esa versión), setear secreto OpenAI por `CONFIG_SET`, y validar hasta ese punto.
+Levantar un nodo AI normal (no gov) usando runtime `ai.chat@0.1.1` (pisando esa versión), setear secreto OpenAI por `CONFIG_SET`, y validar hasta ese punto.
 
 ## Prerrequisitos
 
 - API admin local: `http://127.0.0.1:8080`
 - Hive: `motherbee`
-- Runtime publicado: `AI.chat` versión objetivo `0.1.1`
+- Runtime publicado: `ai.chat` versión objetivo `0.1.1`
 - `jq` instalado
 - Tenant válido (reemplazar): `tnt:REPLACE_ME`
 - API key OpenAI real (reemplazar): `sk-REPLACE_ME`
 
-## Paso 0 - Publicar runtime `AI.chat` (pisando `0.1.1`)
+## Paso 0 - Publicar runtime `ai.chat` (pisando `0.1.1`)
 
 ### 0.1 Publicar + set-current
 
 ```bash
 bash scripts/publish-ia-runtime.sh \
-  --runtime "AI.chat" \
+  --runtime "ai.chat" \
   --version "0.1.1" \
   --mode default \
   --set-current \
@@ -38,7 +38,7 @@ bash scripts/publish-ia-runtime.sh \
 bash scripts/deploy-ia-node.sh \
   --base "http://127.0.0.1:8080" \
   --hive-id "motherbee" \
-  --runtime "AI.chat" \
+  --runtime "ai.chat" \
   --version "0.1.1" \
   --mode default \
   --skip-spawn \
@@ -52,7 +52,7 @@ bash scripts/deploy-ia-node.sh \
 bash scripts/deploy-ia-node.sh \
   --base "http://127.0.0.1:8080" \
   --hive-id "motherbee" \
-  --runtime "AI.chat" \
+  --runtime "ai.chat" \
   --version "0.1.1" \
   --mode default \
   --node-name "AI.chat@motherbee" \
@@ -64,7 +64,7 @@ bash scripts/deploy-ia-node.sh \
 ```
 
 Notas:
-- `runtime` y `node_name` pueden diferir: runtime `AI.chat` + instancia `AI.chat@motherbee`.
+- `runtime` y `node_name` pueden diferir: runtime `ai.chat` + instancia `AI.chat@motherbee`.
 - Si ya existía ese nodo, podés agregar `--kill-first`.
 
 ## Paso 2 - Leer estado/contrato actual (CONFIG_GET)
@@ -175,7 +175,7 @@ BASE="http://127.0.0.1:8080"
 HIVE_ID="motherbee"
 NODE_NAME="AI.chat@motherbee"
 TENANT_ID="tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
-RUNTIME="AI.chat"
+RUNTIME="ai.chat"
 VERSION="0.1.1"
 OPENAI_API_KEY="sk-REPLACE_ME"
 LOG_FILE="/tmp/ai_chat_oneshot_$(date +%Y%m%d-%H%M%S).log"
