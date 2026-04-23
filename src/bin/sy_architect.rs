@@ -69,6 +69,7 @@ const ARCHITECT_MAX_MULTIPART_UPLOAD_BYTES: usize =
     ARCHITECT_MAX_SOFTWARE_UPLOAD_BYTES + (4 * 1024 * 1024);
 const ARCHITECT_INTERNAL_ARTIFACT_KIND_INFRASTRUCTURE: &str = "infrastructure";
 const ARCHITECT_INFRA_ARTIFACT_RUNTIME_PACKAGE_SOURCE: &str = "runtime_package_source";
+const STATUS_REFRESH_INTERVAL_SECS: u64 = 60;
 const ARCHI_SYSTEM_PROMPT: &str = r#"You are archi, the Fluxbee system architect.
 
 Operate as a concise technical assistant for the Fluxbee control plane.
@@ -349,6 +350,8 @@ struct PackagePublishRequest {
     #[serde(default)]
     set_current: Option<bool>,
     #[serde(default)]
+    preserve_node_config: bool,
+    #[serde(default)]
     sync_to: Vec<String>,
     #[serde(default)]
     update_to: Vec<String>,
@@ -367,7 +370,9 @@ struct SoftwarePublishRequest {
     #[serde(default)]
     filename: Option<String>,
     #[serde(default)]
-    relaunch_current: bool,
+    set_current: Option<bool>,
+    #[serde(default)]
+    preserve_node_config: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -429,6 +434,14 @@ struct SessionListResponse {
 struct SessionDetailResponse {
     session: SessionSummary,
     messages: Vec<PersistedChatMessage>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionMetaResponse {
+    session_id: String,
+    message_count: u64,
+    last_activity_at_ms: u64,
+    revision: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1152,7 +1165,7 @@ impl FunctionTool for ArchitectPublishRuntimePackageTool {
                     },
                     "set_current": {
                         "type": "boolean",
-                        "description": "Optional current-pointer intent. Only true or omission is supported in the current implementation."
+                        "description": "Optional current-pointer intent. When true, promote this version to current. When false, publish it only into available versions."
                     },
                     "sync_to": {
                         "type": "array",
@@ -3513,7 +3526,8 @@ async fn handle_software_publish_request(
             state,
             PackagePublishRequest {
                 blob_name: req.blob_name,
-                set_current: Some(true),
+                set_current: req.set_current,
+                preserve_node_config: req.preserve_node_config,
                 sync_to: Vec::new(),
                 update_to: Vec::new(),
             },
@@ -3524,7 +3538,7 @@ async fn handle_software_publish_request(
             "action": "software_publish",
             "resolution": resolved.resolution,
             "publish": package_out,
-            "relaunch": Value::Null,
+            "redeploy": Value::Null,
         });
     }
 
@@ -3616,39 +3630,20 @@ async fn handle_software_publish_request(
                 state,
                 PackagePublishRequest {
                     blob_name,
-                    set_current: Some(true),
+                    set_current: req.set_current,
+                    preserve_node_config: req.preserve_node_config,
                     sync_to: Vec::new(),
                     update_to: Vec::new(),
                 },
             )
             .await;
             let _ = fs::remove_dir_all(&build_dir);
-            let publish_status = publish
-                .get("status")
-                .and_then(|value| value.as_str())
-                .unwrap_or("error");
-            let relaunch = if req.relaunch_current && output_status_is_success(Some(publish_status))
-            {
-                match relaunch_runtime_nodes_with_current(state, &state.hive_id, &runtime_name)
-                    .await
-                {
-                    Ok(value) => value,
-                    Err(err) => json!({
-                        "status": "error",
-                        "hive": state.hive_id,
-                        "runtime": runtime_name,
-                        "errors": [err.to_string()],
-                    }),
-                }
-            } else {
-                Value::Null
-            };
             json!({
                 "status": publish.get("status").and_then(|value| value.as_str()).unwrap_or("error"),
                 "action": "software_publish",
                 "resolution": resolved.resolution,
                 "publish": publish,
-                "relaunch": relaunch,
+                "redeploy": Value::Null,
             })
         }
         Err(err) => {
@@ -3658,7 +3653,7 @@ async fn handle_software_publish_request(
                 "action": "software_publish",
                 "resolution": resolved.resolution,
                 "error": err.to_string(),
-                "relaunch": Value::Null,
+                "redeploy": Value::Null,
             })
         }
     }
@@ -3746,6 +3741,28 @@ async fn dynamic_handler(
                 Err(err) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({ "error": format!("failed to clear sessions: {err}") })),
+                )
+                    .into_response(),
+            }
+        }
+        (Method::GET, _) if is_session_meta_path(path) => {
+            let Some(session_id) = session_meta_id_from_path(path) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "missing session id" })),
+                )
+                    .into_response();
+            };
+            match load_chat_session_meta(&state, session_id).await {
+                Ok(Some(detail)) => Json(detail).into_response(),
+                Ok(None) => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "session_not_found" })),
+                )
+                    .into_response(),
+                Err(err) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("failed to load session meta: {err}") })),
                 )
                     .into_response(),
             }
@@ -4369,6 +4386,7 @@ async fn handle_package_publish_request(
         }
     };
     let set_current = req.set_current.unwrap_or(true);
+    let preserve_node_config = req.preserve_node_config;
     let translation = AdminTranslation {
         admin_target: format!("SY.admin@{}", state.hive_id),
         action: "publish_runtime_package".to_string(),
@@ -4384,12 +4402,48 @@ async fn handle_package_publish_request(
         }),
     };
     match execute_admin_translation(state, translation).await {
-        Ok(output) => json!({
-            "status": output.get("status").and_then(|v| v.as_str()).unwrap_or("ok"),
-            "action": "publish_runtime_package",
-            "payload": output.get("payload").cloned().unwrap_or(Value::Null),
-            "error": output.get("error_detail").or_else(|| output.get("error")).cloned()
-        }),
+        Ok(output) => {
+            let status = output
+                .get("status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("ok")
+                .to_string();
+            let payload = output.get("payload").cloned().unwrap_or(Value::Null);
+            let runtime_name = payload
+                .get("runtime_name")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            let redeploy = if set_current && output_status_is_success(Some(status.as_str())) {
+                match runtime_name {
+                    Some(runtime_name) => match redeploy_runtime_nodes_with_current(
+                        state,
+                        &state.hive_id,
+                        &runtime_name,
+                        preserve_node_config,
+                    )
+                    .await
+                    {
+                        Ok(value) => value,
+                        Err(err) => json!({
+                            "status": "error",
+                            "hive": state.hive_id,
+                            "runtime": runtime_name,
+                            "errors": [err.to_string()],
+                        }),
+                    },
+                    None => Value::Null,
+                }
+            } else {
+                Value::Null
+            };
+            json!({
+                "status": status,
+                "action": "publish_runtime_package",
+                "payload": payload,
+                "redeploy": redeploy,
+                "error": output.get("error_detail").or_else(|| output.get("error")).cloned()
+            })
+        }
         Err(err) => json!({
             "status": "error",
             "action": "publish_runtime_package",
@@ -4422,67 +4476,187 @@ async fn list_nodes_for_hive(
     Ok(nodes)
 }
 
-async fn relaunch_runtime_nodes_with_current(
+async fn get_node_config_for_hive(
+    state: &ArchitectState,
+    hive_id: &str,
+    node_name: &str,
+) -> Result<Value, ArchitectError> {
+    let translation = AdminTranslation {
+        admin_target: format!("SY.admin@{}", state.hive_id),
+        action: "get_node_config".to_string(),
+        target_hive: hive_id.to_string(),
+        params: json!({ "node_name": node_name }),
+    };
+    execute_admin_translation(state, translation).await
+}
+
+fn sanitized_redeploy_config(config: &Value) -> Value {
+    let Some(obj) = config.as_object() else {
+        return json!({});
+    };
+    let mut sanitized = obj.clone();
+    sanitized.remove("_system");
+    Value::Object(sanitized)
+}
+
+fn runtime_name_from_node_config_output(output: &Value) -> Option<&str> {
+    output
+        .get("payload")
+        .and_then(|value| value.get("config"))
+        .and_then(|value| value.get("_system"))
+        .and_then(|value| value.get("runtime"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn node_config_from_output(output: &Value) -> Option<Value> {
+    output
+        .get("payload")
+        .and_then(|value| value.get("config"))
+        .cloned()
+        .filter(Value::is_object)
+}
+
+async fn redeploy_runtime_nodes_with_current(
     state: &ArchitectState,
     hive_id: &str,
     runtime_name: &str,
+    preserve_node_config: bool,
 ) -> Result<Value, ArchitectError> {
     let nodes = list_nodes_for_hive(state, hive_id).await?;
-    let matching_nodes: Vec<Value> = nodes
-        .into_iter()
-        .filter(|node| {
-            node.get("runtime")
-                .and_then(|value| value.get("name"))
-                .and_then(|value| value.as_str())
-                == Some(runtime_name)
-        })
-        .collect();
 
-    let mut restarted = Vec::new();
-    let mut started = Vec::new();
+    let mut recreated = Vec::new();
     let mut errors = Vec::new();
 
-    for node in matching_nodes {
+    for node in nodes {
         let node_name = match node.get("node_name").and_then(|value| value.as_str()) {
             Some(value) if !value.trim().is_empty() => value.to_string(),
             _ => continue,
         };
-        let lifecycle = node
-            .get("lifecycle_state")
+        let mut config_output: Option<Value> = None;
+        let resolved_runtime_name = match node
+            .get("runtime")
+            .and_then(|value| value.get("name"))
             .and_then(|value| value.as_str())
-            .or_else(|| node.get("status").and_then(|value| value.as_str()))
-            .unwrap_or("");
-        let action = if lifecycle.eq_ignore_ascii_case("STOPPED") {
-            "start_node"
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => Some(value.to_string()),
+            None => match get_node_config_for_hive(state, hive_id, &node_name).await {
+                Ok(output) => {
+                    let runtime = runtime_name_from_node_config_output(&output).map(str::to_string);
+                    if runtime.is_some() {
+                        config_output = Some(output);
+                    }
+                    runtime
+                }
+                Err(_) => None,
+            },
+        };
+        if resolved_runtime_name.as_deref() != Some(runtime_name) {
+            continue;
+        }
+        let config = if preserve_node_config {
+            let output = match config_output.take() {
+                Some(output) => Ok(output),
+                None => get_node_config_for_hive(state, hive_id, &node_name).await,
+            };
+            match output {
+                Ok(output) => {
+                    let config = node_config_from_output(&output).unwrap_or(Value::Null);
+                    if !config.is_object() {
+                        errors.push(json!({
+                            "node_name": node_name,
+                            "action": "get_node_config",
+                            "status": "error",
+                            "error": "stored node config is missing or invalid",
+                        }));
+                        continue;
+                    }
+                    Some(sanitized_redeploy_config(&config))
+                }
+                Err(err) => {
+                    errors.push(json!({
+                        "node_name": node_name,
+                        "action": "get_node_config",
+                        "status": "error",
+                        "error": err.to_string(),
+                    }));
+                    continue;
+                }
+            }
         } else {
-            "restart_node"
+            None
         };
-        let translation = AdminTranslation {
+
+        let kill_translation = AdminTranslation {
             admin_target: format!("SY.admin@{}", state.hive_id),
-            action: action.to_string(),
+            action: "kill_node".to_string(),
             target_hive: hive_id.to_string(),
-            params: json!({ "node_name": node_name }),
+            params: json!({
+                "node_name": node_name,
+                "force": true,
+                "purge_instance": true,
+            }),
         };
-        match execute_admin_translation(state, translation).await {
+        let kill_output = match execute_admin_translation(state, kill_translation).await {
+            Ok(output) => output,
+            Err(err) => {
+                errors.push(json!({
+                    "node_name": node_name,
+                    "action": "kill_node",
+                    "status": "error",
+                    "error": err.to_string(),
+                }));
+                continue;
+            }
+        };
+        let kill_status = kill_output
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("error");
+        if !output_status_is_success(Some(kill_status)) {
+            errors.push(json!({
+                "node_name": node_name,
+                "action": "kill_node",
+                "status": kill_status,
+                "error": kill_output.get("error_detail").or_else(|| kill_output.get("error")).cloned().unwrap_or(Value::Null),
+            }));
+            continue;
+        }
+
+        let mut run_params = json!({
+            "node_name": node_name,
+            "runtime_version": "current",
+        });
+        if let Some(config) = config {
+            if let Some(obj) = run_params.as_object_mut() {
+                obj.insert("config".to_string(), config);
+            }
+        }
+        let run_translation = AdminTranslation {
+            admin_target: format!("SY.admin@{}", state.hive_id),
+            action: "run_node".to_string(),
+            target_hive: hive_id.to_string(),
+            params: run_params,
+        };
+        match execute_admin_translation(state, run_translation).await {
             Ok(output) => {
                 let step_status = output
                     .get("status")
                     .and_then(|value| value.as_str())
                     .unwrap_or("error");
-                let item = json!({
-                    "node_name": node_name,
-                    "status": step_status,
-                });
                 if output_status_is_success(Some(step_status)) {
-                    if action == "start_node" {
-                        started.push(item);
-                    } else {
-                        restarted.push(item);
-                    }
+                    recreated.push(json!({
+                        "node_name": node_name,
+                        "status": step_status,
+                        "config_mode": if preserve_node_config { "preserved" } else { "template_default" },
+                    }));
                 } else {
                     errors.push(json!({
                         "node_name": node_name,
-                        "action": action,
+                        "action": "run_node",
                         "status": step_status,
                         "error": output.get("error_detail").or_else(|| output.get("error")).cloned().unwrap_or(Value::Null),
                     }));
@@ -4491,7 +4665,7 @@ async fn relaunch_runtime_nodes_with_current(
             Err(err) => {
                 errors.push(json!({
                     "node_name": node_name,
-                    "action": action,
+                    "action": "run_node",
                     "status": "error",
                     "error": err.to_string(),
                 }));
@@ -4502,9 +4676,9 @@ async fn relaunch_runtime_nodes_with_current(
     Ok(json!({
         "hive": hive_id,
         "runtime": runtime_name,
-        "matched_nodes": restarted.len() + started.len() + errors.len(),
-        "restarted": restarted,
-        "started": started,
+        "matched_nodes": recreated.len() + errors.len(),
+        "preserve_node_config": preserve_node_config,
+        "recreated": recreated,
         "errors": errors,
         "status": if errors.is_empty() { "ok" } else { "error" },
     }))
@@ -7162,8 +7336,6 @@ async fn execute_admin_action_with_context(
     }))
 }
 
-const STATUS_REFRESH_INTERVAL_SECS: u64 = 30;
-
 async fn status_refresh_loop(state: Arc<ArchitectState>) {
     loop {
         let fresh = build_architect_status(&state).await;
@@ -7638,6 +7810,52 @@ async fn load_chat_session(
         session: session_record_to_summary(&session),
         messages: persisted,
     }))
+}
+
+fn session_revision_string(message_count: u64, last_activity_at_ms: u64) -> String {
+    format!("{message_count}:{last_activity_at_ms}")
+}
+
+async fn load_chat_session_meta(
+    state: &ArchitectState,
+    session_id: &str,
+) -> Result<Option<SessionMetaResponse>, ArchitectError> {
+    let _guard = state.chat_lock.lock().await;
+    let db = open_architect_db(state).await?;
+    let sessions = ensure_sessions_table(&db).await?;
+    let filter = format!("session_id = '{}'", session_id.replace('\'', "''"));
+    let batches = sessions
+        .query()
+        .only_if(filter)
+        .select(Select::columns(&[
+            "session_id",
+            "last_activity_at_ms",
+            "message_count",
+        ]))
+        .execute()
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    for batch in &batches {
+        let session_ids = string_column(batch, "session_id")?;
+        let updated = u64_column(batch, "last_activity_at_ms")?;
+        let counts = u64_column(batch, "message_count")?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let session_id = session_ids.value(0).to_string();
+        let last_activity_at_ms = updated.value(0);
+        let message_count = counts.value(0);
+        return Ok(Some(SessionMetaResponse {
+            revision: session_revision_string(message_count, last_activity_at_ms),
+            session_id,
+            message_count,
+            last_activity_at_ms,
+        }));
+    }
+    Ok(None)
 }
 
 async fn delete_chat_session(
@@ -8912,6 +9130,7 @@ fn is_api_path(path: &str) -> bool {
         || path == "/api/status"
         || path == "/api/chat"
         || path == "/api/sessions"
+        || path.starts_with("/api/session-meta/")
         || path == "/api/identity/ich-options"
         || path.starts_with("/api/sessions/")
         || path.ends_with("/api/status")
@@ -8971,12 +9190,25 @@ fn is_sessions_collection_path(path: &str) -> bool {
     path == "/api/sessions" || path.ends_with("/api/sessions")
 }
 
+fn is_session_meta_path(path: &str) -> bool {
+    path.starts_with("/api/session-meta/") && session_meta_id_from_path(path).is_some()
+}
+
 fn is_session_detail_path(path: &str) -> bool {
-    path.starts_with("/api/sessions/") && session_id_from_path(path).is_some()
+    path.starts_with("/api/sessions/")
+        && !path.ends_with("/meta")
+        && session_id_from_path(path).is_some()
 }
 
 fn session_id_from_path(path: &str) -> Option<&str> {
     path.split("/api/sessions/")
+        .nth(1)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn session_meta_id_from_path(path: &str) -> Option<&str> {
+    path.split("/api/session-meta/")
         .nth(1)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -10380,9 +10612,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
           </div>
           <div id="publish-options" class="publish-options" style="display:none">
             <div id="publish-filename" class="publish-filename"></div>
-            <label id="publish-relaunch-wrap" class="publish-label" style="display:none">
-              <input type="checkbox" id="publish-relaunch-current" />
-              Restart or start matching node(s) on this hive after publish
+            <label class="publish-label">
+              <input type="checkbox" id="publish-promote-current" />
+              Promote To Current and recreate matching node(s) on this hive
+            </label>
+            <label id="publish-preserve-config-wrap" class="publish-label" style="display:none">
+              <input type="checkbox" id="publish-preserve-node-config" checked />
+              Preserve existing node config during recreate
             </label>
             <button id="publish-btn" class="publish-btn" type="button">Publish</button>
           </div>
@@ -10482,12 +10718,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const softwarePublishUrl = (base || "") + "/api/software/publish";
     const packagePublishUrl = (base || "") + "/api/package/publish";
     const sessionsUrl = (base || "") + "/api/sessions";
+    const sessionMetaUrl = (base || "") + "/api/session-meta";
     const identityIchOptionsUrl = (base || "") + "/api/identity/ich-options";
     const currentSessionStorageKey = "sy.architect.currentSession.{hive}";
     const statusRefreshActiveMs = 15000;
     const statusRefreshHiddenMs = 60000;
-    const sessionRefreshActiveMs = 2000;
-    const sessionRefreshHiddenMs = 8000;
+    const sessionRefreshActiveMs = 5000;
+    const sessionRefreshHiddenMs = 15000;
     const messages = document.getElementById("messages");
     const input = document.getElementById("input");
     const attach = document.getElementById("attach");
@@ -10514,8 +10751,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
     const publishFileInput = document.getElementById("publish-file-input");
     const publishOptions = document.getElementById("publish-options");
     const publishFilename = document.getElementById("publish-filename");
-    const publishRelaunchWrap = document.getElementById("publish-relaunch-wrap");
-    const publishRelaunchCurrent = document.getElementById("publish-relaunch-current");
+    const publishPromoteCurrent = document.getElementById("publish-promote-current");
+    const publishPreserveConfigWrap = document.getElementById("publish-preserve-config-wrap");
+    const publishPreserveNodeConfig = document.getElementById("publish-preserve-node-config");
     const publishBtn = document.getElementById("publish-btn");
     const publishResult = document.getElementById("publish-result");
     const confirmModal = document.getElementById("confirm-modal");
@@ -11537,12 +11775,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
       detail.messages.forEach((message) => renderStoredMessage(message));
     }}
-    async function loadSession(sessionId, existingDetail, showWelcome = false) {{
+    async function loadSession(sessionId, existingDetail, showWelcome = false, preserveComposer = false) {{
       currentSessionId = sessionId;
       renderHistory();
       localStorage.setItem(currentSessionStorageKey, sessionId);
       if (existingDetail) {{
-        renderSession(existingDetail, showWelcome);
+        renderSession(existingDetail, showWelcome, preserveComposer);
         return;
       }}
       const res = await fetch(sessionsUrl + "/" + encodeURIComponent(sessionId), {{ cache: "no-store" }});
@@ -11553,7 +11791,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         throw new Error("session load failed");
       }}
       const detail = await res.json();
-      renderSession(detail, showWelcome);
+      renderSession(detail, showWelcome, preserveComposer);
     }}
     async function refreshCurrentSession(options = {{}}) {{
       const force = !!(options && options.force);
@@ -11562,14 +11800,16 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
       sessionRefreshInFlight = true;
       try {{
-        const res = await fetch(sessionsUrl + "/" + encodeURIComponent(currentSessionId), {{ cache: "no-store" }});
+        const res = await fetch(sessionMetaUrl + "/" + encodeURIComponent(currentSessionId), {{ cache: "no-store" }});
         if (!res.ok) {{
           return;
         }}
         const detail = await res.json();
-        const nextRevision = sessionRevision(detail);
+        const nextRevision = detail && detail.revision
+          ? String(detail.revision)
+          : sessionRevision({{ session: detail || null }});
         if (force || nextRevision !== currentSessionRevision) {{
-          renderSession(detail, false, true);
+          await loadSession(currentSessionId, null, false, true);
           await refreshSessionList(currentSessionId);
         }}
       }} catch (_err) {{
@@ -11740,6 +11980,15 @@ fn architect_index_html(state: &ArchitectState) -> String {
       publishProgressLines.push(line);
       renderPublishProgress();
     }}
+    function updatePublishOptionsState() {{
+      const promote = !!(publishPromoteCurrent && publishPromoteCurrent.checked);
+      if (publishPreserveConfigWrap) {{
+        publishPreserveConfigWrap.style.display = promote ? "" : "none";
+      }}
+      if (publishPreserveNodeConfig) {{
+        publishPreserveNodeConfig.disabled = !promote;
+      }}
+    }}
     function publishSetFile(file) {{
       if (!file) {{
         publishResult.className = "publish-result err";
@@ -11750,8 +11999,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
       const isZip = isZipPublishFile(file);
       const label = isZip ? "ZIP package" : "Executable upload pilot";
       publishFilename.textContent = file.name + " \u00B7 " + label;
-      if (publishRelaunchCurrent) publishRelaunchCurrent.checked = false;
-      if (publishRelaunchWrap) publishRelaunchWrap.style.display = isZip ? "none" : "";
+      if (publishPromoteCurrent) publishPromoteCurrent.checked = false;
+      if (publishPreserveNodeConfig) publishPreserveNodeConfig.checked = true;
+      updatePublishOptionsState();
       publishOptions.style.display = "";
       resetPublishProgress();
       publishResult.className = "publish-result";
@@ -11771,10 +12021,17 @@ fn architect_index_html(state: &ArchitectState) -> String {
       publishFileInput.value = "";
       if (file) publishSetFile(file);
     }});
+    if (publishPromoteCurrent) {{
+      publishPromoteCurrent.addEventListener("change", () => {{
+        updatePublishOptionsState();
+      }});
+    }}
     publishBtn.addEventListener("click", async () => {{
       if (!publishSelectedFile) return;
       publishBtn.disabled = true;
       resetPublishProgress();
+      const promoteToCurrent = !!(publishPromoteCurrent && publishPromoteCurrent.checked);
+      const preserveNodeConfig = promoteToCurrent && !!(publishPreserveNodeConfig && publishPreserveNodeConfig.checked);
       pushPublishProgress("1. Uploading file...");
       try {{
         const formData = new FormData();
@@ -11789,12 +12046,15 @@ fn architect_index_html(state: &ArchitectState) -> String {
         pushPublishProgress("2. Upload complete.");
         if (uploadData.upload_kind === "bundle_upload") {{
           pushPublishProgress("3. Publishing ZIP package...");
+          if (promoteToCurrent) {{
+            pushPublishProgress("4. Promoting to current and recreating matching node(s)...");
+          }}
         }} else {{
           pushPublishProgress("3. Resolving runtime from executable name...");
           pushPublishProgress("4. Building package from executable...");
           pushPublishProgress("5. Publishing generated package...");
-          if (publishRelaunchCurrent && publishRelaunchCurrent.checked) {{
-            pushPublishProgress("6. Relaunching matching node(s) on this hive if publish succeeds...");
+          if (promoteToCurrent) {{
+            pushPublishProgress("6. Promoting to current and recreating matching node(s)...");
           }}
         }}
         let pubRes;
@@ -11804,7 +12064,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
             headers: {{ "Content-Type": "application/json" }},
             body: JSON.stringify({{
               blob_name: blobName,
-              set_current: true,
+              set_current: promoteToCurrent,
+              preserve_node_config: preserveNodeConfig,
               sync_to: [],
               update_to: []
             }})
@@ -11816,7 +12077,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
             body: JSON.stringify({{
               blob_name: blobName,
               filename: uploadData.attachment.filename,
-              relaunch_current: !!(publishRelaunchCurrent && publishRelaunchCurrent.checked)
+              set_current: promoteToCurrent,
+              preserve_node_config: preserveNodeConfig
             }})
           }});
         }}
@@ -11825,13 +12087,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
         if (effectiveStatus === "ok" || effectiveStatus === "sync_pending") {{
           const publishPayload = pubData.payload || (pubData.publish && pubData.publish.payload) || {{}};
           const resolution = pubData.resolution || null;
-          const relaunch = pubData.relaunch || null;
+          const redeploy = pubData.redeploy || (pubData.publish && pubData.publish.redeploy) || null;
           const name = publishPayload.runtime_name || (resolution && resolution.runtime_name) || "";
           const ver = publishPayload.runtime_version || (resolution && resolution.next_version) || "";
           const summary = resolution && resolution.summary ? " \u00B7 " + resolution.summary : "";
-          const relaunchSummary = relaunch && relaunch !== null && relaunch.status
-            ? " \u00B7 relaunch " + relaunch.status
-                + (typeof relaunch.matched_nodes === "number" ? " (" + relaunch.matched_nodes + " node(s))" : "")
+          const redeploySummary = redeploy && redeploy !== null && redeploy.status
+            ? " \u00B7 redeploy " + redeploy.status
+                + (typeof redeploy.matched_nodes === "number" ? " (" + redeploy.matched_nodes + " node(s))" : "")
             : "";
           publishResult.className = "publish-result ok";
           publishResult.textContent =
@@ -11840,7 +12102,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
             + "Published"
             + (name ? ": " + name + (ver ? " v" + ver : "") : "")
             + summary
-            + relaunchSummary
+            + redeploySummary
             + " ✓";
           publishOptions.style.display = "none";
           publishSelectedFile = null;
@@ -12031,6 +12293,56 @@ mod tests {
             "0.1.4-archi.1776809030"
         );
         assert_eq!(suggest_binary_runtime_version(None, 1776809030), "1.0.0");
+    }
+
+    #[test]
+    fn runtime_name_from_node_config_output_extracts_nested_system_runtime() {
+        let output = json!({
+            "payload": {
+                "config": {
+                    "_system": {
+                        "runtime": "io.api"
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            runtime_name_from_node_config_output(&output),
+            Some("io.api")
+        );
+    }
+
+    #[test]
+    fn node_config_from_output_returns_only_object_payloads() {
+        let output = json!({
+            "payload": {
+                "config": {
+                    "_system": {
+                        "runtime": "io.api",
+                        "runtime_version": "1.0.0"
+                    },
+                    "mode": "support"
+                }
+            }
+        });
+        let config = node_config_from_output(&output).expect("object config");
+        assert_eq!(config.get("mode").and_then(Value::as_str), Some("support"));
+    }
+
+    #[test]
+    fn session_revision_string_formats_count_and_timestamp() {
+        assert_eq!(
+            session_revision_string(42, 1777000000000),
+            "42:1777000000000"
+        );
+    }
+
+    #[test]
+    fn session_meta_id_from_path_extracts_id() {
+        assert_eq!(
+            session_meta_id_from_path("/api/session-meta/sess_123"),
+            Some("sess_123")
+        );
     }
 
     #[test]

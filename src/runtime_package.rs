@@ -694,9 +694,10 @@ fn runtime_case_conflict(
         .cloned()
 }
 
-pub fn update_runtime_manifest_with_package(
+pub fn update_runtime_manifest_with_package_with_options(
     manifest_path: &Path,
     validated: &ValidatedPackage,
+    set_current: bool,
 ) -> Result<u64, String> {
     let maybe_manifest =
         load_runtime_manifest_from_paths(&[manifest_path.to_path_buf()]).map_err(|err| {
@@ -739,7 +740,7 @@ pub fn update_runtime_manifest_with_package(
         entry.available.push(validated.effective_version.clone());
         changed = true;
     }
-    if entry.current.as_deref() != Some(validated.effective_version.as_str()) {
+    if set_current && entry.current.as_deref() != Some(validated.effective_version.as_str()) {
         entry.current = Some(validated.effective_version.clone());
         changed = true;
     }
@@ -787,10 +788,18 @@ pub fn update_runtime_manifest_with_package(
     Ok(manifest.version)
 }
 
-pub fn install_validated_package(
+pub fn update_runtime_manifest_with_package(
+    manifest_path: &Path,
+    validated: &ValidatedPackage,
+) -> Result<u64, String> {
+    update_runtime_manifest_with_package_with_options(manifest_path, validated, true)
+}
+
+pub fn install_validated_package_with_options(
     validated: &ValidatedPackage,
     dist_runtime_root: &Path,
     manifest_path: &Path,
+    set_current: bool,
 ) -> Result<InstallResult, String> {
     let target_dir = dist_runtime_root
         .join(&validated.metadata.name)
@@ -813,7 +822,11 @@ pub fn install_validated_package(
         }
         InstallPackageOutcome::AlreadyInstalled => CopyStats::default(),
     };
-    let manifest_version = match update_runtime_manifest_with_package(manifest_path, validated) {
+    let manifest_version = match update_runtime_manifest_with_package_with_options(
+        manifest_path,
+        validated,
+        set_current,
+    ) {
         Ok(version) => version,
         Err(err) => {
             if installed_new_files {
@@ -840,6 +853,14 @@ pub fn install_validated_package(
         copied_files: copy_stats.files,
         copied_bytes: copy_stats.bytes,
     })
+}
+
+pub fn install_validated_package(
+    validated: &ValidatedPackage,
+    dist_runtime_root: &Path,
+    manifest_path: &Path,
+) -> Result<InstallResult, String> {
+    install_validated_package_with_options(validated, dist_runtime_root, manifest_path, true)
 }
 
 #[cfg(test)]
@@ -990,6 +1011,60 @@ mod tests {
             .expect_err("case-only runtime conflict must fail");
         assert!(err.contains("conflicts by case"), "err={err}");
         assert!(err.contains("IO.api"), "err={err}");
+
+        let _ = fs::remove_dir_all(package_dir);
+        let _ = fs::remove_dir_all(dist_root);
+    }
+
+    #[test]
+    fn update_runtime_manifest_with_package_without_set_current_keeps_existing_current() {
+        let package_dir = test_temp_dir("no-promote-src");
+        write_file(
+            &package_dir.join("package.json"),
+            "{\n  \"name\": \"io.api\",\n  \"version\": \"1.1.0\",\n  \"type\": \"full_runtime\"\n}",
+        );
+        let start_sh = package_dir.join("bin/start.sh");
+        write_file(&start_sh, "#!/usr/bin/env bash\necho ok\n");
+        make_executable(&start_sh);
+
+        let dist_root = test_temp_dir("no-promote-dist");
+        let runtimes_root = dist_root.join("runtimes");
+        fs::create_dir_all(&runtimes_root).expect("create runtimes root");
+        let manifest_path = runtimes_root.join("manifest.json");
+        let manifest = RuntimeManifest {
+            schema_version: 1,
+            version: 1710000000000,
+            updated_at: Some("2026-04-20T00:00:00Z".to_string()),
+            runtimes: serde_json::json!({
+                "io.api": {
+                    "available": ["1.0.0"],
+                    "current": "1.0.0",
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+        write_runtime_manifest_file_atomic(&manifest_path, &manifest, false)
+            .expect("seed manifest");
+
+        let validated = validate_package(&package_dir, None).expect("validate source");
+        update_runtime_manifest_with_package_with_options(&manifest_path, &validated, false)
+            .expect("manifest update without promotion");
+        let updated = load_runtime_manifest_from_paths(std::slice::from_ref(&manifest_path))
+            .expect("load manifest")
+            .expect("manifest should exist");
+        let entry = updated
+            .runtimes
+            .get("io.api")
+            .expect("runtime entry should exist");
+
+        assert_eq!(entry["current"], serde_json::json!("1.0.0"));
+        assert!(
+            entry["available"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|value| value == "1.1.0")),
+            "entry={entry:?}"
+        );
 
         let _ = fs::remove_dir_all(package_dir);
         let _ = fs::remove_dir_all(dist_root);
