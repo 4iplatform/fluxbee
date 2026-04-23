@@ -10,7 +10,7 @@
 
 Este runbook deja el camino operativo minimo para:
 
-- publicar el runtime `IO.api`;
+- publicar el runtime `io.api`;
 - ejecutar `SYSTEM_UPDATE` en el hive destino;
 - crear la instancia por `SPAWN_NODE`;
 - aplicar configuracion valida por `CONFIG_SET`;
@@ -27,7 +27,7 @@ Tambien deja claro cuando conviene usar `curl` y cuando Postman alcanza.
 
 El primer corte implementado de `IO.api` soporta hoy:
 
-- runtime `IO.api`
+- runtime `io.api`
 - `GET /`
 - `POST /`
 - auth `Authorization: Bearer <token>`
@@ -94,7 +94,7 @@ Variables sugeridas:
 ```bash
 BASE="http://127.0.0.1:8080"
 HIVE_ID="motherbee"
-RUNTIME="IO.api"
+RUNTIME="io.api"
 VERSION="0.1.0"
 NODE_NAME="IO.api.frontdesk@$HIVE_ID"
 TENANT_ID="T126"
@@ -436,7 +436,7 @@ curl -sS "http://$LISTEN_ADDRESS:$LISTEN_PORT/"
 Esperado en configured:
 
 - `status = configured`
-- `runtime = IO.api`
+- `runtime = io.api`
 - `auth.mode = api_key`
 - `ingress.subject_mode` segun la config aplicada
 - `ingress.accepted_content_types`
@@ -833,7 +833,7 @@ Senales utiles que hoy existen:
 
 La validacion runtime minima de `IO.api` puede darse por suficiente si se cumple:
 
-1. el runtime `IO.api` se publica y el `SYSTEM_UPDATE` queda `ok`;
+1. el runtime `io.api` se publica y el `SYSTEM_UPDATE` queda `ok`;
 2. el `SPAWN_NODE` arranca la instancia;
 3. `GET /` responde y refleja el contrato efectivo;
 4. `CONFIG_SET` acepta auth + ingress + relay;
@@ -877,7 +877,7 @@ Durante esta implementacion se agregaron estos helpers:
 
 Uso recomendado de cada uno:
 
-- `publish-io-api-runtime.sh`: publica el runtime `IO.api` y deja `RUST_LOG` default util para `io_api` e `io_common` dentro del `start.sh` publicado
+- `publish-io-api-runtime.sh`: publica el runtime `io.api` y deja `RUST_LOG` default util para `io_api` e `io_common` dentro del `start.sh` publicado
 - `deploy-io-api.sh`: hace `publish + update + spawn/restart` siguiendo el mismo patron operativo de otros IO
 - `install-io-api.sh`: instala `io-api` como service local de desarrollo, crea `io-api.env` y bootstrap managed `config.json`
 

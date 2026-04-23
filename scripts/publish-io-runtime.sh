@@ -14,7 +14,7 @@ Required:
   --version <version>      Runtime version (example: 0.1.0)
 
 Options:
-  --runtime <name>         Override runtime key (defaults: IO.slack / IO.sim)
+  --runtime <name>         Override runtime key (defaults: io.slack / io.sim)
   --binary <path>          Override binary path (defaults: nodes/io/target/release/io-slack|io-sim)
   --dist-root <path>       Dist root (default: /var/lib/fluxbee/dist)
   --set-current            Set current version in manifest

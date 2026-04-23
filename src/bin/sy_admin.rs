@@ -6401,11 +6401,11 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
         ],
         "get_runtime" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
-            admin_action_path_param("runtime", "string", "Runtime name, for example AI.chat."),
+            admin_action_path_param("runtime", "string", "Runtime name, for example ai.chat."),
         ],
         "remove_runtime_version" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
-            admin_action_path_param("runtime", "string", "Runtime name, for example AI.chat."),
+            admin_action_path_param("runtime", "string", "Runtime name, for example ai.chat."),
             admin_action_path_param("version", "string", "Runtime version to delete."),
         ],
         "get_ilk" => vec![
@@ -7378,8 +7378,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "These endpoints report core component versions and runtime availability/current selections.",
             "They describe versions available to a hive, not the state of one node instance.",
             "For SY nodes, map node names to core components: for example SY.identity@motherbee -> core.components['sy-identity'].version.",
-            "For runtime-backed nodes, map the node runtime family to runtimes.runtimes[<runtime>].current: for example AI.chat@motherbee -> runtimes.runtimes['AI.chat'].current.",
-            "For IO or WF nodes with instance suffixes, use the runtime family/prefix, for example IO.slack.T123@motherbee -> IO.slack and WF.blob.consume.diag.x@y -> WF.blob.consume.diag when present.",
+            "For runtime-backed nodes, map the node runtime family to runtimes.runtimes[<runtime>].current: for example AI.chat@motherbee -> runtimes.runtimes['ai.chat'].current.",
+            "For IO or WF nodes with instance suffixes, use the runtime family/prefix, for example IO.slack.T123@motherbee -> io.slack and WF.blob.consume.diag.x@y -> wf.blob.consume.diag when present.",
             "Use GET /versions for cross-hive comparisons and GET /hives/{hive}/versions for one hive.",
         ],
         "update" => vec![
@@ -11245,7 +11245,7 @@ mod tests {
                     "action": "get_runtime",
                     "args": {
                         "hive": "motherbee",
-                        "runtime": "AI.chat"
+                        "runtime": "ai.chat"
                     }
                 }]
             }
@@ -11376,7 +11376,7 @@ mod tests {
                     "action": "get_runtime",
                     "args": {
                         "target": "motherbee",
-                        "runtime_name": "AI.chat"
+                        "runtime_name": "ai.chat"
                     }
                 }]
             }
@@ -11393,7 +11393,7 @@ mod tests {
             action: "get_runtime".to_string(),
             args: json!({
                 "hive": "motherbee",
-                "runtime": "AI.chat"
+                "runtime": "ai.chat"
             }),
             executor_fill: None,
         };
@@ -11412,7 +11412,7 @@ mod tests {
             &step,
             &json!({
                 "hive": "otherbee",
-                "runtime": "AI.chat"
+                "runtime": "ai.chat"
             }),
             &schema,
         )

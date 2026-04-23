@@ -1,4 +1,4 @@
-# SY.frontdesk.gov
+# sy.frontdesk.gov
 
 Este directorio quedó temporalmente alineado con el runner AI genérico.
 
@@ -8,9 +8,9 @@ Estado actual:
 - el equipo de dev deberá volver a especializarlo para el caso `gov`.
 
 Frontera de dependencias deseada:
-- `SY.frontdesk.gov` no debe depender de `nodes/ai/common`,
+- `sy.frontdesk.gov` no debe depender de `nodes/ai/common`,
 - la capa compartida de gov debe vivir en `nodes/gov/common` + SDKs (`fluxbee_sdk`, `fluxbee_ai_sdk`),
-- `AI.common` y `SY.frontdesk.gov` no deben importarse entre sí.
+- `ai.common` y `sy.frontdesk.gov` no deben importarse entre sí.
 
 Importante:
 - esta duplicación es deliberada y transitoria,
@@ -41,9 +41,9 @@ Pendiente posterior a esta reorganización:
 - eliminar la duplicación con `nodes/ai/ai-generic`.
 
 Prompt/behavior de frontdesk:
-- el prompt funcional de frontdesk debe viajar con el runtime `SY.frontdesk.gov` (artefacto/versionado propio),
+- el prompt funcional de frontdesk debe viajar con el runtime `sy.frontdesk.gov` (artefacto/versionado propio),
 - no debe depender de mutaciones ad-hoc en runtime común.
 - implementación actual:
-  - existe un prompt base runtime-owned en el runner de `SY.frontdesk.gov`
+  - existe un prompt base runtime-owned en el runner de `sy.frontdesk.gov`
   - la key de provider sigue entrando temporalmente por `CONFIG_SET` y se persiste en `secrets.json`
   - la decisión final sobre surface/privilegios para esa key queda pendiente de `CORE`

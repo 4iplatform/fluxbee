@@ -88,10 +88,10 @@ Rules:
 - Use the available read-only system tool when you need live Fluxbee state instead of guessing.
 - For all nodes across the whole system or across multiple hives, use `/inventory` or `/inventory/summary` first instead of guessing hive names or looping over stale hives from conversation memory.
 - Use `/hives/{hive}/nodes` only for one explicit hive.
-- Distinguish runtime names from node instance names: `AI.chat` is a runtime/package; `AI.chat@motherbee` is a node instance.
+- Distinguish runtime names from node instance names: `ai.chat` is a runtime/package; `AI.chat@motherbee` is a node instance.
 - For software/core/runtime versions, use `/versions` or `/hives/{hive}/versions`. Do not infer versions from `/hives/{hive}/nodes`.
-- When the operator asks for runtime/package info such as `AI.chat`, use `/hives/{hive}/runtimes/{runtime}` or `/hives/{hive}/runtimes`, not `/hives/{hive}/nodes`.
-- When the operator asks for a node software version, map the node to the versions payload explicitly: SY.identity@hive -> core.components['sy-identity'].version; AI.chat@hive -> runtimes.runtimes['AI.chat'].current; IO.slack.T123@hive -> runtimes.runtimes['IO.slack'].current.
+- When the operator asks for runtime/package info such as `ai.chat`, use `/hives/{hive}/runtimes/{runtime}` or `/hives/{hive}/runtimes`, not `/hives/{hive}/nodes`.
+- When the operator asks for a node software version, map the node to the versions payload explicitly: SY.identity@hive -> core.components['sy-identity'].version; AI.chat@hive -> runtimes.runtimes['ai.chat'].current; IO.slack.T123@hive -> runtimes.runtimes['io.slack'].current.
 - For hive-scoped deployments or drift alerts, use `/hives/{hive}/deployments` or `/hives/{hive}/drift-alerts`. Do not synthesize or locally filter a hive-specific answer from `/deployments` or `/drift-alerts` when the hive endpoint exists.
 - If a hive-specific endpoint returns an empty list, report exactly that it returned no recorded entries for that hive. Do not invent filtered rows from broader results.
 - For drift alerts specifically, if `/hives/{hive}/drift-alerts` returns `entries: []`, answer that there are no recorded drift alerts for that hive. Do not infer drift from `/deployments`, `/versions`, `/nodes`, or from the global `/drift-alerts` list.
@@ -1748,7 +1748,7 @@ Examples:
 
 ## Choosing a runtime
 
-When the task requires creating a new node and the runtime is not specified, call `query_hive` with `list_runtimes` to see what is available. Choose the runtime whose name and type match the node being created (e.g. for an AI node, look for AI.* runtimes). Do not reuse the runtime name of an existing node (e.g. `AI.chat`) as the base for a different new node unless explicitly requested.
+When the task requires creating a new node and the runtime is not specified, call `query_hive` with `list_runtimes` to see what is available. Choose the runtime whose name and type match the node being created (e.g. for an AI node, look for `ai.*` runtimes). Do not reuse the runtime name of an existing node (e.g. `ai.chat`) as the base for a different new node unless explicitly requested.
 
 ## Looking up action schemas
 

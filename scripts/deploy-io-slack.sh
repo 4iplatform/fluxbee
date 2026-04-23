@@ -16,7 +16,7 @@ Required:
 
 Options:
   --node-name <name@hive>      If provided, script will also spawn/restart node
-  --runtime <name>             Runtime key (default: IO.slack)
+  --runtime <name>             Runtime key (default: io.slack)
   --runtime-version <ver>      Runtime version for spawn payload (default: current)
   --update-scope <targeted|global>
                                SYSTEM_UPDATE scope (default: targeted)

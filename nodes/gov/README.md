@@ -12,7 +12,7 @@ Objetivo:
 ```text
 nodes/gov/
 ├── common/                  # utilidades compartidas para código gov
-└── ai-frontdesk-gov/        # runtime actual que implementa SY.frontdesk.gov
+└── ai-frontdesk-gov/        # runtime actual que implementa sy.frontdesk.gov
 ```
 
 Alcance de esta fase:
@@ -23,7 +23,7 @@ Alcance de esta fase:
 ## Convenciones
 
 - Nodo canónico actual: `SY.frontdesk.gov@<hive>`
-- Runtime canónico actual: `SY.frontdesk.gov`
+- Runtime canónico actual: `sy.frontdesk.gov`
 - Configuración de ruteo de temporales:
   - `government.identity_frontdesk: "SY.frontdesk.gov@motherbee"`
 

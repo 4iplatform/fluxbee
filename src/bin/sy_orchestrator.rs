@@ -15688,11 +15688,11 @@ blob:
         let runtimes_root = root.join("dist").join("runtimes");
         let nodes_root = root.join("nodes");
 
-        let kept_runtime_dir = runtimes_root.join("AI.chat.test").join("1.0.0");
+        let kept_runtime_dir = runtimes_root.join("ai.chat.test").join("1.0.0");
         fs::create_dir_all(&kept_runtime_dir).expect("create kept runtime dir");
         fs::write(kept_runtime_dir.join("marker"), "keep").expect("write kept marker");
 
-        let pruned_runtime_dir = runtimes_root.join("AI.prune.test").join("1.0.0");
+        let pruned_runtime_dir = runtimes_root.join("ai.prune.test").join("1.0.0");
         fs::create_dir_all(&pruned_runtime_dir).expect("create pruned runtime dir");
         fs::write(pruned_runtime_dir.join("marker"), "prune").expect("write pruned marker");
 
@@ -15702,7 +15702,7 @@ blob:
             node_dir.join("config.json"),
             serde_json::json!({
                 "_system": {
-                    "runtime": "AI.chat.test",
+                    "runtime": "ai.chat.test",
                     "runtime_version": "1.0.0",
                     "relaunch_on_boot": true
                 }
@@ -15741,8 +15741,8 @@ blob:
             std::env::temp_dir().join(format!("fluxbee-retention-protected-{}", Uuid::new_v4()));
         let runtimes_root = root.join("runtimes");
         let nodes_root = root.join("nodes");
-        let protected_runtime_dir = runtimes_root.join("AI.common").join("0.1.2");
-        let sibling_runtime_dir = runtimes_root.join("AI.common").join("0.1.1");
+        let protected_runtime_dir = runtimes_root.join("ai.common").join("0.1.2");
+        let sibling_runtime_dir = runtimes_root.join("ai.common").join("0.1.1");
 
         fs::create_dir_all(&protected_runtime_dir).expect("create protected runtime dir");
         fs::create_dir_all(&sibling_runtime_dir).expect("create sibling runtime dir");
@@ -15758,7 +15758,7 @@ blob:
 
         let mut protected_keep: HashMap<String, HashSet<String>> = HashMap::new();
         protected_keep
-            .entry("AI.common".to_string())
+            .entry("ai.common".to_string())
             .or_default()
             .insert("0.1.2".to_string());
 
@@ -17175,7 +17175,7 @@ blob:
             "category": "runtime",
             "manifest_version": 42,
             "manifest_hash": "sha256:deadbeef",
-            "runtime": "AI.common",
+            "runtime": "ai.common",
             "runtime_version": "0.1.2"
         });
 
@@ -17183,7 +17183,7 @@ blob:
         assert_eq!(parsed.category, "runtime");
         assert_eq!(parsed.manifest_version, 42);
         assert_eq!(parsed.manifest_hash, "sha256:deadbeef");
-        assert_eq!(parsed.runtime.as_deref(), Some("AI.common"));
+        assert_eq!(parsed.runtime.as_deref(), Some("ai.common"));
         assert_eq!(parsed.runtime_version.as_deref(), Some("0.1.2"));
     }
 

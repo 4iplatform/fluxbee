@@ -693,7 +693,7 @@ API_KEY_ID="4iplatform-main"
 INTEGRATION_ID="int_4iplatform_support"
 API_KEY="fb_api_4iplatform_001"
 
-CONFIG_VERSION="1777000000006"
+CONFIG_VERSION="1777000000012"
 
 curl -sS -X POST \
   "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/control/config-set" \

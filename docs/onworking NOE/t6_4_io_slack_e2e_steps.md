@@ -4,7 +4,7 @@ Este flujo usa el camino operativo pedido:
 
 1. limpieza completa,
 2. build nuevo,
-3. publish+update targeted pisando `IO.slack@0.1.0`,
+3. publish+update targeted pisando `io.slack@0.1.0`,
 4. spawn por API con config inline (sin bootstrap file),
 5. validación control-plane,
 6. restart + rehidratación.
@@ -26,7 +26,7 @@ NODE_NAME="${NODE_BASE}@${HIVE_ID}"
 UNIT="fluxbee-node-${NODE_BASE}-${HIVE_ID}.service"
 TENANT_ID="tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
 
-RUNTIME="IO.slack"
+RUNTIME="io.slack"
 VERSION="0.1.0"   # se pisa esta version
 
 SLACK_APP_TOKEN="xapp-REPLACE_ME"
@@ -190,7 +190,7 @@ NODE_BASE="IO.slack.T126"
 NODE_NAME="${NODE_BASE}@${HIVE_ID}"
 UNIT="fluxbee-node-${NODE_BASE}-${HIVE_ID}.service"
 TENANT_ID="tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
-RUNTIME="IO.slack"
+RUNTIME="io.slack"
 VERSION="0.1.0"
 SLACK_APP_TOKEN="xapp-REPLACE_ME"
 SLACK_BOT_TOKEN="xoxb-REPLACE_ME"
