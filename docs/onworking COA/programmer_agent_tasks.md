@@ -168,9 +168,24 @@ Archi → execute_executor_plan_with_context
 
 ---
 
+## Phase 8 — Agent Handshake Visibility (2026-04-23)
+
+- [x] `PROG-T24` Add `ProgrammerTrace` / `ProgrammerTraceStep` structs to capture task, hive, steps, validation status, and first_validation_error.
+- [x] `PROG-T25` Extend `ProgrammerPendingPlan` with `trace: Option<ProgrammerTrace>`.
+- [x] `PROG-T26` In `ArchitectProgrammerTool::run()`: build `ProgrammerTrace` from final plan steps and validation outcome; store in pending; enrich tool result JSON with `plan_steps`, `validation`, `first_validation_error`.
+- [x] `PROG-T27` In `handle_run_ai_chat()`: after AI run completes, if `programmer_pending` was set this turn, inject `programmer_trace` into the chat output JSON.
+- [x] `PROG-T28` Frontend CSS: add `.agent-trace*` classes for collapsible handshake panel.
+- [x] `PROG-T29` Frontend JS: `renderProgrammerTrace(trace)` — renders programmer call, plan steps (id / action / args_preview), pre-validation result, retry error if applicable.
+- [x] `PROG-T30` Frontend: `renderResponsePayload()` calls `renderProgrammerTrace()` when `output.programmer_trace` is present, rendering it between the Archi message and the tool_results section.
+
+**Visible result:** when Archi calls `fluxbee_programmer`, the chat shows a collapsible "Agent activity · programmer → N steps" panel with: task sent, each step (id / action / args), validation status (ok / retried). If first plan was rejected, the rejection error is shown inline.
+
+---
+
 ## Open / Deferred
 
 - **Auditor agent**: deferred. See `solution-manifest-spec_1.md` section 6.
 - **Full reconciliation** (diff manifest vs actual state): deferred.
 - **`fluxbee_infrastructure_specialist` action cache**: still static. Migrate to same TTL cache pattern as PROG-T1/T2 in a future pass.
 - **Unit tests PROG-T3, T7**: written as manual for now; automate when test harness for ADMIN_COMMAND socket calls is available.
+- **Executor trace**: the post-CONFIRM executor steps already render via `renderExecutorResult`. Consider adding a similar "executor activity" toggle that persists with the pre-CONFIRM programmer trace in the same bubble.

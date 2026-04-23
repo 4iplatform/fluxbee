@@ -553,10 +553,26 @@ struct PendingAdminAction {
     created_at_ms: u64,
 }
 
+struct ProgrammerTraceStep {
+    id: String,
+    action: String,
+    args_preview: String,
+}
+
+struct ProgrammerTrace {
+    task: String,
+    hive: String,
+    steps: Vec<ProgrammerTraceStep>,
+    step_count: usize,
+    validation: String,
+    first_validation_error: Option<String>,
+}
+
 struct ProgrammerPendingPlan {
     plan: Value,
     cookbook_entry: Option<ProgrammerCookbookEntry>,
     created_at_ms: u64,
+    trace: Option<ProgrammerTrace>,
 }
 
 struct ArchitectAdminReadToolsProvider {
@@ -1925,6 +1941,9 @@ impl FunctionTool for ArchitectProgrammerTool {
             }
         };
 
+        // Keep the first validation error for the trace (so the operator can see what was rejected).
+        let first_validation_error = validation_error.clone();
+
         let output = if let Some(err) = validation_error {
             tracing::warn!(error = %err, "programmer plan failed pre-validation — retrying with feedback");
             let feedback_context = format!(
@@ -1940,10 +1959,84 @@ impl FunctionTool for ArchitectProgrammerTool {
             output
         };
 
+        let validation_label = if first_validation_error.is_some() {
+            "ok_after_retry"
+        } else {
+            "ok"
+        };
+        let plan_steps: Vec<Value> = output
+            .plan
+            .get("execution")
+            .and_then(|e| e.get("steps"))
+            .and_then(|s| s.as_array())
+            .map(|steps| {
+                steps
+                    .iter()
+                    .map(|step| {
+                        let id = step
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                            .to_string();
+                        let action = step
+                            .get("action")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                            .to_string();
+                        let args_preview = step
+                            .get("args")
+                            .map(|args| {
+                                serde_json::to_string(args)
+                                    .unwrap_or_default()
+                                    .chars()
+                                    .take(200)
+                                    .collect::<String>()
+                            })
+                            .unwrap_or_default();
+                        json!({
+                            "id": id,
+                            "action": action,
+                            "args_preview": args_preview,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let step_count = plan_steps.len();
+
+        let trace = ProgrammerTrace {
+            task: task.clone(),
+            hive: hive.clone(),
+            steps: plan_steps
+                .iter()
+                .map(|s| ProgrammerTraceStep {
+                    id: s.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                    action: s
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    args_preview: s
+                        .get("args_preview")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                })
+                .collect(),
+            step_count,
+            validation: validation_label.to_string(),
+            first_validation_error,
+        };
+
+        // Capture before trace is moved into the pending plan.
+        let tool_result_validation = trace.validation.clone();
+        let tool_result_first_error = trace.first_validation_error.clone();
+
         let pending = ProgrammerPendingPlan {
             plan: output.plan.clone(),
             cookbook_entry: output.cookbook_entry.clone(),
             created_at_ms: now_epoch_ms(),
+            trace: Some(trace),
         };
         self.context
             .programmer_pending
@@ -1954,12 +2047,10 @@ impl FunctionTool for ArchitectProgrammerTool {
         Ok(json!({
             "status": "plan_ready",
             "human_summary": output.human_summary,
-            "step_count": output.plan
-                .get("execution")
-                .and_then(|e| e.get("steps"))
-                .and_then(|s| s.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0),
+            "step_count": step_count,
+            "plan_steps": plan_steps,
+            "validation": tool_result_validation,
+            "first_validation_error": tool_result_first_error,
         }))
     }
 }
@@ -4813,11 +4904,34 @@ async fn handle_ai_chat(
         raw_message
     };
 
+    // If the programmer stored a pending plan this turn, inject its trace into the response
+    // so the frontend can render the full agent handshake (task → plan → validation).
+    let programmer_trace: Option<Value> = {
+        let guard = state.programmer_pending.lock().await;
+        guard.get(&session.session_id).and_then(|pending| {
+            pending.trace.as_ref().map(|trace| {
+                json!({
+                    "task": trace.task,
+                    "hive": trace.hive,
+                    "step_count": trace.step_count,
+                    "steps": trace.steps.iter().map(|s| json!({
+                        "id": s.id,
+                        "action": s.action,
+                        "args_preview": s.args_preview,
+                    })).collect::<Vec<_>>(),
+                    "validation": trace.validation,
+                    "first_validation_error": trace.first_validation_error,
+                })
+            })
+        })
+    };
+
     Ok(json!({
         "message": message,
         "provider": "openai",
         "model": runtime.model,
         "tool_results": tool_results,
+        "programmer_trace": programmer_trace,
     }))
 }
 
@@ -10216,6 +10330,93 @@ fn architect_index_html(state: &ArchitectState) -> String {
       color: var(--warning);
       line-height: 1.5;
     }}
+    /* ── agent trace panel ── */
+    .agent-trace {{
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      overflow: hidden;
+      margin-bottom: 2px;
+    }}
+    .agent-trace-toggle {{
+      list-style: none;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 13px;
+      cursor: pointer;
+      user-select: none;
+      font-size: 0.82rem;
+      font-weight: 700;
+      color: var(--muted);
+    }}
+    .agent-trace-toggle::-webkit-details-marker {{ display: none; }}
+    .agent-trace-toggle:hover {{ color: var(--text); }}
+    .agent-trace-label {{ flex: 1; }}
+    .agent-trace-badge {{
+      font-size: 0.70rem;
+      font-weight: 700;
+      border-radius: 999px;
+      padding: 2px 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }}
+    .agent-trace-badge.ok {{ background: var(--success-soft); color: var(--success); }}
+    .agent-trace-badge.retry {{ background: var(--warning-soft); color: var(--warning); }}
+    .agent-trace-body {{
+      border-top: 1px solid var(--line);
+      padding: 10px 13px;
+      display: grid;
+      gap: 8px;
+    }}
+    .agent-trace-section {{
+      display: grid;
+      gap: 4px;
+    }}
+    .agent-trace-section-label {{
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+    }}
+    .agent-trace-row {{
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      padding: 5px 8px;
+      border-radius: 8px;
+      background: #f8f9fb;
+      font-size: 0.82rem;
+    }}
+    .agent-trace-row-id {{
+      font-family: monospace;
+      font-size: 0.72rem;
+      color: var(--muted);
+      flex-shrink: 0;
+      width: 28px;
+    }}
+    .agent-trace-row-action {{
+      font-weight: 700;
+      color: var(--text);
+      flex-shrink: 0;
+      min-width: 140px;
+    }}
+    .agent-trace-row-args {{
+      font-family: monospace;
+      font-size: 0.73rem;
+      color: var(--muted);
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }}
+    .agent-trace-error {{
+      font-size: 0.78rem;
+      color: var(--warning);
+      background: var(--warning-soft);
+      border-radius: 8px;
+      padding: 6px 10px;
+      line-height: 1.45;
+    }}
     .result-pre {{
       margin: 0;
       padding: 12px 13px;
@@ -11248,6 +11449,116 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }});
       return shell;
     }}
+    function renderProgrammerTrace(trace) {{
+      if (!trace || !trace.step_count) return null;
+      const isRetry = trace.validation === "ok_after_retry";
+      const validationLabel = isRetry ? "retry" : "ok";
+
+      const wrapper = document.createElement("details");
+      wrapper.className = "agent-trace";
+
+      const toggle = document.createElement("summary");
+      toggle.className = "agent-trace-toggle";
+
+      const icon = document.createElement("span");
+      icon.textContent = "⟳ ";
+      icon.style.fontSize = "0.9rem";
+      const label = document.createElement("span");
+      label.className = "agent-trace-label";
+      label.textContent = "Agent activity · programmer → " + trace.step_count + " step" + (trace.step_count !== 1 ? "s" : "");
+      const badge = document.createElement("span");
+      badge.className = "agent-trace-badge " + validationLabel;
+      badge.textContent = isRetry ? "retried" : "valid";
+
+      toggle.appendChild(icon);
+      toggle.appendChild(label);
+      toggle.appendChild(badge);
+      wrapper.appendChild(toggle);
+
+      const body = document.createElement("div");
+      body.className = "agent-trace-body";
+
+      // ── section: call ──
+      const callSection = document.createElement("div");
+      callSection.className = "agent-trace-section";
+      const callLabel = document.createElement("div");
+      callLabel.className = "agent-trace-section-label";
+      callLabel.textContent = "programmer call";
+      callSection.appendChild(callLabel);
+      const callRow = document.createElement("div");
+      callRow.className = "agent-trace-row";
+      callRow.innerHTML =
+        "<span class='agent-trace-row-action'>task →</span>" +
+        "<span class='agent-trace-row-args'>" +
+        (trace.task ? String(trace.task).slice(0, 200) : "") +
+        "</span>";
+      callSection.appendChild(callRow);
+      const hiveRow = document.createElement("div");
+      hiveRow.className = "agent-trace-row";
+      hiveRow.innerHTML =
+        "<span class='agent-trace-row-action'>hive →</span>" +
+        "<span class='agent-trace-row-args'>" + (trace.hive || "") + "</span>";
+      callSection.appendChild(hiveRow);
+      body.appendChild(callSection);
+
+      // ── section: plan steps ──
+      const steps = Array.isArray(trace.steps) ? trace.steps : [];
+      if (steps.length > 0) {{
+        const stepsSection = document.createElement("div");
+        stepsSection.className = "agent-trace-section";
+        const stepsLabel = document.createElement("div");
+        stepsLabel.className = "agent-trace-section-label";
+        stepsLabel.textContent = "generated plan · " + steps.length + " step" + (steps.length !== 1 ? "s" : "");
+        stepsSection.appendChild(stepsLabel);
+        steps.forEach((step, i) => {{
+          const row = document.createElement("div");
+          row.className = "agent-trace-row";
+          const idEl = document.createElement("span");
+          idEl.className = "agent-trace-row-id";
+          idEl.textContent = (step.id || String(i + 1));
+          const actionEl = document.createElement("span");
+          actionEl.className = "agent-trace-row-action";
+          actionEl.textContent = step.action || "?";
+          const argsEl = document.createElement("span");
+          argsEl.className = "agent-trace-row-args";
+          argsEl.title = step.args_preview || "";
+          argsEl.textContent = step.args_preview || "";
+          row.appendChild(idEl);
+          row.appendChild(actionEl);
+          row.appendChild(argsEl);
+          stepsSection.appendChild(row);
+        }});
+        body.appendChild(stepsSection);
+      }}
+
+      // ── section: pre-validation ──
+      const validSection = document.createElement("div");
+      validSection.className = "agent-trace-section";
+      const validLabel = document.createElement("div");
+      validLabel.className = "agent-trace-section-label";
+      validLabel.textContent = "pre-validation";
+      validSection.appendChild(validLabel);
+
+      if (isRetry && trace.first_validation_error) {{
+        const errEl = document.createElement("div");
+        errEl.className = "agent-trace-error";
+        errEl.textContent = "✗ first plan rejected: " + trace.first_validation_error;
+        validSection.appendChild(errEl);
+        const retryOk = document.createElement("div");
+        retryOk.className = "agent-trace-row";
+        retryOk.innerHTML = "<span class='agent-trace-row-action'>retry →</span><span class='agent-trace-row-args'>plan corrected and accepted</span>";
+        validSection.appendChild(retryOk);
+      }} else {{
+        const okRow = document.createElement("div");
+        okRow.className = "agent-trace-row";
+        okRow.innerHTML = "<span class='agent-trace-row-action'>validation →</span><span class='agent-trace-row-args'>ok</span>";
+        validSection.appendChild(okRow);
+      }}
+      body.appendChild(validSection);
+
+      wrapper.appendChild(body);
+      return wrapper;
+    }}
     function renderExecutorResult(data) {{
       const output = data && data.output ? data.output : {{}};
       const payload = output.payload || {{}};
@@ -11462,7 +11773,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
       const output = data && data.output ? data.output : null;
       if (data && data.mode === "chat" && output && typeof output.message === "string" && output.message.trim()) {{
         const toolSummary = createToolSummarySection(output.tool_results);
-        if (!toolSummary) {{
+        const progTrace = renderProgrammerTrace(output.programmer_trace);
+        if (!toolSummary && !progTrace) {{
           addMessage(kind, output.message);
           return;
         }}
@@ -11471,7 +11783,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
         body.className = "chat-response";
         message.textContent = output.message;
         body.appendChild(message);
-        body.appendChild(toolSummary);
+        if (progTrace) body.appendChild(progTrace);
+        if (toolSummary) body.appendChild(toolSummary);
         appendMessage(kind, kind === "architect" ? "archi" : "System", body);
         return;
       }}
