@@ -8,7 +8,7 @@ Notas:
 - el nombre del paquete se conserva como `fluxbee-ai-nodes` para no romper scripts existentes,
 - el bin principal sigue siendo `ai_node_runner`,
 - `ai_local_probe` se conserva como bin auxiliar.
-- el runtime/package actual del runner genérico se publica como `AI.common`.
+- el runtime/package actual del runner genérico se publica como `ai.common`.
 - un nodo vivo usa nombre L2 completo, por ejemplo `AI.chat@motherbee`.
 
 Control-plane y secrets:

@@ -1912,7 +1912,7 @@ impl GenericAiNode {
             "config_version": state.config_version,
             "contract": {
                 "node_family": "AI",
-                "node_kind": "AI.common",
+                "node_kind": "ai.common",
                 "supports": ["CONFIG_GET", "CONFIG_SET"],
                 "required_fields": [
                     "config.behavior.kind",
@@ -1930,7 +1930,7 @@ impl GenericAiNode {
                 "notes": [
                     "Preferred secret field is config.secrets.openai.api_key.",
                     "Legacy aliases config.behavior.openai.api_key and config.behavior.api_key remain accepted during migration.",
-                    "AI.common defaults behavior.capabilities.multimodal=true unless explicitly overridden.",
+                    "ai.common defaults behavior.capabilities.multimodal=true unless explicitly overridden.",
                     "Secret values are persisted in local secrets.json and always returned redacted."
                 ]
             },
@@ -4003,7 +4003,7 @@ fn parse_runner_args() -> Result<RunnerArgs, Box<dyn std::error::Error + Send + 
                 let normalized = value.trim().to_ascii_lowercase();
                 if normalized != "default" {
                     return Err(format!(
-                        "--mode={value} is not supported in AI.common runtime (only default)"
+                        "--mode={value} is not supported in ai.common runtime (only default)"
                     )
                     .into());
                 }
