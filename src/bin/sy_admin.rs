@@ -41,7 +41,8 @@ use json_router::runtime_manifest::{
     write_runtime_manifest_file_atomic, RuntimeManifest, RuntimeManifestEntry,
 };
 use json_router::runtime_package::{
-    install_validated_package, validate_package, DIST_RUNTIME_MANIFEST_PATH, DIST_RUNTIME_ROOT_DIR,
+    install_validated_package_with_options, validate_package, DIST_RUNTIME_MANIFEST_PATH,
+    DIST_RUNTIME_ROOT_DIR,
 };
 use json_router::shm::{
     now_epoch_ms, LsaRegionReader, RemoteHiveEntry, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
@@ -6623,7 +6624,7 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "set_current",
                 "bool",
-                "Optional current-pointer intent. Only true or omission is supported in the current implementation.",
+                "Optional current-pointer intent. When true, promote this version to current. When false, publish it only into available versions.",
             ),
             admin_action_body_field(
                 "sync_to",
@@ -7746,6 +7747,7 @@ fn publish_runtime_package_inline(
     staging_root: &Path,
     dist_root: &Path,
     manifest_path: &Path,
+    set_current: bool,
 ) -> Result<serde_json::Value, String> {
     let package_root = materialize_inline_runtime_package(package_files, staging_root)?;
     let validated = match validate_package(&package_root, None) {
@@ -7755,7 +7757,12 @@ fn publish_runtime_package_inline(
             return Err(err);
         }
     };
-    let install = match install_validated_package(&validated, dist_root, manifest_path) {
+    let install = match install_validated_package_with_options(
+        &validated,
+        dist_root,
+        manifest_path,
+        set_current,
+    ) {
         Ok(install) => install,
         Err(err) => {
             let _ = fs::remove_dir_all(&package_root);
@@ -7782,6 +7789,7 @@ fn publish_runtime_package_bundle(
     staging_root: &Path,
     dist_root: &Path,
     manifest_path: &Path,
+    set_current: bool,
 ) -> Result<serde_json::Value, String> {
     let (package_root, bundle_file) =
         materialize_bundle_runtime_package(blob_root, blob_path, staging_root)?;
@@ -7796,7 +7804,12 @@ fn publish_runtime_package_bundle(
             return Err(err);
         }
     };
-    let install = match install_validated_package(&validated, dist_root, manifest_path) {
+    let install = match install_validated_package_with_options(
+        &validated,
+        dist_root,
+        manifest_path,
+        set_current,
+    ) {
         Ok(install) => install,
         Err(err) => {
             let _ = fs::remove_dir_all(&extraction_root);
@@ -8308,20 +8321,6 @@ async fn handle_publish_runtime_package(
         }
     };
 
-    if matches!(req.set_current, Some(false)) {
-        return Ok((
-            400,
-            serde_json::json!({
-                "status": "error",
-                "action": "publish_runtime_package",
-                "payload": serde_json::Value::Null,
-                "error_code": "INVALID_REQUEST",
-                "error_detail": "set_current=false is not supported yet",
-            })
-            .to_string(),
-        ));
-    }
-
     let manifest_path = PathBuf::from(DIST_RUNTIME_MANIFEST_PATH);
     if !manifest_path.exists() {
         return Ok((
@@ -8375,12 +8374,14 @@ async fn handle_publish_runtime_package(
         }
     };
 
+    let set_current = req.set_current.unwrap_or(true);
     let publish_result = match &req.source {
         PublishRuntimePackageSource::InlinePackage { files } => publish_runtime_package_inline(
             files,
             &staging_root,
             Path::new(DIST_RUNTIME_ROOT_DIR),
             &manifest_path,
+            set_current,
         ),
         PublishRuntimePackageSource::BundleUpload { blob_path } => publish_runtime_package_bundle(
             &ctx.blob_root,
@@ -8388,6 +8389,7 @@ async fn handle_publish_runtime_package(
             &staging_root,
             Path::new(DIST_RUNTIME_ROOT_DIR),
             &manifest_path,
+            set_current,
         ),
     };
 
