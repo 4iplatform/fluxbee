@@ -1,0 +1,113 @@
+[
+  {
+    "layer": "artifact",
+    "pattern_key": "config_only_ai_runtime",
+    "trigger": "Build a config_only runtime package for an AI node — no custom binary, just a system prompt and default config.",
+    "inputs_signature": {
+      "artifact_kind": "runtime_package",
+      "package_source": "inline_package",
+      "node_type_prefix": "AI"
+    },
+    "successful_shape": {
+      "artifact_kind": "runtime_package",
+      "artifact": {
+        "files": {
+          "package.json": "{\"name\":\"ai.example\",\"version\":\"0.1.0\",\"type\":\"config_only\",\"runtime_base\":\"AI.common\"}",
+          "config/default-config.json": "{\"tenant_id\":\"tnt:example\",\"language\":\"es\"}",
+          "prompts/system.txt": "You are an AI assistant specialized in..."
+        }
+      }
+    },
+    "constraints": [
+      "package.json must include: name (lowercase, dots/hyphens allowed), version (semver), type, runtime_base",
+      "runtime_base must match one of the available runtimes in known_context.available_runtimes",
+      "config/default-config.json must be valid JSON",
+      "name in package.json must be lowercase with no spaces"
+    ],
+    "do_not_repeat": [
+      "do not use 'full_runtime' as type for config_only packages — use 'config_only'",
+      "do not invent a runtime_base that is not in the known available runtimes",
+      "do not omit package.json or config/default-config.json — both are required",
+      "do not include binary files or executables in inline_package artifacts"
+    ],
+    "failure_class": null,
+    "recorded_from_run": null,
+    "seed_kind": "manual"
+  },
+  {
+    "layer": "artifact",
+    "pattern_key": "workflow_definition",
+    "trigger": "Build a workflow definition artifact for a WF node deployment.",
+    "inputs_signature": {
+      "artifact_kind": "workflow_definition",
+      "node_type_prefix": "WF"
+    },
+    "successful_shape": {
+      "artifact_kind": "workflow_definition",
+      "artifact": {
+        "workflow_name": "invoice_approval",
+        "version": "0.1.0",
+        "description": "Invoice approval workflow with multi-step validation",
+        "steps": [
+          {
+            "id": "s1",
+            "type": "ai_call",
+            "node": "AI.validator@motherbee",
+            "input_mapping": { "document": "$.input.document" }
+          },
+          {
+            "id": "s2",
+            "type": "conditional",
+            "condition": "$.steps.s1.approved == true",
+            "on_true": "s3",
+            "on_false": "s4"
+          }
+        ]
+      }
+    },
+    "constraints": [
+      "workflow_name must be unique per hive and match the wf_deployment in the manifest",
+      "steps array must be non-empty",
+      "each step must have a unique 'id' field"
+    ],
+    "do_not_repeat": [
+      "do not use numeric step ids — use string ids like 's1', 's2'",
+      "do not reference nodes that do not exist in the desired_state manifest",
+      "do not omit the 'type' field on each step"
+    ],
+    "failure_class": null,
+    "recorded_from_run": null,
+    "seed_kind": "manual"
+  },
+  {
+    "layer": "artifact",
+    "pattern_key": "opa_policy_bundle",
+    "trigger": "Build an OPA Rego policy bundle for authorization or routing decisions.",
+    "inputs_signature": {
+      "artifact_kind": "opa_bundle"
+    },
+    "successful_shape": {
+      "artifact_kind": "opa_bundle",
+      "artifact": {
+        "rego_source": "package fluxbee.access\n\ndefault allow = false\n\nallow {\n  input.role == \"admin\"\n}\n",
+        "metadata": {
+          "policy_id": "access_control_v1",
+          "description": "Basic role-based access control"
+        }
+      }
+    },
+    "constraints": [
+      "rego_source must start with a 'package' declaration",
+      "package name must follow Rego naming convention (lowercase, dots as namespace separators)",
+      "the artifact must contain 'rego_source' as a top-level field"
+    ],
+    "do_not_repeat": [
+      "do not omit the 'package' declaration — it is required by OPA",
+      "do not embed raw JSON in Rego — use input.* references instead",
+      "do not use 'allow = true' as default — always default to false for security"
+    ],
+    "failure_class": null,
+    "recorded_from_run": null,
+    "seed_kind": "manual"
+  }
+]

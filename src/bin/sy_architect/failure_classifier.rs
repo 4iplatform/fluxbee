@@ -143,6 +143,52 @@ pub enum FailureRoutingDecision {
     EscalateToOperator,
 }
 
+impl FailureRoutingDecision {
+    /// Human-readable message for the operator explaining the routing decision.
+    pub fn operator_message(&self, failure_class: &FailureClass) -> String {
+        let class_label = format!("{failure_class:?}");
+        match self {
+            FailureRoutingDecision::RetryDesign => format!(
+                "The design phase will be retried automatically. \
+                Failure class: {class_label}. \
+                The designer will receive the audit feedback and produce a revised manifest."
+            ),
+            FailureRoutingDecision::RetryArtifact => format!(
+                "Artifact generation will be retried with a repair packet. \
+                Failure class: {class_label}. \
+                The programmer will receive the audit findings and correct the artifact."
+            ),
+            FailureRoutingDecision::RetryPlanCompile => format!(
+                "Plan compilation will be retried automatically. \
+                Failure class: {class_label}. \
+                The plan compiler will attempt to produce a valid executor plan."
+            ),
+            FailureRoutingDecision::RetryExecutor => format!(
+                "Execution will be retried automatically. \
+                Failure class: {class_label}. \
+                A transient timeout or environment issue was detected."
+            ),
+            FailureRoutingDecision::EscalateToOperator => format!(
+                "Operator action required — the pipeline cannot proceed automatically. \
+                Failure class: {class_label}. \
+                Review the error above and choose an action from operator_options."
+            ),
+        }
+    }
+
+    /// Structured operator action options — non-empty only for EscalateToOperator.
+    pub fn operator_options(&self) -> &'static [&'static str] {
+        match self {
+            FailureRoutingDecision::EscalateToOperator => &[
+                "fix_manifest_and_retry",
+                "restart_pipeline_from_design",
+                "cancel_pipeline",
+            ],
+            _ => &[],
+        }
+    }
+}
+
 pub fn route_failure(
     class: &FailureClass,
     design_iterations_used: usize,

@@ -1,0 +1,94 @@
+[
+  {
+    "layer": "repair",
+    "pattern_key": "missing_required_file_runtime_package",
+    "trigger": "ArtifactAuditor found MISSING_FILE in a runtime_package artifact.",
+    "inputs_signature": {
+      "failure_class": "ARTIFACT_LAYOUT_INVALID",
+      "finding_code": "MISSING_FILE",
+      "artifact_kind": "runtime_package"
+    },
+    "successful_shape": {
+      "artifact": {
+        "files": {
+          "package.json": "{\"name\":\"ai.example\",\"version\":\"0.1.0\",\"type\":\"config_only\",\"runtime_base\":\"AI.common\"}",
+          "config/default-config.json": "{}"
+        }
+      }
+    },
+    "constraints": [
+      "Both package.json and config/default-config.json are always required for runtime_package",
+      "package.json content must be valid JSON — not just a filename",
+      "Files must be nested under the 'files' key inside the artifact object"
+    ],
+    "do_not_repeat": [
+      "do not return an empty 'files' object — always include at minimum the two required files",
+      "do not put file content at the top level of the artifact — it must be under 'files'",
+      "do not repeat the same structure if the previous attempt already had the files missing at the same path"
+    ],
+    "failure_class": "ARTIFACT_LAYOUT_INVALID",
+    "recorded_from_run": null,
+    "seed_kind": "manual"
+  },
+  {
+    "layer": "repair",
+    "pattern_key": "invalid_runtime_base",
+    "trigger": "ArtifactAuditor found INVALID_RUNTIME_BASE — the runtime_base in package.json is not in available runtimes.",
+    "inputs_signature": {
+      "failure_class": "ARTIFACT_CONTRACT_INVALID",
+      "finding_code": "INVALID_RUNTIME_BASE",
+      "artifact_kind": "runtime_package"
+    },
+    "successful_shape": {
+      "artifact": {
+        "files": {
+          "package.json": "{\"name\":\"ai.example\",\"version\":\"0.1.0\",\"type\":\"config_only\",\"runtime_base\":\"AI.common\"}"
+        }
+      }
+    },
+    "constraints": [
+      "runtime_base must be exactly one of the values listed in the repair_hints instruction",
+      "Do not guess or invent a runtime_base — only use names from the known_context.available_runtimes list provided in the repair packet"
+    ],
+    "do_not_repeat": [
+      "do not keep the invalid runtime_base from the previous attempt",
+      "do not use a runtime_base with an @hive suffix — just the plain runtime name",
+      "do not use 'AI.chat' as a base for new config_only packages — use 'AI.common'"
+    ],
+    "failure_class": "ARTIFACT_CONTRACT_INVALID",
+    "recorded_from_run": null,
+    "seed_kind": "manual"
+  },
+  {
+    "layer": "repair",
+    "pattern_key": "plan_invalid_unknown_action",
+    "trigger": "Plan compiler produced a plan with an unknown or misspelled action name.",
+    "inputs_signature": {
+      "failure_class": "PLAN_INVALID",
+      "finding_code": "UNKNOWN_ACTION"
+    },
+    "successful_shape": {
+      "steps": [
+        {
+          "id": "s1",
+          "action": "run_node",
+          "args": {}
+        }
+      ]
+    },
+    "constraints": [
+      "Use only action names returned by get_admin_action_help or listed in the available actions",
+      "Action names are case-sensitive and use snake_case",
+      "Always verify the action name with get_admin_action_help before using it in a plan"
+    ],
+    "do_not_repeat": [
+      "do not use 'create_node' — the correct action is 'run_node'",
+      "do not use 'deploy_runtime' — the correct action is 'publish_runtime_package'",
+      "do not use 'update_route' — use 'delete_route' followed by 'add_route' instead",
+      "do not use 'apply_config' — the correct action is 'node_control_config_set'"
+    ],
+    "failure_class": "PLAN_INVALID",
+    "recorded_from_run": null,
+    "seed_kind": "manual"
+  }
+]

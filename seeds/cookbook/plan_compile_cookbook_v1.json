@@ -1,0 +1,124 @@
+[
+  {
+    "layer": "plan_compile",
+    "pattern_key": "node_run_missing",
+    "trigger": "Delta report contains NODE_RUN_MISSING for an AI or IO node. Runtime is already published and materialized.",
+    "inputs_signature": {
+      "compiler_class": "NODE_RUN_MISSING",
+      "runtime_materialized": true
+    },
+    "successful_shape": {
+      "steps": [
+        {
+          "id": "s1",
+          "action": "run_node",
+          "args": {
+            "hive": "motherbee",
+            "node_name": "AI.example@motherbee",
+            "runtime": "AI.example",
+            "runtime_version": "current"
+          }
+        }
+      ]
+    },
+    "constraints": [
+      "runtime_version must be 'current' unless a specific version is required",
+      "node_name must include the full @hive suffix",
+      "runtime arg must NOT include @hive suffix — just the runtime name",
+      "hive must match the @hive suffix in node_name exactly"
+    ],
+    "do_not_repeat": [
+      "do not add publish_runtime_package before run_node if runtime is already materialized — check delta report payload_ref",
+      "do not use the node_name as the runtime arg — they are different identifiers"
+    ],
+    "failure_class": null,
+    "recorded_from_run": null,
+    "seed_kind": "manual"
+  },
+  {
+    "layer": "plan_compile",
+    "pattern_key": "runtime_publish_and_distribute",
+    "trigger": "Delta report contains RUNTIME_PUBLISH_AND_DISTRIBUTE. An approved artifact bundle is available.",
+    "inputs_signature": {
+      "compiler_class": "RUNTIME_PUBLISH_AND_DISTRIBUTE",
+      "approved_artifact_available": true,
+      "sync_to_hives": ["worker-220"]
+    },
+    "successful_shape": {
+      "steps": [
+        {
+          "id": "s1",
+          "action": "publish_runtime_package",
+          "args": {
+            "hive": "motherbee",
+            "name": "AI.specialist",
+            "version": "0.1.0",
+            "source": {
+              "kind": "inline_package",
+              "files": {}
+            },
+            "sync_to": ["worker-220"],
+            "update_to": "worker-220"
+          }
+        }
+      ]
+    },
+    "constraints": [
+      "source.kind must be 'inline_package' or 'bundle_upload' — match what the artifact bundle produced",
+      "sync_to is a list of hive IDs to distribute the runtime to after publishing",
+      "update_to is the hive that should activate the new version — usually the target worker hive"
+    ],
+    "do_not_repeat": [
+      "do not add run_node in the same plan if the delta only requires publishing — run_node is a separate delta operation",
+      "do not invent sync_to hives — use only hives listed in the delta operation notes or manifest"
+    ],
+    "failure_class": null,
+    "recorded_from_run": null,
+    "seed_kind": "manual"
+  },
+  {
+    "layer": "plan_compile",
+    "pattern_key": "node_config_apply_restart",
+    "trigger": "Delta report contains NODE_CONFIG_APPLY_RESTART. WF or SY node with config drift that requires a restart to take effect.",
+    "inputs_signature": {
+      "compiler_class": "NODE_CONFIG_APPLY_RESTART",
+      "node_prefix": ["WF", "SY"]
+    },
+    "successful_shape": {
+      "steps": [
+        {
+          "id": "s1",
+          "action": "node_control_config_set",
+          "args": {
+            "hive": "motherbee",
+            "node_name": "WF.router@motherbee",
+            "config": {
+              "routing_table": "v2"
+            }
+          }
+        },
+        {
+          "id": "s2",
+          "action": "restart_node",
+          "args": {
+            "hive": "motherbee",
+            "node_name": "WF.router@motherbee"
+          }
+        }
+      ]
+    },
+    "constraints": [
+      "node_control_config_set MUST come before restart_node — config is applied first, then node restarts to pick it up",
+      "both steps must reference the same hive and node_name",
+      "config in node_control_config_set must be the delta config (not the full config)"
+    ],
+    "do_not_repeat": [
+      "do not skip node_control_config_set and only restart — this leaves config unchanged",
+      "do not add restart_node for AI.* or IO.* nodes — those use NODE_CONFIG_APPLY_HOT with no restart",
+      "do not include unchanged config fields — only the fields that changed"
+    ],
+    "failure_class": null,
+    "recorded_from_run": null,
+    "seed_kind": "manual"
+  }
+]

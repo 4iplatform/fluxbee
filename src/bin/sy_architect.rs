@@ -6,7 +6,7 @@ mod failure_classifier;
 mod pipeline_types;
 #[path = "sy_architect/reconciler.rs"]
 mod reconciler;
-use failure_classifier::{classify_failure_deterministic, route_failure, FailureContext};
+use failure_classifier::{classify_failure_deterministic, route_failure, FailureContext, FailureRoutingDecision};
 use pipeline_types::{
     compiler_class_admin_steps, compiler_class_risk, cookbook_paths,
     desired_state_unknown_sections, is_valid_ownership_label, manifest_path,
@@ -93,8 +93,6 @@ const ARCHITECT_MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 const ARCHITECT_MAX_SOFTWARE_UPLOAD_BYTES: usize = 128 * 1024 * 1024;
 const ARCHITECT_MAX_MULTIPART_UPLOAD_BYTES: usize =
     ARCHITECT_MAX_SOFTWARE_UPLOAD_BYTES + (4 * 1024 * 1024);
-const ARCHITECT_INTERNAL_ARTIFACT_KIND_INFRASTRUCTURE: &str = "infrastructure";
-const ARCHITECT_INFRA_ARTIFACT_RUNTIME_PACKAGE_SOURCE: &str = "runtime_package_source";
 const STATUS_REFRESH_INTERVAL_SECS: u64 = 60;
 const ARCHI_SYSTEM_PROMPT: &str = r#"You are archi, the Fluxbee system architect.
 
@@ -151,48 +149,21 @@ Rules:
   - `fluxbee_set_node_config` — for `node_control_config_set` when passing a large node `config` object. Pass the config in `config`, or serialize to a JSON string and pass in `config_json`. Always do CONFIG_GET first to read the current `config_version`.
   - Use `fluxbee_system_write` only for mutations whose body is small and fits cleanly as an inline JSON object (route adds, vpn adds, kill_node, rollback, delete, etc.).
   - `fluxbee_start_pipeline` — for pipeline-eligible design intents: creating or extending a solution, changing topology, adding runtimes/nodes/routes, or any request that should go through manifest + reconcile instead of direct ad-hoc mutations.
-  - `fluxbee_plan_compiler` (DEPRECATED name: `fluxbee_programmer`) — when the operator wants to deploy, spawn, route, or configure nodes and the intent is clear enough to produce a concrete plan. The programmer translates the task into an executor_plan automatically. After receiving its result, present the `human_summary` to the operator (NOT the raw JSON plan) and wait for the literal word CONFIRM.
+  - `fluxbee_plan_compiler` (DEPRECATED free-form path; old role name: `fluxbee_programmer`) — use only when the operator explicitly wants a direct executor plan instead of the full design/reconcile pipeline, or when the task is a narrow legacy deployment/configuration flow that does not need a manifest-driven pipeline. It translates the task into an executor_plan automatically.
 - For pipeline-eligible design intents, prefer the pipeline path over direct programmer/planner output.
-- If the operator is asking for a full solution design or clearly approves your previous offer to design it, call `fluxbee_start_pipeline` once with the task and any important constraints.
+- If the operator is asking for a full solution design or clearly approves your previous offer to design it, call `fluxbee_start_pipeline` once with the task and any important constraints. That tool stages the canonical pipeline start request and returns the operator-facing confirmation message.
 - If the operator message is ambiguous about whether they want the full pipeline, ask a brief question first instead of starting it silently.
 - After `fluxbee_start_pipeline` returns, call NO more tools in that turn. Present its returned `message` directly.
+- After you show that staged pipeline message, the operator can reply `si`, `sí`, `ok`, `dale`, `adelante`, `start`, or `CONFIRM` to launch the pipeline, or `no` / `CANCEL` to discard it.
 - CONFIRM at pipeline Confirm1 approves the design direction only. It does not execute admin changes yet.
+- CONFIRM at pipeline Confirm2 approves execution of the prepared executor plan. Make destructive or restarting effects explicit before asking for it.
 - Do not call `fluxbee_plan_compiler` for questions, status checks, or exploratory requests. Only call it when the operator has a clear deployment or configuration intent.
-- After `fluxbee_plan_compiler` returns a plan: call NO more tools. Output ONLY the human_summary and end your message with "Reply **CONFIRM** to execute or **CANCEL** to discard." Stop there. Do not call `fluxbee_plan_compiler` again unless the operator explicitly cancels and starts a new task.
+- In the deprecated free-form plan path only: after `fluxbee_plan_compiler` returns a plan, call NO more tools. Output ONLY the human_summary and end your message with "Reply **CONFIRM** to execute or **CANCEL** to discard." Stop there. Do not call `fluxbee_plan_compiler` again unless the operator explicitly cancels and starts a new task.
 - "yes", "si", "ok", "sure", "proceed" are NOT CONFIRM. Only the literal word CONFIRM (or "OK CONFIRM") triggers plan execution. If the operator says something other than CONFIRM or CANCEL after you show the summary, remind them to reply CONFIRM or CANCEL.
 - Never call `fluxbee_plan_compiler` more than once per task. If the plan needs adjustment, tell the operator what needs clarification first, then call it once with the complete information.
 - Do not claim actions were executed unless they actually were.
 - If information is missing, say what is missing.
 - Keep answers useful for administrators and developers."#;
-const ARCHITECT_INFRASTRUCTURE_SPECIALIST_PROMPT: &str = r#"You are the infrastructure specialist inside SY.architect.
-
-Your job is to materialize infrastructure-focused internal artifacts for the host architect.
-
-Current supported artifact type:
-- runtime_package_source
-
-For runtime_package_source:
-- produce an internal infrastructure artifact payload that helps publish a runtime package
-- prefer shapes directly reusable by SY.admin publish_runtime_package
-- when the request clearly targets a generated/config package, prefer source.kind=inline_package
-- when the request clearly targets an uploaded zip bundle, prefer source.kind=bundle_upload
-- do not invent lifecycle execution; only include sync_to/update_to if the request explicitly or mechanically implies them
-- do not invent tenant ids, hive ids, runtime names, versions, prompts, or package files unless they are given or derivable from the request
-- when data is missing, keep the artifact partial and list the missing items in notes
-
-Return ONLY one JSON object with this exact top-level shape:
-{
-  "summary": "short summary",
-  "publish_request": { ... direct body for publish_runtime_package ... },
-  "notes": ["..."]
-}
-
-Rules:
-- Output JSON only. No markdown fences.
-- publish_request must be an object.
-- For inline_package, publish_request.source.files must be a string map.
-- For bundle_upload, publish_request.source.blob_path must be relative to blob root.
-- Keep notes concise and operational."#;
 const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
   <rect width="64" height="64" rx="16" fill="#ffffff"/>
   <path d="M18 33c0-8 6.5-14.5 14.5-14.5S47 25 47 33s-6.5 14.5-14.5 14.5S18 41 18 33Z" fill="#0070F3" opacity="0.14"/>
@@ -258,6 +229,7 @@ struct ArchitectAdminToolContext {
     session_id: Option<String>,
     chat_lock: Arc<Mutex<()>>,
     pending_actions: Arc<Mutex<HashMap<String, PendingAdminAction>>>,
+    pending_pipeline_starts: Arc<Mutex<HashMap<String, PendingPipelineStart>>>,
     admin_actions_cache: Arc<Mutex<Option<AdminActionsCache>>>,
     plan_compile_pending: Arc<Mutex<HashMap<String, PlanCompilePending>>>,
     active_pipeline_runs: Arc<Mutex<HashMap<String, PipelineRunRecord>>>,
@@ -298,6 +270,7 @@ struct ArchitectState {
     ai_runtime: Arc<Mutex<Option<ArchitectAiRuntime>>>,
     chat_lock: Arc<Mutex<()>>,
     pending_actions: Arc<Mutex<HashMap<String, PendingAdminAction>>>,
+    pending_pipeline_starts: Arc<Mutex<HashMap<String, PendingPipelineStart>>>,
     router_sender: Arc<Mutex<Option<NodeSender>>>,
     cached_status: Arc<RwLock<ArchitectStatus>>,
     admin_actions_cache: Arc<Mutex<Option<AdminActionsCache>>>,
@@ -706,6 +679,14 @@ struct DesignerTrace {
     validation_result: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingPipelineStart {
+    task: String,
+    solution_id: Option<String>,
+    operator_context: String,
+    created_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum DesignLoopStopReason {
@@ -757,10 +738,6 @@ impl FunctionToolProvider for ArchitectAdminReadToolsProvider {
             self.context.clone(),
         )))?;
         registry.register(Arc::new(StartPipelineTool::new(self.context.clone())))?;
-        // DEPRECATED: fluxbee_infrastructure_specialist is superseded by
-        // real_programmer + artifact_auditor per rearchitecture spec v4 (TD-7).
-        // Removed from registry — struct kept as dead code for migration safety.
-        // registry.register(Arc::new(ArchitectInfrastructureSpecialistTool::new(self.context.clone())))?;
         registry.register(Arc::new(ArchitectDeployWorkflowTool::new(
             self.context.clone(),
         )))?;
@@ -776,133 +753,6 @@ impl FunctionToolProvider for ArchitectAdminReadToolsProvider {
         registry.register(Arc::new(PlanCompilerTool::new(self.context.clone())))?;
         registry.register(Arc::new(DesignerTool::new(self.context.clone())))?;
         registry.register(Arc::new(DesignAuditorTool::new(self.context.clone())))
-    }
-}
-
-#[allow(dead_code)]
-struct ArchitectDesignerToolsProvider {
-    context: ArchitectAdminToolContext,
-}
-
-#[allow(dead_code)]
-impl ArchitectDesignerToolsProvider {
-    fn new(context: ArchitectAdminToolContext) -> Self {
-        Self { context }
-    }
-}
-
-impl FunctionToolProvider for ArchitectDesignerToolsProvider {
-    fn register_tools(&self, registry: &mut FunctionToolRegistry) -> fluxbee_ai_sdk::Result<()> {
-        registry.register(Arc::new(GetManifestCurrentTool::new(self.context.clone())))?;
-        registry.register(Arc::new(PlanCompilerLiveQueryTool {
-            context: self.context.clone(),
-        }))
-    }
-}
-
-// ---- ArchitectInfrastructureSpecialistTool ---------------------------------
-// DEPRECATED: superseded by real_programmer + artifact_auditor (rearchitecture spec v4, TD-7).
-// Kept as dead code for migration safety. Do not add features here.
-
-#[allow(dead_code)]
-struct ArchitectInfrastructureSpecialistTool {
-    context: ArchitectAdminToolContext,
-}
-
-impl ArchitectInfrastructureSpecialistTool {
-    fn new(context: ArchitectAdminToolContext) -> Self {
-        Self { context }
-    }
-}
-
-#[async_trait]
-impl FunctionTool for ArchitectInfrastructureSpecialistTool {
-    fn definition(&self) -> FunctionToolDefinition {
-        FunctionToolDefinition {
-            name: "fluxbee_infrastructure_specialist".to_string(),
-            description: format!(
-                "Call the internal infrastructure specialist inside SY.architect on hive {}. \
-                Use this when package assembly or other infrastructure materialization is too \
-                complex to keep in the host prompt. The current supported artifact_type is \
-                runtime_package_source. The tool returns an internal infrastructure artifact \
-                whose payload.publish_request is intended to feed publish_runtime_package.",
-                self.context.hive_id,
-            ),
-            parameters_json_schema: json!({
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["artifact_type", "task"],
-                "properties": {
-                    "artifact_type": {
-                        "type": "string",
-                        "enum": [ARCHITECT_INFRA_ARTIFACT_RUNTIME_PACKAGE_SOURCE],
-                        "description": "Infrastructure artifact type to materialize."
-                    },
-                    "task": {
-                        "type": "string",
-                        "description": "Short statement of what the specialist should produce."
-                    },
-                    "request": {
-                        "type": "object",
-                        "description": "Structured specialist input. For runtime_package_source, include the package intent, runtime metadata, file content requirements, and any deploy hints."
-                    },
-                    "request_json": {
-                        "type": "string",
-                        "description": "Alternative to request: the specialist input serialized as JSON."
-                    }
-                }
-            }),
-        }
-    }
-
-    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
-        let artifact_type = arguments
-            .get("artifact_type")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                fluxbee_ai_sdk::AiSdkError::Protocol(
-                    "fluxbee_infrastructure_specialist requires 'artifact_type'".to_string(),
-                )
-            })?;
-        let task = arguments
-            .get("task")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                fluxbee_ai_sdk::AiSdkError::Protocol(
-                    "fluxbee_infrastructure_specialist requires 'task'".to_string(),
-                )
-            })?;
-        if artifact_type != ARCHITECT_INFRA_ARTIFACT_RUNTIME_PACKAGE_SOURCE {
-            return Err(fluxbee_ai_sdk::AiSdkError::Protocol(format!(
-                "unsupported infrastructure artifact_type '{}'",
-                artifact_type
-            )));
-        }
-        let request =
-            resolve_json_object_param(&arguments, "request", "request_json").map_err(|err| {
-                fluxbee_ai_sdk::AiSdkError::Protocol(format!(
-                    "fluxbee_infrastructure_specialist: {err}"
-                ))
-            })?;
-
-        let specialist_output = run_infrastructure_specialist_with_context(
-            &self.context,
-            artifact_type,
-            task,
-            &request,
-        )
-        .await
-        .map_err(|err| fluxbee_ai_sdk::AiSdkError::Protocol(err.to_string()))?;
-
-        Ok(json!({
-            "status": "ok",
-            "artifact": specialist_output,
-            "message": "Infrastructure artifact generated."
-        }))
     }
 }
 
@@ -1779,65 +1629,6 @@ async fn stage_admin_write(
     }))
 }
 
-async fn run_infrastructure_specialist_with_context(
-    context: &ArchitectAdminToolContext,
-    artifact_type: &str,
-    task: &str,
-    request: &Value,
-) -> Result<Value, ArchitectError> {
-    let runtime = context
-        .ai_runtime
-        .lock()
-        .await
-        .clone()
-        .ok_or_else(|| -> ArchitectError {
-            "AI provider not configured for the infrastructure specialist."
-                .to_string()
-                .into()
-        })?;
-    let prompt = ARCHITECT_INFRASTRUCTURE_SPECIALIST_PROMPT.to_string();
-    let model = runtime.client.clone().function_model(
-        runtime.model.clone(),
-        Some(prompt),
-        runtime.model_settings.clone(),
-    );
-    let tools = FunctionToolRegistry::new();
-    let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
-    let request_text = serde_json::to_string_pretty(&json!({
-        "artifact_type": artifact_type,
-        "task": task,
-        "request": request,
-    }))
-    .map_err(|err| -> ArchitectError {
-        format!("failed to serialize infrastructure specialist request: {err}").into()
-    })?;
-    let result = runner
-        .run_with_input(
-            &model,
-            &tools,
-            FunctionRunInput {
-                current_user_message: request_text,
-                current_user_parts: None,
-                immediate_memory: None,
-            },
-        )
-        .await
-        .map_err(|err| -> ArchitectError {
-            format!("infrastructure specialist request failed: {err}").into()
-        })?;
-    let raw = result
-        .final_assistant_text
-        .ok_or_else(|| -> ArchitectError {
-            "infrastructure specialist returned no final text"
-                .to_string()
-                .into()
-        })?;
-    let parsed = parse_json_value_from_text(&raw).map_err(|err| -> ArchitectError {
-        format!("infrastructure specialist returned invalid JSON: {err}").into()
-    })?;
-    build_infrastructure_artifact(artifact_type, task, parsed)
-}
-
 // ── Admin actions cache (PROG-T1/T2) ─────────────────────────────────────────
 
 async fn get_or_refresh_admin_actions(
@@ -2223,6 +2014,36 @@ fn append_artifact_cookbook_entry(state_dir: &Path, entry: CookbookEntryV2) {
     write_artifact_cookbook(state_dir, &entries);
 }
 
+fn write_design_cookbook(state_dir: &Path, entries: &[CookbookEntryV2]) {
+    let path = state_dir.join(cookbook_paths::DESIGN);
+    let json_bytes = match serde_json::to_vec_pretty(entries) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(error = %err, "design cookbook serialize failed");
+            return;
+        }
+    };
+    let tmp_path = path.with_extension("tmp");
+    if let Err(err) = std::fs::write(&tmp_path, &json_bytes) {
+        tracing::warn!(error = %err, path = %tmp_path.display(), "design cookbook write failed");
+        return;
+    }
+    if let Err(err) = std::fs::rename(&tmp_path, &path) {
+        tracing::warn!(error = %err, "design cookbook rename failed — removing tmp");
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+}
+
+fn append_design_cookbook_entry(state_dir: &Path, entry: CookbookEntryV2) {
+    let mut entries = read_design_cookbook(state_dir);
+    entries.push(entry);
+    if entries.len() > PLAN_COMPILE_COOKBOOK_MAX_ENTRIES {
+        let drop = entries.len() - PLAN_COMPILE_COOKBOOK_MAX_ENTRIES;
+        entries.drain(0..drop);
+    }
+    write_design_cookbook(state_dir, &entries);
+}
+
 fn read_design_cookbook(state_dir: &Path) -> Vec<CookbookEntryV2> {
     let path = state_dir.join(cookbook_paths::DESIGN);
     let raw = match std::fs::read(&path) {
@@ -2238,6 +2059,126 @@ fn read_handbook_text() -> Option<String> {
         .iter()
         .map(|candidate| cwd.join(candidate))
         .find_map(|path| std::fs::read_to_string(path).ok())
+}
+
+// ── TF: Seed cookbooks from repo defaults on startup ─────────────────────────
+// Each cookbook is seeded once from seeds/cookbook/{name} if the runtime file
+// is missing or empty. Once the pipeline appends observed patterns, the seeds
+// are never overwritten — they are bootstrapping data, not configuration.
+fn seed_cookbooks_from_defaults(state_dir: &Path) {
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    let pairs: &[(&str, &str)] = &[
+        (cookbook_paths::DESIGN,       "seeds/cookbook/design_cookbook_v1.json"),
+        (cookbook_paths::ARTIFACT,     "seeds/cookbook/artifact_cookbook_v1.json"),
+        (cookbook_paths::PLAN_COMPILE, "seeds/cookbook/plan_compile_cookbook_v1.json"),
+        (cookbook_paths::REPAIR,       "seeds/cookbook/repair_cookbook_v1.json"),
+    ];
+
+    for (runtime_rel, seed_rel) in pairs {
+        let runtime_path = state_dir.join(runtime_rel);
+        let is_empty = !runtime_path.exists()
+            || std::fs::metadata(&runtime_path).map(|m| m.len() <= 2).unwrap_or(true);
+        if !is_empty {
+            continue;
+        }
+        let seed_path = cwd.join(seed_rel);
+        let raw = match std::fs::read(&seed_path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if let Some(parent) = runtime_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(err) = std::fs::write(&runtime_path, &raw) {
+            tracing::warn!(
+                seed = %seed_path.display(),
+                target = %runtime_path.display(),
+                error = %err,
+                "cookbook seed write failed"
+            );
+        } else {
+            tracing::info!(
+                target = %runtime_path.display(),
+                "cookbook seeded from defaults"
+            );
+        }
+    }
+}
+
+// ── TE-2: Residual AI failure classifier ─────────────────────────────────────
+// Called only when classify_failure_deterministic returns None.
+// Uses a direct chat completion (no function calling) to classify unknown errors.
+// Always returns a FailureClass — falls back to UnknownResidual if AI is unavailable.
+async fn classify_failure_with_ai(
+    state: &ArchitectState,
+    error_text: &str,
+    ctx: &failure_classifier::FailureContext,
+) -> FailureClass {
+    let runtime = match state.ai_runtime.lock().await.clone() {
+        Some(r) => r,
+        None => return FailureClass::UnknownResidual,
+    };
+
+    let stage_label = format!("{:?}", ctx.stage);
+    let code_label = ctx.error_code.as_deref().unwrap_or("none");
+    let prompt = format!(
+        "You are a failure classifier for the Fluxbee pipeline. \
+        Classify the following error into exactly one FailureClass variant. \
+        Respond with ONLY the variant name — no explanation, no markdown.\n\n\
+        Valid variants: DesignIncomplete, DesignConflict, SnapshotPartialBlocking, \
+        SnapshotSectionUnsupported, DeltaUnsupported, ArtifactTaskUnderspecified, \
+        ArtifactContractInvalid, ArtifactLayoutInvalid, PlanInvalid, PlanContractInvalid, \
+        ExecutionEnvironmentMissing, ExecutionActionFailed, ExecutionTimeout, UnknownResidual\n\n\
+        Stage: {stage_label}\n\
+        Error code: {code_label}\n\
+        Error: {error_text}"
+    );
+
+    let model = runtime.client.clone().function_model(
+        runtime.model.clone(),
+        None,
+        runtime.model_settings.clone(),
+    );
+    let tools = FunctionToolRegistry::new();
+    let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
+    let result = runner
+        .run_with_input(
+            &model,
+            &tools,
+            FunctionRunInput {
+                current_user_message: prompt,
+                current_user_parts: None,
+                immediate_memory: None,
+            },
+        )
+        .await;
+
+    let raw = match result {
+        Ok(r) => r.final_assistant_text.unwrap_or_default(),
+        Err(_) => return FailureClass::UnknownResidual,
+    };
+
+    let label = raw.trim();
+    match label {
+        "DesignIncomplete" => FailureClass::DesignIncomplete,
+        "DesignConflict" => FailureClass::DesignConflict,
+        "SnapshotPartialBlocking" => FailureClass::SnapshotPartialBlocking,
+        "SnapshotSectionUnsupported" => FailureClass::SnapshotSectionUnsupported,
+        "DeltaUnsupported" => FailureClass::DeltaUnsupported,
+        "ArtifactTaskUnderspecified" => FailureClass::ArtifactTaskUnderspecified,
+        "ArtifactContractInvalid" => FailureClass::ArtifactContractInvalid,
+        "ArtifactLayoutInvalid" => FailureClass::ArtifactLayoutInvalid,
+        "PlanInvalid" => FailureClass::PlanInvalid,
+        "PlanContractInvalid" => FailureClass::PlanContractInvalid,
+        "ExecutionEnvironmentMissing" => FailureClass::ExecutionEnvironmentMissing,
+        "ExecutionActionFailed" => FailureClass::ExecutionActionFailed,
+        "ExecutionTimeout" => FailureClass::ExecutionTimeout,
+        _ => FailureClass::UnknownResidual,
+    }
 }
 
 fn sanitize_solution_id(seed: &str) -> String {
@@ -2342,6 +2283,7 @@ When the input includes `delta_report`, you are in the canonical pipeline path.
 - Do not skip required steps for a delta operation unless the operation is NOOP.
 - If a delta operation has a blocked compiler_class with no translation, do not invent a workaround.
 - Treat free-form `task` as deprecated context only when `delta_report` is present.
+- If `approved_artifacts` entries include `publish_source`, use that exact source for any `publish_runtime_package` step justified by the delta. Do not reconstruct inline files or blob paths manually when a canonical publish_source is already provided.
 
 ## Fluxbee node naming convention
 
@@ -2490,6 +2432,45 @@ You call submit_design_audit_verdict exactly once.
 - advisory notes that signal unresolved deployment risk
 "#;
 
+const REAL_PROGRAMMER_SYSTEM_PROMPT_BASE: &str = r#"You are the real_programmer agent inside SY.architect.
+
+Your job is to generate one concrete artifact bundle for exactly one build_task_packet.
+You do NOT design topology, compute diffs, choose admin actions, or publish anything.
+You must stay inside the artifact task.
+
+## Scope
+
+- Read the build_task_packet and optional repair_packet as structured input.
+- Produce one structurally coherent artifact bundle candidate.
+- Preserve any required_corrections and must_preserve constraints from the repair packet.
+- If information is missing, make the smallest safe assumption and record it in assumptions.
+
+## Current supported artifact contract
+
+- runtime_package
+- target_kind = inline_package | bundle_upload
+
+For runtime_package:
+- artifact must be:
+  {
+    "files": {
+      "package.json": "...json string...",
+      "config/default-config.json": "...json string..."
+    }
+  }
+- The artifact payload is always a logical package file map. If target_kind is bundle_upload, the host will archive those files into a zip blob after structural approval.
+- You may add extra files such as system.txt, prompts, scripts, or docs when useful.
+- package.json must be a JSON string with at least: name, version, type, runtime_base
+- runtime_base must come from build_task_packet.known_context.available_runtimes when one is needed
+
+## Rules
+
+- Never output admin steps or executor plans.
+- Never wrap the artifact in publish_request or infrastructure payloads.
+- Never emit markdown fences.
+- Call submit_artifact_bundle exactly once.
+"#;
+
 fn build_designer_prompt(cookbook: &[CookbookEntryV2], handbook: Option<&str>) -> String {
     let mut prompt = DESIGNER_SYSTEM_PROMPT_BASE.to_string();
     if let Some(handbook_text) = handbook.filter(|text| !text.trim().is_empty()) {
@@ -2512,6 +2493,23 @@ fn build_design_auditor_prompt(handbook: Option<&str>) -> String {
     if let Some(handbook_text) = handbook.filter(|text| !text.trim().is_empty()) {
         prompt.push_str("\n## HANDBOOK\n\n");
         prompt.push_str(handbook_text);
+    }
+    prompt
+}
+
+fn build_real_programmer_prompt(cookbook: &[CookbookEntryV2], handbook: Option<&str>) -> String {
+    let mut prompt = REAL_PROGRAMMER_SYSTEM_PROMPT_BASE.to_string();
+    if let Some(handbook_text) = handbook.filter(|text| !text.trim().is_empty()) {
+        prompt.push_str("\n## HANDBOOK\n\n");
+        prompt.push_str(handbook_text);
+    }
+    if !cookbook.is_empty() {
+        prompt.push_str("\n## ARTIFACT COOKBOOK EXAMPLES\n\n");
+        for (idx, entry) in cookbook.iter().enumerate().take(8) {
+            let entry_json =
+                serde_json::to_string_pretty(entry).unwrap_or_else(|_| "{}".to_string());
+            prompt.push_str(&format!("Example {}:\n{}\n\n", idx + 1, entry_json));
+        }
     }
     prompt
 }
@@ -2760,100 +2758,130 @@ impl FunctionTool for StartPipelineTool {
             )));
         }
 
-        let pipeline_run =
-            start_pipeline_run_with_context(&self.context, session_id, solution_id.as_deref(), task)
-            .await
-            .map_err(|err| {
-                fluxbee_ai_sdk::AiSdkError::Protocol(format!(
-                    "failed to start pipeline run: {err}"
-                ))
-            })?;
-
-        let loop_output = match run_design_loop(
-            &self.context,
-            &pipeline_run,
-            task,
-            solution_id.as_deref(),
-            &operator_context,
-        )
-        .await {
-            Ok(output) => output,
-            Err(err) => {
-                if let Ok(record) = pipeline_run_with_state_update(
-                    &pipeline_run,
-                    PipelineStage::Blocked,
-                    Some(json!({
-                        "blocked_reason": format!("design loop failed: {err}"),
-                        "blocked_failure_class": FailureClass::DesignIncomplete,
-                    })),
-                    None,
-                ) {
-                    if let Err(save_err) = save_pipeline_run_with_context(&self.context, &record).await {
-                        tracing::warn!(error = %save_err, pipeline_run_id = %pipeline_run.pipeline_run_id, "failed to persist blocked design-loop run");
-                    }
-                }
-                return Err(fluxbee_ai_sdk::AiSdkError::Protocol(format!(
-                    "design loop failed: {err}"
-                )));
-            }
+        let pending = PendingPipelineStart {
+            task: task.to_string(),
+            solution_id: solution_id.clone(),
+            operator_context: operator_context.clone(),
+            created_at_ms: now_epoch_ms(),
         };
-
-        let stage = if loop_output.audit_verdict.status == DesignAuditStatus::Pass {
-            PipelineStage::Confirm1
-        } else {
-            PipelineStage::Blocked
-        };
-        let message = if stage == PipelineStage::Confirm1 {
-            render_confirm1_message(&loop_output.confirm1_summary, &loop_output.audit_verdict)
-        } else {
-            render_design_blocked_message(&loop_output)
-        };
-        let state_update = json!({
-            "task": task,
-            "solution_id": loop_output.solution_id,
-            "manifest_ref": format!("manifest://{}/current", loop_output.solution_id),
-            "manifest_path": loop_output.manifest_path,
-            "designer_human_summary": loop_output.designer_human_summary,
-            "designer_traces": loop_output.designer_traces,
-            "design_audit_verdict": loop_output.audit_verdict,
-            "confirm1_summary": loop_output.confirm1_summary,
-            "design_iterations_used": loop_output.iterations_used,
-            "design_stop_reason": loop_output.stopped_reason,
-            "design_loop_trace": loop_output.trace,
-        });
-        let updated = pipeline_run_with_state_update(
-            &pipeline_run,
-            stage.clone(),
-            Some(state_update),
-            Some(loop_output.iterations_used),
-        )
-        .map_err(|err| {
-            fluxbee_ai_sdk::AiSdkError::Protocol(format!(
-                "pipeline state update after design loop failed: {err}"
-            ))
-        })?;
-        save_pipeline_run_with_context(&self.context, &updated)
-            .await
-            .map_err(|err| {
-                fluxbee_ai_sdk::AiSdkError::Protocol(format!(
-                    "pipeline state update after design loop failed: {err}"
-                ))
-            })?;
+        stage_pending_pipeline_start(&self.context, session_id, pending.clone()).await;
 
         Ok(json!({
-            "status": if stage == PipelineStage::Confirm1 { "ok" } else { "blocked" },
-            "pipeline_run_id": pipeline_run.pipeline_run_id,
-            "stage": stage,
-            "solution_id": loop_output.solution_id,
-            "iterations_used": loop_output.iterations_used,
-            "stopped_reason": loop_output.stopped_reason,
-            "designer_traces": loop_output.designer_traces,
-            "design_loop_trace": loop_output.trace,
-            "confirm1_summary": loop_output.confirm1_summary,
-            "design_audit_verdict": loop_output.audit_verdict,
-            "message": message,
+            "status": "pending_confirmation",
+            "staged": true,
+            "stage": "awaiting_pipeline_start_confirmation",
+            "solution_id": pending.solution_id,
+            "task": pending.task,
+            "pending_created_at_ms": pending.created_at_ms,
+            "message": render_pipeline_start_offer_message(task, solution_id.as_deref()),
         }))
     }
+}
+
+fn render_pipeline_start_offer_message(task: &str, solution_id: Option<&str>) -> String {
+    let mut lines = vec!["I prepared the canonical solution pipeline start.".to_string()];
+    lines.push(format!("Task: {}", task.trim()));
+    if let Some(solution_id) = solution_id.filter(|value| !value.trim().is_empty()) {
+        lines.push(format!("Solution: {}", solution_id.trim()));
+    }
+    lines.push(
+        "Reply **si**, **sí**, **ok**, **adelante**, **start**, or **CONFIRM** to launch it."
+            .to_string(),
+    );
+    lines.push("Reply **no** or **CANCEL** to discard it.".to_string());
+    lines.join("\n")
+}
+
+async fn execute_pipeline_start_with_context(
+    context: &ArchitectAdminToolContext,
+    session_id: &str,
+    task: &str,
+    solution_id: Option<&str>,
+    operator_context: &str,
+) -> Result<Value, ArchitectError> {
+    if let Some(existing) = latest_nonterminal_pipeline_run_for_session(context, session_id).await? {
+        return Err(format!(
+            "session already has an active pipeline run '{}' at stage '{}'; resolve it before starting a new pipeline",
+            existing.pipeline_run_id, existing.current_stage
+        )
+        .into());
+    }
+
+    let pipeline_run =
+        start_pipeline_run_with_context(context, session_id, solution_id, task).await?;
+
+    let loop_output = match run_design_loop(
+        context,
+        &pipeline_run,
+        task,
+        solution_id,
+        operator_context,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(err) => {
+            if let Ok(record) = pipeline_run_with_state_update(
+                &pipeline_run,
+                PipelineStage::Blocked,
+                Some(json!({
+                    "blocked_reason": format!("design loop failed: {err}"),
+                    "blocked_failure_class": FailureClass::DesignIncomplete,
+                })),
+                None,
+            ) {
+                if let Err(save_err) = save_pipeline_run_with_context(context, &record).await {
+                    tracing::warn!(error = %save_err, pipeline_run_id = %pipeline_run.pipeline_run_id, "failed to persist blocked design-loop run");
+                }
+            }
+            return Err(format!("design loop failed: {err}").into());
+        }
+    };
+
+    let stage = if loop_output.audit_verdict.status == DesignAuditStatus::Pass {
+        PipelineStage::Confirm1
+    } else {
+        PipelineStage::Blocked
+    };
+    let message = if stage == PipelineStage::Confirm1 {
+        render_confirm1_message(&loop_output.confirm1_summary, &loop_output.audit_verdict)
+    } else {
+        render_design_blocked_message(&loop_output)
+    };
+    let state_update = json!({
+        "task": task,
+        "solution_id": loop_output.solution_id,
+        "manifest_ref": format!("manifest://{}/current", loop_output.solution_id),
+        "manifest_path": loop_output.manifest_path,
+        "designer_human_summary": loop_output.designer_human_summary,
+        "designer_traces": loop_output.designer_traces,
+        "design_audit_verdict": loop_output.audit_verdict,
+        "confirm1_summary": loop_output.confirm1_summary,
+        "design_iterations_used": loop_output.iterations_used,
+        "design_stop_reason": loop_output.stopped_reason,
+        "design_loop_trace": loop_output.trace,
+    });
+    let updated = pipeline_run_with_state_update(
+        &pipeline_run,
+        stage.clone(),
+        Some(state_update),
+        Some(loop_output.iterations_used),
+    )?;
+    save_pipeline_run_with_context(context, &updated).await?;
+
+    Ok(json!({
+        "status": if stage == PipelineStage::Confirm1 { "ok" } else { "blocked" },
+        "pipeline_run_id": pipeline_run.pipeline_run_id,
+        "stage": stage,
+        "solution_id": loop_output.solution_id,
+        "iterations_used": loop_output.iterations_used,
+        "stopped_reason": loop_output.stopped_reason,
+        "designer_traces": loop_output.designer_traces,
+        "design_loop_trace": loop_output.trace,
+        "confirm1_summary": loop_output.confirm1_summary,
+        "design_audit_verdict": loop_output.audit_verdict,
+        "message": message,
+    }))
 }
 
 struct DesignerSubmitManifestTool;
@@ -2945,6 +2973,54 @@ impl FunctionTool for DesignAuditorSubmitTool {
                     },
                     "summary": {
                         "type": "string"
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        Ok(arguments)
+    }
+}
+
+struct RealProgrammerSubmitArtifactTool;
+
+#[async_trait]
+impl FunctionTool for RealProgrammerSubmitArtifactTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "submit_artifact_bundle".to_string(),
+            description: "Submit the generated artifact bundle candidate. Call this exactly once."
+                .to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["summary", "artifact"],
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "Short operator-facing summary of what was generated."
+                    },
+                    "artifact": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["files"],
+                        "properties": {
+                            "files": {
+                                "type": "object",
+                                "additionalProperties": { "type": "string" },
+                                "description": "Artifact file map. Values must be full file contents as strings."
+                            }
+                        }
+                    },
+                    "assumptions": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "verification_hints": {
+                        "type": "array",
+                        "items": { "type": "string" }
                     }
                 }
             }),
@@ -3215,6 +3291,77 @@ async fn run_design_auditor_with_context(
             .to_string(),
         produced_at_ms: now_epoch_ms(),
     })
+}
+
+async fn run_real_programmer_with_context(
+    context: &ArchitectAdminToolContext,
+    packet: &BuildTaskPacket,
+    repair_packet: Option<&RepairPacket>,
+) -> Result<ArtifactBundle, ArchitectError> {
+    let runtime = context
+        .ai_runtime
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| -> ArchitectError {
+            "AI provider not configured for the real programmer agent."
+                .to_string()
+                .into()
+        })?;
+    let cookbook = read_artifact_cookbook(&context.state_dir);
+    let handbook = read_handbook_text();
+    let system_prompt = build_real_programmer_prompt(&cookbook, handbook.as_deref());
+    let model = runtime.client.clone().function_model(
+        runtime.model.clone(),
+        Some(system_prompt),
+        runtime.model_settings.clone(),
+    );
+
+    let mut tools = FunctionToolRegistry::new();
+    tools
+        .register(Arc::new(RealProgrammerSubmitArtifactTool))
+        .map_err(|err| -> ArchitectError {
+            format!("real programmer submit tool register failed: {err}").into()
+        })?;
+
+    let input_text = serde_json::to_string_pretty(&json!({
+        "request": build_real_programmer_request(packet, repair_packet),
+        "current_hive": context.hive_id,
+    }))
+    .unwrap_or_else(|_| "generate artifact bundle".to_string());
+
+    let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
+    let result = runner
+        .run_with_input(
+            &model,
+            &tools,
+            FunctionRunInput {
+                current_user_message: input_text,
+                current_user_parts: None,
+                immediate_memory: None,
+            },
+        )
+        .await
+        .map_err(|err| -> ArchitectError {
+            format!("real programmer AI call failed: {err}").into()
+        })?;
+
+    let submitted = result.items.iter().find_map(|item| {
+        if let FunctionLoopItem::ToolResult { result: tr } = item {
+            if tr.name == "submit_artifact_bundle" && !tr.is_error {
+                return Some(tr.output.clone());
+            }
+        }
+        None
+    });
+
+    let submitted = submitted.ok_or_else(|| -> ArchitectError {
+        "real programmer did not call submit_artifact_bundle"
+            .to_string()
+            .into()
+    })?;
+    artifact_bundle_from_real_programmer_submission(packet, &submitted)
+        .map_err(|err| -> ArchitectError { err.into() })
 }
 
 fn design_feedback_from_verdict(verdict: &DesignAuditVerdict) -> String {
@@ -4207,49 +4354,6 @@ fn parse_json_value_from_text(raw: &str) -> Result<Value, String> {
     serde_json::from_str(&candidate).map_err(|err| err.to_string())
 }
 
-fn build_infrastructure_artifact(
-    artifact_type: &str,
-    task: &str,
-    payload: Value,
-) -> Result<Value, ArchitectError> {
-    let payload_obj = payload.as_object().ok_or_else(|| -> ArchitectError {
-        "infrastructure specialist payload must be an object".into()
-    })?;
-    let summary = payload_obj
-        .get("summary")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("Infrastructure artifact generated.")
-        .to_string();
-    let publish_request = payload_obj
-        .get("publish_request")
-        .filter(|value| value.is_object())
-        .cloned()
-        .ok_or_else(|| -> ArchitectError {
-            "infrastructure specialist payload must include object field 'publish_request'"
-                .to_string()
-                .into()
-        })?;
-    let notes = payload_obj
-        .get("notes")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    Ok(json!({
-        "kind": ARCHITECT_INTERNAL_ARTIFACT_KIND_INFRASTRUCTURE,
-        "artifact_type": artifact_type,
-        "specialist": "infrastructure",
-        "task": task,
-        "summary": summary,
-        "payload": {
-            "publish_request": publish_request,
-            "notes": notes,
-        }
-    }))
-}
-
 #[tokio::main]
 async fn main() -> Result<(), ArchitectError> {
     if cfg!(not(target_os = "linux")) {
@@ -4308,6 +4412,7 @@ async fn main() -> Result<(), ArchitectError> {
         ai_runtime: Arc::new(Mutex::new(ai_runtime)),
         chat_lock: Arc::new(Mutex::new(())),
         pending_actions: Arc::new(Mutex::new(HashMap::new())),
+        pending_pipeline_starts: Arc::new(Mutex::new(HashMap::new())),
         router_sender: Arc::new(Mutex::new(None)),
         cached_status: Arc::new(RwLock::new(initial_status)),
         admin_actions_cache: Arc::new(Mutex::new(None)),
@@ -4318,6 +4423,7 @@ async fn main() -> Result<(), ArchitectError> {
     ensure_chat_storage(&state).await?;
     ensure_plan_compile_cookbook_dir(&state.state_dir);
     ensure_artifact_cookbook_dir(&state.state_dir);
+    seed_cookbooks_from_defaults(&state.state_dir);
     mark_interrupted_pipeline_runs(&state).await;
 
     let node_config = NodeConfig {
@@ -4528,6 +4634,7 @@ fn admin_tool_context(
         session_id: session_id.map(str::to_string),
         chat_lock: Arc::clone(&state.chat_lock),
         pending_actions: Arc::clone(&state.pending_actions),
+        pending_pipeline_starts: Arc::clone(&state.pending_pipeline_starts),
         admin_actions_cache: Arc::clone(&state.admin_actions_cache),
         plan_compile_pending: Arc::clone(&state.plan_compile_pending),
         active_pipeline_runs: Arc::clone(&state.active_pipeline_runs),
@@ -4545,6 +4652,35 @@ fn cancellation_requested(input: &str) -> bool {
     matches!(
         input.trim().to_ascii_uppercase().as_str(),
         "CANCEL" | "ABORT"
+    )
+}
+
+fn pipeline_start_confirmation_requested(input: &str) -> bool {
+    let normalized = input.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "confirm"
+            | "ok confirm"
+            | "si"
+            | "sí"
+            | "s"
+            | "yes"
+            | "y"
+            | "ok"
+            | "okay"
+            | "dale"
+            | "adelante"
+            | "proceed"
+            | "go ahead"
+            | "start"
+    )
+}
+
+fn pipeline_start_declined(input: &str) -> bool {
+    let normalized = input.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "no" | "nop" | "not now" | "later" | "cancel" | "abort"
     )
 }
 
@@ -4582,6 +4718,88 @@ async fn take_pending_action(
     session_id: &str,
 ) -> Option<PendingAdminAction> {
     state.pending_actions.lock().await.remove(session_id)
+}
+
+async fn stage_pending_pipeline_start(
+    context: &ArchitectAdminToolContext,
+    session_id: &str,
+    pending: PendingPipelineStart,
+) {
+    context
+        .pending_pipeline_starts
+        .lock()
+        .await
+        .insert(session_id.to_string(), pending);
+}
+
+async fn take_pending_pipeline_start(
+    state: &ArchitectState,
+    session_id: &str,
+) -> Option<PendingPipelineStart> {
+    state.pending_pipeline_starts.lock().await.remove(session_id)
+}
+
+async fn peek_pending_pipeline_start(
+    state: &ArchitectState,
+    session_id: &str,
+) -> Option<PendingPipelineStart> {
+    state.pending_pipeline_starts.lock().await.get(session_id).cloned()
+}
+
+async fn execute_pending_pipeline_start_response(
+    state: &ArchitectState,
+    session_id: &str,
+    session: &ChatSessionRecord,
+    pending: PendingPipelineStart,
+) -> ChatResponse {
+    let tool_ctx = admin_tool_context(state, Some(session_id));
+    match execute_pipeline_start_with_context(
+        &tool_ctx,
+        session_id,
+        &pending.task,
+        pending.solution_id.as_deref(),
+        &pending.operator_context,
+    )
+    .await
+    {
+        Ok(output) => ChatResponse {
+            status: output
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("ok")
+                .to_string(),
+            mode: "pipeline".to_string(),
+            output,
+            session_id: Some(session_id.to_string()),
+            session_title: Some(session.title.clone()),
+        },
+        Err(err) => ChatResponse {
+            status: "error".to_string(),
+            mode: "pipeline".to_string(),
+            output: json!({ "error": err.to_string() }),
+            session_id: Some(session_id.to_string()),
+            session_title: Some(session.title.clone()),
+        },
+    }
+}
+
+fn discard_pending_pipeline_start_response(
+    session_id: &str,
+    session: &ChatSessionRecord,
+    pending: PendingPipelineStart,
+) -> ChatResponse {
+    ChatResponse {
+        status: "ok".to_string(),
+        mode: "pipeline".to_string(),
+        output: json!({
+            "message": "Pending pipeline start discarded.",
+            "task": pending.task,
+            "solution_id": pending.solution_id,
+            "pending_created_at_ms": pending.created_at_ms,
+        }),
+        session_id: Some(session_id.to_string()),
+        session_title: Some(session.title.clone()),
+    }
 }
 
 async fn clear_pending_action(
@@ -5853,6 +6071,8 @@ async fn handle_chat_message(
         };
 
     let trimmed_message = message.trim();
+    let has_pending_pipeline_start =
+        peek_pending_pipeline_start(state, &resolved_session_id).await.is_some();
 
     let response = if confirmation_requested(trimmed_message) {
         if let Some(pipeline_run) =
@@ -5902,6 +6122,16 @@ async fn handle_chat_message(
                         session_title: Some(session.title.clone()),
                     },
                 }
+            } else if let Some(pending) =
+                take_pending_pipeline_start(state, &resolved_session_id).await
+            {
+                execute_pending_pipeline_start_response(
+                    state,
+                    &resolved_session_id,
+                    &session,
+                    pending,
+                )
+                .await
             } else {
                 match take_pending_action(state, &resolved_session_id).await {
                     Some(pending) => {
@@ -5991,6 +6221,10 @@ async fn handle_chat_message(
                     session_id: Some(resolved_session_id.clone()),
                     session_title: Some(session.title.clone()),
                 }
+            } else if let Some(pending) =
+                take_pending_pipeline_start(state, &resolved_session_id).await
+            {
+                discard_pending_pipeline_start_response(&resolved_session_id, &session, pending)
             } else {
                 match clear_pending_action(state, &resolved_session_id).await {
                     Some(pending) => {
@@ -6043,6 +6277,35 @@ async fn handle_chat_message(
                 }
             }
         } // end else (no plan_compile_pending)
+    } else if has_pending_pipeline_start && pipeline_start_confirmation_requested(trimmed_message) {
+        if let Some(pending) = take_pending_pipeline_start(state, &resolved_session_id).await {
+            execute_pending_pipeline_start_response(state, &resolved_session_id, &session, pending)
+                .await
+        } else {
+            ChatResponse {
+                status: "error".to_string(),
+                mode: "pipeline".to_string(),
+                output: json!({
+                    "message": "There is no pending pipeline start to confirm in this chat."
+                }),
+                session_id: Some(resolved_session_id.clone()),
+                session_title: Some(session.title.clone()),
+            }
+        }
+    } else if has_pending_pipeline_start && pipeline_start_declined(trimmed_message) {
+        if let Some(pending) = take_pending_pipeline_start(state, &resolved_session_id).await {
+            discard_pending_pipeline_start_response(&resolved_session_id, &session, pending)
+        } else {
+            ChatResponse {
+                status: "error".to_string(),
+                mode: "pipeline".to_string(),
+                output: json!({
+                    "message": "There is no pending pipeline start to discard in this chat."
+                }),
+                session_id: Some(resolved_session_id.clone()),
+                session_title: Some(session.title.clone()),
+            }
+        }
     } else if let Some(raw) = message.strip_prefix("SCMD:") {
         match handle_scmd(state, &resolved_session_id, raw.trim()).await {
             Ok(output) => {
@@ -13788,6 +14051,69 @@ fn architect_index_html(state: &ArchitectState) -> String {
       wrapper.appendChild(body);
       return wrapper;
     }}
+    function renderArtifactLoopTrace(events) {{
+      const items = Array.isArray(events) ? events : [];
+      if (!items.length) return null;
+
+      const wrapper = document.createElement("details");
+      wrapper.className = "agent-trace";
+      const hasFailure = items.some((event) => {{
+        const status = event && event.status ? String(event.status) : "";
+        return status === "rejected" || status === "blocked" || status === "repairable";
+      }});
+      if (hasFailure) {{
+        wrapper.open = true;
+      }}
+
+      const toggle = document.createElement("summary");
+      toggle.className = "agent-trace-toggle";
+
+      const icon = document.createElement("span");
+      icon.textContent = "⚙ ";
+      icon.style.fontSize = "0.9rem";
+      const label = document.createElement("span");
+      label.className = "agent-trace-label";
+      label.textContent = "Agent activity · artifact_loop";
+      const badge = document.createElement("span");
+      badge.className = "agent-trace-badge " + (hasFailure ? "warn" : "ok");
+      badge.textContent = items.length === 1 ? "1 event" : (items.length + " events");
+
+      toggle.appendChild(icon);
+      toggle.appendChild(label);
+      toggle.appendChild(badge);
+      wrapper.appendChild(toggle);
+
+      const body = document.createElement("div");
+      body.className = "agent-trace-body";
+      const section = document.createElement("div");
+      section.className = "agent-trace-section";
+      const sectionLabel = document.createElement("div");
+      sectionLabel.className = "agent-trace-section-label";
+      sectionLabel.textContent = "artifact loop progression";
+      section.appendChild(sectionLabel);
+
+      items.forEach((event) => {{
+        const row = document.createElement("div");
+        row.className = "agent-trace-row";
+        const attempt = event && event.attempt != null ? event.attempt : "?";
+        const taskId = event && event.task_id ? event.task_id : "unknown-task";
+        const status = event && event.status ? event.status : "unknown";
+        const findingCount = event && event.findings_count != null ? event.findings_count : 0;
+        const failureClass = event && event.failure_class ? " · " + event.failure_class : "";
+        const bundleId = event && event.bundle_id ? " · bundle " + event.bundle_id : "";
+        row.innerHTML =
+          "<span class='agent-trace-row-id'>" + attempt + "</span>" +
+          "<span class='agent-trace-row-action'>" + status + "</span>" +
+          "<span class='agent-trace-row-args'>" +
+          taskId + " · findings " + findingCount + failureClass + bundleId +
+          "</span>";
+        section.appendChild(row);
+      }});
+
+      body.appendChild(section);
+      wrapper.appendChild(body);
+      return wrapper;
+    }}
     function extractPipelineTrace(toolResults) {{
       const results = Array.isArray(toolResults) ? toolResults : [];
       for (const tool of results) {{
@@ -13796,10 +14122,23 @@ fn architect_index_html(state: &ArchitectState) -> String {
         const output = tool.output || {{}};
         return {{
           designerTraces: Array.isArray(output.designer_traces) ? output.designer_traces : [],
-          designLoopTrace: Array.isArray(output.design_loop_trace) ? output.design_loop_trace : []
+          designLoopTrace: Array.isArray(output.design_loop_trace) ? output.design_loop_trace : [],
+          artifactLoopTrace: Array.isArray(output.artifact_loop_trace) ? output.artifact_loop_trace : [],
+          planCompileTrace: output.plan_compile_trace || null,
         }};
       }}
       return null;
+    }}
+    function extractDirectPipelineTrace(output) {{
+      if (!output || typeof output !== "object") return null;
+      const designerTraces = Array.isArray(output.designer_traces) ? output.designer_traces : [];
+      const designLoopTrace = Array.isArray(output.design_loop_trace) ? output.design_loop_trace : [];
+      const artifactLoopTrace = Array.isArray(output.artifact_loop_trace) ? output.artifact_loop_trace : [];
+      const planCompileTrace = output.plan_compile_trace || null;
+      if (!designerTraces.length && !designLoopTrace.length && !artifactLoopTrace.length && !planCompileTrace) {{
+        return null;
+      }}
+      return {{ designerTraces, designLoopTrace, artifactLoopTrace, planCompileTrace }};
     }}
     function renderExecutorResult(data) {{
       const output = data && data.output ? data.output : {{}};
@@ -14013,13 +14352,19 @@ fn architect_index_html(state: &ArchitectState) -> String {
         return;
       }}
       const output = data && data.output ? data.output : null;
+      const directPipelineTrace = extractDirectPipelineTrace(output);
       if (data && data.mode === "chat" && output && typeof output.message === "string" && output.message.trim()) {{
         const toolSummary = createToolSummarySection(output.tool_results);
-        const progTrace = renderPlanCompileTrace(output.plan_compile_trace);
-        const pipelineTrace = extractPipelineTrace(output.tool_results);
+        const pipelineTrace = extractPipelineTrace(output.tool_results) || directPipelineTrace;
+        const progTrace = renderPlanCompileTrace(
+          pipelineTrace && pipelineTrace.planCompileTrace
+            ? pipelineTrace.planCompileTrace
+            : output.plan_compile_trace
+        );
         const designerTrace = pipelineTrace ? renderDesignerTrace(pipelineTrace.designerTraces) : null;
         const designLoopTrace = pipelineTrace ? renderDesignLoopTrace(pipelineTrace.designLoopTrace) : null;
-        if (!toolSummary && !progTrace && !designerTrace && !designLoopTrace) {{
+        const artifactLoopTrace = pipelineTrace ? renderArtifactLoopTrace(pipelineTrace.artifactLoopTrace) : null;
+        if (!toolSummary && !progTrace && !designerTrace && !designLoopTrace && !artifactLoopTrace) {{
           addMessage(kind, output.message);
           return;
         }}
@@ -14030,10 +14375,31 @@ fn architect_index_html(state: &ArchitectState) -> String {
         body.appendChild(message);
         if (designerTrace) body.appendChild(designerTrace);
         if (designLoopTrace) body.appendChild(designLoopTrace);
+        if (artifactLoopTrace) body.appendChild(artifactLoopTrace);
         if (progTrace) body.appendChild(progTrace);
         if (toolSummary) body.appendChild(toolSummary);
         appendMessage(kind, kind === "architect" ? "archi" : "System", body);
         return;
+      }}
+      if (data && data.mode === "pipeline" && output && typeof output.message === "string" && output.message.trim()) {{
+        const pipelineTrace = directPipelineTrace;
+        const progTrace = pipelineTrace ? renderPlanCompileTrace(pipelineTrace.planCompileTrace) : null;
+        const designerTrace = pipelineTrace ? renderDesignerTrace(pipelineTrace.designerTraces) : null;
+        const designLoopTrace = pipelineTrace ? renderDesignLoopTrace(pipelineTrace.designLoopTrace) : null;
+        const artifactLoopTrace = pipelineTrace ? renderArtifactLoopTrace(pipelineTrace.artifactLoopTrace) : null;
+        if (progTrace || designerTrace || designLoopTrace || artifactLoopTrace) {{
+          const body = document.createElement("div");
+          const message = document.createElement("div");
+          body.className = "chat-response";
+          message.textContent = output.message;
+          body.appendChild(message);
+          if (designerTrace) body.appendChild(designerTrace);
+          if (designLoopTrace) body.appendChild(designLoopTrace);
+          if (artifactLoopTrace) body.appendChild(artifactLoopTrace);
+          if (progTrace) body.appendChild(progTrace);
+          appendMessage(kind, kind === "architect" ? "archi" : "System", body);
+          return;
+        }}
       }}
       renderCommandResult(kind, data.mode, data);
     }}
@@ -16240,6 +16606,66 @@ fn observed_artifact_cookbook_entry(
     })
 }
 
+fn observed_design_cookbook_entry_from_run_state(
+    run_state: &Value,
+    pipeline_run_id: &str,
+) -> Option<CookbookEntryV2> {
+    let solution_id = run_state
+        .get("solution_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let summary = run_state
+        .get("confirm1_summary")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Confirm1Summary>(value).ok())?;
+    let verdict = run_state
+        .get("design_audit_verdict")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<DesignAuditVerdict>(value).ok())?;
+    if verdict.status != DesignAuditStatus::Pass {
+        return None;
+    }
+
+    Some(CookbookEntryV2 {
+        layer: CookbookLayer::Design,
+        pattern_key: sanitize_pattern_key(&format!(
+            "design_{}_{}_{}_{}",
+            solution_id,
+            summary.hive_count,
+            summary.node_count,
+            summary.main_runtimes.join("_")
+        )),
+        trigger: format!(
+            "When designing solution '{}' with {} hive(s) and {} node(s).",
+            summary.solution_name,
+            summary.hive_count,
+            summary.node_count
+        ),
+        inputs_signature: json!({
+            "solution_id": solution_id,
+            "solution_name": summary.solution_name,
+            "hive_count": summary.hive_count,
+            "node_count": summary.node_count,
+            "route_count": summary.route_count,
+            "main_runtimes": summary.main_runtimes,
+        }),
+        successful_shape: json!({
+            "audit_score": verdict.score,
+            "audit_status": verdict.status,
+            "design_iterations_used": run_state.get("design_iterations_used").cloned().unwrap_or(Value::Null),
+            "design_stop_reason": run_state.get("design_stop_reason").cloned().unwrap_or(Value::Null),
+            "message": summary.message,
+            "advisory_highlights": summary.advisory_highlights,
+        }),
+        constraints: summary.warnings,
+        do_not_repeat: verdict.blocking_issues,
+        failure_class: None,
+        recorded_from_run: Some(pipeline_run_id.to_string()),
+        seed_kind: "observed".to_string(),
+    })
+}
+
 fn pipeline_cookbook_entry_from_run_state(run_state: &Value) -> Option<CookbookEntryV2> {
     run_state
         .get("plan_compile_cookbook_entry")
@@ -16265,7 +16691,325 @@ fn artifact_content_digest(value: &Value) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
-fn build_artifact_specialist_request(
+fn runtime_package_file_map_from_value(
+    artifact: &Value,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let files = artifact
+        .get("files")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "artifact.files must be an object".to_string())?;
+    let mut out = serde_json::Map::new();
+    for (path, value) in files {
+        let Some(content) = value.as_str() else {
+            return Err(format!("artifact file '{}' must be a string", path));
+        };
+        out.insert(path.clone(), Value::String(content.to_string()));
+    }
+    Ok(out)
+}
+
+fn runtime_package_publish_source_inline(
+    files: &serde_json::Map<String, Value>,
+) -> Result<Value, String> {
+    for (path, value) in files {
+        if !value.is_string() {
+            return Err(format!("artifact file '{}' must be a string", path));
+        }
+    }
+    Ok(json!({
+        "kind": "inline_package",
+        "files": Value::Object(files.clone()),
+    }))
+}
+
+fn runtime_package_name_from_packet_or_files(
+    packet: &BuildTaskPacket,
+    files: &serde_json::Map<String, Value>,
+) -> String {
+    packet
+        .runtime_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            packet
+                .requirements
+                .get("runtime_name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            files
+                .get("package.json")
+                .and_then(Value::as_str)
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .and_then(|pkg| {
+                    pkg.get("name")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                })
+        })
+        .unwrap_or_else(|| "runtime.package".to_string())
+}
+
+fn runtime_package_version_from_packet_or_files(
+    packet: &BuildTaskPacket,
+    files: &serde_json::Map<String, Value>,
+) -> String {
+    packet
+        .requirements
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            files
+                .get("package.json")
+                .and_then(Value::as_str)
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .and_then(|pkg| {
+                    pkg.get("version")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                })
+        })
+        .unwrap_or_else(|| "0.1.0".to_string())
+}
+
+fn runtime_package_bundle_root_dir(runtime_name: &str) -> String {
+    let trimmed = runtime_name.trim();
+    if trimmed.is_empty() {
+        "runtime-package".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn sanitize_runtime_bundle_upload_filename(runtime_name: &str, version: &str) -> String {
+    let runtime_part = sanitize_exec_name(&runtime_name.replace('.', "-"), runtime_name);
+    let version_part = version
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    format!("{runtime_part}-{version_part}.zip")
+}
+
+fn normalize_artifact_relative_path(path: &str) -> Result<String, String> {
+    let trimmed = path.trim().trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Err("artifact file path must not be empty".to_string());
+    }
+    let candidate = Path::new(trimmed);
+    if candidate.is_absolute() {
+        return Err(format!("artifact file path '{}' must be relative", path));
+    }
+    let mut normalized = Vec::new();
+    for component in candidate.components() {
+        match component {
+            std::path::Component::Normal(value) => {
+                let segment = value.to_string_lossy();
+                if segment.is_empty() {
+                    return Err(format!("artifact file path '{}' is invalid", path));
+                }
+                normalized.push(segment.to_string());
+            }
+            std::path::Component::CurDir => {}
+            _ => {
+                return Err(format!(
+                    "artifact file path '{}' contains unsupported path traversal",
+                    path
+                ));
+            }
+        }
+    }
+    if normalized.is_empty() {
+        return Err(format!("artifact file path '{}' is invalid", path));
+    }
+    Ok(normalized.join("/"))
+}
+
+fn runtime_package_file_mode(path: &str) -> u32 {
+    if path.starts_with("bin/") || path.ends_with(".sh") {
+        0o755
+    } else {
+        0o644
+    }
+}
+
+fn build_runtime_bundle_zip_from_files(
+    files: &serde_json::Map<String, Value>,
+    root_dir: &str,
+) -> Result<Vec<u8>, String> {
+    let cursor = std::io::Cursor::new(Vec::<u8>::new());
+    let mut writer = zip::ZipWriter::new(cursor);
+    writer
+        .add_directory(
+            format!("{root_dir}/"),
+            zip::write::FileOptions::default().unix_permissions(0o755),
+        )
+        .map_err(|err| format!("failed to create bundle root directory in zip: {err}"))?;
+
+    let mut paths = files.keys().cloned().collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let normalized = normalize_artifact_relative_path(&path)?;
+        let content = files
+            .get(&path)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("artifact file '{}' must be a string", path))?;
+        writer
+            .start_file(
+                format!("{root_dir}/{normalized}"),
+                zip::write::FileOptions::default()
+                    .unix_permissions(runtime_package_file_mode(&normalized)),
+            )
+            .map_err(|err| format!("failed to start zip entry '{}': {err}", normalized))?;
+        writer
+            .write_all(content.as_bytes())
+            .map_err(|err| format!("failed to write zip entry '{}': {err}", normalized))?;
+    }
+
+    writer
+        .finish()
+        .map(|cursor| cursor.into_inner())
+        .map_err(|err| format!("failed to finalize runtime bundle zip: {err}"))
+}
+
+fn publish_runtime_bundle_blob(
+    blob_root: &Path,
+    filename: &str,
+    zip_bytes: &[u8],
+) -> Result<(String, String), String> {
+    let mut cfg = BlobConfig::default();
+    cfg.blob_root = blob_root.to_path_buf();
+    let toolkit = BlobToolkit::new(cfg)
+        .map_err(|err| format!("failed to initialize blob toolkit for artifact bundle: {err}"))?;
+    let blob_ref = toolkit
+        .put_bytes(zip_bytes, filename, "application/zip")
+        .and_then(|blob_ref| {
+            toolkit.promote(&blob_ref)?;
+            Ok(blob_ref)
+        })
+        .map_err(|err| format!("failed to persist runtime bundle upload '{}': {err}", filename))?;
+    let rel_path = format!(
+        "active/{}/{}",
+        BlobToolkit::prefix(&blob_ref.blob_name),
+        blob_ref.blob_name
+    );
+    Ok((blob_ref.blob_name, rel_path))
+}
+
+fn finalize_runtime_package_bundle_for_target(
+    blob_root: &Path,
+    packet: &BuildTaskPacket,
+    bundle: &mut ArtifactBundle,
+) -> Result<(), String> {
+    let files = runtime_package_file_map_from_value(&bundle.artifact)?;
+    let publish_source = match packet.target_kind.as_str() {
+        "inline_package" => runtime_package_publish_source_inline(&files)?,
+        "bundle_upload" => {
+            let runtime_name = runtime_package_name_from_packet_or_files(packet, &files);
+            let version = runtime_package_version_from_packet_or_files(packet, &files);
+            let root_dir = runtime_package_bundle_root_dir(&runtime_name);
+            let zip_bytes = build_runtime_bundle_zip_from_files(&files, &root_dir)?;
+            let filename = sanitize_runtime_bundle_upload_filename(&runtime_name, &version);
+            let (blob_name, blob_path) = publish_runtime_bundle_blob(blob_root, &filename, &zip_bytes)?;
+            json!({
+                "kind": "bundle_upload",
+                "blob_path": blob_path,
+                "blob_name": blob_name,
+            })
+        }
+        other => {
+            return Err(format!(
+                "runtime_package artifact finalization does not support target_kind '{}'",
+                other
+            ));
+        }
+    };
+    bundle.artifact["publish_source"] = publish_source;
+    bundle.content_digest = artifact_content_digest(&bundle.artifact);
+    Ok(())
+}
+
+fn expand_approved_artifacts_for_plan_compile(
+    state_dir: &Path,
+    pipeline_run_id: &str,
+    approved_artifacts: &[artifact_loop::ApprovedArtifact],
+) -> Result<Value, String> {
+    let mut expanded = Vec::new();
+    for approved in approved_artifacts {
+        let bundle = artifact_loop::load_artifact_bundle(state_dir, pipeline_run_id, &approved.bundle_id)
+            .ok_or_else(|| {
+                format!(
+                    "approved artifact bundle '{}' could not be loaded from disk",
+                    approved.bundle_id
+                )
+            })?;
+        let packet = std::fs::read_to_string(artifact_loop::task_packet_path(
+            state_dir,
+            pipeline_run_id,
+            &approved.task_id,
+        ))
+        .map_err(|err| {
+            format!(
+                "approved artifact task packet '{}' could not be read: {err}",
+                approved.task_id
+            )
+        })
+        .and_then(|raw| {
+            serde_json::from_str::<BuildTaskPacket>(&raw).map_err(|err| {
+                format!(
+                    "approved artifact task packet '{}' is invalid JSON: {err}",
+                    approved.task_id
+                )
+            })
+        })?;
+
+        let publish_source = if let Some(value) = bundle.artifact.get("publish_source") {
+            value.clone()
+        } else if approved.artifact_kind == "runtime_package" && packet.target_kind == "inline_package" {
+            let files = runtime_package_file_map_from_value(&bundle.artifact)?;
+            runtime_package_publish_source_inline(&files)?
+        } else {
+            return Err(format!(
+                "approved artifact '{}' is missing publish_source for target_kind '{}'",
+                approved.bundle_id,
+                packet.target_kind
+            ));
+        };
+
+        expanded.push(json!({
+            "bundle_id": approved.bundle_id,
+            "task_id": approved.task_id,
+            "source_delta_op": approved.source_delta_op,
+            "artifact_kind": approved.artifact_kind,
+            "target_kind": packet.target_kind,
+            "runtime_name": packet.runtime_name,
+            "content_digest": approved.content_digest,
+            "summary": bundle.summary,
+            "verification_hints": bundle.verification_hints,
+            "publish_source": publish_source,
+        }));
+    }
+    Ok(Value::Array(expanded))
+}
+
+fn build_real_programmer_request(
     packet: &BuildTaskPacket,
     repair: Option<&RepairPacket>,
 ) -> Value {
@@ -16288,55 +17032,55 @@ fn build_artifact_specialist_request(
     request
 }
 
-fn runtime_artifact_bundle_from_specialist_output(
+fn artifact_bundle_from_real_programmer_submission(
     packet: &BuildTaskPacket,
-    artifact: &Value,
+    submitted: &Value,
 ) -> Result<ArtifactBundle, String> {
-    let payload = artifact
-        .get("payload")
+    let artifact = submitted
+        .get("artifact")
         .and_then(Value::as_object)
-        .ok_or_else(|| "infrastructure artifact missing payload object".to_string())?;
-    let publish_request = payload
-        .get("publish_request")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            "infrastructure artifact missing payload.publish_request object".to_string()
-        })?;
-    let source = publish_request
-        .get("source")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "publish_request missing source object".to_string())?;
-    let source_kind = source
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("inline_package");
-    if source_kind != "inline_package" {
+        .ok_or_else(|| "submit_artifact_bundle missing artifact object".to_string())?;
+    if packet.artifact_kind != "runtime_package" {
         return Err(format!(
-            "artifact loop currently supports only inline_package sources, got '{}'",
-            source_kind
+            "real programmer bundle conversion does not yet support artifact_kind '{}'",
+            packet.artifact_kind
         ));
     }
-    let files = source
-        .get("files")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "inline_package source missing files object".to_string())?;
-    let mut file_map = serde_json::Map::new();
-    for (path, value) in files {
-        let Some(content) = value.as_str() else {
-            return Err(format!("inline_package file '{}' must be a string", path));
-        };
-        file_map.insert(path.clone(), Value::String(content.to_string()));
+    if packet.target_kind != "inline_package" && packet.target_kind != "bundle_upload" {
+        return Err(format!(
+            "real programmer bundle conversion currently supports inline_package and bundle_upload targets, got '{}'",
+            packet.target_kind
+        ));
     }
+    let file_map = runtime_package_file_map_from_value(&Value::Object(artifact.clone()))?;
+    let publish_source = if packet.target_kind == "inline_package" {
+        runtime_package_publish_source_inline(&file_map)?
+    } else {
+        Value::Null
+    };
     let artifact_payload = json!({
         "files": Value::Object(file_map),
+        "publish_source": publish_source,
     });
-    let summary = artifact
+    let summary = submitted
         .get("summary")
         .and_then(Value::as_str)
-        .unwrap_or("Generated runtime package source.")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Generated artifact bundle.")
         .to_string();
-    let verification_hints = payload
-        .get("notes")
+    let assumptions = submitted
+        .get("assumptions")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let verification_hints = submitted
+        .get("verification_hints")
         .and_then(Value::as_array)
         .map(|items| {
             items
@@ -16353,11 +17097,11 @@ fn runtime_artifact_bundle_from_specialist_output(
         status: pipeline_types::ArtifactBundleStatus::Pending,
         summary,
         artifact: artifact_payload.clone(),
-        assumptions: vec![],
+        assumptions,
         verification_hints,
         content_digest: artifact_content_digest(&artifact_payload),
         generated_at_ms: now_epoch_ms(),
-        generator_model: "infrastructure_specialist".to_string(),
+        generator_model: "real_programmer".to_string(),
     })
 }
 
@@ -16368,6 +17112,7 @@ async fn run_pipeline_artifact_loop(
     build_task_packets: &[BuildTaskPacket],
 ) -> Result<artifact_loop::ArtifactLoopResult, ArchitectError> {
     let tool_ctx = admin_tool_context(state, Some(&session.session_id));
+    let blob_root = architect_blob_root(state)?;
     let mut approved = Vec::new();
     let mut trace_events: Vec<artifact_loop::ArtifactLoopTraceEvent> = Vec::new();
 
@@ -16386,13 +17131,13 @@ async fn run_pipeline_artifact_loop(
                 )),
             });
         }
-        if packet.target_kind != "inline_package" {
+        if packet.target_kind != "inline_package" && packet.target_kind != "bundle_upload" {
             return Ok(artifact_loop::ArtifactLoopResult {
                 approved,
                 failed_task_id: Some(packet.task_id.clone()),
                 failure_class: Some(FailureClass::ArtifactTaskUnderspecified),
                 error: Some(format!(
-                    "artifact loop currently supports only inline_package task packets; '{}' is not yet implemented",
+                    "artifact loop currently supports runtime_package task packets with inline_package or bundle_upload targets; '{}' is not yet implemented",
                     packet.target_kind
                 )),
             });
@@ -16416,20 +17161,10 @@ async fn run_pipeline_artifact_loop(
                 timestamp_ms: now_epoch_ms(),
             });
 
-            let request = build_artifact_specialist_request(packet, repair_packet.as_ref());
-            let task = format!(
-                "Materialize runtime package source for {} (attempt {attempt}/{max_attempts})",
-                packet.runtime_name.as_deref().unwrap_or("unknown_runtime")
-            );
-            let specialist_output = match run_infrastructure_specialist_with_context(
-                &tool_ctx,
-                ARCHITECT_INFRA_ARTIFACT_RUNTIME_PACKAGE_SOURCE,
-                &task,
-                &request,
-            )
+            let bundle = match run_real_programmer_with_context(&tool_ctx, packet, repair_packet.as_ref())
             .await
             {
-                Ok(output) => output,
+                Ok(bundle) => bundle,
                 Err(err) => {
                     return Ok(artifact_loop::ArtifactLoopResult {
                         approved,
@@ -16439,19 +17174,7 @@ async fn run_pipeline_artifact_loop(
                     });
                 }
             };
-
-            let mut bundle =
-                match runtime_artifact_bundle_from_specialist_output(packet, &specialist_output) {
-                    Ok(bundle) => bundle,
-                    Err(err) => {
-                        return Ok(artifact_loop::ArtifactLoopResult {
-                            approved,
-                            failed_task_id: Some(packet.task_id.clone()),
-                            failure_class: Some(FailureClass::ArtifactContractInvalid),
-                            error: Some(err),
-                        });
-                    }
-                };
+            let mut bundle = bundle;
 
             trace_events.push(artifact_loop::ArtifactLoopTraceEvent {
                 task_id: packet.task_id.clone(),
@@ -16477,12 +17200,6 @@ async fn run_pipeline_artifact_loop(
                     pipeline_types::ArtifactBundleStatus::Repairable
                 }
             };
-            artifact_loop::save_artifact_bundle(
-                &state.state_dir,
-                &pipeline_run.pipeline_run_id,
-                &bundle,
-            )
-            .map_err(|err| -> ArchitectError { err.into() })?;
 
             trace_events.push(artifact_loop::ArtifactLoopTraceEvent {
                 task_id: packet.task_id.clone(),
@@ -16505,6 +17222,34 @@ async fn run_pipeline_artifact_loop(
 
             match verdict.status {
                 pipeline_types::AuditStatus::Approved => {
+                    if let Err(err) =
+                        finalize_runtime_package_bundle_for_target(&blob_root, packet, &mut bundle)
+                    {
+                        let _ = advance_pipeline_run(
+                            state,
+                            &pipeline_run.pipeline_run_id,
+                            PipelineStage::ArtifactLoop,
+                            Some(json!({
+                                "artifact_loop_trace": serde_json::to_value(&trace_events).unwrap_or(Value::Null),
+                            })),
+                        )
+                        .await;
+                        return Ok(artifact_loop::ArtifactLoopResult {
+                            approved,
+                            failed_task_id: Some(packet.task_id.clone()),
+                            failure_class: Some(FailureClass::ArtifactContractInvalid),
+                            error: Some(format!(
+                                "approved artifact could not be finalized for target '{}': {err}",
+                                packet.target_kind
+                            )),
+                        });
+                    }
+                    artifact_loop::save_artifact_bundle(
+                        &state.state_dir,
+                        &pipeline_run.pipeline_run_id,
+                        &bundle,
+                    )
+                    .map_err(|err| -> ArchitectError { err.into() })?;
                     approved.push(artifact_loop::ApprovedArtifact {
                         bundle_id: bundle.bundle_id.clone(),
                         task_id: packet.task_id.clone(),
@@ -16522,6 +17267,12 @@ async fn run_pipeline_artifact_loop(
                     break;
                 }
                 pipeline_types::AuditStatus::Rejected => {
+                    artifact_loop::save_artifact_bundle(
+                        &state.state_dir,
+                        &pipeline_run.pipeline_run_id,
+                        &bundle,
+                    )
+                    .map_err(|err| -> ArchitectError { err.into() })?;
                     let _ = advance_pipeline_run(
                         state,
                         &pipeline_run.pipeline_run_id,
@@ -16539,6 +17290,12 @@ async fn run_pipeline_artifact_loop(
                     });
                 }
                 pipeline_types::AuditStatus::Repairable => {
+                    artifact_loop::save_artifact_bundle(
+                        &state.state_dir,
+                        &pipeline_run.pipeline_run_id,
+                        &bundle,
+                    )
+                    .map_err(|err| -> ArchitectError { err.into() })?;
                     let signature = format!(
                         "{:?}",
                         artifact_loop::build_repair_packet(&verdict, &bundle, attempt)
@@ -16649,6 +17406,10 @@ async fn handle_pipeline_plan_compile(
             session_title: Some(session.title.clone()),
         };
     };
+    let artifact_loop_trace = run_state
+        .get("artifact_loop_trace")
+        .cloned()
+        .unwrap_or(Value::Null);
     let delta_report: DeltaReport = match serde_json::from_value(delta_report_value) {
         Ok(value) => value,
         Err(err) => {
@@ -16689,28 +17450,86 @@ async fn handle_pipeline_plan_compile(
     let task = pipeline_task_summary(&run_state, solution_id, &delta_report);
     let tool_ctx = admin_tool_context(state, Some(&session.session_id));
 
+    let expanded_approved_artifacts = match approved_artifacts {
+        Some(value) => {
+            let raw = match serde_json::from_value::<Vec<artifact_loop::ApprovedArtifact>>(value) {
+                Ok(items) => items,
+                Err(err) => {
+                    let _ = block_pipeline_run(
+                        state,
+                        &pipeline_run.pipeline_run_id,
+                        &format!("pipeline approved_artifacts parse failed: {err}"),
+                        &FailureClass::ArtifactContractInvalid,
+                    )
+                    .await;
+                    return ChatResponse {
+                        status: "error".to_string(),
+                        mode: "pipeline".to_string(),
+                        output: json!({
+                            "message": format!("Pipeline blocked: invalid approved_artifacts in pipeline state: {err}"),
+                            "pipeline_run_id": pipeline_run.pipeline_run_id,
+                            "stage": "blocked",
+                            "artifact_loop_trace": artifact_loop_trace,
+                        }),
+                        session_id: Some(session.session_id.clone()),
+                        session_title: Some(session.title.clone()),
+                    };
+                }
+            };
+            match expand_approved_artifacts_for_plan_compile(
+                &state.state_dir,
+                &pipeline_run.pipeline_run_id,
+                &raw,
+            ) {
+                Ok(value) => Some(value),
+                Err(err) => {
+                    let _ = block_pipeline_run(
+                        state,
+                        &pipeline_run.pipeline_run_id,
+                        &format!("approved_artifacts expansion failed: {err}"),
+                        &FailureClass::ArtifactContractInvalid,
+                    )
+                    .await;
+                    return ChatResponse {
+                        status: "error".to_string(),
+                        mode: "pipeline".to_string(),
+                        output: json!({
+                            "message": format!("Pipeline blocked: approved artifact context could not be expanded for plan compilation: {err}"),
+                            "pipeline_run_id": pipeline_run.pipeline_run_id,
+                            "stage": "blocked",
+                            "artifact_loop_trace": artifact_loop_trace,
+                        }),
+                        session_id: Some(session.session_id.clone()),
+                        session_title: Some(session.title.clone()),
+                    };
+                }
+            }
+        }
+        None => None,
+    };
+
     let execution = match run_plan_compiler_transaction(
         &tool_ctx,
         &task,
         &state.hive_id,
         "",
         Some(&delta_report),
-        approved_artifacts.as_ref(),
+        expanded_approved_artifacts.as_ref(),
     )
     .await
     {
         Ok(result) => result,
         Err(err) => {
             let err_text = err.to_string();
-            let failure_class = classify_failure_deterministic(
-                &err_text,
-                &FailureContext {
-                    stage: PipelineStage::PlanValidation,
-                    error_code: None,
-                    resource_type: None,
-                },
-            )
-            .unwrap_or(FailureClass::UnknownResidual);
+            let ctx = FailureContext {
+                stage: PipelineStage::PlanValidation,
+                error_code: None,
+                resource_type: None,
+            };
+            let failure_class = match classify_failure_deterministic(&err_text, &ctx) {
+                Some(c) => c,
+                None => classify_failure_with_ai(state, &err_text, &ctx).await,
+            };
             let route = route_failure(
                 &failure_class,
                 pipeline_run.current_loop as usize,
@@ -16730,7 +17549,8 @@ async fn handle_pipeline_plan_compile(
                 PipelineStage::Blocked,
                 Some(json!({
                     "plan_compile_error": err_text,
-                    "failure_route": format!("{route:?}"),
+                    "failure_route": route.operator_message(&failure_class),
+                    "operator_options": route.operator_options(),
                 })),
             )
             .await;
@@ -16742,7 +17562,8 @@ async fn handle_pipeline_plan_compile(
                     "pipeline_run_id": pipeline_run.pipeline_run_id,
                     "stage": "blocked",
                     "failure_class": failure_class,
-                    "failure_route": format!("{route:?}"),
+                    "failure_route": route.operator_message(&failure_class),
+                    "operator_options": route.operator_options(),
                 }),
                 session_id: Some(session.session_id.clone()),
                 session_title: Some(session.title.clone()),
@@ -16755,12 +17576,6 @@ async fn handle_pipeline_plan_compile(
     let plan = output.plan.clone();
     let human_summary = output.human_summary.clone();
     let cookbook_entry = output.cookbook_entry.clone();
-    let confirm2_payload = build_confirm2_payload(
-        &pipeline_run.pipeline_run_id,
-        &delta_report,
-        &human_summary,
-        &trace,
-    );
     let trace_value = json!({
         "task": trace.task.clone(),
         "hive": trace.hive.clone(),
@@ -16773,6 +17588,17 @@ async fn handle_pipeline_plan_compile(
         "validation": trace.validation.clone(),
         "first_validation_error": trace.first_validation_error.clone(),
     });
+    let confirm2_payload = build_confirm2_payload(
+        &pipeline_run.pipeline_run_id,
+        &delta_report,
+        &human_summary,
+        &trace,
+    );
+    let mut confirm2_payload = confirm2_payload;
+    if let Some(payload_obj) = confirm2_payload.as_object_mut() {
+        payload_obj.insert("plan_compile_trace".to_string(), trace_value.clone());
+        payload_obj.insert("artifact_loop_trace".to_string(), artifact_loop_trace);
+    }
 
     if let Err(err) = advance_pipeline_run(
         state,
@@ -17119,6 +17945,17 @@ async fn handle_pipeline_confirm1(
                 &failure_class,
             )
             .await;
+            let artifact_loop_trace = load_pipeline_run(state, &pipeline_run.pipeline_run_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|run| {
+                    pipeline_state_from_run(&run)
+                        .get("artifact_loop_trace")
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                })
+                .unwrap_or(Value::Null);
             return ChatResponse {
                 status: "error".to_string(),
                 mode: "pipeline".to_string(),
@@ -17128,6 +17965,7 @@ async fn handle_pipeline_confirm1(
                     "stage": "blocked",
                     "failed_task_id": artifact_result.failed_task_id,
                     "failure_class": failure_class,
+                    "artifact_loop_trace": artifact_loop_trace,
                 }),
                 session_id: Some(session.session_id.clone()),
                 session_title: Some(session.title.clone()),
@@ -17319,7 +18157,8 @@ async fn handle_pipeline_confirm2(
                         "execution_report": output.clone(),
                         "executor_plan": plan,
                         "execution_failure_class": failure_class,
-                        "execution_failure_route": format!("{route:?}"),
+                        "execution_failure_route": route.operator_message(&failure_class),
+                        "operator_options": route.operator_options(),
                     })),
                 )
                 .await;
@@ -17331,7 +18170,8 @@ async fn handle_pipeline_confirm2(
                         "pipeline_run_id": pipeline_run.pipeline_run_id,
                         "stage": "blocked",
                         "failure_class": failure_class,
-                        "failure_route": format!("{route:?}"),
+                        "failure_route": route.operator_message(&failure_class),
+                        "operator_options": route.operator_options(),
                         "execution_report": output,
                     }),
                     session_id: Some(session.session_id.clone()),
@@ -17380,6 +18220,12 @@ async fn handle_pipeline_confirm2(
             }
 
             if verification.eligible_for_cookbook {
+                if let Some(entry) = observed_design_cookbook_entry_from_run_state(
+                    &run_state,
+                    &pipeline_run.pipeline_run_id,
+                ) {
+                    append_design_cookbook_entry(&state.state_dir, entry);
+                }
                 if let Some(entry) = pipeline_cookbook_entry_from_run_state(&run_state) {
                     append_plan_compile_cookbook_entry(
                         &state.state_dir,
@@ -17451,7 +18297,8 @@ async fn handle_pipeline_confirm2(
                 Some(json!({
                     "executor_plan": plan,
                     "execution_failure_class": failure_class,
-                    "execution_failure_route": format!("{route:?}"),
+                    "execution_failure_route": route.operator_message(&failure_class),
+                    "operator_options": route.operator_options(),
                     "execution_failure_error": err_text,
                 })),
             )
@@ -17464,7 +18311,8 @@ async fn handle_pipeline_confirm2(
                     "pipeline_run_id": pipeline_run.pipeline_run_id,
                     "stage": "blocked",
                     "failure_class": failure_class,
-                    "failure_route": format!("{route:?}"),
+                    "failure_route": route.operator_message(&failure_class),
+                    "operator_options": route.operator_options(),
                 }),
                 session_id: Some(session.session_id.clone()),
                 session_title: Some(session.title.clone()),
@@ -17959,6 +18807,35 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_start_confirmation_requested_accepts_short_affirmatives() {
+        assert!(pipeline_start_confirmation_requested("si"));
+        assert!(pipeline_start_confirmation_requested("sí"));
+        assert!(pipeline_start_confirmation_requested("ok"));
+        assert!(pipeline_start_confirmation_requested("adelante"));
+        assert!(pipeline_start_confirmation_requested("CONFIRM"));
+        assert!(!pipeline_start_confirmation_requested("maybe"));
+    }
+
+    #[test]
+    fn pipeline_start_declined_accepts_short_cancels() {
+        assert!(pipeline_start_declined("no"));
+        assert!(pipeline_start_declined("cancel"));
+        assert!(pipeline_start_declined("later"));
+        assert!(!pipeline_start_declined("ok"));
+    }
+
+    #[test]
+    fn render_pipeline_start_offer_message_mentions_start_and_cancel_paths() {
+        let message = render_pipeline_start_offer_message(
+            "create a support solution for acme",
+            Some("acme.support"),
+        );
+        assert!(message.contains("acme.support"));
+        assert!(message.contains("Reply **si**"));
+        assert!(message.contains("Reply **no** or **CANCEL**"));
+    }
+
+    #[test]
     fn canonical_plan_compile_cookbook_path_uses_shared_contract_path() {
         let dir = test_temp_dir("plan-compile-path");
         let path = plan_compile_cookbook_path(&dir);
@@ -18385,6 +19262,55 @@ mod tests {
     }
 
     #[test]
+    fn observed_design_cookbook_entry_from_run_state_uses_confirm1_summary() {
+        let run_state = json!({
+            "solution_id": "support-acme",
+            "design_iterations_used": 2,
+            "design_stop_reason": "pass",
+            "confirm1_summary": {
+                "solution_name": "Support Acme",
+                "hive_count": 2,
+                "node_count": 3,
+                "route_count": 1,
+                "main_runtimes": ["ai.common", "io.slack"],
+                "audit_status": "pass",
+                "audit_score": 9,
+                "blocking_issues": [],
+                "advisory_highlights": ["slack token required"],
+                "warnings": ["verify tenant mapping"],
+                "message": "Support topology ready."
+            },
+            "design_audit_verdict": {
+                "verdict_id": "design-audit-1",
+                "manifest_version": "2",
+                "status": "pass",
+                "score": 9,
+                "blocking_issues": [],
+                "findings": [],
+                "summary": "ok",
+                "produced_at_ms": 1
+            }
+        });
+
+        let entry = observed_design_cookbook_entry_from_run_state(&run_state, "run-42")
+            .expect("design cookbook entry");
+        assert_eq!(entry.layer, CookbookLayer::Design);
+        assert_eq!(entry.recorded_from_run.as_deref(), Some("run-42"));
+        assert_eq!(entry.seed_kind, "observed");
+        assert_eq!(
+            entry.inputs_signature.get("solution_id").and_then(Value::as_str),
+            Some("support-acme")
+        );
+        assert_eq!(
+            entry.successful_shape
+                .get("audit_score")
+                .and_then(Value::as_u64),
+            Some(9)
+        );
+        assert_eq!(entry.constraints, vec!["verify tenant mapping".to_string()]);
+    }
+
+    #[test]
     fn observed_artifact_cookbook_entry_uses_saved_bundle_and_task_packet() {
         let dir = test_temp_dir("artifact-cookbook-entry");
         let packet = BuildTaskPacket {
@@ -18519,7 +19445,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_artifact_bundle_from_specialist_output_extracts_inline_files() {
+    fn artifact_bundle_from_real_programmer_submission_extracts_inline_files() {
         let packet = BuildTaskPacket {
             task_packet_version: "0.1".to_string(),
             task_id: "art-1".to_string(),
@@ -18534,26 +19460,22 @@ mod tests {
             max_attempts: 3,
             cookbook_context: vec![],
         };
-        let artifact = json!({
-            "kind": "infrastructure",
+        let submitted = json!({
             "summary": "Prepared package",
-            "payload": {
-                "publish_request": {
-                    "source": {
-                        "kind": "inline_package",
-                        "files": {
-                            "package.json": "{\"name\":\"ai.common.demo\"}",
-                            "config/default-config.json": "{}"
-                        }
-                    }
-                },
-                "notes": ["publish me"]
-            }
+            "artifact": {
+                "files": {
+                    "package.json": "{\"name\":\"ai.common.demo\"}",
+                    "config/default-config.json": "{}"
+                }
+            },
+            "assumptions": ["used default version"],
+            "verification_hints": ["verify runtime_base"]
         });
 
-        let bundle =
-            runtime_artifact_bundle_from_specialist_output(&packet, &artifact).expect("bundle");
+        let bundle = artifact_bundle_from_real_programmer_submission(&packet, &submitted)
+            .expect("bundle");
         assert_eq!(bundle.artifact_kind, "runtime_package");
+        assert_eq!(bundle.generator_model, "real_programmer");
         assert_eq!(
             bundle
                 .artifact
@@ -18563,11 +19485,15 @@ mod tests {
                 .and_then(Value::as_str),
             Some("{\"name\":\"ai.common.demo\"}")
         );
+        assert!(bundle
+            .assumptions
+            .iter()
+            .any(|value| value == "used default version"));
         assert!(bundle.content_digest.starts_with("sha256:"));
     }
 
     #[test]
-    fn runtime_artifact_bundle_from_specialist_output_rejects_bundle_upload() {
+    fn artifact_bundle_from_real_programmer_submission_accepts_bundle_upload_target() {
         let packet = BuildTaskPacket {
             task_packet_version: "0.1".to_string(),
             task_id: "art-1".to_string(),
@@ -18582,23 +19508,206 @@ mod tests {
             max_attempts: 3,
             cookbook_context: vec![],
         };
-        let artifact = json!({
-            "kind": "infrastructure",
-            "summary": "Prepared bundle path",
-            "payload": {
-                "publish_request": {
-                    "source": {
-                        "kind": "bundle_upload",
-                        "blob_path": "incoming/demo.zip"
-                    }
-                },
-                "notes": []
+        let submitted = json!({
+            "summary": "Prepared package",
+            "artifact": {
+                "files": {
+                    "package.json": "{\"name\":\"ai.common.demo\"}",
+                    "config/default-config.json": "{}"
+                }
             }
         });
 
-        let err = runtime_artifact_bundle_from_specialist_output(&packet, &artifact)
-            .expect_err("bundle_upload should not be accepted yet");
-        assert!(err.contains("inline_package"));
+        let bundle = artifact_bundle_from_real_programmer_submission(&packet, &submitted)
+            .expect("bundle_upload target should be accepted as a logical file map");
+        assert_eq!(bundle.artifact_kind, "runtime_package");
+        assert_eq!(bundle.artifact["publish_source"], Value::Null);
+        assert_eq!(
+            bundle
+                .artifact
+                .get("files")
+                .and_then(Value::as_object)
+                .and_then(|value| value.get("package.json"))
+                .and_then(Value::as_str),
+            Some("{\"name\":\"ai.common.demo\"}")
+        );
+    }
+
+    #[test]
+    fn finalize_runtime_package_bundle_for_target_inline_adds_publish_source() {
+        let blob_root = test_temp_dir("artifact-inline-publish-source");
+        let packet = BuildTaskPacket {
+            task_packet_version: "0.1".to_string(),
+            task_id: "art-1".to_string(),
+            artifact_kind: "runtime_package".to_string(),
+            source_delta_op: "op-1".to_string(),
+            runtime_name: Some("ai.common.demo".to_string()),
+            target_kind: "inline_package".to_string(),
+            requirements: json!({"version": "1.2.3"}),
+            constraints: json!({}),
+            known_context: BuildTaskKnownContext::default(),
+            attempt: 0,
+            max_attempts: 3,
+            cookbook_context: vec![],
+        };
+        let mut bundle = ArtifactBundle {
+            bundle_version: "0.1".to_string(),
+            bundle_id: "bundle-1".to_string(),
+            source_task_id: "art-1".to_string(),
+            artifact_kind: "runtime_package".to_string(),
+            status: pipeline_types::ArtifactBundleStatus::Approved,
+            summary: "Prepared package".to_string(),
+            artifact: json!({
+                "files": {
+                    "package.json": "{\"name\":\"ai.common.demo\",\"version\":\"1.2.3\",\"type\":\"config_only\",\"runtime_base\":\"ai.common\"}",
+                    "config/default-config.json": "{}"
+                }
+            }),
+            assumptions: vec![],
+            verification_hints: vec![],
+            content_digest: "sha256:old".to_string(),
+            generated_at_ms: 1,
+            generator_model: "real_programmer".to_string(),
+        };
+
+        finalize_runtime_package_bundle_for_target(&blob_root, &packet, &mut bundle)
+            .expect("finalize inline publish source");
+        assert_eq!(
+            bundle.artifact["publish_source"]["kind"],
+            json!("inline_package")
+        );
+        assert!(
+            bundle.artifact["publish_source"]["files"]
+                .get("package.json")
+                .and_then(Value::as_str)
+                .is_some()
+        );
+        assert!(bundle.content_digest.starts_with("sha256:"));
+
+        let _ = fs::remove_dir_all(blob_root);
+    }
+
+    #[test]
+    fn finalize_runtime_package_bundle_for_target_bundle_upload_adds_blob_path() {
+        let blob_root = test_temp_dir("artifact-bundle-upload-publish-source");
+        let packet = BuildTaskPacket {
+            task_packet_version: "0.1".to_string(),
+            task_id: "art-1".to_string(),
+            artifact_kind: "runtime_package".to_string(),
+            source_delta_op: "op-1".to_string(),
+            runtime_name: Some("ai.common.demo".to_string()),
+            target_kind: "bundle_upload".to_string(),
+            requirements: json!({"version": "1.2.3"}),
+            constraints: json!({}),
+            known_context: BuildTaskKnownContext::default(),
+            attempt: 0,
+            max_attempts: 3,
+            cookbook_context: vec![],
+        };
+        let mut bundle = ArtifactBundle {
+            bundle_version: "0.1".to_string(),
+            bundle_id: "bundle-1".to_string(),
+            source_task_id: "art-1".to_string(),
+            artifact_kind: "runtime_package".to_string(),
+            status: pipeline_types::ArtifactBundleStatus::Approved,
+            summary: "Prepared package".to_string(),
+            artifact: json!({
+                "files": {
+                    "package.json": "{\"name\":\"ai.common.demo\",\"version\":\"1.2.3\",\"type\":\"config_only\",\"runtime_base\":\"ai.common\"}",
+                    "config/default-config.json": "{}"
+                }
+            }),
+            assumptions: vec![],
+            verification_hints: vec![],
+            content_digest: "sha256:old".to_string(),
+            generated_at_ms: 1,
+            generator_model: "real_programmer".to_string(),
+        };
+
+        finalize_runtime_package_bundle_for_target(&blob_root, &packet, &mut bundle)
+            .expect("finalize bundle_upload publish source");
+        let blob_path = bundle.artifact["publish_source"]["blob_path"]
+            .as_str()
+            .expect("blob_path");
+        assert_eq!(
+            bundle.artifact["publish_source"]["kind"],
+            json!("bundle_upload")
+        );
+        assert!(blob_path.starts_with("active/"));
+        assert!(blob_root.join(blob_path).exists(), "bundle blob should exist");
+        assert!(bundle.content_digest.starts_with("sha256:"));
+
+        let _ = fs::remove_dir_all(blob_root);
+    }
+
+    #[test]
+    fn expand_approved_artifacts_for_plan_compile_includes_publish_source() {
+        let dir = test_temp_dir("expand-approved-artifacts");
+        let packet = BuildTaskPacket {
+            task_packet_version: "0.1".to_string(),
+            task_id: "task-1".to_string(),
+            artifact_kind: "runtime_package".to_string(),
+            source_delta_op: "op-1".to_string(),
+            runtime_name: Some("ai.support.demo".to_string()),
+            target_kind: "inline_package".to_string(),
+            requirements: json!({}),
+            constraints: json!({}),
+            known_context: BuildTaskKnownContext::default(),
+            attempt: 0,
+            max_attempts: 3,
+            cookbook_context: vec![],
+        };
+        artifact_loop::save_task_packet(&dir, "run-1", &packet).expect("save task packet");
+
+        let bundle = ArtifactBundle {
+            bundle_version: "0.1".to_string(),
+            bundle_id: "bundle-1".to_string(),
+            source_task_id: "task-1".to_string(),
+            artifact_kind: "runtime_package".to_string(),
+            status: pipeline_types::ArtifactBundleStatus::Approved,
+            summary: "Prepared runtime package".to_string(),
+            artifact: json!({
+                "files": {
+                    "package.json": "{\"name\":\"ai.support.demo\"}",
+                    "config/default-config.json": "{}"
+                },
+                "publish_source": {
+                    "kind": "inline_package",
+                    "files": {
+                        "package.json": "{\"name\":\"ai.support.demo\"}",
+                        "config/default-config.json": "{}"
+                    }
+                }
+            }),
+            assumptions: vec![],
+            verification_hints: vec!["publish runtime".to_string()],
+            content_digest: "sha256:demo".to_string(),
+            generated_at_ms: 1,
+            generator_model: "gpt-test".to_string(),
+        };
+        artifact_loop::save_artifact_bundle(&dir, "run-1", &bundle).expect("save artifact bundle");
+
+        let approved = artifact_loop::ApprovedArtifact {
+            bundle_id: "bundle-1".to_string(),
+            task_id: "task-1".to_string(),
+            source_delta_op: "op-1".to_string(),
+            artifact_kind: "runtime_package".to_string(),
+            content_digest: "sha256:demo".to_string(),
+            path: dir.display().to_string(),
+        };
+
+        let expanded = expand_approved_artifacts_for_plan_compile(&dir, "run-1", &[approved])
+            .expect("expand approved artifacts");
+        let first = expanded
+            .as_array()
+            .and_then(|items| items.first())
+            .expect("first expanded artifact");
+        assert_eq!(
+            first["publish_source"]["kind"],
+            json!("inline_package")
+        );
+        assert_eq!(first["target_kind"], json!("inline_package"));
+        assert_eq!(first["runtime_name"], json!("ai.support.demo"));
     }
 
     #[test]
@@ -18648,40 +19757,6 @@ mod tests {
                 },
                 "notes": []
             })
-        );
-    }
-
-    #[test]
-    fn build_infrastructure_artifact_wraps_publish_request() {
-        let artifact = build_infrastructure_artifact(
-            ARCHITECT_INFRA_ARTIFACT_RUNTIME_PACKAGE_SOURCE,
-            "materialize package source",
-            json!({
-                "summary": "Prepared inline package source.",
-                "publish_request": {
-                    "source": {
-                        "kind": "inline_package",
-                        "files": {
-                            "package.json": "{}"
-                        }
-                    },
-                    "sync_to": ["worker-220"]
-                },
-                "notes": ["runtime_base still required"]
-            }),
-        )
-        .expect("build infrastructure artifact");
-
-        assert_eq!(artifact["kind"], json!("infrastructure"));
-        assert_eq!(artifact["artifact_type"], json!("runtime_package_source"));
-        assert_eq!(artifact["specialist"], json!("infrastructure"));
-        assert_eq!(
-            artifact["payload"]["publish_request"]["sync_to"],
-            json!(["worker-220"])
-        );
-        assert_eq!(
-            artifact["payload"]["notes"],
-            json!(["runtime_base still required"])
         );
     }
 

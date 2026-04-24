@@ -279,7 +279,7 @@ All four cookbooks (design, artifact, plan_compile, repair) use this exact shape
 - Implement `block_pipeline_run(state, run_id, reason, failure_class)`: transitions to Blocked
 - Acceptance: state machine transitions are logged and persisted
 
-### [ ] TA-6 — Host trace rendering for multi-actor pipeline
+### [x] TA-6 — Host trace rendering for multi-actor pipeline
 - Add `renderPipelineTrace(trace)` JS function in embedded UI:
   - Shows each completed stage as a row: stage name, status icon, actor, duration
   - Expandable detail per stage (artifact refs, audit scores, loop counts)
@@ -547,7 +547,7 @@ struct RepairPacket {
 ```
 - Built by the artifact loop controller from the `ArtifactAuditVerdict`
 
-### [ ] TC-5 — RealProgrammerTool: AI tool for artifact generation
+### [x] TC-5 — RealProgrammerTool: AI tool for artifact generation
 - Implement `RealProgrammerTool` as `FunctionTool`
 - Tool name: `fluxbee_real_programmer`
 - System prompt: focused on artifact generation only — no design decisions, no admin ops
@@ -560,6 +560,11 @@ struct RepairPacket {
 - For `WorkflowDefinition`: validates workflow schema fields
 - After call: compute content_digest, build `ArtifactBundle`, store to filesystem
 - Acceptance: given a build_task_packet for a config_only AI runtime, produces a valid ArtifactBundle with package.json + default-config.json + system.txt
+
+Current code status:
+- `RealProgrammerTool` now exists as `fluxbee_real_programmer`.
+- The host-side runner uses a strict `submit_artifact_bundle` tool, injects artifact cookbook context plus handbook text into the prompt, and converts the submitted payload into canonical `ArtifactBundle` records with computed digest / metadata.
+- The current supported artifact contract is intentionally still `runtime_package`, but that runtime-package path now supports both `inline_package` and `bundle_upload` targets; other artifact kinds remain outside the implemented scope for now.
 
 ### [x] TC-6 — ArtifactAuditor: structural validator
 
@@ -578,7 +583,7 @@ This boundary must be a doc comment on the function, not just an inline note, so
 - Repair hints: for each MISSING_FILE finding, hint = `add file {path}`; for INVALID_RUNTIME_BASE, hint = `set runtime_base to one of: {known_context.available_runtimes}`
 - Acceptance: audit of a bundle missing package.json returns Repairable verdict with MISSING_FILE finding and add-file repair hint
 
-### [ ] TC-7 — Artifact loop controller
+### [x] TC-7 — Artifact loop controller
 - Implement `run_artifact_loop(context, task_packets: Vec<BuildTaskPacket>) -> Result<Vec<ApprovedArtifact>>`
 - For each task_packet:
   ```
@@ -600,6 +605,14 @@ This boundary must be a doc comment on the function, not just an inline note, so
 - `save_approved_artifact_registry(state_dir, pipeline_run_id, artifacts)`: JSON file linking delta ops to approved bundles
 - Acceptance: artifact loop with a failing bundle (missing file) recovers on attempt 2 after repair packet directs programmer to add the file
 
+Current code status:
+- `run_pipeline_artifact_loop(...)` is implemented and now calls `run_real_programmer_with_context(...)` instead of the deprecated infrastructure specialist bridge.
+- It persists task packets, bundles, repair packets, approved artifact registry, and trace events; repeated repair signatures stop early as required.
+- Approved runtime-package bundles are now finalized into canonical `publish_source` payloads before plan compilation:
+  - `inline_package` keeps the generated file map as `publish_source.kind = inline_package`
+  - `bundle_upload` archives the approved package into a promoted blob zip and records `publish_source.kind = bundle_upload` with the resolved `blob_path`
+- This task remains open only because support is still intentionally limited to the currently implemented artifact kinds, not because the loop wiring is missing.
+
 ### [x] TC-8 — Artifact storage
 - Artifacts stored at `{state_dir}/pipeline/{run_id}/artifacts/{bundle_id}/`
 - Each bundle: `bundle.json` (ArtifactBundle metadata), `artifact/` subdirectory with artifact files
@@ -607,7 +620,7 @@ This boundary must be a doc comment on the function, not just an inline note, so
 - Repair packets stored at `{state_dir}/pipeline/{run_id}/repairs/{repair_id}.json`
 - Acceptance: after artifact loop, all produced files are readable from filesystem
 
-### [ ] TC-9 — Artifact loop trace rendering in chat
+### [x] TC-9 — Artifact loop trace rendering in chat
 - Emit `ArtifactLoopTraceEvent` per attempt:
   ```rust
   struct ArtifactLoopTraceEvent {
@@ -626,6 +639,11 @@ This boundary must be a doc comment on the function, not just an inline note, so
 - Frontend: `renderArtifactLoopTrace(events)` — show each attempt with status icon and expand for findings
 - Collapsed by default; auto-expand if any rejected or blocked
 - Acceptance: operator sees artifact loop retries in trace panel without being interrupted
+
+Current code status:
+- `artifact_loop_trace` is already persisted into pipeline state during the artifact loop.
+- The frontend now renders it as a collapsed `Agent activity · artifact_loop` panel, and auto-expands it when a repairable/rejected/blocked status appears.
+- Confirm2 payloads and artifact-loop block responses now surface that trace directly, so the operator can inspect internal retries without leaving the chat flow.
 
 ---
 
@@ -695,13 +713,13 @@ Implementation note:
 - Update frontend `renderResponsePayload` to check for `plan_compile_trace` (keep backward compat check for `programmer_trace` during migration)
 - Acceptance: chat response from plan compiler invocation has `plan_compile_trace` field
 
-### [ ] TD-6 — Seed plan_compile_cookbook (see also Track F)
+### [x] TD-6 — Seed plan_compile_cookbook (see also Track F)
 - Extract 3-4 entries from existing successful programmer/plan-compiler runs (those in current `programmer-v1.json`)
 - Convert to `CookbookEntryV2` format with `layer: "plan_compile"`, `pattern_key`, `trigger`, `successful_shape`
 - Write to `plan_compile_cookbook_v1.json`
 - Acceptance: cookbook is non-empty before the first new pipeline run
 
-### [ ] TD-8 — Archi host system prompt update for pipeline orchestration
+### [x] TD-8 — Archi host system prompt update for pipeline orchestration
 
 The current Archi system prompt was written for the old single-programmer architecture. It must be rewritten to be compatible with the new pipeline model. Without this, Archi will continue offering the old flow, call deprecated tools, and confuse the two CONFIRM semantics.
 
@@ -719,6 +737,11 @@ What changes:
 - Keep backward compat language for free-form plan_compile path (deprecated, but still works)
 
 Acceptance: Archi, given "quiero desplegar soporte para acme", asks the operator if they want to start the full pipeline — does not silently invoke plan_compiler as before.
+
+Current code status:
+- The Archi host prompt now distinguishes pipeline-eligible intents from quick query / SCMD / legacy free-form plan intents.
+- `fluxbee_start_pipeline` is explicitly preferred for full design/topology work, and the prompt now documents the staged start semantics plus the `si/sí/ok/adelante/start/CONFIRM` launch path.
+- The old `fluxbee_plan_compiler` wording was narrowed to the deprecated free-form path only, and the CONFIRM text now distinguishes pipeline Confirm1 vs Confirm2 from the legacy free-form planner confirmation.
 
 ### [x] TD-7 — Deprecate infrastructure_specialist
 - Remove `ArchitectInfrastructureSpecialistTool` from Archi's tool registry
@@ -775,7 +798,7 @@ fn classify_failure_deterministic(
   - error_code == "EXECUTION_TIMEOUT" -> ExecutionTimeout
 - Acceptance: unit test for each deterministic rule
 
-### [ ] TE-2 — Residual AI classifier
+### [x] TE-2 — Residual AI classifier
 - Implement `classify_failure_ai(context, stage, error_payload) -> Result<FailureClass>`
 - Uses a focused AI call with: stage context, error text, recent trace summary, artifact refs
 - Prompt: "Classify this failure into exactly one class from the enum. Return JSON: {class: '...', confidence: 0-1, reasoning: '...'}. Do not invent new classes."
@@ -798,7 +821,7 @@ fn classify_failure_deterministic(
 - `FailureRoutingDecision`: RetryArtifact, RetryPlanCompile, RetryDesign, RetryExecutor, EscalateToOperator
 - Acceptance: routing table test — each class returns expected decision
 
-### [ ] TE-4 — Host escalation on unresolvable failure
+### [x] TE-4 — Host escalation on unresolvable failure
 - When routing decision is EscalateToOperator:
   - Block pipeline run
   - Emit structured message to operator:
@@ -817,21 +840,21 @@ fn classify_failure_deterministic(
 **No code changes** — data preparation only  
 **Blocks agent readiness:** designer, plan compiler, real programmer, and repair loop cannot operate usefully until the seed files exist. Do not treat this as optional or deferrable.
 
-### [ ] TF-1 — Seed design_cookbook_v1.json
+### [x] TF-1 — Seed design_cookbook_v1.json
 - Write 2-3 entries covering most common solution topologies:
   1. Single-tenant AI support system: motherbee + dedicated worker, AI.chat + AI.support + WF.router + IO.slack
   2. Basic AI + IO topology: motherbee only, AI.chat + IO.api
   3. Multi-channel with routing: motherbee + worker, AI multi-instance + IO.slack + IO.email + WF.router with tenant prefix routing
 - Format per `CookbookEntryV2`: kind=design, pattern_key, trigger, inputs_signature, successful_shape, constraints, recorded_from_run=null (manual seed)
 
-### [ ] TF-2 — Seed artifact_cookbook_v1.json
+### [x] TF-2 — Seed artifact_cookbook_v1.json
 - Write entries from known working runtime/package patterns:
   1. config_only AI runtime over AI.common: package.json shape, default-config.json shape, system.txt
   2. workflow runtime over wf.engine: package.json, workflow_definition.json shape
   3. OPA bundle basic: package.json, policy.rego structure
 - Include known anti-patterns in `do_not_repeat`: missing runtime_base, wrong naming (no prefix)
 
-### [ ] TF-3 — Seed plan_compile_cookbook_v1.json
+### [x] TF-3 — Seed plan_compile_cookbook_v1.json
 - Convert 3-4 successful entries from current `programmer-v1.json` cookbook
 - Translate to CookbookEntryV2 format with `layer: "plan_compile"`
 - Add new entries covering:
@@ -840,7 +863,7 @@ fn classify_failure_deterministic(
   3. config_set + restart_node
 - Discard any entry where the steps are out of lifecycle order
 
-### [ ] TF-5 — Rewrite handbook_fluxbee.md for new architecture
+### [x] TF-5 — Rewrite handbook_fluxbee.md for new architecture
 
 The current `handbook_fluxbee.md` was written as a guide for `fluxbee_programmer` — it explains how to generate executor plans directly from a task description. That model is superseded. The handbook is injected into designer, plan_compiler, and real_programmer prompts, so if it's not updated, agents will receive contradictory or obsolete instructions.
 
@@ -888,7 +911,7 @@ Three focused sub-sections, one per AI actor that reads this handbook:
 
 Acceptance: designer prompted with this handbook produces manifests with correct desired_state structure; plan_compiler prompted with this handbook does not try to interpret design intent from delta ops.
 
-### [ ] TF-4 — Seed repair_cookbook_v1.json
+### [x] TF-4 — Seed repair_cookbook_v1.json
 - Write entries from known repeated failure/fix pairs:
   1. Missing package.json -> add package.json with correct fields
   2. Invalid runtime_base -> check known runtimes, correct runtime_base
@@ -1084,8 +1107,8 @@ Archi must NOT silently start a pipeline run. It always asks first. If the opera
 - Add `start_pipeline_run(state, session_id, solution_id) -> Result<PipelineRunRecord>`
 - Add `StartPipelineTool` as an internal Archi tool (not shown to operator; called after operator confirms intent):
   - Input: `task: String`, `solution_id: Option<String>`
-  - Creates pipeline run in Design stage, stores in `active_runs`
-  - Returns `{ pipeline_run_id, stage: "design", message: "Pipeline started" }`
+  - Stages a pending pipeline start request for the session
+  - Returns an operator-facing confirmation message; actual pipeline creation happens only after the operator confirms
 - Call `run_design_loop(context, task, solution_id, operator_context)` (TH-3):
   - Internally calls `DesignerTool` and `DesignAuditorTool` per iteration
   - Returns `DesignLoopOutput { manifest, verdict, iterations_used, stopped_reason }`
@@ -1096,14 +1119,13 @@ Archi must NOT silently start a pipeline run. It always asks first. If the opera
 
 Current code status:
 - `fluxbee_start_pipeline` now exists as an internal host tool.
-- It creates the pipeline run in `Design`, executes `run_design_loop(...)`, transitions to `Confirm1` on pass, or `Blocked` on failed design-loop stop conditions, and returns the operator-facing Confirm1 message.
+- It now stages a pending pipeline start request instead of launching immediately.
+- `handle_chat_message(...)` consumes that pending start structurally: free-text `si` / `sí` / `ok` / `adelante` / `start` and literal `CONFIRM` launch the pipeline; `no` / `CANCEL` discard it.
+- The actual execution path now lives behind that confirmation gate: create pipeline run in `Design`, execute `run_design_loop(...)`, transition to `Confirm1` on pass, or `Blocked` on failed design-loop stop conditions, and return the operator-facing Confirm1 message.
 - `handle_pipeline_confirm1(...)` was already wired and remains the bridge into snapshot + reconcile + downstream plan/artifact handling.
 - The full pipeline path is therefore now `StartPipelineTool -> Design loop -> Confirm1 -> Reconcile`.
 
-Known divergence from spec:
-- The "ask first, then start pipeline only after the operator confirms" behavior is currently prompt-guided in the host instructions, not hard-enforced by a separate pending-pipeline state machine. In practice the host should ask first, but the guard is behavioral rather than structural today.
-
-### [ ] TG-2 — Connect reconciler → artifact loop → plan compiler
+### [x] TG-2 — Connect reconciler → artifact loop → plan compiler
 - After reconciler: if `build_task_packets` non-empty, transition to ArtifactLoop stage; call `run_artifact_loop`
 - After artifact loop: approved artifacts registered; transition to PlanCompile stage
 - Invoke `run_plan_compiler_with_context` with delta_report + approved artifact refs
@@ -1114,8 +1136,11 @@ Known divergence from spec:
 
 Current code status:
 - Reconcile → PlanCompile is now wired for the no-artifact case: when `build_task_packets` is empty, the pipeline auto-invokes the plan compiler using `delta_report`, persists `executor_plan`, advances through `PlanValidation`, and emits a Confirm2 payload with destructive/restarting highlights.
-- ArtifactLoop is now wired through a temporary bridge implementation for `runtime_package + inline_package`: task packets are persisted, the internal artifact loop runs, approved artifacts are registered on disk and in pipeline state, and the pipeline advances into PlanCompile automatically.
-- This task remains open because the bridge still uses the deprecated internal infrastructure specialist instead of the canonical `RealProgrammerTool`, and support is intentionally limited to the currently implemented artifact kinds/targets.
+- ArtifactLoop now runs through the canonical `real_programmer -> artifact_auditor` path for the currently supported `runtime_package` scope:
+  - `inline_package` and `bundle_upload` targets are both finalized into canonical `publish_source` payloads after approval
+  - approved artifacts are expanded before plan compilation so the plan compiler receives concrete `publish_source` refs instead of raw bundle ids only
+- The artifact loop is also visible in the chat UI via `artifact_loop_trace`.
+- This task remains open only because artifact-kind coverage is still intentionally partial outside `runtime_package`.
 
 ### [x] TG-3 — Connect plan compiler → CONFIRM 2 → executor
 - On CONFIRM 2: retrieve executor_plan from pipeline state; call `execute_executor_plan_with_context`
@@ -1148,7 +1173,7 @@ Current code status:
 - Expected flow: snapshot partial → reconciler blocks → host presents SNAPSHOT_PARTIAL_BLOCKING to operator
 - Acceptance: no destructive ops emitted; operator sees clear error about which hive is down
 
-### [ ] TG-8 — Verification auditor v1
+### [x] TG-8 — Verification auditor v1
 - Implement `verify_execution_result(execution_report: &ExecutionReport) -> VerificationVerdict`
 - `VerificationVerdict`: `{ eligible_for_cookbook: bool, reason: String, verified_success: bool }`
 - V1 logic is deterministic — no AI needed:
@@ -1162,8 +1187,7 @@ Current code status:
 
 Current code status:
 - `verify_execution_result(...)` is now implemented deterministically and wired into the CONFIRM 2 success path.
-- Eligible runs append observed `plan_compile` and `artifact` cookbook entries only after verification passes; failed or unverified runs write nothing.
-- This task remains open because design-layer cookbook writes are not yet emitted for successful runs once the design loop exists.
+- Eligible runs now append observed `design`, `plan_compile`, and `artifact` cookbook entries only after verification passes; failed or unverified runs write nothing.
 
 ---
 
