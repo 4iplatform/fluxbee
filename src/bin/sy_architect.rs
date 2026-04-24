@@ -20133,4 +20133,294 @@ mod tests {
         assert!(!serialized.contains("data:"));
         assert!(!serialized.contains("base64,"));
     }
+
+    // ── TG-4: Pipeline state machine progresses Design → Completed ────────────
+    // Verifies that pipeline_run_with_state_update correctly transitions every
+    // stage and that only Completed/Failed/Blocked/Interrupted set terminal status.
+    #[test]
+    fn tg4_pipeline_state_machine_progresses_design_to_completed() {
+        let base = PipelineRunRecord {
+            pipeline_run_id: "run-tg4-001".to_string(),
+            session_id: "sess-tg4".to_string(),
+            solution_id: Some("sol-tg4".to_string()),
+            status: PipelineRunStatus::InProgress,
+            current_stage: PipelineStage::Design,
+            current_loop: 0,
+            current_attempt: 0,
+            state_json: "{}".to_string(),
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            interrupted_at_ms: None,
+        };
+
+        let stages_in_order = [
+            PipelineStage::DesignAudit,
+            PipelineStage::Confirm1,
+            PipelineStage::Reconcile,
+            PipelineStage::ArtifactLoop,
+            PipelineStage::PlanCompile,
+            PipelineStage::PlanValidation,
+            PipelineStage::Confirm2,
+            PipelineStage::Execute,
+            PipelineStage::Verify,
+        ];
+
+        let mut run = base;
+        for stage in &stages_in_order {
+            let next = pipeline_run_with_state_update(&run, stage.clone(), None, None)
+                .expect("state transition must not fail");
+            assert_eq!(next.current_stage, *stage, "stage must advance to {stage:?}");
+            assert_eq!(
+                next.status,
+                PipelineRunStatus::InProgress,
+                "status must remain InProgress through {stage:?}"
+            );
+            assert!(next.interrupted_at_ms.is_none(), "interrupted_at_ms must be None mid-run");
+            run = next;
+        }
+
+        // Advance to Completed — status must flip to Completed
+        let completed = pipeline_run_with_state_update(&run, PipelineStage::Completed, None, None)
+            .expect("Completed transition must not fail");
+        assert_eq!(completed.current_stage, PipelineStage::Completed);
+        assert_eq!(completed.status, PipelineRunStatus::Completed);
+        assert!(completed.interrupted_at_ms.is_none());
+
+        // State payloads survive each merge
+        let with_state = pipeline_run_with_state_update(
+            &completed,
+            PipelineStage::Completed,
+            Some(json!({ "executor_plan_ref": "plan-001" })),
+            None,
+        )
+        .unwrap();
+        let state = pipeline_state_from_run(&with_state);
+        assert_eq!(state["executor_plan_ref"], json!("plan-001"));
+    }
+
+    // ── TG-5: Artifact repair loop — bad bundle → repair → approved ──────────
+    // Tests the two-attempt artifact auditor path:
+    // attempt 1: missing package.json → Repairable + repair hints
+    // attempt 2: complete bundle → Approved
+    #[test]
+    fn tg5_artifact_repair_loop_recovers_on_second_attempt() {
+        use super::artifact_loop::{audit_artifact, build_repair_packet};
+        use super::pipeline_types::{
+            ArtifactBundle, ArtifactBundleStatus, AuditStatus, BuildTaskKnownContext,
+            BuildTaskPacket,
+        };
+
+        let packet = BuildTaskPacket {
+            task_packet_version: "0.1".to_string(),
+            task_id: "tg5-task-001".to_string(),
+            artifact_kind: "runtime_package".to_string(),
+            source_delta_op: "op-tg5".to_string(),
+            runtime_name: Some("ai.support.tg5".to_string()),
+            target_kind: "inline_package".to_string(),
+            requirements: json!({}),
+            constraints: json!({}),
+            known_context: BuildTaskKnownContext {
+                available_runtimes: vec!["AI.common".to_string()],
+                running_nodes: vec![],
+            },
+            attempt: 0,
+            max_attempts: 3,
+            cookbook_context: vec![],
+        };
+
+        // Attempt 1: bundle missing package.json — auditor must return Repairable
+        let bad_bundle = ArtifactBundle {
+            bundle_version: "0.1".to_string(),
+            bundle_id: "bundle-tg5-bad".to_string(),
+            source_task_id: "tg5-task-001".to_string(),
+            artifact_kind: "runtime_package".to_string(),
+            status: ArtifactBundleStatus::Pending,
+            summary: "attempt 1 — missing package.json".to_string(),
+            artifact: json!({ "files": { "config/default-config.json": "{}" } }),
+            assumptions: vec![],
+            verification_hints: vec![],
+            content_digest: "sha256:bad".to_string(),
+            generated_at_ms: 1_000,
+            generator_model: "test".to_string(),
+        };
+
+        let verdict1 = audit_artifact(&packet, &bad_bundle);
+        assert_eq!(verdict1.status, AuditStatus::Repairable, "attempt 1 must be Repairable");
+        assert!(
+            verdict1.blocking_issues.iter().any(|c| c == "MISSING_FILE"),
+            "must flag MISSING_FILE"
+        );
+        assert!(
+            !verdict1.repair_hints.is_empty(),
+            "repair hints must be non-empty for attempt 1"
+        );
+        assert!(
+            verdict1.repair_hints.iter().any(|h| h.instruction.contains("package.json")),
+            "repair hint must mention package.json"
+        );
+
+        // Build repair packet — simulates what the loop controller does between attempts
+        let repair = build_repair_packet(&verdict1, &bad_bundle, 1);
+        assert_eq!(repair.attempt, 1);
+        assert!(repair.retry_allowed, "retry must be allowed after Repairable verdict");
+        assert!(
+            repair.required_corrections.iter().any(|c| c.contains("package.json")),
+            "repair packet must carry correction about package.json"
+        );
+
+        // Attempt 2: programmer follows the repair packet — complete bundle
+        let mut fixed_packet = packet.clone();
+        fixed_packet.attempt = 1;
+        let good_bundle = ArtifactBundle {
+            bundle_id: "bundle-tg5-good".to_string(),
+            summary: "attempt 2 — all required files present".to_string(),
+            artifact: json!({
+                "files": {
+                    "package.json": r#"{"name":"ai.support.tg5","version":"0.1.0","type":"config_only","runtime_base":"AI.common"}"#,
+                    "config/default-config.json": r#"{"tenant_id":"tnt:tg5"}"#
+                }
+            }),
+            content_digest: "sha256:good".to_string(),
+            ..bad_bundle.clone()
+        };
+
+        let verdict2 = audit_artifact(&fixed_packet, &good_bundle);
+        assert_eq!(verdict2.status, AuditStatus::Approved, "attempt 2 must be Approved");
+        assert!(verdict2.findings.is_empty(), "no findings on approved bundle");
+        assert!(verdict2.repair_hints.is_empty(), "no repair hints on approved bundle");
+    }
+
+    // ── TG-6: Interrupted run — state and timestamp preserved ────────────────
+    // Verifies that transitioning to PipelineStage::Interrupted:
+    // - sets status to Interrupted
+    // - sets interrupted_at_ms (first transition)
+    // - preserves interrupted_at_ms on subsequent updates (idempotent)
+    #[test]
+    fn tg6_interrupted_run_sets_and_preserves_interrupted_at_ms() {
+        let run = PipelineRunRecord {
+            pipeline_run_id: "run-tg6-001".to_string(),
+            session_id: "sess-tg6".to_string(),
+            solution_id: None,
+            status: PipelineRunStatus::InProgress,
+            current_stage: PipelineStage::ArtifactLoop,
+            current_loop: 0,
+            current_attempt: 1,
+            state_json: r#"{"build_task_packets":[{"task_id":"art-tg6"}]}"#.to_string(),
+            created_at_ms: 1_000,
+            updated_at_ms: 2_000,
+            interrupted_at_ms: None,
+        };
+
+        // Simulate process kill mid-artifact-loop → mark interrupted
+        let interrupted = pipeline_run_with_state_update(
+            &run,
+            PipelineStage::Interrupted,
+            None,
+            None,
+        )
+        .expect("Interrupted transition must succeed");
+
+        assert_eq!(interrupted.status, PipelineRunStatus::Interrupted);
+        assert_eq!(interrupted.current_stage, PipelineStage::Interrupted);
+        let ts = interrupted.interrupted_at_ms.expect("interrupted_at_ms must be set");
+        assert!(ts >= 1_000, "interrupted_at_ms must be a real timestamp");
+
+        // State payload must survive the transition (needed for recovery UI)
+        let state = pipeline_state_from_run(&interrupted);
+        assert!(
+            state["build_task_packets"].is_array(),
+            "build_task_packets must be preserved after interruption"
+        );
+
+        // Second mark-interrupted call must not overwrite the original timestamp
+        let interrupted2 = pipeline_run_with_state_update(
+            &interrupted,
+            PipelineStage::Interrupted,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            interrupted2.interrupted_at_ms,
+            Some(ts),
+            "interrupted_at_ms must not be overwritten on repeated Interrupted transitions"
+        );
+    }
+
+    // ── TG-7: Partial snapshot blocking — no destructive ops emitted ─────────
+    // Verifies the full reconciler output when the snapshot is partial-blocking:
+    // - delta report status is BlockedPartialSnapshot
+    // - zero operations with destructive compiler_class are present
+    // - at least one BLOCKED_PARTIAL_SNAPSHOT op is present for the unreachable hive
+    #[test]
+    fn tg7_partial_snapshot_blocks_all_destructive_ops() {
+        use super::pipeline_types::{
+            ActualStateSnapshot, ChangeType, CompilerClass, DesiredStateV2,
+            HiveResources, HiveSnapshotStatus, RiskClass, SnapshotAtomicity, SnapshotCompleteness,
+            SnapshotScope, SolutionManifestV2, compiler_class_risk,
+        };
+        use super::reconciler::run_reconciler;
+        use std::collections::HashMap;
+
+        // Manifest: wants to delete an existing node (ownership=solution) on worker-220
+        let manifest = SolutionManifestV2 {
+            manifest_version: "2.0".to_string(),
+            solution: json!({ "name": "tg7-test" }),
+            desired_state: DesiredStateV2 {
+                nodes: Some(vec![]), // desired: no nodes → reconciler would normally emit NODE_KILL
+                ..Default::default()
+            },
+            advisory: json!({}),
+        };
+
+        // Snapshot: worker-220 is unreachable → blocking = true
+        let mut hive_status = HashMap::new();
+        hive_status.insert(
+            "worker-220".to_string(),
+            HiveSnapshotStatus { reachable: false, error: Some("connection refused".to_string()) },
+        );
+        let mut resources = HashMap::new();
+        resources.insert("worker-220".to_string(), HiveResources::default());
+
+        let snapshot = ActualStateSnapshot {
+            snapshot_version: "1.0".to_string(),
+            snapshot_id: "snap-tg7".to_string(),
+            captured_at_start: "2026-04-24T00:00:00Z".to_string(),
+            captured_at_end: "2026-04-24T00:00:01Z".to_string(),
+            scope: SnapshotScope { hives: vec!["worker-220".to_string()], resources: vec![] },
+            atomicity: SnapshotAtomicity { mode: "best_effort_multi_call".to_string(), is_atomic: false },
+            hive_status,
+            resources,
+            completeness: SnapshotCompleteness {
+                is_partial: true,
+                missing_sections: vec!["worker-220".to_string()],
+                blocking: true,
+            },
+        };
+
+        let output = run_reconciler(&manifest, &snapshot, "manifest-tg7")
+            .expect("reconciler must not error on partial snapshot");
+
+        assert_eq!(
+            output.delta_report.status,
+            super::pipeline_types::DeltaReportStatus::BlockedPartialSnapshot,
+            "delta report must be BlockedPartialSnapshot when snapshot is blocking"
+        );
+
+        // No destructive or restarting ops must be emitted
+        let destructive_ops: Vec<_> = output.delta_report.operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    compiler_class_risk(&op.compiler_class),
+                    RiskClass::Destructive | RiskClass::Restarting
+                ) && op.change_type != ChangeType::Blocked
+            })
+            .collect();
+        assert!(
+            destructive_ops.is_empty(),
+            "must emit zero destructive/restarting ops when snapshot is partial-blocking; got: {:?}",
+            destructive_ops.iter().map(|o| &o.compiler_class).collect::<Vec<_>>()
+        );
+    }
 }

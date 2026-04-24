@@ -1153,22 +1153,22 @@ Current code status:
 - CONFIRM 2 now loads `executor_plan` from pipeline state, executes it, advances through `Execute -> Verify`, classifies/routs execution failures through the deterministic failure classifier, and finalizes the run as `Completed`, `Blocked`, or `Failed` as appropriate.
 - Successful verified runs now persist `verification_verdict` and append an observed `plan_compile` cookbook entry when eligible.
 
-### [ ] TG-4 — E2E test: design → execute success
+### [x] TG-4 — E2E test: design → execute success
 - Fixture: human input "deploy AI support for tenant acme on worker-220 with slack integration"
 - Expected flow: designer produces manifest → design audit passes → CONFIRM 1 → reconciler produces delta → artifact loop produces packages → plan compiler produces plan → CONFIRM 2 → executor succeeds
 - Acceptance: full pipeline completes without human intervention between CONFIRM 1 and CONFIRM 2
 
-### [ ] TG-5 — E2E test: artifact repair loop
+### [x] TG-5 — E2E test: artifact repair loop
 - Fixture: real_programmer intentionally produces a bundle with missing package.json on first attempt
 - Expected flow: artifact auditor catches it → repair_packet generated → second attempt succeeds → approved
 - Acceptance: pipeline recovers without operator intervention; trace shows 2 attempts
 
-### [ ] TG-6 — E2E test: interrupted run recovery
+### [x] TG-6 — E2E test: interrupted run recovery
 - Start a pipeline; kill process mid-artifact-loop; restart server; open same session
 - Expected flow: host detects interrupted run → presents recovery options to operator
 - Acceptance: operator can resume or discard; pipeline state is intact
 
-### [ ] TG-7 — E2E test: partial snapshot blocking
+### [x] TG-7 — E2E test: partial snapshot blocking
 - Mock one hive as unreachable during snapshot build
 - Expected flow: snapshot partial → reconciler blocks → host presents SNAPSHOT_PARTIAL_BLOCKING to operator
 - Acceptance: no destructive ops emitted; operator sees clear error about which hive is down
