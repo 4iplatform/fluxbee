@@ -28,14 +28,14 @@ Track G  (final assembly)            → blocked until A+B+C+D+E+F+H are complet
 All 12 contracts must be written as signed-off design decisions before any implementation begins.
 These are design tasks, not code tasks. Output is a frozen decision document per item.
 
-### [ ] CFZ-1 — solution_manifest desired_state / advisory schema
+### [x] CFZ-1 — solution_manifest desired_state / advisory schema
 **Deliverable:** JSON schema or typed Rust definition for `desired_state` v1 scope.
 - Must enumerate allowed top-level sections: topology, runtimes, nodes, routing, wf_deployments, opa_deployments, ownership
 - Must enumerate rejected sections: policy, identity
 - Must enumerate allowed fields per section with types and optionality
 - Must define ownership marker format per resource class
 
-### [ ] CFZ-2 — actual_state_snapshot v1 schema + exact admin actions
+### [x] CFZ-2 — actual_state_snapshot v1 schema + exact admin actions
 **Deliverable:** Rust struct definition + JSON example per spec section 6.4, **plus** a frozen table of exact admin actions used to build the snapshot.
 
 Struct fields:
@@ -62,14 +62,14 @@ Exact admin action table (frozen — must not drift):
 
 Rule: if a required action fails for a hive that has solution-owned resources → that hive section is marked missing and `completeness.blocking = true`. Non-required action failures produce warnings only.
 
-### [ ] CFZ-3 — delta_report schema
+### [x] CFZ-3 — delta_report schema
 **Deliverable:** Rust struct definition + JSON example per spec section 7.2.
 - `delta_report_version`, `status` (ready / blocked_partial_snapshot / blocked_unsupported)
 - `manifest_ref`, `snapshot_ref`
 - `summary`: creates, updates, deletes, noops, blocked
 - `operations[]`: op_id, resource_type, resource_id, change_type, ownership, compiler_class, desired_ref, actual_ref, blocking, payload_ref, notes
 
-### [ ] CFZ-4 — compiler_class full vocabulary
+### [x] CFZ-4 — compiler_class full vocabulary
 **Deliverable:** Rust enum `CompilerClass` with all values per spec section 7.3:
 - Topology: HIVE_CREATE, VPN_CREATE, VPN_DELETE
 - Runtimes: RUNTIME_PUBLISH_ONLY, RUNTIME_PUBLISH_AND_DISTRIBUTE, RUNTIME_DELETE_VERSION
@@ -79,7 +79,7 @@ Rule: if a required action fails for a hive that has solution-owned resources �
 - OPA: OPA_APPLY, OPA_REMOVE
 - Meta: NOOP, BLOCKED_PARTIAL_SNAPSHOT, SCOPE_NOT_SUPPORTED
 
-### [ ] CFZ-5 — compiler_class → admin-step translation table (frozen)
+### [x] CFZ-5 — compiler_class → admin-step translation table (frozen)
 **Deliverable:** frozen translation table per spec section 7.4, extended with risk classification.
 
 Rules:
@@ -122,7 +122,7 @@ Risk classes:
 
 The host must use this risk class when building the CONFIRM 2 payload (TA-8).
 
-### [ ] CFZ-6 — design loop stop conditions
+### [x] CFZ-6 — design loop stop conditions
 **Deliverable:** signed-off numeric policy:
 - max 3 iterations
 - score must improve >= 1 point per iteration (define score scale: 0-10)
@@ -131,13 +131,13 @@ The host must use this risk class when building the CONFIRM 2 payload (TA-8).
 
 Define how design audit "score" is produced: structured field in `design_audit_verdict.score` (integer 0-10) with `blocking_issues[]` containing issue signatures (short string keys, not free text).
 
-### [ ] CFZ-7 — artifact loop stop conditions
+### [x] CFZ-7 — artifact loop stop conditions
 **Deliverable:** signed-off numeric policy:
 - max 3 attempts per build_task_packet
 - same failure signature twice (based on failure_class + failing_field) => stop
 - failure class in [ARTIFACT_TASK_UNDERSPECIFIED, ARTIFACT_UNSUPPORTED_KIND] => stop immediately
 
-### [ ] CFZ-8 — failure classification vocabulary + first deterministic rules
+### [x] CFZ-8 — failure classification vocabulary + first deterministic rules
 **Deliverable:** complete `FailureClass` enum + initial matcher table.
 - Classes per spec section 11.2
 - Deterministic rules per 11.3 + extension:
@@ -151,7 +151,7 @@ Define how design audit "score" is produced: structured field in `design_audit_v
   - admin returns HTTP 4xx not matching known patterns => EXECUTION_ACTION_FAILED
   - AI call fails => UNKNOWN_RESIDUAL (escalate)
 
-### [ ] CFZ-9 — get_manifest_current tool contract
+### [x] CFZ-9 — get_manifest_current tool contract
 **Deliverable:** tool definition: name, inputs, outputs, error cases.
 - Input: `solution_id: Option<String>` — if None, uses current session's active solution
 - Output: `solution_manifest` JSON (full document including desired_state + advisory)
@@ -159,7 +159,7 @@ Define how design audit "score" is produced: structured field in `design_audit_v
 - Error if storage read fails: propagates as tool error
 - This is a read-only tool; must never mutate manifest
 
-### [ ] CFZ-10 — cookbook file names and seed set
+### [x] CFZ-10 — cookbook file names and seed set
 **Deliverable:** file layout + minimum seed content for each cookbook:
 - `{state_dir}/cookbook/design_cookbook_v1.json`
 - `{state_dir}/cookbook/artifact_cookbook_v1.json`
@@ -168,7 +168,7 @@ Define how design audit "score" is produced: structured field in `design_audit_v
 - Each file: JSON array of `CookbookEntryV2` (see CFZ-10 for shape)
 - Seed content: at minimum, collect 3-4 entries per cookbook from existing working cases
 
-### [ ] CFZ-11 — pipeline_runs persistence schema
+### [x] CFZ-11 — pipeline_runs persistence schema
 **Deliverable:** SQL table definition + Rust struct for `PipelineRunRecord`.
 ```sql
 CREATE TABLE pipeline_runs (
@@ -187,7 +187,7 @@ CREATE TABLE pipeline_runs (
 ```
 `state_json` holds serialized `PipelineRunState` with refs to all active artifacts.
 
-### [ ] CFZ-13 — CookbookEntryV2 schema (frozen)
+### [x] CFZ-13 — CookbookEntryV2 schema (frozen)
 **Deliverable:** single canonical JSON schema for all cookbook entries across all layers.
 
 Without this, each track writes cookbooks with a different shape and agents cannot read them reliably.
@@ -221,7 +221,7 @@ Field rules:
 
 All four cookbooks (design, artifact, plan_compile, repair) use this exact shape. No layer-specific top-level fields.
 
-### [ ] CFZ-12 — restart / hot-apply / immutable-change table by node type
+### [x] CFZ-12 — restart / hot-apply / immutable-change table by node type
 **Deliverable:** frozen Rust table mapping node type prefix and runtime class to reconcile semantics.
 - WF.* => config changes require restart (NODE_CONFIG_APPLY_RESTART by default)
 - AI.* => config changes are hot by default (NODE_CONFIG_APPLY_HOT by default)
@@ -237,7 +237,7 @@ All four cookbooks (design, artifact, plan_compile, repair) use this exact shape
 **Blocked by:** Phase 0  
 **Primary file:** `src/bin/sy_architect.rs`
 
-### [ ] TA-1 — Rust types for solution_manifest v2
+### [x] TA-1 — Rust types for solution_manifest v2
 - Add `SolutionManifestV2` struct with `manifest_version`, `solution`, `desired_state: DesiredStateV2`, `advisory: AdvisoryV2`
 - `DesiredStateV2`: topology, runtimes, nodes, routing, wf_deployments, opa_deployments, ownership_config
 - `AdvisoryV2`: `serde_json::Value` (free-form, not reconciler-facing)
@@ -247,14 +247,14 @@ All four cookbooks (design, artifact, plan_compile, repair) use this exact shape
   - Validates ownership markers if present
 - Acceptance: unit test — manifest with `desired_state.identity` field is rejected with `UNSUPPORTED_DESIRED_STATE_SECTION`
 
-### [ ] TA-2 — Manifest storage (save / load)
+### [x] TA-2 — Manifest storage (save / load)
 - `save_manifest(state_dir, solution_id, manifest) -> Result<PathBuf>`: writes JSON to `{state_dir}/manifests/{solution_id}/{version}.json`
 - `load_manifest(state_dir, solution_id, version: Option<&str>) -> Result<Option<SolutionManifestV2>>`: reads latest or specific version
 - Version: incrementing integer or timestamp-based string
 - DB: `manifest_refs` table with `solution_id`, `version`, `path`, `created_at_ms`
 - Acceptance: save → load returns same content
 
-### [ ] TA-3 — get_manifest_current tool
+### [x] TA-3 — get_manifest_current tool
 - Implement `GetManifestCurrentTool` as `FunctionTool`
 - Tool name: `get_manifest_current`
 - Input: `{ "solution_id": "<optional>" }`
@@ -263,7 +263,7 @@ All four cookbooks (design, artifact, plan_compile, repair) use this exact shape
 - Register in designer's tool registry only (not in Archi general tools)
 - Acceptance: call with existing solution_id returns manifest; call with unknown returns found=false
 
-### [ ] TA-4 — pipeline_runs DB table
+### [x] TA-4 — pipeline_runs DB table
 - Implement `ensure_pipeline_runs_table(db) -> Result<Table>`
 - Implement `save_pipeline_run(table, record) -> Result<()>`
 - Implement `load_pipeline_run(table, run_id) -> Result<Option<PipelineRunRecord>>`
@@ -271,7 +271,7 @@ All four cookbooks (design, artifact, plan_compile, repair) use this exact shape
 - `PipelineRunRecord` per CFZ-11 schema
 - Acceptance: save → load returns same record; status update persists
 
-### [ ] TA-5 — PipelineRunState machine
+### [x] TA-5 — PipelineRunState machine
 - Add `PipelineRunState` struct to `ArchitectState`:
   - `active_runs: Arc<Mutex<HashMap<String, PipelineRunRecord>>>`
 - Add `PipelineStage` enum: Design, DesignAudit, Confirm1, Reconcile, ArtifactLoop, PlanCompile, PlanValidation, Confirm2, Execute, Verify, Completed, Failed, Blocked, Interrupted
@@ -288,7 +288,7 @@ All four cookbooks (design, artifact, plan_compile, repair) use this exact shape
 - `PipelineTraceEvent`: stage, actor, status, duration_ms, summary, artifact_ref
 - Acceptance: operator sees pipeline stages updating in trace panel during internal loops
 
-### [ ] TA-7 — CONFIRM 1 flow
+### [x] TA-7 — CONFIRM 1 flow
 **Important:** CONFIRM routing must be driven by `pipeline_run.current_stage`, not by legacy pending flags.
 
 Legacy flags (`programmer_pending`, `plan_compile_pending`) remain for backward compatibility with free-form chat flows only. They must not be used as the routing criterion for pipeline runs.
@@ -306,7 +306,7 @@ Host shows CONFIRM 1 payload per spec 14.1: manifest summary, design audit verdi
 
 Acceptance: CONFIRM 1 in a design-complete pipeline transitions to Reconcile stage; CONFIRM in a legacy free-form chat session still works as before.
 
-### [ ] TA-8 — CONFIRM 2 flow
+### [x] TA-8 — CONFIRM 2 flow
 **Important:** same routing rule as TA-7 — check `pipeline_run.current_stage == Confirm2` first.
 
 Logic in CONFIRM handler:
@@ -326,7 +326,7 @@ Host shows CONFIRM 2 payload per spec 14.3:
 
 Acceptance: CONFIRM 2 triggers executor using plan from pipeline state; legacy free-form CONFIRM still works.
 
-### [ ] TA-9 — Interrupted run recovery
+### [x] TA-9 — Interrupted run recovery
 - On startup: `list_interrupted_runs` for all sessions
 - Mark any `in_progress` runs as `interrupted` in DB
 - When session is opened: check for interrupted runs, present recovery options:
@@ -342,7 +342,7 @@ Acceptance: CONFIRM 2 triggers executor using plan from pipeline state; legacy f
 **Primary file:** new module `src/reconciler/mod.rs` (or inline in `sy_architect.rs` if monolith policy)  
 **Nature:** pure Rust, no AI calls
 
-### [ ] TB-1 — SnapshotBuilder: Rust struct + admin calls
+### [x] TB-1 — SnapshotBuilder: Rust struct + admin calls
 - Implement `SnapshotBuilder` struct with `context: ArchitectAdminToolContext`
 - Implement `build_snapshot(hives: &[String], scope: SnapshotScope) -> Result<ActualStateSnapshot>`
 - Makes parallel admin calls per hive:
@@ -354,7 +354,7 @@ Acceptance: CONFIRM 2 triggers executor using plan from pipeline state; legacy f
 - Times each section fetch; stores in `captured_at_start/end`
 - Acceptance: calling against live motherbee returns populated snapshot with correct hive_status
 
-### [ ] TB-2 — Partial snapshot policy
+### [x] TB-2 — Partial snapshot policy
 - If a target hive from `desired_state.topology.hives` is unreachable:
   - Mark `hive_status[hive].reachable = false`
   - Mark `completeness.is_partial = true`
@@ -363,21 +363,21 @@ Acceptance: CONFIRM 2 triggers executor using plan from pipeline state; legacy f
 - `build_snapshot` does not fail on hive timeout; it records the failure and continues
 - Acceptance: snapshot builder with one mocked-down hive produces partial snapshot with blocking=true
 
-### [ ] TB-3 — DeltaReport Rust types
+### [x] TB-3 — DeltaReport Rust types
 - `DeltaReport` struct per CFZ-3
 - `DeltaOperation` struct: op_id, resource_type, resource_id, change_type (Create/Update/Delete/Noop/Blocked), ownership, compiler_class, desired_ref, actual_ref, blocking, payload_ref, notes
 - `DeltaReportStatus`: Ready, BlockedPartialSnapshot, BlockedUnsupported
 - All types: `Serialize`, `Deserialize`, `Clone`, `Debug`
 - Acceptance: can round-trip through JSON
 
-### [ ] TB-4 — Hive and VPN reconciler
+### [x] TB-4 — Hive and VPN reconciler
 - `reconcile_topology(desired: &DesiredTopology, snapshot: &ActualStateSnapshot) -> Vec<DeltaOperation>`
 - For each desired hive: if absent in snapshot -> emit HIVE_CREATE
 - For each desired VPN: if absent -> emit VPN_CREATE; if absent in desired but present and solution-owned -> emit VPN_DELETE
 - Ownership check: never emit delete for `ownership = "external"` or `ownership = "system"`
 - Acceptance: unit test with fixture — desired has hive "worker-new", snapshot has none → creates HIVE_CREATE op
 
-### [ ] TB-5 — Runtime reconciler
+### [x] TB-5 — Runtime reconciler
 - `reconcile_runtimes(desired: &[DesiredRuntime], snapshot: &ActualStateSnapshot) -> Vec<DeltaOperation>`
 - For each desired runtime/package:
   - If absent in snapshot -> emit RUNTIME_PUBLISH_ONLY or RUNTIME_PUBLISH_AND_DISTRIBUTE
@@ -387,7 +387,7 @@ Acceptance: CONFIRM 2 triggers executor using plan from pipeline state; legacy f
 - `artifact_requirement` field in op: points to required `build_task_packet` if package source is `inline_package` or not yet available
 - Acceptance: unit test — desired runtime not in snapshot → RUNTIME_PUBLISH_AND_DISTRIBUTE; same version in snapshot → NOOP
 
-### [ ] TB-6 — Node reconciler + restart semantics table
+### [x] TB-6 — Node reconciler + restart semantics table
 - `reconcile_nodes(desired: &[DesiredNode], snapshot: &ActualStateSnapshot, restart_table: &RestartTable) -> Vec<DeltaOperation>`
 - For each desired node:
   - If absent -> emit NODE_RUN_MISSING
@@ -401,14 +401,14 @@ Acceptance: CONFIRM 2 triggers executor using plan from pipeline state; legacy f
 - Config hash comparison: compare `node.config` fields declared in desired_state against current `node_config` from snapshot; ignore runtime-internal fields not declared
 - Acceptance: unit test battery — 6 scenarios covering each class emitted
 
-### [ ] TB-7 — Route reconciler
+### [x] TB-7 — Route reconciler
 - `reconcile_routes(desired: &[DesiredRoute], snapshot: &ActualStateSnapshot) -> Vec<DeltaOperation>`
 - Route identity key: (hive, prefix, action_type) — if same key with different fields -> ROUTE_REPLACE (delete + add)
 - New route -> ROUTE_ADD
 - Route absent in desired but present and solution-owned -> ROUTE_DELETE
 - Acceptance: unit test — desired has new prefix, snapshot missing it → ROUTE_ADD
 
-### [ ] TB-8 — WF reconciler
+### [x] TB-8 — WF reconciler
 - `reconcile_wf(desired: &[DesiredWfDeployment], snapshot: &ActualStateSnapshot, restart_table: &RestartTable) -> Vec<DeltaOperation>`
 - For each desired WF deployment:
   - If absent -> WF_DEPLOY_APPLY
@@ -419,7 +419,7 @@ Acceptance: CONFIRM 2 triggers executor using plan from pipeline state; legacy f
     - If no canonical remove action available -> emit BLOCKED with note
 - Acceptance: unit test — desired WF not in snapshot → WF_DEPLOY_APPLY; definition changed → WF_DEPLOY_RESTART
 
-### [ ] TB-9 — OPA reconciler
+### [x] TB-9 — OPA reconciler
 - `reconcile_opa(desired: &[DesiredOpaDeployment], snapshot: &ActualStateSnapshot) -> Vec<DeltaOperation>`
 - For each desired OPA deployment:
   - If absent -> OPA_APPLY
@@ -428,7 +428,7 @@ Acceptance: CONFIRM 2 triggers executor using plan from pipeline state; legacy f
     - If no canonical remove action -> emit BLOCKED with note
 - Acceptance: unit test — desired OPA missing → OPA_APPLY; same hash in snapshot → NOOP
 
-### [ ] TB-10 — Artifact gap detection
+### [x] TB-10 — Artifact gap detection
 - After reconciler runs, scan all `DeltaOperation` entries with `compiler_class` requiring a runtime artifact (RUNTIME_PUBLISH_ONLY, RUNTIME_PUBLISH_AND_DISTRIBUTE, WF_DEPLOY_APPLY/RESTART):
   - Check if an approved `artifact_bundle` already exists for the required resource
   - If not: emit a `BuildTaskPacket` for that operation
@@ -436,7 +436,7 @@ Acceptance: CONFIRM 2 triggers executor using plan from pipeline state; legacy f
 - Return `Vec<BuildTaskPacket>` alongside the `DeltaReport`
 - Acceptance: reconciler on a desired state with unpackaged inline runtime emits a BuildTaskPacket pointing to the delta op
 
-### [ ] TB-11 — Reconciler entry point
+### [x] TB-11 — Reconciler entry point
 - `run_reconciler(context, manifest_ref, snapshot) -> Result<ReconcilerOutput>`
 - `ReconcilerOutput`: `delta_report: DeltaReport`, `build_task_packets: Vec<BuildTaskPacket>`, `diagnostics: Vec<String>`
 - Validates manifest v2 shape first (reject unsupported sections)
@@ -449,7 +449,7 @@ Acceptance: CONFIRM 2 triggers executor using plan from pipeline state; legacy f
   - READY otherwise
 - Acceptance: full reconciler run against fixture returns deterministic DeltaReport
 
-### [ ] TB-12 — Reconciler unit tests
+### [x] TB-12 — Reconciler unit tests
 - One fixture set per resource type (TB-4 through TB-9)
 - Each fixture: `(manifest_desired_state, actual_state_snapshot) -> expected DeltaReport`
 - Must include idempotency test: running reconciler twice on same inputs produces same output
@@ -465,7 +465,7 @@ Acceptance: CONFIRM 2 triggers executor using plan from pipeline state; legacy f
 **Primary file:** `src/bin/sy_architect.rs` (new structs + tools)  
 **Depends on:** Track B (build_task_packets feed the loop)
 
-### [ ] TC-1 — BuildTaskPacket Rust struct
+### [x] TC-1 — BuildTaskPacket Rust struct
 ```rust
 struct BuildTaskPacket {
     task_packet_version: String,
@@ -486,7 +486,7 @@ struct BuildTaskPacket {
 - `Serialize`, `Deserialize`, `Clone`
 - `save_task_packet(state_dir, packet) -> Result<PathBuf>`: writes to `{state_dir}/task_packets/{task_id}.json`
 
-### [ ] TC-2 — ArtifactBundle Rust struct
+### [x] TC-2 — ArtifactBundle Rust struct
 ```rust
 struct ArtifactBundle {
     bundle_version: String,
@@ -507,7 +507,7 @@ struct ArtifactBundle {
 - `load_artifact_bundle(state_dir, bundle_id) -> Result<Option<ArtifactBundle>>`
 - Content digest: `sha256(serde_json::to_string_pretty(&bundle.artifact)?)`
 
-### [ ] TC-3 — ArtifactAuditVerdict Rust struct
+### [x] TC-3 — ArtifactAuditVerdict Rust struct
 ```rust
 struct ArtifactAuditVerdict {
     verdict_id: String,
@@ -528,7 +528,7 @@ struct AuditFinding {
 }
 ```
 
-### [ ] TC-4 — RepairPacket Rust struct
+### [x] TC-4 — RepairPacket Rust struct
 ```rust
 struct RepairPacket {
     repair_packet_version: String,
@@ -561,7 +561,7 @@ struct RepairPacket {
 - After call: compute content_digest, build `ArtifactBundle`, store to filesystem
 - Acceptance: given a build_task_packet for a config_only AI runtime, produces a valid ArtifactBundle with package.json + default-config.json + system.txt
 
-### [ ] TC-6 — ArtifactAuditor: structural validator
+### [x] TC-6 — ArtifactAuditor: structural validator
 
 **Scope boundary (mandatory, must be documented in code):**
 > `ArtifactAuditor` validates structural and contract-level correctness only. It does not validate semantic quality of prompts, business correctness of configs, normative correctness of Rego logic, or real-world adequacy of workflow definitions. If an artifact passes the auditor, it means the artifact is structurally valid — not that it will work as intended.
@@ -600,7 +600,7 @@ This boundary must be a doc comment on the function, not just an inline note, so
 - `save_approved_artifact_registry(state_dir, pipeline_run_id, artifacts)`: JSON file linking delta ops to approved bundles
 - Acceptance: artifact loop with a failing bundle (missing file) recovers on attempt 2 after repair packet directs programmer to add the file
 
-### [ ] TC-8 — Artifact storage
+### [x] TC-8 — Artifact storage
 - Artifacts stored at `{state_dir}/pipeline/{run_id}/artifacts/{bundle_id}/`
 - Each bundle: `bundle.json` (ArtifactBundle metadata), `artifact/` subdirectory with artifact files
 - Task packets stored at `{state_dir}/pipeline/{run_id}/task_packets/{task_id}.json`
@@ -635,7 +635,7 @@ This boundary must be a doc comment on the function, not just an inline note, so
 **Primary file:** `src/bin/sy_architect.rs`  
 **Nature:** mostly renaming + wiring changes; AI prompt changes
 
-### [ ] TD-1 — Rename fluxbee_programmer to plan_compiler in code
+### [x] TD-1 — Rename fluxbee_programmer to plan_compiler in code
 - Rename Rust identifiers:
   - `ArchitectProgrammerTool` -> `PlanCompilerTool`
   - `programmer_pending` -> `plan_compile_pending` in `ArchitectState`
@@ -651,7 +651,7 @@ This boundary must be a doc comment on the function, not just an inline note, so
 - Update trace field names: `programmer_trace` -> `plan_compile_trace` in JSON output
 - Acceptance: no remaining `programmer` identifiers except in comments explaining the old name for migration context
 
-### [ ] TD-2 — Bind plan compiler to delta_report
+### [x] TD-2 — Bind plan compiler to delta_report
 
 **Legacy path policy:** the free-form chat path (no delta_report) is explicitly `#[deprecated]` from this point. It must not receive new features or prompt improvements. All future investment goes into the delta_report path. The legacy path exists only for backward compatibility with existing free-form sessions and will be removed after Track G E2E tests pass.
 
@@ -673,7 +673,11 @@ Mark in code:
 - When called from free-form chat (legacy path): no delta_report, old behavior, no new development
 - Acceptance: plan compiler receiving a delta_report with 3 operations produces an executor_plan with the correct step sequence per the translation table
 
-### [ ] TD-3 — Enforce compiler_class translation table in plan compiler
+Implementation note:
+- `PlanCompilerTool` now accepts `delta_report` and `approved_artifacts`, injects them into the plan compiler prompt, and routes both pipeline and legacy free-form calls through the same prevalidation/retry transaction helper.
+- The free-form path still exists and still stages `plan_compile_pending`; that is intentional backward compatibility.
+
+### [x] TD-3 — Enforce compiler_class translation table in plan compiler
 - Add `validate_plan_against_delta(plan: &Value, delta: &DeltaReport) -> Result<()>`:
   - For each delta operation, check that the produced executor plan contains the steps mandated by the translation table
   - Rejects plan if it uses `kill_node -> run_node` for an op classified as `NODE_CONFIG_APPLY_RESTART`
@@ -681,12 +685,12 @@ Mark in code:
 - Pre-validation calls this function before storing `plan_compile_pending`
 - Acceptance: plan with wrong step sequence for a NODE_CONFIG_APPLY_RESTART op is rejected at pre-validation
 
-### [ ] TD-4 — Plan compiler cookbook update
+### [x] TD-4 — Plan compiler cookbook update
 - Rename cookbook file from old path to `plan_compile_cookbook_v1.json`
 - Update `plan_compile_cookbook_path()` and all read/write calls
 - Acceptance: existing cookbook entries survive rename; new entries written to new path
 
-### [ ] TD-5 — Rename plan_compile_trace in chat output
+### [x] TD-5 — Rename plan_compile_trace in chat output
 - `programmer_trace` -> `plan_compile_trace` in the `handle_run_ai_chat` output JSON
 - Update frontend `renderResponsePayload` to check for `plan_compile_trace` (keep backward compat check for `programmer_trace` during migration)
 - Acceptance: chat response from plan compiler invocation has `plan_compile_trace` field
@@ -716,7 +720,7 @@ What changes:
 
 Acceptance: Archi, given "quiero desplegar soporte para acme", asks the operator if they want to start the full pipeline — does not silently invoke plan_compiler as before.
 
-### [ ] TD-7 — Deprecate infrastructure_specialist
+### [x] TD-7 — Deprecate infrastructure_specialist
 - Remove `ArchitectInfrastructureSpecialistTool` from Archi's tool registry
 - Add deprecation note in code comment: "superseded by real_programmer + artifact_auditor per rearchitecture spec v4"
 - Do not delete code yet — keep as dead code for migration safety; mark with `#[allow(dead_code)]`
@@ -729,7 +733,7 @@ Acceptance: Archi, given "quiero desplegar soporte para acme", asks the operator
 **Blocked by:** Phase 0 (CFZ-8)  
 **Primary file:** new module `failure_classifier.rs` or section in `sy_architect.rs`
 
-### [ ] TE-1 — FailureClass enum and deterministic matcher
+### [x] TE-1 — FailureClass enum and deterministic matcher
 
 Note: `PolicyBlocked` is removed. Policy and identity are out of scope for this architecture version (per spec v4 section 4.1). If those sections appear in a manifest, they are rejected by `validate_manifest_v2` before reconciliation, not by the failure classifier.
 
@@ -778,7 +782,7 @@ fn classify_failure_deterministic(
 - If confidence < 0.6 or model returns unknown class -> return UnknownResidual
 - Acceptance: AI classifier called only when deterministic matcher returns None
 
-### [ ] TE-3 — Failure routing table
+### [x] TE-3 — Failure routing table
 - Given `FailureClass` -> route to repair loop:
   ```
   DesignIncomplete / DesignConflict -> design loop (if < max iterations)
@@ -903,7 +907,7 @@ Acceptance: designer prompted with this handbook produces manifests with correct
 
 This is the largest missing track. TG-1 currently says "invoke designer AI tool" and "invoke design_auditor AI tool" as if they exist — they do not. This track implements them.
 
-### [ ] TH-1 — DesignerTool: AI tool for solution manifest generation
+### [x] TH-1 — DesignerTool: AI tool for solution manifest generation
 
 - Implement `DesignerTool` as `FunctionTool`
 - Tool name: `fluxbee_designer`
@@ -928,13 +932,23 @@ This is the largest missing track. TG-1 currently says "invoke designer AI tool"
 - `DesignerOutput` stored in pipeline run state
 - Acceptance: given "deploy AI support for acme on worker-220", produces a valid `SolutionManifestV2` with correct `desired_state` sections and no `executor_plan` content
 
-### [ ] TH-2 — DesignerTool trace
+Current code status:
+- `fluxbee_designer` now exists as a `FunctionTool`.
+- It runs with `query_hive` + `get_manifest_current`, injects handbook + design cookbook context, validates the returned manifest via `validate_manifest_v2`, persists it, and returns `solution_manifest + solution_id + human_summary`.
+- The tool is also used internally by the new `run_design_loop(...)`.
+
+### [x] TH-2 — DesignerTool trace
 - `DesignerTrace` struct: task, solution_id, query_hive_calls (count), manifest_version, section_count, validation_result
 - Stored in pipeline trace per stage
 - Frontend: `renderDesignerTrace(trace)` — collapsed panel showing task sent, live queries made, manifest sections produced
 - Acceptance: designer trace appears in pipeline trace panel after designer completes
 
-### [ ] TH-3 — Design loop controller
+Current code status:
+- `DesignerTrace` now exists in backend output and is emitted by `fluxbee_designer`.
+- `run_design_loop(...)` accumulates per-iteration `designer_traces` and persists them in pipeline state.
+- The frontend now renders the designer trace as a collapsed "Agent activity · designer" panel in chat responses that came from `fluxbee_start_pipeline`.
+
+### [x] TH-3 — Design loop controller
 - Implement `run_design_loop(context, task, solution_id, operator_context) -> Result<DesignLoopOutput>`
 - `DesignLoopOutput`: manifest, audit_verdict, iterations_used, stopped_reason
 - Loop per CFZ-6 stop conditions:
@@ -954,7 +968,12 @@ This is the largest missing track. TG-1 currently says "invoke designer AI tool"
 - `feedback` passed to next iteration is a structured string extracted from `design_audit_verdict.findings`
 - Acceptance: design loop with an intentionally incomplete manifest (missing topology) iterates and improves on second attempt
 
-### [ ] TH-4 — DesignAuditorTool: AI tool for manifest review
+Current code status:
+- `run_design_loop(...)` now exists and is wired into pipeline start.
+- It persists the manifest and `design_audit_{iteration}.json` per iteration, carries structured feedback into the next designer pass, and stops on `pass`, `reject`, no score improvement, repeated blocker signature, or max iterations.
+- It also stores `design_loop_trace` in pipeline state for later frontend rendering.
+
+### [x] TH-4 — DesignAuditorTool: AI tool for manifest review
 
 - Implement `DesignAuditorTool` as `FunctionTool`
 - Tool name: `fluxbee_design_auditor`
@@ -982,7 +1001,12 @@ This is the largest missing track. TG-1 currently says "invoke designer AI tool"
 - `blocking_issues` strings are used for dedup detection (same key twice = stop)
 - Acceptance: auditor on a manifest missing all node definitions returns `revise` verdict with score <= 3 and blocking issue `NODES_MISSING`
 
-### [ ] TH-5 — DesignAuditVerdict Rust struct
+Current code status:
+- `fluxbee_design_auditor` now exists as a `FunctionTool`.
+- It reads a full manifest plus optional prior context, forces one `submit_design_audit_verdict` call, validates `status`/`score`/`findings`, and returns a `DesignAuditVerdict`.
+- The tool is also used internally by `run_design_loop(...)`.
+
+### [x] TH-5 — DesignAuditVerdict Rust struct
 ```rust
 struct DesignAuditVerdict {
     verdict_id: String,
@@ -1005,7 +1029,7 @@ struct DesignFinding {
 - Stored in pipeline state; persisted to `{state_dir}/pipeline/{run_id}/design_audit_{iteration}.json`
 - Acceptance: struct round-trips through JSON; verdict stored and loadable
 
-### [ ] TH-6 — CONFIRM 1 summary builder
+### [x] TH-6 — CONFIRM 1 summary builder
 - Implement `build_confirm1_summary(manifest, verdict) -> Confirm1Summary`
 - `Confirm1Summary`: solution name, topology summary (N hives, M nodes, K routes), main runtimes listed, audit score, blocking issues if any, advisory highlights
 - This is what the operator sees before CONFIRM 1 (per spec 14.1)
@@ -1013,11 +1037,19 @@ struct DesignFinding {
 - Must highlight any `verdict.status == Revise` warnings even if proceeding
 - Acceptance: CONFIRM 1 message includes hive count, node count, audit score, and any blocking issues in readable form
 
-### [ ] TH-7 — Design loop trace rendering
+Current code status:
+- `build_confirm1_summary(...)` now exists and is covered by tests for hive/node/route counts, runtime extraction, advisory highlights, and warning surfacing.
+- The summary is now wired into `fluxbee_start_pipeline` and is rendered into the operator-facing Confirm1 message.
+
+### [x] TH-7 — Design loop trace rendering
 - `DesignLoopTraceEvent` per iteration: iteration number, status (designing/auditing/pass/revise), score, blocking_issue_count, stopped_reason
 - Frontend: `renderDesignLoopTrace(events)` — show iterations with scores improving over iterations
 - Collapsed by default; auto-expand if stopped early
 - Acceptance: operator sees design loop iterations in trace panel
+
+Current code status:
+- `DesignLoopTraceEvent` now exists and is persisted in pipeline state as `design_loop_trace`.
+- The frontend now renders it as a collapsed "Agent activity · design_loop" panel in chat responses from `fluxbee_start_pipeline`.
 
 ---
 
@@ -1026,7 +1058,7 @@ struct DesignFinding {
 **Blocked by:** Tracks A + B + C + D + E + F all substantially complete  
 **Primary file:** `src/bin/sy_architect.rs`
 
-### [ ] TG-1 — Connect design loop → CONFIRM 1 → reconciler
+### [x] TG-1 — Connect design loop → CONFIRM 1 → reconciler
 
 **Requires Track H complete** (`DesignerTool`, `DesignAuditorTool`, `run_design_loop` all implemented and tested).
 
@@ -1062,6 +1094,15 @@ Archi must NOT silently start a pipeline run. It always asks first. If the opera
 - On CONFIRM 1 (TA-7): transition to Reconcile; call `run_reconciler`; store delta_report + task_packets in pipeline state
 - Acceptance: full design → confirm → reconcile sequence produces a delta_report stored in pipeline state
 
+Current code status:
+- `fluxbee_start_pipeline` now exists as an internal host tool.
+- It creates the pipeline run in `Design`, executes `run_design_loop(...)`, transitions to `Confirm1` on pass, or `Blocked` on failed design-loop stop conditions, and returns the operator-facing Confirm1 message.
+- `handle_pipeline_confirm1(...)` was already wired and remains the bridge into snapshot + reconcile + downstream plan/artifact handling.
+- The full pipeline path is therefore now `StartPipelineTool -> Design loop -> Confirm1 -> Reconcile`.
+
+Known divergence from spec:
+- The "ask first, then start pipeline only after the operator confirms" behavior is currently prompt-guided in the host instructions, not hard-enforced by a separate pending-pipeline state machine. In practice the host should ask first, but the guard is behavioral rather than structural today.
+
 ### [ ] TG-2 — Connect reconciler → artifact loop → plan compiler
 - After reconciler: if `build_task_packets` non-empty, transition to ArtifactLoop stage; call `run_artifact_loop`
 - After artifact loop: approved artifacts registered; transition to PlanCompile stage
@@ -1071,12 +1112,21 @@ Archi must NOT silently start a pipeline run. It always asks first. If the opera
 - On validation pass: transition to Confirm2 stage; present CONFIRM 2 payload
 - Acceptance: reconciler with 2 task_packets → artifact loop → plan compiler → executor_plan stored in pipeline
 
-### [ ] TG-3 — Connect plan compiler → CONFIRM 2 → executor
+Current code status:
+- Reconcile → PlanCompile is now wired for the no-artifact case: when `build_task_packets` is empty, the pipeline auto-invokes the plan compiler using `delta_report`, persists `executor_plan`, advances through `PlanValidation`, and emits a Confirm2 payload with destructive/restarting highlights.
+- ArtifactLoop is now wired through a temporary bridge implementation for `runtime_package + inline_package`: task packets are persisted, the internal artifact loop runs, approved artifacts are registered on disk and in pipeline state, and the pipeline advances into PlanCompile automatically.
+- This task remains open because the bridge still uses the deprecated internal infrastructure specialist instead of the canonical `RealProgrammerTool`, and support is intentionally limited to the currently implemented artifact kinds/targets.
+
+### [x] TG-3 — Connect plan compiler → CONFIRM 2 → executor
 - On CONFIRM 2: retrieve executor_plan from pipeline state; call `execute_executor_plan_with_context`
 - Store execution_report; transition to Verify stage
 - On execution success: check cookbook eligibility; write cookbook entries if approved
 - On execution failure: run failure classifier; route per routing table
 - Acceptance: CONFIRM 2 triggers executor using plan from pipeline state; result stored as execution_report
+
+Current code status:
+- CONFIRM 2 now loads `executor_plan` from pipeline state, executes it, advances through `Execute -> Verify`, classifies/routs execution failures through the deterministic failure classifier, and finalizes the run as `Completed`, `Blocked`, or `Failed` as appropriate.
+- Successful verified runs now persist `verification_verdict` and append an observed `plan_compile` cookbook entry when eligible.
 
 ### [ ] TG-4 — E2E test: design → execute success
 - Fixture: human input "deploy AI support for tenant acme on worker-220 with slack integration"
@@ -1109,6 +1159,11 @@ Archi must NOT silently start a pipeline run. It always asks first. If the opera
 - If `eligible_for_cookbook`: for each layer that participated in this run (plan_compile always; artifact if artifact loop ran; design if design loop ran), write cookbook entry via `append_cookbook_entry(layer, entry)`
 - Cookbook entries built from: `delta_report` ops → plan_compile entry; approved `artifact_bundles` → artifact entries; `solution_manifest` → design entry if loop ran cleanly
 - Acceptance: successful full pipeline run writes at minimum one `plan_compile` cookbook entry; failed pipeline writes nothing
+
+Current code status:
+- `verify_execution_result(...)` is now implemented deterministically and wired into the CONFIRM 2 success path.
+- Eligible runs append observed `plan_compile` and `artifact` cookbook entries only after verification passes; failed or unverified runs write nothing.
+- This task remains open because design-layer cookbook writes are not yet emitted for successful runs once the design loop exists.
 
 ---
 
