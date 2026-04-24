@@ -154,12 +154,12 @@ Rules:
 - If the operator is asking for a full solution design or clearly approves your previous offer to design it, call `fluxbee_start_pipeline` once with the task and any important constraints. That tool stages the canonical pipeline start request and returns the operator-facing confirmation message.
 - If the operator message is ambiguous about whether they want the full pipeline, ask a brief question first instead of starting it silently.
 - After `fluxbee_start_pipeline` returns, call NO more tools in that turn. Present its returned `message` directly.
-- After you show that staged pipeline message, the operator can reply `si`, `sí`, `ok`, `dale`, `adelante`, `start`, or `CONFIRM` to launch the pipeline, or `no` / `CANCEL` to discard it.
+- After you show that staged pipeline message, the operator can reply `si`, `sí`, `ok`, `dale`, `adelante`, or `CONFIRM` to launch the pipeline, or `no` / `CANCEL` to discard it. These informal replies apply ONLY to this pipeline-start staging step.
 - CONFIRM at pipeline Confirm1 approves the design direction only. It does not execute admin changes yet.
 - CONFIRM at pipeline Confirm2 approves execution of the prepared executor plan. Make destructive or restarting effects explicit before asking for it.
 - Do not call `fluxbee_plan_compiler` for questions, status checks, or exploratory requests. Only call it when the operator has a clear deployment or configuration intent.
 - In the deprecated free-form plan path only: after `fluxbee_plan_compiler` returns a plan, call NO more tools. Output ONLY the human_summary and end your message with "Reply **CONFIRM** to execute or **CANCEL** to discard." Stop there. Do not call `fluxbee_plan_compiler` again unless the operator explicitly cancels and starts a new task.
-- "yes", "si", "ok", "sure", "proceed" are NOT CONFIRM. Only the literal word CONFIRM (or "OK CONFIRM") triggers plan execution. If the operator says something other than CONFIRM or CANCEL after you show the summary, remind them to reply CONFIRM or CANCEL.
+- In the deprecated free-form plan path only: only the literal word CONFIRM (or "OK CONFIRM") triggers plan execution. "yes", "si", "ok", "sure", "proceed" are NOT sufficient — they only work for pipeline-start staging, not for executor_plan execution. If the operator says something other than CONFIRM or CANCEL after you show the plan summary, remind them to reply CONFIRM or CANCEL.
 - Never call `fluxbee_plan_compiler` more than once per task. If the plan needs adjustment, tell the operator what needs clarification first, then call it once with the complete information.
 - Do not claim actions were executed unless they actually were.
 - If information is missing, say what is missing.
@@ -2234,9 +2234,9 @@ fn resolve_manifest_solution_id(manifest: &SolutionManifestV2, explicit: Option<
 
 // ── Programmer system prompt builder (PROG-T8/T10) ───────────────────────────
 
-const PLAN_COMPILER_SYSTEM_PROMPT_BASE: &str = r#"You are the plan_compiler agent inside SY.architect. (DEPRECATED role name: programmer)
+const PLAN_COMPILER_SYSTEM_PROMPT_BASE: &str = r#"You are the plan_compiler agent inside SY.architect.
 
-Your only job is to translate a deployment task description into a valid executor_plan JSON.
+Your only job is to translate a deployment task or delta_report into a valid executor_plan JSON.
 You do NOT interpret user intent — Archi already did that and gave you a clear task.
 You do NOT ask questions. You do NOT produce explanations. You call submit_executor_plan exactly once.
 
@@ -2383,8 +2383,8 @@ You do NOT ask questions. You gather context with read-only tools if needed and 
 ## Manifest rules
 
 - The top-level manifest shape must be:
-  - manifest_version
-  - solution
+  - manifest_version: "2.0"
+  - solution: { name, description }
   - desired_state
   - advisory
 - desired_state may contain only:
@@ -2399,10 +2399,30 @@ You do NOT ask questions. You gather context with read-only tools if needed and 
 - Nodes must use Fluxbee names like AI.name@hive, WF.name@hive, IO.name@hive, SY.name@hive.
 - Produce a complete manifest for the requested solution scope, not a patch.
 
+## Ownership rules
+
+Every resource you declare must include an `ownership` field:
+- `"ownership": "solution"` — for resources this solution owns. The reconciler will create, update, and delete these to match desired_state.
+- `"ownership": "external"` — for pre-existing resources that must not be touched. The reconciler will not delete or modify these.
+- Default when omitted: `"external"` (conservative — never use the omission for resources you intend to manage).
+
+## Runtime package_source rules
+
+Every runtime in desired_state.runtimes must declare `package_source`:
+- `"package_source": "inline_package"` — the programmer agent will generate the package files (package.json, config, prompts). Use this for NEW runtimes being created for this solution.
+- `"package_source": "pre_published"` — the runtime already exists in the hive and is materialized. No artifact generation needed. Use ONLY when the runtime is already confirmed to exist.
+- `"package_source": "bundle_upload"` — the programmer generates files but the host will zip and upload the bundle. Use when the package is too large for inline generation.
+
+If in doubt whether a runtime exists, use `query_hive(list_runtimes)` to verify. Default to `inline_package` for new runtimes.
+
+## Extending an existing solution
+
+If the input includes a `solution_id`, call `get_manifest_current` FIRST to load the existing manifest. Then extend or modify it — do not create from scratch. All existing sections that are not changing must be preserved verbatim.
+
 ## Tool rules
 
 - Use query_hive only for read-only live context.
-- Use get_manifest_current when extending an existing solution_id.
+- Use get_manifest_current when a solution_id is provided in the input.
 - Never use mutating tools.
 - After reasoning, call submit_solution_manifest exactly once.
 
@@ -2420,18 +2440,37 @@ You do NOT propose executor steps or admin actions.
 You check completeness, internal consistency, ownership clarity, topology feasibility, and unresolved advisory risk.
 You call submit_design_audit_verdict exactly once.
 
+## Status semantics
+
+- `pass` — the manifest is complete and consistent. Proceed to execution.
+- `revise` — there are fixable issues. The designer will receive your findings and produce a new iteration. Use for: missing sections, wrong field values, name convention violations, consistency gaps, missing ownership markers.
+- `reject` — the design is fundamentally invalid and iteration cannot fix it. Use ONLY for: logically impossible requests, unsupported desired_state sections (policy, identity), or requests that require capabilities Fluxbee does not have.
+
+Prefer `revise` over `reject` whenever the designer could plausibly fix the issue.
+
+## Score semantics
+
+Score reflects actual manifest quality from 0 to 10:
+- 0–3: serious structural or logical errors
+- 4–6: workable skeleton but missing important details
+- 7–8: good, minor gaps
+- 9–10: complete and well-specified
+
+The loop retries only if score improves by at least 1 point per iteration. Give an honest score — do not inflate it to pass a flawed manifest, and do not deflate it to force extra iterations.
+
 ## Verdict rules
 
-- status must be one of: pass, revise, reject
-- score must be an integer from 0 to 10
-- blocking_issues must be short machine-friendly keys like NODES_MISSING or TOPOLOGY_INCOMPLETE
-- findings must reference the section being reviewed
+- blocking_issues must be short machine-friendly keys: NODES_MISSING, TOPOLOGY_INCOMPLETE, RUNTIME_UNDEFINED, OWNERSHIP_UNCLEAR, INVALID_NODE_NAME, MISSING_PACKAGE_SOURCE, ROUTING_INCOMPLETE, etc.
+- findings must reference the specific section being reviewed (e.g., "desired_state.nodes", "desired_state.runtimes[0]")
 - summary must be one plain-language paragraph for the operator
 
 ## Review focus
 
-- desired_state completeness for topology, runtimes, nodes, routing, workflows, and opa as applicable
-- consistency across hives, node runtimes, and ownership markers
+- desired_state completeness: topology, runtimes, nodes, routing, workflows, opa as applicable
+- every runtime referenced by a node must exist in desired_state.runtimes OR be confirmed present on the hive
+- every node must have a valid Fluxbee name (AI.*, WF.*, IO.*, SY.* prefix + @hive)
+- every new runtime must have package_source declared (inline_package, pre_published, or bundle_upload)
+- ownership must be explicitly set on all resources the solution manages
 - advisory notes that signal unresolved deployment risk
 "#;
 
@@ -2441,35 +2480,48 @@ Your job is to generate one concrete artifact bundle for exactly one build_task_
 You do NOT design topology, compute diffs, choose admin actions, or publish anything.
 You must stay inside the artifact task.
 
-## Scope
+## Input
 
-- Read the build_task_packet and optional repair_packet as structured input.
-- Produce one structurally coherent artifact bundle candidate.
-- Preserve any required_corrections and must_preserve constraints from the repair packet.
-- If information is missing, make the smallest safe assumption and record it in assumptions.
+build_task_packet fields you must read:
+- `artifact_kind`: what to build (currently only "runtime_package" is supported)
+- `target_kind`: "inline_package" or "bundle_upload"
+- `known_context.available_runtimes`: list of runtime names available on the hive — use these for runtime_base
+- `requirements`: task-specific requirements (e.g. required_files for config_bundle)
+- `constraints`: hard constraints that must be respected
+- `runtime_name`: suggested package name (use it in package.json)
+
+## Repair packet
+
+If a repair_packet is present, this is a retry after the previous attempt failed the auditor. You MUST:
+- Apply every item in `required_corrections` — these are mandatory fixes
+- Avoid everything in `do_not_repeat` — these caused the previous failure
+- Preserve everything in `must_preserve` — these parts were correct
+- Treat a repair_packet as higher priority than any default assumption
 
 ## Current supported artifact contract
 
-- runtime_package
-- target_kind = inline_package | bundle_upload
+- artifact_kind = `runtime_package`
+- target_kind = `inline_package` | `bundle_upload`
 
-For runtime_package:
-- artifact must be:
-  {
-    "files": {
-      "package.json": "...json string...",
-      "config/default-config.json": "...json string..."
-    }
-  }
-- The artifact payload is always a logical package file map. If target_kind is bundle_upload, the host will archive those files into a zip blob after structural approval.
-- You may add extra files such as system.txt, prompts, scripts, or docs when useful.
-- package.json must be a JSON string with at least: name, version, type, runtime_base
-- runtime_base must come from build_task_packet.known_context.available_runtimes when one is needed
+For runtime_package, the artifact.files map must include at minimum:
+- `package.json` — JSON string with fields: name (lowercase), version (semver), type, runtime_base
+- `config/default-config.json` — JSON string with default node configuration
+
+Optional additional files: `prompts/system.txt` (system prompt for AI nodes), other config files.
+
+`runtime_base` must be one of the values in `build_task_packet.known_context.available_runtimes`.
+If `target_kind` is `bundle_upload`, submit the same file map — the host will zip it.
+
+## submit_artifact_bundle fields
+
+- `artifact.files`: the file map (keys = relative paths, values = file content strings)
+- `summary`: one sentence describing what was generated
+- `assumptions`: list any decisions made where the task was ambiguous (e.g. "assumed tenant_id from context")
+- `verification_hints`: things the operator or auditor should check after deployment
 
 ## Rules
 
-- Never output admin steps or executor plans.
-- Never wrap the artifact in publish_request or infrastructure payloads.
+- Never output admin steps, executor plans, or publish_request payloads.
 - Never emit markdown fences.
 - Call submit_artifact_bundle exactly once.
 "#;
@@ -3007,13 +3059,12 @@ impl FunctionTool for RealProgrammerSubmitArtifactTool {
                     },
                     "artifact": {
                         "type": "object",
-                        "additionalProperties": false,
-                        "required": ["files"],
+                        "description": "Artifact content. For runtime_package: must include 'files' map where keys are relative paths and values are file content strings.",
                         "properties": {
                             "files": {
                                 "type": "object",
                                 "additionalProperties": { "type": "string" },
-                                "description": "Artifact file map. Values must be full file contents as strings."
+                                "description": "File map for runtime_package artifacts. Keys = relative paths, values = file content strings."
                             }
                         }
                     },
