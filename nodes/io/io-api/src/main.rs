@@ -369,7 +369,7 @@ async fn main() -> Result<()> {
         boot_state.current_state.as_str(),
         boot_state.config_version,
     ));
-    let control_src = sender.full_name().to_string();
+    let control_src = sender.uuid().to_string();
 
     let http_state = Arc::new(HttpState {
         hive_id: config.island_id.clone(),
