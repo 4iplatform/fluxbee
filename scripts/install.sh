@@ -202,6 +202,7 @@ sudo install -d "$CONFIG_DIR"
 sudo install -d "$STATE_DIR"
 sudo install -d -m 0700 "$STATE_DIR/ssh"
 sudo install -d "$STATE_DIR/state/nodes"
+sudo install -d "$STATE_DIR/state/cookbook"
 sudo install -d "$STATE_DIR/hives"
 sudo install -d "$STATE_DIR/opa"
 sudo install -d "$STATE_DIR/opa/current"
@@ -833,6 +834,52 @@ fi
 if [[ -f "$ROOT_DIR/config/hive.yaml" ]]; then
   sudo install -m 0644 "$ROOT_DIR/config/hive.yaml" "$CONFIG_DIR/hive.yaml"
 fi
+
+# Install SY.architect handbook (always overwrite — static doc, not runtime data).
+handbook_src=""
+for candidate in \
+  "$ROOT_DIR/docs/onworking COA/archi/handbook_fluxbee.md" \
+  "$ROOT_DIR/docs/onworking COA/handbook_fluxbee.md"
+do
+  if [[ -f "$candidate" ]]; then
+    handbook_src="$candidate"
+    break
+  fi
+done
+if [[ -n "$handbook_src" ]]; then
+  sudo install -m 0644 "$handbook_src" "$CONFIG_DIR/handbook_fluxbee.md"
+  echo "Installed architect handbook to $CONFIG_DIR/handbook_fluxbee.md"
+else
+  echo "Warning: handbook_fluxbee.md not found in repo docs/; skipping." >&2
+fi
+
+# Seed SY.architect cookbooks — never overwrite existing data (preserves live patterns).
+seed_cookbook_if_missing() {
+  local src="$1"
+  local dst="$2"
+  if [[ ! -f "$src" ]]; then
+    echo "Warning: cookbook seed not found: $src; skipping." >&2
+    return
+  fi
+  if [[ -f "$dst" && -s "$dst" ]]; then
+    echo "Preserving existing cookbook: $dst"
+    return
+  fi
+  sudo install -m 0644 "$src" "$dst"
+  echo "Seeded cookbook: $dst"
+}
+seed_cookbook_if_missing \
+  "$ROOT_DIR/seeds/cookbook/design_cookbook_v1.json" \
+  "$STATE_DIR/state/cookbook/design_cookbook_v1.json"
+seed_cookbook_if_missing \
+  "$ROOT_DIR/seeds/cookbook/artifact_cookbook_v1.json" \
+  "$STATE_DIR/state/cookbook/artifact_cookbook_v1.json"
+seed_cookbook_if_missing \
+  "$ROOT_DIR/seeds/cookbook/plan_compile_cookbook_v1.json" \
+  "$STATE_DIR/state/cookbook/plan_compile_cookbook_v1.json"
+seed_cookbook_if_missing \
+  "$ROOT_DIR/seeds/cookbook/repair_cookbook_v1.json" \
+  "$STATE_DIR/state/cookbook/repair_cookbook_v1.json"
 
 if [[ -f "$ROOT_DIR/config/sy-config-routes.yaml" ]]; then
   sudo install -m 0644 "$ROOT_DIR/config/sy-config-routes.yaml" "$CONFIG_DIR/sy-config-routes.yaml"

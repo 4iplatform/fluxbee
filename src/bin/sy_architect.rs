@@ -254,6 +254,9 @@ struct LegacyPlanCompileCookbookEntry {
 const LEGACY_PLAN_COMPILE_COOKBOOK_PATH: &str = "plan_compile/cookbook-v1.json";
 const PLAN_COMPILE_COOKBOOK_MAX_ENTRIES: usize = 50;
 const HANDBOOK_CANDIDATE_PATHS: &[&str] = &[
+    // Production path — installed by install.sh to /etc/fluxbee/
+    "/etc/fluxbee/handbook_fluxbee.md",
+    // Dev paths — relative to repo root (used when CWD = repo)
     "docs/onworking COA/archi/handbook_fluxbee.md",
     "docs/onworking COA/handbook_fluxbee.md",
 ];
