@@ -242,16 +242,6 @@ struct AdminActionsCache {
 
 const ADMIN_ACTIONS_CACHE_TTL_MS: u64 = 300_000; // 5 minutes
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LegacyPlanCompileCookbookEntry {
-    task_pattern: String,
-    trigger: String,
-    steps_pattern: Vec<String>,
-    notes: String,
-    recorded_at_ms: u64,
-}
-
-const LEGACY_PLAN_COMPILE_COOKBOOK_PATH: &str = "plan_compile/cookbook-v1.json";
 const PLAN_COMPILE_COOKBOOK_MAX_ENTRIES: usize = 50;
 const HANDBOOK_CANDIDATE_PATHS: &[&str] = &[
     // Production path — installed by install.sh to /etc/fluxbee/
@@ -1694,10 +1684,6 @@ fn artifact_cookbook_path(state_dir: &Path) -> PathBuf {
     state_dir.join(cookbook_paths::ARTIFACT)
 }
 
-fn legacy_plan_compile_cookbook_path(state_dir: &Path) -> PathBuf {
-    state_dir.join(LEGACY_PLAN_COMPILE_COOKBOOK_PATH)
-}
-
 fn sanitize_pattern_key(seed: &str) -> String {
     let mut key = seed
         .chars()
@@ -1720,30 +1706,6 @@ fn sanitize_pattern_key(seed: &str) -> String {
     }
 }
 
-fn legacy_plan_compile_entry_to_v2(entry: LegacyPlanCompileCookbookEntry) -> CookbookEntryV2 {
-    CookbookEntryV2 {
-        layer: CookbookLayer::PlanCompile,
-        pattern_key: format!(
-            "{}_{}",
-            sanitize_pattern_key(&entry.task_pattern),
-            entry.recorded_at_ms
-        ),
-        trigger: entry.trigger,
-        inputs_signature: json!({
-            "task_pattern": entry.task_pattern,
-        }),
-        successful_shape: json!({
-            "steps_pattern": entry.steps_pattern,
-            "notes": entry.notes,
-        }),
-        constraints: vec![],
-        do_not_repeat: vec![],
-        failure_class: None,
-        recorded_from_run: None,
-        seed_kind: "observed".to_string(),
-    }
-}
-
 fn normalize_plan_compile_cookbook_entry(mut entry: CookbookEntryV2) -> CookbookEntryV2 {
     entry.layer = CookbookLayer::PlanCompile;
     entry.pattern_key = sanitize_pattern_key(&entry.pattern_key);
@@ -1760,11 +1722,6 @@ fn parse_plan_compile_cookbook_entry(value: &Value) -> Option<CookbookEntryV2> {
     serde_json::from_value::<CookbookEntryV2>(value.clone())
         .ok()
         .map(normalize_plan_compile_cookbook_entry)
-        .or_else(|| {
-            serde_json::from_value::<LegacyPlanCompileCookbookEntry>(value.clone())
-                .ok()
-                .map(legacy_plan_compile_entry_to_v2)
-        })
 }
 
 fn normalize_artifact_cookbook_entry(mut entry: CookbookEntryV2) -> CookbookEntryV2 {
@@ -1810,35 +1767,6 @@ fn ensure_plan_compile_cookbook_dir(state_dir: &Path) {
         }
     }
 
-    let legacy_path = legacy_plan_compile_cookbook_path(state_dir);
-    if !legacy_path.exists() {
-        return;
-    }
-    if let Ok(existing) = std::fs::read(&path) {
-        if serde_json::from_slice::<Vec<CookbookEntryV2>>(&existing)
-            .map(|entries| !entries.is_empty())
-            .unwrap_or(false)
-        {
-            return;
-        }
-    }
-
-    let migrated = std::fs::read(&legacy_path)
-        .ok()
-        .and_then(|bytes| {
-            serde_json::from_slice::<Vec<LegacyPlanCompileCookbookEntry>>(&bytes).ok()
-        })
-        .map(|entries| {
-            entries
-                .into_iter()
-                .map(legacy_plan_compile_entry_to_v2)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if migrated.is_empty() {
-        return;
-    }
-    write_plan_compile_cookbook(state_dir, &migrated);
 }
 
 fn ensure_artifact_cookbook_dir(state_dir: &Path) {
@@ -2409,7 +2337,7 @@ Every resource you declare must include an `ownership` field:
 ## Runtime package_source rules
 
 Every runtime in desired_state.runtimes must declare `package_source`:
-- `"package_source": "inline_package"` — the programmer agent will generate the package files (package.json, config, prompts). Use this for NEW runtimes being created for this solution.
+- `"package_source": "inline_package"` — the real_programmer agent will generate the package files (package.json, config, prompts). Use this for NEW runtimes being created for this solution.
 - `"package_source": "pre_published"` — the runtime already exists in the hive and is materialized. No artifact generation needed. Use ONLY when the runtime is already confirmed to exist.
 - `"package_source": "bundle_upload"` — the programmer generates files but the host will zip and upload the bundle. Use when the package is too large for inline generation.
 
@@ -18890,43 +18818,6 @@ mod tests {
         let dir = test_temp_dir("plan-compile-path");
         let path = plan_compile_cookbook_path(&dir);
         assert_eq!(path, dir.join(cookbook_paths::PLAN_COMPILE));
-    }
-
-    #[test]
-    fn ensure_plan_compile_cookbook_dir_migrates_legacy_entries_to_canonical_shape() {
-        let dir = test_temp_dir("plan-compile-migrate");
-        let legacy_path = legacy_plan_compile_cookbook_path(&dir);
-        std::fs::create_dir_all(legacy_path.parent().expect("legacy parent")).expect("legacy dir");
-        let legacy = vec![LegacyPlanCompileCookbookEntry {
-            task_pattern: "publish runtime and run node".to_string(),
-            trigger: "quiero desplegar un runtime".to_string(),
-            steps_pattern: vec![
-                "publish_runtime_package".to_string(),
-                "run_node".to_string(),
-            ],
-            notes: "publish before run".to_string(),
-            recorded_at_ms: 42,
-        }];
-        std::fs::write(
-            &legacy_path,
-            serde_json::to_vec(&legacy).expect("legacy json"),
-        )
-        .expect("legacy write");
-
-        ensure_plan_compile_cookbook_dir(&dir);
-
-        let entries = read_plan_compile_cookbook(&dir);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].layer, CookbookLayer::PlanCompile);
-        assert_eq!(entries[0].trigger, "quiero desplegar un runtime");
-        assert_eq!(
-            entries[0].successful_shape["steps_pattern"],
-            json!(["publish_runtime_package", "run_node"])
-        );
-        assert_eq!(
-            plan_compile_cookbook_path(&dir),
-            dir.join(cookbook_paths::PLAN_COMPILE)
-        );
     }
 
     #[test]
