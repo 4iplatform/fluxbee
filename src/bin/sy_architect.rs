@@ -3621,22 +3621,18 @@ impl FunctionTool for PlanCompilerTool {
             parameters_json_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
-                "anyOf": [
-                    { "required": ["task", "hive"] },
-                    { "required": ["delta_report"] }
-                ],
                 "properties": {
                     "task": {
                         "type": "string",
-                        "description": "DEPRECATED free-form path. Clear description of what needs to be deployed or configured. Include node names, runtime names, hive, and topology intent."
+                        "description": "DEPRECATED free-form path. Provide either this field (with hive) OR delta_report — not both. Clear description of what needs to be deployed or configured."
                     },
                     "hive": {
                         "type": "string",
-                        "description": "Primary target hive for the deployment. Optional when delta_report is present; defaults to the current architect hive."
+                        "description": "Primary target hive for the deployment. Required when using free-form task path; optional when delta_report is present."
                     },
                     "delta_report": {
                         "type": "object",
-                        "description": "Canonical pipeline input. Deterministic delta_report to translate into executor steps."
+                        "description": "Canonical pipeline input. Deterministic delta_report to translate into executor steps. Provide either this OR task+hive."
                     },
                     "approved_artifacts": {
                         "type": "array",
@@ -3649,7 +3645,7 @@ impl FunctionTool for PlanCompilerTool {
                         "type": "string",
                         "description": "Optional. Any known state: which runtimes are already published, which nodes are already running, constraints the plan_compiler should respect."
                     }
-                },
+                }
             }),
         }
     }
