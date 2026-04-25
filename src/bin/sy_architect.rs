@@ -614,6 +614,8 @@ struct PlanCompileTrace {
     step_count: usize,
     validation: String,
     first_validation_error: Option<String>,
+    tokens_used: u32,
+    token_budget: u32,
 }
 
 struct PlanCompilePending {
@@ -2852,21 +2854,18 @@ impl FunctionTool for PlanCompilerTool {
         let output = execution.output;
         let trace = execution.trace;
         let step_count = trace.step_count;
-        let plan_steps: Vec<Value> = trace
-            .steps
-            .iter()
-            .map(|step| {
-                json!({
-                    "id": step.id,
-                    "action": step.action,
-                    "args_preview": step.args_preview,
-                })
-            })
-            .collect();
+        let trace_value = plan_compile_trace_to_value(&trace);
+        let plan_steps: Vec<Value> = trace_value
+            .get("steps")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
 
         // Capture before trace is moved into the pending plan.
         let tool_result_validation = trace.validation.clone();
         let tool_result_first_error = trace.first_validation_error.clone();
+        let tool_result_tokens_used = trace.tokens_used;
+        let tool_result_token_budget = trace.token_budget;
 
         let pending = PlanCompilePending {
             plan: output.plan.clone(),
@@ -2886,6 +2885,12 @@ impl FunctionTool for PlanCompilerTool {
             "plan_steps": plan_steps,
             "validation": tool_result_validation,
             "first_validation_error": tool_result_first_error,
+            "plan_compile_trace": trace_value,
+            "token_usage": {
+                "plan_compile": tool_result_tokens_used,
+                "total": tool_result_tokens_used,
+                "budget": tool_result_token_budget,
+            },
         }))
     }
 }
@@ -2907,6 +2912,7 @@ fn build_plan_compile_trace(
     hive: &str,
     plan: &Value,
     first_validation_error: Option<String>,
+    tokens_used: u32,
 ) -> PlanCompileTrace {
     let validation_label = if first_validation_error.is_some() {
         "ok_after_retry"
@@ -2977,7 +2983,26 @@ fn build_plan_compile_trace(
         step_count,
         validation: validation_label.to_string(),
         first_validation_error,
+        tokens_used,
+        token_budget: TASK_AGENT_TOKEN_BUDGET,
     }
+}
+
+fn plan_compile_trace_to_value(trace: &PlanCompileTrace) -> Value {
+    json!({
+        "task": trace.task,
+        "hive": trace.hive,
+        "steps": trace.steps.iter().map(|step| json!({
+            "id": step.id,
+            "action": step.action,
+            "args_preview": step.args_preview,
+        })).collect::<Vec<_>>(),
+        "step_count": trace.step_count,
+        "validation": trace.validation,
+        "first_validation_error": trace.first_validation_error,
+        "tokens_used": trace.tokens_used,
+        "token_budget": trace.token_budget,
+    })
 }
 
 async fn run_plan_compiler_transaction(
@@ -3036,7 +3061,13 @@ async fn run_plan_compiler_transaction(
         first_output
     };
 
-    let trace = build_plan_compile_trace(task, hive, &output.plan, first_validation_error);
+    let trace = build_plan_compile_trace(
+        task,
+        hive,
+        &output.plan,
+        first_validation_error,
+        output.tokens_used,
+    );
     Ok(PlanCompilerExecution { output, trace })
 }
 
@@ -5194,7 +5225,15 @@ async fn handle_chat_message(
                 )
                 .await
                 {
-                    Ok(output) => {
+                    Ok(mut output) => {
+                        if let Some(trace) = prog_pending.trace.as_ref() {
+                            output["plan_compile_trace"] = plan_compile_trace_to_value(trace);
+                            output["token_usage"] = json!({
+                                "plan_compile": trace.tokens_used,
+                                "total": trace.tokens_used,
+                                "budget": trace.token_budget,
+                            });
+                        }
                         if let Some(entry) = prog_pending.cookbook_entry {
                             append_plan_compile_cookbook_entry(&state.state_dir, entry);
                         }
@@ -5206,13 +5245,24 @@ async fn handle_chat_message(
                             session_title: Some(session.title.clone()),
                         }
                     }
-                    Err(err) => ChatResponse {
-                        status: "error".to_string(),
-                        mode: "executor".to_string(),
-                        output: json!({ "error": err.to_string() }),
-                        session_id: Some(resolved_session_id.clone()),
-                        session_title: Some(session.title.clone()),
-                    },
+                    Err(err) => {
+                        let mut output = json!({ "error": err.to_string() });
+                        if let Some(trace) = prog_pending.trace.as_ref() {
+                            output["plan_compile_trace"] = plan_compile_trace_to_value(trace);
+                            output["token_usage"] = json!({
+                                "plan_compile": trace.tokens_used,
+                                "total": trace.tokens_used,
+                                "budget": trace.token_budget,
+                            });
+                        }
+                        ChatResponse {
+                            status: "error".to_string(),
+                            mode: "executor".to_string(),
+                            output,
+                            session_id: Some(resolved_session_id.clone()),
+                            session_title: Some(session.title.clone()),
+                        }
+                    }
                 }
             } else {
                 match take_pending_action(state, &resolved_session_id).await {
@@ -6069,20 +6119,10 @@ async fn handle_ai_chat(
     let plan_compile_trace: Option<Value> = {
         let guard = state.plan_compile_pending.lock().await;
         guard.get(&session.session_id).and_then(|pending| {
-            pending.trace.as_ref().map(|trace| {
-                json!({
-                    "task": trace.task,
-                    "hive": trace.hive,
-                    "step_count": trace.step_count,
-                    "steps": trace.steps.iter().map(|s| json!({
-                        "id": s.id,
-                        "action": s.action,
-                        "args_preview": s.args_preview,
-                    })).collect::<Vec<_>>(),
-                    "validation": trace.validation,
-                    "first_validation_error": trace.first_validation_error,
-                })
-            })
+            pending
+                .trace
+                .as_ref()
+                .map(|trace| plan_compile_trace_to_value(trace))
         })
     };
 
@@ -11398,6 +11438,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
       gap: 8px;
       flex-wrap: wrap;
     }}
+    .exec-head-right {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }}
     .exec-title {{
       font-size: 0.94rem;
       font-weight: 700;
@@ -11407,6 +11454,17 @@ fn architect_index_html(state: &ArchitectState) -> String {
       font-size: 0.78rem;
       color: var(--muted);
       margin-top: 2px;
+    }}
+    .exec-token-chip {{
+      font-size: 0.72rem;
+      font-weight: 800;
+      border-radius: 999px;
+      padding: 6px 10px;
+      letter-spacing: 0.03em;
+      background: #eef4ff;
+      color: #1d4ed8;
+      text-transform: uppercase;
+      white-space: nowrap;
     }}
     .exec-steps {{
       display: grid;
@@ -12166,6 +12224,11 @@ fn architect_index_html(state: &ArchitectState) -> String {
       if (size < 1024 * 1024) return (size / 1024).toFixed(1).replace(/\.0$/, "") + " KB";
       return (size / (1024 * 1024)).toFixed(1).replace(/\.0$/, "") + " MB";
     }}
+    function formatTokenCount(value) {{
+      const n = Number(value || 0);
+      if (!Number.isFinite(n) || n <= 0) return "";
+      return Math.round(n).toLocaleString("es-AR");
+    }}
     function attachmentDisplayName(entry) {{
       if (!entry) return "attachment";
       return entry.filename || entry.name || "attachment";
@@ -12744,10 +12807,15 @@ fn architect_index_html(state: &ArchitectState) -> String {
       const badge = document.createElement("span");
       badge.className = "agent-trace-badge " + validationLabel;
       badge.textContent = isRetry ? "retried" : "valid";
+      const tokenBadge = document.createElement("span");
+      tokenBadge.className = "agent-trace-badge ok";
+      const tokenText = formatTokenCount(trace.tokens_used);
+      tokenBadge.textContent = tokenText ? tokenText + " tokens" : "";
 
       toggle.appendChild(icon);
       toggle.appendChild(label);
       toggle.appendChild(badge);
+      if (tokenText) toggle.appendChild(tokenBadge);
       wrapper.appendChild(toggle);
 
       const body = document.createElement("div");
@@ -13055,6 +13123,20 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
       return {{ designerTraces, designLoopTrace, artifactLoopTrace, planCompileTrace }};
     }}
+    function extractExecutorTokenUsage(data) {{
+      const output = data && data.output ? data.output : {{}};
+      if (output.token_usage && typeof output.token_usage === "object") {{
+        return output.token_usage;
+      }}
+      if (output.plan_compile_trace && typeof output.plan_compile_trace === "object") {{
+        const planTokens = Number(output.plan_compile_trace.tokens_used || 0);
+        const budget = Number(output.plan_compile_trace.token_budget || 0);
+        if (planTokens > 0) {{
+          return {{ plan_compile: planTokens, total: planTokens, budget }};
+        }}
+      }}
+      return null;
+    }}
     function renderExecutorResult(data) {{
       const output = data && data.output ? data.output : {{}};
       const payload = output.payload || {{}};
@@ -13071,6 +13153,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       const head = document.createElement("div");
       head.className = "exec-head";
       const titleBlock = document.createElement("div");
+      const headRight = document.createElement("div");
       const titleEl = document.createElement("div");
       titleEl.className = "exec-title";
       titleEl.textContent = "executor plan";
@@ -13088,11 +13171,22 @@ fn architect_index_html(state: &ArchitectState) -> String {
       subtitleEl.textContent = stepsText + (finalMessage ? " · " + finalMessage : "") + failedStep;
       titleBlock.appendChild(titleEl);
       titleBlock.appendChild(subtitleEl);
+      headRight.className = "exec-head-right";
+      const tokenUsage = extractExecutorTokenUsage(data);
+      const tokenTotal = tokenUsage ? Number(tokenUsage.total || tokenUsage.plan_compile || 0) : 0;
+      if (tokenTotal > 0) {{
+        const tokenChip = document.createElement("div");
+        tokenChip.className = "exec-token-chip";
+        const budgetText = tokenUsage && tokenUsage.budget ? " / " + formatTokenCount(tokenUsage.budget) : "";
+        tokenChip.textContent = "tokens " + formatTokenCount(tokenTotal) + budgetText;
+        headRight.appendChild(tokenChip);
+      }}
       const badge = document.createElement("div");
       badge.className = "result-status " + (isError ? "warn" : "ok");
       badge.textContent = overallStatus;
       head.appendChild(titleBlock);
-      head.appendChild(badge);
+      headRight.appendChild(badge);
+      head.appendChild(headRight);
       shell.appendChild(head);
 
       // if validation/pre-execution error
@@ -16518,18 +16612,7 @@ async fn handle_pipeline_plan_compile(
     let human_summary = output.human_summary.clone();
     let cookbook_entry = output.cookbook_entry.clone();
     let plan_compile_tokens = output.tokens_used;
-    let trace_value = json!({
-        "task": trace.task.clone(),
-        "hive": trace.hive.clone(),
-        "steps": trace.steps.iter().map(|step| json!({
-            "id": step.id,
-            "action": step.action,
-            "args_preview": step.args_preview,
-        })).collect::<Vec<_>>(),
-        "step_count": trace.step_count,
-        "validation": trace.validation.clone(),
-        "first_validation_error": trace.first_validation_error.clone(),
-    });
+    let trace_value = plan_compile_trace_to_value(&trace);
     let confirm2_payload = build_confirm2_payload(
         &pipeline_run.pipeline_run_id,
         &delta_report,
@@ -16792,18 +16875,7 @@ async fn compile_pipeline_plan_with_context(
     let human_summary = output.human_summary.clone();
     let cookbook_entry = output.cookbook_entry.clone();
     let plan_compile_tokens = output.tokens_used;
-    let trace_value = json!({
-        "task": trace.task.clone(),
-        "hive": trace.hive.clone(),
-        "steps": trace.steps.iter().map(|step| json!({
-            "id": step.id,
-            "action": step.action,
-            "args_preview": step.args_preview,
-        })).collect::<Vec<_>>(),
-        "step_count": trace.step_count,
-        "validation": trace.validation.clone(),
-        "first_validation_error": trace.first_validation_error.clone(),
-    });
+    let trace_value = plan_compile_trace_to_value(&trace);
     let total_tokens = design_tokens_used
         .saturating_add(artifact_tokens_used)
         .saturating_add(plan_compile_tokens);
@@ -18531,6 +18603,8 @@ mod tests {
             step_count: 2,
             validation: "ok".to_string(),
             first_validation_error: None,
+            tokens_used: 13_225,
+            token_budget: TASK_AGENT_TOKEN_BUDGET,
         };
 
         let payload = build_confirm2_payload("run-1", &delta, "2 steps", &trace);
