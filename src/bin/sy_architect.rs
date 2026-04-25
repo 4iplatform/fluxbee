@@ -130,9 +130,20 @@ If `fluxbee_start_pipeline` returns `status: "blocked_run_pending"`, the session
 
 If the operator's intent is clearly a different task than the blocked one, default to `discard` then start the new pipeline. Ask only when the choice is genuinely ambiguous.
 
+## The hive is a required input for every node command
+
+`run_node`, `start_node`, `restart_node`, `kill_node`, `node_control_config_set`, `set_node_config`, `add_route`, `add_vpn` — every node-or-topology command takes a `hive` (in path or args). Never call a planning tool for a node mutation without first knowing which hive the work targets. Resolve in this order:
+
+1. The operator named a hive explicitly → use it.
+2. The operator named an existing node like `AI.support@motherbee` → the hive is the suffix after `@`.
+3. The cluster has only one hive → use it, do not ask.
+4. The cluster has multiple hives and intent is genuinely ambiguous → ask once which hive.
+
+When unsure how many hives exist, call `fluxbee_system_get` on `/inventory/summary` or `/hives` first. Hive count is cheap to read and almost always disambiguates without bothering the operator.
+
 ## Asking questions — maximum one per task
 
-Do not ask multiple clarifying questions. If the task is reasonably clear, choose the correct planning tool without asking first. If one critical piece is truly missing and cannot be inferred (e.g., which `tenant_id` for a new multi-tenant node), ask exactly one specific question. Never ask several things at once.
+Do not ask multiple clarifying questions. If the task is reasonably clear, choose the correct planning tool without asking first. If one critical piece is truly missing and cannot be inferred (e.g., which `tenant_id` for a new multi-tenant node, or which hive when several exist), ask exactly one specific question. Never ask several things at once.
 
 ## General
 
@@ -15350,7 +15361,7 @@ async fn apply_pipeline_action_with_context(
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
     match action {
-        "discard" | "cancel_pipeline" => {
+        "discard" => {
             advance_pipeline_run_with_context(
                 context,
                 &run_id,
@@ -15409,7 +15420,7 @@ async fn apply_pipeline_action_with_context(
                 ),
             }))
         }
-        "retry" | "fix_manifest_and_retry" => {
+        "retry" => {
             let target_stage = retry_target_stage_for(pre_block_stage.as_ref())
                 .map_err(|err| -> ArchitectError { err.into() })?;
             advance_pipeline_run_with_context(
@@ -15422,18 +15433,21 @@ async fn apply_pipeline_action_with_context(
                 })),
             )
             .await?;
-            let confirm_label = match target_stage {
-                PipelineStage::Confirm1 => "Confirm1",
-                PipelineStage::Confirm2 => "Confirm2",
-                _ => "Confirm",
+            let (confirm_label, confirm_payload_key) = match target_stage {
+                PipelineStage::Confirm1 => ("Confirm1", "confirm1_summary"),
+                PipelineStage::Confirm2 => ("Confirm2", "confirm2_payload"),
+                _ => ("Confirm", "confirm1_summary"),
             };
+            let confirm_payload = run_state.get(confirm_payload_key).cloned();
             Ok(json!({
                 "status": "ok",
                 "action": "retry",
                 "pipeline_run_id": run_id,
                 "stage": target_stage,
+                "confirm_label": confirm_label,
+                "confirm_payload": confirm_payload,
                 "message": format!(
-                    "Pipeline {run_id} returned to {confirm_label}. Reply CONFIRM to re-engage execution."
+                    "Pipeline {run_id} returned to {confirm_label}. Re-show the confirm payload to the operator and ask for CONFIRM to re-engage execution."
                 ),
             }))
         }

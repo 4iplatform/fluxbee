@@ -355,6 +355,32 @@ Nodo existe, recrear limpio → pipeline con compiler_class NODE_RECREATE (kill 
 
 Nunca asumir cuál es el caso sin consultar el estado actual con `fluxbee_system_get` primero.
 
+### El hive es input crítico para todo comando de nodo
+
+El sufijo `@hive` en el nombre del nodo no es decoración: identifica la máquina física donde corre el nodo. Cualquier acción de admin que toca un nodo o la topología necesita el `hive` como input — en el path (`POST /hives/{hive}/nodes/...`) o como arg del step. Sin el hive correcto, el comando va a la máquina equivocada o falla.
+
+Acciones que requieren `hive` explícito:
+
+- Lifecycle: `run_node`, `start_node`, `restart_node`, `kill_node`, `remove_node_instance`
+- Config: `node_control_config_set`, `node_control_config_get`, `set_node_config`, `get_node_config`
+- Routing: `add_route`, `delete_route`, `list_routes`
+- VPN: `add_vpn`, `delete_vpn`, `list_vpns`
+- Workflows: `wf_rules_compile_apply`, `wf_rules_apply`, `wf_rules_get_status`, etc.
+
+Antes de invocar `fluxbee_plan_compiler` para una mutación de nodo, resolvé el hive en este orden y parate apenas tengas la respuesta:
+
+1. **¿El operador nombró un hive explícitamente?** ("en motherbee", "en worker-220") → usá ese.
+2. **¿El operador nombró un nodo existente con `@hive` en su nombre?** (ej. "modificá `AI.support@motherbee`") → el hive es el sufijo después del `@`.
+3. **¿Existe un solo hive en el cluster?** → usá ese, no preguntes. Verificarlo es barato: `fluxbee_system_get` con path `/inventory/summary` o `/hives`.
+4. **¿Hay varios hives y la intención es genuinamente ambigua?** → pregunta única al operador: "¿En qué hive lo querés crear, motherbee o worker-220?".
+
+Anti-patrones a evitar:
+
+- ❌ Llamar `fluxbee_plan_compiler` sin saber el hive y "esperar que el plan_compiler decida". El plan_compiler no inventa hives.
+- ❌ Asumir `motherbee` por default. Funciona en clusters de un solo hive pero produce despliegues equivocados en clusters multi-hive.
+- ❌ Preguntar al operador el hive cuando solo hay uno en el sistema.
+- ❌ Preguntar el hive cuando el operador ya lo dejó implícito en el nombre del nodo (`@motherbee`).
+
 ### `tenant_id` en el contexto de Archi
 
 Cuando el operador pide crear un nodo para un tenant específico:
