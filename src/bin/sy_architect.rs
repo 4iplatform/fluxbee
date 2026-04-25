@@ -120,6 +120,16 @@ If the operator's mutation intent is clear, call `fluxbee_plan_compiler` directl
 - After `fluxbee_start_pipeline` returns, call NO more tools. Present its returned `message` verbatim. If it produced an executor plan, the next CONFIRM approves execution. If it blocked before a plan, explain the blocker and next option.
 - After `fluxbee_plan_compiler` returns a plan, call NO more tools. Present the `human_summary` and end with "Reply CONFIRM to execute or CANCEL to discard." Only the literal word CONFIRM triggers execution. Never call `fluxbee_plan_compiler` more than once per task.
 
+## Resolving a blocked pipeline
+
+If `fluxbee_start_pipeline` returns `status: "blocked_run_pending"`, the session has a previous pipeline stuck in `Blocked` state. Do NOT just retry `fluxbee_start_pipeline` — it will keep returning the same status. Instead, present the three options to the operator and call `fluxbee_pipeline_action` with their choice:
+
+- `discard` — drop the blocked run, then call `fluxbee_start_pipeline` again for the new task.
+- `restart_from_design` — close the blocked run and re-run the same task from Design (returns a fresh Confirm1 payload).
+- `retry` — return the blocked run to its last CONFIRM checkpoint so the operator can re-engage execution with a CONFIRM message.
+
+If the operator's intent is clearly a different task than the blocked one, default to `discard` then start the new pipeline. Ask only when the choice is genuinely ambiguous.
+
 ## Asking questions — maximum one per task
 
 Do not ask multiple clarifying questions. If the task is reasonably clear, choose the correct planning tool without asking first. If one critical piece is truly missing and cannot be inferred (e.g., which `tenant_id` for a new multi-tenant node), ask exactly one specific question. Never ask several things at once.
@@ -733,6 +743,7 @@ impl FunctionToolProvider for ArchitectAdminReadToolsProvider {
     fn register_tools(&self, registry: &mut FunctionToolRegistry) -> fluxbee_ai_sdk::Result<()> {
         registry.register(Arc::new(ArchitectSystemGetTool::new(self.context.clone())))?;
         registry.register(Arc::new(StartPipelineTool::new(self.context.clone())))?;
+        registry.register(Arc::new(PipelineActionTool::new(self.context.clone())))?;
         registry.register(Arc::new(PlanCompilerTool::new(self.context.clone())))
     }
 }
@@ -1922,6 +1933,33 @@ impl FunctionTool for StartPipelineTool {
                     ))
                 })?
         {
+            // Blocked runs need explicit operator action — surface options instead of just erroring.
+            if existing.status == PipelineRunStatus::Blocked {
+                let state_obj = pipeline_state_from_run(&existing);
+                let blocked_reason = state_obj
+                    .get("blocked_reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let blocked_failure_class = state_obj
+                    .get("blocked_failure_class")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                return Ok(json!({
+                    "status": "blocked_run_pending",
+                    "pipeline_run_id": existing.pipeline_run_id,
+                    "blocked_failure_class": blocked_failure_class,
+                    "blocked_reason": blocked_reason,
+                    "operator_options": [
+                        "discard",
+                        "restart_from_design",
+                        "retry",
+                    ],
+                    "message": format!(
+                        "There is a blocked pipeline run '{}' in this session that must be resolved first. Call fluxbee_pipeline_action with one of: 'discard' (drop it and start fresh), 'restart_from_design' (close this one and re-design from scratch), or 'retry' (return to the last confirmation checkpoint and re-engage).",
+                        existing.pipeline_run_id
+                    ),
+                }));
+            }
             return Err(fluxbee_ai_sdk::AiSdkError::Protocol(format!(
                 "session already has an active pipeline run '{}' at stage '{}'; resolve it before starting a new pipeline",
                 existing.pipeline_run_id, existing.current_stage
@@ -1937,6 +1975,65 @@ impl FunctionTool for StartPipelineTool {
         )
         .await
         .map_err(|err| fluxbee_ai_sdk::AiSdkError::Protocol(err.to_string()))
+    }
+}
+
+struct PipelineActionTool {
+    context: ArchitectAdminToolContext,
+}
+
+impl PipelineActionTool {
+    fn new(context: ArchitectAdminToolContext) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl FunctionTool for PipelineActionTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "fluxbee_pipeline_action".to_string(),
+            description: "Resolve a blocked pipeline run in the current session. Use after fluxbee_start_pipeline reports a blocked_run_pending, or whenever the operator wants to act on a stuck pipeline. Three actions: 'discard' closes the blocked run and frees the session; 'restart_from_design' closes it and starts a new pipeline with the same task from scratch; 'retry' returns the run to the last confirmation checkpoint (Confirm1 or Confirm2) so the operator can re-engage it with a CONFIRM message.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["action"],
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["discard", "restart_from_design", "retry"],
+                        "description": "Operator-chosen resolution for the blocked pipeline."
+                    },
+                    "pipeline_run_id": {
+                        "type": "string",
+                        "description": "Optional explicit blocked pipeline_run_id. When omitted, the latest blocked run in this session is used."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let session_id = require_session_id(&self.context, "fluxbee_pipeline_action")?;
+        let action = arguments
+            .get("action")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(
+                    "fluxbee_pipeline_action requires 'action'".to_string(),
+                )
+            })?;
+        let run_id = arguments
+            .get("pipeline_run_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        apply_pipeline_action_with_context(&self.context, session_id, run_id, action)
+            .await
+            .map_err(|err| fluxbee_ai_sdk::AiSdkError::Protocol(err.to_string()))
     }
 }
 
@@ -15076,6 +15173,11 @@ async fn block_pipeline_run(
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_else(|| format!("{failure_class:?}"));
+    let pre_block_stage = load_pipeline_run(state, run_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|run| run.current_stage);
     advance_pipeline_run(
         state,
         run_id,
@@ -15083,6 +15185,7 @@ async fn block_pipeline_run(
         Some(serde_json::json!({
             "blocked_reason": reason,
             "blocked_failure_class": class_str,
+            "pre_block_stage": pre_block_stage,
         })),
     )
     .await?;
@@ -15119,6 +15222,11 @@ async fn block_pipeline_run_with_context(
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_else(|| format!("{failure_class:?}"));
+    let pre_block_stage = load_pipeline_run_with_context(context, run_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|run| run.current_stage);
     let updated = advance_pipeline_run_with_context(
         context,
         run_id,
@@ -15126,6 +15234,7 @@ async fn block_pipeline_run_with_context(
         Some(json!({
             "blocked_reason": reason,
             "blocked_failure_class": class_str,
+            "pre_block_stage": pre_block_stage,
         })),
     )
     .await?;
@@ -15136,6 +15245,203 @@ async fn block_pipeline_run_with_context(
         "pipeline run blocked"
     );
     Ok(updated)
+}
+
+/// Resolve the active blocked pipeline run for a session — returns most recent if any.
+async fn latest_blocked_pipeline_run_for_session(
+    context: &ArchitectAdminToolContext,
+    session_id: &str,
+) -> Result<Option<PipelineRunRecord>, ArchitectError> {
+    if let Some(run) = context
+        .active_pipeline_runs
+        .lock()
+        .await
+        .values()
+        .filter(|run| {
+            run.session_id == session_id && run.status == PipelineRunStatus::Blocked
+        })
+        .cloned()
+        .max_by_key(|run| (run.updated_at_ms, run.created_at_ms))
+    {
+        return Ok(Some(run));
+    }
+    Ok(
+        list_pipeline_runs_for_session_by_hive(&context.hive_id, session_id)
+            .await?
+            .into_iter()
+            .rev()
+            .find(|run| run.status == PipelineRunStatus::Blocked),
+    )
+}
+
+/// Resolve a blocked run by id (preferred) or by session (latest blocked).
+async fn resolve_blocked_pipeline_run(
+    context: &ArchitectAdminToolContext,
+    session_id: &str,
+    run_id: Option<&str>,
+) -> Result<PipelineRunRecord, ArchitectError> {
+    if let Some(id) = run_id.filter(|s| !s.trim().is_empty()) {
+        let run = load_pipeline_run_with_context(context, id)
+            .await?
+            .ok_or_else(|| -> ArchitectError {
+                format!("pipeline run '{id}' not found").into()
+            })?;
+        if run.session_id != session_id {
+            return Err(format!(
+                "pipeline run '{id}' does not belong to this session"
+            )
+            .into());
+        }
+        if run.status != PipelineRunStatus::Blocked {
+            return Err(format!(
+                "pipeline run '{id}' is in status '{:?}', not 'blocked'; pipeline_action only operates on blocked runs",
+                run.status
+            )
+            .into());
+        }
+        return Ok(run);
+    }
+    latest_blocked_pipeline_run_for_session(context, session_id)
+        .await?
+        .ok_or_else(|| -> ArchitectError {
+            "no blocked pipeline run in this session to act on"
+                .to_string()
+                .into()
+        })
+}
+
+/// Map a `pre_block_stage` to the CONFIRM checkpoint where retry should park the run.
+/// Pure for unit testing.
+fn retry_target_stage_for(pre_block_stage: Option<&PipelineStage>) -> Result<PipelineStage, String> {
+    match pre_block_stage {
+        Some(PipelineStage::Reconcile)
+        | Some(PipelineStage::ArtifactLoop)
+        | Some(PipelineStage::PlanCompile)
+        | Some(PipelineStage::PlanValidation)
+        | Some(PipelineStage::Design)
+        | Some(PipelineStage::DesignAudit)
+        | Some(PipelineStage::Confirm1) => Ok(PipelineStage::Confirm1),
+        Some(PipelineStage::Execute)
+        | Some(PipelineStage::Verify)
+        | Some(PipelineStage::Confirm2) => Ok(PipelineStage::Confirm2),
+        Some(other) => Err(format!(
+            "cannot retry from stage '{other:?}' — restart_from_design or discard instead"
+        )),
+        None => Err(
+            "blocked pipeline has no recorded pre_block_stage; use restart_from_design or discard"
+                .to_string(),
+        ),
+    }
+}
+
+/// Apply one of the operator-options actions to a blocked pipeline run.
+/// `action` must be one of: "discard", "restart_from_design", "retry".
+async fn apply_pipeline_action_with_context(
+    context: &ArchitectAdminToolContext,
+    session_id: &str,
+    run_id: Option<&str>,
+    action: &str,
+) -> Result<Value, ArchitectError> {
+    let run = resolve_blocked_pipeline_run(context, session_id, run_id).await?;
+    let run_id = run.pipeline_run_id.clone();
+    let run_state = pipeline_state_from_run(&run);
+    let pre_block_stage: Option<PipelineStage> = run_state
+        .get("pre_block_stage")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+    match action {
+        "discard" | "cancel_pipeline" => {
+            advance_pipeline_run_with_context(
+                context,
+                &run_id,
+                PipelineStage::Failed,
+                Some(json!({
+                    "discarded_by_operator": true,
+                    "discarded_at_ms": now_epoch_ms(),
+                })),
+            )
+            .await?;
+            Ok(json!({
+                "status": "ok",
+                "action": "discard",
+                "pipeline_run_id": run_id,
+                "message": format!(
+                    "Pipeline run {run_id} discarded. You can start a new pipeline now."
+                ),
+            }))
+        }
+        "restart_from_design" => {
+            let task = run_state
+                .get("task")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| -> ArchitectError {
+                    format!("blocked pipeline run '{run_id}' has no original task to restart from")
+                        .into()
+                })?;
+            let solution_id = run.solution_id.clone();
+            advance_pipeline_run_with_context(
+                context,
+                &run_id,
+                PipelineStage::Failed,
+                Some(json!({
+                    "discarded_by_operator": true,
+                    "discarded_for_restart": true,
+                    "discarded_at_ms": now_epoch_ms(),
+                })),
+            )
+            .await?;
+            let restart = execute_pipeline_start_with_context(
+                context,
+                session_id,
+                &task,
+                solution_id.as_deref(),
+                "",
+            )
+            .await?;
+            Ok(json!({
+                "status": "ok",
+                "action": "restart_from_design",
+                "previous_pipeline_run_id": run_id,
+                "restart_payload": restart,
+                "message": format!(
+                    "Previous pipeline {run_id} closed; new pipeline started from Design."
+                ),
+            }))
+        }
+        "retry" | "fix_manifest_and_retry" => {
+            let target_stage = retry_target_stage_for(pre_block_stage.as_ref())
+                .map_err(|err| -> ArchitectError { err.into() })?;
+            advance_pipeline_run_with_context(
+                context,
+                &run_id,
+                target_stage.clone(),
+                Some(json!({
+                    "retried_by_operator": true,
+                    "retried_at_ms": now_epoch_ms(),
+                })),
+            )
+            .await?;
+            let confirm_label = match target_stage {
+                PipelineStage::Confirm1 => "Confirm1",
+                PipelineStage::Confirm2 => "Confirm2",
+                _ => "Confirm",
+            };
+            Ok(json!({
+                "status": "ok",
+                "action": "retry",
+                "pipeline_run_id": run_id,
+                "stage": target_stage,
+                "message": format!(
+                    "Pipeline {run_id} returned to {confirm_label}. Reply CONFIRM to re-engage execution."
+                ),
+            }))
+        }
+        other => Err(format!(
+            "unknown pipeline action '{other}'; expected 'discard', 'restart_from_design', or 'retry'"
+        )
+        .into()),
+    }
 }
 
 /// On startup: mark any in_progress runs as interrupted so they surface for recovery.
@@ -19869,5 +20175,53 @@ mod tests {
             "must emit zero destructive/restarting ops when snapshot is partial-blocking; got: {:?}",
             destructive_ops.iter().map(|o| &o.compiler_class).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn retry_target_stage_pre_block_inner_stages_route_to_confirm1() {
+        use super::pipeline_types::PipelineStage;
+
+        for stage in [
+            PipelineStage::Reconcile,
+            PipelineStage::ArtifactLoop,
+            PipelineStage::PlanCompile,
+            PipelineStage::PlanValidation,
+            PipelineStage::Design,
+            PipelineStage::DesignAudit,
+            PipelineStage::Confirm1,
+        ] {
+            assert_eq!(
+                super::retry_target_stage_for(Some(&stage)).unwrap(),
+                PipelineStage::Confirm1,
+                "stage {stage:?} should retry at Confirm1",
+            );
+        }
+    }
+
+    #[test]
+    fn retry_target_stage_pre_block_execute_or_verify_routes_to_confirm2() {
+        use super::pipeline_types::PipelineStage;
+
+        for stage in [
+            PipelineStage::Execute,
+            PipelineStage::Verify,
+            PipelineStage::Confirm2,
+        ] {
+            assert_eq!(
+                super::retry_target_stage_for(Some(&stage)).unwrap(),
+                PipelineStage::Confirm2,
+                "stage {stage:?} should retry at Confirm2",
+            );
+        }
+    }
+
+    #[test]
+    fn retry_target_stage_terminal_or_missing_stage_errors() {
+        use super::pipeline_types::PipelineStage;
+
+        assert!(super::retry_target_stage_for(None).is_err());
+        assert!(super::retry_target_stage_for(Some(&PipelineStage::Failed)).is_err());
+        assert!(super::retry_target_stage_for(Some(&PipelineStage::Completed)).is_err());
+        assert!(super::retry_target_stage_for(Some(&PipelineStage::Blocked)).is_err());
     }
 }

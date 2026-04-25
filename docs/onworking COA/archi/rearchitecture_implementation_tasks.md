@@ -870,6 +870,16 @@ fn classify_failure_deterministic(
   - Host presents options: retry from this stage / go back to design / discard
 - Acceptance: UnknownResidual failure in artifact loop causes pipeline to pause and show operator escalation message
 
+Implementation status (Fase 2 close-out):
+
+- `block_pipeline_run` and `block_pipeline_run_with_context` now persist `pre_block_stage` in pipeline state, so retry knows which checkpoint to return to.
+- `fluxbee_pipeline_action` tool exposes the three operator options:
+  - `discard` — transitions Blocked → Failed, frees the session.
+  - `restart_from_design` — closes the blocked run as Failed and starts a fresh pipeline with the same task and `solution_id` from `Design`.
+  - `retry` — returns the run to its prior CONFIRM checkpoint (`Confirm1` for Reconcile/ArtifactLoop/PlanCompile/PlanValidation; `Confirm2` for Execute/Verify) so the operator can re-engage with a CONFIRM message.
+- `fluxbee_start_pipeline` no longer hard-errors when a Blocked run exists: it returns `status: "blocked_run_pending"` with the three options inline so Archi can prompt the operator and call `fluxbee_pipeline_action`.
+- ARCHI_SYSTEM_PROMPT documents the resolution flow under "Resolving a blocked pipeline".
+
 ---
 
 ## Track F — Seed Data Preparation
