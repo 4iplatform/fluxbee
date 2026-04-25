@@ -211,7 +211,7 @@ struct AdminActionsCache {
 }
 
 const ADMIN_ACTIONS_CACHE_TTL_MS: u64 = 300_000; // 5 minutes
-const TASK_AGENT_TOKEN_BUDGET: u32 = 5_000;
+const TASK_AGENT_TOKEN_BUDGET: u32 = 50_000;
 
 #[derive(Debug, Clone)]
 struct TaskTokenBudget {

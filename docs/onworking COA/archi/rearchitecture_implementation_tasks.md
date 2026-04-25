@@ -1346,9 +1346,11 @@ Acceptance: una tarea compleja clara no requiere intervención humana entre `flu
 
 ## Track J — Token budget por tarea
 
-**Objetivo:** Cada tarea tiene un presupuesto de 5000 tokens para todos los agentes invocados (sin contar Archi). Si se supera, los loops retornan error estructurado sin preguntar al operador.
+**Objetivo:** Cada tarea tiene un presupuesto de 50.000 tokens para todos los agentes invocados (sin contar Archi). Si se supera, los loops retornan error estructurado sin preguntar al operador.
 
-**Constante inicial:** `TASK_AGENT_TOKEN_BUDGET: u32 = 5_000` — hardcodeada. Cuando esté estable se expone en CONFIG SET/GET del nodo SY.architect.
+**Constante inicial:** `TASK_AGENT_TOKEN_BUDGET: u32 = 50_000` — hardcodeada. Cuando esté estable se expone en CONFIG SET/GET del nodo SY.architect.
+
+**Nota 2026-04-25:** el valor inicial de `5_000` era demasiado bajo porque `usage.total_tokens` incluye prompt, tool schemas, contexto, tool calls y respuesta. Un plan directo simple de `run_node` ya consumió `13.225` tokens en el primer intento, por lo que el límite se elevó a `50_000`.
 
 ### [x] TJ-1 — Capturar tokens usados por cada llamada AI
 
@@ -1368,7 +1370,7 @@ Acceptance: cada llamada a `run_with_input` retorna `tokens_used` en su resultad
 Agregar en `sy_architect.rs`:
 
 ```rust
-pub const TASK_AGENT_TOKEN_BUDGET: u32 = 5_000;
+pub const TASK_AGENT_TOKEN_BUDGET: u32 = 50_000;
 
 ```
 
@@ -1383,12 +1385,12 @@ En los loops que invocan agentes (design loop, artifact loop, plan_compile):
 - Antes de cada invocación de agente, verificar `accumulated_tokens < TASK_AGENT_TOKEN_BUDGET`
 - Si se supera: retornar `FailureClass::UnknownResidual` con mensaje:
   ```json
-  { "error": "BUDGET_EXCEEDED", "tokens_used": N, "budget": 5000, "stage": "artifact_loop" }
+  { "error": "BUDGET_EXCEEDED", "tokens_used": N, "budget": 50000, "stage": "artifact_loop" }
   ```
 
 - No preguntar al operador — solo reportar
 
-Acceptance: un loop que gasta más de 5000 tokens se detiene con error explícito sin iteraciones adicionales.
+Acceptance: un loop que gasta más de 50.000 tokens se detiene con error explícito sin iteraciones adicionales.
 
 ### [x] TJ-4 — Incluir token usage en el reporte de tarea al operador
 
@@ -1396,7 +1398,7 @@ Cuando una tarea completa (éxito o fallo), incluir en el mensaje al operador:
 
 ```
 
-Tokens usados: 1.847 / 5.000
+Tokens usados: 13.225 / 50.000
 Agentes involucrados: designer (412t), design_auditor (289t), plan_compiler (1.146t)
 
 ```
@@ -1461,7 +1463,7 @@ Confirmar que el programmer no decide nada de topología — solo genera el arti
 
 ### [x] TK-7 — Reducir schemas embebidos en prompt de plan_compiler
 
-El `PLAN_COMPILER_SYSTEM_PROMPT` no debe inyectar el `request_contract` completo de las 66 acciones en cada run, porque compite con el budget de 5000 tokens. El prompt mantiene catálogo compacto y obliga a llamar `get_admin_action_help` antes de emitir steps.
+El `PLAN_COMPILER_SYSTEM_PROMPT` no debe inyectar el `request_contract` completo de las 66 acciones en cada run, porque compite con el budget de tarea. El prompt mantiene catálogo compacto y obliga a llamar `get_admin_action_help` antes de emitir steps.
 
 Acceptance: el plan_compiler recibe nombres/descripciones compactas y consulta help detallado bajo demanda.
 
