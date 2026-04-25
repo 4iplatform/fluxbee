@@ -61,12 +61,16 @@ pub struct FunctionModelTurnResponse {
     pub assistant_text: Option<String>,
     #[serde(default)]
     pub tool_calls: Vec<FunctionToolCall>,
+    #[serde(default)]
+    pub tokens_used: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionLoopRunResult {
     pub final_assistant_text: Option<String>,
     pub items: Vec<FunctionLoopItem>,
+    #[serde(default)]
+    pub tokens_used: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +164,7 @@ impl FunctionCallingRunner {
     ) -> Result<FunctionLoopRunResult> {
         let mut items = build_initial_items(input);
         let mut last_assistant_text = None;
+        let mut total_tokens_used: u32 = 0;
 
         for _ in 0..self.config.max_turns {
             let response = model
@@ -168,6 +173,8 @@ impl FunctionCallingRunner {
                     tools: tools.definitions(),
                 })
                 .await?;
+
+            total_tokens_used = total_tokens_used.saturating_add(response.tokens_used);
 
             let should_commit_assistant_text = response.tool_calls.is_empty();
             if should_commit_assistant_text {
@@ -181,6 +188,7 @@ impl FunctionCallingRunner {
                 return Ok(FunctionLoopRunResult {
                     final_assistant_text: last_assistant_text,
                     items,
+                    tokens_used: total_tokens_used,
                 });
             }
 
@@ -525,12 +533,14 @@ mod tests {
                         name: "demo_write".to_string(),
                         arguments: json!({"path":"/hives"}),
                     }],
+                    tokens_used: 0,
                 }),
                 _ => Ok(FunctionModelTurnResponse {
                     assistant_text: Some(
                         "The tool failed, so there is nothing to confirm.".to_string(),
                     ),
                     tool_calls: Vec::new(),
+                    tokens_used: 0,
                 }),
             }
         }
@@ -553,6 +563,7 @@ mod tests {
             Ok(FunctionModelTurnResponse {
                 assistant_text: Some("ok".to_string()),
                 tool_calls: Vec::new(),
+                tokens_used: 0,
             })
         }
     }

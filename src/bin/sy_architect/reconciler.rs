@@ -53,19 +53,6 @@ pub fn validate_manifest_sections(manifest: &SolutionManifestV2) -> Result<(), S
     Ok(())
 }
 
-// ── Helper: extract typed list from a JSON value ─────────────────────────────
-
-fn extract_list<T: serde::de::DeserializeOwned>(value: Option<&Vec<serde_json::Value>>) -> Vec<T> {
-    value
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| serde_json::from_value::<T>(item.clone()).ok())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn snapshot_item_values(payload: Option<&serde_json::Value>) -> Vec<serde_json::Value> {
     if let Some(arr) = payload.and_then(|v| v.as_array()) {
         return arr.clone();

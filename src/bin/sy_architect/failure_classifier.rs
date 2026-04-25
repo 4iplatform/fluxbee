@@ -11,7 +11,6 @@ use super::pipeline_types::{FailureClass, PipelineStage};
 pub struct FailureContext {
     pub stage: PipelineStage,
     pub error_code: Option<String>,
-    pub resource_type: Option<String>,
 }
 
 /// Attempt to classify a failure deterministically.
@@ -253,7 +252,6 @@ mod tests {
         FailureContext {
             stage,
             error_code: None,
-            resource_type: None,
         }
     }
 
@@ -261,7 +259,6 @@ mod tests {
         FailureContext {
             stage,
             error_code: Some(code.to_string()),
-            resource_type: None,
         }
     }
 

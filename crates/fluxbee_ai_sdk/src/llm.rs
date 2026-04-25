@@ -732,9 +732,16 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
             }
         }
 
+        let tokens_used = value
+            .get("usage")
+            .and_then(|u| u.get("total_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+
         Ok(FunctionModelTurnResponse {
             assistant_text,
             tool_calls,
+            tokens_used,
         })
     }
 }

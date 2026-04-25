@@ -115,6 +115,24 @@ Patrón: `TIPO.nombre@hive`
 }
 ```
 
+### Topologías multi-hive: cuándo usar worker-hive
+
+| Situación | Usar |
+| --- | --- |
+| Nodo de uso general, sirve a todos los tenants | `motherbee` |
+| Nodo con alta carga de cómputo o hardware especial | `worker-*` dedicado |
+| Nodo con aislamiento de tenant requerido | `worker-*` por tenant |
+
+Cuando el nodo destino es un `worker-*` que no existe aún, incluir en `desired_state.topology` la definición del hive y su VPN. Si el worker ya existe, omitir `topology`.
+
+### Naming convention para nodos IO con tenant
+
+Nodos IO de tenant único: `IO.slack@motherbee` (sin sufijo de tenant).
+
+Nodos IO multi-tenant (un nodo por tenant): `IO.slack.T126@motherbee` donde `T126` es el identificador corto del tenant. Usar el mismo identificador corto en todos los nodos del mismo tenant.
+
+No combinar nodos AI y IO del mismo tenant bajo identificadores diferentes.
+
 ### Lo que NO hace el Designer
 
 - No genera executor plans ni admin steps
@@ -246,19 +264,47 @@ Los args de cada step son fijos — el output de un step no puede alimentar el s
 
 **Clases bloqueadas (no emitir steps):** `NOOP`, `WF_REMOVE`, `OPA_REMOVE`, `BLOCKED_*`
 
-### Args requeridos para `run_node`
+### Args completos de `run_node`
+
+| Campo | Tipo | Req | Descripción |
+| --- | --- | --- | --- |
+| `node_name` | string | **sí** | Nombre completo: `AI.coa@motherbee` |
+| `runtime` | string | no | Nombre del runtime sin `@hive`. Omitible si derivable del nombre del nodo. |
+| `runtime_version` | string | no | Versión del runtime. Default: `"current"`. |
+| `tenant_id` | string | condicional | ID de tenant para primer spawn con identidad. Ver regla abajo. |
+| `unit` | string | no | Override del sufijo de unit systemd. Usar raramente. |
+| `config` | object | no | Config de runtime pasada durante el spawn. |
+
+**Regla de `tenant_id`:** Requerido cuando el runtime necesita identidad de tenant en la creación inicial de la instancia. Esto es el caso para runtimes AI multi-tenant. El valor tiene formato `"tnt:<uuid>"` (ej. `"tnt:43d576a3-d712-4d91-9245-5d5463dd693e"`). Llamar `get_admin_action_help run_node` en tiempo de compilación para confirmar si el runtime específico lo requiere.
+
+Si el manifest incluye `tenant_id` en la config del nodo, extraerlo y pasarlo como arg de nivel raíz en `run_node`, no dentro de `config`.
 
 ```json
 {
   "hive": "motherbee",
   "node_name": "AI.coa@motherbee",
   "runtime": "AI.common",
-  "runtime_version": "current"
+  "runtime_version": "current",
+  "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
 }
 ```
 
-- `runtime` es el nombre del runtime sin `@hive`
-- `runtime_version`: usar `"current"` salvo versión específica requerida
+### `executor_fill` — cuándo y cómo usarlo
+
+`executor_fill.allowed` es una lista de campos de `step.args` que el ejecutor AI puede rellenar con valores derivados del estado de infraestructura en tiempo de ejecución.
+
+Usar `executor_fill` solo cuando un arg no puede conocerse en tiempo de compilación del plan y solo puede derivarse consultando el estado live del sistema.
+
+```json
+{
+  "id": "s1",
+  "action": "run_node",
+  "args": { "hive": "motherbee", "node_name": "AI.coa@motherbee", "runtime": "AI.common" },
+  "executor_fill": { "allowed": ["runtime_version"], "notes": ["use latest stable version from list_runtimes"] }
+}
+```
+
+**Regla general:** La mayoría de los args deben estar hardcodeados en tiempo de compilación. Usar `executor_fill` solo si el valor es genuinamente imposible de obtener en ese momento.
 
 ### Clasificación de riesgo (para CONFIRM 2)
 
@@ -284,10 +330,57 @@ Los args de cada step son fijos — el output de un step no puede alimentar el s
 
 ---
 
-## Gaps conocidos / pendientes
+---
 
-- [ ] Campos opcionales de `run_node` (e.g. `tenant_id` para nodos multi-tenant)
-- [ ] Cómo funciona `executor_fill` en los steps
-- [ ] Topologías multi-hive: cuándo un nodo vive en `worker-*` vs `motherbee`
-- [ ] Convenciones de naming para nodos IO con tenant (ej. `IO.slack.T126@motherbee`)
-- [ ] Nodos `SY.*` — cuándo se crean, si alguna vez se crean desde pipeline
+## Sección 4: Para Archi (coordinador del pipeline)
+
+**Rol:** Recibir tareas del operador, arrancar el pipeline, confirmar los checkpoints, y reportar el resultado. Archi NUNCA muta el sistema directamente.
+
+### Regla fundamental: toda mutación va por `fluxbee_plan_compiler`
+
+Archi no tiene tools de escritura. Cualquier cambio al sistema — crear nodo, publicar runtime, modificar config, desplegar workflow — debe ir a través del pipeline iniciado con `fluxbee_plan_compiler`.
+
+**Si el operador pide crear un nodo:** Archi arranca el pipeline con una descripción del objetivo. El pipeline genera el manifest, compila el plan, y ejecuta los steps.
+
+**Archi nunca llama:** `run_node`, `publish_runtime_package`, `node_control_config_set`, `wf_rules_compile_apply`, ni ninguna otra acción de mutación.
+
+### Árbol de decisión para operaciones de ciclo de vida
+
+```text
+Nodo no existe en el sistema → pipeline con compiler_class NODE_RUN_MISSING
+Nodo existe, detenido       → pipeline con compiler_class NODE_RESTART_ONLY
+Nodo existe, config cambió  → pipeline con compiler_class NODE_CONFIG_APPLY_HOT o NODE_CONFIG_APPLY_RESTART
+Nodo existe, recrear limpio → pipeline con compiler_class NODE_RECREATE (kill + run_node)
+```
+
+Nunca asumir cuál es el caso sin consultar el estado actual con `fluxbee_system_get` primero.
+
+### `tenant_id` en el contexto de Archi
+
+Cuando el operador pide crear un nodo para un tenant específico:
+
+1. Identificar el `tenant_id` del contexto de la conversación o preguntarlo al operador (UNA sola vez).
+2. Incluir el `tenant_id` en la descripción del pipeline task para que el Designer lo incorpore en el manifest.
+3. El PlanCompiler lo extraerá del manifest y lo pasará como arg de `run_node`.
+
+El `tenant_id` tiene formato `"tnt:<uuid>"`. Si el operador provee un ID corto como `"acme"`, formatear como `"tnt:acme"`.
+
+### Nodos `SY.*` — no crear desde pipeline
+
+Los nodos `SY.*` (SY.admin, SY.storage, SY.identity, SY.cognition, SY.config.routes) son infraestructura del sistema. No deben crearse ni modificarse desde el pipeline. Son gestionados por el operador o por bootstrap del hive.
+
+Si el operador pide modificar un `SY.*`, escalar y pedir confirmación explícita antes de proceder.
+
+### Cuándo NO arrancar el pipeline
+
+| Situación | Acción correcta |
+| --- | --- |
+| El operador solo quiere consultar el estado del sistema | Usar `fluxbee_system_get` directamente |
+| El operador quiere ver logs o métricas | Usar `fluxbee_system_get` directamente |
+| El operador quiere listar nodos / runtimes | Usar `fluxbee_system_get` directamente |
+| El operador quiere un cambio de configuración | Arrancar pipeline |
+| El operador quiere crear, modificar o eliminar un recurso | Arrancar pipeline |
+
+### Regla anti-pregunta
+
+Hacer como máximo UNA pregunta de aclaración por tarea. Si la tarea es razonablemente clara (topología inferible, runtime obvio), arrancar el pipeline sin preguntar. Si faltan datos críticos imposibles de inferir (ej. qué tenant), preguntar una vez con una sola pregunta concreta.
