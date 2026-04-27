@@ -1,0 +1,155 @@
+[
+  {
+    "layer": "design",
+    "pattern_key": "single_hive_ai_node",
+    "trigger": "User wants to create a new AI node on a single hive with no topology changes needed.",
+    "inputs_signature": {
+      "desired_node_type": "AI.*",
+      "hive_already_exists": true,
+      "new_runtime_needed": true
+    },
+    "successful_shape": {
+      "desired_state": {
+        "runtimes": [
+          {
+            "name": "AI.example",
+            "version": "0.1.0",
+            "package_source": "inline_package",
+            "ownership": "solution"
+          }
+        ],
+        "nodes": [
+          {
+            "node_name": "AI.example@motherbee",
+            "hive": "motherbee",
+            "runtime": "AI.example",
+            "config": {},
+            "ownership": "solution"
+          }
+        ]
+      }
+    },
+    "constraints": [
+      "node_name must match pattern TYPE.name@hive",
+      "runtime field in node must exactly match the runtime name (no @hive suffix)",
+      "runtime version must be a semver string like '0.1.0'",
+      "ownership must be 'solution' for user-created nodes"
+    ],
+    "do_not_repeat": [
+      "do not add topology section if no new hive or VPN is needed",
+      "do not duplicate the runtime in nodes — nodes reference runtimes by name",
+      "do not set package_source to 'pre_published' unless the runtime already exists and is materialized"
+    ],
+    "failure_class": null,
+    "recorded_from_run": null,
+    "seed_kind": "manual"
+  },
+  {
+    "layer": "design",
+    "pattern_key": "multi_hive_with_route",
+    "trigger": "User wants a node on a worker hive and a routing rule so messages flow from motherbee to that worker.",
+    "inputs_signature": {
+      "source_hive": "motherbee",
+      "target_hive": "worker-*",
+      "need_vpn": true,
+      "need_route": true
+    },
+    "successful_shape": {
+      "desired_state": {
+        "topology": {
+          "hives": [
+            { "hive_id": "worker-220", "role": "worker", "ownership": "solution" }
+          ],
+          "vpns": [
+            { "vpn_id": "vpn-motherbee-worker220", "hive_id": "worker-220", "ownership": "solution" }
+          ]
+        },
+        "nodes": [
+          {
+            "node_name": "AI.specialist@worker-220",
+            "hive": "worker-220",
+            "runtime": "AI.common",
+            "config": {},
+            "ownership": "solution"
+          }
+        ],
+        "routing": [
+          {
+            "hive": "motherbee",
+            "prefix": "AI.specialist.",
+            "action": "FORWARD",
+            "next_hop_hive": "worker-220",
+            "ownership": "solution"
+          }
+        ]
+      }
+    },
+    "constraints": [
+      "always include the VPN entry when a new worker hive is added",
+      "route prefix must end with a dot (e.g., 'AI.specialist.' not 'AI.specialist')",
+      "next_hop_hive in routing must match the hive_id of the target hive exactly"
+    ],
+    "do_not_repeat": [
+      "do not add topology.hives for motherbee — it always exists",
+      "do not add a VPN for hives that already have one — check snapshot first",
+      "do not set next_hop_hive to a hive where the node does not live"
+    ],
+    "failure_class": null,
+    "recorded_from_run": null,
+    "seed_kind": "manual"
+  },
+  {
+    "layer": "design",
+    "pattern_key": "wf_node_with_workflow",
+    "trigger": "User wants to deploy a workflow node with a workflow definition on an existing hive.",
+    "inputs_signature": {
+      "desired_node_type": "WF.*",
+      "hive_already_exists": true,
+      "workflow_definition_needed": true
+    },
+    "successful_shape": {
+      "desired_state": {
+        "runtimes": [
+          {
+            "name": "wf.invoice",
+            "version": "0.1.0",
+            "package_source": "inline_package",
+            "ownership": "solution"
+          }
+        ],
+        "nodes": [
+          {
+            "node_name": "WF.invoice@motherbee",
+            "hive": "motherbee",
+            "runtime": "wf.invoice",
+            "config": {},
+            "ownership": "solution"
+          }
+        ],
+        "wf_deployments": [
+          {
+            "hive": "motherbee",
+            "workflow_name": "invoice_approval",
+            "definition": {
+              "steps": []
+            },
+            "ownership": "solution"
+          }
+        ]
+      }
+    },
+    "constraints": [
+      "WF nodes must use a WF.* or wf.* runtime",
+      "wf_deployments.workflow_name must be unique per hive",
+      "wf_deployments.definition must be a non-empty object with at least a 'steps' array"
+    ],
+    "do_not_repeat": [
+      "do not put the workflow definition content inside the node config — it goes in wf_deployments",
+      "do not use 'WF.engine' as a node name — it is a runtime base, not a node",
+      "do not omit the runtime when WF node needs a custom package"
+    ],
+    "failure_class": null,
+    "recorded_from_run": null,
+    "seed_kind": "manual"
+  }
+]
