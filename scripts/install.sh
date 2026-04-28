@@ -112,6 +112,12 @@ INSTALL_RESTART_SERVICES=(
   "fluxbee-syncthing"
 )
 
+# SY.frontdesk.gov depends on the router and then on SY.identity for registration
+# handoffs. During install we tear down volatile router/SHM state, so restoring
+# frontdesk too early can leave the process "running" while identity is still
+# unavailable inside Fluxbee. Keep it in the capture list, but defer the actual
+# restart until after rt-gateway and sy-identity are back.
+
 if [[ "$CLEAN_RUNTIME_VOLATILE_ON_INSTALL" == "1" ]]; then
   for svc in sy-orchestrator "${INSTALL_RESTART_SERVICES[@]}"; do
     if install_service_is_active "$svc"; then
@@ -953,15 +959,6 @@ if [[ "${INSTALL_WAS_ACTIVE[sy-orchestrator]:-0}" != "1" ]] && install_service_e
   fi
 fi
 
-if [[ "${INSTALL_WAS_ACTIVE[sy-orchestrator]:-0}" != "1" ]] && install_service_exists "sy-frontdesk-gov"; then
-  if [[ "${INSTALL_WAS_ACTIVE[sy-frontdesk-gov]:-0}" == "1" ]]; then
-    echo "Restarting sy-frontdesk-gov to restore pre-install state..."
-    sudo systemctl restart sy-frontdesk-gov
-  else
-    echo "sy-frontdesk-gov was not active before install; skipping restart."
-  fi
-fi
-
 if [[ "${INSTALL_WAS_ACTIVE[sy-orchestrator]:-0}" != "1" ]]; then
   for svc in "${INSTALL_RESTART_SERVICES[@]}"; do
     if [[ "$svc" == "sy-architect" || "$svc" == "sy-frontdesk-gov" ]]; then
@@ -972,6 +969,15 @@ if [[ "${INSTALL_WAS_ACTIVE[sy-orchestrator]:-0}" != "1" ]]; then
       sudo systemctl restart "${svc}.service"
     fi
   done
+fi
+
+if install_service_exists "sy-frontdesk-gov"; then
+  if [[ "${INSTALL_WAS_ACTIVE[sy-frontdesk-gov]:-0}" == "1" ]]; then
+    echo "Restarting sy-frontdesk-gov after rt-gateway and sy-identity are restored..."
+    sudo systemctl restart sy-frontdesk-gov
+  else
+    echo "sy-frontdesk-gov was not active before install; skipping restart."
+  fi
 fi
 
 if [[ "$APPLY_DEV_OWNERSHIP" == "1" ]]; then
