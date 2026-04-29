@@ -52,6 +52,11 @@ pub struct IlkProvisionRequest<'a> {
     pub channel_type: &'a str,
     pub address: &'a str,
     pub tenant_id: Option<&'a str>,
+    /// Caller-declared ilk type. Only the IO node knows whether the external
+    /// counterpart is a human or an automated agent. Allowed values:
+    /// `"human"` or `"agent"`. When `None`, SY.identity defaults to `"human"`.
+    /// `"system"` is rejected by the server for IO-originated provisioning.
+    pub ilk_type: Option<&'a str>,
     pub timeout: Duration,
 }
 
@@ -579,6 +584,14 @@ pub async fn provision_ilk(
         .filter(|s| !s.is_empty())
     {
         payload["tenant_id"] = json!(tid);
+    }
+    if let Some(ilk_type) = request
+        .ilk_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        payload["ilk_type"] = json!(ilk_type);
     }
     let call = identity_system_call(
         sender,

@@ -25,6 +25,7 @@ When these docs conflict with the current Fluxbee v1.16/v1.17 direction in this 
 - IO uses shared `io-common` pipeline: `lookup -> provision_on_miss -> forward`.
 - IO must not block waiting for identity before acking inbound provider traffic.
 - On provision failure/timeout, IO forwards with `meta.src_ilk = null` (degraded fallback), and Router/OPA handles onboarding.
+- On provision, the IO node declares `ilk_type` (`"human"` or `"agent"`) when it can identify the external counterpart's nature. This is constructive of the IO node — set in `IdentityLookupInput.ilk_type` at the call site. When omitted, the server defaults to `"human"`. `"system"` is rejected for IO-originated provisioning.
 
 2. Context fields:
 - `meta.ctx` is conversational context key.

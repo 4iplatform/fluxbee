@@ -184,6 +184,12 @@ struct IlkProvisionRequest {
     address: String,
     #[serde(default)]
     tenant_id: Option<String>,
+    /// Optional ilk type — only the originating IO node knows whether its
+    /// external counterpart is a human or an agent. Allowed values: `"human"`
+    /// or `"agent"`. Defaults to `"human"` when absent. `"system"` is reserved
+    /// for SY-internal creation paths and is rejected here.
+    #[serde(default)]
+    ilk_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -562,6 +568,14 @@ impl IdentityStore {
         validate_max_len("channel_type", &req.channel_type, ICH_CHANNEL_TYPE_MAX_LEN)?;
         validate_max_len("address", &req.address, ICH_ADDRESS_MAX_LEN)?;
 
+        let ilk_type = match req.ilk_type.as_deref().map(str::trim) {
+            Some(value) if !value.is_empty() => {
+                validate_provision_ilk_type(value)?;
+                value.to_string()
+            }
+            _ => "human".to_string(),
+        };
+
         let tenant_id = req
             .tenant_id
             .clone()
@@ -585,7 +599,7 @@ impl IdentityStore {
 
         let ilk = IlkRecord {
             ilk_id: ilk_id.clone(),
-            ilk_type: "human".to_string(),
+            ilk_type,
             registration_status: "temporary".to_string(),
             tenant_id,
             identification: json!({}),
@@ -3284,6 +3298,15 @@ fn parse_prefixed_uuid(value: &str, prefix: &str) -> Result<Uuid, String> {
 
 fn validate_ilk_type(value: &str) -> Result<(), String> {
     if matches!(value.trim(), "human" | "agent" | "system") {
+        return Ok(());
+    }
+    Err("INVALID_REQUEST".to_string())
+}
+
+/// Validator for `ilk_type` arriving via ILK_PROVISION. IO nodes can only
+/// declare humans or agents; `"system"` is reserved for SY-internal creation.
+fn validate_provision_ilk_type(value: &str) -> Result<(), String> {
+    if matches!(value.trim(), "human" | "agent") {
         return Ok(());
     }
     Err("INVALID_REQUEST".to_string())

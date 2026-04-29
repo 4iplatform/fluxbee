@@ -261,6 +261,7 @@ async fn provision_ilk_with_fallback(
             channel_type,
             address,
             tenant_id: tenant_id_opt,
+            ilk_type: None,
             timeout,
         },
     )
@@ -303,6 +304,7 @@ async fn provision_ilk_with_fallback(
                     channel_type,
                     address,
                     tenant_id: tenant_id_opt,
+                    ilk_type: None,
                     timeout,
                 },
             )
@@ -345,6 +347,7 @@ async fn provision_ilk_with_fallback(
                     channel_type,
                     address,
                     tenant_id: tenant_id_opt,
+                    ilk_type: None,
                     timeout,
                 },
             )

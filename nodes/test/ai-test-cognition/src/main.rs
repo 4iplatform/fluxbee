@@ -106,6 +106,7 @@ async fn run_loop(sender: &NodeSender, receiver: &mut NodeReceiver) -> Result<()
             let reply = Message {
                 routing: Routing {
                     src: sender.uuid().to_string(),
+                    src_l2_name: None,
                     dst: Destination::Unicast(msg.routing.src.clone()),
                     ttl: 16,
                     trace_id: msg.routing.trace_id.clone(),

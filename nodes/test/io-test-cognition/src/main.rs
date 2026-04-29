@@ -283,6 +283,7 @@ async fn send_probe(
     let msg = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Unicast(target.to_string()),
             ttl: 16,
             trace_id: trace_id.clone(),
