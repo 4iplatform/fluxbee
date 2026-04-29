@@ -29,6 +29,48 @@ install_service_is_active() {
   sudo systemctl is-active --quiet "${svc}.service"
 }
 
+load_install_hive_id() {
+  local hive_yaml=""
+  if [[ -f "$CONFIG_DIR/hive.yaml" ]]; then
+    hive_yaml="$CONFIG_DIR/hive.yaml"
+  elif [[ -f "$ROOT_DIR/config/hive.yaml" ]]; then
+    hive_yaml="$ROOT_DIR/config/hive.yaml"
+  else
+    return 1
+  fi
+  awk -F': ' '/^hive_id:/ { gsub(/"/, "", $2); print $2; exit }' "$hive_yaml"
+}
+
+wait_for_service_active() {
+  local svc="$1"
+  local timeout_secs="${2:-30}"
+  local waited=0
+  while (( waited < timeout_secs )); do
+    if install_service_is_active "$svc"; then
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+wait_for_router_registration() {
+  local node_name="$1"
+  local since_ts="$2"
+  local timeout_secs="${3:-30}"
+  local waited=0
+  while (( waited < timeout_secs )); do
+    if sudo journalctl -u rt-gateway.service --since "$since_ts" --no-pager 2>/dev/null \
+      | grep -Fq "name=${node_name}"; then
+      return 0
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
 stop_install_service() {
   local svc="$1"
   if ! install_service_exists "$svc"; then
@@ -904,11 +946,14 @@ fi
 install_unit() {
   local name="$1"
   local exec="$2"
+  local after_units="${3:-network.target}"
+  local wants_units="${4:-}"
   local path="/etc/systemd/system/${name}.service"
   cat <<EOF | sudo tee "$path" >/dev/null
 [Unit]
 Description=Fluxbee ${name}
-After=network.target
+After=${after_units}
+$(if [[ -n "$wants_units" ]]; then printf 'Wants=%s\n' "$wants_units"; fi)
 
 [Service]
 Type=simple
@@ -934,7 +979,11 @@ install_unit "sy-cognition" "/usr/bin/sy-cognition"
 install_unit "sy-policy" "/usr/bin/sy-policy"
 install_unit "sy-timer" "/usr/bin/sy-timer"
 install_unit "sy-wf-rules" "/usr/bin/sy-wf-rules"
-install_unit "sy-frontdesk-gov" "/usr/bin/sy-frontdesk-gov"
+install_unit \
+  "sy-frontdesk-gov" \
+  "/usr/bin/sy-frontdesk-gov" \
+  "network.target rt-gateway.service sy-identity.service" \
+  "rt-gateway.service sy-identity.service"
 sudo systemctl daemon-reload
 
 if [[ "$RESTART_ORCHESTRATOR_AFTER_INSTALL" == "1" ]]; then
@@ -973,6 +1022,25 @@ fi
 
 if install_service_exists "sy-frontdesk-gov"; then
   if [[ "${INSTALL_WAS_ACTIVE[sy-frontdesk-gov]:-0}" == "1" ]]; then
+    if install_service_exists "rt-gateway"; then
+      if ! wait_for_service_active "rt-gateway" 30; then
+        echo "Warning: rt-gateway did not become active before frontdesk restore; restarting frontdesk anyway." >&2
+      fi
+    fi
+    if install_service_exists "sy-identity"; then
+      if wait_for_service_active "sy-identity" 30; then
+        hive_id="$(load_install_hive_id || true)"
+        if [[ -n "${hive_id:-}" ]]; then
+          identity_active_enter="$(sudo systemctl show sy-identity.service --property=ActiveEnterTimestamp --value 2>/dev/null || true)"
+          identity_active_enter="${identity_active_enter:-now}"
+          if ! wait_for_router_registration "SY.identity@${hive_id}" "$identity_active_enter" 30; then
+            echo "Warning: SY.identity@${hive_id} did not register in rt-gateway before frontdesk restore; restarting frontdesk anyway." >&2
+          fi
+        fi
+      else
+        echo "Warning: sy-identity did not become active before frontdesk restore; restarting frontdesk anyway." >&2
+      fi
+    fi
     echo "Restarting sy-frontdesk-gov after rt-gateway and sy-identity are restored..."
     sudo systemctl restart sy-frontdesk-gov
   else
