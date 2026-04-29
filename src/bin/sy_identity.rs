@@ -75,6 +75,8 @@ const MSG_ILK_ADD_CHANNEL: &str = "ILK_ADD_CHANNEL";
 const MSG_ILK_ADD_CHANNEL_RESPONSE: &str = "ILK_ADD_CHANNEL_RESPONSE";
 const MSG_ILK_UPDATE: &str = "ILK_UPDATE";
 const MSG_ILK_UPDATE_RESPONSE: &str = "ILK_UPDATE_RESPONSE";
+const MSG_ICH_SET_ENABLED: &str = "ICH_SET_ENABLED";
+const MSG_ICH_SET_ENABLED_RESPONSE: &str = "ICH_SET_ENABLED_RESPONSE";
 const MSG_TNT_CREATE: &str = "TNT_CREATE";
 const MSG_TNT_CREATE_RESPONSE: &str = "TNT_CREATE_RESPONSE";
 const MSG_TNT_APPROVE: &str = "TNT_APPROVE";
@@ -225,6 +227,13 @@ struct IlkAddChannelRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct IchSetEnabledRequest {
+    ich_id: String,
+    enabled: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IlkUpdateRequest {
     ilk_id: String,
     #[serde(default)]
@@ -251,6 +260,8 @@ struct TntCreateRequest {
     status: Option<String>,
     #[serde(default)]
     settings: Option<Value>,
+    #[serde(default)]
+    sponsor_tenant_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -267,6 +278,7 @@ struct TenantRecord {
     domain: Option<String>,
     status: String,
     settings: Value,
+    sponsor_tenant_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,6 +286,8 @@ struct ChannelRecord {
     ich_id: String,
     channel_type: String,
     address: String,
+    owner_l2_name: Option<String>,
+    enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -470,6 +484,8 @@ impl IdentityStore {
                         "ich_id": channel.ich_id,
                         "channel_type": channel.channel_type,
                         "address": channel.address,
+                        "owner_l2_name": channel.owner_l2_name,
+                        "enabled": channel.enabled,
                     })).collect::<Vec<_>>(),
                     "deleted_at_ms": ilk.deleted_at_ms,
                 }))
@@ -517,13 +533,26 @@ impl IdentityStore {
                 domain: None,
                 status: "active".to_string(),
                 settings: json!({}),
+                sponsor_tenant_id: None,
             },
         );
         out
     }
 
     fn default_tenant_id(&self) -> Option<String> {
-        self.tenants.keys().next().cloned()
+        let mut root_tenants: Vec<&String> = self
+            .tenants
+            .iter()
+            .filter(|(_, tenant)| tenant.sponsor_tenant_id.is_none())
+            .map(|(tenant_id, _)| tenant_id)
+            .collect();
+        root_tenants.sort_unstable();
+        if let Some(tenant_id) = root_tenants.first() {
+            return Some((*tenant_id).clone());
+        }
+        let mut all_tenants: Vec<&String> = self.tenants.keys().collect();
+        all_tenants.sort_unstable();
+        all_tenants.first().map(|tenant_id| (*tenant_id).clone())
     }
 
     fn provision_temporary_ilk(&mut self, req: IlkProvisionRequest) -> Result<Value, String> {
@@ -566,6 +595,8 @@ impl IdentityStore {
                 ich_id: req.ich_id,
                 channel_type: req.channel_type,
                 address: req.address,
+                owner_l2_name: None,
+                enabled: false,
             }],
             deleted_at_ms: None,
         };
@@ -649,10 +680,12 @@ impl IdentityStore {
     fn add_channel(
         &mut self,
         req: IlkAddChannelRequest,
+        owner_l2_name: Option<&str>,
         merge_alias_ttl_secs: u64,
     ) -> Result<Value, String> {
         let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
         validate_channel_input(&req.channel)?;
+        let normalized_owner_l2_name = normalize_optional_owner_l2_name(owner_l2_name)?;
 
         let canonical_ilk_id = req.ilk_id.clone();
         let target = self
@@ -679,6 +712,8 @@ impl IdentityStore {
                 ich_id: req.channel.ich_id,
                 channel_type: req.channel.channel_type,
                 address: req.channel.address,
+                owner_l2_name: normalized_owner_l2_name.clone(),
+                enabled: false,
             });
         }
 
@@ -733,6 +768,8 @@ impl IdentityStore {
         Ok(json!({
             "status": "ok",
             "ilk_id": canonical_ilk_id,
+            "owner_l2_name": normalized_owner_l2_name,
+            "enabled": false,
             "change_reason": req.change_reason,
         }))
     }
@@ -762,6 +799,8 @@ impl IdentityStore {
                     ich_id: ch.ich_id.clone(),
                     channel_type: ch.channel_type.clone(),
                     address: ch.address.clone(),
+                    owner_l2_name: None,
+                    enabled: false,
                 });
             }
         }
@@ -778,6 +817,12 @@ impl IdentityStore {
 
     fn create_tenant(&mut self, req: TntCreateRequest) -> Result<Value, String> {
         validate_non_empty("name", &req.name)?;
+        if let Some(sponsor_tenant_id) = req.sponsor_tenant_id.as_deref() {
+            let _ = parse_prefixed_uuid(sponsor_tenant_id, "tnt")?;
+            if !self.tenants.contains_key(sponsor_tenant_id) {
+                return Err("INVALID_SPONSOR_TENANT".to_string());
+            }
+        }
         let normalized_name = req.name.trim().to_string();
         let normalized_domain = req
             .domain
@@ -802,10 +847,12 @@ impl IdentityStore {
                 "tenant_id": tenant.tenant_id,
                 "created": false,
                 "matched_by": matched_by,
+                "sponsor_tenant_id": tenant.sponsor_tenant_id,
             }));
         }
 
         let tenant_id = format!("tnt:{}", Uuid::new_v4());
+        let sponsor_tenant_id = req.sponsor_tenant_id.clone();
         self.tenants.insert(
             tenant_id.clone(),
             TenantRecord {
@@ -814,6 +861,7 @@ impl IdentityStore {
                 domain: normalized_domain,
                 status,
                 settings: req.settings.unwrap_or_else(|| json!({})),
+                sponsor_tenant_id: sponsor_tenant_id.clone(),
             },
         );
 
@@ -822,6 +870,36 @@ impl IdentityStore {
             "tenant_id": tenant_id,
             "created": true,
             "matched_by": serde_json::Value::Null,
+            "sponsor_tenant_id": sponsor_tenant_id,
+        }))
+    }
+
+    fn set_ich_enabled(&mut self, ich_id: &str, enabled: bool) -> Result<Value, String> {
+        let _ = parse_prefixed_uuid(ich_id, "ich")?;
+        let mut updated: Option<(String, Option<String>)> = None;
+        for (ilk_id, ilk) in &mut self.ilks {
+            if ilk.deleted_at_ms.is_some() {
+                continue;
+            }
+            if let Some(channel) = ilk
+                .channels
+                .iter_mut()
+                .find(|channel| channel.ich_id == ich_id)
+            {
+                channel.enabled = enabled;
+                updated = Some((ilk_id.clone(), channel.owner_l2_name.clone()));
+                break;
+            }
+        }
+        let Some((ilk_id, owner_l2_name)) = updated else {
+            return Err("ICH_NOT_FOUND".to_string());
+        };
+        Ok(json!({
+            "status": "ok",
+            "ilk_id": ilk_id,
+            "ich_id": ich_id,
+            "enabled": enabled,
+            "owner_l2_name": owner_l2_name,
         }))
     }
 
@@ -1032,6 +1110,10 @@ impl IdentityRuntime {
         );
         allowed_prefixes.insert(MSG_ILK_ADD_CHANNEL, vec!["SY.frontdesk.gov@"]);
         allowed_prefixes.insert(MSG_ILK_UPDATE, vec!["SY.orchestrator@"]);
+        allowed_prefixes.insert(
+            MSG_ICH_SET_ENABLED,
+            vec!["IO.", "SY.admin@", "SY.architect@", "SY.frontdesk.gov@"],
+        );
         allowed_prefixes.insert(MSG_TNT_CREATE, vec!["SY.frontdesk.gov@"]);
         allowed_prefixes.insert(MSG_TNT_APPROVE, vec!["SY.admin@"]);
         allowed_prefixes.insert("CONFIG_GET", vec!["SY.admin@"]);
@@ -1049,6 +1131,10 @@ impl IdentityRuntime {
                 .insert(frontdesk_node.clone());
             allowed_exacts
                 .entry(MSG_ILK_ADD_CHANNEL)
+                .or_default()
+                .insert(frontdesk_node.clone());
+            allowed_exacts
+                .entry(MSG_ICH_SET_ENABLED)
                 .or_default()
                 .insert(frontdesk_node.clone());
             allowed_exacts
@@ -1335,10 +1421,11 @@ impl IdentityRuntime {
                         } else {
                             None
                         };
-                        match self
-                            .store
-                            .add_channel(req.clone(), self.merge_alias_ttl_secs)
-                        {
+                        match self.store.add_channel(
+                            req.clone(),
+                            src_l2_name,
+                            self.merge_alias_ttl_secs,
+                        ) {
                             Ok(ok) => {
                                 let alias_delta =
                                     req.merge_from_ilk_id.as_ref().and_then(|old_ilk_id| {
@@ -1409,6 +1496,73 @@ impl IdentityRuntime {
                                 }
                             }
                             Err(code) => error_payload(&code, "failed to add channel"),
+                        }
+                    }
+                    Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
+                }
+            }
+            MSG_ICH_SET_ENABLED => {
+                match serde_json::from_value::<IchSetEnabledRequest>(msg.payload.clone()) {
+                    Ok(req) => {
+                        if let Value::Bool(enabled) = req.enabled {
+                            let snapshot = if self.is_primary && self.db_config.is_some() {
+                                Some(self.store.clone())
+                            } else {
+                                None
+                            };
+                            match self.store.set_ich_enabled(&req.ich_id, enabled) {
+                                Ok(ok) => {
+                                    if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
+                                        if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
+                                            if self.is_primary {
+                                                if let Some(database_config) =
+                                                    self.db_config.as_ref()
+                                                {
+                                                    if let Err(err) = persist_ilk_state_in_db(
+                                                        database_config,
+                                                        &ilk,
+                                                        None,
+                                                    )
+                                                    .await
+                                                    {
+                                                        if let Some(snapshot) = snapshot {
+                                                            self.store = snapshot;
+                                                        }
+                                                        db_write_error_payload(
+                                                            "failed to persist ich enabled update",
+                                                            err.as_ref(),
+                                                        )
+                                                    } else {
+                                                        deltas.push(delta_envelope(
+                                                            IdentityDelta::IlkUpsert { ilk },
+                                                        ));
+                                                        ok
+                                                    }
+                                                } else {
+                                                    deltas.push(delta_envelope(
+                                                        IdentityDelta::IlkUpsert { ilk },
+                                                    ));
+                                                    ok
+                                                }
+                                            } else {
+                                                deltas.push(delta_envelope(
+                                                    IdentityDelta::IlkUpsert { ilk },
+                                                ));
+                                                ok
+                                            }
+                                        } else {
+                                            ok
+                                        }
+                                    } else {
+                                        ok
+                                    }
+                                }
+                                Err(code) => {
+                                    error_payload(&code, "failed to set ich enabled state")
+                                }
+                            }
+                        } else {
+                            error_payload("INVALID_ICH_STATE", "enabled must be boolean")
                         }
                     }
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
@@ -2116,9 +2270,16 @@ fn sync_identity_shm_mappings(
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
                 .min(u32::MAX as u64) as u32,
+            sponsor_tenant_id: tenant
+                .sponsor_tenant_id
+                .as_deref()
+                .map(|sponsor_id| {
+                    parse_prefixed_uuid(sponsor_id, "tnt").map(|uuid| *uuid.as_bytes())
+                })
+                .transpose()?
+                .unwrap_or([0u8; 16]),
             created_at: now_ms,
             updated_at: now_ms,
-            _reserved: [0u8; 8],
         };
         copy_bytes_with_len(&mut entry.name, tenant.name.trim());
         if let Some(domain) = tenant
@@ -2177,16 +2338,21 @@ fn sync_identity_shm_mappings(
             let mut ich_entry = IchEntry {
                 ich_id: *ich_uuid.as_bytes(),
                 ilk_id: *ilk_uuid.as_bytes(),
+                tenant_id: *tenant_uuid.as_bytes(),
                 channel_type: [0u8; ICH_CHANNEL_TYPE_MAX_LEN],
                 address: [0u8; ICH_ADDRESS_MAX_LEN],
                 flags: FLAG_ACTIVE,
+                owner_l2_name: [0u8; 128],
                 is_primary: if idx == 0 { 1 } else { 0 },
+                enabled: if channel.enabled { 1 } else { 0 },
                 _pad0: [0u8; 5],
                 added_at: now_ms,
-                _reserved: [0u8; 16],
             };
             copy_bytes_with_len(&mut ich_entry.channel_type, &channel_type);
             copy_bytes_with_len(&mut ich_entry.address, &address);
+            if let Some(owner_l2_name) = channel.owner_l2_name.as_deref() {
+                copy_bytes_with_len(&mut ich_entry.owner_l2_name, owner_l2_name);
+            }
             ich_entries.push(ich_entry);
             ich_count = ich_count.saturating_add(1);
             channel_to_ich.insert(
@@ -2353,9 +2519,14 @@ fn tenant_entry_from_record(tenant: &TenantRecord) -> Result<TenantEntry, Identi
             .and_then(Value::as_u64)
             .unwrap_or(0)
             .min(u32::MAX as u64) as u32,
+        sponsor_tenant_id: tenant
+            .sponsor_tenant_id
+            .as_deref()
+            .map(|sponsor_id| parse_prefixed_uuid(sponsor_id, "tnt").map(|uuid| *uuid.as_bytes()))
+            .transpose()?
+            .unwrap_or([0u8; 16]),
         created_at: now_ms,
         updated_at: now_ms,
-        _reserved: [0u8; 8],
     };
     copy_bytes_with_len(&mut entry.name, tenant.name.trim());
     if let Some(domain) = tenant
@@ -2420,16 +2591,21 @@ fn ich_entries_from_ilk_record(
         let mut entry = IchEntry {
             ich_id: *ich_uuid.as_bytes(),
             ilk_id: *ilk_uuid.as_bytes(),
+            tenant_id: parse_prefixed_uuid(&ilk.tenant_id, "tnt")?.into_bytes(),
             channel_type: [0u8; ICH_CHANNEL_TYPE_MAX_LEN],
             address: [0u8; ICH_ADDRESS_MAX_LEN],
             flags: FLAG_ACTIVE,
+            owner_l2_name: [0u8; 128],
             is_primary: if idx == 0 { 1 } else { 0 },
+            enabled: if channel.enabled { 1 } else { 0 },
             _pad0: [0u8; 5],
             added_at: now_ms,
-            _reserved: [0u8; 16],
         };
         copy_bytes_with_len(&mut entry.channel_type, &channel_type);
         copy_bytes_with_len(&mut entry.address, &address);
+        if let Some(owner_l2_name) = channel.owner_l2_name.as_deref() {
+            copy_bytes_with_len(&mut entry.owner_l2_name, owner_l2_name);
+        }
         entries.push((entry, channel_type, address));
     }
     Ok(entries)
@@ -2931,6 +3107,7 @@ fn response_name(action: &str) -> &'static str {
         MSG_ILK_REGISTER => MSG_ILK_REGISTER_RESPONSE,
         MSG_ILK_ADD_CHANNEL => MSG_ILK_ADD_CHANNEL_RESPONSE,
         MSG_ILK_UPDATE => MSG_ILK_UPDATE_RESPONSE,
+        MSG_ICH_SET_ENABLED => MSG_ICH_SET_ENABLED_RESPONSE,
         MSG_TNT_CREATE => MSG_TNT_CREATE_RESPONSE,
         MSG_TNT_APPROVE => MSG_TNT_APPROVE_RESPONSE,
         "IDENTITY_METRICS" => "IDENTITY_METRICS_RESPONSE",
@@ -2946,6 +3123,7 @@ fn action_requires_primary(action: &str) -> bool {
             | MSG_ILK_REGISTER
             | MSG_ILK_ADD_CHANNEL
             | MSG_ILK_UPDATE
+            | MSG_ICH_SET_ENABLED
             | MSG_TNT_CREATE
             | MSG_TNT_APPROVE
     )
@@ -3138,6 +3316,17 @@ fn validate_channel_input(channel: &ChannelInput) -> Result<(), String> {
     Ok(())
 }
 
+fn normalize_optional_owner_l2_name(owner_l2_name: Option<&str>) -> Result<Option<String>, String> {
+    let Some(owner_l2_name) = owner_l2_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    validate_max_len("owner_l2_name", owner_l2_name, 128)?;
+    Ok(Some(owner_l2_name.to_string()))
+}
+
 fn dedup_lowercase_tags(tags: Vec<String>) -> Result<Vec<String>, String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -3189,10 +3378,15 @@ CREATE TABLE IF NOT EXISTS identity_tenants (
     domain VARCHAR(128),
     status VARCHAR(16) NOT NULL DEFAULT 'pending',
     settings JSONB NOT NULL DEFAULT '{}',
+    sponsor_tenant_id UUID REFERENCES identity_tenants(tenant_id),
     approved_by UUID,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS idx_identity_tenants_sponsor
+    ON identity_tenants(sponsor_tenant_id)
+    WHERE sponsor_tenant_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS identity_ilks (
     ilk_id UUID PRIMARY KEY,
@@ -3246,7 +3440,9 @@ CREATE TABLE IF NOT EXISTS identity_ichs (
     tenant_id UUID NOT NULL REFERENCES identity_tenants(tenant_id),
     channel_type VARCHAR(32) NOT NULL,
     address VARCHAR(256) NOT NULL,
+    owner_l2_name VARCHAR(128),
     is_primary BOOLEAN DEFAULT FALSE,
+    enabled BOOLEAN NOT NULL DEFAULT FALSE,
     added_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(channel_type, address, tenant_id)
 );
@@ -3257,6 +3453,10 @@ CREATE INDEX IF NOT EXISTS idx_identity_ichs_lookup
 CREATE INDEX IF NOT EXISTS idx_identity_ichs_ilk
     ON identity_ichs(ilk_id);
 
+CREATE INDEX IF NOT EXISTS idx_identity_ichs_owner
+    ON identity_ichs(owner_l2_name)
+    WHERE owner_l2_name IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS identity_vocabulary (
     tag VARCHAR(64) PRIMARY KEY,
     category VARCHAR(16) NOT NULL,
@@ -3264,6 +3464,28 @@ CREATE TABLE IF NOT EXISTS identity_vocabulary (
     created_at TIMESTAMPTZ DEFAULT NOW(),
     deprecated_at TIMESTAMPTZ
 );
+"#,
+        )
+        .await?;
+    client
+        .batch_execute(
+            r#"
+ALTER TABLE identity_tenants
+    ADD COLUMN IF NOT EXISTS sponsor_tenant_id UUID REFERENCES identity_tenants(tenant_id);
+
+ALTER TABLE identity_ichs
+    ADD COLUMN IF NOT EXISTS owner_l2_name VARCHAR(128);
+
+ALTER TABLE identity_ichs
+    ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT FALSE;
+
+CREATE INDEX IF NOT EXISTS idx_identity_tenants_sponsor
+    ON identity_tenants(sponsor_tenant_id)
+    WHERE sponsor_tenant_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_identity_ichs_owner
+    ON identity_ichs(owner_l2_name)
+    WHERE owner_l2_name IS NOT NULL;
 "#,
         )
         .await?;
@@ -3360,6 +3582,8 @@ fn association_json_from_ilk(ilk: &IlkRecord) -> Value {
                 "ich_id": channel.ich_id,
                 "type": channel.channel_type,
                 "address": channel.address,
+                "owner_l2_name": channel.owner_l2_name,
+                "enabled": channel.enabled,
             })
         })
         .collect();
@@ -3474,15 +3698,27 @@ SET
             let is_primary = index == 0;
             tx.execute(
                 r#"
-INSERT INTO identity_ichs (ich_id, ilk_id, tenant_id, channel_type, address, is_primary, added_at)
-VALUES ($1::text::uuid, $2::text::uuid, $3::text::uuid, $4, $5, $6, NOW())
+INSERT INTO identity_ichs (
+    ich_id,
+    ilk_id,
+    tenant_id,
+    channel_type,
+    address,
+    owner_l2_name,
+    is_primary,
+    enabled,
+    added_at
+)
+VALUES ($1::text::uuid, $2::text::uuid, $3::text::uuid, $4, $5, $6, $7, $8, NOW())
 ON CONFLICT (ich_id) DO UPDATE
 SET
     ilk_id = EXCLUDED.ilk_id,
     tenant_id = EXCLUDED.tenant_id,
     channel_type = EXCLUDED.channel_type,
     address = EXCLUDED.address,
-    is_primary = EXCLUDED.is_primary
+    owner_l2_name = EXCLUDED.owner_l2_name,
+    is_primary = EXCLUDED.is_primary,
+    enabled = EXCLUDED.enabled
 "#,
                 &[
                     &ich_uuid,
@@ -3490,7 +3726,9 @@ SET
                     &tenant_uuid,
                     &channel.channel_type,
                     &channel.address,
+                    &channel.owner_l2_name,
                     &is_primary,
+                    &channel.enabled,
                 ],
             )
             .await?;
@@ -3543,7 +3781,8 @@ SELECT
     name,
     domain,
     status,
-    settings
+    settings,
+    sponsor_tenant_id::text AS sponsor_tenant_id
 FROM identity_tenants
 ORDER BY created_at ASC
 "#,
@@ -3559,6 +3798,7 @@ ORDER BY created_at ASC
         let domain: Option<String> = row.get("domain");
         let status: String = row.get("status");
         let settings: Value = row.get("settings");
+        let sponsor_tenant_uuid: Option<String> = row.get("sponsor_tenant_id");
         store.tenants.insert(
             tenant_id.clone(),
             TenantRecord {
@@ -3567,6 +3807,7 @@ ORDER BY created_at ASC
                 domain,
                 status,
                 settings,
+                sponsor_tenant_id: sponsor_tenant_uuid.map(|uuid| format!("tnt:{uuid}")),
             },
         );
     }
@@ -3621,7 +3862,9 @@ SELECT
     ich_id::text AS ich_id,
     ilk_id::text AS ilk_id,
     channel_type,
-    address
+    address,
+    owner_l2_name,
+    enabled
 FROM identity_ichs
 ORDER BY added_at ASC
 "#,
@@ -3634,6 +3877,8 @@ ORDER BY added_at ASC
             ich_id: format!("ich:{}", row.get::<_, String>("ich_id")),
             channel_type: row.get("channel_type"),
             address: row.get("address"),
+            owner_l2_name: row.get("owner_l2_name"),
+            enabled: row.get("enabled"),
         };
         if let Some(ilk) = store.ilks.get_mut(&ilk_id) {
             if !ilk
@@ -3685,6 +3930,11 @@ async fn upsert_tenant_in_db(
 ) -> Result<(), IdentityError> {
     let tenant_uuid = parse_prefixed_uuid(&tenant.tenant_id, "tnt")?;
     let tenant_uuid = tenant_uuid.to_string();
+    let sponsor_tenant_uuid = tenant
+        .sponsor_tenant_id
+        .as_deref()
+        .map(|tenant_id| parse_prefixed_uuid(tenant_id, "tnt").map(|uuid| uuid.to_string()))
+        .transpose()?;
     let (client, connection) = database_config.connect(NoTls).await?;
     tokio::spawn(async move {
         if let Err(err) = connection.await {
@@ -3695,14 +3945,23 @@ async fn upsert_tenant_in_db(
     client
         .execute(
             r#"
-INSERT INTO identity_tenants (tenant_id, name, domain, status, settings, updated_at)
-VALUES ($1::text::uuid, $2, $3, $4, $5::jsonb, NOW())
+INSERT INTO identity_tenants (
+    tenant_id,
+    name,
+    domain,
+    status,
+    settings,
+    sponsor_tenant_id,
+    updated_at
+)
+VALUES ($1::text::uuid, $2, $3, $4, $5::jsonb, $6::text::uuid, NOW())
 ON CONFLICT (tenant_id) DO UPDATE
 SET
     name = EXCLUDED.name,
     domain = EXCLUDED.domain,
     status = EXCLUDED.status,
     settings = EXCLUDED.settings,
+    sponsor_tenant_id = EXCLUDED.sponsor_tenant_id,
     updated_at = NOW()
 "#,
             &[
@@ -3711,6 +3970,7 @@ SET
                 &tenant.domain,
                 &tenant.status,
                 &tenant.settings,
+                &sponsor_tenant_uuid,
             ],
         )
         .await?;
@@ -4306,6 +4566,7 @@ mod tests {
                 domain: Some("tenant-a.local".to_string()),
                 status: "active".to_string(),
                 settings: json!({}),
+                sponsor_tenant_id: None,
             },
         );
         store.ilks.insert(
@@ -4322,6 +4583,8 @@ mod tests {
                     ich_id: "ich:33333333-3333-3333-3333-333333333333".to_string(),
                     channel_type: "slack".to_string(),
                     address: "U123".to_string(),
+                    owner_l2_name: Some("IO.slack@motherbee".to_string()),
+                    enabled: true,
                 }],
                 deleted_at_ms: None,
             },
@@ -4366,6 +4629,7 @@ mod tests {
                 domain: Some("4iplatform.com".to_string()),
                 status: "active".to_string(),
                 settings: json!({}),
+                sponsor_tenant_id: None,
             },
         );
 
@@ -4375,6 +4639,7 @@ mod tests {
                 domain: None,
                 status: Some("active".to_string()),
                 settings: None,
+                sponsor_tenant_id: None,
             })
             .expect("resolve by name");
         assert_eq!(
@@ -4393,6 +4658,7 @@ mod tests {
                 domain: Some("4iplatform.com".to_string()),
                 status: Some("active".to_string()),
                 settings: None,
+                sponsor_tenant_id: None,
             })
             .expect("resolve by domain");
         assert_eq!(
@@ -4410,6 +4676,84 @@ mod tests {
     }
 
     #[test]
+    fn default_tenant_id_prefers_root_tenant_without_sponsor() {
+        let mut store = IdentityStore::default();
+        store.tenants.insert(
+            "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+            TenantRecord {
+                tenant_id: "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                name: "child".to_string(),
+                domain: None,
+                status: "active".to_string(),
+                settings: json!({}),
+                sponsor_tenant_id: Some("tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string()),
+            },
+        );
+        store.tenants.insert(
+            "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+            TenantRecord {
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                name: "root".to_string(),
+                domain: None,
+                status: "active".to_string(),
+                settings: json!({}),
+                sponsor_tenant_id: None,
+            },
+        );
+
+        assert_eq!(
+            store.default_tenant_id().as_deref(),
+            Some("tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        );
+    }
+
+    #[test]
+    fn set_ich_enabled_updates_existing_channel() {
+        let mut store = IdentityStore::default();
+        store.tenants.insert(
+            "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+            TenantRecord {
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                name: "fluxbee".to_string(),
+                domain: None,
+                status: "active".to_string(),
+                settings: json!({}),
+                sponsor_tenant_id: None,
+            },
+        );
+        store.ilks.insert(
+            "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+            IlkRecord {
+                ilk_id: "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                ilk_type: "human".to_string(),
+                registration_status: "complete".to_string(),
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                identification: json!({}),
+                roles: vec![],
+                capabilities: vec![],
+                channels: vec![ChannelRecord {
+                    ich_id: "ich:cccccccc-cccc-cccc-cccc-cccccccccccc".to_string(),
+                    channel_type: "slack".to_string(),
+                    address: "U123".to_string(),
+                    owner_l2_name: Some("IO.slack.support@motherbee".to_string()),
+                    enabled: false,
+                }],
+                deleted_at_ms: None,
+            },
+        );
+
+        let out = store
+            .set_ich_enabled("ich:cccccccc-cccc-cccc-cccc-cccccccccccc", true)
+            .expect("enable ich");
+        assert_eq!(out.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            out.get("owner_l2_name").and_then(Value::as_str),
+            Some("IO.slack.support@motherbee")
+        );
+        assert!(store.ilks["ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"].channels[0].enabled);
+    }
+
+    #[test]
     fn list_ilks_payload_returns_compact_identity_rows() {
         let mut store = IdentityStore::default();
         store.tenants.insert(
@@ -4420,6 +4764,7 @@ mod tests {
                 domain: None,
                 status: "active".to_string(),
                 settings: json!({}),
+                sponsor_tenant_id: None,
             },
         );
         store.ilks.insert(
@@ -4436,6 +4781,8 @@ mod tests {
                     ich_id: "ich:cccccccc-cccc-cccc-cccc-cccccccccccc".to_string(),
                     channel_type: "slack".to_string(),
                     address: "U123".to_string(),
+                    owner_l2_name: Some("IO.slack.support@motherbee".to_string()),
+                    enabled: false,
                 }],
                 deleted_at_ms: None,
             },

@@ -27,7 +27,7 @@ pub const OPA_VERSION: u32 = 1;
 pub const OPA_MAX_WASM_SIZE: usize = 4 * 1024 * 1024;
 
 pub const IDENTITY_MAGIC: u32 = 0x4A534944; // "JSID"
-pub const IDENTITY_VERSION: u32 = 3;
+pub const IDENTITY_VERSION: u32 = 4;
 pub const MEMORY_MAGIC: u32 = 0x4A534D4D; // "JSMM"
 pub const MEMORY_VERSION: u32 = 1;
 pub const MEMORY_MAX_DATA_SIZE: usize = 4 * 1024 * 1024;
@@ -338,9 +338,9 @@ pub struct TenantEntry {
     pub flags: u16,
     pub _pad0: [u8; 5],
     pub max_ilks: u32,
+    pub sponsor_tenant_id: [u8; 16],
     pub created_at: u64,
     pub updated_at: u64,
-    pub _reserved: [u8; 8],
 }
 
 #[repr(C)]
@@ -372,13 +372,15 @@ pub struct IlkEntry {
 pub struct IchEntry {
     pub ich_id: [u8; 16],
     pub ilk_id: [u8; 16],
+    pub tenant_id: [u8; 16],
     pub channel_type: [u8; ICH_CHANNEL_TYPE_MAX_LEN],
     pub address: [u8; ICH_ADDRESS_MAX_LEN],
     pub flags: u16,
+    pub owner_l2_name: [u8; 128],
     pub is_primary: u8,
+    pub enabled: u8,
     pub _pad0: [u8; 5],
     pub added_at: u64,
-    pub _reserved: [u8; 16],
 }
 
 #[repr(C)]
@@ -3642,9 +3644,9 @@ fn empty_tenant_entry() -> TenantEntry {
         flags: 0,
         _pad0: [0u8; 5],
         max_ilks: 0,
+        sponsor_tenant_id: [0u8; 16],
         created_at: 0,
         updated_at: 0,
-        _reserved: [0u8; 8],
     }
 }
 
@@ -3676,13 +3678,15 @@ fn empty_ich_entry() -> IchEntry {
     IchEntry {
         ich_id: [0u8; 16],
         ilk_id: [0u8; 16],
+        tenant_id: [0u8; 16],
         channel_type: [0u8; ICH_CHANNEL_TYPE_MAX_LEN],
         address: [0u8; ICH_ADDRESS_MAX_LEN],
         flags: 0,
+        owner_l2_name: [0u8; 128],
         is_primary: 0,
+        enabled: 0,
         _pad0: [0u8; 5],
         added_at: 0,
-        _reserved: [0u8; 16],
     }
 }
 
@@ -4008,9 +4012,9 @@ mod tests {
             flags: FLAG_ACTIVE,
             _pad0: [0u8; 5],
             max_ilks: 0,
+            sponsor_tenant_id: [0u8; 16],
             created_at: 1,
             updated_at: 1,
-            _reserved: [0u8; 8],
         };
         writer.upsert_tenant_entry(tenant).expect("tenant upsert");
 
@@ -4146,9 +4150,9 @@ mod tests {
             flags: FLAG_ACTIVE,
             _pad0: [0u8; 5],
             max_ilks: 100,
+            sponsor_tenant_id: [0u8; 16],
             created_at: 1,
             updated_at: 1,
-            _reserved: [0u8; 8],
         };
         let ilk = IlkEntry {
             ilk_id: [4u8; 16],
@@ -4174,13 +4178,15 @@ mod tests {
         let ich = IchEntry {
             ich_id: [5u8; 16],
             ilk_id: [4u8; 16],
+            tenant_id: [3u8; 16],
             channel_type: [0u8; ICH_CHANNEL_TYPE_MAX_LEN],
             address: [0u8; ICH_ADDRESS_MAX_LEN],
             flags: FLAG_ACTIVE,
+            owner_l2_name: [0u8; 128],
             is_primary: 1,
+            enabled: 0,
             _pad0: [0u8; 5],
             added_at: 1,
-            _reserved: [0u8; 16],
         };
         let alias = IlkAliasEntry {
             old_ilk_id: [6u8; 16],
