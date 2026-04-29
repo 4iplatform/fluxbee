@@ -10,6 +10,7 @@
 ## Dependency order
 
 ```
+
 Phase 0 (contracts) → must complete before any track starts
 Track A  (manifest + host)           → unblocked after Phase 0
 Track B  (reconciler)                → unblocked after Phase 0; integration needs Track A
@@ -19,6 +20,7 @@ Track E  (failure classifier)        → unblocked after Phase 0
 Track F  (seed data preparation)     → unblocked immediately, no prerequisites; blocks agent readiness
 Track H  (designer + design auditor) → unblocked after Phase 0; integration needs Track A
 Track G  (final assembly)            → blocked until A+B+C+D+E+F+H are complete
+
 ```
 
 ---
@@ -39,6 +41,7 @@ These are design tasks, not code tasks. Output is a frozen decision document per
 **Deliverable:** Rust struct definition + JSON example per spec section 6.4, **plus** a frozen table of exact admin actions used to build the snapshot.
 
 Struct fields:
+
 - `snapshot_version`, `snapshot_id`, `captured_at_start/end`
 - `scope.hives[]`, `scope.resources[]`
 - `atomicity.mode = "best_effort_multi_call"`, `is_atomic: false`
@@ -83,6 +86,7 @@ Rule: if a required action fails for a hive that has solution-owned resources �
 **Deliverable:** frozen translation table per spec section 7.4, extended with risk classification.
 
 Rules:
+
 - This is the contract between reconciler and plan compiler.
 - Must be represented as code (match arm or lookup table) in a shared module.
 - Plan compiler must import and use this table; must not redefine it.
@@ -115,6 +119,7 @@ Each `compiler_class` must also declare its **risk class**:
 | BLOCKED_IMMUTABLE_CHANGE | none — stop | blocked_until_operator |
 
 Risk classes:
+
 - `non_destructive`: safe to auto-proceed after CONFIRM 2
 - `restarting`: causes service interruption; highlighted in CONFIRM 2 summary
 - `destructive`: irreversible or data-loss risk; explicitly called out in CONFIRM 2 with individual confirmation
@@ -170,6 +175,7 @@ Define how design audit "score" is produced: structured field in `design_audit_v
 
 ### [x] CFZ-11 — pipeline_runs persistence schema
 **Deliverable:** SQL table definition + Rust struct for `PipelineRunRecord`.
+
 ```sql
 CREATE TABLE pipeline_runs (
   pipeline_run_id TEXT PRIMARY KEY,
@@ -184,6 +190,7 @@ CREATE TABLE pipeline_runs (
   updated_at_ms INTEGER NOT NULL,
   interrupted_at_ms INTEGER
 );
+
 ```
 `state_json` holds serialized `PipelineRunState` with refs to all active artifacts.
 
@@ -205,9 +212,11 @@ Without this, each track writes cookbooks with a different shape and agents cann
   "recorded_from_run": null,
   "seed_kind": "manual | observed"
 }
+
 ```
 
 Field rules:
+
 - `layer`: mandatory, must be one of the four values
 - `pattern_key`: mandatory, lowercase with underscores, unique per layer
 - `trigger`: mandatory, one sentence, no JSON
@@ -299,6 +308,7 @@ Logic in CONFIRM handler:
    - Transition pipeline to Reconcile stage
    - Trigger snapshot builder (Track B)
    - Return `{ mode: "pipeline", stage: "reconcile_started" }`
+
 3. If no pipeline run at Confirm1: fall through to legacy `plan_compile_pending` check (backward compat)
 4. If no legacy pending either: fall through to SCMD pending check
 
@@ -315,9 +325,11 @@ Logic in CONFIRM handler:
    - Retrieve `executor_plan` from `pipeline_run.state_json`
    - Execute via `execute_executor_plan_with_context`
    - Transition to Execute stage
+
 3. If no pipeline run at Confirm2: fall through to legacy check
 
 Host shows CONFIRM 2 payload per spec 14.3:
+
 - Plan summary (N steps, resources affected)
 - Destructive ops explicitly listed (all ops with risk_class == `destructive` per CFZ-5 table)
 - Restarting ops highlighted (risk_class == `restarting`)
@@ -466,6 +478,7 @@ Acceptance: CONFIRM 2 triggers executor using plan from pipeline state; legacy f
 **Depends on:** Track B (build_task_packets feed the loop)
 
 ### [x] TC-1 — BuildTaskPacket Rust struct
+
 ```rust
 struct BuildTaskPacket {
     task_packet_version: String,
@@ -482,11 +495,14 @@ struct BuildTaskPacket {
     max_attempts: u32,
     cookbook_context: Vec<Value>,
 }
+
 ```
+
 - `Serialize`, `Deserialize`, `Clone`
 - `save_task_packet(state_dir, packet) -> Result<PathBuf>`: writes to `{state_dir}/task_packets/{task_id}.json`
 
 ### [x] TC-2 — ArtifactBundle Rust struct
+
 ```rust
 struct ArtifactBundle {
     bundle_version: String,
@@ -502,12 +518,15 @@ struct ArtifactBundle {
     generated_at_ms: u64,
     generator_model: String,
 }
+
 ```
+
 - `save_artifact_bundle(state_dir, bundle) -> Result<PathBuf>`
 - `load_artifact_bundle(state_dir, bundle_id) -> Result<Option<ArtifactBundle>>`
 - Content digest: `sha256(serde_json::to_string_pretty(&bundle.artifact)?)`
 
 ### [x] TC-3 — ArtifactAuditVerdict Rust struct
+
 ```rust
 struct ArtifactAuditVerdict {
     verdict_id: String,
@@ -526,9 +545,11 @@ struct AuditFinding {
     message: String,
     severity: AuditSeverity,      // Error | Warning | Info
 }
+
 ```
 
 ### [x] TC-4 — RepairPacket Rust struct
+
 ```rust
 struct RepairPacket {
     repair_packet_version: String,
@@ -544,7 +565,9 @@ struct RepairPacket {
     retry_allowed: bool,
     attempt: u32,
 }
+
 ```
+
 - Built by the artifact loop controller from the `ArtifactAuditVerdict`
 
 ### [x] TC-5 — RealProgrammerTool: AI tool for artifact generation
@@ -562,6 +585,7 @@ struct RepairPacket {
 - Acceptance: given a build_task_packet for a config_only AI runtime, produces a valid ArtifactBundle with package.json + default-config.json + system.txt
 
 Current code status:
+
 - `RealProgrammerTool` now exists as `fluxbee_real_programmer`.
 - The host-side runner uses a strict `submit_artifact_bundle` tool, injects artifact cookbook context plus handbook text into the prompt, and converts the submitted payload into canonical `ArtifactBundle` records with computed digest / metadata.
 - The current supported artifact contract is intentionally still `runtime_package`, but that runtime-package path now supports both `inline_package` and `bundle_upload` targets; other artifact kinds remain outside the implemented scope for now.
@@ -587,6 +611,7 @@ This boundary must be a doc comment on the function, not just an inline note, so
 - Implement `run_artifact_loop(context, task_packets: Vec<BuildTaskPacket>) -> Result<Vec<ApprovedArtifact>>`
 - For each task_packet:
   ```
+
   for attempt in 0..packet.max_attempts (default 3):
       bundle = run_real_programmer(context, packet, repair_packet.as_ref())
       verdict = audit_artifact(&packet, &bundle)
@@ -601,11 +626,13 @@ This boundary must be a doc comment on the function, not just an inline note, so
       update packet.attempt += 1
   return Err if max_attempts exceeded
   ```
+
 - `ApprovedArtifact`: bundle_id, task_id, artifact_kind, content_digest, path
 - `save_approved_artifact_registry(state_dir, pipeline_run_id, artifacts)`: JSON file linking delta ops to approved bundles
 - Acceptance: artifact loop with a failing bundle (missing file) recovers on attempt 2 after repair packet directs programmer to add the file
 
 Current code status:
+
 - `run_pipeline_artifact_loop(...)` is implemented and now calls `run_real_programmer_with_context(...)` instead of the deprecated infrastructure specialist bridge.
 - It persists task packets, bundles, repair packets, approved artifact registry, and trace events; repeated repair signatures stop early as required.
 - Approved runtime-package bundles are now finalized into canonical `publish_source` payloads before plan compilation:
@@ -635,12 +662,14 @@ Current code status:
       timestamp_ms: u64,
   }
   ```
+
 - Add `artifact_loop_trace: Option<Vec<ArtifactLoopTraceEvent>>` to pipeline trace
 - Frontend: `renderArtifactLoopTrace(events)` — show each attempt with status icon and expand for findings
 - Collapsed by default; auto-expand if any rejected or blocked
 - Acceptance: operator sees artifact loop retries in trace panel without being interrupted
 
 Current code status:
+
 - `artifact_loop_trace` is already persisted into pipeline state during the artifact loop.
 - The frontend now renders it as a collapsed `Agent activity · artifact_loop` panel, and auto-expands it when a repairable/rejected/blocked status appears.
 - Confirm2 payloads and artifact-loop block responses now surface that trace directly, so the operator can inspect internal retries without leaving the chat flow.
@@ -674,10 +703,12 @@ Current code status:
 **Legacy path policy:** the free-form chat path (no delta_report) is explicitly `#[deprecated]` from this point. It must not receive new features or prompt improvements. All future investment goes into the delta_report path. The legacy path exists only for backward compatibility with existing free-form sessions and will be removed after Track G E2E tests pass.
 
 Mark in code:
+
 ```rust
 // DEPRECATED: free-form task path — use delta_report path for all new pipeline flows.
 // This path is preserved only for backward compatibility with pre-rearchitecture sessions.
 // Do not add features here.
+
 ```
 
 - Change `PlanCompilerTool` input args schema:
@@ -692,6 +723,7 @@ Mark in code:
 - Acceptance: plan compiler receiving a delta_report with 3 operations produces an executor_plan with the correct step sequence per the translation table
 
 Implementation note:
+
 - `PlanCompilerTool` now accepts `delta_report` and `approved_artifacts`, injects them into the plan compiler prompt, and routes both pipeline and legacy free-form calls through the same prevalidation/retry transaction helper.
 - The free-form path still exists and still stages `plan_compile_pending`; that is intentional backward compatibility.
 
@@ -724,24 +756,26 @@ Implementation note:
 The current Archi system prompt was written for the old single-programmer architecture. It must be rewritten to be compatible with the new pipeline model. Without this, Archi will continue offering the old flow, call deprecated tools, and confuse the two CONFIRM semantics.
 
 What changes:
+
 - Remove all references to `fluxbee_programmer` — replace with `fluxbee_plan_compiler` for the legacy free-form path
 - Remove references to `fluxbee_infrastructure_specialist`
 - Add pipeline intent detection guidance:
-  - When operator intent is deployment/topology/solution design → offer to start pipeline (ask, don't assume)
+  - When operator intent is clear simple/multi-step mutation → call `fluxbee_plan_compiler` directly
+  - When operator intent is deployment/topology/solution design that needs manifest/reconcile → call `fluxbee_start_pipeline` directly
   - When operator intent is a quick query, SCMD, or status check → do not start pipeline
   - When operator intent is ambiguous → ask before choosing
 - Add `StartPipelineTool` to Archi's available tools
-- Add CONFIRM 1 context: "When a pipeline is at Confirm1 stage, CONFIRM approves the design direction — not execution. Tell the operator explicitly what they are approving."
+- Keep CONFIRM 1 context only as compatibility/recovery: "When a pipeline is at Confirm1 stage, CONFIRM approves the design direction — not execution."
 - Add CONFIRM 2 context: "When a pipeline is at Confirm2 stage, CONFIRM approves execution of the listed plan steps. Highlight destructive and restarting ops explicitly before asking for confirmation."
-- Remove the old `"Reply CONFIRM to execute or CANCEL to discard"` instruction for plan_compiler results — that flow is now handled by CONFIRM 2 from pipeline state
-- Keep backward compat language for free-form plan_compile path (deprecated, but still works)
+- Keep `"Reply CONFIRM to execute or CANCEL to discard"` for direct plan_compiler results; that is the single confirmation for simple operations.
 
-Acceptance: Archi, given "quiero desplegar soporte para acme", asks the operator if they want to start the full pipeline — does not silently invoke plan_compiler as before.
+Acceptance: Archi, given a clear mutation request, calls plan_compiler without asking first. Given a broad design request, starts pipeline planning without asking first.
 
 Current code status:
-- The Archi host prompt now distinguishes pipeline-eligible intents from quick query / SCMD / legacy free-form plan intents.
-- `fluxbee_start_pipeline` is explicitly preferred for full design/topology work, and the prompt now documents the staged start semantics plus the `si/sí/ok/adelante/start/CONFIRM` launch path.
-- The old `fluxbee_plan_compiler` wording was narrowed to the deprecated free-form path only, and the CONFIRM text now distinguishes pipeline Confirm1 vs Confirm2 from the legacy free-form planner confirmation.
+
+- The Archi host prompt now distinguishes direct plan_compiler mutation intents from broad manifest/reconcile pipeline intents.
+- `fluxbee_start_pipeline` no longer stages a start confirmation; it launches internal planning directly.
+- `fluxbee_plan_compiler` is now described as the primary executor-plan mutation path for clear operations.
 
 ### [x] TD-7 — Deprecate infrastructure_specialist
 - Remove `ArchitectInfrastructureSpecialistTool` from Archi's tool registry
@@ -786,7 +820,9 @@ fn classify_failure_deterministic(
     error_code: Option<&str>,
     context: &FailureContext,
 ) -> Option<FailureClass>
+
 ```
+
 - Returns `None` if no deterministic rule matches (caller then invokes AI classifier)
 - Pattern matching on error_text (lowercase, trimmed):
   - contains "runtime not materialized" -> ExecutionEnvironmentMissing
@@ -808,6 +844,7 @@ fn classify_failure_deterministic(
 ### [x] TE-3 — Failure routing table
 - Given `FailureClass` -> route to repair loop:
   ```
+
   DesignIncomplete / DesignConflict -> design loop (if < max iterations)
   ArtifactContractInvalid / ArtifactLayoutInvalid -> artifact loop repair
   PlanInvalid / PlanContractInvalid -> plan compiler retry
@@ -817,6 +854,7 @@ fn classify_failure_deterministic(
   SnapshotPartialBlocking -> escalate to operator
   UnknownResidual -> escalate to operator
   ```
+
 - Implement `route_failure(class, pipeline_state) -> FailureRoutingDecision`
 - `FailureRoutingDecision`: RetryArtifact, RetryPlanCompile, RetryDesign, RetryExecutor, EscalateToOperator
 - Acceptance: routing table test — each class returns expected decision
@@ -831,6 +869,16 @@ fn classify_failure_deterministic(
     - recommended next action
   - Host presents options: retry from this stage / go back to design / discard
 - Acceptance: UnknownResidual failure in artifact loop causes pipeline to pause and show operator escalation message
+
+Implementation status (Fase 2 close-out):
+
+- `block_pipeline_run` and `block_pipeline_run_with_context` now persist `pre_block_stage` in pipeline state, so retry knows which checkpoint to return to.
+- `fluxbee_pipeline_action` tool exposes the three operator options:
+  - `discard` — transitions Blocked → Failed, frees the session.
+  - `restart_from_design` — closes the blocked run as Failed and starts a fresh pipeline with the same task and `solution_id` from `Design`.
+  - `retry` — returns the run to its prior CONFIRM checkpoint (`Confirm1` for Reconcile/ArtifactLoop/PlanCompile/PlanValidation; `Confirm2` for Execute/Verify) so the operator can re-engage with a CONFIRM message.
+- `fluxbee_start_pipeline` no longer hard-errors when a Blocked run exists: it returns `status: "blocked_run_pending"` with the three options inline so Archi can prompt the operator and call `fluxbee_pipeline_action`.
+- ARCHI_SYSTEM_PROMPT documents the resolution flow under "Resolving a blocked pipeline".
 
 ---
 
@@ -926,14 +974,12 @@ Acceptance: designer prompted with this handbook produces manifests with correct
 **Blocked by:** Phase 0 (CFZ-1, CFZ-6, CFZ-9, CFZ-10, CFZ-13)  
 **Primary file:** `src/bin/sy_architect.rs`  
 **Depends on:** Track A (manifest storage, get_manifest_current, pipeline_runs)  
-**Note:** TG-1 uses these tools — Track G is blocked until Track H is complete.
+**Note:** TG-1 uses these agents internally — Track G is blocked until Track H is complete.
 
-This is the largest missing track. TG-1 currently says "invoke designer AI tool" and "invoke design_auditor AI tool" as if they exist — they do not. This track implements them.
+This is the largest missing track. TG-1 needs a designer agent and a design_auditor agent. They are internal pipeline runners, not public tools exposed to Archi.
 
-### [x] TH-1 — DesignerTool: AI tool for solution manifest generation
+### [x] TH-1 — Designer agent runner for solution manifest generation
 
-- Implement `DesignerTool` as `FunctionTool`
-- Tool name: `fluxbee_designer`
 - Input args: `task: String` (human need description), `solution_id: Option<String>` (existing solution to extend), `context: Option<String>` (additional constraints from operator)
 - Allowed tools available to the designer AI during its run:
   - `query_hive` (read-only, already exists)
@@ -956,18 +1002,20 @@ This is the largest missing track. TG-1 currently says "invoke designer AI tool"
 - Acceptance: given "deploy AI support for acme on worker-220", produces a valid `SolutionManifestV2` with correct `desired_state` sections and no `executor_plan` content
 
 Current code status:
-- `fluxbee_designer` now exists as a `FunctionTool`.
-- It runs with `query_hive` + `get_manifest_current`, injects handbook + design cookbook context, validates the returned manifest via `validate_manifest_v2`, persists it, and returns `solution_manifest + solution_id + human_summary`.
-- The tool is also used internally by the new `run_design_loop(...)`.
 
-### [x] TH-2 — DesignerTool trace
+- The designer is implemented as an internal runner used by `run_design_loop(...)`.
+- It runs with `query_hive` + `get_manifest_current`, injects handbook + design cookbook context, validates the returned manifest via `validate_manifest_v2`, persists it, and returns `solution_manifest + solution_id + human_summary`.
+- It is not registered in `ArchitectAdminReadToolsProvider`; Archi cannot call it directly.
+
+### [x] TH-2 — Designer trace
 - `DesignerTrace` struct: task, solution_id, query_hive_calls (count), manifest_version, section_count, validation_result
 - Stored in pipeline trace per stage
 - Frontend: `renderDesignerTrace(trace)` — collapsed panel showing task sent, live queries made, manifest sections produced
 - Acceptance: designer trace appears in pipeline trace panel after designer completes
 
 Current code status:
-- `DesignerTrace` now exists in backend output and is emitted by `fluxbee_designer`.
+
+- `DesignerTrace` now exists in backend output and is emitted by the internal designer runner.
 - `run_design_loop(...)` accumulates per-iteration `designer_traces` and persists them in pipeline state.
 - The frontend now renders the designer trace as a collapsed "Agent activity · designer" panel in chat responses that came from `fluxbee_start_pipeline`.
 
@@ -976,6 +1024,7 @@ Current code status:
 - `DesignLoopOutput`: manifest, audit_verdict, iterations_used, stopped_reason
 - Loop per CFZ-6 stop conditions:
   ```
+
   for iteration in 0..MAX_DESIGN_ITERATIONS (default 3):
       manifest = run_designer(context, task, solution_id, feedback.as_ref())
       verdict = run_design_auditor(context, &manifest)
@@ -988,18 +1037,18 @@ Current code status:
       feedback = build_design_feedback(&verdict)
   if blocked: escalate to host
   ```
+
 - `feedback` passed to next iteration is a structured string extracted from `design_audit_verdict.findings`
 - Acceptance: design loop with an intentionally incomplete manifest (missing topology) iterates and improves on second attempt
 
 Current code status:
+
 - `run_design_loop(...)` now exists and is wired into pipeline start.
 - It persists the manifest and `design_audit_{iteration}.json` per iteration, carries structured feedback into the next designer pass, and stops on `pass`, `reject`, no score improvement, repeated blocker signature, or max iterations.
 - It also stores `design_loop_trace` in pipeline state for later frontend rendering.
 
-### [x] TH-4 — DesignAuditorTool: AI tool for manifest review
+### [x] TH-4 — Design auditor agent runner for manifest review
 
-- Implement `DesignAuditorTool` as `FunctionTool`
-- Tool name: `fluxbee_design_auditor`
 - Input: full `SolutionManifestV2` JSON + optional previous audit context
 - System prompt (`DESIGN_AUDITOR_SYSTEM_PROMPT`):
   - Role: review a solution_manifest and produce a `design_audit_verdict`
@@ -1020,16 +1069,19 @@ Current code status:
     "summary": "one paragraph in plain language for the operator"
   }
   ```
+
 - `design_audit_verdict.score` drives loop stop conditions (CFZ-6)
 - `blocking_issues` strings are used for dedup detection (same key twice = stop)
 - Acceptance: auditor on a manifest missing all node definitions returns `revise` verdict with score <= 3 and blocking issue `NODES_MISSING`
 
 Current code status:
-- `fluxbee_design_auditor` now exists as a `FunctionTool`.
+
+- The design auditor is implemented as an internal runner used by `run_design_loop(...)`.
 - It reads a full manifest plus optional prior context, forces one `submit_design_audit_verdict` call, validates `status`/`score`/`findings`, and returns a `DesignAuditVerdict`.
-- The tool is also used internally by `run_design_loop(...)`.
+- It is not registered in `ArchitectAdminReadToolsProvider`; Archi cannot call it directly.
 
 ### [x] TH-5 — DesignAuditVerdict Rust struct
+
 ```rust
 struct DesignAuditVerdict {
     verdict_id: String,
@@ -1048,7 +1100,9 @@ struct DesignFinding {
     message: String,
     severity: AuditSeverity,
 }
+
 ```
+
 - Stored in pipeline state; persisted to `{state_dir}/pipeline/{run_id}/design_audit_{iteration}.json`
 - Acceptance: struct round-trips through JSON; verdict stored and loadable
 
@@ -1061,8 +1115,9 @@ struct DesignFinding {
 - Acceptance: CONFIRM 1 message includes hive count, node count, audit score, and any blocking issues in readable form
 
 Current code status:
+
 - `build_confirm1_summary(...)` now exists and is covered by tests for hive/node/route counts, runtime extraction, advisory highlights, and warning surfacing.
-- The summary is now wired into `fluxbee_start_pipeline` and is rendered into the operator-facing Confirm1 message.
+- The summary is now persisted in pipeline state. It is rendered only if an older/recovered run is still parked at Confirm1; new runs auto-advance to Confirm2.
 
 ### [x] TH-7 — Design loop trace rendering
 - `DesignLoopTraceEvent` per iteration: iteration number, status (designing/auditing/pass/revise), score, blocking_issue_count, stopped_reason
@@ -1071,6 +1126,7 @@ Current code status:
 - Acceptance: operator sees design loop iterations in trace panel
 
 Current code status:
+
 - `DesignLoopTraceEvent` now exists and is persisted in pipeline state as `design_loop_trace`.
 - The frontend now renders it as a collapsed "Agent activity · design_loop" panel in chat responses from `fluxbee_start_pipeline`.
 
@@ -1083,7 +1139,7 @@ Current code status:
 
 ### [x] TG-1 — Connect design loop → CONFIRM 1 → reconciler
 
-**Requires Track H complete** (`DesignerTool`, `DesignAuditorTool`, `run_design_loop` all implemented and tested).
+**Requires Track H complete** (designer runner, design auditor runner, `run_design_loop` all implemented and tested).
 
 **Pipeline trigger — how it starts:**
 
@@ -1099,31 +1155,31 @@ Trigger flow:
 **What makes intent pipeline-eligible vs free-form:**
 
 Archi system prompt (TD-8) must define this distinction explicitly:
-- Pipeline-eligible: intent involves creating a solution, adding nodes, changing topology, deploying runtimes, setting up routing — anything that benefits from manifest + reconciliation
-- Free-form (old path): single admin queries, status checks, SCMD operations, quick one-step mutations that don't need a manifest
 
-Archi must NOT silently start a pipeline run. It always asks first. If the operator declines, Archi falls back to free-form / SCMD suggestions.
+- Pipeline-eligible: intent involves creating a solution, changing topology, or broad desired-state work that benefits from manifest + reconciliation
+- Plan compiler direct path: clear mutations, including quick one-step and multi-step admin-backed changes that do not need manifest design
+
+Archi must not ask for permission before starting internal planning when the intent is clear. The operator confirms once before execution, after an executor plan exists. `Confirm1` remains only as a compatibility/recovery handler for older in-flight runs.
 
 - Add `start_pipeline_run(state, session_id, solution_id) -> Result<PipelineRunRecord>`
-- Add `StartPipelineTool` as an internal Archi tool (not shown to operator; called after operator confirms intent):
+- Add `StartPipelineTool` as an internal Archi tool:
   - Input: `task: String`, `solution_id: Option<String>`
-  - Stages a pending pipeline start request for the session
-  - Returns an operator-facing confirmation message; actual pipeline creation happens only after the operator confirms
+  - Starts the design loop directly; no pending pre-confirmation
 - Call `run_design_loop(context, task, solution_id, operator_context)` (TH-3):
-  - Internally calls `DesignerTool` and `DesignAuditorTool` per iteration
+  - Internally calls the designer runner and design auditor runner per iteration
   - Returns `DesignLoopOutput { manifest, verdict, iterations_used, stopped_reason }`
 - If design loop stops with `verdict.status != Pass`: transition to Blocked; present blocking issues to operator
-- If design loop completes with pass verdict: transition to Confirm1; call `build_confirm1_summary` (TH-6); present to operator
-- On CONFIRM 1 (TA-7): transition to Reconcile; call `run_reconciler`; store delta_report + task_packets in pipeline state
-- Acceptance: full design → confirm → reconcile sequence produces a delta_report stored in pipeline state
+- If design loop completes with pass verdict: persist `Confirm1` compatibility state, then auto-advance to Reconcile without operator input.
+- Reconcile stores delta_report + task_packets in pipeline state and continues to ArtifactLoop or PlanCompile.
+- Acceptance: full design → reconcile → plan compile sequence produces a Confirm2 executor plan without human intervention before the final execution confirmation.
 
 Current code status:
+
 - `fluxbee_start_pipeline` now exists as an internal host tool.
-- It now stages a pending pipeline start request instead of launching immediately.
-- `handle_chat_message(...)` consumes that pending start structurally: free-text `si` / `sí` / `ok` / `adelante` / `start` and literal `CONFIRM` launch the pipeline; `no` / `CANCEL` discard it.
-- The actual execution path now lives behind that confirmation gate: create pipeline run in `Design`, execute `run_design_loop(...)`, transition to `Confirm1` on pass, or `Blocked` on failed design-loop stop conditions, and return the operator-facing Confirm1 message.
-- `handle_pipeline_confirm1(...)` was already wired and remains the bridge into snapshot + reconcile + downstream plan/artifact handling.
-- The full pipeline path is therefore now `StartPipelineTool -> Design loop -> Confirm1 -> Reconcile`.
+- It now launches the design loop immediately. The old pending-start helpers remain only as compatibility code.
+- The current execution path is: create pipeline run in `Design`, execute `run_design_loop(...)`, auto-advance through `Reconcile`, optional `ArtifactLoop`, and `PlanCompile`, then return the operator-facing Confirm2 plan.
+- `handle_pipeline_confirm1(...)` remains only for compatibility/recovery of older runs already parked at Confirm1.
+- The full pipeline path is therefore now `StartPipelineTool -> Design loop -> Reconcile -> ArtifactLoop? -> PlanCompile -> Confirm2`.
 
 ### [x] TG-2 — Connect reconciler → artifact loop → plan compiler
 - After reconciler: if `build_task_packets` non-empty, transition to ArtifactLoop stage; call `run_artifact_loop`
@@ -1135,6 +1191,7 @@ Current code status:
 - Acceptance: reconciler with 2 task_packets → artifact loop → plan compiler → executor_plan stored in pipeline
 
 Current code status:
+
 - Reconcile → PlanCompile is now wired for the no-artifact case: when `build_task_packets` is empty, the pipeline auto-invokes the plan compiler using `delta_report`, persists `executor_plan`, advances through `PlanValidation`, and emits a Confirm2 payload with destructive/restarting highlights.
 - ArtifactLoop now runs through the canonical `real_programmer -> artifact_auditor` path for the currently supported `runtime_package` scope:
   - `inline_package` and `bundle_upload` targets are both finalized into canonical `publish_source` payloads after approval
@@ -1150,6 +1207,7 @@ Current code status:
 - Acceptance: CONFIRM 2 triggers executor using plan from pipeline state; result stored as execution_report
 
 Current code status:
+
 - CONFIRM 2 now loads `executor_plan` from pipeline state, executes it, advances through `Execute -> Verify`, classifies/routs execution failures through the deterministic failure classifier, and finalizes the run as `Completed`, `Blocked`, or `Failed` as appropriate.
 - Successful verified runs now persist `verification_verdict` and append an observed `plan_compile` cookbook entry when eligible.
 
@@ -1186,6 +1244,7 @@ Current code status:
 - Acceptance: successful full pipeline run writes at minimum one `plan_compile` cookbook entry; failed pipeline writes nothing
 
 Current code status:
+
 - `verify_execution_result(...)` is now implemented deterministically and wired into the CONFIRM 2 success path.
 - Eligible runs now append observed `design`, `plan_compile`, and `artifact` cookbook entries only after verification passes; failed or unverified runs write nothing.
 
@@ -1202,6 +1261,285 @@ Current code status:
 | Full pipeline | E2E tests (TG-4 to TG-7) | manual with test harness |
 
 All reconciler and classifier tests must pass without any AI call.
+
+---
+
+---
+
+## Fase 2 — Refinamiento de comportamiento
+
+**Fecha:** 2026-04-25  
+**Origen:** diagnóstico de sesión de debug — fallo en `run_node` / exceso de preguntas al operador  
+**Principios:**
+- Archi es coordinador puro — conoce Fluxbee, ordena el trabajo, nunca ejecuta mutaciones
+- Toda mutación (simple o compleja) pasa por el plan_compiler
+- Los agentes iteran internamente hasta budget o límite — no preguntan al operador entre iteraciones
+- El handbook y el help de admin son la fuente de conocimiento operativo — deben ser completos
+- El resultado de cada tarea es visible y explícito en el chat
+
+---
+
+## Track I — Archi como coordinador puro
+
+**Objetivo:** Archi pierde todas las herramientas de escritura directa. El plan_compiler es el único ejecutor de mutaciones. Archi lee el handbook para conocer Fluxbee y conversar bien con el operador.
+
+**Depende de:** Track K (prompts), Track L (handbook)
+
+### [x] TI-1 — Remover tools de escritura del provider de Archi
+
+Sacar de `ArchitectAdminReadToolsProvider::register_tools`:
+
+- `ArchitectSystemWriteTool` (`fluxbee_system_write`)
+- `ArchitectSetNodeConfigTool` (`fluxbee_set_node_config`)
+- `ArchitectDeployWorkflowTool` (`fluxbee_deploy_workflow`)
+- `ArchitectDeployOpaPolicyTool` (`fluxbee_deploy_opa_policy`)
+- `ArchitectPublishRuntimePackageTool` (`fluxbee_publish_runtime_package`)
+
+Le quedan a Archi:
+
+- `fluxbee_system_get` — lectura del sistema
+- `fluxbee_plan_compiler` — único path para mutaciones
+- `fluxbee_start_pipeline` — para soluciones complejas
+
+Los agentes designer / design_auditor quedan sólo como implementación interna del pipeline. No se registran en el provider público de Archi.
+
+Acceptance: Archi no puede stagear ninguna mutación directa. Cualquier intento va por plan_compiler.
+
+### [x] TI-2 — Inyectar handbook en el prompt de Archi
+
+Hoy `ARCHI_SYSTEM_PROMPT` es una constante estática. Cambiar a una función `build_archi_prompt(handbook: Option<&str>) -> String` que:
+
+- Incluye el handbook si está disponible (`/etc/fluxbee/handbook_fluxbee.md` o path de dev)
+- Lo inyecta al final del prompt base, igual que Designer y RealProgrammer
+
+Acceptance: Archi conoce los naming conventions, las acciones disponibles y los campos de run_node con tenant_id.
+
+### [x] TI-3 — Actualizar descripción de `fluxbee_plan_compiler` tool
+
+La descripción actual dice "DEPRECATED free-form path". Cambiar para reflejar que es el único camino de mutaciones:
+
+- Eliminar la palabra DEPRECATED de la description
+- Aclarar: "usar para TODA mutación — simple (1 step) o compleja (N steps)"
+- Ejemplos en la description: "crear un nodo", "agregar una ruta", "publicar un runtime", etc.
+
+Acceptance: el modelo entiende que `fluxbee_plan_compiler` es la herramienta para cualquier operación que cambie estado, sin importar la complejidad.
+
+### [x] TI-4 — Regla anti-pregunta en ARCHI_SYSTEM_PROMPT
+
+Agregar regla explícita: "Cuando el intent de mutación del operador es claro y tenés los datos necesarios, llamá `fluxbee_plan_compiler` directamente. No pedís confirmación previa ni preguntás si debés proceder."
+
+Distinguir:
+
+- **Intent ambiguo** (operador no especificó hive, tenant, nombre) → una pregunta específica sobre el dato que falta
+- **Intent claro con datos completos** → llamar plan_compiler directamente
+
+Acceptance: dado "creá el nodo AI.support@motherbee con runtime ai.common y tenant tnt:xxx", Archi llama plan_compiler sin preguntas.
+
+### [x] TI-5 — Eliminar confirmación previa para iniciar pipeline
+
+`fluxbee_start_pipeline` ya no stagea un `pending_pipeline_start` ni pregunta "¿lo lanzo?". Si Archi decide usar el pipeline, el tool inicia directamente el design loop interno y devuelve el estado resultante.
+
+Acceptance: el operador no debe confirmar antes de que corran los agentes internos de diseño.
+
+### [x] TI-6 — Colapsar Confirm1/Confirm2 a una sola confirmación final
+
+La estrategia nueva pide una sola confirmación del operador: cuando el executor plan ya está listo. El código todavía conserva `Confirm1` por compatibilidad del pipeline previo:
+
+- `Confirm1` aprueba dirección de diseño y dispara Reconcile/Artifact/PlanCompile.
+- `Confirm2` aprueba ejecución del executor plan.
+
+Implementado: los pipelines nuevos avanzan automáticamente después del design loop exitoso por Reconcile, ArtifactLoop si aplica, y PlanCompile hasta dejar el run en `Confirm2`. `Confirm1` queda sólo como handler de compatibilidad/recovery para runs viejos que ya hayan quedado estacionados ahí.
+
+Acceptance: una tarea compleja clara no requiere intervención humana entre `fluxbee_start_pipeline` y el plan listo para ejecutar.
+
+---
+
+## Track J — Token budget por tarea
+
+**Objetivo:** Cada tarea tiene un presupuesto de 50.000 tokens para todos los agentes invocados (sin contar Archi). Si se supera, los loops retornan error estructurado sin preguntar al operador.
+
+**Constante inicial:** `TASK_AGENT_TOKEN_BUDGET: u32 = 50_000` — hardcodeada. Cuando esté estable se expone en CONFIG SET/GET del nodo SY.architect.
+
+**Nota 2026-04-25:** el valor inicial de `5_000` era demasiado bajo porque `usage.total_tokens` incluye prompt, tool schemas, contexto, tool calls y respuesta. Un plan directo simple de `run_node` ya consumió `13.225` tokens en el primer intento, por lo que el límite se elevó a `50_000`.
+
+### [x] TJ-1 — Capturar tokens usados por cada llamada AI
+
+En `FunctionCallingRunner` o en los wrappers de agentes, capturar `usage.total_tokens` de cada response de OpenAI. El SDK ya tiene acceso a este campo en la response.
+
+Agregar a `FunctionCallingResult`:
+
+```rust
+pub tokens_used: u32,  // total tokens consumidos en este run
+
+```
+
+Acceptance: cada llamada a `run_with_input` retorna `tokens_used` en su resultado.
+
+### [x] TJ-2 — Acumulador de tokens por tarea y constante de budget
+
+Agregar en `sy_architect.rs`:
+
+```rust
+pub const TASK_AGENT_TOKEN_BUDGET: u32 = 50_000;
+
+```
+
+Cada tarea (pipeline run o plan_compiler call) mantiene un acumulador `tokens_used: u32` que suma los tokens de todos los agentes invocados (designer, design_auditor, real_programmer, plan_compiler). Archi no cuenta.
+
+Acceptance: el acumulador se inicializa en 0 al empezar una tarea y suma correctamente. Para pipeline, design → artifact → plan_compile comparten el total acumulado; para plan_compiler directo el acumulador inicia en 0.
+
+### [x] TJ-3 — Check de budget en cada loop de agente
+
+En los loops que invocan agentes (design loop, artifact loop, plan_compile):
+
+- Antes de cada invocación de agente, verificar `accumulated_tokens < TASK_AGENT_TOKEN_BUDGET`
+- Si se supera: retornar `FailureClass::UnknownResidual` con mensaje:
+  ```json
+  { "error": "BUDGET_EXCEEDED", "tokens_used": N, "budget": 50000, "stage": "artifact_loop" }
+  ```
+
+- No preguntar al operador — solo reportar
+
+Acceptance: un loop que gasta más de 50.000 tokens se detiene con error explícito sin iteraciones adicionales.
+
+### [x] TJ-4 — Incluir token usage en el reporte de tarea al operador
+
+Cuando una tarea completa (éxito o fallo), incluir en el mensaje al operador:
+
+```
+
+Tokens usados: 13.225 / 50.000
+Agentes involucrados: designer (412t), design_auditor (289t), plan_compiler (1.146t)
+
+```
+
+Acceptance: el operador puede ver cuánto gastó cada tarea para ajustar el budget o el prompt.
+
+Nota de implementación: el reporte incluye `design`, `artifact`, `plan_compile`, `total` y `budget` en payloads de pipeline. El formato textual final del frontend puede mejorarse después; el dato ya queda estructurado.
+
+---
+
+## Track K — Revisión de prompts
+
+**Objetivo:** Cada prompt es concreto, sin hedging, y solo contiene reglas del responsable de ese agente. Las reglas de WF/OPA que hoy están en Archi se mueven al plan_compiler que es quien genera esos steps.
+
+### [x] TK-1 — Reescribir ARCHI_SYSTEM_PROMPT
+
+Remover del prompt de Archi:
+
+- Todas las reglas específicas de WF (`wf_rules_*`, `workflow_name` format, WF `definition` schema completo)
+- Las reglas de OPA
+- Las reglas de `CONFIG_SET` / `CONFIG_GET` por nodo específico
+- Las referencias a `example_scmd` como guía de ejecución (ya no ejecuta)
+
+Agregar/mantener:
+
+- Quién es Archi: coordinador, conoce Fluxbee, ordena el trabajo al plan_compiler
+- Cuándo usar `fluxbee_plan_compiler` vs `fluxbee_start_pipeline`
+- Regla de no preguntar cuando el intent es claro (ver TI-4)
+- Distinguir runtime de nodo, hive de nodo, etc. (conocimiento para conversar bien)
+
+Acceptance: el prompt de Archi tiene menos de 600 palabras y no contiene schemas de acciones de admin.
+
+### [x] TK-2 — Refocalizar PLAN_COMPILER_SYSTEM_PROMPT
+
+Agregar:
+
+- "Sos el único agente que ejecuta mutaciones en Fluxbee — simple o complejo"
+- Reglas específicas de WF (las que se sacan de Archi van acá)
+- Reglas de OPA, CONFIG_SET
+- Énfasis en `get_admin_action_help` como primera acción antes de generar cualquier step
+- El plan de 1 step es tan válido como uno de N steps — no inventar complejidad
+
+Acceptance: el plan_compiler sabe manejar `{"task": "crear nodo AI.support@motherbee con runtime ai.common y tenant tnt:xxx"}` y produce el plan correcto sin consultar al operador.
+
+### [x] TK-3 — Limpiar y enfocar DESIGNER_SYSTEM_PROMPT
+
+Revisar que el designer solo hable de solution_manifest. Ninguna mención de executor_plan, admin steps, o ejecución.
+
+### [x] TK-4 — Limpiar DESIGN_AUDITOR_SYSTEM_PROMPT
+
+Confirmar que el auditor no propone cambios — solo clasifica y puntúa. Criterios de `revise` vs `reject` claros y cortos.
+
+### [x] TK-5 — Limpiar REAL_PROGRAMMER_SYSTEM_PROMPT
+
+Confirmar que el programmer no decide nada de topología — solo genera el artifact bundle para lo que le pide el packet. Sin preguntas.
+
+### [x] TK-6 — Revisar descriptions de tools de Archi
+
+- `fluxbee_system_get`: acortar description — hoy tiene ~500 palabras, bajar a ~100. Los paths de ejemplo quedan en el handbook.
+- `fluxbee_start_pipeline`: acotar a "soluciones multi-recurso que necesitan manifest + reconcile". Un solo nodo NO va por acá.
+- `fluxbee_plan_compiler`: expandir — "toda mutación de estado, desde 1 step hasta N steps".
+
+### [x] TK-7 — Reducir schemas embebidos en prompt de plan_compiler
+
+El `PLAN_COMPILER_SYSTEM_PROMPT` no debe inyectar el `request_contract` completo de las 66 acciones en cada run, porque compite con el budget de tarea. El prompt mantiene catálogo compacto y obliga a llamar `get_admin_action_help` antes de emitir steps.
+
+Acceptance: el plan_compiler recibe nombres/descripciones compactas y consulta help detallado bajo demanda.
+
+---
+
+## Track L — Handbook y admin help
+
+**Objetivo:** El handbook es la fuente operativa completa para todos los agentes. El help de admin llega al modelo en formato interpretable.
+
+### [x] TL-1 — Sección Archi en el handbook
+
+Agregar sección "Para Archi — operaciones directas frecuentes":
+
+- Ciclo de vida de un nodo: `run_node` (crear), `start_node` (reiniciar existente), `restart_node` (reiniciar corriendo), `kill_node` (detener)
+- `run_node` completo con `tenant_id`, todos los campos opcionales
+- `add_route` con todos los campos
+- `kill_node` con `purge_instance`
+- La diferencia crítica: `get_node_config` (snapshot en disco) vs `node_control_config_get` (live del nodo corriendo)
+- Cuándo usar plan_compiler directo vs fluxbee_start_pipeline
+
+### [x] TL-2 — Completar gaps del handbook
+
+Los gaps marcados con `[ ]` al final del handbook:
+
+- `tenant_id` en run_node: documentar que es requerido para nodos AI/IO multi-tenant y no se puede agregar después
+- `executor_fill`: documentar qué campos puede completar el executor automáticamente
+- Topologías multi-hive: cuándo un nodo vive en `worker-*` vs `motherbee`
+- Convenciones de naming para nodos IO con tenant
+
+### [x] TL-3 — Reformatear respuesta de `get_admin_action_help`
+
+`PlanCompilerHelpTool::call()` devuelve ahora una capa `help` LLM-readable además del `raw` original:
+
+- Los campos requeridos vs opcionales son visibles
+- El `example_scmd` o ejemplo es legible para el modelo
+- `path_patterns` se marcan explícitamente como templates
+- El modelo recibe instrucciones de usar `example_scmd` y `request_contract`, sin inventar campos
+
+Acceptance: el plan_compiler puede interpretar la respuesta de get_admin_action_help para run_node y generar el step correcto con tenant_id.
+
+### [ ] TL-5 — Capturar `get_admin_action_help("run_node")` real post-cambio
+
+Pendiente operativo en ambiente real: llamar `get_admin_action_help("run_node")`, guardar el JSON completo y confirmar que la capa `help` generada contiene `tenant_id`, `runtime_version`, `node_name` y ejemplo ejecutable.
+
+Acceptance: queda evidencia real de que el modelo recibe un help legible y suficiente para `run_node`.
+
+### [x] TL-4 — Verificar que `fluxbee_system_get` puede llamar `get_admin_action_help`
+
+Confirmar que Archi puede llamar `GET /admin/actions/run_node` vía `fluxbee_system_get` y obtener el mismo help que usa el plan_compiler. Así Archi puede responder preguntas sobre qué es posible.
+
+---
+
+## Orden de implementación sugerido
+
+```
+
+TL-1, TL-2  →  Handbook completo (contenido, sin código)
+TL-3, TL-4  →  Help format + verificación
+TI-1        →  Sacar write tools de Archi
+TI-2        →  Archi lee handbook
+TK-1..TK-6  →  Revisar todos los prompts y tool descriptions
+TI-3, TI-4  →  Actualizar plan_compiler desc + regla anti-pregunta
+TJ-1..TJ-4  →  Token budget
+E2E         →  Probar flujo completo con una sola confirmación final
+
+```
 
 ---
 

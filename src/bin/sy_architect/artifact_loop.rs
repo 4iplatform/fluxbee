@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use super::pipeline_types::{
-    ArtifactAuditVerdict, ArtifactBundle, ArtifactBundleStatus, AuditFinding, AuditSeverity,
-    AuditStatus, BuildTaskPacket, FailureClass, RepairHint, RepairPacket, MAX_ARTIFACT_ATTEMPTS,
+    ArtifactAuditVerdict, ArtifactBundle, AuditFinding, AuditSeverity, AuditStatus,
+    BuildTaskPacket, FailureClass, RepairHint, RepairPacket,
 };
 
 // ── TC-8: Artifact storage ────────────────────────────────────────────────
@@ -412,13 +412,14 @@ fn build_repair_hints(findings: &[AuditFinding], packet: &BuildTaskPacket) -> Ve
 // ── TC-7: Artifact loop controller ────────────────────────────────────────
 
 pub struct ArtifactLoopResult {
-    pub approved: Vec<ApprovedArtifact>,
     pub failed_task_id: Option<String>,
     pub failure_class: Option<FailureClass>,
     pub error: Option<String>,
+    pub tokens_used: u32,
 }
 
 /// Failure signature for detecting repeated failures (stop early rule).
+#[cfg(test)]
 fn failure_signature(verdict: &ArtifactAuditVerdict) -> String {
     let class = verdict
         .failure_class

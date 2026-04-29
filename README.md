@@ -1134,7 +1134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | Blob confirmed publish | `fluxbee_sdk::blob::PublishBlobRequest` | `publish_blob_and_confirm` (`SYSTEM_SYNC_HINT` gate before emitting `blob_ref`) |
 | Blob metrics snapshot | `fluxbee_sdk::blob::BlobToolkit::metrics_snapshot` | Operational counters (`put/resolve/retry/errors/bytes`) |
 | Identity SHM lookup | `fluxbee_sdk::identity::{resolve_ilk_from_shm_name, resolve_ilk_from_hive_id, resolve_ilk_from_hive_config}` | Resolve `(channel_type,address) -> ilk` locally from identity SHM |
-| Identity provision | `fluxbee_sdk::identity::{IlkProvisionRequest, provision_ilk}` | Request `ILK_PROVISION` with automatic `NOT_PRIMARY` fallback target support |
+| Identity provision | `fluxbee_sdk::identity::{IlkProvisionRequest, provision_ilk}` | Request `ILK_PROVISION` with automatic `NOT_PRIMARY` fallback target support. `IlkProvisionRequest.ilk_type` is set by the IO node at construction time — `Some("human")`, `Some("agent")`, or `None` (server defaults to `"human"`). Only the IO node knows whether its external counterpart is human or agent. `"system"` is rejected here; it is reserved for SY-internal creation paths. |
 | Identity system calls | `fluxbee_sdk::identity::{IdentitySystemRequest, identity_system_call, identity_system_call_ok}` | Generic helpers for `ILK_REGISTER`, `ILK_ADD_CHANNEL`, `ILK_UPDATE`, tenant actions |
 | Node status default handler | `fluxbee_sdk::try_handle_default_node_status` | Respond `NODE_STATUS_GET` with canonical `health_state` |
 | Admin internal gateway | `fluxbee_sdk::{admin_command, admin_command_ok, AdminCommandRequest}` | Execute `ADMIN_COMMAND` over socket/WAN against `SY.admin@<hive>` |

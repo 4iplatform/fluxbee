@@ -25,10 +25,10 @@ pub use crate::comm::{nats, protocol};
 pub use crate::identity::{
     identity_shm_name_for_hive, identity_system_call, identity_system_call_ok, load_hive_id,
     provision_ilk, resolve_ilk_from_hive_config, resolve_ilk_from_hive_id,
-    resolve_ilk_from_shm_name, IdentityError, IdentityShmError, IdentitySystemRequest,
-    IdentitySystemResult, IlkProvisionRequest, IlkProvisionResult, MSG_IDENTITY_METRICS,
-    MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION, MSG_ILK_REGISTER, MSG_ILK_UPDATE, MSG_TNT_APPROVE,
-    MSG_TNT_CREATE,
+    resolve_ilk_from_shm_name, set_ich_enabled, IchSetEnabledResponse, IdentityError,
+    IdentityShmError, IdentitySystemRequest, IdentitySystemResult, IlkProvisionRequest,
+    IlkProvisionResult, MSG_ICH_SET_ENABLED, MSG_IDENTITY_METRICS, MSG_ILK_ADD_CHANNEL,
+    MSG_ILK_PROVISION, MSG_ILK_REGISTER, MSG_ILK_UPDATE, MSG_TNT_APPROVE, MSG_TNT_CREATE,
 };
 pub use crate::managed_node::{
     managed_node_config_path, managed_node_config_path_with_root, managed_node_instance_dir,

@@ -11,7 +11,6 @@ use super::pipeline_types::{FailureClass, PipelineStage};
 pub struct FailureContext {
     pub stage: PipelineStage,
     pub error_code: Option<String>,
-    pub resource_type: Option<String>,
 }
 
 /// Attempt to classify a failure deterministically.
@@ -177,13 +176,13 @@ impl FailureRoutingDecision {
     }
 
     /// Structured operator action options — non-empty only for EscalateToOperator.
+    /// These match the `action` enum on the `fluxbee_pipeline_action` tool exactly,
+    /// so Archi can pass them through verbatim when the operator picks one.
     pub fn operator_options(&self) -> &'static [&'static str] {
         match self {
-            FailureRoutingDecision::EscalateToOperator => &[
-                "fix_manifest_and_retry",
-                "restart_pipeline_from_design",
-                "cancel_pipeline",
-            ],
+            FailureRoutingDecision::EscalateToOperator => {
+                &["retry", "restart_from_design", "discard"]
+            }
             _ => &[],
         }
     }
@@ -253,7 +252,6 @@ mod tests {
         FailureContext {
             stage,
             error_code: None,
-            resource_type: None,
         }
     }
 
@@ -261,7 +259,6 @@ mod tests {
         FailureContext {
             stage,
             error_code: Some(code.to_string()),
-            resource_type: None,
         }
     }
 

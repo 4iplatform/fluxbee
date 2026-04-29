@@ -25,11 +25,12 @@ pub const MSG_ILK_PROVISION_RESPONSE: &str = "ILK_PROVISION_RESPONSE";
 pub const MSG_ILK_REGISTER: &str = "ILK_REGISTER";
 pub const MSG_ILK_ADD_CHANNEL: &str = "ILK_ADD_CHANNEL";
 pub const MSG_ILK_UPDATE: &str = "ILK_UPDATE";
+pub const MSG_ICH_SET_ENABLED: &str = "ICH_SET_ENABLED";
 pub const MSG_TNT_CREATE: &str = "TNT_CREATE";
 pub const MSG_TNT_APPROVE: &str = "TNT_APPROVE";
 pub const MSG_IDENTITY_METRICS: &str = "IDENTITY_METRICS";
 const IDENTITY_MAGIC: u32 = 0x4A534944; // "JSID"
-const IDENTITY_VERSION: u32 = 3;
+const IDENTITY_VERSION: u32 = 4;
 const REGION_ALIGNMENT: usize = 64;
 const ICH_CHANNEL_TYPE_MAX_LEN: usize = 32;
 const ICH_ADDRESS_MAX_LEN: usize = 256;
@@ -51,6 +52,11 @@ pub struct IlkProvisionRequest<'a> {
     pub channel_type: &'a str,
     pub address: &'a str,
     pub tenant_id: Option<&'a str>,
+    /// Caller-declared ilk type. Only the IO node knows whether the external
+    /// counterpart is a human or an automated agent. Allowed values:
+    /// `"human"` or `"agent"`. When `None`, SY.identity defaults to `"human"`.
+    /// `"system"` is rejected by the server for IO-originated provisioning.
+    pub ilk_type: Option<&'a str>,
     pub timeout: Duration,
 }
 
@@ -92,6 +98,8 @@ pub struct IdentityIchOption {
     pub channel_type: String,
     pub address: String,
     pub is_primary: bool,
+    pub owner_l2_name: Option<String>,
+    pub enabled: bool,
     pub ilks: Vec<IdentityIlkOption>,
 }
 
@@ -101,7 +109,17 @@ pub struct ResolvedIdentityOption {
     pub channel_type: String,
     pub address: String,
     pub is_primary: bool,
+    pub owner_l2_name: Option<String>,
+    pub enabled: bool,
     pub ilk: IdentityIlkOption,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct IchSetEnabledResponse {
+    pub ich_id: String,
+    pub enabled: bool,
+    pub owner_l2_name: Option<String>,
+    pub trace_id: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -272,9 +290,9 @@ struct TenantEntry {
     flags: u16,
     _pad0: [u8; 5],
     max_ilks: u32,
+    sponsor_tenant_id: [u8; 16],
     created_at: u64,
     updated_at: u64,
-    _reserved: [u8; 8],
 }
 
 #[repr(C)]
@@ -306,13 +324,15 @@ struct IlkEntry {
 struct IchEntry {
     ich_id: [u8; 16],
     ilk_id: [u8; 16],
+    tenant_id: [u8; 16],
     channel_type: [u8; ICH_CHANNEL_TYPE_MAX_LEN],
     address: [u8; ICH_ADDRESS_MAX_LEN],
     flags: u16,
+    owner_l2_name: [u8; 128],
     is_primary: u8,
+    enabled: u8,
     _pad0: [u8; 5],
     added_at: u64,
-    _reserved: [u8; 16],
 }
 
 #[repr(C)]
@@ -480,6 +500,62 @@ pub async fn identity_system_call_ok(
     })
 }
 
+pub async fn set_ich_enabled(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    target: &str,
+    ich_id: &str,
+    enabled: bool,
+    timeout: Duration,
+) -> Result<IchSetEnabledResponse, IdentityError> {
+    let ich_id = ich_id.trim();
+    if ich_id.is_empty() {
+        return Err(IdentityError::InvalidRequest(
+            "ich_id must be non-empty".to_string(),
+        ));
+    }
+    let out = identity_system_call_ok(
+        sender,
+        receiver,
+        IdentitySystemRequest {
+            target,
+            fallback_target: None,
+            action: MSG_ICH_SET_ENABLED,
+            payload: json!({
+                "ich_id": ich_id,
+                "enabled": enabled,
+            }),
+            timeout,
+        },
+    )
+    .await?;
+    let ich_id = out
+        .payload
+        .get("ich_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| IdentityError::InvalidResponse("missing ich_id".to_string()))?
+        .to_string();
+    let enabled = out
+        .payload
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| IdentityError::InvalidResponse("missing enabled".to_string()))?;
+    let owner_l2_name = out
+        .payload
+        .get("owner_l2_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    Ok(IchSetEnabledResponse {
+        ich_id,
+        enabled,
+        owner_l2_name,
+        trace_id: out.trace_id,
+    })
+}
+
 /// Sends `ILK_PROVISION` to `SY.identity@<hive>` and waits for
 /// `ILK_PROVISION_RESPONSE` with matching `trace_id`.
 pub async fn provision_ilk(
@@ -508,6 +584,14 @@ pub async fn provision_ilk(
         .filter(|s| !s.is_empty())
     {
         payload["tenant_id"] = json!(tid);
+    }
+    if let Some(ilk_type) = request
+        .ilk_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        payload["ilk_type"] = json!(ilk_type);
     }
     let call = identity_system_call(
         sender,
@@ -1371,9 +1455,21 @@ fn build_ich_options(ilks: &[IlkEntry], ichs: &[IchEntry]) -> Vec<IdentityIchOpt
                 channel_type: channel_type.clone(),
                 address: address.clone(),
                 is_primary: ich.is_primary != 0,
+                owner_l2_name: {
+                    let value = fixed_str_to_string(&ich.owner_l2_name);
+                    (!value.is_empty()).then_some(value)
+                },
+                enabled: ich.enabled != 0,
                 ilks: Vec::new(),
             });
         entry.is_primary = entry.is_primary || ich.is_primary != 0;
+        if entry.owner_l2_name.is_none() {
+            let value = fixed_str_to_string(&ich.owner_l2_name);
+            if !value.is_empty() {
+                entry.owner_l2_name = Some(value);
+            }
+        }
+        entry.enabled = entry.enabled || ich.enabled != 0;
         if let Some(ilk) = ilk {
             if !entry
                 .ilks
@@ -1424,6 +1520,11 @@ fn build_resolved_identity_option(
         channel_type,
         address,
         is_primary: ich.is_primary != 0,
+        owner_l2_name: {
+            let value = fixed_str_to_string(&ich.owner_l2_name);
+            (!value.is_empty()).then_some(value)
+        },
+        enabled: ich.enabled != 0,
         ilk: IdentityIlkOption {
             ilk_id: prefixed_uuid_from_bytes("ilk", ilk.ilk_id),
             display_name: {
@@ -1678,24 +1779,28 @@ mod tests {
                 .unwrap()
                 .into_bytes(),
             ilk_id: ilk_a.ilk_id,
+            tenant_id: [0; 16],
             channel_type: encode_fixed::<ICH_CHANNEL_TYPE_MAX_LEN>("whatsapp"),
             address: encode_fixed::<ICH_ADDRESS_MAX_LEN>("5491112345678"),
             flags: FLAG_ACTIVE,
+            owner_l2_name: encode_fixed::<128>("IO.whatsapp@motherbee"),
             is_primary: 1,
+            enabled: 1,
             _pad0: [0; 5],
             added_at: 0,
-            _reserved: [0; 16],
         };
         let ich_same = IchEntry {
             ich_id: ich_primary.ich_id,
             ilk_id: ilk_b.ilk_id,
+            tenant_id: [0; 16],
             channel_type: encode_fixed::<ICH_CHANNEL_TYPE_MAX_LEN>("whatsapp"),
             address: encode_fixed::<ICH_ADDRESS_MAX_LEN>("5491112345678"),
             flags: FLAG_ACTIVE,
+            owner_l2_name: encode_fixed::<128>("IO.whatsapp@motherbee"),
             is_primary: 0,
+            enabled: 1,
             _pad0: [0; 5],
             added_at: 0,
-            _reserved: [0; 16],
         };
 
         let options = build_ich_options(&[ilk_a, ilk_b], &[ich_primary, ich_same]);
@@ -1703,6 +1808,11 @@ mod tests {
         assert_eq!(options[0].channel_type, "whatsapp");
         assert_eq!(options[0].address, "5491112345678");
         assert!(options[0].is_primary);
+        assert_eq!(
+            options[0].owner_l2_name.as_deref(),
+            Some("IO.whatsapp@motherbee")
+        );
+        assert!(options[0].enabled);
         assert_eq!(options[0].ilks.len(), 2);
         assert_eq!(
             options[0].ilks[0].ilk_id,
@@ -1744,13 +1854,15 @@ mod tests {
                 .unwrap()
                 .into_bytes(),
             ilk_id: ilk.ilk_id,
+            tenant_id: [0; 16],
             channel_type: encode_fixed::<ICH_CHANNEL_TYPE_MAX_LEN>("api"),
             address: encode_fixed::<ICH_ADDRESS_MAX_LEN>("crm:123"),
             flags: FLAG_ACTIVE,
+            owner_l2_name: encode_fixed::<128>("IO.api@motherbee"),
             is_primary: 1,
+            enabled: 1,
             _pad0: [0; 5],
             added_at: 0,
-            _reserved: [0; 16],
         };
 
         let resolved = build_resolved_identity_option(&[ilk], &[ich], ich.ich_id, ilk.ilk_id)
@@ -1760,6 +1872,8 @@ mod tests {
         assert_eq!(resolved.channel_type, "api");
         assert_eq!(resolved.address, "crm:123");
         assert!(resolved.is_primary);
+        assert!(resolved.enabled);
+        assert_eq!(resolved.owner_l2_name.as_deref(), Some("IO.api@motherbee"));
         assert_eq!(
             resolved.ilk.ilk_id,
             "ilk:550e8400-e29b-41d4-a716-446655440000"
@@ -1806,9 +1920,9 @@ mod tests {
             flags: FLAG_ACTIVE,
             _pad0: [0; 5],
             max_ilks: 10,
+            sponsor_tenant_id: [0; 16],
             created_at: 0,
             updated_at: 0,
-            _reserved: [0; 8],
         };
         let layout = layout_identity(IdentityRegionLimits {
             max_ilks: 1,

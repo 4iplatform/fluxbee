@@ -196,6 +196,14 @@ pub async fn strict_provision_ilk(
     {
         payload["tenant_id"] = serde_json::json!(tenant_id);
     }
+    if let Some(ilk_type) = input
+        .ilk_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        payload["ilk_type"] = serde_json::json!(ilk_type);
+    }
     let req = WireMessage {
         routing: Routing {
             src: sender.uuid().to_string(),

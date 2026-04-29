@@ -24,6 +24,7 @@ impl FunctionCallingModel for CaptureModel {
         Ok(FunctionModelTurnResponse {
             assistant_text: Some("ok".to_string()),
             tool_calls: Vec::new(),
+            tokens_used: 0,
         })
     }
 }

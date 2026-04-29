@@ -21,6 +21,12 @@ pub struct IdentityLookupInput {
     pub tenant_hint: Option<String>,
     #[serde(default)]
     pub attributes: serde_json::Value,
+    /// Caller-supplied ilk type for ILK_PROVISION. Only the IO node knows whether
+    /// the external counterpart is a human user or an automated agent. Allowed
+    /// values: `"human"` or `"agent"`. When omitted, SY.identity defaults to
+    /// `"human"`. `"system"` is reserved for SY-internal nodes and is rejected here.
+    #[serde(default)]
+    pub ilk_type: Option<String>,
 }
 
 pub type ResolveOrCreateInput = IdentityLookupInput;

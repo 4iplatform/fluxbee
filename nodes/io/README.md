@@ -153,6 +153,18 @@ Logging note:
 
 Identity behavior is provision-on-miss by default in current IO nodes (no mode flag required).
 
+### Declaring `ilk_type` at provision time
+
+When an IO node provisions a new ILK (lookup miss → `ILK_PROVISION`), it can declare whether the external counterpart is a human user or an automated agent. This is set on `IdentityLookupInput.ilk_type` (alias `ResolveOrCreateInput`) at the call site:
+
+- `Some("human")` — the channel represents a human user (Slack user, email sender, web visitor)
+- `Some("agent")` — the channel represents an automated external agent (LinkedHelper bot, partner-system service account, scripted client behind an API token)
+- `None` — leave the decision to the server, which defaults to `"human"`
+
+`SY.identity` rejects `"system"` from IO-originated provisioning; that label is reserved for SY-internal creation paths.
+
+The decision is **constructive of the IO node itself**: only the IO runtime knows the nature of its counterpart (by config, subdomain, header, token type, etc.). When in doubt, omit the field and let the server default to human; switch to `"agent"` only when the IO has a deterministic signal that the other side is a bot. The provisional ILK's type is overwritten when `register_ilk` later promotes it to `complete`, so a wrong default is recoverable but produces incorrect short-lived behavior in policy/routing decisions taken during the provisional window.
+
 Example:
 
 ```bash

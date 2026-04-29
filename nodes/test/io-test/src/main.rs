@@ -75,7 +75,7 @@ async fn resolve_or_provision_ilk(
         return Ok(explicit);
     }
 
-    match resolve_ilk_from_hive_config(config_dir, channel_type, address) {
+    match resolve_ilk_from_hive_config(config_dir, channel_type, address, "") {
         Ok(Some(existing)) => return Ok(existing),
         Ok(None) => {}
         Err(err) if is_lookup_unavailable(&err) => {
@@ -102,6 +102,8 @@ async fn resolve_or_provision_ilk(
             ich_id: &format!("ich:{}", Uuid::new_v4()),
             channel_type,
             address,
+            tenant_id: None,
+            ilk_type: None,
             timeout: Duration::from_millis(env_u64("IO_TEST_PROVISION_TIMEOUT_MS", 8_000)),
         },
     )
@@ -120,6 +122,7 @@ async fn send_probe(
     let msg = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
+            src_l2_name: None,
             dst: Destination::Resolve,
             ttl: 16,
             trace_id: trace_id.clone(),

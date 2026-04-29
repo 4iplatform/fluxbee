@@ -142,7 +142,10 @@ if err != nil {
     // Fatal I/O or mapping failure — treat as unavailable.
 }
 if !found {
-    // ILK not yet provisioned for this channel; send ILK_PROVISION.
+    // ILK not yet provisioned for this channel.
+    // Provisioning (ILK_PROVISION wire message) is Rust-only today;
+    // the Go SDK does not emit ILK_PROVISION. See the Rust SDK
+    // (`fluxbee_sdk::identity::provision_ilk`) for the provisioning path.
 }
 // ilkID is in "ilk:<uuid>" format, ready for meta.src_ilk.
 ```
@@ -158,5 +161,14 @@ Requirements:
 - Requires `IDENTITY_VERSION=3` in the SHM region. Older regions (version ≤ 2) return `(_, false, nil)` without error.
 - The SHM file must exist at `/dev/shm/jsr-identity-<hiveID>`. A missing file is treated as not-found (`false, nil`), not an error.
 - Uses a 50 ms seqlock timeout. If the writer holds the lock for longer, the call returns `(_, false, nil)` rather than blocking.
+
+### Scope of this SDK regarding identity
+
+The Go SDK exposes **only** identity SHM lookup. It does not construct or send the
+`ILK_PROVISION` wire message. All ILK provisioning today happens through the Rust
+SDK (`fluxbee_sdk::identity::provision_ilk` / `IlkProvisionRequest`) because all
+current IO node runtimes are written in Rust. If a Go-based IO node needs to
+provision ILKs, the wire message must be assembled manually against the
+`SY.identity@<hive>` contract — there is no Go helper for that today.
 
 Everything else should be treated as implementation support unless it is later documented here as part of the stable surface.
