@@ -12943,6 +12943,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
     let sessionRefreshInFlight = false;
     let confirmResolver = null;
     let pendingAttachments = [];
+    let composerBaseHint = "Enter to send. Shift+Enter for newline. Sessions on the left are local and reload-safe.";
+    let confirmationLockActive = false;
+    let confirmationLockReason = "";
     function formatBytes(value) {{
       const size = Number(value || 0);
       if (!Number.isFinite(size) || size <= 0) return "0 B";
@@ -13246,6 +13249,88 @@ fn architect_index_html(state: &ArchitectState) -> String {
     function addMessage(kind, text, labelOverride) {{
       const labels = {{ user: "Operator", architect: "archi", system: "System" }};
       appendMessage(kind, labelOverride || labels[kind] || "Message", text);
+    }}
+    function applyComposerInteractivity() {{
+      const busy = submitInFlight || confirmationLockActive;
+      input.disabled = busy;
+      send.disabled = busy;
+      attach.disabled = busy;
+      clearHistory.disabled = busy;
+      historySearch.disabled = busy;
+      newChatOperator.disabled = busy;
+      newChatImpersonation.disabled = busy;
+      historyList.style.pointerEvents = busy ? "none" : "";
+      historyList.style.opacity = busy ? "0.72" : "";
+      if (confirmationLockActive) {{
+        composerHint.textContent = confirmationLockReason || "A confirmation is pending in this chat. Use the inline controls below.";
+        return;
+      }}
+      if (submitInFlight) {{
+        composerHint.textContent = "Processing current request. Wait for the response before sending another message.";
+        return;
+      }}
+      composerHint.textContent = composerBaseHint;
+    }}
+    function setComposerLock(active, reason) {{
+      confirmationLockActive = !!active;
+      confirmationLockReason = active ? String(reason || "").trim() : "";
+      applyComposerInteractivity();
+    }}
+    function clearInlineConfirmBars() {{
+      document.querySelectorAll(".inline-confirm-bar").forEach((node) => node.remove());
+    }}
+    function pendingConfirmationUiMeta(data) {{
+      if (!responseWantsInlineConfirm(data)) return null;
+      const output = data && data.output ? data.output : null;
+      if (data && data.mode === "pipeline") {{
+        if (output && output.stage === "confirm1") {{
+          return {{
+            confirmLabel: "Continue pipeline",
+            cancelLabel: "Cancel",
+            lockReason: "A pipeline run is waiting for confirmation in this chat. Use Continue pipeline or Cancel below.",
+            executionHint: "Advancing pipeline confirmation..."
+          }};
+        }}
+        return {{
+          confirmLabel: "Execute plan",
+          cancelLabel: "Cancel",
+          lockReason: "A pipeline plan is waiting for confirmation in this chat. Use Execute plan or Cancel below.",
+          executionHint: "Executing pipeline plan..."
+        }};
+      }}
+      if (data && data.mode === "chat") {{
+        return {{
+          confirmLabel: "Execute plan",
+          cancelLabel: "Discard",
+          lockReason: "A compiled plan is waiting for confirmation in this chat. Use Execute plan or Discard below.",
+          executionHint: "Executing compiled plan..."
+        }};
+      }}
+      if (data && (data.mode === "scmd" || data.mode === "acmd")) {{
+        return {{
+          confirmLabel: "Execute command",
+          cancelLabel: "Discard",
+          lockReason: "A system command is waiting for confirmation in this chat. Use Execute command or Discard below.",
+          executionHint: "Executing system command..."
+        }};
+      }}
+      return {{
+        confirmLabel: "Confirm",
+        cancelLabel: "Cancel",
+        lockReason: "A confirmation is pending in this chat. Use the inline controls below.",
+        executionHint: "Executing confirmation..."
+      }};
+    }}
+    function pendingConfirmationMessageIndex(messagesList) {{
+      if (!Array.isArray(messagesList) || !messagesList.length) return -1;
+      for (let index = messagesList.length - 1; index >= 0; index -= 1) {{
+        const metadata = messagesList[index] && messagesList[index].metadata ? messagesList[index].metadata : null;
+        if (!metadata || metadata.kind !== "response" || !metadata.response) {{
+          continue;
+        }}
+        return responseWantsInlineConfirm(metadata.response) ? index : -1;
+      }}
+      return -1;
     }}
     async function submitPipelineRecoveryAction(action, recovery) {{
       if (!currentSessionId || !recovery || !recovery.pipeline_run_id) {{
@@ -14126,8 +14211,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
         shell.appendChild(createResultSection("result", data.output));
       }}
 
-      if (!fromHistory && responseWantsInlineConfirm(data)) {{
-        shell.appendChild(buildInlineConfirmBar());
+      if (responseWantsInlineConfirm(data) && (!fromHistory || (options && options.allowInlineConfirm))) {{
+        shell.appendChild(buildInlineConfirmBar(data));
       }}
 
       appendMessage(kind, kind === "architect" ? "archi" : "System", shell);
@@ -14153,22 +14238,27 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
       return false;
     }}
-    function buildInlineConfirmBar() {{
+    function buildInlineConfirmBar(data) {{
+      const meta = pendingConfirmationUiMeta(data) || {{
+        confirmLabel: "Confirm",
+        cancelLabel: "Cancel",
+        executionHint: "Executing confirmation..."
+      }};
       const bar = document.createElement("div");
       bar.className = "inline-confirm-bar";
       const confirmBtn = document.createElement("button");
       confirmBtn.type = "button";
       confirmBtn.className = "inline-confirm-btn primary";
-      confirmBtn.textContent = "CONFIRM";
+      confirmBtn.textContent = meta.confirmLabel;
       confirmBtn.addEventListener("click", () => {{
-        sendQuickControlMessage("CONFIRM");
+        sendQuickControlMessage("CONFIRM", meta.executionHint || "Executing confirmation...");
       }});
       const cancelBtn = document.createElement("button");
       cancelBtn.type = "button";
       cancelBtn.className = "inline-confirm-btn";
-      cancelBtn.textContent = "CANCEL";
+      cancelBtn.textContent = meta.cancelLabel;
       cancelBtn.addEventListener("click", () => {{
-        sendQuickControlMessage("CANCEL");
+        sendQuickControlMessage("CANCEL", "Discarding pending action...");
       }});
       bar.appendChild(confirmBtn);
       bar.appendChild(cancelBtn);
@@ -14176,6 +14266,11 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     function renderResponsePayload(kind, data, options = {{}}) {{
       const fromHistory = !!(options && options.fromHistory);
+      if (!fromHistory) {{
+        clearInlineConfirmBars();
+        const meta = pendingConfirmationUiMeta(data);
+        setComposerLock(!!meta, meta ? meta.lockReason : "");
+      }}
       if (data && data.mode === "executor") {{
         renderExecutorResult(data);
         return;
@@ -14194,6 +14289,16 @@ fn architect_index_html(state: &ArchitectState) -> String {
         const designLoopTrace = pipelineTrace ? renderDesignLoopTrace(pipelineTrace.designLoopTrace) : null;
         const artifactLoopTrace = pipelineTrace ? renderArtifactLoopTrace(pipelineTrace.artifactLoopTrace) : null;
         if (!toolSummary && !progTrace && !designerTrace && !designLoopTrace && !artifactLoopTrace) {{
+          if (responseWantsInlineConfirm(data) && (!fromHistory || (options && options.allowInlineConfirm))) {{
+            const body = document.createElement("div");
+            body.className = "chat-response";
+            const message = document.createElement("div");
+            message.textContent = output.message;
+            body.appendChild(message);
+            body.appendChild(buildInlineConfirmBar(data));
+            appendMessage(kind, kind === "architect" ? "archi" : "System", body);
+            return;
+          }}
           addMessage(kind, output.message);
           return;
         }}
@@ -14202,7 +14307,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         body.className = "chat-response";
         message.textContent = output.message;
         body.appendChild(message);
-        if (!fromHistory && responseWantsInlineConfirm(data)) body.appendChild(buildInlineConfirmBar());
+        if (responseWantsInlineConfirm(data) && (!fromHistory || (options && options.allowInlineConfirm))) body.appendChild(buildInlineConfirmBar(data));
         if (designerTrace) body.appendChild(designerTrace);
         if (designLoopTrace) body.appendChild(designLoopTrace);
         if (artifactLoopTrace) body.appendChild(artifactLoopTrace);
@@ -14223,7 +14328,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
           body.className = "chat-response";
           message.textContent = output.message;
           body.appendChild(message);
-          if (!fromHistory && responseWantsInlineConfirm(data)) body.appendChild(buildInlineConfirmBar());
+          if (responseWantsInlineConfirm(data) && (!fromHistory || (options && options.allowInlineConfirm))) body.appendChild(buildInlineConfirmBar(data));
           if (designerTrace) body.appendChild(designerTrace);
           if (designLoopTrace) body.appendChild(designLoopTrace);
           if (artifactLoopTrace) body.appendChild(artifactLoopTrace);
@@ -14234,11 +14339,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }}
       renderCommandResult(kind, data.mode, data, options);
     }}
-    function renderStoredMessage(message) {{
+    function renderStoredMessage(message, options = {{}}) {{
       const metadata = message && message.metadata ? message.metadata : {{}};
       if (metadata.kind === "response" && metadata.response) {{
         const role = message.role === "architect" ? "architect" : message.role === "system" ? "system" : "architect";
-        renderResponsePayload(role, metadata.response, {{ fromHistory: true }});
+        const allowInlineConfirm = !!(options && options.allowInlineConfirm);
+        renderResponsePayload(role, metadata.response, {{ fromHistory: !allowInlineConfirm, allowInlineConfirm }});
         return;
       }}
       const role = message.role === "architect" ? "architect" : message.role === "system" ? "system" : "user";
@@ -14259,7 +14365,9 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     function resetChatViewport(preserveComposer = false) {{
       hidePendingIndicator();
+      clearInlineConfirmBars();
       messages.innerHTML = "";
+      setComposerLock(false, "");
       if (!preserveComposer) {{
         input.value = "";
         clearPendingAttachments();
@@ -14492,7 +14600,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     function updateComposerHint(session) {{
       if (!session) {{
-        composerHint.textContent = "Enter to send. Shift+Enter for newline. Sessions on the left are local and reload-safe.";
+        composerBaseHint = "Enter to send. Shift+Enter for newline. Sessions on the left are local and reload-safe.";
+        applyComposerInteractivity();
         return;
       }}
       const base = session.message_count
@@ -14501,10 +14610,11 @@ fn architect_index_html(state: &ArchitectState) -> String {
       if (sessionModeLabel(session) === "impersonation") {{
         const channel = session.source_channel_kind ? " via " + session.source_channel_kind : "";
         const ich = session.effective_ich_id ? " (" + session.effective_ich_id + ")" : "";
-        composerHint.textContent = base + " Running in impersonation/debug mode" + channel + ich + ".";
+        composerBaseHint = base + " Running in impersonation/debug mode" + channel + ich + ".";
       }} else {{
-        composerHint.textContent = base + " Running in operator mode.";
+        composerBaseHint = base + " Running in operator mode.";
       }}
+      applyComposerInteractivity();
     }}
     function sessionRevision(detail) {{
       const session = detail && detail.session ? detail.session : null;
@@ -14543,7 +14653,16 @@ fn architect_index_html(state: &ArchitectState) -> String {
         }}
         return;
       }}
-      detail.messages.forEach((message) => renderStoredMessage(message));
+      const pendingIndex = pendingConfirmationMessageIndex(detail.messages);
+      detail.messages.forEach((message, index) => renderStoredMessage(message, {{ allowInlineConfirm: index === pendingIndex }}));
+      if (pendingIndex >= 0) {{
+        const pendingMetadata = detail.messages[pendingIndex] && detail.messages[pendingIndex].metadata ? detail.messages[pendingIndex].metadata : null;
+        const pendingResponse = pendingMetadata && pendingMetadata.response ? pendingMetadata.response : null;
+        const pendingMeta = pendingConfirmationUiMeta(pendingResponse);
+        if (pendingMeta) {{
+          setComposerLock(true, pendingMeta.lockReason);
+        }}
+      }}
       if (recovery) {{
         renderPipelineRecoveryPrompt(recovery);
       }}
@@ -14660,16 +14779,16 @@ fn architect_index_html(state: &ArchitectState) -> String {
       scheduleSessionRefresh(delay);
     }}
     let submitInFlight = false;
-    async function sendQuickControlMessage(message) {{
+    async function sendQuickControlMessage(message, pendingText = "Executing confirmation...") {{
       if (submitInFlight) return;
       if (!currentSessionId) {{
         await createSession();
       }}
-      addMessage("user", message);
-      showPendingIndicator("System", "Executing action");
-      send.disabled = true;
-      attach.disabled = true;
+      clearInlineConfirmBars();
+      setComposerLock(true, pendingText);
+      showPendingIndicator("System", pendingText);
       submitInFlight = true;
+      applyComposerInteractivity();
       try {{
         const res = await fetch(chatUrl, {{
           method: "POST",
@@ -14688,17 +14807,22 @@ fn architect_index_html(state: &ArchitectState) -> String {
         await refreshSessionList(currentSessionId);
       }} catch (err) {{
         hidePendingIndicator();
+        try {{
+          await loadSession(currentSessionId, null, false, true);
+          await refreshSessionList(currentSessionId);
+        }} catch (_refreshErr) {{
+          setComposerLock(false, "");
+        }}
         addMessage("system", "Request failed: " + err);
       }} finally {{
         submitInFlight = false;
         hidePendingIndicator();
-        send.disabled = false;
-        attach.disabled = false;
+        applyComposerInteractivity();
         refreshStatus({{ force: true }});
       }}
     }}
     async function submit() {{
-      if (submitInFlight) return;
+      if (submitInFlight || confirmationLockActive) return;
       const message = input.value.trim();
       if (!message && !pendingAttachments.length) return;
       if (!currentSessionId) {{
@@ -14738,9 +14862,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
       showPendingIndicator(pendingLabel, pendingText);
       input.value = "";
       renderAttachmentDraft();
-      send.disabled = true;
-      attach.disabled = true;
       submitInFlight = true;
+      applyComposerInteractivity();
       try {{
         const attachments = await uploadPendingAttachments();
         const res = await fetch(chatUrl, {{
@@ -14765,8 +14888,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }} finally {{
         submitInFlight = false;
         hidePendingIndicator();
-        send.disabled = false;
-        attach.disabled = false;
+        applyComposerInteractivity();
         refreshStatus({{ force: true }});
       }}
     }}
