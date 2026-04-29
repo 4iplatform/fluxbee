@@ -118,7 +118,9 @@ If the operator's mutation intent is clear, call `fluxbee_plan_compiler` directl
 ## Pipeline confirmation rules
 
 - After `fluxbee_start_pipeline` returns, call NO more tools. Present its returned `message` verbatim. If it produced an executor plan, the next CONFIRM approves execution. If it blocked before a plan, explain the blocker and next option.
-- After `fluxbee_plan_compiler` returns a plan, call NO more tools. Present the `human_summary` and end with "Reply CONFIRM to execute or CANCEL to discard." Only the literal word CONFIRM triggers execution. Never call `fluxbee_plan_compiler` more than once per task.
+- After `fluxbee_plan_compiler` returns `status: "plan_ready"`, call NO more tools. Present the `human_summary` and end with "Reply CONFIRM to execute or CANCEL to discard." Only the literal word CONFIRM triggers execution.
+- After `fluxbee_plan_compiler` returns `status: "blocked"`, call NO more tools. Present the `human_summary` as the blocker and stop; do not ask for CONFIRM.
+- Never call `fluxbee_plan_compiler` more than once per task unless the operator gives new information that resolves the blocker.
 
 ## Resolving a blocked pipeline
 
@@ -633,6 +635,13 @@ struct PlanCompileTrace {
     hive: String,
     steps: Vec<PlanCompileTraceStep>,
     step_count: usize,
+    blocked_reason: Option<String>,
+    blocked_code: Option<String>,
+    missing_fields: Vec<String>,
+    operator_hint: Option<String>,
+    help_lookup_actions: Vec<String>,
+    help_lookup_calls: u32,
+    query_hive_calls: u32,
     validation: String,
     first_validation_error: Option<String>,
     tokens_used: u32,
@@ -643,6 +652,59 @@ struct PlanCompilePending {
     plan: Value,
     cookbook_entry: Option<CookbookEntryV2>,
     trace: Option<PlanCompileTrace>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingConfirmationFlow {
+    PipelineConfirm1,
+    PipelineConfirm2,
+    PlanCompile,
+    Scmd,
+}
+
+impl PendingConfirmationFlow {
+    fn as_str(self) -> &'static str {
+        match self {
+            PendingConfirmationFlow::PipelineConfirm1 => "pipeline_confirm1",
+            PendingConfirmationFlow::PipelineConfirm2 => "pipeline_confirm2",
+            PendingConfirmationFlow::PlanCompile => "plan_compile",
+            PendingConfirmationFlow::Scmd => "scmd",
+        }
+    }
+
+    fn blocked_message(self) -> &'static str {
+        match self {
+            PendingConfirmationFlow::PipelineConfirm1 => {
+                "There is a pipeline confirmation pending in this chat. Reply CONFIRM to continue that pipeline or CANCEL to discard it before starting a new request."
+            }
+            PendingConfirmationFlow::PipelineConfirm2 => {
+                "There is a pipeline execution confirmation pending in this chat. Reply CONFIRM to execute that plan or CANCEL to discard it before starting a new request."
+            }
+            PendingConfirmationFlow::PlanCompile => {
+                "There is a compiled executor plan pending in this chat. Reply CONFIRM to execute it or CANCEL to discard it before starting a new request."
+            }
+            PendingConfirmationFlow::Scmd => {
+                "There is a direct SCMD action pending in this chat. Reply CONFIRM to execute it or CANCEL to discard it before starting a new request."
+            }
+        }
+    }
+
+    fn staged_message(self) -> &'static str {
+        match self {
+            PendingConfirmationFlow::PipelineConfirm1 => {
+                "Pipeline confirmation is pending in this chat. Reply CONFIRM to continue or CANCEL to discard."
+            }
+            PendingConfirmationFlow::PipelineConfirm2 => {
+                "Pipeline execution confirmation is pending in this chat. Reply CONFIRM to execute or CANCEL to discard."
+            }
+            PendingConfirmationFlow::PlanCompile => {
+                "A compiled executor plan is pending in this chat. Reply CONFIRM to execute or CANCEL to discard."
+            }
+            PendingConfirmationFlow::Scmd => {
+                "A direct SCMD action is pending in this chat. Reply CONFIRM to execute or CANCEL to discard."
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1490,104 +1552,121 @@ fn resolve_manifest_solution_id(manifest: &SolutionManifestV2, explicit: Option<
 
 const PLAN_COMPILER_SYSTEM_PROMPT_BASE: &str = r#"You are the plan_compiler agent inside SY.architect.
 
-Your only job is to translate a deployment task or delta_report into a valid executor_plan JSON.
-You do NOT interpret user intent — Archi already did that and gave you a clear task.
-You do NOT ask questions. You do NOT produce explanations. You call submit_executor_plan exactly once.
+Your only job is to produce a valid executor_plan JSON for SY.admin.
+You do not design solutions. You do not generate runtime artifacts. You do not execute admin actions. You do not interpret broad user intent.
 
-## executor_plan format
+## Inputs
+
+You receive one of two input modes:
+
+1. `delta_report` mode — preferred pipeline mode.
+   - Translate each deterministic delta operation into executor plan steps.
+   - Use the canonical `compiler_class` translation table from the provided context.
+   - Do not add steps that are not justified by a delta operation.
+
+2. `legacy_direct_task` mode — backward-compatible path for clear direct mutations.
+   - The task must already be clear and operational.
+   - If required target values are missing or ambiguous, block instead of guessing.
+
+## Required workflow
+
+1. Determine the required admin action sequence.
+2. Use `query_hive` only when live state is needed to produce static plan args.
+3. Before using any admin action in a plan step, call `get_admin_action_help(action_name)`.
+4. Build one static executor_plan with concrete args.
+5. Call `submit_executor_plan` exactly once.
+
+## Tool discipline
+
+- `query_hive` is for read-only pre-planning context only.
+- `get_admin_action_help` is mandatory for every admin action used in the final plan.
+- `submit_executor_plan` is the final tool call.
+- Never call mutating admin actions directly.
+
+## submit_executor_plan result shapes
+
+Plan-ready result:
 
 ```json
 {
-  "plan_version": "0.1",
-  "kind": "executor_plan",
-  "metadata": {
-    "name": "<short_snake_case_name>",
-    "target_hive": "<hive_id>"
-  },
-  "execution": {
-    "strict": true,
-    "stop_on_error": true,
-    "allow_help_lookup": true,
-    "steps": [
-      {
-        "id": "s1",
-        "action": "<action_name>",
-        "args": { ... }
-      }
-    ]
+  "status": "plan_ready",
+  "human_summary": "Plain-language explanation of what the plan will do.",
+  "plan": {
+    "plan_version": "0.1",
+    "kind": "executor_plan",
+    "metadata": {
+      "name": "<short_snake_case_name>",
+      "target_hive": "<hive_id>"
+    },
+    "execution": {
+      "strict": true,
+      "stop_on_error": true,
+      "allow_help_lookup": true,
+      "steps": [
+        {
+          "id": "s1",
+          "action": "<action_name>",
+          "args": { ... }
+        }
+      ]
+    }
   }
 }
 ```
 
-## Rules
+Blocked result:
 
-- Use only actions from the AVAILABLE ACTIONS section below. Never invent action names.
-- Every arg field must come from the action's documented schema. Never invent arg fields.
-- Step ids must be unique. Use s1, s2, s3, ... in order.
-- Ordering: publish_runtime_package steps before run_node steps; run_node steps before add_route steps.
-- If the context says a runtime is already published, skip its publish_runtime_package step.
-- If the context says a node is already running, skip its run_node step.
-- target_hive in metadata is the primary hive for this deployment.
-- For multi-hive operations, individual step args carry the specific hive.
+```json
+{
+  "status": "blocked",
+  "human_summary": "Short operator-facing explanation of what is missing or ambiguous.",
+  "blocked_reason": "Concrete deterministic reason.",
+  "blocked_code": "missing_required_value | ambiguous_target | runtime_not_found | live_state_required",
+  "missing_fields": ["tenant_id"],
+  "operator_hint": "Provide tenant_id for the first spawn, then retry plan compilation."
+}
+```
+
+## Hard rules
+
+- Use only admin actions from the injected catalog or returned by `get_admin_action_help`.
+- Never invent action names.
+- Never invent arg fields.
+- Never leave unresolved placeholders such as `{hive}` or `{node_name}`.
+- Never choose a runtime by vague similarity.
+- Never include broad design reasoning in the plan.
+- Never use `run_node` to start an existing stopped instance.
+- Never use `start_node` to create a missing instance.
+- Never use `node_control_config_set` to create a node.
+- Never include read-only discovery actions as executor steps unless the requested plan itself is read-only.
+- Step ids must be unique. Use `s1`, `s2`, `s3` in order.
+- `metadata.target_hive` is the primary hive for this plan; per-step args carry more specific hives when needed.
+- If the task is blocked by a missing required value or ambiguous target, submit `status: "blocked"` instead of guessing.
 
 ## Delta-report mode
 
-When the input includes `delta_report`, you are in the canonical pipeline path.
-
 - Translate only the operations in `delta_report.operations`.
 - Use the compiler_class translation table provided in the input context.
-- Do not add extra mutating steps not justified by a delta operation.
-- Do not skip required steps for a delta operation unless the operation is NOOP.
-- If a delta operation has a blocked compiler_class with no translation, do not invent a workaround.
-- Treat free-form `task` as deprecated context only when `delta_report` is present.
+- Respect operation order and dependencies.
 - If `approved_artifacts` entries include `publish_source`, use that exact source for any `publish_runtime_package` step justified by the delta. Do not reconstruct inline files or blob paths manually when a canonical publish_source is already provided.
+- Do not reinterpret desired state.
+- Do not add publish, cleanup, restart, route, or config steps unless they are required by the translated operations.
 
-## Fluxbee node naming convention
+## Legacy direct-task mode
 
-Node names in Fluxbee always include a type prefix followed by a dot, then the instance name, then `@hive`. The prefixes are: `AI.` for AI/language model nodes, `WF.` for workflow nodes, `IO.` for I/O integration nodes, `SY.` for system nodes. Examples: `AI.coa@motherbee`, `WF.router@worker-220`, `IO.slack.main@motherbee`. Never create a `node_name` without its type prefix — a name like `coa@motherbee` is invalid.
+When no `delta_report` is present:
 
-## Querying live hive state before generating the plan
-
-Use `query_hive` to read live state from the hive BEFORE generating steps. This is how you find out what runtimes exist, which nodes are running, what routes are configured, etc. Never include read actions (list_runtimes, inventory, etc.) as steps in the executor plan — executor plan args are static, so a step's output cannot feed into another step's args at runtime.
-
-Examples:
-- `query_hive(action="list_runtimes", hive="motherbee")` → see which runtimes are available and materialized
-- `query_hive(action="inventory")` → see which nodes are already running
-- `query_hive(action="get_runtime", hive="motherbee", params={"runtime": "ai.common"})` → verify a specific runtime
-
-## Choosing a runtime
-
-When the task requires creating a new node and the runtime is not specified, call `query_hive` with `list_runtimes` to see what is available. Choose the runtime whose name and type match the node being created (e.g. for an AI node, look for `ai.*` runtimes). Do not reuse the runtime name of an existing node (e.g. `ai.chat`) as the base for a different new node unless explicitly requested.
-
-## Looking up action schemas
-
-Before generating a step for any action, call `get_admin_action_help` with the action name. The response contains the exact required and optional fields, their types, and an example. Use it — do not guess arg names or assume fields based on action name alone.
+- Handle only clear operational mutation requests.
+- Use live reads only to determine whether the correct action is `run_node`, `start_node`, `restart_node`, config set, route add, runtime publish, etc.
+- If the request is broad design work, do not compile it.
+- If required values are missing, block rather than guess.
 
 ## human_summary rules
 
 - Write one paragraph, plain language, no JSON, no commands, no technical field names.
 - Describe what will happen from the operator's perspective.
-- Example: "I'll publish the WF routing runtime on motherbee, then start three nodes on worker-220, and configure the routes so messages from AI.support flow through WF.router to IO.slack and IO.email."
-
-## Workflow definition schema (wf_rules_compile_apply)
-
-`workflow_name` must match `^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)*$` — lowercase, digits, hyphens, dot-segments. Underscores are rejected. Convert snake_case to kebab-case (e.g. `response_dispatch` → `response-dispatch`).
-
-Required top-level fields: `wf_schema_version: "1"`, `workflow_type` (matches workflow_name), `description`, `input_schema` (JSON Schema), `initial_state`, `terminal_states: [...]`, `states: [...]`.
-
-Each state: `name`, `description`, `entry_actions: []`, `exit_actions: []`, `transitions: []`.
-
-Action types: `send_message` (fields: `type`, `target` as node instance name, `meta: {"msg":"...", "type":"..."}`, `payload`), `schedule_timer` (fields: `type`, `timer_key`, `fire_in`, `missed_policy`), `cancel_timer` (fields: `type`, `timer_key`), `reschedule_timer` (fields: `type`, `timer_key`, `fire_in`), `set_variable` (fields: `type`, `name`, `value` as CEL expression).
-
-`send_message` critical: `msg` and `type` go INSIDE `meta` — never as top-level fields. No `type_meta` field. Unknown top-level fields cause compile errors.
-
-Payload `$ref` syntax: `{"$ref": "input.field"}`, `{"$ref": "state.field"}`, `{"$ref": "event.field"}` for runtime values. Plain JSON values are literals.
-
-Each transition: `event_match: {"msg":"..."}`, optional `guard` (CEL), `target_state`, `actions: []`.
-
-CEL guard variables: `input` (creation event payload), `state` (workflow variables), `event` (`event.payload` for user data, `event.user_payload` for timer metadata).
-
-`tenant_id` is required in the `wf_rules_compile_apply` body when `auto_spawn: true` and the `WF.<name>@<hive>` node does not yet exist.
+- For `status: "blocked"`, the human_summary must describe the blocker in operator language.
+- If schema details are needed for an action such as `wf_rules_compile_apply`, rely on `get_admin_action_help` instead of memory.
 
 ## cookbook_entry rules
 
@@ -1603,8 +1682,65 @@ CEL guard variables: `input` (creation event payload), `state` (workflow variabl
 - Omit cookbook_entry for one-off tasks or tasks with very specific non-reusable parameters.
 "#;
 
+const PLAN_COMPILER_PLATFORM_FACTS: &str = r#"## PLATFORM_PLANNING_FACTS
+
+Use these facts only to select and validate planning intent. Do not treat them as admin action schemas. For exact parameters and request shape, call `get_admin_action_help` for each action.
+
+### Core concepts
+
+- A Fluxbee runtime is a published package/template. It is similar to an image.
+- A Fluxbee node is a managed instance created from a runtime.
+- A published runtime does not imply that a node exists.
+- A managed node instance may exist even when the process is stopped.
+- A live process is not the same thing as a persisted managed instance.
+
+### Naming
+
+- A full L2 node identity is composed as `<node_name>@<hive>`.
+- `node_name` must include a functional prefix such as `AI.*`, `IO.*`, `WF.*`, `SY.*`, or supported `RT.*`.
+- The hive in the node identity suffix must match the target hive argument when creating or operating that node.
+- Runtime names do not include `@hive`. Node instances do.
+- Example: `AI.support@motherbee` is a node instance. `ai.common` is a runtime/package name.
+
+### Lifecycle selection
+
+- Use `run_node` only to create/spawn a new managed node instance.
+- Use `start_node` only when the managed instance already exists and is stopped.
+- Use `restart_node` only when the managed instance already exists and should be restarted.
+- Use `kill_node` to stop a node process. It does not necessarily delete the persisted instance.
+- Use `remove_node_instance` only to delete the persisted managed instance.
+- Use `publish_runtime_package` to publish a runtime package. It does not spawn nodes.
+
+### Config selection
+
+- `get_node_config` reads persisted node config from disk/snapshot.
+- `node_control_config_get` asks a running node for its live config contract.
+- `node_control_config_set` updates live node-defined config for an existing node. It does not create nodes.
+- For config updates, read current live config first when `config_version` is required.
+
+### Restart semantics
+
+- `AI.*` and `IO.*` config changes are generally hot-apply unless the live contract says otherwise.
+- `WF.*` and `SY.*` config changes are conservative and generally require restart unless the live contract says otherwise.
+- If restart requirement is ambiguous, surface it as risk or block rather than guessing.
+
+### Tenant and identity
+
+- Some first-spawn operations for AI/IO tenant-scoped nodes require `tenant_id` at root action args.
+- Do not invent `tenant_id`.
+- If a required `tenant_id` is missing and cannot be read from reliable context, block with a clear missing-field reason.
+
+### Planning discipline
+
+- Use `query_hive` for pre-read state needed to produce static executor plan args.
+- Do not include read-only actions as executor plan steps unless the operator explicitly requested a read-only executor plan.
+- Do not choose a runtime by vague name similarity. If the runtime is missing or ambiguous, block or require upstream clarification.
+"#;
+
 fn build_plan_compiler_prompt(actions: &[Value], cookbook: &[CookbookEntryV2]) -> String {
     let mut prompt = PLAN_COMPILER_SYSTEM_PROMPT_BASE.to_string();
+    prompt.push_str("\n\n");
+    prompt.push_str(PLAN_COMPILER_PLATFORM_FACTS);
 
     prompt.push_str("\n## AVAILABLE ACTIONS\n\n");
     prompt.push_str(
@@ -2858,8 +2994,8 @@ impl FunctionTool for PlanCompilerTool {
                 workflow deployments, runtime publishing, and other admin-backed changes. Use \
                 fluxbee_start_pipeline only when the desired state needs manifest/reconcile design work before a plan can exist. Pass either a free-form task description or the \
                 canonical delta_report, plus the target hive and any known context. The plan_compiler \
-                produces a validated executor_plan and a human-readable summary. After receiving the \
-                result, present the human_summary and wait for CONFIRM before execution. \
+                produces either a validated executor_plan or an explicit blocked result with a deterministic reason, plus a human-readable summary. After receiving a \
+                plan_ready result, present the human_summary and wait for CONFIRM before execution. If it returns blocked, explain the blocker and stop. \
                 Do NOT show the raw JSON plan unless the operator explicitly asks. Hive: {}.",
                 self.context.hive_id
             ),
@@ -2941,6 +3077,14 @@ impl FunctionTool for PlanCompilerTool {
             })?
             .to_string();
 
+        // Any new plan_compiler invocation supersedes a previously pending unconfirmed plan
+        // for this session. Clear it up front so a later CONFIRM cannot execute stale work.
+        self.context
+            .plan_compile_pending
+            .lock()
+            .await
+            .remove(&session_id);
+
         let execution = match run_plan_compiler_transaction(
             &self.context,
             &task,
@@ -2974,39 +3118,77 @@ impl FunctionTool for PlanCompilerTool {
         let tool_result_first_error = trace.first_validation_error.clone();
         let tool_result_tokens_used = trace.tokens_used;
         let tool_result_token_budget = trace.token_budget;
-
-        let pending = PlanCompilePending {
-            plan: output.plan.clone(),
-            cookbook_entry: output.cookbook_entry.clone(),
-            trace: Some(trace),
+        let response = if output.disposition == PlanCompilerDisposition::Blocked {
+            json!({
+                "status": "blocked",
+                "human_summary": output.human_summary,
+                "blocked_reason": output.blocked_reason,
+                "blocked_code": output.blocked_code,
+                "missing_fields": output.missing_fields,
+                "operator_hint": output.operator_hint,
+                "step_count": step_count,
+                "plan_steps": plan_steps,
+                "validation": tool_result_validation,
+                "first_validation_error": tool_result_first_error,
+                "plan_compile_trace": trace_value,
+                "token_usage": {
+                    "plan_compile": tool_result_tokens_used,
+                    "total": tool_result_tokens_used,
+                    "budget": tool_result_token_budget,
+                },
+            })
+        } else {
+            let pending = PlanCompilePending {
+                plan: output
+                    .plan
+                    .clone()
+                    .expect("plan_ready output must include a plan"),
+                cookbook_entry: output.cookbook_entry.clone(),
+                trace: Some(trace),
+            };
+            self.context
+                .plan_compile_pending
+                .lock()
+                .await
+                .insert(session_id, pending);
+            json!({
+                "status": "plan_ready",
+                "human_summary": output.human_summary,
+                "step_count": step_count,
+                "plan_steps": plan_steps,
+                "validation": tool_result_validation,
+                "first_validation_error": tool_result_first_error,
+                "plan_compile_trace": trace_value,
+                "token_usage": {
+                    "plan_compile": tool_result_tokens_used,
+                    "total": tool_result_tokens_used,
+                    "budget": tool_result_token_budget,
+                },
+            })
         };
-        self.context
-            .plan_compile_pending
-            .lock()
-            .await
-            .insert(session_id, pending);
 
-        Ok(json!({
-            "status": "plan_ready",
-            "human_summary": output.human_summary,
-            "step_count": step_count,
-            "plan_steps": plan_steps,
-            "validation": tool_result_validation,
-            "first_validation_error": tool_result_first_error,
-            "plan_compile_trace": trace_value,
-            "token_usage": {
-                "plan_compile": tool_result_tokens_used,
-                "total": tool_result_tokens_used,
-                "budget": tool_result_token_budget,
-            },
-        }))
+        Ok(response)
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanCompilerDisposition {
+    PlanReady,
+    Blocked,
+}
+
 struct PlanCompilerOutput {
-    plan: Value,
+    disposition: PlanCompilerDisposition,
+    plan: Option<Value>,
     human_summary: String,
+    blocked_reason: Option<String>,
+    blocked_code: Option<String>,
+    missing_fields: Vec<String>,
+    operator_hint: Option<String>,
     cookbook_entry: Option<CookbookEntryV2>,
+    help_lookup_actions: Vec<String>,
+    help_lookup_calls: u32,
+    query_hive_calls: u32,
     tokens_used: u32,
 }
 
@@ -3015,20 +3197,36 @@ struct PlanCompilerExecution {
     trace: PlanCompileTrace,
 }
 
+struct PlanCompileBlockedDetails {
+    human_summary: String,
+    blocked_reason: String,
+    blocked_code: Option<String>,
+    missing_fields: Vec<String>,
+    operator_hint: Option<String>,
+    plan_compile_trace: Value,
+    failure_class: FailureClass,
+    failure_route: String,
+    operator_options: Value,
+    plan_compile_tokens: u32,
+}
+
 fn build_plan_compile_trace(
     task: &str,
     hive: &str,
-    plan: &Value,
+    plan: Option<&Value>,
+    validation_label: &str,
+    blocked_reason: Option<String>,
+    blocked_code: Option<String>,
+    missing_fields: Vec<String>,
+    operator_hint: Option<String>,
+    help_lookup_actions: Vec<String>,
+    help_lookup_calls: u32,
+    query_hive_calls: u32,
     first_validation_error: Option<String>,
     tokens_used: u32,
 ) -> PlanCompileTrace {
-    let validation_label = if first_validation_error.is_some() {
-        "ok_after_retry"
-    } else {
-        "ok"
-    };
     let plan_steps: Vec<Value> = plan
-        .get("execution")
+        .and_then(|value| value.get("execution"))
         .and_then(|e| e.get("steps"))
         .and_then(|s| s.as_array())
         .map(|steps| {
@@ -3089,6 +3287,13 @@ fn build_plan_compile_trace(
             })
             .collect(),
         step_count,
+        blocked_reason,
+        blocked_code,
+        missing_fields,
+        operator_hint,
+        help_lookup_actions,
+        help_lookup_calls,
+        query_hive_calls,
         validation: validation_label.to_string(),
         first_validation_error,
         tokens_used,
@@ -3106,11 +3311,45 @@ fn plan_compile_trace_to_value(trace: &PlanCompileTrace) -> Value {
             "args_preview": step.args_preview,
         })).collect::<Vec<_>>(),
         "step_count": trace.step_count,
+        "blocked_reason": trace.blocked_reason,
+        "blocked_code": trace.blocked_code,
+        "missing_fields": trace.missing_fields,
+        "operator_hint": trace.operator_hint,
+        "help_lookup_actions": trace.help_lookup_actions,
+        "help_lookup_calls": trace.help_lookup_calls,
+        "query_hive_calls": trace.query_hive_calls,
         "validation": trace.validation,
         "first_validation_error": trace.first_validation_error,
         "tokens_used": trace.tokens_used,
         "token_budget": trace.token_budget,
     })
+}
+
+fn build_plan_compile_blocked_details(
+    output: &PlanCompilerOutput,
+    trace_value: Value,
+    failure_class: FailureClass,
+    current_loop: usize,
+    plan_compile_attempts_used: u32,
+) -> PlanCompileBlockedDetails {
+    let human_summary = output.human_summary.clone();
+    let blocked_reason = output
+        .blocked_reason
+        .clone()
+        .unwrap_or_else(|| human_summary.clone());
+    let route = route_failure(&failure_class, current_loop, 0, plan_compile_attempts_used);
+    PlanCompileBlockedDetails {
+        human_summary,
+        blocked_reason,
+        blocked_code: output.blocked_code.clone(),
+        missing_fields: output.missing_fields.clone(),
+        operator_hint: output.operator_hint.clone(),
+        plan_compile_trace: trace_value,
+        failure_class: failure_class.clone(),
+        failure_route: route.operator_message(&failure_class),
+        operator_options: json!(route.operator_options()),
+        plan_compile_tokens: output.tokens_used,
+    }
 }
 
 async fn run_plan_compiler_transaction(
@@ -3135,8 +3374,38 @@ async fn run_plan_compiler_transaction(
     .await?;
     token_budget.add("plan_compiler.first_attempt", first_output.tokens_used)?;
 
-    let validation_error =
-        plan_compiler_prevalidate(context, &first_output.plan, delta_report).await;
+    if first_output.disposition == PlanCompilerDisposition::Blocked {
+        let trace = build_plan_compile_trace(
+            task,
+            hive,
+            None,
+            "blocked",
+            first_output.blocked_reason.clone(),
+            first_output.blocked_code.clone(),
+            first_output.missing_fields.clone(),
+            first_output.operator_hint.clone(),
+            first_output.help_lookup_actions.clone(),
+            first_output.help_lookup_calls,
+            first_output.query_hive_calls,
+            None,
+            first_output.tokens_used,
+        );
+        return Ok(PlanCompilerExecution {
+            output: first_output,
+            trace,
+        });
+    }
+
+    let validation_error = plan_compiler_prevalidate(
+        context,
+        first_output
+            .plan
+            .as_ref()
+            .expect("plan_ready output must include a plan"),
+        &first_output.help_lookup_actions,
+        delta_report,
+    )
+    .await;
     let first_validation_error = validation_error.clone();
 
     let output = if let Some(err) = validation_error {
@@ -3156,23 +3425,53 @@ async fn run_plan_compiler_transaction(
         )
         .await?;
         token_budget.add("plan_compiler.retry", retried.tokens_used)?;
-        if let Some(retry_err) =
-            plan_compiler_prevalidate(context, &retried.plan, delta_report).await
+        if retried.disposition == PlanCompilerDisposition::Blocked {
+            PlanCompilerOutput {
+                tokens_used: first_output.tokens_used.saturating_add(retried.tokens_used),
+                ..retried
+            }
+        } else if let Some(retry_err) = plan_compiler_prevalidate(
+            context,
+            retried
+                .plan
+                .as_ref()
+                .expect("plan_ready retry output must include a plan"),
+            &retried.help_lookup_actions,
+            delta_report,
+        )
+        .await
         {
             return Err(format!("plan_compiler retry produced invalid plan: {retry_err}").into());
-        }
-        PlanCompilerOutput {
-            tokens_used: first_output.tokens_used.saturating_add(retried.tokens_used),
-            ..retried
+        } else {
+            PlanCompilerOutput {
+                tokens_used: first_output.tokens_used.saturating_add(retried.tokens_used),
+                ..retried
+            }
         }
     } else {
         first_output
     };
 
+    let help_lookup_actions = output.help_lookup_actions.clone();
+    let help_lookup_calls = output.help_lookup_calls;
+    let query_hive_calls = output.query_hive_calls;
+    let validation_label = match output.disposition {
+        PlanCompilerDisposition::Blocked => "blocked",
+        PlanCompilerDisposition::PlanReady if first_validation_error.is_some() => "ok_after_retry",
+        PlanCompilerDisposition::PlanReady => "ok",
+    };
     let trace = build_plan_compile_trace(
         task,
         hive,
-        &output.plan,
+        output.plan.as_ref(),
+        validation_label,
+        output.blocked_reason.clone(),
+        output.blocked_code.clone(),
+        output.missing_fields.clone(),
+        output.operator_hint.clone(),
+        help_lookup_actions,
+        help_lookup_calls,
+        query_hive_calls,
         first_validation_error,
         output.tokens_used,
     );
@@ -3212,9 +3511,14 @@ async fn run_plan_compiler_with_context(
         "parameters": {
             "type": "object",
             "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["plan_ready", "blocked"],
+                    "description": "Use 'plan_ready' when returning a concrete executor plan. Use 'blocked' when the task is underspecified or ambiguous and must not be guessed."
+                },
                 "plan": {
                     "type": "object",
-                    "description": "The complete executor_plan JSON.",
+                    "description": "The complete executor_plan JSON. Required when status='plan_ready'. Omit when status='blocked'.",
                     "properties": {
                         "plan_version": { "type": "string" },
                         "kind": { "type": "string" },
@@ -3252,7 +3556,24 @@ async fn run_plan_compiler_with_context(
                 },
                 "human_summary": {
                     "type": "string",
-                    "description": "One paragraph in plain language describing what this plan does. No JSON, no commands. Archi shows this to the user."
+                    "description": "One paragraph in plain language describing what this plan does, or why it is blocked. No JSON, no commands. Archi shows this to the user."
+                },
+                "blocked_reason": {
+                    "type": "string",
+                    "description": "Required when status='blocked'. State the concrete missing value or ambiguity that prevented plan creation."
+                },
+                "blocked_code": {
+                    "type": "string",
+                    "description": "Optional structured blocker code for common plan blockers such as missing_required_value, ambiguous_target, runtime_not_found, or live_state_required."
+                },
+                "missing_fields": {
+                    "type": "array",
+                    "description": "Optional list of concrete missing fields when status='blocked'.",
+                    "items": { "type": "string" }
+                },
+                "operator_hint": {
+                    "type": "string",
+                    "description": "Optional one-line next step for the operator when status='blocked'."
                 },
                 "cookbook_entry": {
                     "type": "object",
@@ -3284,7 +3605,7 @@ async fn run_plan_compiler_with_context(
                     ]
                 }
             },
-            "required": ["plan", "human_summary"]
+            "required": ["status", "human_summary"]
         }
     });
 
@@ -3332,7 +3653,7 @@ async fn run_plan_compiler_with_context(
     });
 
     let input_text = serde_json::to_string_pretty(&json!({
-        "mode": if delta_report.is_some() { "delta_report" } else { "legacy_task" },
+        "mode": if delta_report.is_some() { "delta_report" } else { "legacy_direct_task" },
         "task": if task.trim().is_empty() { Value::Null } else { Value::String(task.to_string()) },
         "hive": hive,
         "context": user_context,
@@ -3372,29 +3693,127 @@ async fn run_plan_compiler_with_context(
             .into()
     })?;
 
-    let plan = submitted
-        .get("plan")
-        .cloned()
-        .ok_or_else(|| -> ArchitectError {
-            "submit_executor_plan missing 'plan'".to_string().into()
-        })?;
+    let mut help_lookup_actions = result
+        .items
+        .iter()
+        .filter_map(|item| {
+            if let FunctionLoopItem::ToolResult { result } = item {
+                if result.name == "get_admin_action_help" && !result.is_error {
+                    return result
+                        .output
+                        .get("action_name")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string);
+                }
+            }
+            None
+        })
+        .collect::<Vec<_>>();
+    help_lookup_actions.sort();
+    help_lookup_actions.dedup();
+    let help_lookup_calls = result
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(item, FunctionLoopItem::ToolResult { result } if result.name == "get_admin_action_help" && !result.is_error)
+        })
+        .count() as u32;
+    let query_hive_calls = result
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(item, FunctionLoopItem::ToolResult { result } if result.name == "query_hive" && !result.is_error)
+        })
+        .count() as u32;
+
+    let disposition = match submitted
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("plan_ready")
+    {
+        "plan_ready" => PlanCompilerDisposition::PlanReady,
+        "blocked" => PlanCompilerDisposition::Blocked,
+        other => {
+            return Err(
+                format!("submit_executor_plan returned unsupported status '{other}'").into(),
+            )
+        }
+    };
     let human_summary = submitted
         .get("human_summary")
         .and_then(|v| v.as_str())
-        .unwrap_or("Plan ready.")
+        .unwrap_or(match disposition {
+            PlanCompilerDisposition::PlanReady => "Plan ready.",
+            PlanCompilerDisposition::Blocked => "Plan blocked.",
+        })
         .to_string();
+    let blocked_reason = submitted
+        .get("blocked_reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let blocked_code = submitted
+        .get("blocked_code")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let missing_fields = submitted
+        .get("missing_fields")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let operator_hint = submitted
+        .get("operator_hint")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let cookbook_entry = submitted
         .get("cookbook_entry")
         .and_then(parse_plan_compile_cookbook_entry);
 
-    // Validate the plan shape before returning
-    validate_architect_executor_plan_shape(&plan)
-        .map_err(|e| -> ArchitectError { format!("plan_compiler plan invalid: {e}").into() })?;
+    let plan = match disposition {
+        PlanCompilerDisposition::PlanReady => {
+            let plan = submitted
+                .get("plan")
+                .cloned()
+                .ok_or_else(|| -> ArchitectError {
+                    "submit_executor_plan missing 'plan' for status='plan_ready'"
+                        .to_string()
+                        .into()
+                })?;
+            validate_architect_executor_plan_shape(&plan).map_err(|e| -> ArchitectError {
+                format!("plan_compiler plan invalid: {e}").into()
+            })?;
+            Some(plan)
+        }
+        PlanCompilerDisposition::Blocked => None,
+    };
 
     Ok(PlanCompilerOutput {
+        disposition,
         plan,
         human_summary,
+        blocked_reason,
+        blocked_code,
+        missing_fields,
+        operator_hint,
         cookbook_entry,
+        help_lookup_actions,
+        help_lookup_calls,
+        query_hive_calls,
         tokens_used: result.tokens_used,
     })
 }
@@ -3990,6 +4409,36 @@ fn cancellation_requested(input: &str) -> bool {
         input.trim().to_ascii_uppercase().as_str(),
         "CANCEL" | "ABORT"
     )
+}
+
+async fn pending_confirmation_flow(
+    state: &ArchitectState,
+    session_id: &str,
+) -> Option<PendingConfirmationFlow> {
+    if active_pipeline_at_stage(state, session_id, &PipelineStage::Confirm1)
+        .await
+        .is_some()
+    {
+        return Some(PendingConfirmationFlow::PipelineConfirm1);
+    }
+    if active_pipeline_at_stage(state, session_id, &PipelineStage::Confirm2)
+        .await
+        .is_some()
+    {
+        return Some(PendingConfirmationFlow::PipelineConfirm2);
+    }
+    if state
+        .plan_compile_pending
+        .lock()
+        .await
+        .contains_key(session_id)
+    {
+        return Some(PendingConfirmationFlow::PlanCompile);
+    }
+    if state.pending_actions.lock().await.contains_key(session_id) {
+        return Some(PendingConfirmationFlow::Scmd);
+    }
+    None
 }
 
 fn is_terminal_pipeline_status(status: &PipelineRunStatus) -> bool {
@@ -5513,6 +5962,17 @@ async fn handle_chat_message(
                 }
             }
         } // end else (no plan_compile_pending)
+    } else if let Some(flow) = pending_confirmation_flow(state, &resolved_session_id).await {
+        ChatResponse {
+            status: "blocked".to_string(),
+            mode: "chat".to_string(),
+            output: json!({
+                "message": flow.blocked_message(),
+                "pending_confirmation_flow": flow.as_str(),
+            }),
+            session_id: Some(resolved_session_id.clone()),
+            session_title: Some(session.title.clone()),
+        }
     } else if let Some(raw) = message.strip_prefix("SCMD:") {
         match handle_scmd(state, &resolved_session_id, raw.trim()).await {
             Ok(output) => {
@@ -5700,6 +6160,26 @@ async fn handle_executor_plan_request(
                 }
             }
         };
+
+    if let Some(flow) = pending_confirmation_flow(state, &resolved_session_id).await {
+        let response = ChatResponse {
+            status: "blocked".to_string(),
+            mode: "executor".to_string(),
+            output: json!({
+                "error": flow.blocked_message(),
+                "phase": "pending_confirmation",
+                "pending_confirmation_flow": flow.as_str(),
+            }),
+            session_id: Some(resolved_session_id.clone()),
+            session_title: Some(session.title.clone()),
+        };
+        let plan_text = render_executor_plan_submission(
+            req.execution_id.as_deref().unwrap_or("blocked"),
+            &req.plan,
+        );
+        let _ = persist_chat_exchange(state, &mut session, plan_text, &[], &response).await;
+        return response;
+    }
 
     let execution_id = req
         .execution_id
@@ -6172,11 +6652,8 @@ async fn handle_ai_chat(
         )
         .await
         .map_err(|err| -> ArchitectError { format!("AI request failed: {err}").into() })?;
-    let pending_confirmation_staged = state
-        .pending_actions
-        .lock()
-        .await
-        .contains_key(&session.session_id);
+    let pending_confirmation_state = pending_confirmation_flow(state, &session.session_id).await;
+    let pending_confirmation_staged = pending_confirmation_state.is_some();
 
     let tool_results = result
         .items
@@ -6204,7 +6681,12 @@ async fn handle_ai_chat(
             }
         });
     let message = if pending_confirmation_staged {
-        latest_staged_confirmation_message(&result.items).unwrap_or(raw_message)
+        latest_staged_confirmation_message(&result.items).unwrap_or_else(|| {
+            pending_confirmation_state
+                .map(PendingConfirmationFlow::staged_message)
+                .unwrap_or(raw_message.as_str())
+                .to_string()
+        })
     } else if text_suggests_pending_confirmation(&raw_message) {
         if tool_results.iter().any(|result| {
             result
@@ -7748,15 +8230,105 @@ fn validate_plan_against_delta(plan: &Value, delta: &DeltaReport) -> Result<(), 
     Ok(())
 }
 
+fn plan_step_actions(plan: &Value) -> Result<Vec<String>, ArchitectError> {
+    let steps = plan
+        .get("execution")
+        .and_then(|value| value.get("steps"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| -> ArchitectError {
+            "executor plan execution.steps must be an array".into()
+        })?;
+    steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            step.get("action")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| -> ArchitectError {
+                    format!(
+                        "executor plan step {} is missing string field 'action'",
+                        index + 1
+                    )
+                    .into()
+                })
+        })
+        .collect()
+}
+
+fn validate_plan_help_lookups(
+    plan: &Value,
+    help_lookup_actions: &[String],
+) -> Result<(), ArchitectError> {
+    let looked_up: std::collections::HashSet<&str> =
+        help_lookup_actions.iter().map(String::as_str).collect();
+    let mut missing = Vec::new();
+    for action in plan_step_actions(plan)? {
+        if !looked_up.contains(action.as_str()) {
+            missing.push(action);
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    if !missing.is_empty() {
+        return Err(format!(
+            "missing get_admin_action_help lookup for plan actions: {}",
+            missing.join(", ")
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn classify_plan_compile_blocked_failure(
+    blocked_code: Option<&str>,
+    blocked_reason: &str,
+    missing_fields: &[String],
+) -> FailureClass {
+    let code = blocked_code.unwrap_or("").trim().to_ascii_lowercase();
+    let reason = blocked_reason.to_ascii_lowercase();
+    if !missing_fields.is_empty()
+        || code == "missing_required_value"
+        || code == "tenant_id_required"
+        || code == "hive_required"
+        || code == "config_version_required"
+        || reason.contains("missing required")
+        || reason.contains("tenant_id")
+    {
+        return FailureClass::PlanContractInvalid;
+    }
+    if code == "ambiguous_target"
+        || code == "ambiguous_runtime"
+        || reason.contains("ambiguous")
+        || reason.contains("multiple candidates")
+    {
+        return FailureClass::PlanInvalid;
+    }
+    if code == "runtime_not_found"
+        || code == "live_state_required"
+        || reason.contains("runtime not found")
+        || reason.contains("live state")
+    {
+        return FailureClass::ExecutionEnvironmentMissing;
+    }
+    FailureClass::PlanInvalid
+}
+
 async fn plan_compiler_prevalidate(
     context: &ArchitectAdminToolContext,
     plan: &Value,
+    help_lookup_actions: &[String],
     delta_report: Option<&DeltaReport>,
 ) -> Option<String> {
     if let Some(delta) = delta_report {
         if let Err(err) = validate_plan_against_delta(plan, delta) {
             return Some(format!("delta validation failed: {err}"));
         }
+    }
+    if let Err(err) = validate_plan_help_lookups(plan, help_lookup_actions) {
+        return Some(format!("help lookup validation failed: {err}"));
     }
 
     let admin_target = format!("SY.admin@{}", context.hive_id);
@@ -11197,6 +11769,28 @@ fn architect_index_html(state: &ArchitectState) -> String {
       color: var(--warning);
       display: block;
     }}
+    .inline-confirm-bar {{
+      display: flex;
+      gap: 8px;
+      margin-top: 10px;
+      flex-wrap: wrap;
+    }}
+    .inline-confirm-btn {{
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--text);
+      border-radius: 999px;
+      padding: 6px 12px;
+      font: inherit;
+      font-size: 0.78rem;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .inline-confirm-btn.primary {{
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }}
     .modal-backdrop {{
       position: fixed;
       inset: 0;
@@ -12896,9 +13490,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
       return shell;
     }}
     function renderPlanCompileTrace(trace) {{
-      if (!trace || !trace.step_count) return null;
+      if (!trace) return null;
       const isRetry = trace.validation === "ok_after_retry";
-      const validationLabel = isRetry ? "retry" : "ok";
+      const isBlocked = trace.validation === "blocked";
+      const validationLabel = isBlocked ? "blocked" : (isRetry ? "retry" : "ok");
 
       const wrapper = document.createElement("details");
       wrapper.className = "agent-trace";
@@ -12911,10 +13506,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
       icon.style.fontSize = "0.9rem";
       const label = document.createElement("span");
       label.className = "agent-trace-label";
-      label.textContent = "Agent activity · plan_compiler → " + trace.step_count + " step" + (trace.step_count !== 1 ? "s" : "");
+      label.textContent = isBlocked
+        ? "Agent activity · plan_compiler → blocked"
+        : "Agent activity · plan_compiler → " + trace.step_count + " step" + (trace.step_count !== 1 ? "s" : "");
       const badge = document.createElement("span");
       badge.className = "agent-trace-badge " + validationLabel;
-      badge.textContent = isRetry ? "retried" : "valid";
+      badge.textContent = isBlocked ? "blocked" : (isRetry ? "retried" : "valid");
       const tokenBadge = document.createElement("span");
       tokenBadge.className = "agent-trace-badge ok";
       const tokenText = formatTokenCount(trace.tokens_used);
@@ -12950,6 +13547,49 @@ fn architect_index_html(state: &ArchitectState) -> String {
         "<span class='agent-trace-row-action'>hive →</span>" +
         "<span class='agent-trace-row-args'>" + (trace.hive || "") + "</span>";
       callSection.appendChild(hiveRow);
+      const toolRow = document.createElement("div");
+      toolRow.className = "agent-trace-row";
+      toolRow.innerHTML =
+        "<span class='agent-trace-row-action'>reads →</span>" +
+        "<span class='agent-trace-row-args'>" +
+        "help " + Number(trace && trace.help_lookup_calls ? trace.help_lookup_calls : 0) + " time(s)" +
+        " · query_hive " + Number(trace && trace.query_hive_calls ? trace.query_hive_calls : 0) + " time(s)" +
+        "</span>";
+      callSection.appendChild(toolRow);
+      const helpActions = Array.isArray(trace && trace.help_lookup_actions) ? trace.help_lookup_actions.filter(Boolean) : [];
+      if (helpActions.length > 0) {{
+        const helpActionRow = document.createElement("div");
+        helpActionRow.className = "agent-trace-row";
+        helpActionRow.innerHTML =
+          "<span class='agent-trace-row-action'>helped →</span>" +
+          "<span class='agent-trace-row-args'>" + helpActions.join(", ") + "</span>";
+        callSection.appendChild(helpActionRow);
+      }}
+      if (trace && trace.blocked_reason) {{
+        const blockedRow = document.createElement("div");
+        blockedRow.className = "agent-trace-row";
+        blockedRow.innerHTML =
+          "<span class='agent-trace-row-action'>blocked →</span>" +
+          "<span class='agent-trace-row-args'>" + String(trace.blocked_reason) + "</span>";
+        callSection.appendChild(blockedRow);
+      }}
+      const missingFields = Array.isArray(trace && trace.missing_fields) ? trace.missing_fields.filter(Boolean) : [];
+      if (missingFields.length > 0) {{
+        const missingRow = document.createElement("div");
+        missingRow.className = "agent-trace-row";
+        missingRow.innerHTML =
+          "<span class='agent-trace-row-action'>missing →</span>" +
+          "<span class='agent-trace-row-args'>" + missingFields.join(", ") + "</span>";
+        callSection.appendChild(missingRow);
+      }}
+      if (trace && trace.operator_hint) {{
+        const hintRow = document.createElement("div");
+        hintRow.className = "agent-trace-row";
+        hintRow.innerHTML =
+          "<span class='agent-trace-row-action'>next →</span>" +
+          "<span class='agent-trace-row-args'>" + String(trace.operator_hint) + "</span>";
+        callSection.appendChild(hintRow);
+      }}
       body.appendChild(callSection);
 
       // ── section: plan steps ──
@@ -13420,7 +14060,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
 
       appendMessage("architect", "archi", shell);
     }}
-    function renderCommandResult(kind, mode, data) {{
+    function renderCommandResult(kind, mode, data, options = {{}}) {{
+      const fromHistory = !!(options && options.fromHistory);
       const shell = document.createElement("div");
       const head = document.createElement("div");
       const title = document.createElement("div");
@@ -13461,9 +14102,56 @@ fn architect_index_html(state: &ArchitectState) -> String {
         shell.appendChild(createResultSection("result", data.output));
       }}
 
+      if (!fromHistory && responseWantsInlineConfirm(data)) {{
+        shell.appendChild(buildInlineConfirmBar());
+      }}
+
       appendMessage(kind, kind === "architect" ? "archi" : "System", shell);
     }}
-    function renderResponsePayload(kind, data) {{
+    function responseWantsInlineConfirm(data) {{
+      const output = data && data.output ? data.output : null;
+      if (!output || typeof output !== "object") return false;
+      if (data && data.mode === "pipeline") {{
+        return output.stage === "confirm1" || output.stage === "confirm2";
+      }}
+      if (data && data.mode === "chat") {{
+        const trace = output.plan_compile_trace;
+        return !!(
+          trace &&
+          trace.validation !== "blocked" &&
+          typeof output.message === "string" &&
+          /confirm/i.test(output.message)
+        );
+      }}
+      if (data && (data.mode === "scmd" || data.mode === "acmd")) {{
+        const status = String(data.status || (output && output.status) || "").toLowerCase();
+        return status === "pending_confirm" || !!(output.pending_confirmation || output.requires_confirmation);
+      }}
+      return false;
+    }}
+    function buildInlineConfirmBar() {{
+      const bar = document.createElement("div");
+      bar.className = "inline-confirm-bar";
+      const confirmBtn = document.createElement("button");
+      confirmBtn.type = "button";
+      confirmBtn.className = "inline-confirm-btn primary";
+      confirmBtn.textContent = "CONFIRM";
+      confirmBtn.addEventListener("click", () => {{
+        sendQuickControlMessage("CONFIRM");
+      }});
+      const cancelBtn = document.createElement("button");
+      cancelBtn.type = "button";
+      cancelBtn.className = "inline-confirm-btn";
+      cancelBtn.textContent = "CANCEL";
+      cancelBtn.addEventListener("click", () => {{
+        sendQuickControlMessage("CANCEL");
+      }});
+      bar.appendChild(confirmBtn);
+      bar.appendChild(cancelBtn);
+      return bar;
+    }}
+    function renderResponsePayload(kind, data, options = {{}}) {{
+      const fromHistory = !!(options && options.fromHistory);
       if (data && data.mode === "executor") {{
         renderExecutorResult(data);
         return;
@@ -13490,6 +14178,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
         body.className = "chat-response";
         message.textContent = output.message;
         body.appendChild(message);
+        if (!fromHistory && responseWantsInlineConfirm(data)) body.appendChild(buildInlineConfirmBar());
         if (designerTrace) body.appendChild(designerTrace);
         if (designLoopTrace) body.appendChild(designLoopTrace);
         if (artifactLoopTrace) body.appendChild(artifactLoopTrace);
@@ -13510,6 +14199,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
           body.className = "chat-response";
           message.textContent = output.message;
           body.appendChild(message);
+          if (!fromHistory && responseWantsInlineConfirm(data)) body.appendChild(buildInlineConfirmBar());
           if (designerTrace) body.appendChild(designerTrace);
           if (designLoopTrace) body.appendChild(designLoopTrace);
           if (artifactLoopTrace) body.appendChild(artifactLoopTrace);
@@ -13518,13 +14208,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
           return;
         }}
       }}
-      renderCommandResult(kind, data.mode, data);
+      renderCommandResult(kind, data.mode, data, options);
     }}
     function renderStoredMessage(message) {{
       const metadata = message && message.metadata ? message.metadata : {{}};
       if (metadata.kind === "response" && metadata.response) {{
         const role = message.role === "architect" ? "architect" : message.role === "system" ? "system" : "architect";
-        renderResponsePayload(role, metadata.response);
+        renderResponsePayload(role, metadata.response, {{ fromHistory: true }});
         return;
       }}
       const role = message.role === "architect" ? "architect" : message.role === "system" ? "system" : "user";
@@ -13946,6 +14636,43 @@ fn architect_index_html(state: &ArchitectState) -> String {
       scheduleSessionRefresh(delay);
     }}
     let submitInFlight = false;
+    async function sendQuickControlMessage(message) {{
+      if (submitInFlight) return;
+      if (!currentSessionId) {{
+        await createSession();
+      }}
+      addMessage("user", message);
+      showPendingIndicator("System", "Executing action");
+      send.disabled = true;
+      attach.disabled = true;
+      submitInFlight = true;
+      try {{
+        const res = await fetch(chatUrl, {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ session_id: currentSessionId, message, attachments: [] }})
+        }});
+        const data = await res.json();
+        if (data.session_id) {{
+          currentSessionId = data.session_id;
+          localStorage.setItem(currentSessionStorageKey, currentSessionId);
+        }}
+        hidePendingIndicator();
+        if (!(data && data.output && data.output.suppress_echo === true)) {{
+          renderResponsePayload(data.status === "ok" ? "architect" : "system", data);
+        }}
+        await refreshSessionList(currentSessionId);
+      }} catch (err) {{
+        hidePendingIndicator();
+        addMessage("system", "Request failed: " + err);
+      }} finally {{
+        submitInFlight = false;
+        hidePendingIndicator();
+        send.disabled = false;
+        attach.disabled = false;
+        refreshStatus({{ force: true }});
+      }}
+    }}
     async function submit() {{
       if (submitInFlight) return;
       const message = input.value.trim();
@@ -15268,9 +15995,7 @@ async fn latest_blocked_pipeline_run_for_session(
         .lock()
         .await
         .values()
-        .filter(|run| {
-            run.session_id == session_id && run.status == PipelineRunStatus::Blocked
-        })
+        .filter(|run| run.session_id == session_id && run.status == PipelineRunStatus::Blocked)
         .cloned()
         .max_by_key(|run| (run.updated_at_ms, run.created_at_ms))
     {
@@ -15294,14 +16019,9 @@ async fn resolve_blocked_pipeline_run(
     if let Some(id) = run_id.filter(|s| !s.trim().is_empty()) {
         let run = load_pipeline_run_with_context(context, id)
             .await?
-            .ok_or_else(|| -> ArchitectError {
-                format!("pipeline run '{id}' not found").into()
-            })?;
+            .ok_or_else(|| -> ArchitectError { format!("pipeline run '{id}' not found").into() })?;
         if run.session_id != session_id {
-            return Err(format!(
-                "pipeline run '{id}' does not belong to this session"
-            )
-            .into());
+            return Err(format!("pipeline run '{id}' does not belong to this session").into());
         }
         if run.status != PipelineRunStatus::Blocked {
             return Err(format!(
@@ -15323,7 +16043,9 @@ async fn resolve_blocked_pipeline_run(
 
 /// Map a `pre_block_stage` to the CONFIRM checkpoint where retry should park the run.
 /// Pure for unit testing.
-fn retry_target_stage_for(pre_block_stage: Option<&PipelineStage>) -> Result<PipelineStage, String> {
+fn retry_target_stage_for(
+    pre_block_stage: Option<&PipelineStage>,
+) -> Result<PipelineStage, String> {
     match pre_block_stage {
         Some(PipelineStage::Reconcile)
         | Some(PipelineStage::ArtifactLoop)
@@ -16741,7 +17463,7 @@ async fn handle_pipeline_plan_compile(
         )
         .await;
         return ChatResponse {
-            status: "error".to_string(),
+            status: "blocked".to_string(),
             mode: "pipeline".to_string(),
             output: json!({
                 "message": "Pipeline blocked: missing delta_report for plan compilation.",
@@ -16767,7 +17489,7 @@ async fn handle_pipeline_plan_compile(
             )
             .await;
             return ChatResponse {
-                status: "error".to_string(),
+                status: "blocked".to_string(),
                 mode: "pipeline".to_string(),
                 output: json!({
                     "message": format!("Pipeline blocked: invalid delta_report in pipeline state: {err}"),
@@ -16809,7 +17531,7 @@ async fn handle_pipeline_plan_compile(
                     )
                     .await;
                     return ChatResponse {
-                        status: "error".to_string(),
+                        status: "blocked".to_string(),
                         mode: "pipeline".to_string(),
                         output: json!({
                             "message": format!("Pipeline blocked: invalid approved_artifacts in pipeline state: {err}"),
@@ -16837,7 +17559,7 @@ async fn handle_pipeline_plan_compile(
                     )
                     .await;
                     return ChatResponse {
-                        status: "error".to_string(),
+                        status: "blocked".to_string(),
                         mode: "pipeline".to_string(),
                         output: json!({
                             "message": format!("Pipeline blocked: approved artifact context could not be expanded for plan compilation: {err}"),
@@ -16910,7 +17632,7 @@ async fn handle_pipeline_plan_compile(
             )
             .await;
             return ChatResponse {
-                status: "error".to_string(),
+                status: "blocked".to_string(),
                 mode: "pipeline".to_string(),
                 output: json!({
                     "message": format!("Pipeline blocked during plan compilation: {err_text}"),
@@ -16928,11 +17650,97 @@ async fn handle_pipeline_plan_compile(
 
     let output = execution.output;
     let trace = execution.trace;
-    let plan = output.plan.clone();
-    let human_summary = output.human_summary.clone();
     let cookbook_entry = output.cookbook_entry.clone();
-    let plan_compile_tokens = output.tokens_used;
     let trace_value = plan_compile_trace_to_value(&trace);
+    if output.disposition == PlanCompilerDisposition::Blocked {
+        let ctx = FailureContext {
+            stage: PipelineStage::PlanValidation,
+            error_code: None,
+        };
+        let failure_class = match classify_failure_deterministic(
+            output
+                .blocked_reason
+                .as_deref()
+                .unwrap_or(&output.human_summary),
+            &ctx,
+        ) {
+            Some(c) => c,
+            None => classify_plan_compile_blocked_failure(
+                output.blocked_code.as_deref(),
+                output
+                    .blocked_reason
+                    .as_deref()
+                    .unwrap_or(&output.human_summary),
+                &output.missing_fields,
+            ),
+        };
+        let details = build_plan_compile_blocked_details(
+            &output,
+            trace_value.clone(),
+            failure_class,
+            pipeline_run.current_loop as usize,
+            pipeline_run.current_attempt.saturating_add(2),
+        );
+        let _ = block_pipeline_run(
+            state,
+            &pipeline_run.pipeline_run_id,
+            &format!("plan compiler blocked: {}", details.blocked_reason),
+            &details.failure_class,
+        )
+        .await;
+        let _ = advance_pipeline_run(
+            state,
+            &pipeline_run.pipeline_run_id,
+            PipelineStage::Blocked,
+            Some(json!({
+                "plan_compile_blocked_reason": details.blocked_reason,
+                "plan_compile_blocked_code": details.blocked_code,
+                "plan_compile_missing_fields": details.missing_fields,
+                "plan_compile_operator_hint": details.operator_hint,
+                "plan_compile_human_summary": details.human_summary,
+                "plan_compile_trace": details.plan_compile_trace,
+                "plan_compile_tokens_used": details.plan_compile_tokens,
+                "failure_route": details.failure_route,
+                "operator_options": details.operator_options,
+            })),
+        )
+        .await;
+        return ChatResponse {
+            status: "blocked".to_string(),
+            mode: "pipeline".to_string(),
+            output: json!({
+                "message": details.human_summary,
+                "pipeline_run_id": pipeline_run.pipeline_run_id,
+                "stage": "blocked",
+                "blocked_reason": details.blocked_reason,
+                "blocked_code": details.blocked_code,
+                "missing_fields": details.missing_fields,
+                "operator_hint": details.operator_hint,
+                "plan_compile_trace": details.plan_compile_trace,
+                "artifact_loop_trace": artifact_loop_trace,
+                "token_usage": {
+                    "design": design_tokens_used,
+                    "artifact": artifact_tokens_used,
+                    "plan_compile": details.plan_compile_tokens,
+                    "total": design_tokens_used
+                        .saturating_add(artifact_tokens_used)
+                        .saturating_add(details.plan_compile_tokens),
+                    "budget": TASK_AGENT_TOKEN_BUDGET,
+                },
+                "failure_class": details.failure_class,
+                "failure_route": details.failure_route,
+                "operator_options": details.operator_options,
+            }),
+            session_id: Some(session.session_id.clone()),
+            session_title: Some(session.title.clone()),
+        };
+    }
+    let human_summary = output.human_summary.clone();
+    let plan_compile_tokens = output.tokens_used;
+    let plan = output
+        .plan
+        .clone()
+        .expect("plan_ready pipeline output must include a plan");
     let confirm2_payload = build_confirm2_payload(
         &pipeline_run.pipeline_run_id,
         &delta_report,
@@ -17031,7 +17839,7 @@ async fn compile_pipeline_plan_with_context(
         )
         .await;
         return Ok(json!({
-            "status": "error",
+            "status": "blocked",
             "message": "Pipeline blocked: missing delta_report for plan compilation.",
             "pipeline_run_id": pipeline_run.pipeline_run_id,
             "stage": "blocked",
@@ -17052,7 +17860,7 @@ async fn compile_pipeline_plan_with_context(
             )
             .await;
             return Ok(json!({
-                "status": "error",
+                "status": "blocked",
                 "message": format!("Pipeline blocked: invalid delta_report in pipeline state: {err}"),
                 "pipeline_run_id": pipeline_run.pipeline_run_id,
                 "stage": "blocked",
@@ -17088,7 +17896,7 @@ async fn compile_pipeline_plan_with_context(
                     )
                     .await;
                     return Ok(json!({
-                        "status": "error",
+                        "status": "blocked",
                         "message": format!("Pipeline blocked: invalid approved_artifacts in pipeline state: {err}"),
                         "pipeline_run_id": pipeline_run.pipeline_run_id,
                         "stage": "blocked",
@@ -17111,7 +17919,7 @@ async fn compile_pipeline_plan_with_context(
                     )
                     .await;
                     return Ok(json!({
-                        "status": "error",
+                        "status": "blocked",
                         "message": format!("Pipeline blocked: approved artifact context could not be expanded for plan compilation: {err}"),
                         "pipeline_run_id": pipeline_run.pipeline_run_id,
                         "stage": "blocked",
@@ -17178,7 +17986,7 @@ async fn compile_pipeline_plan_with_context(
             )
             .await;
             return Ok(json!({
-                "status": "error",
+                "status": "blocked",
                 "message": format!("Pipeline blocked during plan compilation: {err_text}"),
                 "pipeline_run_id": pipeline_run.pipeline_run_id,
                 "stage": "blocked",
@@ -17191,11 +17999,92 @@ async fn compile_pipeline_plan_with_context(
 
     let output = execution.output;
     let trace = execution.trace;
-    let plan = output.plan.clone();
-    let human_summary = output.human_summary.clone();
     let cookbook_entry = output.cookbook_entry.clone();
-    let plan_compile_tokens = output.tokens_used;
     let trace_value = plan_compile_trace_to_value(&trace);
+    if output.disposition == PlanCompilerDisposition::Blocked {
+        let ctx = FailureContext {
+            stage: PipelineStage::PlanValidation,
+            error_code: None,
+        };
+        let failure_class = classify_failure_deterministic(
+            output
+                .blocked_reason
+                .as_deref()
+                .unwrap_or(&output.human_summary),
+            &ctx,
+        )
+        .unwrap_or_else(|| {
+            classify_plan_compile_blocked_failure(
+                output.blocked_code.as_deref(),
+                output
+                    .blocked_reason
+                    .as_deref()
+                    .unwrap_or(&output.human_summary),
+                &output.missing_fields,
+            )
+        });
+        let details = build_plan_compile_blocked_details(
+            &output,
+            trace_value.clone(),
+            failure_class,
+            pipeline_run.current_loop as usize,
+            pipeline_run.current_attempt.saturating_add(2),
+        );
+        let _ = block_pipeline_run_with_context(
+            context,
+            &pipeline_run.pipeline_run_id,
+            &format!("plan compiler blocked: {}", details.blocked_reason),
+            &details.failure_class,
+        )
+        .await;
+        let _ = advance_pipeline_run_with_context(
+            context,
+            &pipeline_run.pipeline_run_id,
+            PipelineStage::Blocked,
+            Some(json!({
+                "plan_compile_blocked_reason": details.blocked_reason,
+                "plan_compile_blocked_code": details.blocked_code,
+                "plan_compile_missing_fields": details.missing_fields,
+                "plan_compile_operator_hint": details.operator_hint,
+                "plan_compile_human_summary": details.human_summary,
+                "plan_compile_trace": details.plan_compile_trace,
+                "plan_compile_tokens_used": details.plan_compile_tokens,
+                "failure_route": details.failure_route,
+                "operator_options": details.operator_options,
+            })),
+        )
+        .await;
+        return Ok(json!({
+            "status": "blocked",
+            "message": details.human_summary,
+            "pipeline_run_id": pipeline_run.pipeline_run_id,
+            "stage": "blocked",
+            "blocked_reason": details.blocked_reason,
+            "blocked_code": details.blocked_code,
+            "missing_fields": details.missing_fields,
+            "operator_hint": details.operator_hint,
+            "plan_compile_trace": details.plan_compile_trace,
+            "artifact_loop_trace": artifact_loop_trace,
+            "token_usage": {
+                "design": design_tokens_used,
+                "artifact": artifact_tokens_used,
+                "plan_compile": details.plan_compile_tokens,
+                "total": design_tokens_used
+                    .saturating_add(artifact_tokens_used)
+                    .saturating_add(details.plan_compile_tokens),
+                "budget": TASK_AGENT_TOKEN_BUDGET,
+            },
+            "failure_class": details.failure_class,
+            "failure_route": details.failure_route,
+            "operator_options": details.operator_options,
+        }));
+    }
+    let human_summary = output.human_summary.clone();
+    let plan_compile_tokens = output.tokens_used;
+    let plan = output
+        .plan
+        .clone()
+        .expect("plan_ready pipeline output must include a plan");
     let total_tokens = design_tokens_used
         .saturating_add(artifact_tokens_used)
         .saturating_add(plan_compile_tokens);
@@ -17291,7 +18180,7 @@ async fn continue_pipeline_after_design_with_context(
         )
         .await;
         return Ok(json!({
-            "status": "error",
+            "status": "blocked",
             "message": "Pipeline blocked: missing solution_id for auto-continue.",
             "pipeline_run_id": pipeline_run.pipeline_run_id,
             "stage": "blocked",
@@ -17310,7 +18199,7 @@ async fn continue_pipeline_after_design_with_context(
             )
             .await;
             return Ok(json!({
-                "status": "error",
+                "status": "blocked",
                 "message": format!("Pipeline blocked: no saved manifest found for solution '{}'.", solution_id),
                 "pipeline_run_id": pipeline_run.pipeline_run_id,
                 "stage": "blocked",
@@ -17352,7 +18241,7 @@ async fn continue_pipeline_after_design_with_context(
                 )
                 .await;
                 return Ok(json!({
-                    "status": "error",
+                    "status": "blocked",
                     "message": format!("Pipeline blocked during snapshot build: {err}"),
                     "pipeline_run_id": pipeline_run.pipeline_run_id,
                     "stage": "blocked",
@@ -17372,7 +18261,7 @@ async fn continue_pipeline_after_design_with_context(
             )
             .await;
             return Ok(json!({
-                "status": "error",
+                "status": "blocked",
                 "message": format!("Pipeline blocked during reconcile: {err}"),
                 "pipeline_run_id": pipeline_run.pipeline_run_id,
                 "stage": "blocked",
@@ -17455,7 +18344,7 @@ async fn continue_pipeline_after_design_with_context(
                     })
                     .unwrap_or(Value::Null);
             return Ok(json!({
-                "status": "error",
+                "status": "blocked",
                 "message": format!("Pipeline blocked during artifact loop: {error}"),
                 "pipeline_run_id": pipeline_run.pipeline_run_id,
                 "stage": "blocked",
@@ -17497,7 +18386,7 @@ async fn handle_pipeline_confirm1(
         )
         .await;
         return ChatResponse {
-            status: "error".to_string(),
+            status: "blocked".to_string(),
             mode: "pipeline".to_string(),
             output: json!({
                 "message": "Pipeline blocked: missing solution_id for CONFIRM 1.",
@@ -17520,7 +18409,7 @@ async fn handle_pipeline_confirm1(
             )
             .await;
             return ChatResponse {
-                status: "error".to_string(),
+                status: "blocked".to_string(),
                 mode: "pipeline".to_string(),
                 output: json!({
                     "message": format!("Pipeline blocked: no saved manifest found for solution '{}'.", solution_id),
@@ -17760,7 +18649,7 @@ async fn handle_pipeline_confirm1(
                 })
                 .unwrap_or(Value::Null);
             return ChatResponse {
-                status: "error".to_string(),
+                status: "blocked".to_string(),
                 mode: "pipeline".to_string(),
                 output: json!({
                     "message": format!("Pipeline blocked during artifact loop: {error}"),
@@ -17893,7 +18782,7 @@ async fn handle_pipeline_confirm2(
         )
         .await;
         return ChatResponse {
-            status: "error".to_string(),
+            status: "blocked".to_string(),
             mode: "pipeline".to_string(),
             output: json!({
                 "message": "Pipeline blocked: missing executor_plan for CONFIRM 2.",
@@ -17965,7 +18854,7 @@ async fn handle_pipeline_confirm2(
                 )
                 .await;
                 return ChatResponse {
-                    status: "error".to_string(),
+                    status: "blocked".to_string(),
                     mode: "pipeline".to_string(),
                     output: json!({
                         "message": format!("Pipeline execution failed: {failure_text}"),
@@ -18127,7 +19016,7 @@ async fn handle_pipeline_confirm2(
             )
             .await;
             ChatResponse {
-                status: "error".to_string(),
+                status: "blocked".to_string(),
                 mode: "pipeline".to_string(),
                 output: json!({
                     "message": format!("Pipeline execution failed: {err_text}"),
@@ -18921,6 +19810,16 @@ mod tests {
             hive: "motherbee".to_string(),
             steps: vec![],
             step_count: 2,
+            blocked_reason: None,
+            blocked_code: None,
+            missing_fields: vec![],
+            operator_hint: None,
+            help_lookup_actions: vec![
+                "node_control_config_set".to_string(),
+                "restart_node".to_string(),
+            ],
+            help_lookup_calls: 1,
+            query_hive_calls: 1,
             validation: "ok".to_string(),
             first_validation_error: None,
             tokens_used: 13_225,
@@ -18946,6 +19845,79 @@ mod tests {
                 .map(Vec::len),
             Some(1)
         );
+    }
+
+    #[test]
+    fn validate_plan_help_lookups_accepts_when_all_step_actions_were_looked_up() {
+        let plan = json!({
+            "plan_version": "0.1",
+            "kind": "executor_plan",
+            "metadata": {
+                "name": "publish_then_run",
+                "target_hive": "motherbee"
+            },
+            "execution": {
+                "strict": true,
+                "stop_on_error": true,
+                "steps": [
+                    { "id": "s1", "action": "publish_runtime_package", "args": {} },
+                    { "id": "s2", "action": "run_node", "args": {} }
+                ]
+            }
+        });
+
+        validate_plan_help_lookups(
+            &plan,
+            &[
+                "publish_runtime_package".to_string(),
+                "run_node".to_string(),
+            ],
+        )
+        .expect("all plan actions were looked up");
+    }
+
+    #[test]
+    fn validate_plan_help_lookups_rejects_missing_lookup_for_any_plan_step() {
+        let plan = json!({
+            "plan_version": "0.1",
+            "kind": "executor_plan",
+            "metadata": {
+                "name": "publish_then_run",
+                "target_hive": "motherbee"
+            },
+            "execution": {
+                "strict": true,
+                "stop_on_error": true,
+                "steps": [
+                    { "id": "s1", "action": "publish_runtime_package", "args": {} },
+                    { "id": "s2", "action": "run_node", "args": {} }
+                ]
+            }
+        });
+
+        let err = validate_plan_help_lookups(&plan, &["publish_runtime_package".to_string()])
+            .expect_err("missing run_node help lookup must fail");
+        assert!(err.to_string().contains("run_node"));
+    }
+
+    #[test]
+    fn classify_plan_compile_blocked_failure_prefers_contract_invalid_for_missing_fields() {
+        let class = classify_plan_compile_blocked_failure(
+            Some("missing_required_value"),
+            "missing tenant_id for first spawn",
+            &["tenant_id".to_string()],
+        );
+        assert_eq!(class, FailureClass::PlanContractInvalid);
+    }
+
+    #[test]
+    fn classify_plan_compile_blocked_failure_marks_ambiguous_targets_as_plan_invalid() {
+        let class = classify_plan_compile_blocked_failure(
+            Some("ambiguous_target"),
+            "multiple runtime candidates matched the request",
+            &[],
+        );
+        assert_eq!(class, FailureClass::PlanInvalid);
     }
 
     #[test]

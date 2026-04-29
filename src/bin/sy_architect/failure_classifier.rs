@@ -180,11 +180,9 @@ impl FailureRoutingDecision {
     /// so Archi can pass them through verbatim when the operator picks one.
     pub fn operator_options(&self) -> &'static [&'static str] {
         match self {
-            FailureRoutingDecision::EscalateToOperator => &[
-                "retry",
-                "restart_from_design",
-                "discard",
-            ],
+            FailureRoutingDecision::EscalateToOperator => {
+                &["retry", "restart_from_design", "discard"]
+            }
             _ => &[],
         }
     }
