@@ -1735,12 +1735,35 @@ Use these facts only to select and validate planning intent. Do not treat them a
 - Use `query_hive` for pre-read state needed to produce static executor plan args.
 - Do not include read-only actions as executor plan steps unless the operator explicitly requested a read-only executor plan.
 - Do not choose a runtime by vague name similarity. If the runtime is missing or ambiguous, block or require upstream clarification.
+
+### Routing, workflows, and OPA
+
+- Prefer direct routing rules or workflow deployments for deterministic message choreography between existing nodes.
+- If the operator describes message fan-out, mirroring, relay, echo, or branching between known nodes, first consider routing/workflow tools before inventing new intermediate nodes.
+- OPA is for policy-based target resolution and enforcement when the destination is not explicit. It is not the primary tool for deterministic business-process orchestration between named nodes.
+- If the target nodes are already explicitly named, prefer routes/workflows over OPA unless the operator explicitly asks for policy-driven routing.
+
+### IO and SY node boundaries
+
+- `IO.*` nodes are integration boundaries to external systems such as HTTP APIs, Slack, WhatsApp, or email.
+- Do not assume an `IO.*` node is a generic internal relay or router unless the operator explicitly wants a dedicated integration/relay node and there is a clear runtime for it.
+- For internal system choreography, prefer `WF.*`, routing, or existing node-to-node message design before proposing new `IO.*` nodes.
+- `SY.*` nodes are system infrastructure. Do not propose creating or modifying `SY.*` nodes as part of normal operator workflows unless the operator explicitly asks for system-infrastructure work.
 "#;
 
-fn build_plan_compiler_prompt(actions: &[Value], cookbook: &[CookbookEntryV2]) -> String {
+fn build_plan_compiler_prompt(
+    actions: &[Value],
+    cookbook: &[CookbookEntryV2],
+    handbook: Option<&str>,
+) -> String {
     let mut prompt = PLAN_COMPILER_SYSTEM_PROMPT_BASE.to_string();
     prompt.push_str("\n\n");
     prompt.push_str(PLAN_COMPILER_PLATFORM_FACTS);
+
+    if let Some(handbook_text) = handbook.filter(|text| !text.trim().is_empty()) {
+        prompt.push_str("\n## HANDBOOK\n\n");
+        prompt.push_str(handbook_text);
+    }
 
     prompt.push_str("\n## AVAILABLE ACTIONS\n\n");
     prompt.push_str(
@@ -3501,8 +3524,9 @@ async fn run_plan_compiler_with_context(
         .await
         .unwrap_or_default();
     let cookbook = read_plan_compile_cookbook(&context.state_dir);
+    let handbook = read_handbook_text();
 
-    let system_prompt = build_plan_compiler_prompt(&actions, &cookbook);
+    let system_prompt = build_plan_compiler_prompt(&actions, &cookbook, handbook.as_deref());
 
     // Build the submit_executor_plan function schema
     let submit_fn = json!({
@@ -19494,6 +19518,22 @@ mod tests {
         let dir = test_temp_dir("plan-compile-path");
         let path = plan_compile_cookbook_path(&dir);
         assert_eq!(path, dir.join(cookbook_paths::PLAN_COMPILE));
+    }
+
+    #[test]
+    fn build_plan_compiler_prompt_includes_handbook_when_provided() {
+        let prompt = build_plan_compiler_prompt(&[], &[], Some("## test handbook\nworkflow-first"));
+        assert!(prompt.contains("## HANDBOOK"));
+        assert!(prompt.contains("workflow-first"));
+    }
+
+    #[test]
+    fn build_plan_compiler_prompt_mentions_routing_workflow_and_io_boundaries() {
+        let prompt = build_plan_compiler_prompt(&[], &[], None);
+        assert!(prompt.contains("Prefer direct routing rules or workflow deployments"));
+        assert!(prompt.contains("OPA is for policy-based target resolution"));
+        assert!(prompt.contains("`IO.*` nodes are integration boundaries"));
+        assert!(prompt.contains("`SY.*` nodes are system infrastructure"));
     }
 
     #[test]
