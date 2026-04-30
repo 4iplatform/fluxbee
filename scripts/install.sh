@@ -195,6 +195,8 @@ if [[ "${SKIP_BUILD:-}" != "1" ]]; then
     cargo build --release --bins
     echo "Building sy-frontdesk-gov core binary..."
     cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
+    echo "Building ai_node_runner (nodes/ai/ai-generic) for ai.common runtime..."
+    cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner
   fi
 fi
 
