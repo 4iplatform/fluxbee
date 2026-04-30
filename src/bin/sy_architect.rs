@@ -283,7 +283,6 @@ const HANDBOOK_CANDIDATE_PATHS: &[&str] = &[
     "/etc/fluxbee/handbook_fluxbee.md",
     // Dev paths — relative to repo root (used when CWD = repo)
     "docs/onworking COA/archi/handbook_fluxbee.md",
-    "docs/onworking COA/handbook_fluxbee.md",
 ];
 
 struct ArchitectState {

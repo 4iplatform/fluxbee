@@ -15,16 +15,16 @@ import (
 )
 
 const (
-	identityMagic          uint32 = 0x4A534944 // "JSID"
-	identityVersionCurrent uint32 = 3
-	identityRegionAlign           = 64
-	identitySeqlockTimeoutMs      = 50
+	identityMagic            uint32 = 0x4A534944 // "JSID"
+	identityVersionCurrent   uint32 = 4
+	identityRegionAlign             = 64
+	identitySeqlockTimeoutMs        = 50
 
 	// Struct sizes computed from #[repr(C)] Rust layout rules.
-	identityHeaderSize = 176
-	tenantEntrySize    = 312
-	ilkEntrySize       = 344
-	ichEntrySize       = 352
+	identityHeaderSize  = 176
+	tenantEntrySize     = 316
+	ilkEntrySize        = 344
+	ichEntrySize        = 352
 	ichMappingEntrySize = 384
 
 	// Field offsets within IchMappingEntry (384 bytes total).
@@ -39,7 +39,7 @@ const (
 	// Field offsets within IdentityHeader.
 	hdrOffMagic          = 0
 	hdrOffVersion        = 4
-	hdrOffSeq            = 8  // AtomicU64
+	hdrOffSeq            = 8 // AtomicU64
 	hdrOffMaxIlks        = 40
 	hdrOffMaxTenants     = 44
 	hdrOffMaxIchs        = 48
@@ -156,7 +156,7 @@ func identitySearchMappings(table []byte, maxMappings int, hash uint64, channelT
 	if len(table) < maxMappings*ichMappingEntrySize {
 		return [16]byte{}, false
 	}
-	start := int(hash%uint64(maxMappings))
+	start := int(hash % uint64(maxMappings))
 	for probe := 0; probe < maxMappings; probe++ {
 		pos := ((start + probe) % maxMappings) * ichMappingEntrySize
 		entry := table[pos : pos+ichMappingEntrySize]

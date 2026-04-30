@@ -158,17 +158,16 @@ Parameters:
 
 Requirements:
 
-- Requires `IDENTITY_VERSION=3` in the SHM region. Older regions (version ≤ 2) return `(_, false, nil)` without error.
+- Requires `IDENTITY_VERSION=4` in the SHM region. Older regions return `(_, false, nil)` without error.
 - The SHM file must exist at `/dev/shm/jsr-identity-<hiveID>`. A missing file is treated as not-found (`false, nil`), not an error.
 - Uses a 50 ms seqlock timeout. If the writer holds the lock for longer, the call returns `(_, false, nil)` rather than blocking.
 
 ### Scope of this SDK regarding identity
 
-The Go SDK exposes **only** identity SHM lookup. It does not construct or send the
-`ILK_PROVISION` wire message. All ILK provisioning today happens through the Rust
-SDK (`fluxbee_sdk::identity::provision_ilk` / `IlkProvisionRequest`) because all
-current IO node runtimes are written in Rust. If a Go-based IO node needs to
-provision ILKs, the wire message must be assembled manually against the
-`SY.identity@<hive>` contract — there is no Go helper for that today.
+The Go SDK exposes **only** identity SHM lookup. It does not currently construct or send
+the identity system verbs such as `ILK_PROVISION`, `TNT_CREATE`, `TNT_UPDATE`, or
+`TNT_SET_SPONSOR`. All first-party identity mutation helpers today live in the Rust SDK.
+If a Go-based node needs to call `SY.identity@<hive>`, the wire message must still be
+assembled manually against the live `SY.identity` contract.
 
 Everything else should be treated as implementation support unless it is later documented here as part of the stable surface.

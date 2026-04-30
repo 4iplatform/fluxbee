@@ -79,6 +79,10 @@ const MSG_ICH_SET_ENABLED: &str = "ICH_SET_ENABLED";
 const MSG_ICH_SET_ENABLED_RESPONSE: &str = "ICH_SET_ENABLED_RESPONSE";
 const MSG_TNT_CREATE: &str = "TNT_CREATE";
 const MSG_TNT_CREATE_RESPONSE: &str = "TNT_CREATE_RESPONSE";
+const MSG_TNT_UPDATE: &str = "TNT_UPDATE";
+const MSG_TNT_UPDATE_RESPONSE: &str = "TNT_UPDATE_RESPONSE";
+const MSG_TNT_SET_SPONSOR: &str = "TNT_SET_SPONSOR";
+const MSG_TNT_SET_SPONSOR_RESPONSE: &str = "TNT_SET_SPONSOR_RESPONSE";
 const MSG_TNT_APPROVE: &str = "TNT_APPROVE";
 const MSG_TNT_APPROVE_RESPONSE: &str = "TNT_APPROVE_RESPONSE";
 
@@ -275,6 +279,29 @@ struct TntCreateRequest {
 struct TntApproveRequest {
     tenant_id: String,
     approved_by: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TntUpdateRequest {
+    tenant_id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    domain: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    settings: Option<Value>,
+    #[serde(default)]
+    sponsor_tenant_id: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TntSetSponsorRequest {
+    tenant_id: String,
+    sponsor_tenant_id: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -888,6 +915,108 @@ impl IdentityStore {
         }))
     }
 
+    fn validate_sponsor_assignment(
+        &self,
+        tenant_id: &str,
+        sponsor_tenant_id: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let tenant_id = tenant_id.trim();
+        let _ = parse_prefixed_uuid(tenant_id, "tnt")?;
+        let Some(sponsor_tenant_id) = sponsor_tenant_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(None);
+        };
+        let _ = parse_prefixed_uuid(sponsor_tenant_id, "tnt")?;
+        if sponsor_tenant_id == tenant_id {
+            return Err("INVALID_SPONSOR_RELATION".to_string());
+        }
+        if !self.tenants.contains_key(sponsor_tenant_id) {
+            return Err("INVALID_SPONSOR_TENANT".to_string());
+        }
+
+        let mut cursor = Some(sponsor_tenant_id.to_string());
+        while let Some(current_id) = cursor {
+            if current_id == tenant_id {
+                return Err("INVALID_SPONSOR_RELATION".to_string());
+            }
+            cursor = self
+                .tenants
+                .get(&current_id)
+                .and_then(|tenant| tenant.sponsor_tenant_id.clone());
+        }
+
+        Ok(Some(sponsor_tenant_id.to_string()))
+    }
+
+    fn parse_optional_sponsor_update(
+        &self,
+        tenant_id: &str,
+        sponsor_tenant_id: Option<Value>,
+    ) -> Result<Option<Option<String>>, String> {
+        let Some(raw_value) = sponsor_tenant_id else {
+            return Ok(None);
+        };
+        match raw_value {
+            Value::Null => Ok(Some(None)),
+            Value::String(value) => self
+                .validate_sponsor_assignment(tenant_id, Some(&value))
+                .map(Some),
+            _ => Err("INVALID_REQUEST".to_string()),
+        }
+    }
+
+    fn update_tenant(&mut self, req: TntUpdateRequest) -> Result<Value, String> {
+        let tenant_id = req.tenant_id.trim().to_string();
+        let _ = parse_prefixed_uuid(&tenant_id, "tnt")?;
+        let sponsor_update =
+            self.parse_optional_sponsor_update(&tenant_id, req.sponsor_tenant_id)?;
+
+        let tenant = self
+            .tenants
+            .get_mut(&tenant_id)
+            .ok_or_else(|| "TENANT_NOT_FOUND".to_string())?;
+
+        if let Some(name) = req.name {
+            validate_non_empty("name", &name)?;
+            tenant.name = name.trim().to_string();
+        }
+        if let Some(domain) = req.domain {
+            tenant.domain = normalize_tenant_domain(Some(&domain));
+        }
+        if let Some(status) = req.status {
+            let status = status.trim().to_ascii_lowercase();
+            if !matches!(status.as_str(), "pending" | "active" | "suspended") {
+                return Err("INVALID_REQUEST".to_string());
+            }
+            tenant.status = status;
+        }
+        if let Some(settings) = req.settings {
+            tenant.settings = settings;
+        }
+        if let Some(sponsor_tenant_id) = sponsor_update {
+            tenant.sponsor_tenant_id = sponsor_tenant_id;
+        }
+
+        Ok(json!({
+            "status": "ok",
+            "tenant_id": tenant_id,
+            "sponsor_tenant_id": tenant.sponsor_tenant_id,
+        }))
+    }
+
+    fn set_tenant_sponsor(&mut self, req: TntSetSponsorRequest) -> Result<Value, String> {
+        self.update_tenant(TntUpdateRequest {
+            tenant_id: req.tenant_id,
+            name: None,
+            domain: None,
+            status: None,
+            settings: None,
+            sponsor_tenant_id: Some(req.sponsor_tenant_id),
+        })
+    }
+
     fn set_ich_enabled(&mut self, ich_id: &str, enabled: bool) -> Result<Value, String> {
         let _ = parse_prefixed_uuid(ich_id, "ich")?;
         let mut updated: Option<(String, Option<String>)> = None;
@@ -1129,6 +1258,14 @@ impl IdentityRuntime {
             vec!["IO.", "SY.admin@", "SY.architect@", "SY.frontdesk.gov@"],
         );
         allowed_prefixes.insert(MSG_TNT_CREATE, vec!["SY.frontdesk.gov@"]);
+        allowed_prefixes.insert(
+            MSG_TNT_UPDATE,
+            vec!["SY.admin@", "SY.architect@", "SY.frontdesk.gov@"],
+        );
+        allowed_prefixes.insert(
+            MSG_TNT_SET_SPONSOR,
+            vec!["SY.admin@", "SY.architect@", "SY.frontdesk.gov@"],
+        );
         allowed_prefixes.insert(MSG_TNT_APPROVE, vec!["SY.admin@"]);
         allowed_prefixes.insert("CONFIG_GET", vec!["SY.admin@"]);
         allowed_prefixes.insert("CONFIG_SET", vec!["SY.admin@"]);
@@ -1153,6 +1290,14 @@ impl IdentityRuntime {
                 .insert(frontdesk_node.clone());
             allowed_exacts
                 .entry(MSG_TNT_CREATE)
+                .or_default()
+                .insert(frontdesk_node.clone());
+            allowed_exacts
+                .entry(MSG_TNT_UPDATE)
+                .or_default()
+                .insert(frontdesk_node.clone());
+            allowed_exacts
+                .entry(MSG_TNT_SET_SPONSOR)
                 .or_default()
                 .insert(frontdesk_node);
         }
@@ -1685,6 +1830,126 @@ impl IdentityRuntime {
                 },
                 Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
             },
+            MSG_TNT_UPDATE => match serde_json::from_value::<TntUpdateRequest>(msg.payload.clone())
+            {
+                Ok(req) => {
+                    let snapshot = if self.is_primary && self.db_config.is_some() {
+                        Some(self.store.clone())
+                    } else {
+                        None
+                    };
+                    match self.store.update_tenant(req) {
+                        Ok(ok) => {
+                            if let Some(tenant_id) = ok
+                                .get("tenant_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                            {
+                                if let Some(tenant) = self.store.tenants.get(&tenant_id).cloned() {
+                                    if self.is_primary {
+                                        if let Some(database_config) = self.db_config.as_ref() {
+                                            if let Err(err) =
+                                                upsert_tenant_in_db(database_config, &tenant).await
+                                            {
+                                                if let Some(snapshot) = snapshot {
+                                                    self.store = snapshot;
+                                                }
+                                                db_write_error_payload(
+                                                    "failed to persist tenant update",
+                                                    err.as_ref(),
+                                                )
+                                            } else {
+                                                deltas.push(delta_envelope(
+                                                    IdentityDelta::TenantUpsert { tenant },
+                                                ));
+                                                ok
+                                            }
+                                        } else {
+                                            deltas.push(delta_envelope(
+                                                IdentityDelta::TenantUpsert { tenant },
+                                            ));
+                                            ok
+                                        }
+                                    } else {
+                                        deltas.push(delta_envelope(IdentityDelta::TenantUpsert {
+                                            tenant,
+                                        }));
+                                        ok
+                                    }
+                                } else {
+                                    ok
+                                }
+                            } else {
+                                ok
+                            }
+                        }
+                        Err(code) => error_payload(&code, "failed to update tenant"),
+                    }
+                }
+                Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
+            },
+            MSG_TNT_SET_SPONSOR => {
+                match serde_json::from_value::<TntSetSponsorRequest>(msg.payload.clone()) {
+                    Ok(req) => {
+                        let snapshot = if self.is_primary && self.db_config.is_some() {
+                            Some(self.store.clone())
+                        } else {
+                            None
+                        };
+                        match self.store.set_tenant_sponsor(req) {
+                            Ok(ok) => {
+                                if let Some(tenant_id) = ok
+                                    .get("tenant_id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                                {
+                                    if let Some(tenant) =
+                                        self.store.tenants.get(&tenant_id).cloned()
+                                    {
+                                        if self.is_primary {
+                                            if let Some(database_config) = self.db_config.as_ref() {
+                                                if let Err(err) =
+                                                    upsert_tenant_in_db(database_config, &tenant)
+                                                        .await
+                                                {
+                                                    if let Some(snapshot) = snapshot {
+                                                        self.store = snapshot;
+                                                    }
+                                                    db_write_error_payload(
+                                                        "failed to persist tenant sponsor update",
+                                                        err.as_ref(),
+                                                    )
+                                                } else {
+                                                    deltas.push(delta_envelope(
+                                                        IdentityDelta::TenantUpsert { tenant },
+                                                    ));
+                                                    ok
+                                                }
+                                            } else {
+                                                deltas.push(delta_envelope(
+                                                    IdentityDelta::TenantUpsert { tenant },
+                                                ));
+                                                ok
+                                            }
+                                        } else {
+                                            deltas.push(delta_envelope(
+                                                IdentityDelta::TenantUpsert { tenant },
+                                            ));
+                                            ok
+                                        }
+                                    } else {
+                                        ok
+                                    }
+                                } else {
+                                    ok
+                                }
+                            }
+                            Err(code) => error_payload(&code, "failed to set tenant sponsor"),
+                        }
+                    }
+                    Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
+                }
+            }
             MSG_TNT_APPROVE => {
                 match serde_json::from_value::<TntApproveRequest>(msg.payload.clone()) {
                     Ok(req) => {
@@ -3123,6 +3388,8 @@ fn response_name(action: &str) -> &'static str {
         MSG_ILK_UPDATE => MSG_ILK_UPDATE_RESPONSE,
         MSG_ICH_SET_ENABLED => MSG_ICH_SET_ENABLED_RESPONSE,
         MSG_TNT_CREATE => MSG_TNT_CREATE_RESPONSE,
+        MSG_TNT_UPDATE => MSG_TNT_UPDATE_RESPONSE,
+        MSG_TNT_SET_SPONSOR => MSG_TNT_SET_SPONSOR_RESPONSE,
         MSG_TNT_APPROVE => MSG_TNT_APPROVE_RESPONSE,
         "IDENTITY_METRICS" => "IDENTITY_METRICS_RESPONSE",
         "CONFIG_GET" | "CONFIG_SET" => "CONFIG_RESPONSE",
@@ -3139,6 +3406,8 @@ fn action_requires_primary(action: &str) -> bool {
             | MSG_ILK_UPDATE
             | MSG_ICH_SET_ENABLED
             | MSG_TNT_CREATE
+            | MSG_TNT_UPDATE
+            | MSG_TNT_SET_SPONSOR
             | MSG_TNT_APPROVE
     )
 }
@@ -4728,6 +4997,102 @@ mod tests {
             store.default_tenant_id().as_deref(),
             Some("tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
         );
+    }
+
+    #[test]
+    fn set_tenant_sponsor_updates_and_clears_sponsor() {
+        let mut store = IdentityStore::default();
+        store.tenants.insert(
+            "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+            TenantRecord {
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                name: "root".to_string(),
+                domain: None,
+                status: "active".to_string(),
+                settings: json!({}),
+                sponsor_tenant_id: None,
+            },
+        );
+        store.tenants.insert(
+            "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+            TenantRecord {
+                tenant_id: "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                name: "child".to_string(),
+                domain: None,
+                status: "active".to_string(),
+                settings: json!({}),
+                sponsor_tenant_id: None,
+            },
+        );
+
+        let set_out = store
+            .set_tenant_sponsor(TntSetSponsorRequest {
+                tenant_id: "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                sponsor_tenant_id: Value::String(
+                    "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                ),
+            })
+            .expect("set sponsor");
+        assert_eq!(
+            set_out.get("sponsor_tenant_id").and_then(Value::as_str),
+            Some("tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        );
+
+        let clear_out = store
+            .set_tenant_sponsor(TntSetSponsorRequest {
+                tenant_id: "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                sponsor_tenant_id: Value::Null,
+            })
+            .expect("clear sponsor");
+        assert!(clear_out.get("sponsor_tenant_id").is_some());
+        assert!(clear_out.get("sponsor_tenant_id").unwrap().is_null());
+    }
+
+    #[test]
+    fn set_tenant_sponsor_rejects_cycles_and_self_sponsorship() {
+        let mut store = IdentityStore::default();
+        store.tenants.insert(
+            "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+            TenantRecord {
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                name: "root".to_string(),
+                domain: None,
+                status: "active".to_string(),
+                settings: json!({}),
+                sponsor_tenant_id: None,
+            },
+        );
+        store.tenants.insert(
+            "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+            TenantRecord {
+                tenant_id: "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                name: "child".to_string(),
+                domain: None,
+                status: "active".to_string(),
+                settings: json!({}),
+                sponsor_tenant_id: Some("tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string()),
+            },
+        );
+
+        let self_err = store
+            .set_tenant_sponsor(TntSetSponsorRequest {
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                sponsor_tenant_id: Value::String(
+                    "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                ),
+            })
+            .expect_err("self sponsor must fail");
+        assert_eq!(self_err, "INVALID_SPONSOR_RELATION");
+
+        let cycle_err = store
+            .set_tenant_sponsor(TntSetSponsorRequest {
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                sponsor_tenant_id: Value::String(
+                    "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                ),
+            })
+            .expect_err("cycle must fail");
+        assert_eq!(cycle_err, "INVALID_SPONSOR_RELATION");
     }
 
     #[test]

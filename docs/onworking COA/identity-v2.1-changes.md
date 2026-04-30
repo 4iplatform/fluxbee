@@ -237,13 +237,64 @@ No changes needed. `TenantRecord` is serialized as JSON in sync deltas. The new 
 | `TNT_CREATE_RESPONSE` | Includes `sponsor_tenant_id` if set |
 | `ILK_GET_RESPONSE` | Tenant section includes `sponsor_tenant_id` |
 
-No new verbs required. No breaking changes to existing requests (new field is optional with default NULL).
+Additive tenant-management verbs:
+
+| Verb | Purpose |
+|---|---|
+| `TNT_UPDATE` | Update mutable tenant fields after creation (`name`, `domain`, `status`, `settings`, optional `sponsor_tenant_id`) |
+| `TNT_SET_SPONSOR` | Focused verb to set or clear only the tenant sponsor relationship |
+
+These are additive and non-breaking. `TNT_CREATE` remains the creation path. `TNT_UPDATE` / `TNT_SET_SPONSOR` are the post-creation mutation paths.
 
 ### 2.11 New error code
 
 | Code | Description |
 |---|---|
 | `INVALID_SPONSOR_TENANT` | `sponsor_tenant_id` specified but the referenced tenant does not exist |
+| `INVALID_SPONSOR_RELATION` | The requested sponsor assignment would create self-sponsorship or a sponsorship cycle |
+
+### 2.12 Tenant lifecycle: where tenant data is created vs updated
+
+The model is now:
+
+| Operation | Verb | Typical caller | Notes |
+|---|---|---|---|
+| Create tenant | `TNT_CREATE` | `SY.frontdesk.gov` | Can optionally set `sponsor_tenant_id` at creation time |
+| Approve tenant | `TNT_APPROVE` | `SY.admin` | Status transition from `pending` to `active` |
+| Update tenant fields | `TNT_UPDATE` | `SY.admin`, `SY.architect`, `SY.frontdesk.gov` | For mutable fields after creation |
+| Set/clear sponsor only | `TNT_SET_SPONSOR` | `SY.admin`, `SY.architect`, `SY.frontdesk.gov` | Focused administrative verb for hierarchy changes |
+
+Important separation:
+
+- `ILK_REGISTER` does **not** create or update tenant hierarchy.
+- `ILK_UPDATE` does **not** create or update tenant hierarchy.
+- ILKs belong to a tenant, but `sponsor_tenant_id` belongs to the **tenant record**, not the ILK.
+
+### 2.13 How sponsor relates to the native/default tenant
+
+`sponsor_tenant_id` does **not** replace the default/root tenant.
+
+The relationship is:
+
+- The **root/default tenant** is the native infrastructure tenant for the hive/control-plane.
+- Root tenant is identified by `sponsor_tenant_id = NULL`.
+- `default_tenant_id()` prefers a root tenant (`sponsor_tenant_id = NULL`) deterministically.
+- Sponsored tenants are children of that root or of another sponsored/admin tenant.
+
+So the model is:
+
+```text
+root/default tenant (sponsor = NULL)
+  ├── admin tenant
+  │   ├── customer tenant A
+  │   └── customer tenant B
+  └── another admin tenant
+```
+
+Implication:
+
+- If an operation needs a fallback/default tenant and none was provided explicitly, identity still resolves the root/default tenant first.
+- `sponsor_tenant_id` only adds hierarchy and administrative lineage; it does not redefine what the native default tenant is.
 
 ---
 

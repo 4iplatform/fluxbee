@@ -27,6 +27,8 @@ pub const MSG_ILK_ADD_CHANNEL: &str = "ILK_ADD_CHANNEL";
 pub const MSG_ILK_UPDATE: &str = "ILK_UPDATE";
 pub const MSG_ICH_SET_ENABLED: &str = "ICH_SET_ENABLED";
 pub const MSG_TNT_CREATE: &str = "TNT_CREATE";
+pub const MSG_TNT_UPDATE: &str = "TNT_UPDATE";
+pub const MSG_TNT_SET_SPONSOR: &str = "TNT_SET_SPONSOR";
 pub const MSG_TNT_APPROVE: &str = "TNT_APPROVE";
 pub const MSG_IDENTITY_METRICS: &str = "IDENTITY_METRICS";
 const IDENTITY_MAGIC: u32 = 0x4A534944; // "JSID"
@@ -119,6 +121,13 @@ pub struct IchSetEnabledResponse {
     pub ich_id: String,
     pub enabled: bool,
     pub owner_l2_name: Option<String>,
+    pub trace_id: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct TenantUpdateResponse {
+    pub tenant_id: String,
+    pub sponsor_tenant_id: Option<String>,
     pub trace_id: String,
 }
 
@@ -552,6 +561,99 @@ pub async fn set_ich_enabled(
         ich_id,
         enabled,
         owner_l2_name,
+        trace_id: out.trace_id,
+    })
+}
+
+pub async fn update_tenant(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    target: &str,
+    payload: Value,
+    timeout: Duration,
+) -> Result<TenantUpdateResponse, IdentityError> {
+    let out = identity_system_call_ok(
+        sender,
+        receiver,
+        IdentitySystemRequest {
+            target,
+            fallback_target: None,
+            action: MSG_TNT_UPDATE,
+            payload,
+            timeout,
+        },
+    )
+    .await?;
+    let tenant_id = out
+        .payload
+        .get("tenant_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| IdentityError::InvalidResponse("missing tenant_id".to_string()))?
+        .to_string();
+    let sponsor_tenant_id = out
+        .payload
+        .get("sponsor_tenant_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    Ok(TenantUpdateResponse {
+        tenant_id,
+        sponsor_tenant_id,
+        trace_id: out.trace_id,
+    })
+}
+
+pub async fn set_tenant_sponsor(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    target: &str,
+    tenant_id: &str,
+    sponsor_tenant_id: Option<&str>,
+    timeout: Duration,
+) -> Result<TenantUpdateResponse, IdentityError> {
+    let tenant_id = tenant_id.trim();
+    if tenant_id.is_empty() {
+        return Err(IdentityError::InvalidRequest(
+            "tenant_id must be non-empty".to_string(),
+        ));
+    }
+    let payload = match sponsor_tenant_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(sponsor_tenant_id) => json!({
+            "tenant_id": tenant_id,
+            "sponsor_tenant_id": sponsor_tenant_id,
+        }),
+        None => json!({
+            "tenant_id": tenant_id,
+            "sponsor_tenant_id": Value::Null,
+        }),
+    };
+    let out = identity_system_call_ok(
+        sender,
+        receiver,
+        IdentitySystemRequest {
+            target,
+            fallback_target: None,
+            action: MSG_TNT_SET_SPONSOR,
+            payload,
+            timeout,
+        },
+    )
+    .await?;
+    let sponsor_tenant_id = out
+        .payload
+        .get("sponsor_tenant_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    Ok(TenantUpdateResponse {
+        tenant_id: tenant_id.to_string(),
+        sponsor_tenant_id,
         trace_id: out.trace_id,
     })
 }
