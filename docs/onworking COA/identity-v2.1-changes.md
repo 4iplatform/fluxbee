@@ -38,6 +38,29 @@ tnt:fluxbee-infra (root, sponsor=NULL — the infrastructure tenant)
 
 The root tenant (sponsor=NULL) is the infrastructure tenant. In self-hosted, it's the default `fluxbee` tenant. In cloud, it's the platform operator's tenant.
 
+### 2.1.1 Where tenant data is created, read, and updated
+
+- `TNT_CREATE`
+  - creates a tenant
+  - may set `sponsor_tenant_id` at creation time
+- `TNT_UPDATE`
+  - updates mutable tenant fields after creation
+  - may also update or clear `sponsor_tenant_id`
+- `TNT_SET_SPONSOR`
+  - focused update path for sponsor only
+  - accepts `null` to clear sponsorship
+- `TNT_LIST`
+  - lists known tenants with summary counts
+- `TNT_GET`
+  - returns one tenant plus its resolved sponsor record when present
+
+At the admin surface these map to:
+
+- `GET /hives/{hive}/identity/tenants`
+- `GET /hives/{hive}/identity/tenants/{tenant_id}`
+- `PUT /hives/{hive}/identity/tenants/{tenant_id}`
+- `POST /hives/{hive}/identity/tenants/{tenant_id}/sponsor`
+
 ### 2.2 Rust struct changes
 
 **`TenantRecord`** (line 264):

@@ -369,6 +369,29 @@ Notes:
 - `runtime` is lowercase and has no `@hive`
 - `tenant_id` is root-level when required for first spawn; do not bury it inside `config`
 
+### 8.1.1 Tenant discovery before first spawn
+
+When the operator says things like:
+- "use the same tenant as `AI.chat@motherbee`"
+- "associate this tenant to that sponsor"
+- "create the client under the same sponsor as another tenant"
+
+do **not** infer tenant data from:
+- inventory
+- `list_nodes`
+- runtime names
+- channel names
+
+Use the identity tenant read surface first:
+- `list_tenants`
+- `get_tenant`
+
+Rules:
+- use `list_tenants` to discover candidate root/default tenants, sponsors, or client tenants
+- use `get_tenant` when one exact tenant id is already known or when you need the resolved sponsor record
+- if the task says "same tenant as an existing node", prefer reading the node config/live config to find the exact `tenant_id`, then validate that tenant with `get_tenant`
+- if no reliable tenant can be found, block and ask for exactly one missing tenant clarification
+
 ### 8.2 IO tenant naming
 
 Single-tenant IO node:
@@ -420,6 +443,11 @@ Examples of acceptable one-question clarifications:
 - which hive?
 - which tenant?
 - is this policy-driven or deterministic workflow behavior?
+
+Before asking "which tenant?", try these reads first when applicable:
+- `get_node_config` or `node_control_config_get` on an existing tenant-scoped node
+- `list_tenants`
+- `get_tenant`
 
 ### 10.2 Prefer existing platform primitives
 

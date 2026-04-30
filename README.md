@@ -957,6 +957,10 @@ Current HTTP surface exposed by `SY.admin`.
 | `POST` | `/hives/{hive}/nodes/{name}/control/config-set` | Apply node-owned control-plane config (`CONFIG_SET`) |
 | `GET` | `/hives/{hive}/identity/ilks` | List ILKs on hive (compact identity view) |
 | `GET` | `/hives/{hive}/identity/ilks/{ilk_id}` | Read one ILK with resolved tenant/alias detail |
+| `GET` | `/hives/{hive}/identity/tenants` | List tenants on hive (summary view for sponsor/default discovery) |
+| `GET` | `/hives/{hive}/identity/tenants/{tenant_id}` | Read one tenant with resolved sponsor detail |
+| `PUT` | `/hives/{hive}/identity/tenants/{tenant_id}` | Update mutable tenant fields |
+| `POST` | `/hives/{hive}/identity/tenants/{tenant_id}/sponsor` | Set or clear tenant sponsor |
 | `POST` | `/hives/{hive}/update` | Send `SYSTEM_UPDATE` to hive orchestrator |
 | `POST` | `/hives/{hive}/sync-hint` | Send `SYSTEM_SYNC_HINT` (`blob`/`dist`) to hive orchestrator |
 | `GET` | `/hives/{hive}/versions` | Effective versions for hive |
@@ -978,6 +982,7 @@ Notes:
 - History responses may include `target_hives_detail[*].present` and `workers[*].hive_present` so removed hives remain visible as history.
 - Drift alert history responses may include `hive_present` and `synthetic` markers when a local `motherbee` current-state snapshot is synthesized for history continuity.
 - For `motherbee`, hive-scoped deployment history may include synthesized local-current-state entries when no older history was recorded with `motherbee` as explicit deployment target.
+- For identity-aware first spawn, discover or verify `tenant_id` through `/hives/{hive}/identity/tenants` and `/hives/{hive}/identity/tenants/{tenant_id}` instead of inferring it from inventory alone.
 
 ---
 
