@@ -850,6 +850,7 @@ impl FunctionTool for ArchitectSystemGetTool {
                 Supports GET and safe POST checks (OPA policy check, node CONFIG_GET). \
                 Key paths: /inventory (all nodes), /versions, /hives/{{hive}}/runtimes, \
                 /hives/{{hive}}/nodes, /hives/{{hive}}/nodes/{{name}}/config (persisted), \
+                /hives/{{hive}}/identity/tenants, /hives/{{hive}}/identity/tenants/{{tenant_id}}, \
                 /hives/{{hive}}/nodes/{{name}}/control/config-get (live contract), \
                 /hives/{{hive}}/wf-rules, /hives/{{hive}}/drift-alerts, \
                 /admin/actions/{{action}} (schema + example_scmd). \
@@ -8525,6 +8526,44 @@ fn translate_scmd(
             target_hive: (*hive_id).to_string(),
             params: json!({}),
         }),
+        ("GET", ["hives", hive_id, "identity", "tenants"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "list_tenants".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({}),
+        }),
+        ("GET", ["hives", hive_id, "identity", "tenants", tenant_id]) => Ok(AdminTranslation {
+            admin_target,
+            action: "get_tenant".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({ "tenant_id": tenant_id }),
+        }),
+        ("PUT", ["hives", hive_id, "identity", "tenants", tenant_id]) => {
+            let mut params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for update_tenant must be a JSON object".into());
+            }
+            params["tenant_id"] = Value::String((*tenant_id).to_string());
+            Ok(AdminTranslation {
+                admin_target,
+                action: "update_tenant".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("POST", ["hives", hive_id, "identity", "tenants", tenant_id, "sponsor"]) => {
+            let mut params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for set_tenant_sponsor must be a JSON object".into());
+            }
+            params["tenant_id"] = Value::String((*tenant_id).to_string());
+            Ok(AdminTranslation {
+                admin_target,
+                action: "set_tenant_sponsor".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
         ("POST", ["hives", hive_id, "nodes"]) => {
             let params = parsed.body.unwrap_or_else(|| json!({}));
             if !params.is_object() {
@@ -20698,6 +20737,39 @@ mod tests {
             json!({
                 "workflow_name": "invoice",
                 "definition": { "wf_schema_version": "1" }
+            })
+        );
+    }
+
+    #[test]
+    fn translate_list_tenants_scmd() {
+        let translated = translate_scmd(
+            "motherbee",
+            parse("curl -X GET /hives/motherbee/identity/tenants"),
+        )
+        .expect("translation should succeed");
+
+        assert_eq!(translated.action, "list_tenants");
+        assert_eq!(translated.target_hive, "motherbee");
+        assert_eq!(translated.params, json!({}));
+    }
+
+    #[test]
+    fn translate_get_tenant_scmd() {
+        let translated = translate_scmd(
+            "motherbee",
+            parse(
+                "curl -X GET /hives/motherbee/identity/tenants/tnt:550e8400-e29b-41d4-a716-446655440000",
+            ),
+        )
+        .expect("translation should succeed");
+
+        assert_eq!(translated.action, "get_tenant");
+        assert_eq!(translated.target_hive, "motherbee");
+        assert_eq!(
+            translated.params,
+            json!({
+                "tenant_id": "tnt:550e8400-e29b-41d4-a716-446655440000"
             })
         );
     }
