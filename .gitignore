@@ -13,3 +13,4 @@ nodes/io/target
 /agents-sdk-python
 .DS_Store
 /local-playground/
+/tmp/

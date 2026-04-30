@@ -720,6 +720,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-linkedhelper"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "fluxbee-sdk",
+ "io-common",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "io-sim"
 version = "0.1.0"
 dependencies = [

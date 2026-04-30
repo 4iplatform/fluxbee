@@ -11,6 +11,7 @@ pub mod io_control_plane_bootstrap;
 pub mod io_control_plane_logging;
 pub mod io_control_plane_metrics;
 pub mod io_control_plane_store;
+pub mod io_linkedhelper_adapter_config;
 pub mod io_slack_adapter_config;
 pub mod provision;
 pub mod relay;
