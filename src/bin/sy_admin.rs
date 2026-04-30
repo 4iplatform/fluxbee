@@ -2763,6 +2763,18 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "list_tenants",
+        route: InternalActionRoute::Query("list_tenants"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "get_tenant",
+        route: InternalActionRoute::Command("get_tenant"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "update_tenant",
         route: InternalActionRoute::Command("update_tenant"),
         requires_target: true,
@@ -4246,6 +4258,19 @@ async fn handle_hive_paths(
                 handle_admin_command(ctx, client, "get_ilk", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
+        ("GET", ["identity", "tenants"]) => {
+            let (status, resp) =
+                handle_admin_query(ctx, client, "list_tenants", Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["identity", "tenants", tenant_id]) => {
+            let payload = serde_json::json!({
+                "tenant_id": decode_percent(tenant_id),
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "get_tenant", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
         ("PUT", ["identity", "tenants", tenant_id]) => {
             let mut payload = if body.is_empty() {
                 serde_json::json!({})
@@ -5643,7 +5668,7 @@ async fn handle_admin_query(
     if action == "list_admin_actions" {
         return Ok(build_admin_actions_catalog_response());
     }
-    if action == "list_ilks" {
+    if matches!(action, "list_ilks" | "list_tenants") {
         return handle_identity_query(ctx, client, action, hive).await;
     }
     let payload = normalize_admin_payload(action, serde_json::json!({}), hive.as_deref());
@@ -6227,6 +6252,8 @@ fn admin_action_summary(action: &str) -> &'static str {
         }
         "list_ilks" => "List identity ilks in a hive.",
         "get_ilk" => "Read one identity ilk.",
+        "list_tenants" => "List identity tenants in a hive.",
+        "get_tenant" => "Read one identity tenant in a hive.",
         "update_tenant" => "Update mutable fields of one identity tenant in a hive.",
         "set_tenant_sponsor" => {
             "Set or clear the sponsor relationship for one identity tenant in a hive."
@@ -6309,6 +6336,8 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         }
         "list_ilks" => vec!["GET /hives/{hive}/identity/ilks"],
         "get_ilk" => vec!["GET /hives/{hive}/identity/ilks/{ilk_id}"],
+        "list_tenants" => vec!["GET /hives/{hive}/identity/tenants"],
+        "get_tenant" => vec!["GET /hives/{hive}/identity/tenants/{tenant_id}"],
         "update_tenant" => vec!["PUT /hives/{hive}/identity/tenants/{tenant_id}"],
         "set_tenant_sponsor" => {
             vec!["POST /hives/{hive}/identity/tenants/{tenant_id}/sponsor"]
@@ -6425,7 +6454,7 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             "string",
             "Hive id, for example worker-220.",
         )],
-        "list_nodes" | "list_ilks" | "get_versions" | "list_runtimes" | "list_routes"
+        "list_nodes" | "list_ilks" | "list_tenants" | "get_versions" | "list_runtimes" | "list_routes"
         | "list_vpns" | "get_deployments" | "get_drift_alerts" | "opa_get_policy"
         | "opa_get_status" | "wf_rules_get_workflow" | "wf_rules_get_status"
         | "wf_rules_list_workflows" | "timer_help" | "timer_list" | "timer_now"
@@ -6487,7 +6516,7 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
                 "ILK identifier in prefixed format, for example ilk:550e8400-e29b-41d4-a716-446655440000.",
             ),
         ],
-        "update_tenant" | "set_tenant_sponsor" => vec![
+        "get_tenant" | "update_tenant" | "set_tenant_sponsor" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
             admin_action_path_param(
                 "tenant_id",
@@ -7305,6 +7334,10 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "get_ilk" => {
             "curl -X GET /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000"
         }
+        "list_tenants" => "curl -X GET /hives/motherbee/identity/tenants",
+        "get_tenant" => {
+            "curl -X GET /hives/motherbee/identity/tenants/tnt:550e8400-e29b-41d4-a716-446655440000"
+        }
         "update_tenant" => {
             r#"curl -X PUT /hives/motherbee/identity/tenants/tnt:550e8400-e29b-41d4-a716-446655440000 -d '{"status":"active","sponsor_tenant_id":"tnt:11111111-1111-1111-1111-111111111111"}'"#
         }
@@ -7506,6 +7539,17 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The ilk_id path segment must use the prefixed UUID format ilk:<uuid>.",
             "Identity may resolve an old alias ILK to its canonical ILK if an alias mapping exists.",
             "This lookup is by ILK identifier, not by channel address, node name, or tenant.",
+        ],
+        "list_tenants" => vec![
+            "Lists the identity tenants currently known by SY.identity for one hive.",
+            "Use this when you need to discover root/default tenants, candidate sponsors, or tenant ids before spawning identity-aware software.",
+            "This returns tenant summaries only; use get_tenant for one specific tenant and its sponsor details.",
+        ],
+        "get_tenant" => vec![
+            "The hive target comes from the /hives/{hive} path in HTTP.",
+            "The tenant_id path segment must use the prefixed UUID format tnt:<uuid>.",
+            "This lookup returns the tenant plus its resolved sponsor record when one exists.",
+            "Use this before set_tenant_sponsor or run_node when you need the exact tenant association already used by another node.",
         ],
         "update_tenant" => vec![
             "This mutates the tenant record itself, not ILKs that belong to that tenant.",
@@ -9144,7 +9188,10 @@ async fn handle_admin_command(
     ) {
         return handle_node_control_command(ctx, client, action, payload, hive).await;
     }
-    if matches!(action, "get_ilk" | "update_tenant" | "set_tenant_sponsor") {
+    if matches!(
+        action,
+        "get_ilk" | "get_tenant" | "update_tenant" | "set_tenant_sponsor"
+    ) {
         return handle_identity_command(ctx, client, action, payload, hive).await;
     }
 
@@ -9433,6 +9480,7 @@ async fn handle_identity_query(
     let target = format!("SY.identity@{}", target_hive);
     let (request_msg, response_msg) = match action {
         "list_ilks" => ("ILK_LIST", "ILK_LIST_RESPONSE"),
+        "list_tenants" => ("TNT_LIST", "TNT_LIST_RESPONSE"),
         _ => return Err(format!("unsupported identity admin query: {action}").into()),
     };
     let response = send_system_request(
@@ -9458,6 +9506,7 @@ async fn handle_identity_command(
     let target = format!("SY.identity@{}", target_hive);
     let (request_msg, response_msg) = match action {
         "get_ilk" => ("ILK_GET", "ILK_GET_RESPONSE"),
+        "get_tenant" => ("TNT_GET", "TNT_GET_RESPONSE"),
         "update_tenant" => ("TNT_UPDATE", "TNT_UPDATE_RESPONSE"),
         "set_tenant_sponsor" => ("TNT_SET_SPONSOR", "TNT_SET_SPONSOR_RESPONSE"),
         _ => return Err(format!("unsupported identity admin action: {action}").into()),

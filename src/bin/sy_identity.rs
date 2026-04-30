@@ -79,6 +79,10 @@ const MSG_ICH_SET_ENABLED: &str = "ICH_SET_ENABLED";
 const MSG_ICH_SET_ENABLED_RESPONSE: &str = "ICH_SET_ENABLED_RESPONSE";
 const MSG_TNT_CREATE: &str = "TNT_CREATE";
 const MSG_TNT_CREATE_RESPONSE: &str = "TNT_CREATE_RESPONSE";
+const MSG_TNT_LIST: &str = "TNT_LIST";
+const MSG_TNT_LIST_RESPONSE: &str = "TNT_LIST_RESPONSE";
+const MSG_TNT_GET: &str = "TNT_GET";
+const MSG_TNT_GET_RESPONSE: &str = "TNT_GET_RESPONSE";
 const MSG_TNT_UPDATE: &str = "TNT_UPDATE";
 const MSG_TNT_UPDATE_RESPONSE: &str = "TNT_UPDATE_RESPONSE";
 const MSG_TNT_SET_SPONSOR: &str = "TNT_SET_SPONSOR";
@@ -279,6 +283,12 @@ struct TntCreateRequest {
 struct TntApproveRequest {
     tenant_id: String,
     approved_by: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TntGetRequest {
+    tenant_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -529,6 +539,81 @@ impl IdentityStore {
             "status": "ok",
             "count": ilks.len(),
             "ilks": ilks,
+        })
+    }
+
+    fn get_tenant_payload(&self, tenant_id: &str) -> Result<Value, String> {
+        let tenant_id = tenant_id.trim();
+        if tenant_id.is_empty() {
+            return Err("INVALID_REQUEST".to_string());
+        }
+        let _ = parse_prefixed_uuid(tenant_id, "tnt")?;
+        let Some(tenant) = self.tenants.get(tenant_id).cloned() else {
+            return Err("TENANT_NOT_FOUND".to_string());
+        };
+
+        let sponsor = tenant
+            .sponsor_tenant_id
+            .as_ref()
+            .and_then(|sponsor_id| self.tenants.get(sponsor_id).cloned());
+        let child_count = self
+            .tenants
+            .values()
+            .filter(|entry| entry.sponsor_tenant_id.as_deref() == Some(tenant_id))
+            .count();
+        let ilk_count = self
+            .ilks
+            .values()
+            .filter(|ilk| ilk.deleted_at_ms.is_none() && ilk.tenant_id == tenant_id)
+            .count();
+
+        Ok(json!({
+            "status": "ok",
+            "tenant_id": tenant_id,
+            "tenant": tenant,
+            "sponsor": sponsor,
+            "child_count": child_count,
+            "ilk_count": ilk_count,
+        }))
+    }
+
+    fn list_tenants_payload(&self) -> Value {
+        let mut tenant_ids: Vec<&String> = self.tenants.keys().collect();
+        tenant_ids.sort_unstable();
+
+        let tenants: Vec<Value> = tenant_ids
+            .into_iter()
+            .filter_map(|tenant_id| {
+                let tenant = self.tenants.get(tenant_id)?;
+                let child_count = self
+                    .tenants
+                    .values()
+                    .filter(|entry| {
+                        entry.sponsor_tenant_id.as_deref() == Some(tenant.tenant_id.as_str())
+                    })
+                    .count();
+                let ilk_count = self
+                    .ilks
+                    .values()
+                    .filter(|ilk| ilk.deleted_at_ms.is_none() && ilk.tenant_id == tenant.tenant_id)
+                    .count();
+                Some(json!({
+                    "tenant_id": tenant.tenant_id,
+                    "name": tenant.name,
+                    "domain": tenant.domain,
+                    "status": tenant.status,
+                    "settings": tenant.settings,
+                    "sponsor_tenant_id": tenant.sponsor_tenant_id,
+                    "child_count": child_count,
+                    "ilk_count": ilk_count,
+                }))
+            })
+            .collect();
+
+        json!({
+            "status": "ok",
+            "count": tenants.len(),
+            "tenants": tenants,
         })
     }
 
@@ -1247,6 +1332,8 @@ impl IdentityRuntime {
         allowed_prefixes.insert(MSG_ILK_PROVISION, vec!["IO."]);
         allowed_prefixes.insert(MSG_ILK_LIST, vec!["SY.admin@"]);
         allowed_prefixes.insert(MSG_ILK_GET, vec!["SY.admin@"]);
+        allowed_prefixes.insert(MSG_TNT_LIST, vec!["SY.admin@"]);
+        allowed_prefixes.insert(MSG_TNT_GET, vec!["SY.admin@"]);
         allowed_prefixes.insert(
             MSG_ILK_REGISTER,
             vec!["SY.frontdesk.gov@", "SY.orchestrator@"],
@@ -1443,6 +1530,14 @@ impl IdentityRuntime {
                 Ok(req) => match self.store.get_ilk_payload(&req.ilk_id) {
                     Ok(ok) => ok,
                     Err(code) => error_payload(&code, "failed to get ilk"),
+                },
+                Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
+            },
+            MSG_TNT_LIST => self.store.list_tenants_payload(),
+            MSG_TNT_GET => match serde_json::from_value::<TntGetRequest>(msg.payload.clone()) {
+                Ok(req) => match self.store.get_tenant_payload(&req.tenant_id) {
+                    Ok(ok) => ok,
+                    Err(code) => error_payload(&code, "failed to get tenant"),
                 },
                 Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
             },
@@ -3383,6 +3478,8 @@ fn response_name(action: &str) -> &'static str {
         MSG_ILK_PROVISION => MSG_ILK_PROVISION_RESPONSE,
         MSG_ILK_LIST => MSG_ILK_LIST_RESPONSE,
         MSG_ILK_GET => MSG_ILK_GET_RESPONSE,
+        MSG_TNT_LIST => MSG_TNT_LIST_RESPONSE,
+        MSG_TNT_GET => MSG_TNT_GET_RESPONSE,
         MSG_ILK_REGISTER => MSG_ILK_REGISTER_RESPONSE,
         MSG_ILK_ADD_CHANNEL => MSG_ILK_ADD_CHANNEL_RESPONSE,
         MSG_ILK_UPDATE => MSG_ILK_UPDATE_RESPONSE,
@@ -4907,6 +5004,111 @@ mod tests {
                 .and_then(|value| value.get("tenant_id"))
                 .and_then(Value::as_str),
             Some("tnt:11111111-1111-1111-1111-111111111111")
+        );
+    }
+
+    #[test]
+    fn get_tenant_payload_returns_tenant_sponsor_and_counts() {
+        let mut store = IdentityStore::default();
+        store.tenants.insert(
+            "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+            TenantRecord {
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                name: "root".to_string(),
+                domain: Some("root.local".to_string()),
+                status: "active".to_string(),
+                settings: json!({}),
+                sponsor_tenant_id: None,
+            },
+        );
+        store.tenants.insert(
+            "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+            TenantRecord {
+                tenant_id: "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                name: "child".to_string(),
+                domain: Some("child.local".to_string()),
+                status: "active".to_string(),
+                settings: json!({"tier":"pro"}),
+                sponsor_tenant_id: Some("tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string()),
+            },
+        );
+        store.ilks.insert(
+            "ilk:11111111-1111-1111-1111-111111111111".to_string(),
+            IlkRecord {
+                ilk_id: "ilk:11111111-1111-1111-1111-111111111111".to_string(),
+                ilk_type: "agent".to_string(),
+                registration_status: "complete".to_string(),
+                tenant_id: "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                identification: json!({}),
+                roles: Vec::new(),
+                capabilities: Vec::new(),
+                channels: Vec::new(),
+                deleted_at_ms: None,
+            },
+        );
+
+        let payload = store
+            .get_tenant_payload("tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+            .expect("tenant payload");
+
+        assert_eq!(
+            payload.get("tenant_id").and_then(Value::as_str),
+            Some("tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        );
+        assert_eq!(payload.get("child_count").and_then(Value::as_u64), Some(0));
+        assert_eq!(payload.get("ilk_count").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            payload
+                .get("sponsor")
+                .and_then(|value| value.get("tenant_id"))
+                .and_then(Value::as_str),
+            Some("tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        );
+    }
+
+    #[test]
+    fn list_tenants_payload_sorts_and_includes_summary_counts() {
+        let mut store = IdentityStore::default();
+        store.tenants.insert(
+            "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+            TenantRecord {
+                tenant_id: "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                name: "child".to_string(),
+                domain: None,
+                status: "active".to_string(),
+                settings: json!({}),
+                sponsor_tenant_id: Some("tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string()),
+            },
+        );
+        store.tenants.insert(
+            "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+            TenantRecord {
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                name: "root".to_string(),
+                domain: None,
+                status: "active".to_string(),
+                settings: json!({}),
+                sponsor_tenant_id: None,
+            },
+        );
+
+        let payload = store.list_tenants_payload();
+        let tenants = payload
+            .get("tenants")
+            .and_then(Value::as_array)
+            .expect("tenant list");
+        assert_eq!(payload.get("count").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            tenants[0].get("tenant_id").and_then(Value::as_str),
+            Some("tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        );
+        assert_eq!(
+            tenants[0].get("child_count").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            tenants[1].get("tenant_id").and_then(Value::as_str),
+            Some("tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
         );
     }
 

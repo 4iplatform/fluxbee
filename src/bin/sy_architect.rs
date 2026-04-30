@@ -1727,6 +1727,8 @@ Use these facts only to select and validate planning intent. Do not treat them a
 
 - Some first-spawn operations for AI/IO tenant-scoped nodes require `tenant_id` at root action args.
 - Do not invent `tenant_id`.
+- Discover tenant candidates through identity reads first: `list_tenants` for discovery and `get_tenant` for exact sponsor/default detail.
+- If the operator says "same tenant as node X", read node config/live config to recover the exact `tenant_id`, then validate it with `get_tenant`.
 - If a required `tenant_id` is missing and cannot be read from reliable context, block with a clear missing-field reason.
 
 ### Planning discipline
