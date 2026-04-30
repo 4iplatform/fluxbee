@@ -836,21 +836,12 @@ if [[ -f "$ROOT_DIR/config/hive.yaml" ]]; then
 fi
 
 # Install SY.architect handbook (always overwrite — static doc, not runtime data).
-handbook_src=""
-for candidate in \
-  "$ROOT_DIR/docs/onworking COA/archi/handbook_fluxbee.md" \
-  "$ROOT_DIR/docs/onworking COA/handbook_fluxbee.md"
-do
-  if [[ -f "$candidate" ]]; then
-    handbook_src="$candidate"
-    break
-  fi
-done
-if [[ -n "$handbook_src" ]]; then
+handbook_src="$ROOT_DIR/docs/onworking COA/archi/handbook_fluxbee.md"
+if [[ -f "$handbook_src" ]]; then
   sudo install -m 0644 "$handbook_src" "$CONFIG_DIR/handbook_fluxbee.md"
   echo "Installed architect handbook to $CONFIG_DIR/handbook_fluxbee.md"
 else
-  echo "Warning: handbook_fluxbee.md not found in repo docs/; skipping." >&2
+  echo "Warning: architect handbook not found at $handbook_src; skipping." >&2
 fi
 
 # Seed SY.architect cookbooks — never overwrite existing data (preserves live patterns).

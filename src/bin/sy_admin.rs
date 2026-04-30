@@ -2763,6 +2763,18 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "update_tenant",
+        route: InternalActionRoute::Command("update_tenant"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "set_tenant_sponsor",
+        route: InternalActionRoute::Command("set_tenant_sponsor"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "list_deployments",
         route: InternalActionRoute::Command("list_deployments"),
         requires_target: true,
@@ -4232,6 +4244,55 @@ async fn handle_hive_paths(
             });
             let (status, resp) =
                 handle_admin_command(ctx, client, "get_ilk", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("PUT", ["identity", "tenants", tenant_id]) => {
+            let mut payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            if !payload.is_object() {
+                return Ok(Some((
+                    400,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": "update_tenant",
+                        "payload": serde_json::Value::Null,
+                        "error_code": "INVALID_REQUEST",
+                        "error_detail": "request body must be a JSON object",
+                    })
+                    .to_string(),
+                )));
+            }
+            payload["tenant_id"] = serde_json::Value::String(decode_percent(tenant_id));
+            let (status, resp) =
+                handle_admin_command(ctx, client, "update_tenant", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["identity", "tenants", tenant_id, "sponsor"]) => {
+            let mut payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            if !payload.is_object() {
+                return Ok(Some((
+                    400,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": "set_tenant_sponsor",
+                        "payload": serde_json::Value::Null,
+                        "error_code": "INVALID_REQUEST",
+                        "error_detail": "request body must be a JSON object",
+                    })
+                    .to_string(),
+                )));
+            }
+            payload["tenant_id"] = serde_json::Value::String(decode_percent(tenant_id));
+            let (status, resp) =
+                handle_admin_command(ctx, client, "set_tenant_sponsor", payload, Some(hive))
+                    .await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["versions"]) => {
@@ -6133,6 +6194,8 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "set_node_config"
             | "node_control_config_set"
             | "set_storage"
+            | "update_tenant"
+            | "set_tenant_sponsor"
             | "update"
             | "sync_hint"
             | "opa_compile_apply"
@@ -6164,6 +6227,10 @@ fn admin_action_summary(action: &str) -> &'static str {
         }
         "list_ilks" => "List identity ilks in a hive.",
         "get_ilk" => "Read one identity ilk.",
+        "update_tenant" => "Update mutable fields of one identity tenant in a hive.",
+        "set_tenant_sponsor" => {
+            "Set or clear the sponsor relationship for one identity tenant in a hive."
+        }
         "inventory" => "Read global or per-hive inventory, including system-wide node visibility.",
         "list_versions" => "List core and runtime versions across hives.",
         "get_versions" => "Read core and runtime versions for one hive.",
@@ -6242,6 +6309,10 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         }
         "list_ilks" => vec!["GET /hives/{hive}/identity/ilks"],
         "get_ilk" => vec!["GET /hives/{hive}/identity/ilks/{ilk_id}"],
+        "update_tenant" => vec!["PUT /hives/{hive}/identity/tenants/{tenant_id}"],
+        "set_tenant_sponsor" => {
+            vec!["POST /hives/{hive}/identity/tenants/{tenant_id}/sponsor"]
+        }
         "inventory" => vec![
             "GET /inventory",
             "GET /inventory/summary",
@@ -6416,6 +6487,14 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
                 "ILK identifier in prefixed format, for example ilk:550e8400-e29b-41d4-a716-446655440000.",
             ),
         ],
+        "update_tenant" | "set_tenant_sponsor" => vec![
+            admin_action_path_param("hive", "string", "Target hive id in the URL path."),
+            admin_action_path_param(
+                "tenant_id",
+                "string",
+                "Tenant identifier in prefixed format, for example tnt:550e8400-e29b-41d4-a716-446655440000.",
+            ),
+        ],
         "run_node" => vec![admin_action_path_param(
             "hive",
             "string",
@@ -6474,6 +6553,8 @@ fn admin_action_body_required(action: &str) -> bool {
             | "node_control_config_set"
             | "set_storage"
             | "update"
+            | "update_tenant"
+            | "set_tenant_sponsor"
             | "opa_compile_apply"
             | "opa_compile"
             | "opa_apply"
@@ -6614,6 +6695,11 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field("layout", "string", "Go time layout used for formatting."),
             admin_action_body_field("tz", "string", "IANA timezone used for rendering."),
         ],
+        "set_tenant_sponsor" => vec![admin_action_body_field(
+            "sponsor_tenant_id",
+            "string|null",
+            "Prefixed tenant id to assign as sponsor, or null to clear the sponsor relationship.",
+        )],
         _ => Vec::new(),
     }
 }
@@ -6657,6 +6743,45 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "dist_sync_probe_timeout_secs",
                 "u64",
                 "Timeout for dist sync readiness probe.",
+            ),
+        ],
+        "update_tenant" => vec![
+            admin_action_body_field(
+                "name",
+                "string",
+                "Optional new display name for the tenant.",
+            ),
+            admin_action_body_field(
+                "domain",
+                "string",
+                "Optional domain value. Pass an empty string to clear it.",
+            ),
+            admin_action_body_field(
+                "status",
+                "string",
+                "Optional tenant status. Accepted values: pending, active, suspended.",
+            ),
+            admin_action_body_field(
+                "settings",
+                "object",
+                "Optional full tenant settings object replacement.",
+            ),
+            admin_action_body_field(
+                "sponsor_tenant_id",
+                "string|null",
+                "Optional sponsor tenant id update. Pass null to clear sponsorship.",
+            ),
+            admin_action_body_field(
+                "hive",
+                "string",
+                "Optional hive override when using internal admin dispatch.",
+            ),
+        ],
+        "set_tenant_sponsor" => vec![
+            admin_action_body_field(
+                "hive",
+                "string",
+                "Optional hive override when using internal admin dispatch.",
             ),
         ],
         "run_node" => vec![
@@ -7120,6 +7245,13 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         "wf_rules_get_workflow" | "wf_rules_get_status" => serde_json::json!({
             "workflow_name": "invoice"
         }),
+        "update_tenant" => serde_json::json!({
+            "status": "active",
+            "sponsor_tenant_id": "tnt:11111111-1111-1111-1111-111111111111"
+        }),
+        "set_tenant_sponsor" => serde_json::json!({
+            "sponsor_tenant_id": serde_json::Value::Null
+        }),
         "remove_runtime_version" => serde_json::json!({
             "test_hold_ms": 250
         }),
@@ -7172,6 +7304,12 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "list_ilks" => "curl -X GET /hives/motherbee/identity/ilks",
         "get_ilk" => {
             "curl -X GET /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000"
+        }
+        "update_tenant" => {
+            r#"curl -X PUT /hives/motherbee/identity/tenants/tnt:550e8400-e29b-41d4-a716-446655440000 -d '{"status":"active","sponsor_tenant_id":"tnt:11111111-1111-1111-1111-111111111111"}'"#
+        }
+        "set_tenant_sponsor" => {
+            r#"curl -X POST /hives/motherbee/identity/tenants/tnt:550e8400-e29b-41d4-a716-446655440000/sponsor -d '{"sponsor_tenant_id":null}'"#
         }
         "inventory" => "curl -X GET /inventory",
         "list_versions" => "curl -X GET /versions",
@@ -7368,6 +7506,17 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The ilk_id path segment must use the prefixed UUID format ilk:<uuid>.",
             "Identity may resolve an old alias ILK to its canonical ILK if an alias mapping exists.",
             "This lookup is by ILK identifier, not by channel address, node name, or tenant.",
+        ],
+        "update_tenant" => vec![
+            "This mutates the tenant record itself, not ILKs that belong to that tenant.",
+            "Use TNT_CREATE to create a tenant. Use update_tenant only after the tenant already exists.",
+            "Passing sponsor_tenant_id updates the tenant hierarchy. Passing sponsor_tenant_id=null clears sponsorship and makes the tenant a root/default candidate.",
+            "Sponsor updates are validated against self-reference and sponsorship cycles.",
+        ],
+        "set_tenant_sponsor" => vec![
+            "Focused identity admin action for changing only the sponsor relationship of a tenant.",
+            "Pass sponsor_tenant_id as a prefixed tenant id to assign a sponsor, or null to clear it.",
+            "This does not create a tenant and does not modify ILK membership.",
         ],
         "inventory" => vec![
             "Use GET /inventory for the full global inventory view.",
@@ -8995,7 +9144,7 @@ async fn handle_admin_command(
     ) {
         return handle_node_control_command(ctx, client, action, payload, hive).await;
     }
-    if matches!(action, "get_ilk") {
+    if matches!(action, "get_ilk" | "update_tenant" | "set_tenant_sponsor") {
         return handle_identity_command(ctx, client, action, payload, hive).await;
     }
 
@@ -9309,6 +9458,8 @@ async fn handle_identity_command(
     let target = format!("SY.identity@{}", target_hive);
     let (request_msg, response_msg) = match action {
         "get_ilk" => ("ILK_GET", "ILK_GET_RESPONSE"),
+        "update_tenant" => ("TNT_UPDATE", "TNT_UPDATE_RESPONSE"),
+        "set_tenant_sponsor" => ("TNT_SET_SPONSOR", "TNT_SET_SPONSOR_RESPONSE"),
         _ => return Err(format!("unsupported identity admin action: {action}").into()),
     };
     let response = send_system_request(
