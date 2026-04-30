@@ -80,6 +80,8 @@ pub struct IchStateRecord {
     pub external_profile_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ilk_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_l2_name: Option<String>,
     pub automation_enabled: bool,
     pub observed_at_ms: u64,
 }
@@ -289,6 +291,35 @@ impl LinkedHelperDurableState {
                 .push(external_profile_id.to_string());
         }
         adapter.updated_at_ms = now_ms;
+    }
+
+    pub fn upsert_ich_state(
+        &mut self,
+        ich_id: &str,
+        adapter_id: &str,
+        external_profile_id: &str,
+        ilk_id: Option<String>,
+        owner_l2_name: Option<String>,
+        automation_enabled: bool,
+    ) -> Option<bool> {
+        let now_ms = now_epoch_ms();
+        let previous = self
+            .own_ichs
+            .get(ich_id)
+            .map(|record| record.automation_enabled);
+        self.own_ichs.insert(
+            ich_id.to_string(),
+            IchStateRecord {
+                ich_id: ich_id.to_string(),
+                adapter_id: adapter_id.to_string(),
+                external_profile_id: external_profile_id.to_string(),
+                ilk_id,
+                owner_l2_name,
+                automation_enabled,
+                observed_at_ms: now_ms,
+            },
+        );
+        previous
     }
 }
 
