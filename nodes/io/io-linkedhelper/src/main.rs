@@ -12,8 +12,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{
-    connect, resolve_identity_option_from_hive_id, try_handle_default_node_status, NodeConfig,
-    NodeUuidMode, FLUXBEE_NODE_NAME_ENV,
+    compute_thread_id, connect, resolve_identity_option_from_hive_id,
+    try_handle_default_node_status, NodeConfig, NodeUuidMode, ThreadIdInput,
+    FLUXBEE_NODE_NAME_ENV,
 };
 use io_common::identity::{IdentityError, ResolveOrCreateInput};
 use io_common::io_adapter_config::{
@@ -34,6 +35,7 @@ use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
 use io_common::io_control_plane_store::persist_io_control_plane_state;
 use io_common::io_linkedhelper_adapter_config::IoLinkedHelperAdapterConfigContract;
 use io_common::provision::{strict_provision_ilk, IdentityProvisionConfig, RouterInbox};
+use io_common::router_message::new_trace_id;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -46,7 +48,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::schema::{build_configured_schema, build_unconfigured_schema};
 use crate::state_store::{
     load_linkedhelper_state, persist_linkedhelper_state, AdapterSnapshot, LinkedHelperDurableState,
-    StoredResponseItem,
+    ProfileStateRecord, StoredResponseItem,
 };
 
 #[derive(Clone)]
@@ -148,6 +150,17 @@ struct ProfileCreatePayload {
     metadata: Option<Value>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ConversationMessagePayload {
+    profile_ilk: String,
+    contact_name: String,
+    contact_external_composite_id: String,
+    #[serde(default)]
+    contact_lh_person_id: Option<String>,
+    conversation_external_id: String,
+    content: Value,
+}
+
 #[derive(Debug, Serialize)]
 struct PollResponse {
     response_id: String,
@@ -238,7 +251,7 @@ impl From<StoredResponseItem> for ResponseItem {
 async fn main() -> Result<()> {
     let config = Config::from_env();
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,io_linkedhelper=debug,fluxbee_sdk=info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,io_linkedhelper=info,fluxbee_sdk=info"));
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     tracing::info!(
@@ -829,6 +842,10 @@ fn linkedhelper_profile_channel() -> &'static str {
     "linkedhelper"
 }
 
+fn linkedhelper_contact_channel() -> &'static str {
+    "linkedhelper_contact"
+}
+
 fn default_identity_target_for_hive(hive_id: &str) -> String {
     format!("SY.identity@{}", hive_id.trim())
 }
@@ -957,6 +974,7 @@ async fn post_poll(
         .unwrap_or("heartbeat");
     let mut durable_state = state.durable_state.read().await.clone();
     durable_state.mark_adapter_poll(&runtime.adapter_id, request_id);
+    refresh_pending_profiles_for_adapter(state.as_ref(), &runtime, &mut durable_state);
     let pending_deliveries = durable_state
         .drain_pending_deliveries(&runtime.adapter_id)
         .into_iter()
@@ -1005,6 +1023,19 @@ async fn post_poll(
             }
             if item.item_type.eq_ignore_ascii_case("profile_create") {
                 process_profile_create(
+                    &state,
+                    &runtime,
+                    &identity_cfg,
+                    &mut durable_state,
+                    request_id,
+                    item,
+                    &mut responses,
+                )
+                .await;
+                continue;
+            }
+            if item.item_type.eq_ignore_ascii_case("conversation_message") {
+                process_conversation_message(
                     &state,
                     &runtime,
                     &identity_cfg,
@@ -1071,7 +1102,7 @@ async fn post_poll(
     }
     *state.durable_state.write().await = durable_state;
 
-    tracing::info!(
+    tracing::debug!(
         adapter_id = %runtime.adapter_id,
         adapter_label = %runtime.label.as_deref().unwrap_or(""),
         tenant_id = %runtime.tenant_id,
@@ -1079,7 +1110,7 @@ async fn post_poll(
         request_id = %request_id,
         mode = %mode,
         item_count = request.items.len(),
-        "io-linkedhelper poll received"
+        "io-linkedhelper poll processed"
     );
 
     Json(PollResponse {
@@ -1099,6 +1130,180 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
     } else {
         Some(trimmed)
     }
+}
+
+fn refresh_pending_profiles_for_adapter(
+    state: &HttpState,
+    runtime: &AdapterRuntime,
+    durable_state: &mut LinkedHelperDurableState,
+) {
+    let external_profile_ids: Vec<String> = durable_state
+        .profiles
+        .values()
+        .filter(|profile| profile.adapter_id == runtime.adapter_id)
+        .map(|profile| profile.external_profile_id.clone())
+        .collect();
+
+    for external_profile_id in external_profile_ids {
+        let Some(existing) = durable_state.profiles.get(&external_profile_id).cloned() else {
+            continue;
+        };
+        match resolve_identity_option_from_hive_id(
+            &state.hive_id,
+            linkedhelper_profile_channel(),
+            &existing.external_profile_id,
+            &existing.tenant_id,
+        ) {
+            Ok(Some(resolved))
+                if resolved.ilk.registration_status.eq_ignore_ascii_case("complete") =>
+            {
+                let was_ready = existing.status.eq_ignore_ascii_case("ready");
+                durable_state.upsert_profile(
+                    &existing.adapter_id,
+                    &existing.tenant_id,
+                    &existing.external_profile_id,
+                    Some(resolved.ilk.ilk_id.clone()),
+                    Some(resolved.ich_id.clone()),
+                    "ready",
+                    existing.display_name.clone(),
+                    existing.metadata.clone(),
+                );
+                if !was_ready {
+                    tracing::info!(
+                        node_name = %state.node_name,
+                        adapter_id = %existing.adapter_id,
+                        external_profile_id = %existing.external_profile_id,
+                        ilk_id = %resolved.ilk.ilk_id,
+                        ich_id = %resolved.ich_id,
+                        "linkedhelper profile promoted to ready"
+                    );
+                    durable_state.enqueue_pending_delivery(
+                        &existing.adapter_id,
+                        format!("profile_ready:{}", existing.external_profile_id),
+                        Some(format!("profile_ready:{}", existing.external_profile_id)),
+                        StoredResponseItem::Result {
+                            response_id: format!(
+                                "resp:profile_ready:{}",
+                                existing.external_profile_id
+                            ),
+                            adapter_id: existing.adapter_id.clone(),
+                            event_id: existing.external_profile_id.clone(),
+                            status: "success".to_string(),
+                            result_type: "profile_ready".to_string(),
+                            payload: Some(serde_json::json!({
+                                "external_profile_id": existing.external_profile_id,
+                                "ilk_id": resolved.ilk.ilk_id,
+                                "ich_id": resolved.ich_id
+                            })),
+                            error_code: None,
+                            error_message: None,
+                            retryable: None,
+                        },
+                    );
+                }
+                refresh_ich_state_for_profile(
+                    durable_state,
+                    &existing,
+                    &resolved.ich_id,
+                    &resolved.ilk.ilk_id,
+                    resolved.owner_l2_name.as_deref(),
+                    resolved.enabled,
+                );
+            }
+            Ok(Some(resolved)) => {
+                let ilk_id = resolved.ilk.ilk_id.clone();
+                let ich_id = resolved.ich_id.clone();
+                let next_status = if existing.status.eq_ignore_ascii_case("ready") {
+                    "ready"
+                } else {
+                    "pending_promotion"
+                };
+                durable_state.upsert_profile(
+                    &existing.adapter_id,
+                    &existing.tenant_id,
+                    &existing.external_profile_id,
+                    Some(ilk_id.clone()),
+                    Some(ich_id.clone()),
+                    next_status,
+                    existing.display_name.clone(),
+                    existing.metadata.clone(),
+                );
+                refresh_ich_state_for_profile(
+                    durable_state,
+                    &existing,
+                    &ich_id,
+                    &ilk_id,
+                    resolved.owner_l2_name.as_deref(),
+                    resolved.enabled,
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    node_name = %state.node_name,
+                    adapter_id = %runtime.adapter_id,
+                    external_profile_id = %existing.external_profile_id,
+                    error = %err,
+                    "linkedhelper failed to refresh pending profile from identity SHM"
+                );
+            }
+        }
+    }
+}
+
+fn refresh_ich_state_for_profile(
+    durable_state: &mut LinkedHelperDurableState,
+    profile: &ProfileStateRecord,
+    ich_id: &str,
+    ilk_id: &str,
+    owner_l2_name: Option<&str>,
+    enabled: bool,
+) {
+    let previous = durable_state.upsert_ich_state(
+        ich_id,
+        &profile.adapter_id,
+        &profile.external_profile_id,
+        Some(ilk_id.to_string()),
+        owner_l2_name.map(ToString::to_string),
+        enabled,
+    );
+    if previous == Some(enabled) {
+        return;
+    }
+    let result_type = if enabled {
+        "automation_enabled"
+    } else {
+        "automation_disabled"
+    };
+    tracing::info!(
+        adapter_id = %profile.adapter_id,
+        external_profile_id = %profile.external_profile_id,
+        ilk_id = %ilk_id,
+        ich_id = %ich_id,
+        enabled,
+        result_type = %result_type,
+        "linkedhelper observed automation state change for own ICH"
+    );
+    durable_state.enqueue_pending_delivery(
+        &profile.adapter_id,
+        format!("{result_type}:{ich_id}"),
+        Some(format!("ich_state:{ich_id}")),
+        StoredResponseItem::Result {
+            response_id: format!("resp:{result_type}:{ich_id}"),
+            adapter_id: profile.adapter_id.clone(),
+            event_id: profile.external_profile_id.clone(),
+            status: "success".to_string(),
+            result_type: result_type.to_string(),
+            payload: Some(serde_json::json!({
+                "external_profile_id": profile.external_profile_id,
+                "ilk_id": ilk_id,
+                "ich_id": ich_id
+            })),
+            error_code: None,
+            error_message: None,
+            retryable: None,
+        },
+    );
 }
 
 async fn process_profile_create(
@@ -1160,6 +1365,7 @@ async fn process_profile_create(
             "metadata": payload.metadata.clone(),
             "source": "io.linkedhelper"
         }),
+        ilk_type: Some("agent".to_string()),
     };
 
     match resolve_identity_option_from_hive_id(
@@ -1182,6 +1388,16 @@ async fn process_profile_create(
                 },
                 Some(display_name.to_string()),
                 payload.metadata.clone(),
+            );
+            tracing::info!(
+                node_name = %state.node_name,
+                adapter_id = %runtime.adapter_id,
+                event_id = %item.id,
+                external_profile_id = %external_profile_id,
+                ilk_id = %resolved.ilk.ilk_id,
+                ich_id = %resolved.ich_id,
+                registration_status = %resolved.ilk.registration_status,
+                "linkedhelper accepted profile_create for known profile"
             );
             responses.push(ResponseItem::Ack {
                 response_id: format!("resp:{request_id}:{event_id}"),
@@ -1220,11 +1436,19 @@ async fn process_profile_create(
                     &runtime.adapter_id,
                     &runtime.tenant_id,
                     external_profile_id,
-                    Some(src_ilk),
+                    Some(src_ilk.clone()),
                     None,
                     "pending_promotion",
                     Some(display_name.to_string()),
                     payload.metadata.clone(),
+                );
+                tracing::info!(
+                    node_name = %state.node_name,
+                    adapter_id = %runtime.adapter_id,
+                    event_id = %item.id,
+                    external_profile_id = %external_profile_id,
+                    provisional_ilk = %src_ilk,
+                    "linkedhelper provisioned provisional profile ILK"
                 );
                 responses.push(ResponseItem::Ack {
                     response_id: format!("resp:{request_id}:{event_id}"),
@@ -1255,6 +1479,445 @@ async fn process_profile_create(
                 retryable: Some(true),
             });
         }
+    }
+}
+
+async fn process_conversation_message(
+    state: &Arc<HttpState>,
+    runtime: &AdapterRuntime,
+    identity_cfg: &IdentityProvisionConfig,
+    durable_state: &mut LinkedHelperDurableState,
+    request_id: &str,
+    item: &PollItem,
+    responses: &mut Vec<ResponseItem>,
+) {
+    let event_id = item.id.trim();
+    let payload = match serde_json::from_value::<ConversationMessagePayload>(item.payload.clone()) {
+        Ok(payload) => payload,
+        Err(err) => {
+            responses.push(ResponseItem::Result {
+                response_id: format!("resp:{request_id}:{event_id}:invalid"),
+                adapter_id: runtime.adapter_id.clone(),
+                event_id: item.id.clone(),
+                status: "error".to_string(),
+                result_type: "validation_error".to_string(),
+                payload: None,
+                error_code: Some("invalid_conversation_message_payload".to_string()),
+                error_message: Some(err.to_string()),
+                retryable: Some(false),
+            });
+            return;
+        }
+    };
+
+    let profile_ilk = payload.profile_ilk.trim();
+    let contact_name = payload.contact_name.trim();
+    let contact_external_id = payload.contact_external_composite_id.trim();
+    let conversation_external_id = payload.conversation_external_id.trim();
+    if profile_ilk.is_empty()
+        || contact_name.is_empty()
+        || contact_external_id.is_empty()
+        || conversation_external_id.is_empty()
+    {
+        responses.push(ResponseItem::Result {
+            response_id: format!("resp:{request_id}:{event_id}:invalid"),
+            adapter_id: runtime.adapter_id.clone(),
+            event_id: item.id.clone(),
+            status: "error".to_string(),
+            result_type: "validation_error".to_string(),
+            payload: None,
+            error_code: Some("invalid_conversation_message_payload".to_string()),
+            error_message: Some(
+                "conversation_message requires non-empty profile_ilk, contact_name, contact_external_composite_id and conversation_external_id"
+                    .to_string(),
+            ),
+            retryable: Some(false),
+        });
+        return;
+    }
+
+    let Some(profile) = durable_state
+        .profiles
+        .values()
+        .find(|profile| {
+            profile.adapter_id == runtime.adapter_id
+                && profile
+                    .ilk_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    == Some(profile_ilk)
+        })
+        .cloned()
+    else {
+        tracing::info!(
+            node_name = %state.node_name,
+            adapter_id = %runtime.adapter_id,
+            event_id = %item.id,
+            profile_ilk = %profile_ilk,
+            error_code = "unknown_profile",
+            "linkedhelper blocked conversation_message"
+        );
+        responses.push(blocked_profile_result(
+            runtime,
+            request_id,
+            &item.id,
+            "unknown_profile",
+            "profile_ilk does not belong to a known profile for this adapter",
+            Some(false),
+        ));
+        return;
+    };
+
+    if !profile.status.eq_ignore_ascii_case("ready") {
+        tracing::info!(
+            node_name = %state.node_name,
+            adapter_id = %runtime.adapter_id,
+            event_id = %item.id,
+            external_profile_id = %profile.external_profile_id,
+            profile_ilk = %profile_ilk,
+            profile_status = %profile.status,
+            error_code = "profile_not_ready",
+            "linkedhelper blocked conversation_message"
+        );
+        responses.push(blocked_profile_result(
+            runtime,
+            request_id,
+            &item.id,
+            "profile_not_ready",
+            "profile is not ready for automation yet",
+            Some(true),
+        ));
+        return;
+    }
+
+    let Some(profile_ich_id) = profile
+        .ich_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        tracing::info!(
+            node_name = %state.node_name,
+            adapter_id = %runtime.adapter_id,
+            event_id = %item.id,
+            external_profile_id = %profile.external_profile_id,
+            profile_ilk = %profile_ilk,
+            error_code = "profile_missing_ich",
+            "linkedhelper blocked conversation_message"
+        );
+        responses.push(blocked_profile_result(
+            runtime,
+            request_id,
+            &item.id,
+            "profile_missing_ich",
+            "profile is missing its linked helper ICH state",
+            Some(true),
+        ));
+        return;
+    };
+
+    let Some(ich_state) = durable_state.own_ichs.get(profile_ich_id).cloned() else {
+        tracing::info!(
+            node_name = %state.node_name,
+            adapter_id = %runtime.adapter_id,
+            event_id = %item.id,
+            external_profile_id = %profile.external_profile_id,
+            profile_ilk = %profile_ilk,
+            ich_id = %profile_ich_id,
+            error_code = "automation_state_unknown",
+            "linkedhelper blocked conversation_message"
+        );
+        responses.push(blocked_profile_result(
+            runtime,
+            request_id,
+            &item.id,
+            "automation_state_unknown",
+            "profile automation state is not known yet",
+            Some(true),
+        ));
+        return;
+    };
+
+    if !ich_state.automation_enabled {
+        tracing::info!(
+            node_name = %state.node_name,
+            adapter_id = %runtime.adapter_id,
+            event_id = %item.id,
+            external_profile_id = %profile.external_profile_id,
+            profile_ilk = %profile_ilk,
+            ich_id = %profile_ich_id,
+            error_code = "automation_disabled",
+            "linkedhelper blocked conversation_message"
+        );
+        responses.push(blocked_profile_result(
+            runtime,
+            request_id,
+            &item.id,
+            "automation_disabled",
+            "profile automation is disabled for the linked helper ICH",
+            Some(false),
+        ));
+        return;
+    }
+
+    let Some(dst_node) = runtime
+        .dst_node
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+    else {
+        responses.push(ResponseItem::Result {
+            response_id: format!("resp:{request_id}:{event_id}:routing_error"),
+            adapter_id: runtime.adapter_id.clone(),
+            event_id: item.id.clone(),
+            status: "error".to_string(),
+            result_type: "routing_error".to_string(),
+            payload: None,
+            error_code: Some("missing_dst_node".to_string()),
+            error_message: Some("adapter does not define dst_node".to_string()),
+            retryable: Some(false),
+        });
+        return;
+    };
+
+    let message_payload = match normalize_conversation_payload(&payload.content) {
+        Ok(value) => value,
+        Err(message) => {
+            responses.push(ResponseItem::Result {
+                response_id: format!("resp:{request_id}:{event_id}:invalid_content"),
+                adapter_id: runtime.adapter_id.clone(),
+                event_id: item.id.clone(),
+                status: "error".to_string(),
+                result_type: "validation_error".to_string(),
+                payload: None,
+                error_code: Some("invalid_conversation_content".to_string()),
+                error_message: Some(message),
+                retryable: Some(false),
+            });
+            return;
+        }
+    };
+
+    let contact_identity_input = ResolveOrCreateInput {
+        channel: linkedhelper_contact_channel().to_string(),
+        external_id: contact_external_id.to_string(),
+        src_ilk_override: None,
+        tenant_id: Some(runtime.tenant_id.clone()),
+        tenant_hint: None,
+        attributes: serde_json::json!({
+            "display_name": contact_name,
+            "contact_lh_person_id": payload.contact_lh_person_id.clone(),
+            "source": "io.linkedhelper"
+        }),
+        ilk_type: Some("human".to_string()),
+    };
+
+    let (contact_src_ilk, contact_ich_id) = match resolve_identity_option_from_hive_id(
+        &state.hive_id,
+        &contact_identity_input.channel,
+        &contact_identity_input.external_id,
+        contact_identity_input.tenant_id.as_deref().unwrap_or(""),
+    ) {
+        Ok(Some(resolved)) => (resolved.ilk.ilk_id, Some(resolved.ich_id)),
+        Ok(None) => match strict_provision_ilk(
+            &state.sender,
+            state.router_inbox.clone(),
+            identity_cfg,
+            identity_cfg.target.as_str(),
+            &contact_identity_input,
+        )
+        .await
+        {
+            Ok(src_ilk) => (src_ilk, None),
+            Err(err) => {
+                responses.push(identity_error_result(
+                    runtime,
+                    request_id,
+                    &item.id,
+                    "identity_error",
+                    err,
+                ));
+                return;
+            }
+        },
+        Err(err) => {
+            responses.push(ResponseItem::Result {
+                response_id: format!("resp:{request_id}:{event_id}:identity_lookup_error"),
+                adapter_id: runtime.adapter_id.clone(),
+                event_id: item.id.clone(),
+                status: "error".to_string(),
+                result_type: "identity_error".to_string(),
+                payload: None,
+                error_code: Some("identity_lookup_failed".to_string()),
+                error_message: Some(err.to_string()),
+                retryable: Some(true),
+            });
+            return;
+        }
+    };
+
+    let thread_id = match compute_thread_id(ThreadIdInput::PersistentChannel {
+        channel_type: linkedhelper_profile_channel(),
+        entrypoint_id: Some(runtime.adapter_id.as_str()),
+        conversation_id: conversation_external_id,
+    }) {
+        Ok(thread_id) => thread_id,
+        Err(err) => {
+            responses.push(ResponseItem::Result {
+                response_id: format!("resp:{request_id}:{event_id}:thread_error"),
+                adapter_id: runtime.adapter_id.clone(),
+                event_id: item.id.clone(),
+                status: "error".to_string(),
+                result_type: "validation_error".to_string(),
+                payload: None,
+                error_code: Some("invalid_conversation_external_id".to_string()),
+                error_message: Some(err.to_string()),
+                retryable: Some(false),
+            });
+            return;
+        }
+    };
+
+    let trace_id = new_trace_id();
+    let profile_ilk_owned = profile_ilk.to_string();
+    let conversation_msg = WireMessage {
+        routing: Routing {
+            src: state.sender.uuid().to_string(),
+            src_l2_name: None,
+            dst: Destination::Unicast(dst_node.clone()),
+            ttl: 16,
+            trace_id: trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: "user".to_string(),
+            msg: None,
+            src_ilk: Some(contact_src_ilk.clone()),
+            dst_ilk: Some(profile_ilk_owned.clone()),
+            ich: contact_ich_id.clone(),
+            thread_id: Some(thread_id.clone()),
+            scope: None,
+            target: None,
+            action: None,
+            priority: None,
+            context: Some(serde_json::json!({
+                "io": {
+                    "channel": linkedhelper_profile_channel(),
+                    "adapter": {
+                        "id": runtime.adapter_id
+                    },
+                    "entrypoint": {
+                        "id": runtime.adapter_id
+                    },
+                    "sender": {
+                        "id": contact_external_id,
+                        "display_name": contact_name
+                    },
+                    "recipient": {
+                        "id": profile_ilk_owned
+                    },
+                    "conversation": {
+                        "id": conversation_external_id,
+                        "thread_id": thread_id
+                    },
+                    "message": {
+                        "id": item.id,
+                        "request_id": request_id
+                    },
+                    "linkedhelper": {
+                        "external_profile_id": profile.external_profile_id,
+                        "contact_lh_person_id": payload.contact_lh_person_id,
+                        "profile_ilk": profile_ilk
+                    }
+                }
+            })),
+            ..Meta::default()
+        },
+        payload: message_payload,
+    };
+
+    if let Err(err) = state.sender.send(conversation_msg).await {
+        tracing::warn!(
+            node_name = %state.node_name,
+            adapter_id = %runtime.adapter_id,
+            event_id = %item.id,
+            trace_id = %trace_id,
+            dst_node = %dst_node,
+            error = ?err,
+            "failed to send linkedhelper conversation message to router"
+        );
+        responses.push(ResponseItem::Result {
+            response_id: format!("resp:{request_id}:{event_id}:routing_error"),
+            adapter_id: runtime.adapter_id.clone(),
+            event_id: item.id.clone(),
+            status: "error".to_string(),
+            result_type: "routing_error".to_string(),
+            payload: None,
+            error_code: Some("router_unavailable".to_string()),
+            error_message: Some("unable to dispatch conversation message to router".to_string()),
+            retryable: Some(true),
+        });
+        return;
+    }
+
+    tracing::info!(
+        node_name = %state.node_name,
+        adapter_id = %runtime.adapter_id,
+        event_id = %item.id,
+        external_profile_id = %profile.external_profile_id,
+        profile_ilk = %profile_ilk,
+        contact_external_id = %contact_external_id,
+        dst_node = %dst_node,
+        thread_id = %thread_id,
+        trace_id = %trace_id,
+        "linkedhelper dispatched conversation_message to router"
+    );
+
+    responses.push(ResponseItem::Ack {
+        response_id: format!("resp:{request_id}:{event_id}"),
+        adapter_id: runtime.adapter_id.clone(),
+        event_id: item.id.clone(),
+    });
+    responses.push(ResponseItem::Result {
+        response_id: format!("resp:{request_id}:{event_id}:processed"),
+        adapter_id: runtime.adapter_id.clone(),
+        event_id: item.id.clone(),
+        status: "success".to_string(),
+        result_type: "conversation_processed".to_string(),
+        payload: Some(serde_json::json!({
+            "external_profile_id": profile.external_profile_id,
+            "profile_ilk": profile_ilk,
+            "contact_ilk": contact_src_ilk,
+            "contact_ich_id": contact_ich_id,
+            "conversation_external_id": conversation_external_id,
+            "thread_id": thread_id,
+            "dst_node": dst_node,
+            "trace_id": trace_id
+        })),
+        error_code: None,
+        error_message: None,
+        retryable: None,
+    });
+}
+
+fn normalize_conversation_payload(content: &Value) -> Result<Value, String> {
+    match content {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Err("conversation_message content must not be empty".to_string());
+            }
+            Ok(serde_json::json!({
+                "type": "text",
+                "content": trimmed
+            }))
+        }
+        Value::Object(map) if !map.is_empty() => Ok(Value::Object(map.clone())),
+        _ => Err(
+            "conversation_message content must be a non-empty string or a non-empty object"
+                .to_string(),
+        ),
     }
 }
 
@@ -1298,6 +1961,27 @@ fn identity_error_result(
         error_code: Some(error_code),
         error_message: Some(error_message),
         retryable: Some(retryable),
+    }
+}
+
+fn blocked_profile_result(
+    runtime: &AdapterRuntime,
+    request_id: &str,
+    event_id: &str,
+    error_code: &str,
+    error_message: &str,
+    retryable: Option<bool>,
+) -> ResponseItem {
+    ResponseItem::Result {
+        response_id: format!("resp:{request_id}:{event_id}:blocked_profile"),
+        adapter_id: runtime.adapter_id.clone(),
+        event_id: event_id.to_string(),
+        status: "error".to_string(),
+        result_type: "blocked_profile".to_string(),
+        payload: None,
+        error_code: Some(error_code.to_string()),
+        error_message: Some(error_message.to_string()),
+        retryable,
     }
 }
 

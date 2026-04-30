@@ -28,12 +28,12 @@
 - [x] Definir headers mínimos de autenticación por installation key
 - [x] Definir envelope mínimo para `heartbeat`
 - [x] Definir envelope mínimo para `profile_create`
-- [ ] Definir envelope mínimo para `conversation_message`
+- [x] Definir envelope mínimo para `conversation_message`
 - [x] Definir envelope mínimo para `ack`
 - [x] Definir envelope mínimo para `result`
 - [x] Definir envelope mínimo para `profile_ready`
-- [ ] Definir envelope mínimo para `automation_enabled`
-- [ ] Definir envelope mínimo para `automation_disabled`
+- [x] Definir envelope mínimo para `automation_enabled`
+- [x] Definir envelope mínimo para `automation_disabled`
 
 Nota:
 
@@ -54,18 +54,18 @@ Nota:
 Nota:
 
 - el skeleton actual compila y expone `GET /schema`, `POST /v1/poll` y control-plane básico;
-- por ahora el batch solo valida/authentica y responde `heartbeat` o `ack/result` mínimos;
-- todavía no hay lógica real de `profile_create`, `conversation_message`, monitoreo de SHM ni estado durable.
+- el batch ya autentica, procesa `profile_create`, procesa `conversation_message` y responde `heartbeat` / `ack` / `result`;
+- el monitoreo de SHM y la store durable ya existen en forma MVP.
 
 ---
 
 ## 4. Estado durable mínimo
 
 - [x] Persistir mapping `adapter_id ↔ installation key` o referencia equivalente
-- [ ] Persistir mapping `adapter ↔ profiles descubiertos`
-- [ ] Persistir mapping `external_profile_id ↔ ILK`
-- [ ] Persistir listado de ILKs provisorios pendientes
-- [ ] Persistir último estado observado por ICH propio
+- [x] Persistir mapping `adapter ↔ profiles descubiertos`
+- [x] Persistir mapping `external_profile_id ↔ ILK`
+- [x] Persistir listado de ILKs provisorios pendientes
+- [x] Persistir último estado observado por ICH propio
 - [x] Persistir cambios pendientes de entregar al adapter
 - [x] Persistir cola o reconstrucción de resultados por adapter
 
@@ -73,7 +73,7 @@ Nota:
 
 - el nodo ya persiste una store JSON durable propia con adapters sincronizados, referencia de installation key, metadata básica de poll y pending deliveries por adapter;
 - el poll/heartbeat ya drena pending deliveries desde esa store;
-- todavía no hay productores reales de profiles, ILKs provisorios ni estados de ICH.
+- el nodo ya produce y persiste estado real de profiles, ILKs observados y estados de ICH propios;
 - esta store local cumple para el MVP, pero no debe considerarse el destino final de producción;
 - queda asentado que a futuro habrá que migrar a una persistencia más robusta para estado operativo mutable, colas pendientes y updates frecuentes del canal.
 
@@ -82,61 +82,69 @@ Nota:
 ## 5. Flujo de `profile_create`
 
 - [x] Recibir y validar `profile_create`
-- [ ] Crear ILK provisorio tipo `agent`
+- [x] Crear ILK provisorio tipo `agent`
 - [x] Asociar el profile al tenant host/default
 - [x] Guardar el profile como pendiente de promoción
 - [x] No devolver el ILK provisorio al adapter
 - [x] Registrar `ack` y resultado pendiente cuando corresponda
 
-Nota importante:
-
-- el flujo actual ya hace lookup/provision y persiste el profile pendiente;
-- pero `ILK_PROVISION` en core hoy crea ILKs temporales con `ilk_type = "human"` hardcodeado;
-- por eso el ítem "Crear ILK provisorio tipo `agent`" sigue abierto y requiere definición/cambio de core o un camino alternativo explícito.
-
 ---
 
 ## 6. Monitoreo de promoción de ILK
 
-- [ ] Implementar observación de identity SHM para profiles pendientes
-- [ ] Detectar paso a estado utilizable/`complete`
-- [ ] Emitir `profile_ready` al adapter correcto
-- [ ] Limpiar el estado pendiente del profile promovido
+- [x] Implementar observación de identity SHM para profiles pendientes
+- [x] Detectar paso a estado utilizable/`complete`
+- [x] Emitir `profile_ready` al adapter correcto
+- [x] Limpiar el estado pendiente del profile promovido
+
+Nota:
+
+- en esta etapa el monitoreo de promoción corre de forma oportunista durante los polls/beacons del adapter;
+- no hay todavía watcher dedicado ni loop separado de observación continua.
 
 ---
 
 ## 7. Monitoreo de ICH propios
 
-- [ ] Definir cómo el nodo identifica cuáles ICHs considera propios
-- [ ] Observar cambios de estado de esos ICHs
-- [ ] Persistir el último estado relevante por ICH
-- [ ] Colapsar cambios pendientes por ICH al último estado relevante
-- [ ] Emitir `automation_enabled` al adapter correcto
-- [ ] Emitir `automation_disabled` al adapter correcto
+- [x] Definir cómo el nodo identifica cuáles ICHs considera propios
+- [x] Observar cambios de estado de esos ICHs
+- [x] Persistir el último estado relevante por ICH
+- [x] Colapsar cambios pendientes por ICH al último estado relevante
+- [x] Emitir `automation_enabled` al adapter correcto
+- [x] Emitir `automation_disabled` al adapter correcto
+
+Nota:
+
+- en esta etapa el nodo considera propios los ICHs asociados a profiles descubiertos y persistidos por `IO.linkedhelper`;
+- la observación también corre de forma oportunista durante los polls/beacons del adapter;
+- el colapso se hace por `ich_id`, manteniendo solo el último estado relevante pendiente.
 
 ---
 
 ## 8. Gating por profile
 
-- [ ] Bloquear `conversation_message` para profiles sin ILK utilizable
-- [ ] Bloquear `conversation_message` para ICH LH con automatización desactivada
-- [ ] Mantener el bloqueo por profile sin afectar a otros profiles
-- [ ] Devolver `blocked_profile` o error equivalente cuando corresponda
+- [x] Bloquear `conversation_message` para profiles sin ILK utilizable
+- [x] Bloquear `conversation_message` para ICH LH con automatización desactivada
+- [x] Mantener el bloqueo por profile sin afectar a otros profiles
+- [x] Devolver `blocked_profile` o error equivalente cuando corresponda
 
 ---
 
 ## 9. Flujo de `conversation_message`
 
-- [ ] Validar shape mínimo del evento
-- [ ] Resolver identidad mínima del contacto
-- [ ] Tratar `contact_external_composite_id` como `external_id` canónico opaco
-- [ ] Resolver routing interno a Fluxbee
-- [ ] Emitir el mensaje interno solo si el profile está habilitado
-- [ ] Devolver `conversation_processed` o error equivalente
+- [x] Validar shape mínimo del evento
+- [x] Resolver identidad mínima del contacto
+- [x] Tratar `contact_external_composite_id` como `external_id` canónico opaco
+- [x] Resolver routing interno a Fluxbee
+- [x] Emitir el mensaje interno solo si el profile está habilitado
+- [x] Devolver `conversation_processed` o error equivalente
 
 Nota MVP:
 
 - si falla la resolución mínima del contacto, el nodo devuelve error y no agrega waits complejos.
+- el contenido hoy acepta string no vacío como texto o un objeto no vacío como payload ya estructurado;
+- el routing interno exige `dst_node` configurado en el adapter;
+- el monitoreo de automatización sigue siendo oportunista por poll/beacon, así que el gating depende del último estado durable observado por el nodo.
 
 ---
 
@@ -150,11 +158,17 @@ Nota MVP:
 
 ## 11. Operación y observabilidad
 
-- [ ] Logging mínimo del canal
-- [ ] Logging de profiles provisorios/promovidos
-- [ ] Logging de cambios por ICH
+- [x] Logging mínimo del canal
+- [x] Logging de profiles provisorios/promovidos
+- [x] Logging de cambios por ICH
 - [ ] Logging de cola pendiente por adapter
 - [ ] Métricas mínimas del nodo si el patrón del repo lo justifica
+
+Nota:
+
+- la observabilidad actual es event-driven, no periódica por defecto;
+- los hitos operativos relevantes salen en `INFO` sin depender de configurar variables extra;
+- el detalle rutinario por poll quedó en `DEBUG` para evitar ruido en consola en una instalación normal.
 
 ---
 
