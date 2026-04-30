@@ -50,9 +50,9 @@ The root tenant (sponsor=NULL) is the infrastructure tenant. In self-hosted, it'
   - focused update path for sponsor only
   - accepts `null` to clear sponsorship
 - `TNT_LIST`
-  - lists known tenants with summary counts
+  - lists known tenants with summary counts and role hints
 - `TNT_GET`
-  - returns one tenant plus its resolved sponsor record when present
+  - returns one tenant plus its resolved sponsor record when present and child tenant summaries when it acts as sponsor
 
 At the admin surface these map to:
 
@@ -60,6 +60,19 @@ At the admin surface these map to:
 - `GET /hives/{hive}/identity/tenants/{tenant_id}`
 - `PUT /hives/{hive}/identity/tenants/{tenant_id}`
 - `POST /hives/{hive}/identity/tenants/{tenant_id}/sponsor`
+
+Read payload semantics:
+
+- `list_tenants`
+  - includes `sponsor_tenant_id`
+  - includes `child_count`
+  - includes `ilk_count`
+  - includes `is_root` (`sponsor_tenant_id = null`)
+  - includes `is_sponsor` (`child_count > 0`)
+- `get_tenant`
+  - includes the same summary booleans
+  - includes resolved `sponsor`
+  - includes `children` summaries when the tenant sponsors others
 
 ### 2.2 Rust struct changes
 
