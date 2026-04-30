@@ -24,7 +24,7 @@ No cubre todavía:
 - política final de retries/timeouts;
 - wire format alternativo;
 - detalle interno nodo ↔ router;
-- ni API final de config / status.
+- ni shape final de `get-config` / `set-config`.
 
 ---
 
@@ -51,9 +51,8 @@ Se prioriza:
 ## 2.3. Autenticación mínima
 Cada instalación del adapter tendrá una **installation key** única.
 
-## 2.4. Pendientes de seguridad
+## 2.4. Pendientes de seguridad reales
 Siguen abiertos:
-
 - almacenamiento local de la key;
 - rotación/revocación;
 - mecanismo exacto de autenticación HTTP;
@@ -106,7 +105,7 @@ También sirve para:
 ## 5.1. Batch por request
 Un request puede contener múltiples eventos de:
 
-- distintos avatares;
+- distintos profiles;
 - distintas cuentas;
 - distintos tipos de evento.
 
@@ -142,7 +141,7 @@ Fluxbee decide qué hacer con ellos según:
 - servicios internos.
 
 Ejemplos:
-- avatar detectado;
+- profile detectado;
 - mensaje conversacional;
 - alerta operativa.
 
@@ -153,63 +152,60 @@ Ejemplos:
 ## 7.1. `heartbeat`
 Sigue siendo un tipo conceptual válido a nivel mecanismo.
 
-## 7.2. `avatar_create`
+## 7.2. `profile_create`
 Sigue vigente, pero ahora su semántica es:
 
-- reportar descubrimiento del avatar;
+- reportar descubrimiento del profile;
 - permitir que el nodo cree el ILK provisorio;
 - sin habilitar todavía automatización en el adapter.
 
 ## 7.3. `conversation_message`
 Sigue vigente, con una restricción nueva:
-- no debe emitirse para un avatar sin ILK definitivo/utilizable y sin automatización LH habilitada por ICH.
+- no debe emitirse para un profile sin ILK definitivo/utilizable y sin automatización LH habilitada por ICH.
 
 ## 7.4. `system_alert`
 Sigue siendo relevante para estados y alertas no conversacionales del canal.
 
-## 7.5. Evento futuro: `avatar_update`
+## 7.5. Evento futuro: `profile_update`
 Se reconoce como posible evento futuro, pero no forma parte del mínimo v1.
 
 ---
 
-# 8. Gating por avatar
+# 8. Gating por profile
 
 ## 8.1. Principio general
-Existen bloqueos por avatar.
-Un avatar no bloquea a otro.
+Existen bloqueos por profile.
+Un profile no bloquea a otro.
 
-## 8.2. Casos claros hoy
-- avatar nuevo sin ILK definitivo;
-- avatar con ILK aún no `complete`;
+## 8.2. Casos claros ya definidos
+- profile nuevo sin ILK definitivo;
+- profile con ILK aún no `complete`;
 - ICH LH con automatización desactivada.
 
 ## 8.3. Consecuencia
-Mientras un avatar no esté listo:
-- el adapter no debe enviar mensajes conversacionales de ese avatar;
+Mientras un profile no esté listo:
+- el adapter no debe enviar mensajes conversacionales de ese profile;
 - el nodo no debe devolverle ILK provisorio;
 - y el canal queda en espera hasta promoción/habilitación.
-
-## 8.4. Pendiente
-Sigue abierto el catálogo exacto de eventos bloqueantes por avatar.
 
 ---
 
 # 9. Cambios de configuración devueltos por beacon
 
-## 9.1. Beacon como canal de configuración
+## 9.1. Beacon como canal de cambios incrementales
 Además de resultados, el beacon debe poder devolver al adapter:
 
-- ILK de avatar ya listo;
+- ILK de profile ya listo;
 - automatización LH habilitada/deshabilitada para un ICH;
-- otros cambios de configuración futuros del canal.
+- otros cambios incrementales relevantes para que el adapter siga operando.
 
 ## 9.2. Caso importante: ICH LH auto-detectado
 Los ICHs de Linked Helper auto-detectados nacen con automatización desactivada.
 Cuando ese flag cambia, el nodo debe devolvérselo al adapter por beacon.
 
 ## 9.3. Efecto en el adapter
-Cuando recibe automatización desactivada para el ICH LH de un avatar:
-- deja de buscar/reportar mensajes para IA de ese avatar;
+Cuando recibe automatización desactivada para el ICH LH de un profile:
+- deja de buscar/reportar mensajes para IA de ese profile;
 - puede seguir reportando estados, alertas y eventos no conversacionales.
 
 ## 9.4. Colapso de cambios por ICH
@@ -245,12 +241,13 @@ Se mantiene el modelo conceptual:
 ## 10.3. `heartbeat`
 Se usa cuando no hay nada más que devolver o como respuesta mínima a un poll vacío.
 
-## 10.4. Nuevos resultados especialmente relevantes
-Con el nuevo reparto aparecen como importantes, por ejemplo:
+## 10.4. Resultados del beacon ya encaminados
+Los casos más firmes hoy son:
 
-- avatar listo / ILK completo;
-- automatización LH habilitada/deshabilitada para un ICH;
-- errores de resolución/promoción.
+- `profile_ready`
+- `automation_enabled`
+- `automation_disabled`
+- errores de resolución/promoción
 
 ---
 
@@ -259,11 +256,11 @@ Con el nuevo reparto aparecen como importantes, por ejemplo:
 El nodo debería persistir de forma durable el estado mínimo de coordinación del canal, incluyendo al menos:
 
 - mapping `installation_id / adapter_id ↔ installation_key` o referencia equivalente;
-- mapping `installation_id ↔ avatares descubiertos`;
-- mapping `avatar externo ↔ ILK provisorio/definitivo`;
+- mapping `installation_id ↔ profiles descubiertos`;
+- mapping `external_profile_id ↔ ILK provisorio/definitivo`;
 - mapping `ILK/ICH ↔ installation_id`;
 - lista de ILKs provisorios pendientes de promoción;
-- estado conocido de automatización por ICH para LH;
+- último estado observado de automatización por ICH para LH;
 - cambios pendientes de entregar al adapter;
 - cola durable o reconstruible de resultados por adapter.
 
@@ -276,40 +273,47 @@ La persistencia no es solo para “no perder datos”, sino para poder:
 
 ---
 
-# 12. Config vs status/state (distinción conceptual)
+# 12. `get-config` / `set-config` (estado tentativo)
 
-## 12.1. Data plane
-El beacon/poll debe transportar:
-- eventos del adapter;
-- resultados;
-- y cambios incrementales relevantes para que el adapter siga operando.
+## 12.1. Estado actual
+Por ahora, `get-config` / `set-config` quedan **tentativos**.
+No se cierra todavía su shape final.
 
-## 12.2. Control plane
-La consulta administrativa del estado del nodo no debería mezclarse sin más con el beacon.
+## 12.2. Criterio tentativo acordado
+Si se avanza por ese camino:
 
-Hay dos necesidades distintas:
+- conviene no desviarlo demasiado de cómo se ve la config en otros nodos;
+- lo común del nodo debería mantenerse en primer nivel;
+- y lo específico de Linked Helper debería agregarse en keys/secciones propias.
+
+## 12.3. Distinción conceptual
+Aunque viajen por un mismo mecanismo, conviene distinguir internamente entre:
 
 ### Config propia del nodo
 Ejemplos:
 - puerto;
-- features del canal;
 - installation keys / adapters registrados;
-- límites o switches propios del nodo.
+- límites o switches del nodo.
 
 ### Estado / pending del canal
 Ejemplos:
 - ILKs provisorios pendientes;
-- ICHs LH deshabilitados;
-- mappings installation ↔ avatar ↔ ILK/ICH;
 - cambios pendientes.
 
-## 12.3. Pendiente
-Sigue abierto si esto se expondrá por:
-- `get config` / `set config`,
-- otro mecanismo de status/state,
-- o una combinación.
+## 12.4. Nota importante
+La exposición administrativa de:
+- ICHs habilitados/deshabilitados
+- e ILKs pendientes
 
-Pero conceptualmente conviene no mezclar “config del nodo” con “estado operativo multi-tenant del canal” sin distinguirlos.
+ya no se considera responsabilidad del nodo `IO.linkedhelper`.
+Eso debe quedar a cargo de identity/core a través de otros mecanismos.
+
+## 12.5. `set-config`
+Si se usara en una primera implementación:
+- debería seguir soportando el comportamiento común esperado para la config del nodo;
+- y podría aceptar una extensión acotada para cambios específicos del nodo.
+
+Pero esto sigue siendo tentativo y pendiente de definición con el resto del equipo.
 
 ---
 
@@ -325,21 +329,21 @@ Pero conceptualmente conviene no mezclar “config del nodo” con “estado ope
 - `error` como status de `result`
 
 ## 13.2. Cambia o se reencuadra
-- `avatar_create` ya no implica habilitación inmediata;
+- `profile_create` ya no implica habilitación inmediata;
 - `conversation_message` no sale hasta tener ILK definitivo y automatización habilitada;
-- el beacon ahora también transporta cambios de configuración;
+- el beacon ahora también transporta cambios incrementales de configuración;
 - el adapter ya no consume ILKs provisorios;
-- `avatar_update` sale del mínimo v1.
+- `profile_update` sale del mínimo v1;
+- `get-config` / `set-config` dejan de cargar responsabilidad sobre ICHs habilitados/deshabilitados e ILKs pendientes.
 
 ---
 
-# 14. Pendientes / cajas negras
+# 14. Pendientes / cajas negras reales
 
-## 14.1. `get config` / `set config`
+## 14.1. `get-config` / `set-config`
 No está definido:
-- si la habilitación/deshabilitación por ICH entra por `set config`;
-- si se ve por `get config`;
-- cómo listar ILKs/ICHs provisorios;
+- shape final;
+- si `set-config` tocará solo config común o también alguna extensión del nodo;
 - cuánto estado operativo conviene devolver desde ahí.
 
 ## 14.2. Payloads exactos
@@ -357,7 +361,7 @@ El canal `adapter ↔ IO.linkedhelper` queda actualmente modelado como:
 - HTTP/HTTPS;
 - instancia única del nodo en un puerto fijo a definir;
 - polling iniciado siempre por el adapter;
-- heartbeat como retiro de pendientes y canal de config;
+- heartbeat como retiro de pendientes y canal de cambios incrementales;
 - cola de resultados por adapter;
 - cambios de ICH colapsados por último estado;
 - estado durable mínimo del canal;

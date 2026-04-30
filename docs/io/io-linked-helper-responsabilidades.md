@@ -48,18 +48,18 @@ El adapter es el componente que:
 - se instala en la PC donde corre Linked Helper;
 - accede al mundo técnico de LH;
 - monitorea carpetas/instancias disponibles;
-- detecta nuevos avatares y eventos relevantes;
+- detecta nuevos profiles y eventos relevantes;
 - se comunica con `IO.linkedhelper`;
 - y ejecuta en LH las acciones que Fluxbee le devuelva.
 
 ## 3.2. Responsabilidades claras
 
-### A. Descubrimiento automático de instancias y avatares
+### A. Descubrimiento automático de instancias y profiles
 Debe poder:
 
 - monitorear las carpetas/instancias de Linked Helper;
 - detectar automáticamente nuevas instancias;
-- detectar nuevos avatares disponibles.
+- detectar nuevos profiles disponibles.
 
 ### B. Comunicación con el nodo
 Debe:
@@ -85,31 +85,40 @@ Queda del lado del adapter decidir, ante un resultado de error:
 - cuántas veces reintenta;
 - cuándo alerta.
 
+### E. Construcción de ids canónicos externos
+Debe construir y enviar al nodo los ids canónicos externos que el canal necesite para garantizar unicidad.
+
+En particular:
+
+- `external_profile_id` debe llegar ya resuelto por el adapter como identificador canónico del profile;
+- si para lograr unicidad el adapter necesita componerlo a partir de `adapter_id`, instancia de Linked Helper u otros componentes, esa composición pertenece al adapter;
+- el nodo no debería depender de conocer ni reconstruir esa composición interna.
+
 ## 3.3. Restricciones claras
 
-### A. No es dueño de la identidad definitiva del avatar
-Puede descubrir y reportar un avatar, pero no define su identidad final dentro de Fluxbee.
+### A. No es dueño de la identidad definitiva del profile
+Puede descubrir y reportar un profile, pero no define su identidad final dentro de Fluxbee.
 
-### B. No reporta mensajes ni automatización de un avatar sin ILK definitivo
-Cuando detecta un avatar nuevo:
+### B. No reporta mensajes ni automatización de un profile sin ILK definitivo
+Cuando detecta un profile nuevo:
 
 - lo reporta;
-- pero no reporta mensajes ni inicia automatización para ese avatar hasta recibir el ILK utilizable.
+- pero no reporta mensajes ni inicia automatización para ese profile hasta recibir el ILK utilizable.
 
 ### C. No recibe ni usa ILKs provisorios
-El adapter no debe recibir el ILK provisorio del avatar.
+El adapter no debe recibir el ILK provisorio del profile.
 
 ### D. La automatización se gobierna por ICH del canal LH
 Debe reaccionar a la habilitación/deshabilitación por ICH de Linked Helper, no por ILK global.
 
 ### E. Los ICHs LH auto-detectados nacen desactivados
-Por default, cuando se auto-detecta un avatar/canal LH, la automatización de ese ICH nace desactivada.
+Por default, cuando se auto-detecta un profile/canal LH, la automatización de ese ICH nace desactivada.
 
 ## 3.4. Efecto operativo de la automatización desactivada
 
-Cuando el adapter recibe que el ICH LH de un avatar tiene automatización desactivada:
+Cuando el adapter recibe que el ICH LH de un profile tiene automatización desactivada:
 
-- deja de buscar/reportar mensajes para IA de ese avatar;
+- deja de buscar/reportar mensajes para IA de ese profile;
 - pero puede seguir reportando estados, alertas y eventos no conversacionales.
 
 ---
@@ -133,8 +142,8 @@ El nodo `IO.linkedhelper`:
 ### A. Recepción y validación inicial
 Recibir y validar mínimamente los eventos enviados por el adapter.
 
-### B. Creación de ILK provisorio para avatares nuevos
-Cuando detecta un avatar nuevo:
+### B. Creación de ILK provisorio para profiles nuevos
+Cuando detecta un profile nuevo:
 
 - registra un ILK de tipo `agent`;
 - en estado no `complete`;
@@ -155,9 +164,9 @@ Cuando detecta que el ILK está listo, lo devuelve al adapter mediante beacon/po
 ### G. Cola de resultados por adapter
 Debe mantener una cola o conjunto de resultados pendientes por adapter.
 
-### H. Gating por avatar
-Debe impedir que un avatar no listo avance a automatización.
-El bloqueo es por avatar; un avatar no bloquea a otro.
+### H. Gating por profile
+Debe impedir que un profile no listo avance a automatización.
+El bloqueo es por profile; un profile no bloquea a otro.
 
 ### I. Cambios de configuración por ICH
 Debe poder devolver al adapter cambios como:
@@ -175,11 +184,15 @@ Si existe ya un cambio pendiente para un ICH y luego ocurre un nuevo cambio del 
 
 El nodo sí debería monitorear:
 
-- estado de avatares provisorios/listos;
-- estado de ICHs auto-detectados;
+- estado de profiles provisorios/listos;
+- estado de sus ICHs propios;
 - cambios de automatización por ICH;
 - resultados pendientes por adapter;
 - cambios de identidad necesarios para liberar el canal.
+
+### Importante
+Este monitoreo de estados de ICH propios no es una rareza específica de Linked Helper.
+Se considera una responsabilidad generalizable para nodos IO: cada nodo IO debería poder observar los estados de sus propios ICHs y reaccionar operativamente a cambios relevantes.
 
 ## 4.4. Qué no debería absorber el nodo
 
@@ -189,15 +202,16 @@ No debería centralizar:
 - alertado operacional complejo;
 - reintentos prolongados configurables;
 - workflows generales de recuperación;
-- decisiones de negocio posteriores a un error.
+- decisiones de negocio posteriores a un error;
+- exposición administrativa de ICHs habilitados/deshabilitados o ILKs pendientes, cuando esa responsabilidad quede del lado de identity/core.
 
 ## 4.5. Persistencia durable mínima
 
 El nodo debería persistir de forma durable, como mínimo:
 
-- mappings installation/adapter ↔ avatar ↔ ILK/ICH;
+- mappings installation/adapter ↔ profile ↔ ILK/ICH;
 - ILKs provisorios pendientes;
-- estado de automatización por ICH para LH;
+- último estado observado de automatización por ICH para LH;
 - cambios pendientes de entregar al adapter;
 - cola o reconstrucción de resultados por adapter.
 
@@ -212,7 +226,7 @@ Esto es necesario no solo para no perder seguimiento, sino para poder responderl
 Fluxbee/core queda como responsable de:
 
 - sostener la fuente de verdad de identidad;
-- completar datos faltantes del avatar;
+- completar datos faltantes del profile;
 - promover ILKs provisorios a completos/utilizables;
 - administrar configuración por ICH;
 - y ejecutar routing/AI/workflows del sistema.
@@ -222,7 +236,7 @@ Fluxbee/core queda como responsable de:
 ### A. Fuente de verdad de identidad
 Los ILKs y la verdad canónica viven dentro de Fluxbee/core.
 
-### B. Completar los datos faltantes del avatar
+### B. Completar los datos faltantes del profile
 Debe completar o confirmar, según corresponda:
 
 - tenant representado;
@@ -232,33 +246,41 @@ Debe completar o confirmar, según corresponda:
 - rol/capacidades;
 - prompting/configuración futura.
 
-### C. Promoción del ILK de avatar
+### C. Promoción del ILK de profile
 Debe promover el ILK desde estado provisorio a completo/utilizable.
 
 ### D. Configuración por ICH
 Debe permitir habilitar/deshabilitar automatización por ICH.
 
+### E. Exposición administrativa
+La exposición administrativa de:
+- ICHs habilitados/deshabilitados
+- ILKs pendientes
+- y otros estados de identity
+
+ya no se considera responsabilidad del nodo `IO.linkedhelper`, sino de identity/core y de los mecanismos que defina ese equipo.
+
 ---
 
 # 6. Invariantes claros
 
-1. Un avatar puede existir dentro de Fluxbee en estado provisorio.
+1. Un profile puede existir dentro de Fluxbee en estado provisorio.
 2. El adapter no recibe ni usa el ILK provisorio.
-3. El adapter no automatiza hasta recibir confirmación de avatar listo.
+3. El adapter no automatiza hasta recibir confirmación de profile listo.
 4. La automatización se gobierna por ICH del canal LH.
 5. Los ICHs LH auto-detectados nacen con automatización desactivada.
-6. Un avatar no bloquea a otro.
+6. Un profile no bloquea a otro.
 7. El nodo mantiene la cola de resultados por adapter.
-8. El nodo detecta la promoción del avatar observando identity SHM.
+8. El nodo detecta la promoción del profile observando identity SHM.
 9. El tenant host no equivale necesariamente al tenant representado.
 10. Los cambios pendientes por ICH deben llegar al adapter correcto.
 11. Para cambios de ICH, debe prevalecer el último estado relevante.
 
 ---
 
-# 7. Cajas negras / pendientes
+# 7. Cajas negras / pendientes reales
 
-## 7.1. Promoción del avatar
+## 7.1. Promoción del profile
 No está definido:
 
 - qué componente exacto la dispara;
@@ -266,20 +288,14 @@ No está definido:
 - qué intervención humana ocurre exactamente;
 - cómo se resuelve internamente el tenant representado.
 
-## 7.2. `get config` / `set config`
+## 7.2. `get-config` / `set-config`
 Queda abierto:
 
-- si la habilitación/deshabilitación por ICH entra por `set config`;
-- si se ve por `get config`;
-- cómo extender estos mecanismos sin deformar el modelo actual.
+- si finalmente se usan y para qué config propia del nodo;
+- cómo se extienden sin deformar el modelo actual;
+- y cuál será su shape final.
 
-## 7.3. Listado de ILKs/ICHs provisorios pendientes
-No está definido cómo listar:
-- ILKs provisorios;
-- ICHs pendientes de confirmación;
-- estados de espera relacionados.
-
-## 7.4. SDK
+## 7.3. SDK
 No está claro si habrá que tocar el SDK para soportar estos estados/datos extra.
 
 ---
@@ -298,15 +314,17 @@ Ve y ejecuta:
 Coordina y traduce:
 - registra provisorios;
 - observa identity;
+- monitorea ILKs pendientes y estados de sus ICHs propios;
 - mantiene cola;
-- libera/bloquea por avatar;
+- libera/bloquea por profile;
 - registra cambios pendientes por ICH;
 - devuelve resultados/config al adapter correcto.
 
 ## Core
 Completa y promueve:
-- mantiene identidad;
+- mantiene identity;
 - completa datos;
 - promueve ILKs;
 - gobierna configuración por ICH;
+- expone administrativamente el estado de ICHs/ILKs por mecanismos propios;
 - ejecuta routing/AI/workflows.

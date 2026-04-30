@@ -43,6 +43,8 @@ Nota operativa vigente para frontdesk:
 - el prompt funcional base del runtime no debería depender de que el operador lo cargue por `CONFIG_SET`.
 - la key de provider puede seguir entrando temporalmente por `CONFIG_SET` y persistirse en `secrets.json` mientras `CORE` define el modelo final para secretos de un AI de sistema crítico.
 - si el servicio observado usa `ExecStart=/usr/bin/sy-frontdesk-gov`, `publish + SYSTEM_UPDATE + restart` no alcanza por sí solo para cambiar el binario efectivo; primero hay que instalar el binario actualizado en `/usr/bin/sy-frontdesk-gov` o ejecutar el camino equivalente de `scripts/install.sh`.
+- el host debe restaurar `sy-frontdesk-gov` solo despues de que `rt-gateway` y `SY.identity@<hive>` esten realmente listos; unidad activa no alcanza como señal de readiness.
+- incluso con ese orden operativo corregido, sigue pendiente endurecer `SY.frontdesk.gov` internamente con retry corto/backoff frente a errores transitorios de identity (`UNREACHABLE`, `TIMEOUT`, `NOT_PRIMARY`, etc.).
 
 ---
 
@@ -105,6 +107,7 @@ bash scripts/install.sh
 ```
 
 Ese camino tambien actualiza `dist/core/bin` y puede reiniciar otros servicios del core, por lo que debe tratarse como una operacion mas amplia que el update puntual de frontdesk.
+Ademas, para frontdesk el install debe entenderse como restore ordenado de dependencias: `rt-gateway` -> `sy-identity` -> `sy-frontdesk-gov`, con espera de readiness real de identity antes de restaurar frontdesk.
 
 ---
 
