@@ -19,13 +19,13 @@ use crate::nats::{
 };
 use crate::opa::OpaResolver;
 use crate::shm::{
-    copy_bytes_with_len, memory_shm_name_for_hive, now_epoch_ms, ConfigRegionReader,
-    ConfigSnapshot, IdentityRegionReader, LsaRegionReader, LsaRegionWriter, LsaSnapshot,
-    MemoryRegionReader, MemoryShmSnapshot, OpaRegionReader, OpaSnapshot, RemoteHiveEntry,
-    RemoteNodeEntry, RemoteRouteEntry, RemoteVpnEntry, RouterRegionReader, RouterRegionWriter,
-    VpnAssignment, ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE,
-    HEARTBEAT_STALE_MS, HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR,
-    OPA_STATUS_LOADING,
+    copy_bytes_with_len, memory_shm_name_for_hive, now_epoch_ms, sha256_bytes_is_zero,
+    sha256_bytes_to_hex, ConfigRegionReader, ConfigSnapshot, IdentityRegionReader, LsaRegionReader,
+    LsaRegionWriter, LsaSnapshot, MemoryRegionReader, MemoryShmSnapshot, OpaRegionReader,
+    OpaSnapshot, RemoteHiveEntry, RemoteNodeEntry, RemoteRouteEntry, RemoteVpnEntry,
+    RouterRegionReader, RouterRegionWriter, VpnAssignment, ACTION_DROP, ACTION_FORWARD,
+    FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS, HIVE_FLAG_SELF, MATCH_EXACT,
+    MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING,
 };
 use fluxbee_sdk::classify_routed_message;
 use fluxbee_sdk::protocol::{
@@ -4144,8 +4144,9 @@ fn inject_identity_data(root: &mut serde_json::Value, snapshot: &crate::shm::Ide
             "ilk_type": ilk_type,
             "registration_status": registration_status,
             "handler_node": handler_node,
-            "roles": [],
-            "capabilities": []
+            "role_hash": role_hash_value(&ilk.role_hash),
+            "skill_hashes": skill_hashes_value(&ilk.skill_hashes, ilk.skill_count as usize),
+            "handbook_hashes": handbook_hashes_value(&ilk.handbook_hashes, ilk.handbook_count as usize)
         });
         identity_obj.insert(ilk_id, payload);
     }
@@ -4182,6 +4183,32 @@ fn build_dynamic_identity_opa_data(snapshot: &crate::shm::IdentitySnapshot) -> s
 fn fixed_str(buf: &[u8]) -> String {
     let len = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..len]).trim().to_string()
+}
+
+fn role_hash_value(hash: &[u8; 32]) -> serde_json::Value {
+    if sha256_bytes_is_zero(hash) {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(sha256_bytes_to_hex(hash))
+    }
+}
+
+fn skill_hashes_value(hashes: &[[u8; 32]], count: usize) -> serde_json::Value {
+    definition_hashes_value(hashes, count)
+}
+
+fn handbook_hashes_value(hashes: &[[u8; 32]], count: usize) -> serde_json::Value {
+    definition_hashes_value(hashes, count)
+}
+
+fn definition_hashes_value(hashes: &[[u8; 32]], count: usize) -> serde_json::Value {
+    let count = usize::min(count, hashes.len());
+    serde_json::Value::Array(
+        hashes[..count]
+            .iter()
+            .map(|hash| serde_json::Value::String(sha256_bytes_to_hex(hash)))
+            .collect(),
+    )
 }
 
 fn format_prefixed_uuid(prefix: &str, bytes: &[u8; 16]) -> String {
@@ -5164,6 +5191,11 @@ mod tests {
         let canonical_ilk_id = Uuid::new_v4();
         let old_ilk_id = Uuid::new_v4();
 
+        let mut skill_hashes = [[0u8; 32]; IDENTITY_DEFINITION_MAX_SKILLS];
+        skill_hashes[0] = [0xcd; 32];
+        skill_hashes[1] = [0xef; 32];
+        let mut handbook_hashes = [[0u8; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS];
+        handbook_hashes[0] = [0x12; 32];
         let mut ilk = IlkEntry {
             ilk_id: *ilk_id.as_bytes(),
             ilk_type: 1,
@@ -5175,11 +5207,11 @@ mod tests {
             ich_offset: 0,
             ich_count: 0,
             _pad0: [0u8; 2],
-            role_hash: [0u8; 32],
-            skill_hashes: [[0u8; 32]; IDENTITY_DEFINITION_MAX_SKILLS],
-            skill_count: 0,
-            handbook_count: 0,
-            handbook_hashes: [[0u8; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
+            role_hash: [0xab; 32],
+            skill_hashes,
+            skill_count: 2,
+            handbook_count: 1,
+            handbook_hashes,
             created_at: now,
             updated_at: now,
             _reserved: [0u8; 8],
@@ -5248,6 +5280,43 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("SY.frontdesk.gov@sandbox")
         );
+        let expected_role_hash = "ab".repeat(32);
+        let expected_skill_hash_a = "cd".repeat(32);
+        let expected_skill_hash_b = "ef".repeat(32);
+        let expected_handbook_hash = "12".repeat(32);
+        assert_eq!(
+            record.get("role_hash").and_then(serde_json::Value::as_str),
+            Some(expected_role_hash.as_str())
+        );
+        assert_eq!(
+            record
+                .get("skill_hashes")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                }),
+            Some(vec![
+                expected_skill_hash_a.as_str(),
+                expected_skill_hash_b.as_str()
+            ])
+        );
+        assert_eq!(
+            record
+                .get("handbook_hashes")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                }),
+            Some(vec![expected_handbook_hash.as_str()])
+        );
+        assert!(record.get("roles").is_none());
+        assert!(record.get("capabilities").is_none());
 
         let aliases = root
             .get("identity_aliases")

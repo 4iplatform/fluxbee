@@ -52,10 +52,10 @@
 
 ## Phase D - Router / OPA Projection
 
-- [ ] D1. Extend router `data.identity` injection with `role_hash`, `skill_hashes`, and `handbook_hashes`.
-- [ ] D2. Remove always-empty `roles` / `capabilities` projection.
-- [ ] D3. Add router tests proving OPA-visible identity contains hash facts.
-- [ ] D4. Document that OPA matches hashes only and never reads blob assets.
+- [x] D1. Extend router `data.identity` injection with `role_hash`, `skill_hashes`, and `handbook_hashes`.
+- [x] D2. Remove always-empty `roles` / `capabilities` projection.
+- [x] D3. Add router tests proving OPA-visible identity contains hash facts.
+- [x] D4. Document that OPA matches hashes only and never reads blob assets.
 
 ## Phase E - Admin / SDK Surface
 
