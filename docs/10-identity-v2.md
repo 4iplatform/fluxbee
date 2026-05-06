@@ -5,6 +5,8 @@
 **Audience:** All developers (IO, AI, WF, SY, router, OPA)
 **Replaces:** `10-identity-layer3.md` (v1.15)
 
+> **2026-05-06 update:** Agent identity definition is being consolidated by `identity-v2.1-agent-definition-addendum.md`. The older `roles/capabilities/degrees` model in this document is superseded for AI agents by hash-based role/skill/handbook references stored in `identity_ilks.definition` and projected through SHM/router. Treat examples that route by `data.identity[ilk].capabilities` as historical design notes until this document is fully rewritten.
+
 ---
 
 ## 1. Purpose
@@ -21,8 +23,8 @@ SY.identity does NOT handle:
 
 - Authentication (edge/IO responsibility).
 - Routing permissions (OPA responsibility).
-- Knowledge module management, degree compilation, or graduation lifecycle (deferred to a future SY service). Identity only stores degree data as opaque metadata written by external services via ILK_UPDATE.
-- Cognitive data (SY.cognition responsibility).
+- Knowledge module management, degree compilation, or graduation lifecycle from the older v2 degree model.
+- Asset content for agent cognitive definitions. Identity stores hash references only; Archi owns asset generation/catalog and `ai.generic` owns prompt composition.
 
 ---
 
@@ -174,9 +176,23 @@ Data that uniquely distinguishes the entity. Varies by type.
 }
 ```
 
-### 4.3 Definition — what it can do (with history)
+### 4.3 Definition — cognitive references
 
-Roles and capabilities are controlled vocabulary: lowercase English strings, managed by SY.admin, validated by SY.identity at write time. No free-form strings allowed.
+The earlier roles/capabilities/degrees model below is superseded for AI agents by the v2.1 addendum.
+
+For `ilk_type="agent"`, `definition` now means hash references to cognitive assets:
+
+```json
+{
+  "role_hash": "64hex...",
+  "skill_hashes": ["64hex..."],
+  "handbook_hashes": ["64hex..."]
+}
+```
+
+The referenced JSON assets live in blob under `agent-assets/<hash>.json`. Identity stores hashes only. `ai.generic` resolves the assets and composes the active prompt. OPA can route by hashes after router projection, but it does not read blob content.
+
+Historical v2 shape, retained here only for context:
 
 ```json
 {
@@ -206,14 +222,10 @@ Roles and capabilities are controlled vocabulary: lowercase English strings, man
 }
 ```
 
-**Rules:**
+**Historical rules:**
 
-- `current` reflects the active state.
-- `history` is append-only — every change to roles, capabilities, or degrees generates a snapshot entry with `change_reason`.
-- Roles and capabilities can be added and removed from `current`; history tracks the CV.
-- For agents, capabilities are assigned by the system at spawn time.
-- For humans, the AI.frontdesk assigns tags from the controlled vocabulary based on the registration process.
-- Degrees are opaque metadata: identity stores and propagates them but does not compile, verify, or manage their lifecycle. A future SY service will own degree management and write degree data via ILK_UPDATE.
+- This shape is not the forward contract for AI agents.
+- New implementation should use `ILK_SET_DEFINITION` and hash references.
 
 ### 4.4 Complete ILK Document
 
@@ -779,8 +791,10 @@ OPA loads the identity region as `data.identity` for routing rules. Keys are the
 # Derive tenant from src_ilk
 tenant := data.identity[input.meta.src_ilk].tenant_id
 
-# Check capabilities
-data.identity[ilk].capabilities
+# Check cognitive hashes for agent routing
+data.identity[ilk].role_hash
+data.identity[ilk].skill_hashes
+data.identity[ilk].handbook_hashes
 
 # Check registration status
 data.identity[ilk].registration_status
@@ -1110,21 +1124,17 @@ target = "AI.support.l1@production" {
     tenant == "tnt:uuid-acme"
 }
 
-# Route by capability
+# Route by configured skill hash
 target = node {
-    required := input.meta.context.required_capability
+    required_hash := input.meta.context.required_skill_hash
     some ilk
     data.identity[ilk].ilk_type == "agent"
-    required in data.identity[ilk].capabilities
+    required_hash in data.identity[ilk].skill_hashes
     node := data.identity[ilk].handler_node
 }
 
-# Authorization: only registrars can register (defense in depth, SY.identity also enforces)
-allow {
-    input.meta.msg == "ILK_REGISTER"
-    ilk := input.meta.src_ilk
-    "registration" in data.identity[ilk].capabilities
-}
+# Authorization remains explicit policy plus SY.identity source enforcement.
+# Do not use legacy capabilities for identity-system authorization.
 ```
 
 ---

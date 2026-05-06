@@ -389,6 +389,7 @@ Use the identity tenant read surface first:
 Rules:
 - use `list_tenants` to discover candidate root/default tenants, sponsors, or client tenants
 - use `get_tenant` when one exact tenant id is already known or when you need the resolved sponsor record
+- in tenant reads, treat `is_root=true` as the native/root tenant and `is_sponsor=true` as a tenant that currently sponsors child tenants
 - if the task says "same tenant as an existing node", prefer reading the node config/live config to find the exact `tenant_id`, then validate that tenant with `get_tenant`
 - if no reliable tenant can be found, block and ask for exactly one missing tenant clarification
 

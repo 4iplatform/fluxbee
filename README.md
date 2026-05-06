@@ -983,6 +983,10 @@ Notes:
 - Drift alert history responses may include `hive_present` and `synthetic` markers when a local `motherbee` current-state snapshot is synthesized for history continuity.
 - For `motherbee`, hive-scoped deployment history may include synthesized local-current-state entries when no older history was recorded with `motherbee` as explicit deployment target.
 - For identity-aware first spawn, discover or verify `tenant_id` through `/hives/{hive}/identity/tenants` and `/hives/{hive}/identity/tenants/{tenant_id}` instead of inferring it from inventory alone.
+- Tenant reads expose role hints:
+  - `is_root=true` means root/default tenant for that hive
+  - `is_sponsor=true` means the tenant currently sponsors child tenants
+  - `child_count` and `children` help distinguish sponsor/admin tenants from ordinary client tenants
 
 ---
 

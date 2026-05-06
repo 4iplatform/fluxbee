@@ -4,6 +4,8 @@
 **Date:** 2026-04-12  
 **Audience:** IO, AI, WF node developers, L3 routing
 
+> **Superseded note (2026-05-06):** This document contains an older modules/degrees/capabilities identity model. For current AI agent cognitive definition work, use `identity-v2.1-agent-definition-addendum.md`. The forward model stores role/skill/handbook hashes in identity, projects those hashes through SHM/router, and lets `ai.generic` compose prompts from blob assets. Examples below that route by `data.identity[ilk].capabilities` are historical.
+
 ---
 
 ## 1. The Three Routing Layers
@@ -875,14 +877,14 @@ target = node {
     node := handler
 }
 
-# ACME: Route based on required capability
+# ACME: Route based on configured skill hash
 target = node {
     tenant := get_tenant(input.meta.src_ilk)
     tenant == "ilk:tenant-acme"
-    required := input.meta.context.required_capability
+    required_hash := input.meta.context.required_skill_hash
     some ilk
     data.identity[ilk].type == "agent"
-    required in data.identity[ilk].capabilities
+    required_hash in data.identity[ilk].skill_hashes
     node := data.identity[ilk].handler_node
 }
 

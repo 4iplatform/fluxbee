@@ -416,6 +416,39 @@ struct IdentityDeltaEnvelope {
 }
 
 impl IdentityStore {
+    fn tenant_child_count(&self, tenant_id: &str) -> usize {
+        self.tenants
+            .values()
+            .filter(|entry| entry.sponsor_tenant_id.as_deref() == Some(tenant_id))
+            .count()
+    }
+
+    fn tenant_ilk_count(&self, tenant_id: &str) -> usize {
+        self.ilks
+            .values()
+            .filter(|ilk| ilk.deleted_at_ms.is_none() && ilk.tenant_id == tenant_id)
+            .count()
+    }
+
+    fn tenant_summary_value(&self, tenant: &TenantRecord) -> Value {
+        let child_count = self.tenant_child_count(&tenant.tenant_id);
+        let ilk_count = self.tenant_ilk_count(&tenant.tenant_id);
+        let is_root = tenant.sponsor_tenant_id.is_none();
+        let is_sponsor = child_count > 0;
+        json!({
+            "tenant_id": tenant.tenant_id,
+            "name": tenant.name,
+            "domain": tenant.domain,
+            "status": tenant.status,
+            "settings": tenant.settings,
+            "sponsor_tenant_id": tenant.sponsor_tenant_id,
+            "child_count": child_count,
+            "ilk_count": ilk_count,
+            "is_root": is_root,
+            "is_sponsor": is_sponsor,
+        })
+    }
+
     fn find_tenant_by_hint(
         &self,
         name: &str,
@@ -556,16 +589,21 @@ impl IdentityStore {
             .sponsor_tenant_id
             .as_ref()
             .and_then(|sponsor_id| self.tenants.get(sponsor_id).cloned());
-        let child_count = self
+        let child_count = self.tenant_child_count(tenant_id);
+        let ilk_count = self.tenant_ilk_count(tenant_id);
+        let is_root = tenant.sponsor_tenant_id.is_none();
+        let is_sponsor = child_count > 0;
+        let mut child_tenants: Vec<TenantRecord> = self
             .tenants
             .values()
             .filter(|entry| entry.sponsor_tenant_id.as_deref() == Some(tenant_id))
-            .count();
-        let ilk_count = self
-            .ilks
-            .values()
-            .filter(|ilk| ilk.deleted_at_ms.is_none() && ilk.tenant_id == tenant_id)
-            .count();
+            .cloned()
+            .collect();
+        child_tenants.sort_by(|a, b| a.tenant_id.cmp(&b.tenant_id));
+        let children: Vec<Value> = child_tenants
+            .iter()
+            .map(|entry| self.tenant_summary_value(entry))
+            .collect();
 
         Ok(json!({
             "status": "ok",
@@ -574,6 +612,9 @@ impl IdentityStore {
             "sponsor": sponsor,
             "child_count": child_count,
             "ilk_count": ilk_count,
+            "is_root": is_root,
+            "is_sponsor": is_sponsor,
+            "children": children,
         }))
     }
 
@@ -585,28 +626,7 @@ impl IdentityStore {
             .into_iter()
             .filter_map(|tenant_id| {
                 let tenant = self.tenants.get(tenant_id)?;
-                let child_count = self
-                    .tenants
-                    .values()
-                    .filter(|entry| {
-                        entry.sponsor_tenant_id.as_deref() == Some(tenant.tenant_id.as_str())
-                    })
-                    .count();
-                let ilk_count = self
-                    .ilks
-                    .values()
-                    .filter(|ilk| ilk.deleted_at_ms.is_none() && ilk.tenant_id == tenant.tenant_id)
-                    .count();
-                Some(json!({
-                    "tenant_id": tenant.tenant_id,
-                    "name": tenant.name,
-                    "domain": tenant.domain,
-                    "status": tenant.status,
-                    "settings": tenant.settings,
-                    "sponsor_tenant_id": tenant.sponsor_tenant_id,
-                    "child_count": child_count,
-                    "ilk_count": ilk_count,
-                }))
+                Some(self.tenant_summary_value(tenant))
             })
             .collect();
 
@@ -5057,6 +5077,18 @@ mod tests {
         );
         assert_eq!(payload.get("child_count").and_then(Value::as_u64), Some(0));
         assert_eq!(payload.get("ilk_count").and_then(Value::as_u64), Some(1));
+        assert_eq!(payload.get("is_root").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            payload.get("is_sponsor").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            payload
+                .get("children")
+                .and_then(Value::as_array)
+                .map(|items| items.len()),
+            Some(0)
+        );
         assert_eq!(
             payload
                 .get("sponsor")
@@ -5107,8 +5139,20 @@ mod tests {
             Some(1)
         );
         assert_eq!(
+            tenants[0].get("is_root").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            tenants[0].get("is_sponsor").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
             tenants[1].get("tenant_id").and_then(Value::as_str),
             Some("tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        );
+        assert_eq!(
+            tenants[1].get("is_root").and_then(Value::as_bool),
+            Some(false)
         );
     }
 

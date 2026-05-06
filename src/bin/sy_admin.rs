@@ -7543,12 +7543,13 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "list_tenants" => vec![
             "Lists the identity tenants currently known by SY.identity for one hive.",
             "Use this when you need to discover root/default tenants, candidate sponsors, or tenant ids before spawning identity-aware software.",
-            "This returns tenant summaries only; use get_tenant for one specific tenant and its sponsor details.",
+            "This returns tenant summaries including sponsor_tenant_id, child_count, ilk_count, is_root, and is_sponsor.",
+            "Use get_tenant for one specific tenant, its resolved sponsor record, and its child tenant summaries.",
         ],
         "get_tenant" => vec![
             "The hive target comes from the /hives/{hive} path in HTTP.",
             "The tenant_id path segment must use the prefixed UUID format tnt:<uuid>.",
-            "This lookup returns the tenant plus its resolved sponsor record when one exists.",
+            "This lookup returns the tenant plus its resolved sponsor record when one exists, and child tenant summaries when this tenant sponsors others.",
             "Use this before set_tenant_sponsor or run_node when you need the exact tenant association already used by another node.",
         ],
         "update_tenant" => vec![

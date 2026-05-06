@@ -10,8 +10,6 @@ INSTALL_OWNER="${INSTALL_OWNER:-${SUDO_USER:-$USER}}"
 RESTART_ORCHESTRATOR_AFTER_INSTALL="${RESTART_ORCHESTRATOR_AFTER_INSTALL:-1}"
 CLEAN_RUNTIME_VOLATILE_ON_INSTALL="${CLEAN_RUNTIME_VOLATILE_ON_INSTALL:-1}"
 SEED_RUNTIME_FIXTURE="${SEED_RUNTIME_FIXTURE:-0}"
-SEED_AI_COMMON_RUNTIME="${SEED_AI_COMMON_RUNTIME:-1}"
-AI_COMMON_RUNTIME_VERSION="${AI_COMMON_RUNTIME_VERSION:-0.1.0}"
 RESEED_SYNCTHING_CONFIG_ON_INSTALL="${RESEED_SYNCTHING_CONFIG_ON_INSTALL:-0}"
 RUNTIME_FIXTURE_NAME="${RUNTIME_FIXTURE_NAME:-wf.orch.diag}"
 RUNTIME_FIXTURE_VERSION="${RUNTIME_FIXTURE_VERSION:-0.0.1}"
@@ -783,24 +781,6 @@ EOF
   echo "Seeded managed Syncthing config at $STATE_DIR/syncthing/config.xml"
 else
   echo "Preserving existing managed Syncthing config at $STATE_DIR/syncthing/config.xml"
-fi
-
-if [[ "$SEED_AI_COMMON_RUNTIME" == "1" ]]; then
-  ai_node_runner_bin="$BIN_DIR/ai_node_runner"
-  if [[ -x "$ai_node_runner_bin" ]]; then
-    echo "Seeding ai.common runtime v${AI_COMMON_RUNTIME_VERSION} into $STATE_DIR/dist/runtimes..."
-    bash "$ROOT_DIR/scripts/publish-ia-runtime.sh" \
-      --runtime "ai.common" \
-      --version "$AI_COMMON_RUNTIME_VERSION" \
-      --binary "$ai_node_runner_bin" \
-      --dist-root "$STATE_DIR/dist" \
-      --set-current \
-      --skip-build \
-      --sudo
-    echo "ai.common runtime seeded."
-  else
-    echo "Warning: ai_node_runner binary not found at $ai_node_runner_bin; skipping ai.common seed." >&2
-  fi
 fi
 
 if [[ "$SEED_RUNTIME_FIXTURE" == "1" ]]; then
