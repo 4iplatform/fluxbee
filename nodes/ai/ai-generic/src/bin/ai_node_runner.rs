@@ -21,6 +21,7 @@ use fluxbee_ai_sdk::{
     ModelSettings, NodeRuntime, OpenAiResponsesClient, ResolvedModelInput, RetryPolicy,
     RouterClient, RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,
 };
+use fluxbee_sdk::identity::{find_ilk_by_handler_node_from_hive_config, IdentityIlkOption};
 use fluxbee_sdk::node_client::NodeError;
 use fluxbee_sdk::protocol::{
     Destination, MemoryPackage, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
@@ -50,6 +51,21 @@ const GOV_IDENTITY_TIMEOUT_MS_ENV: &str = "GOV_IDENTITY_TIMEOUT_MS";
 const GOV_IDENTITY_TENANT_ID_ENV: &str = "GOV_IDENTITY_TENANT_ID";
 const IMMEDIATE_INTERACTION_MAX_CHARS: usize = 1_200;
 const AI_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
+const AI_RUNTIME_KIND: &str = "ai.generic";
+const DEFAULT_AGENT_ASSET_BLOB_ROOT: &str = "/var/lib/fluxbee/blob";
+const AGENT_ASSET_MAX_BYTES: u64 = 256 * 1024;
+const COMPOSED_PROMPT_MAX_BYTES: usize = 64 * 1024;
+const DEFAULT_COGNITIVE_POLL_INTERVAL_SECS: u64 = 10;
+const DEFAULT_UNCONFIGURED_AGENT_PROMPT: &str = r#"You are an AI agent that has not yet received its operational configuration.
+
+If you receive a message, respond with this exact structure:
+{
+  "status": "unconfigured",
+  "message": "This agent has not been configured yet. Please contact the system administrator to assign a role, skills, and handbooks."
+}
+
+Do not interpret messages beyond confirming receipt.
+Do not perform any action."#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenAiApiKeySource {
@@ -109,6 +125,8 @@ struct RuntimeSection {
     metrics_log_interval_ms: u64,
     #[serde(default)]
     immediate_memory: ImmediateMemorySection,
+    #[serde(default)]
+    cognitive_definition: CognitiveDefinitionSection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +138,15 @@ struct ImmediateMemorySection {
     summary_max_chars: usize,
     summary_refresh_every_turns: usize,
     trim_noise_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct CognitiveDefinitionSection {
+    enabled: bool,
+    poll_interval_secs: u64,
+    #[serde(default)]
+    blob_root: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -304,6 +331,8 @@ struct EffectiveRuntimeSection {
     metrics_log_interval_ms: Option<u64>,
     #[serde(default)]
     immediate_memory: Option<ImmediateMemorySection>,
+    #[serde(default)]
+    cognitive_definition: Option<CognitiveDefinitionSection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -333,6 +362,7 @@ impl Default for RuntimeSection {
             retry_max_backoff_ms: 2_000,
             metrics_log_interval_ms: 30_000,
             immediate_memory: ImmediateMemorySection::default(),
+            cognitive_definition: CognitiveDefinitionSection::default(),
         }
     }
 }
@@ -346,6 +376,16 @@ impl Default for ImmediateMemorySection {
             summary_max_chars: 1_600,
             summary_refresh_every_turns: 3,
             trim_noise_enabled: true,
+        }
+    }
+}
+
+impl Default for CognitiveDefinitionSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_secs: DEFAULT_COGNITIVE_POLL_INTERVAL_SECS,
+            blob_root: None,
         }
     }
 }
@@ -408,12 +448,15 @@ struct GenericAiNode {
     mode: RunnerMode,
     node_name: String,
     behavior: Arc<RwLock<Option<NodeBehavior>>>,
+    config_dir: PathBuf,
     dynamic_config_dir: PathBuf,
     thread_state_store: Option<Arc<dyn ThreadStateStore>>,
     immediate_memory_store: Option<Arc<ImmediateMemoryStore>>,
     gov_identity: GovIdentityConfig,
     gov_identity_bridge: Option<Arc<GovIdentityBridge>>,
     control_plane: Arc<RwLock<ControlPlaneState>>,
+    cognitive_definition: Arc<RwLock<CognitiveDefinitionRuntimeState>>,
+    cognitive_definition_config: CognitiveDefinitionRuntimeConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -982,6 +1025,105 @@ impl Default for ControlPlaneState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CognitiveDefinitionRuntimeConfig {
+    enabled: bool,
+    poll_interval: Duration,
+    blob_root: PathBuf,
+}
+
+impl From<CognitiveDefinitionSection> for CognitiveDefinitionRuntimeConfig {
+    fn from(value: CognitiveDefinitionSection) -> Self {
+        let poll_secs = value.poll_interval_secs.max(1).min(300);
+        Self {
+            enabled: value.enabled,
+            poll_interval: Duration::from_secs(poll_secs),
+            blob_root: value
+                .blob_root
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_AGENT_ASSET_BLOB_ROOT)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CognitiveDefinitionHashes {
+    role_hash: Option<String>,
+    skill_hashes: Vec<String>,
+    handbook_hashes: Vec<String>,
+}
+
+impl CognitiveDefinitionHashes {
+    fn is_empty(&self) -> bool {
+        self.role_hash.is_none() && self.skill_hashes.is_empty() && self.handbook_hashes.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CognitiveAssetFailure {
+    hash: String,
+    asset_type: String,
+    error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CognitiveDefinitionRuntimeState {
+    enabled: bool,
+    definition_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ilk_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    role_hash_loaded: Option<String>,
+    #[serde(default)]
+    skill_hashes_loaded: Vec<String>,
+    #[serde(default)]
+    handbook_hashes_loaded: Vec<String>,
+    #[serde(default)]
+    failed_hashes: Vec<CognitiveAssetFailure>,
+    prompt_truncated: bool,
+    active_prompt_chars: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_recompose_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_identity_seq: Option<u64>,
+    #[serde(skip)]
+    last_hashes: CognitiveDefinitionHashes,
+    #[serde(skip)]
+    active_prompt: Option<String>,
+}
+
+impl CognitiveDefinitionRuntimeState {
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            definition_state: "disabled".to_string(),
+            ilk_id: None,
+            role_hash_loaded: None,
+            skill_hashes_loaded: Vec::new(),
+            handbook_hashes_loaded: Vec::new(),
+            failed_hashes: Vec::new(),
+            prompt_truncated: false,
+            active_prompt_chars: 0,
+            last_recompose_at: None,
+            last_identity_seq: None,
+            last_hashes: CognitiveDefinitionHashes::default(),
+            active_prompt: None,
+        }
+    }
+
+    fn unresolved(enabled: bool) -> Self {
+        Self {
+            enabled,
+            definition_state: if enabled { "unresolved" } else { "disabled" }.to_string(),
+            ..Self::disabled()
+        }
+    }
+
+    fn has_failures(&self) -> bool {
+        !self.failed_hashes.is_empty()
+    }
+}
+
 #[async_trait]
 impl AiNode for GenericAiNode {
     async fn on_message(&self, msg: Message) -> fluxbee_ai_sdk::Result<Option<Message>> {
@@ -1210,7 +1352,8 @@ impl GenericAiNode {
             "openai chat request prepared"
         );
         if !tool_registry.definitions().is_empty() {
-            let system = match (&openai.instructions, &output_schema) {
+            let base_instructions = self.effective_openai_instructions(openai).await;
+            let system = match (&base_instructions, &output_schema) {
                 (Some(base), Some(schema)) => Some(format!(
                     "{base}\n\n{}",
                     build_output_schema_fallback_instruction(schema)?
@@ -1256,9 +1399,10 @@ impl GenericAiNode {
         }
 
         let current_user_input = input.clone();
+        let system = self.effective_openai_instructions(openai).await;
         let req = fluxbee_ai_sdk::llm::LlmRequest {
             model: openai.model.clone(),
-            system: openai.instructions.clone(),
+            system,
             input,
             input_parts,
             output_schema,
@@ -1269,6 +1413,14 @@ impl GenericAiNode {
         self.persist_immediate_turn(openai, ctx, &current_user_input, &response.content)
             .await;
         Ok(AiBehaviorOutput::text(response.content))
+    }
+
+    async fn effective_openai_instructions(&self, openai: &OpenAiChatRuntime) -> Option<String> {
+        let state = self.cognitive_definition.read().await;
+        state
+            .active_prompt
+            .clone()
+            .or_else(|| openai.instructions.clone())
     }
 
     fn build_function_run_input(
@@ -1874,6 +2026,9 @@ impl GenericAiNode {
 
     async fn build_config_get_response(&self) -> Value {
         let state = self.control_plane.read().await;
+        let cognitive_definition = self.cognitive_definition.read().await.clone();
+        let definition_state = cognitive_definition.definition_state.clone();
+        let active_prompt_chars = cognitive_definition.active_prompt_chars;
         let (ok, config_source) = if state.effective_config.is_some() {
             (true, state.config_source)
         } else {
@@ -1912,7 +2067,7 @@ impl GenericAiNode {
             "config_version": state.config_version,
             "contract": {
                 "node_family": "AI",
-                "node_kind": "ai.common",
+                "node_kind": AI_RUNTIME_KIND,
                 "supports": ["CONFIG_GET", "CONFIG_SET"],
                 "required_fields": [
                     "config.behavior.kind",
@@ -1930,11 +2085,16 @@ impl GenericAiNode {
                 "notes": [
                     "Preferred secret field is config.secrets.openai.api_key.",
                     "Legacy aliases config.behavior.openai.api_key and config.behavior.api_key remain accepted during migration.",
-                    "ai.common defaults behavior.capabilities.multimodal=true unless explicitly overridden.",
+                    "ai.generic defaults behavior.capabilities.multimodal=true unless explicitly overridden.",
+                    "Cognitive role/skill/handbook prompt definition is loaded from identity SHM and blob://agent-assets/<hash>.json.",
                     "Secret values are persisted in local secrets.json and always returned redacted."
                 ]
             },
             "effective_config": state.effective_config.as_ref().map(redact_secrets),
+            "runtime": AI_RUNTIME_KIND,
+            "definition_state": definition_state,
+            "definition": cognitive_definition,
+            "active_prompt_chars": active_prompt_chars,
             "error": error,
         })
     }
@@ -1979,6 +2139,537 @@ impl GenericAiNode {
             "health_state": health_state
         })
     }
+}
+
+#[derive(Debug, Clone)]
+struct LoadedCognitiveDefinition {
+    role: Option<LoadedRoleAsset>,
+    skills: Vec<LoadedSkillAsset>,
+    handbooks: Vec<LoadedHandbookAsset>,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedRoleAsset {
+    hash: String,
+    name: String,
+    persona: String,
+    tone: Option<String>,
+    limits: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedSkillAsset {
+    hash: String,
+    name: String,
+    description: Option<String>,
+    instructions: Vec<String>,
+    examples: Vec<SkillExampleAsset>,
+    constraints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SkillExampleAsset {
+    #[serde(default)]
+    input: String,
+    #[serde(default)]
+    output: String,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedHandbookAsset {
+    hash: String,
+    name: String,
+    sections: Vec<HandbookSectionAsset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HandbookSectionAsset {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    subsections: Vec<HandbookSectionAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CognitiveAssetDocument {
+    asset_type: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    persona: Option<String>,
+    #[serde(default)]
+    tone: Option<String>,
+    #[serde(default)]
+    limits: Vec<String>,
+    #[serde(default)]
+    instructions: Vec<String>,
+    #[serde(default)]
+    examples: Vec<SkillExampleAsset>,
+    #[serde(default)]
+    constraints: Vec<String>,
+    #[serde(default)]
+    sections: Vec<HandbookSectionAsset>,
+}
+
+async fn cognitive_definition_poll_loop(
+    node_name: String,
+    config_dir: PathBuf,
+    config: CognitiveDefinitionRuntimeConfig,
+    state: Arc<RwLock<CognitiveDefinitionRuntimeState>>,
+) {
+    if !config.enabled {
+        return;
+    }
+    loop {
+        if let Err(err) =
+            refresh_cognitive_definition(&node_name, &config_dir, &config, &state).await
+        {
+            tracing::warn!(
+                node_name = %node_name,
+                error = %err,
+                "cognitive definition refresh failed"
+            );
+        }
+        tokio::time::sleep(config.poll_interval).await;
+    }
+}
+
+fn spawn_cognitive_definition_poll_if_enabled(
+    node_name: String,
+    config_dir: PathBuf,
+    config: CognitiveDefinitionRuntimeConfig,
+    state: Arc<RwLock<CognitiveDefinitionRuntimeState>>,
+) {
+    if !config.enabled {
+        return;
+    }
+    tokio::spawn(cognitive_definition_poll_loop(
+        node_name, config_dir, config, state,
+    ));
+}
+
+async fn refresh_cognitive_definition(
+    node_name: &str,
+    config_dir: &PathBuf,
+    config: &CognitiveDefinitionRuntimeConfig,
+    state: &Arc<RwLock<CognitiveDefinitionRuntimeState>>,
+) -> Result<(), String> {
+    let resolved = match find_ilk_by_handler_node_from_hive_config(config_dir, node_name) {
+        Ok(value) => value,
+        Err(err) => {
+            update_cognitive_unresolved(state, format!("identity SHM unavailable: {err}")).await;
+            return Ok(());
+        }
+    };
+    let Some((seq, ilk)) = resolved else {
+        update_cognitive_unresolved(state, "agent ILK not found for handler_node".to_string())
+            .await;
+        return Ok(());
+    };
+    if !ilk.ilk_type.eq_ignore_ascii_case("agent") {
+        update_cognitive_unresolved(state, format!("matched ILK is not agent: {}", ilk.ilk_type))
+            .await;
+        return Ok(());
+    }
+
+    let hashes = hashes_from_identity_ilk(&ilk);
+    {
+        let current = state.read().await;
+        if current.last_identity_seq == Some(seq)
+            && current.last_hashes == hashes
+            && !current.has_failures()
+        {
+            return Ok(());
+        }
+    }
+
+    let next = compose_cognitive_state(&config.blob_root, seq, &ilk, hashes)?;
+    tracing::info!(
+        node_name = %node_name,
+        ilk_id = %ilk.ilk_id,
+        identity_seq = seq,
+        definition_state = %next.definition_state,
+        role_hash_loaded = ?next.role_hash_loaded,
+        skill_hashes_loaded = ?next.skill_hashes_loaded,
+        handbook_hashes_loaded = ?next.handbook_hashes_loaded,
+        failed_hashes = ?next.failed_hashes,
+        prompt_truncated = next.prompt_truncated,
+        active_prompt_chars = next.active_prompt_chars,
+        "cognitive definition refreshed"
+    );
+    *state.write().await = next;
+    Ok(())
+}
+
+async fn update_cognitive_unresolved(
+    state: &Arc<RwLock<CognitiveDefinitionRuntimeState>>,
+    message: String,
+) {
+    let mut guard = state.write().await;
+    guard.definition_state = "unresolved".to_string();
+    guard.active_prompt = None;
+    guard.active_prompt_chars = 0;
+    guard.failed_hashes = vec![CognitiveAssetFailure {
+        hash: String::new(),
+        asset_type: "identity".to_string(),
+        error: message,
+    }];
+}
+
+fn hashes_from_identity_ilk(ilk: &IdentityIlkOption) -> CognitiveDefinitionHashes {
+    CognitiveDefinitionHashes {
+        role_hash: ilk.role_hash.clone(),
+        skill_hashes: ilk.skill_hashes.clone(),
+        handbook_hashes: ilk.handbook_hashes.clone(),
+    }
+}
+
+fn compose_cognitive_state(
+    blob_root: &std::path::Path,
+    seq: u64,
+    ilk: &IdentityIlkOption,
+    hashes: CognitiveDefinitionHashes,
+) -> Result<CognitiveDefinitionRuntimeState, String> {
+    if hashes.is_empty() {
+        return Ok(CognitiveDefinitionRuntimeState {
+            enabled: true,
+            definition_state: "empty".to_string(),
+            ilk_id: Some(ilk.ilk_id.clone()),
+            role_hash_loaded: None,
+            skill_hashes_loaded: Vec::new(),
+            handbook_hashes_loaded: Vec::new(),
+            failed_hashes: Vec::new(),
+            prompt_truncated: false,
+            active_prompt_chars: DEFAULT_UNCONFIGURED_AGENT_PROMPT.chars().count(),
+            last_recompose_at: Some(chrono::Utc::now().to_rfc3339()),
+            last_identity_seq: Some(seq),
+            last_hashes: hashes,
+            active_prompt: Some(DEFAULT_UNCONFIGURED_AGENT_PROMPT.to_string()),
+        });
+    }
+
+    let mut failures = Vec::new();
+    let role = match hashes.role_hash.as_deref() {
+        Some(hash) => match load_role_asset(blob_root, hash) {
+            Ok(asset) => Some(asset),
+            Err(err) => {
+                failures.push(CognitiveAssetFailure {
+                    hash: hash.to_string(),
+                    asset_type: "role".to_string(),
+                    error: err,
+                });
+                None
+            }
+        },
+        None => None,
+    };
+
+    let mut skills = Vec::new();
+    for hash in &hashes.skill_hashes {
+        match load_skill_asset(blob_root, hash) {
+            Ok(asset) => skills.push(asset),
+            Err(err) => failures.push(CognitiveAssetFailure {
+                hash: hash.clone(),
+                asset_type: "skill".to_string(),
+                error: err,
+            }),
+        }
+    }
+
+    let mut handbooks = Vec::new();
+    for hash in &hashes.handbook_hashes {
+        match load_handbook_asset(blob_root, hash) {
+            Ok(asset) => handbooks.push(asset),
+            Err(err) => failures.push(CognitiveAssetFailure {
+                hash: hash.clone(),
+                asset_type: "handbook".to_string(),
+                error: err,
+            }),
+        }
+    }
+
+    let loaded = LoadedCognitiveDefinition {
+        role,
+        skills,
+        handbooks,
+    };
+    let loaded_count = loaded.role.iter().count() + loaded.skills.len() + loaded.handbooks.len();
+    let (prompt, prompt_truncated) = if loaded_count == 0 {
+        (DEFAULT_UNCONFIGURED_AGENT_PROMPT.to_string(), false)
+    } else {
+        compose_cognitive_prompt(&loaded)
+    };
+    let definition_state = if failures.is_empty() {
+        "composed"
+    } else if loaded_count > 0 {
+        "partial"
+    } else {
+        "error"
+    };
+
+    Ok(CognitiveDefinitionRuntimeState {
+        enabled: true,
+        definition_state: definition_state.to_string(),
+        ilk_id: Some(ilk.ilk_id.clone()),
+        role_hash_loaded: loaded.role.as_ref().map(|asset| asset.hash.clone()),
+        skill_hashes_loaded: loaded
+            .skills
+            .iter()
+            .map(|asset| asset.hash.clone())
+            .collect(),
+        handbook_hashes_loaded: loaded
+            .handbooks
+            .iter()
+            .map(|asset| asset.hash.clone())
+            .collect(),
+        failed_hashes: failures,
+        prompt_truncated,
+        active_prompt_chars: prompt.chars().count(),
+        last_recompose_at: Some(chrono::Utc::now().to_rfc3339()),
+        last_identity_seq: Some(seq),
+        last_hashes: hashes,
+        active_prompt: Some(prompt),
+    })
+}
+
+fn load_role_asset(blob_root: &std::path::Path, hash: &str) -> Result<LoadedRoleAsset, String> {
+    let doc = load_cognitive_asset(blob_root, hash, "role")?;
+    let name = required_asset_string(&doc.name, "role.name")?;
+    let persona = required_asset_string(doc.persona.as_deref().unwrap_or(""), "role.persona")?;
+    Ok(LoadedRoleAsset {
+        hash: hash.to_string(),
+        name,
+        persona,
+        tone: doc.tone.filter(|value| !value.trim().is_empty()),
+        limits: clean_string_vec(doc.limits),
+    })
+}
+
+fn load_skill_asset(blob_root: &std::path::Path, hash: &str) -> Result<LoadedSkillAsset, String> {
+    let doc = load_cognitive_asset(blob_root, hash, "skill")?;
+    let name = required_asset_string(&doc.name, "skill.name")?;
+    let instructions = clean_string_vec(doc.instructions);
+    if instructions.is_empty() {
+        return Err("skill.instructions must contain at least one item".to_string());
+    }
+    Ok(LoadedSkillAsset {
+        hash: hash.to_string(),
+        name,
+        description: doc.description.filter(|value| !value.trim().is_empty()),
+        instructions,
+        examples: doc
+            .examples
+            .into_iter()
+            .filter(|item| !item.input.trim().is_empty() || !item.output.trim().is_empty())
+            .collect(),
+        constraints: clean_string_vec(doc.constraints),
+    })
+}
+
+fn load_handbook_asset(
+    blob_root: &std::path::Path,
+    hash: &str,
+) -> Result<LoadedHandbookAsset, String> {
+    let doc = load_cognitive_asset(blob_root, hash, "handbook")?;
+    let name = required_asset_string(&doc.name, "handbook.name")?;
+    if doc.sections.is_empty() {
+        return Err("handbook.sections must contain at least one item".to_string());
+    }
+    Ok(LoadedHandbookAsset {
+        hash: hash.to_string(),
+        name,
+        sections: doc.sections,
+    })
+}
+
+fn load_cognitive_asset(
+    blob_root: &std::path::Path,
+    hash: &str,
+    expected_type: &str,
+) -> Result<CognitiveAssetDocument, String> {
+    validate_hash64(hash)?;
+    let path = blob_root.join("agent-assets").join(format!("{hash}.json"));
+    let meta = fs::metadata(&path)
+        .map_err(|err| format!("asset not readable '{}': {err}", path.display()))?;
+    if meta.len() > AGENT_ASSET_MAX_BYTES {
+        return Err(format!(
+            "asset too large: {} bytes > {}",
+            meta.len(),
+            AGENT_ASSET_MAX_BYTES
+        ));
+    }
+    let raw = fs::read_to_string(&path)
+        .map_err(|err| format!("asset read failed '{}': {err}", path.display()))?;
+    let doc: CognitiveAssetDocument =
+        serde_json::from_str(&raw).map_err(|err| format!("asset JSON invalid: {err}"))?;
+    if doc.asset_type != expected_type {
+        return Err(format!(
+            "asset_type mismatch: expected '{expected_type}', got '{}'",
+            doc.asset_type
+        ));
+    }
+    Ok(doc)
+}
+
+fn validate_hash64(hash: &str) -> Result<(), String> {
+    let trimmed = hash.trim();
+    if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err("hash must be 64 hex chars".to_string())
+    }
+}
+
+fn required_asset_string(value: &str, field: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(format!("{field} is required"))
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn clean_string_vec(items: Vec<String>) -> Vec<String> {
+    items
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn compose_cognitive_prompt(loaded: &LoadedCognitiveDefinition) -> (String, bool) {
+    let mut out = String::new();
+    let mut truncated = false;
+
+    if let Some(role) = &loaded.role {
+        out.push_str(&format!("[ROLE: {}]\n", role.name));
+        out.push_str(&role.persona);
+        out.push('\n');
+        out.push_str(&format!("\nAsset hash: {}\n", role.hash));
+        if let Some(tone) = &role.tone {
+            out.push_str(&format!("\nTone: {tone}\n"));
+        }
+        if !role.limits.is_empty() {
+            out.push_str("\nLimits:\n");
+            for limit in &role.limits {
+                out.push_str(&format!("- {limit}\n"));
+            }
+        }
+    }
+
+    if !loaded.skills.is_empty() {
+        out.push_str("\n--- SKILLS ---\n");
+        for skill in &loaded.skills {
+            out.push_str(&format!("\n[{}]\nAsset hash: {}\n", skill.name, skill.hash));
+            if let Some(description) = &skill.description {
+                out.push_str(&format!("Description: {description}\n"));
+            }
+            out.push_str("\nInstructions:\n");
+            for (idx, instruction) in skill.instructions.iter().enumerate() {
+                out.push_str(&format!("{}. {instruction}\n", idx + 1));
+            }
+            if !skill.constraints.is_empty() {
+                out.push_str("\nConstraints:\n");
+                for constraint in &skill.constraints {
+                    out.push_str(&format!("- {constraint}\n"));
+                }
+            }
+            if !skill.examples.is_empty() {
+                append_budgeted(&mut out, "\nExamples:\n", &mut truncated);
+                for example in &skill.examples {
+                    append_budgeted(
+                        &mut out,
+                        &format!("Input: {}\nOutput: {}\n", example.input, example.output),
+                        &mut truncated,
+                    );
+                }
+            }
+        }
+    }
+
+    if !loaded.handbooks.is_empty() {
+        append_budgeted(&mut out, "\n--- REFERENCE MATERIAL ---\n", &mut truncated);
+        for handbook in &loaded.handbooks {
+            append_budgeted(
+                &mut out,
+                &format!("\n[{}]\nAsset hash: {}\n", handbook.name, handbook.hash),
+                &mut truncated,
+            );
+            for section in &handbook.sections {
+                append_handbook_section(&mut out, section, 2, &mut truncated);
+            }
+        }
+    }
+
+    if out.trim().is_empty() {
+        return (DEFAULT_UNCONFIGURED_AGENT_PROMPT.to_string(), false);
+    }
+    if out.len() > COMPOSED_PROMPT_MAX_BYTES {
+        truncate_to_byte_budget(&mut out, COMPOSED_PROMPT_MAX_BYTES);
+        truncated = true;
+    }
+    (out, truncated)
+}
+
+fn append_handbook_section(
+    out: &mut String,
+    section: &HandbookSectionAsset,
+    level: usize,
+    truncated: &mut bool,
+) {
+    let title = section.title.trim();
+    if !title.is_empty() {
+        append_budgeted(
+            out,
+            &format!("\n{} {}\n", "#".repeat(level.clamp(2, 6)), title),
+            truncated,
+        );
+    }
+    if !section.content.trim().is_empty() {
+        append_budgeted(out, &format!("{}\n", section.content.trim()), truncated);
+    }
+    for child in &section.subsections {
+        append_handbook_section(out, child, level + 1, truncated);
+    }
+}
+
+fn append_budgeted(out: &mut String, text: &str, truncated: &mut bool) {
+    if out.len() >= COMPOSED_PROMPT_MAX_BYTES {
+        *truncated = true;
+        return;
+    }
+    let remaining = COMPOSED_PROMPT_MAX_BYTES - out.len();
+    if text.len() <= remaining {
+        out.push_str(text);
+        return;
+    }
+    let marker = "\n[TRUNCATED]\n";
+    let budget = remaining.saturating_sub(marker.len()).max(0);
+    let mut end = budget;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.push_str(&text[..end]);
+    if remaining >= marker.len() {
+        out.push_str(marker);
+    }
+    truncate_to_byte_budget(out, COMPOSED_PROMPT_MAX_BYTES);
+    *truncated = true;
+}
+
+fn truncate_to_byte_budget(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
 }
 
 fn normalize_health_state(raw: &str) -> &'static str {
@@ -3641,12 +4332,13 @@ async fn run_one_config(
     let persisted_dynamic =
         load_persisted_dynamic_config(&PathBuf::from(&cfg.node.dynamic_config_dir), &cfg.node.name);
     let behavior = build_behavior(&cfg)?;
+    let node_config_dir = cfg.node.config_dir.clone();
     let ai_node_config = AiNodeConfig {
         name: cfg.node.name,
         version: cfg.node.version,
         router_socket: PathBuf::from(cfg.node.router_socket),
         uuid_persistence_dir: PathBuf::from(cfg.node.uuid_persistence_dir),
-        config_dir: PathBuf::from(cfg.node.config_dir),
+        config_dir: PathBuf::from(node_config_dir.clone()),
     };
 
     let runtime_config = RuntimeConfig {
@@ -3675,10 +4367,16 @@ async fn run_one_config(
         init_thread_state_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
     let immediate_memory_store =
         init_immediate_memory_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
+    let cognitive_definition_config =
+        CognitiveDefinitionRuntimeConfig::from(cfg.runtime.cognitive_definition.clone());
+    let cognitive_definition = Arc::new(RwLock::new(CognitiveDefinitionRuntimeState::unresolved(
+        cognitive_definition_config.enabled,
+    )));
     let node = GenericAiNode {
         mode: RunnerMode::Default,
         node_name,
         behavior: Arc::new(RwLock::new(Some(behavior))),
+        config_dir: PathBuf::from(node_config_dir),
         dynamic_config_dir: PathBuf::from(cfg.node.dynamic_config_dir),
         thread_state_store,
         immediate_memory_store,
@@ -3698,7 +4396,15 @@ async fn run_one_config(
                 .unwrap_or(1),
             ..ControlPlaneState::default()
         })),
+        cognitive_definition: cognitive_definition.clone(),
+        cognitive_definition_config: cognitive_definition_config.clone(),
     };
+    spawn_cognitive_definition_poll_if_enabled(
+        node.node_name.clone(),
+        node.config_dir.clone(),
+        cognitive_definition_config,
+        cognitive_definition,
+    );
     let client = RouterClient::connect(ai_node_config).await?;
     let runtime = NodeRuntime::new(client, node);
     runtime.run_with_config(runtime_config).await?;
@@ -3712,6 +4418,11 @@ async fn run_unconfigured_bootstrap(
     let dynamic_dir = PathBuf::from(node.dynamic_config_dir.clone());
     let thread_state_store = init_thread_state_store(&node_name, &dynamic_dir).await;
     let immediate_memory_store = init_immediate_memory_store(&node_name, &dynamic_dir).await;
+    let cognitive_definition_config =
+        CognitiveDefinitionRuntimeConfig::from(CognitiveDefinitionSection::default());
+    let cognitive_definition = Arc::new(RwLock::new(CognitiveDefinitionRuntimeState::unresolved(
+        cognitive_definition_config.enabled,
+    )));
     let persisted_dynamic = load_persisted_dynamic_config(&dynamic_dir, &node_name);
     let spawn_effective = if persisted_dynamic.is_none() {
         load_effective_config_from_spawn(&node_name)
@@ -3866,12 +4577,13 @@ async fn run_unconfigured_bootstrap(
         }
     };
 
+    let node_config_dir = node.config_dir.clone();
     let ai_node_config = AiNodeConfig {
         name: node.name,
         version: node.version,
         router_socket: PathBuf::from(node.router_socket),
         uuid_persistence_dir: PathBuf::from(node.uuid_persistence_dir),
-        config_dir: PathBuf::from(node.config_dir),
+        config_dir: PathBuf::from(node_config_dir.clone()),
     };
     tracing::info!(
         node_name = %node_name,
@@ -3882,13 +4594,22 @@ async fn run_unconfigured_bootstrap(
         mode: RunnerMode::Default,
         node_name,
         behavior: Arc::new(RwLock::new(behavior)),
+        config_dir: PathBuf::from(node_config_dir),
         dynamic_config_dir: dynamic_dir,
         thread_state_store,
         immediate_memory_store,
         gov_identity,
         gov_identity_bridge: None,
         control_plane: Arc::new(RwLock::new(state)),
+        cognitive_definition: cognitive_definition.clone(),
+        cognitive_definition_config: cognitive_definition_config.clone(),
     };
+    spawn_cognitive_definition_poll_if_enabled(
+        ai_node.node_name.clone(),
+        ai_node.config_dir.clone(),
+        cognitive_definition_config,
+        cognitive_definition,
+    );
     let client = RouterClient::connect(ai_node_config).await?;
     let runtime = NodeRuntime::new(client, ai_node);
     runtime.run_with_config(RuntimeConfig::default()).await?;
@@ -4279,6 +5000,7 @@ fn build_startup_effective_config_doc(cfg: &RunnerConfig) -> EffectiveConfigDocu
             retry_max_backoff_ms: Some(cfg.runtime.retry_max_backoff_ms),
             metrics_log_interval_ms: Some(cfg.runtime.metrics_log_interval_ms),
             immediate_memory: Some(cfg.runtime.immediate_memory.clone()),
+            cognitive_definition: Some(cfg.runtime.cognitive_definition.clone()),
         }),
         secrets: None,
     }
@@ -4778,6 +5500,9 @@ fn materialize_runtime_defaults(runtime: &mut EffectiveRuntimeSection) {
     }
     if runtime.immediate_memory.is_none() {
         runtime.immediate_memory = Some(defaults.immediate_memory);
+    }
+    if runtime.cognitive_definition.is_none() {
+        runtime.cognitive_definition = Some(defaults.cognitive_definition);
     }
 }
 
@@ -5430,6 +6155,7 @@ mod tests {
             mode: RunnerMode::Default,
             node_name: "SY.frontdesk.gov".to_string(),
             behavior: Arc::new(RwLock::new(None)),
+            config_dir: PathBuf::from("/tmp"),
             dynamic_config_dir: PathBuf::from("/tmp"),
             thread_state_store: None,
             immediate_memory_store: None,
@@ -5442,7 +6168,241 @@ mod tests {
                 schema_version: 0,
                 config_version: 0,
             })),
+            cognitive_definition: Arc::new(
+                RwLock::new(CognitiveDefinitionRuntimeState::disabled()),
+            ),
+            cognitive_definition_config: CognitiveDefinitionRuntimeConfig {
+                enabled: false,
+                poll_interval: Duration::from_secs(DEFAULT_COGNITIVE_POLL_INTERVAL_SECS),
+                blob_root: PathBuf::from(DEFAULT_AGENT_ASSET_BLOB_ROOT),
+            },
         }
+    }
+
+    fn cognitive_temp_root(test_name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "fluxbee-ai-cognitive-tests-{}-{}",
+            test_name,
+            Uuid::new_v4()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(path.join("agent-assets")).expect("create agent-assets temp root");
+        path
+    }
+
+    fn write_cognitive_asset(root: &std::path::Path, hash: &str, value: Value) {
+        let path = root.join("agent-assets").join(format!("{hash}.json"));
+        fs::write(
+            path,
+            serde_json::to_string_pretty(&value).expect("serialize asset"),
+        )
+        .expect("write cognitive asset");
+    }
+
+    fn sample_agent_ilk() -> IdentityIlkOption {
+        IdentityIlkOption {
+            ilk_id: "ilk:11111111-1111-4111-8111-111111111111".to_string(),
+            display_name: Some("Support Agent".to_string()),
+            handler_node: Some("AI.support@motherbee".to_string()),
+            registration_status: "complete".to_string(),
+            ilk_type: "agent".to_string(),
+            role_hash: None,
+            skill_hashes: Vec::new(),
+            handbook_hashes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cognitive_definition_empty_hashes_uses_default_unconfigured_prompt() {
+        let root = cognitive_temp_root("empty-hashes");
+        let ilk = sample_agent_ilk();
+        let hashes = CognitiveDefinitionHashes::default();
+
+        let state = compose_cognitive_state(&root, 7, &ilk, hashes).expect("compose state");
+
+        assert_eq!(state.definition_state, "empty");
+        assert_eq!(state.ilk_id.as_deref(), Some(ilk.ilk_id.as_str()));
+        assert_eq!(state.last_identity_seq, Some(7));
+        assert_eq!(
+            state.active_prompt.as_deref(),
+            Some(DEFAULT_UNCONFIGURED_AGENT_PROMPT)
+        );
+        assert_eq!(
+            state.active_prompt_chars,
+            DEFAULT_UNCONFIGURED_AGENT_PROMPT.chars().count()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cognitive_definition_composes_role_skill_and_handbook_assets() {
+        let root = cognitive_temp_root("compose-assets");
+        let role_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let skill_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let handbook_hash = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        write_cognitive_asset(
+            &root,
+            role_hash,
+            json!({
+                "asset_type": "role",
+                "name": "Support role",
+                "persona": "Answer as a Fluxbee support agent.",
+                "tone": "direct",
+                "limits": ["Do not invent platform capabilities."]
+            }),
+        );
+        write_cognitive_asset(
+            &root,
+            skill_hash,
+            json!({
+                "asset_type": "skill",
+                "name": "triage",
+                "description": "Classify operator requests.",
+                "instructions": ["Ask for missing node names before mutating state."],
+                "constraints": ["No SCMD execution without operator confirmation."],
+                "examples": [{"input": "list nodes", "output": "read-only inventory"}]
+            }),
+        );
+        write_cognitive_asset(
+            &root,
+            handbook_hash,
+            json!({
+                "asset_type": "handbook",
+                "name": "Fluxbee basics",
+                "sections": [{
+                    "title": "Routing",
+                    "content": "Use workflows for business orchestration."
+                }]
+            }),
+        );
+        let mut ilk = sample_agent_ilk();
+        ilk.role_hash = Some(role_hash.to_string());
+        ilk.skill_hashes = vec![skill_hash.to_string()];
+        ilk.handbook_hashes = vec![handbook_hash.to_string()];
+        let hashes = hashes_from_identity_ilk(&ilk);
+
+        let state = compose_cognitive_state(&root, 8, &ilk, hashes).expect("compose state");
+        let prompt = state.active_prompt.as_deref().expect("active prompt");
+
+        assert_eq!(state.definition_state, "composed");
+        assert_eq!(state.role_hash_loaded.as_deref(), Some(role_hash));
+        assert_eq!(state.skill_hashes_loaded, vec![skill_hash.to_string()]);
+        assert_eq!(
+            state.handbook_hashes_loaded,
+            vec![handbook_hash.to_string()]
+        );
+        assert!(state.failed_hashes.is_empty());
+        assert!(prompt.contains("Answer as a Fluxbee support agent."));
+        assert!(prompt.contains("Ask for missing node names before mutating state."));
+        assert!(prompt.contains("Use workflows for business orchestration."));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cognitive_definition_reports_partial_when_some_assets_fail() {
+        let root = cognitive_temp_root("partial-assets");
+        let role_hash = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let missing_skill_hash = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        write_cognitive_asset(
+            &root,
+            role_hash,
+            json!({
+                "asset_type": "role",
+                "name": "Support role",
+                "persona": "Answer with the loaded role."
+            }),
+        );
+        let mut ilk = sample_agent_ilk();
+        ilk.role_hash = Some(role_hash.to_string());
+        ilk.skill_hashes = vec![missing_skill_hash.to_string()];
+        let hashes = hashes_from_identity_ilk(&ilk);
+
+        let state = compose_cognitive_state(&root, 9, &ilk, hashes).expect("compose state");
+
+        assert_eq!(state.definition_state, "partial");
+        assert_eq!(state.role_hash_loaded.as_deref(), Some(role_hash));
+        assert_eq!(state.failed_hashes.len(), 1);
+        assert_eq!(state.failed_hashes[0].asset_type, "skill");
+        assert_eq!(state.failed_hashes[0].hash, missing_skill_hash);
+        assert!(state
+            .active_prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains("Answer with the loaded role.")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cognitive_definition_reports_error_for_malformed_asset_schema() {
+        let root = cognitive_temp_root("malformed-asset");
+        let role_hash = "abababababababababababababababababababababababababababababababab";
+        write_cognitive_asset(
+            &root,
+            role_hash,
+            json!({
+                "asset_type": "role",
+                "name": "Broken role"
+            }),
+        );
+        let mut ilk = sample_agent_ilk();
+        ilk.role_hash = Some(role_hash.to_string());
+        let hashes = hashes_from_identity_ilk(&ilk);
+
+        let state = compose_cognitive_state(&root, 11, &ilk, hashes).expect("compose state");
+
+        assert_eq!(state.definition_state, "error");
+        assert!(state.role_hash_loaded.is_none());
+        assert_eq!(state.failed_hashes.len(), 1);
+        assert_eq!(state.failed_hashes[0].asset_type, "role");
+        assert!(state.failed_hashes[0].error.contains("role.persona"));
+        assert_eq!(
+            state.active_prompt.as_deref(),
+            Some(DEFAULT_UNCONFIGURED_AGENT_PROMPT)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cognitive_definition_rejects_invalid_hashes() {
+        assert!(validate_hash64(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        )
+        .is_ok());
+        assert!(validate_hash64("not-a-hash").is_err());
+        assert!(validate_hash64(
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cognitive_definition_truncates_large_composed_prompt() {
+        let root = cognitive_temp_root("truncate-prompt");
+        let handbook_hash = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let large_content = "x".repeat(COMPOSED_PROMPT_MAX_BYTES * 2);
+        write_cognitive_asset(
+            &root,
+            handbook_hash,
+            json!({
+                "asset_type": "handbook",
+                "name": "Large handbook",
+                "sections": [{
+                    "title": "Large",
+                    "content": large_content
+                }]
+            }),
+        );
+        let mut ilk = sample_agent_ilk();
+        ilk.handbook_hashes = vec![handbook_hash.to_string()];
+        let hashes = hashes_from_identity_ilk(&ilk);
+
+        let state = compose_cognitive_state(&root, 10, &ilk, hashes).expect("compose state");
+        let prompt = state.active_prompt.as_deref().expect("active prompt");
+
+        assert_eq!(state.definition_state, "composed");
+        assert!(state.prompt_truncated);
+        assert!(prompt.len() <= COMPOSED_PROMPT_MAX_BYTES);
+        assert!(prompt.contains("[TRUNCATED]"));
+        let _ = fs::remove_dir_all(root);
     }
 
     fn temp_secret_root(test_name: &str) -> PathBuf {
@@ -5792,6 +6752,7 @@ mod tests {
                     is_error: false,
                 },
             }],
+            tokens_used: 0,
         };
 
         let output = extract_final_output_from_tool_results(&result)

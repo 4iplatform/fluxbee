@@ -97,7 +97,7 @@ Examples:
 Runtime/package names are **lowercase** and do **not** include `@hive`.
 
 Examples:
-- `ai.common`
+- `ai.generic`
 - `wf.engine`
 - `io.api`
 - `io.slack`
@@ -107,7 +107,7 @@ Rules:
 - Do not create new mixed-case runtime names.
 - Node identity and runtime key are different concepts.
 - `AI.chat@motherbee` is a node.
-- `ai.common` is a runtime.
+- `ai.generic` is a runtime.
 
 ---
 
@@ -140,7 +140,7 @@ If a worker hive does not exist yet, include topology/VPN creation in desired st
 Use when the work is conversational, interpretive, or agentic.
 
 Common runtime bases:
-- `ai.common` for generic new AI nodes
+- `ai.generic` for generic new AI nodes
 - `ai.chat` is an existing chat runtime, not the default base for cloning new AI behavior
 
 ### 4.2 WF nodes and workflows
@@ -359,7 +359,7 @@ Canonical required shape:
 {
   "hive": "motherbee",
   "node_name": "AI.coa@motherbee",
-  "runtime": "ai.common",
+  "runtime": "ai.generic",
   "runtime_version": "current"
 }
 ```

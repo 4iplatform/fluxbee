@@ -68,20 +68,20 @@
 
 ## Phase F - ai.generic Runtime
 
-- [ ] F1. Locate and normalize the runtime name/documentation to `ai.generic`.
-- [ ] F2. Add identity SHM reader state to `nodes/ai/ai-generic`.
-- [ ] F3. Resolve the node's own ILK at boot.
-- [ ] F4. Read current definition hashes from SHM at boot.
-- [ ] F5. Add default unconfigured prompt.
-- [ ] F6. Add asset loader for `blob://agent-assets/<hash>.json`.
-- [ ] F7. Validate role/skill/handbook asset schema.
-- [ ] F8. Compose prompt deterministically with a 64 KiB budget.
-- [ ] F9. Add truncation behavior for handbooks and skill examples.
-- [ ] F10. Add polling loop for identity SHM seq and own hash changes.
-- [ ] F11. Swap active prompt without restart.
-- [ ] F12. Preserve in-flight request behavior during prompt swap.
-- [ ] F13. Report `definition_state`, loaded/failed hashes, truncation, and prompt size through `CONFIG_GET`.
-- [ ] F14. Add unit tests for empty, partial, composed, malformed asset, and truncation states.
+- [x] F1. Locate and normalize the runtime name/documentation to `ai.generic`.
+- [x] F2. Add identity SHM reader state to `nodes/ai/ai-generic`.
+- [x] F3. Resolve the node's own ILK at boot.
+- [x] F4. Read current definition hashes from SHM at boot.
+- [x] F5. Add default unconfigured prompt.
+- [x] F6. Add asset loader for `blob://agent-assets/<hash>.json`.
+- [x] F7. Validate role/skill/handbook asset schema.
+- [x] F8. Compose prompt deterministically with a 64 KiB budget.
+- [x] F9. Add truncation behavior for handbooks and skill examples.
+- [x] F10. Add polling loop for identity SHM seq and own hash changes.
+- [x] F11. Swap active prompt without restart.
+- [x] F12. Preserve in-flight request behavior during prompt swap.
+- [x] F13. Report `definition_state`, loaded/failed hashes, truncation, and prompt size through `CONFIG_GET`.
+- [x] F14. Add unit tests for empty, partial, composed, malformed asset, and truncation states.
 
 ## Phase G - Archi Asset Builder
 

@@ -273,7 +273,7 @@ Optional follow-up operations after publish:
 - [x] RPP-G3. Implement runtime resolution from uploaded executable name.
   - Normalize to core runtime naming policy (`lowercase + dots`).
   - Support pilot shortcuts:
-    - `ai` or `ai-common` -> `ai.common`
+    - `ai`, `ai-common`, or `ai-generic` -> `ai.generic`
     - `wf` or `wf-common` -> `wf.common`
     - `io-*` -> `io.*`
   - Return operator-facing resolution info:

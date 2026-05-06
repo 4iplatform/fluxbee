@@ -12,12 +12,13 @@ Frontera de dependencias (decisión vigente):
 - `nodes/ai/common` es exclusivo de la familia AI no-gov.
 
 Regla:
-- `ai.chat`, `ai.common`, `SY.frontdesk.gov` son nombres de runtime/package.
+- `ai.generic`, `ai.chat`, `sy.frontdesk.gov` son nombres de runtime/package.
 - las instancias (`AI.chat@motherbee`, etc.) no viven en el repo.
 - acá viven solo los fuentes del runtime y sus especializaciones.
 
 Nota:
-- La separación de comportamiento es por runtime (`ai.common` vs `SY.frontdesk.gov`), no por `AI_NODE_MODE`.
+- La separación de comportamiento es por runtime (`ai.generic` vs `sy.frontdesk.gov`), no por `AI_NODE_MODE`.
+- `ai.generic` es el runtime base actual para agentes AI configurables; el "alma" cognitiva se carga por identidad con hashes de role/skill/handbook.
 
 Contrato operativo actual:
 - configuración funcional ví­a `CONFIG_GET` / `CONFIG_SET`.

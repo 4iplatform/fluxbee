@@ -716,16 +716,16 @@ These are used primarily by Archi's executor. Direct invocation by humans or by 
 [ ] Router: project role_hash, skill_hashes, handbook_hashes into data.identity
 [ ] Admin: expose set_ilk_definition and update action help
 
-[ ] ai.generic: read own IlkEntry at boot
-[ ] ai.generic: load assets from blob://agent-assets/<hash>.json
-[ ] ai.generic: parse and validate asset schema
-[ ] ai.generic: compose system prompt according to template and 64 KiB budget
-[ ] ai.generic: handle missing/invalid assets gracefully (partial state)
-[ ] ai.generic: default prompt when definition is empty
-[ ] ai.generic: polling loop reading SHM seq
-[ ] ai.generic: detect own hash changes, recompose without restart
-[ ] ai.generic: report state via CONFIG_GET response
-[ ] ai.generic: log all asset load successes and failures
+[x] ai.generic: read own IlkEntry at boot
+[x] ai.generic: load assets from blob://agent-assets/<hash>.json
+[x] ai.generic: parse and validate asset schema
+[x] ai.generic: compose system prompt according to template and 64 KiB budget
+[x] ai.generic: handle missing/invalid assets gracefully (partial state)
+[x] ai.generic: default prompt when definition is empty
+[x] ai.generic: polling loop reading SHM seq
+[x] ai.generic: detect own hash changes, recompose without restart
+[x] ai.generic: report state via CONFIG_GET response
+[x] ai.generic: log all asset load successes and failures
 
 [ ] Archi: asset builder sub-agent with typed functions
 [ ] Archi: hash computation (sha256 of canonical JSON)

@@ -119,7 +119,7 @@ Archi accede al mismo endpoint a través del sistema de lectura genérico (`flux
   - `unit` (string): override de sufijo de unit systemd
   - `config` (object): config de runtime/nodo pasada durante el spawn
 - **Nota:** Usar SOLO para crear/spawnnear una nueva instancia gestionada.
-- **Ejemplo:** `POST /hives/motherbee/nodes {"node_name":"AI.support@motherbee","runtime":"ai.common","runtime_version":"current","tenant_id":"tnt:43d576a3-..."}`
+- **Ejemplo:** `POST /hives/motherbee/nodes {"node_name":"AI.support@motherbee","runtime":"ai.generic","runtime_version":"current","tenant_id":"tnt:43d576a3-..."}`
 
 ### `start_node`
 - **Path:** `POST /hives/{hive}/nodes/{node_name}/start`
@@ -227,7 +227,7 @@ Archi accede al mismo endpoint a través del sistema de lectura genérico (`flux
 ### `get_runtime`
 - **Path:** `GET /hives/{hive}/runtimes/{runtime}`
 - **Read-only:** sí
-- **Path param:** `runtime` — nombre del runtime, e.g. `ai.common`
+- **Path param:** `runtime` — nombre del runtime, e.g. `ai.generic`
 
 ### `publish_runtime_package`
 - **Path:** `POST /admin/runtime-packages/publish`
@@ -475,7 +475,7 @@ Archi accede al mismo endpoint a través del sistema de lectura genérico (`flux
 POST /hives/motherbee/nodes
 {
   "node_name": "AI.support@motherbee",
-  "runtime": "ai.common",
+  "runtime": "ai.generic",
   "runtime_version": "current",
   "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
 }

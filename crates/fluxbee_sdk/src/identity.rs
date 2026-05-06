@@ -104,6 +104,12 @@ pub struct IdentityIlkOption {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct IdentityIlkSnapshot {
+    pub seq: u64,
+    pub ilks: Vec<IdentityIlkOption>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct IdentityIchOption {
     pub ich_id: String,
     pub channel_type: String,
@@ -1072,12 +1078,99 @@ pub fn list_ich_options_from_hive_config(
     list_ich_options_from_hive_id(&hive_id)
 }
 
+/// Read the current identity SHM sequence for one SHM name.
+pub fn identity_shm_seq_from_shm_name(identity_shm_name: &str) -> Result<u64, IdentityShmError> {
+    let reader = open_identity_shm_reader(identity_shm_name)?;
+    reader.seq()
+}
+
+/// Read the current identity SHM sequence for one hive.
+pub fn identity_shm_seq_from_hive_id(hive_id: &str) -> Result<u64, IdentityShmError> {
+    let shm_name = identity_shm_name_for_hive(hive_id)?;
+    identity_shm_seq_from_shm_name(&shm_name)
+}
+
+/// Read the current identity SHM sequence using `hive.yaml` from config dir.
+pub fn identity_shm_seq_from_hive_config(config_dir: &Path) -> Result<u64, IdentityShmError> {
+    let hive_id = load_hive_id(config_dir)?;
+    identity_shm_seq_from_hive_id(&hive_id)
+}
+
+/// List active ILKs directly from identity SHM.
+pub fn list_ilks_from_shm_name(
+    identity_shm_name: &str,
+) -> Result<IdentityIlkSnapshot, IdentityShmError> {
+    let reader = open_identity_shm_reader(identity_shm_name)?;
+    reader.list_ilk_options()
+}
+
+/// List active ILKs directly from identity SHM for one hive.
+pub fn list_ilks_from_hive_id(hive_id: &str) -> Result<IdentityIlkSnapshot, IdentityShmError> {
+    let shm_name = identity_shm_name_for_hive(hive_id)?;
+    list_ilks_from_shm_name(&shm_name)
+}
+
+/// List active ILKs directly from identity SHM using `hive.yaml` from config dir.
+pub fn list_ilks_from_hive_config(
+    config_dir: &Path,
+) -> Result<IdentityIlkSnapshot, IdentityShmError> {
+    let hive_id = load_hive_id(config_dir)?;
+    list_ilks_from_hive_id(&hive_id)
+}
+
+/// Resolve one active ILK by its handler node name.
+pub fn find_ilk_by_handler_node_from_shm_name(
+    identity_shm_name: &str,
+    handler_node: &str,
+) -> Result<Option<(u64, IdentityIlkOption)>, IdentityShmError> {
+    let wanted = handler_node.trim();
+    if wanted.is_empty() {
+        return Ok(None);
+    }
+    let snapshot = list_ilks_from_shm_name(identity_shm_name)?;
+    let found = snapshot
+        .ilks
+        .into_iter()
+        .find(|ilk| ilk.handler_node.as_deref() == Some(wanted));
+    Ok(found.map(|ilk| (snapshot.seq, ilk)))
+}
+
+/// Resolve one active ILK by handler node name for one hive.
+pub fn find_ilk_by_handler_node_from_hive_id(
+    hive_id: &str,
+    handler_node: &str,
+) -> Result<Option<(u64, IdentityIlkOption)>, IdentityShmError> {
+    let shm_name = identity_shm_name_for_hive(hive_id)?;
+    find_ilk_by_handler_node_from_shm_name(&shm_name, handler_node)
+}
+
+/// Resolve one active ILK by handler node name using `hive.yaml` from config dir.
+pub fn find_ilk_by_handler_node_from_hive_config(
+    config_dir: &Path,
+    handler_node: &str,
+) -> Result<Option<(u64, IdentityIlkOption)>, IdentityShmError> {
+    let hive_id = load_hive_id(config_dir)?;
+    find_ilk_by_handler_node_from_hive_id(&hive_id, handler_node)
+}
+
 struct IdentityShmReader {
     mmap: Mmap,
     layout: IdentityRegionLayout,
 }
 
 impl IdentityShmReader {
+    fn seq(&self) -> Result<u64, IdentityShmError> {
+        let header = header_ref::<IdentityHeader>(self.mmap.as_ref(), self.layout.header_offset)
+            .ok_or(IdentityShmError::InvalidShmHeader)?;
+        Ok(header.seq.load(Ordering::Acquire))
+    }
+
+    fn list_ilk_options(&self) -> Result<IdentityIlkSnapshot, IdentityShmError> {
+        let header = header_ref::<IdentityHeader>(self.mmap.as_ref(), self.layout.header_offset)
+            .ok_or(IdentityShmError::InvalidShmHeader)?;
+        read_ilk_options_from_region(header, self.mmap.as_ref(), &self.layout)
+    }
+
     fn resolve_ich_mapping(
         &self,
         channel_type: &str,
@@ -1298,6 +1391,43 @@ fn read_ich_options_from_region(
         let s2 = header.seq.load(Ordering::Acquire);
         if s1 == s2 {
             return Ok(build_ich_options(&ilk_snapshot, &ich_snapshot));
+        }
+    }
+}
+
+fn read_ilk_options_from_region(
+    header: &IdentityHeader,
+    mmap: &[u8],
+    layout: &IdentityRegionLayout,
+) -> Result<IdentityIlkSnapshot, IdentityShmError> {
+    let start = StdInstant::now();
+    loop {
+        if start.elapsed() > StdDuration::from_millis(SEQLOCK_READ_TIMEOUT_MS) {
+            return Err(IdentityShmError::SeqLockTimeout);
+        }
+        let s1 = header.seq.load(Ordering::Acquire);
+        if s1 & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        atomic::fence(Ordering::Acquire);
+
+        let max_ilks = usize::min(header.ilk_count as usize, layout.limits.max_ilks as usize);
+        let ilks = read_slice::<IlkEntry>(mmap, layout.ilk_offset, layout.limits.max_ilks as usize)
+            .ok_or(IdentityShmError::InvalidShmHeader)?;
+        let snapshot = ilks[..max_ilks]
+            .iter()
+            .filter(|entry| entry.flags & FLAG_ACTIVE != 0)
+            .map(identity_ilk_option_from_entry)
+            .collect::<Vec<_>>();
+
+        atomic::fence(Ordering::Acquire);
+        let s2 = header.seq.load(Ordering::Acquire);
+        if s1 == s2 {
+            return Ok(IdentityIlkSnapshot {
+                seq: s1,
+                ilks: snapshot,
+            });
         }
     }
 }

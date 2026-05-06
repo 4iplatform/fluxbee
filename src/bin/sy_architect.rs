@@ -1701,7 +1701,7 @@ Use these facts only to select and validate planning intent. Do not treat them a
 - `node_name` must include a functional prefix such as `AI.*`, `IO.*`, `WF.*`, `SY.*`, or supported `RT.*`.
 - The hive in the node identity suffix must match the target hive argument when creating or operating that node.
 - Runtime names do not include `@hive`. Node instances do.
-- Example: `AI.support@motherbee` is a node instance. `ai.common` is a runtime/package name.
+- Example: `AI.support@motherbee` is a node instance. `ai.generic` is a runtime/package name.
 
 ### Lifecycle selection
 
@@ -4026,7 +4026,7 @@ impl FunctionTool for PlanCompilerLiveQueryTool {
                     },
                     "params": {
                         "type": "object",
-                        "description": "Optional params for the action (e.g. {\"runtime\": \"ai.common\"} for get_runtime)."
+                        "description": "Optional params for the action (e.g. {\"runtime\": \"ai.generic\"} for get_runtime)."
                     }
                 }
             }),
@@ -4956,8 +4956,11 @@ fn resolve_runtime_name_from_binary_filename(filename: &str) -> Result<String, A
     };
     match prefix {
         "ai" => {
-            if segments.len() <= 1 || segments.get(1) == Some(&"common") {
-                Ok("ai.common".to_string())
+            if segments.len() <= 1
+                || segments.get(1) == Some(&"common")
+                || segments.get(1) == Some(&"generic")
+            {
+                Ok("ai.generic".to_string())
             } else {
                 Ok(format!("ai.{}", segments[1..].join(".")))
             }
@@ -19491,10 +19494,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_runtime_name_from_binary_filename_defaults_ai_and_wf_common() {
+    fn resolve_runtime_name_from_binary_filename_defaults_ai_to_generic_and_wf_common() {
         assert_eq!(
             resolve_runtime_name_from_binary_filename("ai").expect("ai runtime"),
-            "ai.common"
+            "ai.generic"
+        );
+        assert_eq!(
+            resolve_runtime_name_from_binary_filename("ai-common").expect("ai runtime"),
+            "ai.generic"
+        );
+        assert_eq!(
+            resolve_runtime_name_from_binary_filename("ai-generic").expect("ai runtime"),
+            "ai.generic"
         );
         assert_eq!(
             resolve_runtime_name_from_binary_filename("wf-common").expect("wf runtime"),
@@ -20193,7 +20204,7 @@ mod tests {
                 "hive_count": 2,
                 "node_count": 3,
                 "route_count": 1,
-                "main_runtimes": ["ai.common", "io.slack"],
+                "main_runtimes": ["ai.generic", "io.slack"],
                 "audit_status": "pass",
                 "audit_score": 9,
                 "blocking_issues": [],
@@ -20376,7 +20387,7 @@ mod tests {
             task_id: "art-1".to_string(),
             artifact_kind: "runtime_package".to_string(),
             source_delta_op: "op-1".to_string(),
-            runtime_name: Some("ai.common.demo".to_string()),
+            runtime_name: Some("ai.generic.demo".to_string()),
             target_kind: "inline_package".to_string(),
             requirements: json!({}),
             constraints: json!({}),
@@ -20389,7 +20400,7 @@ mod tests {
             "summary": "Prepared package",
             "artifact": {
                 "files": {
-                    "package.json": "{\"name\":\"ai.common.demo\"}",
+                    "package.json": "{\"name\":\"ai.generic.demo\"}",
                     "config/default-config.json": "{}"
                 }
             },
@@ -20408,7 +20419,7 @@ mod tests {
                 .and_then(Value::as_object)
                 .and_then(|value| value.get("package.json"))
                 .and_then(Value::as_str),
-            Some("{\"name\":\"ai.common.demo\"}")
+            Some("{\"name\":\"ai.generic.demo\"}")
         );
         assert!(bundle
             .assumptions
@@ -20424,7 +20435,7 @@ mod tests {
             task_id: "art-1".to_string(),
             artifact_kind: "runtime_package".to_string(),
             source_delta_op: "op-1".to_string(),
-            runtime_name: Some("ai.common.demo".to_string()),
+            runtime_name: Some("ai.generic.demo".to_string()),
             target_kind: "bundle_upload".to_string(),
             requirements: json!({}),
             constraints: json!({}),
@@ -20437,7 +20448,7 @@ mod tests {
             "summary": "Prepared package",
             "artifact": {
                 "files": {
-                    "package.json": "{\"name\":\"ai.common.demo\"}",
+                    "package.json": "{\"name\":\"ai.generic.demo\"}",
                     "config/default-config.json": "{}"
                 }
             }
@@ -20454,7 +20465,7 @@ mod tests {
                 .and_then(Value::as_object)
                 .and_then(|value| value.get("package.json"))
                 .and_then(Value::as_str),
-            Some("{\"name\":\"ai.common.demo\"}")
+            Some("{\"name\":\"ai.generic.demo\"}")
         );
     }
 
@@ -20466,7 +20477,7 @@ mod tests {
             task_id: "art-1".to_string(),
             artifact_kind: "runtime_package".to_string(),
             source_delta_op: "op-1".to_string(),
-            runtime_name: Some("ai.common.demo".to_string()),
+            runtime_name: Some("ai.generic.demo".to_string()),
             target_kind: "inline_package".to_string(),
             requirements: json!({"version": "1.2.3"}),
             constraints: json!({}),
@@ -20484,7 +20495,7 @@ mod tests {
             summary: "Prepared package".to_string(),
             artifact: json!({
                 "files": {
-                    "package.json": "{\"name\":\"ai.common.demo\",\"version\":\"1.2.3\",\"type\":\"config_only\",\"runtime_base\":\"ai.common\"}",
+                    "package.json": "{\"name\":\"ai.generic.demo\",\"version\":\"1.2.3\",\"type\":\"config_only\",\"runtime_base\":\"ai.generic\"}",
                     "config/default-config.json": "{}"
                 }
             }),
@@ -20518,7 +20529,7 @@ mod tests {
             task_id: "art-1".to_string(),
             artifact_kind: "runtime_package".to_string(),
             source_delta_op: "op-1".to_string(),
-            runtime_name: Some("ai.common.demo".to_string()),
+            runtime_name: Some("ai.generic.demo".to_string()),
             target_kind: "bundle_upload".to_string(),
             requirements: json!({"version": "1.2.3"}),
             constraints: json!({}),
@@ -20536,7 +20547,7 @@ mod tests {
             summary: "Prepared package".to_string(),
             artifact: json!({
                 "files": {
-                    "package.json": "{\"name\":\"ai.common.demo\",\"version\":\"1.2.3\",\"type\":\"config_only\",\"runtime_base\":\"ai.common\"}",
+                    "package.json": "{\"name\":\"ai.generic.demo\",\"version\":\"1.2.3\",\"type\":\"config_only\",\"runtime_base\":\"ai.generic\"}",
                     "config/default-config.json": "{}"
                 }
             }),
@@ -21209,7 +21220,7 @@ mod tests {
             requirements: json!({}),
             constraints: json!({}),
             known_context: BuildTaskKnownContext {
-                available_runtimes: vec!["AI.common".to_string()],
+                available_runtimes: vec!["ai.generic".to_string()],
                 running_nodes: vec![],
             },
             attempt: 0,
@@ -21278,7 +21289,7 @@ mod tests {
             summary: "attempt 2 — all required files present".to_string(),
             artifact: json!({
                 "files": {
-                    "package.json": r#"{"name":"ai.support.tg5","version":"0.1.0","type":"config_only","runtime_base":"AI.common"}"#,
+                    "package.json": r#"{"name":"ai.support.tg5","version":"0.1.0","type":"config_only","runtime_base":"ai.generic"}"#,
                     "config/default-config.json": r#"{"tenant_id":"tnt:tg5"}"#
                 }
             }),
