@@ -33,7 +33,9 @@ pub const MSG_TNT_SET_SPONSOR: &str = "TNT_SET_SPONSOR";
 pub const MSG_TNT_APPROVE: &str = "TNT_APPROVE";
 pub const MSG_IDENTITY_METRICS: &str = "IDENTITY_METRICS";
 const IDENTITY_MAGIC: u32 = 0x4A534944; // "JSID"
-const IDENTITY_VERSION: u32 = 4;
+const IDENTITY_VERSION: u32 = 5;
+const IDENTITY_DEFINITION_MAX_SKILLS: usize = 16;
+const IDENTITY_DEFINITION_MAX_HANDBOOKS: usize = 8;
 const REGION_ALIGNMENT: usize = 64;
 const ICH_CHANNEL_TYPE_MAX_LEN: usize = 32;
 const ICH_ADDRESS_MAX_LEN: usize = 256;
@@ -93,6 +95,12 @@ pub struct IdentityIlkOption {
     pub handler_node: Option<String>,
     pub registration_status: String,
     pub ilk_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skill_hashes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handbook_hashes: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -318,12 +326,11 @@ struct IlkEntry {
     ich_offset: u32,
     ich_count: u16,
     _pad0: [u8; 2],
-    roles_offset: u32,
-    roles_len: u16,
-    _pad1: [u8; 2],
-    capabilities_offset: u32,
-    capabilities_len: u16,
-    _pad2: [u8; 2],
+    role_hash: [u8; 32],
+    skill_hashes: [[u8; 32]; IDENTITY_DEFINITION_MAX_SKILLS],
+    skill_count: u16,
+    handbook_count: u16,
+    handbook_hashes: [[u8; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
     created_at: u64,
     updated_at: u64,
     _reserved: [u8; 8],
@@ -1493,6 +1500,59 @@ fn prefixed_uuid_from_bytes(prefix: &str, bytes: [u8; 16]) -> String {
     format!("{prefix}:{}", Uuid::from_bytes(bytes))
 }
 
+fn sha256_bytes_to_hex(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn sha256_bytes_is_zero(bytes: &[u8; 32]) -> bool {
+    bytes.iter().all(|byte| *byte == 0)
+}
+
+fn definition_hashes_from_ilk(ilk: &IlkEntry) -> (Option<String>, Vec<String>, Vec<String>) {
+    let role_hash =
+        (!sha256_bytes_is_zero(&ilk.role_hash)).then(|| sha256_bytes_to_hex(&ilk.role_hash));
+    let skill_count = usize::min(ilk.skill_count as usize, IDENTITY_DEFINITION_MAX_SKILLS);
+    let handbook_count = usize::min(
+        ilk.handbook_count as usize,
+        IDENTITY_DEFINITION_MAX_HANDBOOKS,
+    );
+    let skill_hashes = ilk.skill_hashes[..skill_count]
+        .iter()
+        .map(sha256_bytes_to_hex)
+        .collect();
+    let handbook_hashes = ilk.handbook_hashes[..handbook_count]
+        .iter()
+        .map(sha256_bytes_to_hex)
+        .collect();
+    (role_hash, skill_hashes, handbook_hashes)
+}
+
+fn identity_ilk_option_from_entry(ilk: &IlkEntry) -> IdentityIlkOption {
+    let (role_hash, skill_hashes, handbook_hashes) = definition_hashes_from_ilk(ilk);
+    IdentityIlkOption {
+        ilk_id: prefixed_uuid_from_bytes("ilk", ilk.ilk_id),
+        display_name: {
+            let value = fixed_str_to_string(&ilk.display_name);
+            (!value.is_empty()).then_some(value)
+        },
+        handler_node: {
+            let value = fixed_str_to_string(&ilk.handler_node);
+            (!value.is_empty()).then_some(value)
+        },
+        registration_status: registration_status_from_shm(ilk.registration_status),
+        ilk_type: ilk_type_from_shm(ilk.ilk_type),
+        role_hash,
+        skill_hashes,
+        handbook_hashes,
+    }
+}
+
 fn ilk_type_from_shm(value: u8) -> String {
     match value {
         SHM_ILK_TYPE_HUMAN => "human",
@@ -1520,22 +1580,7 @@ fn build_ich_options(ilks: &[IlkEntry], ichs: &[IchEntry]) -> Vec<IdentityIchOpt
         if ilk.flags & FLAG_ACTIVE == 0 {
             continue;
         }
-        ilk_map.insert(
-            ilk.ilk_id,
-            IdentityIlkOption {
-                ilk_id: prefixed_uuid_from_bytes("ilk", ilk.ilk_id),
-                display_name: {
-                    let value = fixed_str_to_string(&ilk.display_name);
-                    (!value.is_empty()).then_some(value)
-                },
-                handler_node: {
-                    let value = fixed_str_to_string(&ilk.handler_node);
-                    (!value.is_empty()).then_some(value)
-                },
-                registration_status: registration_status_from_shm(ilk.registration_status),
-                ilk_type: ilk_type_from_shm(ilk.ilk_type),
-            },
-        );
+        ilk_map.insert(ilk.ilk_id, identity_ilk_option_from_entry(ilk));
     }
 
     let mut grouped: std::collections::BTreeMap<(String, String, String), IdentityIchOption> =
@@ -1628,19 +1673,7 @@ fn build_resolved_identity_option(
             (!value.is_empty()).then_some(value)
         },
         enabled: ich.enabled != 0,
-        ilk: IdentityIlkOption {
-            ilk_id: prefixed_uuid_from_bytes("ilk", ilk.ilk_id),
-            display_name: {
-                let value = fixed_str_to_string(&ilk.display_name);
-                (!value.is_empty()).then_some(value)
-            },
-            handler_node: {
-                let value = fixed_str_to_string(&ilk.handler_node);
-                (!value.is_empty()).then_some(value)
-            },
-            registration_status: registration_status_from_shm(ilk.registration_status),
-            ilk_type: ilk_type_from_shm(ilk.ilk_type),
-        },
+        ilk: identity_ilk_option_from_entry(ilk),
     })
 }
 
@@ -1844,16 +1877,19 @@ mod tests {
             ich_offset: 0,
             ich_count: 0,
             _pad0: [0; 2],
-            roles_offset: 0,
-            roles_len: 0,
-            _pad1: [0; 2],
-            capabilities_offset: 0,
-            capabilities_len: 0,
-            _pad2: [0; 2],
+            role_hash: [0; 32],
+            skill_hashes: [[0; 32]; IDENTITY_DEFINITION_MAX_SKILLS],
+            skill_count: 0,
+            handbook_count: 0,
+            handbook_hashes: [[0; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
             created_at: 0,
             updated_at: 0,
             _reserved: [0; 8],
         };
+        let mut skill_hashes = [[0; 32]; IDENTITY_DEFINITION_MAX_SKILLS];
+        skill_hashes[0] = [0xcd; 32];
+        let mut handbook_hashes = [[0; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS];
+        handbook_hashes[0] = [0xef; 32];
         let ilk_b = IlkEntry {
             ilk_id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001")
                 .unwrap()
@@ -1867,12 +1903,11 @@ mod tests {
             ich_offset: 0,
             ich_count: 0,
             _pad0: [0; 2],
-            roles_offset: 0,
-            roles_len: 0,
-            _pad1: [0; 2],
-            capabilities_offset: 0,
-            capabilities_len: 0,
-            _pad2: [0; 2],
+            role_hash: [0xab; 32],
+            skill_hashes,
+            skill_count: 1,
+            handbook_count: 1,
+            handbook_hashes,
             created_at: 0,
             updated_at: 0,
             _reserved: [0; 8],
@@ -1925,6 +1960,13 @@ mod tests {
             options[0].ilks[1].ilk_id,
             "ilk:550e8400-e29b-41d4-a716-446655440001"
         );
+        let expected_role_hash = "ab".repeat(32);
+        assert_eq!(
+            options[0].ilks[1].role_hash.as_deref(),
+            Some(expected_role_hash.as_str())
+        );
+        assert_eq!(options[0].ilks[1].skill_hashes, vec!["cd".repeat(32)]);
+        assert_eq!(options[0].ilks[1].handbook_hashes, vec!["ef".repeat(32)]);
     }
 
     #[test]
@@ -1942,12 +1984,11 @@ mod tests {
             ich_offset: 0,
             ich_count: 0,
             _pad0: [0; 2],
-            roles_offset: 0,
-            roles_len: 0,
-            _pad1: [0; 2],
-            capabilities_offset: 0,
-            capabilities_len: 0,
-            _pad2: [0; 2],
+            role_hash: [0; 32],
+            skill_hashes: [[0; 32]; IDENTITY_DEFINITION_MAX_SKILLS],
+            skill_count: 0,
+            handbook_count: 0,
+            handbook_hashes: [[0; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
             created_at: 0,
             updated_at: 0,
             _reserved: [0; 8],
@@ -2093,12 +2134,11 @@ mod tests {
             ich_offset: 0,
             ich_count: 0,
             _pad0: [0; 2],
-            roles_offset: 0,
-            roles_len: 0,
-            _pad1: [0; 2],
-            capabilities_offset: 0,
-            capabilities_len: 0,
-            _pad2: [0; 2],
+            role_hash: [0; 32],
+            skill_hashes: [[0; 32]; IDENTITY_DEFINITION_MAX_SKILLS],
+            skill_count: 0,
+            handbook_count: 0,
+            handbook_hashes: [[0; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
             created_at: 0,
             updated_at: 0,
             _reserved: [0; 8],

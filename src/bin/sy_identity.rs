@@ -24,9 +24,10 @@ use fluxbee_sdk::{
     NODE_CONFIG_APPLY_MODE_REPLACE, NODE_SECRET_REDACTION_TOKEN,
 };
 use json_router::shm::{
-    copy_bytes_with_len, now_epoch_ms, IchEntry, IdentityRegionLimits, IdentityRegionWriter,
-    IlkAliasEntry, IlkEntry, TenantEntry, VocabularyEntry, FLAG_ACTIVE, ICH_ADDRESS_MAX_LEN,
-    ICH_CHANNEL_TYPE_MAX_LEN,
+    copy_bytes_with_len, now_epoch_ms, sha256_hex_to_bytes, IchEntry, IdentityRegionLimits,
+    IdentityRegionWriter, IlkAliasEntry, IlkEntry, TenantEntry, VocabularyEntry, FLAG_ACTIVE,
+    ICH_ADDRESS_MAX_LEN, ICH_CHANNEL_TYPE_MAX_LEN, IDENTITY_DEFINITION_MAX_HANDBOOKS,
+    IDENTITY_DEFINITION_MAX_SKILLS,
 };
 
 type IdentityError = Box<dyn std::error::Error + Send + Sync>;
@@ -53,8 +54,8 @@ const IDENTITY_DELTA_MAX_RETRIES: u32 = 3;
 const DEFAULT_IDENTITY_SHM_MAX_ILKS: u32 = 8_192;
 const DEFAULT_IDENTITY_SHM_MAX_TENANTS: u32 = 1_024;
 const DEFAULT_IDENTITY_SHM_MAX_VOCABULARY: u32 = 4_096;
-const AGENT_DEFINITION_MAX_SKILLS: usize = 16;
-const AGENT_DEFINITION_MAX_HANDBOOKS: usize = 8;
+const AGENT_DEFINITION_MAX_SKILLS: usize = IDENTITY_DEFINITION_MAX_SKILLS;
+const AGENT_DEFINITION_MAX_HANDBOOKS: usize = IDENTITY_DEFINITION_MAX_HANDBOOKS;
 const SHM_ILK_TYPE_HUMAN: u8 = 0;
 const SHM_ILK_TYPE_AGENT: u8 = 1;
 const SHM_ILK_TYPE_SYSTEM: u8 = 2;
@@ -2837,16 +2838,16 @@ fn sync_identity_shm_mappings(
             ich_offset,
             ich_count,
             _pad0: [0u8; 2],
-            roles_offset: 0,
-            roles_len: 0,
-            _pad1: [0u8; 2],
-            capabilities_offset: 0,
-            capabilities_len: 0,
-            _pad2: [0u8; 2],
+            role_hash: [0u8; 32],
+            skill_hashes: [[0u8; 32]; IDENTITY_DEFINITION_MAX_SKILLS],
+            skill_count: 0,
+            handbook_count: 0,
+            handbook_hashes: [[0u8; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
             created_at: now_ms,
             updated_at: now_ms,
             _reserved: [0u8; 8],
         };
+        apply_definition_to_ilk_entry(&mut ilk_entry, &ilk.definition)?;
         let display_name = identification_str(&ilk.identification, "display_name")
             .or_else(|| identification_str(&ilk.identification, "node_name"))
             .unwrap_or(ilk.ilk_id.as_str());
@@ -3016,16 +3017,16 @@ fn ilk_entry_from_record(ilk: &IlkRecord) -> Result<IlkEntry, IdentityError> {
         ich_offset: 0,
         ich_count: 0,
         _pad0: [0u8; 2],
-        roles_offset: 0,
-        roles_len: 0,
-        _pad1: [0u8; 2],
-        capabilities_offset: 0,
-        capabilities_len: 0,
-        _pad2: [0u8; 2],
+        role_hash: [0u8; 32],
+        skill_hashes: [[0u8; 32]; IDENTITY_DEFINITION_MAX_SKILLS],
+        skill_count: 0,
+        handbook_count: 0,
+        handbook_hashes: [[0u8; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
         created_at: now_ms,
         updated_at: now_ms,
         _reserved: [0u8; 8],
     };
+    apply_definition_to_ilk_entry(&mut entry, &ilk.definition)?;
     let display_name = identification_str(&ilk.identification, "display_name")
         .or_else(|| identification_str(&ilk.identification, "node_name"))
         .unwrap_or(ilk.ilk_id.as_str());
@@ -3907,6 +3908,51 @@ fn agent_definition_present(definition: &Value) -> bool {
                     .unwrap_or(false)
         })
         .unwrap_or(false)
+}
+
+fn definition_hash_array_for_shm<const N: usize>(
+    definition: &Value,
+    key: &str,
+) -> Result<([[u8; 32]; N], u16), IdentityError> {
+    let mut out = [[0u8; 32]; N];
+    let Some(values) = definition.get(key).and_then(Value::as_array) else {
+        return Ok((out, 0));
+    };
+    if values.len() > N {
+        return Err(format!("definition {} exceeds shm limit {}", key, N).into());
+    }
+    for (idx, value) in values.iter().enumerate() {
+        let hash = value
+            .as_str()
+            .and_then(sha256_hex_to_bytes)
+            .ok_or_else(|| format!("invalid definition hash in {}", key))?;
+        out[idx] = hash;
+    }
+    Ok((out, values.len() as u16))
+}
+
+fn apply_definition_to_ilk_entry(
+    entry: &mut IlkEntry,
+    definition: &Value,
+) -> Result<(), IdentityError> {
+    if let Some(role_hash) = definition
+        .get("role_hash")
+        .and_then(Value::as_str)
+        .and_then(sha256_hex_to_bytes)
+    {
+        entry.role_hash = role_hash;
+    }
+    let (skill_hashes, skill_count) = definition_hash_array_for_shm::<
+        IDENTITY_DEFINITION_MAX_SKILLS,
+    >(definition, "skill_hashes")?;
+    let (handbook_hashes, handbook_count) = definition_hash_array_for_shm::<
+        IDENTITY_DEFINITION_MAX_HANDBOOKS,
+    >(definition, "handbook_hashes")?;
+    entry.skill_hashes = skill_hashes;
+    entry.skill_count = skill_count;
+    entry.handbook_hashes = handbook_hashes;
+    entry.handbook_count = handbook_count;
+    Ok(())
 }
 
 fn normalize_optional_owner_l2_name(owner_l2_name: Option<&str>) -> Result<Option<String>, String> {

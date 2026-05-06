@@ -41,14 +41,14 @@
 
 ## Phase C - SHM And Readers
 
-- [ ] C1. Extend `src/shm/mod.rs::IlkEntry` with role hash, skill hashes, skill count, handbook hashes, handbook count.
-- [ ] C2. Bump identity SHM version.
-- [ ] C3. Update `IdentityRegionWriter` snapshot/upsert logic.
-- [ ] C4. Update `crates/fluxbee_sdk/src/identity.rs` reader layout.
-- [ ] C5. Update Go identity SHM reader layout if still consuming identity SHM.
-- [ ] C6. Add helpers to convert 64-hex hashes to `[u8; 32]` and back.
-- [ ] C7. Ensure `ILK_SET_DEFINITION` increments SHM seq.
-- [ ] C8. Add SHM tests for empty definitions and populated definitions.
+- [x] C1. Extend `src/shm/mod.rs::IlkEntry` with role hash, skill hashes, skill count, handbook hashes, handbook count.
+- [x] C2. Bump identity SHM version.
+- [x] C3. Update `IdentityRegionWriter` snapshot/upsert logic.
+- [x] C4. Update `crates/fluxbee_sdk/src/identity.rs` reader layout.
+- [x] C5. Update Go identity SHM reader layout if still consuming identity SHM.
+- [x] C6. Add helpers to convert 64-hex hashes to `[u8; 32]` and back.
+- [x] C7. Ensure `ILK_SET_DEFINITION` increments SHM seq.
+- [x] C8. Add SHM tests for empty definitions and populated definitions.
 
 ## Phase D - Router / OPA Projection
 

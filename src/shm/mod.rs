@@ -27,7 +27,9 @@ pub const OPA_VERSION: u32 = 1;
 pub const OPA_MAX_WASM_SIZE: usize = 4 * 1024 * 1024;
 
 pub const IDENTITY_MAGIC: u32 = 0x4A534944; // "JSID"
-pub const IDENTITY_VERSION: u32 = 4;
+pub const IDENTITY_VERSION: u32 = 5;
+pub const IDENTITY_DEFINITION_MAX_SKILLS: usize = 16;
+pub const IDENTITY_DEFINITION_MAX_HANDBOOKS: usize = 8;
 pub const MEMORY_MAGIC: u32 = 0x4A534D4D; // "JSMM"
 pub const MEMORY_VERSION: u32 = 1;
 pub const MEMORY_MAX_DATA_SIZE: usize = 4 * 1024 * 1024;
@@ -356,12 +358,11 @@ pub struct IlkEntry {
     pub ich_offset: u32,
     pub ich_count: u16,
     pub _pad0: [u8; 2],
-    pub roles_offset: u32,
-    pub roles_len: u16,
-    pub _pad1: [u8; 2],
-    pub capabilities_offset: u32,
-    pub capabilities_len: u16,
-    pub _pad2: [u8; 2],
+    pub role_hash: [u8; 32],
+    pub skill_hashes: [[u8; 32]; IDENTITY_DEFINITION_MAX_SKILLS],
+    pub skill_count: u16,
+    pub handbook_count: u16,
+    pub handbook_hashes: [[u8; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
     pub created_at: u64,
     pub updated_at: u64,
     pub _reserved: [u8; 8],
@@ -2154,6 +2155,44 @@ pub fn copy_bytes_with_len(dst: &mut [u8], src: &str) -> usize {
     len
 }
 
+pub fn sha256_hex_to_bytes(raw: &str) -> Option<[u8; 32]> {
+    let value = raw.trim();
+    if value.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    let bytes = value.as_bytes();
+    for idx in 0..32 {
+        let high = hex_nibble(bytes[idx * 2])?;
+        let low = hex_nibble(bytes[idx * 2 + 1])?;
+        out[idx] = (high << 4) | low;
+    }
+    Some(out)
+}
+
+pub fn sha256_bytes_to_hex(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+pub fn sha256_bytes_is_zero(bytes: &[u8; 32]) -> bool {
+    bytes.iter().all(|byte| *byte == 0)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 pub fn compute_ich_hash(channel_type: &str, address: &str, tenant_id: [u8; 16]) -> u64 {
     // FNV-1a 64-bit, deterministic across processes/hives.
     const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -3662,12 +3701,11 @@ fn empty_ilk_entry() -> IlkEntry {
         ich_offset: 0,
         ich_count: 0,
         _pad0: [0u8; 2],
-        roles_offset: 0,
-        roles_len: 0,
-        _pad1: [0u8; 2],
-        capabilities_offset: 0,
-        capabilities_len: 0,
-        _pad2: [0u8; 2],
+        role_hash: [0u8; 32],
+        skill_hashes: [[0u8; 32]; IDENTITY_DEFINITION_MAX_SKILLS],
+        skill_count: 0,
+        handbook_count: 0,
+        handbook_hashes: [[0u8; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
         created_at: 0,
         updated_at: 0,
         _reserved: [0u8; 8],
@@ -4018,6 +4056,10 @@ mod tests {
         };
         writer.upsert_tenant_entry(tenant).expect("tenant upsert");
 
+        let mut skill_hashes = [[0u8; 32]; IDENTITY_DEFINITION_MAX_SKILLS];
+        skill_hashes[0] = [8u8; 32];
+        let mut handbook_hashes = [[0u8; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS];
+        handbook_hashes[0] = [9u8; 32];
         let ilk = IlkEntry {
             ilk_id,
             ilk_type: 0,
@@ -4029,12 +4071,11 @@ mod tests {
             ich_offset: 0,
             ich_count: 0,
             _pad0: [0u8; 2],
-            roles_offset: 0,
-            roles_len: 0,
-            _pad1: [0u8; 2],
-            capabilities_offset: 0,
-            capabilities_len: 0,
-            _pad2: [0u8; 2],
+            role_hash: [7u8; 32],
+            skill_hashes,
+            skill_count: 1,
+            handbook_count: 1,
+            handbook_hashes,
             created_at: 1,
             updated_at: 1,
             _reserved: [0u8; 8],
@@ -4070,6 +4111,11 @@ mod tests {
         assert_eq!(snap.header.ich_count, 1);
         assert_eq!(snap.header.ilk_alias_count, 1);
         assert_eq!(snap.header.ich_mapping_count, 1);
+        assert_eq!(snap.ilks[0].role_hash, [7u8; 32]);
+        assert_eq!(snap.ilks[0].skill_count, 1);
+        assert_eq!(snap.ilks[0].skill_hashes[0], [8u8; 32]);
+        assert_eq!(snap.ilks[0].handbook_count, 1);
+        assert_eq!(snap.ilks[0].handbook_hashes[0], [9u8; 32]);
         assert_eq!(
             writer.resolve_ich_mapping("io.test.demo", "addr-1", tenant_id),
             Some((ich_id, ilk_id))
@@ -4097,6 +4143,17 @@ mod tests {
         );
 
         cleanup_shm(&name);
+    }
+
+    #[test]
+    fn identity_definition_hash_helpers_round_trip_and_reject_invalid() {
+        let hash = "ab".repeat(32);
+        let bytes = sha256_hex_to_bytes(&hash).expect("hash bytes");
+        assert_eq!(bytes, [0xab; 32]);
+        assert_eq!(sha256_bytes_to_hex(&bytes), hash);
+        assert!(sha256_hex_to_bytes("not-a-hash").is_none());
+        assert!(sha256_bytes_is_zero(&[0u8; 32]));
+        assert!(!sha256_bytes_is_zero(&bytes));
     }
 
     #[test]
@@ -4165,12 +4222,11 @@ mod tests {
             ich_offset: 0,
             ich_count: 1,
             _pad0: [0u8; 2],
-            roles_offset: 0,
-            roles_len: 0,
-            _pad1: [0u8; 2],
-            capabilities_offset: 0,
-            capabilities_len: 0,
-            _pad2: [0u8; 2],
+            role_hash: [0u8; 32],
+            skill_hashes: [[0u8; 32]; IDENTITY_DEFINITION_MAX_SKILLS],
+            skill_count: 0,
+            handbook_count: 0,
+            handbook_hashes: [[0u8; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
             created_at: 1,
             updated_at: 1,
             _reserved: [0u8; 8],

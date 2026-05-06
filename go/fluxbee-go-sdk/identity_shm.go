@@ -16,14 +16,14 @@ import (
 
 const (
 	identityMagic            uint32 = 0x4A534944 // "JSID"
-	identityVersionCurrent   uint32 = 4
+	identityVersionCurrent   uint32 = 5
 	identityRegionAlign             = 64
 	identitySeqlockTimeoutMs        = 50
 
 	// Struct sizes computed from #[repr(C)] Rust layout rules.
 	identityHeaderSize  = 176
 	tenantEntrySize     = 316
-	ilkEntrySize        = 344
+	ilkEntrySize        = 1128
 	ichEntrySize        = 352
 	ichMappingEntrySize = 384
 

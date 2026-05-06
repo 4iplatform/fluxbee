@@ -9290,22 +9290,6 @@ fn derive_ilk_type_for_node(node_name: &str) -> &'static str {
     }
 }
 
-fn string_list_from_payload(payload: &serde_json::Value, key: &str) -> Vec<String> {
-    payload
-        .get(key)
-        .and_then(|v| v.as_array())
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|value| value.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn resolve_tenant_id_for_node(payload: &serde_json::Value) -> Option<String> {
     let from_payload = payload
         .get("tenant_id")
