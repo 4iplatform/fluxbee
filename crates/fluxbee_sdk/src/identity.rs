@@ -25,6 +25,7 @@ pub const MSG_ILK_PROVISION_RESPONSE: &str = "ILK_PROVISION_RESPONSE";
 pub const MSG_ILK_REGISTER: &str = "ILK_REGISTER";
 pub const MSG_ILK_ADD_CHANNEL: &str = "ILK_ADD_CHANNEL";
 pub const MSG_ILK_UPDATE: &str = "ILK_UPDATE";
+pub const MSG_ILK_SET_DEFINITION: &str = "ILK_SET_DEFINITION";
 pub const MSG_ICH_SET_ENABLED: &str = "ICH_SET_ENABLED";
 pub const MSG_TNT_CREATE: &str = "TNT_CREATE";
 pub const MSG_TNT_UPDATE: &str = "TNT_UPDATE";

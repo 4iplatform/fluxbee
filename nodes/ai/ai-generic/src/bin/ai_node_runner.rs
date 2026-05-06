@@ -3307,9 +3307,7 @@ impl FunctionTool for IlkRegisterTool {
                 "email": args.identity_candidate.email,
                 "phone": args.identity_candidate.phone,
                 "tenant_hint": args.identity_candidate.tenant_hint,
-            },
-            "roles": [],
-            "capabilities": []
+            }
         });
         tracing::info!(
             op = "ilk_register",

@@ -409,8 +409,6 @@ async fn main() -> Result<(), DiagError> {
                 "display_name": format!("Identity Provision {}", test_id),
                 "email": format!("idprov-{}@diag.local", test_id),
             },
-            "roles": [],
-            "capabilities": [],
         }),
         timeout_ms,
     )
@@ -493,8 +491,6 @@ async fn main() -> Result<(), DiagError> {
                 "display_name": format!("Identity Provision {}", test_id),
                 "email": format!("idprov-{}@diag.local", test_id),
             },
-            "roles": [],
-            "capabilities": [],
         }),
         timeout_ms,
     )

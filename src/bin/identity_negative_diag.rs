@@ -47,8 +47,6 @@ async fn main() -> Result<(), DynError> {
             "display_name": "unauthorized",
             "email": format!("unauth-{}@diag.local", test_id),
         },
-        "roles": [],
-        "capabilities": [],
     });
     let unauthorized_code = run_case_expect_error(
         &unauthorized_name,
@@ -74,8 +72,6 @@ async fn main() -> Result<(), DynError> {
             "display_name": "malformed",
             "email": format!("malformed-{}@diag.local", test_id),
         },
-        "roles": [],
-        "capabilities": [],
     });
     let invalid_request_code = run_case_expect_error(
         &frontdesk_name,
@@ -97,8 +93,6 @@ async fn main() -> Result<(), DynError> {
             "display_name": "missing-tenant",
             "email": format!("missing-tenant-{}@diag.local", test_id),
         },
-        "roles": [],
-        "capabilities": [],
     });
     let invalid_tenant_code = run_case_expect_error(
         &frontdesk_name,
@@ -140,8 +134,6 @@ async fn main() -> Result<(), DynError> {
             "display_name": "dup-email-first",
             "email": duplicate_email,
         },
-        "roles": [],
-        "capabilities": [],
     });
     let first_human = run_case_expect_ok(
         &frontdesk_name,
@@ -166,8 +158,6 @@ async fn main() -> Result<(), DynError> {
             "display_name": "dup-email-second",
             "email": duplicate_email,
         },
-        "roles": [],
-        "capabilities": [],
     });
     let duplicate_email_code = run_case_expect_error(
         &frontdesk_name,
@@ -189,8 +179,6 @@ async fn main() -> Result<(), DynError> {
             "display_name": "dup-ich-second-human",
             "email": format!("dup-ich-second-{}@diag.local", test_id),
         },
-        "roles": [],
-        "capabilities": [],
     });
     let second_human = run_case_expect_ok(
         &frontdesk_name,

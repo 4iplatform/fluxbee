@@ -9362,15 +9362,11 @@ fn resolve_identity_change_reason(payload: &serde_json::Value) -> Option<String>
 }
 
 fn identity_update_requested(payload: &serde_json::Value) -> bool {
-    !string_list_from_payload(payload, "add_roles").is_empty()
-        || !string_list_from_payload(payload, "remove_roles").is_empty()
-        || !string_list_from_payload(payload, "add_capabilities").is_empty()
-        || !string_list_from_payload(payload, "remove_capabilities").is_empty()
-        || payload
-            .get("add_channels")
-            .and_then(|v| v.as_array())
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
+    payload
+        .get("add_channels")
+        .and_then(|v| v.as_array())
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
         || resolve_identity_change_reason(payload).is_some()
 }
 
@@ -9791,8 +9787,6 @@ async fn ensure_node_identity_registered(
 
     let requested_ilk_id = resolve_node_ilk_id(state, payload, node_name)?;
     let ilk_type = derive_ilk_type_for_node(node_name);
-    let roles = string_list_from_payload(payload, "roles");
-    let capabilities = string_list_from_payload(payload, "capabilities");
 
     let request_payload = serde_json::json!({
         "ilk_id": requested_ilk_id,
@@ -9803,9 +9797,7 @@ async fn ensure_node_identity_registered(
             "node_name": node_name,
             "runtime": runtime,
             "runtime_version": runtime_version,
-        },
-        "roles": roles,
-        "capabilities": capabilities,
+        }
     });
     let identity_target = format!("SY.identity@{}", identity_primary_hive_id);
     let response = relay_identity_system_call_ok(
@@ -9847,19 +9839,10 @@ async fn apply_node_identity_update(
     ilk_id: &str,
 ) -> Result<Option<serde_json::Value>, OrchestratorError> {
     parse_prefixed_uuid(ilk_id, "ilk")?;
-    let add_roles = string_list_from_payload(payload, "add_roles");
-    let remove_roles = string_list_from_payload(payload, "remove_roles");
-    let add_capabilities = string_list_from_payload(payload, "add_capabilities");
-    let remove_capabilities = string_list_from_payload(payload, "remove_capabilities");
     let add_channels = identity_add_channels_from_payload(payload)?;
     let change_reason = resolve_identity_change_reason(payload);
 
-    let has_changes = !add_roles.is_empty()
-        || !remove_roles.is_empty()
-        || !add_capabilities.is_empty()
-        || !remove_capabilities.is_empty()
-        || !add_channels.is_empty()
-        || change_reason.is_some();
+    let has_changes = !add_channels.is_empty() || change_reason.is_some();
     if !has_changes {
         return Ok(Some(serde_json::json!({
             "status": "skipped",
@@ -9870,10 +9853,6 @@ async fn apply_node_identity_update(
     let request_payload = serde_json::json!({
         "ilk_id": ilk_id,
         "add_channels": add_channels,
-        "add_roles": add_roles,
-        "remove_roles": remove_roles,
-        "add_capabilities": add_capabilities,
-        "remove_capabilities": remove_capabilities,
         "change_reason": change_reason,
     });
     let identity_target = format!("SY.identity@{}", identity_primary_hive_id);

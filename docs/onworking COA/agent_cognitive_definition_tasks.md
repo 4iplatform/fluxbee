@@ -1,6 +1,6 @@
 # Agent Cognitive Definition Tasks
 
-**Status:** planning
+**Status:** in progress
 **Date:** 2026-05-06
 **Spec:** `docs/identity-v2.1-agent-definition-addendum.md`
 **Scope:** implement hash-based cognitive definitions for `ai.generic` agents.
@@ -26,18 +26,18 @@
 
 ## Phase B - Identity Core
 
-- [ ] B1. Add `definition: Value` to `IlkRecord`.
-- [ ] B2. Replace `definition_json_from_ilk()` so it persists the cognitive definition directly.
-- [ ] B3. Remove legacy `roles` / `capabilities` fields from `IlkRecord`.
-- [ ] B4. Remove legacy `roles` / `capabilities` parsing from `ILK_REGISTER`.
-- [ ] B5. Remove legacy `add_roles` / `remove_roles` / `add_capabilities` / `remove_capabilities` behavior from `ILK_UPDATE`.
-- [ ] B6. Add `ILK_SET_DEFINITION` / `ILK_SET_DEFINITION_RESPONSE`.
-- [ ] B7. Validate `ILK_SET_DEFINITION` only applies to `ilk_type="agent"`.
-- [ ] B8. Validate definition hash format, role count, skill count, handbook count.
-- [ ] B9. Persist definition update in DB.
-- [ ] B10. Include definition in `ILK_GET_RESPONSE`.
-- [ ] B11. Keep `ILK_LIST_RESPONSE` compact, but expose whether a definition is present.
-- [ ] B12. Add tests for valid, empty, malformed, non-agent, and not-found definitions.
+- [x] B1. Add `definition: Value` to `IlkRecord`.
+- [x] B2. Replace `definition_json_from_ilk()` so it persists the cognitive definition directly.
+- [x] B3. Remove legacy `roles` / `capabilities` fields from `IlkRecord`.
+- [x] B4. Remove legacy `roles` / `capabilities` parsing from `ILK_REGISTER`.
+- [x] B5. Remove legacy `add_roles` / `remove_roles` / `add_capabilities` / `remove_capabilities` behavior from `ILK_UPDATE`.
+- [x] B6. Add `ILK_SET_DEFINITION` / `ILK_SET_DEFINITION_RESPONSE`.
+- [x] B7. Validate `ILK_SET_DEFINITION` only applies to `ilk_type="agent"`.
+- [x] B8. Validate definition hash format, role count, skill count, handbook count.
+- [x] B9. Persist definition update in DB.
+- [x] B10. Include definition in `ILK_GET_RESPONSE`.
+- [x] B11. Keep `ILK_LIST_RESPONSE` compact, but expose whether a definition is present.
+- [x] B12. Add tests for valid, empty, malformed, non-agent, and not-found definitions.
 
 ## Phase C - SHM And Readers
 
@@ -59,7 +59,7 @@
 
 ## Phase E - Admin / SDK Surface
 
-- [ ] E1. Add Rust SDK constant/helper for `ILK_SET_DEFINITION`.
+- [x] E1. Add Rust SDK constant/helper for `ILK_SET_DEFINITION`.
 - [ ] E2. Add `SY.admin` wrapper action `set_ilk_definition`.
 - [ ] E3. Expose `POST /hives/{hive}/identity/ilks/{ilk_id}/definition`.
 - [ ] E4. Add admin help entry with request contract and example SCMD.

@@ -53,6 +53,8 @@ const IDENTITY_DELTA_MAX_RETRIES: u32 = 3;
 const DEFAULT_IDENTITY_SHM_MAX_ILKS: u32 = 8_192;
 const DEFAULT_IDENTITY_SHM_MAX_TENANTS: u32 = 1_024;
 const DEFAULT_IDENTITY_SHM_MAX_VOCABULARY: u32 = 4_096;
+const AGENT_DEFINITION_MAX_SKILLS: usize = 16;
+const AGENT_DEFINITION_MAX_HANDBOOKS: usize = 8;
 const SHM_ILK_TYPE_HUMAN: u8 = 0;
 const SHM_ILK_TYPE_AGENT: u8 = 1;
 const SHM_ILK_TYPE_SYSTEM: u8 = 2;
@@ -75,6 +77,8 @@ const MSG_ILK_ADD_CHANNEL: &str = "ILK_ADD_CHANNEL";
 const MSG_ILK_ADD_CHANNEL_RESPONSE: &str = "ILK_ADD_CHANNEL_RESPONSE";
 const MSG_ILK_UPDATE: &str = "ILK_UPDATE";
 const MSG_ILK_UPDATE_RESPONSE: &str = "ILK_UPDATE_RESPONSE";
+const MSG_ILK_SET_DEFINITION: &str = "ILK_SET_DEFINITION";
+const MSG_ILK_SET_DEFINITION_RESPONSE: &str = "ILK_SET_DEFINITION_RESPONSE";
 const MSG_ICH_SET_ENABLED: &str = "ICH_SET_ENABLED";
 const MSG_ICH_SET_ENABLED_RESPONSE: &str = "ICH_SET_ENABLED_RESPONSE";
 const MSG_TNT_CREATE: &str = "TNT_CREATE";
@@ -213,10 +217,6 @@ struct IlkRegisterRequest {
     ilk_type: String,
     tenant_id: String,
     identification: Value,
-    #[serde(default)]
-    roles: Vec<String>,
-    #[serde(default)]
-    capabilities: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -253,15 +253,14 @@ struct IlkUpdateRequest {
     #[serde(default)]
     add_channels: Vec<ChannelInput>,
     #[serde(default)]
-    add_roles: Vec<String>,
-    #[serde(default)]
-    remove_roles: Vec<String>,
-    #[serde(default)]
-    add_capabilities: Vec<String>,
-    #[serde(default)]
-    remove_capabilities: Vec<String>,
-    #[serde(default)]
     change_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IlkSetDefinitionRequest {
+    ilk_id: String,
+    definition: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -340,8 +339,7 @@ struct IlkRecord {
     registration_status: String,
     tenant_id: String,
     identification: Value,
-    roles: Vec<String>,
-    capabilities: Vec<String>,
+    definition: Value,
     channels: Vec<ChannelRecord>,
     deleted_at_ms: Option<u64>,
 }
@@ -555,6 +553,7 @@ impl IdentityStore {
                     "tenant_name": tenant.map(|entry| entry.name.clone()),
                     "display_name": display_name,
                     "node_name": node_name,
+                    "definition_present": agent_definition_present(&ilk.definition),
                     "channel_count": ilk.channels.len(),
                     "channels": ilk.channels.iter().map(|channel| json!({
                         "ich_id": channel.ich_id,
@@ -735,8 +734,7 @@ impl IdentityStore {
             registration_status: "temporary".to_string(),
             tenant_id,
             identification: json!({}),
-            roles: Vec::new(),
-            capabilities: Vec::new(),
+            definition: json!({}),
             channels: vec![ChannelRecord {
                 ich_id: req.ich_id,
                 channel_type: req.channel_type,
@@ -767,9 +765,6 @@ impl IdentityStore {
             return Err("TENANT_PENDING".to_string());
         }
 
-        let roles = dedup_lowercase_tags(req.roles)?;
-        let capabilities = dedup_lowercase_tags(req.capabilities)?;
-
         let requested_ilk_id = req.ilk_id.clone();
         let node_name = req
             .identification
@@ -796,8 +791,6 @@ impl IdentityStore {
                 existing.tenant_id = req.tenant_id;
                 existing.registration_status = "complete".to_string();
                 existing.identification = req.identification;
-                existing.roles = roles;
-                existing.capabilities = capabilities;
             }
             None => {
                 self.ilks.insert(
@@ -808,8 +801,7 @@ impl IdentityStore {
                         registration_status: "complete".to_string(),
                         tenant_id: req.tenant_id,
                         identification: req.identification,
-                        roles,
-                        capabilities,
+                        definition: json!({}),
                         channels: Vec::new(),
                         deleted_at_ms: None,
                     },
@@ -922,10 +914,6 @@ impl IdentityStore {
 
     fn update_ilk(&mut self, req: IlkUpdateRequest) -> Result<Value, String> {
         let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
-        let add_roles = dedup_lowercase_tags(req.add_roles)?;
-        let remove_roles = dedup_lowercase_tags(req.remove_roles)?;
-        let add_caps = dedup_lowercase_tags(req.add_capabilities)?;
-        let remove_caps = dedup_lowercase_tags(req.remove_capabilities)?;
 
         let entry = self
             .ilks
@@ -951,13 +939,31 @@ impl IdentityStore {
             }
         }
 
-        apply_tag_delta(&mut entry.roles, &add_roles, &remove_roles);
-        apply_tag_delta(&mut entry.capabilities, &add_caps, &remove_caps);
-
         Ok(json!({
             "status": "ok",
             "ilk_id": req.ilk_id,
             "change_reason": req.change_reason,
+        }))
+    }
+
+    fn set_ilk_definition(&mut self, req: IlkSetDefinitionRequest) -> Result<Value, String> {
+        let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
+        let entry = self
+            .ilks
+            .get_mut(&req.ilk_id)
+            .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
+        if entry.deleted_at_ms.is_some() {
+            return Err("ILK_NOT_FOUND".to_string());
+        }
+        if entry.ilk_type != "agent" {
+            return Err("INVALID_ILK_TYPE".to_string());
+        }
+        let normalized = normalize_agent_definition(&req.definition)?;
+        entry.definition = normalized.clone();
+        Ok(json!({
+            "status": "ok",
+            "ilk_id": req.ilk_id,
+            "definition": normalized,
         }))
     }
 
@@ -1360,6 +1366,7 @@ impl IdentityRuntime {
         );
         allowed_prefixes.insert(MSG_ILK_ADD_CHANNEL, vec!["SY.frontdesk.gov@"]);
         allowed_prefixes.insert(MSG_ILK_UPDATE, vec!["SY.orchestrator@"]);
+        allowed_prefixes.insert(MSG_ILK_SET_DEFINITION, vec!["SY.admin@", "SY.architect@"]);
         allowed_prefixes.insert(
             MSG_ICH_SET_ENABLED,
             vec!["IO.", "SY.admin@", "SY.architect@", "SY.frontdesk.gov@"],
@@ -1381,7 +1388,8 @@ impl IdentityRuntime {
         let mut bootstrap = HashSet::new();
         bootstrap.insert(format!("SY.identity@{}", hive.hive_id));
         allowed_exacts.insert(MSG_ILK_REGISTER, bootstrap.clone());
-        allowed_exacts.insert(MSG_ILK_UPDATE, bootstrap);
+        allowed_exacts.insert(MSG_ILK_UPDATE, bootstrap.clone());
+        allowed_exacts.insert(MSG_ILK_SET_DEFINITION, bootstrap);
         if let Some(frontdesk_node) = configured_identity_frontdesk_node_name(hive) {
             allowed_exacts
                 .entry(MSG_ILK_REGISTER)
@@ -1896,6 +1904,65 @@ impl IdentityRuntime {
                 }
                 Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
             },
+            MSG_ILK_SET_DEFINITION => {
+                match serde_json::from_value::<IlkSetDefinitionRequest>(msg.payload.clone()) {
+                    Ok(req) => {
+                        let snapshot = if self.is_primary && self.db_config.is_some() {
+                            Some(self.store.clone())
+                        } else {
+                            None
+                        };
+                        match self.store.set_ilk_definition(req) {
+                            Ok(ok) => {
+                                if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
+                                    if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
+                                        if self.is_primary {
+                                            if let Some(database_config) = self.db_config.as_ref() {
+                                                if let Err(err) = persist_ilk_state_in_db(
+                                                    database_config,
+                                                    &ilk,
+                                                    None,
+                                                )
+                                                .await
+                                                {
+                                                    if let Some(snapshot) = snapshot {
+                                                        self.store = snapshot;
+                                                    }
+                                                    db_write_error_payload(
+                                                        "failed to persist ilk definition",
+                                                        err.as_ref(),
+                                                    )
+                                                } else {
+                                                    deltas.push(delta_envelope(
+                                                        IdentityDelta::IlkUpsert { ilk },
+                                                    ));
+                                                    ok
+                                                }
+                                            } else {
+                                                deltas.push(delta_envelope(
+                                                    IdentityDelta::IlkUpsert { ilk },
+                                                ));
+                                                ok
+                                            }
+                                        } else {
+                                            deltas.push(delta_envelope(IdentityDelta::IlkUpsert {
+                                                ilk,
+                                            }));
+                                            ok
+                                        }
+                                    } else {
+                                        ok
+                                    }
+                                } else {
+                                    ok
+                                }
+                            }
+                            Err(code) => error_payload(&code, "failed to set ilk definition"),
+                        }
+                    }
+                    Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
+                }
+            }
             MSG_TNT_CREATE => match serde_json::from_value::<TntCreateRequest>(msg.payload.clone())
             {
                 Ok(req) => match self.store.create_tenant(req) {
@@ -3503,6 +3570,7 @@ fn response_name(action: &str) -> &'static str {
         MSG_ILK_REGISTER => MSG_ILK_REGISTER_RESPONSE,
         MSG_ILK_ADD_CHANNEL => MSG_ILK_ADD_CHANNEL_RESPONSE,
         MSG_ILK_UPDATE => MSG_ILK_UPDATE_RESPONSE,
+        MSG_ILK_SET_DEFINITION => MSG_ILK_SET_DEFINITION_RESPONSE,
         MSG_ICH_SET_ENABLED => MSG_ICH_SET_ENABLED_RESPONSE,
         MSG_TNT_CREATE => MSG_TNT_CREATE_RESPONSE,
         MSG_TNT_UPDATE => MSG_TNT_UPDATE_RESPONSE,
@@ -3521,6 +3589,7 @@ fn action_requires_primary(action: &str) -> bool {
             | MSG_ILK_REGISTER
             | MSG_ILK_ADD_CHANNEL
             | MSG_ILK_UPDATE
+            | MSG_ILK_SET_DEFINITION
             | MSG_ICH_SET_ENABLED
             | MSG_TNT_CREATE
             | MSG_TNT_UPDATE
@@ -3725,6 +3794,121 @@ fn validate_channel_input(channel: &ChannelInput) -> Result<(), String> {
     Ok(())
 }
 
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn normalize_hash_array(
+    definition: &Value,
+    key: &str,
+    max_len: usize,
+) -> Result<Vec<String>, String> {
+    let Some(raw) = definition.get(key) else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = raw.as_array() else {
+        return Err("INVALID_DEFINITION".to_string());
+    };
+    if values.len() > max_len {
+        return Err("DEFINITION_TOO_LARGE".to_string());
+    }
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(hash) = value.as_str().map(str::trim).filter(|v| !v.is_empty()) else {
+            return Err("INVALID_DEFINITION".to_string());
+        };
+        if !is_sha256_hex(hash) {
+            return Err("INVALID_DEFINITION_HASH".to_string());
+        }
+        out.push(hash.to_ascii_lowercase());
+    }
+    Ok(out)
+}
+
+fn normalize_optional_hash(definition: &Value, key: &str) -> Result<Option<String>, String> {
+    let Some(raw) = definition.get(key) else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let Some(hash) = raw.as_str().map(str::trim).filter(|v| !v.is_empty()) else {
+        return Err("INVALID_DEFINITION".to_string());
+    };
+    if !is_sha256_hex(hash) {
+        return Err("INVALID_DEFINITION_HASH".to_string());
+    }
+    Ok(Some(hash.to_ascii_lowercase()))
+}
+
+fn normalize_agent_definition(definition: &Value) -> Result<Value, String> {
+    let Some(obj) = definition.as_object() else {
+        return Err("INVALID_DEFINITION".to_string());
+    };
+    for key in obj.keys() {
+        if !matches!(
+            key.as_str(),
+            "role_hash" | "skill_hashes" | "handbook_hashes"
+        ) {
+            return Err("INVALID_DEFINITION".to_string());
+        }
+    }
+
+    let role_hash = normalize_optional_hash(definition, "role_hash")?;
+    let skill_hashes =
+        normalize_hash_array(definition, "skill_hashes", AGENT_DEFINITION_MAX_SKILLS)?;
+    let handbook_hashes = normalize_hash_array(
+        definition,
+        "handbook_hashes",
+        AGENT_DEFINITION_MAX_HANDBOOKS,
+    )?;
+
+    if role_hash.is_none() && skill_hashes.is_empty() && handbook_hashes.is_empty() {
+        return Ok(json!({}));
+    }
+
+    let mut out = Map::new();
+    if let Some(role_hash) = role_hash {
+        out.insert("role_hash".to_string(), Value::String(role_hash));
+    }
+    out.insert(
+        "skill_hashes".to_string(),
+        Value::Array(skill_hashes.into_iter().map(Value::String).collect()),
+    );
+    out.insert(
+        "handbook_hashes".to_string(),
+        Value::Array(handbook_hashes.into_iter().map(Value::String).collect()),
+    );
+    Ok(Value::Object(out))
+}
+
+fn normalize_definition_for_ilk_type(ilk_type: &str, definition: Value) -> Value {
+    if ilk_type == "agent" {
+        normalize_agent_definition(&definition).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    }
+}
+
+fn agent_definition_present(definition: &Value) -> bool {
+    definition
+        .as_object()
+        .map(|obj| {
+            obj.get("role_hash").is_some()
+                || obj
+                    .get("skill_hashes")
+                    .and_then(Value::as_array)
+                    .map(|items| !items.is_empty())
+                    .unwrap_or(false)
+                || obj
+                    .get("handbook_hashes")
+                    .and_then(Value::as_array)
+                    .map(|items| !items.is_empty())
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
 fn normalize_optional_owner_l2_name(owner_l2_name: Option<&str>) -> Result<Option<String>, String> {
     let Some(owner_l2_name) = owner_l2_name
         .map(str::trim)
@@ -3734,40 +3918,6 @@ fn normalize_optional_owner_l2_name(owner_l2_name: Option<&str>) -> Result<Optio
     };
     validate_max_len("owner_l2_name", owner_l2_name, 128)?;
     Ok(Some(owner_l2_name.to_string()))
-}
-
-fn dedup_lowercase_tags(tags: Vec<String>) -> Result<Vec<String>, String> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for raw in tags {
-        let tag = raw.trim().to_ascii_lowercase();
-        if tag.is_empty() {
-            return Err("INVALID_REQUEST".to_string());
-        }
-        if !tag
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-        {
-            return Err("VOCABULARY_INVALID".to_string());
-        }
-        if seen.insert(tag.clone()) {
-            out.push(tag);
-        }
-    }
-    Ok(out)
-}
-
-fn apply_tag_delta(current: &mut Vec<String>, add: &[String], remove: &[String]) {
-    let mut set: HashSet<String> = current.iter().cloned().collect();
-    for value in add {
-        set.insert(value.clone());
-    }
-    for value in remove {
-        set.remove(value);
-    }
-    let mut out: Vec<String> = set.into_iter().collect();
-    out.sort();
-    *current = out;
 }
 
 async fn ensure_primary_schema(database_config: &PgConfig) -> Result<(), IdentityError> {
@@ -3942,27 +4092,6 @@ SELECT COUNT(*)::BIGINT AS removed_count FROM expired
     Ok(removed)
 }
 
-fn definition_tags(definition: &Value, key: &str) -> Vec<String> {
-    let from_current = definition
-        .get("current")
-        .and_then(Value::as_object)
-        .and_then(|current| current.get(key))
-        .and_then(Value::as_array);
-    let from_root = definition.get(key).and_then(Value::as_array);
-    from_current
-        .or(from_root)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|value| value.to_string())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-}
-
 fn optional_identification_string(
     identification: &Value,
     key: &str,
@@ -4003,12 +4132,7 @@ fn association_json_from_ilk(ilk: &IlkRecord) -> Value {
 }
 
 fn definition_json_from_ilk(ilk: &IlkRecord) -> Value {
-    json!({
-        "current": {
-            "roles": ilk.roles,
-            "capabilities": ilk.capabilities,
-        }
-    })
+    normalize_definition_for_ilk_type(&ilk.ilk_type, ilk.definition.clone())
 }
 
 async fn persist_ilk_state_in_db(
@@ -4245,19 +4369,17 @@ ORDER BY created_at ASC
         let ilk_uuid: String = row.get("ilk_id");
         let tenant_uuid: String = row.get("tenant_id");
         let definition: Value = row.get("definition");
-        let roles = definition_tags(&definition, "roles");
-        let capabilities = definition_tags(&definition, "capabilities");
+        let ilk_type: String = row.get("ilk_type");
         let deleted_at_ms: Option<i64> = row.get("deleted_at_ms");
         store.ilks.insert(
             format!("ilk:{}", ilk_uuid),
             IlkRecord {
                 ilk_id: format!("ilk:{}", ilk_uuid),
-                ilk_type: row.get("ilk_type"),
+                ilk_type: ilk_type.clone(),
                 registration_status: row.get("registration_status"),
                 tenant_id: format!("tnt:{}", tenant_uuid),
                 identification: row.get("identification"),
-                roles,
-                capabilities,
+                definition: normalize_definition_for_ilk_type(&ilk_type, definition),
                 channels: Vec::new(),
                 deleted_at_ms: deleted_at_ms.and_then(|value| u64::try_from(value).ok()),
             },
@@ -4986,8 +5108,7 @@ mod tests {
                 registration_status: "complete".to_string(),
                 tenant_id: "tnt:11111111-1111-1111-1111-111111111111".to_string(),
                 identification: json!({"display_name":"Jane","node_name":"SY.frontdesk.gov@motherbee"}),
-                roles: vec!["user".to_string()],
-                capabilities: vec!["chat".to_string()],
+                definition: json!({}),
                 channels: vec![ChannelRecord {
                     ich_id: "ich:33333333-3333-3333-3333-333333333333".to_string(),
                     channel_type: "slack".to_string(),
@@ -5060,8 +5181,7 @@ mod tests {
                 registration_status: "complete".to_string(),
                 tenant_id: "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
                 identification: json!({}),
-                roles: Vec::new(),
-                capabilities: Vec::new(),
+                definition: json!({}),
                 channels: Vec::new(),
                 deleted_at_ms: None,
             },
@@ -5363,8 +5483,7 @@ mod tests {
                 registration_status: "complete".to_string(),
                 tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
                 identification: json!({}),
-                roles: vec![],
-                capabilities: vec![],
+                definition: json!({}),
                 channels: vec![ChannelRecord {
                     ich_id: "ich:cccccccc-cccc-cccc-cccc-cccccccccccc".to_string(),
                     channel_type: "slack".to_string(),
@@ -5385,6 +5504,176 @@ mod tests {
             Some("IO.slack.support@motherbee")
         );
         assert!(store.ilks["ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"].channels[0].enabled);
+    }
+
+    #[test]
+    fn set_ilk_definition_updates_agent_definition_and_normalizes_hashes() {
+        let mut store = IdentityStore::default();
+        store.tenants.insert(
+            "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+            TenantRecord {
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                name: "fluxbee".to_string(),
+                domain: None,
+                status: "active".to_string(),
+                settings: json!({}),
+                sponsor_tenant_id: None,
+            },
+        );
+        store.ilks.insert(
+            "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+            IlkRecord {
+                ilk_id: "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                ilk_type: "agent".to_string(),
+                registration_status: "complete".to_string(),
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                identification: json!({"node_name":"AI.test@motherbee"}),
+                definition: json!({}),
+                channels: Vec::new(),
+                deleted_at_ms: None,
+            },
+        );
+
+        let role_hash = "A".repeat(64);
+        let skill_hash = "b".repeat(64);
+        let handbook_hash = "C".repeat(64);
+        let out = store
+            .set_ilk_definition(IlkSetDefinitionRequest {
+                ilk_id: "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                definition: json!({
+                    "role_hash": role_hash,
+                    "skill_hashes": [skill_hash],
+                    "handbook_hashes": [handbook_hash],
+                }),
+            })
+            .expect("set definition");
+
+        let definition = out.get("definition").expect("definition");
+        let expected_role_hash = "a".repeat(64);
+        let expected_skill_hash = "b".repeat(64);
+        let expected_handbook_hash = "c".repeat(64);
+        assert_eq!(
+            definition.get("role_hash").and_then(Value::as_str),
+            Some(expected_role_hash.as_str())
+        );
+        assert_eq!(
+            definition
+                .get("skill_hashes")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_str),
+            Some(expected_skill_hash.as_str())
+        );
+        assert_eq!(
+            definition
+                .get("handbook_hashes")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_str),
+            Some(expected_handbook_hash.as_str())
+        );
+        assert!(agent_definition_present(
+            &store.ilks["ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"].definition
+        ));
+    }
+
+    #[test]
+    fn set_ilk_definition_accepts_empty_definition_as_clear() {
+        let mut store = IdentityStore::default();
+        store.ilks.insert(
+            "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+            IlkRecord {
+                ilk_id: "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                ilk_type: "agent".to_string(),
+                registration_status: "complete".to_string(),
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                identification: json!({}),
+                definition: json!({"role_hash": "a".repeat(64)}),
+                channels: Vec::new(),
+                deleted_at_ms: None,
+            },
+        );
+
+        let out = store
+            .set_ilk_definition(IlkSetDefinitionRequest {
+                ilk_id: "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                definition: json!({}),
+            })
+            .expect("clear definition");
+
+        assert_eq!(out.get("definition"), Some(&json!({})));
+        assert_eq!(
+            store.ilks["ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"].definition,
+            json!({})
+        );
+    }
+
+    #[test]
+    fn set_ilk_definition_rejects_malformed_definition() {
+        let mut store = IdentityStore::default();
+        store.ilks.insert(
+            "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+            IlkRecord {
+                ilk_id: "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                ilk_type: "agent".to_string(),
+                registration_status: "complete".to_string(),
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                identification: json!({}),
+                definition: json!({}),
+                channels: Vec::new(),
+                deleted_at_ms: None,
+            },
+        );
+
+        let invalid_hash = store
+            .set_ilk_definition(IlkSetDefinitionRequest {
+                ilk_id: "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                definition: json!({"role_hash": "not-a-hash"}),
+            })
+            .expect_err("invalid hash");
+        assert_eq!(invalid_hash, "INVALID_DEFINITION_HASH");
+
+        let too_many_skills = store
+            .set_ilk_definition(IlkSetDefinitionRequest {
+                ilk_id: "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                definition: json!({"skill_hashes": vec!["a".repeat(64); 17]}),
+            })
+            .expect_err("too many skills");
+        assert_eq!(too_many_skills, "DEFINITION_TOO_LARGE");
+    }
+
+    #[test]
+    fn set_ilk_definition_rejects_non_agent_and_not_found() {
+        let mut store = IdentityStore::default();
+        store.ilks.insert(
+            "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+            IlkRecord {
+                ilk_id: "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                ilk_type: "human".to_string(),
+                registration_status: "complete".to_string(),
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                identification: json!({}),
+                definition: json!({}),
+                channels: Vec::new(),
+                deleted_at_ms: None,
+            },
+        );
+
+        let non_agent = store
+            .set_ilk_definition(IlkSetDefinitionRequest {
+                ilk_id: "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                definition: json!({"role_hash": "a".repeat(64)}),
+            })
+            .expect_err("non-agent");
+        assert_eq!(non_agent, "INVALID_ILK_TYPE");
+
+        let not_found = store
+            .set_ilk_definition(IlkSetDefinitionRequest {
+                ilk_id: "ilk:cccccccc-cccc-cccc-cccc-cccccccccccc".to_string(),
+                definition: json!({"role_hash": "a".repeat(64)}),
+            })
+            .expect_err("not found");
+        assert_eq!(not_found, "ILK_NOT_FOUND");
     }
 
     #[test]
@@ -5409,8 +5698,7 @@ mod tests {
                 registration_status: "temporary".to_string(),
                 tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
                 identification: json!({"display_name":"Jane","node_name":"SY.frontdesk.gov@motherbee"}),
-                roles: vec![],
-                capabilities: vec![],
+                definition: json!({}),
                 channels: vec![ChannelRecord {
                     ich_id: "ich:cccccccc-cccc-cccc-cccc-cccccccccccc".to_string(),
                     channel_type: "slack".to_string(),

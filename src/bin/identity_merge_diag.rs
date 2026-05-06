@@ -250,8 +250,6 @@ async fn main() -> Result<(), DiagError> {
                 "display_name": format!("Merge {}", test_id),
                 "email": format!("merge-{}@diag.local", test_id),
             },
-            "roles": [],
-            "capabilities": [],
         }),
         timeout_ms,
     )
