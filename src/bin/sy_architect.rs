@@ -89,6 +89,12 @@ const ARCHITECT_MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 const ARCHITECT_MAX_SOFTWARE_UPLOAD_BYTES: usize = 128 * 1024 * 1024;
 const ARCHITECT_MAX_MULTIPART_UPLOAD_BYTES: usize =
     ARCHITECT_MAX_SOFTWARE_UPLOAD_BYTES + (4 * 1024 * 1024);
+const AGENT_ASSET_MAX_BYTES: usize = 256 * 1024;
+const AGENT_ASSET_ROLE_MAX_LIMITS: usize = 32;
+const AGENT_ASSET_SKILL_MAX_INSTRUCTIONS: usize = 64;
+const AGENT_ASSET_SKILL_MAX_EXAMPLES: usize = 16;
+const AGENT_ASSET_SKILL_MAX_CONSTRAINTS: usize = 32;
+const AGENT_ASSET_HANDBOOK_MAX_SECTIONS: usize = 128;
 const STATUS_REFRESH_INTERVAL_SECS: u64 = 60;
 fn build_archi_prompt(handbook: Option<&str>) -> String {
     let mut prompt = r#"You are Archi, the Fluxbee system coordinator.
@@ -105,6 +111,7 @@ You are a coordinator, not an executor. You read system state and route all muta
 - For deployments and drift: use `/hives/{hive}/deployments` or `/hives/{hive}/drift-alerts`. If these return `entries: []`, report zero entries — do not infer data from broader endpoints.
 - Stored node config: `GET /hives/{hive}/nodes/{node_name}/config` (persisted snapshot). Live node contract: `POST /hives/{hive}/nodes/{node_name}/control/config-get`. Prefer GET first; use control/config-get only when the live contract is needed.
 - For admin action schemas and examples, use `fluxbee_system_get` on `/admin/actions/{action}` when answering questions. Planning tools do their own schema lookup before mutation.
+- For agent cognitive assets, use `list_agent_assets` to inspect role/skill/handbook assets already stored in blob.
 
 ## Making changes
 
@@ -112,8 +119,21 @@ Never stage writes. Never call admin mutation endpoints directly.
 
 - `fluxbee_plan_compiler` — primary path for clear mutations, from one step to many steps. It translates the task to an executor_plan and executes only after the operator confirms the prepared plan.
 - `fluxbee_start_pipeline` — for broad design intents that need manifest + reconcile before a plan can be produced: new topology, multi-resource architecture, or unclear desired-state work.
+- `create_agent_role_asset`, `create_agent_skill_asset`, `create_agent_handbook_asset` — create immutable local blob assets for an agent's cognitive definition. These only write content-addressed files under `blob://agent-assets/`; they do not mutate identity, run nodes, or apply the definition.
 
 If the operator's mutation intent is clear, call `fluxbee_plan_compiler` directly. Do not ask "should I continue?" first. The operator confirms once, after the plan is ready. Do not claim a mutation ran before confirmation.
+
+## Agent cognitive definitions
+
+For `ai.generic` agents, the "alma" is role/skill/handbook assets plus an identity definition that references their hashes.
+
+Workflow:
+1. Generate role/skill/handbook assets with the typed asset tools.
+2. Show the generated hashes and `blob://agent-assets/<hash>.json` URIs to the operator.
+3. Use `fluxbee_plan_compiler` to apply `set_ilk_definition` with `{role_hash, skill_hashes, handbook_hashes}`.
+4. Verify with node `CONFIG_GET` that `definition_state` becomes `composed` or explain `partial/error`.
+
+Do not put role text, skill instructions, or handbook contents directly into `set_ilk_definition`; identity stores hashes only.
 
 ## Pipeline confirmation rules
 
@@ -226,6 +246,20 @@ struct ArchitectAdminToolContext {
     admin_actions_cache: Arc<Mutex<Option<AdminActionsCache>>>,
     plan_compile_pending: Arc<Mutex<HashMap<String, PlanCompilePending>>>,
     active_pipeline_runs: Arc<Mutex<HashMap<String, PipelineRunRecord>>>,
+    agent_asset_catalog: Arc<RwLock<BTreeMap<String, AgentAssetCatalogEntry>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AgentAssetCatalogEntry {
+    hash: String,
+    asset_type: String,
+    name: Option<String>,
+    blob_uri: String,
+    path: String,
+    size_bytes: u64,
+    valid: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 struct AdminActionsCache {
@@ -302,6 +336,7 @@ struct ArchitectState {
     admin_actions_cache: Arc<Mutex<Option<AdminActionsCache>>>,
     plan_compile_pending: Arc<Mutex<HashMap<String, PlanCompilePending>>>,
     active_pipeline_runs: Arc<Mutex<HashMap<String, PipelineRunRecord>>>,
+    agent_asset_catalog: Arc<RwLock<BTreeMap<String, AgentAssetCatalogEntry>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -814,6 +849,16 @@ impl ArchitectAdminReadToolsProvider {
 impl FunctionToolProvider for ArchitectAdminReadToolsProvider {
     fn register_tools(&self, registry: &mut FunctionToolRegistry) -> fluxbee_ai_sdk::Result<()> {
         registry.register(Arc::new(ArchitectSystemGetTool::new(self.context.clone())))?;
+        registry.register(Arc::new(ListAgentAssetsTool::new(self.context.clone())))?;
+        registry.register(Arc::new(CreateAgentRoleAssetTool::new(
+            self.context.clone(),
+        )))?;
+        registry.register(Arc::new(CreateAgentSkillAssetTool::new(
+            self.context.clone(),
+        )))?;
+        registry.register(Arc::new(CreateAgentHandbookAssetTool::new(
+            self.context.clone(),
+        )))?;
         registry.register(Arc::new(StartPipelineTool::new(self.context.clone())))?;
         registry.register(Arc::new(PipelineActionTool::new(self.context.clone())))?;
         registry.register(Arc::new(PlanCompilerTool::new(self.context.clone())))
@@ -926,6 +971,253 @@ impl FunctionTool for ArchitectSystemGetTool {
                     fluxbee_ai_sdk::AiSdkError::Protocol(format!("system get failed: {err}"))
                 })?;
         Ok(output)
+    }
+}
+
+struct ListAgentAssetsTool {
+    context: ArchitectAdminToolContext,
+}
+
+impl ListAgentAssetsTool {
+    fn new(context: ArchitectAdminToolContext) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl FunctionTool for ListAgentAssetsTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "list_agent_assets".to_string(),
+            description: "List known immutable cognitive assets for ai.generic agents from blob://agent-assets/. Read-only. Use this before creating duplicate role, skill, or handbook assets.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "asset_type": {
+                        "type": "string",
+                        "enum": ["role", "skill", "handbook"],
+                        "description": "Optional asset type filter."
+                    },
+                    "include_invalid": {
+                        "type": "boolean",
+                        "description": "Include catalog entries whose filename hash or schema validation failed. Defaults to false."
+                    },
+                    "refresh": {
+                        "type": "boolean",
+                        "description": "Rescan blob://agent-assets before listing. Defaults to true."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let asset_type = arguments
+            .get("asset_type")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let include_invalid = arguments
+            .get("include_invalid")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let refresh = arguments
+            .get("refresh")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
+        if refresh {
+            let catalog = bootstrap_agent_asset_catalog_from_config_dir(&self.context.config_dir)
+                .map_err(|err| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                    "agent asset catalog refresh failed: {err}"
+                ))
+            })?;
+            *self.context.agent_asset_catalog.write().await = catalog;
+        }
+
+        let catalog = self.context.agent_asset_catalog.read().await;
+        let mut assets = catalog
+            .values()
+            .filter(|entry| include_invalid || entry.valid)
+            .filter(|entry| {
+                asset_type
+                    .as_deref()
+                    .map(|wanted| entry.asset_type == wanted)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assets.sort_by(|a, b| {
+            a.asset_type
+                .cmp(&b.asset_type)
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| a.hash.cmp(&b.hash))
+        });
+        Ok(json!({
+            "status": "ok",
+            "asset_count": assets.len(),
+            "assets": assets,
+        }))
+    }
+}
+
+struct CreateAgentRoleAssetTool {
+    context: ArchitectAdminToolContext,
+}
+
+impl CreateAgentRoleAssetTool {
+    fn new(context: ArchitectAdminToolContext) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl FunctionTool for CreateAgentRoleAssetTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "create_agent_role_asset".to_string(),
+            description: "Create an immutable role asset for an ai.generic agent. Writes only blob://agent-assets/<hash>.json and returns the hash. Does not apply the definition to identity.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "persona"],
+                "properties": {
+                    "name": {"type": "string", "description": "Human-readable role name."},
+                    "persona": {"type": "string", "description": "Core role/persona instructions."},
+                    "tone": {"type": "string", "description": "Optional response tone."},
+                    "limits": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": AGENT_ASSET_ROLE_MAX_LIMITS,
+                        "description": "Optional hard limits for the role."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let asset = build_role_asset_value(&arguments).map_err(fluxbee_tool_protocol_err)?;
+        write_agent_asset_and_update_catalog(&self.context, asset)
+            .await
+            .map_err(fluxbee_tool_protocol_err)
+    }
+}
+
+struct CreateAgentSkillAssetTool {
+    context: ArchitectAdminToolContext,
+}
+
+impl CreateAgentSkillAssetTool {
+    fn new(context: ArchitectAdminToolContext) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl FunctionTool for CreateAgentSkillAssetTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "create_agent_skill_asset".to_string(),
+            description: "Create an immutable skill asset for an ai.generic agent. Writes only blob://agent-assets/<hash>.json and returns the hash. Does not apply the definition to identity.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "instructions"],
+                "properties": {
+                    "name": {"type": "string", "description": "Human-readable skill name."},
+                    "description": {"type": "string", "description": "Optional short skill description."},
+                    "instructions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": AGENT_ASSET_SKILL_MAX_INSTRUCTIONS,
+                        "description": "Ordered instructions for this skill."
+                    },
+                    "constraints": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": AGENT_ASSET_SKILL_MAX_CONSTRAINTS,
+                        "description": "Optional constraints."
+                    },
+                    "examples": {
+                        "type": "array",
+                        "maxItems": AGENT_ASSET_SKILL_MAX_EXAMPLES,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "input": {"type": "string"},
+                                "output": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let asset = build_skill_asset_value(&arguments).map_err(fluxbee_tool_protocol_err)?;
+        write_agent_asset_and_update_catalog(&self.context, asset)
+            .await
+            .map_err(fluxbee_tool_protocol_err)
+    }
+}
+
+struct CreateAgentHandbookAssetTool {
+    context: ArchitectAdminToolContext,
+}
+
+impl CreateAgentHandbookAssetTool {
+    fn new(context: ArchitectAdminToolContext) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl FunctionTool for CreateAgentHandbookAssetTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "create_agent_handbook_asset".to_string(),
+            description: "Create an immutable handbook/reference asset for an ai.generic agent. Writes only blob://agent-assets/<hash>.json and returns the hash. Does not apply the definition to identity.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "sections"],
+                "properties": {
+                    "name": {"type": "string", "description": "Human-readable handbook name."},
+                    "sections": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": AGENT_ASSET_HANDBOOK_MAX_SECTIONS,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "title": {"type": "string"},
+                                "content": {"type": "string"},
+                                "subsections": {
+                                    "type": "array",
+                                    "items": {"type": "object"}
+                                }
+                            }
+                        },
+                        "description": "Reference sections. Each section should have title or content; subsections are allowed."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let asset = build_handbook_asset_value(&arguments).map_err(fluxbee_tool_protocol_err)?;
+        write_agent_asset_and_update_catalog(&self.context, asset)
+            .await
+            .map_err(fluxbee_tool_protocol_err)
     }
 }
 
@@ -4161,6 +4453,11 @@ async fn main() -> Result<(), ArchitectError> {
     let node_config = load_architect_node_config(&hive.hive_id)?;
     let node_name = architect_node_name(&hive.hive_id);
     let ai_runtime = build_architect_ai_runtime(&node_name, node_config.as_ref(), &hive);
+    let agent_asset_catalog = bootstrap_agent_asset_catalog_from_config_dir(&config_dir)
+        .unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "failed to bootstrap agent asset catalog");
+            BTreeMap::new()
+        });
     let listen = std::env::var("JSR_ARCHITECT_LISTEN")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -4204,6 +4501,7 @@ async fn main() -> Result<(), ArchitectError> {
         admin_actions_cache: Arc::new(Mutex::new(None)),
         plan_compile_pending: Arc::new(Mutex::new(HashMap::new())),
         active_pipeline_runs: Arc::new(Mutex::new(HashMap::new())),
+        agent_asset_catalog: Arc::new(RwLock::new(agent_asset_catalog)),
     });
 
     ensure_chat_storage(&state).await?;
@@ -4421,6 +4719,7 @@ fn admin_tool_context(
         admin_actions_cache: Arc::clone(&state.admin_actions_cache),
         plan_compile_pending: Arc::clone(&state.plan_compile_pending),
         active_pipeline_runs: Arc::clone(&state.active_pipeline_runs),
+        agent_asset_catalog: Arc::clone(&state.agent_asset_catalog),
     }
 }
 
@@ -4603,6 +4902,482 @@ fn architect_blob_toolkit(state: &ArchitectState) -> Result<BlobToolkit, Archite
     BlobToolkit::new(cfg).map_err(|err| -> ArchitectError {
         format!("failed to initialize blob toolkit for archi attachments: {err}").into()
     })
+}
+
+fn agent_assets_dir_from_config_dir(config_dir: &Path) -> Result<PathBuf, ArchitectError> {
+    Ok(architect_blob_root_from_config_dir(config_dir)?.join("agent-assets"))
+}
+
+fn validate_hash64(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn canonicalize_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            let mut out = serde_json::Map::new();
+            for (key, value) in entries {
+                out.insert(key.clone(), canonicalize_json_value(value));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json_value).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn canonical_agent_asset_bytes(asset: &Value) -> Result<Vec<u8>, ArchitectError> {
+    let canonical = canonicalize_json_value(asset);
+    Ok(serde_json::to_vec(&canonical)?)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn clean_required_string(value: &Value, field: &str) -> Result<String, ArchitectError> {
+    let Some(raw) = value.as_str() else {
+        return Err(format!("{field} must be a string").into());
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        Err(format!("{field} is required").into())
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn clean_optional_string(
+    value: Option<&Value>,
+    field: &str,
+) -> Result<Option<String>, ArchitectError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(raw) = value.as_str() else {
+        return Err(format!("{field} must be a string").into());
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
+    }
+}
+
+fn clean_string_array(
+    value: Option<&Value>,
+    field: &str,
+    max_items: usize,
+) -> Result<Vec<String>, ArchitectError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = value.as_array() else {
+        return Err(format!("{field} must be an array of strings").into());
+    };
+    if items.len() > max_items {
+        return Err(format!("{field} max items is {max_items}").into());
+    }
+    let mut out = Vec::new();
+    for item in items {
+        let Some(raw) = item.as_str() else {
+            return Err(format!("{field} must contain only strings").into());
+        };
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            out.push(trimmed.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn build_role_asset_value(arguments: &Value) -> Result<Value, ArchitectError> {
+    let name = clean_required_string(arguments.get("name").unwrap_or(&Value::Null), "role.name")?;
+    let persona = clean_required_string(
+        arguments.get("persona").unwrap_or(&Value::Null),
+        "role.persona",
+    )?;
+    let tone = clean_optional_string(arguments.get("tone"), "role.tone")?;
+    let limits = clean_string_array(
+        arguments.get("limits"),
+        "role.limits",
+        AGENT_ASSET_ROLE_MAX_LIMITS,
+    )?;
+    let mut map = serde_json::Map::new();
+    map.insert("asset_type".to_string(), json!("role"));
+    map.insert("name".to_string(), json!(name));
+    map.insert("persona".to_string(), json!(persona));
+    if let Some(tone) = tone {
+        map.insert("tone".to_string(), json!(tone));
+    }
+    if !limits.is_empty() {
+        map.insert("limits".to_string(), json!(limits));
+    }
+    Ok(Value::Object(map))
+}
+
+fn build_skill_examples(value: Option<&Value>) -> Result<Vec<Value>, ArchitectError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = value.as_array() else {
+        return Err("skill.examples must be an array".into());
+    };
+    if items.len() > AGENT_ASSET_SKILL_MAX_EXAMPLES {
+        return Err(format!(
+            "skill.examples max items is {}",
+            AGENT_ASSET_SKILL_MAX_EXAMPLES
+        )
+        .into());
+    }
+    let mut out = Vec::new();
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            return Err("skill.examples must contain objects".into());
+        };
+        let input =
+            clean_optional_string(obj.get("input"), "skill.examples.input")?.unwrap_or_default();
+        let output =
+            clean_optional_string(obj.get("output"), "skill.examples.output")?.unwrap_or_default();
+        if input.is_empty() && output.is_empty() {
+            continue;
+        }
+        out.push(json!({"input": input, "output": output}));
+    }
+    Ok(out)
+}
+
+fn build_skill_asset_value(arguments: &Value) -> Result<Value, ArchitectError> {
+    let name = clean_required_string(arguments.get("name").unwrap_or(&Value::Null), "skill.name")?;
+    let description = clean_optional_string(arguments.get("description"), "skill.description")?;
+    let instructions = clean_string_array(
+        arguments.get("instructions"),
+        "skill.instructions",
+        AGENT_ASSET_SKILL_MAX_INSTRUCTIONS,
+    )?;
+    if instructions.is_empty() {
+        return Err("skill.instructions must contain at least one item".into());
+    }
+    let constraints = clean_string_array(
+        arguments.get("constraints"),
+        "skill.constraints",
+        AGENT_ASSET_SKILL_MAX_CONSTRAINTS,
+    )?;
+    let examples = build_skill_examples(arguments.get("examples"))?;
+    let mut map = serde_json::Map::new();
+    map.insert("asset_type".to_string(), json!("skill"));
+    map.insert("name".to_string(), json!(name));
+    if let Some(description) = description {
+        map.insert("description".to_string(), json!(description));
+    }
+    map.insert("instructions".to_string(), json!(instructions));
+    if !constraints.is_empty() {
+        map.insert("constraints".to_string(), json!(constraints));
+    }
+    if !examples.is_empty() {
+        map.insert("examples".to_string(), Value::Array(examples));
+    }
+    Ok(Value::Object(map))
+}
+
+fn count_handbook_sections(sections: &[Value]) -> usize {
+    sections
+        .iter()
+        .map(|section| {
+            1 + section
+                .get("subsections")
+                .and_then(Value::as_array)
+                .map(|children| count_handbook_sections(children))
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+fn build_handbook_sections(value: Option<&Value>) -> Result<Vec<Value>, ArchitectError> {
+    let Some(value) = value else {
+        return Err("handbook.sections is required".into());
+    };
+    let Some(items) = value.as_array() else {
+        return Err("handbook.sections must be an array".into());
+    };
+    if items.is_empty() {
+        return Err("handbook.sections must contain at least one item".into());
+    }
+    let mut out = Vec::new();
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            return Err("handbook.sections must contain objects".into());
+        };
+        let title =
+            clean_optional_string(obj.get("title"), "handbook.sections.title")?.unwrap_or_default();
+        let content = clean_optional_string(obj.get("content"), "handbook.sections.content")?
+            .unwrap_or_default();
+        let subsections = if obj.contains_key("subsections") {
+            build_handbook_sections(obj.get("subsections"))?
+        } else {
+            Vec::new()
+        };
+        if title.is_empty() && content.is_empty() && subsections.is_empty() {
+            return Err("each handbook section must contain title, content, or subsections".into());
+        }
+        let mut section = serde_json::Map::new();
+        if !title.is_empty() {
+            section.insert("title".to_string(), json!(title));
+        }
+        if !content.is_empty() {
+            section.insert("content".to_string(), json!(content));
+        }
+        if !subsections.is_empty() {
+            section.insert("subsections".to_string(), Value::Array(subsections));
+        }
+        out.push(Value::Object(section));
+    }
+    Ok(out)
+}
+
+fn build_handbook_asset_value(arguments: &Value) -> Result<Value, ArchitectError> {
+    let name = clean_required_string(
+        arguments.get("name").unwrap_or(&Value::Null),
+        "handbook.name",
+    )?;
+    let sections = build_handbook_sections(arguments.get("sections"))?;
+    let section_count = count_handbook_sections(&sections);
+    if section_count > AGENT_ASSET_HANDBOOK_MAX_SECTIONS {
+        return Err(format!(
+            "handbook.sections max recursive count is {}",
+            AGENT_ASSET_HANDBOOK_MAX_SECTIONS
+        )
+        .into());
+    }
+    Ok(json!({
+        "asset_type": "handbook",
+        "name": name,
+        "sections": sections,
+    }))
+}
+
+fn validate_agent_asset_value(asset: &Value) -> Result<(String, String), ArchitectError> {
+    let obj = asset
+        .as_object()
+        .ok_or_else(|| "agent asset must be a JSON object".to_string())?;
+    let asset_type = asset
+        .get("asset_type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let name = asset
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "agent asset name is required".to_string())?;
+    match asset_type {
+        "role" => {
+            ensure_allowed_asset_fields(
+                obj,
+                &["asset_type", "name", "persona", "tone", "limits"],
+                "role",
+            )?;
+            build_role_asset_value(asset)?;
+        }
+        "skill" => {
+            ensure_allowed_asset_fields(
+                obj,
+                &[
+                    "asset_type",
+                    "name",
+                    "description",
+                    "instructions",
+                    "examples",
+                    "constraints",
+                ],
+                "skill",
+            )?;
+            build_skill_asset_value(asset)?;
+        }
+        "handbook" => {
+            ensure_allowed_asset_fields(obj, &["asset_type", "name", "sections"], "handbook")?;
+            build_handbook_asset_value(asset)?;
+        }
+        _ => return Err(format!("unsupported agent asset_type '{asset_type}'").into()),
+    }
+    Ok((asset_type.to_string(), name.to_string()))
+}
+
+fn ensure_allowed_asset_fields(
+    obj: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+    asset_type: &str,
+) -> Result<(), ArchitectError> {
+    for key in obj.keys() {
+        if !allowed.iter().any(|allowed_key| key == allowed_key) {
+            return Err(format!("{asset_type} asset has unsupported field '{key}'").into());
+        }
+    }
+    Ok(())
+}
+
+fn agent_asset_catalog_entry_from_file(path: &Path) -> AgentAssetCatalogEntry {
+    let hash = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_string();
+    let blob_uri = format!("blob://agent-assets/{hash}.json");
+    let mut entry = AgentAssetCatalogEntry {
+        hash: hash.clone(),
+        asset_type: "unknown".to_string(),
+        name: None,
+        blob_uri,
+        path: path.display().to_string(),
+        size_bytes: 0,
+        valid: false,
+        error: None,
+    };
+
+    if !validate_hash64(&hash) {
+        entry.error = Some("filename stem is not a 64-hex hash".to_string());
+        return entry;
+    }
+    let raw = match fs::read(path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            entry.error = Some(format!("asset read failed: {err}"));
+            return entry;
+        }
+    };
+    entry.size_bytes = raw.len() as u64;
+    if raw.len() > AGENT_ASSET_MAX_BYTES {
+        entry.error = Some(format!(
+            "asset too large: {} bytes > {}",
+            raw.len(),
+            AGENT_ASSET_MAX_BYTES
+        ));
+        return entry;
+    }
+    let content_hash = sha256_hex(&raw);
+    if content_hash != hash {
+        entry.error = Some(format!(
+            "filename hash mismatch: filename={hash} content={content_hash}"
+        ));
+        return entry;
+    }
+    let parsed = match serde_json::from_slice::<Value>(&raw) {
+        Ok(value) => value,
+        Err(err) => {
+            entry.error = Some(format!("asset JSON invalid: {err}"));
+            return entry;
+        }
+    };
+    match validate_agent_asset_value(&parsed) {
+        Ok((asset_type, name)) => {
+            entry.asset_type = asset_type;
+            entry.name = Some(name);
+            entry.valid = true;
+        }
+        Err(err) => {
+            entry.error = Some(err.to_string());
+        }
+    }
+    entry
+}
+
+fn bootstrap_agent_asset_catalog_from_config_dir(
+    config_dir: &Path,
+) -> Result<BTreeMap<String, AgentAssetCatalogEntry>, ArchitectError> {
+    let asset_dir = agent_assets_dir_from_config_dir(config_dir)?;
+    let mut catalog = BTreeMap::new();
+    if !asset_dir.exists() {
+        return Ok(catalog);
+    }
+    for entry_res in fs::read_dir(&asset_dir)? {
+        let entry = entry_res?;
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let catalog_entry = agent_asset_catalog_entry_from_file(&path);
+        catalog.insert(catalog_entry.hash.clone(), catalog_entry);
+    }
+    Ok(catalog)
+}
+
+fn persist_agent_asset(
+    config_dir: &Path,
+    asset: Value,
+) -> Result<(AgentAssetCatalogEntry, bool), ArchitectError> {
+    let (asset_type, name) = validate_agent_asset_value(&asset)?;
+    let bytes = canonical_agent_asset_bytes(&asset)?;
+    if bytes.len() > AGENT_ASSET_MAX_BYTES {
+        return Err(format!(
+            "agent asset too large: {} bytes > {}",
+            bytes.len(),
+            AGENT_ASSET_MAX_BYTES
+        )
+        .into());
+    }
+    let hash = sha256_hex(&bytes);
+    let asset_dir = agent_assets_dir_from_config_dir(config_dir)?;
+    fs::create_dir_all(&asset_dir)?;
+    let path = asset_dir.join(format!("{hash}.json"));
+    let existed = path.exists();
+    if existed {
+        let existing = fs::read(&path)?;
+        let existing_hash = sha256_hex(&existing);
+        if existing_hash != hash {
+            return Err(format!(
+                "refusing to reuse corrupted agent asset path '{}': expected hash {hash}, got {existing_hash}",
+                path.display()
+            )
+            .into());
+        }
+    } else {
+        let tmp_path = asset_dir.join(format!(".{hash}.tmp"));
+        fs::write(&tmp_path, &bytes)?;
+        fs::rename(&tmp_path, &path)?;
+    }
+    let entry = AgentAssetCatalogEntry {
+        hash: hash.clone(),
+        asset_type,
+        name: Some(name),
+        blob_uri: format!("blob://agent-assets/{hash}.json"),
+        path: path.display().to_string(),
+        size_bytes: bytes.len() as u64,
+        valid: true,
+        error: None,
+    };
+    Ok((entry, !existed))
+}
+
+async fn write_agent_asset_and_update_catalog(
+    context: &ArchitectAdminToolContext,
+    asset: Value,
+) -> Result<Value, ArchitectError> {
+    let (entry, written) = persist_agent_asset(&context.config_dir, asset)?;
+    context
+        .agent_asset_catalog
+        .write()
+        .await
+        .insert(entry.hash.clone(), entry.clone());
+    Ok(json!({
+        "status": "ok",
+        "written": written,
+        "asset": entry,
+        "definition_fragment": match entry.asset_type.as_str() {
+            "role" => json!({"role_hash": entry.hash}),
+            "skill" => json!({"skill_hashes": [entry.hash]}),
+            "handbook" => json!({"handbook_hashes": [entry.hash]}),
+            _ => Value::Null,
+        },
+        "next_step": "Use fluxbee_plan_compiler with set_ilk_definition to apply these hashes to the target agent ILK, then verify node CONFIG_GET.",
+    }))
+}
+
+fn fluxbee_tool_protocol_err(err: ArchitectError) -> fluxbee_ai_sdk::AiSdkError {
+    fluxbee_ai_sdk::AiSdkError::Protocol(err.to_string())
 }
 
 fn normalize_attachment_mime(provided: Option<&str>, filename: &str) -> Option<String> {
@@ -19491,6 +20266,97 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fluxbee-{prefix}-{nanos}"));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+
+    fn test_config_dir_with_blob_root(prefix: &str) -> (PathBuf, PathBuf) {
+        let root = test_temp_dir(prefix);
+        let config_dir = root.join("config");
+        let blob_root = root.join("blob");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        std::fs::create_dir_all(&blob_root).expect("blob root");
+        std::fs::write(
+            config_dir.join("hive.yaml"),
+            format!(
+                "hive_id: motherbee\nblob:\n  path: {}\n",
+                blob_root.display()
+            ),
+        )
+        .expect("hive config");
+        (config_dir, blob_root)
+    }
+
+    #[test]
+    fn agent_asset_canonical_hash_is_stable_for_object_key_order() {
+        let first = json!({
+            "asset_type": "role",
+            "name": "Support",
+            "persona": "Answer clearly.",
+            "limits": ["No invention"]
+        });
+        let second = json!({
+            "limits": ["No invention"],
+            "persona": "Answer clearly.",
+            "name": "Support",
+            "asset_type": "role"
+        });
+        let first_hash = sha256_hex(&canonical_agent_asset_bytes(&first).expect("first bytes"));
+        let second_hash = sha256_hex(&canonical_agent_asset_bytes(&second).expect("second bytes"));
+        assert_eq!(first_hash, second_hash);
+    }
+
+    #[test]
+    fn agent_asset_persist_writes_content_addressed_file_and_catalogs_it() {
+        let (config_dir, blob_root) = test_config_dir_with_blob_root("agent-asset-persist");
+        let asset = build_skill_asset_value(&json!({
+            "name": "triage",
+            "instructions": ["Classify the operator request."],
+            "constraints": ["Do not mutate state directly."]
+        }))
+        .expect("skill asset");
+
+        let (entry, written) = persist_agent_asset(&config_dir, asset).expect("persist asset");
+
+        assert!(written);
+        assert_eq!(entry.asset_type, "skill");
+        assert_eq!(entry.name.as_deref(), Some("triage"));
+        assert!(validate_hash64(&entry.hash));
+        assert!(blob_root
+            .join("agent-assets")
+            .join(format!("{}.json", entry.hash))
+            .exists());
+
+        let catalog =
+            bootstrap_agent_asset_catalog_from_config_dir(&config_dir).expect("bootstrap catalog");
+        let loaded = catalog.get(&entry.hash).expect("catalog entry");
+        assert!(loaded.valid);
+        assert_eq!(loaded.asset_type, "skill");
+
+        let _ = std::fs::remove_dir_all(config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn agent_asset_catalog_marks_filename_hash_mismatch_invalid() {
+        let (config_dir, blob_root) = test_config_dir_with_blob_root("agent-asset-corrupt");
+        let asset_dir = blob_root.join("agent-assets");
+        std::fs::create_dir_all(&asset_dir).expect("asset dir");
+        let wrong_hash = "1111111111111111111111111111111111111111111111111111111111111111";
+        std::fs::write(
+            asset_dir.join(format!("{wrong_hash}.json")),
+            br#"{"asset_type":"role","name":"broken","persona":"x"}"#,
+        )
+        .expect("write corrupt asset");
+
+        let catalog =
+            bootstrap_agent_asset_catalog_from_config_dir(&config_dir).expect("bootstrap catalog");
+        let entry = catalog.get(wrong_hash).expect("catalog entry");
+
+        assert!(!entry.valid);
+        assert!(entry
+            .error
+            .as_deref()
+            .is_some_and(|err| err.contains("filename hash mismatch")));
+
+        let _ = std::fs::remove_dir_all(config_dir.parent().unwrap());
     }
 
     #[test]

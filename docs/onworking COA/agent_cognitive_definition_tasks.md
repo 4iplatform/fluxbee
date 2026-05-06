@@ -85,16 +85,16 @@
 
 ## Phase G - Archi Asset Builder
 
-- [ ] G1. Add asset schemas for role, skill, and handbook.
-- [ ] G2. Add canonical JSON serializer and sha256 content hash.
-- [ ] G3. Write assets to blob path `agent-assets/<hash>.json`.
-- [ ] G4. Bootstrap in-memory asset catalog by scanning blob.
-- [ ] G5. Validate filename hash matches content on bootstrap.
-- [ ] G6. Add typed generation path for role assets.
-- [ ] G7. Add typed generation path for skill assets.
-- [ ] G8. Add typed generation path for handbook assets.
-- [ ] G9. Add UI/chat flow to show generated assets and target agent.
-- [ ] G10. Compile plan: run node, get ILK, set definition, verify CONFIG_GET.
+- [x] G1. Add asset schemas for role, skill, and handbook.
+- [x] G2. Add canonical JSON serializer and sha256 content hash.
+- [x] G3. Write assets to blob path `agent-assets/<hash>.json`.
+- [x] G4. Bootstrap in-memory asset catalog by scanning blob.
+- [x] G5. Validate filename hash matches content on bootstrap.
+- [x] G6. Add typed generation path for role assets.
+- [x] G7. Add typed generation path for skill assets.
+- [x] G8. Add typed generation path for handbook assets.
+- [x] G9. Add UI/chat flow to show generated assets and target agent.
+- [x] G10. Compile plan: run node, get ILK, set definition, verify CONFIG_GET.
 
 ## Phase H - E2E / Operational Validation
 

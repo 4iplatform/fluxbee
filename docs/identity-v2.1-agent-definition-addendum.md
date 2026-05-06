@@ -727,12 +727,12 @@ These are used primarily by Archi's executor. Direct invocation by humans or by 
 [x] ai.generic: report state via CONFIG_GET response
 [x] ai.generic: log all asset load successes and failures
 
-[ ] Archi: asset builder sub-agent with typed functions
-[ ] Archi: hash computation (sha256 of canonical JSON)
-[ ] Archi: write asset files to blob with hash filename
-[ ] Archi: in-memory catalog of assets
-[ ] Archi: bootstrap catalog by scanning blob on startup
-[ ] Archi: validate filename matches content hash on bootstrap
+[x] Archi: asset builder sub-agent with typed functions
+[x] Archi: hash computation (sha256 of canonical JSON)
+[x] Archi: write asset files to blob with hash filename
+[x] Archi: in-memory catalog of assets
+[x] Archi: bootstrap catalog by scanning blob on startup
+[x] Archi: validate filename matches content hash on bootstrap
 
 [ ] SDK: add set_ilk_definition (Rust)
 [ ] SDK: add SetIlkDefinition (Go)

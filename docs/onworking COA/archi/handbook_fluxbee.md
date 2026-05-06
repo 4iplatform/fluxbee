@@ -398,13 +398,19 @@ Rules:
 `ai.generic` agents boot with operational config first and receive their cognitive "alma" later through identity.
 
 Use:
+- `list_agent_assets` to inspect existing immutable role/skill/handbook assets
+- `create_agent_role_asset` to create the role asset
+- `create_agent_skill_asset` to create each skill asset
+- `create_agent_handbook_asset` to create each handbook/reference asset
 - `get_ilk` to resolve the target agent ILK
 - `set_ilk_definition` to apply role/skill/handbook hashes
 - `node_control_config_get` to verify the running agent loaded or rejected the definition
 
 Rules:
+- asset builder tools only write content-addressed files under `blob://agent-assets/<hash>.json`
 - `set_ilk_definition` updates identity only; it does not create blob assets
 - role, skill, and handbook assets must already exist in `blob://agent-assets/<hash>.json`
+- identity stores hashes only; never put prompt text, skill instructions, or handbook content directly in `set_ilk_definition`
 - OPA/routing can match `role_hash`, `skill_hashes`, and `handbook_hashes`, but cannot read blob contents
 - do not use legacy `roles` or `capabilities`; they are retired
 
