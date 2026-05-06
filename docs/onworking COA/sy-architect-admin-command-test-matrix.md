@@ -349,6 +349,22 @@ SCMD: curl -X GET /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446
   - detalle de ILK
   - filtra por `ilk_id` exacto en formato `ilk:<uuid>`
 
+[ ] `set_ilk_definition`
+
+- curl:
+```bash
+curl -sS -X POST "$BASE/hives/$LOCAL_HIVE/identity/ilks/$TEST_ILK/definition" \
+  -H "Content-Type: application/json" \
+  -d '{"definition":{"role_hash":"1111111111111111111111111111111111111111111111111111111111111111","skill_hashes":[],"handbook_hashes":[]}}'
+```
+- SCMD:
+```text
+SCMD: curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{"definition":{"role_hash":"1111111111111111111111111111111111111111111111111111111111111111","skill_hashes":[],"handbook_hashes":[]}}'
+```
+- check:
+  - requiere un ILK real de tipo agent
+  - actualiza `definition` y publica hashes a SHM
+
 [x] `list_routes`
 
 - curl:

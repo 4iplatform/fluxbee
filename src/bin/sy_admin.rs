@@ -66,6 +66,7 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "get_admin_action_help",
     "get_runtime",
     "list_nodes",
+    "set_ilk_definition",
     "publish_runtime_package",
     "sync_hint",
     "update",
@@ -2763,6 +2764,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "set_ilk_definition",
+        route: InternalActionRoute::Command("set_ilk_definition"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "list_tenants",
         route: InternalActionRoute::Query("list_tenants"),
         requires_target: true,
@@ -4256,6 +4263,31 @@ async fn handle_hive_paths(
             });
             let (status, resp) =
                 handle_admin_command(ctx, client, "get_ilk", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["identity", "ilks", ilk_id, "definition"]) => {
+            let mut payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            if !payload.is_object() {
+                return Ok(Some((
+                    400,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": "set_ilk_definition",
+                        "payload": serde_json::Value::Null,
+                        "error_code": "INVALID_REQUEST",
+                        "error_detail": "request body must be a JSON object",
+                    })
+                    .to_string(),
+                )));
+            }
+            payload["ilk_id"] = serde_json::Value::String(decode_percent(ilk_id));
+            let (status, resp) =
+                handle_admin_command(ctx, client, "set_ilk_definition", payload, Some(hive))
+                    .await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["identity", "tenants"]) => {
@@ -6216,6 +6248,7 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "kill_node"
             | "remove_node_instance"
             | "remove_runtime_version"
+            | "set_ilk_definition"
             | "set_node_config"
             | "node_control_config_set"
             | "set_storage"
@@ -6252,6 +6285,9 @@ fn admin_action_summary(action: &str) -> &'static str {
         }
         "list_ilks" => "List identity ilks in a hive.",
         "get_ilk" => "Read one identity ilk.",
+        "set_ilk_definition" => {
+            "Set the cognitive definition hashes for one identity agent ILK."
+        }
         "list_tenants" => "List identity tenants in a hive.",
         "get_tenant" => "Read one identity tenant in a hive.",
         "update_tenant" => "Update mutable fields of one identity tenant in a hive.",
@@ -6336,6 +6372,9 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         }
         "list_ilks" => vec!["GET /hives/{hive}/identity/ilks"],
         "get_ilk" => vec!["GET /hives/{hive}/identity/ilks/{ilk_id}"],
+        "set_ilk_definition" => {
+            vec!["POST /hives/{hive}/identity/ilks/{ilk_id}/definition"]
+        }
         "list_tenants" => vec!["GET /hives/{hive}/identity/tenants"],
         "get_tenant" => vec!["GET /hives/{hive}/identity/tenants/{tenant_id}"],
         "update_tenant" => vec!["PUT /hives/{hive}/identity/tenants/{tenant_id}"],
@@ -6508,7 +6547,7 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             admin_action_path_param("runtime", "string", "Runtime name, for example ai.chat."),
             admin_action_path_param("version", "string", "Runtime version to delete."),
         ],
-        "get_ilk" => vec![
+        "get_ilk" | "set_ilk_definition" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
             admin_action_path_param(
                 "ilk_id",
@@ -6582,6 +6621,7 @@ fn admin_action_body_required(action: &str) -> bool {
             | "node_control_config_set"
             | "set_storage"
             | "update"
+            | "set_ilk_definition"
             | "update_tenant"
             | "set_tenant_sponsor"
             | "opa_compile_apply"
@@ -6728,6 +6768,11 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             "sponsor_tenant_id",
             "string|null",
             "Prefixed tenant id to assign as sponsor, or null to clear the sponsor relationship.",
+        )],
+        "set_ilk_definition" => vec![admin_action_body_field(
+            "definition",
+            "object",
+            "Cognitive definition object with role_hash, skill_hashes, and handbook_hashes.",
         )],
         _ => Vec::new(),
     }
@@ -7281,6 +7326,17 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         "set_tenant_sponsor" => serde_json::json!({
             "sponsor_tenant_id": serde_json::Value::Null
         }),
+        "set_ilk_definition" => serde_json::json!({
+            "definition": {
+                "role_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+                "skill_hashes": [
+                    "2222222222222222222222222222222222222222222222222222222222222222"
+                ],
+                "handbook_hashes": [
+                    "3333333333333333333333333333333333333333333333333333333333333333"
+                ]
+            }
+        }),
         "remove_runtime_version" => serde_json::json!({
             "test_hold_ms": 250
         }),
@@ -7333,6 +7389,9 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "list_ilks" => "curl -X GET /hives/motherbee/identity/ilks",
         "get_ilk" => {
             "curl -X GET /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000"
+        }
+        "set_ilk_definition" => {
+            r#"curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{"definition":{"role_hash":"1111111111111111111111111111111111111111111111111111111111111111","skill_hashes":["2222222222222222222222222222222222222222222222222222222222222222"],"handbook_hashes":["3333333333333333333333333333333333333333333333333333333333333333"]}}'"#
         }
         "list_tenants" => "curl -X GET /hives/motherbee/identity/tenants",
         "get_tenant" => {
@@ -7539,6 +7598,12 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The ilk_id path segment must use the prefixed UUID format ilk:<uuid>.",
             "Identity may resolve an old alias ILK to its canonical ILK if an alias mapping exists.",
             "This lookup is by ILK identifier, not by channel address, node name, or tenant.",
+        ],
+        "set_ilk_definition" => vec![
+            "This mutates the cognitive definition stored on one agent ILK.",
+            "The body must include definition.role_hash, definition.skill_hashes, and definition.handbook_hashes; use null or empty arrays to clear optional parts.",
+            "Identity validates hash format and v1 limits before persisting and publishing the SHM update.",
+            "This does not create the blob assets; Archi must write canonical role/skill/handbook assets to blob before applying the hashes.",
         ],
         "list_tenants" => vec![
             "Lists the identity tenants currently known by SY.identity for one hive.",
@@ -9191,7 +9256,7 @@ async fn handle_admin_command(
     }
     if matches!(
         action,
-        "get_ilk" | "get_tenant" | "update_tenant" | "set_tenant_sponsor"
+        "get_ilk" | "set_ilk_definition" | "get_tenant" | "update_tenant" | "set_tenant_sponsor"
     ) {
         return handle_identity_command(ctx, client, action, payload, hive).await;
     }
@@ -9507,6 +9572,7 @@ async fn handle_identity_command(
     let target = format!("SY.identity@{}", target_hive);
     let (request_msg, response_msg) = match action {
         "get_ilk" => ("ILK_GET", "ILK_GET_RESPONSE"),
+        "set_ilk_definition" => ("ILK_SET_DEFINITION", "ILK_SET_DEFINITION_RESPONSE"),
         "get_tenant" => ("TNT_GET", "TNT_GET_RESPONSE"),
         "update_tenant" => ("TNT_UPDATE", "TNT_UPDATE_RESPONSE"),
         "set_tenant_sponsor" => ("TNT_SET_SPONSOR", "TNT_SET_SPONSOR_RESPONSE"),
@@ -11670,6 +11736,22 @@ mod tests {
         assert_eq!(
             admin_action_path_patterns("publish_runtime_package"),
             vec!["POST /admin/runtime-packages/publish"]
+        );
+    }
+
+    #[test]
+    fn set_ilk_definition_action_is_registered() {
+        let spec = resolve_internal_action_spec("set_ilk_definition").expect("action must exist");
+        assert!(spec.requires_target);
+        assert!(admin_action_requires_confirmation("set_ilk_definition"));
+        assert_eq!(
+            admin_action_path_patterns("set_ilk_definition"),
+            vec!["POST /hives/{hive}/identity/ilks/{ilk_id}/definition"]
+        );
+        assert_eq!(
+            admin_action_example_scmd("set_ilk_definition")
+                .expect("set_ilk_definition should expose example_scmd"),
+            r#"curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{"definition":{"role_hash":"1111111111111111111111111111111111111111111111111111111111111111","skill_hashes":["2222222222222222222222222222222222222222222222222222222222222222"],"handbook_hashes":["3333333333333333333333333333333333333333333333333333333333333333"]}}'"#
         );
     }
 

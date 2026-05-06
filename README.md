@@ -869,9 +869,21 @@ curl -sS "$BASE/hives/$HIVE_ID/identity/ilks" | jq .
 
 # full detail for one ILK
 curl -sS "$BASE/hives/$HIVE_ID/identity/ilks/$ILK_ID" | jq .
+
+# set cognitive definition hashes for an agent ILK
+curl -sS -X POST "$BASE/hives/$HIVE_ID/identity/ilks/$ILK_ID/definition" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "definition": {
+      "role_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+      "skill_hashes": [],
+      "handbook_hashes": []
+    }
+  }' | jq .
 ```
 
 `GET /hives/{hive}/identity/ilks` returns a compact row per ILK with `ilk_id`, `ilk_type`, `registration_status`, `tenant_id`, `tenant_name`, `display_name`, `node_name`, `channel_count`, `channels` (`ich_id`, `channel_type`, `address`), and `deleted_at_ms`.
+`POST /hives/{hive}/identity/ilks/{ilk_id}/definition` forwards `ILK_SET_DEFINITION` to `SY.identity`; identity validates the target is an agent ILK and publishes the hash facts to identity SHM for router/OPA projection.
 
 ### Debug message to one node
 
@@ -957,6 +969,7 @@ Current HTTP surface exposed by `SY.admin`.
 | `POST` | `/hives/{hive}/nodes/{name}/control/config-set` | Apply node-owned control-plane config (`CONFIG_SET`) |
 | `GET` | `/hives/{hive}/identity/ilks` | List ILKs on hive (compact identity view) |
 | `GET` | `/hives/{hive}/identity/ilks/{ilk_id}` | Read one ILK with resolved tenant/alias detail |
+| `POST` | `/hives/{hive}/identity/ilks/{ilk_id}/definition` | Set cognitive definition hashes for one agent ILK |
 | `GET` | `/hives/{hive}/identity/tenants` | List tenants on hive (summary view for sponsor/default discovery) |
 | `GET` | `/hives/{hive}/identity/tenants/{tenant_id}` | Read one tenant with resolved sponsor detail |
 | `PUT` | `/hives/{hive}/identity/tenants/{tenant_id}` | Update mutable tenant fields |

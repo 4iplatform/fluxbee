@@ -60,11 +60,11 @@
 ## Phase E - Admin / SDK Surface
 
 - [x] E1. Add Rust SDK constant/helper for `ILK_SET_DEFINITION`.
-- [ ] E2. Add `SY.admin` wrapper action `set_ilk_definition`.
-- [ ] E3. Expose `POST /hives/{hive}/identity/ilks/{ilk_id}/definition`.
-- [ ] E4. Add admin help entry with request contract and example SCMD.
-- [ ] E5. Add Archi SCMD translation for the definition endpoint.
-- [ ] E6. Update README endpoint table.
+- [x] E2. Add `SY.admin` wrapper action `set_ilk_definition`.
+- [x] E3. Expose `POST /hives/{hive}/identity/ilks/{ilk_id}/definition`.
+- [x] E4. Add admin help entry with request contract and example SCMD.
+- [x] E5. Add Archi SCMD translation for the definition endpoint.
+- [x] E6. Update README endpoint table.
 
 ## Phase F - ai.generic Runtime
 

@@ -850,6 +850,7 @@ impl FunctionTool for ArchitectSystemGetTool {
                 Supports GET and safe POST checks (OPA policy check, node CONFIG_GET). \
                 Key paths: /inventory (all nodes), /versions, /hives/{{hive}}/runtimes, \
                 /hives/{{hive}}/nodes, /hives/{{hive}}/nodes/{{name}}/config (persisted), \
+                /hives/{{hive}}/identity/ilks, /hives/{{hive}}/identity/ilks/{{ilk_id}}, \
                 /hives/{{hive}}/identity/tenants, /hives/{{hive}}/identity/tenants/{{tenant_id}}, \
                 /hives/{{hive}}/nodes/{{name}}/control/config-get (live contract), \
                 /hives/{{hive}}/wf-rules, /hives/{{hive}}/drift-alerts, \
@@ -7678,6 +7679,7 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
                 "SCMD: curl -X GET /hives/motherbee/nodes/SY.frontdesk.gov@motherbee/config",
                 "SCMD: curl -X POST /hives/motherbee/nodes/AI.chat@motherbee/control/config-get -d '{\"requested_by\":\"archi\"}'",
                 "SCMD: curl -X GET /hives/motherbee/identity/ilks",
+                "SCMD: curl -X GET /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000",
                 "SCMD: curl -X GET /hives/motherbee/deployments",
                 "SCMD: curl -X GET /hives/motherbee/drift-alerts",
                 "SCMD: curl -X GET /hives/motherbee/timer/help",
@@ -7690,6 +7692,7 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
                 "SCMD: curl -X POST /hives -d '{\"hive_id\":\"worker-220\",\"address\":\"192.168.8.220\"}'",
                 "SCMD: curl -X POST /hives/motherbee/sync-hint -d '{\"channel\":\"blob\",\"wait_for_idle\":true,\"timeout_ms\":30000}'",
                 "SCMD: curl -X POST /hives/motherbee/nodes -d '{\"node_name\":\"AI.chat@motherbee\",\"runtime_version\":\"current\"}'",
+                "SCMD: curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{\"definition\":{\"role_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"skill_hashes\":[],\"handbook_hashes\":[]}}'",
                 "SCMD: curl -X PUT /hives/motherbee/nodes/SY.frontdesk.gov@motherbee/config -d '{\"openai\":{\"default_model\":\"gpt-4.1-mini\"}}'"
             ]
         }
@@ -7909,6 +7912,7 @@ fn admin_action_allows_ai_write(action: &str) -> bool {
             | "kill_node"
             | "remove_node_instance"
             | "remove_runtime_version"
+            | "set_ilk_definition"
             | "set_node_config"
             | "node_control_config_set"
             | "send_node_message"
@@ -8644,6 +8648,19 @@ fn translate_scmd(
             target_hive: (*hive_id).to_string(),
             params: json!({ "ilk_id": ilk_id }),
         }),
+        ("POST", ["hives", hive_id, "identity", "ilks", ilk_id, "definition"]) => {
+            let mut params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for set_ilk_definition must be a JSON object".into());
+            }
+            params["ilk_id"] = Value::String((*ilk_id).to_string());
+            Ok(AdminTranslation {
+                admin_target,
+                action: "set_ilk_definition".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
         ("GET", ["hives", hive_id, "versions"]) => Ok(AdminTranslation {
             admin_target,
             action: "get_versions".to_string(),
@@ -20772,6 +20789,32 @@ mod tests {
                 "tenant_id": "tnt:550e8400-e29b-41d4-a716-446655440000"
             })
         );
+    }
+
+    #[test]
+    fn translate_set_ilk_definition_scmd() {
+        let translated = translate_scmd(
+            "motherbee",
+            parse(
+                r#"curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{"definition":{"role_hash":"1111111111111111111111111111111111111111111111111111111111111111","skill_hashes":[],"handbook_hashes":[]}}'"#,
+            ),
+        )
+        .expect("translation should succeed");
+
+        assert_eq!(translated.action, "set_ilk_definition");
+        assert_eq!(translated.target_hive, "motherbee");
+        assert_eq!(
+            translated.params,
+            json!({
+                "ilk_id": "ilk:550e8400-e29b-41d4-a716-446655440000",
+                "definition": {
+                    "role_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+                    "skill_hashes": [],
+                    "handbook_hashes": []
+                }
+            })
+        );
+        assert!(admin_action_allows_ai_write("set_ilk_definition"));
     }
 
     #[test]

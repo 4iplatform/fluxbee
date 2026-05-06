@@ -193,6 +193,13 @@ Archi accede al mismo endpoint a través del sistema de lectura genérico (`flux
 - **Read-only:** sí
 - **Path param:** `ilk_id` en formato `ilk:<uuid>`
 
+### `set_ilk_definition`
+- **Path:** `POST /hives/{hive}/identity/ilks/{ilk_id}/definition`
+- **Read-only:** no
+- **Path param:** `ilk_id` en formato `ilk:<uuid>`
+- **Body:** `definition` con `role_hash`, `skill_hashes`, `handbook_hashes`
+- **Uso:** aplica la definición cognitiva de un agent ILK; no crea assets blob, solo registra los hashes validados en identity/SHM.
+
 ### `inventory`
 - **Path:** `GET /inventory`, `GET /inventory/summary`, `GET /inventory/{hive}`, `GET /hives/{hive}/inventory/summary`
 - **Descripción:** Inventario global o por hive incluyendo visibilidad de nodos del sistema completo.

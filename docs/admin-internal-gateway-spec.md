@@ -229,6 +229,7 @@ Implementación actual:
 | `POST /hives/{id}/nodes/{name}/messages` | `send_node_message` | `handle_admin_command` (direct debug emit via router) |
 | `GET /hives/{id}/identity/ilks` | `list_ilks` | `handle_admin_query` -> `SY.identity` (`ILK_LIST`) |
 | `GET /hives/{id}/identity/ilks/{ilk_id}` | `get_ilk` | `handle_admin_command` -> `SY.identity` (`ILK_GET`) |
+| `POST /hives/{id}/identity/ilks/{ilk_id}/definition` | `set_ilk_definition` | `handle_admin_command` -> `SY.identity` (`ILK_SET_DEFINITION`) |
 
 ### 7.1.1 Planned node config control-plane wrappers (non-`SY`)
 

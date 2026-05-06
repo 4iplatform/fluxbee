@@ -393,6 +393,21 @@ Rules:
 - if the task says "same tenant as an existing node", prefer reading the node config/live config to find the exact `tenant_id`, then validate that tenant with `get_tenant`
 - if no reliable tenant can be found, block and ask for exactly one missing tenant clarification
 
+### 8.1.2 Agent cognitive definition
+
+`ai.generic` agents boot with operational config first and receive their cognitive "alma" later through identity.
+
+Use:
+- `get_ilk` to resolve the target agent ILK
+- `set_ilk_definition` to apply role/skill/handbook hashes
+- `node_control_config_get` to verify the running agent loaded or rejected the definition
+
+Rules:
+- `set_ilk_definition` updates identity only; it does not create blob assets
+- role, skill, and handbook assets must already exist in `blob://agent-assets/<hash>.json`
+- OPA/routing can match `role_hash`, `skill_hashes`, and `handbook_hashes`, but cannot read blob contents
+- do not use legacy `roles` or `capabilities`; they are retired
+
 ### 8.2 IO tenant naming
 
 Single-tenant IO node:
