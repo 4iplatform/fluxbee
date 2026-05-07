@@ -1040,6 +1040,11 @@ This is the effective port map for current deployments.
 
 **Bootstrap behavior:**
 
+- `scripts/install.sh` runs `scripts/fluxbee_db_bootstrap.sh` by default when local `psql` is available.
+- The DB bootstrap is installation/package infrastructure only: it creates local PostgreSQL role/DBs but does not write Fluxbee node secrets.
+- Default managed DBs: `fluxbee`, `fluxbee_identity`, `fluxbee_storage`.
+- For clean test installs, run install with `FLUXBEE_DB_RESET=1`; this terminates active connections and recreates the managed DBs.
+- Override the DB owner with `FLUXBEE_DB_USER=<role>`; if omitted, the bootstrap uses existing `sa`, then existing `fluxbee`, else creates `fluxbee`.
 - `SY.identity` exposes `CONFIG_GET` / `CONFIG_SET` for its primary DB bootstrap. Precedence: local `secrets.json` via `CONFIG_SET` → env overrides.
 - `SY.storage` precedence: local `secrets.json` via `CONFIG_SET` → env overrides. Does **not** use `database.url` in `hive.yaml`.
 - On motherbee startup, each service ensures its own database exists (`CREATE DATABASE` if missing) and then ensures its own schema/tables.

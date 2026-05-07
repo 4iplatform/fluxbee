@@ -9,6 +9,7 @@ APPLY_DEV_OWNERSHIP="${APPLY_DEV_OWNERSHIP:-1}"
 INSTALL_OWNER="${INSTALL_OWNER:-${SUDO_USER:-$USER}}"
 RESTART_ORCHESTRATOR_AFTER_INSTALL="${RESTART_ORCHESTRATOR_AFTER_INSTALL:-1}"
 CLEAN_RUNTIME_VOLATILE_ON_INSTALL="${CLEAN_RUNTIME_VOLATILE_ON_INSTALL:-1}"
+FLUXBEE_DB_BOOTSTRAP_ON_INSTALL="${FLUXBEE_DB_BOOTSTRAP_ON_INSTALL:-1}"
 SEED_RUNTIME_FIXTURE="${SEED_RUNTIME_FIXTURE:-0}"
 RESEED_SYNCTHING_CONFIG_ON_INSTALL="${RESEED_SYNCTHING_CONFIG_ON_INSTALL:-0}"
 RUNTIME_FIXTURE_NAME="${RUNTIME_FIXTURE_NAME:-wf.orch.diag}"
@@ -299,6 +300,21 @@ if [[ "$CLEAN_RUNTIME_VOLATILE_ON_INSTALL" == "1" ]]; then
   cleanup_volatile_runtime_artifacts
 else
   echo "CLEAN_RUNTIME_VOLATILE_ON_INSTALL=0: preserving router sockets and SHM artifacts."
+fi
+
+if [[ "$FLUXBEE_DB_BOOTSTRAP_ON_INSTALL" == "1" ]]; then
+  if [[ -x "$ROOT_DIR/scripts/fluxbee_db_bootstrap.sh" ]]; then
+    if command -v psql >/dev/null 2>&1; then
+      echo "Bootstrapping local PostgreSQL databases..."
+      bash "$ROOT_DIR/scripts/fluxbee_db_bootstrap.sh"
+    else
+      echo "Warning: psql not found; skipping local PostgreSQL database bootstrap." >&2
+    fi
+  else
+    echo "Warning: database bootstrap script not found or not executable; skipping." >&2
+  fi
+else
+  echo "FLUXBEE_DB_BOOTSTRAP_ON_INSTALL=0: skipping local PostgreSQL database bootstrap."
 fi
 
 MOTHERBEE_KEY="$STATE_DIR/ssh/motherbee.key"
