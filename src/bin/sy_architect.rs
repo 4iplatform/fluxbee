@@ -4539,6 +4539,7 @@ async fn main() -> Result<(), ArchitectError> {
         .route("/api/attachments", any(dynamic_handler))
         .route("/api/software/upload", any(dynamic_handler))
         .route("/api/software/publish", any(dynamic_handler))
+        .route("/api/agent-assets", any(dynamic_handler))
         .route("/api/sessions", any(dynamic_handler))
         .route("/api/sessions/*path", any(dynamic_handler))
         .route("/*path", any(dynamic_handler))
@@ -5352,17 +5353,8 @@ fn persist_agent_asset(
     Ok((entry, !existed))
 }
 
-async fn write_agent_asset_and_update_catalog(
-    context: &ArchitectAdminToolContext,
-    asset: Value,
-) -> Result<Value, ArchitectError> {
-    let (entry, written) = persist_agent_asset(&context.config_dir, asset)?;
-    context
-        .agent_asset_catalog
-        .write()
-        .await
-        .insert(entry.hash.clone(), entry.clone());
-    Ok(json!({
+fn agent_asset_write_response(entry: AgentAssetCatalogEntry, written: bool) -> Value {
+    json!({
         "status": "ok",
         "written": written,
         "asset": entry,
@@ -5373,7 +5365,155 @@ async fn write_agent_asset_and_update_catalog(
             _ => Value::Null,
         },
         "next_step": "Use fluxbee_plan_compiler with set_ilk_definition to apply these hashes to the target agent ILK, then verify node CONFIG_GET.",
+    })
+}
+
+async fn create_agent_asset_for_state(
+    state: &ArchitectState,
+    requested: Value,
+) -> Result<Value, ArchitectError> {
+    let asset_type = requested
+        .get("asset_type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "agent asset request requires asset_type".to_string())?;
+    let asset = match asset_type {
+        "role" => build_role_asset_value(&requested)?,
+        "skill" => build_skill_asset_value(&requested)?,
+        "handbook" => build_handbook_asset_value(&requested)?,
+        _ => return Err(format!("unsupported agent asset_type '{asset_type}'").into()),
+    };
+    let (entry, written) = persist_agent_asset(&state.config_dir, asset)?;
+    state
+        .agent_asset_catalog
+        .write()
+        .await
+        .insert(entry.hash.clone(), entry.clone());
+    Ok(agent_asset_write_response(entry, written))
+}
+
+async fn list_agent_assets_for_state(
+    state: &ArchitectState,
+    asset_type: Option<&str>,
+    include_invalid: bool,
+    refresh: bool,
+) -> Result<Value, ArchitectError> {
+    if refresh {
+        let catalog = bootstrap_agent_asset_catalog_from_config_dir(&state.config_dir)?;
+        *state.agent_asset_catalog.write().await = catalog;
+    }
+    let catalog = state.agent_asset_catalog.read().await;
+    let mut assets = catalog
+        .values()
+        .filter(|entry| include_invalid || entry.valid)
+        .filter(|entry| {
+            asset_type
+                .map(|wanted| entry.asset_type == wanted)
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assets.sort_by(|a, b| {
+        a.asset_type
+            .cmp(&b.asset_type)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.hash.cmp(&b.hash))
+    });
+    Ok(json!({
+        "status": "ok",
+        "asset_count": assets.len(),
+        "assets": assets,
     }))
+}
+
+async fn handle_agent_asset_request(
+    state: &ArchitectState,
+    method: Method,
+    uri: &Uri,
+    request: Request,
+) -> Result<Value, ArchitectError> {
+    match method {
+        Method::GET => {
+            let query = uri.query().unwrap_or("");
+            let asset_type = query_param(query, "asset_type");
+            let include_invalid = query_bool_param(query, "include_invalid").unwrap_or(false);
+            let refresh = query_bool_param(query, "refresh").unwrap_or(true);
+            list_agent_assets_for_state(state, asset_type.as_deref(), include_invalid, refresh)
+                .await
+        }
+        Method::POST => {
+            let body = axum::body::to_bytes(request.into_body(), AGENT_ASSET_MAX_BYTES)
+                .await
+                .map_err(|err| format!("invalid body: {err}"))?;
+            let value: Value =
+                serde_json::from_slice(&body).map_err(|err| format!("invalid json: {err}"))?;
+            create_agent_asset_for_state(state, value).await
+        }
+        _ => Err("unsupported method for /api/agent-assets".into()),
+    }
+}
+
+fn query_param(query: &str, key: &str) -> Option<String> {
+    for pair in query.split('&').filter(|value| !value.is_empty()) {
+        let mut parts = pair.splitn(2, '=');
+        let Some(raw_key) = parts.next() else {
+            continue;
+        };
+        if raw_key == key {
+            return parts
+                .next()
+                .map(percent_decode_simple)
+                .filter(|value| !value.trim().is_empty());
+        }
+    }
+    None
+}
+
+fn query_bool_param(query: &str, key: &str) -> Option<bool> {
+    query_param(query, key).and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Some(true),
+        "0" | "false" | "no" => Some(false),
+        _ => None,
+    })
+}
+
+fn percent_decode_simple(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = &raw[i + 1..i + 3];
+            if let Ok(value) = u8::from_str_radix(hex, 16) {
+                out.push(value);
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+async fn write_agent_asset_and_update_catalog(
+    context: &ArchitectAdminToolContext,
+    asset: Value,
+) -> Result<Value, ArchitectError> {
+    let (entry, written) = persist_agent_asset(&context.config_dir, asset)?;
+    context
+        .agent_asset_catalog
+        .write()
+        .await
+        .insert(entry.hash.clone(), entry.clone());
+    Ok(agent_asset_write_response(entry, written))
 }
 
 fn fluxbee_tool_protocol_err(err: ArchitectError) -> fluxbee_ai_sdk::AiSdkError {
@@ -6229,6 +6369,7 @@ async fn dynamic_handler(
     request: Request,
 ) -> Response {
     let path = uri.path();
+    let request_method = method.clone();
     match (method, path) {
         (Method::GET, _) if is_favicon_path(path) => serve_favicon(path),
         (Method::GET, _) if is_status_path(path) => {
@@ -6519,6 +6660,16 @@ async fn dynamic_handler(
             };
             let out = handle_software_publish_request(&state, req).await;
             Json(out).into_response()
+        }
+        (Method::GET, _) | (Method::POST, _) if is_agent_assets_path(path) => {
+            match handle_agent_asset_request(&state, request_method, &uri, request).await {
+                Ok(response) => Json(response).into_response(),
+                Err(err) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": err.to_string() })),
+                )
+                    .into_response(),
+            }
         }
         (Method::POST, _) if is_attachments_path(path) => {
             match handle_attachment_upload(&state, request).await {
@@ -12010,6 +12161,10 @@ fn is_software_upload_path(path: &str) -> bool {
 
 fn is_software_publish_path(path: &str) -> bool {
     path == "/api/software/publish" || path.ends_with("/api/software/publish")
+}
+
+fn is_agent_assets_path(path: &str) -> bool {
+    path == "/api/agent-assets" || path.ends_with("/api/agent-assets")
 }
 
 fn is_identity_ich_options_path(path: &str) -> bool {

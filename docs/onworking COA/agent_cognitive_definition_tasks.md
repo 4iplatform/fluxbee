@@ -98,6 +98,7 @@
 
 ## Phase H - E2E / Operational Validation
 
+- [x] H0. Add reproducible E2E harness: `scripts/agent_cognitive_definition_e2e.sh`.
 - [ ] H1. Start `AI.test@motherbee` on `ai.generic` without definition and verify default prompt.
 - [ ] H2. Generate role/skill/handbook assets through Archi.
 - [ ] H3. Apply `ILK_SET_DEFINITION` and verify SHM seq increments.

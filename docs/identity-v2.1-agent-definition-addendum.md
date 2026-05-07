@@ -734,6 +734,8 @@ These are used primarily by Archi's executor. Direct invocation by humans or by 
 [x] Archi: bootstrap catalog by scanning blob on startup
 [x] Archi: validate filename matches content hash on bootstrap
 
+[x] E2E: add reproducible harness at `scripts/agent_cognitive_definition_e2e.sh`
+
 [ ] SDK: add set_ilk_definition (Rust)
 [ ] SDK: add SetIlkDefinition (Go)
 
