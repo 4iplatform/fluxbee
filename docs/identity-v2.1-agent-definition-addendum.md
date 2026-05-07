@@ -524,7 +524,9 @@ After bootstrap, Archi has full visibility of available assets and can answer qu
 
 Assets are immutable once created (their hash is their identity). Updating an asset means generating a new file with a new hash and updating references in the ILKs that should use the new version. The old asset remains in blob — useful for audit, rollback, or other agents still using it.
 
-Archi may eventually run garbage collection (delete assets in blob that are no longer referenced by any ILK), but this is optional and not in v1.
+Archi can delete an explicit local asset by hash when the operator asks. Deletion only removes `blob://agent-assets/<hash>.json` and the in-memory catalog entry; it does not mutate ILK definitions. If an active ILK still references the deleted hash, the agent can become `partial` until the definition is updated.
+
+Automatic garbage collection of unreferenced assets is still optional and not in v1.
 
 ---
 

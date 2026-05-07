@@ -120,6 +120,7 @@ Never stage writes. Never call admin mutation endpoints directly.
 - `fluxbee_plan_compiler` — primary path for clear mutations, from one step to many steps. It translates the task to an executor_plan and executes only after the operator confirms the prepared plan.
 - `fluxbee_start_pipeline` — for broad design intents that need manifest + reconcile before a plan can be produced: new topology, multi-resource architecture, or unclear desired-state work.
 - `create_agent_role_asset`, `create_agent_skill_asset`, `create_agent_handbook_asset` — create immutable local blob assets for an agent's cognitive definition. These only write content-addressed files under `blob://agent-assets/`; they do not mutate identity, run nodes, or apply the definition.
+- `delete_agent_asset` — delete a local blob asset by hash only when the operator explicitly asks. It does not mutate existing ILK definitions; agents that still reference the hash can become `partial` until the definition is updated.
 
 If the operator's mutation intent is clear, call `fluxbee_plan_compiler` directly. Do not ask "should I continue?" first. The operator confirms once, after the plan is ready. Do not claim a mutation ran before confirmation.
 
@@ -850,6 +851,7 @@ impl FunctionToolProvider for ArchitectAdminReadToolsProvider {
     fn register_tools(&self, registry: &mut FunctionToolRegistry) -> fluxbee_ai_sdk::Result<()> {
         registry.register(Arc::new(ArchitectSystemGetTool::new(self.context.clone())))?;
         registry.register(Arc::new(ListAgentAssetsTool::new(self.context.clone())))?;
+        registry.register(Arc::new(DeleteAgentAssetTool::new(self.context.clone())))?;
         registry.register(Arc::new(CreateAgentRoleAssetTool::new(
             self.context.clone(),
         )))?;
@@ -1061,6 +1063,53 @@ impl FunctionTool for ListAgentAssetsTool {
             "asset_count": assets.len(),
             "assets": assets,
         }))
+    }
+}
+
+struct DeleteAgentAssetTool {
+    context: ArchitectAdminToolContext,
+}
+
+impl DeleteAgentAssetTool {
+    fn new(context: ArchitectAdminToolContext) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl FunctionTool for DeleteAgentAssetTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "delete_agent_asset".to_string(),
+            description: "Delete one local cognitive asset from blob://agent-assets/<hash>.json by 64-hex hash. Use only when the operator explicitly asks. Does not mutate existing ILK definitions; agents still referencing the deleted hash can become partial.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["hash"],
+                "properties": {
+                    "hash": {
+                        "type": "string",
+                        "description": "64-hex content hash of the role, skill, or handbook asset to delete."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let hash = arguments
+            .get("hash")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(
+                    "delete_agent_asset requires a non-empty 'hash'".to_string(),
+                )
+            })?;
+        delete_agent_asset_and_update_catalog(&self.context, hash)
+            .await
+            .map_err(fluxbee_tool_protocol_err)
     }
 }
 
@@ -4913,6 +4962,15 @@ fn validate_hash64(hash: &str) -> bool {
     hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+fn normalize_agent_asset_hash(hash: &str) -> Result<String, ArchitectError> {
+    let normalized = hash.trim().to_ascii_lowercase();
+    if validate_hash64(&normalized) {
+        Ok(normalized)
+    } else {
+        Err("agent asset hash must be a 64-hex sha256 value".into())
+    }
+}
+
 fn canonicalize_json_value(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
@@ -5368,6 +5426,46 @@ fn agent_asset_write_response(entry: AgentAssetCatalogEntry, written: bool) -> V
     })
 }
 
+fn delete_agent_asset_from_disk(
+    config_dir: &Path,
+    hash: &str,
+) -> Result<(String, PathBuf, Option<AgentAssetCatalogEntry>, bool), ArchitectError> {
+    let hash = normalize_agent_asset_hash(hash)?;
+    let asset_dir = agent_assets_dir_from_config_dir(config_dir)?;
+    let path = asset_dir.join(format!("{hash}.json"));
+    let previous_entry = if path.exists() {
+        Some(agent_asset_catalog_entry_from_file(&path))
+    } else {
+        None
+    };
+    let deleted = if path.exists() {
+        fs::remove_file(&path)
+            .map_err(|err| format!("failed to delete agent asset '{}': {err}", path.display()))?;
+        true
+    } else {
+        false
+    };
+    Ok((hash, path, previous_entry, deleted))
+}
+
+fn agent_asset_delete_response(
+    hash: String,
+    path: PathBuf,
+    previous_entry: Option<AgentAssetCatalogEntry>,
+    catalog_entry: Option<AgentAssetCatalogEntry>,
+    deleted: bool,
+) -> Value {
+    json!({
+        "status": "ok",
+        "deleted": deleted,
+        "hash": hash,
+        "blob_uri": format!("blob://agent-assets/{hash}.json"),
+        "path": path.display().to_string(),
+        "asset": previous_entry.or(catalog_entry),
+        "definition_warning": "This only deletes the local asset file and catalog entry. Existing ILK definitions are not mutated; agents that reference the deleted hash can become partial until the definition is updated.",
+    })
+}
+
 async fn create_agent_asset_for_state(
     state: &ArchitectState,
     requested: Value,
@@ -5427,6 +5525,22 @@ async fn list_agent_assets_for_state(
     }))
 }
 
+async fn delete_agent_asset_for_state(
+    state: &ArchitectState,
+    hash: &str,
+) -> Result<Value, ArchitectError> {
+    let (hash, path, previous_entry, deleted) =
+        delete_agent_asset_from_disk(&state.config_dir, hash)?;
+    let catalog_entry = state.agent_asset_catalog.write().await.remove(&hash);
+    Ok(agent_asset_delete_response(
+        hash,
+        path,
+        previous_entry,
+        catalog_entry,
+        deleted,
+    ))
+}
+
 async fn handle_agent_asset_request(
     state: &ArchitectState,
     method: Method,
@@ -5449,6 +5563,29 @@ async fn handle_agent_asset_request(
             let value: Value =
                 serde_json::from_slice(&body).map_err(|err| format!("invalid json: {err}"))?;
             create_agent_asset_for_state(state, value).await
+        }
+        Method::DELETE => {
+            let query = uri.query().unwrap_or("");
+            let hash = if let Some(hash) = query_param(query, "hash") {
+                hash
+            } else {
+                let body = axum::body::to_bytes(request.into_body(), 4096)
+                    .await
+                    .map_err(|err| format!("invalid body: {err}"))?;
+                if body.is_empty() {
+                    return Err(
+                        "DELETE /api/agent-assets requires query or body field 'hash'".into(),
+                    );
+                }
+                let value: Value =
+                    serde_json::from_slice(&body).map_err(|err| format!("invalid json: {err}"))?;
+                value
+                    .get("hash")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| "DELETE /api/agent-assets requires field 'hash'".to_string())?
+            };
+            delete_agent_asset_for_state(state, &hash).await
         }
         _ => Err("unsupported method for /api/agent-assets".into()),
     }
@@ -5514,6 +5651,22 @@ async fn write_agent_asset_and_update_catalog(
         .await
         .insert(entry.hash.clone(), entry.clone());
     Ok(agent_asset_write_response(entry, written))
+}
+
+async fn delete_agent_asset_and_update_catalog(
+    context: &ArchitectAdminToolContext,
+    hash: &str,
+) -> Result<Value, ArchitectError> {
+    let (hash, path, previous_entry, deleted) =
+        delete_agent_asset_from_disk(&context.config_dir, hash)?;
+    let catalog_entry = context.agent_asset_catalog.write().await.remove(&hash);
+    Ok(agent_asset_delete_response(
+        hash,
+        path,
+        previous_entry,
+        catalog_entry,
+        deleted,
+    ))
 }
 
 fn fluxbee_tool_protocol_err(err: ArchitectError) -> fluxbee_ai_sdk::AiSdkError {
@@ -6661,7 +6814,9 @@ async fn dynamic_handler(
             let out = handle_software_publish_request(&state, req).await;
             Json(out).into_response()
         }
-        (Method::GET, _) | (Method::POST, _) if is_agent_assets_path(path) => {
+        (Method::GET, _) | (Method::POST, _) | (Method::DELETE, _)
+            if is_agent_assets_path(path) =>
+        {
             match handle_agent_asset_request(&state, request_method, &uri, request).await {
                 Ok(response) => Json(response).into_response(),
                 Err(err) => (
@@ -20510,6 +20665,36 @@ mod tests {
             .error
             .as_deref()
             .is_some_and(|err| err.contains("filename hash mismatch")));
+
+        let _ = std::fs::remove_dir_all(config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn agent_asset_delete_removes_only_content_addressed_file() {
+        let (config_dir, blob_root) = test_config_dir_with_blob_root("agent-asset-delete");
+        let asset = build_skill_asset_value(&json!({
+            "name": "cleanup",
+            "instructions": ["Remove unused test assets."]
+        }))
+        .expect("skill asset");
+        let (entry, _) = persist_agent_asset(&config_dir, asset).expect("persist asset");
+        let path = blob_root
+            .join("agent-assets")
+            .join(format!("{}.json", entry.hash));
+        assert!(path.exists());
+
+        let (deleted_hash, deleted_path, previous_entry, deleted) =
+            delete_agent_asset_from_disk(&config_dir, &entry.hash).expect("delete asset");
+
+        assert_eq!(deleted_hash, entry.hash);
+        assert_eq!(deleted_path, path);
+        assert!(deleted);
+        assert!(previous_entry.is_some_and(|entry| entry.valid));
+        assert!(!deleted_path.exists());
+
+        let err = delete_agent_asset_from_disk(&config_dir, "not-a-hash")
+            .expect_err("invalid hash must fail");
+        assert!(err.to_string().contains("64-hex"));
 
         let _ = std::fs::remove_dir_all(config_dir.parent().unwrap());
     }

@@ -1,7 +1,8 @@
 # Agent Cognitive Definition Tasks
 
-**Status:** in progress
+**Status:** completed
 **Date:** 2026-05-06
+**Completed:** 2026-05-07
 **Spec:** `docs/identity-v2.1-agent-definition-addendum.md`
 **Scope:** implement hash-based cognitive definitions for `ai.generic` agents.
 
@@ -14,6 +15,8 @@
 - Legacy `roles/capabilities` in identity are retired. They were only partially implemented and are replaced by role/skill/handbook hash references.
 - OPA/routing can use cognitive hashes after router projection, but OPA does not read blob content.
 - Hard prompt limits for v1: 1 role, 16 skills, 8 handbooks, 256 KiB asset file max, 64 KiB composed prompt max.
+- Archi's asset catalog remains in memory for v1 and is rebuilt by scanning `blob://agent-assets/` on startup/refresh.
+- Agent assets can be deleted by explicit hash through Archi, but deletion does not mutate ILK definitions that may still reference the hash.
 
 ## Phase A - Spec And Cleanup
 
@@ -95,21 +98,39 @@
 - [x] G8. Add typed generation path for handbook assets.
 - [x] G9. Add UI/chat flow to show generated assets and target agent.
 - [x] G10. Compile plan: run node, get ILK, set definition, verify CONFIG_GET.
+- [x] G11. Add explicit delete tool for unused local agent assets by hash.
 
 ## Phase H - E2E / Operational Validation
 
 - [x] H0. Add reproducible E2E harness: `scripts/agent_cognitive_definition_e2e.sh`.
-- [ ] H1. Start `AI.test@motherbee` on `ai.generic` without definition and verify default prompt.
-- [ ] H2. Generate role/skill/handbook assets through Archi.
-- [ ] H3. Apply `ILK_SET_DEFINITION` and verify SHM seq increments.
-- [ ] H4. Verify `CONFIG_GET` reaches `definition_state=composed`.
-- [ ] H5. Verify missing asset produces `partial`.
-- [ ] H6. Verify later asset sync moves `partial` to `composed`.
-- [ ] H7. Verify router/OPA can route by a configured skill hash.
-- [ ] H8. Verify restart preserves definition from DB/SHM.
+- [x] H1. Start `AI.test@motherbee` on `ai.generic` without definition and verify default prompt.
+- [x] H2. Generate role/skill/handbook assets through Archi.
+- [x] H3. Apply `ILK_SET_DEFINITION` and verify SHM seq increments.
+- [x] H4. Verify `CONFIG_GET` reaches `definition_state=composed`.
+- [x] H5. Verify missing asset produces `partial`.
+- [x] H6. Verify later asset sync moves `partial` to `composed`.
+- [x] H7. Verify router/OPA can route by a configured skill hash.
+- [x] H8. Verify restart preserves definition from DB/SHM.
+
+E2E evidence:
+
+```bash
+BASE="http://127.0.0.1:8080" \
+ARCHI_BASE="http://127.0.0.1:3000" \
+HIVE_ID="motherbee" \
+scripts/agent_cognitive_definition_e2e.sh
+```
+
+Result:
+
+- `status=ok`
+- `runtime=ai.generic@current`
+- `definition_state` verified as `empty`, `composed`, `partial`, `composed`.
+- `seq_before=188`, `seq_after=198` in the completed run.
+- OPA hash-route policy compile check passed.
+- Restart preserved the composed definition.
 
 ## Open Questions
 
 - Whether Go needs an RPC helper for `ILK_SET_DEFINITION`, or only SHM reader support.
-- Whether Archi's asset catalog should remain purely in memory for v1 or persist an index for faster startup.
 - Whether routing by hash should stay explicit in policy or be wrapped by an Archi-side symbolic policy compiler.

@@ -402,12 +402,14 @@ Use:
 - `create_agent_role_asset` to create the role asset
 - `create_agent_skill_asset` to create each skill asset
 - `create_agent_handbook_asset` to create each handbook/reference asset
+- `delete_agent_asset` to delete an unused local asset by hash when the operator explicitly asks
 - `get_ilk` to resolve the target agent ILK
 - `set_ilk_definition` to apply role/skill/handbook hashes
 - `node_control_config_get` to verify the running agent loaded or rejected the definition
 
 Rules:
 - asset builder tools only write content-addressed files under `blob://agent-assets/<hash>.json`
+- deleting an asset does not update ILK definitions; first remove or replace the hash from any active definition if the asset is still referenced
 - `set_ilk_definition` updates identity only; it does not create blob assets
 - role, skill, and handbook assets must already exist in `blob://agent-assets/<hash>.json`
 - identity stores hashes only; never put prompt text, skill instructions, or handbook content directly in `set_ilk_definition`
