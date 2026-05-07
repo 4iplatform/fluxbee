@@ -18,6 +18,17 @@ REQUESTED_BIN_DIR="${BIN_DIR:-}"
 BIN_DIR="$ROOT_DIR/target/release"
 STATE_ROOT_DIR="$STATE_DIR/state"
 
+if [[ "${EUID:-$(id -u)}" -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+  sudo_user_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+  if [[ -n "$sudo_user_home" && -d "$sudo_user_home" ]]; then
+    export CARGO_HOME="${CARGO_HOME:-$sudo_user_home/.cargo}"
+    export RUSTUP_HOME="${RUSTUP_HOME:-$sudo_user_home/.rustup}"
+    if [[ -d "$CARGO_HOME/bin" && ":$PATH:" != *":$CARGO_HOME/bin:"* ]]; then
+      export PATH="$CARGO_HOME/bin:$PATH"
+    fi
+  fi
+fi
+
 if [[ -n "${SKIP_BUILD:-}" || -n "${SKIP_GO_BUILD:-}" ]]; then
   echo "Error: scripts/install.sh is deterministic and always builds before installing." >&2
   echo "Do not set SKIP_BUILD/SKIP_GO_BUILD for the core installer." >&2
