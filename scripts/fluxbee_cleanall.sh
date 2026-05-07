@@ -31,9 +31,9 @@ step() { echo "[cleanall] $*"; }
 
 run_as_postgres() {
   if command -v sudo >/dev/null 2>&1; then
-    sudo -u postgres "$@"
+    sudo -u postgres sh -c 'cd /tmp && exec "$@"' sh "$@"
   elif command -v runuser >/dev/null 2>&1; then
-    runuser -u postgres -- "$@"
+    runuser -u postgres -- sh -c 'cd /tmp && exec "$@"' sh "$@"
   else
     echo "  warning: neither sudo nor runuser is available to execute as OS user 'postgres'"
     return 1
