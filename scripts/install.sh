@@ -196,11 +196,30 @@ if [[ "${SKIP_BUILD:-}" != "1" ]]; then
   fi
 fi
 
+go_required=0
+for go_dir in "go/sy-opa-rules" "go/sy-timer" "go/sy-wf-rules" "go/nodes/wf/wf-generic"; do
+  if [[ -d "$ROOT_DIR/$go_dir" ]]; then
+    go_required=1
+    break
+  fi
+done
+
+if [[ "$go_required" == "1" && "${SKIP_BUILD:-}" != "1" && "${SKIP_GO_BUILD:-}" != "1" ]]; then
+  if ! command -v go >/dev/null 2>&1; then
+    echo "Error: 'go' not found in PATH but Go components must be built (sy-opa-rules, sy-timer, sy-wf-rules, wf-generic)." >&2
+    echo "Hints:" >&2
+    echo "  - If Go lives under /usr/local/go/bin or ~/go/bin and you ran with sudo, the path was reset:" >&2
+    echo "      sudo PATH=\"\$PATH\" ./scripts/install.sh" >&2
+    echo "  - To install Go on Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y golang" >&2
+    echo "  - To skip Go builds entirely (use existing prebuilt binaries from BIN_DIR):" >&2
+    echo "      SKIP_GO_BUILD=1 sudo ./scripts/install.sh" >&2
+    exit 1
+  fi
+fi
+
 if [[ -d "$ROOT_DIR/go/sy-opa-rules" ]]; then
   if [[ "${SKIP_BUILD:-}" == "1" || "${SKIP_GO_BUILD:-}" == "1" ]]; then
     echo "SKIP_BUILD/SKIP_GO_BUILD set; skipping sy-opa-rules build."
-  elif ! command -v go >/dev/null 2>&1; then
-    echo "Warning: go not found. Skipping sy-opa-rules build." >&2
   else
     echo "Building sy-opa-rules (Go)..."
     rm -f "$ROOT_DIR/go/sy-opa-rules/sy-opa-rules"
@@ -211,8 +230,6 @@ fi
 if [[ -d "$ROOT_DIR/go/sy-timer" ]]; then
   if [[ "${SKIP_BUILD:-}" == "1" || "${SKIP_GO_BUILD:-}" == "1" ]]; then
     echo "SKIP_BUILD/SKIP_GO_BUILD set; skipping sy-timer build."
-  elif ! command -v go >/dev/null 2>&1; then
-    echo "Warning: go not found. Skipping sy-timer build." >&2
   else
     echo "Building sy-timer (Go)..."
     rm -f "$ROOT_DIR/go/sy-timer/sy-timer"
@@ -223,8 +240,6 @@ fi
 if [[ -d "$ROOT_DIR/go/sy-wf-rules" ]]; then
   if [[ "${SKIP_BUILD:-}" == "1" || "${SKIP_GO_BUILD:-}" == "1" ]]; then
     echo "SKIP_BUILD/SKIP_GO_BUILD set; skipping sy-wf-rules build."
-  elif ! command -v go >/dev/null 2>&1; then
-    echo "Warning: go not found. Skipping sy-wf-rules build." >&2
   else
     echo "Building sy-wf-rules (Go)..."
     rm -f "$ROOT_DIR/go/sy-wf-rules/sy-wf-rules"
@@ -235,8 +250,6 @@ fi
 if [[ -d "$ROOT_DIR/go/nodes/wf/wf-generic" ]]; then
   if [[ "${SKIP_BUILD:-}" == "1" || "${SKIP_GO_BUILD:-}" == "1" ]]; then
     echo "SKIP_BUILD/SKIP_GO_BUILD set; skipping wf-generic build."
-  elif ! command -v go >/dev/null 2>&1; then
-    echo "Warning: go not found. Skipping wf-generic build." >&2
   else
     echo "Building wf-generic (Go)..."
     rm -f "$ROOT_DIR/go/nodes/wf/wf-generic/wf-generic"
