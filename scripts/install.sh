@@ -14,8 +14,21 @@ RESEED_SYNCTHING_CONFIG_ON_INSTALL="${RESEED_SYNCTHING_CONFIG_ON_INSTALL:-0}"
 RUNTIME_FIXTURE_NAME="${RUNTIME_FIXTURE_NAME:-wf.orch.diag}"
 RUNTIME_FIXTURE_VERSION="${RUNTIME_FIXTURE_VERSION:-0.0.1}"
 RUNTIME_FIXTURE_SLEEP_SECS="${RUNTIME_FIXTURE_SLEEP_SECS:-3600}"
-BIN_DIR="${BIN_DIR:-$ROOT_DIR/target/release}"
+REQUESTED_BIN_DIR="${BIN_DIR:-}"
+BIN_DIR="$ROOT_DIR/target/release"
 STATE_ROOT_DIR="$STATE_DIR/state"
+
+if [[ -n "${SKIP_BUILD:-}" || -n "${SKIP_GO_BUILD:-}" ]]; then
+  echo "Error: scripts/install.sh is deterministic and always builds before installing." >&2
+  echo "Do not set SKIP_BUILD/SKIP_GO_BUILD for the core installer." >&2
+  exit 1
+fi
+
+if [[ -n "$REQUESTED_BIN_DIR" && "$REQUESTED_BIN_DIR" != "$ROOT_DIR/target/release" ]]; then
+  echo "Error: scripts/install.sh installs from its fresh build output only: $ROOT_DIR/target/release" >&2
+  echo "Do not override BIN_DIR for the core installer." >&2
+  exit 1
+fi
 
 install_service_exists() {
   local svc="$1"
@@ -166,31 +179,29 @@ if [[ "$CLEAN_RUNTIME_VOLATILE_ON_INSTALL" == "1" ]]; then
   done
 fi
 
-if [[ "${SKIP_BUILD:-}" != "1" ]]; then
-  if ! command -v cargo >/dev/null 2>&1; then
-    echo "Error: 'cargo' not found in PATH." >&2
-    echo "  - If you are running with sudo and cargo lives under \$HOME/.cargo/bin or similar:" >&2
-    echo "      sudo PATH=\"\$PATH\" ./scripts/install.sh" >&2
-    echo "  - If cargo is not installed: https://www.rust-lang.org/tools/install" >&2
-    exit 1
-  fi
-  if ! cargo --version >/dev/null 2>&1; then
-    echo "Error: 'cargo' is in PATH but failed to run (likely rustup has no default toolchain set)." >&2
-    echo "  Fix: run 'rustup default stable' once, then re-run this script." >&2
-    exit 1
-  fi
-  if ! command -v protoc >/dev/null 2>&1; then
-    echo "Error: 'protoc' not found in PATH." >&2
-    echo "  Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y protobuf-compiler" >&2
-    echo "  RHEL/CentOS:   sudo dnf install -y protobuf-compiler" >&2
-    exit 1
-  fi
-
-  echo "Building Rust binaries..."
-  cargo build --release --bins
-  echo "Building sy-frontdesk-gov core binary..."
-  cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "Error: 'cargo' not found in PATH." >&2
+  echo "  - If you are running with sudo and cargo lives under \$HOME/.cargo/bin or similar:" >&2
+  echo "      sudo PATH=\"\$PATH\" ./scripts/install.sh" >&2
+  echo "  - If cargo is not installed: https://www.rust-lang.org/tools/install" >&2
+  exit 1
 fi
+if ! cargo --version >/dev/null 2>&1; then
+  echo "Error: 'cargo' is in PATH but failed to run (likely rustup has no default toolchain set)." >&2
+  echo "  Fix: run 'rustup default stable' once, then re-run this script." >&2
+  exit 1
+fi
+if ! command -v protoc >/dev/null 2>&1; then
+  echo "Error: 'protoc' not found in PATH." >&2
+  echo "  Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y protobuf-compiler" >&2
+  echo "  RHEL/CentOS:   sudo dnf install -y protobuf-compiler" >&2
+  exit 1
+fi
+
+echo "Building Rust core binaries..."
+cargo build --release --bins
+echo "Building sy-frontdesk-gov system binary..."
+cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
 
 go_required=0
 for go_dir in "go/sy-opa-rules" "go/sy-timer" "go/sy-wf-rules" "go/nodes/wf/wf-generic"; do
@@ -200,57 +211,39 @@ for go_dir in "go/sy-opa-rules" "go/sy-timer" "go/sy-wf-rules" "go/nodes/wf/wf-g
   fi
 done
 
-if [[ "$go_required" == "1" && "${SKIP_BUILD:-}" != "1" && "${SKIP_GO_BUILD:-}" != "1" ]]; then
+if [[ "$go_required" == "1" ]]; then
   if ! command -v go >/dev/null 2>&1; then
     echo "Error: 'go' not found in PATH but Go components must be built (sy-opa-rules, sy-timer, sy-wf-rules, wf-generic)." >&2
     echo "Hints:" >&2
     echo "  - If Go lives under /usr/local/go/bin or ~/go/bin and you ran with sudo, the path was reset:" >&2
     echo "      sudo PATH=\"\$PATH\" ./scripts/install.sh" >&2
     echo "  - To install Go on Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y golang" >&2
-    echo "  - To skip Go builds entirely (use existing prebuilt binaries from BIN_DIR):" >&2
-    echo "      SKIP_GO_BUILD=1 sudo ./scripts/install.sh" >&2
     exit 1
   fi
 fi
 
 if [[ -d "$ROOT_DIR/go/sy-opa-rules" ]]; then
-  if [[ "${SKIP_BUILD:-}" == "1" || "${SKIP_GO_BUILD:-}" == "1" ]]; then
-    echo "SKIP_BUILD/SKIP_GO_BUILD set; skipping sy-opa-rules build."
-  else
-    echo "Building sy-opa-rules (Go)..."
-    rm -f "$ROOT_DIR/go/sy-opa-rules/sy-opa-rules"
-    (cd "$ROOT_DIR/go/sy-opa-rules" && go build -o sy-opa-rules .)
-  fi
+  echo "Building sy-opa-rules (Go)..."
+  rm -f "$ROOT_DIR/go/sy-opa-rules/sy-opa-rules"
+  (cd "$ROOT_DIR/go/sy-opa-rules" && go build -o sy-opa-rules .)
 fi
 
 if [[ -d "$ROOT_DIR/go/sy-timer" ]]; then
-  if [[ "${SKIP_BUILD:-}" == "1" || "${SKIP_GO_BUILD:-}" == "1" ]]; then
-    echo "SKIP_BUILD/SKIP_GO_BUILD set; skipping sy-timer build."
-  else
-    echo "Building sy-timer (Go)..."
-    rm -f "$ROOT_DIR/go/sy-timer/sy-timer"
-    (cd "$ROOT_DIR/go/sy-timer" && go build -o sy-timer .)
-  fi
+  echo "Building sy-timer (Go)..."
+  rm -f "$ROOT_DIR/go/sy-timer/sy-timer"
+  (cd "$ROOT_DIR/go/sy-timer" && go build -o sy-timer .)
 fi
 
 if [[ -d "$ROOT_DIR/go/sy-wf-rules" ]]; then
-  if [[ "${SKIP_BUILD:-}" == "1" || "${SKIP_GO_BUILD:-}" == "1" ]]; then
-    echo "SKIP_BUILD/SKIP_GO_BUILD set; skipping sy-wf-rules build."
-  else
-    echo "Building sy-wf-rules (Go)..."
-    rm -f "$ROOT_DIR/go/sy-wf-rules/sy-wf-rules"
-    (cd "$ROOT_DIR/go/sy-wf-rules" && go build -o sy-wf-rules .)
-  fi
+  echo "Building sy-wf-rules (Go)..."
+  rm -f "$ROOT_DIR/go/sy-wf-rules/sy-wf-rules"
+  (cd "$ROOT_DIR/go/sy-wf-rules" && go build -o sy-wf-rules .)
 fi
 
 if [[ -d "$ROOT_DIR/go/nodes/wf/wf-generic" ]]; then
-  if [[ "${SKIP_BUILD:-}" == "1" || "${SKIP_GO_BUILD:-}" == "1" ]]; then
-    echo "SKIP_BUILD/SKIP_GO_BUILD set; skipping wf-generic build."
-  else
-    echo "Building wf-generic (Go)..."
-    rm -f "$ROOT_DIR/go/nodes/wf/wf-generic/wf-generic"
-    (cd "$ROOT_DIR/go/nodes/wf/wf-generic" && go build -o wf-generic .)
-  fi
+  echo "Building wf-generic (Go)..."
+  rm -f "$ROOT_DIR/go/nodes/wf/wf-generic/wf-generic"
+  (cd "$ROOT_DIR/go/nodes/wf/wf-generic" && go build -o wf-generic .)
 fi
 
 sudo install -d "$CONFIG_DIR"
@@ -303,10 +296,6 @@ sudo chmod 700 "$STATE_DIR/ssh"
 sudo chmod 600 "$MOTHERBEE_KEY"
 if [[ -f "$MOTHERBEE_KEY_PUB" ]]; then
   sudo chmod 644 "$MOTHERBEE_KEY_PUB"
-fi
-
-if [[ "${SKIP_BUILD:-}" == "1" ]]; then
-  echo "SKIP_BUILD=1: installing only binaries from $BIN_DIR" >&2
 fi
 
 echo "Installing binaries to /usr/bin from $BIN_DIR..."
@@ -375,7 +364,7 @@ if [[ -z "${wf_generic_bin:-}" ]]; then
 fi
 
 if [[ "$missing" -eq 1 ]]; then
-  echo "Build them first (e.g. cargo build --release --bins) or set BIN_DIR to where they exist." >&2
+  echo "The deterministic build step completed but one or more expected artifacts are missing." >&2
   exit 1
 fi
 
