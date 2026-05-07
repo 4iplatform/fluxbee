@@ -488,7 +488,6 @@ default target = null
 
 target = "{node}" {{
   dst := input.dst_ilk
-  some h
   h := data.identity[dst].skill_hashes[_]
   h == "{skill}"
 }}
