@@ -24,7 +24,7 @@ cleanup() {
     local src="${pair%%::*}"
     local dst="${pair#*::}"
     if [[ -f "$src" && ! -f "$dst" ]]; then
-      mv "$src" "$dst" >/dev/null 2>&1 || true
+      move_path "$src" "$dst" >/dev/null 2>&1 || true
     fi
   done
   if [[ "$CLEANUP" == "1" && -n "${ILK_ID:-}" ]]; then
@@ -41,6 +41,19 @@ cleanup() {
   return "$ec"
 }
 trap cleanup EXIT
+
+move_path() {
+  local src="$1"
+  local dst="$2"
+  if mv "$src" "$dst" 2>/dev/null; then
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    sudo mv "$src" "$dst"
+    return $?
+  fi
+  return 1
+}
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -448,7 +461,7 @@ JSON
 missing_skill_hash="$(json_get "$missing_skill_file" "asset.hash")"
 missing_skill_path="$(json_get "$missing_skill_file" "asset.path")"
 missing_skill_backup="$tmpdir/${missing_skill_hash}.json"
-mv "$missing_skill_path" "$missing_skill_backup"
+move_path "$missing_skill_path" "$missing_skill_backup"
 cleanup_files+=("${missing_skill_backup}::${missing_skill_path}")
 set_definition "$role_hash" "[\"$skill_hash\",\"$missing_skill_hash\"]" "[\"$handbook_hash\"]" "$set_body"
 wait_definition_state "partial" "$config_body"
@@ -460,7 +473,7 @@ if [[ "$failed_hashes" != *"$missing_skill_hash"* ]]; then
 fi
 
 echo "Step 9/12: restore missing asset and verify composed"
-mv "$missing_skill_backup" "$missing_skill_path"
+move_path "$missing_skill_backup" "$missing_skill_path"
 cleanup_files=()
 wait_definition_state "composed" "$config_body"
 
