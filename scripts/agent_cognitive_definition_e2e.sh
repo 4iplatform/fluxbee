@@ -13,6 +13,7 @@ CONFIG_WAIT_SECS="${CONFIG_WAIT_SECS:-90}"
 POLL_SECS="${POLL_SECS:-2}"
 RUN_OPA_HASH_CHECK="${RUN_OPA_HASH_CHECK:-1}"
 CLEANUP="${CLEANUP:-1}"
+DIST_RUNTIMES_ROOT="${DIST_RUNTIMES_ROOT:-/var/lib/fluxbee/dist/runtimes}"
 
 tmpdir="$(mktemp -d)"
 cleanup_files=()
@@ -139,6 +140,47 @@ print("")
 PY
 }
 
+runtime_available_in_versions() {
+  local file="$1"
+  local runtime="$2"
+  python3 - "$file" "$runtime" <<'PY'
+import json, sys
+file_path, runtime = sys.argv[1], sys.argv[2]
+try:
+    doc = json.load(open(file_path, "r", encoding="utf-8"))
+except Exception:
+    print("0")
+    raise SystemExit(0)
+
+def iter_dicts(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from iter_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from iter_dicts(child)
+
+for obj in iter_dicts(doc):
+    runtimes = obj.get("runtimes")
+    if isinstance(runtimes, dict) and runtime in runtimes:
+        print("1")
+        raise SystemExit(0)
+print("0")
+PY
+}
+
+fail_missing_runtime_preflight() {
+  echo "FAIL: runtime '$RUNTIME' is not ready for spawn on hive '$HIVE_ID'." >&2
+  echo "The core installer should publish ai.generic automatically. If this is a fresh host, re-run install.sh and check its ai.generic publish step." >&2
+  echo "Manual repair command:" >&2
+  echo "  PATH=\"\$PATH\" scripts/publish-ia-runtime.sh --runtime $RUNTIME --version 1.0.0 --set-current --sudo" >&2
+  echo "If the runtime was just published, verify $DIST_RUNTIMES_ROOT/manifest.json and /hives/$HIVE_ID/versions." >&2
+  echo "Last versions response:" >&2
+  cat "$versions_body" >&2 || true
+  exit 1
+}
+
 create_agent_asset() {
   local label="$1"
   local payload="$2"
@@ -229,6 +271,12 @@ if [[ "$admin_http" != "200" ]]; then
   echo "FAIL: admin versions endpoint HTTP $admin_http" >&2
   cat "$versions_body" >&2 || true
   exit 1
+fi
+if [[ ! -f "$DIST_RUNTIMES_ROOT/manifest.json" ]]; then
+  fail_missing_runtime_preflight
+fi
+if [[ "$(runtime_available_in_versions "$versions_body" "$RUNTIME")" != "1" ]]; then
+  fail_missing_runtime_preflight
 fi
 archi_http="$(http_call "GET" "$ARCHI_BASE/api/agent-assets?refresh=true" "$tmpdir/assets_list_initial.json")"
 if [[ "$archi_http" != "200" ]]; then

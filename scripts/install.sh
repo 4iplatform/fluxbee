@@ -14,6 +14,8 @@ RESEED_SYNCTHING_CONFIG_ON_INSTALL="${RESEED_SYNCTHING_CONFIG_ON_INSTALL:-0}"
 RUNTIME_FIXTURE_NAME="${RUNTIME_FIXTURE_NAME:-wf.orch.diag}"
 RUNTIME_FIXTURE_VERSION="${RUNTIME_FIXTURE_VERSION:-0.0.1}"
 RUNTIME_FIXTURE_SLEEP_SECS="${RUNTIME_FIXTURE_SLEEP_SECS:-3600}"
+AI_GENERIC_RUNTIME_NAME="${AI_GENERIC_RUNTIME_NAME:-ai.generic}"
+AI_GENERIC_RUNTIME_VERSION="${AI_GENERIC_RUNTIME_VERSION:-1.0.0}"
 REQUESTED_BIN_DIR="${BIN_DIR:-}"
 BIN_DIR="$ROOT_DIR/target/release"
 STATE_ROOT_DIR="$STATE_DIR/state"
@@ -213,6 +215,8 @@ echo "Building Rust core binaries..."
 cargo build --release --bins
 echo "Building sy-frontdesk-gov system binary..."
 cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
+echo "Building ai.generic runtime binary..."
+cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner
 
 go_required=0
 for go_dir in "go/sy-opa-rules" "go/sy-timer" "go/sy-wf-rules" "go/nodes/wf/wf-generic"; do
@@ -791,6 +795,22 @@ EOF
 else
   echo "Preserving existing managed Syncthing config at $STATE_DIR/syncthing/config.xml"
 fi
+
+ai_generic_bin="$BIN_DIR/ai_node_runner"
+if [[ ! -f "$ai_generic_bin" ]]; then
+  echo "Error: ai.generic build completed but binary is missing: $ai_generic_bin" >&2
+  exit 1
+fi
+
+echo "Publishing base runtime $AI_GENERIC_RUNTIME_NAME@$AI_GENERIC_RUNTIME_VERSION into $STATE_DIR/dist/runtimes..."
+bash "$ROOT_DIR/scripts/publish-ia-runtime.sh" \
+  --runtime "$AI_GENERIC_RUNTIME_NAME" \
+  --version "$AI_GENERIC_RUNTIME_VERSION" \
+  --binary "$ai_generic_bin" \
+  --dist-root "$STATE_DIR/dist" \
+  --set-current \
+  --sudo \
+  --skip-build
 
 if [[ "$SEED_RUNTIME_FIXTURE" == "1" ]]; then
   echo "Seeding runtime fixture in $STATE_DIR/dist/runtimes: $RUNTIME_FIXTURE_NAME@$RUNTIME_FIXTURE_VERSION"
