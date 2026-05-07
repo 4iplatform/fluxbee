@@ -50,11 +50,7 @@ require_cmd() {
 }
 
 validate_tenant_id() {
-  if [[ -z "$TENANT_ID" ]]; then
-    echo "FAIL: TENANT_ID is required for this AI spawn E2E (expected tnt:<uuid>)." >&2
-    exit 1
-  fi
-  if [[ ! "$TENANT_ID" =~ ^tnt:[0-9a-fA-F-]{36}$ ]]; then
+  if [[ -n "$TENANT_ID" && ! "$TENANT_ID" =~ ^tnt:[0-9a-fA-F-]{36}$ ]]; then
     echo "FAIL: invalid TENANT_ID='$TENANT_ID' (expected tnt:<uuid>)." >&2
     exit 1
   fi
@@ -181,6 +177,72 @@ fail_missing_runtime_preflight() {
   exit 1
 }
 
+resolve_default_tenant_id() {
+  local file="$1"
+  python3 - "$file" <<'PY'
+import json, sys
+file_path = sys.argv[1]
+try:
+    doc = json.load(open(file_path, "r", encoding="utf-8"))
+except Exception:
+    print("")
+    raise SystemExit(0)
+
+payload = doc.get("payload", doc)
+tenants = payload.get("tenants", [])
+if not isinstance(tenants, list):
+    print("")
+    raise SystemExit(0)
+
+def tenant_id(row):
+    value = row.get("tenant_id") if isinstance(row, dict) else None
+    return value if isinstance(value, str) else ""
+
+for row in tenants:
+    if not isinstance(row, dict):
+        continue
+    if row.get("status") == "active" and row.get("is_root") is True:
+        print(tenant_id(row))
+        raise SystemExit(0)
+for row in tenants:
+    if not isinstance(row, dict):
+        continue
+    if row.get("is_root") is True:
+        print(tenant_id(row))
+        raise SystemExit(0)
+for row in tenants:
+    if not isinstance(row, dict):
+        continue
+    if row.get("status") == "active":
+        print(tenant_id(row))
+        raise SystemExit(0)
+if tenants:
+    print(tenant_id(tenants[0]))
+else:
+    print("")
+PY
+}
+
+tenant_exists_in_list() {
+  local file="$1"
+  local tenant_id="$2"
+  python3 - "$file" "$tenant_id" <<'PY'
+import json, sys
+file_path, target = sys.argv[1], sys.argv[2]
+try:
+    doc = json.load(open(file_path, "r", encoding="utf-8"))
+except Exception:
+    print("0")
+    raise SystemExit(0)
+payload = doc.get("payload", doc)
+for row in payload.get("tenants", []):
+    if isinstance(row, dict) and row.get("tenant_id") == target:
+        print("1")
+        raise SystemExit(0)
+print("0")
+PY
+}
+
 create_agent_asset() {
   local label="$1"
   local payload="$2"
@@ -255,8 +317,6 @@ require_cmd curl
 require_cmd python3
 validate_tenant_id
 
-echo "Agent cognitive definition E2E: BASE=$BASE ARCHI_BASE=$ARCHI_BASE HIVE_ID=$HIVE_ID NODE_NAME=$NODE_NAME RUNTIME=$RUNTIME TENANT_ID=$TENANT_ID"
-
 versions_body="$tmpdir/versions.json"
 spawn_body="$tmpdir/spawn.json"
 ilks_body="$tmpdir/ilks.json"
@@ -264,6 +324,7 @@ config_body="$tmpdir/config.json"
 set_body="$tmpdir/set_definition.json"
 restart_body="$tmpdir/restart.json"
 opa_body="$tmpdir/opa.json"
+tenants_body="$tmpdir/tenants.json"
 
 echo "Step 1/12: validate admin + archi are reachable"
 admin_http="$(http_call "GET" "$BASE/hives/$HIVE_ID/versions" "$versions_body")"
@@ -278,6 +339,27 @@ fi
 if [[ "$(runtime_available_in_versions "$versions_body" "$RUNTIME")" != "1" ]]; then
   fail_missing_runtime_preflight
 fi
+tenants_http="$(http_call "GET" "$BASE/hives/$HIVE_ID/identity/tenants" "$tenants_body")"
+if [[ "$tenants_http" != "200" ]]; then
+  echo "FAIL: identity tenants endpoint HTTP $tenants_http" >&2
+  cat "$tenants_body" >&2 || true
+  exit 1
+fi
+if [[ -z "$TENANT_ID" ]]; then
+  TENANT_ID="$(resolve_default_tenant_id "$tenants_body")"
+  if [[ -z "$TENANT_ID" ]]; then
+    echo "FAIL: could not resolve a tenant for AI spawn E2E." >&2
+    cat "$tenants_body" >&2 || true
+    exit 1
+  fi
+  echo "Resolved TENANT_ID=$TENANT_ID"
+elif [[ "$(tenant_exists_in_list "$tenants_body" "$TENANT_ID")" != "1" ]]; then
+  echo "FAIL: TENANT_ID '$TENANT_ID' does not exist in hive '$HIVE_ID'." >&2
+  echo "Available tenants:" >&2
+  cat "$tenants_body" >&2 || true
+  exit 1
+fi
+echo "Agent cognitive definition E2E: BASE=$BASE ARCHI_BASE=$ARCHI_BASE HIVE_ID=$HIVE_ID NODE_NAME=$NODE_NAME RUNTIME=$RUNTIME TENANT_ID=$TENANT_ID"
 archi_http="$(http_call "GET" "$ARCHI_BASE/api/agent-assets?refresh=true" "$tmpdir/assets_list_initial.json")"
 if [[ "$archi_http" != "200" ]]; then
   echo "FAIL: Archi agent-assets endpoint HTTP $archi_http" >&2
