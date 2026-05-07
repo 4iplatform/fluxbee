@@ -166,21 +166,23 @@ if [[ "$CLEAN_RUNTIME_VOLATILE_ON_INSTALL" == "1" ]]; then
   done
 fi
 
+_RUST_BUILD_AVAILABLE=1
 if [[ "${SKIP_BUILD:-}" != "1" ]]; then
   if ! command -v cargo >/dev/null 2>&1; then
     # Common case: running with plain sudo loses user PATH (cargo unavailable as root).
-    # If release binaries already exist, continue without rebuilding.
+    # If release binaries already exist, continue without rebuilding the Rust side
+    # only — the Go side is independent and must NOT be skipped because of this.
     if [[ -x "$BIN_DIR/json-router" && -x "$BIN_DIR/sy_orchestrator" && -x "$BIN_DIR/sy_identity" && -x "$BIN_DIR/sy_cognition" && -x "$BIN_DIR/sy_policy" ]]; then
-      echo "Warning: cargo not found; using prebuilt binaries from $BIN_DIR (SKIP_BUILD=1)."
-      SKIP_BUILD=1
+      echo "Warning: cargo not found; using prebuilt Rust binaries from $BIN_DIR. Go builds will still run if 'go' is available."
+      _RUST_BUILD_AVAILABLE=0
     else
       echo "Error: cargo not found and required prebuilt binaries are missing in $BIN_DIR." >&2
-      echo "Hint: run without sudo (the script already uses sudo internally), or install cargo in root PATH, or set SKIP_BUILD=1 with existing binaries." >&2
+      echo "Hint: ensure cargo is in PATH (e.g. 'sudo PATH=\"\$PATH\" ./scripts/install.sh'), or set SKIP_BUILD=1 with existing binaries." >&2
       exit 1
     fi
   fi
 
-  if [[ "${SKIP_BUILD:-}" != "1" ]] && ! command -v protoc >/dev/null 2>&1; then
+  if [[ "$_RUST_BUILD_AVAILABLE" == "1" ]] && ! command -v protoc >/dev/null 2>&1; then
     echo "Error: protoc not found in PATH." >&2
     echo "Fluxbee now builds LanceDB-backed components and requires the Protocol Buffers compiler on the build host." >&2
     echo "Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y protobuf-compiler" >&2
@@ -188,7 +190,7 @@ if [[ "${SKIP_BUILD:-}" != "1" ]]; then
     exit 1
   fi
 
-  if [[ "${SKIP_BUILD:-}" != "1" ]]; then
+  if [[ "$_RUST_BUILD_AVAILABLE" == "1" ]]; then
     echo "Building Rust binaries..."
     cargo build --release --bins
     echo "Building sy-frontdesk-gov core binary..."
