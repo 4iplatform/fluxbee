@@ -166,6 +166,8 @@ else
   step "Created PostgreSQL role '$DB_USER'"
 fi
 
+psql_postgres -c "GRANT CONNECT ON DATABASE postgres TO \"$DB_USER\";" >/dev/null
+
 for db in $DB_NAMES; do
   if [[ "$RESET" == "1" ]]; then
     step "Resetting database '$db'"
@@ -186,6 +188,20 @@ for db in $DB_NAMES; do
     -c "ALTER SCHEMA public OWNER TO \"$DB_USER\";" \
     -c "GRANT ALL ON SCHEMA public TO \"$DB_USER\";" >/dev/null
 done
+
+if [[ -n "$DB_PASSWORD" ]]; then
+  step "Validating TCP password access for role '$DB_USER'"
+  for db in postgres $DB_NAMES; do
+    if ! PGPASSWORD="$DB_PASSWORD" psql \
+      "postgresql://$DB_USER@127.0.0.1:5432/$db" \
+      -v ON_ERROR_STOP=1 \
+      -tAc "SELECT 1;" >/dev/null; then
+      echo "Error: role '$DB_USER' cannot connect to database '$db' using the provided password." >&2
+      echo "       Check PostgreSQL pg_hba.conf, password auth, and FLUXBEE_DB_PASSWORD." >&2
+      exit 1
+    fi
+  done
+fi
 
 step "PostgreSQL bootstrap complete. Managed DBs: $DB_NAMES owner=$DB_USER reset=$RESET"
 if [[ -n "$DB_PASSWORD" ]]; then
