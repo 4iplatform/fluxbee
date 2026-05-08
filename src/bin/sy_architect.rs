@@ -17554,8 +17554,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
           const desired = '#/' + target;
           if (location.hash !== desired) {{
             location.hash = desired;
-          }} else {{
-            setSection(readSectionFromHash());
+          }} else if (currentSection === target && target === 'messages') {{
+            messagesView.activate();
           }}
         }});
       }});
@@ -17895,8 +17895,10 @@ fn architect_index_html(state: &ArchitectState) -> String {
 
         return {{
           activate: async function() {{
-            if (activated) return;
+            if (activated && initialLoaded && eventSource) return;
             activated = true;
+            stopStream();
+            setUnconfigured(false);
             const ok = await loadInitial();
             if (ok) startStream();
           }},
