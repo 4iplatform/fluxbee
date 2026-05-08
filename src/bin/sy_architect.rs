@@ -5879,7 +5879,7 @@ const MESSAGES_LIST_DEFAULT_LIMIT: i64 = 200;
 const MESSAGES_LIST_MAX_LIMIT: i64 = 500;
 const MESSAGES_STREAM_POLL_INTERVAL_MS: u64 = 1_000;
 const MESSAGES_STREAM_TAIL_LIMIT: i64 = 500;
-const MESSAGES_STREAM_KEEPALIVE_SECS: u64 = 15;
+const MESSAGES_STREAM_KEEPALIVE_SECS: u64 = 5;
 const MESSAGES_STREAM_CHANNEL_CAPACITY: usize = 64;
 const MESSAGES_STREAM_MAX_CONCURRENT: usize = 16;
 
@@ -6013,6 +6013,13 @@ async fn messages_stream_task(
     tx: tokio::sync::mpsc::Sender<Result<SseEvent, std::convert::Infallible>>,
     _guard: MessagesStreamGuard,
 ) {
+    if tx
+        .send(Ok(SseEvent::default().event("ready").data("ok")))
+        .await
+        .is_err()
+    {
+        return;
+    }
     let mut interval = tokio::time::interval(Duration::from_millis(MESSAGES_STREAM_POLL_INTERVAL_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval.tick().await;
@@ -17836,8 +17843,14 @@ fn architect_index_html(state: &ArchitectState) -> String {
               console.error('SSE message parse failed', err);
             }}
           }});
-          eventSource.addEventListener('error', function() {{
-            setStatus('error', 'error');
+          eventSource.addEventListener('ready', function() {{
+            setStatus('live', 'live');
+          }});
+          eventSource.addEventListener('error', function(ev) {{
+            const rs = eventSource ? eventSource.readyState : -1;
+            const label = rs === 0 ? 'error: connecting' : (rs === 2 ? 'error: closed' : 'error');
+            console.warn('SSE error', {{ readyState: rs, event: ev }});
+            setStatus('error', label);
             stopStream();
           }});
           eventSource.onopen = function() {{ setStatus('live', 'live'); }};
