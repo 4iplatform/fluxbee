@@ -111,6 +111,7 @@ You are a coordinator, not an executor. You read system state and route all muta
 - For deployments and drift: use `/hives/{hive}/deployments` or `/hives/{hive}/drift-alerts`. If these return `entries: []`, report zero entries — do not infer data from broader endpoints.
 - Stored node config: `GET /hives/{hive}/nodes/{node_name}/config` (persisted snapshot). Live node contract: `POST /hives/{hive}/nodes/{node_name}/control/config-get`. Prefer GET first; use control/config-get only when the live contract is needed.
 - For admin action schemas and examples, use `fluxbee_system_get` on `/admin/actions/{action}` when answering questions. Planning tools do their own schema lookup before mutation.
+- Do not use `/admin/actions/{action}` lookups as a substitute for compiling a mutation plan. If the operator wants a change and the target values are known, call `fluxbee_plan_compiler`.
 
 ## Making changes
 
@@ -120,6 +121,7 @@ Never stage writes. Never call admin mutation endpoints directly.
 - `fluxbee_start_pipeline` — for broad design intents that need manifest + reconcile before a plan can be produced: new topology, multi-resource architecture, or unclear desired-state work.
 
 If the operator's mutation intent is clear, call `fluxbee_plan_compiler` directly. Do not ask "should I continue?" first. The operator confirms once, after the plan is ready. Do not claim a mutation ran before confirmation.
+If you read live state to resolve a missing value for a mutation and the value becomes clear, call `fluxbee_plan_compiler` in the same turn with that resolved context. Do not stop with "if you want, I can retry".
 
 ## Agent cognitive definitions
 
@@ -131,6 +133,7 @@ For `ai.generic` agents, use the handbook and tool schemas as the operational so
 - After `fluxbee_plan_compiler` returns `status: "plan_ready"`, call NO more tools. Present the `human_summary` and end with "Reply CONFIRM to execute or CANCEL to discard." Only the literal word CONFIRM triggers execution.
 - After `fluxbee_plan_compiler` returns `status: "blocked"`, call NO more tools. Present the `human_summary` as the blocker and stop; do not ask for CONFIRM.
 - Never call `fluxbee_plan_compiler` more than once per task unless the operator gives new information that resolves the blocker.
+- A user message such as "reintenta", "sí, reintenta", or "seguí" after a blocked mutation is permission to call `fluxbee_plan_compiler` again if the missing state has now been resolved.
 
 ## Resolving a blocked pipeline
 
@@ -893,7 +896,8 @@ impl FunctionTool for ArchitectSystemGetTool {
                 /hives/{{hive}}/wf-rules, /hives/{{hive}}/drift-alerts, \
                 /admin/actions/{{action}} (schema + example_scmd). \
                 Never execute paths with literal {{placeholders}}. \
-                For admin action schemas, prefer example_scmd over guessing.",
+                For admin action schemas, prefer example_scmd over guessing. \
+                Do not use /admin/actions help lookups as the final step for requested mutations; call fluxbee_plan_compiler to stage executor plans.",
                 hive = self.context.hive_id,
             ),
             parameters_json_schema: json!({
@@ -21068,6 +21072,14 @@ mod tests {
         assert!(prompt.contains("OPA is for policy-based target resolution"));
         assert!(prompt.contains("`IO.*` nodes are integration boundaries"));
         assert!(prompt.contains("`SY.*` nodes are system infrastructure"));
+    }
+
+    #[test]
+    fn build_archi_prompt_routes_resolved_mutations_to_plan_compiler() {
+        let prompt = build_archi_prompt(None);
+        assert!(prompt.contains("Do not use `/admin/actions/{action}` lookups as a substitute"));
+        assert!(prompt.contains("call `fluxbee_plan_compiler` in the same turn"));
+        assert!(prompt.contains("A user message such as \"reintenta\""));
     }
 
     #[test]
