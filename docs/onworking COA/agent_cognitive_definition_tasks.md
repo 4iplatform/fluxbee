@@ -16,6 +16,7 @@
 - OPA/routing can use cognitive hashes after router projection, but OPA does not read blob content.
 - Hard prompt limits for v1: 1 role, 16 skills, 8 handbooks, 256 KiB asset file max, 64 KiB composed prompt max.
 - Archi's asset catalog remains in memory for v1 and is rebuilt by scanning `blob://agent-assets/` on startup/refresh.
+- Archi can read exact role/skill/handbook JSON content by hash from `blob://agent-assets/`; it must not reconstruct assets from chat memory when asked to show content.
 - Agent assets can be deleted by explicit hash through Archi, but deletion does not mutate ILK definitions that may still reference the hash.
 
 ## Phase A - Spec And Cleanup
@@ -99,6 +100,7 @@
 - [x] G9. Add UI/chat flow to show generated assets and target agent.
 - [x] G10. Compile plan: run node, get ILK, set definition, verify CONFIG_GET.
 - [x] G11. Add explicit delete tool for unused local agent assets by hash.
+- [x] G12. Add explicit read tool for local agent asset content by hash.
 
 ## Phase H - E2E / Operational Validation
 

@@ -518,7 +518,7 @@ for each file in blob://agent-assets/:
     store in catalog: filename → metadata
 ```
 
-After bootstrap, Archi has full visibility of available assets and can answer questions like "what skills do I have available for support?" or "is there a handbook about billing procedures?"
+After bootstrap, Archi has visibility of available assets and can answer questions like "what skills do I have available for support?" or "is there a handbook about billing procedures?". When the operator asks to inspect content, Archi reads the asset JSON from `blob://agent-assets/<hash>.json` by hash; it does not reconstruct the content from chat history.
 
 ### 6.5 Asset lifecycle
 

@@ -399,6 +399,7 @@ Rules:
 
 Use:
 - `list_agent_assets` to inspect existing immutable role/skill/handbook assets
+- `get_agent_asset` to read the real JSON content of a role/skill/handbook asset by hash
 - `create_agent_role_asset` to create the role asset
 - `create_agent_skill_asset` to create each skill asset
 - `create_agent_handbook_asset` to create each handbook/reference asset
@@ -408,6 +409,7 @@ Use:
 - `node_control_config_get` to verify the running agent loaded or rejected the definition
 
 Rules:
+- when the operator asks to inspect or show an asset, read it with `get_agent_asset`; do not reconstruct it from chat memory
 - asset builder tools only write content-addressed files under `blob://agent-assets/<hash>.json`
 - deleting an asset does not update ILK definitions; first remove or replace the hash from any active definition if the asset is still referenced
 - `set_ilk_definition` updates identity only; it does not create blob assets

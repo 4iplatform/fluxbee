@@ -111,7 +111,6 @@ You are a coordinator, not an executor. You read system state and route all muta
 - For deployments and drift: use `/hives/{hive}/deployments` or `/hives/{hive}/drift-alerts`. If these return `entries: []`, report zero entries — do not infer data from broader endpoints.
 - Stored node config: `GET /hives/{hive}/nodes/{node_name}/config` (persisted snapshot). Live node contract: `POST /hives/{hive}/nodes/{node_name}/control/config-get`. Prefer GET first; use control/config-get only when the live contract is needed.
 - For admin action schemas and examples, use `fluxbee_system_get` on `/admin/actions/{action}` when answering questions. Planning tools do their own schema lookup before mutation.
-- For agent cognitive assets, use `list_agent_assets` to inspect role/skill/handbook assets already stored in blob.
 
 ## Making changes
 
@@ -119,22 +118,12 @@ Never stage writes. Never call admin mutation endpoints directly.
 
 - `fluxbee_plan_compiler` — primary path for clear mutations, from one step to many steps. It translates the task to an executor_plan and executes only after the operator confirms the prepared plan.
 - `fluxbee_start_pipeline` — for broad design intents that need manifest + reconcile before a plan can be produced: new topology, multi-resource architecture, or unclear desired-state work.
-- `create_agent_role_asset`, `create_agent_skill_asset`, `create_agent_handbook_asset` — create immutable local blob assets for an agent's cognitive definition. These only write content-addressed files under `blob://agent-assets/`; they do not mutate identity, run nodes, or apply the definition.
-- `delete_agent_asset` — delete a local blob asset by hash only when the operator explicitly asks. It does not mutate existing ILK definitions; agents that still reference the hash can become `partial` until the definition is updated.
 
 If the operator's mutation intent is clear, call `fluxbee_plan_compiler` directly. Do not ask "should I continue?" first. The operator confirms once, after the plan is ready. Do not claim a mutation ran before confirmation.
 
 ## Agent cognitive definitions
 
-For `ai.generic` agents, the "alma" is role/skill/handbook assets plus an identity definition that references their hashes.
-
-Workflow:
-1. Generate role/skill/handbook assets with the typed asset tools.
-2. Show the generated hashes and `blob://agent-assets/<hash>.json` URIs to the operator.
-3. Use `fluxbee_plan_compiler` to apply `set_ilk_definition` with `{role_hash, skill_hashes, handbook_hashes}`.
-4. Verify with node `CONFIG_GET` that `definition_state` becomes `composed` or explain `partial/error`.
-
-Do not put role text, skill instructions, or handbook contents directly into `set_ilk_definition`; identity stores hashes only.
+For `ai.generic` agents, use the handbook and tool schemas as the operational source of truth. Read persisted assets/config from the system when asked to inspect them; do not reconstruct source-of-truth content from chat memory. Identity stores cognitive definitions by hash reference, not embedded prompt text.
 
 ## Pipeline confirmation rules
 
@@ -851,6 +840,7 @@ impl FunctionToolProvider for ArchitectAdminReadToolsProvider {
     fn register_tools(&self, registry: &mut FunctionToolRegistry) -> fluxbee_ai_sdk::Result<()> {
         registry.register(Arc::new(ArchitectSystemGetTool::new(self.context.clone())))?;
         registry.register(Arc::new(ListAgentAssetsTool::new(self.context.clone())))?;
+        registry.register(Arc::new(GetAgentAssetTool::new(self.context.clone())))?;
         registry.register(Arc::new(DeleteAgentAssetTool::new(self.context.clone())))?;
         registry.register(Arc::new(CreateAgentRoleAssetTool::new(
             self.context.clone(),
@@ -1068,6 +1058,53 @@ impl FunctionTool for ListAgentAssetsTool {
 
 struct DeleteAgentAssetTool {
     context: ArchitectAdminToolContext,
+}
+
+struct GetAgentAssetTool {
+    context: ArchitectAdminToolContext,
+}
+
+impl GetAgentAssetTool {
+    fn new(context: ArchitectAdminToolContext) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl FunctionTool for GetAgentAssetTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "get_agent_asset".to_string(),
+            description: "Read one immutable cognitive asset from blob://agent-assets/<hash>.json by 64-hex hash. Returns the actual role, skill, or handbook JSON content plus catalog metadata.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["hash"],
+                "properties": {
+                    "hash": {
+                        "type": "string",
+                        "description": "64-hex content hash of the role, skill, or handbook asset to read."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let hash = arguments
+            .get("hash")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol(
+                    "get_agent_asset requires a non-empty 'hash'".to_string(),
+                )
+            })?;
+        get_agent_asset_and_update_catalog(&self.context, hash)
+            .await
+            .map_err(fluxbee_tool_protocol_err)
+    }
 }
 
 impl DeleteAgentAssetTool {
@@ -5426,6 +5463,36 @@ fn agent_asset_write_response(entry: AgentAssetCatalogEntry, written: bool) -> V
     })
 }
 
+fn read_agent_asset_from_disk(
+    config_dir: &Path,
+    hash: &str,
+) -> Result<(AgentAssetCatalogEntry, Value), ArchitectError> {
+    let hash = normalize_agent_asset_hash(hash)?;
+    let asset_dir = agent_assets_dir_from_config_dir(config_dir)?;
+    let path = asset_dir.join(format!("{hash}.json"));
+    if !path.exists() {
+        return Err(format!("agent asset not found: blob://agent-assets/{hash}.json").into());
+    }
+    let entry = agent_asset_catalog_entry_from_file(&path);
+    if !entry.valid {
+        let detail = entry.error.as_deref().unwrap_or("asset failed validation");
+        return Err(format!("agent asset invalid: {detail}").into());
+    }
+    let raw = fs::read(&path)?;
+    let value: Value = serde_json::from_slice(&raw)?;
+    Ok((entry, value))
+}
+
+fn agent_asset_read_response(entry: AgentAssetCatalogEntry, content: Value) -> Value {
+    json!({
+        "status": "ok",
+        "hash": entry.hash,
+        "blob_uri": entry.blob_uri,
+        "asset": entry,
+        "content": content,
+    })
+}
+
 fn delete_agent_asset_from_disk(
     config_dir: &Path,
     hash: &str,
@@ -5525,6 +5592,19 @@ async fn list_agent_assets_for_state(
     }))
 }
 
+async fn get_agent_asset_for_state(
+    state: &ArchitectState,
+    hash: &str,
+) -> Result<Value, ArchitectError> {
+    let (entry, content) = read_agent_asset_from_disk(&state.config_dir, hash)?;
+    state
+        .agent_asset_catalog
+        .write()
+        .await
+        .insert(entry.hash.clone(), entry.clone());
+    Ok(agent_asset_read_response(entry, content))
+}
+
 async fn delete_agent_asset_for_state(
     state: &ArchitectState,
     hash: &str,
@@ -5550,6 +5630,9 @@ async fn handle_agent_asset_request(
     match method {
         Method::GET => {
             let query = uri.query().unwrap_or("");
+            if let Some(hash) = query_param(query, "hash") {
+                return get_agent_asset_for_state(state, &hash).await;
+            }
             let asset_type = query_param(query, "asset_type");
             let include_invalid = query_bool_param(query, "include_invalid").unwrap_or(false);
             let refresh = query_bool_param(query, "refresh").unwrap_or(true);
@@ -5651,6 +5734,19 @@ async fn write_agent_asset_and_update_catalog(
         .await
         .insert(entry.hash.clone(), entry.clone());
     Ok(agent_asset_write_response(entry, written))
+}
+
+async fn get_agent_asset_and_update_catalog(
+    context: &ArchitectAdminToolContext,
+    hash: &str,
+) -> Result<Value, ArchitectError> {
+    let (entry, content) = read_agent_asset_from_disk(&context.config_dir, hash)?;
+    context
+        .agent_asset_catalog
+        .write()
+        .await
+        .insert(entry.hash.clone(), entry.clone());
+    Ok(agent_asset_read_response(entry, content))
 }
 
 async fn delete_agent_asset_and_update_catalog(
@@ -20640,6 +20736,35 @@ mod tests {
         let loaded = catalog.get(&entry.hash).expect("catalog entry");
         assert!(loaded.valid);
         assert_eq!(loaded.asset_type, "skill");
+
+        let _ = std::fs::remove_dir_all(config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn agent_asset_read_returns_valid_content() {
+        let (config_dir, _) = test_config_dir_with_blob_root("agent-asset-read");
+        let asset = build_handbook_asset_value(&json!({
+            "name": "Sales Playbook",
+            "sections": [
+                {"title": "Discovery", "content": "Ask concise qualification questions."}
+            ]
+        }))
+        .expect("handbook asset");
+        let (entry, _) = persist_agent_asset(&config_dir, asset).expect("persist asset");
+
+        let (read_entry, content) =
+            read_agent_asset_from_disk(&config_dir, &entry.hash).expect("read asset");
+
+        assert_eq!(read_entry.hash, entry.hash);
+        assert_eq!(read_entry.asset_type, "handbook");
+        assert_eq!(
+            content.get("name").and_then(Value::as_str),
+            Some("Sales Playbook")
+        );
+        assert_eq!(
+            content.get("asset_type").and_then(Value::as_str),
+            Some("handbook")
+        );
 
         let _ = std::fs::remove_dir_all(config_dir.parent().unwrap());
     }
