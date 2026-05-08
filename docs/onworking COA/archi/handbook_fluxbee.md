@@ -390,6 +390,7 @@ Use the identity tenant read surface first:
 - `set_tenant_sponsor`
 
 Rules:
+- executor plans use flat `step.args`; do not wrap tenant mutation fields inside `body`
 - use `list_tenants` to discover candidate root/default tenants, sponsors, or client tenants
 - use `get_tenant` when one exact tenant id is already known or when you need the resolved sponsor record
 - use `create_tenant` to create a new admin/company tenant or a new client tenant

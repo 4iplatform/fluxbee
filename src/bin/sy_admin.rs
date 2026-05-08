@@ -1929,7 +1929,9 @@ If the step args are invalid or incomplete — missing required fields, invalid 
 If the step args are correct and complete, do not call report_step_issue.\n\
 \n\
 Important review rules:\n\
-- Validate only against the executable request contract: path params, required_fields, optional_fields, documented enums, and documented conditional requirements.\n\
+- Validate against `executor_contract.function_schema` when present; it is the source of truth for executor step.args.\n\
+- `request_contract.body` describes the HTTP/SCMD shape only. Do not require or invent `args.body` unless the executor schema explicitly defines a `body` property.\n\
+- Executor step args are flat function args: path params and JSON body fields are siblings under step.args.\n\
 - Do not invent extra acknowledgement, confirmation, approval, or consent fields unless they appear explicitly in the request contract.\n\
 - `confirmation_required=true` is operator/UI metadata, not a step.args field requirement.\n\
 - Do not reject a step for lacking a confirm/ack field when the request contract does not define one.\n\
@@ -6447,6 +6449,35 @@ fn build_admin_action_doc(spec: &InternalActionSpec) -> serde_json::Value {
         "path_patterns_are_templates": true,
         "execution_preference": "example_scmd",
         "request_contract": admin_action_request_contract(spec.action),
+        "executor_contract": admin_action_executor_contract(spec),
+    })
+}
+
+fn admin_action_executor_contract(spec: &InternalActionSpec) -> serde_json::Value {
+    let schema = build_admin_executor_function_definition(spec).parameters_json_schema;
+    let notes = if matches!(
+        spec.action,
+        "create_tenant" | "update_tenant" | "set_tenant_sponsor"
+    ) {
+        vec![
+            "Executor plans must put path params and JSON body fields directly under step.args.",
+            "Do not wrap mutation fields under args.body; body is only the HTTP request shape.",
+            "Tenant hierarchy uses sponsor_tenant_id directly in args, for example \"$steps.s1.payload.tenant_id\".",
+            "For update_tenant, use args.tenant_id plus args.name/status/domain/settings/sponsor_tenant_id directly.",
+        ]
+    } else {
+        vec![
+            "Executor plans must put path params and JSON body fields directly under step.args.",
+            "Do not wrap mutation fields under args.body unless function_schema explicitly defines a body property.",
+            "Step output references may use $steps.<step_id>.<path>.",
+        ]
+    };
+    serde_json::json!({
+        "kind": "flat_function_args",
+        "arg_shape": "flat_object",
+        "description": "Exact executor step.args schema. This is distinct from the HTTP request_contract body shape.",
+        "function_schema": schema,
+        "notes": notes,
     })
 }
 
@@ -7925,6 +7956,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "update_tenant" => vec![
             "This mutates the tenant record itself, not ILKs that belong to that tenant.",
             "Use create_tenant to create a tenant. Use update_tenant only after the tenant already exists.",
+            "Executor plans use flat args: put tenant_id, name, status, domain, settings, and sponsor_tenant_id directly under step.args; do not use args.body.",
             "Passing sponsor_tenant_id updates the tenant hierarchy. Passing sponsor_tenant_id=null clears sponsorship and makes the tenant a root/default candidate.",
             "Sponsor updates are validated against self-reference and sponsorship cycles.",
         ],
@@ -12227,6 +12259,86 @@ mod tests {
         assert_eq!(
             admin_action_example_scmd("create_tenant").expect("create_tenant example"),
             r#"curl -X POST /hives/motherbee/identity/tenants -d '{"name":"Client Co","domain":"client.example","status":"active","sponsor_tenant_id":"tnt:11111111-1111-1111-1111-111111111111"}'"#
+        );
+    }
+
+    #[test]
+    fn update_tenant_executor_contract_exposes_flat_args() {
+        let spec = resolve_internal_action_spec("update_tenant").expect("action must exist");
+        let doc = build_admin_action_doc(spec);
+        let schema = &doc["executor_contract"]["function_schema"];
+
+        assert_eq!(
+            doc["executor_contract"]["kind"],
+            json!("flat_function_args")
+        );
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert_eq!(schema["required"], json!(["hive", "tenant_id"]));
+        assert!(schema["properties"]["tenant_id"].is_object());
+        assert!(schema["properties"]["name"].is_object());
+        assert!(schema["properties"].get("body").is_none());
+    }
+
+    #[test]
+    fn executor_plan_validation_rejects_update_tenant_body_wrapper() {
+        let err = parse_executor_plan(json!({
+            "plan_version": "0.1",
+            "kind": "executor_plan",
+            "metadata": {
+                "name": "rename-tenant",
+                "target_hive": "motherbee"
+            },
+            "execution": {
+                "strict": true,
+                "stop_on_error": true,
+                "allow_help_lookup": true,
+                "steps": [{
+                    "id": "s1",
+                    "action": "update_tenant",
+                    "args": {
+                        "hive": "motherbee",
+                        "tenant_id": "tnt:11111111-1111-1111-1111-111111111111",
+                        "body": {
+                            "name": "4i Platform Inc."
+                        }
+                    }
+                }]
+            }
+        }))
+        .expect_err("executor update_tenant must not accept HTTP body wrapper");
+
+        assert!(err.contains("unexpected field 'body'"));
+    }
+
+    #[test]
+    fn executor_plan_validation_accepts_update_tenant_flat_args() {
+        let plan = parse_executor_plan(json!({
+            "plan_version": "0.1",
+            "kind": "executor_plan",
+            "metadata": {
+                "name": "rename-tenant",
+                "target_hive": "motherbee"
+            },
+            "execution": {
+                "strict": true,
+                "stop_on_error": true,
+                "allow_help_lookup": true,
+                "steps": [{
+                    "id": "s1",
+                    "action": "update_tenant",
+                    "args": {
+                        "hive": "motherbee",
+                        "tenant_id": "tnt:11111111-1111-1111-1111-111111111111",
+                        "name": "4i Platform Inc."
+                    }
+                }]
+            }
+        }))
+        .expect("executor update_tenant must accept flat args");
+
+        assert_eq!(
+            plan.execution.steps[0].args["name"],
+            json!("4i Platform Inc.")
         );
     }
 

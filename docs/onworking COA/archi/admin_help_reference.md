@@ -216,6 +216,7 @@ Archi accede al mismo endpoint a través del sistema de lectura genérico (`flux
 - **Read-only:** no | **Requiere CONFIRM:** sí
 - **Campos requeridos:** `name`
 - **Campos opcionales:** `domain`, `status`, `settings`, `sponsor_tenant_id`
+- **Executor args:** planos en `step.args`; no usar `body`.
 - **Uso:** crear tenant admin/company sin sponsor, o tenant cliente con `sponsor_tenant_id` apuntando al tenant admin/company.
 - **Nota:** idempotente por `name`/`domain`; si ya existe devuelve `created=false` con el `tenant_id` existente.
 
@@ -223,12 +224,14 @@ Archi accede al mismo endpoint a través del sistema de lectura genérico (`flux
 - **Path:** `PUT /hives/{hive}/identity/tenants/{tenant_id}`
 - **Read-only:** no | **Requiere CONFIRM:** sí
 - **Campos opcionales:** `name`, `domain`, `status`, `settings`, `sponsor_tenant_id`
+- **Executor args:** planos en `step.args`; no usar `body`. Ejemplo: `{"hive":"motherbee","tenant_id":"tnt:...","name":"4i Platform Inc."}`.
 - **Uso:** mutar campos de tenant existente. `sponsor_tenant_id:null` limpia sponsor.
 
 ### `set_tenant_sponsor`
 - **Path:** `POST /hives/{hive}/identity/tenants/{tenant_id}/sponsor`
 - **Read-only:** no | **Requiere CONFIRM:** sí
 - **Campos requeridos:** `sponsor_tenant_id` (`tnt:<uuid>` o `null`)
+- **Executor args:** planos en `step.args`; no usar `body`.
 - **Uso:** cambio enfocado de relación sponsor sin tocar otros campos.
 
 ### `inventory`

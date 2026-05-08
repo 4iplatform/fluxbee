@@ -2011,6 +2011,7 @@ Blocked result:
 - Use only admin actions from the injected catalog or returned by `get_admin_action_help`.
 - Never invent action names.
 - Never invent arg fields.
+- Executor action args are flat function args. Do not wrap HTTP request body fields under `body` unless the action help executor schema explicitly exposes a `body` property.
 - Never leave unresolved placeholders such as `{hive}` or `{node_name}`.
 - Never choose a runtime by vague similarity.
 - Never include broad design reasoning in the plan.
@@ -2152,7 +2153,7 @@ fn build_plan_compiler_prompt(
 
     prompt.push_str("\n## AVAILABLE ACTIONS\n\n");
     prompt.push_str(
-        "This is a compact catalog. Before emitting any executor step, call `get_admin_action_help` for that action and use its request_contract/example_scmd as the exact schema.\n\n",
+        "This is a compact catalog. Before emitting any executor step, call `get_admin_action_help` for that action and use its executor_contract.function_schema as the exact step.args schema.\n\n",
     );
     for action in actions {
         let name = action.get("name").and_then(|v| v.as_str()).unwrap_or("?");
@@ -4274,6 +4275,10 @@ fn llm_readable_admin_action_help(action_name: &str, raw: &Value) -> Value {
         .get("request_contract")
         .cloned()
         .unwrap_or_else(|| Value::Null);
+    let executor_contract = entry
+        .get("executor_contract")
+        .cloned()
+        .unwrap_or_else(|| Value::Null);
     let example_scmd = entry
         .get("example_scmd")
         .or_else(|| contract.get("example_scmd"))
@@ -4303,11 +4308,13 @@ fn llm_readable_admin_action_help(action_name: &str, raw: &Value) -> Value {
         "path_patterns": path_patterns,
         "example_scmd": example_scmd,
         "request_contract": contract,
+        "executor_contract": executor_contract,
         "model_instructions": [
-            "Use example_scmd as the execution shape.",
-            "Use request_contract for exact required and optional argument fields.",
+            "Use executor_contract.function_schema as the exact executor step.args schema when present.",
+            "Executor step.args are flat; path params and JSON body fields are siblings under args.",
+            "Use request_contract/example_scmd for HTTP/SCMD understanding, not as a nested args.body requirement.",
             "Do not put literal {placeholders} from path_patterns into executor args.",
-            "Never invent fields that are not present in request_contract."
+            "Never invent fields that are not present in executor_contract.function_schema."
         ],
     })
 }
