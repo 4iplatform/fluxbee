@@ -15,8 +15,26 @@ impl fmt::Display for MessagesDbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MessagesDbError::InvalidUrl(message) => write!(f, "invalid messages_db_url: {message}"),
-            MessagesDbError::Connect(err) => write!(f, "messages_db connect failed: {err}"),
-            MessagesDbError::Query(err) => write!(f, "messages_db query failed: {err}"),
+            MessagesDbError::Connect(err) => match err.as_db_error() {
+                Some(db) => write!(
+                    f,
+                    "messages_db connect failed: {} ({}): {}",
+                    db.severity(),
+                    db.code().code(),
+                    db.message()
+                ),
+                None => write!(f, "messages_db connect failed: {err}"),
+            },
+            MessagesDbError::Query(err) => match err.as_db_error() {
+                Some(db) => write!(
+                    f,
+                    "messages_db query failed: {} ({}): {}",
+                    db.severity(),
+                    db.code().code(),
+                    db.message()
+                ),
+                None => write!(f, "messages_db query failed: {err}"),
+            },
         }
     }
 }
