@@ -2111,6 +2111,9 @@ Use these facts only to select and validate planning intent. Do not treat them a
 - In legacy direct-task mode, if the operator asks to create an `AI.*` or `IO.*` node and does not provide a tenant, query `list_tenants`; if exactly one active root/default tenant exists, use that `tenant_id`, otherwise block with `missing_fields:["tenant_id"]`.
 - If the operator says "same tenant as node X", read node config/live config to recover the exact `tenant_id`, then validate it with `get_tenant`.
 - If a required `tenant_id` is missing and cannot be read from reliable context, block with a clear missing-field reason.
+- If a later step needs a value produced by an earlier step, use a formal executor output reference: `$steps.<step_id>.payload.<field>`.
+- Example: create root tenant in step `s1`, then create client tenant in step `s2` with `"sponsor_tenant_id":"$steps.s1.payload.tenant_id"`.
+- Never emit human placeholders such as `<tenant_id_from_s1>`; those are not executable.
 
 ### Planning discipline
 

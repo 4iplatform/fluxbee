@@ -395,6 +395,8 @@ Rules:
 - use `create_tenant` to create a new admin/company tenant or a new client tenant
 - create an admin/company tenant as a root tenant with no sponsor
 - create a client tenant with `sponsor_tenant_id` pointing to the admin/company tenant
+- when the client tenant depends on a just-created admin/company tenant in the same executor plan, use a formal output reference: `"$steps.s1.payload.tenant_id"`
+- never use non-executable placeholders like `<tenant_id_from_s1>`
 - in tenant reads, treat `is_root=true` as a root/default tenant candidate and `is_sponsor=true` as a tenant that currently sponsors child tenants
 - if the task says "same tenant as an existing node", prefer reading the node config/live config to find the exact `tenant_id`, then validate that tenant with `get_tenant`
 - run client-facing `AI.*` / `IO.*` nodes with the client `tenant_id`, not the sponsor/admin tenant, unless the operator explicitly asks for an internal admin node

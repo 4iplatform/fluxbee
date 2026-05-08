@@ -176,6 +176,8 @@ struct AdminExecutorPlanStep {
     executor_fill: Option<AdminExecutorFill>,
 }
 
+type AdminExecutorStepOutputs = HashMap<String, serde_json::Value>;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct AdminExecutorFill {
@@ -1155,11 +1157,118 @@ fn validate_executor_plan(plan: &AdminExecutorPlan) -> Result<(), String> {
         let spec = resolve_internal_action_spec(action)
             .map_err(|detail| format!("{step_label}.action {detail}: '{action}'"))?;
         let function_schema = build_admin_executor_function_definition(spec).parameters_json_schema;
+        validate_executor_arg_literals(&step.args, &format!("{step_label}.args"))?;
         validate_value_against_schema(&step.args, &function_schema, &format!("{step_label}.args"))?;
         validate_executor_plan_step_semantics(step, &step_label)?;
         validate_executor_fill(step, &function_schema, &step_label)?;
     }
     Ok(())
+}
+
+fn validate_executor_arg_literals(value: &serde_json::Value, label: &str) -> Result<(), String> {
+    match value {
+        serde_json::Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.starts_with('<') && trimmed.ends_with('>') {
+                return Err(format!(
+                    "{label} contains unresolved placeholder '{trimmed}'. Use a formal step output reference like $steps.s1.payload.tenant_id, or split the operation into separate confirmed plans."
+                ));
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                validate_executor_arg_literals(item, &format!("{label}[{index}]"))?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Object(map) => {
+            for (key, item) in map {
+                validate_executor_arg_literals(item, &format!("{label}.{key}"))?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn resolve_executor_step_refs(
+    step: &AdminExecutorPlanStep,
+    outputs: &AdminExecutorStepOutputs,
+) -> Result<AdminExecutorPlanStep, String> {
+    let mut resolved = step.clone();
+    resolved.args = resolve_executor_value_refs(&step.args, outputs)?;
+    Ok(resolved)
+}
+
+fn resolve_executor_value_refs(
+    value: &serde_json::Value,
+    outputs: &AdminExecutorStepOutputs,
+) -> Result<serde_json::Value, String> {
+    match value {
+        serde_json::Value::String(raw) => {
+            let trimmed = raw.trim();
+            if let Some(path) = trimmed.strip_prefix("$steps.") {
+                return resolve_executor_step_output_path(path, outputs);
+            }
+            Ok(value.clone())
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|item| resolve_executor_value_refs(item, outputs))
+            .collect::<Result<Vec<_>, _>>()
+            .map(serde_json::Value::Array),
+        serde_json::Value::Object(map) => {
+            let mut resolved = serde_json::Map::new();
+            for (key, item) in map {
+                resolved.insert(key.clone(), resolve_executor_value_refs(item, outputs)?);
+            }
+            Ok(serde_json::Value::Object(resolved))
+        }
+        _ => Ok(value.clone()),
+    }
+}
+
+fn resolve_executor_step_output_path(
+    path: &str,
+    outputs: &AdminExecutorStepOutputs,
+) -> Result<serde_json::Value, String> {
+    let mut parts = path.split('.');
+    let step_id = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "step output reference is missing step id".to_string())?;
+    let mut current = outputs.get(step_id).ok_or_else(|| {
+        format!("step output reference points to unknown or incomplete step '{step_id}'")
+    })?;
+    for part in parts {
+        let key = part.trim();
+        if key.is_empty() {
+            return Err(format!(
+                "step output reference '$steps.{path}' contains an empty path segment"
+            ));
+        }
+        current = current.get(key).ok_or_else(|| {
+            format!("step output reference '$steps.{path}' could not resolve segment '{key}'")
+        })?;
+    }
+    Ok(current.clone())
+}
+
+fn successful_step_output(
+    step_events: &[AdminExecutorStepEvent],
+    action: &str,
+) -> Option<serde_json::Value> {
+    step_events
+        .iter()
+        .rev()
+        .find(|event| {
+            event.step_action == action
+                && event.tool_name.as_deref() == Some(action)
+                && event.status.eq_ignore_ascii_case("done")
+        })
+        .and_then(|event| event.result_preview.clone())
 }
 
 fn validate_executor_plan_step_semantics(
@@ -1824,6 +1933,7 @@ Important review rules:\n\
 - Do not invent extra acknowledgement, confirmation, approval, or consent fields unless they appear explicitly in the request contract.\n\
 - `confirmation_required=true` is operator/UI metadata, not a step.args field requirement.\n\
 - Do not reject a step for lacking a confirm/ack field when the request contract does not define one.\n\
+- Step output references using `$steps.<step_id>.payload.<field>` are executable string values and must not be rejected as placeholders.\n\
 \n\
 Action help contract:\n{}\n\
 \n\
@@ -2251,6 +2361,7 @@ async fn execute_admin_executor_plan(
     let mut failed_step_id = None::<String>;
     let mut failed_step_action = None::<String>;
     let mut last_failure = None::<AdminExecutorFailure>;
+    let mut step_outputs = AdminExecutorStepOutputs::new();
 
     for (index, step) in request.plan.execution.steps.iter().enumerate() {
         if request.executor_options.dry_run {
@@ -2273,14 +2384,19 @@ async fn execute_admin_executor_plan(
             continue;
         }
 
-        let step_spec = resolve_internal_action_spec(&step.action)
+        let resolved_step = resolve_executor_step_refs(step, &step_outputs)
+            .map_err(|detail| -> AdminError { format!("step '{}': {detail}", step.id).into() })?;
+        validate_executor_plan_step_semantics(&resolved_step, &format!("execution.steps[{index}]"))
+            .map_err(|detail| -> AdminError { detail.into() })?;
+
+        let step_spec = resolve_internal_action_spec(&resolved_step.action)
             .map_err(|detail| -> AdminError { format!("step '{}': {detail}", step.id).into() })?;
         let mut tools = FunctionToolRegistry::new();
         tools
             .register(Arc::new(AdminExecutorStepTool {
                 ctx: ctx.clone(),
                 client: client.clone(),
-                step: step.clone(),
+                step: resolved_step.clone(),
                 definition: build_admin_executor_function_definition(step_spec),
             }))
             .map_err(|err| -> AdminError {
@@ -2293,7 +2409,7 @@ async fn execute_admin_executor_plan(
                 .register(Arc::new(AdminExecutorHelpTool {
                     ctx: ctx.clone(),
                     client: client.clone(),
-                    step: step.clone(),
+                    step: resolved_step.clone(),
                     definition: build_admin_executor_function_definition(help_spec),
                 }))
                 .map_err(|err| -> AdminError {
@@ -2303,7 +2419,7 @@ async fn execute_admin_executor_plan(
 
         let model = runtime.client.clone().function_model(
             runtime.model.clone(),
-            Some(admin_executor_prompt(step, &request.plan)),
+            Some(admin_executor_prompt(&resolved_step, &request.plan)),
             runtime.model_settings.clone(),
         );
         let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
@@ -2314,7 +2430,7 @@ async fn execute_admin_executor_plan(
                 FunctionRunInput {
                     current_user_message: format!(
                         "Execute step '{}' ({}) using the provided plan and tool contract.",
-                        step.id, step.action
+                        resolved_step.id, resolved_step.action
                     ),
                     current_user_parts: None,
                     immediate_memory: None,
@@ -2323,19 +2439,28 @@ async fn execute_admin_executor_plan(
             .await
             .map_err(|err| -> AdminError { format!("executor model run failed: {err}").into() })?;
 
-        let (mut step_events, action_called, mut failure) =
-            build_executor_step_events_from_result(&request.execution_id, index, step, &result);
+        let (mut step_events, action_called, mut failure) = build_executor_step_events_from_result(
+            &request.execution_id,
+            index,
+            &resolved_step,
+            &result,
+        );
         if !action_called && failure.is_none() {
             let (fallback_event, fallback_failure) = execute_admin_executor_step_fallback(
                 ctx,
                 client,
                 &request.execution_id,
                 index,
-                step,
+                &resolved_step,
             )
             .await;
             step_events.push(fallback_event);
             failure = fallback_failure;
+        }
+        if failure.is_none() {
+            if let Some(output) = successful_step_output(&step_events, &resolved_step.action) {
+                step_outputs.insert(resolved_step.id.clone(), output);
+            }
         }
         all_events.append(&mut step_events);
         if failure.is_none() {
@@ -2343,19 +2468,19 @@ async fn execute_admin_executor_plan(
             continue;
         }
         last_failure = failure.clone();
-        failed_step_id = Some(step.id.clone());
-        failed_step_action = Some(step.action.clone());
+        failed_step_id = Some(resolved_step.id.clone());
+        failed_step_action = Some(resolved_step.action.clone());
         if request.plan.execution.stop_on_error {
             all_events.push(AdminExecutorStepEvent {
                 execution_id: request.execution_id.clone(),
-                step_id: step.id.clone(),
+                step_id: resolved_step.id.clone(),
                 step_index: index,
-                step_action: step.action.clone(),
+                step_action: resolved_step.action.clone(),
                 status: "stopped".to_string(),
                 timestamp: now_epoch_ms(),
                 summary: "Execution stopped after failure".to_string(),
-                tool_name: Some(step.action.clone()),
-                tool_args_preview: Some(step.args.clone()),
+                tool_name: Some(resolved_step.action.clone()),
+                tool_args_preview: Some(resolved_step.args.clone()),
                 result_preview: None,
                 error_code: failure.as_ref().map(|value| value.code.clone()),
                 error_source: failure.as_ref().map(|value| value.source.clone()),
@@ -11825,6 +11950,70 @@ mod tests {
         .expect_err("AI run_node without tenant_id must fail validation");
 
         assert!(err.contains("requires root-level tenant_id"));
+    }
+
+    #[test]
+    fn executor_plan_validation_rejects_human_placeholder_args() {
+        let err = parse_executor_plan(json!({
+            "plan_version": "0.1",
+            "kind": "executor_plan",
+            "metadata": {
+                "name": "tenant-chain",
+                "target_hive": "motherbee"
+            },
+            "execution": {
+                "strict": true,
+                "stop_on_error": true,
+                "allow_help_lookup": true,
+                "steps": [{
+                    "id": "s1",
+                    "action": "create_tenant",
+                    "args": {
+                        "hive": "motherbee",
+                        "name": "Techline srl",
+                        "status": "active",
+                        "sponsor_tenant_id": "<tenant_id_from_s0>"
+                    }
+                }]
+            }
+        }))
+        .expect_err("human placeholders must not validate");
+
+        assert!(err.contains("unresolved placeholder"));
+        assert!(err.contains("$steps.s1.payload.tenant_id"));
+    }
+
+    #[test]
+    fn executor_step_output_refs_resolve_from_prior_payloads() {
+        let step = AdminExecutorPlanStep {
+            id: "s2".to_string(),
+            action: "create_tenant".to_string(),
+            args: json!({
+                "hive": "motherbee",
+                "name": "Techline srl",
+                "status": "active",
+                "sponsor_tenant_id": "$steps.s1.payload.tenant_id"
+            }),
+            executor_fill: None,
+        };
+        let mut outputs = AdminExecutorStepOutputs::new();
+        outputs.insert(
+            "s1".to_string(),
+            json!({
+                "status": "ok",
+                "action": "create_tenant",
+                "payload": {
+                    "tenant_id": "tnt:11111111-1111-1111-1111-111111111111"
+                }
+            }),
+        );
+
+        let resolved = resolve_executor_step_refs(&step, &outputs).expect("resolve ref");
+
+        assert_eq!(
+            resolved.args["sponsor_tenant_id"],
+            json!("tnt:11111111-1111-1111-1111-111111111111")
+        );
     }
 
     #[test]
