@@ -2126,8 +2126,6 @@ Use these facts only to select and validate planning intent. Do not treat them a
 - If a required `tenant_id` is missing and cannot be read from reliable context, block with a clear missing-field reason.
 - If a later step needs a value produced by an earlier step, use a formal executor output reference: `$steps.<step_id>.payload.<field>`.
 - Example: create root tenant in step `s1`, then create client tenant in step `s2` with `"sponsor_tenant_id":"$steps.s1.payload.tenant_id"`.
-- If a tenant id is already explicit in the task or verified context, use that literal `tnt:<uuid>` directly as `tenant_id` or `sponsor_tenant_id`; do not block just to revalidate the same sponsor.
-- For update-then-create tenant chains, either use the known literal sponsor tenant id or `$steps.s1.payload.tenant_id` from `update_tenant`.
 - Never emit human placeholders such as `<tenant_id_from_s1>`; those are not executable.
 
 ### Planning discipline
@@ -3652,16 +3650,15 @@ fn should_retry_blocked_plan_compiler_output(
         .as_deref()
         .unwrap_or(&output.human_summary)
         .to_ascii_lowercase();
-    let combined_context = format!("{task}\n{user_context}").to_ascii_lowercase();
-    let has_prefixed_tenant_id = combined_context.contains("tnt:");
-    let sponsor_or_validation_block = reason.contains("sponsor")
-        || reason.contains("live read")
-        || reason.contains("validate")
-        || reason.contains("validation");
     let missing_without_specific_field =
         output.missing_fields.is_empty() && code == "missing_required_value";
+    let schema_lookup_block = reason.contains("schema")
+        || reason.contains("contract")
+        || reason.contains("action help")
+        || reason.contains("admin action");
+    let context_has_identifiers = format!("{task}\n{user_context}").contains(':');
 
-    (has_prefixed_tenant_id && sponsor_or_validation_block) || missing_without_specific_field
+    schema_lookup_block || (missing_without_specific_field && context_has_identifiers)
 }
 
 fn build_plan_compile_trace(
@@ -3840,7 +3837,7 @@ async fn run_plan_compiler_transaction(
                 "plan_compiler returned a potentially recoverable blocked result — retrying with feedback"
             );
             let feedback_context = format!(
-                "{}\n\n[FEEDBACK] Your previous result was blocked with this reason: {}\nIf the task or context contains an explicit prefixed id such as tnt:<uuid>, use that literal directly in executor args instead of blocking for another validation pass. For tenant sponsor chains, use sponsor_tenant_id directly when the sponsor tenant id is explicit, or use a formal step output reference such as $steps.s1.payload.tenant_id when it is produced by an earlier step. Every executor step must include an args object, even when args is empty. Call get_admin_action_help for each action, then call submit_executor_plan.",
+                "{}\n\n[FEEDBACK] Your previous result was blocked with this reason: {}\nDo not block because an action schema is missing until you have called get_admin_action_help for each action you intend to use. Use executor_contract.function_schema as the exact step.args schema. Every executor step must include an args object, even when args is empty. If a required value is already explicit in the task or verified context, use it directly instead of asking for it again. Then call submit_executor_plan exactly once.",
                 user_context, retry_reason
             );
             let retried = run_plan_compiler_with_context(
@@ -22980,6 +22977,54 @@ mod tests {
             &["tenant_id".to_string()],
         );
         assert_eq!(class, FailureClass::PlanContractInvalid);
+    }
+
+    #[test]
+    fn plan_compiler_retries_schema_lookup_blockers() {
+        let output = PlanCompilerOutput {
+            disposition: PlanCompilerDisposition::Blocked,
+            plan: None,
+            human_summary: "schema missing".to_string(),
+            blocked_reason: Some("Required admin action schema is missing".to_string()),
+            blocked_code: Some("missing_required_value".to_string()),
+            missing_fields: vec![],
+            operator_hint: None,
+            cookbook_entry: None,
+            help_lookup_actions: vec![],
+            help_lookup_calls: 0,
+            query_hive_calls: 0,
+            tokens_used: 0,
+        };
+
+        assert!(should_retry_blocked_plan_compiler_output(
+            &output,
+            "Create tenant Techline SRL",
+            ""
+        ));
+    }
+
+    #[test]
+    fn plan_compiler_does_not_retry_specific_missing_fields() {
+        let output = PlanCompilerOutput {
+            disposition: PlanCompilerDisposition::Blocked,
+            plan: None,
+            human_summary: "missing tenant".to_string(),
+            blocked_reason: Some("tenant id is missing".to_string()),
+            blocked_code: Some("missing_required_value".to_string()),
+            missing_fields: vec!["tenant_id".to_string()],
+            operator_hint: None,
+            cookbook_entry: None,
+            help_lookup_actions: vec![],
+            help_lookup_calls: 0,
+            query_hive_calls: 0,
+            tokens_used: 0,
+        };
+
+        assert!(!should_retry_blocked_plan_compiler_output(
+            &output,
+            "Create AI.sales",
+            ""
+        ));
     }
 
     #[test]
