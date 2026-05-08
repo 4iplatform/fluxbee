@@ -16,7 +16,7 @@ Add a new section to archi (the SY.architect web frontend) that shows the system
 - Live tail when the page is active.
 - A new lateral rail to navigate between sections (Archi chat, Messages, future logs) — replaces the single-screen layout. Tabs were rejected for not scaling.
 
-This is **read-only** for archi. archi must **not** be able to mutate `storage_inbox`.
+archi's queries against `storage_inbox` are exclusively `SELECT` (see `list_messages`, `tail_since`, `get_message` in `src/bin/sy_architect/messages_db.rs`). The system does **not** enforce read-only at the connection level — the operator chooses the connection string. Reusing storage's own connection string is fine for now; tightening to a separate read-only role can come later if/when threat-model warrants it.
 
 ---
 
@@ -66,7 +66,7 @@ These were closed in the design conversation, recorded here so future readers ha
 1. **Endpoint name**: `/api/messages` (not `/api/router-log` or `/api/ilk-messages`). Rationale: in archi context the noun is unambiguous; subject of dispute later can be split into `/api/messages/<kind>`.
 2. **Navigation**: lateral rail, **angosto fijo + tooltip** (no expand toggle), to the left of everything. Sections become first-class. Existing chat-history sidebar moves *inside* the Archi section.
 3. **Live tail**: yes, via SSE with backend polling DB every ~1s. No NATS coupling from archi-frontend.
-4. **DB access**: cross-process direct read against storage's Postgres, with **a dedicated read-only Postgres role** (option (b) of the design). Mínimo privilegio.
+4. **DB access**: cross-process direct read against storage's Postgres. The operator provides the connection string via CONFIG SET; reusing storage's own URL is the simplest path. archi's code only runs `SELECT` so DB-level enforcement is not required (revisit if threat model changes).
 5. **Secret delivery**: a new key `messages_db_url` in archi's existing `secrets.json`, written via `architect_local_config_set` (already implemented for OpenAI). No env-only path. Compatible with the storage / identity pattern.
 6. **List row**: 2 lines. Line 1: `HH:MM:SS.mmm · subject`. Line 2 (apagada): `ich · size · estado(✓/…/!)`. `ich` is the chosen identifier for now; can change later.
 7. **Filters in MVP**: temporal window (`15m / 1h / 24h / All`) + toggle "sólo con error". Subject filter deferred to iteration 2.
@@ -75,22 +75,9 @@ These were closed in the design conversation, recorded here so future readers ha
 
 ---
 
-## Prerequisite — DBA / Operations (not code)
+## Prerequisite — none
 
-Before any code in archi can be useful, the operator (or an automation step we add later) must create a read-only role in the storage Postgres:
-
-```sql
--- Run as superuser against the storage DB.
-CREATE ROLE archi_messages_reader LOGIN PASSWORD '<random-strong>';
-GRANT CONNECT ON DATABASE <storage_db_name> TO archi_messages_reader;
-GRANT USAGE ON SCHEMA public TO archi_messages_reader;
-GRANT SELECT ON public.storage_inbox TO archi_messages_reader;
--- Future-proof if more log tables appear:
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-  GRANT SELECT ON TABLES TO archi_messages_reader;
-```
-
-The resulting connection string is what gets stored in archi via CONFIG SET. **Do not** reuse the storage write user.
+The operator just needs a Postgres connection string that can read `storage_inbox`. The simplest path is to copy storage's own connection string (already stored in storage's `secrets.json`) and pass it to archi via the same CONFIG SET pattern. Provisioning a dedicated read-only role is **out of scope** for this iteration — archi's queries are all `SELECT` so the privilege gap is not exercised. If later the threat model demands it, we add a separate task to provision and rotate the role automatically.
 
 ---
 

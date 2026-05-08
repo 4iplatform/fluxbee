@@ -4961,25 +4961,29 @@ fn resolve_messages_db_url(node_name: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-async fn refresh_architect_messages_db_url(state: &ArchitectState) -> bool {
+async fn refresh_architect_messages_db_url(state: &ArchitectState) -> (bool, bool, Option<String>) {
     let url = resolve_messages_db_url(&state.node_name);
-    let configured = url.is_some();
+    let url_present = url.is_some();
+    let mut connect_error: Option<String> = None;
     let new_client = match url.as_deref() {
         Some(url) => match messages_db::MessagesDb::connect(url).await {
             Ok(client) => Some(Arc::new(client)),
             Err(err) => {
-                tracing::warn!(error = %err, "messages_db reconnect failed; viewer disabled until reconfigured");
+                let err_text = err.to_string();
+                tracing::warn!(error = %err_text, "messages_db connect failed; viewer disabled until reconfigured");
+                connect_error = Some(err_text);
                 None
             }
         },
         None => None,
     };
+    let connected = new_client.is_some();
     *state.messages_db_url.write().await = url;
     *state.messages_db.write().await = new_client;
     state
         .messages_db_configured
-        .store(configured, Ordering::Relaxed);
-    configured
+        .store(url_present, Ordering::Relaxed);
+    (url_present, connected, connect_error)
 }
 
 fn load_identity_ich_options(
@@ -9551,7 +9555,8 @@ async fn handle_architect_local_config_set(
     let path = save_node_secret_record_with_root(&state.node_name, architect_nodes_root(), &record)
         .map_err(|err| -> ArchitectError { Box::new(err) })?;
     let ai_configured = refresh_architect_ai_runtime(state).await?;
-    let messages_db_configured = refresh_architect_messages_db_url(state).await;
+    let (messages_db_url_set, messages_db_connected, messages_db_connect_error) =
+        refresh_architect_messages_db_url(state).await;
 
     let message = match (
         stored_secrets.iter().any(|entry| {
@@ -9578,7 +9583,9 @@ async fn handle_architect_local_config_set(
             "state": if ai_configured { "configured" } else { "missing_secret" },
             "trace_id": trace_id,
             "ai_configured": ai_configured,
-            "messages_db_configured": messages_db_configured,
+            "messages_db_configured": messages_db_url_set,
+            "messages_db_connected": messages_db_connected,
+            "messages_db_connect_error": messages_db_connect_error,
             "persisted_path": path,
             "stored_secrets": stored_secrets,
             "message": message
@@ -15119,13 +15126,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
         <div id="messages-unconfigured" class="messages-unconfigured" hidden>
           <div class="messages-unconfigured-card">
             <h2>messages_db_url not configured</h2>
-            <p>Set the read-only Postgres connection string for storage to enable this panel. archi only reads <code>storage_inbox</code>; do not point this at the storage write user.</p>
+            <p>Set the Postgres connection string that points to storage's database — archi only runs <code>SELECT</code> against <code>storage_inbox</code>. The simplest path is to reuse the same connection string storage uses.</p>
             <p class="messages-unconfigured-label">From archi chat (operator):</p>
-            <code>SCMD: curl -X POST /architect/control/config-set -d '{{"config":{{"storage":{{"messages_db_url":"postgresql://archi_messages_reader:PASS@HOST:5432/fluxbee"}}}}}}'</code>
+            <code>SCMD: curl -X POST /architect/control/config-set -d '{{"config":{{"storage":{{"messages_db_url":"postgresql://USER:PASS@HOST:5432/fluxbee"}}}}}}'</code>
             <p class="messages-unconfigured-label">Or via admin gateway:</p>
             <code>curl -sS -X POST http://MOTHERBEE:8080/hives/HIVE/nodes/SY.architect@HIVE/control/config-set \
   -H 'Content-Type: application/json' \
-  -d '{{"schema_version":1,"config_version":1,"apply_mode":"replace","config":{{"storage":{{"messages_db_url":"postgresql://archi_messages_reader:PASS@HOST:5432/fluxbee"}}}}}}'</code>
+  -d '{{"schema_version":1,"config_version":1,"apply_mode":"replace","config":{{"storage":{{"messages_db_url":"postgresql://USER:PASS@HOST:5432/fluxbee"}}}}}}'</code>
           </div>
         </div>
       </section>
