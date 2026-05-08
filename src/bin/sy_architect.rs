@@ -2,6 +2,8 @@
 mod artifact_loop;
 #[path = "sy_architect/failure_classifier.rs"]
 mod failure_classifier;
+#[path = "sy_architect/messages_db.rs"]
+mod messages_db;
 #[path = "sy_architect/pipeline_types.rs"]
 mod pipeline_types;
 #[path = "sy_architect/reconciler.rs"]
@@ -23,7 +25,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -33,6 +35,7 @@ use async_trait::async_trait;
 use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Request, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{Method, StatusCode, Uri};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::any;
 use axum::{Json, Router};
@@ -84,6 +87,7 @@ const CHAT_SESSION_PROFILES_TABLE: &str = "session_profiles";
 const CHAT_MODE_OPERATOR: &str = "operator";
 const CHAT_MODE_IMPERSONATION: &str = "impersonation";
 const ARCHITECT_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
+const ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL: &str = "messages_db_url";
 const ARCHITECT_MAX_ATTACHMENTS: usize = 8;
 const ARCHITECT_MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 const ARCHITECT_MAX_SOFTWARE_UPLOAD_BYTES: usize = 128 * 1024 * 1024;
@@ -322,6 +326,10 @@ struct ArchitectState {
     router_connected: AtomicBool,
     ai_configured: AtomicBool,
     ai_runtime: Arc<Mutex<Option<ArchitectAiRuntime>>>,
+    messages_db_configured: AtomicBool,
+    messages_db_url: Arc<RwLock<Option<String>>>,
+    messages_db: Arc<RwLock<Option<Arc<messages_db::MessagesDb>>>>,
+    messages_stream_active: Arc<AtomicUsize>,
     chat_lock: Arc<Mutex<()>>,
     pending_actions: Arc<Mutex<HashMap<String, PendingAdminAction>>>,
     router_sender: Arc<Mutex<Option<NodeSender>>>,
@@ -4707,6 +4715,18 @@ async fn main() -> Result<(), ArchitectError> {
         components: default_component_statuses(),
         error: None,
     };
+    let initial_messages_db_url = resolve_messages_db_url(&node_name);
+    let initial_messages_db_configured = initial_messages_db_url.is_some();
+    let initial_messages_db = match initial_messages_db_url.as_deref() {
+        Some(url) => match messages_db::MessagesDb::connect(url).await {
+            Ok(client) => Some(Arc::new(client)),
+            Err(err) => {
+                tracing::warn!(error = %err, "messages_db connect at boot failed; viewer disabled until reconfigured");
+                None
+            }
+        },
+        None => None,
+    };
     let state = Arc::new(ArchitectState {
         hive_id: hive.hive_id.clone(),
         node_name: node_name.clone(),
@@ -4717,6 +4737,10 @@ async fn main() -> Result<(), ArchitectError> {
         router_connected: AtomicBool::new(false),
         ai_configured: AtomicBool::new(ai_runtime.is_some()),
         ai_runtime: Arc::new(Mutex::new(ai_runtime)),
+        messages_db_configured: AtomicBool::new(initial_messages_db_configured),
+        messages_db_url: Arc::new(RwLock::new(initial_messages_db_url)),
+        messages_db: Arc::new(RwLock::new(initial_messages_db)),
+        messages_stream_active: Arc::new(AtomicUsize::new(0)),
         chat_lock: Arc::new(Mutex::new(())),
         pending_actions: Arc::new(Mutex::new(HashMap::new())),
         router_sender: Arc::new(Mutex::new(None)),
@@ -4763,6 +4787,9 @@ async fn main() -> Result<(), ArchitectError> {
         .route("/api/software/upload", any(dynamic_handler))
         .route("/api/software/publish", any(dynamic_handler))
         .route("/api/agent-assets", any(dynamic_handler))
+        .route("/api/messages", any(dynamic_handler))
+        .route("/api/messages/stream", any(dynamic_handler))
+        .route("/api/messages/*dedupe_key", any(dynamic_handler))
         .route("/api/sessions", any(dynamic_handler))
         .route("/api/sessions/*path", any(dynamic_handler))
         .route("/*path", any(dynamic_handler))
@@ -4774,6 +4801,7 @@ async fn main() -> Result<(), ArchitectError> {
         node = %state.node_name,
         listen = %state.listen,
         ai_configured = state.ai_configured.load(Ordering::Relaxed),
+        messages_db_configured = state.messages_db_configured.load(Ordering::Relaxed),
         "sy.architect axum listening"
     );
     axum::serve(listener, app).await?;
@@ -4920,6 +4948,38 @@ async fn refresh_architect_ai_runtime(state: &ArchitectState) -> Result<bool, Ar
         .store(runtime.is_some(), Ordering::Relaxed);
     *state.ai_runtime.lock().await = runtime;
     Ok(state.ai_configured.load(Ordering::Relaxed))
+}
+
+fn resolve_messages_db_url(node_name: &str) -> Option<String> {
+    let record = load_architect_secret_record(node_name).ok().flatten()?;
+    record
+        .secrets
+        .get(ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+async fn refresh_architect_messages_db_url(state: &ArchitectState) -> bool {
+    let url = resolve_messages_db_url(&state.node_name);
+    let configured = url.is_some();
+    let new_client = match url.as_deref() {
+        Some(url) => match messages_db::MessagesDb::connect(url).await {
+            Ok(client) => Some(Arc::new(client)),
+            Err(err) => {
+                tracing::warn!(error = %err, "messages_db reconnect failed; viewer disabled until reconfigured");
+                None
+            }
+        },
+        None => None,
+    };
+    *state.messages_db_url.write().await = url;
+    *state.messages_db.write().await = new_client;
+    state
+        .messages_db_configured
+        .store(configured, Ordering::Relaxed);
+    configured
 }
 
 fn load_identity_ich_options(
@@ -5808,6 +5868,282 @@ async fn handle_agent_asset_request(
             delete_agent_asset_for_state(state, &hash).await
         }
         _ => Err("unsupported method for /api/agent-assets".into()),
+    }
+}
+
+const MESSAGES_LIST_DEFAULT_LIMIT: i64 = 200;
+const MESSAGES_LIST_MAX_LIMIT: i64 = 500;
+const MESSAGES_STREAM_POLL_INTERVAL_MS: u64 = 1_000;
+const MESSAGES_STREAM_TAIL_LIMIT: i64 = 500;
+const MESSAGES_STREAM_KEEPALIVE_SECS: u64 = 15;
+const MESSAGES_STREAM_CHANNEL_CAPACITY: usize = 64;
+const MESSAGES_STREAM_MAX_CONCURRENT: usize = 16;
+
+struct MessagesStreamGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl MessagesStreamGuard {
+    fn try_acquire(counter: &Arc<AtomicUsize>) -> Option<Self> {
+        let prev = counter.fetch_add(1, Ordering::Relaxed);
+        if prev >= MESSAGES_STREAM_MAX_CONCURRENT {
+            counter.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(Self {
+            counter: Arc::clone(counter),
+        })
+    }
+}
+
+impl Drop for MessagesStreamGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn current_messages_iso_timestamp() -> String {
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
+async fn handle_messages_stream(state: &ArchitectState, query: &str) -> Response {
+    let cursor = match (
+        query_param(query, "after_ts"),
+        query_param(query, "after_dk"),
+    ) {
+        (Some(ts), Some(dk)) => messages_db::MessagesCursor {
+            received_at_iso: ts,
+            dedupe_key: dk,
+        },
+        (None, None) => messages_db::MessagesCursor {
+            received_at_iso: current_messages_iso_timestamp(),
+            dedupe_key: String::new(),
+        },
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid_cursor",
+                    "message": "after_ts and after_dk must be provided together"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let client = state.messages_db.read().await.clone();
+    let Some(client) = client else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "messages_db_not_configured",
+                "message": "messages_db_url is not configured. Set it via architect_local_config_set."
+            })),
+        )
+            .into_response();
+    };
+
+    let Some(guard) = MessagesStreamGuard::try_acquire(&state.messages_stream_active) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "messages_stream_capacity",
+                "message": format!("max {} concurrent SSE streams reached", MESSAGES_STREAM_MAX_CONCURRENT)
+            })),
+        )
+            .into_response();
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<SseEvent, std::convert::Infallible>>(
+        MESSAGES_STREAM_CHANNEL_CAPACITY,
+    );
+    tokio::spawn(messages_stream_task(client, cursor, tx, guard));
+
+    Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(MESSAGES_STREAM_KEEPALIVE_SECS))
+                .text("ping"),
+        )
+        .into_response()
+}
+
+async fn handle_messages_detail(state: &ArchitectState, dedupe_key: &str) -> Response {
+    let client = state.messages_db.read().await.clone();
+    let Some(client) = client else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "messages_db_not_configured",
+                "message": "messages_db_url is not configured. Set it via architect_local_config_set."
+            })),
+        )
+            .into_response();
+    };
+    match client.get_message(dedupe_key).await {
+        Ok(Some(detail)) => Json(detail).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "messages_not_found", "dedupe_key": dedupe_key })),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::warn!(error = %err, "messages detail query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "messages_db_query_failed",
+                    "message": err.to_string()
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn messages_stream_task(
+    client: Arc<messages_db::MessagesDb>,
+    mut cursor: messages_db::MessagesCursor,
+    tx: tokio::sync::mpsc::Sender<Result<SseEvent, std::convert::Infallible>>,
+    _guard: MessagesStreamGuard,
+) {
+    let mut interval = tokio::time::interval(Duration::from_millis(MESSAGES_STREAM_POLL_INTERVAL_MS));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        match client.tail_since(&cursor, MESSAGES_STREAM_TAIL_LIMIT).await {
+            Ok(items) => {
+                if items.is_empty() {
+                    continue;
+                }
+                let count = items.len();
+                if count as i64 >= MESSAGES_STREAM_TAIL_LIMIT {
+                    tracing::warn!(
+                        count,
+                        "messages SSE tail returned full batch; client may be paused or system bursting"
+                    );
+                }
+                if let Some(last) = items.last() {
+                    cursor = messages_db::MessagesCursor {
+                        received_at_iso: last.received_at.clone(),
+                        dedupe_key: last.dedupe_key.clone(),
+                    };
+                }
+                for item in items {
+                    let event = match SseEvent::default().event("message").json_data(&item) {
+                        Ok(event) => event,
+                        Err(err) => {
+                            tracing::warn!(error = %err, "failed to encode messages SSE event; skipping");
+                            continue;
+                        }
+                    };
+                    if tx.send(Ok(event)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "messages SSE tail query failed; closing stream");
+                let payload = json!({
+                    "error": "messages_db_query_failed",
+                    "message": err.to_string()
+                });
+                let event = SseEvent::default()
+                    .event("error")
+                    .data(payload.to_string());
+                let _ = tx.send(Ok(event)).await;
+                return;
+            }
+        }
+    }
+}
+
+
+
+async fn handle_messages_list(state: &ArchitectState, query: &str) -> Response {
+    let limit = query_param(query, "limit")
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .unwrap_or(MESSAGES_LIST_DEFAULT_LIMIT)
+        .clamp(1, MESSAGES_LIST_MAX_LIMIT);
+
+    let since = match query_param(query, "since") {
+        Some(raw) => match messages_db::TimeWindow::parse(&raw) {
+            Some(window) => window,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "invalid_since",
+                        "message": "since must be one of: 15m, 1h, 24h, all"
+                    })),
+                )
+                    .into_response();
+            }
+        },
+        None => messages_db::TimeWindow::All,
+    };
+    let with_error = query_bool_param(query, "with_error");
+
+    let cursor = match (
+        query_param(query, "cursor_ts"),
+        query_param(query, "cursor_dk"),
+    ) {
+        (Some(ts), Some(dk)) => Some(messages_db::MessagesCursor {
+            received_at_iso: ts,
+            dedupe_key: dk,
+        }),
+        (None, None) => None,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid_cursor",
+                    "message": "cursor_ts and cursor_dk must be provided together"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let client = state.messages_db.read().await.clone();
+    let Some(client) = client else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "messages_db_not_configured",
+                "message": "messages_db_url is not configured. Set it via architect_local_config_set."
+            })),
+        )
+            .into_response();
+    };
+
+    let filters = messages_db::MessagesFilters {
+        since,
+        with_error,
+    };
+    match client
+        .list_messages(cursor.as_ref(), &filters, limit)
+        .await
+    {
+        Ok((items, next_cursor)) => Json(json!({
+            "items": items,
+            "next_cursor": next_cursor.map(|c| json!({ "ts": c.received_at_iso, "dk": c.dedupe_key })),
+        }))
+        .into_response(),
+        Err(err) => {
+            tracing::warn!(error = %err, "messages list query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "messages_db_query_failed",
+                    "message": err.to_string()
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -6771,6 +7107,16 @@ async fn dynamic_handler(
                 )
                     .into_response(),
             }
+        }
+        (Method::GET, _) if is_messages_stream_path(path) => {
+            handle_messages_stream(&state, uri.query().unwrap_or("")).await
+        }
+        (Method::GET, _) if is_messages_list_path(path) => {
+            handle_messages_list(&state, uri.query().unwrap_or("")).await
+        }
+        (Method::GET, _) if messages_detail_key_from_path(path).is_some() => {
+            let key = messages_detail_key_from_path(path).unwrap();
+            handle_messages_detail(&state, &key).await
         }
         (Method::GET, _) if is_sessions_collection_path(path) => {
             match list_chat_sessions(&state).await {
@@ -9067,11 +9413,31 @@ async fn handle_architect_local_config_get(
     } else {
         "missing"
     };
-    let descriptor = NodeSecretDescriptor {
+    let messages_db_configured = secret_record
+        .as_ref()
+        .and_then(|record| record.secrets.get(ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    let messages_db_url_source = if messages_db_configured {
+        "local_file"
+    } else {
+        "missing"
+    };
+    let openai_descriptor = NodeSecretDescriptor {
         field: "ai_providers.openai.api_key".to_string(),
         storage_key: ARCHITECT_LOCAL_SECRET_KEY_OPENAI.to_string(),
         required: true,
         configured,
+        value_redacted: true,
+        persistence: "local_file".to_string(),
+    };
+    let messages_db_descriptor = NodeSecretDescriptor {
+        field: "storage.messages_db_url".to_string(),
+        storage_key: ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL.to_string(),
+        required: false,
+        configured: messages_db_configured,
         value_redacted: true,
         persistence: "local_file".to_string(),
     };
@@ -9083,6 +9449,7 @@ async fn handle_architect_local_config_get(
             "node_name": state.node_name,
             "config_version": 1,
             "state": if configured { "configured" } else { "missing_secret" },
+            "messages_db_state": if messages_db_configured { "configured" } else { "missing_secret" },
             "config": {
                 "ai_providers": {
                     "openai": {
@@ -9092,6 +9459,9 @@ async fn handle_architect_local_config_get(
                         "temperature": merged.as_ref().and_then(|openai| openai.temperature.map(Value::from)).unwrap_or(Value::Null),
                         "top_p": merged.as_ref().and_then(|openai| openai.top_p.map(Value::from)).unwrap_or(Value::Null)
                     }
+                },
+                "storage": {
+                    "messages_db_url": if messages_db_configured { Value::String(NODE_SECRET_REDACTION_TOKEN.to_string()) } else { Value::Null }
                 }
             },
             "contract": {
@@ -9099,15 +9469,17 @@ async fn handle_architect_local_config_get(
                 "node_kind": "SY.architect",
                 "supports": ["CONFIG_GET", "CONFIG_SET"],
                 "required_fields": ["config.ai_providers.openai.api_key"],
-                "optional_fields": [],
-                "secrets": [descriptor],
+                "optional_fields": ["config.storage.messages_db_url"],
+                "secrets": [openai_descriptor, messages_db_descriptor],
                 "notes": [
-                    "This local control path bootstraps archi's own OpenAI key only from local secrets.json.",
-                    "Secret values are persisted in local secrets.json and always returned redacted."
+                    "This local control path bootstraps archi's own OpenAI key and the read-only messages DB URL from local secrets.json.",
+                    "Secret values are persisted in local secrets.json and always returned redacted.",
+                    "messages_db_url is optional; when set, archi enables the Messages log viewer against storage's Postgres."
                 ]
             },
             "secret_record": secret_record.map(|record| redacted_node_secret_record(&record)),
-            "api_key_source": api_key_source
+            "api_key_source": api_key_source,
+            "messages_db_url_source": messages_db_url_source
         }
     }))
 }
@@ -9116,9 +9488,11 @@ async fn handle_architect_local_config_set(
     state: &ArchitectState,
     body: Value,
 ) -> Result<Value, ArchitectError> {
-    let api_key = extract_architect_openai_api_key(&body)?.ok_or_else(|| -> ArchitectError {
-        "architect local config-set requires config.ai_providers.openai.api_key".into()
-    })?;
+    let api_key = extract_architect_openai_api_key(&body)?;
+    let messages_db_url = extract_architect_messages_db_url(&body)?;
+    if api_key.is_none() && messages_db_url.is_none() {
+        return Err("architect local config-set requires at least one of: config.ai_providers.openai.api_key, config.storage.messages_db_url".into());
+    }
     let updated_by_ilk = body
         .get("updated_by_ilk")
         .and_then(Value::as_str)
@@ -9143,10 +9517,29 @@ async fn handle_architect_local_config_set(
     let mut secrets = load_architect_secret_record(&state.node_name)?
         .map(|record| record.secrets)
         .unwrap_or_default();
-    secrets.insert(
-        ARCHITECT_LOCAL_SECRET_KEY_OPENAI.to_string(),
-        Value::String(api_key),
-    );
+    let mut stored_secrets: Vec<Value> = Vec::new();
+    if let Some(api_key) = api_key {
+        secrets.insert(
+            ARCHITECT_LOCAL_SECRET_KEY_OPENAI.to_string(),
+            Value::String(api_key),
+        );
+        stored_secrets.push(json!({
+            "field": "ai_providers.openai.api_key",
+            "storage_key": ARCHITECT_LOCAL_SECRET_KEY_OPENAI,
+            "value_redacted": true
+        }));
+    }
+    if let Some(url) = &messages_db_url {
+        secrets.insert(
+            ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL.to_string(),
+            Value::String(url.clone()),
+        );
+        stored_secrets.push(json!({
+            "field": "storage.messages_db_url",
+            "storage_key": ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL,
+            "value_redacted": true
+        }));
+    }
     let record = build_node_secret_record(
         secrets,
         &NodeSecretWriteOptions {
@@ -9158,6 +9551,23 @@ async fn handle_architect_local_config_set(
     let path = save_node_secret_record_with_root(&state.node_name, architect_nodes_root(), &record)
         .map_err(|err| -> ArchitectError { Box::new(err) })?;
     let ai_configured = refresh_architect_ai_runtime(state).await?;
+    let messages_db_configured = refresh_architect_messages_db_url(state).await;
+
+    let message = match (
+        stored_secrets.iter().any(|entry| {
+            entry
+                .get("storage_key")
+                .and_then(Value::as_str)
+                .map(|s| s == ARCHITECT_LOCAL_SECRET_KEY_OPENAI)
+                .unwrap_or(false)
+        }),
+        messages_db_url.is_some(),
+    ) {
+        (true, true) => "Architect local OpenAI key and messages DB URL stored in secrets.json and runtime reloaded.",
+        (true, false) => "Architect local OpenAI key stored in secrets.json and runtime reloaded.",
+        (false, true) => "Architect local messages DB URL stored in secrets.json and runtime reloaded.",
+        (false, false) => "Architect local secrets.json updated.",
+    };
 
     Ok(json!({
         "status": "ok",
@@ -9168,13 +9578,10 @@ async fn handle_architect_local_config_set(
             "state": if ai_configured { "configured" } else { "missing_secret" },
             "trace_id": trace_id,
             "ai_configured": ai_configured,
+            "messages_db_configured": messages_db_configured,
             "persisted_path": path,
-            "stored_secrets": [{
-                "field": "ai_providers.openai.api_key",
-                "storage_key": ARCHITECT_LOCAL_SECRET_KEY_OPENAI,
-                "value_redacted": true
-            }],
-            "message": "Architect local OpenAI key stored in secrets.json and runtime reloaded."
+            "stored_secrets": stored_secrets,
+            "message": message
         }
     }))
 }
@@ -9193,6 +9600,27 @@ fn extract_architect_openai_api_key(body: &Value) -> Result<Option<String>, Arch
         }
     }
     if let Some(value) = body.get("api_key").and_then(Value::as_str) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(trimmed.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+fn extract_architect_messages_db_url(body: &Value) -> Result<Option<String>, ArchitectError> {
+    if let Some(value) = body
+        .get("config")
+        .and_then(|config| config.get("storage"))
+        .and_then(|storage| storage.get("messages_db_url"))
+        .and_then(Value::as_str)
+    {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(trimmed.to_string()));
+        }
+    }
+    if let Some(value) = body.get("messages_db_url").and_then(Value::as_str) {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
             return Ok(Some(trimmed.to_string()));
@@ -12555,6 +12983,28 @@ fn is_agent_assets_path(path: &str) -> bool {
     path == "/api/agent-assets" || path.ends_with("/api/agent-assets")
 }
 
+fn is_messages_list_path(path: &str) -> bool {
+    path == "/api/messages" || path.ends_with("/api/messages")
+}
+
+fn is_messages_stream_path(path: &str) -> bool {
+    path == "/api/messages/stream" || path.ends_with("/api/messages/stream")
+}
+
+fn messages_detail_key_from_path(path: &str) -> Option<String> {
+    let marker = "/api/messages/";
+    let idx = path.rfind(marker)?;
+    let raw = &path[idx + marker.len()..];
+    if raw.is_empty() || raw == "stream" || raw.contains('/') {
+        return None;
+    }
+    let decoded = percent_decode_simple(raw);
+    if decoded.trim().is_empty() {
+        return None;
+    }
+    Some(decoded)
+}
+
 fn is_identity_ich_options_path(path: &str) -> bool {
     path == "/api/identity/ich-options" || path.ends_with("/api/identity/ich-options")
 }
@@ -12658,13 +13108,81 @@ fn architect_index_html(state: &ArchitectState) -> String {
       overflow: hidden;
     }}
     .page {{
-      width: min(1320px, calc(100vw - 32px));
+      width: min(1400px, calc(100vw - 24px));
       margin: 0 auto;
       padding: 22px 0 28px;
       height: 100vh;
       display: grid;
-      grid-template-rows: auto minmax(0, 1fr);
+      grid-template-columns: auto minmax(0, 1fr);
+      grid-template-rows: minmax(0, 1fr);
+      gap: 14px;
       overflow: hidden;
+    }}
+    .app-rail {{
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 6px;
+      width: 56px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      align-self: stretch;
+    }}
+    .rail-item {{
+      width: 40px;
+      height: 40px;
+      border-radius: 12px;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      padding: 0;
+      transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+    }}
+    .rail-item svg {{
+      width: 20px;
+      height: 20px;
+      display: block;
+    }}
+    .rail-item:hover {{
+      background: var(--accent-soft);
+      color: var(--accent);
+    }}
+    .rail-item.active {{
+      background: var(--accent-soft);
+      color: var(--accent);
+      border-color: var(--accent-soft);
+    }}
+    .rail-item:focus-visible {{
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }}
+    .main-stage {{
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+    }}
+    .section-stage {{
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+      position: relative;
+    }}
+    .section-shell {{
+      height: 100%;
+      min-height: 0;
+      min-width: 0;
+    }}
+    .section-shell[hidden] {{
+      display: none !important;
     }}
     .masthead {{
       display: flex;
@@ -12770,6 +13288,333 @@ fn architect_index_html(state: &ArchitectState) -> String {
       align-items: stretch;
       min-height: 0;
       overflow: hidden;
+    }}
+    .messages-view {{
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 12px;
+      min-height: 0;
+      min-width: 0;
+    }}
+    .messages-toolbar {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      gap: 14px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+    }}
+    .messages-toolbar-left {{
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      min-width: 0;
+    }}
+    .messages-title {{
+      font-size: 1.1rem;
+      font-weight: 700;
+      margin: 0;
+      letter-spacing: -0.01em;
+    }}
+    .messages-toolbar-meta {{
+      color: var(--muted);
+      font-size: 0.82rem;
+    }}
+    .messages-toolbar-right {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }}
+    .messages-filter {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.82rem;
+      color: var(--muted);
+    }}
+    .messages-filter select {{
+      border: 1px solid var(--line);
+      background: #fff;
+      border-radius: 8px;
+      padding: 4px 8px;
+      font-size: 0.84rem;
+      color: var(--text);
+    }}
+    .messages-filter-toggle {{
+      cursor: pointer;
+      user-select: none;
+    }}
+    .messages-status-pill {{
+      font-size: 0.7rem;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 999px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      background: rgba(0, 0, 0, 0.06);
+      color: var(--muted);
+    }}
+    .messages-status-pill[data-state="live"] {{
+      background: rgba(34, 197, 94, 0.14);
+      color: #15803d;
+    }}
+    .messages-status-pill[data-state="error"] {{
+      background: rgba(220, 38, 38, 0.14);
+      color: #b91c1c;
+    }}
+    .messages-body {{
+      display: grid;
+      grid-template-columns: 380px minmax(0, 1fr);
+      gap: 12px;
+      min-height: 0;
+      min-width: 0;
+    }}
+    .messages-list-pane {{
+      position: relative;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden;
+    }}
+    .messages-list {{
+      flex: 1 1 auto;
+      overflow: auto;
+      padding: 6px 0;
+    }}
+    .messages-list-empty {{
+      padding: 30px 18px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.86rem;
+    }}
+    .messages-row {{
+      padding: 8px 14px;
+      cursor: pointer;
+      border-left: 3px solid transparent;
+      display: grid;
+      grid-template-rows: auto auto;
+      gap: 2px;
+      font-size: 0.84rem;
+    }}
+    .messages-row:hover {{
+      background: rgba(0, 0, 0, 0.025);
+    }}
+    .messages-row.active {{
+      background: var(--accent-soft);
+      border-left-color: var(--accent);
+    }}
+    .messages-row-head {{
+      display: flex;
+      gap: 10px;
+      align-items: baseline;
+      min-width: 0;
+    }}
+    .messages-row-time {{
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.78rem;
+      flex: none;
+    }}
+    .messages-row-subject {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.82rem;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }}
+    .messages-row-meta {{
+      color: var(--muted);
+      font-size: 0.74rem;
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+      overflow: hidden;
+    }}
+    .messages-row-meta-id {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }}
+    .messages-row-meta-id.is-fallback {{
+      font-style: italic;
+    }}
+    .messages-row-meta-id.is-missing {{
+      font-style: italic;
+      color: rgba(220, 38, 38, 0.85);
+    }}
+    .messages-row-meta-size {{
+      flex: none;
+    }}
+    .messages-row-status {{
+      flex: none;
+      font-weight: 700;
+    }}
+    .messages-row-status.ok {{
+      color: #15803d;
+    }}
+    .messages-row-status.pending {{
+      color: var(--muted);
+    }}
+    .messages-row-status.err {{
+      color: #b91c1c;
+    }}
+    .messages-load-more {{
+      border: none;
+      background: transparent;
+      color: var(--accent);
+      padding: 10px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.84rem;
+    }}
+    .messages-load-more:hover {{
+      background: rgba(0, 0, 0, 0.03);
+    }}
+    .messages-new-pill {{
+      position: absolute;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 2;
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 999px;
+      padding: 5px 12px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      cursor: pointer;
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18);
+    }}
+    .messages-detail-pane {{
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+    }}
+    .messages-detail {{
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: auto;
+      padding: 16px 18px;
+    }}
+    .messages-detail-empty {{
+      color: var(--muted);
+      font-size: 0.9rem;
+      text-align: center;
+      padding: 40px 20px;
+    }}
+    .messages-detail-meta {{
+      display: grid;
+      grid-template-columns: max-content minmax(0, 1fr);
+      gap: 4px 14px;
+      font-size: 0.82rem;
+      margin-bottom: 14px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--line);
+    }}
+    .messages-detail-meta-key {{
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 0.7rem;
+      font-weight: 700;
+      align-self: center;
+    }}
+    .messages-detail-meta-value {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      word-break: break-all;
+      color: var(--text);
+    }}
+    .messages-detail-meta-value.err {{
+      color: #b91c1c;
+    }}
+    .messages-detail-json-head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 6px;
+    }}
+    .messages-detail-json-title {{
+      font-size: 0.74rem;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }}
+    .messages-detail-copy {{
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 4px 10px;
+      font-size: 0.76rem;
+      cursor: pointer;
+    }}
+    .messages-detail-copy:hover {{
+      background: rgba(0, 0, 0, 0.03);
+    }}
+    .messages-detail-json {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.82rem;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: rgba(0, 0, 0, 0.025);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px 14px;
+      margin: 0;
+    }}
+    .messages-unconfigured {{
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 0;
+    }}
+    .messages-unconfigured-card {{
+      max-width: 540px;
+      padding: 28px 30px;
+      border: 1px dashed var(--line);
+      background: var(--panel);
+      border-radius: 18px;
+      text-align: left;
+    }}
+    .messages-unconfigured-card h2 {{
+      margin: 0 0 8px;
+      font-size: 1.05rem;
+    }}
+    .messages-unconfigured-card p {{
+      color: var(--muted);
+      margin: 0 0 12px;
+      font-size: 0.9rem;
+    }}
+    .messages-unconfigured-card code {{
+      display: block;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.78rem;
+      background: rgba(0, 0, 0, 0.04);
+      padding: 10px 12px;
+      border-radius: 8px;
+      word-break: break-word;
     }}
     .sidebar,
     .shell {{
@@ -14092,6 +14937,22 @@ fn architect_index_html(state: &ArchitectState) -> String {
 </head>
 <body>
   <div class="page">
+    <aside class="app-rail" aria-label="Section navigation">
+      <button class="rail-item active" type="button" data-section-target="archi" aria-label="Archi" title="Archi">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6A8.4 8.4 0 0 1 12.5 3h.5a8.5 8.5 0 0 1 8 8v.5z"/>
+        </svg>
+      </button>
+      <button class="rail-item" type="button" data-section-target="messages" aria-label="Messages" title="Messages">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3 6h13"/>
+          <path d="M3 12h9"/>
+          <path d="M3 18h13"/>
+          <path d="M19 4l3 5h-2v6h-2V9h-2l3-5z"/>
+        </svg>
+      </button>
+    </aside>
+    <div class="main-stage">
     <div class="masthead">
       <div class="brand">
         <svg class="brand-mark" viewBox="0 0 300 252" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
@@ -14127,6 +14988,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
         </div>
       </div>
     </div>
+    <div class="section-stage">
+      <section class="section-shell" data-section="archi">
     <div class="workspace">
       <aside class="sidebar">
         <div class="sidebar-head">
@@ -14191,6 +15054,53 @@ fn architect_index_html(state: &ArchitectState) -> String {
           </div>
         </div>
       </div>
+    </div>
+      </section>
+      <section class="section-shell messages-view" data-section="messages" hidden>
+        <div class="messages-toolbar">
+          <div class="messages-toolbar-left">
+            <h1 class="messages-title">Messages</h1>
+            <span class="messages-toolbar-meta">System message log &middot; storage_inbox</span>
+          </div>
+          <div class="messages-toolbar-right">
+            <label class="messages-filter">
+              <span class="messages-filter-label">Window</span>
+              <select id="messages-since">
+                <option value="all" selected>All</option>
+                <option value="24h">24h</option>
+                <option value="1h">1h</option>
+                <option value="15m">15m</option>
+              </select>
+            </label>
+            <label class="messages-filter messages-filter-toggle">
+              <input type="checkbox" id="messages-with-error" />
+              <span>Only errors</span>
+            </label>
+            <span id="messages-status-pill" class="messages-status-pill" data-state="paused">paused</span>
+          </div>
+        </div>
+        <div class="messages-body">
+          <div class="messages-list-pane">
+            <button id="messages-new-pill" class="messages-new-pill" type="button" hidden>0 new</button>
+            <div id="messages-list" class="messages-list"></div>
+            <div id="messages-list-empty" class="messages-list-empty">Loading...</div>
+            <button id="messages-load-more" class="messages-load-more" type="button" hidden>Load more</button>
+          </div>
+          <div class="messages-detail-pane">
+            <div id="messages-detail" class="messages-detail">
+              <div class="messages-detail-empty">Select a message to view its full envelope.</div>
+            </div>
+          </div>
+        </div>
+        <div id="messages-unconfigured" class="messages-unconfigured" hidden>
+          <div class="messages-unconfigured-card">
+            <h2>messages_db_url not configured</h2>
+            <p>Set the read-only Postgres connection string for storage via CONFIG SET to enable this panel. archi only reads <code>storage_inbox</code>; do not point this at the storage write user.</p>
+            <code>SCMD POST /architect/control/config-set<br>{{ "config": {{ "storage": {{ "messages_db_url": "postgres://..." }} }} }}</code>
+          </div>
+        </div>
+      </section>
+    </div>
     </div>
   </div>
   <div id="impersonation-modal" class="modal-backdrop" aria-hidden="true">
@@ -16558,6 +17468,405 @@ fn architect_index_html(state: &ArchitectState) -> String {
     bootstrap().catch((err) => {{
       addMessage("system", "Bootstrap failed: " + err);
     }});
+  </script>
+  <script>
+    (function() {{
+      'use strict';
+
+      // ---- Hash router ----
+      const RAIL_BUTTONS = Array.from(document.querySelectorAll('.rail-item[data-section-target]'));
+      const SECTIONS = Array.from(document.querySelectorAll('.section-shell[data-section]'));
+      const VALID_SECTIONS = new Set(SECTIONS.map(function(s) {{ return s.dataset.section; }}));
+      let currentSection = null;
+
+      function readSectionFromHash() {{
+        const raw = (location.hash || '').replace(/^#\/?/, '').split('/')[0];
+        return VALID_SECTIONS.has(raw) ? raw : 'archi';
+      }}
+
+      function setSection(name) {{
+        if (currentSection === name) return;
+        SECTIONS.forEach(function(s) {{
+          if (s.dataset.section === name) {{
+            s.removeAttribute('hidden');
+          }} else {{
+            s.setAttribute('hidden', '');
+          }}
+        }});
+        RAIL_BUTTONS.forEach(function(b) {{
+          b.classList.toggle('active', b.dataset.sectionTarget === name);
+        }});
+        if (currentSection === 'messages' && name !== 'messages') {{
+          messagesView.deactivate();
+        }}
+        currentSection = name;
+        if (name === 'messages') {{
+          messagesView.activate();
+        }}
+      }}
+
+      RAIL_BUTTONS.forEach(function(btn) {{
+        btn.addEventListener('click', function() {{
+          const target = btn.dataset.sectionTarget;
+          if (!target) return;
+          const desired = '#/' + target;
+          if (location.hash !== desired) {{
+            location.hash = desired;
+          }} else {{
+            setSection(readSectionFromHash());
+          }}
+        }});
+      }});
+
+      window.addEventListener('hashchange', function() {{
+        setSection(readSectionFromHash());
+      }});
+
+      // ---- Messages view module ----
+      function createMessagesView() {{
+        const listEl = document.getElementById('messages-list');
+        const emptyEl = document.getElementById('messages-list-empty');
+        const detailEl = document.getElementById('messages-detail');
+        const loadMoreBtn = document.getElementById('messages-load-more');
+        const newPillBtn = document.getElementById('messages-new-pill');
+        const sinceSelect = document.getElementById('messages-since');
+        const errorToggle = document.getElementById('messages-with-error');
+        const statusPill = document.getElementById('messages-status-pill');
+        const unconfiguredEl = document.getElementById('messages-unconfigured');
+        const bodyEl = document.querySelector('.messages-view .messages-body');
+
+        let activated = false;
+        let initialLoaded = false;
+        let rows = [];
+        let nextCursor = null;
+        let selectedKey = null;
+        let eventSource = null;
+        let pendingNew = 0;
+        let atTop = true;
+
+        function setStatus(state, text) {{
+          statusPill.dataset.state = state;
+          statusPill.textContent = text;
+        }}
+
+        function setUnconfigured(on) {{
+          if (on) {{
+            bodyEl.style.display = 'none';
+            unconfiguredEl.removeAttribute('hidden');
+          }} else {{
+            bodyEl.style.display = '';
+            unconfiguredEl.setAttribute('hidden', '');
+          }}
+        }}
+
+        function escapeHtml(s) {{
+          return String(s).replace(/[&<>"']/g, function(ch) {{
+            const map = {{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }};
+            return map[ch];
+          }});
+        }}
+
+        function cssEscapeAttr(s) {{
+          return String(s).replace(/["\\]/g, '\\$&');
+        }}
+
+        function formatTimeOnly(iso) {{
+          const t = iso.indexOf('T');
+          if (t < 0) return iso;
+          return iso.slice(t + 1).replace('Z', '');
+        }}
+
+        function formatSize(bytes) {{
+          if (bytes < 1024) return bytes + ' B';
+          if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+          return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+        }}
+
+        function statusClass(item) {{
+          if (item.has_error) return 'err';
+          if (!item.processed_at) return 'pending';
+          return 'ok';
+        }}
+
+        function statusGlyph(item) {{
+          if (item.has_error) return '!';
+          if (!item.processed_at) return '…';
+          return '✓';
+        }}
+
+        function identifierFor(item) {{
+          if (item.ich) return {{ text: 'ich:' + item.ich, cls: '' }};
+          if (item.thread_id) return {{ text: item.thread_id, cls: 'is-fallback' }};
+          return {{ text: 'no ich', cls: 'is-missing' }};
+        }}
+
+        function rowHtml(item) {{
+          const id = identifierFor(item);
+          const subject = escapeHtml(item.subject);
+          const idText = escapeHtml(id.text);
+          return ''
+            + '<div class="messages-row-head">'
+            + '<span class="messages-row-time">' + formatTimeOnly(item.received_at) + '</span>'
+            + '<span class="messages-row-subject" title="' + subject + '">' + subject + '</span>'
+            + '</div>'
+            + '<div class="messages-row-meta">'
+            + '<span class="messages-row-meta-id ' + id.cls + '" title="' + idText + '">' + idText + '</span>'
+            + '<span class="messages-row-meta-size">' + formatSize(item.size_bytes) + '</span>'
+            + '<span class="messages-row-status ' + statusClass(item) + '">' + statusGlyph(item) + '</span>'
+            + '</div>';
+        }}
+
+        function renderList() {{
+          if (rows.length === 0) {{
+            listEl.innerHTML = '';
+            emptyEl.style.display = '';
+            emptyEl.textContent = initialLoaded ? 'No messages match your filters.' : 'Loading...';
+          }} else {{
+            emptyEl.style.display = 'none';
+            const html = rows.map(function(item) {{
+              const klass = item.dedupe_key === selectedKey ? ' active' : '';
+              return '<div class="messages-row' + klass + '" data-dedupe="' + escapeHtml(item.dedupe_key) + '">' + rowHtml(item) + '</div>';
+            }}).join('');
+            listEl.innerHTML = html;
+          }}
+          loadMoreBtn.hidden = !nextCursor || rows.length === 0;
+        }}
+
+        function renderDetail(detail) {{
+          if (!detail) {{
+            detailEl.innerHTML = '<div class="messages-detail-empty">Select a message to view its full envelope.</div>';
+            return;
+          }}
+          const meta = [
+            ['Subject', detail.subject],
+            ['Received', detail.received_at],
+            ['Dedupe key', detail.dedupe_key],
+            ['ICH', detail.ich || '(none)'],
+            ['Thread', detail.thread_id || '(none)'],
+            ['Attempts', String(detail.attempts)],
+            ['Processed', detail.processed_at || '(pending)'],
+            ['Size', formatSize(detail.size_bytes)]
+          ];
+          if (detail.last_error) meta.push(['Error', detail.last_error]);
+          const metaHtml = meta.map(function(pair) {{
+            const k = pair[0];
+            const v = pair[1];
+            const errCls = k === 'Error' ? ' err' : '';
+            return '<div class="messages-detail-meta-key">' + escapeHtml(k) + '</div>'
+              + '<div class="messages-detail-meta-value' + errCls + '">' + escapeHtml(v) + '</div>';
+          }}).join('');
+          let payloadDisplay;
+          if (detail.payload_json !== null && detail.payload_json !== undefined) {{
+            payloadDisplay = JSON.stringify(detail.payload_json, null, 2);
+          }} else if (detail.payload_text) {{
+            payloadDisplay = detail.payload_text;
+          }} else {{
+            payloadDisplay = '(empty)';
+          }}
+          detailEl.innerHTML = ''
+            + '<div class="messages-detail-meta">' + metaHtml + '</div>'
+            + '<div class="messages-detail-json-head">'
+            + '<span class="messages-detail-json-title">Payload</span>'
+            + '<button class="messages-detail-copy" id="messages-detail-copy" type="button">Copy JSON</button>'
+            + '</div>'
+            + '<pre class="messages-detail-json" id="messages-detail-json"></pre>';
+          document.getElementById('messages-detail-json').textContent = payloadDisplay;
+          document.getElementById('messages-detail-copy').addEventListener('click', function() {{
+            if (navigator.clipboard && navigator.clipboard.writeText) {{
+              navigator.clipboard.writeText(payloadDisplay).catch(function() {{}});
+            }}
+          }});
+        }}
+
+        function buildListUrl(extra) {{
+          const params = new URLSearchParams();
+          params.set('limit', '200');
+          params.set('since', sinceSelect.value);
+          if (errorToggle.checked) params.set('with_error', 'true');
+          if (extra && extra.cursor) {{
+            params.set('cursor_ts', extra.cursor.ts);
+            params.set('cursor_dk', extra.cursor.dk);
+          }}
+          return '/api/messages?' + params.toString();
+        }}
+
+        async function loadInitial() {{
+          setStatus('paused', 'loading');
+          try {{
+            const resp = await fetch(buildListUrl(), {{ headers: {{ Accept: 'application/json' }} }});
+            if (resp.status === 503) {{
+              setUnconfigured(true);
+              setStatus('paused', 'unconfigured');
+              return false;
+            }}
+            if (!resp.ok) {{
+              const text = await resp.text().catch(function() {{ return ''; }});
+              throw new Error('HTTP ' + resp.status + ' ' + text);
+            }}
+            const data = await resp.json();
+            rows = data.items || [];
+            nextCursor = data.next_cursor || null;
+            initialLoaded = true;
+            pendingNew = 0;
+            newPillBtn.hidden = true;
+            setUnconfigured(false);
+            renderList();
+            setStatus('paused', 'paused');
+            return true;
+          }} catch (err) {{
+            console.error('messages list load failed', err);
+            emptyEl.style.display = '';
+            emptyEl.textContent = 'Failed to load: ' + err.message;
+            setStatus('error', 'error');
+            return false;
+          }}
+        }}
+
+        async function loadMore() {{
+          if (!nextCursor) return;
+          try {{
+            const resp = await fetch(buildListUrl({{ cursor: nextCursor }}), {{ headers: {{ Accept: 'application/json' }} }});
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            const data = await resp.json();
+            const seen = new Set(rows.map(function(r) {{ return r.dedupe_key; }}));
+            const items = data.items || [];
+            for (let i = 0; i < items.length; i += 1) {{
+              if (!seen.has(items[i].dedupe_key)) rows.push(items[i]);
+            }}
+            nextCursor = data.next_cursor || null;
+            renderList();
+          }} catch (err) {{
+            console.error('messages load more failed', err);
+          }}
+        }}
+
+        async function selectRow(dedupeKey) {{
+          selectedKey = dedupeKey;
+          const oldActive = listEl.querySelectorAll('.messages-row.active');
+          for (let i = 0; i < oldActive.length; i += 1) oldActive[i].classList.remove('active');
+          const target = listEl.querySelector('[data-dedupe="' + cssEscapeAttr(dedupeKey) + '"]');
+          if (target) target.classList.add('active');
+          detailEl.innerHTML = '<div class="messages-detail-empty">Loading...</div>';
+          try {{
+            const resp = await fetch('/api/messages/' + encodeURIComponent(dedupeKey), {{ headers: {{ Accept: 'application/json' }} }});
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            const data = await resp.json();
+            renderDetail(data);
+          }} catch (err) {{
+            detailEl.innerHTML = '<div class="messages-detail-empty">Failed to load: ' + escapeHtml(err.message) + '</div>';
+          }}
+        }}
+
+        function handleStreamEvent(item) {{
+          if (rows.length > 0 && rows[0].dedupe_key === item.dedupe_key) return;
+          if (atTop) {{
+            rows.unshift(item);
+            if (rows.length > 1000) rows.length = 1000;
+            renderList();
+          }} else {{
+            pendingNew += 1;
+            newPillBtn.textContent = pendingNew + ' new';
+            newPillBtn.hidden = false;
+          }}
+        }}
+
+        function startStream() {{
+          if (eventSource) return;
+          const top = rows[0];
+          const params = new URLSearchParams();
+          if (top) {{
+            params.set('after_ts', top.received_at);
+            params.set('after_dk', top.dedupe_key);
+          }}
+          const url = '/api/messages/stream' + (params.toString() ? ('?' + params.toString()) : '');
+          try {{
+            eventSource = new EventSource(url);
+          }} catch (err) {{
+            console.error('SSE open failed', err);
+            setStatus('error', 'error');
+            return;
+          }}
+          eventSource.addEventListener('message', function(ev) {{
+            try {{
+              const item = JSON.parse(ev.data);
+              handleStreamEvent(item);
+            }} catch (err) {{
+              console.error('SSE message parse failed', err);
+            }}
+          }});
+          eventSource.addEventListener('error', function() {{
+            setStatus('error', 'error');
+            stopStream();
+          }});
+          eventSource.onopen = function() {{ setStatus('live', 'live'); }};
+        }}
+
+        function stopStream() {{
+          if (eventSource) {{
+            eventSource.close();
+            eventSource = null;
+          }}
+          if (statusPill.dataset.state !== 'error') {{
+            setStatus('paused', 'paused');
+          }}
+        }}
+
+        function checkAtTop() {{
+          atTop = listEl.scrollTop <= 4;
+          if (atTop && pendingNew > 0) {{
+            flushPending();
+          }}
+        }}
+
+        async function flushPending() {{
+          pendingNew = 0;
+          newPillBtn.hidden = true;
+          await loadInitial();
+        }}
+
+        listEl.addEventListener('scroll', checkAtTop);
+        listEl.addEventListener('click', function(ev) {{
+          const row = ev.target.closest('.messages-row');
+          if (!row) return;
+          const key = row.dataset.dedupe;
+          if (key) selectRow(key);
+        }});
+        loadMoreBtn.addEventListener('click', loadMore);
+        newPillBtn.addEventListener('click', function() {{
+          listEl.scrollTop = 0;
+          flushPending();
+        }});
+        sinceSelect.addEventListener('change', async function() {{
+          stopStream();
+          selectedKey = null;
+          renderDetail(null);
+          const ok = await loadInitial();
+          if (ok) startStream();
+        }});
+        errorToggle.addEventListener('change', async function() {{
+          stopStream();
+          selectedKey = null;
+          renderDetail(null);
+          const ok = await loadInitial();
+          if (ok) startStream();
+        }});
+
+        return {{
+          activate: async function() {{
+            if (activated) return;
+            activated = true;
+            const ok = await loadInitial();
+            if (ok) startStream();
+          }},
+          deactivate: function() {{
+            stopStream();
+          }}
+        }};
+      }}
+
+      const messagesView = createMessagesView();
+      setSection(readSectionFromHash());
+    }})();
   </script>
         </body>
 </html>"##,
