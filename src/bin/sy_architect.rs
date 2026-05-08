@@ -13180,6 +13180,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
       height: 100%;
       min-height: 0;
       min-width: 0;
+      display: grid;
+      grid-template-rows: minmax(0, 1fr);
     }}
     .section-shell[hidden] {{
       display: none !important;
