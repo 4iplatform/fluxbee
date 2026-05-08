@@ -13372,6 +13372,8 @@ fn architect_index_html(state: &ArchitectState) -> String {
       gap: 12px;
       min-height: 0;
       min-width: 0;
+      grid-row: 2;
+      grid-column: 1 / -1;
     }}
     .messages-list-pane {{
       position: relative;
@@ -13583,7 +13585,11 @@ fn architect_index_html(state: &ArchitectState) -> String {
       padding: 12px 14px;
       margin: 0;
     }}
+    .messages-view [hidden] {{
+      display: none !important;
+    }}
     .messages-unconfigured {{
+      grid-row: 2;
       grid-column: 1 / -1;
       display: flex;
       align-items: center;
@@ -17473,6 +17479,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
     (function() {{
       'use strict';
 
+      const RAW_PATH = window.location.pathname.replace(/\/+$/, '');
+      const API_BASE = RAW_PATH || '';
+      const MESSAGES_LIST_URL = API_BASE + '/api/messages';
+      const MESSAGES_STREAM_URL = API_BASE + '/api/messages/stream';
+      const MESSAGES_DETAIL_URL = API_BASE + '/api/messages/';
+
       // ---- Hash router ----
       const RAIL_BUTTONS = Array.from(document.querySelectorAll('.rail-item[data-section-target]'));
       const SECTIONS = Array.from(document.querySelectorAll('.section-shell[data-section]'));
@@ -17687,7 +17699,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
             params.set('cursor_ts', extra.cursor.ts);
             params.set('cursor_dk', extra.cursor.dk);
           }}
-          return '/api/messages?' + params.toString();
+          return MESSAGES_LIST_URL + '?' + params.toString();
         }}
 
         async function loadInitial() {{
@@ -17748,7 +17760,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
           if (target) target.classList.add('active');
           detailEl.innerHTML = '<div class="messages-detail-empty">Loading...</div>';
           try {{
-            const resp = await fetch('/api/messages/' + encodeURIComponent(dedupeKey), {{ headers: {{ Accept: 'application/json' }} }});
+            const resp = await fetch(MESSAGES_DETAIL_URL + encodeURIComponent(dedupeKey), {{ headers: {{ Accept: 'application/json' }} }});
             if (!resp.ok) throw new Error('HTTP ' + resp.status);
             const data = await resp.json();
             renderDetail(data);
@@ -17778,7 +17790,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
             params.set('after_ts', top.received_at);
             params.set('after_dk', top.dedupe_key);
           }}
-          const url = '/api/messages/stream' + (params.toString() ? ('?' + params.toString()) : '');
+          const url = MESSAGES_STREAM_URL + (params.toString() ? ('?' + params.toString()) : '');
           try {{
             eventSource = new EventSource(url);
           }} catch (err) {{
