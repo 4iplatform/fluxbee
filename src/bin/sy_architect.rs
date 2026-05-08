@@ -13622,7 +13622,23 @@ fn architect_index_html(state: &ArchitectState) -> String {
       background: rgba(0, 0, 0, 0.04);
       padding: 10px 12px;
       border-radius: 8px;
-      word-break: break-word;
+      word-break: break-all;
+      white-space: pre-wrap;
+      margin-bottom: 8px;
+    }}
+    .messages-unconfigured-card .messages-unconfigured-label {{
+      margin: 14px 0 4px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      color: var(--text);
+      text-transform: none;
+    }}
+    .messages-unconfigured-card p code {{
+      display: inline;
+      padding: 1px 5px;
+      font-size: 0.78rem;
+      margin: 0;
     }}
     .sidebar,
     .shell {{
@@ -15103,8 +15119,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
         <div id="messages-unconfigured" class="messages-unconfigured" hidden>
           <div class="messages-unconfigured-card">
             <h2>messages_db_url not configured</h2>
-            <p>Set the read-only Postgres connection string for storage via CONFIG SET to enable this panel. archi only reads <code>storage_inbox</code>; do not point this at the storage write user.</p>
-            <code>SCMD POST /architect/control/config-set<br>{{ "config": {{ "storage": {{ "messages_db_url": "postgres://..." }} }} }}</code>
+            <p>Set the read-only Postgres connection string for storage to enable this panel. archi only reads <code>storage_inbox</code>; do not point this at the storage write user.</p>
+            <p class="messages-unconfigured-label">From archi chat (operator):</p>
+            <code>SCMD: curl -X POST /architect/control/config-set -d '{{"config":{{"storage":{{"messages_db_url":"postgresql://archi_messages_reader:PASS@HOST:5432/fluxbee"}}}}}}'</code>
+            <p class="messages-unconfigured-label">Or via admin gateway:</p>
+            <code>curl -sS -X POST http://MOTHERBEE:8080/hives/HIVE/nodes/SY.architect@HIVE/control/config-set \
+  -H 'Content-Type: application/json' \
+  -d '{{"schema_version":1,"config_version":1,"apply_mode":"replace","config":{{"storage":{{"messages_db_url":"postgresql://archi_messages_reader:PASS@HOST:5432/fluxbee"}}}}}}'</code>
           </div>
         </div>
       </section>
