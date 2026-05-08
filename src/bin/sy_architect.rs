@@ -2118,6 +2118,8 @@ Use these facts only to select and validate planning intent. Do not treat them a
 - If a required `tenant_id` is missing and cannot be read from reliable context, block with a clear missing-field reason.
 - If a later step needs a value produced by an earlier step, use a formal executor output reference: `$steps.<step_id>.payload.<field>`.
 - Example: create root tenant in step `s1`, then create client tenant in step `s2` with `"sponsor_tenant_id":"$steps.s1.payload.tenant_id"`.
+- If a tenant id is already explicit in the task or verified context, use that literal `tnt:<uuid>` directly as `tenant_id` or `sponsor_tenant_id`; do not block just to revalidate the same sponsor.
+- For update-then-create tenant chains, either use the known literal sponsor tenant id or `$steps.s1.payload.tenant_id` from `update_tenant`.
 - Never emit human placeholders such as `<tenant_id_from_s1>`; those are not executable.
 
 ### Planning discipline
@@ -3623,6 +3625,37 @@ struct PlanCompileBlockedDetails {
     plan_compile_tokens: u32,
 }
 
+fn should_retry_blocked_plan_compiler_output(
+    output: &PlanCompilerOutput,
+    task: &str,
+    user_context: &str,
+) -> bool {
+    if output.disposition != PlanCompilerDisposition::Blocked {
+        return false;
+    }
+    let code = output
+        .blocked_code
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let reason = output
+        .blocked_reason
+        .as_deref()
+        .unwrap_or(&output.human_summary)
+        .to_ascii_lowercase();
+    let combined_context = format!("{task}\n{user_context}").to_ascii_lowercase();
+    let has_prefixed_tenant_id = combined_context.contains("tnt:");
+    let sponsor_or_validation_block = reason.contains("sponsor")
+        || reason.contains("live read")
+        || reason.contains("validate")
+        || reason.contains("validation");
+    let missing_without_specific_field =
+        output.missing_fields.is_empty() && code == "missing_required_value";
+
+    (has_prefixed_tenant_id && sponsor_or_validation_block) || missing_without_specific_field
+}
+
 fn build_plan_compile_trace(
     task: &str,
     hive: &str,
@@ -3788,6 +3821,93 @@ async fn run_plan_compiler_transaction(
     token_budget.add("plan_compiler.first_attempt", first_output.tokens_used)?;
 
     if first_output.disposition == PlanCompilerDisposition::Blocked {
+        if should_retry_blocked_plan_compiler_output(&first_output, task, user_context) {
+            token_budget.ensure_room("plan_compiler.blocked_retry")?;
+            let retry_reason = first_output
+                .blocked_reason
+                .clone()
+                .unwrap_or_else(|| first_output.human_summary.clone());
+            tracing::warn!(
+                blocked_reason = %retry_reason,
+                "plan_compiler returned a potentially recoverable blocked result — retrying with feedback"
+            );
+            let feedback_context = format!(
+                "{}\n\n[FEEDBACK] Your previous result was blocked with this reason: {}\nIf the task or context contains an explicit prefixed id such as tnt:<uuid>, use that literal directly in executor args instead of blocking for another validation pass. For tenant sponsor chains, use sponsor_tenant_id directly when the sponsor tenant id is explicit, or use a formal step output reference such as $steps.s1.payload.tenant_id when it is produced by an earlier step. Every executor step must include an args object, even when args is empty. Call get_admin_action_help for each action, then call submit_executor_plan.",
+                user_context, retry_reason
+            );
+            let retried = run_plan_compiler_with_context(
+                context,
+                task,
+                hive,
+                &feedback_context,
+                delta_report,
+                approved_artifacts,
+            )
+            .await?;
+            token_budget.add("plan_compiler.blocked_retry", retried.tokens_used)?;
+            let total_tokens = first_output.tokens_used.saturating_add(retried.tokens_used);
+
+            if retried.disposition == PlanCompilerDisposition::PlanReady {
+                if let Some(validation_err) = plan_compiler_prevalidate(
+                    context,
+                    retried
+                        .plan
+                        .as_ref()
+                        .expect("plan_ready retry output must include a plan"),
+                    &retried.help_lookup_actions,
+                    delta_report,
+                )
+                .await
+                {
+                    return Err(format!(
+                        "plan_compiler blocked retry produced invalid plan: {validation_err}"
+                    )
+                    .into());
+                }
+                let output = PlanCompilerOutput {
+                    tokens_used: total_tokens,
+                    ..retried
+                };
+                let trace = build_plan_compile_trace(
+                    task,
+                    hive,
+                    output.plan.as_ref(),
+                    "ok_after_blocked_retry",
+                    output.blocked_reason.clone(),
+                    output.blocked_code.clone(),
+                    output.missing_fields.clone(),
+                    output.operator_hint.clone(),
+                    output.help_lookup_actions.clone(),
+                    output.help_lookup_calls,
+                    output.query_hive_calls,
+                    Some(format!("blocked_retry: {retry_reason}")),
+                    output.tokens_used,
+                );
+                return Ok(PlanCompilerExecution { output, trace });
+            }
+
+            let output = PlanCompilerOutput {
+                tokens_used: total_tokens,
+                ..retried
+            };
+            let trace = build_plan_compile_trace(
+                task,
+                hive,
+                None,
+                "blocked_after_retry",
+                output.blocked_reason.clone(),
+                output.blocked_code.clone(),
+                output.missing_fields.clone(),
+                output.operator_hint.clone(),
+                output.help_lookup_actions.clone(),
+                output.help_lookup_calls,
+                output.query_hive_calls,
+                Some(format!("blocked_retry: {retry_reason}")),
+                output.tokens_used,
+            );
+            return Ok(PlanCompilerExecution { output, trace });
+        }
+
         let trace = build_plan_compile_trace(
             task,
             hive,
