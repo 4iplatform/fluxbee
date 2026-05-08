@@ -193,7 +193,7 @@ Existe tabla y espacio en SHM, pero en el codigo actual aparece como capacidad p
 | `ILK_UPDATE` | `ILK_UPDATE_RESPONSE` | `SY.orchestrator@*`, bootstrap exacto | Si |
 | `ILK_SET_DEFINITION` | `ILK_SET_DEFINITION_RESPONSE` | `SY.admin@*`, `SY.architect@*`, bootstrap exacto | Si |
 | `ICH_SET_ENABLED` | `ICH_SET_ENABLED_RESPONSE` | `IO.*`, `SY.admin@*`, `SY.architect@*`, `SY.frontdesk.gov@*` | Si |
-| `TNT_CREATE` | `TNT_CREATE_RESPONSE` | `SY.frontdesk.gov@*`, frontdesk configurado | Si |
+| `TNT_CREATE` | `TNT_CREATE_RESPONSE` | `SY.admin@*`, `SY.architect@*`, `SY.frontdesk.gov@*`, frontdesk configurado | Si |
 | `TNT_UPDATE` | `TNT_UPDATE_RESPONSE` | `SY.admin@*`, `SY.architect@*`, `SY.frontdesk.gov@*` | Si |
 | `TNT_SET_SPONSOR` | `TNT_SET_SPONSOR_RESPONSE` | `SY.admin@*`, `SY.architect@*`, `SY.frontdesk.gov@*` | Si |
 | `TNT_APPROVE` | `TNT_APPROVE_RESPONSE` | `SY.admin@*` | Si |

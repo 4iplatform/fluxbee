@@ -2105,9 +2105,10 @@ Use these facts only to select and validate planning intent. Do not treat them a
 
 ### Tenant and identity
 
-- Some first-spawn operations for AI/IO tenant-scoped nodes require `tenant_id` at root action args.
+- First-spawn `run_node` for `AI.*` and `IO.*` managed nodes requires root-level `tenant_id`.
 - Do not invent `tenant_id`.
 - Discover tenant candidates through identity reads first: `list_tenants` for discovery and `get_tenant` for exact sponsor/default detail.
+- In legacy direct-task mode, if the operator asks to create an `AI.*` or `IO.*` node and does not provide a tenant, query `list_tenants`; if exactly one active root/default tenant exists, use that `tenant_id`, otherwise block with `missing_fields:["tenant_id"]`.
 - If the operator says "same tenant as node X", read node config/live config to recover the exact `tenant_id`, then validate it with `get_tenant`.
 - If a required `tenant_id` is missing and cannot be read from reliable context, block with a clear missing-field reason.
 
@@ -4376,6 +4377,8 @@ const PROGRAMMER_QUERY_ALLOWED_ACTIONS: &[&str] = &[
     "hive_status",
     "list_versions",
     "get_versions",
+    "list_tenants",
+    "get_tenant",
 ];
 
 #[async_trait]

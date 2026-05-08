@@ -1372,7 +1372,10 @@ impl IdentityRuntime {
             MSG_ICH_SET_ENABLED,
             vec!["IO.", "SY.admin@", "SY.architect@", "SY.frontdesk.gov@"],
         );
-        allowed_prefixes.insert(MSG_TNT_CREATE, vec!["SY.frontdesk.gov@"]);
+        allowed_prefixes.insert(
+            MSG_TNT_CREATE,
+            vec!["SY.admin@", "SY.architect@", "SY.frontdesk.gov@"],
+        );
         allowed_prefixes.insert(
             MSG_TNT_UPDATE,
             vec!["SY.admin@", "SY.architect@", "SY.frontdesk.gov@"],
@@ -5102,6 +5105,8 @@ mod tests {
         assert!(runtime.is_authorized(MSG_ILK_REGISTER, Some("SY.frontdesk.gov@motherbee")));
         assert!(runtime.is_authorized(MSG_ILK_ADD_CHANNEL, Some("SY.frontdesk.gov@motherbee")));
         assert!(runtime.is_authorized(MSG_TNT_CREATE, Some("SY.frontdesk.gov@motherbee")));
+        assert!(runtime.is_authorized(MSG_TNT_CREATE, Some("SY.admin@motherbee")));
+        assert!(runtime.is_authorized(MSG_TNT_CREATE, Some("SY.architect@motherbee")));
     }
 
     #[test]

@@ -971,6 +971,7 @@ Current HTTP surface exposed by `SY.admin`.
 | `GET` | `/hives/{hive}/identity/ilks/{ilk_id}` | Read one ILK with resolved tenant/alias detail |
 | `POST` | `/hives/{hive}/identity/ilks/{ilk_id}/definition` | Set cognitive definition hashes for one agent ILK |
 | `GET` | `/hives/{hive}/identity/tenants` | List tenants on hive (summary view for sponsor/default discovery) |
+| `POST` | `/hives/{hive}/identity/tenants` | Create a tenant; optional `sponsor_tenant_id` creates a client tenant under an admin/company tenant |
 | `GET` | `/hives/{hive}/identity/tenants/{tenant_id}` | Read one tenant with resolved sponsor detail |
 | `PUT` | `/hives/{hive}/identity/tenants/{tenant_id}` | Update mutable tenant fields |
 | `POST` | `/hives/{hive}/identity/tenants/{tenant_id}/sponsor` | Set or clear tenant sponsor |

@@ -2,7 +2,7 @@
 
 **Fecha extracción:** 2026-04-24  
 **Fuente:** `src/bin/sy_admin.rs`  
-**Total acciones:** 66  
+**Total acciones:** 67
 **Propósito:** Documentar exactamente qué información está disponible en el help de admin para los modelos que usan `get_admin_action_help`.
 
 ---
@@ -18,7 +18,7 @@ Archi accede al mismo endpoint a través del sistema de lectura genérico (`flux
 
 ### Acciones que requieren CONFIRM
 
-`publish_runtime_package`, `remove_hive`, `kill_node`, `remove_node_instance`, `remove_runtime_version`, `set_node_config`, `node_control_config_set`, `set_storage`, `update`, `sync_hint`, `opa_compile`, `opa_compile_apply`, `opa_apply`, `opa_rollback`, `wf_rules_compile`, `wf_rules_compile_apply`, `send_node_message`
+`publish_runtime_package`, `remove_hive`, `kill_node`, `remove_node_instance`, `remove_runtime_version`, `set_node_config`, `node_control_config_set`, `set_storage`, `create_tenant`, `update_tenant`, `set_tenant_sponsor`, `update`, `sync_hint`, `opa_compile`, `opa_compile_apply`, `opa_apply`, `opa_rollback`, `wf_rules_compile`, `wf_rules_compile_apply`, `send_node_message`
 
 ---
 
@@ -115,7 +115,7 @@ Archi accede al mismo endpoint a través del sistema de lectura genérico (`flux
 - **Campos opcionales:**
   - `runtime` (string): nombre del runtime (opcional si derivable del node_name)
   - `runtime_version` (string): versión del runtime (default: `current`)
-  - `tenant_id` (string): **tenant id para el primer spawn** (requerido por algunos runtimes, incluidos los nodos AI multi-tenant)
+  - `tenant_id` (string): **tenant id para el primer spawn** (requerido a nivel raíz para nodos `AI.*` / `IO.*`)
   - `unit` (string): override de sufijo de unit systemd
   - `config` (object): config de runtime/nodo pasada durante el spawn
 - **Nota:** Usar SOLO para crear/spawnnear una nueva instancia gestionada.
@@ -182,7 +182,7 @@ Archi accede al mismo endpoint a través del sistema de lectura genérico (`flux
 
 ---
 
-## Categoría 5 — Identidad e inventario (3 acciones)
+## Categoría 5 — Identidad e inventario (7 acciones)
 
 ### `list_ilks`
 - **Path:** `GET /hives/{hive}/identity/ilks`
@@ -199,6 +199,37 @@ Archi accede al mismo endpoint a través del sistema de lectura genérico (`flux
 - **Path param:** `ilk_id` en formato `ilk:<uuid>`
 - **Body:** `definition` con `role_hash`, `skill_hashes`, `handbook_hashes`
 - **Uso:** aplica la definición cognitiva de un agent ILK; no crea assets blob, solo registra los hashes validados en identity/SHM.
+
+### `list_tenants`
+- **Path:** `GET /hives/{hive}/identity/tenants`
+- **Read-only:** sí
+- **Uso:** descubrir tenants root/default, sponsors y tenants cliente antes de crear nodos multi-tenant.
+
+### `get_tenant`
+- **Path:** `GET /hives/{hive}/identity/tenants/{tenant_id}`
+- **Read-only:** sí
+- **Path param:** `tenant_id` en formato `tnt:<uuid>`
+- **Uso:** leer un tenant puntual con sponsor resuelto, children y counts.
+
+### `create_tenant`
+- **Path:** `POST /hives/{hive}/identity/tenants`
+- **Read-only:** no | **Requiere CONFIRM:** sí
+- **Campos requeridos:** `name`
+- **Campos opcionales:** `domain`, `status`, `settings`, `sponsor_tenant_id`
+- **Uso:** crear tenant admin/company sin sponsor, o tenant cliente con `sponsor_tenant_id` apuntando al tenant admin/company.
+- **Nota:** idempotente por `name`/`domain`; si ya existe devuelve `created=false` con el `tenant_id` existente.
+
+### `update_tenant`
+- **Path:** `PUT /hives/{hive}/identity/tenants/{tenant_id}`
+- **Read-only:** no | **Requiere CONFIRM:** sí
+- **Campos opcionales:** `name`, `domain`, `status`, `settings`, `sponsor_tenant_id`
+- **Uso:** mutar campos de tenant existente. `sponsor_tenant_id:null` limpia sponsor.
+
+### `set_tenant_sponsor`
+- **Path:** `POST /hives/{hive}/identity/tenants/{tenant_id}/sponsor`
+- **Read-only:** no | **Requiere CONFIRM:** sí
+- **Campos requeridos:** `sponsor_tenant_id` (`tnt:<uuid>` o `null`)
+- **Uso:** cambio enfocado de relación sponsor sin tocar otros campos.
 
 ### `inventory`
 - **Path:** `GET /inventory`, `GET /inventory/summary`, `GET /inventory/{hive}`, `GET /hives/{hive}/inventory/summary`

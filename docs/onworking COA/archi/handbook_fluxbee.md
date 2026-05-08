@@ -360,14 +360,15 @@ Canonical required shape:
   "hive": "motherbee",
   "node_name": "AI.coa@motherbee",
   "runtime": "ai.generic",
-  "runtime_version": "current"
+  "runtime_version": "current",
+  "tenant_id": "tnt:<uuid>"
 }
 ```
 
 Notes:
 - `node_name` uses type prefix + `@hive`
 - `runtime` is lowercase and has no `@hive`
-- `tenant_id` is root-level when required for first spawn; do not bury it inside `config`
+- `tenant_id` is root-level and required for `AI.*` / `IO.*` first spawn; do not bury it inside `config`
 
 ### 8.1.1 Tenant discovery before first spawn
 
@@ -385,12 +386,18 @@ do **not** infer tenant data from:
 Use the identity tenant read surface first:
 - `list_tenants`
 - `get_tenant`
+- `create_tenant`
+- `set_tenant_sponsor`
 
 Rules:
 - use `list_tenants` to discover candidate root/default tenants, sponsors, or client tenants
 - use `get_tenant` when one exact tenant id is already known or when you need the resolved sponsor record
-- in tenant reads, treat `is_root=true` as the native/root tenant and `is_sponsor=true` as a tenant that currently sponsors child tenants
+- use `create_tenant` to create a new admin/company tenant or a new client tenant
+- create an admin/company tenant as a root tenant with no sponsor
+- create a client tenant with `sponsor_tenant_id` pointing to the admin/company tenant
+- in tenant reads, treat `is_root=true` as a root/default tenant candidate and `is_sponsor=true` as a tenant that currently sponsors child tenants
 - if the task says "same tenant as an existing node", prefer reading the node config/live config to find the exact `tenant_id`, then validate that tenant with `get_tenant`
+- run client-facing `AI.*` / `IO.*` nodes with the client `tenant_id`, not the sponsor/admin tenant, unless the operator explicitly asks for an internal admin node
 - if no reliable tenant can be found, block and ask for exactly one missing tenant clarification
 
 ### 8.1.2 Agent cognitive definition

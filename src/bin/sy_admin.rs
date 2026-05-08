@@ -66,6 +66,11 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "get_admin_action_help",
     "get_runtime",
     "list_nodes",
+    "list_tenants",
+    "get_tenant",
+    "create_tenant",
+    "update_tenant",
+    "set_tenant_sponsor",
     "set_ilk_definition",
     "publish_runtime_package",
     "sync_hint",
@@ -1151,9 +1156,58 @@ fn validate_executor_plan(plan: &AdminExecutorPlan) -> Result<(), String> {
             .map_err(|detail| format!("{step_label}.action {detail}: '{action}'"))?;
         let function_schema = build_admin_executor_function_definition(spec).parameters_json_schema;
         validate_value_against_schema(&step.args, &function_schema, &format!("{step_label}.args"))?;
+        validate_executor_plan_step_semantics(step, &step_label)?;
         validate_executor_fill(step, &function_schema, &step_label)?;
     }
     Ok(())
+}
+
+fn validate_executor_plan_step_semantics(
+    step: &AdminExecutorPlanStep,
+    step_label: &str,
+) -> Result<(), String> {
+    if step.action.trim() != "run_node" {
+        return Ok(());
+    }
+    if !run_node_args_require_tenant(&step.args) {
+        return Ok(());
+    }
+    let tenant_id = step
+        .args
+        .get("tenant_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if tenant_id.is_empty() {
+        return Err(format!(
+            "{step_label}.args: run_node for AI/IO identity-aware first spawn requires root-level tenant_id"
+        ));
+    }
+    Ok(())
+}
+
+fn run_node_args_require_tenant(args: &serde_json::Value) -> bool {
+    let node_name = args
+        .get("node_name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let runtime = args
+        .get("runtime")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    is_identity_aware_spawn_name(node_name) || is_identity_aware_runtime_name(runtime)
+}
+
+fn is_identity_aware_spawn_name(node_name: &str) -> bool {
+    let l2_name = node_name.split('@').next().unwrap_or(node_name).trim();
+    l2_name.starts_with("AI.") || l2_name.starts_with("IO.")
+}
+
+fn is_identity_aware_runtime_name(runtime: &str) -> bool {
+    let runtime = runtime.trim().to_ascii_lowercase();
+    runtime.starts_with("ai.") || runtime.starts_with("io.")
 }
 
 fn validate_executor_fill(
@@ -1840,6 +1894,37 @@ Plan metadata:\n{}",
     )
 }
 
+fn admin_envelope_failure(output: &serde_json::Value) -> Option<(String, String, String)> {
+    let status = output.get("status").and_then(serde_json::Value::as_str)?;
+    if !status.eq_ignore_ascii_case("error") {
+        return None;
+    }
+    let code = output
+        .get("error_code")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            output
+                .get("payload")
+                .and_then(|value| value.get("error_code"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("ADMIN_ACTION_FAILED")
+        .to_string();
+    let detail = output
+        .get("error_detail")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            output
+                .get("payload")
+                .and_then(|value| value.get("message"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| output.get("message").and_then(serde_json::Value::as_str))
+        .unwrap_or("admin action returned status=error")
+        .to_string();
+    Some((code, "admin_action_failure".to_string(), detail))
+}
+
 fn build_executor_step_events_from_result(
     execution_id: &str,
     step_index: usize,
@@ -1890,9 +1975,14 @@ fn build_executor_step_events_from_result(
         } = item
         {
             let tool_name = tool_result.name.clone();
+            let envelope_failure = if tool_name == "get_admin_action_help" {
+                None
+            } else {
+                admin_envelope_failure(&tool_result.output)
+            };
             let status = if tool_name == "get_admin_action_help" {
                 "help_lookup"
-            } else if tool_result.is_error {
+            } else if tool_result.is_error || envelope_failure.is_some() {
                 "failed"
             } else {
                 "done"
@@ -1925,10 +2015,12 @@ fn build_executor_step_events_from_result(
                     "admin_action_failure".to_string()
                 };
                 (Some(code), Some(source), Some(detail_text))
+            } else if let Some((code, source, detail)) = envelope_failure.clone() {
+                (Some(code), Some(source), Some(detail))
             } else {
                 (None, None, None)
             };
-            if tool_result.is_error && failure.is_none() {
+            if (tool_result.is_error || envelope_failure.is_some()) && failure.is_none() {
                 failure = Some(AdminExecutorFailure {
                     code: error_code
                         .clone()
@@ -2778,6 +2870,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "get_tenant",
         route: InternalActionRoute::Command("get_tenant"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "create_tenant",
+        route: InternalActionRoute::Command("create_tenant"),
         requires_target: true,
         allow_legacy_hive_id: false,
     },
@@ -4293,6 +4391,29 @@ async fn handle_hive_paths(
         ("GET", ["identity", "tenants"]) => {
             let (status, resp) =
                 handle_admin_query(ctx, client, "list_tenants", Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["identity", "tenants"]) => {
+            let payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            if !payload.is_object() {
+                return Ok(Some((
+                    400,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": "create_tenant",
+                        "payload": serde_json::Value::Null,
+                        "error_code": "INVALID_REQUEST",
+                        "error_detail": "request body must be a JSON object",
+                    })
+                    .to_string(),
+                )));
+            }
+            let (status, resp) =
+                handle_admin_command(ctx, client, "create_tenant", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
         ("GET", ["identity", "tenants", tenant_id]) => {
@@ -6252,6 +6373,7 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "set_node_config"
             | "node_control_config_set"
             | "set_storage"
+            | "create_tenant"
             | "update_tenant"
             | "set_tenant_sponsor"
             | "update"
@@ -6290,6 +6412,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         }
         "list_tenants" => "List identity tenants in a hive.",
         "get_tenant" => "Read one identity tenant in a hive.",
+        "create_tenant" => "Create an identity tenant in a hive.",
         "update_tenant" => "Update mutable fields of one identity tenant in a hive.",
         "set_tenant_sponsor" => {
             "Set or clear the sponsor relationship for one identity tenant in a hive."
@@ -6377,6 +6500,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         }
         "list_tenants" => vec!["GET /hives/{hive}/identity/tenants"],
         "get_tenant" => vec!["GET /hives/{hive}/identity/tenants/{tenant_id}"],
+        "create_tenant" => vec!["POST /hives/{hive}/identity/tenants"],
         "update_tenant" => vec!["PUT /hives/{hive}/identity/tenants/{tenant_id}"],
         "set_tenant_sponsor" => {
             vec!["POST /hives/{hive}/identity/tenants/{tenant_id}/sponsor"]
@@ -6555,6 +6679,11 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
                 "ILK identifier in prefixed format, for example ilk:550e8400-e29b-41d4-a716-446655440000.",
             ),
         ],
+        "create_tenant" => vec![admin_action_path_param(
+            "hive",
+            "string",
+            "Target hive id in the URL path.",
+        )],
         "get_tenant" | "update_tenant" | "set_tenant_sponsor" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
             admin_action_path_param(
@@ -6622,6 +6751,7 @@ fn admin_action_body_required(action: &str) -> bool {
             | "set_storage"
             | "update"
             | "set_ilk_definition"
+            | "create_tenant"
             | "update_tenant"
             | "set_tenant_sponsor"
             | "opa_compile_apply"
@@ -6769,6 +6899,11 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             "string|null",
             "Prefixed tenant id to assign as sponsor, or null to clear the sponsor relationship.",
         )],
+        "create_tenant" => vec![admin_action_body_field(
+            "name",
+            "string",
+            "Tenant display name. Creating by the same name or domain is idempotent and returns the existing tenant.",
+        )],
         "set_ilk_definition" => vec![admin_action_body_field(
             "definition",
             "object",
@@ -6817,6 +6952,33 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "dist_sync_probe_timeout_secs",
                 "u64",
                 "Timeout for dist sync readiness probe.",
+            ),
+        ],
+        "create_tenant" => vec![
+            admin_action_body_field(
+                "domain",
+                "string",
+                "Optional domain used as a stable tenant lookup hint.",
+            ),
+            admin_action_body_field(
+                "status",
+                "string",
+                "Optional tenant status. Defaults to pending. Accepted values: pending, active, suspended.",
+            ),
+            admin_action_body_field(
+                "settings",
+                "object",
+                "Optional tenant settings object.",
+            ),
+            admin_action_body_field(
+                "sponsor_tenant_id",
+                "string",
+                "Optional parent/sponsor tenant id. Use this for client tenants sponsored by an admin/company tenant.",
+            ),
+            admin_action_body_field(
+                "hive",
+                "string",
+                "Optional hive override when using internal admin dispatch.",
             ),
         ],
         "update_tenant" => vec![
@@ -6872,7 +7034,7 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "tenant_id",
                 "string",
-                "Optional tenant id for identity-aware first spawn. Required by runtimes that need tenant-scoped identity during initial instance creation.",
+                "Tenant id for identity-aware first spawn. Required at root level for AI.* and IO.* managed nodes during initial instance creation.",
             ),
             admin_action_body_field("unit", "string", "Optional unit suffix override."),
             admin_action_body_field(
@@ -7160,7 +7322,9 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         }),
         "run_node" => serde_json::json!({
             "node_name": "AI.chat@motherbee",
-            "runtime_version": "current"
+            "runtime": "ai.generic",
+            "runtime_version": "current",
+            "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
         }),
         "start_node" => serde_json::json!({
             "node_name": "AI.chat@motherbee"
@@ -7323,6 +7487,12 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "status": "active",
             "sponsor_tenant_id": "tnt:11111111-1111-1111-1111-111111111111"
         }),
+        "create_tenant" => serde_json::json!({
+            "name": "Client Co",
+            "domain": "client.example",
+            "status": "active",
+            "sponsor_tenant_id": "tnt:11111111-1111-1111-1111-111111111111"
+        }),
         "set_tenant_sponsor" => serde_json::json!({
             "sponsor_tenant_id": serde_json::Value::Null
         }),
@@ -7363,7 +7533,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "get_node_state" => "curl -X GET /hives/motherbee/nodes/SY.admin@motherbee/state",
         "get_node_config" => "curl -X GET /hives/motherbee/nodes/AI.chat@motherbee/config",
         "run_node" => {
-            r#"curl -X POST /hives/motherbee/nodes -d '{"node_name":"AI.chat@motherbee","runtime_version":"current"}'"#
+            r#"curl -X POST /hives/motherbee/nodes -d '{"node_name":"AI.chat@motherbee","runtime":"ai.generic","runtime_version":"current","tenant_id":"tnt:43d576a3-d712-4d91-9245-5d5463dd693e"}'"#
         }
         "start_node" => {
             r#"curl -X POST /hives/motherbee/nodes/AI.chat@motherbee/start -d '{"node_name":"AI.chat@motherbee"}'"#
@@ -7396,6 +7566,9 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "list_tenants" => "curl -X GET /hives/motherbee/identity/tenants",
         "get_tenant" => {
             "curl -X GET /hives/motherbee/identity/tenants/tnt:550e8400-e29b-41d4-a716-446655440000"
+        }
+        "create_tenant" => {
+            r#"curl -X POST /hives/motherbee/identity/tenants -d '{"name":"Client Co","domain":"client.example","status":"active","sponsor_tenant_id":"tnt:11111111-1111-1111-1111-111111111111"}'"#
         }
         "update_tenant" => {
             r#"curl -X PUT /hives/motherbee/identity/tenants/tnt:550e8400-e29b-41d4-a716-446655440000 -d '{"status":"active","sponsor_tenant_id":"tnt:11111111-1111-1111-1111-111111111111"}'"#
@@ -7514,6 +7687,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "run_node" => vec![
             "Use this only when creating/spawning a new managed instance.",
             "runtime can be omitted when it is derivable from node_name.",
+            "AI.* and IO.* managed nodes require root-level tenant_id on first spawn. Discover it with list_tenants/get_tenant or from an existing node config; do not place it only under config.",
             "For internal ADMIN_COMMAND dispatch, the hive target is encoded via payload.target; in HTTP it comes from /hives/{hive}.",
         ],
         "start_node" => vec![
@@ -7617,9 +7791,15 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "This lookup returns the tenant plus its resolved sponsor record when one exists, and child tenant summaries when this tenant sponsors others.",
             "Use this before set_tenant_sponsor or run_node when you need the exact tenant association already used by another node.",
         ],
+        "create_tenant" => vec![
+            "Creates a tenant on the target hive through SY.identity.",
+            "Creation is idempotent by normalized name or domain; existing matches return created=false with the existing tenant_id.",
+            "Use a root tenant with no sponsor for an admin/company tenant. Use sponsor_tenant_id for client tenants sponsored by that admin/company tenant.",
+            "AI.* and IO.* node spawns should use the client tenant_id when the node operates for that client.",
+        ],
         "update_tenant" => vec![
             "This mutates the tenant record itself, not ILKs that belong to that tenant.",
-            "Use TNT_CREATE to create a tenant. Use update_tenant only after the tenant already exists.",
+            "Use create_tenant to create a tenant. Use update_tenant only after the tenant already exists.",
             "Passing sponsor_tenant_id updates the tenant hierarchy. Passing sponsor_tenant_id=null clears sponsorship and makes the tenant a root/default candidate.",
             "Sponsor updates are validated against self-reference and sponsorship cycles.",
         ],
@@ -9256,7 +9436,12 @@ async fn handle_admin_command(
     }
     if matches!(
         action,
-        "get_ilk" | "set_ilk_definition" | "get_tenant" | "update_tenant" | "set_tenant_sponsor"
+        "get_ilk"
+            | "set_ilk_definition"
+            | "get_tenant"
+            | "create_tenant"
+            | "update_tenant"
+            | "set_tenant_sponsor"
     ) {
         return handle_identity_command(ctx, client, action, payload, hive).await;
     }
@@ -9574,6 +9759,7 @@ async fn handle_identity_command(
         "get_ilk" => ("ILK_GET", "ILK_GET_RESPONSE"),
         "set_ilk_definition" => ("ILK_SET_DEFINITION", "ILK_SET_DEFINITION_RESPONSE"),
         "get_tenant" => ("TNT_GET", "TNT_GET_RESPONSE"),
+        "create_tenant" => ("TNT_CREATE", "TNT_CREATE_RESPONSE"),
         "update_tenant" => ("TNT_UPDATE", "TNT_UPDATE_RESPONSE"),
         "set_tenant_sponsor" => ("TNT_SET_SPONSOR", "TNT_SET_SPONSOR_RESPONSE"),
         _ => return Err(format!("unsupported identity admin action: {action}").into()),
@@ -11426,6 +11612,11 @@ mod tests {
         assert!(actions.contains(&"sync_hint"));
         assert!(actions.contains(&"update"));
         assert!(actions.contains(&"get_runtime"));
+        assert!(actions.contains(&"list_tenants"));
+        assert!(actions.contains(&"get_tenant"));
+        assert!(actions.contains(&"create_tenant"));
+        assert!(actions.contains(&"update_tenant"));
+        assert!(actions.contains(&"set_tenant_sponsor"));
         assert!(actions.contains(&"start_node"));
         assert!(actions.contains(&"restart_node"));
         assert!(actions.contains(&"run_node"));
@@ -11607,6 +11798,83 @@ mod tests {
     }
 
     #[test]
+    fn executor_plan_validation_rejects_ai_run_node_without_tenant_id() {
+        let err = parse_executor_plan(json!({
+            "plan_version": "0.1",
+            "kind": "executor_plan",
+            "metadata": {
+                "name": "spawn-ai-without-tenant",
+                "target_hive": "motherbee"
+            },
+            "execution": {
+                "strict": true,
+                "stop_on_error": true,
+                "allow_help_lookup": true,
+                "steps": [{
+                    "id": "s1",
+                    "action": "run_node",
+                    "args": {
+                        "hive": "motherbee",
+                        "node_name": "AI.sales@motherbee",
+                        "runtime": "ai.generic",
+                        "runtime_version": "current"
+                    }
+                }]
+            }
+        }))
+        .expect_err("AI run_node without tenant_id must fail validation");
+
+        assert!(err.contains("requires root-level tenant_id"));
+    }
+
+    #[test]
+    fn executor_events_mark_error_envelope_as_failed() {
+        let step = AdminExecutorPlanStep {
+            id: "s1".to_string(),
+            action: "run_node".to_string(),
+            args: json!({
+                "hive": "motherbee",
+                "node_name": "AI.sales@motherbee",
+                "runtime": "ai.generic",
+                "runtime_version": "current",
+                "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
+            }),
+            executor_fill: None,
+        };
+        let result = fluxbee_ai_sdk::function_calling::FunctionLoopRunResult {
+            final_assistant_text: None,
+            tokens_used: 0,
+            items: vec![FunctionLoopItem::ToolResult {
+                result: fluxbee_ai_sdk::function_calling::FunctionToolResult {
+                    call_id: "call-1".to_string(),
+                    response_id: None,
+                    name: "run_node".to_string(),
+                    arguments: step.args.clone(),
+                    output: json!({
+                        "action": "run_node",
+                        "status": "error",
+                        "error_code": "IDENTITY_REGISTER_FAILED",
+                        "error_detail": "identity registration required but tenant_id is missing"
+                    }),
+                    is_error: false,
+                },
+            }],
+        };
+
+        let (events, action_called, failure) =
+            build_executor_step_events_from_result("exec-test", 0, &step, &result);
+
+        assert!(action_called);
+        let failure = failure.expect("error envelope must produce failure");
+        assert_eq!(failure.code, "IDENTITY_REGISTER_FAILED");
+        assert!(events.iter().any(|event| {
+            event.step_id == "s1"
+                && event.tool_name.as_deref() == Some("run_node")
+                && event.status == "failed"
+        }));
+    }
+
+    #[test]
     fn executor_plan_validation_rejects_unknown_action() {
         let err = parse_executor_plan(json!({
             "plan_version": "0.1",
@@ -11752,6 +12020,24 @@ mod tests {
             admin_action_example_scmd("set_ilk_definition")
                 .expect("set_ilk_definition should expose example_scmd"),
             r#"curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{"definition":{"role_hash":"1111111111111111111111111111111111111111111111111111111111111111","skill_hashes":["2222222222222222222222222222222222222222222222222222222222222222"],"handbook_hashes":["3333333333333333333333333333333333333333333333333333333333333333"]}}'"#
+        );
+    }
+
+    #[test]
+    fn create_tenant_action_is_registered() {
+        let spec = resolve_internal_action_spec("create_tenant").expect("action must exist");
+        assert!(spec.requires_target);
+        assert!(admin_action_requires_confirmation("create_tenant"));
+        assert_eq!(
+            admin_action_path_patterns("create_tenant"),
+            vec!["POST /hives/{hive}/identity/tenants"]
+        );
+        let required_fields = admin_action_body_required_fields("create_tenant");
+        assert_eq!(required_fields.len(), 1);
+        assert_eq!(required_fields[0]["name"], json!("name"));
+        assert_eq!(
+            admin_action_example_scmd("create_tenant").expect("create_tenant example"),
+            r#"curl -X POST /hives/motherbee/identity/tenants -d '{"name":"Client Co","domain":"client.example","status":"active","sponsor_tenant_id":"tnt:11111111-1111-1111-1111-111111111111"}'"#
         );
     }
 
