@@ -308,6 +308,7 @@ pub(crate) fn parse_json_message_request(
             tenant_id: Some(auth_match.tenant_id.clone()),
             tenant_hint: None,
             attributes: Value::Object(attributes),
+            ilk_type: Some("human".to_string()),
         },
         dst_node_override,
         io_context: IoContext {

@@ -9,14 +9,14 @@ use fluxbee_sdk::protocol::{
     Destination, Message as WireMessage, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE,
     SYSTEM_KIND,
 };
-use fluxbee_sdk::{NodeError, NodeReceiver, NodeSender, MSG_ILK_PROVISION};
+use fluxbee_sdk::{
+    NodeError, NodeReceiver, NodeSender, MSG_ILK_PROVISION, MSG_ILK_PROVISION_RESPONSE,
+};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::identity::{IdentityError, IdentityProvisioner, ResolveOrCreateInput};
-
-const MSG_ILK_PROVISION_RESPONSE: &str = "ILK_PROVISION_RESPONSE";
 
 pub struct RouterInbox {
     receiver: NodeReceiver,

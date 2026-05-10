@@ -677,6 +677,7 @@ mod tests {
                 tenant_id: None,
                 tenant_hint: Some("T1".to_string()),
                 attributes: serde_json::json!({ "team_id": "T1" }),
+                ilk_type: Some("human".to_string()),
             },
             dst_node_override: None,
             flush_hints: RelayFlushHints::default(),

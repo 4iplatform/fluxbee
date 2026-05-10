@@ -299,6 +299,7 @@ mod tests {
             tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
+            ilk_type: Some("human".to_string()),
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
@@ -323,6 +324,7 @@ mod tests {
             tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
+            ilk_type: Some("human".to_string()),
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
@@ -352,6 +354,7 @@ mod tests {
             tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
+            ilk_type: Some("human".to_string()),
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
@@ -384,6 +387,7 @@ mod tests {
             tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
+            ilk_type: Some("human".to_string()),
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
@@ -415,6 +419,7 @@ mod tests {
             tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
+            ilk_type: Some("human".to_string()),
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
@@ -521,6 +526,7 @@ mod tests {
             tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
+            ilk_type: Some("human".to_string()),
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
@@ -553,6 +559,7 @@ mod tests {
             tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
+            ilk_type: Some("human".to_string()),
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
@@ -588,6 +595,7 @@ mod tests {
             tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
+            ilk_type: Some("human".to_string()),
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 
@@ -624,6 +632,7 @@ mod tests {
             tenant_id: None,
             tenant_hint: None,
             attributes: serde_json::json!({}),
+            ilk_type: Some("human".to_string()),
         };
         let payload = serde_json::json!({ "type": "text", "content": "hi" });
 

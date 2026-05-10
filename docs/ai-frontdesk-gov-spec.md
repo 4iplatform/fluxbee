@@ -339,5 +339,5 @@ Debe exponer:
 
 ## 13. Dependencias abiertas de core
 
-- `ILK_PROVISION` todavia no acepta `tenant_id` explicito;
-- la version actual de `IO.api` puede validar tenant y construir handoff correcto, pero el aislamiento multitenant real del provisional sigue dependiendo del cierre de ese gap en core.
+- `ILK_PROVISION` ya acepta `tenant_id` explicito y los ICH provisorios son tenant-scoped;
+- `IO.api` debe seguir enviando `tenant_id` validado desde su integracion para preservar aislamiento multitenant.

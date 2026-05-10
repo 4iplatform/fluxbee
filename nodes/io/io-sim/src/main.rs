@@ -358,6 +358,7 @@ async fn process_one_inbound(
                     "conversation_id": config.sim_conversation_id,
                     "source": "io-sim",
                 }),
+                ilk_type: Some("human".to_string()),
             },
             None,
             io_ctx,

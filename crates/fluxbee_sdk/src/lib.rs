@@ -45,8 +45,9 @@ pub use identity::{
     IchSetEnabledResponse, IdentityError, IdentityIchOption, IdentityIlkOption, IdentityShmError,
     IdentitySystemRequest, IdentitySystemResult, IlkProvisionRequest, IlkProvisionResult,
     ResolvedIdentityOption, TenantUpdateResponse, MSG_ICH_SET_ENABLED, MSG_IDENTITY_METRICS,
-    MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION, MSG_ILK_REGISTER, MSG_ILK_SET_DEFINITION,
-    MSG_ILK_UPDATE, MSG_TNT_APPROVE, MSG_TNT_CREATE, MSG_TNT_SET_SPONSOR, MSG_TNT_UPDATE,
+    MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION, MSG_ILK_PROVISION_RESPONSE, MSG_ILK_REGISTER,
+    MSG_ILK_SET_DEFINITION, MSG_ILK_UPDATE, MSG_TNT_APPROVE, MSG_TNT_CREATE, MSG_TNT_SET_SPONSOR,
+    MSG_TNT_UPDATE,
 };
 pub use managed_node::{
     managed_node_config_path, managed_node_config_path_with_root, managed_node_instance_dir,

@@ -264,6 +264,7 @@ mod tests {
             tenant_id: tenant_id.map(ToString::to_string),
             tenant_hint: None,
             attributes: serde_json::json!({}),
+            ilk_type: Some("human".to_string()),
         }
     }
 
