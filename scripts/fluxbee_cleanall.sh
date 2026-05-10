@@ -3,7 +3,7 @@
 #
 # This is intentionally aggressive and non-interactive. After running it,
 # the host has no Fluxbee runtime state, no node configs, no secrets,
-# no databases, no SHM, no sockets — only your repo at ~/fluxbee.
+# no databases, no vault DB/key, no SHM, no sockets — only your repo at ~/fluxbee.
 #
 # Then run scripts/install.sh from the repo to bring the system back as
 # if installed for the first time. After install you must:
@@ -157,15 +157,15 @@ fi
 step "Removing router sockets..."
 $SUDO find "$RUN_DIR/routers" -maxdepth 1 \( -type s -o -type f \) -name '*.sock' -delete 2>/dev/null || true
 
-# ── 5. Wipe entire $STATE_DIR (every subdir: state/, nodes/, vendor/, dist/, ssh/, blob/, etc.) ──
+# ── 5. Wipe entire $STATE_DIR (every subdir: state/, nodes/, vendor/, dist/, ssh/, blob/, vault.db, etc.) ──
 if [[ -d "$STATE_DIR" ]]; then
-  step "Wiping contents of $STATE_DIR (everything: state, nodes, secrets, vendor, dist, ssh, blob, ...)"
+  step "Wiping contents of $STATE_DIR (everything: state, nodes, secrets, vendor, dist, ssh, blob, vault.db, ...)"
   $SUDO find "$STATE_DIR" -mindepth 1 -delete 2>/dev/null || true
 fi
 
-# ── 6. Wipe entire $CONFIG_DIR (hive.yaml, handbook, *.env, secrets.json, ...) ──
+# ── 6. Wipe entire $CONFIG_DIR (hive.yaml, handbook, *.env, secrets.json, vault.master.key, ...) ──
 if [[ -d "$CONFIG_DIR" ]]; then
-  step "Wiping contents of $CONFIG_DIR (hive.yaml, handbook, *.env, secrets, ...)"
+  step "Wiping contents of $CONFIG_DIR (hive.yaml, handbook, *.env, secrets, vault.master.key, ...)"
   $SUDO find "$CONFIG_DIR" -mindepth 1 -delete 2>/dev/null || true
 fi
 

@@ -91,6 +91,7 @@ pub struct IdentitySystemResult {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct IdentityIlkOption {
     pub ilk_id: String,
+    pub tenant_id: String,
     pub display_name: Option<String>,
     pub handler_node: Option<String>,
     pub registration_status: String,
@@ -1667,6 +1668,7 @@ fn identity_ilk_option_from_entry(ilk: &IlkEntry) -> IdentityIlkOption {
     let (role_hash, skill_hashes, handbook_hashes) = definition_hashes_from_ilk(ilk);
     IdentityIlkOption {
         ilk_id: prefixed_uuid_from_bytes("ilk", ilk.ilk_id),
+        tenant_id: prefixed_uuid_from_bytes("tnt", ilk.tenant_id),
         display_name: {
             let value = fixed_str_to_string(&ilk.display_name);
             (!value.is_empty()).then_some(value)

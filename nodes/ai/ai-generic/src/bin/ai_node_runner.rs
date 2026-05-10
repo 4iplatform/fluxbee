@@ -6202,6 +6202,7 @@ mod tests {
     fn sample_agent_ilk() -> IdentityIlkOption {
         IdentityIlkOption {
             ilk_id: "ilk:11111111-1111-4111-8111-111111111111".to_string(),
+            tenant_id: "tnt:22222222-2222-4222-8222-222222222222".to_string(),
             display_name: Some("Support Agent".to_string()),
             handler_node: Some("AI.support@motherbee".to_string()),
             registration_status: "complete".to_string(),

@@ -19,6 +19,7 @@ pub mod split;
 pub mod status;
 pub mod thread;
 pub mod timer;
+pub mod vault;
 
 pub use admin::{
     admin_command, admin_command_ok, AdminCommandError, AdminCommandRequest, AdminCommandResult,
@@ -97,4 +98,11 @@ pub use timer::{
     MSG_TIMER_RESPONSE, MSG_TIMER_SCHEDULE, MSG_TIMER_SCHEDULE_RECURRING,
     TIMER_DEFAULT_RPC_TIMEOUT_MS, TIMER_DEFAULT_TIME_RETRY_SCHEDULE_MS, TIMER_LIST_DEFAULT_LIMIT,
     TIMER_LIST_MAX_LIMIT, TIMER_MIN_DURATION_MS, TIMER_NODE_FAMILY, TIMER_NODE_KIND,
+};
+pub use vault::{
+    parse_vault_ref, vault_get, vault_get_metadata, vault_get_with_retry, VaultError,
+    VaultGetMetadataRequest, VaultGetMetadataResponse, VaultGetRequest, VaultGetResponse,
+    VaultMetadata, VaultPutRequest, VaultPutResponse, VaultRetryPolicy, VaultValueResponse,
+    MSG_VAULT_GET, MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE,
+    MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE, VAULT_REF_PREFIX,
 };

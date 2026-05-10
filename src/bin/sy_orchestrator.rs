@@ -112,6 +112,7 @@ const CORE_SYNC_RESTART_ORDER: &[&str] = &[
     "sy-identity",
     "sy-admin",
     "sy-architect",
+    "sy-vault",
     "sy-storage",
     "sy-cognition",
     "sy-policy",
@@ -120,21 +121,23 @@ const CORE_SYNC_RESTART_ORDER: &[&str] = &[
     "sy-frontdesk-gov",
     "sy-orchestrator",
 ];
-const WORKER_MIN_CORE_COMPONENTS: [&str; 8] = [
+const WORKER_MIN_CORE_COMPONENTS: [&str; 9] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
     "sy-identity",
+    "sy-vault",
     "sy-cognition",
     "sy-policy",
     "sy-timer",
     "sy-orchestrator",
 ];
-const WORKER_BOOTSTRAP_CORE_COMPONENTS: [&str; 8] = [
+const WORKER_BOOTSTRAP_CORE_COMPONENTS: [&str; 9] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
     "sy-identity",
+    "sy-vault",
     "sy-cognition",
     "sy-policy",
     "sy-timer",
@@ -430,11 +433,12 @@ struct SystemUpdateRequest {
     runtime_version: Option<String>,
 }
 
-const MOTHERBEE_CRITICAL_SERVICES: [&str; 11] = [
+const MOTHERBEE_CRITICAL_SERVICES: [&str; 12] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
     "sy-identity",
+    "sy-vault",
     "sy-admin",
     "sy-architect",
     "sy-storage",
@@ -443,11 +447,12 @@ const MOTHERBEE_CRITICAL_SERVICES: [&str; 11] = [
     "sy-timer",
     "sy-frontdesk-gov",
 ];
-const WORKER_CRITICAL_SERVICES: [&str; 7] = [
+const WORKER_CRITICAL_SERVICES: [&str; 8] = [
     "rt-gateway",
     "sy-config-routes",
     "sy-opa-rules",
     "sy-identity",
+    "sy-vault",
     "sy-cognition",
     "sy-policy",
     "sy-timer",
@@ -674,6 +679,7 @@ async fn bootstrap_local(
         services.extend([
             "sy-admin",
             "sy-architect",
+            "sy-vault",
             "sy-storage",
             "sy-cognition",
             "sy-policy",
@@ -684,7 +690,13 @@ async fn bootstrap_local(
         services
     } else {
         let mut services = LEGACY_ALIGNED_SERVICE_UNITS.to_vec();
-        services.extend(["sy-cognition", "sy-policy", "sy-timer", "sy-wf-rules"]);
+        services.extend([
+            "sy-vault",
+            "sy-cognition",
+            "sy-policy",
+            "sy-timer",
+            "sy-wf-rules",
+        ]);
         services
     };
     if identity_available() {
@@ -1192,6 +1204,7 @@ async fn shutdown_sequence(state: &OrchestratorState) {
         "sy-policy",
         "sy-cognition",
         "sy-storage",
+        "sy-vault",
         "sy-architect",
         "sy-admin",
     ];
@@ -6640,7 +6653,7 @@ fn get_hive(_state_dir: &Path, hive_id: &str) -> Result<serde_json::Value, Orche
 }
 
 fn remove_hive_cleanup_script() -> &'static str {
-    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-cognition sy-policy sy-timer sy-wf-rules sy-orchestrator sy-admin sy-architect sy-storage sy-frontdesk-gov fluxbee-syncthing; do \
+    "for s in rt-gateway sy-config-routes sy-opa-rules sy-identity sy-vault sy-cognition sy-policy sy-timer sy-wf-rules sy-orchestrator sy-admin sy-architect sy-storage sy-frontdesk-gov fluxbee-syncthing; do \
 systemctl stop --no-block \"$s\" >/dev/null 2>&1 || true; \
 systemctl disable \"$s\" >/dev/null 2>&1 || true; \
 systemctl kill -s KILL \"$s\" >/dev/null 2>&1 || true; \
@@ -13640,6 +13653,7 @@ async fn add_hive_flow(
         }
     };
     let has_identity_source = core_manifest.components.contains_key("sy-identity");
+    let has_vault_source = core_manifest.components.contains_key("sy-vault");
     let has_cognition_source = core_manifest.components.contains_key("sy-cognition");
     let has_policy_source = core_manifest.components.contains_key("sy-policy");
     let has_timer_source = core_manifest.components.contains_key("sy-timer");
@@ -13821,6 +13835,9 @@ async fn add_hive_flow(
     worker_units.extend(LEGACY_ALIGNED_WORKER_UNITS.iter().copied());
     if has_identity_source {
         worker_units.push(("sy-identity", "/usr/bin/sy-identity"));
+    }
+    if has_vault_source {
+        worker_units.push(("sy-vault", "/usr/bin/sy-vault"));
     }
     if has_cognition_source {
         worker_units.push(("sy-cognition", "/usr/bin/sy-cognition"));

@@ -123,62 +123,69 @@ Default `vault_get_with_retry` policy:
 
 ## 5. Phase B - Rust SDK vault contract
 
-- [ ] VA-B1. Add `crates/fluxbee_sdk/src/vault.rs`.
-- [ ] VA-B2. Define verb constants:
+- [x] VA-B1. Add `crates/fluxbee_sdk/src/vault.rs`.
+- [x] VA-B2a. Define initial verb constants:
   - `VAULT_PUT`
   - `VAULT_GET`
+  - `VAULT_GET_METADATA`
+- [ ] VA-B2b. Define remaining verb constants:
   - `VAULT_LIST`
   - `VAULT_DELETE`
   - `VAULT_ROTATE`
   - `VAULT_ROLLBACK`
-  - `VAULT_GET_METADATA`
-- [ ] VA-B3. Define request/response structs for all verbs.
-- [ ] VA-B4. Define `VaultMetadata`, `VaultFilter`, and typed error handling.
-- [ ] VA-B5. Implement L2 helper functions using `NodeSender` and trace-id matching pattern used by identity helpers.
-- [ ] VA-B6. Re-export vault types/helpers from `fluxbee_sdk::lib` and prelude if appropriate.
-- [ ] VA-B7. Add unit tests for serialization and response parsing.
-- [ ] VA-B8. Implement `vault_ref` parsing helper for `vault://<key>`.
-- [ ] VA-B9. Implement `vault_get_with_retry` with bounded attempts/time, backoff, and jitter.
-- [ ] VA-B10. Ensure retry does not retry `UNAUTHORIZED`, `INVALID_KEY_FORMAT`, or malformed refs.
+- [x] VA-B3a. Define request/response structs for initial verbs.
+- [ ] VA-B3b. Define request/response structs for list/delete/rotate/rollback.
+- [x] VA-B4a. Define `VaultMetadata` and typed vault errors.
+- [ ] VA-B4b. Define `VaultFilter` for listing/querying.
+- [x] VA-B5a. Implement `vault_get` / `vault_get_metadata` L2 helper functions using `NodeSender` and trace-id matching pattern used by identity helpers.
+- [ ] VA-B5b. Implement SDK helpers for `VAULT_PUT`, `VAULT_LIST`, `VAULT_DELETE`, `VAULT_ROTATE`, and `VAULT_ROLLBACK`.
+- [x] VA-B6. Re-export vault types/helpers from `fluxbee_sdk::lib` and prelude if appropriate.
+- [x] VA-B7a. Add unit tests for vault ref parsing.
+- [ ] VA-B7b. Add unit tests for serialization and response parsing.
+- [x] VA-B8. Implement `vault_ref` parsing helper for `vault://<key>`.
+- [x] VA-B9. Implement `vault_get_with_retry` with bounded attempts/time, backoff, and jitter.
+- [x] VA-B10. Ensure retry does not retry `UNAUTHORIZED`, `INVALID_KEY_FORMAT`, or malformed refs.
 
 ## 6. Phase C - `sy-vault` node implementation
 
-- [ ] VA-C1. Add `src/bin/sy_vault.rs`.
-- [ ] VA-C2. Add binary target `sy-vault` to `Cargo.toml`.
-- [ ] VA-C3. Load hive id and node name using the same core service pattern as other SY nodes.
-- [ ] VA-C4. Implement lock file `/var/run/fluxbee/sy-vault.lock`.
-- [ ] VA-C5. Implement master key load/generate:
+- [x] VA-C1. Add `src/bin/sy_vault.rs`.
+- [x] VA-C2. Use Cargo auto-discovered binary target `sy_vault` and install/service name `sy-vault`.
+- [x] VA-C3. Load hive id and node name using the same core service pattern as other SY nodes.
+- [x] VA-C4. Implement lock file `/var/run/fluxbee/sy-vault.lock`.
+- [x] VA-C5. Implement master key load/generate:
   - create if missing;
   - validate exact 32 bytes;
   - enforce `0600` or stricter;
   - fail closed on invalid key.
-- [ ] VA-C6. Implement SQLite schema creation and schema version check.
-- [ ] VA-C7. Implement AES-256-GCM encrypt/decrypt.
-- [ ] VA-C8. Implement `VAULT_PUT`.
-- [ ] VA-C9. Implement `VAULT_GET`.
+- [x] VA-C6. Implement SQLite schema creation and schema version check.
+- [x] VA-C7. Implement AES-256-GCM encrypt/decrypt.
+- [x] VA-C8. Implement `VAULT_PUT`.
+- [x] VA-C9. Implement `VAULT_GET`.
 - [ ] VA-C10. Implement `VAULT_LIST`.
 - [ ] VA-C11. Implement `VAULT_DELETE`.
 - [ ] VA-C12. Implement `VAULT_ROTATE`.
 - [ ] VA-C13. Implement `VAULT_ROLLBACK`.
-- [ ] VA-C14. Implement `VAULT_GET_METADATA`.
-- [ ] VA-C15. Ensure secret values are never logged.
-- [ ] VA-C16. Add structured audit write for every operation, including denial and no-op.
-- [ ] VA-C17. Update `last_accessed_at` and `access_count` only after successful authorized GET.
+- [x] VA-C14. Implement `VAULT_GET_METADATA`.
+- [x] VA-C15. Ensure secret values are never logged.
+- [x] VA-C16a. Add structured audit write for supported operations, including errors and no-op.
+- [ ] VA-C16b. Ensure auth failures that happen before caller resolution also produce an audit row.
+- [x] VA-C17. Update `last_accessed_at` and `access_count` only after successful authorized GET.
 - [ ] VA-C18. Add graceful shutdown.
-- [ ] VA-C19. Ensure audit writes are in the same SQLite transaction as secret mutation when applicable.
+- [x] VA-C19. Ensure audit writes are in the same SQLite transaction as secret mutation when applicable.
 
 ## 7. Phase D - Authorization
 
-- [ ] VA-D1. Implement caller extraction from current message shape:
+- [x] VA-D1. Implement caller extraction from current message shape:
   - `routing.src_l2_name`
   - `meta.src_ilk`
   - `routing.trace_id`
-- [ ] VA-D2. Resolve caller tenant and ILK type through identity SHM by canonical `meta.src_ilk`.
-- [ ] VA-D3. Implement admin override for `SY.admin@*` and `SY.architect@*`.
-- [ ] VA-D4. Implement owner authorization: caller `meta.src_ilk == metadata.owner_ilk`.
-- [ ] VA-D5. Implement same-tenant system authorization if caller is `system` ILK.
-- [ ] VA-D6. For `tenant_id = sys`, allow only admin/architect.
-- [ ] VA-D7. Prevent key enumeration for `VAULT_GET` and `VAULT_LIST`.
+- [x] VA-D2. Resolve caller tenant and ILK type through identity SHM by canonical `meta.src_ilk`.
+- [x] VA-D3. Implement admin override for `SY.admin@*` and `SY.architect@*`.
+- [x] VA-D4. Implement owner authorization: caller `meta.src_ilk == metadata.owner_ilk`.
+- [x] VA-D5. Implement same-tenant system authorization if caller is `system` ILK.
+- [x] VA-D6. For `tenant_id = sys`, allow only admin/architect.
+- [x] VA-D7a. Prevent key enumeration for `VAULT_GET`.
+- [ ] VA-D7b. Prevent key enumeration for `VAULT_LIST`.
 - [ ] VA-D8. Unit-test allowed/denied matrix.
 
 ## 8. Phase E - Admin and Archi integration
@@ -205,17 +212,18 @@ Default `vault_get_with_retry` policy:
 
 ## 9. Phase F - Install, orchestrator, and core manifest
 
-- [ ] VA-F1. Add `sy-vault` compile/install path in `scripts/install.sh`.
-- [ ] VA-F2. Install `/usr/bin/sy-vault`.
-- [ ] VA-F3. Add `sy-vault` to `/var/lib/fluxbee/dist/core/bin`.
-- [ ] VA-F4. Add `sy-vault` to core manifest.
-- [ ] VA-F5. Add systemd unit for `sy-vault`.
+- [x] VA-F1. Add `sy-vault` compile/install path in `scripts/install.sh`.
+- [x] VA-F2. Install `/usr/bin/sy-vault`.
+- [x] VA-F3. Add `sy-vault` to `/var/lib/fluxbee/dist/core/bin`.
+- [x] VA-F4. Add `sy-vault` to core manifest.
+- [x] VA-F5. Add systemd unit for `sy-vault`.
 - [x] VA-F6. Decide whether orchestrator should start it by default: yes, normal SY service.
-- [ ] VA-F7. Add to orchestrator-managed service set without making AI/IO/SY node startup block on vault readiness.
-- [ ] VA-F8. Add clean/reset behavior to `fluxbee_cleanall.sh`:
+- [x] VA-F7. Add to orchestrator-managed service set without making AI/IO/SY node startup block on vault readiness.
+- [x] VA-F8. Add clean/reset behavior to `fluxbee_cleanall.sh`:
   - alpha clean deletes vault DB/key;
   - no extra confirmation in this development cycle.
-- [ ] VA-F9. Add file permission/ownership checks in install or vault boot.
+- [x] VA-F9a. Add master key permission checks in vault boot.
+- [ ] VA-F9b. Add database file permission/ownership checks in install or vault boot.
 - [x] VA-F10. Decide service user model: same as existing SY services; no dedicated `sy-vault` user in v1.
 
 ## 10. Phase G - Consumer migration strategy

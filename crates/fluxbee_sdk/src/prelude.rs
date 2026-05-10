@@ -76,3 +76,10 @@ pub use crate::timer::{
     TIMER_DEFAULT_RPC_TIMEOUT_MS, TIMER_DEFAULT_TIME_RETRY_SCHEDULE_MS, TIMER_LIST_DEFAULT_LIMIT,
     TIMER_LIST_MAX_LIMIT, TIMER_MIN_DURATION_MS, TIMER_NODE_FAMILY, TIMER_NODE_KIND,
 };
+pub use crate::vault::{
+    parse_vault_ref, vault_get, vault_get_metadata, vault_get_with_retry, VaultError,
+    VaultGetMetadataRequest, VaultGetMetadataResponse, VaultGetRequest, VaultGetResponse,
+    VaultMetadata, VaultPutRequest, VaultPutResponse, VaultRetryPolicy, VaultValueResponse,
+    MSG_VAULT_GET, MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE,
+    MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE, VAULT_REF_PREFIX,
+};

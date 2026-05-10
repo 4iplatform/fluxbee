@@ -6017,7 +6017,8 @@ async fn messages_stream_task(
     {
         return;
     }
-    let mut interval = tokio::time::interval(Duration::from_millis(MESSAGES_STREAM_POLL_INTERVAL_MS));
+    let mut interval =
+        tokio::time::interval(Duration::from_millis(MESSAGES_STREAM_POLL_INTERVAL_MS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval.tick().await;
     loop {
@@ -6059,17 +6060,13 @@ async fn messages_stream_task(
                     "error": "messages_db_query_failed",
                     "message": err.to_string()
                 });
-                let event = SseEvent::default()
-                    .event("error")
-                    .data(payload.to_string());
+                let event = SseEvent::default().event("error").data(payload.to_string());
                 let _ = tx.send(Ok(event)).await;
                 return;
             }
         }
     }
 }
-
-
 
 async fn handle_messages_list(state: &ArchitectState, query: &str) -> Response {
     let limit = query_param(query, "limit")
@@ -6128,10 +6125,7 @@ async fn handle_messages_list(state: &ArchitectState, query: &str) -> Response {
             .into_response();
     };
 
-    let filters = messages_db::MessagesFilters {
-        since,
-        with_error,
-    };
+    let filters = messages_db::MessagesFilters { since, with_error };
     match client
         .list_messages(cursor.as_ref(), &filters, limit)
         .await
@@ -9423,7 +9417,11 @@ async fn handle_architect_local_config_get(
     };
     let messages_db_configured = secret_record
         .as_ref()
-        .and_then(|record| record.secrets.get(ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL))
+        .and_then(|record| {
+            record
+                .secrets
+                .get(ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL)
+        })
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())

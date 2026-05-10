@@ -43,3 +43,6 @@ arrow-schema = "57.2"
 futures = "0.3"
 tokio-stream = "0.1"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
+aes-gcm = "0.10"
+rand = "0.8"
+rusqlite = { version = "0.31", features = ["bundled"] }
