@@ -197,8 +197,21 @@ Archi accede al mismo endpoint a través del sistema de lectura genérico (`flux
 - **Path:** `POST /hives/{hive}/identity/ilks/{ilk_id}/definition`
 - **Read-only:** no
 - **Path param:** `ilk_id` en formato `ilk:<uuid>`
-- **Body:** `definition` con `role_hash`, `skill_hashes`, `handbook_hashes`
+- **Body:** `definition` con `role_hash`, `skill_hashes`, `handbook_hashes`, `personality_hash` (este último single 64-hex string, no array).
 - **Uso:** aplica la definición cognitiva de un agent ILK; no crea assets blob, solo registra los hashes validados en identity/SHM.
+- **Nota:** `personality_hash` es opcional. Ausente o `null` ⇒ no se renderiza bloque de personalidad y la proyección flat de `personality_*` (timezone, country_code, primary_language, additional_languages) en `data.identity[ilk]` queda vacía. Set parcial es válido: enviar sólo `personality_hash` deja role/skill/handbook intactos.
+
+```json
+POST /hives/motherbee/identity/ilks/ilk:ai-support/definition
+{
+  "definition": {
+    "role_hash": "a1b2c3d4...",
+    "skill_hashes": ["e5f6a7b8...", "c9d0e1f2..."],
+    "handbook_hashes": ["3a4b5c6d..."],
+    "personality_hash": "9f8e7d6c..."
+  }
+}
+```
 
 ### `list_tenants`
 - **Path:** `GET /hives/{hive}/identity/tenants`
@@ -496,6 +509,35 @@ Archi accede al mismo endpoint a través del sistema de lectura genérico (`flux
 - **Path:** `POST /hives/{hive}/timer/format`
 - **Read-only:** sí
 - **Campos requeridos:** `instant_utc_ms` (i64), `layout` (Go time layout), `tz` (IANA)
+
+---
+
+## Categoría — SY.architect local control plane
+
+archi tiene su propio control-plane local que se invoca por SCMD desde el chat (operator) o por el admin gateway sobre `SY.architect@<hive>`. Persiste secretos en `secrets.json` del nodo y refresca runtimes en caliente sin reiniciar.
+
+### `architect_local_config_get`
+- **Path:** `GET /architect/control/config-get` (SCMD) o `POST /hives/{hive}/nodes/SY.architect@{hive}/control/config-get` (admin gateway)
+- **Read-only:** sí
+- **Descripción:** Devuelve el contrato live de archi: estado de cada secret (configured / missing_secret), valores redacted, secret_record y `state` global. Hoy reporta dos descriptores: OpenAI API key y messages DB URL.
+- **Respuesta clave:** `payload.state` (configured | missing_secret) refleja sólo el secret de OpenAI (requerido). `payload.messages_db_state` reporta la DB de mensajes (opcional). `payload.contract.secrets[]` enumera los descriptores con `field`, `storage_key`, `required`, `configured`.
+
+### `architect_local_config_set`
+- **Path:** `POST /architect/control/config-set` (SCMD) o `POST /hives/{hive}/nodes/SY.architect@{hive}/control/config-set` (admin gateway)
+- **Read-only:** no | **Requiere CONFIRM:** sí
+- **Descripción:** Persiste uno o ambos secrets en `secrets.json` y refresca el runtime en caliente. Acepta set parcial: si sólo viene un campo, el otro queda intacto.
+- **Campos aceptados (al menos uno requerido):**
+  - `config.ai_providers.openai.api_key` (string) — habilita razonamiento de archi.
+  - `config.storage.messages_db_url` (string) — habilita el panel "Messages" leyendo `storage_inbox` de storage.
+- **Campos opcionales del wrapper admin gateway:** `schema_version` (u32), `config_version` (u64), `apply_mode` (string). Los toma archi pero los ignora; el handler local persiste atómicamente.
+- **Respuesta clave:**
+  - `payload.ai_configured` (bool) — runtime AI listo después del set.
+  - `payload.messages_db_configured` (bool) — URL guardada.
+  - `payload.messages_db_connected` (bool) — connect a Postgres efectivamente exitoso.
+  - `payload.messages_db_connect_error` (string | null) — mensaje exacto de Postgres si `messages_db_connected=false`.
+  - `payload.stored_secrets[]` — qué se persistió en este call.
+- **Nota crítica:** la URL apunta al **Postgres de storage**, en la base `fluxbee_storage` (NO `fluxbee` — storage usa `STORAGE_DB_NAME=fluxbee_storage` internamente). Cualquier user con `SELECT` sobre `storage_inbox` alcanza; reusar la misma URL que storage usa es válido. archi sólo ejecuta `SELECT` sobre `storage_inbox`.
+- **Endpoints relacionados que habilita:** `GET /api/messages` (lista paginada), `GET /api/messages/stream` (SSE tail), `GET /api/messages/{dedupe_key}` (detalle).
 
 ---
 

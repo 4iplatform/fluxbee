@@ -1,9 +1,9 @@
 # Messages Log Viewer — Implementation Tasks
 
-**Status:** drafted, not started
-**Date:** 2026-05-08
+**Status:** phases 1–7 complete; manual smoke confirmed by operator on 2026-05-10
+**Date:** 2026-05-08 (drafted) → 2026-05-10 (closed)
 **Audience:** `SY.architect` developers
-**Related docs:** `docs/13-storage.md`, `docs/onworking COA/archi/admin_help_reference.md`
+**Related docs:** `docs/13-storage.md`, `docs/onworking COA/archi/admin_help_reference.md`, `docs/onworking COA/archi/handbook_fluxbee.md`
 
 ---
 
@@ -85,19 +85,19 @@ The operator just needs a Postgres connection string that can read `storage_inbo
 
 archi already has the secret-record machinery ([sy_architect.rs:9115](../../../src/bin/sy_architect.rs#L9115), [sy_architect.rs:4904](../../../src/bin/sy_architect.rs#L4904)). It currently stores **one** key (`ARCHITECT_LOCAL_SECRET_KEY_OPENAI`). Goal: add a second key without breaking the first.
 
-- [ ] `MSGS-T1` Define constant `ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL = "messages_db_url"` (next to `ARCHITECT_LOCAL_SECRET_KEY_OPENAI` at [sy_architect.rs:86](../../../src/bin/sy_architect.rs#L86)).
+- [x] `MSGS-T1` Define constant `ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL = "messages_db_url"` (next to `ARCHITECT_LOCAL_SECRET_KEY_OPENAI` at [sy_architect.rs:86](../../../src/bin/sy_architect.rs#L86)).
 - [ ] ~~`MSGS-T2` Define enum~~ **DROPPED.** archi today does not use a `SecretSource` enum for the OpenAI key (only `ai_configured: AtomicBool` + `ai_runtime: Arc<Mutex<Option<...>>>`). To match the established archi pattern, MSGS-T4 mirrors that lightweight shape instead.
-- [ ] `MSGS-T3` Implement `resolve_messages_db_url(node_name: &str) -> Option<String>` that reads `secrets.json` via `load_architect_secret_record(...)` and extracts `secrets[ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL]` as a non-empty string. Returns `None` when missing or empty.
-- [ ] `MSGS-T4` Extend `ArchitectState` (at [sy_architect.rs:315](../../../src/bin/sy_architect.rs#L315)) with two fields, mirroring the existing OpenAI pair:
+- [x] `MSGS-T3` Implement `resolve_messages_db_url(node_name: &str) -> Option<String>` that reads `secrets.json` via `load_architect_secret_record(...)` and extracts `secrets[ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL]` as a non-empty string. Returns `None` when missing or empty.
+- [x] `MSGS-T4` Extend `ArchitectState` (at [sy_architect.rs:315](../../../src/bin/sy_architect.rs#L315)) with two fields, mirroring the existing OpenAI pair:
   - `messages_db_configured: AtomicBool`
   - `messages_db_url: Arc<RwLock<Option<String>>>` (the resolved URL string; Phase 2 reads this to build the Postgres client)
-- [ ] `MSGS-T5` Generalize `handle_architect_local_config_set`:
+- [x] `MSGS-T5` Generalize `handle_architect_local_config_set`:
   - Accept `config.storage.messages_db_url` (string) in the body in addition to the existing OpenAI field.
   - Partial set semantics: each field is independent. If only one is present, leave the other untouched. If neither is present, return error (matches today's behavior for OpenAI).
   - Persist via the same `save_node_secret_record_with_root` path; `secrets.insert(...)` adds the new key without disturbing OpenAI.
   - Response payload `stored_secrets` array includes a second descriptor when the DB url was set.
-- [ ] `MSGS-T6` Extend the GET-config response (`load_architect_secret_record` consumer around [sy_architect.rs:9050](../../../src/bin/sy_architect.rs#L9050)) to emit a second `NodeSecretDescriptor` for the messages DB url with `state: configured | missing_secret`.
-- [ ] `MSGS-T7` On archi startup, call `resolve_messages_db_url` and stash the source in control state. Do **not** fail boot if missing — feature degrades gracefully (the Messages section shows a "Not configured. Use CONFIG SET to set `messages_db_url`." panel).
+- [x] `MSGS-T6` Extend the GET-config response (`load_architect_secret_record` consumer around [sy_architect.rs:9050](../../../src/bin/sy_architect.rs#L9050)) to emit a second `NodeSecretDescriptor` for the messages DB url with `state: configured | missing_secret`.
+- [x] `MSGS-T7` On archi startup, call `resolve_messages_db_url` and stash the source in control state. Do **not** fail boot if missing — feature degrades gracefully (the Messages section shows a "Not configured. Use CONFIG SET to set `messages_db_url`." panel).
 
 **Acceptance:**
 - `architect_local_config_set` with only OpenAI still works exactly as before.
@@ -110,12 +110,12 @@ archi already has the secret-record machinery ([sy_architect.rs:9115](../../../s
 
 ## Phase 2 — Postgres read-only client in archi
 
-- [ ] `MSGS-T8` Add `tokio_postgres` as a dependency on the archi binary (storage already uses it — same crate, NoTls). No new top-level dep beyond what storage already pulls in.
-- [ ] `MSGS-T9` Create a `MessagesDb` module under `src/bin/sy_architect/messages_db.rs`:
+- [x] `MSGS-T8` Add `tokio_postgres` as a dependency on the archi binary (storage already uses it — same crate, NoTls). No new top-level dep beyond what storage already pulls in.
+- [x] `MSGS-T9` Create a `MessagesDb` module under `src/bin/sy_architect/messages_db.rs`:
   - Wraps a `tokio_postgres::Client` (or a small pool — start with a single client; if contention shows up, switch to `deadpool-postgres` later).
   - Constructor `MessagesDb::connect(connection_string) -> Result<Self, ArchitectError>`.
   - Reconnect-on-error loop with exponential backoff (mirror what storage does).
-- [ ] `MSGS-T10` Define query method `list_messages(cursor: Option<MessagesCursor>, filters: MessagesFilters, limit: u32) -> Result<Vec<MessagesRow>>`:
+- [x] `MSGS-T10` Define query method `list_messages(cursor: Option<MessagesCursor>, filters: MessagesFilters, limit: u32) -> Result<Vec<MessagesRow>>`:
   - Cursor is `(received_at, dedupe_key)` tuple, descending.
   - SQL:
     ```sql
@@ -130,9 +130,9 @@ archi already has the secret-record machinery ([sy_architect.rs:9115](../../../s
     LIMIT $5;
     ```
   - `MessagesRow`: includes a parsed-or-raw payload representation. Detail view needs the JSON; list view does not — so list endpoint can avoid sending `payload` (only size + summary).
-- [ ] `MSGS-T11` Define `tail_since(after: (TimestampTz, String)) -> Result<Vec<MessagesRow>>` for the SSE poller:
+- [x] `MSGS-T11` Define `tail_since(after: (TimestampTz, String)) -> Result<Vec<MessagesRow>>` for the SSE poller:
   - Same projection but filtered by `received_at > $1 OR (received_at = $1 AND dedupe_key > $2)`, ordered ASC, bounded LIMIT (e.g., 500 — backstop in case of bursts).
-- [ ] `MSGS-T12` Implement `get_message(dedupe_key) -> Result<Option<MessagesRow>>` that returns the row including the decoded payload (BYTEA → utf8 → serde_json::Value, or raw text if not valid JSON — never panic).
+- [x] `MSGS-T12` Implement `get_message(dedupe_key) -> Result<Option<MessagesRow>>` that returns the row including the decoded payload (BYTEA → utf8 → serde_json::Value, or raw text if not valid JSON — never panic).
 
 **Acceptance:**
 - Connection initializes when `messages_db_url` is configured at boot.
@@ -143,13 +143,13 @@ archi already has the secret-record machinery ([sy_architect.rs:9115](../../../s
 
 ## Phase 3 — `/api/messages` (paginated list)
 
-- [ ] `MSGS-T13` Register route `GET /api/messages` in the axum router around [sy_architect.rs:4622](../../../src/bin/sy_architect.rs#L4622), routed through the existing `dynamic_handler`.
-- [ ] `MSGS-T14` Implement handler. Query params:
+- [x] `MSGS-T13` Register route `GET /api/messages` in the axum router around [sy_architect.rs:4622](../../../src/bin/sy_architect.rs#L4622), routed through the existing `dynamic_handler`.
+- [x] `MSGS-T14` Implement handler. Query params:
   - `cursor` — opaque base64 of `{"ts": "...", "dk": "..."}`. Optional (first page).
   - `limit` — default 200, max 500.
   - `since` — one of `15m | 1h | 24h | all` (server resolves to absolute timestamp).
   - `with_error` — `true | false`. Optional (default: include both).
-- [ ] `MSGS-T15` Response shape:
+- [x] `MSGS-T15` Response shape:
   ```json
   {
     "items": [
@@ -169,10 +169,10 @@ archi already has the secret-record machinery ([sy_architect.rs:9115](../../../s
   ```
   - `ich` is extracted from the payload during query (cheap pre-parse for the small subset of fields the list needs — see MSGS-T16).
   - Payload itself is **not** included in the list response.
-- [ ] `MSGS-T16` `ich` extraction strategy:
+- [x] `MSGS-T16` `ich` extraction strategy:
   - Try a JSON path inside payload (e.g., `envelope.ich` or whatever the canonical location is — verify against actual envelopes in `storage_inbox` before fixing the path).
   - If extraction fails, return `null` for `ich` — never block the row.
-- [ ] `MSGS-T17` Error handling:
+- [x] `MSGS-T17` Error handling:
   - If `MessagesDb` is unavailable → `503` with body `{"error": "messages_db_not_configured"}`. Frontend renders the empty-state.
   - If query fails → `500` with redacted error message.
 
@@ -185,17 +185,17 @@ archi already has the secret-record machinery ([sy_architect.rs:9115](../../../s
 
 ## Phase 4 — `/api/messages/stream` (SSE tail)
 
-- [ ] `MSGS-T18` Register route `GET /api/messages/stream`. Returns `text/event-stream`.
-- [ ] `MSGS-T19` Handler logic:
+- [x] `MSGS-T18` Register route `GET /api/messages/stream`. Returns `text/event-stream`.
+- [x] `MSGS-T19` Handler logic:
   - Open SSE connection. Initial cursor from `?after_ts=...&after_dk=...` query (defaults to "now" if absent).
   - Loop every 1000 ms: call `MessagesDb::tail_since(cursor)`, advance cursor to last seen row.
   - For each new row, emit `event: message\ndata: {<same row shape as list>}\n\n`.
   - Heartbeat every 15s with `: ping\n\n` to keep the connection alive through proxies.
   - Cancellation: stop loop when client disconnects (axum's `Sse` stream handles drop).
-- [ ] `MSGS-T20` Backpressure / safety:
+- [x] `MSGS-T20` Backpressure / safety:
   - If a tick returns ≥ 500 rows, log a warning and continue — likely the page was paused or the system bursted; consumer can refresh via `/api/messages` to resync.
   - If DB query fails, emit `event: error\ndata: {...}\n\n` and exit (let frontend reconnect with backoff).
-- [ ] `MSGS-T21` Concurrency: each open SSE keeps its own poll loop. For sane caps, register max simultaneous SSE per archi instance (e.g., 16) — beyond that return `503`.
+- [x] `MSGS-T21` Concurrency: each open SSE keeps its own poll loop. For sane caps, register max simultaneous SSE per archi instance (e.g., 16) — beyond that return `503`.
 
 **Acceptance:**
 - Open stream, insert a test row in storage_inbox, see it on the stream within ~1.5s.
@@ -207,17 +207,17 @@ archi already has the secret-record machinery ([sy_architect.rs:9115](../../../s
 
 The front-end is inlined as a Rust raw string at [sy_architect.rs:12485-16429](../../../src/bin/sy_architect.rs#L12485-L16429). All HTML/CSS/JS lives there.
 
-- [ ] `MSGS-T22` Add CSS for `.app-rail` (fixed left, ~56px, dark, vertical):
+- [x] `MSGS-T22` Add CSS for `.app-rail` (fixed left, ~56px, dark, vertical):
   - One slot per section: small icon (SVG) + tooltip on hover.
   - Active state: brighter background or accent bar on the left edge.
   - The rail sits **outside** `.workspace`. Layout becomes: `.page > .app-rail` + `.page > .main-stage`, and `.main-stage` contains masthead + workspace.
-- [ ] `MSGS-T23` Add JS hash router:
+- [x] `MSGS-T23` Add JS hash router:
   - Parse `location.hash` → section id (`archi` | `messages`).
   - Default `#/archi` if empty or unknown.
   - On `hashchange`, swap the visible section, update active rail item, lazy-init the section's JS module on first entry.
-- [ ] `MSGS-T24` Wrap the existing chat workspace (sidebar + shell) in `<section data-section="archi">`. No DOM/CSS changes inside; just enclose. Hidden via `display:none` when not active.
-- [ ] `MSGS-T25` Add a new `<section data-section="messages">` skeleton (filled in Phase 6). Hidden by default.
-- [ ] `MSGS-T26` Rail icons for MVP:
+- [x] `MSGS-T24` Wrap the existing chat workspace (sidebar + shell) in `<section data-section="archi">`. No DOM/CSS changes inside; just enclose. Hidden via `display:none` when not active.
+- [x] `MSGS-T25` Add a new `<section data-section="messages">` skeleton (filled in Phase 6). Hidden by default.
+- [x] `MSGS-T26` Rail icons for MVP:
   - Archi → chat-bubble icon, label "Archi"
   - Messages → list-with-lightning icon, label "Messages"
   - Reserve a "more sections" pattern in the JS so adding `cognitive` later is one entry.
@@ -232,7 +232,7 @@ The front-end is inlined as a Rust raw string at [sy_architect.rs:12485-16429](.
 
 ## Phase 6 — Vista Messages
 
-- [ ] `MSGS-T27` HTML skeleton inside `<section data-section="messages">`:
+- [x] `MSGS-T27` HTML skeleton inside `<section data-section="messages">`:
   ```
   .messages-view
     .messages-toolbar      (filters: temporal window dropdown + with-error toggle + status pill "live | paused")
@@ -243,12 +243,12 @@ The front-end is inlined as a Rust raw string at [sy_architect.rs:12485-16429](.
         .messages-detail-json   (pretty-printed payload, copy button)
         .messages-detail-empty  (shown when no row selected)
   ```
-- [ ] `MSGS-T28` CSS:
+- [x] `MSGS-T28` CSS:
   - List row two-line layout (Line 1 mono small; Line 2 muted smaller).
   - Status icon: `✓` (processed_at NOT NULL, last_error NULL), `…` (processed_at NULL), `!` (last_error NOT NULL, red).
   - Selected row: subtle accent border on the left, slightly elevated background.
   - JSON pane: monospace, comfortable line-height, syntax-color via a tiny inline highlighter (or just bold keys). Avoid heavyweight libs.
-- [ ] `MSGS-T29` JS module `messages-view.js` (inlined in the same raw string):
+- [x] `MSGS-T29` JS module `messages-view.js` (inlined in the same raw string):
   - State: `{ rows: [], selected: null, cursor: null, live: true, eventSource: null, filters: { since: 'all', withError: null } }`.
   - `loadInitial()` → `GET /api/messages?since=...&limit=200` → `state.rows`, `state.cursor = response.next_cursor`.
   - `loadMore()` → uses cursor.
@@ -256,9 +256,9 @@ The front-end is inlined as a Rust raw string at [sy_architect.rs:12485-16429](.
   - `selectRow(dedupe_key)` → `GET /api/messages/<dedupe_key>` (see MSGS-T31) → render detail.
   - On filter change: cancel stream, reload from scratch, restart stream.
   - On section deactivate: cancel stream.
-- [ ] `MSGS-T30` Empty / unconfigured state:
+- [x] `MSGS-T30` Empty / unconfigured state:
   - If `/api/messages` returns 503 `messages_db_not_configured`, render a single-pane informational panel: "messages_db_url no está configurado en archi. Setealo via CONFIG SET para habilitar este panel."
-- [ ] `MSGS-T31` Single-message endpoint `GET /api/messages/<dedupe_key>`:
+- [x] `MSGS-T31` Single-message endpoint `GET /api/messages/<dedupe_key>`:
   - Returns full row including decoded payload.
   - Used by the detail panel to fetch the JSON only when the user clicks (avoids sending payloads for every list row).
 
@@ -273,15 +273,15 @@ The front-end is inlined as a Rust raw string at [sy_architect.rs:12485-16429](.
 
 ## Phase 7 — Wiring & smoke test
 
-- [ ] `MSGS-T32` Smoke checklist (manual, no automated E2E in this iteration):
+- [x] `MSGS-T32` Smoke checklist (manual, no automated E2E in this iteration):
   - With a fresh archi instance, neither secret configured → boot succeeds, chat works, Messages section shows empty state.
   - Configure OpenAI only via existing flow → unchanged.
   - Configure `messages_db_url` only → Messages section becomes functional, chat unaffected.
   - Configure both → both work.
   - Send messages through NATS so storage_inbox grows → list reflects them, detail JSON renders.
   - Error rows (last_error populated) render with red `!` and surface `last_error` in the detail meta.
-- [ ] `MSGS-T33` Update [admin_help_reference.md](./admin_help_reference.md) with the new CONFIG SET field `config.storage.messages_db_url` and a short note on what enables.
-- [ ] `MSGS-T34` Add a brief section to [handbook_fluxbee.md](./handbook_fluxbee.md) describing the rail and the Messages view (one paragraph + one screenshot or ASCII once it exists).
+- [x] `MSGS-T33` Update [admin_help_reference.md](./admin_help_reference.md) with the new CONFIG SET field `config.storage.messages_db_url` and a short note on what enables.
+- [x] `MSGS-T34` Add a brief section to [handbook_fluxbee.md](./handbook_fluxbee.md) describing the rail and the Messages view (one paragraph + one screenshot or ASCII once it exists).
 
 ---
 
@@ -293,6 +293,22 @@ The front-end is inlined as a Rust raw string at [sy_architect.rs:12485-16429](.
 - Migrating storage's Postgres connection out of `EnvCompat` env-var fallback (separate cleanup if desired).
 - Pushing the SSE through a NATS-direct path instead of DB polling (only worth doing if 1s latency proves insufficient).
 - Authn/authz for the Messages view (the design says "no permisos en esta página" — revisit when archi gains general operator gating).
+
+---
+
+## Findings During Implementation / Smoke Testing
+
+These came up while wiring everything together. Recorded so future iterations don't re-discover them:
+
+1. **storage uses `fluxbee_storage`, not `fluxbee` as DB name** ([`STORAGE_DB_NAME`](../../../src/bin/sy_storage.rs#L67)). archi's `messages_db_url` must point at `fluxbee_storage`. The base `fluxbee` exists (Postgres allows a connection there) so `connect()` succeeds, but `SELECT FROM storage_inbox` fails with `relation does not exist`. The unconfigured card now spells this out.
+2. **Frontend URL prefix**: archi is served behind nginx under `/archi/`, so `fetch('/api/messages')` must be prefixed with `window.location.pathname`. Mirrored the existing `base` pattern from the original chat JS.
+3. **`[hidden]` UA stylesheet loses to author CSS at equal specificity** — added `.messages-view [hidden] { display: none !important; }` to keep the unconfigured card and other toggled elements actually hidden when `hidden` is set.
+4. **`.section-shell` wrapper crushed the chat composer**: original `.workspace` was a direct grid item of `.page` with explicit row height; wrapping it in `.section-shell` removed that height inheritance. Fixed by giving `.section-shell` `display: grid; grid-template-rows: minmax(0, 1fr)` so its child fills the row. The messages-view's own `display: grid` overrides this via cascade order (later wins).
+5. **`refresh_architect_messages_db_url` returned only "URL stored", silently swallowing connect failures**. Refactored to return `(url_set, connected, connect_error)` tuple, so the SCMD response now reports `messages_db_connected` + `messages_db_connect_error` with the exact Postgres error.
+6. **Postgres error rendering was too parse**: `tokio_postgres::Error` Display is generic ("db error"). `MessagesDbError` now uses `as_db_error()` to surface `severity (code): message` so failures like `relation "storage_inbox" does not exist` are visible end-to-end.
+7. **SSE through nginx is fragile by default**: lowered keep-alive to 5s and emitted an initial `event: ready / data: ok` at stream open to flush headers immediately. Added `readyState` to the frontend error pill (`error: connecting` vs `error: closed`) for diagnosis. nginx-side fixes (`proxy_buffering off`, longer `proxy_read_timeout`) are out of scope but documented as a follow-up if needed.
+8. **Frontend retry on re-entry**: `activate()` originally short-circuited with `if (activated) return`, leaving a failed first attempt frozen. Now skips only when `activated && initialLoaded && eventSource` — i.e. re-entry retries on prior failure. Click on already-active rail icon also forces a refresh of Messages.
+9. **Read-only role enforcement was over-engineered for v1**: original plan required a dedicated `archi_messages_reader` role. Operator decided that's not viable as a hard requirement (no automated provisioning yet). archi's queries are exclusively `SELECT` so the privilege gap is not exercised — the operator simply hands over any URL that can read `storage_inbox`, including reusing storage's own connection string. Provisioning can come later as a separate task if/when threat model demands.
 
 ---
 

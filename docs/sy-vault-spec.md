@@ -1,7 +1,7 @@
 # Fluxbee — SY.vault Specification
 
-**Status:** v1.0 draft — ready for implementation
-**Date:** 2026-04-17
+**Status:** v1.1 draft — implementation-ready after closed design decisions
+**Date:** 2026-05-10
 **Audience:** SY.vault developer, SDK maintainers, Archi designers
 **Related:** `10-identity-v2.md`, `01-arquitectura.md`, `executor_manifest_pilot_spec.md`
 
@@ -25,17 +25,19 @@ The design prioritizes simplicity and operability over cryptographic completenes
 
 ## 2. Design principles
 
-**2.1 Trust the router for source authentication.** When a message arrives at the vault, `routing.src_l2_name`, `routing.src_ilk`, and `routing.src_tenant_id` are already validated by the router (canonicalization). The vault does not re-authenticate clients.
+**2.1 Trust the router for source authentication.** When a message arrives at the vault, `routing.src_l2_name` and `meta.src_ilk` are already validated/canonicalized by the router. The vault does not re-authenticate clients. It resolves tenant and ILK type from identity SHM using the canonical `meta.src_ilk`.
 
-**2.2 Encrypt at rest, not in transit.** Secret values are encrypted in the database. Messages in transit travel through the standard Fluxbee routing infrastructure without additional encryption. Cross-hive encryption is the router's responsibility (see §13).
+**2.2 Encrypt at rest, not in transit.** Secret values are encrypted in the database. Messages in transit travel through the standard Fluxbee routing infrastructure without additional encryption. Cross-hive encryption is the router's responsibility (see §14).
 
 **2.3 Single L2 protocol.** Vault speaks the same L2 protocol as any other node. No HTTP API, no certificates, no TLS endpoints. Simplicity over complexity.
 
 **2.4 Authorization in vault.** Until OPA integration is ready, the vault implements its own authorization rules based on the requester's identity. These rules are hardcoded in v1 and migrate to OPA later.
 
-**2.5 Self-contained.** Vault has its own SQLite database, its own master key, its own audit log. No dependencies on identity beyond reading the standard SHM region for ILK metadata.
+**2.5 Self-contained secret storage.** Vault has its own SQLite database, its own master key, and its own audit log. Secret storage does not depend on `SY.storage`, Postgres, NATS persistence, or any node-local `secrets.json`. Vault does read identity SHM for authorization metadata (`tenant_id`, `ilk_type`, status) because the current L2 protocol does not carry `src_tenant_id`.
 
 **2.6 Append-only audit.** Every operation is logged with full context. Audit log is tamper-evident in design (append-only table) but not cryptographically signed in v1.
+
+**2.7 Canonical secret backend.** This is a monolithic replacement for node-local secret persistence in the alpha line. New secret writes go through `SY.admin -> SY.vault`; nodes consume secrets through SDK helpers. The previous `secrets.json` model is deprecated for new writes once vault is enabled.
 
 ---
 
@@ -45,7 +47,7 @@ The design prioritizes simplicity and operability over cryptographic completenes
 
 **T1: A node legitimately registered in Fluxbee tries to read secrets it should not access.**
 
-Mitigation: vault checks `src_ilk` against secret metadata (`owner_ilk`, `tenant_id`). Returns error if not authorized.
+Mitigation: vault checks canonical `meta.src_ilk` against secret metadata (`owner_ilk`, `tenant_id`) and identity SHM metadata. Returns error if not authorized.
 
 **T2: A node tries to impersonate another node when requesting a secret.**
 
@@ -65,7 +67,7 @@ Mitigation: every vault operation logs source identity, timestamp, operation, ke
 
 ### 3.2 Threats explicitly NOT addressed in v1
 
-**T6: Network sniffing between hives.** Cross-hive TCP traffic is not encrypted at the vault level. This is the router's responsibility (see §13).
+**T6: Network sniffing between hives.** Cross-hive TCP traffic is not encrypted at the vault level. This is the router's responsibility (see §14).
 
 **T7: Compromise of the running vault process.** If an attacker executes code in the vault process, they have access to the master key in memory and to all secrets. No software defense against this — the vault process is a trusted boundary.
 
@@ -121,7 +123,7 @@ CREATE TABLE audit_log (
     caller_l2_name VARCHAR(128),
     caller_ilk VARCHAR(64),
     caller_tenant_id VARCHAR(64),
-    result VARCHAR(16) NOT NULL,     -- 'success' | 'denied' | 'error'
+    result VARCHAR(16) NOT NULL,     -- 'success' | 'noop' | 'denied' | 'error'
     error_code VARCHAR(32)
 );
 
@@ -145,9 +147,11 @@ CREATE INDEX idx_audit_operation ON audit_log(operation);
 
 **No HSM / KMS in v1.** The master key lives in plaintext on disk. This is an explicit tradeoff for simplicity. The host is the trust boundary.
 
-### 4.4 No SHM
+### 4.4 SHM usage
 
-The vault does not write to or read from the identity SHM region. It receives all client identity via L2 message canonicalization. No SHM region for vault data — secrets are never in shared memory.
+The vault does not write vault data to SHM and never places secret values in shared memory.
+
+The vault does read identity SHM for authorization because the current message shape has `meta.src_ilk` but no `src_tenant_id` field. The SHM lookup is used only to resolve caller `tenant_id`, `ilk_type`, and active/deleted status from the canonical ILK.
 
 ---
 
@@ -157,15 +161,15 @@ The vault does not write to or read from the identity SHM region. It receives al
 
 ```json
 {
-  "key": "tnt:acme:slack-webhook-support",
+  "key": "tenant:techline:slack-webhook-support",
   "value": { "webhook_url": "https://hooks.slack.com/services/...", "channel": "#support" },
   "metadata": {
-    "tenant_id": "tnt:acme",
-    "owner_ilk": "ilk:io-slack-acme",
-    "description": "Slack webhook for Acme support mirror channel",
-    "created_by": "ilk:admin-cesar",
-    "created_at": "2026-04-17T10:00:00Z",
-    "tags": ["solution:acme-support", "channel:slack"]
+    "tenant_id": "tnt:85e6eefe-6034-47ee-969d-a05a4189873b",
+    "owner_ilk": "ilk:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    "description": "Slack webhook for Techline support mirror channel",
+    "created_by": "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    "created_at": "2026-05-10T10:00:00Z",
+    "tags": ["solution:techline-support", "channel:slack"]
   }
 }
 ```
@@ -187,7 +191,7 @@ Recommended convention (not enforced):
 Where `scope` is one of:
 
 - `sys:` — system-wide secrets (master credentials, infrastructure)
-- `tnt:<tenant>:` — secrets owned by a specific tenant
+- `tenant:<tenant-slug>:` — human-readable tenant-scoped keys
 - `node:<node-name>:` — secrets specific to a single node
 - `solution:<solution-name>:` — secrets for a specific solution
 
@@ -196,27 +200,29 @@ Examples:
 ```
 sys:openai-api-key
 sys:postgres-master-password
-tnt:acme:slack-webhook-support
-tnt:acme:quickbooks-credentials
-node:io-slack-acme:webhook-url
-solution:acme-billing:stripe-api-key
+tenant:techline:slack-webhook-support
+tenant:techline:quickbooks-credentials
+node:io-slack-support:bot-token
+solution:techline-billing:stripe-api-key
 ```
 
 The vault accepts any key matching `^[a-z0-9][a-z0-9:_-]{0,255}$`.
+
+Key text is not authoritative for authorization. Authorization uses `metadata.tenant_id` and `metadata.owner_ilk`, not a tenant slug parsed from the key.
 
 ### 5.3 Metadata fields
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `tenant_id` | string | Yes | Tenant the secret belongs to. Used for authorization. |
+| `tenant_id` | string | Yes | Canonical tenant the secret belongs to. Must be `tnt:<uuid>` or `sys`. Used for authorization. |
 | `owner_ilk` | string | Yes | ILK that "owns" the secret (typically the consumer). |
 | `description` | string | No | Free-text description for humans. |
-| `created_by` | string | Auto-filled | ILK that created the secret (from `routing.src_ilk`). |
+| `created_by` | string | Auto-filled | ILK that created the secret (from canonical `meta.src_ilk`). |
 | `created_at` | timestamp | Auto-filled | When the secret was created. |
 | `updated_at` | timestamp | Auto-filled | Last update. |
 | `tags` | string[] | No | Free-form tags for filtering/organization. |
 
-The vault auto-fills `created_by` from the message's canonicalized source. Other fields come from the request.
+The vault auto-fills `created_by` from the message's canonicalized source. Other fields come from the request. Any request-provided `created_by`, `created_at`, or `updated_at` is ignored or rejected.
 
 ### 5.4 Versioning
 
@@ -263,26 +269,27 @@ Create or update a secret.
 **Request:**
 ```json
 {
-  "key": "tnt:acme:slack-webhook-support",
+  "key": "tenant:techline:slack-webhook-support",
   "value": { "webhook_url": "https://hooks.slack.com/...", "channel": "#support" },
   "metadata": {
-    "tenant_id": "tnt:acme",
-    "owner_ilk": "ilk:io-slack-acme",
-    "description": "Slack webhook for Acme support",
-    "tags": ["solution:acme-support"]
+    "tenant_id": "tnt:85e6eefe-6034-47ee-969d-a05a4189873b",
+    "owner_ilk": "ilk:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    "description": "Slack webhook for Techline support",
+    "tags": ["solution:techline-support"]
   }
 }
 ```
 
-`tenant_id` and `owner_ilk` are required in metadata. `created_by` is auto-filled from `routing.src_ilk` and rejects any value provided in the request.
+`tenant_id` and `owner_ilk` are required in metadata. `tenant_id` must be `tnt:<uuid>` or `sys`. `created_by` is auto-filled from canonical `meta.src_ilk` and rejects any value provided in the request.
 
 **Response (success):**
 ```json
 {
   "status": "ok",
-  "key": "tnt:acme:slack-webhook-support",
+  "key": "tenant:techline:slack-webhook-support",
   "version": 1,
-  "created_at": "2026-04-17T10:00:00Z"
+  "created_at": "2026-05-10T10:00:00Z",
+  "changed": true
 }
 ```
 
@@ -300,23 +307,23 @@ Retrieve the value and metadata of a secret.
 
 **Request:**
 ```json
-{ "key": "tnt:acme:slack-webhook-support" }
+{ "key": "tenant:techline:slack-webhook-support" }
 ```
 
 **Response (success):**
 ```json
 {
   "status": "ok",
-  "key": "tnt:acme:slack-webhook-support",
+  "key": "tenant:techline:slack-webhook-support",
   "value": { "webhook_url": "https://hooks.slack.com/...", "channel": "#support" },
   "metadata": {
-    "tenant_id": "tnt:acme",
-    "owner_ilk": "ilk:io-slack-acme",
-    "description": "Slack webhook for Acme support",
-    "created_by": "ilk:admin-cesar",
-    "created_at": "2026-04-17T10:00:00Z",
-    "updated_at": "2026-04-17T10:00:00Z",
-    "tags": ["solution:acme-support"]
+    "tenant_id": "tnt:85e6eefe-6034-47ee-969d-a05a4189873b",
+    "owner_ilk": "ilk:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    "description": "Slack webhook for Techline support",
+    "created_by": "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    "created_at": "2026-05-10T10:00:00Z",
+    "updated_at": "2026-05-10T10:00:00Z",
+    "tags": ["solution:techline-support"]
   },
   "version": 1
 }
@@ -339,9 +346,9 @@ List secrets, optionally filtered. Values are NEVER returned in this operation.
 ```json
 {
   "filter": {
-    "prefix": "tnt:acme:",
-    "tags": ["solution:acme-support"],
-    "tenant_id": "tnt:acme"
+    "prefix": "tenant:techline:",
+    "tags": ["solution:techline-support"],
+    "tenant_id": "tnt:85e6eefe-6034-47ee-969d-a05a4189873b"
   }
 }
 ```
@@ -355,13 +362,13 @@ All filter fields are optional. If no filter, lists all secrets the caller is au
   "count": 3,
   "secrets": [
     {
-      "key": "tnt:acme:slack-webhook-support",
+      "key": "tenant:techline:slack-webhook-support",
       "metadata": {
-        "tenant_id": "tnt:acme",
-        "owner_ilk": "ilk:io-slack-acme",
-        "description": "Slack webhook for Acme support",
-        "created_at": "2026-04-17T10:00:00Z",
-        "tags": ["solution:acme-support"]
+        "tenant_id": "tnt:85e6eefe-6034-47ee-969d-a05a4189873b",
+        "owner_ilk": "ilk:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "description": "Slack webhook for Techline support",
+        "created_at": "2026-05-10T10:00:00Z",
+        "tags": ["solution:techline-support"]
       },
       "version": 1
     }
@@ -375,14 +382,14 @@ Remove a secret permanently. Includes both current and previous versions.
 
 **Request:**
 ```json
-{ "key": "tnt:acme:slack-webhook-support" }
+{ "key": "tenant:techline:slack-webhook-support" }
 ```
 
 **Response:**
 ```json
 {
   "status": "ok",
-  "key": "tnt:acme:slack-webhook-support",
+  "key": "tenant:techline:slack-webhook-support",
   "deleted": true
 }
 ```
@@ -439,14 +446,14 @@ Get only metadata, no value. Useful for inspection without granting access to th
 
 **Request:**
 ```json
-{ "key": "tnt:acme:slack-webhook-support" }
+{ "key": "tenant:techline:slack-webhook-support" }
 ```
 
 **Response:**
 ```json
 {
   "status": "ok",
-  "key": "tnt:acme:slack-webhook-support",
+  "key": "tenant:techline:slack-webhook-support",
   "metadata": { ... },
   "version": 1,
   "last_accessed_at": "2026-04-17T15:00:00Z",
@@ -464,6 +471,14 @@ This operation has more permissive authorization than GET — it can be authoriz
 
 Hardcoded in vault. Migrate to OPA when OPA integration is mature.
 
+The vault extracts caller identity from the current L2 message shape:
+
+- `routing.src_l2_name` for node-level admin override.
+- `meta.src_ilk` for ILK-level ownership checks.
+- identity SHM lookup by `meta.src_ilk` for caller `tenant_id`, `ilk_type`, and status.
+
+If `meta.src_ilk` is missing for a non-admin caller, or if identity SHM cannot resolve an active ILK, the request is denied.
+
 **VAULT_PUT, VAULT_DELETE, VAULT_ROTATE, VAULT_ROLLBACK:**
 
 Allowed only if `routing.src_l2_name` matches one of:
@@ -476,8 +491,8 @@ Allowed only if `routing.src_l2_name` matches one of:
 Allowed if:
 
 - `routing.src_l2_name` matches `SY.admin@*` or `SY.architect@*` (admin override), OR
-- `routing.src_ilk == metadata.owner_ilk` (owner reads their own secret), OR
-- `routing.src_tenant_id == metadata.tenant_id` AND the requesting node is a `system` ILK type (system nodes within the same tenant can read tenant secrets).
+- `meta.src_ilk == metadata.owner_ilk` (owner reads their own secret), OR
+- caller tenant resolved from identity SHM equals `metadata.tenant_id` AND caller `ilk_type == "system"` (system nodes within the same tenant can read tenant secrets).
 
 For `system` secrets (`tenant_id == "sys"`), only admin and architect can read.
 
@@ -494,7 +509,7 @@ Same as VAULT_GET but also allows any node in the same tenant to read metadata (
 
 ### 7.2 Authorization audit
 
-Every authorization decision is logged. Denials are logged with `result: "denied"` and `error_code: "UNAUTHORIZED"`. Successes are logged with `result: "success"`.
+Every authorization decision is logged. Denials are logged with `result: "denied"` and `error_code: "UNAUTHORIZED"`. Successes are logged with `result: "success"`. Idempotent no-change writes are logged with `result: "noop"` and do not increment secret version.
 
 The audit log includes the full caller identity even on denials, which is critical for incident investigation.
 
@@ -510,7 +525,7 @@ The transition is non-breaking: as long as OPA's decisions match the current har
 
 ### 8.1 Logged operations
 
-Every vault operation, regardless of result, generates an audit log entry:
+Every vault operation, regardless of result, generates an audit log entry in the local SQLite database at `/var/lib/fluxbee/vault.db`. Audit is not sent through NATS, `SY.storage`, or a separate external database.
 
 ```sql
 INSERT INTO audit_log (timestamp, operation, key, caller_l2_name, caller_ilk, caller_tenant_id, result, error_code)
@@ -527,27 +542,29 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 
 In v1, the audit log grows indefinitely. The vault provides no automatic rotation or archival. If the log grows too large, the operator manually archives old entries (e.g., copy to file and delete from table).
 
-A future improvement is automatic rotation by date or by row count, with archived entries moved to compressed log files.
+A future improvement is automatic rotation by date or by row count, with archived entries moved to compressed log files. This remains local to the vault; it is not a NATS stream.
 
 ### 8.4 Audit log query
 
-There is no L2 verb to query the audit log in v1. The operator queries directly via `sqlite3 /var/lib/fluxbee/vault.db`. A future verb `VAULT_AUDIT_QUERY` may be added if needed by tooling.
+There is no L2 verb to query the audit log in v1. The operator queries directly via `sqlite3 /var/lib/fluxbee/vault.db`. A future audit read verb/admin action may be added if needed by tooling.
+
+There is also no admin action for audit reads in v1. Audit read UX is a later cross-system audit topic; v1 only guarantees local audit writes.
 
 ---
 
 ## 9. Trust model and message canonicalization
 
-### 9.1 Trusting routing.src_*
+### 9.1 Trusting canonical source fields
 
 The vault does NOT verify the identity of the message sender beyond what the router provides. Specifically:
 
 - `routing.src_l2_name` is trusted as the L2 name of the sending node.
-- `routing.src_ilk` is trusted as the ILK of the sending node.
-- `routing.src_tenant_id` is trusted as the tenant of the sending node.
+- `meta.src_ilk` is trusted as the canonical ILK of the sending node/user flow.
+- caller tenant and ILK type are resolved from identity SHM using `meta.src_ilk`.
 
 These fields are populated by the router during message canonicalization (the router validates that the actual sender matches the declared identity, based on socket peer information, ICH registration, and identity SHM).
 
-If a node attempts to forge `routing.src_*`, the router rejects the message before it reaches the vault.
+If a node attempts to forge canonical source identity, the router rejects or canonicalizes the message before it reaches the vault.
 
 ### 9.2 What this means for security
 
@@ -585,7 +602,9 @@ The vault does not maintain its own list of authorized nodes. It does not issue 
 5. Begin processing L2 messages
 ```
 
-The vault is operational immediately after step 5. No coordination with other SY nodes required at boot.
+The vault is operational immediately after step 5. Orchestrator manages it as a normal SY service. Other nodes do not block on vault readiness: they should start in their normal degraded/unconfigured state and begin functioning when their required secrets become available in vault and their reload/retry path succeeds.
+
+`sy-vault` uses the same service user and ownership model as the existing SY services. v1 does not introduce a dedicated `sy-vault` Unix user.
 
 ---
 
@@ -667,7 +686,52 @@ func VaultRollback(sender *Sender, key string) (*VaultRollbackResponse, error)
 
 Both SDKs send the corresponding L2 message to `SY.vault@<hive>` and parse the response.
 
-### 12.3 Caching considerations
+### 12.3 Vault references
+
+Secret-bearing node config should not carry plaintext once vault is enabled. It should carry vault references:
+
+```json
+{
+  "secrets": {
+    "openai": {
+      "api_key_ref": "vault://sys:openai-api-key"
+    }
+  }
+}
+```
+
+Reference format is intentionally simple in v1:
+
+```text
+vault://<key>
+```
+
+The string after `vault://` is the vault key exactly as stored in `secrets.key`.
+
+### 12.4 Retry helpers
+
+SDK consumers need a standard way to wait for a secret that is not loaded yet. The SDK should provide a bounded retry helper:
+
+```rust
+pub async fn vault_get_with_retry(
+    sender: &NodeSender,
+    key: &str,
+    policy: VaultRetryPolicy,
+) -> Result<VaultGetResponse, SdkError>;
+```
+
+Initial retry policy:
+
+- max elapsed: `60s`;
+- initial delay: `250ms`;
+- max delay: `5s`;
+- jitter: `20%`;
+- retry on `VAULT_UNAVAILABLE`, timeout, and `KEY_NOT_FOUND`;
+- do not retry on `UNAUTHORIZED`, `INVALID_KEY_FORMAT`, or `INVALID_VAULT_REF`.
+
+The first runtime to validate this behavior should be `SY.architect`: it should start without its OpenAI secret, retry/read from vault when configured, and move from missing-secret to configured without requiring a special orchestrator sequence.
+
+### 12.5 Caching considerations
 
 The SDK helpers do NOT cache responses by default. Each call is a fresh L2 round-trip.
 
@@ -677,15 +741,32 @@ If a secret is rotated, cached copies become stale. The node responsible for the
 
 ---
 
-## 13. Future: cross-hive TCP encryption (not part of vault)
+## 13. Secret write flow and node migration
 
-### 13.1 The problem
+Vault replaces node-local secret writes. Once vault is enabled, new secret-bearing configuration should use this flow:
+
+1. The node exposes required secret fields through its existing `CONFIG_GET` contract.
+2. `SY.admin` receives a secret-bearing config update from Archi/operator.
+3. `SY.admin` writes plaintext secret values to `SY.vault` via `VAULT_PUT`.
+4. `SY.admin` stores or forwards only non-secret config plus `vault://...` references.
+5. The node resolves the reference using SDK `vault_get` / `vault_get_with_retry`.
+6. If vault or the secret is not available, the node remains degraded/unconfigured and retries according to its runtime policy.
+
+Nodes should not persist new plaintext secrets to local `secrets.json`. Existing `secrets.json` support is legacy state and can be removed/migrated during this alpha iteration.
+
+The first end-to-end consumer for retry/read behavior is `SY.architect`: it should be able to start without its OpenAI secret, accept vault-backed configuration through admin, and become configured once `vault_get_with_retry` succeeds.
+
+---
+
+## 14. Future: cross-hive TCP encryption (not part of vault)
+
+### 14.1 The problem
 
 Today, routers in different hives communicate via plain TCP. Messages between hives travel without encryption. An attacker with network access between hives can capture traffic, including messages addressed to the vault from cross-hive nodes.
 
 This is NOT a vault concern. The vault operates at the L2 message layer, which is already abstracted from transport. The encryption (or lack thereof) of the underlying transport is the router's responsibility.
 
-### 13.2 Planned solution (not in v1)
+### 14.2 Planned solution (not in v1)
 
 A future enhancement to the router will add TLS to inter-hive TCP connections:
 
@@ -696,13 +777,13 @@ A future enhancement to the router will add TLS to inter-hive TCP connections:
 
 This work is independent of the vault and benefits all cross-hive communication, not just secret-related messages.
 
-### 13.3 Scope of this work for the vault
+### 14.3 Scope of this work for the vault
 
 When the router gains cross-hive TLS, the vault automatically benefits without any changes. The vault still receives L2 messages from the router; the router handles transport security transparently.
 
 The vault does not need to be aware of which transport its clients used.
 
-### 13.4 Estimated timeline
+### 14.4 Estimated timeline
 
 Cross-hive TLS for routers is a follow-up project after the vault is operational. Tentative:
 
@@ -713,7 +794,7 @@ There is no hard deadline. The work is triggered when multi-hive production depl
 
 ---
 
-## 14. Error codes
+## 15. Error codes
 
 | Code | Description |
 |---|---|
@@ -723,6 +804,8 @@ There is no hard deadline. The work is triggered when multi-hive production depl
 | `INVALID_KEY_FORMAT` | Key does not match `^[a-z0-9][a-z0-9:_-]{0,255}$` |
 | `INVALID_VALUE` | Value is not valid JSON or is too large (>1 MB) |
 | `INVALID_METADATA` | Metadata is missing required fields (`tenant_id`, `owner_ilk`) |
+| `INVALID_VAULT_REF` | Vault reference string is malformed |
+| `VAULT_UNAVAILABLE` | Vault service is not reachable or timed out |
 | `NO_PREVIOUS_VERSION` | VAULT_ROLLBACK called on a secret with no previous version |
 | `STORAGE_ERROR` | SQLite error |
 | `ENCRYPTION_ERROR` | AES-GCM error (should not happen in normal operation) |
@@ -732,7 +815,7 @@ For VAULT_GET and VAULT_LIST, denied access returns `UNAUTHORIZED` regardless of
 
 ---
 
-## 15. Implementation checklist
+## 16. Implementation checklist
 
 ```
 [ ] Generate master key on first boot if not present
@@ -749,16 +832,18 @@ For VAULT_GET and VAULT_LIST, denied access returns `UNAUTHORIZED` regardless of
 [ ] Implement VAULT_ROLLBACK handler
 [ ] Implement VAULT_GET_METADATA handler
 [ ] Authorization logic per §7
-[ ] Audit log writes for every operation (success and denial)
+[ ] Audit log writes for every operation (success, noop, denial, error)
 [ ] Update last_accessed_at and access_count on successful GETs
-[ ] Idempotency for PUT (same value → no version increment, no audit)
+[ ] Idempotency for PUT (same value -> no version increment, audit as noop)
 [ ] Lock file to prevent multiple instances
 [ ] Graceful shutdown (close SQLite cleanly)
 [ ] Boot validation: master key file permissions, db file permissions
 
 [ ] Rust SDK: vault_get, vault_put, vault_list, vault_delete, vault_rotate, vault_rollback
+[ ] Rust SDK: vault_get_with_retry and vault_ref parsing helpers
 [ ] Go SDK: same surface
 [ ] SDK error handling with typed errors
+[ ] SY.architect: use vault-backed secret read/retry for OpenAI key as first consumer
 
 [ ] Audit log size monitoring
 [ ] Documentation of operator procedures (init, backup, restore)
@@ -767,22 +852,22 @@ For VAULT_GET and VAULT_LIST, denied access returns `UNAUTHORIZED` regardless of
 
 ---
 
-## 16. Operator procedures
+## 17. Operator procedures
 
-### 16.1 Initialization
+### 17.1 Initialization
 
 On first deploy, no special steps. Vault generates its master key and database on first boot.
 
 ```bash
-# Vault binary installed at /usr/local/bin/sy-vault
+# Vault binary installed at /usr/bin/sy-vault
 # Configuration default at /etc/fluxbee/sy-vault.conf
 
 systemctl start sy-vault
 # or
-/usr/local/bin/sy-vault
+/usr/bin/sy-vault
 ```
 
-### 16.2 Backup
+### 17.2 Backup
 
 To backup the vault, copy two files:
 
@@ -795,18 +880,19 @@ sudo cp /etc/fluxbee/vault.master.key /backup/vault.master.key.YYYY-MM-DD
 
 Backup locations should have similar or stricter permissions than the originals.
 
-### 16.3 Restore
+### 17.3 Restore
 
 ```bash
 systemctl stop sy-vault
 sudo cp /backup/vault.db.YYYY-MM-DD /var/lib/fluxbee/vault.db
 sudo cp /backup/vault.master.key.YYYY-MM-DD /etc/fluxbee/vault.master.key
-sudo chown sy-vault:sy-vault /var/lib/fluxbee/vault.db
+# Ownership must match the same service user/group used by the other SY services.
+sudo chown <sy-service-user>:<sy-service-group> /var/lib/fluxbee/vault.db
 sudo chmod 0600 /etc/fluxbee/vault.master.key
 systemctl start sy-vault
 ```
 
-### 16.4 Audit log inspection
+### 17.4 Audit log inspection
 
 ```bash
 sqlite3 /var/lib/fluxbee/vault.db
@@ -815,7 +901,7 @@ sqlite3 /var/lib/fluxbee/vault.db
 > SELECT operation, COUNT(*) FROM audit_log GROUP BY operation;
 ```
 
-### 16.5 Audit log archival
+### 17.5 Audit log archival
 
 When the audit log grows too large:
 
@@ -830,9 +916,18 @@ VACUUM;
 EOF
 ```
 
+### 17.6 Alpha reset
+
+In the alpha development cycle, `fluxbee_cleanall.sh` full clean/reset may delete both:
+
+- `/var/lib/fluxbee/vault.db`
+- `/etc/fluxbee/vault.master.key`
+
+This intentionally destroys vault contents. The next vault boot generates a new database and master key.
+
 ---
 
-## 17. Decisions
+## 18. Decisions
 
 | Decision | Rationale |
 |---|---|
@@ -841,18 +936,26 @@ EOF
 | Master key in filesystem | Tradeoff for simplicity; relies on OS-level access control |
 | L2 only, no HTTP | Consistent with all other Fluxbee nodes |
 | Trust router canonicalization | Same trust model as identity and opa-rules |
+| Read identity SHM for auth | Current L2 messages carry `meta.src_ilk`, not `src_tenant_id`; SHM resolves tenant/type locally |
 | No mTLS / certificates in v1 | Vault doesn't have direct connections; canonicalization is sufficient |
 | Hardcoded authorization in v1 | OPA integration deferred; logic is straightforward enough to hardcode |
 | Audit log in same SQLite | Transactional with operations; single file to backup |
+| No NATS audit persistence | Avoids dependency/circularity; vault remains locally auditable even if other services are degraded |
 | Versioning: current + previous | Simple rollback; full history available via audit log |
 | Encryption at rest only | Channel encryption is router's responsibility |
 | Master key at first boot | No external setup; vault is self-bootstrapping |
+| Admin-centralized writes | Secret writes are centralized in `SY.admin -> SY.vault`; nodes consume through SDK helpers |
+| Deprecated node-local secret writes | `secrets.json` remains legacy/cleanup concern, not the new write path |
+| Same SY service user model | Avoids a new permissions branch in v1; dedicated user can be revisited for production hardening |
+| Alpha reset deletes DB/key | Current test workflow recreates the full platform from scratch |
+| No audit read API in v1 | v1 only writes local audit; integrated system audit is a later cross-system topic |
+| SDK retry defaults fixed | `60s` max elapsed, `250ms` initial delay, `5s` max delay, `20%` jitter |
 | No HSM/KMS in v1 | Adds operational complexity; not justified for piloto |
 | Cross-hive TLS deferred to router | Vault is transport-agnostic; router handles network security |
 
 ---
 
-## 18. References
+## 19. References
 
 | Topic | Document |
 |---|---|
@@ -864,7 +967,7 @@ EOF
 
 ---
 
-## 19. What is NOT in v1
+## 20. What is NOT in v1
 
 - TLS / mTLS (handled at router level, future)
 - Certificate-based authentication
@@ -876,8 +979,9 @@ EOF
 - Audit log signing for tamper-evidence
 - Hierarchical key paths (Vault-style `/secret/data/...`)
 - OPA integration (planned)
-- L2 verb to query audit log
+- L2/admin verb to query audit log
 - Automatic audit log rotation
 - Hot-reload notification on secret change (consumers re-query as needed)
 - Multi-instance / replication
 - Cross-hive vault federation
+- Support for new node-local plaintext `secrets.json` writes once vault is enabled

@@ -449,7 +449,9 @@ The resulting zip is the file you upload in Step 4.
 
 Open Archi in your browser (default `http://127.0.0.1:3000`).
 
-In the left sidebar, scroll to the **Publish Package** panel at the bottom.
+The left rail switches between sections; pick the chat-bubble icon (default landing) to access the operator chat. The list-with-lightning icon below it opens **Messages**, a read-only viewer of the system-wide ILK message log persisted by storage in `storage_inbox`. Messages requires a one-time CONFIG SET pointing at storage's database (`fluxbee_storage`); see [docs/onworking COA/archi/handbook_fluxbee.md §6.5](docs/onworking%20COA/archi/handbook_fluxbee.md) and [admin_help_reference.md `architect_local_config_set`](docs/onworking%20COA/archi/admin_help_reference.md) for the field shape.
+
+In the left sidebar of the chat section, scroll to the **Publish Package** panel at the bottom.
 
 1. Click the drop zone (or drag the `.zip` file onto it).
 2. Select the zip you created in Step 3.
@@ -871,19 +873,22 @@ curl -sS "$BASE/hives/$HIVE_ID/identity/ilks" | jq .
 curl -sS "$BASE/hives/$HIVE_ID/identity/ilks/$ILK_ID" | jq .
 
 # set cognitive definition hashes for an agent ILK
+# Body accepts role_hash, skill_hashes[], handbook_hashes[], and personality_hash (single, optional).
+# Omit personality_hash or set to null to leave personality unconfigured.
 curl -sS -X POST "$BASE/hives/$HIVE_ID/identity/ilks/$ILK_ID/definition" \
   -H "Content-Type: application/json" \
   -d '{
     "definition": {
       "role_hash": "1111111111111111111111111111111111111111111111111111111111111111",
       "skill_hashes": [],
-      "handbook_hashes": []
+      "handbook_hashes": [],
+      "personality_hash": "9f8e7d6c5b4a3210123456789abcdef0123456789abcdef0123456789abcdef0"
     }
   }' | jq .
 ```
 
 `GET /hives/{hive}/identity/ilks` returns a compact row per ILK with `ilk_id`, `ilk_type`, `registration_status`, `tenant_id`, `tenant_name`, `display_name`, `node_name`, `channel_count`, `channels` (`ich_id`, `channel_type`, `address`), and `deleted_at_ms`.
-`POST /hives/{hive}/identity/ilks/{ilk_id}/definition` forwards `ILK_SET_DEFINITION` to `SY.identity`; identity validates the target is an agent ILK and publishes the hash facts to identity SHM for router/OPA projection.
+`POST /hives/{hive}/identity/ilks/{ilk_id}/definition` forwards `ILK_SET_DEFINITION` to `SY.identity`; identity validates the target is an agent ILK and publishes the hash facts to identity SHM for router/OPA projection. The body accepts the agent's four cognitive asset references — `role_hash`, `skill_hashes[]`, `handbook_hashes[]`, and `personality_hash` (the last is optional and represents nationality, languages, timezone, biography). See [docs/identity-v2.1-agent-definition-addendum.md](docs/identity-v2.1-agent-definition-addendum.md) for the full schema.
 
 ### Debug message to one node
 

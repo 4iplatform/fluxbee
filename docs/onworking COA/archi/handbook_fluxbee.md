@@ -287,6 +287,27 @@ Archi should:
 - use `fluxbee_start_pipeline` for broad desired-state design
 - not mutate directly
 
+### 6.5 Archi UI sections (rail + Messages)
+
+The Archi web UI is a single-page app served by `SY.architect@<hive>`. Two top-level sections are reachable via the left rail (icon column on the far left of the page); navigation is hash-based:
+
+| Hash | Section | Purpose |
+| --- | --- | --- |
+| `#/archi` (default) | Archi chat | The original operator/impersonation chat workspace, `Publish Software` panel, and chat history. |
+| `#/messages` | Messages | Read-only viewer of the system-wide ILK message log persisted by storage in `storage_inbox`. |
+
+Rules for the rail:
+
+- Click a rail icon to navigate; clicking the already-active icon for `messages` forces a refresh of that section without reloading the page.
+- Each section owns its own internal layout. Switching sections does not unmount the other; it only toggles `[hidden]`. SSE streams in inactive sections are stopped on deactivate.
+- Adding new sections later (e.g. cognition log) is one rail entry plus one `<section data-section="...">` block; do not introduce parallel layout systems.
+
+**Messages section requirements:**
+
+- archi must have `config.storage.messages_db_url` configured (`SCMD POST /architect/control/config-set`). Until then the panel shows a centered "messages_db_url not configured" card with copy-pasteable SCMD examples.
+- The connection string must point to storage's database (`fluxbee_storage`), not the base `fluxbee`. archi only runs `SELECT` against `storage_inbox`, so a separate read-only role is optional.
+- Filters (`Window`, `Only errors`) are client-side wrappers around `GET /api/messages` query params. The SSE tail (`GET /api/messages/stream`) is unfiltered — incoming rows that do not match the active filters are simply not appended.
+
 ---
 
 ## 7. Common Mutation Patterns
@@ -408,14 +429,15 @@ Rules:
 `ai.generic` agents boot with operational config first and receive their cognitive "alma" later through identity.
 
 Use:
-- `list_agent_assets` to inspect existing immutable role/skill/handbook assets
-- `get_agent_asset` to read the real JSON content of a role/skill/handbook asset by hash
+- `list_agent_assets` to inspect existing immutable role/skill/handbook/personality assets
+- `get_agent_asset` to read the real JSON content of an asset by hash
 - `create_agent_role_asset` to create the role asset
 - `create_agent_skill_asset` to create each skill asset
 - `create_agent_handbook_asset` to create each handbook/reference asset
+- `create_agent_personality_asset` to create the personality asset (nationality, languages, timezone, biography). At most one per agent.
 - `delete_agent_asset` to delete an unused local asset by hash when the operator explicitly asks
 - `get_ilk` to resolve the target agent ILK
-- `set_ilk_definition` to apply role/skill/handbook hashes
+- `set_ilk_definition` to apply role/skill/handbook (and optionally personality) hashes
 - `node_control_config_get` to verify the running agent loaded or rejected the definition
 
 Rules:
@@ -423,9 +445,10 @@ Rules:
 - asset builder tools only write content-addressed files under `blob://agent-assets/<hash>.json`
 - deleting an asset does not update ILK definitions; first remove or replace the hash from any active definition if the asset is still referenced
 - `set_ilk_definition` updates identity only; it does not create blob assets
-- role, skill, and handbook assets must already exist in `blob://agent-assets/<hash>.json`
-- identity stores hashes only; never put prompt text, skill instructions, or handbook content directly in `set_ilk_definition`
-- OPA/routing can match `role_hash`, `skill_hashes`, and `handbook_hashes`, but cannot read blob contents
+- role, skill, handbook, and personality assets must already exist in `blob://agent-assets/<hash>.json`
+- identity stores hashes only; never put prompt text, skill instructions, handbook content, or personality biography directly in `set_ilk_definition`
+- OPA/routing can match `role_hash`, `skill_hashes`, `handbook_hashes`, `personality_hash`, plus the flat `personality_timezone` / `personality_country_code` / `personality_primary_language` / `personality_additional_languages` view of personality `system_fields`. OPA cannot read blob contents.
+- when an operator asks to make an agent "Argentinian", "Spanish-speaking", "based in Mendoza", or describes nationality/timezone/language traits, route through `create_agent_personality_asset` (or reuse an existing personality hash from the catalog). Do **not** stuff these traits into the role asset — the role describes function, the personality describes person.
 - do not use legacy `roles` or `capabilities`; they are retired
 
 ### 8.2 IO tenant naming
