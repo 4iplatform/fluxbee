@@ -1181,10 +1181,10 @@ impl FunctionTool for CreateAgentRoleAssetTool {
             parameters_json_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["name", "persona"],
+                "required": ["name", "description"],
                 "properties": {
                     "name": {"type": "string", "description": "Human-readable role name."},
-                    "persona": {"type": "string", "description": "Core role/persona instructions."},
+                    "description": {"type": "string", "description": "Self-contained functional statement of what the agent does (1-3 sentences). Renders as the role section of the composed prompt. Does NOT include identity traits like nationality, language, or timezone — those belong in the personality asset."},
                     "tone": {"type": "string", "description": "Optional response tone."},
                     "limits": {
                         "type": "array",
@@ -5290,9 +5290,9 @@ fn clean_string_array(
 
 fn build_role_asset_value(arguments: &Value) -> Result<Value, ArchitectError> {
     let name = clean_required_string(arguments.get("name").unwrap_or(&Value::Null), "role.name")?;
-    let persona = clean_required_string(
-        arguments.get("persona").unwrap_or(&Value::Null),
-        "role.persona",
+    let description = clean_required_string(
+        arguments.get("description").unwrap_or(&Value::Null),
+        "role.description",
     )?;
     let tone = clean_optional_string(arguments.get("tone"), "role.tone")?;
     let limits = clean_string_array(
@@ -5303,7 +5303,7 @@ fn build_role_asset_value(arguments: &Value) -> Result<Value, ArchitectError> {
     let mut map = serde_json::Map::new();
     map.insert("asset_type".to_string(), json!("role"));
     map.insert("name".to_string(), json!(name));
-    map.insert("persona".to_string(), json!(persona));
+    map.insert("description".to_string(), json!(description));
     if let Some(tone) = tone {
         map.insert("tone".to_string(), json!(tone));
     }
@@ -5472,7 +5472,7 @@ fn validate_agent_asset_value(asset: &Value) -> Result<(String, String), Archite
         "role" => {
             ensure_allowed_asset_fields(
                 obj,
-                &["asset_type", "name", "persona", "tone", "limits"],
+                &["asset_type", "name", "description", "tone", "limits"],
                 "role",
             )?;
             build_role_asset_value(asset)?;
@@ -22194,12 +22194,12 @@ mod tests {
         let first = json!({
             "asset_type": "role",
             "name": "Support",
-            "persona": "Answer clearly.",
+            "description": "Answer clearly.",
             "limits": ["No invention"]
         });
         let second = json!({
             "limits": ["No invention"],
-            "persona": "Answer clearly.",
+            "description": "Answer clearly.",
             "name": "Support",
             "asset_type": "role"
         });
@@ -22275,7 +22275,7 @@ mod tests {
         let wrong_hash = "1111111111111111111111111111111111111111111111111111111111111111";
         std::fs::write(
             asset_dir.join(format!("{wrong_hash}.json")),
-            br#"{"asset_type":"role","name":"broken","persona":"x"}"#,
+            br#"{"asset_type":"role","name":"broken","description":"x"}"#,
         )
         .expect("write corrupt asset");
 

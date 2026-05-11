@@ -18,6 +18,14 @@ pub const MSG_VAULT_GET: &str = "VAULT_GET";
 pub const MSG_VAULT_GET_RESPONSE: &str = "VAULT_GET_RESPONSE";
 pub const MSG_VAULT_GET_METADATA: &str = "VAULT_GET_METADATA";
 pub const MSG_VAULT_GET_METADATA_RESPONSE: &str = "VAULT_GET_METADATA_RESPONSE";
+pub const MSG_VAULT_LIST: &str = "VAULT_LIST";
+pub const MSG_VAULT_LIST_RESPONSE: &str = "VAULT_LIST_RESPONSE";
+pub const MSG_VAULT_DELETE: &str = "VAULT_DELETE";
+pub const MSG_VAULT_DELETE_RESPONSE: &str = "VAULT_DELETE_RESPONSE";
+pub const MSG_VAULT_ROTATE: &str = "VAULT_ROTATE";
+pub const MSG_VAULT_ROTATE_RESPONSE: &str = "VAULT_ROTATE_RESPONSE";
+pub const MSG_VAULT_ROLLBACK: &str = "VAULT_ROLLBACK";
+pub const MSG_VAULT_ROLLBACK_RESPONSE: &str = "VAULT_ROLLBACK_RESPONSE";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VaultMetadata {
@@ -83,6 +91,98 @@ pub struct VaultValueResponse {
 
 pub type VaultGetResponse = VaultValueResponse;
 pub type VaultGetMetadataResponse = VaultValueResponse;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VaultFilter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VaultListRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<VaultFilter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultSecretSummary {
+    pub key: String,
+    pub metadata: VaultMetadata,
+    pub version: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_accessed_at: Option<String>,
+    pub access_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultListResponse {
+    pub status: String,
+    pub count: usize,
+    #[serde(default)]
+    pub secrets: Vec<VaultSecretSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultKeyRequest {
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultRotateRequest {
+    pub key: String,
+    pub value: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultDeleteResponse {
+    pub status: String,
+    pub key: String,
+    pub deleted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultRotateResponse {
+    pub status: String,
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultRollbackResponse {
+    pub status: String,
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct VaultRetryPolicy {
@@ -174,6 +274,122 @@ pub async fn vault_get_metadata(
     )
     .await?;
     let parsed: VaultGetMetadataResponse = serde_json::from_value(response)?;
+    ensure_ok(
+        &parsed.status,
+        parsed.error_code.as_deref(),
+        parsed.message.as_deref(),
+    )?;
+    Ok(parsed)
+}
+
+pub async fn vault_put(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    target: &str,
+    request: VaultPutRequest,
+    timeout: Duration,
+) -> Result<VaultPutResponse, VaultError> {
+    let response = send_action_once(
+        sender,
+        receiver,
+        target,
+        MSG_VAULT_PUT,
+        json!(request),
+        timeout,
+    )
+    .await?;
+    let parsed: VaultPutResponse = serde_json::from_value(response)?;
+    ensure_ok(
+        &parsed.status,
+        parsed.error_code.as_deref(),
+        parsed.message.as_deref(),
+    )?;
+    Ok(parsed)
+}
+
+pub async fn vault_list(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    target: &str,
+    filter: Option<VaultFilter>,
+    timeout: Duration,
+) -> Result<VaultListResponse, VaultError> {
+    let payload = json!(VaultListRequest { filter });
+    let response =
+        send_action_once(sender, receiver, target, MSG_VAULT_LIST, payload, timeout).await?;
+    let parsed: VaultListResponse = serde_json::from_value(response)?;
+    ensure_ok(
+        &parsed.status,
+        parsed.error_code.as_deref(),
+        parsed.message.as_deref(),
+    )?;
+    Ok(parsed)
+}
+
+pub async fn vault_delete(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    target: &str,
+    key: &str,
+    timeout: Duration,
+) -> Result<VaultDeleteResponse, VaultError> {
+    let payload = json!(VaultKeyRequest {
+        key: key.to_string()
+    });
+    let response =
+        send_action_once(sender, receiver, target, MSG_VAULT_DELETE, payload, timeout).await?;
+    let parsed: VaultDeleteResponse = serde_json::from_value(response)?;
+    ensure_ok(
+        &parsed.status,
+        parsed.error_code.as_deref(),
+        parsed.message.as_deref(),
+    )?;
+    Ok(parsed)
+}
+
+pub async fn vault_rotate(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    target: &str,
+    key: &str,
+    value: Value,
+    timeout: Duration,
+) -> Result<VaultRotateResponse, VaultError> {
+    let payload = json!(VaultRotateRequest {
+        key: key.to_string(),
+        value
+    });
+    let response =
+        send_action_once(sender, receiver, target, MSG_VAULT_ROTATE, payload, timeout).await?;
+    let parsed: VaultRotateResponse = serde_json::from_value(response)?;
+    ensure_ok(
+        &parsed.status,
+        parsed.error_code.as_deref(),
+        parsed.message.as_deref(),
+    )?;
+    Ok(parsed)
+}
+
+pub async fn vault_rollback(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    target: &str,
+    key: &str,
+    timeout: Duration,
+) -> Result<VaultRollbackResponse, VaultError> {
+    let payload = json!(VaultKeyRequest {
+        key: key.to_string()
+    });
+    let response = send_action_once(
+        sender,
+        receiver,
+        target,
+        MSG_VAULT_ROLLBACK,
+        payload,
+        timeout,
+    )
+    .await?;
+    let parsed: VaultRollbackResponse = serde_json::from_value(response)?;
     ensure_ok(
         &parsed.status,
         parsed.error_code.as_deref(),
@@ -319,6 +535,10 @@ fn response_action_for(action: &str) -> &'static str {
         MSG_VAULT_PUT => MSG_VAULT_PUT_RESPONSE,
         MSG_VAULT_GET => MSG_VAULT_GET_RESPONSE,
         MSG_VAULT_GET_METADATA => MSG_VAULT_GET_METADATA_RESPONSE,
+        MSG_VAULT_LIST => MSG_VAULT_LIST_RESPONSE,
+        MSG_VAULT_DELETE => MSG_VAULT_DELETE_RESPONSE,
+        MSG_VAULT_ROTATE => MSG_VAULT_ROTATE_RESPONSE,
+        MSG_VAULT_ROLLBACK => MSG_VAULT_ROLLBACK_RESPONSE,
         _ => MSG_VAULT_GET_RESPONSE,
     }
 }

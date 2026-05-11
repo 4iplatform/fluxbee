@@ -4146,7 +4146,8 @@ fn inject_identity_data(root: &mut serde_json::Value, snapshot: &crate::shm::Ide
             "handler_node": handler_node,
             "role_hash": role_hash_value(&ilk.role_hash),
             "skill_hashes": skill_hashes_value(&ilk.skill_hashes, ilk.skill_count as usize),
-            "handbook_hashes": handbook_hashes_value(&ilk.handbook_hashes, ilk.handbook_count as usize)
+            "handbook_hashes": handbook_hashes_value(&ilk.handbook_hashes, ilk.handbook_count as usize),
+            "personality_hash": role_hash_value(&ilk.personality_hash)
         });
         identity_obj.insert(ilk_id, payload);
     }
@@ -5214,6 +5215,7 @@ mod tests {
             handbook_hashes,
             created_at: now,
             updated_at: now,
+            personality_hash: [0x34; 32],
             _reserved: [0u8; 8],
         };
         copy_bytes_with_len(&mut ilk.handler_node, "SY.frontdesk.gov@sandbox");
@@ -5315,6 +5317,13 @@ mod tests {
                 }),
             Some(vec![expected_handbook_hash.as_str()])
         );
+        let expected_personality_hash = "34".repeat(32);
+        assert_eq!(
+            record
+                .get("personality_hash")
+                .and_then(serde_json::Value::as_str),
+            Some(expected_personality_hash.as_str())
+        );
         assert!(record.get("roles").is_none());
         assert!(record.get("capabilities").is_none());
 
@@ -5354,6 +5363,7 @@ mod tests {
             handbook_hashes: [[0u8; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
             created_at: now,
             updated_at: now,
+            personality_hash: [0u8; 32],
             _reserved: [0u8; 8],
         };
         let alias = IlkAliasEntry {
@@ -5555,6 +5565,7 @@ mod tests {
             handbook_hashes: [[0u8; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
             created_at: now,
             updated_at: now,
+            personality_hash: [0u8; 32],
             _reserved: [0u8; 8],
         };
         let alias = IlkAliasEntry {
@@ -5626,6 +5637,7 @@ mod tests {
             handbook_hashes: [[0u8; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
             created_at: now,
             updated_at: now,
+            personality_hash: [0u8; 32],
             _reserved: [0u8; 8],
         };
         let alias = IlkAliasEntry {

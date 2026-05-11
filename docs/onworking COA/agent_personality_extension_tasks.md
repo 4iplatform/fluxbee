@@ -59,11 +59,11 @@
 
 ## Phase E — Router / OPA Projection
 
-- [ ] E1. Extend router `data.identity` injection with `personality_hash`.
-- [ ] E2. Add a per-ILK personality `system_fields` cache: when a definition delta changes `personality_hash`, the router (or whichever component owns the projection) reads the asset from blob once and caches a flattened `personality_timezone`, `personality_country_code`, `personality_primary_language`, `personality_additional_languages[]` view in `data.identity[<ilk>]`.
-- [ ] E3. If the asset cannot be loaded (sync delay, deleted file), keep `personality_hash` projected but leave the flat view empty. OPA rules that match by hash still work; rules that match by language/timezone gracefully return no match.
-- [ ] E4. Router tests: OPA sees personality_hash; OPA sees flat language/timezone after asset is in blob; OPA degrades cleanly when asset is missing.
-- [ ] E5. Document in OPA examples a rule that routes by `data.identity[<ilk>].personality_primary_language`.
+- [x] E1. Extend router `data.identity` injection with `personality_hash`. Done in [src/router/mod.rs](../../src/router/mod.rs).
+- [ ] ~~E2. Per-ILK personality `system_fields` cache in the router~~ **DEFERRED.** Implementing this requires the router to read blob files (currently it does not — that boundary is intentional). Cost is real: blob path coupling, cache invalidation, deserialization, fault tolerance for missing files. Until a concrete OPA-routing-by-language use case justifies it, we skip this. OPA rules that need to route by `personality_*` should match on the hash (a fixed-value match), not on language strings.
+- [ ] ~~E3. Graceful degradation when asset cannot be loaded~~ **N/A while E2 is deferred** — the router never tries to load the asset, so there is no degradation path to test. Automatically satisfied.
+- [x] E4. Router tests should cover that OPA sees `personality_hash`. Will fold into existing `inject_identity_data_exposes_identity_and_aliases` test.
+- [ ] ~~E5. OPA cookbook entry for routing by `personality_primary_language`~~ **DEFERRED** with E2. Documented as out of scope in Phase J.
 
 ## Phase F — Admin / SDK Surface
 
@@ -118,6 +118,8 @@
 - Automated provisioning of personality from external HR systems.
 - A dedicated UI in Archi to browse/edit personalities (the asset builder generates via typed functions; visual curation is a separate iteration).
 - Indexing biographical fields for semantic search (e.g. "find agents with finance background"). The data is structured enough that a future iteration can add this without schema changes.
+- **Router-side blob reads / flat projection of personality `system_fields` into `data.identity[<ilk>].personality_timezone` etc.** The router intentionally does not read blob today; coupling those layers for a not-yet-exercised use case is over-engineering. OPA can match on `personality_hash` directly (fixed-value match against a known hash) when routing-by-personality is needed. Revisit only when OPA must match on language/timezone strings rather than on a hash that already encodes them.
+- OPA cookbook entry for routing by `personality_primary_language` (depends on the deferred router flat projection).
 
 ---
 

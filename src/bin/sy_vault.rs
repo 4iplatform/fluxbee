@@ -12,8 +12,11 @@ use fluxbee_sdk::identity::list_ilks_from_hive_config;
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{
     connect, try_handle_default_node_status, NodeConfig, NodeReceiver, NodeSender, NodeUuidMode,
-    VaultMetadata, MSG_VAULT_GET, MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE,
-    MSG_VAULT_GET_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE,
+    VaultFilter, VaultKeyRequest, VaultListRequest, VaultMetadata, VaultRotateRequest,
+    VaultSecretSummary, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET,
+    MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE,
+    MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE,
+    MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
 };
 use nix::libc::{flock, LOCK_EX, LOCK_NB};
 use rand::RngCore;
@@ -51,6 +54,8 @@ enum VaultError {
     Unauthorized,
     #[error("key not found")]
     KeyNotFound,
+    #[error("no previous version available")]
+    NoPreviousVersion,
     #[error("storage error: {0}")]
     Storage(String),
     #[error("encryption error")]
@@ -64,6 +69,7 @@ impl VaultError {
             VaultError::InvalidRequest(_) => "INVALID_REQUEST",
             VaultError::Unauthorized => "UNAUTHORIZED",
             VaultError::KeyNotFound => "KEY_NOT_FOUND",
+            VaultError::NoPreviousVersion => "NO_PREVIOUS_VERSION",
             VaultError::Sqlite(_) | VaultError::Storage(_) => "STORAGE_ERROR",
             VaultError::Encryption => "ENCRYPTION_ERROR",
             VaultError::Identity(_) => "IDENTITY_UNAVAILABLE",
@@ -121,6 +127,17 @@ struct SecretRecord {
     last_accessed_at: Option<String>,
 }
 
+struct VaultRotateResult {
+    rotated_at: String,
+    current_version: i64,
+    previous_version: i64,
+}
+
+struct VaultRollbackResult {
+    current_version: i64,
+    previous_version: i64,
+}
+
 struct VaultStore {
     conn: Connection,
     cipher: Aes256Gcm,
@@ -176,7 +193,13 @@ async fn main() -> Result<(), VaultError> {
         let action = msg.meta.msg.as_deref().unwrap_or_default();
         if !matches!(
             action,
-            MSG_VAULT_PUT | MSG_VAULT_GET | MSG_VAULT_GET_METADATA
+            MSG_VAULT_PUT
+                | MSG_VAULT_GET
+                | MSG_VAULT_GET_METADATA
+                | MSG_VAULT_LIST
+                | MSG_VAULT_DELETE
+                | MSG_VAULT_ROTATE
+                | MSG_VAULT_ROLLBACK
         ) {
             continue;
         }
@@ -205,6 +228,10 @@ async fn handle_vault_message(
         MSG_VAULT_PUT => handle_put(store, msg, &caller),
         MSG_VAULT_GET => handle_get(store, msg, &caller, true),
         MSG_VAULT_GET_METADATA => handle_get(store, msg, &caller, false),
+        MSG_VAULT_LIST => handle_list(store, msg, &caller),
+        MSG_VAULT_DELETE => handle_delete(store, msg, &caller),
+        MSG_VAULT_ROTATE => handle_rotate(store, msg, &caller),
+        MSG_VAULT_ROLLBACK => handle_rollback(store, msg, &caller),
         _ => Err(VaultError::InvalidRequest(
             "unsupported vault action".to_string(),
         )),
@@ -214,12 +241,80 @@ async fn handle_vault_message(
         Ok(payload) => payload,
         Err(err) => {
             let key = request_key(&msg.payload);
-            let _ = store.audit(action, key.as_deref(), &caller, "error", Some(err.code()));
+            let _ = store.audit(
+                action,
+                key.as_deref(),
+                &caller,
+                audit_result_for_error(&err),
+                Some(err.code()),
+            );
             error_payload(&err)
         }
     };
     send_system_response(sender, msg, response_action, payload).await?;
     Ok(())
+}
+
+fn handle_list(store: &mut VaultStore, msg: &Message, caller: &Caller) -> VaultResult<Value> {
+    let request: VaultListRequest = serde_json::from_value(msg.payload.clone())?;
+    let secrets = store.list(request.filter.unwrap_or_default(), caller)?;
+    store.audit(MSG_VAULT_LIST, None, caller, "success", None)?;
+    Ok(json!({
+        "status": "ok",
+        "count": secrets.len(),
+        "secrets": secrets,
+    }))
+}
+
+fn handle_delete(store: &mut VaultStore, msg: &Message, caller: &Caller) -> VaultResult<Value> {
+    if !caller.is_admin() {
+        return Err(VaultError::Unauthorized);
+    }
+    let request: VaultKeyRequest = serde_json::from_value(msg.payload.clone())?;
+    validate_key(&request.key)?;
+    store.delete(&request.key, caller)?;
+    Ok(json!({
+        "status": "ok",
+        "key": request.key,
+        "deleted": true,
+    }))
+}
+
+fn handle_rotate(store: &mut VaultStore, msg: &Message, caller: &Caller) -> VaultResult<Value> {
+    if !caller.is_admin() {
+        return Err(VaultError::Unauthorized);
+    }
+    let request: VaultRotateRequest = serde_json::from_value(msg.payload.clone())?;
+    validate_key(&request.key)?;
+    let value_bytes = serde_json::to_vec(&request.value)?;
+    if value_bytes.len() > MAX_SECRET_VALUE_BYTES {
+        return Err(VaultError::InvalidRequest(
+            "secret value exceeds 1 MiB".to_string(),
+        ));
+    }
+    let result = store.rotate(&request.key, request.value, caller)?;
+    Ok(json!({
+        "status": "ok",
+        "key": request.key,
+        "rotated_at": result.rotated_at,
+        "current_version": result.current_version,
+        "previous_version": result.previous_version,
+    }))
+}
+
+fn handle_rollback(store: &mut VaultStore, msg: &Message, caller: &Caller) -> VaultResult<Value> {
+    if !caller.is_admin() {
+        return Err(VaultError::Unauthorized);
+    }
+    let request: VaultKeyRequest = serde_json::from_value(msg.payload.clone())?;
+    validate_key(&request.key)?;
+    let result = store.rollback(&request.key, caller)?;
+    Ok(json!({
+        "status": "ok",
+        "key": request.key,
+        "current_version": result.current_version,
+        "previous_version": result.previous_version,
+    }))
 }
 
 fn handle_put(store: &mut VaultStore, msg: &Message, caller: &Caller) -> VaultResult<Value> {
@@ -446,6 +541,164 @@ impl VaultStore {
             .map_err(VaultError::from)
     }
 
+    fn list(&self, filter: VaultFilter, caller: &Caller) -> VaultResult<Vec<VaultSecretSummary>> {
+        let limit = filter.limit.unwrap_or(200).clamp(1, 1000) as usize;
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT key, metadata_json, version, access_count, last_accessed_at
+              FROM secrets
+             ORDER BY key
+            "#,
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut summaries = Vec::new();
+        while let Some(row) = rows.next()? {
+            let key: String = row.get(0)?;
+            if let Some(prefix) = filter.prefix.as_deref() {
+                if !key.starts_with(prefix) {
+                    continue;
+                }
+            }
+            let metadata_json: String = row.get(1)?;
+            let metadata: VaultMetadata = serde_json::from_str(&metadata_json)?;
+            if let Some(tenant_id) = filter.tenant_id.as_deref() {
+                if metadata.tenant_id != tenant_id {
+                    continue;
+                }
+            }
+            if !filter
+                .tags
+                .iter()
+                .all(|tag| metadata.tags.iter().any(|candidate| candidate == tag))
+            {
+                continue;
+            }
+            if !caller.is_admin() && authorize_read(caller, &metadata, true).is_err() {
+                continue;
+            }
+            summaries.push(VaultSecretSummary {
+                key,
+                metadata,
+                version: row.get(2)?,
+                access_count: row.get(3)?,
+                last_accessed_at: row.get(4)?,
+            });
+            if summaries.len() >= limit {
+                break;
+            }
+        }
+        Ok(summaries)
+    }
+
+    fn delete(&mut self, key: &str, caller: &Caller) -> VaultResult<()> {
+        let tx = self.conn.transaction()?;
+        let deleted = tx.execute("DELETE FROM secrets WHERE key = ?1", params![key])?;
+        if deleted == 0 {
+            return Err(VaultError::KeyNotFound);
+        }
+        audit_with_tx(&tx, MSG_VAULT_DELETE, Some(key), caller, "success", None)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn rotate(
+        &mut self,
+        key: &str,
+        value: Value,
+        caller: &Caller,
+    ) -> VaultResult<VaultRotateResult> {
+        let existing = self.get_record(key)?.ok_or(VaultError::KeyNotFound)?;
+        let mut metadata = existing.metadata;
+        let now = Utc::now().to_rfc3339();
+        metadata.updated_at = Some(now.clone());
+        let metadata_json = serde_json::to_string(&metadata)?;
+        let (nonce, ciphertext) = self.encrypt_value(&value)?;
+        let previous_version = existing.version;
+        let current_version = existing.version.saturating_add(1);
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            r#"
+            UPDATE secrets
+               SET metadata_json = ?2,
+                   version = ?3,
+                   current_nonce = ?4,
+                   current_ciphertext = ?5,
+                   previous_nonce = ?6,
+                   previous_ciphertext = ?7,
+                   previous_version = ?8,
+                   updated_at = ?9
+             WHERE key = ?1
+            "#,
+            params![
+                key,
+                metadata_json,
+                current_version,
+                nonce,
+                ciphertext,
+                existing.current_nonce,
+                existing.current_ciphertext,
+                previous_version,
+                now
+            ],
+        )?;
+        audit_with_tx(&tx, MSG_VAULT_ROTATE, Some(key), caller, "success", None)?;
+        tx.commit()?;
+        Ok(VaultRotateResult {
+            rotated_at: Utc::now().to_rfc3339(),
+            current_version,
+            previous_version,
+        })
+    }
+
+    fn rollback(&mut self, key: &str, caller: &Caller) -> VaultResult<VaultRollbackResult> {
+        let existing = self.get_record(key)?.ok_or(VaultError::KeyNotFound)?;
+        let previous_nonce = existing
+            .previous_nonce
+            .ok_or(VaultError::NoPreviousVersion)?;
+        let previous_ciphertext = existing
+            .previous_ciphertext
+            .ok_or(VaultError::NoPreviousVersion)?;
+        let previous_version = existing
+            .previous_version
+            .ok_or(VaultError::NoPreviousVersion)?;
+        let mut metadata = existing.metadata;
+        metadata.updated_at = Some(Utc::now().to_rfc3339());
+        let metadata_json = serde_json::to_string(&metadata)?;
+        let old_current_version = existing.version;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            r#"
+            UPDATE secrets
+               SET metadata_json = ?2,
+                   version = ?3,
+                   current_nonce = ?4,
+                   current_ciphertext = ?5,
+                   previous_nonce = ?6,
+                   previous_ciphertext = ?7,
+                   previous_version = ?8,
+                   updated_at = ?9
+             WHERE key = ?1
+            "#,
+            params![
+                key,
+                metadata_json,
+                previous_version,
+                previous_nonce,
+                previous_ciphertext,
+                existing.current_nonce,
+                existing.current_ciphertext,
+                old_current_version,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        audit_with_tx(&tx, MSG_VAULT_ROLLBACK, Some(key), caller, "success", None)?;
+        tx.commit()?;
+        Ok(VaultRollbackResult {
+            current_version: previous_version,
+            previous_version: old_current_version,
+        })
+    }
+
     fn mark_accessed(&self, key: &str) -> VaultResult<()> {
         self.conn.execute(
             "UPDATE secrets SET last_accessed_at = ?2, access_count = access_count + 1 WHERE key = ?1",
@@ -573,7 +826,7 @@ fn resolve_caller(config_dir: &Path, msg: &Message) -> VaultResult<Caller> {
 fn authorize_read(
     caller: &Caller,
     metadata: &VaultMetadata,
-    metadata_only: bool,
+    include_value: bool,
 ) -> VaultResult<()> {
     if caller.is_admin() {
         return Ok(());
@@ -585,13 +838,20 @@ fn authorize_read(
         return Ok(());
     }
     let same_tenant = caller.tenant_id.as_deref() == Some(metadata.tenant_id.as_str());
-    if metadata_only && same_tenant {
+    if !include_value && same_tenant {
         return Ok(());
     }
     if same_tenant && caller.ilk_type.as_deref() == Some("system") {
         return Ok(());
     }
     Err(VaultError::Unauthorized)
+}
+
+fn audit_result_for_error(err: &VaultError) -> &'static str {
+    match err {
+        VaultError::Unauthorized => "denied",
+        _ => "error",
+    }
 }
 
 fn validate_key(key: &str) -> VaultResult<()> {
@@ -686,6 +946,10 @@ fn response_action_for(action: &str) -> &'static str {
         MSG_VAULT_PUT => MSG_VAULT_PUT_RESPONSE,
         MSG_VAULT_GET_METADATA => MSG_VAULT_GET_METADATA_RESPONSE,
         MSG_VAULT_GET => MSG_VAULT_GET_RESPONSE,
+        MSG_VAULT_LIST => MSG_VAULT_LIST_RESPONSE,
+        MSG_VAULT_DELETE => MSG_VAULT_DELETE_RESPONSE,
+        MSG_VAULT_ROTATE => MSG_VAULT_ROTATE_RESPONSE,
+        MSG_VAULT_ROLLBACK => MSG_VAULT_ROLLBACK_RESPONSE,
         _ => MSG_VAULT_GET_RESPONSE,
     }
 }

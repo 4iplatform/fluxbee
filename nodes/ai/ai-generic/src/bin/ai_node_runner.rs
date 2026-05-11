@@ -2152,7 +2152,7 @@ struct LoadedCognitiveDefinition {
 struct LoadedRoleAsset {
     hash: String,
     name: String,
-    persona: String,
+    description: String,
     tone: Option<String>,
     limits: Vec<String>,
 }
@@ -2199,8 +2199,6 @@ struct CognitiveAssetDocument {
     name: String,
     #[serde(default)]
     description: Option<String>,
-    #[serde(default)]
-    persona: Option<String>,
     #[serde(default)]
     tone: Option<String>,
     #[serde(default)]
@@ -2439,11 +2437,12 @@ fn compose_cognitive_state(
 fn load_role_asset(blob_root: &std::path::Path, hash: &str) -> Result<LoadedRoleAsset, String> {
     let doc = load_cognitive_asset(blob_root, hash, "role")?;
     let name = required_asset_string(&doc.name, "role.name")?;
-    let persona = required_asset_string(doc.persona.as_deref().unwrap_or(""), "role.persona")?;
+    let description =
+        required_asset_string(doc.description.as_deref().unwrap_or(""), "role.description")?;
     Ok(LoadedRoleAsset {
         hash: hash.to_string(),
         name,
-        persona,
+        description,
         tone: doc.tone.filter(|value| !value.trim().is_empty()),
         limits: clean_string_vec(doc.limits),
     })
@@ -2547,7 +2546,7 @@ fn compose_cognitive_prompt(loaded: &LoadedCognitiveDefinition) -> (String, bool
 
     if let Some(role) = &loaded.role {
         out.push_str(&format!("[ROLE: {}]\n", role.name));
-        out.push_str(&role.persona);
+        out.push_str(&role.description);
         out.push('\n');
         out.push_str(&format!("\nAsset hash: {}\n", role.hash));
         if let Some(tone) = &role.tone {
@@ -6247,7 +6246,7 @@ mod tests {
             json!({
                 "asset_type": "role",
                 "name": "Support role",
-                "persona": "Answer as a Fluxbee support agent.",
+                "description": "Answer as a Fluxbee support agent.",
                 "tone": "direct",
                 "limits": ["Do not invent platform capabilities."]
             }),
@@ -6310,7 +6309,7 @@ mod tests {
             json!({
                 "asset_type": "role",
                 "name": "Support role",
-                "persona": "Answer with the loaded role."
+                "description": "Answer with the loaded role."
             }),
         );
         let mut ilk = sample_agent_ilk();
@@ -6354,7 +6353,7 @@ mod tests {
         assert!(state.role_hash_loaded.is_none());
         assert_eq!(state.failed_hashes.len(), 1);
         assert_eq!(state.failed_hashes[0].asset_type, "role");
-        assert!(state.failed_hashes[0].error.contains("role.persona"));
+        assert!(state.failed_hashes[0].error.contains("role.description"));
         assert_eq!(
             state.active_prompt.as_deref(),
             Some(DEFAULT_UNCONFIGURED_AGENT_PROMPT)

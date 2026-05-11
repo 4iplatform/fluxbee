@@ -119,7 +119,7 @@ Default `vault_get_with_retry` policy:
 - [x] VA-A4. Clarify key naming: key text is operator-facing and not authoritative for authorization.
 - [x] VA-A5. Resolve PUT idempotency vs audit contradiction: no version increment, audit as `noop`.
 - [x] VA-A6. Define max secret value size in one place. Initial hard limit: 1 MiB.
-- [ ] VA-A7. Define response envelopes consistently with current L2 system message style.
+- [x] VA-A7. Define response envelopes consistently with current L2 system message style.
 
 ## 5. Phase B - Rust SDK vault contract
 
@@ -128,17 +128,17 @@ Default `vault_get_with_retry` policy:
   - `VAULT_PUT`
   - `VAULT_GET`
   - `VAULT_GET_METADATA`
-- [ ] VA-B2b. Define remaining verb constants:
+- [x] VA-B2b. Define remaining verb constants:
   - `VAULT_LIST`
   - `VAULT_DELETE`
   - `VAULT_ROTATE`
   - `VAULT_ROLLBACK`
 - [x] VA-B3a. Define request/response structs for initial verbs.
-- [ ] VA-B3b. Define request/response structs for list/delete/rotate/rollback.
+- [x] VA-B3b. Define request/response structs for list/delete/rotate/rollback.
 - [x] VA-B4a. Define `VaultMetadata` and typed vault errors.
-- [ ] VA-B4b. Define `VaultFilter` for listing/querying.
+- [x] VA-B4b. Define `VaultFilter` for listing/querying.
 - [x] VA-B5a. Implement `vault_get` / `vault_get_metadata` L2 helper functions using `NodeSender` and trace-id matching pattern used by identity helpers.
-- [ ] VA-B5b. Implement SDK helpers for `VAULT_PUT`, `VAULT_LIST`, `VAULT_DELETE`, `VAULT_ROTATE`, and `VAULT_ROLLBACK`.
+- [x] VA-B5b. Implement SDK helpers for `VAULT_PUT`, `VAULT_LIST`, `VAULT_DELETE`, `VAULT_ROTATE`, and `VAULT_ROLLBACK`.
 - [x] VA-B6. Re-export vault types/helpers from `fluxbee_sdk::lib` and prelude if appropriate.
 - [x] VA-B7a. Add unit tests for vault ref parsing.
 - [ ] VA-B7b. Add unit tests for serialization and response parsing.
@@ -161,10 +161,10 @@ Default `vault_get_with_retry` policy:
 - [x] VA-C7. Implement AES-256-GCM encrypt/decrypt.
 - [x] VA-C8. Implement `VAULT_PUT`.
 - [x] VA-C9. Implement `VAULT_GET`.
-- [ ] VA-C10. Implement `VAULT_LIST`.
-- [ ] VA-C11. Implement `VAULT_DELETE`.
-- [ ] VA-C12. Implement `VAULT_ROTATE`.
-- [ ] VA-C13. Implement `VAULT_ROLLBACK`.
+- [x] VA-C10. Implement `VAULT_LIST`.
+- [x] VA-C11. Implement `VAULT_DELETE`.
+- [x] VA-C12. Implement `VAULT_ROTATE`.
+- [x] VA-C13. Implement `VAULT_ROLLBACK`.
 - [x] VA-C14. Implement `VAULT_GET_METADATA`.
 - [x] VA-C15. Ensure secret values are never logged.
 - [x] VA-C16a. Add structured audit write for supported operations, including errors and no-op.
@@ -185,23 +185,26 @@ Default `vault_get_with_retry` policy:
 - [x] VA-D5. Implement same-tenant system authorization if caller is `system` ILK.
 - [x] VA-D6. For `tenant_id = sys`, allow only admin/architect.
 - [x] VA-D7a. Prevent key enumeration for `VAULT_GET`.
-- [ ] VA-D7b. Prevent key enumeration for `VAULT_LIST`.
+- [x] VA-D7b. Prevent key enumeration for `VAULT_LIST`.
 - [ ] VA-D8. Unit-test allowed/denied matrix.
 
 ## 8. Phase E - Admin and Archi integration
 
-- [ ] VA-E1. Add admin action handlers that proxy to `SY.vault` over L2.
-- [ ] VA-E2. Add action help entries for:
+- [x] VA-E1a. Add admin action handlers for `vault_put`, `vault_get`, and `vault_get_metadata` that proxy to `SY.vault` over L2.
+- [x] VA-E1b. Add admin action handlers for `vault_list`, `vault_delete`, `vault_rotate`, and `vault_rollback`.
+- [x] VA-E2a. Add action help entries for:
   - `vault_put`
   - `vault_get`
+  - `vault_get_metadata`
+- [x] VA-E2b. Add action help entries for:
   - `vault_list`
   - `vault_delete`
   - `vault_rotate`
   - `vault_rollback`
-  - `vault_get_metadata`
-- [ ] VA-E3. Mark value-bearing actions as secret-sensitive in previews/logs.
-- [ ] VA-E4. Ensure executor plan display redacts `value`.
-- [ ] VA-E5. Add SCMD examples to admin help reference.
+- [x] VA-E3. Mark value-bearing actions as secret-sensitive in previews/logs.
+- [x] VA-E4. Ensure executor plan display redacts `value`.
+- [x] VA-E5a. Add SCMD examples for `vault_put`, `vault_get`, and `vault_get_metadata` to admin help reference.
+- [x] VA-E5b. Add SCMD examples for list/delete/rotate/rollback after those verbs exist.
 - [ ] VA-E6. Add Archi handbook guidance at method level only:
   - discover action help;
   - do not print secret values;

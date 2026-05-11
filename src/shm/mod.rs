@@ -27,7 +27,7 @@ pub const OPA_VERSION: u32 = 1;
 pub const OPA_MAX_WASM_SIZE: usize = 4 * 1024 * 1024;
 
 pub const IDENTITY_MAGIC: u32 = 0x4A534944; // "JSID"
-pub const IDENTITY_VERSION: u32 = 5;
+pub const IDENTITY_VERSION: u32 = 6;
 pub const IDENTITY_DEFINITION_MAX_SKILLS: usize = 16;
 pub const IDENTITY_DEFINITION_MAX_HANDBOOKS: usize = 8;
 pub const MEMORY_MAGIC: u32 = 0x4A534D4D; // "JSMM"
@@ -365,6 +365,7 @@ pub struct IlkEntry {
     pub handbook_hashes: [[u8; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
     pub created_at: u64,
     pub updated_at: u64,
+    pub personality_hash: [u8; 32],
     pub _reserved: [u8; 8],
 }
 
@@ -3708,6 +3709,7 @@ fn empty_ilk_entry() -> IlkEntry {
         handbook_hashes: [[0u8; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
         created_at: 0,
         updated_at: 0,
+        personality_hash: [0u8; 32],
         _reserved: [0u8; 8],
     }
 }
@@ -4078,6 +4080,7 @@ mod tests {
             handbook_hashes,
             created_at: 1,
             updated_at: 1,
+            personality_hash: [0u8; 32],
             _reserved: [0u8; 8],
         };
         writer.upsert_ilk_entry(ilk).expect("ilk upsert");
@@ -4229,6 +4232,7 @@ mod tests {
             handbook_hashes: [[0u8; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
             created_at: 1,
             updated_at: 1,
+            personality_hash: [0u8; 32],
             _reserved: [0u8; 8],
         };
         let ich = IchEntry {

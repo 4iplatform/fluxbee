@@ -34,7 +34,12 @@ use fluxbee_sdk::{
     classify_system_message, connect, derive_action_outcome, load_node_secret_record_with_root,
     redacted_node_secret_record, save_node_secret_record_with_root, try_handle_default_node_status,
     ClientConfig, NodeConfig, NodeReceiver, NodeSecretDescriptor, NodeSecretError,
-    NodeSecretRecord, NodeSecretWriteOptions, NodeSender, NODE_SECRET_REDACTION_TOKEN,
+    NodeSecretRecord, NodeSecretWriteOptions, NodeSender, MSG_VAULT_DELETE,
+    MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET, MSG_VAULT_GET_METADATA,
+    MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE, MSG_VAULT_LIST,
+    MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE, MSG_VAULT_ROLLBACK,
+    MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
+    NODE_SECRET_REDACTION_TOKEN,
 };
 use json_router::runtime_manifest::{
     load_runtime_manifest_from_paths, runtime_manifest_write_v2_gate_enabled_from_env,
@@ -71,6 +76,13 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "create_tenant",
     "update_tenant",
     "set_tenant_sponsor",
+    "vault_list",
+    "vault_put",
+    "vault_get_metadata",
+    "vault_get",
+    "vault_delete",
+    "vault_rotate",
+    "vault_rollback",
     "set_ilk_definition",
     "publish_runtime_package",
     "sync_hint",
@@ -1068,12 +1080,30 @@ fn redact_executor_log_value(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
             let mut redacted = serde_json::Map::new();
+            let looks_like_vault_payload = map.contains_key("key")
+                && map.contains_key("value")
+                && (map.contains_key("metadata")
+                    || map.contains_key("version")
+                    || map.get("action").and_then(serde_json::Value::as_str) == Some("vault_get")
+                    || map.get("action").and_then(serde_json::Value::as_str) == Some("vault_put")
+                    || map
+                        .get("key")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|key| {
+                            key.contains(':')
+                                && key.bytes().all(|b| {
+                                    b.is_ascii_lowercase()
+                                        || b.is_ascii_digit()
+                                        || matches!(b, b':' | b'_' | b'-')
+                                })
+                        }));
             for (key, entry) in map {
                 let lower = key.to_ascii_lowercase();
                 if matches!(
                     lower.as_str(),
                     "api_key" | "token" | "secret" | "password" | "authorization"
-                ) {
+                ) || (looks_like_vault_payload && lower == "value")
+                {
                     redacted.insert(
                         key.clone(),
                         serde_json::Value::String(NODE_SECRET_REDACTION_TOKEN.to_string()),
@@ -2769,7 +2799,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "6";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "7";
 
 const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
@@ -3015,6 +3045,48 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "set_tenant_sponsor",
         route: InternalActionRoute::Command("set_tenant_sponsor"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "vault_list",
+        route: InternalActionRoute::Command("vault_list"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "vault_put",
+        route: InternalActionRoute::Command("vault_put"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "vault_get_metadata",
+        route: InternalActionRoute::Command("vault_get_metadata"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "vault_get",
+        route: InternalActionRoute::Command("vault_get"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "vault_delete",
+        route: InternalActionRoute::Command("vault_delete"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "vault_rotate",
+        route: InternalActionRoute::Command("vault_rotate"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "vault_rollback",
+        route: InternalActionRoute::Command("vault_rollback"),
         requires_target: true,
         allow_legacy_hive_id: false,
     },
@@ -4600,6 +4672,130 @@ async fn handle_hive_paths(
                     .await?;
             Ok(Some((status, resp)))
         }
+        ("GET", ["vault", "secrets"]) => {
+            let mut filter = serde_json::Map::new();
+            if let Some(prefix) = query.get("prefix") {
+                filter.insert(
+                    "prefix".to_string(),
+                    serde_json::Value::String(prefix.to_string()),
+                );
+            }
+            if let Some(tenant_id) = query.get("tenant_id") {
+                filter.insert(
+                    "tenant_id".to_string(),
+                    serde_json::Value::String(tenant_id.to_string()),
+                );
+            }
+            if let Some(tags) = query.get("tags") {
+                filter.insert(
+                    "tags".to_string(),
+                    serde_json::Value::Array(
+                        tags.split(',')
+                            .map(str::trim)
+                            .filter(|tag| !tag.is_empty())
+                            .map(|tag| serde_json::Value::String(tag.to_string()))
+                            .collect(),
+                    ),
+                );
+            }
+            if let Some(limit) = query
+                .get("limit")
+                .and_then(|value| value.parse::<u32>().ok())
+            {
+                filter.insert(
+                    "limit".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(limit)),
+                );
+            }
+            let payload = if filter.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({ "filter": filter })
+            };
+            let (status, resp) =
+                handle_admin_command(ctx, client, "vault_list", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["vault", "secrets"]) => {
+            let payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            if !payload.is_object() {
+                return Ok(Some((
+                    400,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": "vault_put",
+                        "payload": serde_json::Value::Null,
+                        "error_code": "INVALID_REQUEST",
+                        "error_detail": "request body must be a JSON object",
+                    })
+                    .to_string(),
+                )));
+            }
+            let (status, resp) =
+                handle_admin_command(ctx, client, "vault_put", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["vault", "secrets", key, "metadata"]) => {
+            let payload = serde_json::json!({
+                "key": decode_percent(key),
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "vault_get_metadata", payload, Some(hive))
+                    .await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["vault", "secrets", key]) => {
+            let payload = serde_json::json!({
+                "key": decode_percent(key),
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "vault_get", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("DELETE", ["vault", "secrets", key]) => {
+            let payload = serde_json::json!({
+                "key": decode_percent(key),
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "vault_delete", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["vault", "secrets", key, "rotate"]) => {
+            let mut payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            if !payload.is_object() {
+                return Ok(Some((
+                    400,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": "vault_rotate",
+                        "payload": serde_json::Value::Null,
+                        "error_code": "INVALID_REQUEST",
+                        "error_detail": "request body must be a JSON object",
+                    })
+                    .to_string(),
+                )));
+            }
+            payload["key"] = serde_json::Value::String(decode_percent(key));
+            let (status, resp) =
+                handle_admin_command(ctx, client, "vault_rotate", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["vault", "secrets", key, "rollback"]) => {
+            let payload = serde_json::json!({
+                "key": decode_percent(key),
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "vault_rollback", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
         ("GET", ["versions"]) => {
             let (status, resp) =
                 handle_admin_query(ctx, client, "get_versions", Some(hive)).await?;
@@ -5175,10 +5371,12 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
     }
     match code.as_str() {
         "INVALID_REQUEST" | "INVALID_ADDRESS" | "INVALID_ARCHIVE" | "INVALID_HIVE_ID"
-        | "INVALID_ZIP" => 400,
+        | "INVALID_ZIP" | "INVALID_KEY_FORMAT" | "INVALID_VALUE" => 400,
+        "UNAUTHORIZED" => 403,
         "NOT_FOUND"
         | "NODE_NOT_FOUND"
         | "BLOB_NOT_FOUND"
+        | "KEY_NOT_FOUND"
         | "RUNTIME_NOT_AVAILABLE"
         | "RUNTIME_NOT_FOUND"
         | "RUNTIME_VERSION_NOT_FOUND" => 404,
@@ -5191,6 +5389,7 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "NODE_NOT_CONFIGURED"
         | "NOTHING_STAGED"
         | "NO_BACKUP"
+        | "NO_PREVIOUS_VERSION"
         | "INSTANCES_ACTIVE"
         | "INSTANCES_UNKNOWN"
         | "STALE_CONFIG_VERSION"
@@ -5219,8 +5418,15 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "RUNTIME_REMOVE_FAILED"
         | "ORCHESTRATOR_ERROR"
         | "RESTART_FAILED"
+        | "STORAGE_ERROR"
+        | "ENCRYPTION_ERROR"
         | "TRANSPORT_ERROR" => 502,
-        "SHM_NOT_FOUND" | "RUNTIME_MANIFEST_MISSING" | "MISSING_WAN_LISTEN" => 503,
+        "SHM_NOT_FOUND"
+        | "RUNTIME_MANIFEST_MISSING"
+        | "MISSING_WAN_LISTEN"
+        | "IDENTITY_UNAVAILABLE"
+        | "VAULT_UNAVAILABLE"
+        | "MASTER_KEY_NOT_AVAILABLE" => 503,
         _ => 500,
     }
 }
@@ -6457,6 +6663,22 @@ fn admin_action_executor_contract(spec: &InternalActionSpec) -> serde_json::Valu
     let schema = build_admin_executor_function_definition(spec).parameters_json_schema;
     let notes = if matches!(
         spec.action,
+        "vault_list"
+            | "vault_put"
+            | "vault_get"
+            | "vault_get_metadata"
+            | "vault_delete"
+            | "vault_rotate"
+            | "vault_rollback"
+    ) {
+        vec![
+            "Executor plans must put path params and JSON body fields directly under step.args.",
+            "Do not wrap mutation fields under args.body; body is only the HTTP request shape.",
+            "Vault value-bearing fields are secret-sensitive and must not be printed in summaries/logs.",
+            "Prefer vault_get_metadata for inspection. Use vault_get only when the operator explicitly needs the secret value.",
+        ]
+    } else if matches!(
+        spec.action,
         "create_tenant" | "update_tenant" | "set_tenant_sponsor"
     ) {
         vec![
@@ -6501,6 +6723,10 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "node_control_config_set"
             | "send_node_message"
             | "set_storage"
+            | "vault_put"
+            | "vault_delete"
+            | "vault_rotate"
+            | "vault_rollback"
             | "update"
             | "sync_hint"
             | "opa_compile_apply"
@@ -6532,6 +6758,11 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "create_tenant"
             | "update_tenant"
             | "set_tenant_sponsor"
+            | "vault_put"
+            | "vault_get"
+            | "vault_delete"
+            | "vault_rotate"
+            | "vault_rollback"
             | "update"
             | "sync_hint"
             | "opa_compile_apply"
@@ -6573,6 +6804,13 @@ fn admin_action_summary(action: &str) -> &'static str {
         "set_tenant_sponsor" => {
             "Set or clear the sponsor relationship for one identity tenant in a hive."
         }
+        "vault_list" => "List SY.vault secret metadata visible to the caller.",
+        "vault_put" => "Write or update one encrypted secret in SY.vault.",
+        "vault_get_metadata" => "Read one SY.vault secret metadata record without returning the secret value.",
+        "vault_get" => "Read one SY.vault secret value. Secret-sensitive; prefer metadata inspection when possible.",
+        "vault_delete" => "Delete one encrypted secret from SY.vault.",
+        "vault_rotate" => "Rotate one encrypted secret value while keeping the previous version for rollback.",
+        "vault_rollback" => "Rollback one encrypted secret to its previous version.",
         "inventory" => "Read global or per-hive inventory, including system-wide node visibility.",
         "list_versions" => "List core and runtime versions across hives.",
         "get_versions" => "Read core and runtime versions for one hive.",
@@ -6661,6 +6899,13 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "set_tenant_sponsor" => {
             vec!["POST /hives/{hive}/identity/tenants/{tenant_id}/sponsor"]
         }
+        "vault_list" => vec!["GET /hives/{hive}/vault/secrets"],
+        "vault_put" => vec!["POST /hives/{hive}/vault/secrets"],
+        "vault_get_metadata" => vec!["GET /hives/{hive}/vault/secrets/{key}/metadata"],
+        "vault_get" => vec!["GET /hives/{hive}/vault/secrets/{key}"],
+        "vault_delete" => vec!["DELETE /hives/{hive}/vault/secrets/{key}"],
+        "vault_rotate" => vec!["POST /hives/{hive}/vault/secrets/{key}/rotate"],
+        "vault_rollback" => vec!["POST /hives/{hive}/vault/secrets/{key}/rollback"],
         "inventory" => vec![
             "GET /inventory",
             "GET /inventory/summary",
@@ -6835,11 +7080,23 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
                 "ILK identifier in prefixed format, for example ilk:550e8400-e29b-41d4-a716-446655440000.",
             ),
         ],
-        "create_tenant" => vec![admin_action_path_param(
+        "create_tenant" | "vault_list" | "vault_put" => vec![admin_action_path_param(
             "hive",
             "string",
             "Target hive id in the URL path.",
         )],
+        "vault_get"
+        | "vault_get_metadata"
+        | "vault_delete"
+        | "vault_rotate"
+        | "vault_rollback" => vec![
+            admin_action_path_param("hive", "string", "Target hive id in the URL path."),
+            admin_action_path_param(
+                "key",
+                "string",
+                "Vault key, for example sys:openai-api-key.",
+            ),
+        ],
         "get_tenant" | "update_tenant" | "set_tenant_sponsor" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
             admin_action_path_param(
@@ -6905,6 +7162,8 @@ fn admin_action_body_required(action: &str) -> bool {
             | "send_node_message"
             | "node_control_config_set"
             | "set_storage"
+            | "vault_put"
+            | "vault_rotate"
             | "update"
             | "set_ilk_definition"
             | "create_tenant"
@@ -7060,6 +7319,27 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             "string",
             "Tenant display name. Creating by the same name or domain is idempotent and returns the existing tenant.",
         )],
+        "vault_put" => vec![
+            admin_action_body_field("key", "string", "Vault key to write."),
+            admin_action_body_field(
+                "value",
+                "object",
+                "Secret JSON value. This field is secret-sensitive and redacted in previews/logs.",
+            ),
+            admin_action_body_field(
+                "metadata",
+                "object",
+                "Vault metadata containing tenant_id and owner_ilk.",
+            ),
+        ],
+        "vault_rotate" => vec![
+            admin_action_body_field("key", "string", "Vault key to rotate."),
+            admin_action_body_field(
+                "value",
+                "object",
+                "New secret JSON value. This field is secret-sensitive and redacted in previews/logs.",
+            ),
+        ],
         "set_ilk_definition" => vec![admin_action_body_field(
             "definition",
             "object",
@@ -7176,6 +7456,11 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
                 "Optional hive override when using internal admin dispatch.",
             ),
         ],
+        "vault_list" => vec![admin_action_body_field(
+            "filter",
+            "object",
+            "Optional filter object with prefix, tenant_id, tags, and limit.",
+        )],
         "run_node" => vec![
             admin_action_body_field(
                 "runtime",
@@ -7652,6 +7937,36 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         "set_tenant_sponsor" => serde_json::json!({
             "sponsor_tenant_id": serde_json::Value::Null
         }),
+        "vault_list" => serde_json::json!({
+            "filter": {
+                "prefix": "sys:",
+                "tags": ["provider:openai"],
+                "limit": 100
+            }
+        }),
+        "vault_put" => serde_json::json!({
+            "key": "sys:openai-api-key",
+            "value": {
+                "api_key": "sk-redacted-example"
+            },
+            "metadata": {
+                "tenant_id": "sys",
+                "owner_ilk": "ilk:550e8400-e29b-41d4-a716-446655440000",
+                "description": "OpenAI API key for a system node",
+                "tags": ["provider:openai"]
+            }
+        }),
+        "vault_get_metadata" | "vault_get" | "vault_delete" | "vault_rollback" => {
+            serde_json::json!({
+                "key": "sys:openai-api-key"
+            })
+        }
+        "vault_rotate" => serde_json::json!({
+            "key": "sys:openai-api-key",
+            "value": {
+                "api_key": "sk-rotated-redacted-example"
+            }
+        }),
         "set_ilk_definition" => serde_json::json!({
             "definition": {
                 "role_hash": "1111111111111111111111111111111111111111111111111111111111111111",
@@ -7731,6 +8046,21 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         }
         "set_tenant_sponsor" => {
             r#"curl -X POST /hives/motherbee/identity/tenants/tnt:550e8400-e29b-41d4-a716-446655440000/sponsor -d '{"sponsor_tenant_id":null}'"#
+        }
+        "vault_list" => "curl -X GET '/hives/motherbee/vault/secrets?prefix=sys:&tags=provider:openai&limit=100'",
+        "vault_put" => {
+            r#"curl -X POST /hives/motherbee/vault/secrets -d '{"key":"sys:openai-api-key","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"sys","owner_ilk":"ilk:550e8400-e29b-41d4-a716-446655440000","description":"OpenAI API key"}}'"#
+        }
+        "vault_get_metadata" => {
+            "curl -X GET /hives/motherbee/vault/secrets/sys:openai-api-key/metadata"
+        }
+        "vault_get" => "curl -X GET /hives/motherbee/vault/secrets/sys:openai-api-key",
+        "vault_delete" => "curl -X DELETE /hives/motherbee/vault/secrets/sys:openai-api-key",
+        "vault_rotate" => {
+            r#"curl -X POST /hives/motherbee/vault/secrets/sys:openai-api-key/rotate -d '{"value":{"api_key":"sk-rotated-..."}}'"#
+        }
+        "vault_rollback" => {
+            "curl -X POST /hives/motherbee/vault/secrets/sys:openai-api-key/rollback"
         }
         "inventory" => "curl -X GET /inventory",
         "list_versions" => "curl -X GET /versions",
@@ -7964,6 +8294,38 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Focused identity admin action for changing only the sponsor relationship of a tenant.",
             "Pass sponsor_tenant_id as a prefixed tenant id to assign a sponsor, or null to clear it.",
             "This does not create a tenant and does not modify ILK membership.",
+        ],
+        "vault_list" => vec![
+            "Lists metadata summaries only; it never returns secret values.",
+            "Non-admin callers only see secrets they are authorized to read.",
+            "Supports optional filter.prefix, filter.tenant_id, filter.tags, and filter.limit.",
+        ],
+        "vault_put" => vec![
+            "Writes plaintext to SY.vault over L2; SY.vault encrypts at rest and writes local audit.",
+            "value is secret-sensitive and must be redacted in previews/history.",
+            "metadata.tenant_id must be sys or tnt:<uuid>; metadata.owner_ilk must be ilk:<uuid>.",
+            "Same-value PUT is idempotent: the vault returns changed=false and does not increment version.",
+        ],
+        "vault_get_metadata" => vec![
+            "Reads metadata only; it never returns the secret value.",
+            "Use this for operator/Archi inspection whenever the secret value is not explicitly needed.",
+        ],
+        "vault_get" => vec![
+            "Reads the secret value and is secret-sensitive.",
+            "Use only when the operator explicitly needs the plaintext value; prefer vault_get_metadata for inspection.",
+            "Executor previews/history must redact the returned value.",
+        ],
+        "vault_delete" => vec![
+            "Deletes one secret. Admin/Architect only.",
+            "Use metadata/list first when you need to inspect before delete.",
+        ],
+        "vault_rotate" => vec![
+            "Rotates one secret value and preserves the immediately previous version for rollback.",
+            "value is secret-sensitive and must be redacted in previews/history.",
+        ],
+        "vault_rollback" => vec![
+            "Rolls one secret back to the immediately previous version.",
+            "Fails with NO_PREVIOUS_VERSION when no previous encrypted value is available.",
         ],
         "inventory" => vec![
             "Use GET /inventory for the full global inventory view.",
@@ -9602,6 +9964,18 @@ async fn handle_admin_command(
     ) {
         return handle_identity_command(ctx, client, action, payload, hive).await;
     }
+    if matches!(
+        action,
+        "vault_list"
+            | "vault_put"
+            | "vault_get"
+            | "vault_get_metadata"
+            | "vault_delete"
+            | "vault_rotate"
+            | "vault_rollback"
+    ) {
+        return handle_vault_command(ctx, client, action, payload, hive).await;
+    }
 
     if let Some(detail) = admin_payload_contract_error(action, &payload) {
         return Ok((
@@ -9920,6 +10294,37 @@ async fn handle_identity_command(
         "update_tenant" => ("TNT_UPDATE", "TNT_UPDATE_RESPONSE"),
         "set_tenant_sponsor" => ("TNT_SET_SPONSOR", "TNT_SET_SPONSOR_RESPONSE"),
         _ => return Err(format!("unsupported identity admin action: {action}").into()),
+    };
+    let response = send_system_request(
+        client,
+        &target,
+        request_msg,
+        response_msg,
+        payload,
+        admin_action_timeout(action),
+    )
+    .await;
+    Ok(build_admin_http_response(action, response))
+}
+
+async fn handle_vault_command(
+    ctx: &AdminContext,
+    client: &AdminRouterClient,
+    action: &str,
+    payload: serde_json::Value,
+    hive: Option<String>,
+) -> Result<(u16, String), AdminError> {
+    let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
+    let target = format!("SY.vault@{}", target_hive);
+    let (request_msg, response_msg) = match action {
+        "vault_list" => (MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE),
+        "vault_put" => (MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE),
+        "vault_get" => (MSG_VAULT_GET, MSG_VAULT_GET_RESPONSE),
+        "vault_get_metadata" => (MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE),
+        "vault_delete" => (MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE),
+        "vault_rotate" => (MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE),
+        "vault_rollback" => (MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE),
+        _ => return Err(format!("unsupported vault admin action: {action}").into()),
     };
     let response = send_system_request(
         client,
@@ -11840,6 +12245,125 @@ mod tests {
             json!(NODE_SECRET_REDACTION_TOKEN)
         );
         assert_eq!(redacted["list"][1]["safe"], json!("item"));
+    }
+
+    #[test]
+    fn redact_executor_log_value_redacts_vault_value_fields() {
+        let value = json!({
+            "action": "vault_get",
+            "payload": {
+                "status": "ok",
+                "key": "sys:openai-api-key",
+                "value": {
+                    "api_key": "sk-live"
+                },
+                "metadata": {
+                    "tenant_id": "sys",
+                    "owner_ilk": "ilk:11111111-1111-4111-8111-111111111111"
+                }
+            }
+        });
+
+        let redacted = redact_executor_log_value(&value);
+
+        assert_eq!(
+            redacted["payload"]["value"],
+            json!(NODE_SECRET_REDACTION_TOKEN)
+        );
+        assert_eq!(redacted["payload"]["key"], json!("sys:openai-api-key"));
+    }
+
+    #[test]
+    fn vault_actions_are_registered_with_flat_executor_schema() {
+        let put_spec = resolve_internal_action_spec("vault_put").expect("vault_put action");
+        let list_spec = resolve_internal_action_spec("vault_list").expect("vault_list action");
+        let get_meta_spec =
+            resolve_internal_action_spec("vault_get_metadata").expect("vault_get_metadata action");
+        let get_spec = resolve_internal_action_spec("vault_get").expect("vault_get action");
+        let delete_spec =
+            resolve_internal_action_spec("vault_delete").expect("vault_delete action");
+        let rotate_spec =
+            resolve_internal_action_spec("vault_rotate").expect("vault_rotate action");
+        let rollback_spec =
+            resolve_internal_action_spec("vault_rollback").expect("vault_rollback action");
+
+        assert!(put_spec.requires_target);
+        assert!(list_spec.requires_target);
+        assert!(delete_spec.requires_target);
+        assert!(rotate_spec.requires_target);
+        assert!(rollback_spec.requires_target);
+        assert!(admin_action_requires_confirmation("vault_put"));
+        assert!(admin_action_requires_confirmation("vault_get"));
+        assert!(admin_action_requires_confirmation("vault_delete"));
+        assert!(admin_action_requires_confirmation("vault_rotate"));
+        assert!(admin_action_requires_confirmation("vault_rollback"));
+        assert!(!admin_action_requires_confirmation("vault_list"));
+        assert!(!admin_action_requires_confirmation("vault_get_metadata"));
+        assert!(!admin_action_is_read_only("vault_put"));
+        assert!(!admin_action_is_read_only("vault_delete"));
+        assert!(!admin_action_is_read_only("vault_rotate"));
+        assert!(!admin_action_is_read_only("vault_rollback"));
+        assert!(admin_action_is_read_only("vault_list"));
+        assert!(admin_action_is_read_only("vault_get_metadata"));
+        assert!(admin_action_is_read_only("vault_get"));
+        assert_eq!(
+            admin_action_path_patterns("vault_list"),
+            vec!["GET /hives/{hive}/vault/secrets"]
+        );
+        assert_eq!(
+            admin_action_path_patterns("vault_put"),
+            vec!["POST /hives/{hive}/vault/secrets"]
+        );
+        assert_eq!(
+            admin_action_path_patterns("vault_get_metadata"),
+            vec!["GET /hives/{hive}/vault/secrets/{key}/metadata"]
+        );
+        assert_eq!(
+            admin_action_path_patterns("vault_get"),
+            vec!["GET /hives/{hive}/vault/secrets/{key}"]
+        );
+        assert_eq!(
+            admin_action_path_patterns("vault_delete"),
+            vec!["DELETE /hives/{hive}/vault/secrets/{key}"]
+        );
+        assert_eq!(
+            admin_action_path_patterns("vault_rotate"),
+            vec!["POST /hives/{hive}/vault/secrets/{key}/rotate"]
+        );
+        assert_eq!(
+            admin_action_path_patterns("vault_rollback"),
+            vec!["POST /hives/{hive}/vault/secrets/{key}/rollback"]
+        );
+
+        let put_schema = build_admin_executor_function_definition(put_spec).parameters_json_schema;
+        assert_eq!(
+            put_schema["required"],
+            json!(["hive", "key", "value", "metadata"])
+        );
+        assert!(put_schema["properties"]["value"].is_object());
+
+        let get_meta_schema =
+            build_admin_executor_function_definition(get_meta_spec).parameters_json_schema;
+        assert_eq!(get_meta_schema["required"], json!(["hive", "key"]));
+
+        let get_schema = build_admin_executor_function_definition(get_spec).parameters_json_schema;
+        assert_eq!(get_schema["required"], json!(["hive", "key"]));
+
+        let list_schema =
+            build_admin_executor_function_definition(list_spec).parameters_json_schema;
+        assert_eq!(list_schema["required"], json!(["hive"]));
+
+        let rotate_schema =
+            build_admin_executor_function_definition(rotate_spec).parameters_json_schema;
+        assert_eq!(rotate_schema["required"], json!(["hive", "key", "value"]));
+
+        let delete_schema =
+            build_admin_executor_function_definition(delete_spec).parameters_json_schema;
+        assert_eq!(delete_schema["required"], json!(["hive", "key"]));
+
+        let rollback_schema =
+            build_admin_executor_function_definition(rollback_spec).parameters_json_schema;
+        assert_eq!(rollback_schema["required"], json!(["hive", "key"]));
     }
 
     #[test]

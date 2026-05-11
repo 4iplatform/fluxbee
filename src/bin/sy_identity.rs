@@ -2848,6 +2848,7 @@ fn sync_identity_shm_mappings(
             handbook_hashes: [[0u8; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
             created_at: now_ms,
             updated_at: now_ms,
+            personality_hash: [0u8; 32],
             _reserved: [0u8; 8],
         };
         apply_definition_to_ilk_entry(&mut ilk_entry, &ilk.definition)?;
@@ -3027,6 +3028,7 @@ fn ilk_entry_from_record(ilk: &IlkRecord) -> Result<IlkEntry, IdentityError> {
         handbook_hashes: [[0u8; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
         created_at: now_ms,
         updated_at: now_ms,
+        personality_hash: [0u8; 32],
         _reserved: [0u8; 8],
     };
     apply_definition_to_ilk_entry(&mut entry, &ilk.definition)?;
@@ -3852,7 +3854,7 @@ fn normalize_agent_definition(definition: &Value) -> Result<Value, String> {
     for key in obj.keys() {
         if !matches!(
             key.as_str(),
-            "role_hash" | "skill_hashes" | "handbook_hashes"
+            "role_hash" | "skill_hashes" | "handbook_hashes" | "personality_hash"
         ) {
             return Err("INVALID_DEFINITION".to_string());
         }
@@ -3866,8 +3868,13 @@ fn normalize_agent_definition(definition: &Value) -> Result<Value, String> {
         "handbook_hashes",
         AGENT_DEFINITION_MAX_HANDBOOKS,
     )?;
+    let personality_hash = normalize_optional_hash(definition, "personality_hash")?;
 
-    if role_hash.is_none() && skill_hashes.is_empty() && handbook_hashes.is_empty() {
+    if role_hash.is_none()
+        && skill_hashes.is_empty()
+        && handbook_hashes.is_empty()
+        && personality_hash.is_none()
+    {
         return Ok(json!({}));
     }
 
@@ -3883,6 +3890,12 @@ fn normalize_agent_definition(definition: &Value) -> Result<Value, String> {
         "handbook_hashes".to_string(),
         Value::Array(handbook_hashes.into_iter().map(Value::String).collect()),
     );
+    if let Some(personality_hash) = personality_hash {
+        out.insert(
+            "personality_hash".to_string(),
+            Value::String(personality_hash),
+        );
+    }
     Ok(Value::Object(out))
 }
 
@@ -3909,6 +3922,7 @@ fn agent_definition_present(definition: &Value) -> bool {
                     .and_then(Value::as_array)
                     .map(|items| !items.is_empty())
                     .unwrap_or(false)
+                || obj.get("personality_hash").is_some()
         })
         .unwrap_or(false)
 }
@@ -3938,13 +3952,11 @@ fn apply_definition_to_ilk_entry(
     entry: &mut IlkEntry,
     definition: &Value,
 ) -> Result<(), IdentityError> {
-    if let Some(role_hash) = definition
+    entry.role_hash = definition
         .get("role_hash")
         .and_then(Value::as_str)
         .and_then(sha256_hex_to_bytes)
-    {
-        entry.role_hash = role_hash;
-    }
+        .unwrap_or([0u8; 32]);
     let (skill_hashes, skill_count) = definition_hash_array_for_shm::<
         IDENTITY_DEFINITION_MAX_SKILLS,
     >(definition, "skill_hashes")?;
@@ -3955,6 +3967,11 @@ fn apply_definition_to_ilk_entry(
     entry.skill_count = skill_count;
     entry.handbook_hashes = handbook_hashes;
     entry.handbook_count = handbook_count;
+    entry.personality_hash = definition
+        .get("personality_hash")
+        .and_then(Value::as_str)
+        .and_then(sha256_hex_to_bytes)
+        .unwrap_or([0u8; 32]);
     Ok(())
 }
 
@@ -5588,6 +5605,7 @@ mod tests {
         let role_hash = "A".repeat(64);
         let skill_hash = "b".repeat(64);
         let handbook_hash = "C".repeat(64);
+        let personality_hash = "D".repeat(64);
         let out = store
             .set_ilk_definition(IlkSetDefinitionRequest {
                 ilk_id: "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
@@ -5595,6 +5613,7 @@ mod tests {
                     "role_hash": role_hash,
                     "skill_hashes": [skill_hash],
                     "handbook_hashes": [handbook_hash],
+                    "personality_hash": personality_hash,
                 }),
             })
             .expect("set definition");
@@ -5603,6 +5622,7 @@ mod tests {
         let expected_role_hash = "a".repeat(64);
         let expected_skill_hash = "b".repeat(64);
         let expected_handbook_hash = "c".repeat(64);
+        let expected_personality_hash = "d".repeat(64);
         assert_eq!(
             definition.get("role_hash").and_then(Value::as_str),
             Some(expected_role_hash.as_str())
@@ -5623,9 +5643,59 @@ mod tests {
                 .and_then(Value::as_str),
             Some(expected_handbook_hash.as_str())
         );
+        assert_eq!(
+            definition.get("personality_hash").and_then(Value::as_str),
+            Some(expected_personality_hash.as_str())
+        );
         assert!(agent_definition_present(
             &store.ilks["ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"].definition
         ));
+    }
+
+    #[test]
+    fn set_ilk_definition_handles_personality_only_and_clears_it() {
+        let mut store = IdentityStore::default();
+        store.ilks.insert(
+            "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+            IlkRecord {
+                ilk_id: "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                ilk_type: "agent".to_string(),
+                registration_status: "complete".to_string(),
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                identification: json!({}),
+                definition: json!({}),
+                channels: Vec::new(),
+                deleted_at_ms: None,
+            },
+        );
+
+        let personality_hash = "9".repeat(64);
+        let out = store
+            .set_ilk_definition(IlkSetDefinitionRequest {
+                ilk_id: "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                definition: json!({"personality_hash": personality_hash}),
+            })
+            .expect("set personality only");
+        let definition = out.get("definition").expect("definition");
+        assert_eq!(
+            definition.get("personality_hash").and_then(Value::as_str),
+            Some(personality_hash.as_str())
+        );
+        assert!(definition.get("role_hash").is_none());
+
+        let cleared = store
+            .set_ilk_definition(IlkSetDefinitionRequest {
+                ilk_id: "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                definition: json!({}),
+            })
+            .expect("clear definition");
+        assert_eq!(cleared.get("definition"), Some(&json!({})));
+
+        let bad = store.set_ilk_definition(IlkSetDefinitionRequest {
+            ilk_id: "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+            definition: json!({"personality_hash": "not-a-hash"}),
+        });
+        assert!(bad.is_err());
     }
 
     #[test]

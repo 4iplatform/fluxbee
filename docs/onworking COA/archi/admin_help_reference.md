@@ -1,8 +1,8 @@
 # Fluxbee — Referencia completa de acciones SY.admin
 
-**Fecha extracción:** 2026-04-24  
+**Fecha extracción:** 2026-05-11  
 **Fuente:** `src/bin/sy_admin.rs`  
-**Total acciones:** 67
+**Total acciones:** 74
 **Propósito:** Documentar exactamente qué información está disponible en el help de admin para los modelos que usan `get_admin_action_help`.
 
 ---
@@ -18,7 +18,7 @@ Archi accede al mismo endpoint a través del sistema de lectura genérico (`flux
 
 ### Acciones que requieren CONFIRM
 
-`publish_runtime_package`, `remove_hive`, `kill_node`, `remove_node_instance`, `remove_runtime_version`, `set_node_config`, `node_control_config_set`, `set_storage`, `create_tenant`, `update_tenant`, `set_tenant_sponsor`, `update`, `sync_hint`, `opa_compile`, `opa_compile_apply`, `opa_apply`, `opa_rollback`, `wf_rules_compile`, `wf_rules_compile_apply`, `send_node_message`
+`publish_runtime_package`, `remove_hive`, `kill_node`, `remove_node_instance`, `remove_runtime_version`, `set_node_config`, `node_control_config_set`, `set_storage`, `create_tenant`, `update_tenant`, `set_tenant_sponsor`, `vault_put`, `vault_get`, `vault_delete`, `vault_rotate`, `vault_rollback`, `update`, `sync_hint`, `opa_compile`, `opa_compile_apply`, `opa_apply`, `opa_rollback`, `wf_rules_compile`, `wf_rules_compile_apply`, `send_node_message`
 
 ---
 
@@ -246,6 +246,64 @@ POST /hives/motherbee/identity/ilks/ilk:ai-support/definition
 - **Campos requeridos:** `sponsor_tenant_id` (`tnt:<uuid>` o `null`)
 - **Executor args:** planos en `step.args`; no usar `body`.
 - **Uso:** cambio enfocado de relación sponsor sin tocar otros campos.
+
+---
+
+## Categoría 5b — Vault y secretos (7 acciones)
+
+### `vault_list`
+- **Path:** `GET /hives/{hive}/vault/secrets`
+- **Descripción:** Lista metadata/resúmenes de secrets visibles para el caller; nunca devuelve valores.
+- **Read-only:** sí
+- **Campos opcionales:** `filter.prefix`, `filter.tenant_id`, `filter.tags`, `filter.limit`
+- **Executor args:** planos: `{"hive":"motherbee","filter":{"prefix":"sys:","limit":100}}`
+- **Nota:** callers no-admin solo ven secrets que podrían leer; esto evita enumeración de keys no autorizadas.
+
+### `vault_put`
+- **Path:** `POST /hives/{hive}/vault/secrets`
+- **Descripción:** Escribe o actualiza un secret en `SY.vault`; el valor se cifra at-rest y se audita localmente.
+- **Read-only:** no | **Requiere CONFIRM:** sí
+- **Campos requeridos:** `key` (string), `value` (object), `metadata` (object)
+- **Metadata mínima:** `metadata.tenant_id` (`sys` o `tnt:<uuid>`), `metadata.owner_ilk` (`ilk:<uuid>`)
+- **Executor args:** planos en `step.args`; no usar `body`.
+- **Nota crítica:** `value` es sensible y debe quedar redacted en previews, history y logs. PUT con el mismo valor es idempotente y no incrementa versión.
+- **Ejemplo:** `POST /hives/motherbee/vault/secrets {"key":"sys:openai-api-key","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"sys","owner_ilk":"ilk:550e8400-e29b-41d4-a716-446655440000"}}`
+
+### `vault_get_metadata`
+- **Path:** `GET /hives/{hive}/vault/secrets/{key}/metadata`
+- **Descripción:** Lee metadata de un secret sin devolver el valor.
+- **Read-only:** sí
+- **Executor args:** planos: `{"hive":"motherbee","key":"sys:openai-api-key"}`
+- **Uso recomendado:** inspección por operador/Archi cuando no se necesita plaintext.
+
+### `vault_get`
+- **Path:** `GET /hives/{hive}/vault/secrets/{key}`
+- **Descripción:** Lee el valor plaintext del secret.
+- **Read-only:** sí | **Requiere CONFIRM:** sí
+- **Executor args:** planos: `{"hive":"motherbee","key":"sys:openai-api-key"}`
+- **Nota crítica:** usar solo si el operador pide explícitamente el valor. Para inspección normal usar `vault_get_metadata`.
+
+### `vault_delete`
+- **Path:** `DELETE /hives/{hive}/vault/secrets/{key}`
+- **Descripción:** Borra un secret de `SY.vault`.
+- **Read-only:** no | **Requiere CONFIRM:** sí
+- **Executor args:** planos: `{"hive":"motherbee","key":"sys:openai-api-key"}`
+- **Nota:** admin/architect only.
+
+### `vault_rotate`
+- **Path:** `POST /hives/{hive}/vault/secrets/{key}/rotate`
+- **Descripción:** Rota el valor de un secret y conserva la versión previa para rollback.
+- **Read-only:** no | **Requiere CONFIRM:** sí
+- **Campos requeridos:** `key` (string), `value` (object)
+- **Executor args:** planos: `{"hive":"motherbee","key":"sys:openai-api-key","value":{"api_key":"sk-..."}}`
+- **Nota crítica:** `value` es sensible y debe quedar redacted en previews/history/logs.
+
+### `vault_rollback`
+- **Path:** `POST /hives/{hive}/vault/secrets/{key}/rollback`
+- **Descripción:** Revierte un secret a su versión inmediatamente anterior.
+- **Read-only:** no | **Requiere CONFIRM:** sí
+- **Executor args:** planos: `{"hive":"motherbee","key":"sys:openai-api-key"}`
+- **Error esperado:** `NO_PREVIOUS_VERSION` si no hay versión anterior disponible.
 
 ### `inventory`
 - **Path:** `GET /inventory`, `GET /inventory/summary`, `GET /inventory/{hive}`, `GET /hives/{hive}/inventory/summary`

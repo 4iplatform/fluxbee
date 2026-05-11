@@ -33,7 +33,7 @@ pub const MSG_TNT_SET_SPONSOR: &str = "TNT_SET_SPONSOR";
 pub const MSG_TNT_APPROVE: &str = "TNT_APPROVE";
 pub const MSG_IDENTITY_METRICS: &str = "IDENTITY_METRICS";
 const IDENTITY_MAGIC: u32 = 0x4A534944; // "JSID"
-const IDENTITY_VERSION: u32 = 5;
+const IDENTITY_VERSION: u32 = 6;
 const IDENTITY_DEFINITION_MAX_SKILLS: usize = 16;
 const IDENTITY_DEFINITION_MAX_HANDBOOKS: usize = 8;
 const REGION_ALIGNMENT: usize = 64;
@@ -102,6 +102,8 @@ pub struct IdentityIlkOption {
     pub skill_hashes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub handbook_hashes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personality_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -340,6 +342,7 @@ struct IlkEntry {
     handbook_hashes: [[u8; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
     created_at: u64,
     updated_at: u64,
+    personality_hash: [u8; 32],
     _reserved: [u8; 8],
 }
 
@@ -1645,7 +1648,9 @@ fn sha256_bytes_is_zero(bytes: &[u8; 32]) -> bool {
     bytes.iter().all(|byte| *byte == 0)
 }
 
-fn definition_hashes_from_ilk(ilk: &IlkEntry) -> (Option<String>, Vec<String>, Vec<String>) {
+fn definition_hashes_from_ilk(
+    ilk: &IlkEntry,
+) -> (Option<String>, Vec<String>, Vec<String>, Option<String>) {
     let role_hash =
         (!sha256_bytes_is_zero(&ilk.role_hash)).then(|| sha256_bytes_to_hex(&ilk.role_hash));
     let skill_count = usize::min(ilk.skill_count as usize, IDENTITY_DEFINITION_MAX_SKILLS);
@@ -1661,11 +1666,14 @@ fn definition_hashes_from_ilk(ilk: &IlkEntry) -> (Option<String>, Vec<String>, V
         .iter()
         .map(sha256_bytes_to_hex)
         .collect();
-    (role_hash, skill_hashes, handbook_hashes)
+    let personality_hash = (!sha256_bytes_is_zero(&ilk.personality_hash))
+        .then(|| sha256_bytes_to_hex(&ilk.personality_hash));
+    (role_hash, skill_hashes, handbook_hashes, personality_hash)
 }
 
 fn identity_ilk_option_from_entry(ilk: &IlkEntry) -> IdentityIlkOption {
-    let (role_hash, skill_hashes, handbook_hashes) = definition_hashes_from_ilk(ilk);
+    let (role_hash, skill_hashes, handbook_hashes, personality_hash) =
+        definition_hashes_from_ilk(ilk);
     IdentityIlkOption {
         ilk_id: prefixed_uuid_from_bytes("ilk", ilk.ilk_id),
         tenant_id: prefixed_uuid_from_bytes("tnt", ilk.tenant_id),
@@ -1682,6 +1690,7 @@ fn identity_ilk_option_from_entry(ilk: &IlkEntry) -> IdentityIlkOption {
         role_hash,
         skill_hashes,
         handbook_hashes,
+        personality_hash,
     }
 }
 
@@ -2016,6 +2025,7 @@ mod tests {
             handbook_hashes: [[0; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
             created_at: 0,
             updated_at: 0,
+            personality_hash: [0; 32],
             _reserved: [0; 8],
         };
         let mut skill_hashes = [[0; 32]; IDENTITY_DEFINITION_MAX_SKILLS];
@@ -2042,6 +2052,7 @@ mod tests {
             handbook_hashes,
             created_at: 0,
             updated_at: 0,
+            personality_hash: [0; 32],
             _reserved: [0; 8],
         };
         let ich_primary = IchEntry {
@@ -2123,6 +2134,7 @@ mod tests {
             handbook_hashes: [[0; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
             created_at: 0,
             updated_at: 0,
+            personality_hash: [0; 32],
             _reserved: [0; 8],
         };
         let ich = IchEntry {
@@ -2273,6 +2285,7 @@ mod tests {
             handbook_hashes: [[0; 32]; IDENTITY_DEFINITION_MAX_HANDBOOKS],
             created_at: 0,
             updated_at: 0,
+            personality_hash: [0; 32],
             _reserved: [0; 8],
         };
         let layout = layout_identity(IdentityRegionLimits {
