@@ -347,9 +347,9 @@ mod tests {
 
     #[test]
     fn parses_json_inside_code_fence() {
-        let raw = "```json\n{\"tags\":[\"support\"],\"reason_signals_canonical\":[\"request\"],\"reason_signals_extra\":[]}\n```";
+        let raw = "```json\n{\"tags\":[\"billing\"],\"reason_signals_canonical\":[\"request\"],\"reason_signals_extra\":[]}\n```";
         let parsed = parse_semantic_tagger_response(raw, 4, 4).expect("should parse");
-        assert_eq!(parsed.tags, vec!["support"]);
+        assert_eq!(parsed.tags, vec!["billing"]);
         assert_eq!(parsed.reason_signals_canonical, vec!["request"]);
     }
 

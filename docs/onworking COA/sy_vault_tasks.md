@@ -243,7 +243,7 @@ Default `vault_get_with_retry` policy:
   - exposes the same vault-backed OpenAI config contract through node L2 `CONFIG_GET` / `CONFIG_SET`, so admin `node_control_config_get/set` is the canonical control path.
   - orchestrator starts configured `system_nodes` from `hive.yaml` with `SY.identity` first; `sy.identity` seeds deterministic `system` ILKs from the same list, so vault consumers must have real `ilk:<uuid>` ownership instead of placeholder/workaround metadata.
   - the `hive.yaml` schema uses the compact `system_nodes.<role>.{nodes, wait_for}` shape (service/exec/start/critical are derived/defaulted in code, not declared per entry).
-  - each Rust SY (`sy_admin`, `sy_architect`, `sy_cognition`, `sy_config_routes`, `sy_identity`, `sy_policy`, `sy_storage`, `sy_vault`) resolves its own `ilk:<uuid>` at boot via `fluxbee_sdk::identity::wait_for_self_system_ilk_id(...)` and caches it for the process lifetime, so outgoing vault calls can set `meta.src_ilk` directly without an extra identity round-trip. Go-side SYs (`sy-timer`, `sy-wf-rules`, `sy-opa-rules`) gain the equivalent lookup as a follow-up.
+  - every SY except `sy_orchestrator` resolves its own `ilk:<uuid>` at boot from identity SHM and caches it for the process lifetime, so outgoing vault calls can set `meta.src_ilk` directly without an extra identity round-trip. Rust SYs use `fluxbee_sdk::identity::wait_for_self_system_ilk_id(...)`; Go SYs (`sy-timer`, `sy-wf-rules`, `sy-opa-rules`) use the symmetric `fluxbee-go-sdk.WaitForSelfSystemIlkID(...)`.
 - [ ] VA-G4. Migrate `ai.generic` OpenAI key to vault refs.
 - [ ] VA-G5. Migrate IO secret-bearing configs to vault refs:
   - `IO.api` API keys/webhook secrets;

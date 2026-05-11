@@ -295,9 +295,9 @@ Once the SY ILKs are seeded by identity, each Rust SY binary resolves its own IL
 
 This is what enables a SY to use `meta.src_ilk = <own ILK>` in outgoing calls — required for `SY.vault` access control and any other path where L3 identity matters.
 
-Wired SYs (resolve at boot): `sy_admin`, `sy_architect`, `sy_cognition`, `sy_config_routes`, `sy_identity` (uses its own internal derive, no SHM wait), `sy_policy`, `sy_storage`, `sy_vault`.
+Wired Rust SYs (resolve at boot): `sy_admin`, `sy_architect`, `sy_cognition`, `sy_config_routes`, `sy_identity` (uses its own internal derive, no SHM wait), `sy_policy`, `sy_storage`, `sy_vault`.
 
-Go-side SYs (`sy-timer`, `sy-wf-rules`, `sy-opa-rules`) gain the same lookup as a follow-up via a Go-side helper mirroring the Rust SDK function.
+Wired Go SYs (resolve at boot via `fluxbee-go-sdk.WaitForSelfSystemIlkID`): `sy-timer`, `sy-wf-rules`, `sy-opa-rules`. The Go SDK gained a symmetric helper plus `LookupIlkByHandlerNode` that scans `IlkEntry` rows by `handler_node` under the same seqlock contract used elsewhere. The Go-side `identityVersionCurrent` is also bumped to 6 and `ilkEntrySize` to 1160 to match the Rust struct layout.
 
 `sy_orchestrator` is excluded: it does not sign outgoing messages with `src_ilk` (uses L2 routing source name).
 

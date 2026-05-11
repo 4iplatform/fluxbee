@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"strings"
@@ -72,6 +73,22 @@ func Run(runtimeCfg RuntimeConfig) error {
 	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return fmt.Errorf("sy-wf-rules already running (lock held): %w", err)
 	}
+
+	hiveID, err := fluxbeesdk.LoadHiveID(runtimeCfg.ConfigDir)
+	if err != nil {
+		return fmt.Errorf("load hive id: %w", err)
+	}
+	selfIlkID, err := fluxbeesdk.WaitForSelfSystemIlkID(
+		hiveID,
+		runtimeCfg.NodeBaseName,
+		30*time.Second,
+		250*time.Millisecond,
+	)
+	if err != nil {
+		return fmt.Errorf("resolve self system ILK: %w", err)
+	}
+	log.Printf("resolved self system ILK from identity SHM: %s", selfIlkID)
+	_ = selfIlkID // cached for future outgoing meta.src_ilk use
 
 	sender, receiver, err := fluxbeesdk.Connect(fluxbeesdk.NodeConfig{
 		Name:               runtimeCfg.NodeBaseName,

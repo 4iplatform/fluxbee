@@ -379,6 +379,12 @@ func loadHiveID(configDir string) (string, error) {
 	return hive.HiveID, nil
 }
 
+// LoadHiveID exposes the hive_id parsed from hive.yaml for callers that need it
+// outside Connect (e.g. to call WaitForSelfSystemIlkID before sender wiring).
+func LoadHiveID(configDir string) (string, error) {
+	return loadHiveID(configDir)
+}
+
 func normalizeNodeName(name, hiveID string) (string, string) {
 	if strings.Contains(name, "@") {
 		parts := strings.SplitN(name, "@", 2)

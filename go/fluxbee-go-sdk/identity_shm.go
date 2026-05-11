@@ -16,14 +16,14 @@ import (
 
 const (
 	identityMagic            uint32 = 0x4A534944 // "JSID"
-	identityVersionCurrent   uint32 = 5
+	identityVersionCurrent   uint32 = 6
 	identityRegionAlign             = 64
 	identitySeqlockTimeoutMs        = 50
 
 	// Struct sizes computed from #[repr(C)] Rust layout rules.
 	identityHeaderSize  = 176
 	tenantEntrySize     = 316
-	ilkEntrySize        = 1128
+	ilkEntrySize        = 1160
 	ichEntrySize        = 352
 	ichMappingEntrySize = 384
 
@@ -36,10 +36,19 @@ const (
 	ichMapOffTenantID    = 328 // [u8; 16]
 	ichMapOffFlags       = 344 // u16
 
+	// Field offsets within IlkEntry (1160 bytes total).
+	ilkOffIlkID       = 0
+	ilkOffFlags       = 18  // u16
+	ilkOffHandlerNode = 164 // [u8; 128]
+
+	// IlkEntry flags.
+	ilkFlagActive uint16 = 0x0001
+
 	// Field offsets within IdentityHeader.
 	hdrOffMagic          = 0
 	hdrOffVersion        = 4
 	hdrOffSeq            = 8 // AtomicU64
+	hdrOffIlkCount       = 20
 	hdrOffMaxIlks        = 40
 	hdrOffMaxTenants     = 44
 	hdrOffMaxIchs        = 48
@@ -260,4 +269,142 @@ func identityFixedStrMatches(buf []byte, value string) bool {
 // On Linux, shm_open("/foo") maps to /dev/shm/foo.
 func shmFilePath(name string) string {
 	return "/dev/shm/" + strings.TrimPrefix(name, "/")
+}
+
+// LookupIlkByHandlerNode resolves the active ILK whose `handler_node` matches
+// the given L2 name (e.g. "SY.timer@motherbee") from the hive's identity SHM.
+// Returns ("ilk:<uuid>", true, nil) on hit, ("", false, nil) on miss.
+func LookupIlkByHandlerNode(hiveID, handlerNode string) (string, bool, error) {
+	name := fmt.Sprintf("/jsr-identity-%s", strings.TrimSpace(hiveID))
+	return lookupIlkByHandlerNodeShm(name, handlerNode)
+}
+
+func lookupIlkByHandlerNodeShm(shmName, handlerNode string) (string, bool, error) {
+	handler := strings.TrimSpace(handlerNode)
+	if handler == "" {
+		return "", false, nil
+	}
+	path := shmFilePath(shmName)
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("identity shm open %q: %w", path, err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return "", false, fmt.Errorf("identity shm stat: %w", err)
+	}
+	size := int(fi.Size())
+	if size < identityHeaderSize {
+		return "", false, nil
+	}
+	data, err := syscall.Mmap(int(f.Fd()), 0, size, syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		return "", false, fmt.Errorf("identity shm mmap: %w", err)
+	}
+	defer syscall.Munmap(data) //nolint:errcheck
+
+	magic := binary.LittleEndian.Uint32(data[hdrOffMagic:])
+	if magic != identityMagic {
+		return "", false, nil
+	}
+	version := binary.LittleEndian.Uint32(data[hdrOffVersion:])
+	if version != identityVersionCurrent {
+		return "", false, nil
+	}
+
+	ilkCount := int(binary.LittleEndian.Uint32(data[hdrOffIlkCount:]))
+	maxIlks := int(binary.LittleEndian.Uint32(data[hdrOffMaxIlks:]))
+	maxTenants := int(binary.LittleEndian.Uint32(data[hdrOffMaxTenants:]))
+	if maxIlks <= 0 {
+		return "", false, nil
+	}
+	if ilkCount > maxIlks {
+		ilkCount = maxIlks
+	}
+
+	ilkOffset := identityAlignUp(identityHeaderSize, identityRegionAlign)
+	ilkOffset = identityAlignUp(ilkOffset+tenantEntrySize*maxTenants, identityRegionAlign)
+	needed := ilkOffset + ilkCount*ilkEntrySize
+	if needed > size {
+		return "", false, nil
+	}
+
+	seqPtr := (*uint64)(unsafe.Pointer(&data[hdrOffSeq]))
+	deadline := time.Now().Add(identitySeqlockTimeoutMs * time.Millisecond)
+	for {
+		s1 := atomic.LoadUint64(seqPtr)
+		if s1&1 != 0 {
+			runtime.Gosched()
+			if time.Now().After(deadline) {
+				return "", false, nil
+			}
+			continue
+		}
+		ilkBytes, found := scanIlkEntriesByHandler(data[ilkOffset:], ilkCount, handler)
+		s2 := atomic.LoadUint64(seqPtr)
+		if s1 == s2 {
+			if found {
+				return "ilk:" + uuid.UUID(ilkBytes).String(), true, nil
+			}
+			return "", false, nil
+		}
+		if time.Now().After(deadline) {
+			return "", false, nil
+		}
+		runtime.Gosched()
+	}
+}
+
+func scanIlkEntriesByHandler(buf []byte, count int, handler string) ([16]byte, bool) {
+	var zero [16]byte
+	for i := 0; i < count; i++ {
+		off := i * ilkEntrySize
+		if off+ilkEntrySize > len(buf) {
+			return zero, false
+		}
+		entry := buf[off : off+ilkEntrySize]
+		flags := binary.LittleEndian.Uint16(entry[ilkOffFlags:])
+		if flags&ilkFlagActive == 0 {
+			continue
+		}
+		handlerBuf := entry[ilkOffHandlerNode : ilkOffHandlerNode+128]
+		if !identityFixedStrMatches(handlerBuf, handler) {
+			continue
+		}
+		var ilkID [16]byte
+		copy(ilkID[:], entry[ilkOffIlkID:ilkOffIlkID+16])
+		return ilkID, true
+	}
+	return zero, false
+}
+
+// WaitForSelfSystemIlkID blocks until the SY node's own ILK (seeded by SY.identity)
+// is visible in identity SHM and returns its "ilk:<uuid>" string. selfBaseName is
+// the L2 base (e.g. "SY.timer") — the hive is appended automatically.
+func WaitForSelfSystemIlkID(hiveID, selfBaseName string, timeout, pollInterval time.Duration) (string, error) {
+	handler := strings.TrimSpace(selfBaseName)
+	if handler == "" {
+		return "", fmt.Errorf("self base name is empty")
+	}
+	if !strings.Contains(handler, "@") {
+		handler = fmt.Sprintf("%s@%s", handler, strings.TrimSpace(hiveID))
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		ilkID, ok, err := LookupIlkByHandlerNode(hiveID, handler)
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			return ilkID, nil
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("self system ILK not visible for handler_node=%q after %s", handler, timeout)
+		}
+		time.Sleep(pollInterval)
+	}
 }

@@ -122,6 +122,22 @@ type timerReference struct {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
+	hiveID, err := fluxbeesdk.LoadHiveID(configDir)
+	if err != nil {
+		log.Fatalf("failed to load hive id: %v", err)
+	}
+	selfIlkID, err := fluxbeesdk.WaitForSelfSystemIlkID(
+		hiveID,
+		defaultNodeBaseName,
+		30*time.Second,
+		250*time.Millisecond,
+	)
+	if err != nil {
+		log.Fatalf("failed to resolve self system ILK from identity SHM: %v", err)
+	}
+	log.Printf("resolved self system ILK from identity SHM: %s", selfIlkID)
+	_ = selfIlkID // cached for future outgoing meta.src_ilk use
+
 	sender, receiver, err := fluxbeesdk.Connect(fluxbeesdk.NodeConfig{
 		Name:               defaultNodeBaseName,
 		RouterSocket:       routerSockDir,
