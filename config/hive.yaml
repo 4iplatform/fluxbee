@@ -27,7 +27,6 @@ storage:
 
 # Identity runtime settings.
 identity:
-  default_tenant: "fluxbee"
   sync:
     port: 9100
 

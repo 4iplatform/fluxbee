@@ -36,7 +36,7 @@ tnt:fluxbee-infra (root, sponsor=NULL — the infrastructure tenant)
   └── sponsor of → tnt:admin-maria (another admin)
 ```
 
-The root tenant (sponsor=NULL) is the infrastructure tenant. In self-hosted, it's the default `fluxbee` tenant. In cloud, it's the platform operator's tenant.
+The root tenant (sponsor=NULL) is the infrastructure tenant. In self-hosted, it is the native fixed `fluxbee` tenant: `tnt:00000000-0000-0000-0000-000000000001`.
 
 ### 2.1.1 Where tenant data is created, read, and updated
 
@@ -237,27 +237,21 @@ SET
 
 Add `$6` parameter for `sponsor_tenant_id` (can be NULL).
 
-### 2.8 `default_tenant_id()` fix (line 525)
+### 2.8 Native root tenant is fixed by code
 
-Current implementation returns the first key from a HashMap — non-deterministic order.
+The default/root tenant is not configurable and is not regenerated on each install.
 
-Change to: return the tenant with `sponsor_tenant_id = None` (the root tenant). If multiple roots exist (shouldn't happen in normal operation), return the first alphabetically by tenant_id for determinism.
+- Name: `fluxbee`
+- Tenant id: `tnt:00000000-0000-0000-0000-000000000001`
+- Status: `active`
+- `sponsor_tenant_id`: `NULL`
 
 ```rust
 fn default_tenant_id(&self) -> Option<String> {
-    // prefer root tenant (no sponsor)
-    let mut root_tenants: Vec<&String> = self.tenants.iter()
-        .filter(|(_, t)| t.sponsor_tenant_id.is_none())
-        .map(|(id, _)| id)
-        .collect();
-    root_tenants.sort();
-    if let Some(id) = root_tenants.first() {
-        return Some((*id).clone());
+    if self.tenants.contains_key(DEFAULT_ROOT_TENANT_ID) {
+        return Some(DEFAULT_ROOT_TENANT_ID.to_string());
     }
-    // fallback: any tenant, sorted for determinism
-    let mut all: Vec<&String> = self.tenants.keys().collect();
-    all.sort();
-    all.first().map(|id| (*id).clone())
+    None
 }
 ```
 
@@ -313,8 +307,8 @@ Important separation:
 The relationship is:
 
 - The **root/default tenant** is the native infrastructure tenant for the hive/control-plane.
-- Root tenant is identified by `sponsor_tenant_id = NULL`.
-- `default_tenant_id()` prefers a root tenant (`sponsor_tenant_id = NULL`) deterministically.
+- The native root tenant is always `fluxbee` / `tnt:00000000-0000-0000-0000-000000000001`.
+- `default_tenant_id()` does not fall back to arbitrary root tenants.
 - Sponsored tenants are children of that root or of another sponsored/admin tenant.
 
 So the model is:
@@ -725,7 +719,7 @@ Workers must be compiled with the new struct definitions before receiving deltas
 [ ] create_tenant: validate sponsor exists
 [ ] create_tenant: propagate sponsor_tenant_id to TenantRecord
 [ ] upsert_tenant_in_db: add $6 parameter for sponsor
-[ ] default_tenant_id: return root tenant (sponsor=NULL) deterministically
+[ ] default_tenant_id: return only the fixed native root tenant id
 [ ] TenantEntry SHM: add sponsor_tenant_id [u8; 16]
 [ ] tenant_entry_from_record: populate sponsor_tenant_id bytes
 [ ] TNT_CREATE_RESPONSE: include sponsor_tenant_id

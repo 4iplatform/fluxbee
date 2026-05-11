@@ -460,7 +460,6 @@ government:
   identity_frontdesk: SY.frontdesk.gov@motherbee
 
 identity:
-  default_tenant: fluxbee
   merge_alias_ttl_secs: 3600
   max_ilks: 8192
   max_tenants: 1024

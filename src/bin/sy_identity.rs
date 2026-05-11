@@ -34,6 +34,7 @@ type IdentityError = Box<dyn std::error::Error + Send + Sync>;
 const PRIMARY_HIVE_ID: &str = "motherbee";
 
 const DEFAULT_DEFAULT_TENANT_NAME: &str = "fluxbee";
+const DEFAULT_ROOT_TENANT_ID: &str = "tnt:00000000-0000-0000-0000-000000000001";
 const DEFAULT_MERGE_ALIAS_TTL_SECS: u64 = 3600;
 const ALIAS_GC_INTERVAL_SECS: u64 = 30;
 const DEFAULT_IDENTITY_SYNC_PORT: u16 = 9100;
@@ -159,8 +160,6 @@ struct WanSection {
 
 #[derive(Debug, Deserialize)]
 struct IdentitySection {
-    #[serde(default)]
-    default_tenant: Option<String>,
     #[serde(default)]
     merge_alias_ttl_secs: Option<u64>,
     #[serde(default)]
@@ -660,37 +659,60 @@ impl IdentityStore {
         })
     }
 
-    fn with_default_tenant(name: &str) -> Self {
+    fn with_default_tenant() -> Self {
         let mut out = Self::default();
-        let tenant_id = format!("tnt:{}", Uuid::new_v4());
-        out.tenants.insert(
-            tenant_id.clone(),
-            TenantRecord {
-                tenant_id,
-                name: name.trim().to_string(),
-                domain: None,
-                status: "active".to_string(),
-                settings: json!({}),
-                sponsor_tenant_id: None,
-            },
-        );
+        out.ensure_default_root_tenant();
         out
     }
 
-    fn default_tenant_id(&self) -> Option<String> {
-        let mut root_tenants: Vec<&String> = self
-            .tenants
-            .iter()
-            .filter(|(_, tenant)| tenant.sponsor_tenant_id.is_none())
-            .map(|(tenant_id, _)| tenant_id)
-            .collect();
-        root_tenants.sort_unstable();
-        if let Some(tenant_id) = root_tenants.first() {
-            return Some((*tenant_id).clone());
+    fn ensure_default_root_tenant(&mut self) -> bool {
+        match self.tenants.get_mut(DEFAULT_ROOT_TENANT_ID) {
+            Some(tenant) => {
+                let mut changed = false;
+                if tenant.name != DEFAULT_DEFAULT_TENANT_NAME {
+                    tenant.name = DEFAULT_DEFAULT_TENANT_NAME.to_string();
+                    changed = true;
+                }
+                if tenant.status != "active" {
+                    tenant.status = "active".to_string();
+                    changed = true;
+                }
+                if tenant.domain.is_some() {
+                    tenant.domain = None;
+                    changed = true;
+                }
+                if tenant.settings != json!({}) {
+                    tenant.settings = json!({});
+                    changed = true;
+                }
+                if tenant.sponsor_tenant_id.is_some() {
+                    tenant.sponsor_tenant_id = None;
+                    changed = true;
+                }
+                changed
+            }
+            None => {
+                self.tenants.insert(
+                    DEFAULT_ROOT_TENANT_ID.to_string(),
+                    TenantRecord {
+                        tenant_id: DEFAULT_ROOT_TENANT_ID.to_string(),
+                        name: DEFAULT_DEFAULT_TENANT_NAME.to_string(),
+                        domain: None,
+                        status: "active".to_string(),
+                        settings: json!({}),
+                        sponsor_tenant_id: None,
+                    },
+                );
+                true
+            }
         }
-        let mut all_tenants: Vec<&String> = self.tenants.keys().collect();
-        all_tenants.sort_unstable();
-        all_tenants.first().map(|tenant_id| (*tenant_id).clone())
+    }
+
+    fn default_tenant_id(&self) -> Option<String> {
+        if self.tenants.contains_key(DEFAULT_ROOT_TENANT_ID) {
+            return Some(DEFAULT_ROOT_TENANT_ID.to_string());
+        }
+        None
     }
 
     fn provision_temporary_ilk(&mut self, req: IlkProvisionRequest) -> Result<Value, String> {
@@ -1421,12 +1443,6 @@ impl IdentityRuntime {
                 .insert(frontdesk_node);
         }
 
-        let default_tenant = hive
-            .identity
-            .as_ref()
-            .and_then(|cfg| cfg.default_tenant.as_deref())
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or(DEFAULT_DEFAULT_TENANT_NAME);
         let merge_alias_ttl_secs = hive
             .identity
             .as_ref()
@@ -1438,7 +1454,7 @@ impl IdentityRuntime {
             is_primary,
             db_config,
             merge_alias_ttl_secs,
-            store: IdentityStore::with_default_tenant(default_tenant),
+            store: IdentityStore::with_default_tenant(),
             allowed_prefixes,
             allowed_exacts,
         }
@@ -2417,22 +2433,23 @@ async fn main() -> Result<(), IdentityError> {
     if is_primary {
         if let Some(database_config) = runtime.db_config.clone() {
             match load_identity_store_from_db(&database_config).await {
-                Ok(store) if store.tenants.is_empty() => {
-                    if let Some(default_tenant_id) = runtime.store.default_tenant_id() {
+                Ok(mut store) => {
+                    if store.ensure_default_root_tenant() {
                         if let Some(default_tenant) =
-                            runtime.store.tenants.get(&default_tenant_id).cloned()
+                            store.tenants.get(DEFAULT_ROOT_TENANT_ID).cloned()
                         {
                             if let Err(err) =
                                 upsert_tenant_in_db(&database_config, &default_tenant).await
                             {
-                                tracing::warn!(error = %err, "failed to persist default tenant in primary db bootstrap");
+                                tracing::warn!(error = %err, "failed to persist fixed default tenant in primary db bootstrap");
                             } else {
-                                tracing::info!(tenant_id = %default_tenant.tenant_id, "persisted default tenant in primary db bootstrap");
+                                tracing::info!(
+                                    tenant_id = %default_tenant.tenant_id,
+                                    "persisted fixed default tenant in primary db bootstrap"
+                                );
                             }
                         }
                     }
-                }
-                Ok(store) => {
                     let metrics = store.metrics();
                     runtime.store = store;
                     tracing::info!(metrics = %metrics, "loaded identity store from primary db");
@@ -5402,7 +5419,48 @@ mod tests {
     }
 
     #[test]
-    fn default_tenant_id_prefers_root_tenant_without_sponsor() {
+    fn default_root_tenant_is_fixed_by_code() {
+        let store = IdentityStore::with_default_tenant();
+
+        let tenant = store
+            .tenants
+            .get(DEFAULT_ROOT_TENANT_ID)
+            .expect("fixed default tenant must exist");
+        assert_eq!(tenant.name, DEFAULT_DEFAULT_TENANT_NAME);
+        assert_eq!(tenant.status, "active");
+        assert_eq!(tenant.sponsor_tenant_id, None);
+        assert_eq!(
+            store.default_tenant_id().as_deref(),
+            Some(DEFAULT_ROOT_TENANT_ID)
+        );
+    }
+
+    #[test]
+    fn ensure_default_root_tenant_repairs_existing_fixed_record() {
+        let mut store = IdentityStore::default();
+        store.tenants.insert(
+            DEFAULT_ROOT_TENANT_ID.to_string(),
+            TenantRecord {
+                tenant_id: DEFAULT_ROOT_TENANT_ID.to_string(),
+                name: "other".to_string(),
+                domain: Some("example.invalid".to_string()),
+                status: "suspended".to_string(),
+                settings: json!({"kept": true}),
+                sponsor_tenant_id: Some("tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string()),
+            },
+        );
+
+        assert!(store.ensure_default_root_tenant());
+        let tenant = store.tenants.get(DEFAULT_ROOT_TENANT_ID).unwrap();
+        assert_eq!(tenant.name, DEFAULT_DEFAULT_TENANT_NAME);
+        assert_eq!(tenant.status, "active");
+        assert_eq!(tenant.sponsor_tenant_id, None);
+        assert_eq!(tenant.domain, None);
+        assert_eq!(tenant.settings, json!({}));
+    }
+
+    #[test]
+    fn default_tenant_id_does_not_fall_back_to_legacy_roots() {
         let mut store = IdentityStore::default();
         store.tenants.insert(
             "tnt:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
@@ -5427,9 +5485,12 @@ mod tests {
             },
         );
 
+        assert_eq!(store.default_tenant_id().as_deref(), None);
+
+        store.ensure_default_root_tenant();
         assert_eq!(
             store.default_tenant_id().as_deref(),
-            Some("tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+            Some(DEFAULT_ROOT_TENANT_ID)
         );
     }
 
