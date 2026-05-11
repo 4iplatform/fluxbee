@@ -241,6 +241,7 @@ Default `vault_get_with_retry` policy:
   - retries/loads via SDK helper when key appears;
   - transitions to configured without special orchestrator ordering.
   - exposes the same vault-backed OpenAI config contract through node L2 `CONFIG_GET` / `CONFIG_SET`, so admin `node_control_config_get/set` is the canonical control path.
+  - orchestrator starts `SY.identity` before identity/vault consumers, registers visible core `SY.*` system nodes in identity after bootstrap, and retries from watchdog, so vault consumers must have real `ilk:<uuid>` ownership instead of placeholder/workaround metadata.
 - [ ] VA-G4. Migrate `ai.generic` OpenAI key to vault refs.
 - [ ] VA-G5. Migrate IO secret-bearing configs to vault refs:
   - `IO.api` API keys/webhook secrets;

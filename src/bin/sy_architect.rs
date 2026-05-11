@@ -11661,7 +11661,8 @@ async fn execute_admin_action_with_context(
     params: Value,
     purpose: &str,
 ) -> Result<Value, ArchitectError> {
-    let params_json = serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string());
+    let params_json = serde_json::to_string(&redact_json_secret_fields(&params))
+        .unwrap_or_else(|_| "{}".to_string());
     let timeout = architect_admin_action_timeout(action);
     tracing::info!(
         purpose = %purpose,
