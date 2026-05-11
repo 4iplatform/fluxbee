@@ -49,13 +49,14 @@ use fluxbee_ai_sdk::{
 };
 use fluxbee_sdk::blob::{BlobConfig, BlobRef, BlobToolkit};
 use fluxbee_sdk::payload::TextV1Payload;
-use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
+use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{
-    admin_command, build_node_secret_record, connect, list_ich_options_from_hive_config,
-    load_node_secret_record_with_root, redacted_node_secret_record,
-    save_node_secret_record_with_root, AdminCommandRequest, IdentityIchOption, NodeConfig,
-    NodeError, NodeReceiver, NodeSecretDescriptor, NodeSecretError, NodeSecretRecord,
-    NodeSecretWriteOptions, NodeSender, NODE_SECRET_REDACTION_TOKEN,
+    admin_command, build_node_config_response_message, build_node_secret_record, connect,
+    list_ich_options_from_hive_config, load_node_secret_record_with_root,
+    redacted_node_secret_record, save_node_secret_record_with_root, try_handle_default_node_status,
+    vault_get_with_retry, AdminCommandRequest, IdentityIchOption, NodeConfig, NodeError,
+    NodeReceiver, NodeSecretDescriptor, NodeSecretError, NodeSecretRecord, NodeSecretWriteOptions,
+    NodeSender, VaultRetryPolicy, NODE_SECRET_REDACTION_TOKEN, VAULT_REF_PREFIX,
 };
 use futures::TryStreamExt;
 use json_router::runtime_manifest::{
@@ -88,6 +89,8 @@ const CHAT_MODE_OPERATOR: &str = "operator";
 const CHAT_MODE_IMPERSONATION: &str = "impersonation";
 const ARCHITECT_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
 const ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL: &str = "messages_db_url";
+const ARCHITECT_DEFAULT_OPENAI_VAULT_REF: &str = "vault://sys:openai-api-key";
+const ARCHITECT_SECRET_REFRESH_INTERVAL_SECS: u64 = 10;
 const ARCHITECT_MAX_ATTACHMENTS: usize = 8;
 const ARCHITECT_MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 const ARCHITECT_MAX_SOFTWARE_UPLOAD_BYTES: usize = 128 * 1024 * 1024;
@@ -213,6 +216,7 @@ struct AiProvidersSection {
 #[derive(Debug, Deserialize, Clone)]
 struct OpenAiSection {
     api_key: Option<String>,
+    api_key_ref: Option<String>,
     default_model: Option<String>,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
@@ -1433,8 +1437,7 @@ impl FunctionTool for CreateAgentPersonalityAssetTool {
     }
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
-        let asset =
-            build_personality_asset_value(&arguments).map_err(fluxbee_tool_protocol_err)?;
+        let asset = build_personality_asset_value(&arguments).map_err(fluxbee_tool_protocol_err)?;
         write_agent_asset_and_update_catalog(&self.context, asset)
             .await
             .map_err(fluxbee_tool_protocol_err)
@@ -4802,7 +4805,14 @@ async fn main() -> Result<(), ArchitectError> {
     let hive = load_hive(&config_dir)?;
     let node_config = load_architect_node_config(&hive.hive_id)?;
     let node_name = architect_node_name(&hive.hive_id);
-    let ai_runtime = build_architect_ai_runtime(&node_name, node_config.as_ref(), &hive);
+    let ai_runtime = build_architect_ai_runtime(
+        &node_name,
+        node_config.as_ref(),
+        &hive,
+        &config_dir,
+        &state_dir,
+    )
+    .await;
     let agent_asset_catalog = bootstrap_agent_asset_catalog_from_config_dir(&config_dir)
         .unwrap_or_else(|err| {
             tracing::warn!(error = %err, "failed to bootstrap agent asset catalog");
@@ -4895,6 +4905,11 @@ async fn main() -> Result<(), ArchitectError> {
         status_refresh_loop(refresh_state).await;
     });
 
+    let secret_refresh_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        architect_secret_refresh_loop(secret_refresh_state).await;
+    });
+
     let app = Router::new()
         .route("/", any(root_handler))
         .route("/healthz", any(dynamic_handler))
@@ -4960,19 +4975,44 @@ fn architect_config_path(hive_id: &str) -> PathBuf {
     architect_node_dir(hive_id).join("config.json")
 }
 
-fn build_architect_ai_runtime(
+async fn build_architect_ai_runtime(
     node_name: &str,
     config: Option<&ArchitectNodeConfigFile>,
     hive: &HiveFile,
+    config_dir: &Path,
+    state_dir: &Path,
 ) -> Option<ArchitectAiRuntime> {
     let secrets = load_architect_secret_record(node_name).ok().flatten();
     let openai = merged_openai_section(config, hive, secrets.as_ref())?;
-    let api_key = openai
+    let api_key = if let Some(api_key) = openai
         .api_key
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())?
-        .to_string();
+        .filter(|value| !value.is_empty())
+    {
+        api_key.to_string()
+    } else if let Some(api_key_ref) = openai
+        .api_key_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        match resolve_architect_openai_api_key_from_vault(config_dir, state_dir, hive, api_key_ref)
+            .await
+        {
+            Ok(api_key) => api_key,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    api_key_ref,
+                    "sy.architect OpenAI key vault lookup failed"
+                );
+                return None;
+            }
+        }
+    } else {
+        return None;
+    };
     let model = openai
         .default_model
         .as_deref()
@@ -5005,16 +5045,27 @@ fn merged_openai_section(
         .ai_providers
         .as_ref()
         .and_then(|providers| providers.openai.clone());
-    let secret_api_key = secrets
+    let raw_secret_api_key = secrets
         .and_then(|record| record.secrets.get(ARCHITECT_LOCAL_SECRET_KEY_OPENAI))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
+    let secret_api_key_ref = raw_secret_api_key
+        .as_deref()
+        .filter(|value| value.starts_with(VAULT_REF_PREFIX))
+        .map(ToString::to_string);
+    let secret_api_key = raw_secret_api_key
+        .as_deref()
+        .filter(|value| !value.starts_with(VAULT_REF_PREFIX))
+        .map(ToString::to_string);
 
     match (config_openai, hive_openai) {
         (Some(cfg), Some(hive_cfg)) => Some(OpenAiSection {
             api_key: secret_api_key,
+            api_key_ref: secret_api_key_ref
+                .or(cfg.api_key_ref)
+                .or(hive_cfg.api_key_ref),
             default_model: cfg.default_model.or(hive_cfg.default_model),
             max_tokens: cfg.max_tokens.or(hive_cfg.max_tokens),
             temperature: cfg.temperature.or(hive_cfg.temperature),
@@ -5022,6 +5073,7 @@ fn merged_openai_section(
         }),
         (Some(cfg), None) => Some(OpenAiSection {
             api_key: secret_api_key,
+            api_key_ref: secret_api_key_ref.or(cfg.api_key_ref),
             default_model: cfg.default_model,
             max_tokens: cfg.max_tokens,
             temperature: cfg.temperature,
@@ -5029,19 +5081,84 @@ fn merged_openai_section(
         }),
         (None, Some(hive_cfg)) => Some(OpenAiSection {
             api_key: secret_api_key,
+            api_key_ref: secret_api_key_ref.or(hive_cfg.api_key_ref),
             default_model: hive_cfg.default_model,
             max_tokens: hive_cfg.max_tokens,
             temperature: hive_cfg.temperature,
             top_p: hive_cfg.top_p,
         }),
-        (None, None) => secret_api_key.map(|api_key| OpenAiSection {
-            api_key: Some(api_key),
-            default_model: None,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-        }),
+        (None, None) => {
+            if secret_api_key.is_some() || secret_api_key_ref.is_some() {
+                Some(OpenAiSection {
+                    api_key: secret_api_key,
+                    api_key_ref: secret_api_key_ref,
+                    default_model: None,
+                    max_tokens: None,
+                    temperature: None,
+                    top_p: None,
+                })
+            } else {
+                None
+            }
+        }
     }
+}
+
+async fn resolve_architect_openai_api_key_from_vault(
+    config_dir: &Path,
+    state_dir: &Path,
+    hive: &HiveFile,
+    api_key_ref: &str,
+) -> Result<String, ArchitectError> {
+    let key = fluxbee_sdk::parse_vault_ref(api_key_ref)?;
+    let node_config = NodeConfig {
+        name: "SY.architect".to_string(),
+        router_socket: json_router::paths::router_socket_dir(),
+        uuid_persistence_dir: state_dir.join("nodes"),
+        uuid_mode: fluxbee_sdk::NodeUuidMode::Ephemeral,
+        config_dir: config_dir.to_path_buf(),
+        version: "0.1.0".to_string(),
+    };
+    let (sender, mut receiver) = connect(&node_config).await?;
+    let policy = VaultRetryPolicy {
+        max_elapsed: Duration::from_secs(3),
+        initial_delay: Duration::from_millis(250),
+        max_delay: Duration::from_secs(1),
+        jitter_ratio: 0.20,
+    };
+    let response = vault_get_with_retry(
+        &sender,
+        &mut receiver,
+        &format!("SY.vault@{}", hive.hive_id),
+        key,
+        policy,
+    )
+    .await;
+    let _ = sender.close().await;
+    let response = response?;
+    vault_response_openai_api_key(&response.value)
+}
+
+fn vault_response_openai_api_key(value: &Option<Value>) -> Result<String, ArchitectError> {
+    let Some(value) = value else {
+        return Err("vault response missing value".into());
+    };
+    if let Some(api_key) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(api_key.to_string());
+    }
+    if let Some(api_key) = value
+        .get("api_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(api_key.to_string());
+    }
+    Err("vault secret value must be a string or object with non-empty api_key".into())
 }
 
 fn architect_nodes_root() -> PathBuf {
@@ -5061,7 +5178,14 @@ fn load_architect_secret_record(
 async fn refresh_architect_ai_runtime(state: &ArchitectState) -> Result<bool, ArchitectError> {
     let hive = load_hive(&state.config_dir)?;
     let node_config = load_architect_node_config(&hive.hive_id)?;
-    let runtime = build_architect_ai_runtime(&state.node_name, node_config.as_ref(), &hive);
+    let runtime = build_architect_ai_runtime(
+        &state.node_name,
+        node_config.as_ref(),
+        &hive,
+        &state.config_dir,
+        &state.state_dir,
+    )
+    .await;
     state
         .ai_configured
         .store(runtime.is_some(), Ordering::Relaxed);
@@ -5256,6 +5380,9 @@ async fn router_recv_loop(
             msg = ?msg.meta.msg,
             "sy.architect received message"
         );
+        if handle_architect_system_message(&state, &msg).await? {
+            continue;
+        }
         if let Some(session_id) = router_message_session_id(&msg) {
             if let Err(err) = persist_router_incoming_message(&state, &session_id, &msg).await {
                 tracing::warn!(
@@ -5266,6 +5393,74 @@ async fn router_recv_loop(
                 );
             }
         }
+    }
+}
+
+async fn handle_architect_system_message(
+    state: &ArchitectState,
+    msg: &Message,
+) -> Result<bool, NodeError> {
+    let sender = {
+        let guard = state.router_sender.lock().await;
+        guard.clone()
+    };
+    let Some(sender) = sender else {
+        return Ok(false);
+    };
+
+    if try_handle_default_node_status(&sender, msg).await? {
+        return Ok(true);
+    }
+    if msg.meta.msg_type != SYSTEM_KIND {
+        return Ok(false);
+    }
+
+    match msg.meta.msg.as_deref() {
+        Some("CONFIG_GET") => {
+            let payload = architect_config_payload_from_result(
+                handle_architect_local_config_get(state).await,
+                "CONFIG_GET",
+            );
+            let response = build_node_config_response_message(msg, sender.uuid(), payload);
+            sender.send(response).await?;
+            Ok(true)
+        }
+        Some("CONFIG_SET") => {
+            let payload = architect_config_payload_from_result(
+                handle_architect_local_config_set(state, msg.payload.clone()).await,
+                "CONFIG_SET",
+            );
+            let response = build_node_config_response_message(msg, sender.uuid(), payload);
+            sender.send(response).await?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn architect_config_payload_from_result(
+    result: Result<Value, ArchitectError>,
+    command: &str,
+) -> Value {
+    match result {
+        Ok(value) => value.get("payload").cloned().unwrap_or_else(|| {
+            json!({
+                "ok": false,
+                "error": {
+                    "code": "INVALID_CONFIG_RESPONSE",
+                    "detail": format!("{command} handler returned no payload")
+                }
+            })
+        }),
+        Err(err) => json!({
+            "ok": false,
+            "status": "error",
+            "node_name": "SY.architect",
+            "error": {
+                "code": if command == "CONFIG_SET" { "INVALID_CONFIG_SET" } else { "INVALID_CONFIG_GET" },
+                "detail": err.to_string()
+            }
+        }),
     }
 }
 
@@ -5580,7 +5775,8 @@ fn build_personality_asset_value(arguments: &Value) -> Result<Value, ArchitectEr
         arguments.get("name").unwrap_or(&Value::Null),
         "personality.name",
     )?;
-    let description = clean_optional_string(arguments.get("description"), "personality.description")?;
+    let description =
+        clean_optional_string(arguments.get("description"), "personality.description")?;
     let system_fields_obj = arguments
         .get("system_fields")
         .and_then(Value::as_object)
@@ -5590,7 +5786,9 @@ fn build_personality_asset_value(arguments: &Value) -> Result<Value, ArchitectEr
         "personality.system_fields.timezone",
     )?;
     let country_code = clean_required_string(
-        system_fields_obj.get("country_code").unwrap_or(&Value::Null),
+        system_fields_obj
+            .get("country_code")
+            .unwrap_or(&Value::Null),
         "personality.system_fields.country_code",
     )?;
     let primary_language = clean_required_string(
@@ -5603,8 +5801,10 @@ fn build_personality_asset_value(arguments: &Value) -> Result<Value, ArchitectEr
         system_fields_obj.get("region_code"),
         "personality.system_fields.region_code",
     )?;
-    let additional_languages =
-        system_fields_obj.get("additional_languages").cloned().unwrap_or(Value::Null);
+    let additional_languages = system_fields_obj
+        .get("additional_languages")
+        .cloned()
+        .unwrap_or(Value::Null);
     let mut system_fields = serde_json::Map::new();
     system_fields.insert("timezone".to_string(), json!(timezone));
     system_fields.insert("country_code".to_string(), json!(country_code));
@@ -5614,7 +5814,10 @@ fn build_personality_asset_value(arguments: &Value) -> Result<Value, ArchitectEr
     system_fields.insert("primary_language".to_string(), json!(primary_language));
     if let Some(items) = additional_languages.as_array() {
         if !items.is_empty() {
-            system_fields.insert("additional_languages".to_string(), Value::Array(items.clone()));
+            system_fields.insert(
+                "additional_languages".to_string(),
+                Value::Array(items.clone()),
+            );
         }
     }
 
@@ -9599,13 +9802,32 @@ async fn handle_architect_local_config_get(
     let node_config = load_architect_node_config(&state.hive_id)?;
     let secret_record = load_architect_secret_record(&state.node_name)?;
     let merged = merged_openai_section(node_config.as_ref(), &hive, secret_record.as_ref());
-    let configured = merged
+    let has_plain_api_key = merged
         .as_ref()
         .and_then(|openai| openai.api_key.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .is_some();
+    let has_api_key_ref = merged
+        .as_ref()
+        .and_then(|openai| openai.api_key_ref.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    let configured =
+        has_plain_api_key || (has_api_key_ref && state.ai_configured.load(Ordering::Relaxed));
     let api_key_source = if secret_record
+        .as_ref()
+        .and_then(|record| record.secrets.get(ARCHITECT_LOCAL_SECRET_KEY_OPENAI))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| value.starts_with(VAULT_REF_PREFIX))
+        .is_some()
+        || has_api_key_ref
+    {
+        "vault_ref"
+    } else if secret_record
         .as_ref()
         .and_then(|record| record.secrets.get(ARCHITECT_LOCAL_SECRET_KEY_OPENAI))
         .and_then(Value::as_str)
@@ -9613,7 +9835,7 @@ async fn handle_architect_local_config_get(
         .filter(|value| !value.is_empty())
         .is_some()
     {
-        "local_file"
+        "local_file_legacy"
     } else {
         "missing"
     };
@@ -9639,7 +9861,11 @@ async fn handle_architect_local_config_get(
         required: true,
         configured,
         value_redacted: true,
-        persistence: "local_file".to_string(),
+        persistence: if has_api_key_ref {
+            "vault".to_string()
+        } else {
+            "local_file_legacy".to_string()
+        },
     };
     let messages_db_descriptor = NodeSecretDescriptor {
         field: "storage.messages_db_url".to_string(),
@@ -9662,6 +9888,7 @@ async fn handle_architect_local_config_get(
                 "ai_providers": {
                     "openai": {
                         "api_key": if configured { Value::String(NODE_SECRET_REDACTION_TOKEN.to_string()) } else { Value::Null },
+                        "api_key_ref": merged.as_ref().and_then(|openai| openai.api_key_ref.clone()).map(Value::String).unwrap_or(Value::Null),
                         "default_model": merged.as_ref().and_then(|openai| openai.default_model.clone()).map(Value::String).unwrap_or(Value::Null),
                         "max_tokens": merged.as_ref().and_then(|openai| openai.max_tokens.map(Value::from)).unwrap_or(Value::Null),
                         "temperature": merged.as_ref().and_then(|openai| openai.temperature.map(Value::from)).unwrap_or(Value::Null),
@@ -9680,8 +9907,8 @@ async fn handle_architect_local_config_get(
                 "optional_fields": ["config.storage.messages_db_url"],
                 "secrets": [openai_descriptor, messages_db_descriptor],
                 "notes": [
-                    "This local control path bootstraps archi's own OpenAI key and the read-only messages DB URL from local secrets.json.",
-                    "Secret values are persisted in local secrets.json and always returned redacted.",
+                    "This local control path bootstraps archi's own OpenAI key through SY.vault and the read-only messages DB URL from local secrets.json.",
+                    "New OpenAI secret writes are stored in SY.vault; local secrets.json stores only the vault:// reference for OpenAI.",
                     "messages_db_url is optional; when set, archi enables the Messages log viewer against storage's Postgres."
                 ]
             },
@@ -9697,9 +9924,13 @@ async fn handle_architect_local_config_set(
     body: Value,
 ) -> Result<Value, ArchitectError> {
     let api_key = extract_architect_openai_api_key(&body)?;
+    let supplied_api_key_ref = extract_architect_openai_api_key_ref(&body)?;
+    let api_key_ref = supplied_api_key_ref
+        .clone()
+        .unwrap_or_else(|| ARCHITECT_DEFAULT_OPENAI_VAULT_REF.to_string());
     let messages_db_url = extract_architect_messages_db_url(&body)?;
-    if api_key.is_none() && messages_db_url.is_none() {
-        return Err("architect local config-set requires at least one of: config.ai_providers.openai.api_key, config.storage.messages_db_url".into());
+    if api_key.is_none() && supplied_api_key_ref.is_none() && messages_db_url.is_none() {
+        return Err("architect local config-set requires at least one of: config.ai_providers.openai.api_key, config.ai_providers.openai.api_key_ref, config.storage.messages_db_url".into());
     }
     let updated_by_ilk = body
         .get("updated_by_ilk")
@@ -9727,14 +9958,30 @@ async fn handle_architect_local_config_set(
         .unwrap_or_default();
     let mut stored_secrets: Vec<Value> = Vec::new();
     if let Some(api_key) = api_key {
+        let vault_key = fluxbee_sdk::parse_vault_ref(&api_key_ref)?;
+        let owner_ilk = resolve_architect_owner_ilk(state, updated_by_ilk.as_deref())?;
+        write_architect_openai_secret_to_vault(state, vault_key, &api_key, &owner_ilk).await?;
         secrets.insert(
             ARCHITECT_LOCAL_SECRET_KEY_OPENAI.to_string(),
-            Value::String(api_key),
+            Value::String(api_key_ref.clone()),
         );
         stored_secrets.push(json!({
             "field": "ai_providers.openai.api_key",
             "storage_key": ARCHITECT_LOCAL_SECRET_KEY_OPENAI,
+            "vault_ref": api_key_ref,
             "value_redacted": true
+        }));
+    } else if supplied_api_key_ref.is_some() {
+        fluxbee_sdk::parse_vault_ref(&api_key_ref)?;
+        secrets.insert(
+            ARCHITECT_LOCAL_SECRET_KEY_OPENAI.to_string(),
+            Value::String(api_key_ref.clone()),
+        );
+        stored_secrets.push(json!({
+            "field": "ai_providers.openai.api_key_ref",
+            "storage_key": ARCHITECT_LOCAL_SECRET_KEY_OPENAI,
+            "vault_ref": api_key_ref,
+            "value_redacted": false
         }));
     }
     if let Some(url) = &messages_db_url {
@@ -9772,8 +10019,8 @@ async fn handle_architect_local_config_set(
         }),
         messages_db_url.is_some(),
     ) {
-        (true, true) => "Architect local OpenAI key and messages DB URL stored in secrets.json and runtime reloaded.",
-        (true, false) => "Architect local OpenAI key stored in secrets.json and runtime reloaded.",
+        (true, true) => "Architect OpenAI vault ref persisted locally, messages DB URL stored in secrets.json, and runtime reloaded.",
+        (true, false) => "Architect OpenAI vault ref persisted locally and runtime reloaded.",
         (false, true) => "Architect local messages DB URL stored in secrets.json and runtime reloaded.",
         (false, false) => "Architect local secrets.json updated.",
     };
@@ -9817,6 +10064,92 @@ fn extract_architect_openai_api_key(body: &Value) -> Result<Option<String>, Arch
         }
     }
     Ok(None)
+}
+
+fn extract_architect_openai_api_key_ref(body: &Value) -> Result<Option<String>, ArchitectError> {
+    if let Some(value) = body
+        .get("config")
+        .and_then(|config| config.get("ai_providers"))
+        .and_then(|providers| providers.get("openai"))
+        .and_then(|openai| openai.get("api_key_ref"))
+        .and_then(Value::as_str)
+    {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            fluxbee_sdk::parse_vault_ref(trimmed)?;
+            return Ok(Some(trimmed.to_string()));
+        }
+    }
+    if let Some(value) = body.get("api_key_ref").and_then(Value::as_str) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            fluxbee_sdk::parse_vault_ref(trimmed)?;
+            return Ok(Some(trimmed.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+fn resolve_architect_owner_ilk(
+    state: &ArchitectState,
+    fallback_ilk: Option<&str>,
+) -> Result<String, ArchitectError> {
+    if let Some((_, ilk)) = fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_config(
+        &state.config_dir,
+        &state.node_name,
+    )? {
+        return Ok(ilk.ilk_id);
+    }
+    if let Some(ilk) = fallback_ilk
+        .map(str::trim)
+        .filter(|value| value.starts_with("ilk:") && !value.is_empty())
+    {
+        return Ok(ilk.to_string());
+    }
+    Err("cannot resolve SY.architect ILK for vault metadata.owner_ilk".into())
+}
+
+async fn write_architect_openai_secret_to_vault(
+    state: &ArchitectState,
+    vault_key: &str,
+    api_key: &str,
+    owner_ilk: &str,
+) -> Result<(), ArchitectError> {
+    let admin_target = format!("SY.admin@{}", state.hive_id);
+    let payload = json!({
+        "key": vault_key,
+        "value": {
+            "api_key": api_key
+        },
+        "metadata": {
+            "tenant_id": "sys",
+            "owner_ilk": owner_ilk,
+            "description": "OpenAI API key for SY.architect",
+            "tags": ["provider:openai", "node:sy.architect"]
+        }
+    });
+    let response = execute_admin_action_with_context(
+        &admin_tool_context(state, None),
+        &admin_target,
+        "vault_put",
+        Some(&state.hive_id),
+        payload,
+        "architect.config_set.vault_put",
+    )
+    .await?;
+    if !response
+        .get("status")
+        .and_then(Value::as_str)
+        .map(|status| status.eq_ignore_ascii_case("ok"))
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "vault_put failed while storing SY.architect OpenAI key: {}",
+            response_detail_text(&response).unwrap_or_else(|| response.to_string())
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn extract_architect_messages_db_url(body: &Value) -> Result<Option<String>, ArchitectError> {
@@ -11403,6 +11736,17 @@ async fn status_refresh_loop(state: Arc<ArchitectState>) {
         let fresh = build_architect_status(&state).await;
         *state.cached_status.write().await = fresh;
         time::sleep(Duration::from_secs(STATUS_REFRESH_INTERVAL_SECS)).await;
+    }
+}
+
+async fn architect_secret_refresh_loop(state: Arc<ArchitectState>) {
+    loop {
+        if !state.ai_configured.load(Ordering::Relaxed) {
+            if let Err(err) = refresh_architect_ai_runtime(&state).await {
+                tracing::warn!(error = %err, "sy.architect vault-backed AI refresh failed");
+            }
+        }
+        time::sleep(Duration::from_secs(ARCHITECT_SECRET_REFRESH_INTERVAL_SECS)).await;
     }
 }
 
@@ -22478,7 +22822,10 @@ mod tests {
             "name": "Bad",
             "system_fields": { "timezone": "America/Buenos_Aires" }
         }));
-        assert!(bad.is_err(), "missing country_code/primary_language must fail");
+        assert!(
+            bad.is_err(),
+            "missing country_code/primary_language must fail"
+        );
 
         let _ = std::fs::remove_dir_all(config_dir.parent().unwrap());
     }

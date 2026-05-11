@@ -6678,7 +6678,8 @@ mod tests {
     fn cognitive_definition_personality_failure_yields_partial() {
         let root = cognitive_temp_root("personality-partial");
         let role_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let missing_personality = "5555555555555555555555555555555555555555555555555555555555555555";
+        let missing_personality =
+            "5555555555555555555555555555555555555555555555555555555555555555";
         write_cognitive_asset(
             &root,
             role_hash,

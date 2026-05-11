@@ -173,10 +173,22 @@ These are system infrastructure:
 - `SY.storage`
 - `SY.identity`
 - `SY.cognition`
+- `SY.vault`
 - `SY.config.routes`
 - `SY.opa.rules`
 
 Normal operator requests should not create or redesign these.
+
+### 4.5 Secrets and vault
+
+`SY.vault` is the canonical secret backend for new secret writes. Do not ask users to place plaintext secrets in node config files.
+
+Rules:
+- For secret inspection, prefer `vault_list` and `vault_get_metadata`.
+- Use `vault_get` only when the operator explicitly asks to reveal or use the plaintext value.
+- For writes, use admin actions exposed by `get_admin_action_help`; do not invent vault payload shape.
+- Secret-bearing config should store `vault://<key>` references, not plaintext.
+- If a node reports missing secret, inspect its `CONFIG_GET` contract and the vault metadata/list before changing runtime or routing.
 
 ---
 

@@ -205,7 +205,7 @@ Default `vault_get_with_retry` policy:
 - [x] VA-E4. Ensure executor plan display redacts `value`.
 - [x] VA-E5a. Add SCMD examples for `vault_put`, `vault_get`, and `vault_get_metadata` to admin help reference.
 - [x] VA-E5b. Add SCMD examples for list/delete/rotate/rollback after those verbs exist.
-- [ ] VA-E6. Add Archi handbook guidance at method level only:
+- [x] VA-E6. Add Archi handbook guidance at method level only:
   - discover action help;
   - do not print secret values;
   - prefer metadata/list operations for inspection.
@@ -231,14 +231,16 @@ Default `vault_get_with_retry` policy:
 
 ## 10. Phase G - Consumer migration strategy
 
-- [ ] VA-G1. Define `vault_ref` convention for node config:
+- [x] VA-G1. Define `vault_ref` convention for node config:
   - example: `config.secrets.openai.api_key_ref = "vault://sys:openai-api-key"`.
+  - provider-local config may also use adjacent refs, for example `config.ai_providers.openai.api_key_ref`, when that matches the existing node contract.
 - [ ] VA-G2. Deprecate new node-local plaintext `secrets.json` writes once vault is enabled.
-- [ ] VA-G3. Implement `SY.architect` as the first vault-backed consumer:
+- [x] VA-G3. Implement `SY.architect` as the first vault-backed consumer:
   - starts without OpenAI key;
   - reports missing secret;
   - retries/loads via SDK helper when key appears;
   - transitions to configured without special orchestrator ordering.
+  - exposes the same vault-backed OpenAI config contract through node L2 `CONFIG_GET` / `CONFIG_SET`, so admin `node_control_config_get/set` is the canonical control path.
 - [ ] VA-G4. Migrate `ai.generic` OpenAI key to vault refs.
 - [ ] VA-G5. Migrate IO secret-bearing configs to vault refs:
   - `IO.api` API keys/webhook secrets;
@@ -249,6 +251,11 @@ Default `vault_get_with_retry` policy:
   - `SY.identity` Postgres URL;
   - Archi messages DB URL.
 - [ ] VA-G7. Remove or mark legacy `secrets.json` write paths after consumers are migrated.
+- [ ] VA-G7a. Remove or deprecate `SY.architect` local-only config entrypoints:
+  - current legacy/bootstrap paths: `GET /architect/control/config-get` and `POST /architect/control/config-set`;
+  - canonical path is admin `node_control_config_get/set` -> L2 `CONFIG_GET/CONFIG_SET`;
+  - local paths currently share the same handler functions, so they are not divergent, but they are an extra operational doorway and should not remain long term unless a concrete bootstrap-only need is proven;
+  - if retained temporarily, rename internals away from `local_*` to neutral config handlers and label local HTTP/SCMD as deprecated in UI/docs.
 - [ ] VA-G8. Document runtime behavior when vault/secret is missing: node runs degraded/unconfigured and retries/refreshes according to its own runtime policy.
 
 ## 11. Phase H - Tests and diagnostics
