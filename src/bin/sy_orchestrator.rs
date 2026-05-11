@@ -64,9 +64,7 @@ const STORAGE_DB_READINESS_REQUEST_TIMEOUT_SECS: u64 = 3;
 const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
 const MSG_ILK_REGISTER: &str = "ILK_REGISTER";
 const MSG_ILK_UPDATE: &str = "ILK_UPDATE";
-const MSG_TNT_LIST: &str = "TNT_LIST";
 const SY_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
-const IDENTITY_CORE_REGISTER_TIMEOUT_SECS: u64 = 30;
 const ADD_HIVE_SOCKET_READY_PROBE_TIMEOUT_SECS: u64 = 10;
 const SYNCTHING_SERVICE_NAME: &str = "fluxbee-syncthing";
 const SYNCTHING_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
@@ -180,7 +178,6 @@ struct HiveFile {
 
 #[derive(Debug, Deserialize)]
 struct IdentitySection {
-    default_tenant: Option<String>,
     sync: Option<IdentitySyncSection>,
 }
 
@@ -677,11 +674,8 @@ async fn bootstrap_local(
         disable_blob_sync_runtime_local()?;
     }
 
-    let services = if state.is_motherbee {
+    let mut services = if state.is_motherbee {
         let mut services = LEGACY_ALIGNED_SERVICE_UNITS.to_vec();
-        if identity_available() {
-            services.push("sy-identity");
-        }
         services.extend([
             "sy-admin",
             "sy-architect",
@@ -696,9 +690,6 @@ async fn bootstrap_local(
         services
     } else {
         let mut services = LEGACY_ALIGNED_SERVICE_UNITS.to_vec();
-        if identity_available() {
-            services.push("sy-identity");
-        }
         services.extend([
             "sy-vault",
             "sy-cognition",
@@ -708,33 +699,13 @@ async fn bootstrap_local(
         ]);
         services
     };
+    if identity_available() {
+        services.push("sy-identity");
+    }
     for service in services {
         tracing::info!(service = service, "starting service");
         if let Err(err) = systemd_start(service) {
             tracing::warn!(service = service, error = %err, "failed to start service");
-        }
-        if service == "sy-identity" {
-            if let Err(err) = wait_for_service_active(
-                service,
-                Duration::from_secs(CORE_SERVICE_HEALTH_TIMEOUT_SECS),
-            )
-            .await
-            {
-                tracing::warn!(
-                    service = service,
-                    error = %err,
-                    "identity service did not become active before starting dependent SY services"
-                );
-            }
-            if let Err(err) =
-                wait_for_sy_node_visible(state, "SY.identity", Duration::from_secs(10)).await
-            {
-                tracing::warn!(
-                    service = service,
-                    error = %err,
-                    "identity node did not become router-visible before starting dependent SY services"
-                );
-            }
         }
     }
 
@@ -744,12 +715,6 @@ async fn bootstrap_local(
         tracing::warn!(
             error = %err,
             "sy nodes did not fully bootstrap before timeout; continuing and relying on watchdog restarts"
-        );
-    }
-    if let Err(err) = ensure_core_system_identities_registered(state).await {
-        tracing::warn!(
-            error = %err,
-            "core SY identity registration did not complete during bootstrap; watchdog will retry"
         );
     }
     if state.is_motherbee {
@@ -1124,308 +1089,6 @@ async fn wait_for_sy_nodes(
     }
 }
 
-async fn wait_for_sy_node_visible(
-    state: &OrchestratorState,
-    node_base_name: &str,
-    timeout: Duration,
-) -> Result<(), OrchestratorError> {
-    let expected = ensure_l2_name(node_base_name, &state.hive_id);
-    let start = Instant::now();
-    loop {
-        if let Ok(snapshot) = load_router_snapshot(state) {
-            let found = snapshot.nodes.iter().any(|node| {
-                if node.name_len == 0 {
-                    return false;
-                }
-                let node_name = node_name(node);
-                node_name == node_base_name || node_name == expected
-            });
-            if found {
-                return Ok(());
-            }
-        }
-        if start.elapsed() >= timeout {
-            return Err(format!("timed out waiting for {expected} to become visible").into());
-        }
-        time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
-async fn ensure_core_system_identities_registered(
-    state: &OrchestratorState,
-) -> Result<(), OrchestratorError> {
-    if !identity_available() {
-        return Ok(());
-    }
-    let identity_primary_hive_id = resolve_identity_primary_hive_id(state)?;
-    let identity_target = format!("SY.identity@{}", identity_primary_hive_id);
-    let tenant_id = resolve_core_system_tenant_id(state, &identity_target).await?;
-    let mut registered = 0usize;
-    let mut skipped_not_visible = 0usize;
-    let mut skipped_already_registered = 0usize;
-
-    for node_name in core_system_identity_node_names(state) {
-        if !local_inventory_has_node(state, &node_name) {
-            skipped_not_visible = skipped_not_visible.saturating_add(1);
-            tracing::debug!(
-                node_name = %node_name,
-                "skipping core SY identity registration because node is not visible locally"
-            );
-            continue;
-        }
-        if core_system_identity_already_registered(state, &node_name) {
-            skipped_already_registered = skipped_already_registered.saturating_add(1);
-            continue;
-        }
-        let payload = serde_json::json!({
-            "ilk_id": format!("ilk:{}", Uuid::new_v4()),
-            "ilk_type": "system",
-            "tenant_id": tenant_id,
-            "identification": {
-                "display_name": node_name,
-                "node_name": node_name,
-                "runtime": "core-systemd",
-                "runtime_version": "current"
-            }
-        });
-        let response = relay_identity_system_call_ok(
-            state,
-            &identity_target,
-            MSG_ILK_REGISTER,
-            payload,
-            system_forward_timeout(),
-        )
-        .await;
-        let response = map_identity_action_result("register core system", response)?;
-        let Some(ilk_id) = response
-            .get("ilk_id")
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
-        else {
-            return Err(
-                format!("identity core registration returned no ilk_id for {node_name}").into(),
-            );
-        };
-        if let Err(err) = persist_node_ilk_mapping(state, &node_name, &ilk_id) {
-            tracing::warn!(
-                node_name = %node_name,
-                ilk_id = %ilk_id,
-                error = %err,
-                "failed to persist core node->ilk mapping"
-            );
-        }
-        registered = registered.saturating_add(1);
-    }
-
-    tracing::info!(
-        registered,
-        skipped_not_visible,
-        skipped_already_registered,
-        tenant_id = %tenant_id,
-        "core SY identities registered"
-    );
-    Ok(())
-}
-
-async fn resolve_core_system_tenant_id(
-    state: &OrchestratorState,
-    identity_target: &str,
-) -> Result<String, OrchestratorError> {
-    if let Some(tenant_id) = std::env::var("ORCH_DEFAULT_TENANT_ID")
-        .ok()
-        .map(|raw| raw.trim().to_string())
-        .filter(|raw| !raw.is_empty())
-    {
-        parse_prefixed_uuid(&tenant_id, "tnt")?;
-        return Ok(tenant_id);
-    }
-
-    let desired_name = load_hive(&state.config_dir)
-        .ok()
-        .and_then(|hive| hive.identity.and_then(|identity| identity.default_tenant))
-        .map(|name| name.trim().to_string())
-        .filter(|name| !name.is_empty());
-    let started = Instant::now();
-    let timeout = Duration::from_secs(IDENTITY_CORE_REGISTER_TIMEOUT_SECS);
-    let mut last_error: Option<String> = None;
-
-    while started.elapsed() < timeout {
-        let response = relay_identity_system_call_ok(
-            state,
-            identity_target,
-            MSG_TNT_LIST,
-            serde_json::json!({}),
-            Duration::from_secs(5),
-        )
-        .await;
-        match response {
-            Ok(payload) => {
-                if let Some(tenant_id) =
-                    select_core_system_tenant_id(&payload, desired_name.as_deref())
-                {
-                    return Ok(tenant_id);
-                }
-                last_error = Some(format!(
-                    "no active tenant matched default {:?} in TNT_LIST payload",
-                    desired_name
-                ));
-            }
-            Err(err) => {
-                last_error = Some(err.to_string());
-            }
-        }
-        time::sleep(Duration::from_millis(500)).await;
-    }
-
-    Err(format!(
-        "failed to resolve core system tenant id from identity after {}s: {}",
-        timeout.as_secs(),
-        last_error.unwrap_or_else(|| "unknown error".to_string())
-    )
-    .into())
-}
-
-fn select_core_system_tenant_id(
-    payload: &serde_json::Value,
-    desired_name: Option<&str>,
-) -> Option<String> {
-    let tenants = payload.get("tenants")?.as_array()?;
-    if let Some(desired_name) = desired_name.map(normalize_tenant_name_for_match) {
-        if let Some(tenant_id) = tenants.iter().find_map(|tenant| {
-            let active = tenant
-                .get("status")
-                .and_then(|value| value.as_str())
-                .map(|status| status.eq_ignore_ascii_case("active"))
-                .unwrap_or(false);
-            let name_matches = tenant
-                .get("name")
-                .and_then(|value| value.as_str())
-                .map(normalize_tenant_name_for_match)
-                .as_deref()
-                == Some(desired_name.as_str());
-            if active && name_matches {
-                tenant
-                    .get("tenant_id")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string)
-            } else {
-                None
-            }
-        }) {
-            return Some(tenant_id);
-        }
-    }
-
-    tenants.iter().find_map(|tenant| {
-        let active = tenant
-            .get("status")
-            .and_then(|value| value.as_str())
-            .map(|status| status.eq_ignore_ascii_case("active"))
-            .unwrap_or(false);
-        let is_root = tenant
-            .get("is_root")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        if active && is_root {
-            tenant
-                .get("tenant_id")
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-        } else {
-            None
-        }
-    })
-}
-
-fn normalize_tenant_name_for_match(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
-}
-
-fn core_system_identity_already_registered(state: &OrchestratorState, node_name: &str) -> bool {
-    match fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_config(
-        &state.config_dir,
-        node_name,
-    ) {
-        Ok(Some((_seq, ilk))) => {
-            ilk.registration_status.eq_ignore_ascii_case("complete")
-                && ilk.ilk_type.eq_ignore_ascii_case("system")
-        }
-        Ok(None) => false,
-        Err(err) => {
-            tracing::debug!(
-                node_name = %node_name,
-                error = %err,
-                "core SY identity registration precheck could not read identity SHM"
-            );
-            false
-        }
-    }
-}
-
-fn core_system_identity_node_names(state: &OrchestratorState) -> Vec<String> {
-    let mut names = HashSet::new();
-    names.insert(ensure_l2_name("SY.orchestrator", &state.hive_id));
-    for service in core_system_identity_services(state) {
-        if let Some(node_base) = core_service_node_base_name(service) {
-            names.insert(ensure_l2_name(node_base, &state.hive_id));
-        }
-    }
-    let mut out: Vec<String> = names.into_iter().collect();
-    out.sort();
-    out
-}
-
-fn core_system_identity_services(state: &OrchestratorState) -> Vec<&'static str> {
-    let mut services = LEGACY_ALIGNED_SERVICE_UNITS.to_vec();
-    if state.is_motherbee {
-        services.extend([
-            "sy-admin",
-            "sy-architect",
-            "sy-vault",
-            "sy-storage",
-            "sy-cognition",
-            "sy-policy",
-            "sy-timer",
-            "sy-wf-rules",
-            "sy-frontdesk-gov",
-        ]);
-    } else {
-        services.extend([
-            "sy-vault",
-            "sy-cognition",
-            "sy-policy",
-            "sy-timer",
-            "sy-wf-rules",
-        ]);
-    }
-    if identity_available() {
-        services.push("sy-identity");
-    }
-    services
-}
-
-fn core_service_node_base_name(service: &str) -> Option<&'static str> {
-    match service {
-        "sy-admin" => Some("SY.admin"),
-        "sy-architect" => Some("SY.architect"),
-        "sy-cognition" => Some("SY.cognition"),
-        "sy-config-routes" => Some("SY.config.routes"),
-        "sy-frontdesk-gov" => Some("SY.frontdesk.gov"),
-        "sy-identity" => Some("SY.identity"),
-        "sy-opa-rules" => Some("SY.opa.rules"),
-        "sy-policy" => Some("SY.policy"),
-        "sy-storage" => Some("SY.storage"),
-        "sy-timer" => Some("SY.timer"),
-        "sy-vault" => Some("SY.vault"),
-        "sy-wf-rules" => Some("SY.wf-rules"),
-        _ => None,
-    }
-}
-
 async fn watchdog_tick(state: &OrchestratorState) {
     let services: &[&str] = if state.is_motherbee {
         &MOTHERBEE_CRITICAL_SERVICES
@@ -1478,12 +1141,6 @@ async fn watchdog_tick(state: &OrchestratorState) {
                 "service restart failed"
             );
         }
-    }
-    if let Err(err) = ensure_core_system_identities_registered(state).await {
-        tracing::warn!(
-            error = %err,
-            "core SY identity registration retry failed"
-        );
     }
 
     if let Ok(snapshot) = load_router_snapshot(state) {
@@ -15734,66 +15391,6 @@ mod tests {
             sync_enabled: true,
             sync_tool: "syncthing".to_string(),
         }
-    }
-
-    #[test]
-    fn select_core_system_tenant_prefers_configured_active_tenant_name() {
-        let payload = serde_json::json!({
-            "tenants": [
-                {
-                    "tenant_id": "tnt:11111111-1111-1111-1111-111111111111",
-                    "name": "Other",
-                    "status": "active",
-                    "is_root": true
-                },
-                {
-                    "tenant_id": "tnt:22222222-2222-2222-2222-222222222222",
-                    "name": "Fluxbee",
-                    "status": "active",
-                    "is_root": false
-                }
-            ]
-        });
-
-        assert_eq!(
-            select_core_system_tenant_id(&payload, Some(" fluxbee ")).as_deref(),
-            Some("tnt:22222222-2222-2222-2222-222222222222")
-        );
-    }
-
-    #[test]
-    fn select_core_system_tenant_falls_back_to_active_root() {
-        let payload = serde_json::json!({
-            "tenants": [
-                {
-                    "tenant_id": "tnt:11111111-1111-1111-1111-111111111111",
-                    "name": "Inactive Root",
-                    "status": "inactive",
-                    "is_root": true
-                },
-                {
-                    "tenant_id": "tnt:22222222-2222-2222-2222-222222222222",
-                    "name": "Root",
-                    "status": "active",
-                    "is_root": true
-                }
-            ]
-        });
-
-        assert_eq!(
-            select_core_system_tenant_id(&payload, Some("missing")).as_deref(),
-            Some("tnt:22222222-2222-2222-2222-222222222222")
-        );
-    }
-
-    #[test]
-    fn core_service_node_base_name_maps_vault_and_architect() {
-        assert_eq!(
-            core_service_node_base_name("sy-architect"),
-            Some("SY.architect")
-        );
-        assert_eq!(core_service_node_base_name("sy-vault"), Some("SY.vault"));
-        assert_eq!(core_service_node_base_name("unknown"), None);
     }
 
     #[test]
