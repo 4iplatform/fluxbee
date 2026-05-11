@@ -99,50 +99,6 @@ const NODE_STATUS_SCHEMA_VERSION: &str = "1";
 const NODE_STATUS_FORWARD_TIMEOUT_SECS: u64 = 2;
 const DEPLOYMENT_HISTORY_MAX_LIMIT: usize = 500;
 const DRIFT_ALERT_MAX_LIMIT: usize = 500;
-const LEGACY_ALIGNED_NODE_NAMES: &[&str] = &["SY.config.routes", "SY.opa.rules"];
-const LEGACY_ALIGNED_SERVICE_UNITS: &[&str] = &["sy-config-routes", "sy-opa-rules"];
-const LEGACY_ALIGNED_WORKER_UNITS: &[(&str, &str)] = &[
-    ("sy-config-routes", "/usr/bin/sy-config-routes"),
-    ("sy-opa-rules", "/usr/bin/sy-opa-rules"),
-];
-const CORE_SYNC_RESTART_ORDER: &[&str] = &[
-    "rt-gateway",
-    "sy-config-routes",
-    "sy-opa-rules",
-    "sy-identity",
-    "sy-admin",
-    "sy-architect",
-    "sy-vault",
-    "sy-storage",
-    "sy-cognition",
-    "sy-policy",
-    "sy-timer",
-    "sy-wf-rules",
-    "sy-frontdesk-gov",
-    "sy-orchestrator",
-];
-const WORKER_MIN_CORE_COMPONENTS: [&str; 9] = [
-    "rt-gateway",
-    "sy-config-routes",
-    "sy-opa-rules",
-    "sy-identity",
-    "sy-vault",
-    "sy-cognition",
-    "sy-policy",
-    "sy-timer",
-    "sy-orchestrator",
-];
-const WORKER_BOOTSTRAP_CORE_COMPONENTS: [&str; 9] = [
-    "rt-gateway",
-    "sy-config-routes",
-    "sy-opa-rules",
-    "sy-identity",
-    "sy-vault",
-    "sy-cognition",
-    "sy-policy",
-    "sy-timer",
-    "sy-orchestrator",
-];
 const DEFAULT_BLOB_ENABLED: bool = true;
 const DEFAULT_BLOB_PATH: &str = "/var/lib/fluxbee/blob";
 const DEFAULT_BLOB_SYNC_ENABLED: bool = false;
@@ -174,6 +130,20 @@ struct HiveFile {
     dist: Option<DistSection>,
     identity: Option<IdentitySection>,
     government: Option<GovernmentSection>,
+    system_nodes: Option<SystemNodesSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemNodesSection {
+    motherbee: Option<RoleSystemNodes>,
+    worker: Option<RoleSystemNodes>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RoleSystemNodes {
+    nodes: Vec<String>,
+    #[serde(default)]
+    wait_for: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -409,6 +379,7 @@ struct OrchestratorState {
     last_blob_gc: Mutex<Instant>,
     nats_endpoint: String,
     identity_sync_port: u16,
+    system_nodes: RoleSystemNodes,
     blob: BlobRuntimeConfig,
     dist: DistRuntimeConfig,
     blob_sync_last_desired: Mutex<BlobRuntimeConfig>,
@@ -432,31 +403,6 @@ struct SystemUpdateRequest {
     runtime: Option<String>,
     runtime_version: Option<String>,
 }
-
-const MOTHERBEE_CRITICAL_SERVICES: [&str; 12] = [
-    "rt-gateway",
-    "sy-config-routes",
-    "sy-opa-rules",
-    "sy-identity",
-    "sy-vault",
-    "sy-admin",
-    "sy-architect",
-    "sy-storage",
-    "sy-cognition",
-    "sy-policy",
-    "sy-timer",
-    "sy-frontdesk-gov",
-];
-const WORKER_CRITICAL_SERVICES: [&str; 8] = [
-    "rt-gateway",
-    "sy-config-routes",
-    "sy-opa-rules",
-    "sy-identity",
-    "sy-vault",
-    "sy-cognition",
-    "sy-policy",
-    "sy-timer",
-];
 
 #[tokio::main]
 async fn main() -> Result<(), OrchestratorError> {
@@ -515,6 +461,7 @@ async fn main() -> Result<(), OrchestratorError> {
     let blob_runtime = blob_runtime_from_hive(&hive);
     let dist_runtime = dist_runtime_from_hive(&hive);
     let storage_path = storage_path_from_hive(&hive);
+    let system_nodes = system_nodes_for_role(&hive, is_motherbee)?;
     let runtime_manifest = load_runtime_manifest();
     let system_allowed_origins = load_system_allowed_origins(&hive.hive_id);
     tracing::info!(allowed = ?system_allowed_origins, "system message origin allowlist loaded");
@@ -537,6 +484,7 @@ async fn main() -> Result<(), OrchestratorError> {
         last_blob_gc: Mutex::new(Instant::now()),
         nats_endpoint,
         identity_sync_port,
+        system_nodes,
         blob: blob_runtime.clone(),
         dist: dist_runtime,
         blob_sync_last_desired: Mutex::new(blob_runtime),
@@ -674,38 +622,15 @@ async fn bootstrap_local(
         disable_blob_sync_runtime_local()?;
     }
 
-    let mut services = if state.is_motherbee {
-        let mut services = LEGACY_ALIGNED_SERVICE_UNITS.to_vec();
-        services.extend([
-            "sy-admin",
-            "sy-architect",
-            "sy-vault",
-            "sy-storage",
-            "sy-cognition",
-            "sy-policy",
-            "sy-timer",
-            "sy-wf-rules",
-            "sy-frontdesk-gov",
-        ]);
-        services
-    } else {
-        let mut services = LEGACY_ALIGNED_SERVICE_UNITS.to_vec();
-        services.extend([
-            "sy-vault",
-            "sy-cognition",
-            "sy-policy",
-            "sy-timer",
-            "sy-wf-rules",
-        ]);
-        services
-    };
-    if identity_available() {
-        services.push("sy-identity");
-    }
-    for service in services {
-        tracing::info!(service = service, "starting service");
-        if let Err(err) = systemd_start(service) {
-            tracing::warn!(service = service, error = %err, "failed to start service");
+    for node_name in &state.system_nodes.nodes {
+        let service = name_to_service(node_name);
+        tracing::info!(
+            service = service.as_str(),
+            node = node_name.as_str(),
+            "starting configured system node"
+        );
+        if let Err(err) = systemd_start(&service) {
+            tracing::warn!(service = service.as_str(), error = %err, "failed to start service");
         }
     }
 
@@ -1039,33 +964,29 @@ async fn wait_for_sy_nodes(
     timeout: Duration,
 ) -> Result<(), OrchestratorError> {
     // Only router-connected SY nodes are visible in router SHM.
-    let mut required: Vec<&str> = LEGACY_ALIGNED_NODE_NAMES.to_vec();
-    if state.is_motherbee {
-        required.push("SY.admin");
+    let required: Vec<String> = state
+        .system_nodes
+        .wait_for
+        .iter()
+        .map(|name| name.trim().to_string())
+        .collect();
+    if required.is_empty() {
+        tracing::info!("no configured sy nodes marked for bootstrap wait");
+        return Ok(());
     }
-    if identity_available() {
-        required.push("SY.identity");
-    }
-    if cognition_available() {
-        required.push("SY.cognition");
-    }
-    if policy_available() {
-        required.push("SY.policy");
-    }
-    required.push("SY.timer");
     let start = Instant::now();
-    let mut last_missing: Vec<String> = required.iter().map(|name| (*name).to_string()).collect();
+    let mut last_missing = required.clone();
     loop {
         if let Ok(snapshot) = load_router_snapshot(state) {
             let mut missing = Vec::new();
-            for name in required.iter().copied() {
+            for name in required.iter() {
                 let expected = ensure_l2_name(name, &state.hive_id);
                 let found = snapshot.nodes.iter().any(|node| {
                     if node.name_len == 0 {
                         return false;
                     }
                     let node_name = node_name(node);
-                    node_name == name || node_name == expected
+                    node_name == *name || node_name == expected
                 });
                 if !found {
                     missing.push(name.to_string());
@@ -1090,56 +1011,19 @@ async fn wait_for_sy_nodes(
 }
 
 async fn watchdog_tick(state: &OrchestratorState) {
-    let services: &[&str] = if state.is_motherbee {
-        &MOTHERBEE_CRITICAL_SERVICES
-    } else {
-        &WORKER_CRITICAL_SERVICES
-    };
-    for service in services {
-        if !systemd_is_active(service) {
-            tracing::warn!(service = service, "service not active; attempting restart");
-            if let Err(err) = systemd_start(service) {
-                tracing::warn!(service = service, error = %err, "service restart failed");
+    if !systemd_is_active("rt-gateway") {
+        tracing::warn!(service = "rt-gateway", "service not active; attempting restart");
+        if let Err(err) = systemd_start("rt-gateway") {
+            tracing::warn!(service = "rt-gateway", error = %err, "service restart failed");
+        }
+    }
+    for node_name in &state.system_nodes.nodes {
+        let service = name_to_service(node_name);
+        if !systemd_is_active(&service) {
+            tracing::warn!(service = service.as_str(), "service not active; attempting restart");
+            if let Err(err) = systemd_start(&service) {
+                tracing::warn!(service = service.as_str(), error = %err, "service restart failed");
             }
-        }
-    }
-    if identity_available() && !systemd_is_active("sy-identity") {
-        tracing::warn!(
-            service = "sy-identity",
-            "service not active; attempting restart"
-        );
-        if let Err(err) = systemd_start("sy-identity") {
-            tracing::warn!(
-                service = "sy-identity",
-                error = %err,
-                "service restart failed"
-            );
-        }
-    }
-    if cognition_available() && !systemd_is_active("sy-cognition") {
-        tracing::warn!(
-            service = "sy-cognition",
-            "service not active; attempting restart"
-        );
-        if let Err(err) = systemd_start("sy-cognition") {
-            tracing::warn!(
-                service = "sy-cognition",
-                error = %err,
-                "service restart failed"
-            );
-        }
-    }
-    if policy_available() && !systemd_is_active("sy-policy") {
-        tracing::warn!(
-            service = "sy-policy",
-            "service not active; attempting restart"
-        );
-        if let Err(err) = systemd_start("sy-policy") {
-            tracing::warn!(
-                service = "sy-policy",
-                error = %err,
-                "service restart failed"
-            );
         }
     }
 
@@ -1197,30 +1081,16 @@ async fn shutdown_sequence(state: &OrchestratorState) {
 
     time::sleep(Duration::from_secs(10)).await;
 
-    let mut shutdown_services = vec![
-        "sy-frontdesk-gov",
-        "sy-wf-rules",
-        "sy-timer",
-        "sy-policy",
-        "sy-cognition",
-        "sy-storage",
-        "sy-vault",
-        "sy-architect",
-        "sy-admin",
-    ];
-    shutdown_services.extend(LEGACY_ALIGNED_SERVICE_UNITS.iter().copied());
-    for service in shutdown_services {
+    let mut shutdown_services: Vec<String> = state
+        .system_nodes
+        .nodes
+        .iter()
+        .map(|name| name_to_service(name))
+        .collect();
+    shutdown_services.reverse();
+    for service in &shutdown_services {
         if let Err(err) = systemd_stop(service) {
-            tracing::warn!(service = service, error = %err, "failed to stop service");
-        }
-    }
-    if identity_available() {
-        if let Err(err) = systemd_stop("sy-identity") {
-            tracing::warn!(
-                service = "sy-identity",
-                error = %err,
-                "failed to stop service"
-            );
+            tracing::warn!(service = service.as_str(), error = %err, "failed to stop service");
         }
     }
     if let Err(err) = systemd_stop("rt-gateway") {
@@ -2243,21 +2113,30 @@ async fn handle_system_sync_hint_message(
 
 async fn restart_local_core_services_with_health_gate() -> Result<Vec<String>, OrchestratorError> {
     let mut restarted = Vec::new();
-    for service in CORE_SYNC_RESTART_ORDER {
-        if *service == "sy-orchestrator" {
+    let hive = load_hive(&json_router::paths::config_dir())?;
+    let is_motherbee = is_mother_role(hive.role.as_deref());
+    let mut services = vec!["rt-gateway".to_string()];
+    services.extend(
+        system_nodes_for_role(&hive, is_motherbee)?
+            .nodes
+            .iter()
+            .map(|name| name_to_service(name)),
+    );
+    for service in services {
+        if service == "sy-orchestrator" {
             // Avoid self-restart while processing the request; operator can restart orchestrator separately.
             continue;
         }
-        if !systemd_unit_exists(service) {
+        if !systemd_unit_exists(&service) {
             continue;
         }
-        systemd_start(service)?;
+        systemd_start(&service)?;
         wait_for_service_active(
-            service,
+            &service,
             Duration::from_secs(CORE_SERVICE_HEALTH_TIMEOUT_SECS),
         )
         .await?;
-        restarted.push((*service).to_string());
+        restarted.push(service);
     }
     Ok(restarted)
 }
@@ -2969,6 +2848,116 @@ async fn connect_with_retry(
 fn load_hive(config_dir: &Path) -> Result<HiveFile, OrchestratorError> {
     let data = fs::read_to_string(config_dir.join("hive.yaml"))?;
     Ok(serde_yaml::from_str(&data)?)
+}
+
+fn system_nodes_for_role(
+    hive: &HiveFile,
+    is_motherbee: bool,
+) -> Result<RoleSystemNodes, OrchestratorError> {
+    let section = hive
+        .system_nodes
+        .as_ref()
+        .ok_or_else(|| "invalid hive.yaml: system_nodes section is required".to_string())?;
+    let role_section = if is_motherbee {
+        section.motherbee.as_ref()
+    } else {
+        section.worker.as_ref()
+    }
+    .ok_or_else(|| {
+        format!(
+            "invalid hive.yaml: system_nodes.{} section is required",
+            if is_motherbee { "motherbee" } else { "worker" }
+        )
+    })?;
+    validate_system_nodes(role_section, is_motherbee)?;
+    Ok(role_section.clone())
+}
+
+fn validate_system_nodes(
+    section: &RoleSystemNodes,
+    is_motherbee: bool,
+) -> Result<(), OrchestratorError> {
+    let nodes = &section.nodes;
+    if nodes.is_empty() {
+        return Err("invalid hive.yaml: configured system node list is empty".into());
+    }
+    if nodes[0].trim() != "SY.identity" {
+        return Err(format!(
+            "invalid hive.yaml: system_nodes.{}.nodes must start with SY.identity",
+            if is_motherbee { "motherbee" } else { "worker" }
+        )
+        .into());
+    }
+    let mut seen_nodes = HashSet::new();
+    let mut seen_services = HashSet::new();
+    for raw_name in nodes {
+        let name = raw_name.trim();
+        if !name.starts_with("SY.") {
+            return Err(format!(
+                "invalid hive.yaml: system node '{}' must use SY.* naming",
+                raw_name
+            )
+            .into());
+        }
+        let service = name_to_service(name);
+        if !valid_token(&service) || !service.starts_with("sy-") {
+            return Err(format!(
+                "invalid hive.yaml: system node '{}' yields invalid service '{}'",
+                name, service
+            )
+            .into());
+        }
+        if !is_motherbee && service == "sy-vault" {
+            return Err("invalid hive.yaml: workers must not run sy-vault".into());
+        }
+        if !seen_nodes.insert(name.to_string()) {
+            return Err(format!("invalid hive.yaml: duplicate system node '{name}'").into());
+        }
+        if !seen_services.insert(service.clone()) {
+            return Err(format!("invalid hive.yaml: duplicate system service '{service}'").into());
+        }
+    }
+    let node_set: HashSet<&str> = nodes.iter().map(String::as_str).map(str::trim).collect();
+    let mut seen_wait = HashSet::new();
+    for raw_wait in &section.wait_for {
+        let wait_name = raw_wait.trim();
+        if !node_set.contains(wait_name) {
+            return Err(format!(
+                "invalid hive.yaml: wait_for entry '{}' is not in nodes list",
+                wait_name
+            )
+            .into());
+        }
+        if !seen_wait.insert(wait_name.to_string()) {
+            return Err(format!("invalid hive.yaml: duplicate wait_for entry '{wait_name}'").into());
+        }
+    }
+    Ok(())
+}
+
+/// `SY.config.routes` → `sy-config-routes`. Lowercase, `.` → `-`, prefix preserved.
+fn name_to_service(node_name: &str) -> String {
+    let trimmed = node_name.trim();
+    let base = trimmed.strip_prefix("SY.").unwrap_or(trimmed);
+    format!("sy-{}", base.to_ascii_lowercase().replace('.', "-"))
+}
+
+fn service_to_exec(service: &str) -> String {
+    format!("/usr/bin/{}", service)
+}
+
+fn render_worker_system_nodes_yaml(section: &RoleSystemNodes) -> String {
+    let mut out = String::from("system_nodes:\n  worker:\n    nodes:\n");
+    for name in &section.nodes {
+        out.push_str(&format!("      - {}\n", name.trim()));
+    }
+    if !section.wait_for.is_empty() {
+        out.push_str("    wait_for:\n");
+        for name in &section.wait_for {
+            out.push_str(&format!("      - {}\n", name.trim()));
+        }
+    }
+    out
 }
 
 fn ensure_dirs(
@@ -12302,12 +12291,26 @@ fn core_component_names_for_role(
         return Ok(manifest.components.keys().cloned().collect());
     }
 
-    let mut out = Vec::new();
-    for name in WORKER_MIN_CORE_COMPONENTS {
+    worker_core_component_names(manifest)
+}
+
+fn worker_core_component_names(manifest: &CoreManifest) -> Result<Vec<String>, OrchestratorError> {
+    let hive = load_hive(&json_router::paths::config_dir())?;
+    let worker_section = system_nodes_for_role(&hive, false)?;
+    let mut out = vec!["rt-gateway".to_string()];
+    for node_name in &worker_section.nodes {
+        let service = name_to_service(node_name);
+        if !out.iter().any(|name| name == &service) {
+            out.push(service);
+        }
+    }
+    if !out.iter().any(|name| name == "sy-orchestrator") {
+        out.push("sy-orchestrator".to_string());
+    }
+    for name in &out {
         if !manifest.components.contains_key(name) {
             return Err(format!("core manifest missing required worker component '{name}'").into());
         }
-        out.push(name.to_string());
     }
     Ok(out)
 }
@@ -12331,10 +12334,7 @@ fn sync_core_to_worker(
 ) -> Result<(), OrchestratorError> {
     let manifest = load_core_manifest()?;
     let component_names = if worker_bootstrap_only {
-        WORKER_BOOTSTRAP_CORE_COMPONENTS
-            .iter()
-            .map(|name| name.to_string())
-            .collect()
+        worker_core_component_names(&manifest)?
     } else {
         core_component_names_for_role(&manifest, true)?
     };
@@ -12547,12 +12547,18 @@ fn sync_core_to_worker(
     }
 
     if restart_services_with_health_gate {
-        if let Err(err) = restart_remote_core_services_with_health_gate(address, key_path) {
+        let restart_services = worker_core_component_names(&manifest)?;
+        if let Err(err) =
+            restart_remote_core_services_with_health_gate(address, key_path, &restart_services)
+        {
             let rollback_result = rollback_remote_core_to_prev(address, key_path);
             let rollback_note = match rollback_result {
                 Ok(()) => {
-                    if let Err(rb_err) =
-                        restart_remote_core_services_with_health_gate(address, key_path)
+                    if let Err(rb_err) = restart_remote_core_services_with_health_gate(
+                        address,
+                        key_path,
+                        &restart_services,
+                    )
                     {
                         format!("rollback applied but restart after rollback failed: {rb_err}")
                     } else {
@@ -12757,17 +12763,18 @@ fn remote_wait_service_active(
 fn restart_remote_core_services_with_health_gate(
     address: &str,
     key_path: &Path,
+    services: &[String],
 ) -> Result<(), OrchestratorError> {
-    for service in CORE_SYNC_RESTART_ORDER {
+    for service in services {
         let exists = remote_service_exists(address, key_path, service)?;
         if !exists {
             tracing::info!(
-                service = *service,
+                service = service.as_str(),
                 "core sync: remote service not present; skipping restart"
             );
             continue;
         }
-        tracing::info!(service = *service, "core sync: restarting remote service");
+        tracing::info!(service = service.as_str(), "core sync: restarting remote service");
         let restart_cmd = format!("systemctl restart {}", service);
         ssh_with_key(
             address,
@@ -12778,7 +12785,7 @@ fn restart_remote_core_services_with_health_gate(
         .map_err(|err| format!("failed to restart service '{}': {}", service, err))?;
         remote_wait_service_active(address, key_path, service, CORE_SERVICE_HEALTH_TIMEOUT_SECS)?;
         tracing::info!(
-            service = *service,
+            service = service.as_str(),
             "core sync: remote service active after restart"
         );
     }
@@ -13652,12 +13659,36 @@ async fn add_hive_flow(
             });
         }
     };
-    let has_identity_source = core_manifest.components.contains_key("sy-identity");
-    let has_vault_source = core_manifest.components.contains_key("sy-vault");
-    let has_cognition_source = core_manifest.components.contains_key("sy-cognition");
-    let has_policy_source = core_manifest.components.contains_key("sy-policy");
-    let has_timer_source = core_manifest.components.contains_key("sy-timer");
-    let has_wf_rules_source = core_manifest.components.contains_key("sy-wf-rules");
+    let local_hive = match load_hive(&state.config_dir) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "CONFIG_FAILED",
+                "message": format!("failed to read local hive.yaml: {err}"),
+            });
+        }
+    };
+    let worker_system_nodes = match system_nodes_for_role(&local_hive, false) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "CONFIG_FAILED",
+                "message": format!("invalid worker system_nodes config: {err}"),
+            });
+        }
+    };
+    for node_name in &worker_system_nodes.nodes {
+        let service = name_to_service(node_name);
+        if !core_manifest.components.contains_key(&service) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "MANIFEST_INVALID",
+                "message": format!("core manifest missing configured worker service '{service}'"),
+            });
+        }
+    }
 
     let core_deploy_started_at = now_epoch_ms();
     let core_deploy_started = Instant::now();
@@ -13761,15 +13792,8 @@ async fn add_hive_flow(
                 .to_string_lossy()
                 .to_string()
         });
-    let local_hive = load_hive(&state.config_dir).ok();
-    let identity_frontdesk_node_name = local_hive
-        .as_ref()
-        .map(identity_frontdesk_node_name_from_hive)
-        .unwrap_or_else(|| format!("SY.frontdesk.gov@{}", state.hive_id));
-    let identity_sync_port = local_hive
-        .as_ref()
-        .map(identity_sync_port_from_hive)
-        .unwrap_or(DEFAULT_IDENTITY_SYNC_PORT);
+    let identity_frontdesk_node_name = identity_frontdesk_node_name_from_hive(&local_hive);
+    let identity_sync_port = identity_sync_port_from_hive(&local_hive);
     let (worker_uplink_host, _) = match parse_host_port(&worker_uplink) {
         Ok(value) => value,
         Err(err) => {
@@ -13782,7 +13806,7 @@ async fn add_hive_flow(
     };
     let identity_sync_upstream = format_host_port(&worker_uplink_host, identity_sync_port);
     let hive_yaml = format!(
-        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\ngovernment:\n  identity_frontdesk: \"{}\"\nidentity:\n  sync:\n    upstream: \"{}\"\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n",
+        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\ngovernment:\n  identity_frontdesk: \"{}\"\nidentity:\n  sync:\n    upstream: \"{}\"\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n{}",
         hive_id,
         worker_uplink,
         storage_path,
@@ -13801,7 +13825,8 @@ async fn add_hive_flow(
         desired_blob.gc_active_retain_days,
         desired_dist.path.display(),
         desired_dist.sync_enabled,
-        desired_dist.sync_tool
+        desired_dist.sync_tool,
+        render_worker_system_nodes_yaml(&worker_system_nodes)
     );
     if let Err(err) = write_remote_file(address, &key_path, "/etc/fluxbee/hive.yaml", &hive_yaml) {
         return serde_json::json!({
@@ -13832,25 +13857,17 @@ async fn add_hive_flow(
         ("rt-gateway", "/usr/bin/rt-gateway"),
         ("sy-orchestrator", "/usr/bin/sy-orchestrator"),
     ];
-    worker_units.extend(LEGACY_ALIGNED_WORKER_UNITS.iter().copied());
-    if has_identity_source {
-        worker_units.push(("sy-identity", "/usr/bin/sy-identity"));
+    let mut worker_unit_storage: Vec<(String, String)> = Vec::new();
+    for node_name in &worker_system_nodes.nodes {
+        let service = name_to_service(node_name);
+        let exec = service_to_exec(&service);
+        worker_unit_storage.push((service, exec));
     }
-    if has_vault_source {
-        worker_units.push(("sy-vault", "/usr/bin/sy-vault"));
-    }
-    if has_cognition_source {
-        worker_units.push(("sy-cognition", "/usr/bin/sy-cognition"));
-    }
-    if has_policy_source {
-        worker_units.push(("sy-policy", "/usr/bin/sy-policy"));
-    }
-    if has_timer_source {
-        worker_units.push(("sy-timer", "/usr/bin/sy-timer"));
-    }
-    if has_wf_rules_source {
-        worker_units.push(("sy-wf-rules", "/usr/bin/sy-wf-rules"));
-    }
+    worker_units.extend(
+        worker_unit_storage
+            .iter()
+            .map(|(service, exec)| (service.as_str(), exec.as_str())),
+    );
 
     for (name, exec_path) in &worker_units {
         let unit = if *name == "sy-orchestrator" {
@@ -14828,14 +14845,6 @@ fn ensure_remote_orchestrator_sudoers_with_access(
 
 fn identity_available() -> bool {
     Path::new("/usr/bin/sy-identity").exists()
-}
-
-fn cognition_available() -> bool {
-    Path::new("/usr/bin/sy-cognition").exists()
-}
-
-fn policy_available() -> bool {
-    Path::new("/usr/bin/sy-policy").exists()
 }
 
 fn askpass_script(password: &str) -> Result<PathBuf, OrchestratorError> {
@@ -15880,6 +15889,10 @@ blob:
             last_blob_gc: Mutex::new(Instant::now()),
             nats_endpoint: "nats://127.0.0.1:4222".to_string(),
             identity_sync_port: 0,
+            system_nodes: RoleSystemNodes {
+                nodes: vec!["SY.identity".to_string(), "SY.timer".to_string()],
+                wait_for: vec!["SY.identity".to_string(), "SY.timer".to_string()],
+            },
             blob: sample_blob_config(),
             dist: sample_dist_config(),
             blob_sync_last_desired: Mutex::new(sample_blob_config()),

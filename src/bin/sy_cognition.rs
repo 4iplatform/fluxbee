@@ -474,6 +474,16 @@ async fn main() -> Result<(), CognitionError> {
 
     let config_dir = json_router::paths::config_dir();
     let hive = load_hive(&config_dir)?;
+    let _self_ilk_id = fluxbee_sdk::identity::wait_for_self_system_ilk_id(
+        &config_dir,
+        "SY.cognition",
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_millis(250),
+    )
+    .map_err(|err| -> CognitionError {
+        format!("failed to resolve self system ILK from identity SHM: {err}").into()
+    })?;
+    tracing::info!(self_ilk_id = %_self_ilk_id, "resolved self system ILK from identity SHM");
     let endpoint = resolve_local_nats_endpoint(&config_dir)?;
     let use_durable_consumer = hive
         .nats

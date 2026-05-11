@@ -255,7 +255,53 @@ fn default_tenant_id(&self) -> Option<String> {
 }
 ```
 
-### 2.9 Sync propagation
+### 2.9 Deterministic system ILKs from `hive.yaml`
+
+`SY.*` nodes are system construction nodes. They do not depend on a late boot-time identity registration to get their ILK.
+
+At startup, `sy.identity` reads the active role's `system_nodes` list from `hive.yaml` and seeds one deterministic `system` ILK per configured `SY.*` node:
+
+- Tenant: fixed native `fluxbee` tenant, `tnt:00000000-0000-0000-0000-000000000001`.
+- ILK id: deterministic UUID derived from the full node name, for example `SY.architect@motherbee`.
+- Identification includes `node_name`, `system_node`, `service` (derived from the node name: `SY.config.routes` → `sy-config-routes`), `hive_id`, and `source: hive.system_nodes`.
+- `registration_status`: `complete`.
+
+`SY.identity` must be the first configured `system_nodes` entry. Workers use their own `system_nodes.worker` list; workers do not run `SY.vault` unless the product topology is explicitly changed later.
+
+#### Compact YAML schema
+
+`hive.yaml`'s `system_nodes` section is a per-role object with two lists. The orchestrator iterates `nodes` to drive `systemd_start`; the bootstrap wait blocks on `wait_for`. Service names are derived from the base name (`SY.X.Y` → `sy-x-y`); the exec path is `/usr/bin/<service>`. No per-entry `start` / `critical` / `exec` / `service` fields — those are constants in code.
+
+```yaml
+system_nodes:
+  motherbee:
+    nodes: [SY.identity, SY.config.routes, SY.opa.rules, SY.admin, SY.architect,
+            SY.vault, SY.storage, SY.cognition, SY.policy, SY.timer,
+            SY.wf-rules, SY.frontdesk.gov]
+    wait_for: [SY.identity, SY.config.routes, SY.opa.rules, SY.admin,
+               SY.cognition, SY.policy, SY.timer]
+  worker:
+    nodes: [SY.identity, SY.config.routes, SY.opa.rules, SY.cognition,
+            SY.policy, SY.timer, SY.wf-rules]
+    wait_for: [SY.identity, SY.config.routes, SY.opa.rules, SY.cognition,
+               SY.policy, SY.timer]
+```
+
+Validation enforced at orchestrator + identity boot: `nodes[0]` must be `SY.identity`; every name must start with `SY.`; `wait_for` must be a subset of `nodes`; workers reject `SY.vault`; no duplicates.
+
+### 2.10 Each SY reads its own ILK at boot
+
+Once the SY ILKs are seeded by identity, each Rust SY binary resolves its own ILK from identity SHM at boot via `fluxbee_sdk::identity::wait_for_self_system_ilk_id(config_dir, self_base_name, timeout, poll_interval)` and caches the resulting `ilk:<uuid>` string for the life of the process.
+
+This is what enables a SY to use `meta.src_ilk = <own ILK>` in outgoing calls — required for `SY.vault` access control and any other path where L3 identity matters.
+
+Wired SYs (resolve at boot): `sy_admin`, `sy_architect`, `sy_cognition`, `sy_config_routes`, `sy_identity` (uses its own internal derive, no SHM wait), `sy_policy`, `sy_storage`, `sy_vault`.
+
+Go-side SYs (`sy-timer`, `sy-wf-rules`, `sy-opa-rules`) gain the same lookup as a follow-up via a Go-side helper mirroring the Rust SDK function.
+
+`sy_orchestrator` is excluded: it does not sign outgoing messages with `src_ilk` (uses L2 routing source name).
+
+### 2.10 Sync propagation
 
 No changes needed. `TenantRecord` is serialized as JSON in sync deltas. The new `sponsor_tenant_id` field is included automatically via `#[derive(Serialize)]`. Workers receive it, deserialize it, update their in-memory store and SHM.
 
@@ -711,43 +757,6 @@ Workers must be compiled with the new struct definitions before receiving deltas
 
 ---
 
-## 11. Implementation Checklist
-
-```
-[ ] TenantRecord: add sponsor_tenant_id field
-[ ] TntCreateRequest: add sponsor_tenant_id field
-[ ] create_tenant: validate sponsor exists
-[ ] create_tenant: propagate sponsor_tenant_id to TenantRecord
-[ ] upsert_tenant_in_db: add $6 parameter for sponsor
-[ ] default_tenant_id: return only the fixed native root tenant id
-[ ] TenantEntry SHM: add sponsor_tenant_id [u8; 16]
-[ ] tenant_entry_from_record: populate sponsor_tenant_id bytes
-[ ] TNT_CREATE_RESPONSE: include sponsor_tenant_id
-
-[ ] ChannelRecord: add owner_l2_name field
-[ ] ChannelRecord: add enabled field (default false)
-[ ] ILK_ADD_CHANNEL handler: auto-fill owner_l2_name from routing.src
-[ ] ILK_ADD_CHANNEL handler: set enabled=false on new channels
-[ ] IchEntry SHM: add owner_l2_name [u8; 128] and enabled u8
-[ ] ich_entry_from_record: populate new fields
-
-[ ] New handler: ICH_SET_ENABLED
-[ ] ICH_SET_ENABLED: validate ich_id exists
-[ ] ICH_SET_ENABLED: update in-memory, DB, SHM
-[ ] ICH_SET_ENABLED: emit sync delta
-[ ] ICH_SET_ENABLED: return response with new state
-
-[ ] Rust SDK: add set_ich_enabled function
-[ ] Go SDK: add SetIchEnabled function
-
-[ ] SHM struct rebuild: update TenantEntry + IchEntry in shm crate
-[ ] SHM region: delete and recreate on first boot after update
-[ ] DB migration: run ALTER TABLE statements
-[ ] Full binary rebuild of all SHM consumers
-
-[ ] ILK_GET_RESPONSE: include sponsor_tenant_id in tenant, owner_l2_name and enabled in channels
-[ ] ILK_LIST_RESPONSE: same additions
-```
 
 ---
 

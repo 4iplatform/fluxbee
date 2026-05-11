@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -144,6 +145,24 @@ struct HiveFile {
     identity: Option<IdentitySection>,
     #[serde(default)]
     database: Option<DatabaseSection>,
+    #[serde(default)]
+    system_nodes: Option<SystemNodesSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemNodesSection {
+    #[serde(default)]
+    motherbee: Option<RoleSystemNodes>,
+    #[serde(default)]
+    worker: Option<RoleSystemNodes>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RoleSystemNodes {
+    nodes: Vec<String>,
+    #[serde(default)]
+    #[allow(dead_code)] // identity does not use wait_for; orchestrator does. Parsed for schema completeness.
+    wait_for: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -713,6 +732,48 @@ impl IdentityStore {
             return Some(DEFAULT_ROOT_TENANT_ID.to_string());
         }
         None
+    }
+
+    fn ensure_system_ilks_from_hive(&mut self, hive: &HiveFile) -> Result<Vec<IlkRecord>, String> {
+        self.ensure_default_root_tenant();
+        let nodes = system_nodes_for_hive(hive)?;
+        let mut changed = Vec::new();
+        for base_name in nodes {
+            let node_name = ensure_l2_name(&base_name, &hive.hive_id);
+            let ilk_id = deterministic_system_ilk_id(&node_name);
+            let next = IlkRecord {
+                ilk_id: ilk_id.clone(),
+                ilk_type: "system".to_string(),
+                registration_status: "complete".to_string(),
+                tenant_id: DEFAULT_ROOT_TENANT_ID.to_string(),
+                identification: json!({
+                    "node_name": node_name,
+                    "system_node": base_name,
+                    "service": name_to_service(&base_name),
+                    "hive_id": hive.hive_id.as_str(),
+                    "source": "hive.system_nodes"
+                }),
+                definition: json!({}),
+                channels: Vec::new(),
+                deleted_at_ms: None,
+            };
+            let needs_upsert = self
+                .ilks
+                .get(&ilk_id)
+                .map(|existing| {
+                    existing.ilk_type != next.ilk_type
+                        || existing.registration_status != next.registration_status
+                        || existing.tenant_id != next.tenant_id
+                        || existing.identification != next.identification
+                        || existing.deleted_at_ms.is_some()
+                })
+                .unwrap_or(true);
+            if needs_upsert {
+                self.ilks.insert(ilk_id, next.clone());
+                changed.push(next);
+            }
+        }
+        Ok(changed)
     }
 
     fn provision_temporary_ilk(&mut self, req: IlkProvisionRequest) -> Result<Value, String> {
@@ -2510,11 +2571,43 @@ async fn main() -> Result<(), IdentityError> {
             tracing::warn!("identity replica mode without identity.sync.upstream; starting with local in-memory state");
         }
     }
+    match runtime.store.ensure_system_ilks_from_hive(&hive) {
+        Ok(changed_ilks) => {
+            if !changed_ilks.is_empty() {
+                tracing::info!(
+                    count = changed_ilks.len(),
+                    "seeded deterministic system ILKs from hive.yaml"
+                );
+            }
+            if is_primary {
+                if let Some(database_config) = runtime.db_config.clone() {
+                    for ilk in &changed_ilks {
+                        if let Err(err) = persist_ilk_state_in_db(&database_config, ilk, None).await
+                        {
+                            tracing::warn!(
+                                ilk_id = %ilk.ilk_id,
+                                error = %err,
+                                "failed to persist deterministic system ILK"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            return Err(format!("failed to seed system ILKs from hive.yaml: {err}").into());
+        }
+    }
     if let Some(writer) = identity_shm.as_mut() {
         if let Err(err) = sync_identity_shm_mappings(writer, &runtime.store) {
             tracing::warn!(error = %err, "initial identity shm sync failed");
         }
     }
+    // Identity is the SHM writer; it derives its own ILK locally rather than
+    // waiting on the SHM read path it just populated.
+    let _self_ilk_id =
+        deterministic_system_ilk_id(&ensure_l2_name("SY.identity", &hive.hive_id));
+    tracing::info!(self_ilk_id = %_self_ilk_id, "resolved self system ILK");
     let (delta_event_tx, mut delta_event_rx) = mpsc::unbounded_channel::<IdentityDeltaEnvelope>();
     if !is_primary {
         if let Some(upstream) = sync_upstream.clone() {
@@ -3575,12 +3668,71 @@ fn load_hive(config_dir: &Path) -> Result<HiveFile, IdentityError> {
     Ok(serde_yaml::from_str(&raw)?)
 }
 
+fn system_nodes_for_hive(hive: &HiveFile) -> Result<Vec<String>, String> {
+    let section = hive
+        .system_nodes
+        .as_ref()
+        .ok_or_else(|| "system_nodes section is required".to_string())?;
+    let is_primary = is_mother_role(hive.role.as_deref());
+    let role_section = if is_primary {
+        section.motherbee.as_ref()
+    } else {
+        section.worker.as_ref()
+    }
+    .ok_or_else(|| {
+        format!(
+            "system_nodes.{} section is required",
+            if is_primary { "motherbee" } else { "worker" }
+        )
+    })?;
+    let nodes = &role_section.nodes;
+    if nodes.is_empty() {
+        return Err("system node list is empty".to_string());
+    }
+    if nodes[0].trim() != "SY.identity" {
+        return Err("system node list must start with SY.identity".to_string());
+    }
+    let mut seen_nodes = HashSet::new();
+    let mut out = Vec::with_capacity(nodes.len());
+    for raw_name in nodes {
+        let name = raw_name.trim();
+        if !name.starts_with("SY.") {
+            return Err(format!("system node '{name}' must use SY.* naming"));
+        }
+        if !seen_nodes.insert(name.to_string()) {
+            return Err(format!("duplicate system node '{name}'"));
+        }
+        out.push(name.to_string());
+    }
+    Ok(out)
+}
+
+/// Derive the systemd-style service name for a SY base name. Matches the orchestrator's
+/// helper of the same name — keep both in sync if either changes.
+fn name_to_service(node_name: &str) -> String {
+    let trimmed = node_name.trim();
+    let base = trimmed.strip_prefix("SY.").unwrap_or(trimmed);
+    format!("sy-{}", base.to_ascii_lowercase().replace('.', "-"))
+}
+
 fn ensure_l2_name(name: &str, hive_id: &str) -> String {
     if name.contains('@') {
         name.to_string()
     } else {
         format!("{}@{}", name, hive_id)
     }
+}
+
+fn deterministic_system_ilk_id(node_name: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"fluxbee:identity:system-ilk:v1:");
+    hasher.update(node_name.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!("ilk:{}", Uuid::from_bytes(bytes))
 }
 
 fn response_name(action: &str) -> &'static str {
@@ -5119,6 +5271,13 @@ mod tests {
             }),
             identity: None,
             database: None,
+            system_nodes: Some(SystemNodesSection {
+                motherbee: Some(RoleSystemNodes {
+                    nodes: vec!["SY.identity".to_string(), "SY.architect".to_string()],
+                    wait_for: vec!["SY.identity".to_string()],
+                }),
+                worker: None,
+            }),
         }
     }
 
@@ -5492,6 +5651,39 @@ mod tests {
             store.default_tenant_id().as_deref(),
             Some(DEFAULT_ROOT_TENANT_ID)
         );
+    }
+
+    #[test]
+    fn system_ilks_are_seeded_deterministically_from_hive() {
+        let hive = test_hive(Some("SY.frontdesk.gov@motherbee"));
+        let mut store = IdentityStore::default();
+
+        let changed = store
+            .ensure_system_ilks_from_hive(&hive)
+            .expect("seed system ilks");
+        assert_eq!(changed.len(), 2);
+
+        let identity_node = "SY.identity@motherbee";
+        let identity_ilk_id = deterministic_system_ilk_id(identity_node);
+        let identity_ilk = store
+            .ilks
+            .get(&identity_ilk_id)
+            .expect("identity system ilk");
+        assert_eq!(identity_ilk.ilk_type, "system");
+        assert_eq!(identity_ilk.registration_status, "complete");
+        assert_eq!(identity_ilk.tenant_id, DEFAULT_ROOT_TENANT_ID);
+        assert_eq!(
+            identity_ilk
+                .identification
+                .get("node_name")
+                .and_then(Value::as_str),
+            Some(identity_node)
+        );
+
+        let changed_again = store
+            .ensure_system_ilks_from_hive(&hive)
+            .expect("seed system ilks idempotently");
+        assert!(changed_again.is_empty());
     }
 
     #[test]

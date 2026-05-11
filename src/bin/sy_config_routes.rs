@@ -80,6 +80,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let hive = load_hive(&config_dir)?;
     let hive_id = hive.hive_id.clone();
+    let _self_ilk_id = fluxbee_sdk::identity::wait_for_self_system_ilk_id(
+        &config_dir,
+        "SY.config.routes",
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_millis(250),
+    )
+    .map_err(|err| -> Box<dyn std::error::Error> {
+        format!("failed to resolve self system ILK from identity SHM: {err}").into()
+    })?;
+    tracing::info!(self_ilk_id = %_self_ilk_id, "resolved self system ILK from identity SHM");
     let router_socket = match std::env::var("JSR_ROUTER_NAME") {
         Ok(router_name) => {
             let router_l2_name = ensure_l2_name(&router_name, &hive.hive_id);

@@ -160,6 +160,13 @@ async fn main() -> Result<(), VaultError> {
     let hive_id = fluxbee_sdk::load_hive_id(&config_dir)?;
     let node_base_name = VAULT_NODE_BASE_NAME.to_string();
     let node_name = ensure_l2_name(&node_base_name, &hive_id);
+    let _self_ilk_id = fluxbee_sdk::identity::wait_for_self_system_ilk_id(
+        &config_dir,
+        &node_base_name,
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_millis(250),
+    )?;
+    tracing::info!(self_ilk_id = %_self_ilk_id, "resolved self system ILK from identity SHM");
 
     let _lock = acquire_lock(Path::new(DEFAULT_LOCK_PATH))?;
     let key = load_or_create_master_key(Path::new(DEFAULT_MASTER_KEY_PATH))?;

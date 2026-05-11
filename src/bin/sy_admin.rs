@@ -264,6 +264,12 @@ struct AdminContext {
     blob_root: PathBuf,
     node_name: String,
     hive_id: String,
+    /// SY ILK for this admin process, derived deterministically from the L2 name
+    /// by SY.identity and resolved here at boot from identity SHM. Use as
+    /// `meta.src_ilk` for outgoing vault/identity calls and any other path where
+    /// L3 identity is required.
+    #[allow(dead_code)] // wired into outgoing calls in the follow-up vault work
+    self_ilk_id: String,
     authorized_hives: Vec<String>,
     nats_endpoint: String,
     nats_client: Arc<NatsClient>,
@@ -570,6 +576,20 @@ async fn main() -> Result<(), AdminError> {
     let nats_client = Arc::new(NatsClient::from_client_config(&client_config)?);
     let command_lock = Arc::new(Mutex::new(()));
     let node_name = admin_node_name(&hive.hive_id);
+    let self_ilk_id = fluxbee_sdk::identity::wait_for_self_system_ilk_id(
+        &config_dir,
+        "SY.admin",
+        Duration::from_secs(30),
+        Duration::from_millis(250),
+    )
+    .map_err(|err| -> AdminError {
+        format!("failed to resolve self system ILK from identity SHM: {err}").into()
+    })?;
+    tracing::info!(
+        node_name = %node_name,
+        self_ilk_id = %self_ilk_id,
+        "resolved self system ILK from identity SHM"
+    );
     let initial_executor_runtime = build_admin_executor_ai_runtime(&hive.hive_id, &node_name)?;
     let executor_configured = Arc::new(AtomicBool::new(initial_executor_runtime.is_some()));
     let executor_runtime = Arc::new(Mutex::new(initial_executor_runtime));
@@ -580,6 +600,7 @@ async fn main() -> Result<(), AdminError> {
         blob_root,
         node_name,
         hive_id,
+        self_ilk_id,
         authorized_hives,
         nats_endpoint: nats_client.endpoint().to_string(),
         nats_client,

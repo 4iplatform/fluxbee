@@ -212,6 +212,8 @@ pub enum IdentityShmError {
     Yaml(#[from] serde_yaml::Error),
     #[error("nix error: {0}")]
     Nix(#[from] nix::Error),
+    #[error("{0}")]
+    Custom(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -1155,6 +1157,43 @@ pub fn find_ilk_by_handler_node_from_hive_config(
 ) -> Result<Option<(u64, IdentityIlkOption)>, IdentityShmError> {
     let hive_id = load_hive_id(config_dir)?;
     find_ilk_by_handler_node_from_hive_id(&hive_id, handler_node)
+}
+
+/// Block until a SY node's own ILK is visible in identity SHM, polling every
+/// `poll_interval`. Returns the resolved ILK id (e.g. `"ilk:<uuid>"`).
+///
+/// Use at boot in every SY binary to cache the process's own ILK for outgoing
+/// `meta.src_ilk` (e.g. SY.vault calls) without a network round-trip. Identity
+/// seeds these deterministically in its own boot before announcing to the
+/// router, so the wait is short under normal operation.
+pub fn wait_for_self_system_ilk_id(
+    config_dir: &Path,
+    self_base_name: &str,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> Result<String, IdentityShmError> {
+    let hive_id = load_hive_id(config_dir)?;
+    let handler_node = if self_base_name.contains('@') {
+        self_base_name.to_string()
+    } else {
+        format!("{}@{}", self_base_name.trim(), hive_id)
+    };
+    let started = std::time::Instant::now();
+    let mut last_err: Option<IdentityShmError> = None;
+    loop {
+        match find_ilk_by_handler_node_from_hive_id(&hive_id, &handler_node) {
+            Ok(Some((_seq, ilk))) => return Ok(ilk.ilk_id),
+            Ok(None) => {}
+            Err(err) => last_err = Some(err),
+        }
+        if started.elapsed() >= timeout {
+            return Err(last_err.unwrap_or_else(|| IdentityShmError::Custom(format!(
+                "self system ILK not visible for handler_node='{handler_node}' after {}ms",
+                timeout.as_millis()
+            ))));
+        }
+        std::thread::sleep(poll_interval);
+    }
 }
 
 struct IdentityShmReader {

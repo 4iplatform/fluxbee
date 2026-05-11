@@ -180,6 +180,16 @@ async fn main() -> Result<(), StorageError> {
 
     let config_dir = json_router::paths::config_dir();
     let hive = load_hive(&config_dir).await?;
+    let _self_ilk_id = fluxbee_sdk::identity::wait_for_self_system_ilk_id(
+        &config_dir,
+        "SY.storage",
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_millis(250),
+    )
+    .map_err(|err| -> StorageError {
+        format!("failed to resolve self system ILK from identity SHM: {err}").into()
+    })?;
+    tracing::info!(self_ilk_id = %_self_ilk_id, "resolved self system ILK from identity SHM");
     if hive.hive_id == PRIMARY_HIVE_ID && !is_mother_role(hive.role.as_deref()) {
         return Err(format!(
             "invalid hive.yaml: hive_id='{}' is reserved for role=motherbee",

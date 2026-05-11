@@ -50,3 +50,48 @@ dist:
   sync:
     enabled: true
     tool: "syncthing"
+
+# Declarative SY topology per hive role. SY.identity is always first by
+# contract: it seeds the fixed fluxbee root tenant and deterministic system
+# ILKs before any other SY needs identity metadata. `nodes` is the start
+# order; `wait_for` is the subset the orchestrator blocks on before
+# continuing bootstrap. Workers do not run SY.vault.
+system_nodes:
+  motherbee:
+    nodes:
+      - SY.identity
+      - SY.config.routes
+      - SY.opa.rules
+      - SY.admin
+      - SY.architect
+      - SY.vault
+      - SY.storage
+      - SY.cognition
+      - SY.policy
+      - SY.timer
+      - SY.wf-rules
+      - SY.frontdesk.gov
+    wait_for:
+      - SY.identity
+      - SY.config.routes
+      - SY.opa.rules
+      - SY.admin
+      - SY.cognition
+      - SY.policy
+      - SY.timer
+  worker:
+    nodes:
+      - SY.identity
+      - SY.config.routes
+      - SY.opa.rules
+      - SY.cognition
+      - SY.policy
+      - SY.timer
+      - SY.wf-rules
+    wait_for:
+      - SY.identity
+      - SY.config.routes
+      - SY.opa.rules
+      - SY.cognition
+      - SY.policy
+      - SY.timer

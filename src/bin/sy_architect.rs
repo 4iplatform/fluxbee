@@ -4805,6 +4805,20 @@ async fn main() -> Result<(), ArchitectError> {
     let hive = load_hive(&config_dir)?;
     let node_config = load_architect_node_config(&hive.hive_id)?;
     let node_name = architect_node_name(&hive.hive_id);
+    let _self_ilk_id = fluxbee_sdk::identity::wait_for_self_system_ilk_id(
+        &config_dir,
+        "SY.architect",
+        Duration::from_secs(30),
+        Duration::from_millis(250),
+    )
+    .map_err(|err| -> ArchitectError {
+        format!("failed to resolve self system ILK from identity SHM: {err}").into()
+    })?;
+    tracing::info!(
+        node_name = %node_name,
+        self_ilk_id = %_self_ilk_id,
+        "resolved self system ILK from identity SHM"
+    );
     let ai_runtime = build_architect_ai_runtime(
         &node_name,
         node_config.as_ref(),
