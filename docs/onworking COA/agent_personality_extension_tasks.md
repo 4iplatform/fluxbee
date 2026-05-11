@@ -123,6 +123,69 @@
 
 ---
 
+## Future Direction — Resolving the Deferred E2/E5 (when the use case is concrete)
+
+The reason E2/E3/E5 were deferred is structural: the personality `system_fields` (timezone, country_code, primary_language) live in the blob asset file, not in the message envelope nor in identity itself. Today the router only sees the `personality_hash` (a fixed-value match). When a concrete OPA-routing-by-language use case appears — e.g. "route messages from Spanish-speaking customers to any agent whose `personality_primary_language == 'es-AR'`" — we will need to expose those fields to OPA without coupling the router to blob.
+
+**Do not** address this by having the router read blob. The correct path is to **denormalize the routing-relevant subset into identity at the moment of `ILK_SET_DEFINITION`**.
+
+### Proposed shape (for the future iteration)
+
+**Step A — Extend the `set_ilk_definition` request body** so archi sends the small subset alongside the hash. Archi already has the personality in hand when it calls this — it just generated the asset. No extra blob read, no new caller responsibility:
+
+```json
+{
+  "definition": {
+    "role_hash": "...",
+    "skill_hashes": [],
+    "handbook_hashes": [],
+    "personality_hash": "9f8e7d...",
+    "personality_system_fields": {
+      "timezone": "America/Argentina/Mendoza",
+      "country_code": "AR",
+      "primary_language": "es-AR",
+      "additional_languages": ["en", "pt-BR"]
+    }
+  }
+}
+```
+
+**Step B — Identity persists both** in the `IlkRecord.definition` JSON and projects both into `IlkEntry` SHM:
+
+- `personality_hash: [u8; 32]` — canonical pointer (already present).
+- Plus four short fixed-size SHM slots for the denormalized subset, e.g. `personality_timezone: [u8; 64]`, `personality_country_code: [u8; 8]`, `personality_primary_language: [u8; 16]`, `personality_additional_languages: [[u8; 16]; 8]`. Bump `IDENTITY_VERSION` again.
+
+**Step C — Router projection** in `inject_identity_data` adds `personality_timezone`, `personality_country_code`, `personality_primary_language`, `personality_additional_languages` directly from the SHM strings. Zero blob access. OPA rules can match by these fields:
+
+```rego
+package router
+
+target = "AI.support@motherbee" {
+  data.identity[input.meta.dst_ilk].personality_primary_language == "es-AR"
+}
+```
+
+**Step D — Validation**: identity treats the `personality_system_fields` block as authoritative — it doesn't revalidate against the blob on every set call. The contract is: archi (the asset author) is responsible for keeping the denormalized subset in sync with the asset it generated. If they ever diverge, the asset author misconfigured; identity will not arbitrate. An optional fence later: identity reads blob ONCE per `set_ilk_definition` to verify the subset matches the asset (one blob read per definition change, not per OPA evaluation — distinct from router blob coupling).
+
+### Why this is preferable to router-reads-blob
+
+- Router stays in its high-throughput lane: no IO, no cache, no invalidation logic, no fault tolerance for missing files.
+- Identity already owns the canonical state of ILKs; extending its responsibility to "store the routing-projected subset of an ILK's assets" is natural.
+- Caller (archi) already has the data in memory at the right moment. Pushing it through `set_ilk_definition` is one extra JSON field, not new infrastructure.
+- Duplication is bounded: ~100–200 bytes per ILK in SHM. For 8192 ILKs, that's ~1.6 MB. Comparable to the existing per-ILK overhead.
+
+### Trigger to actually do this
+
+Open the work when an operator says any of:
+
+- "Route this conversation to any agent that speaks {language}"
+- "Distribute load across agents in timezone {tz}"
+- "Show me all agents from {country}"
+
+Until then, keep `personality_hash` projection only and let OPA match by curated hashes.
+
+---
+
 ## Open Questions
 
 1. **Sync ordering on personality update.** When `ILK_SET_DEFINITION` changes only `personality_hash` and the router needs to refresh its flat `system_fields` cache, what is the contract: does the router block on the asset being readable from blob, or does it project `personality_hash` immediately and backfill the flat view asynchronously? Default: project immediately, backfill async; OPA rules that match by hash work right away, rules that match by language/timezone work after backfill (typically <1s on motherbee, longer across hives).
