@@ -201,7 +201,7 @@ Assets are JSON files stored in `blob://agent-assets/<hash>.json`. The filename 
 
 **Field groups:**
 
-- `system_fields` — **rigid, system-queryable.** These are the fields routing/scheduling/policy code may read directly from SHM or via `data.identity` projection. Their shape is fixed:
+- `system_fields` — **rigid, structured.** These are the fields the system will eventually need to query for routing/scheduling. Today their values live only inside the personality asset (rendered into the prompt for the LLM); a flat projection into `data.identity[<ilk>]` is descoped (see §8.3 note). Their schema is still validated rigidly here so that when the projection is added later, no asset has to be reauthored. Shape is fixed:
   - `timezone` (string, IANA timezone name; e.g. `America/Argentina/Mendoza`) — **required when the asset is present.**
   - `country_code` (string, ISO 3166-1 alpha-2 uppercase; e.g. `AR`) — **required when the asset is present.**
   - `region_code` (string, ISO 3166-2 like `AR-M`) — optional.
@@ -261,7 +261,7 @@ The `identity_ilks.definition` JSONB column already exists in PostgreSQL. The Ru
 }
 ```
 
-`personality_hash` is optional. Absent or empty string ⇒ no personality block in the composed prompt and no `data.identity[*].personality_*` projection from SHM.
+`personality_hash` is optional. Absent or empty string ⇒ no personality block in the composed prompt. The router projects `personality_hash` itself when non-zero; the flat `system_fields` view is not projected today (see §8.3 note).
 
 For non-agent ILKs (humans, system), the definition remains `{}`.
 
@@ -760,19 +760,7 @@ The router already injects identity SHM data into OPA as `data.identity`. After 
 }
 ```
 
-When `personality_hash` is non-zero, the router also exposes a flattened view of personality `system_fields` (the only fields routing/policy reasonably need to match on) directly inside `data.identity[<ilk>]`:
-
-```json
-{
-  "personality_hash": "9f8e7d6c...",
-  "personality_timezone": "America/Argentina/Mendoza",
-  "personality_country_code": "AR",
-  "personality_primary_language": "es-AR",
-  "personality_additional_languages": ["en", "pt-BR"]
-}
-```
-
-This projection is read by the router from blob (asset content) once at definition-change time and cached per ILK; it is not re-read per OPA evaluation. If the asset cannot be loaded, the projection stays empty and the personality_hash is the only field present, which is enough for OPA rules that match by hash.
+**Note on flat `system_fields` projection.** The router intentionally **does not** read blob to flatten personality `system_fields` (timezone, country_code, primary_language) into `data.identity[<ilk>]`. This was considered but descoped: introducing a blob-read coupling and a per-ILK cache in the router is non-trivial for a use case that hasn't materialized. OPA rules that need to route on personality match on the `personality_hash` itself (a fixed-value match against a known hash), which is sufficient when the operator picks a curated set of personalities. If a future use case demands matching by language/timezone strings rather than by hash, this projection can be added by extending the router with a small asset reader and cache invalidation tied to identity SHM seq changes.
 
 OPA can route by these facts:
 

@@ -447,7 +447,7 @@ Rules:
 - `set_ilk_definition` updates identity only; it does not create blob assets
 - role, skill, handbook, and personality assets must already exist in `blob://agent-assets/<hash>.json`
 - identity stores hashes only; never put prompt text, skill instructions, handbook content, or personality biography directly in `set_ilk_definition`
-- OPA/routing can match `role_hash`, `skill_hashes`, `handbook_hashes`, `personality_hash`, plus the flat `personality_timezone` / `personality_country_code` / `personality_primary_language` / `personality_additional_languages` view of personality `system_fields`. OPA cannot read blob contents.
+- OPA/routing can match `role_hash`, `skill_hashes`, `handbook_hashes`, and `personality_hash`. Matching is hash-only — OPA cannot read blob contents. A flat projection of personality `system_fields` (timezone/country_code/primary_language) is *not* exposed in `data.identity[ilk]` today; route by the hash itself when matching personality.
 - when an operator asks to make an agent "Argentinian", "Spanish-speaking", "based in Mendoza", or describes nationality/timezone/language traits, route through `create_agent_personality_asset` (or reuse an existing personality hash from the catalog). Do **not** stuff these traits into the role asset — the role describes function, the personality describes person.
 - do not use legacy `roles` or `capabilities`; they are retired
 

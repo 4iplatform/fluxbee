@@ -1051,11 +1051,15 @@ struct CognitiveDefinitionHashes {
     role_hash: Option<String>,
     skill_hashes: Vec<String>,
     handbook_hashes: Vec<String>,
+    personality_hash: Option<String>,
 }
 
 impl CognitiveDefinitionHashes {
     fn is_empty(&self) -> bool {
-        self.role_hash.is_none() && self.skill_hashes.is_empty() && self.handbook_hashes.is_empty()
+        self.role_hash.is_none()
+            && self.skill_hashes.is_empty()
+            && self.handbook_hashes.is_empty()
+            && self.personality_hash.is_none()
     }
 }
 
@@ -1078,6 +1082,8 @@ struct CognitiveDefinitionRuntimeState {
     skill_hashes_loaded: Vec<String>,
     #[serde(default)]
     handbook_hashes_loaded: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    personality_hash_loaded: Option<String>,
     #[serde(default)]
     failed_hashes: Vec<CognitiveAssetFailure>,
     prompt_truncated: bool,
@@ -1101,6 +1107,7 @@ impl CognitiveDefinitionRuntimeState {
             role_hash_loaded: None,
             skill_hashes_loaded: Vec::new(),
             handbook_hashes_loaded: Vec::new(),
+            personality_hash_loaded: None,
             failed_hashes: Vec::new(),
             prompt_truncated: false,
             active_prompt_chars: 0,
@@ -2146,6 +2153,7 @@ struct LoadedCognitiveDefinition {
     role: Option<LoadedRoleAsset>,
     skills: Vec<LoadedSkillAsset>,
     handbooks: Vec<LoadedHandbookAsset>,
+    personality: Option<LoadedPersonalityAsset>,
 }
 
 #[derive(Debug, Clone)]
@@ -2182,6 +2190,91 @@ struct LoadedHandbookAsset {
     sections: Vec<HandbookSectionAsset>,
 }
 
+#[derive(Debug, Clone)]
+struct LoadedPersonalityAsset {
+    hash: String,
+    name: String,
+    description: Option<String>,
+    system_fields: PersonalitySystemFields,
+    biographical: PersonalityBiographical,
+    narrative: PersonalityNarrative,
+    extensions: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PersonalitySystemFields {
+    #[serde(default)]
+    timezone: String,
+    #[serde(default)]
+    country_code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    region_code: Option<String>,
+    #[serde(default)]
+    primary_language: String,
+    #[serde(default)]
+    additional_languages: Vec<PersonalityLanguage>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PersonalityLanguage {
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    level: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PersonalityBiographical {
+    #[serde(default)]
+    nationality: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    birth_year: Option<u32>,
+    #[serde(default)]
+    birth_place: Option<String>,
+    #[serde(default)]
+    current_residence: Option<String>,
+    #[serde(default)]
+    education: Vec<PersonalityEducation>,
+    #[serde(default)]
+    professional_background: Vec<PersonalityProfessionalEntry>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PersonalityEducation {
+    #[serde(default)]
+    institution: Option<String>,
+    #[serde(default)]
+    degree: Option<String>,
+    #[serde(default)]
+    year_completed: Option<u32>,
+    #[serde(default)]
+    field: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PersonalityProfessionalEntry {
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    organization: Option<String>,
+    #[serde(default)]
+    years: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PersonalityNarrative {
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    personality_traits: Vec<String>,
+    #[serde(default)]
+    communication_style: Option<String>,
+    #[serde(default)]
+    interests: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct HandbookSectionAsset {
     #[serde(default)]
@@ -2211,6 +2304,14 @@ struct CognitiveAssetDocument {
     constraints: Vec<String>,
     #[serde(default)]
     sections: Vec<HandbookSectionAsset>,
+    #[serde(default)]
+    system_fields: Option<PersonalitySystemFields>,
+    #[serde(default)]
+    biographical: Option<PersonalityBiographical>,
+    #[serde(default)]
+    narrative: Option<PersonalityNarrative>,
+    #[serde(default)]
+    extensions: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 async fn cognitive_definition_poll_loop(
@@ -2323,6 +2424,7 @@ fn hashes_from_identity_ilk(ilk: &IdentityIlkOption) -> CognitiveDefinitionHashe
         role_hash: ilk.role_hash.clone(),
         skill_hashes: ilk.skill_hashes.clone(),
         handbook_hashes: ilk.handbook_hashes.clone(),
+        personality_hash: ilk.personality_hash.clone(),
     }
 }
 
@@ -2340,6 +2442,7 @@ fn compose_cognitive_state(
             role_hash_loaded: None,
             skill_hashes_loaded: Vec::new(),
             handbook_hashes_loaded: Vec::new(),
+            personality_hash_loaded: None,
             failed_hashes: Vec::new(),
             prompt_truncated: false,
             active_prompt_chars: DEFAULT_UNCONFIGURED_AGENT_PROMPT.chars().count(),
@@ -2390,12 +2493,31 @@ fn compose_cognitive_state(
         }
     }
 
+    let personality = match hashes.personality_hash.as_deref() {
+        Some(hash) => match load_personality_asset(blob_root, hash) {
+            Ok(asset) => Some(asset),
+            Err(err) => {
+                failures.push(CognitiveAssetFailure {
+                    hash: hash.to_string(),
+                    asset_type: "personality".to_string(),
+                    error: err,
+                });
+                None
+            }
+        },
+        None => None,
+    };
+
     let loaded = LoadedCognitiveDefinition {
         role,
         skills,
         handbooks,
+        personality,
     };
-    let loaded_count = loaded.role.iter().count() + loaded.skills.len() + loaded.handbooks.len();
+    let loaded_count = loaded.role.iter().count()
+        + loaded.skills.len()
+        + loaded.handbooks.len()
+        + loaded.personality.iter().count();
     let (prompt, prompt_truncated) = if loaded_count == 0 {
         (DEFAULT_UNCONFIGURED_AGENT_PROMPT.to_string(), false)
     } else {
@@ -2424,6 +2546,7 @@ fn compose_cognitive_state(
             .iter()
             .map(|asset| asset.hash.clone())
             .collect(),
+        personality_hash_loaded: loaded.personality.as_ref().map(|asset| asset.hash.clone()),
         failed_hashes: failures,
         prompt_truncated,
         active_prompt_chars: prompt.chars().count(),
@@ -2485,6 +2608,35 @@ fn load_handbook_asset(
     })
 }
 
+fn load_personality_asset(
+    blob_root: &std::path::Path,
+    hash: &str,
+) -> Result<LoadedPersonalityAsset, String> {
+    let doc = load_cognitive_asset(blob_root, hash, "personality")?;
+    let name = required_asset_string(&doc.name, "personality.name")?;
+    let system_fields = doc
+        .system_fields
+        .ok_or_else(|| "personality.system_fields is required".to_string())?;
+    if system_fields.timezone.trim().is_empty() {
+        return Err("personality.system_fields.timezone is required".to_string());
+    }
+    if system_fields.country_code.trim().is_empty() {
+        return Err("personality.system_fields.country_code is required".to_string());
+    }
+    if system_fields.primary_language.trim().is_empty() {
+        return Err("personality.system_fields.primary_language is required".to_string());
+    }
+    Ok(LoadedPersonalityAsset {
+        hash: hash.to_string(),
+        name,
+        description: doc.description.filter(|value| !value.trim().is_empty()),
+        system_fields,
+        biographical: doc.biographical.unwrap_or_default(),
+        narrative: doc.narrative.unwrap_or_default(),
+        extensions: doc.extensions.unwrap_or_default(),
+    })
+}
+
 fn load_cognitive_asset(
     blob_root: &std::path::Path,
     hash: &str,
@@ -2540,9 +2692,166 @@ fn clean_string_vec(items: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+fn append_personality_block(out: &mut String, personality: &LoadedPersonalityAsset) {
+    out.push_str(&format!("[PERSONALITY: {}]\n", personality.name));
+    out.push_str(&format!("Asset hash: {}\n", personality.hash));
+    if let Some(description) = &personality.description {
+        out.push_str(description);
+        out.push('\n');
+    }
+
+    let sys = &personality.system_fields;
+    out.push_str(&format!("Timezone: {}\n", sys.timezone));
+    out.push_str(&format!("Country: {}\n", sys.country_code));
+    if let Some(region) = sys.region_code.as_deref().filter(|s| !s.trim().is_empty()) {
+        out.push_str(&format!("Region: {region}\n"));
+    }
+    out.push_str(&format!("Primary language: {}\n", sys.primary_language));
+    if !sys.additional_languages.is_empty() {
+        let langs: Vec<String> = sys
+            .additional_languages
+            .iter()
+            .filter(|lang| !lang.code.trim().is_empty())
+            .map(|lang| {
+                if lang.level.trim().is_empty() {
+                    lang.code.clone()
+                } else {
+                    format!("{} ({})", lang.code, lang.level)
+                }
+            })
+            .collect();
+        if !langs.is_empty() {
+            out.push_str(&format!("Additional languages: {}\n", langs.join(", ")));
+        }
+    }
+
+    let bio = &personality.biographical;
+    if let Some(name) = bio.display_name.as_deref().filter(|s| !s.trim().is_empty()) {
+        out.push_str(&format!("Display name: {name}\n"));
+    }
+    if let Some(nat) = bio.nationality.as_deref().filter(|s| !s.trim().is_empty()) {
+        out.push_str(&format!("Nationality: {nat}\n"));
+    }
+    if let Some(year) = bio.birth_year {
+        out.push_str(&format!("Birth year: {year}\n"));
+    }
+    if let Some(place) = bio.birth_place.as_deref().filter(|s| !s.trim().is_empty()) {
+        out.push_str(&format!("Birth place: {place}\n"));
+    }
+    if let Some(residence) = bio
+        .current_residence
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        out.push_str(&format!("Current residence: {residence}\n"));
+    }
+    if !bio.education.is_empty() {
+        out.push_str("Education:\n");
+        for entry in &bio.education {
+            let parts: Vec<String> = [
+                entry.degree.as_deref(),
+                entry.field.as_deref(),
+                entry.institution.as_deref(),
+            ]
+            .iter()
+            .filter_map(|opt| opt.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+            .collect();
+            let year = entry
+                .year_completed
+                .map(|y| format!(" ({y})"))
+                .unwrap_or_default();
+            if parts.is_empty() && year.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("- {}{year}\n", parts.join(" — ")));
+        }
+    }
+    if !bio.professional_background.is_empty() {
+        out.push_str("Professional background:\n");
+        for entry in &bio.professional_background {
+            let role = entry.role.as_deref().unwrap_or("").trim();
+            let org = entry.organization.as_deref().unwrap_or("").trim();
+            let years = entry.years.as_deref().unwrap_or("").trim();
+            if role.is_empty() && org.is_empty() && years.is_empty() {
+                continue;
+            }
+            let mut line = String::from("- ");
+            if !role.is_empty() {
+                line.push_str(role);
+            }
+            if !org.is_empty() {
+                if !role.is_empty() {
+                    line.push_str(" — ");
+                }
+                line.push_str(org);
+            }
+            if !years.is_empty() {
+                line.push_str(&format!(" ({years})"));
+            }
+            line.push('\n');
+            out.push_str(&line);
+        }
+    }
+
+    let nar = &personality.narrative;
+    if let Some(summary) = nar.summary.as_deref().filter(|s| !s.trim().is_empty()) {
+        out.push('\n');
+        out.push_str(summary);
+        out.push('\n');
+    }
+    if let Some(style) = nar
+        .communication_style
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        out.push_str(&format!("Communication style: {style}\n"));
+    }
+    if !nar.personality_traits.is_empty() {
+        let traits: Vec<&str> = nar
+            .personality_traits
+            .iter()
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !traits.is_empty() {
+            out.push_str(&format!("Traits: {}\n", traits.join(", ")));
+        }
+    }
+    if !nar.interests.is_empty() {
+        let interests: Vec<&str> = nar
+            .interests
+            .iter()
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !interests.is_empty() {
+            out.push_str(&format!("Interests: {}\n", interests.join(", ")));
+        }
+    }
+
+    if !personality.extensions.is_empty() {
+        out.push_str("Additional traits:\n");
+        for (key, value) in &personality.extensions {
+            let rendered = match value {
+                serde_json::Value::String(s) => s.clone(),
+                _ => value.to_string(),
+            };
+            out.push_str(&format!("- {key}: {rendered}\n"));
+        }
+    }
+
+    out.push('\n');
+}
+
 fn compose_cognitive_prompt(loaded: &LoadedCognitiveDefinition) -> (String, bool) {
     let mut out = String::new();
     let mut truncated = false;
+
+    if let Some(personality) = &loaded.personality {
+        append_personality_block(&mut out, personality);
+    }
 
     if let Some(role) = &loaded.role {
         out.push_str(&format!("[ROLE: {}]\n", role.name));
@@ -6209,6 +6518,7 @@ mod tests {
             role_hash: None,
             skill_hashes: Vec::new(),
             handbook_hashes: Vec::new(),
+            personality_hash: None,
         }
     }
 
@@ -6295,6 +6605,140 @@ mod tests {
         assert!(prompt.contains("Answer as a Fluxbee support agent."));
         assert!(prompt.contains("Ask for missing node names before mutating state."));
         assert!(prompt.contains("Use workflows for business orchestration."));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cognitive_definition_composes_personality_before_role() {
+        let root = cognitive_temp_root("compose-personality");
+        let role_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let personality_hash = "9999999999999999999999999999999999999999999999999999999999999999";
+        write_cognitive_asset(
+            &root,
+            role_hash,
+            json!({
+                "asset_type": "role",
+                "name": "Support role",
+                "description": "Receive and triage support tickets.",
+            }),
+        );
+        write_cognitive_asset(
+            &root,
+            personality_hash,
+            json!({
+                "asset_type": "personality",
+                "name": "Argentine engineer",
+                "system_fields": {
+                    "timezone": "America/Argentina/Mendoza",
+                    "country_code": "AR",
+                    "primary_language": "es-AR",
+                    "additional_languages": [{ "code": "en", "level": "C1" }]
+                },
+                "biographical": {
+                    "display_name": "Lucía",
+                    "nationality": "Argentinian",
+                    "birth_year": 1985
+                },
+                "narrative": {
+                    "summary": "Engineer comfortable in formal and informal contexts.",
+                    "communication_style": "Direct but friendly."
+                }
+            }),
+        );
+        let mut ilk = sample_agent_ilk();
+        ilk.role_hash = Some(role_hash.to_string());
+        ilk.personality_hash = Some(personality_hash.to_string());
+        let hashes = hashes_from_identity_ilk(&ilk);
+
+        let state = compose_cognitive_state(&root, 21, &ilk, hashes).expect("compose state");
+
+        assert_eq!(state.definition_state, "composed");
+        assert_eq!(
+            state.personality_hash_loaded.as_deref(),
+            Some(personality_hash)
+        );
+        let prompt = state.active_prompt.as_deref().expect("prompt");
+        let personality_idx = prompt
+            .find("[PERSONALITY:")
+            .expect("personality block present");
+        let role_idx = prompt.find("[ROLE:").expect("role block present");
+        assert!(
+            personality_idx < role_idx,
+            "personality must render before role"
+        );
+        assert!(prompt.contains("Argentine engineer"));
+        assert!(prompt.contains("America/Argentina/Mendoza"));
+        assert!(prompt.contains("es-AR"));
+        assert!(prompt.contains("Display name: Lucía"));
+        assert!(prompt.contains("Direct but friendly."));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cognitive_definition_personality_failure_yields_partial() {
+        let root = cognitive_temp_root("personality-partial");
+        let role_hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let missing_personality = "5555555555555555555555555555555555555555555555555555555555555555";
+        write_cognitive_asset(
+            &root,
+            role_hash,
+            json!({
+                "asset_type": "role",
+                "name": "R",
+                "description": "Answer support requests."
+            }),
+        );
+        let mut ilk = sample_agent_ilk();
+        ilk.role_hash = Some(role_hash.to_string());
+        ilk.personality_hash = Some(missing_personality.to_string());
+        let hashes = hashes_from_identity_ilk(&ilk);
+
+        let state = compose_cognitive_state(&root, 22, &ilk, hashes).expect("compose state");
+
+        assert_eq!(state.definition_state, "partial");
+        assert_eq!(state.role_hash_loaded.as_deref(), Some(role_hash));
+        assert!(state.personality_hash_loaded.is_none());
+        let failure = state
+            .failed_hashes
+            .iter()
+            .find(|f| f.asset_type == "personality")
+            .expect("personality failure recorded");
+        assert_eq!(failure.hash, missing_personality);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cognitive_definition_personality_rejects_missing_required_system_fields() {
+        let root = cognitive_temp_root("personality-bad");
+        let personality_hash = "7777777777777777777777777777777777777777777777777777777777777777";
+        write_cognitive_asset(
+            &root,
+            personality_hash,
+            json!({
+                "asset_type": "personality",
+                "name": "Broken",
+                "system_fields": { "timezone": "America/Buenos_Aires" }
+                // missing country_code and primary_language
+            }),
+        );
+        let mut ilk = sample_agent_ilk();
+        ilk.personality_hash = Some(personality_hash.to_string());
+        let hashes = hashes_from_identity_ilk(&ilk);
+
+        let state = compose_cognitive_state(&root, 23, &ilk, hashes).expect("compose state");
+
+        assert_eq!(state.definition_state, "error");
+        assert!(state.personality_hash_loaded.is_none());
+        let failure = state
+            .failed_hashes
+            .iter()
+            .find(|f| f.asset_type == "personality")
+            .expect("personality failure");
+        assert!(
+            failure.error.contains("country_code") || failure.error.contains("primary_language"),
+            "expected missing required system_fields, got: {}",
+            failure.error
+        );
         let _ = fs::remove_dir_all(root);
     }
 

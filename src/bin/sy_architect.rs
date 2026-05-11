@@ -862,6 +862,9 @@ impl FunctionToolProvider for ArchitectAdminReadToolsProvider {
         registry.register(Arc::new(CreateAgentHandbookAssetTool::new(
             self.context.clone(),
         )))?;
+        registry.register(Arc::new(CreateAgentPersonalityAssetTool::new(
+            self.context.clone(),
+        )))?;
         registry.register(Arc::new(StartPipelineTool::new(self.context.clone())))?;
         registry.register(Arc::new(PipelineActionTool::new(self.context.clone())))?;
         registry.register(Arc::new(PlanCompilerTool::new(self.context.clone())))
@@ -1313,6 +1316,125 @@ impl FunctionTool for CreateAgentHandbookAssetTool {
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
         let asset = build_handbook_asset_value(&arguments).map_err(fluxbee_tool_protocol_err)?;
+        write_agent_asset_and_update_catalog(&self.context, asset)
+            .await
+            .map_err(fluxbee_tool_protocol_err)
+    }
+}
+
+struct CreateAgentPersonalityAssetTool {
+    context: ArchitectAdminToolContext,
+}
+
+impl CreateAgentPersonalityAssetTool {
+    fn new(context: ArchitectAdminToolContext) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl FunctionTool for CreateAgentPersonalityAssetTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "create_agent_personality_asset".to_string(),
+            description: "Create an immutable personality asset for an ai.generic agent. Personality describes WHO the agent is as a person (nationality, languages, timezone, biography) — orthogonal to the role which describes WHAT the agent does. At most one personality per agent. Writes only blob://agent-assets/<hash>.json and returns the hash. Does not apply the definition to identity.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "system_fields"],
+                "properties": {
+                    "name": {"type": "string", "description": "Human-readable personality name."},
+                    "description": {"type": "string", "description": "Short description of the personality (one line)."},
+                    "system_fields": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["timezone", "country_code", "primary_language"],
+                        "properties": {
+                            "timezone": {"type": "string", "description": "IANA timezone, e.g. 'America/Argentina/Mendoza'."},
+                            "country_code": {"type": "string", "description": "ISO 3166-1 alpha-2 country code, e.g. 'AR'."},
+                            "region_code": {"type": "string", "description": "Optional ISO 3166-2 region code, e.g. 'AR-M'."},
+                            "primary_language": {"type": "string", "description": "BCP-47 primary language tag, e.g. 'es-AR'."},
+                            "additional_languages": {
+                                "type": "array",
+                                "maxItems": 8,
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["code"],
+                                    "properties": {
+                                        "code": {"type": "string", "description": "BCP-47 language tag, e.g. 'en'."},
+                                        "level": {"type": "string", "description": "Proficiency level: A1, A2, B1, B2, C1, C2, or native."}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "biographical": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "nationality": {"type": "string"},
+                            "display_name": {"type": "string", "description": "First name the agent may present as."},
+                            "birth_year": {"type": "integer", "minimum": 1900, "maximum": 2099},
+                            "birth_place": {"type": "string"},
+                            "current_residence": {"type": "string"},
+                            "education": {
+                                "type": "array",
+                                "maxItems": 8,
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "institution": {"type": "string"},
+                                        "degree": {"type": "string"},
+                                        "year_completed": {"type": "integer", "minimum": 1900, "maximum": 2099},
+                                        "field": {"type": "string"}
+                                    }
+                                }
+                            },
+                            "professional_background": {
+                                "type": "array",
+                                "maxItems": 12,
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "role": {"type": "string"},
+                                        "organization": {"type": "string"},
+                                        "years": {"type": "string"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "narrative": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "summary": {"type": "string", "description": "Biographical paragraph, up to ~2000 chars."},
+                            "personality_traits": {
+                                "type": "array",
+                                "items": {"type": "string"}
+                            },
+                            "communication_style": {"type": "string"},
+                            "interests": {
+                                "type": "array",
+                                "items": {"type": "string"}
+                            }
+                        }
+                    },
+                    "extensions": {
+                        "type": "object",
+                        "description": "Domain-specific traits not standardized in the core schema. Rendered as key:value pairs into the prompt."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let asset =
+            build_personality_asset_value(&arguments).map_err(fluxbee_tool_protocol_err)?;
         write_agent_asset_and_update_catalog(&self.context, asset)
             .await
             .map_err(fluxbee_tool_protocol_err)
@@ -5453,6 +5575,70 @@ fn build_handbook_asset_value(arguments: &Value) -> Result<Value, ArchitectError
     }))
 }
 
+fn build_personality_asset_value(arguments: &Value) -> Result<Value, ArchitectError> {
+    let name = clean_required_string(
+        arguments.get("name").unwrap_or(&Value::Null),
+        "personality.name",
+    )?;
+    let description = clean_optional_string(arguments.get("description"), "personality.description")?;
+    let system_fields_obj = arguments
+        .get("system_fields")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "personality.system_fields is required".to_string())?;
+    let timezone = clean_required_string(
+        system_fields_obj.get("timezone").unwrap_or(&Value::Null),
+        "personality.system_fields.timezone",
+    )?;
+    let country_code = clean_required_string(
+        system_fields_obj.get("country_code").unwrap_or(&Value::Null),
+        "personality.system_fields.country_code",
+    )?;
+    let primary_language = clean_required_string(
+        system_fields_obj
+            .get("primary_language")
+            .unwrap_or(&Value::Null),
+        "personality.system_fields.primary_language",
+    )?;
+    let region_code = clean_optional_string(
+        system_fields_obj.get("region_code"),
+        "personality.system_fields.region_code",
+    )?;
+    let additional_languages =
+        system_fields_obj.get("additional_languages").cloned().unwrap_or(Value::Null);
+    let mut system_fields = serde_json::Map::new();
+    system_fields.insert("timezone".to_string(), json!(timezone));
+    system_fields.insert("country_code".to_string(), json!(country_code));
+    if let Some(region) = region_code {
+        system_fields.insert("region_code".to_string(), json!(region));
+    }
+    system_fields.insert("primary_language".to_string(), json!(primary_language));
+    if let Some(items) = additional_languages.as_array() {
+        if !items.is_empty() {
+            system_fields.insert("additional_languages".to_string(), Value::Array(items.clone()));
+        }
+    }
+
+    let mut map = serde_json::Map::new();
+    map.insert("asset_type".to_string(), json!("personality"));
+    map.insert("name".to_string(), json!(name));
+    if let Some(desc) = description {
+        map.insert("description".to_string(), json!(desc));
+    }
+    map.insert("system_fields".to_string(), Value::Object(system_fields));
+    if let Some(bio) = arguments.get("biographical").filter(|v| v.is_object()) {
+        map.insert("biographical".to_string(), bio.clone());
+    }
+    if let Some(nar) = arguments.get("narrative").filter(|v| v.is_object()) {
+        map.insert("narrative".to_string(), nar.clone());
+    }
+    if let Some(ext) = arguments.get("extensions").filter(|v| v.is_object()) {
+        if !ext.as_object().map(|m| m.is_empty()).unwrap_or(true) {
+            map.insert("extensions".to_string(), ext.clone());
+        }
+    }
+    Ok(Value::Object(map))
+}
+
 fn validate_agent_asset_value(asset: &Value) -> Result<(String, String), ArchitectError> {
     let obj = asset
         .as_object()
@@ -5495,6 +5681,22 @@ fn validate_agent_asset_value(asset: &Value) -> Result<(String, String), Archite
         "handbook" => {
             ensure_allowed_asset_fields(obj, &["asset_type", "name", "sections"], "handbook")?;
             build_handbook_asset_value(asset)?;
+        }
+        "personality" => {
+            ensure_allowed_asset_fields(
+                obj,
+                &[
+                    "asset_type",
+                    "name",
+                    "description",
+                    "system_fields",
+                    "biographical",
+                    "narrative",
+                    "extensions",
+                ],
+                "personality",
+            )?;
+            build_personality_asset_value(asset)?;
         }
         _ => return Err(format!("unsupported agent asset_type '{asset_type}'").into()),
     }
@@ -9357,7 +9559,7 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
                 "SCMD: curl -X POST /hives -d '{\"hive_id\":\"worker-220\",\"address\":\"192.168.8.220\"}'",
                 "SCMD: curl -X POST /hives/motherbee/sync-hint -d '{\"channel\":\"blob\",\"wait_for_idle\":true,\"timeout_ms\":30000}'",
                 "SCMD: curl -X POST /hives/motherbee/nodes -d '{\"node_name\":\"AI.chat@motherbee\",\"runtime_version\":\"current\"}'",
-                "SCMD: curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{\"definition\":{\"role_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"skill_hashes\":[],\"handbook_hashes\":[]}}'",
+                "SCMD: curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{\"definition\":{\"role_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"skill_hashes\":[],\"handbook_hashes\":[],\"personality_hash\":\"4444444444444444444444444444444444444444444444444444444444444444\"}}'",
                 "SCMD: curl -X PUT /hives/motherbee/nodes/SY.frontdesk.gov@motherbee/config -d '{\"openai\":{\"default_model\":\"gpt-4.1-mini\"}}'"
             ]
         }
@@ -22234,6 +22436,49 @@ mod tests {
         let loaded = catalog.get(&entry.hash).expect("catalog entry");
         assert!(loaded.valid);
         assert_eq!(loaded.asset_type, "skill");
+
+        let _ = std::fs::remove_dir_all(config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn agent_asset_builds_personality_with_required_system_fields() {
+        let (config_dir, blob_root) = test_config_dir_with_blob_root("agent-asset-personality");
+        let asset = build_personality_asset_value(&json!({
+            "name": "Argentine Engineer",
+            "description": "Mid-career engineer profile",
+            "system_fields": {
+                "timezone": "America/Argentina/Mendoza",
+                "country_code": "AR",
+                "primary_language": "es-AR",
+                "additional_languages": [{"code": "en", "level": "C1"}]
+            },
+            "biographical": {
+                "nationality": "Argentinian",
+                "display_name": "Lucía"
+            },
+            "narrative": {
+                "summary": "Patient and concise.",
+                "personality_traits": ["analytical"]
+            }
+        }))
+        .expect("personality asset");
+
+        let (entry, written) = persist_agent_asset(&config_dir, asset).expect("persist asset");
+
+        assert!(written);
+        assert_eq!(entry.asset_type, "personality");
+        assert_eq!(entry.name.as_deref(), Some("Argentine Engineer"));
+        assert!(validate_hash64(&entry.hash));
+        assert!(blob_root
+            .join("agent-assets")
+            .join(format!("{}.json", entry.hash))
+            .exists());
+
+        let bad = build_personality_asset_value(&json!({
+            "name": "Bad",
+            "system_fields": { "timezone": "America/Buenos_Aires" }
+        }));
+        assert!(bad.is_err(), "missing country_code/primary_language must fail");
 
         let _ = std::fs::remove_dir_all(config_dir.parent().unwrap());
     }

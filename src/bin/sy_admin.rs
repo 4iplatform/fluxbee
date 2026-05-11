@@ -7343,7 +7343,7 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
         "set_ilk_definition" => vec![admin_action_body_field(
             "definition",
             "object",
-            "Cognitive definition object with role_hash, skill_hashes, and handbook_hashes.",
+            "Cognitive definition object with role_hash, skill_hashes, handbook_hashes, and optional personality_hash (single 64-hex string).",
         )],
         _ => Vec::new(),
     }
@@ -7975,7 +7975,8 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
                 ],
                 "handbook_hashes": [
                     "3333333333333333333333333333333333333333333333333333333333333333"
-                ]
+                ],
+                "personality_hash": "4444444444444444444444444444444444444444444444444444444444444444"
             }
         }),
         "remove_runtime_version" => serde_json::json!({
@@ -8261,9 +8262,10 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         ],
         "set_ilk_definition" => vec![
             "This mutates the cognitive definition stored on one agent ILK.",
-            "The body must include definition.role_hash, definition.skill_hashes, and definition.handbook_hashes; use null or empty arrays to clear optional parts.",
-            "Identity validates hash format and v1 limits before persisting and publishing the SHM update.",
-            "This does not create the blob assets; Archi must write canonical role/skill/handbook assets to blob before applying the hashes.",
+            "The body accepts definition.role_hash, definition.skill_hashes, definition.handbook_hashes, and definition.personality_hash; use null or empty arrays to clear optional parts.",
+            "personality_hash is optional and refers to a single personality asset (nationality, languages, timezone, biography).",
+            "Identity validates hash format and limits before persisting and publishing the SHM update.",
+            "This does not create the blob assets; Archi must write canonical role/skill/handbook/personality assets to blob before applying the hashes.",
         ],
         "list_tenants" => vec![
             "Lists the identity tenants currently known by SY.identity for one hive.",

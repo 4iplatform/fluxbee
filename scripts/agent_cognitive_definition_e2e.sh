@@ -303,15 +303,23 @@ set_definition() {
   local skill_hashes_json="$2"
   local handbook_hashes_json="$3"
   local out_file="$4"
+  local personality_hash="${5:-}"
   local body
-  body="$(python3 - "$role_hash" "$skill_hashes_json" "$handbook_hashes_json" <<'PY'
+  body="$(python3 - "$role_hash" "$skill_hashes_json" "$handbook_hashes_json" "$personality_hash" <<'PY'
 import json, sys
-role_hash, skills, handbooks = sys.argv[1], json.loads(sys.argv[2]), json.loads(sys.argv[3])
+role_hash, skills, handbooks, personality_hash = (
+    sys.argv[1],
+    json.loads(sys.argv[2]),
+    json.loads(sys.argv[3]),
+    sys.argv[4],
+)
 definition = {}
 if role_hash:
     definition["role_hash"] = role_hash
 definition["skill_hashes"] = skills
 definition["handbook_hashes"] = handbooks
+if personality_hash:
+    definition["personality_hash"] = personality_hash
 print(json.dumps({"definition": definition}, separators=(",", ":")))
 PY
 )"
@@ -428,7 +436,7 @@ fi
 
 echo "Step 6/12: create role/skill/handbook assets through Archi"
 role_file="$(create_agent_asset role "$(cat <<'JSON'
-{"asset_type":"role","name":"E2E support role","persona":"Answer as a concise Fluxbee test support agent.","tone":"direct","limits":["Do not invent runtime state."]}
+{"asset_type":"role","name":"E2E support role","description":"Answer as a concise Fluxbee test support agent.","tone":"direct","limits":["Do not invent runtime state."]}
 JSON
 )")"
 skill_file="$(create_agent_asset skill "$(cat <<'JSON'
@@ -476,6 +484,49 @@ echo "Step 9/12: restore missing asset and verify composed"
 move_path "$missing_skill_backup" "$missing_skill_path"
 cleanup_files=()
 wait_definition_state "composed" "$config_body"
+
+echo "Step 9b/12: attach personality asset and verify composed prompt renders it first"
+personality_file="$(create_agent_asset personality "$(cat <<'JSON'
+{"asset_type":"personality","name":"E2E argentine engineer","system_fields":{"timezone":"America/Argentina/Mendoza","country_code":"AR","primary_language":"es-AR","additional_languages":[{"code":"en","level":"C1"}]},"biographical":{"nationality":"Argentinian","display_name":"Lucía","birth_year":1985},"narrative":{"summary":"Mid-career engineer; direct but friendly.","communication_style":"Direct."}}
+JSON
+)")"
+personality_hash="$(json_get "$personality_file" "asset.hash")"
+set_definition "$role_hash" "[\"$skill_hash\"]" "[\"$handbook_hash\"]" "$set_body" "$personality_hash"
+wait_definition_state "composed" "$config_body"
+personality_loaded="$(json_get "$config_body" "definition.personality_hash_loaded")"
+if [[ "$personality_loaded" != "$personality_hash" ]]; then
+  echo "FAIL: personality_hash_loaded mismatch loaded='$personality_loaded' expected='$personality_hash'" >&2
+  cat "$config_body" >&2 || true
+  exit 1
+fi
+active_prompt="$(json_get "$config_body" "definition.active_prompt")"
+if [[ -n "$active_prompt" && "$active_prompt" != "null" ]]; then
+  # Best-effort check: ensure PERSONALITY appears before ROLE in the composed prompt when CONFIG_GET returns it.
+  if [[ "$active_prompt" == *"[PERSONALITY:"* && "$active_prompt" == *"[ROLE:"* ]]; then
+    if ! python3 - "$active_prompt" <<'PY'
+import sys
+prompt = sys.argv[1]
+p_idx = prompt.find("[PERSONALITY:")
+r_idx = prompt.find("[ROLE:")
+if p_idx == -1 or r_idx == -1 or p_idx >= r_idx:
+    sys.exit(1)
+PY
+    then
+      echo "FAIL: personality must render before role in composed prompt" >&2
+      exit 1
+    fi
+  fi
+fi
+
+echo "Step 9c/12: clear personality (set to null) and verify composed without personality block"
+set_definition "$role_hash" "[\"$skill_hash\"]" "[\"$handbook_hash\"]" "$set_body"
+wait_definition_state "composed" "$config_body"
+personality_after_clear="$(json_get "$config_body" "definition.personality_hash_loaded")"
+if [[ "$personality_after_clear" != "" && "$personality_after_clear" != "null" ]]; then
+  echo "FAIL: personality_hash_loaded should be empty after clear, got '$personality_after_clear'" >&2
+  cat "$config_body" >&2 || true
+  exit 1
+fi
 
 echo "Step 10/12: verify OPA policy can compile hash-based route condition"
 if [[ "$RUN_OPA_HASH_CHECK" == "1" ]]; then

@@ -199,7 +199,7 @@ Archi accede al mismo endpoint a través del sistema de lectura genérico (`flux
 - **Path param:** `ilk_id` en formato `ilk:<uuid>`
 - **Body:** `definition` con `role_hash`, `skill_hashes`, `handbook_hashes`, `personality_hash` (este último single 64-hex string, no array).
 - **Uso:** aplica la definición cognitiva de un agent ILK; no crea assets blob, solo registra los hashes validados en identity/SHM.
-- **Nota:** `personality_hash` es opcional. Ausente o `null` ⇒ no se renderiza bloque de personalidad y la proyección flat de `personality_*` (timezone, country_code, primary_language, additional_languages) en `data.identity[ilk]` queda vacía. Set parcial es válido: enviar sólo `personality_hash` deja role/skill/handbook intactos.
+- **Nota:** `personality_hash` es opcional. Ausente o `null` ⇒ no se renderiza bloque de personalidad. El router proyecta `personality_hash` cuando está presente; la flat-view de `personality_timezone`/`country_code`/`primary_language` está descopada por ahora (OPA rules deben matchear por hash). Set parcial es válido: enviar sólo `personality_hash` deja role/skill/handbook intactos.
 
 ```json
 POST /hives/motherbee/identity/ilks/ilk:ai-support/definition
