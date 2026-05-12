@@ -234,7 +234,7 @@ Default `vault_get_with_retry` policy:
 - [x] VA-G1. Define `vault_ref` convention for node config:
   - example: `config.secrets.openai.api_key_ref = "vault://sys:openai-api-key"`.
   - provider-local config may also use adjacent refs, for example `config.ai_providers.openai.api_key_ref`, when that matches the existing node contract.
-- [ ] VA-G2. Deprecate new node-local plaintext `secrets.json` writes once vault is enabled.
+- [ ] VA-G2. Deprecate new node-local plaintext `secrets.json` writes once vault is enabled. **→ Ejecutado en Phase J (VA-J1..J6 + VA-J8).**
 - [x] VA-G3. Implement `SY.architect` as the first vault-backed consumer:
   - starts without OpenAI key;
   - reports missing secret;
@@ -244,16 +244,17 @@ Default `vault_get_with_retry` policy:
   - orchestrator starts configured `system_nodes` from `hive.yaml` with `SY.identity` first; `sy.identity` seeds deterministic `system` ILKs from the same list, so vault consumers must have real `ilk:<uuid>` ownership instead of placeholder/workaround metadata.
   - the `hive.yaml` schema uses the compact `system_nodes.<role>.{nodes, wait_for}` shape (service/exec/start/critical are derived/defaulted in code, not declared per entry).
   - every SY except `sy_orchestrator` resolves its own `ilk:<uuid>` at boot from identity SHM and caches it for the process lifetime, so outgoing vault calls can set `meta.src_ilk` directly without an extra identity round-trip. Rust SYs use `fluxbee_sdk::identity::wait_for_self_system_ilk_id(...)`; Go SYs (`sy-timer`, `sy-wf-rules`, `sy-opa-rules`) use the symmetric `fluxbee-go-sdk.WaitForSelfSystemIlkID(...)`.
-- [ ] VA-G4. Migrate `ai.generic` OpenAI key to vault refs.
+- [ ] VA-G4. Migrate `ai.generic` OpenAI key to vault refs. **→ VA-J6 en Phase J.**
 - [ ] VA-G5. Migrate IO secret-bearing configs to vault refs:
   - `IO.api` API keys/webhook secrets;
   - `IO.slack` app/bot tokens;
   - `IO.linkedhelper` adapter credentials where applicable.
+  - **→ Diferido a Phase K (VA-K1..K4).** No se toca en el ciclo actual.
 - [ ] VA-G6. Migrate SY DB secrets if still required:
-  - `SY.storage` Postgres URL;
-  - `SY.identity` Postgres URL;
-  - Archi messages DB URL.
-- [ ] VA-G7. Remove or mark legacy `secrets.json` write paths after consumers are migrated.
+  - `SY.storage` Postgres URL; **→ VA-J1 en Phase J.**
+  - `SY.identity` Postgres URL; **→ VA-J2 en Phase J.**
+  - Archi messages DB URL. **→ VA-J4 en Phase J.**
+- [ ] VA-G7. Remove or mark legacy `secrets.json` write paths after consumers are migrated. **→ VA-J8 en Phase J (borrar, no marcar).**
 - [ ] VA-G7a. Remove or deprecate `SY.architect` local-only config entrypoints:
   - current legacy/bootstrap paths: `GET /architect/control/config-get` and `POST /architect/control/config-set`;
   - canonical path is admin `node_control_config_get/set` -> L2 `CONFIG_GET/CONFIG_SET`;
@@ -299,6 +300,139 @@ Default `vault_get_with_retry` policy:
   - Slack bot token;
   - IO.api webhook secret;
   - Postgres URL for system services.
+
+## 12bis. Phase J - Vault-only secret consumption (legacy plaintext deletion)
+
+Objetivo: que **todos** los servicios listados consuman secretos desde vault (vault_ref + SDK retry) y que el path legacy de CONFIG_SET con plaintext + persistencia en `secrets.json` quede **eliminado** (no deprecado-luego-eliminado: borrado directo, en línea con la política de no-legacy de este proyecto).
+
+In-scope (este ciclo): `sy.storage`, `sy.identity`, `sy.admin`, `sy.architect (parte messages_db_url)`, `sy.cognition`, `ai.generic`.
+
+Out-of-scope (deferido): `IO.api`, `IO.slack`, `IO.linkedhelper`. Se migran cuando se incorporen sus tokens (volver a `VA-G5` cuando toque).
+
+Patrón canónico para todos los nodos in-scope:
+
+1. Node `CONFIG_SET` acepta **únicamente** `vault_ref: "vault://<key>"` para campos secretos (no plaintext en el payload, no escritura a `secrets.json` del nodo).
+2. Operador setea el plaintext vía `vault_put` (admin → SY.vault) usando `SY.admin` action `vault_put` antes (o después: el nodo arranca degradado y retry-loadea).
+3. Node arranca con vault_ref en su config local no-secreta (es decir, el ref como string, no el plaintext).
+4. Al boot/refresh, el nodo usa `fluxbee_sdk::vault::vault_get_with_retry(parse_vault_ref(ref))` para resolver el plaintext en memoria.
+5. Si el secret falta o vault está caído, el nodo corre **degradado** (logueando estado claro) y reintenta según política del SDK.
+
+### J1. `sy.storage`
+
+- [ ] VA-J1a. Aceptar solo `config.database.postgres_url_ref: "vault://<key>"` en `CONFIG_SET`; rechazar `config.database.postgres_url` plaintext con `INVALID_CONFIG`.
+- [ ] VA-J1b. Persistir el ref (string, no secreto) en el config local del nodo. Eliminar la escritura a `secrets.json` para `postgres_url`.
+- [ ] VA-J1c. En `resolve_database_url` (y boot), si hay ref, resolver vía `vault_get_with_retry`. Si no hay ref o vault no responde, arrancar sin DB backend (estado actual `STORAGE_NOT_READY`).
+- [ ] VA-J1d. Borrar `STORAGE_LOCAL_SECRET_KEY_POSTGRES_URL`, `persist_local_postgres_url` y `load_local_postgres_url` de `src/bin/sy_storage.rs`.
+- [ ] VA-J1e. E2E: `vault_put sys:storage-postgres-url` → `CONFIG_SET storage ... postgres_url_ref` → `restart sy-storage` → `STATUS` reporta `configured`.
+
+### J2. `sy.identity`
+
+- [ ] VA-J2a. Aceptar solo `config.database.postgres_url_ref: "vault://<key>"` en `CONFIG_SET`; rechazar plaintext.
+- [ ] VA-J2b. Persistir el ref en el config local del nodo. Eliminar la escritura a `secrets.json` del identity postgres_url.
+- [ ] VA-J2c. Resolver vía `vault_get_with_retry` en boot. Si vault no responde, arrancar in-memory + SHM (estado actual `started without active DB backend`).
+- [ ] VA-J2d. Borrar `IDENTITY_LOCAL_SECRET_KEY_POSTGRES_URL` / `persist_local_identity_postgres_url` / load equivalente de `src/bin/sy_identity.rs`.
+- [ ] VA-J2e. E2E: análogo a VA-J1e con `sys:identity-postgres-url`.
+
+### J3. `sy.admin` (executor OpenAI key)
+
+- [ ] VA-J3a. `CONFIG_SET` de admin acepta solo `config.executor.openai.api_key_ref: "vault://<key>"`; sin plaintext.
+- [ ] VA-J3b. Eliminar la rama que escribe `openai_api_key` en `secrets.json` del propio admin (`ADMIN_EXECUTOR_LOCAL_SECRET_KEY_OPENAI` y sus paths).
+- [ ] VA-J3c. `build_admin_executor_ai_runtime` resuelve el ref con `vault_get_with_retry` al boot y en reload de config.
+- [ ] VA-J3d. E2E: `vault_put sys:admin-executor-openai-key` → `CONFIG_SET admin ... api_key_ref` → admin executor pasa a `configured` sin reiniciar.
+
+### J4. `sy.architect` (messages_db_url, completar; OpenAI key ya migrado)
+
+- [ ] VA-J4a. `CONFIG_SET` de architect acepta solo `config.storage.messages_db_url_ref: "vault://<key>"`; rechazar `messages_db_url` plaintext.
+- [ ] VA-J4b. Eliminar `ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL` y sus paths (`resolve_messages_db_url`/`refresh_architect_messages_db_url` deben leer solo del ref).
+- [ ] VA-J4c. `messages_db_connect` resuelve el ref con `vault_get_with_retry`.
+- [ ] VA-J4d. **Decidido**: borrar el atajo plaintext (`config.ai_providers.openai.api_key`). Único path soportado = `api_key_ref`. Reemplazo 100% para simetría con J1-J6.
+- [ ] VA-J4e. Borrar la rama plaintext en `apply_architect_executor_config_set` y la lógica de auto-vault asociada (`resolve_architect_openai_api_key_from_vault` queda solo para el path por ref).
+- [ ] VA-J4f. E2E: `vault_put sys:architect-messages-db-url` → `CONFIG_SET architect ... messages_db_url_ref` → architect reporta `messages_db_configured: true` sin reiniciar.
+
+### J5. `sy.cognition`
+
+- [ ] VA-J5a. `CONFIG_SET` de cognition acepta solo `api_key_ref` (mismo patrón que J3); sin plaintext.
+- [ ] VA-J5b. Eliminar `COGNITION_LOCAL_SECRET_KEY_OPENAI` y sus paths.
+- [ ] VA-J5c. Resolver OpenAI key con `vault_get_with_retry`.
+- [ ] VA-J5d. Cognition lee el postgres_url de storage **también** vía vault. Concretamente: en lugar de `load_node_secret_record(storage_node_name)`, debe hacer `vault_get_with_retry` contra el ref que storage publica en su `CONFIG_GET contract.secrets[*]`. Eliminar el cross-read del `secrets.json` de storage.
+- [ ] VA-J5e. E2E: cognition cold boot sin secret → `vault_put` → cognition converge a `configured`.
+
+### J6. `ai.generic`
+
+- [ ] VA-J6a. `CONFIG_SET` de ai-generic acepta solo `api_key_ref`; sin plaintext, sin fallback a env, sin YAML inline (los tres están en `resolve_openai_api_key_with_source`).
+- [ ] VA-J6b. Eliminar `AI_LOCAL_SECRET_KEY_OPENAI`, `load_local_openai_api_key`, el env var fallback y el inline YAML.
+- [ ] VA-J6c. `resolve_openai_api_key` queda como: parsear ref + `vault_get_with_retry`. Solo una fuente.
+- [ ] VA-J6d. E2E: cold boot sin secret → `vault_put` → siguiente request resuelve OK.
+
+### J7. SDK helpers — preparatorio, va PRIMERO antes de migrar nodos
+
+Hallazgo del review técnico: `vault_get` / `vault_get_with_retry` actuales **no setean `meta.src_ilk` ni `routing.src_l2_name`**. Hoy funciona porque los únicos consumers (`SY.admin`, `SY.architect`) tienen admin-override en vault (VA-D3). En cuanto migremos `cognition`/`ai.generic`/`storage`/`identity` (system ILK + tenant `sys`), vault va a usar same-tenant system auth (VA-D5), que requiere resolver el caller por `meta.src_ilk`. Sin eso, vault niega.
+
+- [x] VA-J7a. `crates/fluxbee_sdk/src/vault.rs` ya expone `vault_get_with_retry`, `parse_vault_ref`, request/response structs y verb constants (Phase B).
+- [ ] VA-J7b. Extender `vault_get`, `vault_get_metadata`, `vault_put`, `vault_list`, `vault_delete`, `vault_rotate`, `vault_rollback`, y `vault_get_with_retry` para aceptar `src_ilk: &str` y `src_l2_name: &str`, y setearlos en el Message saliente (`meta.src_ilk` y `routing.src_l2_name`). Es breaking change del SDK; actualizar callers en `sy_admin.rs` y `sy_architect.rs` en la misma diff.
+- [ ] VA-J7c. **Decidido**: crear `fluxbee_sdk::vault::resolve_vault_ref(sender, receiver, src_ilk, src_l2_name, hive_id, ref_str, policy) -> Result<String, VaultError>` como wrapper único: parse ref + vault_get_with_retry contra `SY.vault@<hive>` + devolver `secret.value` plaintext. Es la única función que J1-J6 deben llamar. La política de "degraded state" (qué hace el nodo cuando no resuelve) queda en cada caller, no en el SDK.
+- [ ] VA-J7d. Tests unitarios del wrapper: parse ref inválido, vault retorna ok, vault retorna UNAUTHORIZED, retry hasta max_elapsed.
+
+### J8. Borrar el path legacy de CONFIG_SET plaintext en SDK
+
+- [ ] VA-J8a. Una vez J1-J6 cerrados, eliminar `node_secret.rs` write paths de `crates/fluxbee_sdk/src/node_secret.rs` que ya nadie use (probablemente `persist_local_*` paths). Mantener solo lectura de config no-secreto local.
+- [ ] VA-J8b. Borrar `NodeSecretWriteOptions` / `build_secret_write_options_from_message` si no quedan callers.
+- [ ] VA-J8c. Borrar `NODE_SECRET_REDACTION_TOKEN` si ya no aparece en payloads (los nodos no exponen plaintext, solo refs).
+
+### J9. Documentación + cleanup
+
+- [ ] VA-J9a. Actualizar `docs/onworking COA/node-secret-config-spec.md`: el único path para secretos es vault_ref. `secrets.json` solo guarda config no-secreto (si queda algo); idealmente desaparece.
+- [ ] VA-J9b. Actualizar la sección §13 (proposed first coding slice) si ya está obsoleta tras esta fase.
+- [ ] VA-J9c. Cerrar/cross-referenciar `VA-G2`, `VA-G4`, `VA-G6`, `VA-G7`, `VA-G7a` contra los tasks J1-J8 correspondientes para no duplicar.
+
+### J10. Out-of-scope explícito en este ciclo
+
+- IO nodes (`IO.api`, `IO.slack`, `IO.linkedhelper`): se difieren a Phase K (abajo). No se tocan en este ciclo.
+
+---
+
+## 12ter. Phase K - IO nodes vault migration (deferred)
+
+Objetivo: aplicar el mismo patrón vault-only que Phase J a los nodos IO cuando se introduzcan sus tokens / credenciales. **No es parte del ciclo actual** — queda escrito para no perderlo de vista.
+
+Pattern esperado (espejo de Phase J):
+
+- IO node `CONFIG_SET` acepta solo `*_ref: "vault://<key>"` para campos secretos.
+- Operador setea plaintext con `vault_put`.
+- Node resuelve con `resolve_vault_ref` (SDK, VA-J7c) al boot/refresh.
+- Node corre degradado si vault no responde, retry según política SDK.
+- Sin escritura a `secrets.json` plaintext del nodo.
+
+### K1. `IO.api`
+
+- [ ] VA-K1a. Identificar todos los campos secretos en config actual de `IO.api` (API keys de endpoints, webhook signing secrets, bearer tokens, etc.).
+- [ ] VA-K1b. `CONFIG_SET` acepta solo `*_ref` para cada uno.
+- [ ] VA-K1c. Borrar paths plaintext + escrituras a `secrets.json` del nodo.
+- [ ] VA-K1d. E2E vault_put → CONFIG_SET ref → request HTTP entra al endpoint con auth correcta.
+
+### K2. `IO.slack`
+
+- [ ] VA-K2a. Migrar `bot_token`, `app_token`, `signing_secret` a `*_ref`.
+- [ ] VA-K2b. Borrar paths plaintext en el nodo.
+- [ ] VA-K2c. E2E: envío de mensaje a un canal slack tras `vault_put` + `CONFIG_SET ref`.
+
+### K3. `IO.linkedhelper`
+
+- [ ] VA-K3a. Identificar credenciales del adapter (auth con LinkedHelper API).
+- [ ] VA-K3b. Migrar a `*_ref`; borrar paths plaintext.
+- [ ] VA-K3c. E2E con un request al adapter funcionando tras el setup vault.
+
+### K4. Borrado final de `secrets.json` plaintext en todo IO
+
+- [ ] VA-K4a. Verificar que después de K1-K3 ningún IO node escribe plaintext a `secrets.json`.
+- [ ] VA-K4b. Si el SDK siguiera teniendo write paths para IO secrets (post-J8), eliminarlos.
+
+### K5. Out-of-scope explícito (post-Phase K)
+
+- Encriptación de tokens IO en tránsito hacia los providers externos (Slack/LinkedHelper/etc.) — eso es responsabilidad del provider, no de fluxbee.
+- Rotation automática de tokens IO con cron — defer salvo que aparezca un caso concreto.
+
+---
 
 ## 13. Proposed first coding slice
 
