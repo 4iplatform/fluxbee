@@ -20,11 +20,14 @@ const (
 	identityRegionAlign             = 64
 	identitySeqlockTimeoutMs        = 50
 
-	// Struct sizes computed from #[repr(C)] Rust layout rules.
+	// Struct sizes mirroring Rust #[repr(C)] layouts in src/shm/mod.rs (Identity
+	// structs). The Rust file has const-asserts pinning these exact bytes; keep
+	// the Go constants in lockstep or this SDK will read every entry at the
+	// wrong offset and silently miss them.
 	identityHeaderSize  = 176
-	tenantEntrySize     = 316
+	tenantEntrySize     = 320
 	ilkEntrySize        = 1160
-	ichEntrySize        = 352
+	ichEntrySize        = 488
 	ichMappingEntrySize = 384
 
 	// Field offsets within IchMappingEntry (384 bytes total).

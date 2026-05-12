@@ -408,6 +408,18 @@ pub struct IlkAliasEntry {
     pub _reserved: [u8; 22],
 }
 
+// Go SDK (go/fluxbee-go-sdk/identity_shm.go) hardcodes these byte sizes to
+// compute SHM offsets. If you change any identity struct above, update these
+// const-asserts AND the matching Go SDK constants in lockstep, or Go will read
+// from the wrong offsets and silently miss every ILK/tenant entry.
+const _: () = {
+    assert!(std::mem::size_of::<IdentityHeader>() == 176);
+    assert!(std::mem::size_of::<TenantEntry>() == 320);
+    assert!(std::mem::size_of::<IlkEntry>() == 1160);
+    assert!(std::mem::size_of::<IchEntry>() == 488);
+    assert!(std::mem::size_of::<IchMappingEntry>() == 384);
+};
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct VocabularyEntry {
