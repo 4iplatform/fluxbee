@@ -30,11 +30,9 @@ use fluxbee_sdk::protocol::{
     MSG_NODE_STATUS_GET, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    build_node_config_response_message, build_node_secret_record, classify_admin_action,
-    classify_system_message, connect, derive_action_outcome, load_node_secret_record_with_root,
-    redacted_node_secret_record, save_node_secret_record_with_root, try_handle_default_node_status,
-    ClientConfig, NodeConfig, NodeReceiver, NodeSecretDescriptor, NodeSecretError,
-    NodeSecretRecord, NodeSecretWriteOptions, NodeSender, MSG_VAULT_DELETE,
+    build_node_config_response_message, classify_admin_action, classify_system_message, connect,
+    derive_action_outcome, try_handle_default_node_status, ClientConfig, NodeConfig, NodeReceiver,
+    NodeSecretDescriptor, NodeSender, MSG_VAULT_DELETE,
     MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET, MSG_VAULT_GET_METADATA,
     MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE, MSG_VAULT_LIST,
     MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE, MSG_VAULT_ROLLBACK,
@@ -61,7 +59,6 @@ const MSG_ADMIN_COMMAND: &str = "ADMIN_COMMAND";
 const MSG_ADMIN_COMMAND_RESPONSE: &str = "ADMIN_COMMAND_RESPONSE";
 const DEFAULT_ADMIN_EXECUTOR_MODEL: &str = "gpt-5.4-mini";
 const ADMIN_EXECUTOR_CONFIG_SCHEMA_VERSION: u32 = 1;
-const ADMIN_EXECUTOR_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
 const ADMIN_EXECUTOR_DEFAULT_CATALOG_MODE: &str = "full";
 const ADMIN_EXECUTOR_PLAN_KIND: &str = "executor_plan";
 const ADMIN_EXECUTOR_PLAN_VERSION: &str = "0.1";
@@ -130,7 +127,10 @@ struct AiProvidersSection {
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 struct OpenAiSection {
-    api_key: Option<String>,
+    /// `vault://<key>` reference. Plaintext `api_key` is no longer accepted —
+    /// admin's executor resolves the secret from vault at runtime via
+    /// `resolve_vault_ref`. See Phase J / VA-J3 in `docs/onworking COA/sy_vault_tasks.md`.
+    api_key_ref: Option<String>,
     default_model: Option<String>,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
@@ -588,7 +588,15 @@ async fn main() -> Result<(), AdminError> {
         self_ilk_id = %self_ilk_id,
         "resolved self system ILK from identity SHM"
     );
-    let initial_executor_runtime = build_admin_executor_ai_runtime(&hive.hive_id, &node_name)?;
+    let initial_executor_runtime = build_admin_executor_ai_runtime(
+        &hive.hive_id,
+        &node_name,
+        &self_ilk_id,
+        &config_dir,
+        &state_dir,
+        &socket_dir,
+    )
+    .await?;
     let executor_configured = Arc::new(AtomicBool::new(initial_executor_runtime.is_some()));
     let executor_runtime = Arc::new(Mutex::new(initial_executor_runtime));
     let http_ctx = AdminContext {
@@ -822,58 +830,37 @@ fn save_admin_executor_node_config(
     Ok(path)
 }
 
-fn load_admin_secret_record(node_name: &str) -> Result<Option<NodeSecretRecord>, AdminError> {
-    match load_node_secret_record_with_root(node_name, admin_nodes_root()) {
-        Ok(record) => Ok(Some(record)),
-        Err(NodeSecretError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(Box::new(err)),
-    }
-}
-
 fn merged_admin_executor_openai_section(
     config: Option<&AdminExecutorNodeConfigFile>,
-    secrets: Option<&NodeSecretRecord>,
 ) -> Option<OpenAiSection> {
-    let config_openai = config
+    config
         .and_then(|cfg| cfg.ai_providers.as_ref())
-        .and_then(|providers| providers.openai.clone());
-    let secret_api_key = secrets
-        .and_then(|record| record.secrets.get(ADMIN_EXECUTOR_LOCAL_SECRET_KEY_OPENAI))
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-
-    match config_openai {
-        Some(cfg) => Some(OpenAiSection {
-            api_key: secret_api_key,
-            default_model: cfg.default_model,
-            max_tokens: cfg.max_tokens,
-            temperature: cfg.temperature,
-            top_p: cfg.top_p,
-        }),
-        None => secret_api_key.map(|api_key| OpenAiSection {
-            api_key: Some(api_key),
-            default_model: None,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
-        }),
-    }
+        .and_then(|providers| providers.openai.clone())
 }
 
-fn build_admin_executor_ai_runtime(
+/// Build the admin executor AI runtime by resolving the `api_key_ref` against
+/// SY.vault. Returns `Ok(None)` (degraded) on any of:
+/// - no `api_key_ref` persisted yet (operator hasn't set CONFIG_SET);
+/// - vault unreachable or denies access;
+/// - vault `value` doesn't carry a non-empty `api_key`.
+///
+/// Async because vault is a router round-trip. Caller (`refresh_*` or main
+/// boot) decides whether to retry/log.
+async fn build_admin_executor_ai_runtime(
     hive_id: &str,
     node_name: &str,
+    self_ilk_id: &str,
+    config_dir: &Path,
+    state_dir: &Path,
+    socket_dir: &Path,
 ) -> Result<Option<AdminExecutorAiRuntime>, AdminError> {
     let config = load_admin_executor_node_config(hive_id)?;
-    let secrets = load_admin_secret_record(node_name)?;
-    let openai = merged_admin_executor_openai_section(config.as_ref(), secrets.as_ref());
+    let openai = merged_admin_executor_openai_section(config.as_ref());
     let Some(openai) = openai else {
         return Ok(None);
     };
-    let Some(api_key) = openai
-        .api_key
+    let Some(api_key_ref) = openai
+        .api_key_ref
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -887,6 +874,46 @@ fn build_admin_executor_ai_runtime(
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_ADMIN_EXECUTOR_MODEL)
         .to_string();
+    let node_config = fluxbee_sdk::NodeConfig {
+        name: "SY.admin".to_string(),
+        router_socket: socket_dir.to_path_buf(),
+        uuid_persistence_dir: state_dir.join("nodes"),
+        uuid_mode: fluxbee_sdk::NodeUuidMode::Ephemeral,
+        config_dir: config_dir.to_path_buf(),
+        version: "0.1.0".to_string(),
+    };
+    let (sender, mut receiver) = fluxbee_sdk::connect(&node_config).await?;
+    let caller = fluxbee_sdk::VaultCaller::new(self_ilk_id, node_name);
+    let policy = fluxbee_sdk::VaultRetryPolicy {
+        max_elapsed: Duration::from_secs(3),
+        initial_delay: Duration::from_millis(250),
+        max_delay: Duration::from_secs(1),
+        jitter_ratio: 0.20,
+    };
+    let value = fluxbee_sdk::resolve_vault_ref(
+        &sender,
+        &mut receiver,
+        caller,
+        hive_id,
+        api_key_ref,
+        policy,
+    )
+    .await;
+    let _ = sender.close().await;
+    let api_key = match value {
+        Ok(value) => admin_executor_extract_openai_api_key(&value)?,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                api_key_ref,
+                "SY.admin executor OpenAI key vault lookup failed; running degraded"
+            );
+            return Ok(None);
+        }
+    };
+    let Some(api_key) = api_key else {
+        return Ok(None);
+    };
     Ok(Some(AdminExecutorAiRuntime {
         model,
         model_settings: ModelSettings {
@@ -894,12 +921,43 @@ fn build_admin_executor_ai_runtime(
             top_p: openai.top_p,
             max_output_tokens: openai.max_tokens,
         },
-        client: OpenAiResponsesClient::new(api_key.to_string()),
+        client: OpenAiResponsesClient::new(api_key),
     }))
 }
 
+/// Extract the OpenAI api_key from a vault `value`. Supports both
+/// `{"api_key": "..."}` and a bare string.
+fn admin_executor_extract_openai_api_key(
+    value: &serde_json::Value,
+) -> Result<Option<String>, AdminError> {
+    if let Some(api_key) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        return Ok(Some(api_key.to_string()));
+    }
+    if let Some(api_key) = value
+        .get("api_key")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        return Ok(Some(api_key.to_string()));
+    }
+    Ok(None)
+}
+
 async fn refresh_admin_executor_ai_runtime(ctx: &AdminContext) -> Result<bool, AdminError> {
-    let runtime = build_admin_executor_ai_runtime(&ctx.hive_id, &ctx.node_name)?;
+    let runtime = build_admin_executor_ai_runtime(
+        &ctx.hive_id,
+        &ctx.node_name,
+        &ctx.self_ilk_id,
+        &ctx.config_dir,
+        &ctx.state_dir,
+        &ctx.socket_dir,
+    )
+    .await?;
     ctx.executor_configured
         .store(runtime.is_some(), Ordering::Relaxed);
     *ctx.executor_runtime.lock().await = runtime;
@@ -6286,19 +6344,33 @@ fn build_admin_executor_function_catalog_response(
     ))
 }
 
-fn extract_admin_executor_openai_api_key(
+fn extract_admin_executor_openai_api_key_ref(
     payload: &serde_json::Value,
 ) -> Result<Option<String>, AdminError> {
     let config_root = payload.get("config").unwrap_or(payload);
-    if let Some(value) = config_root
+    let openai = config_root
         .get("ai_providers")
-        .and_then(|providers| providers.get("openai"))
-        .and_then(|openai| openai.get("api_key"))
+        .and_then(|providers| providers.get("openai"));
+    let Some(openai) = openai else {
+        return Ok(None);
+    };
+    if openai.get("api_key").is_some() {
+        return Err(
+            "admin executor config-set no longer accepts plaintext api_key; use api_key_ref with vault://<key>".into(),
+        );
+    }
+    if let Some(value) = openai
+        .get("api_key_ref")
         .and_then(serde_json::Value::as_str)
     {
         let trimmed = value.trim();
         if trimmed.is_empty() {
-            return Err("admin executor config-set received an empty OpenAI api_key".into());
+            return Err("admin executor config-set received an empty api_key_ref".into());
+        }
+        if fluxbee_sdk::parse_vault_ref(trimmed).is_err() {
+            return Err(
+                "admin executor api_key_ref must be a vault ref like 'vault://<key>'".into(),
+            );
         }
         return Ok(Some(trimmed.to_string()));
     }
@@ -6325,6 +6397,14 @@ fn merge_admin_executor_local_config(
             .ai_providers
             .get_or_insert_with(AiProvidersSection::default);
         let openai_cfg = provider.openai.get_or_insert_with(OpenAiSection::default);
+        if let Some(value) = openai.get("api_key_ref") {
+            openai_cfg.api_key_ref = value
+                .as_str()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToString::to_string);
+            changed = true;
+        }
         if let Some(value) = openai.get("default_model") {
             openai_cfg.default_model = value
                 .as_str()
@@ -6394,8 +6474,7 @@ fn build_admin_executor_config_get_payload(
     ctx: &AdminContext,
 ) -> Result<serde_json::Value, AdminError> {
     let node_config = load_admin_executor_node_config(&ctx.hive_id)?;
-    let secret_record = load_admin_secret_record(&ctx.node_name)?;
-    let merged = merged_admin_executor_openai_section(node_config.as_ref(), secret_record.as_ref());
+    let merged = merged_admin_executor_openai_section(node_config.as_ref());
     let config_version = node_config
         .as_ref()
         .map(|cfg| cfg.config_version)
@@ -6404,31 +6483,23 @@ fn build_admin_executor_config_get_payload(
         .as_ref()
         .map(|cfg| cfg.schema_version)
         .unwrap_or(ADMIN_EXECUTOR_CONFIG_SCHEMA_VERSION);
-    let configured = merged
+    let api_key_ref = merged
         .as_ref()
-        .and_then(|openai| openai.api_key.as_deref())
+        .and_then(|openai| openai.api_key_ref.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .is_some();
-    let api_key_source = if secret_record
-        .as_ref()
-        .and_then(|record| record.secrets.get(ADMIN_EXECUTOR_LOCAL_SECRET_KEY_OPENAI))
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_some()
-    {
-        "local_file"
-    } else {
-        "missing"
-    };
+        .map(ToString::to_string);
+    // "configured" reflects what the *runtime* actually resolved (vault may
+    // be unreachable even when a ref is persisted), not just whether a ref
+    // string exists.
+    let configured = ctx.executor_configured.load(Ordering::Relaxed);
     let mut descriptor = NodeSecretDescriptor::new(
-        "config.ai_providers.openai.api_key",
-        ADMIN_EXECUTOR_LOCAL_SECRET_KEY_OPENAI,
+        "config.ai_providers.openai.api_key_ref",
+        "openai_api_key",
     );
     descriptor.required = true;
-    descriptor.configured = configured;
-    descriptor.persistence = "local_file".to_string();
+    descriptor.configured = api_key_ref.is_some();
+    descriptor.persistence = "vault".to_string();
 
     Ok(serde_json::json!({
         "ok": true,
@@ -6439,7 +6510,7 @@ fn build_admin_executor_config_get_payload(
         "config": {
             "ai_providers": {
                 "openai": {
-                    "api_key": if configured { serde_json::Value::String(NODE_SECRET_REDACTION_TOKEN.to_string()) } else { serde_json::Value::Null },
+                    "api_key_ref": api_key_ref.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
                     "default_model": merged.as_ref().and_then(|openai| openai.default_model.clone()).map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
                     "max_tokens": merged.as_ref().and_then(|openai| openai.max_tokens.map(serde_json::Value::from)).unwrap_or(serde_json::Value::Null),
                     "temperature": merged.as_ref().and_then(|openai| openai.temperature.map(serde_json::Value::from)).unwrap_or(serde_json::Value::Null),
@@ -6460,7 +6531,7 @@ fn build_admin_executor_config_get_payload(
             "node_family": "SY",
             "node_kind": "SY.admin",
             "supports": ["CONFIG_GET", "CONFIG_SET"],
-            "required_fields": ["config.ai_providers.openai.api_key"],
+            "required_fields": ["config.ai_providers.openai.api_key_ref"],
             "optional_fields": [
                 "config.ai_providers.openai.default_model",
                 "config.ai_providers.openai.max_tokens",
@@ -6471,13 +6542,12 @@ fn build_admin_executor_config_get_payload(
             ],
             "secrets": [descriptor],
             "notes": [
-                "This is the standard node CONFIG_GET/SET surface for the SY.admin executor runtime.",
-                "OpenAI secrets are stored in local secrets.json and always returned redacted.",
+                "OpenAI secrets are vault-only. Set the secret in SY.vault first (vault_put), then send the vault://<key> ref through CONFIG_SET.",
+                "The api_key_ref string is stored in the local executor config (not a secret). Admin resolves it against SY.vault at boot and on every CONFIG_SET.",
                 "Catalog mode defaults to full. Use subset only when intentionally constraining the executor-visible action set."
             ]
         },
-        "secret_record": secret_record.map(|record| redacted_node_secret_record(&record)),
-        "api_key_source": api_key_source,
+        "api_key_ref": api_key_ref,
         "function_count": build_admin_executor_function_catalog(node_config.as_ref()).len()
     }))
 }
@@ -6547,7 +6617,9 @@ async fn apply_admin_executor_config_set(
         }
     }
 
-    let api_key = match extract_admin_executor_openai_api_key(&msg.payload) {
+    // Validate the api_key_ref (or reject plaintext). The ref itself gets
+    // persisted in the executor config below — no secret hits secrets.json.
+    let api_key_ref = match extract_admin_executor_openai_api_key_ref(&msg.payload) {
         Ok(value) => value,
         Err(err) => {
             return admin_executor_config_error_response(ctx, "invalid_config", &err.to_string());
@@ -6569,11 +6641,11 @@ async fn apply_admin_executor_config_set(
                 );
             }
         };
-    if api_key.is_none() && !config_changed {
+    if api_key_ref.is_none() && !config_changed {
         return admin_executor_config_error_response(
             ctx,
             "invalid_config",
-            "config-set requires config.ai_providers.openai.api_key or another executor config field",
+            "config-set requires config.ai_providers.openai.api_key_ref or another executor config field",
         );
     }
 
@@ -6591,36 +6663,12 @@ async fn apply_admin_executor_config_set(
 
     let _ = save_admin_executor_node_config(&ctx.hive_id, &merged_config)?;
 
-    let stored_openai_secret = if let Some(api_key) = api_key {
-        let mut secrets = load_admin_secret_record(&ctx.node_name)?
-            .map(|record| record.secrets)
-            .unwrap_or_default();
-        secrets.insert(
-            ADMIN_EXECUTOR_LOCAL_SECRET_KEY_OPENAI.to_string(),
-            serde_json::Value::String(api_key),
-        );
-        let record = build_node_secret_record(
-            secrets,
-            &NodeSecretWriteOptions {
-                updated_by_ilk: msg
-                    .payload
-                    .get("requested_by")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToString::to_string),
-                updated_by_label: Some("SY.admin".to_string()),
-                trace_id: Some(msg.routing.trace_id.clone()),
-            },
-        );
-        save_node_secret_record_with_root(&ctx.node_name, admin_nodes_root(), &record)
-            .map_err(|err| -> AdminError { Box::new(err) })?;
-        true
-    } else {
-        false
-    };
-
     let configured = refresh_admin_executor_ai_runtime(ctx).await?;
+    let persisted_ref = merged_config
+        .ai_providers
+        .as_ref()
+        .and_then(|p| p.openai.as_ref())
+        .and_then(|o| o.api_key_ref.clone());
     Ok(serde_json::json!({
         "ok": true,
         "node_name": ctx.node_name,
@@ -6631,7 +6679,7 @@ async fn apply_admin_executor_config_set(
         "config": {
             "ai_providers": {
                 "openai": {
-                    "api_key": if configured { serde_json::Value::String(NODE_SECRET_REDACTION_TOKEN.to_string()) } else { serde_json::Value::Null },
+                    "api_key_ref": persisted_ref.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
                     "default_model": merged_config.ai_providers.as_ref().and_then(|p| p.openai.as_ref()).and_then(|o| o.default_model.clone()).map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
                     "max_tokens": merged_config.ai_providers.as_ref().and_then(|p| p.openai.as_ref()).and_then(|o| o.max_tokens.map(serde_json::Value::from)).unwrap_or(serde_json::Value::Null),
                     "temperature": merged_config.ai_providers.as_ref().and_then(|p| p.openai.as_ref()).and_then(|o| o.temperature.map(serde_json::Value::from)).unwrap_or(serde_json::Value::Null),
@@ -6643,16 +6691,11 @@ async fn apply_admin_executor_config_set(
                 "actions": merged_config.catalog.as_ref().and_then(|catalog| catalog.actions.clone()).map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
             }
         },
-        "stored_secrets": if stored_openai_secret {
-            serde_json::json!([{
-                "field": "config.ai_providers.openai.api_key",
-                "storage_key": ADMIN_EXECUTOR_LOCAL_SECRET_KEY_OPENAI,
-                "value_redacted": true
-            }])
-        } else {
-            serde_json::json!([])
-        },
-        "message": "SY.admin executor config persisted through CONFIG_SET."
+        "stored_refs": persisted_ref.map(|vault_ref| serde_json::json!([{
+            "field": "config.ai_providers.openai.api_key_ref",
+            "vault_ref": vault_ref
+        }])).unwrap_or(serde_json::json!([])),
+        "message": "SY.admin executor config persisted through CONFIG_SET (vault-only)."
     }))
 }
 

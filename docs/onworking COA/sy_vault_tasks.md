@@ -319,26 +319,26 @@ Patrón canónico para todos los nodos in-scope:
 
 ### J1. `sy.storage`
 
-- [ ] VA-J1a. Aceptar solo `config.database.postgres_url_ref: "vault://<key>"` en `CONFIG_SET`; rechazar `config.database.postgres_url` plaintext con `INVALID_CONFIG`.
-- [ ] VA-J1b. Persistir el ref (string, no secreto) en el config local del nodo. Eliminar la escritura a `secrets.json` para `postgres_url`.
-- [ ] VA-J1c. En `resolve_database_url` (y boot), si hay ref, resolver vía `vault_get_with_retry`. Si no hay ref o vault no responde, arrancar sin DB backend (estado actual `STORAGE_NOT_READY`).
-- [ ] VA-J1d. Borrar `STORAGE_LOCAL_SECRET_KEY_POSTGRES_URL`, `persist_local_postgres_url` y `load_local_postgres_url` de `src/bin/sy_storage.rs`.
-- [ ] VA-J1e. E2E: `vault_put sys:storage-postgres-url` → `CONFIG_SET storage ... postgres_url_ref` → `restart sy-storage` → `STATUS` reporta `configured`.
+- [x] VA-J1a. `CONFIG_SET` rechaza `postgres_url` plaintext con `invalid_config`, acepta solo `postgres_url_ref: vault://<key>` validado con `parse_vault_ref`.
+- [x] VA-J1b. Persistencia del ref en `secrets.json` local con key `postgres_url_ref` (el archivo se mantiene por compatibilidad, pero solo contiene refs — no plaintext).
+- [x] VA-J1c. `resolve_database_url` es ahora async: conecta SDK efímero a router, llama `resolve_vault_ref` contra `SY.vault@<hive>` con backoff/jitter (max 30s). Falla → arranca degradado (`STORAGE_NOT_READY`).
+- [x] VA-J1d. Renombré `STORAGE_LOCAL_SECRET_KEY_POSTGRES_URL` → `STORAGE_LOCAL_REF_KEY_POSTGRES_URL`. `persist_local_postgres_url` / `load_local_postgres_url` renombradas a versiones `_ref`. Eliminado el variant `EnvCompat` + fallbacks `FLUXBEE_DATABASE_URL` / `JSR_DATABASE_URL`.
+- [ ] VA-J1e. E2E: `vault_put sys:storage-postgres-url` → `CONFIG_SET storage ... postgres_url_ref` → `restart sy-storage` → `STATUS` reporta `configured`. **Pendiente test en VM.**
 
 ### J2. `sy.identity`
 
-- [ ] VA-J2a. Aceptar solo `config.database.postgres_url_ref: "vault://<key>"` en `CONFIG_SET`; rechazar plaintext.
-- [ ] VA-J2b. Persistir el ref en el config local del nodo. Eliminar la escritura a `secrets.json` del identity postgres_url.
-- [ ] VA-J2c. Resolver vía `vault_get_with_retry` en boot. Si vault no responde, arrancar in-memory + SHM (estado actual `started without active DB backend`).
-- [ ] VA-J2d. Borrar `IDENTITY_LOCAL_SECRET_KEY_POSTGRES_URL` / `persist_local_identity_postgres_url` / load equivalente de `src/bin/sy_identity.rs`.
-- [ ] VA-J2e. E2E: análogo a VA-J1e con `sys:identity-postgres-url`.
+- [x] VA-J2a. `CONFIG_SET` rechaza `postgres_url` plaintext, acepta solo `postgres_url_ref` validado.
+- [x] VA-J2b. Persistencia del ref en `secrets.json` con key `postgres_url_ref`. Sin plaintext.
+- [x] VA-J2c. `resolve_database_url` async con SDK ephemeral + `resolve_vault_ref`. Si vault no responde, identity arranca in-memory + SHM ("started without active DB backend"), comportamiento actual preservado. `SY.identity` agregado al `is_admin` fast-path en `sy_vault` para resolver el chicken/egg de boot (identity es quien escribe la SHM que vault usaría para autenticarla).
+- [x] VA-J2d. Renombré `IDENTITY_LOCAL_SECRET_KEY_POSTGRES_URL` → `IDENTITY_LOCAL_REF_KEY_POSTGRES_URL`, `persist_local_identity_postgres_url` / `load_local_identity_postgres_url` → `_ref`. Eliminados los fallbacks `FLUXBEE_DATABASE_URL` / `JSR_DATABASE_URL` y el variant `EnvCompat`. `_self_ilk_id` ahora se calcula al top de main con `deterministic_system_ilk_id` y se reusa en la llamada a vault.
+- [ ] VA-J2e. E2E: análogo a VA-J1e con `sys:identity-postgres-url`. **Pendiente test en VM.**
 
 ### J3. `sy.admin` (executor OpenAI key)
 
-- [ ] VA-J3a. `CONFIG_SET` de admin acepta solo `config.executor.openai.api_key_ref: "vault://<key>"`; sin plaintext.
-- [ ] VA-J3b. Eliminar la rama que escribe `openai_api_key` en `secrets.json` del propio admin (`ADMIN_EXECUTOR_LOCAL_SECRET_KEY_OPENAI` y sus paths).
-- [ ] VA-J3c. `build_admin_executor_ai_runtime` resuelve el ref con `vault_get_with_retry` al boot y en reload de config.
-- [ ] VA-J3d. E2E: `vault_put sys:admin-executor-openai-key` → `CONFIG_SET admin ... api_key_ref` → admin executor pasa a `configured` sin reiniciar.
+- [x] VA-J3a. `CONFIG_SET` de admin acepta solo `config.ai_providers.openai.api_key_ref: "vault://<key>"`; rechaza plaintext con error explícito.
+- [x] VA-J3b. Constante `ADMIN_EXECUTOR_LOCAL_SECRET_KEY_OPENAI` y `load_admin_secret_record` eliminadas. `apply_admin_executor_config_set` ya no escribe `secrets.json` para el executor (solo persiste el ref en el config.json local).
+- [x] VA-J3c. `build_admin_executor_ai_runtime` ahora es `async`, conecta un sub-client al router, llama `resolve_vault_ref` con `VaultCaller { src_ilk: self_ilk_id, src_l2_name: SY.admin@<hive> }` contra `SY.vault@<hive>`. Si el ref no existe o vault falla → runtime degradado (`Ok(None)`). `refresh_admin_executor_ai_runtime` propaga.
+- [ ] VA-J3d. E2E: `vault_put sys:admin-executor-openai-key` → `CONFIG_SET admin ... api_key_ref` → admin executor pasa a `configured` sin reiniciar. **Pendiente test en VM.**
 
 ### J4. `sy.architect` (messages_db_url, completar; OpenAI key ya migrado)
 

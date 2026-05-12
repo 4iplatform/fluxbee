@@ -22,7 +22,7 @@ use fluxbee_sdk::{
     build_node_config_response_message, build_node_secret_record, connect, load_node_secret_record,
     managed_node_config_path, save_node_secret_record, try_handle_default_node_status, NodeConfig,
     NodeReceiver, NodeSecretDescriptor, NodeSecretWriteOptions, NodeSender,
-    NODE_CONFIG_APPLY_MODE_REPLACE, NODE_SECRET_REDACTION_TOKEN,
+    NODE_CONFIG_APPLY_MODE_REPLACE,
 };
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, sha256_hex_to_bytes, IchEntry, IdentityRegionLimits,
@@ -42,7 +42,7 @@ const DEFAULT_IDENTITY_SYNC_PORT: u16 = 9100;
 const IDENTITY_DB_NAME: &str = "fluxbee_identity";
 const IDENTITY_NODE_BASE_NAME: &str = "SY.identity";
 const IDENTITY_NODE_VERSION: &str = "2.0";
-const IDENTITY_LOCAL_SECRET_KEY_POSTGRES_URL: &str = "postgres_url";
+const IDENTITY_LOCAL_REF_KEY_POSTGRES_URL: &str = "postgres_url_ref";
 const IDENTITY_CONFIG_SCHEMA_VERSION: u32 = 1;
 const IDENTITY_FULL_SYNC_CHUNK_ITEMS: usize = 256;
 const IDENTITY_SYNC_VERSION: u32 = 1;
@@ -99,16 +99,18 @@ const MSG_TNT_APPROVE_RESPONSE: &str = "TNT_APPROVE_RESPONSE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IdentityDbSecretSource {
+    /// A `postgres_url_ref` is persisted locally and was resolvable through
+    /// SY.vault at the last `resolve_database_url` attempt. Note: the variant
+    /// name keeps "LocalFile" for backward compatibility with state files
+    /// already on disk, but the meaning is now "vault ref persisted locally".
     LocalFile,
-    EnvCompat,
     Missing,
 }
 
 impl IdentityDbSecretSource {
     fn as_str(self) -> &'static str {
         match self {
-            Self::LocalFile => "local_file",
-            Self::EnvCompat => "env_compat",
+            Self::LocalFile => "vault",
             Self::Missing => "missing",
         }
     }
@@ -2456,9 +2458,27 @@ async fn main() -> Result<(), IdentityError> {
         .into());
     }
     let node_name = ensure_l2_name(IDENTITY_NODE_BASE_NAME, &hive.hive_id);
-    let (database_url, db_secret_source) = resolve_database_url(&node_name);
+    // Identity's own ILK is deterministic, so we can compute it locally
+    // without waiting for any SHM to be populated (we're the one writing it).
+    let self_ilk_id = deterministic_system_ilk_id(&node_name);
+    let (database_url, db_secret_source, vault_lookup_error) = if is_primary {
+        resolve_database_url(
+            &config_dir,
+            &state_dir,
+            &socket_dir,
+            &hive.hive_id,
+            &node_name,
+            &self_ilk_id,
+        )
+        .await
+    } else {
+        (None, IdentityDbSecretSource::Missing, None)
+    };
     let (db_config, db_init_error) = if is_primary {
-        initialize_identity_database_backend(database_url.as_deref()).await
+        let (cfg, init_err) =
+            initialize_identity_database_backend(database_url.as_deref()).await;
+        let init_err = init_err.or(vault_lookup_error);
+        (cfg, init_err)
     } else {
         tracing::info!(
             role = %hive.role.clone().unwrap_or_else(|| "unknown".to_string()),
@@ -2605,9 +2625,7 @@ async fn main() -> Result<(), IdentityError> {
     }
     // Identity is the SHM writer; it derives its own ILK locally rather than
     // waiting on the SHM read path it just populated.
-    let _self_ilk_id =
-        deterministic_system_ilk_id(&ensure_l2_name("SY.identity", &hive.hive_id));
-    tracing::info!(self_ilk_id = %_self_ilk_id, "resolved self system ILK");
+    tracing::info!(self_ilk_id = %self_ilk_id, "resolved self system ILK");
     let (delta_event_tx, mut delta_event_rx) = mpsc::unbounded_channel::<IdentityDeltaEnvelope>();
     if !is_primary {
         if let Some(upstream) = sync_upstream.clone() {
@@ -4819,14 +4837,17 @@ fn persist_identity_config_state(
 }
 
 fn identity_public_config(is_primary: bool, state: &IdentityControlState) -> Value {
+    let postgres_url_ref = if is_primary {
+        load_local_identity_postgres_url_ref(IDENTITY_NODE_BASE_NAME)
+            .map(Value::String)
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
     json!({
         "database": {
             "mode": "postgres",
-            "postgres_url": if identity_secret_configured(is_primary, state) {
-                Value::String(NODE_SECRET_REDACTION_TOKEN.to_string())
-            } else {
-                Value::Null
-            },
+            "postgres_url_ref": postgres_url_ref,
             "source": identity_effective_source(is_primary, state),
             "db_name": if is_primary {
                 Value::String(IDENTITY_DB_NAME.to_string())
@@ -4844,24 +4865,24 @@ fn build_identity_config_get_payload(
 ) -> Value {
     let configured = identity_secret_configured(is_primary, control_state);
     let mut secret_descriptor = NodeSecretDescriptor::new(
-        "config.database.postgres_url",
-        IDENTITY_LOCAL_SECRET_KEY_POSTGRES_URL,
+        "config.database.postgres_url_ref",
+        IDENTITY_LOCAL_REF_KEY_POSTGRES_URL,
     );
     secret_descriptor.required = is_primary;
     secret_descriptor.configured = configured;
     secret_descriptor.persistence = if is_primary {
-        control_state.secret_source.as_str().to_string()
+        "vault".to_string()
     } else {
         "replica_non_primary".to_string()
     };
     let mut notes = vec![
         Value::String("SY.identity uses PostgreSQL only on motherbee primary.".to_string()),
         Value::String(
-            "Secret values are persisted in local secrets.json and always returned redacted."
+            "Connection string is vault-only: set the plaintext in SY.vault and pass the vault://<key> ref through CONFIG_SET."
                 .to_string(),
         ),
         Value::String(
-            "Applying a new DB secret persists locally and requires sy-identity restart to affect live connections."
+            "Applying a new ref persists locally and requires sy-identity restart to re-resolve the ref and reconnect."
                 .to_string(),
         ),
     ];
@@ -5008,10 +5029,23 @@ fn apply_identity_config_set(
             "Missing required field: payload.config".to_string(),
         ));
     };
-    let Some(postgres_url) = config
+    let database = config
         .get("database")
-        .and_then(Value::as_object)
-        .and_then(|value| value.get("postgres_url"))
+        .and_then(Value::as_object);
+    if database
+        .and_then(|d| d.get("postgres_url"))
+        .is_some()
+    {
+        return Ok(identity_config_error_response(
+            is_primary,
+            node_name,
+            control_state,
+            "invalid_config",
+            "plaintext config.database.postgres_url is no longer accepted; use postgres_url_ref with vault://<key>".to_string(),
+        ));
+    }
+    let Some(postgres_url_ref) = database
+        .and_then(|d| d.get("postgres_url_ref"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -5021,21 +5055,21 @@ fn apply_identity_config_set(
             node_name,
             control_state,
             "invalid_config",
-            "config.database.postgres_url is required".to_string(),
+            "config.database.postgres_url_ref is required (vault://<key>)".to_string(),
         ));
     };
-    if let Err(err) = postgres_url.parse::<PgConfig>() {
+    if fluxbee_sdk::parse_vault_ref(postgres_url_ref).is_err() {
         return Ok(identity_config_error_response(
             is_primary,
             node_name,
             control_state,
             "invalid_config",
-            format!("invalid postgres_url: {err}"),
+            "config.database.postgres_url_ref must be a vault ref like 'vault://<key>'".to_string(),
         ));
     }
-    persist_local_identity_postgres_url(
+    persist_local_identity_postgres_url_ref(
         node_name,
-        postgres_url,
+        postgres_url_ref,
         &build_secret_write_options_from_message(msg),
     )?;
     control_state.schema_version = schema_version;
@@ -5045,7 +5079,7 @@ fn apply_identity_config_set(
         control_state.last_error = None;
     } else {
         control_state.last_error = Some(
-            "restart_required: sy-identity must be restarted to apply new DB connection settings"
+            "restart_required: sy-identity must be restarted to resolve new vault ref and connect"
                 .to_string(),
         );
     }
@@ -5058,9 +5092,13 @@ fn apply_identity_config_set(
         "config_version": control_state.config_version,
         "config": identity_public_config(is_primary, control_state),
         "notes": [
-            "postgres_url persisted in local secrets.json",
-            "restart_required: sy-identity must be restarted to apply new DB connection settings"
+            "postgres_url_ref persisted in local node config (no plaintext)",
+            "restart_required: sy-identity must be restarted to resolve the new vault ref"
         ],
+        "stored_refs": [{
+            "field": "config.database.postgres_url_ref",
+            "vault_ref": postgres_url_ref
+        }],
         "error": Value::Null
     }))
 }
@@ -5086,34 +5124,37 @@ fn identity_config_error_response(
     })
 }
 
-fn persist_local_identity_postgres_url(
+/// Persist the `vault://<key>` ref for identity's postgres URL in the node's
+/// local config file. Note: this writes a REF, not plaintext — the real
+/// secret stays in SY.vault.
+fn persist_local_identity_postgres_url_ref(
     node_name: &str,
-    postgres_url: &str,
+    postgres_url_ref: &str,
     options: &NodeSecretWriteOptions,
 ) -> Result<(), fluxbee_sdk::NodeSecretError> {
     let mut secrets = load_node_secret_record(node_name)
         .map(|record| record.secrets)
         .unwrap_or_else(|_| Map::new());
     secrets.insert(
-        IDENTITY_LOCAL_SECRET_KEY_POSTGRES_URL.to_string(),
-        Value::String(postgres_url.to_string()),
+        IDENTITY_LOCAL_REF_KEY_POSTGRES_URL.to_string(),
+        Value::String(postgres_url_ref.to_string()),
     );
     let record = build_node_secret_record(secrets, options);
     save_node_secret_record(node_name, &record)?;
     Ok(())
 }
 
-fn load_local_identity_postgres_url(node_name: &str) -> Option<String> {
+fn load_local_identity_postgres_url_ref(node_name: &str) -> Option<String> {
     load_node_secret_record(node_name)
         .ok()
         .and_then(|record| {
             record
                 .secrets
-                .get(IDENTITY_LOCAL_SECRET_KEY_POSTGRES_URL)
+                .get(IDENTITY_LOCAL_REF_KEY_POSTGRES_URL)
                 .cloned()
         })
         .and_then(|value| value.as_str().map(ToString::to_string))
-        .filter(|value| !value.trim().is_empty() && value != NODE_SECRET_REDACTION_TOKEN)
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn build_secret_write_options_from_message(msg: &Message) -> NodeSecretWriteOptions {
@@ -5132,21 +5173,94 @@ fn build_secret_write_options_from_message(msg: &Message) -> NodeSecretWriteOpti
     }
 }
 
-fn resolve_database_url(node_name: &str) -> (Option<String>, IdentityDbSecretSource) {
-    if let Some(url) = load_local_identity_postgres_url(node_name) {
-        return (Some(url), IdentityDbSecretSource::LocalFile);
-    }
-    if let Ok(url) = std::env::var("FLUXBEE_DATABASE_URL") {
-        if !url.trim().is_empty() {
-            return (Some(url), IdentityDbSecretSource::EnvCompat);
+/// Resolve identity's Postgres URL by reading the locally persisted
+/// `postgres_url_ref` and looking it up in SY.vault. Connects an ephemeral
+/// SDK client because identity's own router connection hasn't been built yet
+/// at boot. Returns `Ok((None, Missing))` if no ref is persisted (degraded
+/// start, no DB backend). Returns `Ok((None, last_error))` with the error
+/// text if vault is unreachable or denies. Never blocks identity boot
+/// indefinitely; the retry budget caps at ~30s.
+async fn resolve_database_url(
+    config_dir: &Path,
+    state_dir: &Path,
+    socket_dir: &Path,
+    hive_id: &str,
+    node_name: &str,
+    self_ilk_id: &str,
+) -> (Option<String>, IdentityDbSecretSource, Option<String>) {
+    let Some(ref_str) = load_local_identity_postgres_url_ref(node_name) else {
+        return (None, IdentityDbSecretSource::Missing, None);
+    };
+    let node_config = fluxbee_sdk::NodeConfig {
+        name: IDENTITY_NODE_BASE_NAME.to_string(),
+        router_socket: socket_dir.to_path_buf(),
+        uuid_persistence_dir: state_dir.join("nodes"),
+        uuid_mode: fluxbee_sdk::NodeUuidMode::Ephemeral,
+        config_dir: config_dir.to_path_buf(),
+        version: IDENTITY_NODE_VERSION.to_string(),
+    };
+    let (sender, mut receiver) = match fluxbee_sdk::connect(&node_config).await {
+        Ok(pair) => pair,
+        Err(err) => {
+            return (
+                None,
+                IdentityDbSecretSource::Missing,
+                Some(format!(
+                    "failed to connect ephemeral router client for vault lookup: {err}"
+                )),
+            );
         }
+    };
+    let caller = fluxbee_sdk::VaultCaller::new(self_ilk_id, node_name);
+    let policy = fluxbee_sdk::VaultRetryPolicy {
+        max_elapsed: Duration::from_secs(30),
+        initial_delay: Duration::from_millis(250),
+        max_delay: Duration::from_secs(2),
+        jitter_ratio: 0.20,
+    };
+    let result = fluxbee_sdk::resolve_vault_ref(
+        &sender,
+        &mut receiver,
+        caller,
+        hive_id,
+        &ref_str,
+        policy,
+    )
+    .await;
+    let _ = sender.close().await;
+    match result {
+        Ok(value) => match extract_postgres_url_from_vault_value(&value) {
+            Some(url) => (Some(url), IdentityDbSecretSource::LocalFile, None),
+            None => (
+                None,
+                IdentityDbSecretSource::Missing,
+                Some(
+                    "vault value for postgres_url_ref did not contain a valid postgres URL"
+                        .to_string(),
+                ),
+            ),
+        },
+        Err(err) => (
+            None,
+            IdentityDbSecretSource::Missing,
+            Some(format!(
+                "vault lookup for postgres_url_ref={ref_str} failed: {err}"
+            )),
+        ),
     }
-    if let Ok(url) = std::env::var("JSR_DATABASE_URL") {
-        if !url.trim().is_empty() {
-            return (Some(url), IdentityDbSecretSource::EnvCompat);
-        }
+}
+
+/// Accept either a bare string or `{"postgres_url": "..."}` shape.
+fn extract_postgres_url_from_vault_value(value: &Value) -> Option<String> {
+    if let Some(s) = value.as_str().map(str::trim).filter(|v| !v.is_empty()) {
+        return Some(s.to_string());
     }
-    (None, IdentityDbSecretSource::Missing)
+    value
+        .get("postgres_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
 }
 
 async fn initialize_identity_database_backend(

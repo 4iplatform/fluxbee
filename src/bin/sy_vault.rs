@@ -89,12 +89,16 @@ struct Caller {
 }
 
 impl Caller {
+    /// L2-name fast-path: admin/architect for tooling, identity for the
+    /// boot-time chicken/egg (identity is the writer of the SHM that vault
+    /// itself reads to resolve any other caller). Treat all three as
+    /// pre-authorised by name; the rest go through tenant/ILK auth in SHM.
     fn is_admin(&self) -> bool {
         self.l2_name
             .as_deref()
             .map(|name| {
                 let base = name.split('@').next().unwrap_or(name);
-                matches!(base, "SY.admin" | "SY.architect")
+                matches!(base, "SY.admin" | "SY.architect" | "SY.identity")
             })
             .unwrap_or(false)
     }
