@@ -342,20 +342,20 @@ Patrón canónico para todos los nodos in-scope:
 
 ### J4. `sy.architect` (messages_db_url, completar; OpenAI key ya migrado)
 
-- [ ] VA-J4a. `CONFIG_SET` de architect acepta solo `config.storage.messages_db_url_ref: "vault://<key>"`; rechazar `messages_db_url` plaintext.
-- [ ] VA-J4b. Eliminar `ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL` y sus paths (`resolve_messages_db_url`/`refresh_architect_messages_db_url` deben leer solo del ref).
-- [ ] VA-J4c. `messages_db_connect` resuelve el ref con `vault_get_with_retry`.
-- [ ] VA-J4d. **Decidido**: borrar el atajo plaintext (`config.ai_providers.openai.api_key`). Único path soportado = `api_key_ref`. Reemplazo 100% para simetría con J1-J6.
-- [ ] VA-J4e. Borrar la rama plaintext en `apply_architect_executor_config_set` y la lógica de auto-vault asociada (`resolve_architect_openai_api_key_from_vault` queda solo para el path por ref).
-- [ ] VA-J4f. E2E: `vault_put sys:architect-messages-db-url` → `CONFIG_SET architect ... messages_db_url_ref` → architect reporta `messages_db_configured: true` sin reiniciar.
+- [x] VA-J4a. `CONFIG_SET` rechaza `messages_db_url` plaintext con `reject_architect_messages_db_url_plaintext`; acepta solo `messages_db_url_ref` validado.
+- [x] VA-J4b. `resolve_messages_db_url` legacy → reemplazado por `resolve_messages_db_url_from_vault` (async, ephemeral SDK + `resolve_vault_ref`). `refresh_architect_messages_db_url` ahora usa el path vault.
+- [x] VA-J4c. `messages_db_connect` se ejecuta sobre el plaintext resuelto por vault. Caída silenciosa a degraded (viewer disabled) si vault no responde.
+- [x] VA-J4d. Borrada toda la rama plaintext de OpenAI: campo `api_key: Option<String>` eliminado del `OpenAiSection`, `extract_architect_openai_api_key` reemplazado por `reject_architect_openai_plaintext`. Único path = `api_key_ref`.
+- [x] VA-J4e. Eliminada `write_architect_openai_secret_to_vault` (auto-vault), `resolve_architect_owner_ilk` y la constante `ARCHITECT_DEFAULT_OPENAI_VAULT_REF`. `build_architect_ai_runtime` simplificado a single-path (sólo `api_key_ref` → `resolve_architect_openai_api_key_from_vault`).
+- [ ] VA-J4f. E2E: `vault_put sys:architect-messages-db-url` → `CONFIG_SET architect ... messages_db_url_ref` → architect reporta `messages_db_configured: true` sin reiniciar. **Pendiente test en VM.**
 
 ### J5. `sy.cognition`
 
-- [ ] VA-J5a. `CONFIG_SET` de cognition acepta solo `api_key_ref` (mismo patrón que J3); sin plaintext.
-- [ ] VA-J5b. Eliminar `COGNITION_LOCAL_SECRET_KEY_OPENAI` y sus paths.
-- [ ] VA-J5c. Resolver OpenAI key con `vault_get_with_retry`.
-- [ ] VA-J5d. Cognition lee el postgres_url de storage **también** vía vault. Concretamente: en lugar de `load_node_secret_record(storage_node_name)`, debe hacer `vault_get_with_retry` contra el ref que storage publica en su `CONFIG_GET contract.secrets[*]`. Eliminar el cross-read del `secrets.json` de storage.
-- [ ] VA-J5e. E2E: cognition cold boot sin secret → `vault_put` → cognition converge a `configured`.
+- [x] VA-J5a. `CONFIG_SET` rechaza plaintext (`reject_cognition_openai_plaintext`); acepta solo `api_key_ref` y `storage_postgres_url_ref` ambos validados con `parse_vault_ref`.
+- [x] VA-J5b. Renombré `COGNITION_LOCAL_SECRET_KEY_OPENAI` → `COGNITION_LOCAL_REF_KEY_OPENAI`. Persistencia escribe el ref, no el plaintext. Eliminado `STORAGE_LOCAL_SECRET_KEY_POSTGRES_URL`, `STORAGE_NODE_BASE_NAME`, `extract_cognition_openai_api_key`. `EnvCompat` variant + `OPENAI_API_KEY` env fallback eliminados.
+- [x] VA-J5c. `resolve_cognition_openai_api_key` (nueva) y `resolve_storage_database_url` ahora usan `resolve_vault_value_to_plaintext`: SDK ephemeral + `resolve_vault_ref` + extraer field anidado.
+- [x] VA-J5d. Cognition ya no hace cross-read del `secrets.json` de storage. Tiene su propia config `config.storage.postgres_url_ref` que el operador apunta al mismo (o distinto) `vault://<key>` que storage usa. Loose coupling vía vault, no via filesystem.
+- [ ] VA-J5e. E2E: cognition cold boot sin secret → `vault_put sys:cognition-openai-api-key` + `vault_put sys:storage-postgres-url` → `CONFIG_SET cognition ... api_key_ref + storage_postgres_url_ref` → restart → cognition converge a `configured`. **Pendiente test en VM.**
 
 ### J6. `ai.generic`
 

@@ -3015,22 +3015,21 @@ fn persist_storage_config_state(
         schema_version: state.schema_version,
         config_version: state.config_version,
         node_name: node_name.to_string(),
-        config: storage_public_config(state.secret_source),
+        config: storage_public_config(node_name, state.secret_source),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
     write_json_atomic(&path, &serde_json::to_string_pretty(&payload)?)?;
     Ok(())
 }
 
-fn storage_public_config(secret_source: StorageDbSecretSource) -> Value {
+fn storage_public_config(node_name: &str, secret_source: StorageDbSecretSource) -> Value {
+    let postgres_url_ref = load_local_postgres_url_ref(node_name)
+        .map(Value::String)
+        .unwrap_or(Value::Null);
     json!({
         "database": {
             "mode": "postgres",
-            "postgres_url": if secret_source == StorageDbSecretSource::Missing {
-                Value::Null
-            } else {
-                Value::String(NODE_SECRET_REDACTION_TOKEN.to_string())
-            },
+            "postgres_url_ref": postgres_url_ref,
             "source": secret_source.as_str()
         }
     })
@@ -3070,7 +3069,7 @@ fn build_storage_config_get_payload(
         "state": storage_state_label(state.secret_source),
         "schema_version": state.schema_version,
         "config_version": state.config_version,
-        "config": storage_public_config(state.secret_source),
+        "config": storage_public_config(node_name, state.secret_source),
         "postgres_url_ref": postgres_url_ref,
         "contract": {
             "node_family": "SY",
@@ -3213,7 +3212,7 @@ fn apply_storage_config_set(
         "state": storage_state_label(control_state.secret_source),
         "schema_version": control_state.schema_version,
         "config_version": control_state.config_version,
-        "config": storage_public_config(control_state.secret_source),
+        "config": storage_public_config(node_name, control_state.secret_source),
         "notes": [
             "postgres_url_ref persisted in local node config (no plaintext)",
             "restart_required: sy-storage must be restarted to resolve the new vault ref"
@@ -3238,7 +3237,7 @@ fn storage_config_error_response(
         "state": storage_state_label(control_state.secret_source),
         "schema_version": control_state.schema_version,
         "config_version": control_state.config_version,
-        "config": storage_public_config(control_state.secret_source),
+        "config": storage_public_config(node_name, control_state.secret_source),
         "error": {
             "code": code,
             "message": message

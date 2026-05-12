@@ -4829,16 +4829,20 @@ fn persist_identity_config_state(
         schema_version: state.schema_version,
         config_version: state.config_version,
         node_name: node_name.to_string(),
-        config: identity_public_config(is_primary, state),
+        config: identity_public_config(is_primary, node_name, state),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
     write_json_atomic(&path, &serde_json::to_string_pretty(&payload)?)?;
     Ok(())
 }
 
-fn identity_public_config(is_primary: bool, state: &IdentityControlState) -> Value {
+fn identity_public_config(
+    is_primary: bool,
+    node_name: &str,
+    state: &IdentityControlState,
+) -> Value {
     let postgres_url_ref = if is_primary {
-        load_local_identity_postgres_url_ref(IDENTITY_NODE_BASE_NAME)
+        load_local_identity_postgres_url_ref(node_name)
             .map(Value::String)
             .unwrap_or(Value::Null)
     } else {
@@ -4917,7 +4921,7 @@ fn build_identity_config_get_payload(
         "state": identity_state_label(is_primary, control_state),
         "schema_version": control_state.schema_version,
         "config_version": control_state.config_version,
-        "config": identity_public_config(is_primary, control_state),
+        "config": identity_public_config(is_primary, node_name, control_state),
         "contract": {
             "node_family": "SY",
             "node_kind": "SY.identity",
@@ -5090,7 +5094,7 @@ fn apply_identity_config_set(
         "state": identity_state_label(is_primary, control_state),
         "schema_version": control_state.schema_version,
         "config_version": control_state.config_version,
-        "config": identity_public_config(is_primary, control_state),
+        "config": identity_public_config(is_primary, node_name, control_state),
         "notes": [
             "postgres_url_ref persisted in local node config (no plaintext)",
             "restart_required: sy-identity must be restarted to resolve the new vault ref"
@@ -5116,7 +5120,7 @@ fn identity_config_error_response(
         "state": identity_state_label(is_primary, control_state),
         "schema_version": control_state.schema_version,
         "config_version": control_state.config_version,
-        "config": identity_public_config(is_primary, control_state),
+        "config": identity_public_config(is_primary, node_name, control_state),
         "error": {
             "code": code,
             "message": message

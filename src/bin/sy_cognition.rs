@@ -25,7 +25,7 @@ use fluxbee_sdk::{
     managed_node_config_path, managed_node_instance_dir, managed_node_name,
     save_node_secret_record, try_handle_default_node_status, NodeConfig, NodeReceiver,
     NodeSecretDescriptor, NodeSecretWriteOptions, NodeSender, NodeUuidMode,
-    NODE_CONFIG_APPLY_MODE_REPLACE, NODE_SECRET_REDACTION_TOKEN,
+    NODE_CONFIG_APPLY_MODE_REPLACE,
 };
 use fluxbee_sdk::{
     CognitionContextData, CognitionCooccurrenceData, CognitionDurableEntity,
@@ -56,9 +56,8 @@ type CognitionError = Box<dyn std::error::Error + Send + Sync>;
 const COGNITION_NODE_BASE_NAME: &str = "SY.cognition";
 const COGNITION_NODE_VERSION: &str = "2.0";
 const COGNITION_CONFIG_SCHEMA_VERSION: u32 = 1;
-const COGNITION_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
-const STORAGE_LOCAL_SECRET_KEY_POSTGRES_URL: &str = "postgres_url";
-const STORAGE_NODE_BASE_NAME: &str = "SY.storage";
+const COGNITION_LOCAL_REF_KEY_OPENAI: &str = "openai_api_key_ref";
+const COGNITION_LOCAL_REF_KEY_STORAGE_POSTGRES_URL: &str = "storage_postgres_url_ref";
 const STORAGE_DB_NAME: &str = "fluxbee_storage";
 const COGNITION_TURNS_SID: u32 = 27;
 const DURABLE_QUEUE_TURNS: &str = "durable.sy-cognition.turns";
@@ -115,16 +114,18 @@ struct ThreadUpdateResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CognitionAiSecretSource {
+    /// `openai_api_key_ref` persisted locally; resolution to plaintext via
+    /// SY.vault happens lazily on each call site. The variant name keeps
+    /// "LocalFile" for backward compatibility with already-persisted state
+    /// files; the actual meaning is now "vault ref present locally".
     LocalFile,
-    EnvCompat,
     Missing,
 }
 
 impl CognitionAiSecretSource {
     fn as_str(self) -> &'static str {
         match self {
-            Self::LocalFile => "local_file",
-            Self::EnvCompat => "env_compat",
+            Self::LocalFile => "vault",
             Self::Missing => "missing",
         }
     }
@@ -239,8 +240,11 @@ struct CognitionRuntimeState {
 #[derive(Debug)]
 struct CognitionAppState {
     config_dir: PathBuf,
+    state_dir: PathBuf,
+    socket_dir: PathBuf,
     hive_id: String,
     node_name: String,
+    self_ilk_id: String,
     use_durable_consumer: bool,
     runtime_paths: RuntimePaths,
     control_state: Arc<Mutex<CognitionControlState>>,
@@ -474,7 +478,7 @@ async fn main() -> Result<(), CognitionError> {
 
     let config_dir = json_router::paths::config_dir();
     let hive = load_hive(&config_dir)?;
-    let _self_ilk_id = fluxbee_sdk::identity::wait_for_self_system_ilk_id(
+    let self_ilk_id = fluxbee_sdk::identity::wait_for_self_system_ilk_id(
         &config_dir,
         "SY.cognition",
         std::time::Duration::from_secs(30),
@@ -483,7 +487,9 @@ async fn main() -> Result<(), CognitionError> {
     .map_err(|err| -> CognitionError {
         format!("failed to resolve self system ILK from identity SHM: {err}").into()
     })?;
-    tracing::info!(self_ilk_id = %_self_ilk_id, "resolved self system ILK from identity SHM");
+    tracing::info!(self_ilk_id = %self_ilk_id, "resolved self system ILK from identity SHM");
+    let state_dir = json_router::paths::state_dir();
+    let socket_dir = json_router::paths::router_socket_dir();
     let endpoint = resolve_local_nats_endpoint(&config_dir)?;
     let use_durable_consumer = hive
         .nats
@@ -503,8 +509,11 @@ async fn main() -> Result<(), CognitionError> {
     let nats_subscribe_errors = Arc::new(AtomicU64::new(0));
     let app_state = Arc::new(CognitionAppState {
         config_dir: config_dir.clone(),
+        state_dir: state_dir.clone(),
+        socket_dir: socket_dir.clone(),
         hive_id: hive.hive_id.clone(),
         node_name: node_name.clone(),
+        self_ilk_id: self_ilk_id.clone(),
         use_durable_consumer,
         runtime_paths: runtime_paths.clone(),
         control_state: Arc::clone(&control_state),
@@ -682,7 +691,7 @@ async fn handle_turn_payload(
         state.last_semantic_impl = Some("openai_responses".to_string());
     }
 
-    let Some(api_key) = resolve_openai_api_key(&app_state.node_name) else {
+    let Some(api_key) = resolve_cognition_openai_api_key(&app_state).await else {
         let mut state = app_state.runtime_state.lock().await;
         state.semantic_tagger_failures_total =
             state.semantic_tagger_failures_total.saturating_add(1);
@@ -1092,7 +1101,7 @@ async fn rebuild_from_durable_on_startup(app_state: Arc<CognitionAppState>) {
         return;
     }
 
-    let Some(base_database_url) = resolve_storage_database_url(&app_state.hive_id) else {
+    let Some(base_database_url) = resolve_storage_database_url(&app_state).await else {
         let mut state = app_state.runtime_state.lock().await;
         state.last_rebuild_status = Some("skipped_missing_storage_db".to_string());
         state.last_rebuild_source = Some("startup".to_string());
@@ -1533,31 +1542,81 @@ fn row_payload<T: for<'de> Deserialize<'de>>(row: &Row) -> Result<T, CognitionEr
     Ok(serde_json::from_value(payload)?)
 }
 
-fn resolve_storage_database_url(hive_id: &str) -> Option<String> {
-    let storage_node_name = ensure_l2_name(STORAGE_NODE_BASE_NAME, hive_id);
-    load_node_secret_record(&storage_node_name)
-        .ok()
-        .and_then(|record| {
-            record
-                .secrets
-                .get(STORAGE_LOCAL_SECRET_KEY_POSTGRES_URL)
-                .cloned()
-        })
-        .and_then(|value| value.as_str().map(ToString::to_string))
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty() && value != NODE_SECRET_REDACTION_TOKEN)
-        .or_else(|| {
-            std::env::var("FLUXBEE_DATABASE_URL")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        })
-        .or_else(|| {
-            std::env::var("JSR_DATABASE_URL")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        })
+/// Resolve cognition's view of storage's Postgres URL through SY.vault by
+/// reading the locally persisted `storage_postgres_url_ref` (a `vault://<key>`
+/// pointing at the same secret storage itself uses). No cross-reads of other
+/// nodes' secrets.json files anymore.
+async fn resolve_storage_database_url(app_state: &CognitionAppState) -> Option<String> {
+    let ref_str = load_local_storage_postgres_url_ref(&app_state.node_name)?;
+    resolve_vault_value_to_plaintext(app_state, &ref_str, "postgres_url").await
+}
+
+/// Generic helper: connect an ephemeral SDK client, look up a vault ref, and
+/// extract a plaintext string from the response (accepts a bare string or
+/// `{"<field>": "..."}`).
+async fn resolve_vault_value_to_plaintext(
+    app_state: &CognitionAppState,
+    vault_ref: &str,
+    nested_field: &str,
+) -> Option<String> {
+    let node_config = NodeConfig {
+        name: COGNITION_NODE_BASE_NAME.to_string(),
+        router_socket: app_state.socket_dir.clone(),
+        uuid_persistence_dir: app_state.state_dir.join("nodes"),
+        uuid_mode: NodeUuidMode::Ephemeral,
+        config_dir: app_state.config_dir.clone(),
+        version: COGNITION_NODE_VERSION.to_string(),
+    };
+    let (sender, mut receiver) = match fluxbee_sdk::connect(&node_config).await {
+        Ok(pair) => pair,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                vault_ref,
+                "sy.cognition vault lookup: ephemeral router connect failed"
+            );
+            return None;
+        }
+    };
+    let caller = fluxbee_sdk::VaultCaller::new(&app_state.self_ilk_id, &app_state.node_name);
+    let policy = fluxbee_sdk::VaultRetryPolicy {
+        max_elapsed: Duration::from_secs(3),
+        initial_delay: Duration::from_millis(250),
+        max_delay: Duration::from_secs(1),
+        jitter_ratio: 0.20,
+    };
+    let result = fluxbee_sdk::resolve_vault_ref(
+        &sender,
+        &mut receiver,
+        caller,
+        &app_state.hive_id,
+        vault_ref,
+        policy,
+    )
+    .await;
+    let _ = sender.close().await;
+    match result {
+        Ok(value) => {
+            if let Some(s) = value.as_str().map(str::trim).filter(|v| !v.is_empty()) {
+                return Some(s.to_string());
+            }
+            value
+                .get(nested_field)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToString::to_string)
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, vault_ref, "sy.cognition vault lookup failed");
+            None
+        }
+    }
+}
+
+async fn resolve_cognition_openai_api_key(app_state: &CognitionAppState) -> Option<String> {
+    let ref_str = load_local_openai_api_key_ref(&app_state.node_name)?;
+    resolve_vault_value_to_plaintext(app_state, &ref_str, "api_key").await
 }
 
 fn with_dbname(base: &PgConfig, dbname: &str) -> PgConfig {
@@ -2065,18 +2124,18 @@ fn build_cognition_config_get_payload(
     note: Option<&str>,
 ) -> Value {
     let configured = control_state.ai_secret_source != CognitionAiSecretSource::Missing;
-    let redacted_api_key = if configured {
-        Value::String(NODE_SECRET_REDACTION_TOKEN.to_string())
-    } else {
-        Value::Null
-    };
+    let openai_api_key_ref =
+        load_local_openai_api_key_ref(node_name).map(Value::String).unwrap_or(Value::Null);
+    let storage_postgres_url_ref = load_local_storage_postgres_url_ref(node_name)
+        .map(Value::String)
+        .unwrap_or(Value::Null);
     let mut secret_descriptor = NodeSecretDescriptor::new(
-        "config.secrets.openai.api_key",
-        COGNITION_LOCAL_SECRET_KEY_OPENAI,
+        "config.secrets.openai.api_key_ref",
+        COGNITION_LOCAL_REF_KEY_OPENAI,
     );
     secret_descriptor.required = false;
     secret_descriptor.configured = configured;
-    secret_descriptor.persistence = control_state.ai_secret_source.as_str().to_string();
+    secret_descriptor.persistence = "vault".to_string();
 
     let mut notes = vec![
         Value::String(
@@ -2114,18 +2173,19 @@ fn build_cognition_config_get_payload(
             }
         },
         "storage": {
+            "postgres_url_ref": storage_postgres_url_ref,
             "write_subject_prefix": "storage.cognition",
             "enabled": true
         },
         "ai_providers": {
             "openai": {
                 "provider": "openai",
-                "api_key": redacted_api_key.clone()
+                "api_key_ref": openai_api_key_ref.clone()
             }
         },
         "secrets": {
             "openai": {
-                "api_key": redacted_api_key
+                "api_key_ref": openai_api_key_ref
             }
         },
         "semantic_tagger": {
@@ -2271,8 +2331,45 @@ fn apply_cognition_config_set(
         }
     }
 
-    let openai_api_key = extract_cognition_openai_api_key(&msg.payload);
-    let stored_openai_secret = openai_api_key.is_some();
+    if let Err(err) = reject_cognition_openai_plaintext(&msg.payload) {
+        return Ok(config_error_response(
+            node_name,
+            control_state,
+            runtime_paths,
+            use_durable_consumer,
+            "invalid_config",
+            &err.to_string(),
+        ));
+    }
+    let openai_api_key_ref = match extract_cognition_openai_api_key_ref(&msg.payload) {
+        Ok(value) => value,
+        Err(err) => {
+            return Ok(config_error_response(
+                node_name,
+                control_state,
+                runtime_paths,
+                use_durable_consumer,
+                "invalid_config",
+                &err.to_string(),
+            ));
+        }
+    };
+    let storage_postgres_url_ref =
+        match extract_cognition_storage_postgres_url_ref(&msg.payload) {
+            Ok(value) => value,
+            Err(err) => {
+                return Ok(config_error_response(
+                    node_name,
+                    control_state,
+                    runtime_paths,
+                    use_durable_consumer,
+                    "invalid_config",
+                    &err.to_string(),
+                ));
+            }
+        };
+    let stored_openai_secret = openai_api_key_ref.is_some();
+    let stored_storage_ref = storage_postgres_url_ref.is_some();
     let thresholds = match extract_cognition_thresholds(&msg.payload) {
         Ok(value) => value,
         Err(err) => {
@@ -2300,23 +2397,23 @@ fn apply_cognition_config_set(
         }
     };
 
-    if let Some(api_key) = openai_api_key.as_deref() {
-        persist_local_openai_api_key(
-            node_name,
-            api_key,
-            &NodeSecretWriteOptions {
-                updated_by_ilk: msg
-                    .payload
-                    .get("requested_by")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToString::to_string),
-                updated_by_label: Some("sy.cognition".to_string()),
-                trace_id: Some(msg.routing.trace_id.clone()),
-            },
-        )?;
+    let secret_options = NodeSecretWriteOptions {
+        updated_by_ilk: msg
+            .payload
+            .get("requested_by")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        updated_by_label: Some("sy.cognition".to_string()),
+        trace_id: Some(msg.routing.trace_id.clone()),
+    };
+    if let Some(api_key_ref) = openai_api_key_ref.as_deref() {
+        persist_local_openai_api_key_ref(node_name, api_key_ref, &secret_options)?;
         control_state.ai_secret_source = CognitionAiSecretSource::LocalFile;
+    }
+    if let Some(postgres_url_ref) = storage_postgres_url_ref.as_deref() {
+        persist_local_storage_postgres_url_ref(node_name, postgres_url_ref, &secret_options)?;
     }
 
     if let Some(thresholds) = thresholds {
@@ -2338,12 +2435,11 @@ fn apply_cognition_config_set(
         "config": {
             "secrets": {
                 "openai": {
-                    "api_key": if control_state.ai_secret_source != CognitionAiSecretSource::Missing {
-                        Value::String(NODE_SECRET_REDACTION_TOKEN.to_string())
-                    } else {
-                        Value::Null
-                    }
+                    "api_key_ref": load_local_openai_api_key_ref(node_name).map(Value::String).unwrap_or(Value::Null)
                 }
+            },
+            "storage": {
+                "postgres_url_ref": load_local_storage_postgres_url_ref(node_name).map(Value::String).unwrap_or(Value::Null)
             },
             "semantic_tagger": {
                 "provider": control_state.semantic_tagger.provider,
@@ -2359,17 +2455,26 @@ fn apply_cognition_config_set(
                 "reason_open": control_state.thresholds.reason_open
             }
         },
-        "stored_secrets": if stored_openai_secret {
-            json!([{
-                "field": "config.secrets.openai.api_key",
-                "storage_key": COGNITION_LOCAL_SECRET_KEY_OPENAI,
-                "value_redacted": true
-            }])
-        } else {
-            Value::Array(Vec::new())
-        },
-        "message": "SY.cognition local config persisted. Semantic extraction uses the configured AI semantic tagger."
+        "stored_refs": cognition_stored_refs_payload(stored_openai_secret, stored_storage_ref),
+        "message": "SY.cognition local config persisted (vault-only). Restart required to re-resolve refs against SY.vault."
     }))
+}
+
+fn cognition_stored_refs_payload(stored_openai: bool, stored_storage: bool) -> Value {
+    let mut refs: Vec<Value> = Vec::new();
+    if stored_openai {
+        refs.push(json!({
+            "field": "config.secrets.openai.api_key_ref",
+            "storage_key": COGNITION_LOCAL_REF_KEY_OPENAI
+        }));
+    }
+    if stored_storage {
+        refs.push(json!({
+            "field": "config.storage.postgres_url_ref",
+            "storage_key": COGNITION_LOCAL_REF_KEY_STORAGE_POSTGRES_URL
+        }));
+    }
+    Value::Array(refs)
 }
 
 fn config_error_response(
@@ -2418,7 +2523,7 @@ fn config_error_response(
 fn cognition_state_label(control_state: &CognitionControlState) -> &'static str {
     match control_state.ai_secret_source {
         CognitionAiSecretSource::Missing => "degraded_no_ai_provider",
-        CognitionAiSecretSource::LocalFile | CognitionAiSecretSource::EnvCompat => {
+        CognitionAiSecretSource::LocalFile => {
             "ready_semantic_ai"
         }
     }
@@ -2526,15 +2631,73 @@ fn ensure_runtime_paths(node_name: &str) -> Result<RuntimePaths, CognitionError>
     })
 }
 
-fn extract_cognition_openai_api_key(body: &Value) -> Option<String> {
-    body.get("config")
+/// Reject plaintext `api_key` (Phase J vault-only).
+fn reject_cognition_openai_plaintext(body: &Value) -> Result<(), CognitionError> {
+    let plain = body
+        .get("config")
         .and_then(|config| config.get("secrets"))
         .and_then(|value| value.get("openai"))
         .and_then(|value| value.get("api_key"))
         .and_then(Value::as_str)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    if plain {
+        return Err(
+            "plaintext config.secrets.openai.api_key is no longer accepted; use api_key_ref with vault://<key>".into(),
+        );
+    }
+    Ok(())
+}
+
+fn extract_cognition_openai_api_key_ref(body: &Value) -> Result<Option<String>, CognitionError> {
+    let raw = body
+        .get("config")
+        .and_then(|config| config.get("secrets"))
+        .and_then(|value| value.get("openai"))
+        .and_then(|value| value.get("api_key_ref"))
+        .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+        .filter(|value| !value.is_empty());
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    if fluxbee_sdk::parse_vault_ref(value).is_err() {
+        return Err(
+            "config.secrets.openai.api_key_ref must be a vault ref like 'vault://<key>'".into(),
+        );
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn extract_cognition_storage_postgres_url_ref(
+    body: &Value,
+) -> Result<Option<String>, CognitionError> {
+    if body
+        .get("config")
+        .and_then(|config| config.get("storage"))
+        .and_then(|s| s.get("postgres_url"))
+        .is_some()
+    {
+        return Err(
+            "plaintext config.storage.postgres_url is no longer accepted; use postgres_url_ref with vault://<key>".into(),
+        );
+    }
+    let raw = body
+        .get("config")
+        .and_then(|config| config.get("storage"))
+        .and_then(|s| s.get("postgres_url_ref"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    if fluxbee_sdk::parse_vault_ref(value).is_err() {
+        return Err(
+            "config.storage.postgres_url_ref must be a vault ref like 'vault://<key>'".into(),
+        );
+    }
+    Ok(Some(value.to_string()))
 }
 
 fn extract_cognition_thresholds(
@@ -4087,30 +4250,32 @@ fn update_ema(current: f64, new_value: f64, alpha: f64) -> f64 {
     }
 }
 
-fn persist_local_openai_api_key(
+/// Persist the OpenAI vault ref (`vault://<key>`) — not the plaintext — in
+/// the node-local secrets file. Phase J vault-only.
+fn persist_local_openai_api_key_ref(
     node_name: &str,
-    api_key: &str,
+    api_key_ref: &str,
     options: &NodeSecretWriteOptions,
 ) -> Result<(), CognitionError> {
     let mut secrets = load_node_secret_record(node_name)
         .map(|record| record.secrets)
         .unwrap_or_else(|_| Map::new());
     secrets.insert(
-        COGNITION_LOCAL_SECRET_KEY_OPENAI.to_string(),
-        Value::String(api_key.to_string()),
+        COGNITION_LOCAL_REF_KEY_OPENAI.to_string(),
+        Value::String(api_key_ref.to_string()),
     );
     let record = build_node_secret_record(secrets, options);
     save_node_secret_record(node_name, &record)?;
     Ok(())
 }
 
-fn load_local_openai_api_key(node_name: &str) -> Option<String> {
+fn load_local_openai_api_key_ref(node_name: &str) -> Option<String> {
     load_node_secret_record(node_name)
         .ok()
         .and_then(|record| {
             record
                 .secrets
-                .get(COGNITION_LOCAL_SECRET_KEY_OPENAI)
+                .get(COGNITION_LOCAL_REF_KEY_OPENAI)
                 .cloned()
         })
         .and_then(|value| value.as_str().map(ToString::to_string))
@@ -4118,28 +4283,43 @@ fn load_local_openai_api_key(node_name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn resolve_openai_api_key(node_name: &str) -> Option<String> {
-    load_local_openai_api_key(node_name).or_else(|| {
-        std::env::var("OPENAI_API_KEY")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    })
+fn persist_local_storage_postgres_url_ref(
+    node_name: &str,
+    postgres_url_ref: &str,
+    options: &NodeSecretWriteOptions,
+) -> Result<(), CognitionError> {
+    let mut secrets = load_node_secret_record(node_name)
+        .map(|record| record.secrets)
+        .unwrap_or_else(|_| Map::new());
+    secrets.insert(
+        COGNITION_LOCAL_REF_KEY_STORAGE_POSTGRES_URL.to_string(),
+        Value::String(postgres_url_ref.to_string()),
+    );
+    let record = build_node_secret_record(secrets, options);
+    save_node_secret_record(node_name, &record)?;
+    Ok(())
+}
+
+fn load_local_storage_postgres_url_ref(node_name: &str) -> Option<String> {
+    load_node_secret_record(node_name)
+        .ok()
+        .and_then(|record| {
+            record
+                .secrets
+                .get(COGNITION_LOCAL_REF_KEY_STORAGE_POSTGRES_URL)
+                .cloned()
+        })
+        .and_then(|value| value.as_str().map(ToString::to_string))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn resolve_openai_api_key_source(node_name: &str) -> CognitionAiSecretSource {
-    if load_local_openai_api_key(node_name).is_some() {
-        return CognitionAiSecretSource::LocalFile;
+    if load_local_openai_api_key_ref(node_name).is_some() {
+        CognitionAiSecretSource::LocalFile
+    } else {
+        CognitionAiSecretSource::Missing
     }
-    if std::env::var("OPENAI_API_KEY")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .is_some()
-    {
-        return CognitionAiSecretSource::EnvCompat;
-    }
-    CognitionAiSecretSource::Missing
 }
 
 fn load_hive(config_dir: &Path) -> Result<HiveFile, CognitionError> {
