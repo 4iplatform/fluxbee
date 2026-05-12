@@ -273,7 +273,6 @@ struct AdminContext {
     authorized_hives: Vec<String>,
     nats_endpoint: String,
     nats_client: Arc<NatsClient>,
-    command_lock: Arc<Mutex<()>>,
     executor_runtime: Arc<Mutex<Option<AdminExecutorAiRuntime>>>,
     executor_configured: Arc<AtomicBool>,
 }
@@ -574,7 +573,6 @@ async fn main() -> Result<(), AdminError> {
     let (broadcast_tx, broadcast_rx) = mpsc::unbounded_channel::<BroadcastRequest>();
     let http_tx = broadcast_tx.clone();
     let nats_client = Arc::new(NatsClient::from_client_config(&client_config)?);
-    let command_lock = Arc::new(Mutex::new(()));
     let node_name = admin_node_name(&hive.hive_id);
     let self_ilk_id = fluxbee_sdk::identity::wait_for_self_system_ilk_id(
         &config_dir,
@@ -604,7 +602,6 @@ async fn main() -> Result<(), AdminError> {
         authorized_hives,
         nats_endpoint: nats_client.endpoint().to_string(),
         nats_client,
-        command_lock,
         executor_runtime,
         executor_configured,
     };
@@ -2665,17 +2662,20 @@ async fn handle_internal_admin_command(
         }
     };
 
-    let internal = {
-        let _command_guard = ctx.command_lock.lock().await;
-        dispatch_internal_admin_command(
-            ctx,
-            client,
-            &action,
-            parsed.target.as_deref(),
-            parsed.params,
-        )
-        .await?
-    };
+    // No global command_lock here: this loop is already a single async task
+    // serialised by `rx.recv()` in run_internal_admin_loop. Holding a shared
+    // lock across an external `.await` deadlocks when the forwarded command
+    // causes the target node (e.g. architect) to call back to admin with a
+    // nested ADMIN_COMMAND (e.g. vault_put) — the callback then blocks waiting
+    // for the lock the HTTP handler still holds.
+    let internal = dispatch_internal_admin_command(
+        ctx,
+        client,
+        &action,
+        parsed.target.as_deref(),
+        parsed.params,
+    )
+    .await?;
     let status = internal
         .envelope
         .get("status")
@@ -3808,9 +3808,16 @@ async fn handle_http(
         return Ok(());
     }
 
-    // FR9-T5: single global command lock shared by HTTP and internal socket commands.
-    // Contention is blocking (wait), never immediate reject.
-    let _command_guard = ctx.command_lock.lock().await;
+    // FR9-T5 originally took a global command_lock shared with the internal
+    // socket loop, but holding it across `send_system_request_with_meta().await`
+    // deadlocks: when admin forwards CONFIG_SET to a node and that node sends
+    // a nested ADMIN_COMMAND back (e.g. architect → vault_put → admin), the
+    // callback can't acquire the lock the HTTP handler still owns, so the
+    // CONFIG_RESPONSE never arrives and admin times out at 25s while the
+    // nested vault_put completes only after the HTTP timeout releases the
+    // lock. The HTTP path doesn't mutate admin's own state across the await,
+    // and each individual handler holds its own per-state locks where needed,
+    // so the blanket lock is unsafe by construction.
 
     if method == "GET" {
         if path == "/inventory" {

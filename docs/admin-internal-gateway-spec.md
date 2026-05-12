@@ -158,9 +158,8 @@ Pipeline:
 1. validar action en registry
 2. normalizar payload (`target`, no-legacy)
 3. aplicar precedencia `node_name@hive > target`
-4. adquirir lock monocomando
-5. ejecutar handler existente
-6. convertir a `AdminCommandResult`
+4. ejecutar handler existente (sin lock global; ver §9)
+5. convertir a `AdminCommandResult`
 
 ### 5.3 Adapters
 
@@ -318,10 +317,11 @@ Semántica de lifecycle:
 
 ## 9. Concurrency and timeout
 
-- lock monocomando global compartido
-- una ejecución activa a la vez
+- sin lock global HTTP+socket: bloquea deadlocks cuando una acción que reenvía a otro nodo provoca que ese nodo llame de vuelta a admin con un `ADMIN_COMMAND` anidado (ej. architect → `vault_put` → admin). El callback no podía adquirir el lock que el handler HTTP retenía y el `CONFIG_RESPONSE` nunca llegaba.
+- `run_internal_admin_loop` ya es un único task async que procesa `ADMIN_COMMAND` uno por uno (serialización natural sin lock).
+- HTTP no muta estado propio de admin a través del `.await` del forwarding; cada handler que mute estado compartido toma su lock fino (no hay lock global).
 - misma política de timeout por acción que HTTP
-- comportamiento bajo contención: espera (no error inmediato)
+- comportamiento bajo contención: requests HTTP concurrentes pueden ejecutarse en paralelo cuando son proxies a nodos distintos.
 
 ---
 
@@ -331,7 +331,7 @@ Semántica de lifecycle:
 - [x] FR9-T2. Implementar `dispatch_internal_admin_command()` como adapter a handlers existentes.
 - [x] FR9-T3. Corregir mapping v1 según este spec (sin routers legacy).
 - [x] FR9-T4. Incluir acción `inventory` en canal interno. (`scripts/admin_internal_inventory_socket_e2e.sh`)
-- [x] FR9-T5. Mantener lock monocomando global HTTP+socket.
+- [x] FR9-T5. ~~Mantener lock monocomando global HTTP+socket.~~ Eliminado: causaba deadlock cuando una acción HTTP reenvía a un nodo que dispara un `ADMIN_COMMAND` anidado de vuelta a admin. La serialización entre `ADMIN_COMMAND`s internos la garantiza `run_internal_admin_loop` (task único). HTTP corre en paralelo.
 - [x] FR9-T6. Mantener validación no-legacy (`name`/`version` inválidos). (`scripts/admin_internal_no_legacy_e2e.sh`)
 - [x] FR9-T7. Aplicar precedencia `node_name@hive` en normalización única.
 - [x] FR9-T8. SDK helper `admin_command()` para callers internos (`crates/fluxbee_sdk/src/admin.rs`, usado por `src/bin/admin_internal_command_diag.rs`).
@@ -358,7 +358,7 @@ Semántica de lifecycle:
 
 - ACL por origen/acción (defer)
 - Idempotencia fuerte por `request_id` (defer)
-- Modelo concurrente fino (se mantiene monocomando)
+- Modelo concurrente fino entre HTTP handlers que mutan estado compartido (cuando aparezcan, se agregan locks finos por estado, no global)
 - Reemplazar HTTP
 
 ---
