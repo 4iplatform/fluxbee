@@ -8121,7 +8121,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         }
         "vault_list" => "curl -X GET '/hives/motherbee/vault/secrets?prefix=sys:&tags=provider:openai&limit=100'",
         "vault_put" => {
-            r#"curl -X POST /hives/motherbee/vault/secrets -d '{"key":"sys:openai-api-key","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"sys","owner_ilk":"ilk:550e8400-e29b-41d4-a716-446655440000","description":"OpenAI API key"}}'"#
+            r#"curl -X POST /hives/motherbee/vault/secrets -d '{"key":"sys:openai-api-key","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"sys","owner_node":"SY.architect","description":"OpenAI API key"}}'"#
         }
         "vault_get_metadata" => {
             "curl -X GET /hives/motherbee/vault/secrets/sys:openai-api-key/metadata"
@@ -10399,16 +10399,103 @@ async fn handle_vault_command(
         "vault_rollback" => (MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE),
         _ => return Err(format!("unsupported vault admin action: {action}").into()),
     };
+    let normalized_payload = if action == "vault_put" {
+        match normalize_vault_put_payload(ctx, &target_hive, payload) {
+            Ok(value) => value,
+            Err(detail) => {
+                return Ok((
+                    400,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": action,
+                        "payload": serde_json::Value::Null,
+                        "error_code": "INVALID_REQUEST",
+                        "error_detail": detail,
+                    })
+                    .to_string(),
+                ));
+            }
+        }
+    } else {
+        payload
+    };
     let response = send_system_request(
         client,
         &target,
         request_msg,
         response_msg,
-        payload,
+        normalized_payload,
         admin_action_timeout(action),
     )
     .await;
     Ok(build_admin_http_response(action, response))
+}
+
+/// Resolve operator-friendly `metadata.owner_node` (or `owner_l2`) into the
+/// strict `metadata.owner_ilk` that vault uses for authorization. Lets the
+/// operator write `"owner_node": "SY.cognition"` instead of having to look
+/// up the ILK UUID by hand. If `owner_ilk` is already set, it wins as-is
+/// (advanced/explicit path).
+///
+/// **No silent defaults**: if neither `owner_ilk` nor `owner_node` is provided,
+/// the request fails with `INVALID_REQUEST`. The operator must say explicitly
+/// who owns the secret.
+fn normalize_vault_put_payload(
+    ctx: &AdminContext,
+    target_hive: &str,
+    mut payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let Some(metadata) = payload.get_mut("metadata").and_then(|m| m.as_object_mut()) else {
+        return Err("vault_put requires payload.metadata".to_string());
+    };
+    let owner_node = metadata
+        .remove("owner_node")
+        .or_else(|| metadata.remove("owner_l2"))
+        .and_then(|v| v.as_str().map(str::trim).map(ToString::to_string))
+        .filter(|v| !v.is_empty());
+    let existing_owner_ilk = metadata
+        .get("owner_ilk")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    let resolved_owner_ilk = match (existing_owner_ilk, owner_node) {
+        (Some(ilk), _) => ilk,
+        (None, Some(node)) => {
+            let handler_node = if node.contains('@') {
+                node
+            } else {
+                format!("{}@{}", node, target_hive)
+            };
+            match fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_config(
+                &ctx.config_dir,
+                &handler_node,
+            ) {
+                Ok(Some((_, ilk))) => ilk.ilk_id,
+                Ok(None) => {
+                    return Err(format!(
+                        "owner_node '{handler_node}' not found in identity SHM (is the node registered?)"
+                    ));
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "failed to resolve owner_node='{handler_node}' from identity SHM: {err}"
+                    ));
+                }
+            }
+        }
+        (None, None) => {
+            return Err(
+                "vault_put requires metadata.owner_node (or metadata.owner_ilk for advanced use)"
+                    .to_string(),
+            );
+        }
+    };
+    metadata.insert(
+        "owner_ilk".to_string(),
+        serde_json::Value::String(resolved_owner_ilk),
+    );
+    Ok(payload)
 }
 
 async fn handle_hive_update_command(
