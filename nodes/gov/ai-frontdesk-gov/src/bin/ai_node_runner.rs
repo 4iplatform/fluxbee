@@ -505,6 +505,13 @@ struct OpenAiChatRuntime {
 struct GenericAiNode {
     mode: RunnerMode,
     node_name: String,
+    /// Deterministic self ILK resolved at boot via
+    /// `fluxbee_sdk::identity::wait_for_self_system_ilk_id` from identity
+    /// SHM (SY.frontdesk.gov is a system node listed in `hive.yaml`, not a
+    /// dynamic spawn, so it does NOT use `FLUXBEE_NODE_ILK_ID` like AI.* /
+    /// IO.* do). Used as `meta.src_ilk` for outgoing identity / vault calls.
+    /// `None` if SHM lookup failed at boot (degraded).
+    self_ilk_id: Option<String>,
     behavior: Arc<RwLock<Option<NodeBehavior>>>,
     dynamic_config_dir: PathBuf,
     thread_state_store: Option<Arc<dyn ThreadStateStore>>,
@@ -2470,6 +2477,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_env_filter(EnvFilter::new(log_filter))
         .init();
 
+    // SY.frontdesk.gov is a system node; identity seeds its deterministic
+    // ILK in SHM before any consumer talks to vault. We resolve it here once
+    // at boot and pass it down into each node instance constructed below.
+    // Failure is logged but doesn't kill the process — the node can still
+    // serve its non-identity-bearing flows in degraded mode.
+    let frontdesk_self_ilk_id = match fluxbee_sdk::identity::wait_for_self_system_ilk_id(
+        std::path::Path::new(&default_config_dir()),
+        "SY.frontdesk.gov",
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_millis(250),
+    ) {
+        Ok(ilk) => {
+            tracing::info!(self_ilk_id = %ilk, "SY.frontdesk.gov self ILK resolved from identity SHM");
+            Some(ilk)
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "SY.frontdesk.gov failed to resolve self ILK from SHM; identity-bearing outgoing calls will fail");
+            None
+        }
+    };
+
     let args = parse_runner_args()?;
     let config_paths = args.config_paths;
     let mut loaded = Vec::with_capacity(config_paths.len());
@@ -2488,14 +2516,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             mode = %args.mode.as_str(),
             "starting ai_node_runner without YAML config (UNCONFIGURED mode)"
         );
-        run_unconfigured_bootstrap(bootstrap_node, args.mode).await?;
+        run_unconfigured_bootstrap(bootstrap_node, args.mode, frontdesk_self_ilk_id).await?;
         return Ok(());
     }
 
     let mut runners = JoinSet::new();
     let mode = args.mode;
     for (config_path, cfg) in loaded {
-        runners.spawn(async move { run_one_config(config_path, cfg, mode).await });
+        let self_ilk_id = frontdesk_self_ilk_id.clone();
+        runners.spawn(async move { run_one_config(config_path, cfg, mode, self_ilk_id).await });
     }
 
     while let Some(result) = runners.join_next().await {
@@ -2711,6 +2740,7 @@ async fn run_one_config(
     config_path: PathBuf,
     cfg: RunnerConfig,
     mode: RunnerMode,
+    self_ilk_id: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let startup_effective_doc = build_startup_effective_config_doc(&cfg);
     let startup_effective_doc =
@@ -2757,6 +2787,7 @@ async fn run_one_config(
     let node = GenericAiNode {
         mode,
         node_name,
+        self_ilk_id,
         behavior: Arc::new(RwLock::new(Some(behavior))),
         dynamic_config_dir: PathBuf::from(cfg.node.dynamic_config_dir),
         thread_state_store,
@@ -2796,6 +2827,7 @@ async fn run_one_config(
 async fn run_unconfigured_bootstrap(
     node: NodeSection,
     mode: RunnerMode,
+    self_ilk_id: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let node_name = node.name.clone();
     let dynamic_dir = PathBuf::from(node.dynamic_config_dir.clone());
@@ -2971,6 +3003,7 @@ async fn run_unconfigured_bootstrap(
     let ai_node = GenericAiNode {
         mode,
         node_name: node_name.clone(),
+        self_ilk_id,
         behavior: Arc::new(RwLock::new(behavior)),
         dynamic_config_dir: dynamic_dir,
         thread_state_store,
@@ -4590,6 +4623,7 @@ mod tests {
         GenericAiNode {
             mode: RunnerMode::Gov,
             node_name: "SY.frontdesk.gov".to_string(),
+            self_ilk_id: None,
             behavior: Arc::new(RwLock::new(None)),
             dynamic_config_dir: PathBuf::from("/tmp"),
             thread_state_store: None,

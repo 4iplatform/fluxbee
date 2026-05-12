@@ -416,12 +416,12 @@ Hoy el orchestrator pre-registra cada nodo dinámico llamando a `SY.identity` co
 
 Fix:
 
-- [ ] VA-J'-0a-1. `register_node_identity` (en `sy_orchestrator.rs` ~9760): después del `ILK_REGISTER` exitoso, retornar también `tenant_id` resuelto (ya viene en `payload`).
-- [ ] VA-J'-0a-2. Donde se construye el comando `systemd-run` (~12180): agregar `--setenv=FLUXBEE_NODE_ILK_ID='<ilk:uuid>'` y `--setenv=FLUXBEE_NODE_TENANT_ID='<tnt:uuid>'`. Solo para nodos no-system (AI/IO/WF). Los SY usan `wait_for_self_system_ilk_id` y no necesitan env.
-- [ ] VA-J'-0a-3. SDK: agregar `fluxbee_sdk::identity::read_self_ilk_from_env() -> Option<String>` (lee `FLUXBEE_NODE_ILK_ID`) y `read_self_tenant_from_env() -> Option<String>` (`FLUXBEE_NODE_TENANT_ID`).
-- [ ] VA-J'-0a-4. AI runner (`nodes/ai/ai-generic/src/bin/ai_node_runner.rs` `run_one_config` ~4632): al boot, leer `self_ilk_id` del env. Si falta, arranca degraded (logueado claro). Almacenar en `GenericAiNode` para uso posterior.
-- [ ] VA-J'-0a-5. IO runners (`nodes/io/io-api`, `nodes/io/io-slack`, `nodes/io/io-linkedhelper`): mismo patrón. Leer env al boot, cachear, usar en outgoing messages.
-- [ ] VA-J'-0a-6. E2E: spawn de un AI.generic via orchestrator → verificar que el binario recibe el env var → primer mensaje hacia vault lleva `meta.src_ilk` correcto y vault autoriza.
+- [x] VA-J'-0a-1. `register_node_identity` (en `sy_orchestrator.rs` ~9760): después del `ILK_REGISTER` exitoso, retornar también `tenant_id` resuelto. **Hecho**: `identity_tenant_id` se computa en `run_node_flow` desde `resolve_tenant_id_for_node(payload)` y se persiste junto con el ILK en `IdentityNodeIlkMap.tenants` para reconcile-on-boot.
+- [x] VA-J'-0a-2. `systemd-run` ahora emite `--setenv=FLUXBEE_NODE_ILK_ID` y `--setenv=FLUXBEE_NODE_TENANT_ID` cuando se pasan. `build_managed_node_run_command` toma `Option<&str>` para ambos; SY (managed por unit files estáticos) no pasa por este path así que no recibe envs extra (mantiene la semántica `wait_for_self_system_ilk_id`). Tests `build_managed_node_run_command_injects_ilk_and_tenant_when_provided` agregados.
+- [x] VA-J'-0a-3. SDK: `fluxbee_sdk::identity::read_self_ilk_from_env()` y `read_self_tenant_from_env()` agregadas. Constantes `ENV_SELF_ILK_ID` y `ENV_SELF_TENANT_ID` re-exportadas desde `lib.rs` + `prelude.rs`.
+- [x] VA-J'-0a-4. AI runner (`nodes/ai/ai-generic/src/bin/ai_node_runner.rs` `run_one_config`): lee env al boot, loguea presencia/ausencia con warn, cachea en `GenericAiNode { self_ilk_id, self_tenant_id }`. Mismo cambio en `run_unconfigured_bootstrap`. Test fixture actualizado.
+- [x] VA-J'-0a-5. IO runners (`io-api`, `io-slack`, `io-linkedhelper`): lectura del env al boot + log de validación. Cachear en struct interno queda para Phase K' cuando empiecen a consumir vault.
+- [ ] VA-J'-0a-6. E2E en VM: spawn de un AI.generic via orchestrator → verificar que el binario recibe el env var → primer mensaje hacia vault lleva `meta.src_ilk` correcto y vault autoriza. **Pendiente test en VM.**
 
 Notas: `sy.orchestrator` no obtiene ILK propio — no escribe ni lee vault para sí mismo, así que queda como excepción documentada.
 
@@ -431,10 +431,10 @@ El binario en `nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs` está deriv
 
 Fix:
 
-- [ ] VA-J'-0b-1. Agregar `wait_for_self_system_ilk_id("SY.frontdesk.gov", ...)` al boot (`main` o `run_one_config`).
-- [ ] VA-J'-0b-2. Almacenar `self_ilk_id` en `GenericAiNode` y propagar a sitios que mandan mensajes hacia otros nodos (admin actions, identity ops, vault calls cuando aplique).
-- [ ] VA-J'-0b-3. Decisión a tomar (sub-charla cuando llegue): ¿conviene reescribir frontdesk-gov como SY puro (binario propio, sin la maquinaria de AI runner) o mantener la base AI con shim del patrón SY? Para alpha, lo más bajo costo es agregar el shim (`wait_for_self_system_ilk_id` + cache). Reescritura completa puede ir después.
-- [ ] VA-J'-0b-4. E2E: tras alineación, frontdesk-gov puede mandar mensajes a vault y autoriza por su ILK deterministico.
+- [x] VA-J'-0b-1. `wait_for_self_system_ilk_id("SY.frontdesk.gov", ...)` agregado al `main()` del runner antes de cargar configs. Si falla, log + degraded (no kill).
+- [x] VA-J'-0b-2. `self_ilk_id: Option<String>` agregado a `GenericAiNode` de frontdesk-gov. Propagado a través de `run_one_config` y `run_unconfigured_bootstrap` desde el main. Test fixture actualizado.
+- [x] VA-J'-0b-3. **Decisión tomada**: shim mínimo (`wait_for_self_system_ilk_id` + cache en el struct AI). No se reescribe frontdesk-gov como SY puro en este ciclo. Reescritura completa al binario SY-style queda para fase posterior si justifica.
+- [ ] VA-J'-0b-4. E2E en VM: tras alineación, frontdesk-gov puede mandar mensajes a vault y autoriza por su ILK deterministico. **Pendiente test en VM.**
 
 ### J'-0c. Postergado — Go SDK vault helpers
 

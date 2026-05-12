@@ -64,12 +64,20 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
+    // Phase J'-0a: read self ILK + tenant injected by orchestrator via
+    // FLUXBEE_NODE_ILK_ID / FLUXBEE_NODE_TENANT_ID at spawn time. IO nodes
+    // don't consume vault secrets in this cycle (deferred to Phase K') but
+    // we validate the env is present so the wiring is end-to-end exercised.
+    let self_ilk_id = fluxbee_sdk::read_self_ilk_from_env();
+    let self_tenant_id = fluxbee_sdk::read_self_tenant_from_env();
     tracing::info!(
         node_name = %config.node_name,
         router_socket = %config.router_socket.display(),
         state_dir = %config.state_dir.display(),
         dst_node = %config.dst_node.clone().unwrap_or_else(|| "resolve".to_string()),
         dev_mode = %config.dev_mode,
+        self_ilk_id = ?self_ilk_id,
+        self_tenant_id = ?self_tenant_id,
         "io-slack starting"
     );
 

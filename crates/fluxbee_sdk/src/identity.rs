@@ -1196,6 +1196,43 @@ pub fn wait_for_self_system_ilk_id(
     }
 }
 
+/// Environment variable that the orchestrator injects when spawning a
+/// dynamic node (`AI.*`, `IO.*`, `WF.*`). Holds the `ilk:<uuid>` assigned
+/// by `SY.identity` at registration time. SY system nodes do not use this;
+/// they resolve their own ILK via [`wait_for_self_system_ilk_id`].
+pub const ENV_SELF_ILK_ID: &str = "FLUXBEE_NODE_ILK_ID";
+
+/// Environment variable that the orchestrator injects when spawning a
+/// dynamic node. Holds the `tnt:<uuid>` the node belongs to.
+pub const ENV_SELF_TENANT_ID: &str = "FLUXBEE_NODE_TENANT_ID";
+
+/// Read the node's own ILK from the `FLUXBEE_NODE_ILK_ID` env var.
+///
+/// Used by dynamically spawned nodes (`AI.*`, `IO.*`, `WF.*`) at boot.
+/// The orchestrator sets this variable in the `systemd-run` command after
+/// a successful `ILK_REGISTER` to `SY.identity`. Returns `None` if the
+/// variable is missing or empty (node should run degraded and not attempt
+/// secure vault calls until a future restart re-injects it).
+///
+/// SY system nodes listed in `hive.yaml system_nodes` should not call this:
+/// their ILK is deterministic and resolved via [`wait_for_self_system_ilk_id`].
+pub fn read_self_ilk_from_env() -> Option<String> {
+    std::env::var(ENV_SELF_ILK_ID)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty() && v.starts_with("ilk:"))
+}
+
+/// Read the node's tenant id from the `FLUXBEE_NODE_TENANT_ID` env var.
+/// Same lifecycle as [`read_self_ilk_from_env`]; injected together by the
+/// orchestrator. Returns `None` if missing or not in `tnt:<uuid>` form.
+pub fn read_self_tenant_from_env() -> Option<String> {
+    std::env::var(ENV_SELF_TENANT_ID)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty() && (v == "sys" || v.starts_with("tnt:")))
+}
+
 struct IdentityShmReader {
     mmap: Mmap,
     layout: IdentityRegionLayout,

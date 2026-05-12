@@ -447,6 +447,14 @@ struct OpenAiChatRuntime {
 struct GenericAiNode {
     mode: RunnerMode,
     node_name: String,
+    /// Self ILK, read from `FLUXBEE_NODE_ILK_ID` env injected by orchestrator
+    /// at spawn (after `ILK_REGISTER` to SY.identity). `None` only when the
+    /// node was started manually outside the orchestrator pipeline; in that
+    /// case vault and any identity-bearing call will be rejected by auth.
+    self_ilk_id: Option<String>,
+    /// Self tenant, read from `FLUXBEE_NODE_TENANT_ID` env injected by
+    /// orchestrator at spawn. Same lifecycle as `self_ilk_id`.
+    self_tenant_id: Option<String>,
     behavior: Arc<RwLock<Option<NodeBehavior>>>,
     config_dir: PathBuf,
     dynamic_config_dir: PathBuf,
@@ -4680,9 +4688,33 @@ async fn run_one_config(
     let cognitive_definition = Arc::new(RwLock::new(CognitiveDefinitionRuntimeState::unresolved(
         cognitive_definition_config.enabled,
     )));
+    let self_ilk_id = fluxbee_sdk::read_self_ilk_from_env();
+    let self_tenant_id = fluxbee_sdk::read_self_tenant_from_env();
+    match (&self_ilk_id, &self_tenant_id) {
+        (Some(ilk), Some(tenant)) => {
+            tracing::info!(
+                node_name = %node_name,
+                self_ilk_id = %ilk,
+                self_tenant_id = %tenant,
+                "AI node self identity loaded from FLUXBEE_NODE_ILK_ID / FLUXBEE_NODE_TENANT_ID"
+            );
+        }
+        _ => {
+            tracing::warn!(
+                node_name = %node_name,
+                has_ilk = self_ilk_id.is_some(),
+                has_tenant = self_tenant_id.is_some(),
+                "AI node missing FLUXBEE_NODE_ILK_ID and/or FLUXBEE_NODE_TENANT_ID; \
+                 outgoing identity-bearing calls (vault, identity) will fail until \
+                 the orchestrator re-spawns this node with the env vars."
+            );
+        }
+    }
     let node = GenericAiNode {
         mode: RunnerMode::Default,
         node_name,
+        self_ilk_id,
+        self_tenant_id,
         behavior: Arc::new(RwLock::new(Some(behavior))),
         config_dir: PathBuf::from(node_config_dir),
         dynamic_config_dir: PathBuf::from(cfg.node.dynamic_config_dir),
@@ -4898,9 +4930,13 @@ async fn run_unconfigured_bootstrap(
         "starting ai_node_runner bootstrap instance"
     );
     let gov_identity = gov_identity_config_from_env();
+    let self_ilk_id = fluxbee_sdk::read_self_ilk_from_env();
+    let self_tenant_id = fluxbee_sdk::read_self_tenant_from_env();
     let ai_node = GenericAiNode {
         mode: RunnerMode::Default,
         node_name,
+        self_ilk_id,
+        self_tenant_id,
         behavior: Arc::new(RwLock::new(behavior)),
         config_dir: PathBuf::from(node_config_dir),
         dynamic_config_dir: dynamic_dir,
@@ -6462,6 +6498,8 @@ mod tests {
         GenericAiNode {
             mode: RunnerMode::Default,
             node_name: "SY.frontdesk.gov".to_string(),
+            self_ilk_id: None,
+            self_tenant_id: None,
             behavior: Arc::new(RwLock::new(None)),
             config_dir: PathBuf::from("/tmp"),
             dynamic_config_dir: PathBuf::from("/tmp"),

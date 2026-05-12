@@ -356,8 +356,18 @@ struct RuntimeRetentionStats {
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct IdentityNodeIlkMap {
+    /// `node_name -> ilk_id`. Populated after a successful `ILK_REGISTER`
+    /// from `register_node_identity`. Read at reconcile-on-boot to inject
+    /// the node's own ILK back into its `systemd-run` env (so the binary
+    /// can put it in `meta.src_ilk` for outgoing vault/identity calls).
     #[serde(default)]
     nodes: HashMap<String, String>,
+    /// `node_name -> tenant_id`. Paired with `nodes`; same lifecycle.
+    /// Read at reconcile-on-boot to inject `FLUXBEE_NODE_TENANT_ID`.
+    /// Entries from older runs without tenant data start empty; the next
+    /// `ILK_REGISTER` for that node fills it in.
+    #[serde(default)]
+    tenants: HashMap<String, String>,
 }
 
 struct OrchestratorState {
@@ -861,7 +871,14 @@ async fn reconcile_persisted_custom_nodes(
             continue;
         }
 
-        let cmd = build_managed_node_run_command(&unit, &node.node_name, &entrypoint.script_path);
+        let (persisted_ilk, persisted_tenant) = load_persisted_node_identity(state, &node.node_name);
+        let cmd = build_managed_node_run_command(
+            &unit,
+            &node.node_name,
+            &entrypoint.script_path,
+            persisted_ilk.as_deref(),
+            persisted_tenant.as_deref(),
+        );
         match execute_on_hive(
             state,
             &state.hive_id,
@@ -9276,12 +9293,27 @@ fn persist_node_ilk_mapping(
     state: &OrchestratorState,
     node_name: &str,
     ilk_id: &str,
+    tenant_id: &str,
 ) -> Result<(), OrchestratorError> {
     parse_prefixed_uuid(ilk_id, "ilk")?;
+    parse_prefixed_uuid(tenant_id, "tnt")?;
     let map_path = node_ilk_map_path(state);
     let mut map = load_identity_node_ilk_map(&map_path);
     map.nodes.insert(node_name.to_string(), ilk_id.to_string());
+    map.tenants
+        .insert(node_name.to_string(), tenant_id.to_string());
     save_identity_node_ilk_map(&map_path, &map)
+}
+
+fn load_persisted_node_identity(
+    state: &OrchestratorState,
+    node_name: &str,
+) -> (Option<String>, Option<String>) {
+    let map = load_identity_node_ilk_map(&node_ilk_map_path(state));
+    (
+        map.nodes.get(node_name).cloned(),
+        map.tenants.get(node_name).cloned(),
+    )
 }
 
 fn derive_ilk_type_for_node(node_name: &str) -> &'static str {
@@ -9801,10 +9833,11 @@ async fn ensure_node_identity_registered(
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| requested_ilk_id.clone());
-    if let Err(err) = persist_node_ilk_mapping(state, node_name, &resolved_ilk_id) {
+    if let Err(err) = persist_node_ilk_mapping(state, node_name, &resolved_ilk_id, &tenant_id) {
         tracing::warn!(
             node_name = node_name,
             ilk_id = resolved_ilk_id,
+            tenant_id = tenant_id,
             error = %err,
             "failed to persist node->ilk mapping"
         );
@@ -11152,6 +11185,7 @@ async fn run_node_flow(
         .and_then(|value| value.get("ilk_id"))
         .and_then(|value| value.as_str())
         .map(str::to_string);
+    let identity_tenant_id = resolve_tenant_id_for_node(payload);
     let identity_update = match identity_ilk_id.as_deref() {
         Some(ilk_id) => {
             match apply_node_identity_update(state, payload, &identity_primary_hive_id, ilk_id)
@@ -11283,7 +11317,13 @@ async fn run_node_flow(
         }
     }
 
-    let cmd = build_managed_node_run_command(&unit, &node_name, &entrypoint.script_path);
+    let cmd = build_managed_node_run_command(
+        &unit,
+        &node_name,
+        &entrypoint.script_path,
+        identity_ilk_id.as_deref(),
+        identity_tenant_id.as_deref(),
+    );
 
     match execute_on_hive(state, &target_hive, &cmd, "run_node") {
         Ok(()) => serde_json::json!({
@@ -11486,23 +11526,33 @@ fn managed_node_launch_plan(
     })
 }
 
-fn managed_node_start_command(plan: &ManagedNodeLaunchPlan) -> String {
+fn managed_node_start_command(state: &OrchestratorState, plan: &ManagedNodeLaunchPlan) -> String {
+    let (ilk_id, tenant_id) = load_persisted_node_identity(state, &plan.node.node_name);
     format!(
         "systemctl reset-failed {unit} || true; {run_cmd}",
         unit = shell_single_quote(&plan.unit),
         run_cmd = build_managed_node_run_command(
             &plan.unit,
             &plan.node.node_name,
-            &plan.entrypoint.script_path
+            &plan.entrypoint.script_path,
+            ilk_id.as_deref(),
+            tenant_id.as_deref(),
         ),
     )
 }
 
-fn managed_node_restart_command(plan: &ManagedNodeLaunchPlan, unit_active: bool) -> String {
+fn managed_node_restart_command(
+    state: &OrchestratorState,
+    plan: &ManagedNodeLaunchPlan,
+    unit_active: bool,
+) -> String {
+    let (ilk_id, tenant_id) = load_persisted_node_identity(state, &plan.node.node_name);
     let run_cmd = build_managed_node_run_command(
         &plan.unit,
         &plan.node.node_name,
         &plan.entrypoint.script_path,
+        ilk_id.as_deref(),
+        tenant_id.as_deref(),
     );
     if unit_active {
         format!(
@@ -11511,7 +11561,7 @@ fn managed_node_restart_command(plan: &ManagedNodeLaunchPlan, unit_active: bool)
             run_cmd = run_cmd,
         )
     } else {
-        managed_node_start_command(plan)
+        managed_node_start_command(state, plan)
     }
 }
 
@@ -11609,9 +11659,9 @@ async fn start_or_restart_node_flow(
     }
 
     let cmd = if restart {
-        managed_node_restart_command(&plan, unit_active)
+        managed_node_restart_command(state, &plan, unit_active)
     } else {
-        managed_node_start_command(&plan)
+        managed_node_start_command(state, &plan)
     };
     let label = if restart {
         "restart_node"
@@ -12175,11 +12225,37 @@ fn execute_on_hive(
     run_cmd(cmd, label)
 }
 
-fn build_managed_node_run_command(unit: &str, node_name: &str, script_path: &str) -> String {
+fn build_managed_node_run_command(
+    unit: &str,
+    node_name: &str,
+    script_path: &str,
+    ilk_id: Option<&str>,
+    tenant_id: Option<&str>,
+) -> String {
+    // The dynamic node (AI.*, IO.*, WF.*) discovers its own ILK + tenant via
+    // `FLUXBEE_NODE_ILK_ID` / `FLUXBEE_NODE_TENANT_ID`, injected here by the
+    // orchestrator after a successful `ILK_REGISTER` to SY.identity. SY system
+    // nodes don't go through this path (they're started by static systemd
+    // units and resolve their own deterministic ILK via SHM), so the extra
+    // env vars are only emitted when provided.
+    let mut extra_env = String::new();
+    if let Some(ilk) = ilk_id.map(str::trim).filter(|v| !v.is_empty()) {
+        extra_env.push_str(&format!(
+            " --setenv=FLUXBEE_NODE_ILK_ID='{}'",
+            shell_single_quote(ilk)
+        ));
+    }
+    if let Some(tnt) = tenant_id.map(str::trim).filter(|v| !v.is_empty()) {
+        extra_env.push_str(&format!(
+            " --setenv=FLUXBEE_NODE_TENANT_ID='{}'",
+            shell_single_quote(tnt)
+        ));
+    }
     format!(
-        "systemd-run --unit {unit} --setenv=FLUXBEE_NODE_NAME='{node_name}' --collect --property Restart=always --property RestartSec=5 '{script_path}'",
+        "systemd-run --unit {unit} --setenv=FLUXBEE_NODE_NAME='{node_name}'{extra_env} --collect --property Restart=always --property RestartSec=5 '{script_path}'",
         unit = shell_single_quote(unit),
         node_name = shell_single_quote(node_name),
+        extra_env = extra_env,
         script_path = shell_single_quote(script_path),
     )
 }
@@ -15863,7 +15939,8 @@ blob:
             },
         };
 
-        let command = managed_node_restart_command(&plan, true);
+        let state = sample_orchestrator_state_for_tests();
+        let command = managed_node_restart_command(&state, &plan, true);
         assert!(command.contains("systemctl restart"));
         assert!(command.contains("systemd-run --unit"));
         assert!(command.contains("FLUXBEE_NODE_NAME='WF.invoice@motherbee'"));
@@ -16228,11 +16305,35 @@ blob:
             "fluxbee-node-AI.demo-motherbee",
             "AI.demo@motherbee",
             "/var/lib/fluxbee/dist/runtimes/ai.demo/1.0.0/bin/start.sh",
+            None,
+            None,
         );
 
         assert!(cmd.contains("--setenv=FLUXBEE_NODE_NAME='AI.demo@motherbee'"));
         assert!(cmd.contains("systemd-run --unit fluxbee-node-AI.demo-motherbee"));
         assert!(cmd.contains("'/var/lib/fluxbee/dist/runtimes/ai.demo/1.0.0/bin/start.sh'"));
+        // When ilk/tenant are None, the env vars are NOT emitted (SY managed
+        // by static units take this path, not dynamic spawn).
+        assert!(!cmd.contains("FLUXBEE_NODE_ILK_ID"));
+        assert!(!cmd.contains("FLUXBEE_NODE_TENANT_ID"));
+    }
+
+    #[test]
+    fn build_managed_node_run_command_injects_ilk_and_tenant_when_provided() {
+        let cmd = build_managed_node_run_command(
+            "fluxbee-node-AI.demo-motherbee",
+            "AI.demo@motherbee",
+            "/var/lib/fluxbee/dist/runtimes/ai.demo/1.0.0/bin/start.sh",
+            Some("ilk:11111111-2222-3333-4444-555555555555"),
+            Some("tnt:00000000-0000-0000-0000-000000000001"),
+        );
+
+        assert!(cmd.contains(
+            "--setenv=FLUXBEE_NODE_ILK_ID='ilk:11111111-2222-3333-4444-555555555555'"
+        ));
+        assert!(cmd.contains(
+            "--setenv=FLUXBEE_NODE_TENANT_ID='tnt:00000000-0000-0000-0000-000000000001'"
+        ));
     }
 
     #[test]

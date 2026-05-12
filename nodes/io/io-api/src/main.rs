@@ -262,6 +262,9 @@ async fn main() -> Result<()> {
         config.listen_addr = boot_listen_addr;
     }
 
+    // Phase J'-0a: self ILK + tenant from orchestrator-injected env vars.
+    let self_ilk_id = fluxbee_sdk::read_self_ilk_from_env();
+    let self_tenant_id = fluxbee_sdk::read_self_tenant_from_env();
     tracing::info!(
         node_name = %config.node_name,
         runtime_version = %config.node_version,
@@ -270,6 +273,8 @@ async fn main() -> Result<()> {
         router_socket = %config.router_socket.display(),
         state_dir = %config.state_dir.display(),
         spawn_config_path = %config.spawn_config_path.display(),
+        self_ilk_id = ?self_ilk_id,
+        self_tenant_id = ?self_tenant_id,
         "io-api starting"
     );
 

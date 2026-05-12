@@ -254,11 +254,16 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,io_linkedhelper=info,fluxbee_sdk=info"));
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
+    // Phase J'-0a: self ILK + tenant from orchestrator-injected env vars.
+    let self_ilk_id = fluxbee_sdk::read_self_ilk_from_env();
+    let self_tenant_id = fluxbee_sdk::read_self_tenant_from_env();
     tracing::info!(
         node_name = %config.node_name,
         router_socket = %config.router_socket.display(),
         state_dir = %config.state_dir.display(),
         listen_addr = %config.listen_addr,
+        self_ilk_id = ?self_ilk_id,
+        self_tenant_id = ?self_tenant_id,
         "io-linkedhelper starting"
     );
 
