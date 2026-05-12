@@ -54,9 +54,9 @@ use fluxbee_sdk::{
     admin_command, build_node_config_response_message, build_node_secret_record, connect,
     list_ich_options_from_hive_config, load_node_secret_record_with_root,
     redacted_node_secret_record, save_node_secret_record_with_root, try_handle_default_node_status,
-    vault_get_with_retry, AdminCommandRequest, IdentityIchOption, NodeConfig, NodeError,
-    NodeReceiver, NodeSecretDescriptor, NodeSecretError, NodeSecretRecord, NodeSecretWriteOptions,
-    NodeSender, VaultRetryPolicy, NODE_SECRET_REDACTION_TOKEN, VAULT_REF_PREFIX,
+    AdminCommandRequest, IdentityIchOption, NodeConfig, NodeError, NodeReceiver,
+    NodeSecretDescriptor, NodeSecretError, NodeSecretRecord, NodeSecretWriteOptions, NodeSender,
+    VaultRetryPolicy, NODE_SECRET_REDACTION_TOKEN, VAULT_REF_PREFIX,
 };
 use futures::TryStreamExt;
 use json_router::runtime_manifest::{
@@ -323,6 +323,7 @@ const HANDBOOK_CANDIDATE_PATHS: &[&str] = &[
 struct ArchitectState {
     hive_id: String,
     node_name: String,
+    self_ilk_id: String,
     listen: String,
     config_dir: PathBuf,
     state_dir: PathBuf,
@@ -4805,7 +4806,7 @@ async fn main() -> Result<(), ArchitectError> {
     let hive = load_hive(&config_dir)?;
     let node_config = load_architect_node_config(&hive.hive_id)?;
     let node_name = architect_node_name(&hive.hive_id);
-    let _self_ilk_id = fluxbee_sdk::identity::wait_for_self_system_ilk_id(
+    let self_ilk_id = fluxbee_sdk::identity::wait_for_self_system_ilk_id(
         &config_dir,
         "SY.architect",
         Duration::from_secs(30),
@@ -4816,11 +4817,12 @@ async fn main() -> Result<(), ArchitectError> {
     })?;
     tracing::info!(
         node_name = %node_name,
-        self_ilk_id = %_self_ilk_id,
+        self_ilk_id = %self_ilk_id,
         "resolved self system ILK from identity SHM"
     );
     let ai_runtime = build_architect_ai_runtime(
         &node_name,
+        &self_ilk_id,
         node_config.as_ref(),
         &hive,
         &config_dir,
@@ -4873,6 +4875,7 @@ async fn main() -> Result<(), ArchitectError> {
     let state = Arc::new(ArchitectState {
         hive_id: hive.hive_id.clone(),
         node_name: node_name.clone(),
+        self_ilk_id: self_ilk_id.clone(),
         listen: listen.clone(),
         config_dir,
         state_dir,
@@ -4991,6 +4994,7 @@ fn architect_config_path(hive_id: &str) -> PathBuf {
 
 async fn build_architect_ai_runtime(
     node_name: &str,
+    self_ilk_id: &str,
     config: Option<&ArchitectNodeConfigFile>,
     hive: &HiveFile,
     config_dir: &Path,
@@ -5011,8 +5015,15 @@ async fn build_architect_ai_runtime(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        match resolve_architect_openai_api_key_from_vault(config_dir, state_dir, hive, api_key_ref)
-            .await
+        match resolve_architect_openai_api_key_from_vault(
+            config_dir,
+            state_dir,
+            hive,
+            node_name,
+            self_ilk_id,
+            api_key_ref,
+        )
+        .await
         {
             Ok(api_key) => api_key,
             Err(err) => {
@@ -5122,9 +5133,10 @@ async fn resolve_architect_openai_api_key_from_vault(
     config_dir: &Path,
     state_dir: &Path,
     hive: &HiveFile,
+    node_name: &str,
+    self_ilk_id: &str,
     api_key_ref: &str,
 ) -> Result<String, ArchitectError> {
-    let key = fluxbee_sdk::parse_vault_ref(api_key_ref)?;
     let node_config = NodeConfig {
         name: "SY.architect".to_string(),
         router_socket: json_router::paths::router_socket_dir(),
@@ -5140,17 +5152,19 @@ async fn resolve_architect_openai_api_key_from_vault(
         max_delay: Duration::from_secs(1),
         jitter_ratio: 0.20,
     };
-    let response = vault_get_with_retry(
+    let caller = fluxbee_sdk::VaultCaller::new(self_ilk_id, node_name);
+    let value = fluxbee_sdk::resolve_vault_ref(
         &sender,
         &mut receiver,
-        &format!("SY.vault@{}", hive.hive_id),
-        key,
+        caller,
+        &hive.hive_id,
+        api_key_ref,
         policy,
     )
     .await;
     let _ = sender.close().await;
-    let response = response?;
-    vault_response_openai_api_key(&response.value)
+    let value = value?;
+    vault_response_openai_api_key(&Some(value))
 }
 
 fn vault_response_openai_api_key(value: &Option<Value>) -> Result<String, ArchitectError> {
@@ -5194,6 +5208,7 @@ async fn refresh_architect_ai_runtime(state: &ArchitectState) -> Result<bool, Ar
     let node_config = load_architect_node_config(&hive.hive_id)?;
     let runtime = build_architect_ai_runtime(
         &state.node_name,
+        &state.self_ilk_id,
         node_config.as_ref(),
         &hive,
         &state.config_dir,

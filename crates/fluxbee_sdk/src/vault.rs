@@ -220,6 +220,35 @@ pub enum VaultError {
     Service { code: String, message: String },
     #[error("invalid vault ref")]
     InvalidVaultRef,
+    #[error("vault response missing value field for key={key}")]
+    EmptyValue { key: String },
+}
+
+/// Identity of the caller of a vault L2 action.
+///
+/// Both fields are mandatory:
+/// - `src_ilk`: caller's own ILK (`ilk:<uuid>`), resolved at boot from
+///   identity SHM via `fluxbee_sdk::identity::wait_for_self_system_ilk_id`.
+///   Vault uses it to look up the caller's `tenant_id` and `ilk_type` for
+///   same-tenant/owner authorisation (vault spec D1, VA-D2/D4/D5).
+/// - `src_l2_name`: caller's full L2 name (`SY.foo@motherbee`), used by vault
+///   for the `SY.admin@*` / `SY.architect@*` override fast-path (VA-D3).
+///
+/// Callers that omit these will be rejected by vault for any tenant-scoped
+/// auth path. The override fast-path only covers admin/architect.
+#[derive(Debug, Clone, Copy)]
+pub struct VaultCaller<'a> {
+    pub src_ilk: &'a str,
+    pub src_l2_name: &'a str,
+}
+
+impl<'a> VaultCaller<'a> {
+    pub fn new(src_ilk: &'a str, src_l2_name: &'a str) -> Self {
+        Self {
+            src_ilk,
+            src_l2_name,
+        }
+    }
 }
 
 pub fn parse_vault_ref(value: &str) -> Result<&str, VaultError> {
@@ -236,6 +265,7 @@ pub fn parse_vault_ref(value: &str) -> Result<&str, VaultError> {
 pub async fn vault_get(
     sender: &NodeSender,
     receiver: &mut NodeReceiver,
+    caller: VaultCaller<'_>,
     target: &str,
     key: &str,
     timeout: Duration,
@@ -243,8 +273,16 @@ pub async fn vault_get(
     let payload = json!(VaultGetRequest {
         key: key.to_string()
     });
-    let response =
-        send_action_once(sender, receiver, target, MSG_VAULT_GET, payload, timeout).await?;
+    let response = send_action_once(
+        sender,
+        receiver,
+        caller,
+        target,
+        MSG_VAULT_GET,
+        payload,
+        timeout,
+    )
+    .await?;
     let parsed: VaultGetResponse = serde_json::from_value(response)?;
     ensure_ok(
         &parsed.status,
@@ -257,6 +295,7 @@ pub async fn vault_get(
 pub async fn vault_get_metadata(
     sender: &NodeSender,
     receiver: &mut NodeReceiver,
+    caller: VaultCaller<'_>,
     target: &str,
     key: &str,
     timeout: Duration,
@@ -267,6 +306,7 @@ pub async fn vault_get_metadata(
     let response = send_action_once(
         sender,
         receiver,
+        caller,
         target,
         MSG_VAULT_GET_METADATA,
         payload,
@@ -285,6 +325,7 @@ pub async fn vault_get_metadata(
 pub async fn vault_put(
     sender: &NodeSender,
     receiver: &mut NodeReceiver,
+    caller: VaultCaller<'_>,
     target: &str,
     request: VaultPutRequest,
     timeout: Duration,
@@ -292,6 +333,7 @@ pub async fn vault_put(
     let response = send_action_once(
         sender,
         receiver,
+        caller,
         target,
         MSG_VAULT_PUT,
         json!(request),
@@ -310,13 +352,22 @@ pub async fn vault_put(
 pub async fn vault_list(
     sender: &NodeSender,
     receiver: &mut NodeReceiver,
+    caller: VaultCaller<'_>,
     target: &str,
     filter: Option<VaultFilter>,
     timeout: Duration,
 ) -> Result<VaultListResponse, VaultError> {
     let payload = json!(VaultListRequest { filter });
-    let response =
-        send_action_once(sender, receiver, target, MSG_VAULT_LIST, payload, timeout).await?;
+    let response = send_action_once(
+        sender,
+        receiver,
+        caller,
+        target,
+        MSG_VAULT_LIST,
+        payload,
+        timeout,
+    )
+    .await?;
     let parsed: VaultListResponse = serde_json::from_value(response)?;
     ensure_ok(
         &parsed.status,
@@ -329,6 +380,7 @@ pub async fn vault_list(
 pub async fn vault_delete(
     sender: &NodeSender,
     receiver: &mut NodeReceiver,
+    caller: VaultCaller<'_>,
     target: &str,
     key: &str,
     timeout: Duration,
@@ -336,8 +388,16 @@ pub async fn vault_delete(
     let payload = json!(VaultKeyRequest {
         key: key.to_string()
     });
-    let response =
-        send_action_once(sender, receiver, target, MSG_VAULT_DELETE, payload, timeout).await?;
+    let response = send_action_once(
+        sender,
+        receiver,
+        caller,
+        target,
+        MSG_VAULT_DELETE,
+        payload,
+        timeout,
+    )
+    .await?;
     let parsed: VaultDeleteResponse = serde_json::from_value(response)?;
     ensure_ok(
         &parsed.status,
@@ -350,6 +410,7 @@ pub async fn vault_delete(
 pub async fn vault_rotate(
     sender: &NodeSender,
     receiver: &mut NodeReceiver,
+    caller: VaultCaller<'_>,
     target: &str,
     key: &str,
     value: Value,
@@ -359,8 +420,16 @@ pub async fn vault_rotate(
         key: key.to_string(),
         value
     });
-    let response =
-        send_action_once(sender, receiver, target, MSG_VAULT_ROTATE, payload, timeout).await?;
+    let response = send_action_once(
+        sender,
+        receiver,
+        caller,
+        target,
+        MSG_VAULT_ROTATE,
+        payload,
+        timeout,
+    )
+    .await?;
     let parsed: VaultRotateResponse = serde_json::from_value(response)?;
     ensure_ok(
         &parsed.status,
@@ -373,6 +442,7 @@ pub async fn vault_rotate(
 pub async fn vault_rollback(
     sender: &NodeSender,
     receiver: &mut NodeReceiver,
+    caller: VaultCaller<'_>,
     target: &str,
     key: &str,
     timeout: Duration,
@@ -383,6 +453,7 @@ pub async fn vault_rollback(
     let response = send_action_once(
         sender,
         receiver,
+        caller,
         target,
         MSG_VAULT_ROLLBACK,
         payload,
@@ -401,6 +472,7 @@ pub async fn vault_rollback(
 pub async fn vault_get_with_retry(
     sender: &NodeSender,
     receiver: &mut NodeReceiver,
+    caller: VaultCaller<'_>,
     target: &str,
     key_or_ref: &str,
     policy: VaultRetryPolicy,
@@ -415,6 +487,7 @@ pub async fn vault_get_with_retry(
         match vault_get(
             sender,
             receiver,
+            caller,
             target,
             &key,
             delay.min(Duration::from_secs(5)),
@@ -430,6 +503,32 @@ pub async fn vault_get_with_retry(
             Err(err) => return Err(err),
         }
     }
+}
+
+/// Resolve a `vault://<key>` reference to its stored plaintext value.
+///
+/// Wrapper over `parse_vault_ref` + `vault_get_with_retry` that's the single
+/// entry-point Phase J consumers (`ai.generic`, `sy.cognition`, `sy.architect`,
+/// `sy.admin`, `sy.identity`, `sy.storage`) should call when they need to read
+/// a secret. Targets `SY.vault@<hive_id>` automatically. The caller decides
+/// what "degraded" means when this returns `Err` (most callers should log
+/// and continue with their service in degraded mode).
+///
+/// Returns the raw `value` JSON the secret was stored as (often
+/// `{"<field>": "<plaintext>"}` for nested secrets, or a plain string).
+pub async fn resolve_vault_ref(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    caller: VaultCaller<'_>,
+    hive_id: &str,
+    vault_ref: &str,
+    policy: VaultRetryPolicy,
+) -> Result<Value, VaultError> {
+    let key = parse_vault_ref(vault_ref)?.to_string();
+    let target = format!("SY.vault@{}", hive_id);
+    let response =
+        vault_get_with_retry(sender, receiver, caller, &target, &key, policy).await?;
+    response.value.ok_or(VaultError::EmptyValue { key })
 }
 
 fn ensure_ok(
@@ -479,6 +578,7 @@ fn jittered_delay(delay: Duration, ratio: f64) -> Duration {
 async fn send_action_once(
     sender: &NodeSender,
     receiver: &mut NodeReceiver,
+    caller: VaultCaller<'_>,
     target: &str,
     action: &str,
     payload: Value,
@@ -488,7 +588,7 @@ async fn send_action_once(
     let msg = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
-            src_l2_name: None,
+            src_l2_name: Some(caller.src_l2_name.to_string()),
             dst: Destination::Unicast(target.to_string()),
             ttl: 16,
             trace_id: trace_id.clone(),
@@ -496,6 +596,8 @@ async fn send_action_once(
         meta: Meta {
             msg_type: SYSTEM_KIND.to_string(),
             msg: Some(action.to_string()),
+            src_ilk: Some(caller.src_ilk.to_string()),
+            target: Some(target.to_string()),
             ..Meta::default()
         },
         payload,
