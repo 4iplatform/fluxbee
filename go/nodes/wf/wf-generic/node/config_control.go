@@ -117,29 +117,53 @@ func buildWFConfigGetPayload(nodeName string, cfg *Config) map[string]any {
 	if cfg == nil {
 		state = "unconfigured"
 	}
+	managedPackage := IsManagedPackageMode(cfg)
+	workflowSource := "config"
+	packagePath := ""
+	packageDefPath := ""
+	if managedPackage {
+		workflowSource = "managed_package"
+		packagePath = managedPackagePath(cfg)
+		packageDefPath = PackageDefinitionPath(cfg)
+	}
+	effectiveConfig := map[string]any{
+		"workflow_definition_path":        stringOrEmpty(cfg, func(c *Config) string { return c.WorkflowDefinitionPath }),
+		"workflow_definition_source":      workflowSource,
+		"db_path":                         stringOrEmpty(cfg, func(c *Config) string { return c.DBPath }),
+		"sy_timer_l2_name":                stringOrEmpty(cfg, func(c *Config) string { return c.SYTimerL2Name }),
+		"tenant_id":                       stringOrEmpty(cfg, func(c *Config) string { return c.TenantID }),
+		"gc_retention_days":               intOrZero(cfg, func(c *Config) int { return c.GCRetentionDays }),
+		"gc_interval_seconds":             intOrZero(cfg, func(c *Config) int { return c.GCIntervalSeconds }),
+		"managed_package_mode":            managedPackage,
+		"package_path":                    packagePath,
+		"package_definition_path":         packageDefPath,
+	}
+	contract := map[string]any{
+		"supports":               []string{sdk.MSGConfigGet, sdk.MSGConfigSet},
+		"target":                 sdk.NodeConfigControlTarget,
+		"schema_version":         wfConfigSchemaVersion,
+		"apply_modes":            []string{sdk.NodeConfigApplyModeReplace},
+		"config_schema":          "wf_runtime_config_v1",
+		"boot_time_only":         true,
+		"restart_required":       true,
+		"package_native_binding": managedPackage,
+	}
+	if managedPackage {
+		contract["workflow_definition_path_locked"] = true
+		contract["notes"] = []string{
+			"workflow_definition_path is package-native in managed mode: derived from _system.package_path/flow/definition.json.",
+			"CONFIG_SET attempts to mutate workflow_definition_path are rejected with MANAGED_PACKAGE_PATH_LOCKED.",
+			"Operator-facing source of truth in managed mode is the workflow package, not the local config field.",
+		}
+	}
 	return map[string]any{
-		"ok":             true,
-		"node_name":      nodeName,
-		"state":          state,
-		"schema_version": wfConfigSchemaVersion,
-		"config_version": version,
-		"effective_config": map[string]any{
-			"workflow_definition_path": stringOrEmpty(cfg, func(c *Config) string { return c.WorkflowDefinitionPath }),
-			"db_path":                  stringOrEmpty(cfg, func(c *Config) string { return c.DBPath }),
-			"sy_timer_l2_name":         stringOrEmpty(cfg, func(c *Config) string { return c.SYTimerL2Name }),
-			"tenant_id":                stringOrEmpty(cfg, func(c *Config) string { return c.TenantID }),
-			"gc_retention_days":        intOrZero(cfg, func(c *Config) int { return c.GCRetentionDays }),
-			"gc_interval_seconds":      intOrZero(cfg, func(c *Config) int { return c.GCIntervalSeconds }),
-		},
-		"contract": map[string]any{
-			"supports":         []string{sdk.MSGConfigGet, sdk.MSGConfigSet},
-			"target":           sdk.NodeConfigControlTarget,
-			"schema_version":   wfConfigSchemaVersion,
-			"apply_modes":      []string{sdk.NodeConfigApplyModeReplace},
-			"config_schema":    "wf_runtime_config_v1",
-			"boot_time_only":   true,
-			"restart_required": true,
-		},
+		"ok":               true,
+		"node_name":        nodeName,
+		"state":            state,
+		"schema_version":   wfConfigSchemaVersion,
+		"config_version":   version,
+		"effective_config": effectiveConfig,
+		"contract":         contract,
 	}
 }
 
@@ -156,6 +180,26 @@ func applyWFConfigSet(configPath, nodeName string, current *Config, request *sdk
 	}
 	if _, exists := configMap["_system"]; exists {
 		return wfConfigErrorPayload(nodeName, "INVALID_CONFIG_SET", "_system is managed by orchestrator and cannot be changed via CONFIG_SET", request.ConfigVersion), nil, nil
+	}
+	// Package-native binding: when running as a managed workflow package the
+	// definition path is derived from `_system.package_path/flow/definition.json`
+	// and is not operator-controlled. A CONFIG_SET attempt to mutate it (to a
+	// value other than the package-resolved path) is rejected up-front so the
+	// operator gets a clear error instead of a silently-ignored field.
+	if IsManagedPackageMode(current) {
+		if raw, exists := configMap["workflow_definition_path"]; exists {
+			supplied, _ := raw.(string)
+			supplied = strings.TrimSpace(supplied)
+			expected := PackageDefinitionPath(current)
+			if supplied != "" && supplied != expected {
+				return wfConfigErrorPayload(
+					nodeName,
+					"MANAGED_PACKAGE_PATH_LOCKED",
+					fmt.Sprintf("workflow_definition_path is package-native in managed mode (expected %q, got %q); CONFIG_SET cannot mutate it. Republish the workflow package to change the definition.", expected, supplied),
+					request.ConfigVersion,
+				), nil, nil
+			}
+		}
 	}
 	if len(configMap) == 0 {
 		return wfConfigErrorPayload(nodeName, "INVALID_CONFIG_SET", "config must not be empty", request.ConfigVersion), nil, nil

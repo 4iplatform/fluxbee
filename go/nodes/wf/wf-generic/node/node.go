@@ -90,10 +90,18 @@ func finalizeConfig(cfg *Config, configPath string) error {
 		}
 	}
 
-	if cfg.WorkflowDefinitionPath == "" {
-		if pkgPath := managedPackagePath(cfg); pkgPath != "" {
-			cfg.WorkflowDefinitionPath = filepath.Join(pkgPath, "flow", "definition.json")
+	// In managed package mode (`_system.package_path` set), the workflow
+	// definition is package-native: `<package_path>/flow/definition.json` is
+	// the single source of truth. Any `workflow_definition_path` value in
+	// the config is ignored (compat-only; the operator should not be setting
+	// it). Local-dev / smoke mode (no `_system.package_path`) still uses
+	// `workflow_definition_path` as the canonical control.
+	if pkgPath := managedPackagePath(cfg); pkgPath != "" {
+		packageDefPath := filepath.Join(pkgPath, "flow", "definition.json")
+		if cfg.WorkflowDefinitionPath != "" && cfg.WorkflowDefinitionPath != packageDefPath {
+			log.Printf("wf-generic: managed package mode active; ignoring workflow_definition_path=%q and using package-native %q", cfg.WorkflowDefinitionPath, packageDefPath)
 		}
+		cfg.WorkflowDefinitionPath = packageDefPath
 	}
 	if cfg.DBPath == "" && configPath != "" {
 		cfg.DBPath = filepath.Join(filepath.Dir(configPath), "wf_instances.db")
@@ -104,7 +112,7 @@ func finalizeConfig(cfg *Config, configPath string) error {
 		}
 	}
 	if cfg.WorkflowDefinitionPath == "" {
-		return fmt.Errorf("config: workflow_definition_path is required")
+		return fmt.Errorf("config: workflow_definition_path is required (or set _system.package_path for managed mode)")
 	}
 	if cfg.DBPath == "" {
 		return fmt.Errorf("config: db_path is required")
@@ -218,7 +226,25 @@ func managedPackagePath(cfg *Config) string {
 	if cfg == nil || cfg.System == nil {
 		return ""
 	}
-	return cfg.System.PackagePath
+	return strings.TrimSpace(cfg.System.PackagePath)
+}
+
+// IsManagedPackageMode reports whether the node is running as a managed
+// workflow package — i.e. orchestrator stamped `_system.package_path` and
+// the workflow definition is `<package_path>/flow/definition.json` (not
+// operator-controlled via `workflow_definition_path`).
+func IsManagedPackageMode(cfg *Config) bool {
+	return managedPackagePath(cfg) != ""
+}
+
+// PackageDefinitionPath returns the package-native definition.json path
+// for managed mode, or "" when not in managed mode.
+func PackageDefinitionPath(cfg *Config) string {
+	pkg := managedPackagePath(cfg)
+	if pkg == "" {
+		return ""
+	}
+	return filepath.Join(pkg, "flow", "definition.json")
 }
 
 // RunOptions is the full set of options for node.Run().

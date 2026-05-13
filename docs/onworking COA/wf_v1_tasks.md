@@ -456,7 +456,7 @@ go/nodes/wf/wf-generic/
 - [x] Timer upsert updates fire_at on re-registration
 - [x] ListAllExpectedTimers across multiple instances
 - [x] Internal event queue CRUD (enqueue, list FIFO, delete consumed)
-- [ ] Internal event queue rows participate correctly in schema migration
+- [x] Internal event queue rows participate correctly in schema migration (`TestEnsureWFSchemaMigratesV1ToCurrentAddsInternalEventQueue` — builds a v1 fixture by hand, runs `ensureWFSchema`, asserts table+index appear, pre-migration data survives, queue CRUD works for legacy instances, and re-migration is idempotent)
 - [x] Atomic commit test: instance update + internal event enqueue/delete commit together
 
 ### WF-TEST-6 — Restart recovery unit tests (in-memory SQLite + mock timer client)
@@ -470,7 +470,7 @@ go/nodes/wf/wf-generic/
 - [x] TIMER_LIST failure → error returned (hard dependency enforced)
 - [x] Pending internal events are loaded and drained on restart before steady-state receive loop
 - [x] Crash after queueing internal event but before draining it → restart resumes and processes it exactly once from durable queue
-- [ ] Crash during consumption transition leaves instance + internal queue in a recoverable pre-commit state
+- [x] Crash during consumption transition leaves instance + internal queue in a recoverable pre-commit state (`TestCrashDuringConsumptionTransitionLeavesQueueAndInstanceInPreCommitState` — picks event with `GetNextInternalEvent`, computes planned mutation, closes the store before `CommitInstanceMutation` to simulate crash, reopens and asserts: instance row unchanged, EV1 still queued with same event_id, retry commit with same mutation completes the transition exactly once)
 
 ### WF-TEST-7 — Integration test against real SY.timer v1.1
 - [ ] End-to-end: WF.invoice instance through complete flow with real SY.timer
@@ -504,18 +504,19 @@ go/nodes/wf/wf-generic/
 - [x] Added `scripts/publish-wf-invoice-package.sh` and package fixture `go/nodes/wf/examples/packages/wf.invoice/`
 
 ### WF-BUILD-3 — Package-native contract hardening
-- [ ] Treat `workflow_definition_path` as compatibility/local-dev input only, not as the canonical managed-runtime contract
-- [ ] In managed package mode (`_system.package_path` present), document and enforce that workflow code comes from `_system.package_path/flow/definition.json`
-- [ ] In `CONFIG_SET`, reject attempts to mutate `workflow_definition_path` when the node is running as a managed workflow package
-- [ ] Keep rejecting `_system` mutations via `CONFIG_SET`; managed runtime/package metadata remains orchestrator-owned
-- [ ] Update `CONFIG_GET` / effective config response so the package-native source of truth is visible and `workflow_definition_path` is not presented as the primary operator-facing control in managed mode
+
+- [x] Treat `workflow_definition_path` as compatibility/local-dev input only, not as the canonical managed-runtime contract. **Done** — `finalizeConfig` in `node.go` now overrides any operator-supplied `workflow_definition_path` whenever `_system.package_path` is set, logging a warning if the supplied value differs from the package-native one.
+- [x] In managed package mode (`_system.package_path` present), document and enforce that workflow code comes from `_system.package_path/flow/definition.json`. **Done** — `IsManagedPackageMode` and `PackageDefinitionPath` helpers expose the contract; `finalizeConfig` enforces it.
+- [x] In `CONFIG_SET`, reject attempts to mutate `workflow_definition_path` when the node is running as a managed workflow package. **Done** — `applyWFConfigSet` returns `MANAGED_PACKAGE_PATH_LOCKED` when the supplied value differs from the package-resolved path. Idempotent set (same value) is accepted.
+- [x] Keep rejecting `_system` mutations via `CONFIG_SET`; managed runtime/package metadata remains orchestrator-owned. (Already enforced pre-J'; verified in tests.)
+- [x] Update `CONFIG_GET` / effective config response so the package-native source of truth is visible and `workflow_definition_path` is not presented as the primary operator-facing control in managed mode. **Done** — `buildWFConfigGetPayload` adds `managed_package_mode`, `workflow_definition_source` (`managed_package`|`config`), `package_path`, `package_definition_path` to `effective_config`; `contract` gains `package_native_binding`, `workflow_definition_path_locked`, and operator-facing notes when in managed mode.
 - [x] Reuse the shared `go/pkg/wfcel` package for guard validation / CEL environment setup so `sy.wf-rules` and `wf-generic` cannot drift
 - [x] `WF_LIST_INSTANCES` with `limit = 0` means unbounded count/listing so `SY.wf-rules` can query active instances safely
-- [ ] Add tests covering:
-  - managed package mode resolves definition from `_system.package_path`
-  - `CONFIG_SET` in managed package mode refuses `workflow_definition_path` mutation
-  - `CONFIG_GET` in managed package mode clearly reflects package-native binding
-  - local-dev / smoke mode with explicit `workflow_definition_path` still works when no managed package binding exists
+- [x] Add tests covering:
+  - managed package mode resolves definition from `_system.package_path` (`TestManagedPackageModeResolvesDefinitionFromPackagePath`)
+  - `CONFIG_SET` in managed package mode refuses `workflow_definition_path` mutation (`TestApplyWFConfigSetRejectsWorkflowDefinitionPathMutationInManagedMode` + idempotent-OK companion `TestApplyWFConfigSetAcceptsMatchingPackagePathInManagedMode`)
+  - `CONFIG_GET` in managed package mode clearly reflects package-native binding (`TestBuildWFConfigGetPayloadReflectsPackageNativeBindingInManagedMode`)
+  - local-dev / smoke mode with explicit `workflow_definition_path` still works when no managed package binding exists (`TestLocalDevModeWorkflowDefinitionPathRemainsMutable`)
 
 ---
 
