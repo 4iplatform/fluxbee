@@ -713,8 +713,8 @@ pub async fn resolve_resource(
         }
     }
 
-    // (2) Pool (no owner_ilk).
-    let value = list_then_get_first(
+    // (2) Pool del tenant del caller.
+    if let Some(value) = list_then_get_first(
         sender,
         receiver,
         caller,
@@ -724,8 +724,32 @@ pub async fn resolve_resource(
         Some(String::new()),
         timeout,
     )
-    .await?;
-    Ok(value)
+    .await?
+    {
+        return Ok(Some(value));
+    }
+
+    // (3) Pool `sys` — hive-wide shared secrets for system services.
+    // Skip if the caller already lives in `sys` (would be a duplicate
+    // of the previous query).
+    if my_tenant != "sys" {
+        if let Some(value) = list_then_get_first(
+            sender,
+            receiver,
+            caller,
+            &target,
+            &resource_str,
+            "sys",
+            Some(String::new()),
+            timeout,
+        )
+        .await?
+        {
+            return Ok(Some(value));
+        }
+    }
+
+    Ok(None)
 }
 
 async fn list_then_get_first(

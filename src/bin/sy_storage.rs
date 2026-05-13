@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use tokio::time;
 use tokio_postgres::{error::SqlState, Client, Config as PgConfig, GenericClient, NoTls};
 use tracing_subscriber::EnvFilter;
@@ -19,11 +19,9 @@ use fluxbee_sdk::nats::{
 };
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{
-    build_node_config_response_message, build_node_secret_record, connect, load_node_secret_record,
-    managed_node_config_path, managed_node_name, save_node_secret_record,
-    try_handle_default_node_status, NodeConfig, NodeReceiver, NodeSecretDescriptor,
-    NodeSecretWriteOptions, NodeSender, NodeUuidMode, NODE_CONFIG_APPLY_MODE_REPLACE,
-    NODE_SECRET_REDACTION_TOKEN,
+    build_node_config_response_message, connect, managed_node_config_path, managed_node_name,
+    try_handle_default_node_status, NodeConfig, NodeReceiver, NodeSender, NodeUuidMode,
+    NODE_CONFIG_APPLY_MODE_REPLACE,
 };
 use fluxbee_sdk::{
     CognitionContextData, CognitionCooccurrenceData, CognitionDurableEntity,
@@ -67,7 +65,6 @@ const STORAGE_METRICS_QUERY_SID: u32 = 19;
 const STORAGE_DB_NAME: &str = "fluxbee_storage";
 const STORAGE_NODE_BASE_NAME: &str = "SY.storage";
 const STORAGE_NODE_VERSION: &str = "2.0";
-const STORAGE_LOCAL_REF_KEY_POSTGRES_URL: &str = "postgres_url_ref";
 const STORAGE_CONFIG_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +230,9 @@ async fn main() -> Result<(), StorageError> {
     };
     let socket_dir = json_router::paths::router_socket_dir();
     let state_dir = json_router::paths::state_dir();
+    // SY.storage is a system node; its tenant is the hive's root tenant.
+    // For Model D' pool match, both that tenant and `sys` are searched.
+    let my_tenant = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
     let (database_url, db_secret_source, vault_lookup_error) = resolve_database_url(
         &config_dir,
         &state_dir,
@@ -240,6 +240,7 @@ async fn main() -> Result<(), StorageError> {
         &hive.hive_id,
         &node_name,
         &self_ilk_id,
+        my_tenant,
     )
     .await;
     if let Some(err) = vault_lookup_error.as_deref() {
@@ -2379,10 +2380,8 @@ async fn resolve_database_url(
     hive_id: &str,
     node_name: &str,
     self_ilk_id: &str,
+    my_tenant: &str,
 ) -> (Option<String>, StorageDbSecretSource, Option<String>) {
-    let Some(ref_str) = load_local_postgres_url_ref(node_name) else {
-        return (None, StorageDbSecretSource::Missing, None);
-    };
     let node_config = NodeConfig {
         name: STORAGE_NODE_BASE_NAME.to_string(),
         router_socket: socket_dir.to_path_buf(),
@@ -2404,40 +2403,33 @@ async fn resolve_database_url(
         }
     };
     let caller = fluxbee_sdk::VaultCaller::new(self_ilk_id, node_name);
-    let policy = fluxbee_sdk::VaultRetryPolicy {
-        max_elapsed: Duration::from_secs(30),
-        initial_delay: Duration::from_millis(250),
-        max_delay: Duration::from_secs(2),
-        jitter_ratio: 0.20,
-    };
-    let result = fluxbee_sdk::resolve_vault_ref(
+    let result = fluxbee_sdk::resolve_resource(
         &sender,
         &mut receiver,
         caller,
         hive_id,
-        &ref_str,
-        policy,
+        fluxbee_sdk::ResourceType::Postgres,
+        my_tenant,
+        Duration::from_secs(5),
     )
     .await;
     let _ = sender.close().await;
     match result {
-        Ok(value) => match extract_postgres_url_from_vault_value(&value) {
+        Ok(Some(value)) => match extract_postgres_url_from_vault_value(&value) {
             Some(url) => (Some(url), StorageDbSecretSource::LocalFile, None),
             None => (
                 None,
                 StorageDbSecretSource::Missing,
                 Some(
-                    "vault value for postgres_url_ref did not contain a valid postgres URL"
-                        .to_string(),
+                    "vault postgres secret did not carry a usable URL value".to_string(),
                 ),
             ),
         },
+        Ok(None) => (None, StorageDbSecretSource::Missing, None),
         Err(err) => (
             None,
             StorageDbSecretSource::Missing,
-            Some(format!(
-                "vault lookup for postgres_url_ref={ref_str} failed: {err}"
-            )),
+            Some(format!("vault resource lookup for postgres failed: {err}")),
         ),
     }
 }
@@ -3035,15 +3027,12 @@ fn persist_storage_config_state(
     Ok(())
 }
 
-fn storage_public_config(node_name: &str, secret_source: StorageDbSecretSource) -> Value {
-    let postgres_url_ref = load_local_postgres_url_ref(node_name)
-        .map(Value::String)
-        .unwrap_or(Value::Null);
+fn storage_public_config(_node_name: &str, secret_source: StorageDbSecretSource) -> Value {
     json!({
         "database": {
             "mode": "postgres",
-            "postgres_url_ref": postgres_url_ref,
-            "source": secret_source.as_str()
+            "source": secret_source.as_str(),
+            "resolved_from": "vault://resource_type=postgres"
         }
     })
 }
@@ -3054,28 +3043,29 @@ fn build_storage_config_get_payload(
     note: Option<&str>,
 ) -> Value {
     let configured = state.secret_source != StorageDbSecretSource::Missing;
-    let postgres_url_ref = load_local_postgres_url_ref(node_name);
-    let mut secret_descriptor = NodeSecretDescriptor::new(
-        "config.database.postgres_url_ref",
-        STORAGE_LOCAL_REF_KEY_POSTGRES_URL,
-    );
-    secret_descriptor.required = true;
-    secret_descriptor.configured = postgres_url_ref.is_some();
-    secret_descriptor.persistence = "vault".to_string();
     let mut notes = vec![
         Value::String("SY.storage uses PostgreSQL only on motherbee.".to_string()),
         Value::String(
-            "Connection string is vault-only: set the plaintext in SY.vault and pass the vault://<key> ref through CONFIG_SET."
+            "Model D': credentials live entirely in SY.vault. Operator loads them with vault_put + resource_type=postgres; storage resolves from the pool on boot/refresh."
                 .to_string(),
         ),
         Value::String(
-            "Applying a new ref persists locally and requires sy-storage restart to re-resolve and reconnect."
+            "CONFIG_SET on SY.storage takes no secret-bearing fields. Rotating the postgres secret requires sy-storage restart (or a refresh cycle) to re-resolve."
                 .to_string(),
         ),
     ];
     if let Some(note) = note.filter(|value| !value.trim().is_empty()) {
         notes.push(Value::String(note.to_string()));
     }
+    let resources = json!([
+        {
+            "resource_type": "postgres",
+            "required": true,
+            "configured": configured,
+            "scope": "pool (tenant or sys)",
+            "consumer_dbname": STORAGE_DB_NAME
+        }
+    ]);
     json!({
         "ok": configured,
         "node_name": node_name,
@@ -3083,14 +3073,13 @@ fn build_storage_config_get_payload(
         "schema_version": state.schema_version,
         "config_version": state.config_version,
         "config": storage_public_config(node_name, state.secret_source),
-        "postgres_url_ref": postgres_url_ref,
         "contract": {
             "node_family": "SY",
             "node_kind": "SY.storage",
             "supports": ["CONFIG_GET", "CONFIG_SET"],
-            "required_fields": ["config.database.postgres_url_ref"],
+            "required_fields": [],
             "optional_fields": [],
-            "secrets": [secret_descriptor],
+            "resources": resources,
             "notes": notes,
         },
         "error": if configured {
@@ -3098,7 +3087,7 @@ fn build_storage_config_get_payload(
         } else {
             json!({
                 "code": "missing_secret",
-                "message": "Missing postgres_url_ref or vault unreachable; configure SY.vault and CONFIG_SET storage with postgres_url_ref."
+                "message": "postgres secret not resolvable from vault pool; load it via vault_put with resource_type=postgres."
             })
         }
     })
@@ -3180,44 +3169,29 @@ fn apply_storage_config_set(
             "Missing required field: payload.config".to_string(),
         ));
     };
+    // Model D' — sy.storage has no secret-bearing config fields on the
+    // CONFIG_SET surface. The postgres credentials live entirely in vault
+    // (operator: vault_put + resource_type=postgres). On boot/refresh
+    // storage discovers them via `resolve_resource`. So CONFIG_SET here
+    // accepts only the envelope (schema_version/config_version/apply_mode)
+    // and rejects any secret-bearing field with a clear error.
     let database = config.get("database").and_then(Value::as_object);
-    if database.and_then(|d| d.get("postgres_url")).is_some() {
-        return Ok(storage_config_error_response(
-            node_name,
-            control_state,
-            "invalid_config",
-            "plaintext config.database.postgres_url is no longer accepted; use postgres_url_ref with vault://<key>".to_string(),
-        ));
+    if let Some(database) = database {
+        for forbidden in ["postgres_url", "postgres_url_ref"] {
+            if database.contains_key(forbidden) {
+                return Ok(storage_config_error_response(
+                    node_name,
+                    control_state,
+                    "invalid_config",
+                    format!(
+                        "config.database.{forbidden} is no longer accepted; load the postgres secret via vault_put (resource_type=postgres) and storage will discover it from the pool"
+                    ),
+                ));
+            }
+        }
     }
-    let Some(postgres_url_ref) = database
-        .and_then(|d| d.get("postgres_url_ref"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(storage_config_error_response(
-            node_name,
-            control_state,
-            "invalid_config",
-            "config.database.postgres_url_ref is required (vault://<key>)".to_string(),
-        ));
-    };
-    if fluxbee_sdk::parse_vault_ref(postgres_url_ref).is_err() {
-        return Ok(storage_config_error_response(
-            node_name,
-            control_state,
-            "invalid_config",
-            "config.database.postgres_url_ref must be a vault ref like 'vault://<key>'".to_string(),
-        ));
-    }
-    persist_local_postgres_url_ref(
-        node_name,
-        postgres_url_ref,
-        &build_secret_write_options_from_message(msg),
-    )?;
     control_state.schema_version = schema_version;
     control_state.config_version = config_version;
-    control_state.secret_source = StorageDbSecretSource::LocalFile;
     persist_storage_config_state(node_name, control_state)?;
     Ok(json!({
         "ok": true,
@@ -3227,13 +3201,9 @@ fn apply_storage_config_set(
         "config_version": control_state.config_version,
         "config": storage_public_config(node_name, control_state.secret_source),
         "notes": [
-            "postgres_url_ref persisted in local node config (no plaintext)",
-            "restart_required: sy-storage must be restarted to resolve the new vault ref"
+            "sy.storage has no secret-bearing CONFIG_SET fields in Model D'.",
+            "Load postgres credentials via vault_put with resource_type=postgres; storage will pick them up at boot from the pool."
         ],
-        "stored_refs": [{
-            "field": "config.database.postgres_url_ref",
-            "vault_ref": postgres_url_ref
-        }],
         "error": Value::Null
     }))
 }
@@ -3267,54 +3237,6 @@ fn storage_state_label(secret_source: StorageDbSecretSource) -> &'static str {
 
 fn storage_node_name_matches(expected: &str, requested: &str) -> bool {
     requested == expected || requested == STORAGE_NODE_BASE_NAME
-}
-
-/// Persist the `vault://<key>` ref (not the plaintext) in the node-local
-/// secrets file. Storage no longer accepts plaintext via CONFIG_SET.
-fn persist_local_postgres_url_ref(
-    node_name: &str,
-    postgres_url_ref: &str,
-    options: &NodeSecretWriteOptions,
-) -> Result<(), fluxbee_sdk::NodeSecretError> {
-    let mut secrets = load_node_secret_record(node_name)
-        .map(|record| record.secrets)
-        .unwrap_or_else(|_| Map::new());
-    secrets.insert(
-        STORAGE_LOCAL_REF_KEY_POSTGRES_URL.to_string(),
-        Value::String(postgres_url_ref.to_string()),
-    );
-    let record = build_node_secret_record(secrets, options);
-    save_node_secret_record(node_name, &record)?;
-    Ok(())
-}
-
-fn load_local_postgres_url_ref(node_name: &str) -> Option<String> {
-    load_node_secret_record(node_name)
-        .ok()
-        .and_then(|record| {
-            record
-                .secrets
-                .get(STORAGE_LOCAL_REF_KEY_POSTGRES_URL)
-                .cloned()
-        })
-        .and_then(|value| value.as_str().map(ToString::to_string))
-        .filter(|value| !value.trim().is_empty())
-}
-
-fn build_secret_write_options_from_message(msg: &Message) -> NodeSecretWriteOptions {
-    let updated_by_label = msg
-        .payload
-        .get("requested_by")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| msg.meta.action.clone());
-    NodeSecretWriteOptions {
-        updated_by_ilk: msg.meta.src_ilk.clone(),
-        updated_by_label,
-        trace_id: Some(msg.routing.trace_id.clone()),
-    }
 }
 
 fn ensure_l2_name(name: &str, hive_id: &str) -> String {

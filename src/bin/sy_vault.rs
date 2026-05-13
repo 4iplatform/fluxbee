@@ -988,10 +988,21 @@ fn authorize_read(
     }
     // (2) Pool match — only if caller is fully resolved via SHM.
     if secret_owner.is_none() {
+        // (2a) Exact tenant pool: caller and secret in same tenant.
         if let Some(tenant) = caller.tenant_id.as_deref() {
             if tenant == metadata.tenant_id {
                 return Ok(());
             }
+        }
+        // (2b) `sys` is the system-wide pool of the hive. Readable by
+        // any system-type caller regardless of which tnt:<uuid> their
+        // ILK belongs to. Matches the operator's mental model: "sys"
+        // secrets are shared infrastructure credentials available to
+        // every SY service in the hive.
+        if metadata.tenant_id == "sys"
+            && caller.ilk_type.as_deref() == Some("system")
+        {
+            return Ok(());
         }
     }
     Err(VaultError::Unauthorized)

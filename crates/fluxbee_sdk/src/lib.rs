@@ -37,7 +37,7 @@ pub use cognition::{
     SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, SUBJECT_STORAGE_COGNITION_THREADS,
 };
 pub use identity::{
-    deterministic_system_ilk_id, identity_shm_name_for_hive, identity_system_call,
+    deterministic_system_ilk_id, identity_shm_name_for_hive, identity_system_call, DEFAULT_ROOT_TENANT_ID,
     identity_system_call_ok, list_ich_options_from_hive_config, list_ich_options_from_hive_id,
     list_ich_options_from_shm_name, load_hive_id, provision_ilk, read_self_ilk_from_env,
     read_self_tenant_from_env, resolve_identity_option_from_hive_config,

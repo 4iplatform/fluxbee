@@ -442,29 +442,29 @@ Los Go SY actuales (`sy-timer`, `sy-opa-rules`, `sy-wf-rules`) no necesitan vaul
 
 ### J'-1. SDK base
 
-- [ ] VA-J'-1a. Mover `deterministic_system_ilk_id` de `src/bin/sy_identity.rs` a `crates/fluxbee_sdk/src/identity.rs`. Re-export. Actualizar todos los callers (sy_identity, sy_admin's `normalize_vault_put_payload`, y los nuevos use sites en sy_vault).
-- [ ] VA-J'-1b. Agregar `enum ResourceType` + `normalize_resource_type(&str) -> Result<String>` en `crates/fluxbee_sdk/src/vault.rs`. Tests unitarios de normalización.
-- [ ] VA-J'-1c. Agregar `VaultPutRequest` / `VaultListRequest` actualizados al schema del modelo D' (`resource_type` requerido, `ilk` opcional, `owner_ilk` eliminado).
-- [ ] VA-J'-1d. Agregar SDK helper `fluxbee_sdk::vault::resolve_resource(sender, receiver, caller, hive, resource_type, my_ilk, my_tenant) -> Result<Option<Value>>` que implementa el match path (owner → pool → None). Es la API canónica que los nodos consumer usan.
-- [ ] VA-J'-1e. Borrar `parse_vault_ref` y `resolve_vault_ref` (modelo viejo) o marcarlos como deprecated si quedan callers transitorios. En modelo D' los nodos no manejan refs.
+- [x] VA-J'-1a. Mover `deterministic_system_ilk_id` de `src/bin/sy_identity.rs` a `crates/fluxbee_sdk/src/identity.rs`. Re-export. Actualizar todos los callers (sy_identity, sy_admin's `normalize_vault_put_payload`, y los nuevos use sites en sy_vault). **Hecho** — vive en SDK + `DEFAULT_ROOT_TENANT_ID` también.
+- [x] VA-J'-1b. Agregar `enum ResourceType` + `normalize_resource_type(&str) -> Result<String>` en `crates/fluxbee_sdk/src/vault.rs`. Tests unitarios de normalización. **Hecho** — enum con Serialize/Deserialize manual como string canonical.
+- [x] VA-J'-1c. Agregar `VaultPutRequest` / `VaultListRequest` actualizados al schema del modelo D' (`resource_type` requerido, `ilk` opcional, `owner_ilk` eliminado). **Hecho** — `VaultFilter` y `VaultMetadata` extendidos.
+- [x] VA-J'-1d. Agregar SDK helper `fluxbee_sdk::vault::resolve_resource(sender, receiver, caller, hive, resource_type, my_tenant, timeout) -> Result<Option<Value>>` que implementa el match path (owned → tenant pool → sys pool → None). Es la API canónica que los nodos consumer usan. **Hecho**.
+- [ ] VA-J'-1e. Borrar `parse_vault_ref` y `resolve_vault_ref` (modelo viejo) o marcarlos como deprecated si quedan callers transitorios. En modelo D' los nodos no manejan refs. **Pendiente** — admin executor todavía importa parse_vault_ref para CONFIG_SET de WAN; eval después.
 
 ### J'-2. sy_vault: schema + auth
 
-- [ ] VA-J'-2a. Cambiar el schema SQLite de `secrets`: drop columna `owner_ilk` mandatoria, agregar `resource_type` (TEXT, NOT NULL, normalized), agregar `ilk` (TEXT, NULL = pool). Alpha = drop+recreate (no migración), sigue la política `fluxbee_cleanall.sh`.
-- [ ] VA-J'-2b. Cambiar `Caller` y `resolve_caller`: eliminar `is_admin()` por L2 name. Computar al boot `well_known_admin_ilks: HashSet<String>` con admin/architect deterministicos. Identity NO va en el set (no necesita privilegios admin).
-- [ ] VA-J'-2c. Reimplementar `authorize_*` según §6 del model D' doc:
+- [x] VA-J'-2a. Cambiar el schema SQLite de `secrets`: drop columna `owner_ilk` mandatoria, agregar `resource_type` (TEXT, NOT NULL, normalized), agregar `ilk` (TEXT, NULL = pool). Alpha = drop+recreate (no migración), sigue la política `fluxbee_cleanall.sh`. **Hecho** — `fluxbee_cleanall.sh` ahora hace wipe explícito de `vault.db` + `vault.master.key`.
+- [x] VA-J'-2b. Cambiar `Caller` y `resolve_caller`: eliminar `is_admin()` por L2 name. Computar al boot `well_known_admin_ilks: HashSet<String>` con admin/architect deterministicos. Identity NO va en el set (no necesita privilegios admin). **Hecho**.
+- [x] VA-J'-2c. Reimplementar `authorize_*` según §6 del model D' doc:
   - `vault_get` plaintext: `caller.src_ilk == secret.ilk` o `secret.ilk == null && caller.tenant == secret.tenant`. Sin bypass.
   - `vault_list`/`vault_get_metadata`: abierto.
   - `vault_put`: solo `caller.src_ilk in well_known_admin_ilks`.
   - `vault_delete`/`rotate`/`rollback`: admin/architect well-known **o** caller==owner.
-- [ ] VA-J'-2d. Implementar la regla "caller no resuelto en SHM → solo ILK-equality match" (chicken/egg para identity al boot).
-- [ ] VA-J'-2e. Agregar query path `vault_list(resource_type, ilk_filter, tenant_id)` con `ORDER BY created_at DESC`. Resultado: lista filtrada para el match del consumer.
+- [x] VA-J'-2d. Implementar la regla "caller no resuelto en SHM → solo ILK-equality match" (chicken/egg para identity al boot). **Hecho** — `resolve_caller` ya no aborta, y la dedicated-match path compara ILK directamente.
+- [x] VA-J'-2e. Agregar query path `vault_list(resource_type, ilk_filter, tenant_id)` con `ORDER BY created_at DESC`. Resultado: lista filtrada para el match del consumer. **Hecho** en `handle_list`.
 
 ### J'-3. sy_admin HTTP layer
 
-- [ ] VA-J'-3a. Reescribir `normalize_vault_put_payload`: ahora normaliza `resource_type` (string libre → canonical), defaultea `tenant_id` a `sys` si falta, resuelve `owner_node` → `ilk` (no `owner_ilk`). `metadata.owner_ilk` legacy queda **rechazado** con `INVALID_REQUEST` (forzar a usar `owner_node` o nada).
-- [ ] VA-J'-3b. Borrar `extract_admin_executor_openai_api_key_ref` y los helpers relacionados — admin ya no recibe refs por CONFIG_SET.
-- [ ] VA-J'-3c. Adaptar `apply_admin_executor_config_set` para que CONFIG_SET de admin solo gestione config no-secreta (catalog mode/actions, model defaults, etc.) — los secrets se cargan via `vault_put`.
+- [x] VA-J'-3a. Reescribir `normalize_vault_put_payload`: ahora normaliza `resource_type` (string libre → canonical), defaultea `tenant_id` a `sys` si falta, resuelve `owner_node` → `ilk` (no `owner_ilk`). `metadata.owner_ilk` legacy queda **rechazado** con `INVALID_REQUEST` (forzar a usar `owner_node` o nada). **Hecho**.
+- [x] VA-J'-3b. Borrar `extract_admin_executor_openai_api_key_ref` y los helpers relacionados — admin ya no recibe refs por CONFIG_SET. **Hecho** — reemplazado por `reject_admin_executor_secret_fields`.
+- [x] VA-J'-3c. Adaptar `apply_admin_executor_config_set` para que CONFIG_SET de admin solo gestione config no-secreta (catalog mode/actions, model defaults, etc.) — los secrets se cargan via `vault_put`. **Hecho**.
 
 ### J'-4. Consumer nodes — patrón común
 
@@ -478,48 +478,48 @@ Para cada nodo consumer, el patrón es:
 
 ### J'-5. `sy.storage`
 
-- [ ] VA-J'-5a. `REQUIRED_RESOURCES = [(Postgres, "database.postgres_url")]`. Borrar `STORAGE_LOCAL_REF_KEY_POSTGRES_URL` y `persist_local_postgres_url_ref` / `load_local_postgres_url_ref`.
-- [ ] VA-J'-5b. `apply_storage_config_set`: borrar todo manejo de `postgres_url` / `postgres_url_ref` (el field deja de existir en CONFIG_SET). El handler de CONFIG_SET pasa a manejar SOLO config no-secreta (si la tiene; storage hoy solo tenía postgres_url → CONFIG_SET puede quedar como inert con un mensaje "no secret-bearing fields, use vault_put").
-- [ ] VA-J'-5c. Boot path: `resolve_resource(Postgres, my_ilk, my_tenant)` → si lo encuentra, inicializa el Storage backend; si no, degraded (igual que hoy con `STORAGE_NOT_READY`).
-- [ ] VA-J'-5d. Refresh loop cada 60s. Si cambió el postgres URL, reconecta el pool.
-- [ ] VA-J'-5e. `CONFIG_GET` reporta `resources.postgres`.
-- [ ] VA-J'-5f. E2E: operador `vault_put` con `resource_type=postgres, tenant=sys` (en pool, sin ilk) → restart storage → reporta `resolved=true, source=pool`.
+- [x] VA-J'-5a. `REQUIRED_RESOURCES = [(Postgres, "database.postgres_url")]`. Borrar `STORAGE_LOCAL_REF_KEY_POSTGRES_URL` y `persist_local_postgres_url_ref` / `load_local_postgres_url_ref`. **Hecho** — sin REQUIRED_RESOURCES literal (overkill para un solo resource), pero el discovery es por `resolve_resource(Postgres, …)` y las helpers locales fueron borradas.
+- [x] VA-J'-5b. `apply_storage_config_set`: borrar todo manejo de `postgres_url` / `postgres_url_ref` (el field deja de existir en CONFIG_SET). El handler de CONFIG_SET pasa a manejar SOLO config no-secreta (si la tiene; storage hoy solo tenía postgres_url → CONFIG_SET puede quedar como inert con un mensaje "no secret-bearing fields, use vault_put"). **Hecho** — rechaza `postgres_url`/`postgres_url_ref` con `INVALID_CONFIG`.
+- [x] VA-J'-5c. Boot path: `resolve_resource(Postgres, my_ilk, my_tenant)` → si lo encuentra, inicializa el Storage backend; si no, degraded (igual que hoy con `STORAGE_NOT_READY`). **Hecho** — strict rejection de URLs con dbname embebido (cada consumer agrega su dbname con `with_dbname`).
+- [ ] VA-J'-5d. Refresh loop cada 60s. Si cambió el postgres URL, reconecta el pool. **Pendiente**.
+- [x] VA-J'-5e. `CONFIG_GET` reporta `resources.postgres`. **Hecho**.
+- [ ] VA-J'-5f. E2E: operador `vault_put` con `resource_type=postgres, tenant=sys` (en pool, sin ilk) → restart storage → reporta `resolved=true, source=pool`. **Pendiente test en VM**.
 
 ### J'-6. `sy.identity`
 
-- [ ] VA-J'-6a. `REQUIRED_RESOURCES = [(Postgres, "database.postgres_url")]`. Borrar `IDENTITY_LOCAL_REF_KEY_POSTGRES_URL` y persist/load equivalentes.
-- [ ] VA-J'-6b. `apply_identity_config_set`: borrar manejo de `postgres_url_ref`. CONFIG_SET queda solo para config no-secreta (si aplica).
-- [ ] VA-J'-6c. Boot path para resolver Postgres: usar `resolve_resource(Postgres, my_self_ilk_deterministic, "sys")`. El operador asigna el secret a identity vía `owner_node: "SY.identity"` (que admin resuelve a `identity_ilk_deterministic`). Match directo sin SHM resolution.
-- [ ] VA-J'-6d. Refresh loop como storage.
-- [ ] VA-J'-6e. CONFIG_GET reporta `resources.postgres`.
-- [ ] VA-J'-6f. E2E: operador `vault_put` con `resource_type=postgres, tenant=sys, owner_node="SY.identity"` → restart identity → DB ready.
+- [x] VA-J'-6a. `REQUIRED_RESOURCES = [(Postgres, "database.postgres_url")]`. Borrar `IDENTITY_LOCAL_REF_KEY_POSTGRES_URL` y persist/load equivalentes. **Hecho** — constante y helpers borrados.
+- [x] VA-J'-6b. `apply_identity_config_set`: borrar manejo de `postgres_url_ref`. CONFIG_SET queda solo para config no-secreta (si aplica). **Hecho** — rechaza secret-bearing fields.
+- [x] VA-J'-6c. Boot path para resolver Postgres: usar `resolve_resource(Postgres, my_self_ilk_deterministic, "sys")`. El operador asigna el secret a identity vía `owner_node: "SY.identity"` (que admin resuelve a `identity_ilk_deterministic`). Match directo sin SHM resolution. **Hecho** — usa `DEFAULT_ROOT_TENANT_ID` como tenant, el match sys-pool universal cubre el caso por defecto.
+- [ ] VA-J'-6d. Refresh loop como storage. **Pendiente**.
+- [x] VA-J'-6e. CONFIG_GET reporta `resources.postgres`. **Hecho**.
+- [ ] VA-J'-6f. E2E: operador `vault_put` con `resource_type=postgres, tenant=sys, owner_node="SY.identity"` → restart identity → DB ready. **Pendiente test en VM**.
 
 ### J'-7. `sy.admin` (executor OpenAI)
 
-- [ ] VA-J'-7a. `REQUIRED_RESOURCES = [(OpenAi, "ai_providers.openai.api_key")]`.
-- [ ] VA-J'-7b. Borrar `OpenAiSection.api_key_ref` del schema de admin executor config. CONFIG_SET de admin solo persiste `default_model`, `max_tokens`, `temperature`, `top_p`, `catalog.{mode,actions}`.
-- [ ] VA-J'-7c. `build_admin_executor_ai_runtime` ahora usa `resolve_resource(OpenAi, ...)` en vez de leer `api_key_ref` del config.
-- [ ] VA-J'-7d. Refresh loop.
-- [ ] VA-J'-7e. CONFIG_GET reporta `resources.openai`.
-- [ ] VA-J'-7f. E2E con `vault_put` en pool sys + restart admin → executor configured.
+- [x] VA-J'-7a. `REQUIRED_RESOURCES = [(OpenAi, "ai_providers.openai.api_key")]`. **Hecho** — discovery directo por `resolve_resource(Openai, …)`.
+- [x] VA-J'-7b. Borrar `OpenAiSection.api_key_ref` del schema de admin executor config. CONFIG_SET de admin solo persiste `default_model`, `max_tokens`, `temperature`, `top_p`, `catalog.{mode,actions}`. **Hecho**.
+- [x] VA-J'-7c. `build_admin_executor_ai_runtime` ahora usa `resolve_resource(OpenAi, ...)` en vez de leer `api_key_ref` del config. **Hecho**.
+- [ ] VA-J'-7d. Refresh loop. **Pendiente** (hoy refresh manual por CONFIG_SET no-secret + boot; agregar periodic).
+- [x] VA-J'-7e. CONFIG_GET reporta `resources.openai`. **Hecho**.
+- [ ] VA-J'-7f. E2E con `vault_put` en pool sys + restart admin → executor configured. **Pendiente test en VM**.
 
 ### J'-8. `sy.architect`
 
-- [ ] VA-J'-8a. `REQUIRED_RESOURCES = [(OpenAi, "ai_providers.openai.api_key"), (Postgres, "storage.messages_db_url")]`.
-- [ ] VA-J'-8b. Borrar `api_key_ref` y `messages_db_url_ref` del schema. Borrar `extract_*_ref`, `reject_*_plaintext`, `resolve_*_from_vault` que armé en J4.
-- [ ] VA-J'-8c. `build_architect_ai_runtime` y `refresh_architect_messages_db_url` usan `resolve_resource(...)`. El messages_db se distingue del OpenAI por `resource_type=postgres`. Si hay un Postgres dedicado a architect via `ilk`, lo usa; si no, el del pool sys.
-- [ ] VA-J'-8d. Refresh loop unificado para ambos resources.
-- [ ] VA-J'-8e. CONFIG_GET reporta `resources.{openai,postgres}`.
-- [ ] VA-J'-8f. E2E con dos `vault_put`s (openai en pool + postgres en pool) y verificación de archi.
+- [x] VA-J'-8a. `REQUIRED_RESOURCES = [(OpenAi, "ai_providers.openai.api_key"), (Postgres, "storage.messages_db_url")]`. **Hecho** — discovery directo por `resolve_resource` para ambos.
+- [x] VA-J'-8b. Borrar `api_key_ref` y `messages_db_url_ref` del schema. Borrar `extract_*_ref`, `reject_*_plaintext`, `resolve_*_from_vault` que armé en J4. **Hecho** — reemplazado por `reject_architect_secret_fields` + `resolve_architect_openai_api_key_from_vault` / `resolve_messages_db_url_from_vault` que usan `resolve_resource`.
+- [x] VA-J'-8c. `build_architect_ai_runtime` y `refresh_architect_messages_db_url` usan `resolve_resource(...)`. El messages_db se distingue del OpenAI por `resource_type=postgres`. Si hay un Postgres dedicado a architect via `ilk`, lo usa; si no, el del pool sys. **Hecho**.
+- [ ] VA-J'-8d. Refresh loop unificado para ambos resources. **Pendiente**.
+- [x] VA-J'-8e. CONFIG_GET reporta `resources.{openai,postgres}`. **Hecho**.
+- [ ] VA-J'-8f. E2E con dos `vault_put`s (openai en pool + postgres en pool) y verificación de archi. **Pendiente test en VM**.
 
 ### J'-9. `sy.cognition`
 
-- [ ] VA-J'-9a. `REQUIRED_RESOURCES = [(OpenAi, "ai_providers.openai.api_key"), (Postgres, "storage.postgres_url")]`.
-- [ ] VA-J'-9b. Borrar `COGNITION_LOCAL_REF_KEY_OPENAI`, `COGNITION_LOCAL_REF_KEY_STORAGE_POSTGRES_URL`, `extract_*_ref`, `reject_*_plaintext`, `resolve_*_to_plaintext`, `persist_local_*_ref` (todo lo de J5 legacy).
-- [ ] VA-J'-9c. Cognition usa el MISMO secret de pool que storage para Postgres (mismo `resource_type=postgres, tenant=sys, ilk=null` en vault). Sin duplicación.
-- [ ] VA-J'-9d. Refresh loop.
-- [ ] VA-J'-9e. CONFIG_GET con `resources.{openai,postgres}`.
-- [ ] VA-J'-9f. E2E: cognition cold boot sin secrets → operador hace 2 vault_puts (compartidos con storage/architect) → cognition arranca configurado.
+- [x] VA-J'-9a. `REQUIRED_RESOURCES = [(OpenAi, "ai_providers.openai.api_key"), (Postgres, "storage.postgres_url")]`. **Hecho** — discovery directo por `resolve_cognition_resource(<type>, …)`.
+- [x] VA-J'-9b. Borrar `COGNITION_LOCAL_REF_KEY_OPENAI`, `COGNITION_LOCAL_REF_KEY_STORAGE_POSTGRES_URL`, `extract_*_ref`, `reject_*_plaintext`, `resolve_*_to_plaintext`, `persist_local_*_ref` (todo lo de J5 legacy). **Hecho** — todas las helpers y constantes borradas, reemplazadas por `reject_cognition_secret_fields`.
+- [x] VA-J'-9c. Cognition usa el MISMO secret de pool que storage para Postgres (mismo `resource_type=postgres, tenant=sys, ilk=null` en vault). Sin duplicación. **Hecho** — comparte el pool match con storage; cognition aplica `with_dbname("fluxbee_storage")` en su path.
+- [ ] VA-J'-9d. Refresh loop. **Pendiente**.
+- [x] VA-J'-9e. CONFIG_GET con `resources.{openai,postgres}`. **Hecho**.
+- [ ] VA-J'-9f. E2E: cognition cold boot sin secrets → operador hace 2 vault_puts (compartidos con storage/architect) → cognition arranca configurado. **Pendiente test en VM**.
 
 ### J'-10. Sy_vault tests
 

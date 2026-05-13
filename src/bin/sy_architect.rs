@@ -51,12 +51,10 @@ use fluxbee_sdk::blob::{BlobConfig, BlobRef, BlobToolkit};
 use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{
-    admin_command, build_node_config_response_message, build_node_secret_record, connect,
-    list_ich_options_from_hive_config, load_node_secret_record_with_root,
-    redacted_node_secret_record, save_node_secret_record_with_root, try_handle_default_node_status,
-    AdminCommandRequest, IdentityIchOption, NodeConfig, NodeError, NodeReceiver,
-    NodeSecretDescriptor, NodeSecretError, NodeSecretRecord, NodeSecretWriteOptions, NodeSender,
-    VaultRetryPolicy, NODE_SECRET_REDACTION_TOKEN, VAULT_REF_PREFIX,
+    admin_command, build_node_config_response_message, connect,
+    list_ich_options_from_hive_config, try_handle_default_node_status, AdminCommandRequest,
+    IdentityIchOption, NodeConfig, NodeError, NodeReceiver, NodeSender,
+    NODE_SECRET_REDACTION_TOKEN,
 };
 use futures::TryStreamExt;
 use json_router::runtime_manifest::{
@@ -87,8 +85,6 @@ const MANIFEST_REFS_TABLE: &str = "manifest_refs";
 const CHAT_SESSION_PROFILES_TABLE: &str = "session_profiles";
 const CHAT_MODE_OPERATOR: &str = "operator";
 const CHAT_MODE_IMPERSONATION: &str = "impersonation";
-const ARCHITECT_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
-const ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL: &str = "messages_db_url";
 /// Postgres database name archi connects to for the messages viewer.
 /// This is storage's child DB (`fluxbee_storage`); the vault secret that
 /// carries the connection should only have credentials + host, never the
@@ -220,10 +216,6 @@ struct AiProvidersSection {
 
 #[derive(Debug, Deserialize, Clone)]
 struct OpenAiSection {
-    /// Vault ref (`vault://<key>`). Plaintext `api_key` is no longer
-    /// accepted; the secret lives only in SY.vault and architect resolves it
-    /// at boot/reload via `resolve_vault_ref`.
-    api_key_ref: Option<String>,
     default_model: Option<String>,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
@@ -5015,39 +5007,29 @@ async fn build_architect_ai_runtime(
     config_dir: &Path,
     state_dir: &Path,
 ) -> Option<ArchitectAiRuntime> {
-    let secrets = load_architect_secret_record(node_name).ok().flatten();
-    let openai = merged_openai_section(config, hive, secrets.as_ref())?;
-    let Some(api_key_ref) = openai
-        .api_key_ref
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return None;
-    };
+    let openai = merged_openai_section(config, hive);
     let api_key = match resolve_architect_openai_api_key_from_vault(
         config_dir,
         state_dir,
         hive,
         node_name,
         self_ilk_id,
-        api_key_ref,
     )
     .await
     {
-        Ok(api_key) => api_key,
+        Ok(Some(api_key)) => api_key,
+        Ok(None) => return None,
         Err(err) => {
             tracing::warn!(
                 error = %err,
-                api_key_ref,
-                "sy.architect OpenAI key vault lookup failed"
+                "sy.architect OpenAI vault resource lookup failed"
             );
             return None;
         }
     };
     let model = openai
-        .default_model
-        .as_deref()
+        .as_ref()
+        .and_then(|section| section.default_model.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_ARCHITECT_MODEL)
@@ -5057,9 +5039,9 @@ async fn build_architect_ai_runtime(
         model,
         instructions: build_archi_prompt(read_handbook_text().as_deref()),
         model_settings: ModelSettings {
-            temperature: openai.temperature,
-            top_p: openai.top_p,
-            max_output_tokens: openai.max_tokens,
+            temperature: openai.as_ref().and_then(|s| s.temperature),
+            top_p: openai.as_ref().and_then(|s| s.top_p),
+            max_output_tokens: openai.as_ref().and_then(|s| s.max_tokens),
         },
         client: OpenAiResponsesClient::new(api_key),
     })
@@ -5068,7 +5050,6 @@ async fn build_architect_ai_runtime(
 fn merged_openai_section(
     config: Option<&ArchitectNodeConfigFile>,
     hive: &HiveFile,
-    secrets: Option<&NodeSecretRecord>,
 ) -> Option<OpenAiSection> {
     let config_openai = config
         .and_then(|cfg| cfg.ai_providers.as_ref())
@@ -5077,59 +5058,17 @@ fn merged_openai_section(
         .ai_providers
         .as_ref()
         .and_then(|providers| providers.openai.clone());
-    // Persisted local ref (Phase J): only `vault://<key>` values are kept in
-    // secrets.json now. We ignore anything that doesn't look like a ref —
-    // plaintext is never accepted, so legacy values from old installs are
-    // treated as missing and force the operator to re-run CONFIG_SET.
-    let secret_api_key_ref = secrets
-        .and_then(|record| record.secrets.get(ARCHITECT_LOCAL_SECRET_KEY_OPENAI))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| value.starts_with(VAULT_REF_PREFIX))
-        .map(ToString::to_string);
-
-    let merge_refs = |cfg_ref: Option<String>, hive_ref: Option<String>| -> Option<String> {
-        secret_api_key_ref.clone().or(cfg_ref).or(hive_ref)
-    };
 
     match (config_openai, hive_openai) {
-        (Some(cfg), Some(hive_cfg)) => {
-            let api_key_ref = merge_refs(cfg.api_key_ref, hive_cfg.api_key_ref);
-            Some(OpenAiSection {
-                api_key_ref,
-                default_model: cfg.default_model.or(hive_cfg.default_model),
-                max_tokens: cfg.max_tokens.or(hive_cfg.max_tokens),
-                temperature: cfg.temperature.or(hive_cfg.temperature),
-                top_p: cfg.top_p.or(hive_cfg.top_p),
-            })
-        }
-        (Some(cfg), None) => {
-            let api_key_ref = merge_refs(cfg.api_key_ref, None);
-            Some(OpenAiSection {
-                api_key_ref,
-                default_model: cfg.default_model,
-                max_tokens: cfg.max_tokens,
-                temperature: cfg.temperature,
-                top_p: cfg.top_p,
-            })
-        }
-        (None, Some(hive_cfg)) => {
-            let api_key_ref = merge_refs(None, hive_cfg.api_key_ref);
-            Some(OpenAiSection {
-                api_key_ref,
-                default_model: hive_cfg.default_model,
-                max_tokens: hive_cfg.max_tokens,
-                temperature: hive_cfg.temperature,
-                top_p: hive_cfg.top_p,
-            })
-        }
-        (None, None) => secret_api_key_ref.map(|ref_str| OpenAiSection {
-            api_key_ref: Some(ref_str),
-            default_model: None,
-            max_tokens: None,
-            temperature: None,
-            top_p: None,
+        (Some(cfg), Some(hive_cfg)) => Some(OpenAiSection {
+            default_model: cfg.default_model.or(hive_cfg.default_model),
+            max_tokens: cfg.max_tokens.or(hive_cfg.max_tokens),
+            temperature: cfg.temperature.or(hive_cfg.temperature),
+            top_p: cfg.top_p.or(hive_cfg.top_p),
         }),
+        (Some(cfg), None) => Some(cfg),
+        (None, Some(hive_cfg)) => Some(hive_cfg),
+        (None, None) => None,
     }
 }
 
@@ -5139,8 +5078,7 @@ async fn resolve_architect_openai_api_key_from_vault(
     hive: &HiveFile,
     node_name: &str,
     self_ilk_id: &str,
-    api_key_ref: &str,
-) -> Result<String, ArchitectError> {
+) -> Result<Option<String>, ArchitectError> {
     let node_config = NodeConfig {
         name: "SY.architect".to_string(),
         router_socket: json_router::paths::router_socket_dir(),
@@ -5150,61 +5088,38 @@ async fn resolve_architect_openai_api_key_from_vault(
         version: "0.1.0".to_string(),
     };
     let (sender, mut receiver) = connect(&node_config).await?;
-    let policy = VaultRetryPolicy {
-        max_elapsed: Duration::from_secs(3),
-        initial_delay: Duration::from_millis(250),
-        max_delay: Duration::from_secs(1),
-        jitter_ratio: 0.20,
-    };
     let caller = fluxbee_sdk::VaultCaller::new(self_ilk_id, node_name);
-    let value = fluxbee_sdk::resolve_vault_ref(
+    let value = fluxbee_sdk::resolve_resource(
         &sender,
         &mut receiver,
         caller,
         &hive.hive_id,
-        api_key_ref,
-        policy,
+        fluxbee_sdk::ResourceType::Openai,
+        fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+        Duration::from_secs(5),
     )
     .await;
     let _ = sender.close().await;
-    let value = value?;
-    vault_response_openai_api_key(&Some(value))
+    let Some(value) = value? else {
+        return Ok(None);
+    };
+    Ok(vault_response_openai_api_key(&value))
 }
 
-fn vault_response_openai_api_key(value: &Option<Value>) -> Result<String, ArchitectError> {
-    let Some(value) = value else {
-        return Err("vault response missing value".into());
-    };
+fn vault_response_openai_api_key(value: &Value) -> Option<String> {
     if let Some(api_key) = value
         .as_str()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        return Ok(api_key.to_string());
+        return Some(api_key.to_string());
     }
-    if let Some(api_key) = value
+    value
         .get("api_key")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    {
-        return Ok(api_key.to_string());
-    }
-    Err("vault secret value must be a string or object with non-empty api_key".into())
-}
-
-fn architect_nodes_root() -> PathBuf {
-    json_router::paths::storage_root_dir().join("nodes")
-}
-
-fn load_architect_secret_record(
-    node_name: &str,
-) -> Result<Option<NodeSecretRecord>, ArchitectError> {
-    match load_node_secret_record_with_root(node_name, architect_nodes_root()) {
-        Ok(record) => Ok(Some(record)),
-        Err(NodeSecretError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(Box::new(err)),
-    }
+        .map(ToString::to_string)
 }
 
 async fn refresh_architect_ai_runtime(state: &ArchitectState) -> Result<bool, ArchitectError> {
@@ -5226,21 +5141,11 @@ async fn refresh_architect_ai_runtime(state: &ArchitectState) -> Result<bool, Ar
     Ok(state.ai_configured.load(Ordering::Relaxed))
 }
 
-fn load_local_architect_messages_db_url_ref(node_name: &str) -> Option<String> {
-    let record = load_architect_secret_record(node_name).ok().flatten()?;
-    record
-        .secrets
-        .get(ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
-/// Resolve architect's messages DB URL by reading the locally persisted
-/// `messages_db_url_ref` and looking it up in SY.vault via an ephemeral SDK
-/// client. Returns `Ok(Some(url))` on success, `Ok(None)` when the ref is
-/// missing or vault doesn't resolve it (degraded — viewer disabled).
+/// Resolve architect's messages-db Postgres credentials via Model D'
+/// `resolve_resource(Postgres)`. Returns `Some(url)` when the postgres
+/// resource is reachable from our (ilk, tenant) pool match, else `None`
+/// (degraded — viewer disabled). The connection string carries credentials
+/// + host only; the consumer adds the dbname (ARCHITECT_MESSAGES_DB_NAME).
 async fn resolve_messages_db_url_from_vault(
     config_dir: &Path,
     state_dir: &Path,
@@ -5249,7 +5154,6 @@ async fn resolve_messages_db_url_from_vault(
     node_name: &str,
     self_ilk_id: &str,
 ) -> Option<String> {
-    let ref_str = load_local_architect_messages_db_url_ref(node_name)?;
     let node_config = NodeConfig {
         name: "SY.architect".to_string(),
         router_socket: socket_dir.to_path_buf(),
@@ -5261,31 +5165,27 @@ async fn resolve_messages_db_url_from_vault(
     let (sender, mut receiver) = match fluxbee_sdk::connect(&node_config).await {
         Ok(pair) => pair,
         Err(err) => {
-            tracing::warn!(error = %err, "messages_db_url vault lookup: ephemeral router connect failed");
+            tracing::warn!(error = %err, "messages_db postgres vault lookup: ephemeral router connect failed");
             return None;
         }
     };
     let caller = fluxbee_sdk::VaultCaller::new(self_ilk_id, node_name);
-    let policy = fluxbee_sdk::VaultRetryPolicy {
-        max_elapsed: Duration::from_secs(3),
-        initial_delay: Duration::from_millis(250),
-        max_delay: Duration::from_secs(1),
-        jitter_ratio: 0.20,
-    };
-    let result = fluxbee_sdk::resolve_vault_ref(
+    let result = fluxbee_sdk::resolve_resource(
         &sender,
         &mut receiver,
         caller,
         hive_id,
-        &ref_str,
-        policy,
+        fluxbee_sdk::ResourceType::Postgres,
+        fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+        Duration::from_secs(5),
     )
     .await;
     let _ = sender.close().await;
     match result {
-        Ok(value) => extract_messages_db_url_from_vault_value(&value),
+        Ok(Some(value)) => extract_messages_db_url_from_vault_value(&value),
+        Ok(None) => None,
         Err(err) => {
-            tracing::warn!(error = %err, vault_ref = %ref_str, "messages_db_url vault lookup failed; viewer stays disabled");
+            tracing::warn!(error = %err, "messages_db postgres vault lookup failed; viewer stays disabled");
             None
         }
     }
@@ -5296,8 +5196,8 @@ fn extract_messages_db_url_from_vault_value(value: &Value) -> Option<String> {
         return Some(s.to_string());
     }
     value
-        .get("messages_db_url")
-        .or_else(|| value.get("postgres_url"))
+        .get("postgres_url")
+        .or_else(|| value.get("messages_db_url"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|v| !v.is_empty())
@@ -9908,46 +9808,25 @@ async fn handle_architect_local_config_get(
 ) -> Result<Value, ArchitectError> {
     let hive = load_hive(&state.config_dir)?;
     let node_config = load_architect_node_config(&state.hive_id)?;
-    let secret_record = load_architect_secret_record(&state.node_name)?;
-    let merged = merged_openai_section(node_config.as_ref(), &hive, secret_record.as_ref());
-    let api_key_ref = merged
-        .as_ref()
-        .and_then(|openai| openai.api_key_ref.clone())
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
-    // `configured` here reflects whether the runtime actually has a usable
-    // key resolved (i.e. vault returned a value), not just that a ref is
-    // persisted. Operator must run CONFIG_SET + restart if missing.
-    let configured = api_key_ref.is_some() && state.ai_configured.load(Ordering::Relaxed);
-    let messages_db_url_ref = secret_record
-        .as_ref()
-        .and_then(|record| {
-            record
-                .secrets
-                .get(ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL)
-        })
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && value.starts_with(VAULT_REF_PREFIX))
-        .map(ToString::to_string);
-    let messages_db_configured = messages_db_url_ref.is_some()
-        && state.messages_db_configured.load(Ordering::Relaxed);
-    let openai_descriptor = NodeSecretDescriptor {
-        field: "ai_providers.openai.api_key_ref".to_string(),
-        storage_key: ARCHITECT_LOCAL_SECRET_KEY_OPENAI.to_string(),
-        required: true,
-        configured,
-        value_redacted: false,
-        persistence: "vault".to_string(),
-    };
-    let messages_db_descriptor = NodeSecretDescriptor {
-        field: "storage.messages_db_url_ref".to_string(),
-        storage_key: ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL.to_string(),
-        required: false,
-        configured: messages_db_configured,
-        value_redacted: false,
-        persistence: "vault".to_string(),
-    };
+    let merged = merged_openai_section(node_config.as_ref(), &hive);
+    let configured = state.ai_configured.load(Ordering::Relaxed);
+    let messages_db_configured = state.messages_db_configured.load(Ordering::Relaxed);
+    let resources = json!([
+        {
+            "resource_type": "openai",
+            "required": true,
+            "configured": configured,
+            "scope": "pool (tenant or sys)"
+        },
+        {
+            "resource_type": "postgres",
+            "required": false,
+            "configured": messages_db_configured,
+            "scope": "pool (tenant or sys)",
+            "consumer_dbname": ARCHITECT_MESSAGES_DB_NAME,
+            "purpose": "messages log viewer"
+        }
+    ]);
     Ok(json!({
         "status": "ok",
         "action": "architect_local_config_get",
@@ -9960,33 +9839,31 @@ async fn handle_architect_local_config_get(
             "config": {
                 "ai_providers": {
                     "openai": {
-                        "api_key_ref": api_key_ref.clone().map(Value::String).unwrap_or(Value::Null),
                         "default_model": merged.as_ref().and_then(|openai| openai.default_model.clone()).map(Value::String).unwrap_or(Value::Null),
                         "max_tokens": merged.as_ref().and_then(|openai| openai.max_tokens.map(Value::from)).unwrap_or(Value::Null),
                         "temperature": merged.as_ref().and_then(|openai| openai.temperature.map(Value::from)).unwrap_or(Value::Null),
                         "top_p": merged.as_ref().and_then(|openai| openai.top_p.map(Value::from)).unwrap_or(Value::Null)
                     }
-                },
-                "storage": {
-                    "messages_db_url_ref": messages_db_url_ref.clone().map(Value::String).unwrap_or(Value::Null)
                 }
             },
             "contract": {
                 "node_family": "SY",
                 "node_kind": "SY.architect",
                 "supports": ["CONFIG_GET", "CONFIG_SET"],
-                "required_fields": ["config.ai_providers.openai.api_key_ref"],
-                "optional_fields": ["config.storage.messages_db_url_ref"],
-                "secrets": [openai_descriptor, messages_db_descriptor],
+                "required_fields": [],
+                "optional_fields": [
+                    "config.ai_providers.openai.default_model",
+                    "config.ai_providers.openai.max_tokens",
+                    "config.ai_providers.openai.temperature",
+                    "config.ai_providers.openai.top_p"
+                ],
+                "resources": resources,
                 "notes": [
-                    "OpenAI api_key and messages_db_url are vault-only: set the plaintext with vault_put and pass only the vault://<key> ref in CONFIG_SET.",
-                    "Architect resolves both refs at boot and after each CONFIG_SET via fluxbee_sdk::resolve_vault_ref.",
-                    "messages_db_url_ref is optional; when set, archi enables the Messages log viewer against storage's Postgres."
+                    "Model D': openai + postgres credentials live entirely in SY.vault. Operator loads them with vault_put + resource_type=<openai|postgres>; architect resolves from the pool on boot/refresh.",
+                    "CONFIG_SET on SY.architect takes no secret-bearing fields (api_key/api_key_ref/messages_db_url/messages_db_url_ref are rejected).",
+                    "The postgres resource is optional; if present, architect enables the messages log viewer against ARCHITECT_MESSAGES_DB_NAME on the resolved cluster."
                 ]
-            },
-            "secret_record": secret_record.map(|record| redacted_node_secret_record(&record)),
-            "api_key_ref": api_key_ref,
-            "messages_db_url_ref": messages_db_url_ref
+            }
         }
     }))
 }
@@ -9995,28 +9872,12 @@ async fn handle_architect_local_config_set(
     state: &ArchitectState,
     body: Value,
 ) -> Result<Value, ArchitectError> {
-    // Phase J: only vault refs are accepted. Plaintext gets rejected early
-    // with an actionable error message — the operator must vault_put first.
-    reject_architect_openai_plaintext(&body)?;
-    reject_architect_messages_db_url_plaintext(&body)?;
-    let supplied_api_key_ref = extract_architect_openai_api_key_ref(&body)?;
-    let messages_db_url_ref = extract_architect_messages_db_url_ref(&body)?;
-    if supplied_api_key_ref.is_none() && messages_db_url_ref.is_none() {
-        return Err("architect local config-set requires at least one of: config.ai_providers.openai.api_key_ref, config.storage.messages_db_url_ref".into());
-    }
-    let updated_by_ilk = body
-        .get("updated_by_ilk")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-    let updated_by_label = body
-        .get("updated_by_label")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| Some("archi".to_string()));
+    // Model D' — architect has no secret-bearing config fields on the
+    // CONFIG_SET surface. OpenAI and Postgres credentials live entirely in
+    // SY.vault under resource_type=openai/postgres; architect resolves them
+    // via `resolve_resource` at boot and on refresh. Any attempt to pass a
+    // secret here (plaintext or vault ref) is rejected up-front.
+    reject_architect_secret_fields(&body)?;
     let trace_id = body
         .get("trace_id")
         .and_then(Value::as_str)
@@ -10024,56 +9885,9 @@ async fn handle_architect_local_config_set(
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-
-    let mut secrets = load_architect_secret_record(&state.node_name)?
-        .map(|record| record.secrets)
-        .unwrap_or_default();
-    let mut stored_refs: Vec<Value> = Vec::new();
-    if let Some(api_key_ref) = supplied_api_key_ref.as_deref() {
-        secrets.insert(
-            ARCHITECT_LOCAL_SECRET_KEY_OPENAI.to_string(),
-            Value::String(api_key_ref.to_string()),
-        );
-        stored_refs.push(json!({
-            "field": "config.ai_providers.openai.api_key_ref",
-            "storage_key": ARCHITECT_LOCAL_SECRET_KEY_OPENAI,
-            "vault_ref": api_key_ref
-        }));
-    }
-    if let Some(url_ref) = messages_db_url_ref.as_deref() {
-        secrets.insert(
-            ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL.to_string(),
-            Value::String(url_ref.to_string()),
-        );
-        stored_refs.push(json!({
-            "field": "config.storage.messages_db_url_ref",
-            "storage_key": ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL,
-            "vault_ref": url_ref
-        }));
-    }
-    let record = build_node_secret_record(
-        secrets,
-        &NodeSecretWriteOptions {
-            updated_by_ilk,
-            updated_by_label,
-            trace_id: Some(trace_id.clone()),
-        },
-    );
-    let path = save_node_secret_record_with_root(&state.node_name, architect_nodes_root(), &record)
-        .map_err(|err| -> ArchitectError { Box::new(err) })?;
     let ai_configured = refresh_architect_ai_runtime(state).await?;
     let (messages_db_url_set, messages_db_connected, messages_db_connect_error) =
         refresh_architect_messages_db_url(state).await;
-
-    let message = match (
-        supplied_api_key_ref.is_some(),
-        messages_db_url_ref.is_some(),
-    ) {
-        (true, true) => "Architect OpenAI and messages DB vault refs persisted locally and runtime reloaded.",
-        (true, false) => "Architect OpenAI vault ref persisted locally and runtime reloaded.",
-        (false, true) => "Architect messages DB vault ref persisted locally and runtime reloaded.",
-        (false, false) => "Architect local config updated.",
-    };
 
     Ok(json!({
         "status": "ok",
@@ -10087,112 +9901,51 @@ async fn handle_architect_local_config_set(
             "messages_db_configured": messages_db_url_set,
             "messages_db_connected": messages_db_connected,
             "messages_db_connect_error": messages_db_connect_error,
-            "persisted_path": path,
-            "stored_refs": stored_refs,
-            "message": message
+            "message": "Model D': architect refreshed its vault-resolved resources (openai + postgres). No secret-bearing fields persisted (vault is the source of truth)."
         }
     }))
 }
 
-/// Detect plaintext `api_key` in the config-set body and reject it. The
-/// architect no longer auto-vaults plaintext — operators must set the secret
-/// in SY.vault first and pass only the `api_key_ref`.
-fn reject_architect_openai_plaintext(body: &Value) -> Result<(), ArchitectError> {
-    let has_plaintext = body
-        .get("config")
-        .and_then(|config| config.get("ai_providers"))
-        .and_then(|providers| providers.get("openai"))
-        .and_then(|openai| openai.get("api_key"))
-        .and_then(Value::as_str)
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false)
-        || body
-            .get("api_key")
-            .and_then(Value::as_str)
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false);
-    if has_plaintext {
-        return Err(
-            "plaintext config.ai_providers.openai.api_key is no longer accepted; use api_key_ref with vault://<key> (set the secret via vault_put first)".into(),
-        );
+/// Model D' — reject any secret-bearing field on the architect CONFIG_SET
+/// surface. OpenAI + messages-db credentials live entirely in SY.vault.
+fn reject_architect_secret_fields(body: &Value) -> Result<(), ArchitectError> {
+    let config_root = body.get("config").unwrap_or(body);
+    let openai = config_root
+        .get("ai_providers")
+        .and_then(|providers| providers.get("openai"));
+    if let Some(openai) = openai {
+        for forbidden in ["api_key", "api_key_ref"] {
+            if openai.get(forbidden).is_some() {
+                return Err(format!(
+                    "config.ai_providers.openai.{forbidden} is no longer accepted; load the openai secret via vault_put (resource_type=openai) and architect will discover it from the pool"
+                ).into());
+            }
+        }
+    }
+    let storage = config_root.get("storage");
+    if let Some(storage) = storage {
+        for forbidden in ["messages_db_url", "messages_db_url_ref"] {
+            if storage.get(forbidden).is_some() {
+                return Err(format!(
+                    "config.storage.{forbidden} is no longer accepted; load the postgres secret via vault_put (resource_type=postgres) and architect will discover it from the pool"
+                ).into());
+            }
+        }
+    }
+    // Top-level shorthand fields are also rejected.
+    for forbidden in [
+        "api_key",
+        "api_key_ref",
+        "messages_db_url",
+        "messages_db_url_ref",
+    ] {
+        if body.get(forbidden).is_some() {
+            return Err(format!(
+                "top-level '{forbidden}' field is no longer accepted; secrets live entirely in SY.vault under resource_type=openai/postgres"
+            ).into());
+        }
     }
     Ok(())
-}
-
-fn extract_architect_openai_api_key_ref(body: &Value) -> Result<Option<String>, ArchitectError> {
-    if let Some(value) = body
-        .get("config")
-        .and_then(|config| config.get("ai_providers"))
-        .and_then(|providers| providers.get("openai"))
-        .and_then(|openai| openai.get("api_key_ref"))
-        .and_then(Value::as_str)
-    {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            fluxbee_sdk::parse_vault_ref(trimmed)?;
-            return Ok(Some(trimmed.to_string()));
-        }
-    }
-    if let Some(value) = body.get("api_key_ref").and_then(Value::as_str) {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            fluxbee_sdk::parse_vault_ref(trimmed)?;
-            return Ok(Some(trimmed.to_string()));
-        }
-    }
-    Ok(None)
-}
-
-
-/// Detect plaintext `messages_db_url` and reject. messages DB URL is
-/// vault-only; the operator must `vault_put` the URL first and pass only
-/// the `messages_db_url_ref`.
-fn reject_architect_messages_db_url_plaintext(body: &Value) -> Result<(), ArchitectError> {
-    let has_plaintext = body
-        .get("config")
-        .and_then(|config| config.get("storage"))
-        .and_then(|storage| storage.get("messages_db_url"))
-        .and_then(Value::as_str)
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false)
-        || body
-            .get("messages_db_url")
-            .and_then(Value::as_str)
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false);
-    if has_plaintext {
-        return Err(
-            "plaintext config.storage.messages_db_url is no longer accepted; use messages_db_url_ref with vault://<key>".into(),
-        );
-    }
-    Ok(())
-}
-
-fn extract_architect_messages_db_url_ref(body: &Value) -> Result<Option<String>, ArchitectError> {
-    let extract = |raw: &str| -> Result<Option<String>, ArchitectError> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return Ok(None);
-        }
-        fluxbee_sdk::parse_vault_ref(trimmed)?;
-        Ok(Some(trimmed.to_string()))
-    };
-    if let Some(value) = body
-        .get("config")
-        .and_then(|config| config.get("storage"))
-        .and_then(|storage| storage.get("messages_db_url_ref"))
-        .and_then(Value::as_str)
-    {
-        if let Some(out) = extract(value)? {
-            return Ok(Some(out));
-        }
-    }
-    if let Some(value) = body.get("messages_db_url_ref").and_then(Value::as_str) {
-        if let Some(out) = extract(value)? {
-            return Ok(Some(out));
-        }
-    }
-    Ok(None)
 }
 
 fn scmd_raw_from_parts(method: &str, path: &str, body: Option<&Value>) -> String {
