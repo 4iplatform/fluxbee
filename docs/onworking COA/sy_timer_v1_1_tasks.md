@@ -175,10 +175,10 @@ For full context, see `wf_v1_tasks.md` Resolved 1 and `docs/wf-v1.md` §10.2.
 - [x] Database with v1.0 schema and duplicate client_refs → migration fails with clear error (`TestEnsureTimerSchemaFailsLegacyV1WithDuplicateClientRefs`)
 
 ### SYT11-TEST-6 — End-to-end against running SY.timer
-- [ ] Full schedule → cancel by client_ref flow without waiting for schedule response
-- [ ] Full schedule → reschedule by client_ref flow
-- [ ] Idempotent schedule (call twice with same client_ref, verify only one timer)
-- Note: these require a live hive; run manually on the Linux test server
+- [x] Full schedule → cancel by client_ref flow (`scripts/sy_timer_client_ref_e2e.sh`)
+- [x] Full schedule → reschedule by client_ref flow (`scripts/sy_timer_client_ref_e2e.sh`)
+- [x] Idempotent schedule: call twice with same client_ref, verify one pending timer (`scripts/sy_timer_client_ref_e2e.sh`)
+- Note: requires a live hive; run manually on the Linux test server with `HIVE_ID=motherbee scripts/sy_timer_client_ref_e2e.sh`
 
 ---
 

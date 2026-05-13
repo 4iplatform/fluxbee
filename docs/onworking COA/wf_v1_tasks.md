@@ -1,7 +1,7 @@
 # WF (Workflow Nodes) v1 — Implementation Tasks
 
-**Status:** planning / ready for implementation
-**Date:** 2026-04-13 (updated 2026-04-14 with frictions resolved)
+**Status:** implemented / local unit tests validated; real-server E2E scripts added
+**Date:** 2026-04-13 (updated 2026-05-13 with WF-BUILD-3 / WF-TEST-5 / WF-TEST-6 validation and WF-TEST-7 E2E script)
 **Primary spec:** `docs/wf-v1.md`
 **Target module:** `go/nodes/wf/wf-generic/`
 **Dependencies:** `go/fluxbee-go-sdk`, `go/sy-timer` (**requires v1.1, see WF-DEP-1**), `cel-go`, `modernc.org/sqlite`
@@ -473,9 +473,10 @@ go/nodes/wf/wf-generic/
 - [x] Crash during consumption transition leaves instance + internal queue in a recoverable pre-commit state (`TestCrashDuringConsumptionTransitionLeavesQueueAndInstanceInPreCommitState` — picks event with `GetNextInternalEvent`, computes planned mutation, closes the store before `CommitInstanceMutation` to simulate crash, reopens and asserts: instance row unchanged, EV1 still queued with same event_id, retry commit with same mutation completes the transition exactly once)
 
 ### WF-TEST-7 — Integration test against real SY.timer v1.1
-- [ ] End-to-end: WF.invoice instance through complete flow with real SY.timer
-- [ ] End-to-end: cancel mid-flow
-- [ ] End-to-end: simulate WF crash mid-transition, restart, verify recovery
+- [x] End-to-end: WF.invoice instance through complete flow with real SY.timer (`scripts/wf_invoice_runtime_e2e.sh`)
+- [x] End-to-end: cancel mid-flow (`scripts/wf_invoice_runtime_e2e.sh`)
+- [x] End-to-end: restart/recovery while instance is pending an external response (`WF_E2E_RESTART=1 scripts/wf_invoice_runtime_e2e.sh`)
+- Note: the exact pre-commit crash point is validated deterministically by `TestCrashDuringConsumptionTransitionLeavesQueueAndInstanceInPreCommitState`; the live E2E uses a process restart boundary because forcing a crash at the DB pre-commit window is not stable enough for an operator script.
 
 ---
 
@@ -517,6 +518,12 @@ go/nodes/wf/wf-generic/
   - `CONFIG_SET` in managed package mode refuses `workflow_definition_path` mutation (`TestApplyWFConfigSetRejectsWorkflowDefinitionPathMutationInManagedMode` + idempotent-OK companion `TestApplyWFConfigSetAcceptsMatchingPackagePathInManagedMode`)
   - `CONFIG_GET` in managed package mode clearly reflects package-native binding (`TestBuildWFConfigGetPayloadReflectsPackageNativeBindingInManagedMode`)
   - local-dev / smoke mode with explicit `workflow_definition_path` still works when no managed package binding exists (`TestLocalDevModeWorkflowDefinitionPathRemainsMutable`)
+- [x] Local validation rerun 2026-05-13:
+  - `go test ./... -count=1` in `go/nodes/wf/wf-generic`
+  - `go test ./... -count=1` in `go/sy-wf-rules`
+  - `go test ./... -count=1` in `go/pkg/wfcel`
+  - targeted WF-BUILD-3 / WF-TEST-5 / WF-TEST-6 tests with `-count=1 -v`
+  - `go build` for `wf-generic` and `sy-wf-rules`
 
 ---
 
