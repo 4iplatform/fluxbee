@@ -91,7 +91,7 @@ const CHAT_MODE_IMPERSONATION: &str = "impersonation";
 /// dbname. Architect hardcodes it here and applies `with_dbname` before
 /// connecting.
 const ARCHITECT_MESSAGES_DB_NAME: &str = "fluxbee_storage";
-const ARCHITECT_SECRET_REFRESH_INTERVAL_SECS: u64 = 10;
+const ARCHITECT_SECRET_REFRESH_INTERVAL_SECS: u64 = 60;
 const ARCHITECT_MAX_ATTACHMENTS: usize = 8;
 const ARCHITECT_MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 const ARCHITECT_MAX_SOFTWARE_UPLOAD_BYTES: usize = 128 * 1024 * 1024;
