@@ -208,6 +208,21 @@ pub enum ResourceType {
 - Custom variant accepts a normalized string (lowercase, `_`-joined). For unknown providers without an SDK release.
 - Normalization rule (`normalize_resource_type(s) -> String`): trim, lowercase, replace runs of non-alphanumeric chars with single `_`, drop leading/trailing `_`. Examples: `"OpenAI"` → `"openai"`, `"Google Calendar"` → `"google_calendar"`, `"linked-helper"` → `"linked_helper"`. Admin normalizes before forwarding to vault. Vault stores the normalized string and rejects empty / pure-digit / over-N-chars.
 
+### Per-resource value contract
+
+Each `resource_type` has a documented `value` shape so consumers know what to expect. Critical: the secret carries **only what is actually secret** — implementation knobs that any consumer can derive (database name, target table, retry policy) live in the consumer's code, not in the secret.
+
+| `resource_type` | `value` shape | Notes |
+| --------------- | ------------- | ----- |
+| `postgres` | `"postgresql://USER:PASS@HOST:PORT"` (string, no dbname) or `{"host", "port", "user", "password"}` (object form, future) | **No dbname**. Each consumer hardcodes its own (`fluxbee_storage`, `fluxbee_identity`, etc.) and applies `with_dbname` before connecting. The operator loads ONE postgres secret per cluster — storage, identity, architect, cognition share it. If the operator includes a dbname out of habit, consumers log a warning and overwrite. |
+| `openai` | `{"api_key": "sk-..."}` or bare string `"sk-..."` | Provider-level shared secret. |
+| `anthropic` | same shape as openai | |
+| `google_calendar`, `gmail`, `google_drive` | `{"access_token", "refresh_token", "client_id", "client_secret"}` (OAuth bundle) | per-account if `ilk` is set; per-tenant if pool |
+| `slack` | `{"bot_token", "app_token", "signing_secret"}` | workspace-level (pool) or per-user (ilk) |
+| `hubspot`, `linked_helper`, etc. | per-provider object | |
+
+Rule of thumb when introducing a new `resource_type`: ask "would two consumers in the same tenant reasonably share this value?" If yes → that field belongs in the secret. If no (it's implementation-specific) → the consumer hardcodes or configures it via CONFIG_SET.
+
 ---
 
 ## 6. Authorization rules

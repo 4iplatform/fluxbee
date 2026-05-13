@@ -125,10 +125,23 @@ pub struct MessagesDb {
 }
 
 impl MessagesDb {
-    pub async fn connect(url: &str) -> Result<Self, MessagesDbError> {
-        let config: PgConfig = url
+    /// Connect to the architect messages DB.
+    ///
+    /// `url` carries credentials + host/port (e.g.
+    /// `postgresql://user:pass@host:5432`); any dbname embedded in it is
+    /// ignored. `dbname` is the actual database to connect to (architect uses
+    /// `fluxbee_storage` because it reads storage's inbox table). This split
+    /// matches the Phase J' / Model D' contract for `resource_type=postgres`
+    /// secrets: the secret carries only what is actually secret (creds +
+    /// host); each consumer hardcodes the dbname it needs.
+    pub async fn connect(url: &str, dbname: &str) -> Result<Self, MessagesDbError> {
+        let mut config: PgConfig = url
             .parse()
             .map_err(|err: tokio_postgres::Error| MessagesDbError::InvalidUrl(err.to_string()))?;
+        // Always overwrite the dbname so a stray `/fluxbee_storage` in the
+        // URL doesn't accidentally redirect us if the secret was loaded by
+        // an operator who included a dbname out of habit.
+        config.dbname(dbname);
         let (client, connection) = config
             .connect(NoTls)
             .await

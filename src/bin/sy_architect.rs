@@ -89,6 +89,12 @@ const CHAT_MODE_OPERATOR: &str = "operator";
 const CHAT_MODE_IMPERSONATION: &str = "impersonation";
 const ARCHITECT_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
 const ARCHITECT_LOCAL_SECRET_KEY_MESSAGES_DB_URL: &str = "messages_db_url";
+/// Postgres database name archi connects to for the messages viewer.
+/// This is storage's child DB (`fluxbee_storage`); the vault secret that
+/// carries the connection should only have credentials + host, never the
+/// dbname. Architect hardcodes it here and applies `with_dbname` before
+/// connecting.
+const ARCHITECT_MESSAGES_DB_NAME: &str = "fluxbee_storage";
 const ARCHITECT_SECRET_REFRESH_INTERVAL_SECS: u64 = 10;
 const ARCHITECT_MAX_ATTACHMENTS: usize = 8;
 const ARCHITECT_MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
@@ -4872,7 +4878,7 @@ async fn main() -> Result<(), ArchitectError> {
     .await;
     let initial_messages_db_configured = initial_messages_db_url.is_some();
     let initial_messages_db = match initial_messages_db_url.as_deref() {
-        Some(url) => match messages_db::MessagesDb::connect(url).await {
+        Some(url) => match messages_db::MessagesDb::connect(url, ARCHITECT_MESSAGES_DB_NAME).await {
             Ok(client) => Some(Arc::new(client)),
             Err(err) => {
                 tracing::warn!(error = %err, "messages_db connect at boot failed; viewer disabled until reconfigured");
@@ -5311,7 +5317,7 @@ async fn refresh_architect_messages_db_url(state: &ArchitectState) -> (bool, boo
     let url_present = url.is_some();
     let mut connect_error: Option<String> = None;
     let new_client = match url.as_deref() {
-        Some(url) => match messages_db::MessagesDb::connect(url).await {
+        Some(url) => match messages_db::MessagesDb::connect(url, ARCHITECT_MESSAGES_DB_NAME).await {
             Ok(client) => Some(Arc::new(client)),
             Err(err) => {
                 let err_text = err.to_string();
@@ -15690,14 +15696,13 @@ fn architect_index_html(state: &ArchitectState) -> String {
         </div>
         <div id="messages-unconfigured" class="messages-unconfigured" hidden>
           <div class="messages-unconfigured-card">
-            <h2>messages_db_url not configured</h2>
-            <p>Set the Postgres connection string that points to storage's database. archi only runs <code>SELECT</code> against <code>storage_inbox</code>. The DB name is <strong><code>fluxbee_storage</code></strong> — storage's child DB; the base <code>fluxbee</code> does not contain <code>storage_inbox</code>.</p>
-            <p class="messages-unconfigured-label">From archi chat (operator):</p>
-            <code>SCMD: curl -X POST /architect/control/config-set -d '{{"config":{{"storage":{{"messages_db_url":"postgresql://USER:PASS@HOST:5432/fluxbee_storage"}}}}}}'</code>
-            <p class="messages-unconfigured-label">Or via admin gateway:</p>
-            <code>curl -sS -X POST http://MOTHERBEE:8080/hives/HIVE/nodes/SY.architect@HIVE/control/config-set \
+            <h2>messages_db not configured</h2>
+            <p>archi needs a Postgres connection (credentials + host only — <strong>no dbname</strong>) to read storage's inbox. archi internally hardcodes the dbname (<code>fluxbee_storage</code>); the secret is the same one storage and cognition use.</p>
+            <p class="messages-unconfigured-label">Operator flow (Phase J' — vault):</p>
+            <code>curl -sS -X POST http://MOTHERBEE:8080/hives/HIVE/vault/secrets \
   -H 'Content-Type: application/json' \
-  -d '{{"schema_version":1,"config_version":1,"apply_mode":"replace","config":{{"storage":{{"messages_db_url":"postgresql://USER:PASS@HOST:5432/fluxbee_storage"}}}}}}'</code>
+  -d '{{"key":"postgres-shared","value":"postgresql://USER:PASS@HOST:5432","metadata":{{"resource_type":"postgres","tenant_id":"sys"}}}}'</code>
+            <p>Then restart archi. It will pick up the secret from the pool, append its dbname, and connect.</p>
           </div>
         </div>
       </section>

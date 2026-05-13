@@ -5283,6 +5283,14 @@ async fn initialize_identity_database_backend(
         Ok(value) => value,
         Err(err) => return (None, Some(format!("invalid postgres_url: {err}"))),
     };
+    if base.get_dbname().map(str::trim).unwrap_or("").len() > 0 {
+        tracing::warn!(
+            dbname = %base.get_dbname().unwrap_or(""),
+            target_dbname = IDENTITY_DB_NAME,
+            "vault postgres secret carried an embedded dbname; identity is ignoring it. \
+             The secret should be shared across nodes — load credentials + host only."
+        );
+    }
     if let Err(err) = ensure_database_exists(&base, IDENTITY_DB_NAME).await {
         return (
             None,
