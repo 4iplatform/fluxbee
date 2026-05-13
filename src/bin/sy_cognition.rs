@@ -1191,13 +1191,11 @@ async fn load_rebuild_snapshot_from_storage(
     base_database_url: &str,
 ) -> Result<RebuildSnapshot, CognitionError> {
     let base_config: PgConfig = base_database_url.parse()?;
-    if base_config.get_dbname().map(str::trim).unwrap_or("").len() > 0 {
-        tracing::warn!(
-            dbname = %base_config.get_dbname().unwrap_or(""),
-            target_dbname = STORAGE_DB_NAME,
-            "vault postgres secret carried an embedded dbname; cognition is ignoring it \
-             and using the canonical storage dbname instead."
-        );
+    if !base_config.get_dbname().map(str::trim).unwrap_or("").is_empty() {
+        return Err(format!(
+            "postgres secret must not include a dbname (got '{}'); load only credentials + host (postgresql://user:pass@host:port)",
+            base_config.get_dbname().unwrap_or("")
+        ).into());
     }
     let storage_config = with_dbname(&base_config, STORAGE_DB_NAME);
     let (client, connection) = storage_config.connect(NoTls).await?;

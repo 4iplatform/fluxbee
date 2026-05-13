@@ -10431,15 +10431,19 @@ async fn handle_vault_command(
     Ok(build_admin_http_response(action, response))
 }
 
-/// Resolve operator-friendly `metadata.owner_node` (or `owner_l2`) into the
-/// strict `metadata.owner_ilk` that vault uses for authorization. Lets the
-/// operator write `"owner_node": "SY.cognition"` instead of having to look
-/// up the ILK UUID by hand. If `owner_ilk` is already set, it wins as-is
-/// (advanced/explicit path).
+/// Normalize a vault_put HTTP payload to the Model D' contract before
+/// forwarding to SY.vault.
 ///
-/// **No silent defaults**: if neither `owner_ilk` nor `owner_node` is provided,
-/// the request fails with `INVALID_REQUEST`. The operator must say explicitly
-/// who owns the secret.
+/// What this does:
+/// - **Required**: `metadata.resource_type` — normalized via
+///   `normalize_resource_type` (lowercase + `_`-joined).
+/// - **Default**: `metadata.tenant_id` defaults to `"sys"` if omitted.
+/// - **Owner resolution**: if `metadata.owner_node` is provided, resolved
+///   to `metadata.ilk` against identity SHM. If `metadata.ilk` is set
+///   directly, it wins (advanced/explicit path). Both empty → secret goes
+///   to the **pool** (no `ilk` set).
+/// - **Reject**: `metadata.owner_ilk` (legacy field, replaced by `ilk`) —
+///   operator gets a clear error instead of silently using the wrong field.
 fn normalize_vault_put_payload(
     ctx: &AdminContext,
     target_hive: &str,
@@ -10448,53 +10452,88 @@ fn normalize_vault_put_payload(
     let Some(metadata) = payload.get_mut("metadata").and_then(|m| m.as_object_mut()) else {
         return Err("vault_put requires payload.metadata".to_string());
     };
+
+    // Reject legacy field.
+    if metadata.contains_key("owner_ilk") {
+        return Err(
+            "metadata.owner_ilk is deprecated in Model D'; use metadata.ilk (advanced) or metadata.owner_node (admin resolves the ILK from identity SHM)".to_string(),
+        );
+    }
+
+    // Default tenant_id to "sys" if missing.
+    let tenant_present = metadata
+        .get("tenant_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    if !tenant_present {
+        metadata.insert(
+            "tenant_id".to_string(),
+            serde_json::Value::String("sys".to_string()),
+        );
+    }
+
+    // resource_type: required, normalize.
+    let raw_resource = metadata
+        .remove("resource_type")
+        .and_then(|v| v.as_str().map(str::trim).map(ToString::to_string))
+        .filter(|v| !v.is_empty());
+    let Some(raw_resource) = raw_resource else {
+        return Err(
+            "metadata.resource_type is required (e.g. 'openai', 'postgres', 'slack')".to_string(),
+        );
+    };
+    let normalized_resource = fluxbee_sdk::normalize_resource_type(&raw_resource)?;
+    metadata.insert(
+        "resource_type".to_string(),
+        serde_json::Value::String(normalized_resource),
+    );
+
+    // Resolve owner_node → ilk (Model D').
     let owner_node = metadata
         .remove("owner_node")
         .or_else(|| metadata.remove("owner_l2"))
         .and_then(|v| v.as_str().map(str::trim).map(ToString::to_string))
         .filter(|v| !v.is_empty());
-    let existing_owner_ilk = metadata
-        .get("owner_ilk")
+    let existing_ilk = metadata
+        .get("ilk")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(ToString::to_string);
-    let resolved_owner_ilk = match (existing_owner_ilk, owner_node) {
-        (Some(ilk), _) => ilk,
+    let resolved_ilk: Option<String> = match (existing_ilk, owner_node) {
+        (Some(ilk), _) => Some(ilk),
         (None, Some(node)) => {
             let handler_node = if node.contains('@') {
                 node
             } else {
                 format!("{}@{}", node, target_hive)
             };
-            match fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_config(
-                &ctx.config_dir,
-                &handler_node,
-            ) {
-                Ok(Some((_, ilk))) => ilk.ilk_id,
-                Ok(None) => {
-                    return Err(format!(
-                        "owner_node '{handler_node}' not found in identity SHM (is the node registered?)"
-                    ));
-                }
-                Err(err) => {
-                    return Err(format!(
-                        "failed to resolve owner_node='{handler_node}' from identity SHM: {err}"
-                    ));
-                }
+            // First try identity SHM for dynamic nodes (AI/IO/WF) that
+            // have been registered there.
+            if let Ok(Some((_, ilk))) =
+                fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_config(
+                    &ctx.config_dir,
+                    &handler_node,
+                )
+            {
+                Some(ilk.ilk_id)
+            } else {
+                // Fall back to deterministic computation for SY system
+                // nodes — they may not be visible in SHM yet at the moment
+                // the operator runs the put, but their ILK is computable.
+                Some(fluxbee_sdk::deterministic_system_ilk_id(&handler_node))
             }
         }
-        (None, None) => {
-            return Err(
-                "vault_put requires metadata.owner_node (or metadata.owner_ilk for advanced use)"
-                    .to_string(),
-            );
-        }
+        (None, None) => None, // pool secret
     };
-    metadata.insert(
-        "owner_ilk".to_string(),
-        serde_json::Value::String(resolved_owner_ilk),
-    );
+    if let Some(ilk) = resolved_ilk {
+        metadata.insert("ilk".to_string(), serde_json::Value::String(ilk));
+    } else {
+        metadata.remove("ilk");
+    }
+
     Ok(payload)
 }
 

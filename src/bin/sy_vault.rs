@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -89,17 +90,18 @@ struct Caller {
 }
 
 impl Caller {
-    /// L2-name fast-path: admin/architect for tooling, identity for the
-    /// boot-time chicken/egg (identity is the writer of the SHM that vault
-    /// itself reads to resolve any other caller). Treat all three as
-    /// pre-authorised by name; the rest go through tenant/ILK auth in SHM.
-    fn is_admin(&self) -> bool {
-        self.l2_name
+    /// True when the caller's ILK matches one of the well-known administrative
+    /// ILKs computed deterministically at boot (admin + architect).
+    ///
+    /// In Model D' this is the only fast-path: there's no string-based
+    /// "trust whoever claims SY.admin in their L2 name" — we compare the
+    /// deterministic ILK exactly. Identity is NOT in this set anymore; its
+    /// boot-time chicken/egg is resolved by direct ILK-equality match
+    /// (`caller.ilk == secret.ilk`) which doesn't need SHM resolution.
+    fn is_well_known_admin(&self, well_known: &HashSet<String>) -> bool {
+        self.ilk_id
             .as_deref()
-            .map(|name| {
-                let base = name.split('@').next().unwrap_or(name);
-                matches!(base, "SY.admin" | "SY.architect" | "SY.identity")
-            })
+            .map(|ilk| well_known.contains(ilk))
             .unwrap_or(false)
     }
 }
@@ -172,6 +174,30 @@ async fn main() -> Result<(), VaultError> {
     )?;
     tracing::info!(self_ilk_id = %_self_ilk_id, "resolved self system ILK from identity SHM");
 
+    // Phase J' / Model D' — well-known administrative ILKs. Computed
+    // locally with the same deterministic formula identity uses to seed
+    // SHM. Vault never trusts `routing.src_l2_name` strings; it compares
+    // the caller's `meta.src_ilk` against this set for admin operations.
+    let well_known_admin_ilks: HashSet<String> = {
+        let admin_ilk = fluxbee_sdk::deterministic_system_ilk_id(&format!(
+            "SY.admin@{}",
+            hive_id
+        ));
+        let architect_ilk = fluxbee_sdk::deterministic_system_ilk_id(&format!(
+            "SY.architect@{}",
+            hive_id
+        ));
+        tracing::info!(
+            admin_ilk = %admin_ilk,
+            architect_ilk = %architect_ilk,
+            "well-known administrative ILKs computed"
+        );
+        let mut set = HashSet::with_capacity(2);
+        set.insert(admin_ilk);
+        set.insert(architect_ilk);
+        set
+    };
+
     let _lock = acquire_lock(Path::new(DEFAULT_LOCK_PATH))?;
     let key = load_or_create_master_key(Path::new(DEFAULT_MASTER_KEY_PATH))?;
     let mut store = VaultStore::open(Path::new(DEFAULT_DB_PATH), &key)?;
@@ -214,7 +240,15 @@ async fn main() -> Result<(), VaultError> {
         ) {
             continue;
         }
-        if let Err(err) = handle_vault_message(&sender, &mut store, &config_dir, &msg).await {
+        if let Err(err) = handle_vault_message(
+            &sender,
+            &mut store,
+            &config_dir,
+            &well_known_admin_ilks,
+            &msg,
+        )
+        .await
+        {
             tracing::warn!(
                 error = %err,
                 action,
@@ -230,19 +264,20 @@ async fn handle_vault_message(
     sender: &NodeSender,
     store: &mut VaultStore,
     config_dir: &Path,
+    well_known_admin_ilks: &HashSet<String>,
     msg: &Message,
 ) -> VaultResult<()> {
     let action = msg.meta.msg.as_deref().unwrap_or_default();
     let caller = resolve_caller(config_dir, msg)?;
     let response_action = response_action_for(action);
     let result = match action {
-        MSG_VAULT_PUT => handle_put(store, msg, &caller),
-        MSG_VAULT_GET => handle_get(store, msg, &caller, true),
-        MSG_VAULT_GET_METADATA => handle_get(store, msg, &caller, false),
+        MSG_VAULT_PUT => handle_put(store, msg, &caller, well_known_admin_ilks),
+        MSG_VAULT_GET => handle_get(store, msg, &caller, well_known_admin_ilks, true),
+        MSG_VAULT_GET_METADATA => handle_get(store, msg, &caller, well_known_admin_ilks, false),
         MSG_VAULT_LIST => handle_list(store, msg, &caller),
-        MSG_VAULT_DELETE => handle_delete(store, msg, &caller),
-        MSG_VAULT_ROTATE => handle_rotate(store, msg, &caller),
-        MSG_VAULT_ROLLBACK => handle_rollback(store, msg, &caller),
+        MSG_VAULT_DELETE => handle_delete(store, msg, &caller, well_known_admin_ilks),
+        MSG_VAULT_ROTATE => handle_rotate(store, msg, &caller, well_known_admin_ilks),
+        MSG_VAULT_ROLLBACK => handle_rollback(store, msg, &caller, well_known_admin_ilks),
         _ => Err(VaultError::InvalidRequest(
             "unsupported vault action".to_string(),
         )),
@@ -277,12 +312,27 @@ fn handle_list(store: &mut VaultStore, msg: &Message, caller: &Caller) -> VaultR
     }))
 }
 
-fn handle_delete(store: &mut VaultStore, msg: &Message, caller: &Caller) -> VaultResult<Value> {
-    if !caller.is_admin() {
-        return Err(VaultError::Unauthorized);
-    }
+fn handle_delete(
+    store: &mut VaultStore,
+    msg: &Message,
+    caller: &Caller,
+    well_known: &HashSet<String>,
+) -> VaultResult<Value> {
     let request: VaultKeyRequest = serde_json::from_value(msg.payload.clone())?;
     validate_key(&request.key)?;
+    // Auth: admin/architect can delete anything; non-admin can only delete
+    // secrets dedicated to their own ILK.
+    if !caller.is_well_known_admin(well_known) {
+        let existing = store.get_record(&request.key)?;
+        let Some(existing) = existing else {
+            return Err(VaultError::Unauthorized);
+        };
+        let owner_ilk = secret_owner_ilk(&existing.metadata);
+        match (owner_ilk, caller.ilk_id.as_deref()) {
+            (Some(owner), Some(self_ilk)) if owner == self_ilk => {}
+            _ => return Err(VaultError::Unauthorized),
+        }
+    }
     store.delete(&request.key, caller)?;
     Ok(json!({
         "status": "ok",
@@ -291,12 +341,25 @@ fn handle_delete(store: &mut VaultStore, msg: &Message, caller: &Caller) -> Vaul
     }))
 }
 
-fn handle_rotate(store: &mut VaultStore, msg: &Message, caller: &Caller) -> VaultResult<Value> {
-    if !caller.is_admin() {
-        return Err(VaultError::Unauthorized);
-    }
+fn handle_rotate(
+    store: &mut VaultStore,
+    msg: &Message,
+    caller: &Caller,
+    well_known: &HashSet<String>,
+) -> VaultResult<Value> {
     let request: VaultRotateRequest = serde_json::from_value(msg.payload.clone())?;
     validate_key(&request.key)?;
+    if !caller.is_well_known_admin(well_known) {
+        let existing = store.get_record(&request.key)?;
+        let Some(existing) = existing else {
+            return Err(VaultError::Unauthorized);
+        };
+        let owner_ilk = secret_owner_ilk(&existing.metadata);
+        match (owner_ilk, caller.ilk_id.as_deref()) {
+            (Some(owner), Some(self_ilk)) if owner == self_ilk => {}
+            _ => return Err(VaultError::Unauthorized),
+        }
+    }
     let value_bytes = serde_json::to_vec(&request.value)?;
     if value_bytes.len() > MAX_SECRET_VALUE_BYTES {
         return Err(VaultError::InvalidRequest(
@@ -313,12 +376,25 @@ fn handle_rotate(store: &mut VaultStore, msg: &Message, caller: &Caller) -> Vaul
     }))
 }
 
-fn handle_rollback(store: &mut VaultStore, msg: &Message, caller: &Caller) -> VaultResult<Value> {
-    if !caller.is_admin() {
-        return Err(VaultError::Unauthorized);
-    }
+fn handle_rollback(
+    store: &mut VaultStore,
+    msg: &Message,
+    caller: &Caller,
+    well_known: &HashSet<String>,
+) -> VaultResult<Value> {
     let request: VaultKeyRequest = serde_json::from_value(msg.payload.clone())?;
     validate_key(&request.key)?;
+    if !caller.is_well_known_admin(well_known) {
+        let existing = store.get_record(&request.key)?;
+        let Some(existing) = existing else {
+            return Err(VaultError::Unauthorized);
+        };
+        let owner_ilk = secret_owner_ilk(&existing.metadata);
+        match (owner_ilk, caller.ilk_id.as_deref()) {
+            (Some(owner), Some(self_ilk)) if owner == self_ilk => {}
+            _ => return Err(VaultError::Unauthorized),
+        }
+    }
     let result = store.rollback(&request.key, caller)?;
     Ok(json!({
         "status": "ok",
@@ -328,8 +404,15 @@ fn handle_rollback(store: &mut VaultStore, msg: &Message, caller: &Caller) -> Va
     }))
 }
 
-fn handle_put(store: &mut VaultStore, msg: &Message, caller: &Caller) -> VaultResult<Value> {
-    if !caller.is_admin() {
+fn handle_put(
+    store: &mut VaultStore,
+    msg: &Message,
+    caller: &Caller,
+    well_known: &HashSet<String>,
+) -> VaultResult<Value> {
+    // Model D': only well-known admin ILKs (SY.admin, SY.architect) can
+    // write to vault. Other nodes consume secrets via resolve_resource.
+    if !caller.is_well_known_admin(well_known) {
         return Err(VaultError::Unauthorized);
     }
     let request: fluxbee_sdk::VaultPutRequest = serde_json::from_value(msg.payload.clone())?;
@@ -350,10 +433,26 @@ fn handle_put(store: &mut VaultStore, msg: &Message, caller: &Caller) -> VaultRe
     }))
 }
 
+/// Extract the canonical owner ILK from a metadata record, preferring the
+/// new `ilk` field (Model D') and falling back to the legacy `owner_ilk`
+/// string for transitional reads of secrets written by the old schema.
+fn secret_owner_ilk(metadata: &VaultMetadata) -> Option<&str> {
+    if let Some(ilk) = metadata.ilk.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        return Some(ilk);
+    }
+    let legacy = metadata.owner_ilk.trim();
+    if legacy.is_empty() {
+        None
+    } else {
+        Some(legacy)
+    }
+}
+
 fn handle_get(
     store: &mut VaultStore,
     msg: &Message,
     caller: &Caller,
+    _well_known: &HashSet<String>,
     include_value: bool,
 ) -> VaultResult<Value> {
     let key = request_key_required(&msg.payload)?;
@@ -577,6 +676,26 @@ impl VaultStore {
                     continue;
                 }
             }
+            // Model D' filter: resource_type
+            if let Some(resource_type) = filter.resource_type.as_deref() {
+                let resource_matches = metadata
+                    .resource_type
+                    .as_deref()
+                    .map(|v| v == resource_type)
+                    .unwrap_or(false);
+                if !resource_matches {
+                    continue;
+                }
+            }
+            // Model D' filter: ilk — `Some("")` means "pool only" (no owner),
+            // `Some("ilk:...")` means "dedicated to that ILK", `None` means
+            // "don't filter".
+            if let Some(ilk_filter) = filter.ilk.as_deref() {
+                let secret_ilk = secret_owner_ilk(&metadata).unwrap_or("");
+                if ilk_filter != secret_ilk {
+                    continue;
+                }
+            }
             if !filter
                 .tags
                 .iter()
@@ -584,9 +703,10 @@ impl VaultStore {
             {
                 continue;
             }
-            if !caller.is_admin() && authorize_read(caller, &metadata, true).is_err() {
-                continue;
-            }
+            // Model D': list is open. Anyone in the hive can see metadata of
+            // any secret. The protection is on `vault_get` plaintext, not on
+            // the list of keys.
+            let _ = caller; // silence unused warning in this loop scope
             summaries.push(VaultSecretSummary {
                 key,
                 metadata,
@@ -810,6 +930,15 @@ fn audit_with_tx(
     Ok(())
 }
 
+/// Resolve the caller's identity from the incoming message.
+///
+/// In Model D' vault never trusts `routing.src_l2_name` for authorization
+/// — it's kept here only for audit logging. The real key is `meta.src_ilk`,
+/// which the caller pre-computed (deterministic for SY, from env var for
+/// dynamic AI/IO/WF) and which vault may also enrich with `tenant_id` /
+/// `ilk_type` by reading identity SHM. If the caller's ILK is not yet in
+/// SHM (identity at boot, fresh node), tenant/ilk_type stay `None` and
+/// downstream auth falls back to direct ILK-equality match.
 fn resolve_caller(config_dir: &Path, msg: &Message) -> VaultResult<Caller> {
     let l2_name = msg.source_l2_name().map(ToString::to_string);
     let ilk_id = msg.meta.src_ilk.clone();
@@ -819,41 +948,51 @@ fn resolve_caller(config_dir: &Path, msg: &Message) -> VaultResult<Caller> {
         tenant_id: None,
         ilk_type: None,
     };
-    if caller.is_admin() {
-        return Ok(caller);
+    if let Some(ilk_id) = ilk_id {
+        // Best-effort enrichment from SHM; missing is fine, downstream auth
+        // handles unresolved callers.
+        if let Ok(snapshot) = list_ilks_from_hive_config(config_dir) {
+            if let Some(ilk) = snapshot.ilks.into_iter().find(|ilk| ilk.ilk_id == ilk_id) {
+                caller.tenant_id = Some(ilk.tenant_id);
+                caller.ilk_type = Some(ilk.ilk_type);
+            }
+        }
     }
-    let Some(ilk_id) = ilk_id else {
-        return Err(VaultError::Unauthorized);
-    };
-    let snapshot = list_ilks_from_hive_config(config_dir)?;
-    let Some(ilk) = snapshot.ilks.into_iter().find(|ilk| ilk.ilk_id == ilk_id) else {
-        return Err(VaultError::Unauthorized);
-    };
-    caller.tenant_id = Some(ilk.tenant_id);
-    caller.ilk_type = Some(ilk.ilk_type);
     Ok(caller)
 }
 
+/// Model D' read authorization (vault_get plaintext + vault_get_metadata
+/// when `include_value=false`).
+///
+/// Rules:
+/// - Dedicated secret (`secret.ilk` set): only that ILK reads. **No admin
+///   bypass** — the operator's "read my own secret" path is `vault_get`
+///   from a node that owns it, not admin reading on the operator's behalf.
+/// - Pool secret (`secret.ilk` empty/null): any caller of the same tenant
+///   reads. The caller's tenant is resolved via SHM in `resolve_caller`.
+/// - Caller unresolved by SHM (boot chicken/egg): only the dedicated path
+///   applies — direct ILK-equality match.
 fn authorize_read(
     caller: &Caller,
     metadata: &VaultMetadata,
-    include_value: bool,
+    _include_value: bool,
 ) -> VaultResult<()> {
-    if caller.is_admin() {
-        return Ok(());
+    let secret_owner = secret_owner_ilk(metadata);
+    let caller_ilk = caller.ilk_id.as_deref().filter(|v| !v.is_empty());
+
+    // (1) Dedicated match (works without SHM resolution).
+    if let (Some(owner), Some(self_ilk)) = (secret_owner, caller_ilk) {
+        if owner == self_ilk {
+            return Ok(());
+        }
     }
-    if metadata.tenant_id == "sys" {
-        return Err(VaultError::Unauthorized);
-    }
-    if caller.ilk_id.as_deref() == Some(metadata.owner_ilk.as_str()) {
-        return Ok(());
-    }
-    let same_tenant = caller.tenant_id.as_deref() == Some(metadata.tenant_id.as_str());
-    if !include_value && same_tenant {
-        return Ok(());
-    }
-    if same_tenant && caller.ilk_type.as_deref() == Some("system") {
-        return Ok(());
+    // (2) Pool match — only if caller is fully resolved via SHM.
+    if secret_owner.is_none() {
+        if let Some(tenant) = caller.tenant_id.as_deref() {
+            if tenant == metadata.tenant_id {
+                return Ok(());
+            }
+        }
     }
     Err(VaultError::Unauthorized)
 }
@@ -889,9 +1028,33 @@ fn validate_metadata(metadata: &VaultMetadata) -> VaultResult<()> {
             "metadata.tenant_id must be sys or tnt:<uuid>".to_string(),
         ));
     }
-    if !metadata.owner_ilk.starts_with("ilk:") {
+    // Model D': resource_type is mandatory on every PUT. We accept either
+    // a known canonical string (e.g. "openai") or a custom one — but it
+    // must be already normalized by the caller (admin's HTTP path does it
+    // before forwarding). Reject empty.
+    let Some(resource_type) = metadata.resource_type.as_deref().map(str::trim) else {
         return Err(VaultError::InvalidRequest(
-            "metadata.owner_ilk must be ilk:<uuid>".to_string(),
+            "metadata.resource_type is required (e.g. 'openai', 'postgres')".to_string(),
+        ));
+    };
+    if resource_type.is_empty() {
+        return Err(VaultError::InvalidRequest(
+            "metadata.resource_type must not be empty".to_string(),
+        ));
+    }
+    // Optional: if ilk is set, it must be a well-formed ilk: id.
+    if let Some(ilk) = metadata.ilk.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        if !ilk.starts_with("ilk:") {
+            return Err(VaultError::InvalidRequest(
+                "metadata.ilk must be ilk:<uuid> (or omit for pool)".to_string(),
+            ));
+        }
+    }
+    // owner_ilk (legacy field) is no longer required. If present, validate;
+    // if empty, fine — Model D' uses metadata.ilk instead.
+    if !metadata.owner_ilk.is_empty() && !metadata.owner_ilk.starts_with("ilk:") {
+        return Err(VaultError::InvalidRequest(
+            "metadata.owner_ilk if provided must be ilk:<uuid>; prefer metadata.ilk in Model D'".to_string(),
         ));
     }
     Ok(())

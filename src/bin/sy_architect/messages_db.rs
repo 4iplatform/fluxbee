@@ -138,9 +138,12 @@ impl MessagesDb {
         let mut config: PgConfig = url
             .parse()
             .map_err(|err: tokio_postgres::Error| MessagesDbError::InvalidUrl(err.to_string()))?;
-        // Always overwrite the dbname so a stray `/fluxbee_storage` in the
-        // URL doesn't accidentally redirect us if the secret was loaded by
-        // an operator who included a dbname out of habit.
+        if !config.get_dbname().map(str::trim).unwrap_or("").is_empty() {
+            return Err(MessagesDbError::InvalidUrl(format!(
+                "postgres secret must not include a dbname (got '{}'); load only credentials + host (postgresql://user:pass@host:port)",
+                config.get_dbname().unwrap_or("")
+            )));
+        }
         config.dbname(dbname);
         let (client, connection) = config
             .connect(NoTls)

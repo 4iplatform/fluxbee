@@ -12,6 +12,7 @@ use nix::sys::mman::shm_open;
 use nix::sys::stat::fstat;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::time::{Duration, Instant as TokioInstant};
 use uuid::Uuid;
 
@@ -1194,6 +1195,35 @@ pub fn wait_for_self_system_ilk_id(
         }
         std::thread::sleep(poll_interval);
     }
+}
+
+/// Compute the deterministic ILK assigned by `SY.identity` to a system
+/// node listed in `hive.yaml system_nodes`.
+///
+/// `node_name` must be the fully qualified L2 name (e.g.
+/// `"SY.admin@motherbee"`). The function is pure — same input always yields
+/// the same `ilk:<uuid>`. Used by:
+///
+/// - `sy_identity` at boot to seed the SHM with the well-known SY ILKs.
+/// - `sy_vault` at boot to build the well-known admin/architect ILK set
+///   (the only ILKs allowed to call `vault_put` and administrative actions
+///   in Model D').
+/// - `sy_admin`'s `vault_put` HTTP path to resolve `owner_node` to the
+///   exact `owner_ilk` of the target consumer.
+///
+/// Algorithm: `sha256("fluxbee:identity:system-ilk:v1:" || node_name)`,
+/// take the first 16 bytes, force the version (5) and variant (RFC4122)
+/// bits, and emit as a UUID.
+pub fn deterministic_system_ilk_id(node_name: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"fluxbee:identity:system-ilk:v1:");
+    hasher.update(node_name.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!("ilk:{}", Uuid::from_bytes(bytes))
 }
 
 /// Environment variable that the orchestrator injects when spawning a

@@ -157,19 +157,32 @@ fi
 step "Removing router sockets..."
 $SUDO find "$RUN_DIR/routers" -maxdepth 1 \( -type s -o -type f \) -name '*.sock' -delete 2>/dev/null || true
 
-# ── 5. Wipe entire $STATE_DIR (every subdir: state/, nodes/, vendor/, dist/, ssh/, blob/, vault.db, etc.) ──
+# ── 5. Vault: explicit wipe of secrets DB + master key ────────────────────
+# Phase J / J' contract: every secret in the cluster lives in vault.db
+# (AES-256-GCM at rest, encrypted with vault.master.key). Deleting both is
+# the only safe way to start clean — there is no separate "list and delete
+# every secret" path because by spec vault is the canonical and only secrets
+# store, and `fluxbee_cleanall.sh` is the canonical reset.
+VAULT_DB="$STATE_DIR/vault.db"
+VAULT_KEY="$CONFIG_DIR/vault.master.key"
+if [[ -e "$VAULT_DB" || -e "$VAULT_KEY" ]]; then
+  step "Removing vault secrets store (vault.db + vault.master.key)"
+  $SUDO rm -f "$VAULT_DB" "$VAULT_KEY" 2>/dev/null || true
+fi
+
+# ── 6. Wipe entire $STATE_DIR (every subdir: state/, nodes/, vendor/, dist/, ssh/, blob/, ...) ──
 if [[ -d "$STATE_DIR" ]]; then
-  step "Wiping contents of $STATE_DIR (everything: state, nodes, secrets, vendor, dist, ssh, blob, vault.db, ...)"
+  step "Wiping contents of $STATE_DIR (everything: state, nodes, vendor, dist, ssh, blob, ...)"
   $SUDO find "$STATE_DIR" -mindepth 1 -delete 2>/dev/null || true
 fi
 
-# ── 6. Wipe entire $CONFIG_DIR (hive.yaml, handbook, *.env, secrets.json, vault.master.key, ...) ──
+# ── 7. Wipe entire $CONFIG_DIR (hive.yaml, handbook, *.env, secrets.json, ...) ──
 if [[ -d "$CONFIG_DIR" ]]; then
-  step "Wiping contents of $CONFIG_DIR (hive.yaml, handbook, *.env, secrets, vault.master.key, ...)"
+  step "Wiping contents of $CONFIG_DIR (hive.yaml, handbook, *.env, secrets, ...)"
   $SUDO find "$CONFIG_DIR" -mindepth 1 -delete 2>/dev/null || true
 fi
 
-# ── 7. Postgres — drop only if URL points at localhost ────────────────────
+# ── 8. Postgres — drop only if URL points at localhost ────────────────────
 step "Checking Postgres URL..."
 if [[ -z "$DB_URL" ]]; then
   echo "  no FLUXBEE_DATABASE_URL / JSR_DATABASE_URL / secrets.json database_url found"
@@ -194,7 +207,7 @@ else
   fi
 fi
 
-# ── 8. Done ────────────────────────────────────────────────────────────────
+# ── 9. Done ────────────────────────────────────────────────────────────────
 step "Cleanall complete. Host has no Fluxbee state."
 echo
 echo "Next steps:"

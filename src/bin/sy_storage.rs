@@ -2456,18 +2456,17 @@ fn extract_postgres_url_from_vault_value(value: &Value) -> Option<String> {
 
 fn database_config_from_url(url: &str) -> Result<PgConfig, StorageError> {
     let config: PgConfig = url.parse()?;
-    // The vault secret carrying this URL should contain credentials + host
-    // ONLY (no dbname). storage hardcodes its dbname (`STORAGE_DB_NAME`) and
-    // overwrites whatever came in via `with_dbname`. If the operator did
-    // include a dbname here, log a warning so they know it's being ignored
-    // and other consumers can share the same secret.
-    if config.get_dbname().map(str::trim).unwrap_or("").len() > 0 {
-        tracing::warn!(
-            dbname = %config.get_dbname().unwrap_or(""),
-            target_dbname = STORAGE_DB_NAME,
-            "vault postgres secret carried an embedded dbname; ignoring it. \
-             The secret should be shared across nodes — load credentials + host only."
-        );
+    // The vault postgres secret must contain credentials + host ONLY.
+    // The dbname is the consumer's responsibility (storage uses STORAGE_DB_NAME,
+    // identity uses IDENTITY_DB_NAME, etc.) — that way one secret per cluster
+    // serves every consumer in the tenant. Rejecting up-front so the operator
+    // notices early instead of getting a stale/duplicate secret.
+    if !config.get_dbname().map(str::trim).unwrap_or("").is_empty() {
+        return Err(format!(
+            "postgres secret must not include a dbname (got '{}'); load only credentials + host (postgresql://user:pass@host:port)",
+            config.get_dbname().unwrap_or("")
+        )
+        .into());
     }
     Ok(config)
 }

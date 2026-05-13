@@ -37,8 +37,8 @@ pub use cognition::{
     SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, SUBJECT_STORAGE_COGNITION_THREADS,
 };
 pub use identity::{
-    identity_shm_name_for_hive, identity_system_call, identity_system_call_ok,
-    list_ich_options_from_hive_config, list_ich_options_from_hive_id,
+    deterministic_system_ilk_id, identity_shm_name_for_hive, identity_system_call,
+    identity_system_call_ok, list_ich_options_from_hive_config, list_ich_options_from_hive_id,
     list_ich_options_from_shm_name, load_hive_id, provision_ilk, read_self_ilk_from_env,
     read_self_tenant_from_env, resolve_identity_option_from_hive_config,
     resolve_identity_option_from_hive_id, resolve_identity_option_from_shm_name,
@@ -101,15 +101,15 @@ pub use timer::{
     TIMER_LIST_MAX_LIMIT, TIMER_MIN_DURATION_MS, TIMER_NODE_FAMILY, TIMER_NODE_KIND,
 };
 pub use vault::{
-    parse_vault_ref, resolve_vault_ref, vault_delete, vault_get, vault_get_metadata,
-    vault_get_with_retry, vault_list, vault_put, vault_rollback, vault_rotate, VaultCaller,
-    VaultDeleteResponse, VaultError, VaultFilter, VaultGetMetadataRequest,
-    VaultGetMetadataResponse, VaultGetRequest, VaultGetResponse, VaultKeyRequest, VaultListRequest,
-    VaultListResponse, VaultMetadata, VaultPutRequest, VaultPutResponse, VaultRetryPolicy,
-    VaultRollbackResponse, VaultRotateRequest, VaultRotateResponse, VaultSecretSummary,
-    VaultValueResponse, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET,
-    MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE,
-    MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE,
-    MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
-    VAULT_REF_PREFIX,
+    normalize_resource_type, parse_vault_ref, resolve_resource, resolve_vault_ref, vault_delete,
+    vault_get, vault_get_metadata, vault_get_with_retry, vault_list, vault_put, vault_rollback,
+    vault_rotate, ResourceType, VaultCaller, VaultDeleteResponse, VaultError, VaultFilter,
+    VaultGetMetadataRequest, VaultGetMetadataResponse, VaultGetRequest, VaultGetResponse,
+    VaultKeyRequest, VaultListRequest, VaultListResponse, VaultMetadata, VaultPutRequest,
+    VaultPutResponse, VaultRetryPolicy, VaultRollbackResponse, VaultRotateRequest,
+    VaultRotateResponse, VaultSecretSummary, VaultValueResponse, MSG_VAULT_DELETE,
+    MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET, MSG_VAULT_GET_METADATA,
+    MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE, MSG_VAULT_LIST,
+    MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE, MSG_VAULT_ROLLBACK,
+    MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE, VAULT_REF_PREFIX,
 };

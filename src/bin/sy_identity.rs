@@ -3741,17 +3741,10 @@ fn ensure_l2_name(name: &str, hive_id: &str) -> String {
     }
 }
 
-fn deterministic_system_ilk_id(node_name: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"fluxbee:identity:system-ilk:v1:");
-    hasher.update(node_name.as_bytes());
-    let digest = hasher.finalize();
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x50;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    format!("ilk:{}", Uuid::from_bytes(bytes))
-}
+// Re-exported from the SDK so sy_vault, sy_admin, and any future consumer
+// of the well-known SY ILK formula share a single source of truth. Keeping
+// a local alias here so existing call sites compile unchanged.
+use fluxbee_sdk::deterministic_system_ilk_id;
 
 fn response_name(action: &str) -> &'static str {
     match action {
@@ -5283,12 +5276,13 @@ async fn initialize_identity_database_backend(
         Ok(value) => value,
         Err(err) => return (None, Some(format!("invalid postgres_url: {err}"))),
     };
-    if base.get_dbname().map(str::trim).unwrap_or("").len() > 0 {
-        tracing::warn!(
-            dbname = %base.get_dbname().unwrap_or(""),
-            target_dbname = IDENTITY_DB_NAME,
-            "vault postgres secret carried an embedded dbname; identity is ignoring it. \
-             The secret should be shared across nodes — load credentials + host only."
+    if !base.get_dbname().map(str::trim).unwrap_or("").is_empty() {
+        return (
+            None,
+            Some(format!(
+                "postgres secret must not include a dbname (got '{}'); load only credentials + host (postgresql://user:pass@host:port)",
+                base.get_dbname().unwrap_or("")
+            )),
         );
     }
     if let Err(err) = ensure_database_exists(&base, IDENTITY_DB_NAME).await {

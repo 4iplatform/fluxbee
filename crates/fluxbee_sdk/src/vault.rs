@@ -27,10 +27,130 @@ pub const MSG_VAULT_ROTATE_RESPONSE: &str = "VAULT_ROTATE_RESPONSE";
 pub const MSG_VAULT_ROLLBACK: &str = "VAULT_ROLLBACK";
 pub const MSG_VAULT_ROLLBACK_RESPONSE: &str = "VAULT_ROLLBACK_RESPONSE";
 
+/// Canonical resource types vault knows about. Drives the consumer-side
+/// match in Model D' (`resolve_resource(ResourceType::Openai, ...)` → vault
+/// returns the most recent secret with `metadata.resource_type == "openai"`).
+///
+/// Serialized as a plain lowercase `snake_case` string on the wire so the
+/// JSON payload is consistent regardless of which language/SDK builds the
+/// request. `Custom` covers providers not yet in the enum; promote to a
+/// dedicated variant once stable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceType {
+    Postgres,
+    Openai,
+    Anthropic,
+    GoogleCalendar,
+    Gmail,
+    GoogleDrive,
+    Slack,
+    Hubspot,
+    LinkedHelper,
+    /// String must already be normalized (`normalize_resource_type`).
+    Custom(String),
+}
+
+impl ResourceType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            ResourceType::Postgres => "postgres",
+            ResourceType::Openai => "openai",
+            ResourceType::Anthropic => "anthropic",
+            ResourceType::GoogleCalendar => "google_calendar",
+            ResourceType::Gmail => "gmail",
+            ResourceType::GoogleDrive => "google_drive",
+            ResourceType::Slack => "slack",
+            ResourceType::Hubspot => "hubspot",
+            ResourceType::LinkedHelper => "linked_helper",
+            ResourceType::Custom(s) => s.as_str(),
+        }
+    }
+
+    /// Parse from the wire string (already normalized). Unknown values
+    /// become `Custom`. Use [`normalize_resource_type`] first if the input
+    /// might not be canonical.
+    pub fn from_wire(s: &str) -> Self {
+        match s {
+            "postgres" => Self::Postgres,
+            "openai" => Self::Openai,
+            "anthropic" => Self::Anthropic,
+            "google_calendar" => Self::GoogleCalendar,
+            "gmail" => Self::Gmail,
+            "google_drive" => Self::GoogleDrive,
+            "slack" => Self::Slack,
+            "hubspot" => Self::Hubspot,
+            "linked_helper" => Self::LinkedHelper,
+            other => Self::Custom(other.to_string()),
+        }
+    }
+}
+
+impl serde::Serialize for ResourceType {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ResourceType {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        Ok(ResourceType::from_wire(&s))
+    }
+}
+
+/// Normalize a free-form resource type string into the canonical wire form.
+/// Lowercase, replace runs of non-alphanumeric with single `_`, trim
+/// leading/trailing `_`. Rejects empty / digits-only / over 64 chars.
+///
+/// Examples: `"OpenAI"` → `"openai"`, `"Google Calendar"` → `"google_calendar"`,
+/// `"linked-helper"` → `"linked_helper"`.
+pub fn normalize_resource_type(raw: &str) -> Result<String, String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let mut out = String::with_capacity(lower.len());
+    let mut prev_underscore = true;
+    for ch in lower.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            prev_underscore = false;
+        } else if !prev_underscore {
+            out.push('_');
+            prev_underscore = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    if out.is_empty() {
+        return Err(format!("resource_type '{raw}' normalized to empty string"));
+    }
+    if out.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("resource_type '{raw}' must contain at least one letter"));
+    }
+    if out.len() > 64 {
+        return Err(format!(
+            "resource_type '{out}' is too long (max 64 chars)"
+        ));
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VaultMetadata {
     pub tenant_id: String,
+    /// Legacy field in the Phase J (pre-Model-D') schema. New consumers in
+    /// Model D' should use `resource_type` + optional `ilk` instead and
+    /// leave `owner_ilk` defaulted (empty string is acceptable on the wire
+    /// during the transition; vault rewrites under Phase J' drop it).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub owner_ilk: String,
+    /// Canonical resource type (e.g. "openai", "postgres"). Required in
+    /// Model D' write paths; `None` only for legacy reads of older secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_type: Option<String>,
+    /// Owner ILK in Model D'. `None` means the secret lives in the tenant's
+    /// pool and any caller of the same tenant can read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ilk: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -98,6 +218,15 @@ pub struct VaultFilter {
     pub prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
+    /// Filter by resource type (canonical wire form, e.g. "openai"). New
+    /// in Model D'; older vault servers ignore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_type: Option<String>,
+    /// Filter by owner ILK. Pass `Some("ilk:<uuid>")` to match secrets
+    /// dedicated to that ILK; pass `Some("")` to match pool secrets
+    /// explicitly. `None` means "don't filter by owner".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ilk: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -529,6 +658,100 @@ pub async fn resolve_vault_ref(
     let response =
         vault_get_with_retry(sender, receiver, caller, &target, &key, policy).await?;
     response.value.ok_or(VaultError::EmptyValue { key })
+}
+
+/// Resolve a Model D' resource for the calling node.
+///
+/// Tries two queries against vault:
+/// 1. **Dedicated**: secrets with `(resource_type=X, tenant_id=mine, ilk=my_ilk)`.
+/// 2. **Pool**: secrets with `(resource_type=X, tenant_id=mine, ilk=null)`.
+///
+/// Returns the most recently-created matching secret's plaintext `value`,
+/// or `Ok(None)` if nothing was found in either query (degraded boot — the
+/// node should run without that capability and log).
+///
+/// `Err` is returned on transport problems, malformed responses, or
+/// `vault_get` returning a non-pool secret the caller can't decrypt. The
+/// caller decides whether to retry or degrade.
+///
+/// Notes for callers:
+/// - Each node hardcodes its `REQUIRED_RESOURCES` and calls this once per
+///   entry at boot and on each refresh tick (default 60s).
+/// - The two queries are explicit (not a single composite query) so the
+///   reading semantics — "your dedicated key wins over the pool" — is
+///   visible in code.
+/// - `vault_list` returns metadata only; we follow up with a single
+///   `vault_get` on the chosen key to fetch the plaintext, paying for the
+///   secret retrieval only when there is a match.
+pub async fn resolve_resource(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    caller: VaultCaller<'_>,
+    hive_id: &str,
+    resource: ResourceType,
+    my_tenant: &str,
+    timeout: Duration,
+) -> Result<Option<Value>, VaultError> {
+    let target = format!("SY.vault@{}", hive_id);
+    let resource_str = resource.as_str().to_string();
+
+    // (1) Dedicated to caller — only attempt if caller has an ILK.
+    if !caller.src_ilk.is_empty() {
+        if let Some(value) = list_then_get_first(
+            sender,
+            receiver,
+            caller,
+            &target,
+            &resource_str,
+            my_tenant,
+            Some(caller.src_ilk.to_string()),
+            timeout,
+        )
+        .await?
+        {
+            return Ok(Some(value));
+        }
+    }
+
+    // (2) Pool (no owner_ilk).
+    let value = list_then_get_first(
+        sender,
+        receiver,
+        caller,
+        &target,
+        &resource_str,
+        my_tenant,
+        Some(String::new()),
+        timeout,
+    )
+    .await?;
+    Ok(value)
+}
+
+async fn list_then_get_first(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    caller: VaultCaller<'_>,
+    target: &str,
+    resource_type: &str,
+    tenant_id: &str,
+    ilk_filter: Option<String>,
+    timeout: Duration,
+) -> Result<Option<Value>, VaultError> {
+    let filter = VaultFilter {
+        prefix: None,
+        tenant_id: Some(tenant_id.to_string()),
+        resource_type: Some(resource_type.to_string()),
+        ilk: ilk_filter,
+        tags: Vec::new(),
+        limit: Some(1),
+    };
+    let list = vault_list(sender, receiver, caller, target, Some(filter), timeout).await?;
+    let Some(summary) = list.secrets.into_iter().next() else {
+        return Ok(None);
+    };
+    let response = vault_get(sender, receiver, caller, target, &summary.key, timeout).await?;
+    Ok(response.value)
 }
 
 fn ensure_ok(
