@@ -363,12 +363,9 @@ Patrón canónico para todos los nodos in-scope:
 - [x] VA-J5d. Cognition ya no hace cross-read del `secrets.json` de storage. Tiene su propia config `config.storage.postgres_url_ref` que el operador apunta al mismo (o distinto) `vault://<key>` que storage usa. Loose coupling vía vault, no via filesystem.
 - [ ] VA-J5e. E2E: cognition cold boot sin secret → `vault_put sys:cognition-openai-api-key` + `vault_put sys:storage-postgres-url` → `CONFIG_SET cognition ... api_key_ref + storage_postgres_url_ref` → restart → cognition converge a `configured`. **Pendiente test en VM.**
 
-### J6. `ai.generic`
+### J6. `ai.generic` — **superseded** por Phase J' Model D' (ver §12bis-AI abajo)
 
-- [ ] VA-J6a. `CONFIG_SET` de ai-generic acepta solo `api_key_ref`; sin plaintext, sin fallback a env, sin YAML inline (los tres están en `resolve_openai_api_key_with_source`).
-- [ ] VA-J6b. Eliminar `AI_LOCAL_SECRET_KEY_OPENAI`, `load_local_openai_api_key`, el env var fallback y el inline YAML.
-- [ ] VA-J6c. `resolve_openai_api_key` queda como: parsear ref + `vault_get_with_retry`. Solo una fuente.
-- [ ] VA-J6d. E2E: cold boot sin secret → `vault_put` → siguiente request resuelve OK.
+VA-J6a..d quedaron sin sentido en Model D': los nodos AI no manejan refs ni hacen CONFIG_SET de secrets. La migración real está cerrada en J'-AI más abajo, donde `ai-generic` y `ai-frontdesk-gov` consumen vault directo con `resolve_resource(Openai)` y borran todas las fuentes alternativas (env var, YAML inline, local file, control plane legacy).
 
 ### J7. SDK helpers — preparatorio, va PRIMERO antes de migrar nodos
 
@@ -446,7 +443,7 @@ Los Go SY actuales (`sy-timer`, `sy-opa-rules`, `sy-wf-rules`) no necesitan vaul
 - [x] VA-J'-1b. Agregar `enum ResourceType` + `normalize_resource_type(&str) -> Result<String>` en `crates/fluxbee_sdk/src/vault.rs`. Tests unitarios de normalización. **Hecho** — enum con Serialize/Deserialize manual como string canonical.
 - [x] VA-J'-1c. Agregar `VaultPutRequest` / `VaultListRequest` actualizados al schema del modelo D' (`resource_type` requerido, `ilk` opcional, `owner_ilk` eliminado). **Hecho** — `VaultFilter` y `VaultMetadata` extendidos.
 - [x] VA-J'-1d. Agregar SDK helper `fluxbee_sdk::vault::resolve_resource(sender, receiver, caller, hive, resource_type, my_tenant, timeout) -> Result<Option<Value>>` que implementa el match path (owned → tenant pool → sys pool → None). Es la API canónica que los nodos consumer usan. **Hecho**.
-- [ ] VA-J'-1e. Borrar `parse_vault_ref` y `resolve_vault_ref` (modelo viejo) o marcarlos como deprecated si quedan callers transitorios. En modelo D' los nodos no manejan refs. **Pendiente** — admin executor todavía importa parse_vault_ref para CONFIG_SET de WAN; eval después.
+- [x] VA-J'-1e. Borrar `parse_vault_ref` y `resolve_vault_ref` (modelo viejo) o marcarlos como deprecated si quedan callers transitorios. En modelo D' los nodos no manejan refs. **Hecho** — funciones + tests borrados de `crates/fluxbee_sdk/src/vault.rs`; re-exports limpiados en `lib.rs` y `prelude.rs`. `VAULT_REF_PREFIX` se mantiene porque `vault_get_with_retry` lo acepta defensivamente como fallback (no daña).
 
 ### J'-2. sy_vault: schema + auth
 
@@ -481,7 +478,7 @@ Para cada nodo consumer, el patrón es:
 - [x] VA-J'-5a. `REQUIRED_RESOURCES = [(Postgres, "database.postgres_url")]`. Borrar `STORAGE_LOCAL_REF_KEY_POSTGRES_URL` y `persist_local_postgres_url_ref` / `load_local_postgres_url_ref`. **Hecho** — sin REQUIRED_RESOURCES literal (overkill para un solo resource), pero el discovery es por `resolve_resource(Postgres, …)` y las helpers locales fueron borradas.
 - [x] VA-J'-5b. `apply_storage_config_set`: borrar todo manejo de `postgres_url` / `postgres_url_ref` (el field deja de existir en CONFIG_SET). El handler de CONFIG_SET pasa a manejar SOLO config no-secreta (si la tiene; storage hoy solo tenía postgres_url → CONFIG_SET puede quedar como inert con un mensaje "no secret-bearing fields, use vault_put"). **Hecho** — rechaza `postgres_url`/`postgres_url_ref` con `INVALID_CONFIG`.
 - [x] VA-J'-5c. Boot path: `resolve_resource(Postgres, my_ilk, my_tenant)` → si lo encuentra, inicializa el Storage backend; si no, degraded (igual que hoy con `STORAGE_NOT_READY`). **Hecho** — strict rejection de URLs con dbname embebido (cada consumer agrega su dbname con `with_dbname`).
-- [ ] VA-J'-5d. Refresh loop cada 60s. Si cambió el postgres URL, reconecta el pool. **Pendiente**.
+- [x] VA-J'-5d. Refresh loop cada 60s. **Hecho parcial** — `run_storage_vault_refresh_loop` probea `resolve_resource(Postgres)` cada 60s y actualiza un `AtomicBool vault_postgres_live` que el CONFIG_GET reporta en `resources.postgres.live_in_vault`. **Reporting-only**: la reconexión del pool en hot rotation sigue requiriendo `restart sy-storage` (documentado en las notas del CONFIG_GET).
 - [x] VA-J'-5e. `CONFIG_GET` reporta `resources.postgres`. **Hecho**.
 - [ ] VA-J'-5f. E2E: operador `vault_put` con `resource_type=postgres, tenant=sys` (en pool, sin ilk) → restart storage → reporta `resolved=true, source=pool`. **Pendiente test en VM**.
 
@@ -490,7 +487,7 @@ Para cada nodo consumer, el patrón es:
 - [x] VA-J'-6a. `REQUIRED_RESOURCES = [(Postgres, "database.postgres_url")]`. Borrar `IDENTITY_LOCAL_REF_KEY_POSTGRES_URL` y persist/load equivalentes. **Hecho** — constante y helpers borrados.
 - [x] VA-J'-6b. `apply_identity_config_set`: borrar manejo de `postgres_url_ref`. CONFIG_SET queda solo para config no-secreta (si aplica). **Hecho** — rechaza secret-bearing fields.
 - [x] VA-J'-6c. Boot path para resolver Postgres: usar `resolve_resource(Postgres, my_self_ilk_deterministic, "sys")`. El operador asigna el secret a identity vía `owner_node: "SY.identity"` (que admin resuelve a `identity_ilk_deterministic`). Match directo sin SHM resolution. **Hecho** — usa `DEFAULT_ROOT_TENANT_ID` como tenant, el match sys-pool universal cubre el caso por defecto.
-- [ ] VA-J'-6d. Refresh loop como storage. **Pendiente**.
+- [x] VA-J'-6d. Refresh loop como storage. **Hecho** — `run_identity_vault_refresh_loop` corre solo en motherbee primary, cada 60s probea `resolve_resource(Postgres)` y actualiza `vault_postgres_live` que CONFIG_GET refleja. Reporting-only; reconexión sigue requiriendo restart.
 - [x] VA-J'-6e. CONFIG_GET reporta `resources.postgres`. **Hecho**.
 - [ ] VA-J'-6f. E2E: operador `vault_put` con `resource_type=postgres, tenant=sys, owner_node="SY.identity"` → restart identity → DB ready. **Pendiente test en VM**.
 
@@ -499,7 +496,7 @@ Para cada nodo consumer, el patrón es:
 - [x] VA-J'-7a. `REQUIRED_RESOURCES = [(OpenAi, "ai_providers.openai.api_key")]`. **Hecho** — discovery directo por `resolve_resource(Openai, …)`.
 - [x] VA-J'-7b. Borrar `OpenAiSection.api_key_ref` del schema de admin executor config. CONFIG_SET de admin solo persiste `default_model`, `max_tokens`, `temperature`, `top_p`, `catalog.{mode,actions}`. **Hecho**.
 - [x] VA-J'-7c. `build_admin_executor_ai_runtime` ahora usa `resolve_resource(OpenAi, ...)` en vez de leer `api_key_ref` del config. **Hecho**.
-- [ ] VA-J'-7d. Refresh loop. **Pendiente** (hoy refresh manual por CONFIG_SET no-secret + boot; agregar periodic).
+- [x] VA-J'-7d. Refresh loop. **Hecho** — `run_admin_executor_vault_refresh_loop` corre cada 60s y llama `refresh_admin_executor_ai_runtime`, que ya tenía la lógica de probe + reload del runtime. Flippa `executor_configured` cuando aparece/desaparece el secret en vault.
 - [x] VA-J'-7e. CONFIG_GET reporta `resources.openai`. **Hecho**.
 - [ ] VA-J'-7f. E2E con `vault_put` en pool sys + restart admin → executor configured. **Pendiente test en VM**.
 
@@ -508,7 +505,7 @@ Para cada nodo consumer, el patrón es:
 - [x] VA-J'-8a. `REQUIRED_RESOURCES = [(OpenAi, "ai_providers.openai.api_key"), (Postgres, "storage.messages_db_url")]`. **Hecho** — discovery directo por `resolve_resource` para ambos.
 - [x] VA-J'-8b. Borrar `api_key_ref` y `messages_db_url_ref` del schema. Borrar `extract_*_ref`, `reject_*_plaintext`, `resolve_*_from_vault` que armé en J4. **Hecho** — reemplazado por `reject_architect_secret_fields` + `resolve_architect_openai_api_key_from_vault` / `resolve_messages_db_url_from_vault` que usan `resolve_resource`.
 - [x] VA-J'-8c. `build_architect_ai_runtime` y `refresh_architect_messages_db_url` usan `resolve_resource(...)`. El messages_db se distingue del OpenAI por `resource_type=postgres`. Si hay un Postgres dedicado a architect via `ilk`, lo usa; si no, el del pool sys. **Hecho**.
-- [ ] VA-J'-8d. Refresh loop unificado para ambos resources. **Pendiente**.
+- [x] VA-J'-8d. Refresh loop unificado para ambos resources. **Hecho** — `architect_secret_refresh_loop` actualizado: ahora refresca **siempre** (no solo cuando degraded) tanto `refresh_architect_ai_runtime` como `refresh_architect_messages_db_url` cada 10s (lo dejo así porque la conexión es local; se puede subir a 60s en producción si hace ruido).
 - [x] VA-J'-8e. CONFIG_GET reporta `resources.{openai,postgres}`. **Hecho**.
 - [ ] VA-J'-8f. E2E con dos `vault_put`s (openai en pool + postgres en pool) y verificación de archi. **Pendiente test en VM**.
 
@@ -517,9 +514,39 @@ Para cada nodo consumer, el patrón es:
 - [x] VA-J'-9a. `REQUIRED_RESOURCES = [(OpenAi, "ai_providers.openai.api_key"), (Postgres, "storage.postgres_url")]`. **Hecho** — discovery directo por `resolve_cognition_resource(<type>, …)`.
 - [x] VA-J'-9b. Borrar `COGNITION_LOCAL_REF_KEY_OPENAI`, `COGNITION_LOCAL_REF_KEY_STORAGE_POSTGRES_URL`, `extract_*_ref`, `reject_*_plaintext`, `resolve_*_to_plaintext`, `persist_local_*_ref` (todo lo de J5 legacy). **Hecho** — todas las helpers y constantes borradas, reemplazadas por `reject_cognition_secret_fields`.
 - [x] VA-J'-9c. Cognition usa el MISMO secret de pool que storage para Postgres (mismo `resource_type=postgres, tenant=sys, ilk=null` en vault). Sin duplicación. **Hecho** — comparte el pool match con storage; cognition aplica `with_dbname("fluxbee_storage")` en su path.
-- [ ] VA-J'-9d. Refresh loop. **Pendiente**.
+- [x] VA-J'-9d. Refresh loop. **Hecho** — `run_vault_refresh_loop` corre cada 60s, probea `resolve_cognition_openai_api_key` y actualiza `ai_secret_source`. Esto cierra el "lazy state" donde cognition reportaba `degraded_no_ai_provider` hasta que llegara el primer turn semantic.
 - [x] VA-J'-9e. CONFIG_GET con `resources.{openai,postgres}`. **Hecho**.
 - [ ] VA-J'-9f. E2E: cognition cold boot sin secrets → operador hace 2 vault_puts (compartidos con storage/architect) → cognition arranca configurado. **Pendiente test en VM**.
+
+### J'-AI. `ai-generic` + `ai-frontdesk-gov` (Phase J' migration de Phase J VA-J6 legacy)
+
+- [x] VA-J'-AI-1. `ai-generic` (`nodes/ai/ai-generic/src/bin/ai_node_runner.rs`): borrar las 4 fuentes alternativas (`load_local_openai_api_key`, control plane legacy, YAML inline, env var fallback) y reemplazarlas por `resolve_resource(Openai, self_tenant_id)` puro. Usa los envs `FLUXBEE_NODE_ILK_ID` + `FLUXBEE_NODE_TENANT_ID` inyectados por el orchestrator. `OpenAiApiKeySource` queda con dos variantes: `Vault` y `Missing`. **Hecho**.
+- [x] VA-J'-AI-2. `ai-frontdesk-gov` (`nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs`): mismo cambio que ai-generic, pero como es un SY system node, usa `DEFAULT_ROOT_TENANT_ID` (no FLUXBEE_NODE_TENANT_ID). `self_ilk_id` viene de `wait_for_self_system_ilk_id` (ya estaba). **Hecho**.
+- [x] VA-J'-AI-3. Borrar `resolve_openai_api_key_source_from_effective_config` y tests asociados de ambos runners. **Hecho**.
+- [ ] VA-J'-AI-4. E2E en VM: arrancar ai-generic sin secret en vault → confirmar `OpenAiApiKeySource::Missing` en NODE_STATUS_GET → operador hace `vault_put` con `resource_type=openai` (pool sys) → siguiente request resuelve y responde OK. **Pendiente test en VM.**
+
+### J'-IO-slack. `io-slack` (Phase K parcial)
+
+- [x] VA-J'-IO-slack-1. Boot lookup via `resolve_resource(Slack, self_tenant_id)`. El secret de vault es un objeto con `app_token` + `bot_token`; helper `extract_slack_tokens_from_vault_value` valida que ambos vengan no-vacíos. **Hecho**.
+- [x] VA-J'-IO-slack-2. Eliminar las cadenas legacy: env vars (`SLACK_APP_TOKEN`/`SLACK_BOT_TOKEN`) + `resolve_secret(spawn_doc, ...)` para los dos tokens. **Hecho** — el bloque de carga en `Config::from_path_or_env` ahora deja ambos en `None` y delega al lookup post-boot. Las funciones `resolve_secret` / `json_get_string_opt` siguen porque otros campos no-secret todavía las usan.
+- [x] VA-J'-IO-slack-3. Refresh loop cada 60s (`run_slack_vault_refresh_loop`) que reusa `resolve_slack_credentials_from_vault` + `slack.reload_credentials`. Cubre vault_put post-boot y rotaciones en runtime. **Hecho**.
+- [ ] VA-J'-IO-slack-4. CONFIG_SET: hoy todavía acepta tokens vía adapter contract (path legacy de Phase J). Deprecar / rechazar en el siguiente ciclo cuando linkedhelper + io-api se migren juntos (multi-tenant). **Pendiente.**
+- [ ] VA-J'-IO-slack-5. E2E en VM: `vault_put` con `resource_type=slack` + restart → io-slack se conecta y manda un mensaje. **Pendiente test en VM.**
+
+### J'-IO-linkedhelper + J'-IO-api. Multi-tenant — postergado para charla de diseño
+
+Ambos nodos son multi-tenant (`adapters[]` en linkedhelper, `api_keys[]` en io-api con `tenant_id` + `integration_id` por entry). El patrón single-resource pool de Model D' no aplica directo: cada entry tiene su propio secret y el match por `(resource_type, tenant_id)` no es único.
+
+Antes de codear hay que decidir:
+
+- Cómo se identifica cada adapter/integration en vault — ¿por `ilk` deterministico derivado del `adapter_id` / `integration_id`? ¿O `resource_type` con sub-key?
+- Cómo cambia el contrato HTTP de `io-api`: hoy `api_keys[]` se envía en CONFIG_SET con `token_ref`; Model D' lo movería completamente a vault, pero el cliente externo todavía necesita el plaintext.
+- Cómo se enumeran los adapters/integrations sin un CONFIG_SET con la lista — ¿por discovery via `vault_list(resource_type=...)`?
+
+**Tareas posponidas hasta la charla:**
+
+- [ ] VA-J'-IO-linkedhelper-*. Migración multi-tenant.
+- [ ] VA-J'-IO-api-*. Migración multi-tenant + bearer auth contract.
 
 ### J'-10. Sy_vault tests
 
@@ -529,9 +556,9 @@ Para cada nodo consumer, el patrón es:
 
 ### J'-11. SDK cleanup
 
-- [ ] VA-J'-11a. Borrar paths del SDK que se quedaron sin callers: `build_node_secret_record`, `save_node_secret_record_with_root`, `NodeSecretWriteOptions`, `redacted_node_secret_record` si ya nadie los usa. Mantener solo lo que `secrets.json` para config no-secreta legacy aún consume.
-- [ ] VA-J'-11b. Renombrar `VaultCaller` si hace falta para reflejar el modelo D' (`src_ilk` + `src_l2_name` siguen siendo lo que pasa al wire).
-- [ ] VA-J'-11c. Borrar el campo `value_redacted` y `NODE_SECRET_REDACTION_TOKEN` si dejan de usarse en payloads de responses HTTP.
+- [ ] VA-J'-11a. Borrar paths del SDK que se quedaron sin callers: `build_node_secret_record`, `save_node_secret_record_with_root`, `NodeSecretWriteOptions`, `redacted_node_secret_record` si ya nadie los usa. **Bloqueado**: `io-api/auth.rs` todavía los usa para el flujo multi-tenant; sale cuando se cierre VA-J'-IO-api.
+- [ ] VA-J'-11b. Renombrar `VaultCaller` si hace falta para reflejar el modelo D' (`src_ilk` + `src_l2_name` siguen siendo lo que pasa al wire). **Decisión pendiente** — el nombre actual es claro, no urgente cambiarlo.
+- [x] VA-J'-11c. Borrar `NODE_SECRET_REDACTION_TOKEN` si dejan de usarse en payloads de responses HTTP. **Mantenido** — sigue siendo el token de redacción en respuestas de admin/architect/io-common para campos secretos en logs y payloads, eso NO es legacy de Phase J. Lo que sí se borró: `parse_vault_ref` y `resolve_vault_ref` legacy del SDK (ver VA-J'-1e).
 
 ### J'-12. Documentación
 
@@ -560,17 +587,13 @@ Pattern esperado (espejo de Phase J):
 - [ ] VA-K1c. Borrar paths plaintext + escrituras a `secrets.json` del nodo.
 - [ ] VA-K1d. E2E vault_put → CONFIG_SET ref → request HTTP entra al endpoint con auth correcta.
 
-### K2. `IO.slack`
+### K2. `IO.slack` — **superseded** por Phase J' (VA-J'-IO-slack)
 
-- [ ] VA-K2a. Migrar `bot_token`, `app_token`, `signing_secret` a `*_ref`.
-- [ ] VA-K2b. Borrar paths plaintext en el nodo.
-- [ ] VA-K2c. E2E: envío de mensaje a un canal slack tras `vault_put` + `CONFIG_SET ref`.
+VA-K2a..c quedaron sin sentido en Model D' (no hay `*_ref` para Slack; el secret va directo a vault como `resource_type=slack` y el nodo lo resuelve con `resolve_resource`). La migración real está cerrada en J'-IO-slack arriba.
 
-### K3. `IO.linkedhelper`
+### K3. `IO.linkedhelper` — **superseded** por Phase J' (VA-J'-IO-linkedhelper, posponido por multi-tenant)
 
-- [ ] VA-K3a. Identificar credenciales del adapter (auth con LinkedHelper API).
-- [ ] VA-K3b. Migrar a `*_ref`; borrar paths plaintext.
-- [ ] VA-K3c. E2E con un request al adapter funcionando tras el setup vault.
+VA-K3a..c quedaron sin sentido en Model D'. La migración real está en J'-IO-linkedhelper arriba, **posponida** porque el flujo multi-tenant (adapters[] con tenant + installation_key por entry) necesita charla de diseño antes de codear.
 
 ### K4. Borrado final de `secrets.json` plaintext en todo IO
 

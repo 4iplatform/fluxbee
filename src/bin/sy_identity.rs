@@ -4,6 +4,8 @@ use std::fs::OpenOptions;
 use std::future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -1527,6 +1529,7 @@ impl IdentityRuntime {
         identity_shm: Option<&mut IdentityRegionWriter>,
         control_state: &mut IdentityControlState,
         node_name: &str,
+        vault_postgres_live: bool,
     ) -> Result<Vec<IdentityDeltaEnvelope>, IdentityError> {
         if try_handle_default_node_status(sender, msg).await? {
             return Ok(Vec::new());
@@ -1555,8 +1558,12 @@ impl IdentityRuntime {
             return Ok(Vec::new());
         }
         if action == "CONFIG_GET" {
-            let payload =
-                build_identity_config_get_payload(self.is_primary, node_name, control_state);
+            let payload = build_identity_config_get_payload(
+                self.is_primary,
+                node_name,
+                control_state,
+                vault_postgres_live,
+            );
             let response = build_node_config_response_message(msg, sender.uuid(), payload);
             sender.send(response).await?;
             return Ok(Vec::new());
@@ -2501,7 +2508,7 @@ async fn main() -> Result<(), IdentityError> {
     }
     let node_config = NodeConfig {
         name: IDENTITY_NODE_BASE_NAME.to_string(),
-        router_socket: socket_dir,
+        router_socket: socket_dir.clone(),
         uuid_persistence_dir: state_dir.join("nodes"),
         uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
         config_dir: config_dir.clone(),
@@ -2641,6 +2648,26 @@ async fn main() -> Result<(), IdentityError> {
         "sy.identity started"
     );
 
+    // Periodic vault refresh: probes resolve_resource(Postgres) on motherbee
+    // primary every IDENTITY_VAULT_REFRESH_INTERVAL_SECS. Reporting-only:
+    // surfaced via resources.postgres.live_in_vault on CONFIG_GET. Identity
+    // is the SHM writer, so its ILK is deterministic and the refresh task
+    // can connect ephemeral router clients without chicken/egg.
+    let vault_postgres_live = Arc::new(AtomicBool::new(
+        db_secret_source != IdentityDbSecretSource::Missing,
+    ));
+    if is_primary {
+        std::mem::drop(tokio::spawn(run_identity_vault_refresh_loop(
+            config_dir.clone(),
+            state_dir.clone(),
+            socket_dir.clone(),
+            hive.hive_id.clone(),
+            node_name.clone(),
+            self_ilk_id.clone(),
+            Arc::clone(&vault_postgres_live),
+        )));
+    }
+
     let mut heartbeat = time::interval(Duration::from_secs(5));
     let mut alias_gc_tick = time::interval(Duration::from_secs(ALIAS_GC_INTERVAL_SECS));
     let sync_listener = sync_listener;
@@ -2724,6 +2751,7 @@ async fn main() -> Result<(), IdentityError> {
                         identity_shm.as_mut(),
                         &mut control_state,
                         &node_name,
+                        vault_postgres_live.load(Ordering::Relaxed),
                     )
                     .await
                 {
@@ -4854,6 +4882,7 @@ fn build_identity_config_get_payload(
     is_primary: bool,
     node_name: &str,
     control_state: &IdentityControlState,
+    vault_postgres_live: bool,
 ) -> Value {
     let configured = identity_secret_configured(is_primary, control_state);
     let mut notes = vec![
@@ -4863,7 +4892,7 @@ fn build_identity_config_get_payload(
                 .to_string(),
         ),
         Value::String(
-            "CONFIG_SET on SY.identity takes no secret-bearing fields. Rotating the postgres secret requires sy-identity restart to re-resolve."
+            "CONFIG_SET on SY.identity takes no secret-bearing fields. The vault refresh loop polls every 60s — `live_in_vault` reflects the latest probe. Connection reconnect on rotation still requires sy-identity restart."
                 .to_string(),
         ),
     ];
@@ -4898,6 +4927,7 @@ fn build_identity_config_get_payload(
                 "resource_type": "postgres",
                 "required": true,
                 "configured": configured,
+                "live_in_vault": vault_postgres_live,
                 "scope": "pool (tenant or sys)",
                 "consumer_dbname": IDENTITY_DB_NAME
             }
@@ -5159,6 +5189,52 @@ fn extract_postgres_url_from_vault_value(value: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(ToString::to_string)
+}
+
+const IDENTITY_VAULT_REFRESH_INTERVAL_SECS: u64 = 60;
+
+/// Polls vault for the postgres resource on motherbee primary every
+/// IDENTITY_VAULT_REFRESH_INTERVAL_SECS so CONFIG_GET reflects live vault
+/// state even if the operator added/rotated the secret post-boot. Pool
+/// reconnect on rotation still requires sy-identity restart — this flag
+/// is reporting-only, surfaced via resources.postgres.live_in_vault.
+async fn run_identity_vault_refresh_loop(
+    config_dir: PathBuf,
+    state_dir: PathBuf,
+    socket_dir: PathBuf,
+    hive_id: String,
+    node_name: String,
+    self_ilk_id: String,
+    live_flag: Arc<AtomicBool>,
+) {
+    let mut ticker = time::interval(Duration::from_secs(IDENTITY_VAULT_REFRESH_INTERVAL_SECS));
+    ticker.tick().await; // skip the first immediate tick
+    loop {
+        ticker.tick().await;
+        let (url, _source, err) = resolve_database_url(
+            &config_dir,
+            &state_dir,
+            &socket_dir,
+            &hive_id,
+            &node_name,
+            &self_ilk_id,
+            fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+        )
+        .await;
+        let live = url.is_some();
+        let prev = live_flag.swap(live, Ordering::Relaxed);
+        if prev != live {
+            tracing::info!(
+                node_name = %node_name,
+                previous = prev,
+                current = live,
+                "sy.identity vault refresh flipped postgres live flag"
+            );
+        }
+        if let Some(err) = err {
+            tracing::debug!(error = %err, "sy.identity vault refresh: lookup error (will retry)");
+        }
+    }
 }
 
 async fn initialize_identity_database_backend(

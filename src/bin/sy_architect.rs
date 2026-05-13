@@ -11517,11 +11517,39 @@ async fn status_refresh_loop(state: Arc<ArchitectState>) {
 
 async fn architect_secret_refresh_loop(state: Arc<ArchitectState>) {
     loop {
-        if !state.ai_configured.load(Ordering::Relaxed) {
-            if let Err(err) = refresh_architect_ai_runtime(&state).await {
+        // Always refresh both resources, not only when degraded: the
+        // operator may rotate the vault secret, and architect needs to pick
+        // that up without a manual restart. `refresh_architect_ai_runtime`
+        // and `refresh_architect_messages_db_url` are both idempotent and
+        // cheap when the resource hasn't changed.
+        let prev_ai = state.ai_configured.load(Ordering::Relaxed);
+        match refresh_architect_ai_runtime(&state).await {
+            Ok(now) => {
+                if prev_ai != now {
+                    tracing::info!(
+                        node_name = %state.node_name,
+                        previous = prev_ai,
+                        current = now,
+                        "sy.architect vault refresh flipped ai_configured"
+                    );
+                }
+            }
+            Err(err) => {
                 tracing::warn!(error = %err, "sy.architect vault-backed AI refresh failed");
             }
         }
+
+        let prev_db = state.messages_db_configured.load(Ordering::Relaxed);
+        let (db_present, _connected, _err) = refresh_architect_messages_db_url(&state).await;
+        if prev_db != db_present {
+            tracing::info!(
+                node_name = %state.node_name,
+                previous = prev_db,
+                current = db_present,
+                "sy.architect vault refresh flipped messages_db_configured"
+            );
+        }
+
         time::sleep(Duration::from_secs(ARCHITECT_SECRET_REFRESH_INTERVAL_SECS)).await;
     }
 }

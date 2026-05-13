@@ -155,6 +155,59 @@ async fn main() -> Result<()> {
             }
         }
     }
+
+    // Model D' — try to resolve slack credentials from vault on every boot.
+    // If vault has the secret it overrides whatever was in the persisted
+    // effective_config (which is the legacy path; will be deprecated). If
+    // vault doesn't have the secret yet, the node runs degraded and the
+    // refresh loop below will pick it up once the operator runs vault_put.
+    if let (Some(self_ilk_id_ref), Some(self_tenant_id_ref)) = (
+        self_ilk_id.as_deref().filter(|v| !v.is_empty()),
+        self_tenant_id.as_deref().filter(|v| !v.is_empty()),
+    ) {
+        match resolve_slack_credentials_from_vault(
+            &config,
+            self_ilk_id_ref,
+            self_tenant_id_ref,
+        )
+        .await
+        {
+            Some((app_token, bot_token)) => {
+                slack.reload_credentials(app_token, bot_token).await;
+                tracing::info!(
+                    node_name = %config.node_name,
+                    "io-slack credentials loaded from vault (resource_type=slack)"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    node_name = %config.node_name,
+                    "io-slack vault lookup for slack credentials returned None; running degraded (refresh loop will retry)"
+                );
+            }
+        }
+    } else {
+        tracing::warn!(
+            node_name = %config.node_name,
+            "FLUXBEE_NODE_ILK_ID / FLUXBEE_NODE_TENANT_ID not set; vault lookup skipped"
+        );
+    }
+    // Periodic vault refresh — picks up vault_put after boot or rotations.
+    {
+        let refresh_config = config.clone();
+        let refresh_slack = slack.clone();
+        let self_ilk_id_clone = self_ilk_id.clone();
+        let self_tenant_id_clone = self_tenant_id.clone();
+        tokio::spawn(async move {
+            run_slack_vault_refresh_loop(
+                refresh_config,
+                refresh_slack,
+                self_ilk_id_clone,
+                self_tenant_id_clone,
+            )
+            .await;
+        });
+    }
     let relay_policy = slack_relay_policy(&config, boot_state.effective_config.as_ref())
         .map_err(|err| anyhow::anyhow!("invalid relay policy from node config: {err}"))?;
     tracing::info!(
@@ -277,20 +330,13 @@ impl Config {
         tracing::info!(path = %spawn_cfg.path.display(), "io-slack loaded spawn config");
         let spawn_doc = Some(&spawn_cfg.doc);
 
-        let slack_app_token = env("SLACK_APP_TOKEN").or_else(|| {
-            resolve_secret(
-                spawn_doc,
-                &["slack.app_token", "slack_app_token"],
-                &["slack.app_token_ref", "slack_app_token_ref"],
-            )
-        });
-        let slack_bot_token = env("SLACK_BOT_TOKEN").or_else(|| {
-            resolve_secret(
-                spawn_doc,
-                &["slack.bot_token", "slack_bot_token"],
-                &["slack.bot_token_ref", "slack_bot_token_ref"],
-            )
-        });
+        // Model D' — Slack credentials live entirely in SY.vault under
+        // `resource_type=slack`. Local plaintext / spawn-doc / env var
+        // fallbacks were removed in Phase J' / VA-K2. The boot path here
+        // leaves credentials empty; the actual lookup happens in main()
+        // after the SDK router is up, via `resolve_resource(Slack, ...)`.
+        let slack_app_token: Option<String> = None;
+        let slack_bot_token: Option<String> = None;
 
         let blob_root = PathBuf::from(
             env("BLOB_ROOT")
@@ -583,6 +629,116 @@ fn resolve_secret(doc: Option<&Value>, value_paths: &[&str], ref_paths: &[&str])
         return env(var);
     }
     None
+}
+
+const IO_SLACK_VAULT_REFRESH_INTERVAL_SECS: u64 = 60;
+
+/// Model D' — resolve the Slack credentials by discovering the `slack`
+/// resource in SY.vault (pool match: dedicated to caller ILK → tenant pool
+/// → sys pool). The vault value is expected to be an object with both
+/// `app_token` and `bot_token` fields. Returns `Some((app_token, bot_token))`
+/// when both are present and non-empty, else `None` (degraded).
+async fn resolve_slack_credentials_from_vault(
+    config: &Config,
+    self_ilk_id: &str,
+    self_tenant_id: &str,
+) -> Option<(String, String)> {
+    let Some(hive_id) = config.node_name.split('@').nth(1).filter(|v| !v.is_empty()) else {
+        tracing::warn!(
+            node_name = %config.node_name,
+            "node_name has no @hive suffix; cannot resolve vault target"
+        );
+        return None;
+    };
+    let node_config = NodeConfig {
+        name: config.node_name.clone(),
+        router_socket: config.router_socket.clone(),
+        uuid_persistence_dir: config.uuid_persistence_dir.clone(),
+        uuid_mode: NodeUuidMode::Ephemeral,
+        config_dir: config.config_dir.clone(),
+        version: config.node_version.clone(),
+    };
+    let (sender, mut receiver) = match connect(&node_config).await {
+        Ok(pair) => pair,
+        Err(err) => {
+            tracing::warn!(error = %err, "io-slack vault lookup: ephemeral router connect failed");
+            return None;
+        }
+    };
+    let caller = fluxbee_sdk::VaultCaller::new(self_ilk_id, &config.node_name);
+    let result = fluxbee_sdk::resolve_resource(
+        &sender,
+        &mut receiver,
+        caller,
+        hive_id,
+        fluxbee_sdk::ResourceType::Slack,
+        self_tenant_id,
+        Duration::from_secs(5),
+    )
+    .await;
+    let _ = sender.close().await;
+    match result {
+        Ok(Some(value)) => extract_slack_tokens_from_vault_value(&value),
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!(error = %err, "io-slack vault resource lookup failed");
+            None
+        }
+    }
+}
+
+/// Extract `(app_token, bot_token)` from a vault `value`. The value must
+/// be an object with both fields non-empty; bare strings are not accepted
+/// (would be ambiguous which token they represent).
+fn extract_slack_tokens_from_vault_value(value: &Value) -> Option<(String, String)> {
+    let obj = value.as_object()?;
+    let app_token = obj
+        .get("app_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?
+        .to_string();
+    let bot_token = obj
+        .get("bot_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?
+        .to_string();
+    Some((app_token, bot_token))
+}
+
+/// Polls vault for the slack resource every IO_SLACK_VAULT_REFRESH_INTERVAL_SECS
+/// so credentials picked up post-boot (vault_put after the node started)
+/// or rotated credentials flow into the runtime without restart.
+async fn run_slack_vault_refresh_loop(
+    config: Config,
+    slack: Arc<SlackClients>,
+    self_ilk_id: Option<String>,
+    self_tenant_id: Option<String>,
+) {
+    let (Some(self_ilk_id), Some(self_tenant_id)) = (
+        self_ilk_id.filter(|v| !v.is_empty()),
+        self_tenant_id.filter(|v| !v.is_empty()),
+    ) else {
+        tracing::warn!(
+            node_name = %config.node_name,
+            "self_ilk_id / self_tenant_id missing; vault refresh loop disabled"
+        );
+        return;
+    };
+    let mut ticker = tokio::time::interval(Duration::from_secs(IO_SLACK_VAULT_REFRESH_INTERVAL_SECS));
+    ticker.tick().await; // skip first immediate tick
+    loop {
+        ticker.tick().await;
+        if let Some((app_token, bot_token)) =
+            resolve_slack_credentials_from_vault(&config, &self_ilk_id, &self_tenant_id).await
+        {
+            // reload_credentials is cheap and idempotent: it overwrites
+            // the runtime tokens. If they didn't change, the next API
+            // call simply re-authenticates with the same value.
+            slack.reload_credentials(app_token, bot_token).await;
+        }
+    }
 }
 
 fn json_get_path<'a>(root: &'a Value, dotted_path: &str) -> Option<&'a Value> {

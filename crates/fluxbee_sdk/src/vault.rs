@@ -380,17 +380,6 @@ impl<'a> VaultCaller<'a> {
     }
 }
 
-pub fn parse_vault_ref(value: &str) -> Result<&str, VaultError> {
-    let trimmed = value.trim();
-    let key = trimmed
-        .strip_prefix(VAULT_REF_PREFIX)
-        .ok_or(VaultError::InvalidVaultRef)?;
-    if key.trim().is_empty() || key != key.trim() {
-        return Err(VaultError::InvalidVaultRef);
-    }
-    Ok(key)
-}
-
 pub async fn vault_get(
     sender: &NodeSender,
     receiver: &mut NodeReceiver,
@@ -634,32 +623,6 @@ pub async fn vault_get_with_retry(
     }
 }
 
-/// Resolve a `vault://<key>` reference to its stored plaintext value.
-///
-/// Wrapper over `parse_vault_ref` + `vault_get_with_retry` that's the single
-/// entry-point Phase J consumers (`ai.generic`, `sy.cognition`, `sy.architect`,
-/// `sy.admin`, `sy.identity`, `sy.storage`) should call when they need to read
-/// a secret. Targets `SY.vault@<hive_id>` automatically. The caller decides
-/// what "degraded" means when this returns `Err` (most callers should log
-/// and continue with their service in degraded mode).
-///
-/// Returns the raw `value` JSON the secret was stored as (often
-/// `{"<field>": "<plaintext>"}` for nested secrets, or a plain string).
-pub async fn resolve_vault_ref(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
-    caller: VaultCaller<'_>,
-    hive_id: &str,
-    vault_ref: &str,
-    policy: VaultRetryPolicy,
-) -> Result<Value, VaultError> {
-    let key = parse_vault_ref(vault_ref)?.to_string();
-    let target = format!("SY.vault@{}", hive_id);
-    let response =
-        vault_get_with_retry(sender, receiver, caller, &target, &key, policy).await?;
-    response.value.ok_or(VaultError::EmptyValue { key })
-}
-
 /// Resolve a Model D' resource for the calling node.
 ///
 /// Tries two queries against vault:
@@ -892,23 +855,3 @@ fn response_action_for(action: &str) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_vault_ref_accepts_valid_ref() {
-        assert_eq!(
-            parse_vault_ref("vault://sys:openai-api-key").unwrap(),
-            "sys:openai-api-key"
-        );
-    }
-
-    #[test]
-    fn parse_vault_ref_rejects_plain_key() {
-        assert!(matches!(
-            parse_vault_ref("sys:openai-api-key"),
-            Err(VaultError::InvalidVaultRef)
-        ));
-    }
-}

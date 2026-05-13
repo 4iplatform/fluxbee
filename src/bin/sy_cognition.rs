@@ -554,6 +554,13 @@ async fn main() -> Result<(), CognitionError> {
         Arc::clone(&app_state),
     )));
 
+    // Periodic vault refresh: probes resolve_resource(Openai) every
+    // COGNITION_VAULT_REFRESH_INTERVAL_SECS to keep `ai_secret_source` in
+    // sync with vault state without waiting for the first inbound turn.
+    // Closes the "lazy state" UX issue where CONFIG_GET would report
+    // `degraded_no_ai_provider` even after vault_put succeeded.
+    std::mem::drop(tokio::spawn(run_vault_refresh_loop(Arc::clone(&app_state))));
+
     let startup_ai_secret_source = control_state.lock().await.ai_secret_source;
 
     tracing::info!(
@@ -1566,6 +1573,37 @@ async fn resolve_storage_database_url(app_state: &CognitionAppState) -> Option<S
 
 async fn resolve_cognition_openai_api_key(app_state: &CognitionAppState) -> Option<String> {
     resolve_cognition_resource(app_state, fluxbee_sdk::ResourceType::Openai, "api_key").await
+}
+
+const COGNITION_VAULT_REFRESH_INTERVAL_SECS: u64 = 60;
+
+/// Polls vault for the openai resource at a fixed cadence and updates
+/// `ai_secret_source` so CONFIG_GET reflects the live state without waiting
+/// for the first inbound turn to drive the lazy flip. Runs forever.
+async fn run_vault_refresh_loop(app_state: Arc<CognitionAppState>) {
+    let mut ticker = time::interval(Duration::from_secs(COGNITION_VAULT_REFRESH_INTERVAL_SECS));
+    // The first tick fires immediately; skip it so we don't race with the
+    // initial boot probe that happens on the first turn.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let resolved = resolve_cognition_openai_api_key(&app_state).await.is_some();
+        let next_source = if resolved {
+            CognitionAiSecretSource::LocalFile
+        } else {
+            CognitionAiSecretSource::Missing
+        };
+        let mut control = app_state.control_state.lock().await;
+        if control.ai_secret_source != next_source {
+            tracing::info!(
+                node_name = %app_state.node_name,
+                previous = %control.ai_secret_source.as_str(),
+                current = %next_source.as_str(),
+                "sy.cognition vault refresh flipped ai_secret_source"
+            );
+            control.ai_secret_source = next_source;
+        }
+    }
 }
 
 /// Generic helper: connect an ephemeral SDK client, discover the named

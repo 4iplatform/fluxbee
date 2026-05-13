@@ -2,7 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -380,6 +380,27 @@ async fn main() -> Result<(), StorageError> {
         Arc::clone(&nats_subscribe_errors),
         Arc::clone(&storage_handler_errors),
     )));
+
+    // Periodic vault refresh: probes resolve_resource(Postgres) every
+    // STORAGE_VAULT_REFRESH_INTERVAL_SECS so CONFIG_GET reflects live vault
+    // state even if the operator added/rotated the secret post-boot. The
+    // pool connection is NOT reconnected here (still requires sy-storage
+    // restart) — this flip is reporting-only, surfaced via
+    // resources.postgres.live_in_vault.
+    let vault_postgres_live = Arc::new(AtomicBool::new(
+        db_secret_source != StorageDbSecretSource::Missing,
+    ));
+    std::mem::drop(tokio::spawn(run_storage_vault_refresh_loop(
+        config_dir.clone(),
+        state_dir.clone(),
+        socket_dir.clone(),
+        hive.hive_id.clone(),
+        node_name.clone(),
+        self_ilk_id.clone(),
+        my_tenant.to_string(),
+        Arc::clone(&vault_postgres_live),
+    )));
+
     let mut heartbeat = time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
@@ -388,6 +409,7 @@ async fn main() -> Result<(), StorageError> {
                     node_name = %sender.full_name(),
                     config_version = control_state.config_version,
                     db_secret_source = %control_state.secret_source.as_str(),
+                    vault_postgres_live = vault_postgres_live.load(Ordering::Relaxed),
                     "sy.storage heartbeat"
                 );
             }
@@ -399,10 +421,59 @@ async fn main() -> Result<(), StorageError> {
                         continue;
                     }
                 };
-                if let Err(err) = process_router_message(&sender, &msg, &mut control_state, &node_name).await {
+                if let Err(err) = process_router_message(
+                    &sender,
+                    &msg,
+                    &mut control_state,
+                    &node_name,
+                    vault_postgres_live.load(Ordering::Relaxed),
+                ).await {
                     tracing::warn!(error = %err, action = ?msg.meta.msg, "failed to process sy.storage system message");
                 }
             }
+        }
+    }
+}
+
+const STORAGE_VAULT_REFRESH_INTERVAL_SECS: u64 = 60;
+
+#[allow(clippy::too_many_arguments)]
+async fn run_storage_vault_refresh_loop(
+    config_dir: PathBuf,
+    state_dir: PathBuf,
+    socket_dir: PathBuf,
+    hive_id: String,
+    node_name: String,
+    self_ilk_id: String,
+    my_tenant: String,
+    live_flag: Arc<AtomicBool>,
+) {
+    let mut ticker = time::interval(Duration::from_secs(STORAGE_VAULT_REFRESH_INTERVAL_SECS));
+    ticker.tick().await; // skip the first immediate tick
+    loop {
+        ticker.tick().await;
+        let (url, _source, err) = resolve_database_url(
+            &config_dir,
+            &state_dir,
+            &socket_dir,
+            &hive_id,
+            &node_name,
+            &self_ilk_id,
+            &my_tenant,
+        )
+        .await;
+        let live = url.is_some();
+        let prev = live_flag.swap(live, Ordering::Relaxed);
+        if prev != live {
+            tracing::info!(
+                node_name = %node_name,
+                previous = prev,
+                current = live,
+                "sy.storage vault refresh flipped postgres live flag"
+            );
+        }
+        if let Some(err) = err {
+            tracing::debug!(error = %err, "sy.storage vault refresh: lookup error (will retry)");
         }
     }
 }
@@ -2860,6 +2931,7 @@ async fn process_router_message(
     msg: &Message,
     control_state: &mut StorageControlState,
     node_name: &str,
+    vault_postgres_live: bool,
 ) -> Result<(), StorageError> {
     tracing::info!(
         node_name = %node_name,
@@ -2883,7 +2955,7 @@ async fn process_router_message(
     };
     match command {
         "CONFIG_GET" => {
-            let payload = build_storage_config_get_payload(node_name, control_state, None);
+            let payload = build_storage_config_get_payload(node_name, control_state, vault_postgres_live, None);
             let response = build_node_config_response_message(msg, sender.uuid(), payload);
             tracing::info!(
                 node_name = %node_name,
@@ -2896,7 +2968,7 @@ async fn process_router_message(
             sender.send(response).await?;
         }
         "CONFIG_SET" => {
-            let payload = apply_storage_config_set(msg, node_name, control_state)?;
+            let payload = apply_storage_config_set(msg, node_name, control_state, vault_postgres_live)?;
             let response = build_node_config_response_message(msg, sender.uuid(), payload);
             tracing::info!(
                 node_name = %node_name,
@@ -3040,6 +3112,7 @@ fn storage_public_config(_node_name: &str, secret_source: StorageDbSecretSource)
 fn build_storage_config_get_payload(
     node_name: &str,
     state: &StorageControlState,
+    vault_postgres_live: bool,
     note: Option<&str>,
 ) -> Value {
     let configured = state.secret_source != StorageDbSecretSource::Missing;
@@ -3050,7 +3123,7 @@ fn build_storage_config_get_payload(
                 .to_string(),
         ),
         Value::String(
-            "CONFIG_SET on SY.storage takes no secret-bearing fields. Rotating the postgres secret requires sy-storage restart (or a refresh cycle) to re-resolve."
+            "CONFIG_SET on SY.storage takes no secret-bearing fields. The vault refresh loop polls every 60s — `live_in_vault` reflects the latest probe. Connection reconnect on rotation still requires sy-storage restart."
                 .to_string(),
         ),
     ];
@@ -3062,6 +3135,7 @@ fn build_storage_config_get_payload(
             "resource_type": "postgres",
             "required": true,
             "configured": configured,
+            "live_in_vault": vault_postgres_live,
             "scope": "pool (tenant or sys)",
             "consumer_dbname": STORAGE_DB_NAME
         }
@@ -3097,11 +3171,13 @@ fn apply_storage_config_set(
     msg: &Message,
     node_name: &str,
     control_state: &mut StorageControlState,
+    vault_postgres_live: bool,
 ) -> Result<Value, StorageError> {
     let Some(requested_node_name) = msg.payload.get("node_name").and_then(Value::as_str) else {
         return Ok(storage_config_error_response(
             node_name,
             control_state,
+            vault_postgres_live,
             "invalid_config",
             "Missing required field: payload.node_name".to_string(),
         ));
@@ -3110,6 +3186,7 @@ fn apply_storage_config_set(
         return Ok(storage_config_error_response(
             node_name,
             control_state,
+            vault_postgres_live,
             "invalid_config",
             format!(
                 "Invalid payload.node_name: expected '{}' or '{}', got '{}'",
@@ -3121,6 +3198,7 @@ fn apply_storage_config_set(
         return Ok(storage_config_error_response(
             node_name,
             control_state,
+            vault_postgres_live,
             "invalid_config",
             "Missing required field: payload.schema_version".to_string(),
         ));
@@ -3130,6 +3208,7 @@ fn apply_storage_config_set(
         return Ok(storage_config_error_response(
             node_name,
             control_state,
+            vault_postgres_live,
             "invalid_config",
             "Missing required field: payload.config_version".to_string(),
         ));
@@ -3138,6 +3217,7 @@ fn apply_storage_config_set(
         return Ok(storage_config_error_response(
             node_name,
             control_state,
+            vault_postgres_live,
             "stale_config_version",
             format!(
                 "Stale config_version: received {}, current {}",
@@ -3149,6 +3229,7 @@ fn apply_storage_config_set(
         return Ok(storage_config_error_response(
             node_name,
             control_state,
+            vault_postgres_live,
             "invalid_config",
             "Missing required field: payload.apply_mode".to_string(),
         ));
@@ -3157,6 +3238,7 @@ fn apply_storage_config_set(
         return Ok(storage_config_error_response(
             node_name,
             control_state,
+            vault_postgres_live,
             "unsupported_apply_mode",
             format!("Unsupported payload.apply_mode='{apply_mode}'"),
         ));
@@ -3165,6 +3247,7 @@ fn apply_storage_config_set(
         return Ok(storage_config_error_response(
             node_name,
             control_state,
+            vault_postgres_live,
             "invalid_config",
             "Missing required field: payload.config".to_string(),
         ));
@@ -3182,6 +3265,7 @@ fn apply_storage_config_set(
                 return Ok(storage_config_error_response(
                     node_name,
                     control_state,
+                    vault_postgres_live,
                     "invalid_config",
                     format!(
                         "config.database.{forbidden} is no longer accepted; load the postgres secret via vault_put (resource_type=postgres) and storage will discover it from the pool"
@@ -3200,9 +3284,17 @@ fn apply_storage_config_set(
         "schema_version": control_state.schema_version,
         "config_version": control_state.config_version,
         "config": storage_public_config(node_name, control_state.secret_source),
+        "resources": [{
+            "resource_type": "postgres",
+            "required": true,
+            "configured": control_state.secret_source != StorageDbSecretSource::Missing,
+            "live_in_vault": vault_postgres_live,
+            "scope": "pool (tenant or sys)",
+            "consumer_dbname": STORAGE_DB_NAME
+        }],
         "notes": [
             "sy.storage has no secret-bearing CONFIG_SET fields in Model D'.",
-            "Load postgres credentials via vault_put with resource_type=postgres; storage will pick them up at boot from the pool."
+            "Load postgres credentials via vault_put with resource_type=postgres; storage will pick them up at boot from the pool. The refresh loop probes vault every 60s and reflects live presence in resources.postgres.live_in_vault."
         ],
         "error": Value::Null
     }))
@@ -3211,6 +3303,7 @@ fn apply_storage_config_set(
 fn storage_config_error_response(
     node_name: &str,
     control_state: &StorageControlState,
+    _vault_postgres_live: bool,
     code: &str,
     message: String,
 ) -> Value {

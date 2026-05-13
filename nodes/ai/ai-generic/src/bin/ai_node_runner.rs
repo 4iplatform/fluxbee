@@ -69,20 +69,16 @@ Do not perform any action."#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenAiApiKeySource {
-    LocalFile,
-    ControlPlaneLegacy,
-    YamlInlineLegacy,
-    EnvLegacy,
+    /// Model D' — secret resolved via `fluxbee_sdk::resolve_resource(Openai)`
+    /// (pool match against SY.vault). This is the only supported source.
+    Vault,
     Missing,
 }
 
 impl OpenAiApiKeySource {
     fn as_str(self) -> &'static str {
         match self {
-            Self::LocalFile => "local_file",
-            Self::ControlPlaneLegacy => "effective_config_legacy",
-            Self::YamlInlineLegacy => "yaml_inline_legacy",
-            Self::EnvLegacy => "env_legacy",
+            Self::Vault => "vault",
             Self::Missing => "missing",
         }
     }
@@ -458,6 +454,11 @@ struct GenericAiNode {
     behavior: Arc<RwLock<Option<NodeBehavior>>>,
     config_dir: PathBuf,
     dynamic_config_dir: PathBuf,
+    /// Router socket directory — needed to spin up ephemeral SDK clients for
+    /// vault lookups (Model D' `resolve_resource`).
+    router_socket: PathBuf,
+    /// UUID persistence root — passed to ephemeral SDK clients.
+    state_dir: PathBuf,
     thread_state_store: Option<Arc<dyn ThreadStateStore>>,
     immediate_memory_store: Option<Arc<ImmediateMemoryStore>>,
     gov_identity: GovIdentityConfig,
@@ -1669,33 +1670,86 @@ impl GenericAiNode {
         self.resolve_openai_api_key_with_source(openai).await.0
     }
 
+    /// Model D' — resolve the OpenAI api_key by discovering the `openai`
+    /// resource in SY.vault (pool match: dedicated to caller ILK → tenant
+    /// pool → sys pool). This is the **only** supported source. The
+    /// legacy alternatives (`api_key` plaintext, env var, YAML inline,
+    /// effective_config) were removed in Phase J' / VA-J6.
+    ///
+    /// Requires `self_ilk_id` and `self_tenant_id` to be present (set by
+    /// the orchestrator via FLUXBEE_NODE_ILK_ID + FLUXBEE_NODE_TENANT_ID
+    /// envs). If either is missing the node runs degraded and replies
+    /// with a runtime-not-ready payload on chat requests.
     async fn resolve_openai_api_key_with_source(
         &self,
-        openai: &OpenAiChatRuntime,
+        _openai: &OpenAiChatRuntime,
     ) -> (Option<String>, OpenAiApiKeySource) {
-        let from_local_file = load_local_openai_api_key(&self.node_name);
-        if from_local_file.is_some() {
-            return (from_local_file, OpenAiApiKeySource::LocalFile);
-        }
-        let from_control_plane = {
-            let state = self.control_plane.read().await;
-            state
-                .effective_config
-                .as_ref()
-                .and_then(extract_openai_api_key_from_config)
-        };
-        if from_control_plane.is_some() {
-            return (from_control_plane, OpenAiApiKeySource::ControlPlaneLegacy);
-        }
-        if openai.yaml_inline_api_key.is_some() {
-            return (
-                openai.yaml_inline_api_key.clone(),
-                OpenAiApiKeySource::YamlInlineLegacy,
+        let Some(self_ilk_id) = self.self_ilk_id.as_deref().filter(|v| !v.is_empty()) else {
+            tracing::warn!(
+                node_name = %self.node_name,
+                "FLUXBEE_NODE_ILK_ID not set; vault lookup skipped (node running degraded)"
             );
-        }
-        match std::env::var(&openai.api_key_env).ok() {
-            Some(value) => (Some(value), OpenAiApiKeySource::EnvLegacy),
-            None => (None, OpenAiApiKeySource::Missing),
+            return (None, OpenAiApiKeySource::Missing);
+        };
+        let Some(self_tenant_id) = self.self_tenant_id.as_deref().filter(|v| !v.is_empty()) else {
+            tracing::warn!(
+                node_name = %self.node_name,
+                "FLUXBEE_NODE_TENANT_ID not set; vault lookup skipped (node running degraded)"
+            );
+            return (None, OpenAiApiKeySource::Missing);
+        };
+        let Some(hive_id) = self.node_name.split('@').nth(1).filter(|v| !v.is_empty()) else {
+            tracing::warn!(
+                node_name = %self.node_name,
+                "node_name has no @hive suffix; cannot resolve vault target"
+            );
+            return (None, OpenAiApiKeySource::Missing);
+        };
+        let node_config = fluxbee_sdk::NodeConfig {
+            name: self.node_name.clone(),
+            router_socket: self.router_socket.clone(),
+            uuid_persistence_dir: self.state_dir.join("nodes"),
+            uuid_mode: fluxbee_sdk::NodeUuidMode::Ephemeral,
+            config_dir: self.config_dir.clone(),
+            version: "0.1.0".to_string(),
+        };
+        let (sender, mut receiver) = match fluxbee_sdk::connect(&node_config).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                tracing::warn!(error = %err, "ai-generic vault lookup: ephemeral router connect failed");
+                return (None, OpenAiApiKeySource::Missing);
+            }
+        };
+        let caller = fluxbee_sdk::VaultCaller::new(self_ilk_id, &self.node_name);
+        let result = fluxbee_sdk::resolve_resource(
+            &sender,
+            &mut receiver,
+            caller,
+            hive_id,
+            fluxbee_sdk::ResourceType::Openai,
+            self_tenant_id,
+            Duration::from_secs(5),
+        )
+        .await;
+        let _ = sender.close().await;
+        match result {
+            Ok(Some(value)) => {
+                let api_key = extract_openai_api_key_from_value(&value);
+                if api_key.is_some() {
+                    (api_key, OpenAiApiKeySource::Vault)
+                } else {
+                    tracing::warn!(
+                        node_name = %self.node_name,
+                        "vault openai secret did not carry a usable api_key"
+                    );
+                    (None, OpenAiApiKeySource::Missing)
+                }
+            }
+            Ok(None) => (None, OpenAiApiKeySource::Missing),
+            Err(err) => {
+                tracing::warn!(error = %err, "ai-generic vault resource lookup failed");
+                (None, OpenAiApiKeySource::Missing)
+            }
         }
     }
 
@@ -2049,17 +2103,17 @@ impl GenericAiNode {
         } else {
             (false, "none")
         };
-        let api_key_source = match state.effective_config.as_ref() {
-            Some(config) => {
-                resolve_openai_api_key_source_from_effective_config(&self.node_name, config)
-            }
-            None => {
-                if load_local_openai_api_key(&self.node_name).is_some() {
-                    OpenAiApiKeySource::LocalFile
-                } else {
-                    OpenAiApiKeySource::Missing
-                }
-            }
+        // Model D' — the only source is vault. Reports `vault` when the
+        // node has both `self_ilk_id` and `self_tenant_id` available
+        // (orchestrator-spawned with FLUXBEE_NODE_ILK_ID +
+        // FLUXBEE_NODE_TENANT_ID); reports `missing` otherwise. Live vault
+        // presence is verified on each chat resolve call.
+        let api_key_source = if self.self_ilk_id.as_deref().filter(|v| !v.is_empty()).is_some()
+            && self.self_tenant_id.as_deref().filter(|v| !v.is_empty()).is_some()
+        {
+            OpenAiApiKeySource::Vault
+        } else {
+            OpenAiApiKeySource::Missing
         };
         let error = if ok {
             Value::Null
@@ -4718,6 +4772,8 @@ async fn run_one_config(
         behavior: Arc::new(RwLock::new(Some(behavior))),
         config_dir: PathBuf::from(node_config_dir),
         dynamic_config_dir: PathBuf::from(cfg.node.dynamic_config_dir),
+        router_socket: ai_node_config.router_socket.clone(),
+        state_dir: ai_node_config.uuid_persistence_dir.clone(),
         thread_state_store,
         immediate_memory_store,
         gov_identity,
@@ -4940,6 +4996,8 @@ async fn run_unconfigured_bootstrap(
         behavior: Arc::new(RwLock::new(behavior)),
         config_dir: PathBuf::from(node_config_dir),
         dynamic_config_dir: dynamic_dir,
+        router_socket: ai_node_config.router_socket.clone(),
+        state_dir: ai_node_config.uuid_persistence_dir.clone(),
         thread_state_store,
         immediate_memory_store,
         gov_identity,
@@ -5442,6 +5500,21 @@ fn format_instructions_snapshot(cfg: &Option<InstructionsSourceConfig>) -> Value
     }
 }
 
+/// Model D' — extract the openai api_key from a vault `value`. Vault may
+/// return either a bare string or an object with `api_key` field; both are
+/// accepted (matches what SY consumers do).
+fn extract_openai_api_key_from_value(value: &Value) -> Option<String> {
+    if let Some(s) = value.as_str().map(str::trim).filter(|v| !v.is_empty()) {
+        return Some(s.to_string());
+    }
+    value
+        .get("api_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+}
+
 fn extract_openai_api_key_from_config(config: &Value) -> Option<String> {
     config
         .get("secrets")
@@ -5595,35 +5668,6 @@ fn migrate_bootstrap_openai_secret_with_root(
     Ok(true)
 }
 
-fn resolve_openai_api_key_source_from_effective_config(
-    node_name: &str,
-    config: &Value,
-) -> OpenAiApiKeySource {
-    if load_local_openai_api_key(node_name).is_some() {
-        return OpenAiApiKeySource::LocalFile;
-    }
-    if extract_openai_api_key_from_config(config)
-        .filter(|value| !value.trim().is_empty() && value != NODE_SECRET_REDACTION_TOKEN)
-        .is_some()
-    {
-        return OpenAiApiKeySource::ControlPlaneLegacy;
-    }
-    let api_key_env = config
-        .get("behavior")
-        .and_then(|value| value.get("api_key_env"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("OPENAI_API_KEY");
-    if std::env::var(api_key_env)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .is_some()
-    {
-        return OpenAiApiKeySource::EnvLegacy;
-    }
-    OpenAiApiKeySource::Missing
-}
 
 fn parse_effective_config_doc(
     config: &Value,
@@ -6503,6 +6547,8 @@ mod tests {
             behavior: Arc::new(RwLock::new(None)),
             config_dir: PathBuf::from("/tmp"),
             dynamic_config_dir: PathBuf::from("/tmp"),
+            router_socket: PathBuf::from("/tmp"),
+            state_dir: PathBuf::from("/tmp"),
             thread_state_store: None,
             immediate_memory_store: None,
             gov_identity,
@@ -7626,8 +7672,6 @@ mod tests {
         let redacted = redact_secrets(&value);
         let redacted_json = serde_json::to_string(&redacted).expect("serialize redacted config");
         assert!(!redacted_json.contains("canonical-secret"));
-        let source = resolve_openai_api_key_source_from_effective_config(node_name, &value);
-        assert_eq!(source, OpenAiApiKeySource::Missing);
 
         let _ = fs::remove_dir_all(root);
     }

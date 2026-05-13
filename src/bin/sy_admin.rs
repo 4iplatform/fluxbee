@@ -631,12 +631,48 @@ async fn main() -> Result<(), AdminError> {
 
     let system_client = router_client.clone();
     let system_rx = router_client.subscribe_system_commands();
+    let refresh_ctx = system_ctx.clone();
     tokio::spawn(async move {
         run_system_command_loop(system_ctx, system_client, system_rx).await;
     });
 
+    // Periodic vault refresh: probes resolve_resource(Openai) every
+    // ADMIN_EXECUTOR_VAULT_REFRESH_INTERVAL_SECS so executor_configured
+    // flips to true automatically once the operator runs vault_put — no
+    // CONFIG_SET dance or restart needed.
+    tokio::spawn(async move {
+        run_admin_executor_vault_refresh_loop(refresh_ctx).await;
+    });
+
     future::pending::<()>().await;
     Ok(())
+}
+
+const ADMIN_EXECUTOR_VAULT_REFRESH_INTERVAL_SECS: u64 = 60;
+
+async fn run_admin_executor_vault_refresh_loop(ctx: AdminContext) {
+    let mut ticker =
+        tokio::time::interval(Duration::from_secs(ADMIN_EXECUTOR_VAULT_REFRESH_INTERVAL_SECS));
+    ticker.tick().await; // skip first immediate tick
+    loop {
+        ticker.tick().await;
+        let prev = ctx.executor_configured.load(Ordering::Relaxed);
+        match refresh_admin_executor_ai_runtime(&ctx).await {
+            Ok(now) => {
+                if prev != now {
+                    tracing::info!(
+                        node_name = %ctx.node_name,
+                        previous = prev,
+                        current = now,
+                        "sy.admin executor vault refresh flipped configured flag"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "sy.admin executor vault refresh failed (will retry)");
+            }
+        }
+    }
 }
 
 enum BroadcastRequest {

@@ -78,9 +78,9 @@ pub use crate::timer::{
     TIMER_LIST_MAX_LIMIT, TIMER_MIN_DURATION_MS, TIMER_NODE_FAMILY, TIMER_NODE_KIND,
 };
 pub use crate::vault::{
-    parse_vault_ref, resolve_vault_ref, vault_delete, vault_get, vault_get_metadata,
-    vault_get_with_retry, vault_list, vault_put, vault_rollback, vault_rotate, VaultCaller,
-    VaultDeleteResponse, VaultError, VaultFilter, VaultGetMetadataRequest,
+    normalize_resource_type, resolve_resource, vault_delete, vault_get, vault_get_metadata,
+    vault_get_with_retry, vault_list, vault_put, vault_rollback, vault_rotate, ResourceType,
+    VaultCaller, VaultDeleteResponse, VaultError, VaultFilter, VaultGetMetadataRequest,
     VaultGetMetadataResponse, VaultGetRequest, VaultGetResponse, VaultKeyRequest, VaultListRequest,
     VaultListResponse, VaultMetadata, VaultPutRequest, VaultPutResponse, VaultRetryPolicy,
     VaultRollbackResponse, VaultRotateRequest, VaultRotateResponse, VaultSecretSummary,
