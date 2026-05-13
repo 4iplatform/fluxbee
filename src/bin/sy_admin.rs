@@ -10363,12 +10363,24 @@ async fn handle_vault_command(
     } else {
         payload
     };
-    let response = send_system_request(
+    // Model D' — vault authorizes admin operations against
+    // `well_known_admin_ilks` (set computed by SY.vault at boot from
+    // deterministic SY.admin/SY.architect ILKs). The caller's ILK must be
+    // stamped into `meta.src_ilk`, otherwise vault sees `None` and replies
+    // UNAUTHORIZED. The HTTP operator never supplies this — admin uses its
+    // own self_ilk_id (resolved from identity SHM at boot).
+    let response = send_system_request_with_meta(
         client,
         &target,
         request_msg,
         response_msg,
         normalized_payload,
+        16,
+        Some(ctx.self_ilk_id.clone()),
+        None,
+        Some(target.clone()),
+        Some(action.to_string()),
+        None,
         admin_action_timeout(action),
     )
     .await;
