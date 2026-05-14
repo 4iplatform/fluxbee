@@ -2898,15 +2898,22 @@ fn validate_system_nodes(
     if nodes.is_empty() {
         return Err("invalid hive.yaml: configured system node list is empty".into());
     }
-    // Model D' boot order: SY.config.routes is the only absolute prereq —
-    // it writes the routing SHM that every other SY node needs to register.
-    // SY.vault is the second-most critical on motherbee (consumers do an
-    // ephemeral `resolve_resource` lookup at boot; if vault hasn't yet
-    // registered in the router, the lookup returns VAULT_UNAVAILABLE and
-    // the consumer falls to `secret_source = Missing`). We enforce that
-    // SY.config.routes is first, and on motherbee SY.vault must appear
-    // before any of its consumers (admin/architect/storage/identity/
-    // cognition).
+    // Model D' boot order (counter-intuitive but required by the
+    // VAULT_SECRET_CHANGED broadcast semantics):
+    //
+    //   - SY.config.routes FIRST: writes the routing SHM. Every other
+    //     SY node needs the router to be functional before it can
+    //     register.
+    //   - SY.vault LAST among the SY system nodes that participate in
+    //     vault. Reason: broadcasts in src/router/mod.rs Destination::
+    //     Broadcast only reach nodes registered at the moment of
+    //     emission. Vault emits `VAULT_SECRET_CHANGED { op=put }` for
+    //     every existing secret right after it connects, to rescue
+    //     consumers that already arrived in `secret_source = Missing`.
+    //     For those broadcasts to land, every consumer must already
+    //     be registered. Vault-last achieves that.
+    //
+    // We enforce both invariants.
     if nodes[0].trim() != "SY.config.routes" {
         return Err(format!(
             "invalid hive.yaml: system_nodes.{}.nodes must start with SY.config.routes (writer of the routing SHM; required by every other SY service)",
@@ -2923,12 +2930,13 @@ fn validate_system_nodes(
                 "SY.storage",
                 "SY.identity",
                 "SY.cognition",
+                "SY.frontdesk.gov",
             ];
             for consumer in VAULT_CONSUMERS {
                 if let Some(consumer_idx) = nodes.iter().position(|n| n.trim() == *consumer) {
-                    if consumer_idx < vault_idx {
+                    if consumer_idx > vault_idx {
                         return Err(format!(
-                            "invalid hive.yaml: system_nodes.motherbee.nodes lists '{}' before SY.vault — vault consumers must appear after SY.vault to avoid VAULT_UNAVAILABLE at boot (Model D')",
+                            "invalid hive.yaml: system_nodes.motherbee.nodes lists '{}' after SY.vault — vault consumers must appear BEFORE SY.vault so the bootstrap VAULT_SECRET_CHANGED broadcasts that vault emits at startup land in their receive loop (router broadcasts only reach already-registered nodes; Model D' VA-J'-13c)",
                             consumer
                         )
                         .into());
