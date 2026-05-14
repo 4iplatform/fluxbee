@@ -1064,21 +1064,41 @@ async fn handle_message(
             }
         }
         Destination::Broadcast => {
+            tracing::info!(
+                src = %src_handle.name,
+                msg = msg.meta.msg.as_deref().unwrap_or(""),
+                msg_type = %msg.meta.msg_type,
+                trace_id = %msg.routing.trace_id,
+                ttl = msg.routing.ttl,
+                "router received broadcast"
+            );
             let trace_id = match Uuid::parse_str(&msg.routing.trace_id) {
                 Ok(value) => value,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    tracing::warn!(
+                        trace_id = %msg.routing.trace_id,
+                        "broadcast dropped: invalid trace_id (must be UUID)"
+                    );
+                    return Ok(());
+                }
             };
             {
                 let mut cache = broadcast_cache.lock().await;
                 if !cache.check_and_add(trace_id) {
-                    tracing::debug!(trace_id = %msg.routing.trace_id, "broadcast duplicate dropped");
+                    tracing::warn!(trace_id = %msg.routing.trace_id, "broadcast duplicate dropped by cache");
                     return Ok(());
                 }
             }
             let target = msg.meta.target.as_deref();
             let nodes_guard = nodes.lock().await;
+            let mut considered = 0usize;
+            let mut skipped_self = 0usize;
+            let mut skipped_vpn = 0usize;
+            let mut skipped_target = 0usize;
             for (uuid, handle) in nodes_guard.iter() {
+                considered += 1;
                 if *uuid == src_uuid {
+                    skipped_self += 1;
                     continue;
                 }
                 if !vpn_allows_between(
@@ -1088,15 +1108,35 @@ async fn handle_message(
                     &handle.name,
                     handle.vpn_id,
                 ) {
+                    skipped_vpn += 1;
                     continue;
                 }
                 if let Some(pattern) = target {
                     if !pattern_match(pattern, &handle.name) {
+                        skipped_target += 1;
                         continue;
                     }
                 }
+                tracing::info!(
+                    src = %src_handle.name,
+                    msg = msg.meta.msg.as_deref().unwrap_or(""),
+                    dst = %handle.name,
+                    trace_id = %msg.routing.trace_id,
+                    "router enqueueing broadcast for delivery"
+                );
                 senders.push(handle.sender.clone());
             }
+            tracing::info!(
+                src = %src_handle.name,
+                msg = msg.meta.msg.as_deref().unwrap_or(""),
+                trace_id = %msg.routing.trace_id,
+                registered_nodes = considered,
+                delivered_to = senders.len(),
+                skipped_self = skipped_self,
+                skipped_vpn = skipped_vpn,
+                skipped_target = skipped_target,
+                "router broadcast fanout summary"
+            );
             if msg.routing.ttl >= 2 {
                 broadcast_to_peers(peers, &msg).await?;
             }
