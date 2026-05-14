@@ -566,6 +566,49 @@ Antes de codear hay que decidir:
 - [ ] VA-J'-12b. Actualizar `docs/onworking COA/node-secret-config-spec.md`: el único path de secrets es vault con el modelo D'. CONFIG_SET solo para config no-secreta. Archivo `secrets.json` se va.
 - [ ] VA-J'-12c. Examples de `vault_put` con `owner_node` y sin `owner_node` (pool) en `docs/07-operaciones.md` o el doc de operación.
 
+### J'-13. Vault broadcast de cambios de secret — **pendiente, próximo sprint**
+
+**Problema actual.** Los consumers descubren cambios en vault mediante un refresh loop polling cada 60s. Eso resuelve el caso de los nodos que pueden re-construir su runtime desde un valor en memoria (admin executor, architect, cognition: re-crean el `OpenAiResponsesClient`), pero NO resuelve el caso de los nodos que abren un **pool de conexiones** al boot (storage e identity con Postgres). Hoy esos dos quedan en `secret_source = Missing` para siempre si arrancan antes que `vault_put` y la única forma de reconectar es `systemctl restart`.
+
+**Decisión de diseño (operador 2026-05-14):** la solución correcta no es polling, es **broadcast event-driven desde SY.vault**.
+
+**Diseño preliminar (a refinar):**
+
+1. **Nuevo subject NATS o canal router** `vault.events.secrets` (a definir): SY.vault publica un envelope `VAULT_SECRET_CHANGED` cada vez que cambia un secret. Schema mínimo:
+
+   ```json
+   {
+     "event": "vault_secret_changed",
+     "op": "put | rotate | delete",
+     "resource_type": "openai | postgres | slack | ...",
+     "tenant_id": "sys",
+     "ilk": null,
+     "version": 7,
+     "key": "sys:openai-api-key",
+     "trace_id": "...",
+     "at_ms": 1234567890
+   }
+   ```
+
+   El payload NO contiene el plaintext del secret — solo metadata. Los consumers reciben el evento, hacen `vault_get` ellos mismos si les interesa.
+2. **Filtro de suscripción.** Cada consumer se suscribe filtrando por `(resource_type, tenant_id, ilk?)` que le interesa, igual que hace en `resolve_resource` al boot. Ej: storage se suscribe a `(postgres, sys, null|<self_ilk>)`.
+3. **Handler en cada consumer.** Al recibir el evento, el consumer:
+   - Refresca el secret con `resolve_resource(...)` (mismo path que ya tienen).
+   - **Reconstruye el runtime** que dependía del secret. Para admin/architect/cognition esto ya está implementado (`refresh_*_ai_runtime`). Para storage/identity hay que escribir el reconnect del pool de Postgres — mover `Storage` a `Arc<RwLock<Option<Arc<Storage>>>>` compartido entre el dispatcher y los workers.
+4. **Autorización del evento.** El evento es de metadatos, así que es público dentro del hive — no necesita auth especial. El plaintext sigue pidiendo `vault_get` con caller autorizado.
+5. **Compatibilidad con el polling actual.** Cuando este broadcast esté en producción y los handlers funcionen, **borrar los `run_*_vault_refresh_loop`** de los 5 consumers. Mientras tanto, el polling de 60s actúa como fallback por si el broadcast se pierde.
+6. **SDK helper.** Agregar `fluxbee_sdk::vault::subscribe_resource_changes(filter, callback)` que envuelve la suscripción + filtrado + dispatch al callback. Reduce boilerplate en cada consumer.
+
+**Tareas (próximo sprint, no este):**
+
+- [ ] VA-J'-13a. Definir el schema definitivo del envelope `VAULT_SECRET_CHANGED` (campos, versionado, naming en NATS/router).
+- [ ] VA-J'-13b. Implementar el publish en SY.vault para todos los handlers que mutan estado (`handle_put`, `handle_rotate`, `handle_delete`, `handle_rollback`).
+- [ ] VA-J'-13c. SDK helper `subscribe_resource_changes` con filtro + dispatch.
+- [ ] VA-J'-13d. Storage + identity: mover `Storage` / `IdentityRuntime.db_config` a `Arc<RwLock<Option<...>>>` y wirear el handler del broadcast para reconectar pool en caliente.
+- [ ] VA-J'-13e. Admin executor / architect / cognition: reemplazar el polling loop por el handler del broadcast. Borrar el polling cuando el broadcast esté estable en VM.
+- [ ] VA-J'-13f. Tests unitarios del filtrado: un consumer con `(postgres, sys, ilk=A)` no recibe cambios de `(openai, sys, ilk=B)`.
+- [ ] VA-J'-13g. Test E2E en VM: arrancar storage sin secret → `vault_put` → confirmar que storage pasa a `configured` sin restart en menos de 1s.
+
 ---
 
 ## 12ter. Phase K - IO nodes vault migration (deferred)

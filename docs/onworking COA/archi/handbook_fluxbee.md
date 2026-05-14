@@ -179,16 +179,27 @@ These are system infrastructure:
 
 Normal operator requests should not create or redesign these.
 
-### 4.5 Secrets and vault
+### 4.5 Secrets and vault (Model D')
 
-`SY.vault` is the canonical secret backend for new secret writes. Do not ask users to place plaintext secrets in node config files.
+`SY.vault` is the canonical secret backend. Secrets live **entirely** in vault — nodes never receive plaintext secrets through `CONFIG_SET` and never persist them locally. Consumers discover their secret at boot/refresh by querying vault for a `resource_type` (e.g. `openai`, `postgres`, `slack`).
 
-Rules:
-- For secret inspection, prefer `vault_list` and `vault_get_metadata`.
+How consumers find their secret:
+
+- Each consumer calls `resolve_resource(resource_type, my_tenant_id)` against vault. Vault matches in this order: secret dedicated to the caller's ILK → secret in the caller's tenant pool → secret in the `sys` pool (universal for system callers).
+- "Pool" means a secret stored without an explicit `ilk` — every consumer of that tenant (or `sys`) reads the same value. Useful when several SY services share one Postgres or one OpenAI key.
+- "Dedicated" means a secret stored with `ilk` set to a specific ILK. Only that exact ILK reads it. Useful when one tenant or one specific node needs its own credential.
+
+Rules for archi when asked about secrets:
+
+- For inspection of who has what: prefer `vault_list` (returns metadata only, no plaintext) and `vault_get_metadata` (full metadata for one key).
 - Use `vault_get` only when the operator explicitly asks to reveal or use the plaintext value.
-- For writes, use admin actions exposed by `get_admin_action_help`; do not invent vault payload shape.
-- Secret-bearing config should store `vault://<key>` references, not plaintext.
-- If a node reports missing secret, inspect its `CONFIG_GET` contract and the vault metadata/list before changing runtime or routing.
+- For writes, use admin actions exposed by `get_admin_action_help`; do not invent vault payload shape. The contract changed in Model D' — read the live contract instead of remembering older payload shapes.
+- **Never** suggest storing `vault://<key>` references in node config: that path was removed. Node configs no longer carry any secret-bearing field.
+- **Never** suggest `metadata.owner_ilk` in `vault_put`: it is rejected. Use `metadata.owner_node` (a friendly L2 name like `SY.architect`) and admin will resolve the ILK; or omit it entirely to publish the secret to the pool.
+- `metadata.resource_type` is mandatory on every `vault_put` (it's the discovery key). `metadata.tenant_id` defaults to `"sys"` when omitted.
+- If a node reports `missing_secret`, inspect its live `CONFIG_GET` (`/control/config-get`) — look at `contract.resources[]` to see which `resource_type` each consumer is waiting for, and `live_in_vault` to confirm whether vault has it yet. If `live_in_vault: true` but `configured: false`, the consumer is reporting-only and needs `systemctl restart <node>` to reconnect its pool (known limitation, see vault tasks).
+- Supported `resource_type` values: `openai`, `postgres`, `anthropic`, `google_calendar`, `gmail`, `google_drive`, `slack`, `hubspot`, `linkedhelper`, plus free-form `Custom(string)` (lowercase, snake_case, max 64 chars).
+- Postgres value contract: store **credentials + host only** (no `dbname`) — each consumer applies its own dbname (`fluxbee_storage`, `fluxbee_identity`, etc.). Example value: `{"postgres_url": "postgresql://user:pass@host:5432"}`.
 
 ---
 

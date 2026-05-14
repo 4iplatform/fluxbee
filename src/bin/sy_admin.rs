@@ -6727,6 +6727,8 @@ fn admin_action_executor_contract(spec: &InternalActionSpec) -> serde_json::Valu
             "Do not wrap mutation fields under args.body; body is only the HTTP request shape.",
             "Vault value-bearing fields are secret-sensitive and must not be printed in summaries/logs.",
             "Prefer vault_get_metadata for inspection. Use vault_get only when the operator explicitly needs the secret value.",
+            "Model D' for vault_put / vault_rotate: metadata.resource_type is MANDATORY (canonical lowercase snake_case: openai, postgres, slack, anthropic, hubspot, linkedhelper, google_calendar, gmail, google_drive, or a free-form custom string up to 64 chars). metadata.tenant_id defaults to 'sys' when omitted. To scope a secret to a specific node, use metadata.owner_node (a friendly L2 like 'SY.architect' — admin resolves the ILK); omit it entirely to publish to the pool. metadata.owner_ilk is REJECTED (legacy Model J) — do not generate it.",
+            "Postgres secrets MUST be credentials + host only — never include a dbname in the connection string. Each consumer (storage, identity, architect-messages-db, cognition) applies its own dbname after resolving. Example value: {\"postgres_url\": \"postgresql://user:pass@host:5432\"}.",
         ]
     } else if matches!(
         spec.action,
@@ -7375,12 +7377,12 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "value",
                 "object",
-                "Secret JSON value. This field is secret-sensitive and redacted in previews/logs.",
+                "Secret JSON value. This field is secret-sensitive and redacted in previews/logs. Shape depends on the resource_type: openai → {\"api_key\":\"sk-…\"}; postgres → {\"postgres_url\":\"postgresql://user:pass@host:port\"} (credentials + host only, NO dbname); slack → {\"app_token\":\"xapp-…\",\"bot_token\":\"xoxb-…\"}.",
             ),
             admin_action_body_field(
                 "metadata",
                 "object",
-                "Vault metadata containing tenant_id and owner_ilk.",
+                "Vault metadata (Model D'). MUST contain resource_type. Optionally tenant_id (default 'sys'), owner_node (friendly L2 like 'SY.architect' — admin resolves the ILK), description, tags. metadata.owner_ilk is REJECTED — use owner_node or omit (pool secret).",
             ),
         ],
         "vault_rotate" => vec![
@@ -7388,7 +7390,7 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "value",
                 "object",
-                "New secret JSON value. This field is secret-sensitive and redacted in previews/logs.",
+                "New secret JSON value. This field is secret-sensitive and redacted in previews/logs. Same shape rules as vault_put for the chosen resource_type (openai → api_key; postgres → postgres_url credentials+host only, no dbname; slack → app_token+bot_token).",
             ),
         ],
         "set_ilk_definition" => vec![admin_action_body_field(
@@ -7510,7 +7512,7 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
         "vault_list" => vec![admin_action_body_field(
             "filter",
             "object",
-            "Optional filter object with prefix, tenant_id, tags, and limit.",
+            "Optional filter object. Fields: prefix (string), tenant_id (string, default 'sys'), resource_type (string — canonical Model D' lowercase snake_case), ilk (string for dedicated secrets; pass empty string to match pool secrets explicitly), tags (string[]), limit (number).",
         )],
         "run_node" => vec![
             admin_action_body_field(
@@ -7990,8 +7992,8 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         }),
         "vault_list" => serde_json::json!({
             "filter": {
-                "prefix": "sys:",
-                "tags": ["provider:openai"],
+                "resource_type": "openai",
+                "tenant_id": "sys",
                 "limit": 100
             }
         }),
@@ -8001,9 +8003,9 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
                 "api_key": "sk-redacted-example"
             },
             "metadata": {
+                "resource_type": "openai",
                 "tenant_id": "sys",
-                "owner_ilk": "ilk:550e8400-e29b-41d4-a716-446655440000",
-                "description": "OpenAI API key for a system node",
+                "description": "OpenAI API key shared by SY system services (pool)",
                 "tags": ["provider:openai"]
             }
         }),
@@ -8351,12 +8353,12 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "vault_list" => vec![
             "Lists metadata summaries only; it never returns secret values.",
             "Non-admin callers only see secrets they are authorized to read.",
-            "Supports optional filter.prefix, filter.tenant_id, filter.tags, and filter.limit.",
+            "Supports optional filter.prefix, filter.tenant_id, filter.resource_type, filter.ilk, filter.tags, and filter.limit (Model D').",
         ],
         "vault_put" => vec![
             "Writes plaintext to SY.vault over L2; SY.vault encrypts at rest and writes local audit.",
             "value is secret-sensitive and must be redacted in previews/history.",
-            "metadata.tenant_id must be sys or tnt:<uuid>; metadata.owner_ilk must be ilk:<uuid>.",
+            "Model D' metadata contract: metadata.resource_type is REQUIRED (canonical lowercase snake_case). metadata.tenant_id is optional (defaults to 'sys'; values must be 'sys' or 'tnt:<uuid>'). metadata.owner_node is optional (friendly L2 name like 'SY.architect' — admin resolves the ILK); omit owner_node entirely for a pool secret. metadata.owner_ilk is REJECTED — never include it.",
             "Same-value PUT is idempotent: the vault returns changed=false and does not increment version.",
         ],
         "vault_get_metadata" => vec![

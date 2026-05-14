@@ -5246,7 +5246,10 @@ async fn initialize_identity_database_backend(
     else {
         return (
             None,
-            Some("Missing database secret in local secrets.json or env overrides.".to_string()),
+            Some(
+                "postgres secret not resolvable from SY.vault at boot. Load it with vault_put (resource_type=postgres, value={\"postgres_url\":\"postgresql://user:pass@host:port\"}, no dbname) and restart sy-identity. Note: in Model D' the refresh loop detects the secret in vault (live_in_vault flag in CONFIG_GET) but does NOT auto-reconnect the pool; restart is required after the first vault_put. See VA-J'-13 for the planned broadcast-based hot-reconnect."
+                    .to_string(),
+            ),
         );
     };
     let base = match database_url.parse::<PgConfig>() {
