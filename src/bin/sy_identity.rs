@@ -5184,8 +5184,18 @@ fn extract_postgres_url_from_vault_value(value: &Value) -> Option<String> {
 /// re-resolves vault with the secret cleanly. See `handle_vault_secret_changed`
 /// in `sy_storage.rs` for the rationale (Model D' VA-J'-13).
 fn handle_vault_secret_changed(msg: &Message, is_primary: bool, node_name: &str) {
+    tracing::info!(
+        node_name = %node_name,
+        is_primary = is_primary,
+        trace_id = %msg.routing.trace_id,
+        "sy.identity handle_vault_secret_changed: entered"
+    );
     if !is_primary {
         // Replicas have no local Postgres pool; nothing to reconnect.
+        tracing::info!(
+            node_name = %node_name,
+            "sy.identity handle_vault_secret_changed: not primary, ignoring"
+        );
         return;
     }
     let payload: VaultSecretChangedPayload = match serde_json::from_value(msg.payload.clone()) {
@@ -5203,11 +5213,13 @@ fn handle_vault_secret_changed(msg: &Message, is_primary: bool, node_name: &str)
         system_caller: true,
     };
     if !payload.matches_interest(&interest) {
-        tracing::debug!(
+        tracing::info!(
             node_name = %node_name,
             resource_type = %payload.resource_type,
             payload_tenant = %payload.tenant_id,
             payload_ilk = %payload.ilk.as_deref().unwrap_or(""),
+            my_tenant = %fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+            my_ilk = %self_ilk_id,
             "VAULT_SECRET_CHANGED does not match our interest; ignoring"
         );
         return;

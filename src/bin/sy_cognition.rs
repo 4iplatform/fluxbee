@@ -1893,6 +1893,12 @@ fn build_memory_package_for_thread(
 /// the in-memory `ai_secret_source` flag for openai. Postgres is consulted
 /// fresh on the next rebuild attempt — no state to update here.
 async fn handle_vault_secret_changed_cognition(msg: &Message, app_state: &CognitionAppState) {
+    tracing::info!(
+        node_name = %app_state.node_name,
+        trace_id = %msg.routing.trace_id,
+        my_ilk = %app_state.self_ilk_id,
+        "sy.cognition handle_vault_secret_changed_cognition: entered"
+    );
     let payload: VaultSecretChangedPayload = match serde_json::from_value(msg.payload.clone()) {
         Ok(p) => p,
         Err(err) => {
@@ -1912,7 +1918,20 @@ async fn handle_vault_secret_changed_cognition(msg: &Message, app_state: &Cognit
         my_ilk: Some(app_state.self_ilk_id.as_str()),
         system_caller: true,
     };
-    if payload.matches_interest(&interest_openai) {
+    let matched_openai = payload.matches_interest(&interest_openai);
+    let matched_postgres = payload.matches_interest(&interest_postgres);
+    if !matched_openai && !matched_postgres {
+        tracing::info!(
+            node_name = %app_state.node_name,
+            resource_type = %payload.resource_type,
+            payload_tenant = %payload.tenant_id,
+            payload_ilk = %payload.ilk.as_deref().unwrap_or(""),
+            my_tenant = %fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+            my_ilk = %app_state.self_ilk_id,
+            "sy.cognition VAULT_SECRET_CHANGED matches neither openai nor postgres interest; ignoring"
+        );
+    }
+    if matched_openai {
         tracing::info!(
             node_name = %app_state.node_name,
             op = %payload.op.as_str(),
@@ -1935,7 +1954,7 @@ async fn handle_vault_secret_changed_cognition(msg: &Message, app_state: &Cognit
             control.ai_secret_source = next_source;
         }
     }
-    if payload.matches_interest(&interest_postgres) {
+    if matched_postgres {
         // Postgres for cognition is consulted lazily during rebuild; nothing
         // to update in-memory. Log the event so operators can correlate.
         tracing::info!(

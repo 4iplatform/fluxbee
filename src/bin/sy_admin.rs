@@ -370,6 +370,15 @@ impl AdminRouterClient {
     }
 
     async fn dispatch(&self, msg: Message) {
+        tracing::info!(
+            trace_id = %msg.routing.trace_id,
+            src = %msg.routing.src,
+            dst = ?msg.routing.dst,
+            msg_type = %msg.meta.msg_type,
+            msg = msg.meta.msg.as_deref().unwrap_or(""),
+            action = msg.meta.action.as_deref().unwrap_or(""),
+            "sy.admin dispatch: received router message"
+        );
         if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_NODE_STATUS_GET)
         {
             let sender = self.sender.read().await.clone();
@@ -377,8 +386,17 @@ impl AdminRouterClient {
             return;
         }
         if msg.meta.msg_type == SYSTEM_KIND
-            && matches!(msg.meta.msg.as_deref(), Some("CONFIG_GET" | "CONFIG_SET"))
+            && matches!(
+                msg.meta.msg.as_deref(),
+                Some("CONFIG_GET" | "CONFIG_SET" | MSG_VAULT_SECRET_CHANGED)
+            )
         {
+            tracing::info!(
+                trace_id = %msg.routing.trace_id,
+                msg = ?msg.meta.msg,
+                action = ?msg.meta.action,
+                "sy.admin dispatch: forwarding system command to system_command_tx"
+            );
             let _ = self.system_command_tx.send(msg);
             return;
         }
@@ -2659,6 +2677,12 @@ async fn handle_system_command(
 /// `refresh_admin_executor_ai_runtime`, so no exit() needed — we refresh
 /// in-memory and the executor picks up the new key on the next call.
 async fn handle_vault_secret_changed_admin(ctx: &AdminContext, msg: &Message) {
+    tracing::info!(
+        node_name = %ctx.node_name,
+        trace_id = %msg.routing.trace_id,
+        my_ilk = %ctx.self_ilk_id,
+        "sy.admin handle_vault_secret_changed_admin: entered"
+    );
     let payload: VaultSecretChangedPayload = match serde_json::from_value(msg.payload.clone()) {
         Ok(p) => p,
         Err(err) => {
@@ -2673,6 +2697,15 @@ async fn handle_vault_secret_changed_admin(ctx: &AdminContext, msg: &Message) {
         system_caller: true,
     };
     if !payload.matches_interest(&interest) {
+        tracing::info!(
+            node_name = %ctx.node_name,
+            resource_type = %payload.resource_type,
+            payload_tenant = %payload.tenant_id,
+            payload_ilk = %payload.ilk.as_deref().unwrap_or(""),
+            my_tenant = %fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+            my_ilk = %ctx.self_ilk_id,
+            "sy.admin VAULT_SECRET_CHANGED does not match interest (resource_type=openai); ignoring"
+        );
         return;
     }
     tracing::info!(

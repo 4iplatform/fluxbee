@@ -2892,6 +2892,13 @@ fn handle_vault_secret_changed(
     control_state: &StorageControlState,
     node_name: &str,
 ) {
+    tracing::info!(
+        node_name = %node_name,
+        trace_id = %msg.routing.trace_id,
+        my_tenant = %control_state.self_tenant_id,
+        my_ilk = %control_state.self_ilk_id,
+        "sy.storage handle_vault_secret_changed: entered"
+    );
     let payload: VaultSecretChangedPayload = match serde_json::from_value(msg.payload.clone()) {
         Ok(p) => p,
         Err(err) => {
@@ -2906,11 +2913,13 @@ fn handle_vault_secret_changed(
         system_caller: true,
     };
     if !payload.matches_interest(&interest) {
-        tracing::debug!(
+        tracing::info!(
             node_name = %node_name,
             resource_type = %payload.resource_type,
             payload_tenant = %payload.tenant_id,
             payload_ilk = %payload.ilk.as_deref().unwrap_or(""),
+            my_tenant = %control_state.self_tenant_id,
+            my_ilk = %control_state.self_ilk_id,
             "VAULT_SECRET_CHANGED does not match our interest; ignoring"
         );
         return;

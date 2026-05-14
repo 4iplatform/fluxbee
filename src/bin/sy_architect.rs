@@ -5449,6 +5449,12 @@ async fn handle_architect_system_message(
 /// viewer), each independently hot-rebuildable, so we filter per
 /// resource_type and call the existing `refresh_*` functions.
 async fn handle_vault_secret_changed_architect(state: &ArchitectState, msg: &Message) {
+    tracing::info!(
+        node_name = %state.node_name,
+        trace_id = %msg.routing.trace_id,
+        my_ilk = %state.self_ilk_id,
+        "sy.architect handle_vault_secret_changed_architect: entered"
+    );
     let payload: VaultSecretChangedPayload = match serde_json::from_value(msg.payload.clone()) {
         Ok(p) => p,
         Err(err) => {
@@ -5468,7 +5474,20 @@ async fn handle_vault_secret_changed_architect(state: &ArchitectState, msg: &Mes
         my_ilk: Some(state.self_ilk_id.as_str()),
         system_caller: true,
     };
-    if payload.matches_interest(&interest_openai) {
+    let matched_openai = payload.matches_interest(&interest_openai);
+    let matched_postgres = payload.matches_interest(&interest_postgres);
+    if !matched_openai && !matched_postgres {
+        tracing::info!(
+            node_name = %state.node_name,
+            resource_type = %payload.resource_type,
+            payload_tenant = %payload.tenant_id,
+            payload_ilk = %payload.ilk.as_deref().unwrap_or(""),
+            my_tenant = %fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+            my_ilk = %state.self_ilk_id,
+            "sy.architect VAULT_SECRET_CHANGED matches neither openai nor postgres interest; ignoring"
+        );
+    }
+    if matched_openai {
         tracing::info!(
             node_name = %state.node_name,
             op = %payload.op.as_str(),
@@ -5479,7 +5498,7 @@ async fn handle_vault_secret_changed_architect(state: &ArchitectState, msg: &Mes
             tracing::warn!(error = %err, "architect ai runtime refresh failed after broadcast");
         }
     }
-    if payload.matches_interest(&interest_postgres) {
+    if matched_postgres {
         tracing::info!(
             node_name = %state.node_name,
             op = %payload.op.as_str(),
