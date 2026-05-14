@@ -1,7 +1,7 @@
 # WF (Workflow Nodes) v1 — Implementation Tasks
 
 **Status:** implemented / local unit tests validated; real-server E2E scripts added
-**Date:** 2026-04-13 (updated 2026-05-13 with WF-BUILD-3 / WF-TEST-5 / WF-TEST-6 validation and WF-TEST-7 E2E script)
+**Date:** 2026-04-13 (updated 2026-05-14 with WF base runtime install publish, WF-BUILD-3 / WF-TEST-5 / WF-TEST-6 validation, and WF-TEST-7 E2E script)
 **Primary spec:** `docs/wf-v1.md`
 **Target module:** `go/nodes/wf/wf-generic/`
 **Dependencies:** `go/fluxbee-go-sdk`, `go/sy-timer` (**requires v1.1, see WF-DEP-1**), `cel-go`, `modernc.org/sqlite`
@@ -493,6 +493,7 @@ go/nodes/wf/wf-generic/
 - [x] Add binary check: look for `$ROOT_DIR/go/nodes/wf/wf-generic/wf-generic`
 - [x] Install binary to `/usr/bin/wf-generic`
 - [x] Install to `$STATE_DIR/dist/core/bin/wf-generic`
+- [x] Publish canonical WF base runtime into dist during install, without instantiating nodes (`wf.engine@1.0.0` by default; override with `WF_ENGINE_RUNTIME_NAME` / `WF_ENGINE_RUNTIME_VERSION`)
 
 ### WF-BUILD-2 — Orchestrator awareness
 - [x] `wf-generic` accepts the managed `config.json` written by orchestrator (`config_version`, `_system.*`, wrapped/top-level fields)
@@ -651,16 +652,14 @@ Expected result:
 - `/usr/bin/wf-generic` exists
 - `/var/lib/fluxbee/dist/core/bin/wf-generic` exists
 
-### 3. Publish the runtime base and canonical workflow package
+### 3. Publish the canonical workflow package
 
-Publish the base runtime:
+`install.sh` now publishes the WF base runtime automatically:
+- default runtime: `wf.engine`
+- default version: `1.0.0`
+- no WF node is instantiated by install
 
-```bash
-cd ~/fluxbee
-bash scripts/publish-wf-runtime.sh --version 0.1.0 --set-current --sudo
-```
-
-Publish the canonical package:
+Publish the canonical `wf.invoice` package when you want to instantiate/test that workflow:
 
 ```bash
 cd ~/fluxbee
@@ -668,7 +667,7 @@ bash scripts/publish-wf-invoice-package.sh --version 0.1.0 --deploy motherbee
 ```
 
 Expected result:
-- runtime base published as `wf.engine`
+- runtime base already available as `wf.engine`
 - workflow package published as `wf.invoice`
 - package files exist under `/var/lib/fluxbee/dist/runtimes/wf.invoice/0.1.0/`
 

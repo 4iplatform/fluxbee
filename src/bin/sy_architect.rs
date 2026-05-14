@@ -4807,19 +4807,12 @@ async fn main() -> Result<(), ArchitectError> {
     let hive = load_hive(&config_dir)?;
     let node_config = load_architect_node_config(&hive.hive_id)?;
     let node_name = architect_node_name(&hive.hive_id);
-    let self_ilk_id = fluxbee_sdk::identity::wait_for_self_system_ilk_id(
-        &config_dir,
-        "SY.architect",
-        Duration::from_secs(30),
-        Duration::from_millis(250),
-    )
-    .map_err(|err| -> ArchitectError {
-        format!("failed to resolve self system ILK from identity SHM: {err}").into()
-    })?;
+    // Model D': self-ILK is deterministic from L2 name (no SHM wait).
+    let self_ilk_id = fluxbee_sdk::deterministic_system_ilk_id(&node_name);
     tracing::info!(
         node_name = %node_name,
         self_ilk_id = %self_ilk_id,
-        "resolved self system ILK from identity SHM"
+        "self system ILK computed deterministically"
     );
     let ai_runtime = build_architect_ai_runtime(
         &node_name,

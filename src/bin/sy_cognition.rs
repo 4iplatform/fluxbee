@@ -475,16 +475,10 @@ async fn main() -> Result<(), CognitionError> {
 
     let config_dir = json_router::paths::config_dir();
     let hive = load_hive(&config_dir)?;
-    let self_ilk_id = fluxbee_sdk::identity::wait_for_self_system_ilk_id(
-        &config_dir,
-        "SY.cognition",
-        std::time::Duration::from_secs(30),
-        std::time::Duration::from_millis(250),
-    )
-    .map_err(|err| -> CognitionError {
-        format!("failed to resolve self system ILK from identity SHM: {err}").into()
-    })?;
-    tracing::info!(self_ilk_id = %self_ilk_id, "resolved self system ILK from identity SHM");
+    // Model D': self-ILK is deterministic from L2 name (no SHM wait).
+    let self_ilk_id =
+        fluxbee_sdk::deterministic_system_ilk_id(&format!("SY.cognition@{}", hive.hive_id));
+    tracing::info!(self_ilk_id = %self_ilk_id, "self system ILK computed deterministically");
     let state_dir = json_router::paths::state_dir();
     let socket_dir = json_router::paths::router_socket_dir();
     let endpoint = resolve_local_nats_endpoint(&config_dir)?;

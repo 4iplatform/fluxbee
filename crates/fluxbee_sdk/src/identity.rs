@@ -1267,7 +1267,7 @@ pub fn read_self_tenant_from_env() -> Option<String> {
     std::env::var(ENV_SELF_TENANT_ID)
         .ok()
         .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty() && (v == "sys" || v.starts_with("tnt:")))
+        .filter(|v| !v.is_empty() && v.starts_with("tnt:"))
 }
 
 struct IdentityShmReader {

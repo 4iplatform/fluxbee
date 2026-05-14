@@ -185,9 +185,10 @@ Normal operator requests should not create or redesign these.
 
 How consumers find their secret:
 
-- Each consumer calls `resolve_resource(resource_type, my_tenant_id)` against vault. Vault matches in this order: secret dedicated to the caller's ILK → secret in the caller's tenant pool → secret in the `sys` pool (universal for system callers).
-- "Pool" means a secret stored without an explicit `ilk` — every consumer of that tenant (or `sys`) reads the same value. Useful when several SY services share one Postgres or one OpenAI key.
+- Each consumer calls `resolve_resource(resource_type, my_tenant_id)` against vault. Vault matches in this order: secret dedicated to the caller's ILK → secret in the caller's tenant pool → secret in the hive's root tenant pool (universal for system callers).
+- "Pool" means a secret stored without an explicit `ilk` — every consumer of that tenant reads the same value. Useful when several SY services share one Postgres or one OpenAI key.
 - "Dedicated" means a secret stored with `ilk` set to a specific ILK. Only that exact ILK reads it. Useful when one tenant or one specific node needs its own credential.
+- Every `tenant_id` in Model D' follows the canonical `tnt:<uuid>` form. The hive's root tenant (`tnt:00000000-0000-0000-0000-000000000001`, alias `fluxbee`) holds infrastructure-wide secrets (shared Postgres, shared OpenAI key, etc.); client tenants hold their own client-scoped secrets.
 
 Rules for archi when asked about secrets:
 
@@ -196,8 +197,8 @@ Rules for archi when asked about secrets:
 - For writes, use admin actions exposed by `get_admin_action_help`; do not invent vault payload shape. The contract changed in Model D' — read the live contract instead of remembering older payload shapes.
 - **Never** suggest storing `vault://<key>` references in node config: that path was removed. Node configs no longer carry any secret-bearing field.
 - **Never** suggest `metadata.owner_ilk` in `vault_put`: it is rejected. Use `metadata.owner_node` (a friendly L2 name like `SY.architect`) and admin will resolve the ILK; or omit it entirely to publish the secret to the pool.
-- `metadata.resource_type` is mandatory on every `vault_put` (it's the discovery key). `metadata.tenant_id` defaults to `"sys"` when omitted.
-- If a node reports `missing_secret`, inspect its live `CONFIG_GET` (`/control/config-get`) — look at `contract.resources[]` to see which `resource_type` each consumer is waiting for, and `live_in_vault` to confirm whether vault has it yet. If `live_in_vault: true` but `configured: false`, the consumer is reporting-only and needs `systemctl restart <node>` to reconnect its pool (known limitation, see vault tasks).
+- `metadata.resource_type` is mandatory on every `vault_put` (it's the discovery key). `metadata.tenant_id` is optional and defaults to the hive's root tenant when omitted (infrastructure-wide secret).
+- If a node reports `missing_secret`, inspect its live `CONFIG_GET` (`/control/config-get`) — look at `contract.resources[]` to see which `resource_type` each consumer is waiting for. SY.vault broadcasts `VAULT_SECRET_CHANGED` on every put/rotate/delete; storage and identity react with `exit(0)` (systemd restart), admin/architect/cognition refresh in-memory. If a consumer stays missing after a vault_put, check the broadcast was received (vault logs `vault secret changed broadcast sent`).
 - Supported `resource_type` values: `openai`, `postgres`, `anthropic`, `google_calendar`, `gmail`, `google_drive`, `slack`, `hubspot`, `linkedhelper`, plus free-form `Custom(string)` (lowercase, snake_case, max 64 chars).
 - Postgres value contract: store **credentials + host only** (no `dbname`) — each consumer applies its own dbname (`fluxbee_storage`, `fluxbee_identity`, etc.). Example value: `{"postgres_url": "postgresql://user:pass@host:5432"}`.
 

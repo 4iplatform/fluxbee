@@ -362,8 +362,14 @@ impl VaultSecretChangedPayload {
             if self.tenant_id == interest.my_tenant {
                 return true;
             }
-            // (2b) sys-pool universal for system callers.
-            if interest.system_caller && self.tenant_id == "sys" {
+            // (2b) Root-tenant pool universal for system callers — secrets
+            // in the hive's root tenant (`DEFAULT_ROOT_TENANT_ID`, alias
+            // `fluxbee`) are infrastructure-wide; any SY system caller
+            // reads them regardless of which tenant they themselves
+            // belong to.
+            if interest.system_caller
+                && self.tenant_id == crate::identity::DEFAULT_ROOT_TENANT_ID
+            {
                 return true;
             }
         }

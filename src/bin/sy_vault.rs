@@ -85,7 +85,7 @@ impl VaultError {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct Caller {
     l2_name: Option<String>,
     ilk_id: Option<String>,
@@ -170,18 +170,17 @@ async fn main() -> Result<(), VaultError> {
     let hive_id = fluxbee_sdk::load_hive_id(&config_dir)?;
     let node_base_name = VAULT_NODE_BASE_NAME.to_string();
     let node_name = ensure_l2_name(&node_base_name, &hive_id);
-    let _self_ilk_id = fluxbee_sdk::identity::wait_for_self_system_ilk_id(
-        &config_dir,
-        &node_base_name,
-        std::time::Duration::from_secs(30),
-        std::time::Duration::from_millis(250),
-    )?;
-    tracing::info!(self_ilk_id = %_self_ilk_id, "resolved self system ILK from identity SHM");
+    // Model D' / Phase J'-13: vault is self-contained and does NOT wait
+    // for identity SHM. It computes every system ILK it needs locally with
+    // the same deterministic formula identity uses to seed SHM. This
+    // eliminates the legacy chicken-and-egg where vault had to boot AFTER
+    // identity even though identity itself needs vault to resolve its
+    // postgres secret. Order is now: SY.config.routes → SY.vault → SY.identity.
+    let self_ilk_id = fluxbee_sdk::deterministic_system_ilk_id(&node_name);
+    tracing::info!(self_ilk_id = %self_ilk_id, "self system ILK computed deterministically (no SHM wait)");
 
-    // Phase J' / Model D' — well-known administrative ILKs. Computed
-    // locally with the same deterministic formula identity uses to seed
-    // SHM. Vault never trusts `routing.src_l2_name` strings; it compares
-    // the caller's `meta.src_ilk` against this set for admin operations.
+    // Phase J' / Model D' — well-known administrative ILKs (admin /
+    // architect): only these can write to vault.
     let well_known_admin_ilks: HashSet<String> = {
         let admin_ilk = fluxbee_sdk::deterministic_system_ilk_id(&format!(
             "SY.admin@{}",
@@ -202,6 +201,20 @@ async fn main() -> Result<(), VaultError> {
         set
     };
 
+    // Well-known SY system ILKs — the full `system_nodes` list from
+    // hive.yaml plus the admin/architect override set. Used by
+    // `authorize_read` to grant sys-pool universal reads to any SY system
+    // caller WITHOUT requiring identity SHM to be populated. This is the
+    // piece that closes the boot chicken/egg: vault can authorize reads
+    // for identity (and any other SY) at boot even if identity hasn't
+    // written its SHM yet.
+    let well_known_system_ilks: HashSet<String> =
+        compute_well_known_system_ilks(&config_dir, &hive_id, &self_ilk_id, &well_known_admin_ilks);
+    tracing::info!(
+        count = well_known_system_ilks.len(),
+        "well-known SY system ILKs computed from hive.yaml (no SHM dependency)"
+    );
+
     let _lock = acquire_lock(Path::new(DEFAULT_LOCK_PATH))?;
     let key = load_or_create_master_key(Path::new(DEFAULT_MASTER_KEY_PATH))?;
     let mut store = VaultStore::open(Path::new(DEFAULT_DB_PATH), &key)?;
@@ -216,6 +229,21 @@ async fn main() -> Result<(), VaultError> {
     };
     let (sender, mut receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     tracing::info!(node_name = %node_name, "sy.vault started");
+
+    // Model D' / Phase J'-13c — bootstrap broadcast. Emit one
+    // VAULT_SECRET_CHANGED with `op=put` for each secret already in
+    // vault.db so consumers that arrived before us and got
+    // VAULT_UNAVAILABLE can react now. Without this, vault.db with
+    // pre-existing secrets + a boot race leaves consumers stuck in
+    // `secret_source = Missing` because no future mutation will fire to
+    // wake them up. The broadcast is idempotent for consumers already
+    // configured (they just re-resolve the same value and continue).
+    if let Err(err) = emit_bootstrap_secret_broadcasts(&sender, &store, &hive_id).await {
+        tracing::warn!(
+            error = %err,
+            "failed to emit bootstrap secret broadcasts; consumers may stay degraded until next mutation"
+        );
+    }
 
     loop {
         let msg = match receiver.recv().await {
@@ -250,6 +278,7 @@ async fn main() -> Result<(), VaultError> {
             &config_dir,
             &hive_id,
             &well_known_admin_ilks,
+            &well_known_system_ilks,
             &msg,
         )
         .await
@@ -282,12 +311,69 @@ impl HandlerOutcome {
     }
 }
 
+/// Compute the set of well-known SY system ILKs from `hive.yaml`. Includes
+/// `self_ilk` (vault), `well_known_admin_ilks` (admin + architect), and
+/// every entry in `system_nodes.<role>.nodes` mapped via
+/// `deterministic_system_ilk_id`. Reads `hive.yaml` directly from disk;
+/// does NOT depend on identity SHM being populated. This is what closes
+/// the boot chicken-and-egg in Model D'.
+fn compute_well_known_system_ilks(
+    config_dir: &Path,
+    hive_id: &str,
+    self_ilk_id: &str,
+    admin_set: &HashSet<String>,
+) -> HashSet<String> {
+    let mut set: HashSet<String> = HashSet::new();
+    set.insert(self_ilk_id.to_string());
+    set.extend(admin_set.iter().cloned());
+    let hive_yaml_path = config_dir.join("hive.yaml");
+    let Ok(yaml_str) = std::fs::read_to_string(&hive_yaml_path) else {
+        tracing::warn!(
+            path = %hive_yaml_path.display(),
+            "could not read hive.yaml; SY system ILK set will be admin+architect+self only"
+        );
+        return set;
+    };
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&yaml_str) else {
+        tracing::warn!(
+            path = %hive_yaml_path.display(),
+            "could not parse hive.yaml; SY system ILK set will be admin+architect+self only"
+        );
+        return set;
+    };
+    let role = value
+        .get("role")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "motherbee".to_string());
+    if let Some(nodes) = value
+        .get("system_nodes")
+        .and_then(|sn| sn.get(role.as_str()))
+        .and_then(|r| r.get("nodes"))
+        .and_then(|n| n.as_sequence())
+    {
+        for entry in nodes {
+            if let Some(name) = entry.as_str() {
+                let l2 = if name.contains('@') {
+                    name.to_string()
+                } else {
+                    format!("{}@{}", name, hive_id)
+                };
+                set.insert(fluxbee_sdk::deterministic_system_ilk_id(&l2));
+            }
+        }
+    }
+    set
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_vault_message(
     sender: &NodeSender,
     store: &mut VaultStore,
     config_dir: &Path,
     hive_id: &str,
     well_known_admin_ilks: &HashSet<String>,
+    well_known_system_ilks: &HashSet<String>,
     msg: &Message,
 ) -> VaultResult<()> {
     let action = msg.meta.msg.as_deref().unwrap_or_default();
@@ -295,12 +381,24 @@ async fn handle_vault_message(
     let response_action = response_action_for(action);
     let result = match action {
         MSG_VAULT_PUT => handle_put(store, msg, &caller, well_known_admin_ilks, hive_id),
-        MSG_VAULT_GET => {
-            handle_get(store, msg, &caller, well_known_admin_ilks, true).map(HandlerOutcome::response_only)
-        }
-        MSG_VAULT_GET_METADATA => {
-            handle_get(store, msg, &caller, well_known_admin_ilks, false).map(HandlerOutcome::response_only)
-        }
+        MSG_VAULT_GET => handle_get(
+            store,
+            msg,
+            &caller,
+            well_known_admin_ilks,
+            well_known_system_ilks,
+            true,
+        )
+        .map(HandlerOutcome::response_only),
+        MSG_VAULT_GET_METADATA => handle_get(
+            store,
+            msg,
+            &caller,
+            well_known_admin_ilks,
+            well_known_system_ilks,
+            false,
+        )
+        .map(HandlerOutcome::response_only),
         MSG_VAULT_LIST => handle_list(store, msg, &caller).map(HandlerOutcome::response_only),
         MSG_VAULT_DELETE => handle_delete(store, msg, &caller, well_known_admin_ilks, hive_id),
         MSG_VAULT_ROTATE => handle_rotate(store, msg, &caller, well_known_admin_ilks, hive_id),
@@ -387,6 +485,92 @@ async fn send_broadcast_secret_changed(
         version = payload.version,
         key = %payload.key,
         "vault secret changed broadcast sent"
+    );
+    Ok(())
+}
+
+/// Emit one `VAULT_SECRET_CHANGED` (op=put) for each secret currently
+/// stored in vault.db. Called once at boot, after the router connection
+/// is established and right before entering the receive loop.
+///
+/// Why: the `VAULT_SECRET_CHANGED` broadcast is the consumers' wake-up
+/// signal. It normally fires on put/rotate/delete/rollback. If vault.db
+/// already has secrets at boot (reinstall without cleanall, or simple
+/// restart), no mutation will fire — and any consumer that arrived
+/// before vault was routable saw `VAULT_UNAVAILABLE` and stayed
+/// degraded. The bootstrap broadcast rescues them: each receives the
+/// event, filters by interest, and reacts (exit/refresh).
+///
+/// Idempotent for consumers already configured: they re-resolve the
+/// same value and continue. The cost is N small messages at boot, where
+/// N = number of secrets in vault.db — bounded by operator intent.
+async fn emit_bootstrap_secret_broadcasts(
+    sender: &NodeSender,
+    store: &VaultStore,
+    hive_id: &str,
+) -> VaultResult<()> {
+    let summaries = store.list(VaultFilter::default(), &Caller::default())?;
+    if summaries.is_empty() {
+        tracing::info!("sy.vault bootstrap broadcast: vault.db is empty, nothing to announce");
+        return Ok(());
+    }
+    let mut emitted = 0usize;
+    let mut skipped = 0usize;
+    for summary in summaries {
+        let Some(payload) = build_secret_changed_payload(
+            VaultSecretOp::Put,
+            &summary.key,
+            &summary.metadata,
+            summary.version,
+            hive_id,
+        ) else {
+            // Secret has no resource_type — Model D' rejects this on put,
+            // but legacy records could still exist. Skip and log.
+            skipped += 1;
+            tracing::warn!(
+                key = %summary.key,
+                "bootstrap broadcast skipped: secret has no resource_type (legacy record?)"
+            );
+            continue;
+        };
+        // Build the broadcast Message directly. We don't have an
+        // originating msg here (this is boot, not a mutation), so we
+        // mint a fresh trace_id and synthesize the routing.
+        let broadcast = Message {
+            routing: Routing {
+                src: sender.uuid().to_string(),
+                src_l2_name: None,
+                dst: Destination::Broadcast,
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(MSG_VAULT_SECRET_CHANGED.to_string()),
+                src_ilk: None,
+                scope: Some(SCOPE_GLOBAL.to_string()),
+                target: None,
+                action: Some("bootstrap".to_string()),
+                priority: None,
+                context: None,
+                ..Meta::default()
+            },
+            payload: serde_json::to_value(&payload)?,
+        };
+        if let Err(err) = sender.send(broadcast).await {
+            tracing::warn!(
+                error = %err,
+                key = %summary.key,
+                "bootstrap broadcast failed for one secret; continuing with the rest"
+            );
+            continue;
+        }
+        emitted += 1;
+    }
+    tracing::info!(
+        emitted = emitted,
+        skipped = skipped,
+        "sy.vault bootstrap broadcast complete (rescues consumers that raced ahead at boot)"
     );
     Ok(())
 }
@@ -632,13 +816,14 @@ fn handle_get(
     store: &mut VaultStore,
     msg: &Message,
     caller: &Caller,
-    _well_known: &HashSet<String>,
+    _well_known_admin: &HashSet<String>,
+    well_known_system: &HashSet<String>,
     include_value: bool,
 ) -> VaultResult<Value> {
     let key = request_key_required(&msg.payload)?;
     validate_key(&key)?;
     let record = store.get_record(&key)?.ok_or(VaultError::KeyNotFound)?;
-    authorize_read(caller, &record.metadata, include_value)?;
+    authorize_read(caller, &record.metadata, well_known_system, include_value)?;
     let mut payload = json!({
         "status": "ok",
         "key": record.key,
@@ -1148,13 +1333,18 @@ fn resolve_caller(config_dir: &Path, msg: &Message) -> VaultResult<Caller> {
 /// - Dedicated secret (`secret.ilk` set): only that ILK reads. **No admin
 ///   bypass** — the operator's "read my own secret" path is `vault_get`
 ///   from a node that owns it, not admin reading on the operator's behalf.
-/// - Pool secret (`secret.ilk` empty/null): any caller of the same tenant
-///   reads. The caller's tenant is resolved via SHM in `resolve_caller`.
-/// - Caller unresolved by SHM (boot chicken/egg): only the dedicated path
-///   applies — direct ILK-equality match.
+/// - Pool secret (`secret.ilk` empty/null) with `tenant_id == "sys"`:
+///   readable by any caller whose ILK is in `well_known_system_ilks`. This
+///   set is computed locally from `hive.yaml` at boot and does NOT depend
+///   on identity SHM, so consumers can resolve their boot secrets even
+///   when identity hasn't written SHM yet.
+/// - Pool secret with `tenant_id == "tnt:<uuid>"`: readable by any caller
+///   in the same tenant (resolved from SHM). If SHM isn't populated yet,
+///   only the dedicated path applies.
 fn authorize_read(
     caller: &Caller,
     metadata: &VaultMetadata,
+    well_known_system_ilks: &HashSet<String>,
     _include_value: bool,
 ) -> VaultResult<()> {
     let secret_owner = secret_owner_ilk(metadata);
@@ -1166,23 +1356,35 @@ fn authorize_read(
             return Ok(());
         }
     }
-    // (2) Pool match — only if caller is fully resolved via SHM.
+    // (2) Pool match.
     if secret_owner.is_none() {
-        // (2a) Exact tenant pool: caller and secret in same tenant.
+        // (2a) Root-tenant pool universal for SY system callers (no SHM
+        // needed). This is the path that closes the boot chicken/egg:
+        // any node whose ILK matches a deterministic SY system ILK from
+        // hive.yaml can read root-tenant pool secrets, even before
+        // identity has written SHM. The root tenant
+        // (`DEFAULT_ROOT_TENANT_ID`, alias `fluxbee`) holds all
+        // infrastructure-wide secrets in Model D'.
+        if metadata.tenant_id == fluxbee_sdk::DEFAULT_ROOT_TENANT_ID {
+            if let Some(self_ilk) = caller_ilk {
+                if well_known_system_ilks.contains(self_ilk) {
+                    return Ok(());
+                }
+            }
+            // Fallback: if SHM is populated, accept callers tagged as
+            // system there (covers non-SY system callers we haven't
+            // anticipated).
+            if caller.ilk_type.as_deref() == Some("system") {
+                return Ok(());
+            }
+        }
+        // (2b) Exact tenant pool: caller and secret in same tenant
+        // (requires SHM-populated tenant for the caller). Used for
+        // tenant-scoped secrets (e.g. a client tenant's own API key).
         if let Some(tenant) = caller.tenant_id.as_deref() {
             if tenant == metadata.tenant_id {
                 return Ok(());
             }
-        }
-        // (2b) `sys` is the system-wide pool of the hive. Readable by
-        // any system-type caller regardless of which tnt:<uuid> their
-        // ILK belongs to. Matches the operator's mental model: "sys"
-        // secrets are shared infrastructure credentials available to
-        // every SY service in the hive.
-        if metadata.tenant_id == "sys"
-            && caller.ilk_type.as_deref() == Some("system")
-        {
-            return Ok(());
         }
     }
     Err(VaultError::Unauthorized)
@@ -1214,9 +1416,9 @@ fn validate_key(key: &str) -> VaultResult<()> {
 
 fn validate_metadata(metadata: &VaultMetadata) -> VaultResult<()> {
     let tenant = metadata.tenant_id.trim();
-    if tenant != "sys" && !tenant.starts_with("tnt:") {
+    if !tenant.starts_with("tnt:") {
         return Err(VaultError::InvalidRequest(
-            "metadata.tenant_id must be sys or tnt:<uuid>".to_string(),
+            "metadata.tenant_id must be tnt:<uuid> (use the hive's root tenant for infrastructure secrets — admin defaults to it when tenant_id is omitted)".to_string(),
         ));
     }
     // Model D': resource_type is mandatory on every PUT. We accept either

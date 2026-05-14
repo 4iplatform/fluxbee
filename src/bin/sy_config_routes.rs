@@ -80,16 +80,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let hive = load_hive(&config_dir)?;
     let hive_id = hive.hive_id.clone();
-    let _self_ilk_id = fluxbee_sdk::identity::wait_for_self_system_ilk_id(
-        &config_dir,
-        "SY.config.routes",
-        std::time::Duration::from_secs(30),
-        std::time::Duration::from_millis(250),
-    )
-    .map_err(|err| -> Box<dyn std::error::Error> {
-        format!("failed to resolve self system ILK from identity SHM: {err}").into()
-    })?;
-    tracing::info!(self_ilk_id = %_self_ilk_id, "resolved self system ILK from identity SHM");
+    // Model D': self-ILK is deterministic from L2 name (no SHM wait).
+    // Same hash function identity uses to seed SHM, so the value matches
+    // what other nodes expect. Eliminates boot-order dependency on identity.
+    let self_node_name = format!("SY.config.routes@{hive_id}");
+    let _self_ilk_id = fluxbee_sdk::deterministic_system_ilk_id(&self_node_name);
+    tracing::info!(self_ilk_id = %_self_ilk_id, "self system ILK computed deterministically");
     let router_socket = match std::env::var("JSR_ROUTER_NAME") {
         Ok(router_name) => {
             let router_l2_name = ensure_l2_name(&router_name, &hive.hive_id);

@@ -2515,23 +2515,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_env_filter(EnvFilter::new(log_filter))
         .init();
 
-    // SY.frontdesk.gov is a system node; identity seeds its deterministic
-    // ILK in SHM before any consumer talks to vault. We resolve it here once
-    // at boot and pass it down into each node instance constructed below.
-    // Failure is logged but doesn't kill the process — the node can still
-    // serve its non-identity-bearing flows in degraded mode.
-    let frontdesk_self_ilk_id = match fluxbee_sdk::identity::wait_for_self_system_ilk_id(
-        std::path::Path::new(&default_config_dir()),
-        "SY.frontdesk.gov",
-        std::time::Duration::from_secs(30),
-        std::time::Duration::from_millis(250),
-    ) {
-        Ok(ilk) => {
-            tracing::info!(self_ilk_id = %ilk, "SY.frontdesk.gov self ILK resolved from identity SHM");
+    // Model D': SY.frontdesk.gov self-ILK is deterministic from its L2 name
+    // (no SHM wait). Identity uses the same formula to seed SHM, so the
+    // value matches what other nodes look up.
+    let frontdesk_self_ilk_id = match fluxbee_sdk::load_hive_id(std::path::Path::new(
+        &default_config_dir(),
+    )) {
+        Ok(hive_id) => {
+            let l2 = format!("SY.frontdesk.gov@{hive_id}");
+            let ilk = fluxbee_sdk::deterministic_system_ilk_id(&l2);
+            tracing::info!(self_ilk_id = %ilk, "SY.frontdesk.gov self ILK computed deterministically");
             Some(ilk)
         }
         Err(err) => {
-            tracing::warn!(error = %err, "SY.frontdesk.gov failed to resolve self ILK from SHM; identity-bearing outgoing calls will fail");
+            tracing::warn!(error = %err, "SY.frontdesk.gov could not read hive.yaml to derive self ILK; identity-bearing outgoing calls will fail");
             None
         }
     };

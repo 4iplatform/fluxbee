@@ -272,7 +272,8 @@ go/sy-wf-rules/
 
 ### WFRULES-ORCH-1 — Node status client
 - [x] Node existence is determined via `GetNodeConfig` → `NODE_CONFIG_NOT_FOUND` error (implemented in `orchestrator.go`)
-- [ ] **OPTIONAL / non-blocking:** Add direct `NODE_STATUS_GET` probing of the WF node L2 name to distinguish "managed config exists" from "process is alive but idle". Current implementation already reports useful reachability via `WF_LIST_INSTANCES` timeout behavior and is aligned with the current infra.
+- [x] Direct `NODE_STATUS_GET` probing of the WF node L2 name distinguishes "managed config exists" from "process is alive" (`wf_client.go`, wired through `GetWorkflowStatus`).
+- [x] Additive observability fields expose `status_reachable` and `health_state` while active instance count remains sourced from `WF_LIST_INSTANCES`.
 
 ### WFRULES-ORCH-2 — Managed config read client
 - [x] Implement `GetNodeConfig(nodeL2Name string)`
@@ -607,7 +608,7 @@ go/sy-wf-rules/
 - [x] Request contracts/docs cover all `wf-rules` Admin endpoints
 - [x] Hive/target normalization is tested
 - [x] Admin response envelope accepts `sy.wf-rules` ok/error payload shapes
-- [ ] **PENDING:** End-to-end forwarding test of each Admin endpoint through router to L2 (requires integration test harness)
+- [x] End-to-end forwarding test of each Admin endpoint through router to L2 (`scripts/wf_rules_admin_forwarding_e2e.sh`)
 
 ### WFRULES-TEST-13 — E2E lifecycle test on real server (2026-04-16) ✓
 

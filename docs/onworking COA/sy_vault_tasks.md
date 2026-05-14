@@ -581,6 +581,39 @@ Tareas:
 - [ ] VA-J'-14c. `ai-generic::resolve_openai_api_key_with_source`: retry con backoff (3×2s) en boot path.
 - [ ] VA-J'-14d. `io-slack::resolve_slack_credentials_from_vault`: retry con backoff (3×2s) en boot path.
 
+### J'-13b. Vault self-contained al boot (sin dependencia de identity SHM) — **2026-05-14**
+
+Después de J'-13 quedó una dependencia residual entre vault e identity al boot que rompía el reorden vault-first en `hive.yaml`:
+
+1. **`wait_for_self_system_ilk_id`** bloqueaba vault hasta que identity escribiera SHM con vault's own ILK. Solo se usaba para loggear (descartado con `let _self_ilk_id`).
+2. **`list_ilks_from_hive_config` en `resolve_caller`** poblaba `caller.tenant_id` y `caller.ilk_type` desde SHM. La regla "sys-pool universal" en `authorize_read` requería `caller.ilk_type == "system"` (vía SHM) → si identity arrancaba después de vault, los SY callers no podían leer pool secrets hasta que identity hubiera escrito SHM.
+
+**Fix aplicado:**
+
+- Vault ahora computa su own ILK con `deterministic_system_ilk_id(&node_name)` (cero espera).
+- `compute_well_known_system_ilks` lee `hive.yaml` directamente y construye el set completo de ILKs deterministicos de TODOS los SY system nodes. Cero dependencia de SHM.
+- `authorize_read` rule (2a) reemplazada: en lugar de exigir `caller.ilk_type == "system"` (SHM), ahora acepta cualquier caller cuyo ILK esté en `well_known_system_ilks` (computado de hive.yaml). El path SHM-based queda como fallback para callers no-SY.
+
+Con esto, vault arranca self-contained:
+
+- Lee `vault.master.key` (filesystem)
+- Abre `vault.db` (filesystem)
+- Computa `well_known_admin_ilks` (admin + architect) y `well_known_system_ilks` (admin + architect + vault + todos los SY de hive.yaml) localmente
+- Entra al receive loop sin esperar a nadie
+
+Y los consumers (identity incluido) pueden leer su postgres pool secret al boot incluso antes de que identity escriba SHM, porque su ILK deterministico ya está en el set well-known de vault.
+
+**Tareas:**
+
+- [x] VA-J'-13b-1. Reemplazar `wait_for_self_system_ilk_id` por `deterministic_system_ilk_id(&node_name)` en sy_vault.rs.
+- [x] VA-J'-13b-2. Función `compute_well_known_system_ilks(config_dir, hive_id, self_ilk, admin_set)` que lee `system_nodes.<role>.nodes` de hive.yaml y mapea con `deterministic_system_ilk_id`.
+- [x] VA-J'-13b-3. `authorize_read` toma `well_known_system_ilks` y lo usa para sys-pool universal sin requerir SHM.
+- [x] VA-J'-13b-4. `handle_vault_message` propaga el set a `handle_get`. `handle_put/rotate/delete/rollback` no necesitan (solo well_known_admin_ilks).
+- [x] VA-J'-13b-5. **Self-ILK determinístico propagado a los 7 SY nodes restantes** (sy_config_routes, sy_admin, sy_architect, sy_storage, sy_cognition, sy_policy, ai-frontdesk-gov). Antes solo vault e identity computaban su propio ILK localmente; los demás esperaban hasta 30s a que identity escribiera SHM. Ahora todos los SY arrancan self-contained: `let self_ilk_id = deterministic_system_ilk_id(&node_name)`. Cero functional change (mismo valor de ILK) + cero wait al boot.
+- [x] VA-J'-13c-1. **Sentinel `"sys"` eliminado.** Toda referencia a `tenant_id = "sys"` reemplazada por `DEFAULT_ROOT_TENANT_ID` (`tnt:00000000-0000-0000-0000-000000000001`, alias `fluxbee`). Cambios: SDK (`resolve_resource`, `VaultSecretChangedPayload::matches_interest`, `read_self_tenant_from_env`), sy_vault (`authorize_read`, `validate_metadata`), sy_admin (default + docstrings + ejemplos + test fixture), handbook §4.5. Modelo conceptual más simple: todos los `tenant_id` siguen `tnt:<uuid>`, sin sentinels. Los secrets de infraestructura viven en el tenant raíz, los de clientes en sus tenants respectivos.
+- [x] VA-J'-13c-2. **Bootstrap broadcast on vault boot.** `emit_bootstrap_secret_broadcasts` corre una vez después de que vault conecta al router y antes del receive loop, emitiendo un `VAULT_SECRET_CHANGED { op=put }` por cada secret en vault.db. Cierra el Caso C: consumers que arrancan antes que vault esté routable + ven `VAULT_UNAVAILABLE` + se quedan degraded son rescatados cuando vault finalmente entra al loop y anuncia su contenido. Idempotente para consumers ya configurados.
+- [ ] VA-J'-13b-6. Test unitario: caller con ILK en `well_known_system_ilks` y SHM vacía puede leer un secret con `tenant_id=sys, ilk=null`. **Pendiente.**
+
 ### J'-13. Vault broadcast de cambios de secret — **implementado 2026-05-14**
 
 > **Estado: completado.** SY.vault publica `VAULT_SECRET_CHANGED` por router broadcast después de cada `put` / `rotate` / `delete` / `rollback` que cambia estado. Los 5 consumers escuchan en su `process_router_message` / `process_system_message` / `handle_system_command` existente, filtran por interest (`resource_type`, `tenant_id`, `ilk`) usando `VaultSecretChangedPayload::matches_interest`, y reaccionan según su capacidad:

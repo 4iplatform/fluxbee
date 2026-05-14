@@ -692,17 +692,18 @@ pub async fn resolve_resource(
         return Ok(Some(value));
     }
 
-    // (3) Pool `sys` — hive-wide shared secrets for system services.
-    // Skip if the caller already lives in `sys` (would be a duplicate
-    // of the previous query).
-    if my_tenant != "sys" {
+    // (3) Pool del tenant raíz (`DEFAULT_ROOT_TENANT_ID`, alias `fluxbee`)
+    // — secrets de infraestructura del hive compartidos por todos los SY
+    // system services. Skip if the caller already lives in the root
+    // tenant (duplicate of step 2).
+    if my_tenant != crate::identity::DEFAULT_ROOT_TENANT_ID {
         if let Some(value) = list_then_get_first(
             sender,
             receiver,
             caller,
             &target,
             &resource_str,
-            "sys",
+            crate::identity::DEFAULT_ROOT_TENANT_ID,
             Some(String::new()),
             timeout,
         )

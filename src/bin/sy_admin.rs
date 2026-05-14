@@ -570,19 +570,12 @@ async fn main() -> Result<(), AdminError> {
     let http_tx = broadcast_tx.clone();
     let nats_client = Arc::new(NatsClient::from_client_config(&client_config)?);
     let node_name = admin_node_name(&hive.hive_id);
-    let self_ilk_id = fluxbee_sdk::identity::wait_for_self_system_ilk_id(
-        &config_dir,
-        "SY.admin",
-        Duration::from_secs(30),
-        Duration::from_millis(250),
-    )
-    .map_err(|err| -> AdminError {
-        format!("failed to resolve self system ILK from identity SHM: {err}").into()
-    })?;
+    // Model D': self-ILK is deterministic from L2 name (no SHM wait).
+    let self_ilk_id = fluxbee_sdk::deterministic_system_ilk_id(&node_name);
     tracing::info!(
         node_name = %node_name,
         self_ilk_id = %self_ilk_id,
-        "resolved self system ILK from identity SHM"
+        "self system ILK computed deterministically"
     );
     let initial_executor_runtime = build_admin_executor_ai_runtime(
         &hive.hive_id,
@@ -6745,7 +6738,7 @@ fn admin_action_executor_contract(spec: &InternalActionSpec) -> serde_json::Valu
             "Do not wrap mutation fields under args.body; body is only the HTTP request shape.",
             "Vault value-bearing fields are secret-sensitive and must not be printed in summaries/logs.",
             "Prefer vault_get_metadata for inspection. Use vault_get only when the operator explicitly needs the secret value.",
-            "Model D' for vault_put / vault_rotate: metadata.resource_type is MANDATORY (canonical lowercase snake_case: openai, postgres, slack, anthropic, hubspot, linkedhelper, google_calendar, gmail, google_drive, or a free-form custom string up to 64 chars). metadata.tenant_id defaults to 'sys' when omitted. To scope a secret to a specific node, use metadata.owner_node (a friendly L2 like 'SY.architect' — admin resolves the ILK); omit it entirely to publish to the pool. metadata.owner_ilk is REJECTED (legacy Model J) — do not generate it.",
+            "Model D' for vault_put / vault_rotate: metadata.resource_type is MANDATORY (canonical lowercase snake_case: openai, postgres, slack, anthropic, hubspot, linkedhelper, google_calendar, gmail, google_drive, or a free-form custom string up to 64 chars). metadata.tenant_id defaults to the hive's root tenant when omitted (infrastructure-wide secret, readable by every SY system caller). To scope a secret to a specific node, use metadata.owner_node (a friendly L2 like 'SY.architect' — admin resolves the ILK); omit it entirely to publish to the tenant pool. metadata.owner_ilk is REJECTED (legacy Model J) — do not generate it.",
             "Postgres secrets MUST be credentials + host only — never include a dbname in the connection string. Each consumer (storage, identity, architect-messages-db, cognition) applies its own dbname after resolving. Example value: {\"postgres_url\": \"postgresql://user:pass@host:5432\"}.",
         ]
     } else if matches!(
@@ -7400,7 +7393,7 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "metadata",
                 "object",
-                "Vault metadata (Model D'). MUST contain resource_type. Optionally tenant_id (default 'sys'), owner_node (friendly L2 like 'SY.architect' — admin resolves the ILK), description, tags. metadata.owner_ilk is REJECTED — use owner_node or omit (pool secret).",
+                "Vault metadata (Model D'). MUST contain resource_type. Optionally tenant_id (defaults to the hive's root tenant — infrastructure-wide secret), owner_node (friendly L2 like 'SY.architect' — admin resolves the ILK), description, tags. tenant_id values must be in canonical tnt:<uuid> form. metadata.owner_ilk is REJECTED — use owner_node or omit (pool secret).",
             ),
         ],
         "vault_rotate" => vec![
@@ -7530,7 +7523,7 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
         "vault_list" => vec![admin_action_body_field(
             "filter",
             "object",
-            "Optional filter object. Fields: prefix (string), tenant_id (string, default 'sys'), resource_type (string — canonical Model D' lowercase snake_case), ilk (string for dedicated secrets; pass empty string to match pool secrets explicitly), tags (string[]), limit (number).",
+            "Optional filter object. Fields: prefix (string), tenant_id (string, canonical tnt:<uuid>; defaults to the hive's root tenant when admin caller and omitted), resource_type (string — canonical Model D' lowercase snake_case), ilk (string for dedicated secrets; pass empty string to match pool secrets explicitly), tags (string[]), limit (number).",
         )],
         "run_node" => vec![
             admin_action_body_field(
@@ -8011,7 +8004,7 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         "vault_list" => serde_json::json!({
             "filter": {
                 "resource_type": "openai",
-                "tenant_id": "sys",
+                "tenant_id": "tnt:00000000-0000-0000-0000-000000000001",
                 "limit": 100
             }
         }),
@@ -8022,8 +8015,8 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             },
             "metadata": {
                 "resource_type": "openai",
-                "tenant_id": "sys",
-                "description": "OpenAI API key shared by SY system services (pool)",
+                "tenant_id": "tnt:00000000-0000-0000-0000-000000000001",
+                "description": "OpenAI API key shared by SY system services (root-tenant pool)",
                 "tags": ["provider:openai"]
             }
         }),
@@ -8121,7 +8114,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         }
         "vault_list" => "curl -X GET '/hives/motherbee/vault/secrets?prefix=sys:&tags=provider:openai&limit=100'",
         "vault_put" => {
-            r#"curl -X POST /hives/motherbee/vault/secrets -d '{"key":"sys:openai-api-key","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"sys","owner_node":"SY.architect","description":"OpenAI API key"}}'"#
+            r#"curl -X POST /hives/motherbee/vault/secrets -d '{"key":"sys:openai-api-key","value":{"api_key":"sk-..."},"metadata":{"resource_type":"openai","owner_node":"SY.architect","description":"OpenAI API key"}}'"#
         }
         "vault_get_metadata" => {
             "curl -X GET /hives/motherbee/vault/secrets/sys:openai-api-key/metadata"
@@ -8376,7 +8369,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
         "vault_put" => vec![
             "Writes plaintext to SY.vault over L2; SY.vault encrypts at rest and writes local audit.",
             "value is secret-sensitive and must be redacted in previews/history.",
-            "Model D' metadata contract: metadata.resource_type is REQUIRED (canonical lowercase snake_case). metadata.tenant_id is optional (defaults to 'sys'; values must be 'sys' or 'tnt:<uuid>'). metadata.owner_node is optional (friendly L2 name like 'SY.architect' — admin resolves the ILK); omit owner_node entirely for a pool secret. metadata.owner_ilk is REJECTED — never include it.",
+            "Model D' metadata contract: metadata.resource_type is REQUIRED (canonical lowercase snake_case). metadata.tenant_id is optional (defaults to the hive's root tenant — infrastructure-wide secret; values must be in canonical tnt:<uuid> form). metadata.owner_node is optional (friendly L2 name like 'SY.architect' — admin resolves the ILK); omit owner_node entirely for a pool secret. metadata.owner_ilk is REJECTED — never include it.",
             "Same-value PUT is idempotent: the vault returns changed=false and does not increment version.",
         ],
         "vault_get_metadata" => vec![
@@ -10449,7 +10442,9 @@ async fn handle_vault_command(
 /// What this does:
 /// - **Required**: `metadata.resource_type` — normalized via
 ///   `normalize_resource_type` (lowercase + `_`-joined).
-/// - **Default**: `metadata.tenant_id` defaults to `"sys"` if omitted.
+/// - **Default**: `metadata.tenant_id` defaults to the hive's root tenant
+///   (`DEFAULT_ROOT_TENANT_ID`, alias `fluxbee`) if omitted. That tenant
+///   holds all infrastructure-wide secrets in Model D'.
 /// - **Owner resolution**: if `metadata.owner_node` is provided, resolved
 ///   to `metadata.ilk` against identity SHM. If `metadata.ilk` is set
 ///   directly, it wins (advanced/explicit path). Both empty → secret goes
@@ -10472,7 +10467,10 @@ fn normalize_vault_put_payload(
         );
     }
 
-    // Default tenant_id to "sys" if missing.
+    // Default tenant_id to the hive's root tenant if missing. Model D'
+    // stores every infrastructure-wide secret under the root tenant — no
+    // sentinel like "sys"; every tenant_id keeps the canonical
+    // `tnt:<uuid>` shape.
     let tenant_present = metadata
         .get("tenant_id")
         .and_then(|v| v.as_str())
@@ -10482,7 +10480,7 @@ fn normalize_vault_put_payload(
     if !tenant_present {
         metadata.insert(
             "tenant_id".to_string(),
-            serde_json::Value::String("sys".to_string()),
+            serde_json::Value::String(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID.to_string()),
         );
     }
 
@@ -12469,7 +12467,7 @@ mod tests {
                     "api_key": "sk-live"
                 },
                 "metadata": {
-                    "tenant_id": "sys",
+                    "tenant_id": "tnt:00000000-0000-0000-0000-000000000001",
                     "owner_ilk": "ilk:11111111-1111-4111-8111-111111111111"
                 }
             }
@@ -13162,7 +13160,7 @@ mod tests {
             updated_at: Some("2026-03-16T00:00:00Z".to_string()),
             runtimes: serde_json::json!({
                 "ai.test.gov": {
-                    "available": ["1.0.0"],
+                    "available": ["0.9.0", "1.0.0"],
                     "current": "1.0.0",
                     "type": "full_runtime"
                 }

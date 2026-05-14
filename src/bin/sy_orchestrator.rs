@@ -2898,12 +2898,49 @@ fn validate_system_nodes(
     if nodes.is_empty() {
         return Err("invalid hive.yaml: configured system node list is empty".into());
     }
-    if nodes[0].trim() != "SY.identity" {
+    // Model D' boot order: SY.config.routes is the only absolute prereq —
+    // it writes the routing SHM that every other SY node needs to register.
+    // SY.vault is the second-most critical on motherbee (consumers do an
+    // ephemeral `resolve_resource` lookup at boot; if vault hasn't yet
+    // registered in the router, the lookup returns VAULT_UNAVAILABLE and
+    // the consumer falls to `secret_source = Missing`). We enforce that
+    // SY.config.routes is first, and on motherbee SY.vault must appear
+    // before any of its consumers (admin/architect/storage/identity/
+    // cognition).
+    if nodes[0].trim() != "SY.config.routes" {
         return Err(format!(
-            "invalid hive.yaml: system_nodes.{}.nodes must start with SY.identity",
+            "invalid hive.yaml: system_nodes.{}.nodes must start with SY.config.routes (writer of the routing SHM; required by every other SY service)",
             if is_motherbee { "motherbee" } else { "worker" }
         )
         .into());
+    }
+    if is_motherbee {
+        let vault_idx = nodes.iter().position(|n| n.trim() == "SY.vault");
+        if let Some(vault_idx) = vault_idx {
+            const VAULT_CONSUMERS: &[&str] = &[
+                "SY.admin",
+                "SY.architect",
+                "SY.storage",
+                "SY.identity",
+                "SY.cognition",
+            ];
+            for consumer in VAULT_CONSUMERS {
+                if let Some(consumer_idx) = nodes.iter().position(|n| n.trim() == *consumer) {
+                    if consumer_idx < vault_idx {
+                        return Err(format!(
+                            "invalid hive.yaml: system_nodes.motherbee.nodes lists '{}' before SY.vault — vault consumers must appear after SY.vault to avoid VAULT_UNAVAILABLE at boot (Model D')",
+                            consumer
+                        )
+                        .into());
+                    }
+                }
+            }
+        } else {
+            return Err(
+                "invalid hive.yaml: system_nodes.motherbee.nodes must include SY.vault on motherbee (Model D' canonical secret backend)"
+                    .into(),
+            );
+        }
     }
     let mut seen_nodes = HashSet::new();
     let mut seen_services = HashSet::new();
@@ -15967,8 +16004,8 @@ blob:
             nats_endpoint: "nats://127.0.0.1:4222".to_string(),
             identity_sync_port: 0,
             system_nodes: RoleSystemNodes {
-                nodes: vec!["SY.identity".to_string(), "SY.timer".to_string()],
-                wait_for: vec!["SY.identity".to_string(), "SY.timer".to_string()],
+                nodes: vec!["SY.config.routes".to_string(), "SY.timer".to_string()],
+                wait_for: vec!["SY.config.routes".to_string(), "SY.timer".to_string()],
             },
             blob: sample_blob_config(),
             dist: sample_dist_config(),

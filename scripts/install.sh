@@ -17,6 +17,8 @@ RUNTIME_FIXTURE_VERSION="${RUNTIME_FIXTURE_VERSION:-0.0.1}"
 RUNTIME_FIXTURE_SLEEP_SECS="${RUNTIME_FIXTURE_SLEEP_SECS:-3600}"
 AI_GENERIC_RUNTIME_NAME="${AI_GENERIC_RUNTIME_NAME:-ai.generic}"
 AI_GENERIC_RUNTIME_VERSION="${AI_GENERIC_RUNTIME_VERSION:-1.0.0}"
+WF_ENGINE_RUNTIME_NAME="${WF_ENGINE_RUNTIME_NAME:-wf.engine}"
+WF_ENGINE_RUNTIME_VERSION="${WF_ENGINE_RUNTIME_VERSION:-1.0.0}"
 REQUESTED_BIN_DIR="${BIN_DIR:-}"
 BIN_DIR="$ROOT_DIR/target/release"
 STATE_ROOT_DIR="$STATE_DIR/state"
@@ -840,6 +842,21 @@ bash "$ROOT_DIR/scripts/publish-ia-runtime.sh" \
   --runtime "$AI_GENERIC_RUNTIME_NAME" \
   --version "$AI_GENERIC_RUNTIME_VERSION" \
   --binary "$ai_generic_bin" \
+  --dist-root "$STATE_DIR/dist" \
+  --set-current \
+  --sudo \
+  --skip-build
+
+if [[ ! -f "$wf_generic_bin" ]]; then
+  echo "Error: WF engine build completed but binary is missing: $wf_generic_bin" >&2
+  exit 1
+fi
+
+echo "Publishing base runtime $WF_ENGINE_RUNTIME_NAME@$WF_ENGINE_RUNTIME_VERSION into $STATE_DIR/dist/runtimes..."
+bash "$ROOT_DIR/scripts/publish-wf-runtime.sh" \
+  --runtime "$WF_ENGINE_RUNTIME_NAME" \
+  --version "$WF_ENGINE_RUNTIME_VERSION" \
+  --binary "$wf_generic_bin" \
   --dist-root "$STATE_DIR/dist" \
   --set-current \
   --sudo \
