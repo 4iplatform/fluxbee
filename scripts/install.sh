@@ -163,14 +163,23 @@ cleanup_volatile_runtime_artifacts() {
 }
 
 declare -A INSTALL_WAS_ACTIVE=()
+# Restart order matters in Model D' (vault): rt-gateway must be up first so
+# every service can register; sy-vault must be up second so the consumers
+# that resolve secrets from vault at boot (admin/architect/storage/identity/
+# cognition) find vault ready when they make their ephemeral lookup. Without
+# this ordering, a race during reinstall leaves storage/identity in
+# `missing_secret` even though `vault.db` and `vault.master.key` are intact —
+# the refresh loop later sees `live_in_vault: true` but does not reconnect
+# the pool (VA-J'-13). Reordering + the explicit wait below closes the
+# race.
 INSTALL_RESTART_SERVICES=(
   "rt-gateway"
+  "sy-vault"
   "sy-config-routes"
   "sy-opa-rules"
   "sy-wf-rules"
   "sy-admin"
   "sy-architect"
-  "sy-vault"
   "sy-storage"
   "sy-identity"
   "sy-cognition"
@@ -1041,6 +1050,20 @@ if [[ "${INSTALL_WAS_ACTIVE[sy-orchestrator]:-0}" != "1" ]]; then
     if [[ "${INSTALL_WAS_ACTIVE[$svc]:-0}" == "1" ]] && install_service_exists "$svc"; then
       echo "Restarting ${svc}.service to restore pre-install state..."
       sudo systemctl restart "${svc}.service"
+      # After restarting rt-gateway and sy-vault, block briefly until they
+      # are active. Every consumer that follows depends on rt-gateway being
+      # routable and on sy-vault answering `resolve_resource` lookups at
+      # boot (Model D'). Without these waits, storage/identity arrive at
+      # vault before its socket is ready, fall back to
+      # `secret_source = Missing`, and need a manual restart to reconnect
+      # the Postgres pool.
+      case "$svc" in
+        "rt-gateway"|"sy-vault")
+          if ! wait_for_service_active "$svc" 30; then
+            echo "Warning: ${svc}.service did not become active within 30s; downstream consumers may race the secret lookup." >&2
+          fi
+          ;;
+      esac
     fi
   done
 fi
