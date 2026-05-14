@@ -566,6 +566,21 @@ Antes de codear hay que decidir:
 - [ ] VA-J'-12b. Actualizar `docs/onworking COA/node-secret-config-spec.md`: el único path de secrets es vault con el modelo D'. CONFIG_SET solo para config no-secreta. Archivo `secrets.json` se va.
 - [ ] VA-J'-12c. Examples de `vault_put` con `owner_node` y sin `owner_node` (pool) en `docs/07-operaciones.md` o el doc de operación.
 
+### J'-14. Retry con backoff en `resolve_database_url` al boot — **pendiente, defensa adicional**
+
+**Problema observado (2026-05-14).** En reinstalls sin `cleanall`, sy-storage y sy-identity arrancan, hacen un único `resolve_resource(Postgres, ...)` al boot, vault aún no está registrado en el router (window de ~cientos de ms entre `systemctl active` y `ANNOUNCE` completado), el lookup retorna `VAULT_UNAVAILABLE`, y el consumer queda en `secret_source = Missing` para siempre (limitación VA-J'-13).
+
+**Fix de install.sh aplicado (mismo día):** `wait_for_router_registration("SY.vault@<hive>")` después de restartear sy-vault. Cierra la mayoría de los casos.
+
+**Defensa adicional (este task):** en el boot path de cada consumer, hacer retry con backoff a `resolve_database_url` y equivalentes — p.ej. 3 intentos con 2s entre cada uno antes de declarar Missing. Esto cubre casos que el wait de install.sh no atrapa: orchestrator-spawned dynamic nodes (AI/IO/WF) que no pasan por install.sh, reinicios manuales con `systemctl`, crashes transitorios de vault.
+
+Tareas:
+
+- [ ] VA-J'-14a. `sy_storage::resolve_database_url`: retry con backoff (3×2s).
+- [ ] VA-J'-14b. `sy_identity::resolve_database_url`: retry con backoff (3×2s).
+- [ ] VA-J'-14c. `ai-generic::resolve_openai_api_key_with_source`: retry con backoff (3×2s) en boot path.
+- [ ] VA-J'-14d. `io-slack::resolve_slack_credentials_from_vault`: retry con backoff (3×2s) en boot path.
+
 ### J'-13. Vault broadcast de cambios de secret — **pendiente, próximo sprint**
 
 **Problema actual.** Los consumers descubren cambios en vault mediante un refresh loop polling cada 60s. Eso resuelve el caso de los nodos que pueden re-construir su runtime desde un valor en memoria (admin executor, architect, cognition: re-crean el `OpenAiResponsesClient`), pero NO resuelve el caso de los nodos que abren un **pool de conexiones** al boot (storage e identity con Postgres). Hoy esos dos quedan en `secret_source = Missing` para siempre si arrancan antes que `vault_put` y la única forma de reconectar es `systemctl restart`.

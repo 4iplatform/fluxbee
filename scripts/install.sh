@@ -1043,24 +1043,45 @@ if [[ "${INSTALL_WAS_ACTIVE[sy-orchestrator]:-0}" != "1" ]] && install_service_e
 fi
 
 if [[ "${INSTALL_WAS_ACTIVE[sy-orchestrator]:-0}" != "1" ]]; then
+  # Cache hive_id once for router-registration waits below.
+  INSTALL_HIVE_ID="$(load_install_hive_id || true)"
   for svc in "${INSTALL_RESTART_SERVICES[@]}"; do
     if [[ "$svc" == "sy-architect" || "$svc" == "sy-frontdesk-gov" ]]; then
       continue
     fi
     if [[ "${INSTALL_WAS_ACTIVE[$svc]:-0}" == "1" ]] && install_service_exists "$svc"; then
       echo "Restarting ${svc}.service to restore pre-install state..."
+      svc_active_enter_ref="now"
       sudo systemctl restart "${svc}.service"
-      # After restarting rt-gateway and sy-vault, block briefly until they
-      # are active. Every consumer that follows depends on rt-gateway being
-      # routable and on sy-vault answering `resolve_resource` lookups at
-      # boot (Model D'). Without these waits, storage/identity arrive at
-      # vault before its socket is ready, fall back to
-      # `secret_source = Missing`, and need a manual restart to reconnect
-      # the Postgres pool.
+      svc_active_enter_ref="$(sudo systemctl show "${svc}.service" --property=ActiveEnterTimestamp --value 2>/dev/null || true)"
+      svc_active_enter_ref="${svc_active_enter_ref:-now}"
+      # rt-gateway: wait for the systemd unit to be active. It's the router
+      # itself, so it's its own registry — there is no peer to register
+      # against. Every consumer that follows depends on it being up.
+      # sy-vault: wait BOTH for the unit to be active AND for the router to
+      # have logged its `name=SY.vault@<hive>` ANNOUNCE. The systemd-active
+      # state is reached early (process spawned) while the vault loop is
+      # still loading the master key, opening vault.db, sending HELLO and
+      # receiving ANNOUNCE. In that window, sy-storage / sy-identity hit
+      # the router with a `resolve_resource` lookup and get
+      # VAULT_UNAVAILABLE — the router doesn't have vault in its routing
+      # table yet. Both must complete before the consumers below restart.
       case "$svc" in
-        "rt-gateway"|"sy-vault")
+        "rt-gateway")
           if ! wait_for_service_active "$svc" 30; then
             echo "Warning: ${svc}.service did not become active within 30s; downstream consumers may race the secret lookup." >&2
+          fi
+          ;;
+        "sy-vault")
+          if ! wait_for_service_active "$svc" 30; then
+            echo "Warning: ${svc}.service did not become active within 30s; downstream consumers may race the secret lookup." >&2
+          fi
+          if [[ -n "${INSTALL_HIVE_ID:-}" ]]; then
+            if ! wait_for_router_registration "SY.vault@${INSTALL_HIVE_ID}" "${svc_active_enter_ref}" 30; then
+              echo "Warning: SY.vault@${INSTALL_HIVE_ID} did not appear in rt-gateway within 30s; downstream consumers may see VAULT_UNAVAILABLE on their first lookup." >&2
+            fi
+          else
+            echo "Warning: hive_id not available; skipping router-registration wait for sy-vault. Consumers may race vault registration." >&2
           fi
           ;;
       esac
