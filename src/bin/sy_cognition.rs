@@ -18,7 +18,8 @@ use fluxbee_sdk::nats::{publish_local, resolve_local_nats_endpoint};
 use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{
     Destination, EpisodeSummary, MemoryContextSummary, MemoryPackage, MemoryPackageTruncated,
-    MemoryReasonSummary, MemorySummary, Message, Meta, Routing, SYSTEM_KIND,
+    MemoryReasonSummary, MemorySummary, Message, Meta, Routing, VaultSecretChangedPayload,
+    VaultSecretInterest, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, connect, managed_node_config_path,
@@ -554,12 +555,9 @@ async fn main() -> Result<(), CognitionError> {
         Arc::clone(&app_state),
     )));
 
-    // Periodic vault refresh: probes resolve_resource(Openai) every
-    // COGNITION_VAULT_REFRESH_INTERVAL_SECS to keep `ai_secret_source` in
-    // sync with vault state without waiting for the first inbound turn.
-    // Closes the "lazy state" UX issue where CONFIG_GET would report
-    // `degraded_no_ai_provider` even after vault_put succeeded.
-    std::mem::drop(tokio::spawn(run_vault_refresh_loop(Arc::clone(&app_state))));
+    // Vault state changes arrive event-driven via VAULT_SECRET_CHANGED
+    // broadcasts from SY.vault — no polling loop needed. See
+    // `handle_vault_secret_changed_cognition` in process_router_message.
 
     let startup_ai_secret_source = control_state.lock().await.ai_secret_source;
 
@@ -1575,37 +1573,6 @@ async fn resolve_cognition_openai_api_key(app_state: &CognitionAppState) -> Opti
     resolve_cognition_resource(app_state, fluxbee_sdk::ResourceType::Openai, "api_key").await
 }
 
-const COGNITION_VAULT_REFRESH_INTERVAL_SECS: u64 = 60;
-
-/// Polls vault for the openai resource at a fixed cadence and updates
-/// `ai_secret_source` so CONFIG_GET reflects the live state without waiting
-/// for the first inbound turn to drive the lazy flip. Runs forever.
-async fn run_vault_refresh_loop(app_state: Arc<CognitionAppState>) {
-    let mut ticker = time::interval(Duration::from_secs(COGNITION_VAULT_REFRESH_INTERVAL_SECS));
-    // The first tick fires immediately; skip it so we don't race with the
-    // initial boot probe that happens on the first turn.
-    ticker.tick().await;
-    loop {
-        ticker.tick().await;
-        let resolved = resolve_cognition_openai_api_key(&app_state).await.is_some();
-        let next_source = if resolved {
-            CognitionAiSecretSource::LocalFile
-        } else {
-            CognitionAiSecretSource::Missing
-        };
-        let mut control = app_state.control_state.lock().await;
-        if control.ai_secret_source != next_source {
-            tracing::info!(
-                node_name = %app_state.node_name,
-                previous = %control.ai_secret_source.as_str(),
-                current = %next_source.as_str(),
-                "sy.cognition vault refresh flipped ai_secret_source"
-            );
-            control.ai_secret_source = next_source;
-        }
-    }
-}
-
 /// Generic helper: connect an ephemeral SDK client, discover the named
 /// resource via `resolve_resource` (Model D' pool match), and extract a
 /// plaintext string from the response (accepts a bare string or
@@ -1926,6 +1893,66 @@ fn build_memory_package_for_thread(
     }
 }
 
+/// Handle `VAULT_SECRET_CHANGED` for cognition. Both cognition resources
+/// (openai for semantic tagger, postgres for rebuild) are resolved lazily
+/// per-call, so the reaction is simply to probe the new value and update
+/// the in-memory `ai_secret_source` flag for openai. Postgres is consulted
+/// fresh on the next rebuild attempt — no state to update here.
+async fn handle_vault_secret_changed_cognition(msg: &Message, app_state: &CognitionAppState) {
+    let payload: VaultSecretChangedPayload = match serde_json::from_value(msg.payload.clone()) {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::warn!(error = %err, "ignoring malformed VAULT_SECRET_CHANGED payload");
+            return;
+        }
+    };
+    let interest_openai = VaultSecretInterest {
+        resource_type: "openai",
+        my_tenant: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+        my_ilk: Some(app_state.self_ilk_id.as_str()),
+        system_caller: true,
+    };
+    let interest_postgres = VaultSecretInterest {
+        resource_type: "postgres",
+        my_tenant: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+        my_ilk: Some(app_state.self_ilk_id.as_str()),
+        system_caller: true,
+    };
+    if payload.matches_interest(&interest_openai) {
+        tracing::info!(
+            node_name = %app_state.node_name,
+            op = %payload.op.as_str(),
+            version = payload.version,
+            "VAULT_SECRET_CHANGED (openai) matches; probing fresh value"
+        );
+        let resolved = resolve_cognition_openai_api_key(app_state).await.is_some();
+        let next_source = if resolved {
+            CognitionAiSecretSource::LocalFile
+        } else {
+            CognitionAiSecretSource::Missing
+        };
+        let mut control = app_state.control_state.lock().await;
+        if control.ai_secret_source != next_source {
+            tracing::info!(
+                previous = %control.ai_secret_source.as_str(),
+                current = %next_source.as_str(),
+                "sy.cognition ai_secret_source flipped after VAULT_SECRET_CHANGED"
+            );
+            control.ai_secret_source = next_source;
+        }
+    }
+    if payload.matches_interest(&interest_postgres) {
+        // Postgres for cognition is consulted lazily during rebuild; nothing
+        // to update in-memory. Log the event so operators can correlate.
+        tracing::info!(
+            node_name = %app_state.node_name,
+            op = %payload.op.as_str(),
+            version = payload.version,
+            "VAULT_SECRET_CHANGED (postgres) matches; next rebuild will use fresh value"
+        );
+    }
+}
+
 async fn process_router_message(
     sender: &NodeSender,
     msg: &Message,
@@ -1952,6 +1979,9 @@ async fn process_router_message(
         return Ok(());
     };
     match command {
+        MSG_VAULT_SECRET_CHANGED => {
+            handle_vault_secret_changed_cognition(msg, &app_state).await;
+        }
         "CONFIG_GET" => {
             let snapshot = app_state.runtime_state.lock().await.clone();
             let control_state = app_state.control_state.lock().await.clone();

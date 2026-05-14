@@ -10,7 +10,10 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use chrono::Utc;
 use fluxbee_sdk::identity::list_ilks_from_hive_config;
-use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
+use fluxbee_sdk::protocol::{
+    Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretOp, SCOPE_GLOBAL,
+    SYSTEM_KIND, MSG_VAULT_SECRET_CHANGED,
+};
 use fluxbee_sdk::{
     connect, try_handle_default_node_status, NodeConfig, NodeReceiver, NodeSender, NodeUuidMode,
     VaultFilter, VaultKeyRequest, VaultListRequest, VaultMetadata, VaultRotateRequest,
@@ -19,6 +22,7 @@ use fluxbee_sdk::{
     MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE,
     MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
 };
+use uuid::Uuid;
 use nix::libc::{flock, LOCK_EX, LOCK_NB};
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -244,6 +248,7 @@ async fn main() -> Result<(), VaultError> {
             &sender,
             &mut store,
             &config_dir,
+            &hive_id,
             &well_known_admin_ilks,
             &msg,
         )
@@ -260,10 +265,28 @@ async fn main() -> Result<(), VaultError> {
     }
 }
 
+/// Output of a vault handler. Carries the response payload sent back to
+/// the caller, plus (for mutating actions) an optional broadcast payload
+/// emitted to all hive nodes via `VAULT_SECRET_CHANGED`.
+struct HandlerOutcome {
+    response: Value,
+    broadcast: Option<VaultSecretChangedPayload>,
+}
+
+impl HandlerOutcome {
+    fn response_only(response: Value) -> Self {
+        Self {
+            response,
+            broadcast: None,
+        }
+    }
+}
+
 async fn handle_vault_message(
     sender: &NodeSender,
     store: &mut VaultStore,
     config_dir: &Path,
+    hive_id: &str,
     well_known_admin_ilks: &HashSet<String>,
     msg: &Message,
 ) -> VaultResult<()> {
@@ -271,20 +294,24 @@ async fn handle_vault_message(
     let caller = resolve_caller(config_dir, msg)?;
     let response_action = response_action_for(action);
     let result = match action {
-        MSG_VAULT_PUT => handle_put(store, msg, &caller, well_known_admin_ilks),
-        MSG_VAULT_GET => handle_get(store, msg, &caller, well_known_admin_ilks, true),
-        MSG_VAULT_GET_METADATA => handle_get(store, msg, &caller, well_known_admin_ilks, false),
-        MSG_VAULT_LIST => handle_list(store, msg, &caller),
-        MSG_VAULT_DELETE => handle_delete(store, msg, &caller, well_known_admin_ilks),
-        MSG_VAULT_ROTATE => handle_rotate(store, msg, &caller, well_known_admin_ilks),
-        MSG_VAULT_ROLLBACK => handle_rollback(store, msg, &caller, well_known_admin_ilks),
+        MSG_VAULT_PUT => handle_put(store, msg, &caller, well_known_admin_ilks, hive_id),
+        MSG_VAULT_GET => {
+            handle_get(store, msg, &caller, well_known_admin_ilks, true).map(HandlerOutcome::response_only)
+        }
+        MSG_VAULT_GET_METADATA => {
+            handle_get(store, msg, &caller, well_known_admin_ilks, false).map(HandlerOutcome::response_only)
+        }
+        MSG_VAULT_LIST => handle_list(store, msg, &caller).map(HandlerOutcome::response_only),
+        MSG_VAULT_DELETE => handle_delete(store, msg, &caller, well_known_admin_ilks, hive_id),
+        MSG_VAULT_ROTATE => handle_rotate(store, msg, &caller, well_known_admin_ilks, hive_id),
+        MSG_VAULT_ROLLBACK => handle_rollback(store, msg, &caller, well_known_admin_ilks, hive_id),
         _ => Err(VaultError::InvalidRequest(
             "unsupported vault action".to_string(),
         )),
     };
 
-    let payload = match result {
-        Ok(payload) => payload,
+    let outcome = match result {
+        Ok(outcome) => outcome,
         Err(err) => {
             let key = request_key(&msg.payload);
             let _ = store.audit(
@@ -294,11 +321,82 @@ async fn handle_vault_message(
                 audit_result_for_error(&err),
                 Some(err.code()),
             );
-            error_payload(&err)
+            HandlerOutcome::response_only(error_payload(&err))
         }
     };
-    send_system_response(sender, msg, response_action, payload).await?;
+    send_system_response(sender, msg, response_action, outcome.response).await?;
+
+    // Broadcast event-driven notification of the change to all hive nodes.
+    // Mirrors the CONFIG_CHANGED pattern: Destination::Broadcast over the
+    // router socket, scope=global, no auth required (metadata only — the
+    // plaintext stays in vault and requires an authorized vault_get).
+    if let Some(payload) = outcome.broadcast {
+        if let Err(err) = send_broadcast_secret_changed(sender, msg, payload).await {
+            tracing::warn!(
+                error = %err,
+                action,
+                trace_id = %msg.routing.trace_id,
+                "failed to emit VAULT_SECRET_CHANGED broadcast (consumers will retry on next poll/refresh)"
+            );
+        }
+    }
     Ok(())
+}
+
+/// Send a `VAULT_SECRET_CHANGED` broadcast message over the router socket.
+/// `src_trace_id` is the originating mutation's trace_id so observers can
+/// correlate the broadcast with the put/rotate/delete/rollback request.
+async fn send_broadcast_secret_changed(
+    sender: &NodeSender,
+    src_msg: &Message,
+    payload: VaultSecretChangedPayload,
+) -> VaultResult<()> {
+    let broadcast = Message {
+        routing: Routing {
+            src: sender.uuid().to_string(),
+            src_l2_name: None,
+            dst: Destination::Broadcast,
+            ttl: 16,
+            // New trace_id (this is a fan-out event, not a reply). The
+            // payload carries no back-pointer to the mutation trace_id
+            // because consumers don't need it — they react to the resource
+            // change, not to the specific RPC that caused it. If
+            // correlation is needed later, the originating trace_id is
+            // already in vault's audit log under the same `at_ms`.
+            trace_id: Uuid::new_v4().to_string(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(MSG_VAULT_SECRET_CHANGED.to_string()),
+            src_ilk: src_msg.meta.dst_ilk.clone(),
+            scope: Some(SCOPE_GLOBAL.to_string()),
+            target: None,
+            action: None,
+            priority: None,
+            context: None,
+            ..Meta::default()
+        },
+        payload: serde_json::to_value(&payload)?,
+    };
+    sender.send(broadcast).await?;
+    tracing::info!(
+        op = %payload.op.as_str(),
+        resource_type = %payload.resource_type,
+        tenant_id = %payload.tenant_id,
+        ilk = %payload.ilk.as_deref().unwrap_or(""),
+        version = payload.version,
+        key = %payload.key,
+        "vault secret changed broadcast sent"
+    );
+    Ok(())
+}
+
+fn now_epoch_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn handle_list(store: &mut VaultStore, msg: &Message, caller: &Caller) -> VaultResult<Value> {
@@ -317,28 +415,42 @@ fn handle_delete(
     msg: &Message,
     caller: &Caller,
     well_known: &HashSet<String>,
-) -> VaultResult<Value> {
+    hive_id: &str,
+) -> VaultResult<HandlerOutcome> {
     let request: VaultKeyRequest = serde_json::from_value(msg.payload.clone())?;
     validate_key(&request.key)?;
     // Auth: admin/architect can delete anything; non-admin can only delete
     // secrets dedicated to their own ILK.
+    let pre_metadata = store.get_record(&request.key)?.map(|r| r.metadata);
     if !caller.is_well_known_admin(well_known) {
-        let existing = store.get_record(&request.key)?;
-        let Some(existing) = existing else {
+        let Some(existing_metadata) = pre_metadata.as_ref() else {
             return Err(VaultError::Unauthorized);
         };
-        let owner_ilk = secret_owner_ilk(&existing.metadata);
+        let owner_ilk = secret_owner_ilk(existing_metadata);
         match (owner_ilk, caller.ilk_id.as_deref()) {
             (Some(owner), Some(self_ilk)) if owner == self_ilk => {}
             _ => return Err(VaultError::Unauthorized),
         }
     }
     store.delete(&request.key, caller)?;
-    Ok(json!({
-        "status": "ok",
-        "key": request.key,
-        "deleted": true,
-    }))
+    let broadcast = pre_metadata.as_ref().and_then(|metadata| {
+        build_secret_changed_payload(
+            VaultSecretOp::Delete,
+            &request.key,
+            metadata,
+            // After delete the version is gone; report 0 to signal absence.
+            0,
+            hive_id,
+        )
+    });
+    Ok(HandlerOutcome {
+        response: json!({
+            "status": "ok",
+            "key": request.key,
+            "deleted": true,
+        }),
+        broadcast,
+    })
 }
 
 fn handle_rotate(
@@ -346,15 +458,16 @@ fn handle_rotate(
     msg: &Message,
     caller: &Caller,
     well_known: &HashSet<String>,
-) -> VaultResult<Value> {
+    hive_id: &str,
+) -> VaultResult<HandlerOutcome> {
     let request: VaultRotateRequest = serde_json::from_value(msg.payload.clone())?;
     validate_key(&request.key)?;
+    let pre_metadata = store.get_record(&request.key)?.map(|r| r.metadata);
     if !caller.is_well_known_admin(well_known) {
-        let existing = store.get_record(&request.key)?;
-        let Some(existing) = existing else {
+        let Some(existing_metadata) = pre_metadata.as_ref() else {
             return Err(VaultError::Unauthorized);
         };
-        let owner_ilk = secret_owner_ilk(&existing.metadata);
+        let owner_ilk = secret_owner_ilk(existing_metadata);
         match (owner_ilk, caller.ilk_id.as_deref()) {
             (Some(owner), Some(self_ilk)) if owner == self_ilk => {}
             _ => return Err(VaultError::Unauthorized),
@@ -367,13 +480,25 @@ fn handle_rotate(
         ));
     }
     let result = store.rotate(&request.key, request.value, caller)?;
-    Ok(json!({
-        "status": "ok",
-        "key": request.key,
-        "rotated_at": result.rotated_at,
-        "current_version": result.current_version,
-        "previous_version": result.previous_version,
-    }))
+    let broadcast = pre_metadata.as_ref().and_then(|metadata| {
+        build_secret_changed_payload(
+            VaultSecretOp::Rotate,
+            &request.key,
+            metadata,
+            result.current_version,
+            hive_id,
+        )
+    });
+    Ok(HandlerOutcome {
+        response: json!({
+            "status": "ok",
+            "key": request.key,
+            "rotated_at": result.rotated_at,
+            "current_version": result.current_version,
+            "previous_version": result.previous_version,
+        }),
+        broadcast,
+    })
 }
 
 fn handle_rollback(
@@ -381,27 +506,40 @@ fn handle_rollback(
     msg: &Message,
     caller: &Caller,
     well_known: &HashSet<String>,
-) -> VaultResult<Value> {
+    hive_id: &str,
+) -> VaultResult<HandlerOutcome> {
     let request: VaultKeyRequest = serde_json::from_value(msg.payload.clone())?;
     validate_key(&request.key)?;
+    let pre_metadata = store.get_record(&request.key)?.map(|r| r.metadata);
     if !caller.is_well_known_admin(well_known) {
-        let existing = store.get_record(&request.key)?;
-        let Some(existing) = existing else {
+        let Some(existing_metadata) = pre_metadata.as_ref() else {
             return Err(VaultError::Unauthorized);
         };
-        let owner_ilk = secret_owner_ilk(&existing.metadata);
+        let owner_ilk = secret_owner_ilk(existing_metadata);
         match (owner_ilk, caller.ilk_id.as_deref()) {
             (Some(owner), Some(self_ilk)) if owner == self_ilk => {}
             _ => return Err(VaultError::Unauthorized),
         }
     }
     let result = store.rollback(&request.key, caller)?;
-    Ok(json!({
-        "status": "ok",
-        "key": request.key,
-        "current_version": result.current_version,
-        "previous_version": result.previous_version,
-    }))
+    let broadcast = pre_metadata.as_ref().and_then(|metadata| {
+        build_secret_changed_payload(
+            VaultSecretOp::Rollback,
+            &request.key,
+            metadata,
+            result.current_version,
+            hive_id,
+        )
+    });
+    Ok(HandlerOutcome {
+        response: json!({
+            "status": "ok",
+            "key": request.key,
+            "current_version": result.current_version,
+            "previous_version": result.previous_version,
+        }),
+        broadcast,
+    })
 }
 
 fn handle_put(
@@ -409,7 +547,8 @@ fn handle_put(
     msg: &Message,
     caller: &Caller,
     well_known: &HashSet<String>,
-) -> VaultResult<Value> {
+    hive_id: &str,
+) -> VaultResult<HandlerOutcome> {
     // Model D': only well-known admin ILKs (SY.admin, SY.architect) can
     // write to vault. Other nodes consume secrets via resolve_resource.
     if !caller.is_well_known_admin(well_known) {
@@ -424,13 +563,54 @@ fn handle_put(
             "secret value exceeds 1 MiB".to_string(),
         ));
     }
+    let metadata_for_broadcast = request.metadata.clone();
     let (version, changed) = store.put(&request.key, request.value, request.metadata, caller)?;
-    Ok(json!({
-        "status": "ok",
-        "key": request.key,
-        "version": version,
-        "changed": changed,
-    }))
+    // Only emit a broadcast when something actually changed. Idempotent
+    // re-puts (same value) return changed=false and version unchanged —
+    // emitting an event for those would spam consumers with no-ops.
+    let broadcast = if changed {
+        build_secret_changed_payload(
+            VaultSecretOp::Put,
+            &request.key,
+            &metadata_for_broadcast,
+            version,
+            hive_id,
+        )
+    } else {
+        None
+    };
+    Ok(HandlerOutcome {
+        response: json!({
+            "status": "ok",
+            "key": request.key,
+            "version": version,
+            "changed": changed,
+        }),
+        broadcast,
+    })
+}
+
+/// Build the broadcast payload from the secret's metadata. Returns `None`
+/// when metadata is missing `resource_type` (legacy/incomplete records),
+/// since downstream consumers filter by `resource_type`.
+fn build_secret_changed_payload(
+    op: VaultSecretOp,
+    key: &str,
+    metadata: &VaultMetadata,
+    version: i64,
+    hive_id: &str,
+) -> Option<VaultSecretChangedPayload> {
+    let resource_type = metadata.resource_type.clone()?;
+    Some(VaultSecretChangedPayload {
+        op,
+        resource_type,
+        tenant_id: metadata.tenant_id.clone(),
+        ilk: metadata.ilk.clone().filter(|v| !v.is_empty()),
+        version,
+        key: key.to_string(),
+        hive_id: hive_id.to_string(),
+        at_ms: now_epoch_ms(),
+    })
 }
 
 /// Extract the canonical owner ILK from a metadata record, preferring the

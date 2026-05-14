@@ -26,7 +26,8 @@ use fluxbee_ai_sdk::{
 };
 use fluxbee_sdk::nats::{NatsClient, NatsRequestEnvelope, NatsResponseEnvelope};
 use fluxbee_sdk::protocol::{
-    ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED,
+    ConfigChangedPayload, Destination, Message, Meta, Routing, VaultSecretChangedPayload,
+    VaultSecretInterest, MSG_CONFIG_CHANGED, MSG_VAULT_SECRET_CHANGED,
     MSG_NODE_STATUS_GET, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
@@ -631,48 +632,16 @@ async fn main() -> Result<(), AdminError> {
 
     let system_client = router_client.clone();
     let system_rx = router_client.subscribe_system_commands();
-    let refresh_ctx = system_ctx.clone();
     tokio::spawn(async move {
         run_system_command_loop(system_ctx, system_client, system_rx).await;
     });
 
-    // Periodic vault refresh: probes resolve_resource(Openai) every
-    // ADMIN_EXECUTOR_VAULT_REFRESH_INTERVAL_SECS so executor_configured
-    // flips to true automatically once the operator runs vault_put — no
-    // CONFIG_SET dance or restart needed.
-    tokio::spawn(async move {
-        run_admin_executor_vault_refresh_loop(refresh_ctx).await;
-    });
+    // Vault changes arrive via VAULT_SECRET_CHANGED broadcasts handled in
+    // `handle_system_command` (`handle_vault_secret_changed_admin`). No
+    // polling loop.
 
     future::pending::<()>().await;
     Ok(())
-}
-
-const ADMIN_EXECUTOR_VAULT_REFRESH_INTERVAL_SECS: u64 = 60;
-
-async fn run_admin_executor_vault_refresh_loop(ctx: AdminContext) {
-    let mut ticker =
-        tokio::time::interval(Duration::from_secs(ADMIN_EXECUTOR_VAULT_REFRESH_INTERVAL_SECS));
-    ticker.tick().await; // skip first immediate tick
-    loop {
-        ticker.tick().await;
-        let prev = ctx.executor_configured.load(Ordering::Relaxed);
-        match refresh_admin_executor_ai_runtime(&ctx).await {
-            Ok(now) => {
-                if prev != now {
-                    tracing::info!(
-                        node_name = %ctx.node_name,
-                        previous = prev,
-                        current = now,
-                        "sy.admin executor vault refresh flipped configured flag"
-                    );
-                }
-            }
-            Err(err) => {
-                tracing::debug!(error = %err, "sy.admin executor vault refresh failed (will retry)");
-            }
-        }
-    }
 }
 
 enum BroadcastRequest {
@@ -2673,6 +2642,9 @@ async fn handle_system_command(
     };
     let sender = client.sender_snapshot().await;
     match command {
+        MSG_VAULT_SECRET_CHANGED => {
+            handle_vault_secret_changed_admin(ctx, msg).await;
+        }
         "CONFIG_GET" => {
             let payload = build_admin_executor_config_get_payload(ctx)?;
             let response = build_node_config_response_message(msg, sender.uuid(), payload);
@@ -2686,6 +2658,52 @@ async fn handle_system_command(
         _ => {}
     }
     Ok(())
+}
+
+/// Handle a `VAULT_SECRET_CHANGED` broadcast for the admin executor.
+/// Admin's only vault-resolved secret is the OpenAI api_key; the runtime
+/// (`OpenAiResponsesClient`) is hot-rebuildable via
+/// `refresh_admin_executor_ai_runtime`, so no exit() needed — we refresh
+/// in-memory and the executor picks up the new key on the next call.
+async fn handle_vault_secret_changed_admin(ctx: &AdminContext, msg: &Message) {
+    let payload: VaultSecretChangedPayload = match serde_json::from_value(msg.payload.clone()) {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::warn!(error = %err, "ignoring malformed VAULT_SECRET_CHANGED payload");
+            return;
+        }
+    };
+    let interest = VaultSecretInterest {
+        resource_type: "openai",
+        my_tenant: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+        my_ilk: Some(ctx.self_ilk_id.as_str()),
+        system_caller: true,
+    };
+    if !payload.matches_interest(&interest) {
+        return;
+    }
+    tracing::info!(
+        node_name = %ctx.node_name,
+        op = %payload.op.as_str(),
+        version = payload.version,
+        "VAULT_SECRET_CHANGED (openai) matches interest; refreshing executor runtime"
+    );
+    match refresh_admin_executor_ai_runtime(ctx).await {
+        Ok(configured) => {
+            tracing::info!(
+                node_name = %ctx.node_name,
+                configured = configured,
+                "admin executor runtime refreshed after VAULT_SECRET_CHANGED"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                node_name = %ctx.node_name,
+                "admin executor runtime refresh failed after VAULT_SECRET_CHANGED"
+            );
+        }
+    }
 }
 
 async fn handle_internal_admin_command(

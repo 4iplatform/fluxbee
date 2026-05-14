@@ -49,7 +49,10 @@ use fluxbee_ai_sdk::{
 };
 use fluxbee_sdk::blob::{BlobConfig, BlobRef, BlobToolkit};
 use fluxbee_sdk::payload::TextV1Payload;
-use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
+use fluxbee_sdk::protocol::{
+    Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest,
+    MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
+};
 use fluxbee_sdk::{
     admin_command, build_node_config_response_message, connect,
     list_ich_options_from_hive_config, try_handle_default_node_status, AdminCommandRequest,
@@ -91,7 +94,6 @@ const CHAT_MODE_IMPERSONATION: &str = "impersonation";
 /// dbname. Architect hardcodes it here and applies `with_dbname` before
 /// connecting.
 const ARCHITECT_MESSAGES_DB_NAME: &str = "fluxbee_storage";
-const ARCHITECT_SECRET_REFRESH_INTERVAL_SECS: u64 = 60;
 const ARCHITECT_MAX_ATTACHMENTS: usize = 8;
 const ARCHITECT_MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 const ARCHITECT_MAX_SOFTWARE_UPLOAD_BYTES: usize = 128 * 1024 * 1024;
@@ -4929,10 +4931,8 @@ async fn main() -> Result<(), ArchitectError> {
         status_refresh_loop(refresh_state).await;
     });
 
-    let secret_refresh_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        architect_secret_refresh_loop(secret_refresh_state).await;
-    });
+    // Vault state changes arrive via VAULT_SECRET_CHANGED broadcasts
+    // handled in `handle_architect_system_message`. No polling loop.
 
     let app = Router::new()
         .route("/", any(root_handler))
@@ -5424,6 +5424,10 @@ async fn handle_architect_system_message(
     }
 
     match msg.meta.msg.as_deref() {
+        Some(MSG_VAULT_SECRET_CHANGED) => {
+            handle_vault_secret_changed_architect(state, msg).await;
+            Ok(true)
+        }
         Some("CONFIG_GET") => {
             let payload = architect_config_payload_from_result(
                 handle_architect_local_config_get(state).await,
@@ -5443,6 +5447,59 @@ async fn handle_architect_system_message(
             Ok(true)
         }
         _ => Ok(false),
+    }
+}
+
+/// Handle `VAULT_SECRET_CHANGED` for architect: refresh both openai and
+/// messages-db runtimes on the relevant event. Architect has TWO vault
+/// resources (openai for the chat model, postgres for the messages
+/// viewer), each independently hot-rebuildable, so we filter per
+/// resource_type and call the existing `refresh_*` functions.
+async fn handle_vault_secret_changed_architect(state: &ArchitectState, msg: &Message) {
+    let payload: VaultSecretChangedPayload = match serde_json::from_value(msg.payload.clone()) {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::warn!(error = %err, "ignoring malformed VAULT_SECRET_CHANGED payload");
+            return;
+        }
+    };
+    let interest_openai = VaultSecretInterest {
+        resource_type: "openai",
+        my_tenant: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+        my_ilk: Some(state.self_ilk_id.as_str()),
+        system_caller: true,
+    };
+    let interest_postgres = VaultSecretInterest {
+        resource_type: "postgres",
+        my_tenant: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+        my_ilk: Some(state.self_ilk_id.as_str()),
+        system_caller: true,
+    };
+    if payload.matches_interest(&interest_openai) {
+        tracing::info!(
+            node_name = %state.node_name,
+            op = %payload.op.as_str(),
+            version = payload.version,
+            "VAULT_SECRET_CHANGED (openai) matches interest; refreshing architect ai runtime"
+        );
+        if let Err(err) = refresh_architect_ai_runtime(state).await {
+            tracing::warn!(error = %err, "architect ai runtime refresh failed after broadcast");
+        }
+    }
+    if payload.matches_interest(&interest_postgres) {
+        tracing::info!(
+            node_name = %state.node_name,
+            op = %payload.op.as_str(),
+            version = payload.version,
+            "VAULT_SECRET_CHANGED (postgres) matches interest; refreshing architect messages_db runtime"
+        );
+        let (live, connected, err) = refresh_architect_messages_db_url(state).await;
+        tracing::info!(
+            live_in_vault = live,
+            connected = connected,
+            error = err.as_deref().unwrap_or(""),
+            "architect messages_db refresh result after broadcast"
+        );
     }
 }
 
@@ -11512,45 +11569,6 @@ async fn status_refresh_loop(state: Arc<ArchitectState>) {
         let fresh = build_architect_status(&state).await;
         *state.cached_status.write().await = fresh;
         time::sleep(Duration::from_secs(STATUS_REFRESH_INTERVAL_SECS)).await;
-    }
-}
-
-async fn architect_secret_refresh_loop(state: Arc<ArchitectState>) {
-    loop {
-        // Always refresh both resources, not only when degraded: the
-        // operator may rotate the vault secret, and architect needs to pick
-        // that up without a manual restart. `refresh_architect_ai_runtime`
-        // and `refresh_architect_messages_db_url` are both idempotent and
-        // cheap when the resource hasn't changed.
-        let prev_ai = state.ai_configured.load(Ordering::Relaxed);
-        match refresh_architect_ai_runtime(&state).await {
-            Ok(now) => {
-                if prev_ai != now {
-                    tracing::info!(
-                        node_name = %state.node_name,
-                        previous = prev_ai,
-                        current = now,
-                        "sy.architect vault refresh flipped ai_configured"
-                    );
-                }
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "sy.architect vault-backed AI refresh failed");
-            }
-        }
-
-        let prev_db = state.messages_db_configured.load(Ordering::Relaxed);
-        let (db_present, _connected, _err) = refresh_architect_messages_db_url(&state).await;
-        if prev_db != db_present {
-            tracing::info!(
-                node_name = %state.node_name,
-                previous = prev_db,
-                current = db_present,
-                "sy.architect vault refresh flipped messages_db_configured"
-            );
-        }
-
-        time::sleep(Duration::from_secs(ARCHITECT_SECRET_REFRESH_INTERVAL_SECS)).await;
     }
 }
 

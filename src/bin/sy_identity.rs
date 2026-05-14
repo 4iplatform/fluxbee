@@ -4,8 +4,6 @@ use std::fs::OpenOptions;
 use std::future;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -18,7 +16,10 @@ use tokio_postgres::{error::SqlState, Config as PgConfig, NoTls};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
+use fluxbee_sdk::protocol::{
+    Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest,
+    MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
+};
 use fluxbee_sdk::{
     build_node_config_response_message, connect, managed_node_config_path,
     try_handle_default_node_status, NodeConfig, NodeReceiver, NodeSender,
@@ -1529,7 +1530,6 @@ impl IdentityRuntime {
         identity_shm: Option<&mut IdentityRegionWriter>,
         control_state: &mut IdentityControlState,
         node_name: &str,
-        vault_postgres_live: bool,
     ) -> Result<Vec<IdentityDeltaEnvelope>, IdentityError> {
         if try_handle_default_node_status(sender, msg).await? {
             return Ok(Vec::new());
@@ -1551,6 +1551,13 @@ impl IdentityRuntime {
                 "identity received ILK_PROVISION request"
             );
         }
+        // Vault broadcast: react before the auth check because the
+        // broadcast carries no auth-bearing fields (metadata only) and is
+        // meant for every node in the hive to consume.
+        if action == MSG_VAULT_SECRET_CHANGED {
+            handle_vault_secret_changed(msg, self.is_primary, node_name);
+            return Ok(Vec::new());
+        }
         if !self.is_authorized(action, src_l2_name) {
             let payload =
                 unauthorized_identity_source_payload(action, &msg.routing.src, src_l2_name);
@@ -1562,7 +1569,6 @@ impl IdentityRuntime {
                 self.is_primary,
                 node_name,
                 control_state,
-                vault_postgres_live,
             );
             let response = build_node_config_response_message(msg, sender.uuid(), payload);
             sender.send(response).await?;
@@ -2648,25 +2654,10 @@ async fn main() -> Result<(), IdentityError> {
         "sy.identity started"
     );
 
-    // Periodic vault refresh: probes resolve_resource(Postgres) on motherbee
-    // primary every IDENTITY_VAULT_REFRESH_INTERVAL_SECS. Reporting-only:
-    // surfaced via resources.postgres.live_in_vault on CONFIG_GET. Identity
-    // is the SHM writer, so its ILK is deterministic and the refresh task
-    // can connect ephemeral router clients without chicken/egg.
-    let vault_postgres_live = Arc::new(AtomicBool::new(
-        db_secret_source != IdentityDbSecretSource::Missing,
-    ));
-    if is_primary {
-        std::mem::drop(tokio::spawn(run_identity_vault_refresh_loop(
-            config_dir.clone(),
-            state_dir.clone(),
-            socket_dir.clone(),
-            hive.hive_id.clone(),
-            node_name.clone(),
-            self_ilk_id.clone(),
-            Arc::clone(&vault_postgres_live),
-        )));
-    }
+    // Vault changes arrive event-driven via VAULT_SECRET_CHANGED
+    // broadcasts; the consumer handler (`handle_vault_secret_changed`)
+    // triggers exit(0) so systemd restarts identity and the Postgres
+    // pool reconnects with the new secret.
 
     let mut heartbeat = time::interval(Duration::from_secs(5));
     let mut alias_gc_tick = time::interval(Duration::from_secs(ALIAS_GC_INTERVAL_SECS));
@@ -2751,7 +2742,6 @@ async fn main() -> Result<(), IdentityError> {
                         identity_shm.as_mut(),
                         &mut control_state,
                         &node_name,
-                        vault_postgres_live.load(Ordering::Relaxed),
                     )
                     .await
                 {
@@ -4882,18 +4872,15 @@ fn build_identity_config_get_payload(
     is_primary: bool,
     node_name: &str,
     control_state: &IdentityControlState,
-    vault_postgres_live: bool,
 ) -> Value {
     let configured = identity_secret_configured(is_primary, control_state);
     let mut notes = vec![
         Value::String("SY.identity uses PostgreSQL only on motherbee primary.".to_string()),
         Value::String(
-            "Model D': credentials live entirely in SY.vault. Operator loads them with vault_put + resource_type=postgres; identity resolves from the pool on boot."
-                .to_string(),
+            "Model D': credentials live entirely in SY.vault. Operator loads them with vault_put + resource_type=postgres; identity resolves from the pool at boot.".to_string(),
         ),
         Value::String(
-            "CONFIG_SET on SY.identity takes no secret-bearing fields. The vault refresh loop polls every 60s — `live_in_vault` reflects the latest probe. Connection reconnect on rotation still requires sy-identity restart."
-                .to_string(),
+            "VAULT_SECRET_CHANGED broadcasts trigger exit(0) for systemd-managed restart so the pool reconnects with the new secret. CONFIG_SET on SY.identity takes no secret-bearing fields.".to_string(),
         ),
     ];
     let error = if !is_primary {
@@ -4927,7 +4914,6 @@ fn build_identity_config_get_payload(
                 "resource_type": "postgres",
                 "required": true,
                 "configured": configured,
-                "live_in_vault": vault_postgres_live,
                 "scope": "pool (tenant or sys)",
                 "consumer_dbname": IDENTITY_DB_NAME
             }
@@ -5191,50 +5177,50 @@ fn extract_postgres_url_from_vault_value(value: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-const IDENTITY_VAULT_REFRESH_INTERVAL_SECS: u64 = 60;
-
-/// Polls vault for the postgres resource on motherbee primary every
-/// IDENTITY_VAULT_REFRESH_INTERVAL_SECS so CONFIG_GET reflects live vault
-/// state even if the operator added/rotated the secret post-boot. Pool
-/// reconnect on rotation still requires sy-identity restart — this flag
-/// is reporting-only, surfaced via resources.postgres.live_in_vault.
-async fn run_identity_vault_refresh_loop(
-    config_dir: PathBuf,
-    state_dir: PathBuf,
-    socket_dir: PathBuf,
-    hive_id: String,
-    node_name: String,
-    self_ilk_id: String,
-    live_flag: Arc<AtomicBool>,
-) {
-    let mut ticker = time::interval(Duration::from_secs(IDENTITY_VAULT_REFRESH_INTERVAL_SECS));
-    ticker.tick().await; // skip the first immediate tick
-    loop {
-        ticker.tick().await;
-        let (url, _source, err) = resolve_database_url(
-            &config_dir,
-            &state_dir,
-            &socket_dir,
-            &hive_id,
-            &node_name,
-            &self_ilk_id,
-            fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
-        )
-        .await;
-        let live = url.is_some();
-        let prev = live_flag.swap(live, Ordering::Relaxed);
-        if prev != live {
-            tracing::info!(
-                node_name = %node_name,
-                previous = prev,
-                current = live,
-                "sy.identity vault refresh flipped postgres live flag"
-            );
-        }
-        if let Some(err) = err {
-            tracing::debug!(error = %err, "sy.identity vault refresh: lookup error (will retry)");
-        }
+/// Handle a `VAULT_SECRET_CHANGED` broadcast. Identity reacts only on
+/// motherbee primary (replicas don't connect to Postgres) and only for
+/// the `postgres` resource scoped to its own (ilk, tenant) match. The
+/// reaction is `exit(0)` so systemd reboots the node and identity
+/// re-resolves vault with the secret cleanly. See `handle_vault_secret_changed`
+/// in `sy_storage.rs` for the rationale (Model D' VA-J'-13).
+fn handle_vault_secret_changed(msg: &Message, is_primary: bool, node_name: &str) {
+    if !is_primary {
+        // Replicas have no local Postgres pool; nothing to reconnect.
+        return;
     }
+    let payload: VaultSecretChangedPayload = match serde_json::from_value(msg.payload.clone()) {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::warn!(error = %err, "ignoring malformed VAULT_SECRET_CHANGED payload");
+            return;
+        }
+    };
+    let self_ilk_id = deterministic_system_ilk_id(node_name);
+    let interest = VaultSecretInterest {
+        resource_type: "postgres",
+        my_tenant: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+        my_ilk: Some(self_ilk_id.as_str()),
+        system_caller: true,
+    };
+    if !payload.matches_interest(&interest) {
+        tracing::debug!(
+            node_name = %node_name,
+            resource_type = %payload.resource_type,
+            payload_tenant = %payload.tenant_id,
+            payload_ilk = %payload.ilk.as_deref().unwrap_or(""),
+            "VAULT_SECRET_CHANGED does not match our interest; ignoring"
+        );
+        return;
+    }
+    tracing::warn!(
+        node_name = %node_name,
+        op = %payload.op.as_str(),
+        resource_type = %payload.resource_type,
+        version = payload.version,
+        key = %payload.key,
+        "VAULT_SECRET_CHANGED matches our interest; exiting for systemd-managed restart to reconnect the postgres pool"
+    );
+    std::process::exit(0);
 }
 
 async fn initialize_identity_database_backend(
@@ -5247,7 +5233,7 @@ async fn initialize_identity_database_backend(
         return (
             None,
             Some(
-                "postgres secret not resolvable from SY.vault at boot. Load it with vault_put (resource_type=postgres, value={\"postgres_url\":\"postgresql://user:pass@host:port\"}, no dbname) and restart sy-identity. Note: in Model D' the refresh loop detects the secret in vault (live_in_vault flag in CONFIG_GET) but does NOT auto-reconnect the pool; restart is required after the first vault_put. See VA-J'-13 for the planned broadcast-based hot-reconnect."
+                "postgres secret not resolvable from SY.vault at boot. Load it with vault_put (resource_type=postgres, value={\"postgres_url\":\"postgresql://user:pass@host:port\"}, no dbname). SY.vault will broadcast VAULT_SECRET_CHANGED and sy-identity will exit(0) to reconnect via systemd-managed restart automatically."
                     .to_string(),
             ),
         );

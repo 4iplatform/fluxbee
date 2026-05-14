@@ -262,6 +262,115 @@ pub struct ConfigChangedPayload {
     pub config: Value,
 }
 
+/// Broadcast payload emitted by SY.vault whenever a secret changes
+/// (put / rotate / delete / rollback). Carries metadata ONLY — never the
+/// plaintext value. Consumers that match the resource interest filter call
+/// `vault_get` themselves with their own caller credentials.
+///
+/// Mirrors the `CONFIG_CHANGED` broadcast pattern (router socket,
+/// `Destination::Broadcast`, scope=global) so consumers receive it via the
+/// same `NodeReceiver` they already poll for system messages — no separate
+/// pub-sub channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultSecretChangedPayload {
+    /// Operation that triggered the event.
+    pub op: VaultSecretOp,
+    /// Canonical resource_type (e.g. "openai", "postgres", "slack"). Always
+    /// present and normalized.
+    pub resource_type: String,
+    /// Owning tenant. `"sys"` for system pool secrets; `"tnt:<uuid>"` for
+    /// tenant-scoped secrets.
+    pub tenant_id: String,
+    /// Owner ILK when the secret is dedicated to a single caller. `None`
+    /// (or empty string) when the secret lives in the pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ilk: Option<String>,
+    /// New version number after the operation. Increments per change.
+    /// `0` for delete events (the version no longer exists).
+    pub version: i64,
+    /// Vault key (`sys:openai-api-key`, etc.). Useful for logs but
+    /// consumers should match by `(resource_type, tenant_id, ilk)` —
+    /// the key is an opaque identifier and may differ across hives.
+    pub key: String,
+    /// Hive the event belongs to. Useful for multi-hive deployments to
+    /// filter cross-hive noise.
+    pub hive_id: String,
+    /// Epoch milliseconds when SY.vault committed the change.
+    pub at_ms: i64,
+}
+
+/// Vault secret mutation type carried in `VaultSecretChangedPayload.op`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VaultSecretOp {
+    Put,
+    Rotate,
+    Delete,
+    Rollback,
+}
+
+impl VaultSecretOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Put => "put",
+            Self::Rotate => "rotate",
+            Self::Delete => "delete",
+            Self::Rollback => "rollback",
+        }
+    }
+}
+
+/// Filter a consumer applies when listening for `VAULT_SECRET_CHANGED`
+/// broadcasts. The semantics match `resolve_resource`: a consumer cares
+/// about events that match its `resource_type` AND that fall under its
+/// pool/dedicated match rules.
+#[derive(Debug, Clone)]
+pub struct VaultSecretInterest<'a> {
+    /// Required: only events for this resource_type match.
+    pub resource_type: &'a str,
+    /// The consumer's tenant_id (e.g. `DEFAULT_ROOT_TENANT_ID` for SY).
+    pub my_tenant: &'a str,
+    /// The consumer's self ILK. Used to match dedicated secrets.
+    pub my_ilk: Option<&'a str>,
+    /// When `true`, also match events for `tenant_id == "sys"` regardless
+    /// of `my_tenant` — mirrors the sys-pool universal read rule for
+    /// system callers.
+    pub system_caller: bool,
+}
+
+impl VaultSecretChangedPayload {
+    /// True when this event matches what the consumer cares about. Mirrors
+    /// the `authorize_read` rules of SY.vault so the consumer only reacts
+    /// to secrets it could actually read.
+    pub fn matches_interest(&self, interest: &VaultSecretInterest<'_>) -> bool {
+        if self.resource_type != interest.resource_type {
+            return false;
+        }
+        let secret_ilk = self
+            .ilk
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        let my_ilk = interest.my_ilk.map(str::trim).filter(|v| !v.is_empty());
+        // (1) Dedicated match.
+        if let (Some(owner), Some(mine)) = (secret_ilk, my_ilk) {
+            return owner == mine;
+        }
+        // Pool match — secret has no ilk.
+        if secret_ilk.is_none() {
+            // (2a) Tenant pool.
+            if self.tenant_id == interest.my_tenant {
+                return true;
+            }
+            // (2b) sys-pool universal for system callers.
+            if interest.system_caller && self.tenant_id == "sys" {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LsaPayload {
     pub hive: String,
@@ -325,6 +434,7 @@ pub const MSG_WAN_REJECT: &str = "WAN_REJECT";
 pub const MSG_TIME_SYNC: &str = "TIME_SYNC";
 pub const MSG_WITHDRAW: &str = "WITHDRAW";
 pub const MSG_CONFIG_CHANGED: &str = "CONFIG_CHANGED";
+pub const MSG_VAULT_SECRET_CHANGED: &str = "VAULT_SECRET_CHANGED";
 pub const MSG_CONFIG_GET: &str = "CONFIG_GET";
 pub const MSG_CONFIG_SET: &str = "CONFIG_SET";
 pub const MSG_CONFIG_RESPONSE: &str = "CONFIG_RESPONSE";

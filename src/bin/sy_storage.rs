@@ -2,7 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,7 +17,10 @@ use fluxbee_sdk::nats::{
     NatsError as ClientNatsError, NatsRequestEnvelope, NatsResponseEnvelope,
     NATS_ENVELOPE_SCHEMA_VERSION,
 };
-use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
+use fluxbee_sdk::protocol::{
+    Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest,
+    MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
+};
 use fluxbee_sdk::{
     build_node_config_response_message, connect, managed_node_config_path, managed_node_name,
     try_handle_default_node_status, NodeConfig, NodeReceiver, NodeSender, NodeUuidMode,
@@ -91,6 +94,11 @@ struct StorageControlState {
     schema_version: u32,
     config_version: u64,
     secret_source: StorageDbSecretSource,
+    /// Self ILK and tenant cached for matching VAULT_SECRET_CHANGED
+    /// broadcasts. Filled at boot from
+    /// `wait_for_self_system_ilk_id` and `DEFAULT_ROOT_TENANT_ID`.
+    self_ilk_id: String,
+    self_tenant_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,7 +258,12 @@ async fn main() -> Result<(), StorageError> {
             "SY.storage vault lookup for postgres_url_ref failed; starting degraded"
         );
     }
-    let mut control_state = bootstrap_storage_control_state(&node_name, db_secret_source)?;
+    let mut control_state = bootstrap_storage_control_state(
+        &node_name,
+        db_secret_source,
+        self_ilk_id.clone(),
+        my_tenant.to_string(),
+    )?;
     let (mut sender, mut receiver) =
         connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     tracing::info!(node_name = %sender.full_name(), "sy.storage connected to router");
@@ -381,25 +394,9 @@ async fn main() -> Result<(), StorageError> {
         Arc::clone(&storage_handler_errors),
     )));
 
-    // Periodic vault refresh: probes resolve_resource(Postgres) every
-    // STORAGE_VAULT_REFRESH_INTERVAL_SECS so CONFIG_GET reflects live vault
-    // state even if the operator added/rotated the secret post-boot. The
-    // pool connection is NOT reconnected here (still requires sy-storage
-    // restart) — this flip is reporting-only, surfaced via
-    // resources.postgres.live_in_vault.
-    let vault_postgres_live = Arc::new(AtomicBool::new(
-        db_secret_source != StorageDbSecretSource::Missing,
-    ));
-    std::mem::drop(tokio::spawn(run_storage_vault_refresh_loop(
-        config_dir.clone(),
-        state_dir.clone(),
-        socket_dir.clone(),
-        hive.hive_id.clone(),
-        node_name.clone(),
-        self_ilk_id.clone(),
-        my_tenant.to_string(),
-        Arc::clone(&vault_postgres_live),
-    )));
+    // Vault changes arrive event-driven via VAULT_SECRET_CHANGED
+    // broadcasts from SY.vault — no polling loop. See
+    // `handle_vault_secret_changed` in process_router_message.
 
     let mut heartbeat = time::interval(Duration::from_secs(5));
     loop {
@@ -409,7 +406,6 @@ async fn main() -> Result<(), StorageError> {
                     node_name = %sender.full_name(),
                     config_version = control_state.config_version,
                     db_secret_source = %control_state.secret_source.as_str(),
-                    vault_postgres_live = vault_postgres_live.load(Ordering::Relaxed),
                     "sy.storage heartbeat"
                 );
             }
@@ -426,54 +422,10 @@ async fn main() -> Result<(), StorageError> {
                     &msg,
                     &mut control_state,
                     &node_name,
-                    vault_postgres_live.load(Ordering::Relaxed),
                 ).await {
                     tracing::warn!(error = %err, action = ?msg.meta.msg, "failed to process sy.storage system message");
                 }
             }
-        }
-    }
-}
-
-const STORAGE_VAULT_REFRESH_INTERVAL_SECS: u64 = 60;
-
-#[allow(clippy::too_many_arguments)]
-async fn run_storage_vault_refresh_loop(
-    config_dir: PathBuf,
-    state_dir: PathBuf,
-    socket_dir: PathBuf,
-    hive_id: String,
-    node_name: String,
-    self_ilk_id: String,
-    my_tenant: String,
-    live_flag: Arc<AtomicBool>,
-) {
-    let mut ticker = time::interval(Duration::from_secs(STORAGE_VAULT_REFRESH_INTERVAL_SECS));
-    ticker.tick().await; // skip the first immediate tick
-    loop {
-        ticker.tick().await;
-        let (url, _source, err) = resolve_database_url(
-            &config_dir,
-            &state_dir,
-            &socket_dir,
-            &hive_id,
-            &node_name,
-            &self_ilk_id,
-            &my_tenant,
-        )
-        .await;
-        let live = url.is_some();
-        let prev = live_flag.swap(live, Ordering::Relaxed);
-        if prev != live {
-            tracing::info!(
-                node_name = %node_name,
-                previous = prev,
-                current = live,
-                "sy.storage vault refresh flipped postgres live flag"
-            );
-        }
-        if let Some(err) = err {
-            tracing::debug!(error = %err, "sy.storage vault refresh: lookup error (will retry)");
         }
     }
 }
@@ -2926,12 +2878,68 @@ async fn connect_with_retry(
     }
 }
 
+/// Handle a `VAULT_SECRET_CHANGED` broadcast from SY.vault. If the event
+/// matches our interest (postgres, our tenant or sys pool), we auto-restart
+/// the process via `exit(0)` so systemd reboots us and we pick up the
+/// freshly-published secret cleanly. This is the canonical way Model D'
+/// closes the "boot without secret → secret arrives later" race that
+/// stranded sy-storage in `secret_source = Missing` (the polling refresh
+/// loop only flipped `live_in_vault` for reporting — the pool itself
+/// stayed disconnected).
+///
+/// Exit-based reconnect is chosen over hot-swap because the storage
+/// backend is plumbed into 13 workers (`run_turns_loop`, `run_events_loop`,
+/// ...) by Arc-cloned ownership at boot. Restart is one line; hot-swap
+/// would require an Arc<RwLock<Option<...>>> migration across all
+/// workers. For rotations, restart momentarily interrupts traffic but is
+/// idempotent on the inbox-replay path.
+fn handle_vault_secret_changed(
+    msg: &Message,
+    control_state: &StorageControlState,
+    node_name: &str,
+) {
+    let payload: VaultSecretChangedPayload = match serde_json::from_value(msg.payload.clone()) {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::warn!(error = %err, "ignoring malformed VAULT_SECRET_CHANGED payload");
+            return;
+        }
+    };
+    let interest = VaultSecretInterest {
+        resource_type: "postgres",
+        my_tenant: &control_state.self_tenant_id,
+        my_ilk: Some(control_state.self_ilk_id.as_str()),
+        system_caller: true,
+    };
+    if !payload.matches_interest(&interest) {
+        tracing::debug!(
+            node_name = %node_name,
+            resource_type = %payload.resource_type,
+            payload_tenant = %payload.tenant_id,
+            payload_ilk = %payload.ilk.as_deref().unwrap_or(""),
+            "VAULT_SECRET_CHANGED does not match our interest; ignoring"
+        );
+        return;
+    }
+    tracing::warn!(
+        node_name = %node_name,
+        op = %payload.op.as_str(),
+        resource_type = %payload.resource_type,
+        version = payload.version,
+        key = %payload.key,
+        "VAULT_SECRET_CHANGED matches our interest; exiting for systemd-managed restart to reconnect the postgres pool"
+    );
+    // Flush logs before exit so the message above appears in journalctl.
+    // `exit(0)` is the clean shutdown signal — systemd interprets it as
+    // a normal stop and applies its Restart= policy.
+    std::process::exit(0);
+}
+
 async fn process_router_message(
     sender: &NodeSender,
     msg: &Message,
     control_state: &mut StorageControlState,
     node_name: &str,
-    vault_postgres_live: bool,
 ) -> Result<(), StorageError> {
     tracing::info!(
         node_name = %node_name,
@@ -2954,8 +2962,11 @@ async fn process_router_message(
         return Ok(());
     };
     match command {
+        MSG_VAULT_SECRET_CHANGED => {
+            handle_vault_secret_changed(msg, control_state, node_name);
+        }
         "CONFIG_GET" => {
-            let payload = build_storage_config_get_payload(node_name, control_state, vault_postgres_live, None);
+            let payload = build_storage_config_get_payload(node_name, control_state, None);
             let response = build_node_config_response_message(msg, sender.uuid(), payload);
             tracing::info!(
                 node_name = %node_name,
@@ -2968,7 +2979,7 @@ async fn process_router_message(
             sender.send(response).await?;
         }
         "CONFIG_SET" => {
-            let payload = apply_storage_config_set(msg, node_name, control_state, vault_postgres_live)?;
+            let payload = apply_storage_config_set(msg, node_name, control_state)?;
             let response = build_node_config_response_message(msg, sender.uuid(), payload);
             tracing::info!(
                 node_name = %node_name,
@@ -3058,6 +3069,8 @@ fn build_system_reply(
 fn bootstrap_storage_control_state(
     node_name: &str,
     secret_source: StorageDbSecretSource,
+    self_ilk_id: String,
+    self_tenant_id: String,
 ) -> Result<StorageControlState, StorageError> {
     let persisted = load_storage_config_state(node_name);
     let schema_version = persisted
@@ -3072,6 +3085,8 @@ fn bootstrap_storage_control_state(
         schema_version,
         config_version,
         secret_source,
+        self_ilk_id,
+        self_tenant_id,
     };
     persist_storage_config_state(node_name, &state)?;
     Ok(state)
@@ -3112,19 +3127,16 @@ fn storage_public_config(_node_name: &str, secret_source: StorageDbSecretSource)
 fn build_storage_config_get_payload(
     node_name: &str,
     state: &StorageControlState,
-    vault_postgres_live: bool,
     note: Option<&str>,
 ) -> Value {
     let configured = state.secret_source != StorageDbSecretSource::Missing;
     let mut notes = vec![
         Value::String("SY.storage uses PostgreSQL only on motherbee.".to_string()),
         Value::String(
-            "Model D': credentials live entirely in SY.vault. Operator loads them with vault_put + resource_type=postgres; storage resolves from the pool on boot/refresh."
-                .to_string(),
+            "Model D': credentials live entirely in SY.vault. Operator loads them with vault_put + resource_type=postgres; storage resolves from the pool at boot.".to_string(),
         ),
         Value::String(
-            "CONFIG_SET on SY.storage takes no secret-bearing fields. The vault refresh loop polls every 60s — `live_in_vault` reflects the latest probe. Connection reconnect on rotation still requires sy-storage restart."
-                .to_string(),
+            "VAULT_SECRET_CHANGED broadcasts trigger an exit(0) for systemd-managed restart so the pool reconnects with the new secret. CONFIG_SET on SY.storage takes no secret-bearing fields.".to_string(),
         ),
     ];
     if let Some(note) = note.filter(|value| !value.trim().is_empty()) {
@@ -3135,7 +3147,6 @@ fn build_storage_config_get_payload(
             "resource_type": "postgres",
             "required": true,
             "configured": configured,
-            "live_in_vault": vault_postgres_live,
             "scope": "pool (tenant or sys)",
             "consumer_dbname": STORAGE_DB_NAME
         }
@@ -3171,13 +3182,11 @@ fn apply_storage_config_set(
     msg: &Message,
     node_name: &str,
     control_state: &mut StorageControlState,
-    vault_postgres_live: bool,
 ) -> Result<Value, StorageError> {
     let Some(requested_node_name) = msg.payload.get("node_name").and_then(Value::as_str) else {
         return Ok(storage_config_error_response(
             node_name,
             control_state,
-            vault_postgres_live,
             "invalid_config",
             "Missing required field: payload.node_name".to_string(),
         ));
@@ -3186,7 +3195,6 @@ fn apply_storage_config_set(
         return Ok(storage_config_error_response(
             node_name,
             control_state,
-            vault_postgres_live,
             "invalid_config",
             format!(
                 "Invalid payload.node_name: expected '{}' or '{}', got '{}'",
@@ -3198,7 +3206,6 @@ fn apply_storage_config_set(
         return Ok(storage_config_error_response(
             node_name,
             control_state,
-            vault_postgres_live,
             "invalid_config",
             "Missing required field: payload.schema_version".to_string(),
         ));
@@ -3208,7 +3215,6 @@ fn apply_storage_config_set(
         return Ok(storage_config_error_response(
             node_name,
             control_state,
-            vault_postgres_live,
             "invalid_config",
             "Missing required field: payload.config_version".to_string(),
         ));
@@ -3217,7 +3223,6 @@ fn apply_storage_config_set(
         return Ok(storage_config_error_response(
             node_name,
             control_state,
-            vault_postgres_live,
             "stale_config_version",
             format!(
                 "Stale config_version: received {}, current {}",
@@ -3229,7 +3234,6 @@ fn apply_storage_config_set(
         return Ok(storage_config_error_response(
             node_name,
             control_state,
-            vault_postgres_live,
             "invalid_config",
             "Missing required field: payload.apply_mode".to_string(),
         ));
@@ -3238,7 +3242,6 @@ fn apply_storage_config_set(
         return Ok(storage_config_error_response(
             node_name,
             control_state,
-            vault_postgres_live,
             "unsupported_apply_mode",
             format!("Unsupported payload.apply_mode='{apply_mode}'"),
         ));
@@ -3247,7 +3250,6 @@ fn apply_storage_config_set(
         return Ok(storage_config_error_response(
             node_name,
             control_state,
-            vault_postgres_live,
             "invalid_config",
             "Missing required field: payload.config".to_string(),
         ));
@@ -3265,7 +3267,6 @@ fn apply_storage_config_set(
                 return Ok(storage_config_error_response(
                     node_name,
                     control_state,
-                    vault_postgres_live,
                     "invalid_config",
                     format!(
                         "config.database.{forbidden} is no longer accepted; load the postgres secret via vault_put (resource_type=postgres) and storage will discover it from the pool"
@@ -3288,13 +3289,12 @@ fn apply_storage_config_set(
             "resource_type": "postgres",
             "required": true,
             "configured": control_state.secret_source != StorageDbSecretSource::Missing,
-            "live_in_vault": vault_postgres_live,
             "scope": "pool (tenant or sys)",
             "consumer_dbname": STORAGE_DB_NAME
         }],
         "notes": [
             "sy.storage has no secret-bearing CONFIG_SET fields in Model D'.",
-            "Load postgres credentials via vault_put with resource_type=postgres; storage will pick them up at boot from the pool. The refresh loop probes vault every 60s and reflects live presence in resources.postgres.live_in_vault."
+            "Load postgres credentials via vault_put with resource_type=postgres; storage will pick them up at boot. VAULT_SECRET_CHANGED broadcasts trigger exit(0) + systemd restart so the pool reconnects."
         ],
         "error": Value::Null
     }))
@@ -3303,7 +3303,6 @@ fn apply_storage_config_set(
 fn storage_config_error_response(
     node_name: &str,
     control_state: &StorageControlState,
-    _vault_postgres_live: bool,
     code: &str,
     message: String,
 ) -> Value {

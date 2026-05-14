@@ -58,13 +58,31 @@ dist:
 # continuing bootstrap. Workers do not run SY.vault.
 system_nodes:
   motherbee:
+    # Boot order matters in Model D' (vault):
+    #
+    # 1. SY.config.routes — writes routing SHM, prereq for the router to
+    #    deliver messages between everyone below.
+    # 2. SY.vault — opens vault.db (AES-256-GCM at rest) and registers
+    #    itself in the router. Must be ready BEFORE any consumer (admin /
+    #    architect / storage / identity / cognition) does its first
+    #    `resolve_resource` lookup, otherwise that lookup gets
+    #    VAULT_UNAVAILABLE and the node falls to `secret_source = Missing`.
+    #    Once vault is up, VAULT_SECRET_CHANGED broadcasts handle any
+    #    later put/rotate/delete; consumers that arrive degraded receive
+    #    the event on the next put (or on operator-initiated restart).
+    # 3. SY.identity — writes identity SHM (needed for vault auth) and
+    #    consumes its own postgres secret from vault. Putting it after
+    #    SY.vault avoids the chicken/egg of identity needing vault and
+    #    vault needing identity SHM (vault has a dedicated-match fallback
+    #    that doesn't require SHM, used for identity's boot lookup).
+    # The remaining nodes follow in their previous order.
     nodes:
-      - SY.identity
       - SY.config.routes
+      - SY.vault
+      - SY.identity
       - SY.opa.rules
       - SY.admin
       - SY.architect
-      - SY.vault
       - SY.storage
       - SY.cognition
       - SY.policy
@@ -72,8 +90,9 @@ system_nodes:
       - SY.wf-rules
       - SY.frontdesk.gov
     wait_for:
-      - SY.identity
       - SY.config.routes
+      - SY.vault
+      - SY.identity
       - SY.opa.rules
       - SY.admin
       - SY.cognition

@@ -478,7 +478,7 @@ Para cada nodo consumer, el patrón es:
 - [x] VA-J'-5a. `REQUIRED_RESOURCES = [(Postgres, "database.postgres_url")]`. Borrar `STORAGE_LOCAL_REF_KEY_POSTGRES_URL` y `persist_local_postgres_url_ref` / `load_local_postgres_url_ref`. **Hecho** — sin REQUIRED_RESOURCES literal (overkill para un solo resource), pero el discovery es por `resolve_resource(Postgres, …)` y las helpers locales fueron borradas.
 - [x] VA-J'-5b. `apply_storage_config_set`: borrar todo manejo de `postgres_url` / `postgres_url_ref` (el field deja de existir en CONFIG_SET). El handler de CONFIG_SET pasa a manejar SOLO config no-secreta (si la tiene; storage hoy solo tenía postgres_url → CONFIG_SET puede quedar como inert con un mensaje "no secret-bearing fields, use vault_put"). **Hecho** — rechaza `postgres_url`/`postgres_url_ref` con `INVALID_CONFIG`.
 - [x] VA-J'-5c. Boot path: `resolve_resource(Postgres, my_ilk, my_tenant)` → si lo encuentra, inicializa el Storage backend; si no, degraded (igual que hoy con `STORAGE_NOT_READY`). **Hecho** — strict rejection de URLs con dbname embebido (cada consumer agrega su dbname con `with_dbname`).
-- [x] VA-J'-5d. Refresh loop cada 60s. **Hecho parcial — limitación conocida**. `run_storage_vault_refresh_loop` probea `resolve_resource(Postgres)` cada 60s y actualiza un `AtomicBool vault_postgres_live` que el CONFIG_GET reporta en `resources.postgres.live_in_vault`. **Reporting-only**: si storage arranca antes que el secret esté en vault, queda con `secret_source = Missing` y el pool de Postgres NO se conecta. El refresh loop detecta el secret pero no reconecta el backend → requiere `restart sy-storage` después del primer `vault_put`. **Fix planeado: ver VA-J'-13 (vault broadcast).** Por ahora documentar en runbook.
+- [x] VA-J'-5d. Refresh loop cada 60s. **Superseded por VA-J'-13.** El polling loop fue borrado; ahora storage reacciona a `VAULT_SECRET_CHANGED` con `std::process::exit(0)` para que systemd reinicie y el pool reconecte.
 - [x] VA-J'-5e. `CONFIG_GET` reporta `resources.postgres`. **Hecho**.
 - [ ] VA-J'-5f. E2E: operador `vault_put` con `resource_type=postgres, tenant=sys` (en pool, sin ilk) → restart storage → reporta `resolved=true, source=pool`. **Pendiente test en VM**.
 
@@ -487,7 +487,7 @@ Para cada nodo consumer, el patrón es:
 - [x] VA-J'-6a. `REQUIRED_RESOURCES = [(Postgres, "database.postgres_url")]`. Borrar `IDENTITY_LOCAL_REF_KEY_POSTGRES_URL` y persist/load equivalentes. **Hecho** — constante y helpers borrados.
 - [x] VA-J'-6b. `apply_identity_config_set`: borrar manejo de `postgres_url_ref`. CONFIG_SET queda solo para config no-secreta (si aplica). **Hecho** — rechaza secret-bearing fields.
 - [x] VA-J'-6c. Boot path para resolver Postgres: usar `resolve_resource(Postgres, my_self_ilk_deterministic, "sys")`. El operador asigna el secret a identity vía `owner_node: "SY.identity"` (que admin resuelve a `identity_ilk_deterministic`). Match directo sin SHM resolution. **Hecho** — usa `DEFAULT_ROOT_TENANT_ID` como tenant, el match sys-pool universal cubre el caso por defecto.
-- [x] VA-J'-6d. Refresh loop como storage. **Hecho parcial — misma limitación que VA-J'-5d**. `run_identity_vault_refresh_loop` corre solo en motherbee primary, cada 60s probea `resolve_resource(Postgres)` y actualiza `vault_postgres_live` que CONFIG_GET refleja. Reporting-only; reconexión del pool requiere `restart sy-identity` tras el primer `vault_put`. **Fix planeado: ver VA-J'-13 (vault broadcast).**
+- [x] VA-J'-6d. Refresh loop como storage. **Superseded por VA-J'-13.** Polling loop borrado; identity reacciona al broadcast con `exit(0)`.
 - [x] VA-J'-6e. CONFIG_GET reporta `resources.postgres`. **Hecho**.
 - [ ] VA-J'-6f. E2E: operador `vault_put` con `resource_type=postgres, tenant=sys, owner_node="SY.identity"` → restart identity → DB ready. **Pendiente test en VM**.
 
@@ -496,7 +496,7 @@ Para cada nodo consumer, el patrón es:
 - [x] VA-J'-7a. `REQUIRED_RESOURCES = [(OpenAi, "ai_providers.openai.api_key")]`. **Hecho** — discovery directo por `resolve_resource(Openai, …)`.
 - [x] VA-J'-7b. Borrar `OpenAiSection.api_key_ref` del schema de admin executor config. CONFIG_SET de admin solo persiste `default_model`, `max_tokens`, `temperature`, `top_p`, `catalog.{mode,actions}`. **Hecho**.
 - [x] VA-J'-7c. `build_admin_executor_ai_runtime` ahora usa `resolve_resource(OpenAi, ...)` en vez de leer `api_key_ref` del config. **Hecho**.
-- [x] VA-J'-7d. Refresh loop. **Hecho** — `run_admin_executor_vault_refresh_loop` corre cada 60s y llama `refresh_admin_executor_ai_runtime`, que ya tenía la lógica de probe + reload del runtime. Flippa `executor_configured` cuando aparece/desaparece el secret en vault.
+- [x] VA-J'-7d. Refresh loop. **Superseded por VA-J'-13.** Polling loop borrado; admin executor reacciona al broadcast llamando `refresh_admin_executor_ai_runtime` in-memory.
 - [x] VA-J'-7e. CONFIG_GET reporta `resources.openai`. **Hecho**.
 - [ ] VA-J'-7f. E2E con `vault_put` en pool sys + restart admin → executor configured. **Pendiente test en VM**.
 
@@ -505,7 +505,7 @@ Para cada nodo consumer, el patrón es:
 - [x] VA-J'-8a. `REQUIRED_RESOURCES = [(OpenAi, "ai_providers.openai.api_key"), (Postgres, "storage.messages_db_url")]`. **Hecho** — discovery directo por `resolve_resource` para ambos.
 - [x] VA-J'-8b. Borrar `api_key_ref` y `messages_db_url_ref` del schema. Borrar `extract_*_ref`, `reject_*_plaintext`, `resolve_*_from_vault` que armé en J4. **Hecho** — reemplazado por `reject_architect_secret_fields` + `resolve_architect_openai_api_key_from_vault` / `resolve_messages_db_url_from_vault` que usan `resolve_resource`.
 - [x] VA-J'-8c. `build_architect_ai_runtime` y `refresh_architect_messages_db_url` usan `resolve_resource(...)`. El messages_db se distingue del OpenAI por `resource_type=postgres`. Si hay un Postgres dedicado a architect via `ilk`, lo usa; si no, el del pool sys. **Hecho**.
-- [x] VA-J'-8d. Refresh loop unificado para ambos resources. **Hecho** — `architect_secret_refresh_loop` actualizado: ahora refresca **siempre** (no solo cuando degraded) tanto `refresh_architect_ai_runtime` como `refresh_architect_messages_db_url`. Intervalo alineado a **60s** con los otros 4 consumers (storage/identity/admin/cognition) — los 10s preexistentes daban 12 round-trips/min al vault solo desde architect, lo cual era ruidoso considerando que cada tick hace 2 lookups (openai + postgres).
+- [x] VA-J'-8d. Refresh loop unificado para ambos resources. **Superseded por VA-J'-13.** Polling loop borrado; architect reacciona al broadcast llamando los dos refresh in-memory cuando matchean.
 - [x] VA-J'-8e. CONFIG_GET reporta `resources.{openai,postgres}`. **Hecho**.
 - [ ] VA-J'-8f. E2E con dos `vault_put`s (openai en pool + postgres en pool) y verificación de archi. **Pendiente test en VM**.
 
@@ -514,7 +514,7 @@ Para cada nodo consumer, el patrón es:
 - [x] VA-J'-9a. `REQUIRED_RESOURCES = [(OpenAi, "ai_providers.openai.api_key"), (Postgres, "storage.postgres_url")]`. **Hecho** — discovery directo por `resolve_cognition_resource(<type>, …)`.
 - [x] VA-J'-9b. Borrar `COGNITION_LOCAL_REF_KEY_OPENAI`, `COGNITION_LOCAL_REF_KEY_STORAGE_POSTGRES_URL`, `extract_*_ref`, `reject_*_plaintext`, `resolve_*_to_plaintext`, `persist_local_*_ref` (todo lo de J5 legacy). **Hecho** — todas las helpers y constantes borradas, reemplazadas por `reject_cognition_secret_fields`.
 - [x] VA-J'-9c. Cognition usa el MISMO secret de pool que storage para Postgres (mismo `resource_type=postgres, tenant=sys, ilk=null` en vault). Sin duplicación. **Hecho** — comparte el pool match con storage; cognition aplica `with_dbname("fluxbee_storage")` en su path.
-- [x] VA-J'-9d. Refresh loop. **Hecho** — `run_vault_refresh_loop` corre cada 60s, probea `resolve_cognition_openai_api_key` y actualiza `ai_secret_source`. Esto cierra el "lazy state" donde cognition reportaba `degraded_no_ai_provider` hasta que llegara el primer turn semantic.
+- [x] VA-J'-9d. Refresh loop. **Superseded por VA-J'-13.** Polling loop borrado; cognition flippa `ai_secret_source` cuando llega el broadcast.
 - [x] VA-J'-9e. CONFIG_GET con `resources.{openai,postgres}`. **Hecho**.
 - [ ] VA-J'-9f. E2E: cognition cold boot sin secrets → operador hace 2 vault_puts (compartidos con storage/architect) → cognition arranca configurado. **Pendiente test en VM**.
 
@@ -581,7 +581,16 @@ Tareas:
 - [ ] VA-J'-14c. `ai-generic::resolve_openai_api_key_with_source`: retry con backoff (3×2s) en boot path.
 - [ ] VA-J'-14d. `io-slack::resolve_slack_credentials_from_vault`: retry con backoff (3×2s) en boot path.
 
-### J'-13. Vault broadcast de cambios de secret — **pendiente, próximo sprint**
+### J'-13. Vault broadcast de cambios de secret — **implementado 2026-05-14**
+
+> **Estado: completado.** SY.vault publica `VAULT_SECRET_CHANGED` por router broadcast después de cada `put` / `rotate` / `delete` / `rollback` que cambia estado. Los 5 consumers escuchan en su `process_router_message` / `process_system_message` / `handle_system_command` existente, filtran por interest (`resource_type`, `tenant_id`, `ilk`) usando `VaultSecretChangedPayload::matches_interest`, y reaccionan según su capacidad:
+>
+> - **sy.storage** y **sy.identity** (pool de Postgres): `std::process::exit(0)` para que systemd reinicie y el pool reconecte con el secret fresh. Cierra definitivamente el race "boot sin secret → secret aparece después" que requería restart manual.
+> - **sy.admin executor** (OpenAI): `refresh_admin_executor_ai_runtime` in-memory; cero downtime.
+> - **sy.architect** (OpenAI + Postgres-messages-db): `refresh_architect_ai_runtime` + `refresh_architect_messages_db_url`; cero downtime.
+> - **sy.cognition** (OpenAI + Postgres-rebuild lazy): flip de `ai_secret_source` para openai; postgres se consulta lazy en el próximo rebuild.
+>
+> **Los 5 polling loops de 60s + el flag `live_in_vault` fueron borrados**. El broadcast es ahora la fuente de verdad sobre cambios.
 
 **Problema actual.** Los consumers descubren cambios en vault mediante un refresh loop polling cada 60s. Eso resuelve el caso de los nodos que pueden re-construir su runtime desde un valor en memoria (admin executor, architect, cognition: re-crean el `OpenAiResponsesClient`), pero NO resuelve el caso de los nodos que abren un **pool de conexiones** al boot (storage e identity con Postgres). Hoy esos dos quedan en `secret_source = Missing` para siempre si arrancan antes que `vault_put` y la única forma de reconectar es `systemctl restart`.
 
@@ -616,13 +625,13 @@ Tareas:
 
 **Tareas (próximo sprint, no este):**
 
-- [ ] VA-J'-13a. Definir el schema definitivo del envelope `VAULT_SECRET_CHANGED` (campos, versionado, naming en NATS/router).
-- [ ] VA-J'-13b. Implementar el publish en SY.vault para todos los handlers que mutan estado (`handle_put`, `handle_rotate`, `handle_delete`, `handle_rollback`).
-- [ ] VA-J'-13c. SDK helper `subscribe_resource_changes` con filtro + dispatch.
-- [ ] VA-J'-13d. Storage + identity: mover `Storage` / `IdentityRuntime.db_config` a `Arc<RwLock<Option<...>>>` y wirear el handler del broadcast para reconectar pool en caliente.
-- [ ] VA-J'-13e. Admin executor / architect / cognition: reemplazar el polling loop por el handler del broadcast. Borrar el polling cuando el broadcast esté estable en VM.
-- [ ] VA-J'-13f. Tests unitarios del filtrado: un consumer con `(postgres, sys, ilk=A)` no recibe cambios de `(openai, sys, ilk=B)`.
-- [ ] VA-J'-13g. Test E2E en VM: arrancar storage sin secret → `vault_put` → confirmar que storage pasa a `configured` sin restart en menos de 1s.
+- [x] VA-J'-13a. Schema final en `crates/fluxbee_sdk/src/protocol.rs`: `VaultSecretChangedPayload` (op, resource_type, tenant_id, ilk, version, key, hive_id, at_ms) + `VaultSecretOp` enum + `VaultSecretInterest` filter + `matches_interest()`. Constante `MSG_VAULT_SECRET_CHANGED`.
+- [x] VA-J'-13b. Publish en `src/bin/sy_vault.rs`: `HandlerOutcome { response, broadcast }` retornado por los 4 handlers de mutación (`handle_put/rotate/delete/rollback`); dispatcher manda response y, si hay broadcast, lo emite con `Destination::Broadcast`, `scope=global`, sin auth (metadata only). put idempotente (changed=false) no emite — evita spam.
+- [x] VA-J'-13c. SDK helper: en lugar de un task separado, los consumers usan su main loop existente (recv → match `MSG_VAULT_SECRET_CHANGED`) + `VaultSecretChangedPayload::matches_interest` para filtrar. Sin spawning extra, cero contención con el dispatcher.
+- [x] VA-J'-13d. Storage + identity: auto-restart via `std::process::exit(0)` en match positivo. Decisión sobre hot-swap del pool: más simple, predecible y robusto que migrar 13 workers a `Arc<RwLock<Option<...>>>`. La interrupción es ~1s y systemd se encarga.
+- [x] VA-J'-13e. Admin executor / architect / cognition: handler in-memory que llama a los `refresh_*` existentes. Polling loops borrados (`run_*_vault_refresh_loop` en cognition/storage/identity/admin/architect).
+- [ ] VA-J'-13f. Tests unitarios del filtrado: pendiente cubrir matriz (dedicated vs pool, sys vs tenant) en `protocol.rs`.
+- [ ] VA-J'-13g. Test E2E en VM: arrancar storage sin secret → `vault_put` → confirmar que storage pasa a `configured` sin restart manual (debería hacer exit+restart automático en <1s). **Pendiente test en VM.**
 
 ---
 
