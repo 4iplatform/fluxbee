@@ -871,7 +871,8 @@ async fn reconcile_persisted_custom_nodes(
             continue;
         }
 
-        let (persisted_ilk, persisted_tenant) = load_persisted_node_identity(state, &node.node_name);
+        let (persisted_ilk, persisted_tenant) =
+            load_persisted_node_identity(state, &node.node_name);
         let cmd = build_managed_node_run_command(
             &unit,
             &node.node_name,
@@ -1029,7 +1030,10 @@ async fn wait_for_sy_nodes(
 
 async fn watchdog_tick(state: &OrchestratorState) {
     if !systemd_is_active("rt-gateway") {
-        tracing::warn!(service = "rt-gateway", "service not active; attempting restart");
+        tracing::warn!(
+            service = "rt-gateway",
+            "service not active; attempting restart"
+        );
         if let Err(err) = systemd_start("rt-gateway") {
             tracing::warn!(service = "rt-gateway", error = %err, "service restart failed");
         }
@@ -1037,7 +1041,10 @@ async fn watchdog_tick(state: &OrchestratorState) {
     for node_name in &state.system_nodes.nodes {
         let service = name_to_service(node_name);
         if !systemd_is_active(&service) {
-            tracing::warn!(service = service.as_str(), "service not active; attempting restart");
+            tracing::warn!(
+                service = service.as_str(),
+                "service not active; attempting restart"
+            );
             if let Err(err) = systemd_start(&service) {
                 tracing::warn!(service = service.as_str(), error = %err, "service restart failed");
             }
@@ -2991,7 +2998,9 @@ fn validate_system_nodes(
             .into());
         }
         if !seen_wait.insert(wait_name.to_string()) {
-            return Err(format!("invalid hive.yaml: duplicate wait_for entry '{wait_name}'").into());
+            return Err(
+                format!("invalid hive.yaml: duplicate wait_for entry '{wait_name}'").into(),
+            );
         }
     }
     Ok(())
@@ -12679,8 +12688,7 @@ fn sync_core_to_worker(
                         address,
                         key_path,
                         &restart_services,
-                    )
-                    {
+                    ) {
                         format!("rollback applied but restart after rollback failed: {rb_err}")
                     } else {
                         "rollback applied".to_string()
@@ -12895,7 +12903,10 @@ fn restart_remote_core_services_with_health_gate(
             );
             continue;
         }
-        tracing::info!(service = service.as_str(), "core sync: restarting remote service");
+        tracing::info!(
+            service = service.as_str(),
+            "core sync: restarting remote service"
+        );
         let restart_cmd = format!("systemctl restart {}", service);
         ssh_with_key(
             address,
@@ -16373,9 +16384,9 @@ blob:
             Some("tnt:00000000-0000-0000-0000-000000000001"),
         );
 
-        assert!(cmd.contains(
-            "--setenv=FLUXBEE_NODE_ILK_ID='ilk:11111111-2222-3333-4444-555555555555'"
-        ));
+        assert!(
+            cmd.contains("--setenv=FLUXBEE_NODE_ILK_ID='ilk:11111111-2222-3333-4444-555555555555'")
+        );
         assert!(cmd.contains(
             "--setenv=FLUXBEE_NODE_TENANT_ID='tnt:00000000-0000-0000-0000-000000000001'"
         ));

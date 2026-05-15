@@ -2108,8 +2108,16 @@ impl GenericAiNode {
         // (orchestrator-spawned with FLUXBEE_NODE_ILK_ID +
         // FLUXBEE_NODE_TENANT_ID); reports `missing` otherwise. Live vault
         // presence is verified on each chat resolve call.
-        let api_key_source = if self.self_ilk_id.as_deref().filter(|v| !v.is_empty()).is_some()
-            && self.self_tenant_id.as_deref().filter(|v| !v.is_empty()).is_some()
+        let api_key_source = if self
+            .self_ilk_id
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .is_some()
+            && self
+                .self_tenant_id
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .is_some()
         {
             OpenAiApiKeySource::Vault
         } else {
@@ -5667,7 +5675,6 @@ fn migrate_bootstrap_openai_secret_with_root(
     strip_openai_api_key_from_effective_config(config);
     Ok(true)
 }
-
 
 fn parse_effective_config_doc(
     config: &Value,

@@ -11,8 +11,8 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use chrono::Utc;
 use fluxbee_sdk::identity::list_ilks_from_hive_config;
 use fluxbee_sdk::protocol::{
-    Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretOp, SCOPE_GLOBAL,
-    SYSTEM_KIND, MSG_VAULT_SECRET_CHANGED,
+    Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretOp,
+    MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     connect, try_handle_default_node_status, NodeConfig, NodeReceiver, NodeSender, NodeUuidMode,
@@ -22,13 +22,13 @@ use fluxbee_sdk::{
     MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE,
     MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
 };
-use uuid::Uuid;
 use nix::libc::{flock, LOCK_EX, LOCK_NB};
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use tokio::time;
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 type VaultResult<T> = Result<T, VaultError>;
 
@@ -182,14 +182,9 @@ async fn main() -> Result<(), VaultError> {
     // Phase J' / Model D' — well-known administrative ILKs (admin /
     // architect): only these can write to vault.
     let well_known_admin_ilks: HashSet<String> = {
-        let admin_ilk = fluxbee_sdk::deterministic_system_ilk_id(&format!(
-            "SY.admin@{}",
-            hive_id
-        ));
-        let architect_ilk = fluxbee_sdk::deterministic_system_ilk_id(&format!(
-            "SY.architect@{}",
-            hive_id
-        ));
+        let admin_ilk = fluxbee_sdk::deterministic_system_ilk_id(&format!("SY.admin@{}", hive_id));
+        let architect_ilk =
+            fluxbee_sdk::deterministic_system_ilk_id(&format!("SY.architect@{}", hive_id));
         tracing::info!(
             admin_ilk = %admin_ilk,
             architect_ilk = %architect_ilk,
@@ -203,7 +198,7 @@ async fn main() -> Result<(), VaultError> {
 
     // Well-known SY system ILKs — the full `system_nodes` list from
     // hive.yaml plus the admin/architect override set. Used by
-    // `authorize_read` to grant sys-pool universal reads to any SY system
+    // `authorize_read` to grant root-tenant pool reads to any SY system
     // caller WITHOUT requiring identity SHM to be populated. This is the
     // piece that closes the boot chicken/egg: vault can authorize reads
     // for identity (and any other SY) at boot even if identity hasn't
@@ -785,10 +780,14 @@ fn build_secret_changed_payload(
     hive_id: &str,
 ) -> Option<VaultSecretChangedPayload> {
     let resource_type = metadata.resource_type.clone()?;
+    let tenant_id = metadata.tenant_id.trim();
+    if !tenant_id.starts_with("tnt:") {
+        return None;
+    }
     Some(VaultSecretChangedPayload {
         op,
         resource_type,
-        tenant_id: metadata.tenant_id.clone(),
+        tenant_id: tenant_id.to_string(),
         ilk: metadata.ilk.clone().filter(|v| !v.is_empty()),
         version,
         key: key.to_string(),
@@ -801,7 +800,12 @@ fn build_secret_changed_payload(
 /// new `ilk` field (Model D') and falling back to the legacy `owner_ilk`
 /// string for transitional reads of secrets written by the old schema.
 fn secret_owner_ilk(metadata: &VaultMetadata) -> Option<&str> {
-    if let Some(ilk) = metadata.ilk.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+    if let Some(ilk) = metadata
+        .ilk
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
         return Some(ilk);
     }
     let legacy = metadata.owner_ilk.trim();
@@ -898,11 +902,62 @@ impl VaultStore {
             CREATE INDEX IF NOT EXISTS idx_audit_operation ON audit_log(operation);
             "#,
         )?;
-        Ok(Self {
+        let mut store = Self {
             conn,
             cipher: Aes256Gcm::new_from_slice(key)
                 .map_err(|_| VaultError::InvalidMasterKey("invalid AES key".to_string()))?,
-        })
+        };
+        let migrated = store.canonicalize_root_tenant_metadata()?;
+        if migrated > 0 {
+            tracing::warn!(
+                migrated = migrated,
+                root_tenant = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+                "canonicalized vault metadata from old sys tenant sentinel to root tenant"
+            );
+        }
+        Ok(store)
+    }
+
+    fn canonicalize_root_tenant_metadata(&mut self) -> VaultResult<usize> {
+        let now = Utc::now().to_rfc3339();
+        let updates = {
+            let mut stmt = self.conn.prepare(
+                r#"
+                SELECT key, metadata_json
+                  FROM secrets
+                "#,
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut updates = Vec::new();
+            while let Some(row) = rows.next()? {
+                let key: String = row.get(0)?;
+                let metadata_json: String = row.get(1)?;
+                let mut metadata: VaultMetadata = serde_json::from_str(&metadata_json)?;
+                if metadata.tenant_id.trim() == "sys" {
+                    metadata.tenant_id = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID.to_string();
+                    metadata.updated_at = Some(now.clone());
+                    updates.push((key, serde_json::to_string(&metadata)?));
+                }
+            }
+            updates
+        };
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        for (key, metadata_json) in &updates {
+            tx.execute(
+                r#"
+                UPDATE secrets
+                   SET metadata_json = ?2,
+                       updated_at = ?3
+                 WHERE key = ?1
+                "#,
+                params![key, metadata_json, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(updates.len())
     }
 
     fn put(
@@ -1333,7 +1388,7 @@ fn resolve_caller(config_dir: &Path, msg: &Message) -> VaultResult<Caller> {
 /// - Dedicated secret (`secret.ilk` set): only that ILK reads. **No admin
 ///   bypass** — the operator's "read my own secret" path is `vault_get`
 ///   from a node that owns it, not admin reading on the operator's behalf.
-/// - Pool secret (`secret.ilk` empty/null) with `tenant_id == "sys"`:
+/// - Pool secret (`secret.ilk` empty/null) in the hive's root tenant:
 ///   readable by any caller whose ILK is in `well_known_system_ilks`. This
 ///   set is computed locally from `hive.yaml` at boot and does NOT depend
 ///   on identity SHM, so consumers can resolve their boot secrets even
@@ -1436,7 +1491,12 @@ fn validate_metadata(metadata: &VaultMetadata) -> VaultResult<()> {
         ));
     }
     // Optional: if ilk is set, it must be a well-formed ilk: id.
-    if let Some(ilk) = metadata.ilk.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+    if let Some(ilk) = metadata
+        .ilk
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
         if !ilk.starts_with("ilk:") {
             return Err(VaultError::InvalidRequest(
                 "metadata.ilk must be ilk:<uuid> (or omit for pool)".to_string(),
@@ -1447,7 +1507,8 @@ fn validate_metadata(metadata: &VaultMetadata) -> VaultResult<()> {
     // if empty, fine — Model D' uses metadata.ilk instead.
     if !metadata.owner_ilk.is_empty() && !metadata.owner_ilk.starts_with("ilk:") {
         return Err(VaultError::InvalidRequest(
-            "metadata.owner_ilk if provided must be ilk:<uuid>; prefer metadata.ilk in Model D'".to_string(),
+            "metadata.owner_ilk if provided must be ilk:<uuid>; prefer metadata.ilk in Model D'"
+                .to_string(),
         ));
     }
     Ok(())
@@ -1598,5 +1659,90 @@ async fn connect_with_retry(
                 time::sleep(delay).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vault_store_open_canonicalizes_old_sys_tenant_metadata() {
+        let db_path = std::env::temp_dir().join(format!("fluxbee-vault-{}.db", Uuid::new_v4()));
+        let key = [7u8; 32];
+        {
+            let mut store = VaultStore::open(&db_path, &key).expect("open vault store");
+            let caller = Caller {
+                l2_name: Some("SY.admin@motherbee".to_string()),
+                ilk_id: Some("ilk:11111111-1111-4111-8111-111111111111".to_string()),
+                tenant_id: Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID.to_string()),
+                ilk_type: Some("system".to_string()),
+            };
+            let metadata = VaultMetadata {
+                tenant_id: "sys".to_string(),
+                owner_ilk: String::new(),
+                resource_type: Some("postgres".to_string()),
+                ilk: None,
+                description: None,
+                created_by: None,
+                created_at: None,
+                updated_at: None,
+                tags: Vec::new(),
+            };
+            store
+                .put(
+                    "sys:postgres-url",
+                    json!({"postgres_url": "postgresql://sa:pw@127.0.0.1:5432"}),
+                    metadata,
+                    &caller,
+                )
+                .expect("seed old sys tenant record");
+        }
+        {
+            let store = VaultStore::open(&db_path, &key).expect("reopen vault store");
+            let record = store
+                .get_record("sys:postgres-url")
+                .expect("read record")
+                .expect("record exists");
+            assert_eq!(
+                record.metadata.tenant_id,
+                fluxbee_sdk::DEFAULT_ROOT_TENANT_ID
+            );
+            let payload = build_secret_changed_payload(
+                VaultSecretOp::Put,
+                &record.key,
+                &record.metadata,
+                record.version,
+                "motherbee",
+            )
+            .expect("canonical tenant is broadcastable");
+            assert_eq!(payload.tenant_id, fluxbee_sdk::DEFAULT_ROOT_TENANT_ID);
+        }
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = fs::remove_file(db_path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn vault_secret_changed_payload_rejects_noncanonical_tenant() {
+        let metadata = VaultMetadata {
+            tenant_id: "sys".to_string(),
+            owner_ilk: String::new(),
+            resource_type: Some("postgres".to_string()),
+            ilk: None,
+            description: None,
+            created_by: None,
+            created_at: None,
+            updated_at: None,
+            tags: Vec::new(),
+        };
+        assert!(build_secret_changed_payload(
+            VaultSecretOp::Put,
+            "sys:postgres-url",
+            &metadata,
+            1,
+            "motherbee",
+        )
+        .is_none());
     }
 }

@@ -124,12 +124,12 @@ pub fn normalize_resource_type(raw: &str) -> Result<String, String> {
         return Err(format!("resource_type '{raw}' normalized to empty string"));
     }
     if out.chars().all(|c| c.is_ascii_digit()) {
-        return Err(format!("resource_type '{raw}' must contain at least one letter"));
+        return Err(format!(
+            "resource_type '{raw}' must contain at least one letter"
+        ));
     }
     if out.len() > 64 {
-        return Err(format!(
-            "resource_type '{out}' is too long (max 64 chars)"
-        ));
+        return Err(format!("resource_type '{out}' is too long (max 64 chars)"));
     }
     Ok(out)
 }
@@ -855,4 +855,3 @@ fn response_action_for(action: &str) -> &'static str {
         _ => MSG_VAULT_GET_RESPONSE,
     }
 }
-

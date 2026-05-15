@@ -37,7 +37,7 @@ pub use cognition::{
     SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, SUBJECT_STORAGE_COGNITION_THREADS,
 };
 pub use identity::{
-    deterministic_system_ilk_id, identity_shm_name_for_hive, identity_system_call, DEFAULT_ROOT_TENANT_ID,
+    deterministic_system_ilk_id, identity_shm_name_for_hive, identity_system_call,
     identity_system_call_ok, list_ich_options_from_hive_config, list_ich_options_from_hive_id,
     list_ich_options_from_shm_name, load_hive_id, provision_ilk, read_self_ilk_from_env,
     read_self_tenant_from_env, resolve_identity_option_from_hive_config,
@@ -46,10 +46,10 @@ pub use identity::{
     set_ich_enabled, set_tenant_sponsor, update_tenant, IchSetEnabledResponse, IdentityError,
     IdentityIchOption, IdentityIlkOption, IdentityShmError, IdentitySystemRequest,
     IdentitySystemResult, IlkProvisionRequest, IlkProvisionResult, ResolvedIdentityOption,
-    TenantUpdateResponse, ENV_SELF_ILK_ID, ENV_SELF_TENANT_ID, MSG_ICH_SET_ENABLED,
-    MSG_IDENTITY_METRICS, MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION, MSG_ILK_PROVISION_RESPONSE,
-    MSG_ILK_REGISTER, MSG_ILK_SET_DEFINITION, MSG_ILK_UPDATE, MSG_TNT_APPROVE, MSG_TNT_CREATE,
-    MSG_TNT_SET_SPONSOR, MSG_TNT_UPDATE,
+    TenantUpdateResponse, DEFAULT_ROOT_TENANT_ID, ENV_SELF_ILK_ID, ENV_SELF_TENANT_ID,
+    MSG_ICH_SET_ENABLED, MSG_IDENTITY_METRICS, MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION,
+    MSG_ILK_PROVISION_RESPONSE, MSG_ILK_REGISTER, MSG_ILK_SET_DEFINITION, MSG_ILK_UPDATE,
+    MSG_TNT_APPROVE, MSG_TNT_CREATE, MSG_TNT_SET_SPONSOR, MSG_TNT_UPDATE,
 };
 pub use managed_node::{
     managed_node_config_path, managed_node_config_path_with_root, managed_node_instance_dir,
@@ -108,7 +108,7 @@ pub use vault::{
     VaultListResponse, VaultMetadata, VaultPutRequest, VaultPutResponse, VaultRetryPolicy,
     VaultRollbackResponse, VaultRotateRequest, VaultRotateResponse, VaultSecretSummary,
     VaultValueResponse, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET,
-    MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE, MSG_VAULT_LIST,
-    MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE, MSG_VAULT_ROLLBACK,
-    MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
+    MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE,
+    MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE,
+    MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
 };

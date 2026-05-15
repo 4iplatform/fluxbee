@@ -1188,10 +1188,12 @@ pub fn wait_for_self_system_ilk_id(
             Err(err) => last_err = Some(err),
         }
         if started.elapsed() >= timeout {
-            return Err(last_err.unwrap_or_else(|| IdentityShmError::Custom(format!(
-                "self system ILK not visible for handler_node='{handler_node}' after {}ms",
-                timeout.as_millis()
-            ))));
+            return Err(last_err.unwrap_or_else(|| {
+                IdentityShmError::Custom(format!(
+                    "self system ILK not visible for handler_node='{handler_node}' after {}ms",
+                    timeout.as_millis()
+                ))
+            }));
         }
         std::thread::sleep(poll_interval);
     }
@@ -1201,7 +1203,8 @@ pub fn wait_for_self_system_ilk_id(
 /// `SY.identity` seeds the SHM. AI/IO/WF dynamic nodes get their tenant via
 /// `FLUXBEE_NODE_TENANT_ID` env from the orchestrator and may belong to
 /// any `tnt:<uuid>`. Operators reading or writing shared system secrets
-/// should target tenant `"sys"` (which any system-type caller can read).
+/// should target this root tenant; there is no separate `"sys"` tenant
+/// sentinel in the canonical model.
 pub const DEFAULT_ROOT_TENANT_ID: &str = "tnt:00000000-0000-0000-0000-000000000001";
 
 /// Compute the deterministic ILK assigned by `SY.identity` to a system

@@ -27,16 +27,16 @@ use fluxbee_ai_sdk::{
 use fluxbee_sdk::nats::{NatsClient, NatsRequestEnvelope, NatsResponseEnvelope};
 use fluxbee_sdk::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, VaultSecretChangedPayload,
-    VaultSecretInterest, MSG_CONFIG_CHANGED, MSG_VAULT_SECRET_CHANGED,
-    MSG_NODE_STATUS_GET, SCOPE_GLOBAL, SYSTEM_KIND,
+    VaultSecretInterest, MSG_CONFIG_CHANGED, MSG_NODE_STATUS_GET, MSG_VAULT_SECRET_CHANGED,
+    SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, classify_admin_action, classify_system_message, connect,
     derive_action_outcome, try_handle_default_node_status, ClientConfig, NodeConfig, NodeReceiver,
-    NodeSender, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET,
-    MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE,
-    MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE,
-    MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
+    NodeSender, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET, MSG_VAULT_GET_METADATA,
+    MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE, MSG_VAULT_LIST,
+    MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE, MSG_VAULT_ROLLBACK,
+    MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
     NODE_SECRET_REDACTION_TOKEN,
 };
 use json_router::runtime_manifest::{
@@ -851,7 +851,7 @@ fn merged_admin_executor_openai_section(
 }
 
 /// Build the admin executor AI runtime by discovering the `openai` resource
-/// in SY.vault (Model D' pool match: dedicated → tenant pool → sys pool).
+/// in SY.vault (Model D' pool match: dedicated → tenant pool → root pool).
 /// Returns `Ok(None)` (degraded) on any of:
 /// - vault has no openai secret reachable from our (ilk, tenant) match;
 /// - vault unreachable or denies access;
@@ -928,11 +928,7 @@ async fn build_admin_executor_ai_runtime(
 fn admin_executor_extract_openai_api_key(
     value: &serde_json::Value,
 ) -> Result<Option<String>, AdminError> {
-    if let Some(api_key) = value
-        .as_str()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
+    if let Some(api_key) = value.as_str().map(str::trim).filter(|v| !v.is_empty()) {
         return Ok(Some(api_key.to_string()));
     }
     if let Some(api_key) = value
@@ -6410,9 +6406,7 @@ fn build_admin_executor_function_catalog_response(
 /// Model D' — reject any secret-bearing field on the executor CONFIG_SET
 /// surface. OpenAI credentials live entirely in vault under
 /// `resource_type=openai`; the executor resolves them at boot/refresh.
-fn reject_admin_executor_secret_fields(
-    payload: &serde_json::Value,
-) -> Result<(), AdminError> {
+fn reject_admin_executor_secret_fields(payload: &serde_json::Value) -> Result<(), AdminError> {
     let config_root = payload.get("config").unwrap_or(payload);
     let openai = config_root
         .get("ai_providers")
@@ -6536,7 +6530,7 @@ fn build_admin_executor_config_get_payload(
             "resource_type": "openai",
             "required": true,
             "configured": configured,
-            "scope": "pool (tenant or sys)"
+            "scope": "pool (root tenant)"
         }
     ]);
 

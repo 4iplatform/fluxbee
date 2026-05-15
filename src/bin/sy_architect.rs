@@ -54,10 +54,9 @@ use fluxbee_sdk::protocol::{
     MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    admin_command, build_node_config_response_message, connect,
-    list_ich_options_from_hive_config, try_handle_default_node_status, AdminCommandRequest,
-    IdentityIchOption, NodeConfig, NodeError, NodeReceiver, NodeSender,
-    NODE_SECRET_REDACTION_TOKEN,
+    admin_command, build_node_config_response_message, connect, list_ich_options_from_hive_config,
+    try_handle_default_node_status, AdminCommandRequest, IdentityIchOption, NodeConfig, NodeError,
+    NodeReceiver, NodeSender, NODE_SECRET_REDACTION_TOKEN,
 };
 use futures::TryStreamExt;
 use json_router::runtime_manifest::{
@@ -4865,13 +4864,15 @@ async fn main() -> Result<(), ArchitectError> {
     .await;
     let initial_messages_db_configured = initial_messages_db_url.is_some();
     let initial_messages_db = match initial_messages_db_url.as_deref() {
-        Some(url) => match messages_db::MessagesDb::connect(url, ARCHITECT_MESSAGES_DB_NAME).await {
-            Ok(client) => Some(Arc::new(client)),
-            Err(err) => {
-                tracing::warn!(error = %err, "messages_db connect at boot failed; viewer disabled until reconfigured");
-                None
+        Some(url) => {
+            match messages_db::MessagesDb::connect(url, ARCHITECT_MESSAGES_DB_NAME).await {
+                Ok(client) => Some(Arc::new(client)),
+                Err(err) => {
+                    tracing::warn!(error = %err, "messages_db connect at boot failed; viewer disabled until reconfigured");
+                    None
+                }
             }
-        },
+        }
         None => None,
     };
     let state = Arc::new(ArchitectState {
@@ -5210,15 +5211,17 @@ async fn refresh_architect_messages_db_url(state: &ArchitectState) -> (bool, boo
     let url_present = url.is_some();
     let mut connect_error: Option<String> = None;
     let new_client = match url.as_deref() {
-        Some(url) => match messages_db::MessagesDb::connect(url, ARCHITECT_MESSAGES_DB_NAME).await {
-            Ok(client) => Some(Arc::new(client)),
-            Err(err) => {
-                let err_text = err.to_string();
-                tracing::warn!(error = %err_text, "messages_db connect failed; viewer disabled until reconfigured");
-                connect_error = Some(err_text);
-                None
+        Some(url) => {
+            match messages_db::MessagesDb::connect(url, ARCHITECT_MESSAGES_DB_NAME).await {
+                Ok(client) => Some(Arc::new(client)),
+                Err(err) => {
+                    let err_text = err.to_string();
+                    tracing::warn!(error = %err_text, "messages_db connect failed; viewer disabled until reconfigured");
+                    connect_error = Some(err_text);
+                    None
+                }
             }
-        },
+        }
         None => None,
     };
     let connected = new_client.is_some();
@@ -9885,13 +9888,13 @@ async fn handle_architect_local_config_get(
             "resource_type": "openai",
             "required": true,
             "configured": configured,
-            "scope": "pool (tenant or sys)"
+            "scope": "pool (root tenant)"
         },
         {
             "resource_type": "postgres",
             "required": false,
             "configured": messages_db_configured,
-            "scope": "pool (tenant or sys)",
+            "scope": "pool (root tenant)",
             "consumer_dbname": ARCHITECT_MESSAGES_DB_NAME,
             "purpose": "messages log viewer"
         }
@@ -15512,7 +15515,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
             <p class="messages-unconfigured-label">Operator flow (Phase J' — vault):</p>
             <code>curl -sS -X POST http://MOTHERBEE:8080/hives/HIVE/vault/secrets \
   -H 'Content-Type: application/json' \
-  -d '{{"key":"postgres-shared","value":"postgresql://USER:PASS@HOST:5432","metadata":{{"resource_type":"postgres","tenant_id":"sys"}}}}'</code>
+  -d '{{"key":"postgres-shared","value":"postgresql://USER:PASS@HOST:5432","metadata":{{"resource_type":"postgres","tenant_id":"tnt:00000000-0000-0000-0000-000000000001"}}}}'</code>
             <p>Then restart archi. It will pick up the secret from the pool, append its dbname, and connect.</p>
           </div>
         </div>

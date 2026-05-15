@@ -1198,7 +1198,12 @@ async fn load_rebuild_snapshot_from_storage(
     base_database_url: &str,
 ) -> Result<RebuildSnapshot, CognitionError> {
     let base_config: PgConfig = base_database_url.parse()?;
-    if !base_config.get_dbname().map(str::trim).unwrap_or("").is_empty() {
+    if !base_config
+        .get_dbname()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
         return Err(format!(
             "postgres secret must not include a dbname (got '{}'); load only credentials + host (postgresql://user:pass@host:port)",
             base_config.get_dbname().unwrap_or("")
@@ -1560,7 +1565,12 @@ fn row_payload<T: for<'de> Deserialize<'de>>(row: &Row) -> Result<T, CognitionEr
 /// resource is reachable from cognition's (ilk, tenant) pool match.
 /// Credentials + host only; each consumer adds the dbname.
 async fn resolve_storage_database_url(app_state: &CognitionAppState) -> Option<String> {
-    resolve_cognition_resource(app_state, fluxbee_sdk::ResourceType::Postgres, "postgres_url").await
+    resolve_cognition_resource(
+        app_state,
+        fluxbee_sdk::ResourceType::Postgres,
+        "postgres_url",
+    )
+    .await
 }
 
 async fn resolve_cognition_openai_api_key(app_state: &CognitionAppState) -> Option<String> {
@@ -2224,14 +2234,14 @@ fn build_cognition_config_get_payload(
             "resource_type": "openai",
             "required": true,
             "configured": configured,
-            "scope": "pool (tenant or sys)",
+            "scope": "pool (root tenant)",
             "purpose": "semantic tagger + narrative summarizer"
         },
         {
             "resource_type": "postgres",
             "required": false,
             "configured": null,
-            "scope": "pool (tenant or sys)",
+            "scope": "pool (root tenant)",
             "consumer_dbname": "fluxbee_storage",
             "purpose": "cognition rebuild snapshot from storage durable tables (probed on demand)"
         }
@@ -2545,9 +2555,7 @@ fn config_error_response(
 fn cognition_state_label(control_state: &CognitionControlState) -> &'static str {
     match control_state.ai_secret_source {
         CognitionAiSecretSource::Missing => "degraded_no_ai_provider",
-        CognitionAiSecretSource::LocalFile => {
-            "ready_semantic_ai"
-        }
+        CognitionAiSecretSource::LocalFile => "ready_semantic_ai",
     }
 }
 
@@ -4243,7 +4251,6 @@ fn update_ema(current: f64, new_value: f64, alpha: f64) -> f64 {
         alpha * new_value + (1.0 - alpha) * current
     }
 }
-
 
 fn load_hive(config_dir: &Path) -> Result<HiveFile, CognitionError> {
     let path = config_dir.join("hive.yaml");

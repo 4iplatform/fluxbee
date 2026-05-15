@@ -2144,7 +2144,12 @@ impl GenericAiNode {
         // Model D' — vault is the only source. Reports `vault` when
         // self_ilk_id is resolved (frontdesk-gov is a system node whose
         // tenant is DEFAULT_ROOT_TENANT_ID); reports `missing` otherwise.
-        let api_key_source = if self.self_ilk_id.as_deref().filter(|v| !v.is_empty()).is_some() {
+        let api_key_source = if self
+            .self_ilk_id
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .is_some()
+        {
             OpenAiApiKeySource::Vault
         } else {
             OpenAiApiKeySource::Missing

@@ -233,7 +233,8 @@ async fn main() -> Result<(), StorageError> {
     let socket_dir = json_router::paths::router_socket_dir();
     let state_dir = json_router::paths::state_dir();
     // SY.storage is a system node; its tenant is the hive's root tenant.
-    // For Model D' pool match, both that tenant and `sys` are searched.
+    // Model D' pool match searches that tenant; there is no `sys` tenant
+    // sentinel in the canonical model.
     let my_tenant = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
     let (database_url, db_secret_source, vault_lookup_error) = resolve_database_url(
         &config_dir,
@@ -2437,9 +2438,7 @@ async fn resolve_database_url(
             None => (
                 None,
                 StorageDbSecretSource::Missing,
-                Some(
-                    "vault postgres secret did not carry a usable URL value".to_string(),
-                ),
+                Some("vault postgres secret did not carry a usable URL value".to_string()),
             ),
         },
         Ok(None) => (None, StorageDbSecretSource::Missing, None),
@@ -2873,7 +2872,7 @@ async fn connect_with_retry(
 }
 
 /// Handle a `VAULT_SECRET_CHANGED` broadcast from SY.vault. If the event
-/// matches our interest (postgres, our tenant or sys pool), we auto-restart
+/// matches our interest (postgres in our root-tenant pool), we auto-restart
 /// the process via `exit(0)` so systemd reboots us and we pick up the
 /// freshly-published secret cleanly. This is the canonical way Model D'
 /// closes the "boot without secret → secret arrives later" race that
@@ -3150,7 +3149,7 @@ fn build_storage_config_get_payload(
             "resource_type": "postgres",
             "required": true,
             "configured": configured,
-            "scope": "pool (tenant or sys)",
+            "scope": "pool (root tenant)",
             "consumer_dbname": STORAGE_DB_NAME
         }
     ]);
@@ -3292,7 +3291,7 @@ fn apply_storage_config_set(
             "resource_type": "postgres",
             "required": true,
             "configured": control_state.secret_source != StorageDbSecretSource::Missing,
-            "scope": "pool (tenant or sys)",
+            "scope": "pool (root tenant)",
             "consumer_dbname": STORAGE_DB_NAME
         }],
         "notes": [
