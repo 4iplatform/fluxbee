@@ -4911,7 +4911,7 @@ fn build_identity_config_get_payload(
                 "resource_type": "postgres",
                 "required": true,
                 "configured": configured,
-                "scope": "pool (root tenant)",
+                "scope": "pool (tenant or sys)",
                 "consumer_dbname": IDENTITY_DB_NAME
             }
         ])
@@ -5095,7 +5095,7 @@ fn identity_config_error_response(
 
 /// Model D' — resolve identity's Postgres credentials by discovering the
 /// `postgres` resource in SY.vault (pool match: dedicated → tenant pool →
-/// root-tenant pool). Connects an ephemeral SDK client because identity's own
+/// sys pool). Connects an ephemeral SDK client because identity's own
 /// router connection hasn't been built yet at boot. Returns
 /// `Ok((None, Missing))` if vault has no postgres secret reachable from
 /// our (ilk, tenant) match rules. Returns `Ok((None, last_error))` with

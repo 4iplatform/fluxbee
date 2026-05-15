@@ -1203,8 +1203,7 @@ pub fn wait_for_self_system_ilk_id(
 /// `SY.identity` seeds the SHM. AI/IO/WF dynamic nodes get their tenant via
 /// `FLUXBEE_NODE_TENANT_ID` env from the orchestrator and may belong to
 /// any `tnt:<uuid>`. Operators reading or writing shared system secrets
-/// should target this root tenant; there is no separate `"sys"` tenant
-/// sentinel in the canonical model.
+/// should target tenant `"sys"` (which any system-type caller can read).
 pub const DEFAULT_ROOT_TENANT_ID: &str = "tnt:00000000-0000-0000-0000-000000000001";
 
 /// Compute the deterministic ILK assigned by `SY.identity` to a system

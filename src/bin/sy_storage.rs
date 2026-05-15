@@ -2872,7 +2872,7 @@ async fn connect_with_retry(
 }
 
 /// Handle a `VAULT_SECRET_CHANGED` broadcast from SY.vault. If the event
-/// matches our interest (postgres in our root-tenant pool), we auto-restart
+/// matches our interest (postgres in our sys pool), we auto-restart
 /// the process via `exit(0)` so systemd reboots us and we pick up the
 /// freshly-published secret cleanly. This is the canonical way Model D'
 /// closes the "boot without secret → secret arrives later" race that
@@ -3149,7 +3149,7 @@ fn build_storage_config_get_payload(
             "resource_type": "postgres",
             "required": true,
             "configured": configured,
-            "scope": "pool (root tenant)",
+            "scope": "pool (tenant or sys)",
             "consumer_dbname": STORAGE_DB_NAME
         }
     ]);
@@ -3291,7 +3291,7 @@ fn apply_storage_config_set(
             "resource_type": "postgres",
             "required": true,
             "configured": control_state.secret_source != StorageDbSecretSource::Missing,
-            "scope": "pool (root tenant)",
+            "scope": "pool (tenant or sys)",
             "consumer_dbname": STORAGE_DB_NAME
         }],
         "notes": [
