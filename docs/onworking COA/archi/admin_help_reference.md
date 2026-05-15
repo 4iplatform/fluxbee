@@ -264,10 +264,10 @@ POST /hives/motherbee/identity/ilks/ilk:ai-support/definition
 - **Descripción:** Escribe o actualiza un secret en `SY.vault`; el valor se cifra at-rest y se audita localmente.
 - **Read-only:** no | **Requiere CONFIRM:** sí
 - **Campos requeridos:** `key` (string), `value` (object), `metadata` (object)
-- **Metadata mínima:** `metadata.tenant_id` (`sys` o `tnt:<uuid>`), `metadata.owner_ilk` (`ilk:<uuid>`)
+- **Metadata mínima:** `metadata.tenant_id` (siempre `tnt:<uuid>`; para secrets de infraestructura usar el root tenant fijo `tnt:00000000-0000-0000-0000-000000000001`), `metadata.owner_ilk` (`ilk:<uuid>`)
 - **Executor args:** planos en `step.args`; no usar `body`.
 - **Nota crítica:** `value` es sensible y debe quedar redacted en previews, history y logs. PUT con el mismo valor es idempotente y no incrementa versión.
-- **Ejemplo:** `POST /hives/motherbee/vault/secrets {"key":"sys:openai-api-key","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"sys","owner_ilk":"ilk:550e8400-e29b-41d4-a716-446655440000"}}`
+- **Ejemplo:** `POST /hives/motherbee/vault/secrets {"key":"sys:openai-api-key","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"tnt:00000000-0000-0000-0000-000000000001","owner_ilk":"ilk:550e8400-e29b-41d4-a716-446655440000"}}`
 
 ### `vault_get_metadata`
 - **Path:** `GET /hives/{hive}/vault/secrets/{key}/metadata`

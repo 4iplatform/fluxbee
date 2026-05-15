@@ -1671,8 +1671,10 @@ impl GenericAiNode {
     }
 
     /// Model D' — resolve the OpenAI api_key by discovering the `openai`
-    /// resource in SY.vault (pool match: dedicated to caller ILK → tenant
-    /// pool → sys pool). This is the **only** supported source. The
+    /// resource in SY.vault (pool match: dedicated to caller ILK → caller
+    /// tenant pool → root tenant pool, i.e.
+    /// `tnt:00000000-0000-0000-0000-000000000001`). This is the **only**
+    /// supported source. The
     /// legacy alternatives (`api_key` plaintext, env var, YAML inline,
     /// effective_config) were removed in Phase J' / VA-J6.
     ///

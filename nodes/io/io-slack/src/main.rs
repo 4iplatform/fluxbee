@@ -634,10 +634,11 @@ fn resolve_secret(doc: Option<&Value>, value_paths: &[&str], ref_paths: &[&str])
 const IO_SLACK_VAULT_REFRESH_INTERVAL_SECS: u64 = 60;
 
 /// Model D' — resolve the Slack credentials by discovering the `slack`
-/// resource in SY.vault (pool match: dedicated to caller ILK → tenant pool
-/// → sys pool). The vault value is expected to be an object with both
-/// `app_token` and `bot_token` fields. Returns `Some((app_token, bot_token))`
-/// when both are present and non-empty, else `None` (degraded).
+/// resource in SY.vault (pool match: dedicated to caller ILK → caller tenant
+/// pool → root tenant pool, i.e. `tnt:00000000-0000-0000-0000-000000000001`).
+/// The vault value is expected to be an object with both `app_token` and
+/// `bot_token` fields. Returns `Some((app_token, bot_token))` when both are
+/// present and non-empty, else `None` (degraded).
 async fn resolve_slack_credentials_from_vault(
     config: &Config,
     self_ilk_id: &str,

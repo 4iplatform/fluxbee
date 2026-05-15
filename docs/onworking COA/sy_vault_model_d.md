@@ -33,7 +33,7 @@ struct VaultSecret {
 
     metadata: VaultMetadata {
         resource_type: String,      // REQUIRED. canonical normalized form (see §5)
-        tenant_id: String,          // REQUIRED. "sys" | "tnt:<uuid>"
+        tenant_id: String,          // REQUIRED. always "tnt:<uuid>". Infra-wide secrets live in the fixed root tenant `tnt:00000000-0000-0000-0000-000000000001` (alias "fluxbee").
         ilk: Option<String>,        // null = pool, "ilk:<uuid>" = dedicated
         description: Option<String>,
         tags: Vec<String>,
@@ -51,7 +51,7 @@ struct VaultSecret {
 
 - **`resource_type`**: REQUIRED on PUT. Canonical normalized form: lowercase, words joined by `_`. Examples: `openai`, `anthropic`, `postgres`, `google_calendar`, `slack`, `hubspot`. Admin normalizes operator-provided strings before forwarding to vault. See §5 for the enum.
 
-- **`tenant_id`**: REQUIRED. `sys` for hive-level / system-level resources, `tnt:<uuid>` for per-tenant resources. Operator may omit on PUT and admin defaults to `sys`. Tenant association is part of the cost model — every secret belongs to a tenant.
+- **`tenant_id`**: REQUIRED. Always `tnt:<uuid>` — there is no `sys` sentinel. Infrastructure-wide / hive-level resources live in the fixed root tenant `tnt:00000000-0000-0000-0000-000000000001` (alias `fluxbee`, seeded by SY.identity at bootstrap). Per-tenant resources use that tenant's own `tnt:<uuid>`. Operator may omit `tenant_id` on PUT and admin defaults to the root tenant. Tenant association is part of the cost model — every secret belongs to a tenant.
 
 - **`ilk`**: OPTIONAL. If set, the secret is **dedicated** to that ILK; only that ILK can read its plaintext. If `null`, the secret is in the **pool** of the tenant and any caller of the same tenant can read it.
 
@@ -73,19 +73,19 @@ curl -X POST http://127.0.0.1:8080/hives/motherbee/vault/secrets \
     "value": {"api_key": "sk-..."},
     "metadata": {
       "resource_type": "openai",
-      "tenant_id": "sys"
+      "tenant_id": "tnt:00000000-0000-0000-0000-000000000001"
     }
   }'
 ```
 
-That single put publishes an OpenAI key in the `sys` pool. Every system node in the hive that needs OpenAI will pick it up on its next refresh. No CONFIG_SET to architect, cognition, or admin is needed.
+That single put publishes an OpenAI key in the root-tenant pool. Every system node in the hive that needs OpenAI will pick it up on its next refresh. No CONFIG_SET to architect, cognition, or admin is needed. (If `tenant_id` is omitted, admin defaults to the fixed root tenant.)
 
 If the operator wants to dedicate it to one node, they add `"owner_node": "SY.cognition"` and admin resolves it to the deterministic ILK before forwarding to vault. Example:
 
 ```json
 "metadata": {
     "resource_type": "openai",
-    "tenant_id": "sys",
+    "tenant_id": "tnt:00000000-0000-0000-0000-000000000001",
     "owner_node": "SY.cognition"
 }
 ```
@@ -173,7 +173,7 @@ The node's CONFIG_GET response includes:
     "postgres": {
       "resolved": false,
       "source": null,
-      "error": "no secret with resource_type=postgres and (ilk=ilk:<self> or pool) in tenant sys"
+      "error": "no secret with resource_type=postgres and (ilk=ilk:<self> or pool) in tenant tnt:00000000-0000-0000-0000-000000000001"
     }
   }
 }
