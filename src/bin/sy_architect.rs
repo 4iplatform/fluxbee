@@ -9888,13 +9888,13 @@ async fn handle_architect_local_config_get(
             "resource_type": "openai",
             "required": true,
             "configured": configured,
-            "scope": "pool (tenant or sys)"
+            "scope": "pool (tenant or root)"
         },
         {
             "resource_type": "postgres",
             "required": false,
             "configured": messages_db_configured,
-            "scope": "pool (tenant or sys)",
+            "scope": "pool (tenant or root)",
             "consumer_dbname": ARCHITECT_MESSAGES_DB_NAME,
             "purpose": "messages log viewer"
         }
@@ -15515,7 +15515,7 @@ fn architect_index_html(state: &ArchitectState) -> String {
             <p class="messages-unconfigured-label">Operator flow (Phase J' — vault):</p>
             <code>curl -sS -X POST http://MOTHERBEE:8080/hives/HIVE/vault/secrets \
   -H 'Content-Type: application/json' \
-  -d '{{"key":"postgres-shared","value":"postgresql://USER:PASS@HOST:5432","metadata":{{"resource_type":"postgres","tenant_id":"sys"}}}}'</code>
+  -d '{{"key":"postgres-shared","value":"postgresql://USER:PASS@HOST:5432","metadata":{{"resource_type":"postgres","tenant_id":"tnt:00000000-0000-0000-0000-000000000001"}}}}'</code>
             <p>Then restart archi. It will pick up the secret from the pool, append its dbname, and connect.</p>
           </div>
         </div>

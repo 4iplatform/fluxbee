@@ -214,7 +214,7 @@ Key text is not authoritative for authorization. Authorization uses `metadata.te
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `tenant_id` | string | Yes | Canonical tenant the secret belongs to. Must be `tnt:<uuid>` or `sys`. Used for authorization. |
+| `tenant_id` | string | Yes | Canonical tenant the secret belongs to. Must be `tnt:<uuid>`. Infrastructure-wide secrets use the fixed Fluxbee root tenant `tnt:00000000-0000-0000-0000-000000000001`. Used for authorization. |
 | `owner_ilk` | string | Yes | ILK that "owns" the secret (typically the consumer). |
 | `description` | string | No | Free-text description for humans. |
 | `created_by` | string | Auto-filled | ILK that created the secret (from canonical `meta.src_ilk`). |
@@ -280,7 +280,7 @@ Create or update a secret.
 }
 ```
 
-`tenant_id` and `owner_ilk` are required in metadata. `tenant_id` must be `tnt:<uuid>` or `sys`. `created_by` is auto-filled from canonical `meta.src_ilk` and rejects any value provided in the request.
+`tenant_id` and `owner_ilk` are required in metadata. `tenant_id` must be `tnt:<uuid>`; infrastructure-wide secrets use the fixed Fluxbee root tenant `tnt:00000000-0000-0000-0000-000000000001`. `created_by` is auto-filled from canonical `meta.src_ilk` and rejects any value provided in the request.
 
 **Response (success):**
 ```json
@@ -494,7 +494,7 @@ Allowed if:
 - `meta.src_ilk == metadata.owner_ilk` (owner reads their own secret), OR
 - caller tenant resolved from identity SHM equals `metadata.tenant_id` AND caller `ilk_type == "system"` (system nodes within the same tenant can read tenant secrets).
 
-For `system` secrets (`tenant_id == "sys"`), only admin and architect can read.
+For infrastructure-wide system secrets, use the fixed Fluxbee root tenant; read access is still enforced by vault policy.
 
 **VAULT_LIST:**
 

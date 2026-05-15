@@ -35,7 +35,7 @@ Vault reads identity SHM by canonical `meta.src_ilk` to resolve caller `tenant_i
 
 ### D2. Tenant IDs and keys
 
-Secret metadata uses `tenant_id = tnt:<uuid> | sys`. Key text may use human-readable slugs, but authorization never parses tenant identity from the key.
+Secret metadata uses canonical `tenant_id = tnt:<uuid>`. Infrastructure-wide secrets use the fixed Fluxbee root tenant `tnt:00000000-0000-0000-0000-000000000001`. Key text may use human-readable slugs, but authorization never parses tenant identity from the key.
 
 ### D3. Audit storage
 
@@ -115,7 +115,7 @@ Default `vault_get_with_retry` policy:
 
 - [x] VA-A1. Update `docs/sy-vault-spec.md` to match current protocol fields: `routing.src_l2_name` and `meta.src_ilk`.
 - [x] VA-A2. Decide and document caller tenant resolution: identity SHM read by `meta.src_ilk`.
-- [x] VA-A3. Clarify metadata tenant format: `tenant_id = tnt:<uuid> | sys`.
+- [x] VA-A3. Clarify metadata tenant format: `tenant_id = tnt:<uuid>`; infrastructure-wide secrets use the fixed Fluxbee root tenant.
 - [x] VA-A4. Clarify key naming: key text is operator-facing and not authoritative for authorization.
 - [x] VA-A5. Resolve PUT idempotency vs audit contradiction: no version increment, audit as `noop`.
 - [x] VA-A6. Define max secret value size in one place. Initial hard limit: 1 MiB.
@@ -183,7 +183,7 @@ Default `vault_get_with_retry` policy:
 - [x] VA-D3. Implement admin override for `SY.admin@*` and `SY.architect@*`.
 - [x] VA-D4. Implement owner authorization: caller `meta.src_ilk == metadata.owner_ilk`.
 - [x] VA-D5. Implement same-tenant system authorization if caller is `system` ILK.
-- [x] VA-D6. For `tenant_id = sys`, allow only admin/architect.
+- [x] VA-D6. For infrastructure-wide secrets in the fixed Fluxbee root tenant, enforce vault policy authorization.
 - [x] VA-D7a. Prevent key enumeration for `VAULT_GET`.
 - [x] VA-D7b. Prevent key enumeration for `VAULT_LIST`.
 - [ ] VA-D8. Unit-test allowed/denied matrix.
@@ -442,7 +442,7 @@ Los Go SY actuales (`sy-timer`, `sy-opa-rules`, `sy-wf-rules`) no necesitan vaul
 - [x] VA-J'-1a. Mover `deterministic_system_ilk_id` de `src/bin/sy_identity.rs` a `crates/fluxbee_sdk/src/identity.rs`. Re-export. Actualizar todos los callers (sy_identity, sy_admin's `normalize_vault_put_payload`, y los nuevos use sites en sy_vault). **Hecho** — vive en SDK + `DEFAULT_ROOT_TENANT_ID` también.
 - [x] VA-J'-1b. Agregar `enum ResourceType` + `normalize_resource_type(&str) -> Result<String>` en `crates/fluxbee_sdk/src/vault.rs`. Tests unitarios de normalización. **Hecho** — enum con Serialize/Deserialize manual como string canonical.
 - [x] VA-J'-1c. Agregar `VaultPutRequest` / `VaultListRequest` actualizados al schema del modelo D' (`resource_type` requerido, `ilk` opcional, `owner_ilk` eliminado). **Hecho** — `VaultFilter` y `VaultMetadata` extendidos.
-- [x] VA-J'-1d. Agregar SDK helper `fluxbee_sdk::vault::resolve_resource(sender, receiver, caller, hive, resource_type, my_tenant, timeout) -> Result<Option<Value>>` que implementa el match path (owned → tenant pool → sys pool → None). Es la API canónica que los nodos consumer usan. **Hecho**.
+- [x] VA-J'-1d. Agregar SDK helper `fluxbee_sdk::vault::resolve_resource(sender, receiver, caller, hive, resource_type, my_tenant, timeout) -> Result<Option<Value>>` que implementa el match path (owned → tenant pool → root-tenant pool → None). Es la API canónica que los nodos consumer usan. **Hecho**.
 - [x] VA-J'-1e. Borrar `parse_vault_ref` y `resolve_vault_ref` (modelo viejo) o marcarlos como deprecated si quedan callers transitorios. En modelo D' los nodos no manejan refs. **Hecho** — funciones + tests borrados de `crates/fluxbee_sdk/src/vault.rs`; re-exports limpiados en `lib.rs` y `prelude.rs`. `VAULT_REF_PREFIX` se mantiene porque `vault_get_with_retry` lo acepta defensivamente como fallback (no daña).
 
 ### J'-2. sy_vault: schema + auth
@@ -459,7 +459,7 @@ Los Go SY actuales (`sy-timer`, `sy-opa-rules`, `sy-wf-rules`) no necesitan vaul
 
 ### J'-3. sy_admin HTTP layer
 
-- [x] VA-J'-3a. Reescribir `normalize_vault_put_payload`: ahora normaliza `resource_type` (string libre → canonical), defaultea `tenant_id` a `sys` si falta, resuelve `owner_node` → `ilk` (no `owner_ilk`). `metadata.owner_ilk` legacy queda **rechazado** con `INVALID_REQUEST` (forzar a usar `owner_node` o nada). **Hecho**.
+- [x] VA-J'-3a. Reescribir `normalize_vault_put_payload`: ahora normaliza `resource_type` (string libre → canonical), defaultea `tenant_id` al tenant raíz fijo de Fluxbee si falta, resuelve `owner_node` → `ilk` (no `owner_ilk`). `metadata.owner_ilk` legacy queda **rechazado** con `INVALID_REQUEST` (forzar a usar `owner_node` o nada). **Hecho**.
 - [x] VA-J'-3b. Borrar `extract_admin_executor_openai_api_key_ref` y los helpers relacionados — admin ya no recibe refs por CONFIG_SET. **Hecho** — reemplazado por `reject_admin_executor_secret_fields`.
 - [x] VA-J'-3c. Adaptar `apply_admin_executor_config_set` para que CONFIG_SET de admin solo gestione config no-secreta (catalog mode/actions, model defaults, etc.) — los secrets se cargan via `vault_put`. **Hecho**.
 
@@ -486,7 +486,7 @@ Para cada nodo consumer, el patrón es:
 
 - [x] VA-J'-6a. `REQUIRED_RESOURCES = [(Postgres, "database.postgres_url")]`. Borrar `IDENTITY_LOCAL_REF_KEY_POSTGRES_URL` y persist/load equivalentes. **Hecho** — constante y helpers borrados.
 - [x] VA-J'-6b. `apply_identity_config_set`: borrar manejo de `postgres_url_ref`. CONFIG_SET queda solo para config no-secreta (si aplica). **Hecho** — rechaza secret-bearing fields.
-- [x] VA-J'-6c. Boot path para resolver Postgres: usar `resolve_resource(Postgres, my_self_ilk_deterministic, "sys")`. El operador asigna el secret a identity vía `owner_node: "SY.identity"` (que admin resuelve a `identity_ilk_deterministic`). Match directo sin SHM resolution. **Hecho** — usa `DEFAULT_ROOT_TENANT_ID` como tenant, el match sys-pool universal cubre el caso por defecto.
+- [x] VA-J'-6c. Boot path para resolver Postgres: usar `resolve_resource(Postgres, my_self_ilk_deterministic, DEFAULT_ROOT_TENANT_ID)`. El operador asigna el secret a identity vía `owner_node: "SY.identity"` (que admin resuelve a `identity_ilk_deterministic`). Match directo sin SHM resolution. **Hecho**.
 - [x] VA-J'-6d. Refresh loop como storage. **Superseded por VA-J'-13.** Polling loop borrado; identity reacciona al broadcast con `exit(0)`.
 - [x] VA-J'-6e. CONFIG_GET reporta `resources.postgres`. **Hecho**.
 - [ ] VA-J'-6f. E2E: operador `vault_put` con `resource_type=postgres, tenant=sys, owner_node="SY.identity"` → restart identity → DB ready. **Pendiente test en VM**.
@@ -586,7 +586,7 @@ Tareas:
 Después de J'-13 quedó una dependencia residual entre vault e identity al boot que rompía el reorden vault-first en `hive.yaml`:
 
 1. **`wait_for_self_system_ilk_id`** bloqueaba vault hasta que identity escribiera SHM con vault's own ILK. Solo se usaba para loggear (descartado con `let _self_ilk_id`).
-2. **`list_ilks_from_hive_config` en `resolve_caller`** poblaba `caller.tenant_id` y `caller.ilk_type` desde SHM. La regla "sys-pool universal" en `authorize_read` requería `caller.ilk_type == "system"` (vía SHM) → si identity arrancaba después de vault, los SY callers no podían leer pool secrets hasta que identity hubiera escrito SHM.
+2. **`list_ilks_from_hive_config` en `resolve_caller`** poblaba `caller.tenant_id` y `caller.ilk_type` desde SHM. La regla de root-tenant pool universal en `authorize_read` requería `caller.ilk_type == "system"` (vía SHM) → si identity arrancaba después de vault, los SY callers no podían leer pool secrets hasta que identity hubiera escrito SHM.
 
 **Fix aplicado:**
 
@@ -607,13 +607,13 @@ Y los consumers (identity incluido) pueden leer su postgres pool secret al boot 
 
 - [x] VA-J'-13b-1. Reemplazar `wait_for_self_system_ilk_id` por `deterministic_system_ilk_id(&node_name)` en sy_vault.rs.
 - [x] VA-J'-13b-2. Función `compute_well_known_system_ilks(config_dir, hive_id, self_ilk, admin_set)` que lee `system_nodes.<role>.nodes` de hive.yaml y mapea con `deterministic_system_ilk_id`.
-- [x] VA-J'-13b-3. `authorize_read` toma `well_known_system_ilks` y lo usa para sys-pool universal sin requerir SHM.
+- [x] VA-J'-13b-3. `authorize_read` toma `well_known_system_ilks` y lo usa para root-tenant pool universal sin requerir SHM.
 - [x] VA-J'-13b-4. `handle_vault_message` propaga el set a `handle_get`. `handle_put/rotate/delete/rollback` no necesitan (solo well_known_admin_ilks).
 - [x] VA-J'-13b-5. **Self-ILK determinístico propagado a los 7 SY nodes restantes** (sy_config_routes, sy_admin, sy_architect, sy_storage, sy_cognition, sy_policy, ai-frontdesk-gov). Antes solo vault e identity computaban su propio ILK localmente; los demás esperaban hasta 30s a que identity escribiera SHM. Ahora todos los SY arrancan self-contained: `let self_ilk_id = deterministic_system_ilk_id(&node_name)`. Cero functional change (mismo valor de ILK) + cero wait al boot.
 - [x] VA-J'-13c-1. **Sentinel `"sys"` eliminado.** Toda referencia a `tenant_id = "sys"` reemplazada por `DEFAULT_ROOT_TENANT_ID` (`tnt:00000000-0000-0000-0000-000000000001`, alias `fluxbee`). Cambios: SDK (`resolve_resource`, `VaultSecretChangedPayload::matches_interest`, `read_self_tenant_from_env`), sy_vault (`authorize_read`, `validate_metadata`), sy_admin (default + docstrings + ejemplos + test fixture), handbook §4.5. Modelo conceptual más simple: todos los `tenant_id` siguen `tnt:<uuid>`, sin sentinels. Los secrets de infraestructura viven en el tenant raíz, los de clientes en sus tenants respectivos.
 - [x] VA-J'-13c-2. **Bootstrap broadcast on vault boot.** `emit_bootstrap_secret_broadcasts` corre una vez después de que vault conecta al router y antes del receive loop, emitiendo un `VAULT_SECRET_CHANGED { op=put }` por cada secret en vault.db.
 - [x] VA-J'-13c-3. **Orden de arranque INVERTIDO: vault al final.** El router (`src/router/mod.rs:1066`) entrega broadcasts **solo a nodos registrados al momento del envío** — no hay buffering para nodos futuros. Si vault arranca primero y emite bootstrap, los broadcasts se pierden porque ningún consumer está aún en el registry. Solución: vault arranca **al final** de los SY system nodes en `hive.yaml` y en `INSTALL_RESTART_SERVICES`. Todos los consumers ya están registrados cuando vault emite. La validación del orchestrator (`validate_system_nodes`) ahora exige `consumer_idx < vault_idx`. Consumers toleran `VAULT_UNAVAILABLE` durante su lookup inicial (quedan degraded), el bootstrap broadcast los rescata cuando vault arranca.
-- [ ] VA-J'-13b-6. Test unitario: caller con ILK en `well_known_system_ilks` y SHM vacía puede leer un secret con `tenant_id=sys, ilk=null`. **Pendiente.**
+- [ ] VA-J'-13b-6. Test unitario: caller con ILK en `well_known_system_ilks` y SHM vacía puede leer un secret con `tenant_id=DEFAULT_ROOT_TENANT_ID, ilk=null`. **Pendiente.**
 
 ### J'-13. Vault broadcast de cambios de secret — **implementado 2026-05-14**
 
@@ -639,7 +639,7 @@ Y los consumers (identity incluido) pueden leer su postgres pool secret al boot 
      "event": "vault_secret_changed",
      "op": "put | rotate | delete",
      "resource_type": "openai | postgres | slack | ...",
-     "tenant_id": "sys",
+     "tenant_id": "tnt:00000000-0000-0000-0000-000000000001",
      "ilk": null,
      "version": 7,
      "key": "sys:openai-api-key",
@@ -649,7 +649,7 @@ Y los consumers (identity incluido) pueden leer su postgres pool secret al boot 
    ```
 
    El payload NO contiene el plaintext del secret — solo metadata. Los consumers reciben el evento, hacen `vault_get` ellos mismos si les interesa.
-2. **Filtro de suscripción.** Cada consumer se suscribe filtrando por `(resource_type, tenant_id, ilk?)` que le interesa, igual que hace en `resolve_resource` al boot. Ej: storage se suscribe a `(postgres, sys, null|<self_ilk>)`.
+2. **Filtro de suscripción.** Cada consumer se suscribe filtrando por `(resource_type, tenant_id, ilk?)` que le interesa, igual que hace en `resolve_resource` al boot. Ej: storage se suscribe a `(postgres, DEFAULT_ROOT_TENANT_ID, null|<self_ilk>)`.
 3. **Handler en cada consumer.** Al recibir el evento, el consumer:
    - Refresca el secret con `resolve_resource(...)` (mismo path que ya tienen).
    - **Reconstruye el runtime** que dependía del secret. Para admin/architect/cognition esto ya está implementado (`refresh_*_ai_runtime`). Para storage/identity hay que escribir el reconnect del pool de Postgres — mover `Storage` a `Arc<RwLock<Option<Arc<Storage>>>>` compartido entre el dispatcher y los workers.

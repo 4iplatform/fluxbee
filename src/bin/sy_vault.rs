@@ -198,7 +198,7 @@ async fn main() -> Result<(), VaultError> {
 
     // Well-known SY system ILKs — the full `system_nodes` list from
     // hive.yaml plus the admin/architect override set. Used by
-    // `authorize_read` to grant sys-pool universal reads to any SY system
+    // `authorize_read` to grant root-tenant pool reads to any SY system
     // caller WITHOUT requiring identity SHM to be populated. This is the
     // piece that closes the boot chicken/egg: vault can authorize reads
     // for identity (and any other SY) at boot even if identity hasn't
@@ -1333,7 +1333,7 @@ fn resolve_caller(config_dir: &Path, msg: &Message) -> VaultResult<Caller> {
 /// - Dedicated secret (`secret.ilk` set): only that ILK reads. **No admin
 ///   bypass** — the operator's "read my own secret" path is `vault_get`
 ///   from a node that owns it, not admin reading on the operator's behalf.
-/// - Pool secret (`secret.ilk` empty/null) with `tenant_id == "sys"`:
+/// - Pool secret (`secret.ilk` empty/null) in the hive's fixed root tenant:
 ///   readable by any caller whose ILK is in `well_known_system_ilks`. This
 ///   set is computed locally from `hive.yaml` at boot and does NOT depend
 ///   on identity SHM, so consumers can resolve their boot secrets even
@@ -1361,7 +1361,7 @@ fn authorize_read(
         // (2a) Root-tenant pool universal for SY system callers (no SHM
         // needed). This is the path that closes the boot chicken/egg:
         // any node whose ILK matches a deterministic SY system ILK from
-        // hive.yaml can read sys-pool secrets, even before identity has
+        // hive.yaml can read root-tenant pool secrets, even before identity has
         // written SHM.
         if metadata.tenant_id == fluxbee_sdk::DEFAULT_ROOT_TENANT_ID {
             if let Some(self_ilk) = caller_ilk {

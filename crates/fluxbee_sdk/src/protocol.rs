@@ -278,8 +278,8 @@ pub struct VaultSecretChangedPayload {
     /// Canonical resource_type (e.g. "openai", "postgres", "slack"). Always
     /// present and normalized.
     pub resource_type: String,
-    /// Owning tenant. `"sys"` for system pool secrets; `"tnt:<uuid>"` for
-    /// tenant-scoped secrets.
+    /// Owning tenant. `DEFAULT_ROOT_TENANT_ID` for infrastructure-wide
+    /// system pool secrets; `"tnt:<uuid>"` for tenant-scoped secrets.
     pub tenant_id: String,
     /// Owner ILK when the secret is dedicated to a single caller. `None`
     /// (or empty string) when the secret lives in the pool.
@@ -332,9 +332,9 @@ pub struct VaultSecretInterest<'a> {
     pub my_tenant: &'a str,
     /// The consumer's self ILK. Used to match dedicated secrets.
     pub my_ilk: Option<&'a str>,
-    /// When `true`, also match events for `tenant_id == "sys"` regardless
-    /// of `my_tenant` — mirrors the sys-pool universal read rule for
-    /// system callers.
+    /// When `true`, also match events for the fixed Fluxbee root tenant
+    /// regardless of `my_tenant` — mirrors the root-pool universal read
+    /// rule for system callers.
     pub system_caller: bool,
 }
 

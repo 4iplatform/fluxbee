@@ -851,7 +851,7 @@ fn merged_admin_executor_openai_section(
 }
 
 /// Build the admin executor AI runtime by discovering the `openai` resource
-/// in SY.vault (Model D' pool match: dedicated → tenant pool → sys pool).
+/// in SY.vault (Model D' pool match: dedicated → tenant pool → root-tenant pool).
 /// Returns `Ok(None)` (degraded) on any of:
 /// - vault has no openai secret reachable from our (ilk, tenant) match;
 /// - vault unreachable or denies access;
@@ -6530,7 +6530,7 @@ fn build_admin_executor_config_get_payload(
             "resource_type": "openai",
             "required": true,
             "configured": configured,
-            "scope": "pool (tenant or sys)"
+            "scope": "pool (tenant or root)"
         }
     ]);
 
@@ -8043,7 +8043,7 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "metadata": {
                 "resource_type": "openai",
                 "tenant_id": "tnt:00000000-0000-0000-0000-000000000001",
-                "description": "OpenAI API key shared by SY system services (sys pool)",
+                "description": "OpenAI API key shared by SY system services (root-tenant pool)",
                 "tags": ["provider:openai"]
             }
         }),

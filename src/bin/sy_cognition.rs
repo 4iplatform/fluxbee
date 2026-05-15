@@ -2234,14 +2234,14 @@ fn build_cognition_config_get_payload(
             "resource_type": "openai",
             "required": true,
             "configured": configured,
-            "scope": "pool (tenant or sys)",
+            "scope": "pool (tenant or root)",
             "purpose": "semantic tagger + narrative summarizer"
         },
         {
             "resource_type": "postgres",
             "required": false,
             "configured": null,
-            "scope": "pool (tenant or sys)",
+            "scope": "pool (tenant or root)",
             "consumer_dbname": "fluxbee_storage",
             "purpose": "cognition rebuild snapshot from storage durable tables (probed on demand)"
         }
