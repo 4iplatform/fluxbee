@@ -3720,9 +3720,6 @@ fn system_nodes_for_hive(hive: &HiveFile) -> Result<Vec<String>, String> {
     if nodes.is_empty() {
         return Err("system node list is empty".to_string());
     }
-    if nodes[0].trim() != "SY.identity" {
-        return Err("system node list must start with SY.identity".to_string());
-    }
     let mut seen_nodes = HashSet::new();
     let mut out = Vec::with_capacity(nodes.len());
     for raw_name in nodes {
