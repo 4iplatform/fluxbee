@@ -6765,7 +6765,7 @@ fn admin_action_executor_contract(spec: &InternalActionSpec) -> serde_json::Valu
             "Do not wrap mutation fields under args.body; body is only the HTTP request shape.",
             "Vault value-bearing fields are secret-sensitive and must not be printed in summaries/logs.",
             "Prefer vault_get_metadata for inspection. Use vault_get only when the operator explicitly needs the secret value.",
-            "Model D' for vault_put / vault_rotate: metadata.resource_type is MANDATORY (canonical lowercase snake_case: openai, postgres, slack, anthropic, hubspot, linkedhelper, google_calendar, gmail, google_drive, or a free-form custom string up to 64 chars). metadata.tenant_id defaults to the hive's root tenant when omitted (infrastructure-wide secret, readable by every SY system caller). To scope a secret to a specific node, use metadata.owner_node (a friendly L2 like 'SY.architect' — admin resolves the ILK); omit it entirely to publish to the tenant pool. metadata.owner_ilk is REJECTED (legacy Model J) — do not generate it.",
+            "Model D' for vault_put / vault_rotate: metadata.resource_type is MANDATORY (canonical lowercase snake_case). Prefer SDK-known resource types: postgres, mysql, redis, mongodb, openai, anthropic, gemini, mistral, cohere, perplexity, google_calendar, gmail, google_drive, google_sheets, google_docs, google_slides, google_cloud, microsoft_graph, outlook_email, outlook_calendar, teams, sharepoint, slack, discord, hubspot, salesforce, linked_helper, github, gitlab, jira, linear, notion, stripe, twilio, sendgrid, smtp, imap, aws, azure, s3, webhook, bearer_token, api_key, oauth_bundle. Unknown custom strings are allowed only as an escape hatch and must already normalize cleanly. metadata.tenant_id defaults to the hive's root tenant when omitted (infrastructure-wide secret, readable by every SY system caller). To scope a secret to a specific node, use metadata.owner_node (a friendly L2 like 'SY.architect' — admin resolves the ILK); omit it entirely to publish to the tenant pool. metadata.owner_ilk is REJECTED (legacy Model J) — do not generate it.",
             "Postgres secrets MUST be credentials + host only — never include a dbname in the connection string. Each consumer (storage, identity, architect-messages-db, cognition) applies its own dbname after resolving. Example value: {\"postgres_url\": \"postgresql://user:pass@host:5432\"}.",
         ]
     } else if matches!(
@@ -7185,7 +7185,7 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             admin_action_path_param(
                 "key",
                 "string",
-                "Vault key, for example sys:openai-api-key.",
+                "Vault key, for example infra:openai-api-key.",
             ),
         ],
         "get_tenant" | "update_tenant" | "set_tenant_sponsor" => vec![
@@ -8036,7 +8036,7 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             }
         }),
         "vault_put" => serde_json::json!({
-            "key": "sys:openai-api-key",
+            "key": "infra:openai-api-key",
             "value": {
                 "api_key": "sk-redacted-example"
             },
@@ -8049,11 +8049,11 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         }),
         "vault_get_metadata" | "vault_get" | "vault_delete" | "vault_rollback" => {
             serde_json::json!({
-                "key": "sys:openai-api-key"
+                "key": "infra:openai-api-key"
             })
         }
         "vault_rotate" => serde_json::json!({
-            "key": "sys:openai-api-key",
+            "key": "infra:openai-api-key",
             "value": {
                 "api_key": "sk-rotated-redacted-example"
             }
@@ -8139,20 +8139,20 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "set_tenant_sponsor" => {
             r#"curl -X POST /hives/motherbee/identity/tenants/tnt:550e8400-e29b-41d4-a716-446655440000/sponsor -d '{"sponsor_tenant_id":null}'"#
         }
-        "vault_list" => "curl -X GET '/hives/motherbee/vault/secrets?prefix=sys:&tags=provider:openai&limit=100'",
+        "vault_list" => "curl -X GET '/hives/motherbee/vault/secrets?prefix=infra:&tags=provider:openai&limit=100'",
         "vault_put" => {
-            r#"curl -X POST /hives/motherbee/vault/secrets -d '{"key":"sys:openai-api-key","value":{"api_key":"sk-..."},"metadata":{"resource_type":"openai","owner_node":"SY.architect","description":"OpenAI API key"}}'"#
+            r#"curl -X POST /hives/motherbee/vault/secrets -d '{"key":"infra:openai-api-key","value":{"api_key":"sk-..."},"metadata":{"resource_type":"openai","owner_node":"SY.architect","description":"OpenAI API key"}}'"#
         }
         "vault_get_metadata" => {
-            "curl -X GET /hives/motherbee/vault/secrets/sys:openai-api-key/metadata"
+            "curl -X GET /hives/motherbee/vault/secrets/infra:openai-api-key/metadata"
         }
-        "vault_get" => "curl -X GET /hives/motherbee/vault/secrets/sys:openai-api-key",
-        "vault_delete" => "curl -X DELETE /hives/motherbee/vault/secrets/sys:openai-api-key",
+        "vault_get" => "curl -X GET /hives/motherbee/vault/secrets/infra:openai-api-key",
+        "vault_delete" => "curl -X DELETE /hives/motherbee/vault/secrets/infra:openai-api-key",
         "vault_rotate" => {
-            r#"curl -X POST /hives/motherbee/vault/secrets/sys:openai-api-key/rotate -d '{"value":{"api_key":"sk-rotated-..."}}'"#
+            r#"curl -X POST /hives/motherbee/vault/secrets/infra:openai-api-key/rotate -d '{"value":{"api_key":"sk-rotated-..."}}'"#
         }
         "vault_rollback" => {
-            "curl -X POST /hives/motherbee/vault/secrets/sys:openai-api-key/rollback"
+            "curl -X POST /hives/motherbee/vault/secrets/infra:openai-api-key/rollback"
         }
         "inventory" => "curl -X GET /inventory",
         "list_versions" => "curl -X GET /versions",
@@ -12489,7 +12489,7 @@ mod tests {
             "action": "vault_get",
             "payload": {
                 "status": "ok",
-                "key": "sys:openai-api-key",
+                "key": "infra:openai-api-key",
                 "value": {
                     "api_key": "sk-live"
                 },
@@ -12506,7 +12506,7 @@ mod tests {
             redacted["payload"]["value"],
             json!(NODE_SECRET_REDACTION_TOKEN)
         );
-        assert_eq!(redacted["payload"]["key"], json!("sys:openai-api-key"));
+        assert_eq!(redacted["payload"]["key"], json!("infra:openai-api-key"));
     }
 
     #[test]

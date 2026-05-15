@@ -1604,3 +1604,103 @@ async fn connect_with_retry(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metadata(tenant_id: &str, ilk: Option<&str>) -> VaultMetadata {
+        VaultMetadata {
+            tenant_id: tenant_id.to_string(),
+            owner_ilk: String::new(),
+            resource_type: Some("postgres".to_string()),
+            ilk: ilk.map(str::to_string),
+            description: None,
+            created_by: None,
+            created_at: None,
+            updated_at: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn caller(ilk_id: Option<&str>, tenant_id: Option<&str>, ilk_type: Option<&str>) -> Caller {
+        Caller {
+            l2_name: Some("SY.test@motherbee".to_string()),
+            ilk_id: ilk_id.map(str::to_string),
+            tenant_id: tenant_id.map(str::to_string),
+            ilk_type: ilk_type.map(str::to_string),
+        }
+    }
+
+    fn assert_unauthorized(result: VaultResult<()>) {
+        assert!(matches!(result, Err(VaultError::Unauthorized)));
+    }
+
+    #[test]
+    fn authorize_read_allows_dedicated_owner_without_shm() {
+        let caller = caller(Some("ilk:owner"), None, None);
+        let metadata = metadata("tnt:client", Some("ilk:owner"));
+
+        authorize_read(&caller, &metadata, &HashSet::new(), true).expect("owner reads own secret");
+    }
+
+    #[test]
+    fn authorize_read_denies_dedicated_secret_to_different_ilk() {
+        let caller = caller(Some("ilk:other"), Some("tnt:client"), Some("system"));
+        let metadata = metadata("tnt:client", Some("ilk:owner"));
+
+        assert_unauthorized(authorize_read(&caller, &metadata, &HashSet::new(), true));
+    }
+
+    #[test]
+    fn authorize_read_allows_root_pool_for_well_known_system_ilk_without_shm() {
+        let caller = caller(Some("ilk:sy-storage"), None, None);
+        let metadata = metadata(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID, None);
+        let well_known_system_ilks = HashSet::from(["ilk:sy-storage".to_string()]);
+
+        authorize_read(&caller, &metadata, &well_known_system_ilks, true)
+            .expect("well-known system caller reads root pool");
+    }
+
+    #[test]
+    fn authorize_read_denies_root_pool_to_unknown_unresolved_caller() {
+        let caller = caller(Some("ilk:unknown"), None, None);
+        let metadata = metadata(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID, None);
+
+        assert_unauthorized(authorize_read(&caller, &metadata, &HashSet::new(), true));
+    }
+
+    #[test]
+    fn authorize_read_allows_same_tenant_pool_from_shm() {
+        let caller = caller(Some("ilk:client-node"), Some("tnt:client"), Some("ai"));
+        let metadata = metadata("tnt:client", None);
+
+        authorize_read(&caller, &metadata, &HashSet::new(), true)
+            .expect("same tenant reads tenant pool");
+    }
+
+    #[test]
+    fn authorize_read_denies_cross_tenant_pool() {
+        let caller = caller(Some("ilk:client-node"), Some("tnt:client-a"), Some("ai"));
+        let metadata = metadata("tnt:client-b", None);
+
+        assert_unauthorized(authorize_read(&caller, &metadata, &HashSet::new(), true));
+    }
+
+    #[test]
+    fn well_known_admin_authorization_uses_ilk_not_l2_name() {
+        let admin_ilks = HashSet::from(["ilk:admin".to_string()]);
+
+        assert!(caller(Some("ilk:admin"), None, None).is_well_known_admin(&admin_ilks));
+        assert!(!caller(Some("ilk:other"), None, None).is_well_known_admin(&admin_ilks));
+        assert!(!caller(None, None, Some("system")).is_well_known_admin(&admin_ilks));
+    }
+
+    #[test]
+    fn validate_metadata_rejects_sys_tenant_alias() {
+        let metadata = metadata("sys", None);
+
+        let err = validate_metadata(&metadata).expect_err("sys is not a tenant id");
+        assert!(matches!(err, VaultError::InvalidRequest(_)));
+    }
+}

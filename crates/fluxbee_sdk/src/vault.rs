@@ -38,14 +38,49 @@ pub const MSG_VAULT_ROLLBACK_RESPONSE: &str = "VAULT_ROLLBACK_RESPONSE";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceType {
     Postgres,
+    Mysql,
+    Redis,
+    Mongodb,
     Openai,
     Anthropic,
+    Gemini,
+    Mistral,
+    Cohere,
+    Perplexity,
     GoogleCalendar,
     Gmail,
     GoogleDrive,
+    GoogleSheets,
+    GoogleDocs,
+    GoogleSlides,
+    GoogleCloud,
+    MicrosoftGraph,
+    OutlookEmail,
+    OutlookCalendar,
+    Teams,
+    Sharepoint,
     Slack,
+    Discord,
     Hubspot,
+    Salesforce,
     LinkedHelper,
+    Github,
+    Gitlab,
+    Jira,
+    Linear,
+    Notion,
+    Stripe,
+    Twilio,
+    Sendgrid,
+    Smtp,
+    Imap,
+    Aws,
+    Azure,
+    S3,
+    Webhook,
+    BearerToken,
+    ApiKey,
+    OAuthBundle,
     /// String must already be normalized (`normalize_resource_type`).
     Custom(String),
 }
@@ -54,14 +89,49 @@ impl ResourceType {
     pub fn as_str(&self) -> &str {
         match self {
             ResourceType::Postgres => "postgres",
+            ResourceType::Mysql => "mysql",
+            ResourceType::Redis => "redis",
+            ResourceType::Mongodb => "mongodb",
             ResourceType::Openai => "openai",
             ResourceType::Anthropic => "anthropic",
+            ResourceType::Gemini => "gemini",
+            ResourceType::Mistral => "mistral",
+            ResourceType::Cohere => "cohere",
+            ResourceType::Perplexity => "perplexity",
             ResourceType::GoogleCalendar => "google_calendar",
             ResourceType::Gmail => "gmail",
             ResourceType::GoogleDrive => "google_drive",
+            ResourceType::GoogleSheets => "google_sheets",
+            ResourceType::GoogleDocs => "google_docs",
+            ResourceType::GoogleSlides => "google_slides",
+            ResourceType::GoogleCloud => "google_cloud",
+            ResourceType::MicrosoftGraph => "microsoft_graph",
+            ResourceType::OutlookEmail => "outlook_email",
+            ResourceType::OutlookCalendar => "outlook_calendar",
+            ResourceType::Teams => "teams",
+            ResourceType::Sharepoint => "sharepoint",
             ResourceType::Slack => "slack",
+            ResourceType::Discord => "discord",
             ResourceType::Hubspot => "hubspot",
+            ResourceType::Salesforce => "salesforce",
             ResourceType::LinkedHelper => "linked_helper",
+            ResourceType::Github => "github",
+            ResourceType::Gitlab => "gitlab",
+            ResourceType::Jira => "jira",
+            ResourceType::Linear => "linear",
+            ResourceType::Notion => "notion",
+            ResourceType::Stripe => "stripe",
+            ResourceType::Twilio => "twilio",
+            ResourceType::Sendgrid => "sendgrid",
+            ResourceType::Smtp => "smtp",
+            ResourceType::Imap => "imap",
+            ResourceType::Aws => "aws",
+            ResourceType::Azure => "azure",
+            ResourceType::S3 => "s3",
+            ResourceType::Webhook => "webhook",
+            ResourceType::BearerToken => "bearer_token",
+            ResourceType::ApiKey => "api_key",
+            ResourceType::OAuthBundle => "oauth_bundle",
             ResourceType::Custom(s) => s.as_str(),
         }
     }
@@ -72,16 +142,100 @@ impl ResourceType {
     pub fn from_wire(s: &str) -> Self {
         match s {
             "postgres" => Self::Postgres,
+            "mysql" => Self::Mysql,
+            "redis" => Self::Redis,
+            "mongodb" => Self::Mongodb,
             "openai" => Self::Openai,
             "anthropic" => Self::Anthropic,
+            "gemini" => Self::Gemini,
+            "mistral" => Self::Mistral,
+            "cohere" => Self::Cohere,
+            "perplexity" => Self::Perplexity,
             "google_calendar" => Self::GoogleCalendar,
             "gmail" => Self::Gmail,
             "google_drive" => Self::GoogleDrive,
+            "google_sheets" => Self::GoogleSheets,
+            "google_docs" => Self::GoogleDocs,
+            "google_slides" => Self::GoogleSlides,
+            "google_cloud" => Self::GoogleCloud,
+            "microsoft_graph" => Self::MicrosoftGraph,
+            "outlook_email" => Self::OutlookEmail,
+            "outlook_calendar" => Self::OutlookCalendar,
+            "teams" => Self::Teams,
+            "sharepoint" => Self::Sharepoint,
             "slack" => Self::Slack,
+            "discord" => Self::Discord,
             "hubspot" => Self::Hubspot,
+            "salesforce" => Self::Salesforce,
             "linked_helper" => Self::LinkedHelper,
+            "github" => Self::Github,
+            "gitlab" => Self::Gitlab,
+            "jira" => Self::Jira,
+            "linear" => Self::Linear,
+            "notion" => Self::Notion,
+            "stripe" => Self::Stripe,
+            "twilio" => Self::Twilio,
+            "sendgrid" => Self::Sendgrid,
+            "smtp" => Self::Smtp,
+            "imap" => Self::Imap,
+            "aws" => Self::Aws,
+            "azure" => Self::Azure,
+            "s3" => Self::S3,
+            "webhook" => Self::Webhook,
+            "bearer_token" => Self::BearerToken,
+            "api_key" => Self::ApiKey,
+            "oauth_bundle" => Self::OAuthBundle,
             other => Self::Custom(other.to_string()),
         }
+    }
+
+    pub fn known_wire_values() -> &'static [&'static str] {
+        &[
+            "postgres",
+            "mysql",
+            "redis",
+            "mongodb",
+            "openai",
+            "anthropic",
+            "gemini",
+            "mistral",
+            "cohere",
+            "perplexity",
+            "google_calendar",
+            "gmail",
+            "google_drive",
+            "google_sheets",
+            "google_docs",
+            "google_slides",
+            "google_cloud",
+            "microsoft_graph",
+            "outlook_email",
+            "outlook_calendar",
+            "teams",
+            "sharepoint",
+            "slack",
+            "discord",
+            "hubspot",
+            "salesforce",
+            "linked_helper",
+            "github",
+            "gitlab",
+            "jira",
+            "linear",
+            "notion",
+            "stripe",
+            "twilio",
+            "sendgrid",
+            "smtp",
+            "imap",
+            "aws",
+            "azure",
+            "s3",
+            "webhook",
+            "bearer_token",
+            "api_key",
+            "oauth_bundle",
+        ]
     }
 }
 
@@ -853,5 +1007,77 @@ fn response_action_for(action: &str) -> &'static str {
         MSG_VAULT_ROTATE => MSG_VAULT_ROTATE_RESPONSE,
         MSG_VAULT_ROLLBACK => MSG_VAULT_ROLLBACK_RESPONSE,
         _ => MSG_VAULT_GET_RESPONSE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_type_known_values_round_trip_as_wire_strings() {
+        let cases = [
+            (ResourceType::Openai, "openai"),
+            (ResourceType::GoogleCalendar, "google_calendar"),
+            (ResourceType::GoogleSheets, "google_sheets"),
+            (ResourceType::MicrosoftGraph, "microsoft_graph"),
+            (ResourceType::OutlookCalendar, "outlook_calendar"),
+            (ResourceType::LinkedHelper, "linked_helper"),
+            (ResourceType::BearerToken, "bearer_token"),
+            (ResourceType::OAuthBundle, "oauth_bundle"),
+        ];
+        for (resource, wire) in cases {
+            assert_eq!(resource.as_str(), wire);
+            assert_eq!(ResourceType::from_wire(wire), resource);
+            assert_eq!(
+                serde_json::to_string(&resource).unwrap(),
+                format!("\"{wire}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<ResourceType>(&format!("\"{wire}\"")).unwrap(),
+                resource
+            );
+        }
+    }
+
+    #[test]
+    fn resource_type_custom_preserves_normalized_unknown_values() {
+        let resource = ResourceType::from_wire("new_provider");
+        assert_eq!(resource, ResourceType::Custom("new_provider".to_string()));
+        assert_eq!(
+            serde_json::to_string(&resource).unwrap(),
+            "\"new_provider\""
+        );
+    }
+
+    #[test]
+    fn normalize_resource_type_accepts_common_display_names() {
+        let cases = [
+            ("OpenAI", "openai"),
+            ("Google Calendar", "google_calendar"),
+            ("Linked-Helper", "linked_helper"),
+            ("Bearer Token", "bearer_token"),
+            ("OAuth Bundle", "oauth_bundle"),
+            ("Microsoft Graph", "microsoft_graph"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(normalize_resource_type(raw).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn vault_response_serialization_parses_standard_error_shape() {
+        let raw = r#"{
+            "status": "error",
+            "count": 0,
+            "secrets": [],
+            "error_code": "UNAUTHORIZED",
+            "message": "denied"
+        }"#;
+        let response: VaultListResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(response.status, "error");
+        assert_eq!(response.error_code.as_deref(), Some("UNAUTHORIZED"));
+        assert_eq!(response.message.as_deref(), Some("denied"));
+        assert!(response.secrets.is_empty());
     }
 }

@@ -255,8 +255,8 @@ POST /hives/motherbee/identity/ilks/ilk:ai-support/definition
 - **Path:** `GET /hives/{hive}/vault/secrets`
 - **Descripción:** Lista metadata/resúmenes de secrets visibles para el caller; nunca devuelve valores.
 - **Read-only:** sí
-- **Campos opcionales:** `filter.prefix`, `filter.tenant_id`, `filter.tags`, `filter.limit`
-- **Executor args:** planos: `{"hive":"motherbee","filter":{"prefix":"sys:","limit":100}}`
+- **Campos opcionales:** `filter.prefix`, `filter.tenant_id`, `filter.resource_type`, `filter.ilk`, `filter.tags`, `filter.limit`
+- **Executor args:** planos: `{"hive":"motherbee","filter":{"prefix":"infra:","resource_type":"openai","limit":100}}`
 - **Nota:** callers no-admin solo ven secrets que podrían leer; esto evita enumeración de keys no autorizadas.
 
 ### `vault_put`
@@ -264,30 +264,32 @@ POST /hives/motherbee/identity/ilks/ilk:ai-support/definition
 - **Descripción:** Escribe o actualiza un secret en `SY.vault`; el valor se cifra at-rest y se audita localmente.
 - **Read-only:** no | **Requiere CONFIRM:** sí
 - **Campos requeridos:** `key` (string), `value` (object), `metadata` (object)
-- **Metadata mínima:** `metadata.tenant_id` (siempre `tnt:<uuid>`; para secrets de infraestructura usar el root tenant fijo `tnt:00000000-0000-0000-0000-000000000001`), `metadata.owner_ilk` (`ilk:<uuid>`)
+- **Metadata mínima:** `metadata.resource_type` (canonical lowercase snake_case). `metadata.tenant_id` es opcional y defaulta al root tenant fijo `tnt:00000000-0000-0000-0000-000000000001`; `metadata.owner_node` es opcional para dedicar el secret a un nodo específico; si se omite, el secret queda en el pool del tenant.
 - **Executor args:** planos en `step.args`; no usar `body`.
 - **Nota crítica:** `value` es sensible y debe quedar redacted en previews, history y logs. PUT con el mismo valor es idempotente y no incrementa versión.
-- **Ejemplo:** `POST /hives/motherbee/vault/secrets {"key":"sys:openai-api-key","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"tnt:00000000-0000-0000-0000-000000000001","owner_ilk":"ilk:550e8400-e29b-41d4-a716-446655440000"}}`
+- **Nota Model D':** `metadata.owner_ilk` es legacy y está rechazado en el path admin; usar `owner_node` o pool.
+- **Resource types canónicos:** `postgres`, `mysql`, `redis`, `mongodb`, `openai`, `anthropic`, `gemini`, `mistral`, `cohere`, `perplexity`, `google_calendar`, `gmail`, `google_drive`, `google_sheets`, `google_docs`, `google_slides`, `google_cloud`, `microsoft_graph`, `outlook_email`, `outlook_calendar`, `teams`, `sharepoint`, `slack`, `discord`, `hubspot`, `salesforce`, `linked_helper`, `github`, `gitlab`, `jira`, `linear`, `notion`, `stripe`, `twilio`, `sendgrid`, `smtp`, `imap`, `aws`, `azure`, `s3`, `webhook`, `bearer_token`, `api_key`, `oauth_bundle`.
+- **Ejemplo:** `POST /hives/motherbee/vault/secrets {"key":"infra:openai-api-key","value":{"api_key":"sk-..."},"metadata":{"resource_type":"openai","owner_node":"SY.architect","description":"OpenAI API key"}}`
 
 ### `vault_get_metadata`
 - **Path:** `GET /hives/{hive}/vault/secrets/{key}/metadata`
 - **Descripción:** Lee metadata de un secret sin devolver el valor.
 - **Read-only:** sí
-- **Executor args:** planos: `{"hive":"motherbee","key":"sys:openai-api-key"}`
+- **Executor args:** planos: `{"hive":"motherbee","key":"infra:openai-api-key"}`
 - **Uso recomendado:** inspección por operador/Archi cuando no se necesita plaintext.
 
 ### `vault_get`
 - **Path:** `GET /hives/{hive}/vault/secrets/{key}`
 - **Descripción:** Lee el valor plaintext del secret.
 - **Read-only:** sí | **Requiere CONFIRM:** sí
-- **Executor args:** planos: `{"hive":"motherbee","key":"sys:openai-api-key"}`
+- **Executor args:** planos: `{"hive":"motherbee","key":"infra:openai-api-key"}`
 - **Nota crítica:** usar solo si el operador pide explícitamente el valor. Para inspección normal usar `vault_get_metadata`.
 
 ### `vault_delete`
 - **Path:** `DELETE /hives/{hive}/vault/secrets/{key}`
 - **Descripción:** Borra un secret de `SY.vault`.
 - **Read-only:** no | **Requiere CONFIRM:** sí
-- **Executor args:** planos: `{"hive":"motherbee","key":"sys:openai-api-key"}`
+- **Executor args:** planos: `{"hive":"motherbee","key":"infra:openai-api-key"}`
 - **Nota:** admin/architect only.
 
 ### `vault_rotate`
@@ -295,14 +297,14 @@ POST /hives/motherbee/identity/ilks/ilk:ai-support/definition
 - **Descripción:** Rota el valor de un secret y conserva la versión previa para rollback.
 - **Read-only:** no | **Requiere CONFIRM:** sí
 - **Campos requeridos:** `key` (string), `value` (object)
-- **Executor args:** planos: `{"hive":"motherbee","key":"sys:openai-api-key","value":{"api_key":"sk-..."}}`
+- **Executor args:** planos: `{"hive":"motherbee","key":"infra:openai-api-key","value":{"api_key":"sk-..."}}`
 - **Nota crítica:** `value` es sensible y debe quedar redacted en previews/history/logs.
 
 ### `vault_rollback`
 - **Path:** `POST /hives/{hive}/vault/secrets/{key}/rollback`
 - **Descripción:** Revierte un secret a su versión inmediatamente anterior.
 - **Read-only:** no | **Requiere CONFIRM:** sí
-- **Executor args:** planos: `{"hive":"motherbee","key":"sys:openai-api-key"}`
+- **Executor args:** planos: `{"hive":"motherbee","key":"infra:openai-api-key"}`
 - **Error esperado:** `NO_PREVIOUS_VERSION` si no hay versión anterior disponible.
 
 ### `inventory`
@@ -572,29 +574,21 @@ POST /hives/motherbee/identity/ilks/ilk:ai-support/definition
 
 ## Categoría — SY.architect local control plane
 
-archi tiene su propio control-plane local que se invoca por SCMD desde el chat (operator) o por el admin gateway sobre `SY.architect@<hive>`. Persiste secretos en `secrets.json` del nodo y refresca runtimes en caliente sin reiniciar.
+archi tiene su propio control-plane local que se invoca por SCMD desde el chat (operator) o por el admin gateway sobre `SY.architect@<hive>`. En Model D' no persiste secretos locales: consume OpenAI y la DB de mensajes desde `SY.vault` por `resource_type` (`openai`, `postgres`) y refresca runtimes en caliente cuando recibe `VAULT_SECRET_CHANGED`.
 
 ### `architect_local_config_get`
 - **Path:** `GET /architect/control/config-get` (SCMD) o `POST /hives/{hive}/nodes/SY.architect@{hive}/control/config-get` (admin gateway)
 - **Read-only:** sí
-- **Descripción:** Devuelve el contrato live de archi: estado de cada secret (configured / missing_secret), valores redacted, secret_record y `state` global. Hoy reporta dos descriptores: OpenAI API key y messages DB URL.
-- **Respuesta clave:** `payload.state` (configured | missing_secret) refleja sólo el secret de OpenAI (requerido). `payload.messages_db_state` reporta la DB de mensajes (opcional). `payload.contract.secrets[]` enumera los descriptores con `field`, `storage_key`, `required`, `configured`.
+- **Descripción:** Devuelve el contrato live de archi: estado de cada recurso de vault (configured / missing_secret), valores redacted y `state` global. Hoy reporta OpenAI API key y messages DB URL.
+- **Respuesta clave:** `payload.state` (configured | missing_secret) refleja sólo el recurso OpenAI (requerido). `payload.messages_db_state` reporta la DB de mensajes (opcional). `payload.contract.resources[]` / `payload.resources` enumera los recursos con `resource_type`, `required`, `resolved`, `source`, `vault_key`, `version`.
 
 ### `architect_local_config_set`
 - **Path:** `POST /architect/control/config-set` (SCMD) o `POST /hives/{hive}/nodes/SY.architect@{hive}/control/config-set` (admin gateway)
 - **Read-only:** no | **Requiere CONFIRM:** sí
-- **Descripción:** Persiste uno o ambos secrets en `secrets.json` y refresca el runtime en caliente. Acepta set parcial: si sólo viene un campo, el otro queda intacto.
-- **Campos aceptados (al menos uno requerido):**
-  - `config.ai_providers.openai.api_key` (string) — habilita razonamiento de archi.
-  - `config.storage.messages_db_url` (string) — habilita el panel "Messages" leyendo `storage_inbox` de storage.
+- **Descripción:** Actualiza sólo configuración no secreta de archi. Los campos secret-bearing son rechazados; cargar/rotar credenciales se hace con `vault_put` / `vault_rotate`.
+- **Campos secret-bearing rechazados:** `config.ai_providers.openai.api_key`, `config.ai_providers.openai.api_key_ref`, `config.storage.messages_db_url`, `config.storage.messages_db_url_ref`.
 - **Campos opcionales del wrapper admin gateway:** `schema_version` (u32), `config_version` (u64), `apply_mode` (string). Los toma archi pero los ignora; el handler local persiste atómicamente.
-- **Respuesta clave:**
-  - `payload.ai_configured` (bool) — runtime AI listo después del set.
-  - `payload.messages_db_configured` (bool) — URL guardada.
-  - `payload.messages_db_connected` (bool) — connect a Postgres efectivamente exitoso.
-  - `payload.messages_db_connect_error` (string | null) — mensaje exacto de Postgres si `messages_db_connected=false`.
-  - `payload.stored_secrets[]` — qué se persistió en este call.
-- **Nota crítica:** la URL apunta al **Postgres de storage**, en la base `fluxbee_storage` (NO `fluxbee` — storage usa `STORAGE_DB_NAME=fluxbee_storage` internamente). Cualquier user con `SELECT` sobre `storage_inbox` alcanza; reusar la misma URL que storage usa es válido. archi sólo ejecuta `SELECT` sobre `storage_inbox`.
+- **Nota crítica:** para habilitar OpenAI o la DB de mensajes, usar `vault_put` con `metadata.resource_type="openai"` o `metadata.resource_type="postgres"`. Si el secret es del pool de infraestructura, omitir `metadata.tenant_id` y `owner_node`; si es dedicado a archi, usar `metadata.owner_node="SY.architect"`.
 - **Endpoints relacionados que habilita:** `GET /api/messages` (lista paginada), `GET /api/messages/stream` (SSE tail), `GET /api/messages/{dedupe_key}` (detalle).
 
 ---

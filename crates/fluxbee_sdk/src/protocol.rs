@@ -822,4 +822,91 @@ mod tests {
         assert_eq!(msg.routing.src_l2_name, None);
         assert_eq!(msg.source_l2_name(), None);
     }
+
+    fn vault_changed_event(
+        resource_type: &str,
+        tenant_id: &str,
+        ilk: Option<&str>,
+    ) -> VaultSecretChangedPayload {
+        VaultSecretChangedPayload {
+            op: VaultSecretOp::Put,
+            resource_type: resource_type.to_string(),
+            tenant_id: tenant_id.to_string(),
+            ilk: ilk.map(str::to_string),
+            version: 1,
+            key: "infra:test".to_string(),
+            hive_id: "motherbee".to_string(),
+            at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn vault_secret_changed_matches_dedicated_owner_only() {
+        let event = vault_changed_event(
+            "openai",
+            crate::identity::DEFAULT_ROOT_TENANT_ID,
+            Some("ilk:owner"),
+        );
+
+        assert!(event.matches_interest(&VaultSecretInterest {
+            resource_type: "openai",
+            my_tenant: "tnt:client",
+            my_ilk: Some("ilk:owner"),
+            system_caller: false,
+        }));
+        assert!(!event.matches_interest(&VaultSecretInterest {
+            resource_type: "openai",
+            my_tenant: crate::identity::DEFAULT_ROOT_TENANT_ID,
+            my_ilk: Some("ilk:other"),
+            system_caller: true,
+        }));
+    }
+
+    #[test]
+    fn vault_secret_changed_matches_same_tenant_pool() {
+        let event = vault_changed_event("slack", "tnt:client", None);
+
+        assert!(event.matches_interest(&VaultSecretInterest {
+            resource_type: "slack",
+            my_tenant: "tnt:client",
+            my_ilk: Some("ilk:consumer"),
+            system_caller: false,
+        }));
+        assert!(!event.matches_interest(&VaultSecretInterest {
+            resource_type: "slack",
+            my_tenant: "tnt:other",
+            my_ilk: Some("ilk:consumer"),
+            system_caller: false,
+        }));
+    }
+
+    #[test]
+    fn vault_secret_changed_matches_root_pool_for_system_callers_only() {
+        let event = vault_changed_event("postgres", crate::identity::DEFAULT_ROOT_TENANT_ID, None);
+
+        assert!(event.matches_interest(&VaultSecretInterest {
+            resource_type: "postgres",
+            my_tenant: "tnt:client",
+            my_ilk: Some("ilk:sy-storage"),
+            system_caller: true,
+        }));
+        assert!(!event.matches_interest(&VaultSecretInterest {
+            resource_type: "postgres",
+            my_tenant: "tnt:client",
+            my_ilk: Some("ilk:ai-sales"),
+            system_caller: false,
+        }));
+    }
+
+    #[test]
+    fn vault_secret_changed_rejects_resource_type_mismatch() {
+        let event = vault_changed_event("openai", crate::identity::DEFAULT_ROOT_TENANT_ID, None);
+
+        assert!(!event.matches_interest(&VaultSecretInterest {
+            resource_type: "postgres",
+            my_tenant: crate::identity::DEFAULT_ROOT_TENANT_ID,
+            my_ilk: Some("ilk:sy-storage"),
+            system_caller: true,
+        }));
+    }
 }

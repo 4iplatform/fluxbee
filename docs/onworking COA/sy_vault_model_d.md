@@ -1,6 +1,6 @@
 # SY.vault — Model D' (resource-oriented secrets)
 
-**Status:** design closed (2026-05-12). Replaces the "vault_put + CONFIG_SET with ref" approach that was implemented in Phase J (J1-J5) of `sy_vault_tasks.md`. Phase J has to be rewritten on top of this.
+**Status:** design closed and implemented as the active model. Replaces the old "vault_put + CONFIG_SET with ref" approach from Phase J.
 
 **Parent spec:** `docs/sy-vault-spec.md` (vault backbone — message envelope, encryption, audit, etc. remains valid).
 
@@ -49,7 +49,7 @@ struct VaultSecret {
 
 - **`key`**: free-form label chosen by the operator (e.g. `"openai-prod-shared"`, `"cognition-openai-dedicated"`). Unique per `(tenant_id, key)`. Conflict → `KEY_ALREADY_EXISTS`. Used as the addressable identifier for `vault_delete`, `vault_rotate`, `vault_rollback`.
 
-- **`resource_type`**: REQUIRED on PUT. Canonical normalized form: lowercase, words joined by `_`. Examples: `openai`, `anthropic`, `postgres`, `google_calendar`, `slack`, `hubspot`. Admin normalizes operator-provided strings before forwarding to vault. See §5 for the enum.
+- **`resource_type`**: REQUIRED on PUT. Canonical normalized form: lowercase, words joined by `_`. Examples: `openai`, `anthropic`, `postgres`, `google_calendar`, `slack`, `hubspot`. Admin normalizes operator-provided strings before forwarding to vault. See §5 for the fixed SDK enum.
 
 - **`tenant_id`**: REQUIRED. Always `tnt:<uuid>` — there is no `sys` sentinel. Infrastructure-wide / hive-level resources live in the fixed root tenant `tnt:00000000-0000-0000-0000-000000000001` (alias `fluxbee`, seeded by SY.identity at bootstrap). Per-tenant resources use that tenant's own `tnt:<uuid>`. Operator may omit `tenant_id` on PUT and admin defaults to the root tenant. Tenant association is part of the cost model — every secret belongs to a tenant.
 
@@ -57,7 +57,7 @@ struct VaultSecret {
 
 - **`version`**: vault-managed. Starts at 1 on first put. Increments on `vault_rotate` (which preserves history for one previous version). PUT with same value is a noop and does not increment.
 
-- **`(resource_type, tenant_id, ilk)` is NOT unique.** Multiple secrets with the same triple are allowed: same resource, same tenant, same dedication. Disambiguation on read is by `created_at DESC` (most recent wins). This supports pre-loaded rotation: operator adds a new key with the same triple, and on the next refresh consumers pick it up. The old key stays until the operator deletes it.
+- **`(resource_type, tenant_id, ilk)` is NOT unique.** Multiple secrets with the same triple are allowed: same resource, same tenant, same dedication. Disambiguation on read is by `created_at DESC` (most recent wins). This supports pre-loaded rotation: operator adds a new key with the same triple, and consumers pick it up on boot or after the matching `VAULT_SECRET_CHANGED` broadcast. The old key stays until the operator deletes it.
 
 ---
 
@@ -78,7 +78,7 @@ curl -X POST http://127.0.0.1:8080/hives/motherbee/vault/secrets \
   }'
 ```
 
-That single put publishes an OpenAI key in the root-tenant pool. Every system node in the hive that needs OpenAI will pick it up on its next refresh. No CONFIG_SET to architect, cognition, or admin is needed. (If `tenant_id` is omitted, admin defaults to the fixed root tenant.)
+That single put publishes an OpenAI key in the root-tenant pool. Every system node in the hive that needs OpenAI will pick it up on boot or after the `VAULT_SECRET_CHANGED` broadcast. No CONFIG_SET to architect, cognition, or admin is needed. (If `tenant_id` is omitted, admin defaults to the fixed root tenant.)
 
 If the operator wants to dedicate it to one node, they add `"owner_node": "SY.cognition"` and admin resolves it to the deterministic ILK before forwarding to vault. Example:
 
@@ -107,7 +107,7 @@ Only `SY.admin` and `SY.architect` (resolved by deterministic ILK match, see §6
 
 ## 4. Consumer workflow (read path)
 
-The consumer node knows in its own code which resource types it needs. At boot and at each refresh interval, it queries vault for each resource type.
+The consumer node knows in its own code which resource types it needs. At boot and whenever it receives a matching `VAULT_SECRET_CHANGED` broadcast, it queries vault for each resource type.
 
 ### Required resources declaration (in node code)
 
@@ -153,8 +153,8 @@ Two separate `vault_list` calls (clearer code), one round-trip each. For alpha t
 ### Refresh policy
 
 - At boot: resolve once for every entry in `REQUIRED_RESOURCES`. If any returns None, the node logs and continues in degraded mode for that capability.
-- Periodic refresh: every `VAULT_REFRESH_INTERVAL_SECS` (default 60s), re-resolve and apply if changed. This is polling; future versions may replace with a `VAULT_SECRET_CHANGED` broadcast emitted by vault.
-- On change: cached secret is replaced atomically (write lock on the runtime). If a connection (DB pool, HTTP client) was bound to the previous secret, the node rebuilds it.
+- Refresh/change notification: `SY.vault` emits `VAULT_SECRET_CHANGED` after a mutating operation. Consumers filter the broadcast by `resource_type`, tenant, and optional `ilk`, then re-resolve the resource.
+- On change: cached secret is replaced atomically when possible. Nodes with connection pools that are not hot-swappable exit cleanly and let systemd restart them.
 
 ### Reporting (CONFIG_GET)
 
@@ -193,19 +193,54 @@ Defined in `fluxbee_sdk::vault::ResourceType`:
 pub enum ResourceType {
     OpenAi,         // -> "openai"   (special-cased: drop separator)
     Anthropic,      // -> "anthropic"
+    Gemini,         // -> "gemini"
+    Mistral,        // -> "mistral"
+    Cohere,         // -> "cohere"
+    Perplexity,     // -> "perplexity"
     Postgres,       // -> "postgres"
+    Mysql,          // -> "mysql"
+    Redis,          // -> "redis"
+    Mongodb,        // -> "mongodb"
     GoogleCalendar, // -> "google_calendar"
     GoogleDrive,    // -> "google_drive"
+    GoogleSheets,   // -> "google_sheets"
+    GoogleDocs,     // -> "google_docs"
+    GoogleSlides,   // -> "google_slides"
+    GoogleCloud,    // -> "google_cloud"
     Gmail,          // -> "gmail"
+    MicrosoftGraph, // -> "microsoft_graph"
+    OutlookEmail,   // -> "outlook_email"
+    OutlookCalendar,// -> "outlook_calendar"
+    Teams,          // -> "teams"
+    Sharepoint,     // -> "sharepoint"
     Slack,          // -> "slack"
+    Discord,        // -> "discord"
     Hubspot,        // -> "hubspot"
+    Salesforce,     // -> "salesforce"
     LinkedHelper,   // -> "linked_helper"
+    Github,         // -> "github"
+    Gitlab,         // -> "gitlab"
+    Jira,           // -> "jira"
+    Linear,         // -> "linear"
+    Notion,         // -> "notion"
+    Stripe,         // -> "stripe"
+    Twilio,         // -> "twilio"
+    Sendgrid,       // -> "sendgrid"
+    Smtp,           // -> "smtp"
+    Imap,           // -> "imap"
+    Aws,            // -> "aws"
+    Azure,          // -> "azure"
+    S3,             // -> "s3"
+    Webhook,        // -> "webhook"
+    BearerToken,    // -> "bearer_token"
+    ApiKey,         // -> "api_key"
+    OAuthBundle,    // -> "oauth_bundle"
     Custom(String), // -> stored as the inner string (must already be normalized)
 }
 ```
 
 - The SDK enum lets known types be type-checked.
-- Custom variant accepts a normalized string (lowercase, `_`-joined). For unknown providers without an SDK release.
+- Custom variant is an escape hatch for a provider that has not been promoted to the fixed enum yet. Common providers/resources should use one of the variants above, not arbitrary strings.
 - Normalization rule (`normalize_resource_type(s) -> String`): trim, lowercase, replace runs of non-alphanumeric chars with single `_`, drop leading/trailing `_`. Examples: `"OpenAI"` → `"openai"`, `"Google Calendar"` → `"google_calendar"`, `"linked-helper"` → `"linked_helper"`. Admin normalizes before forwarding to vault. Vault stores the normalized string and rejects empty / pure-digit / over-N-chars.
 
 ### Per-resource value contract
@@ -217,9 +252,16 @@ Each `resource_type` has a documented `value` shape so consumers know what to ex
 | `postgres` | `"postgresql://USER:PASS@HOST:PORT"` (string, no dbname) or `{"host", "port", "user", "password"}` (object form, future) | **No dbname**. Each consumer hardcodes its own (`fluxbee_storage`, `fluxbee_identity`, etc.) and applies `with_dbname` before connecting. The operator loads ONE postgres secret per cluster — storage, identity, architect, cognition share it. If the operator includes a dbname out of habit, consumers log a warning and overwrite. |
 | `openai` | `{"api_key": "sk-..."}` or bare string `"sk-..."` | Provider-level shared secret. |
 | `anthropic` | same shape as openai | |
-| `google_calendar`, `gmail`, `google_drive` | `{"access_token", "refresh_token", "client_id", "client_secret"}` (OAuth bundle) | per-account if `ilk` is set; per-tenant if pool |
+| `google_calendar`, `gmail`, `google_drive`, `google_sheets`, `google_docs`, `google_slides`, `google_cloud` | `{"access_token", "refresh_token", "client_id", "client_secret"}` or provider-specific service-account bundle | per-account if `ilk` is set; per-tenant if pool |
+| `microsoft_graph`, `outlook_email`, `outlook_calendar`, `teams`, `sharepoint` | OAuth bundle | per-account if `ilk` is set; per-tenant if pool |
 | `slack` | `{"bot_token", "app_token", "signing_secret"}` | workspace-level (pool) or per-user (ilk) |
-| `hubspot`, `linked_helper`, etc. | per-provider object | |
+| `discord` | `{"bot_token": "...", "webhook_url": "..."}` depending on integration | |
+| `hubspot`, `salesforce`, `linked_helper` | per-provider object | |
+| `github`, `gitlab`, `jira`, `linear`, `notion` | OAuth bundle or provider token object | |
+| `stripe`, `twilio`, `sendgrid` | provider API key/token object | |
+| `smtp`, `imap` | `{"host", "port", "user", "password"}` | |
+| `aws`, `azure`, `google_cloud`, `s3` | cloud credential bundle | |
+| `webhook`, `bearer_token`, `api_key`, `oauth_bundle` | generic integration shapes for cases that are intentionally not provider-specific | |
 
 Rule of thumb when introducing a new `resource_type`: ask "would two consumers in the same tenant reasonably share this value?" If yes → that field belongs in the secret. If no (it's implementation-specific) → the consumer hardcodes or configures it via CONFIG_SET.
 
@@ -283,45 +325,45 @@ Every node that talks to vault needs to know its own ILK at boot to put into `me
 | Family | Self ILK source |
 | ------ | --------------- |
 | `SY.identity` | computed in-process via `deterministic_system_ilk_id` (it's the writer of identity SHM) |
-| Other `SY.*` system nodes listed in `hive.yaml system_nodes` | `wait_for_self_system_ilk_id` — reads SHM seeded deterministically by identity |
+| Other `SY.*` system nodes listed in `hive.yaml system_nodes` | deterministic system ILK derived from `node_name`; SHM lookup is no longer required for boot ownership |
 | `AI.*`, `IO.*`, `WF.*` (dynamically spawned via orchestrator) | `FLUXBEE_NODE_ILK_ID` env var injected by orchestrator's `systemd-run` after a successful `ILK_REGISTER` to identity. SDK helper `read_self_ilk_from_env()` reads it at boot |
 | `sy.orchestrator` | does not have a self ILK; doesn't interact with vault for its own behalf |
 
 The orchestrator already calls `ILK_REGISTER` on every `run_node` for non-system instances and persists `node_name → ilk_id` locally. The env-var injection is the missing step that lets the spawned node read its own ILK without an extra round-trip to identity. Implementation lives in Phase J'-0a (`docs/onworking COA/sy_vault_tasks.md`).
 
-`sy.frontdesk.gov` is a special case: it's listed as a system node in `hive.yaml` (identity seeds its ILK), but the binary is derived from the AI runner and currently doesn't call `wait_for_self_system_ilk_id`. Alignment to the SY pattern is tracked in Phase J'-0b.
+`sy.frontdesk.gov` is a special case: it's listed as a system node in `hive.yaml` but the binary is derived from the AI runner. It now receives/caches the deterministic system ILK through the SY alignment shim tracked in Phase J'-0b.
 
 ---
 
-## 8. Open items deferred from Phase J
+## 8. Open/deferred items
 
-These were marked "deferred" in the previous task list and remain deferred:
+These remain deferred after the Model D' implementation:
 
 - **Load balancing across pool secrets**. Multiple secrets with the same `(resource_type, tenant, ilk=null)` exist by design (rotation pre-loading, multi-key) but the read picks the most recent. True load-distribution across multiple usable keys is a future addition, not alpha.
-- **Push-based change notification** (`VAULT_SECRET_CHANGED` broadcast). Replaces polling. Future, not alpha.
+- **Push-based change notification is implemented.** `VAULT_SECRET_CHANGED` is the current mechanism; remaining work is unit/E2E coverage, not design.
 - **Per-user / per-agent secrets (`usr:<ilk>` namespace)**. When humans/agents acquire their own tokens. This is exactly the use case where `metadata.ilk` set per identity is the right model. Out of scope for alpha.
 - **Cross-hive secret federation**. Vault is per-hive in alpha.
 
 ---
 
-## 9. What changes vs the implemented Phase J
+## 9. What changed vs the removed Phase J
 
-Phase J (J1-J5) currently has the nodes accepting CONFIG_SET with `*_ref` strings and persisting them in local `secrets.json`. Under Model D' the nodes:
+Phase J (J1-J5) had nodes accepting CONFIG_SET with `*_ref` strings and persisting them in local `secrets.json`. Under Model D' the nodes:
 
 - Do **not** receive ref strings via CONFIG_SET.
 - Do **not** persist any vault ref locally. `secrets.json` for secrets goes away.
-- At boot and on periodic refresh, query vault directly using `REQUIRED_RESOURCES` declared in code.
+- At boot and on `VAULT_SECRET_CHANGED`, query vault directly using `REQUIRED_RESOURCES` declared in code.
 
 CONFIG_SET still exists for **non-secret configuration** (default models, timeouts, thresholds, catalog mode, etc.). The split is: vault is the only home for secret values; CONFIG_SET handles everything else.
 
 What's preserved from current code:
 
-- `VaultCaller`, `resolve_vault_ref`, `VaultRetryPolicy` in the SDK (still useful; rename/adapt as needed).
+- `VaultCaller`, `VaultRetryPolicy`, `ResourceType`, and `resolve_resource` in the SDK.
 - `wait_for_self_system_ilk_id` boot-time helper.
 - `deterministic_system_ilk_id` — moved from `sy_identity.rs` into `fluxbee_sdk::identity` so vault can use it.
 - The vault L2 message envelope (`VAULT_PUT`, `VAULT_GET`, etc.) — payload shapes change slightly (no more `owner_ilk` required, new `resource_type`, etc.).
 
-What's removed/rewritten:
+What was removed/rewritten:
 
 - All node-side persistence of `*_ref` keys in `secrets.json` (J1-J5 added these — they go).
 - `extract_*_api_key_ref` / `extract_*_postgres_url_ref` helpers (refs no longer in CONFIG_SET).
@@ -329,4 +371,4 @@ What's removed/rewritten:
 - The `is_admin()` L2-name check in vault — replaced by well-known ILK set comparison.
 - Phase K (IO nodes) tasks need to be rewritten to use Model D'.
 
-The migration plan goes into the updated Phase J in `sy_vault_tasks.md`.
+The active closeout plan is in `sy_vault_tasks.md`.
