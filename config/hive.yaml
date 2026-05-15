@@ -51,23 +51,24 @@ dist:
     enabled: true
     tool: "syncthing"
 
-# Declarative SY topology per hive role. SY.identity is always first by
-# contract: it seeds the fixed fluxbee root tenant and deterministic system
-# ILKs before any other SY needs identity metadata. `nodes` is the start
-# order; `wait_for` is the subset the orchestrator blocks on before
-# continuing bootstrap. Workers do not run SY.vault.
+# Declarative SY topology per hive role. `nodes` is the start order;
+# `wait_for` is the subset the orchestrator blocks on before continuing
+# bootstrap. Workers do not run SY.vault.
 system_nodes:
   motherbee:
-    # Boot order matters in Model D' (vault):
+    # Model D' boot order (enforced by sy_orchestrator::validate_system_nodes):
     #
-    # 1. SY.identity FIRST — seeds the fixed root tenant and deterministic
-    #    system ILKs from this same list.
-    # 2. SY.config.routes and all consumers SECOND (admin, architect,
-    #    storage, cognition, opa.rules, policy, timer, wf-rules, frontdesk-gov)
+    # 1. SY.config.routes FIRST — writer of /jsr-config-<hive> SHM that
+    #    the router consults for cross-hive route lookups. Other SY nodes
+    #    don't depend on its SHM being populated to register, but having
+    #    it first guarantees routes exist before any cross-hive traffic.
+    # 2. All vault consumers SECOND (identity, admin, architect, storage,
+    #    cognition, opa.rules, policy, timer, wf-rules, frontdesk-gov)
     #    so they REGISTER WITH THE ROUTER before vault emits its
     #    bootstrap broadcast. Each consumer tolerates VAULT_UNAVAILABLE
     #    at its initial lookup — it logs degraded and waits for the
-    #    rescue broadcast.
+    #    rescue broadcast. Every SY computes its own deterministic
+    #    system ILK locally (no SHM/seed dependency on identity).
     # 3. SY.vault LAST — opens vault.db, registers, and emits one
     #    VAULT_SECRET_CHANGED { op=put } per existing secret. Because
     #    every consumer is already in the router's registry at this
@@ -80,8 +81,8 @@ system_nodes:
     # first, no consumer is registered yet and the broadcast is lost,
     # leaving the cluster stuck. Vault-last guarantees delivery.
     nodes:
-      - SY.identity
       - SY.config.routes
+      - SY.identity
       - SY.opa.rules
       - SY.admin
       - SY.architect
@@ -103,16 +104,16 @@ system_nodes:
       - SY.vault
   worker:
     nodes:
-      - SY.identity
       - SY.config.routes
+      - SY.identity
       - SY.opa.rules
       - SY.cognition
       - SY.policy
       - SY.timer
       - SY.wf-rules
     wait_for:
-      - SY.identity
       - SY.config.routes
+      - SY.identity
       - SY.opa.rules
       - SY.cognition
       - SY.policy
