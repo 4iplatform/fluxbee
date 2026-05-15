@@ -60,10 +60,10 @@ system_nodes:
   motherbee:
     # Boot order matters in Model D' (vault):
     #
-    # 1. SY.config.routes FIRST — writes routing SHM, prereq for the
-    #    router to deliver messages between everyone below.
-    # 2. All consumers SECOND (identity, admin, architect, storage,
-    #    cognition, opa.rules, policy, timer, wf-rules, frontdesk-gov)
+    # 1. SY.identity FIRST — seeds the fixed root tenant and deterministic
+    #    system ILKs from this same list.
+    # 2. SY.config.routes and all consumers SECOND (admin, architect,
+    #    storage, cognition, opa.rules, policy, timer, wf-rules, frontdesk-gov)
     #    so they REGISTER WITH THE ROUTER before vault emits its
     #    bootstrap broadcast. Each consumer tolerates VAULT_UNAVAILABLE
     #    at its initial lookup — it logs degraded and waits for the
@@ -80,8 +80,8 @@ system_nodes:
     # first, no consumer is registered yet and the broadcast is lost,
     # leaving the cluster stuck. Vault-last guarantees delivery.
     nodes:
-      - SY.config.routes
       - SY.identity
+      - SY.config.routes
       - SY.opa.rules
       - SY.admin
       - SY.architect
