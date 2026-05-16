@@ -14,7 +14,7 @@ Archi consulta este help en tiempo de ejecución llamando:
 - `GET /admin/actions/{action}` — detalle de una acción específica
 
 El PlanCompiler tiene la herramienta `get_admin_action_help` como FunctionTool registrado.  
-Archi accede al mismo endpoint a través del sistema de lectura genérico (`fluxbee_system_read`).
+Archi accede al mismo endpoint a través del sistema de lectura genérico (`fluxbee_system_get`).
 
 ### Acciones que requieren CONFIRM
 

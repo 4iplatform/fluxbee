@@ -908,6 +908,8 @@ impl FunctionTool for ArchitectSystemGetTool {
                 /hives/{{hive}}/nodes, /hives/{{hive}}/nodes/{{name}}/config (persisted), \
                 /hives/{{hive}}/identity/ilks, /hives/{{hive}}/identity/ilks/{{ilk_id}}, \
                 /hives/{{hive}}/identity/tenants, /hives/{{hive}}/identity/tenants/{{tenant_id}}, \
+                /hives/{{hive}}/vault/secrets (metadata list), \
+                /hives/{{hive}}/vault/secrets/{{key}}/metadata, \
                 /hives/{{hive}}/nodes/{{name}}/control/config-get (live contract), \
                 /hives/{{hive}}/wf-rules, /hives/{{hive}}/drift-alerts, \
                 /admin/actions/{{action}} (schema + example_scmd). \
@@ -10243,6 +10245,49 @@ fn scmd_query_params(raw_query: Option<&str>) -> serde_json::Map<String, Value> 
     params
 }
 
+fn scmd_vault_list_params(raw_query: Option<&str>) -> Value {
+    let mut filter = serde_json::Map::new();
+    let Some(query) = raw_query else {
+        return json!({});
+    };
+    for pair in query.split('&').filter(|segment| !segment.is_empty()) {
+        let (key, value) = match pair.split_once('=') {
+            Some(parts) => parts,
+            None => continue,
+        };
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        match key {
+            "prefix" | "tenant_id" | "resource_type" | "ilk" => {
+                filter.insert(key.to_string(), Value::String(percent_decode_simple(value)));
+            }
+            "tags" => {
+                let tags = percent_decode_simple(value)
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|tag| !tag.is_empty())
+                    .map(|tag| Value::String(tag.to_string()))
+                    .collect::<Vec<_>>();
+                if !tags.is_empty() {
+                    filter.insert("tags".to_string(), Value::Array(tags));
+                }
+            }
+            "limit" => {
+                if let Ok(limit) = value.parse::<u64>() {
+                    filter.insert("limit".to_string(), json!(limit));
+                }
+            }
+            _ => {}
+        }
+    }
+    if filter.is_empty() {
+        json!({})
+    } else {
+        json!({ "filter": filter })
+    }
+}
+
 fn architect_admin_action_timeout(action: &str) -> Duration {
     match action {
         "executor_validate_plan" | "executor_execute_plan" => {
@@ -10677,6 +10722,18 @@ fn translate_scmd(
             action: "get_tenant".to_string(),
             target_hive: (*hive_id).to_string(),
             params: json!({ "tenant_id": tenant_id }),
+        }),
+        ("GET", ["hives", hive_id, "vault", "secrets"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "vault_list".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: scmd_vault_list_params(raw_query),
+        }),
+        ("GET", ["hives", hive_id, "vault", "secrets", key, "metadata"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "vault_get_metadata".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({ "key": percent_decode_simple(key) }),
         }),
         ("PUT", ["hives", hive_id, "identity", "tenants", tenant_id]) => {
             let mut params = parsed.body.unwrap_or_else(|| json!({}));
@@ -24111,6 +24168,49 @@ mod tests {
             translated.params,
             json!({
                 "tenant_id": "tnt:550e8400-e29b-41d4-a716-446655440000"
+            })
+        );
+    }
+
+    #[test]
+    fn translate_vault_list_scmd() {
+        let translated = translate_scmd(
+            "motherbee",
+            parse(
+                "curl -X GET /hives/motherbee/vault/secrets?prefix=infra:&resource_type=openai&tags=provider:openai,scope:root&limit=50",
+            ),
+        )
+        .expect("translation should succeed");
+
+        assert_eq!(translated.action, "vault_list");
+        assert_eq!(translated.target_hive, "motherbee");
+        assert_eq!(
+            translated.params,
+            json!({
+                "filter": {
+                    "prefix": "infra:",
+                    "resource_type": "openai",
+                    "tags": ["provider:openai", "scope:root"],
+                    "limit": 50
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn translate_vault_get_metadata_scmd() {
+        let translated = translate_scmd(
+            "motherbee",
+            parse("curl -X GET /hives/motherbee/vault/secrets/infra%3Aopenai-api-key/metadata"),
+        )
+        .expect("translation should succeed");
+
+        assert_eq!(translated.action, "vault_get_metadata");
+        assert_eq!(translated.target_hive, "motherbee");
+        assert_eq!(
+            translated.params,
+            json!({
+                "key": "infra:openai-api-key"
             })
         );
     }

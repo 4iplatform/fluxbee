@@ -4831,6 +4831,18 @@ async fn handle_hive_paths(
                     serde_json::Value::String(tenant_id.to_string()),
                 );
             }
+            if let Some(resource_type) = query.get("resource_type") {
+                filter.insert(
+                    "resource_type".to_string(),
+                    serde_json::Value::String(resource_type.to_string()),
+                );
+            }
+            if let Some(ilk) = query.get("ilk") {
+                filter.insert(
+                    "ilk".to_string(),
+                    serde_json::Value::String(ilk.to_string()),
+                );
+            }
             if let Some(tags) = query.get("tags") {
                 filter.insert(
                     "tags".to_string(),
