@@ -3067,6 +3067,24 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "list_taps",
+        route: InternalActionRoute::Query("list_taps"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "add_tap",
+        route: InternalActionRoute::Command("add_tap"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "delete_tap",
+        route: InternalActionRoute::Command("delete_tap"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "run_node",
         route: InternalActionRoute::Command("run_node"),
         requires_target: true,
@@ -4127,6 +4145,35 @@ async fn handle_http(
             let payload = serde_json::json!({ "pattern": pattern });
             let (status, resp) =
                 handle_admin_command(ctx, client, "delete_vpn", payload, hive).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("GET", "/taps") => {
+            let hive = query.get("hive").cloned();
+            let (status, resp) = handle_admin_query(ctx, client, "list_taps", hive).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("POST", "/taps") => {
+            // ROUTER-TAP-5: install a new tap on the target hive. Body shape
+            // mirrors `TapConfig` in sy_config_routes (match_src, match_dst,
+            // target, mode, enabled).
+            let tap: serde_json::Value = serde_json::from_slice(&body)?;
+            let hive = query.get("hive").cloned();
+            let (status, resp) =
+                handle_admin_command(ctx, client, "add_tap", tap, hive).await?;
+            respond_json(stream, status, &resp).await?;
+        }
+        ("DELETE", "/taps") => {
+            let match_src = query.get("match_src").cloned().unwrap_or_default();
+            let match_dst = query.get("match_dst").cloned().unwrap_or_default();
+            let target = query.get("target").cloned().unwrap_or_default();
+            let hive = query.get("hive").cloned();
+            let payload = serde_json::json!({
+                "match_src": match_src,
+                "match_dst": match_dst,
+                "target": target,
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "delete_tap", payload, hive).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("PUT", "/config/routes") => {
@@ -6816,6 +6863,8 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "delete_route"
             | "add_vpn"
             | "delete_vpn"
+            | "add_tap"
+            | "delete_tap"
             | "run_node"
             | "start_node"
             | "restart_node"
@@ -6851,6 +6900,7 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "remove_hive"
             | "delete_route"
             | "delete_vpn"
+            | "delete_tap"
             | "kill_node"
             | "remove_node_instance"
             | "remove_runtime_version"
@@ -6957,6 +7007,10 @@ fn admin_action_summary(action: &str) -> &'static str {
         "delete_route" => "Delete a route rule from a hive.",
         "add_vpn" => "Add a VPN pattern to a hive.",
         "delete_vpn" => "Delete a VPN pattern from a hive.",
+        "list_taps" => "List installed router-level taps on a hive. A tap mirrors matched unicast traffic (match_src → match_dst) to an additional target as a fire-and-forget secondary delivery. Read-only.",
+        "add_tap" => "Install a router-level tap on a hive. When a unicast message matches (match_src, match_dst), the router enqueues a fire-and-forget secondary copy to `target` with `meta.via_tap=true` (single-hop tap, no cascading). Useful for observability/mirroring without putting a WF node in the path. Exact L2 name matching only.",
+        "delete_tap" => "Delete an installed router-level tap by its (match_src, match_dst, target) natural key.",
+        "delete_vpn" => "Delete a VPN pattern from a hive.",
         "update" => "Run hive update workflow.",
         "sync_hint" => "Trigger a sync hint workflow.",
         "opa_compile_apply" => "Compile and apply OPA policy.",
@@ -7057,6 +7111,9 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "add_route" => vec!["POST /hives/{hive}/routes"],
         "delete_route" => vec!["DELETE /hives/{hive}/routes/{prefix}"],
         "add_vpn" => vec!["POST /hives/{hive}/vpns"],
+        "list_taps" => vec!["GET /hives/{hive}/taps"],
+        "add_tap" => vec!["POST /hives/{hive}/taps"],
+        "delete_tap" => vec!["DELETE /hives/{hive}/taps?match_src=...&match_dst=...&target=..."],
         "delete_vpn" => vec!["DELETE /hives/{hive}/vpns/{pattern}"],
         "update" => vec!["POST /hives/{hive}/update"],
         "sync_hint" => vec!["POST /hives/{hive}/sync-hint"],
@@ -7982,13 +8039,47 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
                 "description": "Issues an invoice",
                 "input_schema": {
                     "type": "object",
+                    "required": ["customer_id"],
                     "properties": {
                         "customer_id": {"type": "string"}
                     }
                 },
                 "initial_state": "collecting_data",
                 "terminal_states": ["completed"],
-                "states": []
+                "states": [
+                    {
+                        "name": "collecting_data",
+                        "description": "Sends the invoice request and waits for validation.",
+                        "entry_actions": [
+                            {
+                                "type": "send_message",
+                                "target": "IO.quickbooks@motherbee",
+                                "meta": {"msg": "INVOICE_CREATE_REQUEST"},
+                                "payload": {
+                                    "customer_id": {"$ref": "input.customer_id"}
+                                }
+                            }
+                        ],
+                        "exit_actions": [],
+                        "transitions": [
+                            {
+                                "event_match": {"msg": "DATA_VALIDATION_RESPONSE"},
+                                "guard": "event.payload.complete == true",
+                                "target_state": "completed",
+                                "actions": [
+                                    {"type": "set_variable", "name": "validated_at", "value": "now()"}
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        "name": "completed",
+                        "description": "Workflow finished.",
+                        "entry_actions": [],
+                        "exit_actions": [],
+                        "transitions": []
+                    }
+                ]
             },
             "auto_spawn": true,
             "tenant_id": "tnt:43d576a3-d712-4d91-9245-5d5463dd693e"
@@ -8184,6 +8275,13 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
             r#"curl -X POST /hives/motherbee/vpns -d '{"pattern":"worker-*","vpn_id":220}'"#
         }
         "delete_vpn" => "curl -X DELETE /hives/motherbee/vpns/worker-*",
+        "list_taps" => "curl -X GET /hives/motherbee/taps",
+        "add_tap" => {
+            r#"curl -X POST /hives/motherbee/taps -d '{"match_src":"IO.api.sales@motherbee","match_dst":"AI.sales@motherbee","target":"IO.slack.sales@motherbee","mode":"best_effort","enabled":true}'"#
+        }
+        "delete_tap" => {
+            "curl -X DELETE '/hives/motherbee/taps?match_src=IO.api.sales@motherbee&match_dst=AI.sales@motherbee&target=IO.slack.sales@motherbee'"
+        }
         "get_storage" => "curl -X GET /config/storage",
         "set_storage" => r#"curl -X PUT /config/storage -d '{"path":"/var/lib/fluxbee"}'"#,
         "list_deployments" => "curl -X GET /deployments",

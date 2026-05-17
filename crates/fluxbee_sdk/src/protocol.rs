@@ -88,6 +88,17 @@ pub struct Meta {
     pub priority: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<Value>,
+    /// True when this message is a tap copy emitted by the router as part
+    /// of a `TapEntry` fanout. Set ONLY by the router on the secondary copy
+    /// it generates; producers and consumers must never set it. Its purpose
+    /// is loop prevention: a tap copy must not itself trigger further tap
+    /// fanout (single-hop tap semantics). Serialized only when true.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub via_tap: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -489,6 +500,7 @@ pub fn build_system_message(
             result_detail_code: None,
             priority: None,
             context: None,
+            via_tap: false,
         },
         payload,
     }

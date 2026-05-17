@@ -17,7 +17,11 @@ pub const SHM_MAGIC: u32 = 0x4A535352; // "JSSR"
 pub const SHM_VERSION: u32 = 2;
 
 pub const CONFIG_MAGIC: u32 = 0x4A534343; // "JSCC"
-pub const CONFIG_VERSION: u32 = 1;
+/// CONFIG_VERSION = 2: bumped to add the `taps` section (TapEntry array)
+/// for the router-level tap/mirror primitive (ROUTER-TAP-2). Readers that
+/// see version=2 must not read past `tap_count` taps. Older binaries that
+/// only know version=1 will fail the version check and refuse to attach.
+pub const CONFIG_VERSION: u32 = 2;
 
 pub const LSA_MAGIC: u32 = 0x4A534C41; // "JSLA"
 pub const LSA_VERSION: u32 = 2;
@@ -43,6 +47,11 @@ const SEQLOCK_READ_TIMEOUT_MS: u64 = 5;
 pub const MAX_NODES: u32 = 1024;
 pub const MAX_STATIC_ROUTES: u32 = 256;
 pub const MAX_VPN_ASSIGNMENTS: u32 = 256;
+/// Maximum number of router-level tap entries per hive. Each tap mirrors
+/// matched traffic to one additional destination as a fire-and-forget
+/// secondary delivery. 256 is generous for observability use cases without
+/// inflating the SHM region appreciably (each TapEntry is ~820 bytes).
+pub const MAX_TAP_ENTRIES: u32 = 256;
 pub const MAX_REMOTE_HIVES: u32 = 16;
 pub const MAX_REMOTE_NODES: u32 = 1024;
 pub const MAX_REMOTE_ROUTES: u32 = 256;
@@ -168,7 +177,9 @@ pub struct ConfigHeader {
     pub created_at: u64,
     pub updated_at: u64,
 
-    pub _reserved: [u8; 38],
+    /// ROUTER-TAP-2: number of installed tap entries in the taps section.
+    pub tap_count: u32,
+    pub _reserved: [u8; 34],
 }
 
 #[repr(C)]
@@ -203,6 +214,39 @@ pub struct VpnAssignment {
     pub flags: u16,
 
     pub _reserved: [u8; 20],
+}
+
+/// Router-level tap entry. When a unicast message matches `(match_src, match_dst)`,
+/// the router enqueues a fire-and-forget secondary copy to `target`. The copy
+/// carries `meta.via_tap = true` so it cannot itself trigger further taps
+/// (single-hop tap semantics). Matching uses exact L2 names (no wildcards in v1).
+///
+/// `target` may live in another hive — the router resolves the copy through
+/// normal cross-hive routing. VPN mismatch between matched traffic and target
+/// causes the copy to be dropped with a warn log; the primary delivery is
+/// never affected.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct TapEntry {
+    pub match_src: [u8; 256],
+    pub match_src_len: u16,
+    pub _pad0: [u8; 6],
+
+    pub match_dst: [u8; 256],
+    pub match_dst_len: u16,
+    pub _pad1: [u8; 6],
+
+    pub target: [u8; 256],
+    pub target_len: u16,
+    pub _pad2: [u8; 6],
+
+    /// 0 = best_effort (only mode supported in v1).
+    pub mode: u8,
+    pub enabled: u8,
+    pub flags: u16,
+    pub installed_at: u64,
+
+    pub _reserved: [u8; 32],
 }
 
 #[repr(C)]
@@ -508,6 +552,9 @@ struct RegionLayout {
     node_offset: usize,
     static_offset: usize,
     vpn_offset: usize,
+    /// ROUTER-TAP-2: byte offset of the taps section within the config
+    /// region. Zero when the region doesn't host taps (e.g. router region).
+    tap_offset: usize,
     hive_offset: usize,
     remote_node_offset: usize,
     remote_route_offset: usize,
@@ -582,6 +629,8 @@ pub struct ConfigSnapshot {
     pub header: ConfigHeaderSnapshot,
     pub routes: Vec<StaticRouteEntry>,
     pub vpns: Vec<VpnAssignment>,
+    /// ROUTER-TAP-2: installed tap entries read from the taps section.
+    pub taps: Vec<TapEntry>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -590,6 +639,8 @@ pub struct ConfigHeaderSnapshot {
     pub vpn_assignment_count: u32,
     pub config_version: u64,
     pub heartbeat: u64,
+    /// ROUTER-TAP-2: number of installed taps for observability/listing.
+    pub tap_count: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -1024,6 +1075,39 @@ impl ConfigRegionWriter {
         Ok(())
     }
 
+    /// ROUTER-TAP-2: replace the entire taps section with `taps`. Same
+    /// write semantics as routes/vpns: seqlock-guarded, zeroed empty slots,
+    /// optional config_version bump for change notification consumers.
+    pub fn write_taps(
+        &mut self,
+        taps: &[TapEntry],
+        bump_version: bool,
+    ) -> Result<(), ShmError> {
+        if taps.len() > MAX_TAP_ENTRIES as usize {
+            return Err(ShmError::ValueTooLong {
+                len: taps.len(),
+                max: MAX_TAP_ENTRIES as usize,
+            });
+        }
+        let (header, entries): (&mut ConfigHeader, &mut [TapEntry]) =
+            config_header_and_taps_mut(&mut self.mmap, &self.layout)
+                .ok_or(ShmError::InvalidHeader)?;
+        let _write_guard = SeqlockWriteGuard::new(&header.seq);
+        for entry in entries.iter_mut() {
+            *entry = empty_tap_entry();
+        }
+        for (idx, tap) in taps.iter().enumerate() {
+            entries[idx] = *tap;
+        }
+        header.tap_count = taps.len() as u32;
+        if bump_version {
+            header.config_version = header.config_version.saturating_add(1);
+        }
+        header.updated_at = now_epoch_ms();
+        header.heartbeat = header.updated_at;
+        Ok(())
+    }
+
     pub fn write_vpn_assignments(
         &mut self,
         vpns: &[VpnAssignment],
@@ -1097,6 +1181,7 @@ impl ConfigRegionReader {
             vpn_assignment_count: header.vpn_assignment_count,
             config_version: header.config_version,
             heartbeat: header.heartbeat,
+            tap_count: header.tap_count,
         })
     }
 
@@ -2246,6 +2331,7 @@ fn layout_router() -> RegionLayout {
         node_offset,
         static_offset: 0,
         vpn_offset: 0,
+        tap_offset: 0,
         hive_offset: 0,
         remote_node_offset: 0,
         remote_route_offset: 0,
@@ -2258,17 +2344,20 @@ fn layout_config() -> RegionLayout {
     let header_size = size_of::<ConfigHeader>();
     let routes_size = size_of::<StaticRouteEntry>() * MAX_STATIC_ROUTES as usize;
     let vpns_size = size_of::<VpnAssignment>() * MAX_VPN_ASSIGNMENTS as usize;
+    let taps_size = size_of::<TapEntry>() * MAX_TAP_ENTRIES as usize;
 
     let header_offset = 0;
     let static_offset = align_up(header_offset + header_size, REGION_ALIGNMENT);
     let vpn_offset = align_up(static_offset + routes_size, REGION_ALIGNMENT);
-    let total_len = align_up(vpn_offset + vpns_size, REGION_ALIGNMENT);
+    let tap_offset = align_up(vpn_offset + vpns_size, REGION_ALIGNMENT);
+    let total_len = align_up(tap_offset + taps_size, REGION_ALIGNMENT);
 
     RegionLayout {
         header_offset,
         node_offset: 0,
         static_offset,
         vpn_offset,
+        tap_offset,
         hive_offset: 0,
         remote_node_offset: 0,
         remote_route_offset: 0,
@@ -2296,6 +2385,7 @@ fn layout_lsa() -> RegionLayout {
         node_offset: 0,
         static_offset: 0,
         vpn_offset: 0,
+        tap_offset: 0,
         hive_offset,
         remote_node_offset,
         remote_route_offset,
@@ -2356,6 +2446,7 @@ fn layout_memory() -> RegionLayout {
         node_offset: data_offset,
         static_offset: 0,
         vpn_offset: 0,
+        tap_offset: 0,
         hive_offset: 0,
         remote_node_offset: 0,
         remote_route_offset: 0,
@@ -2737,10 +2828,12 @@ fn read_config_snapshot(
         atomic::fence(Ordering::Acquire);
         let route_count = header.static_route_count as usize;
         let vpn_count = header.vpn_assignment_count as usize;
+        let tap_count = header.tap_count as usize;
         let routes =
             read_slice::<StaticRouteEntry>(mmap, layout.static_offset, MAX_STATIC_ROUTES as usize)?;
         let vpns =
             read_slice::<VpnAssignment>(mmap, layout.vpn_offset, MAX_VPN_ASSIGNMENTS as usize)?;
+        let taps = read_slice::<TapEntry>(mmap, layout.tap_offset, MAX_TAP_ENTRIES as usize)?;
         let mut route_snapshot = Vec::new();
         for route in routes.iter().take(route_count) {
             route_snapshot.push(*route);
@@ -2748,6 +2841,10 @@ fn read_config_snapshot(
         let mut vpn_snapshot = Vec::new();
         for vpn in vpns.iter().take(vpn_count) {
             vpn_snapshot.push(*vpn);
+        }
+        let mut tap_snapshot = Vec::new();
+        for tap in taps.iter().take(tap_count) {
+            tap_snapshot.push(*tap);
         }
         atomic::fence(Ordering::Acquire);
         let s2 = header.seq.load(Ordering::Acquire);
@@ -2758,9 +2855,11 @@ fn read_config_snapshot(
                     vpn_assignment_count: header.vpn_assignment_count,
                     config_version: header.config_version,
                     heartbeat: header.heartbeat,
+                    tap_count: header.tap_count,
                 },
                 routes: route_snapshot,
                 vpns: vpn_snapshot,
+                taps: tap_snapshot,
             });
         }
     }
@@ -3175,6 +3274,16 @@ fn config_header_and_vpns_mut<'a>(
     let vpns_offset = layout.vpn_offset;
     let vpns_len = MAX_VPN_ASSIGNMENTS as usize;
     header_and_slice_mut::<ConfigHeader, VpnAssignment>(mmap, header_offset, vpns_offset, vpns_len)
+}
+
+fn config_header_and_taps_mut<'a>(
+    mmap: &'a mut MmapMut,
+    layout: &RegionLayout,
+) -> Option<(&'a mut ConfigHeader, &'a mut [TapEntry])> {
+    let header_offset = layout.header_offset;
+    let taps_offset = layout.tap_offset;
+    let taps_len = MAX_TAP_ENTRIES as usize;
+    header_and_slice_mut::<ConfigHeader, TapEntry>(mmap, header_offset, taps_offset, taps_len)
 }
 
 fn lsa_header_and_entries_mut<'a>(
@@ -3625,6 +3734,25 @@ fn empty_vpn_assignment() -> VpnAssignment {
         priority: 0,
         flags: 0,
         _reserved: [0u8; 20],
+    }
+}
+
+fn empty_tap_entry() -> TapEntry {
+    TapEntry {
+        match_src: [0u8; 256],
+        match_src_len: 0,
+        _pad0: [0u8; 6],
+        match_dst: [0u8; 256],
+        match_dst_len: 0,
+        _pad1: [0u8; 6],
+        target: [0u8; 256],
+        target_len: 0,
+        _pad2: [0u8; 6],
+        mode: 0,
+        enabled: 0,
+        flags: 0,
+        installed_at: 0,
+        _reserved: [0u8; 32],
     }
 }
 

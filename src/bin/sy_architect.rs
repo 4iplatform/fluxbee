@@ -5729,6 +5729,7 @@ const PROGRAMMER_QUERY_ALLOWED_ACTIONS: &[&str] = &[
     "get_node_status",
     "get_node_config",
     "list_routes",
+    "list_taps",
     "wf_rules_list_workflows",
     "wf_rules_get_workflow",
     "wf_rules_get_status",

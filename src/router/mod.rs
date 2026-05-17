@@ -876,7 +876,7 @@ async fn handle_message(
     router_uuid: Uuid,
     is_gateway: bool,
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
-    _snapshot: Option<&ConfigSnapshot>,
+    snapshot: Option<&ConfigSnapshot>,
 ) -> Result<(), RouterError> {
     let mut msg = msg.clone();
     assign_thread_seq_if_missing(&mut msg, thread_sequences).await;
@@ -1240,7 +1240,229 @@ async fn handle_message(
             let _ = sender.send(data.clone());
         }
     }
+
+    // ROUTER-TAP-3: tap fanout. After primary unicast delivery is done,
+    // scan installed taps and enqueue fire-and-forget secondary copies to
+    // each matched tap target. Skipped when:
+    //   - the inbound message is already a tap copy (via_tap=true) — single
+    //     hop tap semantics, no cascading
+    //   - destination was not Unicast (broadcasts/resolves use different
+    //     fanout semantics already)
+    //   - no config snapshot available (router booted without config SHM)
+    // Tap failures never affect the primary delivery; they are logged at
+    // warn and dropped.
+    if !msg.meta.via_tap {
+        if let Destination::Unicast(dst_label) = &msg.routing.dst {
+            if let Some(snap) = snapshot {
+                if !snap.taps.is_empty() {
+                    fanout_taps_for_unicast(
+                        &msg,
+                        dst_label,
+                        snap,
+                        &src_handle,
+                        nodes,
+                        fib,
+                        peers,
+                        peer_routers,
+                        peer_nodes,
+                        wan_peers,
+                        lsa_snapshot,
+                        memory_reader,
+                        hive_id,
+                        router_uuid,
+                        is_gateway,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
     Ok(())
+}
+
+/// Fire-and-forget tap fanout for one inbound unicast message. For every
+/// installed `TapEntry` where (match_src, match_dst) equals the message's
+/// `(src_l2_name, dst label)`, build a copy with `meta.via_tap = true` and
+/// dispatch it through the normal name-based resolution path. Failures
+/// (target unknown, VPN mismatch, remote unreachable) increment per-tap
+/// log lines and drop the copy — they NEVER bubble up to the primary path.
+///
+/// `dst_label` is the literal value from `Destination::Unicast`. It may be
+/// either a UUID string or an L2 name. Tap match is by L2 name; if the
+/// label was a UUID we resolve back to a node name from the local registry
+/// so taps installed by L2 name still match.
+async fn fanout_taps_for_unicast(
+    msg: &Message,
+    dst_label: &str,
+    snap: &ConfigSnapshot,
+    src_handle: &NodeHandle,
+    nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
+    fib: &Arc<Mutex<Vec<FibEntry>>>,
+    peers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
+    peer_routers: &Arc<Mutex<std::collections::HashMap<Uuid, PeerRouter>>>,
+    peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
+    wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
+    lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
+    memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
+    hive_id: &str,
+    router_uuid: Uuid,
+    is_gateway: bool,
+) {
+    let src_name = msg.routing.src_l2_name.as_deref().unwrap_or("");
+    if src_name.is_empty() {
+        return;
+    }
+
+    // If dst_label is a UUID, resolve back to the L2 name of the target
+    // node so tap matching (which is by L2 name) still works.
+    let dst_name_owned: String = if let Ok(dst_uuid) = Uuid::parse_str(dst_label) {
+        let nodes_guard = nodes.lock().await;
+        match nodes_guard.get(&dst_uuid) {
+            Some(handle) => handle.name.clone(),
+            None => {
+                let peer_guard = peer_nodes.lock().await;
+                peer_guard
+                    .get(&dst_uuid)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default()
+            }
+        }
+    } else {
+        dst_label.to_string()
+    };
+    if dst_name_owned.is_empty() {
+        return;
+    }
+
+    // Iterate installed taps; for each match emit one copy.
+    for tap in &snap.taps {
+        if tap.enabled == 0 {
+            continue;
+        }
+        let tap_src = bytes_to_string(&tap.match_src, tap.match_src_len as usize);
+        let tap_dst = bytes_to_string(&tap.match_dst, tap.match_dst_len as usize);
+        if tap_src != src_name || tap_dst != dst_name_owned {
+            continue;
+        }
+        let tap_target = bytes_to_string(&tap.target, tap.target_len as usize);
+        if tap_target.is_empty() {
+            continue;
+        }
+
+        let mut copy = msg.clone();
+        copy.meta.via_tap = true;
+        copy.routing.dst = Destination::Unicast(tap_target.to_string());
+        // Mint a fresh trace_id so observer traces can be correlated to
+        // this tap copy specifically without colliding with the primary.
+        copy.routing.trace_id = Uuid::new_v4().to_string();
+
+        let nodes_guard = nodes.lock().await;
+        let resolved = match resolve_by_name(
+            tap_target,
+            src_handle,
+            &nodes_guard,
+            fib,
+            &copy.meta,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    tap_src = %src_name,
+                    tap_dst = %dst_name_owned,
+                    tap_target = %tap_target,
+                    error = %err,
+                    "router tap copy: name resolution failed, dropping copy"
+                );
+                continue;
+            }
+        };
+        match resolved {
+            ResolvedRoute::Drop => {
+                tracing::warn!(
+                    tap_src = %src_name,
+                    tap_dst = %dst_name_owned,
+                    tap_target = %tap_target,
+                    "router tap copy: resolver returned Drop, copy discarded"
+                );
+            }
+            ResolvedRoute::Unreachable(reason) => {
+                tracing::warn!(
+                    tap_src = %src_name,
+                    tap_dst = %dst_name_owned,
+                    tap_target = %tap_target,
+                    reason = reason,
+                    "router tap copy: target unreachable, copy dropped"
+                );
+            }
+            ResolvedRoute::Deliver(target_uuid) => {
+                let target_snapshot = nodes_guard.get(&target_uuid).cloned();
+                drop(nodes_guard);
+                let Some(target_handle) = target_snapshot else {
+                    tracing::warn!(
+                        tap_target = %tap_target,
+                        target_uuid = %target_uuid,
+                        "router tap copy: deliver target not in local nodes, dropped"
+                    );
+                    continue;
+                };
+                if !vpn_allows_between(
+                    &copy.meta,
+                    &src_handle.name,
+                    src_handle.vpn_id,
+                    &target_handle.name,
+                    target_handle.vpn_id,
+                ) {
+                    tracing::warn!(
+                        tap_src = %src_name,
+                        tap_dst = %dst_name_owned,
+                        tap_target = %tap_target,
+                        "router tap copy: VPN mismatch with target, dropped"
+                    );
+                    continue;
+                }
+                let data = match serialize_for_local_delivery(memory_reader, hive_id, &copy).await {
+                    Ok(data) => data,
+                    Err(err) => {
+                        tracing::warn!(
+                            tap_target = %tap_target,
+                            error = %err,
+                            "router tap copy: serialization failed, dropped"
+                        );
+                        continue;
+                    }
+                };
+                let _ = target_handle.sender.send(data);
+            }
+            ResolvedRoute::ForwardRouter(peer_uuid) => {
+                drop(nodes_guard);
+                if copy.routing.ttl <= 1 {
+                    tracing::warn!(
+                        tap_target = %tap_target,
+                        "router tap copy: TTL exhausted before peer router forward, dropped"
+                    );
+                    continue;
+                }
+                let _ = send_to_peer_router(peers, peer_uuid, &copy).await;
+            }
+            ResolvedRoute::ForwardHive(remote_hive) => {
+                drop(nodes_guard);
+                let _ = forward_to_hive(
+                    &remote_hive,
+                    &copy,
+                    is_gateway,
+                    peer_routers,
+                    peers,
+                    wan_peers,
+                    router_uuid,
+                    &src_handle.sender,
+                )
+                .await;
+            }
+        }
+    }
+    let _ = lsa_snapshot; // currently unused inside fanout but kept for symmetry
 }
 
 async fn assign_thread_seq_if_missing(

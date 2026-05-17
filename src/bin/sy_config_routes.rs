@@ -17,8 +17,8 @@ use fluxbee_sdk::{
     NodeReceiver, NodeSender, NODE_CONFIG_APPLY_MODE_REPLACE, NODE_CONFIG_CONTROL_TARGET,
 };
 use json_router::shm::{
-    copy_bytes_with_len, now_epoch_ms, ConfigRegionWriter, StaticRouteEntry, VpnAssignment,
-    ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
+    copy_bytes_with_len, now_epoch_ms, ConfigRegionWriter, StaticRouteEntry, TapEntry,
+    VpnAssignment, ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
 };
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +35,9 @@ struct SyConfigFile {
     routes: Vec<RouteConfig>,
     #[serde(default)]
     vpns: Vec<VpnConfig>,
+    /// ROUTER-TAP-4: router-level tap entries persisted alongside routes/vpns.
+    #[serde(default)]
+    taps: Vec<TapConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -59,6 +62,29 @@ struct VpnConfig {
     vpn_id: u32,
     #[serde(default)]
     priority: Option<u16>,
+}
+
+/// ROUTER-TAP-4: persisted shape of a tap entry inside the config JSON.
+/// Mirrors `shm::TapEntry` semantics: exact L2 name match on `(match_src,
+/// match_dst)`, fire-and-forget copy to `target`. `enabled` defaults to
+/// true so adding a tap is immediately active unless the operator opts out.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+struct TapConfig {
+    match_src: String,
+    match_dst: String,
+    target: String,
+    #[serde(default = "default_tap_mode")]
+    mode: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+fn default_tap_mode() -> String {
+    "best_effort".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[tokio::main]
@@ -254,11 +280,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             next_config.vpns = vpns;
                         }
                     }
+                    "tap" | "taps" => {
+                        let taps = match parse_taps(&payload.config) {
+                            Ok(taps) => taps,
+                            Err(err) => {
+                                tracing::warn!("invalid taps payload: {err}");
+                                let _ = send_config_response(
+                                    &sender,
+                                    &msg,
+                                    "tap",
+                                    payload.version,
+                                    "error",
+                                    Some("INVALID_CONFIG".to_string()),
+                                    Some(err.to_string()),
+                                    &hive_id,
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
+                        if let Some(taps) = taps {
+                            next_config.taps = taps;
+                        }
+                    }
                     _ => {
                         continue;
                     }
                 }
-                if next_config.routes == sy_config.routes && next_config.vpns == sy_config.vpns {
+                if next_config.routes == sy_config.routes
+                    && next_config.vpns == sy_config.vpns
+                    && next_config.taps == sy_config.taps
+                {
                     tracing::info!(
                         subsystem = %payload.subsystem,
                         version = payload.version,
@@ -683,6 +735,86 @@ async fn handle_admin_action(
                 )
             }
         }
+        "list_taps" => admin_success_payload(
+            action,
+            serde_json::json!({
+                "config_version": sy_config.version,
+                "taps": sy_config.taps.clone(),
+            }),
+        ),
+        "add_tap" => {
+            let tap: TapConfig = serde_json::from_value(msg.payload.clone())?;
+            // Natural key for taps is the (match_src, match_dst, target) triple.
+            // Adding a duplicate triple is rejected so the operator notices.
+            let duplicate = sy_config.taps.iter().any(|t| {
+                t.match_src == tap.match_src
+                    && t.match_dst == tap.match_dst
+                    && t.target == tap.target
+            });
+            if duplicate {
+                admin_error_payload(
+                    action,
+                    "DUPLICATE_TAP",
+                    format!(
+                        "Tap (match_src={}, match_dst={}, target={}) already exists",
+                        tap.match_src, tap.match_dst, tap.target
+                    ),
+                )
+            } else {
+                sy_config.taps.push(tap.clone());
+                sy_config.version = sy_config.version.saturating_add(1);
+                sy_config.updated_at = now_epoch_ms().to_string();
+                apply_config(writer, sy_config)?;
+                write_config(config_dir, sy_config)?;
+                admin_success_payload(
+                    action,
+                    serde_json::json!({
+                        "config_version": sy_config.version,
+                        "tap": tap,
+                    }),
+                )
+            }
+        }
+        "delete_tap" => {
+            let payload: serde_json::Value = msg.payload.clone();
+            let match_src = payload
+                .get("match_src")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let match_dst = payload
+                .get("match_dst")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let target = payload
+                .get("target")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let before = sy_config.taps.len();
+            sy_config.taps.retain(|t| {
+                !(t.match_src == match_src && t.match_dst == match_dst && t.target == target)
+            });
+            if sy_config.taps.len() == before {
+                admin_error_payload(
+                    action,
+                    "NOT_FOUND",
+                    format!(
+                        "Tap (match_src={}, match_dst={}, target={}) not found",
+                        match_src, match_dst, target
+                    ),
+                )
+            } else {
+                sy_config.version = sy_config.version.saturating_add(1);
+                sy_config.updated_at = now_epoch_ms().to_string();
+                apply_config(writer, sy_config)?;
+                write_config(config_dir, sy_config)?;
+                admin_success_payload(
+                    action,
+                    serde_json::json!({
+                        "config_version": sy_config.version,
+                    }),
+                )
+            }
+        }
         _ => admin_error_payload(
             action,
             "UNKNOWN_ACTION",
@@ -784,6 +916,7 @@ fn load_config(config_dir: &Path) -> Result<SyConfigFile, Box<dyn std::error::Er
             updated_at: "".to_string(),
             routes: Vec::new(),
             vpns: Vec::new(),
+            taps: Vec::new(),
         };
         let data = serde_yaml::to_string(&empty)?;
         fs::write(&path, data)?;
@@ -815,11 +948,17 @@ fn apply_config(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let routes = build_routes(&sy_config.routes)?;
     let vpns = build_vpns(&sy_config.vpns)?;
+    let taps = build_taps(&sy_config.taps)?;
     writer.write_static_routes(&routes, false)?;
-    writer.write_vpn_assignments(&vpns, true)?;
+    writer.write_vpn_assignments(&vpns, false)?;
+    // ROUTER-TAP-4: bump config_version on the taps write so the router
+    // (which watches config_version) re-reads the snapshot and picks up
+    // the new tap set in a single observable seqlock generation.
+    writer.write_taps(&taps, true)?;
     tracing::info!(
         routes = routes.len(),
         vpns = vpns.len(),
+        taps = taps.len(),
         "config region written"
     );
     for vpn in &sy_config.vpns {
@@ -828,6 +967,16 @@ fn apply_config(
             match_kind = %vpn.match_kind.as_deref().unwrap_or("PREFIX"),
             vpn_id = vpn.vpn_id,
             "vpn rule loaded"
+        );
+    }
+    for tap in &sy_config.taps {
+        tracing::info!(
+            match_src = %tap.match_src,
+            match_dst = %tap.match_dst,
+            target = %tap.target,
+            mode = %tap.mode,
+            enabled = tap.enabled,
+            "tap rule loaded"
         );
     }
     Ok(())
@@ -900,6 +1049,48 @@ fn parse_vpns(
         return Ok(Some(vpns));
     }
     Ok(None)
+}
+
+fn parse_taps(
+    value: &serde_json::Value,
+) -> Result<Option<Vec<TapConfig>>, Box<dyn std::error::Error>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    if value.is_array() {
+        let taps: Vec<TapConfig> = serde_json::from_value(value.clone())?;
+        return Ok(Some(taps));
+    }
+    if let Some(taps_value) = value.get("taps") {
+        let taps: Vec<TapConfig> = serde_json::from_value(taps_value.clone())?;
+        return Ok(Some(taps));
+    }
+    Ok(None)
+}
+
+fn build_taps(taps: &[TapConfig]) -> Result<Vec<TapEntry>, Box<dyn std::error::Error>> {
+    let mut out = Vec::new();
+    for tap in taps {
+        let mut entry = empty_tap_entry();
+        entry.match_src_len =
+            copy_bytes_with_len(&mut entry.match_src, &tap.match_src) as u16;
+        entry.match_dst_len =
+            copy_bytes_with_len(&mut entry.match_dst, &tap.match_dst) as u16;
+        entry.target_len = copy_bytes_with_len(&mut entry.target, &tap.target) as u16;
+        entry.mode = tap_mode_kind(&tap.mode)?;
+        entry.enabled = if tap.enabled { 1 } else { 0 };
+        entry.flags = FLAG_ACTIVE;
+        entry.installed_at = now_epoch_ms();
+        out.push(entry);
+    }
+    Ok(out)
+}
+
+fn tap_mode_kind(mode: &str) -> Result<u8, Box<dyn std::error::Error>> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "best_effort" | "" => Ok(0),
+        other => Err(format!("invalid tap mode '{other}' (expected 'best_effort')").into()),
+    }
 }
 
 fn apply_node_config_set_request(
@@ -1007,6 +1198,25 @@ fn empty_vpn_assignment() -> VpnAssignment {
         priority: 0,
         flags: 0,
         _reserved: [0u8; 20],
+    }
+}
+
+fn empty_tap_entry() -> TapEntry {
+    TapEntry {
+        match_src: [0u8; 256],
+        match_src_len: 0,
+        _pad0: [0u8; 6],
+        match_dst: [0u8; 256],
+        match_dst_len: 0,
+        _pad1: [0u8; 6],
+        target: [0u8; 256],
+        target_len: 0,
+        _pad2: [0u8; 6],
+        mode: 0,
+        enabled: 0,
+        flags: 0,
+        installed_at: 0,
+        _reserved: [0u8; 32],
     }
 }
 
