@@ -148,7 +148,8 @@ Common runtime bases:
 Use when the behavior is deterministic, step-based, branched, or must coordinate several nodes.
 
 Prefer:
-- `wf.engine` as runtime base for workflow-style nodes
+- `wf.engine` only as the base runtime for workflow packages, not as the `run_node` runtime for a `WF.*` node
+- concrete workflow runtimes such as `wf.invoice` or `wf.sales` for actual `WF.*` node instances
 - `wf_deployments` / `wf_rules_compile_apply` when the operator is really asking for business choreography, fan-out, ordered delivery, retry semantics, or dispatch logic
 
 ### 4.3 IO nodes
@@ -414,6 +415,7 @@ Notes:
 - `node_name` uses type prefix + `@hive`
 - `runtime` is lowercase and has no `@hive`
 - `tenant_id` is root-level and required for `AI.*` / `IO.*` first spawn; do not bury it inside `config`
+- For `WF.*`, do not use `runtime: "wf.engine"` in `run_node`; first publish/apply the workflow through `wf_rules_compile_apply` and spawn the resulting concrete runtime (`wf.<workflow_name>`).
 
 ### 8.1.1 Tenant discovery before first spawn
 

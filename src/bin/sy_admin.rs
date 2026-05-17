@@ -8278,6 +8278,7 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "Use this only when creating/spawning a new managed instance.",
             "runtime can be omitted when it is derivable from node_name.",
             "AI.* and IO.* managed nodes require root-level tenant_id on first spawn. Discover it with list_tenants/get_tenant or from an existing node config; do not place it only under config.",
+            "WF.* managed nodes must use an already published workflow package runtime, for example wf.invoice. Do not spawn WF.* directly with the base runtime wf.engine; use wf_rules_compile_apply with auto_spawn=true to publish and deploy workflows.",
             "For internal ADMIN_COMMAND dispatch, the hive target is encoded via payload.target; in HTTP it comes from /hives/{hive}.",
         ],
         "start_node" => vec![

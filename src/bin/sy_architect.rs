@@ -2232,6 +2232,13 @@ Use these facts only to select and validate planning intent. Do not treat them a
 - Use `remove_node_instance` only to delete the persisted managed instance.
 - Use `publish_runtime_package` to publish a runtime package. It does not spawn nodes.
 
+### Workflow runtime selection
+
+- `wf.engine` is the WF base runtime. It is not the runtime to use when creating a `WF.*` managed workflow node.
+- A `WF.<workflow_name>@<hive>` node must run a published workflow package runtime such as `wf.<workflow_name>`, whose manifest type is `workflow` and whose `runtime_base` is `wf.engine`.
+- To create or update a workflow node from a workflow definition, prefer `wf_rules_compile_apply` with `auto_spawn=true` and `tenant_id` for the first deploy.
+- Only use `run_node` for `WF.*` when the concrete `wf.<workflow_name>` workflow package runtime already exists in the runtime manifest.
+
 ### Config selection
 
 - `get_node_config` reads persisted node config from disk/snapshot.

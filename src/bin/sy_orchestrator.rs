@@ -8611,6 +8611,60 @@ fn resolve_runtime_spawn_entrypoint(
     })
 }
 
+fn validate_wf_runtime_spawn_contract(
+    manifest: &RuntimeManifest,
+    runtime: &str,
+    version: &str,
+    target_hive: &str,
+    node_name: &str,
+) -> Result<(), serde_json::Value> {
+    if node_kind_from_name(node_name) != "WF" {
+        return Ok(());
+    }
+
+    let runtime_map = runtime_manifest_entry_map(manifest).map_err(|err| {
+        serde_json::json!({
+            "status": "error",
+            "error_code": "MANIFEST_INVALID",
+            "message": err.to_string(),
+            "runtime": runtime,
+            "version": version,
+            "target": target_hive,
+            "node_name": node_name,
+        })
+    })?;
+    let entry = runtime_map.get(runtime).ok_or_else(|| {
+        serde_json::json!({
+            "status": "error",
+            "error_code": "RUNTIME_NOT_AVAILABLE",
+            "message": format!("runtime '{}' not found in manifest", runtime),
+            "runtime": runtime,
+            "version": version,
+            "target": target_hive,
+            "node_name": node_name,
+        })
+    })?;
+    let package_type = runtime_package_type(entry);
+    if package_type == "workflow" {
+        return Ok(());
+    }
+
+    Err(serde_json::json!({
+        "status": "error",
+        "error_code": "WF_RUNTIME_PACKAGE_REQUIRED",
+        "message": format!(
+            "WF.* managed nodes must use a workflow package runtime such as wf.<workflow_name>; runtime '{}' is package type '{}'",
+            runtime, package_type
+        ),
+        "hint": "Use wf_rules_compile_apply with auto_spawn=true to publish wf.<workflow_name> and spawn the WF node, or run_node with an already published workflow package runtime.",
+        "runtime": runtime,
+        "version": version,
+        "package_type": package_type,
+        "target": target_hive,
+        "node_name": node_name,
+    }))
+}
+
 fn runtime_start_script(runtime: &str, version: &str) -> String {
     format!("/var/lib/fluxbee/dist/runtimes/{runtime}/{version}/bin/start.sh")
 }
@@ -11190,6 +11244,15 @@ async fn run_node_flow(
             });
         }
     };
+    if let Err(payload) = validate_wf_runtime_spawn_contract(
+        &manifest,
+        &runtime_key,
+        &version,
+        &target_hive,
+        &node_name,
+    ) {
+        return payload;
+    }
 
     let entrypoint = match resolve_runtime_spawn_entrypoint(&manifest, &runtime_key, &version) {
         Ok(value) => value,
@@ -11531,6 +11594,13 @@ fn managed_node_launch_plan(
                 }));
             }
         };
+    validate_wf_runtime_spawn_contract(
+        &manifest,
+        &runtime_key,
+        &resolved_version,
+        &state.hive_id,
+        &node.node_name,
+    )?;
     let entrypoint =
         match resolve_runtime_spawn_entrypoint(&manifest, &runtime_key, &resolved_version) {
             Ok(value) => value,
@@ -16837,6 +16907,73 @@ blob:
                 base_runtime, base_version
             )
         );
+    }
+
+    #[test]
+    fn validate_wf_runtime_spawn_contract_rejects_base_runtime_for_wf_node() {
+        let manifest = RuntimeManifest {
+            schema_version: 2,
+            version: 1710000005556,
+            updated_at: Some("2026-03-16T00:55:00Z".to_string()),
+            runtimes: serde_json::json!({
+                "wf.engine": {
+                    "available": ["1.0.0"],
+                    "current": "1.0.0",
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+
+        let err = validate_wf_runtime_spawn_contract(
+            &manifest,
+            "wf.engine",
+            "1.0.0",
+            "motherbee",
+            "WF.sales@motherbee",
+        )
+        .expect_err("WF node must not spawn from base runtime directly");
+
+        assert_eq!(
+            err["error_code"],
+            serde_json::json!("WF_RUNTIME_PACKAGE_REQUIRED")
+        );
+        assert!(err["message"]
+            .as_str()
+            .expect("message")
+            .contains("workflow package runtime"));
+    }
+
+    #[test]
+    fn validate_wf_runtime_spawn_contract_accepts_workflow_package_runtime() {
+        let manifest = RuntimeManifest {
+            schema_version: 2,
+            version: 1710000005557,
+            updated_at: Some("2026-03-16T00:56:00Z".to_string()),
+            runtimes: serde_json::json!({
+                "wf.sales": {
+                    "available": ["1"],
+                    "current": "1",
+                    "type": "workflow",
+                    "runtime_base": "wf.engine"
+                },
+                "wf.engine": {
+                    "available": ["1.0.0"],
+                    "current": "1.0.0",
+                    "type": "full_runtime"
+                }
+            }),
+            hash: None,
+        };
+
+        validate_wf_runtime_spawn_contract(
+            &manifest,
+            "wf.sales",
+            "1",
+            "motherbee",
+            "WF.sales@motherbee",
+        )
+        .expect("WF node should accept concrete workflow package runtime");
     }
 
     #[test]
