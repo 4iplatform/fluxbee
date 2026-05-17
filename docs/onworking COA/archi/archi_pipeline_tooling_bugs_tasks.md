@@ -169,6 +169,36 @@ Implementation note 2026-05-17:
 - Applied it to latest non-terminal lookup, latest blocked lookup, and load-by-id fallback reads.
 - Added unit coverage that a newer terminal state wins over an older blocked state.
 
+### [x] ARCHI-BUG-6 — Plan compiler missing `submit_executor_plan` escapes as protocol error
+
+Observed log:
+
+- Tenant was resolved correctly to `tnt:00000000-0000-0000-0000-000000000001`.
+- `fluxbee_plan_compiler` failed with:
+  - `protocol error: plan_compiler agent failed: plan_compiler did not call submit_executor_plan`
+
+Problem:
+
+- `run_plan_compiler_with_context(...)` required a successful `submit_executor_plan` tool result.
+- If the model finished without that tool call, the code returned `Err(...)`.
+- The tool wrapper surfaced it as a transport/protocol failure instead of a recoverable compiler-output failure.
+
+Expected behavior:
+
+- Missing or malformed `submit_executor_plan` is treated like invalid model output.
+- The compiler gets one generic contract-feedback retry:
+  - call `submit_executor_plan` exactly once
+  - use `status='plan_ready'` with `plan`, or `status='blocked'` with `blocked_reason`
+- If the retry still fails, Archi returns a structured blocked result with trace data, not a protocol error.
+
+Implementation note 2026-05-17:
+
+- Added `PlanCompilerRunOutcome` with `Submitted` and `Invalid`.
+- Missing submit call, unsupported status, missing plan, and invalid executor-plan shape now become `Invalid`.
+- `run_plan_compiler_transaction(...)` retries invalid tool output once with generic feedback.
+- Repeated invalid output returns `blocked_code=plan_compiler_invalid_output`.
+- Added unit coverage for feedback text and structured blocker conversion.
+
 ## 2. Tooling Hardening Tasks
 
 ### [x] ARCHI-HARD-1 — Add deterministic designer schema-retry loop
@@ -239,6 +269,20 @@ Partial implementation note 2026-05-17:
 
 - Added unit coverage for actionable schema feedback.
 - Full loop-level tests still need an injectable/mocked designer runner or an integration harness.
+
+### [x] ARCHI-HARD-6 — Convert plan compiler protocol-output failures into recoverable output failures
+
+Implementation direction:
+
+- Do not let missing `submit_executor_plan` escape as `AiSdkError::Protocol`.
+- Preserve token usage and tool lookup counts in the plan compile trace.
+- Retry once with generic tool-contract feedback.
+- Return a structured blocked response after repeated failure.
+
+Do not:
+
+- Add scenario-specific instructions for API/Slack/AI topology.
+- Hide the failure as a successful empty plan.
 
 ## 3. Documentation Tasks After Code Bugs
 

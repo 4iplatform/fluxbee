@@ -3871,6 +3871,21 @@ struct PlanCompilerOutput {
     tokens_used: u32,
 }
 
+#[derive(Clone)]
+struct PlanCompilerInvalidOutput {
+    reason: String,
+    feedback: String,
+    help_lookup_actions: Vec<String>,
+    help_lookup_calls: u32,
+    query_hive_calls: u32,
+    tokens_used: u32,
+}
+
+enum PlanCompilerRunOutcome {
+    Submitted(PlanCompilerOutput),
+    Invalid(PlanCompilerInvalidOutput),
+}
+
 struct PlanCompilerExecution {
     output: PlanCompilerOutput,
     trace: PlanCompileTrace,
@@ -3917,6 +3932,44 @@ fn should_retry_blocked_plan_compiler_output(
     let context_has_identifiers = format!("{task}\n{user_context}").contains(':');
 
     schema_lookup_block || (missing_without_specific_field && context_has_identifiers)
+}
+
+fn plan_compiler_attempt_tokens(outcome: &PlanCompilerRunOutcome) -> u32 {
+    match outcome {
+        PlanCompilerRunOutcome::Submitted(output) => output.tokens_used,
+        PlanCompilerRunOutcome::Invalid(invalid) => invalid.tokens_used,
+    }
+}
+
+fn plan_compiler_protocol_feedback(reason: &str) -> String {
+    format!(
+        "Your previous plan_compiler attempt was invalid: {reason}. \
+You must call submit_executor_plan exactly once. \
+If a concrete executor plan is possible, call submit_executor_plan with status='plan_ready', human_summary, and plan. \
+If a concrete executor plan is not safe, call submit_executor_plan with status='blocked', human_summary, blocked_reason, and any missing_fields/operator_hint. \
+Do not finish with plain text only."
+    )
+}
+
+fn plan_compiler_invalid_to_blocked_output(
+    invalid: PlanCompilerInvalidOutput,
+) -> PlanCompilerOutput {
+    PlanCompilerOutput {
+        disposition: PlanCompilerDisposition::Blocked,
+        plan: None,
+        human_summary: "Plan compilation blocked by invalid plan_compiler tool output.".to_string(),
+        blocked_reason: Some(invalid.reason),
+        blocked_code: Some("plan_compiler_invalid_output".to_string()),
+        missing_fields: Vec::new(),
+        operator_hint: Some(
+            "Retry plan compilation after fixing the plan_compiler tool-call contract.".to_string(),
+        ),
+        cookbook_entry: None,
+        help_lookup_actions: invalid.help_lookup_actions,
+        help_lookup_calls: invalid.help_lookup_calls,
+        query_hive_calls: invalid.query_hive_calls,
+        tokens_used: invalid.tokens_used,
+    }
 }
 
 fn build_plan_compile_trace(
@@ -4072,7 +4125,7 @@ async fn run_plan_compiler_transaction(
 ) -> Result<PlanCompilerExecution, ArchitectError> {
     let mut token_budget = TaskTokenBudget::new(initial_tokens_used);
     token_budget.ensure_room("plan_compiler.first_attempt")?;
-    let first_output = run_plan_compiler_with_context(
+    let first_attempt = run_plan_compiler_with_context(
         context,
         task,
         hive,
@@ -4081,7 +4134,123 @@ async fn run_plan_compiler_transaction(
         approved_artifacts,
     )
     .await?;
-    token_budget.add("plan_compiler.first_attempt", first_output.tokens_used)?;
+    token_budget.add(
+        "plan_compiler.first_attempt",
+        plan_compiler_attempt_tokens(&first_attempt),
+    )?;
+    let first_output = match first_attempt {
+        PlanCompilerRunOutcome::Submitted(output) => output,
+        PlanCompilerRunOutcome::Invalid(invalid) => {
+            token_budget.ensure_room("plan_compiler.invalid_retry")?;
+            let first_invalid_reason = invalid.reason.clone();
+            tracing::warn!(
+                reason = %first_invalid_reason,
+                "plan_compiler returned invalid tool output — retrying with contract feedback"
+            );
+            let feedback_context = format!("{}\n\n[FEEDBACK] {}", user_context, invalid.feedback);
+            let retried_attempt = run_plan_compiler_with_context(
+                context,
+                task,
+                hive,
+                &feedback_context,
+                delta_report,
+                approved_artifacts,
+            )
+            .await?;
+            token_budget.add(
+                "plan_compiler.invalid_retry",
+                plan_compiler_attempt_tokens(&retried_attempt),
+            )?;
+
+            match retried_attempt {
+                PlanCompilerRunOutcome::Submitted(retried) => {
+                    let total_tokens = invalid.tokens_used.saturating_add(retried.tokens_used);
+                    let output = PlanCompilerOutput {
+                        tokens_used: total_tokens,
+                        ..retried
+                    };
+                    if output.disposition == PlanCompilerDisposition::PlanReady {
+                        if let Some(validation_err) = plan_compiler_prevalidate(
+                            context,
+                            output
+                                .plan
+                                .as_ref()
+                                .expect("plan_ready invalid retry output must include a plan"),
+                            &output.help_lookup_actions,
+                            delta_report,
+                        )
+                        .await
+                        {
+                            return Err(format!(
+                                "plan_compiler invalid-output retry produced invalid plan: {validation_err}"
+                            )
+                            .into());
+                        }
+                    }
+                    let validation_label = match output.disposition {
+                        PlanCompilerDisposition::PlanReady => "ok_after_invalid_retry",
+                        PlanCompilerDisposition::Blocked => "blocked_after_invalid_retry",
+                    };
+                    let trace = build_plan_compile_trace(
+                        task,
+                        hive,
+                        output.plan.as_ref(),
+                        validation_label,
+                        output.blocked_reason.clone(),
+                        output.blocked_code.clone(),
+                        output.missing_fields.clone(),
+                        output.operator_hint.clone(),
+                        output.help_lookup_actions.clone(),
+                        output.help_lookup_calls,
+                        output.query_hive_calls,
+                        Some(format!("invalid_retry: {first_invalid_reason}")),
+                        output.tokens_used,
+                    );
+                    return Ok(PlanCompilerExecution { output, trace });
+                }
+                PlanCompilerRunOutcome::Invalid(retried_invalid) => {
+                    let mut help_lookup_actions = invalid.help_lookup_actions;
+                    help_lookup_actions.extend(retried_invalid.help_lookup_actions);
+                    help_lookup_actions.sort();
+                    help_lookup_actions.dedup();
+                    let merged_invalid = PlanCompilerInvalidOutput {
+                        reason: format!(
+                            "initial invalid output: {first_invalid_reason}; retry invalid output: {}",
+                            retried_invalid.reason
+                        ),
+                        feedback: retried_invalid.feedback,
+                        help_lookup_actions,
+                        help_lookup_calls: invalid
+                            .help_lookup_calls
+                            .saturating_add(retried_invalid.help_lookup_calls),
+                        query_hive_calls: invalid
+                            .query_hive_calls
+                            .saturating_add(retried_invalid.query_hive_calls),
+                        tokens_used: invalid
+                            .tokens_used
+                            .saturating_add(retried_invalid.tokens_used),
+                    };
+                    let output = plan_compiler_invalid_to_blocked_output(merged_invalid);
+                    let trace = build_plan_compile_trace(
+                        task,
+                        hive,
+                        None,
+                        "blocked_invalid_output",
+                        output.blocked_reason.clone(),
+                        output.blocked_code.clone(),
+                        output.missing_fields.clone(),
+                        output.operator_hint.clone(),
+                        output.help_lookup_actions.clone(),
+                        output.help_lookup_calls,
+                        output.query_hive_calls,
+                        Some(format!("invalid_retry: {first_invalid_reason}")),
+                        output.tokens_used,
+                    );
+                    return Ok(PlanCompilerExecution { output, trace });
+                }
+            }
+        }
+    };
 
     if first_output.disposition == PlanCompilerDisposition::Blocked {
         if should_retry_blocked_plan_compiler_output(&first_output, task, user_context) {
@@ -4098,7 +4267,7 @@ async fn run_plan_compiler_transaction(
                 "{}\n\n[FEEDBACK] Your previous result was blocked with this reason: {}\nDo not block because an action schema is missing until you have called get_admin_action_help for each action you intend to use. Use executor_contract.function_schema as the exact step.args schema. Every executor step must include an args object, even when args is empty. If a required value is already explicit in the task or verified context, use it directly instead of asking for it again. Then call submit_executor_plan exactly once.",
                 user_context, retry_reason
             );
-            let retried = run_plan_compiler_with_context(
+            let retried_attempt = run_plan_compiler_with_context(
                 context,
                 task,
                 hive,
@@ -4107,7 +4276,35 @@ async fn run_plan_compiler_transaction(
                 approved_artifacts,
             )
             .await?;
-            token_budget.add("plan_compiler.blocked_retry", retried.tokens_used)?;
+            token_budget.add(
+                "plan_compiler.blocked_retry",
+                plan_compiler_attempt_tokens(&retried_attempt),
+            )?;
+            let retried = match retried_attempt {
+                PlanCompilerRunOutcome::Submitted(output) => output,
+                PlanCompilerRunOutcome::Invalid(invalid) => {
+                    let output = PlanCompilerOutput {
+                        tokens_used: first_output.tokens_used.saturating_add(invalid.tokens_used),
+                        ..plan_compiler_invalid_to_blocked_output(invalid)
+                    };
+                    let trace = build_plan_compile_trace(
+                        task,
+                        hive,
+                        None,
+                        "blocked_retry_invalid_output",
+                        output.blocked_reason.clone(),
+                        output.blocked_code.clone(),
+                        output.missing_fields.clone(),
+                        output.operator_hint.clone(),
+                        output.help_lookup_actions.clone(),
+                        output.help_lookup_calls,
+                        output.query_hive_calls,
+                        Some(format!("blocked_retry: {retry_reason}")),
+                        output.tokens_used,
+                    );
+                    return Ok(PlanCompilerExecution { output, trace });
+                }
+            };
             let total_tokens = first_output.tokens_used.saturating_add(retried.tokens_used);
 
             if retried.disposition == PlanCompilerDisposition::PlanReady {
@@ -4211,7 +4408,7 @@ async fn run_plan_compiler_transaction(
             "{}\n\n[FEEDBACK] Your previous plan was rejected by the validator with this error: {}\nCall get_admin_action_help for the failing action, then call submit_executor_plan with the corrected plan.",
             user_context, err
         );
-        let retried = run_plan_compiler_with_context(
+        let retried_attempt = run_plan_compiler_with_context(
             context,
             task,
             hive,
@@ -4220,7 +4417,36 @@ async fn run_plan_compiler_transaction(
             approved_artifacts,
         )
         .await?;
-        token_budget.add("plan_compiler.retry", retried.tokens_used)?;
+        token_budget.add(
+            "plan_compiler.retry",
+            plan_compiler_attempt_tokens(&retried_attempt),
+        )?;
+        let retried = match retried_attempt {
+            PlanCompilerRunOutcome::Submitted(output) => output,
+            PlanCompilerRunOutcome::Invalid(invalid) => {
+                let total_tokens = first_output.tokens_used.saturating_add(invalid.tokens_used);
+                let output = PlanCompilerOutput {
+                    tokens_used: total_tokens,
+                    ..plan_compiler_invalid_to_blocked_output(invalid)
+                };
+                let trace = build_plan_compile_trace(
+                    task,
+                    hive,
+                    None,
+                    "retry_invalid_output",
+                    output.blocked_reason.clone(),
+                    output.blocked_code.clone(),
+                    output.missing_fields.clone(),
+                    output.operator_hint.clone(),
+                    output.help_lookup_actions.clone(),
+                    output.help_lookup_calls,
+                    output.query_hive_calls,
+                    first_validation_error,
+                    output.tokens_used,
+                );
+                return Ok(PlanCompilerExecution { output, trace });
+            }
+        };
         if retried.disposition == PlanCompilerDisposition::Blocked {
             PlanCompilerOutput {
                 tokens_used: first_output.tokens_used.saturating_add(retried.tokens_used),
@@ -4281,7 +4507,7 @@ async fn run_plan_compiler_with_context(
     user_context: &str,
     delta_report: Option<&DeltaReport>,
     approved_artifacts: Option<&Value>,
-) -> Result<PlanCompilerOutput, ArchitectError> {
+) -> Result<PlanCompilerRunOutcome, ArchitectError> {
     let runtime = context
         .ai_runtime
         .lock()
@@ -4474,22 +4700,6 @@ async fn run_plan_compiler_with_context(
         .await
         .map_err(|e| -> ArchitectError { format!("plan_compiler AI call failed: {e}").into() })?;
 
-    // Extract the submitted plan from the ToolResult item for submit_executor_plan
-    let submitted = result.items.iter().find_map(|item| {
-        if let FunctionLoopItem::ToolResult { result: tr } = item {
-            if tr.name == "submit_executor_plan" && !tr.is_error {
-                return Some(tr.output.clone());
-            }
-        }
-        None
-    });
-
-    let submitted = submitted.ok_or_else(|| -> ArchitectError {
-        "plan_compiler did not call submit_executor_plan"
-            .to_string()
-            .into()
-    })?;
-
     let mut help_lookup_actions = result
         .items
         .iter()
@@ -4525,6 +4735,33 @@ async fn run_plan_compiler_with_context(
         })
         .count() as u32;
 
+    // Extract the submitted plan from the ToolResult item for submit_executor_plan.
+    // Missing or malformed submit calls are model-output failures, not transport errors.
+    // Return them as retryable outcomes so the transaction can provide tool-contract feedback.
+    let submitted = result.items.iter().find_map(|item| {
+        if let FunctionLoopItem::ToolResult { result: tr } = item {
+            if tr.name == "submit_executor_plan" && !tr.is_error {
+                return Some(tr.output.clone());
+            }
+        }
+        None
+    });
+
+    let submitted = match submitted {
+        Some(value) => value,
+        None => {
+            let reason = "plan_compiler did not call submit_executor_plan".to_string();
+            return Ok(PlanCompilerRunOutcome::Invalid(PlanCompilerInvalidOutput {
+                feedback: plan_compiler_protocol_feedback(&reason),
+                reason,
+                help_lookup_actions,
+                help_lookup_calls,
+                query_hive_calls,
+                tokens_used: result.tokens_used,
+            }));
+        }
+    };
+
     let disposition = match submitted
         .get("status")
         .and_then(Value::as_str)
@@ -4533,9 +4770,15 @@ async fn run_plan_compiler_with_context(
         "plan_ready" => PlanCompilerDisposition::PlanReady,
         "blocked" => PlanCompilerDisposition::Blocked,
         other => {
-            return Err(
-                format!("submit_executor_plan returned unsupported status '{other}'").into(),
-            )
+            let reason = format!("submit_executor_plan returned unsupported status '{other}'");
+            return Ok(PlanCompilerRunOutcome::Invalid(PlanCompilerInvalidOutput {
+                feedback: plan_compiler_protocol_feedback(&reason),
+                reason,
+                help_lookup_actions,
+                help_lookup_calls,
+                query_hive_calls,
+                tokens_used: result.tokens_used,
+            }));
         }
     };
     let human_summary = submitted
@@ -4583,23 +4826,38 @@ async fn run_plan_compiler_with_context(
 
     let plan = match disposition {
         PlanCompilerDisposition::PlanReady => {
-            let plan = submitted
-                .get("plan")
-                .cloned()
-                .ok_or_else(|| -> ArchitectError {
-                    "submit_executor_plan missing 'plan' for status='plan_ready'"
-                        .to_string()
-                        .into()
-                })?;
-            validate_architect_executor_plan_shape(&plan).map_err(|e| -> ArchitectError {
-                format!("plan_compiler plan invalid: {e}").into()
-            })?;
+            let plan = match submitted.get("plan").cloned() {
+                Some(plan) => plan,
+                None => {
+                    let reason =
+                        "submit_executor_plan missing 'plan' for status='plan_ready'".to_string();
+                    return Ok(PlanCompilerRunOutcome::Invalid(PlanCompilerInvalidOutput {
+                        feedback: plan_compiler_protocol_feedback(&reason),
+                        reason,
+                        help_lookup_actions,
+                        help_lookup_calls,
+                        query_hive_calls,
+                        tokens_used: result.tokens_used,
+                    }));
+                }
+            };
+            if let Err(err) = validate_architect_executor_plan_shape(&plan) {
+                let reason = format!("plan_compiler plan invalid: {err}");
+                return Ok(PlanCompilerRunOutcome::Invalid(PlanCompilerInvalidOutput {
+                    feedback: plan_compiler_protocol_feedback(&reason),
+                    reason,
+                    help_lookup_actions,
+                    help_lookup_calls,
+                    query_hive_calls,
+                    tokens_used: result.tokens_used,
+                }));
+            }
             Some(plan)
         }
         PlanCompilerDisposition::Blocked => None,
     };
 
-    Ok(PlanCompilerOutput {
+    Ok(PlanCompilerRunOutcome::Submitted(PlanCompilerOutput {
         disposition,
         plan,
         human_summary,
@@ -4612,7 +4870,7 @@ async fn run_plan_compiler_with_context(
         help_lookup_calls,
         query_hive_calls,
         tokens_used: result.tokens_used,
-    })
+    }))
 }
 
 // Minimal shim tool that captures the submit_executor_plan call arguments
@@ -25413,5 +25671,39 @@ mod tests {
         assert!(feedback.contains("solution"));
         assert!(feedback.contains("desired_state"));
         assert!(feedback.contains("advisory"));
+    }
+
+    #[test]
+    fn plan_compiler_protocol_feedback_requires_submit_tool() {
+        let feedback = super::plan_compiler_protocol_feedback(
+            "plan_compiler did not call submit_executor_plan",
+        );
+
+        assert!(feedback.contains("submit_executor_plan exactly once"));
+        assert!(feedback.contains("status='plan_ready'"));
+        assert!(feedback.contains("status='blocked'"));
+        assert!(feedback.contains("Do not finish with plain text only"));
+    }
+
+    #[test]
+    fn plan_compiler_invalid_output_becomes_structured_blocker() {
+        let output = super::plan_compiler_invalid_to_blocked_output(PlanCompilerInvalidOutput {
+            reason: "plan_compiler did not call submit_executor_plan".to_string(),
+            feedback: "feedback".to_string(),
+            help_lookup_actions: vec!["run_node".to_string()],
+            help_lookup_calls: 1,
+            query_hive_calls: 2,
+            tokens_used: 123,
+        });
+
+        assert_eq!(output.disposition, PlanCompilerDisposition::Blocked);
+        assert_eq!(
+            output.blocked_code.as_deref(),
+            Some("plan_compiler_invalid_output")
+        );
+        assert_eq!(output.help_lookup_actions, vec!["run_node"]);
+        assert_eq!(output.help_lookup_calls, 1);
+        assert_eq!(output.query_hive_calls, 2);
+        assert_eq!(output.tokens_used, 123);
     }
 }
