@@ -225,6 +225,32 @@ Implementation note 2026-05-17:
 - `SY.admin` action help for `run_node` now states that `wf.engine` is not valid for direct `WF.*` spawn.
 - Archi platform facts and handbook now distinguish WF base runtime from concrete workflow package runtime.
 
+### [x] ARCHI-BUG-9 — Design auditor reports MANIFEST_UNAVAILABLE on a freshly produced valid manifest
+
+Observed log:
+
+- Pipeline restarted from design after a previous block.
+- Design loop iteration 3 produced a valid manifest (`section_count=3`, `validation_result="ok"`, `solution_id="sales-conversation-routing"`).
+- Audit on the same iteration came back with `score=1`, `status="revise"`, `blocking_issues=["MANIFEST_UNAVAILABLE"]`.
+- Auditor summary: "I could not complete a structural audit because the manifest content is truncated and no current saved manifest is available in session. Please resend the full SolutionManifestV2..."
+- Loop hit `max_iterations` and pipeline blocked.
+
+Problem (root cause is two coupled defects):
+
+1. `run_design_auditor_with_context(...)` registers `GetManifestCurrentTool` for the auditor agent. The auditor receives the manifest inline in `current_user_message`, so it does not need a separate tool to fetch it. The tool's presence let the model treat a stale miss as evidence that the inline manifest was incomplete.
+2. `run_design_loop(...)` updates `current_solution_id` (a local variable) when designer succeeds and saves the manifest to `manifests/<solution_id>/`, but it does NOT update `PipelineRunRecord.solution_id` until AFTER the auditor returns. `GetManifestCurrentTool` resolves session → solution_id through `latest_solution_id_for_session(...)`, which reads the `pipeline_run.solution_id` struct field. The field is still `None` when the auditor calls the tool, so the lookup fails. The auditor then concludes the manifest is unavailable and contradicts the (perfectly valid) inline payload.
+
+Expected behavior:
+
+- Auditor audits the manifest passed inline; it does not look up alternative manifests.
+- Any tool called between designer success and auditor return must see the up-to-date `pipeline_run.solution_id`.
+
+Implementation note 2026-05-17:
+
+- Removed `GetManifestCurrentTool` registration from `run_design_auditor_with_context`. Auditor now has only `submit_design_audit_verdict`.
+- Auditor system prompt now explicitly states that the manifest is in `current_user_message` and that missing fields should be reported as `revise` findings, not as `MANIFEST_UNAVAILABLE`.
+- `run_design_loop` now clones `pipeline_run` into `pipeline_run_with_solution`, sets `solution_id = current_solution_id`, and saves it via `save_pipeline_run_with_context` BEFORE calling the auditor. The post-audit save uses the same updated record so the propagation is consistent across the iteration.
+
 ### [x] ARCHI-BUG-7 — Plan compiler cannot inspect existing workflow definitions
 
 Observed log:

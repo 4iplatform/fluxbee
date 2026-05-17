@@ -2414,6 +2414,15 @@ You do NOT propose executor steps or admin actions.
 You check completeness, internal consistency, ownership clarity, topology feasibility, and unresolved advisory risk.
 You call submit_design_audit_verdict exactly once.
 
+## Input contract
+
+The full solution_manifest you must audit is in `current_user_message` under the
+`solution_manifest` key. Audit THAT manifest. It is complete and authoritative
+for this iteration — do not treat it as truncated, do not request a resend, and
+do not infer that a separately-saved manifest exists elsewhere. If the inline
+manifest is missing required fields or sections, report that as `revise`
+findings (e.g. NODES_MISSING, RUNTIME_UNDEFINED) — not as MANIFEST_UNAVAILABLE.
+
 ## Status semantics
 
 - `pass` — the manifest is complete and consistent. Proceed to execution.
@@ -3228,11 +3237,12 @@ async fn run_design_auditor_with_context(
         .map_err(|err| -> ArchitectError {
             format!("design auditor submit tool register failed: {err}").into()
         })?;
-    tools
-        .register(Arc::new(GetManifestCurrentTool::new(context.clone())))
-        .map_err(|err| -> ArchitectError {
-            format!("design auditor get_manifest_current tool register failed: {err}").into()
-        })?;
+    // Intentionally NO `get_manifest_current` here. The auditor's contract is
+    // to audit the manifest passed inline in `current_user_message`; giving it
+    // a tool that reads a separately-saved manifest let the model treat a stale
+    // miss (e.g. when the pipeline_run record hasn't yet been updated with the
+    // new solution_id) as evidence that the manifest is "unavailable", and
+    // contradict the perfectly valid inline payload (ARCHI-BUG-9).
 
     let input_text = serde_json::to_string_pretty(&json!({
         "solution_manifest": manifest,
@@ -3562,6 +3572,16 @@ async fn run_design_loop(
         .await?;
         designer_traces.push(designer_output.trace.clone());
 
+        // Persist the solution_id on the pipeline_run BEFORE the auditor (or
+        // any tool the auditor invokes) tries to resolve session → solution_id.
+        // The field is otherwise only updated after the audit completes, which
+        // means tools called between designer and auditor see a stale `None`
+        // and erroneously conclude there is no active solution (ARCHI-BUG-9).
+        let mut pipeline_run_with_solution = pipeline_run.clone();
+        pipeline_run_with_solution.solution_id = current_solution_id.clone();
+        pipeline_run_with_solution.updated_at_ms = now_epoch_ms();
+        save_pipeline_run_with_context(context, &pipeline_run_with_solution).await?;
+
         token_budget.ensure_room("design.auditor")?;
 
         let (verdict, auditor_tokens) =
@@ -3621,7 +3641,7 @@ async fn run_design_loop(
         save_pipeline_run_with_context(
             context,
             &pipeline_run_with_state_update(
-                pipeline_run,
+                &pipeline_run_with_solution,
                 PipelineStage::DesignAudit,
                 Some(json!({
                     "solution_id": output.solution_id,
