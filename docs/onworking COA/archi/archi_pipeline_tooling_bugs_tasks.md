@@ -225,6 +225,53 @@ Implementation note 2026-05-17:
 - `SY.admin` action help for `run_node` now states that `wf.engine` is not valid for direct `WF.*` spawn.
 - Archi platform facts and handbook now distinguish WF base runtime from concrete workflow package runtime.
 
+### [x] ARCHI-BUG-12 — Storage/identity miss vault bootstrap broadcast due to ephemeral-connect-then-reconnect race
+
+Observed (2026-05-17, clean reinstall + restart cycle):
+
+- After `cleanall + install.sh + restart`, vault arrives last per hive.yaml, emits its bootstrap `VAULT_SECRET_CHANGED { op=put }` for every secret in `vault.db`, the router fans out — but the storage node never reacts and stays in `STORAGE_NOT_READY` indefinitely.
+- Router fanout summary shows `delivered_to=7, skipped_self=1` and `SY.storage@motherbee` is NOT in the destination list, even though storage was scheduled to start before vault.
+
+Timing (extracted from router journal):
+
+```text
+17:34:45.998 storage HELLO (ephemeral) uuid=644b3b33 → router registers it
+17:34:46.004 storage WARN "vault lookup failed (VAULT_UNAVAILABLE)" — vault not up yet
+              [storage closes the ephemeral connection]
+17:34:46.356 vault HELLO uuid=c625a702 → router registers vault
+17:34:46.357 vault emits bootstrap broadcast
+17:34:46.358 router fanout: registered_nodes=8, delivered_to=7, SY.storage NOT IN LIST
+17:34:47.018 storage HELLO (persistent, second connection) uuid=f8fc63e5 → router registers
+              [620ms TOO LATE — bootstrap already gone]
+```
+
+Problem (root cause):
+
+- `sy_storage` and `sy_identity` follow a pattern of (a) open an **ephemeral** SDK connection to query vault, (b) close it after the lookup completes or fails, (c) open the real **persistent** connection that stays alive for the lifetime of the node.
+- Between (b) and (c) the node is NOT registered in the router. If vault emits its bootstrap broadcast in that window, the router's fanout (`for node in nodes_guard.iter()` in `src/router/mod.rs`) skips the node — broadcasts are NOT buffered for future re-delivery.
+- The previous comment in `hive.yaml` claiming "Vault-last guarantees delivery" was wrong: vault-last only guarantees that nodes already persistently registered receive the broadcast. The ephemeral-reconnect window breaks that.
+
+Decision (2026-05-17): option C from design discussion — connect persistent FIRST, then reuse that connection for the vault lookup. No timeouts, no defensive polling — fix the cause.
+
+Implementation note 2026-05-17:
+
+- `sy_storage.rs`: `resolve_database_url(...)` no longer opens its own ephemeral connection. It takes `(&NodeSender, &mut NodeReceiver, ...)` and runs the vault `resolve_resource` over them. The `main` flow now calls `connect_with_retry(...)` FIRST (persistent), logs `sy.storage connected to router`, and only then calls `resolve_database_url(&sender, &mut receiver, ...)`. If vault is not yet up, the lookup returns `Missing` and storage continues degraded — but because the persistent connection is announced, vault's bootstrap broadcast lands in storage's receive loop and `handle_vault_secret_changed` triggers the `exit(0)` rescue.
+- `sy_identity.rs`: same refactor. `resolve_database_url(...)` now takes `(&NodeSender, &mut NodeReceiver, ...)`. `main` constructs `node_config` and calls `connect_with_retry(...)` BEFORE the `if is_primary { resolve_database_url(...) }` block. The downstream flow (initialize_identity_database_backend, load_identity_store_from_db, ensure_system_ilks_from_hive, identity_shm setup, sync_listener, delta_event_rx, main select loop) is unchanged in code — only the order at the top of `main` changed.
+- Removed the now-redundant `connect_with_retry` call that previously appeared just before the main select loop in identity.
+- No new timeouts, no polling fallback. The bootstrap broadcast pathway is the only synchronization mechanism (event-driven), exactly as the architecture intends.
+
+Side observation:
+
+- The 30-second restart cycle the operator observed on the orchestrator was a downstream consequence: `wait_for_storage_db_ready(timeout=30s)` in `sy_orchestrator.rs` fails after 30s because storage never becomes ready, propagates the error with `?`, the orchestrator exits non-zero, systemd restarts it (Restart=always, RestartSec=5), repeat. Once storage receives the broadcast on first try (this fix), the readiness probe succeeds within seconds and the orchestrator finishes its bootstrap cleanly.
+
+Acceptance:
+
+- After `cleanall + install.sh + restart`, the journal shows:
+  - vault emits bootstrap broadcast with `emitted=N`
+  - router fanout summary lists every SY consumer (including storage and identity) in `delivered_to`
+  - storage's `handle_vault_secret_changed` matches and exits(0); systemd restart reconnects to the DB; orchestrator readiness probe succeeds within the 30s window
+- No more silent degradation on the first boot cycle.
+
 ### [x] ARCHI-BUG-11 — Blocked-run-pending surfaces as text-only; operator must type the recovery word
 
 Observed (2026-05-17, follow-up to ARCHI-BUG-10):

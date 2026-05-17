@@ -2469,11 +2469,29 @@ async fn main() -> Result<(), IdentityError> {
     // Identity's own ILK is deterministic, so we can compute it locally
     // without waiting for any SHM to be populated (we're the one writing it).
     let self_ilk_id = deterministic_system_ilk_id(&node_name);
+
+    let node_config = NodeConfig {
+        name: IDENTITY_NODE_BASE_NAME.to_string(),
+        router_socket: socket_dir.clone(),
+        uuid_persistence_dir: state_dir.join("nodes"),
+        uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
+        config_dir: config_dir.clone(),
+        version: IDENTITY_NODE_VERSION.to_string(),
+    };
+
+    // Option-C fix (race ARCHI-BUG-12): connect persistently to the router
+    // FIRST so we are announced BEFORE asking vault anything. The vault
+    // lookup below uses this same connection. If vault hasn't booted yet,
+    // the lookup returns Missing, but our persistent registration means
+    // vault's bootstrap VAULT_SECRET_CHANGED broadcast (emitted when it
+    // arrives) lands in our receive loop and triggers the exit(0) rescue.
+    let (sender, mut receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    tracing::info!(node_name = %sender.full_name(), "sy.identity connected to router");
+
     let (database_url, db_secret_source, vault_lookup_error) = if is_primary {
         resolve_database_url(
-            &config_dir,
-            &state_dir,
-            &socket_dir,
+            &sender,
+            &mut receiver,
             &hive.hive_id,
             &node_name,
             &self_ilk_id,
@@ -2509,15 +2527,6 @@ async fn main() -> Result<(), IdentityError> {
             "sy.identity started without active DB backend; CONFIG_SET + restart required"
         );
     }
-    let node_config = NodeConfig {
-        name: IDENTITY_NODE_BASE_NAME.to_string(),
-        router_socket: socket_dir.clone(),
-        uuid_persistence_dir: state_dir.join("nodes"),
-        uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
-        config_dir: config_dir.clone(),
-        version: IDENTITY_NODE_VERSION.to_string(),
-    };
-
     let mut runtime = IdentityRuntime::new(&hive, state_dir.clone(), is_primary, db_config);
     if is_primary {
         if let Some(database_config) = runtime.db_config.clone() {
@@ -2642,8 +2651,6 @@ async fn main() -> Result<(), IdentityError> {
             });
         }
     }
-    let (sender, mut receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
-
     tracing::info!(
         hive = %hive.hive_id,
         role = %hive.role.clone().unwrap_or_else(|| "unknown".to_string()),
@@ -5097,41 +5104,25 @@ fn identity_config_error_response(
 /// our (ilk, tenant) match rules. Returns `Ok((None, last_error))` with
 /// the error text if vault is unreachable or denies.
 async fn resolve_database_url(
-    config_dir: &Path,
-    state_dir: &Path,
-    socket_dir: &Path,
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
     hive_id: &str,
     node_name: &str,
     self_ilk_id: &str,
     my_tenant: &str,
 ) -> (Option<String>, IdentityDbSecretSource, Option<String>) {
-    let node_config = fluxbee_sdk::NodeConfig {
-        name: IDENTITY_NODE_BASE_NAME.to_string(),
-        router_socket: socket_dir.to_path_buf(),
-        uuid_persistence_dir: state_dir.join("nodes"),
-        uuid_mode: fluxbee_sdk::NodeUuidMode::Ephemeral,
-        config_dir: config_dir.to_path_buf(),
-        version: IDENTITY_NODE_VERSION.to_string(),
-    };
-    let (sender, mut receiver) = match fluxbee_sdk::connect(&node_config).await {
-        Ok(pair) => pair,
-        Err(err) => {
-            return (
-                None,
-                IdentityDbSecretSource::Missing,
-                Some(format!(
-                    "failed to connect ephemeral router client for vault lookup: {err}"
-                )),
-            );
-        }
-    };
+    // Option-C fix (race ARCHI-BUG-12): vault lookup uses the caller's
+    // PERSISTENT router connection. The caller must already be announced
+    // before calling this, so that if vault boots after us its bootstrap
+    // VAULT_SECRET_CHANGED broadcast lands in our receive loop (rescued by
+    // handle_vault_secret_changed).
     let mut last_error = None;
     let started_at = Instant::now();
     let result = loop {
         let caller = fluxbee_sdk::VaultCaller::new(self_ilk_id, node_name);
         match fluxbee_sdk::resolve_resource(
-            &sender,
-            &mut receiver,
+            sender,
+            receiver,
             caller,
             hive_id,
             fluxbee_sdk::ResourceType::Postgres,
@@ -5156,7 +5147,6 @@ async fn resolve_database_url(
             }
         }
     };
-    let _ = sender.close().await;
     match result {
         Ok(Some(value)) => match extract_postgres_url_from_vault_value(&value) {
             Some(url) => (Some(url), IdentityDbSecretSource::LocalFile, None),

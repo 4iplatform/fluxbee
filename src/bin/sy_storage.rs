@@ -230,16 +230,26 @@ async fn main() -> Result<(), StorageError> {
         config_dir: config_dir.clone(),
         version: STORAGE_NODE_VERSION.to_string(),
     };
-    let socket_dir = json_router::paths::router_socket_dir();
-    let state_dir = json_router::paths::state_dir();
     // SY.storage is a system node; its tenant is the hive's root tenant.
     // Model D' pool match searches that tenant; there is no `sys` tenant
     // sentinel in the canonical model.
     let my_tenant = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID;
+
+    // Option-C fix (race ARCHI-BUG-12): connect to the router with our
+    // PERSISTENT identity FIRST, so we are announced before any vault
+    // lookup happens. The vault lookup then reuses this same connection.
+    // If vault is not yet up (we may arrive before it), the lookup returns
+    // a degraded state and we proceed — but because we are persistently
+    // registered, the bootstrap VAULT_SECRET_CHANGED broadcast vault emits
+    // at its own startup lands in our receive loop and triggers the
+    // exit(0) rescue.
+    let (mut sender, mut receiver) =
+        connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    tracing::info!(node_name = %sender.full_name(), "sy.storage connected to router");
+
     let (database_url, db_secret_source, vault_lookup_error) = resolve_database_url(
-        &config_dir,
-        &state_dir,
-        &socket_dir,
+        &sender,
+        &mut receiver,
         &hive.hive_id,
         &node_name,
         &self_ilk_id,
@@ -259,9 +269,6 @@ async fn main() -> Result<(), StorageError> {
         self_ilk_id.clone(),
         my_tenant.to_string(),
     )?;
-    let (mut sender, mut receiver) =
-        connect_with_retry(&node_config, Duration::from_secs(1)).await?;
-    tracing::info!(node_name = %sender.full_name(), "sy.storage connected to router");
 
     let storage = initialize_storage_backend(database_url.as_deref(), &node_name).await;
     if let Some(storage) = storage.as_ref() {
@@ -2391,39 +2398,25 @@ async fn load_hive(config_dir: &Path) -> Result<HiveFile, StorageError> {
 /// `postgres_url_ref` and looking it up in SY.vault via an ephemeral SDK
 /// client. Returns `(Some(url), LocalFile, None)` on success,
 /// `(None, Missing, Some(reason))` on any failure (degraded boot).
+/// Resolve the postgres URL from SY.vault using the caller's **already
+/// established persistent router connection**. This is the option-C fix to
+/// the boot race: we no longer open an ephemeral connection here. If we
+/// did, we would close it before vault boots, never re-register, and miss
+/// vault's bootstrap broadcast. By reusing the persistent connection that
+/// is already announced in the router, any subsequent broadcast lands in
+/// our receive loop (or the rescue handler in handle_vault_secret_changed).
 async fn resolve_database_url(
-    config_dir: &Path,
-    state_dir: &Path,
-    socket_dir: &Path,
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
     hive_id: &str,
     node_name: &str,
     self_ilk_id: &str,
     my_tenant: &str,
 ) -> (Option<String>, StorageDbSecretSource, Option<String>) {
-    let node_config = NodeConfig {
-        name: STORAGE_NODE_BASE_NAME.to_string(),
-        router_socket: socket_dir.to_path_buf(),
-        uuid_persistence_dir: state_dir.join("nodes"),
-        uuid_mode: NodeUuidMode::Ephemeral,
-        config_dir: config_dir.to_path_buf(),
-        version: STORAGE_NODE_VERSION.to_string(),
-    };
-    let (sender, mut receiver) = match fluxbee_sdk::connect(&node_config).await {
-        Ok(pair) => pair,
-        Err(err) => {
-            return (
-                None,
-                StorageDbSecretSource::Missing,
-                Some(format!(
-                    "failed to connect ephemeral router client for vault lookup: {err}"
-                )),
-            );
-        }
-    };
     let caller = fluxbee_sdk::VaultCaller::new(self_ilk_id, node_name);
     let result = fluxbee_sdk::resolve_resource(
-        &sender,
-        &mut receiver,
+        sender,
+        receiver,
         caller,
         hive_id,
         fluxbee_sdk::ResourceType::Postgres,
@@ -2431,7 +2424,7 @@ async fn resolve_database_url(
         Duration::from_secs(5),
     )
     .await;
-    let _ = sender.close().await;
+    let _ = node_name; // silence unused when feature flags trim logging
     match result {
         Ok(Some(value)) => match extract_postgres_url_from_vault_value(&value) {
             Some(url) => (Some(url), StorageDbSecretSource::LocalFile, None),
