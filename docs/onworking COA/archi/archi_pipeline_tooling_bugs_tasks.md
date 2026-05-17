@@ -86,6 +86,7 @@ Implementation note 2026-05-17:
 - Added host-level blocked pipeline control handling before normal AI chat.
 - Clear retry/restart/discard text now resolves directly to the pipeline action path.
 - For design-stage blockers, `reintenta` maps to `restart_from_design` because there is no useful confirmation checkpoint to re-enter.
+- Delegated recovery text such as "hacé lo que tengas que hacer" also maps deterministically: design-stage blockers restart from design; execution-stage blockers retry.
 
 ### [x] ARCHI-BUG-3 — Confirmation guard hides the real recovery state
 

@@ -1365,7 +1365,7 @@ Acceptance: una tarea compleja clara no requiere intervención humana entre `flu
 
 **Objetivo:** Cada tarea tiene un presupuesto de 50.000 tokens para todos los agentes invocados (sin contar Archi). Si se supera, los loops retornan error estructurado sin preguntar al operador.
 
-**Constante inicial:** `TASK_AGENT_TOKEN_BUDGET: u32 = 50_000` — hardcodeada. Cuando esté estable se expone en CONFIG SET/GET del nodo SY.architect.
+**Constante actual:** `TASK_AGENT_TOKEN_BUDGET: u32 = 250_000` — hardcodeada. Cuando esté estable se expone en CONFIG SET/GET del nodo SY.architect.
 
 **Nota 2026-04-25:** el valor inicial de `5_000` era demasiado bajo porque `usage.total_tokens` incluye prompt, tool schemas, contexto, tool calls y respuesta. Un plan directo simple de `run_node` ya consumió `13.225` tokens en el primer intento, por lo que el límite se elevó a `50_000`.
 
@@ -1387,7 +1387,7 @@ Acceptance: cada llamada a `run_with_input` retorna `tokens_used` en su resultad
 Agregar en `sy_architect.rs`:
 
 ```rust
-pub const TASK_AGENT_TOKEN_BUDGET: u32 = 50_000;
+pub const TASK_AGENT_TOKEN_BUDGET: u32 = 250_000;
 
 ```
 
@@ -1402,7 +1402,7 @@ En los loops que invocan agentes (design loop, artifact loop, plan_compile):
 - Antes de cada invocación de agente, verificar `accumulated_tokens < TASK_AGENT_TOKEN_BUDGET`
 - Si se supera: retornar `FailureClass::UnknownResidual` con mensaje:
   ```json
-  { "error": "BUDGET_EXCEEDED", "tokens_used": N, "budget": 50000, "stage": "artifact_loop" }
+  { "error": "BUDGET_EXCEEDED", "tokens_used": N, "budget": 250000, "stage": "artifact_loop" }
   ```
 
 - No preguntar al operador — solo reportar

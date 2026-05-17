@@ -269,7 +269,7 @@ struct AdminActionsCache {
 }
 
 const ADMIN_ACTIONS_CACHE_TTL_MS: u64 = 300_000; // 5 minutes
-const TASK_AGENT_TOKEN_BUDGET: u32 = 100_000;
+const TASK_AGENT_TOKEN_BUDGET: u32 = 250_000;
 
 #[derive(Debug, Clone)]
 struct TaskTokenBudget {
@@ -5430,6 +5430,29 @@ fn blocked_pipeline_action_from_text(
         || lower.contains("fresh")
     {
         return Some("restart_from_design");
+    }
+    if lower.contains("hace lo que")
+        || lower.contains("hacé lo que")
+        || lower.contains("lo que tengas")
+        || lower.contains("resolve")
+        || lower.contains("resolvelo")
+        || lower.contains("resolverlo")
+        || lower.contains("continua")
+        || lower.contains("continuá")
+        || lower.contains("seguir")
+        || lower.contains("segui")
+        || lower.contains("seguí")
+    {
+        let state = pipeline_state_from_run(run);
+        let pre_block_stage: Option<PipelineStage> = state
+            .get("pre_block_stage")
+            .and_then(|value| serde_json::from_value(value.clone()).ok());
+        return match pre_block_stage {
+            Some(PipelineStage::Execute)
+            | Some(PipelineStage::Verify)
+            | Some(PipelineStage::Confirm2) => Some("retry"),
+            _ => Some("restart_from_design"),
+        };
     }
     if lower.contains("retry")
         || lower.contains("reintenta")
@@ -25304,6 +25327,24 @@ mod tests {
         assert_eq!(
             super::blocked_pipeline_action_from_text("empeza de cero", &run),
             Some("restart_from_design")
+        );
+    }
+
+    #[test]
+    fn blocked_pipeline_delegated_recovery_text_chooses_safe_action() {
+        let design_run = blocked_pipeline_fixture(PipelineStage::Design);
+        let execute_run = blocked_pipeline_fixture(PipelineStage::Execute);
+
+        assert_eq!(
+            super::blocked_pipeline_action_from_text(
+                "hace lo que tengas que hacer para resolverlo",
+                &design_run
+            ),
+            Some("restart_from_design")
+        );
+        assert_eq!(
+            super::blocked_pipeline_action_from_text("hace lo que tengas que hacer", &execute_run),
+            Some("retry")
         );
     }
 
