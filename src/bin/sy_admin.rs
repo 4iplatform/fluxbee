@@ -4551,6 +4551,32 @@ async fn handle_hive_paths(
                 handle_admin_command(ctx, client, "delete_vpn", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
         }
+        ("GET", ["taps"]) => {
+            let (status, resp) = handle_admin_query(ctx, client, "list_taps", Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("POST", ["taps"]) => {
+            // ROUTER-TAP-5: install a new tap on the target hive. Body shape
+            // mirrors `TapConfig` in sy_config_routes (match_src, match_dst,
+            // target, mode, enabled).
+            let tap: serde_json::Value = serde_json::from_slice(body)?;
+            let (status, resp) =
+                handle_admin_command(ctx, client, "add_tap", tap, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("DELETE", ["taps"]) => {
+            // Natural key for taps is the (match_src, match_dst, target)
+            // triple — passed as query string since each component may
+            // contain '/', '@' etc. that don't path-encode cleanly.
+            let payload = serde_json::json!({
+                "match_src": query.get("match_src").cloned().unwrap_or_default(),
+                "match_dst": query.get("match_dst").cloned().unwrap_or_default(),
+                "target": query.get("target").cloned().unwrap_or_default(),
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "delete_tap", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
         ("GET", ["nodes"]) => {
             let (status, resp) = handle_admin_query(ctx, client, "list_nodes", Some(hive)).await?;
             Ok(Some((status, resp)))
