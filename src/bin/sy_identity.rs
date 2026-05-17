@@ -2485,7 +2485,7 @@ async fn main() -> Result<(), IdentityError> {
     };
     let (db_config, db_init_error) = if is_primary {
         let (cfg, init_err) = initialize_identity_database_backend(database_url.as_deref()).await;
-        let init_err = init_err.or(vault_lookup_error);
+        let init_err = vault_lookup_error.or(init_err);
         (cfg, init_err)
     } else {
         tracing::info!(
@@ -2642,8 +2642,7 @@ async fn main() -> Result<(), IdentityError> {
             });
         }
     }
-    let (mut sender, mut receiver) =
-        connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let (sender, mut receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
 
     tracing::info!(
         hive = %hive.hive_id,
@@ -5126,17 +5125,37 @@ async fn resolve_database_url(
             );
         }
     };
-    let caller = fluxbee_sdk::VaultCaller::new(self_ilk_id, node_name);
-    let result = fluxbee_sdk::resolve_resource(
-        &sender,
-        &mut receiver,
-        caller,
-        hive_id,
-        fluxbee_sdk::ResourceType::Postgres,
-        my_tenant,
-        Duration::from_secs(5),
-    )
-    .await;
+    let mut last_error = None;
+    let started_at = Instant::now();
+    let result = loop {
+        let caller = fluxbee_sdk::VaultCaller::new(self_ilk_id, node_name);
+        match fluxbee_sdk::resolve_resource(
+            &sender,
+            &mut receiver,
+            caller,
+            hive_id,
+            fluxbee_sdk::ResourceType::Postgres,
+            my_tenant,
+            Duration::from_secs(5),
+        )
+        .await
+        {
+            Ok(value) => break Ok(value),
+            Err(err) => {
+                let err_text = err.to_string();
+                last_error = Some(err_text.clone());
+                if started_at.elapsed() >= Duration::from_secs(15) {
+                    break Err(err_text);
+                }
+                tracing::warn!(
+                    node_name = %node_name,
+                    error = %err_text,
+                    "identity vault postgres lookup failed during boot; retrying"
+                );
+                time::sleep(Duration::from_millis(750)).await;
+            }
+        }
+    };
     let _ = sender.close().await;
     match result {
         Ok(Some(value)) => match extract_postgres_url_from_vault_value(&value) {
@@ -5151,7 +5170,10 @@ async fn resolve_database_url(
         Err(err) => (
             None,
             IdentityDbSecretSource::Missing,
-            Some(format!("vault resource lookup for postgres failed: {err}")),
+            Some(format!(
+                "vault resource lookup for postgres failed after boot retries: {}",
+                last_error.unwrap_or(err)
+            )),
         ),
     }
 }
