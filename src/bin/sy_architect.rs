@@ -805,6 +805,57 @@ struct DesignerTrace {
     manifest_version: String,
     section_count: usize,
     validation_result: String,
+    /// Per-layer outcomes recorded via `assess_layer` during this designer
+    /// call. Empty when the designer aborted before any `assess_layer` calls
+    /// (treated as schema failure by the design loop).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    layer_outcomes: Vec<DesignerTraceLayerOutcome>,
+}
+
+/// Serializable view of a per-layer outcome for inclusion in `DesignerTrace`.
+/// Mirrors `LayerOutcome` but flattens the variant into a `kind` + summary
+/// shape so it round-trips JSON without surprising the schema consumers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct DesignerTraceLayerOutcome {
+    layer: String,
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    no_work_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blocked_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blocked_reason: Option<String>,
+}
+
+impl From<&LayerAssessmentRecord> for DesignerTraceLayerOutcome {
+    fn from(record: &LayerAssessmentRecord) -> Self {
+        match &record.outcome {
+            LayerOutcome::Work { .. } => DesignerTraceLayerOutcome {
+                layer: record.layer.as_str().to_string(),
+                kind: "work".to_string(),
+                no_work_reason: None,
+                blocked_code: None,
+                blocked_reason: None,
+            },
+            LayerOutcome::NoWork { no_work_reason } => DesignerTraceLayerOutcome {
+                layer: record.layer.as_str().to_string(),
+                kind: "no_work".to_string(),
+                no_work_reason: Some(no_work_reason.clone()),
+                blocked_code: None,
+                blocked_reason: None,
+            },
+            LayerOutcome::Blocked {
+                blocked_code,
+                blocked_reason,
+            } => DesignerTraceLayerOutcome {
+                layer: record.layer.as_str().to_string(),
+                kind: "blocked".to_string(),
+                no_work_reason: None,
+                blocked_code: Some(blocked_code.clone()),
+                blocked_reason: Some(blocked_reason.clone()),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2352,7 +2403,33 @@ const DESIGNER_SYSTEM_PROMPT_BASE: &str = r#"You are the designer agent inside S
 Your job is to produce a valid `solution_manifest` in the Fluxbee rearchitecture format.
 You think only in desired state and advisory guidance.
 You do NOT produce executor plans, SCMD commands, admin step sequences, or operational procedures.
-You do NOT ask questions. You gather context with read-only tools if needed and then call submit_solution_manifest exactly once.
+You do NOT ask questions. You gather context with read-only tools if needed and then complete the layered iteration described below.
+
+## Layered iteration (REQUIRED contract)
+
+Fluxbee solutions touch up to six platform layers, in this fixed dependency order:
+
+1. `infra`             — hives, topology (new worker hive, etc.)
+2. `runtimes`          — runtime packages to publish (publish_runtime_package targets)
+3. `identity_secrets`  — tenants, ILK registrations, vault secrets needed by the solution
+4. `nodes`             — managed node instances (run_node targets)
+5. `routing`           — routes and VPN bindings (add_route)
+6. `logic`             — workflows and OPA policies (wf_rules_compile_apply, opa_compile_apply)
+
+You MUST call `assess_layer` exactly once per layer, in this exact order, BEFORE calling `submit_solution_manifest`. The host will reject `submit_solution_manifest` until all six assessments are recorded.
+
+For each layer, decide one of:
+- `outcome="work"` + `manifest_fragment={...}` — when the layer needs changes for this request. The fragment carries the partial `desired_state` and/or `advisory` for that layer (e.g. `{"desired_state":{"nodes":[...]}}` for the nodes layer).
+- `outcome="no_work"` + `no_work_reason="..."` — when the layer is unchanged by this request. Use this explicitly; you cannot skip a layer silently.
+- `outcome="blocked"` + `blocked_code="..."` + `blocked_reason="..."` — when the layer needs work but you lack enough information to specify it. Use machine-friendly codes like `RUNTIME_UNKNOWN`, `TENANT_AMBIGUOUS`, `WORKFLOW_DEFINITION_MISSING`. The pipeline will retry the design with your blocker as feedback; if still blocked, the manifest is emitted with the layer flagged for operator review.
+
+Cross-layer dependency rule: when one layer references resources, those resources must either appear as `work` in a lower layer of the same manifest, or be already-present external resources (mark them `ownership="external"` in the relevant fragment).
+- Routing requires Nodes to exist (this manifest or external).
+- Nodes require their Runtime to be published (Runtimes layer in this manifest, or already on the hive).
+- Logic (workflows/OPA) operates on top of Nodes and Routing.
+- Identity/secrets that nodes need to boot must be put before or as the node spawns.
+
+After all six `assess_layer` calls, call `submit_solution_manifest` once with the merged `solution_manifest`. The merged manifest must be internally consistent with your per-layer assessments — do not contradict in submit what you said in assess_layer.
 
 ## Manifest rules
 
@@ -2449,12 +2526,20 @@ The loop retries only if score improves by at least 1 point per iteration. Give 
 
 ## Review focus
 
-- desired_state completeness: topology, runtimes, nodes, routing, workflows, opa as applicable
-- every runtime referenced by a node must exist in desired_state.runtimes OR be confirmed present on the hive
-- every node must have a valid Fluxbee name (AI.*, WF.*, IO.*, SY.* prefix + @hive)
-- every new runtime must have package_source declared (inline_package, pre_published, or bundle_upload)
-- ownership must be explicitly set on all resources the solution manages
-- advisory notes that signal unresolved deployment risk
+The designer ran a layered iteration (`assess_layer` per platform layer: infra, runtimes, identity_secrets, nodes, routing, logic) before submitting this manifest. Layer COVERAGE is already enforced by the host — every layer has an explicit outcome (work / no_work / blocked). You do NOT need to re-flag coverage. Focus on the CONTENT per layer:
+
+- `infra`: declared topology consistent with the operator request and current live hives?
+- `runtimes`: every runtime referenced by a node either in `desired_state.runtimes` (with valid `package_source`) or already present on the hive?
+- `identity_secrets`: declared tenants exist or have a creation/registration step? vault-put advisory items carry resource_type?
+- `nodes`: every node has a valid Fluxbee name (AI.*, WF.*, IO.*, SY.* prefix + @hive) and references a resolvable runtime?
+- `routing`: every route src/dst resolves to a node from the nodes layer or an external pre-existing node?
+- `logic`: workflow/OPA deployments reference nodes that exist?
+
+Cross-cutting:
+- ownership must be explicitly set on all resources the solution manages.
+- advisory notes that signal unresolved deployment risk are valuable; missing ones are findings, not blockers.
+
+If the manifest carries a `LAYER_BLOCKED:*` blocking issue, the designer already flagged that layer as blocked. Treat it as an additional finding in your verdict but do not re-derive it.
 "#;
 
 const REAL_PROGRAMMER_SYSTEM_PROMPT_BASE: &str = r#"You are the real_programmer agent inside SY.architect.
@@ -2576,12 +2661,124 @@ impl StartPipelineTool {
     }
 }
 
+/// Returns true when a blocked pipeline's failure class represents
+/// "rework from scratch" (design/plan/artifact/snapshot/delta produced an
+/// invalid artifact) rather than a state worth retrying. Such pipelines are
+/// safe to auto-discard when a new pipeline intent arrives (ARCHI-BUG-10).
+///
+/// Execution-class blockers (an admin action actually ran and failed) and
+/// unknown classes are NOT auto-discardable — they may benefit from
+/// `retry`, or the situation is ambiguous and warrants explicit operator
+/// decision via `fluxbee_pipeline_action`.
+fn is_auto_discardable_blocked_failure_class(failure_class: Option<&str>) -> bool {
+    match failure_class.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(class) => matches!(
+            class,
+            "DESIGN_INCOMPLETE"
+                | "DESIGN_CONFLICT"
+                | "SNAPSHOT_PARTIAL_BLOCKING"
+                | "SNAPSHOT_SECTION_UNSUPPORTED"
+                | "DELTA_UNSUPPORTED"
+                | "ARTIFACT_TASK_UNDERSPECIFIED"
+                | "ARTIFACT_CONTRACT_INVALID"
+                | "ARTIFACT_LAYOUT_INVALID"
+                | "PLAN_INVALID"
+                | "PLAN_CONTRACT_INVALID"
+        ),
+        // Missing/empty failure class is ambiguous — surface to operator
+        // rather than discarding silently.
+        None => false,
+    }
+}
+
+/// Mark a stale blocked pipeline run as Failed so it stops appearing as the
+/// session's "active blocker". The reason text records that this was an
+/// auto-discard, distinguishing it from operator-initiated `discard`.
+async fn auto_discard_stale_blocked_run(
+    context: &ArchitectAdminToolContext,
+    run: &PipelineRunRecord,
+    failure_class: Option<&str>,
+    blocked_reason: Option<&str>,
+) -> Result<(), ArchitectError> {
+    let mut updated = run.clone();
+    updated.status = PipelineRunStatus::Failed;
+    updated.current_stage = PipelineStage::Failed;
+    updated.updated_at_ms = now_epoch_ms();
+    // Annotate state_json so history shows this was auto-cleanup, not the
+    // result of an explicit operator `discard`. Useful for postmortems.
+    let mut state_value = pipeline_state_from_run(run);
+    if let Some(obj) = state_value.as_object_mut() {
+        obj.insert(
+            "auto_discarded".to_string(),
+            json!({
+                "at_ms": updated.updated_at_ms,
+                "reason": "stale_blocked_pipeline_displaced_by_new_intent",
+                "failure_class": failure_class,
+                "original_blocked_reason": blocked_reason,
+            }),
+        );
+        updated.state_json =
+            serde_json::to_string(&state_value).unwrap_or_else(|_| updated.state_json.clone());
+    }
+    save_pipeline_run_with_context(context, &updated).await?;
+    tracing::info!(
+        pipeline_run_id = %run.pipeline_run_id,
+        failure_class = ?failure_class,
+        "auto-discarded stale blocked pipeline (ARCHI-BUG-10): not recoverable by retry, new pipeline intent received"
+    );
+    Ok(())
+}
+
+/// Variant of `execute_pipeline_start_with_context` that injects an
+/// `auto_discarded_predecessor` annotation into the new pipeline's state so
+/// operators / postmortems can see which run was displaced and why.
+async fn execute_pipeline_start_with_context_after_auto_discard(
+    context: &ArchitectAdminToolContext,
+    session_id: &str,
+    task: &str,
+    solution_id: Option<&str>,
+    operator_context: &str,
+    discarded_run_id: &str,
+    discarded_failure_class: Option<&str>,
+    discarded_blocked_reason: Option<&str>,
+) -> Result<Value, ArchitectError> {
+    let mut result = execute_pipeline_start_with_context(
+        context,
+        session_id,
+        task,
+        solution_id,
+        operator_context,
+    )
+    .await?;
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert(
+            "auto_discarded_predecessor".to_string(),
+            json!({
+                "pipeline_run_id": discarded_run_id,
+                "failure_class": discarded_failure_class,
+                "blocked_reason": discarded_blocked_reason,
+            }),
+        );
+    }
+    Ok(result)
+}
+
 struct DesignerOutput {
     manifest: SolutionManifestV2,
     solution_id: String,
     human_summary: String,
     trace: DesignerTrace,
     tokens_used: u32,
+    layer_outcomes: Vec<LayerAssessmentRecord>,
+}
+
+impl DesignerOutput {
+    fn blocked_layers(&self) -> Vec<&LayerAssessmentRecord> {
+        self.layer_outcomes
+            .iter()
+            .filter(|r| matches!(r.outcome, LayerOutcome::Blocked { .. }))
+            .collect()
+    }
 }
 
 struct DesignerInvalidOutput {
@@ -2593,6 +2790,268 @@ struct DesignerInvalidOutput {
 enum DesignerRunOutcome {
     Valid(DesignerOutput),
     Invalid(DesignerInvalidOutput),
+}
+
+/// Platform layers the designer must explicitly assess on every run.
+///
+/// The order is the canonical dependency order: lower layers (smaller index)
+/// must be satisfied before higher layers reference them. The designer MUST
+/// call `assess_layer` exactly once per layer, in this order, before
+/// `submit_solution_manifest`. See `docs/onworking COA/archi/layered_designer_design.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DesignerLayer {
+    Infra,
+    Runtimes,
+    IdentitySecrets,
+    Nodes,
+    Routing,
+    Logic,
+}
+
+impl DesignerLayer {
+    const ALL: [DesignerLayer; 6] = [
+        DesignerLayer::Infra,
+        DesignerLayer::Runtimes,
+        DesignerLayer::IdentitySecrets,
+        DesignerLayer::Nodes,
+        DesignerLayer::Routing,
+        DesignerLayer::Logic,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            DesignerLayer::Infra => "infra",
+            DesignerLayer::Runtimes => "runtimes",
+            DesignerLayer::IdentitySecrets => "identity_secrets",
+            DesignerLayer::Nodes => "nodes",
+            DesignerLayer::Routing => "routing",
+            DesignerLayer::Logic => "logic",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        DesignerLayer::ALL
+            .iter()
+            .copied()
+            .find(|layer| layer.as_str() == value)
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum LayerOutcome {
+    Work {
+        manifest_fragment: Value,
+    },
+    NoWork {
+        no_work_reason: String,
+    },
+    Blocked {
+        blocked_code: String,
+        blocked_reason: String,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct LayerAssessmentRecord {
+    layer: DesignerLayer,
+    #[serde(flatten)]
+    outcome: LayerOutcome,
+}
+
+/// Shared state between `AssessLayerTool` and `DesignerSubmitManifestTool`
+/// within a single designer call. Enforces order and uniqueness during the
+/// function-calling loop so the model gets immediate feedback when it
+/// violates the contract.
+#[derive(Debug, Default)]
+struct LayerAssessmentStore {
+    inner: tokio::sync::Mutex<Vec<LayerAssessmentRecord>>,
+}
+
+impl LayerAssessmentStore {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    async fn record(
+        &self,
+        layer: DesignerLayer,
+        outcome: LayerOutcome,
+    ) -> Result<(), String> {
+        let mut guard = self.inner.lock().await;
+        let next_expected = DesignerLayer::ALL.get(guard.len()).copied();
+        match next_expected {
+            None => Err(format!(
+                "all layers already assessed; rejected duplicate call for layer={}",
+                layer.as_str()
+            )),
+            Some(expected) if expected != layer => Err(format!(
+                "layers must be assessed in order; expected layer={} (next in sequence), got layer={}",
+                expected.as_str(),
+                layer.as_str()
+            )),
+            Some(_) => {
+                guard.push(LayerAssessmentRecord { layer, outcome });
+                Ok(())
+            }
+        }
+    }
+
+    async fn is_complete(&self) -> bool {
+        self.inner.lock().await.len() == DesignerLayer::ALL.len()
+    }
+
+    async fn snapshot(&self) -> Vec<LayerAssessmentRecord> {
+        self.inner.lock().await.clone()
+    }
+}
+
+struct AssessLayerTool {
+    store: Arc<LayerAssessmentStore>,
+}
+
+#[async_trait]
+impl FunctionTool for AssessLayerTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "assess_layer".to_string(),
+            description: "Record the assessment of one platform layer for this solution. Must be called exactly once per layer in the canonical order: infra, runtimes, identity_secrets, nodes, routing, logic. Use outcome=work with manifest_fragment when the layer needs changes; outcome=no_work with no_work_reason when the layer is unchanged; outcome=blocked with blocked_code and blocked_reason when you cannot specify the layer from current information.".to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["layer", "outcome"],
+                "properties": {
+                    "layer": {
+                        "type": "string",
+                        "enum": ["infra", "runtimes", "identity_secrets", "nodes", "routing", "logic"]
+                    },
+                    "outcome": {
+                        "type": "string",
+                        "enum": ["work", "no_work", "blocked"]
+                    },
+                    "manifest_fragment": {
+                        "type": "object",
+                        "description": "Required when outcome=work. Partial manifest section(s) the designer contributes for this layer (e.g. {\"desired_state\":{\"nodes\":[...]}})."
+                    },
+                    "no_work_reason": {
+                        "type": "string",
+                        "description": "Required when outcome=no_work. Short explanation of why this layer needs nothing for this request."
+                    },
+                    "blocked_code": {
+                        "type": "string",
+                        "description": "Required when outcome=blocked. Machine-friendly key, e.g. RUNTIME_UNKNOWN, TENANT_AMBIGUOUS, WORKFLOW_DEFINITION_MISSING."
+                    },
+                    "blocked_reason": {
+                        "type": "string",
+                        "description": "Required when outcome=blocked. Concrete missing information or constraint."
+                    }
+                }
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let layer_str = arguments
+            .get("layer")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol("assess_layer requires layer".to_string())
+            })?;
+        let layer = DesignerLayer::from_str(layer_str).ok_or_else(|| {
+            fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                "assess_layer received unknown layer={layer_str}"
+            ))
+        })?;
+        let outcome_str = arguments
+            .get("outcome")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                fluxbee_ai_sdk::AiSdkError::Protocol("assess_layer requires outcome".to_string())
+            })?;
+        let outcome = match outcome_str {
+            "work" => {
+                let fragment = arguments
+                    .get("manifest_fragment")
+                    .cloned()
+                    .ok_or_else(|| {
+                        fluxbee_ai_sdk::AiSdkError::Protocol(
+                            "assess_layer outcome=work requires manifest_fragment".to_string(),
+                        )
+                    })?;
+                LayerOutcome::Work {
+                    manifest_fragment: fragment,
+                }
+            }
+            "no_work" => {
+                let reason = arguments
+                    .get("no_work_reason")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        fluxbee_ai_sdk::AiSdkError::Protocol(
+                            "assess_layer outcome=no_work requires no_work_reason".to_string(),
+                        )
+                    })?
+                    .to_string();
+                LayerOutcome::NoWork {
+                    no_work_reason: reason,
+                }
+            }
+            "blocked" => {
+                let code = arguments
+                    .get("blocked_code")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        fluxbee_ai_sdk::AiSdkError::Protocol(
+                            "assess_layer outcome=blocked requires blocked_code".to_string(),
+                        )
+                    })?
+                    .to_string();
+                let reason = arguments
+                    .get("blocked_reason")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        fluxbee_ai_sdk::AiSdkError::Protocol(
+                            "assess_layer outcome=blocked requires blocked_reason".to_string(),
+                        )
+                    })?
+                    .to_string();
+                LayerOutcome::Blocked {
+                    blocked_code: code,
+                    blocked_reason: reason,
+                }
+            }
+            other => {
+                return Err(fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                    "assess_layer unknown outcome={other}"
+                )));
+            }
+        };
+        self.store
+            .record(layer, outcome.clone())
+            .await
+            .map_err(fluxbee_ai_sdk::AiSdkError::Protocol)?;
+        Ok(json!({
+            "status": "ok",
+            "layer": layer.as_str(),
+            "outcome": match &outcome {
+                LayerOutcome::Work { .. } => "work",
+                LayerOutcome::NoWork { .. } => "no_work",
+                LayerOutcome::Blocked { .. } => "blocked",
+            },
+            "next_expected_layer": DesignerLayer::ALL
+                .get(self.store.inner.lock().await.len())
+                .copied()
+                .map(|l| l.as_str())
+                .unwrap_or("submit_solution_manifest"),
+        }))
+    }
 }
 
 #[async_trait]
@@ -2657,7 +3116,6 @@ impl FunctionTool for StartPipelineTool {
                     ))
                 })?
         {
-            // Blocked runs need explicit operator action — surface options instead of just erroring.
             if existing.status == PipelineRunStatus::Blocked {
                 let state_obj = pipeline_state_from_run(&existing);
                 let blocked_reason = state_obj
@@ -2668,6 +3126,53 @@ impl FunctionTool for StartPipelineTool {
                     .get("blocked_failure_class")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+
+                // ARCHI-BUG-10: pipelines blocked by design/plan/artifact/
+                // snapshot/delta failure classes are not recoverable — there
+                // is no useful state to retry, only "rework from scratch". A
+                // new operator pipeline intent should not be forced to
+                // type "restart_from_design" / "discard" before proceeding;
+                // we auto-discard the dead pipeline and start the new one,
+                // recording the auto-discarded id in the new run's state for
+                // traceability. Execution-class blocks and unknown classes
+                // are NOT auto-discarded because retry may have value or
+                // the situation is ambiguous and warrants operator decision.
+                if is_auto_discardable_blocked_failure_class(blocked_failure_class.as_deref()) {
+                    if let Err(err) = auto_discard_stale_blocked_run(
+                        &self.context,
+                        &existing,
+                        blocked_failure_class.as_deref(),
+                        blocked_reason.as_deref(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            pipeline_run_id = %existing.pipeline_run_id,
+                            error = %err,
+                            "auto-discard of stale blocked pipeline failed; surfacing recovery options instead"
+                        );
+                        // Fall through to the surface-options path below.
+                    } else {
+                        // Successfully discarded; proceed to start a fresh
+                        // pipeline. We expose the auto_discarded id in the
+                        // new pipeline's state via the start helper below.
+                        return execute_pipeline_start_with_context_after_auto_discard(
+                            &self.context,
+                            session_id,
+                            task,
+                            solution_id.as_deref(),
+                            &operator_context,
+                            &existing.pipeline_run_id,
+                            blocked_failure_class.as_deref(),
+                            blocked_reason.as_deref(),
+                        )
+                        .await
+                        .map_err(|err| fluxbee_ai_sdk::AiSdkError::Protocol(err.to_string()));
+                    }
+                }
+
+                // Surface options path (execution-class or unknown blocker,
+                // or auto-discard failed).
                 return Ok(json!({
                     "status": "blocked_run_pending",
                     "pipeline_run_id": existing.pipeline_run_id,
@@ -2867,14 +3372,16 @@ async fn execute_pipeline_start_with_context(
     }))
 }
 
-struct DesignerSubmitManifestTool;
+struct DesignerSubmitManifestTool {
+    store: Arc<LayerAssessmentStore>,
+}
 
 #[async_trait]
 impl FunctionTool for DesignerSubmitManifestTool {
     fn definition(&self) -> FunctionToolDefinition {
         FunctionToolDefinition {
             name: "submit_solution_manifest".to_string(),
-            description: "Submit the completed solution manifest. Call this exactly once."
+            description: "Submit the completed solution manifest. May only be called after assess_layer has been called once per layer in the canonical order (infra, runtimes, identity_secrets, nodes, routing, logic). The manifest must be consistent with the per-layer assessments already recorded."
                 .to_string(),
             parameters_json_schema: json!({
                 "type": "object",
@@ -2906,6 +3413,25 @@ impl FunctionTool for DesignerSubmitManifestTool {
     }
 
     async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        if !self.store.is_complete().await {
+            let assessed: Vec<&str> = self
+                .store
+                .snapshot()
+                .await
+                .iter()
+                .map(|r| r.layer.as_str())
+                .collect();
+            let missing: Vec<&str> = DesignerLayer::ALL
+                .iter()
+                .filter(|l| !assessed.contains(&l.as_str()))
+                .map(|l| l.as_str())
+                .collect();
+            return Err(fluxbee_ai_sdk::AiSdkError::Protocol(format!(
+                "submit_solution_manifest rejected: must call assess_layer for every layer in order before submit. Missing: {}. Assessed so far: {}.",
+                missing.join(", "),
+                assessed.join(", ")
+            )));
+        }
         Ok(arguments)
     }
 }
@@ -3048,9 +3574,19 @@ async fn run_designer_with_context(
         runtime.model_settings.clone(),
     );
 
+    let layer_store = Arc::new(LayerAssessmentStore::new());
     let mut tools = FunctionToolRegistry::new();
     tools
-        .register(Arc::new(DesignerSubmitManifestTool))
+        .register(Arc::new(AssessLayerTool {
+            store: Arc::clone(&layer_store),
+        }))
+        .map_err(|err| -> ArchitectError {
+            format!("designer assess_layer tool register failed: {err}").into()
+        })?;
+    tools
+        .register(Arc::new(DesignerSubmitManifestTool {
+            store: Arc::clone(&layer_store),
+        }))
         .map_err(|err| -> ArchitectError {
             format!("designer submit tool register failed: {err}").into()
         })?;
@@ -3104,19 +3640,42 @@ async fn run_designer_with_context(
         .filter(|item| matches!(item, FunctionLoopItem::ToolResult { result } if result.name == "query_hive" && !result.is_error))
         .count() as u32;
 
+    // Snapshot the layer store: every `assess_layer` call that succeeded
+    // through the tool is recorded here in canonical order. The tool itself
+    // already enforced order/uniqueness so this list mirrors the contract.
+    let layer_records = layer_store.snapshot().await;
+    let trace_layer_outcomes: Vec<DesignerTraceLayerOutcome> =
+        layer_records.iter().map(DesignerTraceLayerOutcome::from).collect();
+
     let submitted = match submitted {
         Some(value) => value,
         None => {
-            let error = "designer did not call submit_solution_manifest";
+            let error = if layer_records.len() < DesignerLayer::ALL.len() {
+                let assessed: Vec<&str> =
+                    layer_records.iter().map(|r| r.layer.as_str()).collect();
+                let missing: Vec<&str> = DesignerLayer::ALL
+                    .iter()
+                    .filter(|l| !assessed.contains(&l.as_str()))
+                    .map(|l| l.as_str())
+                    .collect();
+                format!(
+                    "designer did not call submit_solution_manifest. assess_layer coverage incomplete: assessed=[{}] missing=[{}]",
+                    assessed.join(", "),
+                    missing.join(", ")
+                )
+            } else {
+                "designer did not call submit_solution_manifest".to_string()
+            };
             return Ok(DesignerRunOutcome::Invalid(DesignerInvalidOutput {
-                feedback: designer_schema_feedback(error),
+                feedback: designer_schema_feedback(&error),
                 trace: DesignerTrace {
                     task: task.to_string(),
                     solution_id: solution_id.map(str::to_string),
                     query_hive_calls,
                     manifest_version: String::new(),
                     section_count: 0,
-                    validation_result: error.to_string(),
+                    validation_result: error,
+                    layer_outcomes: trace_layer_outcomes,
                 },
                 tokens_used: result.tokens_used,
             }));
@@ -3136,6 +3695,7 @@ async fn run_designer_with_context(
                     manifest_version: String::new(),
                     section_count: 0,
                     validation_result: error.to_string(),
+                    layer_outcomes: trace_layer_outcomes.clone(),
                 },
                 tokens_used: result.tokens_used,
             }));
@@ -3155,6 +3715,7 @@ async fn run_designer_with_context(
                     manifest_version: String::new(),
                     section_count: 0,
                     validation_result: error,
+                    layer_outcomes: trace_layer_outcomes.clone(),
                 },
                 tokens_used: result.tokens_used,
             }));
@@ -3171,6 +3732,7 @@ async fn run_designer_with_context(
                 manifest_version: manifest.manifest_version.clone(),
                 section_count: designer_manifest_section_count(&manifest),
                 validation_result: error,
+                layer_outcomes: trace_layer_outcomes.clone(),
             },
             tokens_used: result.tokens_used,
         }));
@@ -3197,6 +3759,7 @@ async fn run_designer_with_context(
         manifest_version: manifest.manifest_version.clone(),
         section_count: designer_manifest_section_count(&manifest),
         validation_result: "ok".to_string(),
+        layer_outcomes: trace_layer_outcomes,
     };
 
     Ok(DesignerRunOutcome::Valid(DesignerOutput {
@@ -3205,6 +3768,7 @@ async fn run_designer_with_context(
         human_summary,
         trace,
         tokens_used: result.tokens_used,
+        layer_outcomes: layer_records,
     }))
 }
 
@@ -3414,6 +3978,67 @@ async fn run_real_programmer_with_context(
     Ok((bundle, result.tokens_used))
 }
 
+/// Build retry feedback for the designer when one or more layers came back
+/// `blocked`. The next iteration receives this as additional context so it
+/// can take a second pass at the same layers with the operator-visible
+/// blocked_code/blocked_reason in mind.
+fn design_feedback_from_blocked_layers(blocked: &[&LayerAssessmentRecord]) -> String {
+    let mut lines = vec![
+        "One or more layers came back from `assess_layer` with outcome=blocked.".to_string(),
+        "Retry the full layered iteration. For each blocked layer below, either resolve the missing information (preferred) or keep the layer blocked with a tighter blocked_code/blocked_reason so the operator can act on it. Do NOT silently downgrade a real block to `no_work`.".to_string(),
+    ];
+    for record in blocked {
+        if let LayerOutcome::Blocked {
+            blocked_code,
+            blocked_reason,
+        } = &record.outcome
+        {
+            lines.push(format!(
+                "  - layer={} code={} reason={}",
+                record.layer.as_str(),
+                blocked_code,
+                blocked_reason
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Convert designer-reported blocked layers into auditor findings on the
+/// last iteration. The pipeline emits the manifest (so the operator sees the
+/// shape), but downstream plan compile refuses to advance while any layer is
+/// flagged blocked — matching the B+C decision recorded in
+/// `docs/onworking COA/archi/layered_designer_design.md`.
+fn inject_blocked_layer_findings_into_verdict(
+    verdict: &mut DesignAuditVerdict,
+    blocked: &[&LayerAssessmentRecord],
+) {
+    if blocked.is_empty() {
+        return;
+    }
+    if matches!(verdict.status, DesignAuditStatus::Pass) {
+        verdict.status = DesignAuditStatus::Revise;
+    }
+    for record in blocked {
+        if let LayerOutcome::Blocked {
+            blocked_code,
+            blocked_reason,
+        } = &record.outcome
+        {
+            let issue_key = format!("LAYER_BLOCKED:{}", record.layer.as_str());
+            if !verdict.blocking_issues.iter().any(|item| item == &issue_key) {
+                verdict.blocking_issues.push(issue_key.clone());
+            }
+            verdict.findings.push(DesignFinding {
+                code: format!("LAYER_BLOCKED_{}", blocked_code),
+                section: format!("layer.{}", record.layer.as_str()),
+                message: blocked_reason.clone(),
+                severity: AuditSeverity::Error,
+            });
+        }
+    }
+}
+
 fn design_feedback_from_verdict(verdict: &DesignAuditVerdict) -> String {
     let mut parts = Vec::new();
     if !verdict.blocking_issues.is_empty() {
@@ -3564,13 +4189,57 @@ async fn run_design_loop(
         tokens_accumulated = tokens_accumulated.saturating_add(designer_output.tokens_used);
         token_budget.add("design.designer", designer_output.tokens_used)?;
         current_solution_id = Some(designer_output.solution_id.clone());
+        designer_traces.push(designer_output.trace.clone());
+
+        // Layer-blocked retry path (ARCHI-STRAT-LAYERED, decision B+C combined):
+        // if the designer flagged any layer as blocked AND we still have
+        // design iterations left, retry with layer-specific feedback. Skip
+        // the auditor this round because the manifest is structurally
+        // incomplete by the designer's own admission. On the LAST iteration
+        // we fall through to the audit so the operator sees a verdict that
+        // includes the blocked-layer findings (B+C: manifest is emitted but
+        // marked, plan compile will refuse).
+        let blocked_layers = designer_output.blocked_layers();
+        if !blocked_layers.is_empty() && iteration < MAX_DESIGN_ITERATIONS {
+            let layer_feedback = design_feedback_from_blocked_layers(&blocked_layers);
+            trace.push(DesignLoopTraceEvent {
+                iteration: iteration_u32,
+                stage: "design_layer_blocked".to_string(),
+                score: None,
+                status: None,
+                blocking_issue_count: blocked_layers.len(),
+                stopped_reason: None,
+            });
+            save_pipeline_run_with_context(
+                context,
+                &pipeline_run_with_state_update(
+                    pipeline_run,
+                    PipelineStage::Design,
+                    Some(json!({
+                        "design_feedback": layer_feedback,
+                        "design_iterations_used": iteration_u32,
+                        "designer_traces": designer_traces,
+                        "design_loop_trace": trace,
+                        "design_tokens_used": tokens_accumulated,
+                    })),
+                    Some(iteration_u32),
+                )?,
+            )
+            .await?;
+            feedback = if feedback.trim().is_empty() {
+                layer_feedback
+            } else {
+                format!("{feedback}\n\n{layer_feedback}")
+            };
+            continue;
+        }
+
         let manifest_path = save_manifest_from_context(
             context,
             &designer_output.solution_id,
             &designer_output.manifest,
         )
         .await?;
-        designer_traces.push(designer_output.trace.clone());
 
         // Persist the solution_id on the pipeline_run BEFORE the auditor (or
         // any tool the auditor invokes) tries to resolve session → solution_id.
@@ -3584,8 +4253,12 @@ async fn run_design_loop(
 
         token_budget.ensure_room("design.auditor")?;
 
-        let (verdict, auditor_tokens) =
+        let (mut verdict, auditor_tokens) =
             run_design_auditor_with_context(context, &designer_output.manifest, &feedback).await?;
+        // If layers were blocked on the final iteration, inject layer-level
+        // findings into the auditor verdict so the operator sees the
+        // specific blocker per layer and plan compile can refuse.
+        inject_blocked_layer_findings_into_verdict(&mut verdict, &blocked_layers);
         tokens_accumulated = tokens_accumulated.saturating_add(auditor_tokens);
         token_budget.add("design.auditor", auditor_tokens)?;
         let verdict_path = save_design_audit_verdict(
@@ -15160,6 +15833,15 @@ fn architect_index_html(state: &ArchitectState) -> String {
       border-color: var(--accent);
       color: #fff;
     }}
+    .inline-confirm-btn.warning {{
+      background: #c2410c;
+      border-color: #c2410c;
+      color: #fff;
+    }}
+    .inline-confirm-btn.warning:hover {{
+      background: #9a2f08;
+      border-color: #9a2f08;
+    }}
     .modal-backdrop {{
       position: fixed;
       inset: 0;
@@ -16696,6 +17378,20 @@ fn architect_index_html(state: &ArchitectState) -> String {
     function pendingConfirmationUiMeta(data) {{
       if (!responseWantsInlineConfirm(data)) return null;
       const output = data && data.output ? data.output : null;
+      // ARCHI-BUG-11: blocked_run_pending offers a single warning-colored
+      // "Discard blocked pipeline" button. The other recovery options
+      // (restart_from_design, retry) stay available via text input for the
+      // less common cases. Operator decision: blocked = dead, drop it.
+      if (output && String(output.status || "").toLowerCase() === "blocked_run_pending") {{
+        return {{
+          confirmHidden: true,
+          cancelLabel: "Discard blocked pipeline",
+          cancelClass: "warning",
+          cancelMessage: "discard",
+          lockReason: "A previous pipeline run is blocked in this session. Click Discard to drop it, or type retry / restart_from_design for advanced recovery.",
+          executionHint: "Discarding blocked pipeline..."
+        }};
+      }}
       if (data && data.mode === "pipeline") {{
         if (output && output.stage === "confirm1") {{
           return {{
@@ -17634,6 +18330,12 @@ fn architect_index_html(state: &ArchitectState) -> String {
     function responseWantsInlineConfirm(data) {{
       const output = data && data.output ? data.output : null;
       if (!output || typeof output !== "object") return false;
+      // ARCHI-BUG-11: blocked_run_pending gets a single-button inline bar
+      // regardless of mode so the operator can dismiss the stale pipeline
+      // with one click instead of typing the recovery word.
+      if (String(output.status || "").toLowerCase() === "blocked_run_pending") {{
+        return true;
+      }}
       if (data && data.mode === "pipeline") {{
         return output.stage === "confirm1" || output.stage === "confirm2";
       }}
@@ -17660,21 +18362,28 @@ fn architect_index_html(state: &ArchitectState) -> String {
       }};
       const bar = document.createElement("div");
       bar.className = "inline-confirm-bar";
-      const confirmBtn = document.createElement("button");
-      confirmBtn.type = "button";
-      confirmBtn.className = "inline-confirm-btn primary";
-      confirmBtn.textContent = meta.confirmLabel;
-      confirmBtn.addEventListener("click", () => {{
-        sendQuickControlMessage("CONFIRM", meta.executionHint || "Executing confirmation...");
-      }});
+      // ARCHI-BUG-11: when meta.confirmHidden is true, only render the
+      // cancel button (used for blocked_run_pending where there is nothing
+      // to "confirm" — operator decides whether to drop the stale pipeline).
+      if (!meta.confirmHidden) {{
+        const confirmBtn = document.createElement("button");
+        confirmBtn.type = "button";
+        confirmBtn.className = "inline-confirm-btn primary";
+        confirmBtn.textContent = meta.confirmLabel;
+        confirmBtn.addEventListener("click", () => {{
+          sendQuickControlMessage("CONFIRM", meta.executionHint || "Executing confirmation...");
+        }});
+        bar.appendChild(confirmBtn);
+      }}
       const cancelBtn = document.createElement("button");
       cancelBtn.type = "button";
-      cancelBtn.className = "inline-confirm-btn";
+      cancelBtn.className = "inline-confirm-btn " + (meta.cancelClass || "");
       cancelBtn.textContent = meta.cancelLabel;
+      const cancelMessage = meta.cancelMessage || "CANCEL";
+      const cancelHint = meta.executionHint || "Discarding pending action...";
       cancelBtn.addEventListener("click", () => {{
-        sendQuickControlMessage("CANCEL", "Discarding pending action...");
+        sendQuickControlMessage(cancelMessage, cancelHint);
       }});
-      bar.appendChild(confirmBtn);
       bar.appendChild(cancelBtn);
       return bar;
     }}
@@ -25742,5 +26451,316 @@ mod tests {
         assert!(PROGRAMMER_QUERY_ALLOWED_ACTIONS.contains(&"wf_rules_list_workflows"));
         assert!(PROGRAMMER_QUERY_ALLOWED_ACTIONS.contains(&"wf_rules_get_workflow"));
         assert!(PROGRAMMER_QUERY_ALLOWED_ACTIONS.contains(&"wf_rules_get_status"));
+    }
+
+    // ── ARCHI-STRAT-LAYERED: layered designer iteration tests ─────────────
+
+    #[tokio::test]
+    async fn layer_store_records_outcomes_in_canonical_order() {
+        let store = LayerAssessmentStore::new();
+        for layer in DesignerLayer::ALL {
+            store
+                .record(
+                    layer,
+                    LayerOutcome::NoWork {
+                        no_work_reason: "trivial test".to_string(),
+                    },
+                )
+                .await
+                .expect("record in order should succeed");
+        }
+        assert!(store.is_complete().await);
+        let snapshot = store.snapshot().await;
+        let names: Vec<&str> = snapshot.iter().map(|r| r.layer.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "infra",
+                "runtimes",
+                "identity_secrets",
+                "nodes",
+                "routing",
+                "logic"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn layer_store_rejects_out_of_order_record() {
+        let store = LayerAssessmentStore::new();
+        // Try to record `nodes` before `infra`, `runtimes`, `identity_secrets`.
+        let err = store
+            .record(
+                DesignerLayer::Nodes,
+                LayerOutcome::NoWork {
+                    no_work_reason: "out of order attempt".to_string(),
+                },
+            )
+            .await
+            .expect_err("out-of-order record must error");
+        assert!(err.contains("expected layer=infra"), "got: {err}");
+        assert!(!store.is_complete().await);
+    }
+
+    #[tokio::test]
+    async fn layer_store_rejects_duplicate_record() {
+        let store = LayerAssessmentStore::new();
+        for layer in DesignerLayer::ALL {
+            store
+                .record(
+                    layer,
+                    LayerOutcome::NoWork {
+                        no_work_reason: "fill all layers".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let err = store
+            .record(
+                DesignerLayer::Logic,
+                LayerOutcome::NoWork {
+                    no_work_reason: "duplicate".to_string(),
+                },
+            )
+            .await
+            .expect_err("duplicate after completion must error");
+        assert!(err.contains("all layers already assessed"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn assess_layer_tool_rejects_work_without_fragment() {
+        let store = Arc::new(LayerAssessmentStore::new());
+        let tool = AssessLayerTool {
+            store: Arc::clone(&store),
+        };
+        let err = tool
+            .call(json!({"layer": "infra", "outcome": "work"}))
+            .await
+            .expect_err("work without manifest_fragment must error");
+        let msg = match err {
+            fluxbee_ai_sdk::AiSdkError::Protocol(text) => text,
+            other => panic!("unexpected error variant: {other:?}"),
+        };
+        assert!(
+            msg.contains("manifest_fragment"),
+            "error must mention manifest_fragment; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn assess_layer_tool_rejects_blocked_without_code() {
+        let store = Arc::new(LayerAssessmentStore::new());
+        let tool = AssessLayerTool {
+            store: Arc::clone(&store),
+        };
+        let err = tool
+            .call(json!({
+                "layer": "infra",
+                "outcome": "blocked",
+                "blocked_reason": "no info"
+            }))
+            .await
+            .expect_err("blocked without blocked_code must error");
+        let msg = match err {
+            fluxbee_ai_sdk::AiSdkError::Protocol(text) => text,
+            other => panic!("unexpected error variant: {other:?}"),
+        };
+        assert!(msg.contains("blocked_code"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn submit_manifest_tool_rejects_when_coverage_incomplete() {
+        let store = Arc::new(LayerAssessmentStore::new());
+        // Only assess infra; leave 5 layers unassessed.
+        store
+            .record(
+                DesignerLayer::Infra,
+                LayerOutcome::NoWork {
+                    no_work_reason: "test".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let tool = DesignerSubmitManifestTool {
+            store: Arc::clone(&store),
+        };
+        let err = tool
+            .call(json!({
+                "solution_manifest": {
+                    "manifest_version": "2.0",
+                    "solution": {"name": "x", "description": "y"},
+                    "desired_state": {},
+                    "advisory": []
+                },
+                "human_summary": "test"
+            }))
+            .await
+            .expect_err("submit must reject when coverage incomplete");
+        let msg = match err {
+            fluxbee_ai_sdk::AiSdkError::Protocol(text) => text,
+            other => panic!("unexpected error variant: {other:?}"),
+        };
+        // Missing layers should be listed.
+        for missing in ["runtimes", "identity_secrets", "nodes", "routing", "logic"] {
+            assert!(msg.contains(missing), "expected '{missing}' in error: {msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_manifest_tool_accepts_when_all_layers_assessed() {
+        let store = Arc::new(LayerAssessmentStore::new());
+        for layer in DesignerLayer::ALL {
+            store
+                .record(
+                    layer,
+                    LayerOutcome::NoWork {
+                        no_work_reason: "test fill".to_string(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let tool = DesignerSubmitManifestTool {
+            store: Arc::clone(&store),
+        };
+        let args = json!({
+            "solution_manifest": {
+                "manifest_version": "2.0",
+                "solution": {"name": "x", "description": "y"},
+                "desired_state": {},
+                "advisory": []
+            },
+            "human_summary": "ok"
+        });
+        let result = tool.call(args.clone()).await.expect("must accept");
+        assert_eq!(result, args);
+    }
+
+    #[test]
+    fn blocked_layer_feedback_mentions_each_blocked_layer() {
+        let records = vec![
+            LayerAssessmentRecord {
+                layer: DesignerLayer::Nodes,
+                outcome: LayerOutcome::Blocked {
+                    blocked_code: "NODE_TARGET_UNKNOWN".to_string(),
+                    blocked_reason: "operator did not name target hive".to_string(),
+                },
+            },
+            LayerAssessmentRecord {
+                layer: DesignerLayer::Routing,
+                outcome: LayerOutcome::Blocked {
+                    blocked_code: "ROUTE_DST_AMBIGUOUS".to_string(),
+                    blocked_reason: "two candidate nodes exist".to_string(),
+                },
+            },
+        ];
+        let refs: Vec<&LayerAssessmentRecord> = records.iter().collect();
+        let feedback = design_feedback_from_blocked_layers(&refs);
+        assert!(feedback.contains("layer=nodes"));
+        assert!(feedback.contains("NODE_TARGET_UNKNOWN"));
+        assert!(feedback.contains("layer=routing"));
+        assert!(feedback.contains("ROUTE_DST_AMBIGUOUS"));
+    }
+
+    #[test]
+    fn inject_blocked_layer_findings_adds_per_layer_blockers_and_marks_revise() {
+        let mut verdict = DesignAuditVerdict {
+            verdict_id: "v1".to_string(),
+            manifest_version: "2.0".to_string(),
+            status: DesignAuditStatus::Pass,
+            score: 9,
+            blocking_issues: vec![],
+            findings: vec![],
+            summary: "all good".to_string(),
+            produced_at_ms: 0,
+        };
+        let records = vec![LayerAssessmentRecord {
+            layer: DesignerLayer::IdentitySecrets,
+            outcome: LayerOutcome::Blocked {
+                blocked_code: "TENANT_AMBIGUOUS".to_string(),
+                blocked_reason: "request did not name a tenant".to_string(),
+            },
+        }];
+        let refs: Vec<&LayerAssessmentRecord> = records.iter().collect();
+        inject_blocked_layer_findings_into_verdict(&mut verdict, &refs);
+        assert_eq!(verdict.status, DesignAuditStatus::Revise);
+        assert!(verdict
+            .blocking_issues
+            .iter()
+            .any(|s| s == "LAYER_BLOCKED:identity_secrets"));
+        assert!(verdict
+            .findings
+            .iter()
+            .any(|f| f.code == "LAYER_BLOCKED_TENANT_AMBIGUOUS"
+                && f.section == "layer.identity_secrets"));
+    }
+
+    // ── ARCHI-BUG-10: auto-discard of stale blocked pipelines ───────────
+
+    #[test]
+    fn auto_discardable_failure_classes_match_decision() {
+        // Design/Plan/Artifact/Snapshot/Delta → auto-discard
+        for class in [
+            "DESIGN_INCOMPLETE",
+            "DESIGN_CONFLICT",
+            "SNAPSHOT_PARTIAL_BLOCKING",
+            "SNAPSHOT_SECTION_UNSUPPORTED",
+            "DELTA_UNSUPPORTED",
+            "ARTIFACT_TASK_UNDERSPECIFIED",
+            "ARTIFACT_CONTRACT_INVALID",
+            "ARTIFACT_LAYOUT_INVALID",
+            "PLAN_INVALID",
+            "PLAN_CONTRACT_INVALID",
+        ] {
+            assert!(
+                is_auto_discardable_blocked_failure_class(Some(class)),
+                "{class} should be auto-discardable"
+            );
+        }
+    }
+
+    #[test]
+    fn execution_failure_classes_are_not_auto_discardable() {
+        // Execution-class blockers may benefit from retry → operator decides
+        for class in [
+            "EXECUTION_ENVIRONMENT_MISSING",
+            "EXECUTION_ACTION_FAILED",
+            "EXECUTION_TIMEOUT",
+        ] {
+            assert!(
+                !is_auto_discardable_blocked_failure_class(Some(class)),
+                "{class} should NOT be auto-discardable"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_or_missing_failure_class_is_not_auto_discardable() {
+        // Ambiguous: surface to operator instead of silent discard.
+        assert!(!is_auto_discardable_blocked_failure_class(Some(
+            "UNKNOWN_RESIDUAL"
+        )));
+        assert!(!is_auto_discardable_blocked_failure_class(None));
+        assert!(!is_auto_discardable_blocked_failure_class(Some("")));
+        assert!(!is_auto_discardable_blocked_failure_class(Some("   ")));
+    }
+
+    #[test]
+    fn inject_blocked_layer_findings_is_noop_when_no_blocks() {
+        let mut verdict = DesignAuditVerdict {
+            verdict_id: "v1".to_string(),
+            manifest_version: "2.0".to_string(),
+            status: DesignAuditStatus::Pass,
+            score: 10,
+            blocking_issues: vec![],
+            findings: vec![],
+            summary: "all good".to_string(),
+            produced_at_ms: 0,
+        };
+        inject_blocked_layer_findings_into_verdict(&mut verdict, &[]);
+        assert_eq!(verdict.status, DesignAuditStatus::Pass);
+        assert!(verdict.blocking_issues.is_empty());
+        assert!(verdict.findings.is_empty());
     }
 }

@@ -225,6 +225,80 @@ Implementation note 2026-05-17:
 - `SY.admin` action help for `run_node` now states that `wf.engine` is not valid for direct `WF.*` spawn.
 - Archi platform facts and handbook now distinguish WF base runtime from concrete workflow package runtime.
 
+### [x] ARCHI-BUG-11 — Blocked-run-pending surfaces as text-only; operator must type the recovery word
+
+Observed (2026-05-17, follow-up to ARCHI-BUG-10):
+
+- After ARCHI-BUG-10, design/plan/artifact-class blocked pipelines auto-discard. Execution-class and unknown-class blockers still surface to the operator and require typing `discard` / `restart_from_design` / `retry`.
+- The chat already renders inline confirmation buttons for `confirm1` / `confirm2` checkpoints (`buildInlineConfirmBar`), but `blocked_run_pending` responses do not opt into that bar.
+- Operator UX: a "decision moment" arrives as a plain text suggestion, with no clickable affordance, even though the answer is almost always "drop it".
+
+Decision (2026-05-17):
+
+- Single warning-colored `Discard blocked pipeline` button on `blocked_run_pending` responses. No `Restart from design` or `Retry` button — those stay available via text input for the rare cases that warrant them. This keeps the UI focused on the dominant decision (drop the stale thing) while preserving the advanced recovery vocabulary.
+- Click sends `discard` as the chat message; the existing host-level intent classifier (added in ARCHI-BUG-2) catches it and routes to `fluxbee_pipeline_action(action="discard")` without spending tokens on the AI chat path.
+
+Implementation note 2026-05-17:
+
+- Added `.inline-confirm-btn.warning` CSS variant (orange) for destructive-but-explicit recovery clicks.
+- `responseWantsInlineConfirm(data)` now returns true when `output.status === "blocked_run_pending"` regardless of `data.mode`.
+- `pendingConfirmationUiMeta(data)` returns a special meta for blocked_run_pending: `{ confirmHidden: true, cancelLabel: "Discard blocked pipeline", cancelClass: "warning", cancelMessage: "discard", lockReason: ..., executionHint: "Discarding blocked pipeline..." }`.
+- `buildInlineConfirmBar` honors `meta.confirmHidden` (skip primary button), `meta.cancelClass` (warning color), and `meta.cancelMessage` (override the default `CANCEL` payload with `discard`).
+- No backend changes required: the host-level classifier from ARCHI-BUG-2 already routes `discard` to `fluxbee_pipeline_action`.
+
+Acceptance:
+
+- When the start tool returns `blocked_run_pending`, the chat shows a single orange button. Clicking it discards the blocked pipeline and re-enables the composer so the operator can re-issue their original intent.
+- Operators who want `retry` or `restart_from_design` can still type those words — no regression of the text-driven path.
+- `confirm1` / `confirm2` confirmation flows are unchanged.
+
+### [x] ARCHI-BUG-10 — Stale blocked pipelines force the operator to type recovery words before any new pipeline
+
+Observed log (2026-05-17):
+
+- Operator opens a new chat intent ("create the WF.sales node routing IO.api ↔ AI.sales with Slack echo").
+- Archi responds with: "Hay un pipeline bloqueado en esta sesión: `09837fe7-...`. Opciones: discard / restart_from_design / retry."
+- The blocked pipeline is unrelated to the new intent and was blocked by a design-stage failure that left no recoverable state.
+- Operator must type the recovery word before Archi will even start the new pipeline.
+
+Problem:
+
+- `StartPipelineTool::call` calls `latest_nonterminal_pipeline_run_for_session` and, if a `Blocked` run exists, returns `blocked_run_pending` unconditionally regardless of WHY the previous run is blocked.
+- The previous pipeline was blocked by a failure class (e.g. `DesignIncomplete`, `PlanInvalid`, `ArtifactContractInvalid`) for which `retry` semantics do not exist — the run can only be discarded or replaced. There is nothing for the operator to recover.
+- The ceremony of typing `restart_from_design` adds friction without enabling any recovery the operator could not also get by simply asking for a new pipeline.
+
+Expected behavior:
+
+- The block-on-new-pipeline guard should only fire when the previous blocker is actually recoverable.
+- Failure classes that mean "the produced artifact is unusable, rework from scratch" should be auto-discarded transparently when a new pipeline intent arrives. The auto-discard is recorded in the discarded run's `state_json.auto_discarded` and in the new run's `auto_discarded_predecessor` so postmortems can trace it.
+- Execution-class blockers (`ExecutionActionFailed`, `ExecutionTimeout`, `ExecutionEnvironmentMissing`) still surface recovery options — a real `retry` may avoid re-doing work, and the situation may need operator attention.
+- Unknown / missing failure class also surfaces options (ambiguous; never auto-discard silently).
+
+Decision (2026-05-17): determinist by failure class, not by TTL. Time-based discard is a workaround; the right model is "blocked = unrecoverable" vs "blocked = recoverable".
+
+| Failure class | Recoverable? | Behavior on new pipeline intent |
+|---|---|---|
+| `DesignIncomplete`, `DesignConflict` | No | auto-discard, start new |
+| `SnapshotPartialBlocking`, `SnapshotSectionUnsupported`, `DeltaUnsupported` | No | auto-discard, start new |
+| `ArtifactTaskUnderspecified`, `ArtifactContractInvalid`, `ArtifactLayoutInvalid` | No | auto-discard, start new |
+| `PlanInvalid`, `PlanContractInvalid` | No | auto-discard, start new |
+| `ExecutionEnvironmentMissing`, `ExecutionActionFailed`, `ExecutionTimeout` | Possibly | surface options (today's behavior) |
+| `UnknownResidual` / null | Ambiguous | surface options (today's behavior) |
+
+Implementation note 2026-05-17:
+
+- Added `is_auto_discardable_blocked_failure_class(Option<&str>) -> bool` matching the SCREAMING_SNAKE_CASE serialized forms of `FailureClass`.
+- Added `auto_discard_stale_blocked_run(...)`: clones the run, sets `status=Failed`, `current_stage=Failed`, appends `state_json.auto_discarded = {at_ms, reason, failure_class, original_blocked_reason}`, saves, and logs at info level (warn-level reserved for actual operator-visible failures).
+- Added `execute_pipeline_start_with_context_after_auto_discard(...)`: wraps the standard start helper and injects `auto_discarded_predecessor = {pipeline_run_id, failure_class, blocked_reason}` into the new pipeline's start payload so the trace is preserved.
+- `StartPipelineTool::call` now branches on `is_auto_discardable_blocked_failure_class(...)` before returning `blocked_run_pending`. If auto-discard succeeds, the new pipeline starts; if it fails (DB error etc.), falls through to the surface-options path defensively.
+- 3 unit tests cover the failure class matrix: design/plan/artifact/snapshot/delta are discardable; execution classes are not; unknown/null/empty are not.
+
+Acceptance:
+
+- A previous pipeline blocked by `DesignIncomplete` does not block a new operator intent — the new pipeline starts directly and the old one is in history as `Failed` with `auto_discarded.reason = "stale_blocked_pipeline_displaced_by_new_intent"`.
+- A previous pipeline blocked by `ExecutionActionFailed` still surfaces the three options exactly as before.
+- An operator who genuinely wants to recover a Design-class blocked pipeline can do so by referencing the `pipeline_run_id` explicitly (the record is preserved in history; only the `active` slot is freed).
+
 ### [x] ARCHI-BUG-9 — Design auditor reports MANIFEST_UNAVAILABLE on a freshly produced valid manifest
 
 Observed log:
@@ -402,6 +476,63 @@ If `next_tool` / `allowed_actions` are added to `fluxbee_start_pipeline` output,
 ## 4. Later Cognitive / Strategy Work
 
 Do not start these until the tooling bugs above are fixed.
+
+### [~] ARCHI-STRAT-LAYERED — Designer iterates explicitly over platform layers
+
+Observed pattern (from `restart_from_design` debug 2026-05-17):
+
+- Designer free-form pass produces a manifest that is schema-valid but covers only some layers of the solution (e.g. 3 of 7 possible desired_state sections).
+- Auditor returns `revise`; designer retries; same pattern.
+- Pipeline blocks on `max_iterations` with partial coverage that schema-validation accepts but operationally is unusable.
+
+Root cause:
+
+- The designer must reason about 6 layers (infra, runtime distribution, identity/secrets, nodes, routing, application logic) in a single free pass. Any layer that is implicit can be silently skipped.
+- The schema validator only checks structural shape, not layer coverage.
+- The auditor catches gaps reactively, costing tokens and iterations.
+
+Direction (option A from design discussion):
+
+- Keep a single designer agent.
+- Replace the one-shot `submit_solution_manifest` with a structured iteration: a new `assess_layer(layer)` tool that the designer calls in fixed order, one call per layer. Each call records either a layer fragment (work to do) or `no_work` (explicit skip with reason).
+- Final `submit_solution_manifest` is accepted only after every required layer has an `assess_layer` outcome.
+- Auditor verifies layer coverage as a structural rule (in addition to current schema/consistency checks).
+- See `docs/onworking COA/archi/layered_designer_design.md` for the layer enumeration, tool contracts, budget semantics, and failure semantics.
+
+Open design questions (resolve before implementation):
+
+1. **Per-layer budget**: track per-layer token usage as observability only and keep a single global design budget? Or enforce per-layer hard caps?
+2. **Layer-level failure semantics**: if `assess_layer` for one layer blocks (designer can't decide), do we (a) discard the whole manifest, (b) retry just that layer up to a per-layer iteration cap, or (c) emit the manifest with the layer marked `blocked` so the operator sees exactly which layer needs more input?
+
+Acceptance:
+
+- Designer cannot produce a manifest without an explicit per-layer outcome for every layer.
+- A request like "create WF.sales routing IO.api ↔ AI.sales with Slack echo" passes all 6 layer assessments in a single design pass (not 3 iterations of partial output).
+- A request that is unsatisfiable at one specific layer surfaces a precise per-layer blocker (resolution depends on Open Question 2).
+
+Decisions taken (2026-05-17):
+
+- **Budget** (Open Q 1): Model A — single global design budget, per-layer token usage recorded only for observability/trace.
+- **Layer failure** (Open Q 2): Model B+C combined — when one or more layers come back `blocked`, the design loop retries with layer-specific feedback up to `MAX_DESIGN_ITERATIONS`; if still blocked, the manifest is emitted with `LAYER_BLOCKED:<layer>` injected into the audit verdict's `blocking_issues` and a `LAYER_BLOCKED_<code>` finding per layer (plan compile must refuse while these exist — separate follow-up below).
+
+Implementation note 2026-05-17:
+
+- Added `DesignerLayer` enum (`infra`, `runtimes`, `identity_secrets`, `nodes`, `routing`, `logic`), `LayerOutcome` enum (Work / NoWork / Blocked), `LayerAssessmentRecord`, and `LayerAssessmentStore` (`tokio::sync::Mutex<Vec<…>>`) shared between the assess tool and submit tool within a single designer call.
+- New `AssessLayerTool` enforces canonical order and uniqueness; rejects work without fragment, no_work without reason, blocked without code/reason.
+- `DesignerSubmitManifestTool` now holds the store and rejects submit until all six layers have a recorded outcome, listing missing layers in the error so the model retries correctly.
+- `run_designer_with_context` creates a fresh store per call, surfaces a coverage error in `DesignerTrace.layer_outcomes` when the model fails to submit, and propagates the layer records on `DesignerOutput`.
+- `run_design_loop` detects blocked layers on a successful designer return and:
+  1. on a non-final iteration, builds `design_feedback_from_blocked_layers(...)` and continues without spending tokens on the auditor;
+  2. on the final iteration, runs the auditor normally and calls `inject_blocked_layer_findings_into_verdict(...)` so the operator sees a precise per-layer blocker in `confirm1_summary`.
+- Designer prompt rewritten with a "Layered iteration (REQUIRED contract)" section that lists the six layers, the per-layer outcome shapes, and the cross-layer dependency rule (Routing requires Nodes, Nodes require Runtime, etc.).
+- Auditor prompt rewritten to drop coverage-checking (now enforced structurally by the host) and focus on per-layer CONTENT review.
+- 9 unit tests (`layer_store_*`, `assess_layer_tool_*`, `submit_manifest_tool_*`, `blocked_layer_feedback_*`, `inject_blocked_layer_findings_*`) cover order/uniqueness, missing-arg rejection, coverage gating, blocked-layer feedback formatting, and verdict injection.
+
+Still pending under this strat:
+
+- Plan compiler must refuse compilation when `LAYER_BLOCKED:*` appears in the confirm1 verdict (today the layer-blocker is informational; plan compile path does not yet hard-stop on it).
+- End-to-end run against the reference WF.sales request to confirm one-pass design with full coverage.
+- Handbook section formalizing layered model + plan ordering (cross-references `layered_designer_design.md`).
 
 ### [ ] ARCHI-STRAT-1 — Evaluate whether Designer has enough platform knowledge
 
