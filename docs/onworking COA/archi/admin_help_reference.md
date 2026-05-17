@@ -16,6 +16,26 @@ Archi consulta este help en tiempo de ejecución llamando:
 El PlanCompiler tiene la herramienta `get_admin_action_help` como FunctionTool registrado.  
 Archi accede al mismo endpoint a través del sistema de lectura genérico (`fluxbee_system_get`).
 
+### Nota sobre herramientas internas de Archi
+
+`fluxbee_start_pipeline` y `fluxbee_pipeline_action` no son acciones SY.admin. Son herramientas internas de `SY.architect`.
+
+Cuando `fluxbee_start_pipeline` encuentra un pipeline bloqueado en la sesión, devuelve una respuesta estructurada con:
+
+```json
+{
+  "status": "blocked_run_pending",
+  "next_tool": "fluxbee_pipeline_action",
+  "allowed_actions": ["discard", "restart_from_design", "retry"]
+}
+```
+
+Semántica:
+
+- `discard` — cierra el pipeline bloqueado y libera la sesión.
+- `restart_from_design` — cierra el pipeline bloqueado y rediseña desde cero con la misma tarea.
+- `retry` — vuelve al último checkpoint de confirmación cuando existe un plan/checkpoint reintentable.
+
 ### Acciones que requieren CONFIRM
 
 `publish_runtime_package`, `remove_hive`, `kill_node`, `remove_node_instance`, `remove_runtime_version`, `set_node_config`, `node_control_config_set`, `set_storage`, `create_tenant`, `update_tenant`, `set_tenant_sponsor`, `vault_put`, `vault_get`, `vault_delete`, `vault_rotate`, `vault_rollback`, `update`, `sync_hint`, `opa_compile`, `opa_compile_apply`, `opa_apply`, `opa_rollback`, `wf_rules_compile`, `wf_rules_compile_apply`, `send_node_message`

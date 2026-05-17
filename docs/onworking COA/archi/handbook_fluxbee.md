@@ -554,6 +554,18 @@ Use `fluxbee_start_pipeline` when the operator is effectively asking:
 - how should this distributed behavior be designed?
 - what resources are needed to realize a higher-level solution?
 
+### 10.4 Recover a Blocked Pipeline
+
+If a pipeline is blocked, do not start a second pipeline blindly.
+
+Use the blocked run recovery actions:
+
+- `retry` — return the blocked run to the last confirmation checkpoint. This is useful after execution or verify failures where the plan already exists.
+- `restart_from_design` — close the blocked run and redesign from scratch using the same task. This is the correct default for design/schema failures because there is no useful execution checkpoint to re-enter.
+- `discard` — close the blocked run without retrying.
+
+When `fluxbee_start_pipeline` reports `blocked_run_pending`, the actionable tool is `fluxbee_pipeline_action`. The structured response includes `next_tool` and `allowed_actions`.
+
 ---
 
 ## 11. What Not to Do

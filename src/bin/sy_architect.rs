@@ -815,6 +815,7 @@ enum DesignLoopStopReason {
     NoScoreImprovement,
     RepeatedBlocker,
     AuditRejected,
+    SchemaInvalid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2567,6 +2568,17 @@ struct DesignerOutput {
     tokens_used: u32,
 }
 
+struct DesignerInvalidOutput {
+    feedback: String,
+    trace: DesignerTrace,
+    tokens_used: u32,
+}
+
+enum DesignerRunOutcome {
+    Valid(DesignerOutput),
+    Invalid(DesignerInvalidOutput),
+}
+
 #[async_trait]
 impl FunctionTool for StartPipelineTool {
     fn definition(&self) -> FunctionToolDefinition {
@@ -2646,6 +2658,12 @@ impl FunctionTool for StartPipelineTool {
                     "blocked_failure_class": blocked_failure_class,
                     "blocked_reason": blocked_reason,
                     "operator_options": [
+                        "discard",
+                        "restart_from_design",
+                        "retry",
+                    ],
+                    "next_tool": "fluxbee_pipeline_action",
+                    "allowed_actions": [
                         "discard",
                         "restart_from_design",
                         "retry",
@@ -2764,8 +2782,13 @@ async fn execute_pipeline_start_with_context(
     {
         Ok(output) => output,
         Err(err) => {
+            let latest_run = load_pipeline_run_with_context(context, &pipeline_run.pipeline_run_id)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| pipeline_run.clone());
             if let Ok(record) = pipeline_run_with_state_update(
-                &pipeline_run,
+                &latest_run,
                 PipelineStage::Blocked,
                 Some(json!({
                     "blocked_reason": format!("design loop failed: {err}"),
@@ -2975,12 +2998,21 @@ impl FunctionTool for RealProgrammerSubmitArtifactTool {
     }
 }
 
+fn designer_schema_feedback(error: &str) -> String {
+    format!(
+        "DESIGN_SCHEMA_INVALID: designer submitted an invalid solution_manifest: {error}. \
+Retry by calling submit_solution_manifest exactly once with a complete SolutionManifestV2. \
+Required top-level shape: manifest_version \"2.0\", solution {{ name, description }}, \
+desired_state, advisory. Do not produce executor plans, SCMD, or admin steps."
+    )
+}
+
 async fn run_designer_with_context(
     context: &ArchitectAdminToolContext,
     task: &str,
     solution_id: Option<&str>,
     user_context: &str,
-) -> Result<DesignerOutput, ArchitectError> {
+) -> Result<DesignerRunOutcome, ArchitectError> {
     let runtime = context
         .ai_runtime
         .lock()
@@ -3050,30 +3082,83 @@ async fn run_designer_with_context(
         None
     });
 
-    let submitted = submitted.ok_or_else(|| -> ArchitectError {
-        "designer did not call submit_solution_manifest"
-            .to_string()
-            .into()
-    })?;
     let query_hive_calls = result
         .items
         .iter()
         .filter(|item| matches!(item, FunctionLoopItem::ToolResult { result } if result.name == "query_hive" && !result.is_error))
         .count() as u32;
-    let manifest: SolutionManifestV2 =
-        serde_json::from_value(submitted.get("solution_manifest").cloned().ok_or_else(
-            || -> ArchitectError {
-                "submit_solution_manifest missing solution_manifest"
-                    .to_string()
-                    .into()
+
+    let submitted = match submitted {
+        Some(value) => value,
+        None => {
+            let error = "designer did not call submit_solution_manifest";
+            return Ok(DesignerRunOutcome::Invalid(DesignerInvalidOutput {
+                feedback: designer_schema_feedback(error),
+                trace: DesignerTrace {
+                    task: task.to_string(),
+                    solution_id: solution_id.map(str::to_string),
+                    query_hive_calls,
+                    manifest_version: String::new(),
+                    section_count: 0,
+                    validation_result: error.to_string(),
+                },
+                tokens_used: result.tokens_used,
+            }));
+        }
+    };
+
+    let raw_manifest = match submitted.get("solution_manifest").cloned() {
+        Some(value) => value,
+        None => {
+            let error = "submit_solution_manifest missing solution_manifest";
+            return Ok(DesignerRunOutcome::Invalid(DesignerInvalidOutput {
+                feedback: designer_schema_feedback(error),
+                trace: DesignerTrace {
+                    task: task.to_string(),
+                    solution_id: solution_id.map(str::to_string),
+                    query_hive_calls,
+                    manifest_version: String::new(),
+                    section_count: 0,
+                    validation_result: error.to_string(),
+                },
+                tokens_used: result.tokens_used,
+            }));
+        }
+    };
+
+    let manifest: SolutionManifestV2 = match serde_json::from_value(raw_manifest) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            let error = format!("designer returned invalid solution_manifest: {err}");
+            return Ok(DesignerRunOutcome::Invalid(DesignerInvalidOutput {
+                feedback: designer_schema_feedback(&error),
+                trace: DesignerTrace {
+                    task: task.to_string(),
+                    solution_id: solution_id.map(str::to_string),
+                    query_hive_calls,
+                    manifest_version: String::new(),
+                    section_count: 0,
+                    validation_result: error,
+                },
+                tokens_used: result.tokens_used,
+            }));
+        }
+    };
+    if let Err(err) = validate_manifest_v2(&manifest) {
+        let error = format!("designer returned invalid manifest: {err}");
+        return Ok(DesignerRunOutcome::Invalid(DesignerInvalidOutput {
+            feedback: designer_schema_feedback(&error),
+            trace: DesignerTrace {
+                task: task.to_string(),
+                solution_id: solution_id.map(str::to_string),
+                query_hive_calls,
+                manifest_version: manifest.manifest_version.clone(),
+                section_count: designer_manifest_section_count(&manifest),
+                validation_result: error,
             },
-        )?)
-        .map_err(|err| -> ArchitectError {
-            format!("designer returned invalid solution_manifest: {err}").into()
-        })?;
-    validate_manifest_v2(&manifest).map_err(|err| -> ArchitectError {
-        format!("designer returned invalid manifest: {err}").into()
-    })?;
+            tokens_used: result.tokens_used,
+        }));
+    }
 
     let resolved_solution_id = resolve_manifest_solution_id(
         &manifest,
@@ -3098,13 +3183,13 @@ async fn run_designer_with_context(
         validation_result: "ok".to_string(),
     };
 
-    Ok(DesignerOutput {
+    Ok(DesignerRunOutcome::Valid(DesignerOutput {
         manifest,
         solution_id: resolved_solution_id,
         human_summary,
         trace,
         tokens_used: result.tokens_used,
-    })
+    }))
 }
 
 async fn run_design_auditor_with_context(
@@ -3407,13 +3492,58 @@ async fn run_design_loop(
 
         token_budget.ensure_room("design.designer")?;
 
-        let designer_output = run_designer_with_context(
+        let designer_outcome = run_designer_with_context(
             context,
             task,
             current_solution_id.as_deref(),
             &designer_context,
         )
         .await?;
+        let designer_output = match designer_outcome {
+            DesignerRunOutcome::Valid(output) => output,
+            DesignerRunOutcome::Invalid(invalid) => {
+                tokens_accumulated = tokens_accumulated.saturating_add(invalid.tokens_used);
+                token_budget.add("design.designer", invalid.tokens_used)?;
+                designer_traces.push(invalid.trace.clone());
+                trace.push(DesignLoopTraceEvent {
+                    iteration: iteration_u32,
+                    stage: "design_schema_validation".to_string(),
+                    score: None,
+                    status: None,
+                    blocking_issue_count: 1,
+                    stopped_reason: if iteration == MAX_DESIGN_ITERATIONS {
+                        Some(DesignLoopStopReason::SchemaInvalid)
+                    } else {
+                        None
+                    },
+                });
+                save_pipeline_run_with_context(
+                    context,
+                    &pipeline_run_with_state_update(
+                        pipeline_run,
+                        PipelineStage::Design,
+                        Some(json!({
+                            "design_feedback": invalid.feedback,
+                            "design_iterations_used": iteration_u32,
+                            "designer_traces": designer_traces,
+                            "design_loop_trace": trace,
+                            "design_tokens_used": tokens_accumulated,
+                        })),
+                        Some(iteration_u32),
+                    )?,
+                )
+                .await?;
+                if iteration == MAX_DESIGN_ITERATIONS {
+                    return Err(format!(
+                        "DESIGN_SCHEMA_INVALID after {iteration_u32} attempts: {}",
+                        invalid.feedback
+                    )
+                    .into());
+                }
+                feedback = invalid.feedback;
+                continue;
+            }
+        };
         tokens_accumulated = tokens_accumulated.saturating_add(designer_output.tokens_used);
         token_budget.add("design.designer", designer_output.tokens_used)?;
         current_solution_id = Some(designer_output.solution_id.clone());
@@ -5274,6 +5404,72 @@ fn cancellation_requested(input: &str) -> bool {
     )
 }
 
+fn blocked_pipeline_action_from_text(
+    message: &str,
+    run: &PipelineRunRecord,
+) -> Option<&'static str> {
+    let lower = message.trim().to_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    if lower.contains("discard")
+        || lower.contains("descarta")
+        || lower.contains("descartar")
+        || lower.contains("cancel")
+        || lower.contains("abort")
+    {
+        return Some("discard");
+    }
+    if lower.contains("restart_from_design")
+        || lower.contains("desde cero")
+        || lower.contains("empeza de cero")
+        || lower.contains("empezá de cero")
+        || lower.contains("reinicia")
+        || lower.contains("reiniciá")
+        || lower.contains("redise")
+        || lower.contains("fresh")
+    {
+        return Some("restart_from_design");
+    }
+    if lower.contains("retry")
+        || lower.contains("reintenta")
+        || lower.contains("reintent")
+        || lower.contains("intenta de nuevo")
+        || lower.contains("intentá de nuevo")
+        || lower.contains("try again")
+    {
+        let state = pipeline_state_from_run(run);
+        let pre_block_stage: Option<PipelineStage> = state
+            .get("pre_block_stage")
+            .and_then(|value| serde_json::from_value(value.clone()).ok());
+        return match pre_block_stage {
+            Some(PipelineStage::Execute)
+            | Some(PipelineStage::Verify)
+            | Some(PipelineStage::Confirm2) => Some("retry"),
+            _ => Some("restart_from_design"),
+        };
+    }
+    None
+}
+
+fn blocked_pipeline_recovery_options_requested(message: &str) -> bool {
+    let lower = message.trim().to_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    lower.contains("opciones")
+        || lower.contains("options")
+        || lower.contains("bloque")
+        || lower.contains("blocked")
+        || lower.contains("pipeline")
+        || lower.contains("que hago")
+        || lower.contains("qué hago")
+        || lower.contains("como sigo")
+        || lower.contains("cómo sigo")
+        || lower.contains("ayuda")
+        || lower.contains("help")
+}
+
 async fn pending_confirmation_flow(
     state: &ArchitectState,
     session_id: &str,
@@ -5302,6 +5498,86 @@ async fn pending_confirmation_flow(
         return Some(PendingConfirmationFlow::Scmd);
     }
     None
+}
+
+async fn handle_blocked_pipeline_control_message(
+    state: &ArchitectState,
+    session_id: &str,
+    message: &str,
+) -> Option<Value> {
+    let context = admin_tool_context(state, Some(session_id));
+    let blocked_run = match latest_blocked_pipeline_run_for_session(&context, session_id).await {
+        Ok(Some(run)) => run,
+        Ok(None) => return None,
+        Err(err) => {
+            return Some(json!({
+                "status": "error",
+                "message": format!("Could not inspect blocked pipeline state: {err}"),
+            }));
+        }
+    };
+    let action = blocked_pipeline_action_from_text(message, &blocked_run)?;
+    Some(
+        apply_pipeline_action_with_context(
+            &context,
+            session_id,
+            Some(&blocked_run.pipeline_run_id),
+            action,
+        )
+        .await
+        .unwrap_or_else(|err| {
+            json!({
+                "status": "error",
+                "action": action,
+                "pipeline_run_id": blocked_run.pipeline_run_id,
+                "message": err.to_string(),
+            })
+        }),
+    )
+}
+
+async fn handle_blocked_pipeline_recovery_question(
+    state: &ArchitectState,
+    session_id: &str,
+    message: &str,
+) -> Option<Value> {
+    if !blocked_pipeline_recovery_options_requested(message) {
+        return None;
+    }
+    let context = admin_tool_context(state, Some(session_id));
+    let blocked_run = match latest_blocked_pipeline_run_for_session(&context, session_id).await {
+        Ok(Some(run)) => run,
+        Ok(None) => return None,
+        Err(err) => {
+            return Some(json!({
+                "status": "error",
+                "message": format!("Could not inspect blocked pipeline state: {err}"),
+            }));
+        }
+    };
+    Some(json!({
+        "status": "blocked",
+        "pipeline_run_id": blocked_run.pipeline_run_id,
+        "next_tool": "fluxbee_pipeline_action",
+        "allowed_actions": [
+            "discard",
+            "restart_from_design",
+            "retry",
+        ],
+        "message": render_blocked_pipeline_recovery_message(&blocked_run),
+    }))
+}
+
+fn render_blocked_pipeline_recovery_message(run: &PipelineRunRecord) -> String {
+    let state = pipeline_state_from_run(run);
+    let reason = state
+        .get("blocked_reason")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown blocker");
+    format!(
+        "A pipeline is blocked in this chat: {}. Blocker: {}. Valid recovery actions are: retry, restart_from_design, or discard.",
+        run.pipeline_run_id, reason
+    )
 }
 
 fn is_terminal_pipeline_status(status: &PipelineRunStatus) -> bool {
@@ -8129,18 +8405,69 @@ async fn handle_chat_message(
                             session_title: Some(session.title.clone()),
                         }
                     }
-                    None => ChatResponse {
-                        status: "error".to_string(),
-                        mode: "chat".to_string(),
-                        output: json!({
-                            "message": "There is no pending action to cancel in this chat."
-                        }),
-                        session_id: Some(resolved_session_id.clone()),
-                        session_title: Some(session.title.clone()),
-                    },
+                    None => {
+                        if let Some(blocked_response) = handle_blocked_pipeline_control_message(
+                            state,
+                            &resolved_session_id,
+                            trimmed_message,
+                        )
+                        .await
+                        {
+                            ChatResponse {
+                                status: blocked_response
+                                    .get("status")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("ok")
+                                    .to_string(),
+                                mode: "pipeline".to_string(),
+                                output: blocked_response,
+                                session_id: Some(resolved_session_id.clone()),
+                                session_title: Some(session.title.clone()),
+                            }
+                        } else {
+                            ChatResponse {
+                                status: "error".to_string(),
+                                mode: "chat".to_string(),
+                                output: json!({
+                                    "message": "There is no pending action to cancel in this chat."
+                                }),
+                                session_id: Some(resolved_session_id.clone()),
+                                session_title: Some(session.title.clone()),
+                            }
+                        }
+                    }
                 }
             }
         } // end else (no plan_compile_pending)
+    } else if let Some(blocked_response) =
+        handle_blocked_pipeline_control_message(state, &resolved_session_id, trimmed_message).await
+    {
+        ChatResponse {
+            status: blocked_response
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("ok")
+                .to_string(),
+            mode: "pipeline".to_string(),
+            output: blocked_response,
+            session_id: Some(resolved_session_id.clone()),
+            session_title: Some(session.title.clone()),
+        }
+    } else if let Some(blocked_response) =
+        handle_blocked_pipeline_recovery_question(state, &resolved_session_id, trimmed_message)
+            .await
+    {
+        ChatResponse {
+            status: blocked_response
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("blocked")
+                .to_string(),
+            mode: "pipeline".to_string(),
+            output: blocked_response,
+            session_id: Some(resolved_session_id.clone()),
+            session_title: Some(session.title.clone()),
+        }
     } else if let Some(flow) = pending_confirmation_flow(state, &resolved_session_id).await {
         ChatResponse {
             status: "blocked".to_string(),
@@ -8859,6 +9186,17 @@ async fn handle_ai_chat(
                 "I executed live system lookups, but the model returned no final text.".to_string()
             }
         });
+    let blocked_pipeline_recovery_message =
+        if !pending_confirmation_staged && text_suggests_pending_confirmation(&raw_message) {
+            let context = admin_tool_context(state, Some(&session.session_id));
+            latest_blocked_pipeline_run_for_session(&context, &session.session_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|run| render_blocked_pipeline_recovery_message(&run))
+        } else {
+            None
+        };
     let message = if pending_confirmation_staged {
         latest_staged_confirmation_message(&result.items).unwrap_or_else(|| {
             pending_confirmation_state
@@ -8875,6 +9213,8 @@ async fn handle_ai_chat(
         }) {
             "I could not prepare the mutation in this turn. Review the tool errors and try again."
                 .to_string()
+        } else if let Some(message) = blocked_pipeline_recovery_message {
+            message
         } else {
             "The model suggested a confirmation, but no pending action was staged in this chat."
                 .to_string()
@@ -24911,5 +25251,93 @@ mod tests {
         assert!(super::retry_target_stage_for(Some(&PipelineStage::Failed)).is_err());
         assert!(super::retry_target_stage_for(Some(&PipelineStage::Completed)).is_err());
         assert!(super::retry_target_stage_for(Some(&PipelineStage::Blocked)).is_err());
+    }
+
+    fn blocked_pipeline_fixture(pre_block_stage: PipelineStage) -> PipelineRunRecord {
+        PipelineRunRecord {
+            pipeline_run_id: "pipe-test".to_string(),
+            session_id: "session-test".to_string(),
+            solution_id: Some("solution-test".to_string()),
+            status: PipelineRunStatus::Blocked,
+            current_stage: PipelineStage::Blocked,
+            current_loop: 1,
+            current_attempt: 1,
+            state_json: json!({
+                "blocked_reason": "test blocker",
+                "pre_block_stage": pre_block_stage,
+            })
+            .to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            interrupted_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn blocked_pipeline_retry_text_restarts_design_stage_blocker() {
+        let run = blocked_pipeline_fixture(PipelineStage::Design);
+
+        assert_eq!(
+            super::blocked_pipeline_action_from_text("reintenta hasta lograr un plan", &run),
+            Some("restart_from_design")
+        );
+    }
+
+    #[test]
+    fn blocked_pipeline_retry_text_retries_execution_stage_blocker() {
+        let run = blocked_pipeline_fixture(PipelineStage::Execute);
+
+        assert_eq!(
+            super::blocked_pipeline_action_from_text("retry", &run),
+            Some("retry")
+        );
+    }
+
+    #[test]
+    fn blocked_pipeline_action_text_supports_discard_and_restart() {
+        let run = blocked_pipeline_fixture(PipelineStage::DesignAudit);
+
+        assert_eq!(
+            super::blocked_pipeline_action_from_text("descarta ese pipeline", &run),
+            Some("discard")
+        );
+        assert_eq!(
+            super::blocked_pipeline_action_from_text("empeza de cero", &run),
+            Some("restart_from_design")
+        );
+    }
+
+    #[test]
+    fn blocked_pipeline_recovery_options_text_is_detected() {
+        assert!(super::blocked_pipeline_recovery_options_requested(
+            "el pipeline quedo bloqueado, que hago?"
+        ));
+        assert!(super::blocked_pipeline_recovery_options_requested(
+            "mostrame opciones"
+        ));
+        assert!(!super::blocked_pipeline_recovery_options_requested(
+            "lista tenants activos"
+        ));
+    }
+
+    #[test]
+    fn blocked_pipeline_recovery_message_includes_actions() {
+        let run = blocked_pipeline_fixture(PipelineStage::Design);
+        let message = super::render_blocked_pipeline_recovery_message(&run);
+
+        assert!(message.contains("pipe-test"));
+        assert!(message.contains("restart_from_design"));
+        assert!(message.contains("discard"));
+        assert!(message.contains("retry"));
+    }
+
+    #[test]
+    fn designer_schema_feedback_is_actionable() {
+        let feedback = super::designer_schema_feedback("missing field `solution`");
+
+        assert!(feedback.contains("DESIGN_SCHEMA_INVALID"));
+        assert!(feedback.contains("solution"));
+        assert!(feedback.contains("desired_state"));
+        assert!(feedback.contains("advisory"));
     }
 }

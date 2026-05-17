@@ -880,6 +880,13 @@ Implementation status (Fase 2 close-out):
 - `fluxbee_start_pipeline` no longer hard-errors when a Blocked run exists: it returns `status: "blocked_run_pending"` with the three options inline so Archi can prompt the operator and call `fluxbee_pipeline_action`.
 - ARCHI_SYSTEM_PROMPT documents the resolution flow under "Resolving a blocked pipeline".
 
+Implementation status update 2026-05-17:
+
+- Malformed designer tool output is now a retryable design-loop failure. Missing `solution_manifest`, missing top-level `solution`, or `validate_manifest_v2(...)` failures become `DESIGN_SCHEMA_INVALID` feedback and are fed back to the designer until `MAX_DESIGN_ITERATIONS` is exhausted.
+- Design schema failures are recorded in `design_loop_trace` with stage `design_schema_validation`.
+- `fluxbee_start_pipeline` blocked-run responses now include `next_tool: "fluxbee_pipeline_action"` and `allowed_actions`.
+- Host chat handling now routes clear blocked-run recovery text directly to `fluxbee_pipeline_action` without spending an AI turn. Design-stage retry text maps to `restart_from_design`; execution/verify-stage retry text maps to `retry`.
+
 ---
 
 ## Track F — Seed Data Preparation
