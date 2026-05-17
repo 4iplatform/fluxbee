@@ -3870,6 +3870,7 @@ async fn refresh_config(
                 config_version = snapshot.header.config_version,
                 routes = snapshot.routes.len(),
                 vpns = snapshot.vpns.len(),
+                taps = snapshot.taps.len(),
                 "config snapshot updated"
             );
             reassign_vpns(&snapshot, nodes, shm).await;
