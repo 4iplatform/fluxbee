@@ -5626,13 +5626,11 @@ async fn latest_nonterminal_pipeline_run_for_session(
         return Ok(Some(run));
     }
 
-    Ok(
-        list_pipeline_runs_for_session_by_hive(&context.hive_id, session_id)
-            .await?
-            .into_iter()
-            .rev()
-            .find(|run| !is_terminal_pipeline_status(&run.status)),
-    )
+    let runs = list_pipeline_runs_for_session_by_hive(&context.hive_id, session_id).await?;
+    Ok(latest_pipeline_runs_by_id(runs)
+        .into_iter()
+        .rev()
+        .find(|run| !is_terminal_pipeline_status(&run.status)))
 }
 
 async fn take_pending_action(
@@ -19191,9 +19189,11 @@ async fn load_pipeline_run(
         .try_collect::<Vec<_>>()
         .await
         .map_err(|e| -> ArchitectError { Box::new(e) })?;
-    Ok(pipeline_run_from_batches(&batches)
-        .into_iter()
-        .find(|r| r.pipeline_run_id == run_id))
+    Ok(
+        latest_pipeline_runs_by_id(pipeline_run_from_batches(&batches))
+            .into_iter()
+            .find(|r| r.pipeline_run_id == run_id),
+    )
 }
 
 async fn load_pipeline_run_with_context(
@@ -19213,9 +19213,11 @@ async fn load_pipeline_run_with_context(
         .try_collect::<Vec<_>>()
         .await
         .map_err(|e| -> ArchitectError { Box::new(e) })?;
-    Ok(pipeline_run_from_batches(&batches)
-        .into_iter()
-        .find(|run| run.pipeline_run_id == run_id))
+    Ok(
+        latest_pipeline_runs_by_id(pipeline_run_from_batches(&batches))
+            .into_iter()
+            .find(|run| run.pipeline_run_id == run_id),
+    )
 }
 
 fn pipeline_run_with_state_update(
@@ -19251,6 +19253,23 @@ fn pipeline_run_with_state_update(
             serde_json::to_string(&current).unwrap_or_else(|_| updated.state_json.clone());
     }
     Ok(updated)
+}
+
+fn latest_pipeline_runs_by_id(runs: Vec<PipelineRunRecord>) -> Vec<PipelineRunRecord> {
+    let mut by_id: HashMap<String, PipelineRunRecord> = HashMap::new();
+    for run in runs {
+        match by_id.get(&run.pipeline_run_id) {
+            Some(existing)
+                if (existing.updated_at_ms, existing.created_at_ms)
+                    >= (run.updated_at_ms, run.created_at_ms) => {}
+            _ => {
+                by_id.insert(run.pipeline_run_id.clone(), run);
+            }
+        }
+    }
+    let mut runs = by_id.into_values().collect::<Vec<_>>();
+    runs.sort_by_key(|run| (run.updated_at_ms, run.created_at_ms));
+    runs
 }
 
 async fn list_interrupted_runs_for_startup(
@@ -19688,13 +19707,11 @@ async fn latest_blocked_pipeline_run_for_session(
     {
         return Ok(Some(run));
     }
-    Ok(
-        list_pipeline_runs_for_session_by_hive(&context.hive_id, session_id)
-            .await?
-            .into_iter()
-            .rev()
-            .find(|run| run.status == PipelineRunStatus::Blocked),
-    )
+    let runs = list_pipeline_runs_for_session_by_hive(&context.hive_id, session_id).await?;
+    Ok(latest_pipeline_runs_by_id(runs)
+        .into_iter()
+        .rev()
+        .find(|run| run.status == PipelineRunStatus::Blocked))
 }
 
 /// Resolve a blocked run by id (preferred) or by session (latest blocked).
@@ -25346,6 +25363,22 @@ mod tests {
             super::blocked_pipeline_action_from_text("hace lo que tengas que hacer", &execute_run),
             Some("retry")
         );
+    }
+
+    #[test]
+    fn latest_pipeline_runs_by_id_prefers_newer_terminal_state() {
+        let mut blocked = blocked_pipeline_fixture(PipelineStage::Design);
+        blocked.updated_at_ms = 10;
+        let mut failed = blocked.clone();
+        failed.status = PipelineRunStatus::Failed;
+        failed.current_stage = PipelineStage::Failed;
+        failed.updated_at_ms = 20;
+
+        let runs = super::latest_pipeline_runs_by_id(vec![blocked, failed]);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, PipelineRunStatus::Failed);
+        assert_eq!(runs[0].current_stage, PipelineStage::Failed);
     }
 
     #[test]

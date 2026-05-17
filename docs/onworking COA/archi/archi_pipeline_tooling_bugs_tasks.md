@@ -144,6 +144,31 @@ Implementation note 2026-05-17:
 
 - `blocked_run_pending` responses now include `next_tool: "fluxbee_pipeline_action"` and `allowed_actions`.
 
+### [x] ARCHI-BUG-5 — Discarded blocked pipeline can reappear from stale run state
+
+Observed log:
+
+- `fluxbee_pipeline_action` returned OK for `discard`.
+- A following `fluxbee_start_pipeline` still reported the same `pipeline_run_id` as `blocked_run_pending`.
+- The old `blocked_reason` still contained `budget:100000`, proving the response came from stale pipeline state, not the new run.
+
+Problem:
+
+- Pipeline run reads can see duplicate/stale records for the same `pipeline_run_id`.
+- The lookup path selected an older `Blocked` record instead of the newest terminal `Failed` record.
+
+Expected behavior:
+
+- Pipeline reads coalesce records by `pipeline_run_id`.
+- The newest `(updated_at_ms, created_at_ms)` record wins.
+- Once a run is terminal, it must not block a new pipeline.
+
+Implementation note 2026-05-17:
+
+- Added `latest_pipeline_runs_by_id(...)`.
+- Applied it to latest non-terminal lookup, latest blocked lookup, and load-by-id fallback reads.
+- Added unit coverage that a newer terminal state wins over an older blocked state.
+
 ## 2. Tooling Hardening Tasks
 
 ### [x] ARCHI-HARD-1 — Add deterministic designer schema-retry loop
