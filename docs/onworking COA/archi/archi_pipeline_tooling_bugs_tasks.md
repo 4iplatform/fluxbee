@@ -199,6 +199,38 @@ Implementation note 2026-05-17:
 - Repeated invalid output returns `blocked_code=plan_compiler_invalid_output`.
 - Added unit coverage for feedback text and structured blocker conversion.
 
+### [x] ARCHI-BUG-7 — Plan compiler cannot inspect existing workflow definitions
+
+Observed log:
+
+- Operator asks for an API → AI → API flow with Slack mirror through a WF echo workflow.
+- Archi resolves:
+  - `AI.sales@motherbee` exists
+  - root tenant is `tnt:00000000-0000-0000-0000-000000000001`
+  - runtimes `io.api`, `io.slack`, `ai.generic`, `wf.engine` exist
+- Operator says existing `WF.echo.*` may be reused.
+- `fluxbee_plan_compiler` blocks with missing `workflow_definition` and says it cannot determine whether the existing WF route/workflow is sufficient.
+
+Problem:
+
+- `PlanCompilerLiveQueryTool` is the correct read-only path for live planning state.
+- Its allowlist did not include read-only WF actions:
+  - `wf_rules_list_workflows`
+  - `wf_rules_get_workflow`
+  - `wf_rules_get_status`
+- Therefore the compiler could inspect runtimes/nodes/routes but not the existing workflow catalog or definition before deciding whether reuse is possible.
+
+Expected behavior:
+
+- When workflow reuse is in scope, PlanCompiler can query the WF catalog and a concrete WF definition.
+- It should only block after reading the relevant WF state, not before.
+- If no reusable workflow exists, it should either synthesize a new workflow through the normal WF definition contract or block with a precise missing behavior reason.
+
+Implementation note 2026-05-17:
+
+- Added `wf_rules_list_workflows`, `wf_rules_get_workflow`, and `wf_rules_get_status` to the PlanCompiler live query allowlist.
+- Added unit coverage so these read-only WF actions remain available to `query_hive`.
+
 ## 2. Tooling Hardening Tasks
 
 ### [x] ARCHI-HARD-1 — Add deterministic designer schema-retry loop
@@ -283,6 +315,17 @@ Do not:
 
 - Add scenario-specific instructions for API/Slack/AI topology.
 - Hide the failure as a successful empty plan.
+
+### [x] ARCHI-HARD-7 — Expose WF read-only live state to PlanCompiler
+
+Implementation direction:
+
+- `query_hive` must include read-only WF introspection actions when workflow compile/apply is available.
+- This is live-state discovery, not mutation.
+
+Acceptance:
+
+- PlanCompiler can list workflows, get a named workflow definition, and get WF status before planning `wf_rules_compile_apply` or workflow reuse.
 
 ## 3. Documentation Tasks After Code Bugs
 

@@ -5029,6 +5029,9 @@ const PROGRAMMER_QUERY_ALLOWED_ACTIONS: &[&str] = &[
     "get_node_status",
     "get_node_config",
     "list_routes",
+    "wf_rules_list_workflows",
+    "wf_rules_get_workflow",
+    "wf_rules_get_status",
     "hive_status",
     "list_versions",
     "get_versions",
@@ -25705,5 +25708,12 @@ mod tests {
         assert_eq!(output.help_lookup_calls, 1);
         assert_eq!(output.query_hive_calls, 2);
         assert_eq!(output.tokens_used, 123);
+    }
+
+    #[test]
+    fn plan_compiler_live_query_allows_wf_read_actions() {
+        assert!(PROGRAMMER_QUERY_ALLOWED_ACTIONS.contains(&"wf_rules_list_workflows"));
+        assert!(PROGRAMMER_QUERY_ALLOWED_ACTIONS.contains(&"wf_rules_get_workflow"));
+        assert!(PROGRAMMER_QUERY_ALLOWED_ACTIONS.contains(&"wf_rules_get_status"));
     }
 }
