@@ -9,7 +9,8 @@ Este runbook describe cómo desplegar y operar `IO.slack` por el camino canónic
 3. `SPAWN_NODE` (o restart controlado del nodo)
 4. configurar runtime del nodo por control-plane (`CONFIG_GET` / `CONFIG_SET`)
 
-No depende de `install-io.sh` para el deploy final.
+No existe un camino local directo para `IO.slack`: el deploy soportado es runtime
+publicado + instancia gestionada por orchestrator.
 
 ---
 
@@ -240,21 +241,7 @@ Cómo verlo en runtime canónico:
 - el runtime publicado por `scripts/publish-io-runtime.sh` ya incluye `RUST_LOG` default con `io_common=debug`
 - por eso, en deploy canónico, esos eventos deberían aparecer en `journalctl`
 
-Cómo verlo en install local:
-
-- si el nodo se levantó con `install-io.sh`, revisar `/etc/fluxbee/io-slack.env`
-- si `RUST_LOG` no está definido, los logs `debug` del relay pueden no verse
-
----
-
-## 8) Camino rápido local (no canónico)
-
-`scripts/install-io.sh` sigue siendo útil para desarrollo local rápido (systemd + env file),
-pero no reemplaza el pipeline canónico `publish -> update -> spawn`.
-
----
-
-## 9) Script automatizado (publish + update + spawn opcional)
+## 8) Script automatizado (publish + update + spawn opcional)
 
 Se agregó:
 

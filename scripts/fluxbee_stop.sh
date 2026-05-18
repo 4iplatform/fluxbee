@@ -53,6 +53,27 @@ stop_unit() {
   fi
 }
 
+stop_matching_units() {
+  local pattern="$1"
+  local units=()
+  mapfile -t units < <($SUDO systemctl list-units --all --type=service "$pattern" --no-legend --no-pager 2>/dev/null | awk '{print $1}' || true)
+  if [[ "${#units[@]}" -eq 0 ]]; then
+    echo " - no units matching ${pattern}"
+    return 0
+  fi
+
+  for unit in "${units[@]}"; do
+    [[ -n "$unit" ]] || continue
+    echo " - stopping ${unit}"
+    $SUDO systemctl stop "$unit" || true
+    if $SUDO systemctl is-active --quiet "$unit"; then
+      echo "   force-killing ${unit}"
+      $SUDO systemctl kill "$unit" || true
+      sleep 0.5
+    fi
+  done
+}
+
 kill_process_name() {
   local proc="$1"
   if ! command -v pgrep >/dev/null 2>&1; then
@@ -72,6 +93,10 @@ kill_process_name() {
 echo "Stopping Fluxbee services..."
 echo " - stopping sy-orchestrator.service first (watchdog)"
 stop_unit "sy-orchestrator"
+
+echo "Stopping managed runtime node units..."
+stop_matching_units "fluxbee-node-*.service"
+stop_matching_units "fluxbee-io-*.service"
 
 for svc in "${services[@]}"; do
   stop_unit "$svc"
@@ -106,6 +131,11 @@ residual_procs=(
   "sy_opa_rules"
   "sy_identity"
   "ai_node_runner"
+  "wf-generic"
+  "io-api"
+  "io-slack"
+  "io-sim"
+  "io-linkedhelper"
   "syncthing"
 )
 for proc in "${residual_procs[@]}"; do

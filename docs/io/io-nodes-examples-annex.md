@@ -21,8 +21,8 @@
 
 ## 1) Ejemplo YAML por nodo (Slack IO)
 
-> 1 instancia systemd ↔ 1 YAML.  
-> Ejemplo: `fluxbee-io-slack@IO.slack.support.service` carga `/etc/fluxbee/io-nodes/IO.slack.support.yaml`.
+> 1 instancia runtime-managed ↔ 1 config de nodo.
+> Ejemplo: `IO.slack.support@motherbee` corre como `fluxbee-node-IO.slack.support-motherbee.service`.
 
 ```yaml
 # /etc/fluxbee/io-nodes/IO.slack.support.yaml

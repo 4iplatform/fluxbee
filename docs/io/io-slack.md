@@ -443,9 +443,7 @@ Política vigente:
 
 Observación de deploy:
 
-- en el camino canónico de runtime, el `start.sh` publicado deja `RUST_LOG` incluyendo `io_common=debug`, por lo que los logs del relay deberían verse en `journalctl`;
-- en installs locales con `install-io.sh`, si `/etc/fluxbee/io-slack.env` no define `RUST_LOG`, esos `debug` pueden no aparecer aunque el relay esté activo.
-
+- el `start.sh` publicado deja `RUST_LOG` incluyendo `io_common=debug`, por lo que los logs del relay deberían verse en `journalctl`.
 
 
 

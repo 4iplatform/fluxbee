@@ -150,24 +150,6 @@ En el camino `publish -> update -> start.sh`, el runtime publicado deja `RUST_LO
 
 Por eso, en el camino canonico, los logs del relay deberian verse en `journalctl`.
 
-### Install local por systemd
-
-Si el nodo se levanta via `install-io.sh`, revisar:
-
-```bash
-sudo grep -n "RUST_LOG" /etc/fluxbee/io-slack.env
-```
-
-Si no esta definido, agregar:
-
-```bash
-sudo sh -c 'printf "\nRUST_LOG=info,io_slack=debug,io_common=debug,fluxbee_sdk=info\n" >> /etc/fluxbee/io-slack.env'
-sudo systemctl restart fluxbee-io-slack
-```
-
-Importante:
-
-- esto sirve para visibilidad de logs del unit local;
 - no es el camino correcto para configurar el relay de un nodo spawned existente.
 
 ---

@@ -250,61 +250,50 @@ Operational note:
 Use:
 
 ```bash
-bash scripts/install-io.sh
+sudo bash scripts/install.sh
 ```
 
-This installs:
-- `/usr/bin/io-slack`
-- `/usr/bin/io-sim`
-- `/etc/systemd/system/fluxbee-io-slack.service`
-- `/etc/systemd/system/fluxbee-io-sim.service`
-- env templates:
-  - `/etc/fluxbee/io-slack.env`
-  - `/etc/fluxbee/io-sim.env`
+This publishes IO runtimes into `/var/lib/fluxbee/dist/runtimes`.
+IO node instances are created by orchestrator/admin and run as
+`fluxbee-node-<node-name>.service`.
 
 ## 4) IO lifecycle
 
-Start/enable:
+Create/start through admin/orchestrator:
 
 ```bash
-sudo systemctl enable --now fluxbee-io-slack
-sudo systemctl enable --now fluxbee-io-sim
+POST /hives/{hive}/nodes/run
 ```
 
 Status/logs:
 
 ```bash
-systemctl status fluxbee-io-slack
-journalctl -u fluxbee-io-slack -f
+systemctl status fluxbee-node-IO.slack.support-motherbee
+journalctl -u fluxbee-node-IO.slack.support-motherbee -f
 ```
 
 ## 5) Notes
 
-- Core installer `scripts/install.sh` remains unchanged.
-- These scripts are additive and focused on AI/IO runtime deployment.
+- Core installer `scripts/install.sh` publishes the supported IO runtimes.
 - `io-slack` fixed destination test mode:
-  - set `IO_SLACK_DST_NODE=AI.chat@<hive_id>` in `/etc/fluxbee/io-slack.env` when needed.
+  - set it through node config/control-plane when needed.
 
 ## 6) Update / reinstall behavior
 
-`install-ia.sh` and `install-io.sh` are idempotent for runtime assets:
-- binaries in `/usr/bin` are overwritten with the new build
-- systemd unit files are overwritten
-- `systemctl daemon-reload` is executed
+`install.sh` is the supported installer for runtime assets:
+- runtime packages in `/var/lib/fluxbee/dist/runtimes` are republished
+- runtime manifest is updated
+- fixed IO systemd services are not used
 
 What they do not change automatically:
-- existing node YAML configs (`/etc/fluxbee/ai-nodes/*.yaml`)
-- existing env files for IO if already present (`/etc/fluxbee/io-slack.env`, `/etc/fluxbee/io-sim.env`)
-- running service instances are not force-restarted by the scripts
+- existing managed node config/state unless explicitly reconciled by orchestrator/admin
+- running node service instances unless restarted through orchestrator/admin
 
 After reinstall/update, restart affected services manually:
 
 ```bash
-sudo systemctl restart fluxbee-ai-node@ai-chat
-sudo systemctl restart fluxbee-io-slack
-sudo systemctl restart fluxbee-io-sim
+sudo systemctl restart fluxbee-node-IO.slack.support-motherbee
 ```
 
 Useful flags:
-- `SKIP_BUILD=1` to reinstall from an existing build output
-- `BIN_DIR=/path/to/bin` to install from a custom binary directory
+- use runtime publish/deploy helpers when testing a single IO runtime without full install

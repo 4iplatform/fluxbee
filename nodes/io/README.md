@@ -20,24 +20,17 @@ This subtree hosts IO crates isolated from core routing/AI crates.
 From repo root:
 
 ```bash
-bash scripts/install-io.sh
+sudo bash scripts/install.sh
 ```
 
-This installs `/usr/bin/io-slack`, `/usr/bin/io-sim` and systemd units:
-- `fluxbee-io-slack.service`
-- `fluxbee-io-sim.service`
+This publishes the canonical IO runtimes into `/var/lib/fluxbee/dist/runtimes`:
 
-`IO.api` has its own local install helper:
+- `io.api`
+- `io.slack`
 
-```bash
-bash scripts/install-io-api.sh --node-name IO.api.local@motherbee
-```
-
-This installs:
-- `/usr/bin/io-api`
-- `/etc/fluxbee/io-api.env`
-- managed bootstrap config under `/var/lib/fluxbee/nodes/IO/<node_name>/config.json`
-- `fluxbee-io-api.service`
+IO node processes are not installed as fixed systemd services. They are spawned by
+the orchestrator as managed runtime instances, with units named
+`fluxbee-node-<node-name>.service`.
 
 ## Publish runtime (orchestrator v2 canonical flow)
 
@@ -99,7 +92,6 @@ Useful helpers:
 
 - `scripts/publish-io-api-runtime.sh`
 - `scripts/deploy-io-api.sh`
-- `scripts/install-io-api.sh`
 
 Required env vars:
 
@@ -144,12 +136,10 @@ Relay note:
 Logging note:
 
 - canonical runtime publish defaults include `io_common=debug`, so relay event logs should show in `journalctl`
-- local installs via `install-io.sh` only show those debug logs if `/etc/fluxbee/io-slack.env` defines `RUST_LOG`
 
 `IO.api` logging note:
 
 - `publish-io-api-runtime.sh` publishes `start.sh` with default `RUST_LOG=info,io_api=debug,io_common=debug,fluxbee_sdk=info`
-- `install-io-api.sh` writes the same default into `/etc/fluxbee/io-api.env`
 
 Identity behavior is provision-on-miss by default in current IO nodes (no mode flag required).
 

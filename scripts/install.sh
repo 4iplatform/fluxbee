@@ -19,6 +19,10 @@ AI_GENERIC_RUNTIME_NAME="${AI_GENERIC_RUNTIME_NAME:-ai.generic}"
 AI_GENERIC_RUNTIME_VERSION="${AI_GENERIC_RUNTIME_VERSION:-1.0.0}"
 WF_ENGINE_RUNTIME_NAME="${WF_ENGINE_RUNTIME_NAME:-wf.engine}"
 WF_ENGINE_RUNTIME_VERSION="${WF_ENGINE_RUNTIME_VERSION:-1.0.0}"
+IO_API_RUNTIME_NAME="${IO_API_RUNTIME_NAME:-io.api}"
+IO_API_RUNTIME_VERSION="${IO_API_RUNTIME_VERSION:-1.0.0}"
+IO_SLACK_RUNTIME_NAME="${IO_SLACK_RUNTIME_NAME:-io.slack}"
+IO_SLACK_RUNTIME_VERSION="${IO_SLACK_RUNTIME_VERSION:-1.0.0}"
 REQUESTED_BIN_DIR="${BIN_DIR:-}"
 BIN_DIR="$ROOT_DIR/target/release"
 STATE_ROOT_DIR="$STATE_DIR/state"
@@ -237,6 +241,8 @@ echo "Building sy-frontdesk-gov system binary..."
 cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
 echo "Building ai.generic runtime binary..."
 cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner
+echo "Building IO runtime binaries (io.api, io.slack)..."
+cargo build --release --manifest-path nodes/io/Cargo.toml -p io-api -p io-slack
 
 go_required=0
 for go_dir in "go/sy-opa-rules" "go/sy-timer" "go/sy-wf-rules" "go/nodes/wf/wf-generic"; do
@@ -864,6 +870,39 @@ bash "$ROOT_DIR/scripts/publish-wf-runtime.sh" \
   --runtime "$WF_ENGINE_RUNTIME_NAME" \
   --version "$WF_ENGINE_RUNTIME_VERSION" \
   --binary "$wf_generic_bin" \
+  --dist-root "$STATE_DIR/dist" \
+  --set-current \
+  --sudo \
+  --skip-build
+
+io_api_bin="$ROOT_DIR/nodes/io/target/release/io-api"
+if [[ ! -f "$io_api_bin" ]]; then
+  echo "Error: io.api build completed but binary is missing: $io_api_bin" >&2
+  exit 1
+fi
+
+echo "Publishing base runtime $IO_API_RUNTIME_NAME@$IO_API_RUNTIME_VERSION into $STATE_DIR/dist/runtimes..."
+bash "$ROOT_DIR/scripts/publish-io-api-runtime.sh" \
+  --runtime "$IO_API_RUNTIME_NAME" \
+  --version "$IO_API_RUNTIME_VERSION" \
+  --binary "$io_api_bin" \
+  --dist-root "$STATE_DIR/dist" \
+  --set-current \
+  --sudo \
+  --skip-build
+
+io_slack_bin="$ROOT_DIR/nodes/io/target/release/io-slack"
+if [[ ! -f "$io_slack_bin" ]]; then
+  echo "Error: io.slack build completed but binary is missing: $io_slack_bin" >&2
+  exit 1
+fi
+
+echo "Publishing base runtime $IO_SLACK_RUNTIME_NAME@$IO_SLACK_RUNTIME_VERSION into $STATE_DIR/dist/runtimes..."
+bash "$ROOT_DIR/scripts/publish-io-runtime.sh" \
+  --kind slack \
+  --runtime "$IO_SLACK_RUNTIME_NAME" \
+  --version "$IO_SLACK_RUNTIME_VERSION" \
+  --binary "$io_slack_bin" \
   --dist-root "$STATE_DIR/dist" \
   --set-current \
   --sudo \

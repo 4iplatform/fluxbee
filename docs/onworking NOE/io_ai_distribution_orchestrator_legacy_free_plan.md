@@ -29,7 +29,7 @@ Referencias:
 
 ## 3.1 Publicación canónica de runtimes IO/IA
 
-Hoy `scripts/install-io.sh` y `scripts/install-ia.sh` instalan localmente (`/usr/bin` + systemd), pero no publican runtimes versionados en `dist/runtimes`.
+El modelo anterior instalaba IO/IA localmente (`/usr/bin` + systemd), pero no publicaba runtimes versionados en `dist/runtimes`.
 
 Falta:
 - publicar binarios IO/IA en:

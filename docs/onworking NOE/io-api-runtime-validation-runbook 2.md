@@ -873,13 +873,11 @@ Durante esta implementacion se agregaron estos helpers:
 
 - `scripts/publish-io-api-runtime.sh`
 - `scripts/deploy-io-api.sh`
-- `scripts/install-io-api.sh`
 
 Uso recomendado de cada uno:
 
 - `publish-io-api-runtime.sh`: publica el runtime `io.api` y deja `RUST_LOG` default util para `io_api` e `io_common` dentro del `start.sh` publicado
 - `deploy-io-api.sh`: hace `publish + update + spawn/restart` siguiendo el mismo patron operativo de otros IO
-- `install-io-api.sh`: instala `io-api` como service local de desarrollo, crea `io-api.env` y bootstrap managed `config.json`
 
 Ejemplo de publish:
 
@@ -917,24 +915,6 @@ bash scripts/deploy-io-api.sh \
   --sync-hint \
   --sudo
 ```
-
-Ejemplo de install local:
-
-```bash
-bash scripts/install-io-api.sh \
-  --node-name "$NODE_NAME" \
-  --listen-address "$LISTEN_ADDRESS" \
-  --listen-port "$LISTEN_PORT"
-```
-
-Luego:
-
-```bash
-sudo systemctl enable --now fluxbee-io-api
-sudo journalctl -u fluxbee-io-api -f
-```
-
----
 
 ## 23. Nota de bootstrap minimo
 
