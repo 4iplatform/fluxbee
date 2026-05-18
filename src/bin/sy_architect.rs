@@ -964,6 +964,7 @@ impl FunctionTool for ArchitectSystemGetTool {
                 /hives/{{hive}}/vault/secrets/{{key}}/metadata, \
                 /hives/{{hive}}/nodes/{{name}}/control/config-get (live contract), \
                 /hives/{{hive}}/wf-rules, /hives/{{hive}}/drift-alerts, \
+                /hives/{{hive}}/routes, /hives/{{hive}}/vpns, /hives/{{hive}}/taps, \
                 /admin/actions/{{action}} (schema + example_scmd). \
                 Never execute paths with literal {{placeholders}}. \
                 For admin action schemas, prefer example_scmd over guessing. \

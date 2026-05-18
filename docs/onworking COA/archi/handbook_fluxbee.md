@@ -18,17 +18,18 @@ Use this section first. If the task is clear here, do not overcomplicate it.
 | The operator wants a clear mutation on existing platform primitives | `fluxbee_plan_compiler` |
 | The operator wants broad desired-state design across topology, runtimes, nodes, routing, workflow deployment, or OPA deployment | `fluxbee_start_pipeline` |
 
-### 1.2 Workflow vs routing vs OPA
+### 1.2 Workflow vs routing vs taps vs OPA
 
 | Need | Prefer |
 | --- | --- |
 | Deterministic choreography between known nodes | `wf_deployments` / `wf_rules_compile_apply` |
 | Prefix- or hive-based forwarding between known destinations | `routing` / `add_route` |
+| Secondary copy of unicast traffic to an additional node | `router taps` / `add_tap` |
 | Policy-based target resolution when destination is not explicit | `opa_deployments` / OPA |
 
 Rules:
 - If the operator already names the participating nodes, do **not** default to OPA.
-- If the operator wants fan-out, mirror, relay, echo, or ordered business flow, think **workflow first**, then routing.
+- If the operator wants fan-out or ordered business flow that depends on message content, think **workflow first**, then routing.
 - Use OPA when the business wants policy-driven target selection, not when the path is already explicit.
 
 ### 1.3 IO, AI, WF, SY boundaries
@@ -205,7 +206,7 @@ Rules for archi when asked about secrets:
 
 ---
 
-## 5. Choosing Between Routing, Workflow, and OPA
+## 5. Choosing Between Routing, Workflow, Taps, and OPA
 
 This is the section Archi was missing most often.
 
@@ -234,7 +235,19 @@ Examples:
 
 That is usually **workflow-orchestration territory**, not OPA-first.
 
-### 5.3 Use OPA when
+### 5.3 Use a tap when
+
+- a copy of a unicast delivery should also reach an additional node
+- the secondary copy carries no business decision (no branching, no transformation, no state)
+- the primary path should not change
+
+Examples:
+- audit copy of traffic between two named nodes to a third
+- observer node that receives a copy of every message without participating in the flow
+
+Taps are router-level (`add_tap`); the copy is fire-and-forget and carries `meta.via_tap=true` so it never cascades.
+
+### 5.4 Use OPA when
 
 - destination is policy-driven
 - tenant/identity/rule evaluation determines target
@@ -245,11 +258,11 @@ Examples:
 - route by identity restriction
 - route by role/capability decision when `dst` is not explicit
 
-### 5.4 Anti-patterns
+### 5.5 Anti-patterns
 
 Do not:
 - use OPA as a substitute for deterministic workflow orchestration
-- invent a new `IO.echo` node by default when workflow/routing already model the problem
+- invent a new `IO.echo` node by default when workflow/routing/taps already model the problem
 - route normal application behavior through `SY.config.routes` as if it were a business node
 
 ---
