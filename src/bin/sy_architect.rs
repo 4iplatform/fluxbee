@@ -54,7 +54,7 @@ use fluxbee_sdk::protocol::{
     MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    admin_command, build_node_config_response_message, connect, list_ich_options_from_hive_config,
+    admin_command, build_node_config_response_message, connect, list_ich_options_from_hive_id,
     try_handle_default_node_status, AdminCommandRequest, IdentityIchOption, NodeConfig, NodeError,
     NodeReceiver, NodeSender, NODE_SECRET_REDACTION_TOKEN,
 };
@@ -6329,8 +6329,7 @@ async fn refresh_architect_messages_db_url(state: &ArchitectState) -> (bool, boo
 fn load_identity_ich_options(
     state: &ArchitectState,
 ) -> Result<Vec<IdentityIchOption>, ArchitectError> {
-    list_ich_options_from_hive_config(&state.config_dir)
-        .map_err(|err| -> ArchitectError { Box::new(err) })
+    list_ich_options_from_hive_id(&state.hive_id).map_err(|err| -> ArchitectError { Box::new(err) })
 }
 
 fn admin_tool_context(
@@ -17161,8 +17160,15 @@ fn architect_index_html(state: &ArchitectState) -> String {
     }}
     function describeIchOption(option) {{
       if (!option) return "";
-      const primary = option.is_primary ? " \u00B7 primary" : "";
-      return option.channel_type + " \u00B7 " + option.address + primary + " \u00B7 " + option.ich_id;
+      const parts = [
+        option.channel_type,
+        option.address,
+        option.owner_l2_name || "owner: unknown",
+        option.enabled ? "enabled" : "disabled",
+        option.is_primary ? "primary" : "",
+        option.ich_id
+      ].filter(Boolean);
+      return parts.join(" \u00B7 ");
     }}
     function selectedImpersonationOption() {{
       const idx = Number(impersonationIch.value);
