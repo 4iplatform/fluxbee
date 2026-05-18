@@ -14039,7 +14039,7 @@ async fn add_hive_flow(
     }
 
     let config_routes_yaml = format!(
-        "version: 1\nupdated_at: \"{}\"\nroutes: []\nvpns: []\n",
+        "version: 1\nupdated_at: \"{}\"\nroutes: []\nvpns: []\ntaps: []\n",
         now_epoch_ms()
     );
     if let Err(err) = write_remote_file(

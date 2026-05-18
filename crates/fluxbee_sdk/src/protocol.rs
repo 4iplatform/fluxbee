@@ -394,6 +394,7 @@ pub struct LsaPayload {
     pub nodes: Vec<LsaNode>,
     pub routes: Vec<LsaRoute>,
     pub vpns: Vec<LsaVpn>,
+    pub taps: Vec<LsaTap>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -417,6 +418,15 @@ pub struct LsaVpn {
     pub pattern: String,
     pub match_kind: String,
     pub vpn_id: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LsaTap {
+    pub match_src: String,
+    pub match_dst: String,
+    pub target: String,
+    pub mode: String,
+    pub enabled: bool,
 }
 
 impl Message {

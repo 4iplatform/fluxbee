@@ -996,6 +996,7 @@ version: 1
 updated_at: ""
 routes: []
 vpns: []
+taps: []
 EOF
   fi
 fi

@@ -491,6 +491,25 @@ struct VpnConfig {
     priority: Option<u16>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+struct TapConfig {
+    match_src: String,
+    match_dst: String,
+    target: String,
+    #[serde(default = "default_tap_mode")]
+    mode: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+fn default_tap_mode() -> String {
+    "best_effort".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
 fn default_debug_msg_type() -> String {
     "user".to_string()
 }
@@ -669,6 +688,11 @@ enum BroadcastRequest {
         version: u64,
         ack: oneshot::Sender<Result<(), String>>,
     },
+    Taps {
+        taps: Vec<TapConfig>,
+        version: u64,
+        ack: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -735,6 +759,30 @@ async fn run_broadcast_loop(
                     None,
                     version,
                     serde_json::json!({ "vpns": vpns }),
+                    None,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        let _ = ack.send(Ok(()));
+                        Ok(())
+                    }
+                    Err(err) => {
+                        let err_msg = err.to_string();
+                        let _ = ack.send(Err(err_msg.clone()));
+                        tracing::warn!(error = %err, "broadcast failed");
+                        Err(err_msg)
+                    }
+                }
+            }
+            BroadcastRequest::Taps { taps, version, ack } => {
+                match broadcast_config_changed(
+                    &client,
+                    "taps",
+                    None,
+                    None,
+                    version,
+                    serde_json::json!({ "taps": taps }),
                     None,
                 )
                 .await
@@ -1782,6 +1830,8 @@ struct ConfigUpdate {
     routes: Option<Vec<RouteConfig>>,
     #[serde(default)]
     vpns: Option<Vec<VpnConfig>>,
+    #[serde(default)]
+    taps: Option<Vec<TapConfig>>,
     #[serde(default)]
     version: Option<u64>,
 }
@@ -4182,6 +4232,7 @@ async fn handle_http(
             let update: ConfigUpdate = serde_json::from_slice(&body)?;
             let mut broadcasts = usize::from(update.routes.is_some());
             broadcasts += usize::from(update.vpns.is_some());
+            broadcasts += usize::from(update.taps.is_some());
             let mut versions = match allocate_config_changed_versions(
                 &ctx.state_dir,
                 "routes",
@@ -4242,6 +4293,25 @@ async fn handle_http(
                     return Ok(());
                 }
             }
+            if let Some(taps) = update.taps {
+                let version = versions.remove(0);
+                if let Err(err) = send_broadcast_request(
+                    tx,
+                    |ack| BroadcastRequest::Taps { taps, version, ack },
+                    "taps",
+                )
+                .await
+                {
+                    let body = serde_json::json!({
+                        "status": "error",
+                        "error_code": "CONFIG_BROADCAST_FAILED",
+                        "error_detail": err.to_string(),
+                    })
+                    .to_string();
+                    respond_json(stream, 502, &body).await?;
+                    return Ok(());
+                }
+            }
             tracing::info!("config routes update received");
             respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
         }
@@ -4280,6 +4350,43 @@ async fn handle_http(
                 }
             }
             tracing::info!("config vpns update received");
+            respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
+        }
+        ("PUT", "/config/taps") => {
+            let update: ConfigUpdate = serde_json::from_slice(&body)?;
+            if let Some(taps) = update.taps {
+                let version =
+                    match next_config_changed_version(&ctx.state_dir, "taps", update.version) {
+                        Ok(version) => version,
+                        Err(err) => {
+                            let body = serde_json::json!({
+                                "status": "error",
+                                "error_code": "VERSION_MISMATCH",
+                                "error_detail": err.to_string(),
+                            })
+                            .to_string();
+                            respond_json(stream, 409, &body).await?;
+                            return Ok(());
+                        }
+                    };
+                if let Err(err) = send_broadcast_request(
+                    tx,
+                    |ack| BroadcastRequest::Taps { taps, version, ack },
+                    "taps",
+                )
+                .await
+                {
+                    let body = serde_json::json!({
+                        "status": "error",
+                        "error_code": "CONFIG_BROADCAST_FAILED",
+                        "error_detail": err.to_string(),
+                    })
+                    .to_string();
+                    respond_json(stream, 502, &body).await?;
+                    return Ok(());
+                }
+            }
+            tracing::info!("config taps update received");
             respond_json(stream, 200, r#"{"status":"ok"}"#).await?;
         }
         ("GET", "/config/storage") => {
@@ -7038,7 +7145,6 @@ fn admin_action_summary(action: &str) -> &'static str {
         "list_taps" => "List router-level taps installed on a hive. Read-only.",
         "add_tap" => "Add a router-level tap on a hive. When a unicast message matches (match_src, match_dst), the router enqueues a fire-and-forget secondary copy to `target` with `meta.via_tap=true`. mode defaults to `best_effort` when omitted. enabled defaults to true. Exact L2 name match.",
         "delete_tap" => "Delete an installed router-level tap by its (match_src, match_dst, target) natural key.",
-        "delete_vpn" => "Delete a VPN pattern from a hive.",
         "update" => "Run hive update workflow.",
         "sync_hint" => "Trigger a sync hint workflow.",
         "opa_compile_apply" => "Compile and apply OPA policy.",
@@ -7207,7 +7313,7 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             "Hive id, for example worker-220.",
         )],
         "list_nodes" | "list_ilks" | "list_tenants" | "get_versions" | "list_runtimes" | "list_routes"
-        | "list_vpns" | "get_deployments" | "get_drift_alerts" | "opa_get_policy"
+        | "list_vpns" | "list_taps" | "get_deployments" | "get_drift_alerts" | "opa_get_policy"
         | "opa_get_status" | "wf_rules_get_workflow" | "wf_rules_get_status"
         | "wf_rules_list_workflows" | "timer_help" | "timer_list" | "timer_now"
         | "timer_now_in" | "timer_convert" | "timer_parse" | "timer_format" | "update"
@@ -7332,6 +7438,17 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
                 "VPN pattern encoded in the URL path when deleting via HTTP.",
             ),
         ],
+        "add_tap" => vec![admin_action_path_param(
+            "hive",
+            "string",
+            "Target hive where the router tap will be added.",
+        )],
+        "delete_tap" => vec![
+            admin_action_path_param("hive", "string", "Target hive where the tap exists."),
+            admin_action_path_param("match_src", "string", "Exact source L2 name."),
+            admin_action_path_param("match_dst", "string", "Exact destination L2 name."),
+            admin_action_path_param("target", "string", "Exact tap target L2 name."),
+        ],
         _ => Vec::new(),
     }
 }
@@ -7346,6 +7463,7 @@ fn admin_action_body_required(action: &str) -> bool {
             | "restart_node"
             | "add_route"
             | "add_vpn"
+            | "add_tap"
             | "set_node_config"
             | "send_node_message"
             | "node_control_config_set"
@@ -7404,6 +7522,11 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
         "add_vpn" => vec![
             admin_action_body_field("pattern", "string", "VPN match pattern."),
             admin_action_body_field("vpn_id", "u32", "VPN identifier."),
+        ],
+        "add_tap" => vec![
+            admin_action_body_field("match_src", "string", "Exact source L2 node name to match."),
+            admin_action_body_field("match_dst", "string", "Exact destination L2 node name to match."),
+            admin_action_body_field("target", "string", "Exact L2 node name that receives the secondary copy."),
         ],
         "set_node_config" => vec![admin_action_body_field(
             "config",
@@ -7710,6 +7833,10 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field("match_kind", "string", "Optional VPN match kind."),
             admin_action_body_field("priority", "u16", "Optional VPN priority."),
         ],
+        "add_tap" => vec![
+            admin_action_body_field("mode", "string", "Optional tap mode. Only best_effort is supported in v1."),
+            admin_action_body_field("enabled", "bool", "Optional enabled flag. Defaults to true."),
+        ],
         "set_node_config" => vec![
             admin_action_body_field(
                 "replace",
@@ -7979,6 +8106,18 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         }),
         "delete_vpn" => serde_json::json!({
             "pattern": "worker-*"
+        }),
+        "add_tap" => serde_json::json!({
+            "match_src": "IO.api.sales@motherbee",
+            "match_dst": "AI.sales@motherbee",
+            "target": "IO.slack.sales@motherbee",
+            "mode": "best_effort",
+            "enabled": true
+        }),
+        "delete_tap" => serde_json::json!({
+            "match_src": "IO.api.sales@motherbee",
+            "match_dst": "AI.sales@motherbee",
+            "target": "IO.slack.sales@motherbee"
         }),
         "set_node_config" => serde_json::json!({
             "config": {
@@ -8452,16 +8591,16 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "For SY.storage v1, the canonical secret field is config.database.postgres_url and the apply is persist-only until sy-storage is restarted.",
             "For SY.identity v1, the canonical secret field is config.database.postgres_url and the apply is persist-only until sy-identity is restarted.",
             "For SY.cognition, the canonical AI secret field is config.secrets.openai.api_key and semantic controls live under config.semantic_tagger.*.",
-            "For SY.config.routes v1, CONFIG_SET replaces selected sections of the node-owned effective routes/vpns config; use add/delete actions when you want explicit domain mutations instead of a control-plane config replace.",
+            "For SY.config.routes v2, CONFIG_SET replaces selected sections of the node-owned effective routes/vpns/taps config; use add/delete actions when you want explicit domain mutations instead of a control-plane config replace.",
         ],
-        "list_routes" | "list_vpns" => vec![
+        "list_routes" | "list_vpns" | "list_taps" => vec![
             "These are SY.config.routes domain read actions exposed as admin queries.",
-            "Use them when you want the route/VPN lists in the legacy admin surface.",
+            "Use them when you want the route/VPN/tap lists in the legacy admin surface.",
             "For the node-owned live config contract, use node_control_config_get against SY.config.routes instead.",
         ],
         "add_route" => vec![
             "These are SY.config.routes domain mutation actions exposed as admin commands.",
-            "They mutate one route/VPN rule at a time and preserve the legacy operational surface.",
+            "They mutate one route/VPN/tap rule at a time and preserve the legacy operational surface.",
             "For HTTP delete calls, the identifier lives in the final path segment; internal admin commands may still carry it in payload.",
             "Use node_control_config_set against SY.config.routes only when you want the node-owned live config replace path instead of one explicit domain mutation.",
             "The 'action' field controls how matching traffic is handled. Valid values are FORWARD and DROP only. Case-sensitive.",
@@ -8471,9 +8610,9 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "priority defaults to 100 when omitted. Higher value means higher priority. Do not pass 0 unless intentionally setting lowest priority.",
             "metric defaults to 0 when omitted. Used only for tie-breaking between routes with the same prefix and priority.",
         ],
-        "delete_route" | "add_vpn" | "delete_vpn" => vec![
+        "delete_route" | "add_vpn" | "delete_vpn" | "add_tap" | "delete_tap" => vec![
             "These are SY.config.routes domain mutation actions exposed as admin commands.",
-            "They mutate one route/VPN rule at a time and preserve the legacy operational surface.",
+            "They mutate one route/VPN/tap rule at a time and preserve the legacy operational surface.",
             "For HTTP delete calls, the identifier lives in the final path segment; internal admin commands may still carry it in payload.",
             "Use node_control_config_set against SY.config.routes only when you want the node-owned live config replace path instead of one explicit domain mutation.",
         ],
@@ -10232,7 +10371,12 @@ async fn handle_admin_command(
             if status == "ok" {
                 if matches!(
                     action,
-                    "add_route" | "delete_route" | "add_vpn" | "delete_vpn"
+                    "add_route"
+                        | "delete_route"
+                        | "add_vpn"
+                        | "delete_vpn"
+                        | "add_tap"
+                        | "delete_tap"
                 ) {
                     if let Err(err) =
                         broadcast_full_config(ctx, client, action, target_hive.as_deref()).await
@@ -11050,9 +11194,8 @@ fn build_admin_request(
 ) -> AdminRequest {
     let requested_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
     let base = match action {
-        "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn" | "delete_vpn" => {
-            "SY.config.routes"
-        }
+        "list_routes" | "add_route" | "delete_route" | "list_vpns" | "add_vpn" | "delete_vpn"
+        | "list_taps" | "add_tap" | "delete_tap" => "SY.config.routes",
         "list_nodes"
         | "run_node"
         | "start_node"
@@ -11524,11 +11667,8 @@ async fn broadcast_full_config(
     action: &str,
     target_hive: Option<&str>,
 ) -> Result<(), AdminError> {
-    let list_action = if action.contains("route") {
-        "list_routes"
-    } else {
-        "list_vpns"
-    };
+    let (list_action, item_key, subsystem) = config_domain_for_mutation(action)
+        .ok_or_else(|| format!("unsupported config mutation action '{action}'"))?;
     let list_req = build_admin_request(
         ctx,
         list_action,
@@ -11540,33 +11680,28 @@ async fn broadcast_full_config(
         .get("status")
         .and_then(|v| v.as_str())
         .filter(|v| *v == "ok")
-        .and_then(|_| list_config_items_payload(&response, list_action))
-        .ok_or("list response missing routes/vpns")?;
-    let config = if list_action == "list_routes" {
-        serde_json::json!({ "routes": payload })
-    } else {
-        serde_json::json!({ "vpns": payload })
-    };
+        .and_then(|_| list_config_items_payload(&response, item_key))
+        .ok_or_else(|| format!("list response missing {item_key}"))?;
+    let config = serde_json::json!({ item_key: payload });
 
-    let subsystem = if list_action == "list_routes" {
-        "routes"
-    } else {
-        "vpn"
-    };
     let version = next_config_changed_version(&ctx.state_dir, subsystem, None)?;
     broadcast_config_changed(client, subsystem, None, None, version, config, None).await?;
     Ok(())
 }
 
+fn config_domain_for_mutation(action: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    match action {
+        "add_route" | "delete_route" => Some(("list_routes", "routes", "routes")),
+        "add_vpn" | "delete_vpn" => Some(("list_vpns", "vpns", "vpn")),
+        "add_tap" | "delete_tap" => Some(("list_taps", "taps", "taps")),
+        _ => None,
+    }
+}
+
 fn list_config_items_payload<'a>(
     response: &'a serde_json::Value,
-    list_action: &str,
+    item_key: &str,
 ) -> Option<&'a serde_json::Value> {
-    let item_key = if list_action == "list_routes" {
-        "routes"
-    } else {
-        "vpns"
-    };
     response
         .get("payload")
         .and_then(|payload| payload.get(item_key))
@@ -12200,7 +12335,7 @@ mod tests {
         });
 
         assert_eq!(
-            list_config_items_payload(&response, "list_routes"),
+            list_config_items_payload(&response, "routes"),
             Some(&json!([{ "prefix": "alpha/**" }]))
         );
     }
@@ -12213,7 +12348,7 @@ mod tests {
         });
 
         assert_eq!(
-            list_config_items_payload(&response, "list_vpns"),
+            list_config_items_payload(&response, "vpns"),
             Some(&json!([{ "pattern": "ops/*" }]))
         );
     }

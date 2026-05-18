@@ -309,7 +309,7 @@ while IFS= read -r action; do
       target=""
       params='{}'
       ;;
-    list_versions|get_versions|list_routes|list_vpns|list_nodes|list_deployments|get_deployments|list_drift_alerts|get_drift_alerts)
+    list_versions|get_versions|list_routes|list_vpns|list_taps|list_nodes|list_deployments|get_deployments|list_drift_alerts|get_drift_alerts)
       target="$HIVE_ID"
       params='{}'
       ;;
@@ -340,6 +340,14 @@ while IFS= read -r action; do
     delete_vpn)
       target="$HIVE_ID"
       params="{\"pattern\":\"$VPN_PATTERN\"}"
+      ;;
+    add_tap)
+      target="$HIVE_ID"
+      params='{}'
+      ;;
+    delete_tap)
+      target="$HIVE_ID"
+      params='{"match_src":"IO.api.sales@motherbee","match_dst":"AI.sales@motherbee","target":"IO.slack.sales@motherbee"}'
       ;;
     run_node)
       target="$HIVE_ID"

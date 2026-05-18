@@ -139,8 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config_dir: config_dir.clone(),
         version: "1.0".to_string(),
     };
-    let (mut sender, mut receiver) =
-        connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let (sender, mut receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
     tracing::info!("connected to router");
 
     let mut ticker = time::interval(Duration::from_secs(5));
@@ -515,6 +514,7 @@ async fn handle_node_config_set(
             "effective_config": {
                 "routes": sy_config.routes,
                 "vpns": sy_config.vpns,
+                "taps": sy_config.taps,
                 "updated_at": sy_config.updated_at,
                 "hive": hive_id,
             },
@@ -587,11 +587,12 @@ fn build_node_config_get_payload(
     sy_config: &SyConfigFile,
     requested_node_name: &str,
 ) -> serde_json::Value {
-    let state = if sy_config.routes.is_empty() && sy_config.vpns.is_empty() {
-        "empty"
-    } else {
-        "configured"
-    };
+    let state =
+        if sy_config.routes.is_empty() && sy_config.vpns.is_empty() && sy_config.taps.is_empty() {
+            "empty"
+        } else {
+            "configured"
+        };
     serde_json::json!({
         "ok": true,
         "node_name": node_name,
@@ -601,6 +602,7 @@ fn build_node_config_get_payload(
         "effective_config": {
             "routes": sy_config.routes,
             "vpns": sy_config.vpns,
+            "taps": sy_config.taps,
             "updated_at": sy_config.updated_at,
             "hive": hive_id,
         },
@@ -609,7 +611,7 @@ fn build_node_config_get_payload(
             "target": NODE_CONFIG_CONTROL_TARGET,
             "schema_version": 1,
             "apply_modes": [NODE_CONFIG_APPLY_MODE_REPLACE],
-            "config_schema": "sy_config_routes_v1",
+            "config_schema": "sy_config_routes_v2",
             "requested_node_name": requested_node_name,
         }
     })
@@ -1117,8 +1119,18 @@ fn apply_node_config_set_request(
             changed_fields.push("vpns");
         }
     }
-    if config.get("routes").is_none() && config.get("vpns").is_none() {
-        return Err("config must include 'routes' or 'vpns'".into());
+    if config.get("taps").is_some() {
+        let taps = parse_taps(&request.config)?.ok_or("taps must be present")?;
+        if taps != current.taps {
+            next.taps = taps;
+            changed_fields.push("taps");
+        }
+    }
+    if config.get("routes").is_none()
+        && config.get("vpns").is_none()
+        && config.get("taps").is_none()
+    {
+        return Err("config must include 'routes', 'vpns', or 'taps'".into());
     }
 
     if !changed_fields.is_empty() {
@@ -1240,6 +1252,13 @@ mod tests {
                 vpn_id: 7,
                 priority: Some(100),
             }],
+            taps: vec![TapConfig {
+                match_src: "IO.api.sales@motherbee".to_string(),
+                match_dst: "AI.sales@motherbee".to_string(),
+                target: "IO.slack.sales@motherbee".to_string(),
+                mode: "best_effort".to_string(),
+                enabled: true,
+            }],
         }
     }
 
@@ -1260,6 +1279,10 @@ mod tests {
         assert_eq!(
             payload["effective_config"]["routes"][0]["prefix"],
             json!("support/")
+        );
+        assert_eq!(
+            payload["effective_config"]["taps"][0]["target"],
+            json!("IO.slack.sales@motherbee")
         );
     }
 
@@ -1288,6 +1311,35 @@ mod tests {
         assert_eq!(changed, vec!["routes"]);
         assert_eq!(next.version, 8);
         assert_eq!(next.routes[0].prefix, "billing/");
+        assert_eq!(next.vpns, current.vpns);
+        assert_eq!(next.taps, current.taps);
+    }
+
+    #[test]
+    fn apply_node_config_set_request_replaces_taps_section() {
+        let current = sample_config();
+        let request = NodeConfigSetPayload {
+            node_name: "SY.config.routes@motherbee".to_string(),
+            schema_version: 1,
+            config_version: 9,
+            apply_mode: NODE_CONFIG_APPLY_MODE_REPLACE.to_string(),
+            config: json!({
+                "taps": [{
+                    "match_src": "IO.api.sales@motherbee",
+                    "match_dst": "AI.sales@motherbee",
+                    "target": "WF.sales@motherbee",
+                    "mode": "best_effort",
+                    "enabled": true
+                }]
+            }),
+            ..Default::default()
+        };
+
+        let (next, changed) = apply_node_config_set_request(&current, &request).unwrap();
+        assert_eq!(changed, vec!["taps"]);
+        assert_eq!(next.version, 9);
+        assert_eq!(next.taps[0].target, "WF.sales@motherbee");
+        assert_eq!(next.routes, current.routes);
         assert_eq!(next.vpns, current.vpns);
     }
 

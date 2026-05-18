@@ -24,7 +24,7 @@ pub const CONFIG_MAGIC: u32 = 0x4A534343; // "JSCC"
 pub const CONFIG_VERSION: u32 = 2;
 
 pub const LSA_MAGIC: u32 = 0x4A534C41; // "JSLA"
-pub const LSA_VERSION: u32 = 2;
+pub const LSA_VERSION: u32 = 3;
 
 pub const OPA_MAGIC: u32 = 0x4A534F50; // "JSOP"
 pub const OPA_VERSION: u32 = 1;
@@ -56,6 +56,7 @@ pub const MAX_REMOTE_HIVES: u32 = 16;
 pub const MAX_REMOTE_NODES: u32 = 1024;
 pub const MAX_REMOTE_ROUTES: u32 = 256;
 pub const MAX_REMOTE_VPNS: u32 = 256;
+pub const MAX_REMOTE_TAPS: u32 = 256;
 
 pub const DEFAULT_IDENTITY_MAX_ILKS: u32 = 1_000_000;
 pub const DEFAULT_IDENTITY_MAX_TENANTS: u32 = 10_000;
@@ -266,6 +267,7 @@ pub struct LsaHeader {
     pub total_node_count: u32,
     pub total_route_count: u32,
     pub total_vpn_count: u32,
+    pub total_tap_count: u32,
 
     pub created_at: u64,
     pub updated_at: u64,
@@ -273,7 +275,7 @@ pub struct LsaHeader {
     pub local_hive_id: [u8; 64],
     pub local_hive_id_len: u16,
 
-    pub _reserved: [u8; 38],
+    pub _reserved: [u8; 34],
 }
 
 #[repr(C)]
@@ -495,6 +497,7 @@ pub struct RemoteHiveEntry {
     pub node_count: u32,
     pub route_count: u32,
     pub vpn_count: u32,
+    pub tap_count: u32,
 }
 
 #[repr(C)]
@@ -546,6 +549,28 @@ pub struct RemoteVpnEntry {
     pub _reserved: [u8; 18],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RemoteTapEntry {
+    pub match_src: [u8; 256],
+    pub match_src_len: u16,
+    pub _pad0: [u8; 6],
+
+    pub match_dst: [u8; 256],
+    pub match_dst_len: u16,
+    pub _pad1: [u8; 6],
+
+    pub target: [u8; 256],
+    pub target_len: u16,
+    pub _pad2: [u8; 6],
+
+    pub mode: u8,
+    pub enabled: u8,
+    pub flags: u16,
+    pub hive_index: u16,
+    pub _reserved: [u8; 38],
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RegionLayout {
     header_offset: usize,
@@ -559,6 +584,7 @@ struct RegionLayout {
     remote_node_offset: usize,
     remote_route_offset: usize,
     remote_vpn_offset: usize,
+    remote_tap_offset: usize,
     total_len: usize,
 }
 
@@ -650,6 +676,7 @@ pub struct LsaSnapshot {
     pub nodes: Vec<RemoteNodeEntry>,
     pub routes: Vec<RemoteRouteEntry>,
     pub vpns: Vec<RemoteVpnEntry>,
+    pub taps: Vec<RemoteTapEntry>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -658,6 +685,7 @@ pub struct LsaHeaderSnapshot {
     pub total_node_count: u32,
     pub total_route_count: u32,
     pub total_vpn_count: u32,
+    pub total_tap_count: u32,
     pub heartbeat: u64,
 }
 
@@ -1219,6 +1247,7 @@ impl LsaRegionWriter {
         nodes: &[RemoteNodeEntry],
         routes: &[RemoteRouteEntry],
         vpns: &[RemoteVpnEntry],
+        taps: &[RemoteTapEntry],
     ) -> Result<(), ShmError> {
         if hives.len() > MAX_REMOTE_HIVES as usize {
             return Err(ShmError::ValueTooLong {
@@ -1244,12 +1273,19 @@ impl LsaRegionWriter {
                 max: MAX_REMOTE_VPNS as usize,
             });
         }
-        let (header, hive_entries, node_entries, route_entries, vpn_entries): (
+        if taps.len() > MAX_REMOTE_TAPS as usize {
+            return Err(ShmError::ValueTooLong {
+                len: taps.len(),
+                max: MAX_REMOTE_TAPS as usize,
+            });
+        }
+        let (header, hive_entries, node_entries, route_entries, vpn_entries, tap_entries): (
             &mut LsaHeader,
             &mut [RemoteHiveEntry],
             &mut [RemoteNodeEntry],
             &mut [RemoteRouteEntry],
             &mut [RemoteVpnEntry],
+            &mut [RemoteTapEntry],
         ) = lsa_header_and_entries_mut(&mut self.mmap, &self.layout)
             .ok_or(ShmError::InvalidHeader)?;
 
@@ -1266,6 +1302,9 @@ impl LsaRegionWriter {
         for entry in vpn_entries.iter_mut() {
             *entry = empty_remote_vpn();
         }
+        for entry in tap_entries.iter_mut() {
+            *entry = empty_remote_tap();
+        }
 
         for (idx, hive) in hives.iter().enumerate() {
             hive_entries[idx] = *hive;
@@ -1279,11 +1318,15 @@ impl LsaRegionWriter {
         for (idx, vpn) in vpns.iter().enumerate() {
             vpn_entries[idx] = *vpn;
         }
+        for (idx, tap) in taps.iter().enumerate() {
+            tap_entries[idx] = *tap;
+        }
 
         header.hive_count = hives.len() as u32;
         header.total_node_count = nodes.len() as u32;
         header.total_route_count = routes.len() as u32;
         header.total_vpn_count = vpns.len() as u32;
+        header.total_tap_count = taps.len() as u32;
         header.updated_at = now_epoch_ms();
         header.heartbeat = header.updated_at;
         Ok(())
@@ -2332,6 +2375,7 @@ fn layout_router() -> RegionLayout {
         remote_node_offset: 0,
         remote_route_offset: 0,
         remote_vpn_offset: 0,
+        remote_tap_offset: 0,
         total_len,
     }
 }
@@ -2358,6 +2402,7 @@ fn layout_config() -> RegionLayout {
         remote_node_offset: 0,
         remote_route_offset: 0,
         remote_vpn_offset: 0,
+        remote_tap_offset: 0,
         total_len,
     }
 }
@@ -2368,13 +2413,15 @@ fn layout_lsa() -> RegionLayout {
     let node_size = size_of::<RemoteNodeEntry>() * MAX_REMOTE_NODES as usize;
     let route_size = size_of::<RemoteRouteEntry>() * MAX_REMOTE_ROUTES as usize;
     let vpn_size = size_of::<RemoteVpnEntry>() * MAX_REMOTE_VPNS as usize;
+    let tap_size = size_of::<RemoteTapEntry>() * MAX_REMOTE_TAPS as usize;
 
     let header_offset = 0;
     let hive_offset = align_up(header_offset + header_size, REGION_ALIGNMENT);
     let remote_node_offset = align_up(hive_offset + hive_size, REGION_ALIGNMENT);
     let remote_route_offset = align_up(remote_node_offset + node_size, REGION_ALIGNMENT);
     let remote_vpn_offset = align_up(remote_route_offset + route_size, REGION_ALIGNMENT);
-    let total_len = align_up(remote_vpn_offset + vpn_size, REGION_ALIGNMENT);
+    let remote_tap_offset = align_up(remote_vpn_offset + vpn_size, REGION_ALIGNMENT);
+    let total_len = align_up(remote_tap_offset + tap_size, REGION_ALIGNMENT);
 
     RegionLayout {
         header_offset,
@@ -2386,6 +2433,7 @@ fn layout_lsa() -> RegionLayout {
         remote_node_offset,
         remote_route_offset,
         remote_vpn_offset,
+        remote_tap_offset,
         total_len,
     }
 }
@@ -2447,6 +2495,7 @@ fn layout_memory() -> RegionLayout {
         remote_node_offset: 0,
         remote_route_offset: 0,
         remote_vpn_offset: 0,
+        remote_tap_offset: 0,
         total_len: data_offset + MEMORY_MAX_DATA_SIZE,
     }
 }
@@ -2691,6 +2740,7 @@ fn initialize_lsa_header(mmap: &mut MmapMut, gateway_uuid: Uuid, hive_id: &str) 
         header.total_node_count = 0;
         header.total_route_count = 0;
         header.total_vpn_count = 0;
+        header.total_tap_count = 0;
         header.local_hive_id_len = copy_bytes_with_len(&mut header.local_hive_id, hive_id) as u16;
         header.created_at = now_epoch_ms();
         header.updated_at = header.created_at;
@@ -2881,6 +2931,7 @@ fn read_lsa_snapshot(
         let total_nodes = header.total_node_count as usize;
         let total_routes = header.total_route_count as usize;
         let total_vpns = header.total_vpn_count as usize;
+        let total_taps = header.total_tap_count as usize;
 
         let hives =
             read_slice::<RemoteHiveEntry>(mmap, layout.hive_offset, MAX_REMOTE_HIVES as usize)?;
@@ -2896,6 +2947,8 @@ fn read_lsa_snapshot(
         )?;
         let vpns =
             read_slice::<RemoteVpnEntry>(mmap, layout.remote_vpn_offset, MAX_REMOTE_VPNS as usize)?;
+        let taps =
+            read_slice::<RemoteTapEntry>(mmap, layout.remote_tap_offset, MAX_REMOTE_TAPS as usize)?;
 
         let mut hive_snapshot = Vec::new();
         for hive in hives.iter().take(hive_count) {
@@ -2913,6 +2966,10 @@ fn read_lsa_snapshot(
         for vpn in vpns.iter().take(total_vpns) {
             vpn_snapshot.push(*vpn);
         }
+        let mut tap_snapshot = Vec::new();
+        for tap in taps.iter().take(total_taps) {
+            tap_snapshot.push(*tap);
+        }
         atomic::fence(Ordering::Acquire);
         let s2 = header.seq.load(Ordering::Acquire);
         if s1 == s2 {
@@ -2922,12 +2979,14 @@ fn read_lsa_snapshot(
                     total_node_count: header.total_node_count,
                     total_route_count: header.total_route_count,
                     total_vpn_count: header.total_vpn_count,
+                    total_tap_count: header.total_tap_count,
                     heartbeat: header.heartbeat,
                 },
                 hives: hive_snapshot,
                 nodes: node_snapshot,
                 routes: route_snapshot,
                 vpns: vpn_snapshot,
+                taps: tap_snapshot,
             });
         }
     }
@@ -2950,6 +3009,7 @@ fn read_lsa_header_snapshot(header: &LsaHeader) -> Option<LsaHeaderSnapshot> {
             total_node_count: header.total_node_count,
             total_route_count: header.total_route_count,
             total_vpn_count: header.total_vpn_count,
+            total_tap_count: header.total_tap_count,
             heartbeat: header.heartbeat,
         };
         atomic::fence(Ordering::Acquire);
@@ -3291,16 +3351,19 @@ fn lsa_header_and_entries_mut<'a>(
     &'a mut [RemoteNodeEntry],
     &'a mut [RemoteRouteEntry],
     &'a mut [RemoteVpnEntry],
+    &'a mut [RemoteTapEntry],
 )> {
     let header_offset = layout.header_offset;
     let hives_offset = layout.hive_offset;
     let nodes_offset = layout.remote_node_offset;
     let routes_offset = layout.remote_route_offset;
     let vpns_offset = layout.remote_vpn_offset;
+    let taps_offset = layout.remote_tap_offset;
     let hives_len = MAX_REMOTE_HIVES as usize;
     let nodes_len = MAX_REMOTE_NODES as usize;
     let routes_len = MAX_REMOTE_ROUTES as usize;
     let vpns_len = MAX_REMOTE_VPNS as usize;
+    let taps_len = MAX_REMOTE_TAPS as usize;
     let len = mmap.len();
     let base = mmap.as_mut_ptr();
     if header_offset + size_of::<LsaHeader>() > len {
@@ -3309,18 +3372,23 @@ fn lsa_header_and_entries_mut<'a>(
     if vpns_offset + size_of::<RemoteVpnEntry>() * vpns_len > len {
         return None;
     }
+    if taps_offset + size_of::<RemoteTapEntry>() * taps_len > len {
+        return None;
+    }
     unsafe {
         let header_ptr = base.add(header_offset) as *mut LsaHeader;
         let hives_ptr = base.add(hives_offset) as *mut RemoteHiveEntry;
         let nodes_ptr = base.add(nodes_offset) as *mut RemoteNodeEntry;
         let routes_ptr = base.add(routes_offset) as *mut RemoteRouteEntry;
         let vpns_ptr = base.add(vpns_offset) as *mut RemoteVpnEntry;
+        let taps_ptr = base.add(taps_offset) as *mut RemoteTapEntry;
         Some((
             &mut *header_ptr,
             std::slice::from_raw_parts_mut(hives_ptr, hives_len),
             std::slice::from_raw_parts_mut(nodes_ptr, nodes_len),
             std::slice::from_raw_parts_mut(routes_ptr, routes_len),
             std::slice::from_raw_parts_mut(vpns_ptr, vpns_len),
+            std::slice::from_raw_parts_mut(taps_ptr, taps_len),
         ))
     }
 }
@@ -3765,6 +3833,7 @@ fn empty_remote_hive() -> RemoteHiveEntry {
         node_count: 0,
         route_count: 0,
         vpn_count: 0,
+        tap_count: 0,
     }
 }
 
@@ -3808,6 +3877,25 @@ fn empty_remote_vpn() -> RemoteVpnEntry {
         flags: 0,
         hive_index: 0,
         _reserved: [0u8; 18],
+    }
+}
+
+fn empty_remote_tap() -> RemoteTapEntry {
+    RemoteTapEntry {
+        match_src: [0u8; 256],
+        match_src_len: 0,
+        _pad0: [0u8; 6],
+        match_dst: [0u8; 256],
+        match_dst_len: 0,
+        _pad1: [0u8; 6],
+        target: [0u8; 256],
+        target_len: 0,
+        _pad2: [0u8; 6],
+        mode: 0,
+        enabled: 0,
+        flags: 0,
+        hive_index: 0,
+        _reserved: [0u8; 38],
     }
 }
 

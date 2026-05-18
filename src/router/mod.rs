@@ -22,19 +22,19 @@ use crate::shm::{
     copy_bytes_with_len, memory_shm_name_for_hive, now_epoch_ms, sha256_bytes_is_zero,
     sha256_bytes_to_hex, ConfigRegionReader, ConfigSnapshot, IdentityRegionReader, LsaRegionReader,
     LsaRegionWriter, LsaSnapshot, MemoryRegionReader, MemoryShmSnapshot, OpaRegionReader,
-    OpaSnapshot, RemoteHiveEntry, RemoteNodeEntry, RemoteRouteEntry, RemoteVpnEntry,
-    RouterRegionReader, RouterRegionWriter, VpnAssignment, ACTION_DROP, ACTION_FORWARD,
-    FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS, HIVE_FLAG_SELF, MATCH_EXACT,
-    MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING,
+    OpaSnapshot, RemoteHiveEntry, RemoteNodeEntry, RemoteRouteEntry, RemoteTapEntry,
+    RemoteVpnEntry, RouterRegionReader, RouterRegionWriter, TapEntry, VpnAssignment, ACTION_DROP,
+    ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS, HIVE_FLAG_SELF,
+    MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING,
 };
 use fluxbee_sdk::classify_routed_message;
 use fluxbee_sdk::protocol::{
     build_announce, build_lsa, build_router_hello, build_ttl_exceeded, build_unreachable,
     build_wan_accept, build_wan_hello, build_wan_reject, Destination, LsaNode, LsaPayload,
-    LsaRoute, LsaVpn, Message, Meta, NodeAnnouncePayload, NodeHelloPayload, OpaReloadPayload,
-    RouterHelloPayload, WanAcceptPayload, WanHelloPayload, WanNegotiated, WanRejectPayload,
-    WanTimers, MSG_CONFIG_CHANGED, MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD, MSG_TTL_EXCEEDED,
-    MSG_UNREACHABLE, MSG_WITHDRAW, SCOPE_GLOBAL, SYSTEM_KIND,
+    LsaRoute, LsaTap, LsaVpn, Message, Meta, NodeAnnouncePayload, NodeHelloPayload,
+    OpaReloadPayload, RouterHelloPayload, WanAcceptPayload, WanHelloPayload, WanNegotiated,
+    WanRejectPayload, WanTimers, MSG_CONFIG_CHANGED, MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD,
+    MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_WITHDRAW, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::socket::connection::{read_frame, write_frame};
 
@@ -65,6 +65,7 @@ pub struct Router {
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
     vpn_rules: Arc<Mutex<Vec<VpnAssignment>>>,
+    tap_rules: Arc<Mutex<Vec<TapEntry>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
     config_version: Arc<Mutex<u64>>,
     opa: Arc<Mutex<OpaResolver>>,
@@ -139,6 +140,7 @@ impl Router {
             lsa_snapshot: Arc::new(Mutex::new(None)),
             static_routes: Arc::new(Mutex::new(Vec::new())),
             vpn_rules: Arc::new(Mutex::new(Vec::new())),
+            tap_rules: Arc::new(Mutex::new(Vec::new())),
             fib: Arc::new(Mutex::new(Vec::new())),
             config_version: Arc::new(Mutex::new(0)),
             opa,
@@ -208,6 +210,7 @@ impl Router {
         let wan_peers_pd = Arc::clone(&self.wan_peers);
         let static_routes_pd = Arc::clone(&self.static_routes);
         let vpn_rules_pd = Arc::clone(&self.vpn_rules);
+        let tap_rules_pd = Arc::clone(&self.tap_rules);
         let lsa_snapshot_pd = Arc::clone(&self.lsa_snapshot);
         let fib_pd = Arc::clone(&self.fib);
         let config_reader_pd = Arc::clone(&self.config_reader);
@@ -242,6 +245,7 @@ impl Router {
                 lsa_reader_pd,
                 static_routes_pd,
                 vpn_rules_pd,
+                tap_rules_pd,
                 config_version_pd,
                 shm_pd,
                 opa_pd,
@@ -284,6 +288,7 @@ impl Router {
         let lsa_reader = Arc::clone(&self.lsa_reader);
         let static_routes = Arc::clone(&self.static_routes);
         let vpn_rules = Arc::clone(&self.vpn_rules);
+        let tap_rules = Arc::clone(&self.tap_rules);
         let config_version = Arc::clone(&self.config_version);
         let shm = Arc::clone(&self.shm);
         let opa = Arc::clone(&self.opa);
@@ -313,6 +318,7 @@ impl Router {
                 let config_reader = Arc::clone(&config_reader);
                 let static_routes = Arc::clone(&static_routes);
                 let vpn_rules = Arc::clone(&vpn_rules);
+                let tap_rules = Arc::clone(&tap_rules);
                 let config_version = Arc::clone(&config_version);
                 let shm = Arc::clone(&shm);
                 let opa = Arc::clone(&opa);
@@ -338,6 +344,7 @@ impl Router {
                         lsa_reader,
                         static_routes,
                         vpn_rules,
+                        tap_rules,
                         config_version,
                         shm,
                         opa,
@@ -377,6 +384,7 @@ impl Router {
                 lsa_snapshot: Arc::clone(&self.lsa_snapshot),
                 static_routes: Arc::clone(&self.static_routes),
                 vpn_rules: Arc::clone(&self.vpn_rules),
+                tap_rules: Arc::clone(&self.tap_rules),
                 fib: Arc::clone(&self.fib),
                 broadcast_cache: Arc::clone(&self.broadcast_cache),
                 lsa_seq: Arc::clone(&self.lsa_seq),
@@ -425,6 +433,7 @@ impl Router {
             let lsa_snapshot = Arc::clone(&self.lsa_snapshot);
             let static_routes = Arc::clone(&self.static_routes);
             let vpn_rules = Arc::clone(&self.vpn_rules);
+            let tap_rules = Arc::clone(&self.tap_rules);
             let fib = Arc::clone(&self.fib);
             let config_version = Arc::clone(&self.config_version);
             let opa = Arc::clone(&self.opa);
@@ -451,6 +460,7 @@ impl Router {
                     lsa_snapshot,
                     static_routes,
                     vpn_rules,
+                    tap_rules,
                     fib,
                     config_version,
                     opa,
@@ -489,6 +499,7 @@ async fn handle_node(
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
     vpn_rules: Arc<Mutex<Vec<VpnAssignment>>>,
+    tap_rules: Arc<Mutex<Vec<TapEntry>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
     config_version: Arc<Mutex<u64>>,
     opa: Arc<Mutex<OpaResolver>>,
@@ -553,6 +564,7 @@ async fn handle_node(
         &config_reader,
         &static_routes,
         &vpn_rules,
+        &tap_rules,
         &config_version,
         hive_id,
         &nodes,
@@ -615,6 +627,7 @@ async fn handle_node(
             &peer_nodes,
             &static_routes,
             &vpn_rules,
+            &tap_rules,
             &wan_peers,
             &lsa_seq,
         )
@@ -676,6 +689,7 @@ async fn handle_node(
                             &config_reader,
                             &static_routes,
                             &vpn_rules,
+                            &tap_rules,
                             &config_version,
                             hive_id,
                             &nodes,
@@ -738,6 +752,7 @@ async fn handle_node(
                                 &peer_nodes,
                                 &static_routes,
                                 &vpn_rules,
+                                &tap_rules,
                                 &wan_peers,
                                 &lsa_seq,
                             )
@@ -781,6 +796,7 @@ async fn handle_node(
                     &config_reader,
                     &static_routes,
                     &vpn_rules,
+                    &tap_rules,
                     &config_version,
                     hive_id,
                     &nodes,
@@ -849,6 +865,7 @@ async fn handle_node(
             &peer_nodes,
             &static_routes,
             &vpn_rules,
+            &tap_rules,
             &wan_peers,
             &lsa_seq,
         )
@@ -1312,13 +1329,6 @@ async fn fanout_taps_for_unicast(
     if src_name.is_empty() {
         return;
     }
-    tracing::debug!(
-        src = %src_name,
-        dst_label = %dst_label,
-        tap_count = snap.taps.len(),
-        "router tap fanout: evaluating"
-    );
-
     // If dst_label is a UUID, resolve back to the L2 name of the target
     // node so tap matching (which is by L2 name) still works.
     let dst_name_owned: String = if let Ok(dst_uuid) = Uuid::parse_str(dst_label) {
@@ -1340,7 +1350,7 @@ async fn fanout_taps_for_unicast(
         return;
     }
 
-    // Iterate installed taps; for each match emit one copy.
+    let mut tap_targets = Vec::new();
     for tap in &snap.taps {
         if tap.enabled == 0 {
             continue;
@@ -1354,17 +1364,49 @@ async fn fanout_taps_for_unicast(
         if tap_target.is_empty() {
             continue;
         }
+        tap_targets.push(tap_target.to_string());
+    }
+    if let Some(snapshot) = lsa_snapshot.lock().await.as_ref() {
+        for tap in &snapshot.taps {
+            if tap.enabled == 0 {
+                continue;
+            }
+            if tap.flags != 0 && (tap.flags & FLAG_ACTIVE == 0) {
+                continue;
+            }
+            let tap_src = bytes_to_string(&tap.match_src, tap.match_src_len as usize);
+            let tap_dst = bytes_to_string(&tap.match_dst, tap.match_dst_len as usize);
+            if tap_src != src_name || tap_dst != dst_name_owned {
+                continue;
+            }
+            let tap_target = bytes_to_string(&tap.target, tap.target_len as usize);
+            if tap_target.is_empty() {
+                continue;
+            }
+            tap_targets.push(tap_target.to_string());
+        }
+    }
+    tap_targets.sort();
+    tap_targets.dedup();
+    tracing::debug!(
+        src = %src_name,
+        dst = %dst_name_owned,
+        tap_match_count = tap_targets.len(),
+        "router tap fanout: evaluating"
+    );
 
+    // Iterate installed/global taps; for each match emit one copy.
+    for tap_target in tap_targets {
         let mut copy = msg.clone();
         copy.meta.via_tap = true;
-        copy.routing.dst = Destination::Unicast(tap_target.to_string());
+        copy.routing.dst = Destination::Unicast(tap_target.clone());
         // Mint a fresh trace_id so observer traces can be correlated to
         // this tap copy specifically without colliding with the primary.
         copy.routing.trace_id = Uuid::new_v4().to_string();
 
         let nodes_guard = nodes.lock().await;
         let resolved =
-            match resolve_by_name(tap_target, src_handle, &nodes_guard, fib, &copy.meta).await {
+            match resolve_by_name(&tap_target, src_handle, &nodes_guard, fib, &copy.meta).await {
                 Ok(value) => value,
                 Err(err) => {
                     tracing::warn!(
@@ -1483,7 +1525,6 @@ async fn fanout_taps_for_unicast(
             }
         }
     }
-    let _ = lsa_snapshot; // currently unused inside fanout but kept for symmetry
 }
 
 async fn assign_thread_seq_if_missing(
@@ -1744,6 +1785,20 @@ fn action_from_label(label: &str) -> Option<u8> {
     }
 }
 
+fn tap_mode_label(mode: u8) -> &'static str {
+    match mode {
+        0 => "best_effort",
+        _ => "best_effort",
+    }
+}
+
+fn tap_mode_from_label(label: &str) -> Option<u8> {
+    match label.trim().to_ascii_lowercase().as_str() {
+        "" | "best_effort" => Some(0),
+        _ => None,
+    }
+}
+
 async fn build_local_lsa_payload(
     router_uuid: Uuid,
     router_name: &str,
@@ -1753,6 +1808,7 @@ async fn build_local_lsa_payload(
     peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
     vpn_rules: &Arc<Mutex<Vec<VpnAssignment>>>,
+    tap_rules: &Arc<Mutex<Vec<TapEntry>>>,
 ) -> LsaPayload {
     let mut node_map: HashMap<Uuid, LsaNode> = HashMap::new();
     {
@@ -1814,6 +1870,30 @@ async fn build_local_lsa_payload(
             vpn_id: vpn.vpn_id,
         });
     }
+    let tap_snapshot = {
+        let tap_guard = tap_rules.lock().await;
+        tap_guard.clone()
+    };
+    let mut taps = Vec::new();
+    for tap in tap_snapshot {
+        if tap.enabled == 0
+            || tap.match_src_len == 0
+            || tap.match_dst_len == 0
+            || tap.target_len == 0
+        {
+            continue;
+        }
+        if tap.flags != 0 && (tap.flags & FLAG_ACTIVE == 0) {
+            continue;
+        }
+        taps.push(LsaTap {
+            match_src: bytes_to_string(&tap.match_src, tap.match_src_len as usize).to_string(),
+            match_dst: bytes_to_string(&tap.match_dst, tap.match_dst_len as usize).to_string(),
+            target: bytes_to_string(&tap.target, tap.target_len as usize).to_string(),
+            mode: tap_mode_label(tap.mode).to_string(),
+            enabled: tap.enabled != 0,
+        });
+    }
     LsaPayload {
         hive: hive_id.to_string(),
         router_id: router_uuid.to_string(),
@@ -1823,6 +1903,7 @@ async fn build_local_lsa_payload(
         nodes,
         routes,
         vpns,
+        taps,
     }
 }
 
@@ -1847,6 +1928,7 @@ async fn broadcast_lsa(ctx: &WanContext, target_hive: Option<&str>) -> Result<()
         &ctx.peer_nodes,
         &ctx.static_routes,
         &ctx.vpn_rules,
+        &ctx.tap_rules,
     )
     .await;
     for (hive, peer) in peers.iter() {
@@ -1875,6 +1957,7 @@ async fn broadcast_lsa_direct(
     peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
     vpn_rules: &Arc<Mutex<Vec<VpnAssignment>>>,
+    tap_rules: &Arc<Mutex<Vec<TapEntry>>>,
     wan_peers: &Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     lsa_seq: &Arc<Mutex<u64>>,
 ) -> Result<(), RouterError> {
@@ -1898,6 +1981,7 @@ async fn broadcast_lsa_direct(
         peer_nodes,
         static_routes,
         vpn_rules,
+        tap_rules,
     )
     .await;
     for (_hive, peer) in peers {
@@ -1993,6 +2077,7 @@ async fn apply_lsa_payload(
     entry.nodes = payload.nodes;
     entry.routes = payload.routes;
     entry.vpns = payload.vpns;
+    entry.taps = payload.taps;
     LsaApplyResult::Applied
 }
 
@@ -2010,6 +2095,7 @@ async fn write_lsa_state(ctx: &WanContext) {
         &ctx.peer_nodes,
         &ctx.static_routes,
         &ctx.vpn_rules,
+        &ctx.tap_rules,
     )
     .await;
     let self_last_updated = self_payload
@@ -2026,6 +2112,7 @@ async fn write_lsa_state(ctx: &WanContext) {
         nodes: self_payload.nodes,
         routes: self_payload.routes,
         vpns: self_payload.vpns,
+        taps: self_payload.taps,
     };
 
     let state_guard = ctx.lsa_state.lock().await;
@@ -2047,6 +2134,7 @@ async fn write_lsa_state(ctx: &WanContext) {
     let mut node_entries: Vec<RemoteNodeEntry> = Vec::new();
     let mut route_entries: Vec<RemoteRouteEntry> = Vec::new();
     let mut vpn_entries: Vec<RemoteVpnEntry> = Vec::new();
+    let mut tap_entries: Vec<RemoteTapEntry> = Vec::new();
 
     for (index, (hive_id, state)) in hives.iter().enumerate() {
         let mut hive_entry = RemoteHiveEntry {
@@ -2061,6 +2149,7 @@ async fn write_lsa_state(ctx: &WanContext) {
             node_count: state.nodes.len() as u32,
             route_count: state.routes.len() as u32,
             vpn_count: state.vpns.len() as u32,
+            tap_count: state.taps.len() as u32,
         };
         hive_entry.hive_id_len = copy_bytes_with_len(&mut hive_entry.hive_id, hive_id) as u16;
         hive_entry.router_name_len =
@@ -2129,11 +2218,41 @@ async fn write_lsa_state(ctx: &WanContext) {
             entry.pattern_len = copy_bytes_with_len(&mut entry.pattern, &vpn.pattern) as u16;
             vpn_entries.push(entry);
         }
+
+        for tap in state.taps.iter() {
+            let Some(mode) = tap_mode_from_label(&tap.mode) else {
+                continue;
+            };
+            let mut entry = RemoteTapEntry {
+                match_src: [0u8; 256],
+                match_src_len: 0,
+                _pad0: [0u8; 6],
+                match_dst: [0u8; 256],
+                match_dst_len: 0,
+                _pad1: [0u8; 6],
+                target: [0u8; 256],
+                target_len: 0,
+                _pad2: [0u8; 6],
+                mode,
+                enabled: if tap.enabled { 1 } else { 0 },
+                flags: FLAG_ACTIVE,
+                hive_index: index as u16,
+                _reserved: [0u8; 38],
+            };
+            entry.match_src_len = copy_bytes_with_len(&mut entry.match_src, &tap.match_src) as u16;
+            entry.match_dst_len = copy_bytes_with_len(&mut entry.match_dst, &tap.match_dst) as u16;
+            entry.target_len = copy_bytes_with_len(&mut entry.target, &tap.target) as u16;
+            tap_entries.push(entry);
+        }
     }
 
-    if let Err(err) =
-        writer.write_snapshot(&hive_entries, &node_entries, &route_entries, &vpn_entries)
-    {
+    if let Err(err) = writer.write_snapshot(
+        &hive_entries,
+        &node_entries,
+        &route_entries,
+        &vpn_entries,
+        &tap_entries,
+    ) {
         tracing::warn!("lsa snapshot write failed: {err}");
         return;
     }
@@ -2827,6 +2946,7 @@ async fn peer_discovery_loop(
     lsa_reader: Arc<Mutex<Option<LsaRegionReader>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
     vpn_rules: Arc<Mutex<Vec<VpnAssignment>>>,
+    tap_rules: Arc<Mutex<Vec<TapEntry>>>,
     config_version: Arc<Mutex<u64>>,
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
@@ -2892,6 +3012,7 @@ async fn peer_discovery_loop(
                     let self_router_name = self_router_name.to_string();
                     let self_shm_name = self_shm_name.to_string();
                     let vpn_rules = Arc::clone(&vpn_rules);
+                    let tap_rules = Arc::clone(&tap_rules);
                     let lsa_snapshot = Arc::clone(&lsa_snapshot);
                     let thread_sequences = Arc::clone(&thread_sequences);
                     let is_gateway = is_gateway;
@@ -2913,6 +3034,7 @@ async fn peer_discovery_loop(
                             lsa_reader,
                             static_routes,
                             vpn_rules,
+                            tap_rules,
                             config_version,
                             shm,
                             opa,
@@ -3015,6 +3137,7 @@ async fn connect_to_peer(
     lsa_reader: Arc<Mutex<Option<LsaRegionReader>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
     vpn_rules: Arc<Mutex<Vec<VpnAssignment>>>,
+    tap_rules: Arc<Mutex<Vec<TapEntry>>>,
     config_version: Arc<Mutex<u64>>,
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
@@ -3075,6 +3198,7 @@ async fn connect_to_peer(
                         &lsa_reader,
                         &static_routes,
                         &vpn_rules,
+                        &tap_rules,
                         &config_version,
                         &shm,
                         &opa,
@@ -3114,6 +3238,7 @@ async fn handle_peer_incoming(
     lsa_reader: Arc<Mutex<Option<LsaRegionReader>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
     vpn_rules: Arc<Mutex<Vec<VpnAssignment>>>,
+    tap_rules: Arc<Mutex<Vec<TapEntry>>>,
     config_version: Arc<Mutex<u64>>,
     shm: Arc<Mutex<RouterRegionWriter>>,
     opa: Arc<Mutex<OpaResolver>>,
@@ -3172,6 +3297,7 @@ async fn handle_peer_incoming(
                         &lsa_reader,
                         &static_routes,
                         &vpn_rules,
+                        &tap_rules,
                         &config_version,
                         &shm,
                         &opa,
@@ -3211,6 +3337,7 @@ async fn handle_peer_message(
     lsa_reader: &Arc<Mutex<Option<LsaRegionReader>>>,
     static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
     vpn_rules: &Arc<Mutex<Vec<VpnAssignment>>>,
+    tap_rules: &Arc<Mutex<Vec<TapEntry>>>,
     config_version: &Arc<Mutex<u64>>,
     shm: &Arc<Mutex<RouterRegionWriter>>,
     opa: &Arc<Mutex<OpaResolver>>,
@@ -3235,6 +3362,7 @@ async fn handle_peer_message(
             config_reader,
             static_routes,
             vpn_rules,
+            tap_rules,
             config_version,
             hive_id,
             nodes,
@@ -3701,6 +3829,7 @@ struct RemoteHiveState {
     nodes: Vec<LsaNode>,
     routes: Vec<LsaRoute>,
     vpns: Vec<LsaVpn>,
+    taps: Vec<LsaTap>,
 }
 
 struct WanContext {
@@ -3721,6 +3850,7 @@ struct WanContext {
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
     vpn_rules: Arc<Mutex<Vec<VpnAssignment>>>,
+    tap_rules: Arc<Mutex<Vec<TapEntry>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     lsa_seq: Arc<Mutex<u64>>,
@@ -3820,6 +3950,7 @@ async fn refresh_config(
     config_reader: &Arc<Mutex<Option<ConfigRegionReader>>>,
     static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
     vpn_rules: &Arc<Mutex<Vec<VpnAssignment>>>,
+    tap_rules: &Arc<Mutex<Vec<TapEntry>>>,
     config_version: &Arc<Mutex<u64>>,
     hive_id: &str,
     nodes: &Arc<Mutex<std::collections::HashMap<Uuid, NodeHandle>>>,
@@ -3885,6 +4016,10 @@ async fn refresh_config(
             {
                 let mut vpn_guard = vpn_rules.lock().await;
                 *vpn_guard = snapshot.vpns.clone();
+            }
+            {
+                let mut tap_guard = tap_rules.lock().await;
+                *tap_guard = snapshot.taps.clone();
             }
             *version_guard = snapshot.header.config_version;
             tracing::info!(
@@ -5345,7 +5480,58 @@ mod tests {
             nodes: Vec::new(),
             routes: Vec::new(),
             vpns: Vec::new(),
+            taps: Vec::new(),
         }
+    }
+
+    fn test_tap_entry(match_src: &str, match_dst: &str, target: &str) -> TapEntry {
+        let mut entry = TapEntry {
+            match_src: [0u8; 256],
+            match_src_len: 0,
+            _pad0: [0u8; 6],
+            match_dst: [0u8; 256],
+            match_dst_len: 0,
+            _pad1: [0u8; 6],
+            target: [0u8; 256],
+            target_len: 0,
+            _pad2: [0u8; 6],
+            mode: 0,
+            enabled: 1,
+            flags: FLAG_ACTIVE,
+            installed_at: 1,
+            _reserved: [0u8; 32],
+        };
+        entry.match_src_len = copy_bytes_with_len(&mut entry.match_src, match_src) as u16;
+        entry.match_dst_len = copy_bytes_with_len(&mut entry.match_dst, match_dst) as u16;
+        entry.target_len = copy_bytes_with_len(&mut entry.target, target) as u16;
+        entry
+    }
+
+    #[tokio::test]
+    async fn lsa_payload_includes_router_taps() {
+        let payload = build_local_lsa_payload(
+            Uuid::new_v4(),
+            "RT.gateway@motherbee",
+            "motherbee",
+            1,
+            &Arc::new(Mutex::new(HashMap::<Uuid, NodeHandle>::new())),
+            &Arc::new(Mutex::new(HashMap::<Uuid, PeerNode>::new())),
+            &Arc::new(Mutex::new(Vec::<StaticRoute>::new())),
+            &Arc::new(Mutex::new(Vec::<VpnAssignment>::new())),
+            &Arc::new(Mutex::new(vec![test_tap_entry(
+                "IO.api.sales@motherbee",
+                "AI.sales@motherbee",
+                "IO.slack.sales@motherbee",
+            )])),
+        )
+        .await;
+
+        assert_eq!(payload.taps.len(), 1);
+        assert_eq!(payload.taps[0].match_src, "IO.api.sales@motherbee");
+        assert_eq!(payload.taps[0].match_dst, "AI.sales@motherbee");
+        assert_eq!(payload.taps[0].target, "IO.slack.sales@motherbee");
+        assert_eq!(payload.taps[0].mode, "best_effort");
+        assert!(payload.taps[0].enabled);
     }
 
     #[tokio::test]
@@ -6228,6 +6414,7 @@ mod tests {
             &Arc::new(Mutex::new(None::<LsaRegionReader>)),
             &Arc::new(Mutex::new(Vec::<StaticRoute>::new())),
             &Arc::new(Mutex::new(Vec::<VpnAssignment>::new())),
+            &Arc::new(Mutex::new(Vec::<TapEntry>::new())),
             &Arc::new(Mutex::new(0u64)),
             &shm,
             &Arc::new(Mutex::new(OpaResolver::new())),
@@ -6392,6 +6579,7 @@ mod tests {
                 node_count: 0,
                 route_count: 0,
                 vpn_count: 0,
+                tap_count: 0,
             };
             entry.hive_id_len = copy_bytes_with_len(&mut entry.hive_id, hive) as u16;
             entry.router_name_len = copy_bytes_with_len(&mut entry.router_name, router_name) as u16;
@@ -6402,7 +6590,13 @@ mod tests {
             crate::shm::LsaRegionWriter::open_or_create(&shm_name, Uuid::new_v4(), &hive_id)
                 .expect("create lsa writer");
         writer
-            .write_snapshot(&[make_hive_entry("old-hive", "router-old")], &[], &[], &[])
+            .write_snapshot(
+                &[make_hive_entry("old-hive", "router-old")],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
             .expect("write initial lsa snapshot");
 
         let stale_reader = LsaRegionReader::open_read_only(&shm_name).expect("open stale reader");
@@ -6416,6 +6610,7 @@ mod tests {
         replacement_writer
             .write_snapshot(
                 &[make_hive_entry("fresh-hive", "router-fresh")],
+                &[],
                 &[],
                 &[],
                 &[],
