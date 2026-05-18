@@ -1312,6 +1312,12 @@ async fn fanout_taps_for_unicast(
     if src_name.is_empty() {
         return;
     }
+    tracing::debug!(
+        src = %src_name,
+        dst_label = %dst_label,
+        tap_count = snap.taps.len(),
+        "router tap fanout: evaluating"
+    );
 
     // If dst_label is a UUID, resolve back to the L2 name of the target
     // node so tap matching (which is by L2 name) still works.
@@ -1434,6 +1440,13 @@ async fn fanout_taps_for_unicast(
                     }
                 };
                 let _ = target_handle.sender.send(data);
+                tracing::info!(
+                    tap_src = %src_name,
+                    tap_dst = %dst_name_owned,
+                    tap_target = %tap_target,
+                    copy_trace_id = %copy.routing.trace_id,
+                    "router tap copy delivered (local)"
+                );
             }
             ResolvedRoute::ForwardRouter(peer_uuid) => {
                 drop(nodes_guard);
@@ -1445,6 +1458,13 @@ async fn fanout_taps_for_unicast(
                     continue;
                 }
                 let _ = send_to_peer_router(peers, peer_uuid, &copy).await;
+                tracing::info!(
+                    tap_src = %src_name,
+                    tap_dst = %dst_name_owned,
+                    tap_target = %tap_target,
+                    copy_trace_id = %copy.routing.trace_id,
+                    "router tap copy forwarded (peer router)"
+                );
             }
             ResolvedRoute::ForwardHive(remote_hive) => {
                 drop(nodes_guard);
@@ -1459,6 +1479,14 @@ async fn fanout_taps_for_unicast(
                     &src_handle.sender,
                 )
                 .await;
+                tracing::info!(
+                    tap_src = %src_name,
+                    tap_dst = %dst_name_owned,
+                    tap_target = %tap_target,
+                    remote_hive = %remote_hive,
+                    copy_trace_id = %copy.routing.trace_id,
+                    "router tap copy forwarded (remote hive)"
+                );
             }
         }
     }
