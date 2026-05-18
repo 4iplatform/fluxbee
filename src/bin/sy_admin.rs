@@ -4161,8 +4161,7 @@ async fn handle_http(
             // target, mode, enabled).
             let tap: serde_json::Value = serde_json::from_slice(&body)?;
             let hive = query.get("hive").cloned();
-            let (status, resp) =
-                handle_admin_command(ctx, client, "add_tap", tap, hive).await?;
+            let (status, resp) = handle_admin_command(ctx, client, "add_tap", tap, hive).await?;
             respond_json(stream, status, &resp).await?;
         }
         ("DELETE", "/taps") => {

@@ -1078,11 +1078,7 @@ impl ConfigRegionWriter {
     /// ROUTER-TAP-2: replace the entire taps section with `taps`. Same
     /// write semantics as routes/vpns: seqlock-guarded, zeroed empty slots,
     /// optional config_version bump for change notification consumers.
-    pub fn write_taps(
-        &mut self,
-        taps: &[TapEntry],
-        bump_version: bool,
-    ) -> Result<(), ShmError> {
+    pub fn write_taps(&mut self, taps: &[TapEntry], bump_version: bool) -> Result<(), ShmError> {
         if taps.len() > MAX_TAP_ENTRIES as usize {
             return Err(ShmError::ValueTooLong {
                 len: taps.len(),

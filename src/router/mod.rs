@@ -1363,27 +1363,20 @@ async fn fanout_taps_for_unicast(
         copy.routing.trace_id = Uuid::new_v4().to_string();
 
         let nodes_guard = nodes.lock().await;
-        let resolved = match resolve_by_name(
-            tap_target,
-            src_handle,
-            &nodes_guard,
-            fib,
-            &copy.meta,
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(err) => {
-                tracing::warn!(
-                    tap_src = %src_name,
-                    tap_dst = %dst_name_owned,
-                    tap_target = %tap_target,
-                    error = %err,
-                    "router tap copy: name resolution failed, dropping copy"
-                );
-                continue;
-            }
-        };
+        let resolved =
+            match resolve_by_name(tap_target, src_handle, &nodes_guard, fib, &copy.meta).await {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!(
+                        tap_src = %src_name,
+                        tap_dst = %dst_name_owned,
+                        tap_target = %tap_target,
+                        error = %err,
+                        "router tap copy: name resolution failed, dropping copy"
+                    );
+                    continue;
+                }
+            };
         match resolved {
             ResolvedRoute::Drop => {
                 tracing::warn!(

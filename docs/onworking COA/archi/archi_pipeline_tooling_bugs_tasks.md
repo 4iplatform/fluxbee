@@ -225,6 +225,30 @@ Implementation note 2026-05-17:
 - `SY.admin` action help for `run_node` now states that `wf.engine` is not valid for direct `WF.*` spawn.
 - Archi platform facts and handbook now distinguish WF base runtime from concrete workflow package runtime.
 
+### [x] ARCHI-BUG-9 — `fluxbee_system_get` advertises taps path but cannot translate it
+
+Observed log:
+
+- Operator asks Archi to list configured taps.
+- Archi calls `GET /hives/motherbee/taps`.
+- Tool fails with `unsupported system get path: GET /hives/motherbee/taps`.
+
+Problem:
+
+- `SY.admin` exposes `list_taps`, `add_tap`, and `delete_tap`.
+- `fluxbee_system_get` tool description advertised `/hives/{hive}/taps`.
+- `PlanCompilerLiveQueryTool` allowed `list_taps`.
+- But the SCMD translation table used by `fluxbee_system_get` had route/vpn mappings and no taps mapping, so the read path was unreachable from Archi chat.
+
+Expected behavior:
+
+- `fluxbee_system_get` on `GET /hives/{hive}/taps` translates to read-only admin action `list_taps`.
+
+Implementation note 2026-05-18:
+
+- Added `translate_scmd` mapping for `GET /hives/{hive}/taps -> list_taps`.
+- Added unit coverage for the translation.
+
 ### [x] ARCHI-BUG-12 — Storage/identity miss vault bootstrap broadcast due to ephemeral-connect-then-reconnect race
 
 Observed (2026-05-17, clean reinstall + restart cycle):

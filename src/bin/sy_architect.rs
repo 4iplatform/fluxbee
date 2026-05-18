@@ -2875,11 +2875,7 @@ impl LayerAssessmentStore {
         Self::default()
     }
 
-    async fn record(
-        &self,
-        layer: DesignerLayer,
-        outcome: LayerOutcome,
-    ) -> Result<(), String> {
+    async fn record(&self, layer: DesignerLayer, outcome: LayerOutcome) -> Result<(), String> {
         let mut guard = self.inner.lock().await;
         let next_expected = DesignerLayer::ALL.get(guard.len()).copied();
         match next_expected {
@@ -2972,14 +2968,11 @@ impl FunctionTool for AssessLayerTool {
             })?;
         let outcome = match outcome_str {
             "work" => {
-                let fragment = arguments
-                    .get("manifest_fragment")
-                    .cloned()
-                    .ok_or_else(|| {
-                        fluxbee_ai_sdk::AiSdkError::Protocol(
-                            "assess_layer outcome=work requires manifest_fragment".to_string(),
-                        )
-                    })?;
+                let fragment = arguments.get("manifest_fragment").cloned().ok_or_else(|| {
+                    fluxbee_ai_sdk::AiSdkError::Protocol(
+                        "assess_layer outcome=work requires manifest_fragment".to_string(),
+                    )
+                })?;
                 LayerOutcome::Work {
                     manifest_fragment: fragment,
                 }
@@ -3645,15 +3638,16 @@ async fn run_designer_with_context(
     // through the tool is recorded here in canonical order. The tool itself
     // already enforced order/uniqueness so this list mirrors the contract.
     let layer_records = layer_store.snapshot().await;
-    let trace_layer_outcomes: Vec<DesignerTraceLayerOutcome> =
-        layer_records.iter().map(DesignerTraceLayerOutcome::from).collect();
+    let trace_layer_outcomes: Vec<DesignerTraceLayerOutcome> = layer_records
+        .iter()
+        .map(DesignerTraceLayerOutcome::from)
+        .collect();
 
     let submitted = match submitted {
         Some(value) => value,
         None => {
             let error = if layer_records.len() < DesignerLayer::ALL.len() {
-                let assessed: Vec<&str> =
-                    layer_records.iter().map(|r| r.layer.as_str()).collect();
+                let assessed: Vec<&str> = layer_records.iter().map(|r| r.layer.as_str()).collect();
                 let missing: Vec<&str> = DesignerLayer::ALL
                     .iter()
                     .filter(|l| !assessed.contains(&l.as_str()))
@@ -4027,7 +4021,11 @@ fn inject_blocked_layer_findings_into_verdict(
         } = &record.outcome
         {
             let issue_key = format!("LAYER_BLOCKED:{}", record.layer.as_str());
-            if !verdict.blocking_issues.iter().any(|item| item == &issue_key) {
+            if !verdict
+                .blocking_issues
+                .iter()
+                .any(|item| item == &issue_key)
+            {
                 verdict.blocking_issues.push(issue_key.clone());
             }
             verdict.findings.push(DesignFinding {
@@ -12367,6 +12365,12 @@ fn translate_scmd(
             action: "delete_vpn".to_string(),
             target_hive: (*hive_id).to_string(),
             params: json!({ "pattern": pattern }),
+        }),
+        ("GET", ["hives", hive_id, "taps"]) => Ok(AdminTranslation {
+            admin_target,
+            action: "list_taps".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({}),
         }),
         ("GET", ["hives", hive_id, "deployments"]) => Ok(AdminTranslation {
             admin_target,
@@ -25519,6 +25523,16 @@ mod tests {
     }
 
     #[test]
+    fn translate_list_taps_scmd() {
+        let translated = translate_scmd("motherbee", parse("curl -X GET /hives/motherbee/taps"))
+            .expect("translation should succeed");
+
+        assert_eq!(translated.action, "list_taps");
+        assert_eq!(translated.target_hive, "motherbee");
+        assert_eq!(translated.params, json!({}));
+    }
+
+    #[test]
     fn translate_list_tenants_scmd() {
         let translated = translate_scmd(
             "motherbee",
@@ -26605,7 +26619,10 @@ mod tests {
         };
         // Missing layers should be listed.
         for missing in ["runtimes", "identity_secrets", "nodes", "routing", "logic"] {
-            assert!(msg.contains(missing), "expected '{missing}' in error: {msg}");
+            assert!(
+                msg.contains(missing),
+                "expected '{missing}' in error: {msg}"
+            );
         }
     }
 

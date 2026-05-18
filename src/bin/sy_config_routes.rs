@@ -785,10 +785,7 @@ async fn handle_admin_action(
                 .get("match_dst")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let target = payload
-                .get("target")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let target = payload.get("target").and_then(|v| v.as_str()).unwrap_or("");
             let before = sy_config.taps.len();
             sy_config.taps.retain(|t| {
                 !(t.match_src == match_src && t.match_dst == match_dst && t.target == target)
@@ -1072,10 +1069,8 @@ fn build_taps(taps: &[TapConfig]) -> Result<Vec<TapEntry>, Box<dyn std::error::E
     let mut out = Vec::new();
     for tap in taps {
         let mut entry = empty_tap_entry();
-        entry.match_src_len =
-            copy_bytes_with_len(&mut entry.match_src, &tap.match_src) as u16;
-        entry.match_dst_len =
-            copy_bytes_with_len(&mut entry.match_dst, &tap.match_dst) as u16;
+        entry.match_src_len = copy_bytes_with_len(&mut entry.match_src, &tap.match_src) as u16;
+        entry.match_dst_len = copy_bytes_with_len(&mut entry.match_dst, &tap.match_dst) as u16;
         entry.target_len = copy_bytes_with_len(&mut entry.target, &tap.target) as u16;
         entry.mode = tap_mode_kind(&tap.mode)?;
         entry.enabled = if tap.enabled { 1 } else { 0 };
