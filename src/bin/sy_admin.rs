@@ -8330,14 +8330,10 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         }),
         "set_ilk_definition" => serde_json::json!({
             "definition": {
-                "role_hash": "1111111111111111111111111111111111111111111111111111111111111111",
-                "skill_hashes": [
-                    "2222222222222222222222222222222222222222222222222222222222222222"
-                ],
-                "handbook_hashes": [
-                    "3333333333333333333333333333333333333333333333333333333333333333"
-                ],
-                "personality_hash": "4444444444444444444444444444444444444444444444444444444444444444"
+                "role_hash": null,
+                "skill_hashes": [],
+                "handbook_hashes": [],
+                "personality_hash": null
             }
         }),
         "remove_runtime_version" => serde_json::json!({
@@ -8394,7 +8390,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
             "curl -X GET /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000"
         }
         "set_ilk_definition" => {
-            r#"curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{"definition":{"role_hash":"1111111111111111111111111111111111111111111111111111111111111111","skill_hashes":["2222222222222222222222222222222222222222222222222222222222222222"],"handbook_hashes":["3333333333333333333333333333333333333333333333333333333333333333"]}}'"#
+            r#"curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{"definition":{"role_hash":null,"skill_hashes":[],"handbook_hashes":[],"personality_hash":null}}'"#
         }
         "list_tenants" => "curl -X GET /hives/motherbee/identity/tenants",
         "get_tenant" => {
