@@ -19,6 +19,7 @@
 - [x] el nodo debe monitorear estados de sus ICHs propios
 - [x] la correlación efectiva del nodo se toma como `adapter_id + event_id`
 - [x] el adapter es responsable de construir `external_profile_id` canónico
+- [x] el estado interno del profile queda alineado al lenguaje de identity: `temporary | partial | complete`
 
 ---
 
@@ -101,6 +102,7 @@ Nota:
 
 - en esta etapa el monitoreo de promoción corre de forma oportunista durante los polls/beacons del adapter;
 - no hay todavía watcher dedicado ni loop separado de observación continua.
+- internamente el nodo ya persiste y evalúa el estado del profile con `temporary | partial | complete`; la semántica de “listo/utilizable” se deriva de `complete`.
 
 ---
 
