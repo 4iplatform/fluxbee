@@ -19,7 +19,8 @@ use fluxbee_ai_sdk::{
 };
 use fluxbee_sdk::node_client::NodeError;
 use fluxbee_sdk::protocol::{
-    Destination, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
+    Destination, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest, MSG_TTL_EXCEEDED,
+    MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::{managed_node_config_path, managed_node_name};
 use fluxbee_sdk::{MSG_ILK_REGISTER, MSG_TNT_CREATE};
@@ -923,6 +924,10 @@ impl Default for ControlPlaneState {
 #[async_trait]
 impl AiNode for GenericAiNode {
     async fn on_message(&self, msg: Message) -> fluxbee_ai_sdk::Result<Option<Message>> {
+        if is_vault_secret_changed(&msg) {
+            self.handle_vault_secret_changed(&msg).await;
+            return Ok(None);
+        }
         if is_control_plane(&msg) {
             return self.handle_control_plane(msg).await;
         }
@@ -1741,6 +1746,72 @@ impl GenericAiNode {
                 tracing::warn!(error = %err, "frontdesk-gov vault resource lookup failed");
                 (None, OpenAiApiKeySource::Missing)
             }
+        }
+    }
+
+    async fn handle_vault_secret_changed(&self, msg: &Message) {
+        let payload: VaultSecretChangedPayload = match serde_json::from_value(msg.payload.clone()) {
+            Ok(payload) => payload,
+            Err(err) => {
+                tracing::warn!(
+                    node_name = %self.node_name,
+                    trace_id = %msg.routing.trace_id,
+                    error = %err,
+                    "frontdesk-gov ignoring malformed VAULT_SECRET_CHANGED payload"
+                );
+                return;
+            }
+        };
+        let interest = VaultSecretInterest {
+            resource_type: fluxbee_sdk::ResourceType::Openai.as_str(),
+            my_tenant: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+            my_ilk: self.self_ilk_id.as_deref(),
+            system_caller: true,
+        };
+        if !payload.matches_interest(&interest) {
+            tracing::info!(
+                node_name = %self.node_name,
+                trace_id = %msg.routing.trace_id,
+                resource_type = %payload.resource_type,
+                payload_tenant = %payload.tenant_id,
+                payload_ilk = ?payload.ilk,
+                my_tenant = fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+                my_ilk = ?self.self_ilk_id,
+                "frontdesk-gov VAULT_SECRET_CHANGED does not match interest; ignoring"
+            );
+            return;
+        }
+
+        if matches!(payload.op, fluxbee_sdk::protocol::VaultSecretOp::Delete) {
+            tracing::warn!(
+                node_name = %self.node_name,
+                trace_id = %msg.routing.trace_id,
+                key = %payload.key,
+                version = payload.version,
+                "frontdesk-gov OpenAI vault secret delete matched; next OpenAI call will fail until secret is restored"
+            );
+            return;
+        }
+
+        let resolved = self.resolve_openai_api_key().await.is_some();
+        if resolved {
+            tracing::info!(
+                node_name = %self.node_name,
+                trace_id = %msg.routing.trace_id,
+                op = %payload.op.as_str(),
+                key = %payload.key,
+                version = payload.version,
+                "frontdesk-gov OpenAI vault secret changed; vault probe succeeded"
+            );
+        } else {
+            tracing::warn!(
+                node_name = %self.node_name,
+                trace_id = %msg.routing.trace_id,
+                op = %payload.op.as_str(),
+                key = %payload.key,
+                version = payload.version,
+                "frontdesk-gov OpenAI vault secret changed but vault probe did not resolve a usable api_key"
+            );
         }
     }
 
@@ -3650,6 +3721,11 @@ fn materialize_runtime_defaults(runtime: &mut EffectiveRuntimeSection) {
 fn is_control_plane(msg: &Message) -> bool {
     msg.meta.msg_type.eq_ignore_ascii_case("system")
         || msg.meta.msg_type.eq_ignore_ascii_case("admin")
+}
+
+fn is_vault_secret_changed(msg: &Message) -> bool {
+    msg.meta.msg_type.eq_ignore_ascii_case(SYSTEM_KIND)
+        && msg.meta.msg.as_deref() == Some(MSG_VAULT_SECRET_CHANGED)
 }
 
 fn build_control_plane_response(msg: &Message, response_msg: &str, payload: Value) -> Message {
