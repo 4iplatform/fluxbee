@@ -6,6 +6,7 @@
 > Estado: v0 / definiciones básicas.
 >
 > Objetivo: fijar el alcance, responsabilidades, supuestos y decisiones base del adapter para poder avanzar sobre diseño detallado e implementación.
+> 2026-05-15: Nota importante. Esta documentación se preparó antes de los cambios del monitor de LH. Antes de avanzar con este documento (ya sea para re-definir o implementarlo) es **OBLIGATORIO** revisar si todos los conceptos aquí establecidos siguen siendo vigentes
 
 ---
 

@@ -851,6 +851,18 @@ fn linkedhelper_contact_channel() -> &'static str {
     "linkedhelper_contact"
 }
 
+fn normalize_registration_status(status: &str) -> &'static str {
+    match status.trim() {
+        "complete" => "complete",
+        "partial" => "partial",
+        _ => "temporary",
+    }
+}
+
+fn profile_is_usable(status: &str) -> bool {
+    normalize_registration_status(status).eq("complete")
+}
+
 fn default_identity_target_for_hive(hive_id: &str) -> String {
     format!("SY.identity@{}", hive_id.trim())
 }
@@ -1160,27 +1172,27 @@ fn refresh_pending_profiles_for_adapter(
             &existing.tenant_id,
         ) {
             Ok(Some(resolved))
-                if resolved.ilk.registration_status.eq_ignore_ascii_case("complete") =>
+                if normalize_registration_status(&resolved.ilk.registration_status).eq("complete") =>
             {
-                let was_ready = existing.status.eq_ignore_ascii_case("ready");
+                let was_complete = profile_is_usable(&existing.status);
                 durable_state.upsert_profile(
                     &existing.adapter_id,
                     &existing.tenant_id,
                     &existing.external_profile_id,
                     Some(resolved.ilk.ilk_id.clone()),
                     Some(resolved.ich_id.clone()),
-                    "ready",
+                    "complete",
                     existing.display_name.clone(),
                     existing.metadata.clone(),
                 );
-                if !was_ready {
+                if !was_complete {
                     tracing::info!(
                         node_name = %state.node_name,
                         adapter_id = %existing.adapter_id,
                         external_profile_id = %existing.external_profile_id,
                         ilk_id = %resolved.ilk.ilk_id,
                         ich_id = %resolved.ich_id,
-                        "linkedhelper profile promoted to ready"
+                        "linkedhelper profile promoted to complete/usable"
                     );
                     durable_state.enqueue_pending_delivery(
                         &existing.adapter_id,
@@ -1218,11 +1230,7 @@ fn refresh_pending_profiles_for_adapter(
             Ok(Some(resolved)) => {
                 let ilk_id = resolved.ilk.ilk_id.clone();
                 let ich_id = resolved.ich_id.clone();
-                let next_status = if existing.status.eq_ignore_ascii_case("ready") {
-                    "ready"
-                } else {
-                    "pending_promotion"
-                };
+                let next_status = normalize_registration_status(&resolved.ilk.registration_status);
                 durable_state.upsert_profile(
                     &existing.adapter_id,
                     &existing.tenant_id,
@@ -1386,11 +1394,7 @@ async fn process_profile_create(
                 external_profile_id,
                 Some(resolved.ilk.ilk_id.clone()),
                 Some(resolved.ich_id.clone()),
-                if resolved.ilk.registration_status.eq_ignore_ascii_case("complete") {
-                    "ready"
-                } else {
-                    "pending_promotion"
-                },
+                normalize_registration_status(&resolved.ilk.registration_status),
                 Some(display_name.to_string()),
                 payload.metadata.clone(),
             );
@@ -1409,7 +1413,7 @@ async fn process_profile_create(
                 adapter_id: runtime.adapter_id.clone(),
                 event_id: item.id.clone(),
             });
-            if resolved.ilk.registration_status.eq_ignore_ascii_case("complete") {
+            if normalize_registration_status(&resolved.ilk.registration_status).eq("complete") {
                 responses.push(ResponseItem::Result {
                     response_id: format!("resp:{request_id}:{event_id}:ready"),
                     adapter_id: runtime.adapter_id.clone(),
@@ -1443,7 +1447,7 @@ async fn process_profile_create(
                     external_profile_id,
                     Some(src_ilk.clone()),
                     None,
-                    "pending_promotion",
+                    "temporary",
                     Some(display_name.to_string()),
                     payload.metadata.clone(),
                 );
@@ -1574,7 +1578,7 @@ async fn process_conversation_message(
         return;
     };
 
-    if !profile.status.eq_ignore_ascii_case("ready") {
+    if !profile_is_usable(&profile.status) {
         tracing::info!(
             node_name = %state.node_name,
             adapter_id = %runtime.adapter_id,
