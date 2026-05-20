@@ -7535,6 +7535,16 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
         )],
         "node_control_config_set" => vec![
             admin_action_body_field(
+                "node_name",
+                "string",
+                "Target node L2 name (must match the path's node_name).",
+            ),
+            admin_action_body_field(
+                "subsystem",
+                "string",
+                "Node-defined subsystem string the node uses to route the CONFIG_SET internally (e.g. 'ai_node' for AI nodes, 'routes'/'vpns'/'taps' for SY.config.routes, 'opa' for SY.opa.rules). Required; varies by target node.",
+            ),
+            admin_action_body_field(
                 "schema_version",
                 "u32",
                 "Schema version understood by the node.",
@@ -8132,6 +8142,8 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "requested_by": "archi"
         }),
         "node_control_config_set" => serde_json::json!({
+            "node_name": "AI.sales@motherbee",
+            "subsystem": "ai_node",
             "schema_version": 1,
             "config_version": 7,
             "apply_mode": "replace",
@@ -8383,7 +8395,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
             r#"curl -X POST /hives/motherbee/nodes/WF.invoice@motherbee/control/config-get -d '{"requested_by":"archi"}'"#
         }
         "node_control_config_set" => {
-            r#"curl -X POST /hives/motherbee/nodes/WF.invoice@motherbee/control/config-set -d '{"schema_version":1,"config_version":2,"apply_mode":"replace","config":{"sy_timer_l2_name":"SY.timer@motherbee"}}'"#
+            r#"curl -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-set -d '{"node_name":"AI.sales@motherbee","subsystem":"ai_node","schema_version":1,"config_version":7,"apply_mode":"replace","config":{"behavior":{"kind":"openai_chat","model":"gpt-4.1-mini"}}}'"#
         }
         "list_ilks" => "curl -X GET /hives/motherbee/identity/ilks",
         "get_ilk" => {
@@ -10477,6 +10489,32 @@ async fn handle_send_node_message(
     ))
 }
 
+/// Pull the most useful (error_code, error_detail) pair out of a node's
+/// CONFIG_RESPONSE error payload. Nodes typically reply with
+/// `error: { code: "...", message: "..." }` or `error: { reason: "..." }`;
+/// we tolerate both and fall back to a generic code so the admin envelope
+/// always carries something operator-visible.
+fn extract_node_error_code_and_detail(
+    node_error: &serde_json::Value,
+    node_response: &serde_json::Value,
+) -> (String, String) {
+    let code = node_error
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| node_error.get("error_code").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .unwrap_or_else(|| "NODE_REJECTED_CONFIG".to_string());
+    let detail = node_error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| node_error.get("error_detail").and_then(serde_json::Value::as_str))
+        .or_else(|| node_error.get("reason").and_then(serde_json::Value::as_str))
+        .or_else(|| node_response.get("message").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .unwrap_or_else(|| "node rejected the config control request".to_string());
+    (code, detail)
+}
+
 async fn handle_node_control_command(
     ctx: &AdminContext,
     client: &AdminRouterClient,
@@ -10580,6 +10618,35 @@ async fn handle_node_control_command(
                 .get("error")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
+            // The transport succeeded (we got a CONFIG_RESPONSE back) but the
+            // node may have rejected the request (node_ok=false). Surface that
+            // as a top-level error so the admin executor / archi see the
+            // failure, not just "transport OK". Without this, a malformed
+            // CONFIG_SET (missing subsystem, wrong shape, etc.) reports
+            // success at the admin envelope while the node never applied it.
+            if !node_ok {
+                let (error_code, error_detail) =
+                    extract_node_error_code_and_detail(&node_error, &node_response);
+                return Ok((
+                    422,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": action,
+                        "payload": {
+                            "target": target_hive,
+                            "node_name": node_name,
+                            "request_msg": request_msg,
+                            "response_msg": "CONFIG_RESPONSE",
+                            "node_ok": node_ok,
+                            "node_error": node_error,
+                            "response": node_response,
+                        },
+                        "error_code": error_code,
+                        "error_detail": error_detail,
+                    })
+                    .to_string(),
+                ));
+            }
             Ok((
                 200,
                 serde_json::json!({
