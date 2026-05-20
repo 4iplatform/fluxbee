@@ -12371,6 +12371,30 @@ fn translate_scmd(
             target_hive: (*hive_id).to_string(),
             params: json!({}),
         }),
+        ("POST", ["hives", hive_id, "taps"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for add_tap must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "add_tap".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("DELETE", ["hives", hive_id, "taps"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for delete_tap must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "delete_tap".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
         ("GET", ["hives", hive_id, "deployments"]) => Ok(AdminTranslation {
             admin_target,
             action: "get_deployments".to_string(),
