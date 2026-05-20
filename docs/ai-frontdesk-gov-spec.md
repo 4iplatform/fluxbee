@@ -323,7 +323,8 @@ Estado vigente:
 - usa el runner compartido con `CONFIG_GET` / `CONFIG_SET`;
 - si `behavior.instructions` falta, usa prompt base embebido;
 - si corre como servicio del sistema sin YAML de nodo, bootstrappea `node_name` desde `hive.yaml` como `SY.frontdesk.gov@<hive_id>`;
-- la key del provider se materializa localmente en `secrets.json`.
+- la key del provider se resuelve exclusivamente desde `SY.vault` con `resource_type=openai`;
+- `CONFIG_SET` rechaza campos de secreto; la carga de credenciales se hace por el canal de vault.
 
 ## 12. Observabilidad minima
 
