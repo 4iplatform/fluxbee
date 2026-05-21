@@ -187,7 +187,7 @@ Consecuencia:
 Lectura ajustada al estado real actual del repo:
 
 - `IO.api` ya lee `self_ilk_id` y `self_tenant_id` desde env al boot;
-- hoy esos valores quedan disponibles para observabilidad/runtime, pero no fijan por sí solos un registro explícito del `ICH` local de la instancia;
+- hoy esos valores también se usan para asegurar el alta del `ICH` propio de la instancia vía `ILK_ADD_CHANNEL`;
 - el material local más concreto que hoy ya participa del path operativo es el `listen.address`, usado como `entrypoint` del `IoContext`;
 - el cálculo actual de `thread_id` para `IO.api` ya usa `ThreadIdInput::PersistentChannel` con:
   - `channel_type = "api"`
@@ -197,23 +197,29 @@ Lectura ajustada al estado real actual del repo:
 Conclusión práctica:
 
 - la continuidad conversacional ya incorpora material local del canal;
-- el gap actual no está en `thread_id`;
-- el gap pendiente es definir y eventualmente resolver/registrar de manera más explícita el `ICH` propio de la instancia `IO.api`.
+- `meta.ich` ya se alinea al asset local de ingreso;
+- el `ICH` propio de la instancia ya se intenta registrar explícitamente contra identity usando `self_ilk_id + listen.address`.
 
-### 3.6 Gap actual bloqueado por core
+### 3.6 Estado actual del alta de ICH propio
 
-Con el estado actual del core, `IO.api` no puede cerrar por sí solo el registro explícito de su `ICH` propio en identity.
+El camino operativo actual para `IO.api` es:
 
-Motivo:
+- usar `self_ilk_id` y `self_tenant_id` inyectados al boot;
+- calcular un `ich_id` estable a partir de `channel_type + address + tenant`;
+- solicitar `ILK_ADD_CHANNEL` a `SY.identity` con:
+  - `channel_type = "io_api_instance"`
+  - `address = listen.address`
+  - `ilk_id = self_ilk_id`
 
-- el camino correcto sería usar el `self_ilk_id` de la instancia para asociarle un canal propio mediante `ILK_ADD_CHANNEL`;
-- hoy ese camino existe en core/SDK, pero la autorización vigente no está abierta para que `IO.api` lo ejecute como nodo IO general.
+Si el alta falla:
 
-Decisión actual:
+- el nodo marca `FAILED_CONFIG` al boot;
+- y en `CONFIG_SET` rechaza el cambio de `listen` si no puede asegurar el `ICH` correspondiente.
 
-- no implementar un `ICH` sintético puramente local como workaround;
-- mantener resuelto el carrier conversacional (`thread_id`) y `meta.ich` en el plano IO;
-- dejar el registro explícito del `ICH` propio de la instancia como gap pendiente de core.
+Gap residual:
+
+- la validación local de `SY.identity` queda condicionada al entorno de build disponible;
+- pero el contrato ya no está bloqueado conceptualmente por core para `IO.api`.
 
 ---
 

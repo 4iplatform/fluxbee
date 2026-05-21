@@ -10,7 +10,8 @@ use fluxbee_sdk::protocol::{
     SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    NodeError, NodeReceiver, NodeSender, MSG_ILK_PROVISION, MSG_ILK_PROVISION_RESPONSE,
+    stable_ich_id, NodeError, NodeReceiver, NodeSender, MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION,
+    MSG_ILK_PROVISION_RESPONSE,
 };
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -179,12 +180,14 @@ pub async fn strict_provision_ilk(
     let normalized_channel = normalize_identity_field(&input.channel, true);
     let normalized_address = normalize_identity_field(&input.external_id, true);
     let trace_id = Uuid::new_v4().to_string();
+    let ich_id = stable_ich_id(
+        &normalized_channel,
+        &normalized_address,
+        input.tenant_id.as_deref().unwrap_or(""),
+    )
+    .map_err(|err| IdentityError::Other(format!("invalid provision ICH seed: {err}")))?;
     let mut payload = serde_json::json!({
-        "ich_id": stable_ich_id(
-            &normalized_channel,
-            &normalized_address,
-            input.tenant_id.as_deref().unwrap_or(""),
-        ),
+        "ich_id": ich_id,
         "channel_type": normalized_channel,
         "address": normalized_address,
     });
@@ -207,7 +210,7 @@ pub async fn strict_provision_ilk(
     let req = WireMessage {
         routing: Routing {
             src: sender.uuid().to_string(),
-            src_l2_name: None,
+            src_l2_name: Some(sender.full_name().to_string()),
             dst: Destination::Unicast(target.to_string()),
             ttl: 16,
             trace_id: trace_id.clone(),
@@ -243,6 +246,127 @@ pub async fn strict_provision_ilk(
         "identity provision response matched"
     );
     parse_provision_response(msg)
+}
+
+#[derive(Debug, Clone)]
+pub struct EnsureOwnIchResult {
+    pub ilk_id: String,
+    pub ich_id: String,
+    pub owner_l2_name: Option<String>,
+    pub enabled: bool,
+}
+
+pub async fn ensure_own_ich(
+    sender: &NodeSender,
+    inbox: Arc<Mutex<RouterInbox>>,
+    config: &IdentityProvisionConfig,
+    target: &str,
+    self_ilk_id: &str,
+    self_tenant_id: &str,
+    channel_type: &str,
+    address: &str,
+) -> Result<EnsureOwnIchResult, IdentityError> {
+    let normalized_channel = normalize_identity_field(channel_type, true);
+    let normalized_address = normalize_identity_field(address, true);
+    let normalized_self_ilk_id = self_ilk_id.trim();
+    let normalized_self_tenant_id = self_tenant_id.trim();
+    if normalized_self_ilk_id.is_empty()
+        || normalized_self_tenant_id.is_empty()
+        || normalized_channel.is_empty()
+        || normalized_address.is_empty()
+    {
+        return Err(IdentityError::Other(
+            "self_ilk_id, self_tenant_id, channel_type and address must be non-empty".to_string(),
+        ));
+    }
+    let ich_id = stable_ich_id(
+        &normalized_channel,
+        &normalized_address,
+        normalized_self_tenant_id,
+    )
+    .map_err(|err| IdentityError::Other(format!("invalid own ICH seed: {err}")))?;
+    let trace_id = Uuid::new_v4().to_string();
+    let req = WireMessage {
+        routing: Routing {
+            src: sender.uuid().to_string(),
+            src_l2_name: Some(sender.full_name().to_string()),
+            dst: Destination::Unicast(target.to_string()),
+            ttl: 16,
+            trace_id: trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(MSG_ILK_ADD_CHANNEL.to_string()),
+            src_ilk: None,
+            scope: None,
+            target: None,
+            action: None,
+            priority: None,
+            context: None,
+            ..Meta::default()
+        },
+        payload: serde_json::json!({
+            "ilk_id": normalized_self_ilk_id,
+            "channel": {
+                "ich_id": ich_id,
+                "type": normalized_channel,
+                "address": normalized_address,
+            }
+        }),
+    };
+    let mut inbox = inbox.lock().await;
+    sender.send(req).await.map_err(|_| IdentityError::Unavailable)?;
+    let msg = inbox.recv_for_trace_id(&trace_id, config.timeout).await?;
+    if msg.meta.msg.as_deref() != Some("ILK_ADD_CHANNEL_RESPONSE") {
+        if msg.meta.msg.as_deref() == Some(MSG_UNREACHABLE)
+            || msg.meta.msg.as_deref() == Some(MSG_TTL_EXCEEDED)
+        {
+            return Err(IdentityError::Unavailable);
+        }
+        return Err(IdentityError::Other(
+            "invalid ILK_ADD_CHANNEL response".to_string(),
+        ));
+    }
+    let status = msg
+        .payload
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !status.eq_ignore_ascii_case("ok") {
+        let code = msg
+            .payload
+            .get("error_code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("error");
+        return Err(IdentityError::Other(format!(
+            "ILK_ADD_CHANNEL rejected: {code}"
+        )));
+    }
+    let ilk_id = msg
+        .payload
+        .get("ilk_id")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| IdentityError::Other("ILK_ADD_CHANNEL response missing ilk_id".to_string()))?
+        .to_string();
+    let owner_l2_name = msg
+        .payload
+        .get("owner_l2_name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+    let enabled = msg
+        .payload
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Ok(EnsureOwnIchResult {
+        ilk_id,
+        ich_id,
+        owner_l2_name,
+        enabled,
+    })
 }
 
 #[async_trait]
@@ -310,20 +434,6 @@ fn parse_provision_response(msg: WireMessage) -> Result<String, IdentityError> {
     ))
 }
 
-fn stable_ich_id(channel: &str, external_id: &str, tenant_id: &str) -> String {
-    // Canonical identity ids in Fluxbee use prefixed UUIDs (`ich:<uuid>`).
-    // Include tenant in the UUIDv5 seed so equivalent `(channel, external_id)`
-    // pairs in different tenants never collide.
-    let key = format!(
-        "{}:{}:{}",
-        tenant_id.trim().to_ascii_lowercase(),
-        channel,
-        external_id
-    );
-    let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, key.as_bytes());
-    format!("ich:{uuid}")
-}
-
 fn normalize_identity_field(value: &str, lowercase: bool) -> String {
     let trimmed = value.trim();
     if lowercase {
@@ -339,22 +449,28 @@ mod tests {
 
     #[test]
     fn stable_ich_id_is_deterministic() {
-        let a = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a");
-        let b = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a");
+        let a = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a")
+            .expect("stable ich id");
+        let b = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a")
+            .expect("stable ich id");
         assert_eq!(a, b);
     }
 
     #[test]
     fn stable_ich_id_changes_when_input_changes() {
-        let a = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a");
-        let b = stable_ich_id("sim-new", "user.provision.abc2", "tnt:tenant-a");
+        let a = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a")
+            .expect("stable ich id");
+        let b = stable_ich_id("sim-new", "user.provision.abc2", "tnt:tenant-a")
+            .expect("stable ich id");
         assert_ne!(a, b);
     }
 
     #[test]
     fn stable_ich_id_changes_when_tenant_changes() {
-        let a = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a");
-        let b = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-b");
+        let a = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a")
+            .expect("stable ich id");
+        let b = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-b")
+            .expect("stable ich id");
         assert_ne!(a, b);
     }
 }

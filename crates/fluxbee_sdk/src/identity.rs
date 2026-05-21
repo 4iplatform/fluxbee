@@ -74,6 +74,26 @@ pub struct IlkProvisionResult {
 }
 
 #[derive(Debug, Clone)]
+pub struct IlkAddChannelRequest<'a> {
+    pub target: &'a str,
+    pub ilk_id: &'a str,
+    pub ich_id: &'a str,
+    pub channel_type: &'a str,
+    pub address: &'a str,
+    pub change_reason: Option<&'a str>,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct IlkAddChannelResult {
+    pub ilk_id: String,
+    pub ich_id: String,
+    pub owner_l2_name: Option<String>,
+    pub enabled: bool,
+    pub trace_id: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct IdentitySystemRequest<'a> {
     pub target: &'a str,
     pub fallback_target: Option<&'a str>,
@@ -582,6 +602,90 @@ pub async fn set_ich_enabled(
         ich_id,
         enabled,
         owner_l2_name,
+        trace_id: out.trace_id,
+    })
+}
+
+pub fn stable_ich_id(channel_type: &str, address: &str, tenant_id: &str) -> Result<String, IdentityError> {
+    let channel_type = channel_type.trim().to_ascii_lowercase();
+    let address = address.trim().to_ascii_lowercase();
+    let tenant_id = tenant_id.trim().to_ascii_lowercase();
+    if channel_type.is_empty() || address.is_empty() || tenant_id.is_empty() {
+        return Err(IdentityError::InvalidRequest(
+            "channel_type, address and tenant_id must be non-empty".to_string(),
+        ));
+    }
+    let key = format!("{tenant_id}:{channel_type}:{address}");
+    let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, key.as_bytes());
+    Ok(format!("ich:{uuid}"))
+}
+
+pub async fn add_channel_to_ilk(
+    sender: &NodeSender,
+    receiver: &mut NodeReceiver,
+    request: IlkAddChannelRequest<'_>,
+) -> Result<IlkAddChannelResult, IdentityError> {
+    let target = request.target.trim();
+    let ilk_id = request.ilk_id.trim();
+    let ich_id = request.ich_id.trim();
+    let channel_type = request.channel_type.trim();
+    let address = request.address.trim();
+    if ilk_id.is_empty() || ich_id.is_empty() || channel_type.is_empty() || address.is_empty() {
+        return Err(IdentityError::InvalidRequest(
+            "ilk_id, ich_id, channel_type and address must be non-empty".to_string(),
+        ));
+    }
+    let mut payload = json!({
+        "ilk_id": ilk_id,
+        "channel": {
+            "ich_id": ich_id,
+            "type": channel_type,
+            "address": address,
+        }
+    });
+    if let Some(change_reason) = request
+        .change_reason
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        payload["change_reason"] = json!(change_reason);
+    }
+    let out = identity_system_call_ok(
+        sender,
+        receiver,
+        IdentitySystemRequest {
+            target,
+            fallback_target: None,
+            action: MSG_ILK_ADD_CHANNEL,
+            payload,
+            timeout: request.timeout,
+        },
+    )
+    .await?;
+    let ilk_id = out
+        .payload
+        .get("ilk_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| IdentityError::InvalidResponse("missing ilk_id".to_string()))?
+        .to_string();
+    let enabled = out
+        .payload
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let owner_l2_name = out
+        .payload
+        .get("owner_l2_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    Ok(IlkAddChannelResult {
+        ilk_id,
+        ich_id: ich_id.to_string(),
+        owner_l2_name,
+        enabled,
         trace_id: out.trace_id,
     })
 }

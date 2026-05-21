@@ -42,6 +42,7 @@ Lectura ajustada al estado real actual del repo:
 
 - `IO.slack` ya lee `self_ilk_id` y `self_tenant_id` desde env al boot;
 - a diferencia de otros nodos IO, hoy esos valores sí se usan operacionalmente para resolver credenciales `slack` en `SY.vault` y para el loop de refresh;
+- además, ahora se usan para asegurar el alta del `ICH` propio del workspace cuando entra tráfico Slack;
 - el material local más concreto del canal ya está representado por `team_id` / workspace, que entra en `IoContext.entrypoint`;
 - el cálculo actual de `thread_id` ya usa material local del canal:
   - `NativeThread(channel_type=\"slack\", entrypoint_id=team_id, native_thread_id=thread_ts)` cuando existe thread nativo;
@@ -51,22 +52,30 @@ Conclusión práctica:
 
 - la continuidad conversacional ya incorpora correctamente material local del workspace;
 - el runtime ya usa `self_ilk_id/self_tenant_id` de forma efectiva para su operación;
-- el gap pendiente no está en `thread_id`, sino en la explicitación y eventual registro más homogéneo del `ICH` propio de la instancia/canal Slack.
+- `meta.ich` ya se alinea al workspace local;
+- el `ICH` propio del workspace ya se intenta registrar explícitamente contra identity usando `self_ilk_id + team_id`.
 
-### 2.3 Gap actual bloqueado por core
+### 2.3 Estado actual del alta de ICH propio
 
-Con el estado actual del core, `IO.slack` no puede cerrar por sí solo el registro explícito de su `ICH` propio en identity.
+El camino operativo actual para `IO.slack` es:
 
-Motivo:
+- usar `self_ilk_id` y `self_tenant_id` inyectados al boot;
+- calcular un `ich_id` estable a partir de `channel_type + address + tenant`;
+- solicitar `ILK_ADD_CHANNEL` a `SY.identity` con:
+  - `channel_type = "slack_workspace"`
+  - `address = team_id`
+  - `ilk_id = self_ilk_id`
 
-- el camino correcto sería usar el `self_ilk_id` de la instancia para asociarle su canal propio mediante `ILK_ADD_CHANNEL`;
-- hoy ese camino existe en core/SDK, pero la autorización vigente no está abierta para que `IO.slack` lo ejecute como nodo IO general.
+Si el alta falla:
 
-Decisión actual:
+- el nodo no procesa ese evento inbound;
+- registra `warn` con el `team_id`;
+- y espera al próximo evento para reintentar.
 
-- no implementar un `ICH` sintético puramente local como workaround;
-- mantener resuelto el uso de `team_id`/workspace en `thread_id` y `meta.ich`;
-- dejar el registro explícito del `ICH` propio de la instancia/canal Slack como gap pendiente de core.
+Gap residual:
+
+- la validación local de `SY.identity` queda condicionada al entorno de build disponible;
+- la resolución homogénea para otros nodos IO sigue pendiente.
 
 ---
 

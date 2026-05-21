@@ -52,7 +52,9 @@ use io_common::io_control_plane_logging::{
 use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
 use io_common::io_control_plane_store::persist_io_control_plane_state;
 use io_common::provision::strict_provision_ilk;
-use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig, RouterInbox};
+use io_common::provision::{
+    ensure_own_ich, FluxbeeIdentityProvisioner, IdentityProvisionConfig, RouterInbox,
+};
 use io_common::relay::{
     AssembledTurn, InMemoryRelayStore, RelayBuffer, RelayDecision, RelayFlushHints, RelayFragment,
 };
@@ -182,6 +184,11 @@ struct RuntimeUpdateHandles {
     node_name: String,
     inbound: Arc<Mutex<InboundProcessor>>,
     relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
+    sender: fluxbee_sdk::NodeSender,
+    router_inbox: Arc<Mutex<RouterInbox>>,
+    identity_provision_cfg: IdentityProvisionConfig,
+    self_ilk_id: Option<String>,
+    self_tenant_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -394,6 +401,31 @@ async fn main() -> Result<()> {
         blob_toolkit,
         blob_payload_cfg,
     });
+
+    if let Err(err) = ensure_io_api_own_ich_registered(
+        &config.node_name,
+        &config.listen_addr,
+        &sender,
+        inbox.clone(),
+        &identity_provision_cfg,
+        self_ilk_id.as_deref(),
+        self_tenant_id.as_deref(),
+    )
+    .await
+    {
+        let mut state = control_plane.write().await;
+        state.current_state = IoNodeLifecycleState::FailedConfig;
+        state.last_error = Some(IoControlPlaneErrorInfo {
+            code: "ich_registration_failed".to_string(),
+            message: err.to_string(),
+        });
+        tracing::warn!(
+            node_name = %config.node_name,
+            listen_addr = %config.listen_addr,
+            error = %err,
+            "io-api failed to ensure own ICH registration; starting in FAILED_CONFIG"
+        );
+    }
 
     let http_task = match try_bind_http_listener(
         &config.node_name,
@@ -1289,6 +1321,37 @@ async fn apply_io_config_set(
         apply_reinit.push("auth.api_keys".to_string());
     }
     if section_changed(previous_effective.as_ref(), &effective, &["listen"]) {
+        let next_listen_addr = extract_runtime_listen_addr(Some(&effective), "api");
+        if let Err(err) = ensure_io_api_own_ich_registered(
+            node_name,
+            &next_listen_addr,
+            &runtime_updates.sender,
+            runtime_updates.router_inbox.clone(),
+            &runtime_updates.identity_provision_cfg,
+            runtime_updates.self_ilk_id.as_deref(),
+            runtime_updates.self_tenant_id.as_deref(),
+        )
+        .await
+        {
+            let err_text = err.to_string();
+            state.current_state = IoNodeLifecycleState::FailedConfig;
+            state.last_error = Some(IoControlPlaneErrorInfo {
+                code: "ich_registration_failed".to_string(),
+                message: err_text.clone(),
+            });
+            control_metrics.record_config_set_error(
+                state.current_state.as_str(),
+                payload.config_version,
+                "ich_registration_failed",
+            );
+            let redacted = redact_state(&state, adapter_contract);
+            return build_io_config_set_error_payload(
+                node_name,
+                &redacted,
+                "ich_registration_failed",
+                err_text,
+            );
+        }
         apply_restart_required.push("listen.*".to_string());
     }
     if section_changed(previous_effective.as_ref(), &effective, &["ingress"]) {
@@ -1374,7 +1437,52 @@ fn http_state_ref_for_runtime_updates(
         node_name,
         inbound: state.inbound.clone(),
         relay: state.relay.clone(),
+        sender: state.sender.clone(),
+        router_inbox: state.router_inbox.clone(),
+        identity_provision_cfg: state.identity_provision_cfg.clone(),
+        self_ilk_id: fluxbee_sdk::read_self_ilk_from_env(),
+        self_tenant_id: fluxbee_sdk::read_self_tenant_from_env(),
     }
+}
+
+async fn ensure_io_api_own_ich_registered(
+    node_name: &str,
+    listen_addr: &str,
+    sender: &fluxbee_sdk::NodeSender,
+    router_inbox: Arc<Mutex<RouterInbox>>,
+    identity_provision_cfg: &IdentityProvisionConfig,
+    self_ilk_id: Option<&str>,
+    self_tenant_id: Option<&str>,
+) -> Result<()> {
+    let self_ilk_id = self_ilk_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing self_ilk_id for IO.api own ICH registration"))?;
+    let self_tenant_id = self_tenant_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing self_tenant_id for IO.api own ICH registration"))?;
+    let result = ensure_own_ich(
+        sender,
+        router_inbox,
+        identity_provision_cfg,
+        identity_provision_cfg.target.as_str(),
+        self_ilk_id,
+        self_tenant_id,
+        "io_api_instance",
+        listen_addr,
+    )
+    .await?;
+    tracing::info!(
+        node_name = %node_name,
+        listen_addr = %listen_addr,
+        self_ilk_id = %result.ilk_id,
+        ich_id = %result.ich_id,
+        owner_l2_name = ?result.owner_l2_name,
+        enabled = result.enabled,
+        "io-api own ICH ensured"
+    );
+    Ok(())
 }
 
 fn content_type_matches_any(content_type: &str, accepted: &[String]) -> bool {

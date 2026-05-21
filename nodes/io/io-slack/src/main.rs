@@ -29,7 +29,9 @@ use io_common::io_control_plane_logging::{
 use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
 use io_common::io_control_plane_store::{default_state_dir, persist_io_control_plane_state};
 use io_common::io_slack_adapter_config::IoSlackAdapterConfigContract;
-use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig, RouterInbox};
+use io_common::provision::{
+    ensure_own_ich, FluxbeeIdentityProvisioner, IdentityProvisionConfig, RouterInbox,
+};
 use io_common::relay::{
     AssembledTurn, InMemoryRelayStore, RelayBuffer, RelayDecision, RelayFlushHints, RelayFragment,
     RelayPolicy,
@@ -252,6 +254,13 @@ async fn main() -> Result<()> {
     let inbound_task = tokio::spawn(run_inbound_socket_mode(
         config.clone(),
         sender.clone(),
+        inbox.clone(),
+        IdentityProvisionConfig {
+            target: config.identity_target.clone(),
+            timeout: Duration::from_millis(config.identity_timeout_ms),
+        },
+        self_ilk_id.clone(),
+        self_tenant_id.clone(),
         slack.clone(),
         identity.clone(),
         provisioner.clone(),
@@ -1022,6 +1031,10 @@ struct SocketEnvelope {
 async fn run_inbound_socket_mode(
     config: Config,
     sender: NodeSender,
+    router_inbox: Arc<Mutex<RouterInbox>>,
+    identity_provision_cfg: IdentityProvisionConfig,
+    self_ilk_id: Option<String>,
+    self_tenant_id: Option<String>,
     slack: Arc<SlackClients>,
     identity: Arc<dyn IdentityResolver>,
     provisioner: Arc<dyn IdentityProvisioner>,
@@ -1031,6 +1044,7 @@ async fn run_inbound_socket_mode(
     blob_payload_cfg: IoTextBlobConfig,
 ) -> Result<()> {
     let mention_re = Regex::new(r"^<@[^>]+>\s*")?;
+    let ensured_workspaces = Arc::new(Mutex::new(HashSet::<String>::new()));
 
     loop {
         let socket_generation = slack.config_generation().await;
@@ -1129,6 +1143,26 @@ async fn run_inbound_socket_mode(
                 Some(v) => v.to_string(),
                 None => continue,
             };
+            if let Err(err) = ensure_io_slack_workspace_ich_registered(
+                &config.node_name,
+                &team_id,
+                &sender,
+                router_inbox.clone(),
+                &identity_provision_cfg,
+                self_ilk_id.as_deref(),
+                self_tenant_id.as_deref(),
+                ensured_workspaces.clone(),
+            )
+            .await
+            {
+                tracing::warn!(
+                    node_name = %config.node_name,
+                    team_id = %team_id,
+                    error = %err,
+                    "dropping inbound Slack event: unable to ensure own workspace ICH"
+                );
+                continue;
+            }
             let event = match payload.get("event") {
                 Some(v) => v.clone(),
                 None => continue,
@@ -1348,6 +1382,55 @@ fn build_slack_relay_fragment(
         dst_node_override: None,
         flush_hints: RelayFlushHints::default(),
     }
+}
+
+async fn ensure_io_slack_workspace_ich_registered(
+    node_name: &str,
+    team_id: &str,
+    sender: &NodeSender,
+    router_inbox: Arc<Mutex<RouterInbox>>,
+    identity_provision_cfg: &IdentityProvisionConfig,
+    self_ilk_id: Option<&str>,
+    self_tenant_id: Option<&str>,
+    ensured_workspaces: Arc<Mutex<HashSet<String>>>,
+) -> Result<()> {
+    {
+        let guard = ensured_workspaces.lock().await;
+        if guard.contains(team_id) {
+            return Ok(());
+        }
+    }
+    let self_ilk_id = self_ilk_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing self_ilk_id for IO.slack own ICH registration"))?;
+    let self_tenant_id = self_tenant_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing self_tenant_id for IO.slack own ICH registration"))?;
+    let result = ensure_own_ich(
+        sender,
+        router_inbox,
+        identity_provision_cfg,
+        identity_provision_cfg.target.as_str(),
+        self_ilk_id,
+        self_tenant_id,
+        "slack_workspace",
+        team_id,
+    )
+    .await?;
+    tracing::info!(
+        node_name = %node_name,
+        team_id = %team_id,
+        self_ilk_id = %result.ilk_id,
+        ich_id = %result.ich_id,
+        owner_l2_name = ?result.owner_l2_name,
+        enabled = result.enabled,
+        "io-slack own workspace ICH ensured"
+    );
+    let mut guard = ensured_workspaces.lock().await;
+    guard.insert(team_id.to_string());
+    Ok(())
 }
 
 async fn dispatch_assembled_turn(

@@ -993,6 +993,7 @@ impl IdentityStore {
         Ok(json!({
             "status": "ok",
             "ilk_id": canonical_ilk_id,
+            "ich_id": req.channel.ich_id,
             "owner_l2_name": normalized_owner_l2_name,
             "enabled": false,
             "change_reason": req.change_reason,
@@ -1451,7 +1452,7 @@ impl IdentityRuntime {
             MSG_ILK_REGISTER,
             vec!["SY.frontdesk.gov@", "SY.orchestrator@"],
         );
-        allowed_prefixes.insert(MSG_ILK_ADD_CHANNEL, vec!["SY.frontdesk.gov@"]);
+        allowed_prefixes.insert(MSG_ILK_ADD_CHANNEL, vec!["IO.", "SY.frontdesk.gov@"]);
         allowed_prefixes.insert(MSG_ILK_UPDATE, vec!["SY.orchestrator@"]);
         allowed_prefixes.insert(MSG_ILK_SET_DEFINITION, vec!["SY.admin@", "SY.architect@"]);
         allowed_prefixes.insert(
