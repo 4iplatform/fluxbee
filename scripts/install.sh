@@ -1025,19 +1025,17 @@ seed_cookbook_if_missing \
   "$ROOT_DIR/seeds/cookbook/repair_cookbook_v1.json" \
   "$STATE_DIR/state/cookbook/repair_cookbook_v1.json"
 
-if [[ -f "$ROOT_DIR/config/sy-config-routes.yaml" ]]; then
-  sudo install -m 0644 "$ROOT_DIR/config/sy-config-routes.yaml" "$CONFIG_DIR/sy-config-routes.yaml"
-else
-  if [[ ! -f "$CONFIG_DIR/sy-config-routes.yaml" ]]; then
-    echo "Creating default $CONFIG_DIR/sy-config-routes.yaml"
-    cat <<'EOF' | sudo tee "$CONFIG_DIR/sy-config-routes.yaml" >/dev/null
+if [[ ! -f "$CONFIG_DIR/sy-config-routes.yaml" ]]; then
+  echo "Creating default $CONFIG_DIR/sy-config-routes.yaml"
+  cat <<'EOF' | sudo tee "$CONFIG_DIR/sy-config-routes.yaml" >/dev/null
 version: 1
 updated_at: ""
 routes: []
 vpns: []
 taps: []
 EOF
-  fi
+else
+  echo "Keeping existing $CONFIG_DIR/sy-config-routes.yaml"
 fi
 
 install_unit() {
