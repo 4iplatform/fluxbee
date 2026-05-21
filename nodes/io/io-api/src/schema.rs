@@ -52,6 +52,9 @@ pub(crate) fn build_configured_schema(
         "runtime": "io.api",
         "contract_version": 1,
         "config_version": state.config_version,
+        "operational_state": {
+            "accepts_business_traffic": true
+        },
         "auth": {
             "mode": effective.get("auth").and_then(|auth| auth.get("mode")).and_then(Value::as_str).unwrap_or("api_key"),
             "transport": "Authorization: Bearer <token>",
@@ -70,6 +73,9 @@ pub(crate) fn build_configured_schema(
         "relay": {
             "config_path": "config.io.relay.*",
             "effective": effective.get("io").and_then(|io| io.get("relay")).cloned().unwrap_or(Value::Null)
+        },
+        "channel_identity": {
+            "api_channel_id": effective.get("io").and_then(|io| io.get("api_channel_id")).cloned().unwrap_or(Value::Null)
         },
         "secrets": build_io_adapter_contract_payload(adapter_contract, Some(effective))
             .get("secrets")
@@ -90,6 +96,18 @@ pub(crate) fn build_unconfigured_schema(
         "runtime": "io.api",
         "contract_version": 1,
         "effective_schema": Value::Null,
+        "operational_state": {
+            "accepts_business_traffic": false,
+            "reason": match state.current_state {
+                IoNodeLifecycleState::Unconfigured => "missing_required_configuration",
+                IoNodeLifecycleState::FailedConfig => "invalid_or_incomplete_configuration",
+                IoNodeLifecycleState::Configured => "not_ready",
+            }
+        },
+        "channel_identity": {
+            "api_channel_id_required": true,
+            "config_path": "config.io.api_channel_id"
+        },
         "required_configuration": adapter_contract.required_fields(),
         "last_error": state.last_error,
     })

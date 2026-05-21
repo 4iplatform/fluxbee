@@ -57,6 +57,16 @@ impl Config {
                 })
                 .unwrap_or_else(|| "0.1".to_string()),
             listen_addr: format!("{listen_address}:{listen_port}"),
+            api_channel_id: env("IO_API_CHANNEL_ID").or_else(|| {
+                json_get_string_opt(
+                    spawn_doc,
+                    &[
+                        "config.io.api_channel_id",
+                        "io.api_channel_id",
+                        "api_channel_id",
+                    ],
+                )
+            }),
             router_socket: PathBuf::from(
                 env("ROUTER_SOCKET")
                     .or_else(|| {
@@ -259,6 +269,25 @@ pub(crate) fn extract_runtime_dst_node(effective_config: Option<&Value>) -> Opti
         .map(ToString::to_string)
 }
 
+pub(crate) fn extract_runtime_api_channel_id(
+    effective_config: Option<&Value>,
+    default_api_channel_id: Option<&str>,
+) -> Option<String> {
+    effective_config
+        .and_then(|cfg| cfg.get("io"))
+        .and_then(|io| io.get("api_channel_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            default_api_channel_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+}
+
 pub(crate) fn extract_runtime_listen_addr(
     effective_config: Option<&Value>,
     default_listen_addr: &str,
@@ -399,6 +428,7 @@ fn json_get_path<'a>(root: &'a Value, dotted_path: &str) -> Option<&'a Value> {
 
 #[cfg(test)]
 mod tests {
+    use super::extract_runtime_api_channel_id;
     use super::extract_runtime_listen_addr;
 
     #[test]
@@ -426,5 +456,27 @@ mod tests {
         let addr = extract_runtime_listen_addr(Some(&effective), "127.0.0.1:8080");
 
         assert_eq!(addr, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn extract_runtime_api_channel_id_prefers_effective_config() {
+        let effective = serde_json::json!({
+            "io": {
+                "api_channel_id": "acme_orders"
+            }
+        });
+
+        let value = extract_runtime_api_channel_id(Some(&effective), Some("fallback"));
+
+        assert_eq!(value.as_deref(), Some("acme_orders"));
+    }
+
+    #[test]
+    fn extract_runtime_api_channel_id_falls_back_to_default() {
+        let effective = serde_json::json!({});
+
+        let value = extract_runtime_api_channel_id(Some(&effective), Some("fallback"));
+
+        assert_eq!(value.as_deref(), Some("fallback"));
     }
 }

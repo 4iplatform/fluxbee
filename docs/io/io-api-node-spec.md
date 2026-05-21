@@ -171,16 +171,16 @@ Esto no cambia el pipeline comun de identidad ni relay. Cada instancia aplica el
 
 Para `IO.api`, el `ICH` debe interpretarse como el **asset/canal local de ingreso** operado por la instancia, no como el sujeto externo autenticado ni como el `external_user_id`.
 
-Criterio inicial acordado para esta familia:
+Criterio actual acordado para esta familia:
 
-- una instancia concreta de `IO.api` opera un listener/entrypoint local;
-- ese listener/entrypoint es la base operativa del `ICH` local;
-- el material exacto de unicidad puede refinarse mas adelante, pero el `ICH` no debe derivarse del interlocutor externo.
+- una instancia concreta de `IO.api` opera un canal API estable identificado por `api_channel_id`;
+- el listener/entrypoint HTTP sigue siendo runtime de ingreso, no identidad canonica del `ICH`;
+- el `ICH` no debe derivarse del interlocutor externo ni del bind tecnico.
 
 Consecuencia:
 
 - el caller autenticado y el sujeto conversacional efectivo siguen resolviéndose por auth + identity;
-- el `ICH` de `IO.api` representa el canal local de la instancia HTTP que recibió o emite la comunicación.
+- el `ICH` de `IO.api` representa el canal API local/estable operado por la instancia.
 
 ### 3.5 Estado actual del runtime respecto a ILK interno e ICH
 
@@ -188,6 +188,7 @@ Lectura ajustada al estado real actual del repo:
 
 - `IO.api` ya lee `self_ilk_id` y `self_tenant_id` desde env al boot;
 - hoy esos valores también se usan para asegurar el alta del `ICH` propio de la instancia vía `ILK_ADD_CHANNEL`;
+- el identificador canonico de ese canal es `api_channel_id`;
 - el material local más concreto que hoy ya participa del path operativo es el `listen.address`, usado como `entrypoint` del `IoContext`;
 - el cálculo actual de `thread_id` para `IO.api` ya usa `ThreadIdInput::PersistentChannel` con:
   - `channel_type = "api"`
@@ -198,7 +199,7 @@ Conclusión práctica:
 
 - la continuidad conversacional ya incorpora material local del canal;
 - `meta.ich` ya se alinea al asset local de ingreso;
-- el `ICH` propio de la instancia ya se intenta registrar explícitamente contra identity usando `self_ilk_id + listen.address`.
+- el `ICH` propio de la instancia ya se intenta registrar explícitamente contra identity usando `self_ilk_id + api_channel_id`.
 
 ### 3.6 Estado actual del alta de ICH propio
 
@@ -207,8 +208,8 @@ El camino operativo actual para `IO.api` es:
 - usar `self_ilk_id` y `self_tenant_id` inyectados al boot;
 - calcular un `ich_id` estable a partir de `channel_type + address + tenant`;
 - solicitar `ILK_ADD_CHANNEL` a `SY.identity` con:
-  - `channel_type = "io_api_instance"`
-  - `address = listen.address`
+  - `channel_type = "api_channel"`
+  - `address = api_channel_id`
   - `ilk_id = self_ilk_id`
 
 Si el alta falla:

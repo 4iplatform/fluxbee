@@ -13,6 +13,7 @@ impl IoAdapterConfigContract for IoApiAdapterConfigContract {
         &[
             "config.listen.address",
             "config.listen.port",
+            "config.io.api_channel_id",
             "config.auth.mode",
             "config.auth.api_keys",
             "config.ingress.subject_mode",
@@ -58,6 +59,7 @@ impl IoAdapterConfigContract for IoApiAdapterConfigContract {
             "Inline API keys must be materialized to local secrets.json by IO.api runtime.",
             "CONFIG_GET and CONFIG_RESPONSE must redact secret-bearing fields.",
             "v1 supports auth.mode=api_key only.",
+            "api_channel_id is the stable local API channel identity used for own-ICH registration.",
             "Each API key must declare a tenant_id; IO.api derives the effective tenant from the authenticated key.",
             "Each API key must declare an integration_id; IO.api resolves outbound webhook policy from that integration.",
         ]
@@ -71,7 +73,7 @@ impl IoAdapterConfigContract for IoApiAdapterConfigContract {
         ensure_object_field(&mut cfg, "listen")?;
         ensure_object_field(&mut cfg, "auth")?;
         ensure_object_field(&mut cfg, "ingress")?;
-        ensure_optional_object_field(&mut cfg, "io")?;
+        ensure_object_field(&mut cfg, "io")?;
         ensure_optional_object_field(&mut cfg, "node")?;
         ensure_optional_object_field(&mut cfg, "runtime")?;
 
@@ -121,6 +123,7 @@ impl IoAdapterConfigContract for IoApiAdapterConfigContract {
         validate_accepted_content_types(ingress)?;
 
         if let Some(io_obj) = cfg.get_mut("io").and_then(Value::as_object_mut) {
+            require_non_empty_string(io_obj, "api_channel_id", "io.api_channel_id")?;
             io_obj
                 .entry("dst_node".to_string())
                 .or_insert(Value::String("resolve".to_string()));
@@ -676,6 +679,7 @@ mod tests {
         let out = contract
             .validate_and_materialize(&json!({
                 "listen": { "address": "127.0.0.1", "port": 8080 },
+                "io": { "api_channel_id": "api_partner1" },
                 "auth": {
                     "mode": "api_key",
                     "api_keys": [
@@ -698,8 +702,7 @@ mod tests {
                         "final_reply_required": false,
                         "webhook": { "enabled": false }
                     }
-                ],
-                "io": {}
+                ]
             }))
             .expect("must pass");
         assert_eq!(
@@ -717,6 +720,7 @@ mod tests {
         let err = contract
             .validate_and_materialize(&json!({
                 "listen": { "address": "127.0.0.1", "port": 8080 },
+                "io": { "api_channel_id": "api_partner1" },
                 "auth": {
                     "mode": "api_key",
                     "api_keys": [
@@ -738,11 +742,44 @@ mod tests {
     }
 
     #[test]
+    fn validate_materialize_requires_api_channel_id() {
+        let contract = IoApiAdapterConfigContract;
+        let err = contract
+            .validate_and_materialize(&json!({
+                "listen": { "address": "127.0.0.1", "port": 8080 },
+                "auth": {
+                    "mode": "api_key",
+                    "api_keys": [
+                        { "key_id": "partner1", "tenant_id": "tnt:partner1", "integration_id": "int_partner1", "token_ref": "env:PARTNER1_KEY" }
+                    ]
+                },
+                "ingress": {
+                    "subject_mode": "explicit_subject",
+                    "accepted_content_types": ["application/json"]
+                },
+                "integrations": [
+                    {
+                        "integration_id": "int_partner1",
+                        "tenant_id": "tnt:partner1",
+                        "final_reply_required": false,
+                        "webhook": { "enabled": false }
+                    }
+                ]
+            }))
+            .expect_err("must fail");
+        assert_eq!(
+            err,
+            IoAdapterConfigError::InvalidConfig("io.api_channel_id is required".to_string())
+        );
+    }
+
+    #[test]
     fn validate_materialize_requires_integration_id_per_api_key() {
         let contract = IoApiAdapterConfigContract;
         let err = contract
             .validate_and_materialize(&json!({
                 "listen": { "address": "127.0.0.1", "port": 8080 },
+                "io": { "api_channel_id": "api_partner1" },
                 "auth": {
                     "mode": "api_key",
                     "api_keys": [
@@ -777,6 +814,7 @@ mod tests {
         let err = contract
             .validate_and_materialize(&json!({
                 "listen": { "address": "127.0.0.1", "port": 8080 },
+                "io": { "api_channel_id": "api_partner1" },
                 "auth": {
                     "mode": "api_key",
                     "api_keys": [
@@ -816,6 +854,7 @@ mod tests {
         contract
             .validate_and_materialize(&json!({
                 "listen": { "address": "127.0.0.1", "port": 8080 },
+                "io": { "api_channel_id": "api_partner1" },
                 "auth": {
                     "mode": "api_key",
                     "api_keys": [
@@ -857,6 +896,7 @@ mod tests {
         let err = contract
             .validate_and_materialize(&json!({
                 "listen": { "address": "127.0.0.1", "port": 8080 },
+                "io": { "api_channel_id": "api_partner1" },
                 "auth": {
                     "mode": "api_key",
                     "api_keys": [

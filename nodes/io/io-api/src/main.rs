@@ -76,10 +76,13 @@ use attachments::{
 };
 use auth::{authenticate_bearer, extract_bearer_token, prepare_runtime_api_config};
 use config::{
-    api_relay_policy, api_relay_policy_from_config, extract_runtime_dst_node,
-    extract_runtime_listen_addr, extract_runtime_relay_config,
+    api_relay_policy, api_relay_policy_from_config, extract_runtime_api_channel_id,
+    extract_runtime_dst_node, extract_runtime_listen_addr, extract_runtime_relay_config,
 };
-use http::{accepted_response, api_error, frontdesk_result_response, FrontdeskHttpEnvelope};
+use http::{
+    accepted_response, api_error, frontdesk_result_response, node_unavailable_response,
+    FrontdeskHttpEnvelope,
+};
 use schema::{
     build_configured_schema, build_unconfigured_schema, extract_accepted_content_types,
     extract_max_request_bytes, extract_subject_mode, lifecycle_status,
@@ -93,6 +96,7 @@ struct Config {
     island_id: String,
     node_version: String,
     listen_addr: String,
+    api_channel_id: Option<String>,
     router_socket: PathBuf,
     uuid_persistence_dir: PathBuf,
     config_dir: PathBuf,
@@ -268,6 +272,20 @@ async fn main() -> Result<()> {
         );
         config.listen_addr = boot_listen_addr;
     }
+    let boot_api_channel_id = extract_runtime_api_channel_id(
+        boot_state.effective_config.as_ref(),
+        config.api_channel_id.as_deref(),
+    );
+    if boot_api_channel_id != config.api_channel_id {
+        tracing::info!(
+            node_name = %config.node_name,
+            previous_api_channel_id = ?config.api_channel_id,
+            effective_api_channel_id = ?boot_api_channel_id,
+            config_source = %boot_state.config_source.as_str(),
+            "io-api boot api_channel_id overridden from effective config"
+        );
+        config.api_channel_id = boot_api_channel_id;
+    }
 
     // Phase J'-0a: self ILK + tenant from orchestrator-injected env vars.
     let self_ilk_id = fluxbee_sdk::read_self_ilk_from_env();
@@ -277,6 +295,7 @@ async fn main() -> Result<()> {
         runtime_version = %config.node_version,
         island_id = %config.island_id,
         listen = %config.listen_addr,
+        api_channel_id = ?config.api_channel_id,
         router_socket = %config.router_socket.display(),
         state_dir = %config.state_dir.display(),
         spawn_config_path = %config.spawn_config_path.display(),
@@ -402,29 +421,31 @@ async fn main() -> Result<()> {
         blob_payload_cfg,
     });
 
-    if let Err(err) = ensure_io_api_own_ich_registered(
-        &config.node_name,
-        &config.listen_addr,
-        &sender,
-        inbox.clone(),
-        &identity_provision_cfg,
-        self_ilk_id.as_deref(),
-        self_tenant_id.as_deref(),
-    )
-    .await
-    {
-        let mut state = control_plane.write().await;
-        state.current_state = IoNodeLifecycleState::FailedConfig;
-        state.last_error = Some(IoControlPlaneErrorInfo {
-            code: "ich_registration_failed".to_string(),
-            message: err.to_string(),
-        });
-        tracing::warn!(
-            node_name = %config.node_name,
-            listen_addr = %config.listen_addr,
-            error = %err,
-            "io-api failed to ensure own ICH registration; starting in FAILED_CONFIG"
-        );
+    if control_plane.read().await.current_state != IoNodeLifecycleState::Unconfigured {
+        if let Err(err) = ensure_io_api_own_ich_registered(
+            &config.node_name,
+            config.api_channel_id.as_deref(),
+            &sender,
+            inbox.clone(),
+            &identity_provision_cfg,
+            self_ilk_id.as_deref(),
+            self_tenant_id.as_deref(),
+        )
+        .await
+        {
+            let mut state = control_plane.write().await;
+            state.current_state = IoNodeLifecycleState::FailedConfig;
+            state.last_error = Some(IoControlPlaneErrorInfo {
+                code: "ich_registration_failed".to_string(),
+                message: err.to_string(),
+            });
+            tracing::warn!(
+                node_name = %config.node_name,
+                api_channel_id = ?config.api_channel_id,
+                error = %err,
+                "io-api failed to ensure own ICH registration; starting in FAILED_CONFIG"
+            );
+        }
     }
 
     let http_task = match try_bind_http_listener(
@@ -676,11 +697,7 @@ async fn post_messages(State(state): State<Arc<HttpState>>, request: Request) ->
             lifecycle_state = lifecycle_status(&state_snapshot.current_state),
             "io-api request rejected: node not configured"
         );
-        return api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "node_not_configured",
-            "IO.api instance is not configured yet",
-        );
+        return node_unavailable_response(&state_snapshot);
     }
     let effective = state_snapshot
         .effective_config
@@ -1320,11 +1337,13 @@ async fn apply_io_config_set(
         *auth_registry.write().await = registry.clone();
         apply_reinit.push("auth.api_keys".to_string());
     }
-    if section_changed(previous_effective.as_ref(), &effective, &["listen"]) {
-        let next_listen_addr = extract_runtime_listen_addr(Some(&effective), "api");
+    let previous_api_channel_id =
+        extract_runtime_api_channel_id(previous_effective.as_ref(), None);
+    let next_api_channel_id = extract_runtime_api_channel_id(Some(&effective), None);
+    if previous_api_channel_id != next_api_channel_id {
         if let Err(err) = ensure_io_api_own_ich_registered(
             node_name,
-            &next_listen_addr,
+            next_api_channel_id.as_deref(),
             &runtime_updates.sender,
             runtime_updates.router_inbox.clone(),
             &runtime_updates.identity_provision_cfg,
@@ -1352,6 +1371,9 @@ async fn apply_io_config_set(
                 err_text,
             );
         }
+        apply_hot.push("io.api_channel_id".to_string());
+    }
+    if section_changed(previous_effective.as_ref(), &effective, &["listen"]) {
         apply_restart_required.push("listen.*".to_string());
     }
     if section_changed(previous_effective.as_ref(), &effective, &["ingress"]) {
@@ -1447,7 +1469,7 @@ fn http_state_ref_for_runtime_updates(
 
 async fn ensure_io_api_own_ich_registered(
     node_name: &str,
-    listen_addr: &str,
+    api_channel_id: Option<&str>,
     sender: &fluxbee_sdk::NodeSender,
     router_inbox: Arc<Mutex<RouterInbox>>,
     identity_provision_cfg: &IdentityProvisionConfig,
@@ -1462,6 +1484,10 @@ async fn ensure_io_api_own_ich_registered(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("missing self_tenant_id for IO.api own ICH registration"))?;
+    let api_channel_id = api_channel_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing api_channel_id for IO.api own ICH registration"))?;
     let result = ensure_own_ich(
         sender,
         router_inbox,
@@ -1469,13 +1495,13 @@ async fn ensure_io_api_own_ich_registered(
         identity_provision_cfg.target.as_str(),
         self_ilk_id,
         self_tenant_id,
-        "io_api_instance",
-        listen_addr,
+        "api_channel",
+        api_channel_id,
     )
     .await?;
     tracing::info!(
         node_name = %node_name,
-        listen_addr = %listen_addr,
+        api_channel_id = %api_channel_id,
         self_ilk_id = %result.ilk_id,
         ich_id = %result.ich_id,
         owner_l2_name = ?result.owner_l2_name,
@@ -2428,6 +2454,7 @@ mod tests {
                 }
             ],
             "io": {
+                "api_channel_id": "api_partner1",
                 "dst_node": "resolve"
             }
         })
@@ -2519,6 +2546,13 @@ mod tests {
             .is_some_and(|items| !items.is_empty()));
         assert_eq!(
             schema
+                .get("channel_identity")
+                .and_then(|value| value.get("api_channel_id_required"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            schema
                 .get("last_error")
                 .and_then(|value| value.get("code"))
                 .and_then(Value::as_str),
@@ -2550,6 +2584,13 @@ mod tests {
         );
         assert_eq!(
             schema
+                .get("operational_state")
+                .and_then(|value| value.get("accepts_business_traffic"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            schema
                 .get("ingress")
                 .and_then(|value| value.get("subject_mode"))
                 .and_then(Value::as_str),
@@ -2568,6 +2609,13 @@ mod tests {
                 .and_then(|value| value.get("config_path"))
                 .and_then(Value::as_str),
             Some("config.io.relay.*")
+        );
+        assert_eq!(
+            schema
+                .get("channel_identity")
+                .and_then(|value| value.get("api_channel_id"))
+                .and_then(Value::as_str),
+            Some("api_partner1")
         );
     }
 

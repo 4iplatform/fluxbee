@@ -1,6 +1,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use io_common::io_control_plane::{IoControlPlaneState, IoNodeLifecycleState};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +61,29 @@ pub(crate) fn api_error(
         .into_response()
 }
 
+pub(crate) fn node_unavailable_response(state: &IoControlPlaneState) -> Response {
+    match state.current_state {
+        IoNodeLifecycleState::Unconfigured => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node_not_configured",
+            "IO.api instance is not configured yet",
+        ),
+        IoNodeLifecycleState::FailedConfig => {
+            let message = state
+                .last_error
+                .as_ref()
+                .map(|err| format!("IO.api instance is in failed_config: {}", err.message))
+                .unwrap_or_else(|| "IO.api instance is in failed_config".to_string());
+            api_error(StatusCode::SERVICE_UNAVAILABLE, "node_failed_config", message)
+        }
+        IoNodeLifecycleState::Configured => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node_unavailable",
+            "IO.api instance is temporarily unavailable",
+        ),
+    }
+}
+
 pub(crate) fn frontdesk_result_response(payload: FrontdeskHttpEnvelope) -> Response {
     let status = match (payload.success, payload.error_code.as_deref()) {
         (true, _) => StatusCode::OK,
@@ -75,8 +99,11 @@ pub(crate) fn frontdesk_result_response(payload: FrontdeskHttpEnvelope) -> Respo
 
 #[cfg(test)]
 mod tests {
-    use super::{frontdesk_result_response, FrontdeskHttpEnvelope};
+    use super::{frontdesk_result_response, node_unavailable_response, FrontdeskHttpEnvelope};
     use axum::http::StatusCode;
+    use io_common::io_control_plane::{
+        IoControlPlaneErrorInfo, IoControlPlaneState, IoNodeLifecycleState,
+    };
 
     fn sample_payload(success: bool, error_code: Option<&str>) -> FrontdeskHttpEnvelope {
         FrontdeskHttpEnvelope {
@@ -122,5 +149,29 @@ mod tests {
         let response =
             frontdesk_result_response(sample_payload(false, Some("register_failed")));
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn node_unavailable_response_maps_unconfigured_to_service_unavailable() {
+        let state = IoControlPlaneState {
+            current_state: IoNodeLifecycleState::Unconfigured,
+            ..IoControlPlaneState::default()
+        };
+        let response = node_unavailable_response(&state);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn node_unavailable_response_maps_failed_config_to_service_unavailable() {
+        let state = IoControlPlaneState {
+            current_state: IoNodeLifecycleState::FailedConfig,
+            last_error: Some(IoControlPlaneErrorInfo {
+                code: "ich_registration_failed".to_string(),
+                message: "missing api_channel_id".to_string(),
+            }),
+            ..IoControlPlaneState::default()
+        };
+        let response = node_unavailable_response(&state);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
