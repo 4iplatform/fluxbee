@@ -1881,6 +1881,15 @@ impl GenericAiNode {
                 ),
             );
         }
+        if let Some(field) = find_unsupported_ai_config_field(&config) {
+            return self.invalid_config_response(
+                Some(schema_version),
+                Some(config_version),
+                format!(
+                    "Invalid payload.config: field '{field}' is not accepted by ai.generic; cognitive role/skill/handbook/personality hashes must be applied to the ILK with set_ilk_definition"
+                ),
+            );
+        }
         let mut config_doc = match parse_effective_config_doc(&config) {
             Ok(v) => v,
             Err(err) => {
@@ -2096,6 +2105,15 @@ impl GenericAiNode {
                     "config.behavior.kind",
                     "config.behavior.model"
                 ],
+                "field_values": {
+                    "config.behavior.kind": {
+                        "allowed": ["echo", "openai_chat"],
+                        "notes": ["Use openai_chat for OpenAI-backed chat. Do not use openai."]
+                    },
+                    "config.behavior.model": {
+                        "examples": ["gpt-4.1-mini"]
+                    }
+                },
                 "optional_fields": [
                     "config.behavior.instructions",
                     "config.behavior.model_settings",
@@ -2112,7 +2130,9 @@ impl GenericAiNode {
                     }
                 ],
                 "notes": [
+                    "Cognitive assets are not part of CONFIG_SET. Apply role_hash, skill_hashes, handbook_hashes, and personality_hash with set_ilk_definition against the agent ILK.",
                     "OpenAI credentials are resolved only from SY.vault using resource_type=openai.",
+                    "For OpenAI behavior set config.behavior.kind=openai_chat, not openai.",
                     "CONFIG_SET rejects secret-bearing fields such as config.secrets.openai.api_key, config.behavior.openai.api_key, config.behavior.api_key, and config.behavior.api_key_env.",
                     "ai.generic defaults behavior.capabilities.multimodal=true unless explicitly overridden.",
                     "Cognitive role/skill/handbook prompt definition is loaded from identity SHM and blob://agent-assets/<hash>.json."
@@ -5445,12 +5465,25 @@ fn find_openai_secret_contract_field(config: &Value) -> Option<&'static str> {
     None
 }
 
+fn find_unsupported_ai_config_field(config: &Value) -> Option<&'static str> {
+    if config.get("assets").is_some() {
+        return Some("config.assets");
+    }
+    None
+}
+
 fn parse_effective_config_doc(
     config: &Value,
 ) -> Result<EffectiveConfigDocument, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(field) = find_openai_secret_contract_field(config) {
         return Err(format!(
             "secret-bearing field '{field}' is not accepted by ai.generic; use SY.vault resource_type=openai"
+        )
+        .into());
+    }
+    if let Some(field) = find_unsupported_ai_config_field(config) {
+        return Err(format!(
+            "unsupported field '{field}'; cognitive assets must be applied through set_ilk_definition"
         )
         .into());
     }
@@ -7293,6 +7326,13 @@ mod tests {
                     }
                 }),
                 "config.behavior.openai",
+            ),
+            (
+                json!({
+                    "behavior": {"kind": "openai_chat", "model": "gpt-4.1-mini"},
+                    "assets": {"role_hash": "abc"}
+                }),
+                "config.assets",
             ),
         ];
 

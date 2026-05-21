@@ -209,17 +209,22 @@ Example:
       "model": "gpt-4.1-mini"
     }
   },
-  "contract": {
-    "node_family": "AI",
-    "node_kind": "AI.common",
-    "supports": ["CONFIG_GET", "CONFIG_SET"],
-    "required_fields": [
-      "behavior.kind",
-      "behavior.model"
-    ],
-    "optional_fields": [
-      "behavior.instructions",
-      "runtime.worker_pool_size"
+    "contract": {
+      "node_family": "AI",
+      "node_kind": "AI.common",
+      "supports": ["CONFIG_GET", "CONFIG_SET"],
+      "required_fields": [
+        "behavior.kind",
+        "behavior.model"
+      ],
+      "field_values": {
+        "behavior.kind": {
+          "allowed": ["echo", "openai_chat"]
+        }
+      },
+      "optional_fields": [
+        "behavior.instructions",
+        "runtime.worker_pool_size"
     ],
     "resources": [
       {

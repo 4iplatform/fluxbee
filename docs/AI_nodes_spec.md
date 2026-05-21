@@ -1208,6 +1208,8 @@ mencionado en la “Living Spec” de AI Nodes. fileciteturn2file1L129-
 - Si `behavior.kind = openai_chat`:
   - `behavior.model` (string, requerido)
   - credencial OpenAI resoluble en `SY.vault` con `resource_type=openai`
+- `behavior.kind=openai` no es válido; para OpenAI usar `openai_chat`.
+- Los assets cognitivos no son parte de la config operativa del nodo. Se aplican sobre el ILK del agente con `set_ilk_definition`.
 
 ### 4.2 YAML canónico (v1, ejemplo)
 
