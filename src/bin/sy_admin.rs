@@ -7535,6 +7535,16 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
         )],
         "node_control_config_set" => vec![
             admin_action_body_field(
+                "node_name",
+                "string",
+                "Target node L2 name (must match the path's node_name).",
+            ),
+            admin_action_body_field(
+                "subsystem",
+                "string",
+                "Node-defined subsystem string the node uses to route the CONFIG_SET internally (e.g. 'ai_node' for AI nodes, 'routes'/'vpns'/'taps' for SY.config.routes, 'opa' for SY.opa.rules). Required; varies by target node.",
+            ),
+            admin_action_body_field(
                 "schema_version",
                 "u32",
                 "Schema version understood by the node.",
@@ -7542,7 +7552,7 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "config_version",
                 "u64",
-                "Monotonic config version chosen by the caller or node contract.",
+                "Next monotonic live config version. For AI.* and IO.* first call node_control_config_get, read response.config_version, then send config_version=response.config_version+1. Do not reuse example numbers.",
             ),
             admin_action_body_field(
                 "apply_mode",
@@ -8131,17 +8141,7 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         "node_control_config_get" => serde_json::json!({
             "requested_by": "archi"
         }),
-        "node_control_config_set" => serde_json::json!({
-            "schema_version": 1,
-            "config_version": 7,
-            "apply_mode": "replace",
-            "config": {
-                "behavior": {
-                    "kind": "openai_chat",
-                    "model": "gpt-4.1-mini"
-                }
-            }
-        }),
+        "node_control_config_set" => serde_json::Value::Null,
         "timer_now_in" => serde_json::json!({
             "tz": "America/Argentina/Buenos_Aires"
         }),
@@ -8330,14 +8330,10 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         }),
         "set_ilk_definition" => serde_json::json!({
             "definition": {
-                "role_hash": "1111111111111111111111111111111111111111111111111111111111111111",
-                "skill_hashes": [
-                    "2222222222222222222222222222222222222222222222222222222222222222"
-                ],
-                "handbook_hashes": [
-                    "3333333333333333333333333333333333333333333333333333333333333333"
-                ],
-                "personality_hash": "4444444444444444444444444444444444444444444444444444444444444444"
+                "role_hash": null,
+                "skill_hashes": [],
+                "handbook_hashes": [],
+                "personality_hash": null
             }
         }),
         "remove_runtime_version" => serde_json::json!({
@@ -8387,14 +8383,14 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
             r#"curl -X POST /hives/motherbee/nodes/WF.invoice@motherbee/control/config-get -d '{"requested_by":"archi"}'"#
         }
         "node_control_config_set" => {
-            r#"curl -X POST /hives/motherbee/nodes/WF.invoice@motherbee/control/config-set -d '{"schema_version":1,"config_version":2,"apply_mode":"replace","config":{"sy_timer_l2_name":"SY.timer@motherbee"}}'"#
+            r#"current="$(curl -sS -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-get -d '{"requested_by":"archi"}' | jq -r '.payload.response.config_version')"; next="$((current + 1))"; curl -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-set -d "{\"node_name\":\"AI.sales@motherbee\",\"subsystem\":\"ai_node\",\"schema_version\":1,\"config_version\":${next},\"apply_mode\":\"replace\",\"config\":{\"behavior\":{\"kind\":\"openai_chat\",\"model\":\"gpt-4.1-mini\"}}}""#
         }
         "list_ilks" => "curl -X GET /hives/motherbee/identity/ilks",
         "get_ilk" => {
             "curl -X GET /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000"
         }
         "set_ilk_definition" => {
-            r#"curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{"definition":{"role_hash":"1111111111111111111111111111111111111111111111111111111111111111","skill_hashes":["2222222222222222222222222222222222222222222222222222222222222222"],"handbook_hashes":["3333333333333333333333333333333333333333333333333333333333333333"]}}'"#
+            r#"curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{"definition":{"role_hash":null,"skill_hashes":[],"handbook_hashes":[],"personality_hash":null}}'"#
         }
         "list_tenants" => "curl -X GET /hives/motherbee/identity/tenants",
         "get_tenant" => {
@@ -8586,6 +8582,10 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "This is the canonical live control-plane mutation path for nodes that expose CONFIG_SET, including AI.*, IO.*, WF.*, SY.storage, SY.identity, SY.cognition, and SY.config.routes.",
             "Admin forwards CONFIG_SET over L2 unicast and returns the node's CONFIG_RESPONSE.",
             "The payload.config object is node-defined and is not interpreted by SY.admin.",
+            "Before mutating AI.* or IO.*, call node_control_config_get and set config_version to response.config_version + 1. A smaller value is stale; an equal value is idempotent and will not apply a change.",
+            "Do not use config_version from get_node_config/_system as a substitute unless it exactly matches the live CONFIG_GET response; the canonical source is node_control_config_get.",
+            "For ai.generic OpenAI chat, use config.behavior.kind=openai_chat. Do not use openai as behavior.kind.",
+            "Do not put cognitive assets under CONFIG_SET config.assets. Apply role_hash, skill_hashes, handbook_hashes, and personality_hash with set_ilk_definition against the agent ILK.",
             "For WF.* v1, CONFIG_SET is persist-only and returns restart_required; it does not hot-apply CONFIG_CHANGED.",
             "For WF.* v1, do not mutate _system through CONFIG_SET. Managed package/runtime metadata remains owned by orchestrator.",
             "For SY.storage v1, the canonical secret field is config.database.postgres_url and the apply is persist-only until sy-storage is restarted.",
@@ -10481,6 +10481,32 @@ async fn handle_send_node_message(
     ))
 }
 
+/// Pull the most useful (error_code, error_detail) pair out of a node's
+/// CONFIG_RESPONSE error payload. Nodes typically reply with
+/// `error: { code: "...", message: "..." }` or `error: { reason: "..." }`;
+/// we tolerate both and fall back to a generic code so the admin envelope
+/// always carries something operator-visible.
+fn extract_node_error_code_and_detail(
+    node_error: &serde_json::Value,
+    node_response: &serde_json::Value,
+) -> (String, String) {
+    let code = node_error
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| node_error.get("error_code").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .unwrap_or_else(|| "NODE_REJECTED_CONFIG".to_string());
+    let detail = node_error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| node_error.get("error_detail").and_then(serde_json::Value::as_str))
+        .or_else(|| node_error.get("reason").and_then(serde_json::Value::as_str))
+        .or_else(|| node_response.get("message").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .unwrap_or_else(|| "node rejected the config control request".to_string());
+    (code, detail)
+}
+
 async fn handle_node_control_command(
     ctx: &AdminContext,
     client: &AdminRouterClient,
@@ -10584,6 +10610,35 @@ async fn handle_node_control_command(
                 .get("error")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
+            // The transport succeeded (we got a CONFIG_RESPONSE back) but the
+            // node may have rejected the request (node_ok=false). Surface that
+            // as a top-level error so the admin executor / archi see the
+            // failure, not just "transport OK". Without this, a malformed
+            // CONFIG_SET (missing subsystem, wrong shape, etc.) reports
+            // success at the admin envelope while the node never applied it.
+            if !node_ok {
+                let (error_code, error_detail) =
+                    extract_node_error_code_and_detail(&node_error, &node_response);
+                return Ok((
+                    422,
+                    serde_json::json!({
+                        "status": "error",
+                        "action": action,
+                        "payload": {
+                            "target": target_hive,
+                            "node_name": node_name,
+                            "request_msg": request_msg,
+                            "response_msg": "CONFIG_RESPONSE",
+                            "node_ok": node_ok,
+                            "node_error": node_error,
+                            "response": node_response,
+                        },
+                        "error_code": error_code,
+                        "error_detail": error_detail,
+                    })
+                    .to_string(),
+                ));
+            }
             Ok((
                 200,
                 serde_json::json!({

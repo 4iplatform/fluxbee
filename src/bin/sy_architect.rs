@@ -122,6 +122,10 @@ You are a coordinator, not an executor. You read system state and route all muta
 - For admin action schemas and examples, use `fluxbee_system_get` on `/admin/actions/{action}` when answering questions. Planning tools do their own schema lookup before mutation.
 - Do not use `/admin/actions/{action}` lookups as a substitute for compiling a mutation plan. If the operator wants a change and the target values are known, call `fluxbee_plan_compiler`.
 
+## Read-only diagnostic autonomy
+
+If the operator asks to inspect, diagnose, list, compare, or verify existing state, gather observable state before asking questions. When the operator describes a target by family, count, or role instead of exact name, use inventory and live reads to resolve the concrete resources. If the candidates are clear, continue the read-only diagnostic in the same turn; do not ask for permission to read non-secret state. Ask only if the live state still leaves multiple unsafe interpretations or no viable candidate.
+
 ## Making changes
 
 Never stage writes. Never call admin mutation endpoints directly.
@@ -2296,7 +2300,7 @@ Use these facts only to select and validate planning intent. Do not treat them a
 - `get_node_config` reads persisted node config from disk/snapshot.
 - `node_control_config_get` asks a running node for its live config contract.
 - `node_control_config_set` updates live node-defined config for an existing node. It does not create nodes.
-- For config updates, read current live config first when `config_version` is required.
+- For config updates, read current live config first when `config_version` is required; for mutating AI.* / IO.* updates use `config_version = live CONFIG_GET response.config_version + 1`.
 
 ### Restart semantics
 
@@ -12371,6 +12375,30 @@ fn translate_scmd(
             target_hive: (*hive_id).to_string(),
             params: json!({}),
         }),
+        ("POST", ["hives", hive_id, "taps"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for add_tap must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "add_tap".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
+        ("DELETE", ["hives", hive_id, "taps"]) => {
+            let params = parsed.body.unwrap_or_else(|| json!({}));
+            if !params.is_object() {
+                return Err("SCMD body for delete_tap must be a JSON object".into());
+            }
+            Ok(AdminTranslation {
+                admin_target,
+                action: "delete_tap".to_string(),
+                target_hive: (*hive_id).to_string(),
+                params,
+            })
+        }
         ("GET", ["hives", hive_id, "deployments"]) => Ok(AdminTranslation {
             admin_target,
             action: "get_deployments".to_string(),

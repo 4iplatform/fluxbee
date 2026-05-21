@@ -32,5 +32,7 @@ behavior:
     source: inline   # inline | file | env | none
     value: "You are a concise support assistant."
     trim: true
-  api_key_env: "OPENAI_API_KEY"
   # base_url: "https://api.openai.com/v1/responses"
+
+# OpenAI credentials are not configured here. Load them in SY.vault with
+# metadata.resource_type=openai.

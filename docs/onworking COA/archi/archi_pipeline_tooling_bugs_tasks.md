@@ -296,6 +296,30 @@ Acceptance:
   - storage's `handle_vault_secret_changed` matches and exits(0); systemd restart reconnects to the DB; orchestrator readiness probe succeeds within the 30s window
 - No more silent degradation on the first boot cycle.
 
+### [x] ARCHI-BUG-13 — Archi over-asks on read-only diagnostics instead of resolving observable targets
+
+Observed behavior:
+
+- Operator asks to diagnose a resource set described by family/count.
+- Archi asks for exact resource names even though inventory can resolve them.
+- After inventory resolves the names, Archi asks again whether it should inspect read-only config/state.
+
+Problem:
+
+- This wastes turns and pushes observable system-state work back to the operator.
+- Existing handbook guidance said "ask less, infer more", but did not explicitly cover read-only diagnostics over resource families.
+
+Resolution:
+
+- Added read-only diagnostic autonomy to `SYSTEM_PROMPT_BASE`.
+- Added handbook guidance requiring Archi to resolve family/count/role descriptions with inventory/list endpoints before asking.
+- Explicitly allowed continuing non-secret read-only diagnostics in the same turn when candidates are clear.
+
+Acceptance:
+
+- For diagnostic/inspection requests, Archi reads inventory first when names are inferable.
+- Archi only asks if live state leaves no viable candidate or multiple unsafe interpretations.
+
 ### [x] ARCHI-BUG-11 — Blocked-run-pending surfaces as text-only; operator must type the recovery word
 
 Observed (2026-05-17, follow-up to ARCHI-BUG-10):

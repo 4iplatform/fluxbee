@@ -14,8 +14,8 @@ Notas:
 Control-plane y secrets:
 - `CONFIG_GET` expone contrato/config redacted del nodo.
 - `CONFIG_SET` aplica config funcional del runner.
-- la OpenAI key canónica entra por `config.secrets.openai.api_key`.
-- el secreto se persiste localmente en `secrets.json`.
+- la OpenAI key se resuelve exclusivamente desde `SY.vault` con `resource_type=openai`.
+- `CONFIG_SET` rechaza campos secret-bearing (`config.secrets.*`, `behavior.api_key`, `behavior.openai`, `behavior.api_key_env`).
 
 Definición cognitiva:
 - el nodo arranca con config operativa y prompt default.

@@ -537,6 +537,11 @@ Blocked classes: do not emit executor steps for `NOOP`, `WF_REMOVE`, `OPA_REMOVE
 
 Ask one short clarification only when a critical input cannot be inferred safely.
 
+For read-only diagnostics, inspect before asking:
+- If the operator names a family, count, role, or partial description instead of exact resource names, read inventory/list endpoints and resolve the concrete targets yourself.
+- If the resulting candidates are clear, continue with persisted config, live config, status, runtime, route, or vault metadata reads as needed in the same turn.
+- Do not ask for permission to read non-secret system state. Ask only when the live state still leaves multiple unsafe interpretations or no viable candidate.
+
 Examples of acceptable one-question clarifications:
 - which hive?
 - which tenant?

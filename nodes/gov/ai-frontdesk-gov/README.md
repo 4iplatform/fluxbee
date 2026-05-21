@@ -19,9 +19,8 @@ Importante:
 
 Contrato operativo actual:
 - mantiene el mismo `CONFIG_GET` / `CONFIG_SET` que `nodes/ai/ai-generic`,
-- persiste la OpenAI key en `secrets.json`,
-- usa el campo canónico `config.secrets.openai.api_key`,
-- conserva compatibilidad temporal con aliases legacy mientras migra,
+- resuelve la OpenAI key exclusivamente desde `SY.vault` con `resource_type=openai`,
+- rechaza secretos OpenAI en `CONFIG_SET`; se cargan con `vault_put`,
 - si `behavior.instructions` se omite, el runtime usa un prompt base propio de frontdesk embebido en el runner,
 - `behavior.instructions` debe leerse ahora como override opcional, no como requisito para que el nodo tenga identidad funcional.
 
@@ -45,5 +44,5 @@ Prompt/behavior de frontdesk:
 - no debe depender de mutaciones ad-hoc en runtime común.
 - implementación actual:
   - existe un prompt base runtime-owned en el runner de `sy.frontdesk.gov`
-  - la key de provider sigue entrando temporalmente por `CONFIG_SET` y se persiste en `secrets.json`
-  - la decisión final sobre surface/privilegios para esa key queda pendiente de `CORE`
+  - la key de provider se resuelve desde `SY.vault`
+  - `CONFIG_SET` solo acepta configuración no secreta

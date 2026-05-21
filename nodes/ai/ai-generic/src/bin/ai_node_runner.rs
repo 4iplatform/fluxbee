@@ -27,10 +27,7 @@ use fluxbee_sdk::protocol::{
     Destination, MemoryPackage, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    build_node_secret_record, load_node_secret_record, load_node_secret_record_with_root,
-    managed_node_config_path, managed_node_name, save_node_secret_record,
-    save_node_secret_record_with_root, NodeSecretDescriptor, NodeSecretWriteOptions,
-    NODE_SECRET_REDACTION_TOKEN,
+    managed_node_config_path, managed_node_name,
 };
 use fluxbee_sdk::{MSG_ILK_REGISTER, MSG_TNT_CREATE};
 use serde::{Deserialize, Serialize};
@@ -50,7 +47,6 @@ const GOV_IDENTITY_TARGET_ENV: &str = "GOV_IDENTITY_TARGET";
 const GOV_IDENTITY_TIMEOUT_MS_ENV: &str = "GOV_IDENTITY_TIMEOUT_MS";
 const GOV_IDENTITY_TENANT_ID_ENV: &str = "GOV_IDENTITY_TENANT_ID";
 const IMMEDIATE_INTERACTION_MAX_CHARS: usize = 1_200;
-const AI_LOCAL_SECRET_KEY_OPENAI: &str = "openai_api_key";
 const AI_RUNTIME_KIND: &str = "ai.generic";
 const DEFAULT_AGENT_ASSET_BLOB_ROOT: &str = "/var/lib/fluxbee/blob";
 const AGENT_ASSET_MAX_BYTES: u64 = 256 * 1024;
@@ -160,12 +156,6 @@ struct OpenAiChatSection {
     instructions: Option<InstructionsSourceConfig>,
     #[serde(default)]
     model_settings: Option<RunnerModelSettings>,
-    #[serde(default = "default_openai_api_key_env")]
-    api_key_env: String,
-    #[serde(default)]
-    api_key: Option<String>,
-    #[serde(default)]
-    openai: Option<OpenAiCredentialsSection>,
     #[serde(default)]
     base_url: Option<String>,
     #[serde(default)]
@@ -176,12 +166,6 @@ struct OpenAiChatSection {
 struct BehaviorCapabilities {
     #[serde(default)]
     multimodal: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct OpenAiCredentialsSection {
-    #[serde(default)]
-    api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -245,8 +229,6 @@ struct EffectiveConfigDocument {
     behavior: EffectiveBehaviorSection,
     #[serde(default)]
     runtime: Option<EffectiveRuntimeSection>,
-    #[serde(default)]
-    secrets: Option<EffectiveSecretsSection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -279,12 +261,6 @@ struct EffectiveBehaviorSection {
     instructions: Option<Value>,
     #[serde(default)]
     model_settings: Option<RunnerModelSettings>,
-    #[serde(default)]
-    api_key_env: Option<String>,
-    #[serde(default)]
-    api_key: Option<String>,
-    #[serde(default)]
-    openai: Option<OpenAiCredentialsSection>,
     #[serde(default)]
     base_url: Option<String>,
     #[serde(default)]
@@ -329,20 +305,6 @@ struct EffectiveRuntimeSection {
     immediate_memory: Option<ImmediateMemorySection>,
     #[serde(default)]
     cognitive_definition: Option<CognitiveDefinitionSection>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct EffectiveSecretsSection {
-    #[serde(default)]
-    openai: Option<EffectiveOpenAiSecrets>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct EffectiveOpenAiSecrets {
-    #[serde(default)]
-    api_key: Option<String>,
-    #[serde(default)]
-    api_key_env: Option<String>,
 }
 
 impl Default for RuntimeSection {
@@ -410,10 +372,6 @@ fn default_model() -> String {
     "gpt-4.1-mini".to_string()
 }
 
-fn default_openai_api_key_env() -> String {
-    "OPENAI_API_KEY".to_string()
-}
-
 fn default_multimodal_for_runtime() -> bool {
     true
 }
@@ -433,8 +391,6 @@ struct OpenAiChatRuntime {
     model: String,
     instructions: Option<String>,
     model_settings: ModelSettings,
-    api_key_env: String,
-    yaml_inline_api_key: Option<String>,
     base_url: Option<String>,
     immediate_memory: ImmediateMemorySection,
     multimodal: bool,
@@ -1140,6 +1096,19 @@ impl CognitiveDefinitionRuntimeState {
     }
 }
 
+fn should_reuse_cognitive_state(
+    current: &CognitiveDefinitionRuntimeState,
+    ilk_id: &str,
+    hashes: &CognitiveDefinitionHashes,
+) -> bool {
+    current.enabled
+        && current.last_identity_seq.is_some()
+        && current.ilk_id.as_deref() == Some(ilk_id)
+        && current.last_hashes == *hashes
+        && current.active_prompt.is_some()
+        && !current.has_failures()
+}
+
 #[async_trait]
 impl AiNode for GenericAiNode {
     async fn on_message(&self, msg: Message) -> fluxbee_ai_sdk::Result<Option<Message>> {
@@ -1342,7 +1311,7 @@ impl GenericAiNode {
     ) -> fluxbee_ai_sdk::Result<AiBehaviorOutput> {
         let api_key = self.resolve_openai_api_key(openai).await.ok_or_else(|| {
             fluxbee_ai_sdk::errors::AiSdkError::Protocol(
-                "missing OpenAI api key (local secrets.json, CONFIG_SET override, YAML inline, or env)"
+                "missing OpenAI api key in SY.vault resource_type=openai"
                     .to_string(),
             )
         })?;
@@ -1674,9 +1643,8 @@ impl GenericAiNode {
     /// resource in SY.vault (pool match: dedicated to caller ILK → caller
     /// tenant pool → root tenant pool, i.e.
     /// `tnt:00000000-0000-0000-0000-000000000001`). This is the **only**
-    /// supported source. The
-    /// legacy alternatives (`api_key` plaintext, env var, YAML inline,
-    /// effective_config) were removed in Phase J' / VA-J6.
+    /// supported source. Plaintext config fields, env-var references, YAML
+    /// inline secrets, and local `secrets.json` persistence are not accepted.
     ///
     /// Requires `self_ilk_id` and `self_tenant_id` to be present (set by
     /// the orchestrator via FLUXBEE_NODE_ILK_ID + FLUXBEE_NODE_TENANT_ID
@@ -1917,6 +1885,24 @@ impl GenericAiNode {
                 );
             }
         };
+        if let Some(field) = find_openai_secret_contract_field(&config) {
+            return self.invalid_config_response(
+                Some(schema_version),
+                Some(config_version),
+                format!(
+                    "Invalid payload.config: field '{field}' is not accepted by ai.generic; load OpenAI credentials through SY.vault with resource_type=openai"
+                ),
+            );
+        }
+        if let Some(field) = find_unsupported_ai_config_field(&config) {
+            return self.invalid_config_response(
+                Some(schema_version),
+                Some(config_version),
+                format!(
+                    "Invalid payload.config: field '{field}' is not accepted by ai.generic; cognitive role/skill/handbook/personality hashes must be applied to the ILK with set_ilk_definition"
+                ),
+            );
+        }
         let mut config_doc = match parse_effective_config_doc(&config) {
             Ok(v) => v,
             Err(err) => {
@@ -1928,21 +1914,6 @@ impl GenericAiNode {
             }
         };
         config_doc = materialize_effective_defaults(&self.node_name, config_doc);
-        if let Some(api_key) = extract_openai_api_key_from_effective_config(&config_doc)
-            .filter(|value| !value.trim().is_empty() && value != NODE_SECRET_REDACTION_TOKEN)
-        {
-            let options = build_secret_write_options_from_message(msg);
-            if let Err(err) = persist_local_openai_api_key(&self.node_name, &api_key, &options) {
-                return self.error_response(
-                    "secret_persist_error",
-                    format!("Failed to persist local OpenAI secret: {err}"),
-                    schema_version,
-                    config_version,
-                    self.control_plane.read().await.current_state.as_str(),
-                );
-            }
-        }
-        strip_openai_api_key_from_effective_config(&mut config_doc);
         let next_behavior = match build_behavior_from_effective_config(&config_doc) {
             Ok(v) => v,
             Err(err) => {
@@ -2130,11 +2101,6 @@ impl GenericAiNode {
         } else {
             json!({"code":"node_not_configured","message":"No effective config available"})
         };
-        let mut secret_descriptor =
-            NodeSecretDescriptor::new("config.secrets.openai.api_key", AI_LOCAL_SECRET_KEY_OPENAI);
-        secret_descriptor.required = true;
-        secret_descriptor.configured = api_key_source != OpenAiApiKeySource::Missing;
-        secret_descriptor.persistence = api_key_source.as_str().to_string();
         json!({
             "subsystem": "ai_node",
             "node_name": self.node_name.as_str(),
@@ -2150,23 +2116,39 @@ impl GenericAiNode {
                 "supports": ["CONFIG_GET", "CONFIG_SET"],
                 "required_fields": [
                     "config.behavior.kind",
-                    "config.behavior.model",
-                    "config.secrets.openai.api_key"
+                    "config.behavior.model"
                 ],
+                "field_values": {
+                    "config.behavior.kind": {
+                        "allowed": ["echo", "openai_chat"],
+                        "notes": ["Use openai_chat for OpenAI-backed chat. Do not use openai."]
+                    },
+                    "config.behavior.model": {
+                        "examples": ["gpt-4.1-mini"]
+                    }
+                },
                 "optional_fields": [
                     "config.behavior.instructions",
                     "config.behavior.model_settings",
                     "config.behavior.base_url",
-                    "config.behavior.capabilities.multimodal",
-                    "config.secrets.openai.api_key_env"
+                    "config.behavior.capabilities.multimodal"
                 ],
-                "secrets": [secret_descriptor],
+                "resources": [
+                    {
+                        "resource_type": "openai",
+                        "required": true,
+                        "source": api_key_source.as_str(),
+                        "configured": api_key_source != OpenAiApiKeySource::Missing,
+                        "provider": "SY.vault"
+                    }
+                ],
                 "notes": [
-                    "Preferred secret field is config.secrets.openai.api_key.",
-                    "Legacy aliases config.behavior.openai.api_key and config.behavior.api_key remain accepted during migration.",
+                    "Cognitive assets are not part of CONFIG_SET. Apply role_hash, skill_hashes, handbook_hashes, and personality_hash with set_ilk_definition against the agent ILK.",
+                    "OpenAI credentials are resolved only from SY.vault using resource_type=openai.",
+                    "For OpenAI behavior set config.behavior.kind=openai_chat, not openai.",
+                    "CONFIG_SET rejects secret-bearing fields such as config.secrets.openai.api_key, config.behavior.openai.api_key, config.behavior.api_key, and config.behavior.api_key_env.",
                     "ai.generic defaults behavior.capabilities.multimodal=true unless explicitly overridden.",
-                    "Cognitive role/skill/handbook prompt definition is loaded from identity SHM and blob://agent-assets/<hash>.json.",
-                    "Secret values are persisted in local secrets.json and always returned redacted."
+                    "Cognitive role/skill/handbook prompt definition is loaded from identity SHM and blob://agent-assets/<hash>.json."
                 ]
             },
             "effective_config": state.effective_config.as_ref().map(redact_secrets),
@@ -2449,11 +2431,9 @@ async fn refresh_cognitive_definition(
 
     let hashes = hashes_from_identity_ilk(&ilk);
     {
-        let current = state.read().await;
-        if current.last_identity_seq == Some(seq)
-            && current.last_hashes == hashes
-            && !current.has_failures()
-        {
+        let mut current = state.write().await;
+        if should_reuse_cognitive_state(&current, &ilk.ilk_id, &hashes) {
+            current.last_identity_seq = Some(seq);
             return Ok(());
         }
     }
@@ -4569,6 +4549,19 @@ async fn run_single_connection_runtime(
             Err(err) => return Err(err),
         };
         read_messages = read_messages.saturating_add(1);
+        tracing::info!(
+            node_name = %node.node_name,
+            trace_id = %msg.routing.trace_id,
+            src = %msg.routing.src,
+            src_l2_name = ?msg.routing.src_l2_name,
+            dst = ?msg.routing.dst,
+            msg_type = %msg.meta.msg_type,
+            msg = ?msg.meta.msg,
+            action = ?msg.meta.action,
+            thread_id = ?msg.meta.thread_id,
+            via_tap = msg.meta.via_tap,
+            "ai runtime received router message"
+        );
 
         let mut attempt = 0usize;
         let max_attempts = config.retry_policy.max_attempts.max(1);
@@ -4837,31 +4830,7 @@ async fn run_unconfigured_bootstrap(
     };
     let (behavior, state) = match persisted_dynamic.as_ref() {
         Some(stored) => {
-            let mut materialized =
-                materialize_effective_defaults(&node_name, stored.config.clone());
-            let migrated = migrate_bootstrap_openai_secret(&node_name, &mut materialized);
-            if let Err(err) = &migrated {
-                tracing::warn!(
-                    node_name = %node_name,
-                    error = %err,
-                    "failed to migrate persisted OpenAI secret to local secrets.json"
-                );
-            }
-            if migrated.as_ref().ok().copied().unwrap_or(false) {
-                if let Err(err) = persist_dynamic_config(
-                    &dynamic_dir,
-                    &node_name,
-                    stored.schema_version,
-                    stored.config_version,
-                    &materialized,
-                ) {
-                    tracing::warn!(
-                        node_name = %node_name,
-                        error = %err,
-                        "failed to rewrite persisted dynamic config after secret migration"
-                    );
-                }
-            }
+            let materialized = materialize_effective_defaults(&node_name, stored.config.clone());
             match build_behavior_from_effective_config(&materialized) {
                 Ok(behavior) => {
                     tracing::info!(
@@ -4905,15 +4874,7 @@ async fn run_unconfigured_bootstrap(
         }
         None => {
             if let Some(spawn_cfg) = spawn_effective {
-                let mut spawn_config = spawn_cfg.config.clone();
-                let migrated = migrate_bootstrap_openai_secret(&node_name, &mut spawn_config);
-                if let Err(err) = &migrated {
-                    tracing::warn!(
-                        node_name = %node_name,
-                        error = %err,
-                        "failed to migrate spawn OpenAI secret to local secrets.json"
-                    );
-                }
+                let spawn_config = spawn_cfg.config.clone();
                 match build_behavior_from_effective_config(&spawn_config) {
                     Ok(behavior) => {
                         tracing::info!(
@@ -5225,11 +5186,6 @@ fn build_behavior(
                     max_output_tokens: v.max_output_tokens,
                 })
                 .unwrap_or_default();
-            let yaml_inline_api_key = openai
-                .openai
-                .as_ref()
-                .and_then(|v| v.api_key.clone())
-                .or_else(|| openai.api_key.clone());
             let multimodal = openai
                 .capabilities
                 .as_ref()
@@ -5239,8 +5195,6 @@ fn build_behavior(
                 model: openai.model.clone(),
                 instructions,
                 model_settings,
-                api_key_env: openai.api_key_env.clone(),
-                yaml_inline_api_key,
                 base_url: openai.base_url.clone(),
                 immediate_memory: cfg.runtime.immediate_memory.clone(),
                 multimodal,
@@ -5273,19 +5227,6 @@ fn build_behavior_from_effective_config(
 
             let instructions = extract_instructions_from_effective_config(behavior);
             let model_settings = extract_model_settings_from_effective_config(behavior);
-            let api_key_env = behavior
-                .api_key_env
-                .clone()
-                .or_else(|| {
-                    config
-                        .secrets
-                        .as_ref()
-                        .and_then(|v| v.openai.as_ref())
-                        .and_then(|v| v.api_key_env.clone())
-                })
-                .unwrap_or_else(|| "OPENAI_API_KEY".to_string());
-            let yaml_inline_api_key = extract_openai_api_key_from_effective_config(config)
-                .filter(|v| v != "***REDACTED***");
             let base_url = behavior.base_url.clone();
             let immediate_memory = config
                 .runtime
@@ -5302,8 +5243,6 @@ fn build_behavior_from_effective_config(
                 model,
                 instructions,
                 model_settings,
-                api_key_env,
-                yaml_inline_api_key,
                 base_url,
                 immediate_memory,
                 multimodal,
@@ -5373,9 +5312,6 @@ fn build_startup_effective_config_doc(cfg: &RunnerConfig) -> EffectiveConfigDocu
             model: Some(openai.model.clone()),
             instructions: Some(format_instructions_snapshot(&openai.instructions)),
             model_settings: openai.model_settings.clone(),
-            api_key_env: Some(openai.api_key_env.clone()),
-            api_key: openai.api_key.clone(),
-            openai: openai.openai.clone(),
             base_url: openai.base_url.clone(),
             capabilities: Some(BehaviorCapabilities {
                 multimodal: Some(
@@ -5414,7 +5350,6 @@ fn build_startup_effective_config_doc(cfg: &RunnerConfig) -> EffectiveConfigDocu
             immediate_memory: Some(cfg.runtime.immediate_memory.clone()),
             cognitive_definition: Some(cfg.runtime.cognitive_definition.clone()),
         }),
-        secrets: None,
     }
 }
 
@@ -5429,6 +5364,18 @@ fn load_persisted_dynamic_config(
 ) -> Option<EffectiveStateFile> {
     let path = dynamic_config_path(base_dir, node_name);
     let raw = fs::read_to_string(path).ok()?;
+    let root: Value = serde_json::from_str(&raw).ok()?;
+    if let Some(field) = root
+        .get("config")
+        .and_then(find_openai_secret_contract_field)
+    {
+        tracing::warn!(
+            node_name = %node_name,
+            field,
+            "persisted AI config contains unsupported secret-bearing field; ignoring persisted config"
+        );
+        return None;
+    }
     serde_json::from_str::<EffectiveStateFile>(&raw).ok()
 }
 
@@ -5525,162 +5472,45 @@ fn extract_openai_api_key_from_value(value: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn extract_openai_api_key_from_config(config: &Value) -> Option<String> {
-    config
-        .get("secrets")
-        .and_then(|v| v.get("openai"))
-        .and_then(|v| v.get("api_key"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .or_else(|| {
-            config
-                .get("behavior")
-                .and_then(|v| v.get("openai"))
-                .and_then(|v| v.get("api_key"))
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        })
-        .or_else(|| {
-            config
-                .get("behavior")
-                .and_then(|v| v.get("api_key"))
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        })
-}
-
-fn extract_openai_api_key_from_effective_config(
-    config: &EffectiveConfigDocument,
-) -> Option<String> {
-    config
-        .secrets
-        .as_ref()
-        .and_then(|v| v.openai.as_ref())
-        .and_then(|v| v.api_key.clone())
-        .or_else(|| {
-            config
-                .behavior
-                .openai
-                .as_ref()
-                .and_then(|v| v.api_key.clone())
-        })
-        .or_else(|| config.behavior.api_key.clone())
-}
-
-fn strip_openai_api_key_from_effective_config(config: &mut EffectiveConfigDocument) {
-    if let Some(openai) = config.behavior.openai.as_mut() {
-        openai.api_key = None;
+fn find_openai_secret_contract_field(config: &Value) -> Option<&'static str> {
+    let behavior = config.get("behavior");
+    if config.get("secrets").is_some() {
+        return Some("config.secrets");
     }
-    config.behavior.api_key = None;
-    if let Some(secrets) = config.secrets.as_mut() {
-        if let Some(openai) = secrets.openai.as_mut() {
-            openai.api_key = None;
-        }
+    if behavior.and_then(|v| v.get("api_key")).is_some() {
+        return Some("config.behavior.api_key");
     }
-}
-
-fn persist_local_openai_api_key(
-    node_name: &str,
-    api_key: &str,
-    options: &NodeSecretWriteOptions,
-) -> Result<(), fluxbee_sdk::NodeSecretError> {
-    persist_local_openai_api_key_with_root(node_name, None::<&std::path::Path>, api_key, options)
-}
-
-fn persist_local_openai_api_key_with_root(
-    node_name: &str,
-    root: Option<&std::path::Path>,
-    api_key: &str,
-    options: &NodeSecretWriteOptions,
-) -> Result<(), fluxbee_sdk::NodeSecretError> {
-    let mut secrets = match root {
-        Some(value) => load_node_secret_record_with_root(node_name, value.to_path_buf()),
-        None => load_node_secret_record(node_name),
+    if behavior.and_then(|v| v.get("api_key_env")).is_some() {
+        return Some("config.behavior.api_key_env");
     }
-    .map(|record| record.secrets)
-    .unwrap_or_else(|_| serde_json::Map::new());
-    secrets.insert(
-        AI_LOCAL_SECRET_KEY_OPENAI.to_string(),
-        Value::String(api_key.to_string()),
-    );
-    let record = build_node_secret_record(secrets, options);
-    match root {
-        Some(value) => {
-            save_node_secret_record_with_root(node_name, value.to_path_buf(), &record)?;
-        }
-        None => {
-            save_node_secret_record(node_name, &record)?;
-        }
+    if behavior.and_then(|v| v.get("openai")).is_some() {
+        return Some("config.behavior.openai");
     }
-    Ok(())
+    None
 }
 
-fn load_local_openai_api_key(node_name: &str) -> Option<String> {
-    load_local_openai_api_key_with_root(node_name, None::<&std::path::Path>)
-}
-
-fn load_local_openai_api_key_with_root(
-    node_name: &str,
-    root: Option<&std::path::Path>,
-) -> Option<String> {
-    let record = match root {
-        Some(value) => load_node_secret_record_with_root(node_name, value.to_path_buf()).ok(),
-        None => load_node_secret_record(node_name).ok(),
-    };
-    record
-        .and_then(|record| record.secrets.get(AI_LOCAL_SECRET_KEY_OPENAI).cloned())
-        .and_then(|value| value.as_str().map(ToString::to_string))
-        .filter(|value| !value.trim().is_empty() && value != NODE_SECRET_REDACTION_TOKEN)
-}
-
-fn build_secret_write_options_from_message(msg: &Message) -> NodeSecretWriteOptions {
-    let updated_by_label = msg
-        .payload
-        .get("requested_by")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| msg.meta.action.clone());
-    NodeSecretWriteOptions {
-        updated_by_ilk: msg.meta.src_ilk.clone(),
-        updated_by_label,
-        trace_id: Some(msg.routing.trace_id.clone()),
+fn find_unsupported_ai_config_field(config: &Value) -> Option<&'static str> {
+    if config.get("assets").is_some() {
+        return Some("config.assets");
     }
-}
-
-fn migrate_bootstrap_openai_secret(
-    node_name: &str,
-    config: &mut EffectiveConfigDocument,
-) -> Result<bool, fluxbee_sdk::NodeSecretError> {
-    migrate_bootstrap_openai_secret_with_root(node_name, None::<&std::path::Path>, config)
-}
-
-fn migrate_bootstrap_openai_secret_with_root(
-    node_name: &str,
-    root: Option<&std::path::Path>,
-    config: &mut EffectiveConfigDocument,
-) -> Result<bool, fluxbee_sdk::NodeSecretError> {
-    let Some(api_key) = extract_openai_api_key_from_effective_config(config)
-        .filter(|value| !value.trim().is_empty() && value != NODE_SECRET_REDACTION_TOKEN)
-    else {
-        return Ok(false);
-    };
-    if load_local_openai_api_key_with_root(node_name, root).is_none() {
-        let options = NodeSecretWriteOptions {
-            updated_by_ilk: None,
-            updated_by_label: Some("bootstrap_migration".to_string()),
-            trace_id: None,
-        };
-        persist_local_openai_api_key_with_root(node_name, root, &api_key, &options)?;
-    }
-    strip_openai_api_key_from_effective_config(config);
-    Ok(true)
+    None
 }
 
 fn parse_effective_config_doc(
     config: &Value,
 ) -> Result<EffectiveConfigDocument, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(field) = find_openai_secret_contract_field(config) {
+        return Err(format!(
+            "secret-bearing field '{field}' is not accepted by ai.generic; use SY.vault resource_type=openai"
+        )
+        .into());
+    }
+    if let Some(field) = find_unsupported_ai_config_field(config) {
+        return Err(format!(
+            "unsupported field '{field}'; cognitive assets must be applied through set_ilk_definition"
+        )
+        .into());
+    }
     Ok(serde_json::from_value::<EffectiveConfigDocument>(
         config.clone(),
     )?)
@@ -5835,33 +5665,6 @@ fn materialize_effective_defaults(
         if config.behavior.provider.is_none() {
             config.behavior.provider = Some("openai".to_string());
         }
-        if config.behavior.api_key_env.is_none() {
-            let inherited = config
-                .secrets
-                .as_ref()
-                .and_then(|v| v.openai.as_ref())
-                .and_then(|v| v.api_key_env.clone());
-            config.behavior.api_key_env =
-                Some(inherited.unwrap_or_else(|| default_openai_api_key_env()));
-        }
-        if config.secrets.is_none() {
-            config.secrets = Some(EffectiveSecretsSection::default());
-        }
-        if let Some(secrets) = config.secrets.as_mut() {
-            if secrets.openai.is_none() {
-                secrets.openai = Some(EffectiveOpenAiSecrets::default());
-            }
-            if let Some(openai_secrets) = secrets.openai.as_mut() {
-                if openai_secrets.api_key.is_none() {
-                    openai_secrets.api_key = config
-                        .behavior
-                        .openai
-                        .as_ref()
-                        .and_then(|v| v.api_key.clone())
-                        .or_else(|| config.behavior.api_key.clone());
-                }
-            }
-        }
     }
     config
 }
@@ -5997,7 +5800,7 @@ fn missing_openai_api_key_payload() -> Value {
     json!({
         "type": "error",
         "code": "missing_openai_api_key",
-        "message": "Missing OpenAI API key in local secrets.json, CONFIG_SET override, YAML inline, or env.",
+        "message": "Missing OpenAI API key in SY.vault resource_type=openai.",
         "retryable": true
     })
 }
@@ -6638,6 +6441,52 @@ mod tests {
     }
 
     #[test]
+    fn cognitive_definition_reuses_state_when_hashes_are_unchanged() {
+        let root = cognitive_temp_root("reuse-unchanged-hashes");
+        let role_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        write_cognitive_asset(
+            &root,
+            role_hash,
+            json!({
+                "asset_type": "role",
+                "name": "Support role",
+                "description": "Answer as a Fluxbee support agent."
+            }),
+        );
+        let mut ilk = sample_agent_ilk();
+        ilk.role_hash = Some(role_hash.to_string());
+        let hashes = hashes_from_identity_ilk(&ilk);
+        let mut state =
+            compose_cognitive_state(&root, 8, &ilk, hashes.clone()).expect("compose state");
+
+        assert!(should_reuse_cognitive_state(&state, &ilk.ilk_id, &hashes));
+
+        state.last_identity_seq = Some(12);
+        assert!(
+            should_reuse_cognitive_state(&state, &ilk.ilk_id, &hashes),
+            "identity SHM heartbeat seq changes must not force recomposition"
+        );
+
+        let mut changed_hashes = hashes.clone();
+        changed_hashes.skill_hashes = vec![
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        ];
+        assert!(!should_reuse_cognitive_state(
+            &state,
+            &ilk.ilk_id,
+            &changed_hashes
+        ));
+
+        state.failed_hashes.push(CognitiveAssetFailure {
+            hash: role_hash.to_string(),
+            asset_type: "role".to_string(),
+            error: "temporary read failure".to_string(),
+        });
+        assert!(!should_reuse_cognitive_state(&state, &ilk.ilk_id, &hashes));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn cognitive_definition_composes_role_skill_and_handbook_assets() {
         let root = cognitive_temp_root("compose-assets");
         let role_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -6943,17 +6792,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    fn temp_secret_root(test_name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "fluxbee-ai-secret-tests-{}-{}",
-            test_name,
-            Uuid::new_v4()
-        ));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).expect("create temp root");
-        path
-    }
-
     #[tokio::test]
     async fn node_status_get_respects_handler_enabled_env_false() {
         let _guard = env_lock().lock().expect("env lock");
@@ -7017,8 +6855,6 @@ mod tests {
                 model: "gpt-4.1-mini".to_string(),
                 instructions: Some("Test instructions".to_string()),
                 model_settings: ModelSettings::default(),
-                api_key_env: "OPENAI_API_KEY_MISSING_FOR_TEST".to_string(),
-                yaml_inline_api_key: None,
                 base_url: None,
                 immediate_memory: ImmediateMemorySection::default(),
                 multimodal: true,
@@ -7522,167 +7358,60 @@ mod tests {
     }
 
     #[test]
-    fn strip_openai_secret_removes_inline_secret_fields() {
-        let mut config = EffectiveConfigDocument {
-            behavior: EffectiveBehaviorSection {
-                kind: "openai_chat".to_string(),
-                api_key: Some("legacy-top-level".to_string()),
-                openai: Some(OpenAiCredentialsSection {
-                    api_key: Some("legacy-nested".to_string()),
+    fn parse_effective_config_rejects_openai_secret_contract_fields() {
+        let cases = [
+            (
+                json!({
+                    "behavior": {"kind": "openai_chat", "model": "gpt-4.1-mini"},
+                    "secrets": {"openai": {"api_key": "sk-test"}}
                 }),
-                ..EffectiveBehaviorSection::default()
-            },
-            secrets: Some(EffectiveSecretsSection {
-                openai: Some(EffectiveOpenAiSecrets {
-                    api_key: Some("canonical-secret".to_string()),
-                    api_key_env: Some("OPENAI_API_KEY".to_string()),
-                }),
-            }),
-            ..EffectiveConfigDocument::default()
-        };
-
-        strip_openai_api_key_from_effective_config(&mut config);
-
-        assert_eq!(config.behavior.api_key, None);
-        assert_eq!(
-            config
-                .behavior
-                .openai
-                .as_ref()
-                .and_then(|value| value.api_key.as_ref()),
-            None
-        );
-        assert_eq!(
-            config
-                .secrets
-                .as_ref()
-                .and_then(|value| value.openai.as_ref())
-                .and_then(|value| value.api_key.as_ref()),
-            None
-        );
-        assert_eq!(
-            config
-                .secrets
-                .as_ref()
-                .and_then(|value| value.openai.as_ref())
-                .and_then(|value| value.api_key_env.as_deref()),
-            Some("OPENAI_API_KEY")
-        );
-    }
-
-    #[test]
-    fn build_secret_write_options_uses_requested_by_and_trace_id() {
-        let msg = Message {
-            routing: Routing {
-                src: "SY.admin@motherbee".to_string(),
-                src_l2_name: None,
-                dst: Destination::Unicast("AI.chat@motherbee".to_string()),
-                ttl: 16,
-                trace_id: "trace-config-123".to_string(),
-            },
-            meta: Meta {
-                msg_type: "system".to_string(),
-                msg: Some("CONFIG_SET".to_string()),
-                src_ilk: Some("ilk:123".to_string()),
-                scope: None,
-                target: Some("node_config_control".to_string()),
-                action: Some("CONFIG_SET".to_string()),
-                priority: None,
-                context: None,
-                ..Meta::default()
-            },
-            payload: json!({
-                "requested_by": "archi",
-                "config": {
-                    "secrets": {
-                        "openai": {
-                            "api_key": "sk-test"
-                        }
+                "config.secrets",
+            ),
+            (
+                json!({
+                    "behavior": {
+                        "kind": "openai_chat",
+                        "model": "gpt-4.1-mini",
+                        "api_key": "sk-test"
                     }
-                }
-            }),
-        };
-
-        let options = build_secret_write_options_from_message(&msg);
-
-        assert_eq!(options.updated_by_ilk.as_deref(), Some("ilk:123"));
-        assert_eq!(options.updated_by_label.as_deref(), Some("archi"));
-        assert_eq!(options.trace_id.as_deref(), Some("trace-config-123"));
-    }
-
-    #[test]
-    fn local_openai_secret_roundtrip_survives_reload_with_root() {
-        let root = temp_secret_root("roundtrip");
-        let node_name = "AI.chat@motherbee";
-        let options = NodeSecretWriteOptions {
-            updated_by_ilk: Some("ilk:test".to_string()),
-            updated_by_label: Some("archi".to_string()),
-            trace_id: Some("trace-secret-1".to_string()),
-        };
-
-        persist_local_openai_api_key_with_root(
-            node_name,
-            Some(root.as_path()),
-            "sk-test-roundtrip",
-            &options,
-        )
-        .expect("persist local secret");
-
-        let loaded = load_local_openai_api_key_with_root(node_name, Some(root.as_path()));
-        assert_eq!(loaded.as_deref(), Some("sk-test-roundtrip"));
-
-        let secret_record = load_node_secret_record_with_root(node_name, root.clone())
-            .expect("load redacted secret record");
-        assert_eq!(secret_record.updated_by_label.as_deref(), Some("archi"));
-        assert_eq!(
-            secret_record.secrets.get(AI_LOCAL_SECRET_KEY_OPENAI),
-            Some(&Value::String("sk-test-roundtrip".to_string()))
-        );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn migrate_bootstrap_secret_persists_local_file_and_strips_inline_secret() {
-        let root = temp_secret_root("migrate");
-        let node_name = "AI.chat@motherbee";
-        let mut config = EffectiveConfigDocument {
-            behavior: EffectiveBehaviorSection {
-                kind: "openai_chat".to_string(),
-                api_key: Some("legacy-top-level".to_string()),
-                openai: Some(OpenAiCredentialsSection {
-                    api_key: Some("legacy-nested".to_string()),
                 }),
-                ..EffectiveBehaviorSection::default()
-            },
-            secrets: Some(EffectiveSecretsSection {
-                openai: Some(EffectiveOpenAiSecrets {
-                    api_key: Some("canonical-secret".to_string()),
-                    api_key_env: Some("OPENAI_API_KEY".to_string()),
+                "config.behavior.api_key",
+            ),
+            (
+                json!({
+                    "behavior": {
+                        "kind": "openai_chat",
+                        "model": "gpt-4.1-mini",
+                        "api_key_env": "OPENAI_API_KEY"
+                    }
                 }),
-            }),
-            ..EffectiveConfigDocument::default()
-        };
+                "config.behavior.api_key_env",
+            ),
+            (
+                json!({
+                    "behavior": {
+                        "kind": "openai_chat",
+                        "model": "gpt-4.1-mini",
+                        "openai": {"api_key": "sk-test"}
+                    }
+                }),
+                "config.behavior.openai",
+            ),
+            (
+                json!({
+                    "behavior": {"kind": "openai_chat", "model": "gpt-4.1-mini"},
+                    "assets": {"role_hash": "abc"}
+                }),
+                "config.assets",
+            ),
+        ];
 
-        let changed =
-            migrate_bootstrap_openai_secret_with_root(node_name, Some(root.as_path()), &mut config)
-                .expect("migrate bootstrap secret");
-
-        assert!(changed);
-        assert_eq!(
-            load_local_openai_api_key_with_root(node_name, Some(root.as_path())).as_deref(),
-            Some("canonical-secret")
-        );
-        assert_eq!(extract_openai_api_key_from_effective_config(&config), None);
-
-        let value = serde_json::to_value(&config).expect("serialize config");
-        let serialized = serde_json::to_string(&value).expect("serialize config json");
-        assert!(!serialized.contains("canonical-secret"));
-        let redacted = redact_secrets(&value);
-        let redacted_json = serde_json::to_string(&redacted).expect("serialize redacted config");
-        assert!(!redacted_json.contains("canonical-secret"));
-
-        let _ = fs::remove_dir_all(root);
+        for (config, field) in cases {
+            assert_eq!(find_openai_secret_contract_field(&config), Some(field));
+            let err = parse_effective_config_doc(&config)
+                .expect_err("secret-bearing AI config should be rejected");
+            assert!(err.to_string().contains(field));
+        }
     }
 
     #[test]
