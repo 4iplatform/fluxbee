@@ -2296,7 +2296,7 @@ Use these facts only to select and validate planning intent. Do not treat them a
 - `get_node_config` reads persisted node config from disk/snapshot.
 - `node_control_config_get` asks a running node for its live config contract.
 - `node_control_config_set` updates live node-defined config for an existing node. It does not create nodes.
-- For config updates, read current live config first when `config_version` is required.
+- For config updates, read current live config first when `config_version` is required; for mutating AI.* / IO.* updates use `config_version = live CONFIG_GET response.config_version + 1`.
 
 ### Restart semantics
 

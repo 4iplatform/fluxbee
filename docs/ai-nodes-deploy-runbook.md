@@ -41,7 +41,7 @@ Nota operativa vigente para frontdesk:
 - en updates rutinarios, el camino correcto conceptual es `publish runtime + SYSTEM_UPDATE targeted + refresh del binario real del singleton + restart del servicio singleton`.
 - `spawn/delete/recreate` de `SY.frontdesk.gov` deben leerse como caminos excepcionales de bootstrap, reinstall o recuperación, no como el flujo normal de update.
 - el prompt funcional base del runtime no debería depender de que el operador lo cargue por `CONFIG_SET`.
-- la key de provider puede seguir entrando temporalmente por `CONFIG_SET` y persistirse en `secrets.json` mientras `CORE` define el modelo final para secretos de un AI de sistema crítico.
+- la key de provider no entra por `CONFIG_SET`; debe cargarse en `SY.vault` con `resource_type=openai`.
 - si el servicio observado usa `ExecStart=/usr/bin/sy-frontdesk-gov`, `publish + SYSTEM_UPDATE + restart` no alcanza por sí solo para cambiar el binario efectivo; primero hay que instalar el binario actualizado en `/usr/bin/sy-frontdesk-gov` o ejecutar el camino equivalente de `scripts/install.sh`.
 - el host debe restaurar `sy-frontdesk-gov` solo despues de que `rt-gateway` y `SY.identity@<hive>` esten realmente listos; unidad activa no alcanza como señal de readiness.
 - incluso con ese orden operativo corregido, sigue pendiente endurecer `SY.frontdesk.gov` internamente con retry corto/backoff frente a errores transitorios de identity (`UNREACHABLE`, `TIMEOUT`, `NOT_PRIMARY`, etc.).
@@ -217,7 +217,7 @@ Para `ai.common`, los prompts/config obligatorias pueden versionarse en el `conf
 
 Para `sy.frontdesk.gov`, la dirección vigente es distinta:
 - el prompt funcional base pertenece al runtime frontdesk,
-- `CONFIG_SET` queda preferentemente para modelo, timeouts, flags operativos y secrets,
+- `CONFIG_SET` queda para modelo, timeouts y flags operativos no secretos,
 - no para transportar obligatoriamente todo el prompt funcional del nodo.
 
 Ejemplo base para `openai_chat`:
@@ -232,7 +232,6 @@ Ejemplo base para `openai_chat`:
       "value": "Prompt obligatorio del nodo...",
       "trim": true
     },
-    "api_key_env": "OPENAI_API_KEY",
     "model_settings": {
       "temperature": 0.0,
       "top_p": 1.0,

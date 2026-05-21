@@ -24,6 +24,7 @@ This spec defines a second, node-facing contract for runtime/business configurat
 - Each node defines its own `payload.config` shape.
 - Clients that need to configure a node must first call `CONFIG_GET`.
 - `CONFIG_GET` must return enough information for a client such as `archi` to build a valid `CONFIG_SET`.
+- For mutating updates, clients must use `CONFIG_GET.config_version + 1` unless the node contract explicitly says otherwise.
 - The config payload remains open/extensible for future node types.
 - This contract applies to all non-`SY` nodes.
 
@@ -116,7 +117,7 @@ Minimal request:
   },
   "payload": {
     "node_name": "AI.chat@motherbee",
-    "config_version": 7,
+    "config_version": 8,
     "apply_mode": "replace",
     "config": {}
   }
@@ -128,7 +129,7 @@ Minimal request:
 The platform/common contract defines only these common payload fields:
 
 - `node_name`: fully-qualified target node
-- `config_version`: monotonic version chosen by the caller/node contract
+- `config_version`: next monotonic version for the node-owned live config. For the common `replace` flow, call `CONFIG_GET`, read `config_version`, and send `config_version + 1`. Sending a smaller version is stale; sending the same version may be treated as idempotent and not apply a mutation.
 - `apply_mode`: `replace` or a future compatible mode such as `merge_patch`
 - `config`: free-form JSON object interpreted by the node
 
@@ -167,38 +168,32 @@ Recommended `contract` contents:
 - `examples`
 - `notes`
 
-### 7.1 Minimum `contract.secrets[*]` contract
+### 7.1 Minimum `contract.resources[*]` contract
 
-When a node supports secret-bearing config, each entry inside `contract.secrets` should expose at least:
+When a node depends on external secret/resource material, each entry inside `contract.resources` should expose at least:
 
-- `field`
-- `storage_key`
+- `resource_type`
 - `required`
 - `configured`
-- `value_redacted`
-- `persistence`
+- `provider`
 
 Semantics:
 
-- `field`
-  - node-owned logical config field inside `payload.config`
-- `storage_key`
-  - node-owned local key name used in secret persistence
+- `resource_type`
+  - canonical vault resource type such as `openai`
 - `required`
-  - whether the node needs this secret for a healthy/usable configuration
+  - whether the node needs this resource for a healthy/usable configuration
 - `configured`
-  - whether the secret is already present locally
-- `value_redacted`
-  - must be `true` whenever the node returns secret-related current-state information
-- `persistence`
-  - for v1 should normally be `local_file`
+  - whether the resource is available to the node
+- `provider`
+  - for current AI nodes this is `SY.vault`
 
 Rules:
 
-- `CONFIG_GET` must never return raw secret values in `contract.secrets[*]`.
+- `CONFIG_GET` must never return raw secret values in `contract.resources[*]`.
 - `CONFIG_GET` must never return raw secret values inside `config`.
-- `CONFIG_SET` may carry secret values inside `payload.config`; the platform transport does not interpret them.
-- The node is responsible for separating regular config and secrets during persistence.
+- `CONFIG_SET` must not carry secret values for `AI.*`; credentials are loaded through `SY.vault`.
+- Nodes that still expose node-local secret contracts must document that explicitly; it is not the default path.
 
 Example:
 
@@ -224,17 +219,14 @@ Example:
     ],
     "optional_fields": [
       "behavior.instructions",
-      "behavior.api_key_env",
       "runtime.worker_pool_size"
     ],
-    "secrets": [
+    "resources": [
       {
-        "field": "behavior.openai.api_key",
-        "storage_key": "openai_api_key",
-        "required": false,
+        "resource_type": "openai",
+        "required": true,
         "configured": true,
-        "value_redacted": true,
-        "persistence": "local_file"
+        "provider": "SY.vault"
       }
     ],
     "examples": [

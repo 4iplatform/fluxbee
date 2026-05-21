@@ -197,6 +197,7 @@ Semántica:
 - **Descripción:** Envía CONFIG_SET a un nodo live y retorna su CONFIG_RESPONSE.
 - **Read-only:** no | **Requiere CONFIRM:** sí
 - **Campos requeridos:** `schema_version` (u32), `config_version` (u64), `apply_mode` (string), `config` (object)
+- **Nota crítica de versionado:** antes de mutar `AI.*` o `IO.*`, ejecutar `node_control_config_get` y usar `config_version = response.config_version + 1`. Un valor menor falla como `stale_config_version`; un valor igual puede ser idempotente y no aplicar cambios.
 - **Nota WF.* v1:** CONFIG_SET es persist-only, retorna `restart_required`, no hot-aplica CONFIG_CHANGED.
 - **Nota AI.*/IO.*:** soporta hot-apply (no requiere restart).
 

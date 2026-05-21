@@ -144,40 +144,29 @@
   - `error` (si `ok=false`)
   - `effective_config` (si `ok=true`, sin secretos en claro)
 
-### 2.1.4 Secrets (v1) — `CONFIG_SET` + `secrets.json` local
+### 2.1.4 Secrets (v1) — `SY.vault` only
 
 ✅ **NORMATIVO (v1)**:
-- Para providers que requieren credenciales (p.ej. OpenAI), `CONFIG_SET` **MAY** incluir el secreto inline dentro de `config.secrets.*` para permitir operación sin intervención humana.
-- El campo canónico actual para OpenAI es:
-  - `config.secrets.openai.api_key`
-- El nodo persiste el secreto en un archivo local:
-  - `/var/lib/fluxbee/nodes/<TYPE>/<node@hive>/secrets.json`
+- Para providers que requieren credenciales (p.ej. OpenAI), `CONFIG_SET` **MUST NOT** incluir secretos.
+- El recurso canónico actual para OpenAI es `resource_type=openai` en `SY.vault`.
+- `ai.generic` rechaza campos secret-bearing como `config.secrets.*`, `behavior.openai`, `behavior.api_key` y `behavior.api_key_env`.
 
 
-#### Precedencia de secretos (HOY vs runtime)
+#### Precedencia de secretos
 
 ✅ **NORMATIVO (HOY)**:
-- **Fuente primaria** (si está presente): secreto en `secrets.json` local del nodo.
-- `CONFIG_SET` con `config.secrets.openai.api_key` debe persistir el secreto en `secrets.json`.
-- Durante migración, el nodo **MAY** aceptar aliases legacy (`behavior.openai.api_key`, `behavior.api_key`) y migrarlos a `secrets.json`.
+- **Única fuente válida:** `SY.vault`.
+- El nodo resuelve el secreto por `resource_type=openai` usando su ILK/tenant.
 - En ningún caso el nodo debe persistir el secreto inline en `${STATE_DIR}` ni dejarlo en el `effective_config` devuelto por `CONFIG_GET`.
 
 ✅ **NORMATIVO (en reinicio)**:
-- Tras restart, el nodo debe poder volver a `CONFIGURED` usando el secreto guardado en `secrets.json`.
-- Si no existe secreto local y no hay otra fuente de compatibilidad temporal, el nodo queda `FAILED_CONFIG (missing_secret)` hasta recibir nuevamente `CONFIG_SET`.
-
-🧩 **A ESPECIFICAR (futuro)**:
-- Cuando exista un gestor de secretos y `api_key_ref`, la precedencia recomendada será:
-  - `api_key_ref` (gestor) > `secrets.json` local > compat legacy temporal.
+- Tras restart, el nodo debe poder operar si `SY.vault` tiene un secreto OpenAI resoluble para su ILK/tenant o para el pool root.
+- Si no existe secreto resoluble, el nodo corre degradado y responde `missing_openai_api_key` en requests que necesitan provider.
 
 ⚠️ **ADVERTENCIA (v1)**:
 - El nodo **MUST NOT** persistir secretos en claro dentro de `${STATE_DIR}`.
 - `CONFIG_GET`, `CONFIG_RESPONSE`, status y logs no deben devolver el valor plano del secreto.
-- La metadata del secreto se expone por `contract.secrets[*]`, no por el valor efectivo.
-
-🧩 **A ESPECIFICAR (futuro)**:
-- Uso de `api_key_ref` (env/file/vault/kms) y un gestor de secretos (orchestrator/admin o servicio dedicado) para rotación y persistencia segura.
-- Actualización de key: se materializa como un nuevo `CONFIG_SET` (con `merge_patch` o `replace`) que actualiza la referencia o el valor.
+- La metadata del recurso se expone por `contract.resources[*]`, no por el valor efectivo.
 
 ### 2.1.5 Orden e idempotencia de updates (`config_version`) sin cambiar source-of-truth
 
@@ -898,7 +887,7 @@ Estructura:
 
 ✅ **NORMATIVO**: config mínima:
 - `model`
-- `api_key_ref` (ver Secrets)
+- recurso `openai` disponible en `SY.vault`
 - `timeout_ms`
 - `max_output_tokens` (si aplica)
 - `temperature` (si aplica)
@@ -910,7 +899,7 @@ Estructura:
 ### 3.2 Provider: Anthropic
 
 🧩 **A ESPECIFICAR / IMPLEMENTAR SI SURGE NECESIDAD**:
-- Interfaz equivalente (`model`, `api_key_ref`, `timeout_ms`, etc.).
+- Interfaz equivalente (`model`, recurso vault del provider, `timeout_ms`, etc.).
 - Debe respetar el `ModelInput Contract` (Parte 2) y los códigos de error.
 
 ### 3.3 Provider: Local
@@ -1017,8 +1006,6 @@ limits:
   max_input_bytes: 524288
   max_attachments: 8
   max_attachment_bytes: 10485760
-secrets:
-  api_key_ref: "env:OPENAI_API_KEY"
 ```
 
 ---
@@ -1043,17 +1030,12 @@ secrets:
 
 ## 8. Secrets (credenciales)
 
-✅ **NORMATIVO**: las credenciales no deben persistirse en claro en `STATE_DIR`.
+✅ **NORMATIVO**: las credenciales no deben persistirse en claro en `STATE_DIR` ni viajar por `CONFIG_SET`.
 
-✅ **NORMATIVO**: se define `api_key_ref` con backends soportados:
-- `env:VAR_NAME`
-- `file:/path/to/secret`
-
-🧩 **A ESPECIFICAR / IMPLEMENTAR SI SURGE NECESIDAD**:
-- `vault:<path>`, `kms:<key>`, etc.
+✅ **NORMATIVO**: `SY.vault` es el único backend válido para credenciales runtime.
 
 ✅ **NORMATIVO**:
-- si el secret no está disponible → error `missing_secret`.
+- si el recurso vault requerido no está disponible → error `missing_secret` o payload runtime equivalente.
 
 ---
 
@@ -1081,7 +1063,6 @@ secrets:
 🐞 **DESVIACIÓN CÓDIGO (P1)**:
 - No hay validación formal de schema/version.
 - No hay soporte `apply_mode=merge_patch` en CONFIG_SET.
-- No hay `api_key_ref` en config dinámica (solo config directa).
 
 ---
 
@@ -1194,7 +1175,7 @@ secrets:
 ✅ **NORMATIVO** (requeridos condicionales por behavior):
 - Si `behavior.kind = openai_chat`:
   - `behavior.params.model`
-  - credencial (HOY): `secrets.openai.api_key` vía `CONFIG_SET`, persistida localmente en `secrets.json`, o futura `api_key_ref` (🧩)
+  - credencial OpenAI resoluble en `SY.vault` con `resource_type=openai`
 
 #### Opcionales (con defaults)
 
@@ -1226,7 +1207,7 @@ mencionado en la “Living Spec” de AI Nodes. fileciteturn2file1L129-
 - `behavior.kind` (enum, requerido: `echo` | `openai_chat`)
 - Si `behavior.kind = openai_chat`:
   - `behavior.model` (string, requerido)
-  - credencial (ver §6/§8): `secrets.openai.api_key` (canónico actual) o `secrets.api_key_ref` (futuro)
+  - credencial OpenAI resoluble en `SY.vault` con `resource_type=openai`
 
 ### 4.2 YAML canónico (v1, ejemplo)
 
@@ -1265,13 +1246,9 @@ behavior:
     value: "You are a concise support assistant."
     trim: true
 
-secrets:
-  openai:
-    api_key_env: "OPENAI_API_KEY"   # compat temporal si no se cargó aún por CONFIG_SET
-
 > Nota operativa v1:
-> - el valor real de `secrets.openai.api_key` entra por `CONFIG_SET`
-> - luego el nodo lo persiste en `secrets.json`
+> - el valor real de OpenAI se carga en `SY.vault` con `resource_type=openai`
+> - `CONFIG_SET` no transporta secretos
 > - no debe mantenerse en `hive.yaml`
 ```
 

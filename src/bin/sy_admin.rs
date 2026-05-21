@@ -7552,7 +7552,7 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "config_version",
                 "u64",
-                "Monotonic config version chosen by the caller or node contract.",
+                "Next monotonic live config version. For AI.* and IO.* first call node_control_config_get, read response.config_version, then send config_version=response.config_version+1. Do not reuse example numbers.",
             ),
             admin_action_body_field(
                 "apply_mode",
@@ -8141,19 +8141,7 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         "node_control_config_get" => serde_json::json!({
             "requested_by": "archi"
         }),
-        "node_control_config_set" => serde_json::json!({
-            "node_name": "AI.sales@motherbee",
-            "subsystem": "ai_node",
-            "schema_version": 1,
-            "config_version": 7,
-            "apply_mode": "replace",
-            "config": {
-                "behavior": {
-                    "kind": "openai_chat",
-                    "model": "gpt-4.1-mini"
-                }
-            }
-        }),
+        "node_control_config_set" => serde_json::Value::Null,
         "timer_now_in" => serde_json::json!({
             "tz": "America/Argentina/Buenos_Aires"
         }),
@@ -8395,7 +8383,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
             r#"curl -X POST /hives/motherbee/nodes/WF.invoice@motherbee/control/config-get -d '{"requested_by":"archi"}'"#
         }
         "node_control_config_set" => {
-            r#"curl -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-set -d '{"node_name":"AI.sales@motherbee","subsystem":"ai_node","schema_version":1,"config_version":7,"apply_mode":"replace","config":{"behavior":{"kind":"openai_chat","model":"gpt-4.1-mini"}}}'"#
+            r#"current="$(curl -sS -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-get -d '{"requested_by":"archi"}' | jq -r '.payload.response.config_version')"; next="$((current + 1))"; curl -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-set -d "{\"node_name\":\"AI.sales@motherbee\",\"subsystem\":\"ai_node\",\"schema_version\":1,\"config_version\":${next},\"apply_mode\":\"replace\",\"config\":{\"behavior\":{\"kind\":\"openai_chat\",\"model\":\"gpt-4.1-mini\"}}}""#
         }
         "list_ilks" => "curl -X GET /hives/motherbee/identity/ilks",
         "get_ilk" => {
@@ -8594,6 +8582,8 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "This is the canonical live control-plane mutation path for nodes that expose CONFIG_SET, including AI.*, IO.*, WF.*, SY.storage, SY.identity, SY.cognition, and SY.config.routes.",
             "Admin forwards CONFIG_SET over L2 unicast and returns the node's CONFIG_RESPONSE.",
             "The payload.config object is node-defined and is not interpreted by SY.admin.",
+            "Before mutating AI.* or IO.*, call node_control_config_get and set config_version to response.config_version + 1. A smaller value is stale; an equal value is idempotent and will not apply a change.",
+            "Do not use config_version from get_node_config/_system as a substitute unless it exactly matches the live CONFIG_GET response; the canonical source is node_control_config_get.",
             "For WF.* v1, CONFIG_SET is persist-only and returns restart_required; it does not hot-apply CONFIG_CHANGED.",
             "For WF.* v1, do not mutate _system through CONFIG_SET. Managed package/runtime metadata remains owned by orchestrator.",
             "For SY.storage v1, the canonical secret field is config.database.postgres_url and the apply is persist-only until sy-storage is restarted.",
