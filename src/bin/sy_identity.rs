@@ -913,6 +913,7 @@ impl IdentityStore {
         let normalized_owner_l2_name = normalize_optional_owner_l2_name(owner_l2_name)?;
 
         let canonical_ilk_id = req.ilk_id.clone();
+        let response_ich_id = req.channel.ich_id.clone();
         let target = self
             .ilks
             .get_mut(&canonical_ilk_id)
@@ -993,7 +994,7 @@ impl IdentityStore {
         Ok(json!({
             "status": "ok",
             "ilk_id": canonical_ilk_id,
-            "ich_id": req.channel.ich_id,
+            "ich_id": response_ich_id,
             "owner_l2_name": normalized_owner_l2_name,
             "enabled": false,
             "change_reason": req.change_reason,
