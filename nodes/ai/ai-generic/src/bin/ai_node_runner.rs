@@ -1096,6 +1096,19 @@ impl CognitiveDefinitionRuntimeState {
     }
 }
 
+fn should_reuse_cognitive_state(
+    current: &CognitiveDefinitionRuntimeState,
+    ilk_id: &str,
+    hashes: &CognitiveDefinitionHashes,
+) -> bool {
+    current.enabled
+        && current.last_identity_seq.is_some()
+        && current.ilk_id.as_deref() == Some(ilk_id)
+        && current.last_hashes == *hashes
+        && current.active_prompt.is_some()
+        && !current.has_failures()
+}
+
 #[async_trait]
 impl AiNode for GenericAiNode {
     async fn on_message(&self, msg: Message) -> fluxbee_ai_sdk::Result<Option<Message>> {
@@ -2418,11 +2431,9 @@ async fn refresh_cognitive_definition(
 
     let hashes = hashes_from_identity_ilk(&ilk);
     {
-        let current = state.read().await;
-        if current.last_identity_seq == Some(seq)
-            && current.last_hashes == hashes
-            && !current.has_failures()
-        {
+        let mut current = state.write().await;
+        if should_reuse_cognitive_state(&current, &ilk.ilk_id, &hashes) {
+            current.last_identity_seq = Some(seq);
             return Ok(());
         }
     }
@@ -4538,6 +4549,19 @@ async fn run_single_connection_runtime(
             Err(err) => return Err(err),
         };
         read_messages = read_messages.saturating_add(1);
+        tracing::info!(
+            node_name = %node.node_name,
+            trace_id = %msg.routing.trace_id,
+            src = %msg.routing.src,
+            src_l2_name = ?msg.routing.src_l2_name,
+            dst = ?msg.routing.dst,
+            msg_type = %msg.meta.msg_type,
+            msg = ?msg.meta.msg,
+            action = ?msg.meta.action,
+            thread_id = ?msg.meta.thread_id,
+            via_tap = msg.meta.via_tap,
+            "ai runtime received router message"
+        );
 
         let mut attempt = 0usize;
         let max_attempts = config.retry_policy.max_attempts.max(1);
@@ -6413,6 +6437,52 @@ mod tests {
             state.active_prompt_chars,
             DEFAULT_UNCONFIGURED_AGENT_PROMPT.chars().count()
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cognitive_definition_reuses_state_when_hashes_are_unchanged() {
+        let root = cognitive_temp_root("reuse-unchanged-hashes");
+        let role_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        write_cognitive_asset(
+            &root,
+            role_hash,
+            json!({
+                "asset_type": "role",
+                "name": "Support role",
+                "description": "Answer as a Fluxbee support agent."
+            }),
+        );
+        let mut ilk = sample_agent_ilk();
+        ilk.role_hash = Some(role_hash.to_string());
+        let hashes = hashes_from_identity_ilk(&ilk);
+        let mut state =
+            compose_cognitive_state(&root, 8, &ilk, hashes.clone()).expect("compose state");
+
+        assert!(should_reuse_cognitive_state(&state, &ilk.ilk_id, &hashes));
+
+        state.last_identity_seq = Some(12);
+        assert!(
+            should_reuse_cognitive_state(&state, &ilk.ilk_id, &hashes),
+            "identity SHM heartbeat seq changes must not force recomposition"
+        );
+
+        let mut changed_hashes = hashes.clone();
+        changed_hashes.skill_hashes = vec![
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        ];
+        assert!(!should_reuse_cognitive_state(
+            &state,
+            &ilk.ilk_id,
+            &changed_hashes
+        ));
+
+        state.failed_hashes.push(CognitiveAssetFailure {
+            hash: role_hash.to_string(),
+            asset_type: "role".to_string(),
+            error: "temporary read failure".to_string(),
+        });
+        assert!(!should_reuse_cognitive_state(&state, &ilk.ilk_id, &hashes));
         let _ = fs::remove_dir_all(root);
     }
 
