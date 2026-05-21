@@ -1826,7 +1826,7 @@ mod tests {
                 msg: Some("PING".to_string()),
                 src_ilk: Some("ilk:src".to_string()),
                 dst_ilk: Some("ilk:dst".to_string()),
-                ich: Some("slack://U123".to_string()),
+                ich: Some("slack://T123".to_string()),
                 thread_id: Some("thread:canonical-1".to_string()),
                 thread_seq: Some(7),
                 context: Some(json!({
@@ -1850,7 +1850,7 @@ mod tests {
             json!({ "ok": true }),
         );
 
-        assert_eq!(reply.meta.ich.as_deref(), Some("slack://U123"));
+        assert_eq!(reply.meta.ich.as_deref(), Some("slack://T123"));
         assert_eq!(reply.meta.thread_id.as_deref(), Some("thread:canonical-1"));
         assert_eq!(reply.meta.thread_seq, Some(7));
         assert_eq!(

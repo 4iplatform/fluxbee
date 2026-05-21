@@ -79,6 +79,12 @@ fn assign_vpn(&self, node_name: &str) -> u32 {
 
 **Los cambios de VPN se aplican en tiempo real.** No es necesario reconectar nodos. El router actualiza el `vpn_id` de los nodos en su región `jsr-<uuid>`.
 
+Nota de semántica conversacional vigente:
+
+- el router usa `thread_id/thread_seq` como carrier conversacional canónico;
+- `meta.ich` identifica el canal local/sistémico involucrado y puede ser relevante para routing o dispatch;
+- `meta.ich` no representa el handle remoto del interlocutor externo.
+
 ### 3.4 Filtro VPN en Routing
 
 Al buscar destino:

@@ -26,16 +26,18 @@
 
 ## Adaptación temporal al core/SDK (campos L3 e identidad)
 
-> ✅ **Canónico (protocolo Fluxbee):** existen campos L3 dedicados para identidad y contexto conversacional (por ejemplo `src_ilk/dst_ilk`, `ich/ctx`, `ctx_seq`, `ctx_window`).  
+> ✅ **Canónico (protocolo Fluxbee):** existen carriers dedicados para identidad y continuidad conversacional. En el repo actual, `src_ilk` y `thread_id/thread_seq` forman parte del camino canónico activo, mientras que `ich` debe interpretarse como **canal local/sistémico** del nodo IO.  
 > ⚠️ **Estado actual (core/SDK):** el SDK no expone todos los campos L3 dedicados, pero `src_ilk` sí se transporta canónicamente en `meta.src_ilk`. `meta.context` queda para metadata adicional.
 
 ✅ **NORMATIVO (HOY, implementación compatible):**
 - IO Nodes **MUST** usar `meta.src_ilk` como carrier canónico de identidad de origen.
+- IO Nodes **MUST** tratar `meta.ich` como identificador del canal/asset local operado por la instancia IO cuando ese campo aplique al path.
 - La metadata específica del canal (Slack/WhatsApp/Email) debe vivir bajo `meta.context.io.*`.
 - Mientras dure la transición, campos L3 no tipados (por ejemplo `dst_ilk`) pueden transportarse en `meta.context`.
 
 ⚠️ **ADVERTENCIA:**
 - El uso de `meta.context` como carrier es temporal para campos no tipados. `meta.src_ilk` ya es canónico y no debe duplicarse en `meta.context`.
+- `meta.ich` no debe usarse para representar al interlocutor externo ni su handle remoto.
 
 🧩 **Estado actual del core:**
 - `ctx_seq/ctx_window` no forman parte del happy path canónico del repo.
@@ -258,6 +260,11 @@ Cada vez que el Nodo IO recibe un mensaje o evento desde el exterior:
 2. **Lookup:** `lookup(channel, external_id)`.
 3. **Provision on miss (opcional por config):** si hay miss/error, intentar `ILK_PROVISION`.
 4. **Forward al Router:** con `meta.src_ilk=<ilk>` si hubo éxito, o `null` en fallback.
+
+Importante:
+- el `external_id` usado para identidad externa es un dato distinto del `ICH` local;
+- el `ICH` local identifica el asset/canal operado por la instancia IO;
+- el handle remoto del interlocutor externo no debe reinterpretarse como `ICH`.
 
 ### 3.3 Outbound
 La resolución de destino outbound es por `meta.context.io.reply_target` (contrato IO Context).
@@ -557,4 +564,3 @@ Pipeline normativo:
 
 El MVP usa memoria para estado tecnico local (dedup/sessions/outbox).
 IO no es source of truth; la persistencia canonica permanece en core (Router/Storage/Identity).
-

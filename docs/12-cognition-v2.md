@@ -85,6 +85,11 @@ The physical unit of conversational continuity given by the medium. Created by t
 | Group / persistent channel | `hash(ich_id)` | WhatsApp group, Slack channel. Roster changes do not change the thread |
 | Medium-native thread | `hash(native_thread_id + ich_id)` | Email In-Reply-To, Slack thread reply, helpdesk ticket ID |
 
+Interpretation note:
+
+- `ich_id` must be read here as the **local/system-owned channel** operated by the IO node.
+- it is not the remote handle of the external participant.
+
 The IO node chooses the rule because it knows the channel type. The SDK provides a canonical `compute_thread_id(channel_type, params)` function.
 The current canonical format uses versioned input material plus stable `sha256`, producing identifiers like `thread:sha256:<hex>`.
 

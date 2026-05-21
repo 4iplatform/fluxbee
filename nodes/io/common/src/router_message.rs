@@ -83,13 +83,13 @@ fn extract_ich_from_context_obj(context_obj: &Map<String, Value>) -> Option<Stri
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
-    let sender_id = io
-        .get("sender")
-        .and_then(|sender| sender.get("id"))
+    let entrypoint_id = io
+        .get("entrypoint")
+        .and_then(|entrypoint| entrypoint.get("id"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
-    Some(format!("{channel}://{sender_id}"))
+    Some(format!("{channel}://{entrypoint_id}"))
 }
 
 #[cfg(test)]
@@ -151,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    fn build_user_message_promotes_ich_from_io_channel_and_sender() {
+    fn build_user_message_promotes_ich_from_io_channel_and_entrypoint() {
         let msg = build_user_message(
             "src-node",
             Some("AI.echo@motherbee".to_string()),
@@ -162,8 +162,8 @@ mod tests {
             json!({
                 "io": {
                     "channel": "slack",
-                    "sender": {
-                        "id": "U456"
+                    "entrypoint": {
+                        "id": "T123"
                     },
                     "conversation": {
                         "thread_id": "thread:canonical-io"
@@ -173,7 +173,7 @@ mod tests {
             json!({"type":"text","content":"hi"}),
         );
 
-        assert_eq!(msg.meta.ich.as_deref(), Some("slack://U456"));
+        assert_eq!(msg.meta.ich.as_deref(), Some("slack://T123"));
         assert_eq!(msg.meta.thread_id.as_deref(), Some("thread:canonical-io"));
         assert_eq!(
             msg.meta

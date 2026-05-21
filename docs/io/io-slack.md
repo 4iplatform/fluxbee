@@ -27,6 +27,47 @@ las decisiones y necesidades **específicas de Slack**.
 
 > Nota: para evitar inconsistencias con necesidades futuras de durabilidad, la lógica interna del IO debería usar una **interfaz de persistencia** (MVP: InMemory) tal como se define en `io-common.md`.
 
+### 2.1 ICH local y operatividad mínima
+
+Para `IO.slack`, el `ICH` debe interpretarse como el asset/canal local operado por la instancia para ese workspace/app, no como el usuario remoto de Slack.
+
+Regla operativa mínima:
+- el nodo puede permanecer vivo para `PING/STATUS/CONFIG_*`;
+- si no tiene material suficiente para operar su canal local (por ejemplo credenciales válidas o configuración efectiva mínima), no debe procesar tráfico operativo real de Slack;
+- en el estado actual del repo, esa no-operatividad se expresa mediante `UNCONFIGURED` o `FAILED_CONFIG`, no mediante un estado separado específico de `ICH`.
+
+### 2.2 Estado actual del runtime respecto a ILK interno e ICH
+
+Lectura ajustada al estado real actual del repo:
+
+- `IO.slack` ya lee `self_ilk_id` y `self_tenant_id` desde env al boot;
+- a diferencia de otros nodos IO, hoy esos valores sí se usan operacionalmente para resolver credenciales `slack` en `SY.vault` y para el loop de refresh;
+- el material local más concreto del canal ya está representado por `team_id` / workspace, que entra en `IoContext.entrypoint`;
+- el cálculo actual de `thread_id` ya usa material local del canal:
+  - `NativeThread(channel_type=\"slack\", entrypoint_id=team_id, native_thread_id=thread_ts)` cuando existe thread nativo;
+  - `PersistentChannel(channel_type=\"slack\", entrypoint_id=team_id, conversation_id=channel)` cuando no existe `thread_ts`.
+
+Conclusión práctica:
+
+- la continuidad conversacional ya incorpora correctamente material local del workspace;
+- el runtime ya usa `self_ilk_id/self_tenant_id` de forma efectiva para su operación;
+- el gap pendiente no está en `thread_id`, sino en la explicitación y eventual registro más homogéneo del `ICH` propio de la instancia/canal Slack.
+
+### 2.3 Gap actual bloqueado por core
+
+Con el estado actual del core, `IO.slack` no puede cerrar por sí solo el registro explícito de su `ICH` propio en identity.
+
+Motivo:
+
+- el camino correcto sería usar el `self_ilk_id` de la instancia para asociarle su canal propio mediante `ILK_ADD_CHANNEL`;
+- hoy ese camino existe en core/SDK, pero la autorización vigente no está abierta para que `IO.slack` lo ejecute como nodo IO general.
+
+Decisión actual:
+
+- no implementar un `ICH` sintético puramente local como workaround;
+- mantener resuelto el uso de `team_id`/workspace en `thread_id` y `meta.ich`;
+- dejar el registro explícito del `ICH` propio de la instancia/canal Slack como gap pendiente de core.
+
 ---
 
 ## 3. Inbound: recepción de mensajes desde Slack
@@ -444,6 +485,3 @@ Política vigente:
 Observación de deploy:
 
 - el `start.sh` publicado deja `RUST_LOG` incluyendo `io_common=debug`, por lo que los logs del relay deberían verse en `journalctl`.
-
-
-

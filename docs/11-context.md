@@ -4,6 +4,8 @@
 **Fecha:** 2026-02-04  
 **Audiencia:** Desarrolladores de nodos IO/AI, router core, infraestructura
 
+> **Warning (2026-05-20):** este documento describe el modelo histórico `CTX/ctx_window` y no debe usarse como contrato canónico actual. Sus ejemplos de `ICH` no reflejan la semántica vigente. En el modelo actual, `ICH` representa el canal local/sistémico operado por un nodo IO y la continuidad conversacional canónica usa `thread_id/thread_seq`.
+
 ---
 
 ## 1. Resumen

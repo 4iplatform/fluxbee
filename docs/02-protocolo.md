@@ -109,7 +109,7 @@ Usado por OPA para decisiones de capa 2/3, por el router para broadcast filtrado
 | `target` | string | Opcional | Hint/namespace opcional para OPA o filtro de broadcast (nombre L2, patrón o clave de policy) |
 | `src_ilk` | string | Sí (L3) | ILK del interlocutor que envía. OPA deriva tenant via `data.identity`, actualizado desde SHM de identity en cada `Resolve` |
 | `dst_ilk` | string | No | ILK del interlocutor destino (si se conoce) |
-| `ich` | string | Sí (L3) | ICH (Interlocutor Channel) por el cual se comunica |
+| `ich` | string | Sí (L3) | ICH (Interlocutor Channel) local/sistémico por el cual ingresó o debe salir la comunicación |
 | `thread_id` | string | Sí (L3 canónico) | ID físico del hilo conversacional. Calculado por SDK/IO según tipo de canal |
 | `thread_seq` | integer | Sí (L3 canónico) | Secuencia monotónica dentro de `thread_id`. Asignada por el router |
 | `ctx` | string | Legacy | Carrier viejo de contexto conversacional. Solo compat temporal |
@@ -142,7 +142,7 @@ Nota de contrato:
 
 Estos campos forman el carrier canónico de conversación para cognition v2:
 
-- **`ich`**: Canal por el cual el interlocutor se comunica (WhatsApp, Slack, email, etc.)
+- **`ich`**: Canal local/sistémico involucrado en la comunicación (WhatsApp propio, Slack propio, mailbox propio, endpoint propio, etc.)
 - **`thread_id`**: Identificador físico del hilo, calculado por SDK/IO según tipo de canal
   - se obtiene con `compute_thread_id(...)`
   - usa material canónico versionado + `sha256`
@@ -151,6 +151,7 @@ Estos campos forman el carrier canónico de conversación para cognition v2:
 
 Reglas:
 - `thread_id` lo calcula el productor que conoce el medium, típicamente el IO node.
+- `ich` no representa el handle remoto del interlocutor externo. Representa el canal/asset local operado por el nodo IO.
 - el cálculo admite tres casos canónicos:
   - `DirectPair`
   - `PersistentChannel`
@@ -158,6 +159,10 @@ Reglas:
 - `thread_seq` lo asigna el router.
 - `thread_seq` no es global; solo tiene orden dentro del thread.
 - cognition v2 usa `thread_id` y `thread_seq` como carrier canónico.
+- En los paths IO nuevos, `ich + thread_id + thread_seq` debe leerse como:
+  - canal local/sistémico
+  - hilo físico/relacional del medio
+  - secuencia monotónica por thread
 
 ### 3.2.1 Compatibilidad legacy con `ctx*`
 

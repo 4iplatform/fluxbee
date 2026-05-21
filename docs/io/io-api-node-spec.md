@@ -167,6 +167,54 @@ Patron recomendado:
 
 Esto no cambia el pipeline comun de identidad ni relay. Cada instancia aplica el mismo flujo IO sobre su propio contrato HTTP y su propia configuracion.
 
+### 3.4 ICH local de `IO.api`
+
+Para `IO.api`, el `ICH` debe interpretarse como el **asset/canal local de ingreso** operado por la instancia, no como el sujeto externo autenticado ni como el `external_user_id`.
+
+Criterio inicial acordado para esta familia:
+
+- una instancia concreta de `IO.api` opera un listener/entrypoint local;
+- ese listener/entrypoint es la base operativa del `ICH` local;
+- el material exacto de unicidad puede refinarse mas adelante, pero el `ICH` no debe derivarse del interlocutor externo.
+
+Consecuencia:
+
+- el caller autenticado y el sujeto conversacional efectivo siguen resolviéndose por auth + identity;
+- el `ICH` de `IO.api` representa el canal local de la instancia HTTP que recibió o emite la comunicación.
+
+### 3.5 Estado actual del runtime respecto a ILK interno e ICH
+
+Lectura ajustada al estado real actual del repo:
+
+- `IO.api` ya lee `self_ilk_id` y `self_tenant_id` desde env al boot;
+- hoy esos valores quedan disponibles para observabilidad/runtime, pero no fijan por sí solos un registro explícito del `ICH` local de la instancia;
+- el material local más concreto que hoy ya participa del path operativo es el `listen.address`, usado como `entrypoint` del `IoContext`;
+- el cálculo actual de `thread_id` para `IO.api` ya usa `ThreadIdInput::PersistentChannel` con:
+  - `channel_type = "api"`
+  - `entrypoint_id = listen.address`
+  - `conversation_id` canónico del request
+
+Conclusión práctica:
+
+- la continuidad conversacional ya incorpora material local del canal;
+- el gap actual no está en `thread_id`;
+- el gap pendiente es definir y eventualmente resolver/registrar de manera más explícita el `ICH` propio de la instancia `IO.api`.
+
+### 3.6 Gap actual bloqueado por core
+
+Con el estado actual del core, `IO.api` no puede cerrar por sí solo el registro explícito de su `ICH` propio en identity.
+
+Motivo:
+
+- el camino correcto sería usar el `self_ilk_id` de la instancia para asociarle un canal propio mediante `ILK_ADD_CHANNEL`;
+- hoy ese camino existe en core/SDK, pero la autorización vigente no está abierta para que `IO.api` lo ejecute como nodo IO general.
+
+Decisión actual:
+
+- no implementar un `ICH` sintético puramente local como workaround;
+- mantener resuelto el carrier conversacional (`thread_id`) y `meta.ich` en el plano IO;
+- dejar el registro explícito del `ICH` propio de la instancia como gap pendiente de core.
+
 ---
 
 ## 4. Estados del nodo
@@ -187,6 +235,11 @@ En este estado:
 - no debe aceptar `POST /` para trafico de negocio;
 - debe responder `503 Service Unavailable` con `error_code=node_not_configured` en `POST /`.
 
+Interpretacion respecto a `ICH`:
+- `IO.api` puede quedar vivo y observable aun cuando todavia no tenga material suficiente para operar su `ICH` local;
+- mientras eso ocurra, no debe aceptar trafico operativo real;
+- en el estado actual del repo, esa no-operatividad se expresa mediante falta de configuracion efectiva suficiente.
+
 ### 4.2 CONFIGURED
 
 El nodo tiene listener, auth, `subject_mode`, accepted content types y relay definidos, y puede aceptar trafico de negocio.
@@ -201,6 +254,10 @@ En este estado:
 - debe exponer `GET /`;
 - no debe aceptar `POST /`;
 - debe reportar explicitamente el motivo del fallo en schema/status/control plane.
+
+Interpretacion respecto a `ICH`:
+- para `IO.api`, el `ICH` local esta atado al entrypoint/listener de la instancia;
+- si la instancia no tiene material suficiente para operar ese canal local, puede permanecer viva para control-plane, pero no debe procesar trafico de negocio.
 
 ---
 

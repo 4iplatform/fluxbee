@@ -45,10 +45,15 @@ This strategy provides:
 ## 4. Context Model
 
 IO nodes:
-- Produce `ich`
-- Consume `ctx_seq`
-- Accept `ctx_window`
+- Produce `meta.ich` as the **local/system-owned channel** operated by that concrete IO instance
+- Consume `ctx_seq` only as legacy-compatible metadata when it appears
+- Accept `ctx_window` only as legacy-compatible metadata when it appears
 - Never persist or forward history externally
+
+Important:
+- `ich` is **not** the remote handle of the external interlocutor
+- `ich` is **not** the external user's identity
+- remote handles and external identities must be represented by the corresponding identity/contact mechanisms, not by `ich`
 
 The Router is the **sole owner** of conversational history.
 
@@ -59,8 +64,10 @@ The Router is the **sole owner** of conversational history.
 IO nodes **MUST follow Router v1.16 protocol** exactly.
 
 Notably:
-- `meta.ctx` is the only context identifier
-- `meta.context` is reserved for OPA input
+- `thread_id/thread_seq` are the active canonical carriers for conversational continuity in the current repo
+- `meta.ctx` belongs to historical/legacy context semantics and must not be reintroduced as the primary carrier in new IO paths
+- `meta.context` is reserved for OPA input and extra metadata
+- `meta.ich` identifies the local/system channel of the IO node, not the remote external handle
 - No duplication of context fields
 
 ---
@@ -103,7 +110,8 @@ Según la especificación del Router v1.16:
 ## Adaptación temporal (spec canónica vs core actual)
 
 ✅ **Canónico (protocolo Fluxbee)**:
-- Mensajes `user` deben incluir identidad/contexto L3 (p.ej. `ich/ctx`, `ctx_seq`, y eventualmente `ctx_window`).
+- Mensajes `user` deben incluir identidad y material conversacional canónico.
+- En el repo actual, `ich` debe leerse como **canal local/sistémico** y `thread_id/thread_seq` como carrier conversacional activo.
 
 ⚠️ **Estado actual (core/SDK)**:
 - `ctx_window` no está garantizado en runtime hoy; `ctx_seq` puede no venir en algunos flujos.
@@ -140,6 +148,18 @@ Según la especificación del Router v1.16:
 
 ✅ **NORMATIVO**:
 - En `FAILED_CONFIG`, el nodo **MUST** atender: `PING`, `STATUS`, `CONFIG_GET`, `CONFIG_SET`.
+
+### 2.1 Contrato mínimo respecto a ICH local
+
+✅ **NORMATIVO**:
+- Un nodo IO puede permanecer **vivo** aun cuando todavía no tenga material suficiente para operar su `ICH` local.
+- En ese estado debe seguir atendiendo control-plane y observabilidad mínima.
+- Mientras no tenga material suficiente para operar su canal/asset local, **MUST NOT** aceptar ni procesar tráfico operativo real del canal.
+
+Interpretación operativa:
+- el criterio exacto de "material suficiente" depende del nodo;
+- puede ser configuración mínima, credenciales del canal, asset local resuelto o una combinación de esos factores;
+- ese estado puede expresarse hoy mediante `UNCONFIGURED` o `FAILED_CONFIG`, sin exigir todavía un estado nuevo específico de `ICH`.
 
 ### 3) Configuración en caliente (Control Plane)
 
@@ -202,7 +222,5 @@ Según la especificación del Router v1.16:
 - El auto-offload actual del SDK cubre el contrato `text/v1`.
 - No debe asumirse automaticamente para payloads arbitrarios fuera de ese contrato.
 - Si un adapter necesita otro payload no `text/v1`, ese contrato debe definir explicitamente como resuelve limites de tamano y blobs.
-
-
 
 

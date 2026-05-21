@@ -111,6 +111,10 @@ El adapter no debe recibir el ILK provisorio del profile.
 ### D. La automatización se gobierna por ICH del canal LH
 Debe reaccionar a la habilitación/deshabilitación por ICH de Linked Helper, no por ILK global.
 
+Interpretación importante:
+- ese `ICH` es un canal/asset **propio del sistema Fluxbee** operado por la instancia IO/adaptador para Linked Helper;
+- no representa al contacto externo remoto.
+
 ### E. Los ICHs LH auto-detectados nacen desactivados
 Por default, cuando se auto-detecta un profile/canal LH, la automatización de ese ICH nace desactivada.
 
@@ -136,6 +140,17 @@ El nodo `IO.linkedhelper`:
 - observa cambios relevantes de identity;
 - mantiene una cola de resultados por adapter;
 - y devuelve al adapter resultados e información de configuración.
+
+### Nota operativa sobre lifecycle
+
+`IO.linkedhelper` puede permanecer vivo para control-plane y observabilidad aun cuando todavía no tenga material suficiente para operar un profile/canal LH concreto.
+
+En particular:
+- puede estar vivo sin profiles listos;
+- puede estar vivo con profiles descubiertos pero no promovidos;
+- puede estar vivo mientras observa estados de sus ICHs propios.
+
+Pero mientras un profile no tenga identidad/estado suficiente o su ICH propio no esté operativo, el nodo no debe habilitar tráfico conversacional real para ese profile.
 
 ## 4.2. Responsabilidades claras
 
@@ -193,6 +208,10 @@ El nodo sí debería monitorear:
 ### Importante
 Este monitoreo de estados de ICH propios no es una rareza específica de Linked Helper.
 Se considera una responsabilidad generalizable para nodos IO: cada nodo IO debería poder observar los estados de sus propios ICHs y reaccionar operativamente a cambios relevantes.
+
+Interpretación importante:
+- los ICH monitoreados por el nodo son ICH **locales/sistémicos** del canal LH;
+- los contactos externos y sus handles se resuelven por mecanismos de identidad/contacto, no como ICH.
 
 ## 4.4. Qué no debería absorber el nodo
 
