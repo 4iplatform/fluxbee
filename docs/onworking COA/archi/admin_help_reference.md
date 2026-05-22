@@ -2,7 +2,7 @@
 
 **Fecha extracción:** 2026-05-11  
 **Fuente:** `src/bin/sy_admin.rs`  
-**Total acciones:** 74
+**Total acciones:** 75
 **Propósito:** Documentar exactamente qué información está disponible en el help de admin para los modelos que usan `get_admin_action_help`.
 
 ---
@@ -38,7 +38,7 @@ Semántica:
 
 ### Acciones que requieren CONFIRM
 
-`publish_runtime_package`, `remove_hive`, `kill_node`, `remove_node_instance`, `remove_runtime_version`, `set_node_config`, `node_control_config_set`, `set_storage`, `create_tenant`, `update_tenant`, `set_tenant_sponsor`, `vault_put`, `vault_get`, `vault_delete`, `vault_rotate`, `vault_rollback`, `update`, `sync_hint`, `opa_compile`, `opa_compile_apply`, `opa_apply`, `opa_rollback`, `wf_rules_compile`, `wf_rules_compile_apply`, `send_node_message`
+`publish_runtime_package`, `remove_hive`, `kill_node`, `remove_node_instance`, `remove_runtime_version`, `set_ilk_definition`, `delete_ilk`, `set_node_config`, `node_control_config_set`, `set_storage`, `create_tenant`, `update_tenant`, `set_tenant_sponsor`, `vault_put`, `vault_get`, `vault_delete`, `vault_rotate`, `vault_rollback`, `update`, `sync_hint`, `opa_compile`, `opa_compile_apply`, `opa_apply`, `opa_rollback`, `wf_rules_compile`, `wf_rules_compile_apply`, `send_node_message`
 
 ---
 
@@ -154,17 +154,19 @@ Semántica:
 
 ### `kill_node`
 - **Path:** `DELETE /hives/{hive}/nodes/{node_name}`
-- **Descripción:** Detiene un nodo. Con `purge_instance` también elimina el directorio de instancia persistido.
+- **Descripción:** Detiene un nodo. Con `purge_instance` elimina el estado persistente del nodo gestionado: directorio de instancia, timers, `node_ilk_map`, ILK y secrets dedicados por ILK.
 - **Read-only:** no | **Requiere CONFIRM:** sí
 - **Campos opcionales:**
   - `force` (bool): forzar stop
-  - `purge_instance` (bool): eliminar directorio de instancia persistido tras stop
+  - `purge_instance` (bool): purgar estado persistido tras stop
+- **Nota:** no borra rutas, VPNs ni taps; retorna `routing_references` para que el operador decida el cleanup de routing.
 - **Ejemplo:** `DELETE /hives/motherbee/nodes/AI.chat@motherbee {"force":false,"purge_instance":true}`
 
 ### `remove_node_instance`
 - **Path:** `DELETE /hives/{hive}/nodes/{node_name}/instance`
-- **Descripción:** Elimina una instancia de nodo del estado en disco.
+- **Descripción:** Elimina una instancia de nodo del estado persistente gestionado: directorio de instancia, timers, `node_ilk_map`, ILK y secrets dedicados por ILK.
 - **Read-only:** no | **Requiere CONFIRM:** sí
+- **Nota:** no borra rutas, VPNs ni taps; retorna `routing_references` para que el operador decida el cleanup de routing.
 
 ### `send_node_message`
 - **Path:** `POST /hives/{hive}/nodes/{node_name}/messages`
@@ -204,7 +206,7 @@ Semántica:
 
 ---
 
-## Categoría 5 — Identidad e inventario (7 acciones)
+## Categoría 5 — Identidad e inventario (8 acciones)
 
 ### `list_ilks`
 - **Path:** `GET /hives/{hive}/identity/ilks`
@@ -217,7 +219,7 @@ Semántica:
 
 ### `set_ilk_definition`
 - **Path:** `POST /hives/{hive}/identity/ilks/{ilk_id}/definition`
-- **Read-only:** no
+- **Read-only:** no | **Requiere CONFIRM:** sí
 - **Path param:** `ilk_id` en formato `ilk:<uuid>`
 - **Body:** `definition` con `role_hash`, `skill_hashes`, `handbook_hashes`, `personality_hash` (este último single 64-hex string, no array).
 - **Uso:** aplica la definición cognitiva de un agent ILK; no crea assets blob, solo registra los hashes validados en identity/SHM.
@@ -234,6 +236,12 @@ POST /hives/motherbee/identity/ilks/ilk:ai-support/definition
   }
 }
 ```
+
+### `delete_ilk`
+- **Path:** `DELETE /hives/{hive}/identity/ilks/{ilk_id}`
+- **Read-only:** no | **Requiere CONFIRM:** sí
+- **Path param:** `ilk_id` en formato `ilk:<uuid>`
+- **Uso:** borra un ILK y sus mappings ICH; rechaza ILKs determinísticos de sistema con `SYSTEM_ILK_PROTECTED`.
 
 ### `list_tenants`
 - **Path:** `GET /hives/{hive}/identity/tenants`

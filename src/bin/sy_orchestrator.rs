@@ -20,6 +20,8 @@ use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+#[cfg(not(test))]
+use fluxbee_sdk::admin::{admin_command, AdminCommandRequest};
 use fluxbee_sdk::blob::{
     BlobConfig as SdkBlobConfig, BlobGcOptions, BlobToolkit, BLOB_ACTIVE_RETAIN_DAYS,
     BLOB_NAME_MAX_CHARS, BLOB_STAGING_TTL_HOURS,
@@ -41,9 +43,10 @@ use json_router::{
         RuntimeManifestEntry,
     },
     shm::{
-        now_epoch_ms, LsaRegionReader, LsaSnapshot, NodeEntry, RemoteHiveEntry, RemoteNodeEntry,
-        RouterRegionReader, ShmSnapshot, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS,
-        HIVE_FLAG_SELF,
+        now_epoch_ms, ConfigRegionReader, ConfigSnapshot, LsaRegionReader, LsaSnapshot, NodeEntry,
+        RemoteHiveEntry, RemoteNodeEntry, RouterRegionReader, ShmSnapshot, StaticRouteEntry,
+        TapEntry, VpnAssignment, ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED,
+        FLAG_STALE, HEARTBEAT_STALE_MS, HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
     },
 };
 
@@ -368,6 +371,33 @@ struct IdentityNodeIlkMap {
     /// `ILK_REGISTER` for that node fills it in.
     #[serde(default)]
     tenants: HashMap<String, String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+struct RoutingReferencesSummary {
+    routes: Vec<RoutingRouteReference>,
+    vpns: Vec<RoutingVpnReference>,
+    taps: Vec<RoutingTapReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct RoutingRouteReference {
+    prefix: String,
+    action: String,
+    next_hop_hive: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct RoutingVpnReference {
+    pattern: String,
+    vpn_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct RoutingTapReference {
+    match_src: String,
+    match_dst: String,
+    target: String,
 }
 
 struct OrchestratorState {
@@ -9424,6 +9454,177 @@ fn load_persisted_node_identity(
     )
 }
 
+fn remove_node_ilk_mapping_at(map_path: &Path, node_name: &str) -> Result<bool, OrchestratorError> {
+    let mut map = load_identity_node_ilk_map(map_path);
+    let had_node = map.nodes.remove(node_name).is_some();
+    let had_tenant = map.tenants.remove(node_name).is_some();
+    if !had_node && !had_tenant {
+        return Ok(false);
+    }
+    save_identity_node_ilk_map(map_path, &map)?;
+    Ok(true)
+}
+
+fn remove_node_ilk_mapping(
+    state: &OrchestratorState,
+    node_name: &str,
+) -> Result<bool, OrchestratorError> {
+    remove_node_ilk_mapping_at(&node_ilk_map_path(state), node_name)
+}
+
+fn routing_bytes_to_string(buf: &[u8], len: usize) -> String {
+    let len = len.min(buf.len());
+    std::str::from_utf8(&buf[..len]).unwrap_or("").to_string()
+}
+
+fn routing_action_label(action: u8) -> &'static str {
+    match action {
+        ACTION_DROP => "DROP",
+        ACTION_FORWARD => "FORWARD",
+        _ => "FORWARD",
+    }
+}
+
+fn routing_pattern_matches_node(match_kind: u8, pattern: &str, node_name: &str) -> bool {
+    let local_name = node_name.split('@').next().unwrap_or(node_name);
+    let kind = node_kind_from_name(node_name);
+    [node_name, local_name, kind.as_str()]
+        .iter()
+        .any(|candidate| routing_pattern_match_kind(match_kind, pattern, candidate))
+}
+
+fn routing_pattern_match_kind(match_kind: u8, pattern: &str, name: &str) -> bool {
+    match match_kind {
+        MATCH_EXACT => pattern == name,
+        MATCH_PREFIX => {
+            let prefix = pattern.trim_end_matches(".*");
+            name.starts_with(prefix)
+        }
+        MATCH_GLOB => wildcard_match(pattern.as_bytes(), name.as_bytes()),
+        _ => false,
+    }
+}
+
+fn wildcard_match(pattern: &[u8], text: &[u8]) -> bool {
+    let mut pi = 0usize;
+    let mut ti = 0usize;
+    let mut star = None;
+    let mut match_idx = 0usize;
+    while ti < text.len() {
+        if pi < pattern.len() && pattern[pi] == text[ti] {
+            pi += 1;
+            ti += 1;
+        } else if pi < pattern.len() && pattern[pi] == b'*' {
+            star = Some(pi);
+            match_idx = ti;
+            pi += 1;
+        } else if let Some(star_idx) = star {
+            pi = star_idx + 1;
+            match_idx += 1;
+            ti = match_idx;
+        } else {
+            return false;
+        }
+    }
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pattern.len()
+}
+
+fn routing_entry_is_visible(flags: u16) -> bool {
+    flags == 0 || (flags & FLAG_ACTIVE != 0)
+}
+
+fn route_reference_for_node(
+    route: &StaticRouteEntry,
+    node_name: &str,
+) -> Option<RoutingRouteReference> {
+    if !routing_entry_is_visible(route.flags) {
+        return None;
+    }
+    let prefix = routing_bytes_to_string(&route.prefix, route.prefix_len as usize);
+    if !routing_pattern_matches_node(route.match_kind, &prefix, node_name) {
+        return None;
+    }
+    Some(RoutingRouteReference {
+        prefix,
+        action: routing_action_label(route.action).to_string(),
+        next_hop_hive: routing_bytes_to_string(
+            &route.next_hop_hive,
+            route.next_hop_hive_len as usize,
+        ),
+    })
+}
+
+fn vpn_reference_for_node(vpn: &VpnAssignment, node_name: &str) -> Option<RoutingVpnReference> {
+    if !routing_entry_is_visible(vpn.flags) {
+        return None;
+    }
+    let pattern = routing_bytes_to_string(&vpn.pattern, vpn.pattern_len as usize);
+    if !routing_pattern_matches_node(vpn.match_kind, &pattern, node_name) {
+        return None;
+    }
+    Some(RoutingVpnReference {
+        pattern,
+        vpn_id: vpn.vpn_id,
+    })
+}
+
+fn tap_reference_for_node(tap: &TapEntry, node_name: &str) -> Option<RoutingTapReference> {
+    if !routing_entry_is_visible(tap.flags) {
+        return None;
+    }
+    let match_src = routing_bytes_to_string(&tap.match_src, tap.match_src_len as usize);
+    let match_dst = routing_bytes_to_string(&tap.match_dst, tap.match_dst_len as usize);
+    let target = routing_bytes_to_string(&tap.target, tap.target_len as usize);
+    if match_src != node_name && match_dst != node_name && target != node_name {
+        return None;
+    }
+    Some(RoutingTapReference {
+        match_src,
+        match_dst,
+        target,
+    })
+}
+
+fn enumerate_routing_references_in_snapshot(
+    snapshot: &ConfigSnapshot,
+    node_name: &str,
+) -> RoutingReferencesSummary {
+    RoutingReferencesSummary {
+        routes: snapshot
+            .routes
+            .iter()
+            .filter_map(|route| route_reference_for_node(route, node_name))
+            .collect(),
+        vpns: snapshot
+            .vpns
+            .iter()
+            .filter_map(|vpn| vpn_reference_for_node(vpn, node_name))
+            .collect(),
+        taps: snapshot
+            .taps
+            .iter()
+            .filter_map(|tap| tap_reference_for_node(tap, node_name))
+            .collect(),
+    }
+}
+
+fn enumerate_routing_references_to(
+    state: &OrchestratorState,
+    node_name: &str,
+) -> RoutingReferencesSummary {
+    let shm_name = format!("/jsr-config-{}", state.hive_id);
+    let snapshot = ConfigRegionReader::open_read_only(&shm_name)
+        .ok()
+        .and_then(|reader| reader.read_snapshot());
+    match snapshot {
+        Some(snapshot) => enumerate_routing_references_in_snapshot(&snapshot, node_name),
+        None => RoutingReferencesSummary::default(),
+    }
+}
+
 fn derive_ilk_type_for_node(node_name: &str) -> &'static str {
     if node_name.starts_with("AI.") {
         "agent"
@@ -11956,21 +12157,24 @@ async fn kill_node_flow(
         };
     }
 
-    match systemd_unit_is_active(&unit) {
+    let unit_was_active = match systemd_unit_is_active(&unit) {
         Ok(false) => {
-            return serde_json::json!({
-                "status": "not_found",
-                "state": "not_found",
-                "hive": target_hive,
-                "target": target_hive,
-                "node_name": validated_node_name,
-                "unit": unit,
-                "signal": signal,
-                "force": force,
-                "purge_instance": purge_instance,
-            });
+            if !should_purge_inactive_kill_target(purge_instance, validated_node_name.as_deref()) {
+                return serde_json::json!({
+                    "status": "not_found",
+                    "state": "not_found",
+                    "hive": target_hive,
+                    "target": target_hive,
+                    "node_name": validated_node_name,
+                    "unit": unit,
+                    "signal": signal,
+                    "force": force,
+                    "purge_instance": purge_instance,
+                });
+            }
+            false
         }
-        Ok(true) => {}
+        Ok(true) => true,
         Err(err) => {
             return serde_json::json!({
                 "status": "error",
@@ -11982,46 +12186,116 @@ async fn kill_node_flow(
                 "purge_instance": purge_instance,
             });
         }
-    }
-
-    let timer_purge = if purge_instance {
-        if let Some(node_name) = validated_node_name.as_ref() {
-            Some(purge_owner_timers_before_teardown(state, &target_hive, node_name).await)
-        } else {
-            None
-        }
-    } else {
-        None
     };
 
     match execute_on_hive(state, &target_hive, &cmd, "kill_node") {
         Ok(()) => {
             let mut response = serde_json::json!({
                 "status": "ok",
-                "hive": target_hive,
-                "target": target_hive,
+                "hive": target_hive.clone(),
+                "target": target_hive.clone(),
                 "node_name": validated_node_name,
                 "unit": unit.clone(),
                 "signal": signal.clone(),
                 "force": force,
                 "purge_instance": purge_instance,
+                "unit_was_active": unit_was_active,
+                "pre_stop_state": if unit_was_active { "active" } else { "inactive_or_not_found" },
             });
-            if let Some(timer_purge) = timer_purge {
-                response["timer_purge"] = timer_purge;
-            }
             if purge_instance {
                 if let Some(node_name) = validated_node_name.as_ref() {
+                    let (persisted_ilk_id, _persisted_tenant_id) =
+                        load_persisted_node_identity(state, node_name);
+                    let timer_purge =
+                        purge_owner_timers_before_teardown(state, &target_hive, node_name).await;
+                    response["timer_purge"] = timer_purge.clone();
+                    if !teardown_step_status_is_ok(&timer_purge) {
+                        return serde_json::json!({
+                            "status": "error",
+                            "error_code": "TIMER_PURGE_FAILED",
+                            "message": teardown_error_message(&timer_purge),
+                            "target": target_hive,
+                            "node_name": node_name,
+                            "unit": unit,
+                            "signal": signal,
+                            "force": force,
+                            "purge_instance": purge_instance,
+                            "timer_purge": timer_purge,
+                        });
+                    }
                     match remove_node_instance_dir_with_root(node_name, &node_files_root()) {
                         Ok((removed_path, removed_kind_dir)) => {
                             response["instance_purged"] = serde_json::json!(true);
                             response["removed_path"] =
                                 serde_json::json!(removed_path.display().to_string());
                             response["removed_kind_dir"] = serde_json::json!(removed_kind_dir);
+                            match remove_node_ilk_mapping(state, node_name) {
+                                Ok(removed) => {
+                                    response["ilk_mapping_removed"] = serde_json::json!(removed);
+                                }
+                                Err(err) => {
+                                    return serde_json::json!({
+                                        "status": "error",
+                                        "error_code": "ILK_MAPPING_REMOVE_FAILED",
+                                        "message": err.to_string(),
+                                        "target": target_hive,
+                                        "node_name": node_name,
+                                        "unit": unit,
+                                        "signal": signal,
+                                        "force": force,
+                                        "purge_instance": purge_instance,
+                                        "timer_purge": timer_purge,
+                                        "instance_purged": true,
+                                        "removed_path": removed_path.display().to_string(),
+                                        "removed_kind_dir": removed_kind_dir,
+                                        "ilk_mapping_removed": false,
+                                    });
+                                }
+                            }
+                            append_optional_teardown_cleanup(
+                                state,
+                                &mut response,
+                                &target_hive,
+                                node_name,
+                                persisted_ilk_id.as_deref(),
+                            )
+                            .await;
                         }
                         Err(err) => {
                             if err.to_string() == "NODE_NOT_FOUND" {
                                 response["instance_purged"] = serde_json::json!(false);
-                                response["purge_status"] = serde_json::json!("not_found");
+                                response["purge_status"] = serde_json::json!("instance_not_found");
+                                match remove_node_ilk_mapping(state, node_name) {
+                                    Ok(removed) => {
+                                        response["ilk_mapping_removed"] =
+                                            serde_json::json!(removed);
+                                    }
+                                    Err(err) => {
+                                        return serde_json::json!({
+                                            "status": "error",
+                                            "error_code": "ILK_MAPPING_REMOVE_FAILED",
+                                            "message": err.to_string(),
+                                            "target": target_hive,
+                                            "node_name": node_name,
+                                            "unit": unit,
+                                            "signal": signal,
+                                            "force": force,
+                                            "purge_instance": purge_instance,
+                                            "timer_purge": timer_purge,
+                                            "instance_purged": false,
+                                            "purge_status": "instance_not_found",
+                                            "ilk_mapping_removed": false,
+                                        });
+                                    }
+                                }
+                                append_optional_teardown_cleanup(
+                                    state,
+                                    &mut response,
+                                    &target_hive,
+                                    node_name,
+                                    persisted_ilk_id.as_deref(),
+                                )
+                                .await;
                             } else {
                                 return serde_json::json!({
                                     "status": "error",
@@ -12051,6 +12325,13 @@ async fn kill_node_flow(
             "purge_instance": purge_instance,
         }),
     }
+}
+
+fn should_purge_inactive_kill_target(purge_instance: bool, node_name: Option<&str>) -> bool {
+    purge_instance
+        && node_name
+            .map(|name| !name.trim().is_empty())
+            .unwrap_or(false)
 }
 
 fn remove_node_instance_dir_with_root(
@@ -12200,18 +12481,59 @@ async fn remove_node_instance_flow(
         });
     }
 
+    let (persisted_ilk_id, _persisted_tenant_id) = load_persisted_node_identity(state, &node_name);
     let timer_purge = purge_owner_timers_before_teardown(state, &target_hive, &node_name).await;
-    match remove_node_instance_dir_with_root(&node_name, &node_files_root()) {
-        Ok((removed_path, removed_kind_dir)) => serde_json::json!({
-            "status": "ok",
+    if !teardown_step_status_is_ok(&timer_purge) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "TIMER_PURGE_FAILED",
+            "message": teardown_error_message(&timer_purge),
             "target": target_hive,
-            "hive": target_hive,
             "node_name": node_name,
             "unit": unit,
-            "removed_path": removed_path.display().to_string(),
-            "removed_kind_dir": removed_kind_dir,
             "timer_purge": timer_purge,
-        }),
+        });
+    }
+    match remove_node_instance_dir_with_root(&node_name, &node_files_root()) {
+        Ok((removed_path, removed_kind_dir)) => {
+            let ilk_mapping_removed = match remove_node_ilk_mapping(state, &node_name) {
+                Ok(removed) => removed,
+                Err(err) => {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "ILK_MAPPING_REMOVE_FAILED",
+                        "message": err.to_string(),
+                        "target": target_hive,
+                        "node_name": node_name,
+                        "unit": unit,
+                        "removed_path": removed_path.display().to_string(),
+                        "removed_kind_dir": removed_kind_dir,
+                        "timer_purge": timer_purge,
+                        "ilk_mapping_removed": false,
+                    });
+                }
+            };
+            let mut response = serde_json::json!({
+                "status": "ok",
+                "target": target_hive.clone(),
+                "hive": target_hive.clone(),
+                "node_name": node_name.clone(),
+                "unit": unit.clone(),
+                "removed_path": removed_path.display().to_string(),
+                "removed_kind_dir": removed_kind_dir,
+                "timer_purge": timer_purge,
+                "ilk_mapping_removed": ilk_mapping_removed,
+            });
+            append_optional_teardown_cleanup(
+                state,
+                &mut response,
+                &target_hive,
+                &node_name,
+                persisted_ilk_id.as_deref(),
+            )
+            .await;
+            response
+        }
         Err(err) => {
             if err.to_string() == "NODE_NOT_FOUND" {
                 serde_json::json!({
@@ -12236,6 +12558,371 @@ async fn remove_node_instance_flow(
             }
         }
     }
+}
+
+#[cfg(not(test))]
+async fn delete_ilk_for_teardown(
+    state: &OrchestratorState,
+    ilk_id: &str,
+    target_hive: &str,
+) -> serde_json::Value {
+    let admin_target = ensure_l2_name("SY.admin", target_hive);
+    let socket_dir = json_router::paths::router_socket_dir();
+    let relay_config = NodeConfig {
+        name: format!("SY.orchestrator.ilk-delete.{}", now_epoch_ms()),
+        router_socket: socket_dir,
+        uuid_persistence_dir: state.state_dir.join("nodes"),
+        uuid_mode: NodeUuidMode::Ephemeral,
+        config_dir: state.config_dir.clone(),
+        version: "1.0".to_string(),
+    };
+    let (sender, mut receiver) =
+        match connect_with_retry(&relay_config, Duration::from_millis(100)).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                return serde_json::json!({
+                    "status": "error",
+                    "target": admin_target,
+                    "ilk_id": ilk_id,
+                    "deleted": false,
+                    "error_detail": err.to_string(),
+                });
+            }
+        };
+
+    let response = admin_command(
+        &sender,
+        &mut receiver,
+        AdminCommandRequest {
+            admin_target: &admin_target,
+            action: "delete_ilk",
+            target: Some(target_hive),
+            params: serde_json::json!({ "ilk_id": ilk_id }),
+            request_id: None,
+            timeout: Duration::from_secs(15),
+        },
+    )
+    .await;
+
+    let _ = sender.close().await;
+    match response {
+        Ok(resp) if resp.status == "ok" => serde_json::json!({
+            "status": "ok",
+            "target": admin_target,
+            "ilk_id": ilk_id,
+            "deleted": true,
+            "payload": resp.payload,
+        }),
+        Ok(resp) if resp.error_code.as_deref() == Some("ILK_NOT_FOUND") => serde_json::json!({
+            "status": "ok",
+            "target": admin_target,
+            "ilk_id": ilk_id,
+            "deleted": false,
+            "not_found": true,
+            "payload": resp.payload,
+        }),
+        Ok(resp) => serde_json::json!({
+            "status": "error",
+            "target": admin_target,
+            "ilk_id": ilk_id,
+            "deleted": false,
+            "error_code": resp.error_code.unwrap_or_else(|| "UNKNOWN".to_string()),
+            "error_detail": resp.error_detail.unwrap_or(resp.payload),
+        }),
+        Err(err) => serde_json::json!({
+            "status": "error",
+            "target": admin_target,
+            "ilk_id": ilk_id,
+            "deleted": false,
+            "error_detail": err.to_string(),
+        }),
+    }
+}
+
+#[cfg(test)]
+async fn delete_ilk_for_teardown(
+    _state: &OrchestratorState,
+    ilk_id: &str,
+    target_hive: &str,
+) -> serde_json::Value {
+    if let Some(canned) = take_test_ilk_delete_result() {
+        return canned;
+    }
+    serde_json::json!({
+        "status": "ok",
+        "target": ensure_l2_name("SY.admin", target_hive),
+        "ilk_id": ilk_id,
+        "deleted": true,
+    })
+}
+
+#[cfg(test)]
+fn test_ilk_delete_slot() -> &'static StdMutex<Option<serde_json::Value>> {
+    static SLOT: OnceLock<StdMutex<Option<serde_json::Value>>> = OnceLock::new();
+    SLOT.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn set_test_ilk_delete_result(value: serde_json::Value) {
+    *test_ilk_delete_slot().lock().expect("test ilk delete lock") = Some(value);
+}
+
+#[cfg(test)]
+fn take_test_ilk_delete_result() -> Option<serde_json::Value> {
+    test_ilk_delete_slot()
+        .lock()
+        .expect("test ilk delete lock")
+        .take()
+}
+
+/// Routes vault list+delete through `SY.admin@<target_hive>` to purge every
+/// secret whose metadata is dedicated to `ilk_id`. List is open in vault, but
+/// delete requires admin-class privileges (the doomed ILK no longer exists at
+/// teardown time and cannot self-delete), so this helper consistently uses the
+/// admin transport for both calls.
+///
+/// Returns a summary `{ scanned, deleted, errors[] }` where `errors` contains
+/// per-key `{ key, error_code?, error_detail? }` records. Partial failures do
+/// not abort the loop; the caller (NTC-5) surfaces the summary in the teardown
+/// response.
+#[cfg(not(test))]
+async fn purge_vault_secrets_for_ilk(
+    state: &OrchestratorState,
+    ilk_id: &str,
+    target_hive: &str,
+) -> serde_json::Value {
+    let admin_target = ensure_l2_name("SY.admin", target_hive);
+    let socket_dir = json_router::paths::router_socket_dir();
+    let relay_config = NodeConfig {
+        name: format!("SY.orchestrator.vault-purge.{}", now_epoch_ms()),
+        router_socket: socket_dir,
+        uuid_persistence_dir: state.state_dir.join("nodes"),
+        uuid_mode: NodeUuidMode::Ephemeral,
+        config_dir: state.config_dir.clone(),
+        version: "1.0".to_string(),
+    };
+    let (sender, mut receiver) =
+        match connect_with_retry(&relay_config, Duration::from_millis(100)).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                return serde_json::json!({
+                    "status": "error",
+                    "target": admin_target,
+                    "ilk_id": ilk_id,
+                    "scanned": 0,
+                    "deleted": 0,
+                    "errors": [
+                        {
+                            "stage": "connect",
+                            "error_detail": err.to_string(),
+                        }
+                    ],
+                });
+            }
+        };
+
+    let list_resp = match admin_command(
+        &sender,
+        &mut receiver,
+        AdminCommandRequest {
+            admin_target: &admin_target,
+            action: "vault_list",
+            target: Some(target_hive),
+            params: serde_json::json!({ "filter": { "ilk": ilk_id } }),
+            request_id: None,
+            timeout: Duration::from_secs(15),
+        },
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(err) => {
+            let _ = sender.close().await;
+            return serde_json::json!({
+                "status": "error",
+                "target": admin_target,
+                "ilk_id": ilk_id,
+                "scanned": 0,
+                "deleted": 0,
+                "errors": [
+                    {
+                        "stage": "vault_list",
+                        "error_detail": err.to_string(),
+                    }
+                ],
+            });
+        }
+    };
+    if list_resp.status != "ok" {
+        let _ = sender.close().await;
+        return serde_json::json!({
+            "status": "error",
+            "target": admin_target,
+            "ilk_id": ilk_id,
+            "scanned": 0,
+            "deleted": 0,
+            "errors": [
+                {
+                    "stage": "vault_list",
+                    "error_code": list_resp.error_code.unwrap_or_else(|| "UNKNOWN".to_string()),
+                    "error_detail": list_resp.error_detail.unwrap_or(list_resp.payload),
+                }
+            ],
+        });
+    }
+
+    let keys: Vec<String> = list_resp
+        .payload
+        .get("secrets")
+        .and_then(|secrets| secrets.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| entry.get("key").and_then(|key| key.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let scanned = keys.len();
+    let mut deleted = 0usize;
+    let mut errors: Vec<serde_json::Value> = Vec::new();
+
+    for key in keys {
+        let delete_resp = admin_command(
+            &sender,
+            &mut receiver,
+            AdminCommandRequest {
+                admin_target: &admin_target,
+                action: "vault_delete",
+                target: Some(target_hive),
+                params: serde_json::json!({ "key": key }),
+                request_id: None,
+                timeout: Duration::from_secs(10),
+            },
+        )
+        .await;
+        match delete_resp {
+            Ok(resp) if resp.status == "ok" => {
+                deleted += 1;
+            }
+            Ok(resp) => {
+                errors.push(serde_json::json!({
+                    "stage": "vault_delete",
+                    "key": key,
+                    "error_code": resp.error_code.unwrap_or_else(|| "UNKNOWN".to_string()),
+                    "error_detail": resp.error_detail.unwrap_or(serde_json::Value::Null),
+                }));
+            }
+            Err(err) => {
+                errors.push(serde_json::json!({
+                    "stage": "vault_delete",
+                    "key": key,
+                    "error_detail": err.to_string(),
+                }));
+            }
+        }
+    }
+
+    let _ = sender.close().await;
+    serde_json::json!({
+        "status": if errors.is_empty() { "ok" } else { "partial" },
+        "target": admin_target,
+        "ilk_id": ilk_id,
+        "scanned": scanned,
+        "deleted": deleted,
+        "errors": errors,
+    })
+}
+
+#[cfg(test)]
+async fn purge_vault_secrets_for_ilk(
+    _state: &OrchestratorState,
+    ilk_id: &str,
+    target_hive: &str,
+) -> serde_json::Value {
+    if let Some(canned) = take_test_vault_purge_result() {
+        return canned;
+    }
+    serde_json::json!({
+        "status": "ok",
+        "target": ensure_l2_name("SY.admin", target_hive),
+        "ilk_id": ilk_id,
+        "scanned": 0,
+        "deleted": 0,
+        "errors": [],
+    })
+}
+
+#[cfg(test)]
+fn test_vault_purge_slot() -> &'static StdMutex<Option<serde_json::Value>> {
+    static SLOT: OnceLock<StdMutex<Option<serde_json::Value>>> = OnceLock::new();
+    SLOT.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn set_test_vault_purge_result(value: serde_json::Value) {
+    *test_vault_purge_slot()
+        .lock()
+        .expect("test vault purge lock") = Some(value);
+}
+
+#[cfg(test)]
+fn take_test_vault_purge_result() -> Option<serde_json::Value> {
+    test_vault_purge_slot()
+        .lock()
+        .expect("test vault purge lock")
+        .take()
+}
+
+fn teardown_step_status_is_ok(value: &serde_json::Value) -> bool {
+    value
+        .get("status")
+        .and_then(|status| status.as_str())
+        .map(|status| status == "ok")
+        .unwrap_or(false)
+}
+
+fn teardown_error_message(value: &serde_json::Value) -> String {
+    value
+        .get("error_detail")
+        .and_then(|detail| detail.as_str())
+        .or_else(|| value.get("message").and_then(|detail| detail.as_str()))
+        .or_else(|| value.get("error_code").and_then(|detail| detail.as_str()))
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
+async fn append_optional_teardown_cleanup(
+    state: &OrchestratorState,
+    response: &mut serde_json::Value,
+    target_hive: &str,
+    node_name: &str,
+    ilk_id: Option<&str>,
+) {
+    if let Some(ilk_id) = ilk_id {
+        let ilk_delete = delete_ilk_for_teardown(state, ilk_id, target_hive).await;
+        response["ilk_deleted"] = serde_json::json!(ilk_delete
+            .get("deleted")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false));
+        if !teardown_step_status_is_ok(&ilk_delete) {
+            response["ilk_delete_error"] = serde_json::json!(teardown_error_message(&ilk_delete));
+        }
+        response["ilk_delete"] = ilk_delete;
+        response["vault_secrets_purged"] =
+            purge_vault_secrets_for_ilk(state, ilk_id, target_hive).await;
+    } else {
+        response["ilk_deleted"] = serde_json::json!(false);
+        response["vault_secrets_purged"] = serde_json::json!({
+            "status": "skipped",
+            "scanned": 0,
+            "deleted": 0,
+            "errors": [],
+        });
+    }
+    response["routing_references"] =
+        serde_json::to_value(enumerate_routing_references_to(state, node_name))
+            .unwrap_or_else(|_| serde_json::json!({ "routes": [], "vpns": [], "taps": [] }));
 }
 
 async fn purge_owner_timers_before_teardown(
@@ -17868,5 +18555,282 @@ blob:
         let system_obj = system.as_object().expect("system must be object");
         assert!(!system_obj.contains_key("runtime_base"));
         assert!(!system_obj.contains_key("package_path"));
+    }
+
+    fn test_route(
+        prefix: &str,
+        match_kind: u8,
+        action: u8,
+        next_hop_hive: &str,
+    ) -> StaticRouteEntry {
+        let mut route = StaticRouteEntry {
+            prefix: [0u8; 256],
+            prefix_len: 0,
+            match_kind,
+            action,
+            next_hop_hive: [0u8; 32],
+            next_hop_hive_len: 0,
+            _pad: [0u8; 3],
+            metric: 0,
+            priority: 100,
+            flags: FLAG_ACTIVE,
+            installed_at: 0,
+            _reserved: [0u8; 8],
+        };
+        route.prefix_len = json_router::shm::copy_bytes_with_len(&mut route.prefix, prefix) as u16;
+        route.next_hop_hive_len =
+            json_router::shm::copy_bytes_with_len(&mut route.next_hop_hive, next_hop_hive) as u8;
+        route
+    }
+
+    fn test_vpn(pattern: &str, match_kind: u8, vpn_id: u32) -> VpnAssignment {
+        let mut vpn = VpnAssignment {
+            pattern: [0u8; 256],
+            pattern_len: 0,
+            match_kind,
+            _pad0: 0,
+            vpn_id,
+            priority: 100,
+            flags: FLAG_ACTIVE,
+            _reserved: [0u8; 20],
+        };
+        vpn.pattern_len = json_router::shm::copy_bytes_with_len(&mut vpn.pattern, pattern) as u16;
+        vpn
+    }
+
+    fn test_tap(match_src: &str, match_dst: &str, target: &str) -> TapEntry {
+        let mut tap = TapEntry {
+            match_src: [0u8; 256],
+            match_src_len: 0,
+            _pad0: [0u8; 6],
+            match_dst: [0u8; 256],
+            match_dst_len: 0,
+            _pad1: [0u8; 6],
+            target: [0u8; 256],
+            target_len: 0,
+            _pad2: [0u8; 6],
+            mode: 0,
+            enabled: 1,
+            flags: FLAG_ACTIVE,
+            installed_at: 0,
+            _reserved: [0u8; 32],
+        };
+        tap.match_src_len =
+            json_router::shm::copy_bytes_with_len(&mut tap.match_src, match_src) as u16;
+        tap.match_dst_len =
+            json_router::shm::copy_bytes_with_len(&mut tap.match_dst, match_dst) as u16;
+        tap.target_len = json_router::shm::copy_bytes_with_len(&mut tap.target, target) as u16;
+        tap
+    }
+
+    fn test_config_snapshot(
+        routes: Vec<StaticRouteEntry>,
+        vpns: Vec<VpnAssignment>,
+        taps: Vec<TapEntry>,
+    ) -> ConfigSnapshot {
+        ConfigSnapshot {
+            header: json_router::shm::ConfigHeaderSnapshot {
+                static_route_count: routes.len() as u32,
+                vpn_assignment_count: vpns.len() as u32,
+                config_version: 1,
+                heartbeat: 1,
+                tap_count: taps.len() as u32,
+            },
+            routes,
+            vpns,
+            taps,
+        }
+    }
+
+    #[test]
+    fn routing_reference_summary_is_empty_without_matches() {
+        let snapshot = test_config_snapshot(
+            vec![test_route(
+                "WF.invoice@motherbee",
+                MATCH_EXACT,
+                ACTION_FORWARD,
+                "worker-220",
+            )],
+            vec![test_vpn("IO.*", MATCH_GLOB, 7)],
+            vec![test_tap(
+                "IO.api@motherbee",
+                "WF.invoice@motherbee",
+                "AI.audit@motherbee",
+            )],
+        );
+
+        let summary = enumerate_routing_references_in_snapshot(&snapshot, "AI.demo@motherbee");
+        assert!(summary.routes.is_empty());
+        assert!(summary.vpns.is_empty());
+        assert!(summary.taps.is_empty());
+    }
+
+    #[test]
+    fn routing_reference_summary_returns_routes_vpns_and_matching_taps() {
+        let snapshot = test_config_snapshot(
+            vec![
+                test_route(
+                    "AI.demo@motherbee",
+                    MATCH_EXACT,
+                    ACTION_FORWARD,
+                    "worker-220",
+                ),
+                test_route("AI.", MATCH_PREFIX, ACTION_DROP, ""),
+            ],
+            vec![test_vpn("AI.*@motherbee", MATCH_GLOB, 42)],
+            vec![
+                test_tap(
+                    "IO.api@motherbee",
+                    "AI.demo@motherbee",
+                    "AI.audit@motherbee",
+                ),
+                test_tap(
+                    "AI.demo@motherbee",
+                    "WF.invoice@motherbee",
+                    "IO.audit@motherbee",
+                ),
+                test_tap(
+                    "IO.other@motherbee",
+                    "WF.invoice@motherbee",
+                    "AI.demo@motherbee",
+                ),
+            ],
+        );
+
+        let summary = enumerate_routing_references_in_snapshot(&snapshot, "AI.demo@motherbee");
+        assert_eq!(summary.routes.len(), 2);
+        assert_eq!(summary.routes[0].prefix, "AI.demo@motherbee");
+        assert_eq!(summary.routes[0].action, "FORWARD");
+        assert_eq!(summary.routes[0].next_hop_hive, "worker-220");
+        assert_eq!(summary.routes[1].prefix, "AI.");
+        assert_eq!(summary.routes[1].action, "DROP");
+        assert_eq!(summary.vpns.len(), 1);
+        assert_eq!(summary.vpns[0].pattern, "AI.*@motherbee");
+        assert_eq!(summary.vpns[0].vpn_id, 42);
+        assert_eq!(summary.taps.len(), 3);
+        assert_eq!(summary.taps[0].match_dst, "AI.demo@motherbee");
+        assert_eq!(summary.taps[1].match_src, "AI.demo@motherbee");
+        assert_eq!(summary.taps[2].target, "AI.demo@motherbee");
+    }
+
+    #[tokio::test]
+    async fn optional_teardown_cleanup_surfaces_ilk_and_vault_summaries() {
+        let state = sample_orchestrator_state_for_tests();
+        set_test_ilk_delete_result(serde_json::json!({
+            "status": "error",
+            "deleted": false,
+            "error_code": "TRANSPORT_ERROR",
+            "error_detail": "identity unreachable"
+        }));
+        set_test_vault_purge_result(serde_json::json!({
+            "status": "partial",
+            "scanned": 2,
+            "deleted": 1,
+            "errors": [{"key":"demo","error_detail":"delete failed"}]
+        }));
+        let mut response = serde_json::json!({"status":"ok"});
+
+        append_optional_teardown_cleanup(
+            &state,
+            &mut response,
+            "motherbee",
+            "AI.demo@motherbee",
+            Some("ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        )
+        .await;
+
+        assert_eq!(response["ilk_deleted"], serde_json::json!(false));
+        assert_eq!(
+            response["ilk_delete_error"],
+            serde_json::json!("identity unreachable")
+        );
+        assert_eq!(response["vault_secrets_purged"]["status"], "partial");
+        assert_eq!(response["vault_secrets_purged"]["scanned"], 2);
+        assert_eq!(
+            response["routing_references"]["routes"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            response["routing_references"]["vpns"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            response["routing_references"]["taps"],
+            serde_json::json!([])
+        );
+    }
+
+    fn ilk_map_tmp_dir(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("fluxbee-test-{label}-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).expect("create tmp dir");
+        dir
+    }
+
+    #[test]
+    fn remove_node_ilk_mapping_at_removes_present_entry() {
+        let dir = ilk_map_tmp_dir("ilk-map-present");
+        let path = dir.join("identity-node-ilk-map.json");
+        let mut map = IdentityNodeIlkMap::default();
+        map.nodes
+            .insert("AI.demo@motherbee".to_string(), "ilk:abc".to_string());
+        map.tenants
+            .insert("AI.demo@motherbee".to_string(), "tnt:xyz".to_string());
+        save_identity_node_ilk_map(&path, &map).expect("save");
+
+        let removed = remove_node_ilk_mapping_at(&path, "AI.demo@motherbee").expect("remove");
+        assert!(removed);
+
+        let reloaded = load_identity_node_ilk_map(&path);
+        assert!(reloaded.nodes.get("AI.demo@motherbee").is_none());
+        assert!(reloaded.tenants.get("AI.demo@motherbee").is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_node_ilk_mapping_at_absent_is_noop() {
+        let dir = ilk_map_tmp_dir("ilk-map-absent");
+        let path = dir.join("identity-node-ilk-map.json");
+        let mut map = IdentityNodeIlkMap::default();
+        map.nodes
+            .insert("AI.other@motherbee".to_string(), "ilk:keep".to_string());
+        save_identity_node_ilk_map(&path, &map).expect("save");
+
+        let removed = remove_node_ilk_mapping_at(&path, "AI.missing@motherbee").expect("remove");
+        assert!(!removed);
+
+        let reloaded = load_identity_node_ilk_map(&path);
+        assert_eq!(
+            reloaded.nodes.get("AI.other@motherbee").map(String::as_str),
+            Some("ilk:keep")
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_node_ilk_mapping_at_no_file_returns_false() {
+        let dir = ilk_map_tmp_dir("ilk-map-missing-file");
+        let path = dir.join("identity-node-ilk-map.json");
+        let removed = remove_node_ilk_mapping_at(&path, "AI.demo@motherbee").expect("remove");
+        assert!(!removed);
+        assert!(!path.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kill_node_purge_continues_for_inactive_unit_only_with_node_name() {
+        assert!(should_purge_inactive_kill_target(
+            true,
+            Some("AI.demo@motherbee")
+        ));
+        assert!(!should_purge_inactive_kill_target(
+            false,
+            Some("AI.demo@motherbee")
+        ));
+        assert!(!should_purge_inactive_kill_target(true, None));
+        assert!(!should_purge_inactive_kill_target(true, Some("   ")));
     }
 }

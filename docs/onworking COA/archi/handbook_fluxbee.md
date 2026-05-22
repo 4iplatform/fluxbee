@@ -181,6 +181,10 @@ These are system infrastructure:
 
 Normal operator requests should not create or redesign these.
 
+### 4.4.1 Node teardown semantics
+
+- `purge_instance=true` is a real tabula-rasa for orchestrator-owned node state: instance directory, timers, `node_ilk_map`, ILK, and dedicated vault secrets are removed. Routes, VPNs, and taps are not auto-deleted; teardown returns `routing_references` so the operator can clean those deliberately.
+
 ### 4.5 Secrets and vault (Model D')
 
 `SY.vault` is the canonical secret backend. Secrets live **entirely** in vault — nodes never receive plaintext secrets through `CONFIG_SET` and never persist them locally. Consumers discover their secret at boot/refresh by querying vault for a `resource_type` (e.g. `openai`, `postgres`, `slack`).
