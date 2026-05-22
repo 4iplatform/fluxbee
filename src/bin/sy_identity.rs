@@ -1064,6 +1064,21 @@ impl IdentityStore {
         }))
     }
 
+    /// Enumerate alias `old_ilk_id`s that reference `ilk_id` either as their
+    /// own key or as their canonical target. Used by the `MSG_ILK_DELETE`
+    /// handler to emit explicit `AliasDelete` deltas so replicas and the
+    /// identity SHM converge — `apply_identity_shm_event`'s `IlkDelete` arm
+    /// only clears ich/ilk entries, never aliases.
+    fn alias_old_ids_referencing(&self, ilk_id: &str) -> Vec<String> {
+        self.aliases
+            .iter()
+            .filter_map(|(old_ilk_id, alias)| {
+                (old_ilk_id == ilk_id || alias.canonical_ilk_id == ilk_id)
+                    .then(|| old_ilk_id.clone())
+            })
+            .collect()
+    }
+
     fn delete_ilk(&mut self, req: IlkDeleteRequest) -> Result<Value, String> {
         let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
         let entry = self
@@ -1073,14 +1088,7 @@ impl IdentityStore {
         if is_well_known_system_ilk(entry) {
             return Err("SYSTEM_ILK_PROTECTED".to_string());
         }
-        let removed_aliases: Vec<String> = self
-            .aliases
-            .iter()
-            .filter_map(|(old_ilk_id, alias)| {
-                (old_ilk_id == &req.ilk_id || alias.canonical_ilk_id == req.ilk_id)
-                    .then(|| old_ilk_id.clone())
-            })
-            .collect();
+        let removed_aliases = self.alias_old_ids_referencing(&req.ilk_id);
         for old_ilk_id in &removed_aliases {
             self.aliases.remove(old_ilk_id);
         }
@@ -2108,8 +2116,25 @@ impl IdentityRuntime {
                             None
                         };
                         let ilk_id = req.ilk_id.clone();
+                        // Capture alias old_ilk_ids whose removal we'll need to
+                        // propagate to replicas/SHM. The store consumes them
+                        // when delete_ilk runs; without explicit AliasDelete
+                        // deltas the SHM layer would keep stale alias entries
+                        // because apply_identity_shm_event's IlkDelete arm only
+                        // clears ich/ilk entries, not aliases.
+                        let removed_alias_old_ids = self.store.alias_old_ids_referencing(&ilk_id);
                         match self.store.delete_ilk(req) {
                             Ok(ok) => {
+                                let mut emit_deltas = || {
+                                    for old_ilk_id in &removed_alias_old_ids {
+                                        deltas.push(delta_envelope(IdentityDelta::AliasDelete {
+                                            old_ilk_id: old_ilk_id.clone(),
+                                        }));
+                                    }
+                                    deltas.push(delta_envelope(IdentityDelta::IlkDelete {
+                                        ilk_id: ilk_id.clone(),
+                                    }));
+                                };
                                 if self.is_primary {
                                     if let Some(database_config) = self.db_config.as_ref() {
                                         if let Err(err) =
@@ -2123,21 +2148,15 @@ impl IdentityRuntime {
                                                 err.as_ref(),
                                             )
                                         } else {
-                                            deltas.push(delta_envelope(IdentityDelta::IlkDelete {
-                                                ilk_id: ilk_id.clone(),
-                                            }));
+                                            emit_deltas();
                                             ok
                                         }
                                     } else {
-                                        deltas.push(delta_envelope(IdentityDelta::IlkDelete {
-                                            ilk_id: ilk_id.clone(),
-                                        }));
+                                        emit_deltas();
                                         ok
                                     }
                                 } else {
-                                    deltas.push(delta_envelope(IdentityDelta::IlkDelete {
-                                        ilk_id: ilk_id.clone(),
-                                    }));
+                                    emit_deltas();
                                     ok
                                 }
                             }
@@ -6360,6 +6379,43 @@ mod tests {
         assert!(store
             .aliases
             .contains_key("ilk:eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"));
+    }
+
+    #[test]
+    fn alias_old_ids_referencing_captures_both_directions() {
+        let mut store = IdentityStore::default();
+        let target = "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string();
+        store.aliases.insert(
+            target.clone(),
+            AliasRecord {
+                canonical_ilk_id: "ilk:cccccccc-cccc-cccc-cccc-cccccccccccc".to_string(),
+                expires_at_ms: now_epoch_ms() + 60_000,
+            },
+        );
+        store.aliases.insert(
+            "ilk:dddddddd-dddd-dddd-dddd-dddddddddddd".to_string(),
+            AliasRecord {
+                canonical_ilk_id: target.clone(),
+                expires_at_ms: now_epoch_ms() + 60_000,
+            },
+        );
+        store.aliases.insert(
+            "ilk:eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee".to_string(),
+            AliasRecord {
+                canonical_ilk_id: "ilk:ffffffff-ffff-ffff-ffff-ffffffffffff".to_string(),
+                expires_at_ms: now_epoch_ms() + 60_000,
+            },
+        );
+
+        let mut captured = store.alias_old_ids_referencing(&target);
+        captured.sort();
+        assert_eq!(
+            captured,
+            vec![
+                "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                "ilk:dddddddd-dddd-dddd-dddd-dddddddddddd".to_string(),
+            ]
+        );
     }
 
     #[test]

@@ -12998,6 +12998,20 @@ async fn relay_system_action_for_timer_purge(
 #[cfg(test)]
 type TestTimerPurgeRelayResult = Result<serde_json::Value, String>;
 
+/// Cross-test serialization for the teardown test slots (timer purge, ilk
+/// delete, vault purge). Each slot is process-global state; without this guard
+/// concurrent `#[tokio::test]` invocations interleave set/take and corrupt one
+/// another's results. Each test calling `set_test_*_result` should hold this
+/// guard from the set call until the helper invocation returns.
+#[cfg(test)]
+fn teardown_test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: OnceLock<StdMutex<()>> = OnceLock::new();
+    SERIAL
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 fn test_timer_purge_relay_slot() -> &'static StdMutex<Option<TestTimerPurgeRelayResult>> {
     static SLOT: OnceLock<StdMutex<Option<TestTimerPurgeRelayResult>>> = OnceLock::new();
@@ -16924,6 +16938,7 @@ blob:
 
     #[tokio::test]
     async fn purge_owner_timers_before_teardown_returns_ok_payload_with_deleted_count() {
+        let _guard = teardown_test_serial_guard();
         let state = sample_orchestrator_state_for_tests();
         set_test_timer_purge_relay_result(Ok(serde_json::json!({
             "ok": true,
@@ -16950,6 +16965,7 @@ blob:
 
     #[tokio::test]
     async fn purge_owner_timers_before_teardown_surfaces_relay_error() {
+        let _guard = teardown_test_serial_guard();
         let state = sample_orchestrator_state_for_tests();
         set_test_timer_purge_relay_result(Err(
             "system forward timeout msg=TIMER_PURGE_OWNER response=TIMER_RESPONSE".to_string(),
@@ -18715,6 +18731,7 @@ blob:
 
     #[tokio::test]
     async fn optional_teardown_cleanup_surfaces_ilk_and_vault_summaries() {
+        let _guard = teardown_test_serial_guard();
         let state = sample_orchestrator_state_for_tests();
         set_test_ilk_delete_result(serde_json::json!({
             "status": "error",
