@@ -81,6 +81,7 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "vault_rotate",
     "vault_rollback",
     "set_ilk_definition",
+    "delete_ilk",
     "publish_runtime_package",
     "sync_hint",
     "update",
@@ -3228,6 +3229,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "delete_ilk",
+        route: InternalActionRoute::Command("delete_ilk"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "list_tenants",
         route: InternalActionRoute::Query("list_tenants"),
         requires_target: true,
@@ -4914,6 +4921,14 @@ async fn handle_hive_paths(
                     .await?;
             Ok(Some((status, resp)))
         }
+        ("DELETE", ["identity", "ilks", ilk_id]) => {
+            let payload = serde_json::json!({
+                "ilk_id": decode_percent(ilk_id),
+            });
+            let (status, resp) =
+                handle_admin_command(ctx, client, "delete_ilk", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
         ("GET", ["identity", "tenants"]) => {
             let (status, resp) =
                 handle_admin_query(ctx, client, "list_tenants", Some(hive)).await?;
@@ -5711,8 +5726,9 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
     match code.as_str() {
         "INVALID_REQUEST" | "INVALID_ADDRESS" | "INVALID_ARCHIVE" | "INVALID_HIVE_ID"
         | "INVALID_ZIP" | "INVALID_KEY_FORMAT" | "INVALID_VALUE" => 400,
-        "UNAUTHORIZED" => 403,
+        "UNAUTHORIZED" | "SYSTEM_ILK_PROTECTED" => 403,
         "NOT_FOUND"
+        | "ILK_NOT_FOUND"
         | "NODE_NOT_FOUND"
         | "BLOB_NOT_FOUND"
         | "KEY_NOT_FOUND"
@@ -7040,6 +7056,7 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "remove_node_instance"
             | "remove_runtime_version"
             | "set_ilk_definition"
+            | "delete_ilk"
             | "set_node_config"
             | "node_control_config_set"
             | "set_storage"
@@ -7084,6 +7101,9 @@ fn admin_action_summary(action: &str) -> &'static str {
         "get_ilk" => "Read one identity ilk.",
         "set_ilk_definition" => {
             "Set the cognitive definition hashes for one identity agent ILK."
+        }
+        "delete_ilk" => {
+            "Delete one identity ILK and its ICH mappings. Refuses well-known SY system ILKs (SYSTEM_ILK_PROTECTED)."
         }
         "list_tenants" => "List identity tenants in a hive.",
         "get_tenant" => "Read one identity tenant in a hive.",
@@ -7183,6 +7203,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "set_ilk_definition" => {
             vec!["POST /hives/{hive}/identity/ilks/{ilk_id}/definition"]
         }
+        "delete_ilk" => vec!["DELETE /hives/{hive}/identity/ilks/{ilk_id}"],
         "list_tenants" => vec!["GET /hives/{hive}/identity/tenants"],
         "get_tenant" => vec!["GET /hives/{hive}/identity/tenants/{tenant_id}"],
         "create_tenant" => vec!["POST /hives/{hive}/identity/tenants"],
@@ -7366,7 +7387,7 @@ fn admin_action_path_params(action: &str) -> Vec<serde_json::Value> {
             admin_action_path_param("runtime", "string", "Runtime name, for example ai.chat."),
             admin_action_path_param("version", "string", "Runtime version to delete."),
         ],
-        "get_ilk" | "set_ilk_definition" => vec![
+        "get_ilk" | "set_ilk_definition" | "delete_ilk" => vec![
             admin_action_path_param("hive", "string", "Target hive id in the URL path."),
             admin_action_path_param(
                 "ilk_id",
@@ -8392,6 +8413,9 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "set_ilk_definition" => {
             r#"curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{"definition":{"role_hash":null,"skill_hashes":[],"handbook_hashes":[],"personality_hash":null}}'"#
         }
+        "delete_ilk" => {
+            "curl -X DELETE /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000"
+        }
         "list_tenants" => "curl -X GET /hives/motherbee/identity/tenants",
         "get_tenant" => {
             "curl -X GET /hives/motherbee/identity/tenants/tnt:550e8400-e29b-41d4-a716-446655440000"
@@ -8635,6 +8659,11 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "personality_hash is optional and refers to a single personality asset (nationality, languages, timezone, biography).",
             "Identity validates hash format and limits before persisting and publishing the SHM update.",
             "This does not create the blob assets; Archi must write canonical role/skill/handbook/personality assets to blob before applying the hashes.",
+        ],
+        "delete_ilk" => vec![
+            "Hard-deletes one ILK record and its ICH mappings; the SHM update propagates to all SY.identity replicas via delta broadcast.",
+            "Refuses to delete a well-known SY system ILK (identification.source == hive.system_nodes) with SYSTEM_ILK_PROTECTED.",
+            "Primary use case: orchestrator-driven tabula-rasa of a node instance during purge teardown.",
         ],
         "list_tenants" => vec![
             "Lists the identity tenants currently known by SY.identity for one hive.",
@@ -10328,6 +10357,7 @@ async fn handle_admin_command(
         action,
         "get_ilk"
             | "set_ilk_definition"
+            | "delete_ilk"
             | "get_tenant"
             | "create_tenant"
             | "update_tenant"
@@ -10493,15 +10523,27 @@ fn extract_node_error_code_and_detail(
     let code = node_error
         .get("code")
         .and_then(serde_json::Value::as_str)
-        .or_else(|| node_error.get("error_code").and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            node_error
+                .get("error_code")
+                .and_then(serde_json::Value::as_str)
+        })
         .map(str::to_string)
         .unwrap_or_else(|| "NODE_REJECTED_CONFIG".to_string());
     let detail = node_error
         .get("message")
         .and_then(serde_json::Value::as_str)
-        .or_else(|| node_error.get("error_detail").and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            node_error
+                .get("error_detail")
+                .and_then(serde_json::Value::as_str)
+        })
         .or_else(|| node_error.get("reason").and_then(serde_json::Value::as_str))
-        .or_else(|| node_response.get("message").and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            node_response
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+        })
         .map(str::to_string)
         .unwrap_or_else(|| "node rejected the config control request".to_string());
     (code, detail)
@@ -10720,6 +10762,7 @@ async fn handle_identity_command(
     let (request_msg, response_msg) = match action {
         "get_ilk" => ("ILK_GET", "ILK_GET_RESPONSE"),
         "set_ilk_definition" => ("ILK_SET_DEFINITION", "ILK_SET_DEFINITION_RESPONSE"),
+        "delete_ilk" => ("ILK_DELETE", "ILK_DELETE_RESPONSE"),
         "get_tenant" => ("TNT_GET", "TNT_GET_RESPONSE"),
         "create_tenant" => ("TNT_CREATE", "TNT_CREATE_RESPONSE"),
         "update_tenant" => ("TNT_UPDATE", "TNT_UPDATE_RESPONSE"),
@@ -12675,6 +12718,12 @@ mod tests {
     }
 
     #[test]
+    fn identity_delete_errors_map_to_operator_http_statuses() {
+        assert_eq!(error_code_to_http_status("ILK_NOT_FOUND"), 404);
+        assert_eq!(error_code_to_http_status("SYSTEM_ILK_PROTECTED"), 403);
+    }
+
+    #[test]
     fn build_admin_http_response_maps_sy_wf_rules_error_payload() {
         let payload = json!({
             "ok": false,
@@ -13329,7 +13378,22 @@ mod tests {
         assert_eq!(
             admin_action_example_scmd("set_ilk_definition")
                 .expect("set_ilk_definition should expose example_scmd"),
-            r#"curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{"definition":{"role_hash":"1111111111111111111111111111111111111111111111111111111111111111","skill_hashes":["2222222222222222222222222222222222222222222222222222222222222222"],"handbook_hashes":["3333333333333333333333333333333333333333333333333333333333333333"]}}'"#
+            r#"curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{"definition":{"role_hash":null,"skill_hashes":[],"handbook_hashes":[],"personality_hash":null}}'"#
+        );
+    }
+
+    #[test]
+    fn delete_ilk_action_is_registered() {
+        let spec = resolve_internal_action_spec("delete_ilk").expect("action must exist");
+        assert!(spec.requires_target);
+        assert!(admin_action_requires_confirmation("delete_ilk"));
+        assert_eq!(
+            admin_action_path_patterns("delete_ilk"),
+            vec!["DELETE /hives/{hive}/identity/ilks/{ilk_id}"]
+        );
+        assert_eq!(
+            admin_action_example_scmd("delete_ilk").expect("delete_ilk example_scmd"),
+            "curl -X DELETE /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000"
         );
     }
 

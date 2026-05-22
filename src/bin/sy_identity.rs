@@ -82,6 +82,8 @@ const MSG_ILK_UPDATE: &str = "ILK_UPDATE";
 const MSG_ILK_UPDATE_RESPONSE: &str = "ILK_UPDATE_RESPONSE";
 const MSG_ILK_SET_DEFINITION: &str = "ILK_SET_DEFINITION";
 const MSG_ILK_SET_DEFINITION_RESPONSE: &str = "ILK_SET_DEFINITION_RESPONSE";
+const MSG_ILK_DELETE: &str = "ILK_DELETE";
+const MSG_ILK_DELETE_RESPONSE: &str = "ILK_DELETE_RESPONSE";
 const MSG_ICH_SET_ENABLED: &str = "ICH_SET_ENABLED";
 const MSG_ICH_SET_ENABLED_RESPONSE: &str = "ICH_SET_ENABLED_RESPONSE";
 const MSG_TNT_CREATE: &str = "TNT_CREATE";
@@ -283,6 +285,12 @@ struct IlkUpdateRequest {
 struct IlkSetDefinitionRequest {
     ilk_id: String,
     definition: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IlkDeleteRequest {
+    ilk_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1056,6 +1064,36 @@ impl IdentityStore {
         }))
     }
 
+    fn delete_ilk(&mut self, req: IlkDeleteRequest) -> Result<Value, String> {
+        let _ = parse_prefixed_uuid(&req.ilk_id, "ilk")?;
+        let entry = self
+            .ilks
+            .get(&req.ilk_id)
+            .ok_or_else(|| "ILK_NOT_FOUND".to_string())?;
+        if is_well_known_system_ilk(entry) {
+            return Err("SYSTEM_ILK_PROTECTED".to_string());
+        }
+        let removed_aliases: Vec<String> = self
+            .aliases
+            .iter()
+            .filter_map(|(old_ilk_id, alias)| {
+                (old_ilk_id == &req.ilk_id || alias.canonical_ilk_id == req.ilk_id)
+                    .then(|| old_ilk_id.clone())
+            })
+            .collect();
+        for old_ilk_id in &removed_aliases {
+            self.aliases.remove(old_ilk_id);
+        }
+        self.ich_lookup
+            .retain(|_, mapped_ilk| mapped_ilk != &req.ilk_id);
+        self.ilks.remove(&req.ilk_id);
+        Ok(json!({
+            "status": "ok",
+            "ilk_id": req.ilk_id,
+            "removed_alias_count": removed_aliases.len(),
+        }))
+    }
+
     fn create_tenant(&mut self, req: TntCreateRequest) -> Result<Value, String> {
         validate_non_empty("name", &req.name)?;
         if let Some(sponsor_tenant_id) = req.sponsor_tenant_id.as_deref() {
@@ -1403,6 +1441,9 @@ impl IdentityStore {
                 self.ilks.insert(ilk_id, ilk);
             }
             IdentityDelta::IlkDelete { ilk_id } => {
+                self.aliases.retain(|old_ilk_id, alias| {
+                    old_ilk_id != &ilk_id && alias.canonical_ilk_id != ilk_id
+                });
                 self.ich_lookup
                     .retain(|_, mapped_ilk| mapped_ilk != &ilk_id);
                 self.ilks.remove(&ilk_id);
@@ -1456,6 +1497,7 @@ impl IdentityRuntime {
         allowed_prefixes.insert(MSG_ILK_ADD_CHANNEL, vec!["IO.", "SY.frontdesk.gov@"]);
         allowed_prefixes.insert(MSG_ILK_UPDATE, vec!["SY.orchestrator@"]);
         allowed_prefixes.insert(MSG_ILK_SET_DEFINITION, vec!["SY.admin@", "SY.architect@"]);
+        allowed_prefixes.insert(MSG_ILK_DELETE, vec!["SY.admin@", "SY.orchestrator@"]);
         allowed_prefixes.insert(
             MSG_ICH_SET_ENABLED,
             vec!["IO.", "SY.admin@", "SY.architect@", "SY.frontdesk.gov@"],
@@ -1481,7 +1523,8 @@ impl IdentityRuntime {
         bootstrap.insert(format!("SY.identity@{}", hive.hive_id));
         allowed_exacts.insert(MSG_ILK_REGISTER, bootstrap.clone());
         allowed_exacts.insert(MSG_ILK_UPDATE, bootstrap.clone());
-        allowed_exacts.insert(MSG_ILK_SET_DEFINITION, bootstrap);
+        allowed_exacts.insert(MSG_ILK_SET_DEFINITION, bootstrap.clone());
+        allowed_exacts.insert(MSG_ILK_DELETE, bootstrap);
         if let Some(frontdesk_node) = configured_identity_frontdesk_node_name(hive) {
             allowed_exacts
                 .entry(MSG_ILK_REGISTER)
@@ -2051,6 +2094,54 @@ impl IdentityRuntime {
                                 }
                             }
                             Err(code) => error_payload(&code, "failed to set ilk definition"),
+                        }
+                    }
+                    Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
+                }
+            }
+            MSG_ILK_DELETE => {
+                match serde_json::from_value::<IlkDeleteRequest>(msg.payload.clone()) {
+                    Ok(req) => {
+                        let snapshot = if self.is_primary && self.db_config.is_some() {
+                            Some(self.store.clone())
+                        } else {
+                            None
+                        };
+                        let ilk_id = req.ilk_id.clone();
+                        match self.store.delete_ilk(req) {
+                            Ok(ok) => {
+                                if self.is_primary {
+                                    if let Some(database_config) = self.db_config.as_ref() {
+                                        if let Err(err) =
+                                            delete_ilk_in_db(database_config, &ilk_id).await
+                                        {
+                                            if let Some(snapshot) = snapshot {
+                                                self.store = snapshot;
+                                            }
+                                            db_write_error_payload(
+                                                "failed to delete ilk",
+                                                err.as_ref(),
+                                            )
+                                        } else {
+                                            deltas.push(delta_envelope(IdentityDelta::IlkDelete {
+                                                ilk_id: ilk_id.clone(),
+                                            }));
+                                            ok
+                                        }
+                                    } else {
+                                        deltas.push(delta_envelope(IdentityDelta::IlkDelete {
+                                            ilk_id: ilk_id.clone(),
+                                        }));
+                                        ok
+                                    }
+                                } else {
+                                    deltas.push(delta_envelope(IdentityDelta::IlkDelete {
+                                        ilk_id: ilk_id.clone(),
+                                    }));
+                                    ok
+                                }
+                            }
+                            Err(code) => error_payload(&code, "failed to delete ilk"),
                         }
                     }
                     Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
@@ -3329,6 +3420,14 @@ fn apply_identity_shm_deltas(
     action: &str,
     deltas: &[IdentityDeltaEnvelope],
 ) -> Result<(), IdentityError> {
+    if deltas
+        .iter()
+        .any(|delta| matches!(&delta.delta, IdentityDelta::IlkDelete { .. }))
+    {
+        sync_identity_shm_mappings(writer, store)?;
+        return Ok(());
+    }
+
     if action == MSG_ILK_PROVISION
         && deltas.len() == 1
         && matches!(&deltas[0].delta, IdentityDelta::IlkUpsert { .. })
@@ -3707,6 +3806,19 @@ fn load_hive(config_dir: &Path) -> Result<HiveFile, IdentityError> {
     Ok(serde_yaml::from_str(&raw)?)
 }
 
+/// An ILK is well-known and seeded by `ensure_system_ilks_from_hive` when
+/// `identification.source == "hive.system_nodes"`. These ILKs are the
+/// deterministic SY identities and must not be removable through admin paths:
+/// their deletion would silently break vault authorization and node bootstrap
+/// the next time the SY node restarts.
+fn is_well_known_system_ilk(ilk: &IlkRecord) -> bool {
+    ilk.identification
+        .get("source")
+        .and_then(Value::as_str)
+        .map(|value| value == "hive.system_nodes")
+        .unwrap_or(false)
+}
+
 fn system_nodes_for_hive(hive: &HiveFile) -> Result<Vec<String>, String> {
     let section = hive
         .system_nodes
@@ -3775,6 +3887,7 @@ fn response_name(action: &str) -> &'static str {
         MSG_ILK_ADD_CHANNEL => MSG_ILK_ADD_CHANNEL_RESPONSE,
         MSG_ILK_UPDATE => MSG_ILK_UPDATE_RESPONSE,
         MSG_ILK_SET_DEFINITION => MSG_ILK_SET_DEFINITION_RESPONSE,
+        MSG_ILK_DELETE => MSG_ILK_DELETE_RESPONSE,
         MSG_ICH_SET_ENABLED => MSG_ICH_SET_ENABLED_RESPONSE,
         MSG_TNT_CREATE => MSG_TNT_CREATE_RESPONSE,
         MSG_TNT_UPDATE => MSG_TNT_UPDATE_RESPONSE,
@@ -3794,6 +3907,7 @@ fn action_requires_primary(action: &str) -> bool {
             | MSG_ILK_ADD_CHANNEL
             | MSG_ILK_UPDATE
             | MSG_ILK_SET_DEFINITION
+            | MSG_ILK_DELETE
             | MSG_ICH_SET_ENABLED
             | MSG_TNT_CREATE
             | MSG_TNT_UPDATE
@@ -4556,6 +4670,34 @@ SET
         .await?;
     }
 
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn delete_ilk_in_db(database_config: &PgConfig, ilk_id: &str) -> Result<(), IdentityError> {
+    let ilk_uuid = parse_prefixed_uuid(ilk_id, "ilk")?.to_string();
+    let (mut client, connection) = database_config.connect(NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::warn!(error = %err, "identity ilk delete postgres connection closed");
+        }
+    });
+    let tx = client.transaction().await?;
+    tx.execute(
+        "DELETE FROM identity_ichs WHERE ilk_id = $1::text::uuid",
+        &[&ilk_uuid],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM identity_ilk_aliases WHERE old_ilk_id = $1::text::uuid OR canonical_ilk_id = $1::text::uuid",
+        &[&ilk_uuid],
+    )
+    .await?;
+    tx.execute(
+        "DELETE FROM identity_ilks WHERE ilk_id = $1::text::uuid",
+        &[&ilk_uuid],
+    )
+    .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -6152,6 +6294,153 @@ mod tests {
             })
             .expect_err("not found");
         assert_eq!(not_found, "ILK_NOT_FOUND");
+    }
+
+    #[test]
+    fn delete_ilk_removes_agent_and_purges_ich_lookup() {
+        let mut store = IdentityStore::default();
+        let ilk_id = "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string();
+        let tenant_id = "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string();
+        store.ilks.insert(
+            ilk_id.clone(),
+            IlkRecord {
+                ilk_id: ilk_id.clone(),
+                ilk_type: "agent".to_string(),
+                registration_status: "complete".to_string(),
+                tenant_id: tenant_id.clone(),
+                identification: json!({"node_name":"AI.demo@motherbee","source":"orchestrator.run_node"}),
+                definition: json!({}),
+                channels: Vec::new(),
+                deleted_at_ms: None,
+            },
+        );
+        store.ich_lookup.insert(
+            ("slack".to_string(), "U123".to_string(), tenant_id.clone()),
+            ilk_id.clone(),
+        );
+        store.aliases.insert(
+            ilk_id.clone(),
+            AliasRecord {
+                canonical_ilk_id: "ilk:cccccccc-cccc-cccc-cccc-cccccccccccc".to_string(),
+                expires_at_ms: now_epoch_ms() + 60_000,
+            },
+        );
+        store.aliases.insert(
+            "ilk:dddddddd-dddd-dddd-dddd-dddddddddddd".to_string(),
+            AliasRecord {
+                canonical_ilk_id: ilk_id.clone(),
+                expires_at_ms: now_epoch_ms() + 60_000,
+            },
+        );
+        store.aliases.insert(
+            "ilk:eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee".to_string(),
+            AliasRecord {
+                canonical_ilk_id: "ilk:ffffffff-ffff-ffff-ffff-ffffffffffff".to_string(),
+                expires_at_ms: now_epoch_ms() + 60_000,
+            },
+        );
+
+        let ok = store
+            .delete_ilk(IlkDeleteRequest {
+                ilk_id: ilk_id.clone(),
+            })
+            .expect("delete ok");
+        assert_eq!(ok.get("status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(
+            ok.get("removed_alias_count").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert!(!store.ilks.contains_key(&ilk_id));
+        assert!(!store.ich_lookup.values().any(|mapped| mapped == &ilk_id));
+        assert!(!store.aliases.contains_key(&ilk_id));
+        assert!(!store
+            .aliases
+            .values()
+            .any(|alias| alias.canonical_ilk_id == ilk_id));
+        assert!(store
+            .aliases
+            .contains_key("ilk:eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"));
+    }
+
+    #[test]
+    fn apply_ilk_delete_delta_removes_aliases_for_replicas() {
+        let mut store = IdentityStore::default();
+        let ilk_id = "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string();
+        store.aliases.insert(
+            ilk_id.clone(),
+            AliasRecord {
+                canonical_ilk_id: "ilk:cccccccc-cccc-cccc-cccc-cccccccccccc".to_string(),
+                expires_at_ms: now_epoch_ms() + 60_000,
+            },
+        );
+        store.aliases.insert(
+            "ilk:dddddddd-dddd-dddd-dddd-dddddddddddd".to_string(),
+            AliasRecord {
+                canonical_ilk_id: ilk_id.clone(),
+                expires_at_ms: now_epoch_ms() + 60_000,
+            },
+        );
+        store.aliases.insert(
+            "ilk:eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee".to_string(),
+            AliasRecord {
+                canonical_ilk_id: "ilk:ffffffff-ffff-ffff-ffff-ffffffffffff".to_string(),
+                expires_at_ms: now_epoch_ms() + 60_000,
+            },
+        );
+
+        store.apply_delta(IdentityDelta::IlkDelete {
+            ilk_id: ilk_id.clone(),
+        });
+
+        assert!(!store.aliases.contains_key(&ilk_id));
+        assert!(!store
+            .aliases
+            .values()
+            .any(|alias| alias.canonical_ilk_id == ilk_id));
+        assert!(store
+            .aliases
+            .contains_key("ilk:eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"));
+    }
+
+    #[test]
+    fn delete_ilk_refuses_well_known_system_ilks() {
+        let mut store = IdentityStore::default();
+        let ilk_id = "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string();
+        store.ilks.insert(
+            ilk_id.clone(),
+            IlkRecord {
+                ilk_id: ilk_id.clone(),
+                ilk_type: "system".to_string(),
+                registration_status: "complete".to_string(),
+                tenant_id: "tnt:00000000-0000-0000-0000-000000000001".to_string(),
+                identification: json!({
+                    "node_name":"SY.admin@motherbee",
+                    "source":"hive.system_nodes"
+                }),
+                definition: json!({}),
+                channels: Vec::new(),
+                deleted_at_ms: None,
+            },
+        );
+
+        let err = store
+            .delete_ilk(IlkDeleteRequest {
+                ilk_id: ilk_id.clone(),
+            })
+            .expect_err("must refuse system ilk");
+        assert_eq!(err, "SYSTEM_ILK_PROTECTED");
+        assert!(store.ilks.contains_key(&ilk_id));
+    }
+
+    #[test]
+    fn delete_ilk_not_found_returns_specific_error() {
+        let mut store = IdentityStore::default();
+        let err = store
+            .delete_ilk(IlkDeleteRequest {
+                ilk_id: "ilk:cccccccc-cccc-cccc-cccc-cccccccccccc".to_string(),
+            })
+            .expect_err("not found");
+        assert_eq!(err, "ILK_NOT_FOUND");
     }
 
     #[test]

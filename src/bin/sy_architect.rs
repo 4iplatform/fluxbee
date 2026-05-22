@@ -11376,6 +11376,7 @@ fn admin_action_allows_ai_write(action: &str) -> bool {
             | "remove_node_instance"
             | "remove_runtime_version"
             | "set_ilk_definition"
+            | "delete_ilk"
             | "set_node_config"
             | "node_control_config_set"
             | "send_node_message"
@@ -12179,6 +12180,12 @@ fn translate_scmd(
                 params,
             })
         }
+        ("DELETE", ["hives", hive_id, "identity", "ilks", ilk_id]) => Ok(AdminTranslation {
+            admin_target,
+            action: "delete_ilk".to_string(),
+            target_hive: (*hive_id).to_string(),
+            params: json!({ "ilk_id": ilk_id }),
+        }),
         ("GET", ["hives", hive_id, "versions"]) => Ok(AdminTranslation {
             admin_target,
             action: "get_versions".to_string(),
@@ -25666,6 +25673,24 @@ mod tests {
             })
         );
         assert!(admin_action_allows_ai_write("set_ilk_definition"));
+    }
+
+    #[test]
+    fn translate_delete_ilk_scmd() {
+        let translated = translate_scmd(
+            "motherbee",
+            parse(
+                "curl -X DELETE /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000",
+            ),
+        )
+        .expect("translation should succeed");
+        assert_eq!(translated.action, "delete_ilk");
+        assert_eq!(translated.target_hive, "motherbee");
+        assert_eq!(
+            translated.params,
+            json!({ "ilk_id": "ilk:550e8400-e29b-41d4-a716-446655440000" })
+        );
+        assert!(admin_action_allows_ai_write("delete_ilk"));
     }
 
     #[test]
