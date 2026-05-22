@@ -2203,26 +2203,6 @@ async fn run_outbound_loop(
             continue;
         }
 
-        let Some(meta_context) = msg.meta.context.as_ref() else {
-            tracing::debug!(
-                trace_id = %msg.routing.trace_id,
-                msg_type = %msg.meta.msg_type,
-                msg = %meta_msg,
-                payload_type = %payload_type,
-                "skipping outbound: missing meta.context"
-            );
-            continue;
-        };
-        let Some(target) = extract_slack_post_target(meta_context) else {
-            tracing::debug!(
-                trace_id = %msg.routing.trace_id,
-                msg_type = %msg.meta.msg_type,
-                msg = %meta_msg,
-                payload_type = %payload_type,
-                "skipping outbound: missing/unsupported io.reply_target for Slack"
-            );
-            continue;
-        };
         let binding = match extract_runtime_slack_binding(
             control_plane.read().await.effective_config.as_ref(),
             &config,
@@ -2237,6 +2217,26 @@ async fn run_outbound_loop(
                 continue;
             }
         };
+        let target = msg
+            .meta
+            .context
+            .as_ref()
+            .and_then(extract_slack_post_target)
+            .unwrap_or_else(|| {
+                tracing::debug!(
+                    trace_id = %msg.routing.trace_id,
+                    msg_type = %msg.meta.msg_type,
+                    msg = %meta_msg,
+                    payload_type = %payload_type,
+                    configured_conversation_id = %binding.conversation_id,
+                    "outbound missing io.reply_target; falling back to configured Slack binding"
+                );
+                io_common::io_context::SlackPostTarget {
+                    channel_id: binding.conversation_id.clone(),
+                    thread_ts: None,
+                    workspace_id: Some(binding.workspace_id.clone()),
+                }
+            });
         if target.channel_id != binding.conversation_id {
             tracing::debug!(
                 trace_id = %msg.routing.trace_id,
