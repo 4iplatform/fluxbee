@@ -189,16 +189,16 @@ Lectura ajustada al estado real actual del repo:
 - `IO.api` ya lee `self_ilk_id` y `self_tenant_id` desde env al boot;
 - hoy esos valores también se usan para asegurar el alta del `ICH` propio de la instancia vía `ILK_ADD_CHANNEL`;
 - el identificador canonico de ese canal es `api_channel_id`;
-- el material local más concreto que hoy ya participa del path operativo es el `listen.address`, usado como `entrypoint` del `IoContext`;
+- `listen.address` sigue existiendo como dato técnico de bind/runtime;
 - el cálculo actual de `thread_id` para `IO.api` ya usa `ThreadIdInput::PersistentChannel` con:
   - `channel_type = "api"`
-  - `entrypoint_id = listen.address`
+  - `entrypoint_id = api_channel_id`
   - `conversation_id` canónico del request
 
 Conclusión práctica:
 
-- la continuidad conversacional ya incorpora material local del canal;
-- `meta.ich` ya se alinea al asset local de ingreso;
+- la continuidad conversacional ya incorpora la identidad lógica estable del canal;
+- `meta.ich` ya se alinea al canal API estable, no al bind técnico;
 - el `ICH` propio de la instancia ya se intenta registrar explícitamente contra identity usando `self_ilk_id + api_channel_id`.
 
 ### 3.6 Estado actual del alta de ICH propio
@@ -221,6 +221,34 @@ Gap residual:
 
 - la validación local de `SY.identity` queda condicionada al entorno de build disponible;
 - pero el contrato ya no está bloqueado conceptualmente por core para `IO.api`.
+
+### 3.7 Relación actual entre `api_channel_id` e `integration_id`
+
+En el estado actual de `IO.api`, ambos conceptos conviven pero **no cumplen el mismo rol**.
+
+`api_channel_id`:
+
+- identifica el canal local/estable del nodo;
+- es la base del `ICH` propio;
+- participa en `meta.ich` y en el carrier conversacional del canal.
+
+`integration_id`:
+
+- sigue identificando la integración funcional autenticada;
+- hoy se usa en auth inbound (`auth.api_keys[*].integration_id`);
+- hoy se usa para resolver callback/webhook final y política asociada.
+
+Regla vigente:
+
+- `api_channel_id` manda para identidad del canal / `ICH`;
+- `integration_id` solo debe seguir existiendo donde todavía resuelve auth, callback o política funcional.
+
+Decisión diferida:
+
+- cuando se cierre mejor el modelo de instancia, tenant, ownership y secrets/tokens de API, debe revisarse si `integration_id`:
+  - permanece como concepto separado,
+  - queda como alias,
+  - o pasa a ser metadata del `api_channel_id`.
 
 ---
 

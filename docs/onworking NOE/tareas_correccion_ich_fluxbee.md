@@ -129,16 +129,20 @@ Lectura actual:
 
 - [x] Lee `self_ilk_id` / `self_tenant_id` al boot
 - [x] Usa `self_ilk_id` / `self_tenant_id` operacionalmente para resolver credenciales `slack` en vault y refrescarlas
-- [x] Usa `team_id` / workspace como `entrypoint` operativo en `IoContext`
+- [x] Requiere `config.io.workspace_id` + `config.io.conversation_id` como binding operativo mínimo
+- [x] Usa el binding `workspace_id + conversation_id` como `entrypoint` operativo en `IoContext`
 - [x] Calcula `thread_id` con material local del canal:
-  - `NativeThread(... entrypoint_id=team_id ...)` cuando existe `thread_ts`
-  - `PersistentChannel(... entrypoint_id=team_id ...)` cuando no existe `thread_ts`
-- [x] Asegura alta explícita del `ICH` propio del workspace vía `ILK_ADD_CHANNEL` sobre `self_ilk_id`
+  - `NativeThread(... entrypoint_id=workspace_id, conversation_id=conversation_id ...)` cuando existe `thread_ts`
+  - `PersistentChannel(... entrypoint_id=workspace_id, conversation_id=conversation_id ...)` cuando no existe `thread_ts`
+- [x] Asegura alta explícita del `ICH` propio del binding vía `ILK_ADD_CHANNEL` sobre `self_ilk_id`
+- [x] Descarta inbound fuera del binding configurado
+- [x] Fuerza outbound al `conversation_id` configurado del nodo
+- [x] Asegura el `ICH` propio también al boot y en `CONFIG_SET`, no solo ante inbound
 
 Lectura actual:
 - `IO.slack` ya usa tanto ILK interno como material local del canal de forma operativa real;
-- `meta.ich` ya se promueve desde el workspace local correcto;
-- el alta del `ICH` propio ya quedó implementada usando `self_ilk_id + team_id`;
+- `meta.ich` ya se promueve desde el binding local correcto;
+- el alta del `ICH` propio ya quedó implementada usando `self_ilk_id + (workspace_id + conversation_id)`;
 - el gap pendiente ya no es conceptual de core sino de validación E2E del binario `sy_identity` en este entorno local.
 
 ### Tareas nuevas — alta de `ICH` propio para nodos IO

@@ -206,16 +206,17 @@ pub(crate) fn parse_json_message_request(
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(|| external_user_id.clone());
+    let api_channel_id = effective
+        .get("io")
+        .and_then(|io| io.get("api_channel_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("api");
     let dst_node_override = extract_dst_node_override(envelope)?;
     let thread_id = compute_thread_id(ThreadIdInput::PersistentChannel {
         channel_type: "api",
-        entrypoint_id: Some(
-            effective
-                .get("listen")
-                .and_then(|listen| listen.get("address"))
-                .and_then(Value::as_str)
-                .unwrap_or("api"),
-        ),
+        entrypoint_id: Some(api_channel_id),
         conversation_id: conversation_seed.as_str(),
     })
     .map_err(|err| {
@@ -314,13 +315,8 @@ pub(crate) fn parse_json_message_request(
         io_context: IoContext {
             channel: "api".to_string(),
             entrypoint: PartyRef {
-                kind: "io_api_instance".to_string(),
-                id: effective
-                    .get("listen")
-                    .and_then(|listen| listen.get("address"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("api")
-                    .to_string(),
+                kind: "api_channel".to_string(),
+                id: api_channel_id.to_string(),
             },
             sender: PartyRef {
                 kind: "api_subject".to_string(),

@@ -104,18 +104,18 @@ Mientras el nodo todavía no esté migrado completamente:
 
 ### Bloque E — semántica de mensajes
 
-- [ ] Revisar `meta.ich` en `IO.api` para que represente la integración estable y no el bind técnico
-- [ ] Revisar si hoy `IoContext.entrypoint` en API sigue demasiado acoplado a `listen.address`
-- [ ] Decidir si hace falta separar:
-  - `entrypoint técnico`
-  - `canal lógico estable`
-- [ ] Verificar que la identidad externa del sujeto siga resolviéndose por el pipeline de identity, no por el `ICH`
+- [x] Revisar `meta.ich` en `IO.api` para que represente la integración estable y no el bind técnico
+- [x] Desacoplar `IoContext.entrypoint` de `listen.address` y llevarlo a `api_channel_id`
+- [x] Verificar que la identidad externa del sujeto siga resolviéndose por el pipeline de identity, no por el `ICH`
+- [ ] Decisión diferida de modelo:
+  - revisar si `integration_id` permanece separado
+  - o si más adelante queda como alias/metadata de `api_channel_id`
 
 ### Bloque F — webhooks/callbacks
 
 - [ ] Revisar si `callback_url` / webhook final pertenece semánticamente a la integración
 - [ ] Documentar que ese callback forma parte del canal API configurado
-- [ ] Confirmar que no se lo usa como identidad externa ni como sustituto del `ICH`
+- [x] Confirmar que no se lo usa como identidad externa ni como sustituto del `ICH`
 
 ### Bloque G — compatibilidad y migración
 

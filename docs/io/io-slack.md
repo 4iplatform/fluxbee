@@ -18,7 +18,7 @@ las decisiones y necesidades **específicas de Slack**.
 
 ## 2. Supuestos del MVP
 
-- Existe **una sola instancia activa** del Nodo IO Slack por app/workspace.
+- Existe **una sola instancia lógica activa** del Nodo IO Slack por binding `workspace_id + conversation_id`.
 - Se acepta downtime si el nodo cae.
 - Los Nodos IO **NO** manejan base de datos ni Redis; por lo tanto:
   - deduplicación y sessionización son **en memoria** (*best-effort*),
@@ -29,7 +29,7 @@ las decisiones y necesidades **específicas de Slack**.
 
 ### 2.1 ICH local y operatividad mínima
 
-Para `IO.slack`, el `ICH` debe interpretarse como el asset/canal local operado por la instancia para ese workspace/app, no como el usuario remoto de Slack.
+Para `IO.slack`, el `ICH` debe interpretarse como el binding local operado por la instancia para `workspace_id + conversation_id`, no como el usuario remoto de Slack ni como el workspace en abstracto.
 
 Regla operativa mínima:
 - el nodo puede permanecer vivo para `PING/STATUS/CONFIG_*`;
@@ -42,35 +42,41 @@ Lectura ajustada al estado real actual del repo:
 
 - `IO.slack` ya lee `self_ilk_id` y `self_tenant_id` desde env al boot;
 - a diferencia de otros nodos IO, hoy esos valores sí se usan operacionalmente para resolver credenciales `slack` en `SY.vault` y para el loop de refresh;
-- además, ahora se usan para asegurar el alta del `ICH` propio del workspace cuando entra tráfico Slack;
-- el material local más concreto del canal ya está representado por `team_id` / workspace, que entra en `IoContext.entrypoint`;
+- además, ahora se usan para asegurar el alta del `ICH` propio del binding `workspace_id + conversation_id` cuando entra tráfico Slack;
+- `IoContext.entrypoint` ya no representa el workspace en abstracto, sino el binding local `workspace_id + conversation_id`;
 - el cálculo actual de `thread_id` ya usa material local del canal:
-  - `NativeThread(channel_type=\"slack\", entrypoint_id=team_id, native_thread_id=thread_ts)` cuando existe thread nativo;
-  - `PersistentChannel(channel_type=\"slack\", entrypoint_id=team_id, conversation_id=channel)` cuando no existe `thread_ts`.
+  - `NativeThread(channel_type=\"slack\", entrypoint_id=workspace_id, native_thread_id=thread_ts)` cuando existe thread nativo;
+  - `PersistentChannel(channel_type=\"slack\", entrypoint_id=workspace_id, conversation_id=conversation_id)` cuando no existe `thread_ts`.
 
 Conclusión práctica:
 
-- la continuidad conversacional ya incorpora correctamente material local del workspace;
+- la continuidad conversacional ya incorpora correctamente material local del binding `workspace_id + conversation_id`;
 - el runtime ya usa `self_ilk_id/self_tenant_id` de forma efectiva para su operación;
-- `meta.ich` ya se alinea al workspace local;
-- el `ICH` propio del workspace ya se intenta registrar explícitamente contra identity usando `self_ilk_id + team_id`.
+- `meta.ich` ya se alinea al binding local;
+- el `ICH` propio del binding ya se intenta registrar explícitamente contra identity usando `self_ilk_id + (workspace_id + conversation_id)`.
 
 ### 2.3 Estado actual del alta de ICH propio
 
 El camino operativo actual para `IO.slack` es:
 
 - usar `self_ilk_id` y `self_tenant_id` inyectados al boot;
+- requerir `config.io.workspace_id` y `config.io.conversation_id` como configuración mínima operativa;
 - calcular un `ich_id` estable a partir de `channel_type + address + tenant`;
 - solicitar `ILK_ADD_CHANNEL` a `SY.identity` con:
-  - `channel_type = "slack_workspace"`
-  - `address = team_id`
+  - `channel_type = "slack_binding"`
+  - `address = "<workspace_id>:<conversation_id>"`
   - `ilk_id = self_ilk_id`
 
 Si el alta falla:
 
 - el nodo no procesa ese evento inbound;
-- registra `warn` con el `team_id`;
+- registra `warn` con el binding configurado;
 - y espera al próximo evento para reintentar.
+
+Además, el runtime actual ya intenta asegurar el `ICH` propio:
+
+- al boot, si hay `effective_config` válida;
+- y en cada `CONFIG_SET` exitoso antes de dejar el nodo en `Configured`.
 
 Gap residual:
 
@@ -125,7 +131,7 @@ Slack puede reenviar eventos si:
 
 ### Clave de deduplicación recomendada (en orden de preferencia)
 1. `event_id` (si está presente)
-2. `(team_id, channel, ts)` como surrogate estable
+2. `(workspace_id, conversation_id, ts)` como surrogate estable
 
 ### Implementación (sin DB/Redis)
 - Caché en memoria con TTL.
@@ -155,7 +161,7 @@ en un único turno lógico antes de enviarlo al router.
 ```
 - Derivación implementada hoy:
 ```
-slack:<team_id>:<channel>:<thread_ts||channel>:<user>
+slack:<workspace_id>:<conversation_id>:<thread_ts||conversation_id>:<user>
 ```
 - Ventana de tiempo configurable.
 - `relay_window_ms = 0` implica passthrough inmediato.
@@ -196,7 +202,7 @@ El control de flujo (espera/reinyección) es responsabilidad de `WF.onboarding` 
 
 ## 7. Normalización hacia el router
 
-Además de `meta.src_ilk` (o `null`), el IO Slack **DEBE** adjuntar el bloque estandarizado `meta.context.io` (contrato IO Context), incluyendo `entrypoint` (workspace), `conversation` (channel/thread) y `reply_target` (channel + thread_ts).
+Además de `meta.src_ilk` (o `null`), el IO Slack **DEBE** adjuntar el bloque estandarizado `meta.context.io` (contrato IO Context), incluyendo `entrypoint` (binding `workspace_id + conversation_id`), `conversation` (channel/thread) y `reply_target` (thread Slack dentro del `conversation_id` propio del nodo).
 
 Si el mensaje pasó por relay, también **DEBE** adjuntar `meta.context.io.relay.*` con metadata de trazabilidad del ensamblado.
 

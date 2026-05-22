@@ -2679,7 +2679,8 @@ mod tests {
         assert_eq!(parsed.io_context.message.id, "crm-msg-1");
         assert_eq!(parsed.io_context.channel, "api");
         assert_eq!(parsed.io_context.sender.id, "crm:123");
-        assert_eq!(parsed.io_context.entrypoint.id, "127.0.0.1");
+        assert_eq!(parsed.io_context.entrypoint.id, "api_partner1");
+        assert_eq!(parsed.io_context.entrypoint.kind, "api_channel");
         assert_eq!(
             parsed.dst_node_override.as_deref(),
             Some("AI.chat@motherbee")
@@ -2689,7 +2690,7 @@ mod tests {
             Some(
                 compute_thread_id(ThreadIdInput::PersistentChannel {
                     channel_type: "api",
-                    entrypoint_id: Some("127.0.0.1"),
+                    entrypoint_id: Some("api_partner1"),
                     conversation_id: "conv-1",
                 })
                 .expect("thread id")
@@ -3130,12 +3131,13 @@ mod tests {
         assert_eq!(parsed.identity_input.tenant_hint, None);
         assert_eq!(parsed.io_context.channel, "api");
         assert_eq!(parsed.io_context.sender.id, "caller-1");
+        assert_eq!(parsed.io_context.entrypoint.id, "api_partner1");
         assert_eq!(
             parsed.io_context.conversation.thread_id.as_deref(),
             Some(
                 compute_thread_id(ThreadIdInput::PersistentChannel {
                     channel_type: "api",
-                    entrypoint_id: Some("127.0.0.1"),
+                    entrypoint_id: Some("api_partner1"),
                     conversation_id: "caller-1",
                 })
                 .expect("thread id")

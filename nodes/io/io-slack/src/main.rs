@@ -13,7 +13,9 @@ use io_common::inbound::{InboundConfig, InboundOutcome, InboundProcessor};
 use io_common::io_adapter_config::{
     apply_adapter_config_replace, build_io_adapter_contract_payload, IoAdapterConfigContract,
 };
-use io_common::io_context::{extract_slack_post_target, slack_inbound_io_context};
+use io_common::io_context::{
+    extract_slack_post_target, slack_binding_id, slack_inbound_io_context,
+};
 use io_common::io_control_plane::{
     build_io_config_get_response_payload, build_io_config_response_message,
     build_io_config_set_error_payload, build_io_config_set_ok_payload,
@@ -78,6 +80,8 @@ async fn main() -> Result<()> {
         state_dir = %config.state_dir.display(),
         dst_node = %config.dst_node.clone().unwrap_or_else(|| "resolve".to_string()),
         dev_mode = %config.dev_mode,
+        workspace_id = ?config.workspace_id,
+        conversation_id = ?config.conversation_id,
         self_ilk_id = ?self_ilk_id,
         self_tenant_id = ?self_tenant_id,
         "io-slack starting"
@@ -139,11 +143,14 @@ async fn main() -> Result<()> {
             IoControlPlaneState::default()
         });
     if let Some(effective) = boot_state.effective_config.as_ref() {
-        match extract_runtime_slack_credentials(effective) {
-            Ok((app_token, bot_token)) => {
+        match (
+            extract_runtime_slack_credentials(effective),
+            extract_runtime_slack_binding(Some(effective), &config),
+        ) {
+            (Ok((app_token, bot_token)), Ok(_binding)) => {
                 slack.reload_credentials(app_token, bot_token).await;
             }
-            Err(err) => {
+            (Err(err), _) | (_, Err(err)) => {
                 boot_state.current_state = IoNodeLifecycleState::FailedConfig;
                 boot_state.last_error = Some(IoControlPlaneErrorInfo {
                     code: "invalid_config".to_string(),
@@ -152,7 +159,7 @@ async fn main() -> Result<()> {
                 tracing::warn!(
                     node_name = %config.node_name,
                     error = %err,
-                    "boot effective config is missing/invalid slack credentials; starting in FAILED_CONFIG"
+                    "boot effective config is missing/invalid slack binding or credentials; starting in FAILED_CONFIG"
                 );
             }
         }
@@ -230,15 +237,51 @@ async fn main() -> Result<()> {
             .map_err(|err| anyhow::anyhow!("invalid relay policy: {err}"))?,
     ));
     let control_plane = Arc::new(RwLock::new(boot_state.clone()));
+    let ensured_bindings = Arc::new(Mutex::new(HashSet::<String>::new()));
     let control_metrics = Arc::new(IoControlPlaneMetrics::with_initial_state(
         boot_state.current_state.as_str(),
         boot_state.config_version,
     ));
     let adapter_contract: Arc<dyn IoAdapterConfigContract> = Arc::new(IoSlackAdapterConfigContract);
 
+    if let Some(effective) = boot_state.effective_config.as_ref() {
+        if let Ok(binding) = extract_runtime_slack_binding(Some(effective), &config) {
+            if let Err(error) = ensure_io_slack_binding_ich_registered(
+                &config.node_name,
+                &binding,
+                &sender,
+                inbox.clone(),
+                &IdentityProvisionConfig {
+                    target: config.identity_target.clone(),
+                    timeout: Duration::from_millis(config.identity_timeout_ms),
+                },
+                self_ilk_id.as_deref(),
+                self_tenant_id.as_deref(),
+                ensured_bindings.clone(),
+            )
+            .await
+            {
+                let mut guard = control_plane.write().await;
+                guard.current_state = IoNodeLifecycleState::FailedConfig;
+                guard.last_error = Some(IoControlPlaneErrorInfo {
+                    code: "own_ich_registration_failed".to_string(),
+                    message: error.to_string(),
+                });
+                tracing::warn!(
+                    node_name = %config.node_name,
+                    workspace_id = %binding.workspace_id,
+                    conversation_id = %binding.conversation_id,
+                    error = %error,
+                    "failed to ensure Slack binding ICH at boot; starting in FAILED_CONFIG"
+                );
+            }
+        }
+    }
+
     let outbound_task = tokio::spawn(run_outbound_loop(
         inbox.clone(),
         sender.clone(),
+        config.clone(),
         config.node_name.clone(),
         config.state_dir.clone(),
         control_plane.clone(),
@@ -247,6 +290,14 @@ async fn main() -> Result<()> {
         inbound.clone(),
         slack.clone(),
         relay.clone(),
+        inbox.clone(),
+        IdentityProvisionConfig {
+            target: config.identity_target.clone(),
+            timeout: Duration::from_millis(config.identity_timeout_ms),
+        },
+        self_ilk_id.clone(),
+        self_tenant_id.clone(),
+        ensured_bindings.clone(),
         blob_toolkit.clone(),
         blob_payload_cfg.clone(),
     ));
@@ -259,6 +310,7 @@ async fn main() -> Result<()> {
             target: config.identity_target.clone(),
             timeout: Duration::from_millis(config.identity_timeout_ms),
         },
+        control_plane.clone(),
         self_ilk_id.clone(),
         self_tenant_id.clone(),
         slack.clone(),
@@ -266,6 +318,7 @@ async fn main() -> Result<()> {
         provisioner.clone(),
         inbound.clone(),
         relay.clone(),
+        ensured_bindings.clone(),
         blob_toolkit.clone(),
         blob_payload_cfg.clone(),
     ));
@@ -286,6 +339,8 @@ async fn main() -> Result<()> {
 struct Config {
     slack_app_token: Option<String>,
     slack_bot_token: Option<String>,
+    workspace_id: Option<String>,
+    conversation_id: Option<String>,
     node_name: String,
     island_id: String,
     node_version: String,
@@ -310,6 +365,12 @@ struct SlackRelayConfig {
     max_open_sessions: usize,
     max_fragments_per_session: usize,
     max_bytes_per_session: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlackBindingConfig {
+    workspace_id: String,
+    conversation_id: String,
 }
 
 impl Default for SlackRelayConfig {
@@ -346,6 +407,26 @@ impl Config {
         // after the SDK router is up, via `resolve_resource(Slack, ...)`.
         let slack_app_token: Option<String> = None;
         let slack_bot_token: Option<String> = None;
+        let workspace_id = env("IO_SLACK_WORKSPACE_ID").or_else(|| {
+            json_get_string_opt(
+                spawn_doc,
+                &[
+                    "config.io.workspace_id",
+                    "io.workspace_id",
+                    "workspace_id",
+                ],
+            )
+        });
+        let conversation_id = env("IO_SLACK_CONVERSATION_ID").or_else(|| {
+            json_get_string_opt(
+                spawn_doc,
+                &[
+                    "config.io.conversation_id",
+                    "io.conversation_id",
+                    "conversation_id",
+                ],
+            )
+        });
 
         let blob_root = PathBuf::from(
             env("BLOB_ROOT")
@@ -467,6 +548,8 @@ impl Config {
         Ok(Self {
             slack_app_token,
             slack_bot_token,
+            workspace_id,
+            conversation_id,
             node_name: resolved_node_name,
             island_id: resolved_island_id.clone(),
             node_version: env("NODE_VERSION")
@@ -627,17 +710,6 @@ fn json_get_u64_opt(doc: Option<&Value>, dotted_paths: &[&str]) -> Option<u64> {
 
 fn json_get_usize_opt(doc: Option<&Value>, dotted_paths: &[&str]) -> Option<usize> {
     json_get_u64_opt(doc, dotted_paths).and_then(|value| usize::try_from(value).ok())
-}
-
-fn resolve_secret(doc: Option<&Value>, value_paths: &[&str], ref_paths: &[&str]) -> Option<String> {
-    if let Some(value) = json_get_string_opt(doc, value_paths) {
-        return Some(value);
-    }
-    let reference = json_get_string_opt(doc, ref_paths)?;
-    if let Some(var) = reference.strip_prefix("env:") {
-        return env(var);
-    }
-    None
 }
 
 const IO_SLACK_VAULT_REFRESH_INTERVAL_SECS: u64 = 60;
@@ -1033,6 +1105,7 @@ async fn run_inbound_socket_mode(
     sender: NodeSender,
     router_inbox: Arc<Mutex<RouterInbox>>,
     identity_provision_cfg: IdentityProvisionConfig,
+    control_plane: Arc<RwLock<IoControlPlaneState>>,
     self_ilk_id: Option<String>,
     self_tenant_id: Option<String>,
     slack: Arc<SlackClients>,
@@ -1040,11 +1113,11 @@ async fn run_inbound_socket_mode(
     provisioner: Arc<dyn IdentityProvisioner>,
     inbound: Arc<Mutex<InboundProcessor>>,
     relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
+    ensured_bindings: Arc<Mutex<HashSet<String>>>,
     blob_toolkit: Arc<fluxbee_sdk::blob::BlobToolkit>,
     blob_payload_cfg: IoTextBlobConfig,
 ) -> Result<()> {
     let mention_re = Regex::new(r"^<@[^>]+>\s*")?;
-    let ensured_workspaces = Arc::new(Mutex::new(HashSet::<String>::new()));
 
     loop {
         let socket_generation = slack.config_generation().await;
@@ -1139,34 +1212,64 @@ async fn run_inbound_socket_mode(
             if payload_type != Some("event_callback") {
                 continue;
             }
+            let binding = match extract_runtime_slack_binding(
+                control_plane.read().await.effective_config.as_ref(),
+                &config,
+            ) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    tracing::warn!(
+                        node_name = %config.node_name,
+                        error = %error,
+                        "dropping inbound Slack event: missing workspace_id/conversation_id binding"
+                    );
+                    continue;
+                }
+            };
             let team_id = match payload.get("team_id").and_then(|v| v.as_str()) {
                 Some(v) => v.to_string(),
                 None => continue,
             };
-            if let Err(err) = ensure_io_slack_workspace_ich_registered(
+            let event = match payload.get("event") {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            let channel = match event.get("channel").and_then(|v| v.as_str()) {
+                Some(v) => v.to_string(),
+                None => continue,
+            };
+            if team_id != binding.workspace_id || channel != binding.conversation_id {
+                tracing::debug!(
+                    node_name = %config.node_name,
+                    configured_workspace_id = %binding.workspace_id,
+                    configured_conversation_id = %binding.conversation_id,
+                    event_workspace_id = %team_id,
+                    event_conversation_id = %channel,
+                    "dropping inbound Slack event outside configured binding"
+                );
+                continue;
+            }
+            if let Err(err) = ensure_io_slack_binding_ich_registered(
                 &config.node_name,
-                &team_id,
+                &binding,
                 &sender,
                 router_inbox.clone(),
                 &identity_provision_cfg,
                 self_ilk_id.as_deref(),
                 self_tenant_id.as_deref(),
-                ensured_workspaces.clone(),
+                ensured_bindings.clone(),
             )
             .await
             {
                 tracing::warn!(
                     node_name = %config.node_name,
-                    team_id = %team_id,
+                    workspace_id = %binding.workspace_id,
+                    conversation_id = %binding.conversation_id,
                     error = %err,
-                    "dropping inbound Slack event: unable to ensure own workspace ICH"
+                    "dropping inbound Slack event: unable to ensure own binding ICH"
                 );
                 continue;
             }
-            let event = match payload.get("event") {
-                Some(v) => v.clone(),
-                None => continue,
-            };
             let message_id = payload
                 .get("event_id")
                 .and_then(|v| v.as_str())
@@ -1178,10 +1281,6 @@ async fn run_inbound_socket_mode(
                 continue;
             }
             let user = match event.get("user").and_then(|v| v.as_str()) {
-                Some(v) => v.to_string(),
-                None => continue,
-            };
-            let channel = match event.get("channel").and_then(|v| v.as_str()) {
                 Some(v) => v.to_string(),
                 None => continue,
             };
@@ -1204,9 +1303,9 @@ async fn run_inbound_socket_mode(
             );
 
             let io_ctx = slack_inbound_io_context(
-                &team_id,
+                &binding.workspace_id,
                 &user,
-                &channel,
+                &binding.conversation_id,
                 thread_ts.as_deref(),
                 &message_id,
             );
@@ -1220,7 +1319,7 @@ async fn run_inbound_socket_mode(
             let payload = match build_slack_inbound_payload_from_parts(
                 &team_id,
                 &user,
-                &channel,
+                &binding.conversation_id,
                 thread_ts.as_deref(),
                 &message_id,
                 &content,
@@ -1241,9 +1340,9 @@ async fn run_inbound_socket_mode(
 
             let relay_fragment = build_slack_relay_fragment(
                 &config.node_name,
-                &team_id,
+                &binding.workspace_id,
                 &user,
-                &channel,
+                &binding.conversation_id,
                 thread_ts.as_deref(),
                 &message_id,
                 &content,
@@ -1302,8 +1401,11 @@ async fn run_inbound_socket_mode(
                         external_id: slack_external_id(&config.node_name, &user),
                         src_ilk_override: None,
                         tenant_id: None,
-                        tenant_hint: Some(team_id.to_string()),
-                        attributes: serde_json::json!({ "team_id": team_id }),
+                        tenant_hint: Some(binding.workspace_id.clone()),
+                        attributes: serde_json::json!({
+                            "workspace_id": binding.workspace_id,
+                            "conversation_id": binding.conversation_id
+                        }),
                         ilk_type: Some("human".to_string()),
                     },
                     None,
@@ -1350,9 +1452,9 @@ fn build_slack_inbound_payload_from_parts(
 
 fn build_slack_relay_fragment(
     node_name: &str,
-    team_id: &str,
+    workspace_id: &str,
     user: &str,
-    channel: &str,
+    conversation_id: &str,
     thread_ts: Option<&str>,
     message_id: &str,
     content: &str,
@@ -1360,7 +1462,7 @@ fn build_slack_relay_fragment(
     raw_payload: Value,
 ) -> RelayFragment {
     RelayFragment {
-        relay_key: slack_relay_key(team_id, user, channel, thread_ts),
+        relay_key: slack_relay_key(workspace_id, user, conversation_id, thread_ts),
         fragment_id: message_id.to_string(),
         received_at_ms: now_epoch_ms(),
         content_text: Some(content.to_string()),
@@ -1369,14 +1471,23 @@ fn build_slack_relay_fragment(
             .filter_map(|attachment| serde_json::to_value(attachment.blob_ref).ok())
             .collect(),
         raw_payload: Some(raw_payload),
-        io_context: slack_inbound_io_context(team_id, user, channel, thread_ts, message_id),
+        io_context: slack_inbound_io_context(
+            workspace_id,
+            user,
+            conversation_id,
+            thread_ts,
+            message_id,
+        ),
         identity_input: ResolveOrCreateInput {
             channel: "slack".to_string(),
             external_id: slack_external_id(node_name, user),
             src_ilk_override: None,
             tenant_id: None,
-            tenant_hint: Some(team_id.to_string()),
-            attributes: serde_json::json!({ "team_id": team_id }),
+            tenant_hint: Some(workspace_id.to_string()),
+            attributes: serde_json::json!({
+                "workspace_id": workspace_id,
+                "conversation_id": conversation_id
+            }),
             ilk_type: Some("human".to_string()),
         },
         dst_node_override: None,
@@ -1384,19 +1495,20 @@ fn build_slack_relay_fragment(
     }
 }
 
-async fn ensure_io_slack_workspace_ich_registered(
+async fn ensure_io_slack_binding_ich_registered(
     node_name: &str,
-    team_id: &str,
+    binding: &SlackBindingConfig,
     sender: &NodeSender,
     router_inbox: Arc<Mutex<RouterInbox>>,
     identity_provision_cfg: &IdentityProvisionConfig,
     self_ilk_id: Option<&str>,
     self_tenant_id: Option<&str>,
-    ensured_workspaces: Arc<Mutex<HashSet<String>>>,
+    ensured_bindings: Arc<Mutex<HashSet<String>>>,
 ) -> Result<()> {
+    let binding_id = slack_binding_id(&binding.workspace_id, &binding.conversation_id);
     {
-        let guard = ensured_workspaces.lock().await;
-        if guard.contains(team_id) {
+        let guard = ensured_bindings.lock().await;
+        if guard.contains(binding_id.as_str()) {
             return Ok(());
         }
     }
@@ -1415,21 +1527,22 @@ async fn ensure_io_slack_workspace_ich_registered(
         identity_provision_cfg.target.as_str(),
         self_ilk_id,
         self_tenant_id,
-        "slack_workspace",
-        team_id,
+        "slack_binding",
+        binding_id.as_str(),
     )
     .await?;
     tracing::info!(
         node_name = %node_name,
-        team_id = %team_id,
+        workspace_id = %binding.workspace_id,
+        conversation_id = %binding.conversation_id,
         self_ilk_id = %result.ilk_id,
         ich_id = %result.ich_id,
         owner_l2_name = ?result.owner_l2_name,
         enabled = result.enabled,
-        "io-slack own workspace ICH ensured"
+        "io-slack own binding ICH ensured"
     );
-    let mut guard = ensured_workspaces.lock().await;
-    guard.insert(team_id.to_string());
+    let mut guard = ensured_bindings.lock().await;
+    guard.insert(binding_id);
     Ok(())
 }
 
@@ -1492,9 +1605,14 @@ async fn run_relay_flush_loop(
     }
 }
 
-fn slack_relay_key(team_id: &str, user: &str, channel: &str, thread_ts: Option<&str>) -> String {
-    let thread_or_channel = thread_ts.unwrap_or(channel);
-    format!("slack:{team_id}:{channel}:{thread_or_channel}:{user}")
+fn slack_relay_key(
+    workspace_id: &str,
+    user: &str,
+    conversation_id: &str,
+    thread_ts: Option<&str>,
+) -> String {
+    let thread_or_channel = thread_ts.unwrap_or(conversation_id);
+    format!("slack:{workspace_id}:{conversation_id}:{thread_or_channel}:{user}")
 }
 
 fn slack_relay_policy(config: &Config, effective_config: Option<&Value>) -> Result<RelayPolicy> {
@@ -1990,6 +2108,7 @@ fn slack_external_id(node_name: &str, user_id: &str) -> String {
 async fn run_outbound_loop(
     inbox: Arc<Mutex<RouterInbox>>,
     sender: NodeSender,
+    config: Config,
     node_name: String,
     state_dir: PathBuf,
     control_plane: Arc<RwLock<IoControlPlaneState>>,
@@ -1998,6 +2117,11 @@ async fn run_outbound_loop(
     inbound: Arc<Mutex<InboundProcessor>>,
     slack: Arc<SlackClients>,
     relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
+    router_inbox: Arc<Mutex<RouterInbox>>,
+    identity_provision_cfg: IdentityProvisionConfig,
+    self_ilk_id: Option<String>,
+    self_tenant_id: Option<String>,
+    ensured_bindings: Arc<Mutex<HashSet<String>>>,
     blob_toolkit: Arc<fluxbee_sdk::blob::BlobToolkit>,
     blob_payload_cfg: IoTextBlobConfig,
 ) -> Result<()> {
@@ -2046,6 +2170,12 @@ async fn run_outbound_loop(
             inbound.clone(),
             slack.clone(),
             relay.clone(),
+            sender.clone(),
+            router_inbox.clone(),
+            identity_provision_cfg.clone(),
+            self_ilk_id.clone(),
+            self_tenant_id.clone(),
+            ensured_bindings.clone(),
         )
         .await
         {
@@ -2093,6 +2223,28 @@ async fn run_outbound_loop(
             );
             continue;
         };
+        let binding = match extract_runtime_slack_binding(
+            control_plane.read().await.effective_config.as_ref(),
+            &config,
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                tracing::warn!(
+                    trace_id = %msg.routing.trace_id,
+                    error = %error,
+                    "skipping outbound: missing workspace_id/conversation_id binding"
+                );
+                continue;
+            }
+        };
+        if target.channel_id != binding.conversation_id {
+            tracing::debug!(
+                trace_id = %msg.routing.trace_id,
+                configured_conversation_id = %binding.conversation_id,
+                requested_conversation_id = %target.channel_id,
+                "outbound reply_target channel does not match configured binding; forcing configured conversation_id"
+            );
+        }
 
         let mut sent_any = false;
         match resolve_text_v1_for_outbound(
@@ -2107,7 +2259,7 @@ async fn run_outbound_loop(
                 if !resolved.text.trim().is_empty() {
                     let blocks = msg.payload.get("blocks").cloned();
                     tracing::debug!(
-                        slack_channel = target.channel_id,
+                        slack_channel = binding.conversation_id,
                         slack_thread_ts = target.thread_ts.as_deref().unwrap_or(""),
                         text_len = resolved.text.len(),
                         text_preview = %truncate(&resolved.text, 120),
@@ -2115,7 +2267,7 @@ async fn run_outbound_loop(
                     );
                     if let Err(e) = slack
                         .post_message(
-                            &target.channel_id,
+                            &binding.conversation_id,
                             &resolved.text,
                             target.thread_ts.as_deref(),
                             blocks,
@@ -2139,7 +2291,7 @@ async fn run_outbound_loop(
                         Ok(bytes) => {
                             if let Err(error) = slack
                                 .upload_file(
-                                    &target.channel_id,
+                                    &binding.conversation_id,
                                     target.thread_ts.as_deref(),
                                     filename,
                                     &attachment.blob_ref.mime,
@@ -2184,7 +2336,7 @@ async fn run_outbound_loop(
                 );
                 if let Err(error) = slack
                     .post_message(
-                        &target.channel_id,
+                        &binding.conversation_id,
                         &fallback,
                         target.thread_ts.as_deref(),
                         None,
@@ -2202,7 +2354,7 @@ async fn run_outbound_loop(
             let fallback = "No pude entregar el mensaje en Slack (sin contenido util).";
             if let Err(error) = slack
                 .post_message(
-                    &target.channel_id,
+                    &binding.conversation_id,
                     fallback,
                     target.thread_ts.as_deref(),
                     None,
@@ -2226,6 +2378,12 @@ async fn handle_io_control_plane_message(
     inbound: Arc<Mutex<InboundProcessor>>,
     slack: Arc<SlackClients>,
     relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
+    sender: NodeSender,
+    router_inbox: Arc<Mutex<RouterInbox>>,
+    identity_provision_cfg: IdentityProvisionConfig,
+    self_ilk_id: Option<String>,
+    self_tenant_id: Option<String>,
+    ensured_bindings: Arc<Mutex<HashSet<String>>>,
 ) -> Option<fluxbee_sdk::protocol::Message> {
     let command = msg.meta.msg.as_deref().unwrap_or_default();
     if !is_control_plane_msg_type(&msg.meta.msg_type) {
@@ -2300,6 +2458,12 @@ async fn handle_io_control_plane_message(
                 inbound,
                 slack,
                 relay,
+                sender,
+                router_inbox,
+                identity_provision_cfg,
+                self_ilk_id,
+                self_tenant_id,
+                ensured_bindings,
             )
             .await
         }
@@ -2336,6 +2500,12 @@ async fn apply_io_config_set(
     inbound: Arc<Mutex<InboundProcessor>>,
     slack: Arc<SlackClients>,
     relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
+    sender: NodeSender,
+    router_inbox: Arc<Mutex<RouterInbox>>,
+    identity_provision_cfg: IdentityProvisionConfig,
+    self_ilk_id: Option<String>,
+    self_tenant_id: Option<String>,
+    ensured_bindings: Arc<Mutex<HashSet<String>>>,
 ) -> Value {
     let mut state = control_plane.write().await;
 
@@ -2466,6 +2636,12 @@ async fn apply_io_config_set(
             apply_hot.push("io.dst_node".to_string());
         }
     }
+    if section_changed(previous_effective.as_ref(), &effective, &["io", "workspace_id"]) {
+        apply_hot.push("io.workspace_id".to_string());
+    }
+    if section_changed(previous_effective.as_ref(), &effective, &["io", "conversation_id"]) {
+        apply_hot.push("io.conversation_id".to_string());
+    }
 
     match extract_runtime_relay_config(Some(&effective), &SlackRelayConfig::default())
         .and_then(|relay_cfg| slack_relay_policy_from_config(&relay_cfg))
@@ -2533,6 +2709,62 @@ async fn apply_io_config_set(
         slack.reload_credentials(app_token, bot_token).await;
         apply_reinit.push("slack.credentials".to_string());
     }
+
+    let binding = match extract_slack_binding_from_io_section(effective.get("io")) {
+        Ok(binding) => binding,
+        Err(err) => {
+            let err_text = err.to_string();
+            state.current_state = IoNodeLifecycleState::FailedConfig;
+            state.last_error = Some(IoControlPlaneErrorInfo {
+                code: "invalid_config".to_string(),
+                message: err_text.clone(),
+            });
+            control_metrics.record_config_set_error(
+                state.current_state.as_str(),
+                payload.config_version,
+                "invalid_config",
+            );
+            let redacted = redact_state(&state, adapter_contract);
+            return build_io_config_set_error_payload(
+                node_name,
+                &redacted,
+                "invalid_config",
+                err_text,
+            );
+        }
+    };
+    if let Err(err) = ensure_io_slack_binding_ich_registered(
+        node_name,
+        &binding,
+        &sender,
+        router_inbox,
+        &identity_provision_cfg,
+        self_ilk_id.as_deref(),
+        self_tenant_id.as_deref(),
+        ensured_bindings,
+    )
+    .await
+    {
+        let err_text = err.to_string();
+        state.current_state = IoNodeLifecycleState::FailedConfig;
+        state.last_error = Some(IoControlPlaneErrorInfo {
+            code: "own_ich_registration_failed".to_string(),
+            message: err_text.clone(),
+        });
+        control_metrics.record_config_set_error(
+            state.current_state.as_str(),
+            payload.config_version,
+            "own_ich_registration_failed",
+        );
+        let redacted = redact_state(&state, adapter_contract);
+        return build_io_config_set_error_payload(
+            node_name,
+            &redacted,
+            "own_ich_registration_failed",
+            err_text,
+        );
+    }
+    apply_reinit.push("io.own_ich".to_string());
     control_metrics.record_config_set_ok(state.current_state.as_str(), state.config_version);
 
     log_config_set_applied(
@@ -2568,6 +2800,53 @@ fn extract_runtime_dst_node(effective_config: Option<&Value>) -> Option<String> 
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(ToString::to_string)
+}
+
+fn extract_slack_binding_from_io_section(io: Option<&Value>) -> Result<SlackBindingConfig> {
+    let workspace_id = io
+        .and_then(|section| section.get("workspace_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| anyhow::anyhow!("missing config.io.workspace_id"))?;
+    let conversation_id = io
+        .and_then(|section| section.get("conversation_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| anyhow::anyhow!("missing config.io.conversation_id"))?;
+
+    Ok(SlackBindingConfig {
+        workspace_id,
+        conversation_id,
+    })
+}
+
+fn extract_runtime_slack_binding(
+    effective_config: Option<&Value>,
+    defaults: &Config,
+) -> Result<SlackBindingConfig> {
+    if let Ok(binding) =
+        extract_slack_binding_from_io_section(effective_config.and_then(|cfg| cfg.get("io")))
+    {
+        return Ok(binding);
+    }
+
+    let workspace_id = defaults
+        .workspace_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("missing config.io.workspace_id"))?;
+    let conversation_id = defaults
+        .conversation_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("missing config.io.conversation_id"))?;
+
+    Ok(SlackBindingConfig {
+        workspace_id,
+        conversation_id,
+    })
 }
 
 fn section_changed(

@@ -13,6 +13,8 @@ impl IoAdapterConfigContract for IoSlackAdapterConfigContract {
         &[
             "config.slack.app_token | config.slack.app_token_ref",
             "config.slack.bot_token | config.slack.bot_token_ref",
+            "config.io.workspace_id",
+            "config.io.conversation_id",
         ]
     }
 
@@ -36,6 +38,7 @@ impl IoAdapterConfigContract for IoSlackAdapterConfigContract {
             "For each Slack token, either inline token or *_ref is accepted.",
             "Secrets must be redacted in responses and logs.",
             "MVP apply mode is replace only.",
+            "workspace_id + conversation_id identify the stable local Slack binding used for own-ICH registration.",
         ]
     }
 
@@ -45,7 +48,7 @@ impl IoAdapterConfigContract for IoSlackAdapterConfigContract {
         })?;
 
         ensure_object_field(&mut cfg, "slack")?;
-        ensure_optional_object_field(&mut cfg, "io")?;
+        ensure_object_field(&mut cfg, "io")?;
         ensure_optional_object_field(&mut cfg, "identity")?;
         ensure_optional_object_field(&mut cfg, "node")?;
         ensure_optional_object_field(&mut cfg, "runtime")?;
@@ -80,29 +83,33 @@ impl IoAdapterConfigContract for IoSlackAdapterConfigContract {
             }
         }
 
-        if let Some(io_obj) = cfg.get_mut("io").and_then(Value::as_object_mut) {
-            io_obj
-                .entry("dst_node".to_string())
-                .or_insert(Value::String("resolve".to_string()));
-            ensure_optional_object_member(io_obj, "relay", "io.relay")?;
-            if let Some(relay) = io_obj.get("relay").and_then(Value::as_object) {
-                validate_optional_non_negative_integer(relay, "window_ms", "io.relay.window_ms")?;
-                validate_optional_positive_integer(
-                    relay,
-                    "max_open_sessions",
-                    "io.relay.max_open_sessions",
-                )?;
-                validate_optional_positive_integer(
-                    relay,
-                    "max_fragments_per_session",
-                    "io.relay.max_fragments_per_session",
-                )?;
-                validate_optional_positive_integer(
-                    relay,
-                    "max_bytes_per_session",
-                    "io.relay.max_bytes_per_session",
-                )?;
-            }
+        let io_obj = cfg
+            .get_mut("io")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| IoAdapterConfigError::Internal("io missing".to_string()))?;
+        require_non_empty_string(io_obj, "workspace_id", "io.workspace_id")?;
+        require_non_empty_string(io_obj, "conversation_id", "io.conversation_id")?;
+        io_obj
+            .entry("dst_node".to_string())
+            .or_insert(Value::String("resolve".to_string()));
+        ensure_optional_object_member(io_obj, "relay", "io.relay")?;
+        if let Some(relay) = io_obj.get("relay").and_then(Value::as_object) {
+            validate_optional_non_negative_integer(relay, "window_ms", "io.relay.window_ms")?;
+            validate_optional_positive_integer(
+                relay,
+                "max_open_sessions",
+                "io.relay.max_open_sessions",
+            )?;
+            validate_optional_positive_integer(
+                relay,
+                "max_fragments_per_session",
+                "io.relay.max_fragments_per_session",
+            )?;
+            validate_optional_positive_integer(
+                relay,
+                "max_bytes_per_session",
+                "io.relay.max_bytes_per_session",
+            )?;
         }
 
         Ok(Value::Object(cfg))
@@ -185,6 +192,20 @@ fn has_non_empty_string(map: &Map<String, Value>, key: &str) -> bool {
         .map(str::trim)
         .map(|v| !v.is_empty())
         .unwrap_or(false)
+}
+
+fn require_non_empty_string(
+    root: &Map<String, Value>,
+    field: &str,
+    label: &str,
+) -> Result<(), IoAdapterConfigError> {
+    if has_non_empty_string(root, field) {
+        Ok(())
+    } else {
+        Err(IoAdapterConfigError::InvalidConfig(format!(
+            "{label} is required"
+        )))
+    }
 }
 
 fn ensure_optional_object_member(

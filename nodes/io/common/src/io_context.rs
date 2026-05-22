@@ -462,19 +462,24 @@ fn validate_field_value(
     Ok(())
 }
 
+pub fn slack_binding_id(workspace_id: &str, conversation_id: &str) -> String {
+    format!("{workspace_id}:{conversation_id}")
+}
+
 pub fn slack_inbound_io_context(
-    team_id: &str,
+    workspace_id: &str,
     user_id: &str,
-    channel_id: &str,
+    conversation_id: &str,
     thread_ts: Option<&str>,
     message_id: &str,
 ) -> IoContext {
+    let binding_id = slack_binding_id(workspace_id, conversation_id);
     let thread_id = match thread_ts {
         Some(native_thread_id) => Some(
             compute_thread_id(ThreadIdInput::NativeThread {
                 channel_type: "slack",
-                entrypoint_id: Some(team_id),
-                conversation_id: channel_id,
+                entrypoint_id: Some(workspace_id),
+                conversation_id,
                 native_thread_id,
             })
             .expect("valid slack native thread input"),
@@ -482,22 +487,29 @@ pub fn slack_inbound_io_context(
         None => Some(
             compute_thread_id(ThreadIdInput::PersistentChannel {
                 channel_type: "slack",
-                entrypoint_id: Some(team_id),
-                conversation_id: channel_id,
+                entrypoint_id: Some(workspace_id),
+                conversation_id,
             })
             .expect("valid slack channel thread input"),
         ),
     };
     let params = match thread_ts {
-        Some(t) => serde_json::json!({ "thread_ts": t, "workspace_id": team_id }),
-        None => serde_json::json!({ "workspace_id": team_id }),
+        Some(t) => serde_json::json!({
+            "thread_ts": t,
+            "workspace_id": workspace_id,
+            "conversation_id": conversation_id
+        }),
+        None => serde_json::json!({
+            "workspace_id": workspace_id,
+            "conversation_id": conversation_id
+        }),
     };
 
     IoContext {
         channel: "slack".to_string(),
         entrypoint: PartyRef {
-            kind: "slack_workspace".to_string(),
-            id: team_id.to_string(),
+            kind: "slack_binding".to_string(),
+            id: binding_id,
         },
         sender: PartyRef {
             kind: "slack_user".to_string(),
@@ -505,7 +517,7 @@ pub fn slack_inbound_io_context(
         },
         conversation: ConversationRef {
             kind: "slack_channel".to_string(),
-            id: channel_id.to_string(),
+            id: conversation_id.to_string(),
             thread_id,
         },
         message: MessageRef {
@@ -514,7 +526,7 @@ pub fn slack_inbound_io_context(
         },
         reply_target: ReplyTarget {
             kind: "slack_post".to_string(),
-            address: channel_id.to_string(),
+            address: conversation_id.to_string(),
             params,
         },
     }
@@ -531,12 +543,22 @@ mod tests {
         let io = slack_inbound_io_context("T123", "U456", "C789", Some("171234.567"), "EvABC");
         let meta = wrap_in_meta_context(&io);
 
+        assert_eq!(io.entrypoint.kind, "slack_binding");
+        assert_eq!(io.entrypoint.id, "T123:C789");
+
         let extracted = extract_reply_target(&meta).unwrap();
         assert_eq!(extracted.kind, "slack_post");
         assert_eq!(extracted.address, "C789");
         assert_eq!(
             extracted.params.get("thread_ts").and_then(|v| v.as_str()),
             Some("171234.567")
+        );
+        assert_eq!(
+            extracted
+                .params
+                .get("conversation_id")
+                .and_then(|v| v.as_str()),
+            Some("C789")
         );
     }
 
