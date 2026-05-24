@@ -222,7 +222,10 @@ async fn main() -> Result<(), DiagError> {
         "IDENTITY_MERGE_IO_NODE_NAME",
         &format!("IO.test.identity.merge.{}", test_id),
     );
-    let frontdesk_node_name = env_or("IDENTITY_MERGE_FRONTDESK_NODE_NAME", "AI.frontdesk");
+    let frontdesk_node_name = env_or(
+        "IDENTITY_MERGE_FRONTDESK_NODE_NAME",
+        &format!("SY.frontdesk.gov@{}", hive_id),
+    );
 
     let io_node_config = NodeConfig {
         name: io_node_name,
