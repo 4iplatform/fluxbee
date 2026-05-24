@@ -1,8 +1,8 @@
 # SY.orchestrator internal RPC multiplexing tasks
 
 Date: 2026-05-23 (created)
-Updated: 2026-05-24 (Blocks A–G done; H pending E2E run)
-Status: Blocks A, B, C, D, E, F, G **done**. Block H (integration + E2E) pending — needs live router for the teardown completeness run.
+Updated: 2026-05-24 (Blocks A–G done; H1–H3 done; H4/H5 pending live E2E)
+Status: Blocks A, B, C, D, E, F, G **done**. Block H is **partial**: H1/H2/H3 are covered by in-process `RpcTestHarness` tests; H4/H5 still need a live router/hive run.
 
 ## Goal
 
@@ -68,7 +68,7 @@ The v1 implementation introduced `OrchestratorRouterClient` and migrated every c
 
 4. **Missing fields in result type.** `OrchestratorAdminCommandResult` only carries `status / payload / error_code / error_detail`. It drops `action / request_id / trace_id` that `AdminCommandResult` exposes. Teardown logs lose trace identity, which hurts diagnosis. The SDK type does it right.
 
-Plus housekeeping originally listed in ORPC-12/13/14 that is still pending: dispatch-by-trace_id unit coverage, "unrelated message not swallowed" unit coverage, runtime confirmation of teardown E2E.
+Plus housekeeping originally listed in ORPC-12/13/14: dispatch-by-trace_id and "unrelated message not swallowed" unit coverage are now covered by Block A5/H2; runtime confirmation of teardown E2E remains Block H4.
 
 ## Decisions taken 2026-05-23
 
@@ -217,7 +217,7 @@ ORPC-1..ORPC-14 (the v1 list, see "Task list v1 — historical" below) are subsu
 - [x] **C2.** In `main`, build the orchestrator `OperationalRouteProfile` (`admin` and `system` command channels; pre_pending rule `Exact{ADMIN_KIND, MSG_ADMIN_COMMAND} -> Command("admin")`; post_pending broad catch-alls `AnyMsgOfType(ADMIN_KIND) -> Command("admin")` and `AnyMsgOfType(SYSTEM_KIND) -> Command("system")`), then build `Arc<RpcClient>` via `RpcClient::connect_with_retry`. Store as `OrchestratorState::rpc: OnceLock<Arc<RpcClient>>`. Helper `build_orchestrator_rpc_profile()` lives in `sy_orchestrator.rs`.
 - [x] **C3.** Inline `select! { msg = receiver.recv() }` arm removed. Replaced with `run_admin_worker` + `run_system_worker` spawned tasks fed by `take_command_receiver("admin"|"system")`. Serialized per category. Main loop only handles watchdog + SIGTERM/SIGINT now.
 - [x] **C4.** `handle_admin` and `handle_system_message` signatures kept as `&NodeSender + &OrchestratorState` since workers clone the `Arc` once and call by ref per message; equivalent to the doc's intent without unnecessary churn.
-- [~] **C5.** Operational ordering audit: serialized category handling is sufficient (workers process one message at a time). `OrchestratorState` mutables verified (`storage_path`, `blob_sync_last_desired`, etc., all `Mutex`-guarded). **Caveat**: no global mutable static touched by handlers without locking was found. Formal sign-off pending Block H1 (no-deadlock E2E).
+- [x] **C5.** Operational ordering audit: serialized category handling is sufficient (workers process one message at a time). `OrchestratorState` mutables verified (`storage_path`, `blob_sync_last_desired`, etc., all `Mutex`-guarded). No global mutable static touched by handlers without locking was found. Block H1 now exercises the critical no-deadlock shape with real `run_admin_worker` / `run_system_worker` tasks and the production `RpcClient` dispatcher path.
 - [x] **C6.** `orchestrator_system_action`, `orchestrator_identity_system_call_ok`, `orchestrator_admin_command`, `orchestrator_system_action_for_timer_purge`, `forward_system_action_to_hive(_with_timeout)` rewritten as thin delegations to `state.rpc()?.send_system_rpc(SystemRpcRequest{...})` / `.send_admin_rpc(AdminCommandRequest{...})`. Function names kept.
 - [x] **C7.** `#[cfg(test)]` shortcuts kept for unit tests (payload shaping). They do not count toward Block H3 acceptance.
 - [x] **C8.** `trace_id` propagated to `delete_ilk_for_teardown` response payload (all three branches: ok / not_found / error). `purge_vault_secrets_for_ilk` per-key error records keep the existing shape; bulk `trace_id` propagation to its `errors[]` array deferred (each per-key call has its own `trace_id` available from `AdminCommandResult` if needed — current call sites don't surface it).
@@ -285,18 +285,18 @@ Classification: **anti-pattern follow-up**, not a bug. Each lookup announces/wit
 
 - [x] **G1.** Final grep done. Remaining hits classified:
   - `docs/onworking COA/orchestrator_internal_rpc_multiplexing_tasks.md` — this task file, OK.
-  - `src/bin/sy_orchestrator.rs:16799` — negative regression test, OK.
+  - `src/bin/sy_orchestrator.rs:17199` — negative regression test, OK.
   - `src/bin/sy_identity.rs:5572` — negative regression test, OK.
   - `docs/sy-timer.md:256` — false positive: markdown bold `**Solo SY.orchestrator.**` (Spanish prose), not a wildcard pattern.
   - 0 live behavior references. 0 `authorized_name_variants`. 0 `ilk-delete` / `vault-purge` in code.
 - [x] **G2.** `docs/sy_identity_audit.md` already clean (no mentions of deleted helpers). `docs/onworking COA/orchestrator_frictions.md` FR-10 entry updated to mark CLOSED and reference the ORPC plan. `crates/fluxbee_sdk/README.md` does not exist (skipped). `docs/sy-timer.md` does not need changes.
-- [~] **G3.** PR reference and final `✓` to be added when this branch merges to `main`. Block H pending blocks final closure.
+- [~] **G3.** PR reference and final `✓` to be added when this branch merges to `main`. H4/H5 live E2E gates block final closure.
 
 ### Block H — Integration / E2E tests
 
-- [ ] **H1.** Orchestrator no-deadlock test: fire `run_node` from admin while a `system` message arrives in parallel; assert both complete within timeout.
-- [ ] **H2.** Orchestrator: simulate a message with an unrelated or colliding `trace_id` arriving during a pending RPC; assert (i) the RPC keeps waiting when the message is operational/unrelated, (ii) the message is delivered to its category operational worker/channel, (iii) nothing is dropped, (iv) a malformed correlated response fails the waiter with `InvalidResponse`, and (v) a late correlated response after timeout is counted as stale and discarded rather than delivered to a worker.
-- [ ] **H3.** Orchestrator: `purge_owner_timers_before_teardown` exercised through `RpcClient::from_test_channels` / `RpcTestHarness` exposed by `fluxbee_sdk` under `test-utils` (no trait abstraction; the production type is the one under test), using the same orchestrator `OperationalRouteProfile` shape. The test reads the outgoing `Message` written by the client and asserts: `routing.src = sender.uuid()` (canonical sender), `routing.src_l2_name = None`, `routing.dst = Destination::Unicast(timer_node)`, `meta.msg_type = SYSTEM_KIND`, `meta.msg = Some("TIMER_PURGE_OWNER")`, `meta.target = None`, `meta.action_class = classify_system_message("TIMER_PURGE_OWNER")`. While the purge waiter is pending, the test injects (a) `(SYSTEM_KIND, "SYSTEM_UPDATE")` with random trace, and (b) an `(ADMIN_KIND, MSG_ADMIN_COMMAND)` with the **colliding** trace; asserts (a) reaches `take_command_receiver("system")`, (b) reaches `take_command_receiver("admin")`, and the waiter stays pending. Then injects `(SYSTEM_KIND, "TIMER_RESPONSE")` with the matching trace and a canned payload, and asserts the waiter completes with that payload.
+- [x] **H1.** Orchestrator no-deadlock test: fire `run_node` from admin while a `system` message arrives in parallel; assert both complete within timeout. Implemented as `h1_run_node_remote_does_not_block_system_worker`, using real `run_admin_worker`, `run_system_worker`, `build_orchestrator_rpc_profile()`, and `RpcTestHarness`.
+- [x] **H2.** Orchestrator: simulate a message with an unrelated or colliding `trace_id` arriving during a pending RPC; assert (i) the RPC keeps waiting when the message is operational/unrelated, (ii) the message is delivered to its category operational worker/channel, (iii) nothing is dropped, (iv) a malformed correlated response fails the waiter with `InvalidResponse`, and (v) a late correlated response after timeout is counted as stale and discarded rather than delivered to a worker. Implemented as `h2_orchestrator_rpc_routes_collisions_invalid_and_stale`.
+- [x] **H3.** Orchestrator: `purge_owner_timers_before_teardown` exercised through `RpcClient::from_test_channels` / `RpcTestHarness` exposed by `fluxbee_sdk` under `test-utils` (no trait abstraction; the production type is the one under test), using the same orchestrator `OperationalRouteProfile` shape. The test reads the outgoing `Message` written by the client and asserts: `routing.src = sender.uuid()` (canonical sender), `routing.src_l2_name = None`, `routing.dst = Destination::Unicast(timer_node)`, `meta.msg_type = SYSTEM_KIND`, `meta.msg = Some("TIMER_PURGE_OWNER")`, `meta.target = None`, `meta.action_class = classify_system_message("TIMER_PURGE_OWNER")`. While the purge waiter is pending, the test injects (a) `(SYSTEM_KIND, "SYSTEM_UPDATE")` with random trace, and (b) an `(ADMIN_KIND, MSG_ADMIN_COMMAND)` with the **colliding** trace; asserts (a) reaches `take_command_receiver("system")`, (b) reaches `take_command_receiver("admin")`, and the waiter stays pending. Then injects `(SYSTEM_KIND, "TIMER_RESPONSE")` with the matching trace and a canned payload, and asserts the waiter completes with that payload. Implemented as `h3_timer_purge_uses_canonical_rpc_client_and_routes_collisions`.
 - [ ] **H4.** E2E `scripts/node_teardown_completeness_e2e.sh` runs green post-refactor. No timeout bumps. No relay grants added downstream.
 - [ ] **H5.** Identity E2E: `ILK_REGISTER` and `ILK_UPDATE` from orchestrator land in `SY.identity` with `routing.src_l2_name = SY.orchestrator@<hive>`.
 
@@ -317,20 +317,20 @@ Classification: **anti-pattern follow-up**, not a bug. Each lookup announces/wit
 
 | Block | Status | Evidence |
 | --- | --- | --- |
-| **A** | ✓ DONE | `crates/fluxbee_sdk/src/rpc.rs` complete. 137/137 SDK tests green. |
+| **A** | ✓ DONE | `crates/fluxbee_sdk/src/rpc.rs` complete. SDK RPC tests 34/34 green. |
 | **B** | ✓ DONE | `admin.rs` deleted entirely; identity helpers gone; lib.rs/prelude.rs updated. |
-| **C** | ✓ DONE | `OrchestratorRouterClient` removed; workers via `take_command_receiver`; sy_orchestrator 83/83 green. |
+| **C** | ✓ DONE | `OrchestratorRouterClient` removed; workers via `take_command_receiver`; sy_orchestrator 86/86 green. |
 | **D** | ✓ DONE | `AdminRouterClient` removed; `OperationalRouteProfile` with 3 command channels + 2 broadcasts; sy_admin 65/65 green. |
 | **E** | ✓ DONE | 7 call sites migrated (sy_architect + 5 diags + io-test). 5 diags out of scope by criterion. |
 | **F** | ✓ DONE | Full repo + Go audit; 0 deadlock bugs outside orchestrator; findings table published. |
 | **G** | ✓ DONE | Relay residue grep clean; FR-10 doc closed; identity_audit clean. |
-| **H** | PENDING | Needs live router. H1/H2/H3 are unit-test-style and could be written without router; H4/H5 are E2E gates. |
+| **H** | PARTIAL | H1/H2/H3 done with `RpcTestHarness`; H4/H5 still need live router/hive E2E. |
 
 ### Build + test results
 
-- `cargo check --workspace`: clean.
-- `fluxbee-sdk`: 137/137 green (29 of those in `rpc::tests`).
-- `sy_admin`: 65/65 green. `sy_orchestrator`: 83/83 green. `sy_architect`: 154/154 green. `sy_identity`: 27/27 green.
+- `cargo check --workspace`: passed, warnings only.
+- `fluxbee-sdk` `rpc::tests`: 34/34 green.
+- `sy_admin`: 65/65 green. `sy_orchestrator`: 86/86 green. `sy_architect`: 154/154 green. `sy_identity`: 27/27 green.
 
 ### What did NOT migrate (and why)
 
@@ -343,7 +343,6 @@ These are intentional deferrals, not omissions. Each is documented either above 
 | 5 diags not migrated: `blob_sync_diag`, `inventory_hold_diag`, `jetstream_envelope_diag`, `orch_system_diag`, `wf_nats_diag` | None matches the "1 RPC ephemeral" criterion: `BlobToolkit` multi-step workflow, consumer loops, NATS, mini-protocol dispatcher. None uses deleted helpers. | Per-diag: extend `BlobToolkit::publish_blob_and_confirm` to accept `&RpcClient`; declare profile with `system_update` channel for `orch_system_diag`. Tracked separately. |
 | 5 vault-lookup ephemeral connect anti-patterns: `sy_admin:820`, `sy_cognition:1594`, `io-slack:739`, `ai-generic:1682`, `ai-frontdesk-gov:1708` | `resolve_resource()` SDK helper requires `(&NodeSender, &mut NodeReceiver)`; each caller creates an ephemeral connect+drop per vault lookup. Not a deadlock, not a spoof; just spurious router announce/withdraw. | Add `VaultClient` (or `RpcClient::resolve_resource`) to SDK, then migrate the 5 sites. |
 | Go `RpcClient` equivalent | F4 decision: not needed. `sy-wf-rules` already has its own per-trace_id mux; `sy-opa-rules` has a separate forward goroutine; `sy-timer` is request/respond simple. No critical mass. | Re-evaluate only if a Go node grows the deadlock pattern. |
-| H1, H2, H3 unit tests in orchestrator | Block H content is queued. Can be written without a live router using `RpcTestHarness`. | Next session. |
 | H4, H5 E2E (`scripts/node_teardown_completeness_e2e.sh`, identity E2E) | Need a live hive/router. | Run when CI / staging environment is available. |
 
 ## Task list v1 — historical
@@ -361,7 +360,7 @@ Kept for traceability. Items marked [x] are real progress but live inside `Orche
 - [x] ORPC-9. Clean `SY.identity` relay residue. *Verified in Block G1; negative tests stay.*
 - [~] ORPC-10. Audit `SY.timer`. *Static code path verified clean; live re-run gated on Block H4.*
 - [ ] ORPC-11. Review node teardown E2E. *Block H4.*
-- [~] ORPC-12. Focused coverage. *SDK side fully done (Block A5: 29 tests). Orchestrator-side H1–H3 pending in Block H.*
+- [x] ORPC-12. Focused coverage. *SDK side done (Block A5); orchestrator-side H1–H3 done in Block H.*
 - [x] ORPC-13. Final cleanup sweep. *Done in Block G1.*
 - [x] ORPC-14. Update docs. *Done in Block G2.*
 
@@ -370,13 +369,13 @@ Kept for traceability. Items marked [x] are real progress but live inside `Orche
 - Dispatch by `trace_id` alone is not strong enough for v2. The pending table uses `trace_id` only as the lookup key; completion is decided by the declarative `PendingMatcher`. Exact terminal transport errors are separate from invalid-response families, so an admin RPC can accept `(SYSTEM_KIND, MSG_UNREACHABLE)` without treating every `SYSTEM_KIND` collision as malformed.
 - Responses after waiter removal are not operational commands. The recent-stale trace table catches late correlated responses after success, timeout, or drain and drops them with metrics/logging. The response-only registry catches registered non-`Any` / non-observational RPC response shapes even after stale TTL expiry and drops/logs them before profile routing.
 - `OrchestratorRouterClient::sender_snapshot` returned a cloned `NodeSender` and worked in v1 because the SDK keeps the clone valid across transparent reconnections. `RpcClient` keeps the same contract (`NodeSender: Clone` is assumed stable; `RwLock<NodeSender>` is only needed if the SDK ever exposes a sender-replace API, which it does not today).
-- Operational ordering: handlers run serialized by category in v2. This matches lifecycle expectations and avoids introducing new ordering bugs while fixing the recv-loop deadlock. Parallelism can be added later only per handler, bounded, and after Block C5 records the ordering proof.
+- Operational ordering: handlers run serialized by category in v2. This matches lifecycle expectations and avoids introducing new ordering bugs while fixing the recv-loop deadlock. Block C5/H1 record the ordering proof for the current implementation; parallelism can be added later only per handler and bounded.
 - Command-channel queueing is profile-declared `mpsc` wrapped by `RpcCommandReceiver` with a depth gauge and WARN-on-soft-threshold (1000). Bounded `try_send` with fatal-on-overflow is deferred unless an audit shows the router itself can outrun the consumer. Until then, unbounded + depth metric is the contract.
 - Test transport: `RpcClient::from_test_channels` / `RpcTestHarness` is the single injectable path and must be available to downstream crate tests via `test-utils` or an equivalent public harness module, not plain `#[cfg(test)]` inside `fluxbee_sdk`. No `RpcPort` trait is added — the production type is what tests exercise, so the dispatcher, matcher, stale-response handling, depth metric, and drain logic are all covered by the same code path that runs in production.
 
 ## Fresh review notes 2026-05-24
 
-Review scope: code read-through of the implemented ORPC refactor after Blocks A-G, with Block H still pending. Initial review was doc-only; the follow-up fixes below were applied on 2026-05-24.
+Review scope: code read-through of the implemented ORPC refactor after Blocks A-G. Initial review was doc-only; the follow-up fixes below were applied on 2026-05-24. H1/H2/H3 were then implemented as in-process orchestrator tests; H4/H5 remain live E2E gates.
 
 ### Findings to discuss
 
@@ -394,7 +393,7 @@ Review scope: code read-through of the implemented ORPC refactor after Blocks A-
 
 - `cargo check --workspace`: passed, warnings only.
 - `cargo test -p fluxbee-sdk rpc::tests`: 34/34 passed.
-- `cargo test -p json-router --bin sy_orchestrator -- --nocapture`: 83/83 passed.
+- `cargo test -p json-router --bin sy_orchestrator -- --nocapture`: 86/86 passed.
 - `cargo test -p json-router --bin sy_admin -- --nocapture`: 65/65 passed.
 
 ### Non-issues confirmed
@@ -402,7 +401,7 @@ Review scope: code read-through of the implemented ORPC refactor after Blocks A-
 - No live `AdminRouterClient` / `OrchestratorRouterClient` implementation remains; remaining mentions are historical docs/comments.
 - No live `SY.orchestrator.relay.*`, `SY.orchestrator.ilk-delete.*`, or `SY.orchestrator.vault-purge.*` code path found; relay-name hits are negative tests or unrelated IO relay terminology.
 - `sy_admin` and `sy_orchestrator` build profiles in their own binaries, with no SDK-predefined profile coupling.
-- H1/H2/H3 still need to be written; the current `sy_orchestrator` unit tests still use test shortcuts for timer purge and do not prove the production `RpcClient` transport path.
+- H1/H2/H3 now exercise the production `RpcClient` transport/dispatcher path through `RpcTestHarness`; H4/H5 still need live router/hive validation.
 
 ## Acceptance criteria
 

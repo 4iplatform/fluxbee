@@ -16752,6 +16752,420 @@ blob:
         }
     }
 
+    fn attach_test_rpc(state: &OrchestratorState) -> (Arc<RpcClient>, fluxbee_sdk::RpcTestHarness) {
+        let profile = build_orchestrator_rpc_profile().expect("orchestrator rpc profile");
+        let (client, harness) = fluxbee_sdk::RpcTestHarness::new_with_uuid(
+            "orchestrator-test-uuid",
+            "SY.orchestrator@motherbee",
+            profile,
+        );
+        assert!(state.rpc.set(Arc::clone(&client)).is_ok());
+        (client, harness)
+    }
+
+    fn test_admin_command(trace_id: &str, action: &str, payload: serde_json::Value) -> Message {
+        Message {
+            routing: Routing {
+                src: "admin-test-uuid".to_string(),
+                src_l2_name: Some("SY.admin@motherbee".to_string()),
+                dst: Destination::Unicast("SY.orchestrator@motherbee".to_string()),
+                ttl: 16,
+                trace_id: trace_id.to_string(),
+            },
+            meta: Meta {
+                msg_type: ADMIN_KIND.to_string(),
+                msg: Some(MSG_ADMIN_COMMAND.to_string()),
+                action: Some(action.to_string()),
+                action_class: classify_admin_action(action),
+                ..Meta::default()
+            },
+            payload,
+        }
+    }
+
+    fn test_system_message(trace_id: &str, msg_name: &str, payload: serde_json::Value) -> Message {
+        Message {
+            routing: Routing {
+                src: "system-test-uuid".to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast("SY.orchestrator@motherbee".to_string()),
+                ttl: 16,
+                trace_id: trace_id.to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(msg_name.to_string()),
+                action_class: classify_system_message(msg_name),
+                ..Meta::default()
+            },
+            payload,
+        }
+    }
+
+    fn test_response_for(
+        outgoing: &Message,
+        msg_type: &str,
+        msg_name: &str,
+        payload: serde_json::Value,
+    ) -> Message {
+        Message {
+            routing: Routing {
+                src: "responder-test-uuid".to_string(),
+                src_l2_name: Some("responder@motherbee".to_string()),
+                dst: Destination::Unicast(outgoing.routing.src.clone()),
+                ttl: 16,
+                trace_id: outgoing.routing.trace_id.clone(),
+            },
+            meta: Meta {
+                msg_type: msg_type.to_string(),
+                msg: Some(msg_name.to_string()),
+                action_class: classify_system_message(msg_name),
+                ..Meta::default()
+            },
+            payload,
+        }
+    }
+
+    fn assert_unicast_destination(actual: &Destination, expected: &str) {
+        match actual {
+            Destination::Unicast(value) => assert_eq!(value, expected),
+            other => panic!("expected unicast destination {expected}, got {other:?}"),
+        }
+    }
+
+    async fn wait_for_stale_metric(client: &RpcClient, expected: u64) {
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                if client.metric_stale_responses() >= expected {
+                    break;
+                }
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("stale metric increment");
+    }
+
+    #[tokio::test]
+    async fn h1_run_node_remote_does_not_block_system_worker() {
+        let state = Arc::new(sample_orchestrator_state_for_tests());
+        let (client, mut harness) = attach_test_rpc(&state);
+        let admin_rx = client
+            .take_command_receiver(RPC_CH_ADMIN)
+            .await
+            .expect("admin receiver");
+        let system_rx = client
+            .take_command_receiver(RPC_CH_SYSTEM)
+            .await
+            .expect("system receiver");
+
+        {
+            let state = Arc::clone(&state);
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                run_admin_worker(state, client, admin_rx).await;
+            });
+        }
+        {
+            let state = Arc::clone(&state);
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                run_system_worker(state, client, system_rx).await;
+            });
+        }
+
+        harness
+            .inject(test_admin_command(
+                "admin-run-node-trace",
+                "run_node",
+                serde_json::json!({
+                    "target": "workerbee",
+                    "node_name": "AI.demo@workerbee",
+                    "runtime": "ai.demo",
+                    "runtime_version": "current"
+                }),
+            ))
+            .await
+            .expect("inject admin command");
+
+        let forwarded = time::timeout(Duration::from_secs(1), harness.next_outgoing())
+            .await
+            .expect("forwarded run_node rpc emitted")
+            .expect("forwarded message");
+        assert_unicast_destination(&forwarded.routing.dst, "SY.orchestrator@workerbee");
+        assert_eq!(forwarded.meta.msg_type, SYSTEM_KIND);
+        assert_eq!(forwarded.meta.msg.as_deref(), Some("SPAWN_NODE"));
+        assert_eq!(forwarded.meta.target, None);
+
+        harness
+            .inject(test_system_message(
+                "parallel-system-trace",
+                "SYSTEM_UPDATE",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("inject parallel system message");
+
+        let system_reply = time::timeout(Duration::from_secs(1), harness.next_outgoing())
+            .await
+            .expect("system worker should reply while run_node rpc is pending")
+            .expect("system reply");
+        assert_eq!(system_reply.meta.msg_type, SYSTEM_KIND);
+        assert_eq!(
+            system_reply.meta.msg.as_deref(),
+            Some("SYSTEM_UPDATE_RESPONSE")
+        );
+        assert_eq!(system_reply.routing.trace_id, "parallel-system-trace");
+
+        assert!(
+            time::timeout(Duration::from_millis(50), harness.next_outgoing())
+                .await
+                .is_err(),
+            "admin response should still be blocked on the remote SPAWN_NODE response"
+        );
+
+        harness
+            .inject(test_response_for(
+                &forwarded,
+                SYSTEM_KIND,
+                "SPAWN_NODE_RESPONSE",
+                serde_json::json!({
+                    "status": "ok",
+                    "node_name": "AI.demo@workerbee",
+                    "target": "workerbee"
+                }),
+            ))
+            .await
+            .expect("inject remote spawn response");
+
+        let admin_reply = time::timeout(Duration::from_secs(1), harness.next_outgoing())
+            .await
+            .expect("admin run_node reply emitted")
+            .expect("admin reply");
+        assert_eq!(admin_reply.meta.msg_type, ADMIN_KIND);
+        assert_eq!(admin_reply.meta.action.as_deref(), Some("run_node"));
+        assert_eq!(admin_reply.routing.trace_id, "admin-run-node-trace");
+        assert_eq!(admin_reply.payload["status"], serde_json::json!("ok"));
+    }
+
+    #[tokio::test]
+    async fn h2_orchestrator_rpc_routes_collisions_invalid_and_stale() {
+        let state = sample_orchestrator_state_for_tests();
+        let (client, mut harness) = attach_test_rpc(&state);
+        let mut admin_rx = client
+            .take_command_receiver(RPC_CH_ADMIN)
+            .await
+            .expect("admin receiver");
+        let mut system_rx = client
+            .take_command_receiver(RPC_CH_SYSTEM)
+            .await
+            .expect("system receiver");
+
+        let waiter = {
+            let state = state;
+            tokio::spawn(async move {
+                orchestrator_system_action(
+                    &state,
+                    "SY.timer@motherbee",
+                    "TIMER_PURGE_OWNER",
+                    "TIMER_RESPONSE",
+                    serde_json::json!({ "owner_l2_name": "WF.demo@motherbee" }),
+                    Duration::from_secs(2),
+                )
+                .await
+            })
+        };
+        let outgoing = harness
+            .next_outgoing_within(Duration::from_secs(1))
+            .await
+            .expect("timer purge rpc outgoing");
+
+        harness
+            .inject(test_system_message(
+                "random-system-trace",
+                "SYSTEM_UPDATE",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("inject unrelated system message");
+        let routed_system = time::timeout(Duration::from_secs(1), system_rx.recv())
+            .await
+            .expect("system route timeout")
+            .expect("system route");
+        assert_eq!(routed_system.routing.trace_id, "random-system-trace");
+        assert_eq!(routed_system.meta.msg.as_deref(), Some("SYSTEM_UPDATE"));
+
+        harness
+            .inject(test_admin_command(
+                &outgoing.routing.trace_id,
+                "hive_status",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("inject colliding admin command");
+        let routed_admin = time::timeout(Duration::from_secs(1), admin_rx.recv())
+            .await
+            .expect("admin route timeout")
+            .expect("admin route");
+        assert_eq!(routed_admin.routing.trace_id, outgoing.routing.trace_id);
+        assert_eq!(routed_admin.meta.msg.as_deref(), Some(MSG_ADMIN_COMMAND));
+
+        time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "operational traffic should not complete the pending RPC"
+        );
+
+        harness
+            .inject(test_response_for(
+                &outgoing,
+                SYSTEM_KIND,
+                "WRONG_RESPONSE",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("inject malformed correlated response");
+        let err = waiter
+            .await
+            .expect("waiter join")
+            .expect_err("wrong response should fail waiter");
+        assert!(err.to_string().contains("invalid response"));
+
+        let state = sample_orchestrator_state_for_tests();
+        assert!(state.rpc.set(Arc::clone(&client)).is_ok());
+        let stale_before = client.metric_stale_responses();
+        let timeout_waiter = tokio::spawn(async move {
+            orchestrator_system_action(
+                &state,
+                "SY.timer@motherbee",
+                "TIMER_PURGE_OWNER",
+                "TIMER_RESPONSE",
+                serde_json::json!({ "owner_l2_name": "WF.timeout@motherbee" }),
+                Duration::from_millis(50),
+            )
+            .await
+        });
+        let timed_out_outgoing = harness
+            .next_outgoing_within(Duration::from_secs(1))
+            .await
+            .expect("timeout rpc outgoing");
+        let timeout_err = timeout_waiter
+            .await
+            .expect("timeout waiter join")
+            .expect_err("rpc should time out");
+        assert!(timeout_err.to_string().contains("timeout waiting response"));
+
+        harness
+            .inject(test_response_for(
+                &timed_out_outgoing,
+                SYSTEM_KIND,
+                "TIMER_RESPONSE",
+                serde_json::json!({ "ok": true, "deleted_count": 1 }),
+            ))
+            .await
+            .expect("inject late timer response");
+        wait_for_stale_metric(&client, stale_before + 1).await;
+        assert_eq!(client.metric_stale_responses(), stale_before + 1);
+        assert!(
+            system_rx.try_recv().is_none(),
+            "late stale response must not route to system worker"
+        );
+        assert!(
+            admin_rx.try_recv().is_none(),
+            "late stale response must not route to admin worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn h3_timer_purge_uses_canonical_rpc_client_and_routes_collisions() {
+        let _guard = teardown_test_serial_guard();
+        let state = Arc::new(sample_orchestrator_state_for_tests());
+        let (client, mut harness) = attach_test_rpc(&state);
+        let mut admin_rx = client
+            .take_command_receiver(RPC_CH_ADMIN)
+            .await
+            .expect("admin receiver");
+        let mut system_rx = client
+            .take_command_receiver(RPC_CH_SYSTEM)
+            .await
+            .expect("system receiver");
+
+        let purge_state = Arc::clone(&state);
+        let purge = tokio::spawn(async move {
+            purge_owner_timers_before_teardown(
+                &purge_state,
+                "motherbee",
+                "WF.demo.cleanup@motherbee",
+            )
+            .await
+        });
+
+        let outgoing = harness
+            .next_outgoing_within(Duration::from_secs(1))
+            .await
+            .expect("timer purge outgoing");
+        assert_eq!(outgoing.routing.src, harness.sender_uuid());
+        assert_eq!(outgoing.routing.src_l2_name, None);
+        assert_unicast_destination(&outgoing.routing.dst, "SY.timer@motherbee");
+        assert_eq!(outgoing.meta.msg_type, SYSTEM_KIND);
+        assert_eq!(outgoing.meta.msg.as_deref(), Some("TIMER_PURGE_OWNER"));
+        assert_eq!(outgoing.meta.target, None);
+        assert_eq!(
+            outgoing.meta.action_class,
+            classify_system_message("TIMER_PURGE_OWNER")
+        );
+
+        harness
+            .inject(test_system_message(
+                "random-trace",
+                "SYSTEM_UPDATE",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("inject random system message");
+        let routed_system = time::timeout(Duration::from_secs(1), system_rx.recv())
+            .await
+            .expect("system route timeout")
+            .expect("system route");
+        assert_eq!(routed_system.routing.trace_id, "random-trace");
+
+        harness
+            .inject(test_admin_command(
+                &outgoing.routing.trace_id,
+                "hive_status",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("inject colliding admin command");
+        let routed_admin = time::timeout(Duration::from_secs(1), admin_rx.recv())
+            .await
+            .expect("admin route timeout")
+            .expect("admin route");
+        assert_eq!(routed_admin.routing.trace_id, outgoing.routing.trace_id);
+        assert_eq!(routed_admin.meta.msg.as_deref(), Some(MSG_ADMIN_COMMAND));
+
+        time::sleep(Duration::from_millis(20)).await;
+        assert!(!purge.is_finished(), "purge waiter should still be pending");
+
+        harness
+            .inject(test_response_for(
+                &outgoing,
+                SYSTEM_KIND,
+                "TIMER_RESPONSE",
+                serde_json::json!({ "ok": true, "deleted_count": 2 }),
+            ))
+            .await
+            .expect("inject timer response");
+        let payload = purge.await.expect("purge join");
+        assert_eq!(payload["status"], serde_json::json!("ok"));
+        assert_eq!(payload["target"], serde_json::json!("SY.timer@motherbee"));
+        assert_eq!(
+            payload["owner_l2_name"],
+            serde_json::json!("WF.demo.cleanup@motherbee")
+        );
+        assert_eq!(payload["deleted_count"], serde_json::json!(2));
+    }
+
     #[test]
     fn system_source_without_src_l2_name_is_rejected() {
         let state = sample_orchestrator_state_for_tests();
