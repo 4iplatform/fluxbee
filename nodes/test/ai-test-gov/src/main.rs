@@ -76,13 +76,13 @@ async fn run_loop(sender: &NodeSender, receiver: &mut NodeReceiver) -> Result<()
                     action: None,
                     priority: None,
                     context: Some(json!({
-                        "handled_by": sender.full_name(),
+                        "handled_by": sender.full_name().as_ref(),
                     })),
                     ..Meta::default()
                 },
                 payload: json!({
                     "status": "ok",
-                    "handled_by": sender.full_name(),
+                    "handled_by": sender.full_name().as_ref(),
                     "probe_id": probe_id,
                     "echo": text,
                 }),

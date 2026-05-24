@@ -60,9 +60,11 @@ async fn main() -> Result<(), DynError> {
     .await?;
 
     // Case 2: malformed ilk_id should fail with INVALID_REQUEST.
+    // Canonical name: SY.identity only authorizes the configured frontdesk
+    // node name (no suffixes after @hive — those malform the hive segment).
     let frontdesk_name = env_or(
         "IDENTITY_NEGATIVE_FRONTDESK_NODE_NAME",
-        &format!("SY.frontdesk.gov@{}-neg-{}", hive_id, test_id),
+        &format!("SY.frontdesk.gov@{}", hive_id),
     );
     let malformed_payload = json!({
         "ilk_id": "ilk:not-a-uuid",

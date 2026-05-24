@@ -46,9 +46,11 @@ async fn main() -> Result<(), DynError> {
         "IDENTITY_REPLICA_DIAG_NODE_NAME",
         &format!("WF.identity.replica.{}@{}", test_id, local_hive_id),
     );
+    // Canonical name: SY.identity only authorizes the configured frontdesk
+    // node name (no suffixes after @hive — those malform the hive segment).
     let frontdesk_node_name = env_or(
         "IDENTITY_REPLICA_FRONTDESK_NODE_NAME",
-        &format!("SY.frontdesk.gov@{}-replicasync-{}", local_hive_id, test_id),
+        &format!("SY.frontdesk.gov@{}", local_hive_id),
     );
     let io_node_name = env_or(
         "IDENTITY_REPLICA_IO_NODE_NAME",
