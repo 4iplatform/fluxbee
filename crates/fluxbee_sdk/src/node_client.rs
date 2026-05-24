@@ -168,8 +168,12 @@ async fn connection_manager_loop(
                     let rx_state = Arc::clone(&state);
                     let tx_state = Arc::clone(&state);
                     let mut rx_task = tokio::spawn(rx_loop(read_half, app_rx_tx.clone(), rx_state));
-                    let mut tx_task =
-                        tokio::spawn(tx_loop(write_half, Arc::clone(&app_tx_rx), tx_state));
+                    let mut tx_task = tokio::spawn(tx_loop(
+                        write_half,
+                        Arc::clone(&app_tx_rx),
+                        tx_state,
+                        app_rx_tx.clone(),
+                    ));
                     tokio::select! {
                         _ = &mut rx_task => { tx_task.abort(); }
                         _ = &mut tx_task => { rx_task.abort(); }
@@ -291,6 +295,7 @@ async fn tx_loop(
     mut socket: OwnedWriteHalf,
     rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     state: Arc<ConnectionState>,
+    disconnect_tx: mpsc::Sender<Result<Message, NodeError>>,
 ) {
     loop {
         let frame = {
@@ -302,6 +307,7 @@ async fn tx_loop(
                 if let Err(err) = write_frame(&mut socket, &frame).await {
                     state.set_connected(false);
                     tracing::warn!(error = %err, frame_len = frame.len(), "sdk: tx_loop write_frame failed");
+                    let _ = disconnect_tx.send(Err(NodeError::Io(err))).await;
                     break;
                 }
             }
@@ -441,5 +447,34 @@ mod tests {
         assert_ne!(first, second);
         assert!(!dir.join("SY.test.uuid").exists());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn tx_loop_write_error_notifies_receiver() {
+        let (socket, peer) = UnixStream::pair().expect("socket pair");
+        let (_read_half, write_half) = socket.into_split();
+        drop(peer);
+
+        let (frame_tx, frame_rx) = mpsc::channel(1);
+        let shared_rx = Arc::new(Mutex::new(frame_rx));
+        let (disconnect_tx, mut disconnect_rx) = mpsc::channel(1);
+        let state = Arc::new(ConnectionState::new_connected());
+
+        let task = tokio::spawn(tx_loop(
+            write_half,
+            Arc::clone(&shared_rx),
+            Arc::clone(&state),
+            disconnect_tx,
+        ));
+        frame_tx.send(vec![1, 2, 3]).await.expect("queue frame");
+
+        let received = time::timeout(Duration::from_secs(1), disconnect_rx.recv())
+            .await
+            .expect("disconnect notification timed out")
+            .expect("disconnect notification channel closed");
+        assert!(matches!(received, Err(NodeError::Io(_))));
+        assert!(!state.is_connected());
+
+        task.await.expect("tx loop task panicked");
     }
 }

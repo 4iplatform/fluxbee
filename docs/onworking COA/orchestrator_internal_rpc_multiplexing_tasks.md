@@ -1,8 +1,8 @@
 # SY.orchestrator internal RPC multiplexing tasks
 
 Date: 2026-05-23 (created)
-Updated: 2026-05-24 (Blocks A–G done; H1–H3 done; H4/H5 pending live E2E)
-Status: Blocks A, B, C, D, E, F, G **done**. Block H is **partial**: H1/H2/H3 are covered by in-process `RpcTestHarness` tests; H4/H5 still need a live router/hive run.
+Updated: 2026-05-24 (Iter 1 Blocks A–G + H1–H3 done; H4/H5 statically validated; Iter 2 AF-P1..AF-P3 done; Iter 3 review follow-up done)
+Status: Iteration 1 — Blocks A, B, C, D, E, F, G **done**; Block H: H1/H2/H3 covered by in-process `RpcTestHarness` tests; H4/H5 scripts statically verified, formal `[x]` waits on staging/CI run. Iteration 2 (audit follow-up) — AF-P1 (auth bypass fix), AF-P2a (fail-fast on reconnect), AF-P2b (observational filter), AF-P3 (doc inventory) all **done**. Iteration 3 (code-review hardening) — AF-P4..AF-P7 **done**.
 
 ## Goal
 
@@ -273,13 +273,24 @@ ORPC-1..ORPC-14 (the v1 list, see "Task list v1 — historical" below) are subsu
 
 | File | Use |
 | --- | --- |
-| `src/bin/sy_admin.rs:820` | `name: "SY.admin"` + Ephemeral + `connect()` + `resolve_resource` |
-| `src/bin/sy_cognition.rs:1594` | same pattern for vault lookup |
-| `nodes/io/io-slack/src/main.rs:739` | same |
-| `nodes/ai/ai-generic/src/bin/ai_node_runner.rs:1682` | same |
-| `nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs:1708` | same |
+| `src/bin/sy_admin.rs:820` | `name: "SY.admin"` + Ephemeral + `connect()` + `resolve_resource` (Openai vault) |
+| `src/bin/sy_cognition.rs:1594` | `connect()` + `resolve_resource` for cognition vault lookup |
+| `nodes/io/io-slack/src/main.rs:739` | `connect()` + `resolve_resource` for io-slack vault lookup |
+| `nodes/ai/ai-generic/src/bin/ai_node_runner.rs:1682` | `connect()` + `resolve_resource` for ai-generic vault lookup |
+| `nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs:1708` | `connect()` + `resolve_resource` for ai-frontdesk-gov vault lookup |
+| `src/bin/sy_architect.rs:6174` | `name: "SY.architect"` + Ephemeral + `connect()` + `resolve_resource` (Openai vault) — **added by AF-P3 audit** |
+| `src/bin/sy_architect.rs:6249` | `name: "SY.architect"` + Ephemeral + `connect()` + `resolve_resource` (Postgres `messages_db` vault) — **added by AF-P3 audit** |
 
-Classification: **anti-pattern follow-up**, not a bug. Each lookup announces/withdraws the L2 from the router unnecessarily. No deadlock, no identity spoof. **Out of ORPC scope.** Suggested follow-up: extend SDK with `RpcClient::resolve_resource` or `VaultClient` that wraps `Arc<RpcClient>`, then migrate the 5 call sites.
+Classification: **anti-pattern follow-up**, not a bug. Each lookup announces/withdraws the L2 from the router unnecessarily. No deadlock, no identity spoof. **Out of ORPC scope.** Suggested follow-up: extend SDK with `RpcClient::resolve_resource` or `VaultClient` that wraps `Arc<RpcClient>`, then migrate the 7 call sites.
+
+**Separate (acceptable) category — one-shot `RpcClient` ephemeral RPCs:**
+
+| File | Use |
+| --- | --- |
+| `src/bin/sy_architect.rs:12943` | `RpcClient::connect_with_retry` + `send_admin_rpc` + drop (one-off admin action) |
+| `src/bin/sy_architect.rs:13047` | `RpcClient::connect_with_retry` + `send_admin_rpc` + drop (architect status fetch) |
+
+These are **not** anti-patterns. `sy_architect` only needs occasional outbound admin RPCs and creates a short-lived `Arc<RpcClient>` per call. The canonical SDK abstraction is used; no leaked L2 spoof, no `NodeReceiver` solapado, no internal dispatcher. Listed here for completeness so future audits don't conflate them with Pattern 3.
 
 ### Block G — Relay residue cleanup (subsumes ORPC-9, 13, 14)
 
@@ -297,8 +308,8 @@ Classification: **anti-pattern follow-up**, not a bug. Each lookup announces/wit
 - [x] **H1.** Orchestrator no-deadlock test: fire `run_node` from admin while a `system` message arrives in parallel; assert both complete within timeout. Implemented as `h1_run_node_remote_does_not_block_system_worker`, using real `run_admin_worker`, `run_system_worker`, `build_orchestrator_rpc_profile()`, and `RpcTestHarness`.
 - [x] **H2.** Orchestrator: simulate a message with an unrelated or colliding `trace_id` arriving during a pending RPC; assert (i) the RPC keeps waiting when the message is operational/unrelated, (ii) the message is delivered to its category operational worker/channel, (iii) nothing is dropped, (iv) a malformed correlated response fails the waiter with `InvalidResponse`, and (v) a late correlated response after timeout is counted as stale and discarded rather than delivered to a worker. Implemented as `h2_orchestrator_rpc_routes_collisions_invalid_and_stale`.
 - [x] **H3.** Orchestrator: `purge_owner_timers_before_teardown` exercised through `RpcClient::from_test_channels` / `RpcTestHarness` exposed by `fluxbee_sdk` under `test-utils` (no trait abstraction; the production type is the one under test), using the same orchestrator `OperationalRouteProfile` shape. The test reads the outgoing `Message` written by the client and asserts: `routing.src = sender.uuid()` (canonical sender), `routing.src_l2_name = None`, `routing.dst = Destination::Unicast(timer_node)`, `meta.msg_type = SYSTEM_KIND`, `meta.msg = Some("TIMER_PURGE_OWNER")`, `meta.target = None`, `meta.action_class = classify_system_message("TIMER_PURGE_OWNER")`. While the purge waiter is pending, the test injects (a) `(SYSTEM_KIND, "SYSTEM_UPDATE")` with random trace, and (b) an `(ADMIN_KIND, MSG_ADMIN_COMMAND)` with the **colliding** trace; asserts (a) reaches `take_command_receiver("system")`, (b) reaches `take_command_receiver("admin")`, and the waiter stays pending. Then injects `(SYSTEM_KIND, "TIMER_RESPONSE")` with the matching trace and a canned payload, and asserts the waiter completes with that payload. Implemented as `h3_timer_purge_uses_canonical_rpc_client_and_routes_collisions`.
-- [ ] **H4.** E2E `scripts/node_teardown_completeness_e2e.sh` runs green post-refactor. No timeout bumps. No relay grants added downstream.
-- [ ] **H5.** Identity E2E: `ILK_REGISTER` and `ILK_UPDATE` from orchestrator land in `SY.identity` with `routing.src_l2_name = SY.orchestrator@<hive>`.
+- [~] **H4.** E2E `scripts/node_teardown_completeness_e2e.sh` — **static validation done 2026-05-24**: script has 0 mentions of `relay`, 0 timeout bumps, 0 added grants. Exercises exactly the ORPC-fixed flows (`purge_instance=true` → `kill_node_flow` → `purge_owner_timers_before_teardown` → `TIMER_PURGE_OWNER`, plus `delete_ilk_for_teardown` and `purge_vault_secrets_for_ilk` via `orchestrator_admin_command`). All three paths covered by unit tests post-refactor (H3 fakes the canonical RpcClient transport). **Live run pending**: requires a running router + hive (`BASE=http://127.0.0.1:8080` + identity service); not available in dev workstation. Mark `[x]` after first staging/CI run.
+- [~] **H5.** Identity E2E — **static validation done 2026-05-24**: scripts `identity_register_strict_e2e.sh`, `identity_node_registration_e2e.sh`, `identity_provision_complete_e2e.sh`, `identity_negative_e2e.sh`, `identity_replica_sync_e2e.sh`, `identity_merge_alias_e2e.sh`, `identity_test_nodes_publish_e2e.sh` exist; none contains relay references. `ILK_REGISTER` and `ILK_UPDATE` paths from orchestrator now go through `orchestrator_identity_system_call_ok` → `state.rpc().send_system_rpc(SystemRpcRequest)` with the canonical sender uuid, so `routing.src_l2_name` will be stamped as `SY.orchestrator@<hive>` by the router. **Live run pending**: same infra requirement as H4. Mark `[x]` after first staging/CI run.
 
 ### Execution order
 
@@ -324,7 +335,7 @@ Classification: **anti-pattern follow-up**, not a bug. Each lookup announces/wit
 | **E** | ✓ DONE | 7 call sites migrated (sy_architect + 5 diags + io-test). 5 diags out of scope by criterion. |
 | **F** | ✓ DONE | Full repo + Go audit; 0 deadlock bugs outside orchestrator; findings table published. |
 | **G** | ✓ DONE | Relay residue grep clean; FR-10 doc closed; identity_audit clean. |
-| **H** | PARTIAL | H1/H2/H3 done with `RpcTestHarness`; H4/H5 still need live router/hive E2E. |
+| **H** | PARTIAL | H1/H2/H3 done with `RpcTestHarness`. H4/H5 statically verified (script grep: 0 relay refs, 0 timeout bumps, exercise canonical post-refactor paths). Live run pending — requires running router + hive (`BASE=http://127.0.0.1:8080` + identity service). |
 
 ### Build + test results
 
@@ -341,9 +352,160 @@ These are intentional deferrals, not omissions. Each is documented either above 
 | `IdentityError` enum still has `Unreachable / TtlExceeded / SystemRejected / Timeout / ActionTimeout / Node / Json` variants | `sy_orchestrator::map_rpc_error_to_identity` constructs them locally from `RpcError` for downstream typing; `io_common::identity::IdentityError` in the io nodes is a separate enum with the same name. Encogerlo exigía migrar todos esos call sites. **SDK ya no las construye**, satisface el espíritu del doc. | Split into `IdentityRpcError` (deprecate) + `IdentityShmError` once io nodes adopt `RpcError` directly. |
 | `IdentitySystemRequest` / `IdentitySystemResult` structs still public in `identity.rs` | Used as return types by the custom dispatchers in `nodes/gov/ai-frontdesk-gov` and `nodes/ai/ai-generic` (`SharedRouterConnection::GovIdentityBridge`). | Migrate those 2 nodes to `Arc<RpcClient>`; then types can be removed. |
 | 5 diags not migrated: `blob_sync_diag`, `inventory_hold_diag`, `jetstream_envelope_diag`, `orch_system_diag`, `wf_nats_diag` | None matches the "1 RPC ephemeral" criterion: `BlobToolkit` multi-step workflow, consumer loops, NATS, mini-protocol dispatcher. None uses deleted helpers. | Per-diag: extend `BlobToolkit::publish_blob_and_confirm` to accept `&RpcClient`; declare profile with `system_update` channel for `orch_system_diag`. Tracked separately. |
-| 5 vault-lookup ephemeral connect anti-patterns: `sy_admin:820`, `sy_cognition:1594`, `io-slack:739`, `ai-generic:1682`, `ai-frontdesk-gov:1708` | `resolve_resource()` SDK helper requires `(&NodeSender, &mut NodeReceiver)`; each caller creates an ephemeral connect+drop per vault lookup. Not a deadlock, not a spoof; just spurious router announce/withdraw. | Add `VaultClient` (or `RpcClient::resolve_resource`) to SDK, then migrate the 5 sites. |
+| 7 vault-lookup ephemeral connect anti-patterns: `sy_admin:820`, `sy_cognition:1594`, `io-slack:739`, `ai-generic:1682`, `ai-frontdesk-gov:1708`, `sy_architect:6174`, `sy_architect:6249` (last two added by AF-P3) | `resolve_resource()` SDK helper requires `(&NodeSender, &mut NodeReceiver)`; each caller creates an ephemeral connect+drop per vault lookup. Not a deadlock, not a spoof; just spurious router announce/withdraw. | Add `VaultClient` (or `RpcClient::resolve_resource`) to SDK, then migrate the 7 sites. |
 | Go `RpcClient` equivalent | F4 decision: not needed. `sy-wf-rules` already has its own per-trace_id mux; `sy-opa-rules` has a separate forward goroutine; `sy-timer` is request/respond simple. No critical mass. | Re-evaluate only if a Go node grows the deadlock pattern. |
 | H4, H5 E2E (`scripts/node_teardown_completeness_e2e.sh`, identity E2E) | Need a live hive/router. | Run when CI / staging environment is available. |
+
+## Iteration 2 — Audit follow-up 2026-05-24
+
+External audit surfaced four issues after Blocks A–G closed. Severity-ordered:
+
+### AF-P1 — `sy_orchestrator` bypasses authorization on lifecycle/read actions (🔴 SECURITY)
+
+**Bug**: The allowlist `is_allowed_system_source_name` is applied inside an `if matches!(action, ...)` block ([sy_orchestrator.rs:1532-1547](src/bin/sy_orchestrator.rs#L1532-L1547)) that lists 13 protected actions. The dispatcher `match` further down ([sy_orchestrator.rs:1722-1747](src/bin/sy_orchestrator.rs#L1722-L1747)) **also** accepts and executes `START_NODE`, `RESTART_NODE`, `GET_RUNTIMES`, `LIST_NODES`, `GET_RUNTIME` — none of which goes through the allowlist. Any node routable to the orchestrator can manipulate lifecycle of other nodes. Pre-ORPC bug uncovered by the audit.
+
+**Fix (settled with dev)**: single source of truth.
+
+- New helper `fn protected_system_action_response(action: &str) -> Option<&'static str>` returning the `*_RESPONSE` name for every protected action (the 13 current + 5 missing = 18 total). `INVENTORY_REQUEST` returns `INVENTORY_RESPONSE` (existing asymmetry preserved).
+- `handle_system_message` replaces the current `if matches!(...) { match action { /* forbidden branches */ } }` block (≈115 lines) with:
+
+  ```rust
+  if let Some(response_name) = protected_system_action_response(action) {
+      if !is_allowed_system_source_name(state, msg.routing.src_l2_name.as_deref()) {
+          tracing::warn!(action, src_uuid = %msg.routing.src, "blocked");
+          let payload = forbidden_system_source_payload(msg, msg.routing.src_l2_name.as_deref());
+          let _ = send_system_action_response(sender, msg, response_name, payload).await;
+          return Ok(());
+      }
+  }
+  ```
+
+- Dispatcher `match action { ... }` (lines 1676-1764) stays intact.
+
+**Tests**: one regression test per newly-protected action (`START_NODE`, `RESTART_NODE`, `GET_RUNTIMES`, `LIST_NODES`, `GET_RUNTIME`) asserting that `src_l2_name=None` returns the `FORBIDDEN` payload via the correct `*_RESPONSE` name.
+
+- [x] **AF-P1.** Implemented. New helper `protected_system_action_response` covers 18 actions (the 13 pre-existing + 5 newly-gated: `START_NODE`, `RESTART_NODE`, `GET_RUNTIMES`, `LIST_NODES`, `GET_RUNTIME`). Tests added: `protected_system_action_response_covers_all_18_protected_actions`, `protected_system_action_response_returns_none_for_unknown_action`, `protected_system_action_response_gates_lifecycle_actions_added_by_af_p1`, `protected_actions_emit_forbidden_response_when_origin_is_unauthorized` (6 actions × FORBIDDEN payload + response_name assertions via `RpcTestHarness`). `sy_orchestrator` test count 83 → 90.
+
+### AF-P2a — `RpcClient::send_with_matcher` should fail-fast during reconnect (🟡 UX/timeout friction)
+
+**Bug**: `send_with_matcher` registers the pending waiter and then calls `NodeSender::send` ([rpc.rs:1043](crates/fluxbee_sdk/src/rpc.rs#L1043)). `NodeSender::send` only enqueues into the mpsc backing the connection manager ([split.rs:121](crates/fluxbee_sdk/src/split.rs#L121)) — it does **not** validate connection state. During a reconnect, the manager drains that queue ([node_client.rs:157](crates/fluxbee_sdk/src/node_client.rs#L157)) without sending. The RPC then times out (default 5s, often 30s for lifecycle) instead of failing with `Disconnected`.
+
+**Fix (settled with dev)**: strict fail-fast.
+
+- Expose `NodeSender::is_connected() -> bool` and `NodeSender::wait_connected()` as `pub` methods delegating to `ConnectionState` (already exists, just not exposed).
+- In `RpcClient::send_with_matcher`, before registering the pending entry:
+
+  ```rust
+  if !self.sender.is_connected() {
+      return Err(RpcError::Disconnected);
+  }
+  ```
+
+- After `self.sender.send(outgoing).await`, normalize `NodeError::Disconnected -> RpcError::Disconnected` (today it surfaces as `RpcError::Node(NodeError::Disconnected)` — change to a single error variant the caller can `match` cleanly).
+- Race window between check and send is acceptable (post-send catches it too).
+
+**Tests**: `send_with_matcher` against a harness whose sender is disconnected → `Err(RpcError::Disconnected)` immediately, pending map stays empty.
+
+- [x] **AF-P2a.** Implemented. `NodeSender::is_connected()` and `NodeSender::wait_connected()` exposed as `pub` in `split.rs`. `send_with_matcher` pre-checks `is_connected()` before registering the waiter (fails fast with `Disconnected`) and maps `NodeError::Disconnected` from the post-send path to `RpcError::Disconnected` so callers see a single variant. Test added: `send_with_matcher_fails_fast_when_sender_is_disconnected`.
+
+### AF-P2b — Response-only registry observational exemption must check `RouteTarget` (🟡 Latent semantic bug)
+
+**Bug**: `register_response_only` skips registering a success shape if it appears in `post_pending_rules` ([rpc.rs:973](crates/fluxbee_sdk/src/rpc.rs#L973)). But `post_pending_declares_exact` / `post_pending_declares_family` look only at the `RouteMatch`, not at the `RouteTarget`. With the orchestrator profile that has `AnyMsgOfType(SYSTEM_KIND) -> Command("system")`, **any** `(SYSTEM_KIND, *)` success shape gets quietly skipped from the registry — so a late correlated response after the stale TTL falls through to the `system` worker as if it were a new command.
+
+Today no profile actually triggers the failure (sy_admin's CONFIG_RESPONSE is Broadcast; orchestrator's broad rule is Command but no current `send_*_rpc` has its success shape match the `AnyMsgOfType(SYSTEM_KIND)` family AND survive past stale TTL). But the SDK is more permissive than the doc contract.
+
+**Fix (settled with dev)**:
+
+- Rename `post_pending_declares_exact` → `post_pending_declares_observational_exact` (idem `_family`).
+- Both methods must require `RouteTarget::Broadcast(_)` on the matched rule:
+
+  ```rust
+  fn post_pending_declares_observational_family(&self, msg_type: &str) -> bool {
+      self.profile.post_pending_rules.iter().any(|(rule, target)| {
+          matches!(rule, RouteMatch::AnyMsgOfType(t) if t == msg_type)
+              && matches!(target, RouteTarget::Broadcast(_))
+      })
+  }
+  ```
+
+**Tests**: (a) profile with `AnyMsgOfType(SYSTEM_KIND) -> Command("worker")` + `send_system_rpc`; inject a late correlated response after timeout/stale → count as `metric_unknown_responses`, **NOT** delivered to the worker. (b) profile with `Exact(SYSTEM_KIND, "CONFIG_RESPONSE") -> Broadcast("config")` + `send_system_rpc` whose success is `CONFIG_RESPONSE` → response is **broadcast** (observational exemption applies).
+
+- [x] **AF-P2b.** Implemented. `post_pending_declares_exact` / `post_pending_declares_family` renamed to `post_pending_declares_observational_exact` / `_observational_family`. Both now require `RouteTarget::Broadcast(_)` to grant the response-only registry exemption — `Command` targets no longer slip responses past the registry. Tests added: `post_pending_command_catch_all_does_not_exempt_response_only_registry` (broad Command rule → late response counted as `unknown_responses`, not delivered to worker), `post_pending_broadcast_rule_does_exempt_response_only_registry` (CONFIG_RESPONSE Broadcast rule → response fans out, no unknown count). SDK test count 137 → 140.
+
+### AF-P3 — Ephemeral connect inventory undercount in doc (🟢 Documentation)
+
+**Gap**: Block F table "Pattern 3" lists 5 vault-lookup ephemeral sites. Audit found 2 more in `sy_architect`:
+
+- [sy_architect.rs:6174](src/bin/sy_architect.rs#L6174) — vault Openai lookup, `name: "SY.architect"` + Ephemeral + `connect()` + `resolve_resource`.
+- [sy_architect.rs:6249](src/bin/sy_architect.rs#L6249) — vault Postgres messages_db lookup, same pattern.
+
+Total real: **7 sites**, not 5. Also: the 2 `RpcClient::connect_with_retry` ephemeral admin/status RPCs in `sy_architect` (lines 12943 and 13047, migrated in Block E) are a **different** category — they use the canonical abstraction one-shot per operation, which is acceptable for a node that only needs occasional outbound RPCs. They are not anti-patterns; they should be listed separately in the audit doc as "one-shot RpcClient ephemeral RPC (acceptable)".
+
+**Fix**: doc-only. Update the Pattern 3 table in Block F + the "What did NOT migrate" row.
+
+- [x] **AF-P3.** Updated Block F Pattern 3 table from 5 → 7 sites (added `sy_architect:6174` and `sy_architect:6249`), added separate "one-shot `RpcClient` ephemeral RPCs (acceptable)" subsection for `sy_architect:12943` and `sy_architect:13047`. Updated the matching row in "What did NOT migrate".
+
+### AF-P4 — Write-side disconnect must wake pending RPC waiters (🟡 Hidden timeout bug)
+
+**Bug**: AF-P2a fixed the pre-send disconnected path and receive-side disconnect drain, but a write-side socket failure in `tx_loop` only flipped `ConnectionState` to disconnected. If the reader task was aborted by the connection manager before it emitted a receiver error, `RpcClient::recv_loop` had no signal to call `drain_pending_waiters`; in-flight RPCs could still wait for timeout.
+
+**Fix**: `tx_loop` now receives the app-facing receiver channel and sends `Err(NodeError::Io(_))` when `write_frame` fails. `RpcClient::recv_loop` already treats `Io(_)` as connection loss, so all pending waiters complete with `RpcError::Disconnected`.
+
+**Tests**: `tx_loop_write_error_notifies_receiver`.
+
+- [x] **AF-P4.** Implemented.
+
+### AF-P5 — `ConnectionState::wait_connected` must not lose reconnect notifications (🟡 Async race)
+
+**Bug**: `wait_connected()` checked the atomic state and then awaited `Notify::notified()`. A reconnect between those two operations could be missed because `notify_waiters()` does not store a permit for future waiters.
+
+**Fix**: create and enable the `Notified` future before checking `is_connected()`, then await only if the state is still disconnected.
+
+**Tests**: `wait_connected_returns_after_reconnect_signal`.
+
+- [x] **AF-P5.** Implemented.
+
+### AF-P6 — Observational family rules must exempt exact response shapes (🟢 SDK semantics)
+
+**Bug**: AF-P2b required `RouteTarget::Broadcast(_)`, but exact success shapes only checked exact/one-of post-pending rules. A profile with `AnyMsgOfType("query_response") -> Broadcast("query")` plus an RPC success `Exact("query_response", "QUERY_DONE")` still registered that exact shape in the response-only registry and could drop valid observational events.
+
+**Fix**: `post_pending_declares_observational_exact` now treats a broadcast `AnyMsgOfType` rule for the same `msg_type` as an observational exemption for exact success shapes.
+
+**Tests**: `response_only_skips_exact_success_declared_by_observational_family`.
+
+- [x] **AF-P6.** Implemented.
+
+### AF-P7 — Failed sends must not pollute the response-only registry (🟢 Cleanup)
+
+**Bug**: `send_with_matcher` registered success shapes in `response_only` before `NodeSender::send`. If the send failed, the pending waiter was removed but the response-only shape stayed behind.
+
+**Fix**: register response-only shapes only after `sender.send(outgoing).await` succeeds. The active pending waiter is already installed before send, so correlated immediate responses are still handled by the pending table.
+
+**Tests**: `send_failure_does_not_register_response_only_shape`.
+
+- [x] **AF-P7.** Implemented.
+
+### Iteration 3 verification
+
+- `cargo test -p fluxbee-sdk -- --nocapture`: 144/144 passed.
+- `cargo test --bin sy_orchestrator -- --nocapture`: 90/90 passed.
+- `git diff --check`: passed.
+- `rustfmt --check --edition 2021 crates/fluxbee_sdk/src/node_client.rs crates/fluxbee_sdk/src/split.rs crates/fluxbee_sdk/src/rpc.rs src/bin/sy_orchestrator.rs`: passed.
+- `cargo fmt --check`: still reports pre-existing formatting diffs in `nodes/ai/ai-generic/src/bin/ai_node_runner.rs` only; not touched by ORPC work.
+
+### Iteration 2 execution order
+
+1. AF-P1 (security, immediate).
+2. AF-P2a (UX, short fix).
+3. AF-P2b (latent bug, preventive).
+4. AF-P3 (doc, trivial).
+
+### Iteration 3 execution order
+
+1. AF-P4 (write-side disconnect waiter drain).
+2. AF-P5 (`wait_connected` notification race).
+3. AF-P6 (exact success under observational family).
+4. AF-P7 (failed-send response-only cleanup).
 
 ## Task list v1 — historical
 

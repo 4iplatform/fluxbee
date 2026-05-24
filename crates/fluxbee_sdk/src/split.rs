@@ -39,10 +39,13 @@ impl ConnectionState {
 
     pub(crate) async fn wait_connected(&self) {
         loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.is_connected() {
                 return;
             }
-            self.notify.notified().await;
+            notified.await;
         }
     }
 }
@@ -158,6 +161,23 @@ impl NodeSender {
     pub fn full_name(&self) -> Arc<str> {
         self.info.full_name()
     }
+
+    /// Whether the SDK currently considers the connection up. Flips to
+    /// `false` when the recv loop or a write sees a disconnect; flips back
+    /// to `true` after the connection manager finishes reconnecting.
+    ///
+    /// Callers that want to fail fast on disconnect (instead of enqueuing
+    /// into the SDK's internal buffer and silently waiting for a reconnect
+    /// or a timeout) should check this before any send-and-await pattern.
+    pub fn is_connected(&self) -> bool {
+        self.info.state.is_connected()
+    }
+
+    /// Suspend the current task until [`Self::is_connected`] would return
+    /// `true`. No timeout; pair with `tokio::time::timeout` if you need one.
+    pub async fn wait_connected(&self) {
+        self.info.state.wait_connected().await;
+    }
 }
 
 impl NodeReceiver {
@@ -248,5 +268,24 @@ mod tests {
         assert_eq!(info.full_name().as_ref(), "SY.test@new");
         assert_eq!(info.vpn_id(), 9);
         assert_eq!(info.router_name().as_ref(), "router-new");
+    }
+
+    #[tokio::test]
+    async fn wait_connected_returns_after_reconnect_signal() {
+        let state = Arc::new(ConnectionState::new_connected());
+        state.set_connected(false);
+
+        let waiter_state = Arc::clone(&state);
+        let waiter = tokio::spawn(async move {
+            waiter_state.wait_connected().await;
+        });
+
+        tokio::task::yield_now().await;
+        state.set_connected(true);
+
+        time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("wait_connected timed out")
+            .expect("wait task panicked");
     }
 }

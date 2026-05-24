@@ -975,19 +975,19 @@ impl RpcClient {
         for rule in &matcher.success {
             match rule {
                 RouteMatch::Exact { msg_type, msg } => {
-                    if !self.post_pending_declares_exact(msg_type, msg) {
+                    if !self.post_pending_declares_observational_exact(msg_type, msg) {
                         registry.insert(rule.clone());
                     }
                 }
                 RouteMatch::OneOf { msg_type, msgs } => {
                     for msg in msgs {
-                        if !self.post_pending_declares_exact(msg_type, msg) {
+                        if !self.post_pending_declares_observational_exact(msg_type, msg) {
                             registry.insert(RouteMatch::exact(msg_type.clone(), msg.clone()));
                         }
                     }
                 }
                 RouteMatch::AnyMsgOfType(msg_type) => {
-                    if !self.post_pending_declares_family(msg_type) {
+                    if !self.post_pending_declares_observational_family(msg_type) {
                         registry.insert(rule.clone());
                     }
                 }
@@ -1000,28 +1000,46 @@ impl RpcClient {
         }
     }
 
-    fn post_pending_declares_exact(&self, msg_type: &str, msg: &str) -> bool {
+    /// AF-P2b: a success shape is observational-exempt from the response-only
+    /// registry **only** when the matching post_pending rule routes to
+    /// `RouteTarget::Broadcast(_)`. A rule that routes to `Command` (e.g.
+    /// the orchestrator's broad `AnyMsgOfType(SYSTEM_KIND) -> Command("system")`
+    /// catch-all) must NOT exempt response shapes — otherwise a late
+    /// correlated response after the stale TTL would slip through to a
+    /// worker as if it were a brand-new command.
+    fn post_pending_declares_observational_exact(&self, msg_type: &str, msg: &str) -> bool {
         self.profile
             .post_pending_rules
             .iter()
-            .any(|(rule, _)| match rule {
-                RouteMatch::Exact {
-                    msg_type: rule_type,
-                    msg: rule_msg,
-                } => rule_type == msg_type && rule_msg == msg,
-                RouteMatch::OneOf {
-                    msg_type: rule_type,
-                    msgs,
-                } => rule_type == msg_type && msgs.iter().any(|rule_msg| rule_msg == msg),
-                RouteMatch::AnyMsgOfType(_) | RouteMatch::Any => false,
+            .any(|(rule, target)| {
+                if !matches!(target, RouteTarget::Broadcast(_)) {
+                    return false;
+                }
+                match rule {
+                    RouteMatch::Exact {
+                        msg_type: rule_type,
+                        msg: rule_msg,
+                    } => rule_type == msg_type && rule_msg == msg,
+                    RouteMatch::OneOf {
+                        msg_type: rule_type,
+                        msgs,
+                    } => rule_type == msg_type && msgs.iter().any(|rule_msg| rule_msg == msg),
+                    RouteMatch::AnyMsgOfType(rule_type) => rule_type == msg_type,
+                    RouteMatch::Any => false,
+                }
             })
     }
 
-    fn post_pending_declares_family(&self, msg_type: &str) -> bool {
+    /// AF-P2b: same as `post_pending_declares_observational_exact` but for
+    /// `AnyMsgOfType` matchers. Only exempts if the target is broadcast.
+    fn post_pending_declares_observational_family(&self, msg_type: &str) -> bool {
         self.profile
             .post_pending_rules
             .iter()
-            .any(|(rule, _)| matches!(rule, RouteMatch::AnyMsgOfType(rule_type) if rule_type == msg_type))
+            .any(|(rule, target)| {
+                matches!(rule, RouteMatch::AnyMsgOfType(rule_type) if rule_type == msg_type)
+                    && matches!(target, RouteTarget::Broadcast(_))
+            })
     }
 
     pub async fn send_with_matcher(
@@ -1031,6 +1049,15 @@ impl RpcClient {
         labels: RpcRequestLabels,
         timeout: Duration,
     ) -> Result<Message, RpcError> {
+        // AF-P2a: fail fast if the router connection is down. Otherwise the
+        // SDK enqueues into its internal mpsc, the connection manager drains
+        // it without sending, and we'd wait the full `timeout` for a reply
+        // that can never arrive. Returning `Disconnected` lets the caller
+        // decide whether to retry, log, or surface immediately.
+        if !self.sender.is_connected() {
+            return Err(RpcError::Disconnected);
+        }
+
         let timeout = default_rpc_timeout(timeout);
         if outgoing.routing.trace_id.trim().is_empty() {
             outgoing.routing.trace_id = Uuid::new_v4().to_string();
@@ -1056,12 +1083,16 @@ impl RpcClient {
                 },
             );
         }
-        self.register_response_only(&matcher).await;
-
         if let Err(err) = self.sender.send(outgoing).await {
             self.pending.lock().await.remove(&trace_id);
-            return Err(err.into());
+            // AF-P2a: normalize disconnect to a single `RpcError` variant so
+            // callers can `match` without unwrapping `RpcError::Node(...)`.
+            return Err(match err {
+                NodeError::Disconnected => RpcError::Disconnected,
+                other => other.into(),
+            });
         }
+        self.register_response_only(&matcher).await;
 
         match time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
@@ -2265,6 +2296,55 @@ mod tests {
         assert_eq!(client.metric_unknown_responses(), 0);
     }
 
+    #[tokio::test]
+    async fn response_only_skips_exact_success_declared_by_observational_family() {
+        let profile = OperationalRouteProfile::builder()
+            .broadcast_channel("query")
+            .post_pending_rule(
+                RouteMatch::any_msg_type("query_response"),
+                RouteTarget::Broadcast("query"),
+            )
+            .build()
+            .unwrap();
+        let (client, mut harness) = RpcTestHarness::new("SY.test@hive", profile);
+        let mut sub = client.subscribe("query").unwrap();
+        let matcher = PendingMatcher::new(
+            vec![RouteMatch::exact("query_response", "QUERY_DONE")],
+            vec![],
+            vec![],
+        );
+        let c = Arc::clone(&client);
+        let waiter = tokio::spawn(async move {
+            c.send_with_matcher(
+                make_outgoing("query", "DO_QUERY"),
+                matcher,
+                RpcRequestLabels::new("SY.target@hive", "DO_QUERY", "QUERY_DONE"),
+                Duration::from_millis(50),
+            )
+            .await
+        });
+        let _ = harness.next_outgoing().await.unwrap();
+        let err = waiter.await.unwrap().unwrap_err();
+        assert!(matches!(err, RpcError::Timeout { .. }));
+
+        harness
+            .inject(make_loose(
+                "unrelated-trace",
+                "query_response",
+                "QUERY_DONE",
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        let routed = time::timeout(Duration::from_secs(1), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(routed.meta.msg_type, "query_response");
+        assert_eq!(routed.meta.msg.as_deref(), Some("QUERY_DONE"));
+        assert_eq!(client.metric_unknown_responses(), 0);
+    }
+
     // ---- Lifecycle ----
 
     #[tokio::test]
@@ -2539,5 +2619,170 @@ mod tests {
             }
             other => panic!("expected ReceiverAlreadyTaken, got {other:?}"),
         }
+    }
+
+    /// AF-P2b: an `AnyMsgOfType` post_pending rule routed to `Command`
+    /// must NOT exempt success shapes from the response-only registry.
+    /// Otherwise a late correlated response after stale TTL falls through
+    /// to the worker as if it were a brand-new command.
+    #[tokio::test]
+    async fn post_pending_command_catch_all_does_not_exempt_response_only_registry() {
+        let profile = OperationalRouteProfile::builder()
+            .command_channel("worker")
+            .post_pending_rule(
+                RouteMatch::any_msg_type(SYSTEM_KIND),
+                RouteTarget::Command("worker"),
+            )
+            .build()
+            .unwrap();
+        let (client, harness) = RpcTestHarness::new("SY.test@hive", profile);
+        let mut worker_rx = client.take_command_receiver("worker").await.unwrap();
+
+        // Fire an RPC and let it time out. After timeout the stale TTL
+        // window opens, then expires; here we just immediately inject the
+        // late response under a fresh trace_id — what matters is the
+        // response shape matches what `send_system_rpc` registered.
+        let c = Arc::clone(&client);
+        let waiter = tokio::spawn(async move {
+            c.send_system_rpc(SystemRpcRequest {
+                target: "SY.t@h",
+                request_msg: "REQ",
+                response_msg: "RESP",
+                payload: json!({}),
+                timeout: Duration::from_millis(50),
+            })
+            .await
+        });
+        let _ = waiter.await;
+
+        // Different trace_id, registered response shape. Without AF-P2b the
+        // broad `AnyMsgOfType(SYSTEM_KIND) -> Command("worker")` would
+        // swallow this; with AF-P2b the registry catches it first.
+        harness
+            .inject(make_loose("orphan-trace", SYSTEM_KIND, "RESP", json!({})))
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(client.metric_unknown_responses(), 1);
+        assert!(worker_rx.try_recv().is_none());
+    }
+
+    /// AF-P2b mirror: a `Broadcast` post_pending rule (real observational
+    /// stream) DOES exempt success shapes — the response fans out to
+    /// subscribers, not the response-only drop.
+    #[tokio::test]
+    async fn post_pending_broadcast_rule_does_exempt_response_only_registry() {
+        let profile = OperationalRouteProfile::builder()
+            .broadcast_channel("config_response")
+            .post_pending_rule(
+                RouteMatch::exact(SYSTEM_KIND, "CONFIG_RESPONSE"),
+                RouteTarget::Broadcast("config_response"),
+            )
+            .build()
+            .unwrap();
+        let (client, harness) = RpcTestHarness::new("SY.test@hive", profile);
+        let mut subscriber = client.subscribe("config_response").unwrap();
+
+        // Send and complete the RPC so the response shape is registered.
+        let c = Arc::clone(&client);
+        let waiter = tokio::spawn(async move {
+            c.send_system_rpc(SystemRpcRequest {
+                target: "SY.t@h",
+                request_msg: "REQ",
+                response_msg: "CONFIG_RESPONSE",
+                payload: json!({}),
+                timeout: Duration::from_millis(50),
+            })
+            .await
+        });
+        let _ = waiter.await;
+
+        // Orphan CONFIG_RESPONSE arrives. With AF-P2b's observational
+        // exemption (broadcast target), it must fan out to the subscriber,
+        // NOT count as unknown_responses.
+        harness
+            .inject(make_loose(
+                "orphan-trace",
+                SYSTEM_KIND,
+                "CONFIG_RESPONSE",
+                json!({"v": 1}),
+            ))
+            .await
+            .unwrap();
+        let routed = time::timeout(Duration::from_secs(1), subscriber.recv())
+            .await
+            .expect("subscriber timed out")
+            .expect("subscriber recv");
+        assert_eq!(routed.meta.msg.as_deref(), Some("CONFIG_RESPONSE"));
+        assert_eq!(client.metric_unknown_responses(), 0);
+    }
+
+    /// AF-P2a: an RPC sent while the SDK marks the connection as down must
+    /// fail fast with `Disconnected`, not register a waiter and time out.
+    /// We trip the disconnect flag by closing the inbound channel inside
+    /// the harness: the recv loop sees `Disconnected`, calls
+    /// `drain_pending_waiters`, and flips `is_connected()` to false via the
+    /// `NodeReceiver::recv()` Disconnected path.
+    #[tokio::test]
+    async fn send_with_matcher_fails_fast_when_sender_is_disconnected() {
+        let (client, harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        // Force the SDK to observe a disconnect: dropping the harness's
+        // inbound transmitter closes the receiver, the recv loop errors out
+        // with `Disconnected`, and `NodeReceiver::recv` flips the shared
+        // ConnectionState to disconnected.
+        drop(harness);
+        // Give the recv loop a tick to observe the closed channel.
+        sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            !client.sender_snapshot().is_connected(),
+            "sender should report disconnected after recv loop drained"
+        );
+        let err = client
+            .send_system_rpc(SystemRpcRequest {
+                target: "SY.target@hive",
+                request_msg: "REQ",
+                response_msg: "RESP",
+                payload: json!({}),
+                timeout: Duration::from_secs(10),
+            })
+            .await
+            .expect_err("expected RpcError::Disconnected");
+        assert!(matches!(err, RpcError::Disconnected), "got {err:?}");
+        // Pending map must stay clean — no waiter was registered.
+        assert!(client.pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_failure_does_not_register_response_only_shape() {
+        let (outbound_tx, outbound_rx) = mpsc::channel(1);
+        drop(outbound_rx);
+        let (_inbound_tx, inbound_rx) = mpsc::channel(1);
+        let state = Arc::new(ConnectionState::new_connected());
+        let info = Arc::new(ConnectionInfo::new(
+            "test-uuid".to_string(),
+            "SY.test@hive".to_string(),
+            7,
+            "router-test".to_string(),
+            state,
+        ));
+        let sender = NodeSender::new(outbound_tx, Arc::clone(&info));
+        let receiver = NodeReceiver::new(inbound_rx, info);
+        let client = RpcClient::from_test_channels(sender, receiver, simple_profile());
+
+        let err = client
+            .send_system_rpc(SystemRpcRequest {
+                target: "SY.target@hive",
+                request_msg: "REQ",
+                response_msg: "RESP",
+                payload: json!({}),
+                timeout: Duration::from_secs(10),
+            })
+            .await
+            .expect_err("expected send failure");
+
+        assert!(matches!(err, RpcError::Disconnected), "got {err:?}");
+        assert!(client.pending.lock().await.is_empty());
+        assert!(client.response_only.lock().await.is_empty());
     }
 }
