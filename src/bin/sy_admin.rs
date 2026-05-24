@@ -13,7 +13,7 @@ use std::future;
 use tar::{Archive, Builder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -27,16 +27,17 @@ use fluxbee_ai_sdk::{
 use fluxbee_sdk::nats::{NatsClient, NatsRequestEnvelope, NatsResponseEnvelope};
 use fluxbee_sdk::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, VaultSecretChangedPayload,
-    VaultSecretInterest, MSG_CONFIG_CHANGED, MSG_NODE_STATUS_GET, MSG_VAULT_SECRET_CHANGED,
-    SCOPE_GLOBAL, SYSTEM_KIND,
+    VaultSecretInterest, MSG_CONFIG_CHANGED, MSG_NODE_STATUS_GET, MSG_TTL_EXCEEDED,
+    MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    build_node_config_response_message, classify_admin_action, classify_system_message, connect,
-    derive_action_outcome, try_handle_default_node_status, ClientConfig, NodeConfig, NodeReceiver,
-    NodeSender, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET, MSG_VAULT_GET_METADATA,
-    MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE, MSG_VAULT_LIST,
-    MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE, MSG_VAULT_ROLLBACK,
-    MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
+    build_node_config_response_message, classify_admin_action, classify_system_message,
+    derive_action_outcome, try_handle_default_node_status, ClientConfig, NodeConfig,
+    OperationalRouteProfile, PendingMatcher, RouteMatch, RouteTarget, RpcClient,
+    RpcCommandReceiver, RpcRequestLabels, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE,
+    MSG_VAULT_GET, MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE,
+    MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE,
+    MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
     NODE_SECRET_REDACTION_TOKEN,
 };
 use json_router::runtime_manifest::{
@@ -295,177 +296,46 @@ struct PublishRuntimePackageRequest {
     update_to: Vec<String>,
 }
 
-struct AdminRouterClient {
-    sender: RwLock<NodeSender>,
-    pending_admin: Mutex<HashMap<String, oneshot::Sender<Message>>>,
-    system_tx: broadcast::Sender<Message>,
-    query_tx: broadcast::Sender<Message>,
-    internal_admin_tx: broadcast::Sender<Message>,
-    system_command_tx: broadcast::Sender<Message>,
-}
+const RPC_CH_STATUS_GET: &str = "status_get";
+const RPC_CH_SYSTEM_COMMAND: &str = "system_command";
+const RPC_CH_INTERNAL_ADMIN: &str = "internal_admin";
+const RPC_BC_CONFIG_RESPONSE: &str = "config_response";
+const RPC_BC_QUERY: &str = "query";
+const MSG_CONFIG_GET: &str = "CONFIG_GET";
+const MSG_CONFIG_SET: &str = "CONFIG_SET";
+const MSG_CONFIG_RESPONSE: &str = "CONFIG_RESPONSE";
 
-impl AdminRouterClient {
-    fn new(sender: NodeSender) -> Self {
-        let (system_tx, _) = broadcast::channel(256);
-        let (query_tx, _) = broadcast::channel(256);
-        let (internal_admin_tx, _) = broadcast::channel(256);
-        let (system_command_tx, _) = broadcast::channel(256);
-        Self {
-            sender: RwLock::new(sender),
-            pending_admin: Mutex::new(HashMap::new()),
-            system_tx,
-            query_tx,
-            internal_admin_tx,
-            system_command_tx,
-        }
-    }
-
-    async fn connect_with_retry(
-        config: NodeConfig,
-        delay: Duration,
-    ) -> Result<Arc<Self>, fluxbee_sdk::NodeError> {
-        let (sender, receiver) = Self::connect_once_with_retry(&config, delay).await?;
-        let client = Arc::new(Self::new(sender));
-        client.start(receiver);
-        Ok(client)
-    }
-
-    async fn connect_once_with_retry(
-        config: &NodeConfig,
-        delay: Duration,
-    ) -> Result<(NodeSender, NodeReceiver), fluxbee_sdk::NodeError> {
-        loop {
-            match connect(config).await {
-                Ok(result) => return Ok(result),
-                Err(err) => {
-                    tracing::warn!("connect failed: {err}");
-                    time::sleep(delay).await;
-                }
-            }
-        }
-    }
-
-    fn start(self: &Arc<Self>, receiver: NodeReceiver) {
-        let client = Arc::clone(self);
-        tokio::spawn(async move {
-            client.recv_loop(receiver).await;
-        });
-    }
-
-    async fn recv_loop(self: Arc<Self>, receiver: NodeReceiver) {
-        let mut receiver = receiver;
-        loop {
-            match receiver.recv().await {
-                Ok(msg) => self.dispatch(msg).await,
-                Err(err) => {
-                    tracing::warn!(error = %err, "router connection interrupted; reconnect is handled internally");
-                    self.drain_pending_waiters().await;
-                    // The SDK's connection_manager_loop reconnects transparently and resumes
-                    // sending to the same NodeReceiver channel. Creating a second connection
-                    // here with the same persistent UUID would register a competing node that
-                    // steals messages but has no dispatch loop, causing ADMIN_COMMAND timeouts.
-                }
-            }
-        }
-    }
-
-    async fn sender_snapshot(&self) -> NodeSender {
-        self.sender.read().await.clone()
-    }
-
-    async fn dispatch(&self, msg: Message) {
-        tracing::info!(
-            trace_id = %msg.routing.trace_id,
-            src = %msg.routing.src,
-            dst = ?msg.routing.dst,
-            msg_type = %msg.meta.msg_type,
-            msg = msg.meta.msg.as_deref().unwrap_or(""),
-            action = msg.meta.action.as_deref().unwrap_or(""),
-            "sy.admin dispatch: received router message"
-        );
-        if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_NODE_STATUS_GET)
-        {
-            let sender = self.sender.read().await.clone();
-            let _ = try_handle_default_node_status(&sender, &msg).await;
-            return;
-        }
-        if msg.meta.msg_type == SYSTEM_KIND
-            && matches!(
-                msg.meta.msg.as_deref(),
-                Some("CONFIG_GET" | "CONFIG_SET" | MSG_VAULT_SECRET_CHANGED)
-            )
-        {
-            tracing::info!(
-                trace_id = %msg.routing.trace_id,
-                msg = ?msg.meta.msg,
-                action = ?msg.meta.action,
-                "sy.admin dispatch: forwarding system command to system_command_tx"
-            );
-            let _ = self.system_command_tx.send(msg);
-            return;
-        }
-        if msg.meta.msg_type == "admin" && msg.meta.msg.as_deref() == Some(MSG_ADMIN_COMMAND) {
-            let _ = self.internal_admin_tx.send(msg);
-            return;
-        }
-        if matches!(
-            msg.meta.msg_type.as_str(),
-            "admin" | SYSTEM_KIND | "command" | "command_response" | "query" | "query_response"
-        ) {
-            let mut pending = self.pending_admin.lock().await;
-            if let Some(tx) = pending.remove(&msg.routing.trace_id) {
-                let _ = tx.send(msg);
-                return;
-            }
-            tracing::debug!(
-                trace_id = %msg.routing.trace_id,
-                msg_type = %msg.meta.msg_type,
-                msg = ?msg.meta.msg,
-                action = ?msg.meta.action,
-                src = %msg.routing.src,
-                dst = ?msg.routing.dst,
-                "sy.admin saw admin/system message without pending waiter"
-            );
-        }
-        if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some("CONFIG_RESPONSE") {
-            let _ = self.system_tx.send(msg);
-            return;
-        }
-        if msg.meta.msg_type == "query_response" {
-            let _ = self.query_tx.send(msg);
-        }
-    }
-
-    async fn enqueue_admin_waiter(&self, trace_id: String, tx: oneshot::Sender<Message>) {
-        let mut pending = self.pending_admin.lock().await;
-        pending.insert(trace_id, tx);
-    }
-
-    async fn drop_admin_waiter(&self, trace_id: &str) {
-        let mut pending = self.pending_admin.lock().await;
-        pending.remove(trace_id);
-    }
-
-    async fn drain_pending_waiters(&self) {
-        let mut pending = self.pending_admin.lock().await;
-        pending.clear();
-    }
-
-    fn subscribe_system(&self) -> broadcast::Receiver<Message> {
-        self.system_tx.subscribe()
-    }
-
-    fn subscribe_query(&self) -> broadcast::Receiver<Message> {
-        self.query_tx.subscribe()
-    }
-
-    fn subscribe_internal_admin(&self) -> broadcast::Receiver<Message> {
-        self.internal_admin_tx.subscribe()
-    }
-
-    fn subscribe_system_commands(&self) -> broadcast::Receiver<Message> {
-        self.system_command_tx.subscribe()
-    }
+fn build_admin_rpc_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::RpcError> {
+    OperationalRouteProfile::builder()
+        .command_channel(RPC_CH_STATUS_GET)
+        .command_channel(RPC_CH_SYSTEM_COMMAND)
+        .command_channel(RPC_CH_INTERNAL_ADMIN)
+        .broadcast_channel(RPC_BC_CONFIG_RESPONSE)
+        .broadcast_channel(RPC_BC_QUERY)
+        .pre_pending_rule(
+            RouteMatch::exact(SYSTEM_KIND, MSG_NODE_STATUS_GET),
+            RouteTarget::Command(RPC_CH_STATUS_GET),
+        )
+        .pre_pending_rule(
+            RouteMatch::one_of(
+                SYSTEM_KIND,
+                [MSG_CONFIG_GET, MSG_CONFIG_SET, MSG_VAULT_SECRET_CHANGED],
+            ),
+            RouteTarget::Command(RPC_CH_SYSTEM_COMMAND),
+        )
+        .pre_pending_rule(
+            RouteMatch::exact("admin", MSG_ADMIN_COMMAND),
+            RouteTarget::Command(RPC_CH_INTERNAL_ADMIN),
+        )
+        .post_pending_rule(
+            RouteMatch::exact(SYSTEM_KIND, MSG_CONFIG_RESPONSE),
+            RouteTarget::Broadcast(RPC_BC_CONFIG_RESPONSE),
+        )
+        .post_pending_rule(
+            RouteMatch::any_msg_type("query_response"),
+            RouteTarget::Broadcast(RPC_BC_QUERY),
+        )
+        .build()
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -600,12 +470,14 @@ async fn main() -> Result<(), AdminError> {
         version: "1.0".to_string(),
     };
     let client_config = ClientConfig::new(node_config.clone());
-    let router_client = AdminRouterClient::connect_with_retry(node_config, Duration::from_secs(1))
-        .await
-        .map_err(|err| {
-            tracing::error!("router client connect failed: {err}");
-            err
-        })?;
+    let rpc_profile = build_admin_rpc_profile()?;
+    let router_client =
+        RpcClient::connect_with_retry(node_config, Duration::from_secs(1), rpc_profile)
+            .await
+            .map_err(|err| {
+                tracing::error!("router client connect failed: {err}");
+                err
+            })?;
 
     let (broadcast_tx, broadcast_rx) = mpsc::unbounded_channel::<BroadcastRequest>();
     let http_tx = broadcast_tx.clone();
@@ -658,14 +530,26 @@ async fn main() -> Result<(), AdminError> {
         run_broadcast_loop(broadcast_rx, loop_client).await;
     });
 
+    let status_client = router_client.clone();
+    let status_rx = router_client
+        .take_command_receiver(RPC_CH_STATUS_GET)
+        .await?;
+    tokio::spawn(async move {
+        run_status_get_loop(status_client, status_rx).await;
+    });
+
     let internal_client = router_client.clone();
-    let internal_rx = router_client.subscribe_internal_admin();
+    let internal_rx = router_client
+        .take_command_receiver(RPC_CH_INTERNAL_ADMIN)
+        .await?;
     tokio::spawn(async move {
         run_internal_admin_loop(internal_ctx, internal_client, internal_rx).await;
     });
 
     let system_client = router_client.clone();
-    let system_rx = router_client.subscribe_system_commands();
+    let system_rx = router_client
+        .take_command_receiver(RPC_CH_SYSTEM_COMMAND)
+        .await?;
     tokio::spawn(async move {
         run_system_command_loop(system_ctx, system_client, system_rx).await;
     });
@@ -720,7 +604,7 @@ struct WfRulesRequest {
 
 async fn run_broadcast_loop(
     mut rx: mpsc::UnboundedReceiver<BroadcastRequest>,
-    client: Arc<AdminRouterClient>,
+    client: Arc<RpcClient>,
 ) {
     while let Some(req) = rx.recv().await {
         let result = match req {
@@ -1775,7 +1659,7 @@ fn next_config_changed_version(
 }
 
 async fn broadcast_config_changed(
-    client: &AdminRouterClient,
+    client: &RpcClient,
     subsystem: &str,
     action: Option<String>,
     auto_apply: Option<bool>,
@@ -1783,7 +1667,7 @@ async fn broadcast_config_changed(
     config: serde_json::Value,
     target_hive: Option<String>,
 ) -> Result<(), AdminError> {
-    let sender = client.sender_snapshot().await;
+    let sender = client.sender_snapshot();
     let dst = match target_hive {
         Some(hive) => Destination::Unicast(format!("SY.opa.rules@{}", hive)),
         None => Destination::Broadcast,
@@ -1871,53 +1755,40 @@ struct InternalAdminCommandPayload {
 
 async fn run_internal_admin_loop(
     ctx: AdminContext,
-    client: Arc<AdminRouterClient>,
-    mut rx: broadcast::Receiver<Message>,
+    client: Arc<RpcClient>,
+    mut rx: RpcCommandReceiver,
 ) {
-    loop {
-        match rx.recv().await {
-            Ok(msg) => {
-                if let Err(err) = handle_internal_admin_command(&ctx, &client, &msg).await {
-                    tracing::warn!(error = %err, "internal admin command handling failed");
-                }
-            }
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                tracing::warn!(
-                    skipped = skipped,
-                    "internal admin loop lagged; dropping stale commands"
-                );
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
+    while let Some(msg) = rx.recv().await {
+        if let Err(err) = handle_internal_admin_command(&ctx, &client, &msg).await {
+            tracing::warn!(error = %err, "internal admin command handling failed");
         }
     }
 }
 
 async fn run_system_command_loop(
     ctx: AdminContext,
-    client: Arc<AdminRouterClient>,
-    mut rx: broadcast::Receiver<Message>,
+    client: Arc<RpcClient>,
+    mut rx: RpcCommandReceiver,
 ) {
-    loop {
-        match rx.recv().await {
-            Ok(msg) => {
-                if let Err(err) = handle_system_command(&ctx, &client, &msg).await {
-                    tracing::warn!(error = %err, "system command handling failed");
-                }
-            }
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                tracing::warn!(
-                    skipped = skipped,
-                    "system command loop lagged; dropping stale commands"
-                );
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
+    while let Some(msg) = rx.recv().await {
+        if let Err(err) = handle_system_command(&ctx, &client, &msg).await {
+            tracing::warn!(error = %err, "system command handling failed");
+        }
+    }
+}
+
+async fn run_status_get_loop(client: Arc<RpcClient>, mut rx: RpcCommandReceiver) {
+    while let Some(msg) = rx.recv().await {
+        let sender = client.sender_snapshot();
+        if let Err(err) = try_handle_default_node_status(&sender, &msg).await {
+            tracing::warn!(error = %err, "default node status handling failed");
         }
     }
 }
 
 struct AdminExecutorStepTool {
     ctx: AdminContext,
-    client: Arc<AdminRouterClient>,
+    client: Arc<RpcClient>,
     step: AdminExecutorPlanStep,
     definition: FunctionToolDefinition,
 }
@@ -1963,7 +1834,7 @@ impl FunctionTool for AdminExecutorStepTool {
 
 struct AdminExecutorHelpTool {
     ctx: AdminContext,
-    client: Arc<AdminRouterClient>,
+    client: Arc<RpcClient>,
     step: AdminExecutorPlanStep,
     definition: FunctionToolDefinition,
 }
@@ -2324,7 +2195,7 @@ fn build_executor_step_events_from_result(
 
 async fn execute_admin_executor_step_fallback(
     ctx: &AdminContext,
-    client: &Arc<AdminRouterClient>,
+    client: &Arc<RpcClient>,
     execution_id: &str,
     step_index: usize,
     step: &AdminExecutorPlanStep,
@@ -2501,7 +2372,7 @@ async fn execute_admin_executor_step_fallback(
 
 async fn execute_admin_executor_plan(
     ctx: &AdminContext,
-    client: &Arc<AdminRouterClient>,
+    client: &Arc<RpcClient>,
     request: &AdminExecutorRunRequest,
 ) -> Result<serde_json::Value, AdminError> {
     validate_executor_plan(&request.plan).map_err(|detail| -> AdminError { detail.into() })?;
@@ -2692,7 +2563,7 @@ async fn execute_admin_executor_plan(
 
 async fn handle_system_command(
     ctx: &AdminContext,
-    client: &Arc<AdminRouterClient>,
+    client: &Arc<RpcClient>,
     msg: &Message,
 ) -> Result<(), AdminError> {
     if msg.meta.msg_type != SYSTEM_KIND {
@@ -2701,7 +2572,7 @@ async fn handle_system_command(
     let Some(command) = msg.meta.msg.as_deref() else {
         return Ok(());
     };
-    let sender = client.sender_snapshot().await;
+    let sender = client.sender_snapshot();
     match command {
         MSG_VAULT_SECRET_CHANGED => {
             handle_vault_secret_changed_admin(ctx, msg).await;
@@ -2784,7 +2655,7 @@ async fn handle_vault_secret_changed_admin(ctx: &AdminContext, msg: &Message) {
 
 async fn handle_internal_admin_command(
     ctx: &AdminContext,
-    client: &Arc<AdminRouterClient>,
+    client: &Arc<RpcClient>,
     msg: &Message,
 ) -> Result<(), AdminError> {
     if msg.meta.msg_type != "admin" || msg.meta.msg.as_deref() != Some(MSG_ADMIN_COMMAND) {
@@ -2911,7 +2782,7 @@ fn internal_response_payload_value(envelope: &serde_json::Value) -> serde_json::
 }
 
 async fn send_admin_command_response(
-    client: &AdminRouterClient,
+    client: &RpcClient,
     request_msg: &Message,
     action: &str,
     status: &str,
@@ -2920,7 +2791,7 @@ async fn send_admin_command_response(
     error_detail: Option<serde_json::Value>,
     request_id: Option<String>,
 ) -> Result<(), AdminError> {
-    let sender = client.sender_snapshot().await;
+    let sender = client.sender_snapshot();
     let action_class = classify_admin_action(action);
     let (action_result, result_origin) =
         derive_action_outcome(action_class, Some(status), error_code.as_deref());
@@ -3496,7 +3367,7 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
 
 async fn dispatch_internal_admin_command(
     ctx: &AdminContext,
-    client: &Arc<AdminRouterClient>,
+    client: &Arc<RpcClient>,
     action: &str,
     target: Option<&str>,
     params: serde_json::Value,
@@ -3973,7 +3844,7 @@ async fn run_http_server(
     listen: &str,
     tx: &mpsc::UnboundedSender<BroadcastRequest>,
     ctx: AdminContext,
-    client: Arc<AdminRouterClient>,
+    client: Arc<RpcClient>,
 ) -> Result<(), AdminError> {
     let listener = TcpListener::bind(listen).await?;
     tracing::info!(addr = %listen, "sy.admin http listening");
@@ -3994,7 +3865,7 @@ async fn handle_http(
     stream: &mut tokio::net::TcpStream,
     tx: &mpsc::UnboundedSender<BroadcastRequest>,
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
 ) -> Result<(), AdminError> {
     let (method, path, headers, body) = read_http_request(stream).await?;
     let (path, query) = split_path_query(&path);
@@ -4545,7 +4416,7 @@ async fn handle_http(
 
 async fn handle_inventory_http(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     payload: serde_json::Value,
 ) -> Result<(u16, String), AdminError> {
     let target = format!("SY.orchestrator@{}", ctx.hive_id);
@@ -4568,7 +4439,7 @@ async fn handle_hive_paths(
     query: &HashMap<String, String>,
     body: &[u8],
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
 ) -> Result<Option<(u16, String)>, AdminError> {
     let trimmed = path.trim_matches('/');
     let parts = trimmed.split('/').collect::<Vec<_>>();
@@ -6184,7 +6055,7 @@ fn next_opa_version(requested: Option<u64>) -> Result<u64, AdminError> {
 
 async fn handle_opa_http(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     mut req: OpaRequest,
     action: OpaAction,
 ) -> Result<(u16, String), AdminError> {
@@ -6283,7 +6154,7 @@ async fn handle_opa_http(
 
 async fn handle_opa_query(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     action: &str,
     target: Option<String>,
 ) -> Result<(u16, String), AdminError> {
@@ -6293,7 +6164,7 @@ async fn handle_opa_query(
 
 async fn handle_wf_rules_http(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     req: WfRulesRequest,
     action: WfRulesAction,
 ) -> Result<(u16, String), AdminError> {
@@ -6341,7 +6212,7 @@ async fn handle_wf_rules_http(
 
 async fn handle_wf_rules_query(
     _ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     action: &str,
     req: WfRulesRequest,
 ) -> Result<(u16, String), AdminError> {
@@ -6393,24 +6264,21 @@ fn normalize_wf_rules_target(target: Option<String>, fallback_hive: &str) -> Str
 }
 
 async fn send_l2_action_request(
-    client: &AdminRouterClient,
+    client: &RpcClient,
     target: &str,
     msg_type: &str,
     action: &str,
     payload: serde_json::Value,
     timeout_window: Duration,
 ) -> Result<serde_json::Value, AdminError> {
-    use tokio::time::timeout;
-
-    let sender = client.sender_snapshot().await;
-    let trace_id = Uuid::new_v4().to_string();
+    let sender = client.sender_snapshot();
     let msg = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
             src_l2_name: None,
             dst: Destination::Unicast(target.to_string()),
             ttl: 16,
-            trace_id: trace_id.clone(),
+            trace_id: String::new(),
         },
         meta: Meta {
             msg_type: msg_type.to_string(),
@@ -6421,33 +6289,35 @@ async fn send_l2_action_request(
         },
         payload,
     };
-    let (tx, rx) = oneshot::channel::<Message>();
-    client.enqueue_admin_waiter(trace_id.clone(), tx).await;
-    sender.send(msg).await?;
-
-    let msg = match timeout(timeout_window, rx).await {
-        Ok(Ok(msg)) => msg,
-        Ok(Err(_)) => return Err("l2 action response channel closed".into()),
-        Err(_) => {
-            client.drop_admin_waiter(&trace_id).await;
-            return Err(format!(
-                "l2 action timeout msg_type={} action={} target={} timeout_secs={}",
-                msg_type,
-                action,
-                target,
-                timeout_window.as_secs()
-            )
-            .into());
+    let success = match msg_type {
+        "command" => vec![
+            RouteMatch::any_msg_type("command"),
+            RouteMatch::any_msg_type("command_response"),
+        ],
+        "query" => vec![
+            RouteMatch::any_msg_type("query"),
+            RouteMatch::any_msg_type("query_response"),
+        ],
+        _ => {
+            return Err(format!("unsupported l2 action msg_type={msg_type}").into());
         }
     };
-
-    if matches!(
-        msg.meta.msg.as_deref(),
-        Some("UNREACHABLE" | "TTL_EXCEEDED")
-    ) {
-        let system_msg = msg.meta.msg.as_deref().unwrap_or("");
-        return Err(format!("router returned {} for target={}", system_msg, target).into());
-    }
+    let matcher = PendingMatcher::new(
+        success,
+        vec![
+            RouteMatch::exact(SYSTEM_KIND, MSG_UNREACHABLE),
+            RouteMatch::exact(SYSTEM_KIND, MSG_TTL_EXCEEDED),
+        ],
+        vec![],
+    );
+    let msg = client
+        .send_with_matcher(
+            msg,
+            matcher,
+            RpcRequestLabels::new(target, action, msg_type),
+            timeout_window,
+        )
+        .await?;
 
     let response_msg_type = msg.meta.msg_type.as_str();
     let expected_ok = match msg_type {
@@ -6476,7 +6346,7 @@ async fn send_l2_action_request(
 
 async fn handle_timer_rpc(
     _ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     action: &str,
     timer_msg: &str,
     payload: serde_json::Value,
@@ -6502,7 +6372,7 @@ async fn handle_timer_rpc(
 
 async fn handle_admin_query(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     action: &str,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
@@ -6520,7 +6390,7 @@ async fn handle_admin_query(
 
 async fn handle_admin_query_with_payload(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     action: &str,
     payload: serde_json::Value,
     hive: Option<String>,
@@ -9527,7 +9397,7 @@ fn finalize_quarantined_runtime_version_dir_local(
 
 async fn query_runtime_usage_global_visible(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     runtime: &str,
     runtime_version: &str,
 ) -> Result<serde_json::Value, String> {
@@ -9572,7 +9442,7 @@ fn parse_admin_envelope(body: &str, action: &str) -> Result<serde_json::Value, S
 
 async fn run_publish_runtime_package_follow_up(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     runtime_name: &str,
     runtime_version: &str,
     manifest_version: u64,
@@ -9665,7 +9535,7 @@ async fn run_publish_runtime_package_follow_up(
 
 async fn handle_publish_runtime_package(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     payload: serde_json::Value,
 ) -> Result<(u16, String), AdminError> {
     if ctx.hive_id != PRIMARY_HIVE_ID {
@@ -9882,7 +9752,7 @@ async fn handle_publish_runtime_package(
 
 async fn handle_remove_runtime_version(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
@@ -10325,7 +10195,7 @@ async fn handle_remove_runtime_version(
 
 async fn handle_admin_command(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     action: &str,
     payload: serde_json::Value,
     hive: Option<String>,
@@ -10428,11 +10298,11 @@ async fn handle_admin_command(
 
 async fn handle_send_node_message(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
-    let sender = client.sender_snapshot().await;
+    let sender = client.sender_snapshot();
     let req: DebugNodeMessageRequest = serde_json::from_value(payload)?;
     let target_hive = hive.unwrap_or_else(|| ctx.hive_id.clone());
     let node_name = req.node_name.trim().to_string();
@@ -10551,7 +10421,7 @@ fn extract_node_error_code_and_detail(
 
 async fn handle_node_control_command(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     action: &str,
     payload: serde_json::Value,
     hive: Option<String>,
@@ -10727,7 +10597,7 @@ async fn handle_node_control_command(
 
 async fn handle_identity_query(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     action: &str,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
@@ -10752,7 +10622,7 @@ async fn handle_identity_query(
 
 async fn handle_identity_command(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     action: &str,
     payload: serde_json::Value,
     hive: Option<String>,
@@ -10783,7 +10653,7 @@ async fn handle_identity_command(
 
 async fn handle_vault_command(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     action: &str,
     payload: serde_json::Value,
     hive: Option<String>,
@@ -10957,7 +10827,7 @@ fn normalize_vault_put_payload(
 
 async fn handle_hive_update_command(
     _ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     hive_id: String,
     payload: serde_json::Value,
 ) -> Result<(u16, String), AdminError> {
@@ -11140,7 +11010,7 @@ async fn handle_hive_update_command(
 
 async fn handle_hive_sync_hint_command(
     _ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     hive_id: String,
     payload: serde_json::Value,
 ) -> Result<(u16, String), AdminError> {
@@ -11341,23 +11211,22 @@ fn build_admin_request(
 }
 
 async fn send_admin_request(
-    client: &AdminRouterClient,
+    client: &RpcClient,
     request: AdminRequest,
     timeout_window: Duration,
 ) -> Result<serde_json::Value, AdminError> {
-    let sender = client.sender_snapshot().await;
+    let sender = client.sender_snapshot();
     let dst = request
         .unicast
         .clone()
         .unwrap_or_else(|| request.target.clone());
-    let trace_id = Uuid::new_v4().to_string();
     let msg = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
             src_l2_name: None,
             dst: Destination::Unicast(dst.clone()),
             ttl: 16,
-            trace_id: trace_id.clone(),
+            trace_id: String::new(),
         },
         meta: Meta {
             msg_type: "admin".to_string(),
@@ -11373,31 +11242,27 @@ async fn send_admin_request(
         },
         payload: request.payload,
     };
-    let (tx, rx) = oneshot::channel::<Message>();
-    client.enqueue_admin_waiter(trace_id.clone(), tx).await;
-    sender.send(msg).await?;
-
-    use tokio::time::{timeout, Instant};
-    let deadline = Instant::now() + timeout_window;
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let msg = match timeout(remaining, rx).await {
-        Ok(Ok(msg)) => msg,
-        Ok(Err(_)) => return Err("admin response channel closed".into()),
-        Err(_) => {
-            client.drop_admin_waiter(&trace_id).await;
-            return Err(format!(
-                "admin request timeout action={} timeout_secs={}",
-                request.action,
-                timeout_window.as_secs()
-            )
-            .into());
-        }
-    };
+    let matcher = PendingMatcher::new(
+        vec![RouteMatch::any_msg_type("admin")],
+        vec![
+            RouteMatch::exact(SYSTEM_KIND, MSG_UNREACHABLE),
+            RouteMatch::exact(SYSTEM_KIND, MSG_TTL_EXCEEDED),
+        ],
+        vec![],
+    );
+    let msg = client
+        .send_with_matcher(
+            msg,
+            matcher,
+            RpcRequestLabels::new(dst, request.action, "admin"),
+            timeout_window,
+        )
+        .await?;
     Ok(msg.payload)
 }
 
 async fn send_system_request(
-    client: &AdminRouterClient,
+    client: &RpcClient,
     target: &str,
     request_msg: &str,
     expected_response_msg: &str,
@@ -11422,7 +11287,7 @@ async fn send_system_request(
 }
 
 async fn send_system_request_with_meta(
-    client: &AdminRouterClient,
+    client: &RpcClient,
     target: &str,
     request_msg: &str,
     expected_response_msg: &str,
@@ -11435,17 +11300,14 @@ async fn send_system_request_with_meta(
     context: Option<serde_json::Value>,
     timeout_window: Duration,
 ) -> Result<serde_json::Value, AdminError> {
-    use tokio::time::timeout;
-
-    let sender = client.sender_snapshot().await;
-    let trace_id = Uuid::new_v4().to_string();
+    let sender = client.sender_snapshot();
     let msg = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
             src_l2_name: None,
             dst: Destination::Unicast(target.to_string()),
             ttl,
-            trace_id: trace_id.clone(),
+            trace_id: String::new(),
         },
         meta: Meta {
             msg_type: SYSTEM_KIND.to_string(),
@@ -11461,25 +11323,22 @@ async fn send_system_request_with_meta(
         },
         payload,
     };
-
-    let (tx, rx) = oneshot::channel::<Message>();
-    client.enqueue_admin_waiter(trace_id.clone(), tx).await;
-    sender.send(msg).await?;
-
-    let msg = match timeout(timeout_window, rx).await {
-        Ok(Ok(msg)) => msg,
-        Ok(Err(_)) => return Err("system response channel closed".into()),
-        Err(_) => {
-            client.drop_admin_waiter(&trace_id).await;
-            return Err(format!(
-                "system request timeout msg={} target={} timeout_secs={}",
-                request_msg,
-                target,
-                timeout_window.as_secs()
-            )
-            .into());
-        }
-    };
+    let matcher = PendingMatcher::new(
+        vec![RouteMatch::exact(SYSTEM_KIND, expected_response_msg)],
+        vec![
+            RouteMatch::exact(SYSTEM_KIND, MSG_UNREACHABLE),
+            RouteMatch::exact(SYSTEM_KIND, MSG_TTL_EXCEEDED),
+        ],
+        vec![RouteMatch::any_msg_type(SYSTEM_KIND)],
+    );
+    let msg = client
+        .send_with_matcher(
+            msg,
+            matcher,
+            RpcRequestLabels::new(target, request_msg, expected_response_msg),
+            timeout_window,
+        )
+        .await?;
 
     if msg.meta.msg_type != SYSTEM_KIND {
         return Err(format!(
@@ -11761,7 +11620,7 @@ fn admin_payload_contract_error(action: &str, payload: &serde_json::Value) -> Op
 
 async fn broadcast_full_config(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     action: &str,
     target_hive: Option<&str>,
 ) -> Result<(), AdminError> {
@@ -11808,7 +11667,7 @@ fn list_config_items_payload<'a>(
 
 async fn send_opa_action(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     action: &str,
     version: u64,
     rego: Option<String>,
@@ -11823,6 +11682,9 @@ async fn send_opa_action(
             "entrypoint": entrypoint.unwrap_or_else(|| "router/target".to_string()),
         });
     }
+    let expected = expected_hive_sets(ctx, target.as_deref()).effective;
+    let mut receiver = client.subscribe(RPC_BC_CONFIG_RESPONSE)?;
+
     broadcast_config_changed(
         client,
         "opa",
@@ -11834,19 +11696,17 @@ async fn send_opa_action(
     )
     .await?;
 
-    let expected = expected_hive_sets(ctx, target.as_deref()).effective;
-    let mut receiver = client.subscribe_system();
     let responses = collect_opa_responses(&mut receiver, action, version, &expected).await;
     Ok(responses)
 }
 
 async fn send_opa_query(
     ctx: &AdminContext,
-    client: &AdminRouterClient,
+    client: &RpcClient,
     action: &str,
     target: Option<String>,
 ) -> Result<Vec<OpaQueryEntry>, AdminError> {
-    let sender = client.sender_snapshot().await;
+    let sender = client.sender_snapshot();
     let target_pattern = target
         .as_deref()
         .map(|hive| format!("SY.opa.rules@{}", hive));
@@ -11875,10 +11735,9 @@ async fn send_opa_query(
         },
         payload: serde_json::json!({}),
     };
-    sender.send(msg).await?;
-
     let expected = expected_hive_sets(ctx, target.as_deref()).effective;
-    let mut receiver = client.subscribe_query();
+    let mut receiver = client.subscribe(RPC_BC_QUERY)?;
+    sender.send(msg).await?;
     let responses = collect_opa_query_responses(&mut receiver, action, &expected).await;
     Ok(responses)
 }

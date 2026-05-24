@@ -1,4 +1,3 @@
-pub mod admin;
 pub mod blob;
 pub mod client_config;
 pub mod cognition;
@@ -13,6 +12,7 @@ pub mod payload;
 pub mod policy;
 pub mod prelude;
 pub mod protocol;
+pub mod rpc;
 mod send_normalization;
 pub mod socket;
 pub mod split;
@@ -21,10 +21,6 @@ pub mod thread;
 pub mod timer;
 pub mod vault;
 
-pub use admin::{
-    admin_command, admin_command_ok, AdminCommandError, AdminCommandRequest, AdminCommandResult,
-    ADMIN_KIND, MSG_ADMIN_COMMAND, MSG_ADMIN_COMMAND_RESPONSE,
-};
 pub use client_config::ClientConfig;
 pub use cognition::{
     CognitionContextData, CognitionCooccurrenceData, CognitionDurableEntity,
@@ -37,17 +33,15 @@ pub use cognition::{
     SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, SUBJECT_STORAGE_COGNITION_THREADS,
 };
 pub use identity::{
-    add_channel_to_ilk, deterministic_system_ilk_id, identity_shm_name_for_hive,
-    identity_system_call, identity_system_call_ok, list_ich_options_from_hive_config,
-    list_ich_options_from_hive_id, list_ich_options_from_shm_name, load_hive_id, provision_ilk,
+    deterministic_system_ilk_id, identity_shm_name_for_hive, list_ich_options_from_hive_config,
+    list_ich_options_from_hive_id, list_ich_options_from_shm_name, load_hive_id,
     read_self_ilk_from_env, read_self_tenant_from_env, resolve_identity_option_from_hive_config,
     resolve_identity_option_from_hive_id, resolve_identity_option_from_shm_name,
     resolve_ilk_from_hive_config, resolve_ilk_from_hive_id, resolve_ilk_from_shm_name,
-    set_ich_enabled, set_tenant_sponsor, stable_ich_id, update_tenant, IchSetEnabledResponse,
-    IdentityError, IdentityIchOption, IdentityIlkOption, IdentityShmError,
-    IdentitySystemRequest, IdentitySystemResult, IlkAddChannelRequest, IlkAddChannelResult,
-    IlkProvisionRequest, IlkProvisionResult, ResolvedIdentityOption, TenantUpdateResponse,
-    DEFAULT_ROOT_TENANT_ID, ENV_SELF_ILK_ID, ENV_SELF_TENANT_ID,
+    stable_ich_id, IchSetEnabledResponse, IdentityError, IdentityIchOption, IdentityIlkOption,
+    IdentityShmError, IdentitySystemRequest, IdentitySystemResult, IlkAddChannelRequest,
+    IlkAddChannelResult, IlkProvisionRequest, IlkProvisionResult, ResolvedIdentityOption,
+    TenantUpdateResponse, DEFAULT_ROOT_TENANT_ID, ENV_SELF_ILK_ID, ENV_SELF_TENANT_ID,
     MSG_ICH_SET_ENABLED, MSG_IDENTITY_METRICS, MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION,
     MSG_ILK_PROVISION_RESPONSE, MSG_ILK_REGISTER, MSG_ILK_SET_DEFINITION, MSG_ILK_UPDATE,
     MSG_TNT_APPROVE, MSG_TNT_CREATE, MSG_TNT_SET_SPONSOR, MSG_TNT_UPDATE,
@@ -79,6 +73,14 @@ pub use node_secret::{
 pub use policy::{
     action_class_requires_result, classify_admin_action, classify_routed_message,
     classify_system_message, derive_action_outcome, ActionClass, ActionResult,
+};
+pub use rpc::{
+    admin_response_payload_value, extract_error_message,
+    parse_admin_response as rpc_parse_admin_response, AdminCommandRequest, AdminCommandResult,
+    OperationalRouteProfile, OperationalRouteProfileBuilder, PendingMatcher, RouteMatch,
+    RouteTarget, RpcClient, RpcCommandReceiver, RpcError, RpcRequestLabels, RpcTestHarness,
+    SystemRpcRequest, ADMIN_KIND, MSG_ADMIN_COMMAND, MSG_ADMIN_COMMAND_RESPONSE,
+    RPC_COMMAND_DEPTH_WARN_THRESHOLD,
 };
 pub use split::{NodeReceiver, NodeSender};
 pub use status::try_handle_default_node_status;

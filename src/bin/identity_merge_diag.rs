@@ -2,8 +2,8 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fluxbee_sdk::identity::{identity_system_call, IdentitySystemRequest};
-use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
+use fluxbee_sdk::rpc::{OperationalRouteProfile, RpcClient, RpcError, SystemRpcRequest};
+use fluxbee_sdk::NodeConfig;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::time::sleep;
@@ -65,27 +65,97 @@ fn load_hive_id(config_dir: &PathBuf) -> Result<String, DiagError> {
 }
 
 async fn system_call_with_fallback(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
+    client: &RpcClient,
     target: &str,
     fallback_target: Option<&str>,
     action: &str,
     payload: Value,
     timeout_ms: u64,
 ) -> Result<(Value, String), DiagError> {
-    let out = identity_system_call(
-        sender,
-        receiver,
-        IdentitySystemRequest {
-            target,
-            fallback_target,
-            action,
-            payload,
-            timeout: Duration::from_millis(timeout_ms),
-        },
+    identity_call_with_fallback(
+        client,
+        target,
+        fallback_target,
+        action,
+        payload,
+        Duration::from_millis(timeout_ms),
     )
-    .await?;
-    Ok((out.payload, out.effective_target))
+    .await
+}
+
+/// Replicates the SDK `identity_system_call` fallback semantics over the new
+/// `RpcClient::send_system_rpc`. Retries on transport `UNREACHABLE` with
+/// `reason=NODE_NOT_FOUND` or on payload `status=error, error_code=NOT_PRIMARY`,
+/// against `fallback_target` when supplied and distinct.
+async fn identity_call_with_fallback(
+    client: &RpcClient,
+    target: &str,
+    fallback_target: Option<&str>,
+    action: &str,
+    payload: Value,
+    timeout: Duration,
+) -> Result<(Value, String), DiagError> {
+    let response_msg = format!("{action}_RESPONSE");
+    let fallback_eligible = || -> Option<String> {
+        fallback_target
+            .map(str::trim)
+            .filter(|fb| !fb.is_empty() && *fb != target)
+            .map(str::to_string)
+    };
+    let primary = client
+        .send_system_rpc(SystemRpcRequest {
+            target,
+            request_msg: action,
+            response_msg: &response_msg,
+            payload: payload.clone(),
+            timeout,
+        })
+        .await;
+    match primary {
+        Ok(msg) => {
+            let status = msg.payload.get("status").and_then(Value::as_str);
+            let code = msg.payload.get("error_code").and_then(Value::as_str);
+            if status == Some("error") && code == Some("NOT_PRIMARY") {
+                if let Some(fb) = fallback_eligible() {
+                    let retry = client
+                        .send_system_rpc(SystemRpcRequest {
+                            target: &fb,
+                            request_msg: action,
+                            response_msg: &response_msg,
+                            payload,
+                            timeout,
+                        })
+                        .await?;
+                    return Ok((retry.payload, fb));
+                }
+            }
+            Ok((msg.payload, target.to_string()))
+        }
+        Err(RpcError::Unreachable {
+            reason,
+            original_dst,
+        }) => {
+            if reason == "NODE_NOT_FOUND" {
+                if let Some(fb) = fallback_eligible() {
+                    let retry = client
+                        .send_system_rpc(SystemRpcRequest {
+                            target: &fb,
+                            request_msg: action,
+                            response_msg: &response_msg,
+                            payload,
+                            timeout,
+                        })
+                        .await?;
+                    return Ok((retry.payload, fb));
+                }
+            }
+            Err(format!(
+                "identity transport unreachable reason={reason} original_dst={original_dst}"
+            )
+            .into())
+        }
+        Err(other) => Err(other.to_string().into()),
+    }
 }
 
 fn payload_status_ok(payload: &Value) -> Result<(), DiagError> {
@@ -162,11 +232,13 @@ async fn main() -> Result<(), DiagError> {
         config_dir: json_router::paths::config_dir(),
         version: "0.0.1".to_string(),
     };
-    let (io_sender, mut io_receiver) = connect(&io_node_config).await?;
+    let io_profile = OperationalRouteProfile::builder().build()?;
+    let io_client =
+        RpcClient::connect_with_retry(io_node_config, Duration::from_millis(100), io_profile)
+            .await?;
 
     let (metrics_before, mut effective_target) = system_call_with_fallback(
-        &io_sender,
-        &mut io_receiver,
+        &io_client,
         &target,
         fallback_target.as_deref(),
         "IDENTITY_METRICS",
@@ -179,8 +251,7 @@ async fn main() -> Result<(), DiagError> {
 
     let old_ich_id = format!("ich:{}", Uuid::new_v4());
     let (provision_old, used_target) = system_call_with_fallback(
-        &io_sender,
-        &mut io_receiver,
+        &io_client,
         &effective_target,
         fallback_target.as_deref(),
         "ILK_PROVISION",
@@ -208,11 +279,16 @@ async fn main() -> Result<(), DiagError> {
         config_dir: json_router::paths::config_dir(),
         version: "0.0.1".to_string(),
     };
-    let (frontdesk_sender, mut frontdesk_receiver) = connect(&frontdesk_config).await?;
+    let frontdesk_profile = OperationalRouteProfile::builder().build()?;
+    let frontdesk_client = RpcClient::connect_with_retry(
+        frontdesk_config,
+        Duration::from_millis(100),
+        frontdesk_profile,
+    )
+    .await?;
 
     let (tenant_create, used_target) = system_call_with_fallback(
-        &frontdesk_sender,
-        &mut frontdesk_receiver,
+        &frontdesk_client,
         &effective_target,
         fallback_target.as_deref(),
         "TNT_CREATE",
@@ -237,8 +313,7 @@ async fn main() -> Result<(), DiagError> {
         &format!("ilk:{}", Uuid::new_v4()),
     );
     let (register, used_target) = system_call_with_fallback(
-        &frontdesk_sender,
-        &mut frontdesk_receiver,
+        &frontdesk_client,
         &effective_target,
         fallback_target.as_deref(),
         "ILK_REGISTER",
@@ -258,8 +333,7 @@ async fn main() -> Result<(), DiagError> {
     payload_status_ok(&register)?;
 
     let (add_channel, used_target) = system_call_with_fallback(
-        &frontdesk_sender,
-        &mut frontdesk_receiver,
+        &frontdesk_client,
         &effective_target,
         fallback_target.as_deref(),
         "ILK_ADD_CHANNEL",
@@ -280,8 +354,7 @@ async fn main() -> Result<(), DiagError> {
     payload_status_ok(&add_channel)?;
 
     let (metrics_after_merge, used_target) = system_call_with_fallback(
-        &io_sender,
-        &mut io_receiver,
+        &io_client,
         &effective_target,
         fallback_target.as_deref(),
         "IDENTITY_METRICS",
@@ -295,8 +368,7 @@ async fn main() -> Result<(), DiagError> {
 
     let old_ich_id_second = format!("ich:{}", Uuid::new_v4());
     let (provision_old_again, used_target) = system_call_with_fallback(
-        &io_sender,
-        &mut io_receiver,
+        &io_client,
         &effective_target,
         fallback_target.as_deref(),
         "ILK_PROVISION",
@@ -328,8 +400,7 @@ async fn main() -> Result<(), DiagError> {
     if wait_gc_secs > 0 {
         sleep(Duration::from_secs(wait_gc_secs)).await;
         let (metrics_after_wait, used_target) = system_call_with_fallback(
-            &io_sender,
-            &mut io_receiver,
+            &io_client,
             &effective_target,
             fallback_target.as_deref(),
             "IDENTITY_METRICS",
@@ -349,9 +420,6 @@ async fn main() -> Result<(), DiagError> {
         )
         .into());
     }
-
-    let _ = io_sender.close().await;
-    let _ = frontdesk_sender.close().await;
 
     println!("STATUS=ok");
     println!("TEST_ID={}", test_id);

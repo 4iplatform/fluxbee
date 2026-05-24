@@ -2,9 +2,12 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fluxbee_sdk::identity::{identity_system_call, IdentitySystemRequest};
-use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, MSG_UNREACHABLE, SYSTEM_KIND};
-use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
+use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
+use fluxbee_sdk::rpc::{
+    OperationalRouteProfile, RouteMatch, RouteTarget, RpcClient, RpcCommandReceiver, RpcError,
+    SystemRpcRequest,
+};
+use fluxbee_sdk::{NodeConfig, NodeSender};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::time::{sleep, timeout, Instant};
@@ -91,27 +94,97 @@ fn src_ilk_from_message(msg: &Message) -> Option<String> {
 }
 
 async fn system_call_with_fallback(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
+    client: &RpcClient,
     target: &str,
     fallback_target: Option<&str>,
     action: &str,
     payload: Value,
     timeout_ms: u64,
 ) -> Result<(Value, String), DiagError> {
-    let out = identity_system_call(
-        sender,
-        receiver,
-        IdentitySystemRequest {
-            target,
-            fallback_target,
-            action,
-            payload,
-            timeout: Duration::from_millis(timeout_ms),
-        },
+    identity_call_with_fallback(
+        client,
+        target,
+        fallback_target,
+        action,
+        payload,
+        Duration::from_millis(timeout_ms),
     )
-    .await?;
-    Ok((out.payload, out.effective_target))
+    .await
+}
+
+/// Replicates the SDK `identity_system_call` fallback semantics over the new
+/// `RpcClient::send_system_rpc`. Retries on transport `UNREACHABLE` with
+/// `reason=NODE_NOT_FOUND` or on payload `status=error, error_code=NOT_PRIMARY`,
+/// against `fallback_target` when supplied and distinct.
+async fn identity_call_with_fallback(
+    client: &RpcClient,
+    target: &str,
+    fallback_target: Option<&str>,
+    action: &str,
+    payload: Value,
+    timeout: Duration,
+) -> Result<(Value, String), DiagError> {
+    let response_msg = format!("{action}_RESPONSE");
+    let fallback_eligible = || -> Option<String> {
+        fallback_target
+            .map(str::trim)
+            .filter(|fb| !fb.is_empty() && *fb != target)
+            .map(str::to_string)
+    };
+    let primary = client
+        .send_system_rpc(SystemRpcRequest {
+            target,
+            request_msg: action,
+            response_msg: &response_msg,
+            payload: payload.clone(),
+            timeout,
+        })
+        .await;
+    match primary {
+        Ok(msg) => {
+            let status = msg.payload.get("status").and_then(Value::as_str);
+            let code = msg.payload.get("error_code").and_then(Value::as_str);
+            if status == Some("error") && code == Some("NOT_PRIMARY") {
+                if let Some(fb) = fallback_eligible() {
+                    let retry = client
+                        .send_system_rpc(SystemRpcRequest {
+                            target: &fb,
+                            request_msg: action,
+                            response_msg: &response_msg,
+                            payload,
+                            timeout,
+                        })
+                        .await?;
+                    return Ok((retry.payload, fb));
+                }
+            }
+            Ok((msg.payload, target.to_string()))
+        }
+        Err(RpcError::Unreachable {
+            reason,
+            original_dst,
+        }) => {
+            if reason == "NODE_NOT_FOUND" {
+                if let Some(fb) = fallback_eligible() {
+                    let retry = client
+                        .send_system_rpc(SystemRpcRequest {
+                            target: &fb,
+                            request_msg: action,
+                            response_msg: &response_msg,
+                            payload,
+                            timeout,
+                        })
+                        .await?;
+                    return Ok((retry.payload, fb));
+                }
+            }
+            Err(format!(
+                "identity transport unreachable reason={reason} original_dst={original_dst}"
+            )
+            .into())
+        }
+        Err(other) => Err(other.to_string().into()),
+    }
 }
 
 fn payload_status(payload: &Value) -> (&str, Option<&str>) {
@@ -175,7 +248,7 @@ async fn send_resolve_probe(
 }
 
 async fn wait_frontdesk_probe(
-    receiver: &mut NodeReceiver,
+    receiver: &mut RpcCommandReceiver,
     expected_trace_id: &str,
     timeout_ms: u64,
 ) -> Result<Message, DiagError> {
@@ -190,7 +263,14 @@ async fn wait_frontdesk_probe(
             .into());
         }
         let msg = match timeout(remaining, receiver.recv()).await {
-            Ok(msg) => msg?,
+            Ok(Some(msg)) => msg,
+            Ok(None) => {
+                return Err(format!(
+                    "frontdesk user_probe channel closed waiting trace_id={}",
+                    expected_trace_id
+                )
+                .into());
+            }
             Err(_) => {
                 return Err(format!(
                     "timeout waiting frontdesk probe trace_id={}",
@@ -202,24 +282,13 @@ async fn wait_frontdesk_probe(
         if msg.routing.trace_id != expected_trace_id {
             continue;
         }
-        if msg.meta.msg_type == SYSTEM_KIND {
-            if msg.meta.msg.as_deref() == Some(MSG_UNREACHABLE) {
-                let reason = msg
-                    .payload
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                return Err(format!("probe got UNREACHABLE reason={}", reason).into());
-            }
-            continue;
-        }
         return Ok(msg);
     }
 }
 
 async fn probe_until_frontdesk(
     sender: &NodeSender,
-    receiver: &mut NodeReceiver,
+    receiver: &mut RpcCommandReceiver,
     src_ilk: &str,
     probe_id: &str,
     timeout_ms: u64,
@@ -311,7 +380,10 @@ async fn main() -> Result<(), DiagError> {
         config_dir: json_router::paths::config_dir(),
         version: "0.0.1".to_string(),
     };
-    let (io_sender, mut io_receiver) = connect(&io_cfg).await?;
+    let io_profile = OperationalRouteProfile::builder().build()?;
+    let io_client =
+        RpcClient::connect_with_retry(io_cfg, Duration::from_millis(100), io_profile).await?;
+    let io_sender = io_client.sender_snapshot();
 
     let frontdesk_cfg = NodeConfig {
         name: frontdesk_node_name.clone(),
@@ -321,11 +393,24 @@ async fn main() -> Result<(), DiagError> {
         config_dir: json_router::paths::config_dir(),
         version: "0.0.1".to_string(),
     };
-    let (frontdesk_sender, mut frontdesk_receiver) = connect(&frontdesk_cfg).await?;
+    // The frontdesk node receives operational `user` messages from the
+    // resolve probes routed through the router. Declare a `user_probe`
+    // command channel + matching post_pending rule so those land in a
+    // receiver we own.
+    let frontdesk_profile = OperationalRouteProfile::builder()
+        .command_channel("user_probe")
+        .post_pending_rule(
+            RouteMatch::any_msg_type("user"),
+            RouteTarget::Command("user_probe"),
+        )
+        .build()?;
+    let frontdesk_client =
+        RpcClient::connect_with_retry(frontdesk_cfg, Duration::from_millis(100), frontdesk_profile)
+            .await?;
+    let mut frontdesk_receiver = frontdesk_client.take_command_receiver("user_probe").await?;
 
     let (tenant_create, mut effective_target) = system_call_with_fallback(
-        &frontdesk_sender,
-        &mut frontdesk_receiver,
+        &frontdesk_client,
         &target,
         fallback_target.as_deref(),
         "TNT_CREATE",
@@ -345,8 +430,7 @@ async fn main() -> Result<(), DiagError> {
         .to_string();
 
     let (provision, used_target) = system_call_with_fallback(
-        &io_sender,
-        &mut io_receiver,
+        &io_client,
         &effective_target,
         fallback_target.as_deref(),
         "ILK_PROVISION",
@@ -396,8 +480,7 @@ async fn main() -> Result<(), DiagError> {
     }
 
     let (register, used_target) = system_call_with_fallback(
-        &frontdesk_sender,
-        &mut frontdesk_receiver,
+        &frontdesk_client,
         &effective_target,
         fallback_target.as_deref(),
         "ILK_REGISTER",
@@ -417,8 +500,7 @@ async fn main() -> Result<(), DiagError> {
     require_payload_ok(&register, "ILK_REGISTER")?;
 
     let (provision_after_complete, used_target) = system_call_with_fallback(
-        &io_sender,
-        &mut io_receiver,
+        &io_client,
         &effective_target,
         fallback_target.as_deref(),
         "ILK_PROVISION",
@@ -456,8 +538,7 @@ async fn main() -> Result<(), DiagError> {
     }
 
     let (tenant_create_2, used_target) = system_call_with_fallback(
-        &frontdesk_sender,
-        &mut frontdesk_receiver,
+        &frontdesk_client,
         &effective_target,
         fallback_target.as_deref(),
         "TNT_CREATE",
@@ -478,8 +559,7 @@ async fn main() -> Result<(), DiagError> {
         .to_string();
 
     let (register_second, _) = system_call_with_fallback(
-        &frontdesk_sender,
-        &mut frontdesk_receiver,
+        &frontdesk_client,
         &effective_target,
         fallback_target.as_deref(),
         "ILK_REGISTER",
@@ -504,9 +584,6 @@ async fn main() -> Result<(), DiagError> {
         )
         .into());
     }
-
-    let _ = io_sender.close().await;
-    let _ = frontdesk_sender.close().await;
 
     println!("STATUS=ok");
     println!("TEST_ID={}", test_id);

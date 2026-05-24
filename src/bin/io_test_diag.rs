@@ -2,10 +2,12 @@ use std::error::Error;
 use std::path::PathBuf;
 
 use fluxbee_sdk::identity::{
-    load_hive_id, provision_ilk, resolve_ilk_from_hive_config, IdentityShmError,
-    IlkProvisionRequest,
+    load_hive_id, resolve_ilk_from_hive_config, IdentityShmError, MSG_ILK_PROVISION,
+    MSG_ILK_PROVISION_RESPONSE,
 };
-use fluxbee_sdk::{connect, NodeConfig};
+use fluxbee_sdk::rpc::{OperationalRouteProfile, RpcClient, RpcError, SystemRpcRequest};
+use fluxbee_sdk::NodeConfig;
+use serde_json::{json, Value};
 use tokio::time::{sleep, Duration, Instant};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -58,10 +60,12 @@ async fn main() -> Result<(), DynError> {
                 config_dir: json_router::paths::config_dir(),
                 version: node_version,
             };
-            let (sender, mut receiver) = connect(&node_config).await?;
+            let profile = OperationalRouteProfile::builder().build()?;
+            let client =
+                RpcClient::connect_with_retry(node_config, Duration::from_millis(100), profile)
+                    .await?;
             let provisioned = provision_ilk_with_fallback(
-                &sender,
-                &mut receiver,
+                &client,
                 &target,
                 &ich_id,
                 &channel_type,
@@ -71,7 +75,6 @@ async fn main() -> Result<(), DynError> {
                 env_opt("IO_TEST_IDENTITY_FALLBACK_TARGET"),
             )
             .await?;
-            let _ = sender.close().await;
             provision_trace_id = Some(provisioned.trace_id.clone());
             identity_target = Some(provisioned.target);
             wait_for_lookup_hit(
@@ -106,10 +109,12 @@ async fn main() -> Result<(), DynError> {
                 config_dir: json_router::paths::config_dir(),
                 version: node_version,
             };
-            let (sender, mut receiver) = connect(&node_config).await?;
+            let profile = OperationalRouteProfile::builder().build()?;
+            let client =
+                RpcClient::connect_with_retry(node_config, Duration::from_millis(100), profile)
+                    .await?;
             let provisioned = provision_ilk_with_fallback(
-                &sender,
-                &mut receiver,
+                &client,
                 &target,
                 &ich_id,
                 &channel_type,
@@ -119,7 +124,6 @@ async fn main() -> Result<(), DynError> {
                 env_opt("IO_TEST_IDENTITY_FALLBACK_TARGET"),
             )
             .await?;
-            let _ = sender.close().await;
             provision_trace_id = Some(provisioned.trace_id.clone());
             identity_target = Some(provisioned.target);
             wait_for_lookup_hit(
@@ -237,8 +241,7 @@ struct ProvisionOutcome {
 }
 
 async fn provision_ilk_with_fallback(
-    sender: &fluxbee_sdk::NodeSender,
-    receiver: &mut fluxbee_sdk::NodeReceiver,
+    client: &RpcClient,
     target: &str,
     ich_id: &str,
     channel_type: &str,
@@ -247,90 +250,55 @@ async fn provision_ilk_with_fallback(
     timeout: Duration,
     fallback_target: Option<String>,
 ) -> Result<ProvisionOutcome, DynError> {
-    let tenant_id_opt = if tenant_id.trim().is_empty() {
-        None
-    } else {
-        Some(tenant_id)
-    };
-    let first = provision_ilk(
-        sender,
-        receiver,
-        IlkProvisionRequest {
-            target,
-            ich_id,
-            channel_type,
-            address,
-            tenant_id: tenant_id_opt,
-            ilk_type: None,
-            timeout,
-        },
-    )
-    .await;
+    let mut payload = json!({
+        "ich_id": ich_id,
+        "channel_type": channel_type,
+        "address": address,
+    });
+    if !tenant_id.trim().is_empty() {
+        payload["tenant_id"] = Value::String(tenant_id.to_string());
+    }
+    let first = send_provision_once(client, target, payload.clone(), timeout).await;
     match first {
-        Ok(ok) => Ok(ProvisionOutcome {
-            ilk_id: ok.ilk_id,
-            trace_id: ok.trace_id,
+        Ok((ilk_id, trace_id)) => Ok(ProvisionOutcome {
+            ilk_id,
+            trace_id,
             target: target.to_string(),
         }),
-        Err(fluxbee_sdk::identity::IdentityError::ProvisionRejected {
-            error_code,
-            message,
-        }) if error_code == "NOT_PRIMARY" => {
+        Err(ProvisionAttemptError::NotPrimary { message }) => {
             let Some(fallback) = fallback_target else {
-                return Err(fluxbee_sdk::identity::IdentityError::ProvisionRejected {
-                    error_code,
-                    message,
-                }
-                .into());
+                return Err(format!("identity provision rejected NOT_PRIMARY: {message}").into());
             };
             if fallback == target {
-                return Err(fluxbee_sdk::identity::IdentityError::ProvisionRejected {
-                    error_code,
-                    message,
-                }
-                .into());
+                return Err(format!("identity provision rejected NOT_PRIMARY: {message}").into());
             }
             tracing::warn!(
                 target = %target,
                 fallback = %fallback,
                 "identity target is replica (NOT_PRIMARY), retrying with fallback target"
             );
-            let second = provision_ilk(
-                sender,
-                receiver,
-                IlkProvisionRequest {
-                    target: &fallback,
-                    ich_id,
-                    channel_type,
-                    address,
-                    tenant_id: tenant_id_opt,
-                    ilk_type: None,
-                    timeout,
-                },
-            )
-            .await?;
+            let (ilk_id, trace_id) =
+                send_provision_once(client, &fallback, payload, timeout).await?;
             Ok(ProvisionOutcome {
-                ilk_id: second.ilk_id,
-                trace_id: second.trace_id,
+                ilk_id,
+                trace_id,
                 target: fallback,
             })
         }
-        Err(fluxbee_sdk::identity::IdentityError::Unreachable {
+        Err(ProvisionAttemptError::Unreachable {
             reason,
             original_dst,
         }) if reason == "NODE_NOT_FOUND" => {
             let Some(fallback) = fallback_target else {
-                return Err(fluxbee_sdk::identity::IdentityError::Unreachable {
-                    reason,
-                    original_dst,
-                }
+                return Err(format!(
+                    "identity transport unreachable reason={reason} original_dst={original_dst}"
+                )
                 .into());
             };
             if fallback == target {
-                return Err(fluxbee_sdk::identity::IdentityError::Unreachable {
-                    reason,
-                    original_dst,
-                }
+                return Err(format!(
+                    "identity transport unreachable reason={reason} original_dst={original_dst}"
+                )
                 .into());
             }
             tracing::warn!(
@@ -338,26 +306,92 @@ async fn provision_ilk_with_fallback(
                 fallback = %fallback,
                 "primary identity target unreachable (NODE_NOT_FOUND), retrying with fallback target"
             );
-            let second = provision_ilk(
-                sender,
-                receiver,
-                IlkProvisionRequest {
-                    target: &fallback,
-                    ich_id,
-                    channel_type,
-                    address,
-                    tenant_id: tenant_id_opt,
-                    ilk_type: None,
-                    timeout,
-                },
-            )
-            .await?;
+            let (ilk_id, trace_id) =
+                send_provision_once(client, &fallback, payload, timeout).await?;
             Ok(ProvisionOutcome {
-                ilk_id: second.ilk_id,
-                trace_id: second.trace_id,
+                ilk_id,
+                trace_id,
                 target: fallback,
             })
         }
         Err(other) => Err(other.into()),
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ProvisionAttemptError {
+    #[error("identity provision rejected NOT_PRIMARY: {message}")]
+    NotPrimary { message: String },
+    #[error("identity transport unreachable: reason={reason} original_dst={original_dst}")]
+    Unreachable {
+        reason: String,
+        original_dst: String,
+    },
+    #[error("{0}")]
+    Other(String),
+}
+
+async fn send_provision_once(
+    client: &RpcClient,
+    target: &str,
+    payload: Value,
+    timeout: Duration,
+) -> Result<(String, String), ProvisionAttemptError> {
+    match client
+        .send_system_rpc(SystemRpcRequest {
+            target,
+            request_msg: MSG_ILK_PROVISION,
+            response_msg: MSG_ILK_PROVISION_RESPONSE,
+            payload,
+            timeout,
+        })
+        .await
+    {
+        Ok(msg) => {
+            let trace_id = msg.routing.trace_id.clone();
+            let status = msg
+                .payload
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("error");
+            if status != "ok" {
+                let code = msg
+                    .payload
+                    .get("error_code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("UNKNOWN");
+                let message = msg
+                    .payload
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("identity returned non-ok status")
+                    .to_string();
+                if code == "NOT_PRIMARY" {
+                    return Err(ProvisionAttemptError::NotPrimary { message });
+                }
+                return Err(ProvisionAttemptError::Other(format!(
+                    "ILK_PROVISION error_code={code} message={message}"
+                )));
+            }
+            let ilk_id = msg
+                .payload
+                .get("ilk_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ProvisionAttemptError::Other(
+                        "ILK_PROVISION response missing ilk_id".to_string(),
+                    )
+                })?
+                .to_string();
+            Ok((ilk_id, trace_id))
+        }
+        Err(RpcError::Unreachable {
+            reason,
+            original_dst,
+        }) => Err(ProvisionAttemptError::Unreachable {
+            reason,
+            original_dst,
+        }),
+        Err(other) => Err(ProvisionAttemptError::Other(other.to_string())),
     }
 }

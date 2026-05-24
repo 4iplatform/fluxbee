@@ -5,9 +5,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 #[cfg(test)]
-use std::sync::{Mutex as StdMutex, OnceLock};
+use std::sync::Mutex as StdMutex;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use chrono::{SecondsFormat, TimeZone, Utc};
@@ -20,21 +20,25 @@ use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-#[cfg(not(test))]
-use fluxbee_sdk::admin::{admin_command, AdminCommandRequest};
 use fluxbee_sdk::blob::{
     BlobConfig as SdkBlobConfig, BlobGcOptions, BlobToolkit, BLOB_ACTIVE_RETAIN_DAYS,
     BLOB_NAME_MAX_CHARS, BLOB_STAGING_TTL_HOURS,
 };
-use fluxbee_sdk::identity::{identity_system_call_ok, IdentityError, IdentitySystemRequest};
+use fluxbee_sdk::identity::IdentityError;
 use fluxbee_sdk::nats::{request_local, NatsRequestEnvelope, NatsResponseEnvelope};
 use fluxbee_sdk::protocol::{
-    ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED,
-    MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SCOPE_GLOBAL, SYSTEM_KIND,
+    ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, SCOPE_GLOBAL,
+    SYSTEM_KIND,
+};
+#[cfg(not(test))]
+use fluxbee_sdk::rpc::{AdminCommandRequest, AdminCommandResult};
+use fluxbee_sdk::rpc::{
+    OperationalRouteProfile, RouteMatch, RouteTarget, RpcClient, RpcCommandReceiver, RpcError,
+    SystemRpcRequest,
 };
 use fluxbee_sdk::{
-    classify_admin_action, classify_system_message, connect, derive_action_outcome, NodeConfig,
-    NodeReceiver, NodeSender, NodeUuidMode,
+    classify_admin_action, classify_system_message, derive_action_outcome, NodeConfig, NodeSender,
+    NodeUuidMode, ADMIN_KIND, MSG_ADMIN_COMMAND,
 };
 use json_router::{
     runtime_manifest::{
@@ -65,6 +69,8 @@ const STORAGE_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
 const STORAGE_DB_READINESS_TIMEOUT_SECS: u64 = 30;
 const STORAGE_DB_READINESS_REQUEST_TIMEOUT_SECS: u64 = 3;
 const SUBJECT_STORAGE_METRICS_GET: &str = "storage.metrics.get";
+const RPC_CH_ADMIN: &str = "admin";
+const RPC_CH_SYSTEM: &str = "system";
 const MSG_ILK_REGISTER: &str = "ILK_REGISTER";
 const MSG_ILK_UPDATE: &str = "ILK_UPDATE";
 const SY_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
@@ -423,6 +429,38 @@ struct OrchestratorState {
     blob: BlobRuntimeConfig,
     dist: DistRuntimeConfig,
     blob_sync_last_desired: Mutex<BlobRuntimeConfig>,
+    rpc: OnceLock<Arc<RpcClient>>,
+}
+
+impl OrchestratorState {
+    fn rpc(&self) -> Result<Arc<RpcClient>, OrchestratorError> {
+        self.rpc
+            .get()
+            .cloned()
+            .ok_or_else(|| "orchestrator rpc client unavailable".into())
+    }
+}
+
+fn build_orchestrator_rpc_profile() -> Result<OperationalRouteProfile, RpcError> {
+    OperationalRouteProfile::builder()
+        .command_channel(RPC_CH_ADMIN)
+        .command_channel(RPC_CH_SYSTEM)
+        // Operational ADMIN_COMMAND inbound must beat any pending RPC matcher.
+        .pre_pending_rule(
+            RouteMatch::exact(ADMIN_KIND, MSG_ADMIN_COMMAND),
+            RouteTarget::Command(RPC_CH_ADMIN),
+        )
+        // Broad catch-alls. Safe because response-only + stale tables filter
+        // any registered RPC response shape before profile rules run.
+        .post_pending_rule(
+            RouteMatch::any_msg_type(ADMIN_KIND),
+            RouteTarget::Command(RPC_CH_ADMIN),
+        )
+        .post_pending_rule(
+            RouteMatch::any_msg_type(SYSTEM_KIND),
+            RouteTarget::Command(RPC_CH_SYSTEM),
+        )
+        .build()
 }
 
 #[derive(Debug, Clone)]
@@ -528,6 +566,7 @@ async fn main() -> Result<(), OrchestratorError> {
         blob: blob_runtime.clone(),
         dist: dist_runtime,
         blob_sync_last_desired: Mutex::new(blob_runtime),
+        rpc: OnceLock::new(),
     });
     tracing::info!(
         blob_enabled = state.blob.enabled,
@@ -561,8 +600,13 @@ async fn main() -> Result<(), OrchestratorError> {
         version: "1.0".to_string(),
     };
 
-    let (mut sender, mut receiver) =
-        connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let rpc_profile = build_orchestrator_rpc_profile()
+        .map_err(|err| format!("orchestrator rpc profile invalid: {err}"))?;
+    let rpc_client =
+        RpcClient::connect_with_retry(node_config, Duration::from_secs(1), rpc_profile).await?;
+    if state.rpc.set(Arc::clone(&rpc_client)).is_err() {
+        return Err("orchestrator rpc client already initialized".into());
+    }
     tracing::info!("connected to router");
     tracing::info!(hive = %hive.hive_id, "hive ready");
     tracing::info!(
@@ -573,6 +617,33 @@ async fn main() -> Result<(), OrchestratorError> {
         },
         "orchestrator role mode"
     );
+
+    // Long-lived workers serializing admin/system command delivery. Each one
+    // owns its `RpcCommandReceiver` so we keep ordering inside a category
+    // while the RpcClient recv loop in `tokio::spawn` continues to dispatch
+    // pending RPC responses. This is the deadlock fix from ORPC review item 1.
+    let admin_rx = rpc_client
+        .take_command_receiver(RPC_CH_ADMIN)
+        .await
+        .map_err(|err| format!("orchestrator admin receiver: {err}"))?;
+    let system_rx = rpc_client
+        .take_command_receiver(RPC_CH_SYSTEM)
+        .await
+        .map_err(|err| format!("orchestrator system receiver: {err}"))?;
+    {
+        let state = Arc::clone(&state);
+        let client = Arc::clone(&rpc_client);
+        tokio::spawn(async move {
+            run_admin_worker(state, client, admin_rx).await;
+        });
+    }
+    {
+        let state = Arc::clone(&state);
+        let client = Arc::clone(&rpc_client);
+        tokio::spawn(async move {
+            run_system_worker(state, client, system_rx).await;
+        });
+    }
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -605,28 +676,32 @@ async fn main() -> Result<(), OrchestratorError> {
                 shutdown_sequence(&state).await;
                 return Ok(());
             }
-            msg = receiver.recv() => {
-                let msg = match msg {
-                    Ok(msg) => msg,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "sy.orchestrator connection interrupted; reconnect handled internally");
-                        continue;
-                    }
-                };
-                match msg.meta.msg_type.as_str() {
-                    "admin" => {
-                        if let Err(err) = handle_admin(&sender, &msg, &state).await {
-                            tracing::warn!("admin action error: {err}");
-                        }
-                    }
-                    SYSTEM_KIND => {
-                        if let Err(err) = handle_system_message(&sender, &msg, &state).await {
-                            tracing::warn!("system message error: {err}");
-                        }
-                    }
-                    _ => {}
-                }
-            }
+        }
+    }
+}
+
+async fn run_admin_worker(
+    state: Arc<OrchestratorState>,
+    client: Arc<RpcClient>,
+    mut rx: RpcCommandReceiver,
+) {
+    while let Some(msg) = rx.recv().await {
+        let sender = client.sender_snapshot();
+        if let Err(err) = handle_admin(&sender, &msg, &state).await {
+            tracing::warn!("admin action error: {err}");
+        }
+    }
+}
+
+async fn run_system_worker(
+    state: Arc<OrchestratorState>,
+    client: Arc<RpcClient>,
+    mut rx: RpcCommandReceiver,
+) {
+    while let Some(msg) = rx.recv().await {
+        let sender = client.sender_snapshot();
+        if let Err(err) = handle_system_message(&sender, &msg, &state).await {
+            tracing::warn!("system message error: {err}");
         }
     }
 }
@@ -1698,7 +1773,6 @@ fn is_allowed_system_source_name(state: &OrchestratorState, src_l2_name: Option<
     };
     state.system_allowed_origins.contains(name)
         || name.starts_with("SY.orchestrator@")
-        || name.starts_with("SY.orchestrator.")
         || name.starts_with("SY.admin@")
         || name.starts_with("SY.wf-rules@")
         || name.starts_with("WF.orch.diag@")
@@ -2881,21 +2955,6 @@ fn dist_runtime_from_hive(hive: &HiveFile) -> DistRuntimeConfig {
         path,
         sync_enabled,
         sync_tool,
-    }
-}
-
-async fn connect_with_retry(
-    config: &NodeConfig,
-    delay: Duration,
-) -> Result<(NodeSender, NodeReceiver), fluxbee_sdk::NodeError> {
-    loop {
-        match connect(config).await {
-            Ok(result) => return Ok(result),
-            Err(err) => {
-                tracing::warn!("connect failed: {err}");
-                time::sleep(delay).await;
-            }
-        }
     }
 }
 
@@ -9739,7 +9798,7 @@ fn identity_add_channels_from_payload(
     Ok(out)
 }
 
-async fn relay_system_action(
+async fn orchestrator_system_action(
     state: &OrchestratorState,
     destination: &str,
     request_msg: &str,
@@ -9747,125 +9806,18 @@ async fn relay_system_action(
     payload: serde_json::Value,
     forward_timeout: Duration,
 ) -> Result<serde_json::Value, OrchestratorError> {
-    let socket_dir = json_router::paths::router_socket_dir();
-    let relay_name = format!("SY.orchestrator.relay.{}", now_epoch_ms());
-    let relay_config = NodeConfig {
-        name: relay_name,
-        router_socket: socket_dir,
-        uuid_persistence_dir: state.state_dir.join("nodes"),
-        uuid_mode: NodeUuidMode::Ephemeral,
-        config_dir: state.config_dir.clone(),
-        version: "1.0".to_string(),
-    };
-    let connect_timeout = Duration::from_secs(5);
-    let (relay_sender, mut relay_receiver) = match time::timeout(
-        connect_timeout,
-        connect_with_retry(&relay_config, Duration::from_millis(100)),
-    )
-    .await
-    {
-        Ok(result) => result?,
-        Err(_) => {
-            return Err(format!(
-                "system forward timeout while connecting relay node to local router ({}s)",
-                connect_timeout.as_secs()
-            )
-            .into());
-        }
-    };
-    tracing::info!(
-        relay_name = %relay_config.name,
-        relay_uuid = %relay_sender.uuid(),
-        destination = %destination,
-        request_msg = %request_msg,
-        "relay system action connected"
-    );
-
-    let trace_id = Uuid::new_v4().to_string();
-    let request = Message {
-        routing: Routing {
-            src: relay_sender.uuid().to_string(),
-            src_l2_name: None,
-            dst: Destination::Unicast(destination.to_string()),
-            ttl: 16,
-            trace_id: trace_id.clone(),
-        },
-        meta: Meta {
-            msg_type: SYSTEM_KIND.to_string(),
-            msg: Some(request_msg.to_string()),
-            src_ilk: None,
-            scope: None,
-            target: None,
-            action: None,
-            priority: None,
-            context: None,
-            ..Meta::default()
-        },
-        payload,
-    };
-    relay_sender.send(request).await?;
-
-    let wait_response = async {
-        loop {
-            let incoming = relay_receiver.recv().await?;
-            if incoming.meta.msg_type != SYSTEM_KIND {
-                continue;
-            }
-            if incoming.routing.trace_id != trace_id {
-                continue;
-            }
-            if incoming.meta.msg.as_deref() == Some(MSG_UNREACHABLE) {
-                let reason = incoming
-                    .payload
-                    .get("reason")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("unknown");
-                let original_dst = incoming
-                    .payload
-                    .get("original_dst")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("-");
-                return Err(format!(
-                    "unreachable while waiting {} trace_id={} reason={} original_dst={}",
-                    response_msg, trace_id, reason, original_dst
-                )
-                .into());
-            }
-            if incoming.meta.msg.as_deref() == Some(MSG_TTL_EXCEEDED) {
-                let original_dst = incoming
-                    .payload
-                    .get("original_dst")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("-");
-                let last_hop = incoming
-                    .payload
-                    .get("last_hop")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("-");
-                return Err(format!(
-                    "ttl exceeded while waiting {} trace_id={} original_dst={} last_hop={}",
-                    response_msg, trace_id, original_dst, last_hop
-                )
-                .into());
-            }
-            if incoming.meta.msg.as_deref() != Some(response_msg) {
-                continue;
-            }
-            return Ok::<serde_json::Value, OrchestratorError>(incoming.payload);
-        }
-    };
-
-    match time::timeout(forward_timeout, wait_response).await {
-        Ok(result) => result,
-        Err(_) => Err(format!(
-            "system forward timeout msg={} response={} target={} timeout_secs={}",
+    let client = state.rpc()?;
+    let incoming = client
+        .send_system_rpc(SystemRpcRequest {
+            target: destination,
             request_msg,
             response_msg,
-            destination,
-            forward_timeout.as_secs()
-        )
-        .into()),
-    }
+            payload,
+            timeout: forward_timeout,
+        })
+        .await
+        .map_err(|err| OrchestratorError::from(err.to_string()))?;
+    Ok(incoming.payload)
 }
 
 async fn forward_system_action_to_hive(
@@ -9957,7 +9909,7 @@ async fn forward_system_action_to_hive_with_timeout(
     }
 
     let destination = format!("SY.orchestrator@{target_hive}");
-    relay_system_action(
+    orchestrator_system_action(
         state,
         &destination,
         request_msg,
@@ -9968,60 +9920,100 @@ async fn forward_system_action_to_hive_with_timeout(
     .await
 }
 
-async fn relay_identity_system_call_ok(
+async fn orchestrator_identity_system_call_ok(
     state: &OrchestratorState,
     target: &str,
     action: &str,
     payload: serde_json::Value,
     timeout: Duration,
 ) -> Result<serde_json::Value, IdentityError> {
-    let socket_dir = json_router::paths::router_socket_dir();
-    let relay_name = format!("SY.orchestrator.relay.{}", now_epoch_ms());
-    let relay_config = NodeConfig {
-        name: relay_name,
-        router_socket: socket_dir,
-        uuid_persistence_dir: state.state_dir.join("nodes"),
-        uuid_mode: NodeUuidMode::Ephemeral,
-        config_dir: state.config_dir.clone(),
-        version: "1.0".to_string(),
-    };
-    let connect_timeout = Duration::from_secs(5);
-    let (relay_sender, mut relay_receiver) = match time::timeout(
-        connect_timeout,
-        connect_with_retry(&relay_config, Duration::from_millis(100)),
-    )
-    .await
-    {
-        Ok(result) => result.map_err(IdentityError::Node)?,
-        Err(_) => {
-            return Err(IdentityError::InvalidResponse(format!(
-                "system forward timeout while connecting relay node to local router ({}s)",
-                connect_timeout.as_secs()
-            )));
-        }
-    };
-    tracing::info!(
-        relay_name = %relay_config.name,
-        relay_uuid = %relay_sender.uuid(),
-        target = %target,
-        action = %action,
-        "relay identity system call connected"
-    );
-
-    let result = identity_system_call_ok(
-        &relay_sender,
-        &mut relay_receiver,
-        IdentitySystemRequest {
+    let target = target.trim();
+    let action = action.trim();
+    if target.is_empty() {
+        return Err(IdentityError::InvalidRequest(
+            "target must be non-empty".to_string(),
+        ));
+    }
+    if action.is_empty() {
+        return Err(IdentityError::InvalidRequest(
+            "action must be non-empty".to_string(),
+        ));
+    }
+    let client = state
+        .rpc()
+        .map_err(|err| IdentityError::InvalidResponse(err.to_string()))?;
+    let response_msg = format!("{action}_RESPONSE");
+    let incoming = client
+        .send_system_rpc(SystemRpcRequest {
             target,
-            fallback_target: None,
-            action,
+            request_msg: action,
+            response_msg: &response_msg,
             payload,
             timeout,
+        })
+        .await
+        .map_err(map_rpc_error_to_identity)?;
+    let (status, error_code) = identity_payload_status_and_code(&incoming.payload);
+    if status == Some("ok") {
+        return Ok(incoming.payload);
+    }
+    Err(IdentityError::SystemRejected {
+        action: action.to_string(),
+        error_code: error_code.unwrap_or("UNKNOWN").to_string(),
+        message: identity_payload_message(&incoming.payload)
+            .unwrap_or("identity returned non-ok status")
+            .to_string(),
+    })
+}
+
+fn map_rpc_error_to_identity(err: RpcError) -> IdentityError {
+    match err {
+        RpcError::Node(err) => IdentityError::Node(err),
+        RpcError::Unreachable {
+            reason,
+            original_dst,
+        } => IdentityError::Unreachable {
+            reason,
+            original_dst,
         },
+        RpcError::TtlExceeded {
+            original_dst,
+            last_hop,
+        } => IdentityError::TtlExceeded {
+            original_dst,
+            last_hop,
+        },
+        RpcError::Timeout {
+            trace_id,
+            target,
+            request_msg,
+            timeout_ms,
+            ..
+        } => IdentityError::ActionTimeout {
+            action: request_msg,
+            trace_id,
+            target,
+            timeout_ms,
+        },
+        RpcError::InvalidRequest(message) => IdentityError::InvalidRequest(message),
+        other => IdentityError::InvalidResponse(other.to_string()),
+    }
+}
+
+fn identity_payload_status_and_code(payload: &serde_json::Value) -> (Option<&str>, Option<&str>) {
+    (
+        payload.get("status").and_then(serde_json::Value::as_str),
+        payload
+            .get("error_code")
+            .and_then(serde_json::Value::as_str),
     )
-    .await;
-    let _ = relay_sender.close().await;
-    result.map(|out| out.payload)
+}
+
+fn identity_payload_message(payload: &serde_json::Value) -> Option<&str> {
+    payload
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .filter(|msg| !msg.trim().is_empty())
 }
 
 fn identity_error_code_and_message(err: &IdentityError) -> (String, String) {
@@ -10127,7 +10119,7 @@ async fn ensure_node_identity_registered(
         }
     });
     let identity_target = format!("SY.identity@{}", identity_primary_hive_id);
-    let response = relay_identity_system_call_ok(
+    let response = orchestrator_identity_system_call_ok(
         state,
         &identity_target,
         MSG_ILK_REGISTER,
@@ -10184,7 +10176,7 @@ async fn apply_node_identity_update(
         "change_reason": change_reason,
     });
     let identity_target = format!("SY.identity@{}", identity_primary_hive_id);
-    let update_result = relay_identity_system_call_ok(
+    let update_result = orchestrator_identity_system_call_ok(
         state,
         &identity_target,
         MSG_ILK_UPDATE,
@@ -10810,7 +10802,7 @@ async fn get_node_status_flow(
         let node_status_request = serde_json::json!({
             "node_name": node_name,
         });
-        match relay_system_action(
+        match orchestrator_system_action(
             state,
             &node_name,
             "NODE_STATUS_GET",
@@ -12567,32 +12559,8 @@ async fn delete_ilk_for_teardown(
     target_hive: &str,
 ) -> serde_json::Value {
     let admin_target = ensure_l2_name("SY.admin", target_hive);
-    let socket_dir = json_router::paths::router_socket_dir();
-    let relay_config = NodeConfig {
-        name: format!("SY.orchestrator.ilk-delete.{}", now_epoch_ms()),
-        router_socket: socket_dir,
-        uuid_persistence_dir: state.state_dir.join("nodes"),
-        uuid_mode: NodeUuidMode::Ephemeral,
-        config_dir: state.config_dir.clone(),
-        version: "1.0".to_string(),
-    };
-    let (sender, mut receiver) =
-        match connect_with_retry(&relay_config, Duration::from_millis(100)).await {
-            Ok(pair) => pair,
-            Err(err) => {
-                return serde_json::json!({
-                    "status": "error",
-                    "target": admin_target,
-                    "ilk_id": ilk_id,
-                    "deleted": false,
-                    "error_detail": err.to_string(),
-                });
-            }
-        };
-
-    let response = admin_command(
-        &sender,
-        &mut receiver,
+    let response = orchestrator_admin_command(
+        state,
         AdminCommandRequest {
             admin_target: &admin_target,
             action: "delete_ilk",
@@ -12604,13 +12572,13 @@ async fn delete_ilk_for_teardown(
     )
     .await;
 
-    let _ = sender.close().await;
     match response {
         Ok(resp) if resp.status == "ok" => serde_json::json!({
             "status": "ok",
             "target": admin_target,
             "ilk_id": ilk_id,
             "deleted": true,
+            "trace_id": resp.trace_id,
             "payload": resp.payload,
         }),
         Ok(resp) if resp.error_code.as_deref() == Some("ILK_NOT_FOUND") => serde_json::json!({
@@ -12619,6 +12587,7 @@ async fn delete_ilk_for_teardown(
             "ilk_id": ilk_id,
             "deleted": false,
             "not_found": true,
+            "trace_id": resp.trace_id,
             "payload": resp.payload,
         }),
         Ok(resp) => serde_json::json!({
@@ -12626,6 +12595,7 @@ async fn delete_ilk_for_teardown(
             "target": admin_target,
             "ilk_id": ilk_id,
             "deleted": false,
+            "trace_id": resp.trace_id,
             "error_code": resp.error_code.unwrap_or_else(|| "UNKNOWN".to_string()),
             "error_detail": resp.error_detail.unwrap_or(resp.payload),
         }),
@@ -12692,38 +12662,8 @@ async fn purge_vault_secrets_for_ilk(
     target_hive: &str,
 ) -> serde_json::Value {
     let admin_target = ensure_l2_name("SY.admin", target_hive);
-    let socket_dir = json_router::paths::router_socket_dir();
-    let relay_config = NodeConfig {
-        name: format!("SY.orchestrator.vault-purge.{}", now_epoch_ms()),
-        router_socket: socket_dir,
-        uuid_persistence_dir: state.state_dir.join("nodes"),
-        uuid_mode: NodeUuidMode::Ephemeral,
-        config_dir: state.config_dir.clone(),
-        version: "1.0".to_string(),
-    };
-    let (sender, mut receiver) =
-        match connect_with_retry(&relay_config, Duration::from_millis(100)).await {
-            Ok(pair) => pair,
-            Err(err) => {
-                return serde_json::json!({
-                    "status": "error",
-                    "target": admin_target,
-                    "ilk_id": ilk_id,
-                    "scanned": 0,
-                    "deleted": 0,
-                    "errors": [
-                        {
-                            "stage": "connect",
-                            "error_detail": err.to_string(),
-                        }
-                    ],
-                });
-            }
-        };
-
-    let list_resp = match admin_command(
-        &sender,
-        &mut receiver,
+    let list_resp = match orchestrator_admin_command(
+        state,
         AdminCommandRequest {
             admin_target: &admin_target,
             action: "vault_list",
@@ -12737,7 +12677,6 @@ async fn purge_vault_secrets_for_ilk(
     {
         Ok(resp) => resp,
         Err(err) => {
-            let _ = sender.close().await;
             return serde_json::json!({
                 "status": "error",
                 "target": admin_target,
@@ -12754,7 +12693,6 @@ async fn purge_vault_secrets_for_ilk(
         }
     };
     if list_resp.status != "ok" {
-        let _ = sender.close().await;
         return serde_json::json!({
             "status": "error",
             "target": admin_target,
@@ -12788,9 +12726,8 @@ async fn purge_vault_secrets_for_ilk(
     let mut errors: Vec<serde_json::Value> = Vec::new();
 
     for key in keys {
-        let delete_resp = admin_command(
-            &sender,
-            &mut receiver,
+        let delete_resp = orchestrator_admin_command(
+            state,
             AdminCommandRequest {
                 admin_target: &admin_target,
                 action: "vault_delete",
@@ -12823,7 +12760,6 @@ async fn purge_vault_secrets_for_ilk(
         }
     }
 
-    let _ = sender.close().await;
     serde_json::json!({
         "status": if errors.is_empty() { "ok" } else { "partial" },
         "target": admin_target,
@@ -12892,6 +12828,18 @@ fn teardown_error_message(value: &serde_json::Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
+#[cfg(not(test))]
+async fn orchestrator_admin_command(
+    state: &OrchestratorState,
+    request: AdminCommandRequest<'_>,
+) -> Result<AdminCommandResult, OrchestratorError> {
+    let client = state.rpc()?;
+    client
+        .send_admin_rpc(request)
+        .await
+        .map_err(|err| OrchestratorError::from(err.to_string()))
+}
+
 async fn append_optional_teardown_cleanup(
     state: &OrchestratorState,
     response: &mut serde_json::Value,
@@ -12931,7 +12879,7 @@ async fn purge_owner_timers_before_teardown(
     owner_l2_name: &str,
 ) -> serde_json::Value {
     let timer_node = ensure_l2_name("SY.timer", target_hive);
-    match relay_system_action_for_timer_purge(
+    match orchestrator_system_action_for_timer_purge(
         state,
         &timer_node,
         "TIMER_PURGE_OWNER",
@@ -12970,7 +12918,7 @@ async fn purge_owner_timers_before_teardown(
     }
 }
 
-async fn relay_system_action_for_timer_purge(
+async fn orchestrator_system_action_for_timer_purge(
     state: &OrchestratorState,
     destination: &str,
     request_msg: &str,
@@ -12980,11 +12928,11 @@ async fn relay_system_action_for_timer_purge(
 ) -> Result<serde_json::Value, OrchestratorError> {
     #[cfg(test)]
     {
-        if let Some(result) = take_test_timer_purge_relay_result() {
+        if let Some(result) = take_test_timer_purge_result() {
             return result.map_err(|message| message.into());
         }
     }
-    relay_system_action(
+    orchestrator_system_action(
         state,
         destination,
         request_msg,
@@ -12996,7 +12944,7 @@ async fn relay_system_action_for_timer_purge(
 }
 
 #[cfg(test)]
-type TestTimerPurgeRelayResult = Result<serde_json::Value, String>;
+type TestTimerPurgeResult = Result<serde_json::Value, String>;
 
 /// Cross-test serialization for the teardown test slots (timer purge, ilk
 /// delete, vault purge). Each slot is process-global state; without this guard
@@ -13013,23 +12961,23 @@ fn teardown_test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[cfg(test)]
-fn test_timer_purge_relay_slot() -> &'static StdMutex<Option<TestTimerPurgeRelayResult>> {
-    static SLOT: OnceLock<StdMutex<Option<TestTimerPurgeRelayResult>>> = OnceLock::new();
+fn test_timer_purge_slot() -> &'static StdMutex<Option<TestTimerPurgeResult>> {
+    static SLOT: OnceLock<StdMutex<Option<TestTimerPurgeResult>>> = OnceLock::new();
     SLOT.get_or_init(|| StdMutex::new(None))
 }
 
 #[cfg(test)]
-fn set_test_timer_purge_relay_result(result: TestTimerPurgeRelayResult) {
-    *test_timer_purge_relay_slot()
+fn set_test_timer_purge_result(result: TestTimerPurgeResult) {
+    *test_timer_purge_slot()
         .lock()
-        .expect("test timer purge relay lock") = Some(result);
+        .expect("test timer purge lock") = Some(result);
 }
 
 #[cfg(test)]
-fn take_test_timer_purge_relay_result() -> Option<TestTimerPurgeRelayResult> {
-    test_timer_purge_relay_slot()
+fn take_test_timer_purge_result() -> Option<TestTimerPurgeResult> {
+    test_timer_purge_slot()
         .lock()
-        .expect("test timer purge relay lock")
+        .expect("test timer purge lock")
         .take()
 }
 
@@ -16800,6 +16748,7 @@ blob:
             blob: sample_blob_config(),
             dist: sample_dist_config(),
             blob_sync_last_desired: Mutex::new(sample_blob_config()),
+            rpc: OnceLock::new(),
         }
     }
 
@@ -16825,6 +16774,15 @@ blob:
         assert!(is_allowed_system_source_name(
             &state,
             Some("WF.orch.diag@motherbee")
+        ));
+    }
+
+    #[test]
+    fn system_source_rejects_orchestrator_relay_names() {
+        let state = sample_orchestrator_state_for_tests();
+        assert!(!is_allowed_system_source_name(
+            &state,
+            Some("SY.orchestrator.relay.123@motherbee")
         ));
     }
 
@@ -16940,7 +16898,7 @@ blob:
     async fn purge_owner_timers_before_teardown_returns_ok_payload_with_deleted_count() {
         let _guard = teardown_test_serial_guard();
         let state = sample_orchestrator_state_for_tests();
-        set_test_timer_purge_relay_result(Ok(serde_json::json!({
+        set_test_timer_purge_result(Ok(serde_json::json!({
             "ok": true,
             "verb": "TIMER_PURGE_OWNER",
             "deleted_count": 2
@@ -16964,10 +16922,10 @@ blob:
     }
 
     #[tokio::test]
-    async fn purge_owner_timers_before_teardown_surfaces_relay_error() {
+    async fn purge_owner_timers_before_teardown_surfaces_rpc_error() {
         let _guard = teardown_test_serial_guard();
         let state = sample_orchestrator_state_for_tests();
-        set_test_timer_purge_relay_result(Err(
+        set_test_timer_purge_result(Err(
             "system forward timeout msg=TIMER_PURGE_OWNER response=TIMER_RESPONSE".to_string(),
         ));
 

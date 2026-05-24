@@ -1,7 +1,3 @@
-pub use crate::admin::{
-    admin_command, admin_command_ok, AdminCommandError, AdminCommandRequest, AdminCommandResult,
-    ADMIN_KIND, MSG_ADMIN_COMMAND, MSG_ADMIN_COMMAND_RESPONSE,
-};
 pub use crate::blob::{
     constants as blob_constants, BlobConfig, BlobError, BlobGcOptions, BlobGcPassReport,
     BlobGcReport, BlobMetricsSnapshot, BlobRef, BlobStat, BlobToolkit, PublishBlobRequest,
@@ -23,16 +19,14 @@ pub use crate::comm::{
 };
 pub use crate::comm::{nats, protocol};
 pub use crate::identity::{
-    add_channel_to_ilk, identity_shm_name_for_hive, identity_system_call, identity_system_call_ok,
-    load_hive_id, provision_ilk, read_self_ilk_from_env, read_self_tenant_from_env,
+    identity_shm_name_for_hive, load_hive_id, read_self_ilk_from_env, read_self_tenant_from_env,
     resolve_ilk_from_hive_config, resolve_ilk_from_hive_id, resolve_ilk_from_shm_name,
-    set_ich_enabled, set_tenant_sponsor, stable_ich_id, update_tenant, IchSetEnabledResponse,
-    IdentityError, IdentityShmError, IdentitySystemRequest, IdentitySystemResult,
-    IlkAddChannelRequest, IlkAddChannelResult, IlkProvisionRequest, IlkProvisionResult,
-    TenantUpdateResponse, ENV_SELF_ILK_ID, ENV_SELF_TENANT_ID, MSG_ICH_SET_ENABLED,
-    MSG_IDENTITY_METRICS, MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION, MSG_ILK_PROVISION_RESPONSE,
-    MSG_ILK_REGISTER, MSG_ILK_SET_DEFINITION, MSG_ILK_UPDATE, MSG_TNT_APPROVE, MSG_TNT_CREATE,
-    MSG_TNT_SET_SPONSOR, MSG_TNT_UPDATE,
+    stable_ich_id, IchSetEnabledResponse, IdentityError, IdentityShmError, IlkAddChannelRequest,
+    IlkAddChannelResult, IlkProvisionRequest, IlkProvisionResult, TenantUpdateResponse,
+    ENV_SELF_ILK_ID, ENV_SELF_TENANT_ID, MSG_ICH_SET_ENABLED, MSG_IDENTITY_METRICS,
+    MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION, MSG_ILK_PROVISION_RESPONSE, MSG_ILK_REGISTER,
+    MSG_ILK_SET_DEFINITION, MSG_ILK_UPDATE, MSG_TNT_APPROVE, MSG_TNT_CREATE, MSG_TNT_SET_SPONSOR,
+    MSG_TNT_UPDATE,
 };
 pub use crate::managed_node::{
     managed_node_config_path, managed_node_config_path_with_root, managed_node_instance_dir,
@@ -58,6 +52,10 @@ pub use crate::node_secret::{
     NODE_SECRET_SCHEMA_VERSION,
 };
 pub use crate::payload::{PayloadError, TextV1Payload, TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES};
+pub use crate::rpc::{
+    AdminCommandRequest, AdminCommandResult, OperationalRouteProfile, RpcClient, RpcError,
+    SystemRpcRequest, ADMIN_KIND, MSG_ADMIN_COMMAND, MSG_ADMIN_COMMAND_RESPONSE,
+};
 pub use crate::status::try_handle_default_node_status;
 pub use crate::thread::{compute_thread_id, ThreadIdError, ThreadIdInput};
 pub use crate::timer::{

@@ -2,10 +2,10 @@ use std::error::Error;
 use std::path::PathBuf;
 
 use fluxbee_sdk::identity::{
-    identity_system_call, load_hive_id, IdentitySystemRequest, MSG_ILK_ADD_CHANNEL,
-    MSG_ILK_PROVISION, MSG_ILK_REGISTER, MSG_TNT_CREATE,
+    load_hive_id, MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION, MSG_ILK_REGISTER, MSG_TNT_CREATE,
 };
-use fluxbee_sdk::{connect, NodeConfig};
+use fluxbee_sdk::rpc::{OperationalRouteProfile, RpcClient, RpcError, SystemRpcRequest};
+use fluxbee_sdk::NodeConfig;
 use serde_json::{json, Value};
 use tokio::time::Duration;
 use tracing_subscriber::EnvFilter;
@@ -294,33 +294,23 @@ async fn run_case_expect_ok(
         config_dir: json_router::paths::config_dir(),
         version: "0.0.1".to_string(),
     };
-    let (sender, mut receiver) = connect(&cfg).await?;
-    let out = identity_system_call(
-        &sender,
-        &mut receiver,
-        IdentitySystemRequest {
-            target,
-            fallback_target,
-            action,
-            payload,
-            timeout,
-        },
-    )
-    .await?;
-    let _ = sender.close().await;
-    let status = out
-        .payload
+    let profile = OperationalRouteProfile::builder().build()?;
+    let client = RpcClient::connect_with_retry(cfg, Duration::from_millis(100), profile).await?;
+    let (payload, effective_target) =
+        identity_call_with_fallback(&client, target, fallback_target, action, payload, timeout)
+            .await?;
+    let status = payload
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or_default();
     if status != "ok" {
         return Err(format!(
             "unexpected non-ok response for {} from {} (effective={}): payload={}",
-            action, target, out.effective_target, out.payload
+            action, target, effective_target, payload
         )
         .into());
     }
-    Ok(out.payload)
+    Ok(payload)
 }
 
 async fn run_case_expect_error(
@@ -340,29 +330,18 @@ async fn run_case_expect_error(
         config_dir: json_router::paths::config_dir(),
         version: "0.0.1".to_string(),
     };
-    let (sender, mut receiver) = connect(&cfg).await?;
-    let out = identity_system_call(
-        &sender,
-        &mut receiver,
-        IdentitySystemRequest {
-            target,
-            fallback_target,
-            action,
-            payload,
-            timeout,
-        },
-    )
-    .await?;
-    let _ = sender.close().await;
+    let profile = OperationalRouteProfile::builder().build()?;
+    let client = RpcClient::connect_with_retry(cfg, Duration::from_millis(100), profile).await?;
+    let (payload, effective_target) =
+        identity_call_with_fallback(&client, target, fallback_target, action, payload, timeout)
+            .await?;
 
-    let status = out
-        .payload
+    let status = payload
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let code = out
-        .payload
+    let code = payload
         .get("error_code")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -370,11 +349,88 @@ async fn run_case_expect_error(
     if status != "error" || code != expected_code {
         return Err(format!(
             "unexpected response for {} from {} (effective={}): expected status=error code={}, got payload={}",
-            action, target, out.effective_target, expected_code, out.payload
+            action, target, effective_target, expected_code, payload
         )
         .into());
     }
     Ok(code)
+}
+
+/// Replicates the SDK `identity_system_call` fallback semantics over the new
+/// `RpcClient::send_system_rpc`. Retries on transport `UNREACHABLE` with
+/// `reason=NODE_NOT_FOUND` or on payload `status=error, error_code=NOT_PRIMARY`,
+/// against `fallback_target` when supplied and distinct.
+async fn identity_call_with_fallback(
+    client: &RpcClient,
+    target: &str,
+    fallback_target: Option<&str>,
+    action: &str,
+    payload: Value,
+    timeout: Duration,
+) -> Result<(Value, String), DynError> {
+    let response_msg = format!("{action}_RESPONSE");
+    let primary = client
+        .send_system_rpc(SystemRpcRequest {
+            target,
+            request_msg: action,
+            response_msg: &response_msg,
+            payload: payload.clone(),
+            timeout,
+        })
+        .await;
+
+    let fallback_eligible = |fb: Option<&str>| -> Option<String> {
+        fb.map(str::trim)
+            .filter(|fb| !fb.is_empty() && *fb != target)
+            .map(str::to_string)
+    };
+
+    match primary {
+        Ok(msg) => {
+            let p = &msg.payload;
+            let status = p.get("status").and_then(Value::as_str);
+            let code = p.get("error_code").and_then(Value::as_str);
+            if status == Some("error") && code == Some("NOT_PRIMARY") {
+                if let Some(fb) = fallback_eligible(fallback_target) {
+                    let retry = client
+                        .send_system_rpc(SystemRpcRequest {
+                            target: &fb,
+                            request_msg: action,
+                            response_msg: &response_msg,
+                            payload,
+                            timeout,
+                        })
+                        .await?;
+                    return Ok((retry.payload, fb));
+                }
+            }
+            Ok((msg.payload, target.to_string()))
+        }
+        Err(RpcError::Unreachable {
+            reason,
+            original_dst,
+        }) => {
+            if reason == "NODE_NOT_FOUND" {
+                if let Some(fb) = fallback_eligible(fallback_target) {
+                    let retry = client
+                        .send_system_rpc(SystemRpcRequest {
+                            target: &fb,
+                            request_msg: action,
+                            response_msg: &response_msg,
+                            payload,
+                            timeout,
+                        })
+                        .await?;
+                    return Ok((retry.payload, fb));
+                }
+            }
+            Err(format!(
+                "identity transport unreachable reason={reason} original_dst={original_dst}"
+            )
+            .into())
+        }
+        Err(other) => Err(other.to_string().into()),
+    }
 }
 
 fn env_or(key: &str, default: &str) -> String {

@@ -309,44 +309,38 @@ Estado de tareas FR-09:
 Criterio de cierre FR-09:
 - Cumplido (2026-03-15). Ver checklist consolidado en `docs/onworking/admin-internal-gateway-spec.md`.
 
+Nota post-ORPC (2026-05-24):
+
+- El helper SDK `admin_command()` fue eliminado. El SDK ahora expone `fluxbee_sdk::rpc::RpcClient::send_admin_rpc(AdminCommandRequest)` como única vía canónica. Los callers internos (`sy_admin`, `sy_orchestrator`, `sy_architect`, diags) usan `RpcClient` directamente.
+
 ---
 
 ### FR-10 — Unificar llamadas de identity en orchestrator con helpers del SDK (opción 1)
 
-Estado: OPEN (backlog)
+Estado: SUPERSEDED y CLOSED por `docs/onworking COA/orchestrator_internal_rpc_multiplexing_tasks.md` (Block C cerrado 2026-05-24).
 
-Qué pasa hoy:
-- `SY.orchestrator` usa implementación propia de transporte para `ILK_REGISTER/ILK_UPDATE` (`relay_system_action` + parse/manual errors).
-- El SDK ya expone helpers canónicos de identity (`identity_system_call`, `identity_system_call_ok`), pero orchestrator no los usa.
+Qué pasaba:
 
-Decisión acordada (alcance mínimo):
-- Adoptar opción 1: migrar solo el flujo identity de `run_node` a helpers SDK, sin rediseñar loop principal ni refactor global de mensajería.
-- Mantener compatibilidad del contrato externo actual (`IDENTITY_REGISTER_FAILED`, payloads de `run_node`, timeouts observables).
+- `SY.orchestrator` usaba transporte propio para `ILK_REGISTER/ILK_UPDATE` y abría conexiones auxiliares.
+- El SDK exponía helpers canónicos de identity (`identity_system_call`, `identity_system_call_ok`), pero eso no resolvía por sí solo la propiedad única del receiver principal.
 
-Límite explícito SDK vs negocio:
-- SDK (`fluxbee_sdk::identity`) solo centraliza transporte y manejo genérico de llamadas identity (`trace_id`, timeout, unreachable/ttl, status/error_code).
-- `SY.orchestrator` mantiene reglas de negocio: cuándo llamar, target fijo `SY.identity@motherbee`, armado de payload (`tenant_id`, `ilk_type`, `identification`), persistencia local `node->ilk` y contrato externo de admin/E2E.
-- No mover al SDK decisiones de flujo de spawn ni validaciones de negocio específicas de orchestrator.
+Decisión posterior (ORPC v2):
 
-No objetivo en esta etapa:
-- No reemplazar `forward_system_action_to_hive` ni `relay_system_action` para el resto de acciones.
-- No cambiar el modelo de concurrencia del receiver principal de orchestrator.
+- El problema se movió a ORPC: `SY.orchestrator` multiplexa respuestas por `trace_id` sobre su conexión canónica vía `fluxbee_sdk::rpc::RpcClient`.
+- Los helpers `identity_system_call`, `identity_system_call_ok`, `provision_ilk`, `add_channel_to_ilk`, `update_tenant`, `set_tenant_sponsor`, `set_ich_enabled` fueron **eliminados** del SDK en Block B del plan ORPC.
+- Los callers que necesitaban lógica de fallback (`NOT_PRIMARY` / `UNREACHABLE NODE_NOT_FOUND`) la implementan localmente sobre `RpcClient::send_system_rpc`.
+- No queda transporte auxiliar ni aliases de compatibilidad.
 
-Lista de tareas FR-10 (backlog):
-- [x] FR10-T1. Extraer un wrapper local en orchestrator para crear `NodeSender/NodeReceiver` de relay y ejecutar una llamada identity SDK dentro de ese contexto.
-- [x] FR10-T2. Migrar `ensure_node_identity_registered` para usar `fluxbee_sdk::identity::identity_system_call_ok` con `MSG_ILK_REGISTER`.
-- [x] FR10-T3. Migrar `apply_node_identity_update` para usar `fluxbee_sdk::identity::identity_system_call_ok` con `MSG_ILK_UPDATE`.
-- [x] FR10-T4. Mapear `IdentityError -> OrchestratorError` preservando códigos/mensajes ya consumidos por admin/E2E.
-- [x] FR10-T5. Mantener `identity_target` explícito (`SY.identity@motherbee`) en payload de respuesta para no romper diagnósticos actuales.
-- [ ] FR10-T6. Si aparece lógica reusable, subir al SDK solo helpers agnósticos de transporte/protocolo identity (no reglas de negocio de orchestrator).
-- [x] FR10-T7. Unit tests en orchestrator para mapeo de error y paths `ok/error` de registro/actualización identity.
-- [x] FR10-T8. Re-ejecutar regresión E2E mínima: `identity_register_strict_e2e.sh` + `inventory_identity_primary_routing_e2e.sh`.
-- [x] FR10-T9. Actualizar docs de implementación (`10-identity-v2.md` + este doc) indicando que orchestrator usa helper SDK para identity calls.
+Lista de tareas FR-10 (cerradas vía ORPC Block C):
+
+- [x] FR10-T1..T9. Migrados o reemplazados por las tareas ORPC C1..C8 (ver doc principal).
+- [x] FR10-T6. `RpcClient` centraliza el transporte agnóstico en el SDK; las reglas de negocio (target, payload, mapping de errores) viven en orchestrator.
 
 Criterio de cierre FR-10:
-- No hay envío manual de `ILK_REGISTER/ILK_UPDATE` en orchestrator fuera del wrapper de transición.
-- E2E FR-02 + D4/D5 siguen en verde sin cambios de contrato externo.
-- Lógica reusable de llamada identity queda centralizada en SDK.
+
+- Cumplido (2026-05-24) vía cierre de ORPC Block C.
+- `ensure_node_identity_registered` y `apply_node_identity_update` usan `orchestrator_identity_system_call_ok` que delega en `state.rpc.send_system_rpc(SystemRpcRequest)`.
+- E2E identity continúan en verde post-refactor.
 
 ---
 

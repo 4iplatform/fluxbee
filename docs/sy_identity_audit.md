@@ -207,7 +207,6 @@ Mecanismos:
 
 - Lista de prefixes por accion.
 - Lista de nombres exactos para bootstrap.
-- Variante especial: `SY.orchestrator.relay.<...>@hive` tambien puede mapear a `SY.orchestrator@hive`.
 - Algunas acciones (`PING`, `STATUS`, `IDENTITY_METRICS`) son abiertas.
 
 Evaluacion:

@@ -2,11 +2,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use fluxbee_sdk::identity::{
-    load_hive_id, provision_ilk, resolve_ilk_from_hive_config, IdentityShmError,
-    IlkProvisionRequest,
+    load_hive_id, resolve_ilk_from_hive_config, IdentityShmError, MSG_ILK_PROVISION,
+    MSG_ILK_PROVISION_RESPONSE,
 };
-use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
-use fluxbee_sdk::{connect, try_handle_default_node_status, NodeConfig, NodeReceiver, NodeSender};
+use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
+use fluxbee_sdk::rpc::{
+    OperationalRouteProfile, RouteMatch, RouteTarget, RpcClient, RpcCommandReceiver,
+    SystemRpcRequest,
+};
+use fluxbee_sdk::{try_handle_default_node_status, NodeConfig, NodeSender};
 use serde_json::{json, Value};
 use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
@@ -42,14 +46,47 @@ async fn main() -> Result<(), DynError> {
         "starting IO.test"
     );
 
-    let (sender, mut receiver) = connect(&cfg).await?;
-    let src_ilk =
-        resolve_or_provision_ilk(&sender, &mut receiver, &config_dir, &channel_type, &address)
-            .await?;
+    // Profile: `user_reply` catches inbound user-msg replies; status_get is
+    // routed pre_pending so the responder handler runs while RPCs may be
+    // pending in flight.
+    let profile = OperationalRouteProfile::builder()
+        .command_channel("status_get")
+        .command_channel("user_reply")
+        .pre_pending_rule(
+            RouteMatch::exact(SYSTEM_KIND, "NODE_STATUS_GET"),
+            RouteTarget::Command("status_get"),
+        )
+        .post_pending_rule(
+            RouteMatch::any_msg_type("user"),
+            RouteTarget::Command("user_reply"),
+        )
+        .build()?;
+    let client = RpcClient::connect_with_retry(cfg, Duration::from_millis(100), profile).await?;
+    let sender = client.sender_snapshot();
+    // Drain the status_get channel in the background so the router never
+    // blocks on unanswered NODE_STATUS_GET probes.
+    {
+        let status_client = std::sync::Arc::clone(&client);
+        let mut status_rx = status_client
+            .take_command_receiver("status_get")
+            .await
+            .map_err(|err| -> DynError { err.to_string().into() })?;
+        let status_sender = status_client.sender_snapshot();
+        tokio::spawn(async move {
+            while let Some(msg) = status_rx.recv().await {
+                let _ = try_handle_default_node_status(&status_sender, &msg).await;
+            }
+        });
+    }
+    let mut user_rx = client
+        .take_command_receiver("user_reply")
+        .await
+        .map_err(|err| -> DynError { err.to_string().into() })?;
+    let src_ilk = resolve_or_provision_ilk(&client, &config_dir, &channel_type, &address).await?;
     tracing::info!(src_ilk = %src_ilk, "using src_ilk for routing probe");
 
     let trace_id = send_probe(&sender, &src_ilk, &probe_id, &text).await?;
-    let reply = wait_for_reply(&sender, &mut receiver, &trace_id, wait_reply_ms).await?;
+    let reply = wait_for_reply(&mut user_rx, &trace_id, wait_reply_ms).await?;
 
     let handled_by = reply
         .payload
@@ -65,8 +102,7 @@ async fn main() -> Result<(), DynError> {
 }
 
 async fn resolve_or_provision_ilk(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
+    client: &RpcClient,
     config_dir: &Path,
     channel_type: &str,
     address: &str,
@@ -94,21 +130,41 @@ async fn resolve_or_provision_ilk(
 
     let hive_id = load_hive_id(config_dir)?;
     let target = env_or("IO_TEST_IDENTITY_TARGET", &format!("SY.identity@{hive_id}"));
-    let provisioned = provision_ilk(
-        sender,
-        receiver,
-        IlkProvisionRequest {
+    let ich_id = format!("ich:{}", Uuid::new_v4());
+    let timeout_ms = env_u64("IO_TEST_PROVISION_TIMEOUT_MS", 8_000);
+    let payload = json!({
+        "ich_id": ich_id,
+        "channel_type": channel_type,
+        "address": address,
+    });
+    let response = client
+        .send_system_rpc(SystemRpcRequest {
             target: &target,
-            ich_id: &format!("ich:{}", Uuid::new_v4()),
-            channel_type,
-            address,
-            tenant_id: None,
-            ilk_type: None,
-            timeout: Duration::from_millis(env_u64("IO_TEST_PROVISION_TIMEOUT_MS", 8_000)),
-        },
-    )
-    .await?;
-    Ok(provisioned.ilk_id)
+            request_msg: MSG_ILK_PROVISION,
+            response_msg: MSG_ILK_PROVISION_RESPONSE,
+            payload,
+            timeout: Duration::from_millis(timeout_ms),
+        })
+        .await?;
+    let status = response
+        .payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("error");
+    if status != "ok" {
+        return Err(format!(
+            "ILK_PROVISION returned non-ok status={} payload={}",
+            status, response.payload
+        )
+        .into());
+    }
+    let ilk_id = response
+        .payload
+        .get("ilk_id")
+        .and_then(Value::as_str)
+        .ok_or("ILK_PROVISION response missing ilk_id")?
+        .to_string();
+    Ok(ilk_id)
 }
 
 async fn send_probe(
@@ -158,8 +214,7 @@ async fn send_probe(
 }
 
 async fn wait_for_reply(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
+    receiver: &mut RpcCommandReceiver,
     expected_trace_id: &str,
     timeout_ms: u64,
 ) -> Result<Message, DynError> {
@@ -176,8 +231,13 @@ async fn wait_for_reply(
             return Err(format!("timeout waiting reply trace_id={expected_trace_id}").into());
         }
         let incoming = match timeout(remaining, receiver.recv()).await {
-            Ok(Ok(msg)) => msg,
-            Ok(Err(err)) => return Err(err.into()),
+            Ok(Some(msg)) => msg,
+            Ok(None) => {
+                return Err(format!(
+                    "user_reply channel closed waiting trace_id={expected_trace_id}"
+                )
+                .into());
+            }
             Err(_) => {
                 tracing::warn!(
                     trace_id = %expected_trace_id,
@@ -197,13 +257,7 @@ async fn wait_for_reply(
             "IO.test received message while waiting for reply"
         );
 
-        if try_handle_default_node_status(sender, &incoming).await? {
-            continue;
-        }
         if incoming.routing.trace_id != expected_trace_id {
-            continue;
-        }
-        if incoming.meta.msg_type != "user" {
             continue;
         }
         tracing::info!(

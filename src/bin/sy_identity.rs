@@ -2500,10 +2500,8 @@ impl IdentityRuntime {
             return false;
         };
 
-        let variants = authorized_name_variants(name);
-
         if let Some(exacts) = self.allowed_exacts.get(action) {
-            if variants.iter().any(|candidate| exacts.contains(candidate)) {
+            if exacts.contains(name) {
                 return true;
             }
         }
@@ -2511,9 +2509,7 @@ impl IdentityRuntime {
         let Some(prefixes) = self.allowed_prefixes.get(action) else {
             return false;
         };
-        variants
-            .iter()
-            .any(|candidate| prefixes.iter().any(|prefix| candidate.starts_with(prefix)))
+        prefixes.iter().any(|prefix| name.starts_with(prefix))
     }
 }
 
@@ -2530,16 +2526,6 @@ fn configured_identity_frontdesk_node_name(hive: &HiveFile) -> Option<String> {
                 format!("{value}@{}", hive.hive_id)
             }
         })
-}
-
-fn authorized_name_variants(name: &str) -> Vec<String> {
-    let mut out = vec![name.to_string()];
-    if let Some((local, hive)) = name.split_once('@') {
-        if local.starts_with("SY.orchestrator.relay.") {
-            out.push(format!("SY.orchestrator@{hive}"));
-        }
-    }
-    out
 }
 
 #[tokio::main]
@@ -5574,6 +5560,18 @@ mod tests {
 
         assert!(!runtime.is_authorized(MSG_ILK_REGISTER, None));
         assert!(!runtime.is_authorized(MSG_TNT_CREATE, None));
+    }
+
+    #[test]
+    fn identity_runtime_rejects_orchestrator_relay_for_protected_actions() {
+        let hive = test_hive(Some("SY.frontdesk.gov@motherbee"));
+        let runtime = IdentityRuntime::new(&hive, PathBuf::from("/tmp"), true, None);
+
+        assert!(!runtime.is_authorized(
+            MSG_ILK_REGISTER,
+            Some("SY.orchestrator.relay.123@motherbee")
+        ));
+        assert!(runtime.is_authorized(MSG_ILK_REGISTER, Some("SY.orchestrator@motherbee")));
     }
 
     #[test]

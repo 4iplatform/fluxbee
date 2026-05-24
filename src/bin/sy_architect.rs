@@ -53,10 +53,11 @@ use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest,
     MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
+use fluxbee_sdk::rpc::{AdminCommandRequest, OperationalRouteProfile, RpcClient};
 use fluxbee_sdk::{
-    admin_command, build_node_config_response_message, connect, list_ich_options_from_hive_id,
-    try_handle_default_node_status, AdminCommandRequest, IdentityIchOption, NodeConfig, NodeError,
-    NodeReceiver, NodeSender, NODE_SECRET_REDACTION_TOKEN,
+    build_node_config_response_message, connect, list_ich_options_from_hive_id,
+    try_handle_default_node_status, IdentityIchOption, NodeConfig, NodeError, NodeReceiver,
+    NodeSender, NODE_SECRET_REDACTION_TOKEN,
 };
 use futures::TryStreamExt;
 use json_router::runtime_manifest::{
@@ -12947,21 +12948,21 @@ async fn execute_admin_action_with_context(
         config_dir: context.config_dir.clone(),
         version: "0.1.0".to_string(),
     };
-    let (sender, mut receiver) = connect(&node_config).await?;
-    let response = admin_command(
-        &sender,
-        &mut receiver,
-        AdminCommandRequest {
+    let rpc_profile = OperationalRouteProfile::builder()
+        .build()
+        .map_err(|err| -> ArchitectError { err.to_string().into() })?;
+    let client =
+        RpcClient::connect_with_retry(node_config, Duration::from_millis(100), rpc_profile).await?;
+    let response = client
+        .send_admin_rpc(AdminCommandRequest {
             admin_target,
             action,
             target,
             params,
             request_id: None,
             timeout,
-        },
-    )
-    .await;
-    let _ = sender.close().await;
+        })
+        .await;
     let out = response.map_err(|err| -> ArchitectError {
         tracing::warn!(
             purpose = %purpose,
@@ -13051,47 +13052,43 @@ async fn fetch_inventory_status_data(
         config_dir: state.config_dir.clone(),
         version: "0.1.0".to_string(),
     };
-    let (sender, mut receiver) = connect(&node_config)
-        .await
-        .map_err(|err| -> ArchitectError { Box::new(err) })?;
+    let rpc_profile = OperationalRouteProfile::builder()
+        .build()
+        .map_err(|err| -> ArchitectError { err.to_string().into() })?;
+    let client =
+        RpcClient::connect_with_retry(node_config, Duration::from_millis(100), rpc_profile)
+            .await
+            .map_err(|err| -> ArchitectError { Box::new(err) })?;
     let admin_target = format!("SY.admin@{}", state.hive_id);
 
-    let summary_response = admin_command(
-        &sender,
-        &mut receiver,
-        AdminCommandRequest {
+    let summary_response = client
+        .send_admin_rpc(AdminCommandRequest {
             admin_target: &admin_target,
             action: "inventory",
             target: None,
             params: json!({ "scope": "summary" }),
             request_id: None,
             timeout: Duration::from_secs(5),
-        },
-    )
-    .await;
+        })
+        .await;
     let summary = match summary_response {
         Ok(summary) => summary,
         Err(err) => {
-            let _ = sender.close().await;
-            return Err(Box::new(err));
+            return Err(err.to_string().into());
         }
     };
     ensure_admin_ok("inventory summary", &summary)?;
 
-    let hive_response = admin_command(
-        &sender,
-        &mut receiver,
-        AdminCommandRequest {
+    let hive_response = client
+        .send_admin_rpc(AdminCommandRequest {
             admin_target: &admin_target,
             action: "inventory",
             target: None,
             params: json!({ "scope": "hive", "filter_hive": state.hive_id }),
             request_id: None,
             timeout: Duration::from_secs(5),
-        },
-    )
-    .await;
-    let _ = sender.close().await;
+        })
+        .await;
     let hive_payload = match hive_response {
         Ok(result) => {
             if ensure_admin_ok("inventory hive", &result).is_ok() {
