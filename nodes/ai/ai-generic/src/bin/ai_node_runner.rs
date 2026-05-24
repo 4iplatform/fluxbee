@@ -26,9 +26,7 @@ use fluxbee_sdk::node_client::NodeError;
 use fluxbee_sdk::protocol::{
     Destination, MemoryPackage, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
-use fluxbee_sdk::{
-    managed_node_config_path, managed_node_name,
-};
+use fluxbee_sdk::{managed_node_config_path, managed_node_name};
 use fluxbee_sdk::{MSG_ILK_REGISTER, MSG_TNT_CREATE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1311,8 +1309,7 @@ impl GenericAiNode {
     ) -> fluxbee_ai_sdk::Result<AiBehaviorOutput> {
         let api_key = self.resolve_openai_api_key(openai).await.ok_or_else(|| {
             fluxbee_ai_sdk::errors::AiSdkError::Protocol(
-                "missing OpenAI api key in SY.vault resource_type=openai"
-                    .to_string(),
+                "missing OpenAI api key in SY.vault resource_type=openai".to_string(),
             )
         })?;
         let mut client = OpenAiResponsesClient::new(api_key);
@@ -6468,9 +6465,8 @@ mod tests {
         );
 
         let mut changed_hashes = hashes.clone();
-        changed_hashes.skill_hashes = vec![
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
-        ];
+        changed_hashes.skill_hashes =
+            vec!["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()];
         assert!(!should_reuse_cognitive_state(
             &state,
             &ilk.ilk_id,

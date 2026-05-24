@@ -2,7 +2,7 @@
 
 Date: 2026-05-23 (created)
 Updated: 2026-05-24 (Iter 1 Blocks A–G + H1–H3 done; H4/H5 statically validated; Iter 2 AF-P1..AF-P3 done; Iter 3 review follow-up done)
-Status: Iteration 1 — Blocks A, B, C, D, E, F, G **done**; Block H: H1/H2/H3 covered by in-process `RpcTestHarness` tests; H4/H5 scripts statically verified, formal `[x]` waits on staging/CI run. Iteration 2 (audit follow-up) — AF-P1 (auth bypass fix), AF-P2a (fail-fast on reconnect), AF-P2b (observational filter), AF-P3 (doc inventory) all **done**. Iteration 3 (code-review hardening) — AF-P4..AF-P7 **done**.
+Status: Iteration 1 — Blocks A, B, C, D, E, F, G **done**; Block H: H1/H2/H3 covered by in-process `RpcTestHarness` tests; H4/H5 scripts statically verified, formal `[x]` waits on staging/CI run. Iteration 2 (audit follow-up) — AF-P1 (auth bypass fix), AF-P2a (fail-fast on reconnect), AF-P2b (observational filter), AF-P3 (doc inventory) all **done**. Iteration 3 (code-review hardening) — AF-P4 (write-side drain), AF-P5 (`wait_connected` enable), AF-P6 (Exact under observational family), AF-P7 (response-only after send) **done**; AF-P8 (tx_loop error classification hardening) **deferred** as low-priority. `cargo fmt --check`: 0 diffs across workspace.
 
 ## Goal
 
@@ -283,14 +283,14 @@ ORPC-1..ORPC-14 (the v1 list, see "Task list v1 — historical" below) are subsu
 
 Classification: **anti-pattern follow-up**, not a bug. Each lookup announces/withdraws the L2 from the router unnecessarily. No deadlock, no identity spoof. **Out of ORPC scope.** Suggested follow-up: extend SDK with `RpcClient::resolve_resource` or `VaultClient` that wraps `Arc<RpcClient>`, then migrate the 7 call sites.
 
-**Separate (acceptable) category — one-shot `RpcClient` ephemeral RPCs:**
+**Separate category — one-shot `RpcClient` ephemeral RPCs:**
 
 | File | Use |
 | --- | --- |
 | `src/bin/sy_architect.rs:12943` | `RpcClient::connect_with_retry` + `send_admin_rpc` + drop (one-off admin action) |
 | `src/bin/sy_architect.rs:13047` | `RpcClient::connect_with_retry` + `send_admin_rpc` + drop (architect status fetch) |
 
-These are **not** anti-patterns. `sy_architect` only needs occasional outbound admin RPCs and creates a short-lived `Arc<RpcClient>` per call. The canonical SDK abstraction is used; no leaked L2 spoof, no `NodeReceiver` solapado, no internal dispatcher. Listed here for completeness so future audits don't conflate them with Pattern 3.
+Superseded note (2026-05-24): runtime inventory showed these clients as many visible `SY.architect.*.<uuid>` nodes. They are not orchestrator regressions and do use the SDK `RpcClient`, but they are still an operational anti-pattern for `SY.architect`. Follow-up is tracked in `docs/onworking COA/sy_architect_rpc_multiplexing_tasks.md`: architect should reuse one canonical `SY.architect@<hive>` `RpcClient` for status refresh, tool reads, plan compiler calls, executor calls, and later vault lookups.
 
 ### Block G — Relay residue cleanup (subsumes ORPC-9, 13, 14)
 
@@ -489,9 +489,19 @@ Total real: **7 sites**, not 5. Also: the 2 `RpcClient::connect_with_retry` ephe
 
 - `cargo test -p fluxbee-sdk -- --nocapture`: 144/144 passed.
 - `cargo test --bin sy_orchestrator -- --nocapture`: 90/90 passed.
+- `cargo test --bin sy_admin`: 65/65 passed.
+- `cargo check --workspace`: clean.
 - `git diff --check`: passed.
 - `rustfmt --check --edition 2021 crates/fluxbee_sdk/src/node_client.rs crates/fluxbee_sdk/src/split.rs crates/fluxbee_sdk/src/rpc.rs src/bin/sy_orchestrator.rs`: passed.
-- `cargo fmt --check`: still reports pre-existing formatting diffs in `nodes/ai/ai-generic/src/bin/ai_node_runner.rs` only; not touched by ORPC work.
+- **`cargo fmt --all` executed 2026-05-24**: pre-existing fmt debt in `nodes/ai/ai-generic/src/bin/ai_node_runner.rs` cleaned in the same pass; `cargo fmt --check` now returns **0 diffs across the workspace**.
+
+### AF-P8 — `tx_loop` error classification cleanup (🟢 OPTIONAL hardening — deferred)
+
+**Optional**: AF-P4 currently forwards `disconnect_tx.send(Err(NodeError::Io(err)))` and the recv-loop classifier accepts both `Io(_)` and `Disconnected`. If a future change tightens that classifier to only `Disconnected`, the write-side path silently regresses. Hardening would convert the `tx_loop` error to `NodeError::Disconnected` before forwarding (keeping the original `Io` in `tracing::warn!`).
+
+**Status**: not blocking. The classifier covers both cases today. Deferred as low-priority follow-up.
+
+- [ ] **AF-P8.** Deferred. Implement only if the classifier contract changes.
 
 ### Iteration 2 execution order
 
