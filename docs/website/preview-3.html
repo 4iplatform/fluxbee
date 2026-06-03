@@ -1,0 +1,1757 @@
+<!DOCTYPE html>
+<html lang="es" data-lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <title>fluxbee — Empleados digitales para ventas y soporte</title>
+  <meta name="description" content="Fluxbee crea empleados digitales para ventas, marketing y soporte. Trabajan en LinkedIn, WhatsApp, Instagram, HubSpot, Google Workspace, Slack y tus sistemas internos." />
+
+  <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png" />
+  <link rel="icon" type="image/png" sizes="16x16" href="favicon-16.png" />
+  <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Fira+Code:wght@400;500;600&display=swap" rel="stylesheet" />
+
+  <style>
+    :root {
+      --blue: #0070f3;
+      --blue-2: #4a7be8;
+      --blue-3: #dce9ff;
+      --ink: #16181d;
+      --ink-2: #2d313a;
+      --muted: #667085;
+      --muted-2: #8a93a3;
+      --line: #dde5f2;
+      --line-2: #edf1f7;
+      --bg: #f6f8fc;
+      --bg-2: #eef4ff;
+      --card: #ffffff;
+      --soft: #f9fbff;
+      --green: #11a36a;
+      --purple: #7c5cff;
+      --orange: #e8912d;
+      --shadow: 0 24px 80px rgba(26, 43, 74, .10);
+      --shadow-soft: 0 12px 34px rgba(26, 43, 74, .07);
+      --radius: 28px;
+      --max: 1240px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: linear-gradient(180deg, #f5f8ff 0%, #ffffff 56%, #f7f9fd 100%);
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+    a { color: inherit; text-decoration: none; }
+    button, input { font: inherit; }
+    ::selection { background: var(--blue-3); }
+
+    .shell {
+      position: relative;
+      min-height: 100vh;
+      overflow: clip;        /* clip overflow without breaking the sticky nav */
+    }
+    .shell::before {
+      content: "";
+      position: absolute;
+      inset: -200px -200px auto -200px;
+      height: 720px;
+      background:
+        radial-gradient(circle at 18% 30%, rgba(74,123,232,.22), transparent 28rem),
+        radial-gradient(circle at 78% 18%, rgba(0,112,243,.15), transparent 24rem),
+        radial-gradient(circle at 45% 72%, rgba(124,92,255,.09), transparent 28rem);
+      pointer-events: none;
+      z-index: -1;
+    }
+
+    .container {
+      max-width: var(--max);
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* NAV */
+    .nav {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      height: 76px;
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      background: rgba(246, 248, 252, .72);
+      border-bottom: 1px solid rgba(221,229,242,.7);
+    }
+    /* fixed nav sits above content — reserve its height */
+    .shell { padding-top: 76px; }
+    .nav-inner {
+      max-width: var(--max);
+      margin: 0 auto;
+      height: 100%;
+      padding: 0 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 22px;
+    }
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      flex: none;
+      font-size: 1.34rem;
+      font-weight: 900;
+      letter-spacing: -.055em;
+      color: var(--ink);
+      line-height: 1;
+    }
+    .brand-word .bee { color: var(--blue-2); }
+    .brand img {
+      width: 30px;
+      height: 30px;
+      object-fit: contain;
+      mix-blend-mode: multiply;
+    }
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 28px;
+      color: #687285;
+      font-weight: 650;
+      font-size: .91rem;
+    }
+    .nav-links a { transition: color .15s ease; }
+    .nav-links a:hover { color: var(--ink); }
+    .nav-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex: none;
+    }
+    .nav-login { gap: 8px; }
+    .nav-login svg { width: 17px; height: 17px; }
+    .lang-toggle {
+      display: inline-flex;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.64);
+      border-radius: 12px;
+      padding: 4px;
+      box-shadow: 0 2px 10px rgba(26,43,74,.04);
+    }
+    .lang-toggle button {
+      border: 0;
+      background: transparent;
+      color: #8390a3;
+      font-size: .78rem;
+      font-weight: 800;
+      padding: 7px 10px;
+      border-radius: 9px;
+      cursor: pointer;
+    }
+    html[data-lang="es"] .lang-toggle button[data-set-lang="es"],
+    html[data-lang="en"] .lang-toggle button[data-set-lang="en"] {
+      color: var(--blue-2);
+      background: #edf4ff;
+      box-shadow: inset 0 0 0 1px rgba(74,123,232,.10);
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 9px;
+      min-height: 46px;
+      padding: 0 20px;
+      border-radius: 13px;
+      border: 1px solid transparent;
+      font-weight: 800;
+      font-size: .94rem;
+      cursor: pointer;
+      transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease, background .16s ease, color .16s ease;
+      white-space: nowrap;
+    }
+    .btn:hover { transform: translateY(-1px); }
+    .btn-primary {
+      color: white;
+      background: linear-gradient(180deg, #4d7ee8, #3f72dc);
+      box-shadow: 0 16px 38px rgba(74,123,232,.28);
+    }
+    .btn-primary:hover { box-shadow: 0 20px 48px rgba(74,123,232,.34); }
+    .btn-secondary {
+      background: rgba(255,255,255,.72);
+      border-color: var(--line);
+      color: #4f5a6b;
+      box-shadow: 0 10px 30px rgba(26,43,74,.045);
+    }
+    .btn-secondary:hover {
+      border-color: #c8d3e4;
+      color: var(--ink);
+      background: white;
+    }
+    .arrow-down { font-size: 1.08rem; line-height: 1; }
+
+    /* LANGUAGE */
+    [data-i18n] {}
+    html[data-lang="es"] [data-lang-only="en"],
+    html[data-lang="en"] [data-lang-only="es"] {
+      display: none !important;
+    }
+
+    /* HERO */
+    .hero {
+      padding: 92px 0 78px;
+      text-align: center;
+    }
+    .hero-kicker {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      font-family: "Fira Code", monospace;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+      color: var(--blue-2);
+      font-size: .78rem;
+      font-weight: 600;
+      margin-bottom: 30px;
+    }
+    .hero-kicker::before,
+    .hero-kicker::after {
+      content: "";
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: var(--blue-2);
+      opacity: .65;
+    }
+    h1 {
+      max-width: 930px;
+      margin: 0 auto 24px;
+      font-size: clamp(3.7rem, 8.2vw, 7.15rem);
+      line-height: .93;
+      letter-spacing: -.085em;
+      font-weight: 900;
+      color: #1c1f25;
+    }
+    h1 .accent {
+      color: var(--blue-2);
+      letter-spacing: -.09em;
+    }
+    .hero-copy {
+      max-width: 740px;
+      margin: 0 auto 32px;
+      color: #667085;
+      font-size: clamp(1.08rem, 1.85vw, 1.38rem);
+      line-height: 1.55;
+      font-weight: 500;
+    }
+    .hero-actions {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 13px;
+      flex-wrap: wrap;
+    }
+
+    /* DEMO BOARD */
+    .demo-wrap {
+      max-width: 980px;
+      margin: 78px auto 0;
+      position: relative;
+      height: 460px;
+    }
+    .panel {
+      position: absolute;
+      background: rgba(255,255,255,.82);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: var(--shadow-soft);
+      overflow: hidden;
+      backdrop-filter: blur(14px);
+    }
+    .panel-head {
+      height: 42px;
+      border-bottom: 1px solid var(--line-2);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 16px;
+      color: #b1bac9;
+      font-family: "Fira Code", monospace;
+      font-size: .75rem;
+      font-weight: 600;
+      letter-spacing: .03em;
+    }
+    .panel-head .led {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--blue-2);
+      box-shadow: 0 0 14px rgba(74,123,232,.7);
+      flex: none;
+    }
+    .conversation {
+      left: 0;
+      top: 0;
+      width: 56%;
+      min-height: 332px;
+    }
+    .slack {
+      right: 0;
+      top: 170px;
+      width: 45%;
+      min-height: 210px;
+    }
+    .hubspot {
+      right: 48px;
+      top: 18px;
+      width: 35%;
+      min-height: 128px;
+    }
+    .message-body {
+      padding: 18px 20px 20px;
+      display: grid;
+      gap: 14px;
+    }
+    .bubble {
+      max-width: 78%;
+      border-radius: 14px;
+      padding: 13px 15px;
+      line-height: 1.38;
+      font-weight: 650;
+      font-size: .92rem;
+      color: #667085;
+    }
+    .bubble small {
+      display: block;
+      font-family: "Fira Code", monospace;
+      color: #aeb7c7;
+      margin-bottom: 6px;
+      font-size: .68rem;
+      font-weight: 600;
+    }
+    .bubble.lead {
+      background: #f0f3f8;
+      justify-self: start;
+    }
+    .bubble.agent {
+      background: #e7eeff;
+      border: 1px solid #ccdafe;
+      justify-self: end;
+      color: #3c4659;
+    }
+    .slack-row, .crm-row {
+      padding: 13px 16px;
+      border-bottom: 1px solid var(--line-2);
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+      color: #667085;
+      font-size: .87rem;
+      line-height: 1.45;
+      font-weight: 600;
+    }
+    .slack-row:last-child, .crm-row:last-child { border-bottom: 0; }
+    .avatar {
+      width: 25px;
+      height: 25px;
+      border-radius: 7px;
+      background: #e7eeff;
+      display: grid;
+      place-items: center;
+      color: var(--blue-2);
+      font-size: .73rem;
+      font-weight: 900;
+      flex: none;
+    }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      margin-top: 6px;
+      font-family: "Fira Code", monospace;
+      font-size: .68rem;
+      color: #8a93a3;
+    }
+    .status::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #10b981;
+    }
+
+    /* COMMON */
+    section.block {
+      padding: 108px 0;
+    }
+    .section-head {
+      max-width: 780px;
+      margin-bottom: 42px;
+    }
+    .label {
+      color: var(--blue-2);
+      text-transform: uppercase;
+      font-family: "Fira Code", monospace;
+      letter-spacing: .12em;
+      font-size: .76rem;
+      font-weight: 700;
+      margin-bottom: 14px;
+      display: block;
+    }
+    h2 {
+      font-size: clamp(2.55rem, 5vw, 5rem);
+      line-height: .98;
+      letter-spacing: -.075em;
+      font-weight: 900;
+      color: var(--ink);
+      margin-bottom: 18px;
+    }
+    .section-copy {
+      color: var(--muted);
+      font-size: 1.12rem;
+      line-height: 1.65;
+      font-weight: 500;
+      max-width: 720px;
+    }
+
+    /* EMPLOYEES */
+    .employee-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 22px;
+    }
+    .employee-card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 32px;
+      box-shadow: var(--shadow-soft);
+      position: relative;
+      overflow: hidden;
+      min-height: 520px;
+      display: flex;
+      flex-direction: column;
+    }
+    .employee-card::after {
+      content: "";
+      position: absolute;
+      inset: auto -120px -170px auto;
+      width: 340px;
+      height: 340px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(74,123,232,.16), transparent 68%);
+      pointer-events: none;
+    }
+    .employee-icon {
+      width: 56px;
+      height: 56px;
+      border-radius: 17px;
+      background: #edf4ff;
+      display: grid;
+      place-items: center;
+      color: var(--blue-2);
+      margin-bottom: 22px;
+      font-size: 1.35rem;
+      font-weight: 900;
+      border: 1px solid #dce8ff;
+    }
+    .employee-card h3 {
+      font-size: clamp(2rem, 3vw, 3rem);
+      line-height: 1;
+      letter-spacing: -.06em;
+      margin-bottom: 16px;
+    }
+    .employee-card p {
+      color: var(--muted);
+      line-height: 1.65;
+      font-weight: 500;
+      margin-bottom: 26px;
+      max-width: 500px;
+    }
+    .task-list {
+      display: grid;
+      gap: 12px;
+      margin-top: auto;
+      position: relative;
+      z-index: 1;
+    }
+    .task {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      font-weight: 700;
+      color: #3d4655;
+      line-height: 1.35;
+      font-size: .96rem;
+    }
+    .check {
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: #eaf2ff;
+      color: var(--blue-2);
+      display: grid;
+      place-items: center;
+      font-size: .76rem;
+      flex: none;
+      margin-top: 1px;
+      border: 1px solid #d6e5ff;
+    }
+
+    /* TURN */
+    .turn {
+      background: linear-gradient(180deg, #ffffff, #f7faff);
+      border-top: 1px solid var(--line-2);
+      border-bottom: 1px solid var(--line-2);
+    }
+    .turn-grid {
+      display: grid;
+      grid-template-columns: .9fr 1.1fr;
+      gap: 42px;
+      align-items: center;
+    }
+    .timeline {
+      background: white;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 26px;
+      box-shadow: var(--shadow-soft);
+    }
+    .step {
+      display: grid;
+      grid-template-columns: 34px 1fr;
+      gap: 16px;
+      padding: 0 0 24px;
+      position: relative;
+    }
+    .step:not(:last-child)::after {
+      content: "";
+      position: absolute;
+      left: 16px;
+      top: 36px;
+      bottom: -4px;
+      width: 1px;
+      background: var(--line);
+    }
+    .step:last-child { padding-bottom: 0; }
+    .step-num {
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      background: #edf4ff;
+      color: var(--blue-2);
+      display: grid;
+      place-items: center;
+      font-family: "Fira Code", monospace;
+      font-size: .8rem;
+      font-weight: 800;
+      border: 1px solid #dbe8ff;
+      z-index: 1;
+    }
+    .step h3 {
+      font-size: 1.03rem;
+      letter-spacing: -.02em;
+      margin-bottom: 5px;
+    }
+    .step p {
+      color: var(--muted);
+      line-height: 1.55;
+      font-weight: 500;
+      font-size: .94rem;
+    }
+
+    /* TOOLS */
+    .tools-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+    }
+    .tool-card {
+      background: white;
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 21px;
+      min-height: 128px;
+      box-shadow: 0 10px 28px rgba(26,43,74,.04);
+    }
+    .tool-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--blue-2);
+      margin-bottom: 22px;
+      box-shadow: 0 0 14px rgba(74,123,232,.32);
+    }
+    .tool-card h3 {
+      font-size: 1.02rem;
+      letter-spacing: -.02em;
+      margin-bottom: 7px;
+    }
+    .tool-card p {
+      color: var(--muted);
+      font-size: .88rem;
+      line-height: 1.45;
+      font-weight: 500;
+    }
+
+    /* CONTROL */
+    .control {
+      background: #16181d;
+      color: white;
+      border-radius: 42px;
+      margin: 44px 24px;
+      padding: 94px 0;
+      position: relative;
+      overflow: hidden;
+    }
+    .control::before {
+      content: "";
+      position: absolute;
+      inset: -200px -100px auto auto;
+      width: 600px;
+      height: 600px;
+      background: radial-gradient(circle, rgba(74,123,232,.28), transparent 70%);
+    }
+    .control h2 { color: white; }
+    .control .section-copy { color: rgba(255,255,255,.64); }
+    .control-grid {
+      display: grid;
+      grid-template-columns: .95fr 1.05fr;
+      gap: 42px;
+      align-items: center;
+      position: relative;
+    }
+    .command-panel {
+      background: rgba(255,255,255,.075);
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 24px;
+      overflow: hidden;
+      box-shadow: 0 30px 90px rgba(0,0,0,.28);
+    }
+    .cmd-head {
+      height: 48px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 18px;
+      border-bottom: 1px solid rgba(255,255,255,.1);
+      color: rgba(255,255,255,.5);
+      font-family: "Fira Code", monospace;
+      font-size: .75rem;
+    }
+    .cmd-body { padding: 20px; display: grid; gap: 12px; }
+    .cmd-msg {
+      border: 1px solid rgba(255,255,255,.09);
+      background: rgba(255,255,255,.055);
+      padding: 14px 15px;
+      border-radius: 15px;
+      color: rgba(255,255,255,.76);
+      font-size: .9rem;
+      line-height: 1.5;
+    }
+    .cmd-msg strong { color: white; }
+    .cmd-msg.code {
+      font-family: "Fira Code", monospace;
+      color: #aacaff;
+    }
+
+    /* OPEN SOURCE */
+    .oss-box {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 28px;
+      align-items: center;
+      background: white;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 34px;
+      box-shadow: var(--shadow-soft);
+    }
+    .oss-box p {
+      color: var(--muted);
+      font-size: 1.04rem;
+      line-height: 1.65;
+      max-width: 760px;
+      font-weight: 500;
+    }
+
+    /* CTA */
+    .cta {
+      text-align: center;
+      padding: 112px 0;
+      background:
+        radial-gradient(circle at 50% 0%, rgba(74,123,232,.16), transparent 28rem),
+        #ffffff;
+    }
+    .cta h2 {
+      max-width: 780px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    .cta .section-copy {
+      margin: 0 auto 28px;
+    }
+
+    /* FOOTER */
+    footer {
+      border-top: 1px solid var(--line-2);
+      padding: 34px 0;
+      color: var(--muted-2);
+      background: white;
+    }
+    .footer-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      font-size: .86rem;
+      font-weight: 600;
+    }
+    .footer-inner span a { color: var(--blue-2); transition: color .15s ease; }
+    .footer-inner span a:hover { color: var(--ink); text-decoration: underline; }
+
+    @media (max-width: 980px) {
+      .nav-links { display: none; }
+      .employee-grid,
+      .turn-grid,
+      .control-grid,
+      .oss-box {
+        grid-template-columns: 1fr;
+      }
+      .tools-grid { grid-template-columns: repeat(2, 1fr); }
+      .demo-wrap {
+        height: 560px;
+      }
+      .conversation,
+      .slack,
+      .hubspot {
+        position: relative;
+        width: 100%;
+        left: auto;
+        right: auto;
+        top: auto;
+        margin-bottom: 16px;
+      }
+      .conversation { min-height: 280px; }
+      .slack { min-height: 180px; }
+      .hubspot { min-height: 120px; }
+    }
+    @media (max-width: 640px) {
+      .container, .nav-inner { padding-left: 18px; padding-right: 18px; }
+      .nav { height: 68px; }
+      .shell { padding-top: 68px; }
+      .brand { font-size: 1.16rem; }
+      .brand img { width: 26px; height: 26px; }
+      .nav-login { padding: 0 13px; min-height: 40px; font-size: .86rem; }
+      .nav-login svg { width: 15px; height: 15px; }
+      .hero { padding-top: 70px; }
+      h1 { font-size: clamp(3.1rem, 15vw, 4.4rem); }
+      .hero-copy { font-size: 1.05rem; }
+      .demo-wrap { margin-top: 48px; height: auto; }
+      section.block { padding: 74px 0; }
+      .employee-card { min-height: auto; padding: 24px; }
+      .tools-grid { grid-template-columns: 1fr; }
+      .control {
+        margin: 20px 12px;
+        border-radius: 28px;
+        padding: 74px 0;
+      }
+      .footer-inner {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+    }
+
+    /* ============ HERO — copy left, animated workflow right ============ */
+    .hero {
+      text-align: left;
+      padding: 78px 0 90px;
+      min-height: calc(100svh - 76px);
+      display: flex;
+      align-items: center;
+    }
+    .hero .container {
+      display: grid;
+      grid-template-columns: minmax(460px, 1.06fr) minmax(528px, .94fr);
+      gap: 50px;
+      align-items: center;
+      width: 100%;
+    }
+    .hero-copy-col { min-width: 0; }
+    .hero-kicker,
+    h1,
+    .hero-copy,
+    .hero-actions {
+      margin-left: 0;
+      margin-right: 0;
+      justify-content: flex-start;
+      text-align: left;
+    }
+    h1 {
+      font-size: clamp(3.1rem, 5.4vw, 6.1rem);
+      max-width: 620px;
+      margin: 0 0 22px;
+    }
+    .hero-copy { max-width: 560px; margin: 0 0 30px; }
+
+    /* ---- workflow canvas ---- */
+    .hero-workflow {
+      position: relative;
+      min-height: 680px;
+      width: 100%;
+    }
+
+    /* ===== WhatsApp chat panel (left) ===== */
+    .chat-panel {
+      position: absolute;
+      left: 0;
+      top: 12px;
+      width: min(316px, 56%);
+      height: 646px;
+      border-radius: 16px;
+      background: #efeae2;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      z-index: 2;
+    }
+    .wa-head {
+      height: 56px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 13px;
+      background: #075e54;
+      color: #fff;
+    }
+    .wa-avatar {
+      width: 34px; height: 34px;
+      border-radius: 50%;
+      background: #cfe9e2;
+      color: #075e54;
+      display: grid; place-items: center;
+      font-weight: 800; font-size: .8rem;
+      flex: none;
+    }
+    .wa-id { display: grid; line-height: 1.18; flex: 1 1 auto; min-width: 0; }
+    .wa-id strong { font-size: .9rem; font-weight: 700; letter-spacing: -.01em; }
+    .wa-status { font-size: .67rem; color: #b9e0d6; font-weight: 600; }
+    .wa-mark { flex: none; display: grid; place-items: center; opacity: .95; }
+    .wa-mark svg { width: 19px; height: 19px; fill: #fff; }
+
+    .chat-feed {
+      position: relative;
+      height: calc(100% - 56px);
+      padding: 14px 12px;
+      overflow: hidden;
+      background-color: #efeae2;
+      background-image: radial-gradient(rgba(11,77,69,.05) 1px, transparent 1.4px);
+      background-size: 18px 18px;
+    }
+    .chat-feed::after {
+      content: "";
+      position: absolute;
+      left: 0; right: 0; bottom: 0;
+      height: 16px;
+      background: linear-gradient(180deg, transparent, rgba(239,234,226,.95));
+      pointer-events: none;
+      z-index: 4;
+    }
+    .chat-track {
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+      will-change: transform;
+      animation: scrollFeed 20s ease-in-out infinite;
+    }
+    @keyframes scrollFeed {
+      0%, 26%  { transform: translateY(0); }
+      54%, 88% { transform: translateY(var(--scroll-end, -72px)); }
+      100%     { transform: translateY(0); }
+    }
+
+    .msg {
+      position: relative;
+      max-width: 82%;
+      padding: 6px 9px 5px;
+      border-radius: 9px;
+      font-size: .84rem;
+      line-height: 1.3;
+      font-weight: 600;
+      color: #1f2c33;
+      box-shadow: 0 1px .5px rgba(11,20,26,.13);
+      opacity: 0;
+    }
+    .msg.customer {
+      align-self: flex-start;
+      background: #fff;
+      border-top-left-radius: 2px;
+    }
+    .msg.agent {
+      align-self: flex-end;
+      background: #d9fdd3;
+      border-top-right-radius: 2px;
+    }
+    .msg.customer::before {
+      content: "";
+      position: absolute; top: 0; left: -7px;
+      border: 7px solid transparent;
+      border-top-color: #fff;
+      border-right-width: 0;
+    }
+    .msg.agent::before {
+      content: "";
+      position: absolute; top: 0; right: -7px;
+      border: 7px solid transparent;
+      border-top-color: #d9fdd3;
+      border-left-width: 0;
+    }
+    .meta {
+      display: block;
+      text-align: right;
+      font-style: normal;
+      font-size: .57rem;
+      font-weight: 600;
+      color: #667781;
+      margin-top: 1px;
+      line-height: 1;
+    }
+    .meta .check { color: #53bdeb; font-weight: 700; letter-spacing: -1.5px; margin-left: 3px; }
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      margin-top: 5px;
+      padding: 2px 7px;
+      border-radius: 7px;
+      background: rgba(74,123,232,.13);
+      border: 1px solid rgba(74,123,232,.30);
+      color: #3567cf;
+      font-family: "Fira Code", monospace;
+      font-size: .6rem;
+      font-weight: 700;
+      letter-spacing: -.01em;
+      opacity: 0;
+    }
+    .tag::before { content: "\21B3"; font-weight: 700; }
+
+    /* message reveal */
+    .msg.s1 { animation: msg1 20s ease-in-out infinite; }
+    .msg.s2 { animation: msg2 20s ease-in-out infinite; }
+    .msg.s3 { animation: msg3 20s ease-in-out infinite; }
+    .msg.s4 { animation: msg4 20s ease-in-out infinite; }
+    .msg.s5 { animation: msg5 20s ease-in-out infinite; }
+    .msg.s6 { animation: msg6 20s ease-in-out infinite; }
+    .msg.s7 { animation: msg7 20s ease-in-out infinite; }
+
+    @keyframes msg1 { 0%,3%{opacity:0;transform:translateY(10px)}  7%,86%{opacity:1;transform:none} 90%,100%{opacity:0;transform:translateY(-7px)} }
+    @keyframes msg2 { 0%,11%{opacity:0;transform:translateY(10px)} 15%,86%{opacity:1;transform:none} 90%,100%{opacity:0;transform:translateY(-7px)} }
+    @keyframes msg3 { 0%,25%{opacity:0;transform:translateY(10px)} 29%,86%{opacity:1;transform:none} 90%,100%{opacity:0;transform:translateY(-7px)} }
+    @keyframes msg4 { 0%,35%{opacity:0;transform:translateY(10px)} 39%,86%{opacity:1;transform:none} 90%,100%{opacity:0;transform:translateY(-7px)} }
+    @keyframes msg5 { 0%,47%{opacity:0;transform:translateY(10px)} 51%,86%{opacity:1;transform:none} 90%,100%{opacity:0;transform:translateY(-7px)} }
+    @keyframes msg6 { 0%,57%{opacity:0;transform:translateY(10px)} 61%,86%{opacity:1;transform:none} 90%,100%{opacity:0;transform:translateY(-7px)} }
+    @keyframes msg7 { 0%,68%{opacity:0;transform:translateY(8px)} 72%,86%{opacity:1;transform:none} 90%,100%{opacity:0;transform:translateY(-7px)} }
+
+    /* WhatsApp "typing" bubble that closes the conversation */
+    .msg.typing { padding: 9px 12px; }
+    .dots { display: inline-flex; align-items: center; gap: 4px; }
+    .dots i {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: #9aa6b2;
+      animation: dotPulse 1.25s ease-in-out infinite;
+    }
+    .dots i:nth-child(2) { animation-delay: .18s; }
+    .dots i:nth-child(3) { animation-delay: .36s; }
+    @keyframes dotPulse { 0%,60%,100%{opacity:.35;transform:translateY(0)} 30%{opacity:1;transform:translateY(-2px)} }
+
+    /* flash ring on the fluxbee message at the instant its action fires */
+    .msg.flash::after {
+      content: "";
+      position: absolute;
+      inset: -3px;
+      border-radius: 11px;
+      box-shadow: 0 0 0 2px rgba(74,123,232,.8), 0 0 16px 3px rgba(74,123,232,.42);
+      opacity: 0;
+      pointer-events: none;
+    }
+    .msg.s2.flash::after { animation: flash2 20s ease-in-out infinite; }
+    .msg.s4.flash::after { animation: flash4 20s ease-in-out infinite; }
+    .msg.s6.flash::after { animation: flash6 20s ease-in-out infinite; }
+    @keyframes flash2 { 0%,15%{opacity:0} 17%{opacity:1} 24%{opacity:0} 100%{opacity:0} }
+    @keyframes flash4 { 0%,39%{opacity:0} 41%{opacity:1} 48%{opacity:0} 100%{opacity:0} }
+    @keyframes flash6 { 0%,61%{opacity:0} 63%{opacity:1} 70%{opacity:0} 100%{opacity:0} }
+
+    /* action tag chips appear with the flash, then persist */
+    .s2 .tag { animation: tag2 20s ease-in-out infinite; }
+    .s4 .tag { animation: tag4 20s ease-in-out infinite; }
+    .s6 .tag { animation: tag6 20s ease-in-out infinite; }
+    @keyframes tag2 { 0%,16%{opacity:0;transform:translateY(-3px)} 19%,86%{opacity:1;transform:none} 90%,100%{opacity:0} }
+    @keyframes tag4 { 0%,40%{opacity:0;transform:translateY(-3px)} 43%,86%{opacity:1;transform:none} 90%,100%{opacity:0} }
+    @keyframes tag6 { 0%,62%{opacity:0;transform:translateY(-3px)} 65%,86%{opacity:1;transform:none} 90%,100%{opacity:0} }
+
+    /* ===== tool-action cards (right, scattered like tooltips) ===== */
+    /* event layer scrolls in lockstep with the chat so each card
+       stays at its message's Y (top per card is set by JS) */
+    .event-layer {
+      position: absolute;
+      left: 0;
+      top: 68px;                 /* chat-panel top (12) + wa-head (56) */
+      right: 0;
+      height: 590px;             /* = chat-feed height */
+      pointer-events: none;
+      z-index: 5;
+    }
+    .event-track {
+      position: absolute;
+      inset: 0;
+      will-change: transform;
+      animation: scrollFeed 20s ease-in-out infinite;
+    }
+    .float-action {
+      position: absolute;
+      width: 208px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #fff;
+      box-shadow: 0 18px 50px rgba(26,43,74,.16);
+      overflow: visible;
+      opacity: 0;
+      z-index: 5;
+    }
+    .float-action::before {            /* tooltip tail toward the chat */
+      content: "";
+      position: absolute;
+      left: -7px; top: 25px;
+      border: 7px solid transparent;
+      border-right-color: #fff;
+      border-left-width: 0;
+      filter: drop-shadow(-1.5px 0 0 var(--line));
+    }
+    .float-head {
+      height: 34px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 12px;
+      border-bottom: 1px solid var(--line-2);
+      color: #6b7689;
+      font-family: "Fira Code", monospace;
+      font-size: .68rem;
+      font-weight: 700;
+      letter-spacing: .01em;
+    }
+    .float-head .led {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: var(--accent, var(--blue-2));
+      box-shadow: 0 0 9px var(--accent, var(--blue-2));
+      flex: none;
+    }
+    .float-body { padding: 12px; }
+    /* left = scatter near the chat's right edge; top set by JS to the message Y */
+    .hubspot-card  { --accent:#ff7a59; left: 300px; animation: card1 20s ease-in-out infinite; }
+    .email-card    { --accent:#ea4335; left: 320px; animation: card2 20s ease-in-out infinite; }
+    .calendar-card { --accent:#1a73e8; left: 298px; animation: card3 20s ease-in-out infinite; }
+    .slack-card    { --accent:#611f69; left: 318px; animation: card4 20s ease-in-out infinite; }
+
+    @keyframes card1 { 0%,17%{opacity:0;transform:translate(12px,6px) scale(.96)} 21%,86%{opacity:1;transform:none} 90%,100%{opacity:0;transform:translateY(-7px)} }
+    @keyframes card2 { 0%,41%{opacity:0;transform:translate(12px,6px) scale(.96)} 45%,86%{opacity:1;transform:none} 90%,100%{opacity:0;transform:translateY(-7px)} }
+    @keyframes card3 { 0%,63%{opacity:0;transform:translate(12px,6px) scale(.96)} 67%,86%{opacity:1;transform:none} 90%,100%{opacity:0;transform:translateY(-7px)} }
+    @keyframes card4 { 0%,71%{opacity:0;transform:translate(12px,6px) scale(.96)} 75%,86%{opacity:1;transform:none} 90%,100%{opacity:0;transform:translateY(-7px)} }
+
+    .crm-mini, .calendar-mini, .slack-mini {
+      display: grid;
+      grid-template-columns: 38px 1fr;
+      gap: 10px;
+      align-items: center;
+    }
+    .mini-avatar, .datebox, .slack-dot {
+      width: 38px; height: 38px;
+      border-radius: 11px;
+      display: grid; place-items: center;
+      font-weight: 900; font-size: .8rem;
+    }
+    .hubspot-card  .mini-avatar { background:#fff1ec; border:1px solid #ffd6c7; color:#ff7a59; }
+    .calendar-card .datebox     { background:#e8f0fe; border:1px solid #cfe0fd; color:#1a73e8; }
+    .slack-card    .slack-dot   { background:#f4e9f6; border:1px solid #e3cfe7; color:#611f69; }
+    .datebox { grid-template-rows: 1fr 1fr; gap: 0; font-family: "Fira Code", monospace; }
+    .datebox strong { font-size: .92rem; line-height: 1; align-self: end; }
+    .datebox span { font-size: .66rem; line-height: 1; align-self: start; }
+    .float-body strong {
+      display: block; color: #2c333f;
+      font-size: .88rem; letter-spacing: -.01em; margin-bottom: 2px;
+    }
+    .float-body p { color: #768196; font-size: .74rem; line-height: 1.32; font-weight: 700; }
+    .crm-mini span {
+      display: inline-flex; margin-top: 4px;
+      color: #10a66f; font-family: "Fira Code", monospace;
+      font-size: .62rem; font-weight: 700;
+    }
+    .email-mini { display: grid; gap: 7px; }
+    .email-subject { color: #2c333f; font-size: .86rem; font-weight: 850; letter-spacing: -.01em; }
+    .email-line { height: 7px; width: 92%; background: #eef1f5; border-radius: 999px; }
+    .email-line.short { width: 64%; }
+    .attachment {
+      display: inline-flex; width: fit-content;
+      padding: 5px 9px; border-radius: 8px;
+      background: #fdeceb; border: 1px solid #f7cfcc; color: #ea4335;
+      font-family: "Fira Code", monospace;
+      font-size: .64rem; font-weight: 700;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .chat-track, .event-track, .msg, .float-action, .tag, .msg.flash::after, .dots i { animation: none; }
+      .msg, .float-action, .tag { opacity: 1; transform: none; }
+      .msg.flash::after { opacity: 0; }
+    }
+    @media (max-width: 1180px) {
+      .hero { align-items: flex-start; }
+      .hero .container { grid-template-columns: 1fr; gap: 40px; max-width: 600px; }
+    }
+    @media (max-width: 760px) {
+      .hero-workflow { min-height: 0; }
+      .chat-panel {
+        position: relative;
+        left: auto; top: auto;
+        width: 100%;
+        height: 474px;
+      }
+      .event-layer {
+        position: static;
+        height: auto;
+        pointer-events: auto;
+      }
+      .event-track { position: static; animation: none; transform: none; }
+      .float-action {
+        position: relative;
+        left: auto !important; top: auto !important;
+        width: 100%;
+        margin-top: 12px;
+        animation: none;
+        opacity: 1;
+        transform: none;
+      }
+      .float-action::before { display: none; }
+    }
+
+  </style>
+</head>
+
+<body>
+  <div class="shell">
+    <nav class="nav">
+      <div class="nav-inner">
+        <a class="brand" href="#" aria-label="fluxbee home">
+          <span class="brand-word">flux<span class="bee">bee</span></span>
+          <img src="fluxbee-logo.svg" alt="" />
+        </a>
+
+        <div class="nav-links">
+          <a href="#what" data-i18n="nav.what">Qué hace</a>
+          <a href="#employees" data-i18n="nav.employees">Empleados</a>
+          <a href="#how" data-i18n="nav.how">Cómo funciona</a>
+          <a href="#opensource" data-i18n="nav.oss">Plataforma open source ↗</a>
+        </div>
+
+        <div class="nav-actions">
+          <div class="lang-toggle" aria-label="Language selector">
+            <button type="button" data-set-lang="es">ES</button>
+            <button type="button" data-set-lang="en">EN</button>
+          </div>
+          <a class="btn btn-primary nav-login" href="/login" aria-label="Login">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
+            <span data-i18n="nav.login">Iniciar sesión</span>
+          </a>
+        </div>
+      </div>
+    </nav>
+
+    <main>
+      <section class="hero">
+        <div class="container">
+          <div class="hero-copy-col">
+          <div class="hero-kicker" data-i18n="hero.kicker">Fluxbee · empleados digitales</div>
+          <h1 data-lang-only="es">Ventas en LinkedIn.<br />Soporte por WhatsApp.<br /><span class="accent">Hecho por IA.</span></h1>
+          <h1 data-lang-only="en">LinkedIn sales.<br />WhatsApp support.<br /><span class="accent">Done by AI.</span></h1>
+
+          <p class="hero-copy" data-i18n="hero.copy">
+            Fluxbee crea empleados digitales concretos: uno consigue reuniones desde LinkedIn; otro atiende ventas y soporte por WhatsApp e Instagram. Trabajan en tus herramientas, no en otro dashboard.
+          </p>
+
+          <div class="hero-actions">
+            <a class="btn btn-primary" href="mailto:info@4iplatform.com?subject=Fluxbee%20demo" data-i18n="hero.cta1">Agenda una llamada</a>
+            <a class="btn btn-secondary" href="#what"><span data-i18n="hero.cta2">Mira cómo trabaja</span> <span class="arrow-down">↓</span></a>
+          </div>
+          </div>
+
+          <div class="hero-workflow" aria-label="Fluxbee animated sales workflow">
+            <div class="chat-panel">
+              <div class="wa-head">
+                <span class="wa-avatar">LM</span>
+                <div class="wa-id">
+                  <strong data-i18n="anim.chatName">Lucía M.</strong>
+                  <span class="wa-status" data-i18n="anim.chatStatus">en línea</span>
+                </div>
+                <span class="wa-mark" aria-label="WhatsApp"><svg viewBox="0 0 24 24"><path d="M.057 24l1.687-6.163a11.867 11.867 0 0 1-1.587-5.946C.16 5.335 5.495 0 12.05 0a11.817 11.817 0 0 1 8.413 3.488 11.824 11.824 0 0 1 3.48 8.414c-.003 6.557-5.338 11.892-11.893 11.892a11.9 11.9 0 0 1-5.688-1.448L.057 24zm6.597-3.807c1.676.995 3.276 1.591 5.392 1.592 5.448 0 9.886-4.434 9.889-9.885.002-5.462-4.415-9.89-9.881-9.892-5.452 0-9.887 4.434-9.889 9.884a9.86 9.86 0 0 0 1.51 5.26l-.999 3.648 3.728-.978zm11.387-5.464c-.074-.124-.272-.198-.57-.347-.297-.149-1.758-.868-2.031-.967-.272-.099-.47-.149-.669.149-.198.297-.768.967-.941 1.165-.173.198-.347.223-.644.074-.297-.149-1.255-.462-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.297-.347.446-.521.151-.172.2-.296.3-.495.099-.198.05-.372-.025-.521-.075-.148-.669-1.612-.916-2.207-.242-.579-.487-.501-.669-.51l-.57-.01c-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.626.712.226 1.36.194 1.872.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413z"/></svg></span>
+              </div>
+              <div class="chat-feed">
+                <div class="chat-track">
+                <div class="msg customer s1">
+                  <span data-i18n="anim.c1">Hola, quiero un sillón a medida para mi living.</span>
+                  <i class="meta">10:24</i>
+                </div>
+                <div class="msg agent flash s2">
+                  <span data-i18n="anim.a1">¡Claro! ¿Lo buscas en L, recto o modular? Puedo enviarte telas y opciones.</span>
+                  <i class="meta">10:24 <span class="check">✓✓</span></i>
+                  <b class="tag" data-i18n="anim.tag1">crm.lead</b>
+                </div>
+                <div class="msg customer s3">
+                  <span data-i18n="anim.c2">En L. Mide 2,80 x 1,90. ¿Tienen telas antimanchas?</span>
+                  <i class="meta">10:25</i>
+                </div>
+                <div class="msg agent flash s4">
+                  <span data-i18n="anim.a2">Sí. Te envié el catálogo antimanchas y guardé tus medidas para la cotización.</span>
+                  <i class="meta">10:26 <span class="check">✓✓</span></i>
+                  <b class="tag" data-i18n="anim.tag2">send_email</b>
+                </div>
+                <div class="msg customer s5">
+                  <span data-i18n="anim.c3">Me gusta el gris claro. ¿Podemos verlo en una llamada?</span>
+                  <i class="meta">10:27</i>
+                </div>
+                <div class="msg agent flash s6">
+                  <span data-i18n="anim.a3">Listo. Te agendé una reunión mañana 11:30 con el equipo comercial.</span>
+                  <i class="meta">10:28 <span class="check">✓✓</span></i>
+                  <b class="tag" data-i18n="anim.tag3">calendar.create</b>
+                </div>
+                <div class="msg customer typing s7" aria-label="escribiendo">
+                  <span class="dots"><i></i><i></i><i></i></span>
+                </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="event-layer">
+            <div class="event-track">
+            <div class="float-action hubspot-card">
+              <div class="float-head"><span class="led"></span>HubSpot</div>
+              <div class="float-body crm-mini">
+                <div class="mini-avatar">HS</div>
+                <div>
+                  <strong data-i18n="anim.act1t">Lead creado</strong>
+                  <p data-i18n="anim.act1c">Sillón a medida · Living · En L</p>
+                  <span data-i18n="anim.act1s">Etapa: oportunidad inicial</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="float-action email-card">
+              <div class="float-head"><span class="led"></span>Gmail</div>
+              <div class="float-body email-mini">
+                <div class="email-subject" data-i18n="anim.act2t">Catálogo enviado</div>
+                <div class="email-line"></div>
+                <div class="email-line short"></div>
+                <div class="attachment" data-i18n="anim.act2c">PDF · telas antimanchas</div>
+              </div>
+            </div>
+
+            <div class="float-action calendar-card">
+              <div class="float-head"><span class="led"></span>Google Calendar</div>
+              <div class="float-body calendar-mini">
+                <div class="datebox"><strong>11</strong><span>30</span></div>
+                <div>
+                  <strong data-i18n="anim.act3t">Reunión agendada</strong>
+                  <p data-i18n="anim.act3c">Mañana · asesor comercial</p>
+                </div>
+              </div>
+            </div>
+
+            <div class="float-action slack-card">
+              <div class="float-head"><span class="led"></span>Slack · #sales</div>
+              <div class="float-body slack-mini">
+                <div class="slack-dot">AI</div>
+                <div>
+                  <strong data-i18n="anim.act4t">Resumen publicado</strong>
+                  <p data-i18n="anim.act4c">Medidas, tela preferida, email enviado y reunión creada.</p>
+                </div>
+              </div>
+            </div>
+            </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="what" class="block">
+        <div class="container">
+          <div class="section-head">
+            <span class="label" data-i18n="what.label">Qué hace</span>
+            <h2 data-i18n="what.title">Empleados digitales, pero con trabajos concretos.</h2>
+            <p class="section-copy" data-i18n="what.copy">
+              La categoría es amplia, pero la oferta inicial es simple: Fluxbee opera dos trabajos comerciales reales. Uno genera pipeline desde LinkedIn. El otro responde, vende y soporta clientes por WhatsApp e Instagram.
+            </p>
+          </div>
+
+          <div id="employees" class="employee-grid">
+            <article class="employee-card">
+              <div class="employee-icon">↗</div>
+              <span class="label" data-i18n="sales.label">Sales / Marketing</span>
+              <h3 data-i18n="sales.title">Consigue reuniones desde LinkedIn.</h3>
+              <p data-i18n="sales.copy">
+                Busca prospectos, conecta, conversa, califica interés, envía información, agenda reuniones y actualiza HubSpot.
+              </p>
+              <div class="task-list">
+                <div class="task"><span class="check">✓</span><span data-i18n="sales.t1">Prospección y conexión en LinkedIn</span></div>
+                <div class="task"><span class="check">✓</span><span data-i18n="sales.t2">Conversaciones naturales con IA</span></div>
+                <div class="task"><span class="check">✓</span><span data-i18n="sales.t3">Envío de emails, brochures y material comercial</span></div>
+                <div class="task"><span class="check">✓</span><span data-i18n="sales.t4">Agenda reuniones directamente en Google Calendar</span></div>
+                <div class="task"><span class="check">✓</span><span data-i18n="sales.t5">Crea contactos y oportunidades en HubSpot</span></div>
+                <div class="task"><span class="check">✓</span><span data-i18n="sales.t6">Recontacta leads luego de meses para mantenerlos vivos</span></div>
+              </div>
+            </article>
+
+            <article class="employee-card">
+              <div class="employee-icon">☏</div>
+              <span class="label" data-i18n="support.label">Ventas / Soporte</span>
+              <h3 data-i18n="support.title">Atiende clientes por WhatsApp e Instagram.</h3>
+              <p data-i18n="support.copy">
+                Responde consultas, explica productos, gestiona tickets, maneja adjuntos, cambia prioridades y escala urgencias.
+              </p>
+              <div class="task-list">
+                <div class="task"><span class="check">✓</span><span data-i18n="support.t1">Atención por WhatsApp e Instagram</span></div>
+                <div class="task"><span class="check">✓</span><span data-i18n="support.t2">Información técnica compleja desde base de conocimiento</span></div>
+                <div class="task"><span class="check">✓</span><span data-i18n="support.t3">Creación, edición y seguimiento de tickets</span></div>
+                <div class="task"><span class="check">✓</span><span data-i18n="support.t4">Manejo de attachments y contexto del usuario</span></div>
+                <div class="task"><span class="check">✓</span><span data-i18n="support.t5">Escalación por email y Slack cuando hay urgencias</span></div>
+                <div class="task"><span class="check">✓</span><span data-i18n="support.t6">Soporte y venta dentro del mismo canal conversacional</span></div>
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="how" class="block turn">
+        <div class="container">
+          <div class="turn-grid">
+            <div>
+              <span class="label" data-i18n="turn.label">El turno de trabajo</span>
+              <h2 data-i18n="turn.title">Un empleado que empieza, responde y ejecuta.</h2>
+              <p class="section-copy" data-i18n="turn.copy">
+                Fluxbee no es un chatbot esperando preguntas. Trabaja por turnos: busca, contacta, conversa, interpreta respuestas y acciona en los sistemas reales del cliente.
+              </p>
+            </div>
+
+            <div class="timeline">
+              <div class="step">
+                <div class="step-num">01</div>
+                <div>
+                  <h3 data-i18n="turn.s1t">Encuentra o recibe una conversación</h3>
+                  <p data-i18n="turn.s1c">En LinkedIn inicia contactos. En WhatsApp o Instagram recibe consultas de clientes.</p>
+                </div>
+              </div>
+              <div class="step">
+                <div class="step-num">02</div>
+                <div>
+                  <h3 data-i18n="turn.s2t">Entiende la intención</h3>
+                  <p data-i18n="turn.s2c">El agente interpreta si la persona necesita información, soporte, una llamada, un ticket o una escalación.</p>
+                </div>
+              </div>
+              <div class="step">
+                <div class="step-num">03</div>
+                <div>
+                  <h3 data-i18n="turn.s3t">Ejecuta acciones reales</h3>
+                  <p data-i18n="turn.s3c">Envía emails, agenda reuniones, actualiza HubSpot, crea tickets o notifica al equipo humano.</p>
+                </div>
+              </div>
+              <div class="step">
+                <div class="step-num">04</div>
+                <div>
+                  <h3 data-i18n="turn.s4t">Deja trazabilidad</h3>
+                  <p data-i18n="turn.s4c">Todo queda visible en Slack: conversaciones, errores, decisiones, comandos y actividad del sistema.</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="block">
+        <div class="container">
+          <div class="section-head">
+            <span class="label" data-i18n="tools.label">Integraciones</span>
+            <h2 data-i18n="tools.title">Trabaja donde tu empresa ya trabaja.</h2>
+            <p class="section-copy" data-i18n="tools.copy">
+              No hay una nueva pantalla que vender ni obligar a usar. Fluxbee se conecta a los canales, CRMs y herramientas operativas existentes.
+            </p>
+          </div>
+
+          <div class="tools-grid">
+            <div class="tool-card"><div class="tool-dot"></div><h3>LinkedIn</h3><p data-i18n="tools.linkedin">Prospección, conexión, mensajes, likes y recontactos.</p></div>
+            <div class="tool-card"><div class="tool-dot"></div><h3>WhatsApp</h3><p data-i18n="tools.whatsapp">Soporte, ventas y atención conversacional directa.</p></div>
+            <div class="tool-card"><div class="tool-dot"></div><h3>Instagram</h3><p data-i18n="tools.instagram">Otro canal de soporte y venta conversacional.</p></div>
+            <div class="tool-card"><div class="tool-dot"></div><h3>HubSpot</h3><p data-i18n="tools.hubspot">Contactos, oportunidades, tareas y seguimiento comercial.</p></div>
+            <div class="tool-card"><div class="tool-dot"></div><h3>Google Workspace</h3><p data-i18n="tools.google">Email, Calendar, documentación enviada y reuniones.</p></div>
+            <div class="tool-card"><div class="tool-dot"></div><h3>Slack</h3><p data-i18n="tools.slack">Observabilidad, control humano, comandos y alertas.</p></div>
+            <div class="tool-card"><div class="tool-dot"></div><h3>WordPress / Candy</h3><p data-i18n="tools.wordpress">Tickets, prioridades, adjuntos y gestión de soporte.</p></div>
+            <div class="tool-card"><div class="tool-dot"></div><h3>Custom systems</h3><p data-i18n="tools.custom">Integraciones adaptadas a la realidad del cliente.</p></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="control">
+        <div class="container">
+          <div class="control-grid">
+            <div>
+              <span class="label" data-i18n="control.label">Control humano</span>
+              <h2 data-i18n="control.title">Autónomo no significa invisible.</h2>
+              <p class="section-copy" data-i18n="control.copy">
+                Slack funciona como cabina de control. El equipo puede ver actividad, revisar respuestas, cambiar mensajes antes de enviar, pausar automatizaciones, iniciar campañas y detectar errores.
+              </p>
+            </div>
+            <div class="command-panel">
+              <div class="cmd-head">
+                <span class="led"></span>
+                Slack · #fluxbee-control
+              </div>
+              <div class="cmd-body">
+                <div class="cmd-msg"><strong data-i18n="control.m1t">Lead calificado</strong><br><span data-i18n="control.m1c">Solicitó reunión. Fluxbee propone martes 10:00 o miércoles 15:30.</span></div>
+                <div class="cmd-msg code">/fluxbee pause linkedin-campaign-a</div>
+                <div class="cmd-msg"><strong data-i18n="control.m2t">Mensaje pendiente</strong><br><span data-i18n="control.m2c">Aprobar, editar o enviar automáticamente según política.</span></div>
+                <div class="cmd-msg code">/fluxbee edit next-message</div>
+                <div class="cmd-msg"><strong data-i18n="control.m3t">Error del sistema</strong><br><span data-i18n="control.m3c">Token expirado en integración. Notificado al canal técnico.</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="opensource" class="block">
+        <div class="container">
+          <div class="oss-box">
+            <div>
+              <span class="label" data-i18n="oss.label">Plataforma open source</span>
+              <h2 data-i18n="oss.title">Producto comercial sobre una base abierta.</h2>
+              <p data-i18n="oss.copy">
+                Fluxbee se vende como empleados digitales listos para trabajar, pero su núcleo es una plataforma open source de agentes. Eso permite auditar, extender, adaptar y crear nuevos empleados integrados a la realidad operativa de cada cliente.
+              </p>
+            </div>
+            <a class="btn btn-secondary" href="https://github.com/4iplatform/fluxbee" target="_blank" rel="noopener">GitHub ↗</a>
+          </div>
+        </div>
+      </section>
+
+      <section class="cta">
+        <div class="container">
+          <span class="label" data-i18n="cta.label">Siguiente paso</span>
+          <h2 data-i18n="cta.title">Empieza con un trabajo concreto.</h2>
+          <p class="section-copy" data-i18n="cta.copy">
+            LinkedIn para conseguir reuniones. WhatsApp e Instagram para vender y soportar clientes. Después, el empleado se adapta a tus procesos.
+          </p>
+          <a class="btn btn-primary" href="mailto:info@4iplatform.com?subject=Fluxbee%20demo" data-i18n="cta.button">Agenda una llamada</a>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="container footer-inner">
+        <a class="brand" href="#">
+          <span class="brand-word">flux<span class="bee">bee</span></span>
+          <img src="fluxbee-logo.svg" alt="" />
+        </a>
+        <span>© 2026 fluxbee · <a href="https://4iplatform.com" target="_blank" rel="noopener">4i Platform Inc.</a></span>
+      </div>
+    </footer>
+  </div>
+
+  <script>
+    const translations = {
+      es: {
+        "nav.what": "Qué hace",
+        "nav.employees": "Empleados",
+        "nav.how": "Cómo funciona",
+        "nav.oss": "Plataforma open source ↗",
+        "nav.cta": "Agenda una llamada",
+        "nav.login": "Iniciar sesión",
+
+        "hero.kicker": "Fluxbee · empleados digitales",
+        "hero.copy": "Fluxbee crea empleados digitales concretos: uno consigue reuniones desde LinkedIn; otro atiende ventas y soporte por WhatsApp e Instagram. Trabajan en tus herramientas, no en otro dashboard.",
+        "hero.cta1": "Agenda una llamada",
+        "hero.cta2": "Mira cómo trabaja",
+
+        "demo.linkedin": "LinkedIn · conversación",
+        "demo.m1": "Hola, vi que te conectaste. ¿De qué se trata?",
+        "demo.m2": "¡Hola! Ayudamos a equipos como el tuyo a conseguir más reuniones calificadas. ¿Quieres que te envíe un resumen?",
+        "demo.m3": "Dale, envíame info y coordinamos una llamada.",
+        "demo.m4": "Perfecto. Te envié el material por email y te propuse dos horarios.",
+        "demo.crm1": "Contacto creado",
+        "demo.crm2": "Oportunidad: reunión solicitada",
+        "demo.slack1": "Respuesta generada",
+        "demo.slack2": "Esperando aprobación o envío automático según regla.",
+        "demo.slack3": "Reunión agendada",
+        "demo.slack4": "Calendar actualizado. HubSpot sincronizado.",
+
+        "anim.chatTitle": "WhatsApp · venta de sillones a medida",
+        "anim.chatName": "Lucía M.",
+        "anim.chatStatus": "en línea",
+        "anim.tag1": "crm.lead",
+        "anim.tag2": "send_email",
+        "anim.tag3": "calendar.create",
+        "anim.c1": "Hola, quiero un sillón a medida para mi living.",
+        "anim.a1": "¡Claro! ¿Lo buscas en L, recto o modular? Puedo enviarte telas y opciones.",
+        "anim.c2": "En L. Mide 2,80 x 1,90. ¿Tienen telas antimanchas?",
+        "anim.a2": "Sí. Te envié el catálogo antimanchas y guardé tus medidas para la cotización.",
+        "anim.c3": "Me gusta el gris claro. ¿Podemos verlo en una llamada?",
+        "anim.a3": "Listo. Te agendé una reunión mañana 11:30 con el equipo comercial.",
+        "anim.act1t": "Lead creado",
+        "anim.act1c": "Sillón a medida · Living · En L",
+        "anim.act1s": "Etapa: oportunidad inicial",
+        "anim.act2t": "Catálogo enviado",
+        "anim.act2c": "PDF · telas antimanchas",
+        "anim.act3t": "Reunión agendada",
+        "anim.act3c": "Mañana · asesor comercial",
+        "anim.act4t": "Resumen publicado",
+        "anim.act4c": "Medidas, tela preferida, email enviado y reunión creada.",
+
+        "what.label": "Qué hace",
+        "what.title": "Empleados digitales, pero con trabajos concretos.",
+        "what.copy": "La categoría es amplia, pero la oferta inicial es simple: Fluxbee opera dos trabajos comerciales reales. Uno genera pipeline desde LinkedIn. El otro responde, vende y soporta clientes por WhatsApp e Instagram.",
+
+        "sales.label": "Sales / Marketing",
+        "sales.title": "Consigue reuniones desde LinkedIn.",
+        "sales.copy": "Busca prospectos, conecta, conversa, califica interés, envía información, agenda reuniones y actualiza HubSpot.",
+        "sales.t1": "Prospección y conexión en LinkedIn",
+        "sales.t2": "Conversaciones naturales con IA",
+        "sales.t3": "Envío de emails, brochures y material comercial",
+        "sales.t4": "Agenda reuniones directamente en Google Calendar",
+        "sales.t5": "Crea contactos y oportunidades en HubSpot",
+        "sales.t6": "Recontacta leads luego de meses para mantenerlos vivos",
+
+        "support.label": "Ventas / Soporte",
+        "support.title": "Atiende clientes por WhatsApp e Instagram.",
+        "support.copy": "Responde consultas, explica productos, gestiona tickets, maneja adjuntos, cambia prioridades y escala urgencias.",
+        "support.t1": "Atención por WhatsApp e Instagram",
+        "support.t2": "Información técnica compleja desde base de conocimiento",
+        "support.t3": "Creación, edición y seguimiento de tickets",
+        "support.t4": "Manejo de attachments y contexto del usuario",
+        "support.t5": "Escalación por email y Slack cuando hay urgencias",
+        "support.t6": "Soporte y venta dentro del mismo canal conversacional",
+
+        "turn.label": "El turno de trabajo",
+        "turn.title": "Un empleado que empieza, responde y ejecuta.",
+        "turn.copy": "Fluxbee no es un chatbot esperando preguntas. Trabaja por turnos: busca, contacta, conversa, interpreta respuestas y acciona en los sistemas reales del cliente.",
+        "turn.s1t": "Encuentra o recibe una conversación",
+        "turn.s1c": "En LinkedIn inicia contactos. En WhatsApp o Instagram recibe consultas de clientes.",
+        "turn.s2t": "Entiende la intención",
+        "turn.s2c": "El agente interpreta si la persona necesita información, soporte, una llamada, un ticket o una escalación.",
+        "turn.s3t": "Ejecuta acciones reales",
+        "turn.s3c": "Envía emails, agenda reuniones, actualiza HubSpot, crea tickets o notifica al equipo humano.",
+        "turn.s4t": "Deja trazabilidad",
+        "turn.s4c": "Todo queda visible en Slack: conversaciones, errores, decisiones, comandos y actividad del sistema.",
+
+        "tools.label": "Integraciones",
+        "tools.title": "Trabaja donde tu empresa ya trabaja.",
+        "tools.copy": "No hay una nueva pantalla que vender ni obligar a usar. Fluxbee se conecta a los canales, CRMs y herramientas operativas existentes.",
+        "tools.linkedin": "Prospección, conexión, mensajes, likes y recontactos.",
+        "tools.whatsapp": "Soporte, ventas y atención conversacional directa.",
+        "tools.instagram": "Otro canal de soporte y venta conversacional.",
+        "tools.hubspot": "Contactos, oportunidades, tareas y seguimiento comercial.",
+        "tools.google": "Email, Calendar, documentación enviada y reuniones.",
+        "tools.slack": "Observabilidad, control humano, comandos y alertas.",
+        "tools.wordpress": "Tickets, prioridades, adjuntos y gestión de soporte.",
+        "tools.custom": "Integraciones adaptadas a la realidad del cliente.",
+
+        "control.label": "Control humano",
+        "control.title": "Autónomo no significa invisible.",
+        "control.copy": "Slack funciona como cabina de control. El equipo puede ver actividad, revisar respuestas, cambiar mensajes antes de enviar, pausar automatizaciones, iniciar campañas y detectar errores.",
+        "control.m1t": "Lead calificado",
+        "control.m1c": "Solicitó reunión. Fluxbee propone martes 10:00 o miércoles 15:30.",
+        "control.m2t": "Mensaje pendiente",
+        "control.m2c": "Aprobar, editar o enviar automáticamente según política.",
+        "control.m3t": "Error del sistema",
+        "control.m3c": "Token expirado en integración. Notificado al canal técnico.",
+
+        "oss.label": "Plataforma open source",
+        "oss.title": "Producto comercial sobre una base abierta.",
+        "oss.copy": "Fluxbee se vende como empleados digitales listos para trabajar, pero su núcleo es una plataforma open source de agentes. Eso permite auditar, extender, adaptar y crear nuevos empleados integrados a la realidad operativa de cada cliente.",
+
+        "cta.label": "Siguiente paso",
+        "cta.title": "Empieza con un trabajo concreto.",
+        "cta.copy": "LinkedIn para conseguir reuniones. WhatsApp e Instagram para vender y soportar clientes. Después, el empleado se adapta a tus procesos.",
+        "cta.button": "Agenda una llamada"
+      },
+      en: {
+        "nav.what": "What it does",
+        "nav.employees": "Employees",
+        "nav.how": "How it works",
+        "nav.oss": "Open source platform ↗",
+        "nav.cta": "Book a call",
+        "nav.login": "Log in",
+
+        "hero.kicker": "Fluxbee · digital employees",
+        "hero.copy": "Fluxbee creates concrete digital employees: one books meetings from LinkedIn; another handles sales and support through WhatsApp and Instagram. They work inside your tools, not another dashboard.",
+        "hero.cta1": "Book a call",
+        "hero.cta2": "See how it works",
+
+        "demo.linkedin": "LinkedIn · conversation",
+        "demo.m1": "Hi, I saw you connected. What is this about?",
+        "demo.m2": "Hi! We help teams like yours get more qualified meetings. Want me to send you a short summary?",
+        "demo.m3": "Sure, send me the info and let's coordinate a call.",
+        "demo.m4": "Perfect. I sent the material by email and proposed two time slots.",
+        "demo.crm1": "Contact created",
+        "demo.crm2": "Opportunity: meeting requested",
+        "demo.slack1": "Response generated",
+        "demo.slack2": "Waiting for approval or automatic send based on policy.",
+        "demo.slack3": "Meeting booked",
+        "demo.slack4": "Calendar updated. HubSpot synced.",
+
+        "anim.chatTitle": "WhatsApp · custom sofa sale",
+        "anim.chatName": "Lucía M.",
+        "anim.chatStatus": "online",
+        "anim.tag1": "crm.lead",
+        "anim.tag2": "send_email",
+        "anim.tag3": "calendar.create",
+        "anim.c1": "Hi, I want a custom sofa for my living room.",
+        "anim.a1": "Of course. Are you looking for an L-shaped, straight or modular sofa? I can send fabrics and options.",
+        "anim.c2": "L-shaped. 2.80 x 1.90 meters. Do you have stain-resistant fabrics?",
+        "anim.a2": "Yes. I sent the stain-resistant catalog and saved your measurements for the quote.",
+        "anim.c3": "I like light gray. Can we see it on a call?",
+        "anim.a3": "Done. I booked a meeting tomorrow at 11:30 with the sales team.",
+        "anim.act1t": "Lead created",
+        "anim.act1c": "Custom sofa · Living room · L-shaped",
+        "anim.act1s": "Stage: initial opportunity",
+        "anim.act2t": "Catalog sent",
+        "anim.act2c": "PDF · stain-resistant fabrics",
+        "anim.act3t": "Meeting booked",
+        "anim.act3c": "Tomorrow · sales advisor",
+        "anim.act4t": "Summary posted",
+        "anim.act4c": "Measurements, fabric preference, email sent and meeting created.",
+
+        "what.label": "What it does",
+        "what.title": "Digital employees, with concrete jobs.",
+        "what.copy": "The category is broad, but the initial offer is simple: Fluxbee operates two real commercial jobs. One generates pipeline from LinkedIn. The other responds, sells and supports customers through WhatsApp and Instagram.",
+
+        "sales.label": "Sales / Marketing",
+        "sales.title": "Get meetings from LinkedIn.",
+        "sales.copy": "Finds prospects, connects, talks, qualifies interest, sends information, books meetings and updates HubSpot.",
+        "sales.t1": "Prospecting and connection on LinkedIn",
+        "sales.t2": "Natural AI conversations",
+        "sales.t3": "Emails, brochures and sales material",
+        "sales.t4": "Books meetings directly in Google Calendar",
+        "sales.t5": "Creates contacts and opportunities in HubSpot",
+        "sales.t6": "Recontacts leads months later to keep them alive",
+
+        "support.label": "Sales / Support",
+        "support.title": "Support customers through WhatsApp and Instagram.",
+        "support.copy": "Answers questions, explains products, manages tickets, handles attachments, changes priorities and escalates urgent issues.",
+        "support.t1": "WhatsApp and Instagram support",
+        "support.t2": "Complex technical information from knowledge base",
+        "support.t3": "Ticket creation, editing and follow-up",
+        "support.t4": "Attachments and user context handling",
+        "support.t5": "Email and Slack escalation for urgent cases",
+        "support.t6": "Support and sales inside the same conversational channel",
+
+        "turn.label": "The work shift",
+        "turn.title": "An employee that starts, responds and executes.",
+        "turn.copy": "Fluxbee is not a chatbot waiting for questions. It works in shifts: searches, contacts, talks, interprets responses and acts in the customer's real systems.",
+        "turn.s1t": "Finds or receives a conversation",
+        "turn.s1c": "On LinkedIn it starts contacts. On WhatsApp or Instagram it receives customer requests.",
+        "turn.s2t": "Understands intent",
+        "turn.s2c": "The agent interprets whether the person needs information, support, a call, a ticket or an escalation.",
+        "turn.s3t": "Executes real actions",
+        "turn.s3c": "Sends emails, books meetings, updates HubSpot, creates tickets or notifies the human team.",
+        "turn.s4t": "Leaves a trace",
+        "turn.s4c": "Everything is visible in Slack: conversations, errors, decisions, commands and system activity.",
+
+        "tools.label": "Integrations",
+        "tools.title": "Works where your company already works.",
+        "tools.copy": "There is no new screen to sell or force people to use. Fluxbee connects to existing channels, CRMs and operational tools.",
+        "tools.linkedin": "Prospecting, connection, messages, likes and recontacts.",
+        "tools.whatsapp": "Support, sales and direct conversational service.",
+        "tools.instagram": "Another conversational support and sales channel.",
+        "tools.hubspot": "Contacts, opportunities, tasks and sales follow-up.",
+        "tools.google": "Email, Calendar, sent documentation and meetings.",
+        "tools.slack": "Observability, human control, commands and alerts.",
+        "tools.wordpress": "Tickets, priorities, attachments and support management.",
+        "tools.custom": "Integrations adapted to the customer's reality.",
+
+        "control.label": "Human control",
+        "control.title": "Autonomous does not mean invisible.",
+        "control.copy": "Slack works as the control room. The team can see activity, review responses, change messages before sending, pause automations, start campaigns and detect errors.",
+        "control.m1t": "Qualified lead",
+        "control.m1c": "Requested a meeting. Fluxbee proposes Tuesday 10:00 or Wednesday 15:30.",
+        "control.m2t": "Pending message",
+        "control.m2c": "Approve, edit or send automatically according to policy.",
+        "control.m3t": "System error",
+        "control.m3c": "Expired token in integration. Technical channel notified.",
+
+        "oss.label": "Open source platform",
+        "oss.title": "Commercial product on an open foundation.",
+        "oss.copy": "Fluxbee is sold as ready-to-work digital employees, but its core is an open source agent platform. That makes it auditable, extensible, adaptable and able to create new employees integrated into each customer's operational reality.",
+
+        "cta.label": "Next step",
+        "cta.title": "Start with a concrete job.",
+        "cta.copy": "LinkedIn to get meetings. WhatsApp and Instagram to sell and support customers. Then the employee adapts to your processes.",
+        "cta.button": "Book a call"
+      }
+    };
+
+    function setLang(lang) {
+      document.documentElement.setAttribute("data-lang", lang);
+      document.documentElement.setAttribute("lang", lang);
+      for (const el of document.querySelectorAll("[data-i18n]")) {
+        const key = el.getAttribute("data-i18n");
+        if (translations[lang] && translations[lang][key]) el.textContent = translations[lang][key];
+      }
+      localStorage.setItem("fluxbee_lang", lang);
+      document.title = lang === "es"
+        ? "fluxbee — Empleados digitales para ventas y soporte"
+        : "fluxbee — Digital employees for sales and support";
+      if (typeof layoutEvents === "function") layoutEvents();
+    }
+
+    document.querySelectorAll("[data-set-lang]").forEach(btn => {
+      btn.addEventListener("click", () => setLang(btn.dataset.setLang));
+    });
+
+    const saved = localStorage.getItem("fluxbee_lang");
+    if (saved === "en" || saved === "es") setLang(saved);
+
+    /* Pin each action card to the vertical position of the message that
+       triggered it, so the event sits at the same Y and rides the scroll. */
+    function layoutEvents() {
+      const desktop = window.matchMedia("(min-width: 761px)").matches;
+      const pairs = [
+        [".msg.s2", ".hubspot-card", 0],
+        [".msg.s4", ".email-card", 0],
+        [".msg.s6", ".calendar-card", 0],
+        [".msg.s7", ".slack-card", -6],
+      ];
+      for (const [msgSel, cardSel, offset] of pairs) {
+        const msg = document.querySelector(msgSel);
+        const card = document.querySelector(cardSel);
+        if (!msg || !card) continue;
+        if (!desktop) { card.style.top = ""; continue; }
+        card.style.top = (msg.offsetTop + offset) + "px";
+      }
+
+      /* Scroll just enough to "finish" the conversation: the last bubble ends
+         ~34px above the feed bottom. Computed per language so ES/EN both close. */
+      const feed = document.querySelector(".chat-feed");
+      const last = document.querySelector(".msg.s7");
+      if (feed && last) {
+        const lastBottom = last.offsetTop + last.offsetHeight;
+        const scroll = Math.max(0, Math.round(lastBottom - feed.clientHeight + 34));
+        document.documentElement.style.setProperty("--scroll-end", (-scroll) + "px");
+      }
+    }
+    window.addEventListener("load", layoutEvents);
+    window.addEventListener("resize", layoutEvents);
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(layoutEvents);
+    layoutEvents();
+  </script>
+</body>
+</html>
