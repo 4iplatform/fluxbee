@@ -4,8 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
-  <title>fluxbee — Digital Workforce para trabajo comercial autónomo</title>
-  <meta name="description" content="Fluxbee construye tu Digital Workforce: unidades de trabajo digitales que ejecutan tareas comerciales reales en LinkedIn, WhatsApp, Instagram, HubSpot, Google Workspace, Slack y tus sistemas internos." />
+  <title>fluxbee — Digital Workforce para ventas y soporte</title>
+  <meta name="description" content="Fluxbee ayuda a construir tu Digital Workforce con Ejecutivos Digitales para ventas, marketing y soporte. Trabajan en LinkedIn, WhatsApp, Instagram, HubSpot, Google Workspace, Slack y tus sistemas internos." />
 
   <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png" />
   <link rel="icon" type="image/png" sizes="16x16" href="favicon-16.png" />
@@ -218,7 +218,7 @@
       color: var(--blue-2);
       font-size: .78rem;
       font-weight: 600;
-      margin-bottom: 18px;
+      margin-bottom: 30px;
     }
     .hero-kicker::before,
     .hero-kicker::after {
@@ -256,6 +256,134 @@
       align-items: center;
       gap: 13px;
       flex-wrap: wrap;
+    }
+
+    /* DEMO BOARD */
+    .demo-wrap {
+      max-width: 980px;
+      margin: 78px auto 0;
+      position: relative;
+      height: 460px;
+    }
+    .panel {
+      position: absolute;
+      background: rgba(255,255,255,.82);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: var(--shadow-soft);
+      overflow: hidden;
+      backdrop-filter: blur(14px);
+    }
+    .panel-head {
+      height: 42px;
+      border-bottom: 1px solid var(--line-2);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 16px;
+      color: #b1bac9;
+      font-family: "Fira Code", monospace;
+      font-size: .75rem;
+      font-weight: 600;
+      letter-spacing: .03em;
+    }
+    .panel-head .led {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--blue-2);
+      box-shadow: 0 0 14px rgba(74,123,232,.7);
+      flex: none;
+    }
+    .conversation {
+      left: 0;
+      top: 0;
+      width: 56%;
+      min-height: 332px;
+    }
+    .slack {
+      right: 0;
+      top: 170px;
+      width: 45%;
+      min-height: 210px;
+    }
+    .hubspot {
+      right: 48px;
+      top: 18px;
+      width: 35%;
+      min-height: 128px;
+    }
+    .message-body {
+      padding: 18px 20px 20px;
+      display: grid;
+      gap: 14px;
+    }
+    .bubble {
+      max-width: 78%;
+      border-radius: 14px;
+      padding: 13px 15px;
+      line-height: 1.38;
+      font-weight: 650;
+      font-size: .92rem;
+      color: #667085;
+    }
+    .bubble small {
+      display: block;
+      font-family: "Fira Code", monospace;
+      color: #aeb7c7;
+      margin-bottom: 6px;
+      font-size: .68rem;
+      font-weight: 600;
+    }
+    .bubble.lead {
+      background: #f0f3f8;
+      justify-self: start;
+    }
+    .bubble.agent {
+      background: #e7eeff;
+      border: 1px solid #ccdafe;
+      justify-self: end;
+      color: #3c4659;
+    }
+    .slack-row, .crm-row {
+      padding: 13px 16px;
+      border-bottom: 1px solid var(--line-2);
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+      color: #667085;
+      font-size: .87rem;
+      line-height: 1.45;
+      font-weight: 600;
+    }
+    .slack-row:last-child, .crm-row:last-child { border-bottom: 0; }
+    .avatar {
+      width: 25px;
+      height: 25px;
+      border-radius: 7px;
+      background: #e7eeff;
+      display: grid;
+      place-items: center;
+      color: var(--blue-2);
+      font-size: .73rem;
+      font-weight: 900;
+      flex: none;
+    }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      margin-top: 6px;
+      font-family: "Fira Code", monospace;
+      font-size: .68rem;
+      color: #8a93a3;
+    }
+    .status::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #10b981;
     }
 
     /* COMMON */
@@ -602,9 +730,6 @@
     }
     .footer-inner span a { color: var(--blue-2); transition: color .15s ease; }
     .footer-inner span a:hover { color: var(--ink); text-decoration: underline; }
-    .footer-links { display: flex; gap: 22px; flex-wrap: wrap; }
-    .footer-links a { color: var(--muted-2); transition: color .15s ease; }
-    .footer-links a:hover { color: var(--ink); text-decoration: underline; }
 
     @media (max-width: 980px) {
       .nav-links { display: none; }
@@ -615,6 +740,22 @@
         grid-template-columns: 1fr;
       }
       .tools-grid { grid-template-columns: repeat(2, 1fr); }
+      .demo-wrap {
+        height: 560px;
+      }
+      .conversation,
+      .slack,
+      .hubspot {
+        position: relative;
+        width: 100%;
+        left: auto;
+        right: auto;
+        top: auto;
+        margin-bottom: 16px;
+      }
+      .conversation { min-height: 280px; }
+      .slack { min-height: 180px; }
+      .hubspot { min-height: 120px; }
     }
     @media (max-width: 640px) {
       .container, .nav-inner { padding-left: 18px; padding-right: 18px; }
@@ -627,6 +768,7 @@
       .hero { padding-top: 70px; }
       h1 { font-size: clamp(3.1rem, 15vw, 4.4rem); }
       .hero-copy { font-size: 1.05rem; }
+      .demo-wrap { margin-top: 48px; height: auto; }
       section.block { padding: 74px 0; }
       .workforce-card { min-height: auto; padding: 24px; }
       .tools-grid { grid-template-columns: 1fr; }
@@ -644,7 +786,7 @@
     /* ============ HERO — copy left, animated workflow right ============ */
     .hero {
       text-align: left;
-      padding: 20px 0 24px;
+      padding: 78px 0 90px;
       min-height: calc(100svh - 76px);
       display: flex;
       align-items: center;
@@ -667,14 +809,13 @@
       text-align: left;
     }
     h1 {
-      font-size: clamp(3rem, 5.0vw, 5.1rem);
+      font-size: clamp(3.1rem, 5.4vw, 5.95rem);
       max-width: 620px;
-      margin: 0 0 16px;
-      line-height: 1.0;          /* clears the "i" dot from the line above */
+      margin: 0 0 22px;
       letter-spacing: -.045em;   /* looser tracking so LinkedIn/WhatsApp don't touch */
     }
     h1 .accent { letter-spacing: -.045em; }
-    .hero-copy { max-width: 560px; margin: 0 0 20px; }
+    .hero-copy { max-width: 560px; margin: 0 0 30px; }
 
     /* ---- workflow canvas ---- */
     .hero-workflow {
@@ -1014,138 +1155,6 @@
       .float-action::before { display: none; }
     }
 
-
-    /* ============ FULL MONTY CATEGORY SECTIONS ============ */
-    .thesis-strip {
-      padding: 24px 0 0;
-    }
-    .thesis-box {
-      display: grid;
-      grid-template-columns: 1fr 1fr 1fr;
-      gap: 1px;
-      overflow: hidden;
-      border: 1px solid var(--line);
-      border-radius: 24px;
-      background: var(--line);
-      box-shadow: var(--shadow-soft);
-    }
-    .thesis-cell {
-      background: rgba(255,255,255,.82);
-      padding: 22px;
-      min-height: 132px;
-    }
-    .thesis-cell small {
-      display: block;
-      color: var(--blue-2);
-      font-family: "Fira Code", monospace;
-      text-transform: uppercase;
-      letter-spacing: .11em;
-      font-size: .68rem;
-      font-weight: 800;
-      margin-bottom: 12px;
-    }
-    .thesis-cell strong {
-      display: block;
-      font-size: 1.28rem;
-      line-height: 1.12;
-      letter-spacing: -.045em;
-      margin-bottom: 8px;
-    }
-    .thesis-cell p { color: var(--muted); line-height: 1.45; font-weight: 550; font-size: .94rem; }
-
-    .category {
-      background: #16181d;
-      color: white;
-      border-radius: 42px;
-      margin: 44px 24px;
-      padding: 94px 0;
-      position: relative;
-      overflow: hidden;
-    }
-    .category::before {
-      content: "";
-      position: absolute;
-      inset: -220px auto auto -120px;
-      width: 640px; height: 640px;
-      background: radial-gradient(circle, rgba(74,123,232,.30), transparent 70%);
-    }
-    .category h2 { color: white; max-width: 960px; }
-    .category .section-copy { color: rgba(255,255,255,.66); }
-    .category-grid {
-      display: grid;
-      grid-template-columns: .95fr 1.05fr;
-      gap: 42px;
-      align-items: start;
-      position: relative;
-    }
-    .definition-card {
-      border: 1px solid rgba(255,255,255,.12);
-      background: rgba(255,255,255,.07);
-      border-radius: 26px;
-      padding: 28px;
-      box-shadow: 0 30px 90px rgba(0,0,0,.22);
-    }
-    .definition-card h3 { font-size: 1.7rem; letter-spacing: -.045em; margin-bottom: 16px; }
-    .definition-card p { color: rgba(255,255,255,.72); line-height: 1.62; font-weight: 550; }
-    .definition-list { margin-top: 22px; display: grid; gap: 12px; }
-    .definition-item {
-      display: grid;
-      grid-template-columns: 26px 1fr;
-      gap: 11px;
-      color: rgba(255,255,255,.82);
-      line-height: 1.4;
-      font-weight: 700;
-    }
-    .definition-item span:first-child {
-      width: 26px; height: 26px; border-radius: 50%;
-      background: rgba(74,123,232,.18); color: #b9ccff;
-      display: grid; place-items: center; font-family: "Fira Code", monospace; font-size: .72rem;
-      border: 1px solid rgba(185,204,255,.22);
-    }
-
-    .comparison-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 18px;
-    }
-    .compare-card {
-      background: white;
-      border: 1px solid var(--line);
-      border-radius: 26px;
-      padding: 26px;
-      box-shadow: var(--shadow-soft);
-    }
-    .compare-card h3 { font-size: 1.35rem; letter-spacing: -.035em; margin-bottom: 16px; }
-    .compare-card .line { display:flex; gap: 10px; padding: 12px 0; border-top: 1px solid var(--line-2); color: #4f5a6b; font-weight: 700; line-height: 1.35; }
-    .compare-card .line:first-of-type { border-top: 0; }
-    .compare-card .bad { color: #9b4b4b; }
-    .compare-card .good { color: #2d6f53; }
-
-    .jobs-grid {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 16px;
-      margin-top: 36px;
-    }
-    .job-card {
-      background: #fff;
-      border: 1px solid var(--line);
-      border-radius: 22px;
-      padding: 22px;
-      min-height: 210px;
-      box-shadow: 0 10px 28px rgba(26,43,74,.04);
-    }
-    .job-card small { color: var(--blue-2); font-family: "Fira Code", monospace; font-weight: 800; font-size: .68rem; text-transform: uppercase; letter-spacing: .1em; }
-    .job-card h3 { margin: 14px 0 10px; font-size: 1.22rem; letter-spacing: -.035em; }
-    .job-card p { color: var(--muted); line-height: 1.5; font-weight: 550; font-size: .92rem; }
-
-    @media (max-width: 980px) {
-      .thesis-box, .category-grid, .comparison-grid, .jobs-grid { grid-template-columns: 1fr; }
-    }
-    @media (max-width: 640px) {
-      .category { margin: 20px 12px; border-radius: 28px; padding: 74px 0; }
-    }
-
   </style>
 </head>
 
@@ -1159,9 +1168,9 @@
         </a>
 
         <div class="nav-links">
-          <a href="#what" data-i18n="nav.what">Qué cambia</a>
-          <a href="#workforce" data-i18n="nav.workforce">Workforce Units</a>
-          <a href="#how" data-i18n="nav.how">Cómo trabaja</a>
+          <a href="#what" data-i18n="nav.what">Qué hace</a>
+          <a href="#workforce" data-i18n="nav.workforce">Ejecutivos Digitales</a>
+          <a href="#how" data-i18n="nav.how">Cómo funciona</a>
           <a href="#opensource" data-i18n="nav.oss">Plataforma open source ↗</a>
         </div>
 
@@ -1183,11 +1192,11 @@
         <div class="container">
           <div class="hero-copy-col">
           <div class="hero-kicker" data-i18n="hero.kicker">Fluxbee · Digital Workforce</div>
-          <h1 data-lang-only="es">Ventas en LinkedIn.<br />Soporte por WhatsApp.<br /><span class="accent">Digital Workforce.</span></h1>
-          <h1 data-lang-only="en">LinkedIn sales.<br />WhatsApp support.<br /><span class="accent">Digital Workforce.</span></h1>
+          <h1 data-lang-only="es">Ventas en LinkedIn.<br />Soporte por WhatsApp.<br /><span class="accent">Hecho por IA.</span></h1>
+          <h1 data-lang-only="en">LinkedIn sales.<br />WhatsApp support.<br /><span class="accent">Done by AI.</span></h1>
 
           <p class="hero-copy" data-i18n="hero.copy">
-            Fluxbee construye tu Digital Workforce con Workforce Units concretas: una consigue reuniones desde LinkedIn; otra atiende ventas y soporte por WhatsApp e Instagram. Trabajan en tus herramientas, no en otro dashboard. La IA ejecuta el trabajo pesado bajo dirección humana.
+            Fluxbee ayuda a construir tu Digital Workforce con Ejecutivos Digitales concretos: uno consigue reuniones desde LinkedIn; otro atiende ventas y soporte por WhatsApp e Instagram. Trabajan en tus herramientas, no en otro dashboard. La IA hace el trabajo pesado, dirigida por personas que saben del oficio.
           </p>
 
           <div class="hero-actions">
@@ -1293,35 +1302,13 @@
         </div>
       </section>
 
-      <section class="thesis-strip">
-        <div class="container">
-          <div class="thesis-box">
-            <div class="thesis-cell">
-              <small data-i18n="thesis.a.label">Antes</small>
-              <strong data-i18n="thesis.a.title">El software esperaba que alguien lo usara.</strong>
-              <p data-i18n="thesis.a.copy">Dashboards, tickets, CRMs y formularios. Herramientas potentes, pero el trabajo seguía viviendo en personas.</p>
-            </div>
-            <div class="thesis-cell">
-              <small data-i18n="thesis.b.label">Ahora</small>
-              <strong data-i18n="thesis.b.title">La IA puede ejecutar turnos completos de trabajo.</strong>
-              <p data-i18n="thesis.b.copy">Conversar, decidir, escribir, agendar, actualizar sistemas, escalar y dejar trazabilidad.</p>
-            </div>
-            <div class="thesis-cell">
-              <small data-i18n="thesis.c.label">Fluxbee</small>
-              <strong data-i18n="thesis.c.title">Una Digital Workforce lista para operar.</strong>
-              <p data-i18n="thesis.c.copy">No reemplaza el criterio humano: reemplaza horas de ejecución repetible bajo dirección humana.</p>
-            </div>
-          </div>
-        </div>
-      </section>
-
       <section id="what" class="block">
         <div class="container">
           <div class="section-head">
             <span class="label" data-i18n="what.label">Qué hace</span>
-            <h2 data-i18n="what.title">Digital Workforce: unidades de trabajo digitales para tareas concretas.</h2>
+            <h2 data-i18n="what.title">Digital Workforce, con Ejecutivos Digitales para trabajos concretos.</h2>
             <p class="section-copy" data-i18n="what.copy">
-              La idea es grande, pero la entrada es concreta: Fluxbee despliega Workforce Units para trabajos comerciales reales. Una consigue reuniones desde LinkedIn. Otra responde, vende y soporta clientes por WhatsApp e Instagram.
+              La categoría es amplia, pero la oferta inicial es simple: Fluxbee despliega Ejecutivos Digitales para dos trabajos comerciales reales. Uno genera pipeline desde LinkedIn. Otro responde, vende y soporta clientes por WhatsApp e Instagram.
             </p>
           </div>
 
@@ -1363,59 +1350,14 @@
         </div>
       </section>
 
-      <section class="category">
-        <div class="container category-grid">
-          <div>
-            <span class="label" data-i18n="category.label">La categoría</span>
-            <h2 data-i18n="category.title">Una Workforce Unit es una unidad operativa de trabajo, no una persona digital.</h2>
-            <p class="section-copy" data-i18n="category.copy">La comparación correcta no es “chatbot vs empleado”. Es pala vs retroexcavadora: la tarea sigue siendo la misma, pero la unidad de ejecución cambió. Fluxbee empaqueta esa nueva unidad para que una empresa pueda incorporarla sin rediseñar todo desde cero.</p>
-          </div>
-          <div class="definition-card">
-            <h3 data-i18n="category.card.title">Qué significa en la práctica</h3>
-            <p data-i18n="category.card.copy">Cada Workforce Unit tiene un objetivo, herramientas autorizadas, políticas, memoria operativa, supervisión humana y trazabilidad. No “responde preguntas”: toma un trabajo y lo empuja hasta el siguiente resultado verificable.</p>
-            <div class="definition-list">
-              <div class="definition-item"><span>01</span><div data-i18n="category.i1">Tiene un trabajo específico: vender, soportar, prospectar, coordinar o seguir casos.</div></div>
-              <div class="definition-item"><span>02</span><div data-i18n="category.i2">Opera dentro de tus sistemas: WhatsApp, LinkedIn, HubSpot, Gmail, Calendar, Slack y herramientas internas.</div></div>
-              <div class="definition-item"><span>03</span><div data-i18n="category.i3">Trabaja bajo dirección humana: se configura, se supervisa, se pausa, se corrige y se mejora.</div></div>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <section class="block">
-        <div class="container">
-          <div class="section-head">
-            <span class="label" data-i18n="compare.label">El cambio mental</span>
-            <h2 data-i18n="compare.title">No es otro dashboard. Es capacidad operativa.</h2>
-            <p class="section-copy" data-i18n="compare.copy">Por eso Fluxbee no se presenta como “un agente más”. La promesa es más incómoda y más útil: convertir trabajo repetible en una capacidad digital medible.</p>
-          </div>
-          <div class="comparison-grid">
-            <div class="compare-card">
-              <h3 data-i18n="compare.old.title">Modelo tradicional</h3>
-              <div class="line bad" data-i18n="compare.old.1">Contratar personas para absorber volumen operativo.</div>
-              <div class="line bad" data-i18n="compare.old.2">Comprar software y esperar que alguien lo opere.</div>
-              <div class="line bad" data-i18n="compare.old.3">Perder seguimiento cuando el equipo no tiene tiempo.</div>
-              <div class="line bad" data-i18n="compare.old.4">Escalar sumando coordinación, capacitación y fricción.</div>
-            </div>
-            <div class="compare-card">
-              <h3 data-i18n="compare.new.title">Modelo Fluxbee</h3>
-              <div class="line good" data-i18n="compare.new.1">Agregar Workforce Units para ejecutar trabajos concretos.</div>
-              <div class="line good" data-i18n="compare.new.2">Trabajar dentro de las herramientas existentes.</div>
-              <div class="line good" data-i18n="compare.new.3">Mantener leads, tickets y conversaciones vivos automáticamente.</div>
-              <div class="line good" data-i18n="compare.new.4">Escalar capacidad sin convertir cada mejora en una contratación.</div>
-            </div>
-          </div>
-        </div>
-      </section>
-
       <section id="how" class="block turn">
         <div class="container">
           <div class="turn-grid">
             <div>
               <span class="label" data-i18n="turn.label">El turno de trabajo</span>
-              <h2 data-i18n="turn.title">Una Workforce Unit que empieza, responde y ejecuta.</h2>
+              <h2 data-i18n="turn.title">Un Ejecutivo Digital que empieza, responde y ejecuta.</h2>
               <p class="section-copy" data-i18n="turn.copy">
-                Fluxbee no es un chatbot esperando preguntas. Cada Workforce Unit trabaja por turnos: busca, contacta, conversa, interpreta respuestas y acciona en los sistemas reales del cliente.
+                Fluxbee no es un chatbot esperando preguntas. Cada Ejecutivo Digital trabaja por turnos: busca, contacta, conversa, interpreta respuestas y acciona en los sistemas reales del cliente.
               </p>
             </div>
 
@@ -1431,7 +1373,7 @@
                 <div class="step-num">02</div>
                 <div>
                   <h3 data-i18n="turn.s2t">Entiende la intención</h3>
-                  <p data-i18n="turn.s2c">La Workforce Unit interpreta si el cliente necesita información, soporte, una llamada, un ticket o una escalación.</p>
+                  <p data-i18n="turn.s2c">El agente interpreta si la persona necesita información, soporte, una llamada, un ticket o una escalación.</p>
                 </div>
               </div>
               <div class="step">
@@ -1480,21 +1422,6 @@
         </div>
       </section>
 
-      <section class="block">
-        <div class="container">
-          <div class="section-head">
-            <span class="label" data-i18n="jobs.label">Después de la primera unidad</span>
-            <h2 data-i18n="jobs.title">Empieza por ventas o soporte. Después expande la fuerza laboral.</h2>
-            <p class="section-copy" data-i18n="jobs.copy">La estrategia no es vender una teoría. Es entrar por trabajos que duelen hoy y abrir la puerta a una Digital Workforce más amplia.</p>
-          </div>
-          <div class="jobs-grid">
-            <div class="job-card"><small data-i18n="jobs.j1.label">Comercial</small><h3 data-i18n="jobs.j1.title">Pipeline siempre activo</h3><p data-i18n="jobs.j1.copy">Prospección, follow-up, envío de material, coordinación de reuniones y actualización de CRM.</p></div>
-            <div class="job-card"><small data-i18n="jobs.j2.label">Soporte</small><h3 data-i18n="jobs.j2.title">Atención que no se corta</h3><p data-i18n="jobs.j2.copy">Respuestas, tickets, adjuntos, escalaciones y trazabilidad sin obligar al cliente a cambiar de canal.</p></div>
-            <div class="job-card"><small data-i18n="jobs.j3.label">Operaciones</small><h3 data-i18n="jobs.j3.title">Trabajo administrativo ejecutado</h3><p data-i18n="jobs.j3.copy">Coordinación, reportes, validaciones, recordatorios y acciones entre sistemas internos.</p></div>
-          </div>
-        </div>
-      </section>
-
       <section class="control">
         <div class="container">
           <div class="control-grid">
@@ -1502,7 +1429,7 @@
               <span class="label" data-i18n="control.label">Dirección y control humano</span>
               <h2 data-i18n="control.title">Autónomo no significa invisible.</h2>
               <p class="section-copy" data-i18n="control.copy">
-                Detrás de cada Workforce Unit hay personas que la configuran, la apuntan y la afinan mes a mes. En el día a día, Slack funciona como cabina de control: el equipo ve actividad, revisa respuestas, cambia mensajes antes de enviar, pausa automatizaciones e inicia campañas.
+                Detrás de cada Ejecutivo Digital hay personas que lo configuran, lo apuntan y lo afinan mes a mes. En el día a día, Slack funciona como cabina de control: el equipo ve actividad, revisa respuestas, cambia mensajes antes de enviar, pausa automatizaciones e inicia campañas.
               </p>
             </div>
             <div class="command-panel">
@@ -1529,7 +1456,7 @@
               <span class="label" data-i18n="oss.label">Plataforma open source</span>
               <h2 data-i18n="oss.title">Producto comercial sobre una base abierta.</h2>
               <p data-i18n="oss.copy">
-                Fluxbee se vende como una Digital Workforce lista para operar, pero su núcleo es una plataforma abierta de ejecución para Workforce Units. Eso permite auditar, extender, adaptar y crear nuevas Workforce Units integradas a la realidad operativa de cada cliente.
+                Fluxbee se vende como una Digital Workforce lista para operar, pero su núcleo es una plataforma open source de agentes. Eso permite auditar, extender, adaptar y crear nuevos Ejecutivos Digitales integrados a la realidad operativa de cada cliente.
               </p>
             </div>
             <a class="btn btn-secondary" href="https://github.com/4iplatform/fluxbee" target="_blank" rel="noopener">GitHub ↗</a>
@@ -1542,7 +1469,7 @@
           <span class="label" data-i18n="cta.label">Siguiente paso</span>
           <h2 data-i18n="cta.title">Empieza con un trabajo concreto.</h2>
           <p class="section-copy" data-i18n="cta.copy">
-            LinkedIn para conseguir reuniones. WhatsApp e Instagram para vender y soportar clientes. Después, cada Workforce Unit se adapta a tus procesos.
+            LinkedIn para conseguir reuniones. WhatsApp e Instagram para vender y soportar clientes. Después, cada Ejecutivo Digital se adapta a tus procesos.
           </p>
           <a class="btn btn-primary" href="mailto:info@4iplatform.com?subject=Fluxbee%20demo" data-i18n="cta.button">Agenda una llamada</a>
         </div>
@@ -1555,10 +1482,6 @@
           <span class="brand-word">flux<span class="bee">bee</span></span>
           <img src="fluxbee-logo.svg" alt="" />
         </a>
-        <nav class="footer-links" aria-label="Legal">
-          <a href="privacypolicy.html" data-i18n="footer.privacy">Política de privacidad</a>
-          <a href="termsandconditions.html" data-i18n="footer.terms">Términos y condiciones</a>
-        </nav>
         <span>© 2026 fluxbee · <a href="https://4iplatform.com" target="_blank" rel="noopener">4i Platform Inc.</a></span>
       </div>
     </footer>
@@ -1567,67 +1490,31 @@
   <script>
     const translations = {
       es: {
-        "nav.what": "Qué cambia",
-        "nav.workforce": "Workforce Units",
-        "nav.how": "Cómo trabaja",
+        "nav.what": "Qué hace",
+        "nav.workforce": "Ejecutivos Digitales",
+        "nav.how": "Cómo funciona",
         "nav.oss": "Plataforma open source ↗",
         "nav.cta": "Agenda una llamada",
         "nav.login": "Iniciar sesión",
-        "footer.privacy": "Política de privacidad",
-        "footer.terms": "Términos y condiciones",
 
         "hero.kicker": "Fluxbee · Digital Workforce",
-        "hero.copy": "Fluxbee construye tu Digital Workforce con Workforce Units concretas: una consigue reuniones desde LinkedIn; otra atiende ventas y soporte por WhatsApp e Instagram. Trabajan en tus herramientas, no en otro dashboard. La IA ejecuta el trabajo pesado bajo dirección humana.",
+        "hero.copy": "Fluxbee ayuda a construir tu Digital Workforce con Ejecutivos Digitales concretos: uno consigue reuniones desde LinkedIn; otro atiende ventas y soporte por WhatsApp e Instagram. Trabajan en tus herramientas, no en otro dashboard. La IA hace el trabajo pesado, dirigida por personas que saben del oficio.",
         "hero.cta1": "Agenda una llamada",
         "hero.cta2": "Mira cómo trabaja",
 
-        "thesis.a.label": "Antes",
-        "thesis.a.title": "El software esperaba que alguien lo usara.",
-        "thesis.a.copy": "Dashboards, tickets, CRMs y formularios. Herramientas potentes, pero el trabajo seguía viviendo en personas.",
-        "thesis.b.label": "Ahora",
-        "thesis.b.title": "La IA puede ejecutar turnos completos de trabajo.",
-        "thesis.b.copy": "Conversar, decidir, escribir, agendar, actualizar sistemas, escalar y dejar trazabilidad.",
-        "thesis.c.label": "Fluxbee",
-        "thesis.c.title": "Una Digital Workforce lista para operar.",
-        "thesis.c.copy": "No reemplaza el criterio humano: reemplaza horas de ejecución repetible bajo dirección humana.",
+        "demo.linkedin": "LinkedIn · conversación",
+        "demo.m1": "Hola, vi que te conectaste. ¿De qué se trata?",
+        "demo.m2": "¡Hola! Ayudamos a equipos como el tuyo a conseguir más reuniones calificadas. ¿Quieres que te envíe un resumen?",
+        "demo.m3": "Dale, envíame info y coordinamos una llamada.",
+        "demo.m4": "Perfecto. Te envié el material por email y te propuse dos horarios.",
+        "demo.crm1": "Contacto creado",
+        "demo.crm2": "Oportunidad: reunión solicitada",
+        "demo.slack1": "Respuesta generada",
+        "demo.slack2": "Esperando aprobación o envío automático según regla.",
+        "demo.slack3": "Reunión agendada",
+        "demo.slack4": "Calendar actualizado. HubSpot sincronizado.",
 
-        "category.label": "La categoría",
-        "category.title": "Una Workforce Unit es una unidad operativa de trabajo, no una persona digital.",
-        "category.copy": "La comparación correcta no es “chatbot vs empleado”. Es pala vs retroexcavadora: la tarea sigue siendo la misma, pero la unidad de ejecución cambió. Fluxbee empaqueta esa nueva unidad para que una empresa pueda incorporarla sin rediseñar todo desde cero.",
-        "category.card.title": "Qué significa en la práctica",
-        "category.card.copy": "Cada Workforce Unit tiene un objetivo, herramientas autorizadas, políticas, memoria operativa, supervisión humana y trazabilidad. No “responde preguntas”: toma un trabajo y lo empuja hasta el siguiente resultado verificable.",
-        "category.i1": "Tiene un trabajo específico: vender, soportar, prospectar, coordinar o seguir casos.",
-        "category.i2": "Opera dentro de tus sistemas: WhatsApp, LinkedIn, HubSpot, Gmail, Calendar, Slack y herramientas internas.",
-        "category.i3": "Trabaja bajo dirección humana: se configura, se supervisa, se pausa, se corrige y se mejora.",
-
-        "compare.label": "El cambio mental",
-        "compare.title": "No es otro dashboard. Es capacidad operativa.",
-        "compare.copy": "Por eso Fluxbee no se presenta como “un agente más”. La promesa es más incómoda y más útil: convertir trabajo repetible en una capacidad digital medible.",
-        "compare.old.title": "Modelo tradicional",
-        "compare.old.1": "Contratar personas para absorber volumen operativo.",
-        "compare.old.2": "Comprar software y esperar que alguien lo opere.",
-        "compare.old.3": "Perder seguimiento cuando el equipo no tiene tiempo.",
-        "compare.old.4": "Escalar sumando coordinación, capacitación y fricción.",
-        "compare.new.title": "Modelo Fluxbee",
-        "compare.new.1": "Agregar Workforce Units para ejecutar trabajos concretos.",
-        "compare.new.2": "Trabajar dentro de las herramientas existentes.",
-        "compare.new.3": "Mantener leads, tickets y conversaciones vivos automáticamente.",
-        "compare.new.4": "Escalar capacidad sin convertir cada mejora en una contratación.",
-
-        "jobs.label": "Después de la primera unidad",
-        "jobs.title": "Empieza por ventas o soporte. Después expande la fuerza laboral.",
-        "jobs.copy": "La estrategia no es vender una teoría. Es entrar por trabajos que duelen hoy y abrir la puerta a una Digital Workforce más amplia.",
-        "jobs.j1.label": "Comercial",
-        "jobs.j1.title": "Pipeline siempre activo",
-        "jobs.j1.copy": "Prospección, follow-up, envío de material, coordinación de reuniones y actualización de CRM.",
-        "jobs.j2.label": "Soporte",
-        "jobs.j2.title": "Atención que no se corta",
-        "jobs.j2.copy": "Respuestas, tickets, adjuntos, escalaciones y trazabilidad sin obligar al cliente a cambiar de canal.",
-        "jobs.j3.label": "Operaciones",
-        "jobs.j3.title": "Trabajo administrativo ejecutado",
-        "jobs.j3.copy": "Coordinación, reportes, validaciones, recordatorios y acciones entre sistemas internos.",
-
-
+        "anim.chatTitle": "WhatsApp · venta de sillones a medida",
         "anim.chatName": "Lucía M.",
         "anim.chatStatus": "en línea",
         "anim.tag1": "crm.lead",
@@ -1650,8 +1537,8 @@
         "anim.act4c": "Medidas, tela preferida, email enviado y reunión creada.",
 
         "what.label": "Qué hace",
-        "what.title": "Digital Workforce: unidades de trabajo digitales para tareas concretas.",
-        "what.copy": "La idea es grande, pero la entrada es concreta: Fluxbee despliega Workforce Units para trabajos comerciales reales. Una consigue reuniones desde LinkedIn. Otra responde, vende y soporta clientes por WhatsApp e Instagram.",
+        "what.title": "Digital Workforce, con Ejecutivos Digitales para trabajos concretos.",
+        "what.copy": "La categoría es amplia, pero la oferta inicial es simple: Fluxbee despliega Ejecutivos Digitales para dos trabajos comerciales reales. Uno genera pipeline desde LinkedIn. Otro responde, vende y soporta clientes por WhatsApp e Instagram.",
 
         "sales.label": "Sales / Marketing",
         "sales.title": "Consigue reuniones desde LinkedIn.",
@@ -1674,12 +1561,12 @@
         "support.t6": "Soporte y venta dentro del mismo canal conversacional",
 
         "turn.label": "El turno de trabajo",
-        "turn.title": "Una Workforce Unit que empieza, responde y ejecuta.",
-        "turn.copy": "Fluxbee no es un chatbot esperando preguntas. Cada Workforce Unit trabaja por turnos: busca, contacta, conversa, interpreta respuestas y acciona en los sistemas reales del cliente.",
+        "turn.title": "Un Ejecutivo Digital que empieza, responde y ejecuta.",
+        "turn.copy": "Fluxbee no es un chatbot esperando preguntas. Cada Ejecutivo Digital trabaja por turnos: busca, contacta, conversa, interpreta respuestas y acciona en los sistemas reales del cliente.",
         "turn.s1t": "Encuentra o recibe una conversación",
         "turn.s1c": "En LinkedIn inicia contactos. En WhatsApp o Instagram recibe consultas de clientes.",
         "turn.s2t": "Entiende la intención",
-        "turn.s2c": "La Workforce Unit interpreta si el cliente necesita información, soporte, una llamada, un ticket o una escalación.",
+        "turn.s2c": "El agente interpreta si la persona necesita información, soporte, una llamada, un ticket o una escalación.",
         "turn.s3t": "Ejecuta acciones reales",
         "turn.s3c": "Envía emails, agenda reuniones, actualiza HubSpot, crea tickets o notifica al equipo humano.",
         "turn.s4t": "Deja trazabilidad",
@@ -1700,7 +1587,7 @@
 
         "control.label": "Dirección y control humano",
         "control.title": "Autónomo no significa invisible.",
-        "control.copy": "Detrás de cada Workforce Unit hay personas que la configuran, la apuntan y la afinan mes a mes. En el día a día, Slack funciona como cabina de control: el equipo ve actividad, revisa respuestas, cambia mensajes antes de enviar, pausa automatizaciones e inicia campañas.",
+        "control.copy": "Detrás de cada Ejecutivo Digital hay personas que lo configuran, lo apuntan y lo afinan mes a mes. En el día a día, Slack funciona como cabina de control: el equipo ve actividad, revisa respuestas, cambia mensajes antes de enviar, pausa automatizaciones e inicia campañas.",
         "control.m1t": "Lead calificado",
         "control.m1c": "Solicitó reunión. Fluxbee propone martes 10:00 o miércoles 15:30.",
         "control.m2t": "Mensaje pendiente",
@@ -1710,75 +1597,39 @@
 
         "oss.label": "Plataforma open source",
         "oss.title": "Producto comercial sobre una base abierta.",
-        "oss.copy": "Fluxbee se vende como una Digital Workforce lista para operar, pero su núcleo es una plataforma abierta de ejecución para Workforce Units. Eso permite auditar, extender, adaptar y crear nuevas Workforce Units integradas a la realidad operativa de cada cliente.",
+        "oss.copy": "Fluxbee se vende como una Digital Workforce lista para operar, pero su núcleo es una plataforma open source de agentes. Eso permite auditar, extender, adaptar y crear nuevos Ejecutivos Digitales integrados a la realidad operativa de cada cliente.",
 
         "cta.label": "Siguiente paso",
         "cta.title": "Empieza con un trabajo concreto.",
-        "cta.copy": "LinkedIn para conseguir reuniones. WhatsApp e Instagram para vender y soportar clientes. Después, cada Workforce Unit se adapta a tus procesos.",
+        "cta.copy": "LinkedIn para conseguir reuniones. WhatsApp e Instagram para vender y soportar clientes. Después, cada Ejecutivo Digital se adapta a tus procesos.",
         "cta.button": "Agenda una llamada"
       },
       en: {
-        "nav.what": "What changes",
-        "nav.workforce": "Workforce Units",
+        "nav.what": "What it does",
+        "nav.workforce": "Digital Executives",
         "nav.how": "How it works",
         "nav.oss": "Open source platform ↗",
         "nav.cta": "Book a call",
         "nav.login": "Log in",
-        "footer.privacy": "Privacy Policy",
-        "footer.terms": "Terms & Conditions",
 
         "hero.kicker": "Fluxbee · Digital Workforce",
-        "hero.copy": "Fluxbee builds your Digital Workforce with concrete Workforce Units: one books meetings from LinkedIn; another handles sales and support through WhatsApp and Instagram. They work inside your tools, not another dashboard. AI executes the heavy lifting under human direction.",
+        "hero.copy": "Fluxbee helps you build your Digital Workforce with concrete Digital Executives: one books meetings from LinkedIn; another handles sales and support through WhatsApp and Instagram. They work inside your tools, not another dashboard. The AI does the heavy lifting, directed by people who know the craft.",
         "hero.cta1": "Book a call",
         "hero.cta2": "See how it works",
 
-        "thesis.a.label": "Before",
-        "thesis.a.title": "Software waited for someone to use it.",
-        "thesis.a.copy": "Dashboards, tickets, CRMs and forms. Powerful tools, but the work still lived in people.",
-        "thesis.b.label": "Now",
-        "thesis.b.title": "AI can execute full shifts of work.",
-        "thesis.b.copy": "Talk, decide, write, book, update systems, escalate and leave a trace.",
-        "thesis.c.label": "Fluxbee",
-        "thesis.c.title": "A Digital Workforce ready to operate.",
-        "thesis.c.copy": "It does not replace human judgment: it replaces hours of repeatable execution under human direction.",
+        "demo.linkedin": "LinkedIn · conversation",
+        "demo.m1": "Hi, I saw you connected. What is this about?",
+        "demo.m2": "Hi! We help teams like yours get more qualified meetings. Want me to send you a short summary?",
+        "demo.m3": "Sure, send me the info and let's coordinate a call.",
+        "demo.m4": "Perfect. I sent the material by email and proposed two time slots.",
+        "demo.crm1": "Contact created",
+        "demo.crm2": "Opportunity: meeting requested",
+        "demo.slack1": "Response generated",
+        "demo.slack2": "Waiting for approval or automatic send based on policy.",
+        "demo.slack3": "Meeting booked",
+        "demo.slack4": "Calendar updated. HubSpot synced.",
 
-        "category.label": "The category",
-        "category.title": "A Workforce Unit is an operational unit of work, not a digital person.",
-        "category.copy": "The right comparison is not “chatbot vs employee”. It is shovel vs excavator: the job is the same, but the execution unit changed. Fluxbee packages that new unit so a company can adopt it without redesigning everything from scratch.",
-        "category.card.title": "What it means in practice",
-        "category.card.copy": "Each Workforce Unit has a goal, authorized tools, policies, operational memory, human supervision and traceability. It does not just “answer questions”: it takes a job and pushes it to the next verifiable result.",
-        "category.i1": "It has a specific job: sell, support, prospect, coordinate or follow cases.",
-        "category.i2": "It operates inside your systems: WhatsApp, LinkedIn, HubSpot, Gmail, Calendar, Slack and internal tools.",
-        "category.i3": "It works under human direction: it is configured, supervised, paused, corrected and improved.",
-
-        "compare.label": "The mental shift",
-        "compare.title": "Not another dashboard. Operational capacity.",
-        "compare.copy": "That is why Fluxbee is not positioned as “one more agent”. The promise is more uncomfortable and more useful: turn repeatable work into measurable digital capacity.",
-        "compare.old.title": "Traditional model",
-        "compare.old.1": "Hire people to absorb operational volume.",
-        "compare.old.2": "Buy software and wait for someone to operate it.",
-        "compare.old.3": "Lose follow-up when the team has no time.",
-        "compare.old.4": "Scale by adding coordination, training and friction.",
-        "compare.new.title": "Fluxbee model",
-        "compare.new.1": "Add Workforce Units to execute concrete jobs.",
-        "compare.new.2": "Work inside the tools that already exist.",
-        "compare.new.3": "Keep leads, tickets and conversations alive automatically.",
-        "compare.new.4": "Scale capacity without turning every improvement into a hire.",
-
-        "jobs.label": "After the first unit",
-        "jobs.title": "Start with sales or support. Then expand the workforce.",
-        "jobs.copy": "The strategy is not to sell a theory. It is to enter through jobs that hurt today and open the door to a broader Digital Workforce.",
-        "jobs.j1.label": "Commercial",
-        "jobs.j1.title": "Pipeline always active",
-        "jobs.j1.copy": "Prospecting, follow-up, material delivery, meeting coordination and CRM updates.",
-        "jobs.j2.label": "Support",
-        "jobs.j2.title": "Service that does not stop",
-        "jobs.j2.copy": "Answers, tickets, attachments, escalations and traceability without forcing the customer to switch channels.",
-        "jobs.j3.label": "Operations",
-        "jobs.j3.title": "Administrative work executed",
-        "jobs.j3.copy": "Coordination, reports, validations, reminders and actions across internal systems.",
-
-
+        "anim.chatTitle": "WhatsApp · custom sofa sale",
         "anim.chatName": "Lucía M.",
         "anim.chatStatus": "online",
         "anim.tag1": "crm.lead",
@@ -1801,8 +1652,8 @@
         "anim.act4c": "Measurements, fabric preference, email sent and meeting created.",
 
         "what.label": "What it does",
-        "what.title": "Digital Workforce: digital work units for concrete jobs.",
-        "what.copy": "The idea is big, but the entry point is concrete: Fluxbee deploys Workforce Units for real commercial jobs. One books meetings from LinkedIn. Another responds, sells and supports customers through WhatsApp and Instagram.",
+        "what.title": "Digital Workforce, with Digital Executives for concrete jobs.",
+        "what.copy": "The category is broad, but the initial offer is simple: Fluxbee deploys Digital Executives for two real commercial jobs. One generates pipeline from LinkedIn. The other responds, sells and supports customers through WhatsApp and Instagram.",
 
         "sales.label": "Sales / Marketing",
         "sales.title": "Get meetings from LinkedIn.",
@@ -1825,12 +1676,12 @@
         "support.t6": "Support and sales inside the same conversational channel",
 
         "turn.label": "The work shift",
-        "turn.title": "A Workforce Unit that starts, responds and executes.",
-        "turn.copy": "Fluxbee is not a chatbot waiting for questions. Each Workforce Unit works in shifts: searches, contacts, talks, interprets responses and acts in the customer's real systems.",
+        "turn.title": "A Digital Executive that starts, responds and executes.",
+        "turn.copy": "Fluxbee is not a chatbot waiting for questions. Each Digital Executive works in shifts: searches, contacts, talks, interprets responses and acts in the customer's real systems.",
         "turn.s1t": "Finds or receives a conversation",
         "turn.s1c": "On LinkedIn it starts contacts. On WhatsApp or Instagram it receives customer requests.",
         "turn.s2t": "Understands intent",
-        "turn.s2c": "The Workforce Unit interprets whether the customer needs information, support, a call, a ticket or an escalation.",
+        "turn.s2c": "The agent interprets whether the person needs information, support, a call, a ticket or an escalation.",
         "turn.s3t": "Executes real actions",
         "turn.s3c": "Sends emails, books meetings, updates HubSpot, creates tickets or notifies the human team.",
         "turn.s4t": "Leaves a trace",
@@ -1851,7 +1702,7 @@
 
         "control.label": "Human direction & control",
         "control.title": "Autonomous does not mean invisible.",
-        "control.copy": "Behind every Workforce Unit there are people who set it up, aim it and tune it month after month. Day to day, Slack is the control room: the team sees activity, reviews responses, changes messages before they send, pauses automations and starts campaigns.",
+        "control.copy": "Behind every Digital Executive there are people who set it up, aim it and tune it month after month. Day to day, Slack is the control room: the team sees activity, reviews responses, changes messages before they send, pauses automations and starts campaigns.",
         "control.m1t": "Qualified lead",
         "control.m1c": "Requested a meeting. Fluxbee proposes Tuesday 10:00 or Wednesday 15:30.",
         "control.m2t": "Pending message",
@@ -1861,11 +1712,11 @@
 
         "oss.label": "Open source platform",
         "oss.title": "Commercial product on an open foundation.",
-        "oss.copy": "Fluxbee is sold as a ready-to-operate Digital Workforce, but its core is an open execution platform for Workforce Units. That makes it auditable, extensible, adaptable and able to create new units integrated into each customer's operational reality.",
+        "oss.copy": "Fluxbee is sold as a ready-to-operate Digital Workforce, but its core is an open source agent platform. That makes it auditable, extensible, adaptable and able to create new Digital Executives integrated into each customer's operational reality.",
 
         "cta.label": "Next step",
         "cta.title": "Start with a concrete job.",
-        "cta.copy": "LinkedIn to get meetings. WhatsApp and Instagram to sell and support customers. Then each Workforce Unit adapts to your processes.",
+        "cta.copy": "LinkedIn to get meetings. WhatsApp and Instagram to sell and support customers. Then each Digital Executive adapts to your processes.",
         "cta.button": "Book a call"
       }
     };
@@ -1879,7 +1730,7 @@
       }
       localStorage.setItem("fluxbee_lang", lang);
       document.title = lang === "es"
-        ? "fluxbee — Digital Workforce para trabajo comercial autónomo"
+        ? "fluxbee — Digital Workforce para ventas y soporte"
         : "fluxbee — Digital Workforce for sales and support";
       if (typeof layoutEvents === "function") layoutEvents();
     }

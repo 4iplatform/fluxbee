@@ -4,8 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
-  <title>fluxbee — Empleados digitales para ventas y soporte</title>
-  <meta name="description" content="Fluxbee crea empleados digitales para ventas, marketing y soporte. Trabajan en LinkedIn, WhatsApp, Instagram, HubSpot, Google Workspace, Slack y tus sistemas internos." />
+  <title>fluxbee — Digital Workforce para ventas y soporte</title>
+  <meta name="description" content="Fluxbee ayuda a construir tu Digital Workforce con Ejecutivos Digitales para ventas, marketing y soporte. Trabajan en LinkedIn, WhatsApp, Instagram, HubSpot, Google Workspace, Slack y tus sistemas internos." />
 
   <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png" />
   <link rel="icon" type="image/png" sizes="16x16" href="favicon-16.png" />
@@ -117,7 +117,6 @@
       width: 30px;
       height: 30px;
       object-fit: contain;
-      mix-blend-mode: multiply;
     }
     .nav-links {
       display: flex;
@@ -421,13 +420,13 @@
       max-width: 720px;
     }
 
-    /* EMPLOYEES */
-    .employee-grid {
+    /* WORKFORCE */
+    .workforce-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 22px;
     }
-    .employee-card {
+    .workforce-card {
       background: var(--card);
       border: 1px solid var(--line);
       border-radius: var(--radius);
@@ -439,7 +438,7 @@
       display: flex;
       flex-direction: column;
     }
-    .employee-card::after {
+    .workforce-card::after {
       content: "";
       position: absolute;
       inset: auto -120px -170px auto;
@@ -449,7 +448,7 @@
       background: radial-gradient(circle, rgba(74,123,232,.16), transparent 68%);
       pointer-events: none;
     }
-    .employee-icon {
+    .workforce-icon {
       width: 56px;
       height: 56px;
       border-radius: 17px;
@@ -462,13 +461,13 @@
       font-weight: 900;
       border: 1px solid #dce8ff;
     }
-    .employee-card h3 {
+    .workforce-card h3 {
       font-size: clamp(2rem, 3vw, 3rem);
       line-height: 1;
       letter-spacing: -.06em;
       margin-bottom: 16px;
     }
-    .employee-card p {
+    .workforce-card p {
       color: var(--muted);
       line-height: 1.65;
       font-weight: 500;
@@ -719,7 +718,7 @@
 
     @media (max-width: 980px) {
       .nav-links { display: none; }
-      .employee-grid,
+      .workforce-grid,
       .turn-grid,
       .control-grid,
       .oss-box {
@@ -756,7 +755,7 @@
       .hero-copy { font-size: 1.05rem; }
       .demo-wrap { margin-top: 48px; height: auto; }
       section.block { padding: 74px 0; }
-      .employee-card { min-height: auto; padding: 24px; }
+      .workforce-card { min-height: auto; padding: 24px; }
       .tools-grid { grid-template-columns: 1fr; }
       .control {
         margin: 20px 12px;
@@ -1153,7 +1152,7 @@
 
         <div class="nav-links">
           <a href="#what" data-i18n="nav.what">Qué hace</a>
-          <a href="#employees" data-i18n="nav.employees">Empleados</a>
+          <a href="#workforce" data-i18n="nav.workforce">Ejecutivos Digitales</a>
           <a href="#how" data-i18n="nav.how">Cómo funciona</a>
           <a href="#opensource" data-i18n="nav.oss">Plataforma open source ↗</a>
         </div>
@@ -1163,7 +1162,7 @@
             <button type="button" data-set-lang="es">ES</button>
             <button type="button" data-set-lang="en">EN</button>
           </div>
-          <a class="btn btn-primary nav-login" href="/login" aria-label="Login">
+          <a class="btn btn-primary nav-login" href="/fluxbee" aria-label="Login">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
             <span data-i18n="nav.login">Iniciar sesión</span>
           </a>
@@ -1175,12 +1174,12 @@
       <section class="hero">
         <div class="container">
           <div class="hero-copy-col">
-          <div class="hero-kicker" data-i18n="hero.kicker">Fluxbee · empleados digitales</div>
+          <div class="hero-kicker" data-i18n="hero.kicker">Fluxbee · Digital Workforce</div>
           <h1 data-lang-only="es">Ventas en LinkedIn.<br />Soporte por WhatsApp.<br /><span class="accent">Hecho por IA.</span></h1>
           <h1 data-lang-only="en">LinkedIn sales.<br />WhatsApp support.<br /><span class="accent">Done by AI.</span></h1>
 
           <p class="hero-copy" data-i18n="hero.copy">
-            Fluxbee crea empleados digitales concretos: uno consigue reuniones desde LinkedIn; otro atiende ventas y soporte por WhatsApp e Instagram. Trabajan en tus herramientas, no en otro dashboard.
+            Fluxbee ayuda a construir tu Digital Workforce con Ejecutivos Digitales concretos: uno consigue reuniones desde LinkedIn; otro atiende ventas y soporte por WhatsApp e Instagram. Trabajan en tus herramientas, no en otro dashboard.
           </p>
 
           <div class="hero-actions">
@@ -1290,15 +1289,15 @@
         <div class="container">
           <div class="section-head">
             <span class="label" data-i18n="what.label">Qué hace</span>
-            <h2 data-i18n="what.title">Empleados digitales, pero con trabajos concretos.</h2>
+            <h2 data-i18n="what.title">Digital Workforce, con Ejecutivos Digitales para trabajos concretos.</h2>
             <p class="section-copy" data-i18n="what.copy">
-              La categoría es amplia, pero la oferta inicial es simple: Fluxbee opera dos trabajos comerciales reales. Uno genera pipeline desde LinkedIn. El otro responde, vende y soporta clientes por WhatsApp e Instagram.
+              La categoría es amplia, pero la oferta inicial es simple: Fluxbee despliega Ejecutivos Digitales para dos trabajos comerciales reales. Uno genera pipeline desde LinkedIn. Otro responde, vende y soporta clientes por WhatsApp e Instagram.
             </p>
           </div>
 
-          <div id="employees" class="employee-grid">
-            <article class="employee-card">
-              <div class="employee-icon">↗</div>
+          <div id="workforce" class="workforce-grid">
+            <article class="workforce-card">
+              <div class="workforce-icon">↗</div>
               <span class="label" data-i18n="sales.label">Sales / Marketing</span>
               <h3 data-i18n="sales.title">Consigue reuniones desde LinkedIn.</h3>
               <p data-i18n="sales.copy">
@@ -1314,8 +1313,8 @@
               </div>
             </article>
 
-            <article class="employee-card">
-              <div class="employee-icon">☏</div>
+            <article class="workforce-card">
+              <div class="workforce-icon">☏</div>
               <span class="label" data-i18n="support.label">Ventas / Soporte</span>
               <h3 data-i18n="support.title">Atiende clientes por WhatsApp e Instagram.</h3>
               <p data-i18n="support.copy">
@@ -1339,9 +1338,9 @@
           <div class="turn-grid">
             <div>
               <span class="label" data-i18n="turn.label">El turno de trabajo</span>
-              <h2 data-i18n="turn.title">Un empleado que empieza, responde y ejecuta.</h2>
+              <h2 data-i18n="turn.title">Un Ejecutivo Digital que empieza, responde y ejecuta.</h2>
               <p class="section-copy" data-i18n="turn.copy">
-                Fluxbee no es un chatbot esperando preguntas. Trabaja por turnos: busca, contacta, conversa, interpreta respuestas y acciona en los sistemas reales del cliente.
+                Fluxbee no es un chatbot esperando preguntas. Cada Ejecutivo Digital trabaja por turnos: busca, contacta, conversa, interpreta respuestas y acciona en los sistemas reales del cliente.
               </p>
             </div>
 
@@ -1436,7 +1435,7 @@
               <span class="label" data-i18n="oss.label">Plataforma open source</span>
               <h2 data-i18n="oss.title">Producto comercial sobre una base abierta.</h2>
               <p data-i18n="oss.copy">
-                Fluxbee se vende como empleados digitales listos para trabajar, pero su núcleo es una plataforma open source de agentes. Eso permite auditar, extender, adaptar y crear nuevos empleados integrados a la realidad operativa de cada cliente.
+                Fluxbee se vende como una Digital Workforce lista para operar, pero su núcleo es una plataforma open source de agentes. Eso permite auditar, extender, adaptar y crear nuevos Ejecutivos Digitales integrados a la realidad operativa de cada cliente.
               </p>
             </div>
             <a class="btn btn-secondary" href="https://github.com/4iplatform/fluxbee" target="_blank" rel="noopener">GitHub ↗</a>
@@ -1449,7 +1448,7 @@
           <span class="label" data-i18n="cta.label">Siguiente paso</span>
           <h2 data-i18n="cta.title">Empieza con un trabajo concreto.</h2>
           <p class="section-copy" data-i18n="cta.copy">
-            LinkedIn para conseguir reuniones. WhatsApp e Instagram para vender y soportar clientes. Después, el empleado se adapta a tus procesos.
+            LinkedIn para conseguir reuniones. WhatsApp e Instagram para vender y soportar clientes. Después, cada Ejecutivo Digital se adapta a tus procesos.
           </p>
           <a class="btn btn-primary" href="mailto:info@4iplatform.com?subject=Fluxbee%20demo" data-i18n="cta.button">Agenda una llamada</a>
         </div>
@@ -1471,14 +1470,14 @@
     const translations = {
       es: {
         "nav.what": "Qué hace",
-        "nav.employees": "Empleados",
+        "nav.workforce": "Ejecutivos Digitales",
         "nav.how": "Cómo funciona",
         "nav.oss": "Plataforma open source ↗",
         "nav.cta": "Agenda una llamada",
         "nav.login": "Iniciar sesión",
 
-        "hero.kicker": "Fluxbee · empleados digitales",
-        "hero.copy": "Fluxbee crea empleados digitales concretos: uno consigue reuniones desde LinkedIn; otro atiende ventas y soporte por WhatsApp e Instagram. Trabajan en tus herramientas, no en otro dashboard.",
+        "hero.kicker": "Fluxbee · Digital Workforce",
+        "hero.copy": "Fluxbee ayuda a construir tu Digital Workforce con Ejecutivos Digitales concretos: uno consigue reuniones desde LinkedIn; otro atiende ventas y soporte por WhatsApp e Instagram. Trabajan en tus herramientas, no en otro dashboard.",
         "hero.cta1": "Agenda una llamada",
         "hero.cta2": "Mira cómo trabaja",
 
@@ -1517,8 +1516,8 @@
         "anim.act4c": "Medidas, tela preferida, email enviado y reunión creada.",
 
         "what.label": "Qué hace",
-        "what.title": "Empleados digitales, pero con trabajos concretos.",
-        "what.copy": "La categoría es amplia, pero la oferta inicial es simple: Fluxbee opera dos trabajos comerciales reales. Uno genera pipeline desde LinkedIn. El otro responde, vende y soporta clientes por WhatsApp e Instagram.",
+        "what.title": "Digital Workforce, con Ejecutivos Digitales para trabajos concretos.",
+        "what.copy": "La categoría es amplia, pero la oferta inicial es simple: Fluxbee despliega Ejecutivos Digitales para dos trabajos comerciales reales. Uno genera pipeline desde LinkedIn. Otro responde, vende y soporta clientes por WhatsApp e Instagram.",
 
         "sales.label": "Sales / Marketing",
         "sales.title": "Consigue reuniones desde LinkedIn.",
@@ -1541,8 +1540,8 @@
         "support.t6": "Soporte y venta dentro del mismo canal conversacional",
 
         "turn.label": "El turno de trabajo",
-        "turn.title": "Un empleado que empieza, responde y ejecuta.",
-        "turn.copy": "Fluxbee no es un chatbot esperando preguntas. Trabaja por turnos: busca, contacta, conversa, interpreta respuestas y acciona en los sistemas reales del cliente.",
+        "turn.title": "Un Ejecutivo Digital que empieza, responde y ejecuta.",
+        "turn.copy": "Fluxbee no es un chatbot esperando preguntas. Cada Ejecutivo Digital trabaja por turnos: busca, contacta, conversa, interpreta respuestas y acciona en los sistemas reales del cliente.",
         "turn.s1t": "Encuentra o recibe una conversación",
         "turn.s1c": "En LinkedIn inicia contactos. En WhatsApp o Instagram recibe consultas de clientes.",
         "turn.s2t": "Entiende la intención",
@@ -1576,23 +1575,23 @@
 
         "oss.label": "Plataforma open source",
         "oss.title": "Producto comercial sobre una base abierta.",
-        "oss.copy": "Fluxbee se vende como empleados digitales listos para trabajar, pero su núcleo es una plataforma open source de agentes. Eso permite auditar, extender, adaptar y crear nuevos empleados integrados a la realidad operativa de cada cliente.",
+        "oss.copy": "Fluxbee se vende como una Digital Workforce lista para operar, pero su núcleo es una plataforma open source de agentes. Eso permite auditar, extender, adaptar y crear nuevos Ejecutivos Digitales integrados a la realidad operativa de cada cliente.",
 
         "cta.label": "Siguiente paso",
         "cta.title": "Empieza con un trabajo concreto.",
-        "cta.copy": "LinkedIn para conseguir reuniones. WhatsApp e Instagram para vender y soportar clientes. Después, el empleado se adapta a tus procesos.",
+        "cta.copy": "LinkedIn para conseguir reuniones. WhatsApp e Instagram para vender y soportar clientes. Después, cada Ejecutivo Digital se adapta a tus procesos.",
         "cta.button": "Agenda una llamada"
       },
       en: {
         "nav.what": "What it does",
-        "nav.employees": "Employees",
+        "nav.workforce": "Digital Executives",
         "nav.how": "How it works",
         "nav.oss": "Open source platform ↗",
         "nav.cta": "Book a call",
         "nav.login": "Log in",
 
-        "hero.kicker": "Fluxbee · digital employees",
-        "hero.copy": "Fluxbee creates concrete digital employees: one books meetings from LinkedIn; another handles sales and support through WhatsApp and Instagram. They work inside your tools, not another dashboard.",
+        "hero.kicker": "Fluxbee · Digital Workforce",
+        "hero.copy": "Fluxbee helps you build your Digital Workforce with concrete Digital Executives: one books meetings from LinkedIn; another handles sales and support through WhatsApp and Instagram. They work inside your tools, not another dashboard.",
         "hero.cta1": "Book a call",
         "hero.cta2": "See how it works",
 
@@ -1631,8 +1630,8 @@
         "anim.act4c": "Measurements, fabric preference, email sent and meeting created.",
 
         "what.label": "What it does",
-        "what.title": "Digital employees, with concrete jobs.",
-        "what.copy": "The category is broad, but the initial offer is simple: Fluxbee operates two real commercial jobs. One generates pipeline from LinkedIn. The other responds, sells and supports customers through WhatsApp and Instagram.",
+        "what.title": "Digital Workforce, with Digital Executives for concrete jobs.",
+        "what.copy": "The category is broad, but the initial offer is simple: Fluxbee deploys Digital Executives for two real commercial jobs. One generates pipeline from LinkedIn. The other responds, sells and supports customers through WhatsApp and Instagram.",
 
         "sales.label": "Sales / Marketing",
         "sales.title": "Get meetings from LinkedIn.",
@@ -1655,8 +1654,8 @@
         "support.t6": "Support and sales inside the same conversational channel",
 
         "turn.label": "The work shift",
-        "turn.title": "An employee that starts, responds and executes.",
-        "turn.copy": "Fluxbee is not a chatbot waiting for questions. It works in shifts: searches, contacts, talks, interprets responses and acts in the customer's real systems.",
+        "turn.title": "A Digital Executive that starts, responds and executes.",
+        "turn.copy": "Fluxbee is not a chatbot waiting for questions. Each Digital Executive works in shifts: searches, contacts, talks, interprets responses and acts in the customer's real systems.",
         "turn.s1t": "Finds or receives a conversation",
         "turn.s1c": "On LinkedIn it starts contacts. On WhatsApp or Instagram it receives customer requests.",
         "turn.s2t": "Understands intent",
@@ -1690,11 +1689,11 @@
 
         "oss.label": "Open source platform",
         "oss.title": "Commercial product on an open foundation.",
-        "oss.copy": "Fluxbee is sold as ready-to-work digital employees, but its core is an open source agent platform. That makes it auditable, extensible, adaptable and able to create new employees integrated into each customer's operational reality.",
+        "oss.copy": "Fluxbee is sold as a ready-to-operate Digital Workforce, but its core is an open source agent platform. That makes it auditable, extensible, adaptable and able to create new Digital Executives integrated into each customer's operational reality.",
 
         "cta.label": "Next step",
         "cta.title": "Start with a concrete job.",
-        "cta.copy": "LinkedIn to get meetings. WhatsApp and Instagram to sell and support customers. Then the employee adapts to your processes.",
+        "cta.copy": "LinkedIn to get meetings. WhatsApp and Instagram to sell and support customers. Then each Digital Executive adapts to your processes.",
         "cta.button": "Book a call"
       }
     };
@@ -1708,8 +1707,8 @@
       }
       localStorage.setItem("fluxbee_lang", lang);
       document.title = lang === "es"
-        ? "fluxbee — Empleados digitales para ventas y soporte"
-        : "fluxbee — Digital employees for sales and support";
+        ? "fluxbee — Digital Workforce para ventas y soporte"
+        : "fluxbee — Digital Workforce for sales and support";
       if (typeof layoutEvents === "function") layoutEvents();
     }
 
