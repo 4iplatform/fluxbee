@@ -2551,6 +2551,74 @@ async fn execute_admin_executor_plan(
     }))
 }
 
+/// Section H5 — origin authorization for protected admin system actions.
+///
+/// Returns the matching `_RESPONSE` msg name for any action that must be
+/// authorization-gated. Same shape as architect's
+/// `protected_architect_system_action_response`.
+///
+/// `VAULT_SECRET_CHANGED` is intentionally NOT gated: it is a hive-wide
+/// broadcast emitted by SY.vault with `src_l2_name: None`. The handler
+/// (`handle_vault_secret_changed_admin`) refetches the secret via the
+/// canonical Vault path (which is auth-gated end-to-end by SY.vault), so a
+/// forged event cannot leak data — at worst it triggers a re-resolve we
+/// would have done anyway. This mirrors the audit fix in architect.
+///
+/// `NODE_STATUS_GET` is also NOT gated: health probes and inventory
+/// queries legitimately come from many places.
+///
+/// `ADMIN_COMMAND` is NOT gated here either: it is `msg_type=admin`, not
+/// SYSTEM_KIND, and has heterogeneous legitimate callers (architect,
+/// orchestrator, and operator-run diagnostic binaries). The defense for
+/// admin commands lives at the action-authorization layer inside admin's
+/// HTTP server.
+fn protected_admin_system_action_response(action: &str) -> Option<&'static str> {
+    match action {
+        "CONFIG_GET" => Some("CONFIG_GET_RESPONSE"),
+        "CONFIG_SET" => Some("CONFIG_SET_RESPONSE"),
+        _ => None,
+    }
+}
+
+fn admin_origin_authorized(hive_id: &str, src_l2_name: Option<&str>) -> bool {
+    let Some(src) = src_l2_name.map(str::trim).filter(|v| !v.is_empty()) else {
+        return false;
+    };
+    let Some((node, hive)) = src.split_once('@') else {
+        return false;
+    };
+    if hive.is_empty() || hive != hive_id {
+        return false;
+    }
+    matches!(node, "SY.architect" | "SY.config-routes" | "SY.vault")
+}
+
+fn build_admin_forbidden_response(
+    original: &Message,
+    sender_uuid: &str,
+    response_msg: &'static str,
+) -> Message {
+    Message {
+        routing: Routing {
+            src: sender_uuid.to_string(),
+            src_l2_name: None,
+            dst: Destination::Unicast(original.routing.src.clone()),
+            ttl: 16,
+            trace_id: original.routing.trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(response_msg.to_string()),
+            ..Meta::default()
+        },
+        payload: serde_json::json!({
+            "status": "error",
+            "error_code": "FORBIDDEN",
+            "error_detail": "origin not authorized for protected admin system action",
+        }),
+    }
+}
+
 async fn handle_system_command(
     ctx: &AdminContext,
     client: &Arc<RouterDispatcher>,
@@ -2563,6 +2631,22 @@ async fn handle_system_command(
         return Ok(());
     };
     let sender = client.sender_snapshot();
+
+    // Section H5 gate — reject protected actions from outside the allowlist.
+    if let Some(response_msg) = protected_admin_system_action_response(command) {
+        if !admin_origin_authorized(&ctx.hive_id, msg.routing.src_l2_name.as_deref()) {
+            let forbidden = build_admin_forbidden_response(msg, sender.uuid(), response_msg);
+            sender.send(forbidden).await?;
+            tracing::warn!(
+                action = %command,
+                src = %msg.routing.src,
+                src_l2_name = ?msg.routing.src_l2_name,
+                "sy.admin rejected unauthorized protected system action"
+            );
+            return Ok(());
+        }
+    }
+
     match command {
         MSG_VAULT_SECRET_CHANGED => {
             handle_vault_secret_changed_admin(ctx, msg).await;
@@ -13908,5 +13992,152 @@ mod tests {
         let _ = fs::remove_dir_all(blob_root);
         let _ = fs::remove_dir_all(staging_root);
         let _ = fs::remove_dir_all(dist_root);
+    }
+
+    // ─── H5 admin origin-auth gate ─────────────────────────────────────────
+
+    #[test]
+    fn protected_admin_actions_cover_config_get_and_set_only() {
+        assert_eq!(
+            protected_admin_system_action_response("CONFIG_GET"),
+            Some("CONFIG_GET_RESPONSE")
+        );
+        assert_eq!(
+            protected_admin_system_action_response("CONFIG_SET"),
+            Some("CONFIG_SET_RESPONSE")
+        );
+    }
+
+    /// H5.4 explicit assertion. `VAULT_SECRET_CHANGED` is a broadcast
+    /// emitted by SY.vault with `src_l2_name: None`; gating it would
+    /// reject every hot-refresh event (same trap the architect Section E
+    /// audit found and fixed on 2026-06-06).
+    #[test]
+    fn vault_secret_changed_is_not_protected() {
+        assert_eq!(
+            protected_admin_system_action_response(MSG_VAULT_SECRET_CHANGED),
+            None,
+            "VAULT_SECRET_CHANGED must NOT be gated — it is a broadcast event with src_l2_name=None"
+        );
+    }
+
+    #[test]
+    fn node_status_get_is_not_protected() {
+        assert_eq!(
+            protected_admin_system_action_response(MSG_NODE_STATUS_GET),
+            None,
+            "NODE_STATUS_GET is intentionally open — health probes come from many places"
+        );
+    }
+
+    #[test]
+    fn unknown_actions_are_not_protected() {
+        assert_eq!(protected_admin_system_action_response("WHATEVER"), None);
+        assert_eq!(protected_admin_system_action_response(""), None);
+    }
+
+    #[test]
+    fn admin_origin_authorized_accepts_allowlist_in_same_hive() {
+        assert!(admin_origin_authorized(
+            "motherbee",
+            Some("SY.architect@motherbee")
+        ));
+        assert!(admin_origin_authorized(
+            "motherbee",
+            Some("SY.config-routes@motherbee")
+        ));
+        assert!(admin_origin_authorized(
+            "motherbee",
+            Some("SY.vault@motherbee")
+        ));
+    }
+
+    #[test]
+    fn admin_origin_authorized_rejects_other_nodes() {
+        assert!(!admin_origin_authorized(
+            "motherbee",
+            Some("IO.slack@motherbee")
+        ));
+        assert!(!admin_origin_authorized(
+            "motherbee",
+            Some("AI.support@motherbee")
+        ));
+        assert!(!admin_origin_authorized(
+            "motherbee",
+            Some("WF.invoice@motherbee")
+        ));
+        assert!(!admin_origin_authorized(
+            "motherbee",
+            Some("SY.orchestrator@motherbee")
+        ));
+    }
+
+    #[test]
+    fn admin_origin_authorized_rejects_cross_hive() {
+        assert!(!admin_origin_authorized(
+            "motherbee",
+            Some("SY.architect@workerbee")
+        ));
+    }
+
+    #[test]
+    fn admin_origin_authorized_rejects_missing_src_l2_name() {
+        assert!(!admin_origin_authorized("motherbee", None));
+        assert!(!admin_origin_authorized("motherbee", Some("")));
+        assert!(!admin_origin_authorized("motherbee", Some("   ")));
+    }
+
+    #[test]
+    fn admin_origin_authorized_rejects_malformed_src_l2_name() {
+        // No `@` separator.
+        assert!(!admin_origin_authorized(
+            "motherbee",
+            Some("SY.architect")
+        ));
+        // Empty hive part.
+        assert!(!admin_origin_authorized(
+            "motherbee",
+            Some("SY.architect@")
+        ));
+    }
+
+    /// H4.3 — Admin's executor hot-refresh filters incoming
+    /// `VAULT_SECRET_CHANGED` events by `(resource_type=openai, tenant=root,
+    /// ilk=self)`. Asserts the same `VaultSecretInterest` semantics the
+    /// `handle_vault_secret_changed_admin` handler relies on.
+    #[test]
+    fn admin_vault_interest_filters_openai_at_root_tenant() {
+        use fluxbee_sdk::protocol::{VaultSecretChangedPayload, VaultSecretOp};
+        let self_ilk = "ilk:test-admin";
+        let interest = VaultSecretInterest {
+            resource_type: "openai",
+            my_tenant: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+            my_ilk: Some(self_ilk),
+            system_caller: true,
+        };
+
+        let matches = VaultSecretChangedPayload {
+            op: VaultSecretOp::Put,
+            resource_type: "openai".to_string(),
+            tenant_id: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID.to_string(),
+            ilk: None,
+            version: 1,
+            key: "secret/openai".to_string(),
+            hive_id: "motherbee".to_string(),
+            at_ms: 0,
+        };
+        assert!(matches.matches_interest(&interest));
+
+        let wrong_resource = VaultSecretChangedPayload {
+            resource_type: "postgres".to_string(),
+            ..matches.clone()
+        };
+        assert!(!wrong_resource.matches_interest(&interest));
+
+        let wrong_tenant = VaultSecretChangedPayload {
+            tenant_id: "tnt:other".to_string(),
+            ..matches.clone()
+        };
+        assert!(!wrong_tenant.matches_interest(&interest));
     }
 }

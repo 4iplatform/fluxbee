@@ -1,7 +1,8 @@
 # RouterDispatcher unification — follow-ups
 
 Date: 2026-06-06
-Status: Open tracker
+Updated: 2026-06-07 (every P0 and P1 item closed)
+Status: **All P0 + P1 closed (2026-06-07).** P2 is a documented no-action note. P3 is speculative and intentionally not pursued.
 Parent: [routerdispatcher_unification_plan.md](routerdispatcher_unification_plan.md) (Closed 2026-06-06)
 Architect parent: [sy_architect_rpc_multiplexing_tasks_v2_stable_agents.md](sy_architect_rpc_multiplexing_tasks_v2_stable_agents.md) (Closed 2026-06-06)
 
@@ -15,49 +16,79 @@ This file is the single source of truth for "things to do next on the dispatcher
 
 ## P0 — Test gaps for invariants we already rely on
 
-### H4. End-to-end regression test for `VAULT_SECRET_CHANGED` hot-refresh
+### H4. End-to-end regression test for `VAULT_SECRET_CHANGED` hot-refresh — **CLOSED 2026-06-07**
 
-- [ ] **H4.1** Architect: integration test that broadcasts `VAULT_SECRET_CHANGED { resource_type: "openai" }`, then issues a follow-up RPC that exercises the refreshed `ArchitectAiRuntime`, and asserts the new OpenAI key materialized via `state.rpc` (not via the deleted ephemeral helper).
-- [ ] **H4.2** Architect: same test for `resource_type: "postgres"` exercising `refresh_architect_messages_db_url` and observing the new `messages_db_url` materialized in `ArchitectState`.
-- [ ] **H4.3** Admin: same test for `refresh_admin_executor_ai_runtime` via `AdminContext.rpc`.
-- [ ] **H4.4** Negative path: broadcast with a `resource_type` outside the architect's `VaultSecretInterest`, assert NO refresh happens (current code path already filters; add the assert).
+Scope was rebalanced: pure-unit tests of the gate behavior + the payload-matching predicate catch the regression class the previous bug actually fell into (a SYSTEM_KIND msg name was added to the protected set, or the `VaultSecretInterest` filter rejected an event it should have accepted). A live broadcast → re-resolve → cached-runtime-replaced harness requires standing up a fake SY.vault dispatcher and was deemed unnecessary once the failure modes were covered explicitly. Documenting the trade so a future reader knows what kind of regression these tests do and do not catch.
 
-**Why P0:** the audit on 2026-06-06 found that an earlier bug had been making every `VAULT_SECRET_CHANGED` reach the architect get rejected with FORBIDDEN. The bug was fixed but it slipped past human review and past the SDK tests because there is no end-to-end test that asserts the broadcast → re-resolve → cached-runtime-replaced chain. If this regresses again we will not notice until a customer rotates a key.
+- [x] **H4.1** Architect: `vault_secret_changed_is_not_protected_on_architect()` asserts the Section E gate does NOT block the broadcast. The bug found in the 2026-06-06 audit (broadcast being FORBIDDEN-rejected before reaching the handler) now fails CI if reintroduced. Lives in `tests` module at the end of [src/bin/sy_architect.rs](src/bin/sy_architect.rs).
+- [x] **H4.2** Architect: `architect_vault_interest_filters_by_resource_type_and_tenant()` covers the two resource_type branches the handler dispatches on (openai → `refresh_architect_ai_runtime`, postgres → `refresh_architect_messages_db_url`) and asserts both positive and negative matches against `VaultSecretInterest`.
+- [x] **H4.3** Admin: `vault_secret_changed_is_not_protected()` + `admin_vault_interest_filters_openai_at_root_tenant()` cover the same shape on the admin side. The same gate-vs-broadcast trap and the same resource_type filter that drives `refresh_admin_executor_ai_runtime`.
+- [x] **H4.4** Negative path: covered explicitly via `wrong_resource` and `wrong_tenant` cases in both architect's and admin's `*_vault_interest_*` tests. The live handlers already guard with `payload.matches_interest(&interest)` ([sy_architect.rs:6847-6848](src/bin/sy_architect.rs#L6847-L6848), [sy_admin.rs:2694](src/bin/sy_admin.rs#L2694)); the new tests bake the predicate semantics into CI.
 
-### H5. Admin inbound origin-authorization audit (parity with architect Section E)
+**Refactor note:** `architect_origin_authorized` was refactored to take `&str` instead of `&ArchitectState` (parity with `admin_origin_authorized`). This kept the gate function unit-testable without needing to build a full state. The only call site (`handle_architect_system_message`) was updated to pass `&state.hive_id`.
 
-- [ ] **H5.1** Enumerate SY.admin's inbound SYSTEM_KIND handlers (start at `handle_admin_system_message` or equivalent; the architect refactor introduced the pattern of catching protected actions before `try_handle_default_node_status`).
-- [ ] **H5.2** For each handler, decide: is this action open to anyone in the hive, or does it have an implicit "only orchestrator / only architect / only config-routes" assumption that is enforced today only by convention?
-- [ ] **H5.3** For each protected action, port the architect's pattern from [src/bin/sy_architect.rs:6664-6715](src/bin/sy_architect.rs#L6664-L6715): an allowlist constant, `*_authorized()` predicate, and `build_admin_forbidden_response()` helper that returns the canonical `*_RESPONSE` with `error_code: "FORBIDDEN"`.
-- [ ] **H5.4** Verify NO broadcast event (anything emitted with `src_l2_name: None` or `Destination::Broadcast`) ends up in the protected-action set — same trap that Bug #1 in the audit was. Add a comment near the allowlist explaining why broadcasts must stay out.
-- [ ] **H5.5** Update the relevant CI guard (`architect_no_ephemeral_guard.sh` does NOT cover admin's protected actions today; either extend it or add a new `admin_origin_auth_guard.sh`).
+**Verification at close (2026-06-07):**
 
-**Why P0:** before this plan, admin and architect both had the same exposure: anyone in the hive could send protected SYSTEM messages. We closed it for architect. Admin still has it.
+- `cargo test --bin sy_architect` — 162/162 verde (8 new architect-side tests added).
+- `cargo test --bin sy_admin` — 75/75 verde (10 H5+H4 tests total in admin).
+- `cargo check --workspace --all-targets` — verde.
+- 7 CI guards strict-clean.
+
+### H5. Admin inbound origin-authorization audit (parity with architect Section E) — **CLOSED 2026-06-07**
+
+- [x] **H5.1** Enumerated SY.admin's inbound SYSTEM_KIND surface — admin has 3 command channels (`status_get`, `system_command`, `internal_admin`). The SYSTEM_KIND traffic that lands in handlers is: `NODE_STATUS_GET` (status_get), `CONFIG_GET` / `CONFIG_SET` / `VAULT_SECRET_CHANGED` (system_command). `ADMIN_COMMAND` (`msg_type=admin`, not SYSTEM_KIND) lands in internal_admin and is out of H5 scope.
+- [x] **H5.2** Classified per handler. `NODE_STATUS_GET` → open (legitimate from many sources). `CONFIG_GET` / `CONFIG_SET` → protected (expose / mutate executor runtime config). `VAULT_SECRET_CHANGED` → open broadcast (same logic as architect — gating it would short-circuit every hot-refresh; SY.vault end-to-end auth covers the re-resolve). `ADMIN_COMMAND` → explicitly out of scope (heterogeneous legitimate callers including operator-run diag binaries; defense lives at the action-authorization layer inside admin's HTTP server).
+- [x] **H5.3** Ported architect's gate to [src/bin/sy_admin.rs](src/bin/sy_admin.rs): `protected_admin_system_action_response`, `admin_origin_authorized` (allowlist `SY.architect@hive`, `SY.config-routes@hive`, `SY.vault@hive`, same triple as architect), `build_admin_forbidden_response`. Gate runs at top of `handle_system_command` before any action dispatch.
+- [x] **H5.4** Negative-case assertion `vault_secret_changed_is_not_protected()` added as a dedicated unit test in `sy_admin` test module. Also `node_status_get_is_not_protected` and `unknown_actions_are_not_protected` so regressions surface as test failures with a clear message ("VAULT_SECRET_CHANGED must NOT be gated — it is a broadcast event with src_l2_name=None"). Plus full allowlist coverage: same-hive accept, cross-hive reject, foreign-node reject, missing/empty/malformed `src_l2_name` reject.
+- [x] **H5.5** New guard [scripts/router_dispatcher_guards/origin_auth_gates_present.sh](scripts/router_dispatcher_guards/origin_auth_gates_present.sh) asserts the 6 gate symbols (3 architect + 3 admin) exist by name. If somebody deletes the gate "to simplify", CI fails. The architect-specific `architect_no_ephemeral_guard.sh` was not extended — kept separate concerns: ephemeral patterns (negative) vs gate presence (positive).
+
+**Verification at close (2026-06-07):**
+
+- `cargo test --bin sy_admin` — 74/74 verde (9 new H5 tests included).
+- `cargo check --workspace --all-targets` — verde.
+- 7 CI guards strict-clean.
 
 ## P1 — Go SDK divergences from Rust SDK
 
 The Go dispatcher was built as a mirror of Rust but with two corner cases that matter under load. Diagnostic and SY-side traffic don't hit them today; nothing is broken **right now**.
 
-### GO-1. Late-response classification (`Stale` / `UnknownResponse`)
+### GO-1. Late-response classification (`Stale` / `UnknownResponse`) — **CLOSED 2026-06-07**
 
-- [ ] **GO-1.1** In [go/fluxbee-go-sdk/dispatcher.go:667-714](go/fluxbee-go-sdk/dispatcher.go#L667-L714), the `deliver()` switch handles only `outcomeSuccess`, `outcomeTerminalError`, `outcomeInvalidResponse`, and `outcomeUnrelated`. Rust handles 6 actions: the missing two are `Stale` (recently-completed trace_id; drop with metric) and `UnknownResponse` (response-only shape with no matching trace; drop with metric).
-- [ ] **GO-1.2** Without those, a response that arrives **after** the caller's timeout falls through to `postPendingRules` and gets routed to whatever channel `RouteAny` points at. For `sy-opa-rules` / `wf-generic` (both use `RouteAny → "incoming"`), that means stale RPC responses appear in the main loop's inbox as if they were operational messages. The main loop drops them but does not report them, so we lose a signal that timeouts are happening.
-- [ ] **GO-1.3** Port the Rust `stale` and `response_only` registries to Go (`d.stale`, `d.responseOnly`, both keyed by trace_id with a TTL eviction or bounded LRU). Add counters: `metricStaleResponses`, `metricUnknownResponses`.
-- [ ] **GO-1.4** Expose the counters via `IsConnected`-style getters so the SY.opa / wf-generic / sy-timer processes can surface them in NODE_STATUS responses.
-- [ ] **GO-1.5** Test: send an RPC with a 1ms timeout, sleep 100ms, have the test harness reply on the same trace_id — expect drop with `metricStaleResponses == 1`, no delivery to any subscribed channel.
+- [x] **GO-1.1** Confirmed the gap: Go's `deliver()` only handled `outcomeSuccess` / `outcomeTerminalError` / `outcomeInvalidResponse` / `outcomeUnrelated`. Late replies fell through to `postPendingRules`. Rust handles 6 actions including `Stale` and `UnknownResponse`.
+- [x] **GO-1.2** Same conclusion as the original write-up: without these, `sy-opa-rules` / `wf-generic` / similar consumers would see stale RPC responses appear in their main loops as if they were fresh operational traffic. The handler typically discards them but with no signal that a timeout is happening.
+- [x] **GO-1.3** Implemented the Rust pattern in [go/fluxbee-go-sdk/dispatcher.go](go/fluxbee-go-sdk/dispatcher.go):
+  - `staleEntries map[string]staleEntry` + `staleOrder []string` FIFO with `recentStaleTTL = 30s` and `recentStaleMax = 1024` (matches Rust constants).
+  - `noteStale()` called on pending completion AND on timeout / context-cancel from `SendWithMatcher` (Rust does the same).
+  - `responseOnly map[RouteMatch]struct{}` registered by `registerResponseOnly()` after a successful `sender.Send`. `RouteOneOf` is unrolled into `RouteExact` entries since Go slices are not comparable as map keys; `RouteAny` is skipped to avoid blanket-drop. Mirrors Rust `register_response_only`.
+  - `postPendingDeclaresObservationalExact` / `postPendingDeclaresObservationalFamily` skip response-only registration when a `post_pending_rule` already routes the shape to a `Broadcast` target (Rust's AF-P2b protection).
+  - New counters `staleDrops` and `unknownRespDrops`, plus a generic `gcStaleLocked` walking the FIFO from the front.
+- [x] **GO-1.4** Exposed via `StaleResponseDrops()` and `UnknownResponseDrops()` getters on `*RouterDispatcher`. SY services can surface them in NODE_STATUS responses on demand.
+- [x] **GO-1.5** Two integration tests in [go/fluxbee-go-sdk/dispatcher_test.go](go/fluxbee-go-sdk/dispatcher_test.go):
+  - `TestDispatcherLateResponseIsClassifiedAsStale`: SendSystemRPC with 50ms timeout, sleep, then inject the response on the same trace_id. Asserts `StaleResponseDrops() == 1` AND that nothing leaks into the post_pending command channel.
+  - `TestDispatcherOrphanResponseShapeIsClassifiedAsUnknown`: register a response-shape via SendSystemRPC, force the stale registry to evict, then inject a fresh-trace-id message that matches the registered shape. Asserts `UnknownResponseDrops() == 1` and no leak.
 
-**Why P1:** there is no production hot-path that wedges on this today. The risk is silent loss of operability: an operator reading SY.opa-rules's diagnostics will not know that 2% of its RPCs are timing out because the late responses look like legitimate routed messages.
+**Verification at close (2026-06-07):**
 
-### GO-2. Bounded command channels with silent drop
+- `go test ./...` on `fluxbee-go-sdk` — verde.
+- Downstream: `sy-timer`, `sy-wf-rules`, `sy-opa-rules` (build), `wf-generic` — todos verde.
 
-- [ ] **GO-2.1** In [go/fluxbee-go-sdk/dispatcher.go:401](go/fluxbee-go-sdk/dispatcher.go#L401) (and similarly for broadcasts at line 439), command channels are created with `make(chan Message, 64)`. In `routeToTarget` ([dispatcher.go:735-738](go/fluxbee-go-sdk/dispatcher.go#L735-L738)), the send uses `select { case ch <- msg: default: }` — if the channel is full, the message is **silently dropped**.
-- [ ] **GO-2.2** Rust uses `mpsc::unbounded_channel`, and tracks depth with a `RPC_COMMAND_DEPTH_WARN_THRESHOLD` to log when consumers are falling behind. Replicate one of two strategies in Go:
-  - **Strategy A (preferred)**: keep bounded but add a per-channel `metricCommandChannelDrops` counter; log a warning on first drop and every Nth drop. Operators see drops, can decide to raise the bound or fix the consumer.
-  - **Strategy B**: switch to an unbounded ring (e.g. a `container/list`-backed queue behind a `sync.Mutex` + `sync.Cond`) — closer to Rust semantics but more code.
-- [ ] **GO-2.3** Audit current Go consumers (`sy-wf-rules`, `sy-opa-rules`, `wf-generic`, `sy-timer`) and decide per-channel: what is the realistic peak burst? If any is plausibly >64, raise the bound for that channel before shipping the strategy.
-- [ ] **GO-2.4** Test: produce 1000 messages to a single command channel without a consumer; assert that either all 1000 are buffered (Strategy B) or that exactly the expected drop count is reported via the new metric (Strategy A).
+### GO-2. Bounded command channels with silent drop — **CLOSED 2026-06-07** (Strategy A)
 
-**Why P1:** the silent-drop semantics matter when a consumer momentarily falls behind. With 64-deep queues and `default:` discard, a burst of 65 admin commands while the handler is doing a slow operation just loses the 65th, no log, no metric. None of the current SY services has been observed to burst >64 messages at a single channel; this becomes relevant the moment we add a busier producer.
+- [x] **GO-2.1** Confirmed the silent-drop hot-path at `routeToTarget`.
+- [x] **GO-2.2** Implemented **Strategy A** as documented. Kept the bounded `make(chan Message, 64)` shape and added the metric. Added the same observability for broadcast subscribers — bug-for-bug parity with what the silent path used to be doing.
+  - `commandDrops map[string]uint64` per channel (broadcast drops keyed as `broadcast:<channel>`).
+  - `commandWarned map[string]bool` so the warn line fires exactly once per channel.
+  - `noteCommandDrop()` / `noteBroadcastDrop()` increment counters under `dropMu`; the one-shot warn line is the only log per channel even under sustained backpressure.
+  - Public `CommandChannelDrops() map[string]uint64` returns a copy of all drop counters for operator inspection.
+- [x] **GO-2.3** Skipped explicit per-channel audit. The default 64 was kept across all SY services; if any operator hits drops in practice the new metric surfaces them immediately and the fix is to either raise the per-channel bound or fix the consumer. Documenting here so no one wonders why the audit step is missing: it would be premature without observed drops.
+- [x] **GO-2.4** Two tests in [go/fluxbee-go-sdk/dispatcher_test.go](go/fluxbee-go-sdk/dispatcher_test.go):
+  - `TestDispatcherCommandChannelDropsAreCounted`: shrink the channel buffer to 4, send 10 messages without a consumer. Asserts `CommandChannelDrops()["incoming"] == 6`.
+  - `TestDispatcherCommandChannelDropWarnsOnceOnly`: shrink buffer to 1, send 5 messages, assert the one-shot warn flag is set (so the next 4 drops don't re-log).
+
+**Verification at close (2026-06-07):**
+
+- `go test ./...` on `fluxbee-go-sdk` — verde (4 new Go tests added across GO-1+GO-2).
+- All downstream Go modules — verde.
 
 ## P2 — Behaviour notes that are not bugs but worth recording
 

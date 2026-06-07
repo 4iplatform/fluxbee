@@ -6678,14 +6678,14 @@ fn protected_architect_system_action_response(action: &str) -> Option<&'static s
     }
 }
 
-fn architect_origin_authorized(state: &ArchitectState, src_l2_name: Option<&str>) -> bool {
+fn architect_origin_authorized(hive_id: &str, src_l2_name: Option<&str>) -> bool {
     let Some(src) = src_l2_name.map(str::trim).filter(|v| !v.is_empty()) else {
         return false;
     };
     let Some((node, hive)) = src.split_once('@') else {
         return false;
     };
-    if hive != state.hive_id {
+    if hive.is_empty() || hive != hive_id {
         return false;
     }
     matches!(node, "SY.admin" | "SY.config-routes" | "SY.vault")
@@ -6763,7 +6763,7 @@ async fn handle_architect_system_message(
     if msg.meta.msg_type == SYSTEM_KIND {
         if let Some(action) = msg.meta.msg.as_deref() {
             if let Some(response_msg) = protected_architect_system_action_response(action) {
-                if !architect_origin_authorized(state, msg.routing.src_l2_name.as_deref()) {
+                if !architect_origin_authorized(&state.hive_id, msg.routing.src_l2_name.as_deref()) {
                     let forbidden =
                         build_architect_forbidden_response(msg, sender.uuid(), response_msg);
                     sender.send(forbidden).await?;
@@ -26914,5 +26914,150 @@ mod tests {
         assert_eq!(verdict.status, DesignAuditStatus::Pass);
         assert!(verdict.blocking_issues.is_empty());
         assert!(verdict.findings.is_empty());
+    }
+
+    // ─── Section E + H4 architect origin-auth + hot-refresh coverage ────
+
+    #[test]
+    fn protected_architect_actions_cover_three_rpcs() {
+        assert_eq!(
+            protected_architect_system_action_response("NODE_STATUS_GET"),
+            Some("NODE_STATUS_GET_RESPONSE")
+        );
+        assert_eq!(
+            protected_architect_system_action_response("CONFIG_GET"),
+            Some("CONFIG_GET_RESPONSE")
+        );
+        assert_eq!(
+            protected_architect_system_action_response("CONFIG_SET"),
+            Some("CONFIG_SET_RESPONSE")
+        );
+    }
+
+    /// H4 + audit regression. `VAULT_SECRET_CHANGED` is a broadcast emitted
+    /// by SY.vault with `src_l2_name: None`. Gating it would short-circuit
+    /// every hot-refresh event — exactly the bug found in the post-close
+    /// audit on 2026-06-06. The 2026-06-07 follow-up test bakes that
+    /// invariant into CI so the bug cannot creep back.
+    #[test]
+    fn vault_secret_changed_is_not_protected_on_architect() {
+        assert_eq!(
+            protected_architect_system_action_response(MSG_VAULT_SECRET_CHANGED),
+            None,
+            "VAULT_SECRET_CHANGED must NOT be gated — it is a broadcast event with src_l2_name=None and would short-circuit hot-refresh"
+        );
+    }
+
+    #[test]
+    fn unknown_actions_are_not_protected_on_architect() {
+        assert_eq!(
+            protected_architect_system_action_response("WHATEVER"),
+            None
+        );
+        assert_eq!(protected_architect_system_action_response(""), None);
+    }
+
+    #[test]
+    fn architect_origin_authorized_accepts_allowlist_in_same_hive() {
+        assert!(architect_origin_authorized(
+            "motherbee",
+            Some("SY.admin@motherbee")
+        ));
+        assert!(architect_origin_authorized(
+            "motherbee",
+            Some("SY.config-routes@motherbee")
+        ));
+        assert!(architect_origin_authorized(
+            "motherbee",
+            Some("SY.vault@motherbee")
+        ));
+    }
+
+    #[test]
+    fn architect_origin_authorized_rejects_other_nodes() {
+        assert!(!architect_origin_authorized(
+            "motherbee",
+            Some("IO.slack@motherbee")
+        ));
+        assert!(!architect_origin_authorized(
+            "motherbee",
+            Some("AI.support@motherbee")
+        ));
+        assert!(!architect_origin_authorized(
+            "motherbee",
+            Some("WF.invoice@motherbee")
+        ));
+        assert!(!architect_origin_authorized(
+            "motherbee",
+            Some("SY.architect@motherbee")
+        ));
+    }
+
+    #[test]
+    fn architect_origin_authorized_rejects_cross_hive() {
+        assert!(!architect_origin_authorized(
+            "motherbee",
+            Some("SY.admin@workerbee")
+        ));
+    }
+
+    #[test]
+    fn architect_origin_authorized_rejects_missing_or_malformed_src_l2_name() {
+        assert!(!architect_origin_authorized("motherbee", None));
+        assert!(!architect_origin_authorized("motherbee", Some("")));
+        assert!(!architect_origin_authorized("motherbee", Some("   ")));
+        assert!(!architect_origin_authorized("motherbee", Some("SY.admin")));
+        assert!(!architect_origin_authorized("motherbee", Some("SY.admin@")));
+    }
+
+    /// H4.1/H4.2 — Architect's `VaultSecretInterest` filtering decides
+    /// whether a broadcast triggers a refresh or is ignored. Verifies the
+    /// 4 cases the [`handle_vault_secret_changed_architect`] handler
+    /// branches over: matching openai, matching postgres, non-matching
+    /// resource_type, and non-matching tenant.
+    #[test]
+    fn architect_vault_interest_filters_by_resource_type_and_tenant() {
+        use fluxbee_sdk::protocol::{
+            VaultSecretChangedPayload, VaultSecretInterest, VaultSecretOp,
+        };
+        let self_ilk = "ilk:test-architect";
+        let openai_interest = VaultSecretInterest {
+            resource_type: "openai",
+            my_tenant: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+            my_ilk: Some(self_ilk),
+            system_caller: true,
+        };
+        let postgres_interest = VaultSecretInterest {
+            resource_type: "postgres",
+            my_tenant: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+            my_ilk: Some(self_ilk),
+            system_caller: true,
+        };
+
+        let matches_openai = VaultSecretChangedPayload {
+            op: VaultSecretOp::Put,
+            resource_type: "openai".to_string(),
+            tenant_id: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID.to_string(),
+            ilk: None,
+            version: 1,
+            key: "secret/openai".to_string(),
+            hive_id: "motherbee".to_string(),
+            at_ms: 0,
+        };
+        assert!(matches_openai.matches_interest(&openai_interest));
+        assert!(!matches_openai.matches_interest(&postgres_interest));
+
+        let matches_postgres = VaultSecretChangedPayload {
+            resource_type: "postgres".to_string(),
+            ..matches_openai.clone()
+        };
+        assert!(matches_postgres.matches_interest(&postgres_interest));
+        assert!(!matches_postgres.matches_interest(&openai_interest));
+
+        let other_tenant = VaultSecretChangedPayload {
+            tenant_id: "workspace:bogus".to_string(),
+            ..matches_openai.clone()
+        };
+        assert!(!other_tenant.matches_interest(&openai_interest));
     }
 }

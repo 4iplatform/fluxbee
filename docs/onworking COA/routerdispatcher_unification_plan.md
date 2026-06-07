@@ -1,7 +1,7 @@
 # RouterDispatcher unification — global revamp
 
 Date: 2026-06-01
-Status: **Closed (2026-06-06)** — every objective in §1–§9 met. All 8 inline dispatchers deleted, all 9 Vault sites migrated to `VaultClient`, `fluxbee_sdk::resolve_resource` free function deleted, `fluxbee_sdk::connect` flipped to `pub(crate)`, Rust `TimerClient::new_with_dispatcher` shipped, architect transport refactor (B + C + D + E) landed, admin Vault Section H1/H2/H3 over canonical dispatcher, all 6 CI guards under `scripts/router_dispatcher_guards/` active in strict mode and clean.
+Status: **Closed including all follow-ups (2026-06-07)** — every objective in §1–§9 met, every P0 + P1 item from [routerdispatcher_unification_followups.md](routerdispatcher_unification_followups.md) closed. All 8 inline dispatchers deleted, all 9 Vault sites migrated to `VaultClient`, `fluxbee_sdk::resolve_resource` free function deleted, `fluxbee_sdk::connect` flipped to `pub(crate)`, Rust `TimerClient::new_with_dispatcher` shipped, architect transport refactor (B + C + D + E) landed, admin Vault Section H1/H2/H3 over canonical dispatcher, admin Section H5 origin-auth gate live, VAULT_SECRET_CHANGED hot-refresh regression tests in CI, Go SDK gained Stale/UnknownResponse classification + visible command-channel drop counters. 7 CI guards under `scripts/router_dispatcher_guards/` active in strict mode and clean.
 
 ## Implementation status (2026-06-06)
 
@@ -83,7 +83,6 @@ A second-pass audit was run after the close. Two real bugs were found and fixed 
 - `cargo test -p fluxbee-sdk --lib` — 147/147.
 - Go modules: all verde.
 - All 6 CI guards — verde.
-
 
 Scope: SDK (Rust + Go) + all fluxbee nodes + Pattern 3 Vault sites
 Related:

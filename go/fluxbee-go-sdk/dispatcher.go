@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -350,6 +351,22 @@ type pendingResult struct {
 	err *RpcError
 }
 
+// GO-1 constants. RECENT_STALE_TTL matches the Rust SDK so late
+// responses are classified the same way across languages. The bound on
+// the table avoids unbounded memory under churn.
+const (
+	recentStaleTTL = 30 * time.Second
+	recentStaleMax = 1024
+)
+
+// staleEntry records the matcher that closed out a trace_id so a late
+// reply on the same trace can be classified the same way the original
+// completion would have.
+type staleEntry struct {
+	matcher   PendingMatcher
+	expiresAt time.Time
+}
+
 // RouterDispatcher is the canonical Go router transport.
 type RouterDispatcher struct {
 	sender   *NodeSender
@@ -365,6 +382,27 @@ type RouterDispatcher struct {
 
 	broadcastsMu sync.Mutex
 	broadcasts   map[string][]chan Message
+
+	// GO-2: per-channel drop counters and a one-shot warn flag so command
+	// channels that fall behind a slow consumer report drops instead of
+	// silently discarding messages. Rust uses unbounded mpsc; here we keep
+	// the channel bounded at construction (default 64) and surface drops
+	// as visible signals.
+	dropMu        sync.Mutex
+	commandDrops  map[string]uint64
+	commandWarned map[string]bool
+
+	// GO-1: recent-stale registry and response-only matcher set. Together
+	// they let `deliver` classify late replies (Stale) and orphaned
+	// responses (Unknown) instead of routing them through
+	// postPendingRules where they would look like legitimate operational
+	// traffic. Mirror of Rust `RecentStaleTable` + `response_only`.
+	staleMu          sync.Mutex
+	staleEntries     map[string]staleEntry
+	staleOrder       []string
+	staleDrops       uint64
+	responseOnly     map[RouteMatch]struct{}
+	unknownRespDrops uint64
 
 	closeOnce sync.Once
 	done      chan struct{}
@@ -388,14 +426,18 @@ func ConnectWithRetry(cfg NodeConfig, delay time.Duration, profile OperationalRo
 		}
 	}
 	d := &RouterDispatcher{
-		sender:     sender,
-		receiver:   receiver,
-		profile:    profile,
-		pending:    make(map[string]*pendingEntry),
-		commands:   make(map[string]chan Message),
-		taken:      make(map[string]bool),
-		broadcasts: make(map[string][]chan Message),
-		done:       make(chan struct{}),
+		sender:        sender,
+		receiver:      receiver,
+		profile:       profile,
+		pending:       make(map[string]*pendingEntry),
+		commands:      make(map[string]chan Message),
+		taken:         make(map[string]bool),
+		broadcasts:    make(map[string][]chan Message),
+		commandDrops:  make(map[string]uint64),
+		commandWarned: make(map[string]bool),
+		staleEntries:  make(map[string]staleEntry),
+		responseOnly:  make(map[RouteMatch]struct{}),
+		done:          make(chan struct{}),
 	}
 	for _, name := range profile.commandChannels {
 		d.commands[name] = make(chan Message, 64)
@@ -598,6 +640,7 @@ func (d *RouterDispatcher) SendWithMatcher(
 		d.removePending(traceID)
 		return Message{}, &RpcError{Kind: RpcErrDisconnected, Cause: err}
 	}
+	d.registerResponseOnly(matcher)
 
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
@@ -609,6 +652,10 @@ func (d *RouterDispatcher) SendWithMatcher(
 		return res.msg, nil
 	case <-deadline.C:
 		d.removePending(traceID)
+		// GO-1: remember the matcher so a late reply on this trace_id is
+		// classified as Stale instead of misrouted through
+		// post_pending_rules.
+		d.noteStale(traceID, matcher)
 		return Message{}, &RpcError{
 			Kind:    RpcErrTimeout,
 			TraceID: traceID,
@@ -618,9 +665,12 @@ func (d *RouterDispatcher) SendWithMatcher(
 		}
 	case <-ctx.Done():
 		d.removePending(traceID)
+		d.noteStale(traceID, matcher)
 		return Message{}, ctx.Err()
 	case <-d.done:
 		d.removePending(traceID)
+		// Dispatcher shutting down — no point noting stale; nothing will
+		// consume the registry.
 		return Message{}, &RpcError{Kind: RpcErrDisconnected, Message: "dispatcher closed"}
 	}
 }
@@ -679,10 +729,12 @@ func (d *RouterDispatcher) deliver(msg Message) {
 			switch outcome {
 			case outcomeSuccess:
 				d.removePending(traceID)
+				d.noteStale(traceID, entry.matcher)
 				entry.deliver <- pendingResult{msg: msg}
 				return
 			case outcomeTerminalError:
 				d.removePending(traceID)
+				d.noteStale(traceID, entry.matcher)
 				entry.deliver <- pendingResult{
 					err: &RpcError{
 						Kind:    RpcErrTerminalTransport,
@@ -695,6 +747,7 @@ func (d *RouterDispatcher) deliver(msg Message) {
 				return
 			case outcomeInvalidResponse:
 				d.removePending(traceID)
+				d.noteStale(traceID, entry.matcher)
 				entry.deliver <- pendingResult{
 					err: &RpcError{
 						Kind:    RpcErrInvalidResponse,
@@ -706,11 +759,197 @@ func (d *RouterDispatcher) deliver(msg Message) {
 				}
 				return
 			case outcomeUnrelated:
-				// fall through to post_pending_rules
+				// fall through to stale / response-only / post_pending_rules
 			}
 		}
 	}
+	// GO-1 step 3: late response on a recently-completed trace_id. Drop with
+	// a metric — never route to post_pending_rules where it would look like
+	// fresh operational traffic.
+	if d.classifyStale(msg, msgName) {
+		return
+	}
+	// GO-1 step 4: orphaned response-only shape. The msg matches a
+	// response-shape we have seen from a SendWithMatcher but there is no
+	// pending matcher waiting (already timed out, never registered, etc.).
+	if d.classifyUnknownResponse(msg, msgName) {
+		return
+	}
 	_ = d.routeByRules(d.profile.postPendingRules, msg, msgName)
+}
+
+// noteStale records the matcher that closed out a trace_id so a late
+// reply on the same trace can be classified the same way the original
+// completion would have. Garbage-collects entries past `recentStaleTTL`.
+func (d *RouterDispatcher) noteStale(traceID string, matcher PendingMatcher) {
+	if traceID == "" {
+		return
+	}
+	d.staleMu.Lock()
+	defer d.staleMu.Unlock()
+	d.gcStaleLocked(time.Now())
+	if len(d.staleEntries) >= recentStaleMax {
+		// Evict the oldest entry to bound memory.
+		if len(d.staleOrder) > 0 {
+			oldest := d.staleOrder[0]
+			d.staleOrder = d.staleOrder[1:]
+			delete(d.staleEntries, oldest)
+		}
+	}
+	if _, exists := d.staleEntries[traceID]; !exists {
+		d.staleOrder = append(d.staleOrder, traceID)
+	}
+	d.staleEntries[traceID] = staleEntry{
+		matcher:   matcher,
+		expiresAt: time.Now().Add(recentStaleTTL),
+	}
+}
+
+// classifyStale checks whether `msg.Routing.TraceID` matches a
+// recently-completed trace AND `msg` matches that entry's success /
+// terminal-error / invalid-response shape. If yes, bump the stale-drop
+// counter and return true (caller stops dispatching).
+func (d *RouterDispatcher) classifyStale(msg Message, msgName string) bool {
+	traceID := msg.Routing.TraceID
+	if traceID == "" {
+		return false
+	}
+	d.staleMu.Lock()
+	defer d.staleMu.Unlock()
+	d.gcStaleLocked(time.Now())
+	entry, ok := d.staleEntries[traceID]
+	if !ok {
+		return false
+	}
+	outcome := entry.matcher.classify(msg.Meta.MsgType, msgName)
+	switch outcome {
+	case outcomeSuccess, outcomeTerminalError, outcomeInvalidResponse:
+		d.staleDrops++
+		return true
+	default:
+		return false
+	}
+}
+
+// gcStaleLocked walks the FIFO order from oldest and removes expired
+// entries. Caller must hold staleMu.
+func (d *RouterDispatcher) gcStaleLocked(now time.Time) {
+	for len(d.staleOrder) > 0 {
+		front := d.staleOrder[0]
+		entry, ok := d.staleEntries[front]
+		if !ok {
+			d.staleOrder = d.staleOrder[1:]
+			continue
+		}
+		if entry.expiresAt.After(now) {
+			return
+		}
+		d.staleOrder = d.staleOrder[1:]
+		delete(d.staleEntries, front)
+	}
+}
+
+// registerResponseOnly remembers the response shapes a SendWithMatcher
+// is expecting so the dispatcher can flag orphaned arrivals (responses
+// that match a registered shape but have no pending matcher and are not
+// stale). Unrolls `RouteOneOf` into `RouteExact` because Go slices are
+// not comparable and would otherwise be unusable as map keys.
+func (d *RouterDispatcher) registerResponseOnly(matcher PendingMatcher) {
+	d.staleMu.Lock()
+	defer d.staleMu.Unlock()
+	for _, rule := range matcher.Success {
+		switch r := rule.(type) {
+		case RouteExact:
+			if !d.postPendingDeclaresObservationalExact(r.MsgType, r.Msg) {
+				d.responseOnly[r] = struct{}{}
+			}
+		case RouteOneOf:
+			for _, m := range r.Msgs {
+				if !d.postPendingDeclaresObservationalExact(r.MsgType, m) {
+					d.responseOnly[RouteExact{MsgType: r.MsgType, Msg: m}] = struct{}{}
+				}
+			}
+		case RouteAnyMsgOfType:
+			if !d.postPendingDeclaresObservationalFamily(r.MsgType) {
+				d.responseOnly[r] = struct{}{}
+			}
+		case RouteAny:
+			// Skip — registering RouteAny would drop everything as
+			// orphaned. Mirror of Rust behavior.
+		}
+	}
+}
+
+// classifyUnknownResponse returns true if the msg matches any registered
+// response-only shape but had no pending matcher and is not stale.
+func (d *RouterDispatcher) classifyUnknownResponse(msg Message, msgName string) bool {
+	d.staleMu.Lock()
+	defer d.staleMu.Unlock()
+	for rule := range d.responseOnly {
+		if rule.matches(msg.Meta.MsgType, msgName) {
+			d.unknownRespDrops++
+			return true
+		}
+	}
+	return false
+}
+
+// postPendingDeclaresObservationalExact returns true if the profile has a
+// post_pending rule that matches (msgType, msg) AND routes to a
+// Broadcast target. Such a rule means the response shape is intentionally
+// observational (broadcast fan-out) and should NOT be registered as
+// response-only.
+func (d *RouterDispatcher) postPendingDeclaresObservationalExact(msgType, msg string) bool {
+	for _, rule := range d.profile.postPendingRules {
+		if !rule.match.matches(msgType, msg) {
+			continue
+		}
+		if _, ok := rule.target.(RouteBroadcast); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// postPendingDeclaresObservationalFamily returns true if any post_pending
+// rule for the same msgType routes to a Broadcast target.
+func (d *RouterDispatcher) postPendingDeclaresObservationalFamily(msgType string) bool {
+	for _, rule := range d.profile.postPendingRules {
+		switch r := rule.match.(type) {
+		case RouteAnyMsgOfType:
+			if r.MsgType == msgType {
+				if _, ok := rule.target.(RouteBroadcast); ok {
+					return true
+				}
+			}
+		case RouteExact:
+			if r.MsgType == msgType {
+				if _, ok := rule.target.(RouteBroadcast); ok {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// StaleResponseDrops returns the number of late responses (matching a
+// recently-completed trace_id within the TTL window) the dispatcher has
+// dropped instead of misrouting through post_pending_rules.
+func (d *RouterDispatcher) StaleResponseDrops() uint64 {
+	d.staleMu.Lock()
+	defer d.staleMu.Unlock()
+	return d.staleDrops
+}
+
+// UnknownResponseDrops returns the number of orphaned response-shape
+// messages the dispatcher has dropped (arrivals matching a registered
+// response shape but with no pending matcher and not classified as
+// stale).
+func (d *RouterDispatcher) UnknownResponseDrops() uint64 {
+	d.staleMu.Lock()
+	defer d.staleMu.Unlock()
+	return d.unknownRespDrops
 }
 
 func (d *RouterDispatcher) routeByRules(rules []routeRule, msg Message, msgName string) bool {
@@ -735,6 +974,12 @@ func (d *RouterDispatcher) routeToTarget(target RouteTarget, msg Message) bool {
 		select {
 		case ch <- msg:
 		default:
+			// GO-2: the command channel is full. Bump the per-channel
+			// drop counter and log a single warning per channel so the
+			// signal is visible without flooding logs under sustained
+			// backpressure. Operators can inspect counts via
+			// CommandChannelDrops.
+			d.noteCommandDrop(t.Channel, msg)
 		}
 		return true
 	case RouteBroadcast:
@@ -745,6 +990,10 @@ func (d *RouterDispatcher) routeToTarget(target RouteTarget, msg Message) bool {
 			select {
 			case ch <- msg:
 			default:
+				// Broadcast subscribers are independent; a slow one does
+				// not block the others. Each drop is still counted so a
+				// consumer can be identified as falling behind.
+				d.noteBroadcastDrop(t.Channel)
 			}
 		}
 		return true
@@ -753,6 +1002,46 @@ func (d *RouterDispatcher) routeToTarget(target RouteTarget, msg Message) bool {
 	default:
 		return false
 	}
+}
+
+// noteCommandDrop bumps the drop counter for the named command channel and
+// emits a one-shot warning the first time a drop happens on that channel.
+func (d *RouterDispatcher) noteCommandDrop(channel string, msg Message) {
+	d.dropMu.Lock()
+	d.commandDrops[channel]++
+	firstTime := !d.commandWarned[channel]
+	if firstTime {
+		d.commandWarned[channel] = true
+	}
+	d.dropMu.Unlock()
+	if firstTime {
+		log.Printf(
+			"fluxbee-go-sdk: command channel %q is FULL — dropped message msg_type=%q msg=%q. "+
+				"This is the only warning for this channel; total drops are available via CommandChannelDrops().",
+			channel, msg.Meta.MsgType, stringValue(msg.Meta.Msg),
+		)
+	}
+}
+
+// noteBroadcastDrop bumps the drop counter for a broadcast channel slot.
+func (d *RouterDispatcher) noteBroadcastDrop(channel string) {
+	d.dropMu.Lock()
+	d.commandDrops["broadcast:"+channel]++
+	d.dropMu.Unlock()
+}
+
+// CommandChannelDrops returns a snapshot of how many messages have been
+// dropped per command channel due to a full buffer. Counters are
+// monotonic. Broadcast-channel drops are reported with a `broadcast:`
+// prefix on the channel name.
+func (d *RouterDispatcher) CommandChannelDrops() map[string]uint64 {
+	d.dropMu.Lock()
+	defer d.dropMu.Unlock()
+	out := make(map[string]uint64, len(d.commandDrops))
+	for name, count := range d.commandDrops {
+		out[name] = count
+	}
+	return out
 }
 
 func (d *RouterDispatcher) failAllPending(err *RpcError) {

@@ -1033,14 +1033,18 @@ func newTestTimerClientWithChannels(sender *NodeSender, receiver *NodeReceiver, 
 func newRouterDispatcherTestHarness(sender *NodeSender, receiver *NodeReceiver) *RouterDispatcher {
 	profile, _ := NewOperationalRouteProfile().Build()
 	dispatcher := &RouterDispatcher{
-		sender:     sender,
-		receiver:   receiver,
-		profile:    profile,
-		pending:    make(map[string]*pendingEntry),
-		commands:   make(map[string]chan Message),
-		taken:      make(map[string]bool),
-		broadcasts: make(map[string][]chan Message),
-		done:       make(chan struct{}),
+		sender:        sender,
+		receiver:      receiver,
+		profile:       profile,
+		pending:       make(map[string]*pendingEntry),
+		commands:      make(map[string]chan Message),
+		taken:         make(map[string]bool),
+		broadcasts:    make(map[string][]chan Message),
+		commandDrops:  make(map[string]uint64),
+		commandWarned: make(map[string]bool),
+		staleEntries:  make(map[string]staleEntry),
+		responseOnly:  make(map[RouteMatch]struct{}),
+		done:          make(chan struct{}),
 	}
 	go dispatcher.dispatchLoop()
 	return dispatcher
