@@ -1,13 +1,22 @@
 # SY.architect canonicalization — architect-specific scope
 
 Date: 2026-06-01
-Updated: 2026-06-06 (Sections A + B + C + D + E + G + H1/H2/H3 all closed in the same PR as the global revamp; H4 + H5 remain as optional follow-ups)
+Updated: 2026-06-07 (audit confirmed Archi + 4 specialist helpers + admin executor operate correctly post-RPC)
 Status: **Closed (2026-06-06)** — see "Implementation status (2026-06-06)" below
 Supersedes strategy in: `docs/onworking COA/sy_architect_rpc_multiplexing_tasks.md`
 Related:
 
 - `docs/onworking COA/orchestrator_internal_rpc_multiplexing_tasks.md` (ORPC — orchestrator and admin already migrated)
 - `docs/onworking COA/routerdispatcher_unification_plan.md` (global revamp this work is part of)
+
+## Quick read for anyone arriving here later
+
+The doc is long because it captures both the migration and a back-and-forth design discussion. The bottom line is short:
+
+- **Archi (chat) + 4 specialist agents (`plan_compiler`, `designer`, `design_auditor`, `real_programmer`) + the residual AI path of `failure_classifier` live in-process inside `SY.architect@<hive>`.** The admin executor lives in-process inside `SY.admin@<hive>`. None of them becomes a separate fluxbee node.
+- This is **deliberate**. The v3 resolution (2026-06-01) cancelled the earlier "stable nodes" extraction direction once `RouterDispatcher` removed the root cause that had motivated extraction (per-call ephemeral connections + N Vault lookups). Confirmed again 2026-06-07 with the user: "si puedo dejar todo dentro de archi revisemoslo, no me importa que use la misma key de openai".
+- **There is no half-finished extraction work.** `ai.generic` + cognitive assets (role/skill/handbook/personality) are infrastructure for **end-user-spawned** AI nodes (the `AI.sales@hive`, `AI.support@hive` your customers want), not for Archi's internal helpers. These two systems are unrelated.
+- Post-RPC-migration runtime audit (2026-06-07): single canonical `Arc<RouterDispatcher>`, single shared `OpenAiResponsesClient` resolved once from Vault, hot-refresh via `VAULT_SECRET_CHANGED` works, all 5 agents reach SY.admin through the canonical dispatcher, 154 sy_architect tests verde. Nothing to do here.
 
 ## Implementation status (2026-06-06)
 
@@ -27,8 +36,16 @@ Architect transport refactor landed alongside the global revamp.
 
 **Optional follow-ups (out of scope for this PR — both currently green on the live path):**
 
-- **Section H4** — `VAULT_SECRET_CHANGED` hot-refresh exercises the canonical dispatcher via `refresh_admin_executor_ai_runtime` and `handle_vault_secret_changed_architect`. Missing piece: end-to-end regression test asserting the refreshed runtime is observable from a follow-up RPC. Live path works; only test coverage is gap.
-- **Section H5** — Admin inbound origin-authorization audit, parity with the new architect Section E gate. Architect now rejects unauthorized callers; admin's protected actions have not been audited under the same lens. Separate scoped review.
+- **Section H4** — `VAULT_SECRET_CHANGED` hot-refresh exercises the canonical dispatcher via `refresh_admin_executor_ai_runtime` and `handle_vault_secret_changed_architect`. Missing piece: end-to-end regression test asserting the refreshed runtime is observable from a follow-up RPC. Live path works; only test coverage is gap. **Tracked in [routerdispatcher_unification_followups.md](routerdispatcher_unification_followups.md) under P0 / H4.1–H4.4.**
+- **Section H5** — Admin inbound origin-authorization audit, parity with the new architect Section E gate. Architect now rejects unauthorized callers; admin's protected actions have not been audited under the same lens. Separate scoped review. **Tracked in [routerdispatcher_unification_followups.md](routerdispatcher_unification_followups.md) under P0 / H5.1–H5.5.**
+
+## Post-close audit (2026-06-06)
+
+A second-pass audit was run after the close. The Section E gate as originally landed had a critical bug:
+
+- **Bug:** `VAULT_SECRET_CHANGED` was in `protected_architect_system_action_response`. SY.vault emits the broadcast with `src_l2_name: None`, which `architect_origin_authorized` treats as missing-src → `FORBIDDEN`. Net effect: every hive-wide Vault key rotation event reaching the architect was being shorted to a forbidden response and the architect's `handle_vault_secret_changed_architect` was never running. The architect's cached `ArchitectAiRuntime` and messages-db URL would have stayed stale until the process restarted.
+- **Fix:** removed `VAULT_SECRET_CHANGED` from the protected list. It is a hive-wide event, not a request/response RPC. The actual refresh path (re-resolving the secret via `VaultClient.resolve_resource`) remains end-to-end authenticated by SY.vault on the re-resolve call, so a forged event cannot leak the underlying secret — at worst it triggers a re-resolve the architect would have done eventually anyway.
+- **Side note:** while reviewing the gate, `architect_origin_authorized` was rewritten from `format!("SY.admin@{hive}")`-against-each-allowed-name to `split_once('@') + matches!(node, …)` so it no longer allocates per inbound message (the gate runs once per SYSTEM_KIND message on the system worker).
 
 ## CI gate at end of PR
 

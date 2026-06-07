@@ -77,19 +77,39 @@ Before implementation, the following constraints from the current core must be t
 
 ### 2.2 AI Integration
 
-SY.architect connects directly to AI providers (OpenAI initially) via HTTP. It does NOT use internal AI nodes for its own reasoning. It manages up to 3 concurrent AI agent connections with different system prompts. If more than 3 are needed, they should be spawned as separate AI nodes.
+SY.architect connects directly to AI providers (OpenAI initially) via HTTP. It does NOT use internal AI nodes for its own reasoning. Inside the `SY.architect@<hive>` process, several specialist agents run as in-process async tasks driven by the same `OpenAiResponsesClient` and the same OpenAI API key resolved once from Vault at startup. They never become separate fluxbee nodes.
+
+### Specialist agent inventory (resolved 2026-06-01 v3, confirmed 2026-06-07)
+
+| In-process agent | System prompt source | Invocation site | Role |
+| --- | --- | --- | --- |
+| `archi` | `build_archi_prompt` | [src/bin/sy_architect.rs:10197](src/bin/sy_architect.rs#L10197) | Main chat brain — the single user-facing AI |
+| `plan_compiler` | `PLAN_COMPILER_SYSTEM_PROMPT_BASE` | [src/bin/sy_architect.rs:5346](src/bin/sy_architect.rs#L5346) | Translates a clear mutation request into an executor plan |
+| `designer` | `DESIGNER_SYSTEM_PROMPT_BASE` | [src/bin/sy_architect.rs:3577](src/bin/sy_architect.rs#L3577) | Produces a layered `solution_manifest` for complex topology work |
+| `design_auditor` | `DESIGN_AUDITOR_SYSTEM_PROMPT_BASE` | [src/bin/sy_architect.rs:3799](src/bin/sy_architect.rs#L3799) | Verifies the designer's manifest and emits revise/accept verdicts |
+| `real_programmer` | `REAL_PROGRAMMER_SYSTEM_PROMPT_BASE` | [src/bin/sy_architect.rs:3934](src/bin/sy_architect.rs#L3934) | Compiles the manifest into deployable steps |
+| `failure_classifier` (residual AI fallback) | inline | [src/bin/sy_architect.rs:2044](src/bin/sy_architect.rs#L2044) | Classifies pipeline failures; deterministic matcher runs first |
+
+There is also exactly **one** equivalent agent inside SY.admin: the admin **executor** (`AdminExecutorAiRuntime`, built in [src/bin/sy_admin.rs](src/bin/sy_admin.rs)). It is the AI that understands fluxbee's admin commands and runs them on behalf of operator requests. It follows the same pattern: in-process, resolves its own OpenAI key from Vault via the canonical admin dispatcher, never becomes a separate node.
+
+### Why they stay in-process
+
+All seven agents (6 in architect + 1 in admin) share their parent process's canonical `Arc<RouterDispatcher>` for any outbound RPC and share their parent's `OpenAiResponsesClient` for OpenAI calls. They have no L2 name, no UUID, no separate router connection, no entry in inventory. This is the result of the 2026-06-01 v3 decision recorded in [sy_architect_rpc_multiplexing_tasks_v2_stable_agents.md](sy_architect_rpc_multiplexing_tasks_v2_stable_agents.md) §"Locked-in decisions" #1 and §"v3 resolution".
+
+The earlier draft of that plan proposed extracting them as stable `SY.architect.<role>@<hive>` and `SY.admin.executor@<hive>` nodes. That direction was **explicitly cancelled** once the `RouterDispatcher` unification removed the original motivation (per-call ephemeral connections leaking identity into inventory and forcing N Vault lookups). The consistency win is delivered by the unified dispatcher, not by splitting processes.
 
 Current state in repo:
-- `SY.architect` already has a first direct OpenAI path through `fluxbee_ai_sdk`.
-- normal chat messages can go through a local `archi` agent when an OpenAI key is configured.
+
+- `SY.architect` has a direct OpenAI path through `fluxbee_ai_sdk` with key resolved once via the canonical `VaultClient` over the architect's `Arc<RouterDispatcher>`.
+- All 5 in-process AI agents above are operational and reach SY.admin (for `query_hive` and admin-action lookups) through the same dispatcher via `execute_admin_action_with_context`.
 - `SCMD:` remains a separate local/system path and does not invoke the AI provider.
-- the local agent can already use read-only socket-backed tools against `SY.admin` for live system state.
-- immediate short-horizon memory is now rehydrated through `fluxbee_ai_sdk` using recent interactions, active operations, and conversation summary; see `docs/immediate-conversation-memory-spec.md`.
-- chat creation already supports both `operator` and `impersonation` modes.
-- impersonation chat launch is now backed by identity SHM options:
+- Immediate short-horizon memory is rehydrated through `fluxbee_ai_sdk` (recent interactions, active operations, conversation summary); see `docs/immediate-conversation-memory-spec.md`.
+- Chat creation supports both `operator` and `impersonation` modes.
+- Impersonation chat launch is backed by identity SHM options:
   - the user selects an existing `ICH`
   - architect then narrows to the candidate `ILK` list bound to that channel context
-- streaming, multi-agent routing, and prompt assets by role are still pending.
+- `VAULT_SECRET_CHANGED` hot-refresh updates the shared `ArchitectAiRuntime` (and the admin equivalent updates `AdminExecutorAiRuntime`); next call from any agent picks up the rotated key without restart.
+- Streaming and prompt assets by role for the architect helpers remain genuinely pending. **Multi-agent routing is NOT pending — it was decided not to do it. The architect helpers stay in-process by design.**
 
 ---
 

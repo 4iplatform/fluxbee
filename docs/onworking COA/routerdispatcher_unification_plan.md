@@ -62,6 +62,28 @@ Optional follow-ups that are explicitly **out of scope** of this plan but worth 
 - Section H4 (regression test for `VAULT_SECRET_CHANGED` hot-refresh through the new canonical dispatcher path). The path exists and is exercised by the existing handlers; what's missing is an end-to-end assertion test.
 - Section H5 (admin inbound origin-authorization audit, parity with the new architect Section E gate). Architect now rejects unauthorized callers on protected system actions; admin's parity audit is a separate scoped review.
 
+## Post-close audit (2026-06-06)
+
+A second-pass audit was run after the close. Two real bugs were found and fixed in the same window, plus dead-code cleanup. Anything beyond that is captured in `routerdispatcher_unification_followups.md` (the next-steps tracker).
+
+### Bugs found and fixed in this audit
+
+1. **Origin auth gate was rejecting `VAULT_SECRET_CHANGED` broadcasts.** [src/bin/sy_architect.rs:6664-6678](src/bin/sy_architect.rs#L6664-L6678). SY.vault emits the broadcast with `src_l2_name: None` ([src/bin/sy_vault.rs:470](src/bin/sy_vault.rs#L470)), which my Section E gate treated as "missing src" → `FORBIDDEN` response. Net effect: every Vault hot-refresh on `SY.architect` was silently being shorted to a forbidden response, exactly the opposite of what the section was supposed to enable. Fix: removed `VAULT_SECRET_CHANGED` from `protected_architect_system_action_response` (it is a hive-wide event, not a protected RPC) and documented that the refresh path itself remains end-to-end auth-gated by SY.vault when it re-resolves the secret. Forging the event only triggers a re-resolve the architect would have done anyway.
+2. **Dead error path in `VaultClient::send_vault_action`.** [crates/fluxbee_sdk/src/vault.rs:678-701](crates/fluxbee_sdk/src/vault.rs#L678-L701). The post-await `match response.meta.msg { MSG_UNREACHABLE | MSG_TTL_EXCEEDED => err }` was unreachable: the pending matcher classifies those as `terminal_error`, so `send_with_matcher` returns `RpcError::Unreachable`/`TtlExceeded` directly and `map_rpc_error` converts to `VaultError::Service` before this match is ever evaluated. Removed.
+
+### Cleanups completed in this audit
+
+- Deleted ~387 lines of `#[cfg(any())]` zombie blocks left over from the `SharedRouterConnection` migration in [nodes/ai/ai-generic/src/bin/ai_node_runner.rs](nodes/ai/ai-generic/src/bin/ai_node_runner.rs) and [nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs](nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs). These were silently kept-out-of-build but violated `feedback_no_legacy_in_dev` — they referenced the deleted `SharedRouterConnection` API and would have rotted further.
+- Removed 14 unused imports/variables across 6 files (`sy_architect.rs`, `sy_vault.rs`, both `ai_node_runner.rs`, `io-test-cognition/src/main.rs`, `examples/timer_recurring.rs`, `examples/wf_client.rs`, `examples/node_test.rs`).
+- `architect_origin_authorized` rewritten to `split_once('@') + matches!(...)` so it no longer allocates 3 `String`s per inbound SYSTEM message (was a hot path).
+
+### Audit-final verification (2026-06-06 post-fix)
+
+- `cargo check --workspace --all-targets` — verde. Only 3 unused-import warnings remain, all in `src/bin/fluxbee-publish.rs`, all pre-dating this plan.
+- `cargo test -p fluxbee-sdk --lib` — 147/147.
+- Go modules: all verde.
+- All 6 CI guards — verde.
+
 
 Scope: SDK (Rust + Go) + all fluxbee nodes + Pattern 3 Vault sites
 Related:
