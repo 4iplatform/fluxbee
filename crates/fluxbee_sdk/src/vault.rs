@@ -2,13 +2,14 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::time::{self, Instant};
-use uuid::Uuid;
+
+use std::sync::Arc;
 
 use crate::protocol::{
     Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
-use crate::{NodeError, NodeReceiver, NodeSender};
+use crate::rpc::{PendingMatcher, RouteMatch, RouterDispatcher, RpcError, RpcRequestLabels};
+use crate::NodeError;
 
 pub const VAULT_REF_PREFIX: &str = "vault://";
 
@@ -534,368 +535,6 @@ impl<'a> VaultCaller<'a> {
     }
 }
 
-pub async fn vault_get(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
-    caller: VaultCaller<'_>,
-    target: &str,
-    key: &str,
-    timeout: Duration,
-) -> Result<VaultGetResponse, VaultError> {
-    let payload = json!(VaultGetRequest {
-        key: key.to_string()
-    });
-    let response = send_action_once(
-        sender,
-        receiver,
-        caller,
-        target,
-        MSG_VAULT_GET,
-        payload,
-        timeout,
-    )
-    .await?;
-    let parsed: VaultGetResponse = serde_json::from_value(response)?;
-    ensure_ok(
-        &parsed.status,
-        parsed.error_code.as_deref(),
-        parsed.message.as_deref(),
-    )?;
-    Ok(parsed)
-}
-
-pub async fn vault_get_metadata(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
-    caller: VaultCaller<'_>,
-    target: &str,
-    key: &str,
-    timeout: Duration,
-) -> Result<VaultGetMetadataResponse, VaultError> {
-    let payload = json!(VaultGetMetadataRequest {
-        key: key.to_string()
-    });
-    let response = send_action_once(
-        sender,
-        receiver,
-        caller,
-        target,
-        MSG_VAULT_GET_METADATA,
-        payload,
-        timeout,
-    )
-    .await?;
-    let parsed: VaultGetMetadataResponse = serde_json::from_value(response)?;
-    ensure_ok(
-        &parsed.status,
-        parsed.error_code.as_deref(),
-        parsed.message.as_deref(),
-    )?;
-    Ok(parsed)
-}
-
-pub async fn vault_put(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
-    caller: VaultCaller<'_>,
-    target: &str,
-    request: VaultPutRequest,
-    timeout: Duration,
-) -> Result<VaultPutResponse, VaultError> {
-    let response = send_action_once(
-        sender,
-        receiver,
-        caller,
-        target,
-        MSG_VAULT_PUT,
-        json!(request),
-        timeout,
-    )
-    .await?;
-    let parsed: VaultPutResponse = serde_json::from_value(response)?;
-    ensure_ok(
-        &parsed.status,
-        parsed.error_code.as_deref(),
-        parsed.message.as_deref(),
-    )?;
-    Ok(parsed)
-}
-
-pub async fn vault_list(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
-    caller: VaultCaller<'_>,
-    target: &str,
-    filter: Option<VaultFilter>,
-    timeout: Duration,
-) -> Result<VaultListResponse, VaultError> {
-    let payload = json!(VaultListRequest { filter });
-    let response = send_action_once(
-        sender,
-        receiver,
-        caller,
-        target,
-        MSG_VAULT_LIST,
-        payload,
-        timeout,
-    )
-    .await?;
-    let parsed: VaultListResponse = serde_json::from_value(response)?;
-    ensure_ok(
-        &parsed.status,
-        parsed.error_code.as_deref(),
-        parsed.message.as_deref(),
-    )?;
-    Ok(parsed)
-}
-
-pub async fn vault_delete(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
-    caller: VaultCaller<'_>,
-    target: &str,
-    key: &str,
-    timeout: Duration,
-) -> Result<VaultDeleteResponse, VaultError> {
-    let payload = json!(VaultKeyRequest {
-        key: key.to_string()
-    });
-    let response = send_action_once(
-        sender,
-        receiver,
-        caller,
-        target,
-        MSG_VAULT_DELETE,
-        payload,
-        timeout,
-    )
-    .await?;
-    let parsed: VaultDeleteResponse = serde_json::from_value(response)?;
-    ensure_ok(
-        &parsed.status,
-        parsed.error_code.as_deref(),
-        parsed.message.as_deref(),
-    )?;
-    Ok(parsed)
-}
-
-pub async fn vault_rotate(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
-    caller: VaultCaller<'_>,
-    target: &str,
-    key: &str,
-    value: Value,
-    timeout: Duration,
-) -> Result<VaultRotateResponse, VaultError> {
-    let payload = json!(VaultRotateRequest {
-        key: key.to_string(),
-        value
-    });
-    let response = send_action_once(
-        sender,
-        receiver,
-        caller,
-        target,
-        MSG_VAULT_ROTATE,
-        payload,
-        timeout,
-    )
-    .await?;
-    let parsed: VaultRotateResponse = serde_json::from_value(response)?;
-    ensure_ok(
-        &parsed.status,
-        parsed.error_code.as_deref(),
-        parsed.message.as_deref(),
-    )?;
-    Ok(parsed)
-}
-
-pub async fn vault_rollback(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
-    caller: VaultCaller<'_>,
-    target: &str,
-    key: &str,
-    timeout: Duration,
-) -> Result<VaultRollbackResponse, VaultError> {
-    let payload = json!(VaultKeyRequest {
-        key: key.to_string()
-    });
-    let response = send_action_once(
-        sender,
-        receiver,
-        caller,
-        target,
-        MSG_VAULT_ROLLBACK,
-        payload,
-        timeout,
-    )
-    .await?;
-    let parsed: VaultRollbackResponse = serde_json::from_value(response)?;
-    ensure_ok(
-        &parsed.status,
-        parsed.error_code.as_deref(),
-        parsed.message.as_deref(),
-    )?;
-    Ok(parsed)
-}
-
-pub async fn vault_get_with_retry(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
-    caller: VaultCaller<'_>,
-    target: &str,
-    key_or_ref: &str,
-    policy: VaultRetryPolicy,
-) -> Result<VaultGetResponse, VaultError> {
-    let key = key_or_ref
-        .strip_prefix(VAULT_REF_PREFIX)
-        .map(str::to_string)
-        .unwrap_or_else(|| key_or_ref.to_string());
-    let started = Instant::now();
-    let mut delay = policy.initial_delay;
-    loop {
-        match vault_get(
-            sender,
-            receiver,
-            caller,
-            target,
-            &key,
-            delay.min(Duration::from_secs(5)),
-        )
-        .await
-        {
-            Ok(response) => return Ok(response),
-            Err(err) if should_retry(&err) && started.elapsed() < policy.max_elapsed => {
-                let sleep_for = jittered_delay(delay, policy.jitter_ratio);
-                time::sleep(sleep_for).await;
-                delay = std::cmp::min(delay.saturating_mul(2), policy.max_delay);
-            }
-            Err(err) => return Err(err),
-        }
-    }
-}
-
-/// Resolve a Model D' resource for the calling node.
-///
-/// Tries two queries against vault:
-/// 1. **Dedicated**: secrets with `(resource_type=X, tenant_id=mine, ilk=my_ilk)`.
-/// 2. **Pool**: secrets with `(resource_type=X, tenant_id=mine, ilk=null)`.
-///
-/// Returns the most recently-created matching secret's plaintext `value`,
-/// or `Ok(None)` if nothing was found in either query (degraded boot — the
-/// node should run without that capability and log).
-///
-/// `Err` is returned on transport problems, malformed responses, or
-/// `vault_get` returning a non-pool secret the caller can't decrypt. The
-/// caller decides whether to retry or degrade.
-///
-/// Notes for callers:
-/// - Each node hardcodes its `REQUIRED_RESOURCES` and calls this once per
-///   entry at boot and on each refresh tick (default 60s).
-/// - The two queries are explicit (not a single composite query) so the
-///   reading semantics — "your dedicated key wins over the pool" — is
-///   visible in code.
-/// - `vault_list` returns metadata only; we follow up with a single
-///   `vault_get` on the chosen key to fetch the plaintext, paying for the
-///   secret retrieval only when there is a match.
-pub async fn resolve_resource(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
-    caller: VaultCaller<'_>,
-    hive_id: &str,
-    resource: ResourceType,
-    my_tenant: &str,
-    timeout: Duration,
-) -> Result<Option<Value>, VaultError> {
-    let target = format!("SY.vault@{}", hive_id);
-    let resource_str = resource.as_str().to_string();
-
-    // (1) Dedicated to caller — only attempt if caller has an ILK.
-    if !caller.src_ilk.is_empty() {
-        if let Some(value) = list_then_get_first(
-            sender,
-            receiver,
-            caller,
-            &target,
-            &resource_str,
-            my_tenant,
-            Some(caller.src_ilk.to_string()),
-            timeout,
-        )
-        .await?
-        {
-            return Ok(Some(value));
-        }
-    }
-
-    // (2) Pool del tenant del caller.
-    if let Some(value) = list_then_get_first(
-        sender,
-        receiver,
-        caller,
-        &target,
-        &resource_str,
-        my_tenant,
-        Some(String::new()),
-        timeout,
-    )
-    .await?
-    {
-        return Ok(Some(value));
-    }
-
-    // (3) Pool del tenant raíz (`DEFAULT_ROOT_TENANT_ID`, alias `fluxbee`)
-    // — secrets de infraestructura del hive compartidos por todos los SY
-    // system services. Skip if the caller already lives in the root
-    // tenant (duplicate of step 2).
-    if my_tenant != crate::identity::DEFAULT_ROOT_TENANT_ID {
-        if let Some(value) = list_then_get_first(
-            sender,
-            receiver,
-            caller,
-            &target,
-            &resource_str,
-            crate::identity::DEFAULT_ROOT_TENANT_ID,
-            Some(String::new()),
-            timeout,
-        )
-        .await?
-        {
-            return Ok(Some(value));
-        }
-    }
-
-    Ok(None)
-}
-
-async fn list_then_get_first(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
-    caller: VaultCaller<'_>,
-    target: &str,
-    resource_type: &str,
-    tenant_id: &str,
-    ilk_filter: Option<String>,
-    timeout: Duration,
-) -> Result<Option<Value>, VaultError> {
-    let filter = VaultFilter {
-        prefix: None,
-        tenant_id: Some(tenant_id.to_string()),
-        resource_type: Some(resource_type.to_string()),
-        ilk: ilk_filter,
-        tags: Vec::new(),
-        limit: Some(1),
-    };
-    let list = vault_list(sender, receiver, caller, target, Some(filter), timeout).await?;
-    let Some(summary) = list.secrets.into_iter().next() else {
-        return Ok(None);
-    };
-    let response = vault_get(sender, receiver, caller, target, &summary.key, timeout).await?;
-    Ok(response.value)
-}
-
 fn ensure_ok(
     status: &str,
     error_code: Option<&str>,
@@ -912,101 +551,282 @@ fn ensure_ok(
     })
 }
 
-fn should_retry(err: &VaultError) -> bool {
-    match err {
-        VaultError::Node(NodeError::Timeout) => true,
-        VaultError::Node(NodeError::Disconnected) => true,
-        VaultError::Service { code, .. } => {
-            matches!(code.as_str(), "VAULT_UNAVAILABLE" | "KEY_NOT_FOUND")
+/// Owned variant of [`VaultCaller`]. The dispatcher-backed [`VaultClient`]
+/// stores it so callers don't need to keep the original `&str` slices alive
+/// for the lifetime of the client.
+#[derive(Debug, Clone)]
+pub struct VaultCallerOwned {
+    pub src_ilk: String,
+    pub src_l2_name: String,
+}
+
+impl VaultCallerOwned {
+    pub fn new(src_ilk: impl Into<String>, src_l2_name: impl Into<String>) -> Self {
+        Self {
+            src_ilk: src_ilk.into(),
+            src_l2_name: src_l2_name.into(),
         }
-        _ => false,
+    }
+
+    fn as_borrowed(&self) -> VaultCaller<'_> {
+        VaultCaller {
+            src_ilk: &self.src_ilk,
+            src_l2_name: &self.src_l2_name,
+        }
     }
 }
 
-fn jittered_delay(delay: Duration, ratio: f64) -> Duration {
-    if ratio <= 0.0 {
-        return delay;
+impl<'a> From<VaultCaller<'a>> for VaultCallerOwned {
+    fn from(value: VaultCaller<'a>) -> Self {
+        Self {
+            src_ilk: value.src_ilk.to_string(),
+            src_l2_name: value.src_l2_name.to_string(),
+        }
     }
-    let millis = delay.as_millis() as u64;
-    if millis == 0 {
-        return delay;
-    }
-    let spread = ((millis as f64) * ratio).round() as u64;
-    if spread == 0 {
-        return delay;
-    }
-    let jitter = (Uuid::new_v4().as_u128() as u64) % (spread * 2 + 1);
-    let adjusted = millis.saturating_sub(spread).saturating_add(jitter);
-    Duration::from_millis(adjusted.max(1))
 }
 
-async fn send_action_once(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
-    caller: VaultCaller<'_>,
-    target: &str,
-    action: &str,
-    payload: Value,
-    timeout: Duration,
-) -> Result<Value, VaultError> {
-    let trace_id = Uuid::new_v4().to_string();
-    let msg = Message {
-        routing: Routing {
-            src: sender.uuid().to_string(),
-            src_l2_name: Some(caller.src_l2_name.to_string()),
-            dst: Destination::Unicast(target.to_string()),
-            ttl: 16,
-            trace_id: trace_id.clone(),
-        },
-        meta: Meta {
-            msg_type: SYSTEM_KIND.to_string(),
-            msg: Some(action.to_string()),
-            src_ilk: Some(caller.src_ilk.to_string()),
-            target: Some(target.to_string()),
-            ..Meta::default()
-        },
-        payload,
-    };
-    sender.send(msg).await?;
-    let expected = response_action_for(action);
-    let deadline = Instant::now() + timeout;
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(VaultError::ActionTimeout {
-                action: action.to_string(),
-                trace_id,
-                target: target.to_string(),
-                timeout_ms: timeout.as_millis() as u64,
-            });
+/// Typed Vault client built over the shared [`RouterDispatcher`]. Replaces
+/// the legacy free `resolve_resource(&NodeSender, &mut NodeReceiver, …)` path
+/// — same wire shape (same `meta.src_ilk`, same `routing.src_l2_name`, same
+/// `MSG_VAULT_*` action codes), but the response is awaited through the
+/// dispatcher's `send_with_matcher`, so concurrent vault calls multiplex by
+/// `trace_id` and unrelated SYSTEM traffic doesn't satisfy our waiter.
+///
+/// `SY.vault` sees zero behavior change.
+#[derive(Clone)]
+pub struct VaultClient {
+    dispatcher: Arc<RouterDispatcher>,
+    hive_id: String,
+    caller: VaultCallerOwned,
+}
+
+impl std::fmt::Debug for VaultClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultClient")
+            .field("hive_id", &self.hive_id)
+            .field("caller", &self.caller)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VaultClient {
+    pub fn new(
+        dispatcher: Arc<RouterDispatcher>,
+        hive_id: impl Into<String>,
+        caller: VaultCallerOwned,
+    ) -> Self {
+        Self {
+            dispatcher,
+            hive_id: hive_id.into(),
+            caller,
         }
-        let incoming = receiver.recv_timeout(deadline - now).await?;
-        if incoming.routing.trace_id != trace_id || incoming.meta.msg_type != SYSTEM_KIND {
-            continue;
+    }
+
+    pub fn caller(&self) -> VaultCaller<'_> {
+        self.caller.as_borrowed()
+    }
+
+    pub fn hive_id(&self) -> &str {
+        &self.hive_id
+    }
+
+    /// Vault target node for this client's hive: `SY.vault@<hive>`.
+    fn vault_target(&self) -> String {
+        format!("SY.vault@{}", self.hive_id)
+    }
+
+    /// Build the on-wire message for an individual vault action. Preserves
+    /// the exact shape used by the legacy `send_action_once` so SY.vault
+    /// authorization (`src_ilk`, `src_l2_name`, `target`) is unchanged.
+    fn build_vault_message(&self, target: &str, action: &str, payload: Value) -> Message {
+        Message {
+            routing: Routing {
+                // dispatcher will substitute its own UUID if this is empty;
+                // we leave it blank to let the dispatcher own connection
+                // identity.
+                src: String::new(),
+                src_l2_name: Some(self.caller.src_l2_name.clone()),
+                dst: Destination::Unicast(target.to_string()),
+                ttl: 16,
+                // dispatcher generates the trace_id when empty.
+                trace_id: String::new(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(action.to_string()),
+                src_ilk: Some(self.caller.src_ilk.clone()),
+                target: Some(target.to_string()),
+                ..Meta::default()
+            },
+            payload,
         }
-        match incoming.meta.msg.as_deref() {
-            Some(MSG_UNREACHABLE) | Some(MSG_TTL_EXCEEDED) => {
-                return Err(VaultError::Service {
-                    code: "VAULT_UNAVAILABLE".to_string(),
-                    message: "vault target unavailable".to_string(),
-                });
+    }
+
+    fn vault_matcher(response_msg: &str) -> PendingMatcher {
+        PendingMatcher::new(
+            vec![RouteMatch::exact(SYSTEM_KIND, response_msg)],
+            vec![
+                RouteMatch::exact(SYSTEM_KIND, MSG_UNREACHABLE),
+                RouteMatch::exact(SYSTEM_KIND, MSG_TTL_EXCEEDED),
+            ],
+            // Unrelated SYSTEM messages with a colliding trace are flagged
+            // as malformed responses (same posture as send_system_rpc).
+            vec![RouteMatch::any_msg_type(SYSTEM_KIND)],
+        )
+    }
+
+    async fn send_vault_action(
+        &self,
+        action: &str,
+        response_msg: &str,
+        payload: Value,
+        timeout: Duration,
+    ) -> Result<Value, VaultError> {
+        let target = self.vault_target();
+        let outgoing = self.build_vault_message(&target, action, payload);
+        let matcher = Self::vault_matcher(response_msg);
+        let labels = RpcRequestLabels::new(&target, action, response_msg);
+        let response = self
+            .dispatcher
+            .send_with_matcher(outgoing, matcher, labels, timeout)
+            .await
+            .map_err(map_rpc_error)?;
+        Ok(response.payload)
+    }
+
+    /// Typed `VAULT_GET` over the shared dispatcher.
+    pub async fn get(&self, key: &str, timeout: Duration) -> Result<VaultGetResponse, VaultError> {
+        let payload = json!(VaultGetRequest {
+            key: key.to_string()
+        });
+        let raw = self
+            .send_vault_action(MSG_VAULT_GET, MSG_VAULT_GET_RESPONSE, payload, timeout)
+            .await?;
+        let parsed: VaultGetResponse = serde_json::from_value(raw)?;
+        ensure_ok(
+            &parsed.status,
+            parsed.error_code.as_deref(),
+            parsed.message.as_deref(),
+        )?;
+        Ok(parsed)
+    }
+
+    /// Typed `VAULT_LIST` over the shared dispatcher.
+    pub async fn list(
+        &self,
+        filter: Option<VaultFilter>,
+        timeout: Duration,
+    ) -> Result<VaultListResponse, VaultError> {
+        let payload = json!(VaultListRequest { filter });
+        let raw = self
+            .send_vault_action(MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, payload, timeout)
+            .await?;
+        let parsed: VaultListResponse = serde_json::from_value(raw)?;
+        ensure_ok(
+            &parsed.status,
+            parsed.error_code.as_deref(),
+            parsed.message.as_deref(),
+        )?;
+        Ok(parsed)
+    }
+
+    /// Model D' resource resolution, identical semantics to the legacy free
+    /// `resolve_resource`:
+    /// 1. Dedicated secret for the caller's ILK (skipped when no ILK).
+    /// 2. Pool secret for the caller's tenant.
+    /// 3. Root-tenant pool secret (skipped when caller is already root).
+    pub async fn resolve_resource(
+        &self,
+        resource: ResourceType,
+        my_tenant: &str,
+        timeout: Duration,
+    ) -> Result<Option<Value>, VaultError> {
+        let resource_str = resource.as_str().to_string();
+
+        if !self.caller.src_ilk.is_empty() {
+            if let Some(value) = self
+                .list_then_get_first(
+                    &resource_str,
+                    my_tenant,
+                    Some(self.caller.src_ilk.clone()),
+                    timeout,
+                )
+                .await?
+            {
+                return Ok(Some(value));
             }
-            Some(msg_name) if msg_name == expected => return Ok(incoming.payload),
-            _ => continue,
         }
+
+        if let Some(value) = self
+            .list_then_get_first(&resource_str, my_tenant, Some(String::new()), timeout)
+            .await?
+        {
+            return Ok(Some(value));
+        }
+
+        if my_tenant != crate::identity::DEFAULT_ROOT_TENANT_ID {
+            if let Some(value) = self
+                .list_then_get_first(
+                    &resource_str,
+                    crate::identity::DEFAULT_ROOT_TENANT_ID,
+                    Some(String::new()),
+                    timeout,
+                )
+                .await?
+            {
+                return Ok(Some(value));
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn list_then_get_first(
+        &self,
+        resource_type: &str,
+        tenant_id: &str,
+        ilk_filter: Option<String>,
+        timeout: Duration,
+    ) -> Result<Option<Value>, VaultError> {
+        let filter = VaultFilter {
+            prefix: None,
+            tenant_id: Some(tenant_id.to_string()),
+            resource_type: Some(resource_type.to_string()),
+            ilk: ilk_filter,
+            tags: Vec::new(),
+            limit: Some(1),
+        };
+        let list = self.list(Some(filter), timeout).await?;
+        let Some(summary) = list.secrets.into_iter().next() else {
+            return Ok(None);
+        };
+        let response = self.get(&summary.key, timeout).await?;
+        Ok(response.value)
     }
 }
 
-fn response_action_for(action: &str) -> &'static str {
-    match action {
-        MSG_VAULT_PUT => MSG_VAULT_PUT_RESPONSE,
-        MSG_VAULT_GET => MSG_VAULT_GET_RESPONSE,
-        MSG_VAULT_GET_METADATA => MSG_VAULT_GET_METADATA_RESPONSE,
-        MSG_VAULT_LIST => MSG_VAULT_LIST_RESPONSE,
-        MSG_VAULT_DELETE => MSG_VAULT_DELETE_RESPONSE,
-        MSG_VAULT_ROTATE => MSG_VAULT_ROTATE_RESPONSE,
-        MSG_VAULT_ROLLBACK => MSG_VAULT_ROLLBACK_RESPONSE,
-        _ => MSG_VAULT_GET_RESPONSE,
+/// Bridge `RpcError` → `VaultError`. Vault callers care about three things:
+/// transport disconnect, action timeout, and everything else (`Service`).
+fn map_rpc_error(err: RpcError) -> VaultError {
+    match err {
+        RpcError::Node(node) => VaultError::Node(node),
+        RpcError::Disconnected => VaultError::Node(NodeError::Disconnected),
+        RpcError::Timeout {
+            trace_id,
+            target,
+            request_msg,
+            timeout_ms,
+            ..
+        } => VaultError::ActionTimeout {
+            action: request_msg,
+            trace_id,
+            target,
+            timeout_ms,
+        },
+        other => VaultError::Service {
+            code: "VAULT_RPC_ERROR".to_string(),
+            message: other.to_string(),
+        },
     }
 }
 
@@ -1062,6 +882,177 @@ mod tests {
         ];
         for (raw, expected) in cases {
             assert_eq!(normalize_resource_type(raw).unwrap(), expected);
+        }
+    }
+
+    fn vault_test_profile() -> crate::rpc::OperationalRouteProfile {
+        // Minimal: a single command channel, no pre-pending rules.
+        // Vault responses must flow through the pending-matcher path; any
+        // pre-pending rule covering SYSTEM_KIND would intercept them before
+        // the matcher gets a chance.
+        crate::rpc::OperationalRouteProfile::builder()
+            .command_channel("system")
+            .post_pending_rule(
+                RouteMatch::any_msg_type(SYSTEM_KIND),
+                crate::rpc::RouteTarget::Command("system"),
+            )
+            .build()
+            .expect("profile builds")
+    }
+
+    fn caller() -> VaultCallerOwned {
+        VaultCallerOwned::new("ilk:1111-test", "SY.test@motherbee")
+    }
+
+    fn ok_get_response(trace_id: &str, key: &str, value: Value) -> Message {
+        Message {
+            routing: Routing {
+                src: "vault-uuid".to_string(),
+                src_l2_name: Some("SY.vault@motherbee".to_string()),
+                dst: Destination::Unicast("SY.test@motherbee".to_string()),
+                ttl: 16,
+                trace_id: trace_id.to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(MSG_VAULT_GET_RESPONSE.to_string()),
+                ..Meta::default()
+            },
+            payload: json!({
+                "status": "ok",
+                "key": key,
+                "value": value,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn vault_client_preserves_src_ilk_and_src_l2_name_on_the_wire() {
+        let (dispatcher, mut harness) =
+            crate::rpc::RouterDispatcherTestHarness::new("SY.test@motherbee", vault_test_profile());
+        let client = VaultClient::new(dispatcher.clone(), "motherbee".to_string(), caller());
+
+        // Spawn a get; we don't care about the response for this test, only
+        // about what shows up on the wire.
+        let _bg = tokio::spawn({
+            let client = client.clone();
+            async move { client.get("kv/openai", Duration::from_millis(100)).await }
+        });
+
+        let outgoing = harness
+            .next_outgoing_within(Duration::from_secs(2))
+            .await
+            .expect("vault request reaches the wire");
+        assert_eq!(outgoing.meta.msg.as_deref(), Some(MSG_VAULT_GET));
+        assert_eq!(outgoing.meta.msg_type, SYSTEM_KIND);
+        assert_eq!(outgoing.meta.src_ilk.as_deref(), Some("ilk:1111-test"));
+        assert_eq!(
+            outgoing.routing.src_l2_name.as_deref(),
+            Some("SY.test@motherbee")
+        );
+        assert_eq!(outgoing.meta.target.as_deref(), Some("SY.vault@motherbee"));
+        assert!(!outgoing.routing.trace_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn vault_client_multiplexes_concurrent_calls_by_trace_id() {
+        let (dispatcher, mut harness) =
+            crate::rpc::RouterDispatcherTestHarness::new("SY.test@motherbee", vault_test_profile());
+        let client = VaultClient::new(dispatcher.clone(), "motherbee".to_string(), caller());
+
+        let a = tokio::spawn({
+            let client = client.clone();
+            async move { client.get("kv/a", Duration::from_secs(2)).await }
+        });
+        let b = tokio::spawn({
+            let client = client.clone();
+            async move { client.get("kv/b", Duration::from_secs(2)).await }
+        });
+
+        let out_a = harness
+            .next_outgoing_within(Duration::from_secs(2))
+            .await
+            .expect("first request hits the wire");
+        let out_b = harness
+            .next_outgoing_within(Duration::from_secs(2))
+            .await
+            .expect("second request hits the wire");
+        assert_ne!(
+            out_a.routing.trace_id, out_b.routing.trace_id,
+            "concurrent vault calls must get distinct trace_ids"
+        );
+
+        // Reply in reverse order — multiplexing must still route each reply
+        // to the correct waiter.
+        harness
+            .inject(ok_get_response(
+                &out_b.routing.trace_id,
+                "kv/b",
+                json!("secret_b"),
+            ))
+            .await
+            .expect("inject b");
+        harness
+            .inject(ok_get_response(
+                &out_a.routing.trace_id,
+                "kv/a",
+                json!("secret_a"),
+            ))
+            .await
+            .expect("inject a");
+
+        let response_a = a.await.expect("task a").expect("get a");
+        let response_b = b.await.expect("task b").expect("get b");
+        assert_eq!(response_a.value, Some(json!("secret_a")));
+        assert_eq!(response_b.value, Some(json!("secret_b")));
+    }
+
+    #[tokio::test]
+    async fn vault_client_wrong_msg_for_same_trace_id_is_classified_invalid_response() {
+        let (dispatcher, mut harness) =
+            crate::rpc::RouterDispatcherTestHarness::new("SY.test@motherbee", vault_test_profile());
+        let client = VaultClient::new(dispatcher.clone(), "motherbee".to_string(), caller());
+
+        let call = tokio::spawn({
+            let client = client.clone();
+            async move { client.get("kv/x", Duration::from_millis(500)).await }
+        });
+
+        let outgoing = harness
+            .next_outgoing_within(Duration::from_secs(2))
+            .await
+            .expect("request hits the wire");
+        let trace_id = outgoing.routing.trace_id.clone();
+
+        // Inject a different SYSTEM message reusing the same trace_id. The
+        // vault matcher classifies it as `invalid_response` (it shares
+        // SYSTEM_KIND but is not MSG_VAULT_GET_RESPONSE / UNREACHABLE /
+        // TTL_EXCEEDED), which surfaces as VaultError::Service through our
+        // RpcError → VaultError bridge. The key property is that the call
+        // does NOT silently treat the noise as a vault payload.
+        let bogus = Message {
+            routing: Routing {
+                src: "noise-uuid".to_string(),
+                src_l2_name: Some("SY.noise@motherbee".to_string()),
+                dst: Destination::Unicast("SY.test@motherbee".to_string()),
+                ttl: 16,
+                trace_id: trace_id.clone(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some("UNRELATED_SYSTEM_MESSAGE".to_string()),
+                ..Meta::default()
+            },
+            payload: json!({"junk": true}),
+        };
+        harness.inject(bogus).await.expect("inject noise");
+
+        let result = call.await.expect("task").err();
+        match result {
+            Some(VaultError::Service { code, .. }) => {
+                assert_eq!(code, "VAULT_RPC_ERROR");
+            }
+            other => panic!("expected VaultError::Service{{VAULT_RPC_ERROR}}, got {other:?}"),
         }
     }
 

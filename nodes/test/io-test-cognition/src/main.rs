@@ -5,11 +5,12 @@ use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
 use fluxbee_sdk::thread::ThreadIdInput;
 use fluxbee_sdk::{
-    compute_thread_id, connect, load_hive_id, try_handle_default_node_status, NodeConfig,
-    NodeReceiver, NodeSender,
+    compute_thread_id, load_hive_id, try_handle_default_node_status, NodeConfig,
+    OperationalRouteProfile, PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher, RpcError,
+    RpcRequestLabels,
 };
 use serde_json::{json, Value};
-use tokio::time::timeout;
+use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -55,7 +56,12 @@ async fn main() -> Result<(), DynError> {
         "starting IO.test.cognition"
     );
 
-    let (sender, mut receiver) = connect(&cfg).await?;
+    let profile = OperationalRouteProfile::builder()
+        .command_channel("incoming")
+        .post_pending_rule(RouteMatch::Any, RouteTarget::Command("incoming"))
+        .build()?;
+    let dispatcher =
+        RouterDispatcher::connect_with_retry(cfg, Duration::from_secs(1), profile).await?;
 
     let mut first_observation = None;
     let mut final_observation = None;
@@ -72,8 +78,10 @@ async fn main() -> Result<(), DynError> {
         if step > 1 {
             tokio::time::sleep(Duration::from_millis(turn_delay_ms)).await;
         }
-        let trace_id = send_probe(&sender, &target, &probe_id, &thread_id, step).await?;
-        let reply = wait_for_reply(&sender, &mut receiver, &trace_id, 8_000).await?;
+        let reply =
+            send_probe_and_wait_reply(&dispatcher, &target, &probe_id, &thread_id, step, 8_000)
+                .await?;
+        let trace_id = reply.routing.trace_id.clone();
         let observation = reply
             .payload
             .get("observation")
@@ -259,13 +267,15 @@ fn resolve_thread_id(hive_id: &str, probe_id: &str) -> Result<String, DynError> 
     .map_err(|err| err.into())
 }
 
-async fn send_probe(
-    sender: &NodeSender,
+async fn send_probe_and_wait_reply(
+    dispatcher: &Arc<RouterDispatcher>,
     target: &str,
     probe_id: &str,
     thread_id: &str,
     step: u64,
-) -> Result<String, DynError> {
+    timeout_ms: u64,
+) -> Result<Message, DynError> {
+    let _ = &try_handle_default_node_status; // keep import used
     let trace_id = Uuid::new_v4().to_string();
     let text = if step == 1 {
         env_or(
@@ -282,7 +292,7 @@ async fn send_probe(
     let send_started = Instant::now();
     let msg = Message {
         routing: Routing {
-            src: sender.uuid().to_string(),
+            src: String::new(),
             src_l2_name: None,
             dst: Destination::Unicast(target.to_string()),
             ttl: 16,
@@ -290,20 +300,9 @@ async fn send_probe(
         },
         meta: Meta {
             msg_type: "user".to_string(),
-            msg: None,
-            src_ilk: None,
-            dst_ilk: None,
             ich: Some(format!("io.test.cognition://{}", probe_id)),
             thread_id: Some(thread_id.to_string()),
-            thread_seq: None,
-            ctx: None,
-            ctx_seq: None,
-            ctx_window: None,
-            memory_package: None,
-            scope: None,
             target: Some("io.test.cognition.probe".to_string()),
-            action: None,
-            priority: None,
             context: Some(json!({
                 "probe_id": probe_id,
                 "probe_step": step,
@@ -312,59 +311,27 @@ async fn send_probe(
         },
         payload,
     };
-    sender.send(msg).await?;
+    let matcher = PendingMatcher::new(vec![RouteMatch::any_msg_type("user")], vec![], vec![]);
+    let labels = RpcRequestLabels::new(target, "probe", "user");
+    let response = match dispatcher
+        .send_with_matcher(msg, matcher, labels, Duration::from_millis(timeout_ms))
+        .await
+    {
+        Ok(msg) => msg,
+        Err(RpcError::Timeout { .. }) => {
+            return Err(format!("timeout waiting reply trace_id={trace_id}").into());
+        }
+        Err(err) => return Err(err.into()),
+    };
     tracing::info!(
         trace_id = %trace_id,
         probe_id = %probe_id,
         thread_id = %thread_id,
         step,
         elapsed_us = send_started.elapsed().as_micros() as u64,
-        "IO.test.cognition sent probe"
+        "IO.test.cognition sent probe and received reply"
     );
-    Ok(trace_id)
-}
-
-async fn wait_for_reply(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
-    expected_trace_id: &str,
-    timeout_ms: u64,
-) -> Result<Message, DynError> {
-    let wait_started = Instant::now();
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(format!("timeout waiting reply trace_id={expected_trace_id}").into());
-        }
-        let incoming = match timeout(remaining, receiver.recv()).await {
-            Ok(Ok(msg)) => msg,
-            Ok(Err(err)) => return Err(err.into()),
-            Err(_) => {
-                return Err(format!("timeout waiting reply trace_id={expected_trace_id}").into())
-            }
-        };
-
-        tracing::info!(
-            expected_trace_id = %expected_trace_id,
-            incoming_trace_id = %incoming.routing.trace_id,
-            incoming_type = %incoming.meta.msg_type,
-            incoming_msg = incoming.meta.msg.as_deref().unwrap_or(""),
-            elapsed_us = wait_started.elapsed().as_micros() as u64,
-            "IO.test.cognition received message while waiting for reply"
-        );
-
-        if try_handle_default_node_status(sender, &incoming).await? {
-            continue;
-        }
-        if incoming.routing.trace_id != expected_trace_id {
-            continue;
-        }
-        if incoming.meta.msg_type != "user" {
-            continue;
-        }
-        return Ok(incoming);
-    }
+    Ok(response)
 }
 
 fn build_node_config(default_name: &str, default_version: &str, prefix: &str) -> NodeConfig {

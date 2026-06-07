@@ -4,7 +4,10 @@ use std::path::PathBuf;
 
 use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
-use fluxbee_sdk::{connect, try_handle_default_node_status, NodeConfig, NodeReceiver, NodeSender};
+use fluxbee_sdk::{
+    try_handle_default_node_status, NodeConfig, NodeSender, OperationalRouteProfile, RouteMatch,
+    RouteTarget, RouterDispatcher, RpcCommandReceiver,
+};
 use serde_json::{json, Value};
 use tokio::time::{timeout, Duration};
 use tracing_subscriber::EnvFilter;
@@ -24,15 +27,22 @@ async fn main() -> Result<(), DynError> {
         "starting AI.test.cognition"
     );
 
-    let (sender, mut receiver) = connect(&cfg).await?;
-    run_loop(&sender, &mut receiver).await
+    let profile = OperationalRouteProfile::builder()
+        .command_channel("incoming")
+        .post_pending_rule(RouteMatch::Any, RouteTarget::Command("incoming"))
+        .build()?;
+    let dispatcher =
+        RouterDispatcher::connect_with_retry(cfg, Duration::from_secs(1), profile).await?;
+    let sender = dispatcher.sender_snapshot();
+    let mut incoming = dispatcher.take_command_receiver("incoming").await?;
+    run_loop(&sender, &mut incoming).await
 }
 
-async fn run_loop(sender: &NodeSender, receiver: &mut NodeReceiver) -> Result<(), DynError> {
+async fn run_loop(sender: &NodeSender, incoming: &mut RpcCommandReceiver) -> Result<(), DynError> {
     loop {
-        let msg = match timeout(Duration::from_secs(300), receiver.recv()).await {
-            Ok(Ok(msg)) => msg,
-            Ok(Err(err)) => return Err(err.into()),
+        let msg = match timeout(Duration::from_secs(300), incoming.recv()).await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => return Ok(()),
             Err(_) => continue,
         };
 

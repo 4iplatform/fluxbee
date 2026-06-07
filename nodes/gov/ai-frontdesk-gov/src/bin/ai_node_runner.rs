@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -7,22 +7,23 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use fluxbee_ai_sdk::router_client::{RouterReader, RouterWriter};
 use fluxbee_ai_sdk::{
     build_openai_user_content_parts, build_reply_message_runtime_src, build_text_response,
     extract_response_envelope, extract_text, resolve_model_input_from_payload_with_options, AiNode,
-    AiNodeConfig, FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
+    FunctionCallingConfig, FunctionCallingRunner, FunctionRunInput, FunctionTool,
     FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry,
     ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelInputOptions,
     ModelSettings, NodeRuntime, OpenAiResponsesClient, ResolvedModelInput, RetryPolicy,
-    RouterClient, RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,
+    RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,
 };
-use fluxbee_sdk::node_client::NodeError;
 use fluxbee_sdk::protocol::{
     Destination, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest, MSG_TTL_EXCEEDED,
     MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
-use fluxbee_sdk::{managed_node_config_path, managed_node_name};
+use fluxbee_sdk::{
+    managed_node_config_path, managed_node_name, NodeConfig, NodeUuidMode, OperationalRouteProfile,
+    RouteMatch, RouteTarget, RouterDispatcher, VaultCallerOwned, VaultClient,
+};
 use fluxbee_sdk::{MSG_ILK_REGISTER, MSG_TNT_CREATE};
 use gov_common::{
     frontdesk_contract::{
@@ -38,7 +39,6 @@ use serde_json::{json, Value};
 use tokio::fs as tokio_fs;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use tokio::task::JoinSet;
-use tokio::time::Instant;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -466,65 +466,27 @@ struct GenericAiNode {
     behavior: Arc<RwLock<Option<NodeBehavior>>>,
     config_dir: PathBuf,
     dynamic_config_dir: PathBuf,
-    /// Router socket directory — needed to spin up ephemeral SDK clients
-    /// for vault lookups (Model D' `resolve_resource`).
+    /// Router socket directory — kept for tracing/debug purposes only.
     router_socket: PathBuf,
-    /// UUID persistence root — passed to ephemeral SDK clients.
+    /// UUID persistence root — kept for tracing/debug purposes only.
     state_dir: PathBuf,
     thread_state_store: Option<Arc<dyn ThreadStateStore>>,
     immediate_memory_store: Option<Arc<ImmediateMemoryStore>>,
     gov_identity: GovIdentityConfig,
     gov_identity_bridge: Option<Arc<GovIdentityBridge>>,
+    /// Vault accessor over the canonical `Arc<RouterDispatcher>`.
+    /// `None` when `self_ilk_id` / hive suffix is missing (degraded boot).
+    vault: Option<VaultClient>,
     control_plane: Arc<RwLock<ControlPlaneState>>,
 }
 
-struct SharedRouterConnection {
-    inner: Mutex<SharedRouterState>,
-}
-
-struct SharedRouterState {
-    reader: RouterReader,
-    writer: RouterWriter,
-    backlog: VecDeque<Message>,
-}
-
-impl SharedRouterConnection {
-    fn new(reader: RouterReader, writer: RouterWriter) -> Self {
-        Self {
-            inner: Mutex::new(SharedRouterState {
-                reader,
-                writer,
-                backlog: VecDeque::new(),
-            }),
-        }
-    }
-
-    async fn uuid(&self) -> String {
-        let guard = self.inner.lock().await;
-        guard.writer.uuid().to_string()
-    }
-
-    async fn read_runtime_message(&self, timeout: Duration) -> fluxbee_ai_sdk::Result<Message> {
-        let mut guard = self.inner.lock().await;
-        if let Some(msg) = guard.backlog.pop_front() {
-            return Ok(msg);
-        }
-        guard.reader.read_timeout(timeout).await
-    }
-
-    async fn write(&self, msg: Message) -> fluxbee_ai_sdk::Result<()> {
-        let guard = self.inner.lock().await;
-        guard.writer.write(msg).await
-    }
-}
-
 struct GovIdentityBridge {
-    connection: Arc<SharedRouterConnection>,
+    dispatcher: Arc<RouterDispatcher>,
 }
 
 impl GovIdentityBridge {
-    fn new(connection: Arc<SharedRouterConnection>) -> Self {
-        Self { connection }
+    fn new(dispatcher: Arc<RouterDispatcher>) -> Self {
+        Self { dispatcher }
     }
 
     async fn call_ok(
@@ -587,10 +549,9 @@ impl GovIdentityBridge {
         timeout: Duration,
     ) -> std::result::Result<fluxbee_sdk::IdentitySystemResult, String> {
         let trace_id = Uuid::new_v4().to_string();
-        let src = self.connection.uuid().await;
         let req = Message {
             routing: Routing {
-                src,
+                src: String::new(),
                 src_l2_name: None,
                 dst: Destination::Unicast(target.to_string()),
                 ttl: 16,
@@ -599,59 +560,26 @@ impl GovIdentityBridge {
             meta: Meta {
                 msg_type: SYSTEM_KIND.to_string(),
                 msg: Some(action.to_string()),
-                src_ilk: None,
-                scope: None,
-                target: None,
-                action: None,
-                priority: None,
-                context: None,
                 ..Meta::default()
             },
             payload,
         };
-        self.connection
-            .write(req)
+        let expected_msg = format!("{action}_RESPONSE");
+        let matcher = fluxbee_sdk::PendingMatcher::new(
+            vec![fluxbee_sdk::RouteMatch::exact(SYSTEM_KIND, &expected_msg)],
+            vec![
+                fluxbee_sdk::RouteMatch::exact(SYSTEM_KIND, MSG_UNREACHABLE),
+                fluxbee_sdk::RouteMatch::exact(SYSTEM_KIND, MSG_TTL_EXCEEDED),
+            ],
+            vec![fluxbee_sdk::RouteMatch::any_msg_type(SYSTEM_KIND)],
+        );
+        let labels = fluxbee_sdk::RpcRequestLabels::new(target, action, expected_msg.clone());
+        let msg = self
+            .dispatcher
+            .send_with_matcher(req, matcher, labels, timeout)
             .await
             .map_err(|err| format!("identity send failed: {err}"))?;
-        let expected_msg = format!("{action}_RESPONSE");
-        let deadline = Instant::now() + timeout;
-
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(format!(
-                    "timeout waiting identity response: action={action} trace_id={trace_id} target={target} timeout_ms={}",
-                    timeout.as_millis()
-                ));
-            }
-            let remaining = deadline.saturating_duration_since(now);
-            let mut guard = self.connection.inner.lock().await;
-            if let Some(idx) = guard
-                .backlog
-                .iter()
-                .position(|msg| msg.routing.trace_id == trace_id)
-            {
-                let msg = guard.backlog.remove(idx).expect("backlog index");
-                drop(guard);
-                return Self::parse_identity_reply(msg, &expected_msg, target, trace_id);
-            }
-            match guard.reader.read_timeout(remaining).await {
-                Ok(msg) => {
-                    if msg.routing.trace_id == trace_id {
-                        drop(guard);
-                        return Self::parse_identity_reply(msg, &expected_msg, target, trace_id);
-                    }
-                    guard.backlog.push_back(msg);
-                }
-                Err(fluxbee_ai_sdk::errors::AiSdkError::Node(NodeError::Timeout)) => {
-                    return Err(format!(
-                        "timeout waiting identity response: action={action} trace_id={trace_id} target={target} timeout_ms={}",
-                        timeout.as_millis()
-                    ));
-                }
-                Err(err) => return Err(format!("identity receive failed: {err}")),
-            }
-        }
+        Self::parse_identity_reply(msg, &expected_msg, target, trace_id)
     }
 
     fn parse_identity_reply(
@@ -1687,47 +1615,20 @@ impl GenericAiNode {
     /// tenant is `DEFAULT_ROOT_TENANT_ID` (it doesn't get
     /// FLUXBEE_NODE_TENANT_ID like AI.* / IO.* dynamic spawns).
     async fn resolve_openai_api_key_with_source(&self) -> (Option<String>, OpenAiApiKeySource) {
-        let Some(self_ilk_id) = self.self_ilk_id.as_deref().filter(|v| !v.is_empty()) else {
+        let Some(vault) = self.vault.as_ref() else {
             tracing::warn!(
                 node_name = %self.node_name,
-                "self_ilk_id not resolved; vault lookup skipped (node running degraded)"
+                "vault client unavailable (missing self_ilk_id / hive suffix); lookup skipped"
             );
             return (None, OpenAiApiKeySource::Missing);
         };
-        let Some(hive_id) = self.node_name.split('@').nth(1).filter(|v| !v.is_empty()) else {
-            tracing::warn!(
-                node_name = %self.node_name,
-                "node_name has no @hive suffix; cannot resolve vault target"
-            );
-            return (None, OpenAiApiKeySource::Missing);
-        };
-        let node_config = fluxbee_sdk::NodeConfig {
-            name: self.node_name.clone(),
-            router_socket: self.router_socket.clone(),
-            uuid_persistence_dir: self.state_dir.join("nodes"),
-            uuid_mode: fluxbee_sdk::NodeUuidMode::Ephemeral,
-            config_dir: self.config_dir.clone(),
-            version: "0.1.0".to_string(),
-        };
-        let (sender, mut receiver) = match fluxbee_sdk::connect(&node_config).await {
-            Ok(pair) => pair,
-            Err(err) => {
-                tracing::warn!(error = %err, "frontdesk-gov vault lookup: ephemeral router connect failed");
-                return (None, OpenAiApiKeySource::Missing);
-            }
-        };
-        let caller = fluxbee_sdk::VaultCaller::new(self_ilk_id, &self.node_name);
-        let result = fluxbee_sdk::resolve_resource(
-            &sender,
-            &mut receiver,
-            caller,
-            hive_id,
-            fluxbee_sdk::ResourceType::Openai,
-            fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
-            Duration::from_secs(5),
-        )
-        .await;
-        let _ = sender.close().await;
+        let result = vault
+            .resolve_resource(
+                fluxbee_sdk::ResourceType::Openai,
+                fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+                Duration::from_secs(5),
+            )
+            .await;
         match result {
             Ok(Some(value)) => {
                 let api_key = extract_openai_api_key_from_value(&value);
@@ -2588,190 +2489,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-async fn run_single_connection_runtime(
-    connection: Arc<SharedRouterConnection>,
-    node: GenericAiNode,
-    config: RuntimeConfig,
-) -> fluxbee_ai_sdk::Result<()> {
-    tracing::info!(
-        worker_pool_size = config.worker_pool_size,
-        queue_capacity = config.queue_capacity,
-        read_timeout_ms = config.read_timeout.as_millis() as u64,
-        handler_timeout_ms = config.handler_timeout.as_millis() as u64,
-        write_timeout_ms = config.write_timeout.as_millis() as u64,
-        retry_max_attempts = config.retry_policy.max_attempts,
-        retry_initial_backoff_ms = config.retry_policy.initial_backoff.as_millis() as u64,
-        retry_max_backoff_ms = config.retry_policy.max_backoff.as_millis() as u64,
-        metrics_log_interval_s = config.metrics_log_interval.as_secs(),
-        "ai runtime started (single-connection gov mode)"
-    );
-
-    let mut read_messages = 0u64;
-    let mut idle_read_timeouts = 0u64;
-    let mut reconnect_events = 0u64;
-    let mut reconnect_wait_cycles = 0u64;
-    let mut processed_messages = 0u64;
-    let mut responses_sent = 0u64;
-    let mut retry_attempts = 0u64;
-    let mut next_metrics_log = Instant::now() + config.metrics_log_interval;
-
-    loop {
-        let msg = match connection.read_runtime_message(config.read_timeout).await {
-            Ok(msg) => msg,
-            Err(fluxbee_ai_sdk::errors::AiSdkError::Node(NodeError::Timeout)) => {
-                idle_read_timeouts = idle_read_timeouts.saturating_add(1);
-                tracing::debug!(
-                    read_timeout_ms = config.read_timeout.as_millis() as u64,
-                    "ai runtime read timeout (idle)"
-                );
-                if Instant::now() >= next_metrics_log {
-                    tracing::debug!(
-                        read_messages,
-                        idle_read_timeouts,
-                        reconnect_events,
-                        reconnect_wait_cycles,
-                        enqueued_messages = read_messages,
-                        processed_messages,
-                        responses_sent,
-                        recoverable_exhausted = 0,
-                        fatal_errors = 0,
-                        retry_attempts,
-                        "ai runtime metrics"
-                    );
-                    next_metrics_log = Instant::now() + config.metrics_log_interval;
-                }
-                continue;
-            }
-            Err(err) if is_transient_link_error(&err) => {
-                reconnect_events = reconnect_events.saturating_add(1);
-                tracing::warn!(
-                    error = %err,
-                    "ai runtime disconnected from router; entering reconnect wait"
-                );
-                reconnect_wait_cycles = reconnect_wait_cycles
-                    .saturating_add(wait_for_shared_reconnect(connection.as_ref()).await);
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
-        read_messages = read_messages.saturating_add(1);
-
-        let mut attempt = 0usize;
-        let max_attempts = config.retry_policy.max_attempts.max(1);
-        let mut backoff = config.retry_policy.initial_backoff;
-        let maybe_response = loop {
-            attempt += 1;
-            match tokio::time::timeout(config.handler_timeout, node.on_message(msg.clone())).await {
-                Ok(Ok(response)) => break response,
-                Ok(Err(err)) if err.is_recoverable() && attempt < max_attempts => {
-                    retry_attempts = retry_attempts.saturating_add(1);
-                    tracing::debug!(
-                        stage = "handler",
-                        attempt,
-                        next_backoff_ms = backoff.as_millis() as u64,
-                        error = %err,
-                        "recoverable error, retrying"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    backoff =
-                        std::cmp::min(backoff.saturating_mul(2), config.retry_policy.max_backoff);
-                }
-                Ok(Err(err)) if err.is_recoverable() => {
-                    return Err(fluxbee_ai_sdk::errors::AiSdkError::RecoverableExhausted(
-                        format!("handler failed after {max_attempts} attempts: {err}"),
-                    ));
-                }
-                Ok(Err(err)) => return Err(err),
-                Err(_) => {
-                    return Err(fluxbee_ai_sdk::errors::AiSdkError::Timeout(
-                        "node handler timeout".to_string(),
-                    ))
-                }
-            }
-        };
-
-        if let Some(mut response) = maybe_response {
-            tracing::debug!(
-                trace_id = %response.routing.trace_id,
-                dst = ?response.routing.dst,
-                "sending ai response to router"
-            );
-            response.routing.src = connection.uuid().await;
-            tokio::time::timeout(config.write_timeout, connection.write(response))
-                .await
-                .map_err(|_| {
-                    fluxbee_ai_sdk::errors::AiSdkError::Timeout("router write timeout".to_string())
-                })??;
-            tracing::debug!("ai response delivered to router");
-            responses_sent = responses_sent.saturating_add(1);
-        }
-        processed_messages = processed_messages.saturating_add(1);
-
-        if Instant::now() >= next_metrics_log {
-            tracing::debug!(
-                read_messages,
-                idle_read_timeouts,
-                reconnect_events,
-                reconnect_wait_cycles,
-                enqueued_messages = read_messages,
-                processed_messages,
-                responses_sent,
-                recoverable_exhausted = 0,
-                fatal_errors = 0,
-                retry_attempts,
-                "ai runtime metrics"
-            );
-            next_metrics_log = Instant::now() + config.metrics_log_interval;
-        }
-    }
-}
-
-fn is_transient_link_error(err: &fluxbee_ai_sdk::errors::AiSdkError) -> bool {
-    matches!(
-        err,
-        fluxbee_ai_sdk::errors::AiSdkError::Node(NodeError::Io(_) | NodeError::Disconnected)
-    )
-}
-
-async fn wait_for_shared_reconnect(connection: &SharedRouterConnection) -> u64 {
-    let mut attempt: u64 = 0;
-    let mut wait_cycles: u64 = 0;
-    let mut backoff = Duration::from_millis(200);
-    let max_backoff = Duration::from_secs(5);
-
-    loop {
-        let poll_timeout = Duration::from_millis(250);
-        match connection.read_runtime_message(poll_timeout).await {
-            Ok(msg) => {
-                let mut guard = connection.inner.lock().await;
-                guard.backlog.push_front(msg);
-                drop(guard);
-                tracing::info!(attempt, "ai runtime reconnected to router");
-                return wait_cycles;
-            }
-            Err(fluxbee_ai_sdk::errors::AiSdkError::Node(NodeError::Timeout)) => {}
-            Err(err) if is_transient_link_error(&err) => {}
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "unexpected error while probing reconnect; keeping retry loop"
-                );
-            }
-        }
-
-        attempt = attempt.saturating_add(1);
-        wait_cycles = wait_cycles.saturating_add(1);
-        let wait_for = with_jitter(backoff);
-        tracing::info!(
-            attempt,
-            backoff_ms = backoff.as_millis() as u64,
-            wait_ms = wait_for.as_millis() as u64,
-            "ai runtime reconnecting to router"
-        );
-        tokio::time::sleep(wait_for).await;
-        backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
-    }
-}
 
 fn with_jitter(base: Duration) -> Duration {
     let nanos = SystemTime::now()
@@ -2800,12 +2517,17 @@ async fn run_one_config(
     let persisted_dynamic =
         load_persisted_dynamic_config(&PathBuf::from(&cfg.node.dynamic_config_dir), &cfg.node.name);
     let behavior = build_behavior(&cfg)?;
-    let ai_node_config = AiNodeConfig {
-        name: cfg.node.name,
-        version: cfg.node.version,
-        router_socket: PathBuf::from(cfg.node.router_socket),
-        uuid_persistence_dir: PathBuf::from(cfg.node.uuid_persistence_dir),
-        config_dir: PathBuf::from(cfg.node.config_dir),
+    let runner_node_name = cfg.node.name.clone();
+    let runner_router_socket = PathBuf::from(cfg.node.router_socket);
+    let runner_uuid_persistence_dir = PathBuf::from(cfg.node.uuid_persistence_dir);
+    let runner_config_dir = PathBuf::from(cfg.node.config_dir);
+    let runner_node_config = NodeConfig {
+        name: runner_node_name.clone(),
+        router_socket: runner_router_socket.clone(),
+        uuid_persistence_dir: runner_uuid_persistence_dir.clone(),
+        uuid_mode: NodeUuidMode::Persistent,
+        config_dir: runner_config_dir.clone(),
+        version: cfg.node.version.clone(),
     };
 
     let runtime_config = RuntimeConfig {
@@ -2824,30 +2546,43 @@ async fn run_one_config(
 
     tracing::info!(
         config = %config_path.display(),
-        node_name = %ai_node_config.name,
+        node_name = %runner_node_name,
         mode = %mode.as_str(),
         "starting ai_node_runner node instance"
     );
 
-    let node_name = ai_node_config.name.clone();
+    let node_name = runner_node_name.clone();
     let gov_identity = gov_identity_config_from_env();
     let thread_state_store =
         init_thread_state_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
     let immediate_memory_store =
         init_immediate_memory_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
+
+    let profile = build_frontdesk_gov_rpc_profile()
+        .map_err(|err| format!("frontdesk-gov rpc profile invalid: {err}"))?;
+    let dispatcher =
+        RouterDispatcher::connect_with_retry(runner_node_config, Duration::from_secs(1), profile)
+            .await?;
+    let vault = vault_client_for(dispatcher.clone(), &node_name, self_ilk_id.as_deref());
+    let gov_identity_bridge = if mode == RunnerMode::Gov {
+        Some(Arc::new(GovIdentityBridge::new(dispatcher.clone())))
+    } else {
+        None
+    };
     let node = GenericAiNode {
         mode,
         node_name,
         self_ilk_id,
         behavior: Arc::new(RwLock::new(Some(behavior))),
-        config_dir: ai_node_config.config_dir.clone(),
+        config_dir: runner_config_dir,
         dynamic_config_dir: PathBuf::from(&cfg.node.dynamic_config_dir),
-        router_socket: ai_node_config.router_socket.clone(),
-        state_dir: ai_node_config.uuid_persistence_dir.clone(),
+        router_socket: runner_router_socket,
+        state_dir: runner_uuid_persistence_dir,
         thread_state_store,
         immediate_memory_store,
         gov_identity,
-        gov_identity_bridge: None,
+        gov_identity_bridge,
+        vault,
         control_plane: Arc::new(RwLock::new(ControlPlaneState {
             current_state: NodeLifecycleState::Configured,
             config_source: "yaml",
@@ -2863,19 +2598,33 @@ async fn run_one_config(
             ..ControlPlaneState::default()
         })),
     };
-    if mode == RunnerMode::Gov {
-        let client = RouterClient::connect(ai_node_config).await?;
-        let (reader, writer) = client.split();
-        let shared_conn = Arc::new(SharedRouterConnection::new(reader, writer));
-        let mut node = node;
-        node.gov_identity_bridge = Some(Arc::new(GovIdentityBridge::new(shared_conn.clone())));
-        run_single_connection_runtime(shared_conn, node, runtime_config).await?;
-    } else {
-        let client = RouterClient::connect(ai_node_config).await?;
-        let runtime = NodeRuntime::new(client, node);
-        runtime.run_with_config(runtime_config).await?;
-    }
+    let runtime = NodeRuntime::new(dispatcher, node);
+    runtime.run_with_config(runtime_config).await?;
     Ok(())
+}
+
+fn build_frontdesk_gov_rpc_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::RpcError> {
+    OperationalRouteProfile::builder()
+        .command_channel(fluxbee_ai_sdk::AI_RUNTIME_CHANNEL)
+        .post_pending_rule(
+            RouteMatch::Any,
+            RouteTarget::Command(fluxbee_ai_sdk::AI_RUNTIME_CHANNEL),
+        )
+        .build()
+}
+
+fn vault_client_for(
+    dispatcher: Arc<RouterDispatcher>,
+    node_name: &str,
+    self_ilk_id: Option<&str>,
+) -> Option<VaultClient> {
+    let ilk = self_ilk_id.map(str::trim).filter(|v| !v.is_empty())?;
+    let hive = node_name.split('@').nth(1).filter(|v| !v.is_empty())?;
+    Some(VaultClient::new(
+        dispatcher,
+        hive.to_string(),
+        VaultCallerOwned::new(ilk.to_string(), node_name.to_string()),
+    ))
 }
 
 async fn run_unconfigured_bootstrap(
@@ -3009,12 +2758,17 @@ async fn run_unconfigured_bootstrap(
         }
     };
 
-    let ai_node_config = AiNodeConfig {
-        name: node.name,
-        version: node.version,
-        router_socket: PathBuf::from(node.router_socket),
-        uuid_persistence_dir: PathBuf::from(node.uuid_persistence_dir),
-        config_dir: PathBuf::from(node.config_dir),
+    let runner_node_name = node.name.clone();
+    let runner_router_socket = PathBuf::from(node.router_socket);
+    let runner_uuid_persistence_dir = PathBuf::from(node.uuid_persistence_dir);
+    let runner_config_dir = PathBuf::from(node.config_dir);
+    let runner_node_config = NodeConfig {
+        name: runner_node_name.clone(),
+        router_socket: runner_router_socket.clone(),
+        uuid_persistence_dir: runner_uuid_persistence_dir.clone(),
+        uuid_mode: NodeUuidMode::Persistent,
+        config_dir: runner_config_dir.clone(),
+        version: node.version.clone(),
     };
     tracing::info!(
         node_name = %node_name,
@@ -3022,43 +2776,40 @@ async fn run_unconfigured_bootstrap(
         "starting ai_node_runner bootstrap instance"
     );
     let gov_identity = gov_identity_config_from_env();
+    let profile = build_frontdesk_gov_rpc_profile()
+        .map_err(|err| format!("frontdesk-gov rpc profile invalid: {err}"))?;
+    let dispatcher =
+        RouterDispatcher::connect_with_retry(runner_node_config, Duration::from_secs(1), profile)
+            .await?;
+    tracing::info!(
+        node_name = %node_name,
+        mode = %mode.as_str(),
+        "frontdesk-gov connected to router"
+    );
+    let vault = vault_client_for(dispatcher.clone(), &node_name, self_ilk_id.as_deref());
+    let gov_identity_bridge = if mode == RunnerMode::Gov {
+        Some(Arc::new(GovIdentityBridge::new(dispatcher.clone())))
+    } else {
+        None
+    };
     let ai_node = GenericAiNode {
         mode,
         node_name: node_name.clone(),
         self_ilk_id,
         behavior: Arc::new(RwLock::new(behavior)),
-        config_dir: ai_node_config.config_dir.clone(),
+        config_dir: runner_config_dir,
         dynamic_config_dir: dynamic_dir,
-        router_socket: ai_node_config.router_socket.clone(),
-        state_dir: ai_node_config.uuid_persistence_dir.clone(),
+        router_socket: runner_router_socket,
+        state_dir: runner_uuid_persistence_dir,
         thread_state_store,
         immediate_memory_store,
         gov_identity,
-        gov_identity_bridge: None,
+        gov_identity_bridge,
+        vault,
         control_plane: Arc::new(RwLock::new(state)),
     };
-    if mode == RunnerMode::Gov {
-        let client = RouterClient::connect(ai_node_config).await?;
-        tracing::info!(
-            node_name = %node_name,
-            mode = %mode.as_str(),
-            "SY.frontdesk.gov connected to router"
-        );
-        let (reader, writer) = client.split();
-        let shared_conn = Arc::new(SharedRouterConnection::new(reader, writer));
-        let mut ai_node = ai_node;
-        ai_node.gov_identity_bridge = Some(Arc::new(GovIdentityBridge::new(shared_conn.clone())));
-        run_single_connection_runtime(shared_conn, ai_node, RuntimeConfig::default()).await?;
-    } else {
-        let client = RouterClient::connect(ai_node_config).await?;
-        tracing::info!(
-            node_name = %node_name,
-            mode = %mode.as_str(),
-            "AI runner connected to router"
-        );
-        let runtime = NodeRuntime::new(client, ai_node);
-        runtime.run_with_config(RuntimeConfig::default()).await?;
-    }
+    let runtime = NodeRuntime::new(dispatcher, ai_node);
+    runtime.run_with_config(RuntimeConfig::default()).await?;
     Ok(())
 }
 
@@ -4462,6 +4213,7 @@ mod tests {
             immediate_memory_store: None,
             gov_identity,
             gov_identity_bridge: None,
+            vault: None,
             control_plane: Arc::new(RwLock::new(ControlPlaneState {
                 current_state: NodeLifecycleState::Unconfigured,
                 config_source: "none",

@@ -1,6 +1,6 @@
 //! Multiplexed RPC client over a router connection.
 //!
-//! `RpcClient` owns a single `NodeSender + NodeReceiver` pair and serves two
+//! `RouterDispatcher` owns a single `NodeSender + NodeReceiver` pair and serves two
 //! roles: it correlates outgoing requests with incoming responses by
 //! `trace_id` against caller-supplied response contracts, and it routes
 //! operational traffic that is not a pending response according to a
@@ -41,7 +41,8 @@ use crate::policy::{classify_admin_action, classify_system_message, ActionResult
 use crate::protocol::{
     Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
-use crate::split::{ConnectionInfo, ConnectionState, NodeReceiver, NodeSender};
+use crate::split::{ConnectionInfo, ConnectionState};
+use crate::split::{NodeReceiver, NodeSender};
 
 pub const ADMIN_KIND: &str = "admin";
 pub const MSG_ADMIN_COMMAND: &str = "ADMIN_COMMAND";
@@ -636,10 +637,10 @@ impl RpcCommandReceiver {
 }
 
 // ---------------------------------------------------------------------------
-// RpcClient
+// RouterDispatcher
 // ---------------------------------------------------------------------------
 
-pub struct RpcClient {
+pub struct RouterDispatcher {
     sender: NodeSender,
     profile: OperationalRouteProfile,
     command: HashMap<&'static str, CommandChannel>,
@@ -652,7 +653,7 @@ pub struct RpcClient {
     metric_route_unmatched: AtomicU64,
 }
 
-impl RpcClient {
+impl RouterDispatcher {
     /// Connect to the local router and start the dispatcher loop. Retries
     /// indefinitely on transient connect failures, waiting `delay` between
     /// attempts.
@@ -674,10 +675,8 @@ impl RpcClient {
         }
     }
 
-    /// Build a client around in-process channel fixtures. Used by
-    /// `RpcTestHarness` and by downstream test code that wants to exercise
-    /// the real dispatcher / matcher path without a router.
-    pub fn from_test_channels(
+    /// Build a client around in-process channel fixtures.
+    fn from_test_channels(
         sender: NodeSender,
         receiver: NodeReceiver,
         profile: OperationalRouteProfile,
@@ -1400,17 +1399,17 @@ pub fn extract_error_message<'a>(
 // Test harness
 // ---------------------------------------------------------------------------
 
-/// Test harness that wires a `RpcClient` over in-process channels. Use it
+/// Test harness that wires a `RouterDispatcher` over in-process channels. Use it
 /// from downstream crate tests (orchestrator, sy_admin) to exercise the
 /// real dispatcher / matcher path without a router.
-pub struct RpcTestHarness {
+pub struct RouterDispatcherTestHarness {
     outbound_rx: mpsc::Receiver<Vec<u8>>,
     inbound_tx: mpsc::Sender<Result<Message, NodeError>>,
     sender_uuid: String,
 }
 
-impl RpcTestHarness {
-    pub fn new(full_name: &str, profile: OperationalRouteProfile) -> (Arc<RpcClient>, Self) {
+impl RouterDispatcherTestHarness {
+    pub fn new(full_name: &str, profile: OperationalRouteProfile) -> (Arc<RouterDispatcher>, Self) {
         Self::new_with_uuid("test-uuid", full_name, profile)
     }
 
@@ -1418,7 +1417,7 @@ impl RpcTestHarness {
         uuid: &str,
         full_name: &str,
         profile: OperationalRouteProfile,
-    ) -> (Arc<RpcClient>, Self) {
+    ) -> (Arc<RouterDispatcher>, Self) {
         let (outbound_tx, outbound_rx) = mpsc::channel(64);
         let (inbound_tx, inbound_rx) = mpsc::channel(64);
         let state = Arc::new(ConnectionState::new_connected());
@@ -1431,7 +1430,7 @@ impl RpcTestHarness {
         ));
         let sender = NodeSender::new(outbound_tx, Arc::clone(&info));
         let receiver = NodeReceiver::new(inbound_rx, info);
-        let client = RpcClient::from_test_channels(sender, receiver, profile);
+        let client = RouterDispatcher::from_test_channels(sender, receiver, profile);
         (
             client,
             Self {
@@ -1663,14 +1662,14 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_take_command_receiver_returns_unknown_route_channel() {
-        let (client, _harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        let (client, _harness) = RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         let err = client.take_command_receiver("missing").await.unwrap_err();
         assert!(matches!(err, RpcError::UnknownRouteChannel { .. }));
     }
 
     #[tokio::test]
     async fn unknown_subscribe_returns_unknown_route_channel() {
-        let (client, _harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        let (client, _harness) = RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         let err = client.subscribe("missing").unwrap_err();
         assert!(matches!(err, RpcError::UnknownRouteChannel { .. }));
     }
@@ -1692,7 +1691,7 @@ mod tests {
             )
             .build()
             .unwrap();
-        let (client, harness) = RpcTestHarness::new("SY.test@hive", profile);
+        let (client, harness) = RouterDispatcherTestHarness::new("SY.test@hive", profile);
         let mut sc = client
             .take_command_receiver("system_command")
             .await
@@ -1730,7 +1729,7 @@ mod tests {
             )
             .build()
             .unwrap();
-        let (client, harness) = RpcTestHarness::new("SY.test@hive", profile);
+        let (client, harness) = RouterDispatcherTestHarness::new("SY.test@hive", profile);
         let mut sub = client.subscribe("config_response").unwrap();
 
         harness
@@ -1754,7 +1753,8 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_by_trace_id_with_concurrent_rpcs() {
-        let (client, mut harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        let (client, mut harness) =
+            RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         let c1 = Arc::clone(&client);
         let c2 = Arc::clone(&client);
         let h1 = tokio::spawn(async move {
@@ -1805,7 +1805,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_trace_id_flows_to_operational_receiver() {
-        let (client, harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        let (client, harness) = RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         let mut sys_rx = client.take_command_receiver("system").await.unwrap();
         harness
             .inject(make_loose("free-trace", SYSTEM_KIND, "PING", json!({})))
@@ -1820,7 +1820,8 @@ mod tests {
 
     #[tokio::test]
     async fn pre_pending_rule_wins_against_colliding_admin_waiter() {
-        let (client, mut harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        let (client, mut harness) =
+            RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         let mut admin_rx = client.take_command_receiver("admin").await.unwrap();
         let c = Arc::clone(&client);
         let waiter = tokio::spawn(async move {
@@ -1867,7 +1868,7 @@ mod tests {
     #[tokio::test]
     async fn send_with_matcher_supports_msg_type_wildcard_success() {
         let profile = OperationalRouteProfile::builder().build().unwrap();
-        let (client, mut harness) = RpcTestHarness::new("SY.test@hive", profile);
+        let (client, mut harness) = RouterDispatcherTestHarness::new("SY.test@hive", profile);
         let matcher = PendingMatcher::new(
             vec![RouteMatch::any_msg_type("command_response")],
             vec![],
@@ -1903,7 +1904,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_with_matcher_rejects_duplicate_active_trace_id() {
-        let (client, mut harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        let (client, mut harness) =
+            RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         let matcher = PendingMatcher::new(
             vec![RouteMatch::exact(SYSTEM_KIND, "RESP")],
             vec![],
@@ -1958,7 +1960,8 @@ mod tests {
 
     #[tokio::test]
     async fn colliding_trace_outside_invalid_family_keeps_waiter_pending() {
-        let (client, mut harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        let (client, mut harness) =
+            RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         let mut admin_rx = client.take_command_receiver("admin").await.unwrap();
         let c = Arc::clone(&client);
         let waiter = tokio::spawn(async move {
@@ -2012,7 +2015,8 @@ mod tests {
 
     #[tokio::test]
     async fn colliding_trace_in_invalid_family_unknown_msg_fails_invalid_response() {
-        let (client, mut harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        let (client, mut harness) =
+            RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         let c = Arc::clone(&client);
         let waiter = tokio::spawn(async move {
             // System RPC: invalid_response_families = {SYSTEM_KIND}.
@@ -2041,7 +2045,8 @@ mod tests {
 
     #[tokio::test]
     async fn admin_waiter_completes_on_system_kind_transport_error() {
-        let (client, mut harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        let (client, mut harness) =
+            RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         let c = Arc::clone(&client);
         let waiter = tokio::spawn(async move {
             c.send_admin_rpc(AdminCommandRequest {
@@ -2077,7 +2082,8 @@ mod tests {
 
     #[tokio::test]
     async fn admin_waiter_colliding_non_terminal_system_routes_operationally() {
-        let (client, mut harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        let (client, mut harness) =
+            RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         let mut sys_rx = client.take_command_receiver("system").await.unwrap();
         let c = Arc::clone(&client);
         let waiter = tokio::spawn(async move {
@@ -2126,7 +2132,8 @@ mod tests {
 
     #[tokio::test]
     async fn late_correlated_response_after_timeout_is_stale_not_delivered() {
-        let (client, mut harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        let (client, mut harness) =
+            RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         let mut sys_rx = client.take_command_receiver("system").await.unwrap();
         let c = Arc::clone(&client);
         let waiter = tokio::spawn(async move {
@@ -2170,7 +2177,7 @@ mod tests {
             )
             .build()
             .unwrap();
-        let (client, harness) = RpcTestHarness::new("SY.test@hive", profile);
+        let (client, harness) = RouterDispatcherTestHarness::new("SY.test@hive", profile);
         let mut sys_rx = client.take_command_receiver("system").await.unwrap();
 
         // Issue and time-out an RPC so its response shape lands in the
@@ -2213,7 +2220,7 @@ mod tests {
             .post_pending_rule(RouteMatch::Any, RouteTarget::Command("catch_all"))
             .build()
             .unwrap();
-        let (client, mut harness) = RpcTestHarness::new("SY.test@hive", profile);
+        let (client, mut harness) = RouterDispatcherTestHarness::new("SY.test@hive", profile);
         let mut cmd_rx = client.take_command_receiver("catch_all").await.unwrap();
         let matcher = PendingMatcher::new(
             vec![RouteMatch::any_msg_type("command_response")],
@@ -2258,7 +2265,7 @@ mod tests {
             )
             .build()
             .unwrap();
-        let (client, mut harness) = RpcTestHarness::new("SY.test@hive", profile);
+        let (client, mut harness) = RouterDispatcherTestHarness::new("SY.test@hive", profile);
         let mut sub = client.subscribe("query").unwrap();
         let matcher = PendingMatcher::new(
             vec![RouteMatch::any_msg_type("query_response")],
@@ -2306,7 +2313,7 @@ mod tests {
             )
             .build()
             .unwrap();
-        let (client, mut harness) = RpcTestHarness::new("SY.test@hive", profile);
+        let (client, mut harness) = RouterDispatcherTestHarness::new("SY.test@hive", profile);
         let mut sub = client.subscribe("query").unwrap();
         let matcher = PendingMatcher::new(
             vec![RouteMatch::exact("query_response", "QUERY_DONE")],
@@ -2349,7 +2356,8 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_cleans_waiter_and_subsequent_rpc_works() {
-        let (client, mut harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        let (client, mut harness) =
+            RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         let c = Arc::clone(&client);
         let waiter = tokio::spawn(async move {
             c.send_system_rpc(SystemRpcRequest {
@@ -2387,7 +2395,7 @@ mod tests {
 
     #[tokio::test]
     async fn drain_pending_waiters_completes_with_disconnected() {
-        let (client, _harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        let (client, _harness) = RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         let c = Arc::clone(&client);
         let waiter = tokio::spawn(async move {
             c.send_system_rpc(SystemRpcRequest {
@@ -2407,7 +2415,8 @@ mod tests {
 
     #[tokio::test]
     async fn recv_loop_io_error_drains_pending_waiters() {
-        let (client, mut harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        let (client, mut harness) =
+            RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         let c = Arc::clone(&client);
         let waiter = tokio::spawn(async move {
             c.send_system_rpc(SystemRpcRequest {
@@ -2439,7 +2448,8 @@ mod tests {
 
     #[tokio::test]
     async fn ttl_exceeded_mapped_correctly() {
-        let (client, mut harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        let (client, mut harness) =
+            RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         let c = Arc::clone(&client);
         let waiter = tokio::spawn(async move {
             c.send_system_rpc(SystemRpcRequest {
@@ -2476,7 +2486,8 @@ mod tests {
 
     #[tokio::test]
     async fn admin_response_parses_status_action_request_id_trace_id() {
-        let (client, mut harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        let (client, mut harness) =
+            RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         let c = Arc::clone(&client);
         let waiter = tokio::spawn(async move {
             c.send_admin_rpc(AdminCommandRequest {
@@ -2517,7 +2528,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_depth_gauge_consistent_with_recv() {
-        let (client, harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        let (client, harness) = RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         for i in 0..3 {
             harness
                 .inject(make_loose(
@@ -2610,7 +2621,7 @@ mod tests {
 
     #[tokio::test]
     async fn take_receiver_returns_error_on_double_take() {
-        let (client, _harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        let (client, _harness) = RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         let _first = client.take_command_receiver("admin").await.unwrap();
         let second = client.take_command_receiver("admin").await;
         match second.unwrap_err() {
@@ -2635,7 +2646,7 @@ mod tests {
             )
             .build()
             .unwrap();
-        let (client, harness) = RpcTestHarness::new("SY.test@hive", profile);
+        let (client, harness) = RouterDispatcherTestHarness::new("SY.test@hive", profile);
         let mut worker_rx = client.take_command_receiver("worker").await.unwrap();
 
         // Fire an RPC and let it time out. After timeout the stale TTL
@@ -2680,7 +2691,7 @@ mod tests {
             )
             .build()
             .unwrap();
-        let (client, harness) = RpcTestHarness::new("SY.test@hive", profile);
+        let (client, harness) = RouterDispatcherTestHarness::new("SY.test@hive", profile);
         let mut subscriber = client.subscribe("config_response").unwrap();
 
         // Send and complete the RPC so the response shape is registered.
@@ -2725,7 +2736,7 @@ mod tests {
     /// `NodeReceiver::recv()` Disconnected path.
     #[tokio::test]
     async fn send_with_matcher_fails_fast_when_sender_is_disconnected() {
-        let (client, harness) = RpcTestHarness::new("SY.test@hive", simple_profile());
+        let (client, harness) = RouterDispatcherTestHarness::new("SY.test@hive", simple_profile());
         // Force the SDK to observe a disconnect: dropping the harness's
         // inbound transmitter closes the receiver, the recv loop errors out
         // with `Disconnected`, and `NodeReceiver::recv` flips the shared
@@ -2768,7 +2779,7 @@ mod tests {
         ));
         let sender = NodeSender::new(outbound_tx, Arc::clone(&info));
         let receiver = NodeReceiver::new(inbound_rx, info);
-        let client = RpcClient::from_test_channels(sender, receiver, simple_profile());
+        let client = RouterDispatcher::from_test_channels(sender, receiver, simple_profile());
 
         let err = client
             .send_system_rpc(SystemRpcRequest {

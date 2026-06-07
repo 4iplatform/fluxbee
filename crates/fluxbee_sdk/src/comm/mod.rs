@@ -5,7 +5,4 @@ pub use crate::protocol;
 pub use crate::socket;
 pub use crate::split;
 
-pub use crate::{
-    connect, connect_with_client_config, ClientConfig, NodeConfig, NodeError, NodeReceiver,
-    NodeSender, NodeUuidMode,
-};
+pub use crate::{ClientConfig, NodeConfig, NodeError, NodeSender, NodeUuidMode};

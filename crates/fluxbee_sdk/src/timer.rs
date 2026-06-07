@@ -44,25 +44,35 @@
 //! - [`TimerClient::cancel_by_client_ref`]
 //! - [`TimerClient::reschedule_by_client_ref`]
 //!
-//! For unit tests that should not depend on a real hive, use [`TimerTestHarness`]
-//! to drive a real [`TimerClient`] over a scripted in-memory transport.
+//! Unit tests in this module drive a real [`TimerClient`] over a scripted
+//! in-memory transport without depending on a live hive.
 
+use std::marker::PhantomData;
+#[cfg(test)]
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+#[cfg(test)]
 use tokio::sync::mpsc;
-use tokio::time::{Duration, Instant as TokioInstant};
+use tokio::time::Duration;
+#[cfg(test)]
+use tokio::time::Instant as TokioInstant;
 use uuid::Uuid;
 
 use crate::protocol::{
-    build_system_message, Destination, Message, Meta, Routing, TtlExceededPayload,
-    UnreachablePayload, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
+    build_system_message, Destination, Message, TtlExceededPayload, UnreachablePayload,
+    MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
+#[cfg(test)]
+use crate::protocol::{Meta, Routing};
+#[cfg(test)]
+use crate::split::NodeReceiver;
+#[cfg(test)]
 use crate::split::{ConnectionInfo, ConnectionState};
-use crate::{NodeError, NodeReceiver, NodeSender};
+use crate::{NodeError, NodeSender};
 
 pub const TIMER_NODE_KIND: &str = "SY.timer";
 pub const TIMER_NODE_FAMILY: &str = "SY";
@@ -563,9 +573,23 @@ impl Default for TimerClientConfig {
     }
 }
 
+/// Transport backing the `TimerClient`.
+pub(crate) enum TimerTransport<'a> {
+    #[cfg(test)]
+    Legacy {
+        sender: &'a NodeSender,
+        receiver: &'a mut NodeReceiver,
+    },
+    Dispatcher {
+        dispatcher: std::sync::Arc<crate::rpc::RouterDispatcher>,
+        _marker: PhantomData<&'a ()>,
+    },
+}
+
 pub struct TimerClient<'a> {
-    sender: &'a NodeSender,
-    receiver: &'a mut NodeReceiver,
+    transport: TimerTransport<'a>,
+    /// Cached sender snapshot for the dispatcher backend.
+    dispatcher_sender: Option<NodeSender>,
     timer_target: String,
     rpc_timeout: Duration,
     time_retry_schedule: Vec<Duration>,
@@ -573,13 +597,15 @@ pub struct TimerClient<'a> {
 
 /// Scripted in-memory transport for testing [`TimerClient`] and timer-aware Rust nodes
 /// without a live hive or a running `SY.timer`.
-pub struct TimerTestHarness {
+#[cfg(test)]
+pub(crate) struct TimerTestHarness {
     outbound_rx: mpsc::Receiver<Vec<u8>>,
     inbound_tx: mpsc::Sender<Result<Message, NodeError>>,
 }
 
 impl<'a> TimerClient<'a> {
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         sender: &'a NodeSender,
         receiver: &'a mut NodeReceiver,
         config: TimerClientConfig,
@@ -592,8 +618,36 @@ impl<'a> TimerClient<'a> {
             }
         };
         Ok(Self {
-            sender,
-            receiver,
+            transport: TimerTransport::Legacy { sender, receiver },
+            dispatcher_sender: None,
+            timer_target,
+            rpc_timeout: default_rpc_timeout(config.rpc_timeout),
+            time_retry_schedule: normalized_time_retry_schedule(config.time_retry_schedule),
+        })
+    }
+
+    /// Build a `TimerClient` backed by the canonical
+    /// `Arc<RouterDispatcher>`. Timer RPCs go through
+    /// `dispatcher.send_with_matcher` so `MSG_TIMER_RESPONSE` is correlated
+    /// by `trace_id` without exclusive `NodeReceiver` ownership.
+    pub fn new_with_dispatcher(
+        dispatcher: std::sync::Arc<crate::rpc::RouterDispatcher>,
+        config: TimerClientConfig,
+    ) -> Result<TimerClient<'static>, TimerClientError> {
+        let sender_snapshot = dispatcher.sender_snapshot();
+        let timer_target = match config.timer_target {
+            Some(target) if !target.trim().is_empty() => target.trim().to_string(),
+            _ => {
+                let full_name = sender_snapshot.full_name();
+                local_timer_node_name(full_name.as_ref())?
+            }
+        };
+        Ok(TimerClient::<'static> {
+            transport: TimerTransport::Dispatcher {
+                dispatcher,
+                _marker: PhantomData,
+            },
+            dispatcher_sender: Some(sender_snapshot),
             timer_target,
             rpc_timeout: default_rpc_timeout(config.rpc_timeout),
             time_retry_schedule: normalized_time_retry_schedule(config.time_retry_schedule),
@@ -605,7 +659,14 @@ impl<'a> TimerClient<'a> {
     }
 
     pub fn sender(&self) -> &NodeSender {
-        self.sender
+        match &self.transport {
+            #[cfg(test)]
+            TimerTransport::Legacy { sender, .. } => sender,
+            TimerTransport::Dispatcher { .. } => self
+                .dispatcher_sender
+                .as_ref()
+                .expect("dispatcher sender snapshot is cached at construction"),
+        }
     }
 
     pub async fn help(&mut self) -> Result<TimerHelpDescriptor, TimerClientError> {
@@ -794,7 +855,7 @@ impl<'a> TimerClient<'a> {
         mut filter: TimerListFilter,
     ) -> Result<TimerListResponse, TimerClientError> {
         if filter.owner_l2_name.is_none() {
-            filter.owner_l2_name = Some(self.sender.full_name().to_string());
+            filter.owner_l2_name = Some(self.sender().full_name().to_string());
         }
         self.list(filter).await
     }
@@ -946,16 +1007,105 @@ impl<'a> TimerClient<'a> {
         timeout: Duration,
     ) -> Result<Message, TimerClientError> {
         let request = build_timer_system_request_with_target(
-            self.sender.uuid(),
+            self.sender().uuid(),
             self.timer_target.as_str(),
             verb,
             payload,
         )?;
-        let trace_id = request.routing.trace_id.clone();
-        self.sender.send(request).await?;
-        self.wait_timer_response(verb, &trace_id, timeout).await
+        match &mut self.transport {
+            #[cfg(test)]
+            TimerTransport::Legacy { sender, .. } => {
+                let trace_id = request.routing.trace_id.clone();
+                sender.send(request).await?;
+                self.wait_timer_response(verb, &trace_id, timeout).await
+            }
+            TimerTransport::Dispatcher { dispatcher, .. } => {
+                // Drive the whole send+await round-trip through the
+                // dispatcher's `send_with_matcher` so timer responses are
+                // multiplexed by `trace_id` against any other concurrent
+                // traffic on the same router connection.
+                Self::dispatch_with_matcher(
+                    dispatcher.clone(),
+                    request,
+                    verb,
+                    self.timer_target.clone(),
+                    timeout,
+                )
+                .await
+            }
+        }
     }
 
+    async fn dispatch_with_matcher(
+        dispatcher: std::sync::Arc<crate::rpc::RouterDispatcher>,
+        request: Message,
+        verb: &str,
+        timer_target: String,
+        timeout: Duration,
+    ) -> Result<Message, TimerClientError> {
+        let timeout = default_rpc_timeout(timeout);
+        let trace_id = request.routing.trace_id.clone();
+        let matcher = crate::rpc::PendingMatcher::new(
+            vec![crate::rpc::RouteMatch::exact(
+                SYSTEM_KIND,
+                MSG_TIMER_RESPONSE,
+            )],
+            vec![
+                crate::rpc::RouteMatch::exact(SYSTEM_KIND, MSG_UNREACHABLE),
+                crate::rpc::RouteMatch::exact(SYSTEM_KIND, MSG_TTL_EXCEEDED),
+            ],
+            // Other SYSTEM messages on the same trace_id are unexpected
+            // but should not loop forever; let the dispatcher classify
+            // them as InvalidResponse and surface the error.
+            vec![crate::rpc::RouteMatch::any_msg_type(SYSTEM_KIND)],
+        );
+        let labels =
+            crate::rpc::RpcRequestLabels::new(timer_target.as_str(), verb, MSG_TIMER_RESPONSE);
+        match dispatcher
+            .send_with_matcher(request, matcher, labels, timeout)
+            .await
+        {
+            Ok(msg) => {
+                if let Some(err) = map_timer_transport_message(&msg) {
+                    return Err(err);
+                }
+                Ok(msg)
+            }
+            Err(crate::rpc::RpcError::Timeout { .. }) => Err(TimerClientError::Timeout {
+                response_msg: MSG_TIMER_RESPONSE.to_string(),
+                trace_id,
+                target: timer_target,
+                verb: verb.to_string(),
+                timeout_ms: timeout.as_millis() as u64,
+            }),
+            Err(crate::rpc::RpcError::Unreachable {
+                reason,
+                original_dst,
+            }) => Err(TimerClientError::ServiceError {
+                verb: verb.to_string(),
+                code: "TIMER_UNREACHABLE".to_string(),
+                message: format!("router unreachable reason={reason} original_dst={original_dst}"),
+            }),
+            Err(crate::rpc::RpcError::TtlExceeded {
+                original_dst,
+                last_hop,
+            }) => Err(TimerClientError::ServiceError {
+                verb: verb.to_string(),
+                code: "TIMER_TTL_EXCEEDED".to_string(),
+                message: format!(
+                    "router ttl exceeded original_dst={original_dst} last_hop={last_hop}"
+                ),
+            }),
+            Err(crate::rpc::RpcError::Node(node)) => Err(TimerClientError::Node(node)),
+            Err(other) => Err(TimerClientError::ServiceError {
+                verb: verb.to_string(),
+                code: "TIMER_RPC_ERROR".to_string(),
+                message: other.to_string(),
+            }),
+        }
+    }
+
+    #[cfg(test)]
     async fn wait_timer_response(
         &mut self,
         verb: &str,
@@ -964,6 +1114,12 @@ impl<'a> TimerClient<'a> {
     ) -> Result<Message, TimerClientError> {
         let timeout = default_rpc_timeout(timeout);
         let deadline = TokioInstant::now() + timeout;
+        let receiver = match &mut self.transport {
+            TimerTransport::Legacy { receiver, .. } => receiver,
+            TimerTransport::Dispatcher { .. } => unreachable!(
+                "dispatcher backend short-circuits in request_once and never reaches wait_timer_response"
+            ),
+        };
         loop {
             let now = TokioInstant::now();
             if now >= deadline {
@@ -976,7 +1132,7 @@ impl<'a> TimerClient<'a> {
                 });
             }
             let remaining = deadline - now;
-            let incoming = match self.receiver.recv_timeout(remaining).await {
+            let incoming = match receiver.recv_timeout(remaining).await {
                 Ok(message) => message,
                 Err(NodeError::Timeout) => {
                     return Err(TimerClientError::Timeout {
@@ -1002,8 +1158,10 @@ impl<'a> TimerClient<'a> {
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 impl TimerTestHarness {
-    pub fn new(full_name: &str) -> (NodeSender, NodeReceiver, Self) {
+    pub(crate) fn new(full_name: &str) -> (NodeSender, NodeReceiver, Self) {
         let (outbound_tx, outbound_rx) = mpsc::channel(16);
         let (inbound_tx, inbound_rx) = mpsc::channel(16);
         let state = Arc::new(ConnectionState::new_connected());

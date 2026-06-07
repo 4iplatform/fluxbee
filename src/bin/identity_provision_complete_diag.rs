@@ -4,8 +4,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
 use fluxbee_sdk::rpc::{
-    OperationalRouteProfile, RouteMatch, RouteTarget, RpcClient, RpcCommandReceiver, RpcError,
-    SystemRpcRequest,
+    OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, RpcCommandReceiver,
+    RpcError, SystemRpcRequest,
 };
 use fluxbee_sdk::{NodeConfig, NodeSender};
 use serde::Deserialize;
@@ -94,7 +94,7 @@ fn src_ilk_from_message(msg: &Message) -> Option<String> {
 }
 
 async fn system_call_with_fallback(
-    client: &RpcClient,
+    client: &RouterDispatcher,
     target: &str,
     fallback_target: Option<&str>,
     action: &str,
@@ -113,11 +113,11 @@ async fn system_call_with_fallback(
 }
 
 /// Replicates the SDK `identity_system_call` fallback semantics over the new
-/// `RpcClient::send_system_rpc`. Retries on transport `UNREACHABLE` with
+/// `RouterDispatcher::send_system_rpc`. Retries on transport `UNREACHABLE` with
 /// `reason=NODE_NOT_FOUND` or on payload `status=error, error_code=NOT_PRIMARY`,
 /// against `fallback_target` when supplied and distinct.
 async fn identity_call_with_fallback(
-    client: &RpcClient,
+    client: &RouterDispatcher,
     target: &str,
     fallback_target: Option<&str>,
     action: &str,
@@ -382,7 +382,8 @@ async fn main() -> Result<(), DiagError> {
     };
     let io_profile = OperationalRouteProfile::builder().build()?;
     let io_client =
-        RpcClient::connect_with_retry(io_cfg, Duration::from_millis(100), io_profile).await?;
+        RouterDispatcher::connect_with_retry(io_cfg, Duration::from_millis(100), io_profile)
+            .await?;
     let io_sender = io_client.sender_snapshot();
 
     let frontdesk_cfg = NodeConfig {
@@ -404,9 +405,12 @@ async fn main() -> Result<(), DiagError> {
             RouteTarget::Command("user_probe"),
         )
         .build()?;
-    let frontdesk_client =
-        RpcClient::connect_with_retry(frontdesk_cfg, Duration::from_millis(100), frontdesk_profile)
-            .await?;
+    let frontdesk_client = RouterDispatcher::connect_with_retry(
+        frontdesk_cfg,
+        Duration::from_millis(100),
+        frontdesk_profile,
+    )
+    .await?;
     let mut frontdesk_receiver = frontdesk_client.take_command_receiver("user_probe").await?;
 
     let (tenant_create, mut effective_target) = system_call_with_fallback(

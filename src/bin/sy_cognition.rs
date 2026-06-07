@@ -22,9 +22,10 @@ use fluxbee_sdk::protocol::{
     VaultSecretInterest, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    build_node_config_response_message, connect, managed_node_config_path,
-    managed_node_instance_dir, managed_node_name, try_handle_default_node_status, NodeConfig,
-    NodeReceiver, NodeSender, NodeUuidMode, NODE_CONFIG_APPLY_MODE_REPLACE,
+    build_node_config_response_message, managed_node_config_path, managed_node_instance_dir,
+    managed_node_name, try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode,
+    OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, VaultCallerOwned,
+    VaultClient, NODE_CONFIG_APPLY_MODE_REPLACE,
 };
 use fluxbee_sdk::{
     CognitionContextData, CognitionCooccurrenceData, CognitionDurableEntity,
@@ -249,6 +250,7 @@ struct CognitionAppState {
     nats_subscribe_errors: Arc<AtomicU64>,
     thread_states: Arc<Mutex<HashMap<String, ThreadCognitionState>>>,
     memory_region: Arc<Mutex<Option<MemoryRegionWriter>>>,
+    vault: VaultClient,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -502,6 +504,28 @@ async fn main() -> Result<(), CognitionError> {
     )?));
     let runtime_state = Arc::new(Mutex::new(CognitionRuntimeState::default()));
     let nats_subscribe_errors = Arc::new(AtomicU64::new(0));
+
+    let node_config = NodeConfig {
+        name: node_base_name,
+        router_socket: json_router::paths::router_socket_dir(),
+        uuid_persistence_dir: json_router::paths::state_dir().join("nodes"),
+        uuid_mode: NodeUuidMode::Persistent,
+        config_dir: config_dir.clone(),
+        version: COGNITION_NODE_VERSION.to_string(),
+    };
+    let profile = build_cognition_rpc_profile()
+        .map_err(|err| format!("sy.cognition rpc profile invalid: {err}"))?;
+    let dispatcher =
+        RouterDispatcher::connect_with_retry(node_config, Duration::from_secs(1), profile).await?;
+    let sender = dispatcher.sender_snapshot();
+    tracing::info!(node_name = %sender.full_name(), "sy.cognition connected to router");
+
+    let vault_client = VaultClient::new(
+        dispatcher.clone(),
+        hive.hive_id.clone(),
+        VaultCallerOwned::new(self_ilk_id.clone(), node_name.clone()),
+    );
+
     let app_state = Arc::new(CognitionAppState {
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),
@@ -516,19 +540,8 @@ async fn main() -> Result<(), CognitionError> {
         nats_subscribe_errors: Arc::clone(&nats_subscribe_errors),
         thread_states: Arc::new(Mutex::new(HashMap::new())),
         memory_region: Arc::new(Mutex::new(None)),
+        vault: vault_client,
     });
-
-    let node_config = NodeConfig {
-        name: node_base_name,
-        router_socket: json_router::paths::router_socket_dir(),
-        uuid_persistence_dir: json_router::paths::state_dir().join("nodes"),
-        uuid_mode: NodeUuidMode::Persistent,
-        config_dir: config_dir.clone(),
-        version: COGNITION_NODE_VERSION.to_string(),
-    };
-    let (mut sender, mut receiver) =
-        connect_with_retry(&node_config, Duration::from_secs(1)).await?;
-    tracing::info!(node_name = %sender.full_name(), "sy.cognition connected to router");
 
     if let Ok(owner_uuid) = Uuid::parse_str(sender.uuid()) {
         let shm_name = memory_shm_name_for_hive(&hive.hive_id)?;
@@ -566,6 +579,10 @@ async fn main() -> Result<(), CognitionError> {
     );
 
     let mut heartbeat = time::interval(Duration::from_secs(5));
+    let mut system_rx = dispatcher
+        .take_command_receiver(RPC_CH_SYSTEM)
+        .await
+        .map_err(|err| format!("sy.cognition system receiver: {err}"))?;
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
@@ -580,14 +597,12 @@ async fn main() -> Result<(), CognitionError> {
                     "sy.cognition heartbeat"
                 );
             }
-            received = receiver.recv() => {
-                let msg = match received {
-                    Ok(msg) => msg,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "sy.cognition connection interrupted; reconnect handled internally");
-                        continue;
-                    }
+            maybe_msg = system_rx.recv() => {
+                let Some(msg) = maybe_msg else {
+                    tracing::warn!("sy.cognition system channel closed; exiting main loop");
+                    return Ok(());
                 };
+                let sender = dispatcher.sender_snapshot();
                 if let Err(err) = process_router_message(
                     &sender,
                     &msg,
@@ -1577,47 +1592,23 @@ async fn resolve_cognition_openai_api_key(app_state: &CognitionAppState) -> Opti
     resolve_cognition_resource(app_state, fluxbee_sdk::ResourceType::Openai, "api_key").await
 }
 
-/// Generic helper: connect an ephemeral SDK client, discover the named
-/// resource via `resolve_resource` (Model D' pool match), and extract a
-/// plaintext string from the response (accepts a bare string or
-/// `{"<field>": "..."}`).
+/// Discover the named resource via the shared `VaultClient` (Model D' pool
+/// match) and extract a plaintext string from the response (accepts a bare
+/// string or `{"<field>": "..."}`).
 async fn resolve_cognition_resource(
     app_state: &CognitionAppState,
     resource: fluxbee_sdk::ResourceType,
     nested_field: &str,
 ) -> Option<String> {
     let resource_label = resource.as_str().to_string();
-    let node_config = NodeConfig {
-        name: COGNITION_NODE_BASE_NAME.to_string(),
-        router_socket: app_state.socket_dir.clone(),
-        uuid_persistence_dir: app_state.state_dir.join("nodes"),
-        uuid_mode: NodeUuidMode::Ephemeral,
-        config_dir: app_state.config_dir.clone(),
-        version: COGNITION_NODE_VERSION.to_string(),
-    };
-    let (sender, mut receiver) = match fluxbee_sdk::connect(&node_config).await {
-        Ok(pair) => pair,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                resource = %resource_label,
-                "sy.cognition vault lookup: ephemeral router connect failed"
-            );
-            return None;
-        }
-    };
-    let caller = fluxbee_sdk::VaultCaller::new(&app_state.self_ilk_id, &app_state.node_name);
-    let result = fluxbee_sdk::resolve_resource(
-        &sender,
-        &mut receiver,
-        caller,
-        &app_state.hive_id,
-        resource,
-        fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
-        Duration::from_secs(5),
-    )
-    .await;
-    let _ = sender.close().await;
+    let result = app_state
+        .vault
+        .resolve_resource(
+            resource,
+            fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+            Duration::from_secs(5),
+        )
+        .await;
     match result {
         Ok(Some(value)) => {
             if let Some(s) = value.as_str().map(str::trim).filter(|v| !v.is_empty()) {
@@ -4258,19 +4249,16 @@ fn load_hive(config_dir: &Path) -> Result<HiveFile, CognitionError> {
     Ok(serde_yaml::from_str(&raw)?)
 }
 
-async fn connect_with_retry(
-    config: &NodeConfig,
-    delay: Duration,
-) -> Result<(NodeSender, NodeReceiver), fluxbee_sdk::NodeError> {
-    loop {
-        match connect(config).await {
-            Ok(result) => return Ok(result),
-            Err(err) => {
-                tracing::warn!(error = %err, "sy.cognition router connect failed; retrying");
-                time::sleep(delay).await;
-            }
-        }
-    }
+const RPC_CH_SYSTEM: &str = "system";
+
+fn build_cognition_rpc_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::RpcError> {
+    OperationalRouteProfile::builder()
+        .command_channel(RPC_CH_SYSTEM)
+        .post_pending_rule(
+            RouteMatch::any_msg_type(SYSTEM_KIND),
+            RouteTarget::Command(RPC_CH_SYSTEM),
+        )
+        .build()
 }
 
 fn ensure_l2_name(name: &str, hive_id: &str) -> String {

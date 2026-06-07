@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,115 +9,11 @@ use fluxbee_sdk::protocol::{
     SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    stable_ich_id, NodeError, NodeReceiver, NodeSender, MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION,
-    MSG_ILK_PROVISION_RESPONSE,
+    stable_ich_id, PendingMatcher, RouteMatch, RouterDispatcher, RpcError, RpcRequestLabels,
+    MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION, MSG_ILK_PROVISION_RESPONSE,
 };
-use tokio::sync::Mutex;
-use tokio::time::Instant;
-use uuid::Uuid;
 
 use crate::identity::{IdentityError, IdentityProvisioner, ResolveOrCreateInput};
-
-pub struct RouterInbox {
-    receiver: NodeReceiver,
-    backlog: VecDeque<WireMessage>,
-}
-
-impl RouterInbox {
-    pub fn new(receiver: NodeReceiver) -> Self {
-        Self {
-            receiver,
-            backlog: VecDeque::new(),
-        }
-    }
-
-    pub async fn recv_next_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> anyhow::Result<Option<WireMessage>> {
-        if let Some(msg) = self.backlog.pop_front() {
-            return Ok(Some(msg));
-        }
-        match self.receiver.recv_timeout(timeout).await {
-            Ok(msg) => Ok(Some(msg)),
-            Err(NodeError::Timeout) => Ok(None),
-            Err(err) => Err(err.into()),
-        }
-    }
-
-    pub async fn recv_for_trace_id(
-        &mut self,
-        trace_id: &str,
-        timeout: Duration,
-    ) -> Result<WireMessage, IdentityError> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                tracing::warn!(
-                    %trace_id,
-                    timeout_ms = timeout.as_millis() as u64,
-                    backlog_len = self.backlog.len(),
-                    "router inbox timed out waiting for trace_id"
-                );
-                return Err(IdentityError::Timeout);
-            }
-            if let Some(idx) = self
-                .backlog
-                .iter()
-                .position(|msg| msg.routing.trace_id == trace_id)
-            {
-                tracing::debug!(
-                    %trace_id,
-                    backlog_len = self.backlog.len(),
-                    "router inbox matched trace_id from backlog"
-                );
-                return Ok(self.backlog.remove(idx).expect("backlog idx"));
-            }
-            let remaining = deadline.saturating_duration_since(now);
-            match self.receiver.recv_timeout(remaining).await {
-                Ok(msg) => {
-                    let incoming_trace_id = msg.routing.trace_id.clone();
-                    let incoming_msg = msg.meta.msg.clone();
-                    if msg.routing.trace_id == trace_id {
-                        tracing::debug!(
-                            %trace_id,
-                            msg = %incoming_msg.as_deref().unwrap_or(""),
-                            "router inbox matched trace_id from receiver"
-                        );
-                        return Ok(msg);
-                    }
-                    tracing::debug!(
-                        %trace_id,
-                        incoming_trace_id = %incoming_trace_id,
-                        msg = %incoming_msg.as_deref().unwrap_or(""),
-                        backlog_len = self.backlog.len(),
-                        "router inbox received different trace_id while waiting; moved to backlog"
-                    );
-                    self.backlog.push_back(msg);
-                }
-                Err(NodeError::Timeout) => {
-                    tracing::warn!(
-                        %trace_id,
-                        timeout_ms = timeout.as_millis() as u64,
-                        backlog_len = self.backlog.len(),
-                        "router receiver timed out while waiting for trace_id"
-                    );
-                    return Err(IdentityError::Timeout);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        %trace_id,
-                        error = %err,
-                        backlog_len = self.backlog.len(),
-                        "router receiver failed while waiting for trace_id"
-                    );
-                    return Err(IdentityError::Unavailable);
-                }
-            }
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct IdentityProvisionConfig {
@@ -135,23 +30,16 @@ impl Default for IdentityProvisionConfig {
     }
 }
 
+/// Identity provisioner backed by the canonical `RouterDispatcher`. Replaces
+/// the previous `RouterInbox`-based plumbing.
 pub struct FluxbeeIdentityProvisioner {
-    sender: NodeSender,
-    inbox: Arc<Mutex<RouterInbox>>,
+    dispatcher: Arc<RouterDispatcher>,
     config: IdentityProvisionConfig,
 }
 
 impl FluxbeeIdentityProvisioner {
-    pub fn new(
-        sender: NodeSender,
-        inbox: Arc<Mutex<RouterInbox>>,
-        config: IdentityProvisionConfig,
-    ) -> Self {
-        Self {
-            sender,
-            inbox,
-            config,
-        }
+    pub fn new(dispatcher: Arc<RouterDispatcher>, config: IdentityProvisionConfig) -> Self {
+        Self { dispatcher, config }
     }
 
     async fn call_provision_target(
@@ -159,27 +47,18 @@ impl FluxbeeIdentityProvisioner {
         target: &str,
         input: &ResolveOrCreateInput,
     ) -> Result<String, IdentityError> {
-        strict_provision_ilk(
-            &self.sender,
-            self.inbox.clone(),
-            &self.config,
-            target,
-            input,
-        )
-        .await
+        strict_provision_ilk(&self.dispatcher, &self.config, target, input).await
     }
 }
 
 pub async fn strict_provision_ilk(
-    sender: &NodeSender,
-    inbox: Arc<Mutex<RouterInbox>>,
+    dispatcher: &Arc<RouterDispatcher>,
     config: &IdentityProvisionConfig,
     target: &str,
     input: &ResolveOrCreateInput,
 ) -> Result<String, IdentityError> {
     let normalized_channel = normalize_identity_field(&input.channel, true);
     let normalized_address = normalize_identity_field(&input.external_id, true);
-    let trace_id = Uuid::new_v4().to_string();
     let ich_id = stable_ich_id(
         &normalized_channel,
         &normalized_address,
@@ -207,41 +86,32 @@ pub async fn strict_provision_ilk(
     {
         payload["ilk_type"] = serde_json::json!(ilk_type);
     }
+    let sender = dispatcher.sender_snapshot();
     let req = WireMessage {
         routing: Routing {
-            src: sender.uuid().to_string(),
+            src: String::new(),
             src_l2_name: Some(sender.full_name().to_string()),
             dst: Destination::Unicast(target.to_string()),
             ttl: 16,
-            trace_id: trace_id.clone(),
+            trace_id: String::new(),
         },
         meta: Meta {
             msg_type: SYSTEM_KIND.to_string(),
             msg: Some(MSG_ILK_PROVISION.to_string()),
-            src_ilk: None,
-            scope: None,
-            target: None,
-            action: None,
-            priority: None,
-            context: None,
             ..Meta::default()
         },
         payload,
     };
-    let mut inbox = inbox.lock().await;
-    sender.send(req).await.map_err(|_| IdentityError::Unavailable)?;
+    let matcher = system_request_matcher(MSG_ILK_PROVISION_RESPONSE);
+    let labels = RpcRequestLabels::new(target, MSG_ILK_PROVISION, MSG_ILK_PROVISION_RESPONSE);
+    let msg = dispatcher
+        .send_with_matcher(req, matcher, labels, config.timeout)
+        .await
+        .map_err(map_rpc_err)?;
     tracing::debug!(
-        trace_id = %trace_id,
         target = %target,
         channel = %normalized_channel,
         address = %normalized_address,
-        "identity provision request sent"
-    );
-
-    let msg = inbox.recv_for_trace_id(&trace_id, config.timeout).await?;
-    tracing::debug!(
-        trace_id = %trace_id,
-        target = %target,
         response_msg = %msg.meta.msg.as_deref().unwrap_or(""),
         "identity provision response matched"
     );
@@ -257,8 +127,7 @@ pub struct EnsureOwnIchResult {
 }
 
 pub async fn ensure_own_ich(
-    sender: &NodeSender,
-    inbox: Arc<Mutex<RouterInbox>>,
+    dispatcher: &Arc<RouterDispatcher>,
     config: &IdentityProvisionConfig,
     target: &str,
     self_ilk_id: &str,
@@ -285,24 +154,18 @@ pub async fn ensure_own_ich(
         normalized_self_tenant_id,
     )
     .map_err(|err| IdentityError::Other(format!("invalid own ICH seed: {err}")))?;
-    let trace_id = Uuid::new_v4().to_string();
+    let sender = dispatcher.sender_snapshot();
     let req = WireMessage {
         routing: Routing {
-            src: sender.uuid().to_string(),
+            src: String::new(),
             src_l2_name: Some(sender.full_name().to_string()),
             dst: Destination::Unicast(target.to_string()),
             ttl: 16,
-            trace_id: trace_id.clone(),
+            trace_id: String::new(),
         },
         meta: Meta {
             msg_type: SYSTEM_KIND.to_string(),
             msg: Some(MSG_ILK_ADD_CHANNEL.to_string()),
-            src_ilk: None,
-            scope: None,
-            target: None,
-            action: None,
-            priority: None,
-            context: None,
             ..Meta::default()
         },
         payload: serde_json::json!({
@@ -314,9 +177,12 @@ pub async fn ensure_own_ich(
             }
         }),
     };
-    let mut inbox = inbox.lock().await;
-    sender.send(req).await.map_err(|_| IdentityError::Unavailable)?;
-    let msg = inbox.recv_for_trace_id(&trace_id, config.timeout).await?;
+    let matcher = system_request_matcher("ILK_ADD_CHANNEL_RESPONSE");
+    let labels = RpcRequestLabels::new(target, MSG_ILK_ADD_CHANNEL, "ILK_ADD_CHANNEL_RESPONSE");
+    let msg = dispatcher
+        .send_with_matcher(req, matcher, labels, config.timeout)
+        .await
+        .map_err(map_rpc_err)?;
     if msg.meta.msg.as_deref() != Some("ILK_ADD_CHANNEL_RESPONSE") {
         if msg.meta.msg.as_deref() == Some(MSG_UNREACHABLE)
             || msg.meta.msg.as_deref() == Some(MSG_TTL_EXCEEDED)
@@ -397,6 +263,25 @@ impl IdentityProvisioner for FluxbeeIdentityProvisioner {
                 Ok(None)
             }
         }
+    }
+}
+
+fn system_request_matcher(response_msg: &str) -> PendingMatcher {
+    PendingMatcher::new(
+        vec![RouteMatch::exact(SYSTEM_KIND, response_msg)],
+        vec![
+            RouteMatch::exact(SYSTEM_KIND, MSG_UNREACHABLE),
+            RouteMatch::exact(SYSTEM_KIND, MSG_TTL_EXCEEDED),
+        ],
+        vec![RouteMatch::any_msg_type(SYSTEM_KIND)],
+    )
+}
+
+fn map_rpc_err(err: RpcError) -> IdentityError {
+    match err {
+        RpcError::Timeout { .. } => IdentityError::Timeout,
+        RpcError::Disconnected | RpcError::Node(_) => IdentityError::Unavailable,
+        other => IdentityError::Other(other.to_string()),
     }
 }
 

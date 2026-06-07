@@ -8,7 +8,7 @@ import (
 )
 
 func TestNewTimerClientDerivesLocalTimerNodeName(t *testing.T) {
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 1), state: &connectionState{connected: true}},
 		&NodeReceiver{rx: make(chan receivedMessage, 1), state: &connectionState{connected: true}},
 		TimerClientConfig{},
@@ -22,7 +22,7 @@ func TestNewTimerClientDerivesLocalTimerNodeName(t *testing.T) {
 }
 
 func TestNewTimerClientNormalizesInvalidRetrySchedule(t *testing.T) {
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 1), state: &connectionState{connected: true}},
 		&NodeReceiver{rx: make(chan receivedMessage, 1), state: &connectionState{connected: true}},
 		TimerClientConfig{TimeRetrySchedule: []time.Duration{0, -time.Second}},
@@ -43,7 +43,7 @@ func TestNewTimerClientNormalizesInvalidRetrySchedule(t *testing.T) {
 func TestTimerClientNowUsesTimerResponse(t *testing.T) {
 	tx := make(chan []byte, 1)
 	rx := make(chan receivedMessage, 1)
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
 		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
 		TimerClientConfig{TimeRetrySchedule: []time.Duration{time.Millisecond}},
@@ -97,7 +97,7 @@ func TestTimerClientNowUsesTimerResponse(t *testing.T) {
 func TestTimerClientConvertUsesTimerResponse(t *testing.T) {
 	tx := make(chan []byte, 1)
 	rx := make(chan receivedMessage, 1)
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
 		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
 		TimerClientConfig{TimeRetrySchedule: []time.Duration{time.Millisecond}},
@@ -153,7 +153,7 @@ func TestTimerClientConvertUsesTimerResponse(t *testing.T) {
 func TestTimerClientParseUsesTimerResponse(t *testing.T) {
 	tx := make(chan []byte, 1)
 	rx := make(chan receivedMessage, 1)
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
 		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
 		TimerClientConfig{TimeRetrySchedule: []time.Duration{time.Millisecond}},
@@ -207,7 +207,7 @@ func TestTimerClientParseUsesTimerResponse(t *testing.T) {
 func TestTimerClientFormatUsesTimerResponse(t *testing.T) {
 	tx := make(chan []byte, 1)
 	rx := make(chan receivedMessage, 1)
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
 		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
 		TimerClientConfig{TimeRetrySchedule: []time.Duration{time.Millisecond}},
@@ -260,7 +260,7 @@ func TestTimerClientFormatUsesTimerResponse(t *testing.T) {
 func TestTimerClientHelpUsesTimerResponse(t *testing.T) {
 	tx := make(chan []byte, 1)
 	rx := make(chan receivedMessage, 1)
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
 		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
 		TimerClientConfig{},
@@ -311,7 +311,7 @@ func TestTimerClientHelpUsesTimerResponse(t *testing.T) {
 }
 
 func TestTimerClientNowReturnsTypedUnreachableErrorAfterRetries(t *testing.T) {
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 4), state: &connectionState{connected: true}},
 		&NodeReceiver{rx: make(chan receivedMessage), state: &connectionState{connected: true}},
 		TimerClientConfig{TimeRetrySchedule: []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}},
@@ -334,7 +334,7 @@ func TestTimerClientNowReturnsTypedUnreachableErrorAfterRetries(t *testing.T) {
 }
 
 func TestTimerClientNowInRejectsEmptyTimezone(t *testing.T) {
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 1), state: &connectionState{connected: true}},
 		&NodeReceiver{rx: make(chan receivedMessage, 1), state: &connectionState{connected: true}},
 		TimerClientConfig{},
@@ -373,7 +373,7 @@ func TestParseFiredEventParsesPayload(t *testing.T) {
 }
 
 func TestScheduleInRejectsBelowMinimumClientSide(t *testing.T) {
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 1), state: &connectionState{connected: true}},
 		&NodeReceiver{rx: make(chan receivedMessage, 1), state: &connectionState{connected: true}},
 		TimerClientConfig{},
@@ -392,7 +392,7 @@ func TestScheduleInRejectsBelowMinimumClientSide(t *testing.T) {
 }
 
 func TestScheduleRejectsMissedWithinWithoutFireIfWithin(t *testing.T) {
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 1), state: &connectionState{connected: true}},
 		&NodeReceiver{rx: make(chan receivedMessage, 1), state: &connectionState{connected: true}},
 		TimerClientConfig{},
@@ -411,7 +411,7 @@ func TestScheduleRejectsMissedWithinWithoutFireIfWithin(t *testing.T) {
 }
 
 func TestScheduleRecurringRejectsInvalidCronShape(t *testing.T) {
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 1), state: &connectionState{connected: true}},
 		&NodeReceiver{rx: make(chan receivedMessage, 1), state: &connectionState{connected: true}},
 		TimerClientConfig{},
@@ -428,7 +428,7 @@ func TestScheduleRecurringRejectsInvalidCronShape(t *testing.T) {
 func TestScheduleUsesTimerResponseTimerUUID(t *testing.T) {
 	tx := make(chan []byte, 1)
 	rx := make(chan receivedMessage, 1)
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
 		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
 		TimerClientConfig{},
@@ -479,7 +479,7 @@ func TestScheduleUsesTimerResponseTimerUUID(t *testing.T) {
 func TestScheduleRecurringUsesTimerResponseTimerUUID(t *testing.T) {
 	tx := make(chan []byte, 1)
 	rx := make(chan receivedMessage, 1)
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
 		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
 		TimerClientConfig{},
@@ -530,7 +530,7 @@ func TestScheduleRecurringUsesTimerResponseTimerUUID(t *testing.T) {
 func TestCancelReturnsNilOnSuccessfulTimerResponse(t *testing.T) {
 	tx := make(chan []byte, 1)
 	rx := make(chan receivedMessage, 1)
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
 		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
 		TimerClientConfig{},
@@ -577,7 +577,7 @@ func TestCancelReturnsNilOnSuccessfulTimerResponse(t *testing.T) {
 func TestCancelByClientRefUsesClientRefPayload(t *testing.T) {
 	tx := make(chan []byte, 1)
 	rx := make(chan receivedMessage, 1)
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
 		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
 		TimerClientConfig{},
@@ -630,7 +630,7 @@ func TestCancelByClientRefUsesClientRefPayload(t *testing.T) {
 }
 
 func TestCancelRejectsEmptyTimerID(t *testing.T) {
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 1), state: &connectionState{connected: true}},
 		&NodeReceiver{rx: make(chan receivedMessage, 1), state: &connectionState{connected: true}},
 		TimerClientConfig{},
@@ -646,7 +646,7 @@ func TestCancelRejectsEmptyTimerID(t *testing.T) {
 func TestRescheduleReturnsNilOnSuccessfulTimerResponse(t *testing.T) {
 	tx := make(chan []byte, 1)
 	rx := make(chan receivedMessage, 1)
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
 		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
 		TimerClientConfig{},
@@ -693,7 +693,7 @@ func TestRescheduleReturnsNilOnSuccessfulTimerResponse(t *testing.T) {
 func TestRescheduleByClientRefUsesClientRefPayload(t *testing.T) {
 	tx := make(chan []byte, 1)
 	rx := make(chan receivedMessage, 1)
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
 		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
 		TimerClientConfig{},
@@ -748,7 +748,7 @@ func TestRescheduleByClientRefUsesClientRefPayload(t *testing.T) {
 }
 
 func TestListRejectsInvalidFilters(t *testing.T) {
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 1), state: &connectionState{connected: true}},
 		&NodeReceiver{rx: make(chan receivedMessage, 1), state: &connectionState{connected: true}},
 		TimerClientConfig{},
@@ -765,7 +765,7 @@ func TestListRejectsInvalidFilters(t *testing.T) {
 }
 
 func TestTimeFormattingOpsRejectEmptyFields(t *testing.T) {
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: make(chan []byte, 1), state: &connectionState{connected: true}},
 		&NodeReceiver{rx: make(chan receivedMessage, 1), state: &connectionState{connected: true}},
 		TimerClientConfig{},
@@ -787,7 +787,7 @@ func TestTimeFormattingOpsRejectEmptyFields(t *testing.T) {
 func TestGetParsesTimerInfo(t *testing.T) {
 	tx := make(chan []byte, 1)
 	rx := make(chan receivedMessage, 1)
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
 		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
 		TimerClientConfig{},
@@ -845,7 +845,7 @@ func TestGetParsesTimerInfo(t *testing.T) {
 func TestGetByClientRefUsesClientRefPayload(t *testing.T) {
 	tx := make(chan []byte, 1)
 	rx := make(chan receivedMessage, 1)
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
 		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
 		TimerClientConfig{},
@@ -911,7 +911,7 @@ func TestGetByClientRefUsesClientRefPayload(t *testing.T) {
 func TestListMineParsesTimers(t *testing.T) {
 	tx := make(chan []byte, 1)
 	rx := make(chan receivedMessage, 1)
-	client, err := NewTimerClient(
+	client, err := newTestTimerClientWithChannels(
 		&NodeSender{uuid: "src-1", fullName: "WF.demo@motherbee", tx: tx, state: &connectionState{connected: true}},
 		&NodeReceiver{rx: rx, state: &connectionState{connected: true}},
 		TimerClientConfig{},
@@ -965,4 +965,83 @@ func TestListMineParsesTimers(t *testing.T) {
 	if len(items) != 1 || items[0].UUID != "timer-1" {
 		t.Fatalf("unexpected timers: %+v", items)
 	}
+}
+
+func TestTimerClientNowUsesDispatcherBackend(t *testing.T) {
+	dispatcher, tx, rx := newTimerClientTestDispatcher("WF.demo@motherbee")
+	defer func() { _ = dispatcher.Close() }()
+	client, err := NewTimerClient(dispatcher, TimerClientConfig{
+		TimeRetrySchedule: []time.Duration{time.Second},
+	})
+	if err != nil {
+		t.Fatalf("new timer client: %v", err)
+	}
+
+	go func() {
+		frame := <-tx
+		var request Message
+		if err := json.Unmarshal(frame, &request); err != nil {
+			t.Errorf("unmarshal request: %v", err)
+			return
+		}
+		if stringValue(request.Meta.Msg) != "TIMER_NOW" {
+			t.Errorf("unexpected request verb: %q", stringValue(request.Meta.Msg))
+			return
+		}
+		response, err := BuildSystemResponse(
+			&request,
+			"timer-uuid",
+			MsgTimerResponse,
+			map[string]any{
+				"ok":          true,
+				"verb":        "TIMER_NOW",
+				"now_utc_ms":  int64(1775577600000),
+				"now_utc_iso": "2026-04-07T00:00:00Z",
+			},
+			SystemEnvelopeOptions{},
+		)
+		if err != nil {
+			t.Errorf("build response: %v", err)
+			return
+		}
+		rx <- receivedMessage{msg: response}
+	}()
+
+	out, err := client.Now(context.Background())
+	if err != nil {
+		t.Fatalf("now: %v", err)
+	}
+	if out.NowUTCMS != 1775577600000 {
+		t.Fatalf("unexpected now result: %+v", out)
+	}
+}
+
+func newTimerClientTestDispatcher(fullName string) (*RouterDispatcher, chan []byte, chan receivedMessage) {
+	state := &connectionState{connected: true}
+	tx := make(chan []byte, 8)
+	rx := make(chan receivedMessage, 8)
+	sender := &NodeSender{uuid: "src-1", fullName: fullName, tx: tx, state: state}
+	receiver := &NodeReceiver{uuid: "src-1", fullName: fullName, rx: rx, state: state}
+	dispatcher := newRouterDispatcherTestHarness(sender, receiver)
+	return dispatcher, tx, rx
+}
+
+func newTestTimerClientWithChannels(sender *NodeSender, receiver *NodeReceiver, cfg TimerClientConfig) (*TimerClient, error) {
+	return NewTimerClient(newRouterDispatcherTestHarness(sender, receiver), cfg)
+}
+
+func newRouterDispatcherTestHarness(sender *NodeSender, receiver *NodeReceiver) *RouterDispatcher {
+	profile, _ := NewOperationalRouteProfile().Build()
+	dispatcher := &RouterDispatcher{
+		sender:     sender,
+		receiver:   receiver,
+		profile:    profile,
+		pending:    make(map[string]*pendingEntry),
+		commands:   make(map[string]chan Message),
+		taken:      make(map[string]bool),
+		broadcasts: make(map[string][]chan Message),
+		done:       make(chan struct{}),
+	}
+	go dispatcher.dispatchLoop()
+	return dispatcher
 }

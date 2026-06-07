@@ -21,7 +21,10 @@ use fluxbee_sdk::identity::{
     IdentityShmError,
 };
 use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND};
-use fluxbee_sdk::{connect, try_handle_default_node_status, NodeConfig, NodeUuidMode};
+use fluxbee_sdk::{
+    try_handle_default_node_status, NodeConfig, NodeUuidMode, OperationalRouteProfile,
+    PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher, RpcRequestLabels,
+};
 use io_common::frontdesk_contract::{
     FrontdeskHandoffPayload, FrontdeskHandoffSubject, FRONTDESK_HANDOFF_PAYLOAD_TYPE,
     FRONTDESK_SCHEMA_VERSION_V1,
@@ -52,9 +55,7 @@ use io_common::io_control_plane_logging::{
 use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
 use io_common::io_control_plane_store::persist_io_control_plane_state;
 use io_common::provision::strict_provision_ilk;
-use io_common::provision::{
-    ensure_own_ich, FluxbeeIdentityProvisioner, IdentityProvisionConfig, RouterInbox,
-};
+use io_common::provision::{ensure_own_ich, FluxbeeIdentityProvisioner, IdentityProvisionConfig};
 use io_common::relay::{
     AssembledTurn, InMemoryRelayStore, RelayBuffer, RelayDecision, RelayFlushHints, RelayFragment,
 };
@@ -171,11 +172,9 @@ struct HttpState {
     adapter_contract: Arc<dyn IoAdapterConfigContract>,
     auth_registry: Arc<RwLock<ApiAuthRegistry>>,
     webhook_http: reqwest::Client,
-    sender: fluxbee_sdk::NodeSender,
+    dispatcher: Arc<RouterDispatcher>,
     identity: Arc<dyn IdentityResolver>,
     provisioner: Arc<dyn IdentityProvisioner>,
-    router_inbox: Arc<Mutex<RouterInbox>>,
-    pending_router_replies: Arc<Mutex<HashMap<String, oneshot::Sender<WireMessage>>>>,
     identity_provision_cfg: IdentityProvisionConfig,
     inbound: Arc<Mutex<InboundProcessor>>,
     relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
@@ -188,8 +187,7 @@ struct RuntimeUpdateHandles {
     node_name: String,
     inbound: Arc<Mutex<InboundProcessor>>,
     relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
-    sender: fluxbee_sdk::NodeSender,
-    router_inbox: Arc<Mutex<RouterInbox>>,
+    dispatcher: Arc<RouterDispatcher>,
     identity_provision_cfg: IdentityProvisionConfig,
     self_ilk_id: Option<String>,
     self_tenant_id: Option<String>,
@@ -304,32 +302,32 @@ async fn main() -> Result<()> {
         "io-api starting"
     );
 
-    let (sender, receiver) = connect(&NodeConfig {
+    let node_config = NodeConfig {
         name: config.node_name.clone(),
         router_socket: config.router_socket.clone(),
         uuid_persistence_dir: config.uuid_persistence_dir.clone(),
         uuid_mode: NodeUuidMode::Persistent,
         config_dir: config.config_dir.clone(),
         version: config.node_version.clone(),
-    })
-    .await?;
+    };
+    let profile = build_io_api_rpc_profile()
+        .map_err(|err| anyhow::anyhow!("io-api rpc profile invalid: {err}"))?;
+    let dispatcher =
+        RouterDispatcher::connect_with_retry(node_config, Duration::from_secs(1), profile).await?;
+    let sender = dispatcher.sender_snapshot();
 
     tracing::info!(
-        full_name = %receiver.full_name(),
-        vpn_id = %receiver.vpn_id(),
+        full_name = %sender.full_name(),
         "io-api connected to router"
     );
 
-    let inbox = Arc::new(Mutex::new(RouterInbox::new(receiver)));
-    let pending_router_replies = Arc::new(Mutex::new(HashMap::new()));
     let identity: Arc<dyn IdentityResolver> = Arc::new(ShmIdentityResolver::new(&config.island_id));
     let identity_provision_cfg = IdentityProvisionConfig {
         target: config.identity_target.clone(),
         timeout: Duration::from_millis(config.identity_timeout_ms),
     };
     let provisioner: Arc<dyn IdentityProvisioner> = Arc::new(FluxbeeIdentityProvisioner::new(
-        sender.clone(),
-        inbox.clone(),
+        dispatcher.clone(),
         identity_provision_cfg.clone(),
     ));
 
@@ -409,11 +407,9 @@ async fn main() -> Result<()> {
         adapter_contract: adapter_contract.clone(),
         auth_registry: auth_registry.clone(),
         webhook_http: reqwest::Client::new(),
-        sender: sender.clone(),
+        dispatcher: dispatcher.clone(),
         identity: identity.clone(),
         provisioner: provisioner.clone(),
-        router_inbox: inbox.clone(),
-        pending_router_replies: pending_router_replies.clone(),
         identity_provision_cfg: identity_provision_cfg.clone(),
         inbound: inbound.clone(),
         relay: relay.clone(),
@@ -425,8 +421,7 @@ async fn main() -> Result<()> {
         if let Err(err) = ensure_io_api_own_ich_registered(
             &config.node_name,
             config.api_channel_id.as_deref(),
-            &sender,
-            inbox.clone(),
+            &dispatcher,
             &identity_provision_cfg,
             self_ilk_id.as_deref(),
             self_tenant_id.as_deref(),
@@ -464,14 +459,13 @@ async fn main() -> Result<()> {
     };
     let relay_flush_task = tokio::spawn(run_relay_flush_loop(
         relay,
-        sender.clone(),
+        dispatcher.clone(),
         identity,
         provisioner,
         inbound,
     ));
     let control_task = tokio::spawn(run_router_control_loop(
-        inbox,
-        sender,
+        dispatcher,
         config.node_name.clone(),
         config.state_dir.clone(),
         control_src,
@@ -479,7 +473,6 @@ async fn main() -> Result<()> {
         control_metrics,
         adapter_contract,
         auth_registry,
-        pending_router_replies,
         http_state_ref_for_runtime_updates(config.node_name.clone(), http_state.clone()),
         http_state.clone(),
     ));
@@ -538,8 +531,7 @@ async fn try_bind_http_listener(
 }
 
 async fn run_router_control_loop(
-    inbox: Arc<Mutex<RouterInbox>>,
-    sender: fluxbee_sdk::NodeSender,
+    dispatcher: Arc<RouterDispatcher>,
     node_name: String,
     state_dir: PathBuf,
     control_src: String,
@@ -547,19 +539,19 @@ async fn run_router_control_loop(
     control_metrics: Arc<IoControlPlaneMetrics>,
     adapter_contract: Arc<dyn IoAdapterConfigContract>,
     auth_registry: Arc<RwLock<ApiAuthRegistry>>,
-    pending_router_replies: Arc<Mutex<HashMap<String, oneshot::Sender<WireMessage>>>>,
     runtime_updates: RuntimeUpdateHandles,
     http_state: Arc<HttpState>,
 ) -> Result<()> {
+    let mut incoming_rx = dispatcher
+        .take_command_receiver(RPC_CH_INCOMING)
+        .await
+        .map_err(|err| anyhow::anyhow!("io-api incoming receiver: {err}"))?;
     loop {
-        let maybe_msg = inbox
-            .lock()
-            .await
-            .recv_next_timeout(Duration::from_millis(250))
-            .await?;
-        let Some(msg) = maybe_msg else {
-            continue;
+        let Some(msg) = incoming_rx.recv().await else {
+            tracing::warn!("io-api incoming channel closed; exiting control loop");
+            return Ok(());
         };
+        let sender = dispatcher.sender_snapshot();
 
         if try_handle_default_node_status(&sender, &msg).await? {
             continue;
@@ -589,58 +581,28 @@ async fn run_router_control_loop(
             continue;
         }
 
-        if deliver_pending_router_reply(&pending_router_replies, msg.clone()).await {
-            continue;
-        }
-
         if maybe_deliver_webhook_outbound(&http_state, &msg).await {
             continue;
         }
     }
 }
 
-async fn deliver_pending_router_reply(
-    pending_router_replies: &Arc<Mutex<HashMap<String, oneshot::Sender<WireMessage>>>>,
-    msg: WireMessage,
-) -> bool {
-    let trace_id = msg.routing.trace_id.clone();
-    let msg_type = msg.meta.msg_type.clone();
-    let msg_name = msg.meta.msg.clone();
-    let maybe_waiter = pending_router_replies
-        .lock()
-        .await
-        .remove(trace_id.as_str());
-    if let Some(waiter) = maybe_waiter {
-        if waiter.send(msg).is_err() {
-            tracing::debug!(
-                trace_id = %trace_id,
-                msg_type = %msg_type,
-                msg = %msg_name.as_deref().unwrap_or(""),
-                "io-api dropped router reply because request waiter closed"
-            );
-        } else {
-            tracing::debug!(
-                trace_id = %trace_id,
-                msg_type = %msg_type,
-                msg = %msg_name.as_deref().unwrap_or(""),
-                "io-api delivered router reply to pending http request"
-            );
-        }
-        true
-    } else {
-        tracing::debug!(
-            trace_id = %trace_id,
-            msg_type = %msg_type,
-            msg = %msg_name.as_deref().unwrap_or(""),
-            "io-api ignored non-control-plane router message"
-        );
-        false
-    }
+const RPC_CH_INCOMING: &str = "incoming";
+
+fn build_io_api_rpc_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::RpcError> {
+    // Catch-all routing: every message that isn't satisfying a pending RPC
+    // (provision, ensure_own_ich, frontdesk handoff, etc.) lands in the
+    // single command channel where the control loop + webhook delivery
+    // handle it.
+    OperationalRouteProfile::builder()
+        .command_channel(RPC_CH_INCOMING)
+        .post_pending_rule(RouteMatch::Any, RouteTarget::Command(RPC_CH_INCOMING))
+        .build()
 }
 
 async fn run_relay_flush_loop(
     relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
-    sender: fluxbee_sdk::NodeSender,
+    dispatcher: Arc<RouterDispatcher>,
     identity: Arc<dyn IdentityResolver>,
     provisioner: Arc<dyn IdentityProvisioner>,
     inbound: Arc<Mutex<InboundProcessor>>,
@@ -650,8 +612,9 @@ async fn run_relay_flush_loop(
         interval.tick().await;
         let turns = relay.lock().await.flush_expired(now_epoch_ms());
         for turn in turns {
+            let sender = dispatcher.sender_snapshot();
             dispatch_assembled_turn(
-                sender.clone(),
+                sender,
                 identity.as_ref(),
                 provisioner.as_ref(),
                 inbound.clone(),
@@ -1344,8 +1307,7 @@ async fn apply_io_config_set(
         if let Err(err) = ensure_io_api_own_ich_registered(
             node_name,
             next_api_channel_id.as_deref(),
-            &runtime_updates.sender,
-            runtime_updates.router_inbox.clone(),
+            &runtime_updates.dispatcher,
             &runtime_updates.identity_provision_cfg,
             runtime_updates.self_ilk_id.as_deref(),
             runtime_updates.self_tenant_id.as_deref(),
@@ -1459,8 +1421,7 @@ fn http_state_ref_for_runtime_updates(
         node_name,
         inbound: state.inbound.clone(),
         relay: state.relay.clone(),
-        sender: state.sender.clone(),
-        router_inbox: state.router_inbox.clone(),
+        dispatcher: state.dispatcher.clone(),
         identity_provision_cfg: state.identity_provision_cfg.clone(),
         self_ilk_id: fluxbee_sdk::read_self_ilk_from_env(),
         self_tenant_id: fluxbee_sdk::read_self_tenant_from_env(),
@@ -1470,8 +1431,7 @@ fn http_state_ref_for_runtime_updates(
 async fn ensure_io_api_own_ich_registered(
     node_name: &str,
     api_channel_id: Option<&str>,
-    sender: &fluxbee_sdk::NodeSender,
-    router_inbox: Arc<Mutex<RouterInbox>>,
+    dispatcher: &Arc<RouterDispatcher>,
     identity_provision_cfg: &IdentityProvisionConfig,
     self_ilk_id: Option<&str>,
     self_tenant_id: Option<&str>,
@@ -1489,8 +1449,7 @@ async fn ensure_io_api_own_ich_registered(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("missing api_channel_id for IO.api own ICH registration"))?;
     let result = ensure_own_ich(
-        sender,
-        router_inbox,
+        dispatcher,
         identity_provision_cfg,
         identity_provision_cfg.target.as_str(),
         self_ilk_id,
@@ -1558,8 +1517,7 @@ async fn resolve_explicit_subject_for_http(
     }
 
     let src_ilk = strict_provision_ilk(
-        &state.sender,
-        state.router_inbox.clone(),
+        &state.dispatcher,
         &state.identity_provision_cfg,
         state.identity_provision_cfg.target.as_str(),
         identity_input,
@@ -1783,9 +1741,10 @@ async fn request_frontdesk_handoff_for_http(
             "Unable to build frontdesk response contract",
         )
     })?;
+    let sender_snap = state.dispatcher.sender_snapshot();
     let msg = io_common::router_message::build_user_message(
-        state.sender.uuid().to_string().as_str(),
-        Some(frontdesk.dst_node),
+        sender_snap.uuid().to_string().as_str(),
+        Some(frontdesk.dst_node.clone()),
         16,
         trace_id.clone(),
         Some(frontdesk.src_ilk),
@@ -1793,55 +1752,48 @@ async fn request_frontdesk_handoff_for_http(
         context,
         serde_json::to_value(frontdesk.payload).expect("frontdesk handoff payload"),
     );
-    let mut inbox = state.router_inbox.lock().await;
-    if let Err(err) = state.sender.send(msg).await {
-        tracing::warn!(error = ?err, %trace_id, "failed to send frontdesk handoff to router");
-        return Err(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "router_unavailable",
-            "Unable to send frontdesk handoff to router",
-        ));
-    }
 
     tracing::debug!(
         %trace_id,
         frontdesk_src_ilk = %frontdesk_src_ilk,
         frontdesk_node = %frontdesk_node,
         timeout_ms = state.identity_provision_cfg.timeout.as_millis() as u64,
-        "io-api waiting for structured frontdesk reply via router inbox"
+        "io-api sending frontdesk handoff and waiting for structured reply"
     );
 
-    let reply = match inbox
-        .recv_for_trace_id(&trace_id, state.identity_provision_cfg.timeout)
+    // Frontdesk replies with whatever it produces (structured payload, error
+    // envelope, etc.) keyed only by trace_id. Use a permissive matcher.
+    let matcher = PendingMatcher::new(vec![RouteMatch::Any], Vec::new(), Vec::new());
+    let labels = RpcRequestLabels::new(
+        &frontdesk.dst_node,
+        "FRONTDESK_HANDOFF",
+        "FRONTDESK_REPLY",
+    );
+    let reply = match state
+        .dispatcher
+        .send_with_matcher(msg, matcher, labels, state.identity_provision_cfg.timeout)
         .await
     {
         Ok(reply) => reply,
-        Err(io_common::identity::IdentityError::Timeout) => {
+        Err(fluxbee_sdk::RpcError::Timeout { .. }) => {
             return Err(api_error(
                 StatusCode::GATEWAY_TIMEOUT,
                 "frontdesk_timeout",
                 "Frontdesk did not respond in time",
             ));
         }
-        Err(io_common::identity::IdentityError::Unavailable) => {
+        Err(fluxbee_sdk::RpcError::Disconnected) | Err(fluxbee_sdk::RpcError::Node(_)) => {
             return Err(api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "frontdesk_unavailable",
-                "Frontdesk reply waiter closed unexpectedly",
+                "Router connection unavailable while handing off to frontdesk",
             ));
         }
-        Err(io_common::identity::IdentityError::Miss) => {
-            return Err(api_error(
-                StatusCode::BAD_GATEWAY,
-                "frontdesk_unavailable",
-                "Frontdesk reply was not found in router inbox",
-            ));
-        }
-        Err(io_common::identity::IdentityError::Other(err)) => {
+        Err(err) => {
             tracing::warn!(
                 %trace_id,
                 error = %err,
-                "failed while waiting for frontdesk reply from router inbox"
+                "failed while waiting for frontdesk reply"
             );
             return Err(api_error(
                 StatusCode::BAD_GATEWAY,
@@ -1950,7 +1902,7 @@ async fn route_http_message(
         ),
         RelayDecision::FlushNow(turn) => {
             let trace_id = dispatch_assembled_turn_for_http(
-                state.sender.clone(),
+                state.dispatcher.sender_snapshot(),
                 state.identity.as_ref(),
                 state.provisioner.as_ref(),
                 state.inbound.clone(),
@@ -1988,7 +1940,7 @@ async fn route_http_message(
                 )
                 .await;
             let trace_id = send_inbound_outcome(
-                state.sender.clone(),
+                state.dispatcher.sender_snapshot(),
                 outcome,
                 "relay fail-open direct inbound",
             )

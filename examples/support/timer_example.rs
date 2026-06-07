@@ -1,9 +1,10 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use fluxbee_sdk::{
-    connect, parse_timer_fired_event, try_handle_default_node_status, NodeConfig, NodeError,
-    NodeReceiver, NodeSender, NodeUuidMode, TimerClientError, TimerId,
+    parse_timer_fired_event, try_handle_default_node_status, NodeConfig, NodeError, NodeUuidMode,
+    OperationalRouteProfile, RouterDispatcher, RpcCommandReceiver, TimerClientError, TimerId,
 };
 use tokio::time::{sleep, Duration, Instant as TokioInstant};
 use tracing_subscriber::EnvFilter;
@@ -38,9 +39,15 @@ pub fn example_uuid_mode() -> NodeUuidMode {
     }
 }
 
+/// Returns `(dispatcher, fired_events_receiver, uuid_mode)`.
+///
+/// The dispatcher owns the router connection. `TIMER_FIRED` broadcasts
+/// flow into the `incoming` command channel, which this helper exposes
+/// to the caller so `wait_for_timer_fired` can drain them while other
+/// timer RPCs go through `dispatcher.send_with_matcher`.
 pub async fn connect_example_node(
     prefix: &str,
-) -> Result<(NodeSender, NodeReceiver, NodeUuidMode), Box<dyn std::error::Error>> {
+) -> Result<(Arc<RouterDispatcher>, RpcCommandReceiver, NodeUuidMode), Box<dyn std::error::Error>> {
     let uuid_mode = example_uuid_mode();
     let config_dir = PathBuf::from(json_router::paths::CONFIG_DIR);
     let socket_dir = PathBuf::from(json_router::paths::ROUTER_SOCKET_DIR);
@@ -55,8 +62,17 @@ pub async fn connect_example_node(
         config_dir,
         version: "1.0".to_string(),
     };
-    let (sender, receiver) = connect_with_retry(&node_config, StdDuration::from_secs(1)).await?;
-    Ok((sender, receiver, uuid_mode))
+    let profile = OperationalRouteProfile::builder()
+        .command_channel("incoming")
+        .post_pending_rule(
+            fluxbee_sdk::RouteMatch::Any,
+            fluxbee_sdk::RouteTarget::Command("incoming"),
+        )
+        .build()?;
+    let dispatcher =
+        connect_dispatcher_with_retry(node_config, StdDuration::from_secs(1), profile).await?;
+    let incoming = dispatcher.take_command_receiver("incoming").await?;
+    Ok((dispatcher, incoming, uuid_mode))
 }
 
 pub fn explain_schedule_error(err: TimerClientError) -> Box<dyn std::error::Error> {
@@ -77,11 +93,12 @@ Rebuild/restart sy-timer on the host to pick up the router SHM resolver, or reru
 }
 
 pub async fn wait_for_timer_fired(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
+    dispatcher: &Arc<RouterDispatcher>,
+    incoming: &mut RpcCommandReceiver,
     timer_id: &TimerId,
     timeout: Duration,
 ) -> Result<fluxbee_sdk::FiredEvent, Box<dyn std::error::Error>> {
+    let sender = dispatcher.sender_snapshot();
     let deadline = TokioInstant::now() + timeout;
     loop {
         let now = TokioInstant::now();
@@ -94,11 +111,22 @@ pub async fn wait_for_timer_fired(
             .into());
         }
         let remaining = deadline - now;
-        let incoming = receiver.recv_timeout(remaining).await?;
-        if try_handle_default_node_status(sender, &incoming).await? {
+        let incoming_msg = tokio::time::timeout(remaining, incoming.recv())
+            .await
+            .map_err(|_| {
+                format!(
+                    "timeout waiting TIMER_FIRED for {} after {}s",
+                    timer_id.as_str(),
+                    timeout.as_secs()
+                )
+            })?
+            .ok_or_else::<Box<dyn std::error::Error>, _>(|| {
+                "incoming channel closed before TIMER_FIRED arrived".into()
+            })?;
+        if try_handle_default_node_status(&sender, &incoming_msg).await? {
             continue;
         }
-        match parse_timer_fired_event(&incoming) {
+        match parse_timer_fired_event(&incoming_msg) {
             Ok(event) if event.timer_uuid == *timer_id => return Ok(event),
             Ok(event) => {
                 println!(
@@ -109,23 +137,32 @@ pub async fn wait_for_timer_fired(
             Err(_) => {
                 println!(
                     "ignoring message kind={} msg={:?} trace_id={}",
-                    incoming.meta.msg_type, incoming.meta.msg, incoming.routing.trace_id
+                    incoming_msg.meta.msg_type,
+                    incoming_msg.meta.msg,
+                    incoming_msg.routing.trace_id
                 );
             }
         }
     }
 }
 
-async fn connect_with_retry(
-    config: &NodeConfig,
+async fn connect_dispatcher_with_retry(
+    config: NodeConfig,
     delay: StdDuration,
-) -> Result<(NodeSender, NodeReceiver), NodeError> {
+    profile: OperationalRouteProfile,
+) -> Result<Arc<RouterDispatcher>, NodeError> {
+    let mut config = config;
     loop {
-        match connect(config).await {
-            Ok(result) => return Ok(result),
+        match RouterDispatcher::connect_with_retry(config.clone(), delay, profile.clone()).await {
+            Ok(dispatcher) => return Ok(dispatcher),
             Err(err) => {
                 eprintln!("connect failed: {err}");
                 sleep(Duration::from_millis(delay.as_millis() as u64)).await;
+                // Force the loop to allow retry; the SDK's own retry handles
+                // mid-flight reconnects, but a connect() failure here can
+                // surface and we want to give the operator a chance to fix
+                // their environment.
+                let _ = &mut config;
             }
         }
     }

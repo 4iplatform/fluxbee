@@ -5,7 +5,7 @@ use fluxbee_sdk::identity::{
     load_hive_id, resolve_ilk_from_hive_config, IdentityShmError, MSG_ILK_PROVISION,
     MSG_ILK_PROVISION_RESPONSE,
 };
-use fluxbee_sdk::rpc::{OperationalRouteProfile, RpcClient, RpcError, SystemRpcRequest};
+use fluxbee_sdk::rpc::{OperationalRouteProfile, RouterDispatcher, RpcError, SystemRpcRequest};
 use fluxbee_sdk::NodeConfig;
 use serde_json::{json, Value};
 use tokio::time::{sleep, Duration, Instant};
@@ -61,9 +61,12 @@ async fn main() -> Result<(), DynError> {
                 version: node_version,
             };
             let profile = OperationalRouteProfile::builder().build()?;
-            let client =
-                RpcClient::connect_with_retry(node_config, Duration::from_millis(100), profile)
-                    .await?;
+            let client = RouterDispatcher::connect_with_retry(
+                node_config,
+                Duration::from_millis(100),
+                profile,
+            )
+            .await?;
             let provisioned = provision_ilk_with_fallback(
                 &client,
                 &target,
@@ -110,9 +113,12 @@ async fn main() -> Result<(), DynError> {
                 version: node_version,
             };
             let profile = OperationalRouteProfile::builder().build()?;
-            let client =
-                RpcClient::connect_with_retry(node_config, Duration::from_millis(100), profile)
-                    .await?;
+            let client = RouterDispatcher::connect_with_retry(
+                node_config,
+                Duration::from_millis(100),
+                profile,
+            )
+            .await?;
             let provisioned = provision_ilk_with_fallback(
                 &client,
                 &target,
@@ -241,7 +247,7 @@ struct ProvisionOutcome {
 }
 
 async fn provision_ilk_with_fallback(
-    client: &RpcClient,
+    client: &RouterDispatcher,
     target: &str,
     ich_id: &str,
     channel_type: &str,
@@ -332,7 +338,7 @@ enum ProvisionAttemptError {
 }
 
 async fn send_provision_once(
-    client: &RpcClient,
+    client: &RouterDispatcher,
     target: &str,
     payload: Value,
     timeout: Duration,

@@ -12,14 +12,31 @@ use fluxbee_sdk::protocol::{
     MSG_CONFIG_SET, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    build_node_config_response_message, connect, parse_node_config_request,
-    try_handle_default_node_status, NodeConfig, NodeConfigControlRequest, NodeConfigSetPayload,
-    NodeReceiver, NodeSender, NODE_CONFIG_APPLY_MODE_REPLACE, NODE_CONFIG_CONTROL_TARGET,
+    build_node_config_response_message, parse_node_config_request, try_handle_default_node_status,
+    NodeConfig, NodeConfigControlRequest, NodeConfigSetPayload, NodeSender,
+    OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, ADMIN_KIND,
+    NODE_CONFIG_APPLY_MODE_REPLACE, NODE_CONFIG_CONTROL_TARGET,
 };
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, ConfigRegionWriter, StaticRouteEntry, TapEntry,
     VpnAssignment, ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
 };
+
+const RPC_CH_INCOMING: &str = "incoming";
+
+fn build_config_routes_rpc_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::RpcError> {
+    OperationalRouteProfile::builder()
+        .command_channel(RPC_CH_INCOMING)
+        .post_pending_rule(
+            RouteMatch::any_msg_type(ADMIN_KIND),
+            RouteTarget::Command(RPC_CH_INCOMING),
+        )
+        .post_pending_rule(
+            RouteMatch::any_msg_type(SYSTEM_KIND),
+            RouteTarget::Command(RPC_CH_INCOMING),
+        )
+        .build()
+}
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -139,8 +156,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config_dir: config_dir.clone(),
         version: "1.0".to_string(),
     };
-    let (sender, mut receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let profile = build_config_routes_rpc_profile()
+        .map_err(|err| format!("sy.config-routes rpc profile invalid: {err}"))?;
+    let dispatcher =
+        RouterDispatcher::connect_with_retry(node_config, Duration::from_secs(1), profile).await?;
     tracing::info!("connected to router");
+
+    let mut incoming_rx = dispatcher
+        .take_command_receiver(RPC_CH_INCOMING)
+        .await
+        .map_err(|err| format!("sy.config-routes incoming receiver: {err}"))?;
 
     let mut ticker = time::interval(Duration::from_secs(5));
     loop {
@@ -148,18 +173,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = ticker.tick() => {
                 writer.update_heartbeat();
             }
-            msg = receiver.recv() => {
-                let msg = match msg {
-                    Ok(msg) => msg,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "sy.config-routes connection interrupted; reconnect handled internally");
-                        continue;
-                    }
+            msg = incoming_rx.recv() => {
+                let Some(msg) = msg else {
+                    tracing::warn!("sy.config-routes incoming channel closed; exiting main loop");
+                    return Ok(());
                 };
+                let sender = dispatcher.sender_snapshot();
                 if try_handle_default_node_status(&sender, &msg).await? {
                     continue;
                 }
-                if msg.meta.msg_type == "admin" {
+                if msg.meta.msg_type == ADMIN_KIND {
                     if let Err(err) = handle_admin_action(
                         &sender,
                         &msg,
@@ -862,21 +885,6 @@ fn admin_error_payload(action: &str, code: &str, detail: String) -> serde_json::
         "error_code": code,
         "error_detail": detail,
     })
-}
-
-async fn connect_with_retry(
-    config: &NodeConfig,
-    delay: Duration,
-) -> Result<(NodeSender, NodeReceiver), fluxbee_sdk::NodeError> {
-    loop {
-        match connect(config).await {
-            Ok(result) => return Ok(result),
-            Err(err) => {
-                tracing::warn!("connect failed: {err}");
-                time::sleep(delay).await;
-            }
-        }
-    }
 }
 
 fn load_hive(config_dir: &Path) -> Result<HiveFile, Box<dyn std::error::Error>> {

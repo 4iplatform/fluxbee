@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use fluxbee_sdk::identity::{
     load_hive_id, MSG_IDENTITY_METRICS, MSG_ILK_PROVISION, MSG_TNT_CREATE,
 };
-use fluxbee_sdk::rpc::{OperationalRouteProfile, RpcClient, RpcError, SystemRpcRequest};
+use fluxbee_sdk::rpc::{OperationalRouteProfile, RouterDispatcher, RpcError, SystemRpcRequest};
 use fluxbee_sdk::NodeConfig;
 use serde_json::{json, Value};
 use tokio::time::{sleep, Duration, Instant};
@@ -233,7 +233,7 @@ async fn main() -> Result<(), DynError> {
 }
 
 struct NodeSession {
-    client: std::sync::Arc<RpcClient>,
+    client: std::sync::Arc<RouterDispatcher>,
 }
 
 struct IdentityCallResult {
@@ -250,7 +250,8 @@ async fn connect_node(name: &str) -> Result<NodeSession, DynError> {
         version: "0.0.1".to_string(),
     };
     let profile = OperationalRouteProfile::builder().build()?;
-    let client = RpcClient::connect_with_retry(cfg, Duration::from_millis(100), profile).await?;
+    let client =
+        RouterDispatcher::connect_with_retry(cfg, Duration::from_millis(100), profile).await?;
     Ok(NodeSession { client })
 }
 
@@ -275,11 +276,11 @@ async fn identity_call(
 }
 
 /// Replicates the SDK `identity_system_call` fallback semantics over the new
-/// `RpcClient::send_system_rpc`. Retries on transport `UNREACHABLE` with
+/// `RouterDispatcher::send_system_rpc`. Retries on transport `UNREACHABLE` with
 /// `reason=NODE_NOT_FOUND` or on payload `status=error, error_code=NOT_PRIMARY`,
 /// against `fallback_target` when supplied and distinct.
 async fn identity_call_with_fallback(
-    client: &RpcClient,
+    client: &RouterDispatcher,
     target: &str,
     fallback_target: Option<&str>,
     action: &str,

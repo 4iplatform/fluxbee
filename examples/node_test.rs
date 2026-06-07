@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 
 use fluxbee_sdk::protocol::{
-    build_echo, build_echo_reply, build_time_sync, build_withdraw, Destination, Message, Meta,
-    Routing, TimeSyncPayload, MSG_OPA_RELOAD, SYSTEM_KIND,
+    build_echo, build_echo_reply, build_time_sync, Destination, Message, Meta, Routing,
+    TimeSyncPayload, MSG_OPA_RELOAD, SYSTEM_KIND,
 };
-use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender, NodeUuidMode};
+use fluxbee_sdk::{
+    NodeConfig, NodeUuidMode, OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher,
+};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -62,49 +64,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config_dir,
         version: "1.0".to_string(),
     };
-    let (mut sender, mut receiver) =
-        connect_with_retry(&node_config, std::time::Duration::from_secs(1)).await?;
+    let dispatcher =
+        connect_dispatcher(node_config.clone(), std::time::Duration::from_secs(1)).await?;
+    let sender = dispatcher.sender_snapshot();
+    let mut incoming = dispatcher.take_command_receiver("incoming").await?;
 
     println!(
-        "connected as {} (uuid={}, vpn={}, router={})",
+        "connected as {} (uuid={})",
         sender.full_name(),
         sender.uuid(),
-        receiver.vpn_id(),
-        receiver.full_name()
     );
 
     if mode == "listen" {
         println!("listen mode: waiting for messages");
-        loop {
-            match receiver.recv().await {
-                Ok(msg) => {
-                    let summary = payload_summary(&msg.payload);
-                    println!(
-                        "received: kind={} msg={:?} src={} src_l2_name={:?} dst={:?} payload={}",
-                        msg.meta.msg_type,
-                        msg.meta.msg,
-                        msg.routing.src,
-                        msg.routing.src_l2_name,
-                        msg.routing.dst,
-                        summary
-                    );
-                }
-                Err(err) => {
-                    eprintln!("recv error: {err} (reconnecting)");
-                    let (new_sender, new_receiver) =
-                        connect_with_retry(&node_config, std::time::Duration::from_secs(1)).await?;
-                    sender = new_sender;
-                    receiver = new_receiver;
-                    println!(
-                        "reconnected as {} (uuid={}, vpn={}, router={})",
-                        sender.full_name(),
-                        sender.uuid(),
-                        receiver.vpn_id(),
-                        receiver.full_name()
-                    );
-                }
-            }
+        while let Some(msg) = incoming.recv().await {
+            let summary = payload_summary(&msg.payload);
+            println!(
+                "received: kind={} msg={:?} src={} src_l2_name={:?} dst={:?} payload={}",
+                msg.meta.msg_type,
+                msg.meta.msg,
+                msg.routing.src,
+                msg.routing.src_l2_name,
+                msg.routing.dst,
+                summary
+            );
         }
+        println!("listen channel closed");
+        return Ok(());
     }
 
     if mode == "opa_reload" {
@@ -162,10 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             if let Err(err) = sender.send(msg).await {
                 eprintln!("send error: {err} (reconnecting)");
-                let (new_sender, new_receiver) =
-                    connect_with_retry(&node_config, std::time::Duration::from_secs(1)).await?;
-                sender = new_sender;
-                receiver = new_receiver;
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;
             }
             println!("sent OPA {}", seq);
@@ -200,10 +183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         if let Err(err) = sender.send(msg).await {
             eprintln!("send error: {err} (reconnecting)");
-            let (new_sender, new_receiver) =
-                connect_with_retry(&node_config, std::time::Duration::from_secs(1)).await?;
-            sender = new_sender;
-            receiver = new_receiver;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;
         }
         println!("sent HOLA {} (dst={:?})", seq, dst);
@@ -216,10 +196,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         if let Err(err) = sender.send(echo).await {
             eprintln!("send error: {err} (reconnecting)");
-            let (new_sender, new_receiver) =
-                connect_with_retry(&node_config, std::time::Duration::from_secs(1)).await?;
-            sender = new_sender;
-            receiver = new_receiver;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;
         }
         println!("sent ECHO (dst=Broadcast)");
@@ -232,10 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         if let Err(err) = sender.send(echo_reply).await {
             eprintln!("send error: {err} (reconnecting)");
-            let (new_sender, new_receiver) =
-                connect_with_retry(&node_config, std::time::Duration::from_secs(1)).await?;
-            sender = new_sender;
-            receiver = new_receiver;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;
         }
         println!("sent ECHO_REPLY (dst=Broadcast)");
@@ -254,10 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         if let Err(err) = sender.send(time_sync).await {
             eprintln!("send error: {err} (reconnecting)");
-            let (new_sender, new_receiver) =
-                connect_with_retry(&node_config, std::time::Duration::from_secs(1)).await?;
-            sender = new_sender;
-            receiver = new_receiver;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;
         }
         println!("sent TIME_SYNC (dst=Broadcast)");
@@ -267,19 +238,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn connect_with_retry(
-    config: &NodeConfig,
+async fn connect_dispatcher(
+    config: NodeConfig,
     delay: std::time::Duration,
-) -> Result<(NodeSender, NodeReceiver), fluxbee_sdk::NodeError> {
-    loop {
-        match connect(config).await {
-            Ok(result) => return Ok(result),
-            Err(err) => {
-                eprintln!("connect failed: {err}");
-                tokio::time::sleep(delay).await;
-            }
-        }
-    }
+) -> Result<std::sync::Arc<RouterDispatcher>, Box<dyn std::error::Error>> {
+    let profile = OperationalRouteProfile::builder()
+        .command_channel("incoming")
+        .post_pending_rule(RouteMatch::Any, RouteTarget::Command("incoming"))
+        .build()?;
+    RouterDispatcher::connect_with_retry(config, delay, profile)
+        .await
+        .map_err(|err| err.into())
 }
 
 fn now_epoch_ms() -> u64 {

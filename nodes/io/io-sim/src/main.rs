@@ -2,7 +2,8 @@
 
 use anyhow::Result;
 use fluxbee_sdk::{
-    compute_thread_id, connect, NodeConfig, NodeSender, NodeUuidMode, ThreadIdInput,
+    compute_thread_id, protocol::SYSTEM_KIND, NodeConfig, NodeUuidMode, OperationalRouteProfile,
+    PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher, RpcRequestLabels, ThreadIdInput,
 };
 use io_common::identity::{
     IdentityProvisioner, IdentityResolver, ResolveOrCreateInput, ShmIdentityResolver,
@@ -10,7 +11,7 @@ use io_common::identity::{
 use io_common::inbound::{InboundConfig, InboundOutcome, InboundProcessor};
 use io_common::io_context::{ConversationRef, IoContext, MessageRef, PartyRef, ReplyTarget};
 use io_common::io_control_plane_logging::log_config_response_message;
-use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig, RouterInbox};
+use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,27 +36,28 @@ async fn main() -> Result<()> {
         "io-sim starting"
     );
 
-    let (sender, receiver) = connect(&NodeConfig {
+    let node_config = NodeConfig {
         name: config.node_name.clone(),
         router_socket: config.router_socket.clone(),
         uuid_persistence_dir: config.uuid_persistence_dir.clone(),
         uuid_mode: NodeUuidMode::Persistent,
         config_dir: config.config_dir.clone(),
         version: config.node_version.clone(),
-    })
-    .await?;
+    };
+    let profile = build_io_sim_rpc_profile()
+        .map_err(|err| anyhow::anyhow!("io-sim rpc profile invalid: {err}"))?;
+    let dispatcher =
+        RouterDispatcher::connect_with_retry(node_config, Duration::from_secs(1), profile).await?;
+    let sender = dispatcher.sender_snapshot();
 
     tracing::info!(
-        full_name = %receiver.full_name(),
-        vpn_id = %receiver.vpn_id(),
+        full_name = %sender.full_name(),
         "io-sim connected to router"
     );
 
     let identity: Arc<dyn IdentityResolver> = Arc::new(ShmIdentityResolver::new(&config.island_id));
-    let inbox = Arc::new(Mutex::new(RouterInbox::new(receiver)));
     let provisioner: Arc<dyn IdentityProvisioner> = Arc::new(FluxbeeIdentityProvisioner::new(
-        sender.clone(),
-        inbox.clone(),
+        dispatcher.clone(),
         IdentityProvisionConfig {
             target: config.identity_target.clone(),
             timeout: Duration::from_millis(config.identity_timeout_ms),
@@ -76,8 +78,7 @@ async fn main() -> Result<()> {
     if let Some(text) = args.once {
         process_one_inbound(
             &config,
-            &sender,
-            &inbox,
+            &dispatcher,
             identity.as_ref(),
             provisioner.as_ref(),
             inbound.clone(),
@@ -87,8 +88,7 @@ async fn main() -> Result<()> {
     } else {
         run_stdin_inbound_loop(
             &config,
-            &sender,
-            &inbox,
+            &dispatcher,
             identity.as_ref(),
             provisioner.as_ref(),
             inbound.clone(),
@@ -96,6 +96,22 @@ async fn main() -> Result<()> {
         .await?;
     }
     Ok(())
+}
+
+const RPC_CH_INCOMING: &str = "incoming";
+
+fn build_io_sim_rpc_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::RpcError> {
+    // io-sim's incoming traffic is varied — system, admin responses, etc.
+    // None of it is pre-RPC, so the broad catch-all post-pending rule is
+    // safe (responses for our outbound trace_ids go through the pending
+    // matcher first).
+    OperationalRouteProfile::builder()
+        .command_channel(RPC_CH_INCOMING)
+        .post_pending_rule(
+            RouteMatch::any_msg_type(SYSTEM_KIND),
+            RouteTarget::Command(RPC_CH_INCOMING),
+        )
+        .build()
 }
 
 #[derive(Debug, Clone)]
@@ -225,8 +241,7 @@ fn resolve_sim_thread_id(config: &Config) -> Option<String> {
 
 async fn run_stdin_inbound_loop(
     config: &Config,
-    sender: &NodeSender,
-    inbox: &Arc<Mutex<RouterInbox>>,
+    dispatcher: &Arc<RouterDispatcher>,
     identity: &dyn IdentityResolver,
     provisioner: &dyn IdentityProvisioner,
     inbound: Arc<Mutex<InboundProcessor>>,
@@ -242,8 +257,7 @@ async fn run_stdin_inbound_loop(
         }
         process_one_inbound(
             config,
-            sender,
-            inbox,
+            dispatcher,
             identity,
             provisioner,
             inbound.clone(),
@@ -256,8 +270,7 @@ async fn run_stdin_inbound_loop(
 
 async fn process_one_inbound(
     config: &Config,
-    sender: &NodeSender,
-    inbox: &Arc<Mutex<RouterInbox>>,
+    dispatcher: &Arc<RouterDispatcher>,
     identity: &dyn IdentityResolver,
     provisioner: &dyn IdentityProvisioner,
     inbound: Arc<Mutex<InboundProcessor>>,
@@ -404,23 +417,25 @@ async fn process_one_inbound(
             if let Ok(wire) = serde_json::to_string(&msg) {
                 tracing::debug!(%trace_id, wire = %wire, "io-sim outbound wire message");
             }
-            sender.send(msg).await?;
+            // Match any response that comes back on our trace_id — io-sim
+            // logs whatever it gets (success, error envelope, unreachable),
+            // it doesn't gate on a specific response_msg.
+            let matcher = PendingMatcher::new(vec![RouteMatch::Any], Vec::new(), Vec::new());
+            let labels = RpcRequestLabels::new(&dst, "INBOUND_FORWARD", "ANY_RESPONSE");
             tracing::info!(
                 %trace_id,
                 dst,
                 thread_id = %thread_id,
                 has_src_ilk,
                 src_ilk = %src_ilk,
-                "io-sim sent inbound message to router"
+                "io-sim sending inbound message to router"
             );
-            match inbox
-                .lock()
-                .await
-                .recv_for_trace_id(&trace_id, Duration::from_secs(30))
+            match dispatcher
+                .send_with_matcher(msg, matcher, labels, Duration::from_secs(30))
                 .await
             {
                 Ok(outbound) => log_outbound_message(&outbound),
-                Err(io_common::identity::IdentityError::Timeout) => {
+                Err(fluxbee_sdk::RpcError::Timeout { .. }) => {
                     tracing::warn!(%trace_id, "io-sim timed out waiting outbound from router");
                 }
                 Err(err) => {

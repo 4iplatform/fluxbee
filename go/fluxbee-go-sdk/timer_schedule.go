@@ -125,7 +125,7 @@ func (c *TimerClient) CancelByClientRef(ctx context.Context, clientRef string) e
 }
 
 func (c *TimerClient) cancelWithMessage(ctx context.Context, msg Message) error {
-	resp, err := RequestSystemRPC(ctx, c.sender, c.receiver, msg, MsgTimerResponse)
+	resp, err := c.sendTimerRPC(ctx, msg)
 	if err != nil {
 		return err
 	}
@@ -175,7 +175,7 @@ func (c *TimerClient) RescheduleByClientRef(ctx context.Context, clientRef strin
 }
 
 func (c *TimerClient) rescheduleWithMessage(ctx context.Context, msg Message) error {
-	resp, err := RequestSystemRPC(ctx, c.sender, c.receiver, msg, MsgTimerResponse)
+	resp, err := c.sendTimerRPC(ctx, msg)
 	if err != nil {
 		return err
 	}
@@ -213,7 +213,7 @@ func (c *TimerClient) GetByClientRef(ctx context.Context, clientRef string) (*Ti
 }
 
 func (c *TimerClient) getWithMessage(ctx context.Context, msg Message) (*TimerInfo, error) {
-	resp, err := RequestSystemRPC(ctx, c.sender, c.receiver, msg, MsgTimerResponse)
+	resp, err := c.sendTimerRPC(ctx, msg)
 	if err != nil {
 		return nil, err
 	}
@@ -249,7 +249,7 @@ func (c *TimerClient) List(ctx context.Context, filter ListFilter) ([]TimerInfo,
 	if err != nil {
 		return nil, err
 	}
-	resp, err := RequestSystemRPC(ctx, c.sender, c.receiver, msg, MsgTimerResponse)
+	resp, err := c.sendTimerRPC(ctx, msg)
 	if err != nil {
 		return nil, err
 	}
@@ -357,7 +357,7 @@ func (c *TimerClient) schedule(ctx context.Context, verb string, payload map[str
 	if err != nil {
 		return "", err
 	}
-	resp, err := RequestSystemRPC(ctx, c.sender, c.receiver, msg, MsgTimerResponse)
+	resp, err := c.sendTimerRPC(ctx, msg)
 	if err != nil {
 		return "", err
 	}

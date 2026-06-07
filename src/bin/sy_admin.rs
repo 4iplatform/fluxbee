@@ -33,7 +33,7 @@ use fluxbee_sdk::protocol::{
 use fluxbee_sdk::{
     build_node_config_response_message, classify_admin_action, classify_system_message,
     derive_action_outcome, try_handle_default_node_status, ClientConfig, NodeConfig,
-    OperationalRouteProfile, PendingMatcher, RouteMatch, RouteTarget, RpcClient,
+    OperationalRouteProfile, PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher,
     RpcCommandReceiver, RpcRequestLabels, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE,
     MSG_VAULT_GET, MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE,
     MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE,
@@ -276,6 +276,10 @@ struct AdminContext {
     nats_client: Arc<NatsClient>,
     executor_runtime: Arc<Mutex<Option<AdminExecutorAiRuntime>>>,
     executor_configured: Arc<AtomicBool>,
+    /// Canonical admin dispatcher — reused by the executor's Vault
+    /// hot-refresh path so refreshes flow through the same router
+    /// connection as ordinary admin/system traffic.
+    rpc: Arc<RouterDispatcher>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -472,7 +476,7 @@ async fn main() -> Result<(), AdminError> {
     let client_config = ClientConfig::new(node_config.clone());
     let rpc_profile = build_admin_rpc_profile()?;
     let router_client =
-        RpcClient::connect_with_retry(node_config, Duration::from_secs(1), rpc_profile)
+        RouterDispatcher::connect_with_retry(node_config, Duration::from_secs(1), rpc_profile)
             .await
             .map_err(|err| {
                 tracing::error!("router client connect failed: {err}");
@@ -491,13 +495,11 @@ async fn main() -> Result<(), AdminError> {
         "self system ILK computed deterministically"
     );
     let initial_executor_runtime = build_admin_executor_ai_runtime(
+        Arc::clone(&router_client),
         &hive.hive_id,
         &node_name,
         &self_ilk_id,
         fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
-        &config_dir,
-        &state_dir,
-        &socket_dir,
     )
     .await?;
     let executor_configured = Arc::new(AtomicBool::new(initial_executor_runtime.is_some()));
@@ -515,6 +517,7 @@ async fn main() -> Result<(), AdminError> {
         nats_client,
         executor_runtime,
         executor_configured,
+        rpc: Arc::clone(&router_client),
     };
     let internal_ctx = http_ctx.clone();
     let system_ctx = http_ctx.clone();
@@ -604,7 +607,7 @@ struct WfRulesRequest {
 
 async fn run_broadcast_loop(
     mut rx: mpsc::UnboundedReceiver<BroadcastRequest>,
-    client: Arc<RpcClient>,
+    client: Arc<RouterDispatcher>,
 ) {
     while let Some(req) = rx.recv().await {
         let result = match req {
@@ -796,13 +799,11 @@ fn merged_admin_executor_openai_section(
 /// Async because vault is a router round-trip. Caller (`refresh_*` or main
 /// boot) decides whether to retry/log.
 async fn build_admin_executor_ai_runtime(
+    rpc: Arc<RouterDispatcher>,
     hive_id: &str,
     node_name: &str,
     self_ilk_id: &str,
     my_tenant: &str,
-    config_dir: &Path,
-    state_dir: &Path,
-    socket_dir: &Path,
 ) -> Result<Option<AdminExecutorAiRuntime>, AdminError> {
     let config = load_admin_executor_node_config(hive_id)?;
     let openai = merged_admin_executor_openai_section(config.as_ref()).unwrap_or_default();
@@ -813,27 +814,18 @@ async fn build_admin_executor_ai_runtime(
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_ADMIN_EXECUTOR_MODEL)
         .to_string();
-    let node_config = fluxbee_sdk::NodeConfig {
-        name: "SY.admin".to_string(),
-        router_socket: socket_dir.to_path_buf(),
-        uuid_persistence_dir: state_dir.join("nodes"),
-        uuid_mode: fluxbee_sdk::NodeUuidMode::Ephemeral,
-        config_dir: config_dir.to_path_buf(),
-        version: "0.1.0".to_string(),
-    };
-    let (sender, mut receiver) = fluxbee_sdk::connect(&node_config).await?;
-    let caller = fluxbee_sdk::VaultCaller::new(self_ilk_id, node_name);
-    let value = fluxbee_sdk::resolve_resource(
-        &sender,
-        &mut receiver,
-        caller,
-        hive_id,
-        fluxbee_sdk::ResourceType::Openai,
-        my_tenant,
-        Duration::from_secs(5),
-    )
-    .await;
-    let _ = sender.close().await;
+    let vault_client = fluxbee_sdk::VaultClient::new(
+        rpc,
+        hive_id.to_string(),
+        fluxbee_sdk::VaultCallerOwned::new(self_ilk_id.to_string(), node_name.to_string()),
+    );
+    let value = vault_client
+        .resolve_resource(
+            fluxbee_sdk::ResourceType::Openai,
+            my_tenant,
+            Duration::from_secs(5),
+        )
+        .await;
     let api_key = match value {
         Ok(Some(value)) => admin_executor_extract_openai_api_key(&value)?,
         Ok(None) => None,
@@ -880,13 +872,11 @@ fn admin_executor_extract_openai_api_key(
 
 async fn refresh_admin_executor_ai_runtime(ctx: &AdminContext) -> Result<bool, AdminError> {
     let runtime = build_admin_executor_ai_runtime(
+        Arc::clone(&ctx.rpc),
         &ctx.hive_id,
         &ctx.node_name,
         &ctx.self_ilk_id,
         fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
-        &ctx.config_dir,
-        &ctx.state_dir,
-        &ctx.socket_dir,
     )
     .await?;
     ctx.executor_configured
@@ -1659,7 +1649,7 @@ fn next_config_changed_version(
 }
 
 async fn broadcast_config_changed(
-    client: &RpcClient,
+    client: &RouterDispatcher,
     subsystem: &str,
     action: Option<String>,
     auto_apply: Option<bool>,
@@ -1755,7 +1745,7 @@ struct InternalAdminCommandPayload {
 
 async fn run_internal_admin_loop(
     ctx: AdminContext,
-    client: Arc<RpcClient>,
+    client: Arc<RouterDispatcher>,
     mut rx: RpcCommandReceiver,
 ) {
     while let Some(msg) = rx.recv().await {
@@ -1767,7 +1757,7 @@ async fn run_internal_admin_loop(
 
 async fn run_system_command_loop(
     ctx: AdminContext,
-    client: Arc<RpcClient>,
+    client: Arc<RouterDispatcher>,
     mut rx: RpcCommandReceiver,
 ) {
     while let Some(msg) = rx.recv().await {
@@ -1777,7 +1767,7 @@ async fn run_system_command_loop(
     }
 }
 
-async fn run_status_get_loop(client: Arc<RpcClient>, mut rx: RpcCommandReceiver) {
+async fn run_status_get_loop(client: Arc<RouterDispatcher>, mut rx: RpcCommandReceiver) {
     while let Some(msg) = rx.recv().await {
         let sender = client.sender_snapshot();
         if let Err(err) = try_handle_default_node_status(&sender, &msg).await {
@@ -1788,7 +1778,7 @@ async fn run_status_get_loop(client: Arc<RpcClient>, mut rx: RpcCommandReceiver)
 
 struct AdminExecutorStepTool {
     ctx: AdminContext,
-    client: Arc<RpcClient>,
+    client: Arc<RouterDispatcher>,
     step: AdminExecutorPlanStep,
     definition: FunctionToolDefinition,
 }
@@ -1834,7 +1824,7 @@ impl FunctionTool for AdminExecutorStepTool {
 
 struct AdminExecutorHelpTool {
     ctx: AdminContext,
-    client: Arc<RpcClient>,
+    client: Arc<RouterDispatcher>,
     step: AdminExecutorPlanStep,
     definition: FunctionToolDefinition,
 }
@@ -2195,7 +2185,7 @@ fn build_executor_step_events_from_result(
 
 async fn execute_admin_executor_step_fallback(
     ctx: &AdminContext,
-    client: &Arc<RpcClient>,
+    client: &Arc<RouterDispatcher>,
     execution_id: &str,
     step_index: usize,
     step: &AdminExecutorPlanStep,
@@ -2372,7 +2362,7 @@ async fn execute_admin_executor_step_fallback(
 
 async fn execute_admin_executor_plan(
     ctx: &AdminContext,
-    client: &Arc<RpcClient>,
+    client: &Arc<RouterDispatcher>,
     request: &AdminExecutorRunRequest,
 ) -> Result<serde_json::Value, AdminError> {
     validate_executor_plan(&request.plan).map_err(|detail| -> AdminError { detail.into() })?;
@@ -2563,7 +2553,7 @@ async fn execute_admin_executor_plan(
 
 async fn handle_system_command(
     ctx: &AdminContext,
-    client: &Arc<RpcClient>,
+    client: &Arc<RouterDispatcher>,
     msg: &Message,
 ) -> Result<(), AdminError> {
     if msg.meta.msg_type != SYSTEM_KIND {
@@ -2655,7 +2645,7 @@ async fn handle_vault_secret_changed_admin(ctx: &AdminContext, msg: &Message) {
 
 async fn handle_internal_admin_command(
     ctx: &AdminContext,
-    client: &Arc<RpcClient>,
+    client: &Arc<RouterDispatcher>,
     msg: &Message,
 ) -> Result<(), AdminError> {
     if msg.meta.msg_type != "admin" || msg.meta.msg.as_deref() != Some(MSG_ADMIN_COMMAND) {
@@ -2782,7 +2772,7 @@ fn internal_response_payload_value(envelope: &serde_json::Value) -> serde_json::
 }
 
 async fn send_admin_command_response(
-    client: &RpcClient,
+    client: &RouterDispatcher,
     request_msg: &Message,
     action: &str,
     status: &str,
@@ -3367,7 +3357,7 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
 
 async fn dispatch_internal_admin_command(
     ctx: &AdminContext,
-    client: &Arc<RpcClient>,
+    client: &Arc<RouterDispatcher>,
     action: &str,
     target: Option<&str>,
     params: serde_json::Value,
@@ -3844,7 +3834,7 @@ async fn run_http_server(
     listen: &str,
     tx: &mpsc::UnboundedSender<BroadcastRequest>,
     ctx: AdminContext,
-    client: Arc<RpcClient>,
+    client: Arc<RouterDispatcher>,
 ) -> Result<(), AdminError> {
     let listener = TcpListener::bind(listen).await?;
     tracing::info!(addr = %listen, "sy.admin http listening");
@@ -3865,7 +3855,7 @@ async fn handle_http(
     stream: &mut tokio::net::TcpStream,
     tx: &mpsc::UnboundedSender<BroadcastRequest>,
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
 ) -> Result<(), AdminError> {
     let (method, path, headers, body) = read_http_request(stream).await?;
     let (path, query) = split_path_query(&path);
@@ -4416,7 +4406,7 @@ async fn handle_http(
 
 async fn handle_inventory_http(
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     payload: serde_json::Value,
 ) -> Result<(u16, String), AdminError> {
     let target = format!("SY.orchestrator@{}", ctx.hive_id);
@@ -4439,7 +4429,7 @@ async fn handle_hive_paths(
     query: &HashMap<String, String>,
     body: &[u8],
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
 ) -> Result<Option<(u16, String)>, AdminError> {
     let trimmed = path.trim_matches('/');
     let parts = trimmed.split('/').collect::<Vec<_>>();
@@ -6055,7 +6045,7 @@ fn next_opa_version(requested: Option<u64>) -> Result<u64, AdminError> {
 
 async fn handle_opa_http(
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     mut req: OpaRequest,
     action: OpaAction,
 ) -> Result<(u16, String), AdminError> {
@@ -6154,7 +6144,7 @@ async fn handle_opa_http(
 
 async fn handle_opa_query(
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     action: &str,
     target: Option<String>,
 ) -> Result<(u16, String), AdminError> {
@@ -6164,7 +6154,7 @@ async fn handle_opa_query(
 
 async fn handle_wf_rules_http(
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     req: WfRulesRequest,
     action: WfRulesAction,
 ) -> Result<(u16, String), AdminError> {
@@ -6212,7 +6202,7 @@ async fn handle_wf_rules_http(
 
 async fn handle_wf_rules_query(
     _ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     action: &str,
     req: WfRulesRequest,
 ) -> Result<(u16, String), AdminError> {
@@ -6264,7 +6254,7 @@ fn normalize_wf_rules_target(target: Option<String>, fallback_hive: &str) -> Str
 }
 
 async fn send_l2_action_request(
-    client: &RpcClient,
+    client: &RouterDispatcher,
     target: &str,
     msg_type: &str,
     action: &str,
@@ -6346,7 +6336,7 @@ async fn send_l2_action_request(
 
 async fn handle_timer_rpc(
     _ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     action: &str,
     timer_msg: &str,
     payload: serde_json::Value,
@@ -6372,7 +6362,7 @@ async fn handle_timer_rpc(
 
 async fn handle_admin_query(
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     action: &str,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
@@ -6390,7 +6380,7 @@ async fn handle_admin_query(
 
 async fn handle_admin_query_with_payload(
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     action: &str,
     payload: serde_json::Value,
     hive: Option<String>,
@@ -9397,7 +9387,7 @@ fn finalize_quarantined_runtime_version_dir_local(
 
 async fn query_runtime_usage_global_visible(
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     runtime: &str,
     runtime_version: &str,
 ) -> Result<serde_json::Value, String> {
@@ -9442,7 +9432,7 @@ fn parse_admin_envelope(body: &str, action: &str) -> Result<serde_json::Value, S
 
 async fn run_publish_runtime_package_follow_up(
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     runtime_name: &str,
     runtime_version: &str,
     manifest_version: u64,
@@ -9535,7 +9525,7 @@ async fn run_publish_runtime_package_follow_up(
 
 async fn handle_publish_runtime_package(
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     payload: serde_json::Value,
 ) -> Result<(u16, String), AdminError> {
     if ctx.hive_id != PRIMARY_HIVE_ID {
@@ -9752,7 +9742,7 @@ async fn handle_publish_runtime_package(
 
 async fn handle_remove_runtime_version(
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
@@ -10195,7 +10185,7 @@ async fn handle_remove_runtime_version(
 
 async fn handle_admin_command(
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     action: &str,
     payload: serde_json::Value,
     hive: Option<String>,
@@ -10298,7 +10288,7 @@ async fn handle_admin_command(
 
 async fn handle_send_node_message(
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
@@ -10421,7 +10411,7 @@ fn extract_node_error_code_and_detail(
 
 async fn handle_node_control_command(
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     action: &str,
     payload: serde_json::Value,
     hive: Option<String>,
@@ -10597,7 +10587,7 @@ async fn handle_node_control_command(
 
 async fn handle_identity_query(
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     action: &str,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
@@ -10622,7 +10612,7 @@ async fn handle_identity_query(
 
 async fn handle_identity_command(
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     action: &str,
     payload: serde_json::Value,
     hive: Option<String>,
@@ -10653,7 +10643,7 @@ async fn handle_identity_command(
 
 async fn handle_vault_command(
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     action: &str,
     payload: serde_json::Value,
     hive: Option<String>,
@@ -10827,7 +10817,7 @@ fn normalize_vault_put_payload(
 
 async fn handle_hive_update_command(
     _ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     hive_id: String,
     payload: serde_json::Value,
 ) -> Result<(u16, String), AdminError> {
@@ -11010,7 +11000,7 @@ async fn handle_hive_update_command(
 
 async fn handle_hive_sync_hint_command(
     _ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     hive_id: String,
     payload: serde_json::Value,
 ) -> Result<(u16, String), AdminError> {
@@ -11211,7 +11201,7 @@ fn build_admin_request(
 }
 
 async fn send_admin_request(
-    client: &RpcClient,
+    client: &RouterDispatcher,
     request: AdminRequest,
     timeout_window: Duration,
 ) -> Result<serde_json::Value, AdminError> {
@@ -11262,7 +11252,7 @@ async fn send_admin_request(
 }
 
 async fn send_system_request(
-    client: &RpcClient,
+    client: &RouterDispatcher,
     target: &str,
     request_msg: &str,
     expected_response_msg: &str,
@@ -11287,7 +11277,7 @@ async fn send_system_request(
 }
 
 async fn send_system_request_with_meta(
-    client: &RpcClient,
+    client: &RouterDispatcher,
     target: &str,
     request_msg: &str,
     expected_response_msg: &str,
@@ -11620,7 +11610,7 @@ fn admin_payload_contract_error(action: &str, payload: &serde_json::Value) -> Op
 
 async fn broadcast_full_config(
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     action: &str,
     target_hive: Option<&str>,
 ) -> Result<(), AdminError> {
@@ -11667,7 +11657,7 @@ fn list_config_items_payload<'a>(
 
 async fn send_opa_action(
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     action: &str,
     version: u64,
     rego: Option<String>,
@@ -11702,7 +11692,7 @@ async fn send_opa_action(
 
 async fn send_opa_query(
     ctx: &AdminContext,
-    client: &RpcClient,
+    client: &RouterDispatcher,
     action: &str,
     target: Option<String>,
 ) -> Result<Vec<OpaQueryEntry>, AdminError> {

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use fluxbee_sdk::identity::{
     load_hive_id, MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION, MSG_ILK_REGISTER, MSG_TNT_CREATE,
 };
-use fluxbee_sdk::rpc::{OperationalRouteProfile, RpcClient, RpcError, SystemRpcRequest};
+use fluxbee_sdk::rpc::{OperationalRouteProfile, RouterDispatcher, RpcError, SystemRpcRequest};
 use fluxbee_sdk::NodeConfig;
 use serde_json::{json, Value};
 use tokio::time::Duration;
@@ -297,7 +297,8 @@ async fn run_case_expect_ok(
         version: "0.0.1".to_string(),
     };
     let profile = OperationalRouteProfile::builder().build()?;
-    let client = RpcClient::connect_with_retry(cfg, Duration::from_millis(100), profile).await?;
+    let client =
+        RouterDispatcher::connect_with_retry(cfg, Duration::from_millis(100), profile).await?;
     let (payload, effective_target) =
         identity_call_with_fallback(&client, target, fallback_target, action, payload, timeout)
             .await?;
@@ -333,7 +334,8 @@ async fn run_case_expect_error(
         version: "0.0.1".to_string(),
     };
     let profile = OperationalRouteProfile::builder().build()?;
-    let client = RpcClient::connect_with_retry(cfg, Duration::from_millis(100), profile).await?;
+    let client =
+        RouterDispatcher::connect_with_retry(cfg, Duration::from_millis(100), profile).await?;
     let (payload, effective_target) =
         identity_call_with_fallback(&client, target, fallback_target, action, payload, timeout)
             .await?;
@@ -359,11 +361,11 @@ async fn run_case_expect_error(
 }
 
 /// Replicates the SDK `identity_system_call` fallback semantics over the new
-/// `RpcClient::send_system_rpc`. Retries on transport `UNREACHABLE` with
+/// `RouterDispatcher::send_system_rpc`. Retries on transport `UNREACHABLE` with
 /// `reason=NODE_NOT_FOUND` or on payload `status=error, error_code=NOT_PRIMARY`,
 /// against `fallback_target` when supplied and distinct.
 async fn identity_call_with_fallback(
-    client: &RpcClient,
+    client: &RouterDispatcher,
     target: &str,
     fallback_target: Option<&str>,
     action: &str,

@@ -21,9 +21,9 @@ use fluxbee_sdk::protocol::{
     MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    build_node_config_response_message, connect, managed_node_config_path,
-    try_handle_default_node_status, NodeConfig, NodeReceiver, NodeSender,
-    NODE_CONFIG_APPLY_MODE_REPLACE,
+    build_node_config_response_message, managed_node_config_path, try_handle_default_node_status,
+    NodeConfig, NodeSender, OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher,
+    VaultCallerOwned, VaultClient, NODE_CONFIG_APPLY_MODE_REPLACE,
 };
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, sha256_hex_to_bytes, IchEntry, IdentityRegionLimits,
@@ -2579,20 +2579,27 @@ async fn main() -> Result<(), IdentityError> {
 
     // Option-C fix (race ARCHI-BUG-12): connect persistently to the router
     // FIRST so we are announced BEFORE asking vault anything. The vault
-    // lookup below uses this same connection. If vault hasn't booted yet,
+    // lookup below reuses the same dispatcher. If vault hasn't booted yet,
     // the lookup returns Missing, but our persistent registration means
     // vault's bootstrap VAULT_SECRET_CHANGED broadcast (emitted when it
-    // arrives) lands in our receive loop and triggers the exit(0) rescue.
-    let (sender, mut receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    // arrives) lands in our system receiver and triggers the exit(0) rescue.
+    let profile = build_identity_rpc_profile()
+        .map_err(|err| format!("sy.identity rpc profile invalid: {err}"))?;
+    let dispatcher =
+        RouterDispatcher::connect_with_retry(node_config, Duration::from_secs(1), profile).await?;
+    let sender = dispatcher.sender_snapshot();
     tracing::info!(node_name = %sender.full_name(), "sy.identity connected to router");
+
+    let vault_client = VaultClient::new(
+        dispatcher.clone(),
+        hive.hive_id.clone(),
+        VaultCallerOwned::new(self_ilk_id.clone(), node_name.clone()),
+    );
 
     let (database_url, db_secret_source, vault_lookup_error) = if is_primary {
         resolve_database_url(
-            &sender,
-            &mut receiver,
-            &hive.hive_id,
+            &vault_client,
             &node_name,
-            &self_ilk_id,
             fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
         )
         .await
@@ -2765,6 +2772,10 @@ async fn main() -> Result<(), IdentityError> {
     let sync_listener = sync_listener;
     let mut delta_subscribers: Vec<mpsc::UnboundedSender<IdentityDeltaEnvelope>> = Vec::new();
     let mut next_delta_seq: u64 = 1;
+    let mut system_rx = dispatcher
+        .take_command_receiver(RPC_CH_SYSTEM)
+        .await
+        .map_err(|err| format!("sy.identity system receiver: {err}"))?;
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
@@ -2823,14 +2834,12 @@ async fn main() -> Result<(), IdentityError> {
                     }
                 }
             }
-            received = receiver.recv() => {
-                let msg = match received {
-                    Ok(msg) => msg,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "sy.identity connection interrupted; reconnect handled internally");
-                        continue;
-                    }
+            maybe_msg = system_rx.recv() => {
+                let Some(msg) = maybe_msg else {
+                    tracing::warn!("sy.identity system channel closed; exiting main loop");
+                    return Ok(());
                 };
+                let sender = dispatcher.sender_snapshot();
 
                 if msg.meta.msg_type != SYSTEM_KIND {
                     continue;
@@ -3952,19 +3961,16 @@ async fn send_system_response(
     Ok(())
 }
 
-async fn connect_with_retry(
-    config: &NodeConfig,
-    delay: Duration,
-) -> Result<(NodeSender, NodeReceiver), fluxbee_sdk::NodeError> {
-    loop {
-        match connect(config).await {
-            Ok(result) => return Ok(result),
-            Err(err) => {
-                tracing::warn!(error = %err, "connect failed; retrying");
-                time::sleep(delay).await;
-            }
-        }
-    }
+const RPC_CH_SYSTEM: &str = "system";
+
+fn build_identity_rpc_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::RpcError> {
+    OperationalRouteProfile::builder()
+        .command_channel(RPC_CH_SYSTEM)
+        .post_pending_rule(
+            RouteMatch::any_msg_type(SYSTEM_KIND),
+            RouteTarget::Command(RPC_CH_SYSTEM),
+        )
+        .build()
 }
 
 fn unauthorized_identity_source_payload(
@@ -5253,32 +5259,25 @@ fn identity_config_error_response(
 /// our (ilk, tenant) match rules. Returns `Ok((None, last_error))` with
 /// the error text if vault is unreachable or denies.
 async fn resolve_database_url(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
-    hive_id: &str,
+    vault: &VaultClient,
     node_name: &str,
-    self_ilk_id: &str,
     my_tenant: &str,
 ) -> (Option<String>, IdentityDbSecretSource, Option<String>) {
     // Option-C fix (race ARCHI-BUG-12): vault lookup uses the caller's
     // PERSISTENT router connection. The caller must already be announced
     // before calling this, so that if vault boots after us its bootstrap
-    // VAULT_SECRET_CHANGED broadcast lands in our receive loop (rescued by
-    // handle_vault_secret_changed).
+    // VAULT_SECRET_CHANGED broadcast lands in the dispatcher's system
+    // channel (rescued by `handle_vault_secret_changed`).
     let mut last_error = None;
     let started_at = Instant::now();
     let result = loop {
-        let caller = fluxbee_sdk::VaultCaller::new(self_ilk_id, node_name);
-        match fluxbee_sdk::resolve_resource(
-            sender,
-            receiver,
-            caller,
-            hive_id,
-            fluxbee_sdk::ResourceType::Postgres,
-            my_tenant,
-            Duration::from_secs(5),
-        )
-        .await
+        match vault
+            .resolve_resource(
+                fluxbee_sdk::ResourceType::Postgres,
+                my_tenant,
+                Duration::from_secs(5),
+            )
+            .await
         {
             Ok(value) => break Ok(value),
             Err(err) => {

@@ -3,7 +3,9 @@
 use anyhow::Result;
 use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{
-    connect, managed_node_config_path, NodeConfig, NodeSender, NodeUuidMode, FLUXBEE_NODE_NAME_ENV,
+    managed_node_config_path, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
+    RouteMatch, RouteTarget, RouterDispatcher, VaultCallerOwned, VaultClient,
+    FLUXBEE_NODE_NAME_ENV,
 };
 use futures_util::{SinkExt, StreamExt};
 use io_common::identity::{
@@ -32,7 +34,7 @@ use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
 use io_common::io_control_plane_store::{default_state_dir, persist_io_control_plane_state};
 use io_common::io_slack_adapter_config::IoSlackAdapterConfigContract;
 use io_common::provision::{
-    ensure_own_ich, FluxbeeIdentityProvisioner, IdentityProvisionConfig, RouterInbox,
+    ensure_own_ich, FluxbeeIdentityProvisioner, IdentityProvisionConfig,
 };
 use io_common::relay::{
     AssembledTurn, InMemoryRelayStore, RelayBuffer, RelayDecision, RelayFlushHints, RelayFragment,
@@ -87,28 +89,29 @@ async fn main() -> Result<()> {
         "io-slack starting"
     );
 
-    let (sender, receiver) = connect(&NodeConfig {
+    let node_config = NodeConfig {
         name: config.node_name.clone(),
         router_socket: config.router_socket.clone(),
         uuid_persistence_dir: config.uuid_persistence_dir.clone(),
         uuid_mode: NodeUuidMode::Persistent,
         config_dir: config.config_dir.clone(),
         version: config.node_version.clone(),
-    })
-    .await?;
+    };
+    let profile = build_io_slack_rpc_profile()
+        .map_err(|err| anyhow::anyhow!("io-slack rpc profile invalid: {err}"))?;
+    let dispatcher =
+        RouterDispatcher::connect_with_retry(node_config, Duration::from_secs(1), profile).await?;
+    let sender = dispatcher.sender_snapshot();
 
     tracing::info!(
-        full_name = %receiver.full_name(),
-        vpn_id = %receiver.vpn_id(),
+        full_name = %sender.full_name(),
         "connected to router"
     );
 
-    let inbox = Arc::new(Mutex::new(RouterInbox::new(receiver)));
     let slack = Arc::new(SlackClients::new(&config)?);
     let identity: Arc<dyn IdentityResolver> = Arc::new(ShmIdentityResolver::new(&config.island_id));
     let provisioner: Arc<dyn IdentityProvisioner> = Arc::new(FluxbeeIdentityProvisioner::new(
-        sender.clone(),
-        inbox.clone(),
+        dispatcher.clone(),
         IdentityProvisionConfig {
             target: config.identity_target.clone(),
             timeout: Duration::from_millis(config.identity_timeout_ms),
@@ -170,17 +173,22 @@ async fn main() -> Result<()> {
     // effective_config (which is the legacy path; will be deprecated). If
     // vault doesn't have the secret yet, the node runs degraded and the
     // refresh loop below will pick it up once the operator runs vault_put.
-    if let (Some(self_ilk_id_ref), Some(self_tenant_id_ref)) = (
+    let vault_client_opt: Option<VaultClient> = match (
         self_ilk_id.as_deref().filter(|v| !v.is_empty()),
+        config.node_name.split('@').nth(1).filter(|v| !v.is_empty()),
+    ) {
+        (Some(self_ilk_id_ref), Some(hive_id)) => Some(VaultClient::new(
+            dispatcher.clone(),
+            hive_id.to_string(),
+            VaultCallerOwned::new(self_ilk_id_ref.to_string(), config.node_name.clone()),
+        )),
+        _ => None,
+    };
+    if let (Some(vault_client), Some(self_tenant_id_ref)) = (
+        vault_client_opt.as_ref(),
         self_tenant_id.as_deref().filter(|v| !v.is_empty()),
     ) {
-        match resolve_slack_credentials_from_vault(
-            &config,
-            self_ilk_id_ref,
-            self_tenant_id_ref,
-        )
-        .await
-        {
+        match resolve_slack_credentials_from_vault(vault_client, self_tenant_id_ref).await {
             Some((app_token, bot_token)) => {
                 slack.reload_credentials(app_token, bot_token).await;
                 tracing::info!(
@@ -198,20 +206,19 @@ async fn main() -> Result<()> {
     } else {
         tracing::warn!(
             node_name = %config.node_name,
-            "FLUXBEE_NODE_ILK_ID / FLUXBEE_NODE_TENANT_ID not set; vault lookup skipped"
+            "FLUXBEE_NODE_ILK_ID / FLUXBEE_NODE_TENANT_ID / hive suffix missing; vault lookup skipped"
         );
     }
     // Periodic vault refresh — picks up vault_put after boot or rotations.
-    {
-        let refresh_config = config.clone();
+    if let Some(vault_client) = vault_client_opt {
+        let refresh_node_name = config.node_name.clone();
         let refresh_slack = slack.clone();
-        let self_ilk_id_clone = self_ilk_id.clone();
         let self_tenant_id_clone = self_tenant_id.clone();
         tokio::spawn(async move {
             run_slack_vault_refresh_loop(
-                refresh_config,
+                refresh_node_name,
+                vault_client,
                 refresh_slack,
-                self_ilk_id_clone,
                 self_tenant_id_clone,
             )
             .await;
@@ -249,8 +256,7 @@ async fn main() -> Result<()> {
             if let Err(error) = ensure_io_slack_binding_ich_registered(
                 &config.node_name,
                 &binding,
-                &sender,
-                inbox.clone(),
+                &dispatcher,
                 &IdentityProvisionConfig {
                     target: config.identity_target.clone(),
                     timeout: Duration::from_millis(config.identity_timeout_ms),
@@ -279,8 +285,7 @@ async fn main() -> Result<()> {
     }
 
     let outbound_task = tokio::spawn(run_outbound_loop(
-        inbox.clone(),
-        sender.clone(),
+        dispatcher.clone(),
         config.clone(),
         config.node_name.clone(),
         config.state_dir.clone(),
@@ -290,7 +295,6 @@ async fn main() -> Result<()> {
         inbound.clone(),
         slack.clone(),
         relay.clone(),
-        inbox.clone(),
         IdentityProvisionConfig {
             target: config.identity_target.clone(),
             timeout: Duration::from_millis(config.identity_timeout_ms),
@@ -304,8 +308,7 @@ async fn main() -> Result<()> {
 
     let inbound_task = tokio::spawn(run_inbound_socket_mode(
         config.clone(),
-        sender.clone(),
-        inbox.clone(),
+        dispatcher.clone(),
         IdentityProvisionConfig {
             target: config.identity_target.clone(),
             timeout: Duration::from_millis(config.identity_timeout_ms),
@@ -325,7 +328,7 @@ async fn main() -> Result<()> {
 
     let relay_flush_task = tokio::spawn(run_relay_flush_loop(
         relay,
-        sender,
+        dispatcher.clone(),
         identity,
         provisioner,
         inbound,
@@ -333,6 +336,19 @@ async fn main() -> Result<()> {
 
     let _ = tokio::join!(inbound_task, outbound_task, relay_flush_task);
     Ok(())
+}
+
+const RPC_CH_INCOMING: &str = "incoming";
+
+fn build_io_slack_rpc_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::RpcError> {
+    // io-slack receives admin/system messages (control-plane) and may also
+    // see user/text replies routed back. A single catch-all command channel
+    // is fine because the dispatcher matches our pending RPC waiters before
+    // the post_pending rule runs.
+    OperationalRouteProfile::builder()
+        .command_channel(RPC_CH_INCOMING)
+        .post_pending_rule(RouteMatch::Any, RouteTarget::Command(RPC_CH_INCOMING))
+        .build()
 }
 
 #[derive(Clone)]
@@ -720,45 +736,20 @@ const IO_SLACK_VAULT_REFRESH_INTERVAL_SECS: u64 = 60;
 /// The vault value is expected to be an object with both `app_token` and
 /// `bot_token` fields. Returns `Some((app_token, bot_token))` when both are
 /// present and non-empty, else `None` (degraded).
+///
+/// Vault site #7-of-9: now routed through the canonical `Arc<RouterDispatcher>`
+/// via `VaultClient` (no per-call ephemeral connection).
 async fn resolve_slack_credentials_from_vault(
-    config: &Config,
-    self_ilk_id: &str,
+    vault: &VaultClient,
     self_tenant_id: &str,
 ) -> Option<(String, String)> {
-    let Some(hive_id) = config.node_name.split('@').nth(1).filter(|v| !v.is_empty()) else {
-        tracing::warn!(
-            node_name = %config.node_name,
-            "node_name has no @hive suffix; cannot resolve vault target"
-        );
-        return None;
-    };
-    let node_config = NodeConfig {
-        name: config.node_name.clone(),
-        router_socket: config.router_socket.clone(),
-        uuid_persistence_dir: config.uuid_persistence_dir.clone(),
-        uuid_mode: NodeUuidMode::Ephemeral,
-        config_dir: config.config_dir.clone(),
-        version: config.node_version.clone(),
-    };
-    let (sender, mut receiver) = match connect(&node_config).await {
-        Ok(pair) => pair,
-        Err(err) => {
-            tracing::warn!(error = %err, "io-slack vault lookup: ephemeral router connect failed");
-            return None;
-        }
-    };
-    let caller = fluxbee_sdk::VaultCaller::new(self_ilk_id, &config.node_name);
-    let result = fluxbee_sdk::resolve_resource(
-        &sender,
-        &mut receiver,
-        caller,
-        hive_id,
-        fluxbee_sdk::ResourceType::Slack,
-        self_tenant_id,
-        Duration::from_secs(5),
-    )
-    .await;
-    let _ = sender.close().await;
+    let result = vault
+        .resolve_resource(
+            fluxbee_sdk::ResourceType::Slack,
+            self_tenant_id,
+            Duration::from_secs(5),
+        )
+        .await;
     match result {
         Ok(Some(value)) => extract_slack_tokens_from_vault_value(&value),
         Ok(None) => None,
@@ -793,18 +784,15 @@ fn extract_slack_tokens_from_vault_value(value: &Value) -> Option<(String, Strin
 /// so credentials picked up post-boot (vault_put after the node started)
 /// or rotated credentials flow into the runtime without restart.
 async fn run_slack_vault_refresh_loop(
-    config: Config,
+    node_name: String,
+    vault: VaultClient,
     slack: Arc<SlackClients>,
-    self_ilk_id: Option<String>,
     self_tenant_id: Option<String>,
 ) {
-    let (Some(self_ilk_id), Some(self_tenant_id)) = (
-        self_ilk_id.filter(|v| !v.is_empty()),
-        self_tenant_id.filter(|v| !v.is_empty()),
-    ) else {
+    let Some(self_tenant_id) = self_tenant_id.filter(|v| !v.is_empty()) else {
         tracing::warn!(
-            node_name = %config.node_name,
-            "self_ilk_id / self_tenant_id missing; vault refresh loop disabled"
+            node_name = %node_name,
+            "self_tenant_id missing; vault refresh loop disabled"
         );
         return;
     };
@@ -813,7 +801,7 @@ async fn run_slack_vault_refresh_loop(
     loop {
         ticker.tick().await;
         if let Some((app_token, bot_token)) =
-            resolve_slack_credentials_from_vault(&config, &self_ilk_id, &self_tenant_id).await
+            resolve_slack_credentials_from_vault(&vault, &self_tenant_id).await
         {
             // reload_credentials is cheap and idempotent: it overwrites
             // the runtime tokens. If they didn't change, the next API
@@ -1102,8 +1090,7 @@ struct SocketEnvelope {
 
 async fn run_inbound_socket_mode(
     config: Config,
-    sender: NodeSender,
-    router_inbox: Arc<Mutex<RouterInbox>>,
+    dispatcher: Arc<RouterDispatcher>,
     identity_provision_cfg: IdentityProvisionConfig,
     control_plane: Arc<RwLock<IoControlPlaneState>>,
     self_ilk_id: Option<String>,
@@ -1117,6 +1104,7 @@ async fn run_inbound_socket_mode(
     blob_toolkit: Arc<fluxbee_sdk::blob::BlobToolkit>,
     blob_payload_cfg: IoTextBlobConfig,
 ) -> Result<()> {
+    let sender = dispatcher.sender_snapshot();
     let mention_re = Regex::new(r"^<@[^>]+>\s*")?;
 
     loop {
@@ -1252,8 +1240,7 @@ async fn run_inbound_socket_mode(
             if let Err(err) = ensure_io_slack_binding_ich_registered(
                 &config.node_name,
                 &binding,
-                &sender,
-                router_inbox.clone(),
+                &dispatcher,
                 &identity_provision_cfg,
                 self_ilk_id.as_deref(),
                 self_tenant_id.as_deref(),
@@ -1498,8 +1485,7 @@ fn build_slack_relay_fragment(
 async fn ensure_io_slack_binding_ich_registered(
     node_name: &str,
     binding: &SlackBindingConfig,
-    sender: &NodeSender,
-    router_inbox: Arc<Mutex<RouterInbox>>,
+    dispatcher: &Arc<RouterDispatcher>,
     identity_provision_cfg: &IdentityProvisionConfig,
     self_ilk_id: Option<&str>,
     self_tenant_id: Option<&str>,
@@ -1521,8 +1507,7 @@ async fn ensure_io_slack_binding_ich_registered(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("missing self_tenant_id for IO.slack own ICH registration"))?;
     let result = ensure_own_ich(
-        sender,
-        router_inbox,
+        dispatcher,
         identity_provision_cfg,
         identity_provision_cfg.target.as_str(),
         self_ilk_id,
@@ -1582,7 +1567,7 @@ async fn dispatch_inbound_outcome(sender: NodeSender, outcome: InboundOutcome, s
 
 async fn run_relay_flush_loop(
     relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
-    sender: NodeSender,
+    dispatcher: Arc<RouterDispatcher>,
     identity: Arc<dyn IdentityResolver>,
     provisioner: Arc<dyn IdentityProvisioner>,
     inbound: Arc<Mutex<InboundProcessor>>,
@@ -1592,8 +1577,9 @@ async fn run_relay_flush_loop(
         interval.tick().await;
         let turns = relay.lock().await.flush_expired(now_epoch_ms());
         for turn in turns {
+            let sender = dispatcher.sender_snapshot();
             dispatch_assembled_turn(
-                sender.clone(),
+                sender,
                 identity.as_ref(),
                 provisioner.as_ref(),
                 inbound.clone(),
@@ -2106,8 +2092,7 @@ fn slack_external_id(node_name: &str, user_id: &str) -> String {
 }
 
 async fn run_outbound_loop(
-    inbox: Arc<Mutex<RouterInbox>>,
-    sender: NodeSender,
+    dispatcher: Arc<RouterDispatcher>,
     config: Config,
     node_name: String,
     state_dir: PathBuf,
@@ -2117,7 +2102,6 @@ async fn run_outbound_loop(
     inbound: Arc<Mutex<InboundProcessor>>,
     slack: Arc<SlackClients>,
     relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
-    router_inbox: Arc<Mutex<RouterInbox>>,
     identity_provision_cfg: IdentityProvisionConfig,
     self_ilk_id: Option<String>,
     self_tenant_id: Option<String>,
@@ -2125,24 +2109,15 @@ async fn run_outbound_loop(
     blob_toolkit: Arc<fluxbee_sdk::blob::BlobToolkit>,
     blob_payload_cfg: IoTextBlobConfig,
 ) -> Result<()> {
+    let mut incoming_rx = dispatcher
+        .take_command_receiver(RPC_CH_INCOMING)
+        .await
+        .map_err(|err| anyhow::anyhow!("io-slack incoming receiver: {err}"))?;
+    let sender = dispatcher.sender_snapshot();
     loop {
-        let next_msg = {
-            let mut guard = inbox.lock().await;
-            guard.recv_next_timeout(Duration::from_secs(1)).await
-        };
-        let next_msg = match next_msg {
-            Ok(value) => value,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "router inbox recv failed in outbound loop; continuing"
-                );
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                continue;
-            }
-        };
-        let Some(msg) = next_msg else {
-            continue;
+        let Some(msg) = incoming_rx.recv().await else {
+            tracing::warn!("io-slack incoming channel closed; exiting outbound loop");
+            return Ok(());
         };
 
         let payload_type = msg
@@ -2170,8 +2145,7 @@ async fn run_outbound_loop(
             inbound.clone(),
             slack.clone(),
             relay.clone(),
-            sender.clone(),
-            router_inbox.clone(),
+            dispatcher.clone(),
             identity_provision_cfg.clone(),
             self_ilk_id.clone(),
             self_tenant_id.clone(),
@@ -2378,8 +2352,7 @@ async fn handle_io_control_plane_message(
     inbound: Arc<Mutex<InboundProcessor>>,
     slack: Arc<SlackClients>,
     relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
-    sender: NodeSender,
-    router_inbox: Arc<Mutex<RouterInbox>>,
+    dispatcher: Arc<RouterDispatcher>,
     identity_provision_cfg: IdentityProvisionConfig,
     self_ilk_id: Option<String>,
     self_tenant_id: Option<String>,
@@ -2458,8 +2431,7 @@ async fn handle_io_control_plane_message(
                 inbound,
                 slack,
                 relay,
-                sender,
-                router_inbox,
+                dispatcher,
                 identity_provision_cfg,
                 self_ilk_id,
                 self_tenant_id,
@@ -2500,8 +2472,7 @@ async fn apply_io_config_set(
     inbound: Arc<Mutex<InboundProcessor>>,
     slack: Arc<SlackClients>,
     relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
-    sender: NodeSender,
-    router_inbox: Arc<Mutex<RouterInbox>>,
+    dispatcher: Arc<RouterDispatcher>,
     identity_provision_cfg: IdentityProvisionConfig,
     self_ilk_id: Option<String>,
     self_tenant_id: Option<String>,
@@ -2736,8 +2707,7 @@ async fn apply_io_config_set(
     if let Err(err) = ensure_io_slack_binding_ich_registered(
         node_name,
         &binding,
-        &sender,
-        router_inbox,
+        &dispatcher,
         &identity_provision_cfg,
         self_ilk_id.as_deref(),
         self_tenant_id.as_deref(),

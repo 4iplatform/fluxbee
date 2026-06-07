@@ -33,8 +33,8 @@ use fluxbee_sdk::protocol::{
 #[cfg(not(test))]
 use fluxbee_sdk::rpc::{AdminCommandRequest, AdminCommandResult};
 use fluxbee_sdk::rpc::{
-    OperationalRouteProfile, RouteMatch, RouteTarget, RpcClient, RpcCommandReceiver, RpcError,
-    SystemRpcRequest,
+    OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, RpcCommandReceiver,
+    RpcError, SystemRpcRequest,
 };
 use fluxbee_sdk::{
     classify_admin_action, classify_system_message, derive_action_outcome, NodeConfig, NodeSender,
@@ -429,11 +429,11 @@ struct OrchestratorState {
     blob: BlobRuntimeConfig,
     dist: DistRuntimeConfig,
     blob_sync_last_desired: Mutex<BlobRuntimeConfig>,
-    rpc: OnceLock<Arc<RpcClient>>,
+    rpc: OnceLock<Arc<RouterDispatcher>>,
 }
 
 impl OrchestratorState {
-    fn rpc(&self) -> Result<Arc<RpcClient>, OrchestratorError> {
+    fn rpc(&self) -> Result<Arc<RouterDispatcher>, OrchestratorError> {
         self.rpc
             .get()
             .cloned()
@@ -603,7 +603,8 @@ async fn main() -> Result<(), OrchestratorError> {
     let rpc_profile = build_orchestrator_rpc_profile()
         .map_err(|err| format!("orchestrator rpc profile invalid: {err}"))?;
     let rpc_client =
-        RpcClient::connect_with_retry(node_config, Duration::from_secs(1), rpc_profile).await?;
+        RouterDispatcher::connect_with_retry(node_config, Duration::from_secs(1), rpc_profile)
+            .await?;
     if state.rpc.set(Arc::clone(&rpc_client)).is_err() {
         return Err("orchestrator rpc client already initialized".into());
     }
@@ -620,7 +621,7 @@ async fn main() -> Result<(), OrchestratorError> {
 
     // Long-lived workers serializing admin/system command delivery. Each one
     // owns its `RpcCommandReceiver` so we keep ordering inside a category
-    // while the RpcClient recv loop in `tokio::spawn` continues to dispatch
+    // while the RouterDispatcher recv loop in `tokio::spawn` continues to dispatch
     // pending RPC responses. This is the deadlock fix from ORPC review item 1.
     let admin_rx = rpc_client
         .take_command_receiver(RPC_CH_ADMIN)
@@ -682,7 +683,7 @@ async fn main() -> Result<(), OrchestratorError> {
 
 async fn run_admin_worker(
     state: Arc<OrchestratorState>,
-    client: Arc<RpcClient>,
+    client: Arc<RouterDispatcher>,
     mut rx: RpcCommandReceiver,
 ) {
     while let Some(msg) = rx.recv().await {
@@ -695,7 +696,7 @@ async fn run_admin_worker(
 
 async fn run_system_worker(
     state: Arc<OrchestratorState>,
-    client: Arc<RpcClient>,
+    client: Arc<RouterDispatcher>,
     mut rx: RpcCommandReceiver,
 ) {
     while let Some(msg) = rx.recv().await {
@@ -16672,9 +16673,14 @@ blob:
         }
     }
 
-    fn attach_test_rpc(state: &OrchestratorState) -> (Arc<RpcClient>, fluxbee_sdk::RpcTestHarness) {
+    fn attach_test_rpc(
+        state: &OrchestratorState,
+    ) -> (
+        Arc<RouterDispatcher>,
+        fluxbee_sdk::RouterDispatcherTestHarness,
+    ) {
         let profile = build_orchestrator_rpc_profile().expect("orchestrator rpc profile");
-        let (client, harness) = fluxbee_sdk::RpcTestHarness::new_with_uuid(
+        let (client, harness) = fluxbee_sdk::RouterDispatcherTestHarness::new_with_uuid(
             "orchestrator-test-uuid",
             "SY.orchestrator@motherbee",
             profile,
@@ -16753,7 +16759,7 @@ blob:
         }
     }
 
-    async fn wait_for_stale_metric(client: &RpcClient, expected: u64) {
+    async fn wait_for_stale_metric(client: &RouterDispatcher, expected: u64) {
         time::timeout(Duration::from_secs(1), async {
             loop {
                 if client.metric_stale_responses() >= expected {
@@ -17190,7 +17196,7 @@ blob:
         // on the test sender is the matching `*_RESPONSE` with the FORBIDDEN
         // shape. This proves that the dispatcher never reaches `*_flow` for
         // unauthorized callers.
-        use fluxbee_sdk::RpcTestHarness;
+        use fluxbee_sdk::RouterDispatcherTestHarness;
 
         for (action, expected_response) in [
             ("START_NODE", "START_NODE_RESPONSE"),
@@ -17201,7 +17207,8 @@ blob:
             ("SYSTEM_UPDATE", "SYSTEM_UPDATE_RESPONSE"),
         ] {
             let profile = build_orchestrator_rpc_profile().expect("orchestrator profile builds");
-            let (client, mut harness) = RpcTestHarness::new("SY.orchestrator@motherbee", profile);
+            let (client, mut harness) =
+                RouterDispatcherTestHarness::new("SY.orchestrator@motherbee", profile);
             let sender = client.sender_snapshot();
             let state = Arc::new(sample_orchestrator_state_for_tests());
 

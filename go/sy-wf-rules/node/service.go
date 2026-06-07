@@ -24,36 +24,40 @@ type sender interface {
 	FullName() string
 }
 
-type receiver interface {
-	Recv(context.Context) (fluxbeesdk.Message, error)
-}
-
 type Service struct {
 	cfg          NodeConfig
 	store        *Store
 	sender       sender
-	receiver     receiver
-	mux          *messageMux
+	dispatcher   *fluxbeesdk.RouterDispatcher
+	incoming     <-chan fluxbeesdk.Message
 	admin        adminClient
 	orchestrator orchestratorClient
 	wfNodes      wfNodeClient
 	clock        ClockFunc
 }
 
-func NewService(cfg NodeConfig, snd sender, rcv receiver, clock ClockFunc) *Service {
+func NewService(
+	cfg NodeConfig,
+	dispatcher *fluxbeesdk.RouterDispatcher,
+	incoming <-chan fluxbeesdk.Message,
+	clock ClockFunc,
+) *Service {
 	if clock == nil {
 		clock = func() time.Time { return time.Now().UTC() }
 	}
-	mux := newMessageMux(rcv)
+	var snd sender
+	if dispatcher != nil {
+		snd = dispatcher.SenderSnapshot()
+	}
 	return &Service{
 		cfg:          cfg,
 		store:        NewStore(cfg.StateDir),
 		sender:       snd,
-		receiver:     rcv,
-		mux:          mux,
-		admin:        newAdminClient(cfg, snd, mux),
-		orchestrator: newOrchestratorClient(snd, mux),
-		wfNodes:      newWFNodeClient(snd, mux),
+		dispatcher:   dispatcher,
+		incoming:     incoming,
+		admin:        newAdminClient(cfg, dispatcher),
+		orchestrator: newOrchestratorClient(dispatcher),
+		wfNodes:      newWFNodeClient(dispatcher),
 		clock:        clock,
 	}
 }
@@ -90,16 +94,29 @@ func Run(runtimeCfg RuntimeConfig) error {
 	log.Printf("resolved self system ILK from identity SHM: %s", selfIlkID)
 	_ = selfIlkID // cached for future outgoing meta.src_ilk use
 
-	sender, receiver, err := fluxbeesdk.Connect(fluxbeesdk.NodeConfig{
+	profile, err := fluxbeesdk.NewOperationalRouteProfile().
+		CommandChannel("incoming").
+		PostPendingRule(fluxbeesdk.RouteAny{}, fluxbeesdk.RouteCommand{Channel: "incoming"}).
+		Build()
+	if err != nil {
+		return fmt.Errorf("sy-wf-rules rpc profile invalid: %w", err)
+	}
+	dispatcher, err := fluxbeesdk.ConnectWithRetry(fluxbeesdk.NodeConfig{
 		Name:               runtimeCfg.NodeBaseName,
 		RouterSocket:       runtimeCfg.RouterSocketDir,
 		UUIDPersistenceDir: runtimeCfg.UUIDPersistenceDir,
 		UUIDMode:           fluxbeesdk.NodeUuidPersistent,
 		ConfigDir:          runtimeCfg.ConfigDir,
 		Version:            "0.1.0",
-	})
+	}, time.Second, profile)
 	if err != nil {
 		return err
+	}
+	defer func() { _ = dispatcher.Close() }()
+	sender := dispatcher.SenderSnapshot()
+	incoming, err := dispatcher.TakeCommandReceiver("incoming")
+	if err != nil {
+		return fmt.Errorf("take incoming receiver: %w", err)
 	}
 	cfg, err := BuildNodeConfig(sender.FullName(), runtimeCfg.StateDir, runtimeCfg.DistRuntimeRoot)
 	if err != nil {
@@ -111,7 +128,8 @@ func Run(runtimeCfg RuntimeConfig) error {
 	if err := os.MkdirAll(cfg.DistRuntimeRoot, 0o755); err != nil {
 		return err
 	}
-	return NewService(cfg, sender, receiver, nil).RunWithContext(ctx)
+	_ = sender
+	return NewService(cfg, dispatcher, incoming, nil).RunWithContext(ctx)
 }
 
 func (s *Service) Run() error {
@@ -119,19 +137,19 @@ func (s *Service) Run() error {
 }
 
 func (s *Service) RunWithContext(ctx context.Context) error {
-	if s.mux == nil {
-		return fmt.Errorf("message mux is required")
+	if s.incoming == nil {
+		return fmt.Errorf("incoming channel is required")
 	}
-	go s.mux.Run(ctx)
 	for {
-		msg, err := s.mux.NextMessage(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
+		select {
+		case <-ctx.Done():
+			return nil
+		case msg, ok := <-s.incoming:
+			if !ok {
 				return nil
 			}
-			return err
+			s.handleMessage(msg)
 		}
-		s.handleMessage(msg)
 	}
 }
 

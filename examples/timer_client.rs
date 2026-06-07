@@ -1,10 +1,12 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use fluxbee_sdk::{
-    connect, parse_timer_fired_event, try_handle_default_node_status, NodeConfig, NodeError,
-    NodeReceiver, NodeSender, NodeUuidMode, TimerClient, TimerClientConfig, TimerId, TimerInfo,
-    TimerListFilter, TimerSchedulePayload, TimerStatus,
+    parse_timer_fired_event, try_handle_default_node_status, NodeConfig, NodeUuidMode,
+    OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, RpcCommandReceiver,
+    TimerClient, TimerClientConfig, TimerId, TimerInfo, TimerListFilter, TimerSchedulePayload,
+    TimerStatus,
 };
 use serde_json::json;
 use tokio::time::{sleep, Duration, Instant as TokioInstant};
@@ -52,21 +54,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         version: "1.0".to_string(),
     };
 
-    let (sender, mut receiver) =
-        connect_with_retry(&node_config, StdDuration::from_secs(1)).await?;
+    let profile = OperationalRouteProfile::builder()
+        .command_channel("incoming")
+        .post_pending_rule(RouteMatch::Any, RouteTarget::Command("incoming"))
+        .build()?;
+    let dispatcher =
+        RouterDispatcher::connect_with_retry(node_config, StdDuration::from_secs(1), profile)
+            .await?;
+    let mut incoming = dispatcher.take_command_receiver("incoming").await?;
+    let sender = dispatcher.sender_snapshot();
     println!(
-        "connected as {} (uuid={}, vpn={}, uuid_mode={:?})",
+        "connected as {} (uuid={}, uuid_mode={:?})",
         sender.full_name(),
         sender.uuid(),
-        receiver.vpn_id(),
         uuid_mode,
     );
 
     match mode {
         ExampleMode::Fire => {
             let client_ref = format!("rust-example-{}", unix_now_ms());
-            let timer_id =
-                schedule_and_inspect(&sender, &mut receiver, delay_secs, &client_ref).await?;
+            let timer_id = schedule_and_inspect(&dispatcher, delay_secs, &client_ref).await?;
             println!(
                 "scheduled timer_uuid={} client_ref={}",
                 timer_id.as_str(),
@@ -74,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let fired_event =
-                wait_for_timer_fired(&sender, &mut receiver, &timer_id, delay_secs).await?;
+                wait_for_timer_fired(&dispatcher, &mut incoming, &timer_id, delay_secs).await?;
             println!(
                 "received TIMER_FIRED timer_uuid={} actual_fire_at_utc_ms={} fire_count={}",
                 fired_event.timer_uuid.as_str(),
@@ -82,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fired_event.fire_count,
             );
 
-            let final_state = wait_for_fired_state(&sender, &mut receiver, &timer_id).await?;
+            let final_state = wait_for_fired_state(&dispatcher, &timer_id).await?;
             println!(
                 "confirmed final timer state uuid={} status={:?} fire_count={} last_fired_at={:?}",
                 final_state.uuid.as_str(),
@@ -92,13 +99,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         ExampleMode::CancelByClientRef => {
-            run_cancel_by_client_ref(&sender, &mut receiver, delay_secs).await?;
+            run_cancel_by_client_ref(&dispatcher, delay_secs).await?;
         }
         ExampleMode::RescheduleByClientRef => {
-            run_reschedule_by_client_ref(&sender, &mut receiver, delay_secs).await?;
+            run_reschedule_by_client_ref(&dispatcher, delay_secs).await?;
         }
         ExampleMode::IdempotentClientRef => {
-            run_idempotent_client_ref(&sender, &mut receiver, delay_secs).await?;
+            run_idempotent_client_ref(&dispatcher, delay_secs).await?;
         }
     }
 
@@ -106,12 +113,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn schedule_and_inspect(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
+    dispatcher: &Arc<RouterDispatcher>,
     delay_secs: u64,
     client_ref: &str,
 ) -> Result<TimerId, Box<dyn std::error::Error>> {
-    let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
+    let mut client =
+        TimerClient::new_with_dispatcher(dispatcher.clone(), TimerClientConfig::default())?;
+    let sender = dispatcher.sender_snapshot();
     let now = client.now().await?;
     println!(
         "timer target={} now_utc_ms={} now_utc_iso={}",
@@ -165,26 +173,25 @@ async fn schedule_and_inspect(
 }
 
 async fn run_cancel_by_client_ref(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
+    dispatcher: &Arc<RouterDispatcher>,
     delay_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client_ref = format!("rust-cancel-example-{}", unix_now_ms());
-    let timer_id = schedule_and_inspect(sender, receiver, delay_secs, &client_ref).await?;
+    let timer_id = schedule_and_inspect(dispatcher, delay_secs, &client_ref).await?;
     println!(
         "scheduled timer_uuid={} client_ref={} for cancel-by-client_ref flow",
         timer_id.as_str(),
         client_ref
     );
 
-    let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
+    let mut client =
+        TimerClient::new_with_dispatcher(dispatcher.clone(), TimerClientConfig::default())?;
     let response = client.cancel_by_client_ref(client_ref.as_str()).await?;
     println!(
         "cancel response found={:?} status={:?}",
         response.found, response.status
     );
-    let final_state =
-        wait_for_status(sender, receiver, timer_id.as_ref(), TimerStatus::Canceled).await?;
+    let final_state = wait_for_status(dispatcher, timer_id.as_ref(), TimerStatus::Canceled).await?;
     println!(
         "confirmed canceled timer state uuid={} status={:?}",
         final_state.uuid.as_str(),
@@ -194,18 +201,15 @@ async fn run_cancel_by_client_ref(
 }
 
 async fn run_reschedule_by_client_ref(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
+    dispatcher: &Arc<RouterDispatcher>,
     delay_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client_ref = format!("rust-reschedule-example-{}", unix_now_ms());
-    let timer_id = schedule_and_inspect(sender, receiver, delay_secs, &client_ref).await?;
-    let original = {
-        let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
-        client.get(timer_id.clone()).await?
-    };
+    let timer_id = schedule_and_inspect(dispatcher, delay_secs, &client_ref).await?;
+    let mut client =
+        TimerClient::new_with_dispatcher(dispatcher.clone(), TimerClientConfig::default())?;
+    let original = client.get(timer_id.clone()).await?;
     let new_fire_at = original.fire_at_utc_ms + 120_000;
-    let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
     let response = client
         .reschedule_by_client_ref(client_ref.as_str(), new_fire_at)
         .await?;
@@ -213,7 +217,7 @@ async fn run_reschedule_by_client_ref(
         "reschedule response found={:?} fire_at_utc_ms={:?}",
         response.found, response.fire_at_utc_ms
     );
-    let updated = wait_for_fire_at(sender, receiver, timer_id.as_ref(), new_fire_at).await?;
+    let updated = wait_for_fire_at(dispatcher, timer_id.as_ref(), new_fire_at).await?;
     println!(
         "confirmed rescheduled timer uuid={} new_fire_at_utc_ms={}",
         updated.uuid.as_str(),
@@ -223,13 +227,12 @@ async fn run_reschedule_by_client_ref(
 }
 
 async fn run_idempotent_client_ref(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
+    dispatcher: &Arc<RouterDispatcher>,
     delay_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client_ref = format!("rust-idempotent-example-{}", unix_now_ms());
-    let first = schedule_and_inspect(sender, receiver, delay_secs, &client_ref).await?;
-    let second = schedule_and_inspect(sender, receiver, delay_secs, &client_ref).await?;
+    let first = schedule_and_inspect(dispatcher, delay_secs, &client_ref).await?;
+    let second = schedule_and_inspect(dispatcher, delay_secs, &client_ref).await?;
     println!(
         "idempotent schedule first_uuid={} second_uuid={} same={}",
         first.as_str(),
@@ -239,15 +242,14 @@ async fn run_idempotent_client_ref(
     if first != second {
         return Err("idempotent schedule returned different timer uuids".into());
     }
-    let listed = {
-        let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
-        client
-            .list_mine(TimerListFilter {
-                limit: Some(20),
-                ..TimerListFilter::default()
-            })
-            .await?
-    };
+    let mut client =
+        TimerClient::new_with_dispatcher(dispatcher.clone(), TimerClientConfig::default())?;
+    let listed = client
+        .list_mine(TimerListFilter {
+            limit: Some(20),
+            ..TimerListFilter::default()
+        })
+        .await?;
     let matching: Vec<_> = listed
         .timers
         .iter()
@@ -334,13 +336,14 @@ Rebuild/restart sy-timer on the host to pick up the router SHM resolver, or reru
 }
 
 async fn wait_for_timer_fired(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
+    dispatcher: &Arc<RouterDispatcher>,
+    incoming: &mut RpcCommandReceiver,
     timer_id: &TimerId,
     delay_secs: u64,
 ) -> Result<fluxbee_sdk::FiredEvent, Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(delay_secs + 30);
     let deadline = TokioInstant::now() + timeout;
+    let sender = dispatcher.sender_snapshot();
     loop {
         let now = TokioInstant::now();
         if now >= deadline {
@@ -352,11 +355,22 @@ async fn wait_for_timer_fired(
             .into());
         }
         let remaining = deadline - now;
-        let incoming = receiver.recv_timeout(remaining).await?;
-        if try_handle_default_node_status(sender, &incoming).await? {
+        let incoming_msg = tokio::time::timeout(remaining, incoming.recv())
+            .await
+            .map_err(|_| {
+                format!(
+                    "timeout waiting TIMER_FIRED for {} after {}s",
+                    timer_id.as_str(),
+                    timeout.as_secs()
+                )
+            })?
+            .ok_or_else::<Box<dyn std::error::Error>, _>(|| {
+                "incoming channel closed before TIMER_FIRED arrived".into()
+            })?;
+        if try_handle_default_node_status(&sender, &incoming_msg).await? {
             continue;
         }
-        match parse_timer_fired_event(&incoming) {
+        match parse_timer_fired_event(&incoming_msg) {
             Ok(event) if event.timer_uuid == *timer_id => return Ok(event),
             Ok(event) => {
                 println!(
@@ -367,7 +381,9 @@ async fn wait_for_timer_fired(
             Err(_) => {
                 println!(
                     "ignoring message kind={} msg={:?} trace_id={}",
-                    incoming.meta.msg_type, incoming.meta.msg, incoming.routing.trace_id
+                    incoming_msg.meta.msg_type,
+                    incoming_msg.meta.msg,
+                    incoming_msg.routing.trace_id
                 );
             }
         }
@@ -375,8 +391,7 @@ async fn wait_for_timer_fired(
 }
 
 async fn wait_for_fired_state(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
+    dispatcher: &Arc<RouterDispatcher>,
     timer_id: &TimerId,
 ) -> Result<TimerInfo, Box<dyn std::error::Error>> {
     let delays = [
@@ -392,11 +407,12 @@ async fn wait_for_fired_state(
         Duration::from_secs(1),
     ];
     let mut last_info = None;
+    let mut client =
+        TimerClient::new_with_dispatcher(dispatcher.clone(), TimerClientConfig::default())?;
     for delay in delays.into_iter().take(POST_FIRE_STATUS_ATTEMPTS) {
         if !delay.is_zero() {
             sleep(delay).await;
         }
-        let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
         let info = client.get(timer_id.clone()).await?;
         if info.status == TimerStatus::Fired {
             return Ok(info);
@@ -412,12 +428,13 @@ async fn wait_for_fired_state(
 }
 
 async fn wait_for_status(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
+    dispatcher: &Arc<RouterDispatcher>,
     timer_id: &str,
     expected: TimerStatus,
 ) -> Result<TimerInfo, Box<dyn std::error::Error>> {
     let mut last_info = None;
+    let mut client =
+        TimerClient::new_with_dispatcher(dispatcher.clone(), TimerClientConfig::default())?;
     for delay in [
         Duration::from_millis(0),
         Duration::from_millis(100),
@@ -429,7 +446,6 @@ async fn wait_for_status(
         if !delay.is_zero() {
             sleep(delay).await;
         }
-        let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
         let info = client.get(TimerId::from(timer_id)).await?;
         if info.status == expected {
             return Ok(info);
@@ -446,12 +462,13 @@ async fn wait_for_status(
 }
 
 async fn wait_for_fire_at(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
+    dispatcher: &Arc<RouterDispatcher>,
     timer_id: &str,
     expected_fire_at: i64,
 ) -> Result<TimerInfo, Box<dyn std::error::Error>> {
     let mut last_info = None;
+    let mut client =
+        TimerClient::new_with_dispatcher(dispatcher.clone(), TimerClientConfig::default())?;
     for delay in [
         Duration::from_millis(0),
         Duration::from_millis(100),
@@ -463,7 +480,6 @@ async fn wait_for_fire_at(
         if !delay.is_zero() {
             sleep(delay).await;
         }
-        let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
         let info = client.get(TimerId::from(timer_id)).await?;
         if info.fire_at_utc_ms == expected_fire_at {
             return Ok(info);
@@ -484,19 +500,4 @@ fn unix_now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
-}
-
-async fn connect_with_retry(
-    config: &NodeConfig,
-    delay: StdDuration,
-) -> Result<(NodeSender, NodeReceiver), NodeError> {
-    loop {
-        match connect(config).await {
-            Ok(result) => return Ok(result),
-            Err(err) => {
-                eprintln!("connect failed: {err}");
-                sleep(Duration::from_millis(delay.as_millis() as u64)).await;
-            }
-        }
-    }
 }

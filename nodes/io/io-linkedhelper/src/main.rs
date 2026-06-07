@@ -12,9 +12,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{
-    compute_thread_id, connect, resolve_identity_option_from_hive_id,
-    try_handle_default_node_status, NodeConfig, NodeUuidMode, ThreadIdInput,
-    FLUXBEE_NODE_NAME_ENV,
+    compute_thread_id, resolve_identity_option_from_hive_id, try_handle_default_node_status,
+    NodeConfig, NodeUuidMode, OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher,
+    ThreadIdInput, FLUXBEE_NODE_NAME_ENV,
 };
 use io_common::identity::{IdentityError, ResolveOrCreateInput};
 use io_common::io_adapter_config::{
@@ -34,7 +34,7 @@ use io_common::io_control_plane_logging::{
 use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
 use io_common::io_control_plane_store::persist_io_control_plane_state;
 use io_common::io_linkedhelper_adapter_config::IoLinkedHelperAdapterConfigContract;
-use io_common::provision::{strict_provision_ilk, IdentityProvisionConfig, RouterInbox};
+use io_common::provision::{strict_provision_ilk, IdentityProvisionConfig};
 use io_common::router_message::new_trace_id;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -113,8 +113,7 @@ struct HttpState {
     node_name: String,
     hive_id: String,
     state_dir: PathBuf,
-    sender: fluxbee_sdk::NodeSender,
-    router_inbox: Arc<Mutex<RouterInbox>>,
+    dispatcher: Arc<RouterDispatcher>,
     control_plane: Arc<RwLock<IoControlPlaneState>>,
     adapter_contract: Arc<dyn IoAdapterConfigContract>,
     runtime_registry: Arc<RwLock<LinkedHelperRuntimeRegistry>>,
@@ -267,19 +266,22 @@ async fn main() -> Result<()> {
         "io-linkedhelper starting"
     );
 
-    let (sender, receiver) = connect(&NodeConfig {
+    let node_config = NodeConfig {
         name: config.node_name.clone(),
         router_socket: config.router_socket.clone(),
         uuid_persistence_dir: config.uuid_persistence_dir.clone(),
         uuid_mode: NodeUuidMode::Persistent,
         config_dir: config.config_dir.clone(),
         version: config.node_version.clone(),
-    })
-    .await?;
+    };
+    let profile = build_io_linkedhelper_rpc_profile()
+        .map_err(|err| anyhow::anyhow!("io-linkedhelper rpc profile invalid: {err}"))?;
+    let dispatcher =
+        RouterDispatcher::connect_with_retry(node_config, Duration::from_secs(1), profile).await?;
+    let sender_for_log = dispatcher.sender_snapshot();
 
     tracing::info!(
-        full_name = %receiver.full_name(),
-        vpn_id = %receiver.vpn_id(),
+        full_name = %sender_for_log.full_name(),
         "connected to router"
     );
 
@@ -340,13 +342,11 @@ async fn main() -> Result<()> {
         boot_state.current_state.as_str(),
         boot_state.config_version,
     ));
-    let inbox = Arc::new(Mutex::new(RouterInbox::new(receiver)));
     let http_state = Arc::new(HttpState {
         node_name: config.node_name.clone(),
         hive_id: hive_id_from_node_name(&config.node_name),
         state_dir: config.state_dir.clone(),
-        sender: sender.clone(),
-        router_inbox: inbox.clone(),
+        dispatcher: dispatcher.clone(),
         control_plane: control_plane.clone(),
         adapter_contract: adapter_contract.clone(),
         runtime_registry: runtime_registry.clone(),
@@ -366,8 +366,7 @@ async fn main() -> Result<()> {
     };
 
     let control_task = tokio::spawn(run_router_control_loop(
-        inbox,
-        sender,
+        dispatcher,
         config.node_name.clone(),
         config.state_dir.clone(),
         control_plane,
@@ -432,8 +431,7 @@ async fn try_bind_http_listener(
 }
 
 async fn run_router_control_loop(
-    inbox: Arc<Mutex<RouterInbox>>,
-    sender: fluxbee_sdk::NodeSender,
+    dispatcher: Arc<RouterDispatcher>,
     node_name: String,
     state_dir: PathBuf,
     control_plane: Arc<RwLock<IoControlPlaneState>>,
@@ -442,16 +440,17 @@ async fn run_router_control_loop(
     runtime_registry: Arc<RwLock<LinkedHelperRuntimeRegistry>>,
     durable_state: Arc<RwLock<LinkedHelperDurableState>>,
 ) -> Result<()> {
-    let control_src = sender.uuid().to_string();
+    let control_src = dispatcher.sender_snapshot().uuid().to_string();
+    let mut system_rx = dispatcher
+        .take_command_receiver(RPC_CH_SYSTEM)
+        .await
+        .map_err(|err| anyhow::anyhow!("io-linkedhelper system receiver: {err}"))?;
     loop {
-        let maybe_msg = inbox
-            .lock()
-            .await
-            .recv_next_timeout(Duration::from_millis(250))
-            .await?;
-        let Some(msg) = maybe_msg else {
-            continue;
+        let Some(msg) = system_rx.recv().await else {
+            tracing::warn!("io-linkedhelper system channel closed; exiting control loop");
+            return Ok(());
         };
+        let sender = dispatcher.sender_snapshot();
 
         if try_handle_default_node_status(&sender, &msg).await? {
             continue;
@@ -473,6 +472,19 @@ async fn run_router_control_loop(
             sender.send(response).await?;
         }
     }
+}
+
+const RPC_CH_SYSTEM: &str = "system";
+
+fn build_io_linkedhelper_rpc_profile(
+) -> Result<OperationalRouteProfile, fluxbee_sdk::RpcError> {
+    OperationalRouteProfile::builder()
+        .command_channel(RPC_CH_SYSTEM)
+        .post_pending_rule(
+            RouteMatch::any_msg_type(SYSTEM_KIND),
+            RouteTarget::Command(RPC_CH_SYSTEM),
+        )
+        .build()
 }
 
 async fn handle_io_control_plane_message(
@@ -1432,8 +1444,7 @@ async fn process_profile_create(
             }
         }
         Ok(None) => match strict_provision_ilk(
-            &state.sender,
-            state.router_inbox.clone(),
+            &state.dispatcher,
             identity_cfg,
             identity_cfg.target.as_str(),
             &identity_input,
@@ -1731,8 +1742,7 @@ async fn process_conversation_message(
     ) {
         Ok(Some(resolved)) => (resolved.ilk.ilk_id, Some(resolved.ich_id)),
         Ok(None) => match strict_provision_ilk(
-            &state.sender,
-            state.router_inbox.clone(),
+            &state.dispatcher,
             identity_cfg,
             identity_cfg.target.as_str(),
             &contact_identity_input,
@@ -1791,9 +1801,10 @@ async fn process_conversation_message(
 
     let trace_id = new_trace_id();
     let profile_ilk_owned = profile_ilk.to_string();
+    let sender = state.dispatcher.sender_snapshot();
     let conversation_msg = WireMessage {
         routing: Routing {
-            src: state.sender.uuid().to_string(),
+            src: sender.uuid().to_string(),
             src_l2_name: None,
             dst: Destination::Unicast(dst_node.clone()),
             ttl: 16,
@@ -1846,7 +1857,7 @@ async fn process_conversation_message(
         payload: message_payload,
     };
 
-    if let Err(err) = state.sender.send(conversation_msg).await {
+    if let Err(err) = sender.send(conversation_msg).await {
         tracing::warn!(
             node_name = %state.node_name,
             adapter_id = %runtime.adapter_id,

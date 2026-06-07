@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::time::Duration;
 
-use fluxbee_sdk::rpc::{AdminCommandRequest, OperationalRouteProfile, RpcClient};
+use fluxbee_sdk::rpc::{AdminCommandRequest, OperationalRouteProfile, RouterDispatcher};
 use fluxbee_sdk::NodeConfig;
 use serde_json::json;
 use uuid::Uuid;
@@ -62,7 +62,8 @@ async fn main() -> Result<(), DiagError> {
     };
     let rpc_profile = OperationalRouteProfile::builder().build()?;
     let client =
-        RpcClient::connect_with_retry(node_config, Duration::from_millis(100), rpc_profile).await?;
+        RouterDispatcher::connect_with_retry(node_config, Duration::from_millis(100), rpc_profile)
+            .await?;
 
     let out = client
         .send_admin_rpc(AdminCommandRequest {

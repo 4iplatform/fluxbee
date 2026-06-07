@@ -1,7 +1,11 @@
 use std::error::Error;
 use std::time::Duration;
 
-use fluxbee_sdk::{connect, try_handle_default_node_status, NodeConfig};
+use fluxbee_sdk::protocol::SYSTEM_KIND;
+use fluxbee_sdk::{
+    try_handle_default_node_status, NodeConfig, OperationalRouteProfile, RouteMatch, RouteTarget,
+    RouterDispatcher,
+};
 use tracing_subscriber::EnvFilter;
 
 type DynError = Box<dyn Error + Send + Sync>;
@@ -26,20 +30,30 @@ async fn main() -> Result<(), DynError> {
         version: node_version,
     };
 
-    let (sender, mut receiver) = connect(&node_cfg).await?;
+    let profile = OperationalRouteProfile::builder()
+        .command_channel("system")
+        .post_pending_rule(
+            RouteMatch::any_msg_type(SYSTEM_KIND),
+            RouteTarget::Command("system"),
+        )
+        .build()
+        .map_err(|err| format!("inventory_hold_diag rpc profile invalid: {err}"))?;
+    let dispatcher =
+        RouterDispatcher::connect_with_retry(node_cfg, Duration::from_secs(1), profile).await?;
     tracing::info!("inventory hold diag connected");
 
-    let status_sender = sender.clone();
+    let dispatcher_status = dispatcher.clone();
     tokio::spawn(async move {
-        loop {
-            let message = match receiver.recv().await {
-                Ok(msg) => msg,
-                Err(err) => {
-                    tracing::warn!(error = %err, "inventory hold diag receiver ended");
-                    break;
-                }
-            };
-            if let Err(err) = try_handle_default_node_status(&status_sender, &message).await {
+        let mut system_rx = match dispatcher_status.take_command_receiver("system").await {
+            Ok(rx) => rx,
+            Err(err) => {
+                tracing::warn!(error = %err, "inventory hold diag system receiver");
+                return;
+            }
+        };
+        let sender = dispatcher_status.sender_snapshot();
+        while let Some(message) = system_rx.recv().await {
+            if let Err(err) = try_handle_default_node_status(&sender, &message).await {
                 tracing::warn!(error = %err, "failed to handle default node status");
             }
         }

@@ -80,19 +80,24 @@ func main() {
 
 	fmt.Printf("SY.timer client_ref E2E: hive=%s node=%s timer=%s\n", hiveID, nodeName, timerNode)
 
-	sender, receiver, err := sdk.Connect(sdk.NodeConfig{
+	profile, err := sdk.NewOperationalRouteProfile().Build()
+	if err != nil {
+		fatalf("build route profile: %v", err)
+	}
+	dispatcher, err := sdk.ConnectWithRetry(sdk.NodeConfig{
 		Name:         nodeName,
 		RouterSocket: routerSocket,
 		UUIDMode:     sdk.NodeUuidEphemeral,
 		ConfigDir:    configDir,
 		Version:      "sy-timer-client-ref-e2e",
-	})
+	}, 250*time.Millisecond, profile)
 	if err != nil {
 		fatalf("connect to router: %v", err)
 	}
-	defer func() { _ = sender.Close() }()
+	defer func() { _ = dispatcher.Close() }()
+	sender := dispatcher.SenderSnapshot()
 
-	timer, err := sdk.NewTimerClient(sender, receiver, sdk.TimerClientConfig{TimerNode: timerNode})
+	timer, err := sdk.NewTimerClient(dispatcher, sdk.TimerClientConfig{TimerNode: timerNode})
 	if err != nil {
 		fatalf("new timer client: %v", err)
 	}

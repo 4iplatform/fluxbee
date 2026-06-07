@@ -155,18 +155,16 @@ type RouterHeader struct {
 }
 
 type Service struct {
-	hiveID     string
-	nodeUUID   uuid.UUID
-	nodeName   string
-	routerConn routerTransport
-	opaRegion  *OpaRegion
+	hiveID             string
+	nodeUUID           uuid.UUID
+	nodeName           string
+	routerDispatcherMu sync.RWMutex
+	routerDispatcher   *fluxbeesdk.RouterDispatcher
+	lastPeerMu         sync.Mutex
+	lastPeer           string
+	opaRegion          *OpaRegion
 
 	lastError string
-}
-
-type routerTransport interface {
-	SendSDK(fluxbeesdk.Message)
-	LastPeer() string
 }
 
 type RouterStatus struct {
@@ -230,9 +228,7 @@ func main() {
 		log.Printf("failed to load current policy: %v", err)
 	}
 
-	routerClient := NewRouterClient(nodeUUID, nodeName)
-	service.routerConn = routerClient
-	go routerClient.Run(service)
+	go service.runRouter()
 
 	go service.heartbeatLoop()
 
@@ -626,7 +622,7 @@ func (s *Service) handleNodeStatusGet(msg fluxbeesdk.Message) {
 		log.Printf("failed to build node status response: %v", err)
 		return
 	}
-	s.routerConn.SendSDK(resp)
+	s.sendSDK(resp)
 }
 
 func (s *Service) handleNodeConfigGet(msg fluxbeesdk.Message) {
@@ -807,7 +803,7 @@ func (s *Service) sendNodeConfigResponse(request fluxbeesdk.Message, payload map
 		log.Printf("failed to build CONFIG_RESPONSE: %v", err)
 		return
 	}
-	s.routerConn.SendSDK(resp)
+	s.sendSDK(resp)
 }
 
 func buildPolicySnapshot(meta PolicyMetadata) map[string]any {
@@ -1140,7 +1136,7 @@ func (s *Service) sendCommandResponse(msg fluxbeesdk.Message, action string, pay
 		log.Printf("failed to build command response: %v", err)
 		return
 	}
-	s.routerConn.SendSDK(resp)
+	s.sendSDK(resp)
 }
 
 func (s *Service) sendCommandError(action string, version uint64, code, detail string) {
@@ -1150,10 +1146,7 @@ func (s *Service) sendCommandError(action string, version uint64, code, detail s
 		"error_detail": detail,
 		"version":      version,
 	}
-	dst := ""
-	if s.routerConn != nil {
-		dst = s.routerConn.LastPeer()
-	}
+	dst := s.lastRouterPeer()
 	if dst == "" {
 		return
 	}
@@ -1162,7 +1155,7 @@ func (s *Service) sendCommandError(action string, version uint64, code, detail s
 		log.Printf("failed to build command error response: %v", err)
 		return
 	}
-	s.routerConn.SendSDK(resp)
+	s.sendSDK(resp)
 }
 
 func (s *Service) sendQueryResponse(msg fluxbeesdk.Message, action string, payload map[string]any) {
@@ -1176,7 +1169,7 @@ func (s *Service) sendQueryResponse(msg fluxbeesdk.Message, action string, paylo
 	} else {
 		log.Printf("query response action=%s", action)
 	}
-	s.routerConn.SendSDK(resp)
+	s.sendSDK(resp)
 }
 
 func (s *Service) sendSystemMessage(dst, msg string, payload map[string]any) {
@@ -1185,7 +1178,7 @@ func (s *Service) sendSystemMessage(dst, msg string, payload map[string]any) {
 		log.Printf("failed to build system message: %v", err)
 		return
 	}
-	s.routerConn.SendSDK(resp)
+	s.sendSDK(resp)
 }
 
 func (s *Service) broadcastOpaReload(version uint64, hash string) {
@@ -1198,7 +1191,7 @@ func (s *Service) broadcastOpaReload(version uint64, hash string) {
 		log.Printf("failed to build OPA_RELOAD broadcast: %v", err)
 		return
 	}
-	s.routerConn.SendSDK(msg)
+	s.sendSDK(msg)
 }
 
 func (s *Service) heartbeatLoop() {
@@ -1209,106 +1202,66 @@ func (s *Service) heartbeatLoop() {
 	}
 }
 
-type RouterClient struct {
-	nodeUUID uuid.UUID
-	nodeName string
-	tx       chan fluxbeesdk.Message
-	sender   *fluxbeesdk.NodeSender
-	mu       sync.Mutex
-	lastDst  string
-}
-
-func NewRouterClient(nodeUUID uuid.UUID, nodeName string) *RouterClient {
-	return &RouterClient{
-		nodeUUID: nodeUUID,
-		nodeName: nodeName,
-		tx:       make(chan fluxbeesdk.Message, 256),
+func (s *Service) runRouter() {
+	profile, err := fluxbeesdk.NewOperationalRouteProfile().
+		CommandChannel("incoming").
+		PostPendingRule(fluxbeesdk.RouteAny{}, fluxbeesdk.RouteCommand{Channel: "incoming"}).
+		Build()
+	if err != nil {
+		log.Fatalf("sy-opa-rules rpc profile invalid: %v", err)
 	}
-}
-
-func (c *RouterClient) LastPeer() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.lastDst
-}
-
-func (c *RouterClient) Run(service *Service) {
-	backoff := 100 * time.Millisecond
-	var sender *fluxbeesdk.NodeSender
-	var receiver *fluxbeesdk.NodeReceiver
-	for sender == nil || receiver == nil {
-		connectedSender, connectedReceiver, err := fluxbeesdk.Connect(fluxbeesdk.NodeConfig{
-			Name:               c.nodeName,
-			RouterSocket:       routerSockDir,
-			UUIDPersistenceDir: nodesDir,
-			UUIDMode:           fluxbeesdk.NodeUuidPersistent,
-			ConfigDir:          configDir,
-			Version:            "1.0",
-		})
-		if err != nil {
-			log.Printf("connect failed: %v", err)
-			time.Sleep(backoff)
-			backoff = nextBackoff(backoff)
-			continue
-		}
-		sender = connectedSender
-		receiver = connectedReceiver
+	dispatcher, err := fluxbeesdk.ConnectWithRetry(fluxbeesdk.NodeConfig{
+		Name:               s.nodeName,
+		RouterSocket:       routerSockDir,
+		UUIDPersistenceDir: nodesDir,
+		UUIDMode:           fluxbeesdk.NodeUuidPersistent,
+		ConfigDir:          configDir,
+		Version:            "1.0",
+	}, time.Second, profile)
+	if err != nil {
+		log.Fatalf("connect failed: %v", err)
 	}
-	c.mu.Lock()
-	c.sender = sender
-	c.mu.Unlock()
-	if sender.UUID() != c.nodeUUID.String() {
-		log.Printf("router sdk uuid differs from bootstrap uuid sdk=%s bootstrap=%s", sender.UUID(), c.nodeUUID)
+	s.routerDispatcherMu.Lock()
+	s.routerDispatcher = dispatcher
+	s.routerDispatcherMu.Unlock()
+
+	sender := dispatcher.SenderSnapshot()
+	if sender.UUID() != s.nodeUUID.String() {
+		log.Printf("router sdk uuid differs from bootstrap uuid sdk=%s bootstrap=%s", sender.UUID(), s.nodeUUID)
 	}
 	log.Printf("connected to router as %s", sender.FullName())
-	go c.forwardOutgoing(sender)
 
-	disconnected := false
-	for {
-		msg, err := receiver.Recv(context.Background())
-		if err != nil {
-			if receiver.IsConnected() {
-				log.Printf("router recv error while connected: %v", err)
-				time.Sleep(200 * time.Millisecond)
-				continue
-			}
-			if !disconnected {
-				disconnected = true
-				log.Printf("router disconnected; waiting for sdk reconnect: %v", err)
-			}
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-		if disconnected {
-			disconnected = false
-			log.Printf("router reconnected via sdk as %s", receiver.FullName())
-		}
+	incoming, err := dispatcher.TakeCommandReceiver("incoming")
+	if err != nil {
+		log.Fatalf("take incoming receiver: %v", err)
+	}
+	for msg := range incoming {
 		if msg.Routing.Src != "" {
-			c.mu.Lock()
-			c.lastDst = msg.Routing.Src
-			c.mu.Unlock()
+			s.lastPeerMu.Lock()
+			s.lastPeer = msg.Routing.Src
+			s.lastPeerMu.Unlock()
 		}
-		service.handleMessage(msg)
+		s.handleMessage(msg)
 	}
+	log.Printf("sy-opa-rules incoming channel closed; exiting router loop")
 }
 
-func (c *RouterClient) SendSDK(msg fluxbeesdk.Message) {
-	c.tx <- msg
+func (s *Service) lastRouterPeer() string {
+	s.lastPeerMu.Lock()
+	defer s.lastPeerMu.Unlock()
+	return s.lastPeer
 }
 
-func nextBackoff(current time.Duration) time.Duration {
-	next := current * 2
-	if next > 30*time.Second {
-		return 30 * time.Second
+func (s *Service) sendSDK(msg fluxbeesdk.Message) {
+	s.routerDispatcherMu.RLock()
+	dispatcher := s.routerDispatcher
+	s.routerDispatcherMu.RUnlock()
+	if dispatcher == nil {
+		log.Printf("sendSDK called before dispatcher is ready; dropping msg trace=%s", msg.Routing.TraceID)
+		return
 	}
-	return next
-}
-
-func (c *RouterClient) forwardOutgoing(sender *fluxbeesdk.NodeSender) {
-	for msg := range c.tx {
-		if err := sender.Send(msg); err != nil {
-			log.Printf("failed to send router message: %v", err)
-		}
+	if err := dispatcher.SenderSnapshot().Send(msg); err != nil {
+		log.Printf("failed to send router message: %v", err)
 	}
 }
 

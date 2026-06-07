@@ -1,10 +1,8 @@
 package sdk
 
 import (
-	"context"
 	"encoding/json"
 	"testing"
-	"time"
 )
 
 func TestBuildSystemRequestDefaultsActionToVerb(t *testing.T) {
@@ -61,27 +59,6 @@ func TestBuildSystemResponseKeepsTraceAndRepliesToSource(t *testing.T) {
 	}
 	if !response.Routing.Dst.IsUnicast() || response.Routing.Dst.Value() != "src-1" {
 		t.Fatalf("unexpected reply destination: %+v", response.Routing.Dst)
-	}
-}
-
-func TestAwaitSystemResponseFiltersByTraceAndVerb(t *testing.T) {
-	receiver := &NodeReceiver{
-		rx:    make(chan receivedMessage, 4),
-		state: &connectionState{connected: true},
-	}
-	receiver.rx <- receivedMessage{msg: Message{Routing: Routing{TraceID: "other"}, Meta: Meta{MsgType: SYSTEMKind, Msg: stringPtr(MsgTimerResponse)}}}
-	receiver.rx <- receivedMessage{msg: Message{Routing: Routing{TraceID: "trace-1"}, Meta: Meta{MsgType: SYSTEMKind, Msg: stringPtr("OTHER_RESPONSE")}}}
-	receiver.rx <- receivedMessage{msg: Message{Routing: Routing{TraceID: "trace-1"}, Meta: Meta{MsgType: SYSTEMKind, Msg: stringPtr(MsgTimerResponse)}}}
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	msg, err := AwaitSystemResponse(ctx, receiver, "trace-1", MsgTimerResponse)
-	if err != nil {
-		t.Fatalf("await system response: %v", err)
-	}
-	if stringValue(msg.Meta.Msg) != MsgTimerResponse {
-		t.Fatalf("unexpected response msg: %q", stringValue(msg.Meta.Msg))
 	}
 }
 

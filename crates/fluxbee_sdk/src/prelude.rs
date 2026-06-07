@@ -13,11 +13,8 @@ pub use crate::cognition::{
     SUBJECT_STORAGE_COGNITION_REASONS, SUBJECT_STORAGE_COGNITION_SCOPES,
     SUBJECT_STORAGE_COGNITION_SCOPE_INSTANCES, SUBJECT_STORAGE_COGNITION_THREADS,
 };
-pub use crate::comm::{
-    connect, connect_with_client_config, ClientConfig, NodeConfig, NodeError, NodeReceiver,
-    NodeSender, NodeUuidMode,
-};
 pub use crate::comm::{nats, protocol};
+pub use crate::comm::{ClientConfig, NodeConfig, NodeError, NodeSender, NodeUuidMode};
 pub use crate::identity::{
     identity_shm_name_for_hive, load_hive_id, read_self_ilk_from_env, read_self_tenant_from_env,
     resolve_ilk_from_hive_config, resolve_ilk_from_hive_id, resolve_ilk_from_shm_name,
@@ -53,7 +50,7 @@ pub use crate::node_secret::{
 };
 pub use crate::payload::{PayloadError, TextV1Payload, TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES};
 pub use crate::rpc::{
-    AdminCommandRequest, AdminCommandResult, OperationalRouteProfile, RpcClient, RpcError,
+    AdminCommandRequest, AdminCommandResult, OperationalRouteProfile, RouterDispatcher, RpcError,
     SystemRpcRequest, ADMIN_KIND, MSG_ADMIN_COMMAND, MSG_ADMIN_COMMAND_RESPONSE,
 };
 pub use crate::status::try_handle_default_node_status;
@@ -69,17 +66,16 @@ pub use crate::timer::{
     TimerListFilter, TimerListPayload, TimerListResponse, TimerNowInPayload, TimerNowInResult,
     TimerNowResult, TimerParsePayload, TimerParseResult, TimerPurgeOwnerPayload,
     TimerReschedulePayload, TimerResponse, TimerSchedulePayload, TimerScheduleRecurringPayload,
-    TimerStatus, TimerStatusFilter, TimerTestHarness, MSG_TIMER_CANCEL, MSG_TIMER_CONVERT,
-    MSG_TIMER_FIRED, MSG_TIMER_FORMAT, MSG_TIMER_GET, MSG_TIMER_HELP, MSG_TIMER_LIST,
-    MSG_TIMER_NOW, MSG_TIMER_NOW_IN, MSG_TIMER_PARSE, MSG_TIMER_PURGE_OWNER, MSG_TIMER_RESCHEDULE,
+    TimerStatus, TimerStatusFilter, MSG_TIMER_CANCEL, MSG_TIMER_CONVERT, MSG_TIMER_FIRED,
+    MSG_TIMER_FORMAT, MSG_TIMER_GET, MSG_TIMER_HELP, MSG_TIMER_LIST, MSG_TIMER_NOW,
+    MSG_TIMER_NOW_IN, MSG_TIMER_PARSE, MSG_TIMER_PURGE_OWNER, MSG_TIMER_RESCHEDULE,
     MSG_TIMER_RESPONSE, MSG_TIMER_SCHEDULE, MSG_TIMER_SCHEDULE_RECURRING,
     TIMER_DEFAULT_RPC_TIMEOUT_MS, TIMER_DEFAULT_TIME_RETRY_SCHEDULE_MS, TIMER_LIST_DEFAULT_LIMIT,
     TIMER_LIST_MAX_LIMIT, TIMER_MIN_DURATION_MS, TIMER_NODE_FAMILY, TIMER_NODE_KIND,
 };
 pub use crate::vault::{
-    normalize_resource_type, resolve_resource, vault_delete, vault_get, vault_get_metadata,
-    vault_get_with_retry, vault_list, vault_put, vault_rollback, vault_rotate, ResourceType,
-    VaultCaller, VaultDeleteResponse, VaultError, VaultFilter, VaultGetMetadataRequest,
+    normalize_resource_type, ResourceType, VaultCaller, VaultCallerOwned, VaultClient,
+    VaultDeleteResponse, VaultError, VaultFilter, VaultGetMetadataRequest,
     VaultGetMetadataResponse, VaultGetRequest, VaultGetResponse, VaultKeyRequest, VaultListRequest,
     VaultListResponse, VaultMetadata, VaultPutRequest, VaultPutResponse, VaultRetryPolicy,
     VaultRollbackResponse, VaultRotateRequest, VaultRotateResponse, VaultSecretSummary,

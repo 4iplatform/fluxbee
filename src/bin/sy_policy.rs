@@ -11,8 +11,9 @@ use tracing_subscriber::EnvFilter;
 use fluxbee_sdk::nats::resolve_local_nats_endpoint;
 use fluxbee_sdk::protocol::{Message, SYSTEM_KIND};
 use fluxbee_sdk::{
-    action_class_requires_result, connect, managed_node_name, try_handle_default_node_status,
-    ActionResult, NodeConfig, NodeReceiver, NodeSender, NodeUuidMode,
+    action_class_requires_result, managed_node_name, try_handle_default_node_status, ActionResult,
+    NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile, RouteMatch, RouteTarget,
+    RouterDispatcher,
 };
 use json_router::nats::{NatsSubscriber as RouterNatsSubscriber, SUBJECT_STORAGE_TURNS};
 
@@ -23,6 +24,7 @@ const POLICY_NODE_VERSION: &str = "0.1";
 const POLICY_TURNS_SID: u32 = 29;
 const DURABLE_QUEUE_TURNS: &str = "durable.sy-policy.turns";
 const NATS_ERROR_LOG_EVERY: u64 = 20;
+const RPC_CH_SYSTEM: &str = "system";
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -86,8 +88,10 @@ async fn main() -> Result<(), PolicyError> {
     let runtime_state = Arc::new(Mutex::new(PolicyRuntimeState::default()));
     let nats_subscribe_errors = Arc::new(AtomicU64::new(0));
 
-    let (mut sender, mut receiver) =
-        connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let profile = build_policy_rpc_profile()
+        .map_err(|err| format!("sy.policy rpc profile invalid: {err}"))?;
+    let dispatcher =
+        RouterDispatcher::connect_with_retry(node_config, Duration::from_secs(1), profile).await?;
     tracing::info!(
         node_name = %node_name,
         endpoint = %endpoint,
@@ -101,6 +105,11 @@ async fn main() -> Result<(), PolicyError> {
         Arc::clone(&runtime_state),
         Arc::clone(&nats_subscribe_errors),
     )));
+
+    let mut system_rx = dispatcher
+        .take_command_receiver(RPC_CH_SYSTEM)
+        .await
+        .map_err(|err| format!("sy.policy system receiver: {err}"))?;
 
     let mut heartbeat = time::interval(Duration::from_secs(30));
     loop {
@@ -122,20 +131,28 @@ async fn main() -> Result<(), PolicyError> {
                     "sy.policy heartbeat"
                 );
             }
-            received = receiver.recv() => {
-                let msg = match received {
-                    Ok(msg) => msg,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "sy.policy connection interrupted; reconnect handled internally");
-                        continue;
-                    }
+            received = system_rx.recv() => {
+                let Some(msg) = received else {
+                    tracing::warn!("sy.policy system command channel closed; exiting main loop");
+                    return Ok(());
                 };
+                let sender = dispatcher.sender_snapshot();
                 if let Err(err) = process_router_message(&sender, &msg).await {
                     tracing::warn!(error = %err, msg_type = %msg.meta.msg_type, msg = ?msg.meta.msg, "sy.policy router message handling failed");
                 }
             }
         }
     }
+}
+
+fn build_policy_rpc_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::RpcError> {
+    OperationalRouteProfile::builder()
+        .command_channel(RPC_CH_SYSTEM)
+        .post_pending_rule(
+            RouteMatch::any_msg_type(SYSTEM_KIND),
+            RouteTarget::Command(RPC_CH_SYSTEM),
+        )
+        .build()
 }
 
 async fn run_turns_loop(
@@ -258,21 +275,6 @@ async fn process_router_message(sender: &NodeSender, msg: &Message) -> Result<()
 async fn load_hive(config_dir: &Path) -> Result<HiveFile, PolicyError> {
     let data = tokio::fs::read_to_string(config_dir.join("hive.yaml")).await?;
     Ok(serde_yaml::from_str(&data)?)
-}
-
-async fn connect_with_retry(
-    config: &NodeConfig,
-    delay: Duration,
-) -> Result<(NodeSender, NodeReceiver), fluxbee_sdk::NodeError> {
-    loop {
-        match connect(config).await {
-            Ok(result) => return Ok(result),
-            Err(err) => {
-                tracing::warn!(error = %err, "sy.policy router connect failed; retrying");
-                time::sleep(delay).await;
-            }
-        }
-    }
 }
 
 fn ensure_l2_name(name: &str, hive_id: &str) -> String {

@@ -64,11 +64,12 @@ This is sufficient for `SY.timer` because requester ownership now comes from rou
 The v1 stable surface is:
 
 - node connection/lifecycle:
-  - `Connect`
-  - `ConnectWithClientConfig`
+  - `ConnectWithRetry`
+  - `RouterDispatcher`
+  - `OperationalRouteProfile`
+  - `NewOperationalRouteProfile`
   - `NodeConfig`
   - `NodeSender`
-  - `NodeReceiver`
   - `NodeUuidMode`
 - envelope and protocol types:
   - `Message`
@@ -78,7 +79,11 @@ The v1 stable surface is:
 - request/reply helpers:
   - `BuildSystemRequest`
   - `BuildSystemResponse`
-  - `RequestSystemRPC`
+  - `RouterDispatcher.SendSystemRPC`
+  - `RouterDispatcher.SendAdminRPC`
+  - `RouterDispatcher.SendWithMatcher`
+  - `RouterDispatcher.TakeCommandReceiver`
+  - `RouterDispatcher.Subscribe`
   - `ParseSystemResponse`
   - `ParseSystemResponseError`
 - node control-plane helpers:

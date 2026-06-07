@@ -1,7 +1,68 @@
 # RouterDispatcher unification — global revamp
 
 Date: 2026-06-01
-Status: Draft
+Status: **Closed (2026-06-06)** — every objective in §1–§9 met. All 8 inline dispatchers deleted, all 9 Vault sites migrated to `VaultClient`, `fluxbee_sdk::resolve_resource` free function deleted, `fluxbee_sdk::connect` flipped to `pub(crate)`, Rust `TimerClient::new_with_dispatcher` shipped, architect transport refactor (B + C + D + E) landed, admin Vault Section H1/H2/H3 over canonical dispatcher, all 6 CI guards under `scripts/router_dispatcher_guards/` active in strict mode and clean.
+
+## Implementation status (2026-06-06)
+
+**Every step closed:**
+
+- Step 1 — SDK rename `RpcClient` → `RouterDispatcher` + 6 Group A diag binaries + `nodes/test/io-test`.
+- Step 2 — `VaultClient` over `Arc<RouterDispatcher>` + 3 tests (preserves `meta.src_ilk` / `routing.src_l2_name`, multiplexes by `trace_id`, classifies wrong-msg-same-trace as `InvalidResponse`).
+- Step 3 — 6 Tipo 1 puro Rust nodes migrated (`sy_policy`, `sy_config_routes`, `sy_vault`, `sy_identity`, `sy_storage`, `sy_cognition`). Vault sites 4-of-9 / 5-of-9 / 6-of-9 closed.
+- Step 4 — io-* bundle migrated (`io-api`, `io-slack`, `io-sim`, `io-linkedhelper`). `RouterInbox` and related plumbing deleted from `nodes/io/common/src/provision.rs`. Vault site 7-of-9 closed.
+- Step 5 — ai-* bundle migrated. `fluxbee_ai_sdk::NodeRuntime` rewritten over `Arc<RouterDispatcher>`. `router_client.rs` (`RouterClient`, `RouterReader`, `RouterWriter`, `AiNodeConfig`) deleted. `SharedRouterConnection` deleted from `ai-generic` and `ai-frontdesk-gov`. Vault sites 8-of-9 + 9-of-9 closed.
+- Step 6 — Go SDK `RouterDispatcher` built in `go/fluxbee-go-sdk/dispatcher.go` (mirror of Rust API). `TimerClient` is dispatcher-backed through `NewTimerClient(*RouterDispatcher, ...)`; no sender/receiver constructor remains public.
+- Step 7 — `sy-wf-rules` migrated. `messageMux` deleted (the partial wrapper was the 8th inline dispatcher in disguise); admin/orchestrator/wf-node clients now call `dispatcher.SendSystemRPC` / `dispatcher.SendAdminRPC`.
+- Step 8 — `sy-opa-rules` migrated. The local `RouterClient` wrapper and `forwardOutgoing` are deleted; the service owns the canonical `RouterDispatcher`.
+- Step 9 — Architect Vault sites (×2) + admin Vault site (×1) now go through the **canonical persistent** `Arc<RouterDispatcher>` (no per-call ephemeral connect). `blob_sync_diag`, `orch_system_diag`, `inventory_hold_diag`, 4 test nodes, all 5 examples (`wf_client`, `node_test`, `timer_client`, `timer_recurring`, `timer_restart` + `examples/support/timer_example.rs`) migrated. `fluxbee_sdk::resolve_resource` (free function) + `list_then_get_first` helper + legacy `BlobToolkit::publish_blob_and_confirm` deleted. **Rust `TimerClient` gained `new_with_dispatcher`** and its sender/receiver constructor is crate-private. `fluxbee_sdk::connect` is now **`pub(crate)`**, Go raw `Connect` is package-private, and the SDK re-exports were trimmed; the `no_direct_connect.sh` CI guard is active in strict mode and clean.
+
+## Architect transport refactor (§9 — see architect doc for detail)
+
+The architect-specific chapter (`sy_architect_rpc_multiplexing_tasks_v2_stable_agents.md`) was also fully implemented as part of this close-out:
+
+- **Section B (canonical RouterDispatcher)** — `ArchitectState.rpc: Arc<RouterDispatcher>` added; `router_connect_loop`, `router_recv_loop`, `router_sender: Arc<Mutex<Option<NodeSender>>>`, `router_connected: AtomicBool` **all deleted** from `src/bin/sy_architect.rs`. Startup reordered: dispatcher constructed before Vault lookups so `build_architect_ai_runtime` + `resolve_messages_db_url_from_vault` reuse it instead of opening ephemeral connections. `state.rpc.sender_snapshot().is_connected()` replaces the deleted `AtomicBool`. The architect route profile (`build_architect_rpc_profile`) declares `system` (pre-pending: `NODE_STATUS_GET` / `CONFIG_GET` / `CONFIG_SET` / `VAULT_SECRET_CHANGED`) and `incoming` (post-pending: `user` / `chat` / `text`) command channels — no `RouteMatch::Any`.
+- **Section C (outbound admin RPC)** — `ArchitectAdminToolContext.rpc` added; `execute_admin_action_with_context` and `fetch_inventory_status_data` now call `context.rpc.send_admin_rpc(...)` / `state.rpc.send_admin_rpc(...)`. The per-action `NodeConfig { name: format!("SY.architect.{purpose}.{}"), uuid_mode: Ephemeral }` block at `execute_admin_action_with_context` and the `SY.architect.status.<uuid>` block at `fetch_inventory_status_data` are **deleted**. All 10 outbound admin RPC purposes (`tool.read`, `plan_compiler.*`, `executor.*`, `snapshot.*`, `status`, `scmd`) now flow through the canonical dispatcher.
+- **Section D (system + incoming workers)** — `run_architect_system_worker(state, system_rx)` and `run_architect_incoming_worker(state, incoming_rx)` spawned from `main`. `handle_architect_system_message` reads its sender from `state.rpc.sender_snapshot()` (the deleted lock-protected `Option<NodeSender>` is gone).
+- **Section E (origin authorization)** — `protected_architect_system_action_response`, `architect_origin_authorized`, and `build_architect_forbidden_response` implemented. Inbound `NODE_STATUS_GET` / `CONFIG_GET` / `CONFIG_SET` / `VAULT_SECRET_CHANGED` from outside the allowlist (`SY.admin@hive`, `SY.config-routes@hive`, `SY.vault@hive`) receive a `*_RESPONSE` with `status: "error", error_code: "FORBIDDEN"` and never reach the handler. `NODE_STATUS_GET` is gated before `try_handle_default_node_status`.
+- **Section H1 / H2 / H3 (admin Vault)** — `AdminContext.rpc: Arc<RouterDispatcher>` added (the canonical admin dispatcher built in `main` at `sy_admin.rs:475`); `build_admin_executor_ai_runtime` now takes the dispatcher and constructs `VaultClient` over it. The ephemeral `NodeConfig { uuid_mode: Ephemeral }` + `RouterDispatcher::connect_with_retry` block previously at `sy_admin.rs:816-842` is **deleted**. The `VAULT_SECRET_CHANGED` hot-refresh path (`refresh_admin_executor_ai_runtime`) now flows through the same canonical dispatcher.
+
+## CI guards (§8)
+
+`scripts/router_dispatcher_guards/` contains 6 guard scripts. All run on the current tree in strict mode and report clean:
+
+| Guard | Status |
+| --- | --- |
+| `no_inline_dispatcher.sh` | OK — `RouterInbox`, `SharedRouterConnection`, `fluxbee_ai_sdk::RouterClient`, `messageMux`, `forwardOutgoing` all absent |
+| `no_direct_connect.sh` | OK (strict) — no `fluxbee_sdk::connect(...)` outside SDK, no public Go `Connect`, no public Rust `NodeReceiver` / `from_test_channels`, no legacy blob publish+confirm |
+| `no_legacy_vault_helper.sh` | OK — `fluxbee_sdk::resolve_resource(...)` references zero call sites (and zero imports, single-line or multi-line use-list) |
+| `no_deprecated_attribute_on_dispatcher.sh` | OK — no `#[deprecated]` on `RouterDispatcher` / `RpcClient` / `connect_with_retry` / `VaultClient` / `resolve_resource` |
+| `no_shared_receiver.sh` | OK — no Go function aliases a `NodeReceiver` across `Recv()` + arg-pass |
+| `architect_no_ephemeral_guard.sh` | OK — no `SY.architect.<purpose>.{}` literals, no `NodeUuidMode::Ephemeral`, no deleted `router_*_loop` / `router_sender` / `router_connected` in `sy_architect.rs` / `sy_admin.rs` |
+
+Guards use ast-grep when available and fall back to portable `grep -E` + Python multi-line regex.
+
+## Test status at close
+
+- `cargo check --workspace --all-targets` (Rust root) — verde, sólo warnings preexistentes.
+- `cargo test -p fluxbee-sdk --lib` — **147/147 verdes** (incluyendo los 3 tests `VaultClient` y todos los tests `TimerClient<'a>` legacy + dispatcher backend).
+- `cargo check --workspace --all-targets` (`nodes/io` workspace) — verde.
+- Go modules: `go/fluxbee-go-sdk`, `go/sy-timer`, `go/sy-wf-rules` (node tests), `go/sy-opa-rules` (build), `go/nodes/wf/wf-generic` (node tests) — todos verdes.
+
+## What remains (truly nothing in scope of this plan)
+
+- `examples/timer_client.rs`, `examples/timer_recurring.rs`, `examples/timer_restart.rs`, `examples/support/timer_example.rs` — migrated to `TimerClient::new_with_dispatcher`.
+- The 5 §8 CI guards + the architect §A2 guard exist on disk and pass.
+- `fluxbee_sdk::connect` is `pub(crate)`.
+- `fluxbee_sdk::resolve_resource` deleted from public surface (and from the SDK).
+- All 8 inline dispatchers gone. Every fluxbee process owns exactly one canonical `Arc<RouterDispatcher>` (or `*RouterDispatcher` in Go).
+
+Optional follow-ups that are explicitly **out of scope** of this plan but worth noting for whoever picks them up next:
+
+- Section H4 (regression test for `VAULT_SECRET_CHANGED` hot-refresh through the new canonical dispatcher path). The path exists and is exercised by the existing handlers; what's missing is an end-to-end assertion test.
+- Section H5 (admin inbound origin-authorization audit, parity with the new architect Section E gate). Architect now rejects unauthorized callers on protected system actions; admin's parity audit is a separate scoped review.
+
+
 Scope: SDK (Rust + Go) + all fluxbee nodes + Pattern 3 Vault sites
 Related:
 
@@ -42,11 +103,11 @@ The fix is to recognize this and unify on one abstraction, renamed for clarity: 
 | Decision | Resolution |
 | --- | --- |
 | One transport abstraction or two (Tipo 1 vs Tipo 2)? | **One.** Every node uses `RouterDispatcher`. The Tipo 1/Tipo 2 distinction is operational (do you ever initiate RPCs?), not architectural. Code-wise they are the same. |
-| Rename `RpcClient` → `RouterDispatcher`? | **Yes.** Mechanical rename in the SDK. No alias kept. No `pub use RpcClient = RouterDispatcher`. |
-| Expose `connect(&NodeConfig) -> (NodeSender, NodeReceiver)` to nodes? | **No.** That function becomes `pub(crate)`. Nodes get a connection by calling `RouterDispatcher::connect_with_retry`. The two-tuple form is an internal detail. |
+| Rename `RpcClient` → `RouterDispatcher`? | **Yes.** Mechanical rename in the SDK. No alias kept. No `pub use RpcClient = RouterDispatcher`. The rename PR does **not** change the `connect_with_retry` signature (it stays `(config: NodeConfig, delay: Duration, profile: OperationalRouteProfile)` to keep the rename mechanical). If we later want a `ConnectRetry` struct, that is a separate PR. |
+| Expose `connect(&NodeConfig) -> (NodeSender, NodeReceiver)` to nodes? | **Eventually no — but not in the rename PR.** Today every Tipo 1 puro binary, the 9 `*_diag` binaries, the test nodes, and the AI SDK reach `fluxbee_sdk::connect()` directly. Until all of those callers migrate, `connect` stays `pub`. The change to `pub(crate)` happens in the **last** PR of this plan (after every consumer in the workspace has switched to `RouterDispatcher::connect_with_retry`). That PR also deletes the legacy free function from the public surface of `crates/fluxbee_sdk`. |
 | AI workers split into separate nodes? | **No.** Closed in the architect doc. AI workers are async tasks sharing the parent process's `Arc<RouterDispatcher>`. |
 | Deprecation period for the old surfaces (`RouterInbox`, `SharedRouterConnection`, `messageMux`, `forwardOutgoing`, free `resolve_resource`)? | **No.** Per `feedback_no_legacy_in_dev`. Each is deleted in the same PR that migrates its last caller. |
-| Vault scope? | **Wide (all 7 Pattern 3 sites).** 3 sites in the architect doc, 4 sites here. |
+| Vault scope? | **Wide (all 9 Pattern 3 sites).** 3 sites in the architect doc (architect ×2, admin ×1), 6 sites here. Two sites — `sy_identity` and `sy_storage` — are **not** ephemeral connections (they call `resolve_resource` with the node's persistent `&NodeSender` + `&mut NodeReceiver`), but they still depend on the `&mut NodeReceiver` ownership model and therefore become incompatible when those nodes adopt `Arc<RouterDispatcher>`. They migrate as part of the same per-node PR that introduces the dispatcher. |
 
 ## 4. Target SDK shape (Rust)
 
@@ -57,11 +118,13 @@ The fix is to recognize this and unify on one abstraction, renamed for clarity: 
 pub struct RouterDispatcher { /* fields unchanged from current RpcClient */ }
 
 impl RouterDispatcher {
+    // Signature is preserved exactly as it exists today on RpcClient.
+    // The rename PR is mechanical — no parameter shape changes here.
     pub async fn connect_with_retry(
         config: NodeConfig,
+        delay: Duration,
         profile: OperationalRouteProfile,
-        retry: ConnectRetry,
-    ) -> Result<Arc<Self>, RpcError>;
+    ) -> Result<Arc<Self>, NodeError>;
 
     pub fn sender_snapshot(&self) -> NodeSender;
     pub async fn take_command_receiver(&self, name: &str) -> Result<RpcCommandReceiver, RpcError>;
@@ -77,41 +140,77 @@ impl RouterDispatcher {
 }
 ```
 
-### 4.2 What becomes `pub(crate)`
+If a future change wants to introduce a `ConnectRetry` struct (max attempts, backoff, etc.), that lands as its own PR with explicit migration of every existing call site (`sy_orchestrator`, `sy_admin`, `sy_architect`, the 9 diag binaries, the 6 per-node migration PRs). It is **not** smuggled into the rename PR.
+
+### 4.2 What becomes `pub(crate)` — and when
 
 ```rust
 // crates/fluxbee_sdk/src/node_client.rs
+// FINAL state (the last PR of this plan):
 pub(crate) async fn connect(config: &NodeConfig) -> Result<(NodeSender, NodeReceiver), NodeError>;
 ```
 
-Reason: the only legitimate caller of the raw `connect(&NodeConfig) -> (NodeSender, NodeReceiver)` function is the dispatcher itself. Every node-level use of this function in the repo today is a symptom of the inline-dispatcher problem this work fixes. After the migration, the function exists only as an implementation detail of `RouterDispatcher::connect_with_retry`. **CI guard:** the function must not appear in any `nodes/**`, `src/bin/**`, or `crates/**` outside `crates/fluxbee_sdk/src/`.
+Reason: the only legitimate caller of the raw `connect(&NodeConfig) -> (NodeSender, NodeReceiver)` function is the dispatcher itself. Every node-level use of this function today is a symptom of the inline-dispatcher problem this work fixes.
+
+**But the change cannot land in the rename PR.** Today these callers reach `fluxbee_sdk::connect()` directly:
+
+- All 6 Tipo 1 puro binaries via their local `connect_with_retry` wrappers.
+- The 9 `*_diag` binaries (some via `connect()`, others via `RpcClient::connect_with_retry` which itself calls `connect()` internally — the second group is fine, the first group blocks `pub(crate)`).
+- The 4 test nodes (Section 6.7) which deliberately stay on the raw API.
+- `crates/fluxbee_ai_sdk/src/router_client.rs::RouterClient::connect` — until 6.4 deletes it.
+
+The flip to `pub(crate)` happens as the **final PR of the whole plan**, after every production migration above. Test nodes (Section 6.7) are exempted from the `pub(crate)` requirement by being in scope of the rename and **not** in scope of the `pub(crate)` constraint — to preserve that, the SDK keeps a `pub(crate)` plus a `#[cfg(any(test, feature = "test-harness"))] pub use` path, **or**, more cleanly, test nodes are migrated to `RouterDispatcher::connect_with_retry` in the same final PR. Pick the migration route — it's cheaper than a permanent feature shim.
+
+**CI guard activated by that final PR:** the function must not appear in any `nodes/**`, `src/bin/**`, or `crates/**` outside `crates/fluxbee_sdk/src/`.
 
 ### 4.3 Test harness
 
 `RpcTestHarness` stays as-is and is renamed `RouterDispatcherTestHarness`. Internal field types are renamed mechanically.
 
-## 5. Target SDK shape (Go)
+## 5. Target SDK shape (Go) — this is **construction**, not rename
 
-The Go SDK currently has `rpc.go` (modeled after the Rust `RpcClient`, but with less coverage — Go nodes use it for `sy-timer` and `wf-generic` and not much else). Two Go binaries (`sy-wf-rules`, `sy-opa-rules`) wrote their own bespoke versions on top of the lower-level `client.go` connection because the Go `rpc.go` did not cover their needs at the time.
+The Go SDK started with no multiplexed `RpcClient`: `rpc.go` only had bare request builders/parsers and synchronous receiver-consuming helpers. The migration deletes those receiver-consuming helpers (`AwaitSystemResponse`, `RequestSystemRPC`) and makes `RouterDispatcher` the only public router transport.
 
-We bring the Go SDK to parity:
+- [go/sy-timer/main.go:141 + main.go:202](go/sy-timer/main.go#L141) — naive Recv loop.
+- [go/nodes/wf/wf-generic/node/node.go:319 + node.go:367](go/nodes/wf/wf-generic/node/node.go#L319) — naive Recv loop, **and** at line 328 it hands the same `*NodeReceiver` to `NewSDKTimerSender(sender, receiver, ...)` so the `TimerClient` can `Recv()` on the same receiver the main loop is using. That is a latent multiplexing bug (whichever Recv wins the next message wins it) that today only doesn't bite us because the workload is light.
+- [go/sy-wf-rules/node/service.go:93](go/sy-wf-rules/node/service.go#L93) — same, then drives via `messageMux`.
+- [go/sy-opa-rules/main.go:1240](go/sy-opa-rules/main.go#L1240) — same, then drives via bespoke `RouterClient` + `forwardOutgoing`.
+
+So the Go side is **green-field construction**, not a rename:
 
 ```go
-// go/fluxbee-go-sdk/dispatcher.go  (rename rpc.go)
-type RouterDispatcher struct { /* renamed from RpcClient if it exists, else introduced */ }
+// go/fluxbee-go-sdk/dispatcher.go — NEW FILE (not a rename)
+type RouterDispatcher struct {
+    sender   *NodeSender
+    receiver *NodeReceiver
+    profile  OperationalRouteProfile
+    // pending: map[traceID]chan Message
+    // command channels: map[string]chan Message
+    // broadcast channels: map[string]chan Message
+    // ...
+}
 
-func ConnectWithRetry(cfg NodeConfig, profile OperationalRouteProfile, retry ConnectRetry) (*RouterDispatcher, error)
+func ConnectWithRetry(cfg NodeConfig, delay time.Duration, profile OperationalRouteProfile) (*RouterDispatcher, error)
 
-func (d *RouterDispatcher) SenderSnapshot() NodeSender
-func (d *RouterDispatcher) TakeCommandReceiver(name string) (RpcCommandReceiver, error)
+func (d *RouterDispatcher) SenderSnapshot() *NodeSender
+func (d *RouterDispatcher) TakeCommandReceiver(name string) (CommandReceiver, error)
 func (d *RouterDispatcher) Subscribe(name string) (<-chan Message, error)
-func (d *RouterDispatcher) SendWithMatcher(msg Message, matcher PendingMatcher, timeout time.Duration) (Message, error)
+func (d *RouterDispatcher) SendWithMatcher(ctx context.Context, msg Message, matcher PendingMatcher, timeout time.Duration) (Message, error)
 func (d *RouterDispatcher) SendSystemRPC(...) (Message, error)
 func (d *RouterDispatcher) SendAdminRPC(...) (Message, error)
 func (d *RouterDispatcher) Close() error
 ```
 
 `OperationalRouteProfile`, `PendingMatcher`, `RouteMatch`, `RouteTarget` are mirrored from the Rust SDK with identical semantics. **Const-asserts (compile-time) on the Go side that the protocol byte sizes match `feedback_rust_repr_c_to_go_sizes`** continue to apply — we do **not** change the wire layout in this work.
+
+**`TimerClient` must move onto the dispatcher in the same PR.** Today `TimerClient` calls `receiver.Recv()` directly (see [timer_client.go](go/fluxbee-go-sdk/timer_client.go) and the `NewSDKTimerSender` constructor in [actions.go:341](go/nodes/wf/wf-generic/node/actions.go#L341)). Once `RouterDispatcher` owns the receiver, `TimerClient` must consume timer responses through `dispatcher.SendWithMatcher(...)` keyed on `trace_id`, not through the shared receiver. The Go SDK bring-up PR includes:
+
+1. Construct `RouterDispatcher` with the existing wire helpers (`BuildSystemRequest`, `ParseSystemResponse`) reused inside the new methods.
+2. Rewrite `TimerClient` to take `*RouterDispatcher` instead of `*NodeSender`+`*NodeReceiver`. All `TimerClient` methods (`Schedule`, `Cancel`, `Reschedule`, etc.) call `dispatcher.SendWithMatcher` or `dispatcher.SendSystemRPC`.
+3. Update `wf-generic`'s `NewSDKTimerSender` and the main Recv loop to use dispatcher command/broadcast channels. The shared-`*NodeReceiver` aliasing bug disappears as a side effect.
+4. Update `sy-timer`'s `Service` to own `*RouterDispatcher` and replace its `receiver.Recv` loop with a `dispatcher.TakeCommandReceiver("system")` channel.
+
+The bare builders/parsers in `rpc.go` (`BuildSystemRequest`, `BuildSystemResponse`, `ParseSystemResponse`) stay as building blocks. The receiver-consuming helpers (`AwaitSystemResponse`, `RequestSystemRPC`) are deleted once no consumer is left — same final-state rule as the Rust `connect()` decision in 4.2.
 
 ## 6. Per-node migration plan
 
@@ -123,12 +222,14 @@ These currently have a naive `loop { receiver.recv() }` and have never multiplex
 
 | Node | Current pattern | PR scope |
 | --- | --- | --- |
-| `sy_identity` (`src/bin/sy_identity.rs`) | bespoke `loop { recv }` | introduce `Arc<RouterDispatcher>`, single command channel; CI guard added |
-| `sy_vault` (`src/bin/sy_vault.rs`) | bespoke `loop { recv }` | same |
-| `sy_storage` (`src/bin/sy_storage.rs`) | bespoke `loop { recv }` | same |
-| `sy_policy` (`src/bin/sy_policy.rs`) | bespoke `loop { recv }` | same |
-| `sy_config_routes` (`src/bin/sy_config_routes.rs`) | bespoke `loop { recv }` | same |
-| `sy_cognition` (`src/bin/sy_cognition.rs`) | bespoke `loop { recv }` + Pattern 3 Vault site at line 1594 | same + migrate Vault site to `VaultClient` (4-of-7) |
+| `sy_identity` (`src/bin/sy_identity.rs`) | bespoke `loop { recv }` + local `connect_with_retry` wrapper (line 3955) + Vault site at line 5272 using persistent `&mut NodeReceiver` | introduce `Arc<RouterDispatcher>`, delete local `connect_with_retry` wrapper, migrate Vault site to `VaultClient` (4-of-9) |
+| `sy_vault` (`src/bin/sy_vault.rs`) | bespoke `loop { recv }` + local `connect_with_retry` wrapper (line 1593) | introduce `Arc<RouterDispatcher>`, delete local wrapper |
+| `sy_storage` (`src/bin/sy_storage.rs`) | bespoke `loop { recv }` + local `connect_with_retry` wrapper (line 2852) + Vault site at line 2417 using persistent `&mut NodeReceiver` | introduce `Arc<RouterDispatcher>`, delete local wrapper, migrate Vault site to `VaultClient` (5-of-9) |
+| `sy_policy` (`src/bin/sy_policy.rs`) | bespoke `loop { recv }` + local `connect_with_retry` wrapper (line 263) | introduce `Arc<RouterDispatcher>`, delete local wrapper |
+| `sy_config_routes` (`src/bin/sy_config_routes.rs`) | bespoke `loop { recv }` + local `connect_with_retry` wrapper (line 867) | introduce `Arc<RouterDispatcher>`, delete local wrapper |
+| `sy_cognition` (`src/bin/sy_cognition.rs`) | bespoke `loop { recv }` + local `connect_with_retry` wrapper (line 4261) + ephemeral Vault site at line 1610 | introduce `Arc<RouterDispatcher>`, delete local wrapper, migrate Vault site to `VaultClient` (6-of-9) |
+
+**Note on local `connect_with_retry` wrappers.** Each of these binaries has its own local `connect_with_retry(&NodeConfig, Duration)` that wraps `fluxbee_sdk::connect()`. They were copy-pasted before the canonical `RouterDispatcher::connect_with_retry` existed. Each per-node PR **deletes** its local wrapper in the same change that adopts the canonical one. No node ships with both coexisting.
 
 Each PR:
 
@@ -144,11 +245,11 @@ These have their own dispatcher invented. Their per-node PR deletes the bespoke 
 | Node | Bespoke implementation | PR scope |
 | --- | --- | --- |
 | `io-api` (`nodes/io/io-api/src/main.rs`) | `RouterInbox` consumer | adopt `Arc<RouterDispatcher>`, **delete** `RouterInbox` usages in this node |
-| `io-slack` (`nodes/io/io-slack/src/main.rs`) | `RouterInbox` consumer + Pattern 3 Vault site at line 739 | same + migrate Vault site (5-of-7) |
+| `io-slack` (`nodes/io/io-slack/src/main.rs`) | `RouterInbox` consumer + Pattern 3 Vault site at line 751 | same + migrate Vault site (7-of-9) |
 | `io-sim` (`nodes/io/io-sim/src/main.rs`) | `RouterInbox` consumer | same |
 | `io-linkedhelper` (`nodes/io/io-linkedhelper/src/main.rs`) | `RouterInbox` consumer | same |
-| `ai-generic` (`nodes/ai/ai-generic/src/bin/ai_node_runner.rs`) | `SharedRouterConnection` (lines 442–479) + Pattern 3 Vault site at line 1682 | adopt `Arc<RouterDispatcher>`, **delete** `SharedRouterConnection`, **delete** `wait_for_shared_reconnect` (replaced by dispatcher reconnect signal); migrate Vault site (6-of-7) |
-| `ai-frontdesk-gov` (`nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs`) | `SharedRouterConnection` (lines 481–520, near-copy of ai-generic) + Pattern 3 Vault site at line 1708 | same + migrate Vault site (7-of-7) |
+| `ai-generic` (`nodes/ai/ai-generic/src/bin/ai_node_runner.rs`) | `SharedRouterConnection` (lines 442–479) + Pattern 3 Vault site at line 1691 | adopt `Arc<RouterDispatcher>`, **delete** `SharedRouterConnection`, **delete** `wait_for_shared_reconnect` (replaced by dispatcher reconnect signal); migrate Vault site (8-of-9) |
+| `ai-frontdesk-gov` (`nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs`) | `SharedRouterConnection` (lines 481–520, near-copy of ai-generic) + Pattern 3 Vault site at line 1720 | same + migrate Vault site (9-of-9, deletes free `resolve_resource`) |
 
 Bundling note: `io-api`, `io-slack`, `io-sim`, `io-linkedhelper` all consume `RouterInbox` from `nodes/io/common/src/provision.rs`. The four migrations land **together** so that `RouterInbox` itself can be deleted in the same PR. Keeping `RouterInbox` "for backward compat" while migrating consumers one at a time is exactly the legacy pattern this plan forbids.
 
@@ -185,84 +286,120 @@ PR scope (bundled with the ai-* migrations in 6.2):
 
 ### 6.5 Go nodes
 
+Reclassified after closer reading (see Section 5): **none** of these are mechanical renames. All four migrate from raw `Connect + Recv` patterns to `RouterDispatcher`.
+
 | Node | Current pattern | PR scope |
 | --- | --- | --- |
-| `sy-timer` (`go/sy-timer/`) | already uses `fluxbee-go-sdk/rpc.go` | rename usage to `RouterDispatcher` mechanically |
-| `wf-generic` (Go runtime) | uses `fluxbee-go-sdk/rpc.go` | rename usage mechanically |
-| `sy-wf-rules` (`go/sy-wf-rules/`) | inline `messageMux` (`node/mux.go`) | adopt `*RouterDispatcher`, **delete** `messageMux` |
-| `sy-opa-rules` (`go/sy-opa-rules/`) | inline `RouterClient` + `forwardOutgoing` (`main.go:1264`, `1307`) | adopt `*RouterDispatcher`, **delete** `RouterClient` + `forwardOutgoing` |
+| `sy-timer` (`go/sy-timer/`) | raw `fluxbeesdk.Connect` + `s.receiver.Recv(ctx)` loop at [main.go:202](go/sy-timer/main.go#L202) | adopt `*RouterDispatcher`, replace Recv loop with `dispatcher.TakeCommandReceiver("system")` |
+| `wf-generic` (Go runtime, `go/nodes/wf/wf-generic/`) | raw `sdk.Connect` + `receiver.Recv(ctx)` loop at [node.go:367](go/nodes/wf/wf-generic/node/node.go#L367) AND shares the same `*NodeReceiver` with `TimerClient` via `NewSDKTimerSender(sender, receiver, ...)` at [node.go:328](go/nodes/wf/wf-generic/node/node.go#L328) — latent multiplexing bug | adopt `*RouterDispatcher`, route timer responses through the dispatcher (`SendWithMatcher`), eliminate the shared-receiver aliasing |
+| `sy-wf-rules` (`go/sy-wf-rules/`) | inline `messageMux` (`node/mux.go`) on top of raw `Connect` | adopt `*RouterDispatcher`, **delete** `messageMux` |
+| `sy-opa-rules` (`go/sy-opa-rules/`) | inline `RouterClient` + `forwardOutgoing` (`main.go:1264`, `1307`) on top of raw `Connect` | adopt `*RouterDispatcher`, **delete** `RouterClient` + `forwardOutgoing` |
 
-The Go SDK bring-up (Section 5) is a precondition for `sy-wf-rules` and `sy-opa-rules` migrations. The Go SDK PR lands first; the two Go-node PRs follow.
+The Go SDK bring-up (Section 5) is a precondition for **all four** Go node migrations. The Go SDK PR lands first; the four Go-node PRs follow. `wf-generic` cannot land independently of the Go SDK `TimerClient` refactor, because today `TimerClient` shares the same receiver with the main loop — there is no way to migrate one without the other.
 
 ### 6.6 Diagnostic binaries
 
-The repo has 9 `src/bin/*_diag.rs` binaries that talk to the router with `RpcClient::connect_with_retry` and `NodeUuidMode::Persistent`. They are **not** anti-pattern — they already use the canonical dispatcher. They are included in scope of this work for a single reason: when the SDK rename PR (Section 9 step 1) renames `RpcClient` → `RouterDispatcher`, these binaries must compile against the new name in the same PR. Leaving them out would mean the rename PR ships with broken `cargo build --bins`, which contradicts the no-legacy stance.
+The repo has 9 `src/bin/*_diag.rs` binaries that talk to the router. They split into two groups by how they connect today:
 
-In-scope diagnostic binaries (mechanical rename only):
+**Group A — already use `RpcClient::connect_with_retry`** (mechanical rename in step 1):
 
 - `src/bin/identity_merge_diag.rs`
 - `src/bin/identity_negative_diag.rs`
 - `src/bin/identity_replica_sync_diag.rs`
-- `src/bin/identity_provision_complete_diag.rs`
 - `src/bin/admin_internal_command_diag.rs`
 - `src/bin/io_test_diag.rs`
+- `src/bin/identity_provision_complete_diag.rs`
+
+These migrate in the **SDK rename PR (step 1)** because they already use the canonical type — leaving them on the old name would break `cargo build --bins`.
+
+**Group B — call raw `fluxbee_sdk::connect()` directly** (migrate in the final PR, step 9):
+
+- `src/bin/orch_system_diag.rs`
 - `src/bin/inventory_hold_diag.rs`
 - `src/bin/blob_sync_diag.rs`
-- `src/bin/orch_system_diag.rs`
 
-Per-binary scope: replace `RpcClient` → `RouterDispatcher` everywhere it appears, including `Arc<RpcClient>` field types, `RpcClient::connect_with_retry` call sites, and `use fluxbee_sdk::RpcClient` imports. No behavioral change. No `connect_with_retry` signature changes. This is mechanical and lands as part of step 1 of Section 9 (the SDK rename PR), not as a separate PR.
+These keep working unchanged through steps 1–8 because `connect()` remains `pub` throughout. In step 9 (`pub(crate)` flip), they migrate to `RouterDispatcher::connect_with_retry` in the same PR that activates the CI guard.
 
-If a future audit shows a `_diag` binary using the inline patterns this plan eliminates (it does not today), that one becomes its own line item.
+If a future audit shows a `_diag` binary using one of the inline dispatcher patterns this plan eliminates (today none do), that one becomes its own line item.
 
-### 6.7 Test nodes — explicitly out of scope
+### 6.7 Test nodes — explicitly out of scope until step 9
 
-`nodes/test/ai-test-cognition`, `nodes/test/ai-test-gov`, `nodes/test/io-test-cognition`, and `nodes/test/io-test` use the `connect()` + `loop { recv() }` pattern and run only on-demand against ephemeral environments. They are deliberately **out of scope** for this work:
+`nodes/test/ai-test-cognition`, `nodes/test/ai-test-gov`, `nodes/test/io-test-cognition`, and `nodes/test/io-test` use the `connect()` + `loop { recv() }` pattern and run only on-demand against ephemeral environments. They are **out of scope for steps 1–8**:
 
 - They are test harnesses, not production nodes — no inventory presence, no fleet operations care about them.
 - Their multiplexing behavior does not matter: ephemeral runs do not stress concurrent in-flight RPCs.
-- Migrating them would pull `RouterDispatcher` plumbing into test code that does not benefit from it.
+- Migrating them mid-plan would pull `RouterDispatcher` plumbing into test code that does not benefit from it.
 
-When the SDK rename PR lands, these binaries either compile because they use the SDK's lower-level `connect()`/`NodeConfig` API (which is renamed, not removed) or they are updated mechanically as a trivial follow-up. They do **not** gate any production migration in this plan, and a `_test_*` binary surfacing a new inline dispatcher is treated as a test-only concern.
+**They are migrated in step 9** alongside the Group B diag binaries, because keeping them on `pub` `connect()` while everything else is on `pub(crate)` requires a permanent feature flag or test-only `pub use` — either is a legacy shim that violates `feedback_no_legacy_in_dev`. Migrating the test nodes mechanically in step 9 is cheaper than maintaining that escape hatch. The migration is purely the type swap (`RouterDispatcher::connect_with_retry` instead of `connect()`), no behavior change.
 
-## 7. `VaultClient` and the 4 remaining Pattern 3 sites
+A `_test_*` binary surfacing a *new* inline dispatcher between now and step 9 is treated as a test-only concern and does not gate the plan.
 
-`VaultClient` is introduced by whichever PR lands first — the architect-specific PR or any of the 6.x PRs. After it exists, the global plan migrates these 4 sites:
+## 7. `VaultClient` and the 6 remaining Pattern 3 sites
 
-| Site | File | Migrated in |
-| --- | --- | --- |
-| `sy_cognition` | `src/bin/sy_cognition.rs:1594` | 6.1 sy_cognition PR |
-| `io-slack` | `nodes/io/io-slack/src/main.rs:739` | 6.2 io-slack PR |
-| `ai-generic` | `nodes/ai/ai-generic/src/bin/ai_node_runner.rs:1682` | 6.2 ai-generic PR |
-| `ai-frontdesk-gov` | `nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs:1708` | 6.2 ai-frontdesk-gov PR |
+`VaultClient` is introduced by whichever PR lands first — the architect-specific PR or any of the 6.x PRs. After it exists, the global plan migrates these 6 sites (the architect doc migrates the other 3):
 
-The PR that migrates the **last** site (whichever it is in scheduling order) also **deletes** `fluxbee_sdk::resolve_resource(&NodeSender, &mut NodeReceiver, ...)` from the SDK. No `#[deprecated]` attribute is added at any point.
+| Site | File | Connection style today | Migrated in |
+| --- | --- | --- | --- |
+| `sy_identity` | `src/bin/sy_identity.rs:5272` | Persistent `&NodeSender` + `&mut NodeReceiver` (Option-C fix) — not ephemeral | 6.1 sy_identity PR |
+| `sy_storage` | `src/bin/sy_storage.rs:2417` | Persistent `&NodeSender` + `&mut NodeReceiver` | 6.1 sy_storage PR |
+| `sy_cognition` | `src/bin/sy_cognition.rs:1610` | Ephemeral `connect()` | 6.1 sy_cognition PR |
+| `io-slack` | `nodes/io/io-slack/src/main.rs:751` | Ephemeral `connect()` | 6.2 io-slack PR |
+| `ai-generic` | `nodes/ai/ai-generic/src/bin/ai_node_runner.rs:1691` | Ephemeral `connect()` | 6.2 ai-generic PR |
+| `ai-frontdesk-gov` | `nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs:1720` | Ephemeral `connect()` | 6.2 ai-frontdesk-gov PR |
+
+The two non-ephemeral sites (`sy_identity`, `sy_storage`) deserve a separate note: today they pass `&mut NodeReceiver` *through the main recv loop*, which works only because the loop is a single naive `receiver.recv()` consumer. Once those nodes adopt `Arc<RouterDispatcher>`, the receiver is owned by the dispatcher and these call sites stop compiling. They are **not** optional in the migration — they must convert to `VaultClient` in the same PR that introduces the dispatcher for that node, otherwise that PR doesn't build.
+
+The PR that migrates the **last** site (whichever it is in scheduling order — across the architect doc and the 6 here) also **deletes** `fluxbee_sdk::resolve_resource(&NodeSender, &mut NodeReceiver, ...)` from the SDK. No `#[deprecated]` attribute is added at any point.
 
 ## 8. CI guards (added incrementally as each migration lands)
 
-Place under `scripts/router_dispatcher_guards/`:
+These guards run substring/regex scans of source text. **Substring scans are fragile** (the previous draft proposed `connect(&NodeConfig` and `resolve_resource(&NodeSender`, which miss the actual code patterns — `connect(config)`, `connect(&node_config)`, multi-line `resolve_resource(\n  &sender,\n  ...`). Each guard below specifies what it actually has to find and how.
 
-1. `no_inline_dispatcher.sh` — fails on `struct .*RouterInbox\b`, `struct SharedRouterConnection\b`, `struct RouterClient\b` (in `crates/fluxbee_ai_sdk/`), `type messageMux\b`, `func .*forwardOutgoing\b` outside their original definition site (which will be the SDK, not bespoke).
-2. `no_direct_connect.sh` — fails on `fluxbee_sdk::connect(` or unqualified `connect(&NodeConfig` in `nodes/**` and `src/bin/**` Rust code.
-3. `no_legacy_vault_helper.sh` — fails on `resolve_resource(&NodeSender` or `resolve_resource(&sender, &mut receiver` anywhere in the repo after the final site migrates.
-4. `no_deprecated_attribute_on_dispatcher.sh` — fails if `#[deprecated]` ever appears on `RouterDispatcher`, `RpcClient`, `connect_with_retry`, `VaultClient`, or `resolve_resource`. The forbidden state is "marked deprecated but kept" — we never deprecate, we delete.
+Place under `scripts/router_dispatcher_guards/`. Each guard uses `ast-grep` (preferred — it parses real Rust/Go syntax) with a regex fallback when ast-grep is unavailable in CI.
 
-Each guard's first turn-on is in the PR that finishes its scope. Earlier PRs may have failing-locally guards until that final PR — that is fine, the guards only run in CI once they are committed.
+1. **`no_inline_dispatcher.sh`** — uses ast-grep patterns:
+   - Rust: `struct $NAME { $$$ }` where `$NAME` matches `RouterInbox`, `SharedRouterConnection`, or `RouterClient` (the AI SDK one), allowed only in their original definition path (which will be the SDK or deleted entirely).
+   - Go: `type $NAME struct { $$$ }` where `$NAME` matches `messageMux`, plus `func ($_ *$NAME) forwardOutgoing($_)` for the OPA case.
+2. **`no_direct_connect.sh`** — call-site match, not substring:
+   - Rust ast-grep pattern: `fluxbee_sdk::connect($$$)` and `connect($$$).await` inside files matched by `nodes/**`, `src/bin/**`, `crates/!(fluxbee_sdk)/**`. (The negation excludes the SDK itself.)
+   - Also flag local re-implementations: any `async fn connect_with_retry($$$) { $$$ }` inside `src/bin/sy_*.rs` is forbidden after the per-node migration of that binary lands. Whitelist by path is maintained as part of the migration progress, not as a permanent escape hatch.
+   - Go ast-grep pattern: `fluxbeesdk.Connect($$$)` inside `go/**` outside the SDK package.
+3. **`no_legacy_vault_helper.sh`** — function-call match (handles multi-line):
+   - Rust ast-grep pattern: `fluxbee_sdk::resolve_resource($$$)` anywhere in the workspace. Activates in the PR that migrates the 9th Vault site. The pattern matches regardless of whether `&sender` is on the same line as the open-paren — that was the gap in the previous draft.
+   - Also flags `use fluxbee_sdk::resolve_resource` and re-exports.
+4. **`no_deprecated_attribute_on_dispatcher.sh`** — ast-grep:
+   - Rust pattern: `#[deprecated$$$]` immediately preceding any item named `RouterDispatcher`, `RpcClient`, `connect_with_retry`, `VaultClient`, or `resolve_resource`.
+5. **`no_shared_receiver.sh`** (Go-only, added when `wf-generic` migrates) — ast-grep pattern: any function whose body both reads from `$RECEIVER.Recv($$$)` *and* passes `$RECEIVER` to another function (e.g., `NewSDKTimerSender($_, $RECEIVER, $$$)`). This is the latent bug Section 5 calls out; the guard prevents it from coming back.
+
+Each guard's first turn-on is in the PR that finishes its scope. Until that PR, the guard exists in the repo but is `exit 0`-stubbed with a `TODO: enable after <PR-name>` comment, or is added only at activation time — either is fine, pick one and stick to it for the whole plan.
+
+If ast-grep is not installed in CI, the guards fall back to multi-line `pcregrep -M` patterns that explicitly match across whitespace/newlines. No guard relies on a single-line regex of a function signature.
 
 ## 9. Implementation order
 
-The order respects three constraints: (a) the SDK abstraction must exist before consumers migrate, (b) we never run with two abstractions coexisting longer than one PR boundary, and (c) we don't ship a PR that touches more than one "type of node" at a time (so review remains tractable).
+The order respects four constraints: (a) the SDK abstraction must exist before consumers migrate, (b) we never run with two abstractions coexisting longer than one PR boundary, (c) we don't ship a PR that touches more than one "type of node" at a time (so review remains tractable), and (d) `pub(crate)` on `connect()` is the **last** step, after every external caller is gone.
 
-1. **SDK Rust rename PR** — `RpcClient` → `RouterDispatcher`, `connect` → `pub(crate)`, `RouterDispatcherTestHarness`. No node-level changes in this PR. All existing call sites in `src/bin/sy_orchestrator.rs`, `src/bin/sy_admin.rs`, and the 9 diagnostic binaries listed in Section 6.6 are updated mechanically (they already use the canonical type).
-2. **SDK Rust `VaultClient` PR** — new `crates/fluxbee_sdk/src/vault.rs`. No call site migrations yet. The architect-specific PR may instead land first and introduce `VaultClient`; whichever PR is first does this, the other one uses what already exists.
-3. **`sy_identity`, `sy_vault`, `sy_storage`, `sy_policy`, `sy_config_routes` migration PRs** — one per node, mechanical. Order is free.
-4. **`sy_cognition` migration PR** — same shape, plus Vault site migration.
-5. **io-* bundle PR** — `io-api`, `io-slack`, `io-sim`, `io-linkedhelper` migrate together; `RouterInbox` deleted from `nodes/io/common`; io-slack Vault site migrated.
-6. **ai-generic + ai-frontdesk-gov + fluxbee_ai_sdk bundle PR** — both `SharedRouterConnection` definitions deleted; `fluxbee_ai_sdk::RouterClient` / `RouterReader` / `RouterWriter` / `AiNodeConfig` deleted; `NodeRuntime` rewritten to take `Arc<RouterDispatcher>`; both Vault sites migrated. If this is the PR that closes the last Vault site, it also **deletes** the free `resolve_resource` function.
-7. **Go SDK bring-up PR** — `RouterDispatcher` in `go/fluxbee-go-sdk/`, `sy-timer` and `wf-generic` rename usages.
-8. **`sy-wf-rules` migration PR** — delete `messageMux`.
-9. **`sy-opa-rules` migration PR** — delete `RouterClient` + `forwardOutgoing`.
+1. **SDK Rust rename PR** — `RpcClient` → `RouterDispatcher` as a type alias rename only. `connect_with_retry` keeps its current `(NodeConfig, Duration, OperationalRouteProfile)` signature. `RouterDispatcherTestHarness` renamed. `connect()` stays `pub`. Call-site updates limited to mechanical type-name swaps in:
+   - `src/bin/sy_orchestrator.rs`, `src/bin/sy_admin.rs`, `src/bin/sy_architect.rs` (already use the canonical type).
+   - The 6 Group A `*_diag` binaries listed in Section 6.6.
+   - `nodes/test/io-test/src/main.rs`.
+   The 3 Group B `*_diag` binaries (`orch_system_diag`, `inventory_hold_diag`, `blob_sync_diag`) are **not touched** in this PR — they keep working unchanged because they only use `fluxbee_sdk::connect()` (which is still `pub`).
+2. **SDK Rust `VaultClient` PR** — new `crates/fluxbee_sdk/src/vault.rs` over `Arc<RouterDispatcher>`. No call site migrations yet. The architect-specific PR may instead land first and introduce `VaultClient`; whichever PR is first does this, the other one uses what already exists.
+3. **Tipo 1 puro migration PRs** — one per node, no shared blast radius. Each PR adopts `Arc<RouterDispatcher>`, deletes the binary's local `connect_with_retry` wrapper, and (if applicable) migrates its Vault site. Order is free among themselves but they all land before any later step that depends on `connect()` being `pub(crate)`:
+   - `sy_policy`
+   - `sy_config_routes`
+   - `sy_vault`
+   - `sy_identity` (+ Vault site, 4-of-9)
+   - `sy_storage` (+ Vault site, 5-of-9)
+   - `sy_cognition` (+ Vault site, 6-of-9)
+4. **io-* bundle PR** — `io-api`, `io-slack`, `io-sim`, `io-linkedhelper` migrate together; `RouterInbox` deleted from `nodes/io/common`; io-slack Vault site migrated (7-of-9).
+5. **ai-* + fluxbee_ai_sdk bundle PR** — both `SharedRouterConnection` definitions deleted; `fluxbee_ai_sdk::RouterClient` / `RouterReader` / `RouterWriter` / `AiNodeConfig` deleted; `NodeRuntime` rewritten to take `Arc<RouterDispatcher>`; both Vault sites migrated (8-of-9 and 9-of-9). This PR **deletes** the free `resolve_resource` function from the SDK because it closes the last Vault site.
+6. **Go SDK bring-up PR** — construct `RouterDispatcher` in `go/fluxbee-go-sdk/dispatcher.go`, refactor `TimerClient` to use it, refactor `sy-timer` and `wf-generic` to use it. This PR is bundled because `wf-generic` cannot migrate independently of the `TimerClient` refactor (see Section 5).
+7. **`sy-wf-rules` migration PR** — delete `messageMux`.
+8. **`sy-opa-rules` migration PR** — delete `RouterClient` + `forwardOutgoing`.
+9. **Final cleanup PR** — `fluxbee_sdk::connect()` → `pub(crate)`. The 5 remaining `*_diag` binaries that still called raw `connect()` migrate to `RouterDispatcher::connect_with_retry` in this PR. The 4 test nodes in Section 6.7 migrate too (cheaper than maintaining a test-only escape hatch in the SDK). The CI guard `no_direct_connect.sh` is activated. The corresponding Go-side helpers (`AwaitSystemResponse`, `RequestSystemRPC`) are deleted.
 
-After step 9: no inline dispatcher remains anywhere, no second router connection is opened by any node for any reason, and `RouterDispatcher` is the single router-side abstraction in the codebase.
+After step 9: no inline dispatcher remains anywhere, no second router connection is opened by any node for any reason, no caller in the workspace reaches `fluxbee_sdk::connect()`, and `RouterDispatcher` is the single router-side abstraction in the codebase.
 
 ## 10. Why this is the right shape
 

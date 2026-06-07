@@ -51,7 +51,7 @@ pub use managed_node::{
     managed_node_instance_dir_with_root, managed_node_name, ManagedNodeError,
     DEFAULT_MANAGED_NODE_ROOT, FLUXBEE_NODE_NAME_ENV,
 };
-pub use node_client::{connect, connect_with_client_config, NodeConfig, NodeError, NodeUuidMode};
+pub use node_client::{NodeConfig, NodeError, NodeUuidMode};
 pub use node_config::{
     build_node_config_get_message, build_node_config_response_message,
     build_node_config_response_message_runtime_src, build_node_config_set_message,
@@ -78,11 +78,11 @@ pub use rpc::{
     admin_response_payload_value, extract_error_message,
     parse_admin_response as rpc_parse_admin_response, AdminCommandRequest, AdminCommandResult,
     OperationalRouteProfile, OperationalRouteProfileBuilder, PendingMatcher, RouteMatch,
-    RouteTarget, RpcClient, RpcCommandReceiver, RpcError, RpcRequestLabels, RpcTestHarness,
-    SystemRpcRequest, ADMIN_KIND, MSG_ADMIN_COMMAND, MSG_ADMIN_COMMAND_RESPONSE,
+    RouteTarget, RouterDispatcher, RouterDispatcherTestHarness, RpcCommandReceiver, RpcError,
+    RpcRequestLabels, SystemRpcRequest, ADMIN_KIND, MSG_ADMIN_COMMAND, MSG_ADMIN_COMMAND_RESPONSE,
     RPC_COMMAND_DEPTH_WARN_THRESHOLD,
 };
-pub use split::{NodeReceiver, NodeSender};
+pub use split::NodeSender;
 pub use status::try_handle_default_node_status;
 pub use thread::{compute_thread_id, ThreadIdError, ThreadIdInput};
 pub use timer::{
@@ -96,17 +96,16 @@ pub use timer::{
     TimerListFilter, TimerListPayload, TimerListResponse, TimerNowInPayload, TimerNowInResult,
     TimerNowResult, TimerParsePayload, TimerParseResult, TimerPurgeOwnerPayload,
     TimerReschedulePayload, TimerResponse, TimerSchedulePayload, TimerScheduleRecurringPayload,
-    TimerStatus, TimerStatusFilter, TimerTestHarness, MSG_TIMER_CANCEL, MSG_TIMER_CONVERT,
-    MSG_TIMER_FIRED, MSG_TIMER_FORMAT, MSG_TIMER_GET, MSG_TIMER_HELP, MSG_TIMER_LIST,
-    MSG_TIMER_NOW, MSG_TIMER_NOW_IN, MSG_TIMER_PARSE, MSG_TIMER_PURGE_OWNER, MSG_TIMER_RESCHEDULE,
+    TimerStatus, TimerStatusFilter, MSG_TIMER_CANCEL, MSG_TIMER_CONVERT, MSG_TIMER_FIRED,
+    MSG_TIMER_FORMAT, MSG_TIMER_GET, MSG_TIMER_HELP, MSG_TIMER_LIST, MSG_TIMER_NOW,
+    MSG_TIMER_NOW_IN, MSG_TIMER_PARSE, MSG_TIMER_PURGE_OWNER, MSG_TIMER_RESCHEDULE,
     MSG_TIMER_RESPONSE, MSG_TIMER_SCHEDULE, MSG_TIMER_SCHEDULE_RECURRING,
     TIMER_DEFAULT_RPC_TIMEOUT_MS, TIMER_DEFAULT_TIME_RETRY_SCHEDULE_MS, TIMER_LIST_DEFAULT_LIMIT,
     TIMER_LIST_MAX_LIMIT, TIMER_MIN_DURATION_MS, TIMER_NODE_FAMILY, TIMER_NODE_KIND,
 };
 pub use vault::{
-    normalize_resource_type, resolve_resource, vault_delete, vault_get, vault_get_metadata,
-    vault_get_with_retry, vault_list, vault_put, vault_rollback, vault_rotate, ResourceType,
-    VaultCaller, VaultDeleteResponse, VaultError, VaultFilter, VaultGetMetadataRequest,
+    normalize_resource_type, ResourceType, VaultCaller, VaultCallerOwned, VaultClient,
+    VaultDeleteResponse, VaultError, VaultFilter, VaultGetMetadataRequest,
     VaultGetMetadataResponse, VaultGetRequest, VaultGetResponse, VaultKeyRequest, VaultListRequest,
     VaultListResponse, VaultMetadata, VaultPutRequest, VaultPutResponse, VaultRetryPolicy,
     VaultRollbackResponse, VaultRotateRequest, VaultRotateResponse, VaultSecretSummary,

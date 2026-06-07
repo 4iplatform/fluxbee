@@ -1,9 +1,11 @@
 #[path = "support/timer_example.rs"]
 mod timer_example;
 
+use std::sync::Arc;
+
 use fluxbee_sdk::{
-    TimerClient, TimerClientConfig, TimerId, TimerInfo, TimerScheduleRecurringPayload, TimerStatus,
-    TimerStatusFilter,
+    RouterDispatcher, TimerClient, TimerClientConfig, TimerId, TimerInfo,
+    TimerScheduleRecurringPayload, TimerStatus, TimerStatusFilter,
 };
 use serde_json::json;
 use tokio::time::{sleep, Duration};
@@ -20,22 +22,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     timer_example::init_logging();
 
-    let (sender, mut receiver, uuid_mode) =
+    let (dispatcher, mut incoming, uuid_mode) =
         timer_example::connect_example_node("WF.timer.recurring").await?;
+    let sender = dispatcher.sender_snapshot();
     println!(
-        "connected as {} (uuid={}, vpn={}, uuid_mode={:?})",
+        "connected as {} (uuid={}, uuid_mode={:?})",
         sender.full_name(),
         sender.uuid(),
-        receiver.vpn_id(),
         uuid_mode,
     );
 
-    let timer_id = schedule_recurring_and_inspect(&sender, &mut receiver).await?;
+    let timer_id = schedule_recurring_and_inspect(&dispatcher).await?;
     println!("scheduled recurring timer_uuid={}", timer_id.as_str());
 
     let fired_event = timer_example::wait_for_timer_fired(
-        &sender,
-        &mut receiver,
+        &dispatcher,
+        &mut incoming,
         &timer_id,
         Duration::from_secs(FIRE_WAIT_TIMEOUT_SECS),
     )
@@ -49,8 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let requeued_state = wait_for_recurring_requeued_state(
-        &sender,
-        &mut receiver,
+        &dispatcher,
         &timer_id,
         fired_event.actual_fire_at_utc_ms,
     )
@@ -63,20 +64,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         requeued_state.fire_at_utc_ms,
     );
 
-    cancel_and_confirm(&sender, &mut receiver, &timer_id).await?;
+    cancel_and_confirm(&dispatcher, &timer_id).await?;
     println!(
         "confirmed recurring timer canceled uuid={}",
         timer_id.as_str()
     );
 
+    let _ = incoming; // keep alive until end
     Ok(())
 }
 
 async fn schedule_recurring_and_inspect(
-    sender: &fluxbee_sdk::NodeSender,
-    receiver: &mut fluxbee_sdk::NodeReceiver,
+    dispatcher: &Arc<RouterDispatcher>,
 ) -> Result<TimerId, Box<dyn std::error::Error>> {
-    let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
+    let mut client =
+        TimerClient::new_with_dispatcher(dispatcher.clone(), TimerClientConfig::default())?;
+    let sender = dispatcher.sender_snapshot();
     let now = client.now().await?;
     println!(
         "timer target={} now_utc_ms={} now_utc_iso={}",
@@ -131,8 +134,7 @@ async fn schedule_recurring_and_inspect(
 }
 
 async fn wait_for_recurring_requeued_state(
-    sender: &fluxbee_sdk::NodeSender,
-    receiver: &mut fluxbee_sdk::NodeReceiver,
+    dispatcher: &Arc<RouterDispatcher>,
     timer_id: &TimerId,
     actual_fire_at_utc_ms: i64,
 ) -> Result<TimerInfo, Box<dyn std::error::Error>> {
@@ -149,11 +151,12 @@ async fn wait_for_recurring_requeued_state(
         Duration::from_secs(1),
     ];
     let mut last_info = None;
+    let mut client =
+        TimerClient::new_with_dispatcher(dispatcher.clone(), TimerClientConfig::default())?;
     for delay in delays.into_iter().take(POST_FIRE_STATUS_ATTEMPTS) {
         if !delay.is_zero() {
             sleep(delay).await;
         }
-        let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
         let info = client.get(timer_id.clone()).await?;
         if info.status == TimerStatus::Pending
             && info.fire_count >= 1
@@ -174,11 +177,11 @@ async fn wait_for_recurring_requeued_state(
 }
 
 async fn cancel_and_confirm(
-    sender: &fluxbee_sdk::NodeSender,
-    receiver: &mut fluxbee_sdk::NodeReceiver,
+    dispatcher: &Arc<RouterDispatcher>,
     timer_id: &TimerId,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
+    let mut client =
+        TimerClient::new_with_dispatcher(dispatcher.clone(), TimerClientConfig::default())?;
     client.cancel(timer_id.clone()).await?;
     for delay in [
         Duration::from_millis(0),
@@ -189,8 +192,7 @@ async fn cancel_and_confirm(
         if !delay.is_zero() {
             sleep(delay).await;
         }
-        let mut poll_client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
-        let info = poll_client.get(timer_id.clone()).await?;
+        let info = client.get(timer_id.clone()).await?;
         if info.status == TimerStatus::Canceled {
             return Ok(());
         }

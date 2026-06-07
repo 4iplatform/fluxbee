@@ -4,9 +4,13 @@ use std::time::Duration as StdDuration;
 use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
-use fluxbee_sdk::{connect, NodeConfig, NodeError, NodeReceiver, NodeSender, NodeUuidMode};
+use fluxbee_sdk::{
+    NodeConfig, NodeError, NodeSender, NodeUuidMode, OperationalRouteProfile, PendingMatcher,
+    RouteMatch, RouteTarget, RouterDispatcher, RpcError, RpcRequestLabels,
+};
 use serde_json::{json, Value};
-use tokio::time::{sleep, Duration};
+use std::sync::Arc;
+use tokio::time::Duration;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -23,12 +27,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| s.as_str())
         .unwrap_or("WF.invoice@motherbee");
 
-    let (sender, mut receiver) = connect_example_node().await?;
+    let dispatcher = connect_example_node().await?;
+    let sender = dispatcher.sender_snapshot();
     println!(
-        "connected as {} (uuid={}, vpn={})",
+        "connected as {} (uuid={})",
         sender.full_name(),
         sender.uuid(),
-        receiver.vpn_id(),
     );
 
     match mode {
@@ -59,53 +63,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         "list" => {
-            let trace_id = Uuid::new_v4().to_string();
-            sender
-                .send(build_targeted_message(
-                    &sender,
-                    target,
-                    SYSTEM_KIND,
-                    Some("WF_LIST_INSTANCES"),
-                    json!({ "limit": 20 }),
-                    &trace_id,
-                ))
-                .await?;
-            let response =
-                await_response(&mut receiver, &trace_id, "WF_LIST_INSTANCES_RESPONSE").await?;
+            let response = system_rpc_via_dispatcher(
+                &dispatcher,
+                target,
+                "WF_LIST_INSTANCES",
+                "WF_LIST_INSTANCES_RESPONSE",
+                json!({ "limit": 20 }),
+            )
+            .await?;
             println!("{}", serde_json::to_string_pretty(&response.payload)?);
         }
         "get" => {
             let instance_id = args.get(3).ok_or("missing instance_id for get")?;
-            let trace_id = Uuid::new_v4().to_string();
-            sender
-                .send(build_targeted_message(
-                    &sender,
-                    target,
-                    SYSTEM_KIND,
-                    Some("WF_GET_INSTANCE"),
-                    json!({ "instance_id": instance_id, "log_limit": 20 }),
-                    &trace_id,
-                ))
-                .await?;
-            let response =
-                await_response(&mut receiver, &trace_id, "WF_GET_INSTANCE_RESPONSE").await?;
+            let response = system_rpc_via_dispatcher(
+                &dispatcher,
+                target,
+                "WF_GET_INSTANCE",
+                "WF_GET_INSTANCE_RESPONSE",
+                json!({ "instance_id": instance_id, "log_limit": 20 }),
+            )
+            .await?;
             println!("{}", serde_json::to_string_pretty(&response.payload)?);
         }
         "cancel" => {
             let instance_id = args.get(3).ok_or("missing instance_id for cancel")?;
-            let trace_id = Uuid::new_v4().to_string();
-            sender
-                .send(build_targeted_message(
-                    &sender,
-                    target,
-                    SYSTEM_KIND,
-                    Some("WF_CANCEL_INSTANCE"),
-                    json!({ "instance_id": instance_id, "reason": "manual example cancel" }),
-                    &trace_id,
-                ))
-                .await?;
-            let response =
-                await_response(&mut receiver, &trace_id, "WF_CANCEL_INSTANCE_RESPONSE").await?;
+            let response = system_rpc_via_dispatcher(
+                &dispatcher,
+                target,
+                "WF_CANCEL_INSTANCE",
+                "WF_CANCEL_INSTANCE_RESPONSE",
+                json!({ "instance_id": instance_id, "reason": "manual example cancel" }),
+            )
+            .await?;
             println!("{}", serde_json::to_string_pretty(&response.payload)?);
         }
         other => {
@@ -116,6 +105,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn system_rpc_via_dispatcher(
+    dispatcher: &Arc<RouterDispatcher>,
+    target: &str,
+    request_msg: &str,
+    response_msg: &str,
+    payload: Value,
+) -> Result<Message, Box<dyn std::error::Error>> {
+    let message = Message {
+        routing: Routing {
+            src: String::new(),
+            src_l2_name: None,
+            dst: Destination::Broadcast,
+            ttl: 16,
+            trace_id: String::new(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(request_msg.to_string()),
+            target: Some(target.to_string()),
+            ..Meta::default()
+        },
+        payload,
+    };
+    let matcher = PendingMatcher::new(
+        vec![RouteMatch::exact(SYSTEM_KIND, response_msg)],
+        vec![
+            RouteMatch::exact(SYSTEM_KIND, MSG_UNREACHABLE),
+            RouteMatch::exact(SYSTEM_KIND, MSG_TTL_EXCEEDED),
+        ],
+        vec![],
+    );
+    let labels = RpcRequestLabels::new(target, request_msg, response_msg);
+    match dispatcher
+        .send_with_matcher(message, matcher, labels, Duration::from_secs(30))
+        .await
+    {
+        Ok(msg) => Ok(msg),
+        Err(RpcError::Unreachable {
+            reason,
+            original_dst,
+        }) => Err(format!(
+            "router returned UNREACHABLE: reason={reason} original_dst={original_dst}"
+        )
+        .into()),
+        Err(RpcError::TtlExceeded {
+            original_dst,
+            last_hop,
+        }) => Err(format!(
+            "router returned TTL_EXCEEDED: original_dst={original_dst} last_hop={last_hop}"
+        )
+        .into()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn init_logging() {
     let log_level = std::env::var("JSR_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
     let _ = tracing_subscriber::fmt()
@@ -123,7 +167,7 @@ fn init_logging() {
         .try_init();
 }
 
-async fn connect_example_node() -> Result<(NodeSender, NodeReceiver), NodeError> {
+async fn connect_example_node() -> Result<Arc<RouterDispatcher>, NodeError> {
     let config_dir = PathBuf::from(json_router::paths::CONFIG_DIR);
     let socket_dir = PathBuf::from(json_router::paths::ROUTER_SOCKET_DIR);
     let state_dir = PathBuf::from(json_router::paths::STATE_DIR);
@@ -137,22 +181,20 @@ async fn connect_example_node() -> Result<(NodeSender, NodeReceiver), NodeError>
         config_dir,
         version: VERSION.to_string(),
     };
-    connect_with_retry(&node_config, StdDuration::from_secs(1)).await
-}
-
-async fn connect_with_retry(
-    config: &NodeConfig,
-    delay: StdDuration,
-) -> Result<(NodeSender, NodeReceiver), NodeError> {
-    loop {
-        match connect(config).await {
-            Ok(result) => return Ok(result),
-            Err(err) => {
-                eprintln!("connect failed: {err}");
-                sleep(Duration::from_millis(delay.as_millis() as u64)).await;
-            }
-        }
-    }
+    let profile = OperationalRouteProfile::builder()
+        .command_channel("system")
+        .post_pending_rule(
+            RouteMatch::any_msg_type(SYSTEM_KIND),
+            RouteTarget::Command("system"),
+        )
+        .build()
+        .map_err(|err| {
+            NodeError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                err.to_string(),
+            ))
+        })?;
+    RouterDispatcher::connect_with_retry(node_config, StdDuration::from_secs(1), profile).await
 }
 
 fn build_targeted_message(
@@ -181,42 +223,5 @@ fn build_targeted_message(
     }
 }
 
-async fn await_response(
-    receiver: &mut NodeReceiver,
-    trace_id: &str,
-    response_msg: &str,
-) -> Result<Message, Box<dyn std::error::Error>> {
-    loop {
-        let msg = receiver.recv_timeout(Duration::from_secs(30)).await?;
-        if msg.routing.trace_id != trace_id {
-            continue;
-        }
-        if msg.meta.msg_type == SYSTEM_KIND {
-            match msg.meta.msg.as_deref() {
-                Some(kind) if kind == response_msg => return Ok(msg),
-                Some(MSG_UNREACHABLE) => {
-                    return Err(format!(
-                        "router returned UNREACHABLE: {}",
-                        serde_json::to_string_pretty(&msg.payload)?
-                    )
-                    .into())
-                }
-                Some(MSG_TTL_EXCEEDED) => {
-                    return Err(format!(
-                        "router returned TTL_EXCEEDED: {}",
-                        serde_json::to_string_pretty(&msg.payload)?
-                    )
-                    .into())
-                }
-                Some(other) => {
-                    return Err(format!(
-                        "received unexpected system response {other}: {}",
-                        serde_json::to_string_pretty(&msg.payload)?
-                    )
-                    .into())
-                }
-                None => {}
-            }
-        }
-    }
-}
+// `await_response` was removed when migrating to RouterDispatcher;
+// `system_rpc_via_dispatcher` above replaces it with `send_with_matcher`.

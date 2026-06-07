@@ -9,7 +9,6 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{self, Duration};
 use uuid::Uuid;
 
-use crate::client_config::ClientConfig;
 use crate::protocol::{
     build_hello, Message, NodeAnnouncePayload, NodeHelloPayload, MSG_ANNOUNCE, SYSTEM_KIND,
 };
@@ -60,17 +59,16 @@ struct HiveFile {
     hive_id: String,
 }
 
-pub async fn connect(config: &NodeConfig) -> Result<(NodeSender, NodeReceiver), NodeError> {
+/// Open a raw `(NodeSender, NodeReceiver)` pair against the router.
+///
+/// Crate-private. The canonical entry point for every node/test/example
+/// is `RouterDispatcher::connect_with_retry`, which wraps `connect` and
+/// owns the receiver. The `no_direct_connect.sh` CI guard enforces this.
+pub(crate) async fn connect(config: &NodeConfig) -> Result<(NodeSender, NodeReceiver), NodeError> {
     let parts = connect_parts(config).await?;
     let sender = NodeSender::new(parts.tx, Arc::clone(&parts.info));
     let receiver = NodeReceiver::new(parts.rx, parts.info);
     Ok((sender, receiver))
-}
-
-pub async fn connect_with_client_config(
-    config: &ClientConfig,
-) -> Result<(NodeSender, NodeReceiver), NodeError> {
-    connect(&config.node).await
 }
 
 struct ConnectedParts {

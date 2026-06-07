@@ -53,11 +53,11 @@ use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest,
     MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
-use fluxbee_sdk::rpc::{AdminCommandRequest, OperationalRouteProfile, RpcClient};
+use fluxbee_sdk::rpc::{AdminCommandRequest, OperationalRouteProfile, RouterDispatcher};
 use fluxbee_sdk::{
-    build_node_config_response_message, connect, list_ich_options_from_hive_id,
-    try_handle_default_node_status, IdentityIchOption, NodeConfig, NodeError, NodeReceiver,
-    NodeSender, NODE_SECRET_REDACTION_TOKEN,
+    build_node_config_response_message, list_ich_options_from_hive_id,
+    try_handle_default_node_status, IdentityIchOption, NodeConfig, RouteMatch, RouteTarget,
+    RpcCommandReceiver, NODE_SECRET_REDACTION_TOKEN,
 };
 use futures::TryStreamExt;
 use json_router::runtime_manifest::{
@@ -247,6 +247,10 @@ struct ArchitectAdminToolContext {
     config_dir: PathBuf,
     state_dir: PathBuf,
     socket_dir: PathBuf,
+    /// Canonical architect dispatcher — used by
+    /// `execute_admin_action_with_context` and `fetch_inventory_status_data`
+    /// for every outbound admin RPC. No per-call ephemeral `NodeConfig`.
+    rpc: Arc<RouterDispatcher>,
     ai_runtime: Arc<Mutex<Option<ArchitectAiRuntime>>>,
     session_id: Option<String>,
     admin_actions_cache: Arc<Mutex<Option<AdminActionsCache>>>,
@@ -333,7 +337,11 @@ struct ArchitectState {
     config_dir: PathBuf,
     state_dir: PathBuf,
     socket_dir: PathBuf,
-    router_connected: AtomicBool,
+    /// Canonical dispatcher for all router traffic — admin RPC, system
+    /// channel, incoming impersonation messages, and Vault lookups.
+    /// Replaces the bespoke `router_connect_loop` + `router_recv_loop` +
+    /// `router_sender` + `router_connected` quartet.
+    rpc: Arc<RouterDispatcher>,
     ai_configured: AtomicBool,
     ai_runtime: Arc<Mutex<Option<ArchitectAiRuntime>>>,
     messages_db_configured: AtomicBool,
@@ -342,7 +350,6 @@ struct ArchitectState {
     messages_stream_active: Arc<AtomicUsize>,
     chat_lock: Arc<Mutex<()>>,
     pending_actions: Arc<Mutex<HashMap<String, PendingAdminAction>>>,
-    router_sender: Arc<Mutex<Option<NodeSender>>>,
     cached_status: Arc<RwLock<ArchitectStatus>>,
     admin_actions_cache: Arc<Mutex<Option<AdminActionsCache>>>,
     plan_compile_pending: Arc<Mutex<HashMap<String, PlanCompilePending>>>,
@@ -5902,7 +5909,7 @@ async fn main() -> Result<(), ArchitectError> {
     let socket_dir = json_router::paths::router_socket_dir();
 
     let hive = load_hive(&config_dir)?;
-    let node_config = load_architect_node_config(&hive.hive_id)?;
+    let node_config_file = load_architect_node_config(&hive.hive_id)?;
     let node_name = architect_node_name(&hive.hive_id);
     // Model D': self-ILK is deterministic from L2 name (no SHM wait).
     let self_ilk_id = fluxbee_sdk::deterministic_system_ilk_id(&node_name);
@@ -5911,13 +5918,35 @@ async fn main() -> Result<(), ArchitectError> {
         self_ilk_id = %self_ilk_id,
         "self system ILK computed deterministically"
     );
+
+    // Section B: build the canonical Arc<RouterDispatcher> BEFORE Vault
+    // lookups (Vault helpers now reuse this dispatcher rather than
+    // opening per-call ephemeral connections).
+    let architect_node_config = NodeConfig {
+        name: "SY.architect".to_string(),
+        router_socket: socket_dir.clone(),
+        uuid_persistence_dir: state_dir.join("nodes"),
+        uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
+        config_dir: config_dir.clone(),
+        version: "0.1.0".to_string(),
+    };
+    let rpc_profile = build_architect_rpc_profile()?;
+    let rpc = RouterDispatcher::connect_with_retry(
+        architect_node_config,
+        Duration::from_secs(1),
+        rpc_profile,
+    )
+    .await?;
+    let system_rx = rpc.take_command_receiver("system").await?;
+    let incoming_rx = rpc.take_command_receiver("incoming").await?;
+    tracing::info!(node = %node_name, "sy.architect canonical RouterDispatcher connected");
+
     let ai_runtime = build_architect_ai_runtime(
+        Arc::clone(&rpc),
         &node_name,
         &self_ilk_id,
-        node_config.as_ref(),
+        node_config_file.as_ref(),
         &hive,
-        &config_dir,
-        &state_dir,
     )
     .await;
     let agent_asset_catalog = bootstrap_agent_asset_catalog_from_config_dir(&config_dir)
@@ -5952,9 +5981,7 @@ async fn main() -> Result<(), ArchitectError> {
         error: None,
     };
     let initial_messages_db_url = resolve_messages_db_url_from_vault(
-        &config_dir,
-        &state_dir,
-        &socket_dir,
+        Arc::clone(&rpc),
         &hive.hive_id,
         &node_name,
         &self_ilk_id,
@@ -5981,7 +6008,7 @@ async fn main() -> Result<(), ArchitectError> {
         config_dir,
         state_dir,
         socket_dir,
-        router_connected: AtomicBool::new(false),
+        rpc: Arc::clone(&rpc),
         ai_configured: AtomicBool::new(ai_runtime.is_some()),
         ai_runtime: Arc::new(Mutex::new(ai_runtime)),
         messages_db_configured: AtomicBool::new(initial_messages_db_configured),
@@ -5990,7 +6017,6 @@ async fn main() -> Result<(), ArchitectError> {
         messages_stream_active: Arc::new(AtomicUsize::new(0)),
         chat_lock: Arc::new(Mutex::new(())),
         pending_actions: Arc::new(Mutex::new(HashMap::new())),
-        router_sender: Arc::new(Mutex::new(None)),
         cached_status: Arc::new(RwLock::new(initial_status)),
         admin_actions_cache: Arc::new(Mutex::new(None)),
         plan_compile_pending: Arc::new(Mutex::new(HashMap::new())),
@@ -6004,19 +6030,20 @@ async fn main() -> Result<(), ArchitectError> {
     seed_cookbooks_from_defaults(&state.state_dir);
     mark_interrupted_pipeline_runs(&state).await;
 
-    let node_config = NodeConfig {
-        name: "SY.architect".to_string(),
-        router_socket: state.socket_dir.clone(),
-        uuid_persistence_dir: state.state_dir.join("nodes"),
-        uuid_mode: fluxbee_sdk::NodeUuidMode::Persistent,
-        config_dir: state.config_dir.clone(),
-        version: "0.1.0".to_string(),
-    };
-
-    let router_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        router_connect_loop(node_config, router_state).await;
-    });
+    // Section D: spawn system + incoming workers (replace the deleted
+    // `router_connect_loop` / `router_recv_loop` quartet).
+    {
+        let system_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            run_architect_system_worker(system_state, system_rx).await;
+        });
+    }
+    {
+        let incoming_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            run_architect_incoming_worker(incoming_state, incoming_rx).await;
+        });
+    }
 
     let refresh_state = Arc::clone(&state);
     tokio::spawn(async move {
@@ -6092,17 +6119,15 @@ fn architect_config_path(hive_id: &str) -> PathBuf {
 }
 
 async fn build_architect_ai_runtime(
+    rpc: Arc<RouterDispatcher>,
     node_name: &str,
     self_ilk_id: &str,
     config: Option<&ArchitectNodeConfigFile>,
     hive: &HiveFile,
-    config_dir: &Path,
-    state_dir: &Path,
 ) -> Option<ArchitectAiRuntime> {
     let openai = merged_openai_section(config, hive);
     let api_key = match resolve_architect_openai_api_key_from_vault(
-        config_dir,
-        state_dir,
+        rpc,
         hive,
         node_name,
         self_ilk_id,
@@ -6165,37 +6190,39 @@ fn merged_openai_section(
 }
 
 async fn resolve_architect_openai_api_key_from_vault(
-    config_dir: &Path,
-    state_dir: &Path,
+    rpc: Arc<RouterDispatcher>,
     hive: &HiveFile,
     node_name: &str,
     self_ilk_id: &str,
 ) -> Result<Option<String>, ArchitectError> {
-    let node_config = NodeConfig {
-        name: "SY.architect".to_string(),
-        router_socket: json_router::paths::router_socket_dir(),
-        uuid_persistence_dir: state_dir.join("nodes"),
-        uuid_mode: fluxbee_sdk::NodeUuidMode::Ephemeral,
-        config_dir: config_dir.to_path_buf(),
-        version: "0.1.0".to_string(),
-    };
-    let (sender, mut receiver) = connect(&node_config).await?;
-    let caller = fluxbee_sdk::VaultCaller::new(self_ilk_id, node_name);
-    let value = fluxbee_sdk::resolve_resource(
-        &sender,
-        &mut receiver,
-        caller,
-        &hive.hive_id,
-        fluxbee_sdk::ResourceType::Openai,
-        fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
-        Duration::from_secs(5),
-    )
-    .await;
-    let _ = sender.close().await;
+    let vault_client = architect_vault_client(rpc, &hive.hive_id, node_name, self_ilk_id);
+    let value = vault_client
+        .resolve_resource(
+            fluxbee_sdk::ResourceType::Openai,
+            fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+            Duration::from_secs(5),
+        )
+        .await;
     let Some(value) = value? else {
         return Ok(None);
     };
     Ok(vault_response_openai_api_key(&value))
+}
+
+/// Wraps the canonical architect dispatcher in a `VaultClient` carrying
+/// the architect's identity context. No ephemeral connect; the same
+/// dispatcher used for admin RPCs and inbound system traffic.
+fn architect_vault_client(
+    rpc: Arc<RouterDispatcher>,
+    hive_id: &str,
+    node_name: &str,
+    self_ilk_id: &str,
+) -> fluxbee_sdk::VaultClient {
+    fluxbee_sdk::VaultClient::new(
+        rpc,
+        hive_id.to_string(),
+        fluxbee_sdk::VaultCallerOwned::new(self_ilk_id.to_string(), node_name.to_string()),
+    )
 }
 
 fn vault_response_openai_api_key(value: &Value) -> Option<String> {
@@ -6218,12 +6245,11 @@ async fn refresh_architect_ai_runtime(state: &ArchitectState) -> Result<bool, Ar
     let hive = load_hive(&state.config_dir)?;
     let node_config = load_architect_node_config(&hive.hive_id)?;
     let runtime = build_architect_ai_runtime(
+        Arc::clone(&state.rpc),
         &state.node_name,
         &state.self_ilk_id,
         node_config.as_ref(),
         &hive,
-        &state.config_dir,
-        &state.state_dir,
     )
     .await;
     state
@@ -6239,40 +6265,19 @@ async fn refresh_architect_ai_runtime(state: &ArchitectState) -> Result<bool, Ar
 /// (degraded — viewer disabled). The connection string carries credentials
 /// + host only; the consumer adds the dbname (ARCHITECT_MESSAGES_DB_NAME).
 async fn resolve_messages_db_url_from_vault(
-    config_dir: &Path,
-    state_dir: &Path,
-    socket_dir: &Path,
+    rpc: Arc<RouterDispatcher>,
     hive_id: &str,
     node_name: &str,
     self_ilk_id: &str,
 ) -> Option<String> {
-    let node_config = NodeConfig {
-        name: "SY.architect".to_string(),
-        router_socket: socket_dir.to_path_buf(),
-        uuid_persistence_dir: state_dir.join("nodes"),
-        uuid_mode: fluxbee_sdk::NodeUuidMode::Ephemeral,
-        config_dir: config_dir.to_path_buf(),
-        version: "0.1.0".to_string(),
-    };
-    let (sender, mut receiver) = match fluxbee_sdk::connect(&node_config).await {
-        Ok(pair) => pair,
-        Err(err) => {
-            tracing::warn!(error = %err, "messages_db postgres vault lookup: ephemeral router connect failed");
-            return None;
-        }
-    };
-    let caller = fluxbee_sdk::VaultCaller::new(self_ilk_id, node_name);
-    let result = fluxbee_sdk::resolve_resource(
-        &sender,
-        &mut receiver,
-        caller,
-        hive_id,
-        fluxbee_sdk::ResourceType::Postgres,
-        fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
-        Duration::from_secs(5),
-    )
-    .await;
-    let _ = sender.close().await;
+    let vault_client = architect_vault_client(rpc, hive_id, node_name, self_ilk_id);
+    let result = vault_client
+        .resolve_resource(
+            fluxbee_sdk::ResourceType::Postgres,
+            fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
+            Duration::from_secs(5),
+        )
+        .await;
     match result {
         Ok(Some(value)) => extract_messages_db_url_from_vault_value(&value),
         Ok(None) => None,
@@ -6298,9 +6303,7 @@ fn extract_messages_db_url_from_vault_value(value: &Value) -> Option<String> {
 
 async fn refresh_architect_messages_db_url(state: &ArchitectState) -> (bool, bool, Option<String>) {
     let url = resolve_messages_db_url_from_vault(
-        &state.config_dir,
-        &state.state_dir,
-        &state.socket_dir,
+        Arc::clone(&state.rpc),
         &state.hive_id,
         &state.node_name,
         &state.self_ilk_id,
@@ -6346,6 +6349,7 @@ fn admin_tool_context(
         config_dir: state.config_dir.clone(),
         state_dir: state.state_dir.clone(),
         socket_dir: state.socket_dir.clone(),
+        rpc: Arc::clone(&state.rpc),
         ai_runtime: Arc::clone(&state.ai_runtime),
         session_id: session_id.map(str::to_string),
         admin_actions_cache: Arc::clone(&state.admin_actions_cache),
@@ -6612,45 +6616,129 @@ async fn clear_pending_action(
     state.pending_actions.lock().await.remove(session_id)
 }
 
-async fn router_connect_loop(config: NodeConfig, state: Arc<ArchitectState>) {
-    loop {
-        match connect(&config).await {
-            Ok((sender, receiver)) => {
-                *state.router_sender.lock().await = Some(sender);
-                state.router_connected.store(true, Ordering::Relaxed);
-                tracing::info!(node = %state.node_name, "sy.architect connected to router");
-                if let Err(err) = router_recv_loop(receiver, Arc::clone(&state)).await {
-                    tracing::warn!(error = %err, "sy.architect router loop ended");
-                }
-                *state.router_sender.lock().await = None;
-                state.router_connected.store(false, Ordering::Relaxed);
-            }
-            Err(err) => {
-                *state.router_sender.lock().await = None;
-                state.router_connected.store(false, Ordering::Relaxed);
-                tracing::warn!(error = %err, "sy.architect router connect failed");
-            }
-        }
-        time::sleep(Duration::from_secs(ROUTER_RECONNECT_DELAY_SECS)).await;
+/// Section B + D: builds the dedicated architect route profile.
+///
+/// `system` command channel — `NODE_STATUS_GET`, `CONFIG_GET`,
+/// `CONFIG_SET`, `VAULT_SECRET_CHANGED`. Pre-pending so these win against
+/// trace_id collisions with our own outbound admin RPCs.
+///
+/// `incoming` command channel — `user`, `chat`, `text` traffic that
+/// architect persists for impersonation sessions.
+///
+/// No `RouteMatch::Any` fallback: unknown traffic increments
+/// `rpc_route_unmatched_total` (the SDK metric) and is dropped without
+/// noisy logs in production.
+fn build_architect_rpc_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::RpcError> {
+    OperationalRouteProfile::builder()
+        .command_channel("system")
+        .command_channel("incoming")
+        .pre_pending_rule(
+            RouteMatch::OneOf {
+                msg_type: SYSTEM_KIND.to_string(),
+                msgs: vec![
+                    fluxbee_sdk::protocol::MSG_NODE_STATUS_GET.to_string(),
+                    "CONFIG_GET".to_string(),
+                    "CONFIG_SET".to_string(),
+                    MSG_VAULT_SECRET_CHANGED.to_string(),
+                ],
+            },
+            RouteTarget::Command("system"),
+        )
+        .post_pending_rule(
+            RouteMatch::any_msg_type("user"),
+            RouteTarget::Command("incoming"),
+        )
+        .post_pending_rule(
+            RouteMatch::any_msg_type("chat"),
+            RouteTarget::Command("incoming"),
+        )
+        .post_pending_rule(
+            RouteMatch::any_msg_type("text"),
+            RouteTarget::Command("incoming"),
+        )
+        .build()
+}
+
+/// Section E — origin authorization allowlist for protected architect
+/// system actions. Returns the matching `_RESPONSE` msg name for any
+/// action that must be authorization-gated.
+///
+/// `VAULT_SECRET_CHANGED` is intentionally NOT gated here: it is a
+/// hive-wide broadcast emitted by SY.vault with `src_l2_name: None` and
+/// no expected response. The handler refetches the affected secret via
+/// the canonical Vault path (which is auth-gated end-to-end by SY.vault
+/// itself), so a forged event cannot leak data — at worst it triggers a
+/// re-resolve we would have done anyway.
+fn protected_architect_system_action_response(action: &str) -> Option<&'static str> {
+    match action {
+        "NODE_STATUS_GET" => Some("NODE_STATUS_GET_RESPONSE"),
+        "CONFIG_GET" => Some("CONFIG_GET_RESPONSE"),
+        "CONFIG_SET" => Some("CONFIG_SET_RESPONSE"),
+        _ => None,
     }
 }
 
-async fn router_recv_loop(
-    mut receiver: NodeReceiver,
-    state: Arc<ArchitectState>,
-) -> Result<(), NodeError> {
-    loop {
-        let msg = receiver.recv().await?;
+fn architect_origin_authorized(state: &ArchitectState, src_l2_name: Option<&str>) -> bool {
+    let Some(src) = src_l2_name.map(str::trim).filter(|v| !v.is_empty()) else {
+        return false;
+    };
+    let Some((node, hive)) = src.split_once('@') else {
+        return false;
+    };
+    if hive != state.hive_id {
+        return false;
+    }
+    matches!(node, "SY.admin" | "SY.config-routes" | "SY.vault")
+}
+
+/// Build a `FORBIDDEN` system response payload for an unauthorized
+/// protected action.
+fn build_architect_forbidden_response(
+    original: &fluxbee_sdk::protocol::Message,
+    sender_uuid: &str,
+    response_msg: &'static str,
+) -> fluxbee_sdk::protocol::Message {
+    use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
+    Message {
+        routing: Routing {
+            src: sender_uuid.to_string(),
+            src_l2_name: None,
+            dst: Destination::Unicast(original.routing.src.clone()),
+            ttl: 16,
+            trace_id: original.routing.trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(response_msg.to_string()),
+            ..Meta::default()
+        },
+        payload: json!({
+            "status": "error",
+            "error_code": "FORBIDDEN",
+            "error_detail": "origin not authorized for protected architect system action",
+        }),
+    }
+}
+
+async fn run_architect_system_worker(state: Arc<ArchitectState>, mut rx: RpcCommandReceiver) {
+    while let Some(msg) = rx.recv().await {
         tracing::info!(
             src = %msg.routing.src,
+            src_l2_name = ?msg.routing.src_l2_name,
             dst = ?msg.routing.dst,
             msg_type = %msg.meta.msg_type,
             msg = ?msg.meta.msg,
-            "sy.architect received message"
+            "sy.architect system worker received message"
         );
-        if handle_architect_system_message(&state, &msg).await? {
-            continue;
+        if let Err(err) = handle_architect_system_message(&state, &msg).await {
+            tracing::warn!(error = %err, "sy.architect system message handler failed");
         }
+    }
+    tracing::warn!("sy.architect system command channel closed");
+}
+
+async fn run_architect_incoming_worker(state: Arc<ArchitectState>, mut rx: RpcCommandReceiver) {
+    while let Some(msg) = rx.recv().await {
         if let Some(session_id) = router_message_session_id(&msg) {
             if let Err(err) = persist_router_incoming_message(&state, &session_id, &msg).await {
                 tracing::warn!(
@@ -6662,19 +6750,34 @@ async fn router_recv_loop(
             }
         }
     }
+    tracing::warn!("sy.architect incoming command channel closed");
 }
 
 async fn handle_architect_system_message(
     state: &ArchitectState,
     msg: &Message,
-) -> Result<bool, NodeError> {
-    let sender = {
-        let guard = state.router_sender.lock().await;
-        guard.clone()
-    };
-    let Some(sender) = sender else {
-        return Ok(false);
-    };
+) -> Result<bool, fluxbee_sdk::NodeError> {
+    let sender = state.rpc.sender_snapshot();
+
+    // Section E gate — protected actions must come from the allowlist.
+    if msg.meta.msg_type == SYSTEM_KIND {
+        if let Some(action) = msg.meta.msg.as_deref() {
+            if let Some(response_msg) = protected_architect_system_action_response(action) {
+                if !architect_origin_authorized(state, msg.routing.src_l2_name.as_deref()) {
+                    let forbidden =
+                        build_architect_forbidden_response(msg, sender.uuid(), response_msg);
+                    sender.send(forbidden).await?;
+                    tracing::warn!(
+                        action = %action,
+                        src = %msg.routing.src,
+                        src_l2_name = ?msg.routing.src_l2_name,
+                        "sy.architect rejected unauthorized protected system action"
+                    );
+                    return Ok(true);
+                }
+            }
+        }
+    }
 
     if try_handle_default_node_status(&sender, msg).await? {
         return Ok(true);
@@ -9590,7 +9693,7 @@ async fn handle_chat_message(
                 output: json!({
                     "error": err.to_string(),
                     "message": err.to_string(),
-                    "router_connected": state.router_connected.load(Ordering::Relaxed),
+                    "router_connected": state.rpc.sender_snapshot().is_connected(),
                 }),
                 session_id: Some(resolved_session_id.clone()),
                 session_title: Some(session.title.clone()),
@@ -10235,16 +10338,14 @@ async fn handle_impersonation_chat(
     session: &ChatSessionRecord,
     input: &str,
 ) -> Result<Value, ArchitectError> {
-    let sender = state
-        .router_sender
-        .lock()
-        .await
-        .clone()
-        .ok_or_else(|| -> ArchitectError {
+    let sender = state.rpc.sender_snapshot();
+    if !sender.is_connected() {
+        return Err(
             "Router is not connected, so the impersonated message could not be dispatched."
                 .to_string()
-                .into()
-        })?;
+                .into(),
+        );
+    }
     let effective_ilk =
         none_if_empty(&session.effective_ilk).ok_or_else(|| -> ArchitectError {
             "Impersonation dispatch requires an effective_ilk in the session profile."
@@ -12940,20 +13041,9 @@ async fn execute_admin_action_with_context(
         params = %params_json,
         "sy.architect dispatching admin action"
     );
-    let node_config = NodeConfig {
-        name: format!("SY.architect.{purpose}.{}", Uuid::new_v4().simple()),
-        router_socket: context.socket_dir.clone(),
-        uuid_persistence_dir: context.state_dir.join("nodes"),
-        uuid_mode: fluxbee_sdk::NodeUuidMode::Ephemeral,
-        config_dir: context.config_dir.clone(),
-        version: "0.1.0".to_string(),
-    };
-    let rpc_profile = OperationalRouteProfile::builder()
-        .build()
-        .map_err(|err| -> ArchitectError { err.to_string().into() })?;
-    let client =
-        RpcClient::connect_with_retry(node_config, Duration::from_millis(100), rpc_profile).await?;
-    let response = client
+    let _ = purpose; // purpose is logged; canonical dispatcher does not need a per-call name
+    let response = context
+        .rpc
         .send_admin_rpc(AdminCommandRequest {
             admin_target,
             action,
@@ -13012,7 +13102,7 @@ async fn build_architect_status(state: &ArchitectState) -> ArchitectStatus {
         status: "ok".to_string(),
         hive_id: state.hive_id.clone(),
         node_name: state.node_name.clone(),
-        router_connected: state.router_connected.load(Ordering::Relaxed),
+        router_connected: state.rpc.sender_snapshot().is_connected(),
         admin_available: false,
         inventory_updated_at: None,
         total_hives: None,
@@ -13044,24 +13134,10 @@ async fn build_architect_status(state: &ArchitectState) -> ArchitectStatus {
 async fn fetch_inventory_status_data(
     state: &ArchitectState,
 ) -> Result<(Value, Option<Value>), ArchitectError> {
-    let node_config = NodeConfig {
-        name: format!("SY.architect.status.{}", Uuid::new_v4().simple()),
-        router_socket: state.socket_dir.clone(),
-        uuid_persistence_dir: state.state_dir.join("nodes"),
-        uuid_mode: fluxbee_sdk::NodeUuidMode::Ephemeral,
-        config_dir: state.config_dir.clone(),
-        version: "0.1.0".to_string(),
-    };
-    let rpc_profile = OperationalRouteProfile::builder()
-        .build()
-        .map_err(|err| -> ArchitectError { err.to_string().into() })?;
-    let client =
-        RpcClient::connect_with_retry(node_config, Duration::from_millis(100), rpc_profile)
-            .await
-            .map_err(|err| -> ArchitectError { Box::new(err) })?;
     let admin_target = format!("SY.admin@{}", state.hive_id);
 
-    let summary_response = client
+    let summary_response = state
+        .rpc
         .send_admin_rpc(AdminCommandRequest {
             admin_target: &admin_target,
             action: "inventory",
@@ -13079,7 +13155,8 @@ async fn fetch_inventory_status_data(
     };
     ensure_admin_ok("inventory summary", &summary)?;
 
-    let hive_response = client
+    let hive_response = state
+        .rpc
         .send_admin_rpc(AdminCommandRequest {
             admin_target: &admin_target,
             action: "inventory",

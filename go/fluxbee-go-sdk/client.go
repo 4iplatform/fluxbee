@@ -112,7 +112,7 @@ func (s *connectionState) VpnID() uint32 {
 	return s.vpnID
 }
 
-func Connect(cfg NodeConfig) (*NodeSender, *NodeReceiver, error) {
+func connect(cfg NodeConfig) (*NodeSender, *NodeReceiver, error) {
 	hiveID, err := loadHiveID(cfg.ConfigDir)
 	if err != nil {
 		return nil, nil, err

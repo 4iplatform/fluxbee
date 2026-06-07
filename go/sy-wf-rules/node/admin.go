@@ -9,7 +9,6 @@ import (
 	"time"
 
 	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
-	"github.com/google/uuid"
 )
 
 const (
@@ -50,26 +49,24 @@ func (e *adminActionError) Error() string {
 }
 
 type l2AdminClient struct {
-	sender     sender
-	receiver   rpcReceiver
+	dispatcher *fluxbeesdk.RouterDispatcher
 	targetNode string
 	distRoot   string
 }
 
-func newAdminClient(cfg NodeConfig, snd sender, rcv rpcReceiver) adminClient {
-	if snd == nil || rcv == nil {
+func newAdminClient(cfg NodeConfig, dispatcher *fluxbeesdk.RouterDispatcher) adminClient {
+	if dispatcher == nil {
 		return nil
 	}
 	return &l2AdminClient{
-		sender:     snd,
-		receiver:   rcv,
+		dispatcher: dispatcher,
 		targetNode: fmt.Sprintf("SY.admin@%s", cfg.HiveID),
 		distRoot:   cfg.DistRuntimeRoot,
 	}
 }
 
 func (c *l2AdminClient) PublishRuntimePackage(ctx context.Context, packageFiles map[string]string) (*PackagePublishResult, error) {
-	if c == nil || c.sender == nil || c.receiver == nil {
+	if c == nil || c.dispatcher == nil {
 		return nil, fmt.Errorf("admin client unavailable")
 	}
 	params := map[string]any{
@@ -79,11 +76,7 @@ func (c *l2AdminClient) PublishRuntimePackage(ctx context.Context, packageFiles 
 		},
 		"set_current": true,
 	}
-	response, err := c.request(ctx, map[string]any{
-		"action":     publishRuntimePackageAction,
-		"params":     params,
-		"request_id": uuid.NewString(),
-	})
+	response, err := c.request(ctx, params)
 	if err != nil {
 		return nil, err
 	}
@@ -107,49 +100,17 @@ func (c *l2AdminClient) PublishRuntimePackage(ctx context.Context, packageFiles 
 	}, nil
 }
 
-func (c *l2AdminClient) request(ctx context.Context, payload map[string]any) (map[string]any, error) {
-	traceID := uuid.NewString()
-	responseCh, cancelTrace, err := c.receiver.SubscribeTrace(traceID)
+func (c *l2AdminClient) request(ctx context.Context, params map[string]any) (map[string]any, error) {
+	msg, err := c.dispatcher.SendAdminRPC(ctx, fluxbeesdk.AdminRpcRequest{
+		AdminTarget: c.targetNode,
+		Action:      publishRuntimePackageAction,
+		Params:      params,
+		Timeout:     adminRPCTimeout,
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer cancelTrace()
-
-	raw, err := fluxbeesdk.MarshalPayload(payload)
-	if err != nil {
-		return nil, err
-	}
-	msgCopy := adminCommandMsg
-	action := publishRuntimePackageAction
-	request := fluxbeesdk.Message{
-		Routing: fluxbeesdk.Routing{
-			Src:     c.sender.UUID(),
-			Dst:     fluxbeesdk.UnicastDestination(c.targetNode),
-			TTL:     16,
-			TraceID: traceID,
-		},
-		Meta: fluxbeesdk.Meta{
-			MsgType: "admin",
-			Msg:     &msgCopy,
-			Action:  &action,
-		},
-		Payload: raw,
-	}
-	if err := c.sender.Send(request); err != nil {
-		return nil, err
-	}
-
-	var msg fluxbeesdk.Message
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case item := <-responseCh:
-		if item.err != nil {
-			return nil, item.err
-		}
-		msg = item.msg
-	}
-	if msg.Meta.MsgType != "admin" || stringValue(msg.Meta.Msg) != adminCommandResponseMsg {
+	if msg.Meta.MsgType != fluxbeesdk.ADMINKind || stringValue(msg.Meta.Msg) != fluxbeesdk.MsgAdminCommandResponse {
 		return nil, fmt.Errorf("unexpected admin response %q", stringValue(msg.Meta.Msg))
 	}
 	var decoded map[string]any

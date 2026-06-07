@@ -316,16 +316,31 @@ func Run(ctx context.Context, opts RunOptions) error {
 	var nodeUUID string
 
 	if opts.SDKConfig != nil {
-		sender, receiver, err := sdk.Connect(*opts.SDKConfig)
+		profile, err := sdk.NewOperationalRouteProfile().
+			CommandChannel("incoming").
+			PostPendingRule(
+				sdk.RouteAny{},
+				sdk.RouteCommand{Channel: "incoming"},
+			).
+			Build()
+		if err != nil {
+			return fmt.Errorf("wf rpc profile invalid: %w", err)
+		}
+		routerDispatcher, err := sdk.ConnectWithRetry(*opts.SDKConfig, time.Second, profile)
 		if err != nil {
 			return fmt.Errorf("sdk connect: %w", err)
 		}
-		defer sender.Close()
+		defer func() { _ = routerDispatcher.Close() }()
+		sender := routerDispatcher.SenderSnapshot()
+		incoming, err := routerDispatcher.TakeCommandReceiver("incoming")
+		if err != nil {
+			return fmt.Errorf("take incoming receiver: %w", err)
+		}
 
 		nodeUUID = sender.UUID()
 		dispatcher = NewSDKDispatcher(sender)
 
-		timerSender, err = NewSDKTimerSender(sender, receiver, cfg.SYTimerL2Name)
+		timerSender, err = NewSDKTimerSender(routerDispatcher, cfg.SYTimerL2Name)
 		if err != nil {
 			return fmt.Errorf("create timer sender: %w", err)
 		}
@@ -364,16 +379,17 @@ func Run(ctx context.Context, opts RunOptions) error {
 
 		log.Printf("wf: entering receive loop for %s", sender.FullName())
 		for {
-			msg, err := receiver.Recv(ctx)
-			if err != nil {
-				if ctx.Err() != nil {
-					return nil // clean shutdown
+			select {
+			case <-ctx.Done():
+				return nil
+			case msg, ok := <-incoming:
+				if !ok {
+					log.Printf("wf: incoming channel closed; exiting")
+					return nil
 				}
-				log.Printf("wf: recv error: %v", err)
-				continue
-			}
-			if err := Dispatch(ctx, msg, rt); err != nil {
-				log.Printf("wf: dispatch error: %v", err)
+				if err := Dispatch(ctx, msg, rt); err != nil {
+					log.Printf("wf: dispatch error: %v", err)
+				}
 			}
 		}
 	}

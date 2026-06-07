@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fluxbee_sdk::node_client::NodeError;
+use fluxbee_sdk::{NodeSender, RouterDispatcher, RpcCommandReceiver, RpcError};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
@@ -11,7 +12,11 @@ use tokio::time::timeout;
 use crate::errors::AiSdkError;
 use crate::errors::Result;
 use crate::node_trait::AiNode;
-use crate::router_client::{RouterClient, RouterReader, RouterWriter};
+
+/// Command channel the AI runtime drains. Binary callers must declare a
+/// matching `command_channel` + `post_pending_rule` in the dispatcher
+/// profile they hand to the runtime.
+pub const AI_RUNTIME_CHANNEL: &str = "incoming";
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -56,7 +61,7 @@ impl Default for RetryPolicy {
 }
 
 pub struct NodeRuntime<N: AiNode> {
-    client: RouterClient,
+    dispatcher: Arc<RouterDispatcher>,
     node: N,
 }
 
@@ -106,8 +111,8 @@ impl RuntimeMetrics {
 }
 
 impl<N: AiNode + 'static> NodeRuntime<N> {
-    pub fn new(client: RouterClient, node: N) -> Self {
-        Self { client, node }
+    pub fn new(dispatcher: Arc<RouterDispatcher>, node: N) -> Self {
+        Self { dispatcher, node }
     }
 
     pub async fn run_forever(self) -> Result<()> {
@@ -139,12 +144,24 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
             "ai runtime started"
         );
 
-        let (reader, writer) = self.client.split();
+        let reader = self
+            .dispatcher
+            .take_command_receiver(AI_RUNTIME_CHANNEL)
+            .await
+            .map_err(map_rpc_err)?;
+        let writer = self.dispatcher.sender_snapshot();
         let (tx, mut rx) = mpsc::channel(config.queue_capacity);
         let metrics = Arc::new(RuntimeMetrics::default());
 
         let read_timeout = config.read_timeout;
-        let mut reader_task = tokio::spawn(reader_loop(reader, tx, read_timeout, metrics.clone()));
+        let dispatcher_for_reader = self.dispatcher.clone();
+        let mut reader_task = tokio::spawn(reader_loop(
+            reader,
+            dispatcher_for_reader,
+            tx,
+            read_timeout,
+            metrics.clone(),
+        ));
         let metrics_task = tokio::spawn(metrics_loop(metrics.clone(), config.metrics_log_interval));
         let node = Arc::new(self.node);
         let mut workers = JoinSet::new();
@@ -266,7 +283,8 @@ impl<N: AiNode + 'static> NodeRuntime<N> {
 }
 
 async fn reader_loop(
-    mut reader: RouterReader,
+    mut reader: RpcCommandReceiver,
+    dispatcher: Arc<RouterDispatcher>,
     tx: mpsc::Sender<crate::message::Message>,
     read_timeout: Duration,
     metrics: Arc<RuntimeMetrics>,
@@ -275,10 +293,32 @@ async fn reader_loop(
     let reconnect_max_backoff = Duration::from_secs(5);
 
     loop {
-        let msg = match reader.read_timeout(read_timeout).await {
-            Ok(msg) => msg,
-            Err(AiSdkError::Node(NodeError::Timeout)) => {
-                // Idle window elapsed: keep process alive and continue waiting.
+        let recv = timeout(read_timeout, reader.recv()).await;
+        let msg = match recv {
+            Ok(Some(msg)) => msg,
+            Ok(None) => {
+                // Channel closed (dispatcher dropped). Clean shutdown.
+                tracing::warn!("ai runtime command channel closed");
+                return Ok(());
+            }
+            Err(_) => {
+                // Idle window elapsed: keep process alive and continue
+                // waiting. If the underlying connection has dropped, the
+                // dispatcher's sender_snapshot().is_connected() reports it
+                // and we enter the reconnect wait.
+                let sender = dispatcher.sender_snapshot();
+                if !sender.is_connected() {
+                    metrics.reconnect_events.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!("ai runtime disconnected from router; entering reconnect wait");
+                    wait_for_reconnect(
+                        &sender,
+                        reconnect_initial_backoff,
+                        reconnect_max_backoff,
+                        metrics.clone(),
+                    )
+                    .await;
+                    continue;
+                }
                 metrics.idle_read_timeouts.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(
                     read_timeout_ms = read_timeout.as_millis() as u64,
@@ -286,22 +326,6 @@ async fn reader_loop(
                 );
                 continue;
             }
-            Err(err) if is_transient_link_error(&err) => {
-                metrics.reconnect_events.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    error = %err,
-                    "ai runtime disconnected from router; entering reconnect wait"
-                );
-                wait_for_reconnect(
-                    &reader,
-                    reconnect_initial_backoff,
-                    reconnect_max_backoff,
-                    metrics.clone(),
-                )
-                .await;
-                continue;
-            }
-            Err(err) => return Err(err),
         };
         metrics.read_messages.fetch_add(1, Ordering::Relaxed);
         if tx.send(msg).await.is_err() {
@@ -311,15 +335,8 @@ async fn reader_loop(
     }
 }
 
-fn is_transient_link_error(err: &AiSdkError) -> bool {
-    matches!(
-        err,
-        AiSdkError::Node(NodeError::Io(_) | NodeError::Disconnected)
-    )
-}
-
 async fn wait_for_reconnect(
-    reader: &RouterReader,
+    sender: &NodeSender,
     initial_backoff: Duration,
     max_backoff: Duration,
     metrics: Arc<RuntimeMetrics>,
@@ -328,7 +345,7 @@ async fn wait_for_reconnect(
     let mut backoff = initial_backoff;
 
     loop {
-        if reader.is_connected() {
+        if sender.is_connected() {
             tracing::info!(attempt, "ai runtime reconnected to router");
             return;
         }
@@ -345,7 +362,7 @@ async fn wait_for_reconnect(
             "ai runtime reconnecting to router"
         );
 
-        let _ = timeout(wait_for, reader.wait_connected()).await;
+        let _ = timeout(wait_for, sender.wait_connected()).await;
         backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
     }
 }
@@ -367,7 +384,7 @@ fn with_jitter(base: Duration) -> Duration {
 
 async fn process_one<N: AiNode>(
     node: Arc<N>,
-    writer: RouterWriter,
+    writer: NodeSender,
     msg: crate::message::Message,
     config: RuntimeConfig,
     metrics: Arc<RuntimeMetrics>,
@@ -388,9 +405,10 @@ async fn process_one<N: AiNode>(
         response.routing.src = writer.uuid().to_string();
         execute_with_retry(
             || async {
-                timeout(config.write_timeout, writer.write(response.clone()))
+                timeout(config.write_timeout, writer.send(response.clone()))
                     .await
                     .map_err(|_| AiSdkError::Timeout("router write timeout".to_string()))?
+                    .map_err(AiSdkError::Node)
             },
             &config.retry_policy,
             "write",
@@ -473,5 +491,13 @@ async fn metrics_loop(metrics: Arc<RuntimeMetrics>, interval: Duration) {
             retry_attempts = snapshot.retry_attempts,
             "ai runtime metrics"
         );
+    }
+}
+
+fn map_rpc_err(err: RpcError) -> AiSdkError {
+    match err {
+        RpcError::Node(node) => AiSdkError::Node(node),
+        RpcError::Disconnected => AiSdkError::Node(NodeError::Disconnected),
+        other => AiSdkError::Protocol(format!("router dispatcher error: {other}")),
     }
 }

@@ -5,11 +5,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
-use fluxbee_sdk::{connect, NodeConfig, NodeReceiver, NodeSender};
+use fluxbee_sdk::{
+    NodeConfig, OperationalRouteProfile, PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher,
+    RpcError, RpcRequestLabels,
+};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::time::{timeout, Instant};
+use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -155,13 +158,17 @@ fn load_hive_id(config_dir: &std::path::Path) -> Result<String, DiagError> {
     Ok(hive.hive_id)
 }
 
-async fn send_system_message(
-    sender: &NodeSender,
+/// Combined send + wait helper sobre el dispatcher canónico.
+/// Devuelve `(trace_id, WaitOutcome)` para preservar el logging existente.
+async fn system_rpc(
+    dispatcher: &Arc<RouterDispatcher>,
     target: &str,
     route_mode: RouteMode,
     msg_name: &str,
+    expected_msg: &str,
     payload: serde_json::Value,
-) -> Result<String, DiagError> {
+    timeout_secs: u64,
+) -> Result<(String, WaitOutcome), DiagError> {
     let trace_id = Uuid::new_v4().to_string();
     let (dst, meta_target) = match route_mode {
         RouteMode::Unicast => (Destination::Unicast(target.to_string()), None),
@@ -169,7 +176,7 @@ async fn send_system_message(
     };
     let message = Message {
         routing: Routing {
-            src: sender.uuid().to_string(),
+            src: String::new(),
             src_l2_name: None,
             dst,
             ttl: 16,
@@ -178,87 +185,57 @@ async fn send_system_message(
         meta: Meta {
             msg_type: SYSTEM_KIND.to_string(),
             msg: Some(msg_name.to_string()),
-            src_ilk: None,
-            scope: None,
             target: meta_target,
-            action: None,
-            priority: None,
-            context: None,
             ..Meta::default()
         },
         payload,
     };
-    sender.send(message).await?;
-    Ok(trace_id)
-}
-
-async fn wait_system_response(
-    receiver: &mut NodeReceiver,
-    trace_id: &str,
-    expected_msg: &str,
-    timeout_secs: u64,
-) -> Result<WaitOutcome, DiagError> {
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+    let matcher = PendingMatcher::new(
+        vec![RouteMatch::exact(SYSTEM_KIND, expected_msg)],
+        vec![
+            RouteMatch::exact(SYSTEM_KIND, MSG_UNREACHABLE),
+            RouteMatch::exact(SYSTEM_KIND, MSG_TTL_EXCEEDED),
+        ],
+        vec![],
+    );
+    let labels = RpcRequestLabels::new(target, msg_name, expected_msg);
+    let response = match dispatcher
+        .send_with_matcher(message, matcher, labels, Duration::from_secs(timeout_secs))
+        .await
+    {
+        Ok(msg) => msg,
+        Err(RpcError::Timeout { .. }) => {
             return Err(
                 format!("timeout waiting {} for trace_id={}", expected_msg, trace_id).into(),
             );
         }
-        let message = match timeout(remaining, receiver.recv()).await {
-            Ok(message) => message?,
-            Err(_) => {
-                return Err(
-                    format!("timeout waiting {} for trace_id={}", expected_msg, trace_id).into(),
-                );
-            }
-        };
-        if message.meta.msg_type == SYSTEM_KIND
-            && message.routing.trace_id == trace_id
-            && message.meta.msg.as_deref() == Some(MSG_UNREACHABLE)
-        {
-            let reason = message
-                .payload
-                .get("reason")
-                .and_then(|value| value.as_str())
-                .unwrap_or("unknown");
-            let original_dst = message
-                .payload
-                .get("original_dst")
-                .and_then(|value| value.as_str())
-                .unwrap_or("-");
-            return Ok(WaitOutcome::Unreachable {
-                reason: reason.to_string(),
-                original_dst: original_dst.to_string(),
-            });
+        Err(RpcError::Unreachable {
+            reason,
+            original_dst,
+        }) => {
+            return Ok((
+                trace_id,
+                WaitOutcome::Unreachable {
+                    reason,
+                    original_dst,
+                },
+            ));
         }
-        if message.meta.msg_type == SYSTEM_KIND
-            && message.routing.trace_id == trace_id
-            && message.meta.msg.as_deref() == Some(MSG_TTL_EXCEEDED)
-        {
-            let original_dst = message
-                .payload
-                .get("original_dst")
-                .and_then(|value| value.as_str())
-                .unwrap_or("-");
-            let last_hop = message
-                .payload
-                .get("last_hop")
-                .and_then(|value| value.as_str())
-                .unwrap_or("-");
-            return Ok(WaitOutcome::TtlExceeded {
-                original_dst: original_dst.to_string(),
-                last_hop: last_hop.to_string(),
-            });
+        Err(RpcError::TtlExceeded {
+            original_dst,
+            last_hop,
+        }) => {
+            return Ok((
+                trace_id,
+                WaitOutcome::TtlExceeded {
+                    original_dst,
+                    last_hop,
+                },
+            ));
         }
-        if message.meta.msg_type == SYSTEM_KIND
-            && message.meta.msg.as_deref() == Some(expected_msg)
-            && message.routing.trace_id == trace_id
-        {
-            return Ok(WaitOutcome::Response(message));
-        }
-    }
+        Err(err) => return Err(format!("rpc error for {expected_msg}: {err}").into()),
+    };
+    Ok((trace_id, WaitOutcome::Response(response)))
 }
 
 #[tokio::main]
@@ -318,7 +295,15 @@ async fn main() -> Result<(), DiagError> {
         config_dir,
         version: "1.0".to_string(),
     };
-    let (sender, mut receiver) = connect(&node_config).await?;
+    let profile = OperationalRouteProfile::builder()
+        .command_channel("system")
+        .post_pending_rule(
+            RouteMatch::any_msg_type(SYSTEM_KIND),
+            RouteTarget::Command("system"),
+        )
+        .build()?;
+    let dispatcher =
+        RouterDispatcher::connect_with_retry(node_config, Duration::from_secs(1), profile).await?;
     tracing::info!(diag_node = %diag_node_name, target = %target, route_mode = ?route_mode, "orchestrator diag started");
 
     if send_system_update {
@@ -334,12 +319,14 @@ async fn main() -> Result<(), DiagError> {
             "manifest_hash": system_update_manifest_hash,
         });
 
-        let update_trace = send_system_message(
-            &sender,
+        let (update_trace, update_outcome) = system_rpc(
+            &dispatcher,
             &target,
             route_mode,
             "SYSTEM_UPDATE",
+            "SYSTEM_UPDATE_RESPONSE",
             system_update_payload.clone(),
+            timeout_secs,
         )
         .await?;
         tracing::info!(
@@ -350,14 +337,6 @@ async fn main() -> Result<(), DiagError> {
             manifest_version = system_update_manifest_version,
             "sent SYSTEM_UPDATE"
         );
-
-        let update_outcome = wait_system_response(
-            &mut receiver,
-            &update_trace,
-            "SYSTEM_UPDATE_RESPONSE",
-            timeout_secs,
-        )
-        .await?;
         let update_response = match update_outcome {
             WaitOutcome::Response(message) => message,
             WaitOutcome::Unreachable {
@@ -451,12 +430,14 @@ async fn main() -> Result<(), DiagError> {
                 }
             }
         });
-        let update_trace = send_system_message(
-            &sender,
+        let (update_trace, update_outcome) = system_rpc(
+            &dispatcher,
             &target,
             route_mode,
             "RUNTIME_UPDATE",
+            "RUNTIME_UPDATE_RESPONSE",
             legacy_runtime_update_payload,
+            timeout_secs,
         )
         .await?;
         tracing::info!(
@@ -465,13 +446,6 @@ async fn main() -> Result<(), DiagError> {
             route_mode = ?route_mode,
             "sent legacy RUNTIME_UPDATE"
         );
-        let update_outcome = wait_system_response(
-            &mut receiver,
-            &update_trace,
-            "RUNTIME_UPDATE_RESPONSE",
-            timeout_secs,
-        )
-        .await?;
         let update_response = match update_outcome {
             WaitOutcome::Response(message) => message,
             WaitOutcome::Unreachable {
@@ -559,12 +533,13 @@ async fn main() -> Result<(), DiagError> {
         "unit": unit,
         "target": target_hive,
     });
-    let spawn_trace =
-        send_system_message(&sender, &target, route_mode, "SPAWN_NODE", spawn_payload).await?;
-    let spawn_outcome = wait_system_response(
-        &mut receiver,
-        &spawn_trace,
+    let (spawn_trace, spawn_outcome) = system_rpc(
+        &dispatcher,
+        &target,
+        route_mode,
+        "SPAWN_NODE",
         "SPAWN_NODE_RESPONSE",
+        spawn_payload,
         timeout_secs,
     )
     .await?;
@@ -701,12 +676,13 @@ async fn main() -> Result<(), DiagError> {
             "unit": unit,
             "target": target_hive,
         });
-        let kill_trace =
-            send_system_message(&sender, &target, route_mode, "KILL_NODE", kill_payload).await?;
-        let kill_outcome = wait_system_response(
-            &mut receiver,
-            &kill_trace,
+        let (kill_trace, kill_outcome) = system_rpc(
+            &dispatcher,
+            &target,
+            route_mode,
+            "KILL_NODE",
             "KILL_NODE_RESPONSE",
+            kill_payload,
             timeout_secs,
         )
         .await?;

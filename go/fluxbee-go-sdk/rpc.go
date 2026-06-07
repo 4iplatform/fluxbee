@@ -1,7 +1,6 @@
 package sdk
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 )
@@ -114,35 +113,6 @@ func BuildSystemResponse(incoming *Message, srcUUID, responseMsg string, payload
 		},
 		Payload: raw,
 	}, nil
-}
-
-func AwaitSystemResponse(ctx context.Context, receiver *NodeReceiver, traceID, responseMsg string) (Message, error) {
-	if receiver == nil {
-		return Message{}, fmt.Errorf("receiver must be non-nil")
-	}
-	for {
-		msg, err := receiver.Recv(ctx)
-		if err != nil {
-			return Message{}, err
-		}
-		if msg.Routing.TraceID != traceID {
-			continue
-		}
-		if msg.Meta.MsgType != SYSTEMKind || stringValue(msg.Meta.Msg) != responseMsg {
-			continue
-		}
-		return msg, nil
-	}
-}
-
-func RequestSystemRPC(ctx context.Context, sender *NodeSender, receiver *NodeReceiver, request Message, responseMsg string) (Message, error) {
-	if sender == nil {
-		return Message{}, fmt.Errorf("sender must be non-nil")
-	}
-	if err := sender.Send(request); err != nil {
-		return Message{}, err
-	}
-	return AwaitSystemResponse(ctx, receiver, request.Routing.TraceID, responseMsg)
 }
 
 func ParseSystemResponse(msg *Message, responseMsg string, out any) error {

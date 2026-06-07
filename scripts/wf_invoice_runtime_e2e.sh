@@ -62,9 +62,10 @@ import (
 )
 
 type clientNode struct {
-	name     string
-	sender   *sdk.NodeSender
-	receiver *sdk.NodeReceiver
+	name       string
+	dispatcher *sdk.RouterDispatcher
+	sender     *sdk.NodeSender
+	events     <-chan sdk.Message
 }
 
 type wfInstanceResponse struct {
@@ -118,7 +119,7 @@ func main() {
 	defer cancel()
 
 	step("1/5", "verify WF node responds to WF_HELP")
-	if _, err := rpc(ctx, trigger.sender, trigger.receiver, wfNode, "WF_HELP", map[string]any{}, "", "WF_HELP_RESPONSE"); err != nil {
+	if _, err := rpc(ctx, trigger, wfNode, "WF_HELP", map[string]any{}, "", "WF_HELP_RESPONSE"); err != nil {
 		fatalf("WF_HELP failed for %s: %v", wfNode, err)
 	}
 
@@ -133,14 +134,14 @@ func main() {
 
 	step("3/5", "cancel invoice workflow mid-flow")
 	cancelID := startInvoiceAndReadFirstRequest(ctx, trigger, quickbooks, wfNode, "cust-cancel-"+runID)
-	if _, err := rpc(ctx, trigger.sender, trigger.receiver, wfNode, "WF_CANCEL_INSTANCE", map[string]any{
+	if _, err := rpc(ctx, trigger, wfNode, "WF_CANCEL_INSTANCE", map[string]any{
 		"instance_id": cancelID,
 		"reason":      "e2e cancel",
 	}, "", "WF_CANCEL_INSTANCE_RESPONSE"); err != nil {
 		fatalf("WF_CANCEL_INSTANCE failed: %v", err)
 	}
 	assertInstance(ctx, trigger, wfNode, cancelID, "cancelled", "cancelled")
-	drainOptional(ctx, notifications.receiver, 150*time.Millisecond)
+	drainOptional(ctx, notifications.events, 150*time.Millisecond)
 
 	step("4/5", "restart recovery check")
 	recoveryID := startInvoiceAndReadFirstRequest(ctx, trigger, quickbooks, wfNode, "cust-recovery-"+runID)
@@ -166,27 +167,43 @@ func main() {
 }
 
 func connectNode(configDir, routerSocket, name string) *clientNode {
-	sender, receiver, err := sdk.Connect(sdk.NodeConfig{
+	profile, err := sdk.NewOperationalRouteProfile().
+		BroadcastChannel("events").
+		PostPendingRule(sdk.RouteAny{}, sdk.RouteBroadcast{Channel: "events"}).
+		Build()
+	if err != nil {
+		fatalf("build route profile for %s: %v", name, err)
+	}
+	dispatcher, err := sdk.ConnectWithRetry(sdk.NodeConfig{
 		Name:         name,
 		RouterSocket: routerSocket,
 		UUIDMode:     sdk.NodeUuidEphemeral,
 		ConfigDir:    configDir,
 		Version:      "wf-invoice-runtime-e2e",
-	})
+	}, 250*time.Millisecond, profile)
 	if err != nil {
 		fatalf("connect %s: %v", name, err)
 	}
-	return &clientNode{name: name, sender: sender, receiver: receiver}
+	events, err := dispatcher.Subscribe("events")
+	if err != nil {
+		fatalf("subscribe events for %s: %v", name, err)
+	}
+	return &clientNode{
+		name:       name,
+		dispatcher: dispatcher,
+		sender:     dispatcher.SenderSnapshot(),
+		events:     events,
+	}
 }
 
 func (n *clientNode) close() {
-	if n != nil && n.sender != nil {
-		_ = n.sender.Close()
+	if n != nil && n.dispatcher != nil {
+		_ = n.dispatcher.Close()
 	}
 }
 
 func expectRequestAndReply(ctx context.Context, node *clientNode, wfNode, requestMsg, replyMsg string, payload map[string]any) {
-	msg := awaitMsg(ctx, node.receiver, requestMsg)
+	msg := awaitMsg(ctx, node.events, requestMsg)
 	threadID := ""
 	if msg.Meta.ThreadID != nil {
 		threadID = *msg.Meta.ThreadID
@@ -219,8 +236,8 @@ func sendEvent(ctx context.Context, sender *sdk.NodeSender, dst, msgName string,
 	}
 }
 
-func rpc(ctx context.Context, sender *sdk.NodeSender, receiver *sdk.NodeReceiver, dst, msgName string, payload any, threadID, responseMsg string) (sdk.Message, error) {
-	msg, err := sdk.BuildSystemRequest(sender.UUID(), dst, msgName, payload, traceID(msgName), sdk.SystemEnvelopeOptions{})
+func rpc(ctx context.Context, node *clientNode, dst, msgName string, payload any, threadID, responseMsg string) (sdk.Message, error) {
+	msg, err := sdk.BuildSystemRequest(node.sender.UUID(), dst, msgName, payload, traceID(msgName), sdk.SystemEnvelopeOptions{})
 	if err != nil {
 		return sdk.Message{}, err
 	}
@@ -228,20 +245,36 @@ func rpc(ctx context.Context, sender *sdk.NodeSender, receiver *sdk.NodeReceiver
 		threadCopy := threadID
 		msg.Meta.ThreadID = &threadCopy
 	}
-	return sdk.RequestSystemRPC(ctx, sender, receiver, msg, responseMsg)
+	matcher := sdk.PendingMatcher{
+		Success: []sdk.RouteMatch{sdk.RouteExact{MsgType: sdk.SYSTEMKind, Msg: responseMsg}},
+		TerminalError: []sdk.RouteMatch{
+			sdk.RouteExact{MsgType: sdk.SYSTEMKind, Msg: sdk.MSGUnreachable},
+			sdk.RouteExact{MsgType: sdk.SYSTEMKind, Msg: sdk.MSGTTLExceeded},
+		},
+		InvalidResponse: []sdk.RouteMatch{sdk.RouteAnyMsgOfType{MsgType: sdk.SYSTEMKind}},
+	}
+	return node.dispatcher.SendWithMatcher(ctx, msg, matcher, sdk.RpcRequestLabels{
+		Target:      dst,
+		RequestMsg:  msgName,
+		ResponseMsg: responseMsg,
+	}, 5*time.Second)
 }
 
-func awaitMsg(ctx context.Context, receiver *sdk.NodeReceiver, msgName string) sdk.Message {
-	if receiver == nil {
-		fatalf("receiver is nil")
+func awaitMsg(ctx context.Context, events <-chan sdk.Message, msgName string) sdk.Message {
+	if events == nil {
+		fatalf("events channel is nil")
 	}
 	for {
-		msg, err := receiver.Recv(ctx)
-		if err != nil {
-			fatalf("waiting for %s: %v", msgName, err)
-		}
-		if msgName == "" || (msg.Meta.Msg != nil && *msg.Meta.Msg == msgName) {
-			return msg
+		select {
+		case <-ctx.Done():
+			fatalf("waiting for %s: %v", msgName, ctx.Err())
+		case msg, ok := <-events:
+			if !ok {
+				fatalf("events channel closed while waiting for %s", msgName)
+			}
+			if msgName == "" || (msg.Meta.Msg != nil && *msg.Meta.Msg == msgName) {
+				return msg
+			}
 		}
 	}
 }
@@ -254,7 +287,7 @@ func startInvoiceAndReadFirstRequest(ctx context.Context, trigger, quickbooks *c
 	}, ""); err != nil {
 		fatalf("start invoice: %v", err)
 	}
-	msg := awaitMsg(ctx, quickbooks.receiver, "INVOICE_CREATE_REQUEST")
+	msg := awaitMsg(ctx, quickbooks.events, "INVOICE_CREATE_REQUEST")
 	if msg.Meta.ThreadID == nil || *msg.Meta.ThreadID == "" {
 		fatalf("INVOICE_CREATE_REQUEST missing thread_id")
 	}
@@ -262,7 +295,7 @@ func startInvoiceAndReadFirstRequest(ctx context.Context, trigger, quickbooks *c
 }
 
 func assertInstance(ctx context.Context, trigger *clientNode, wfNode, instanceID, wantStatus, wantState string) {
-	resp, err := rpc(ctx, trigger.sender, trigger.receiver, wfNode, "WF_GET_INSTANCE", map[string]any{
+	resp, err := rpc(ctx, trigger, wfNode, "WF_GET_INSTANCE", map[string]any{
 		"instance_id": instanceID,
 		"log_limit":   10,
 	}, "", "WF_GET_INSTANCE_RESPONSE")
@@ -286,7 +319,7 @@ func waitWFHelp(ctx context.Context, trigger *clientNode, wfNode string) {
 	var lastErr error
 	for time.Now().Before(deadline) {
 		attemptCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		_, err := rpc(attemptCtx, trigger.sender, trigger.receiver, wfNode, "WF_HELP", map[string]any{}, "", "WF_HELP_RESPONSE")
+		_, err := rpc(attemptCtx, trigger, wfNode, "WF_HELP", map[string]any{}, "", "WF_HELP_RESPONSE")
 		cancel()
 		if err == nil {
 			return
@@ -309,10 +342,13 @@ func restartWFUnit(wfNode, hiveID string) {
 	}
 }
 
-func drainOptional(ctx context.Context, receiver *sdk.NodeReceiver, d time.Duration) {
+func drainOptional(ctx context.Context, events <-chan sdk.Message, d time.Duration) {
 	attemptCtx, cancel := context.WithTimeout(ctx, d)
 	defer cancel()
-	_, _ = receiver.Recv(attemptCtx)
+	select {
+	case <-events:
+	case <-attemptCtx.Done():
+	}
 }
 
 func traceID(prefix string) string {

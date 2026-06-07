@@ -279,9 +279,8 @@ pub struct ConfigChangedPayload {
 /// `vault_get` themselves with their own caller credentials.
 ///
 /// Mirrors the `CONFIG_CHANGED` broadcast pattern (router socket,
-/// `Destination::Broadcast`, scope=global) so consumers receive it via the
-/// same `NodeReceiver` they already poll for system messages — no separate
-/// pub-sub channel.
+/// `Destination::Broadcast`, scope=global) so consumers receive it through
+/// their dispatcher route profile — no separate pub-sub channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultSecretChangedPayload {
     /// Operation that triggered the event.

@@ -1,9 +1,11 @@
 #[path = "support/timer_example.rs"]
 mod timer_example;
 
+use std::sync::Arc;
+
 use fluxbee_sdk::{
-    TimerClient, TimerClientConfig, TimerId, TimerInfo, TimerListFilter, TimerSchedulePayload,
-    TimerStatus, TimerStatusFilter,
+    RouterDispatcher, TimerClient, TimerClientConfig, TimerId, TimerInfo, TimerListFilter,
+    TimerSchedulePayload, TimerStatus, TimerStatusFilter,
 };
 use serde_json::json;
 use tokio::time::{sleep, Duration};
@@ -21,17 +23,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     timer_example::init_logging();
 
     let delay_secs = timer_example::parse_delay_secs(DEFAULT_DELAY_SECS)?;
-    let (sender, mut receiver, uuid_mode) =
+    let (dispatcher, mut incoming, uuid_mode) =
         timer_example::connect_example_node("WF.timer.restart").await?;
+    let sender = dispatcher.sender_snapshot();
     println!(
-        "connected as {} (uuid={}, vpn={}, uuid_mode={:?})",
+        "connected as {} (uuid={}, uuid_mode={:?})",
         sender.full_name(),
         sender.uuid(),
-        receiver.vpn_id(),
         uuid_mode,
     );
 
-    let timer_id = schedule_restart_probe(&sender, &mut receiver, delay_secs).await?;
+    let timer_id = schedule_restart_probe(&dispatcher, delay_secs).await?;
     println!("scheduled restart probe timer_uuid={}", timer_id.as_str());
     println!(
         "manual step: restart sy-timer before the fire deadline to validate replay/restart:\n  sudo systemctl restart sy-timer"
@@ -39,8 +41,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("the example will keep waiting for TIMER_FIRED and then confirm final state.");
 
     let fired_event = timer_example::wait_for_timer_fired(
-        &sender,
-        &mut receiver,
+        &dispatcher,
+        &mut incoming,
         &timer_id,
         Duration::from_secs(delay_secs + 90),
     )
@@ -52,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fired_event.fire_count,
     );
 
-    let final_state = wait_for_fired_state(&sender, &mut receiver, &timer_id).await?;
+    let final_state = wait_for_fired_state(&dispatcher, &timer_id).await?;
     println!(
         "confirmed replay/restart final state uuid={} status={:?} fire_count={} last_fired_at={:?}",
         final_state.uuid.as_str(),
@@ -65,11 +67,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn schedule_restart_probe(
-    sender: &fluxbee_sdk::NodeSender,
-    receiver: &mut fluxbee_sdk::NodeReceiver,
+    dispatcher: &Arc<RouterDispatcher>,
     delay_secs: u64,
 ) -> Result<TimerId, Box<dyn std::error::Error>> {
-    let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
+    let mut client =
+        TimerClient::new_with_dispatcher(dispatcher.clone(), TimerClientConfig::default())?;
+    let sender = dispatcher.sender_snapshot();
     let now = client.now().await?;
     println!(
         "timer target={} now_utc_ms={} now_utc_iso={}",
@@ -125,8 +128,7 @@ async fn schedule_restart_probe(
 }
 
 async fn wait_for_fired_state(
-    sender: &fluxbee_sdk::NodeSender,
-    receiver: &mut fluxbee_sdk::NodeReceiver,
+    dispatcher: &Arc<RouterDispatcher>,
     timer_id: &TimerId,
 ) -> Result<TimerInfo, Box<dyn std::error::Error>> {
     let delays = [
@@ -142,11 +144,12 @@ async fn wait_for_fired_state(
         Duration::from_secs(1),
     ];
     let mut last_info = None;
+    let mut client =
+        TimerClient::new_with_dispatcher(dispatcher.clone(), TimerClientConfig::default())?;
     for delay in delays.into_iter().take(POST_FIRE_STATUS_ATTEMPTS) {
         if !delay.is_zero() {
             sleep(delay).await;
         }
-        let mut client = TimerClient::new(sender, receiver, TimerClientConfig::default())?;
         let info = client.get(timer_id.clone()).await?;
         if info.status == TimerStatus::Fired {
             return Ok(info);

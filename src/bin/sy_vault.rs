@@ -15,18 +15,18 @@ use fluxbee_sdk::protocol::{
     MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    connect, try_handle_default_node_status, NodeConfig, NodeReceiver, NodeSender, NodeUuidMode,
-    VaultFilter, VaultKeyRequest, VaultListRequest, VaultMetadata, VaultRotateRequest,
-    VaultSecretSummary, MSG_VAULT_DELETE, MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET,
-    MSG_VAULT_GET_METADATA, MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE,
-    MSG_VAULT_LIST, MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE,
-    MSG_VAULT_ROLLBACK, MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
+    try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
+    RouteMatch, RouteTarget, RouterDispatcher, VaultFilter, VaultKeyRequest, VaultListRequest,
+    VaultMetadata, VaultRotateRequest, VaultSecretSummary, MSG_VAULT_DELETE,
+    MSG_VAULT_DELETE_RESPONSE, MSG_VAULT_GET, MSG_VAULT_GET_METADATA,
+    MSG_VAULT_GET_METADATA_RESPONSE, MSG_VAULT_GET_RESPONSE, MSG_VAULT_LIST,
+    MSG_VAULT_LIST_RESPONSE, MSG_VAULT_PUT, MSG_VAULT_PUT_RESPONSE, MSG_VAULT_ROLLBACK,
+    MSG_VAULT_ROLLBACK_RESPONSE, MSG_VAULT_ROTATE, MSG_VAULT_ROTATE_RESPONSE,
 };
 use nix::libc::{flock, LOCK_EX, LOCK_NB};
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
-use tokio::time;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -34,6 +34,17 @@ type VaultResult<T> = Result<T, VaultError>;
 
 const VAULT_NODE_BASE_NAME: &str = "SY.vault";
 const VAULT_NODE_VERSION: &str = "0.1";
+const RPC_CH_SYSTEM: &str = "system";
+
+fn build_vault_rpc_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::RpcError> {
+    OperationalRouteProfile::builder()
+        .command_channel(RPC_CH_SYSTEM)
+        .post_pending_rule(
+            RouteMatch::any_msg_type(SYSTEM_KIND),
+            RouteTarget::Command(RPC_CH_SYSTEM),
+        )
+        .build()
+}
 const DEFAULT_DB_PATH: &str = "/var/lib/fluxbee/vault.db";
 const DEFAULT_MASTER_KEY_PATH: &str = "/etc/fluxbee/vault.master.key";
 const DEFAULT_LOCK_PATH: &str = "/var/run/fluxbee/sy-vault.lock";
@@ -222,8 +233,16 @@ async fn main() -> Result<(), VaultError> {
         config_dir: config_dir.clone(),
         version: VAULT_NODE_VERSION.to_string(),
     };
-    let (sender, mut receiver) = connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let profile = build_vault_rpc_profile()
+        .map_err(|err| VaultError::Storage(format!("sy.vault rpc profile invalid: {err}")))?;
+    let dispatcher =
+        RouterDispatcher::connect_with_retry(node_config, Duration::from_secs(1), profile).await?;
     tracing::info!(node_name = %node_name, "sy.vault started");
+
+    let mut system_rx = dispatcher
+        .take_command_receiver(RPC_CH_SYSTEM)
+        .await
+        .map_err(|err| VaultError::Storage(format!("sy.vault system receiver: {err}")))?;
 
     // Model D' / Phase J'-13c — bootstrap broadcast. Emit one
     // VAULT_SECRET_CHANGED with `op=put` for each secret already in
@@ -233,21 +252,22 @@ async fn main() -> Result<(), VaultError> {
     // `secret_source = Missing` because no future mutation will fire to
     // wake them up. The broadcast is idempotent for consumers already
     // configured (they just re-resolve the same value and continue).
-    if let Err(err) = emit_bootstrap_secret_broadcasts(&sender, &store, &hive_id).await {
-        tracing::warn!(
-            error = %err,
-            "failed to emit bootstrap secret broadcasts; consumers may stay degraded until next mutation"
-        );
+    {
+        let sender = dispatcher.sender_snapshot();
+        if let Err(err) = emit_bootstrap_secret_broadcasts(&sender, &store, &hive_id).await {
+            tracing::warn!(
+                error = %err,
+                "failed to emit bootstrap secret broadcasts; consumers may stay degraded until next mutation"
+            );
+        }
     }
 
     loop {
-        let msg = match receiver.recv().await {
-            Ok(msg) => msg,
-            Err(err) => {
-                tracing::warn!(error = %err, "sy.vault connection interrupted; reconnect handled internally");
-                continue;
-            }
+        let Some(msg) = system_rx.recv().await else {
+            tracing::warn!("sy.vault system channel closed; exiting main loop");
+            return Ok(());
         };
+        let sender = dispatcher.sender_snapshot();
         if try_handle_default_node_status(&sender, &msg).await? {
             continue;
         }
@@ -1587,21 +1607,6 @@ fn ensure_l2_name(name: &str, hive_id: &str) -> String {
         name.to_string()
     } else {
         format!("{name}@{hive_id}")
-    }
-}
-
-async fn connect_with_retry(
-    config: &NodeConfig,
-    delay: Duration,
-) -> Result<(NodeSender, NodeReceiver), fluxbee_sdk::NodeError> {
-    loop {
-        match connect(config).await {
-            Ok(result) => return Ok(result),
-            Err(err) => {
-                tracing::warn!(error = %err, "connect failed; retrying");
-                time::sleep(delay).await;
-            }
-        }
     }
 }
 

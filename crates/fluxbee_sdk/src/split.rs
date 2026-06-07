@@ -4,6 +4,7 @@ use std::sync::RwLock;
 
 use serde_json;
 use tokio::sync::{mpsc, Notify};
+#[cfg(test)]
 use tokio::time::{self, Duration};
 use uuid::Uuid;
 
@@ -92,6 +93,7 @@ impl ConnectionInfo {
             .unwrap_or_else(|_| Arc::<str>::from(""))
     }
 
+    #[cfg(test)]
     fn vpn_id(&self) -> u32 {
         self.vpn_id.load(Ordering::SeqCst)
     }
@@ -111,7 +113,7 @@ pub struct NodeSender {
     info: Arc<ConnectionInfo>,
 }
 
-pub struct NodeReceiver {
+pub(crate) struct NodeReceiver {
     rx: mpsc::Receiver<Result<Message, NodeError>>,
     info: Arc<ConnectionInfo>,
 }
@@ -188,7 +190,7 @@ impl NodeReceiver {
         Self { rx, info }
     }
 
-    pub async fn recv(&mut self) -> Result<Message, NodeError> {
+    pub(crate) async fn recv(&mut self) -> Result<Message, NodeError> {
         match self.rx.recv().await {
             Some(Ok(msg)) => Ok(msg),
             Some(Err(err)) => Err(err),
@@ -199,46 +201,12 @@ impl NodeReceiver {
         }
     }
 
-    pub async fn recv_timeout(&mut self, timeout: Duration) -> Result<Message, NodeError> {
+    #[cfg(test)]
+    pub(crate) async fn recv_timeout(&mut self, timeout: Duration) -> Result<Message, NodeError> {
         match time::timeout(timeout, self.recv()).await {
             Ok(result) => result,
             Err(_) => Err(NodeError::Timeout),
         }
-    }
-
-    pub fn try_recv(&mut self) -> Option<Message> {
-        match self.rx.try_recv() {
-            Ok(Ok(msg)) => Some(msg),
-            Ok(Err(_)) => {
-                self.info.state.set_connected(false);
-                None
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                self.info.state.set_connected(false);
-                None
-            }
-        }
-    }
-
-    pub fn is_connected(&self) -> bool {
-        self.info.state.is_connected()
-    }
-
-    pub async fn wait_connected(&self) {
-        self.info.state.wait_connected().await;
-    }
-
-    pub fn uuid(&self) -> &str {
-        &self.info.uuid
-    }
-
-    pub fn full_name(&self) -> Arc<str> {
-        self.info.full_name()
-    }
-
-    pub fn vpn_id(&self) -> u32 {
-        self.info.vpn_id()
     }
 }
 

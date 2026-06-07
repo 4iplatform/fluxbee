@@ -8,7 +8,6 @@ import (
 	"time"
 
 	fluxbeesdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
-	"github.com/google/uuid"
 )
 
 const orchestratorRPCTimeout = 3 * time.Second
@@ -49,15 +48,14 @@ func (e *orchestratorActionError) Error() string {
 }
 
 type l2OrchestratorClient struct {
-	sender   sender
-	receiver rpcReceiver
+	dispatcher *fluxbeesdk.RouterDispatcher
 }
 
-func newOrchestratorClient(snd sender, rcv rpcReceiver) orchestratorClient {
-	if snd == nil || rcv == nil {
+func newOrchestratorClient(dispatcher *fluxbeesdk.RouterDispatcher) orchestratorClient {
+	if dispatcher == nil {
 		return nil
 	}
-	return &l2OrchestratorClient{sender: snd, receiver: rcv}
+	return &l2OrchestratorClient{dispatcher: dispatcher}
 }
 
 func (c *l2OrchestratorClient) GetNodeConfig(rpcCtx context.Context, targetNode, nodeName string) (map[string]any, error) {
@@ -116,38 +114,18 @@ func (c *l2OrchestratorClient) KillNode(rpcCtx context.Context, targetNode, node
 }
 
 func (c *l2OrchestratorClient) request(rpcCtx context.Context, targetNode, requestMsg, responseMsg string, payload map[string]any) (map[string]any, error) {
-	if c == nil || c.sender == nil || c.receiver == nil {
+	if c == nil || c.dispatcher == nil {
 		return nil, fmt.Errorf("orchestrator client unavailable")
 	}
-	traceID := uuid.NewString()
-	responseCh, cancelTrace, err := c.receiver.SubscribeTrace(traceID)
+	msg, err := c.dispatcher.SendSystemRPC(rpcCtx, fluxbeesdk.SystemRpcRequest{
+		Target:      targetNode,
+		RequestMsg:  requestMsg,
+		ResponseMsg: responseMsg,
+		Payload:     payload,
+		Timeout:     orchestratorRPCTimeout,
+	})
 	if err != nil {
 		return nil, err
-	}
-	defer cancelTrace()
-	request, err := fluxbeesdk.BuildSystemRequest(
-		c.sender.UUID(),
-		targetNode,
-		requestMsg,
-		payload,
-		traceID,
-		fluxbeesdk.SystemEnvelopeOptions{},
-	)
-	if err != nil {
-		return nil, err
-	}
-	if err := c.sender.Send(request); err != nil {
-		return nil, err
-	}
-	var msg fluxbeesdk.Message
-	select {
-	case <-rpcCtx.Done():
-		return nil, rpcCtx.Err()
-	case item := <-responseCh:
-		if item.err != nil {
-			return nil, item.err
-		}
-		msg = item.msg
 	}
 	if msg.Meta.MsgType != fluxbeesdk.SYSTEMKind || stringValue(msg.Meta.Msg) != responseMsg {
 		return nil, fmt.Errorf("unexpected orchestrator response %q", stringValue(msg.Meta.Msg))

@@ -8,14 +8,11 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
-use crate::node_client::NodeError;
 use crate::payload::{PayloadError, TextV1Payload, TEXT_V1_DEFAULT_MESSAGE_MAX_BYTES};
 use crate::protocol::{
     Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
-use crate::split::{NodeReceiver, NodeSender};
 
 pub mod constants {
     pub const BLOB_NAME_MAX_CHARS: usize = 128;
@@ -352,15 +349,12 @@ impl BlobToolkit {
         }
     }
 
-    /// Publica un blob local (`put_bytes` + `promote`) y confirma convergencia por target
-    /// usando `SYSTEM_SYNC_HINT`.
-    ///
-    /// Nota: este helper consume mensajes del `NodeReceiver` mientras espera respuestas por
-    /// `trace_id`; para evitar interferencias, se recomienda usar un receptor dedicado de control.
-    pub async fn publish_blob_and_confirm(
+    /// Publica un blob local y confirma convergencia por target usando
+    /// `SYSTEM_SYNC_HINT` sobre el `RouterDispatcher` canónico. Variante
+    /// recomendada — multiplexa por `trace_id` sobre el dispatcher canónico.
+    pub async fn publish_blob_and_confirm_via_dispatcher(
         &self,
-        sender: &NodeSender,
-        receiver: &mut NodeReceiver,
+        dispatcher: std::sync::Arc<crate::rpc::RouterDispatcher>,
         request: PublishBlobRequest<'_>,
     ) -> Result<PublishBlobResult, BlobError> {
         if request.targets.is_empty() {
@@ -370,7 +364,6 @@ impl BlobToolkit {
         }
 
         let timeout_ms = request.timeout_ms.max(1).min(BLOB_SYNC_HINT_MAX_TIMEOUT_MS);
-
         let blob_ref = self.put_bytes(request.data, request.filename_original, request.mime)?;
         self.promote(&blob_ref)?;
 
@@ -389,7 +382,6 @@ impl BlobToolkit {
                 let remaining_ms = remaining.as_millis().min(u128::from(u64::MAX)) as u64;
                 let attempt_timeout_ms = remaining_ms.max(1).min(BLOB_SYNC_HINT_MAX_TIMEOUT_MS);
 
-                let trace_id = Uuid::new_v4().to_string();
                 let payload = json!({
                     "channel": "blob",
                     "folder_id": "fluxbee-blob",
@@ -398,52 +390,113 @@ impl BlobToolkit {
                 });
                 let message = Message {
                     routing: Routing {
-                        src: sender.uuid().to_string(),
+                        src: String::new(),
                         src_l2_name: None,
                         dst: Destination::Unicast(target.clone()),
                         ttl: 16,
-                        trace_id: trace_id.clone(),
+                        trace_id: String::new(),
                     },
                     meta: Meta {
                         msg_type: SYSTEM_KIND.to_string(),
                         msg: Some("SYSTEM_SYNC_HINT".to_string()),
-                        src_ilk: None,
-                        scope: None,
-                        target: None,
-                        action: None,
-                        priority: None,
-                        context: None,
+                        target: Some(target.clone()),
                         ..Meta::default()
                     },
                     payload,
                 };
 
-                sender
-                    .send(message)
+                let matcher = crate::rpc::PendingMatcher::new(
+                    vec![crate::rpc::RouteMatch::exact(
+                        SYSTEM_KIND,
+                        "SYSTEM_SYNC_HINT_RESPONSE",
+                    )],
+                    vec![
+                        crate::rpc::RouteMatch::exact(SYSTEM_KIND, MSG_UNREACHABLE),
+                        crate::rpc::RouteMatch::exact(SYSTEM_KIND, MSG_TTL_EXCEEDED),
+                    ],
+                    vec![crate::rpc::RouteMatch::any_msg_type(SYSTEM_KIND)],
+                );
+                let labels = crate::rpc::RpcRequestLabels::new(
+                    &target,
+                    "SYSTEM_SYNC_HINT",
+                    "SYSTEM_SYNC_HINT_RESPONSE",
+                );
+
+                let response = match dispatcher
+                    .send_with_matcher(
+                        message,
+                        matcher,
+                        labels,
+                        Duration::from_millis(attempt_timeout_ms),
+                    )
                     .await
-                    .map_err(|err| BlobError::SyncHintTransport {
-                        target: target.clone(),
-                        detail: format!("send SYSTEM_SYNC_HINT failed: {err}"),
+                {
+                    Ok(msg) => msg,
+                    Err(crate::rpc::RpcError::Timeout { .. }) => {
+                        return Err(BlobError::SyncHintTimeout { target, timeout_ms });
+                    }
+                    Err(err) => {
+                        return Err(BlobError::SyncHintTransport {
+                            target,
+                            detail: format!("send SYSTEM_SYNC_HINT via dispatcher failed: {err}"),
+                        });
+                    }
+                };
+
+                if response.meta.msg.as_deref() == Some(MSG_UNREACHABLE) {
+                    let reason = response
+                        .payload
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let original_dst = response
+                        .payload
+                        .get("original_dst")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("-");
+                    return Err(BlobError::SyncHintFailed {
+                        target,
+                        detail: format!(
+                            "router unreachable: reason={reason} original_dst={original_dst}"
+                        ),
+                    });
+                }
+                if response.meta.msg.as_deref() == Some(MSG_TTL_EXCEEDED) {
+                    let original_dst = response
+                        .payload
+                        .get("original_dst")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("-");
+                    let last_hop = response
+                        .payload
+                        .get("last_hop")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("-");
+                    return Err(BlobError::SyncHintFailed {
+                        target,
+                        detail: format!(
+                            "router ttl exceeded: original_dst={original_dst} last_hop={last_hop}"
+                        ),
+                    });
+                }
+
+                let parsed =
+                    parse_sync_hint_response_payload(&response.payload).map_err(|detail| {
+                        BlobError::SyncHintFailed {
+                            target: target.clone(),
+                            detail,
+                        }
                     })?;
 
-                let response = wait_for_sync_hint_response(
-                    receiver,
-                    &trace_id,
-                    &target,
-                    Duration::from_millis(attempt_timeout_ms),
-                )
-                .await?;
-
-                if response.status == "ok" {
+                if parsed.status == "ok" {
                     target_results.push(SyncHintTargetResult {
                         target,
-                        status: response.status,
+                        status: parsed.status,
                         elapsed_ms: started.elapsed().as_millis() as u64,
                     });
                     break;
                 }
-
-                if response.status == "sync_pending" {
+                if parsed.status == "sync_pending" {
                     if Instant::now() >= deadline {
                         return Err(BlobError::SyncHintTimeout { target, timeout_ms });
                     }
@@ -451,11 +504,10 @@ impl BlobToolkit {
                         .await;
                     continue;
                 }
-
-                let detail = response
+                let detail = parsed
                     .error_code
                     .map(|code| format!("error_code={code}"))
-                    .or(response.message)
+                    .or(parsed.message)
                     .unwrap_or_else(|| "sync hint returned error".to_string());
                 return Err(BlobError::SyncHintFailed { target, detail });
             }
@@ -1162,97 +1214,6 @@ fn parse_sync_hint_response_payload(
             .and_then(|v| v.as_str())
             .map(|v| v.to_string()),
     })
-}
-
-async fn wait_for_sync_hint_response(
-    receiver: &mut NodeReceiver,
-    trace_id: &str,
-    target: &str,
-    timeout: Duration,
-) -> Result<SyncHintResponse, BlobError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(BlobError::SyncHintTimeout {
-                target: target.to_string(),
-                timeout_ms: timeout.as_millis() as u64,
-            });
-        }
-        let remaining = deadline - now;
-        let message = match receiver.recv_timeout(remaining).await {
-            Ok(msg) => msg,
-            Err(NodeError::Timeout) => {
-                return Err(BlobError::SyncHintTimeout {
-                    target: target.to_string(),
-                    timeout_ms: timeout.as_millis() as u64,
-                });
-            }
-            Err(err) => {
-                return Err(BlobError::SyncHintTransport {
-                    target: target.to_string(),
-                    detail: format!("receive SYSTEM_SYNC_HINT_RESPONSE failed: {err}"),
-                });
-            }
-        };
-
-        if message.routing.trace_id != trace_id {
-            continue;
-        }
-
-        if message.meta.msg_type == SYSTEM_KIND
-            && message.meta.msg.as_deref() == Some(MSG_UNREACHABLE)
-        {
-            let reason = message
-                .payload
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let original_dst = message
-                .payload
-                .get("original_dst")
-                .and_then(|v| v.as_str())
-                .unwrap_or("-");
-            return Err(BlobError::SyncHintFailed {
-                target: target.to_string(),
-                detail: format!("router unreachable: reason={reason} original_dst={original_dst}"),
-            });
-        }
-
-        if message.meta.msg_type == SYSTEM_KIND
-            && message.meta.msg.as_deref() == Some(MSG_TTL_EXCEEDED)
-        {
-            let original_dst = message
-                .payload
-                .get("original_dst")
-                .and_then(|v| v.as_str())
-                .unwrap_or("-");
-            let last_hop = message
-                .payload
-                .get("last_hop")
-                .and_then(|v| v.as_str())
-                .unwrap_or("-");
-            return Err(BlobError::SyncHintFailed {
-                target: target.to_string(),
-                detail: format!(
-                    "router ttl exceeded: original_dst={original_dst} last_hop={last_hop}"
-                ),
-            });
-        }
-
-        if message.meta.msg_type != SYSTEM_KIND
-            || message.meta.msg.as_deref() != Some("SYSTEM_SYNC_HINT_RESPONSE")
-        {
-            continue;
-        }
-
-        return parse_sync_hint_response_payload(&message.payload).map_err(|detail| {
-            BlobError::SyncHintFailed {
-                target: target.to_string(),
-                detail,
-            }
-        });
-    }
 }
 
 fn sha256_hex(data: &[u8]) -> String {

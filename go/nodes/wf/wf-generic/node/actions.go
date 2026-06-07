@@ -338,7 +338,17 @@ type SDKTimerSender struct {
 	syncClient *sdk.TimerClient
 }
 
-func NewSDKTimerSender(sender *sdk.NodeSender, receiver *sdk.NodeReceiver, timerNode string) (*SDKTimerSender, error) {
+// NewSDKTimerSender constructs a TimerSender backed by the shared
+// `RouterDispatcher`. The dispatcher multiplexes TIMER_RESPONSE messages
+// by trace_id, so the TimerClient and the wf-generic main loop can
+// coexist on the same router connection without aliasing the receiver
+// (the latent multiplexing bug noted in
+// routerdispatcher_unification_plan.md §5).
+func NewSDKTimerSender(dispatcher *sdk.RouterDispatcher, timerNode string) (*SDKTimerSender, error) {
+	if dispatcher == nil {
+		return nil, fmt.Errorf("dispatcher must be non-nil")
+	}
+	sender := dispatcher.SenderSnapshot()
 	timerNode = strings.TrimSpace(timerNode)
 	if timerNode == "" {
 		_, hiveID, ok := strings.Cut(strings.TrimSpace(sender.FullName()), "@")
@@ -347,7 +357,7 @@ func NewSDKTimerSender(sender *sdk.NodeSender, receiver *sdk.NodeReceiver, timer
 		}
 		timerNode = "SY.timer@" + strings.TrimSpace(hiveID)
 	}
-	client, err := sdk.NewTimerClient(sender, receiver, sdk.TimerClientConfig{
+	client, err := sdk.NewTimerClient(dispatcher, sdk.TimerClientConfig{
 		TimerNode: timerNode,
 	})
 	if err != nil {

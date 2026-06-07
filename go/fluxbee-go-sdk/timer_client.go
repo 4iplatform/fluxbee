@@ -75,7 +75,7 @@ type TimerClientConfig struct {
 
 type TimerClient struct {
 	sender            *NodeSender
-	receiver          *NodeReceiver
+	dispatcher        *RouterDispatcher
 	timerNode         string
 	timeRetrySchedule []time.Duration
 }
@@ -93,12 +93,13 @@ type TimerNowInResult struct {
 	TZAbbrev        string `json:"tz_abbrev"`
 }
 
-func NewTimerClient(sender *NodeSender, receiver *NodeReceiver, cfg TimerClientConfig) (*TimerClient, error) {
-	if sender == nil {
-		return nil, fmt.Errorf("sender must be non-nil")
+func NewTimerClient(dispatcher *RouterDispatcher, cfg TimerClientConfig) (*TimerClient, error) {
+	if dispatcher == nil {
+		return nil, fmt.Errorf("dispatcher must be non-nil")
 	}
-	if receiver == nil {
-		return nil, fmt.Errorf("receiver must be non-nil")
+	sender := dispatcher.SenderSnapshot()
+	if sender == nil {
+		return nil, fmt.Errorf("dispatcher has no sender snapshot")
 	}
 	timerNode := strings.TrimSpace(cfg.TimerNode)
 	if timerNode == "" {
@@ -111,10 +112,45 @@ func NewTimerClient(sender *NodeSender, receiver *NodeReceiver, cfg TimerClientC
 	retries := normalizedTimeRetrySchedule(cfg.TimeRetrySchedule)
 	return &TimerClient{
 		sender:            sender,
-		receiver:          receiver,
+		dispatcher:        dispatcher,
 		timerNode:         timerNode,
 		timeRetrySchedule: retries,
 	}, nil
+}
+
+// sendTimerRPC delivers a request and waits for TIMER_RESPONSE on the
+// same trace_id through the canonical RouterDispatcher.
+func (c *TimerClient) sendTimerRPC(ctx context.Context, msg Message) (Message, error) {
+	if c.dispatcher == nil {
+		return Message{}, fmt.Errorf("timer client dispatcher is nil")
+	}
+	matcher := PendingMatcher{
+		Success: []RouteMatch{RouteExact{MsgType: SYSTEMKind, Msg: MsgTimerResponse}},
+		TerminalError: []RouteMatch{
+			RouteExact{MsgType: SYSTEMKind, Msg: MSGUnreachable},
+			RouteExact{MsgType: SYSTEMKind, Msg: MSGTTLExceeded},
+		},
+		InvalidResponse: []RouteMatch{RouteAnyMsgOfType{MsgType: SYSTEMKind}},
+	}
+	labels := RpcRequestLabels{
+		Target:      c.timerNode,
+		RequestMsg:  stringValue(msg.Meta.Msg),
+		ResponseMsg: MsgTimerResponse,
+	}
+	timeout := timerCtxTimeout(ctx)
+	return c.dispatcher.SendWithMatcher(ctx, msg, matcher, labels, timeout)
+}
+
+func timerCtxTimeout(ctx context.Context) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 5 * time.Second
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return time.Millisecond
+	}
+	return remaining
 }
 
 func (c *TimerClient) Now(ctx context.Context) (*TimerNowResult, error) {
@@ -141,7 +177,7 @@ func (c *TimerClient) Help(ctx context.Context) (*HelpDescriptor, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := RequestSystemRPC(ctx, c.sender, c.receiver, msg, MsgTimerResponse)
+	resp, err := c.sendTimerRPC(ctx, msg)
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +215,7 @@ func (c *TimerClient) callTimeOperation(ctx context.Context, verb string, payloa
 			return err
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
-		resp, err := RequestSystemRPC(attemptCtx, c.sender, c.receiver, msg, MsgTimerResponse)
+		resp, err := c.sendTimerRPC(attemptCtx, msg)
 		cancel()
 		if err == nil {
 			timerResp, parseErr := ParseTimerResponse(&resp)

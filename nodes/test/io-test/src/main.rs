@@ -7,7 +7,7 @@ use fluxbee_sdk::identity::{
 };
 use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::rpc::{
-    OperationalRouteProfile, RouteMatch, RouteTarget, RpcClient, RpcCommandReceiver,
+    OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, RpcCommandReceiver,
     SystemRpcRequest,
 };
 use fluxbee_sdk::{try_handle_default_node_status, NodeConfig, NodeSender};
@@ -61,7 +61,8 @@ async fn main() -> Result<(), DynError> {
             RouteTarget::Command("user_reply"),
         )
         .build()?;
-    let client = RpcClient::connect_with_retry(cfg, Duration::from_millis(100), profile).await?;
+    let client =
+        RouterDispatcher::connect_with_retry(cfg, Duration::from_millis(100), profile).await?;
     let sender = client.sender_snapshot();
     // Drain the status_get channel in the background so the router never
     // blocks on unanswered NODE_STATUS_GET probes.
@@ -102,7 +103,7 @@ async fn main() -> Result<(), DynError> {
 }
 
 async fn resolve_or_provision_ilk(
-    client: &RpcClient,
+    client: &RouterDispatcher,
     config_dir: &Path,
     channel_type: &str,
     address: &str,

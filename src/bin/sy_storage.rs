@@ -22,8 +22,9 @@ use fluxbee_sdk::protocol::{
     MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    build_node_config_response_message, connect, managed_node_config_path, managed_node_name,
-    try_handle_default_node_status, NodeConfig, NodeReceiver, NodeSender, NodeUuidMode,
+    build_node_config_response_message, managed_node_config_path, managed_node_name,
+    try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
+    RouteMatch, RouteTarget, RouterDispatcher, VaultCallerOwned, VaultClient,
     NODE_CONFIG_APPLY_MODE_REPLACE,
 };
 use fluxbee_sdk::{
@@ -243,19 +244,21 @@ async fn main() -> Result<(), StorageError> {
     // registered, the bootstrap VAULT_SECRET_CHANGED broadcast vault emits
     // at its own startup lands in our receive loop and triggers the
     // exit(0) rescue.
-    let (mut sender, mut receiver) =
-        connect_with_retry(&node_config, Duration::from_secs(1)).await?;
+    let profile = build_storage_rpc_profile()
+        .map_err(|err| format!("sy.storage rpc profile invalid: {err}"))?;
+    let dispatcher =
+        RouterDispatcher::connect_with_retry(node_config, Duration::from_secs(1), profile).await?;
+    let sender = dispatcher.sender_snapshot();
     tracing::info!(node_name = %sender.full_name(), "sy.storage connected to router");
 
-    let (database_url, db_secret_source, vault_lookup_error) = resolve_database_url(
-        &sender,
-        &mut receiver,
-        &hive.hive_id,
-        &node_name,
-        &self_ilk_id,
-        my_tenant,
-    )
-    .await;
+    let vault_client = VaultClient::new(
+        dispatcher.clone(),
+        hive.hive_id.clone(),
+        VaultCallerOwned::new(self_ilk_id.clone(), node_name.clone()),
+    );
+
+    let (database_url, db_secret_source, vault_lookup_error) =
+        resolve_database_url(&vault_client, &node_name, my_tenant).await;
     if let Some(err) = vault_lookup_error.as_deref() {
         tracing::warn!(
             node_name = %node_name,
@@ -401,6 +404,10 @@ async fn main() -> Result<(), StorageError> {
     // `handle_vault_secret_changed` in process_router_message.
 
     let mut heartbeat = time::interval(Duration::from_secs(5));
+    let mut system_rx = dispatcher
+        .take_command_receiver(RPC_CH_SYSTEM)
+        .await
+        .map_err(|err| format!("sy.storage system receiver: {err}"))?;
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
@@ -411,14 +418,12 @@ async fn main() -> Result<(), StorageError> {
                     "sy.storage heartbeat"
                 );
             }
-            received = receiver.recv() => {
-                let msg = match received {
-                    Ok(msg) => msg,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "sy.storage connection interrupted; reconnect handled internally");
-                        continue;
-                    }
+            maybe_msg = system_rx.recv() => {
+                let Some(msg) = maybe_msg else {
+                    tracing::warn!("sy.storage system channel closed; exiting main loop");
+                    return Ok(());
                 };
+                let sender = dispatcher.sender_snapshot();
                 if let Err(err) = process_router_message(
                     &sender,
                     &msg,
@@ -2406,24 +2411,17 @@ async fn load_hive(config_dir: &Path) -> Result<HiveFile, StorageError> {
 /// is already announced in the router, any subsequent broadcast lands in
 /// our receive loop (or the rescue handler in handle_vault_secret_changed).
 async fn resolve_database_url(
-    sender: &NodeSender,
-    receiver: &mut NodeReceiver,
-    hive_id: &str,
+    vault: &VaultClient,
     node_name: &str,
-    self_ilk_id: &str,
     my_tenant: &str,
 ) -> (Option<String>, StorageDbSecretSource, Option<String>) {
-    let caller = fluxbee_sdk::VaultCaller::new(self_ilk_id, node_name);
-    let result = fluxbee_sdk::resolve_resource(
-        sender,
-        receiver,
-        caller,
-        hive_id,
-        fluxbee_sdk::ResourceType::Postgres,
-        my_tenant,
-        Duration::from_secs(5),
-    )
-    .await;
+    let result = vault
+        .resolve_resource(
+            fluxbee_sdk::ResourceType::Postgres,
+            my_tenant,
+            Duration::from_secs(5),
+        )
+        .await;
     let _ = node_name; // silence unused when feature flags trim logging
     match result {
         Ok(Some(value)) => match extract_postgres_url_from_vault_value(&value) {
@@ -2849,19 +2847,16 @@ fn is_mother_role(role: Option<&str>) -> bool {
     matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "motherbee")
 }
 
-async fn connect_with_retry(
-    config: &NodeConfig,
-    delay: Duration,
-) -> Result<(NodeSender, NodeReceiver), fluxbee_sdk::NodeError> {
-    loop {
-        match connect(config).await {
-            Ok(result) => return Ok(result),
-            Err(err) => {
-                tracing::warn!(error = %err, "sy.storage router connect failed; retrying");
-                time::sleep(delay).await;
-            }
-        }
-    }
+const RPC_CH_SYSTEM: &str = "system";
+
+fn build_storage_rpc_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::RpcError> {
+    OperationalRouteProfile::builder()
+        .command_channel(RPC_CH_SYSTEM)
+        .post_pending_rule(
+            RouteMatch::any_msg_type(SYSTEM_KIND),
+            RouteTarget::Command(RPC_CH_SYSTEM),
+        )
+        .build()
 }
 
 /// Handle a `VAULT_SECRET_CHANGED` broadcast from SY.vault. If the event

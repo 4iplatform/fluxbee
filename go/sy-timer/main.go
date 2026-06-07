@@ -35,13 +35,9 @@ type messageSender interface {
 	FullName() string
 }
 
-type messageReceiver interface {
-	Recv(context.Context) (fluxbeesdk.Message, error)
-}
-
 type Service struct {
 	sender      messageSender
-	receiver    messageReceiver
+	incoming    <-chan fluxbeesdk.Message
 	nodeName    string
 	instanceDir string
 	dbPath      string
@@ -138,16 +134,31 @@ func main() {
 	log.Printf("resolved self system ILK from identity SHM: %s", selfIlkID)
 	_ = selfIlkID // cached for future outgoing meta.src_ilk use
 
-	sender, receiver, err := fluxbeesdk.Connect(fluxbeesdk.NodeConfig{
+	profile, err := fluxbeesdk.NewOperationalRouteProfile().
+		CommandChannel("incoming").
+		PostPendingRule(
+			fluxbeesdk.RouteAnyMsgOfType{MsgType: fluxbeesdk.SYSTEMKind},
+			fluxbeesdk.RouteCommand{Channel: "incoming"},
+		).
+		Build()
+	if err != nil {
+		log.Fatalf("sy.timer rpc profile invalid: %v", err)
+	}
+	dispatcher, err := fluxbeesdk.ConnectWithRetry(fluxbeesdk.NodeConfig{
 		Name:               defaultNodeBaseName,
 		RouterSocket:       routerSockDir,
 		UUIDPersistenceDir: uuidPersistenceDir,
 		UUIDMode:           fluxbeesdk.NodeUuidPersistent,
 		ConfigDir:          configDir,
 		Version:            version,
-	})
+	}, time.Second, profile)
 	if err != nil {
 		log.Fatalf("failed to connect node lifecycle: %v", err)
+	}
+	sender := dispatcher.SenderSnapshot()
+	incoming, err := dispatcher.TakeCommandReceiver("incoming")
+	if err != nil {
+		log.Fatalf("failed to take incoming channel: %v", err)
 	}
 
 	nodeName := sender.FullName()
@@ -168,7 +179,7 @@ func main() {
 
 	service := &Service{
 		sender:      sender,
-		receiver:    receiver,
+		incoming:    incoming,
 		nodeName:    nodeName,
 		instanceDir: instanceDir,
 		dbPath:      dbPath,
@@ -198,16 +209,7 @@ func main() {
 }
 
 func (s *Service) run() {
-	for {
-		msg, err := s.receiver.Recv(context.Background())
-		if err != nil {
-			logEvent("timer_receiver_error", map[string]any{
-				"error": err.Error(),
-			})
-			log.Printf("receiver error: %v", err)
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
+	for msg := range s.incoming {
 		if err := s.handleMessage(msg); err != nil {
 			logEvent("timer_handler_error", map[string]any{
 				"error":    err.Error(),
@@ -218,6 +220,7 @@ func (s *Service) run() {
 			log.Printf("handle message error: %v", err)
 		}
 	}
+	log.Printf("sy.timer incoming channel closed; exiting run loop")
 }
 
 func (s *Service) handleMessage(msg fluxbeesdk.Message) error {

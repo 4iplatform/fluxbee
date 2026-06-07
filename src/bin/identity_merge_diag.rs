@@ -2,7 +2,7 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fluxbee_sdk::rpc::{OperationalRouteProfile, RpcClient, RpcError, SystemRpcRequest};
+use fluxbee_sdk::rpc::{OperationalRouteProfile, RouterDispatcher, RpcError, SystemRpcRequest};
 use fluxbee_sdk::NodeConfig;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -65,7 +65,7 @@ fn load_hive_id(config_dir: &PathBuf) -> Result<String, DiagError> {
 }
 
 async fn system_call_with_fallback(
-    client: &RpcClient,
+    client: &RouterDispatcher,
     target: &str,
     fallback_target: Option<&str>,
     action: &str,
@@ -84,11 +84,11 @@ async fn system_call_with_fallback(
 }
 
 /// Replicates the SDK `identity_system_call` fallback semantics over the new
-/// `RpcClient::send_system_rpc`. Retries on transport `UNREACHABLE` with
+/// `RouterDispatcher::send_system_rpc`. Retries on transport `UNREACHABLE` with
 /// `reason=NODE_NOT_FOUND` or on payload `status=error, error_code=NOT_PRIMARY`,
 /// against `fallback_target` when supplied and distinct.
 async fn identity_call_with_fallback(
-    client: &RpcClient,
+    client: &RouterDispatcher,
     target: &str,
     fallback_target: Option<&str>,
     action: &str,
@@ -236,9 +236,12 @@ async fn main() -> Result<(), DiagError> {
         version: "0.0.1".to_string(),
     };
     let io_profile = OperationalRouteProfile::builder().build()?;
-    let io_client =
-        RpcClient::connect_with_retry(io_node_config, Duration::from_millis(100), io_profile)
-            .await?;
+    let io_client = RouterDispatcher::connect_with_retry(
+        io_node_config,
+        Duration::from_millis(100),
+        io_profile,
+    )
+    .await?;
 
     let (metrics_before, mut effective_target) = system_call_with_fallback(
         &io_client,
@@ -283,7 +286,7 @@ async fn main() -> Result<(), DiagError> {
         version: "0.0.1".to_string(),
     };
     let frontdesk_profile = OperationalRouteProfile::builder().build()?;
-    let frontdesk_client = RpcClient::connect_with_retry(
+    let frontdesk_client = RouterDispatcher::connect_with_retry(
         frontdesk_config,
         Duration::from_millis(100),
         frontdesk_profile,

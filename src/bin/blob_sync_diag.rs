@@ -7,7 +7,9 @@ use fluxbee_sdk::blob::{
     BLOB_SYNC_HINT_DEFAULT_TIMEOUT_MS,
 };
 use fluxbee_sdk::payload::TextV1Payload;
-use fluxbee_sdk::{connect, NodeConfig};
+use fluxbee_sdk::protocol::SYSTEM_KIND;
+use fluxbee_sdk::{NodeConfig, OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher};
+use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
 type DynError = Box<dyn Error + Send + Sync>;
@@ -71,11 +73,19 @@ async fn run_produce() -> Result<(), DynError> {
             config_dir: json_router::paths::config_dir(),
             version: node_version,
         };
-        let (sender, mut receiver) = connect(&node_config).await?;
+        let profile = OperationalRouteProfile::builder()
+            .command_channel("system")
+            .post_pending_rule(
+                RouteMatch::any_msg_type(SYSTEM_KIND),
+                RouteTarget::Command("system"),
+            )
+            .build()?;
+        let dispatcher =
+            RouterDispatcher::connect_with_retry(node_config, Duration::from_secs(1), profile)
+                .await?;
         let publish = toolkit
-            .publish_blob_and_confirm(
-                &sender,
-                &mut receiver,
+            .publish_blob_and_confirm_via_dispatcher(
+                dispatcher,
                 PublishBlobRequest {
                     data: content.as_bytes(),
                     filename_original: &filename,
@@ -86,7 +96,6 @@ async fn run_produce() -> Result<(), DynError> {
                 },
             )
             .await?;
-        let _ = sender.close().await;
         (publish.blob_ref, publish.targets, publish.timeout_ms)
     };
 
