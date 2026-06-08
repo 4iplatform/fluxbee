@@ -17,6 +17,7 @@ Documentos operativos activos organizados por proceso/componente:
 - `docs/onworking COA/node_secret_tasks.md`
 - `docs/onworking COA/node_secret_migration_runbook.md`
 - `docs/onworking COA/node-status-contract.md`
+- `docs/onworking COA/edge_egress_nat_tasks.md`
 
 Convención aplicada:
 - nodos/procesos: archivo por proceso con patrón `<proceso>_tasks.md` (ej. `sy_admin_tasks.md`, `ai_<name>_tasks.md`).
