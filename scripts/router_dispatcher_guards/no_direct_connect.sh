@@ -2,17 +2,8 @@
 # Guard from routerdispatcher_unification_plan.md §4.2 + §8.
 #
 # Once `fluxbee_sdk::connect` is `pub(crate)`, no code outside the SDK
-# should call it. While the flip is pending (see "Open gaps" §1 in the
-# plan), this guard runs in two modes:
-#
-#   STRICT (default): no call sites outside `crates/fluxbee_sdk/` are
-#     allowed. Pre-requisite: the `pub(crate)` flip + 4 timer examples
-#     must be migrated to `RouterDispatcher`.
-#
-#   PHASE-1 (env var GUARD_NO_DIRECT_CONNECT_PHASE=1): the known-pending
-#     timer example file allowlist passes through. Use this until Gap 1
-#     in the plan is closed; remove the env var and the allowlist when
-#     the timer examples are migrated.
+# should call it. This guard runs only in strict mode; no phase allowlist
+# or transitional escape hatch is allowed.
 #
 # Also forbids local `async fn connect_with_retry` wrappers inside
 # `src/bin/sy_*.rs` (those existed pre-migration and must not come back).
@@ -22,27 +13,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-PHASE="${GUARD_NO_DIRECT_CONNECT_PHASE:-strict}"
 EXIT=0
-
-# Allowlist used in PHASE-1 only: timer examples that still consume the
-# legacy Rust `TimerClient<'a>` API. Remove these entries when the SDK
-# `TimerClient::new_with_dispatcher` lands.
-PHASE1_ALLOW=(
-    'examples/timer_client.rs'
-    'examples/timer_recurring.rs'
-    'examples/timer_restart.rs'
-    'examples/support/timer_example.rs'
-)
-
-is_allowlisted() {
-    local path="$1"
-    [ "$PHASE" = "1" ] || return 1
-    for entry in "${PHASE1_ALLOW[@]}"; do
-        [[ "$path" == *"$entry" ]] && return 0
-    done
-    return 1
-}
 
 # 1. Rust call sites outside the SDK.
 hits=$(grep -RnE 'fluxbee_sdk::connect\(|use[[:space:]]+fluxbee_sdk::connect\b' \
@@ -56,29 +27,15 @@ hits=$(grep -RnE 'fluxbee_sdk::connect\(|use[[:space:]]+fluxbee_sdk::connect\b' 
     | grep -v 'crates/fluxbee_sdk/' \
     || true)
 if [ -n "$hits" ]; then
-    filtered=""
-    while IFS= read -r line; do
-        path="${line%%:*}"
-        if is_allowlisted "$path"; then continue; fi
-        filtered+="$line"$'\n'
-    done <<< "$hits"
-    if [ -n "$filtered" ]; then
-        echo "GUARD FAIL — fluxbee_sdk::connect() called outside the SDK (mode=$PHASE):"
-        printf '%s' "$filtered"
-        EXIT=1
-    fi
+    echo "GUARD FAIL — fluxbee_sdk::connect() called outside the SDK:"
+    echo "$hits"
+    EXIT=1
 fi
 
 # 2. Rust use-list import of `connect` from fluxbee_sdk (multi-line).
-python3 - "$REPO_ROOT" "$PHASE" <<'PY' || EXIT=$?
+python3 - "$REPO_ROOT" <<'PY' || EXIT=$?
 import os, re, sys
-root, phase = sys.argv[1], sys.argv[2]
-allow_paths = (
-    'examples/timer_client.rs',
-    'examples/timer_recurring.rs',
-    'examples/timer_restart.rs',
-    'examples/support/timer_example.rs',
-)
+root = sys.argv[1]
 banned = re.compile(r'use[ \t]+fluxbee_sdk::\{[^}]*\bconnect\b[^}]*\}', re.DOTALL)
 found = []
 for dirpath, dirs, files in os.walk(root):
@@ -89,9 +46,6 @@ for dirpath, dirs, files in os.walk(root):
         if not f.endswith('.rs'):
             continue
         p = os.path.join(dirpath, f)
-        rel = os.path.relpath(p, root)
-        if phase == "1" and any(rel.endswith(a) for a in allow_paths):
-            continue
         try:
             text = open(p, 'r', errors='replace').read()
         except OSError:
@@ -184,6 +138,6 @@ if [ -n "$hits" ]; then
 fi
 
 if [ $EXIT -eq 0 ]; then
-    echo "no_direct_connect: OK — no raw connect()/receiver/blob legacy surface outside the dispatcher path (mode=$PHASE)."
+    echo "no_direct_connect: OK — no raw connect()/receiver/blob legacy surface outside the dispatcher path."
 fi
 exit $EXIT

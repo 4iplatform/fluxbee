@@ -1,0 +1,19 @@
+name: router-dispatcher-guards
+
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  guards:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run RouterDispatcher architectural guards
+        run: bash scripts/router_dispatcher_guards/run_all.sh

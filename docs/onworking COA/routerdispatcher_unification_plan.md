@@ -24,12 +24,12 @@ The architect-specific chapter (`sy_architect_rpc_multiplexing_tasks_v2_stable_a
 - **Section B (canonical RouterDispatcher)** — `ArchitectState.rpc: Arc<RouterDispatcher>` added; `router_connect_loop`, `router_recv_loop`, `router_sender: Arc<Mutex<Option<NodeSender>>>`, `router_connected: AtomicBool` **all deleted** from `src/bin/sy_architect.rs`. Startup reordered: dispatcher constructed before Vault lookups so `build_architect_ai_runtime` + `resolve_messages_db_url_from_vault` reuse it instead of opening ephemeral connections. `state.rpc.sender_snapshot().is_connected()` replaces the deleted `AtomicBool`. The architect route profile (`build_architect_rpc_profile`) declares `system` (pre-pending: `NODE_STATUS_GET` / `CONFIG_GET` / `CONFIG_SET` / `VAULT_SECRET_CHANGED`) and `incoming` (post-pending: `user` / `chat` / `text`) command channels — no `RouteMatch::Any`.
 - **Section C (outbound admin RPC)** — `ArchitectAdminToolContext.rpc` added; `execute_admin_action_with_context` and `fetch_inventory_status_data` now call `context.rpc.send_admin_rpc(...)` / `state.rpc.send_admin_rpc(...)`. The per-action `NodeConfig { name: format!("SY.architect.{purpose}.{}"), uuid_mode: Ephemeral }` block at `execute_admin_action_with_context` and the `SY.architect.status.<uuid>` block at `fetch_inventory_status_data` are **deleted**. All 10 outbound admin RPC purposes (`tool.read`, `plan_compiler.*`, `executor.*`, `snapshot.*`, `status`, `scmd`) now flow through the canonical dispatcher.
 - **Section D (system + incoming workers)** — `run_architect_system_worker(state, system_rx)` and `run_architect_incoming_worker(state, incoming_rx)` spawned from `main`. `handle_architect_system_message` reads its sender from `state.rpc.sender_snapshot()` (the deleted lock-protected `Option<NodeSender>` is gone).
-- **Section E (origin authorization)** — `protected_architect_system_action_response`, `architect_origin_authorized`, and `build_architect_forbidden_response` implemented. Inbound `NODE_STATUS_GET` / `CONFIG_GET` / `CONFIG_SET` / `VAULT_SECRET_CHANGED` from outside the allowlist (`SY.admin@hive`, `SY.config-routes@hive`, `SY.vault@hive`) receive a `*_RESPONSE` with `status: "error", error_code: "FORBIDDEN"` and never reach the handler. `NODE_STATUS_GET` is gated before `try_handle_default_node_status`.
+- **Section E (origin authorization)** — `protected_architect_system_action_response`, `architect_origin_authorized`, and `build_architect_forbidden_response` implemented. Inbound protected RPCs (`NODE_STATUS_GET` / `CONFIG_GET` / `CONFIG_SET`) from outside the allowlist (`SY.admin@hive`, `SY.config-routes@hive`, `SY.vault@hive`) receive a `*_RESPONSE` with `status: "error", error_code: "FORBIDDEN"` and never reach the handler. `NODE_STATUS_GET` is gated before `try_handle_default_node_status`. `VAULT_SECRET_CHANGED` remains an open broadcast event and is filtered by Vault interest before refresh.
 - **Section H1 / H2 / H3 (admin Vault)** — `AdminContext.rpc: Arc<RouterDispatcher>` added (the canonical admin dispatcher built in `main` at `sy_admin.rs:475`); `build_admin_executor_ai_runtime` now takes the dispatcher and constructs `VaultClient` over it. The ephemeral `NodeConfig { uuid_mode: Ephemeral }` + `RouterDispatcher::connect_with_retry` block previously at `sy_admin.rs:816-842` is **deleted**. The `VAULT_SECRET_CHANGED` hot-refresh path (`refresh_admin_executor_ai_runtime`) now flows through the same canonical dispatcher.
 
 ## CI guards (§8)
 
-`scripts/router_dispatcher_guards/` contains 6 guard scripts. All run on the current tree in strict mode and report clean:
+`scripts/router_dispatcher_guards/` contains 7 guard scripts plus `run_all.sh`. The `.github/workflows/router-dispatcher-guards.yml` workflow runs `run_all.sh` on every push and pull request. All guards run on the current tree in strict mode and report clean:
 
 | Guard | Status |
 | --- | --- |
@@ -39,8 +39,9 @@ The architect-specific chapter (`sy_architect_rpc_multiplexing_tasks_v2_stable_a
 | `no_deprecated_attribute_on_dispatcher.sh` | OK — no `#[deprecated]` on `RouterDispatcher` / `RpcClient` / `connect_with_retry` / `VaultClient` / `resolve_resource` |
 | `no_shared_receiver.sh` | OK — no Go function aliases a `NodeReceiver` across `Recv()` + arg-pass |
 | `architect_no_ephemeral_guard.sh` | OK — no `SY.architect.<purpose>.{}` literals, no `NodeUuidMode::Ephemeral`, no deleted `router_*_loop` / `router_sender` / `router_connected` in `sy_architect.rs` / `sy_admin.rs` |
+| `origin_auth_gates_present.sh` | OK — architect Section E + admin H5 gate symbols are present |
 
-Guards use ast-grep when available and fall back to portable `grep -E` + Python multi-line regex.
+Guards use portable `grep -E` scans plus Python multi-line regex where single-line matching would miss Rust/Go use-lists or multi-line call sites.
 
 ## Test status at close
 
@@ -52,7 +53,7 @@ Guards use ast-grep when available and fall back to portable `grep -E` + Python 
 ## What remains (truly nothing in scope of this plan)
 
 - `examples/timer_client.rs`, `examples/timer_recurring.rs`, `examples/timer_restart.rs`, `examples/support/timer_example.rs` — migrated to `TimerClient::new_with_dispatcher`.
-- The 5 §8 CI guards + the architect §A2 guard exist on disk and pass.
+- The 5 §8 CI guards + the architect §A2 guard + the admin/architect origin-auth presence guard exist on disk, are wired through `.github/workflows/router-dispatcher-guards.yml`, and pass.
 - `fluxbee_sdk::connect` is `pub(crate)`.
 - `fluxbee_sdk::resolve_resource` deleted from public surface (and from the SDK).
 - All 8 inline dispatchers gone. Every fluxbee process owns exactly one canonical `Arc<RouterDispatcher>` (or `*RouterDispatcher` in Go).
@@ -82,7 +83,7 @@ A second-pass audit was run after the close. Two real bugs were found and fixed 
 - `cargo check --workspace --all-targets` — verde. Only 3 unused-import warnings remain, all in `src/bin/fluxbee-publish.rs`, all pre-dating this plan.
 - `cargo test -p fluxbee-sdk --lib` — 147/147.
 - Go modules: all verde.
-- All 6 CI guards — verde.
+- All 7 CI guards — verde.
 
 Scope: SDK (Rust + Go) + all fluxbee nodes + Pattern 3 Vault sites
 Related:

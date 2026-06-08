@@ -6,7 +6,7 @@
 # against an allowlist of `src_l2_name` values. If somebody deletes the gate
 # functions during a "simplification", CI fails here.
 #
-# We assert presence of the four symbols by name. The unit tests in each
+# We assert presence of the six symbols by name. The unit tests in each
 # binary cover the *behavior* (VAULT_SECRET_CHANGED must not be in the
 # protected set, the allowlist accepts the right callers and rejects the
 # rest, etc.).

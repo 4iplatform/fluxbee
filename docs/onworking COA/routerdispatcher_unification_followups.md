@@ -8,7 +8,7 @@ Architect parent: [sy_architect_rpc_multiplexing_tasks_v2_stable_agents.md](sy_a
 
 ## Why this doc
 
-The unification plan and the architect refactor were both closed on 2026-06-06: all 8 inline dispatchers gone, all 9 Vault sites on `VaultClient` over the canonical `Arc<RouterDispatcher>`, `connect()` private, 6 CI guards strict-clean, workspace + SDK tests verde.
+The unification plan and the architect refactor were both closed on 2026-06-06: all 8 inline dispatchers gone, all 9 Vault sites on `VaultClient` over the canonical `Arc<RouterDispatcher>`, `connect()` private, 7 CI guards strict-clean and wired through `.github/workflows/router-dispatcher-guards.yml`, workspace + SDK tests verde.
 
 What lives here is the **leftover work that is real, was identified honestly, but is explicitly out of scope of the unification PR**. Either it's testing/audit work that complements the live path, or it's a deeper divergence (Go SDK vs Rust SDK) that nobody is hitting today and will need its own scoped change when load demands it.
 

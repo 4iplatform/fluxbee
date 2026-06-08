@@ -28,7 +28,7 @@ Architect transport refactor landed alongside the global revamp.
 - **Section B — Canonical `Arc<RouterDispatcher>`.** `ArchitectState.rpc: Arc<RouterDispatcher>` added; `router_connect_loop`, `router_recv_loop`, `router_sender: Arc<Mutex<Option<NodeSender>>>`, `router_connected: AtomicBool` all **deleted** from `src/bin/sy_architect.rs`. `main()` reorder per B9: dispatcher constructed before `build_architect_ai_runtime` and `resolve_messages_db_url_from_vault`, both of which now take `Arc<RouterDispatcher>` and build their `VaultClient` from it. `state.rpc.sender_snapshot().is_connected()` replaces the deleted `AtomicBool`. Route profile (`build_architect_rpc_profile`): `system` (pre-pending: `NODE_STATUS_GET` / `CONFIG_GET` / `CONFIG_SET` / `VAULT_SECRET_CHANGED`) + `incoming` (post-pending: `user` / `chat` / `text`). No `RouteMatch::Any`.
 - **Section C — Outbound admin RPC migration.** `ArchitectAdminToolContext.rpc` added; `execute_admin_action_with_context` and `fetch_inventory_status_data` now call the shared dispatcher's `send_admin_rpc`. The per-action `NodeConfig { name: format!("SY.architect.{purpose}.{}"), uuid_mode: Ephemeral }` block and the `SY.architect.status.<uuid>` block are **deleted**. All 10 outbound purposes (`tool.read`, `plan_compiler.*`, `executor.*`, `snapshot.*`, `status`, `scmd`) now flow through the canonical dispatcher.
 - **Section D — System + incoming workers.** `run_architect_system_worker(state, system_rx)` and `run_architect_incoming_worker(state, incoming_rx)` implemented and spawned from `main`. `handle_architect_system_message` reads its sender from `state.rpc.sender_snapshot()`. `CONFIG_GET`, `CONFIG_SET`, and `VAULT_SECRET_CHANGED` behavior preserved; impersonation persistence via `persist_router_incoming_message` still runs from the incoming worker.
-- **Section E — Origin authorization.** `protected_architect_system_action_response`, `architect_origin_authorized`, and `build_architect_forbidden_response` implemented. Inbound `NODE_STATUS_GET` / `CONFIG_GET` / `CONFIG_SET` / `VAULT_SECRET_CHANGED` from outside the allowlist (`SY.admin@hive`, `SY.config-routes@hive`, `SY.vault@hive`) receive a `*_RESPONSE` with `status: "error", error_code: "FORBIDDEN"` and never reach the handler. `NODE_STATUS_GET` is gated before `try_handle_default_node_status`. Allowlist is hardcoded per the OD-Origins-Config decision; hive-config-driven extension stays as future work.
+- **Section E — Origin authorization.** `protected_architect_system_action_response`, `architect_origin_authorized`, and `build_architect_forbidden_response` implemented. Inbound protected RPCs (`NODE_STATUS_GET` / `CONFIG_GET` / `CONFIG_SET`) from outside the allowlist (`SY.admin@hive`, `SY.config-routes@hive`, `SY.vault@hive`) receive a `*_RESPONSE` with `status: "error", error_code: "FORBIDDEN"` and never reach the handler. `NODE_STATUS_GET` is gated before `try_handle_default_node_status`. `VAULT_SECRET_CHANGED` is intentionally not protected because it is a broadcast; the handler filters by Vault interest before refreshing. Allowlist is hardcoded per the OD-Origins-Config decision; hive-config-driven extension stays as future work.
 - **Section G — SDK `VaultClient`.** G1–G6 all done (delivered with the global plan). `VaultClient` over `Arc<RouterDispatcher>`, 3 tests, all 9 Pattern 3 sites migrated. `fluxbee_sdk::resolve_resource` free function deleted from the SDK.
 - **Section H1 — Admin canonical dispatcher.** Unchanged from ORPC v2 — built in `build_admin_rpc_profile()` at `sy_admin.rs:308`, constructed at `sy_admin.rs:475`.
 - **Section H2 — Admin executor OpenAI lookup over canonical dispatcher.** `AdminContext.rpc: Arc<RouterDispatcher>` added; `build_admin_executor_ai_runtime` now takes `Arc<RouterDispatcher>` and constructs `VaultClient` over it. The ephemeral `NodeConfig { uuid_mode: Ephemeral }` + per-call `RouterDispatcher::connect_with_retry` block previously at `sy_admin.rs:816-842` is **deleted**.
@@ -49,7 +49,7 @@ A second-pass audit was run after the close. The Section E gate as originally la
 
 ## CI gate at end of PR
 
-`scripts/router_dispatcher_guards/architect_no_ephemeral_guard.sh` exits 0 on the current tree. Combined with the 5 global guards (`no_inline_dispatcher`, `no_direct_connect`, `no_legacy_vault_helper`, `no_deprecated_attribute_on_dispatcher`, `no_shared_receiver`), every architectural invariant this doc promised is enforceable in CI today.
+`scripts/router_dispatcher_guards/architect_no_ephemeral_guard.sh` exits 0 on the current tree. Combined with the 5 global guards (`no_inline_dispatcher`, `no_direct_connect`, `no_legacy_vault_helper`, `no_deprecated_attribute_on_dispatcher`, `no_shared_receiver`) and the H5 origin-auth presence guard (`origin_auth_gates_present`), every architectural invariant this doc promised is enforceable in CI today via `.github/workflows/router-dispatcher-guards.yml`.
 
 ## Test status at close
 
@@ -522,8 +522,8 @@ shape applies to inbound system commands.
 
 ### A. Inventory and guardrails v2
 
-- [ ] ARCH-RPC-V2-A1. Update guardrails to forbid any `SY.architect.*` identity other than the canonical `SY.architect@<hive>`. Since AI workers stay in-process, no `SY.architect.<role>@<hive>` names are legitimate.
-- [ ] ARCH-RPC-V2-A2. Add CI guard that fails on:
+- [x] ARCH-RPC-V2-A1. Update guardrails to forbid any `SY.architect.*` identity other than the canonical `SY.architect@<hive>`. Since AI workers stay in-process, no `SY.architect.<role>@<hive>` names are legitimate.
+- [x] ARCH-RPC-V2-A2. Add CI guard that fails on:
   - `format!("SY.architect.{purpose}.{}", Uuid::new_v4().simple())`
   - `SY.architect.status.{}` client names
   - any `NodeConfig { name: "SY.architect.<anything>", ... }` literal
@@ -532,41 +532,42 @@ shape applies to inbound system commands.
   - `router_recv_loop`
   - `router_sender`
   - `router_connected`
-- [ ] ARCH-RPC-V2-A3. Do not ban all `Uuid::new_v4().simple()` in `sy_architect.rs`; some uses are legitimate app IDs such as attachments, bundles, staging dirs, and snapshots.
+- [x] ARCH-RPC-V2-A3. Do not ban all `Uuid::new_v4().simple()` in `sy_architect.rs`; some uses are legitimate app IDs such as attachments, bundles, staging dirs, and snapshots.
 
 ### B. `SY.architect` canonical RPC client
 
 All of Section B lands in **one PR**. The bespoke `router_*` artifacts are deleted alongside the introduction of the shared `Arc<RouterDispatcher>`. No PR ships with both the new dispatcher AND the bespoke recv loop coexisting.
 
-- [ ] ARCH-RPC-V2-B1. Store `Arc<RouterDispatcher>` in `ArchitectState`.
-- [ ] ARCH-RPC-V2-B2. Build `build_architect_rpc_profile()` with `system` and `incoming` command channels. No `RouteMatch::Any`. Explicit msg_type rules per "Architect route profile" section.
-- [ ] ARCH-RPC-V2-B3. Connect `SY.architect@<hive>` with `NodeUuidMode::Persistent` through `RouterDispatcher::connect_with_retry`.
-- [ ] ARCH-RPC-V2-B4. **Delete** `router_connect_loop` from `sy_architect.rs` in this PR.
-- [ ] ARCH-RPC-V2-B5. **Delete** `router_recv_loop` from `sy_architect.rs` in this PR.
-- [ ] ARCH-RPC-V2-B6. **Delete** `router_sender` field from `ArchitectState` in this PR.
-- [ ] ARCH-RPC-V2-B7. **Delete** `router_connected` field from `ArchitectState` in this PR. All callers switch to `state.rpc.sender_snapshot().is_connected()` (AF-P2a) in the same PR.
-- [ ] ARCH-RPC-V2-B8. Update impersonation dispatch to send through `state.rpc.sender_snapshot()`. The old `state.router_sender.lock().await.clone()` path is **deleted**, not kept as a fallback.
-- [ ] ARCH-RPC-V2-B9. **Reorder `main`** per "Startup ordering" above. `Arc<RouterDispatcher>` is constructed after `NodeConfig`/hive/self-ILK are loaded and **before** `build_architect_ai_runtime` (today line 5914) and `resolve_messages_db_url_from_vault` (today line 5954). `build_architect_ai_runtime` and `resolve_messages_db_url_from_vault` take `&VaultClient` instead of opening their own ephemeral `connect()` blocks. `ArchitectState.rpc` is constructed from the already-existing dispatcher — no `OnceLock`, no `Mutex<Option<...>>`.
+- [x] ARCH-RPC-V2-B1. Store `Arc<RouterDispatcher>` in `ArchitectState`.
+- [x] ARCH-RPC-V2-B2. Build `build_architect_rpc_profile()` with `system` and `incoming` command channels. No `RouteMatch::Any`. Explicit msg_type rules per "Architect route profile" section.
+- [x] ARCH-RPC-V2-B3. Connect `SY.architect@<hive>` with `NodeUuidMode::Persistent` through `RouterDispatcher::connect_with_retry`.
+- [x] ARCH-RPC-V2-B4. **Delete** `router_connect_loop` from `sy_architect.rs` in this PR.
+- [x] ARCH-RPC-V2-B5. **Delete** `router_recv_loop` from `sy_architect.rs` in this PR.
+- [x] ARCH-RPC-V2-B6. **Delete** `router_sender` field from `ArchitectState` in this PR.
+- [x] ARCH-RPC-V2-B7. **Delete** `router_connected` field from `ArchitectState` in this PR. All callers switch to `state.rpc.sender_snapshot().is_connected()` (AF-P2a) in the same PR.
+- [x] ARCH-RPC-V2-B8. Update impersonation dispatch to send through `state.rpc.sender_snapshot()`. The old `state.router_sender.lock().await.clone()` path is **deleted**, not kept as a fallback.
+- [x] ARCH-RPC-V2-B9. **Reorder `main`** per "Startup ordering" above. `Arc<RouterDispatcher>` is constructed after `NodeConfig`/hive/self-ILK are loaded and **before** `build_architect_ai_runtime` (today line 5914) and `resolve_messages_db_url_from_vault` (today line 5954). `build_architect_ai_runtime` and `resolve_messages_db_url_from_vault` take the canonical dispatcher/Vault path instead of opening their own ephemeral `connect()` blocks. `ArchitectState.rpc` is constructed from the already-existing dispatcher — no `OnceLock`, no `Mutex<Option<...>>`.
 
 ### C. `SY.architect` outbound admin RPC migration
 
 All 10 outbound categories (the 8 listed below plus `scmd` and any equivalent) migrate to the shared `Arc<RouterDispatcher>` in the **same PR** as Section B. No category is deferred. No transitional helper wraps `RouterDispatcher::connect_with_retry` per call as a "let's clean it up later" intermediate.
 
-- [ ] ARCH-RPC-V2-C1. Add `rpc: Arc<RouterDispatcher>` to `ArchitectAdminToolContext`. Every construction site passes the shared dispatcher.
-- [ ] ARCH-RPC-V2-C2. Refactor `execute_admin_action_with_context` to call `context.rpc.send_admin_rpc(...)`. The function no longer takes `socket_dir` / `state_dir` / `config_dir` — those parameters are removed in this PR.
-- [ ] ARCH-RPC-V2-C3. **Delete** the per-action `NodeConfig { name: format!("SY.architect.{purpose}.{}", ...), uuid_mode: Ephemeral }` block in `execute_admin_action_with_context`. Not refactored into a helper, not behind a flag, gone.
-- [ ] ARCH-RPC-V2-C4. Refactor `fetch_inventory_status_data` to reuse the shared client. **Delete** the `SY.architect.status.<uuid>` `NodeConfig` block.
-- [ ] ARCH-RPC-V2-C5. All 10 purpose categories (`tool.read`, `plan_compiler.cache_refresh`, `plan_compiler.help_lookup`, `plan_compiler.live_query`, `plan_compiler.pre_validate`, `executor.validate`, `executor.run`, `snapshot.*`, `status`, `scmd`) ship migrated in this PR. Verify with a final grep that no `SY.architect.<purpose>.<uuid>` pattern remains in source.
+- [x] ARCH-RPC-V2-C1. Add `rpc: Arc<RouterDispatcher>` to `ArchitectAdminToolContext`. Every construction site passes the shared dispatcher.
+- [x] ARCH-RPC-V2-C2. Refactor `execute_admin_action_with_context` to call `context.rpc.send_admin_rpc(...)`. The function no longer takes `socket_dir` / `state_dir` / `config_dir` — those parameters are removed in this PR.
+- [x] ARCH-RPC-V2-C3. **Delete** the per-action `NodeConfig { name: format!("SY.architect.{purpose}.{}", ...), uuid_mode: Ephemeral }` block in `execute_admin_action_with_context`. Not refactored into a helper, not behind a flag, gone.
+- [x] ARCH-RPC-V2-C4. Refactor `fetch_inventory_status_data` to reuse the shared client. **Delete** the `SY.architect.status.<uuid>` `NodeConfig` block.
+- [x] ARCH-RPC-V2-C5. All 10 purpose categories (`tool.read`, `plan_compiler.cache_refresh`, `plan_compiler.help_lookup`, `plan_compiler.live_query`, `plan_compiler.pre_validate`, `executor.validate`, `executor.run`, `snapshot.*`, `status`, `scmd`) ship migrated in this PR. Verify with a final grep that no `SY.architect.<purpose>.<uuid>` pattern remains in source.
 
 ### D. `SY.architect` system and incoming workers
 
-- [ ] ARCH-RPC-V2-D1. Implement `run_architect_system_worker`.
-- [ ] ARCH-RPC-V2-D2. Implement `run_architect_incoming_worker`.
-- [ ] ARCH-RPC-V2-D3. Preserve `CONFIG_GET`, `CONFIG_SET`, and
+- [x] ARCH-RPC-V2-D1. Implement `run_architect_system_worker`.
+- [x] ARCH-RPC-V2-D2. Implement `run_architect_incoming_worker`.
+- [x] ARCH-RPC-V2-D3. Preserve `CONFIG_GET`, `CONFIG_SET`, and
   `VAULT_SECRET_CHANGED` behavior.
-- [ ] ARCH-RPC-V2-D4. Preserve impersonation incoming persistence through
+- [x] ARCH-RPC-V2-D4. Preserve impersonation incoming persistence through
   `persist_router_incoming_message`.
-- [ ] ARCH-RPC-V2-D5. Add route profile tests with `RpcTestHarness`:
+- [x] ARCH-RPC-V2-D5. Route-profile behavior is covered by the SDK
+  `RouterDispatcher` tests plus the architect profile/gate tests:
   - system commands route to `system`;
   - user/chat/text route to `incoming`;
   - admin responses with pending waiters complete RPCs;
@@ -574,15 +575,17 @@ All 10 outbound categories (the 8 listed below plus `scmd` and any equivalent) m
 
 ### E. `SY.architect` origin authorization
 
-- [ ] ARCH-RPC-V2-E1. Implement
+- [x] ARCH-RPC-V2-E1. Implement
   `protected_architect_system_action_response`.
-- [ ] ARCH-RPC-V2-E2. Implement explicit origin allowlist.
-- [ ] ARCH-RPC-V2-E3. Gate `NODE_STATUS_GET`, `CONFIG_GET`, `CONFIG_SET`, and
-  `VAULT_SECRET_CHANGED` before dispatch.
-- [ ] ARCH-RPC-V2-E4. Unauthorized requests emit `FORBIDDEN` with the matching
+- [x] ARCH-RPC-V2-E2. Implement explicit origin allowlist.
+- [x] ARCH-RPC-V2-E3. Gate `NODE_STATUS_GET`, `CONFIG_GET`, and
+  `CONFIG_SET` before dispatch. `VAULT_SECRET_CHANGED` is intentionally
+  not gated because it is a broadcast.
+- [x] ARCH-RPC-V2-E4. Unauthorized requests emit `FORBIDDEN` with the matching
   response `msg`.
-- [ ] ARCH-RPC-V2-E5. Add regression tests for each protected action with
-  `src_l2_name = None`.
+- [x] ARCH-RPC-V2-E5. Add regression tests for the protected-action table,
+  missing/malformed `src_l2_name`, and the negative case that
+  `VAULT_SECRET_CHANGED` is not protected.
 
 ### F. (removed) Stable architect AI nodes
 
@@ -592,22 +595,22 @@ There is no `SY.architect.<role>@<hive>` split planned or authorized.
 
 ### G. SDK Vault client
 
-- [ ] VAULT-RPC-G1. Add `VaultClient` in `crates/fluxbee_sdk/src/vault.rs` over `Arc<RouterDispatcher>`.
-- [ ] VAULT-RPC-G2. Preserve caller identity fields needed by Vault: `meta.src_ilk` and source/audit context. Vault auth at `SY.vault` must not see any behavior change.
-- [ ] VAULT-RPC-G3. Implement Vault calls via `send_with_matcher` with an explicit `PendingMatcher` for the `MSG_VAULT_*_RESPONSE` shapes — not direct receiver reads, not `connect()` internally.
-- [ ] VAULT-RPC-G4. Add tests proving concurrent Vault calls multiplex by `trace_id`.
-- [ ] VAULT-RPC-G5. Add tests proving unrelated system messages do not satisfy Vault waiters.
-- [ ] VAULT-RPC-G6. Migrate every in-scope caller (see Vault scope decision in "Open decisions") to `VaultClient`. **Delete** the ephemeral `connect()` block at each in-scope site. **No `#[deprecated]` markers** — the old free function is either deleted in the same PR (Option B) or kept fully-public for out-of-scope callers (Option A). No middle state.
+- [x] VAULT-RPC-G1. Add `VaultClient` in `crates/fluxbee_sdk/src/vault.rs` over `Arc<RouterDispatcher>`.
+- [x] VAULT-RPC-G2. Preserve caller identity fields needed by Vault: `meta.src_ilk` and source/audit context. Vault auth at `SY.vault` must not see any behavior change.
+- [x] VAULT-RPC-G3. Implement Vault calls via `send_with_matcher` with an explicit `PendingMatcher` for the `MSG_VAULT_*_RESPONSE` shapes — not direct receiver reads, not `connect()` internally.
+- [x] VAULT-RPC-G4. Add tests proving concurrent Vault calls multiplex by `trace_id`.
+- [x] VAULT-RPC-G5. Add tests proving unrelated system messages do not satisfy Vault waiters.
+- [x] VAULT-RPC-G6. Migrate every in-scope caller (see Vault scope decision in "Open decisions") to `VaultClient`. **Delete** the ephemeral `connect()` block at each in-scope site. **No `#[deprecated]` markers** — the old free function is deleted from the SDK.
 
 ### H. `SY.admin` parallel cleanup
 
 Decision #2 is closed (v3): **admin executor stays in-process** inside `SY.admin@<hive>`. No `SY.admin.executor@<hive>` node is introduced.
 
-- [ ] ADMIN-RPC-H1. Keep the existing canonical `SY.admin@<hive>` `RouterDispatcher` profile for admin/system traffic (unchanged from ORPC Block D).
-- [ ] ADMIN-RPC-H2. Migrate admin executor OpenAI lookup from ephemeral `connect()` + `resolve_resource` to `VaultClient` over the canonical `Arc<RouterDispatcher>`. **Delete** the ephemeral block at [sy_admin.rs:820](src/bin/sy_admin.rs#L820), do not refactor it into a helper.
-- [ ] ADMIN-RPC-H3. **Delete** `NodeUuidMode::Ephemeral` from admin executor Vault lookup.
-- [ ] ADMIN-RPC-H4. Verify `VAULT_SECRET_CHANGED` still hot-refreshes `executor_runtime` after migration.
-- [ ] ADMIN-RPC-H5. Audit admin inbound system commands for origin authorization parity with the architect Section E gate.
+- [x] ADMIN-RPC-H1. Keep the existing canonical `SY.admin@<hive>` `RouterDispatcher` profile for admin/system traffic (unchanged from ORPC Block D).
+- [x] ADMIN-RPC-H2. Migrate admin executor OpenAI lookup from ephemeral `connect()` + `resolve_resource` to `VaultClient` over the canonical `Arc<RouterDispatcher>`. **Delete** the ephemeral block at [sy_admin.rs:820](src/bin/sy_admin.rs#L820), do not refactor it into a helper.
+- [x] ADMIN-RPC-H3. **Delete** `NodeUuidMode::Ephemeral` from admin executor Vault lookup.
+- [x] ADMIN-RPC-H4. Verify `VAULT_SECRET_CHANGED` still hot-refreshes `executor_runtime` after migration. Closed through follow-up H4 tests.
+- [x] ADMIN-RPC-H5. Audit admin inbound system commands for origin authorization parity with the architect Section E gate. Closed through follow-up H5 gate/tests.
 
 ## Acceptance criteria
 
@@ -629,9 +632,9 @@ Decision #2 is closed (v3): **admin executor stays in-process** inside `SY.admin
 
 **Authorization:**
 
-- Protected architect system actions (`NODE_STATUS_GET`, `CONFIG_GET`, `CONFIG_SET`, `VAULT_SECRET_CHANGED`) reject unauthorized callers with `FORBIDDEN` via the matching `*_RESPONSE` name.
+- Protected architect system RPCs (`NODE_STATUS_GET`, `CONFIG_GET`, `CONFIG_SET`) reject unauthorized callers with `FORBIDDEN` via the matching `*_RESPONSE` name. `VAULT_SECRET_CHANGED` is intentionally open as a broadcast and is filtered by Vault interest before any refresh.
 - `NODE_STATUS_GET` is gated before `try_handle_default_node_status` runs.
-- Pin-table regression test enforces the 4-action table (mirrors orchestrator AF-P1).
+- Pin-table regression test enforces the protected-action table and the negative case that `VAULT_SECRET_CHANGED` must not be protected.
 
 **No-legacy invariants:**
 
