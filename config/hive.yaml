@@ -118,3 +118,8 @@ system_nodes:
       - SY.cognition
       - SY.policy
       - SY.timer
+  egress:
+    nodes:
+      - SY.config.routes
+    wait_for:
+      - SY.config.routes

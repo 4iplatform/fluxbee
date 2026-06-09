@@ -569,8 +569,7 @@ async fn main() -> Result<(), OrchestratorError> {
         );
         return Ok(());
     }
-    let role = HiveRole::from_role(hive.role.as_deref())
-        .expect("role validated by the gate above");
+    let role = HiveRole::from_role(hive.role.as_deref()).expect("role validated by the gate above");
     if is_motherbee && hive.hive_id != PRIMARY_HIVE_ID {
         return Err(format!(
             "invalid hive.yaml: role=motherbee requires hive_id='{}' (got '{}')",
@@ -802,7 +801,9 @@ async fn bootstrap_local(
         tracing::error!(error = %err, "worker egress route reconciliation failed; continuing");
     }
     let startup_sync = effective_syncthing_runtime_config(&state.blob, &state.dist);
-    if startup_sync.sync_enabled {
+    if state.role == HiveRole::Egress {
+        disable_blob_sync_runtime_local()?;
+    } else if startup_sync.sync_enabled {
         if let Err(err) =
             ensure_blob_sync_runtime(&state.blob, &state.dist, state.is_motherbee).await
         {
@@ -1296,7 +1297,11 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
             }
         }
         HiveRole::Worker => {
-            if let Some(gateway_ip) = eg.gateway_ip.as_deref().map(str::trim).filter(|g| !g.is_empty())
+            if let Some(gateway_ip) = eg
+                .gateway_ip
+                .as_deref()
+                .map(str::trim)
+                .filter(|g| !g.is_empty())
             {
                 let mut cmd = Command::new("ip");
                 cmd.arg("route")
@@ -1582,21 +1587,24 @@ async fn handle_admin(
                 let dist_sync_probe_timeout_secs =
                     resolve_add_hive_dist_sync_probe_timeout_secs(&msg.payload);
                 match resolve_add_hive_role(&msg.payload) {
-                    Ok(HiveRole::Egress) => {
-                        match resolve_add_hive_egress_section(&msg.payload) {
-                            Ok(egress) => {
-                                add_egress_hive_flow(
-                                    state, &hive_id, &address, harden_ssh, restrict_ssh, egress,
-                                )
-                                .await
-                            }
-                            Err(err) => serde_json::json!({
-                                "status": "error",
-                                "error_code": "INVALID_REQUEST",
-                                "message": err.to_string(),
-                            }),
+                    Ok(HiveRole::Egress) => match resolve_add_hive_egress_section(&msg.payload) {
+                        Ok(egress) => {
+                            add_egress_hive_flow(
+                                state,
+                                &hive_id,
+                                &address,
+                                harden_ssh,
+                                restrict_ssh,
+                                egress,
+                            )
+                            .await
                         }
-                    }
+                        Err(err) => serde_json::json!({
+                            "status": "error",
+                            "error_code": "INVALID_REQUEST",
+                            "message": err.to_string(),
+                        }),
+                    },
                     Ok(_) => {
                         add_hive_flow(
                             state,
@@ -2488,8 +2496,7 @@ async fn apply_system_update_local(
         }
         "core" => {
             let manifest = load_core_manifest()?;
-            let (updated, unchanged) =
-                compute_local_core_update_sets(&manifest, state.role)?;
+            let (updated, unchanged) = compute_local_core_update_sets(&manifest, state.role)?;
             let backup_dir = orchestrator_runtime_dir()
                 .join("core-bin.prev.local")
                 .join(format!("update-{}", now_epoch_ms()));
@@ -3185,6 +3192,33 @@ fn render_system_nodes_yaml(role: HiveRole, section: &RoleSystemNodes) -> String
     out
 }
 
+fn render_worker_egress_yaml(egress: Option<&EgressSection>) -> Result<String, OrchestratorError> {
+    let Some(egress) = egress else {
+        return Ok(String::new());
+    };
+    let Some(gateway_ip) = egress
+        .gateway_ip
+        .as_deref()
+        .map(str::trim)
+        .filter(|gw| !gw.is_empty())
+    else {
+        return Ok(String::new());
+    };
+    if egress.ipv6.trim() != "blocked" {
+        return Err(format!(
+            "invalid egress.ipv6 '{}': only \"blocked\" is supported for worker route injection",
+            egress.ipv6
+        )
+        .into());
+    }
+    let gateway_ip: std::net::Ipv4Addr = gateway_ip
+        .parse()
+        .map_err(|_| format!("invalid egress.gateway_ip '{gateway_ip}': bad IPv4 address"))?;
+    Ok(format!(
+        "egress:\n  gateway_ip: \"{gateway_ip}\"\n  ipv6: \"blocked\"\n"
+    ))
+}
+
 fn ensure_dirs(
     config_dir: &Path,
     state_dir: &Path,
@@ -3686,9 +3720,29 @@ struct EgressVerification {
     internet_reachable: bool,
 }
 
-/// First usable host of a CIDR: `(network & mask) + 1`. Works for any IPv4
-/// mask using std bit-math; no CIDR crate needed (spec Open Question #2).
+/// First usable host of a CIDR: `(network & mask) + 1`. Uses std bit-math; no
+/// CIDR crate needed (spec Open Question #2). `/31` and `/32` have no derived
+/// gateway address and require an explicit `edge_ip`.
 fn first_usable_ipv4(cidr: &str) -> Result<std::net::Ipv4Addr, OrchestratorError> {
+    let (network, _, prefix) = parse_ipv4_cidr_network(cidr)?;
+    first_usable_ipv4_from_network(cidr, network, prefix)
+}
+
+fn first_usable_ipv4_from_network(
+    cidr: &str,
+    network: u32,
+    prefix: u32,
+) -> Result<std::net::Ipv4Addr, OrchestratorError> {
+    if prefix >= 31 {
+        return Err(format!(
+            "invalid lan_cidr '{cidr}': prefix /{prefix} has no derived gateway address"
+        )
+        .into());
+    }
+    Ok(std::net::Ipv4Addr::from(network + 1))
+}
+
+fn parse_ipv4_cidr_network(cidr: &str) -> Result<(u32, u32, u32), OrchestratorError> {
     let (ip, pfx) = cidr
         .split_once('/')
         .ok_or_else(|| format!("invalid lan_cidr '{cidr}': missing /prefix"))?;
@@ -3705,13 +3759,10 @@ fn first_usable_ipv4(cidr: &str) -> Result<std::net::Ipv4Addr, OrchestratorError
     }
     let mask = if pfx == 0 { 0 } else { u32::MAX << (32 - pfx) };
     let network = u32::from(base) & mask;
-    Ok(std::net::Ipv4Addr::from(network.wrapping_add(1)))
+    Ok((network, mask, pfx))
 }
 
-fn require_field<'a>(
-    value: Option<&'a String>,
-    field: &str,
-) -> Result<&'a str, OrchestratorError> {
+fn require_field<'a>(value: Option<&'a String>, field: &str) -> Result<&'a str, OrchestratorError> {
     value
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
@@ -3729,6 +3780,7 @@ fn resolve_egress_nat_config(eg: &EgressSection) -> Result<EgressNatConfig, Orch
         .into());
     }
     let lan_cidr = require_field(eg.lan_cidr.as_ref(), "egress.lan_cidr")?.to_string();
+    let (lan_network, lan_mask, lan_prefix) = parse_ipv4_cidr_network(&lan_cidr)?;
     let wan_iface = require_field(eg.wan_iface.as_ref(), "egress.wan_iface")?.to_string();
     let lan_iface = require_field(eg.lan_iface.as_ref(), "egress.lan_iface")?.to_string();
     let edge_ip = match eg
@@ -3740,8 +3792,14 @@ fn resolve_egress_nat_config(eg: &EgressSection) -> Result<EgressNatConfig, Orch
         Some(explicit) => explicit
             .parse()
             .map_err(|_| format!("invalid egress.edge_ip '{explicit}': bad IPv4 address"))?,
-        None => first_usable_ipv4(&lan_cidr)?,
+        None => first_usable_ipv4_from_network(&lan_cidr, lan_network, lan_prefix)?,
     };
+    if u32::from(edge_ip) & lan_mask != lan_network {
+        return Err(format!(
+            "invalid egress.edge_ip '{edge_ip}': not within egress.lan_cidr '{lan_cidr}'"
+        )
+        .into());
+    }
     Ok(EgressNatConfig {
         lan_cidr,
         edge_ip,
@@ -3810,14 +3868,13 @@ fn egress_conntrack_modprobe_content() -> String {
 }
 
 /// Self-contained `table inet fluxbee_egress` (spec §8.2, dedicated-table mode,
-/// Open Question #3). The `add`/`delete`/`table` preamble makes `nft -f` an
-/// atomic replace, so re-apply is idempotent and never duplicates rules.
+/// Open Question #3). Reconcile deletes an existing Fluxbee-owned table before
+/// applying this definition, so re-apply is idempotent and never duplicates
+/// rules.
 fn egress_nft_ruleset(cfg: &EgressNatConfig) -> String {
     format!(
         "#!/usr/sbin/nft -f\n\
          # BEGIN FLUXBEE EGRESS NAT\n\
-         add table {table}\n\
-         delete table {table}\n\
          table {table} {{\n\
          \tchain input {{\n\
          \t\ttype filter hook input priority 0; policy accept;\n\
@@ -3864,8 +3921,23 @@ fn apply_conntrack_live() {
 
 fn nft_table_loaded() -> bool {
     let mut cmd = Command::new("nft");
-    cmd.arg("list").arg("table").arg("inet").arg("fluxbee_egress");
+    cmd.arg("list")
+        .arg("table")
+        .arg("inet")
+        .arg("fluxbee_egress");
     run_cmd_output(cmd, "nft list table").is_ok()
+}
+
+fn delete_egress_nft_table_if_present() -> Result<(), OrchestratorError> {
+    if !nft_table_loaded() {
+        return Ok(());
+    }
+    let mut cmd = Command::new("nft");
+    cmd.arg("delete")
+        .arg("table")
+        .arg("inet")
+        .arg("fluxbee_egress");
+    run_cmd(cmd, "nft delete fluxbee-egress table")
 }
 
 /// Smoke-test that the egress path reaches the internet. Tries ICMP first
@@ -3875,7 +3947,11 @@ fn nft_table_loaded() -> bool {
 /// up" check — if the site responds, the deployment's cloud side is alive too.
 fn check_internet_reachable() -> bool {
     let mut ping = Command::new("ping");
-    ping.arg("-c").arg("1").arg("-W").arg("2").arg(EGRESS_PING_TARGET);
+    ping.arg("-c")
+        .arg("1")
+        .arg("-W")
+        .arg("2")
+        .arg(EGRESS_PING_TARGET);
     if run_cmd(ping, "ping egress target").is_ok() {
         return true;
     }
@@ -3912,7 +3988,10 @@ fn reconcile_egress_nat(eg: &EgressSection) -> Result<EgressVerification, Orches
     verification.ipv6_blocked = true;
 
     // conntrack tuning: live max + persisted file + modprobe hashsize (boot).
-    write_file_if_changed(EGRESS_CONNTRACK_SYSCTL_PATH, &egress_conntrack_sysctl_content())?;
+    write_file_if_changed(
+        EGRESS_CONNTRACK_SYSCTL_PATH,
+        &egress_conntrack_sysctl_content(),
+    )?;
     write_file_if_changed(
         EGRESS_CONNTRACK_MODPROBE_PATH,
         &egress_conntrack_modprobe_content(),
@@ -3920,9 +3999,11 @@ fn reconcile_egress_nat(eg: &EgressSection) -> Result<EgressVerification, Orches
     apply_conntrack_live();
     verification.conntrack_tuned = true;
 
-    // nftables: write the dedicated table and apply atomically, then verify.
+    // nftables: write the dedicated table, replace any existing Fluxbee table,
+    // then verify.
     let ruleset = egress_nft_ruleset(&cfg);
     write_file_if_changed(EGRESS_NFT_PATH, &ruleset)?;
+    delete_egress_nft_table_if_present()?;
     let mut apply = Command::new("nft");
     apply.arg("-f").arg(EGRESS_NFT_PATH);
     run_cmd(apply, "nft -f fluxbee-egress")?;
@@ -5025,6 +5106,9 @@ fn disable_blob_sync_runtime_local() -> Result<(), OrchestratorError> {
 }
 
 async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), OrchestratorError> {
+    if state.role == HiveRole::Egress {
+        return Ok(());
+    }
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
     let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
@@ -15001,7 +15085,8 @@ async fn add_hive_flow(
     let core_deploy_started = Instant::now();
     let local_core_hash = local_core_manifest_hash().ok().flatten();
     let remote_core_hash_before = remote_core_manifest_hash(address, &key_path).ok().flatten();
-    if let Err(err) = sync_core_to_worker(hive_id, address, &key_path, false, true, HiveRole::Worker)
+    if let Err(err) =
+        sync_core_to_worker(hive_id, address, &key_path, false, true, HiveRole::Worker)
     {
         let entry = DeploymentHistoryEntry {
             deployment_id: Uuid::new_v4().to_string(),
@@ -15115,15 +15200,15 @@ async fn add_hive_flow(
     let identity_sync_upstream = format_host_port(&worker_uplink_host, identity_sync_port);
     // Egress route injection (D2): if motherbee declares egress.gateway_ip, new
     // workers carry it in their yaml and reconcile the route locally each boot.
-    let worker_egress_yaml = match state
-        .egress
-        .as_ref()
-        .and_then(|e| e.gateway_ip.as_deref())
-        .map(str::trim)
-        .filter(|gw| !gw.is_empty())
-    {
-        Some(gateway_ip) => format!("egress:\n  gateway_ip: \"{gateway_ip}\"\n  ipv6: \"blocked\"\n"),
-        None => String::new(),
+    let worker_egress_yaml = match render_worker_egress_yaml(state.egress.as_ref()) {
+        Ok(value) => value,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "CONFIG_FAILED",
+                "message": format!("invalid motherbee egress config: {err}"),
+            });
+        }
     };
     let hive_yaml = format!(
         "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\ngovernment:\n  identity_frontdesk: \"{}\"\nidentity:\n  sync:\n    upstream: \"{}\"\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n{}{}",
@@ -15550,9 +15635,7 @@ async fn add_egress_hive_flow(
     restrict_ssh: bool,
     egress: EgressSection,
 ) -> serde_json::Value {
-    let err_payload = |code: &str, msg: String| {
-        serde_json::json!({ "status": "error", "error_code": code, "message": msg })
-    };
+    let err_payload = |code: &str, msg: String| serde_json::json!({ "status": "error", "error_code": code, "message": msg });
 
     // Validate inputs (mirrors the worker pre-bootstrap checks).
     let nat = match resolve_egress_nat_config(&egress) {
@@ -15577,7 +15660,10 @@ async fn add_egress_hive_flow(
     }
     let wan_listen = state.wan_listen.clone().unwrap_or_default();
     if wan_listen.is_empty() {
-        return err_payload("MISSING_WAN_LISTEN", "wan.listen missing in hive.yaml".to_string());
+        return err_payload(
+            "MISSING_WAN_LISTEN",
+            "wan.listen missing in hive.yaml".to_string(),
+        );
     }
     if !state.wan_authorized_hives.is_empty()
         && !state
@@ -15599,7 +15685,10 @@ async fn add_egress_hive_flow(
     if !key_path.exists() {
         return err_payload(
             "SSH_KEY_FAILED",
-            format!("motherbee ssh key missing (expected '{}')", key_path.display()),
+            format!(
+                "motherbee ssh key missing (expected '{}')",
+                key_path.display()
+            ),
         );
     }
     let pub_key = match public_key_from_private_key(&key_path) {
@@ -15610,12 +15699,17 @@ async fn add_egress_hive_flow(
     if ssh_with_pass_any(address, "true", BOOTSTRAP_SSH_USER).is_err() {
         password_channel_available = false;
         if let Err(key_err) = ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER) {
-            return ssh_bootstrap_error_payload(&format!("password and key probe failed: {key_err}"));
+            return ssh_bootstrap_error_payload(&format!(
+                "password and key probe failed: {key_err}"
+            ));
         }
     }
     if password_channel_available {
         if let Err(err) = apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key) {
-            return err_payload("SSH_KEY_FAILED", format!("failed to seed bootstrap key: {err}"));
+            return err_payload(
+                "SSH_KEY_FAILED",
+                format!("failed to seed bootstrap key: {err}"),
+            );
         }
     }
     if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(address, &key_path) {
@@ -15627,7 +15721,10 @@ async fn add_egress_hive_flow(
         "sudo -n /bin/bash -lc 'exit 0'",
         BOOTSTRAP_SSH_USER,
     ) {
-        return err_payload("SSH_KEY_FAILED", format!("key access verification failed: {err}"));
+        return err_payload(
+            "SSH_KEY_FAILED",
+            format!("key access verification failed: {err}"),
+        );
     }
 
     // Resolve the egress profile template from motherbee's own hive.yaml
@@ -15638,7 +15735,12 @@ async fn add_egress_hive_flow(
     };
     let local_hive = match load_hive(&state.config_dir) {
         Ok(h) => h,
-        Err(err) => return err_payload("CONFIG_FAILED", format!("failed to read local hive.yaml: {err}")),
+        Err(err) => {
+            return err_payload(
+                "CONFIG_FAILED",
+                format!("failed to read local hive.yaml: {err}"),
+            )
+        }
     };
     let egress_system_nodes = match system_nodes_for_role(&local_hive, HiveRole::Egress) {
         Ok(s) => s,
@@ -15675,23 +15777,42 @@ async fn add_egress_hive_flow(
         return err_payload("CORE_SYNC_FAILED", err.to_string());
     }
 
+    if let Err(err) = ssh_with_key(
+        address,
+        &key_path,
+        &sudo_wrap(
+            "mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers",
+        ),
+        BOOTSTRAP_SSH_USER,
+    ) {
+        return err_payload("CONFIG_FAILED", err.to_string());
+    }
+
     // Build and write the minimal egress hive.yaml.
     let worker_uplink = match resolve_worker_uplink_address(&wan_listen, address) {
         Ok(value) => value,
-        Err(err) => return err_payload("CONFIG_FAILED", format!("resolve egress uplink failed: {err}")),
+        Err(err) => {
+            return err_payload(
+                "CONFIG_FAILED",
+                format!("resolve egress uplink failed: {err}"),
+            )
+        }
     };
     let storage_path = state
         .storage_path
         .try_lock()
         .map(|guard| guard.clone())
         .unwrap_or_else(|_| {
-            json_router::paths::storage_root_dir().to_string_lossy().to_string()
+            json_router::paths::storage_root_dir()
+                .to_string_lossy()
+                .to_string()
         });
     let hive_yaml = format!(
-        "hive_id: {hive_id}\nrole: egress\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{uplink}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{storage}\"\negress:\n  enabled: true\n  lan_cidr: \"{lan_cidr}\"\n  edge_ip: \"{edge_ip}\"\n  wan_iface: \"{wan_iface}\"\n  lan_iface: \"{lan_iface}\"\n  ipv6: \"blocked\"\n{system_nodes}",
+        "hive_id: {hive_id}\nrole: egress\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{uplink}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  sync:\n    enabled: false\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: false\negress:\n  enabled: true\n  lan_cidr: \"{lan_cidr}\"\n  edge_ip: \"{edge_ip}\"\n  wan_iface: \"{wan_iface}\"\n  lan_iface: \"{lan_iface}\"\n  ipv6: \"blocked\"\n{system_nodes}",
         hive_id = hive_id,
         uplink = worker_uplink,
         storage = storage_path,
+        dist_path = state.dist.path.display(),
         lan_cidr = nat.lan_cidr,
         edge_ip = nat.edge_ip,
         wan_iface = nat.wan_iface,
@@ -15717,7 +15838,10 @@ async fn add_egress_hive_flow(
     // systemd units: rt-gateway + sy-orchestrator + the egress SY nodes.
     let mut units: Vec<(String, String)> = vec![
         ("rt-gateway".to_string(), "/usr/bin/rt-gateway".to_string()),
-        ("sy-orchestrator".to_string(), "/usr/bin/sy-orchestrator".to_string()),
+        (
+            "sy-orchestrator".to_string(),
+            "/usr/bin/sy-orchestrator".to_string(),
+        ),
     ];
     for node_name in &egress_system_nodes.nodes {
         let service = name_to_service(node_name);
@@ -15831,16 +15955,19 @@ async fn add_egress_hive_flow(
     }
 
     // SSH hardening (egress is a security boundary; same controls as worker).
-    let (restrict_ssh_applied, restrict_ssh_mode) =
-        match apply_add_hive_ssh_controls_after_finalize(
-            address, &key_path, &pub_key, restrict_ssh, harden_ssh,
-        ) {
-            Ok(c) => (c.restrict_ssh_applied, c.restrict_ssh_mode),
-            Err(err) => {
-                tracing::warn!(hive_id = hive_id, error = %err, "egress ssh hardening failed; continuing");
-                (false, "error".to_string())
-            }
-        };
+    let (restrict_ssh_applied, restrict_ssh_mode) = match apply_add_hive_ssh_controls_after_finalize(
+        address,
+        &key_path,
+        &pub_key,
+        restrict_ssh,
+        harden_ssh,
+    ) {
+        Ok(c) => (c.restrict_ssh_applied, c.restrict_ssh_mode),
+        Err(err) => {
+            tracing::warn!(hive_id = hive_id, error = %err, "egress ssh hardening failed; continuing");
+            (false, "error".to_string())
+        }
+    };
 
     append_single_deployment_history(
         state,
@@ -15966,10 +16093,9 @@ fn resolve_add_hive_role(payload: &serde_json::Value) -> Result<HiveRole, Orches
 fn resolve_add_hive_egress_section(
     payload: &serde_json::Value,
 ) -> Result<EgressSection, OrchestratorError> {
-    let eg = payload
-        .get("egress")
-        .and_then(|v| v.as_object())
-        .ok_or("add_hive role=egress requires an 'egress' object (lan_cidr, wan_iface, lan_iface)")?;
+    let eg = payload.get("egress").and_then(|v| v.as_object()).ok_or(
+        "add_hive role=egress requires an 'egress' object (lan_cidr, wan_iface, lan_iface)",
+    )?;
     let get_str = |key: &str| {
         eg.get(key)
             .and_then(|v| v.as_str())
@@ -17090,6 +17216,8 @@ mod tests {
             "192.168.8.1".parse::<std::net::Ipv4Addr>().unwrap()
         );
         assert!(first_usable_ipv4("192.168.8.0").is_err());
+        assert!(first_usable_ipv4("192.168.8.0/31").is_err());
+        assert!(first_usable_ipv4("192.168.8.1/32").is_err());
         assert!(first_usable_ipv4("192.168.8.0/33").is_err());
     }
 
@@ -17108,6 +17236,20 @@ mod tests {
         missing.lan_cidr = None;
         assert!(resolve_egress_nat_config(&missing).is_err());
 
+        let mut invalid_cidr_with_explicit_edge_ip = egress_section(true);
+        invalid_cidr_with_explicit_edge_ip.lan_cidr = Some("192.168.8.0/33".to_string());
+        invalid_cidr_with_explicit_edge_ip.edge_ip = Some("192.168.8.1".to_string());
+        assert!(resolve_egress_nat_config(&invalid_cidr_with_explicit_edge_ip).is_err());
+
+        let mut explicit_edge_ip_on_single_host_cidr = egress_section(true);
+        explicit_edge_ip_on_single_host_cidr.lan_cidr = Some("192.168.8.1/32".to_string());
+        explicit_edge_ip_on_single_host_cidr.edge_ip = Some("192.168.8.1".to_string());
+        assert!(resolve_egress_nat_config(&explicit_edge_ip_on_single_host_cidr).is_ok());
+
+        let mut edge_ip_outside_lan_cidr = egress_section(true);
+        edge_ip_outside_lan_cidr.edge_ip = Some("192.168.9.1".to_string());
+        assert!(resolve_egress_nat_config(&edge_ip_outside_lan_cidr).is_err());
+
         let mut bad_ipv6 = egress_section(true);
         bad_ipv6.ipv6 = "allowed".to_string();
         assert!(resolve_egress_nat_config(&bad_ipv6).is_err());
@@ -17118,12 +17260,32 @@ mod tests {
         let cfg = resolve_egress_nat_config(&egress_section(true)).unwrap();
         let a = egress_nft_ruleset(&cfg);
         let b = egress_nft_ruleset(&cfg);
-        assert_eq!(a, b, "ruleset must be deterministic for idempotent re-apply");
+        assert_eq!(
+            a, b,
+            "ruleset must be deterministic for idempotent re-apply"
+        );
         assert!(a.contains("table inet fluxbee_egress"));
-        assert!(a.contains("delete table inet fluxbee_egress"));
+        assert!(!a.contains("add table inet fluxbee_egress"));
+        assert!(!a.contains("delete table inet fluxbee_egress"));
         assert!(a.contains("ip saddr 192.168.8.0/24 oifname \"eth0\" masquerade"));
         assert!(a.contains("iifname \"eth1\" oifname \"eth0\" ip saddr 192.168.8.0/24 accept"));
         assert!(a.contains("meta nfproto ipv6 drop"));
+    }
+
+    #[test]
+    fn render_worker_egress_yaml_validates_gateway() {
+        let mut section = egress_section(false);
+        section.gateway_ip = Some("192.168.8.1".to_string());
+        let yaml = render_worker_egress_yaml(Some(&section)).unwrap();
+        assert!(yaml.contains("gateway_ip: \"192.168.8.1\""));
+        assert!(yaml.contains("ipv6: \"blocked\""));
+
+        section.gateway_ip = Some("not-an-ip".to_string());
+        assert!(render_worker_egress_yaml(Some(&section)).is_err());
+
+        section.gateway_ip = Some("192.168.8.1".to_string());
+        section.ipv6 = "allowed".to_string();
+        assert!(render_worker_egress_yaml(Some(&section)).is_err());
     }
 
     #[test]
