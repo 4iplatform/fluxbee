@@ -1303,14 +1303,22 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
                 .map(str::trim)
                 .filter(|g| !g.is_empty())
             {
-                let mut cmd = Command::new("ip");
-                cmd.arg("route")
-                    .arg("replace")
-                    .arg("default")
-                    .arg("via")
-                    .arg(gateway_ip);
-                if let Err(err) = run_cmd(cmd, "watchdog ip route replace default") {
-                    tracing::warn!(error = %err, "watchdog worker default-route re-apply failed");
+                // Only re-apply on drift: skip the subprocess when the default
+                // route already points at the gateway (the common case).
+                if !default_route_via(gateway_ip) {
+                    tracing::warn!(
+                        gateway_ip = gateway_ip,
+                        "worker default route drifted; re-applying"
+                    );
+                    let mut cmd = Command::new("ip");
+                    cmd.arg("route")
+                        .arg("replace")
+                        .arg("default")
+                        .arg("via")
+                        .arg(gateway_ip);
+                    if let Err(err) = run_cmd(cmd, "watchdog ip route replace default") {
+                        tracing::warn!(error = %err, "watchdog worker default-route re-apply failed");
+                    }
                 }
             }
         }
@@ -3781,6 +3789,15 @@ fn resolve_egress_nat_config(eg: &EgressSection) -> Result<EgressNatConfig, Orch
     }
     let lan_cidr = require_field(eg.lan_cidr.as_ref(), "egress.lan_cidr")?.to_string();
     let (lan_network, lan_mask, lan_prefix) = parse_ipv4_cidr_network(&lan_cidr)?;
+    // Reject absurdly broad LANs: a /0../7 would MASQUERADE far more than an
+    // internal LAN (e.g. 0.0.0.0/0 NATs every source, including the WAN side).
+    // /8 (10.0.0.0/8) is the broadest legitimate private LAN.
+    if lan_prefix < 8 {
+        return Err(format!(
+            "invalid egress.lan_cidr '{lan_cidr}': prefix /{lan_prefix} is too broad for a LAN (use /8 or narrower)"
+        )
+        .into());
+    }
     let wan_iface = require_field(eg.wan_iface.as_ref(), "egress.wan_iface")?.to_string();
     let lan_iface = require_field(eg.lan_iface.as_ref(), "egress.lan_iface")?.to_string();
     let edge_ip = match eg
@@ -3926,6 +3943,20 @@ fn nft_table_loaded() -> bool {
         .arg("inet")
         .arg("fluxbee_egress");
     run_cmd_output(cmd, "nft list table").is_ok()
+}
+
+/// Whether the current IPv4 default route already points at `gateway_ip`.
+/// Used by the watchdog to skip a no-op `ip route replace`. On any error
+/// reading the route table, returns false so the caller re-applies (safe).
+fn default_route_via(gateway_ip: &str) -> bool {
+    let mut cmd = Command::new("ip");
+    cmd.arg("-4").arg("route").arg("show").arg("default");
+    match run_cmd_output(cmd, "ip route show default") {
+        Ok(out) => out
+            .lines()
+            .any(|line| line.split_whitespace().any(|tok| tok == gateway_ip)),
+        Err(_) => false,
+    }
 }
 
 fn delete_egress_nft_table_if_present() -> Result<(), OrchestratorError> {
@@ -17253,6 +17284,23 @@ mod tests {
         let mut bad_ipv6 = egress_section(true);
         bad_ipv6.ipv6 = "allowed".to_string();
         assert!(resolve_egress_nat_config(&bad_ipv6).is_err());
+    }
+
+    #[test]
+    fn resolve_egress_nat_config_rejects_too_broad_lan() {
+        let mut catch_all = egress_section(true);
+        catch_all.lan_cidr = Some("0.0.0.0/0".to_string());
+        catch_all.edge_ip = Some("10.0.0.1".to_string());
+        assert!(resolve_egress_nat_config(&catch_all).is_err());
+
+        let mut p7 = egress_section(true);
+        p7.lan_cidr = Some("10.0.0.0/7".to_string());
+        assert!(resolve_egress_nat_config(&p7).is_err());
+
+        // /8 is the broadest legitimate LAN and must still be accepted.
+        let mut p8 = egress_section(true);
+        p8.lan_cidr = Some("10.0.0.0/8".to_string());
+        assert!(resolve_egress_nat_config(&p8).is_ok());
     }
 
     #[test]

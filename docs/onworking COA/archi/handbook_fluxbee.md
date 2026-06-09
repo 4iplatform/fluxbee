@@ -129,8 +129,11 @@ Resolve hive in this order:
 | Shared general-purpose node | `motherbee` |
 | Heavy compute or special hardware | `worker-*` |
 | Tenant isolation by host | dedicated `worker-*` |
+| LAN-only deployment needs outbound internet (LLM APIs, registries) | `egress` hive (NAT gateway) |
 
 If a worker hive does not exist yet, include topology/VPN creation in desired state. If it already exists, do not recreate topology.
+
+**Egress hives.** When internal hives have no internet access and need outbound HTTPS, provision a hive with `add_hive role=egress`. It runs a minimal profile (only `SY.config.routes` plus the implicit `RT.gateway`/`SY.orchestrator`) and applies OS-level NAT so internal hives can reach the internet through it. Egress provisioning requires host-specific params in the `add_hive` body under `egress` (`lan_cidr`, `wan_iface`, `lan_iface`; optional `edge_ip`/`ipv6`) — query `get_admin_action_help add_hive` for the field contract. If the deployment already has a physical router for internet, do **not** create an egress hive; instead workers receive the gateway route automatically once motherbee declares `egress.gateway_ip`.
 
 ---
 

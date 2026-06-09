@@ -83,12 +83,20 @@ Semántica:
   - `hive_id` (string): id único del hive a crear
   - `address` (string): dirección WAN o bootstrap accesible desde motherbee
 - **Campos opcionales:**
+  - `role` (string): rol a provisionar. Valores: `worker` (default), `egress`. Usar `egress` para levantar un host gateway NAT que da salida a internet a los hives internos.
+  - `egress` (object): requerido cuando `role=egress` (ignorado si no). Parámetros NAT específicos del host:
+    - `lan_cidr` (string, requerido): CIDR IPv4 de la LAN interna
+    - `wan_iface` (string, requerido): interfaz hacia internet
+    - `lan_iface` (string, requerido): interfaz hacia la LAN
+    - `edge_ip` (string, opcional): default = primera IP usable de `lan_cidr`
+    - `ipv6` (string, opcional): solo `"blocked"`
   - `harden_ssh` (bool): habilitar hardening SSH tras bootstrap
   - `restrict_ssh` (bool): restringir acceso SSH tras provisioning
-  - `require_dist_sync` (bool): requerir dist sync antes de éxito
+  - `require_dist_sync` (bool): requerir dist sync antes de éxito (ignorado para `role=egress`)
   - `dist_sync_probe_timeout_secs` (u64): timeout para probe de dist sync
 - **Nota:** Solo motherbee
-- **Ejemplo:** `POST /hives {"hive_id":"worker-220","address":"192.168.8.220"}`
+- **Ejemplo (worker):** `POST /hives {"hive_id":"worker-220","address":"192.168.8.220"}`
+- **Ejemplo (egress):** `POST /hives {"hive_id":"edge-1","address":"10.10.0.1","role":"egress","egress":{"lan_cidr":"10.10.0.0/24","wan_iface":"ens3","lan_iface":"ens4"}}`
 
 ### `remove_hive`
 - **Path:** `DELETE /hives/{hive}`

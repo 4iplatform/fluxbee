@@ -518,6 +518,28 @@ SCMD: curl -X POST /hives -d '{"hive_id":"worker-220-other","address":"192.168.8
   - luego `GET /hives/worker-220-other`
   - luego `GET /hives`
 
+[ ] `add_hive` (role=egress)
+
+- curl:
+```bash
+curl -sS -X POST "$BASE/hives" \
+  -H 'Content-Type: application/json' \
+  -d "{\"hive_id\":\"$TEST_EGRESS_HIVE\",\"address\":\"$TEST_EGRESS_ADDR\",\"role\":\"egress\",\"egress\":{\"lan_cidr\":\"$TEST_EGRESS_CIDR\",\"wan_iface\":\"$TEST_WAN_IFACE\",\"lan_iface\":\"$TEST_LAN_IFACE\"}}"
+```
+- SCMD:
+```text
+SCMD: curl -X POST /hives -d '{"hive_id":"edge-1","address":"10.10.0.1","role":"egress","egress":{"lan_cidr":"10.10.0.0/24","wan_iface":"ens3","lan_iface":"ens4"}}'
+```
+- params requeridos en `egress`: `lan_cidr`, `wan_iface`, `lan_iface` (host-specific). Opcionales: `edge_ip` (default = primera IP usable de `lan_cidr`), `ipv6` (solo `blocked`).
+- check (lo que el executor puede verificar vía admin):
+  - la respuesta debe traer `status:"ok"`, `egress_role:"egress"`, `egress_nat_applied:true`, `wan_connected:true`, `orchestrator_connected:true`. Si el NAT falla en el host, el orchestrator no llega a "active" y la respuesta es `SERVICE_FAILED` (no "ok").
+  - luego `GET /hives/edge-1` → debe existir con role egress.
+- check (verificación profunda en el host egress, fuera del path admin — para e2e/manual):
+  - `nft list table inet fluxbee_egress` muestra las chains forward/postrouting
+  - `sysctl net.ipv4.ip_forward` = 1
+  - journal de `sy-orchestrator` en el host: `ipv6_blocked`/`internet_reachable`
+- errores esperados (validación): falta `egress` u objeto incompleto → `INVALID_REQUEST`; `edge_ip` fuera del `lan_cidr` → `INVALID_REQUEST`.
+
 [ ] `remove_hive`
 
 - curl:

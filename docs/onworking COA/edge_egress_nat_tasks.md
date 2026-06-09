@@ -147,6 +147,23 @@ La chain `forward` de T-NET-3 se estructura para que allow-list y logging insert
 - [x] **CR-3** Forward `policy drop` en tabla dedicada — **se deja como está**. El nodo egress es infra dedicada (no hace otro forwarding), así que el invariante "host dedicado" lo cubre; no se agrega chequeo de coexistencia.
 - [x] **CR-4** `check_internet_reachable`: ping ICMP **+ fallback GET HTTPS** a `https://fluxbee.ai`. Elimina el falso negativo (redes que filtran ICMP pero permiten 443) y doble propósito: si el website responde, la infra/fluxbee cloud está viva.
 
+### Segunda ronda de code-review (post fixes del dev + integración archi)
+
+- [x] **CR2-2** Piso de prefijo en `resolve_egress_nat_config`: rechaza `lan_cidr` con prefijo `< 8` (cubre el footgun `0.0.0.0/0` → masquerade de todo saddr) permitiendo `10.0.0.0/8`. Test `resolve_egress_nat_config_rejects_too_broad_lan`.
+- [x] **CR2-4** `default_route_via()`: el watchdog worker chequea la ruta antes de `ip route replace` y sólo re-aplica en drift (evita spawnear un subproceso cada 5s).
+- [ ] **CR2-1** (re-apply nft no-atómico en restart) — se deja; inherente al approach delete+apply del dev, ventana de ms sólo en restart.
+- [ ] **CR2-3** (yaml egress omite government/identity que el worker incluye) — es la Open Question #1; se confirma en box real.
+
+## 10.6) Integración con SY.architect / SY.admin (paridad con worker)
+
+El gap: el architect invoca `add_hive` con un **tool schema estricto** (`additionalProperties:false`) que sólo declaraba `harden_ssh/restrict_ssh/require_dist_sync/dist_sync_probe_timeout_secs` → el modelo **no podía emitir** `role`/`egress`, dejando el egress inalcanzable vía archi.
+
+- [x] **AR-1** Código `admin_action_body_optional_fields("add_hive")` (sy_admin.rs): agregados `role` (string: worker|egress) y `egress` (object). Esto los mete en el tool schema **y** en el help de runtime (`get_admin_action_help` usa la misma lista). Sigue el precedente de campos-objeto (`source`/`settings`). 75 tests sy_admin verdes (incl. `..._uses_strict_runtime_contract`).
+- [x] **AR-2** `admin_help_reference.md`: entrada `add_hive` documenta role + egress + ejemplo egress (valores distintos a los de tests: 10.10.0.0/24, ens3/ens4 — evita la trampa cognitiva).
+- [x] **AR-3** `handbook_fluxbee.md` §3.2: guía de cuándo provisionar egress (LAN-only que necesita salida) + puntero a `get_admin_action_help add_hive` para el contrato de campos + nota de Mode B (router físico vía `egress.gateway_ip`).
+- [x] **AR-4** `sy-architect-admin-command-test-matrix.md` §5.1: caso `add_hive role=egress` con curl + SCMD + **verificación del executor** (status:ok, egress_nat_applied:true, wan/orchestrator connected; `GET /hives/<id>`) + verificación profunda en host (nft/sysctl/journal) + errores esperados de validación.
+- [ ] **AR-5** e2e shell scripts (`scripts/admin_add_hive_matrix.sh`, `orchestrator_add_hive_hardening_e2e.sh`): caso egress — **requiere box real con 2 NICs + nft**, queda con los tests de integración §9.
+
 ## 11) Open questions a cerrar durante implementación
 
 1. **Piso del perfil egress** (Open Question #1): confirmar que el router local bootea limpio con sólo `SY.config.routes` (+ `RT.gateway`/`SY.orchestrator` implícitos). Si necesita otro SY node para registrarse, agregarlo y actualizar spec §5.1.

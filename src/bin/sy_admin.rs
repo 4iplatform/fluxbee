@@ -7656,6 +7656,16 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
         ],
         "add_hive" => vec![
             admin_action_body_field(
+                "role",
+                "string",
+                "Hive role to provision. Accepted values: worker (default), egress. Use egress to stand up a NAT gateway host that gives internal hives outbound internet access.",
+            ),
+            admin_action_body_field(
+                "egress",
+                "object",
+                "Required when role=egress (ignored otherwise). Host-specific NAT parameters: lan_cidr (IPv4 CIDR of the internal LAN, required), wan_iface (internet-facing interface name, required), lan_iface (LAN-facing interface name, required), edge_ip (optional, defaults to the first usable IP of lan_cidr), ipv6 (optional, only \"blocked\" is supported).",
+            ),
+            admin_action_body_field(
                 "harden_ssh",
                 "bool",
                 "Enable SSH hardening after bootstrap.",
@@ -7668,7 +7678,7 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "require_dist_sync",
                 "bool",
-                "Require dist sync readiness before success.",
+                "Require dist sync readiness before success. Ignored for role=egress (egress hives do not run dist sync).",
             ),
             admin_action_body_field(
                 "dist_sync_probe_timeout_secs",
