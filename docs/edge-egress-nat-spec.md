@@ -305,6 +305,17 @@ All other call sites that pass `is_motherbee` into `system_nodes_for_role` / `va
 `add_hive_flow` (line 14061) generates the worker `hive.yaml` via a `format!` with `role: worker` hardcoded (line 14580–14581). For `role: egress`, generate a distinct yaml that includes `role: egress` and the `egress` section. Two sub-cases:
 
 1. **Provisioning an egress hive** (`add_hive` with `role=egress`): emit a yaml with `role: egress`, the `egress` block (with `lan_cidr`, `edge_ip`, `wan_iface`, `lan_iface`, `ipv6`), and `system_nodes.egress`.
+
+   **Source of the egress params (added v1.0):** the host-specific NAT params (`lan_cidr`, `wan_iface`, `lan_iface`, optional `edge_ip`/`ipv6`) come from the **`add_hive` command payload**, under an `egress` object. They cannot come from motherbee's `hive.yaml`: interface names are host-specific and unknowable in advance. Motherbee validates them at request time (reusing `resolve_egress_nat_config`) and derives `edge_ip` when omitted. This contrasts with the worker-side `egress.gateway_ip`, which **is** declared once in motherbee's `hive.yaml` (§5.2) because it is global to the deployment. Example payload:
+
+   ```json
+   {
+     "hive_id": "edge-1", "address": "192.168.8.1", "role": "egress",
+     "egress": { "lan_cidr": "192.168.8.0/24", "wan_iface": "eth0", "lan_iface": "eth1" }
+   }
+   ```
+
+   **Source of `system_nodes.egress`:** read from motherbee's own `hive.yaml` `system_nodes.egress` template — symmetric with how `system_nodes.worker` is the worker template. Motherbee must declare a `system_nodes.egress` stanza (minimal: `SY.config.routes`). The egress flow is a **dedicated** function (`add_egress_hive_flow`) that reuses the SSH/core-sync/systemd helpers but skips all worker machinery (blob/dist/identity/syncthing).
 2. **Provisioning a worker when motherbee declares egress**: the existing worker yaml generation, plus `egress.gateway_ip` injected **into the worker yaml**. The worker's own orchestrator applies and reconciles the default route + IPv6 block locally on each boot (§7). The route is not pushed over SSH.
 
 `render_worker_system_nodes_yaml` (line 3030) hardcodes `worker:` in the emitted section header. Parameterize it to emit the correct role key:
@@ -488,7 +499,7 @@ For a worker receiving the route:
 }
 ```
 
-`egress_internet_reachable` is obtained by an ICMP ping to `fluxbee.ai` from the host, confirming the egress path reaches the internet end to end. (Public-IP discovery via an IP-echo endpoint is deferred to a later, fuller verification once the complete system is in place.) If IPv4 works but IPv6 is not blocked, the result warns or fails per mode.
+`egress_internet_reachable` is obtained by an ICMP ping to `fluxbee.ai`, with a fallback HTTPS `GET https://fluxbee.ai` when ICMP fails. The HTTPS leg avoids the false-negative where a network filters ICMP but allows 443 (the path egress actually uses), and doubles as a liveness check of the Fluxbee site/cloud. (Public-IP discovery via an IP-echo endpoint is deferred to a later, fuller verification once the complete system is in place.) If IPv4 works but IPv6 is not blocked, the result warns or fails per mode.
 
 ---
 

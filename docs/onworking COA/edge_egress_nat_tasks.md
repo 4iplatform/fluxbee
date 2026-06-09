@@ -54,15 +54,17 @@ Estas dos decisiones divergen del spec v1.0 y son la fuente de verdad para este 
 
 Cambios de bajo riesgo, cross-cutting en el binario único.
 
-- [ ] **T-ROLE-1** `is_egress_role()` junto a `is_mother_role`/`is_worker_role` (cerca de 16106).
-- [ ] **T-ROLE-2** Aceptar `egress` en el gate de arranque (503–512). Mensaje: `role=motherbee|worker|egress`. Mantener el chequeo de `hive_id == PRIMARY_HIVE_ID` sólo para motherbee; egress es un hive normal (no primary).
-- [ ] **T-ROLE-3** `EgressSection` struct + campo `egress: Option<EgressSection>` en `HiveFile` (132). Campos: `enabled`, `lan_cidr`, `edge_ip`, `wan_iface`, `lan_iface`, `ipv6` (default `"blocked"`), `gateway_ip`, `edge_hive`.
-- [ ] **T-ROLE-4** `enum HiveRole { Motherbee, Worker, Egress }` + `impl HiveRole { fn as_str(&self) -> &'static str }`. (Cierra F6.)
-- [ ] **T-ROLE-5** Refactor `system_nodes_for_role(&HiveFile, HiveRole)` (2887) desde `is_motherbee: bool`. Actualizar **todos** los call-sites: 542, 2169, **13069**, **14444** (estos dos pasan `false` literal hoy → `HiveRole::Worker`). (Cierra F5.)
-- [ ] **T-ROLE-6** `SystemNodesSection.egress: Option<RoleSystemNodes>` (146).
-- [ ] **T-ROLE-7** `validate_system_nodes` role-aware (2910): mantener invariante "`SY.config.routes` debe ir primero" para todos los roles; saltar chequeos de vault para no-motherbee; extender el chequeo "no debe correr `sy-vault`" de `!is_motherbee` a `role != Motherbee` (2989) — egress tampoco corre vault.
-- [ ] **T-ROLE-8** Parametrizar el render de system_nodes yaml para emitir la clave de rol correcta. El spec sugiere `render_system_nodes_yaml(role, section)` unificada; renombrar/generalizar el actual `render_worker_system_nodes_yaml` (3030) en lugar de duplicar por rol.
-- [ ] **T-ROLE-9** Generación del `hive.yaml` egress en `add_hive_flow` (14580): emitir `role: egress` + bloque `egress` (`lan_cidr`, `edge_ip`, `wan_iface`, `lan_iface`, `ipv6`) + `system_nodes.egress`. Distinto del `format!` de worker hardcodeado actual.
+- [x] **T-ROLE-1** `is_egress_role()` junto a `is_mother_role`/`is_worker_role`. ✓
+- [x] **T-ROLE-2** Aceptar `egress` en el gate de arranque. Mensaje `role=motherbee|worker|egress`; chequeo `hive_id == PRIMARY_HIVE_ID` extendido a `!is_motherbee` (egress tampoco puede ser primary). ✓
+- [x] **T-ROLE-3** `EgressSection` struct + `egress: Option<EgressSection>` en `HiveFile`. Campos completos + `default_ipv6_policy()`. ✓ *(campos se consumen en §5; warning dead-code esperado hasta Fase B)*
+- [x] **T-ROLE-4** `enum HiveRole { Motherbee, Worker, Egress }` + `from_role()` + `as_str()`. Campo `role: HiveRole` agregado a `OrchestratorState` (resuelto una vez en startup). (Cierra F6.) ✓
+- [x] **T-ROLE-5** `system_nodes_for_role(&HiveFile, HiveRole)`. Call-sites actualizados: startup, `restart_local_core_services` (resuelve rol del hive), `worker_core_component_names` (→ Worker, push de provisioning), `add_hive_flow` worker yaml (→ Worker). Además se hicieron role-aware `core_component_names_for_role`/`core_bin_paths_for_role`/`compute_local_core_update_sets` (self-management usa `state.role`) y se factoró `core_component_names_from_section`. (Cierra F5.) ✓
+- [x] **T-ROLE-6** `SystemNodesSection.egress: Option<RoleSystemNodes>`. ✓
+- [x] **T-ROLE-7** `validate_system_nodes(section, HiveRole)`: invariante `SY.config.routes` primero para todos los roles; vault-checks sólo motherbee; "no `sy-vault`" extendido a `role != Motherbee`; mensajes usan `role.as_str()`. ✓
+- [x] **T-ROLE-8** `render_system_nodes_yaml(role, section)` parametrizada (reemplaza `render_worker_system_nodes_yaml`). ✓
+- [x] **T-ROLE-9** Provisioning remoto del hive egress: función **dedicada** `add_egress_hive_flow` (no ramifica la worker, que tiene 133 touchpoints worker-específicos). Reusa los helpers de bootstrap SSH / sudoers / `sync_core_to_worker` (ahora con param `role`) / `write_remote_file` / systemd / `wait_for_wan` / `write_hive_info` / `apply_add_hive_ssh_controls_after_finalize`. Emite yaml `role: egress` + bloque egress (con `edge_ip` derivado) + `system_nodes.egress` (template de motherbee). Params host-specific desde el payload de `add_hive` (`resolve_add_hive_role` + `resolve_add_hive_egress_section`). ✓
+
+> **Estado:** Fase A + provisioning egress completos y compilando; `cargo test --bin sy_orchestrator` → **98 ok** (8 egress: derivación edge_ip, validación config, ruleset determinista, egress rechaza vault / acepta routes-only, parseo de role y de egress payload). Un hive `role: egress` se reconoce, arranca con su perfil, auto-gestiona componentes; y `add_hive role=egress` lo provisiona remotamente.
 
 ---
 
@@ -70,40 +72,42 @@ Cambios de bajo riesgo, cross-cutting en el binario único.
 
 Greenfield (F1). Corre **localmente** en el host egress, gated por `is_egress && egress.enabled`, siguiendo el patrón idempotente de bloque marcado de los helpers `_local` existentes pero contra **nftables**.
 
-- [ ] **T-NET-1** Detección de backend: `command_exists("nft")`. Si falta nft en un host egress → fail-loud (no fallback silencioso a ufw/iptables).
-- [ ] **T-NET-2** Writer sysctl `/etc/sysctl.d/99-fluxbee-egress.conf` (bloque `# BEGIN/END FLUXBEE EGRESS`) + `sysctl --system`. IPv4 forward on; IPv6 fully off (forwarding off, disable_ipv6, accept_ra=0).
-- [ ] **T-NET-3** Writer nftables: tabla dedicada `table inet fluxbee_egress` (auto-contenida, recomendada en Open Question #3) con chains `forward` (policy drop; ct established/related accept; LAN→WAN accept; `meta nfproto ipv6 drop`) y `postrouting` (masquerade LAN out wan_iface). Sustituir `lan_cidr`/`lan_iface`/`wan_iface` desde la `EgressSection`. Bloque marcado idempotente.
-- [ ] **T-NET-4** **(D1)** En hosts egress, migrar las reglas **inbound** (WAN/identity ports que hoy van por `open_firewall_rules_local`/ufw) a nftables dentro de la misma tabla/política. Sólo para `role: egress`; motherbee/worker siguen igual. Definir cómo se ramifica el código de firewall por rol sin tocar el camino ufw existente.
-- [ ] **T-NET-5** conntrack: `nf_conntrack_max` por sysctl (live) + `modprobe.d` `hashsize=` (next-boot). Reportar estado live vs pending-reboot (F3).
-- [ ] **T-NET-6** Aplicar nft (`nft -f`) + **verificar** que el ruleset quedó cargado (`nft list table inet fluxbee_egress`), no asumir éxito.
-- [ ] **T-NET-7** Bloqueo IPv6 en workers (sysctl disable_ipv6 + accept_ra=0, **sin** las líneas de forwarding/NAT). Aplicado localmente por el orchestrator del worker (D2). Seguro: ningún servicio bindea `::1`/`[::]` (F2 verificado). Camino `EGRESS_IPV6_UNMANAGED` si no se puede aplicar.
-- [ ] **T-NET-8** Idempotencia: re-aplicar nft/sysctl no produce drift (bloques marcados reemplazados en sitio, no apilados).
+- [x] **T-NET-1** `command_exists("nft")` en `reconcile_egress_nat`; fail-loud si falta (sin fallback). ✓
+- [x] **T-NET-2** Writer `egress_sysctl_content()` → `/etc/sysctl.d/99-fluxbee-egress.conf` + `apply_sysctl_system()`. IPv4 forward on; IPv6 fully off. ✓
+- [x] **T-NET-3** `egress_nft_ruleset()` → tabla dedicada `inet fluxbee_egress` con chains `input` (D1 hook, policy accept), `forward` (drop; ct est/rel; LAN→WAN; `meta nfproto ipv6 drop`) y `postrouting` (masquerade). Sustitución desde `EgressNatConfig`. Preamble `add`/`delete`/`table` para reemplazo atómico. ✓
+- [x] **T-NET-4** **(D1)** `ensure_core_firewall_local` hace early-return en `role=egress` (no usa ufw). Inbound queda como base chain `input` en la tabla fluxbee (policy accept en v1). *Nota: el filtrado inbound real (drop + allows explícitos) se difiere a §11 para no arriesgar lockout en la box de testing; D1 se cumple en cuanto a "nft es el único backend, ufw no se invoca".* ✓
+- [x] **T-NET-5** conntrack: `apply_conntrack_live()` (sysctl -w tolerante) + `/etc/sysctl.d/99-fluxbee-conntrack.conf` + `/etc/modprobe.d/fluxbee-conntrack.conf` (hashsize, next-boot). ✓
+- [x] **T-NET-6** `nft -f` + `nft_table_loaded()` verifica que la tabla quedó cargada; error si no. ✓
+- [x] **T-NET-7** `worker_ipv6_sysctl_content()` (disable_ipv6 + accept_ra=0, sin forwarding) aplicado en `reconcile_worker_egress`. Camino `EGRESS_IPV6_UNMANAGED` si `ipv6 != "blocked"`. ✓
+- [x] **T-NET-8** Idempotencia: `write_file_if_changed` (compare-and-write, archivos dedicados) + preamble nft atómico. Test `egress_nft_ruleset_is_deterministic_*`. ✓
 
 ---
 
 ## 6) Config / derivación
 
-- [ ] **T-CFG-1** Validación de `EgressSection` cuando `enabled`: `lan_cidr`, `wan_iface`, `lan_iface` requeridos en hive egress; `ipv6` sólo acepta `"blocked"` en v1 (rechazar otros valores fail-loud).
-- [ ] **T-CFG-2** Sección `egress` en `hive.yaml` de motherbee: `gateway_ip` (requerido para habilitar inyección) + `edge_hive` (informativo). Si `gateway_ip` ausente → `add_hive` no inyecta ruta.
-- [ ] **T-CFG-3** Derivación `edge_ip` = primera IP usable de `lan_cidr` si ausente: `(network & mask) + 1` con bit-math `Ipv4Addr ↔ u32` de `std::net`, válido para cualquier máscara, **sin crate** (F4 cerrado).
+- [x] **T-CFG-1** `resolve_egress_nat_config`: `lan_cidr`/`wan_iface`/`lan_iface` requeridos; `ipv6` sólo `"blocked"` (fail-loud). Test `resolve_egress_nat_config_requires_fields_and_blocks_ipv6`. ✓
+- [x] **T-CFG-2** Sección `egress` en `hive.yaml` de motherbee (`gateway_ip` + `edge_hive`): deserializa a `state.egress` y la inyección en `add_hive_flow` ya la consume (T-WRK-1). ✓
+- [x] **T-CFG-3** `first_usable_ipv4()` con bit-math std, cualquier máscara, sin crate. Test `first_usable_ipv4_handles_any_mask`. ✓
 
 ---
 
 ## 7) Worker route injection (D2)
 
-- [ ] **T-WRK-1** `add_hive_flow` para `role=worker`: cuando motherbee tiene `egress.gateway_ip`, inyectar el campo `egress.gateway_ip` en el `hive.yaml` generado para el worker. **No** ejecutar `ip route` por SSH.
-- [ ] **T-WRK-2** Orchestrator del worker: al arrancar/reconciliar, si `egress.gateway_ip` presente, aplicar localmente la ruta IPv4 por defecto al gateway (persistente/reaplicada cada boot) + bloqueo IPv6 (T-NET-7).
-- [ ] **T-WRK-3** Verificar salida HTTPS a través del gateway y emitir verification payload del worker (§9) desde el propio worker.
-- [ ] **T-WRK-4** Mode B: workers reciben `gateway_ip` apuntando al router físico, sin que exista ningún hive egress. Mismo camino que T-WRK-1/2 (el origen del gateway es transparente).
+- [x] **T-WRK-1** `add_hive_flow` para `role=worker`: inyecta `egress:\n  gateway_ip: ...\n  ipv6: "blocked"` en el yaml generado, tomado de `state.egress.gateway_ip` (la declaración de motherbee). ✓ **→ Mode B end-to-end completo.**
+- [x] **T-WRK-2** `reconcile_worker_egress` (vía `reconcile_egress` en `bootstrap_local`): si `egress.gateway_ip` presente, `ip route replace default via <gw>` (idempotente, reaplicada cada boot) + bloqueo IPv6. ✓
+- [~] **T-WRK-3** Verificación local hecha (`ping_internet` + tracing). Falta emitir el **JSON payload** del worker hacia motherbee (va con provisioning, §8).
+- [~] **T-WRK-4** Mode B: el código no distingue origen del gateway (transparente) → funciona en cuanto T-WRK-1 inyecte `gateway_ip`. Pendiente sólo de T-WRK-1.
 
 ---
 
 ## 8) Verification (no silent success)
 
-- [ ] **T-VER-1** Payload de hive egress: `egress_role`, `egress_nat_applied`, `egress_ipv4_forwarding`, `egress_ipv6_blocked`, `egress_conntrack_tuned` (live|pending-reboot), `egress_wan_iface`, `egress_lan_iface`, `egress_internet_reachable`.
-- [ ] **T-VER-2** **(decidido)** v1: `egress_internet_reachable` = **ping ICMP a `fluxbee.ai`** desde el host. Sólo confirma "hay internet por el path", no descubre IP público. El `egress_public_ip` vía IP-echo HTTPS queda diferido al sistema completo (verificación más compleja).
-- [ ] **T-VER-3** Payload de worker: `egress_configured`, `egress_gateway_ip`, `egress_ipv4_ready`, `egress_ipv6_blocked`, `egress_internet_reachable` (ping a `fluxbee.ai` a través del gateway).
-- [ ] **T-VER-4** Si IPv4 funciona pero IPv6 no quedó bloqueado → warn o fail según modo de deployment. No éxito parcial silencioso.
+- [x] **T-VER-1** Respuesta JSON de `add_hive role=egress` incluye `egress_role`, `egress_lan_cidr`, `egress_edge_ip`, `egress_wan_iface`, `egress_lan_iface`, `wan_connected`, `orchestrator_connected`. Los campos de NAT en sí (`nat_applied`/`ipv6_blocked`/`internet_reachable`) los computa y loguea el orchestrator **del host egress** al bootear (no viajan a motherbee en v1; quedan en su journal). El payload lo dice explícitamente en `note`. ✓
+- [x] **T-VER-2** **(decidido)** `ping_internet()` = ping ICMP a `fluxbee.ai` (`-c 1 -W 2`). IP-echo/IP público diferido. ✓
+- [~] **T-VER-3** Worker: `route_applied` + `internet_reachable` capturados y logueados. Falta el JSON hacia motherbee (provisioning).
+- [x] **T-VER-4** Si `ipv6 != "blocked"` → `EGRESS_IPV6_UNMANAGED` warn; el ping confirma IPv4 por separado. ✓
+
+> **Estado Fase B:** reconciliación **local** completa y testeada (`cargo test --bin sy_orchestrator` → 96 ok, 6 nuevos egress). Un hive `role: egress` aplica sysctl+nft+conntrack y un worker con `gateway_ip` aplica ruta+IPv6 en cada boot. Lo que falta es todo el lado **provisioning/remoto**: emitir el yaml egress y `gateway_ip` desde `add_hive` (T-ROLE-9, T-WRK-1, T-CFG-2), serializar los payloads de verificación a la respuesta JSON, y el binary-sync al host egress. Más los tests de integración §9 sobre máquina real (requieren box con `nft`/2 NICs).
 
 ---
 
@@ -133,6 +137,15 @@ Del §11 del spec — no implementar en esta tanda, sólo reservar hooks:
 La chain `forward` de T-NET-3 se estructura para que allow-list y logging inserten sin reestructurar.
 
 ---
+
+## 10.5) Fixes post code-review (high effort)
+
+- [x] **CR-1** `reconcile_egress` fatal en bootstrap para `role: egress` (NAT es su razón de ser; falla ⇒ orchestrator no "active" ⇒ `add_hive` reporta `SERVICE_FAILED`, no "ok" silencioso). Worker = warn no-fatal.
+- [x] **CR-2** `add_egress_hive_flow` early-return (`WAN_TIMEOUT`/`ORCHESTRATOR_TIMEOUT`) antes de endurecer SSH, simétrico con worker.
+- [x] **CR-5** `watchdog_egress_reconcile` (tick 5s): egress re-aplica NAT sólo si la tabla nft desapareció; worker re-aplica `ip route replace` idempotente. Cierra el gap §6.5 "on startup **and on reconcile**".
+- [x] **CR-6** `resolve_add_hive_role` rechaza `role` no-string en vez de defaultear a worker.
+- [x] **CR-3** Forward `policy drop` en tabla dedicada — **se deja como está**. El nodo egress es infra dedicada (no hace otro forwarding), así que el invariante "host dedicado" lo cubre; no se agrega chequeo de coexistencia.
+- [x] **CR-4** `check_internet_reachable`: ping ICMP **+ fallback GET HTTPS** a `https://fluxbee.ai`. Elimina el falso negativo (redes que filtran ICMP pero permiten 443) y doble propósito: si el website responde, la infra/fluxbee cloud está viva.
 
 ## 11) Open questions a cerrar durante implementación
 
