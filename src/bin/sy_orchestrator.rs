@@ -56,8 +56,6 @@ use json_router::{
 
 type OrchestratorError = Box<dyn std::error::Error + Send + Sync>;
 
-const BOOTSTRAP_SSH_USER: &str = "administrator";
-const BOOTSTRAP_SSH_PASS: &str = "magicAI";
 const MOTHERBEE_SSH_KEY_PATH: &str = "/var/lib/fluxbee/ssh/motherbee.key";
 const PRIMARY_HIVE_ID: &str = "motherbee";
 const ORCH_SUDOERS_PATH: &str = "/etc/sudoers.d/fluxbee-orchestrator";
@@ -723,8 +721,12 @@ async fn main() -> Result<(), OrchestratorError> {
                     let watchdog_state = Arc::clone(&state);
                     let watchdog_flag = Arc::clone(&watchdog_running);
                     tokio::spawn(async move {
+                        // Guard resets the running flag on drop, which happens on
+                        // both normal completion and panic unwinding. The previous
+                        // post-await store was skipped by a panic, leaving the flag
+                        // stuck at true and self-healing silently disabled (F14).
+                        let _guard = WatchdogRunGuard(watchdog_flag);
                         watchdog_tick(&watchdog_state).await;
-                        watchdog_flag.store(false, Ordering::SeqCst);
                     });
                 } else {
                     tracing::debug!("skipping watchdog tick while previous run still active");
@@ -1212,6 +1214,17 @@ async fn wait_for_sy_nodes(
     }
 }
 
+/// Resets the `watchdog_running` flag on drop so a panic inside `watchdog_tick`
+/// cannot leave the watchdog permanently disabled. Drop runs on both normal
+/// completion and unwinding, unlike a plain post-await store (F14).
+struct WatchdogRunGuard(Arc<AtomicBool>);
+
+impl Drop for WatchdogRunGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 async fn watchdog_tick(state: &OrchestratorState) {
     if !systemd_is_active("rt-gateway") {
         tracing::warn!(
@@ -1594,16 +1607,44 @@ async fn handle_admin(
                 let require_dist_sync = resolve_add_hive_require_dist_sync(&msg.payload);
                 let dist_sync_probe_timeout_secs =
                     resolve_add_hive_dist_sync_probe_timeout_secs(&msg.payload);
-                match resolve_add_hive_role(&msg.payload) {
-                    Ok(HiveRole::Egress) => match resolve_add_hive_egress_section(&msg.payload) {
-                        Ok(egress) => {
-                            add_egress_hive_flow(
+                // SSH bootstrap login flows from the caller-supplied payload; the
+                // password is optional (key-first probe, see add_*_hive_flow).
+                match resolve_add_hive_ssh_creds(&msg.payload) {
+                    Err(err) => serde_json::json!({
+                        "status": "error",
+                        "error_code": "INVALID_REQUEST",
+                        "message": err.to_string(),
+                    }),
+                    Ok(creds) => match resolve_add_hive_role(&msg.payload) {
+                        Ok(HiveRole::Egress) => match resolve_add_hive_egress_section(&msg.payload) {
+                            Ok(egress) => {
+                                add_egress_hive_flow(
+                                    state,
+                                    &hive_id,
+                                    &address,
+                                    harden_ssh,
+                                    restrict_ssh,
+                                    egress,
+                                    &creds,
+                                )
+                                .await
+                            }
+                            Err(err) => serde_json::json!({
+                                "status": "error",
+                                "error_code": "INVALID_REQUEST",
+                                "message": err.to_string(),
+                            }),
+                        },
+                        Ok(_) => {
+                            add_hive_flow(
                                 state,
                                 &hive_id,
                                 &address,
                                 harden_ssh,
                                 restrict_ssh,
-                                egress,
+                                require_dist_sync,
+                                dist_sync_probe_timeout_secs,
+                                &creds,
                             )
                             .await
                         }
@@ -1612,24 +1653,7 @@ async fn handle_admin(
                             "error_code": "INVALID_REQUEST",
                             "message": err.to_string(),
                         }),
-                    },
-                    Ok(_) => {
-                        add_hive_flow(
-                            state,
-                            &hive_id,
-                            &address,
-                            harden_ssh,
-                            restrict_ssh,
-                            require_dist_sync,
-                            dist_sync_probe_timeout_secs,
-                        )
-                        .await
                     }
-                    Err(err) => serde_json::json!({
-                        "status": "error",
-                        "error_code": "INVALID_REQUEST",
-                        "message": err.to_string(),
-                    }),
                 }
             } else {
                 serde_json::json!({
@@ -5582,8 +5606,7 @@ fn remote_router_name(entry: &RemoteHiveEntry) -> String {
     if entry.router_name_len == 0 {
         return String::new();
     }
-    let len = entry.router_name_len as usize;
-    String::from_utf8_lossy(&entry.router_name[..len]).into_owned()
+    shm_name_to_string(&entry.router_name, entry.router_name_len)
 }
 
 fn inventory_scope_from_payload(payload: &serde_json::Value) -> String {
@@ -5687,8 +5710,7 @@ fn inventory_flow(state: &OrchestratorState, payload: &serde_json::Value) -> ser
             continue;
         };
 
-        let len = node.name_len as usize;
-        let name = String::from_utf8_lossy(&node.name[..len]).into_owned();
+        let name = shm_name_to_string(&node.name, node.name_len);
         let kind = node_kind_from_name(&name);
         if let Some(expected_kind) = filter_type.as_deref() {
             if kind != expected_kind {
@@ -7200,10 +7222,18 @@ fn node_entry_to_json(entry: &NodeEntry, local_hive: &str) -> Option<serde_json:
     }))
 }
 
+/// Decodes a fixed-capacity SHM name buffer to a String, clamping the recorded
+/// length to the buffer size. name_len is a u16, so a torn/corrupt/buggy SHM
+/// writer can report a length past the buffer; without the clamp the slice
+/// panics — and a panic inside watchdog_tick would disable self-healing forever
+/// (F20, the trigger for F14). Centralizes the previously ad-hoc slices.
+fn shm_name_to_string(name: &[u8], name_len: u16) -> String {
+    let len = (name_len as usize).min(name.len());
+    String::from_utf8_lossy(&name[..len]).into_owned()
+}
+
 fn node_name(entry: &NodeEntry) -> String {
-    let len = entry.name_len as usize;
-    let name_bytes = &entry.name[..len];
-    String::from_utf8_lossy(name_bytes).into_owned()
+    shm_name_to_string(&entry.name, entry.name_len)
 }
 
 fn remote_nodes_for_hive(snapshot: &LsaSnapshot, target_hive: &str) -> Vec<serde_json::Value> {
@@ -7245,8 +7275,7 @@ fn remote_node_to_json(
     if entry.name_len == 0 {
         return None;
     }
-    let len = entry.name_len as usize;
-    let name = String::from_utf8_lossy(&entry.name[..len]).into_owned();
+    let name = shm_name_to_string(&entry.name, entry.name_len);
     let (node_name_l2, hive) = node_l2_and_hive(&name, remote_hive);
     let uuid = Uuid::from_slice(&entry.uuid).ok()?;
     Some(serde_json::json!({
@@ -7394,23 +7423,6 @@ fn remove_hive_cleanup_local_flow() -> serde_json::Value {
     }
 }
 
-fn remove_hive_cleanup_via_ssh(address: &str) -> Result<(), OrchestratorError> {
-    let address = address.trim();
-    if address.is_empty() {
-        return Err("missing worker address for remote cleanup".into());
-    }
-    let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
-    if !key_path.exists() {
-        return Err(format!(
-            "motherbee ssh key missing (expected '{}')",
-            key_path.display()
-        )
-        .into());
-    }
-    let cleanup_cmd = remove_hive_cleanup_shell_command(remove_hive_cleanup_script());
-    ssh_with_key(address, &key_path, &cleanup_cmd, BOOTSTRAP_SSH_USER)
-}
-
 async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_json::Value {
     if !valid_hive_id(hive_id) {
         return serde_json::json!({
@@ -7473,76 +7485,34 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
     };
     let socket_cleanup_timed_out = socket_cleanup_timeout(&forward_result);
 
+    // v2 contract is socket-first: cleanup runs over the worker socket when the
+    // worker is online, or local-only when it is offline/timed out. There is no
+    // operational SSH fallback — SSH is bootstrap-only (F1). The previous SSH
+    // "verification" after a socket-ok cleanup, and the SSH fallback on socket
+    // failure, both violated the v2 contract and its E2E gate.
     if socket_cleanup_ok {
-        let mut ssh_verified = false;
-        if !address.trim().is_empty() {
-            match remove_hive_cleanup_via_ssh(&address) {
-                Ok(()) => {
-                    ssh_verified = true;
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        hive_id = hive_id,
-                        address = %address,
-                        error = %err,
-                        "ssh verification cleanup failed after socket remove_hive cleanup"
-                    );
-                }
-            }
-        }
-        if ssh_verified {
-            remote_cleanup = "socket_ok_ssh_verified".to_string();
-            remote_cleanup_via = "socket+ssh".to_string();
-        } else {
-            remote_cleanup = "socket_ok".to_string();
-            remote_cleanup_via = "socket".to_string();
-        }
+        remote_cleanup = "socket_ok".to_string();
+        remote_cleanup_via = "socket".to_string();
     } else {
-        let mut ssh_cleanup_ok = false;
-        if !address.trim().is_empty() {
-            match remove_hive_cleanup_via_ssh(&address) {
-                Ok(()) => {
-                    ssh_cleanup_ok = true;
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        hive_id = hive_id,
-                        address = %address,
-                        error = %err,
-                        "ssh cleanup fallback failed during remove_hive"
-                    );
-                }
-            }
-        }
-        if ssh_cleanup_ok {
-            remote_cleanup = if socket_cleanup_timed_out {
-                "socket_timeout_ssh_ok"
-            } else {
-                "socket_failed_ssh_ok"
-            }
-            .to_string();
-            remote_cleanup_via = "ssh".to_string();
+        remote_cleanup = if socket_cleanup_timed_out {
+            "socket_timeout"
         } else {
-            remote_cleanup = if socket_cleanup_timed_out {
-                "socket_timeout"
-            } else {
-                "local_only"
-            }
-            .to_string();
-            remote_cleanup_via = "local_only".to_string();
-            if let Err(err) = &forward_result {
-                tracing::warn!(
-                    hive_id = hive_id,
-                    error = %err,
-                    "socket cleanup failed during remove_hive; using local-only cleanup"
-                );
-            } else if let Ok(payload) = &forward_result {
-                tracing::warn!(
-                    hive_id = hive_id,
-                    payload = %payload,
-                    "socket cleanup returned non-ok status; using local-only cleanup"
-                );
-            }
+            "local_only"
+        }
+        .to_string();
+        remote_cleanup_via = "local_only".to_string();
+        if let Err(err) = &forward_result {
+            tracing::warn!(
+                hive_id = hive_id,
+                error = %err,
+                "socket cleanup failed during remove_hive; using local-only cleanup"
+            );
+        } else if let Ok(payload) = &forward_result {
+            tracing::warn!(
+                hive_id = hive_id,
+                payload = %payload,
+                "socket cleanup returned non-ok status; using local-only cleanup"
+            );
         }
     }
 
@@ -8437,9 +8407,10 @@ fn local_core_manifest_hash() -> Result<Option<String>, OrchestratorError> {
 fn remote_core_manifest_hash(
     address: &str,
     key_path: &Path,
+    user: &str,
 ) -> Result<Option<String>, OrchestratorError> {
     let cmd = "bash -lc \"if [ -f '/var/lib/fluxbee/dist/core/manifest.json' ]; then sha256sum '/var/lib/fluxbee/dist/core/manifest.json' | awk '{print $1}'; fi\"".to_string();
-    let out = ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)?;
+    let out = ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), user)?;
     let hash = out
         .split_whitespace()
         .next()
@@ -10446,8 +10417,7 @@ async fn forward_system_action_to_hive_with_timeout(
                 if node.name_len == 0 {
                     continue;
                 }
-                let name =
-                    String::from_utf8_lossy(&node.name[..node.name_len as usize]).into_owned();
+                let name = shm_name_to_string(&node.name, node.name_len);
                 if name == expected_orchestrator || name == "SY.orchestrator" {
                     orchestrator_visible = true;
                 }
@@ -11058,7 +11028,7 @@ fn local_inventory_has_node(state: &OrchestratorState, expected_node_name: &str)
         if entry.flags & (FLAG_DELETED | FLAG_STALE) != 0 {
             return false;
         }
-        let name = String::from_utf8_lossy(&entry.name[..entry.name_len as usize]).into_owned();
+        let name = shm_name_to_string(&entry.name, entry.name_len);
         let (node_name_l2, hive) = node_l2_and_hive(&name, &state.hive_id);
         hive == state.hive_id && node_name_l2 == expected_node_name
     })
@@ -13746,6 +13716,7 @@ fn sync_core_to_worker(
     hive_id: &str,
     address: &str,
     key_path: &Path,
+    user: &str,
     restart_services_with_health_gate: bool,
     worker_bootstrap_only: bool,
     role: HiveRole,
@@ -13796,13 +13767,13 @@ fn sync_core_to_worker(
             "rm -rf '{stage}' && mkdir -p '{stage}'",
             stage = shell_single_quote(&remote_stage)
         );
-        ssh_with_key(address, key_path, &prepare_stage, BOOTSTRAP_SSH_USER)?;
+        ssh_with_key(address, key_path, &prepare_stage, user)?;
         scp_with_key(
             address,
             key_path,
             &upload_refs,
             &format!("{remote_stage}/"),
-            BOOTSTRAP_SSH_USER,
+            user,
         )?;
 
         let mut commands = vec![
@@ -13841,11 +13812,11 @@ fn sync_core_to_worker(
             address,
             key_path,
             &sudo_wrap(&format!("bash -lc '{}'", promote_cmd_q)),
-            BOOTSTRAP_SSH_USER,
+            user,
         )?;
-        verify_remote_core_components(address, key_path, &manifest, &component_names)?;
+        verify_remote_core_components(address, key_path, user, &manifest, &component_names)?;
         if let Some(local_hash) = local_core_manifest_hash()? {
-            let remote_hash = remote_core_manifest_hash(address, key_path)?;
+            let remote_hash = remote_core_manifest_hash(address, key_path, user)?;
             if remote_hash.as_deref() != Some(local_hash.as_str()) {
                 return Err(format!(
                     "core manifest hash mismatch after bootstrap sync hive='{}' local={} remote={}",
@@ -13870,13 +13841,13 @@ fn sync_core_to_worker(
         "rm -rf '{stage}' && mkdir -p '{stage}'",
         stage = shell_single_quote(&remote_stage)
     );
-    ssh_with_key(address, key_path, &prepare_stage, BOOTSTRAP_SSH_USER)?;
+    ssh_with_key(address, key_path, &prepare_stage, user)?;
     scp_with_key(
         address,
         key_path,
         &upload_refs,
         &format!("{remote_stage}/"),
-        BOOTSTRAP_SSH_USER,
+        user,
     )?;
 
     let mut commands = vec![
@@ -13949,12 +13920,12 @@ fn sync_core_to_worker(
         address,
         key_path,
         &sudo_wrap(&format!("bash -lc '{}'", promote_cmd_q)),
-        BOOTSTRAP_SSH_USER,
+        user,
     )?;
-    verify_remote_core_components(address, key_path, &manifest, &component_names)?;
+    verify_remote_core_components(address, key_path, user, &manifest, &component_names)?;
 
     if let Some(local_hash) = local_core_manifest_hash()? {
-        let remote_hash = remote_core_manifest_hash(address, key_path)?;
+        let remote_hash = remote_core_manifest_hash(address, key_path, user)?;
         if remote_hash.as_deref() != Some(local_hash.as_str()) {
             return Err(format!(
                 "core manifest hash mismatch after sync hive='{}' local={} remote={}",
@@ -13968,15 +13939,19 @@ fn sync_core_to_worker(
 
     if restart_services_with_health_gate {
         let restart_services = core_component_names_for_role(&manifest, role)?;
-        if let Err(err) =
-            restart_remote_core_services_with_health_gate(address, key_path, &restart_services)
-        {
-            let rollback_result = rollback_remote_core_to_prev(address, key_path);
+        if let Err(err) = restart_remote_core_services_with_health_gate(
+            address,
+            key_path,
+            user,
+            &restart_services,
+        ) {
+            let rollback_result = rollback_remote_core_to_prev(address, key_path, user);
             let rollback_note = match rollback_result {
                 Ok(()) => {
                     if let Err(rb_err) = restart_remote_core_services_with_health_gate(
                         address,
                         key_path,
+                        user,
                         &restart_services,
                     ) {
                         format!("rollback applied but restart after rollback failed: {rb_err}")
@@ -13998,6 +13973,7 @@ fn sync_core_to_worker(
 fn verify_remote_core_components(
     address: &str,
     key_path: &Path,
+    user: &str,
     manifest: &CoreManifest,
     component_names: &[String],
 ) -> Result<(), OrchestratorError> {
@@ -14047,13 +14023,14 @@ fn verify_remote_core_components(
         address,
         key_path,
         &sudo_wrap(&format!("bash -lc '{}'", verify_cmd_q)),
-        BOOTSTRAP_SSH_USER,
+        user,
     )
 }
 
 fn remote_service_exists(
     address: &str,
     key_path: &Path,
+    user: &str,
     service: &str,
 ) -> Result<bool, OrchestratorError> {
     let service_unit = if service.ends_with(".service") {
@@ -14066,7 +14043,7 @@ fn remote_service_exists(
         "systemctl show '{service}' --property=LoadState --value 2>/dev/null || true",
         service = service_q
     );
-    let out = ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER)?;
+    let out = ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), user)?;
     let state = out.trim();
     Ok(!state.is_empty() && state != "not-found")
 }
@@ -14074,6 +14051,7 @@ fn remote_service_exists(
 fn remote_wait_service_active(
     address: &str,
     key_path: &Path,
+    user: &str,
     service: &str,
     timeout_secs: u64,
 ) -> Result<(), OrchestratorError> {
@@ -14100,13 +14078,13 @@ fn remote_wait_service_active(
             address,
             key_path,
             &sudo_wrap(&is_active_cmd),
-            BOOTSTRAP_SSH_USER,
+            user,
         )?;
         let substate = ssh_with_key_output(
             address,
             key_path,
             &sudo_wrap(&substate_cmd),
-            BOOTSTRAP_SSH_USER,
+            user,
         )
         .unwrap_or_default();
         Ok(substate.trim() == "running")
@@ -14133,7 +14111,7 @@ fn remote_wait_service_active(
                     address,
                     key_path,
                     &sudo_wrap(&state_summary_cmd),
-                    BOOTSTRAP_SSH_USER,
+                    user,
                 )
                 .unwrap_or_default();
                 let summary = summary.trim();
@@ -14182,10 +14160,11 @@ fn remote_wait_service_active(
 fn restart_remote_core_services_with_health_gate(
     address: &str,
     key_path: &Path,
+    user: &str,
     services: &[String],
 ) -> Result<(), OrchestratorError> {
     for service in services {
-        let exists = remote_service_exists(address, key_path, service)?;
+        let exists = remote_service_exists(address, key_path, user, service)?;
         if !exists {
             tracing::info!(
                 service = service.as_str(),
@@ -14202,10 +14181,16 @@ fn restart_remote_core_services_with_health_gate(
             address,
             key_path,
             &sudo_wrap(&restart_cmd),
-            BOOTSTRAP_SSH_USER,
+            user,
         )
         .map_err(|err| format!("failed to restart service '{}': {}", service, err))?;
-        remote_wait_service_active(address, key_path, service, CORE_SERVICE_HEALTH_TIMEOUT_SECS)?;
+        remote_wait_service_active(
+            address,
+            key_path,
+            user,
+            service,
+            CORE_SERVICE_HEALTH_TIMEOUT_SECS,
+        )?;
         tracing::info!(
             service = service.as_str(),
             "core sync: remote service active after restart"
@@ -14214,7 +14199,11 @@ fn restart_remote_core_services_with_health_gate(
     Ok(())
 }
 
-fn rollback_remote_core_to_prev(address: &str, key_path: &Path) -> Result<(), OrchestratorError> {
+fn rollback_remote_core_to_prev(
+    address: &str,
+    key_path: &Path,
+    user: &str,
+) -> Result<(), OrchestratorError> {
     let rollback_cmd = "set -euo pipefail && \
 if [ ! -d /var/lib/fluxbee/dist/core/bin.prev ]; then echo 'missing /var/lib/fluxbee/dist/core/bin.prev' >&2; exit 1; fi && \
 rm -rf /var/lib/fluxbee/dist/core/bin.bad && \
@@ -14227,7 +14216,7 @@ for b in /var/lib/fluxbee/dist/core/bin/*; do [ -f \"$b\" ] || continue; install
         address,
         key_path,
         &sudo_wrap(&format!("bash -lc '{}'", rollback_cmd_q)),
-        BOOTSTRAP_SSH_USER,
+        user,
     )
 }
 
@@ -14252,6 +14241,7 @@ fn truncate_for_error(value: &str, max_len: usize) -> String {
 fn remote_service_journal_tail(
     address: &str,
     key_path: &Path,
+    user: &str,
     service: &str,
     lines: usize,
 ) -> Option<String> {
@@ -14273,7 +14263,7 @@ tail -n {lines} /var/log/syslog 2>/dev/null | grep -E '{service_raw}|sy_orchestr
         service_raw = service.replace('\'', "'\"'\"'"),
         lines = lines
     );
-    match ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), BOOTSTRAP_SSH_USER) {
+    match ssh_with_key_output(address, key_path, &sudo_wrap(&cmd), user) {
         Ok(out) => {
             let trimmed = out.trim();
             if trimmed.is_empty() {
@@ -14584,11 +14574,26 @@ fn is_add_hive_core_sync_pending_error(error: &str) -> bool {
 }
 
 fn is_socket_only_unreachable_error(error: &str) -> bool {
+    // Matches the real strings the socket forward path emits for a transient or
+    // offline worker (i.e. retryable), as opposed to a genuine FINALIZE_FAILED
+    // from a non-ok worker payload. Sources:
+    //   - LSA preflight in forward_system_action_to_hive_with_timeout:
+    //     "target hive '..' not reachable in LSA (stale/missing)" and
+    //     "target orchestrator '..' not visible in LSA for hive '..'".
+    //   - RpcError Display from send_system_rpc (crates/fluxbee_sdk/src/rpc.rs):
+    //     Unreachable -> "transport unreachable: ...",
+    //     TtlExceeded -> "transport ttl exceeded: ..." (note: a SPACE, not '_'),
+    //     Timeout     -> "timeout waiting response trace_id=...".
+    // After F2 both classes return early (no SSH fallback), so this predicate now
+    // only shapes telemetry / the error_code, never the bootstrap gate.
     let lower = error.to_ascii_lowercase();
     lower.contains("system forward timeout")
+        || lower.contains("timeout waiting response")
         || (lower.contains("target hive")
             && (lower.contains("not reachable in lsa") || lower.contains("stale/missing")))
+        || lower.contains("not visible in lsa")
         || lower.contains("unreachable")
+        || lower.contains("ttl exceeded")
         || lower.contains("ttl_exceeded")
 }
 
@@ -14716,6 +14721,7 @@ async fn add_hive_flow(
     restrict_ssh: bool,
     require_dist_sync: bool,
     dist_sync_probe_timeout_secs: u64,
+    creds: &BootstrapCreds,
 ) -> serde_json::Value {
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
@@ -14742,20 +14748,31 @@ async fn add_hive_flow(
     let root = hives_root();
     let hive_dir = root.join(hive_id);
     if hive_exists(&state.state_dir, hive_id) {
-        append_single_deployment_history(
-            state,
-            "core",
-            "add_hive",
-            hive_id,
-            "error",
-            Some("HIVE_EXISTS".to_string()),
-            local_core_manifest_hash().ok().flatten(),
-        );
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "HIVE_EXISTS",
-            "message": "hive already exists",
-        });
+        // A `pending` hive bootstrapped the worker but timed out before finalize
+        // completed (peer-link / SSH controls / status=connected). Resume it via
+        // the idempotent socket-first fast path below rather than dead-ending at
+        // HIVE_EXISTS, which would leave the hive permanently half-provisioned (F9).
+        if hive_status(&root, hive_id).as_deref() == Some("pending") {
+            tracing::warn!(
+                hive_id = hive_id,
+                "hive is pending; resuming add_hive to complete finalize (idempotent)"
+            );
+        } else {
+            append_single_deployment_history(
+                state,
+                "core",
+                "add_hive",
+                hive_id,
+                "error",
+                Some("HIVE_EXISTS".to_string()),
+                local_core_manifest_hash().ok().flatten(),
+            );
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "HIVE_EXISTS",
+                "message": "hive already exists",
+            });
+        }
     }
     if hive_partial_exists(hive_id) {
         tracing::warn!(
@@ -14821,13 +14838,26 @@ async fn add_hive_flow(
     let socket_only_ready =
         wait_for_remote_orchestrator_node(&state.hive_id, hive_id, Duration::from_secs(3)).is_ok();
     if socket_only_ready {
+        // The worker orchestrator is already online in LSA. SSH is bootstrap-only,
+        // so a transient socket precheck failure must NOT reprovision a live host
+        // over SSH (which would re-seed keys/sudoers and recopy core binaries).
+        // Return a retryable error instead of falling back to bootstrap (F2).
         if let Err(err) = probe_remote_orchestrator_socket_ready(state, hive_id, address).await {
-            tracing::warn!(
-                hive_id = hive_id,
-                address = address,
-                error = %err,
-                "socket-only add_hive precheck failed; falling back to bootstrap path"
-            );
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "WORKER_SOCKET_UNREACHABLE",
+                "retryable": true,
+                "message": format!(
+                    "worker orchestrator online but socket precheck failed; not reprovisioning over SSH: {err}"
+                ),
+                "hive_id": hive_id,
+                "address": address,
+                "bootstrap_mode": "socket_only_existing_orchestrator",
+                "harden_ssh": harden_ssh,
+                "restrict_ssh_requested": restrict_ssh,
+                "require_dist_sync": require_dist_sync,
+                "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+            });
         } else {
             let finalize = match add_hive_finalize_via_socket(
                 state,
@@ -14845,35 +14875,43 @@ async fn add_hive_flow(
                     Some(payload)
                 }
                 Err(err) => {
+                    // Worker is online; do NOT fall back to SSH bootstrap on a
+                    // socket finalize failure (F2). An unreachable/timeout is a
+                    // retryable socket condition (the worker can be re-driven by a
+                    // retry, which lands on this same idempotent fast path — also
+                    // the F9 pending-resume path); anything else is a real
+                    // FINALIZE_FAILED from a non-ok worker payload.
                     let err_text = err.to_string();
-                    if is_socket_only_unreachable_error(&err_text) {
-                        tracing::warn!(
-                            hive_id = hive_id,
-                            address = address,
-                            error = %err_text,
-                            "socket-only add_hive finalize unreachable/timeout; falling back to bootstrap path"
-                        );
-                        None
-                    } else {
-                        append_add_hive_finalize_history(
-                            state,
-                            hive_id,
-                            "error",
-                            Some(err_text.clone()),
-                        );
-                        return serde_json::json!({
-                            "status": "error",
-                            "error_code": "FINALIZE_FAILED",
-                            "message": format!("worker socket-only finalize failed: {}", err_text),
-                            "hive_id": hive_id,
-                            "address": address,
-                            "bootstrap_mode": "socket_only_existing_orchestrator",
-                            "harden_ssh": harden_ssh,
-                            "restrict_ssh_requested": restrict_ssh,
-                            "require_dist_sync": require_dist_sync,
-                            "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
-                        });
-                    }
+                    append_add_hive_finalize_history(state, hive_id, "error", Some(err_text.clone()));
+                    let (error_code, retryable, message) =
+                        if is_socket_only_unreachable_error(&err_text) {
+                            (
+                                "WORKER_SOCKET_UNREACHABLE",
+                                true,
+                                format!(
+                                    "worker orchestrator online but socket finalize unreachable/timeout; not reprovisioning over SSH: {err_text}"
+                                ),
+                            )
+                        } else {
+                            (
+                                "FINALIZE_FAILED",
+                                false,
+                                format!("worker socket-only finalize failed: {err_text}"),
+                            )
+                        };
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": error_code,
+                        "retryable": retryable,
+                        "message": message,
+                        "hive_id": hive_id,
+                        "address": address,
+                        "bootstrap_mode": "socket_only_existing_orchestrator",
+                        "harden_ssh": harden_ssh,
+                        "restrict_ssh_requested": restrict_ssh,
+                        "require_dist_sync": require_dist_sync,
+                        "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
+                    });
                 }
             };
             if let Some(finalize) = finalize {
@@ -14948,6 +14986,7 @@ async fn add_hive_flow(
                     "address": address,
                     "created_at": now_epoch_ms().to_string(),
                     "status": "connected",
+                    "ssh_user": creds.user,
                 });
                 if let Some(device_id) = worker_syncthing_device_id.clone() {
                     info_payload["syncthing_device_id"] = serde_json::json!(device_id);
@@ -14984,6 +15023,21 @@ async fn add_hive_flow(
                     "syncthing_device_id": worker_syncthing_device_id,
                     "finalize": finalize,
                 });
+            } else {
+                // Defensive guard: the match above returns on every non-Some path
+                // (PATH A precheck / PATH B unreachable / PATH C finalize-failed),
+                // so `finalize` is statically Some here. Returning explicitly on
+                // the impossible None makes the F2 invariant compiler-enforced — a
+                // future edit that yields None cannot silently fall through to the
+                // SSH bootstrap below and reprovision a live worker.
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "FINALIZE_FAILED",
+                    "message": "internal: socket-only finalize produced no payload",
+                    "hive_id": hive_id,
+                    "address": address,
+                    "bootstrap_mode": "socket_only_existing_orchestrator",
+                });
             }
         }
     }
@@ -15015,41 +15069,51 @@ async fn add_hive_flow(
         }
     };
 
-    let mut password_channel_available = true;
-    if let Err(pass_err) = ssh_with_pass_any(address, "true", BOOTSTRAP_SSH_USER) {
-        password_channel_available = false;
-        match ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER) {
-            Ok(()) => {
-                tracing::warn!(
-                    target = address,
-                    error = %pass_err,
-                    "password bootstrap channel unavailable; continuing via key channel"
-                );
-            }
-            Err(key_err) => {
-                return ssh_bootstrap_error_payload(&format!(
-                    "password probe failed: {pass_err}; key probe failed: {key_err}"
-                ));
+    // KEY-FIRST bootstrap probe: try the seeded SSH key channel first; only fall
+    // back to the password channel (to seed the key) if the key probe fails. The
+    // password is only consulted on that fallback, and only if one was supplied.
+    match ssh_with_key(address, &key_path, "true", creds.user.as_str()) {
+        Ok(()) => {
+            tracing::info!(
+                target = address,
+                "key bootstrap channel already active; skipping password channel"
+            );
+        }
+        Err(key_err) => {
+            let password = match creds.password.as_deref() {
+                Some(p) => p,
+                None => {
+                    return ssh_bootstrap_error_payload(&format!(
+                        "key probe failed and no ssh_password supplied for password bootstrap: {key_err}"
+                    ));
+                }
+            };
+            tracing::warn!(
+                target = address,
+                error = %key_err,
+                "key bootstrap channel unavailable; seeding key via password channel"
+            );
+            if let Err(err) = apply_remote_unrestricted_authorized_key_with_pass(
+                address,
+                &pub_key,
+                creds.user.as_str(),
+                password,
+            ) {
+                return serde_json::json!({
+                    "status": "error",
+                    "error_code": "SSH_KEY_FAILED",
+                    "message": format!("failed to seed bootstrap key via password channel: {err}"),
+                });
             }
         }
     }
 
-    if password_channel_available {
-        if let Err(err) = apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key) {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "SSH_KEY_FAILED",
-                "message": format!("failed to seed bootstrap key via password channel: {err}"),
-            });
-        }
-    } else {
-        tracing::info!(
-            target = address,
-            "password bootstrap channel unavailable; key channel already active, skipping key reseed"
-        );
-    }
-
-    if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(address, &key_path) {
+    if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        creds.password.as_deref().unwrap_or(""),
+    ) {
         return serde_json::json!({
             "status": "error",
             "error_code": "SUDO_SETUP_FAILED",
@@ -15062,7 +15126,7 @@ async fn add_hive_flow(
         address,
         &key_path,
         "sudo -n /bin/bash -lc 'exit 0'",
-        BOOTSTRAP_SSH_USER,
+        creds.user.as_str(),
     ) {
         return serde_json::json!({
             "status": "error",
@@ -15115,9 +15179,9 @@ async fn add_hive_flow(
     let core_deploy_started_at = now_epoch_ms();
     let core_deploy_started = Instant::now();
     let local_core_hash = local_core_manifest_hash().ok().flatten();
-    let remote_core_hash_before = remote_core_manifest_hash(address, &key_path).ok().flatten();
+    let remote_core_hash_before = remote_core_manifest_hash(address, &key_path, creds.user.as_str()).ok().flatten();
     if let Err(err) =
-        sync_core_to_worker(hive_id, address, &key_path, false, true, HiveRole::Worker)
+        sync_core_to_worker(hive_id, address, &key_path, creds.user.as_str(), false, true, HiveRole::Worker)
     {
         let entry = DeploymentHistoryEntry {
             deployment_id: Uuid::new_v4().to_string(),
@@ -15149,7 +15213,7 @@ async fn add_hive_flow(
             "message": err.to_string(),
         });
     }
-    let remote_core_hash_after = remote_core_manifest_hash(address, &key_path).ok().flatten();
+    let remote_core_hash_after = remote_core_manifest_hash(address, &key_path, creds.user.as_str()).ok().flatten();
     let entry = DeploymentHistoryEntry {
         deployment_id: Uuid::new_v4().to_string(),
         category: "core".to_string(),
@@ -15187,7 +15251,7 @@ async fn add_hive_flow(
             blob_staging_dir.display(),
             state.blob.sync_data_dir.display()
         )),
-        BOOTSTRAP_SSH_USER,
+        creds.user.as_str(),
     ) {
         return serde_json::json!({
             "status": "error",
@@ -15265,7 +15329,7 @@ async fn add_hive_flow(
         worker_egress_yaml,
         render_system_nodes_yaml(HiveRole::Worker, &worker_system_nodes)
     );
-    if let Err(err) = write_remote_file(address, &key_path, "/etc/fluxbee/hive.yaml", &hive_yaml) {
+    if let Err(err) = write_remote_file(address, &key_path, creds.user.as_str(), "/etc/fluxbee/hive.yaml", &hive_yaml) {
         return serde_json::json!({
             "status": "error",
             "error_code": "CONFIG_FAILED",
@@ -15280,6 +15344,7 @@ async fn add_hive_flow(
     if let Err(err) = write_remote_file(
         address,
         &key_path,
+        creds.user.as_str(),
         "/etc/fluxbee/sy-config-routes.yaml",
         &config_routes_yaml,
     ) {
@@ -15317,7 +15382,7 @@ async fn add_hive_flow(
             )
         };
         let unit_path = format!("/etc/systemd/system/{name}.service");
-        if let Err(err) = write_remote_file(address, &key_path, &unit_path, &unit) {
+        if let Err(err) = write_remote_file(address, &key_path, creds.user.as_str(), &unit_path, &unit) {
             return serde_json::json!({
                 "status": "error",
                 "error_code": "SERVICE_FAILED",
@@ -15330,7 +15395,7 @@ async fn add_hive_flow(
         address,
         &key_path,
         &sudo_wrap("systemctl daemon-reload"),
-        BOOTSTRAP_SSH_USER,
+        creds.user.as_str(),
     ) {
         return serde_json::json!({
             "status": "error",
@@ -15345,7 +15410,7 @@ async fn add_hive_flow(
             address,
             &key_path,
             &sudo_wrap(&format!("systemctl enable {name}")),
-            BOOTSTRAP_SSH_USER,
+            creds.user.as_str(),
         ) {
             return serde_json::json!({
                 "status": "error",
@@ -15366,7 +15431,7 @@ async fn add_hive_flow(
             "bash -lc '{}'",
             shell_single_quote(&service_inner)
         ));
-        if let Err(err) = ssh_with_key(address, &key_path, &service_cmd, BOOTSTRAP_SSH_USER) {
+        if let Err(err) = ssh_with_key(address, &key_path, &service_cmd, creds.user.as_str()) {
             return serde_json::json!({
                 "status": "error",
                 "error_code": "SERVICE_FAILED",
@@ -15377,10 +15442,11 @@ async fn add_hive_flow(
     if let Err(err) = remote_wait_service_active(
         address,
         &key_path,
+        creds.user.as_str(),
         "sy-orchestrator",
         CORE_SERVICE_HEALTH_TIMEOUT_SECS,
     ) {
-        let journal_tail = remote_service_journal_tail(address, &key_path, "sy-orchestrator", 120);
+        let journal_tail = remote_service_journal_tail(address, &key_path, creds.user.as_str(), "sy-orchestrator", 120);
         return serde_json::json!({
             "status": "error",
             "error_code": "SERVICE_FAILED",
@@ -15424,6 +15490,7 @@ async fn add_hive_flow(
         "address": address,
         "created_at": now_epoch_ms().to_string(),
         "status": if wan_connected && orchestrator_connected { "connected" } else { "pending" },
+        "ssh_user": creds.user,
     });
     if let Err(err) = write_hive_info(&root, hive_id, &info_payload) {
         return serde_json::json!({
@@ -15453,7 +15520,7 @@ async fn add_hive_flow(
     if !orchestrator_connected {
         let detail = orchestrator_wait_error
             .unwrap_or_else(|| "worker orchestrator not observed in LSA".to_string());
-        let journal_tail = remote_service_journal_tail(address, &key_path, "sy-orchestrator", 120);
+        let journal_tail = remote_service_journal_tail(address, &key_path, creds.user.as_str(), "sy-orchestrator", 120);
         return serde_json::json!({
             "status": "error",
             "error_code": "WORKER_ORCHESTRATOR_TIMEOUT",
@@ -15582,6 +15649,7 @@ async fn add_hive_flow(
     let ssh_controls = match apply_add_hive_ssh_controls_after_finalize(
         address,
         &key_path,
+        creds.user.as_str(),
         &pub_key,
         restrict_ssh,
         harden_ssh,
@@ -15621,6 +15689,7 @@ async fn add_hive_flow(
         "created_at": now_epoch_ms().to_string(),
         "status": "connected",
         "syncthing_peer_linked": syncthing_peer_linked,
+        "ssh_user": creds.user,
     });
     if let Some(device_id) = worker_syncthing_device_id.clone() {
         final_info_payload["syncthing_device_id"] = serde_json::json!(device_id);
@@ -15665,6 +15734,7 @@ async fn add_egress_hive_flow(
     harden_ssh: bool,
     restrict_ssh: bool,
     egress: EgressSection,
+    creds: &BootstrapCreds,
 ) -> serde_json::Value {
     let err_payload = |code: &str, msg: String| serde_json::json!({ "status": "error", "error_code": code, "message": msg });
 
@@ -15676,7 +15746,19 @@ async fn add_egress_hive_flow(
     let root = hives_root();
     let hive_dir = root.join(hive_id);
     if hive_exists(&state.state_dir, hive_id) {
-        return err_payload("HIVE_EXISTS", "hive already exists".to_string());
+        // Resume a pending egress add_hive (worker bootstrapped but finalize /
+        // SSH hardening did not complete) instead of returning HIVE_EXISTS (F9).
+        // The egress flow has no socket fast path, so resuming re-runs the
+        // bootstrap, which is idempotent (sudoers from template, dedup keys,
+        // restart) and applies the SSH controls the pending state never reached.
+        if hive_status(&root, hive_id).as_deref() == Some("pending") {
+            tracing::warn!(
+                hive_id = hive_id,
+                "egress hive is pending; resuming add_hive to complete finalize (idempotent)"
+            );
+        } else {
+            return err_payload("HIVE_EXISTS", "hive already exists".to_string());
+        }
     }
     if hive_partial_exists(hive_id) {
         if let Err(err) = fs::remove_dir_all(&hive_dir) {
@@ -15726,31 +15808,46 @@ async fn add_egress_hive_flow(
         Ok(data) => data,
         Err(err) => return err_payload("SSH_KEY_FAILED", err.to_string()),
     };
-    let mut password_channel_available = true;
-    if ssh_with_pass_any(address, "true", BOOTSTRAP_SSH_USER).is_err() {
-        password_channel_available = false;
-        if let Err(key_err) = ssh_with_key(address, &key_path, "true", BOOTSTRAP_SSH_USER) {
-            return ssh_bootstrap_error_payload(&format!(
-                "password and key probe failed: {key_err}"
-            ));
+    // KEY-FIRST bootstrap probe (mirrors the worker flow): try the seeded key
+    // channel first, falling back to the password channel only if the key probe
+    // fails and a password was supplied.
+    match ssh_with_key(address, &key_path, "true", creds.user.as_str()) {
+        Ok(()) => {}
+        Err(key_err) => {
+            let password = match creds.password.as_deref() {
+                Some(p) => p,
+                None => {
+                    return ssh_bootstrap_error_payload(&format!(
+                        "key probe failed and no ssh_password supplied for password bootstrap: {key_err}"
+                    ));
+                }
+            };
+            if let Err(err) = apply_remote_unrestricted_authorized_key_with_pass(
+                address,
+                &pub_key,
+                creds.user.as_str(),
+                password,
+            ) {
+                return err_payload(
+                    "SSH_KEY_FAILED",
+                    format!("failed to seed bootstrap key: {err}"),
+                );
+            }
         }
     }
-    if password_channel_available {
-        if let Err(err) = apply_remote_unrestricted_authorized_key_with_pass(address, &pub_key) {
-            return err_payload(
-                "SSH_KEY_FAILED",
-                format!("failed to seed bootstrap key: {err}"),
-            );
-        }
-    }
-    if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(address, &key_path) {
+    if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        creds.password.as_deref().unwrap_or(""),
+    ) {
         return err_payload("SUDO_SETUP_FAILED", err.to_string());
     }
     if let Err(err) = ssh_with_key(
         address,
         &key_path,
         "sudo -n /bin/bash -lc 'exit 0'",
-        BOOTSTRAP_SSH_USER,
+        creds.user.as_str(),
     ) {
         return err_payload(
             "SSH_KEY_FAILED",
@@ -15794,7 +15891,7 @@ async fn add_egress_hive_flow(
 
     // Push the egress core component set.
     if let Err(err) =
-        sync_core_to_worker(hive_id, address, &key_path, false, true, HiveRole::Egress)
+        sync_core_to_worker(hive_id, address, &key_path, creds.user.as_str(), false, true, HiveRole::Egress)
     {
         append_single_deployment_history(
             state,
@@ -15814,7 +15911,7 @@ async fn add_egress_hive_flow(
         &sudo_wrap(
             "mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers",
         ),
-        BOOTSTRAP_SSH_USER,
+        creds.user.as_str(),
     ) {
         return err_payload("CONFIG_FAILED", err.to_string());
     }
@@ -15850,7 +15947,7 @@ async fn add_egress_hive_flow(
         lan_iface = nat.lan_iface,
         system_nodes = render_system_nodes_yaml(HiveRole::Egress, &egress_system_nodes),
     );
-    if let Err(err) = write_remote_file(address, &key_path, "/etc/fluxbee/hive.yaml", &hive_yaml) {
+    if let Err(err) = write_remote_file(address, &key_path, creds.user.as_str(), "/etc/fluxbee/hive.yaml", &hive_yaml) {
         return err_payload("CONFIG_FAILED", err.to_string());
     }
     let config_routes_yaml = format!(
@@ -15860,6 +15957,7 @@ async fn add_egress_hive_flow(
     if let Err(err) = write_remote_file(
         address,
         &key_path,
+        creds.user.as_str(),
         "/etc/fluxbee/sy-config-routes.yaml",
         &config_routes_yaml,
     ) {
@@ -15885,7 +15983,7 @@ async fn add_egress_hive_flow(
             format!("[Unit]\nDescription=Fluxbee {name}\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n")
         };
         let unit_path = format!("/etc/systemd/system/{name}.service");
-        if let Err(err) = write_remote_file(address, &key_path, &unit_path, &unit) {
+        if let Err(err) = write_remote_file(address, &key_path, creds.user.as_str(), &unit_path, &unit) {
             return err_payload("SERVICE_FAILED", format!("{name}: {err}"));
         }
     }
@@ -15893,7 +15991,7 @@ async fn add_egress_hive_flow(
         address,
         &key_path,
         &sudo_wrap("systemctl daemon-reload"),
-        BOOTSTRAP_SSH_USER,
+        creds.user.as_str(),
     ) {
         return err_payload("SERVICE_FAILED", err.to_string());
     }
@@ -15902,7 +16000,7 @@ async fn add_egress_hive_flow(
             address,
             &key_path,
             &sudo_wrap(&format!("systemctl enable {name}")),
-            BOOTSTRAP_SSH_USER,
+            creds.user.as_str(),
         ) {
             return err_payload("SERVICE_FAILED", format!("enable {name}: {err}"));
         }
@@ -15910,17 +16008,18 @@ async fn add_egress_hive_flow(
             "systemctl restart {name} || (systemctl reset-failed {name} || true; sleep 1; systemctl start {name})"
         );
         let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&inner)));
-        if let Err(err) = ssh_with_key(address, &key_path, &cmd, BOOTSTRAP_SSH_USER) {
+        if let Err(err) = ssh_with_key(address, &key_path, &cmd, creds.user.as_str()) {
             return err_payload("SERVICE_FAILED", format!("start {name}: {err}"));
         }
     }
     if let Err(err) = remote_wait_service_active(
         address,
         &key_path,
+        creds.user.as_str(),
         "sy-orchestrator",
         CORE_SERVICE_HEALTH_TIMEOUT_SECS,
     ) {
-        let journal = remote_service_journal_tail(address, &key_path, "sy-orchestrator", 120);
+        let journal = remote_service_journal_tail(address, &key_path, creds.user.as_str(), "sy-orchestrator", 120);
         return err_payload(
             "SERVICE_FAILED",
             match journal {
@@ -15943,12 +16042,19 @@ async fn add_egress_hive_flow(
                 .is_ok();
     }
 
+    // Write `pending` until SSH hardening (the "close the node" step) succeeds.
+    // On the egress boundary hardening is fatal (F10), so recording `connected`
+    // here would mark a node whose password auth may still be open as done, and
+    // the F9 resume guard would then refuse to re-run it. Leaving `pending` lets
+    // a retry resume via the idempotent egress bootstrap. The success path below
+    // promotes it to `connected` (D3).
     let info_payload = serde_json::json!({
         "hive_id": hive_id,
         "address": address,
         "role": "egress",
         "created_at": now_epoch_ms().to_string(),
-        "status": if wan_connected && orchestrator_connected { "connected" } else { "pending" },
+        "status": "pending",
+        "ssh_user": creds.user,
     });
     if let Err(err) = write_hive_info(&root, hive_id, &info_payload) {
         return err_payload("IO_ERROR", err.to_string());
@@ -15969,7 +16075,7 @@ async fn add_egress_hive_flow(
         });
     }
     if !orchestrator_connected {
-        let journal = remote_service_journal_tail(address, &key_path, "sy-orchestrator", 120);
+        let journal = remote_service_journal_tail(address, &key_path, creds.user.as_str(), "sy-orchestrator", 120);
         return serde_json::json!({
             "status": "error",
             "error_code": "ORCHESTRATOR_TIMEOUT",
@@ -15986,19 +16092,60 @@ async fn add_egress_hive_flow(
     }
 
     // SSH hardening (egress is a security boundary; same controls as worker).
-    let (restrict_ssh_applied, restrict_ssh_mode) = match apply_add_hive_ssh_controls_after_finalize(
+    // FATAL on egress, mirroring the worker flow (F10): the egress host is the
+    // boundary exposed to the internet, so a failure to disable password auth or
+    // restrict the bootstrap key must NOT be reported as success. info.yaml stays
+    // `pending` (written above), so a retry resumes via the F9 egress guard.
+    let ssh_controls = match apply_add_hive_ssh_controls_after_finalize(
         address,
         &key_path,
+        creds.user.as_str(),
         &pub_key,
         restrict_ssh,
         harden_ssh,
     ) {
-        Ok(c) => (c.restrict_ssh_applied, c.restrict_ssh_mode),
+        Ok(c) => c,
         Err(err) => {
-            tracing::warn!(hive_id = hive_id, error = %err, "egress ssh hardening failed; continuing");
-            (false, "error".to_string())
+            let err_text = err.to_string();
+            let error_code = if err_text.to_ascii_lowercase().contains("harden") {
+                "SSH_HARDEN_FAILED"
+            } else {
+                "SSH_KEY_FAILED"
+            };
+            tracing::warn!(hive_id = hive_id, error = %err_text, "egress ssh hardening failed");
+            return serde_json::json!({
+                "status": "error",
+                "error_code": error_code,
+                "message": err_text,
+                "hive_id": hive_id,
+                "address": address,
+                "egress_role": "egress",
+                "harden_ssh": harden_ssh,
+                "harden_ssh_applied": false,
+                "restrict_ssh": false,
+                "restrict_ssh_requested": restrict_ssh,
+                "wan_connected": true,
+                "orchestrator_connected": true,
+            });
         }
     };
+    let restrict_ssh_applied = ssh_controls.restrict_ssh_applied;
+    let restrict_ssh_mode = ssh_controls.restrict_ssh_mode;
+
+    // Hardening succeeded — the node is closed. Promote the hive to `connected`
+    // (D3), mirroring the worker's post-hardening write. Preserve `role: egress`
+    // so list_hives / the F9 resume guard keep the role.
+    let connected_info = serde_json::json!({
+        "hive_id": hive_id,
+        "address": address,
+        "role": "egress",
+        "created_at": now_epoch_ms().to_string(),
+        "status": "connected",
+        "ssh_user": creds.user,
+    });
+    if let Err(err) = write_hive_info(&root, hive_id, &connected_info) {
+        return err_payload("IO_ERROR", err.to_string());
+    }
 
     append_single_deployment_history(
         state,
@@ -16026,6 +16173,7 @@ async fn add_egress_hive_flow(
         "egress_lan_iface": nat.lan_iface,
         "egress_nat_applied": true,
         "harden_ssh": harden_ssh,
+        "harden_ssh_applied": harden_ssh,
         "restrict_ssh": restrict_ssh_applied,
         "restrict_ssh_mode": restrict_ssh_mode,
         "restrict_ssh_requested": restrict_ssh,
@@ -16059,6 +16207,19 @@ fn hive_exists(state_dir: &Path, hive_id: &str) -> bool {
 fn hive_partial_exists(hive_id: &str) -> bool {
     let dir = hives_root().join(hive_id);
     dir.exists() && !dir.join("info.yaml").exists()
+}
+
+/// Recorded `status` of an existing hive (`connected`, `pending`, ...), or None
+/// if info.yaml is absent/unreadable. A `pending` hive is one whose worker was
+/// bootstrapped but whose finalize (peer-link / SSH controls / status=connected)
+/// did not complete; reading the status lets a retry resume it idempotently
+/// instead of dead-ending at HIVE_EXISTS (F9).
+fn hive_status(root: &Path, hive_id: &str) -> Option<String> {
+    read_hive_info(root, hive_id).ok().and_then(|info| {
+        info.get("status")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+    })
 }
 
 fn valid_hive_id(value: &str) -> bool {
@@ -16116,6 +16277,34 @@ fn resolve_add_hive_role(payload: &serde_json::Value) -> Result<HiveRole, Orches
         // A present-but-non-string role is a malformed request, not a worker.
         Some(other) => Err(format!("add_hive: 'role' must be a string, got {other}").into()),
     }
+}
+
+/// SSH bootstrap credentials supplied by the caller in the `add_hive` payload.
+/// `user` is the admin login; `password` is only consulted when the key probe
+/// fails and we must fall back to the password channel. Never logged/persisted.
+struct BootstrapCreds {
+    user: String,
+    password: Option<String>,
+}
+
+/// Resolve the SSH bootstrap credentials from the `add_hive` payload. `ssh_user`
+/// is REQUIRED (no default); `ssh_password` is OPTIONAL (empty -> None). The
+/// password never gets a hardcoded fallback and is never logged or persisted.
+fn resolve_add_hive_ssh_creds(
+    payload: &serde_json::Value,
+) -> Result<BootstrapCreds, OrchestratorError> {
+    let user = payload
+        .get("ssh_user")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or("add_hive: 'ssh_user' is required (admin login for SSH bootstrap)")?;
+    let password = payload
+        .get("ssh_password")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Ok(BootstrapCreds { user, password })
 }
 
 /// Parse the host-specific egress params from the `add_hive` payload. The
@@ -16344,6 +16533,7 @@ struct AddHiveSshControlsResult {
 fn apply_add_hive_ssh_controls_after_finalize(
     address: &str,
     key_path: &Path,
+    user: &str,
     pub_key: &str,
     restrict_ssh_requested: bool,
     harden_ssh: bool,
@@ -16356,6 +16546,7 @@ fn apply_add_hive_ssh_controls_after_finalize(
         let restrict_result = apply_remote_from_only_authorized_key_with_access(
             address,
             key_path,
+            user,
             pub_key,
             &source_patterns,
         )
@@ -16364,7 +16555,7 @@ fn apply_add_hive_ssh_controls_after_finalize(
                 address,
                 key_path,
                 "sudo -n /bin/bash -lc 'exit 0'",
-                BOOTSTRAP_SSH_USER,
+                user,
             )
         });
         match restrict_result {
@@ -16392,9 +16583,9 @@ fn apply_add_hive_ssh_controls_after_finalize(
     }
 
     if harden_ssh {
-        disable_remote_password_auth_with_access(address, key_path)
+        disable_remote_password_auth_with_access(address, key_path, user)
             .map_err(|err| format!("ssh hardening failed: {err}"))?;
-        verify_remote_ssh_hardening_with_access(address, key_path)
+        verify_remote_ssh_hardening_with_access(address, key_path, user)
             .map_err(|err| format!("ssh hardening verification failed: {err}"))?;
     }
 
@@ -16407,6 +16598,7 @@ fn apply_add_hive_ssh_controls_after_finalize(
 fn disable_remote_password_auth_with_access(
     address: &str,
     key_path: &Path,
+    user: &str,
 ) -> Result<(), OrchestratorError> {
     let set_password_auth_cmd = r#"bash -lc 'set -euo pipefail
 cfg="/etc/ssh/sshd_config"
@@ -16451,7 +16643,7 @@ fi'"#;
         address,
         key_path,
         &sudo_wrap(set_password_auth_cmd),
-        BOOTSTRAP_SSH_USER,
+        user,
     )?;
 
     let restart_ssh_cmd = r#"bash -lc "systemctl restart sshd || systemctl restart ssh || service sshd restart || service ssh restart""#;
@@ -16459,7 +16651,7 @@ fi'"#;
         address,
         key_path,
         &sudo_wrap(restart_ssh_cmd),
-        BOOTSTRAP_SSH_USER,
+        user,
     )?;
     Ok(())
 }
@@ -16467,20 +16659,22 @@ fi'"#;
 fn verify_remote_ssh_hardening_with_access(
     address: &str,
     key_path: &Path,
+    user: &str,
 ) -> Result<(), OrchestratorError> {
-    verify_remote_key_access_after_hardening(address, key_path)?;
-    verify_remote_password_auth_is_rejected(address)?;
+    verify_remote_key_access_after_hardening(address, key_path, user)?;
+    verify_remote_password_auth_is_rejected(address, user)?;
     Ok(())
 }
 
 fn verify_remote_key_access_after_hardening(
     address: &str,
     key_path: &Path,
+    user: &str,
 ) -> Result<(), OrchestratorError> {
     let cmd = "sudo -n /bin/bash -lc 'exit 0'";
     let mut last_err: Option<String> = None;
     for attempt in 1..=SSH_HARDEN_VERIFY_RETRIES {
-        match ssh_with_key(address, key_path, cmd, BOOTSTRAP_SSH_USER) {
+        match ssh_with_key(address, key_path, cmd, user) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 last_err = Some(err.to_string());
@@ -16498,10 +16692,15 @@ fn verify_remote_key_access_after_hardening(
     .into())
 }
 
-fn verify_remote_password_auth_is_rejected(address: &str) -> Result<(), OrchestratorError> {
+fn verify_remote_password_auth_is_rejected(
+    address: &str,
+    user: &str,
+) -> Result<(), OrchestratorError> {
     let mut last_err: Option<String> = None;
     for attempt in 1..=SSH_HARDEN_VERIFY_RETRIES {
-        match ssh_with_pass_any(address, "true", BOOTSTRAP_SSH_USER) {
+        // We expect this probe to FAIL; the password value is irrelevant to the
+        // assertion (it must be rejected regardless), so an empty one is fine.
+        match ssh_with_pass_any(address, "true", user, "") {
             Ok(()) => {
                 return Err(
                     "password authentication still accepted after hardening; expected rejection"
@@ -16540,6 +16739,7 @@ fn is_password_auth_rejection_error(message: &str) -> bool {
 fn apply_remote_from_only_authorized_key_with_access(
     address: &str,
     key_path: &Path,
+    user: &str,
     pub_key: &str,
     source_patterns: &[String],
 ) -> Result<(), OrchestratorError> {
@@ -16577,19 +16777,21 @@ mv \"$auth_keys.tmp\" \"$auth_keys\"\n\
 printf '%s\\n' '{entry}' >> \"$auth_keys\"\n\
 chown \"$user:$user\" \"$auth_keys\"\n\
 chmod 600 \"$auth_keys\"\n",
-        user = BOOTSTRAP_SSH_USER,
+        user = user,
         gate_path = shell_single_quote(ORCH_SSH_GATE_PATH),
         key_material = shell_single_quote(key_material),
         entry = shell_single_quote(&entry),
     );
     let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
-    ssh_with_key(address, key_path, &cmd, BOOTSTRAP_SSH_USER)?;
+    ssh_with_key(address, key_path, &cmd, user)?;
     Ok(())
 }
 
 fn apply_remote_unrestricted_authorized_key_with_pass(
     address: &str,
     pub_key: &str,
+    user: &str,
+    password: &str,
 ) -> Result<(), OrchestratorError> {
     let key_material = pub_key
         .split_whitespace()
@@ -16609,20 +16811,22 @@ chmod 600 ~/.ssh/authorized_keys\n",
         entry = shell_single_quote(pub_key),
     );
     let cmd = format!("bash -lc '{}'", shell_single_quote(&script));
-    ssh_with_pass_any(address, &cmd, BOOTSTRAP_SSH_USER)?;
+    ssh_with_pass_any(address, &cmd, user, password)?;
     Ok(())
 }
 
-fn remote_orchestrator_sudoers_contents() -> String {
+fn remote_orchestrator_sudoers_contents(user: &str) -> String {
     format!(
         "Defaults:{} !requiretty\n{} ALL=(root) NOPASSWD: /bin/systemctl, /usr/bin/systemctl, /bin/systemd-run, /usr/bin/systemd-run, /usr/bin/install, /bin/mkdir, /usr/bin/mkdir, /bin/rm, /usr/bin/rm, /bin/cp, /usr/bin/cp, /bin/mv, /usr/bin/mv, /bin/cat, /usr/bin/cat, /usr/bin/sha256sum, /usr/bin/stat, /usr/bin/tee, /bin/chmod, /usr/bin/chmod, /bin/chown, /usr/bin/chown, /usr/bin/rsync, /usr/sbin/ufw, /usr/bin/firewall-cmd, /usr/sbin/service, /bin/bash, /usr/bin/bash\n",
-        BOOTSTRAP_SSH_USER, BOOTSTRAP_SSH_USER
+        user, user
     )
 }
 
 fn ensure_remote_orchestrator_sudoers_with_access(
     address: &str,
     key_path: &Path,
+    user: &str,
+    password: &str,
 ) -> Result<(), OrchestratorError> {
     // Always rewrite sudoers from known-good template.
     // This avoids stale/partial states that can leave sudo -n inconsistent.
@@ -16631,7 +16835,7 @@ fn ensure_remote_orchestrator_sudoers_with_access(
         "fluxbee-orchestrator-sudoers-{}.tmp",
         now_epoch_ms()
     ));
-    fs::write(&local_tmp, remote_orchestrator_sudoers_contents())?;
+    fs::write(&local_tmp, remote_orchestrator_sudoers_contents(user))?;
     let local_tmp_str = local_tmp.to_string_lossy().to_string();
     let local_refs = [local_tmp_str.as_str()];
     let remote_tmp = format!("/tmp/fluxbee-orchestrator-sudoers-{}", now_epoch_ms());
@@ -16640,7 +16844,7 @@ fn ensure_remote_orchestrator_sudoers_with_access(
         key_path,
         &local_refs,
         &remote_tmp,
-        BOOTSTRAP_SSH_USER,
+        user,
     );
     if let Err(err) = upload_result {
         let _ = fs::remove_file(&local_tmp);
@@ -16651,57 +16855,58 @@ fn ensure_remote_orchestrator_sudoers_with_access(
         remote_tmp = shell_single_quote(&remote_tmp),
         sudoers = shell_single_quote(ORCH_SUDOERS_PATH),
     );
-    let apply_cmd = sudo_wrap_with_pass(&format!("bash -lc '{}'", shell_single_quote(&script)));
-    let apply_result = ssh_with_key(address, key_path, &apply_cmd, BOOTSTRAP_SSH_USER);
+    let apply_cmd =
+        sudo_wrap_with_pass(&format!("bash -lc '{}'", shell_single_quote(&script)), password);
+    let apply_result = ssh_with_key(address, key_path, &apply_cmd, user);
     let _ = fs::remove_file(&local_tmp);
     apply_result?;
     ssh_with_key(
         address,
         key_path,
         &sudo_wrap("/bin/systemctl --version"),
-        BOOTSTRAP_SSH_USER,
+        user,
     )
     .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (systemctl): {err}"))?;
     ssh_with_key(
         address,
         key_path,
         &sudo_wrap("systemd-run --version"),
-        BOOTSTRAP_SSH_USER,
+        user,
     )
     .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (systemd-run): {err}"))?;
     ssh_with_key(
         address,
         key_path,
         &sudo_wrap("/usr/bin/install --version"),
-        BOOTSTRAP_SSH_USER,
+        user,
     )
     .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (install): {err}"))?;
     ssh_with_key(
         address,
         key_path,
         &sudo_wrap("/bin/chmod --version"),
-        BOOTSTRAP_SSH_USER,
+        user,
     )
     .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (chmod): {err}"))?;
     ssh_with_key(
         address,
         key_path,
         &sudo_wrap("/bin/bash -lc 'exit 0'"),
-        BOOTSTRAP_SSH_USER,
+        user,
     )
     .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (bash): {err}"))?;
     ssh_with_key(
         address,
         key_path,
         &sudo_wrap("/usr/bin/mkdir -p /tmp"),
-        BOOTSTRAP_SSH_USER,
+        user,
     )
     .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (mkdir): {err}"))?;
     ssh_with_key(
         address,
         key_path,
         &sudo_wrap("/usr/bin/cat /etc/hosts >/dev/null"),
-        BOOTSTRAP_SSH_USER,
+        user,
     )
     .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (cat): {err}"))?;
     Ok(())
@@ -16725,8 +16930,13 @@ fn askpass_script(password: &str) -> Result<PathBuf, OrchestratorError> {
     Ok(path)
 }
 
-fn ssh_with_pass(address: &str, command: &str, user: &str) -> Result<(), OrchestratorError> {
-    let askpass = askpass_script(BOOTSTRAP_SSH_PASS)?;
+fn ssh_with_pass(
+    address: &str,
+    command: &str,
+    user: &str,
+    password: &str,
+) -> Result<(), OrchestratorError> {
+    let askpass = askpass_script(password)?;
     let mut cmd = Command::new("setsid");
     cmd.arg("ssh")
         .arg("-o")
@@ -16749,8 +16959,13 @@ fn ssh_with_pass(address: &str, command: &str, user: &str) -> Result<(), Orchest
     result
 }
 
-fn ssh_with_pass_kbd(address: &str, command: &str, user: &str) -> Result<(), OrchestratorError> {
-    let askpass = askpass_script(BOOTSTRAP_SSH_PASS)?;
+fn ssh_with_pass_kbd(
+    address: &str,
+    command: &str,
+    user: &str,
+    password: &str,
+) -> Result<(), OrchestratorError> {
+    let askpass = askpass_script(password)?;
     let mut cmd = Command::new("setsid");
     cmd.arg("ssh")
         .arg("-o")
@@ -16777,10 +16992,15 @@ fn ssh_with_pass_kbd(address: &str, command: &str, user: &str) -> Result<(), Orc
     result
 }
 
-fn ssh_with_pass_any(address: &str, command: &str, user: &str) -> Result<(), OrchestratorError> {
-    match ssh_with_pass(address, command, user) {
+fn ssh_with_pass_any(
+    address: &str,
+    command: &str,
+    user: &str,
+    password: &str,
+) -> Result<(), OrchestratorError> {
+    match ssh_with_pass(address, command, user, password) {
         Ok(()) => Ok(()),
-        Err(pass_err) => match ssh_with_pass_kbd(address, command, user) {
+        Err(pass_err) => match ssh_with_pass_kbd(address, command, user, password) {
             Ok(()) => {
                 tracing::warn!(
                     target = address,
@@ -16897,13 +17117,14 @@ fn public_key_from_private_key(key_path: &Path) -> Result<String, OrchestratorEr
 fn write_remote_file(
     address: &str,
     key_path: &Path,
+    user: &str,
     remote_path: &str,
     contents: &str,
 ) -> Result<(), OrchestratorError> {
     let escaped = contents.replace('\'', "'\"'\"'");
     let cmd = format!("cat > {} <<'EOF'\n{}\nEOF", remote_path, escaped);
     let sudo_cmd = sudo_wrap(&format!("bash -lc \"{}\"", cmd.replace('"', "\\\"")));
-    ssh_with_key(address, key_path, &sudo_cmd, BOOTSTRAP_SSH_USER)
+    ssh_with_key(address, key_path, &sudo_cmd, user)
 }
 
 fn wait_for_wan(
@@ -16985,8 +17206,7 @@ fn wait_for_remote_orchestrator_node(
                 if node.name_len == 0 {
                     continue;
                 }
-                let node_name =
-                    String::from_utf8_lossy(&node.name[..node.name_len as usize]).into_owned();
+                let node_name = shm_name_to_string(&node.name, node.name_len);
                 visible_nodes.push(node_name.clone());
                 if node_name == expected_node || node_name == "SY.orchestrator" {
                     return Ok(());
@@ -17107,8 +17327,8 @@ fn sudo_wrap(cmd: &str) -> String {
     format!("sudo -n {}", cmd)
 }
 
-fn sudo_wrap_with_pass(cmd: &str) -> String {
-    let pass = BOOTSTRAP_SSH_PASS.replace('\'', "'\"'\"'");
+fn sudo_wrap_with_pass(cmd: &str, password: &str) -> String {
+    let pass = password.replace('\'', "'\"'\"'");
     format!("echo '{}' | sudo -S -p '' {}", pass, cmd)
 }
 
@@ -17213,6 +17433,96 @@ mod tests {
 
     const LOCAL_DEVICE_ID: &str = "V7TZE22-7TDF4XG-KXILPOJ-NXFPHYF-HPXR2AH-YCZKW5G-XAOGXS3-AKHUFAC";
     const PEER_DEVICE_ID: &str = "I7MM32M-LYH7OVN-TCPA6G4-MIFHRC6-T7RKRVN-Q35OZRX-MGZMVA3-X7Y24QF";
+
+    // F9: an add_hive retry must resume a `pending` hive (complete its finalize)
+    // but still reject a `connected` one as HIVE_EXISTS. The entry guards key off
+    // hive_status; this pins that it distinguishes the two and tolerates absence.
+    #[test]
+    fn hive_status_distinguishes_pending_from_connected() {
+        let root = std::env::temp_dir().join(format!("fluxbee-hive-status-{}", Uuid::new_v4()));
+
+        fs::create_dir_all(root.join("pend")).expect("create pending hive dir");
+        write_hive_info(
+            &root,
+            "pend",
+            &serde_json::json!({"hive_id": "pend", "status": "pending"}),
+        )
+        .expect("write pending info");
+        assert_eq!(hive_status(&root, "pend").as_deref(), Some("pending"));
+
+        fs::create_dir_all(root.join("conn")).expect("create connected hive dir");
+        write_hive_info(
+            &root,
+            "conn",
+            &serde_json::json!({"hive_id": "conn", "status": "connected"}),
+        )
+        .expect("write connected info");
+        assert_eq!(hive_status(&root, "conn").as_deref(), Some("connected"));
+
+        // Absent/unreadable info.yaml -> None, which callers treat as
+        // non-resumable (the HIVE_EXISTS path), never as a pending resume.
+        assert_eq!(hive_status(&root, "missing"), None);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // F20: a corrupt/torn SHM writer can report name_len past the buffer (it is a
+    // u16). The decode must clamp to the buffer instead of panicking, since a
+    // panic in watchdog_tick would disable self-healing forever (F14).
+    #[test]
+    fn shm_name_to_string_clamps_oversized_len() {
+        let mut buf = [0u8; 256];
+        buf[..5].copy_from_slice(b"hello");
+        assert_eq!(shm_name_to_string(&buf, 5), "hello");
+        // Oversized len clamps to the 256-byte buffer rather than slicing OOB.
+        assert_eq!(shm_name_to_string(&buf, u16::MAX).len(), 256);
+        // Smaller buffers (router_name is [u8; 64]) clamp to their own size.
+        let small = [b'x'; 64];
+        assert_eq!(shm_name_to_string(&small, u16::MAX).len(), 64);
+    }
+
+    // F2: the socket-only finalize classifier must match the REAL Display strings
+    // of the transport errors (so a transient/offline worker is reported as
+    // retryable WORKER_SOCKET_UNREACHABLE) and must NOT match a genuine non-ok
+    // worker payload (which is a non-retryable FINALIZE_FAILED). Constructing the
+    // real RpcError variants pins the coupling to their Display format.
+    #[test]
+    fn is_socket_only_unreachable_error_matches_real_transport_strings() {
+        let unreachable = RpcError::Unreachable {
+            reason: "no route".into(),
+            original_dst: "SY.orchestrator@h".into(),
+        }
+        .to_string();
+        let ttl = RpcError::TtlExceeded {
+            original_dst: "SY.orchestrator@h".into(),
+            last_hop: "r1".into(),
+        }
+        .to_string();
+        let timeout = RpcError::Timeout {
+            trace_id: "t".into(),
+            target: "SY.orchestrator@h".into(),
+            request_msg: "ADD_HIVE_FINALIZE".into(),
+            response_msg: "ADD_HIVE_FINALIZE_RESPONSE".into(),
+            timeout_ms: 60000,
+        }
+        .to_string();
+        assert!(is_socket_only_unreachable_error(&unreachable), "{unreachable}");
+        assert!(is_socket_only_unreachable_error(&ttl), "{ttl}");
+        assert!(is_socket_only_unreachable_error(&timeout), "{timeout}");
+
+        // LSA preflight strings from forward_system_action_to_hive_with_timeout.
+        assert!(is_socket_only_unreachable_error(
+            "target hive 'h' not reachable in LSA (stale/missing)"
+        ));
+        assert!(is_socket_only_unreachable_error(
+            "target orchestrator 'SY.orchestrator@h' not visible in LSA for hive 'h' (visible: none)"
+        ));
+
+        // A genuine non-ok worker payload is FINALIZE_FAILED, never retryable.
+        assert!(!is_socket_only_unreachable_error(
+            "worker finalize returned non-ok payload: {\"status\":\"error\",\"error_code\":\"INVALID_REQUEST\"}"
+        ));
+    }
 
     fn egress_section(enabled: bool) -> EgressSection {
         EgressSection {
@@ -17377,6 +17687,33 @@ mod tests {
             resolve_add_hive_role(&serde_json::json!({"role": null})).unwrap(),
             HiveRole::Worker
         );
+    }
+
+    #[test]
+    fn resolve_add_hive_ssh_creds_requires_user_and_optional_password() {
+        // ssh_user + ssh_password both present -> Ok with both.
+        let creds = resolve_add_hive_ssh_creds(
+            &serde_json::json!({"ssh_user": "admin", "ssh_password": "secret"}),
+        )
+        .unwrap();
+        assert_eq!(creds.user, "admin");
+        assert_eq!(creds.password.as_deref(), Some("secret"));
+
+        // ssh_user present, no ssh_password -> Ok, password None.
+        let creds = resolve_add_hive_ssh_creds(&serde_json::json!({"ssh_user": "admin"})).unwrap();
+        assert_eq!(creds.user, "admin");
+        assert!(creds.password.is_none());
+
+        // empty ssh_password is treated as None.
+        let creds =
+            resolve_add_hive_ssh_creds(&serde_json::json!({"ssh_user": "admin", "ssh_password": "   "}))
+                .unwrap();
+        assert!(creds.password.is_none());
+
+        // ssh_user missing -> Err. ssh_user empty/whitespace -> Err.
+        assert!(resolve_add_hive_ssh_creds(&serde_json::json!({})).is_err());
+        assert!(resolve_add_hive_ssh_creds(&serde_json::json!({"ssh_user": ""})).is_err());
+        assert!(resolve_add_hive_ssh_creds(&serde_json::json!({"ssh_user": "   "})).is_err());
     }
 
     #[test]

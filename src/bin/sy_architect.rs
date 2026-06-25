@@ -9458,9 +9458,14 @@ async fn handle_chat_message(
                 match clear_pending_action(state, &resolved_session_id).await {
                     Some(pending) => {
                         let now = now_epoch_ms();
-                        let params_json =
-                            serde_json::to_string(&normalize_json(&pending.translation.params))
-                                .unwrap_or_else(|_| "{}".to_string());
+                        // Redact secret fields (e.g. ssh_password) before persisting
+                        // params to the operations log — secret-at-rest. The live
+                        // dispatch uses the in-memory translation.params; readers of
+                        // the persisted copy only extract hive_id, so redaction is safe.
+                        let params_json = serde_json::to_string(&redact_json_secret_fields(
+                            &normalize_json(&pending.translation.params),
+                        ))
+                        .unwrap_or_else(|_| "{}".to_string());
                         let record = ChatOperationRecord {
                             operation_id: pending.operation_id,
                             session_id: resolved_session_id.clone(),
@@ -12854,8 +12859,13 @@ async fn execute_tracked_admin_translation(
     }
 
     let now = now_epoch_ms();
-    let params_json =
-        serde_json::to_string(&normalize_json(&translation.params)).unwrap_or_else(|_| "{}".into());
+    // Redact secret fields (e.g. ssh_password) before persisting params to the
+    // operations log — secret-at-rest. The live dispatch uses translation.params
+    // directly; persisted-copy readers only extract hive_id, so redaction is safe.
+    let params_json = serde_json::to_string(&redact_json_secret_fields(&normalize_json(
+        &translation.params,
+    )))
+    .unwrap_or_else(|_| "{}".into());
     let created_at_ms = existing_match
         .as_ref()
         .filter(|record| existing_operation_id.as_deref() == Some(record.operation_id.as_str()))

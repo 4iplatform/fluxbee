@@ -5669,6 +5669,9 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         return 502;
     }
     match code.as_str() {
+        // Worker orchestrator is online but a socket op failed transiently
+        // (add_hive did not fall back to SSH); the client should retry.
+        "WORKER_SOCKET_UNREACHABLE" => 503,
         "INVALID_REQUEST" | "INVALID_ADDRESS" | "INVALID_ARCHIVE" | "INVALID_HIVE_ID"
         | "INVALID_ZIP" | "INVALID_KEY_FORMAT" | "INVALID_VALUE" => 400,
         "UNAUTHORIZED" | "SYSTEM_ILK_PROTECTED" => 403,
@@ -7465,6 +7468,11 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
                 "string",
                 "WAN or bootstrap address reachable from motherbee.",
             ),
+            admin_action_body_field(
+                "ssh_user",
+                "string",
+                "Admin SSH login on the empty target box for the initial bootstrap. Required (no default). The orchestrator uses it key-first, falling back to the password channel (ssh_password) only on a fresh box; it is never stored.",
+            ),
         ],
         "publish_runtime_package" => vec![admin_action_body_field(
             "source",
@@ -7655,6 +7663,11 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             ),
         ],
         "add_hive" => vec![
+            admin_action_body_field(
+                "ssh_password",
+                "string",
+                "Admin SSH password for the initial bootstrap of an empty box. Optional: only needed when the bootstrap key is not yet seeded (fresh box). Never logged, never stored — redacted at rest.",
+            ),
             admin_action_body_field(
                 "role",
                 "string",
