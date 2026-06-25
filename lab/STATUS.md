@@ -68,8 +68,8 @@ orquestación, identity, vault (Model D'), storage, cognition, dist-sync,
 
 **Limitado en Docker (necesita VM):**
 
-| | Por qué |
-|---|---|
+| Componente | Por qué |
+| --- | --- |
 | Rol **egress/NAT** | `ip_forward`, `nft MASQUERADE`, conntrack — kernel netfilter (F10/F11/F17). |
 | Firewall **ufw** | queda `inactive` en el container — el hardening de firewall no se aplica. |
 | Boot/reboot | restart de container ≠ reboot de VM (afecta cosas de arranque de egress). |
@@ -98,5 +98,6 @@ y el flujo de creds end-to-end.
 - [ ] Actualizar **scripts E2E** (`ssh_user` requerido) + docs de contrato (`sy_orchestrator_v2_tasks.md` items F1/F2).
 - [ ] **Lote de seguridad** del audit: F7/F12/F13 (iface), F8, F3, F4/F15, F11.
 - [ ] **Lote egress**: F5/F6/F16/F17 + validar F10/F11 en **VM** (Fase 2 del lab).
-- [ ] **Distribución**: imagen **slim multi-stage** + push a registry (GHCR / Docker Hub) para compartir sin recompilar; multi-arch si hay devs en Apple Silicon.
+- [x] **Distribución**: workflow `.github/workflows/lab-image.yml` pushea a GHCR las dos flavors — `slim` (multi-stage, ~1.9 GB, `:latest`, boot validado) y `fat` (~9 GB). Repo público → GHCR + Actions **gratis e ilimitado**. **Falta disparar**: `git tag lab-v0.1 && git push --tags` (o Run workflow).
+- [ ] Distribución (mejoras): slim aún duplica binarios (`/usr/bin` + `dist/core/bin`) y syncthing — se puede bajar más. Multi-arch (arm64) si hay devs en Apple Silicon.
 - [ ] **AI**: cargar OpenAI key reproducible; scope/ejecución de la **extensión Anthropic**.

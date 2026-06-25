@@ -47,10 +47,29 @@ systemctl start postgresql 2>/dev/null || pg_ctlcluster "$(ls /usr/lib/postgresq
 sleep 2
 FLUXBEE_DB_USER=fluxbee FLUXBEE_DB_PASSWORD=fluxbee bash scripts/fluxbee_db_bootstrap.sh
 
-echo "lab-install: [3/6] scripts/install.sh (build no-op + units, unchanged)..."
-export FLUXBEE_DB_BOOTSTRAP_ON_INSTALL=0 RESTART_ORCHESTRATOR_AFTER_INSTALL=0 \
-       APPLY_DEV_OWNERSHIP=0 INSTALL_OWNER=root CLEAN_RUNTIME_VOLATILE_ON_INSTALL=1
-bash scripts/install.sh >/tmp/install.log 2>&1 && echo "  install.sh OK" || { echo "  install.sh FAILED:"; tail -20 /tmp/install.log; exit 1; }
+echo "lab-install: [3/6] scripts/install.sh (build no-op + units)..."
+if command -v sy-orchestrator >/dev/null 2>&1 && [ -f /etc/systemd/system/sy-orchestrator.service ]; then
+  # Slim image: install.sh already ran in the builder stage (binaries + units
+  # baked). Just let systemd pick up the copied unit files.
+  echo "  fluxbee already installed (slim image) — skipping install.sh"
+  systemctl daemon-reload
+else
+  export FLUXBEE_DB_BOOTSTRAP_ON_INSTALL=0 RESTART_ORCHESTRATOR_AFTER_INSTALL=0 \
+         APPLY_DEV_OWNERSHIP=0 INSTALL_OWNER=root CLEAN_RUNTIME_VOLATILE_ON_INSTALL=1
+  bash scripts/install.sh >/tmp/install.log 2>&1 && echo "  install.sh OK" || { echo "  install.sh FAILED:"; tail -20 /tmp/install.log; exit 1; }
+fi
+# Make the lab-edited hive.yaml the live config (the slim image baked the
+# original during the builder install; harmless re-copy on the fat image).
+install -m 0644 config/hive.yaml /etc/fluxbee/hive.yaml
+
+# Ensure the motherbee SSH key exists. The slim image deliberately does NOT bake
+# it (never ship a private key in a public image); generate a fresh one here.
+# On the fat path install.sh already created it, so this is a no-op.
+if [ ! -f /var/lib/fluxbee/ssh/motherbee.key ]; then
+  install -d -m 0700 /var/lib/fluxbee/ssh
+  ssh-keygen -t ed25519 -N "" -f /var/lib/fluxbee/ssh/motherbee.key >/dev/null
+  chmod 600 /var/lib/fluxbee/ssh/motherbee.key
+fi
 
 echo "lab-install: [4/6] starting sy-orchestrator (boots the SY stack; crash-loops until the DB secret lands)..."
 systemctl enable --now sy-orchestrator.service

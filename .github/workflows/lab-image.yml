@@ -1,10 +1,12 @@
-# Build the fluxbee lab image and push it to GHCR so devs can `docker pull`
-# instead of compiling locally (~25 min). Triggered manually or on a `lab-v*`
-# tag — NOT on every push, to keep CI minutes in check (the build is heavy).
+# Build the fluxbee lab images and push them to GHCR so devs can `docker pull`
+# instead of compiling locally (~25 min). Public repo → GHCR storage + Actions
+# are free/unlimited. Builds BOTH flavors: `slim` (multi-stage, ~hundreds of MB,
+# also tagged `latest`) and `fat` (single-stage, ~2.2 GB, full toolchain).
+# Triggered manually or on a `lab-v*` tag (not every push).
 name: lab-image
 
 on:
-  workflow_dispatch: {}          # Run manually from the Actions tab.
+  workflow_dispatch: {}
   push:
     tags:
       - 'lab-v*'                  # e.g. git tag lab-v0.1 && git push --tags
@@ -16,11 +18,19 @@ permissions:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    timeout-minutes: 90          # full Rust+Go compile is long
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: slim
+            dockerfile: lab/Dockerfile.slim
+            also_latest: true     # slim is the default `:latest`
+          - flavor: fat
+            dockerfile: lab/Dockerfile
+            also_latest: false
     steps:
       - name: Free up disk space
-        # The fat build (toolchain + target/ + ~2.2GB image) can exceed the
-        # default runner disk. Reclaim space the build doesn't need.
         uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
@@ -48,21 +58,19 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/fluxbee-lab
           tags: |
-            type=ref,event=tag
-            type=raw,value=latest
-            type=sha,format=short
+            type=raw,value=${{ matrix.flavor }}
+            type=sha,prefix=${{ matrix.flavor }}-,format=short
+            type=raw,value=latest,enable=${{ matrix.also_latest }}
 
-      - name: Build and push
+      - name: Build and push (${{ matrix.flavor }})
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: lab/Dockerfile
+          file: ${{ matrix.dockerfile }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Layer cache across runs so unchanged-source rebuilds are faster.
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          # amd64 only for now. arm64 (Apple Silicon) needs a separate, slow
-          # emulated build — add `platforms: linux/amd64,linux/arm64` when needed.
+          cache-from: type=gha,scope=${{ matrix.flavor }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.flavor }}
+          # amd64 only. arm64 (Apple Silicon) = a separate, slow emulated build.
           provenance: false

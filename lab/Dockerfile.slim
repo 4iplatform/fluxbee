@@ -1,0 +1,112 @@
+# Fluxbee lab — SLIM multi-stage image.
+#
+# Stage 1 (builder): full toolchain, compile, then run scripts/install.sh with
+# systemctl/sudo stubbed so the install completes in a build layer (no systemd) —
+# baking /usr/bin binaries, /etc/systemd/system units, /var/lib/fluxbee/dist and
+# /etc/fluxbee. Stage 2 (runtime): systemd + runtime deps only (NO toolchain),
+# with the installed artifacts copied in. The fluxbee binaries link only glibc
+# (verified via ldd), so the runtime needs no extra libs.
+#
+# Result: hundreds of MB instead of ~2.2 GB. fluxbee source/install.sh unchanged.
+# Build context is the repo root (see docker-compose.yml). Same lab-install.sh as
+# the fat image — it detects the baked install and skips the rebuild.
+
+# ---------------------------------------------------------------- builder -----
+FROM ubuntu:24.04 AS builder
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    PATH=/root/.cargo/bin:/usr/local/go/bin:/usr/lib/go/bin:$PATH \
+    HOME=/root \
+    GOPATH=/root/go \
+    GOMODCACHE=/root/go/pkg/mod \
+    CARGO_BUILD_JOBS=4
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git file python3 xz-utils sudo \
+      build-essential pkg-config libssl-dev cmake clang \
+      protobuf-compiler libprotobuf-dev golang \
+  && rm -rf /var/lib/apt/lists/*
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain stable --profile minimal
+
+WORKDIR /opt/fluxbee
+COPY . /opt/fluxbee
+
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    cargo build --release --bins \
+  && cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov \
+  && cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner \
+  && cargo build --release --manifest-path nodes/io/Cargo.toml -p io-api -p io-slack \
+  && (cd go/sy-opa-rules && go build -o sy-opa-rules .) \
+  && (cd go/sy-timer && go build -o sy-timer .) \
+  && (cd go/sy-wf-rules && go build -o sy-wf-rules .) \
+  && (cd go/nodes/wf/wf-generic && go build -o wf-generic .)
+
+# Stub systemctl + sudo so scripts/install.sh runs unchanged without systemd:
+# it installs binaries -> /usr/bin, units -> /etc/systemd/system, dist+config,
+# creates the fluxbee user, seeds syncthing/runtimes. On a fresh install the
+# restart blocks are skipped (is-active=false), and daemon-reload is a no-op.
+# openssh-client (ssh-keygen) — install.sh generates the motherbee key. Added in
+# a late layer so the cached compile above is not invalidated.
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client \
+ && rm -rf /var/lib/apt/lists/* \
+ && printf '#!/bin/sh\ncase "$1" in show) echo not-found ;; is-active) exit 1 ;; *) exit 0 ;; esac\n' > /usr/local/bin/systemctl \
+ && printf '#!/bin/sh\nexec env "$@"\n' > /usr/local/bin/sudo \
+ && chmod +x /usr/local/bin/systemctl /usr/local/bin/sudo
+RUN FLUXBEE_DB_BOOTSTRAP_ON_INSTALL=0 RESTART_ORCHESTRATOR_AFTER_INSTALL=0 \
+    APPLY_DEV_OWNERSHIP=0 INSTALL_OWNER=root CLEAN_RUNTIME_VOLATILE_ON_INSTALL=0 \
+    bash scripts/install.sh \
+ && rm -f /var/lib/fluxbee/ssh/motherbee.key /var/lib/fluxbee/ssh/motherbee.key.pub
+# ^ never bake a private key into the (public) image; lab-install.sh regenerates
+#   it at runtime.
+
+# ---------------------------------------------------------------- runtime -----
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
+
+# systemd + what fluxbee/the lab need at RUNTIME. No build toolchain; binaries
+# link only glibc (base). PostgreSQL baked so first boot needs no apt.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      systemd systemd-sysv dbus dbus-user-session \
+      openssh-server openssh-client sudo \
+      ufw nftables iproute2 iptables iputils-ping procps \
+      ca-certificates curl file python3 \
+      postgresql \
+  && rm -rf /var/lib/apt/lists/*
+RUN systemctl mask \
+      systemd-udevd.service systemd-udevd-kernel.socket systemd-udevd-control.socket \
+      systemd-modules-load.service sys-kernel-config.mount sys-kernel-debug.mount \
+      getty.target console-getty.service \
+      systemd-firstboot.service systemd-resolved.service 2>/dev/null || true
+
+# Recreate the managed system user; ownership of copied state is fixed below.
+RUN useradd --system --home-dir /var/lib/fluxbee/syncthing --shell /usr/sbin/nologin fluxbee || true
+
+# Installed artifacts from the builder (the result of scripts/install.sh).
+COPY --from=builder \
+  /usr/bin/rt-gateway /usr/bin/sy-admin /usr/bin/sy-config-routes /usr/bin/sy-architect \
+  /usr/bin/sy-vault /usr/bin/sy-orchestrator /usr/bin/sy-storage /usr/bin/sy-identity \
+  /usr/bin/sy-cognition /usr/bin/sy-policy /usr/bin/sy-opa-rules /usr/bin/sy-timer \
+  /usr/bin/sy-wf-rules /usr/bin/sy-frontdesk-gov /usr/bin/wf-generic \
+  /usr/bin/
+COPY --from=builder /etc/systemd/system/ /etc/systemd/system/
+COPY --from=builder /etc/fluxbee/ /etc/fluxbee/
+COPY --from=builder /var/lib/fluxbee/ /var/lib/fluxbee/
+# Repo bits lab-install.sh / worker-install.sh still read at runtime.
+COPY --from=builder /opt/fluxbee/scripts/ /opt/fluxbee/scripts/
+COPY --from=builder /opt/fluxbee/config/ /opt/fluxbee/config/
+COPY --from=builder /opt/fluxbee/vendor/ /opt/fluxbee/vendor/
+RUN chown -R fluxbee:fluxbee /var/lib/fluxbee/syncthing /var/lib/fluxbee/blob 2>/dev/null || true
+
+# Lab boot wiring (same one-shot/script as the fat image; it detects the baked
+# install and skips the rebuild).
+COPY lab/lab-install.sh /usr/local/bin/lab-install.sh
+COPY lab/fluxbee-lab-install.service /etc/systemd/system/fluxbee-lab-install.service
+RUN chmod 0755 /usr/local/bin/lab-install.sh \
+  && mkdir -p /run/sshd \
+  && systemctl enable fluxbee-lab-install.service \
+  && systemctl enable ssh
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

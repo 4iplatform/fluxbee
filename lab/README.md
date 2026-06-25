@@ -30,6 +30,15 @@ docker compose -f lab/docker-compose.yml up -d
 docker compose -f lab/docker-compose.yml up -d --build
 ```
 
+GHCR publishes two flavors (`.github/workflows/lab-image.yml`):
+
+| Tag | Built from | Size | Notes |
+| --- | --- | --- | --- |
+| `:slim` / `:latest` | `lab/Dockerfile.slim` | ~1.9 GB | multi-stage, no toolchain — **recommended pull**; boots faster (install baked). |
+| `:fat` | `lab/Dockerfile` | ~9 GB | single-stage, full toolchain; what `compose build` builds locally. |
+
+The compose pulls `:latest` (slim). For the fat: `docker pull ghcr.io/4iplatform/fluxbee-lab:fat`.
+
 Then:
 
 ```bash
