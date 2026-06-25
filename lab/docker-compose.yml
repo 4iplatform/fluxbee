@@ -1,0 +1,46 @@
+# Fluxbee lab — Phase 0: motherbee only.
+#
+# systemd runs as PID 1 inside the container (cgroup v2 + privileged). Phases 1-2
+# (worker / egress containers + add_hive over SSH) get added as services here.
+#
+#   docker compose -f lab/docker-compose.yml up -d --build
+#   docker compose -f lab/docker-compose.yml logs -f motherbee
+#   docker exec -it fluxbee-motherbee bash
+#
+services:
+  motherbee:
+    build:
+      context: ..
+      dockerfile: lab/Dockerfile
+    image: fluxbee-lab:latest
+    container_name: fluxbee-motherbee
+    hostname: motherbee
+    # systemd-in-docker (cgroup v2). Privileged keeps Phase 0 friction-free; the
+    # egress role later needs NET_ADMIN regardless.
+    privileged: true
+    cgroup: host
+    stop_signal: SIGRTMIN+3
+    tmpfs:
+      - /run
+      - /run/lock
+      - /tmp
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      # Persist fluxbee state across restarts (drop the volume to reset).
+      - motherbee_state:/var/lib/fluxbee
+      # Bind the boot provisioner so it can be iterated without rebuilding the image.
+      - ./lab-install.sh:/usr/local/bin/lab-install.sh:ro
+    ports:
+      # Admin HTTP API (hive.yaml admin.listen). Also reachable via docker exec.
+      - "8080:8080"
+      # Architect HTTP UI/API.
+      - "3000:3000"
+    networks:
+      - flux
+
+networks:
+  flux:
+    name: fluxbee-lab
+
+volumes:
+  motherbee_state:

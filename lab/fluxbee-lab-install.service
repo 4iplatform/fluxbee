@@ -1,0 +1,16 @@
+[Unit]
+Description=Fluxbee lab one-shot install (motherbee bootstrap)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/lab-install.sh
+# Build-at-boot is a freshness no-op (compiled in the image), but keep headroom.
+TimeoutStartSec=1800
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

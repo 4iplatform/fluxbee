@@ -1,0 +1,12 @@
+# Build artifacts (wrong platform / huge) — the image rebuilds for linux.
+target/
+**/target/
+# VCS & local tooling
+.git/
+.devcontainer/
+# Audits / scratch
+docs/audits/
+**/*.log
+# Node / misc
+node_modules/
+**/node_modules/
