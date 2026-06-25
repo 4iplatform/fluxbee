@@ -5,8 +5,8 @@ testing — no VMs required. `systemd` runs as PID 1 inside each container, so t
 canonical `scripts/install.sh` and the orchestrator's service lifecycle work
 unchanged.
 
-> **Status: Phase 0 — motherbee only.** Worker / egress containers and
-> `add_hive`-over-SSH come in Phase 1-2.
+> **Status: Phase 1 — motherbee + worker.** A `worker1` container (empty box)
+> joins the mesh via `add_hive` over SSH. Egress (Phase 2) is next.
 
 ## Requirements
 
@@ -48,6 +48,27 @@ curl -s localhost:8080/hives | jq .
 # or inside
 docker exec fluxbee-motherbee sy-admin --help
 ```
+
+## Phase 1: add a worker over SSH
+
+`docker compose up` also brings up `worker1` — an **empty** Linux box (sshd +
+admin login `administrator`/`labpass` + Postgres, no fluxbee). Bootstrap it from
+motherbee with `add_hive`, supplying the SSH credentials in the payload (this is
+the caller-supplied-creds flow):
+
+```bash
+WIP=$(docker exec fluxbee-motherbee getent hosts worker1 | awk '{print $1}')
+docker exec fluxbee-motherbee curl -s -X POST localhost:8080/hives \
+  -H 'content-type: application/json' \
+  -d "{\"hive_id\":\"worker1\",\"address\":\"$WIP\",\"ssh_user\":\"administrator\",\"ssh_password\":\"labpass\",\"role\":\"worker\"}"
+
+curl -s localhost:8080/inventory | jq '.payload.hives'   # motherbee + worker1
+```
+
+motherbee SSHes in (key-first; falls back to the password to seed its key, then
+operates over the key), copies the core binaries, installs the worker's SY stack,
+and links dist-sync. `address` must be an **IP** (the orchestrator runs
+`ip route get` on it).
 
 ## Reset
 

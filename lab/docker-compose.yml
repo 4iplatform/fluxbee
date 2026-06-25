@@ -23,7 +23,8 @@ services:
     tmpfs:
       - /run
       - /run/lock
-      - /tmp
+      # NB: /tmp stays on the overlay fs (exec) — Docker tmpfs defaults to noexec,
+      # which breaks ssh askpass during the add_hive password bootstrap.
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
       # Persist fluxbee state across restarts (drop the volume to reset).
@@ -35,6 +36,27 @@ services:
       - "8080:8080"
       # Architect HTTP UI/API.
       - "3000:3000"
+    networks:
+      - flux
+
+  # Phase 1: an EMPTY Linux box (sshd + admin login + Postgres, no fluxbee).
+  # motherbee bootstraps it via `add_hive` over SSH. Reuses the same image; the
+  # bind-mount makes the baked one-shot run worker-install.sh instead.
+  worker1:
+    image: fluxbee-lab:latest
+    container_name: fluxbee-worker1
+    hostname: worker1
+    privileged: true
+    cgroup: host
+    stop_signal: SIGRTMIN+3
+    tmpfs:
+      - /run
+      - /run/lock
+      # NB: /tmp stays on the overlay fs (exec) — Docker tmpfs defaults to noexec,
+      # which breaks ssh askpass during the add_hive password bootstrap.
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ./worker-install.sh:/usr/local/bin/lab-install.sh:ro
     networks:
       - flux
 
