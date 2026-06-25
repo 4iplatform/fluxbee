@@ -5,6 +5,31 @@ Commit auditado: `78428c5`
 Branch: `daily_onworking_coa`
 Archivo principal: `src/bin/sy_orchestrator.rs` (20562 lineas)
 
+## Estado de resolucion (actualizado 2026-06-25)
+
+Reconciliacion del trabajo posterior a la auditoria. Prioridad acordada con el operador: **operativos primero, seguridad despues** — la red es interna con puertas definidas y SSH se usa solo para el bootstrap inicial. Por eso el lote operativo + SSH-only-bootstrap se resolvio primero; el lote de seguridad (inyeccion de iface, gates de origen, allowlist) queda pendiente **por decision, no por descuido**.
+
+**Resueltos (6 de 24):**
+
+- **F1** remove_hive socket-only — SSH operativo eliminado; online -> `socket_ok/socket`, offline -> `local_only/local_only`, sin fallback SSH. *Validado empiricamente (lab, online + offline).*
+- **F2** add_hive sin fallback SSH — `WORKER_SOCKET_UNREACHABLE` retryable cuando el worker esta online; clasificador alineado a los strings reales de `RpcError`. *Validado empiricamente (lab).*
+- **F9** add_hive idempotente — reintento sobre `pending` resume via fast-path socket; `connected` sigue dando `HIVE_EXISTS`. *Validado empiricamente (lab) + unit test.*
+- **F10** egress hardening fatal — el `Err` arm retorna `SSH_HARDEN_FAILED`/`SSH_KEY_FAILED`; info.yaml queda `pending` (reanudable) en fallo. *Codigo + revision adversarial (SOUND); falta validacion empirica (necesita rol egress, Fase 2 del lab).*
+- **F14** watchdog panic-safe — `WatchdogRunGuard` (Drop) resetea el flag aun ante panic. *Unit test.*
+- **F20** clamp de slices SHM — `shm_name_to_string` centraliza y clampa los 7 sitios. *Unit test.*
+
+Ademas (no era finding del audit; cambio de diseno del operador): **las credenciales SSH del bootstrap se movieron al payload de `add_hive`** (`ssh_user` requerido / `ssh_password` opcional, probe key-first), eliminando los `administrator`/`magicAI` hardcodeados; el secreto se redacta en SY.architect; el schema de admin se actualizo. *Validado empiricamente (lab: worker bootstrapeado con creds del payload).*
+
+**Pendientes (18 de 24)** — por severidad:
+
+- **Alta (5):** **F7** (RCE root via iface sin validar — *el #1 del orden sugerido, SIGUE ABIERTO*), F8 (ADMIN_COMMAND sin gate de origen), F3 (traversal de `hive_id`), F4 (allowlist `system` no configurable), F11 (remove_hive egress no des-aprovisiona NAT — *tiene angulo operativo: router huerfano post-reboot*).
+- **Media (8):** F12 + F13 (inyeccion nft / YAML — **mismo fix de iface que F7**), F5 (egress reporta `ok` incompleto), F6 (drift egress), F15 (allowlist cross-hive), F16 (conntrack_tuned), F17 (nft no carga al boot), F18 (TOCTOU sin lock).
+- **Baja (5):** F19, F21, F22, F23, F25.
+
+**Nota de seguridad (importante):** **F7** (con sus hermanos F12/F13) es el pendiente de mayor prioridad. El lote de creds reescribio el *threading* de `write_remote_file` (agrego el parametro `user`) pero **no** corrigio la construccion de shell por interpolacion ni agrego la allowlist de nombre de interfaz — el vector de F7 sigue abierto. Bajo el modelo interno+gated es motherbee/admin-autenticado (no RCE remoto no-autenticado), pero es un cruce real string-de-config -> shell como root.
+
+Estado de codigo: los fixes resueltos viven en `src/` **sin commitear aun** (commit aparte del lab). Validacion: ver `lab/STATUS.md` (entorno containerizado donde F1/F2/F9 + creds se probaron sobre una malla real de 2 hives).
+
 ## Alcance
 
 Se reviso `sy.orchestrator` con foco en las funcionalidades recientes: contrato v2 socket-first, `add_hive`/`remove_hive`, hardening de origen para acciones `system`, y soporte `role=egress` / NAT. El diff completo contra `main` es amplio; esta auditoria prioriza el comportamiento de `src/bin/sy_orchestrator.rs` y los contratos documentados alrededor de ese binario.
