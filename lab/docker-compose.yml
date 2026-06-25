@@ -12,7 +12,7 @@ services:
     build:
       context: ..
       dockerfile: lab/Dockerfile
-    image: fluxbee-lab:latest
+    image: ghcr.io/4iplatform/fluxbee-lab:latest
     container_name: fluxbee-motherbee
     hostname: motherbee
     # systemd-in-docker (cgroup v2). Privileged keeps Phase 0 friction-free; the
@@ -43,7 +43,7 @@ services:
   # motherbee bootstraps it via `add_hive` over SSH. Reuses the same image; the
   # bind-mount makes the baked one-shot run worker-install.sh instead.
   worker1:
-    image: fluxbee-lab:latest
+    image: ghcr.io/4iplatform/fluxbee-lab:latest
     container_name: fluxbee-worker1
     hostname: worker1
     privileged: true

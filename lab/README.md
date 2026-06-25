@@ -18,9 +18,21 @@ unchanged.
 
 ## Run
 
+Two ways to get the image:
+
 ```bash
-# Build the image and start motherbee (first build is slow — full compile).
+# A) Pull the prebuilt image from GHCR (no compile). Needs `docker login ghcr.io`
+#    if the package is private. Built by .github/workflows/lab-image.yml.
+docker compose -f lab/docker-compose.yml pull
+docker compose -f lab/docker-compose.yml up -d
+
+# B) Build it locally (~25 min full compile) — first run only.
 docker compose -f lab/docker-compose.yml up -d --build
+```
+
+Then:
+
+```bash
 
 # Watch first boot: the one-shot install + sy-orchestrator bringing up the stack.
 docker compose -f lab/docker-compose.yml logs -f motherbee
