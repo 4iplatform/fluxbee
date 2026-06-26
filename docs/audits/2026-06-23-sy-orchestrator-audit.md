@@ -9,8 +9,9 @@ Archivo principal: `src/bin/sy_orchestrator.rs` (20562 lineas)
 
 Reconciliacion del trabajo posterior a la auditoria. Prioridad acordada con el operador: **operativos primero, seguridad despues** — la red es interna con puertas definidas y SSH se usa solo para el bootstrap inicial. Por eso el lote operativo + SSH-only-bootstrap se resolvio primero; ahora se abrio el lote de seguridad arrancando por el #1 del orden sugerido (inyeccion de iface, F7/F12/F13).
 
-**Resueltos (11 de 24):**
+**Resueltos (12 de 24):**
 
+- **F8** gate de origen en el canal ADMIN — cambio de 2 componentes: el relay `SY.admin` estampa su identidad `SY.admin@<hive>` y `handle_admin` gatea las acciones mutantes a `== SY.admin@<su-hive>`. *4 unit tests + revisión adversarial (GO, sin regresión: todo el tráfico admin rutea al orchestrator local). Residual: hop-1 sin gatear (finding aparte).*
 - **F11** teardown NAT en `remove_hive` egress — lee `role`, manda `egress_teardown`, el host removido limpia nft+ficheros+sysctl (idempotente, antepuesto al kill de servicios); respuesta señaliza el orphan offline. *Unit test + revisión adversarial (race del cgroup + orphan offline corregidos). **Falta validación empírica en VM (Fase 2).***
 - **F3** traversal de `hive_id` — `valid_hive_id`/`valid_address` movidos al inicio de `add_hive_flow`/`add_egress_hive_flow` (antes de todo `join`/`remove_dir_all`/`create_dir_all`) + backstop léxico `hive_dir_is_direct_child` antes de cada op destructiva. *Unit test + revisión adversarial (GO).*
 - **F7** RCE root via iface — `validate_iface_name` (allowlist `^[A-Za-z0-9._-]{1,15}$`, IFNAMSIZ, rechaza `.`/`..`) aplicado a `wan_iface`/`lan_iface` en `resolve_egress_nat_config` (el unico constructor de `EgressNatConfig`), antes de cualquier sink. Ademas `write_remote_file` reescrito: el contenido va por **stdin** a `sudo -n tee '<path>'`, sin interpolacion en shell. *Unit test (accept/reject exhaustivo) + revision adversarial multi-agente (GO, 0 defectos bloqueantes; reachability/charset/rewrite verificados).*
@@ -28,9 +29,9 @@ Reconciliacion del trabajo posterior a la auditoria. Prioridad acordada con el o
 
 Ademas (no era finding del audit; cambio de diseno del operador): **las credenciales SSH del bootstrap se movieron al payload de `add_hive`** (`ssh_user` requerido / `ssh_password` opcional, probe key-first), eliminando los `administrator`/`magicAI` hardcodeados; el secreto se redacta en SY.architect; el schema de admin se actualizo. *Validado empiricamente (lab: worker bootstrapeado con creds del payload).*
 
-**Pendientes (13 de 24)** — por severidad:
+**Pendientes (12 de 24)** — por severidad:
 
-- **Alta (2):** F8 (ADMIN_COMMAND sin gate de origen — *siguiente; requiere cambio en 2 componentes, ver nota*), F4 (allowlist `system` no configurable).
+- **Alta (1):** F4 (allowlist `system` no configurable — *con su extensión cross-hive F15; ahora el siguiente*).
 - **Media (6):** F5 (egress reporta `ok` incompleto), F6 (drift egress), F15 (allowlist cross-hive), F16 (conntrack_tuned), F17 (nft no carga al boot), F18 (TOCTOU sin lock).
 - **Baja (5):** F19, F21, F22, F23, F25.
 
@@ -81,7 +82,7 @@ Tambien hay tres bugs de las funcionalidades nuevas comparten una sola causa rai
 | ID | Sev | Area | Titulo | Verificacion | Backlog |
 |----|-----|------|--------|--------------|---------|
 | F7  | Alta | ssh-transport | ✅ RESUELTO — RCE como root en `write_remote_file` (iface sin validar) | empirica | nuevo (antes Baja) |
-| F8  | Alta | origin-auth | `ADMIN_COMMAND` sin gate de origen | lectura | nuevo |
+| F8  | Alta | origin-auth | ✅ RESUELTO — `ADMIN_COMMAND` sin gate de origen | lectura | nuevo |
 | F1  | Alta | remove_hive | SSH operativo en `remove_hive` | lectura+git | contradice `[x]` v2:21 |
 | F2  | Alta | add_hive | `add_hive` socket-only cae a bootstrap SSH | lectura | contradice `[x]` v2:22 |
 | F3  | Alta | add_hive | ✅ RESUELTO — Borra dir antes de validar `hive_id` (traversal) | empirica | nuevo (antes Critica) |
@@ -140,6 +141,8 @@ Recomendacion:
 2. Reescribir `write_remote_file` para no construir shell por interpolacion: pasar `contents` por stdin a `ssh ... sudo tee <path>` (o `scp`, ya existe `scp_with_key:16855`), sin la capa envolvente `bash -lc "..."`.
 
 ### F8 - Alta - `ADMIN_COMMAND` no consulta allowlist de origen para acciones destructivas
+
+> **RESUELTO (2026-06-26) — cambio de 2 componentes.** El diseño reveló que **todo** el tráfico admin legítimo llegaba con `src_l2_name: None`, así que el gate "obvio" habría roto toda la API admin. Fix en dos partes: **(A)** `send_admin_request` (sy_admin.rs) ahora estampa la identidad del relay `SY.admin@<hive>` en vez de `None` (5 call-sites pasan `&admin_node_name(&ctx.hive_id)`; el SDK `send_admin_rpc` se dejó en `None` a propósito — architect/diag llegan vía el relay que re-estampa). **(B)** `handle_admin` gatea las acciones mutantes: `admin_action_requires_origin` (reusa `classify_admin_action` + `start_node`/`restart_node` explícitos) `&&` `is_allowed_admin_source_name` (`== SY.admin@<su-propio-hive>`, exacto, same-hive). Todas las acciones admin rutean al orchestrator **local** (`action_routes_via_local_orchestrator`), así que relay-hive == target-hive → sin regresión cross-hive. 4 unit tests (predicado + e2e `None`→FORBIDDEN + foreign→FORBIDDEN). Revisión adversarial multi-agente: **GO, 0 defectos bloqueantes** (regresión / cobertura+bypass / correctitud verificados). **Residual conocido (finding aparte):** el hop-1 (caller → socket interno de SY.admin) sigue sin gatear; el gate es defensa-en-profundidad sobre nombre auto-afirmado, no barrera criptográfica (eso llega con la auth de transporte de F4/F15).
 
 Verificacion: lectura.
 

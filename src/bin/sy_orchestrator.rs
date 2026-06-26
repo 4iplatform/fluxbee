@@ -37,8 +37,8 @@ use fluxbee_sdk::rpc::{
     RpcError, SystemRpcRequest,
 };
 use fluxbee_sdk::{
-    classify_admin_action, classify_system_message, derive_action_outcome, NodeConfig, NodeSender,
-    NodeUuidMode, ADMIN_KIND, MSG_ADMIN_COMMAND,
+    classify_admin_action, classify_system_message, derive_action_outcome, ActionClass, NodeConfig,
+    NodeSender, NodeUuidMode, ADMIN_KIND, MSG_ADMIN_COMMAND,
 };
 use json_router::{
     runtime_manifest::{
@@ -1425,6 +1425,25 @@ async fn handle_admin(
     state: &OrchestratorState,
 ) -> Result<(), OrchestratorError> {
     let action = msg.meta.action.as_deref().unwrap_or("");
+
+    // F8: gate state-mutating admin actions on an authorized origin. The SY.admin
+    // relay stamps `SY.admin@<hive>` (see send_admin_request); a None or foreign
+    // origin on a mutation is rejected here before any flow runs. Read-only actions
+    // (hive_status, list_*, get_*) are unaffected. This is additive with the
+    // per-action `is_motherbee` gate, which answers a different question (may this
+    // node perform the change) than this one (is the caller authorized to ask).
+    if admin_action_requires_origin(action)
+        && !is_allowed_admin_source_name(state, msg.routing.src_l2_name.as_deref())
+    {
+        tracing::warn!(
+            action = action,
+            src_uuid = %msg.routing.src,
+            src_l2_name = ?msg.routing.src_l2_name,
+            "blocked admin action from unauthorized origin"
+        );
+        return send_admin_forbidden(sender, msg, action, "admin action origin not allowed").await;
+    }
+
     tracing::info!(action = action, trace_id = %msg.routing.trace_id, "admin action received");
     let payload = match action {
         "hive_status" => {
@@ -1882,6 +1901,46 @@ fn is_allowed_system_source_name(state: &OrchestratorState, src_l2_name: Option<
         || name.starts_with("SY.admin@")
         || name.starts_with("SY.wf-rules@")
         || name.starts_with("WF.orch.diag@")
+}
+
+/// F8: an admin action requires origin authorization iff it is state-mutating.
+/// Reuses the canonical `classify_admin_action` so the gate cannot drift as admin
+/// actions are added. `start_node`/`restart_node` are node-lifecycle mutations
+/// handled by this orchestrator but not catalogued by the classifier (it returns
+/// None for them), so they are named explicitly. Read-only and unknown actions
+/// (the latter already fall through to NOT_IMPLEMENTED) stay ungated.
+fn admin_action_requires_origin(action: &str) -> bool {
+    if matches!(action, "start_node" | "restart_node") {
+        return true;
+    }
+    matches!(
+        classify_admin_action(action),
+        Some(
+            ActionClass::Write
+                | ActionClass::SystemConfig
+                | ActionClass::TopologyChange
+                | ActionClass::NodeLifecycle
+                | ActionClass::IdentityChange
+                | ActionClass::ExternalAction
+                | ActionClass::SendMessage
+                | ActionClass::WorkflowStep
+        )
+    )
+}
+
+/// F8: the orchestrator only accepts mutating admin actions relayed by its OWN
+/// hive's SY.admin. Tighter than `is_allowed_system_source_name` on purpose: every
+/// admin command routes `SY.admin@<hive>` -> `SY.orchestrator@<same hive>`
+/// (action_routes_via_local_orchestrator), so there is no legitimate cross-hive or
+/// cross-role admin origin. `src_l2_name` is self-asserted at this layer — this is
+/// defense-in-depth against cross-role/cross-hive mesh injection and against the
+/// un-named (None) shape an unauthorized direct mesh sender would carry, not a
+/// cryptographic boundary (that arrives with transport auth, cf. F4/F15).
+fn is_allowed_admin_source_name(state: &OrchestratorState, src_l2_name: Option<&str>) -> bool {
+    let Some(name) = src_l2_name.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    name == format!("SY.admin@{}", state.hive_id)
 }
 
 fn forbidden_system_source_payload(msg: &Message, src_l2_name: Option<&str>) -> serde_json::Value {
@@ -18666,11 +18725,16 @@ blob:
         (client, harness)
     }
 
-    fn test_admin_command(trace_id: &str, action: &str, payload: serde_json::Value) -> Message {
+    fn test_admin_command_with_origin(
+        trace_id: &str,
+        action: &str,
+        payload: serde_json::Value,
+        src_l2_name: Option<&str>,
+    ) -> Message {
         Message {
             routing: Routing {
                 src: "admin-test-uuid".to_string(),
-                src_l2_name: Some("SY.admin@motherbee".to_string()),
+                src_l2_name: src_l2_name.map(str::to_string),
                 dst: Destination::Unicast("SY.orchestrator@motherbee".to_string()),
                 ttl: 16,
                 trace_id: trace_id.to_string(),
@@ -18684,6 +18748,13 @@ blob:
             },
             payload,
         }
+    }
+
+    fn test_admin_command(trace_id: &str, action: &str, payload: serde_json::Value) -> Message {
+        // Default fixture carries the production-authorized relay identity so the
+        // F8 origin gate admits it. Tests that exercise the gate's rejection path
+        // use test_admin_command_with_origin with None / a foreign name.
+        test_admin_command_with_origin(trace_id, action, payload, Some("SY.admin@motherbee"))
     }
 
     fn test_system_message(trace_id: &str, msg_name: &str, payload: serde_json::Value) -> Message {
@@ -19101,6 +19172,164 @@ blob:
             &state,
             Some("SY.orchestrator.relay.123@motherbee")
         ));
+    }
+
+    #[test]
+    fn f8_admin_action_requires_origin_classifies_mutations() {
+        // Mutating admin actions must be gated.
+        for action in [
+            "add_hive",
+            "remove_hive",
+            "kill_node",
+            "run_node",
+            "start_node",          // not catalogued by classify_admin_action; named explicitly
+            "restart_node",        // idem
+            "set_node_config",
+            "set_storage",
+            "remove_node_instance",
+        ] {
+            assert!(
+                admin_action_requires_origin(action),
+                "{action} must require origin auth"
+            );
+        }
+        // Read-only and unknown actions stay ungated.
+        for action in [
+            "hive_status",
+            "get_storage",
+            "list_nodes",
+            "list_hives",
+            "get_hive",
+            "get_node_status",
+            "get_node_config",
+            "list_versions",
+            "get_versions",
+            "list_deployments",
+            "get_drift_alerts",
+            "totally_unknown_action",
+        ] {
+            assert!(
+                !admin_action_requires_origin(action),
+                "{action} must NOT require origin auth"
+            );
+        }
+    }
+
+    #[test]
+    fn f8_is_allowed_admin_source_name_accepts_only_local_admin() {
+        let state = sample_orchestrator_state_for_tests(); // hive_id == "motherbee"
+        // The only authorized origin is this hive's SY.admin (trimmed).
+        assert!(is_allowed_admin_source_name(&state, Some("SY.admin@motherbee")));
+        assert!(is_allowed_admin_source_name(
+            &state,
+            Some("  SY.admin@motherbee  ")
+        ));
+        // The production None shape, empties, and every foreign/cross-role/cross-hive
+        // name are rejected — this is exactly what the relay-stamp (Part A) feeds.
+        for bad in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("SY.admin@otherhive"),
+            Some("SY.orchestrator@motherbee"),
+            Some("SY.wf-rules@motherbee"),
+            Some("WF.orch.diag@motherbee"),
+            Some("AI.evil@motherbee"),
+            Some("SY.admin"),
+            Some("motherbee"),
+        ] {
+            assert!(
+                !is_allowed_admin_source_name(&state, bad),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn f8_admin_mutation_from_unnamed_origin_is_forbidden() {
+        // Production shape: the relay would carry SY.admin@<hive>; an unauthorized
+        // direct mesh sender carries None. The gate must reject None on a mutation
+        // BEFORE the flow runs — proving the fix is not a no-op (the default fixture
+        // stamps a valid name, which would mask this).
+        let state = Arc::new(sample_orchestrator_state_for_tests());
+        let (client, mut harness) = attach_test_rpc(&state);
+        let admin_rx = client
+            .take_command_receiver(RPC_CH_ADMIN)
+            .await
+            .expect("admin receiver");
+        {
+            let state = Arc::clone(&state);
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                run_admin_worker(state, client, admin_rx).await;
+            });
+        }
+        harness
+            .inject(test_admin_command_with_origin(
+                "f8-none-trace",
+                "kill_node",
+                serde_json::json!({ "target": "workerbee", "node_name": "AI.demo@workerbee" }),
+                None,
+            ))
+            .await
+            .expect("inject admin command");
+
+        let reply = time::timeout(Duration::from_secs(1), harness.next_outgoing())
+            .await
+            .expect("forbidden reply emitted")
+            .expect("reply message");
+        assert_eq!(reply.routing.trace_id, "f8-none-trace");
+        assert_eq!(
+            reply.payload.get("error_code").and_then(|v| v.as_str()),
+            Some("FORBIDDEN"),
+            "unnamed-origin kill_node must be FORBIDDEN, got {:?}",
+            reply.payload
+        );
+        // No SPAWN_NODE / system forward should have been emitted (flow never ran).
+        assert!(
+            time::timeout(Duration::from_millis(50), harness.next_outgoing())
+                .await
+                .is_err(),
+            "no further messages: the gated flow must not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn f8_admin_mutation_from_foreign_admin_is_forbidden() {
+        // A spoofed/cross-hive SY.admin must also be rejected.
+        let state = Arc::new(sample_orchestrator_state_for_tests());
+        let (client, mut harness) = attach_test_rpc(&state);
+        let admin_rx = client
+            .take_command_receiver(RPC_CH_ADMIN)
+            .await
+            .expect("admin receiver");
+        {
+            let state = Arc::clone(&state);
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                run_admin_worker(state, client, admin_rx).await;
+            });
+        }
+        harness
+            .inject(test_admin_command_with_origin(
+                "f8-foreign-trace",
+                "remove_hive",
+                serde_json::json!({ "hive_id": "workerbee" }),
+                Some("SY.admin@evil"),
+            ))
+            .await
+            .expect("inject admin command");
+
+        let reply = time::timeout(Duration::from_secs(1), harness.next_outgoing())
+            .await
+            .expect("forbidden reply emitted")
+            .expect("reply message");
+        assert_eq!(
+            reply.payload.get("error_code").and_then(|v| v.as_str()),
+            Some("FORBIDDEN"),
+            "foreign-admin remove_hive must be FORBIDDEN, got {:?}",
+            reply.payload
+        );
     }
 
     #[test]

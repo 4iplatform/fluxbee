@@ -15,18 +15,18 @@ Origen: [`docs/audits/2026-06-23-sy-orchestrator-audit.md`](../docs/audits/2026-
 Prioridad acordada: **operativos primero, seguridad después** (red interna con
 puertas definidas; SSH solo para bootstrap inicial).
 
-**Resueltos (11):** `F1` `F2` `F9` `F10` `F14` `F20` `F7` `F12` `F13` `F3` `F11`
-— código en `src/`. F1/F2/F9 validados empíricamente en el lab; F10/F11 con
+**Resueltos (12):** `F1` `F2` `F9` `F10` `F14` `F20` `F7` `F12` `F13` `F3` `F11`
+`F8` — código en `src/`. F1/F2/F9 validados empíricamente en el lab; F10/F11 con
 revisión adversarial (falta validación egress en VM); F14/F20 con unit tests;
-**F7/F12/F13** y **F3** con unit tests + revisión adversarial multi-agente (GO).
-**F11** con unit test + revisión adversarial (NO-GO inicial → corregido el race
-del cgroup-kill y el orphan offline sin señal → re-verificado).
+**F7/F12/F13**, **F3** y **F8** con unit tests + revisión adversarial multi-agente
+(GO). **F11** con unit test + revisión adversarial (NO-GO inicial → corregido →
+re-verificado). **F8** fue cambio de 2 componentes (relay sy_admin estampa
+`SY.admin@<hive>` + gate en handle_admin).
 
-**Pendientes (13):**
+**Pendientes (12):**
 
-- **Alta:** `F8` (gate de origen ADMIN — **siguiente; requiere 2 componentes**),
-  `F4` (allowlist).
-- **Media:** `F5` `F6` `F16` `F17` (egress), `F15` (cross-hive), `F18` (TOCTOU lock).
+- **Alta:** `F4` (allowlist configurable — **siguiente**, con su extensión `F15`).
+- **Media:** `F5` `F6` `F16` `F17` (egress), `F18` (TOCTOU lock).
 - **Baja:** `F19` `F21` `F22` `F23` `F25`.
 
 > ✅ **F7/F12/F13 cerrados** (eran el #1 del audit). Un solo allowlist de iface
@@ -99,7 +99,7 @@ y el flujo de creds end-to-end.
 - [ ] **Commit** de los cambios `src/` del audit (F1/F2/F9/F10/F14/F20 + creds) — separado del lab.
 - [ ] **Review adversarial** del código del lote creds.
 - [ ] Actualizar **scripts E2E** (`ssh_user` requerido) + docs de contrato (`sy_orchestrator_v2_tasks.md` items F1/F2).
-- [ ] **Lote de seguridad** del audit: ~~F7/F12/F13 (iface)~~ ✅ ~~F3~~ ✅ ~~F11~~ ✅ (falta VM), **F8** (siguiente, 2 componentes), F4/F15.
+- [ ] **Lote de seguridad** del audit: ~~F7/F12/F13 (iface)~~ ✅ ~~F3~~ ✅ ~~F11~~ ✅ (falta VM) ~~F8~~ ✅, **F4/F15** (siguiente, cross-hive-aware), F18.
 - [ ] **Lote egress**: F5/F6/F16/F17 + validar F10/F11 en **VM** (Fase 2 del lab).
 - [x] **Distribución**: workflow `.github/workflows/lab-image.yml` pushea a GHCR las dos flavors — `slim` (multi-stage, ~1.9 GB, `:latest`, boot validado) y `fat` (~9 GB). Repo público → GHCR + Actions **gratis e ilimitado**. **Falta disparar**: `git tag lab-v0.1 && git push --tags` (o Run workflow).
 - [ ] Distribución (mejoras): slim aún duplica binarios (`/usr/bin` + `dist/core/bin`) y syncthing — se puede bajar más. Multi-arch (arm64) si hay devs en Apple Silicon.

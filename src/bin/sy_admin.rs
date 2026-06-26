@@ -6461,7 +6461,7 @@ async fn handle_admin_query(
     }
     let payload = normalize_admin_payload(action, serde_json::json!({}), hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
-    let response = send_admin_request(client, request, admin_action_timeout(action)).await;
+    let response = send_admin_request(client, request, admin_action_timeout(action), &admin_node_name(&ctx.hive_id)).await;
     Ok(build_admin_http_response(action, response))
 }
 
@@ -6474,7 +6474,7 @@ async fn handle_admin_query_with_payload(
 ) -> Result<(u16, String), AdminError> {
     let payload = normalize_admin_payload(action, payload, hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
-    let response = send_admin_request(client, request, admin_action_timeout(action)).await;
+    let response = send_admin_request(client, request, admin_action_timeout(action), &admin_node_name(&ctx.hive_id)).await;
     Ok(build_admin_http_response(action, response))
 }
 
@@ -9507,7 +9507,12 @@ async fn query_runtime_usage_global_visible(
         }),
         Some(ctx.hive_id.clone()),
     );
-    let payload = send_admin_request(client, request, admin_action_timeout("get_runtime"))
+    let payload = send_admin_request(
+        client,
+        request,
+        admin_action_timeout("get_runtime"),
+        &admin_node_name(&ctx.hive_id),
+    )
         .await
         .map_err(|err| err.to_string())?;
     if !payload_is_ok(&payload) {
@@ -10362,7 +10367,7 @@ async fn handle_admin_command(
     let payload = normalize_admin_payload(action, payload, hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
     let target_hive = extract_hive_from_target(&request.target);
-    let mut response = send_admin_request(client, request, admin_action_timeout(action)).await;
+    let mut response = send_admin_request(client, request, admin_action_timeout(action), &admin_node_name(&ctx.hive_id)).await;
     if let Ok(ref payload) = response {
         if let Some(status) = payload.get("status").and_then(|v| v.as_str()) {
             if status == "ok" {
@@ -11311,6 +11316,7 @@ async fn send_admin_request(
     client: &RouterDispatcher,
     request: AdminRequest,
     timeout_window: Duration,
+    relay_l2_name: &str,
 ) -> Result<serde_json::Value, AdminError> {
     let sender = client.sender_snapshot();
     let dst = request
@@ -11320,7 +11326,12 @@ async fn send_admin_request(
     let msg = Message {
         routing: Routing {
             src: sender.uuid().to_string(),
-            src_l2_name: None,
+            // F8: stamp this relay's own L2 identity (SY.admin@<hive>) so the
+            // orchestrator's admin-origin gate can distinguish a legitimate
+            // SY.admin relay from a spoofed/cross-role mesh sender. Previously
+            // None, which the gate cannot authorize without breaking every real
+            // admin call. The orchestrator only accepts SY.admin@<its-own-hive>.
+            src_l2_name: Some(relay_l2_name.to_string()),
             dst: Destination::Unicast(dst.clone()),
             ttl: 16,
             trace_id: String::new(),
@@ -11729,7 +11740,13 @@ async fn broadcast_full_config(
         serde_json::json!({}),
         target_hive.map(|s| s.to_string()),
     );
-    let response = send_admin_request(client, list_req, admin_action_timeout(list_action)).await?;
+    let response = send_admin_request(
+        client,
+        list_req,
+        admin_action_timeout(list_action),
+        &admin_node_name(&ctx.hive_id),
+    )
+    .await?;
     let payload = response
         .get("status")
         .and_then(|v| v.as_str())
