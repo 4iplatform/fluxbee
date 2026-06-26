@@ -126,19 +126,46 @@ y el flujo de creds end-to-end.
 
 ## Para investigar (anotado 2026-06-26)
 
-- **Vista de ilks por hive en SY.architect (posible bug).** Al pedir "ilks por
-  hive", `worker1` devuelve **19** (sus 7 propios + los 12 de `motherbee`),
-  mientras `motherbee` devuelve 12. Cada ilk viene **etiquetado con su hive
-  dueño** (p.ej. `SY.storage@motherbee`), así que el dato parece la **vista
-  replicada de la malla**, no corrupción. Hipótesis a discernir:
-  1. Replicación de SY.identity **por diseño** (cada hive sincroniza ilks vía
-     `identity.sync` puerto 9100) + archi/admin lo presenta como "ilks de
-     worker1" → bug de **presentación / scoping de la query** en archi o en el
-     endpoint admin.
-  2. El listado de ilks por hive **debería filtrar local-only** y no lo hace →
-     bug de **scoping** en admin / SY.identity.
-  3. El orchestrator no levantó bien algún nodo.
-  - Dónde mirar: endpoint admin de list-ilks (scoping por hive), replicación de
-    SY.identity (SHM/sync 9100), y cómo archi arma la consulta. Repro disponible
-    en el lab (motherbee + worker1, 21 nodos).
+- **Vista de ilks por hive — DIAGNOSTICADO (2026-06-26).** Síntoma: `worker1`
+  devuelve **19** (7 propios + 12 de `motherbee`), `motherbee` devuelve **12**
+  (solo los propios). **Causa raíz: la replicación de SY.identity es one-way
+  (primary → replica); los ilks locales de un replica NUNCA suben al primary.**
+  No es filtro del admin (hipótesis (b) descartada) — el admin devuelve fielmente
+  lo que cada SY.identity tiene; el dato simplemente **no está** en motherbee.
+  Evidencia en `src/bin/sy_identity.rs`:
+  - El **primary** (motherbee) bindea el listener `:9100`; el **replica** (worker)
+    hace `fetch_full_sync_from_primary(upstream)` al boot (de ahí los 12 que ve
+    worker1) + `run_delta_subscription_loop` → `stream_deltas_from_primary`
+    (**solo consume** deltas del primary).
+  - `handle_sync_connection` (primary) solo atiende `FULL_SYNC_REQUEST` (pushea
+    chunks) y `DELTA_SUBSCRIBE` (registra un sink al que **pushea**); **nunca lee
+    ilks del replica**.
+  - `ensure_system_ilks_from_hive` siembra los nodos del **hive local** (worker1
+    siembra sus 7 `@worker1` en su propia store); nunca se registran en el primary.
+  - `GET /hives/{hive}/identity/ilks` (`handle_admin_query("list_ilks", Some(hive))`)
+    es **single-hive**: consulta esa SY.identity y devuelve su contenido tal cual.
+  - Corolario: **no hay vista global completa en ningún lado**. Con un `worker2`,
+    sus ilks no los vería nadie salvo él mismo (no suben al primary → no se
+    re-broadcastean a worker1). worker1 "parece" completo solo porque tiene
+    primary(pull) + locales.
+  - **Opciones de fix** (decisión de diseño):
+    1. **Primary = registro global (bidireccional):** el replica empuja sus deltas
+       de ilk _hacia arriba_; el primary los mergea (ilk_id ya es `node@hive`,
+       additivo, sin conflicto) y re-broadcastea a todos. Cada hive ve todo.
+       Es el modelo correcto si se quiere "todo lo que interactúa tiene su ilk"
+       visible globalmente; alinea con router-authority (el router/identity del
+       primary podría resolver UUIDs de nodos worker). Cambio más grande (nuevo
+       path de push al upstream en el protocolo de sync).
+    2. **Agregación en el admin (presentación):** para la vista "global", el admin
+       hace fan-out de `list_ilks` a cada hive + mergea (reusar el patrón
+       `expected_hive_sets` que ya existe para OPA). No cambia la replicación;
+       da la vista completa on-demand pero la SY.identity local sigue sin conocer
+       ilks cross-hive (no sirve si routing/auth local los necesita resolver).
+    3. **Sembrar los ilks del worker en el primary al `add_hive`** (motherbee crea
+       los system-ilks del worker al provisionarlo) → entran al primary y bajan a
+       todos. Cambia _dónde_ se siembran.
+  - Recomendación: **(1)** si se quiere un registro global real (parece la
+    intención por "cada nodo tiene su ilk… todo lo que interactúa"); **(2)** como
+    quick-win de la vista si el bloqueo es solo de presentación. Repro en el lab
+    (motherbee + worker1).
 - [ ] **AI**: cargar OpenAI key reproducible; scope/ejecución de la **extensión Anthropic**.
