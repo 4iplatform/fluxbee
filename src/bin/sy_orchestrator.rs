@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::Mutex as StdMutex;
 use std::sync::{Arc, OnceLock};
@@ -1312,23 +1312,68 @@ async fn watchdog_tick(state: &OrchestratorState) {
         tracing::warn!(error = %err, "blob sync watchdog failed");
     }
 
-    watchdog_egress_reconcile(state);
+    // watchdog_egress_reconcile runs blocking subprocess I/O (nft/sysctl, and on
+    // the periodic drift tick a full reconcile incl. ping+curl up to ~7s).
+    // block_in_place lets the multi-thread runtime relocate other tasks off this
+    // worker thread while it blocks, so the periodic egress work never starves
+    // the admin/system message handlers (#[tokio::main] defaults to multi_thread).
+    tokio::task::block_in_place(|| watchdog_egress_reconcile(state));
 }
 
+/// Watchdog tick counter for egress drift correction (F6). Every
+/// `EGRESS_RECONCILE_DRIFT_TICKS` ticks the egress/worker reconcile is re-run
+/// idempotently so partial drift (a flushed chain, an edited rule, sysctl /
+/// conntrack drift that `nft_table_loaded()` cannot see) is corrected within
+/// ~N tick-intervals instead of only on the next reboot.
+static EGRESS_RECONCILE_TICKS: AtomicU64 = AtomicU64::new(0);
+/// At the 5s watchdog cadence, 12 ticks ≈ 60s between idempotent re-applies —
+/// bounds the nft delete+apply churn (its ms-window, F25) while still
+/// self-healing partial drift promptly.
+const EGRESS_RECONCILE_DRIFT_TICKS: u64 = 12;
+
 /// Re-establish egress drift on the watchdog tick (spec §6.5: "on startup and
-/// on reconcile"). Cheap: the egress NAT is only re-applied if its nft table
-/// vanished; the worker route uses idempotent `ip route replace` (no-op when
-/// already correct, so it never disrupts an established default route).
+/// on reconcile"). Two paths: the cheap table-missing fast path re-applies the
+/// NAT the instant the `fluxbee_egress` table vanishes; the periodic path
+/// (every `EGRESS_RECONCILE_DRIFT_TICKS`) re-applies the idempotent reconcile to
+/// correct partial drift the presence check can't see — a flushed chain, an
+/// edited rule, sysctl/conntrack drift (F6). The worker route uses idempotent
+/// `ip route replace` (no-op when already correct) plus a periodic IPv6-sysctl
+/// re-assert.
 fn watchdog_egress_reconcile(state: &OrchestratorState) {
     let Some(eg) = state.egress.as_ref() else {
         return;
     };
+    // F6: periodic idempotent drift correction on top of the cheap table-missing
+    // fast path. `tick % N == 0` fires on the first tick and then every N ticks.
+    let tick = EGRESS_RECONCILE_TICKS.fetch_add(1, Ordering::Relaxed);
+    let periodic = tick % EGRESS_RECONCILE_DRIFT_TICKS == 0;
     match state.role {
         HiveRole::Egress if eg.enabled => {
-            if !nft_table_loaded() {
+            let table_missing = !nft_table_loaded();
+            if table_missing {
                 tracing::warn!("egress nft table missing on watchdog; re-applying NAT");
-                if let Err(err) = reconcile_egress_nat(eg) {
-                    tracing::error!(error = %err, "watchdog egress NAT re-apply failed");
+            }
+            // Re-apply when the table vanished (fast path) or on the periodic
+            // tick (catches partial drift the presence check misses: a flushed
+            // chain, an edited rule, sysctl/conntrack drift). reconcile is
+            // idempotent (write_file_if_changed + nft delete+apply + sysctl).
+            if table_missing || periodic {
+                match reconcile_egress_nat(eg) {
+                    Ok(v) => {
+                        // F5: an egress whose NAT is applied but whose WAN has no
+                        // route to the internet is DEGRADED, not healthy. Surface
+                        // it on every drift tick (not just once at bootstrap) so an
+                        // operator tailing the journal sees a persistent signal.
+                        if !v.internet_reachable {
+                            tracing::warn!(
+                                target = EGRESS_PING_TARGET,
+                                "egress NAT healthy but internet unreachable — DEGRADED; check WAN uplink"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "watchdog egress NAT re-apply failed");
+                    }
                 }
             }
         }
@@ -1355,6 +1400,21 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
                     if let Err(err) = run_cmd(cmd, "watchdog ip route replace default") {
                         tracing::warn!(error = %err, "watchdog worker default-route re-apply failed");
                     }
+                }
+            }
+            // F6: re-assert the worker IPv6 block idempotently. It otherwise only
+            // runs at bootstrap (reconcile_worker_egress), so a runtime flip of
+            // disable_ipv6 (or an edit of the persisted file) would survive until
+            // reboot. write_file_if_changed keeps the file correct;
+            // `sysctl --system` re-asserts the live values from it.
+            if periodic {
+                if let Err(err) =
+                    write_file_if_changed(EGRESS_SYSCTL_PATH, worker_ipv6_sysctl_content())
+                {
+                    tracing::warn!(error = %err, "worker IPv6 sysctl file re-write failed");
+                }
+                if let Err(err) = apply_sysctl_system() {
+                    tracing::warn!(error = %err, "worker periodic sysctl re-assert failed");
                 }
             }
         }
@@ -3734,6 +3794,8 @@ const EGRESS_CONNTRACK_SYSCTL_PATH: &str = "/etc/sysctl.d/99-fluxbee-conntrack.c
 const EGRESS_CONNTRACK_MODPROBE_PATH: &str = "/etc/modprobe.d/fluxbee-conntrack.conf";
 const EGRESS_NFT_PATH: &str = "/etc/nftables.d/fluxbee-egress.nft";
 const EGRESS_NFT_TABLE: &str = "inet fluxbee_egress";
+const EGRESS_NFT_BOOT_UNIT: &str = "fluxbee-egress-nft.service";
+const EGRESS_NFT_BOOT_UNIT_PATH: &str = "/etc/systemd/system/fluxbee-egress-nft.service";
 const EGRESS_CONNTRACK_MAX: u32 = 262_144;
 const EGRESS_CONNTRACK_HASHSIZE: u32 = 65_536;
 const EGRESS_PING_TARGET: &str = "fluxbee.ai";
@@ -3752,6 +3814,10 @@ struct EgressVerification {
     nat_applied: bool,
     ipv4_forwarding: bool,
     ipv6_blocked: bool,
+    /// `true` = conntrack max applied **live** and verified by read-back;
+    /// `false` = pending-reboot (module not loaded yet / read-back mismatch).
+    /// The persisted sysctl + modprobe files apply it on the next boot either
+    /// way — `false` is not an error, just an honest "not live yet" (F16).
     conntrack_tuned: bool,
     route_applied: bool,
     internet_reachable: bool,
@@ -3987,16 +4053,59 @@ fn apply_sysctl_system() -> Result<(), OrchestratorError> {
     run_cmd(cmd, "sysctl --system")
 }
 
-/// Apply conntrack max live via `sysctl -w` (tolerant: the keys only exist once
-/// the nf_conntrack module is loaded; the persisted file handles next boot).
-fn apply_conntrack_live() {
+/// Apply conntrack max live via `sysctl -w`, then **verify** by reading
+/// `net.netfilter.nf_conntrack_max` back. Returns `true` only if the kernel now
+/// reports the target value (F16: the reported `conntrack_tuned` must reflect
+/// reality, not merely the fact that we *tried* to write it). The keys only
+/// exist once the `nf_conntrack` module is loaded; on a fresh boot the module
+/// may not be up yet, so a `false` here is expected and benign — the persisted
+/// sysctl + modprobe files apply the value on the next boot. A `false` means
+/// "pending-reboot", a `true` means "live".
+fn apply_conntrack_live() -> bool {
     for key in ["net.netfilter.nf_conntrack_max", "net.nf_conntrack_max"] {
         let mut cmd = Command::new("sysctl");
         cmd.arg("-w").arg(format!("{key}={EGRESS_CONNTRACK_MAX}"));
         if let Err(err) = run_cmd(cmd, "sysctl -w conntrack_max") {
-            tracing::warn!(key = key, error = %err, "conntrack max not applied live (will take effect on next boot via persisted sysctl)");
+            tracing::debug!(key = key, error = %err, "conntrack max not set live via this key (module not loaded? persisted file applies on next boot)");
         }
     }
+    // The write above is only "tuned live" if the kernel reports the target back.
+    match conntrack_max_live() {
+        Some(v) if v == EGRESS_CONNTRACK_MAX => true,
+        Some(v) => {
+            tracing::warn!(
+                observed = v,
+                expected = EGRESS_CONNTRACK_MAX,
+                "conntrack max read-back mismatch after sysctl -w; reporting pending-reboot"
+            );
+            false
+        }
+        None => {
+            tracing::warn!(
+                "conntrack max unreadable (nf_conntrack module not loaded yet?); reporting pending-reboot — persisted file applies on next boot"
+            );
+            false
+        }
+    }
+}
+
+/// Read the live conntrack max. Tries the canonical key first, then the legacy
+/// alias `net.nf_conntrack_max` — `apply_conntrack_live` writes both, so the
+/// read-back must accept either; a host that only exposes the alias would
+/// otherwise falsely report pending-reboot even though the value is live.
+/// `None` when neither key exists (the `nf_conntrack` module is not loaded yet)
+/// or the value is unparseable.
+fn conntrack_max_live() -> Option<u32> {
+    for key in ["net.netfilter.nf_conntrack_max", "net.nf_conntrack_max"] {
+        let mut cmd = Command::new("sysctl");
+        cmd.arg("-n").arg(key);
+        if let Ok(out) = run_cmd_output(cmd, "sysctl -n nf_conntrack_max") {
+            if let Ok(v) = out.trim().parse::<u32>() {
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 fn nft_table_loaded() -> bool {
@@ -4006,6 +4115,100 @@ fn nft_table_loaded() -> bool {
         .arg("inet")
         .arg("fluxbee_egress");
     run_cmd_output(cmd, "nft list table").is_ok()
+}
+
+/// Absolute path of an executable on `PATH`, for baking into a systemd unit's
+/// `ExecStart` (which requires an absolute path). Tries `command -v` first, then
+/// the usual sbin/bin locations. `name` is always a hardcoded literal here, so
+/// there is no injection surface.
+fn resolve_executable_path(name: &str) -> Option<String> {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(format!("command -v {name} 2>/dev/null"));
+    if let Ok(out) = run_cmd_output(cmd, "command -v") {
+        let path = out.trim();
+        if path.starts_with('/') {
+            return Some(path.to_string());
+        }
+    }
+    for candidate in [
+        format!("/usr/sbin/{name}"),
+        format!("/sbin/{name}"),
+        format!("/usr/bin/{name}"),
+        format!("/bin/{name}"),
+    ] {
+        if Path::new(&candidate).exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn egress_nft_boot_unit_contents(nft_path: &str) -> String {
+    // `Before=network-pre.target` + `DefaultDependencies=no` loads the table
+    // before any interface is configured, so no packet can be forwarded before
+    // the masquerade / `forward policy drop` rules exist. `ConditionPathExists`
+    // makes the unit a no-op if the ruleset file was removed (e.g. after egress
+    // teardown), so it never fails the boot on a decommissioned host.
+    format!(
+        "[Unit]\n\
+         Description=Fluxbee egress NAT — load {table} nftables at boot (F17)\n\
+         Documentation=man:nft(8)\n\
+         DefaultDependencies=no\n\
+         Wants=network-pre.target\n\
+         Before=network-pre.target\n\
+         ConditionPathExists={nft_file}\n\
+         \n\
+         [Service]\n\
+         Type=oneshot\n\
+         RemainAfterExit=yes\n\
+         ExecStart={nft} -f {nft_file}\n\
+         ExecReload={nft} -f {nft_file}\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        table = EGRESS_NFT_TABLE,
+        nft_file = EGRESS_NFT_PATH,
+        nft = nft_path,
+    )
+}
+
+/// Install + enable a boot-time systemd unit that loads the egress nft table
+/// before networking comes up (F17). Without it, after each reboot the host has
+/// `ip_forward=1` (persisted via /etc/sysctl.d) but **no** `fluxbee_egress`
+/// table until the orchestrator's bootstrap reconcile runs — a window with
+/// forwarding on and no masquerade / no `forward policy drop` / no IPv6 drop.
+/// `Before=network-pre.target` guarantees the table is present before any
+/// interface is configured, closing the window. Best-effort: the live NAT is
+/// already applied by the caller, so a systemd hiccup here only loses boot
+/// persistence (logged), it does not fail reconciliation. A genuine IO failure
+/// writing the unit file still propagates (fail loud).
+fn ensure_egress_nft_boot_unit() -> Result<(), OrchestratorError> {
+    let Some(nft_path) = resolve_executable_path("nft") else {
+        tracing::warn!(
+            "cannot resolve absolute path of 'nft'; skipping egress nft boot unit (table will load via orchestrator bootstrap only)"
+        );
+        return Ok(());
+    };
+    let contents = egress_nft_boot_unit_contents(&nft_path);
+    let changed = write_file_if_changed(EGRESS_NFT_BOOT_UNIT_PATH, &contents)?;
+    if changed {
+        // Fresh write (first install, or the resolved nft path changed): reload +
+        // enable. The enable symlink is durable on disk, so doing this only on
+        // change — not on every ~60s watchdog reconcile — avoids a subprocess
+        // spawn per tick while still persisting across orchestrator restarts.
+        tracing::info!(unit = EGRESS_NFT_BOOT_UNIT, "wrote egress nft boot unit");
+        let mut reload = Command::new("systemctl");
+        reload.arg("daemon-reload");
+        if let Err(err) = run_cmd(reload, "systemctl daemon-reload (egress nft unit)") {
+            tracing::warn!(error = %err, "systemctl daemon-reload failed after writing egress nft boot unit");
+        }
+        let mut enable = Command::new("systemctl");
+        enable.arg("enable").arg(EGRESS_NFT_BOOT_UNIT);
+        if let Err(err) = run_cmd(enable, "systemctl enable egress nft unit") {
+            tracing::warn!(error = %err, unit = EGRESS_NFT_BOOT_UNIT, "could not enable egress nft boot unit (table still loads via orchestrator bootstrap)");
+        }
+    }
+    Ok(())
 }
 
 /// Whether the current IPv4 default route already points at `gateway_ip`.
@@ -4090,8 +4293,9 @@ fn reconcile_egress_nat(eg: &EgressSection) -> Result<EgressVerification, Orches
         EGRESS_CONNTRACK_MODPROBE_PATH,
         &egress_conntrack_modprobe_content(),
     )?;
-    apply_conntrack_live();
-    verification.conntrack_tuned = true;
+    // F16: report what the kernel actually reports back, not an unconditional
+    // `true`. `false` means pending-reboot (the persisted file applies it then).
+    verification.conntrack_tuned = apply_conntrack_live();
 
     // nftables: write the dedicated table, replace any existing Fluxbee table,
     // then verify.
@@ -4105,6 +4309,10 @@ fn reconcile_egress_nat(eg: &EgressSection) -> Result<EgressVerification, Orches
         return Err("nft applied but table inet fluxbee_egress is not present afterwards".into());
     }
     verification.nat_applied = true;
+
+    // F17: persist the table across reboots independently of the orchestrator,
+    // so the boot window (ip_forward=1 but no fluxbee_egress table) is closed.
+    ensure_egress_nft_boot_unit()?;
 
     verification.internet_reachable = check_internet_reachable();
     if !verification.internet_reachable {
@@ -7454,15 +7662,23 @@ fn remove_hive_cleanup_shell_command(script: &str) -> String {
 /// Built from the EGRESS_* path constants (no caller input), so it carries no
 /// injection surface even inside the outer `sudo bash -lc '...'` wrapper.
 fn egress_teardown_script() -> String {
+    // Also disable + remove the F17 boot unit: its `ConditionPathExists` already
+    // makes it a no-op once the .nft file is gone (so no NAT survives reboot),
+    // but leaving an enabled orphan unit behind is exactly the kind of residue
+    // F11 targets — disable + rm + daemon-reload clears it fully.
     format!(
         "nft delete table {table} >/dev/null 2>&1 || true; \
-rm -f {nft} {sysctl} {conntrack} {modprobe} >/dev/null 2>&1 || true; \
+systemctl disable {boot_unit} >/dev/null 2>&1 || true; \
+rm -f {nft} {sysctl} {conntrack} {modprobe} {boot_unit_path} >/dev/null 2>&1 || true; \
+systemctl daemon-reload >/dev/null 2>&1 || true; \
 sysctl --system >/dev/null 2>&1 || true",
         table = EGRESS_NFT_TABLE,
+        boot_unit = EGRESS_NFT_BOOT_UNIT,
         nft = EGRESS_NFT_PATH,
         sysctl = EGRESS_SYSCTL_PATH,
         conntrack = EGRESS_CONNTRACK_SYSCTL_PATH,
         modprobe = EGRESS_CONNTRACK_MODPROBE_PATH,
+        boot_unit_path = EGRESS_NFT_BOOT_UNIT_PATH,
     )
 }
 
@@ -16320,9 +16536,15 @@ async fn add_egress_hive_flow(
 
     // Reaching here means the egress orchestrator is active and in LSA. Because
     // NAT reconciliation is fatal at the egress hive's bootstrap (see
-    // bootstrap_local), an active orchestrator implies the NAT applied — so "ok"
-    // here is trustworthy. The detailed fields (ipv6_blocked / internet_reachable)
-    // are logged on the egress host's own journal.
+    // bootstrap_local), an active orchestrator implies the NAT applied,
+    // ipv4_forwarding is on and ipv6 is blocked — those three are trustworthy.
+    // F5: `internet_reachable` is NOT one of them — reconcile only `warn`s on a
+    // dead WAN, it does not fail boot, so an egress with a misconfigured uplink
+    // would still reach here. We therefore report `egress_internet_reachable:
+    // null` ("not verified by motherbee in v1") instead of letting "ok" imply a
+    // working uplink. The egress host verifies it authoritatively and re-checks
+    // it every drift tick, degrading to a WARN in its own journal. Transmitting
+    // the real value back here is the T-VER-1 follow-up.
     serde_json::json!({
         "status": "ok",
         "hive_id": hive_id,
@@ -16333,6 +16555,7 @@ async fn add_egress_hive_flow(
         "egress_wan_iface": nat.wan_iface,
         "egress_lan_iface": nat.lan_iface,
         "egress_nat_applied": true,
+        "egress_internet_reachable": serde_json::Value::Null,
         "harden_ssh": harden_ssh,
         "harden_ssh_applied": harden_ssh,
         "restrict_ssh": restrict_ssh_applied,
@@ -16340,7 +16563,7 @@ async fn add_egress_hive_flow(
         "restrict_ssh_requested": restrict_ssh,
         "wan_connected": wan_connected,
         "orchestrator_connected": orchestrator_connected,
-        "note": "egress orchestrator active implies NAT applied (reconcile is fatal at its boot); see its journal for ipv6_blocked/internet_reachable detail",
+        "note": "egress orchestrator active implies NAT applied + ipv4_forwarding + ipv6_blocked (reconcile is fatal at its boot). internet_reachable is verified ONLY on the egress host (degrades to WARN in its journal + re-checked every drift tick); not transmitted to motherbee in v1 (T-VER-1). See the egress journal for live detail.",
     })
 }
 
@@ -17957,6 +18180,24 @@ mod tests {
     }
 
     #[test]
+    fn egress_nft_boot_unit_loads_before_network_and_is_idempotent() {
+        let unit = egress_nft_boot_unit_contents("/usr/sbin/nft");
+        // F17: must load before any interface is configured so no packet is
+        // forwarded before the masquerade / forward-drop rules exist.
+        assert!(unit.contains("DefaultDependencies=no"));
+        assert!(unit.contains("Before=network-pre.target"));
+        // Loads the exact ruleset file the reconcile writes, with an absolute nft.
+        assert!(unit.contains("ExecStart=/usr/sbin/nft -f /etc/nftables.d/fluxbee-egress.nft"));
+        // No-op (not a boot failure) once the ruleset file is gone (after teardown).
+        assert!(unit.contains("ConditionPathExists=/etc/nftables.d/fluxbee-egress.nft"));
+        assert!(unit.contains("Type=oneshot"));
+        assert!(unit.contains("RemainAfterExit=yes"));
+        assert!(unit.contains("WantedBy=multi-user.target"));
+        // Deterministic for write_file_if_changed (no spurious daemon-reloads).
+        assert_eq!(unit, egress_nft_boot_unit_contents("/usr/sbin/nft"));
+    }
+
+    #[test]
     fn render_worker_egress_yaml_validates_gateway() {
         let mut section = egress_section(false);
         section.gateway_ip = Some("192.168.8.1".to_string());
@@ -18156,6 +18397,13 @@ mod tests {
         assert!(egress.contains("/etc/sysctl.d/99-fluxbee-conntrack.conf"));
         assert!(egress.contains("/etc/modprobe.d/fluxbee-conntrack.conf"));
         assert!(egress.contains("sysctl --system"));
+        // F17 boot unit is also disabled + removed: no enabled orphan unit (even
+        // a no-op one) survives the egress decommission.
+        assert!(egress.contains("systemctl disable fluxbee-egress-nft.service"));
+        assert!(egress.contains("/etc/systemd/system/fluxbee-egress-nft.service"));
+        assert!(egress.contains("systemctl daemon-reload"));
+        // Worker (non-egress) removal must NOT touch the boot unit.
+        assert!(!worker.contains("fluxbee-egress-nft.service"));
         // Every teardown command is guarded so a non-egress box is a no-op.
         assert!(egress.contains("|| true"));
         // Ordering is load-bearing: the NAT teardown MUST run before the base

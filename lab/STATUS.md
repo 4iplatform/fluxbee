@@ -15,8 +15,11 @@ Origen: [`docs/audits/2026-06-23-sy-orchestrator-audit.md`](../docs/audits/2026-
 Prioridad acordada: **operativos primero, seguridad después** (red interna con
 puertas definidas; SSH solo para bootstrap inicial).
 
-**Resueltos (15):** `F1` `F2` `F9` `F10` `F14` `F20` `F7` `F12` `F13` `F3` `F11`
-`F8` `F18` `F4` `F15` — código en `src/`. F1/F2/F9 validados en el lab; F10/F11 con
+**Resueltos (19):** `F1` `F2` `F9` `F10` `F14` `F20` `F7` `F12` `F13` `F3` `F11`
+`F8` `F18` `F4` `F15` `F5` `F6` `F16` `F17` — código en `src/`. **Lote egress
+F5/F6/F16/F17 cerrado y validado en VM real** (revisión adversarial + 105 tests +
+empírico: F16 conntrack false→true, F17 boot unit prueba con orchestrator off,
+F6 flush→re-apply <70s, F5 kill-WAN→DEGRADED). F1/F2/F9 validados en el lab; F10/F11 con
 revisión adversarial (falta egress en VM); F14/F20 unit tests; **F7/F12/F13**,
 **F3**, **F8**, **F18** unit tests + revisión adversarial (GO); **F11** (NO-GO →
 corregido → re-verificado). **F4 + F15** = **autoridad de origen SYSTEM movida al
@@ -26,9 +29,9 @@ reglas `SY.` hardcodeadas + rutas **frozen** visibles en SHM; gate del orchestra
 eliminado). Validado en lab (cross-hive + same-hive + router-only, 0 drops) +
 revisión adversarial (GO). **OPA-dual** = próximo gran feature para configurabilidad.
 
-**Pendientes (9):**
+**Pendientes (5):**
 
-- **Media:** `F5` `F6` `F16` `F17` (egress).
+- **Media:** — (lote egress cerrado y validado en VM).
 - **Baja:** `F19` `F21` `F22` `F23` `F25`.
 
 > ✅ **F7/F12/F13 cerrados** (eran el #1 del audit). Un solo allowlist de iface
@@ -101,10 +104,13 @@ y el flujo de creds end-to-end.
 - [ ] **Commit** de los cambios `src/` del audit (F1/F2/F9/F10/F14/F20 + creds) — separado del lab.
 - [ ] **Review adversarial** del código del lote creds.
 - [ ] Actualizar **scripts E2E** (`ssh_user` requerido) + docs de contrato (`sy_orchestrator_v2_tasks.md` items F1/F2).
-- [x] **Lote de seguridad** del audit: ~~F7/F12/F13~~ ~~F3~~ ~~F11~~ (falta VM) ~~F8~~ ~~F18~~ ~~F4/F15~~ ✅ — todo el lote de seguridad **alta+origin-auth cerrado**. Quedan solo F5/F6/F16/F17 (egress, necesitan VM).
+- [x] **Lote de seguridad** del audit: ~~F7/F12/F13~~ ~~F3~~ ~~F11~~ ~~F8~~ ~~F18~~ ~~F4/F15~~ ✅ — todo el lote de seguridad **alta+origin-auth cerrado**.
 - [x] **OPA-dual Fases 1-3** (opción b: capa system Rust + OPA user): `mod system_policy` (seam swappable a Rego) + input OPA enriquecido (`src_l2_name`/`action`) + orden de composición explícito. Refactor byte-idéntico + aditivo; 55 lib tests + revisión adversarial (GO). Ver [`docs/onworking COA/opa-dual.md`](../docs/onworking%20COA/opa-dual.md).
 - [ ] **OPA-dual Fase 4** (futuro, gated): capa system respaldada por Rego (segunda región SHM `/jsr-opa-sys-<hive>`, writer privilegiado, entrypoint boolean) — solo si se quiere las reglas system inspeccionables vía OPA. El `authority()` ya es el contrato; solo cambia el backing.
-- [ ] **Lote egress**: F5/F6/F16/F17 + validar F10/F11 en **VM** (Fase 2 del lab).
+- [x] **Lote egress**: F5/F6/F16/F17 + F10/F11 **validados en VM real** (Ubuntu
+  24.04: `add_hive role=egress` de cero con el binario nuevo, NAT/conntrack/boot-unit,
+  reboot con orchestrator off, flush de chain, kill-WAN). Queda solo la transmisión
+  de los 4 campos de verificación a motherbee (**T-VER-1**, futuro).
 - [x] **Distribución**: workflow `.github/workflows/lab-image.yml` pushea a GHCR las dos flavors — `slim` (multi-stage, ~1.9 GB, `:latest`, boot validado) y `fat` (~9 GB). Repo público → GHCR + Actions **gratis e ilimitado**. **Falta disparar**: `git tag lab-v0.1 && git push --tags` (o Run workflow).
 - [ ] Distribución (mejoras): slim aún duplica binarios (`/usr/bin` + `dist/core/bin`) y syncthing — se puede bajar más. Multi-arch (arm64) si hay devs en Apple Silicon.
 

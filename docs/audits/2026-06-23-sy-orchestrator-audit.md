@@ -9,8 +9,9 @@ Archivo principal: `src/bin/sy_orchestrator.rs` (20562 lineas)
 
 Reconciliacion del trabajo posterior a la auditoria. Prioridad acordada con el operador: **operativos primero, seguridad despues** Ã¢ÂÂ la red es interna con puertas definidas y SSH se usa solo para el bootstrap inicial. Por eso el lote operativo + SSH-only-bootstrap se resolvio primero; ahora se abrio el lote de seguridad arrancando por el #1 del orden sugerido (inyeccion de iface, F7/F12/F13).
 
-**Resueltos (15 de 24):**
+**Resueltos (19 de 24):**
 
+- **F5 + F6 + F16 + F17** lote egress (NAT) Ã¢ÂÂ **validado empÃÂ­ricamente en VM real (Ubuntu 24.04)**. **F16**: `conntrack_tuned` deja de ser `true` incondicional Ã¢ÂÂ `apply_conntrack_live()` devuelve bool verificando el read-back de `nf_conntrack_max` (prueba la key canÃÂ³nica **y** el alias); journal de la VM confirma `false`Ã¢ÂÂ`true` al cargarse el mÃÂ³dulo. **F17**: nuevo unit systemd `fluxbee-egress-nft.service` (oneshot, `Before=network-pre.target`) carga la tabla nft al boot Ã¢ÂÂ **probado concluyentemente**: con el orchestrator **deshabilitado**, tras reboot la tabla estÃÂ¡ presente (la cargÃÂ³ el boot unit, cerrando la ventana ip_forward-sin-tabla). **F6**: el watchdog re-aplica el reconcile idempotente cada ~60s (no solo si la tabla desapareciÃÂ³) Ã¢ÂÂ probado: flush de una chain (drift parcial, tabla presente) se corrige en <70s. **F5**: `internet_reachable=false` degrada Ã¢ÂÂ WARN `DEGRADED` continuo en el journal del egress + el response de `add_hive` reporta `egress_internet_reachable: null` (no implica ÃÂ©xito; transmisiÃÂ³n real = T-VER-1). *RevisiÃÂ³n adversarial (3 hallazgos corregidos: read-back del alias conntrack, churn de `systemctl enable`, `block_in_place` para el I/O bloqueante del watchdog) + 105 unit tests + validaciÃÂ³n empÃÂ­rica en VM (F16/F17/F6/F5).*
 - **F4 + F15** allowlist de origen `system` Ã¢ÂÂ **resuelto reubicando la autoridad de origen al ROUTER** (decisiÃÂ³n de diseÃÂ±o del operador: el router es el centro de routing/autoridad; no distribuir el chequeo entre nodos). El router resuelve el `src_l2_name` autoritativo (UUIDÃ¢ÂÂregistro) y gatea las 18 acciones SYSTEM protegidas en `serialize_for_local_delivery` (choke point ÃÂºnico): `SY.orchestrator@*` (cross-hive, forwards), `SY.admin`/`SY.wf-rules`/`WF.orch.diag` `@<same-hive>` (cierra F15: rechaza cross-hive admin), `SY.config-routes`/`SY.vault` `@<same-hive>` solo para `NODE_STATUS_GET` (probe read-only abierto por el architect). Reglas `SY.` hardcodeadas en el router + publicadas como rutas **frozen** visibles en SHM. El gate del orchestrator (`is_allowed_system_source_name`, no configurable por los prefijos hardcodeados Ã¢ÂÂ el problema de F4) **se eliminÃÂ³**; la configurabilidad futura va a la capa **OPA-system** (anotada). *Unit tests (router) + revisiÃÂ³n adversarial (GO) + validado en el lab de 2 hives (cross-hive live forwards + same-hive + router-only enforcement, 0 drops indebidos).*
 - **F18** TOCTOU lock Ã¢ÂÂ registro de locks por hive_id sostenido durante todo el flujo de `add_hive`/`remove_hive`. *Unit test + revisiÃÂ³n (GO).*
 - **F8** gate de origen en el canal ADMIN Ã¢ÂÂ cambio de 2 componentes: el relay `SY.admin` estampa su identidad `SY.admin@<hive>` y `handle_admin` gatea las acciones mutantes a `== SY.admin@<su-hive>`. *4 unit tests + revisiÃÂ³n adversarial (GO, sin regresiÃÂ³n: todo el trÃÂ¡fico admin rutea al orchestrator local). Residual: hop-1 sin gatear (finding aparte).*
@@ -31,10 +32,10 @@ Reconciliacion del trabajo posterior a la auditoria. Prioridad acordada con el o
 
 Ademas (no era finding del audit; cambio de diseno del operador): **las credenciales SSH del bootstrap se movieron al payload de `add_hive`** (`ssh_user` requerido / `ssh_password` opcional, probe key-first), eliminando los `administrator`/`magicAI` hardcodeados; el secreto se redacta en SY.architect; el schema de admin se actualizo. *Validado empiricamente (lab: worker bootstrapeado con creds del payload).*
 
-**Pendientes (9 de 24)** Ã¢ÂÂ por severidad:
+**Pendientes (5 de 24)** Ã¢ÂÂ por severidad:
 
 - **Alta (0).**
-- **Media (4):** F5 (egress reporta `ok` incompleto), F6 (drift egress), F16 (conntrack_tuned), F17 (nft no carga al boot).
+- **Media (0).** Lote egress (F5/F6/F16/F17) cerrado y validado en VM real.
 - **Baja (5):** F19, F21, F22, F23, F25.
 
 **Nota de seguridad:** **F7/F12/F13 cerrados** Ã¢ÂÂ eran el pendiente #1. Una sola allowlist de iface los cierra a los tres porque el charset aceptado (`[A-Za-z0-9._-]`) no comparte ningun metacarÃÂ¡cter con los tres sinks (shell / nft / YAML), y la validacion corre en el unico constructor de `EgressNatConfig` antes de todo sink (verificado: sin bypass, los paths de reconcile re-validan el `hive.yaml` deserializado). El siguiente pendiente de mayor prioridad pasa a ser **F8** (gate de origen en el canal ADMIN).
@@ -345,6 +346,8 @@ En `remove_hive_flow`, leer `role` de `info.yaml` y, si es egress, extender el c
 
 ### F5 - Media - Egress reporta `ok` con verificacion incompleta
 
+> **RESUELTO (2026-06-26) — validado en VM.** DecisiÃÂ³n: `internet_reachable=false` **degrada** donde vive el dato (el host egress). El watchdog re-chequea la reachability en cada tick de drift y emite un WARN `DEGRADED` continuo (no solo el warn ÃÂºnico de bootstrap). El response de `add_hive role=egress` deja de implicar ÃÂ©xito: reporta `egress_internet_reachable: null` ("no verificado por motherbee en v1") en vez de dejar que `status:ok` sugiera un uplink sano; el `note` lo explicita. La transmisiÃÂ³n real de los 4 campos a motherbee sigue siendo T-VER-1 (futuro), como el propio finding lo acota. *Validado en VM: inyectando un fluxbee.ai inalcanzable (RFC5737) el journal mostrÃÂ³ `egress NAT healthy but internet unreachable Ã¢ÂÂ DEGRADED`; al restaurar, recuperÃÂ³.*
+
 Verificacion: lectura. **Reescrito**: la version anterior fundaba el finding en `edge_ip`, premisa que resulto incorrecta. El problema real es otro.
 
 Correccion de la premisa: el spec ÃÂ§8.2 (`docs/edge-egress-nat-spec.md:411-435`) nunca pide asignar `edge_ip` a `lan_iface`; `edge_ip` es config de host preexistente que el orchestrator usa para validar (`:3814-3819`), reportar y como gateway de la ruta de workers. Que `egress_nft_ruleset` (`:3891`) no use `edge_ip` es spec-compliant, no un defecto. Ese eje de la version anterior se descarta.
@@ -369,6 +372,8 @@ Recomendacion:
 Decidir si `internet_reachable=false` debe degradar el status a `warn`/`pending` (coherente con ÃÂ§3.5) en vez de `ok`. A futuro (T-VER-1/T-VER-3), que `add_hive role=egress` recoja del host remoto los 4 campos reales y los incluya en el payload. Ver F16 para `conntrack_tuned`.
 
 ### F6 - Media - El watchdog egress no corrige drift parcial de reglas/sysctl
+
+> **RESUELTO (2026-06-26) — validado en VM.** El tick egress re-aplica el reconcile idempotente cada `EGRESS_RECONCILE_DRIFT_TICKS` (12 ticks Ã¢ÂÂ ~60s a 5s de cadencia), ademÃÂ¡s del fast-path `!nft_table_loaded()`. AsÃÂ­ el drift parcial que la mera presencia de la tabla no detecta (chain flusheada, regla editada, drift de sysctl/conntrack) se corrige en <~60s, no solo al reboot. En worker, el bloque IPv6 se re-asegura idempotente en el tick periÃÂ³dico. El reconcile (I/O bloqueante: ping+curl+nft) corre bajo `tokio::task::block_in_place` para no inanir el runtime. *Validado en VM: `nft flush chain ... forward` (drift parcial, tabla presente) Ã¢ÂÂ las 4 reglas volvieron en <70s.*
 
 Verificacion: lectura.
 
@@ -477,6 +482,8 @@ El allowlist debe ser match exacto de nombre completo `name@hive` sin los `start
 
 ### F16 - Media - `egress_conntrack_tuned` se reporta `true` incondicionalmente
 
+> **RESUELTO (2026-06-26) — validado en VM.** `apply_conntrack_live()` ahora devuelve `bool`: aplica `sysctl -w` y **verifica leyendo `nf_conntrack_max` de vuelta** (prueba la key canÃÂ³nica `net.netfilter.nf_conntrack_max` **y** el alias `net.nf_conntrack_max`, simÃÂ©trico con la escritura). `conntrack_tuned = apply_conntrack_live()` Ã¢ÂÂ `true` = live verificado, `false` = pending-reboot (el fichero persistido lo aplica al boot). *Validado en VM: el journal mostrÃÂ³ exactamente el escenario del finding Ã¢ÂÂ primer reconcile en bootstrap con el mÃÂ³dulo aÃÂºn sin cargar reportÃÂ³ `conntrack_tuned=false` (donde el cÃÂ³digo viejo mentÃÂ­a `true`), y el reconcile siguiente, ya cargado el mÃÂ³dulo, `true`.*
+
 Verificacion: lectura.
 
 Evidencia:
@@ -499,6 +506,8 @@ Recomendacion:
 Convertir `conntrack_tuned` a un enum/string (`"live"`|`"pending-reboot"`) o agregar `conntrack_live_applied` verificando lectura de `nf_conntrack_max` tras el `sysctl -w`, en vez del bool incondicional.
 
 ### F17 - Media - La tabla nft egress no se carga al boot
+
+> **RESUELTO (2026-06-26) — validado en VM (prueba concluyente).** Nuevo unit systemd `fluxbee-egress-nft.service` (oneshot, `RemainAfterExit`, `DefaultDependencies=no` + `Before=network-pre.target` Ã¢ÂÂ carga la tabla **antes** de que se configure cualquier interfaz, asÃÂ­ ningÃÂºn paquete se forwardea sin la tabla). Lo instala+enable `ensure_egress_nft_boot_unit()` desde el reconcile (path absoluto de `nft` resuelto; `enable` solo al escribir el unit, no en cada tick; `ConditionPathExists` lo hace no-op si el `.nft` fue removido tras teardown). El teardown F11 ademÃÂ¡s lo disable+rm. *Validado en VM **deshabilitando el orchestrator** y rebooteando: con `sy-orchestrator inactive/disabled`, tras el reboot la tabla estaba PRESENTE (4 reglas forward + masquerade), `ip_forward=1`, `conntrack=262144` Ã¢ÂÂ la cargÃÂ³ el boot unit (`active/success`), no el orchestrator. Cierra la ventana ip_forward-sin-tabla.*
 
 Verificacion: lectura.
 
