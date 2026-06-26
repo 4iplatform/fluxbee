@@ -1822,7 +1822,14 @@ async fn handle_system_message(
                 .await;
         }
         Some("REMOVE_HIVE_CLEANUP") => {
-            let result = remove_hive_cleanup_local_flow();
+            // F11: motherbee sets egress_teardown when the removed hive was a
+            // role=egress boundary, so this host also drops its NAT state.
+            let egress_teardown = msg
+                .payload
+                .get("egress_teardown")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let result = remove_hive_cleanup_local_flow(egress_teardown);
             tracing::info!(result = %result, "REMOVE_HIVE_CLEANUP processed");
             let _ =
                 send_system_action_response(sender, msg, "REMOVE_HIVE_CLEANUP_RESPONSE", result)
@@ -7441,8 +7448,50 @@ fn remove_hive_cleanup_shell_command(script: &str) -> String {
     sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(script)))
 }
 
-fn remove_hive_cleanup_local_flow() -> serde_json::Value {
-    let deferred_script = format!("sleep 1; {}", remove_hive_cleanup_script());
+/// F11: NAT teardown appended to the cleanup script on a `role: egress` host.
+/// All commands are idempotent (no-op on a non-egress box, hence harmless if the
+/// flag is ever set wrongly): drop the live nft table, remove the four persistent
+/// `/etc` files that re-apply forwarding + MASQUERADE on boot, and reload sysctl
+/// so the removed boundary does not survive reboot as an ungoverned router/NAT.
+/// Built from the EGRESS_* path constants (no caller input), so it carries no
+/// injection surface even inside the outer `sudo bash -lc '...'` wrapper.
+fn egress_teardown_script() -> String {
+    format!(
+        "nft delete table {table} >/dev/null 2>&1 || true; \
+rm -f {nft} {sysctl} {conntrack} {modprobe} >/dev/null 2>&1 || true; \
+sysctl --system >/dev/null 2>&1 || true",
+        table = EGRESS_NFT_TABLE,
+        nft = EGRESS_NFT_PATH,
+        sysctl = EGRESS_SYSCTL_PATH,
+        conntrack = EGRESS_CONNTRACK_SYSCTL_PATH,
+        modprobe = EGRESS_CONNTRACK_MODPROBE_PATH,
+    )
+}
+
+/// Pure (testable) builder for the remote cleanup script. The base script tears
+/// down fluxbee services + node state on any removed hive; when `egress_teardown`
+/// is set (the removed hive's info.yaml had `role: egress`), the NAT teardown is
+/// PREPENDED so it runs first.
+///
+/// Ordering matters: the base script's service loop runs `systemctl kill -s KILL
+/// sy-orchestrator`, and the orchestrator unit is `KillMode=control-group`. This
+/// deferred cleanup is a child of sy-orchestrator and lives in its cgroup, so any
+/// command sequenced AFTER that kill can be SIGKILLed before it executes. Running
+/// the NAT teardown BEFORE the service loop guarantees the nft table + the four
+/// persistent `/etc` files are removed while the orchestrator (and this script)
+/// are still alive — otherwise F11 would leave exactly the orphan it targets.
+fn remove_hive_cleanup_full_script(egress_teardown: bool) -> String {
+    let base = remove_hive_cleanup_script();
+    if egress_teardown {
+        format!("{}; {}", egress_teardown_script(), base)
+    } else {
+        base.to_string()
+    }
+}
+
+fn remove_hive_cleanup_local_flow(egress_teardown: bool) -> serde_json::Value {
+    let deferred_script =
+        format!("sleep 1; {}", remove_hive_cleanup_full_script(egress_teardown));
     let deferred_cmd = remove_hive_cleanup_shell_command(&deferred_script);
     match Command::new("bash").arg("-lc").arg(deferred_cmd).spawn() {
         Ok(_) => serde_json::json!({
@@ -7500,6 +7549,15 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
         .map(str::trim)
         .filter(|value| valid_syncthing_device_id(value))
         .map(str::to_string);
+    // F11: an egress hive's socket cleanup must also tear down the NAT state
+    // (nft table + the 4 persistent /etc files) so the removed boundary does not
+    // reboot into an ungoverned router. role is read from the removed hive's
+    // info.yaml; non-egress hives carry no teardown.
+    let is_egress = is_egress_role(
+        hive_info
+            .as_ref()
+            .and_then(|info| info.get("role").and_then(|value| value.as_str())),
+    );
     let forward_result = forward_system_action_to_hive_with_timeout(
         state,
         hive_id,
@@ -7508,6 +7566,7 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
         serde_json::json!({
             "hive_id": hive_id,
             "target": hive_id,
+            "egress_teardown": is_egress,
         }),
         Duration::from_secs(REMOVE_HIVE_SOCKET_CLEANUP_TIMEOUT_SECS),
     )
@@ -7595,15 +7654,45 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
         });
     }
 
-    serde_json::json!({
+    // F11: surface the egress NAT teardown outcome. When the removed hive was an
+    // egress boundary but the socket cleanup did NOT confirm (offline / timeout),
+    // the host could not be reached to drop its NAT state — it may reboot as an
+    // ungoverned router. The operator must be able to tell this apart from a
+    // harmless offline-worker removal, so we echo a distinct status + warning
+    // instead of an unqualified `ok`.
+    let egress_teardown = if !is_egress {
+        "not_applicable"
+    } else if socket_cleanup_ok {
+        "applied_via_socket"
+    } else {
+        "not_confirmed_host_unreachable"
+    };
+    let mut response = serde_json::json!({
         "status": "ok",
         "hive_id": hive_id,
         "address": address,
+        "role_egress": is_egress,
         "remote_cleanup": remote_cleanup,
         "remote_cleanup_via": remote_cleanup_via,
+        "egress_teardown": egress_teardown,
         "syncthing_peer_cleanup": syncthing_peer_cleanup,
         "syncthing_peer_unlinked": syncthing_peer_unlinked,
-    })
+    });
+    if is_egress && !socket_cleanup_ok {
+        tracing::warn!(
+            hive_id = hive_id,
+            address = %address,
+            "removed an OFFLINE egress hive: NAT teardown could not be confirmed; \
+             the host may reboot as an ungoverned router — manual teardown required"
+        );
+        response["warning"] = serde_json::Value::String(
+            "egress NAT teardown not confirmed (host unreachable); manual teardown required \
+             on the removed host: nft delete table inet fluxbee_egress + remove /etc/nftables.d/\
+             fluxbee-egress.nft and the fluxbee egress/conntrack sysctl/modprobe files"
+                .to_string(),
+        );
+    }
+    response
 }
 
 fn socket_cleanup_timeout(forward_result: &Result<serde_json::Value, OrchestratorError>) -> bool {
@@ -18039,6 +18128,40 @@ mod tests {
         assert!(cmd.starts_with("sudo -n bash -lc "));
         assert!(cmd.contains("systemctl stop --no-block"));
         assert!(cmd.contains("/var/lib/fluxbee/state/nodes/*"));
+    }
+
+    #[test]
+    fn f11_remove_hive_cleanup_appends_egress_teardown_only_for_egress() {
+        // Non-egress (worker) removal: NO NAT teardown, only the base cleanup.
+        let worker = remove_hive_cleanup_full_script(false);
+        assert!(worker.contains("/var/lib/fluxbee/nodes/*"));
+        assert!(!worker.contains("fluxbee_egress"));
+        assert!(!worker.contains("99-fluxbee-egress"));
+        assert!(!worker.contains("sysctl --system"));
+
+        // Egress removal: base cleanup PLUS idempotent NAT teardown of the live
+        // nft table + all four persistent /etc files + a sysctl reload.
+        let egress = remove_hive_cleanup_full_script(true);
+        assert!(egress.contains("/var/lib/fluxbee/nodes/*")); // base preserved
+        assert!(egress.contains("nft delete table inet fluxbee_egress"));
+        assert!(egress.contains("/etc/nftables.d/fluxbee-egress.nft"));
+        assert!(egress.contains("/etc/sysctl.d/99-fluxbee-egress.conf"));
+        assert!(egress.contains("/etc/sysctl.d/99-fluxbee-conntrack.conf"));
+        assert!(egress.contains("/etc/modprobe.d/fluxbee-conntrack.conf"));
+        assert!(egress.contains("sysctl --system"));
+        // Every teardown command is guarded so a non-egress box is a no-op.
+        assert!(egress.contains("|| true"));
+        // Ordering is load-bearing: the NAT teardown MUST run before the base
+        // service-kill loop, which SIGKILLs the sy-orchestrator cgroup this very
+        // script lives in. nft-delete must precede the systemctl kill of services.
+        let nft_at = egress.find("nft delete table").expect("nft teardown present");
+        let kill_at = egress
+            .find("systemctl kill")
+            .expect("base service kill present");
+        assert!(
+            nft_at < kill_at,
+            "egress teardown must precede the service-kill loop"
+        );
     }
 
     #[test]

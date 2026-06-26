@@ -9,8 +9,9 @@ Archivo principal: `src/bin/sy_orchestrator.rs` (20562 lineas)
 
 Reconciliacion del trabajo posterior a la auditoria. Prioridad acordada con el operador: **operativos primero, seguridad despues** — la red es interna con puertas definidas y SSH se usa solo para el bootstrap inicial. Por eso el lote operativo + SSH-only-bootstrap se resolvio primero; ahora se abrio el lote de seguridad arrancando por el #1 del orden sugerido (inyeccion de iface, F7/F12/F13).
 
-**Resueltos (10 de 24):**
+**Resueltos (11 de 24):**
 
+- **F11** teardown NAT en `remove_hive` egress — lee `role`, manda `egress_teardown`, el host removido limpia nft+ficheros+sysctl (idempotente, antepuesto al kill de servicios); respuesta señaliza el orphan offline. *Unit test + revisión adversarial (race del cgroup + orphan offline corregidos). **Falta validación empírica en VM (Fase 2).***
 - **F3** traversal de `hive_id` — `valid_hive_id`/`valid_address` movidos al inicio de `add_hive_flow`/`add_egress_hive_flow` (antes de todo `join`/`remove_dir_all`/`create_dir_all`) + backstop léxico `hive_dir_is_direct_child` antes de cada op destructiva. *Unit test + revisión adversarial (GO).*
 - **F7** RCE root via iface — `validate_iface_name` (allowlist `^[A-Za-z0-9._-]{1,15}$`, IFNAMSIZ, rechaza `.`/`..`) aplicado a `wan_iface`/`lan_iface` en `resolve_egress_nat_config` (el unico constructor de `EgressNatConfig`), antes de cualquier sink. Ademas `write_remote_file` reescrito: el contenido va por **stdin** a `sudo -n tee '<path>'`, sin interpolacion en shell. *Unit test (accept/reject exhaustivo) + revision adversarial multi-agente (GO, 0 defectos bloqueantes; reachability/charset/rewrite verificados).*
 - **F12** inyeccion nft — cerrado por el **mismo** allowlist: el iface se embebe solo en strings nft entre comillas dobles y el charset excluye `"` y `\`. *Cubierto por el fix y test de F7.*
@@ -27,9 +28,9 @@ Reconciliacion del trabajo posterior a la auditoria. Prioridad acordada con el o
 
 Ademas (no era finding del audit; cambio de diseno del operador): **las credenciales SSH del bootstrap se movieron al payload de `add_hive`** (`ssh_user` requerido / `ssh_password` opcional, probe key-first), eliminando los `administrator`/`magicAI` hardcodeados; el secreto se redacta en SY.architect; el schema de admin se actualizo. *Validado empiricamente (lab: worker bootstrapeado con creds del payload).*
 
-**Pendientes (14 de 24)** — por severidad:
+**Pendientes (13 de 24)** — por severidad:
 
-- **Alta (3):** F8 (ADMIN_COMMAND sin gate de origen — *siguiente en el orden*), F4 (allowlist `system` no configurable), F11 (remove_hive egress no des-aprovisiona NAT — *tiene angulo operativo: router huerfano post-reboot*).
+- **Alta (2):** F8 (ADMIN_COMMAND sin gate de origen — *siguiente; requiere cambio en 2 componentes, ver nota*), F4 (allowlist `system` no configurable).
 - **Media (6):** F5 (egress reporta `ok` incompleto), F6 (drift egress), F15 (allowlist cross-hive), F16 (conntrack_tuned), F17 (nft no carga al boot), F18 (TOCTOU sin lock).
 - **Baja (5):** F19, F21, F22, F23, F25.
 
@@ -87,7 +88,7 @@ Tambien hay tres bugs de las funcionalidades nuevas comparten una sola causa rai
 | F4  | Alta | origin-auth | Allowlist `system` no configurable | lectura+test | parcial v2 |
 | F9  | Alta | add_hive | `add_hive` no idempotente (`pending` atascado) | lectura | nuevo |
 | F10 | Alta | add_hive | Hardening SSH egress no-fatal, reporta `ok` | lectura | nuevo |
-| F11 | Alta | remove_hive | `remove_hive` egress no des-aprovisiona NAT | lectura | nuevo |
+| F11 | Alta | remove_hive | ✅ RESUELTO (cód.; falta VM) — `remove_hive` egress no des-aprovisiona NAT | lectura | nuevo |
 | F12 | Media | egress-nat | ✅ RESUELTO — Inyeccion de reglas nft (iface sin validar) | empirica | nuevo |
 | F13 | Media | ssh-transport | ✅ RESUELTO — Corrupcion/inyeccion YAML en `hive.yaml` remoto | empirica | nuevo |
 | F5  | Media | egress-nat | Egress reporta `ok` con verificacion incompleta | lectura | reescrito |
@@ -308,6 +309,8 @@ Recomendacion:
 Alinear `add_egress_hive_flow` con `add_hive_flow`: retornar `SSH_HARDEN_FAILED`/`SSH_KEY_FAILED` y no devolver `status:ok` cuando el helper falla en un boundary egress. Como minimo, agregar `harden_ssh_applied` real.
 
 ### F11 - Alta - `remove_hive` de un egress no des-aprovisiona el estado NAT
+
+> **RESUELTO en código (2026-06-26) — validación empírica pendiente (VM/Fase 2).** `remove_hive_flow` lee `role` de info.yaml (`is_egress_role`) y, si es egress, manda `egress_teardown=true` en el `REMOVE_HIVE_CLEANUP` reenviado; el host removido corre el teardown idempotente (`nft delete table inet fluxbee_egress` + `rm -f` los 4 ficheros `/etc` + `sysctl --system`). El teardown se **antepone** al loop de kill de servicios (el cleanup base hace `systemctl kill -s KILL sy-orchestrator` con `KillMode=control-group`, que mataría el propio bash diferido → el teardown debe correr antes). La respuesta ahora expone `role_egress` + `egress_teardown` (`not_applicable`/`applied_via_socket`/`not_confirmed_host_unreachable`) y advierte cuando se removió un egress **offline** (orphan posible, teardown manual requerido). Unit test + revisión adversarial (NO-GO inicial detectó el race del cgroup-kill y el orphan offline sin señal; ambos corregidos y re-verificados CLOSED).
 
 Verificacion: lectura.
 
