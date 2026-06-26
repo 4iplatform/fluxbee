@@ -164,8 +164,19 @@ y el flujo de creds end-to-end.
     3. **Sembrar los ilks del worker en el primary al `add_hive`** (motherbee crea
        los system-ilks del worker al provisionarlo) → entran al primary y bajan a
        todos. Cambia _dónde_ se siembran.
-  - Recomendación: **(1)** si se quiere un registro global real (parece la
-    intención por "cada nodo tiene su ilk… todo lo que interactúa"); **(2)** como
-    quick-win de la vista si el bloqueo es solo de presentación. Repro en el lab
-    (motherbee + worker1).
+  - **DECISIÓN (operador, 2026-06-26): opción (1)** — bidireccional entre las
+    SY.identity de cada hive, **centralizado + mergeado en motherbee**, con **SHM
+    aditiva**. Razón: la **SHM de identity es el "quién existe" de todo el
+    sistema** (routing/auth la leen); **sin ilk no existís**, así que la malla
+    necesita un registro global aditivo, no vistas locales parciales. Mecanismo:
+    cada hive sigue siendo dueño de sus `@hive` ilks y los empuja *hacia arriba*
+    a motherbee (push _hacia arriba_); motherbee mergea additivo (`ilk_id = node@hive` namespaced →
+    unión pura) y re-broadcastea el set completo → la SHM converge al union en
+    cada hive. Autoridad por-hive (solo el dueño upsert/delete); deletes por
+    tombstone (`deleted_at_ms`, ya existe). **A construir:** el push-al-upstream
+    en el replica + el lado _read_ en `handle_sync_connection` de motherbee (hoy
+    solo pushea, nunca lee del replica); el re-broadcast + `next_delta_seq` ya
+    existen. (2) y (3) descartadas: (2) es view-only, la SHM local sigue sin
+    resolver cross-hive; (3) no cubre ilks dinámicos AI/WF/IO creados luego en un
+    worker. Repro en el lab (motherbee + worker1).
 - [ ] **AI**: cargar OpenAI key reproducible; scope/ejecución de la **extensión Anthropic**.
