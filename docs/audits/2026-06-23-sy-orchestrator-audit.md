@@ -9,8 +9,9 @@ Archivo principal: `src/bin/sy_orchestrator.rs` (20562 lineas)
 
 Reconciliacion del trabajo posterior a la auditoria. Prioridad acordada con el operador: **operativos primero, seguridad despues** — la red es interna con puertas definidas y SSH se usa solo para el bootstrap inicial. Por eso el lote operativo + SSH-only-bootstrap se resolvio primero; ahora se abrio el lote de seguridad arrancando por el #1 del orden sugerido (inyeccion de iface, F7/F12/F13).
 
-**Resueltos (9 de 24):**
+**Resueltos (10 de 24):**
 
+- **F3** traversal de `hive_id` — `valid_hive_id`/`valid_address` movidos al inicio de `add_hive_flow`/`add_egress_hive_flow` (antes de todo `join`/`remove_dir_all`/`create_dir_all`) + backstop léxico `hive_dir_is_direct_child` antes de cada op destructiva. *Unit test + revisión adversarial (GO).*
 - **F7** RCE root via iface — `validate_iface_name` (allowlist `^[A-Za-z0-9._-]{1,15}$`, IFNAMSIZ, rechaza `.`/`..`) aplicado a `wan_iface`/`lan_iface` en `resolve_egress_nat_config` (el unico constructor de `EgressNatConfig`), antes de cualquier sink. Ademas `write_remote_file` reescrito: el contenido va por **stdin** a `sudo -n tee '<path>'`, sin interpolacion en shell. *Unit test (accept/reject exhaustivo) + revision adversarial multi-agente (GO, 0 defectos bloqueantes; reachability/charset/rewrite verificados).*
 - **F12** inyeccion nft — cerrado por el **mismo** allowlist: el iface se embebe solo en strings nft entre comillas dobles y el charset excluye `"` y `\`. *Cubierto por el fix y test de F7.*
 - **F13** inyeccion/corrupcion YAML — idem: el iface se embebe solo como escalar YAML entre comillas dobles desde `nat.*` (validado); el charset excluye `"`/`\` y los disparadores de coercion de escalar. *Cubierto por el fix y test de F7.*
@@ -26,9 +27,9 @@ Reconciliacion del trabajo posterior a la auditoria. Prioridad acordada con el o
 
 Ademas (no era finding del audit; cambio de diseno del operador): **las credenciales SSH del bootstrap se movieron al payload de `add_hive`** (`ssh_user` requerido / `ssh_password` opcional, probe key-first), eliminando los `administrator`/`magicAI` hardcodeados; el secreto se redacta en SY.architect; el schema de admin se actualizo. *Validado empiricamente (lab: worker bootstrapeado con creds del payload).*
 
-**Pendientes (15 de 24)** — por severidad:
+**Pendientes (14 de 24)** — por severidad:
 
-- **Alta (4):** F8 (ADMIN_COMMAND sin gate de origen — *siguiente en el orden*), F3 (traversal de `hive_id`), F4 (allowlist `system` no configurable), F11 (remove_hive egress no des-aprovisiona NAT — *tiene angulo operativo: router huerfano post-reboot*).
+- **Alta (3):** F8 (ADMIN_COMMAND sin gate de origen — *siguiente en el orden*), F4 (allowlist `system` no configurable), F11 (remove_hive egress no des-aprovisiona NAT — *tiene angulo operativo: router huerfano post-reboot*).
 - **Media (6):** F5 (egress reporta `ok` incompleto), F6 (drift egress), F15 (allowlist cross-hive), F16 (conntrack_tuned), F17 (nft no carga al boot), F18 (TOCTOU sin lock).
 - **Baja (5):** F19, F21, F22, F23, F25.
 
@@ -82,7 +83,7 @@ Tambien hay tres bugs de las funcionalidades nuevas comparten una sola causa rai
 | F8  | Alta | origin-auth | `ADMIN_COMMAND` sin gate de origen | lectura | nuevo |
 | F1  | Alta | remove_hive | SSH operativo en `remove_hive` | lectura+git | contradice `[x]` v2:21 |
 | F2  | Alta | add_hive | `add_hive` socket-only cae a bootstrap SSH | lectura | contradice `[x]` v2:22 |
-| F3  | Alta | add_hive | Borra dir antes de validar `hive_id` (traversal) | empirica | nuevo (antes Critica) |
+| F3  | Alta | add_hive | ✅ RESUELTO — Borra dir antes de validar `hive_id` (traversal) | empirica | nuevo (antes Critica) |
 | F4  | Alta | origin-auth | Allowlist `system` no configurable | lectura+test | parcial v2 |
 | F9  | Alta | add_hive | `add_hive` no idempotente (`pending` atascado) | lectura | nuevo |
 | F10 | Alta | add_hive | Hardening SSH egress no-fatal, reporta `ok` | lectura | nuevo |
@@ -217,6 +218,8 @@ Recomendacion:
 Una vez `socket_only_ready=true`, bloquear todo fallback SSH en ambos puntos (probe y finalize-unreachable): devolver error explicito (`FINALIZE_FAILED` o codigo de probe), sin continuar a bootstrap. Agregar E2E-2 que asierte cero pasos SSH.
 
 ### F3 - Alta - `add_hive` borra directorios antes de validar `hive_id`
+
+> **RESUELTO (2026-06-26).** `valid_hive_id`/`valid_address` movidos al **inicio** de `add_hive_flow` y `add_egress_hive_flow`, antes de todo `join`/`hive_exists`/`hive_partial_exists`/`remove_dir_all`/`create_dir_all`. Backstop léxico de defensa-en-profundidad `hive_dir_is_direct_child` (exige un único componente `Normal` bajo `hives_root`, rechaza `..`) antes de cada `remove_dir_all` **y** `create_dir_all`. Unit test `f3_hive_id_traversal_is_rejected` + revisión adversarial (GO; verificado que no quedan sinks destructivos sin gatear y sin regresión de flujos legítimos).
 
 Verificacion: **empirica** (rustc confirmo que `Path::join` no normaliza `..` y `remove_dir_all` escapa el root).
 

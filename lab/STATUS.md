@@ -15,15 +15,16 @@ Origen: [`docs/audits/2026-06-23-sy-orchestrator-audit.md`](../docs/audits/2026-
 Prioridad acordada: **operativos primero, seguridad después** (red interna con
 puertas definidas; SSH solo para bootstrap inicial).
 
-**Resueltos (9):** `F1` `F2` `F9` `F10` `F14` `F20` `F7` `F12` `F13` — código en
-`src/`. F1/F2/F9 validados empíricamente en el lab; F10 con revisión adversarial
-(falta validación en egress); F14/F20 con unit tests; **F7/F12/F13** con unit
-test exhaustivo + revisión adversarial multi-agente (GO, 0 defectos bloqueantes).
+**Resueltos (10):** `F1` `F2` `F9` `F10` `F14` `F20` `F7` `F12` `F13` `F3` —
+código en `src/`. F1/F2/F9 validados empíricamente en el lab; F10 con revisión
+adversarial (falta validación en egress); F14/F20 con unit tests; **F7/F12/F13**
+y **F3** con unit tests + revisión adversarial multi-agente (GO, 0 defectos
+bloqueantes).
 
-**Pendientes (15):**
+**Pendientes (14):**
 
 - **Alta:** `F8` (gate de origen ADMIN — **siguiente en el orden**),
-  `F3` (traversal hive_id), `F4` (allowlist), `F11` (egress NAT teardown).
+  `F4` (allowlist), `F11` (egress NAT teardown).
 - **Media:** `F5` `F6` `F16` `F17` (egress), `F15` (cross-hive), `F18` (TOCTOU lock).
 - **Baja:** `F19` `F21` `F22` `F23` `F25`.
 

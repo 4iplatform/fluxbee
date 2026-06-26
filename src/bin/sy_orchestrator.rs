@@ -14757,6 +14757,23 @@ async fn add_hive_flow(
     dist_sync_probe_timeout_secs: u64,
     creds: &BootstrapCreds,
 ) -> serde_json::Value {
+    // F3: validate hive_id/address BEFORE any path join / hive_exists /
+    // hive_partial_exists / remove_dir_all. valid_hive_id forbids '/' '.' '..',
+    // so `hives_root().join(hive_id)` below cannot traverse out of the tree.
+    if !valid_hive_id(hive_id) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_HIVE_ID",
+            "message": "invalid hive_id",
+        });
+    }
+    if !valid_address(address) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_ADDRESS",
+            "message": "invalid address",
+        });
+    }
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
     let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
@@ -14813,6 +14830,13 @@ async fn add_hive_flow(
             hive_id = hive_id,
             "stale hive state detected (missing info.yaml); cleaning before bootstrap"
         );
+        if !hive_dir_is_direct_child(&hive_dir, &root) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_HIVE_ID",
+                "message": "refusing to clean hive dir outside hives_root",
+            });
+        }
         if let Err(err) = fs::remove_dir_all(&hive_dir) {
             return serde_json::json!({
                 "status": "error",
@@ -14820,20 +14844,6 @@ async fn add_hive_flow(
                 "message": format!("failed to clean stale hive dir: {err}"),
             });
         }
-    }
-    if !valid_hive_id(hive_id) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "INVALID_HIVE_ID",
-            "message": "invalid hive_id",
-        });
-    }
-    if !valid_address(address) {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "INVALID_ADDRESS",
-            "message": "invalid address",
-        });
     }
     if state.wan_listen.as_deref().unwrap_or("").is_empty() {
         return serde_json::json!({
@@ -14859,6 +14869,13 @@ async fn add_hive_flow(
         });
     }
 
+    if !hive_dir_is_direct_child(&hive_dir, &root) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_HIVE_ID",
+            "message": "refusing to create hive dir outside hives_root",
+        });
+    }
     if let Err(err) = fs::create_dir_all(&hive_dir) {
         return serde_json::json!({
             "status": "error",
@@ -15772,7 +15789,15 @@ async fn add_egress_hive_flow(
 ) -> serde_json::Value {
     let err_payload = |code: &str, msg: String| serde_json::json!({ "status": "error", "error_code": code, "message": msg });
 
-    // Validate inputs (mirrors the worker pre-bootstrap checks).
+    // Validate inputs (mirrors the worker pre-bootstrap checks). F3: validate
+    // hive_id/address BEFORE any path join / hive_exists / remove_dir_all so a
+    // traversal hive_id can never reach a destructive fs op.
+    if !valid_hive_id(hive_id) {
+        return err_payload("INVALID_HIVE_ID", "invalid hive_id".to_string());
+    }
+    if !valid_address(address) {
+        return err_payload("INVALID_ADDRESS", "invalid address".to_string());
+    }
     let nat = match resolve_egress_nat_config(&egress) {
         Ok(cfg) => cfg,
         Err(err) => return err_payload("INVALID_REQUEST", err.to_string()),
@@ -15795,15 +15820,15 @@ async fn add_egress_hive_flow(
         }
     }
     if hive_partial_exists(hive_id) {
+        if !hive_dir_is_direct_child(&hive_dir, &root) {
+            return err_payload(
+                "INVALID_HIVE_ID",
+                "refusing to clean hive dir outside hives_root".to_string(),
+            );
+        }
         if let Err(err) = fs::remove_dir_all(&hive_dir) {
             return err_payload("IO_ERROR", format!("failed to clean stale hive dir: {err}"));
         }
-    }
-    if !valid_hive_id(hive_id) {
-        return err_payload("INVALID_HIVE_ID", "invalid hive_id".to_string());
-    }
-    if !valid_address(address) {
-        return err_payload("INVALID_ADDRESS", "invalid address".to_string());
     }
     let wan_listen = state.wan_listen.clone().unwrap_or_default();
     if wan_listen.is_empty() {
@@ -15821,6 +15846,12 @@ async fn add_egress_hive_flow(
         return err_payload(
             "WAN_NOT_AUTHORIZED",
             format!("hive '{hive_id}' not present in wan.authorized_hives"),
+        );
+    }
+    if !hive_dir_is_direct_child(&hive_dir, &root) {
+        return err_payload(
+            "INVALID_HIVE_ID",
+            "refusing to create hive dir outside hives_root".to_string(),
         );
     }
     if let Err(err) = fs::create_dir_all(&hive_dir) {
@@ -16263,6 +16294,24 @@ fn valid_hive_id(value: &str) -> bool {
     value
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Defense-in-depth for F3: a hive directory we are about to `remove_dir_all`
+/// or `create_dir_all` must be a *direct child* of `hives_root()` — exactly one
+/// trailing `Normal` component, with no `..`/`.`/absolute components that could
+/// escape the tree. `valid_hive_id` (run first in both add flows) already forbids
+/// `/` `.` `..`, so a validated hive_id can never escape; this purely-lexical
+/// guard (no filesystem calls, so it cannot fail on transient FS state) is a
+/// backstop against a future caller that reaches a destructive fs op before
+/// validation — the exact shape of the original F3 regression.
+fn hive_dir_is_direct_child(hive_dir: &Path, root: &Path) -> bool {
+    match hive_dir.strip_prefix(root) {
+        Ok(rest) => {
+            let mut comps = rest.components();
+            matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
+        }
+        Err(_) => false,
+    }
 }
 
 fn valid_address(value: &str) -> bool {
@@ -17765,6 +17814,33 @@ mod tests {
                 "lan_iface should reject {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn f3_hive_id_traversal_is_rejected() {
+        // valid_hive_id (now run FIRST in both add flows) forbids every char
+        // that could escape hives_root via join: '/', '.', '..'.
+        for bad in [
+            "", "..", ".", "../victim", "a/b", "a.b", "../../etc", "foo/../bar", "a\0b", "héllo",
+        ] {
+            assert!(!valid_hive_id(bad), "hive_id {bad:?} must be rejected");
+        }
+        for ok in ["motherbee", "worker1", "hive-01", "a_b-c", "H99"] {
+            assert!(valid_hive_id(ok), "hive_id {ok:?} must be accepted");
+        }
+
+        // Defense-in-depth backstop: only a direct child of root may be deleted.
+        let root = Path::new("/var/lib/fluxbee/storage/hives");
+        assert!(hive_dir_is_direct_child(&root.join("worker1"), root));
+        assert!(hive_dir_is_direct_child(&root.join("hive-01"), root));
+        // Escapes / non-children are refused even if they lexically "start with" root.
+        assert!(!hive_dir_is_direct_child(&root.join("../victim"), root));
+        assert!(!hive_dir_is_direct_child(&root.join("a").join("b"), root));
+        assert!(!hive_dir_is_direct_child(root, root)); // root itself, no child component
+        assert!(!hive_dir_is_direct_child(
+            Path::new("/etc/passwd"),
+            root
+        ));
     }
 
     #[test]
