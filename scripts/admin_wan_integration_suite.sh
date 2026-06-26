@@ -21,6 +21,8 @@ set -euo pipefail
 BASE="${BASE:-http://127.0.0.1:8080}"
 HIVE_ID="${HIVE_ID:-worker-220}"
 HIVE_ADDR="${HIVE_ADDR:-192.168.8.220}"
+SSH_USER="${SSH_USER:-administrator}"
+SSH_PASSWORD="${SSH_PASSWORD:-}"
 STALE_TIMEOUT_SECS="${STALE_TIMEOUT_SECS:-120}"
 RECOVERY_TIMEOUT_SECS="${RECOVERY_TIMEOUT_SECS:-60}"
 POLL_INTERVAL_SECS="${POLL_INTERVAL_SECS:-2}"
@@ -215,7 +217,7 @@ fi
 
 # 2) add_hive + WAN freshness gate
 add_body="$tmpdir/add.json"
-add_payload="{\"hive_id\":\"$HIVE_ID\",\"address\":\"$HIVE_ADDR\"}"
+add_payload="{\"hive_id\":\"$HIVE_ID\",\"address\":\"$HIVE_ADDR\",\"ssh_user\":\"$SSH_USER\",\"ssh_password\":\"$SSH_PASSWORD\"}"
 status="$(http_call "POST" "$BASE/hives" "$add_body" "$add_payload")"
 log_http_response "$status" "$add_body"
 assert_eq "$status" "200" "POST /hives/http"

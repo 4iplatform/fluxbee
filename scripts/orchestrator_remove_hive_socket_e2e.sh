@@ -23,6 +23,7 @@ HARDEN_SSH="${HARDEN_SSH:-true}"
 REQUIRE_SOCKET_ONLINE="${REQUIRE_SOCKET_ONLINE:-1}"
 REQUIRE_OFFLINE_LOCAL_ONLY="${REQUIRE_OFFLINE_LOCAL_ONLY:-${REQUIRE_OFFLINE_FALLBACK:-1}}"
 SSH_USER="${SSH_USER:-administrator}"
+SSH_PASSWORD="${SSH_PASSWORD:-}"
 SSH_KEY="${SSH_KEY:-/var/lib/fluxbee/ssh/motherbee.key}"
 
 require_cmd() {
@@ -114,7 +115,8 @@ delete_hive_allow_not_found() {
 add_hive_expect_ok() {
   local body_file="$1"
   local payload
-  payload="$(printf '{"hive_id":"%s","address":"%s","harden_ssh":%s}' "$HIVE_ID" "$HIVE_ADDR" "$HARDEN_SSH")"
+  # ssh_user is required by the add_hive contract; ssh_password optional (key-first).
+  payload="$(printf '{"hive_id":"%s","address":"%s","harden_ssh":%s,"ssh_user":"%s","ssh_password":"%s"}' "$HIVE_ID" "$HIVE_ADDR" "$HARDEN_SSH" "$SSH_USER" "$SSH_PASSWORD")"
   local status
   status="$(http_call "POST" "$BASE/hives" "$body_file" "$payload")"
   print_http "$status" "$body_file"

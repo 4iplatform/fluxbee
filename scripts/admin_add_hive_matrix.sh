@@ -5,18 +5,25 @@ set -euo pipefail
 # Focus: fast negative-path checks without provisioning remote hosts.
 #
 # Covered:
+# - MISSING_SSH_USER -> HTTP 400 INVALID_REQUEST (ssh_user is required)
 # - INVALID_ADDRESS -> HTTP 400
 # - INVALID_HIVE_ID -> HTTP 400
 # - HIVE_EXISTS -> HTTP 409 (if at least one hive already exists)
 # - SSH_* -> HTTP 502/504 using a reachable/invalid SSH target
 #
+# Contract note: add_hive now requires `ssh_user` in the payload (bootstrap login;
+# `ssh_password` is optional, key-first probe). The structural-error cases below
+# therefore carry a valid `ssh_user` so the request reaches the address/hive_id
+# validation; a dedicated case asserts that omitting `ssh_user` is rejected.
+#
 # Usage:
 #   BASE="http://127.0.0.1:8080" bash scripts/admin_add_hive_matrix.sh
 # Optional:
-#   SSH_TEST_ADDRESS="127.0.0.1"
+#   SSH_TEST_ADDRESS="127.0.0.1"  SSH_USER="administrator"
 
 BASE="${BASE:-http://127.0.0.1:8080}"
 SSH_TEST_ADDRESS="${SSH_TEST_ADDRESS:-127.0.0.1}"
+SSH_USER="${SSH_USER:-administrator}"
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -107,10 +114,23 @@ trap 'rm -rf "$tmpdir"' EXIT
 
 echo "Running add_hive matrix against BASE=$BASE"
 
+# 0) MISSING_SSH_USER (valid hive_id + address, but no ssh_user -> rejected)
+body="$tmpdir/missing_ssh_user.json"
+hid="e2e-missing-user-$RANDOM"
+status="$(call_post_hives "{\"hive_id\":\"$hid\",\"address\":\"127.0.0.1\"}" "$body")"
+log_http_response "$status" "$body"
+code="$(json_get "error_code" "$body")"
+if [[ -z "$code" ]]; then
+  code="$(json_get "payload.error_code" "$body")"
+fi
+assert_eq "$status" "400" "MISSING_SSH_USER/http"
+assert_eq "$code" "INVALID_REQUEST" "MISSING_SSH_USER/code"
+echo "OK: MISSING_SSH_USER -> HTTP 400 (INVALID_REQUEST)"
+
 # 1) INVALID_ADDRESS
 body="$tmpdir/invalid_address.json"
 hid="e2e-invalid-address-$RANDOM"
-status="$(call_post_hives "{\"hive_id\":\"$hid\",\"address\":\"bad address\"}" "$body")"
+status="$(call_post_hives "{\"hive_id\":\"$hid\",\"address\":\"bad address\",\"ssh_user\":\"$SSH_USER\"}" "$body")"
 log_http_response "$status" "$body"
 code="$(json_get "error_code" "$body")"
 if [[ -z "$code" ]]; then
@@ -122,7 +142,7 @@ echo "OK: INVALID_ADDRESS -> HTTP 400"
 
 # 2) INVALID_HIVE_ID
 body="$tmpdir/invalid_hive_id.json"
-status="$(call_post_hives "{\"hive_id\":\"bad id\",\"address\":\"127.0.0.1\"}" "$body")"
+status="$(call_post_hives "{\"hive_id\":\"bad id\",\"address\":\"127.0.0.1\",\"ssh_user\":\"$SSH_USER\"}" "$body")"
 log_http_response "$status" "$body"
 code="$(json_get "error_code" "$body")"
 if [[ -z "$code" ]]; then
@@ -159,7 +179,7 @@ PY
 
 if [[ -n "$existing_hive" ]]; then
   body="$tmpdir/hive_exists.json"
-  status="$(call_post_hives "{\"hive_id\":\"$existing_hive\",\"address\":\"127.0.0.1\"}" "$body")"
+  status="$(call_post_hives "{\"hive_id\":\"$existing_hive\",\"address\":\"127.0.0.1\",\"ssh_user\":\"$SSH_USER\"}" "$body")"
   log_http_response "$status" "$body"
   code="$(json_get "error_code" "$body")"
   if [[ -z "$code" ]]; then
@@ -175,7 +195,7 @@ fi
 # 4) SSH_* (address valid, no bootstrap credentials expected)
 body="$tmpdir/ssh_error.json"
 hid="e2e-ssh-$RANDOM"
-status="$(call_post_hives "{\"hive_id\":\"$hid\",\"address\":\"$SSH_TEST_ADDRESS\"}" "$body")"
+status="$(call_post_hives "{\"hive_id\":\"$hid\",\"address\":\"$SSH_TEST_ADDRESS\",\"ssh_user\":\"$SSH_USER\"}" "$body")"
 log_http_response "$status" "$body"
 code="$(json_get "error_code" "$body")"
 if [[ -z "$code" ]]; then

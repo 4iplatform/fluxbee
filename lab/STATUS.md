@@ -50,8 +50,18 @@ secreto **redactado** en `SY.architect`; schema de admin actualizado.
 
 - **Validado** en el lab: worker real bootstrapeado con las creds del payload;
   `ssh_user` persistido en info.yaml, `ssh_password` nunca.
-- **Pendiente:** review adversarial del código de este lote + actualizar scripts
-  E2E (`admin_add_hive_matrix.sh` etc. ahora deben mandar `ssh_user`).
+- **Review adversarial hecho** (19 agentes, 5 lentes): cerró 6 hallazgos del manejo
+  del password — askpass file world-readable antes del chmod (TOCTOU), encoding
+  inseguro (`echo "..."` rompía con `\`/`$`/backtick), colisión de nombre del
+  temp, password en el argv del ssh (visible en `ps`) en el paso de sudoers,
+  trim que corrompía passwords con espacios, y empty-password en sudoers. Fix:
+  askpass `create_new`+`mode(0600)`+`printf '%s'`+seq único; sudoers por **stdin**
+  (`ssh_with_key_stdin` → `sudo -S`, password fuera de argv) con rama `sudo -n`;
+  password sin trim. Round-trip test con metacaracteres + perms. La redacción en
+  SY.architect ya era correcta.
+- **Scripts E2E actualizados** (`ssh_user` requerido): `admin_add_hive_matrix.sh`
+  (+ caso `MISSING_SSH_USER -> INVALID_REQUEST`), hardening, remove_socket, wan,
+  inventory, ssh_hardening_s4; ejemplos del help admin + schema; doc de contrato.
 
 **Modelo de deploy a mantener:** SSH solo para instalar el orchestrator en una
 caja Linux vacía, con user/pass que provee quien llama `add_hive` (humano o
@@ -102,8 +112,8 @@ y el flujo de creds end-to-end.
 ## Pendientes vivos (checklist)
 
 - [ ] **Commit** de los cambios `src/` del audit (F1/F2/F9/F10/F14/F20 + creds) — separado del lab.
-- [ ] **Review adversarial** del código del lote creds.
-- [ ] Actualizar **scripts E2E** (`ssh_user` requerido) + docs de contrato (`sy_orchestrator_v2_tasks.md` items F1/F2).
+- [x] **Review adversarial** del código del lote creds (6 hallazgos del password cerrados: askpass perms/encoding/colisión, password en argv del sudoers→stdin, trim, empty-pass).
+- [x] Actualizar **scripts E2E** (`ssh_user` requerido) + ejemplos del schema admin + doc de contrato (`sy_orchestrator_v2_tasks.md` Fase D).
 - [x] **Lote de seguridad** del audit: ~~F7/F12/F13~~ ~~F3~~ ~~F11~~ ~~F8~~ ~~F18~~ ~~F4/F15~~ ✅ — todo el lote de seguridad **alta+origin-auth cerrado**.
 - [x] **OPA-dual Fases 1-3** (opción b: capa system Rust + OPA user): `mod system_policy` (seam swappable a Rego) + input OPA enriquecido (`src_l2_name`/`action`) + orden de composición explícito. Refactor byte-idéntico + aditivo; 55 lib tests + revisión adversarial (GO). Ver [`docs/onworking COA/opa-dual.md`](../docs/onworking%20COA/opa-dual.md).
 - [ ] **OPA-dual Fase 4** (futuro, gated): capa system respaldada por Rego (segunda región SHM `/jsr-opa-sys-<hive>`, writer privilegiado, entrypoint boolean) — solo si se quiere las reglas system inspeccionables vía OPA. El `authority()` ya es el contrato; solo cambia el backing.

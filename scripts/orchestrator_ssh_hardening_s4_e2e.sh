@@ -18,6 +18,8 @@ set -euo pipefail
 BASE="${BASE:-http://127.0.0.1:8080}"
 HIVE_ID="${HIVE_ID:-worker-220}"
 HIVE_ADDR="${HIVE_ADDR:-192.168.8.220}"
+SSH_USER="${SSH_USER:-administrator}"
+SSH_PASSWORD="${SSH_PASSWORD:-}"
 BUILD_BIN="${BUILD_BIN:-0}"
 REMOTE_SUDO_PASS="${REMOTE_SUDO_PASS:-magicAI}"
 EXERCISE_ADD_REMOVE="${EXERCISE_ADD_REMOVE:-1}"
@@ -98,7 +100,7 @@ fi
 
 if [[ "$EXERCISE_ADD_REMOVE" == "1" ]]; then
   run_step "precheck remove_hive" bash -lc "curl -sS -X DELETE '$BASE/hives/$HIVE_ID'; echo"
-  run_step "precheck add_hive" bash -lc "curl -sS -X POST '$BASE/hives' -H 'Content-Type: application/json' -d '{\"hive_id\":\"$HIVE_ID\",\"address\":\"$HIVE_ADDR\"}'; echo"
+  run_step "precheck add_hive" bash -lc "curl -sS -X POST '$BASE/hives' -H 'Content-Type: application/json' -d '{\"hive_id\":\"$HIVE_ID\",\"address\":\"$HIVE_ADDR\",\"ssh_user\":\"$SSH_USER\",\"ssh_password\":\"$SSH_PASSWORD\"}'; echo"
   hive_body="$(curl -sS "$BASE/hives/$HIVE_ID" || true)"
   if [[ "$(json_get "status" "$hive_body")" != "ok" ]]; then
     echo "FAIL: hive '$HIVE_ID' is not ready after add_hive: $hive_body" >&2

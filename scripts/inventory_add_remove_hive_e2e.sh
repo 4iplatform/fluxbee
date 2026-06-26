@@ -4,6 +4,8 @@ set -euo pipefail
 BASE="${BASE:-http://127.0.0.1:8080}"
 HIVE_ID="${HIVE_ID:-worker-220}"
 HIVE_ADDR="${HIVE_ADDR:-}"
+SSH_USER="${SSH_USER:-administrator}"
+SSH_PASSWORD="${SSH_PASSWORD:-}"
 POLL_INTERVAL_SECS="${POLL_INTERVAL_SECS:-2}"
 INVENTORY_WAIT_SECS="${INVENTORY_WAIT_SECS:-120}"
 INVENTORY_READY_WAIT_SECS="${INVENTORY_READY_WAIT_SECS:-60}"
@@ -319,7 +321,8 @@ add_hive_expect_ok() {
   local hive_id="$1"
   local hive_addr="$2"
   local payload
-  payload="$(printf '{"hive_id":"%s","address":"%s"}' "$hive_id" "$hive_addr")"
+  # ssh_user required by the add_hive contract; ssh_password optional (key-first).
+  payload="$(printf '{"hive_id":"%s","address":"%s","ssh_user":"%s","ssh_password":"%s"}' "$hive_id" "$hive_addr" "$SSH_USER" "$SSH_PASSWORD")"
   local http
   http="$(http_call "POST" "$BASE/hives" "$add_body" "$payload")"
   if [[ "$http" != "200" || "$(json_get_file "status" "$add_body")" != "ok" ]]; then

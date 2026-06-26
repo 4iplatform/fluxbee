@@ -81,6 +81,7 @@ Fuente de verdad funcional: `docs/onworking/SY.orchestrator — Spec de Cambios 
   - Avance: controles `harden_ssh`/`restrict_ssh` quedan definidos por payload de `add_hive` (sin fallback por env legacy para SSH controls).
 - [x] D2. Mantener solo primitives SSH necesarias para bootstrap minimo (`seed key/sudoers`, copia minima, start bootstrap services).
   - Avance: hardening post-bootstrap unificado a canal key+sudo (sin rama de hardening via password).
+  - Avance: **credenciales de bootstrap movidas al payload de `add_hive`** — `ssh_user` (requerido) / `ssh_password` (opcional, probe key-first); sin `administrator`/`magicAI` hardcodeados. El secreto se redacta en SY.architect (`redact_json_secret_fields`) y nunca se loguea ni persiste; el password viaja a `ssh` por `SSH_ASKPASS` (no en argv/env). Schema admin (`add_hive`) documenta ambos campos; scripts E2E mandan `ssh_user` (matrix incluye caso `MISSING_SSH_USER -> INVALID_REQUEST`).
 - [x] D3. Verificar que no quede ninguna ruta de operacion diaria que invoque SSH.
 
 ## 4. Alineacion documental obligatoria

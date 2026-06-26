@@ -8072,7 +8072,9 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         }),
         "add_hive" => serde_json::json!({
             "hive_id": "worker-220",
-            "address": "192.168.8.220"
+            "address": "192.168.8.220",
+            "ssh_user": "administrator",
+            "ssh_password": "<bootstrap-password-or-omit-if-key-seeded>"
         }),
         "run_node" => serde_json::json!({
             "node_name": "AI.chat@motherbee",
@@ -8342,7 +8344,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "list_hives" => "curl -X GET /hives",
         "get_hive" => "curl -X GET /hives/worker-220",
         "add_hive" => {
-            r#"curl -X POST /hives -d '{"hive_id":"worker-220","address":"192.168.8.220"}'"#
+            r#"curl -X POST /hives -d '{"hive_id":"worker-220","address":"192.168.8.220","ssh_user":"administrator","ssh_password":"<bootstrap-pass-or-omit>"}'"#
         }
         "remove_hive" => "curl -X DELETE /hives/worker-220",
         "list_nodes" => "curl -X GET /hives/motherbee/nodes",

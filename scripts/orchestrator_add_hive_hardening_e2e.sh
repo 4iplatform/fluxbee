@@ -195,10 +195,13 @@ echo "Step 1/5: cleanup baseline (allow NOT_FOUND)"
 delete_hive_allow_not_found "$tmpdir/delete-baseline.json"
 
 echo "Step 2/5: add_hive harden_ssh=$HARDEN_SSH"
+# Bootstrap creds now travel in the add_hive payload (ssh_user required;
+# ssh_password optional, key-first probe). An empty SSH_PASSWORD is sent as ""
+# and treated as "no password" by the orchestrator (key-only bootstrap).
 if [[ "$RESTRICT_SSH" == "auto" ]]; then
-  add_payload="$(printf '{"hive_id":"%s","address":"%s","harden_ssh":%s}' "$HIVE_ID" "$HIVE_ADDR" "$HARDEN_SSH")"
+  add_payload="$(printf '{"hive_id":"%s","address":"%s","harden_ssh":%s,"ssh_user":"%s","ssh_password":"%s"}' "$HIVE_ID" "$HIVE_ADDR" "$HARDEN_SSH" "$SSH_USER" "$SSH_PASSWORD")"
 else
-  add_payload="$(printf '{"hive_id":"%s","address":"%s","harden_ssh":%s,"restrict_ssh":%s}' "$HIVE_ID" "$HIVE_ADDR" "$HARDEN_SSH" "$RESTRICT_SSH")"
+  add_payload="$(printf '{"hive_id":"%s","address":"%s","harden_ssh":%s,"restrict_ssh":%s,"ssh_user":"%s","ssh_password":"%s"}' "$HIVE_ID" "$HIVE_ADDR" "$HARDEN_SSH" "$RESTRICT_SSH" "$SSH_USER" "$SSH_PASSWORD")"
 fi
 status_add="$(http_call "POST" "$BASE/hives" "$tmpdir/add.json" "$add_payload")"
 print_http "$status_add" "$tmpdir/add.json"

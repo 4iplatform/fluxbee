@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16701,11 +16701,14 @@ fn resolve_add_hive_ssh_creds(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or("add_hive: 'ssh_user' is required (admin login for SSH bootstrap)")?;
+    // Do NOT trim the password: a legitimate password may have significant
+    // leading/trailing spaces. Reject only a whitespace-only value (which is the
+    // operator omitting it), keeping the rest verbatim.
     let password = payload
         .get("ssh_password")
         .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string());
     Ok(BootstrapCreds { user, password })
 }
 
@@ -17263,9 +17266,26 @@ fn ensure_remote_orchestrator_sudoers_with_access(
         remote_tmp = shell_single_quote(&remote_tmp),
         sudoers = shell_single_quote(ORCH_SUDOERS_PATH),
     );
-    let apply_cmd =
-        sudo_wrap_with_pass(&format!("bash -lc '{}'", shell_single_quote(&script)), password);
-    let apply_result = ssh_with_key(address, key_path, &apply_cmd, user);
+    // Apply the sudoers file with elevation. The password (when present) is fed
+    // to the remote `sudo -S` via STDIN — never embedded in the ssh command
+    // argument (which would surface in the orchestrator's local `ps`) nor in the
+    // remote command string (which a verbose sshd could log). With no password
+    // (the key channel already works), fall back to `sudo -n`: it succeeds iff
+    // sudo is already NOPASSWD and fails loud otherwise, instead of feeding an
+    // empty password that can never authenticate.
+    let inner = format!("bash -lc '{}'", shell_single_quote(&script));
+    let apply_result = if password.is_empty() {
+        ssh_with_key(address, key_path, &sudo_wrap(&inner), user)
+    } else {
+        let remote_cmd = format!("sudo -S -p '' {inner}");
+        ssh_with_key_stdin(
+            address,
+            key_path,
+            &remote_cmd,
+            user,
+            format!("{password}\n").as_bytes(),
+        )
+    };
     let _ = fs::remove_file(&local_tmp);
     apply_result?;
     ssh_with_key(
@@ -17324,17 +17344,31 @@ fn identity_available() -> bool {
     Path::new("/usr/bin/sy-identity").exists()
 }
 
+/// Per-process counter so two askpass files created in the same millisecond
+/// never collide on a name (which could cross-read passwords between concurrent
+/// bootstraps). Combined with `create_new` below, a residual collision is a hard
+/// error, never a silent reuse.
+static ASKPASS_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Write a transient `SSH_ASKPASS` helper that prints `password` on stdout.
+/// Security-critical:
+/// - Created O_EXCL with mode 0600 from the start, so the password is NEVER
+///   world-readable (no `fs::write`-then-chmod window a local user could race).
+/// - Emitted with `printf '%s\n'` inside single quotes (no `echo`), so a password
+///   containing `$`, backtick, or a trailing backslash is reproduced verbatim and
+///   cannot trigger command substitution or break the script's quoting.
+/// The caller removes the file right after the ssh invocation returns.
 fn askpass_script(password: &str) -> Result<PathBuf, OrchestratorError> {
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("jsr-askpass-{}.sh", now_epoch_ms()));
-    let contents = format!("#!/bin/sh\necho \"{}\"\n", password.replace('"', "\\\""));
-    fs::write(&path, contents)?;
-    let mut perms = fs::metadata(&path)?.permissions();
-    perms.set_readonly(false);
-    fs::set_permissions(&path, perms)?;
-    let mut chmod = Command::new("chmod");
-    chmod.arg("700").arg(&path);
-    run_cmd(chmod, "chmod")?;
+    let seq = ASKPASS_SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("jsr-askpass-{}-{}.sh", now_epoch_ms(), seq));
+    let contents = format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", shell_single_quote(password));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&path)?;
+    file.write_all(contents.as_bytes())?;
     Ok(path)
 }
 
@@ -17792,9 +17826,61 @@ fn sudo_wrap(cmd: &str) -> String {
     format!("sudo -n {}", cmd)
 }
 
-fn sudo_wrap_with_pass(cmd: &str, password: &str) -> String {
-    let pass = password.replace('\'', "'\"'\"'");
-    format!("echo '{}' | sudo -S -p '' {}", pass, cmd)
+/// Like `ssh_with_key`, but writes `stdin_data` to the remote command's stdin.
+/// Used to hand a sudo password to a remote `sudo -S` WITHOUT placing it in the
+/// ssh argv (visible in the local `ps`) or in the command string (a verbose
+/// remote sshd could log it). The password never appears in any error message:
+/// `sudo -S -p ''` prints no prompt and never echoes the secret on failure.
+fn ssh_with_key_stdin(
+    address: &str,
+    key_path: &Path,
+    command: &str,
+    user: &str,
+    stdin_data: &[u8],
+) -> Result<(), OrchestratorError> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-i")
+        .arg(key_path)
+        .arg("-o")
+        .arg("IdentitiesOnly=yes")
+        .arg("-o")
+        .arg("PreferredAuthentications=publickey")
+        .arg("-o")
+        .arg("PasswordAuthentication=no")
+        .arg("-o")
+        .arg("LogLevel=ERROR")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg(format!("{user}@{address}"))
+        .arg(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    // Write the secret and close the pipe (EOF) so `sudo -S` stops reading.
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or("failed to open ssh stdin for password delivery")?;
+        stdin.write_all(stdin_data)?;
+    }
+    let output = child.wait_with_output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let code = output
+        .status
+        .code()
+        .map_or("signal".to_string(), |c| c.to_string());
+    // stderr from sudo on a bad password is "Sorry, try again." — never the
+    // secret itself — so propagating it is safe.
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(format!("ssh (stdin) failed (exit={code}): {stderr}").into())
 }
 
 fn storage_path_from_hive(hive: &HiveFile) -> String {
@@ -18277,10 +18363,56 @@ mod tests {
                 .unwrap();
         assert!(creds.password.is_none());
 
+        // A password with significant surrounding spaces is preserved verbatim
+        // (NOT trimmed): trimming would corrupt a legitimate password (review).
+        let creds = resolve_add_hive_ssh_creds(
+            &serde_json::json!({"ssh_user": "admin", "ssh_password": "  pa ss  "}),
+        )
+        .unwrap();
+        assert_eq!(creds.password.as_deref(), Some("  pa ss  "));
+
         // ssh_user missing -> Err. ssh_user empty/whitespace -> Err.
         assert!(resolve_add_hive_ssh_creds(&serde_json::json!({})).is_err());
         assert!(resolve_add_hive_ssh_creds(&serde_json::json!({"ssh_user": ""})).is_err());
         assert!(resolve_add_hive_ssh_creds(&serde_json::json!({"ssh_user": "   "})).is_err());
+    }
+
+    #[test]
+    fn askpass_script_is_owner_only_and_round_trips_special_chars() {
+        // Passwords with every shell metacharacter that the old `echo "..."`
+        // form mishandled: command substitution, a trailing backslash, single +
+        // double quotes. The script must reproduce each one EXACTLY (no shell
+        // interpretation) and be owner-only on disk.
+        for pw in [
+            "plain",
+            "p$a`ss`", // $ and backticks would command-substitute under echo "..."
+            "trailing\\", // a trailing backslash broke the quoting under echo "..."
+            "quote'd\"both", // single + double quotes
+            "$(touch /tmp/jsr-askpass-pwned)", // command substitution attempt
+            "  spaced  ",
+        ] {
+            let path = askpass_script(pw).expect("askpass write");
+            // Owner-only (no group/other bits): the password is never world-readable.
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o077;
+            assert_eq!(mode, 0, "askpass file must have no group/other perms");
+            // Running the helper must print the password back verbatim.
+            let out = Command::new("sh").arg(&path).output().expect("run askpass");
+            assert!(out.status.success(), "askpass script must execute cleanly for {pw:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                format!("{pw}\n"),
+                "askpass must round-trip the password verbatim for {pw:?}"
+            );
+            let _ = fs::remove_file(&path);
+        }
+        // The injection-attempt password must NOT have executed.
+        assert!(!Path::new("/tmp/jsr-askpass-pwned").exists());
+        // Two calls never collide on a path (concurrent-bootstrap safety).
+        let a = askpass_script("x").unwrap();
+        let b = askpass_script("x").unwrap();
+        assert_ne!(a, b);
+        let _ = fs::remove_file(&a);
+        let _ = fs::remove_file(&b);
     }
 
     #[test]
