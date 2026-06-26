@@ -3803,6 +3803,38 @@ fn require_field<'a>(value: Option<&'a String>, field: &str) -> Result<&'a str, 
         })
 }
 
+/// Validate a Linux network-interface name before it is interpolated into a
+/// remote shell command (write_remote_file → ssh), an nftables ruleset
+/// (`oifname`/`iifname`), or the sy-config-routes YAML. The kernel caps iface
+/// names at IFNAMSIZ-1 = 15 bytes; restricting to `[A-Za-z0-9._-]` admits every
+/// real name (eth0, ens5, enp3s0, eth0.100 VLAN, br-lan, bond0, wg0, tun0,
+/// veth*) while excluding every shell / nft / YAML metacharacter. This single
+/// allowlist closes F7 (shell injection), F12 (nft injection) and F13 (YAML
+/// injection): the accepted charset shares no character with any sink's
+/// metacharacter set, so a validated name is inert in all three.
+fn validate_iface_name(name: &str, field: &str) -> Result<(), OrchestratorError> {
+    // `len()` is the byte length for a &str, which is exactly what IFNAMSIZ caps.
+    if name.is_empty() || name.len() > 15 {
+        return Err(format!(
+            "invalid {field} '{name}': interface name must be 1..=15 bytes (IFNAMSIZ)"
+        )
+        .into());
+    }
+    if name == "." || name == ".." {
+        return Err(format!("invalid {field} '{name}': reserved interface name").into());
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
+    {
+        return Err(format!(
+            "invalid {field} '{name}': only [A-Za-z0-9._-] allowed (no shell/nft/YAML metacharacters)"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn resolve_egress_nat_config(eg: &EgressSection) -> Result<EgressNatConfig, OrchestratorError> {
     if eg.ipv6.trim() != "blocked" {
         return Err(format!(
@@ -3824,6 +3856,8 @@ fn resolve_egress_nat_config(eg: &EgressSection) -> Result<EgressNatConfig, Orch
     }
     let wan_iface = require_field(eg.wan_iface.as_ref(), "egress.wan_iface")?.to_string();
     let lan_iface = require_field(eg.lan_iface.as_ref(), "egress.lan_iface")?.to_string();
+    validate_iface_name(&wan_iface, "egress.wan_iface")?;
+    validate_iface_name(&lan_iface, "egress.lan_iface")?;
     let edge_ip = match eg
         .edge_ip
         .as_ref()
@@ -16333,6 +16367,12 @@ fn resolve_add_hive_egress_section(
         edge_hive: None,
     };
     // Validate + derive eagerly so the operator gets the error at request time.
+    // NB: we return the raw `section`, NOT the derived EgressNatConfig. Iface-name
+    // safety downstream is therefore an *emergent* property: add_egress_hive_flow
+    // re-resolves (resolve_egress_nat_config) and only ever embeds the validated
+    // `nat.*` into sinks, never `section.wan_iface`/`section.lan_iface` directly.
+    // Any future consumer of these fields MUST go through resolve_egress_nat_config
+    // (which calls validate_iface_name) before reaching a shell/nft/YAML sink.
     resolve_egress_nat_config(&section)?;
     Ok(section)
 }
@@ -17121,10 +17161,67 @@ fn write_remote_file(
     remote_path: &str,
     contents: &str,
 ) -> Result<(), OrchestratorError> {
-    let escaped = contents.replace('\'', "'\"'\"'");
-    let cmd = format!("cat > {} <<'EOF'\n{}\nEOF", remote_path, escaped);
-    let sudo_cmd = sudo_wrap(&format!("bash -lc \"{}\"", cmd.replace('"', "\\\"")));
-    ssh_with_key(address, key_path, &sudo_cmd, user)
+    // Stream the file body over ssh stdin into `sudo -n tee <path>` instead of
+    // interpolating it into a remote shell command. Only the (fluxbee-controlled)
+    // path enters the remote argv, single-quoted; the file bytes never reach a
+    // shell, so contents cannot inject commands regardless of what they hold.
+    // Defense-in-depth: this is the audit's recommended structural fix even
+    // though the iface-name allowlist already neutralizes the known F7 vector.
+    // NB: `contents` is written verbatim (unlike the old heredoc, which appended
+    // a trailing newline). All current callers terminate their payload with '\n';
+    // a caller whose remote parser needs a trailing newline must include it.
+    let remote_cmd = format!(
+        "sudo -n tee '{}' >/dev/null",
+        shell_single_quote(remote_path)
+    );
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-i")
+        .arg(key_path)
+        .arg("-o")
+        .arg("IdentitiesOnly=yes")
+        .arg("-o")
+        .arg("PreferredAuthentications=publickey")
+        .arg("-o")
+        .arg("PasswordAuthentication=no")
+        .arg("-o")
+        .arg("LogLevel=ERROR")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg(format!("{user}@{address}"))
+        .arg(&remote_cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| -> OrchestratorError { "failed to open ssh stdin".into() })?;
+        // A BrokenPipe here means ssh / `sudo -n` exited before draining stdin
+        // (e.g. "sudo: a password is required", or the connection dropped). Don't
+        // propagate the bare pipe error — fall through to wait_with_output so the
+        // real remote exit code + stderr win. stdin is closed on scope exit (EOF).
+        if let Err(err) = stdin.write_all(contents.as_bytes()) {
+            if err.kind() != std::io::ErrorKind::BrokenPipe {
+                return Err(err.into());
+            }
+        }
+    }
+    let output = child.wait_with_output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let code = output
+        .status
+        .code()
+        .map_or("signal".to_string(), |c| c.to_string());
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(format!("write_remote_file via ssh+tee failed (exit={code}): stderr={stderr}").into())
 }
 
 fn wait_for_wan(
@@ -17611,6 +17708,63 @@ mod tests {
         let mut p8 = egress_section(true);
         p8.lan_cidr = Some("10.0.0.0/8".to_string());
         assert!(resolve_egress_nat_config(&p8).is_ok());
+    }
+
+    #[test]
+    fn resolve_egress_nat_config_validates_iface_names() {
+        // ACCEPT: real Linux iface names — VLAN '.', bridge/bond '-', predictable
+        // (ens/enp), wireguard/tun, and a full 15-char name at the IFNAMSIZ cap.
+        for name in [
+            "eth0", "eth1", "ens5", "enp3s0", "enp0s3", "wlan0", "br-lan", "eth0.100", "bond0",
+            "wg0", "tun0", "abcdef123456789", // 15 chars
+        ] {
+            let mut w = egress_section(true);
+            w.wan_iface = Some(name.to_string());
+            assert!(
+                resolve_egress_nat_config(&w).is_ok(),
+                "wan_iface should accept {name:?}"
+            );
+            let mut l = egress_section(true);
+            l.lan_iface = Some(name.to_string());
+            assert!(
+                resolve_egress_nat_config(&l).is_ok(),
+                "lan_iface should accept {name:?}"
+            );
+        }
+
+        // REJECT: empty, over-length, and every injection metacharacter class
+        // (shell F7, nft F12, YAML F13), checked on BOTH fields independently.
+        for bad in [
+            "",
+            "abcdef1234567890",     // 16 chars > IFNAMSIZ-1
+            "eth0$(reboot)",        // shell: $( )
+            "eth0`id`",             // shell: backtick
+            "eth0;reboot",          // shell: ;
+            "eth0 reboot",          // shell: space
+            "eth0|x",               // shell: |
+            "eth0&",                // shell: &
+            "eth0>x",               // shell: >
+            "eth0\"",               // nft / yaml token break
+            "eth0\\",               // shell backslash
+            "eth0\nenabled: false", // yaml newline / F13
+            "eth0/../x",            // path / slash
+            "eth\t0",               // internal tab (leading/trailing ws is trimmed upstream)
+            ".",
+            "..",
+        ] {
+            let mut w = egress_section(true);
+            w.wan_iface = Some(bad.to_string());
+            assert!(
+                resolve_egress_nat_config(&w).is_err(),
+                "wan_iface should reject {bad:?}"
+            );
+            let mut l = egress_section(true);
+            l.lan_iface = Some(bad.to_string());
+            assert!(
+                resolve_egress_nat_config(&l).is_err(),
+                "lan_iface should reject {bad:?}"
+            );
+        }
     }
 
     #[test]

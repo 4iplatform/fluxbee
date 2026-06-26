@@ -5,11 +5,17 @@ Commit auditado: `78428c5`
 Branch: `daily_onworking_coa`
 Archivo principal: `src/bin/sy_orchestrator.rs` (20562 lineas)
 
-## Estado de resolucion (actualizado 2026-06-25)
+## Estado de resolucion (actualizado 2026-06-26)
 
-Reconciliacion del trabajo posterior a la auditoria. Prioridad acordada con el operador: **operativos primero, seguridad despues** — la red es interna con puertas definidas y SSH se usa solo para el bootstrap inicial. Por eso el lote operativo + SSH-only-bootstrap se resolvio primero; el lote de seguridad (inyeccion de iface, gates de origen, allowlist) queda pendiente **por decision, no por descuido**.
+Reconciliacion del trabajo posterior a la auditoria. Prioridad acordada con el operador: **operativos primero, seguridad despues** — la red es interna con puertas definidas y SSH se usa solo para el bootstrap inicial. Por eso el lote operativo + SSH-only-bootstrap se resolvio primero; ahora se abrio el lote de seguridad arrancando por el #1 del orden sugerido (inyeccion de iface, F7/F12/F13).
 
-**Resueltos (6 de 24):**
+**Resueltos (9 de 24):**
+
+- **F7** RCE root via iface — `validate_iface_name` (allowlist `^[A-Za-z0-9._-]{1,15}$`, IFNAMSIZ, rechaza `.`/`..`) aplicado a `wan_iface`/`lan_iface` en `resolve_egress_nat_config` (el unico constructor de `EgressNatConfig`), antes de cualquier sink. Ademas `write_remote_file` reescrito: el contenido va por **stdin** a `sudo -n tee '<path>'`, sin interpolacion en shell. *Unit test (accept/reject exhaustivo) + revision adversarial multi-agente (GO, 0 defectos bloqueantes; reachability/charset/rewrite verificados).*
+- **F12** inyeccion nft — cerrado por el **mismo** allowlist: el iface se embebe solo en strings nft entre comillas dobles y el charset excluye `"` y `\`. *Cubierto por el fix y test de F7.*
+- **F13** inyeccion/corrupcion YAML — idem: el iface se embebe solo como escalar YAML entre comillas dobles desde `nat.*` (validado); el charset excluye `"`/`\` y los disparadores de coercion de escalar. *Cubierto por el fix y test de F7.*
+
+**Resueltos previamente (6):**
 
 - **F1** remove_hive socket-only — SSH operativo eliminado; online -> `socket_ok/socket`, offline -> `local_only/local_only`, sin fallback SSH. *Validado empiricamente (lab, online + offline).*
 - **F2** add_hive sin fallback SSH — `WORKER_SOCKET_UNREACHABLE` retryable cuando el worker esta online; clasificador alineado a los strings reales de `RpcError`. *Validado empiricamente (lab).*
@@ -20,15 +26,15 @@ Reconciliacion del trabajo posterior a la auditoria. Prioridad acordada con el o
 
 Ademas (no era finding del audit; cambio de diseno del operador): **las credenciales SSH del bootstrap se movieron al payload de `add_hive`** (`ssh_user` requerido / `ssh_password` opcional, probe key-first), eliminando los `administrator`/`magicAI` hardcodeados; el secreto se redacta en SY.architect; el schema de admin se actualizo. *Validado empiricamente (lab: worker bootstrapeado con creds del payload).*
 
-**Pendientes (18 de 24)** — por severidad:
+**Pendientes (15 de 24)** — por severidad:
 
-- **Alta (5):** **F7** (RCE root via iface sin validar — *el #1 del orden sugerido, SIGUE ABIERTO*), F8 (ADMIN_COMMAND sin gate de origen), F3 (traversal de `hive_id`), F4 (allowlist `system` no configurable), F11 (remove_hive egress no des-aprovisiona NAT — *tiene angulo operativo: router huerfano post-reboot*).
-- **Media (8):** F12 + F13 (inyeccion nft / YAML — **mismo fix de iface que F7**), F5 (egress reporta `ok` incompleto), F6 (drift egress), F15 (allowlist cross-hive), F16 (conntrack_tuned), F17 (nft no carga al boot), F18 (TOCTOU sin lock).
+- **Alta (4):** F8 (ADMIN_COMMAND sin gate de origen — *siguiente en el orden*), F3 (traversal de `hive_id`), F4 (allowlist `system` no configurable), F11 (remove_hive egress no des-aprovisiona NAT — *tiene angulo operativo: router huerfano post-reboot*).
+- **Media (6):** F5 (egress reporta `ok` incompleto), F6 (drift egress), F15 (allowlist cross-hive), F16 (conntrack_tuned), F17 (nft no carga al boot), F18 (TOCTOU sin lock).
 - **Baja (5):** F19, F21, F22, F23, F25.
 
-**Nota de seguridad (importante):** **F7** (con sus hermanos F12/F13) es el pendiente de mayor prioridad. El lote de creds reescribio el *threading* de `write_remote_file` (agrego el parametro `user`) pero **no** corrigio la construccion de shell por interpolacion ni agrego la allowlist de nombre de interfaz — el vector de F7 sigue abierto. Bajo el modelo interno+gated es motherbee/admin-autenticado (no RCE remoto no-autenticado), pero es un cruce real string-de-config -> shell como root.
+**Nota de seguridad:** **F7/F12/F13 cerrados** — eran el pendiente #1. Una sola allowlist de iface los cierra a los tres porque el charset aceptado (`[A-Za-z0-9._-]`) no comparte ningun metacarácter con los tres sinks (shell / nft / YAML), y la validacion corre en el unico constructor de `EgressNatConfig` antes de todo sink (verificado: sin bypass, los paths de reconcile re-validan el `hive.yaml` deserializado). El siguiente pendiente de mayor prioridad pasa a ser **F8** (gate de origen en el canal ADMIN).
 
-Estado de codigo: los fixes resueltos viven en `src/` **sin commitear aun** (commit aparte del lab). Validacion: ver `lab/STATUS.md` (entorno containerizado donde F1/F2/F9 + creds se probaron sobre una malla real de 2 hives).
+Estado de codigo: los fixes resueltos viven en `src/` (commit aparte del lab). Validacion: ver `lab/STATUS.md` (entorno containerizado donde F1/F2/F9 + creds se probaron sobre una malla real de 2 hives); F7/F12/F13 con unit tests + revision adversarial (sin rol egress aun en el lab — Fase 2/VM para validacion empirica de egress).
 
 ## Alcance
 
@@ -72,7 +78,7 @@ Tambien hay tres bugs de las funcionalidades nuevas comparten una sola causa rai
 
 | ID | Sev | Area | Titulo | Verificacion | Backlog |
 |----|-----|------|--------|--------------|---------|
-| F7  | Alta | ssh-transport | RCE como root en `write_remote_file` (iface sin validar) | empirica | nuevo (antes Baja) |
+| F7  | Alta | ssh-transport | ✅ RESUELTO — RCE como root en `write_remote_file` (iface sin validar) | empirica | nuevo (antes Baja) |
 | F8  | Alta | origin-auth | `ADMIN_COMMAND` sin gate de origen | lectura | nuevo |
 | F1  | Alta | remove_hive | SSH operativo en `remove_hive` | lectura+git | contradice `[x]` v2:21 |
 | F2  | Alta | add_hive | `add_hive` socket-only cae a bootstrap SSH | lectura | contradice `[x]` v2:22 |
@@ -81,8 +87,8 @@ Tambien hay tres bugs de las funcionalidades nuevas comparten una sola causa rai
 | F9  | Alta | add_hive | `add_hive` no idempotente (`pending` atascado) | lectura | nuevo |
 | F10 | Alta | add_hive | Hardening SSH egress no-fatal, reporta `ok` | lectura | nuevo |
 | F11 | Alta | remove_hive | `remove_hive` egress no des-aprovisiona NAT | lectura | nuevo |
-| F12 | Media | egress-nat | Inyeccion de reglas nft (iface sin validar) | empirica | nuevo |
-| F13 | Media | ssh-transport | Corrupcion/inyeccion YAML en `hive.yaml` remoto | empirica | nuevo |
+| F12 | Media | egress-nat | ✅ RESUELTO — Inyeccion de reglas nft (iface sin validar) | empirica | nuevo |
+| F13 | Media | ssh-transport | ✅ RESUELTO — Corrupcion/inyeccion YAML en `hive.yaml` remoto | empirica | nuevo |
 | F5  | Media | egress-nat | Egress reporta `ok` con verificacion incompleta | lectura | reescrito |
 | F6  | Media | egress-nat | Watchdog egress no corrige drift parcial | lectura | decision CR-5 |
 | F14 | Media | robustez | `watchdog_tick` no es panic-safe | lectura | nuevo |
@@ -102,6 +108,8 @@ Severidades: 9 Alta, 9 Media, 6 Baja. (F24 quedo absorbido en F6; ver descartado
 ## Findings - Alta
 
 ### F7 - Alta - Inyeccion de comandos como root en `write_remote_file`
+
+> **RESUELTO (2026-06-26).** `validate_iface_name` (allowlist `^[A-Za-z0-9._-]{1,15}$`, IFNAMSIZ, rechaza `.`/`..`) en `resolve_egress_nat_config` — unico constructor de `EgressNatConfig`, antes de todo sink. `write_remote_file` reescrito: contenido por **stdin** a `sudo -n tee '<path>'`, sin shell. Unit test + revision adversarial multi-agente (GO).
 
 Verificacion: **empirica** (se reconstruyo la cadena de quoting exacta y se ejecuto contra bash real).
 
@@ -374,6 +382,8 @@ En el tick egress, ademas de `nft_table_loaded()`, comparar contenido de la tabl
 
 ### F12 - Media - Inyeccion de reglas nft via `wan_iface`/`lan_iface` sin validar
 
+> **RESUELTO (2026-06-26).** Cerrado por el mismo `validate_iface_name` de F7: el iface se embebe solo en strings nft entre comillas dobles y el charset aceptado excluye `"` y `\`.
+
 Verificacion: **empirica** (PoC con serde_yaml 0.9 + simulacion del ruleset).
 
 Causa raiz compartida con F7 y F13: ausencia de allowlist de nombre de interfaz.
@@ -394,6 +404,8 @@ Recomendacion:
 El mismo fix de F7 (allowlist `^[A-Za-z0-9._-]{1,15}$` en `resolve_egress_nat_config`) cierra este vector.
 
 ### F13 - Media - Corrupcion/inyeccion YAML en el `hive.yaml` remoto
+
+> **RESUELTO (2026-06-26).** Cerrado por el mismo `validate_iface_name` de F7: el iface se embebe solo como escalar YAML entre comillas dobles desde `nat.*` (validado); el charset excluye `"`/`\` y los disparadores de coercion de escalar.
 
 Verificacion: **empirica** (simulacion YAML). Causa raiz compartida con F7/F12.
 

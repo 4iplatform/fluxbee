@@ -15,22 +15,23 @@ Origen: [`docs/audits/2026-06-23-sy-orchestrator-audit.md`](../docs/audits/2026-
 Prioridad acordada: **operativos primero, seguridad después** (red interna con
 puertas definidas; SSH solo para bootstrap inicial).
 
-**Resueltos (6):** `F1` `F2` `F9` `F10` `F14` `F20` — código en `src/` **sin
-commitear aún**. F1/F2/F9 validados empíricamente en el lab; F10 con revisión
-adversarial (falta validación en egress); F14/F20 con unit tests.
+**Resueltos (9):** `F1` `F2` `F9` `F10` `F14` `F20` `F7` `F12` `F13` — código en
+`src/`. F1/F2/F9 validados empíricamente en el lab; F10 con revisión adversarial
+(falta validación en egress); F14/F20 con unit tests; **F7/F12/F13** con unit
+test exhaustivo + revisión adversarial multi-agente (GO, 0 defectos bloqueantes).
 
-**Pendientes (18):**
+**Pendientes (15):**
 
-- **Alta:** `F7` (RCE root vía iface — **el #1 del audit, sigue abierto**),
-  `F8` (gate de origen ADMIN), `F3` (traversal hive_id), `F4` (allowlist),
-  `F11` (egress NAT teardown).
-- **Media:** `F12`/`F13` (inyección nft/YAML — mismo fix que F7), `F5` `F6`
-  `F16` `F17` (egress), `F15` (cross-hive), `F18` (TOCTOU lock).
+- **Alta:** `F8` (gate de origen ADMIN — **siguiente en el orden**),
+  `F3` (traversal hive_id), `F4` (allowlist), `F11` (egress NAT teardown).
+- **Media:** `F5` `F6` `F16` `F17` (egress), `F15` (cross-hive), `F18` (TOCTOU lock).
 - **Baja:** `F19` `F21` `F22` `F23` `F25`.
 
-> ⚠️ **F7 es el de mayor prioridad pendiente.** El lote de creds tocó el
-> threading de `write_remote_file` pero **no** el shell-injection ni la
-> validación de nombre de interfaz.
+> ✅ **F7/F12/F13 cerrados** (eran el #1 del audit). Un solo allowlist de iface
+> (`^[A-Za-z0-9._-]{1,15}$`, IFNAMSIZ) en el único constructor de `EgressNatConfig`
+> los cierra a los tres: el charset no comparte metacarácter con shell/nft/YAML.
+> Además `write_remote_file` ahora manda el contenido por stdin a `sudo -n tee`,
+> sin shell. **Siguiente prioridad: `F8`** (gate de origen en el canal ADMIN).
 
 ---
 
@@ -96,8 +97,26 @@ y el flujo de creds end-to-end.
 - [ ] **Commit** de los cambios `src/` del audit (F1/F2/F9/F10/F14/F20 + creds) — separado del lab.
 - [ ] **Review adversarial** del código del lote creds.
 - [ ] Actualizar **scripts E2E** (`ssh_user` requerido) + docs de contrato (`sy_orchestrator_v2_tasks.md` items F1/F2).
-- [ ] **Lote de seguridad** del audit: F7/F12/F13 (iface), F8, F3, F4/F15, F11.
+- [ ] **Lote de seguridad** del audit: ~~F7/F12/F13 (iface)~~ ✅, **F8** (siguiente), F3, F4/F15, F11.
 - [ ] **Lote egress**: F5/F6/F16/F17 + validar F10/F11 en **VM** (Fase 2 del lab).
 - [x] **Distribución**: workflow `.github/workflows/lab-image.yml` pushea a GHCR las dos flavors — `slim` (multi-stage, ~1.9 GB, `:latest`, boot validado) y `fat` (~9 GB). Repo público → GHCR + Actions **gratis e ilimitado**. **Falta disparar**: `git tag lab-v0.1 && git push --tags` (o Run workflow).
 - [ ] Distribución (mejoras): slim aún duplica binarios (`/usr/bin` + `dist/core/bin`) y syncthing — se puede bajar más. Multi-arch (arm64) si hay devs en Apple Silicon.
+
+## Para investigar (anotado 2026-06-26)
+
+- **Vista de ilks por hive en SY.architect (posible bug).** Al pedir "ilks por
+  hive", `worker1` devuelve **19** (sus 7 propios + los 12 de `motherbee`),
+  mientras `motherbee` devuelve 12. Cada ilk viene **etiquetado con su hive
+  dueño** (p.ej. `SY.storage@motherbee`), así que el dato parece la **vista
+  replicada de la malla**, no corrupción. Hipótesis a discernir:
+  1. Replicación de SY.identity **por diseño** (cada hive sincroniza ilks vía
+     `identity.sync` puerto 9100) + archi/admin lo presenta como "ilks de
+     worker1" → bug de **presentación / scoping de la query** en archi o en el
+     endpoint admin.
+  2. El listado de ilks por hive **debería filtrar local-only** y no lo hace →
+     bug de **scoping** en admin / SY.identity.
+  3. El orchestrator no levantó bien algún nodo.
+  - Dónde mirar: endpoint admin de list-ilks (scoping por hive), replicación de
+    SY.identity (SHM/sync 9100), y cómo archi arma la consulta. Repro disponible
+    en el lab (motherbee + worker1, 21 nodos).
 - [ ] **AI**: cargar OpenAI key reproducible; scope/ejecución de la **extensión Anthropic**.
