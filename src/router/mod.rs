@@ -24,7 +24,8 @@ use crate::shm::{
     LsaRegionWriter, LsaSnapshot, MemoryRegionReader, MemoryShmSnapshot, OpaRegionReader,
     OpaSnapshot, RemoteHiveEntry, RemoteNodeEntry, RemoteRouteEntry, RemoteTapEntry,
     RemoteVpnEntry, RouterRegionReader, RouterRegionWriter, TapEntry, VpnAssignment, ACTION_DROP,
-    ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_STALE, HEARTBEAT_STALE_MS, HIVE_FLAG_SELF,
+    ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_FROZEN, FLAG_STALE, HEARTBEAT_STALE_MS,
+    HIVE_FLAG_SELF,
     MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING,
 };
 use fluxbee_sdk::classify_routed_message;
@@ -1252,9 +1253,10 @@ async fn handle_message(
     }
 
     if !senders.is_empty() {
-        let data = serialize_for_local_delivery(memory_reader, hive_id, &msg).await?;
-        for sender in senders {
-            let _ = sender.send(data.clone());
+        if let Some(data) = serialize_for_local_delivery(memory_reader, hive_id, &msg).await? {
+            for sender in senders {
+                let _ = sender.send(data.clone());
+            }
         }
     }
 
@@ -1464,7 +1466,8 @@ async fn fanout_taps_for_unicast(
                     continue;
                 }
                 let data = match serialize_for_local_delivery(memory_reader, hive_id, &copy).await {
-                    Ok(data) => data,
+                    Ok(Some(data)) => data,
+                    Ok(None) => continue, // suppressed: protected SYSTEM from unauthorized origin
                     Err(err) => {
                         tracing::warn!(
                             tap_target = %tap_target,
@@ -2649,6 +2652,14 @@ async fn handle_wan_message(
         return Ok(());
     };
 
+    // F4/F15: stamp the router-authoritative cross-hive L2 name (resolved from the
+    // LSA snapshot) over whatever the WAN frame carried, BEFORE the origin gate in
+    // serialize_for_local_delivery. Unlike the local (:915) and peer (:3413) paths
+    // the WAN handler never stamped src_l2_name, so a remote peer could otherwise
+    // spoof it (e.g. claim SY.orchestrator@<hive>) to pass the protected-action gate.
+    let mut msg = msg.clone();
+    msg.routing.src_l2_name = Some(src_info.name.clone());
+
     if msg.routing.ttl == 0 {
         send_ttl_exceeded_to(&msg, sender, ctx.router_uuid)?;
         return Ok(());
@@ -2917,9 +2928,12 @@ async fn handle_wan_message(
     }
 
     if !senders.is_empty() {
-        let data = serialize_for_local_delivery(&ctx.memory_reader, &ctx.hive_id, &msg).await?;
-        for sender in senders {
-            let _ = sender.send(data.clone());
+        if let Some(data) =
+            serialize_for_local_delivery(&ctx.memory_reader, &ctx.hive_id, &msg).await?
+        {
+            for sender in senders {
+                let _ = sender.send(data.clone());
+            }
         }
     }
     Ok(())
@@ -3697,9 +3711,10 @@ async fn handle_peer_message(
     }
 
     if !senders.is_empty() {
-        let data = serialize_for_local_delivery(memory_reader, hive_id, &msg).await?;
-        for sender in senders {
-            let _ = sender.send(data.clone());
+        if let Some(data) = serialize_for_local_delivery(memory_reader, hive_id, &msg).await? {
+            for sender in senders {
+                let _ = sender.send(data.clone());
+            }
         }
     }
     Ok(())
@@ -3996,7 +4011,13 @@ async fn refresh_config(
             *routes_guard = snapshot
                 .routes
                 .iter()
-                .filter(|route| route.flags == 0 || (route.flags & FLAG_ACTIVE != 0))
+                // Skip FLAG_FROZEN entries: they are system-owned authority
+                // markers published for observability only (see FLAG_FROZEN); they
+                // must never fold into the forwarding FIB.
+                .filter(|route| {
+                    (route.flags == 0 || (route.flags & FLAG_ACTIVE != 0))
+                        && route.flags & FLAG_FROZEN == 0
+                })
                 .map(|route| StaticRoute {
                     pattern: bytes_to_string(&route.prefix, route.prefix_len as usize).to_string(),
                     match_kind: route.match_kind,
@@ -5386,17 +5407,87 @@ fn should_enrich_with_memory_package(msg: &Message) -> bool {
     true
 }
 
+/// Protected SYSTEM actions (by `meta.msg`) that a node may only act on when the
+/// router-resolved origin is authorized. This is the single source of truth that
+/// the orchestrator's per-node gate used to own; it now lives in the router so
+/// origin-authority is enforced once, centrally, at delivery time.
+const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
+    "SYSTEM_UPDATE",
+    "SYSTEM_SYNC_HINT",
+    "SPAWN_NODE",
+    "KILL_NODE",
+    "START_NODE",
+    "RESTART_NODE",
+    "REMOVE_NODE_INSTANCE",
+    "NODE_CONFIG_SET",
+    "NODE_CONFIG_GET",
+    "NODE_STATE_GET",
+    "NODE_STATUS_GET",
+    "GET_VERSIONS",
+    "GET_RUNTIMES",
+    "GET_RUNTIME",
+    "LIST_NODES",
+    "INVENTORY_REQUEST",
+    "ADD_HIVE_FINALIZE",
+    "REMOVE_HIVE_CLEANUP",
+];
+
+/// Origin-authority for protected SYSTEM actions, keyed on the router-resolved
+/// (authoritative) `src_l2_name`. `hive_id` is THIS router's hive.
+///
+/// - `SY.orchestrator@<any hive>`: cross-hive forwards (a peer orchestrator
+///   relays SPAWN_NODE/etc. into this hive). Authorized from ANY hive.
+/// - `SY.admin` / `SY.wf-rules` / `WF.orch.diag`: same-hive control plane only.
+///
+/// These `SY.` rules are structural/constructive and hardcoded here (the router
+/// is the system's routing/authority center); they are also surfaced as frozen
+/// SHM route entries for observability (see FLAG_FROZEN). `src_l2_name` is
+/// router-authoritative (resolved from the source UUID against the node registry,
+/// overwriting any sender-supplied value), so this is a real boundary, not a
+/// self-asserted one.
+fn system_origin_allowed(src_l2_name: Option<&str>, hive_id: &str) -> bool {
+    let Some(name) = src_l2_name.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let Some((role, hive)) = name.split_once('@') else {
+        return false;
+    };
+    if role == "SY.orchestrator" {
+        // Any hive, but the hive label must be non-empty (rejects "SY.orchestrator@").
+        return !hive.is_empty();
+    }
+    hive == hive_id && matches!(role, "SY.admin" | "SY.wf-rules" | "WF.orch.diag")
+}
+
+/// Serialize a message for delivery to a local node, enforcing SYSTEM
+/// origin-authority. Returns `Ok(None)` when delivery must be SUPPRESSED (a
+/// protected SYSTEM action from an unauthorized origin) — callers skip the send.
+/// An `Err` would tear down the connection, so suppression uses `None`, not `Err`.
 async fn serialize_for_local_delivery(
     memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
     hive_id: &str,
     msg: &Message,
-) -> Result<Vec<u8>, RouterError> {
+) -> Result<Option<Vec<u8>>, RouterError> {
+    if msg.meta.msg_type == SYSTEM_KIND {
+        let action = msg.meta.msg.as_deref().unwrap_or_default();
+        if PROTECTED_SYSTEM_ACTIONS.contains(&action)
+            && !system_origin_allowed(msg.routing.src_l2_name.as_deref(), hive_id)
+        {
+            tracing::warn!(
+                action = action,
+                src_uuid = %msg.routing.src,
+                src_l2_name = ?msg.routing.src_l2_name,
+                "router dropped protected SYSTEM action from unauthorized origin"
+            );
+            return Ok(None);
+        }
+    }
     let mut enriched = msg.clone();
     if enriched.meta.action_class.is_none() {
         enriched.meta.action_class = classify_routed_message(&enriched.meta.msg_type);
     }
     maybe_attach_memory_package(memory_reader, hive_id, &mut enriched).await;
-    Ok(serde_json::to_vec(&enriched)?)
+    Ok(Some(serde_json::to_vec(&enriched)?))
 }
 
 async fn maybe_attach_memory_package(
@@ -5469,6 +5560,86 @@ mod tests {
     };
     use fluxbee_sdk::protocol::Routing;
     use std::collections::HashMap;
+
+    #[test]
+    fn system_origin_allowed_enforces_role_and_hive_scope() {
+        let hive = "motherbee";
+        // SY.orchestrator: authorized from ANY hive (cross-hive forwards).
+        assert!(system_origin_allowed(Some("SY.orchestrator@motherbee"), hive));
+        assert!(system_origin_allowed(Some("SY.orchestrator@worker1"), hive));
+        assert!(system_origin_allowed(Some("  SY.orchestrator@worker1  "), hive));
+        // ...but the role label must be EXACT (rejects a relay/sub-name spoof).
+        assert!(!system_origin_allowed(
+            Some("SY.orchestrator.relay.123@motherbee"),
+            hive
+        ));
+        assert!(!system_origin_allowed(Some("SY.orchestrator@"), hive));
+
+        // SY.admin / SY.wf-rules / WF.orch.diag: SAME hive only.
+        for role in ["SY.admin", "SY.wf-rules", "WF.orch.diag"] {
+            assert!(
+                system_origin_allowed(Some(&format!("{role}@motherbee")), hive),
+                "{role}@same must pass"
+            );
+            assert!(
+                !system_origin_allowed(Some(&format!("{role}@worker1")), hive),
+                "{role}@other must be rejected (same-hive only)"
+            );
+        }
+
+        // Everything else: rejected. Including None / empty / no-@ / unknown roles.
+        for bad in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("SY.admin"),
+            Some("motherbee"),
+            Some("AI.evil@motherbee"),
+            Some("SY.vault@motherbee"),
+            Some("SY.identity@motherbee"),
+        ] {
+            assert!(
+                !system_origin_allowed(bad, hive),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn protected_system_actions_match_orchestrator_contract() {
+        // The 18 protected SYSTEM actions the router now gates (parity with the
+        // orchestrator's former protected_system_action_response).
+        for action in [
+            "SYSTEM_UPDATE",
+            "SYSTEM_SYNC_HINT",
+            "SPAWN_NODE",
+            "KILL_NODE",
+            "START_NODE",
+            "RESTART_NODE",
+            "REMOVE_NODE_INSTANCE",
+            "NODE_CONFIG_SET",
+            "NODE_CONFIG_GET",
+            "NODE_STATE_GET",
+            "NODE_STATUS_GET",
+            "GET_VERSIONS",
+            "GET_RUNTIMES",
+            "GET_RUNTIME",
+            "LIST_NODES",
+            "INVENTORY_REQUEST",
+            "ADD_HIVE_FINALIZE",
+            "REMOVE_HIVE_CLEANUP",
+        ] {
+            assert!(
+                PROTECTED_SYSTEM_ACTIONS.contains(&action),
+                "{action} must be protected"
+            );
+        }
+        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 18);
+        // Non-protected / unknown actions are not gated.
+        for action in ["RUNTIME_UPDATE", "HELLO", "LSA", "", "TOTALLY_UNKNOWN"] {
+            assert!(!PROTECTED_SYSTEM_ACTIONS.contains(&action));
+        }
+    }
 
     fn lsa_payload(hive: &str, seq: u64, router_id: &str, router_name: &str) -> LsaPayload {
         LsaPayload {

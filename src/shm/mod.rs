@@ -75,6 +75,11 @@ pub const ACTION_DROP: u8 = 1;
 pub const FLAG_ACTIVE: u16 = 0x0001;
 pub const FLAG_DELETED: u16 = 0x0002;
 pub const FLAG_STALE: u16 = 0x0004;
+/// A frozen, system-owned route entry: published for observability (it is
+/// FLAG_ACTIVE so config readers surface it) but skipped by the router FIB so it
+/// never participates in forwarding. Used to make the hardcoded `SY.` origin
+/// authority rules inspectable in SHM without affecting routing.
+pub const FLAG_FROZEN: u16 = 0x0008;
 pub const HIVE_FLAG_SELF: u16 = 0x0010;
 pub const ICH_MAP_FLAG_OCCUPIED: u16 = 0x0001;
 pub const ICH_MAP_FLAG_TOMBSTONE: u16 = 0x0002;

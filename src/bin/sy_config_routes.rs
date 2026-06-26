@@ -19,7 +19,8 @@ use fluxbee_sdk::{
 };
 use json_router::shm::{
     copy_bytes_with_len, now_epoch_ms, ConfigRegionWriter, StaticRouteEntry, TapEntry,
-    VpnAssignment, ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX,
+    VpnAssignment, ACTION_DROP, ACTION_FORWARD, FLAG_ACTIVE, FLAG_FROZEN, MATCH_EXACT, MATCH_GLOB,
+    MATCH_PREFIX,
 };
 
 const RPC_CH_INCOMING: &str = "incoming";
@@ -146,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node_uuid = load_or_create_uuid(&state_dir.join("nodes"), "SY.config.routes")?;
     let mut writer = ConfigRegionWriter::open_or_create(&shm_name, node_uuid, &hive.hive_id)?;
 
-    apply_config(&mut writer, &sy_config)?;
+    apply_config(&mut writer, &hive_id, &sy_config)?;
 
     let node_config = NodeConfig {
         name: "SY.config.routes".to_string(),
@@ -187,6 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &sender,
                         &msg,
                         &config_dir,
+                        &hive_id,
                         &mut sy_config,
                         &mut writer,
                     )
@@ -346,7 +348,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     next_config.version = payload.version;
                 }
                 next_config.updated_at = now_epoch_ms().to_string();
-                if let Err(err) = apply_config(&mut writer, &next_config) {
+                if let Err(err) = apply_config(&mut writer, &hive_id, &next_config) {
                     tracing::warn!("apply config failed: {err}");
                     let _ = send_config_response(
                         &sender,
@@ -520,7 +522,7 @@ async fn handle_node_config_set(
     };
 
     if next_config != *sy_config {
-        apply_config(writer, &next_config)?;
+        apply_config(writer, hive_id, &next_config)?;
         write_config(config_dir, &next_config)?;
         *sy_config = next_config;
     }
@@ -644,6 +646,7 @@ async fn handle_admin_action(
     sender: &NodeSender,
     msg: &Message,
     config_dir: &Path,
+    hive_id: &str,
     sy_config: &mut SyConfigFile,
     writer: &mut ConfigRegionWriter,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -675,7 +678,7 @@ async fn handle_admin_action(
                 sy_config.routes.push(route.clone());
                 sy_config.version = sy_config.version.saturating_add(1);
                 sy_config.updated_at = now_epoch_ms().to_string();
-                apply_config(writer, sy_config)?;
+                apply_config(writer, hive_id, sy_config)?;
                 write_config(config_dir, sy_config)?;
                 admin_success_payload(
                     action,
@@ -700,7 +703,7 @@ async fn handle_admin_action(
             } else {
                 sy_config.version = sy_config.version.saturating_add(1);
                 sy_config.updated_at = now_epoch_ms().to_string();
-                apply_config(writer, sy_config)?;
+                apply_config(writer, hive_id, sy_config)?;
                 write_config(config_dir, sy_config)?;
                 admin_success_payload(
                     action,
@@ -722,7 +725,7 @@ async fn handle_admin_action(
                 sy_config.vpns.push(vpn.clone());
                 sy_config.version = sy_config.version.saturating_add(1);
                 sy_config.updated_at = now_epoch_ms().to_string();
-                apply_config(writer, sy_config)?;
+                apply_config(writer, hive_id, sy_config)?;
                 write_config(config_dir, sy_config)?;
                 admin_success_payload(
                     action,
@@ -750,7 +753,7 @@ async fn handle_admin_action(
             } else {
                 sy_config.version = sy_config.version.saturating_add(1);
                 sy_config.updated_at = now_epoch_ms().to_string();
-                apply_config(writer, sy_config)?;
+                apply_config(writer, hive_id, sy_config)?;
                 write_config(config_dir, sy_config)?;
                 admin_success_payload(
                     action,
@@ -789,7 +792,7 @@ async fn handle_admin_action(
                 sy_config.taps.push(tap.clone());
                 sy_config.version = sy_config.version.saturating_add(1);
                 sy_config.updated_at = now_epoch_ms().to_string();
-                apply_config(writer, sy_config)?;
+                apply_config(writer, hive_id, sy_config)?;
                 write_config(config_dir, sy_config)?;
                 admin_success_payload(
                     action,
@@ -827,7 +830,7 @@ async fn handle_admin_action(
             } else {
                 sy_config.version = sy_config.version.saturating_add(1);
                 sy_config.updated_at = now_epoch_ms().to_string();
-                apply_config(writer, sy_config)?;
+                apply_config(writer, hive_id, sy_config)?;
                 write_config(config_dir, sy_config)?;
                 admin_success_payload(
                     action,
@@ -949,11 +952,47 @@ fn write_config(
     Ok(())
 }
 
+/// The frozen, system-owned `SY.` origin-authority markers, one per authorized
+/// protected-SYSTEM origin pattern. Published into the route table for
+/// OBSERVABILITY only: they carry FLAG_ACTIVE (so config readers surface them) and
+/// FLAG_FROZEN (so the router FIB skips them — they never affect forwarding).
+///
+/// Enforcement is the router's `system_origin_allowed` gate (the single source of
+/// truth); these entries are the visible mirror of that rule set and must be kept
+/// in sync with it by hand. `SY.orchestrator@*` is any-hive (cross-hive forwards);
+/// the rest are this hive's control plane.
+fn frozen_system_authority_routes(hive_id: &str) -> Vec<StaticRouteEntry> {
+    let patterns = [
+        ("SY.orchestrator@*".to_string(), MATCH_GLOB),
+        (format!("SY.admin@{hive_id}"), MATCH_EXACT),
+        (format!("SY.wf-rules@{hive_id}"), MATCH_EXACT),
+        (format!("WF.orch.diag@{hive_id}"), MATCH_EXACT),
+    ];
+    patterns
+        .into_iter()
+        .map(|(pattern, kind)| {
+            let mut entry = empty_static_route();
+            entry.prefix_len = copy_bytes_with_len(&mut entry.prefix, &pattern) as u16;
+            entry.match_kind = kind;
+            // Benign action; never consulted because the router FIB skips FLAG_FROZEN.
+            entry.action = ACTION_FORWARD;
+            entry.priority = 0;
+            entry.flags = FLAG_ACTIVE | FLAG_FROZEN;
+            entry.installed_at = now_epoch_ms();
+            entry
+        })
+        .collect()
+}
+
 fn apply_config(
     writer: &mut ConfigRegionWriter,
+    hive_id: &str,
     sy_config: &SyConfigFile,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let routes = build_routes(&sy_config.routes)?;
+    let mut routes = build_routes(&sy_config.routes)?;
+    // write_static_routes REPLACES the whole table on every apply, so the frozen
+    // markers must be re-appended here each time (boot + every admin mutation).
+    routes.extend(frozen_system_authority_routes(hive_id));
     let vpns = build_vpns(&sy_config.vpns)?;
     let taps = build_taps(&sy_config.taps)?;
     writer.write_static_routes(&routes, false)?;
