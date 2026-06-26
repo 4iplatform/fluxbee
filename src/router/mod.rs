@@ -5432,12 +5432,18 @@ const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
     "REMOVE_HIVE_CLEANUP",
 ];
 
-/// Origin-authority for protected SYSTEM actions, keyed on the router-resolved
+/// Origin-authority for a protected SYSTEM `action`, keyed on the router-resolved
 /// (authoritative) `src_l2_name`. `hive_id` is THIS router's hive.
 ///
 /// - `SY.orchestrator@<any hive>`: cross-hive forwards (a peer orchestrator
 ///   relays SPAWN_NODE/etc. into this hive). Authorized from ANY hive.
-/// - `SY.admin` / `SY.wf-rules` / `WF.orch.diag`: same-hive control plane only.
+/// - `SY.admin` / `SY.wf-rules` / `WF.orch.diag`: same-hive control plane, all
+///   protected actions.
+/// - `SY.config-routes` / `SY.vault`: same-hive, ONLY for `NODE_STATUS_GET` — a
+///   read-only health probe that SY.architect intentionally opens to these nodes
+///   (architect_origin_authorized in sy_architect). Honoring it here keeps a
+///   single, consistent policy for the probe across every receiver, instead of
+///   the orchestrator-strict / architect-open split that existed before.
 ///
 /// These `SY.` rules are structural/constructive and hardcoded here (the router
 /// is the system's routing/authority center); they are also surfaced as frozen
@@ -5445,7 +5451,7 @@ const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
 /// router-authoritative (resolved from the source UUID against the node registry,
 /// overwriting any sender-supplied value), so this is a real boundary, not a
 /// self-asserted one.
-fn system_origin_allowed(src_l2_name: Option<&str>, hive_id: &str) -> bool {
+fn system_origin_allowed(action: &str, src_l2_name: Option<&str>, hive_id: &str) -> bool {
     let Some(name) = src_l2_name.map(str::trim).filter(|value| !value.is_empty()) else {
         return false;
     };
@@ -5456,7 +5462,14 @@ fn system_origin_allowed(src_l2_name: Option<&str>, hive_id: &str) -> bool {
         // Any hive, but the hive label must be non-empty (rejects "SY.orchestrator@").
         return !hive.is_empty();
     }
-    hive == hive_id && matches!(role, "SY.admin" | "SY.wf-rules" | "WF.orch.diag")
+    if hive != hive_id {
+        return false; // every remaining role is same-hive only
+    }
+    if matches!(role, "SY.admin" | "SY.wf-rules" | "WF.orch.diag") {
+        return true;
+    }
+    // Read-only health probe opened to the config/vault nodes (never mutations).
+    action == "NODE_STATUS_GET" && matches!(role, "SY.config-routes" | "SY.vault")
 }
 
 /// Serialize a message for delivery to a local node, enforcing SYSTEM
@@ -5471,7 +5484,7 @@ async fn serialize_for_local_delivery(
     if msg.meta.msg_type == SYSTEM_KIND {
         let action = msg.meta.msg.as_deref().unwrap_or_default();
         if PROTECTED_SYSTEM_ACTIONS.contains(&action)
-            && !system_origin_allowed(msg.routing.src_l2_name.as_deref(), hive_id)
+            && !system_origin_allowed(action, msg.routing.src_l2_name.as_deref(), hive_id)
         {
             tracing::warn!(
                 action = action,
@@ -5564,30 +5577,37 @@ mod tests {
     #[test]
     fn system_origin_allowed_enforces_role_and_hive_scope() {
         let hive = "motherbee";
+        // Use a mutation action for the strict-scope assertions.
+        let act = "SPAWN_NODE";
         // SY.orchestrator: authorized from ANY hive (cross-hive forwards).
-        assert!(system_origin_allowed(Some("SY.orchestrator@motherbee"), hive));
-        assert!(system_origin_allowed(Some("SY.orchestrator@worker1"), hive));
-        assert!(system_origin_allowed(Some("  SY.orchestrator@worker1  "), hive));
+        assert!(system_origin_allowed(act, Some("SY.orchestrator@motherbee"), hive));
+        assert!(system_origin_allowed(act, Some("SY.orchestrator@worker1"), hive));
+        assert!(system_origin_allowed(
+            act,
+            Some("  SY.orchestrator@worker1  "),
+            hive
+        ));
         // ...but the role label must be EXACT (rejects a relay/sub-name spoof).
         assert!(!system_origin_allowed(
+            act,
             Some("SY.orchestrator.relay.123@motherbee"),
             hive
         ));
-        assert!(!system_origin_allowed(Some("SY.orchestrator@"), hive));
+        assert!(!system_origin_allowed(act, Some("SY.orchestrator@"), hive));
 
-        // SY.admin / SY.wf-rules / WF.orch.diag: SAME hive only.
+        // SY.admin / SY.wf-rules / WF.orch.diag: SAME hive only, all actions.
         for role in ["SY.admin", "SY.wf-rules", "WF.orch.diag"] {
             assert!(
-                system_origin_allowed(Some(&format!("{role}@motherbee")), hive),
+                system_origin_allowed(act, Some(&format!("{role}@motherbee")), hive),
                 "{role}@same must pass"
             );
             assert!(
-                !system_origin_allowed(Some(&format!("{role}@worker1")), hive),
+                !system_origin_allowed(act, Some(&format!("{role}@worker1")), hive),
                 "{role}@other must be rejected (same-hive only)"
             );
         }
 
-        // Everything else: rejected. Including None / empty / no-@ / unknown roles.
+        // Everything else rejected for a mutation: None / empty / no-@ / unknown.
         for bad in [
             None,
             Some(""),
@@ -5596,13 +5616,43 @@ mod tests {
             Some("motherbee"),
             Some("AI.evil@motherbee"),
             Some("SY.vault@motherbee"),
+            Some("SY.config-routes@motherbee"),
             Some("SY.identity@motherbee"),
         ] {
             assert!(
-                !system_origin_allowed(bad, hive),
-                "{bad:?} must be rejected"
+                !system_origin_allowed(act, bad, hive),
+                "{bad:?} must be rejected for {act}"
             );
         }
+
+        // NODE_STATUS_GET (read-only probe) ADDITIONALLY admits SY.config-routes
+        // / SY.vault same-hive (architect's open-probe policy), but NOT for any
+        // mutation and NOT cross-hive.
+        assert!(system_origin_allowed(
+            "NODE_STATUS_GET",
+            Some("SY.config-routes@motherbee"),
+            hive
+        ));
+        assert!(system_origin_allowed(
+            "NODE_STATUS_GET",
+            Some("SY.vault@motherbee"),
+            hive
+        ));
+        assert!(!system_origin_allowed(
+            "NODE_STATUS_GET",
+            Some("SY.config-routes@worker1"),
+            hive
+        ));
+        assert!(!system_origin_allowed(
+            "SPAWN_NODE",
+            Some("SY.config-routes@motherbee"),
+            hive
+        ));
+        assert!(!system_origin_allowed(
+            "NODE_STATUS_GET",
+            Some("AI.evil@motherbee"),
+            hive
+        ));
     }
 
     #[test]

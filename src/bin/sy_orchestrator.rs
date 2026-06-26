@@ -473,7 +473,6 @@ struct OrchestratorState {
     wan_listen: Option<String>,
     wan_authorized_hives: Vec<String>,
     tracked_nodes: Mutex<HashSet<String>>,
-    system_allowed_origins: HashSet<String>,
     runtime_manifest: Mutex<Option<RuntimeManifest>>,
     protected_runtime_versions: Mutex<HashMap<(String, String), Instant>>,
     runtime_lifecycle_lock: Mutex<()>,
@@ -626,8 +625,6 @@ async fn main() -> Result<(), OrchestratorError> {
     let storage_path = storage_path_from_hive(&hive);
     let system_nodes = system_nodes_for_role(&hive, role)?;
     let runtime_manifest = load_runtime_manifest();
-    let system_allowed_origins = load_system_allowed_origins(&hive.hive_id);
-    tracing::info!(allowed = ?system_allowed_origins, "system message origin allowlist loaded");
     let state = Arc::new(OrchestratorState {
         hive_id: hive.hive_id.clone(),
         is_motherbee,
@@ -640,7 +637,6 @@ async fn main() -> Result<(), OrchestratorError> {
         wan_listen,
         wan_authorized_hives,
         tracked_nodes: Mutex::new(HashSet::new()),
-        system_allowed_origins,
         runtime_manifest: Mutex::new(runtime_manifest),
         protected_runtime_versions: Mutex::new(HashMap::new()),
         runtime_lifecycle_lock: Mutex::new(()),
@@ -1753,23 +1749,9 @@ async fn handle_system_message(
     msg: &Message,
     state: &OrchestratorState,
 ) -> Result<(), OrchestratorError> {
-    let action = msg.meta.msg.as_deref().unwrap_or_default();
-    if let Some(response_name) = protected_system_action_response(action) {
-        let src_l2_name = msg.routing.src_l2_name.as_deref();
-        if !is_allowed_system_source_name(state, src_l2_name) {
-            tracing::warn!(
-                action = action,
-                src_uuid = %msg.routing.src,
-                src_l2_name = ?src_l2_name,
-                allowed = ?state.system_allowed_origins,
-                "blocked system message from unauthorized origin"
-            );
-            let payload = forbidden_system_source_payload(msg, src_l2_name);
-            let _ = send_system_action_response(sender, msg, response_name, payload).await;
-            return Ok(());
-        }
-    }
-
+    // SYSTEM origin-authority is now enforced centrally by the router at delivery
+    // time (system_origin_allowed); an unauthorized protected SYSTEM action never
+    // reaches this node, so the orchestrator no longer re-checks it here (F4/F15).
     match msg.meta.msg.as_deref() {
         Some("RUNTIME_UPDATE") => {
             let payload = serde_json::json!({
@@ -1886,50 +1868,6 @@ async fn handle_system_message(
     Ok(())
 }
 
-/// Single source of truth for the system actions that require origin
-/// authorization in `sy_orchestrator`. Returns the response `msg` name to use
-/// when emitting a FORBIDDEN reply.
-///
-/// Any action handled by `handle_system_message` that mutates lifecycle,
-/// reads internal state, or otherwise needs gating MUST appear here. The
-/// dispatcher `match action { ... }` further down stays in sync via this
-/// table — adding a new action means updating both places, and the
-/// regression tests assert both ends.
-fn protected_system_action_response(action: &str) -> Option<&'static str> {
-    match action {
-        "SYSTEM_UPDATE" => Some("SYSTEM_UPDATE_RESPONSE"),
-        "SYSTEM_SYNC_HINT" => Some("SYSTEM_SYNC_HINT_RESPONSE"),
-        "SPAWN_NODE" => Some("SPAWN_NODE_RESPONSE"),
-        "KILL_NODE" => Some("KILL_NODE_RESPONSE"),
-        "START_NODE" => Some("START_NODE_RESPONSE"),
-        "RESTART_NODE" => Some("RESTART_NODE_RESPONSE"),
-        "REMOVE_NODE_INSTANCE" => Some("REMOVE_NODE_INSTANCE_RESPONSE"),
-        "NODE_CONFIG_SET" => Some("NODE_CONFIG_SET_RESPONSE"),
-        "NODE_CONFIG_GET" => Some("NODE_CONFIG_GET_RESPONSE"),
-        "NODE_STATE_GET" => Some("NODE_STATE_GET_RESPONSE"),
-        "NODE_STATUS_GET" => Some("NODE_STATUS_GET_RESPONSE"),
-        "GET_VERSIONS" => Some("GET_VERSIONS_RESPONSE"),
-        "GET_RUNTIMES" => Some("GET_RUNTIMES_RESPONSE"),
-        "GET_RUNTIME" => Some("GET_RUNTIME_RESPONSE"),
-        "LIST_NODES" => Some("LIST_NODES_RESPONSE"),
-        "INVENTORY_REQUEST" => Some("INVENTORY_RESPONSE"),
-        "ADD_HIVE_FINALIZE" => Some("ADD_HIVE_FINALIZE_RESPONSE"),
-        "REMOVE_HIVE_CLEANUP" => Some("REMOVE_HIVE_CLEANUP_RESPONSE"),
-        _ => None,
-    }
-}
-
-fn is_allowed_system_source_name(state: &OrchestratorState, src_l2_name: Option<&str>) -> bool {
-    let Some(name) = src_l2_name.map(str::trim).filter(|value| !value.is_empty()) else {
-        return false;
-    };
-    state.system_allowed_origins.contains(name)
-        || name.starts_with("SY.orchestrator@")
-        || name.starts_with("SY.admin@")
-        || name.starts_with("SY.wf-rules@")
-        || name.starts_with("WF.orch.diag@")
-}
-
 /// F8: an admin action requires origin authorization iff it is state-mutating.
 /// Reuses the canonical `classify_admin_action` so the gate cannot drift as admin
 /// actions are added. `start_node`/`restart_node` are node-lifecycle mutations
@@ -1956,8 +1894,8 @@ fn admin_action_requires_origin(action: &str) -> bool {
 }
 
 /// F8: the orchestrator only accepts mutating admin actions relayed by its OWN
-/// hive's SY.admin. Tighter than `is_allowed_system_source_name` on purpose: every
-/// admin command routes `SY.admin@<hive>` -> `SY.orchestrator@<same hive>`
+/// hive's SY.admin. Same-hive exact-match on purpose: every admin command routes
+/// `SY.admin@<hive>` -> `SY.orchestrator@<same hive>`
 /// (action_routes_via_local_orchestrator), so there is no legitimate cross-hive or
 /// cross-role admin origin. `src_l2_name` is self-asserted at this layer — this is
 /// defense-in-depth against cross-role/cross-hive mesh injection and against the
@@ -1968,16 +1906,6 @@ fn is_allowed_admin_source_name(state: &OrchestratorState, src_l2_name: Option<&
         return false;
     };
     name == format!("SY.admin@{}", state.hive_id)
-}
-
-fn forbidden_system_source_payload(msg: &Message, src_l2_name: Option<&str>) -> serde_json::Value {
-    serde_json::json!({
-        "status": "error",
-        "error_code": "FORBIDDEN",
-        "message": "system action origin not allowed",
-        "src_uuid": msg.routing.src,
-        "src_l2_name": src_l2_name,
-    })
 }
 
 #[derive(Debug, Clone)]
@@ -2903,22 +2831,6 @@ async fn handle_system_update_message(
             "errors": [err.to_string()],
         }),
     }
-}
-
-fn load_system_allowed_origins(hive_id: &str) -> HashSet<String> {
-    let raw = std::env::var("ORCH_SYSTEM_ALLOWED_ORIGINS")
-        .unwrap_or_else(|_| "SY.admin,WF.orch.diag".to_string());
-    raw.split(',')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(|item| {
-            if item.contains('@') {
-                item.to_string()
-            } else {
-                format!("{item}@{hive_id}")
-            }
-        })
-        .collect()
 }
 
 async fn send_system_action_response(
@@ -18725,7 +18637,6 @@ blob:
             wan_listen: None,
             wan_authorized_hives: Vec::new(),
             tracked_nodes: Mutex::new(HashSet::new()),
-            system_allowed_origins: HashSet::new(),
             runtime_manifest: Mutex::new(None),
             protected_runtime_versions: Mutex::new(HashMap::new()),
             runtime_lifecycle_lock: Mutex::new(()),
@@ -19178,40 +19089,6 @@ blob:
     }
 
     #[test]
-    fn system_source_without_src_l2_name_is_rejected() {
-        let state = sample_orchestrator_state_for_tests();
-        assert!(!is_allowed_system_source_name(&state, None));
-        assert!(!is_allowed_system_source_name(&state, Some("")));
-        assert!(!is_allowed_system_source_name(&state, Some("   ")));
-    }
-
-    #[test]
-    fn system_source_with_allowed_src_l2_name_passes_auth() {
-        let mut state = sample_orchestrator_state_for_tests();
-        state
-            .system_allowed_origins
-            .insert("SY.admin@motherbee".to_string());
-
-        assert!(is_allowed_system_source_name(
-            &state,
-            Some("SY.admin@motherbee")
-        ));
-        assert!(is_allowed_system_source_name(
-            &state,
-            Some("WF.orch.diag@motherbee")
-        ));
-    }
-
-    #[test]
-    fn system_source_rejects_orchestrator_relay_names() {
-        let state = sample_orchestrator_state_for_tests();
-        assert!(!is_allowed_system_source_name(
-            &state,
-            Some("SY.orchestrator.relay.123@motherbee")
-        ));
-    }
-
-    #[test]
     fn f8_admin_action_requires_origin_classifies_mutations() {
         // Mutating admin actions must be gated.
         for action in [
@@ -19417,158 +19294,6 @@ blob:
                 .unwrap()
                 .clone()
         ));
-    }
-
-    #[test]
-    fn protected_system_action_response_covers_all_18_protected_actions() {
-        // Single source of truth: every action handled by
-        // `handle_system_message` that mutates lifecycle or reads internal
-        // state must appear here. If the dispatcher gains a new action that
-        // should be auth-gated, this assertion forces updating the table.
-        let expected: &[(&str, &str)] = &[
-            ("SYSTEM_UPDATE", "SYSTEM_UPDATE_RESPONSE"),
-            ("SYSTEM_SYNC_HINT", "SYSTEM_SYNC_HINT_RESPONSE"),
-            ("SPAWN_NODE", "SPAWN_NODE_RESPONSE"),
-            ("KILL_NODE", "KILL_NODE_RESPONSE"),
-            ("START_NODE", "START_NODE_RESPONSE"),
-            ("RESTART_NODE", "RESTART_NODE_RESPONSE"),
-            ("REMOVE_NODE_INSTANCE", "REMOVE_NODE_INSTANCE_RESPONSE"),
-            ("NODE_CONFIG_SET", "NODE_CONFIG_SET_RESPONSE"),
-            ("NODE_CONFIG_GET", "NODE_CONFIG_GET_RESPONSE"),
-            ("NODE_STATE_GET", "NODE_STATE_GET_RESPONSE"),
-            ("NODE_STATUS_GET", "NODE_STATUS_GET_RESPONSE"),
-            ("GET_VERSIONS", "GET_VERSIONS_RESPONSE"),
-            ("GET_RUNTIMES", "GET_RUNTIMES_RESPONSE"),
-            ("GET_RUNTIME", "GET_RUNTIME_RESPONSE"),
-            ("LIST_NODES", "LIST_NODES_RESPONSE"),
-            ("INVENTORY_REQUEST", "INVENTORY_RESPONSE"),
-            ("ADD_HIVE_FINALIZE", "ADD_HIVE_FINALIZE_RESPONSE"),
-            ("REMOVE_HIVE_CLEANUP", "REMOVE_HIVE_CLEANUP_RESPONSE"),
-        ];
-        for (action, response) in expected {
-            assert_eq!(
-                protected_system_action_response(action),
-                Some(*response),
-                "action {action} should be protected with response {response}"
-            );
-        }
-    }
-
-    #[test]
-    fn protected_system_action_response_returns_none_for_unknown_action() {
-        assert_eq!(protected_system_action_response(""), None);
-        assert_eq!(protected_system_action_response("UNKNOWN_ACTION"), None);
-        assert_eq!(protected_system_action_response("RUNTIME_UPDATE"), None);
-    }
-
-    /// AF-P1: actions that the pre-iteration-2 allowlist did NOT cover
-    /// (`START_NODE`, `RESTART_NODE`, `GET_RUNTIMES`, `LIST_NODES`,
-    /// `GET_RUNTIME`) must now be gated. This test pins the table so a
-    /// regression that drops one will fail loudly.
-    #[test]
-    fn protected_system_action_response_gates_lifecycle_actions_added_by_af_p1() {
-        for action in [
-            "START_NODE",
-            "RESTART_NODE",
-            "GET_RUNTIMES",
-            "LIST_NODES",
-            "GET_RUNTIME",
-        ] {
-            assert!(
-                protected_system_action_response(action).is_some(),
-                "AF-P1 regression: action {action} is no longer protected"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn protected_actions_emit_forbidden_response_when_origin_is_unauthorized() {
-        // For each protected action exercised by AF-P1 plus a couple of the
-        // pre-existing ones, build an inbound message with no `src_l2_name`,
-        // hand it to `handle_system_message`, and assert the response captured
-        // on the test sender is the matching `*_RESPONSE` with the FORBIDDEN
-        // shape. This proves that the dispatcher never reaches `*_flow` for
-        // unauthorized callers.
-        use fluxbee_sdk::RouterDispatcherTestHarness;
-
-        for (action, expected_response) in [
-            ("START_NODE", "START_NODE_RESPONSE"),
-            ("RESTART_NODE", "RESTART_NODE_RESPONSE"),
-            ("GET_RUNTIMES", "GET_RUNTIMES_RESPONSE"),
-            ("LIST_NODES", "LIST_NODES_RESPONSE"),
-            ("GET_RUNTIME", "GET_RUNTIME_RESPONSE"),
-            ("SYSTEM_UPDATE", "SYSTEM_UPDATE_RESPONSE"),
-        ] {
-            let profile = build_orchestrator_rpc_profile().expect("orchestrator profile builds");
-            let (client, mut harness) =
-                RouterDispatcherTestHarness::new("SY.orchestrator@motherbee", profile);
-            let sender = client.sender_snapshot();
-            let state = Arc::new(sample_orchestrator_state_for_tests());
-
-            let inbound = Message {
-                routing: Routing {
-                    src: "intruder-uuid".to_string(),
-                    src_l2_name: None,
-                    dst: Destination::Unicast("SY.orchestrator@motherbee".to_string()),
-                    ttl: 16,
-                    trace_id: format!("af-p1-{action}"),
-                },
-                meta: Meta {
-                    msg_type: SYSTEM_KIND.to_string(),
-                    msg: Some(action.to_string()),
-                    ..Meta::default()
-                },
-                payload: serde_json::json!({}),
-            };
-
-            handle_system_message(&sender, &inbound, &state)
-                .await
-                .expect("handler returns Ok(()) even when blocking");
-
-            let outgoing = harness
-                .next_outgoing_within(Duration::from_secs(1))
-                .await
-                .unwrap_or_else(|| panic!("no response emitted for {action}"));
-            assert_eq!(
-                outgoing.meta.msg.as_deref(),
-                Some(expected_response),
-                "wrong response name for {action}"
-            );
-            assert_eq!(
-                outgoing.payload["error_code"], "FORBIDDEN",
-                "{action} response payload missing FORBIDDEN error_code"
-            );
-            assert_eq!(outgoing.routing.trace_id, format!("af-p1-{action}"));
-            drop(client);
-        }
-    }
-
-    #[test]
-    fn forbidden_system_source_payload_uses_src_l2_name_field() {
-        let msg = Message {
-            routing: Routing {
-                src: "src-uuid-1".to_string(),
-                src_l2_name: Some("SY.admin@motherbee".to_string()),
-                dst: Destination::Unicast("SY.orchestrator@motherbee".to_string()),
-                ttl: 16,
-                trace_id: "trace-1".to_string(),
-            },
-            meta: Meta {
-                msg_type: SYSTEM_KIND.to_string(),
-                msg: Some("SYSTEM_UPDATE".to_string()),
-                ..Meta::default()
-            },
-            payload: serde_json::json!({}),
-        };
-
-        let payload = forbidden_system_source_payload(&msg, msg.routing.src_l2_name.as_deref());
-        assert_eq!(payload["error_code"], "FORBIDDEN");
-        assert_eq!(payload["src_uuid"], serde_json::json!("src-uuid-1"));
-        assert_eq!(
-            payload["src_l2_name"],
-            serde_json::json!("SY.admin@motherbee")
-        );
-        assert!(payload.get("source_name").is_none());
     }
 
     #[test]

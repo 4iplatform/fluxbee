@@ -15,18 +15,19 @@ Origen: [`docs/audits/2026-06-23-sy-orchestrator-audit.md`](../docs/audits/2026-
 Prioridad acordada: **operativos primero, seguridad después** (red interna con
 puertas definidas; SSH solo para bootstrap inicial).
 
-**Resueltos (13):** `F1` `F2` `F9` `F10` `F14` `F20` `F7` `F12` `F13` `F3` `F11`
-`F8` `F18` — código en `src/`. F1/F2/F9 validados empíricamente en el lab; F10/F11
-con revisión adversarial (falta validación egress en VM); F14/F20 con unit tests;
-**F7/F12/F13**, **F3**, **F8** y **F18** con unit tests + revisión adversarial
-multi-agente (GO). **F11** con unit test + revisión (NO-GO inicial → corregido →
-re-verificado). **F8** fue cambio de 2 componentes (relay sy_admin estampa
-`SY.admin@<hive>` + gate en handle_admin). **F18** = lock por hive_id.
+**Resueltos (15):** `F1` `F2` `F9` `F10` `F14` `F20` `F7` `F12` `F13` `F3` `F11`
+`F8` `F18` `F4` `F15` — código en `src/`. F1/F2/F9 validados en el lab; F10/F11 con
+revisión adversarial (falta egress en VM); F14/F20 unit tests; **F7/F12/F13**,
+**F3**, **F8**, **F18** unit tests + revisión adversarial (GO); **F11** (NO-GO →
+corregido → re-verificado). **F4 + F15** = **autoridad de origen SYSTEM movida al
+ROUTER** (gate en `serialize_for_local_delivery` sobre el `src_l2_name`
+autoritativo; `SY.orchestrator@*` cross-hive + `SY.admin/wf-rules/diag@same`;
+reglas `SY.` hardcodeadas + rutas **frozen** visibles en SHM; gate del orchestrator
+eliminado). Validado en lab (cross-hive + same-hive + router-only, 0 drops) +
+revisión adversarial (GO). **OPA-dual** = próximo gran feature para configurabilidad.
 
-**Pendientes (11):**
+**Pendientes (9):**
 
-- **Alta:** `F4` (allowlist configurable — **siguiente**, con su extensión `F15`;
-  necesita verificar resolución de `src_l2_name` en el router antes de codear).
 - **Media:** `F5` `F6` `F16` `F17` (egress).
 - **Baja:** `F19` `F21` `F22` `F23` `F25`.
 
@@ -100,7 +101,8 @@ y el flujo de creds end-to-end.
 - [ ] **Commit** de los cambios `src/` del audit (F1/F2/F9/F10/F14/F20 + creds) — separado del lab.
 - [ ] **Review adversarial** del código del lote creds.
 - [ ] Actualizar **scripts E2E** (`ssh_user` requerido) + docs de contrato (`sy_orchestrator_v2_tasks.md` items F1/F2).
-- [ ] **Lote de seguridad** del audit: ~~F7/F12/F13 (iface)~~ ✅ ~~F3~~ ✅ ~~F11~~ ✅ (falta VM) ~~F8~~ ✅, **F4/F15** (siguiente, cross-hive-aware), F18.
+- [x] **Lote de seguridad** del audit: ~~F7/F12/F13~~ ~~F3~~ ~~F11~~ (falta VM) ~~F8~~ ~~F18~~ ~~F4/F15~~ ✅ — todo el lote de seguridad **alta+origin-auth cerrado**. Quedan solo F5/F6/F16/F17 (egress, necesitan VM).
+- [ ] **OPA-dual** (nuevo gran feature acordado): capa system no-editable + capa user con merge, en el router. Absorbe las reglas `SY.` hardcodeadas; herramienta para seguridad **y** bugs/diseño. Anotado para arrancar como proyecto aparte.
 - [ ] **Lote egress**: F5/F6/F16/F17 + validar F10/F11 en **VM** (Fase 2 del lab).
 - [x] **Distribución**: workflow `.github/workflows/lab-image.yml` pushea a GHCR las dos flavors — `slim` (multi-stage, ~1.9 GB, `:latest`, boot validado) y `fat` (~9 GB). Repo público → GHCR + Actions **gratis e ilimitado**. **Falta disparar**: `git tag lab-v0.1 && git push --tags` (o Run workflow).
 - [ ] Distribución (mejoras): slim aún duplica binarios (`/usr/bin` + `dist/core/bin`) y syncthing — se puede bajar más. Multi-arch (arm64) si hay devs en Apple Silicon.
