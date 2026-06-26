@@ -9,8 +9,9 @@ Archivo principal: `src/bin/sy_orchestrator.rs` (20562 lineas)
 
 Reconciliacion del trabajo posterior a la auditoria. Prioridad acordada con el operador: **operativos primero, seguridad despues** — la red es interna con puertas definidas y SSH se usa solo para el bootstrap inicial. Por eso el lote operativo + SSH-only-bootstrap se resolvio primero; ahora se abrio el lote de seguridad arrancando por el #1 del orden sugerido (inyeccion de iface, F7/F12/F13).
 
-**Resueltos (12 de 24):**
+**Resueltos (13 de 24):**
 
+- **F18** TOCTOU lock — registro de locks por hive_id sostenido durante todo el flujo de `add_hive`/`remove_hive`. *Unit test + revisión (GO).*
 - **F8** gate de origen en el canal ADMIN — cambio de 2 componentes: el relay `SY.admin` estampa su identidad `SY.admin@<hive>` y `handle_admin` gatea las acciones mutantes a `== SY.admin@<su-hive>`. *4 unit tests + revisión adversarial (GO, sin regresión: todo el tráfico admin rutea al orchestrator local). Residual: hop-1 sin gatear (finding aparte).*
 - **F11** teardown NAT en `remove_hive` egress — lee `role`, manda `egress_teardown`, el host removido limpia nft+ficheros+sysctl (idempotente, antepuesto al kill de servicios); respuesta señaliza el orphan offline. *Unit test + revisión adversarial (race del cgroup + orphan offline corregidos). **Falta validación empírica en VM (Fase 2).***
 - **F3** traversal de `hive_id` — `valid_hive_id`/`valid_address` movidos al inicio de `add_hive_flow`/`add_egress_hive_flow` (antes de todo `join`/`remove_dir_all`/`create_dir_all`) + backstop léxico `hive_dir_is_direct_child` antes de cada op destructiva. *Unit test + revisión adversarial (GO).*
@@ -29,10 +30,10 @@ Reconciliacion del trabajo posterior a la auditoria. Prioridad acordada con el o
 
 Ademas (no era finding del audit; cambio de diseno del operador): **las credenciales SSH del bootstrap se movieron al payload de `add_hive`** (`ssh_user` requerido / `ssh_password` opcional, probe key-first), eliminando los `administrator`/`magicAI` hardcodeados; el secreto se redacta en SY.architect; el schema de admin se actualizo. *Validado empiricamente (lab: worker bootstrapeado con creds del payload).*
 
-**Pendientes (12 de 24)** — por severidad:
+**Pendientes (11 de 24)** — por severidad:
 
 - **Alta (1):** F4 (allowlist `system` no configurable — *con su extensión cross-hive F15; ahora el siguiente*).
-- **Media (6):** F5 (egress reporta `ok` incompleto), F6 (drift egress), F15 (allowlist cross-hive), F16 (conntrack_tuned), F17 (nft no carga al boot), F18 (TOCTOU sin lock).
+- **Media (5):** F5 (egress reporta `ok` incompleto), F6 (drift egress), F15 (allowlist cross-hive), F16 (conntrack_tuned), F17 (nft no carga al boot).
 - **Baja (5):** F19, F21, F22, F23, F25.
 
 **Nota de seguridad:** **F7/F12/F13 cerrados** — eran el pendiente #1. Una sola allowlist de iface los cierra a los tres porque el charset aceptado (`[A-Za-z0-9._-]`) no comparte ningun metacarácter con los tres sinks (shell / nft / YAML), y la validacion corre en el unico constructor de `EgressNatConfig` antes de todo sink (verificado: sin bypass, los paths de reconcile re-validan el `hive.yaml` deserializado). El siguiente pendiente de mayor prioridad pasa a ser **F8** (gate de origen en el canal ADMIN).
@@ -98,7 +99,7 @@ Tambien hay tres bugs de las funcionalidades nuevas comparten una sola causa rai
 | F15 | Media | origin-auth | Allowlist acepta sufijo de hive arbitrario (cross-hive) | lectura | nuevo (extiende F4) |
 | F16 | Media | egress-nat | `egress_conntrack_tuned=true` incondicional | lectura | nuevo |
 | F17 | Media | egress-nat | Tabla nft no se carga al boot | lectura | nuevo |
-| F18 | Media | concurrency | TOCTOU: `add_hive`/`remove_hive` sin lock | lectura | nuevo |
+| F18 | Media | concurrency | ✅ RESUELTO — TOCTOU: `add_hive`/`remove_hive` sin lock | lectura | nuevo |
 | F19 | Baja | inventory | `list_hives` etiqueta egress como `worker` | lectura | nuevo |
 | F20 | Baja | robustez | Slices de nombre SHM sin clamp (`node_name`) | lectura | nuevo |
 | F21 | Baja | egress-nat | Host egress sin filtrado inbound | lectura | trade-off T-NET-4 |
@@ -511,6 +512,8 @@ Recomendacion:
 Persistir la carga de la tabla al boot (`enable nftables.service` + include de `/etc/nftables.d/fluxbee-egress.nft`, o un `ExecStartPre`), o invertir el orden para que `ip_forward` solo quede ON despues de aplicar la tabla — atando el forwarding al ciclo del orchestrator en vez de persistirlo independientemente.
 
 ### F18 - Media - TOCTOU: `add_hive`/`remove_hive` no toman ningun lock
+
+> **RESUELTO (2026-06-26).** `OrchestratorState` tiene un registro de locks **por hive_id** (`hive_topology_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>`); `lock_hive_topology(hive_id)` devuelve un `OwnedMutexGuard` que `add_hive_flow`/`add_egress_hive_flow`/`remove_hive_flow` sostienen durante **todo** el flujo (tras la validación, antes del `exists`/`remove_dir_all`/`create_dir_all`/`write_hive_info`). Lock **por-hive** (no global) para no serializar bootstraps SSH de hives distintos. Cierra la ventana entre check-de-existencia, borrado y creación para el mismo hive_id. Unit test + revisión (GO: sin deadlock/re-entrancy, cobertura completa de la ventana, RAII en todos los early-returns, sin otros writers de `storage/hives` fuera del lock).
 
 Verificacion: lectura.
 

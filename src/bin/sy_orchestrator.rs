@@ -486,6 +486,14 @@ struct OrchestratorState {
     blob: BlobRuntimeConfig,
     dist: DistRuntimeConfig,
     blob_sync_last_desired: Mutex<BlobRuntimeConfig>,
+    // F18: serialize add_hive/remove_hive per hive_id. The TOCTOU window is the
+    // exists-check -> remove_dir_all -> create_dir_all -> info.yaml write sequence;
+    // two concurrent ops on the SAME hive_id can corrupt storage/hives. A per-hive
+    // lock (not a single global one) lets different hives bootstrap concurrently
+    // — add_hive does a slow SSH bootstrap, so global serialization would be a real
+    // latency regression. The registry is guarded by a brief std mutex (never held
+    // across an await); each per-hive lock is an async mutex held for the whole flow.
+    hive_topology_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
     rpc: OnceLock<Arc<RouterDispatcher>>,
 }
 
@@ -495,6 +503,24 @@ impl OrchestratorState {
             .get()
             .cloned()
             .ok_or_else(|| "orchestrator rpc client unavailable".into())
+    }
+
+    /// F18: acquire the per-hive_id topology lock, held across the whole
+    /// add_hive/remove_hive flow to close the exists/remove/create/write TOCTOU.
+    /// The registry entry persists after release (bounded by the fleet size); the
+    /// returned owned guard releases on drop, including on early return or panic.
+    async fn lock_hive_topology(&self, hive_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut registry = self
+                .hive_topology_locks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry
+                .entry(hive_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
     }
 }
 
@@ -627,6 +653,7 @@ async fn main() -> Result<(), OrchestratorError> {
         blob: blob_runtime.clone(),
         dist: dist_runtime,
         blob_sync_last_desired: Mutex::new(blob_runtime),
+        hive_topology_locks: std::sync::Mutex::new(HashMap::new()),
         rpc: OnceLock::new(),
     });
     tracing::info!(
@@ -7580,6 +7607,9 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
             "message": "cannot remove local motherbee hive",
         });
     }
+    // F18: per-hive topology lock — serialize against a concurrent add_hive or a
+    // second remove_hive on the same hive_id (closes the exists/remove TOCTOU).
+    let _topology_guard = state.lock_hive_topology(hive_id).await;
     let root = hives_root();
     let dir = root.join(hive_id);
     if !dir.exists() {
@@ -14922,6 +14952,10 @@ async fn add_hive_flow(
             "message": "invalid address",
         });
     }
+    // F18: hold the per-hive topology lock for the whole flow so a concurrent
+    // add_hive/remove_hive on the same hive_id cannot race the exists-check /
+    // remove_dir_all / create_dir_all / info.yaml write sequence below.
+    let _topology_guard = state.lock_hive_topology(hive_id).await;
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
     let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
@@ -15946,6 +15980,8 @@ async fn add_egress_hive_flow(
     if !valid_address(address) {
         return err_payload("INVALID_ADDRESS", "invalid address".to_string());
     }
+    // F18: per-hive topology lock for the whole egress flow (see add_hive_flow).
+    let _topology_guard = state.lock_hive_topology(hive_id).await;
     let nat = match resolve_egress_nat_config(&egress) {
         Ok(cfg) => cfg,
         Err(err) => return err_payload("INVALID_REQUEST", err.to_string()),
@@ -18705,6 +18741,7 @@ blob:
             blob: sample_blob_config(),
             dist: sample_dist_config(),
             blob_sync_last_desired: Mutex::new(sample_blob_config()),
+            hive_topology_locks: StdMutex::new(HashMap::new()),
             rpc: OnceLock::new(),
         }
     }
@@ -19330,6 +19367,56 @@ blob:
             "foreign-admin remove_hive must be FORBIDDEN, got {:?}",
             reply.payload
         );
+    }
+
+    #[tokio::test]
+    async fn f18_hive_topology_lock_serializes_same_hive_only() {
+        let state = sample_orchestrator_state_for_tests();
+
+        // Acquire the lock for hive A; the registry now holds an entry for it.
+        let guard_a = state.lock_hive_topology("worker1").await;
+        let lock_a = state
+            .hive_topology_locks
+            .lock()
+            .unwrap()
+            .get("worker1")
+            .expect("worker1 lock registered")
+            .clone();
+        // While held, the SAME hive_id's underlying lock is contended.
+        assert!(
+            lock_a.try_lock().is_err(),
+            "same hive_id must be locked while a flow holds it"
+        );
+
+        // A DIFFERENT hive_id is independent — this must not block (it would hang
+        // here if different hives shared one lock).
+        let guard_b = state.lock_hive_topology("worker2").await;
+        let lock_b = state
+            .hive_topology_locks
+            .lock()
+            .unwrap()
+            .get("worker2")
+            .expect("worker2 lock registered")
+            .clone();
+        assert!(
+            !Arc::ptr_eq(&lock_a, &lock_b),
+            "distinct hive_ids must get distinct locks"
+        );
+
+        drop(guard_b);
+        drop(guard_a);
+        // After release the same hive is re-acquirable (no deadlock, reused entry).
+        let _reacquired = state.lock_hive_topology("worker1").await;
+        assert!(Arc::ptr_eq(
+            &lock_a,
+            &state
+                .hive_topology_locks
+                .lock()
+                .unwrap()
+                .get("worker1")
+                .unwrap()
+                .clone()
+        ));
     }
 
     #[test]

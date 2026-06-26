@@ -15,18 +15,19 @@ Origen: [`docs/audits/2026-06-23-sy-orchestrator-audit.md`](../docs/audits/2026-
 Prioridad acordada: **operativos primero, seguridad después** (red interna con
 puertas definidas; SSH solo para bootstrap inicial).
 
-**Resueltos (12):** `F1` `F2` `F9` `F10` `F14` `F20` `F7` `F12` `F13` `F3` `F11`
-`F8` — código en `src/`. F1/F2/F9 validados empíricamente en el lab; F10/F11 con
-revisión adversarial (falta validación egress en VM); F14/F20 con unit tests;
-**F7/F12/F13**, **F3** y **F8** con unit tests + revisión adversarial multi-agente
-(GO). **F11** con unit test + revisión adversarial (NO-GO inicial → corregido →
+**Resueltos (13):** `F1` `F2` `F9` `F10` `F14` `F20` `F7` `F12` `F13` `F3` `F11`
+`F8` `F18` — código en `src/`. F1/F2/F9 validados empíricamente en el lab; F10/F11
+con revisión adversarial (falta validación egress en VM); F14/F20 con unit tests;
+**F7/F12/F13**, **F3**, **F8** y **F18** con unit tests + revisión adversarial
+multi-agente (GO). **F11** con unit test + revisión (NO-GO inicial → corregido →
 re-verificado). **F8** fue cambio de 2 componentes (relay sy_admin estampa
-`SY.admin@<hive>` + gate en handle_admin).
+`SY.admin@<hive>` + gate en handle_admin). **F18** = lock por hive_id.
 
-**Pendientes (12):**
+**Pendientes (11):**
 
-- **Alta:** `F4` (allowlist configurable — **siguiente**, con su extensión `F15`).
-- **Media:** `F5` `F6` `F16` `F17` (egress), `F18` (TOCTOU lock).
+- **Alta:** `F4` (allowlist configurable — **siguiente**, con su extensión `F15`;
+  necesita verificar resolución de `src_l2_name` en el router antes de codear).
+- **Media:** `F5` `F6` `F16` `F17` (egress).
 - **Baja:** `F19` `F21` `F22` `F23` `F25`.
 
 > ✅ **F7/F12/F13 cerrados** (eran el #1 del audit). Un solo allowlist de iface
