@@ -102,7 +102,8 @@ y el flujo de creds end-to-end.
 - [ ] **Review adversarial** del código del lote creds.
 - [ ] Actualizar **scripts E2E** (`ssh_user` requerido) + docs de contrato (`sy_orchestrator_v2_tasks.md` items F1/F2).
 - [x] **Lote de seguridad** del audit: ~~F7/F12/F13~~ ~~F3~~ ~~F11~~ (falta VM) ~~F8~~ ~~F18~~ ~~F4/F15~~ ✅ — todo el lote de seguridad **alta+origin-auth cerrado**. Quedan solo F5/F6/F16/F17 (egress, necesitan VM).
-- [ ] **OPA-dual** (nuevo gran feature acordado): capa system no-editable + capa user con merge, en el router. Absorbe las reglas `SY.` hardcodeadas; herramienta para seguridad **y** bugs/diseño. Anotado para arrancar como proyecto aparte.
+- [x] **OPA-dual Fases 1-3** (opción b: capa system Rust + OPA user): `mod system_policy` (seam swappable a Rego) + input OPA enriquecido (`src_l2_name`/`action`) + orden de composición explícito. Refactor byte-idéntico + aditivo; 55 lib tests + revisión adversarial (GO). Ver [`docs/onworking COA/opa-dual.md`](../docs/onworking%20COA/opa-dual.md).
+- [ ] **OPA-dual Fase 4** (futuro, gated): capa system respaldada por Rego (segunda región SHM `/jsr-opa-sys-<hive>`, writer privilegiado, entrypoint boolean) — solo si se quiere las reglas system inspeccionables vía OPA. El `authority()` ya es el contrato; solo cambia el backing.
 - [ ] **Lote egress**: F5/F6/F16/F17 + validar F10/F11 en **VM** (Fase 2 del lab).
 - [x] **Distribución**: workflow `.github/workflows/lab-image.yml` pushea a GHCR las dos flavors — `slim` (multi-stage, ~1.9 GB, `:latest`, boot validado) y `fat` (~9 GB). Repo público → GHCR + Actions **gratis e ilimitado**. **Falta disparar**: `git tag lab-v0.1 && git push --tags` (o Run workflow).
 - [ ] Distribución (mejoras): slim aún duplica binarios (`/usr/bin` + `dist/core/bin`) y syncthing — se puede bajar más. Multi-arch (arm64) si hay devs en Apple Silicon.

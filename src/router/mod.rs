@@ -1,3 +1,5 @@
+mod system_policy;
+
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -4413,6 +4415,17 @@ fn read_identity_snapshot(
     }
 }
 
+/// Routing-layer resolution under the OPA-dual composition order:
+///
+///   system authority gate  (upstream, in `serialize_for_local_delivery`)
+///     -> system route       (identity pre-resolve: a forced frontdesk target)
+///       -> user route       (operator OPA policy, `resolve_target`)
+///
+/// The SYSTEM route takes precedence and SHORT-CIRCUITS: when identity
+/// pre-resolve pins a target it returns immediately and the user OPA policy is
+/// NOT consulted. Only when the system yields no target does the user layer run.
+/// (Authority allow/deny is enforced earlier, at delivery; this function is the
+/// routing/selection half.)
 async fn resolve_target_with_identity(
     opa: &Arc<Mutex<OpaResolver>>,
     hive_id: &str,
@@ -5407,71 +5420,6 @@ fn should_enrich_with_memory_package(msg: &Message) -> bool {
     true
 }
 
-/// Protected SYSTEM actions (by `meta.msg`) that a node may only act on when the
-/// router-resolved origin is authorized. This is the single source of truth that
-/// the orchestrator's per-node gate used to own; it now lives in the router so
-/// origin-authority is enforced once, centrally, at delivery time.
-const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
-    "SYSTEM_UPDATE",
-    "SYSTEM_SYNC_HINT",
-    "SPAWN_NODE",
-    "KILL_NODE",
-    "START_NODE",
-    "RESTART_NODE",
-    "REMOVE_NODE_INSTANCE",
-    "NODE_CONFIG_SET",
-    "NODE_CONFIG_GET",
-    "NODE_STATE_GET",
-    "NODE_STATUS_GET",
-    "GET_VERSIONS",
-    "GET_RUNTIMES",
-    "GET_RUNTIME",
-    "LIST_NODES",
-    "INVENTORY_REQUEST",
-    "ADD_HIVE_FINALIZE",
-    "REMOVE_HIVE_CLEANUP",
-];
-
-/// Origin-authority for a protected SYSTEM `action`, keyed on the router-resolved
-/// (authoritative) `src_l2_name`. `hive_id` is THIS router's hive.
-///
-/// - `SY.orchestrator@<any hive>`: cross-hive forwards (a peer orchestrator
-///   relays SPAWN_NODE/etc. into this hive). Authorized from ANY hive.
-/// - `SY.admin` / `SY.wf-rules` / `WF.orch.diag`: same-hive control plane, all
-///   protected actions.
-/// - `SY.config-routes` / `SY.vault`: same-hive, ONLY for `NODE_STATUS_GET` — a
-///   read-only health probe that SY.architect intentionally opens to these nodes
-///   (architect_origin_authorized in sy_architect). Honoring it here keeps a
-///   single, consistent policy for the probe across every receiver, instead of
-///   the orchestrator-strict / architect-open split that existed before.
-///
-/// These `SY.` rules are structural/constructive and hardcoded here (the router
-/// is the system's routing/authority center); they are also surfaced as frozen
-/// SHM route entries for observability (see FLAG_FROZEN). `src_l2_name` is
-/// router-authoritative (resolved from the source UUID against the node registry,
-/// overwriting any sender-supplied value), so this is a real boundary, not a
-/// self-asserted one.
-fn system_origin_allowed(action: &str, src_l2_name: Option<&str>, hive_id: &str) -> bool {
-    let Some(name) = src_l2_name.map(str::trim).filter(|value| !value.is_empty()) else {
-        return false;
-    };
-    let Some((role, hive)) = name.split_once('@') else {
-        return false;
-    };
-    if role == "SY.orchestrator" {
-        // Any hive, but the hive label must be non-empty (rejects "SY.orchestrator@").
-        return !hive.is_empty();
-    }
-    if hive != hive_id {
-        return false; // every remaining role is same-hive only
-    }
-    if matches!(role, "SY.admin" | "SY.wf-rules" | "WF.orch.diag") {
-        return true;
-    }
-    // Read-only health probe opened to the config/vault nodes (never mutations).
-    action == "NODE_STATUS_GET" && matches!(role, "SY.config-routes" | "SY.vault")
-}
-
 /// Serialize a message for delivery to a local node, enforcing SYSTEM
 /// origin-authority. Returns `Ok(None)` when delivery must be SUPPRESSED (a
 /// protected SYSTEM action from an unauthorized origin) — callers skip the send.
@@ -5482,9 +5430,12 @@ async fn serialize_for_local_delivery(
     msg: &Message,
 ) -> Result<Option<Vec<u8>>, RouterError> {
     if msg.meta.msg_type == SYSTEM_KIND {
+        // OPA-dual SYSTEM (authority) layer: a fixed, non-user-editable Rust
+        // policy. System DENY is final. (The user/OPA layer handles routing and,
+        // in future, may only narrow this — never broaden it.)
         let action = msg.meta.msg.as_deref().unwrap_or_default();
-        if PROTECTED_SYSTEM_ACTIONS.contains(&action)
-            && !system_origin_allowed(action, msg.routing.src_l2_name.as_deref(), hive_id)
+        if system_policy::is_protected_system_action(action)
+            && !system_policy::authority(action, msg.routing.src_l2_name.as_deref(), hive_id)
         {
             tracing::warn!(
                 action = action,
@@ -5573,123 +5524,6 @@ mod tests {
     };
     use fluxbee_sdk::protocol::Routing;
     use std::collections::HashMap;
-
-    #[test]
-    fn system_origin_allowed_enforces_role_and_hive_scope() {
-        let hive = "motherbee";
-        // Use a mutation action for the strict-scope assertions.
-        let act = "SPAWN_NODE";
-        // SY.orchestrator: authorized from ANY hive (cross-hive forwards).
-        assert!(system_origin_allowed(act, Some("SY.orchestrator@motherbee"), hive));
-        assert!(system_origin_allowed(act, Some("SY.orchestrator@worker1"), hive));
-        assert!(system_origin_allowed(
-            act,
-            Some("  SY.orchestrator@worker1  "),
-            hive
-        ));
-        // ...but the role label must be EXACT (rejects a relay/sub-name spoof).
-        assert!(!system_origin_allowed(
-            act,
-            Some("SY.orchestrator.relay.123@motherbee"),
-            hive
-        ));
-        assert!(!system_origin_allowed(act, Some("SY.orchestrator@"), hive));
-
-        // SY.admin / SY.wf-rules / WF.orch.diag: SAME hive only, all actions.
-        for role in ["SY.admin", "SY.wf-rules", "WF.orch.diag"] {
-            assert!(
-                system_origin_allowed(act, Some(&format!("{role}@motherbee")), hive),
-                "{role}@same must pass"
-            );
-            assert!(
-                !system_origin_allowed(act, Some(&format!("{role}@worker1")), hive),
-                "{role}@other must be rejected (same-hive only)"
-            );
-        }
-
-        // Everything else rejected for a mutation: None / empty / no-@ / unknown.
-        for bad in [
-            None,
-            Some(""),
-            Some("   "),
-            Some("SY.admin"),
-            Some("motherbee"),
-            Some("AI.evil@motherbee"),
-            Some("SY.vault@motherbee"),
-            Some("SY.config-routes@motherbee"),
-            Some("SY.identity@motherbee"),
-        ] {
-            assert!(
-                !system_origin_allowed(act, bad, hive),
-                "{bad:?} must be rejected for {act}"
-            );
-        }
-
-        // NODE_STATUS_GET (read-only probe) ADDITIONALLY admits SY.config-routes
-        // / SY.vault same-hive (architect's open-probe policy), but NOT for any
-        // mutation and NOT cross-hive.
-        assert!(system_origin_allowed(
-            "NODE_STATUS_GET",
-            Some("SY.config-routes@motherbee"),
-            hive
-        ));
-        assert!(system_origin_allowed(
-            "NODE_STATUS_GET",
-            Some("SY.vault@motherbee"),
-            hive
-        ));
-        assert!(!system_origin_allowed(
-            "NODE_STATUS_GET",
-            Some("SY.config-routes@worker1"),
-            hive
-        ));
-        assert!(!system_origin_allowed(
-            "SPAWN_NODE",
-            Some("SY.config-routes@motherbee"),
-            hive
-        ));
-        assert!(!system_origin_allowed(
-            "NODE_STATUS_GET",
-            Some("AI.evil@motherbee"),
-            hive
-        ));
-    }
-
-    #[test]
-    fn protected_system_actions_match_orchestrator_contract() {
-        // The 18 protected SYSTEM actions the router now gates (parity with the
-        // orchestrator's former protected_system_action_response).
-        for action in [
-            "SYSTEM_UPDATE",
-            "SYSTEM_SYNC_HINT",
-            "SPAWN_NODE",
-            "KILL_NODE",
-            "START_NODE",
-            "RESTART_NODE",
-            "REMOVE_NODE_INSTANCE",
-            "NODE_CONFIG_SET",
-            "NODE_CONFIG_GET",
-            "NODE_STATE_GET",
-            "NODE_STATUS_GET",
-            "GET_VERSIONS",
-            "GET_RUNTIMES",
-            "GET_RUNTIME",
-            "LIST_NODES",
-            "INVENTORY_REQUEST",
-            "ADD_HIVE_FINALIZE",
-            "REMOVE_HIVE_CLEANUP",
-        ] {
-            assert!(
-                PROTECTED_SYSTEM_ACTIONS.contains(&action),
-                "{action} must be protected"
-            );
-        }
-        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 18);
-        // Non-protected / unknown actions are not gated.
-        for action in ["RUNTIME_UPDATE", "HELLO", "LSA", "", "TOTALLY_UNKNOWN"] {
-            assert!(!PROTECTED_SYSTEM_ACTIONS.contains(&action));
-        }
-    }
 
     fn lsa_payload(hive: &str, seq: u64, router_id: &str, router_name: &str) -> LsaPayload {
         LsaPayload {

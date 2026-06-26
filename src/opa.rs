@@ -111,12 +111,7 @@ impl OpaResolver {
         if !self.policy_loaded {
             return Err(OpaError::NotLoaded);
         }
-        let input = serde_json::json!({
-            "meta": &msg.meta,
-            "routing": {
-                "src": &msg.routing.src
-            }
-        });
+        let input = build_opa_input(msg);
         self.eval_target(&input, dynamic_data)
     }
 
@@ -238,6 +233,25 @@ impl OpaResolver {
         }
         target
     }
+}
+
+/// Build the OPA evaluation input for a message (OPA-dual phase 2).
+///
+/// `routing.src_l2_name` is the ROUTER-AUTHORITATIVE origin name (resolved from
+/// the source UUID against the node registry, overwriting any sender-supplied
+/// value), so USER policies can reason about *who* the sender is, not just its
+/// UUID; `action` mirrors `meta.msg`. This shape is purely ADDITIVE over the
+/// historical `{ meta, routing.src }` — existing target-only policies that read
+/// only those fields are unaffected. The golden test pins the shape.
+fn build_opa_input(msg: &Message) -> Value {
+    serde_json::json!({
+        "meta": &msg.meta,
+        "routing": {
+            "src": &msg.routing.src,
+            "src_l2_name": &msg.routing.src_l2_name,
+        },
+        "action": msg.meta.msg.as_deref().unwrap_or_default(),
+    })
 }
 
 fn merge_opa_data(base: Option<&Value>, overlay: &Value) -> Value {
@@ -1311,7 +1325,64 @@ fn json_to_opa_value(
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_opa_data, parse_target_from_result, OpaDumpSource, OpaError};
+    use super::{build_opa_input, merge_opa_data, parse_target_from_result, OpaDumpSource, OpaError};
+    use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
+
+    #[test]
+    fn build_opa_input_golden_shape_is_additive() {
+        let msg = Message {
+            routing: Routing {
+                src: "uuid-123".to_string(),
+                src_l2_name: Some("SY.orchestrator@motherbee".to_string()),
+                dst: Destination::Unicast("SY.policy@motherbee".to_string()),
+                ttl: 16,
+                trace_id: "t".to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some("SPAWN_NODE".to_string()),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+        let input = build_opa_input(&msg);
+        // Historical fields preserved (existing target-only policies still work).
+        assert_eq!(input["routing"]["src"], "uuid-123");
+        assert_eq!(input["meta"]["msg"], "SPAWN_NODE");
+        // New additive fields.
+        assert_eq!(
+            input["routing"]["src_l2_name"],
+            "SY.orchestrator@motherbee"
+        );
+        assert_eq!(input["action"], "SPAWN_NODE");
+        // Exactly these top-level keys (catches an accidental shape change).
+        let obj = input.as_object().expect("input is an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["action", "meta", "routing"]);
+    }
+
+    #[test]
+    fn build_opa_input_handles_absent_src_l2_name_and_msg() {
+        let msg = Message {
+            routing: Routing {
+                src: "uuid-9".to_string(),
+                src_l2_name: None,
+                dst: Destination::Broadcast,
+                ttl: 16,
+                trace_id: "t".to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: None,
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+        let input = build_opa_input(&msg);
+        assert!(input["routing"]["src_l2_name"].is_null());
+        assert_eq!(input["action"], "");
+    }
 
     #[test]
     fn parse_target_from_result_extracts_top_level_target() {

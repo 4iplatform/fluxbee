@@ -957,7 +957,7 @@ fn write_config(
 /// OBSERVABILITY only: they carry FLAG_ACTIVE (so config readers surface them) and
 /// FLAG_FROZEN (so the router FIB skips them — they never affect forwarding).
 ///
-/// Enforcement is the router's `system_origin_allowed` gate (the single source of
+/// Enforcement is the router's `system_policy::authority` gate (the single source of
 /// truth); these entries are the visible mirror of that rule set and must be kept
 /// in sync with it by hand. `SY.orchestrator@*` is any-hive (cross-hive forwards);
 /// the rest are this hive's control plane.

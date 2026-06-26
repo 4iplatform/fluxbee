@@ -1750,7 +1750,7 @@ async fn handle_system_message(
     state: &OrchestratorState,
 ) -> Result<(), OrchestratorError> {
     // SYSTEM origin-authority is now enforced centrally by the router at delivery
-    // time (system_origin_allowed); an unauthorized protected SYSTEM action never
+    // time (system_policy::authority); an unauthorized protected SYSTEM action never
     // reaches this node, so the orchestrator no longer re-checks it here (F4/F15).
     match msg.meta.msg.as_deref() {
         Some("RUNTIME_UPDATE") => {
