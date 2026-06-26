@@ -422,13 +422,21 @@ directo por FIB (sin OPA), igual que cuando recibe un UUID directo.
 
 ### 8.2 Input
 
-OPA recibe el mensaje completo (excepto payload). El `src_ilk` permite derivar tenant via `data.identity`:
+OPA (la **capa USER**, ver §9) recibe el mensaje (excepto payload). El `src_ilk`
+permite derivar tenant via `data.identity`. Desde OPA-dual el input incluye
+además `routing.src_l2_name` (el nombre L2 **autoritativo** que el router resuelve
+del UUID origen contra su registro de nodos — no spoofeable) y `action`
+(espejo de `meta.msg`), para que una policy pueda razonar sobre *quién* envía,
+no solo su UUID. Es **aditivo**: las policies que leen solo `routing.src`/`meta.*`
+no se ven afectadas.
 
 ```json
 {
   "routing": {
-    "src": "uuid-origen"
+    "src": "uuid-origen",
+    "src_l2_name": "AI.cliente@produccion"
   },
+  "action": "",
   "meta": {
     "type": "user",
     "target": "AI.soporte.*",
@@ -439,6 +447,8 @@ OPA recibe el mensaje completo (excepto payload). El `src_ilk` permite derivar t
   }
 }
 ```
+
+> Construido por `build_opa_input` (`src/opa.rs`); un golden test fija el shape.
 
 ### 8.3 Output
 
@@ -560,6 +570,62 @@ allow {
     data.identity[input.meta.src_ilk].human_subtype == "internal"
 }
 ```
+
+### 8.7 Capa SYSTEM de autoridad (modelo OPA-dual)
+
+El router es el centro de routing **y** de autoridad de la malla. La política se
+modela en **dos capas** que el router compone (ver `docs/onworking COA/opa-dual.md`):
+
+- **Capa SYSTEM (autoritativa, NO editable por usuario).** Las reglas `SY.` de
+  origen-autoridad, hoy una tabla fija en Rust: `src/router/system_policy.rs`
+  (`authority()` + `is_protected_system_action()`). Inalcanzable desde los
+  endpoints `/opa/policy*` (esos solo llegan al blob OPA del usuario), así que es
+  no editable por construcción. `authority()` es un **seam estable**: una futura
+  capa system en Rego puede reemplazar el backing sin cambiar los call-sites.
+- **Capa USER.** OPA (§8.1–8.6): selecciona target de routing y, a futuro, podrá
+  *estrechar* autoridad.
+
+**Gate de autoridad de origen.** Toda entrega a un nodo local pasa por
+`serialize_for_local_delivery`, que para los mensajes `SYSTEM` con una **acción
+protegida** verifica el origen contra la capa SYSTEM y, si no está autorizado,
+**suprime la entrega** (drop silencioso, nunca tira la conexión). El `src_l2_name`
+es **autoritativo** (lo resuelve el router del UUID origen contra su registro de
+nodos en delivery local / WAN / peer, sobreescribiendo cualquier valor que haya
+puesto el emisor — ver el test de spoof), así que es una barrera real.
+
+Acciones protegidas (18): `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT`, `SPAWN_NODE`,
+`KILL_NODE`, `START_NODE`, `RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_SET`,
+`NODE_CONFIG_GET`, `NODE_STATE_GET`, `NODE_STATUS_GET`, `GET_VERSIONS`,
+`GET_RUNTIMES`, `GET_RUNTIME`, `LIST_NODES`, `INVENTORY_REQUEST`,
+`ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP`.
+
+Allow-list `SY.` (sobre el `src_l2_name` autoritativo):
+
+| Origen | Hive | Alcance |
+|--------|------|---------|
+| `SY.orchestrator@*` | **cualquiera** | todas las acciones (forwards cross-hive de la malla; control plane, exento de user-deny) |
+| `SY.admin@<hive>` | same-hive | todas |
+| `SY.wf-rules@<hive>` | same-hive | todas |
+| `WF.orch.diag@<hive>` | same-hive | todas |
+| `SY.config-routes@<hive>`, `SY.vault@<hive>` | same-hive | **solo** `NODE_STATUS_GET` (probe read-only) |
+
+El rol se matchea exacto (`split_once('@')`), así que un `SY.orchestrator.relay@h`
+NO pasa como `SY.orchestrator`. Cross-hive solo para `SY.orchestrator` (cierra el
+bypass cross-hive de `SY.admin@<otro-hive>`).
+
+**Orden de composición** (contrato): `system-gate → system-route → user-route(OPA)`.
+`final_allow = system_allow AND user_allow`; **SYSTEM deny es final** (la capa user
+nunca re-permite, ni puede cortar el control plane cross-hive). La ruta SYSTEM
+(p.ej. identity pre-resolve forzando frontdesk) tiene precedencia y corta antes de
+consultar OPA.
+
+**Visibilidad.** Las reglas `SY.` se publican además como rutas **frozen** en la
+tabla de rutas SHM (`FLAG_FROZEN`, escritas por `sy-config-routes` en `apply_config`);
+el FIB del router las **saltea** (no afectan el forwarding) pero quedan
+inspeccionables para auditoría.
+
+> Esto reemplazó el gate de origen que vivía en `sy.orchestrator` (audit F4/F15):
+> la autoridad se centralizó en el router para no distribuir el chequeo entre nodos.
 
 ---
 
