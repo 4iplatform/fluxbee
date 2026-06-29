@@ -369,11 +369,22 @@ impl Router {
         });
 
         if self.cfg.is_gateway {
-            // Load WAN mTLS material when configured. Missing certs degrade to
-            // plaintext (effective mode "disabled") with a loud WARN, so a node
-            // mid-rollout never bricks the mesh.
+            // Load WAN mTLS material when configured. On a load/build failure the
+            // behaviour is mode-dependent and FAIL-CLOSED for `required`:
+            // - required  -> keep mode `required` with NO material, so every WAN
+            //   connection is rejected (the TLS handshake can't run). A missing
+            //   cert is a loud, total outage — NOT a silent downgrade to plaintext
+            //   that an attacker could force by deleting the cert files. (motherbee
+            //   always has certs by boot; workers get them at add_hive, so this
+            //   only bites on a genuine misconfig/attack.)
+            // - permissive -> degrade to plaintext (the lenient rollout mode).
             let (wan_tls, effective_mtls_mode) = if self.cfg.wan_mtls_mode != "disabled" {
                 crate::mesh_tls::install_crypto_provider();
+                let degraded = if self.cfg.wan_mtls_mode == "required" {
+                    "required".to_string() // fail-closed: no plaintext fallback
+                } else {
+                    "disabled".to_string()
+                };
                 match crate::mesh_tls::MeshTlsMaterial::load_from_dir(&self.cfg.tls_dir) {
                     Ok(mat) => match (mat.server_config(), mat.client_config()) {
                         (Ok(sc), Ok(cc)) => (
@@ -384,21 +395,29 @@ impl Router {
                             self.cfg.wan_mtls_mode.clone(),
                         ),
                         _ => {
-                            tracing::warn!(
+                            tracing::error!(
                                 mode = %self.cfg.wan_mtls_mode,
-                                "wan.mtls set but TLS config build failed; WAN runs plaintext"
+                                "wan.mtls set but TLS config build failed; WAN unavailable (required=fail-closed)"
                             );
-                            (None, "disabled".to_string())
+                            (None, degraded)
                         }
                     },
                     Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            dir = %self.cfg.tls_dir.display(),
-                            mode = %self.cfg.wan_mtls_mode,
-                            "wan.mtls set but no TLS material on disk; WAN runs plaintext (re-run add_hive to issue certs)"
-                        );
-                        (None, "disabled".to_string())
+                        if self.cfg.wan_mtls_mode == "required" {
+                            tracing::error!(
+                                error = %err,
+                                dir = %self.cfg.tls_dir.display(),
+                                "wan.mtls=required but no TLS material on disk; WAN FAIL-CLOSED (all peers rejected). Provision certs (add_hive / cert reconcile)."
+                            );
+                        } else {
+                            tracing::warn!(
+                                error = %err,
+                                dir = %self.cfg.tls_dir.display(),
+                                mode = %self.cfg.wan_mtls_mode,
+                                "wan.mtls=permissive but no TLS material; WAN runs plaintext for now"
+                            );
+                        }
+                        (None, degraded)
                     }
                 }
             } else {
@@ -2405,13 +2424,33 @@ async fn accept_wan_connection(stream: TcpStream, ctx: Arc<WanContext>) -> Resul
         "permissive" => {
             // Detect TLS vs plaintext without consuming: a TLS record starts with
             // 0x16 (handshake). Lets old (plaintext) and new (TLS) peers coexist
-            // during rollout.
+            // during rollout. Peek can return 0 before the peer has sent its first
+            // byte (a slow/half-open peer) — poll briefly so a slow TLS peer is not
+            // misdetected as plaintext, with a bounded timeout to avoid a slowloris
+            // hold. Permissive is a TEMPORARY rollout bridge: every accepted
+            // plaintext peer is an UNAUTHENTICATED connection (no mTLS) and is
+            // logged at WARN so the operator knows the rollout is incomplete and
+            // can flip to `required` (the only fully-enforced state).
             let mut probe = [0u8; 1];
-            let n = stream.peek(&mut probe).await?;
+            let mut n = 0usize;
+            let deadline = time::Instant::now() + Duration::from_secs(5);
+            while n == 0 && time::Instant::now() < deadline {
+                match time::timeout(Duration::from_millis(500), stream.peek(&mut probe)).await {
+                    Ok(Ok(read)) => n = read,
+                    Ok(Err(err)) => return Err(err.into()),
+                    Err(_) => {} // peek timed out; retry until the deadline
+                }
+                if n == 0 {
+                    time::sleep(Duration::from_millis(50)).await;
+                }
+            }
             if n >= 1 && probe[0] == 0x16 {
                 let (tls, hive) = tls_accept(stream, &ctx).await?;
                 handle_wan_connection(tls, hive, ctx, false).await
             } else {
+                tracing::warn!(
+                    "wan.mtls=permissive: accepting an UNAUTHENTICATED plaintext peer (rollout incomplete; flip to 'required' once all peers present certs)"
+                );
                 handle_wan_connection(stream, None, ctx, false).await
             }
         }
@@ -2438,6 +2477,14 @@ async fn tls_accept(
         .peer_certificates()
         .and_then(|c| c.first())
         .and_then(crate::mesh_tls::peer_hive_from_cert);
+    // A CA-signed cert with no extractable hive_id can't be bound to the HELLO,
+    // so it is not trustable as a peer identity — reject (defense-in-depth; mesh
+    // leaves always carry CN+SAN, so this never fires for a legit peer).
+    if hive.is_none() {
+        return Err(RouterError::Startup(
+            "wan peer certificate has no extractable hive_id".to_string(),
+        ));
+    }
     Ok((tls, hive))
 }
 
@@ -2466,6 +2513,11 @@ async fn connect_wan_connection(stream: TcpStream, ctx: &Arc<WanContext>) -> Res
         .peer_certificates()
         .and_then(|c| c.first())
         .and_then(crate::mesh_tls::peer_hive_from_cert);
+    if hive.is_none() {
+        return Err(RouterError::Startup(
+            "wan server certificate has no extractable hive_id".to_string(),
+        ));
+    }
     handle_wan_connection(tls, hive, Arc::clone(ctx), true).await
 }
 

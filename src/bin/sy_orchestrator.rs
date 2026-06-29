@@ -818,22 +818,53 @@ fn write_secret_file_0600(path: &Path, contents: &str) -> Result<(), Orchestrato
 /// MESH_CA_DIR); it is NOT derived from the SSH key (isolation).
 fn ensure_mesh_ca() -> Result<json_router::mesh_tls::MeshCa, OrchestratorError> {
     use json_router::mesh_tls::MeshCa;
+    use std::os::unix::fs::OpenOptionsExt;
     let dir = Path::new(MESH_CA_DIR);
     fs::create_dir_all(dir)?;
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
     let ca_crt = dir.join("ca.crt");
     let ca_key = dir.join("ca.key");
-    if ca_crt.exists() && ca_key.exists() {
-        return MeshCa::from_pem(
+    let load = || {
+        MeshCa::from_pem(
             &fs::read_to_string(&ca_crt)?,
             &fs::read_to_string(&ca_key)?,
         )
-        .map_err(|e| format!("load mesh CA: {e}").into());
+        .map_err(|e| OrchestratorError::from(format!("load mesh CA: {e}")))
+    };
+    if ca_crt.exists() && ca_key.exists() {
+        return load();
     }
+    // Generate, then atomically claim ca.key with O_EXCL so concurrent callers
+    // (boot + multiple add_hive flows) cannot each generate a different CA and
+    // orphan already-distributed leaves. The winner persists its CA; a loser
+    // (create_new fails: another won) discards its generated CA and reloads.
     let ca = MeshCa::generate().map_err(|e| format!("generate mesh CA: {e}"))?;
-    fs::write(&ca_crt, ca.ca_cert_pem())?;
-    write_secret_file_0600(&ca_key, ca.ca_key_pem())?;
-    tracing::info!("generated dedicated mesh CA");
-    Ok(ca)
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&ca_key)
+    {
+        Ok(mut f) => {
+            f.write_all(ca.ca_key_pem().as_bytes())?;
+            fs::write(&ca_crt, ca.ca_cert_pem())?;
+            tracing::info!("generated dedicated mesh CA");
+            Ok(ca)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Another caller won; wait briefly for it to finish writing ca.crt.
+            for _ in 0..40 {
+                if ca_crt.exists() && ca_key.exists() {
+                    if let Ok(loaded) = load() {
+                        return Ok(loaded);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            load()
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Write a hive's TLS material (ca.crt + leaf cert/key) into the LOCAL
@@ -846,6 +877,7 @@ fn write_local_hive_tls(
     let leaf = ca.issue_leaf(hive_id).map_err(|e| format!("issue leaf: {e}"))?;
     let dir = Path::new(MESH_TLS_BASE_DIR).join(hive_id);
     fs::create_dir_all(&dir)?;
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     fs::write(dir.join("ca.crt"), ca.ca_cert_pem())?;
     fs::write(dir.join("cert.crt"), &leaf.cert_pem)?;
     write_secret_file_0600(&dir.join("cert.key"), &leaf.key_pem)?;
@@ -888,7 +920,16 @@ fn distribute_hive_tls_inner(
     let ca = ensure_mesh_ca()?;
     let leaf = ca.issue_leaf(hive_id).map_err(|e| format!("issue leaf: {e}"))?;
     let dir = format!("/var/lib/fluxbee/tls/{hive_id}");
-    ssh_with_key(address, key_path, &sudo_wrap(&format!("mkdir -p '{dir}'")), user)?;
+    // Create the dir 0700 BEFORE writing: write_remote_file streams via `tee`,
+    // which leaves the new file at the umask default (often world-readable) until
+    // the chmod below. An owner-only directory blocks traversal in that window, so
+    // cert.key is never readable by another local user even transiently.
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(&format!("mkdir -p '{dir}' && chmod 700 '{dir}'")),
+        user,
+    )?;
     write_remote_file(address, key_path, user, &format!("{dir}/ca.crt"), ca.ca_cert_pem())?;
     write_remote_file(address, key_path, user, &format!("{dir}/cert.crt"), &leaf.cert_pem)?;
     write_remote_file(address, key_path, user, &format!("{dir}/cert.key"), &leaf.key_pem)?;
@@ -901,6 +942,55 @@ fn distribute_hive_tls_inner(
     Ok(())
 }
 
+/// Motherbee: (re)distribute mesh TLS material to all already-provisioned hives
+/// that don't have it yet. New hives get certs at `add_hive`; this catches up the
+/// hives created BEFORE mTLS existed (so the operator can flip `wan.mtls` without
+/// a manual cert step). Idempotent (skips hives that already hold a cert; a CA
+/// rotation is a separate forced op) and best-effort (logged). Runs blocking, so
+/// the caller should spawn it off the boot path.
+fn reconcile_hive_tls_material() {
+    let root = hives_root();
+    let entries = match fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
+    let mut filled = 0u32;
+    for entry in entries.flatten() {
+        let hive_id = entry.file_name().to_string_lossy().to_string();
+        if hive_id == PRIMARY_HIVE_ID || !valid_hive_id(&hive_id) {
+            continue;
+        }
+        let Ok(info) = read_hive_info(&root, &hive_id) else {
+            continue;
+        };
+        if info.get("status").and_then(|v| v.as_str()) != Some("connected") {
+            continue;
+        }
+        let address = info.get("address").and_then(|v| v.as_str()).unwrap_or("");
+        let user = info.get("ssh_user").and_then(|v| v.as_str()).unwrap_or("");
+        if address.is_empty() || user.is_empty() {
+            continue;
+        }
+        // Idempotent: skip a hive that already holds a cert.
+        if ssh_with_key(
+            address,
+            &key_path,
+            &sudo_wrap(&format!("test -f '/var/lib/fluxbee/tls/{hive_id}/cert.crt'")),
+            user,
+        )
+        .is_ok()
+        {
+            continue;
+        }
+        distribute_hive_tls(address, &key_path, user, &hive_id);
+        filled += 1;
+    }
+    if filled > 0 {
+        tracing::info!(count = filled, "distributed mesh TLS material to existing hives");
+    }
+}
+
 async fn bootstrap_local(
     state: &OrchestratorState,
     socket_dir: &Path,
@@ -910,9 +1000,11 @@ async fn bootstrap_local(
     validate_core_manifest_for_bins(&core_bins)?;
 
     // Motherbee is the mesh CA: ensure the CA + its own WAN-mTLS material exist
-    // before rt-gateway starts (the router loads certs at startup).
+    // before rt-gateway starts (the router loads certs at startup). Then, off the
+    // boot path, catch up TLS material for hives provisioned before mTLS existed.
     if state.is_motherbee {
         ensure_motherbee_mesh_tls(&state.hive_id);
+        tokio::task::spawn_blocking(reconcile_hive_tls_material);
     }
 
     tracing::info!("starting rt-gateway");
