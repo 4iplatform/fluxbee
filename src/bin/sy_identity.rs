@@ -51,8 +51,19 @@ const SYNC_OP_FULL_SYNC: &str = "full_sync";
 const SYNC_OP_DELTA_SUBSCRIBE: &str = "IDENTITY_DELTA_SUBSCRIBE";
 const SYNC_OP_DELTA: &str = "IDENTITY_DELTA";
 const SYNC_OP_DELTA_ACK: &str = "IDENTITY_DELTA_ACK";
+// Upstream push (replica → primary): a replica publishes its own `@hive` ilks so
+// motherbee converges to the additive union of the whole mesh ("who exists").
+const SYNC_OP_DELTA_PUBLISH: &str = "IDENTITY_DELTA_PUBLISH";
+const SYNC_OP_PUBLISH_OK: &str = "IDENTITY_DELTA_PUBLISH_OK";
+const SYNC_OP_PUBLISH_SNAPSHOT: &str = "IDENTITY_PUBLISH_SNAPSHOT";
 const IDENTITY_DELTA_ACK_TIMEOUT_MS: u64 = 2_000;
 const IDENTITY_DELTA_MAX_RETRIES: u32 = 3;
+// How often a replica re-pushes its full self-owned ilk set so the primary
+// reconciles (recovers upserts AND hard-deletes lost on a reconnect gap).
+const IDENTITY_PUBLISH_RECONCILE_SECS: u64 = 30;
+// Bound on the primary's ingest queue: a flooding/buggy replica applies
+// backpressure to its own publish connection instead of growing primary memory.
+const IDENTITY_INGEST_CHANNEL_CAP: usize = 4096;
 const DEFAULT_IDENTITY_SHM_MAX_ILKS: u32 = 8_192;
 const DEFAULT_IDENTITY_SHM_MAX_TENANTS: u32 = 1_024;
 const DEFAULT_IDENTITY_SHM_MAX_VOCABULARY: u32 = 4_096;
@@ -353,7 +364,7 @@ struct TenantRecord {
     sponsor_tenant_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct ChannelRecord {
     ich_id: String,
     channel_type: String,
@@ -362,7 +373,7 @@ struct ChannelRecord {
     enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct IlkRecord {
     ilk_id: String,
     ilk_type: String,
@@ -392,6 +403,23 @@ struct IdentityStore {
 #[derive(Debug, Serialize, Deserialize)]
 struct IdentitySyncRequest {
     operation: String,
+    /// Set on `DELTA_PUBLISH`: the publishing replica's hive_id, used by the
+    /// primary for the per-hive authority check (a replica may only push ilks it
+    /// owns, i.e. whose node_name ends with `@<hive_id>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hive_id: Option<String>,
+}
+
+/// Full self-owned ilk set a replica pushes on connect + every
+/// `IDENTITY_PUBLISH_RECONCILE_SECS`. The primary reconciles its view of this
+/// hive to exactly this set (upsert present, hard-remove absent), so upserts and
+/// hard-deletes both converge even after a reconnect gap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IdentityPublishSnapshot {
+    operation: String,
+    seq: u64,
+    hive_id: String,
+    ilks: Vec<IlkRecord>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1449,6 +1477,18 @@ impl IdentityStore {
                 self.ilks.insert(ilk_id, ilk);
             }
             IdentityDelta::IlkDelete { ilk_id } => {
+                // Never hard-remove a well-known system ilk — mirrors the
+                // delete_ilk handler's SYSTEM_ILK_PROTECTED guard, and closes the
+                // forged-snapshot DOS where a publish snapshot omitting
+                // SY.identity@<hive> would otherwise reconcile-delete it mesh-wide.
+                if self
+                    .ilks
+                    .get(&ilk_id)
+                    .map(is_well_known_system_ilk)
+                    .unwrap_or(false)
+                {
+                    return;
+                }
                 self.aliases.retain(|old_ilk_id, alias| {
                     old_ilk_id != &ilk_id && alias.canonical_ilk_id != ilk_id
                 });
@@ -1469,6 +1509,141 @@ impl IdentityStore {
                 self.aliases.remove(&old_ilk_id);
             }
         }
+    }
+
+    /// All ilks owned by `hive_id` (active **and** soft-deleted tombstones), for a
+    /// replica's reconciliation snapshot. Ownership is the `@<hive>` suffix of the
+    /// ilk's L2 `node_name` (the canonical, forge-proof owner — see
+    /// `ilk_owning_hive`).
+    fn self_owned_ilks(&self, hive_id: &str) -> Vec<IlkRecord> {
+        self.ilks
+            .values()
+            .filter(|ilk| ilk_owning_hive(ilk).as_deref() == Some(hive_id))
+            .cloned()
+            .collect()
+    }
+
+    /// Reconcile this store's view of `hive_id`'s ilks to exactly `incoming`
+    /// (a replica's authoritative self-owned set): upsert everything in
+    /// `incoming`, and hard-remove any ilk this store currently attributes to
+    /// `hive_id` that is absent from `incoming` (recovers hard-deletes). Only
+    /// touches ilks owned by `hive_id` — other hives' ilks are never affected
+    /// (additive union across hives). Returns the deltas applied, for broadcast.
+    fn reconcile_hive_ilks(
+        &mut self,
+        hive_id: &str,
+        incoming: Vec<IlkRecord>,
+    ) -> Vec<IdentityDelta> {
+        let incoming_ids: HashSet<String> =
+            incoming.iter().map(|ilk| ilk.ilk_id.clone()).collect();
+        let stale: Vec<String> = self
+            .ilks
+            .values()
+            .filter(|ilk| {
+                ilk_owning_hive(ilk).as_deref() == Some(hive_id)
+                    && !incoming_ids.contains(&ilk.ilk_id)
+                    // Well-known system ilks are never reconcile-removed (a forged
+                    // snapshot that omits them must not delete them); apply_delta
+                    // enforces this too as a net.
+                    && !is_well_known_system_ilk(ilk)
+            })
+            .map(|ilk| ilk.ilk_id.clone())
+            .collect();
+        let mut deltas = Vec::new();
+        for ilk in incoming {
+            // Never overwrite an ilk_id that already belongs to a different hive
+            // (key-collision guard, mirrors delta_authorized_for_hive).
+            if let Some(existing) = self.ilks.get(&ilk.ilk_id) {
+                if ilk_owning_hive(existing).as_deref() != Some(hive_id) {
+                    continue;
+                }
+                // Skip a no-op upsert (already byte-identical) to avoid churn.
+                if existing == &ilk {
+                    continue;
+                }
+            }
+            self.apply_delta(IdentityDelta::IlkUpsert { ilk: ilk.clone() });
+            deltas.push(IdentityDelta::IlkUpsert { ilk });
+        }
+        for ilk_id in stale {
+            self.apply_delta(IdentityDelta::IlkDelete {
+                ilk_id: ilk_id.clone(),
+            });
+            deltas.push(IdentityDelta::IlkDelete { ilk_id });
+        }
+        deltas
+    }
+}
+
+/// The hive that owns an ilk = the `@<hive>` suffix of its L2 `node_name`. This
+/// is the forge-proof owner used for the per-hive authority check: a replica may
+/// only push ilks whose node_name ends with `@<its-own-hive>`. Falls back to the
+/// explicit `identification.hive_id` only when the node_name carries no `@`.
+fn ilk_owning_hive(ilk: &IlkRecord) -> Option<String> {
+    if let Some(node_name) = ilk
+        .identification
+        .get("node_name")
+        .and_then(|v| v.as_str())
+    {
+        if let Some((_, hive)) = node_name.rsplit_once('@') {
+            let hive = hive.trim();
+            if !hive.is_empty() {
+                return Some(hive.to_string());
+            }
+        }
+    }
+    ilk.identification
+        .get("hive_id")
+        .and_then(|v| v.as_str())
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+}
+
+/// Per-hive authority: is `publisher_hive` allowed to push this delta? A replica
+/// may only upsert/delete ilks it owns (`@<publisher_hive>`). For `IlkDelete`
+/// (which carries only an ilk_id) ownership is resolved against the existing ilk
+/// in `store`; an unknown id is rejected, so a replica can neither forge a
+/// `@motherbee`/`@other-hive` ilk nor delete one it does not own. TenantUpsert
+/// is primary-only and never accepted from a replica.
+fn delta_authorized_for_hive(
+    delta: &IdentityDelta,
+    publisher_hive: &str,
+    store: &IdentityStore,
+) -> bool {
+    match delta {
+        IdentityDelta::IlkUpsert { ilk } => {
+            // Claimed owner (node_name `@hive`) must be the publisher, AND the
+            // ilk_id must not already belong to a different hive — otherwise a
+            // replica could overwrite another hive's ilk by reusing its ilk_id
+            // with a forged `@self` node_name (key-collision attack).
+            if ilk_owning_hive(ilk).as_deref() != Some(publisher_hive) {
+                return false;
+            }
+            match store.ilks.get(&ilk.ilk_id) {
+                Some(existing) => ilk_owning_hive(existing).as_deref() == Some(publisher_hive),
+                None => true,
+            }
+        }
+        IdentityDelta::IlkDelete { ilk_id } => store
+            .ilks
+            .get(ilk_id)
+            .and_then(ilk_owning_hive)
+            .as_deref()
+            == Some(publisher_hive),
+        IdentityDelta::AliasUpsert { alias } => store
+            .ilks
+            .get(&alias.canonical_ilk_id)
+            .and_then(ilk_owning_hive)
+            .as_deref()
+            == Some(publisher_hive),
+        IdentityDelta::AliasDelete { old_ilk_id } => store
+            .ilks
+            .get(old_ilk_id)
+            .and_then(ilk_owning_hive)
+            .as_deref()
+            == Some(publisher_hive),
+        // Tenants are primary-authoritative; never accepted from a replica push.
+        IdentityDelta::TenantUpsert { .. } => false,
     }
 }
 
@@ -2749,10 +2924,22 @@ async fn main() -> Result<(), IdentityError> {
     // waiting on the SHM read path it just populated.
     tracing::info!(self_ilk_id = %self_ilk_id, "resolved self system ILK");
     let (delta_event_tx, mut delta_event_rx) = mpsc::unbounded_channel::<IdentityDeltaEnvelope>();
+    // Upstream publish (replica → primary): local ilk deltas a replica pushes up.
+    let (upstream_tx, upstream_rx) = mpsc::unbounded_channel::<UpstreamFrame>();
+    // Ingest (primary): frames received from replicas' publish connections.
+    // Bounded so a flooding replica backpressures its own connection instead of
+    // growing primary memory unboundedly.
+    let (ingest_tx, mut ingest_rx) = mpsc::channel::<IngestFrame>(IDENTITY_INGEST_CHANNEL_CAP);
     if !is_primary {
         if let Some(upstream) = sync_upstream.clone() {
             tokio::spawn(async move {
                 run_delta_subscription_loop(upstream, delta_event_tx).await;
+            });
+        }
+        if let Some(upstream) = sync_upstream.clone() {
+            let publish_hive = hive.hive_id.clone();
+            tokio::spawn(async move {
+                run_delta_publish_loop(upstream, publish_hive, upstream_rx).await;
             });
         }
     }
@@ -2769,6 +2956,11 @@ async fn main() -> Result<(), IdentityError> {
 
     let mut heartbeat = time::interval(Duration::from_secs(5));
     let mut alias_gc_tick = time::interval(Duration::from_secs(ALIAS_GC_INTERVAL_SECS));
+    // Replica reconciliation beat: re-push the full self-owned ilk set so the
+    // primary converges (recovers upserts AND hard-deletes after a reconnect gap).
+    // The first tick fires immediately, publishing the boot-seeded ilks.
+    let mut publish_reconcile_tick =
+        time::interval(Duration::from_secs(IDENTITY_PUBLISH_RECONCILE_SECS));
     let sync_listener = sync_listener;
     let mut delta_subscribers: Vec<mpsc::UnboundedSender<IdentityDeltaEnvelope>> = Vec::new();
     let mut next_delta_seq: u64 = 1;
@@ -2784,6 +2976,64 @@ async fn main() -> Result<(), IdentityError> {
                     writer.update_heartbeat();
                 }
             }
+            _ = publish_reconcile_tick.tick() => {
+                // Replica: push the full self-owned ilk set upstream so the
+                // primary reconciles to it (additive across hives; recovers
+                // upserts + hard-deletes). No-op on the primary.
+                if !is_primary {
+                    let snapshot = runtime.store.self_owned_ilks(&hive.hive_id);
+                    let _ = upstream_tx.send(UpstreamFrame::Snapshot(snapshot));
+                }
+            }
+            maybe_ingest = ingest_rx.recv() => {
+                // Primary: a replica published its ilks. Authority-check, apply
+                // (additive union / per-hive reconcile), update the SHM, and
+                // re-broadcast so every subscriber (the other replicas) converges.
+                if let Some(frame) = maybe_ingest {
+                    // Defense-in-depth: a publish claiming the primary's OWN hive
+                    // is an impersonation attempt — the primary owns its ilks and
+                    // nobody publishes them upward. (The sync port itself is not
+                    // yet peer-authenticated; closing the impersonate-primary case
+                    // bounds the blast radius. See ilk-bidirectional-sync.md.)
+                    let claimed = match &frame {
+                        IngestFrame::Delta { publisher_hive, .. } => publisher_hive,
+                        IngestFrame::Snapshot { publisher_hive, .. } => publisher_hive,
+                    };
+                    let applied: Vec<IdentityDelta> = if claimed == &hive.hive_id {
+                        tracing::warn!(hive = %claimed, "rejected identity publish impersonating the primary hive");
+                        Vec::new()
+                    } else { match frame {
+                        IngestFrame::Delta { publisher_hive, delta } => {
+                            if delta_authorized_for_hive(&delta, &publisher_hive, &runtime.store) {
+                                runtime.store.apply_delta(delta.clone());
+                                vec![delta]
+                            } else {
+                                tracing::warn!(hive = %publisher_hive, "rejected unauthorized identity delta from replica");
+                                Vec::new()
+                            }
+                        }
+                        IngestFrame::Snapshot { publisher_hive, ilks } => {
+                            if ilks.iter().all(|ilk| ilk_owning_hive(ilk).as_deref() == Some(publisher_hive.as_str())) {
+                                runtime.store.reconcile_hive_ilks(&publisher_hive, ilks)
+                            } else {
+                                tracing::warn!(hive = %publisher_hive, "rejected publish snapshot containing foreign ilks");
+                                Vec::new()
+                            }
+                        }
+                    }};
+                    if !applied.is_empty() {
+                        if let Some(writer) = identity_shm.as_mut() {
+                            if let Err(err) = sync_identity_shm_mappings(writer, &runtime.store) {
+                                tracing::warn!(error = %err, "identity shm sync failed after replica ingest");
+                            }
+                        }
+                        let mut envelopes: Vec<IdentityDeltaEnvelope> =
+                            applied.into_iter().map(delta_envelope).collect();
+                        assign_delta_seqs(&mut envelopes, &mut next_delta_seq);
+                        broadcast_deltas(&mut delta_subscribers, &envelopes);
+                    }
+                }
+            }
             _ = alias_gc_tick.tick() => {
                 match runtime.run_alias_gc().await {
                     Ok(mut deltas) => {
@@ -2797,6 +3047,8 @@ async fn main() -> Result<(), IdentityError> {
                         if is_primary && !deltas.is_empty() {
                             assign_delta_seqs(&mut deltas, &mut next_delta_seq);
                             broadcast_deltas(&mut delta_subscribers, &deltas);
+                        } else if !deltas.is_empty() {
+                            push_local_deltas_upstream(&deltas, &upstream_tx);
                         }
                     }
                     Err(err) => {
@@ -2822,7 +3074,7 @@ async fn main() -> Result<(), IdentityError> {
             } => {
                 if let Some((stream, remote_addr)) = accepted {
                     let chunks = runtime.store.build_full_sync_chunks(IDENTITY_FULL_SYNC_CHUNK_ITEMS);
-                    match handle_sync_connection(stream, chunks).await {
+                    match handle_sync_connection(stream, chunks, ingest_tx.clone()).await {
                         Ok(Some(subscriber)) => {
                             tracing::info!(remote = %remote_addr, "identity delta subscriber connected");
                             delta_subscribers.push(subscriber);
@@ -2859,6 +3111,8 @@ async fn main() -> Result<(), IdentityError> {
                         if is_primary && !deltas.is_empty() {
                             assign_delta_seqs(&mut deltas, &mut next_delta_seq);
                             broadcast_deltas(&mut delta_subscribers, &deltas);
+                        } else if !deltas.is_empty() {
+                            push_local_deltas_upstream(&deltas, &upstream_tx);
                         }
                     }
                     Err(err) => {
@@ -3470,6 +3724,7 @@ fn apply_identity_shm_deltas(
 async fn handle_sync_connection(
     stream: TcpStream,
     chunks: Vec<IdentityFullSyncChunk>,
+    ingest_tx: mpsc::Sender<IngestFrame>,
 ) -> Result<Option<mpsc::UnboundedSender<IdentityDeltaEnvelope>>, IdentityError> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -3548,6 +3803,46 @@ async fn handle_sync_connection(
             });
             Ok(Some(tx))
         }
+        SYNC_OP_DELTA_PUBLISH => {
+            // A replica publishes its own `@hive` ilks upstream. Require the
+            // hive_id so the main loop can enforce per-hive authority.
+            let Some(publisher_hive) = request
+                .hive_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .map(str::to_string)
+            else {
+                let payload = IdentitySyncError {
+                    status: "error".to_string(),
+                    error_code: "INVALID_REQUEST".to_string(),
+                    message: "DELTA_PUBLISH requires hive_id".to_string(),
+                };
+                write_half
+                    .write_all(serde_json::to_string(&payload)?.as_bytes())
+                    .await?;
+                write_half.write_all(b"\n").await?;
+                write_half.flush().await?;
+                return Ok(None);
+            };
+            let ack = json!({ "status": "ok", "operation": SYNC_OP_PUBLISH_OK });
+            write_half
+                .write_all(serde_json::to_string(&ack)?.as_bytes())
+                .await?;
+            write_half.write_all(b"\n").await?;
+            write_half.flush().await?;
+            // Read the publish stream until the replica disconnects; the main
+            // loop applies + re-broadcasts the ingested frames.
+            tokio::spawn(async move {
+                if let Err(err) =
+                    run_publish_reader(&mut reader, &mut write_half, publisher_hive.clone(), ingest_tx)
+                        .await
+                {
+                    tracing::warn!(hive = %publisher_hive, error = %err, "identity publish reader ended");
+                }
+            });
+            Ok(None)
+        }
         _ => {
             let payload = IdentitySyncError {
                 status: "error".to_string(),
@@ -3568,6 +3863,7 @@ async fn fetch_full_sync_from_primary(upstream: &str) -> Result<IdentityStore, I
     let (read_half, mut write_half) = stream.into_split();
     let request = IdentitySyncRequest {
         operation: SYNC_OP_FULL_SYNC_REQUEST.to_string(),
+        hive_id: None,
     };
     let encoded = serde_json::to_string(&request)?;
     write_half.write_all(encoded.as_bytes()).await?;
@@ -3665,6 +3961,23 @@ fn assign_delta_seqs(deltas: &mut [IdentityDeltaEnvelope], next_seq: &mut u64) {
     }
 }
 
+/// Replica side: forward locally-originated deltas to the upstream publish task
+/// so the primary (motherbee) learns this hive's ilk changes. Tenants are
+/// primary-authoritative and skipped. Deltas received downstream are NOT routed
+/// here (they go through `delta_event_rx`, which only applies) — so a delta is
+/// never echoed back upstream and there is no loop.
+fn push_local_deltas_upstream(
+    deltas: &[IdentityDeltaEnvelope],
+    upstream_tx: &mpsc::UnboundedSender<UpstreamFrame>,
+) {
+    for envelope in deltas {
+        if matches!(envelope.delta, IdentityDelta::TenantUpsert { .. }) {
+            continue;
+        }
+        let _ = upstream_tx.send(UpstreamFrame::Delta(envelope.delta.clone()));
+    }
+}
+
 fn broadcast_deltas(
     subscribers: &mut Vec<mpsc::UnboundedSender<IdentityDeltaEnvelope>>,
     deltas: &[IdentityDeltaEnvelope],
@@ -3707,6 +4020,7 @@ async fn stream_deltas_from_primary(
     let (read_half, mut write_half) = stream.into_split();
     let request = IdentitySyncRequest {
         operation: SYNC_OP_DELTA_SUBSCRIBE.to_string(),
+        hive_id: None,
     };
     let encoded = serde_json::to_string(&request)?;
     write_half.write_all(encoded.as_bytes()).await?;
@@ -3813,6 +4127,201 @@ async fn send_delta_ack(
     write_half.write_all(b"\n").await?;
     write_half.flush().await?;
     Ok(())
+}
+
+// ===========================================================================
+// Upstream push (replica → primary): bidirectional ilk sync. A replica publishes
+// its own `@hive` ilks so the primary (motherbee) converges to the additive
+// union of the whole mesh. See docs/onworking COA/ilk-bidirectional-sync.md.
+// ===========================================================================
+
+/// A frame the replica's main loop hands to its publish task: an incremental
+/// local delta (low latency) or a full self-owned snapshot (periodic
+/// reconciliation that recovers upserts AND hard-deletes after a reconnect gap).
+enum UpstreamFrame {
+    Delta(IdentityDelta),
+    Snapshot(Vec<IlkRecord>),
+}
+
+/// A frame the primary's publish-connection reader hands to the main loop, tagged
+/// with the authenticated publishing hive for the authority check.
+enum IngestFrame {
+    Delta {
+        publisher_hive: String,
+        delta: IdentityDelta,
+    },
+    Snapshot {
+        publisher_hive: String,
+        ilks: Vec<IlkRecord>,
+    },
+}
+
+/// Replica side: keep an upstream publish connection to the primary alive,
+/// reconnecting on failure. Owns the receiver so the same backlog is drained
+/// across reconnects.
+async fn run_delta_publish_loop(
+    upstream: String,
+    hive_id: String,
+    mut rx: mpsc::UnboundedReceiver<UpstreamFrame>,
+) {
+    loop {
+        match publish_to_primary(&upstream, &hive_id, &mut rx).await {
+            Ok(()) => {
+                tracing::warn!(upstream = %upstream, "identity publish channel closed; reconnecting")
+            }
+            Err(err) => {
+                tracing::warn!(upstream = %upstream, error = %err, "identity publish channel failed; reconnecting")
+            }
+        }
+        time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// One publish-connection lifetime: handshake `DELTA_PUBLISH{hive_id}`, then
+/// drain frames, writing each + waiting for the primary's ACK. A frame consumed
+/// when the link drops is lost, but the periodic snapshot reconciles it.
+async fn publish_to_primary(
+    upstream: &str,
+    hive_id: &str,
+    rx: &mut mpsc::UnboundedReceiver<UpstreamFrame>,
+) -> Result<(), IdentityError> {
+    let stream = TcpStream::connect(upstream).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    let request = IdentitySyncRequest {
+        operation: SYNC_OP_DELTA_PUBLISH.to_string(),
+        hive_id: Some(hive_id.to_string()),
+    };
+    write_half
+        .write_all(serde_json::to_string(&request)?.as_bytes())
+        .await?;
+    write_half.write_all(b"\n").await?;
+    write_half.flush().await?;
+
+    let mut reader = BufReader::new(read_half);
+    // Handshake ack (the primary confirms it accepted the publish channel).
+    let mut line = String::new();
+    let n = reader.read_line(&mut line).await?;
+    if n == 0 {
+        return Err("publish handshake connection closed".into());
+    }
+    if let Ok(err_payload) = serde_json::from_str::<IdentitySyncError>(line.trim()) {
+        if err_payload.status == "error" {
+            return Err(format!(
+                "delta publish rejected: {} ({})",
+                err_payload.error_code, err_payload.message
+            )
+            .into());
+        }
+    }
+
+    let mut next_seq: u64 = 1;
+    while let Some(frame) = rx.recv().await {
+        let seq = next_seq;
+        next_seq = next_seq.saturating_add(1);
+        let encoded = match frame {
+            UpstreamFrame::Delta(delta) => serde_json::to_string(&IdentityDeltaEnvelope {
+                version: IDENTITY_SYNC_VERSION,
+                operation: SYNC_OP_DELTA.to_string(),
+                seq,
+                delta,
+            })?,
+            UpstreamFrame::Snapshot(ilks) => serde_json::to_string(&IdentityPublishSnapshot {
+                operation: SYNC_OP_PUBLISH_SNAPSHOT.to_string(),
+                seq,
+                hive_id: hive_id.to_string(),
+                ilks,
+            })?,
+        };
+        // Retry write+ack on ack timeout: the primary dedups by seq, so a
+        // re-sent frame is idempotent. A write error (dead link) propagates
+        // immediately to trigger a reconnect.
+        let mut acked = false;
+        for attempt in 1..=IDENTITY_DELTA_MAX_RETRIES {
+            write_half.write_all(encoded.as_bytes()).await?;
+            write_half.write_all(b"\n").await?;
+            write_half.flush().await?;
+            match wait_for_delta_ack(&mut reader, seq).await {
+                Ok(()) => {
+                    acked = true;
+                    break;
+                }
+                Err(err) => {
+                    tracing::warn!(seq, attempt, error = %err, "identity publish ack not received; retrying");
+                }
+            }
+        }
+        if !acked {
+            return Err("identity publish ack retries exhausted".into());
+        }
+    }
+    Ok(())
+}
+
+/// Primary side: read a replica's publish stream (after the `DELTA_PUBLISH`
+/// handshake), forwarding each frame to the main loop via `ingest_tx` and ACKing
+/// it. Runs until the replica disconnects.
+async fn run_publish_reader(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+    publisher_hive: String,
+    ingest_tx: mpsc::Sender<IngestFrame>,
+) -> Result<(), IdentityError> {
+    let mut line = String::new();
+    let mut last_seq: Option<u64> = None;
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        let raw = line.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(raw)?;
+        let operation = value.get("operation").and_then(|v| v.as_str()).unwrap_or("");
+        let seq = value.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+        if seq == 0 {
+            return Err("publish frame with seq=0 is invalid".into());
+        }
+        // Duplicate (retry) — ack and skip re-ingesting.
+        if last_seq == Some(seq) {
+            send_delta_ack(write_half, seq).await?;
+            continue;
+        }
+        if let Some(last) = last_seq {
+            if seq != last.saturating_add(1) {
+                return Err(format!(
+                    "publish sequence gap/out-of-order: prev={last} current={seq}"
+                )
+                .into());
+            }
+        }
+        let frame = if operation == SYNC_OP_PUBLISH_SNAPSHOT {
+            let snapshot: IdentityPublishSnapshot = serde_json::from_value(value)?;
+            IngestFrame::Snapshot {
+                publisher_hive: publisher_hive.clone(),
+                ilks: snapshot.ilks,
+            }
+        } else if operation == SYNC_OP_DELTA {
+            let envelope: IdentityDeltaEnvelope = serde_json::from_value(value)?;
+            IngestFrame::Delta {
+                publisher_hive: publisher_hive.clone(),
+                delta: envelope.delta,
+            }
+        } else {
+            return Err(format!("unsupported publish frame operation '{operation}'").into());
+        };
+        // Bounded send: a full queue backpressures here (we stop reading + the
+        // replica's writes block) instead of growing primary memory. We ACK only
+        // after the frame is queued, so the replica won't advance past an
+        // unconsumed frame.
+        if ingest_tx.send(frame).await.is_err() {
+            return Err("identity ingest sink dropped".into());
+        }
+        last_seq = Some(seq);
+        send_delta_ack(write_half, seq).await?;
+    }
 }
 
 fn load_hive(config_dir: &Path) -> Result<HiveFile, IdentityError> {
@@ -6548,5 +7057,203 @@ mod tests {
             rows[0].get("registration_status").and_then(Value::as_str),
             Some("temporary")
         );
+    }
+
+    fn ilk_for(node_name: &str, ilk_id: &str) -> IlkRecord {
+        let hive = node_name.rsplit_once('@').map(|(_, h)| h).unwrap_or("");
+        IlkRecord {
+            ilk_id: ilk_id.to_string(),
+            ilk_type: "system".to_string(),
+            registration_status: "complete".to_string(),
+            tenant_id: "tnt:00000000-0000-0000-0000-000000000001".to_string(),
+            identification: json!({ "node_name": node_name, "hive_id": hive }),
+            definition: json!({}),
+            channels: vec![],
+            deleted_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn ilk_owning_hive_uses_node_name_suffix_then_hive_id() {
+        assert_eq!(
+            ilk_owning_hive(&ilk_for("SY.storage@worker1", "ilk:a")).as_deref(),
+            Some("worker1")
+        );
+        // Fallback to identification.hive_id when node_name carries no `@`.
+        let mut ilk = ilk_for("plain", "ilk:b");
+        ilk.identification = json!({ "node_name": "plain", "hive_id": "motherbee" });
+        assert_eq!(ilk_owning_hive(&ilk).as_deref(), Some("motherbee"));
+    }
+
+    #[test]
+    fn delta_authority_blocks_foreign_forge_and_tenants() {
+        let store = IdentityStore::default();
+        // A replica may push its own `@hive` ilk.
+        assert!(delta_authorized_for_hive(
+            &IdentityDelta::IlkUpsert { ilk: ilk_for("SY.storage@worker1", "ilk:w") },
+            "worker1",
+            &store
+        ));
+        // It may NOT forge a `@motherbee` or another hive's ilk.
+        assert!(!delta_authorized_for_hive(
+            &IdentityDelta::IlkUpsert { ilk: ilk_for("SY.storage@motherbee", "ilk:m") },
+            "worker1",
+            &store
+        ));
+        assert!(!delta_authorized_for_hive(
+            &IdentityDelta::IlkUpsert { ilk: ilk_for("SY.x@worker2", "ilk:w2") },
+            "worker1",
+            &store
+        ));
+        // Tenants are primary-authoritative — never accepted from a replica.
+        assert!(!delta_authorized_for_hive(
+            &IdentityDelta::TenantUpsert {
+                tenant: TenantRecord {
+                    tenant_id: "tnt:x".into(),
+                    name: "x".into(),
+                    domain: None,
+                    status: "active".into(),
+                    settings: json!({}),
+                    sponsor_tenant_id: None,
+                }
+            },
+            "worker1",
+            &store
+        ));
+        // IlkDelete authority resolves against the existing ilk's owner; an
+        // unknown id is rejected (cannot verify ownership).
+        let mut store2 = IdentityStore::default();
+        store2
+            .ilks
+            .insert("ilk:w".into(), ilk_for("SY.storage@worker1", "ilk:w"));
+        assert!(delta_authorized_for_hive(
+            &IdentityDelta::IlkDelete { ilk_id: "ilk:w".into() },
+            "worker1",
+            &store2
+        ));
+        assert!(!delta_authorized_for_hive(
+            &IdentityDelta::IlkDelete { ilk_id: "ilk:w".into() },
+            "worker2",
+            &store2
+        ));
+        assert!(!delta_authorized_for_hive(
+            &IdentityDelta::IlkDelete { ilk_id: "ilk:unknown".into() },
+            "worker1",
+            &store2
+        ));
+    }
+
+    #[test]
+    fn authority_rejects_ilk_id_collision_with_other_hive() {
+        let mut store = IdentityStore::default();
+        // motherbee owns ilk_id "ilk:shared".
+        store
+            .ilks
+            .insert("ilk:shared".into(), ilk_for("SY.storage@motherbee", "ilk:shared"));
+        // worker1 tries to hijack that ilk_id with a forged `@worker1` node_name.
+        let collide =
+            IdentityDelta::IlkUpsert { ilk: ilk_for("SY.evil@worker1", "ilk:shared") };
+        assert!(
+            !delta_authorized_for_hive(&collide, "worker1", &store),
+            "delta path must reject ilk_id collision"
+        );
+        // The snapshot/reconcile path must also skip it, leaving motherbee intact.
+        let deltas =
+            store.reconcile_hive_ilks("worker1", vec![ilk_for("SY.evil@worker1", "ilk:shared")]);
+        assert!(deltas.is_empty(), "reconcile must not overwrite foreign ilk_id");
+        assert_eq!(
+            ilk_owning_hive(store.ilks.get("ilk:shared").unwrap()).as_deref(),
+            Some("motherbee")
+        );
+    }
+
+    #[test]
+    fn reconcile_and_apply_never_delete_well_known_system_ilk() {
+        let mut store = IdentityStore::default();
+        // worker1's well-known system ilk (source = hive.system_nodes).
+        let mut sys = ilk_for("SY.identity@worker1", "ilk:sys");
+        sys.identification = json!({
+            "node_name": "SY.identity@worker1", "hive_id": "worker1", "source": "hive.system_nodes"
+        });
+        store.ilks.insert("ilk:sys".into(), sys);
+        // A forged snapshot that OMITS the system ilk must NOT reconcile-delete it
+        // (the mesh-DOS the reviewer flagged).
+        let deltas =
+            store.reconcile_hive_ilks("worker1", vec![ilk_for("SY.other@worker1", "ilk:other")]);
+        assert!(store.ilks.contains_key("ilk:sys"), "system ilk must survive reconcile");
+        assert!(store.ilks.contains_key("ilk:other"));
+        assert!(!deltas
+            .iter()
+            .any(|d| matches!(d, IdentityDelta::IlkDelete { ilk_id } if ilk_id == "ilk:sys")));
+        // apply_delta is the net: a direct IlkDelete of a well-known ilk is a no-op.
+        store.apply_delta(IdentityDelta::IlkDelete { ilk_id: "ilk:sys".into() });
+        assert!(store.ilks.contains_key("ilk:sys"), "apply_delta must not remove a system ilk");
+    }
+
+    #[test]
+    fn reconcile_hive_ilks_is_additive_and_handles_hard_delete() {
+        let mut store = IdentityStore::default();
+        // motherbee's own ilk must survive a worker1 reconcile untouched.
+        store
+            .ilks
+            .insert("ilk:mb".into(), ilk_for("SY.storage@motherbee", "ilk:mb"));
+        // worker1 had two; now publishes one unchanged + one new (the other was
+        // hard-deleted on the replica).
+        store
+            .ilks
+            .insert("ilk:w1a".into(), ilk_for("SY.a@worker1", "ilk:w1a"));
+        store
+            .ilks
+            .insert("ilk:w1b".into(), ilk_for("SY.b@worker1", "ilk:w1b"));
+        let incoming = vec![
+            ilk_for("SY.a@worker1", "ilk:w1a"),
+            ilk_for("SY.c@worker1", "ilk:w1c"),
+        ];
+        let deltas = store.reconcile_hive_ilks("worker1", incoming);
+
+        assert!(store.ilks.contains_key("ilk:mb"), "other hive untouched");
+        assert!(store.ilks.contains_key("ilk:w1a"));
+        assert!(store.ilks.contains_key("ilk:w1c"), "new ilk added");
+        assert!(!store.ilks.contains_key("ilk:w1b"), "absent ilk hard-removed");
+        // w1a is byte-identical -> no-op skipped; only w1c upsert + w1b delete.
+        let upserts = deltas
+            .iter()
+            .filter(|d| matches!(d, IdentityDelta::IlkUpsert { .. }))
+            .count();
+        let deletes = deltas
+            .iter()
+            .filter(|d| matches!(d, IdentityDelta::IlkDelete { .. }))
+            .count();
+        assert_eq!(upserts, 1);
+        assert_eq!(deletes, 1);
+        // A second identical reconcile is a pure no-op (no churn).
+        let again = store.reconcile_hive_ilks(
+            "worker1",
+            vec![
+                ilk_for("SY.a@worker1", "ilk:w1a"),
+                ilk_for("SY.c@worker1", "ilk:w1c"),
+            ],
+        );
+        assert!(again.is_empty(), "stable state produces no deltas");
+    }
+
+    #[test]
+    fn self_owned_ilks_includes_tombstones_and_excludes_other_hives() {
+        let mut store = IdentityStore::default();
+        store
+            .ilks
+            .insert("ilk:mb".into(), ilk_for("SY.storage@motherbee", "ilk:mb"));
+        store
+            .ilks
+            .insert("ilk:w".into(), ilk_for("SY.a@worker1", "ilk:w"));
+        let mut tomb = ilk_for("SY.b@worker1", "ilk:wt");
+        tomb.deleted_at_ms = Some(123);
+        store.ilks.insert("ilk:wt".into(), tomb);
+
+        let owned = store.self_owned_ilks("worker1");
+        assert_eq!(owned.len(), 2, "active + tombstone, both @worker1");
+        assert!(owned
+            .iter()
+            .all(|i| ilk_owning_hive(i).as_deref() == Some("worker1")));
     }
 }
