@@ -16,7 +16,7 @@ PG_URL="postgresql://${PG_USER}:${PG_PASS}@127.0.0.1:5432"
 ROOT_TENANT="tnt:00000000-0000-0000-0000-000000000001"
 HIVE_ID="$(awk -F': ' '/^hive_id:/{gsub(/"/,"",$2);print $2;exit}' /etc/fluxbee/hive.yaml 2>/dev/null || echo motherbee)"
 
-echo "== [1/4] postgresql + DB bootstrap =="
+echo "== [1/5] postgresql + DB bootstrap =="
 systemctl enable --now postgresql 2>/dev/null \
   || pg_ctlcluster "$(ls /usr/lib/postgresql/ 2>/dev/null | head -1)" main start 2>/dev/null || true
 sleep 2
@@ -28,11 +28,11 @@ for db in fluxbee fluxbee_identity fluxbee_storage; do
     || sudo -u postgres createdb -O "${PG_USER}" "${db}" 2>/dev/null || true
 done
 
-echo "== [2/4] start orchestrator (crash-loops until the secret lands) =="
+echo "== [2/5] start orchestrator (crash-loops until the secret lands) =="
 systemctl reset-failed sy-orchestrator 2>/dev/null || true
 systemctl restart sy-orchestrator
 
-echo "== [3/4] wait admin + vault_put postgres secret =="
+echo "== [3/5] wait admin + vault_put postgres secret =="
 for _ in $(seq 1 60); do curl -s -m3 "$ADMIN/hives" >/dev/null 2>&1 && break; sleep 2; done
 body="{\"key\":\"storage_postgres_url\",\"value\":{\"postgres_url\":\"$PG_URL\"},\"metadata\":{\"tenant_id\":\"$ROOT_TENANT\",\"resource_type\":\"postgres\"}}"
 for _ in $(seq 1 20); do
@@ -40,7 +40,17 @@ for _ in $(seq 1 20); do
   case "$r" in *'"status":"ok"'*) echo "  vault_put OK"; break;; *) sleep 3;; esac
 done
 
-echo "== [4/4] wait hive ready =="
+# The DB consumers (storage/identity) connect to postgres at startup; if they
+# came up before the secret was in the vault they stay "not initialized" until
+# they reconnect. Restart them so they pick up the secret, then re-kick the
+# orchestrator (its sy-storage readiness gate then passes).
+echo "== [4/5] restart secret consumers + orchestrator =="
+systemctl restart sy-vault sy-storage sy-identity 2>/dev/null || true
+sleep 5
+systemctl reset-failed sy-orchestrator 2>/dev/null || true
+systemctl restart sy-orchestrator
+
+echo "== [5/5] wait hive ready =="
 for _ in $(seq 1 60); do
   curl -s -m3 "$ADMIN/hives" 2>/dev/null | grep -q '"status":"ok"' && { echo "  HIVE READY"; break; }
   sleep 2
