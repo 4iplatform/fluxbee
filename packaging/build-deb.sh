@@ -67,6 +67,43 @@ json.dump({"schema_version": 1, "components": comps},
 print(f"manifest: {len(comps)} components")
 PY
 
+# Vendor runtime: bundle the syncthing binary + a vendor manifest so the
+# orchestrator blob-sync watchdog is satisfied (without it the orchestrator WARNs
+# every ~5s and blob/dist sync is non-operational). syncthing self-generates its
+# config.xml in --home at runtime, so only the binary is strictly required; the
+# config.xml template is bundled too if the vendor bundle ships one.
+ST_SRC=""
+for c in vendor/syncthing/syncthing vendor/syncthing-linux-amd64-*/syncthing vendor/*/syncthing; do
+  [ -x "$c" ] && { ST_SRC="$c"; break; }
+done
+if [ -n "$ST_SRC" ]; then
+  install -d "$DEST/var/lib/fluxbee/dist/vendor/syncthing"
+  install -m0755 "$ST_SRC" "$DEST/var/lib/fluxbee/dist/vendor/syncthing/syncthing"
+  ST_CFG=""
+  for c in "$(dirname "$ST_SRC")/config.xml" vendor/syncthing/config.xml; do
+    [ -f "$c" ] && { ST_CFG="$c"; break; }
+  done
+  [ -n "$ST_CFG" ] && install -m0644 "$ST_CFG" "$DEST/var/lib/fluxbee/dist/vendor/syncthing/config.xml"
+  python3 - "$DEST/var/lib/fluxbee/dist/vendor" "$ST_SRC" "$BUILD_ID" "${ST_CFG:-}" <<'PY'
+import json, hashlib, os, sys, re
+vroot, st_src, build_id, st_cfg = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+def comp(path, rel):
+    b = open(path, "rb").read()
+    return {"upstream_version": ver, "hash": "sha256:" + hashlib.sha256(b).hexdigest(),
+            "size": len(b), "path": rel}
+m = re.search(r"-v([0-9][A-Za-z0-9.+-]*)", os.path.basename(os.path.dirname(st_src)))
+ver = m.group(1) if m else "repo-seeded"
+comps = {"syncthing": comp(st_src, "syncthing/syncthing")}
+if st_cfg:
+    comps["syncthing_config"] = comp(st_cfg, "syncthing/config.xml")
+json.dump({"schema_version": 1, "version": int(build_id), "components": comps},
+          open(os.path.join(vroot, "manifest.json"), "w"), indent=2, sort_keys=True)
+print("vendor manifest: syncthing %s (%d components)" % (ver, len(comps)))
+PY
+else
+  echo "WARN: no vendored syncthing under vendor/ — blob sync will be non-operational"
+fi
+
 # systemd units (mirrors scripts/install.sh install_unit). Not enabled here; the
 # postinst enables only sy-orchestrator, which brings up the rest (its bootstrap
 # starts rt-gateway + the SY services in the Model D' order).
@@ -82,8 +119,10 @@ for u in "${UNITS[@]}"; do gen_unit "$u"; done
 gen_unit sy-frontdesk-gov "network.target rt-gateway.service sy-identity.service" \
   "rt-gateway.service sy-identity.service"
 
-# config template + first-boot helper
-[ -f config/hive.yaml ] && install -m0644 config/hive.yaml "$DEST/etc/fluxbee/hive.yaml.example" || true
+# config template + first-boot helper. The packaging template is a clean
+# fresh-motherbee config (no lab uplink; wan.mtls set) — distinct from the dev
+# config/hive.yaml the lab uses.
+install -m0644 packaging/hive.yaml.example "$DEST/etc/fluxbee/hive.yaml.example"
 install -m0755 packaging/fluxbee-firstboot "$DEST/usr/share/fluxbee/fluxbee-firstboot"
 ln -sf ../share/fluxbee/fluxbee-firstboot "$DEST/usr/bin/fluxbee-firstboot"
 

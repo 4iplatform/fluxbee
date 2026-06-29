@@ -42,11 +42,16 @@ done
 
 # The DB consumers (storage/identity) connect to postgres at startup; if they
 # came up before the secret was in the vault they stay "not initialized" until
-# they reconnect. Restart them so they pick up the secret, then re-kick the
-# orchestrator (its sy-storage readiness gate then passes).
-echo "== [4/5] restart secret consumers + orchestrator =="
-systemctl restart sy-vault sy-storage sy-identity 2>/dev/null || true
-sleep 5
+# they reconnect. Restart them so they re-register with the router, THEN restart
+# vault last so its VAULT_SECRET_CHANGED broadcast reaches the already-registered
+# consumers (Model D' vault-last ordering — broadcasts only reach nodes that are
+# registered at the moment of emission). Finally re-kick the orchestrator so its
+# sy-storage readiness gate passes.
+echo "== [4/5] reconnect DB consumers (Model D': consumers first, vault last) =="
+systemctl restart sy-storage sy-identity 2>/dev/null || true
+sleep 4
+systemctl restart sy-vault 2>/dev/null || true
+sleep 4
 systemctl reset-failed sy-orchestrator 2>/dev/null || true
 systemctl restart sy-orchestrator
 
@@ -55,5 +60,5 @@ for _ in $(seq 1 60); do
   curl -s -m3 "$ADMIN/hives" 2>/dev/null | grep -q '"status":"ok"' && { echo "  HIVE READY"; break; }
   sleep 2
 done
-echo -n "services: "; systemctl is-active rt-gateway sy-orchestrator sy-identity sy-admin sy-vault 2>&1 | tr '\n' ' '; echo
+echo -n "services: "; systemctl is-active rt-gateway sy-orchestrator sy-identity sy-admin sy-vault sy-storage sy-architect 2>&1 | tr '\n' ' '; echo
 echo "first-boot done."
