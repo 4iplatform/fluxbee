@@ -1,0 +1,34 @@
+#!/bin/sh
+# fluxbee .deb postinst: system user, dirs, units. Does NOT start services — the
+# orchestrator crash-loops until the first-boot secret lands, so bringing it up
+# is `fluxbee-firstboot`'s job (postgres + vault_put). Only sy-orchestrator is
+# enabled; its bootstrap brings up rt-gateway + the SY services in order.
+set -e
+
+if ! getent passwd fluxbee >/dev/null 2>&1; then
+    adduser --system --group --home /var/lib/fluxbee --no-create-home \
+        --shell /usr/sbin/nologin fluxbee >/dev/null 2>&1 || true
+fi
+
+install -d /etc/fluxbee
+install -d -m 0700 /var/lib/fluxbee/ssh
+install -d -m 0700 /var/lib/fluxbee/tls
+for d in state/nodes state/cookbook hives opa/current opa/staged opa/backup \
+         wf-rules modules blob syncthing nats dist/runtimes dist/vendor; do
+    install -d "/var/lib/fluxbee/$d"
+done
+install -d /run/fluxbee/routers
+chown -R fluxbee:fluxbee /var/lib/fluxbee/syncthing /var/lib/fluxbee/blob 2>/dev/null || true
+
+# Seed a config if none exists yet (the operator edits this before first-boot).
+if [ ! -f /etc/fluxbee/hive.yaml ] && [ -f /etc/fluxbee/hive.yaml.example ]; then
+    cp /etc/fluxbee/hive.yaml.example /etc/fluxbee/hive.yaml
+fi
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+    systemctl enable sy-orchestrator.service >/dev/null 2>&1 || true
+fi
+
+echo "fluxbee installed. Edit /etc/fluxbee/hive.yaml, then run:  sudo fluxbee-firstboot"
+exit 0

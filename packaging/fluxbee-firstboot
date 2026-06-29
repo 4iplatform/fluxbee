@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Fluxbee first-boot orchestration (idempotent). The orchestrator can't stabilize
+# until the postgres secret is in the vault, but the vault needs the orchestrator
+# up to receive it (Model D' chicken-egg). This script: bootstraps postgres,
+# starts the orchestrator (it crash-loops), waits for the admin API, vault_puts
+# the postgres secret, and waits for the hive to go ready.
+#
+#   sudo fluxbee-firstboot
+# Env: FLUXBEE_DB_USER/FLUXBEE_DB_PASSWORD (default fluxbee/fluxbee),
+#      FLUXBEE_ADMIN (default 127.0.0.1:8080).
+set -uo pipefail
+ADMIN="${FLUXBEE_ADMIN:-127.0.0.1:8080}"
+PG_USER="${FLUXBEE_DB_USER:-fluxbee}"
+PG_PASS="${FLUXBEE_DB_PASSWORD:-fluxbee}"
+PG_URL="postgresql://${PG_USER}:${PG_PASS}@127.0.0.1:5432"
+ROOT_TENANT="tnt:00000000-0000-0000-0000-000000000001"
+HIVE_ID="$(awk -F': ' '/^hive_id:/{gsub(/"/,"",$2);print $2;exit}' /etc/fluxbee/hive.yaml 2>/dev/null || echo motherbee)"
+
+echo "== [1/4] postgresql + DB bootstrap =="
+systemctl enable --now postgresql 2>/dev/null \
+  || pg_ctlcluster "$(ls /usr/lib/postgresql/ 2>/dev/null | head -1)" main start 2>/dev/null || true
+sleep 2
+sudo -u postgres psql -v ON_ERROR_STOP=0 >/dev/null 2>&1 <<SQL || true
+DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='${PG_USER}') THEN CREATE ROLE ${PG_USER} LOGIN PASSWORD '${PG_PASS}'; END IF; END \$\$;
+SQL
+for db in fluxbee fluxbee_identity fluxbee_storage; do
+  sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${db}'" 2>/dev/null | grep -q 1 \
+    || sudo -u postgres createdb -O "${PG_USER}" "${db}" 2>/dev/null || true
+done
+
+echo "== [2/4] start orchestrator (crash-loops until the secret lands) =="
+systemctl reset-failed sy-orchestrator 2>/dev/null || true
+systemctl restart sy-orchestrator
+
+echo "== [3/4] wait admin + vault_put postgres secret =="
+for _ in $(seq 1 60); do curl -s -m3 "$ADMIN/hives" >/dev/null 2>&1 && break; sleep 2; done
+body="{\"key\":\"storage_postgres_url\",\"value\":{\"postgres_url\":\"$PG_URL\"},\"metadata\":{\"tenant_id\":\"$ROOT_TENANT\",\"resource_type\":\"postgres\"}}"
+for _ in $(seq 1 20); do
+  r="$(curl -s -m10 -X POST "$ADMIN/hives/$HIVE_ID/vault/secrets" -H 'content-type: application/json' -d "$body" 2>/dev/null || true)"
+  case "$r" in *'"status":"ok"'*) echo "  vault_put OK"; break;; *) sleep 3;; esac
+done
+
+echo "== [4/4] wait hive ready =="
+for _ in $(seq 1 60); do
+  curl -s -m3 "$ADMIN/hives" 2>/dev/null | grep -q '"status":"ok"' && { echo "  HIVE READY"; break; }
+  sleep 2
+done
+echo -n "services: "; systemctl is-active rt-gateway sy-orchestrator sy-identity sy-admin sy-vault 2>&1 | tr '\n' ' '; echo
+echo "first-boot done."
