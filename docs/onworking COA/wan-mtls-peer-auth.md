@@ -85,9 +85,24 @@ implementa acá, pero el diseño no lo cierra.
 - **Revocación** (CRL/OCSP) — por ahora, rotación de CA + re-emisión.
 - **RT.edge ingress** — usa esta CA, spec aparte.
 
-## Validación (lab)
-motherbee + worker1: con `wan.mtls=required` y certs emitidos, el WAN levanta y
-la malla rutea (LSA, cross-hive). Test adversarial: un peer sin cert válido (o con
-cert de otro hive) es **rechazado** en el handshake. `permissive` deja convivir un
-nodo plano y uno TLS durante el rollout. Tests unitarios: verifier (CA-firmado +
-CN==hive), emisión de leaf, detección TLS-vs-plano.
+## Validación (lab) — HECHA 2026-06-29
+motherbee + worker1, `wan.mtls=required` en ambos:
+- CA dedicada generada en motherbee (`/var/lib/fluxbee/tls/ca`); leaf de motherbee
+  (`CN=motherbee`, `SAN DNS:motherbee`) y de worker1 (`CN=worker1`) firmados por
+  la CA. El leaf de worker1 se emitió con `examples/mesh_cert_tool` desde la CA
+  (el worker del lab ya estaba provisionado sin certs; `add_hive` lo haría en un
+  alta nueva).
+- Ambos routers reportan **`wan mtls mode = required`** (certs cargados, no
+  degradado). La malla levanta sobre mTLS: motherbee ve `worker1: connected` (el
+  HELLO/LSA completó con `required` activo, que rechaza plano).
+- **Adversarial**: un peer **plano** a motherbee:9000 recibe un **TLS alert**
+  (`0x15 03 03 …`, fatal) en el handshake — nunca llega al HELLO. (mesh_tls unit
+  tests ya cubren además el rechazo de cert de **CA ajena** y el round-trip mutuo.)
+- Re-handshake: reiniciar el router de worker1 reconecta limpio.
+
+Gotcha de deploy (anotado): al desplegar binarios nuevos al lab/VM hay que
+regenerar `dist/core/manifest.json` (sha256+size) o el orchestrator crash-loopea
+en la validación de manifest **antes** de generar la CA.
+
+Tests unitarios (mesh_tls, 5): verifier CA-only (handshake mutuo + rechazo de CA
+ajena), emisión/reload de CA, extracción de hive del cert.
