@@ -369,6 +369,42 @@ impl Router {
         });
 
         if self.cfg.is_gateway {
+            // Load WAN mTLS material when configured. Missing certs degrade to
+            // plaintext (effective mode "disabled") with a loud WARN, so a node
+            // mid-rollout never bricks the mesh.
+            let (wan_tls, effective_mtls_mode) = if self.cfg.wan_mtls_mode != "disabled" {
+                crate::mesh_tls::install_crypto_provider();
+                match crate::mesh_tls::MeshTlsMaterial::load_from_dir(&self.cfg.tls_dir) {
+                    Ok(mat) => match (mat.server_config(), mat.client_config()) {
+                        (Ok(sc), Ok(cc)) => (
+                            Some(WanTls {
+                                acceptor: tokio_rustls::TlsAcceptor::from(sc),
+                                connector: tokio_rustls::TlsConnector::from(cc),
+                            }),
+                            self.cfg.wan_mtls_mode.clone(),
+                        ),
+                        _ => {
+                            tracing::warn!(
+                                mode = %self.cfg.wan_mtls_mode,
+                                "wan.mtls set but TLS config build failed; WAN runs plaintext"
+                            );
+                            (None, "disabled".to_string())
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            dir = %self.cfg.tls_dir.display(),
+                            mode = %self.cfg.wan_mtls_mode,
+                            "wan.mtls set but no TLS material on disk; WAN runs plaintext (re-run add_hive to issue certs)"
+                        );
+                        (None, "disabled".to_string())
+                    }
+                }
+            } else {
+                (None, "disabled".to_string())
+            };
+            tracing::info!(mode = %effective_mtls_mode, "wan mtls mode");
             let ctx = Arc::new(WanContext {
                 router_uuid: self.cfg.router_uuid,
                 router_name: self.cfg.router_l2_name.clone(),
@@ -396,6 +432,8 @@ impl Router {
                 opa: Arc::clone(&self.opa),
                 wan_session_epochs: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 lsa_reject_counters: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                wan_mtls_mode: effective_mtls_mode,
+                wan_tls,
             });
             if let Some(listen) = self.cfg.wan_listen.clone() {
                 let ctx_listen = Arc::clone(&ctx);
@@ -2349,11 +2387,86 @@ async fn wan_listen_loop(listen_addr: String, ctx: Arc<WanContext>) {
         };
         let ctx = Arc::clone(&ctx);
         tokio::spawn(async move {
-            if let Err(err) = handle_wan_connection(stream, ctx, false).await {
+            if let Err(err) = accept_wan_connection(stream, ctx).await {
                 tracing::warn!("wan connection error: {err}");
             }
         });
     }
+}
+
+/// Server side: terminate TLS (or not) per the effective mTLS mode, then hand the
+/// stream + the TLS-verified peer hive to `handle_wan_connection`.
+async fn accept_wan_connection(stream: TcpStream, ctx: Arc<WanContext>) -> Result<(), RouterError> {
+    match ctx.wan_mtls_mode.as_str() {
+        "required" => {
+            let (tls, hive) = tls_accept(stream, &ctx).await?;
+            handle_wan_connection(tls, hive, ctx, false).await
+        }
+        "permissive" => {
+            // Detect TLS vs plaintext without consuming: a TLS record starts with
+            // 0x16 (handshake). Lets old (plaintext) and new (TLS) peers coexist
+            // during rollout.
+            let mut probe = [0u8; 1];
+            let n = stream.peek(&mut probe).await?;
+            if n >= 1 && probe[0] == 0x16 {
+                let (tls, hive) = tls_accept(stream, &ctx).await?;
+                handle_wan_connection(tls, hive, ctx, false).await
+            } else {
+                handle_wan_connection(stream, None, ctx, false).await
+            }
+        }
+        _ => handle_wan_connection(stream, None, ctx, false).await,
+    }
+}
+
+/// Accept a TLS connection and extract the client's authenticated hive_id from
+/// its (already CA-verified) certificate.
+async fn tls_accept(
+    stream: TcpStream,
+    ctx: &Arc<WanContext>,
+) -> Result<(tokio_rustls::server::TlsStream<TcpStream>, Option<String>), RouterError> {
+    let acceptor = ctx
+        .wan_tls
+        .as_ref()
+        .ok_or_else(|| RouterError::Startup("wan.mtls active but no TLS material".to_string()))?
+        .acceptor
+        .clone();
+    let tls = acceptor.accept(stream).await?;
+    let hive = tls
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|c| c.first())
+        .and_then(crate::mesh_tls::peer_hive_from_cert);
+    Ok((tls, hive))
+}
+
+/// Client side: initiate TLS (or not) per the effective mTLS mode, then hand the
+/// stream + the TLS-verified server hive to `handle_wan_connection`. The client
+/// uses TLS whenever the mode is not "disabled" (its effective mode is already
+/// "disabled" if no TLS material loaded). Rollout order is server-first: a new
+/// (TLS) client only appears after its uplink is at least `permissive`.
+async fn connect_wan_connection(stream: TcpStream, ctx: &Arc<WanContext>) -> Result<(), RouterError> {
+    if ctx.wan_mtls_mode == "disabled" {
+        return handle_wan_connection(stream, None, Arc::clone(ctx), true).await;
+    }
+    let connector = ctx
+        .wan_tls
+        .as_ref()
+        .ok_or_else(|| RouterError::Startup("wan.mtls active but no TLS material".to_string()))?
+        .connector
+        .clone();
+    // The CA-only verifier ignores the server name (identity is bound below by
+    // comparing the server's cert hive_id to its HELLO); use a fixed placeholder.
+    let server_name = rustls::pki_types::ServerName::try_from("mesh").expect("static name");
+    let tls = connector.connect(server_name, stream).await?;
+    let hive = tls
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|c| c.first())
+        .and_then(crate::mesh_tls::peer_hive_from_cert);
+    handle_wan_connection(tls, hive, Arc::clone(ctx), true).await
 }
 
 async fn wan_connect_loop(address: String, ctx: Arc<WanContext>) {
@@ -2377,7 +2490,7 @@ async fn wan_connect_loop(address: String, ctx: Arc<WanContext>) {
                 }
                 failures = 0;
                 backoff_secs = WAN_RETRY_BASE_SECS;
-                if let Err(err) = handle_wan_connection(stream, Arc::clone(&ctx), true).await {
+                if let Err(err) = connect_wan_connection(stream, &ctx).await {
                     tracing::warn!("wan uplink error: {err}");
                     failures = failures.saturating_add(1);
                 }
@@ -2408,12 +2521,16 @@ async fn wan_connect_loop(address: String, ctx: Arc<WanContext>) {
     }
 }
 
-async fn handle_wan_connection(
-    stream: TcpStream,
+async fn handle_wan_connection<S>(
+    stream: S,
+    verified_peer_hive: Option<String>,
     ctx: Arc<WanContext>,
     initiator: bool,
-) -> Result<(), RouterError> {
-    let (mut reader, mut writer) = stream.into_split();
+) -> Result<(), RouterError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
@@ -2473,6 +2590,22 @@ async fn handle_wan_connection(
         );
         writer_task.abort();
         return Ok(());
+    }
+
+    // mTLS: bind the cryptographically-verified peer identity (its cert hive_id)
+    // to the hive_id it claims in the HELLO. The TLS layer already proved the peer
+    // holds a CA-signed cert; this stops a valid mesh member from claiming a
+    // DIFFERENT hive_id in the protocol layer (cross-hive impersonation).
+    if let Some(ref verified) = verified_peer_hive {
+        if verified != &peer_hello.hive_id {
+            tracing::warn!(
+                claimed_hive = %peer_hello.hive_id,
+                cert_hive = %verified,
+                "wan peer rejected: HELLO hive_id does not match its TLS certificate"
+            );
+            writer_task.abort();
+            return Ok(());
+        }
     }
 
     if !initiator {
@@ -3876,6 +4009,17 @@ struct WanContext {
     opa: Arc<Mutex<OpaResolver>>,
     wan_session_epochs: Arc<Mutex<std::collections::HashMap<String, u64>>>,
     lsa_reject_counters: Arc<Mutex<std::collections::HashMap<String, u64>>>,
+    /// Effective WAN mTLS mode: "disabled" | "permissive" | "required". Forced to
+    /// "disabled" when `wan_tls` is None (certs missing) so a node without certs
+    /// never bricks the mesh mid-rollout.
+    wan_mtls_mode: String,
+    /// Loaded TLS material (acceptor/connector). None = plaintext WAN.
+    wan_tls: Option<WanTls>,
+}
+
+struct WanTls {
+    acceptor: tokio_rustls::TlsAcceptor,
+    connector: tokio_rustls::TlsConnector,
 }
 
 #[derive(Clone, Debug)]

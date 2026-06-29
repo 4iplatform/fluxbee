@@ -152,6 +152,15 @@ pub struct MeshTlsMaterial {
 }
 
 impl MeshTlsMaterial {
+    /// Load a hive's TLS material from a directory holding `ca.crt`, `cert.crt`,
+    /// and `cert.key` (what `add_hive` distributes to `/var/lib/fluxbee/tls/<hive>`).
+    pub fn load_from_dir(dir: &std::path::Path) -> Result<Self, MeshTlsError> {
+        let ca = std::fs::read_to_string(dir.join("ca.crt"))?;
+        let cert = std::fs::read_to_string(dir.join("cert.crt"))?;
+        let key = std::fs::read_to_string(dir.join("cert.key"))?;
+        Self::from_pem(&cert, &key, &ca)
+    }
+
     pub fn from_pem(
         leaf_cert_pem: &str,
         leaf_key_pem: &str,
