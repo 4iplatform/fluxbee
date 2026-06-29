@@ -183,12 +183,77 @@ impl MeshTlsMaterial {
         Ok(Arc::new(cfg))
     }
 
-    /// Client config: present our leaf, verify the server cert against the CA.
+    /// Client config: present our leaf, verify the server cert chains to the
+    /// mesh CA — but DO NOT check the server name (the WAN client doesn't know
+    /// the uplink's hive_id ahead of the handshake). Identity is bound at the
+    /// application layer: after the handshake, the caller compares the server's
+    /// cert hive_id (`peer_hive_from_cert`) to the hive_id it claims in the HELLO.
     pub fn client_config(&self) -> Result<Arc<ClientConfig>, MeshTlsError> {
+        let provider = rustls::crypto::ring::default_provider();
+        let verifier = Arc::new(CaOnlyServerVerifier {
+            roots: self.ca_roots.clone(),
+            supported: provider.signature_verification_algorithms,
+        });
         let cfg = ClientConfig::builder()
-            .with_root_certificates((*self.ca_roots).clone())
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
             .with_client_auth_cert(self.leaf_chain.clone(), self.leaf_key.clone_key())?;
         Ok(Arc::new(cfg))
+    }
+}
+
+/// Client-side verifier that requires the server cert to chain to the mesh CA
+/// but skips the server-name (SAN) check. "Dangerous" only in that it omits the
+/// hostname check that a public-PKI TLS client would do — here the identity is
+/// the cert's CA-signed hive_id, bound to the HELLO at the app layer, not a DNS
+/// hostname. The chain + signature verification (the part that proves "issued by
+/// our CA") is fully enforced via webpki.
+#[derive(Debug)]
+struct CaOnlyServerVerifier {
+    roots: Arc<RootCertStore>,
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl rustls::client::danger::ServerCertVerifier for CaOnlyServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let cert = rustls::server::ParsedCertificate::try_from(end_entity)?;
+        rustls::client::verify_server_cert_signed_by_trust_anchor(
+            &cert,
+            &self.roots,
+            intermediates,
+            now,
+            self.supported.all,
+        )?;
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported.supported_schemes()
     }
 }
 
@@ -256,6 +321,77 @@ mod tests {
         assert!(mat.client_config().is_ok());
         let certs = certs_from_pem(&leaf.cert_pem).unwrap();
         assert_eq!(peer_hive_from_cert(&certs[0]).as_deref(), Some("egress1"));
+    }
+
+    #[tokio::test]
+    async fn mtls_handshake_round_trips_and_exposes_peer_identity() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::{TlsAcceptor, TlsConnector};
+        install_crypto_provider();
+        let ca = MeshCa::generate().unwrap();
+        let mb = ca.issue_leaf("motherbee").unwrap();
+        let w1 = ca.issue_leaf("worker1").unwrap();
+        let server_mat =
+            MeshTlsMaterial::from_pem(&mb.cert_pem, &mb.key_pem, ca.ca_cert_pem()).unwrap();
+        let client_mat =
+            MeshTlsMaterial::from_pem(&w1.cert_pem, &w1.key_pem, ca.ca_cert_pem()).unwrap();
+        let acceptor = TlsAcceptor::from(server_mat.server_config().unwrap());
+        let connector = TlsConnector::from(client_mat.client_config().unwrap());
+        let (client_io, server_io) = tokio::io::duplex(8192);
+
+        let server = tokio::spawn(async move {
+            let mut tls = acceptor.accept(server_io).await.expect("server handshake");
+            let certs = tls.get_ref().1.peer_certificates().unwrap().to_vec();
+            let hive = peer_hive_from_cert(&certs[0]).unwrap();
+            // Post-handshake ping/pong over the encrypted channel keeps both
+            // streams alive through the full handshake and proves data flows.
+            let mut buf = [0u8; 1];
+            tls.read_exact(&mut buf).await.unwrap();
+            tls.write_all(b"y").await.unwrap();
+            hive
+        });
+        let client = tokio::spawn(async move {
+            // CA-only verifier ignores the server name; any valid DNS name works.
+            let name = rustls::pki_types::ServerName::try_from("mesh").unwrap();
+            let mut tls = connector.connect(name, client_io).await.expect("client handshake");
+            let certs = tls.get_ref().1.peer_certificates().unwrap().to_vec();
+            let hive = peer_hive_from_cert(&certs[0]).unwrap();
+            tls.write_all(b"x").await.unwrap();
+            let mut buf = [0u8; 1];
+            tls.read_exact(&mut buf).await.unwrap();
+            hive
+        });
+
+        // mutual auth succeeded; each side sees the OTHER's hive identity.
+        assert_eq!(server.await.unwrap(), "worker1", "server sees the client hive");
+        assert_eq!(client.await.unwrap(), "motherbee", "client sees the server hive");
+    }
+
+    #[tokio::test]
+    async fn mtls_handshake_rejects_cert_from_a_foreign_ca() {
+        use tokio_rustls::{TlsAcceptor, TlsConnector};
+        install_crypto_provider();
+        let mesh_ca = MeshCa::generate().unwrap();
+        let attacker_ca = MeshCa::generate().unwrap(); // different CA
+        let mb = mesh_ca.issue_leaf("motherbee").unwrap();
+        // Attacker presents a cert signed by a CA the mesh does NOT trust.
+        let forged = attacker_ca.issue_leaf("worker1").unwrap();
+        let server_mat =
+            MeshTlsMaterial::from_pem(&mb.cert_pem, &mb.key_pem, mesh_ca.ca_cert_pem()).unwrap();
+        let client_mat =
+            MeshTlsMaterial::from_pem(&forged.cert_pem, &forged.key_pem, mesh_ca.ca_cert_pem())
+                .unwrap();
+        let acceptor = TlsAcceptor::from(server_mat.server_config().unwrap());
+        let connector = TlsConnector::from(client_mat.client_config().unwrap());
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move { acceptor.accept(server_io).await.is_ok() });
+        let client = tokio::spawn(async move {
+            let name = rustls::pki_types::ServerName::try_from("mesh").unwrap();
+            connector.connect(name, client_io).await.is_ok()
+        });
+        // The server must reject the attacker's foreign-CA client cert.
+        assert!(!server.await.unwrap(), "foreign-CA client cert must be rejected");
+        let _ = client.await;
     }
 
     #[test]
