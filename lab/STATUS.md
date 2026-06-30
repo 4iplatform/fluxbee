@@ -126,6 +126,17 @@ y el flujo de creds end-to-end.
 
 ## Para investigar (anotado 2026-06-26)
 
+- **Vista de ilks por hive — RESUELTO (2026-06-29).** El sync bidireccional
+  (opción 1) está **implementado y validado en el lab**: `DELTA_PUBLISH` (replica
+  empuja sus `@hive` ilks → motherbee mergea additivo + re-broadcastea) + beat de
+  reconciliación + authority por-hive + protección de system ilks + canal bounded
+  + retry de ACK. `GET /hives/motherbee/identity/ilks` pasó de **12 → 19**.
+  Revisión adversarial (5 lentes): 1 blocker + 3 majors, todos cerrados; ataque de
+  impersonación rechazado en el lab. Detalle en
+  [`docs/onworking COA/ilk-bidirectional-sync.md`](../docs/onworking%20COA/ilk-bidirectional-sync.md).
+  Residual (follow-up): peer-auth real de `:9100` (gap pre-existente, también para READ).
+  El diagnóstico original que sigue:
+
 - **Vista de ilks por hive — DIAGNOSTICADO (2026-06-26).** Síntoma: `worker1`
   devuelve **19** (7 propios + 12 de `motherbee`), `motherbee` devuelve **12**
   (solo los propios). **Causa raíz: la replicación de SY.identity es one-way

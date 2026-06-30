@@ -14,3 +14,4 @@ nodes/io/target
 .DS_Store
 /local-playground/
 /tmp/
+/dist/

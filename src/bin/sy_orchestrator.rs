@@ -57,6 +57,8 @@ use json_router::{
 type OrchestratorError = Box<dyn std::error::Error + Send + Sync>;
 
 const MOTHERBEE_SSH_KEY_PATH: &str = "/var/lib/fluxbee/ssh/motherbee.key";
+const MESH_TLS_BASE_DIR: &str = "/var/lib/fluxbee/tls";
+const MESH_CA_DIR: &str = "/var/lib/fluxbee/tls/ca";
 const PRIMARY_HIVE_ID: &str = "motherbee";
 const ORCH_SUDOERS_PATH: &str = "/etc/sudoers.d/fluxbee-orchestrator";
 const ORCH_SSH_GATE_PATH: &str = "/usr/local/bin/fluxbee-ssh-gate.sh";
@@ -795,6 +797,235 @@ async fn run_system_worker(
     }
 }
 
+/// Write a secret file owner-only from creation (no world-readable window).
+fn write_secret_file_0600(path: &Path, contents: &str) -> Result<(), OrchestratorError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(contents.as_bytes())?;
+    Ok(())
+}
+
+/// Motherbee: ensure the dedicated mesh CA exists (load from disk, or generate +
+/// persist). The CA key is the root of WAN mTLS trust (kept 0600 under
+/// MESH_CA_DIR); it is NOT derived from the SSH key (isolation).
+fn ensure_mesh_ca() -> Result<json_router::mesh_tls::MeshCa, OrchestratorError> {
+    use json_router::mesh_tls::MeshCa;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = Path::new(MESH_CA_DIR);
+    fs::create_dir_all(dir)?;
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    let ca_crt = dir.join("ca.crt");
+    let ca_key = dir.join("ca.key");
+    let load = || {
+        MeshCa::from_pem(
+            &fs::read_to_string(&ca_crt)?,
+            &fs::read_to_string(&ca_key)?,
+        )
+        .map_err(|e| OrchestratorError::from(format!("load mesh CA: {e}")))
+    };
+    if ca_crt.exists() && ca_key.exists() {
+        return load();
+    }
+    // Generate, then atomically claim ca.key with O_EXCL so concurrent callers
+    // (boot + multiple add_hive flows) cannot each generate a different CA and
+    // orphan already-distributed leaves. The winner persists its CA; a loser
+    // (create_new fails: another won) discards its generated CA and reloads.
+    let ca = MeshCa::generate().map_err(|e| format!("generate mesh CA: {e}"))?;
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&ca_key)
+    {
+        Ok(mut f) => {
+            f.write_all(ca.ca_key_pem().as_bytes())?;
+            fs::write(&ca_crt, ca.ca_cert_pem())?;
+            tracing::info!("generated dedicated mesh CA");
+            Ok(ca)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Another caller won; wait briefly for it to finish writing ca.crt.
+            for _ in 0..40 {
+                if ca_crt.exists() && ca_key.exists() {
+                    if let Ok(loaded) = load() {
+                        return Ok(loaded);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            load()
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Write a hive's TLS material (ca.crt + leaf cert/key) into the LOCAL
+/// `/var/lib/fluxbee/tls/<hive_id>/` — used for motherbee's own material so its
+/// router can present a cert.
+fn write_local_hive_tls(
+    ca: &json_router::mesh_tls::MeshCa,
+    hive_id: &str,
+) -> Result<(), OrchestratorError> {
+    let leaf = ca.issue_leaf(hive_id).map_err(|e| format!("issue leaf: {e}"))?;
+    let dir = Path::new(MESH_TLS_BASE_DIR).join(hive_id);
+    fs::create_dir_all(&dir)?;
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    fs::write(dir.join("ca.crt"), ca.ca_cert_pem())?;
+    fs::write(dir.join("cert.crt"), &leaf.cert_pem)?;
+    write_secret_file_0600(&dir.join("cert.key"), &leaf.key_pem)?;
+    Ok(())
+}
+
+/// Motherbee boot: ensure the mesh CA + motherbee's own TLS material exist before
+/// the router starts. Idempotent; best-effort (a failure only means WAN mTLS is
+/// unavailable until fixed, not a boot abort). Pre-stages certs so flipping
+/// `wan.mtls` to permissive/required is instant.
+fn ensure_motherbee_mesh_tls(hive_id: &str) {
+    match ensure_mesh_ca() {
+        Ok(ca) => {
+            if let Err(err) = write_local_hive_tls(&ca, hive_id) {
+                tracing::warn!(error = %err, "failed to write motherbee mesh TLS material");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "mesh CA init failed; WAN mTLS unavailable");
+        }
+    }
+}
+
+/// Motherbee boot: ensure the SSH bootstrap key the orchestrator uses to reach
+/// new hives (`add_hive`, key-first) exists. Generated here — not at package
+/// install — so a motherbee provisioned by any path (e.g. the .deb, whose
+/// postinst only creates the dir) has the key before the first `add_hive`.
+/// Idempotent; best-effort (a failure only blocks add_hive, not boot).
+fn ensure_motherbee_ssh_key() {
+    let key = Path::new(MOTHERBEE_SSH_KEY_PATH);
+    if key.exists() {
+        return;
+    }
+    if let Some(dir) = key.parent() {
+        if let Err(err) = fs::create_dir_all(dir) {
+            tracing::warn!(error = %err, "failed to create ssh dir for motherbee key");
+            return;
+        }
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+    match Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-q", "-f", MOTHERBEE_SSH_KEY_PATH])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            let _ = fs::set_permissions(key, fs::Permissions::from_mode(0o600));
+            let pub_path = format!("{MOTHERBEE_SSH_KEY_PATH}.pub");
+            let _ = fs::set_permissions(Path::new(&pub_path), fs::Permissions::from_mode(0o644));
+            tracing::info!(path = MOTHERBEE_SSH_KEY_PATH, "generated motherbee SSH bootstrap key");
+        }
+        Ok(o) => tracing::warn!(
+            stderr = %String::from_utf8_lossy(&o.stderr),
+            "ssh-keygen failed for motherbee key"
+        ),
+        Err(err) => tracing::warn!(error = %err, "ssh-keygen unavailable; motherbee SSH key not generated"),
+    }
+}
+
+/// add_hive: issue a leaf for `hive_id` and distribute the mesh TLS material to
+/// the remote node's `/var/lib/fluxbee/tls/<hive_id>/` over the authenticated SSH
+/// channel. Best-effort (logged): the WAN degrades to plaintext without certs, so
+/// a distribution hiccup must not fail the whole add_hive.
+fn distribute_hive_tls(address: &str, key_path: &Path, user: &str, hive_id: &str) {
+    if let Err(err) = distribute_hive_tls_inner(address, key_path, user, hive_id) {
+        tracing::warn!(hive_id = hive_id, error = %err, "failed to distribute mesh TLS material");
+    }
+}
+
+fn distribute_hive_tls_inner(
+    address: &str,
+    key_path: &Path,
+    user: &str,
+    hive_id: &str,
+) -> Result<(), OrchestratorError> {
+    let ca = ensure_mesh_ca()?;
+    let leaf = ca.issue_leaf(hive_id).map_err(|e| format!("issue leaf: {e}"))?;
+    let dir = format!("/var/lib/fluxbee/tls/{hive_id}");
+    // Create the dir 0700 BEFORE writing: write_remote_file streams via `tee`,
+    // which leaves the new file at the umask default (often world-readable) until
+    // the chmod below. An owner-only directory blocks traversal in that window, so
+    // cert.key is never readable by another local user even transiently.
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(&format!("mkdir -p '{dir}' && chmod 700 '{dir}'")),
+        user,
+    )?;
+    write_remote_file(address, key_path, user, &format!("{dir}/ca.crt"), ca.ca_cert_pem())?;
+    write_remote_file(address, key_path, user, &format!("{dir}/cert.crt"), &leaf.cert_pem)?;
+    write_remote_file(address, key_path, user, &format!("{dir}/cert.key"), &leaf.key_pem)?;
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(&format!("chmod 600 '{dir}/cert.key'")),
+        user,
+    )?;
+    Ok(())
+}
+
+/// Motherbee: (re)distribute mesh TLS material to all already-provisioned hives
+/// that don't have it yet. New hives get certs at `add_hive`; this catches up the
+/// hives created BEFORE mTLS existed (so the operator can flip `wan.mtls` without
+/// a manual cert step). Idempotent (skips hives that already hold a cert; a CA
+/// rotation is a separate forced op) and best-effort (logged). Runs blocking, so
+/// the caller should spawn it off the boot path.
+fn reconcile_hive_tls_material() {
+    let root = hives_root();
+    let entries = match fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
+    let mut filled = 0u32;
+    for entry in entries.flatten() {
+        let hive_id = entry.file_name().to_string_lossy().to_string();
+        if hive_id == PRIMARY_HIVE_ID || !valid_hive_id(&hive_id) {
+            continue;
+        }
+        let Ok(info) = read_hive_info(&root, &hive_id) else {
+            continue;
+        };
+        if info.get("status").and_then(|v| v.as_str()) != Some("connected") {
+            continue;
+        }
+        let address = info.get("address").and_then(|v| v.as_str()).unwrap_or("");
+        let user = info.get("ssh_user").and_then(|v| v.as_str()).unwrap_or("");
+        if address.is_empty() || user.is_empty() {
+            continue;
+        }
+        // Idempotent: skip a hive that already holds a cert.
+        if ssh_with_key(
+            address,
+            &key_path,
+            &sudo_wrap(&format!("test -f '/var/lib/fluxbee/tls/{hive_id}/cert.crt'")),
+            user,
+        )
+        .is_ok()
+        {
+            continue;
+        }
+        distribute_hive_tls(address, &key_path, user, &hive_id);
+        filled += 1;
+    }
+    if filled > 0 {
+        tracing::info!(count = filled, "distributed mesh TLS material to existing hives");
+    }
+}
+
 async fn bootstrap_local(
     state: &OrchestratorState,
     socket_dir: &Path,
@@ -802,6 +1033,15 @@ async fn bootstrap_local(
     let core_manifest = load_core_manifest()?;
     let core_bins = core_bin_paths_for_role(&core_manifest, state.role)?;
     validate_core_manifest_for_bins(&core_bins)?;
+
+    // Motherbee is the mesh CA: ensure the CA + its own WAN-mTLS material exist
+    // before rt-gateway starts (the router loads certs at startup). Then, off the
+    // boot path, catch up TLS material for hives provisioned before mTLS existed.
+    if state.is_motherbee {
+        ensure_motherbee_ssh_key();
+        ensure_motherbee_mesh_tls(&state.hive_id);
+        tokio::task::spawn_blocking(reconcile_hive_tls_material);
+    }
 
     tracing::info!("starting rt-gateway");
     systemd_start("rt-gateway")?;
@@ -14052,6 +14292,73 @@ fn core_bin_paths_for_role(
         .collect())
 }
 
+/// add_hive: push the motherbee's vendor runtime (syncthing binary + manifest +
+/// optional config template) to the worker, so the worker's blob/dist-sync setup
+/// finds the vendored syncthing during finalize. Mirrors `sync_core_to_worker`.
+/// Best-effort by contract of its caller: if the motherbee has no vendor manifest
+/// there is nothing to push, so this returns Ok and the join proceeds.
+fn sync_vendor_to_worker(
+    hive_id: &str,
+    address: &str,
+    key_path: &Path,
+    user: &str,
+) -> Result<(), OrchestratorError> {
+    let Some(manifest_path) = local_vendor_manifest_path() else {
+        tracing::warn!(hive_id = hive_id, "no local vendor manifest; skipping vendor sync to worker");
+        return Ok(());
+    };
+    let bin_path = Path::new(DIST_SYNCTHING_VENDOR_SOURCE_PATH);
+    if !bin_path.exists() {
+        tracing::warn!(hive_id = hive_id, "vendor manifest present but syncthing binary missing; skipping vendor sync");
+        return Ok(());
+    }
+    let cfg_path = local_vendor_component_path("syncthing/config.xml");
+
+    let mut upload_paths = vec![manifest_path.display().to_string(), bin_path.display().to_string()];
+    if let Some(cfg) = &cfg_path {
+        upload_paths.push(cfg.display().to_string());
+    }
+    let upload_refs: Vec<&str> = upload_paths.iter().map(String::as_str).collect();
+
+    let remote_stage = format!("/tmp/fluxbee-vendor-sync-{}", sanitize_unit_suffix(hive_id));
+    ssh_with_key(
+        address,
+        key_path,
+        &format!("rm -rf '{stage}' && mkdir -p '{stage}'", stage = shell_single_quote(&remote_stage)),
+        user,
+    )?;
+    scp_with_key(address, key_path, &upload_refs, &format!("{remote_stage}/"), user)?;
+
+    let mut commands = vec![
+        "set -euo pipefail".to_string(),
+        "mkdir -p /var/lib/fluxbee/dist/vendor/syncthing".to_string(),
+        format!(
+            "install -m 0644 '{stage}/manifest.json' '/var/lib/fluxbee/dist/vendor/manifest.json'",
+            stage = shell_single_quote(&remote_stage),
+        ),
+        format!(
+            "install -m 0755 '{stage}/syncthing' '/var/lib/fluxbee/dist/vendor/syncthing/syncthing'",
+            stage = shell_single_quote(&remote_stage),
+        ),
+    ];
+    if cfg_path.is_some() {
+        commands.push(format!(
+            "install -m 0644 '{stage}/config.xml' '/var/lib/fluxbee/dist/vendor/syncthing/config.xml'",
+            stage = shell_single_quote(&remote_stage),
+        ));
+    }
+    commands.push(format!("rm -rf '{stage}'", stage = shell_single_quote(&remote_stage)));
+    let promote = commands.join(" && ");
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&promote))),
+        user,
+    )?;
+    tracing::info!(hive_id = hive_id, "synced vendor runtime (syncthing) to worker");
+    Ok(())
+}
+
 fn sync_core_to_worker(
     hive_id: &str,
     address: &str,
@@ -15621,6 +15928,13 @@ async fn add_hive_flow(
         });
     }
 
+    // Push the vendor runtime (syncthing) so the worker's finalize can set up
+    // blob/dist sync; best-effort — a hiccup must not fail the join (the mTLS
+    // link is already up by now), it just leaves sync unavailable until repaired.
+    if let Err(err) = sync_vendor_to_worker(hive_id, address, &key_path, creds.user.as_str()) {
+        tracing::warn!(hive_id = hive_id, error = %err, "vendor sync to worker failed; blob/dist sync may be unavailable");
+    }
+
     let wan_listen = state.wan_listen.clone().unwrap_or_default();
     let worker_uplink = match resolve_worker_uplink_address(&wan_listen, address) {
         Ok(value) => value,
@@ -15667,7 +15981,7 @@ async fn add_hive_flow(
         }
     };
     let hive_yaml = format!(
-        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\ngovernment:\n  identity_frontdesk: \"{}\"\nidentity:\n  sync:\n    upstream: \"{}\"\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n{}{}",
+        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\ngovernment:\n  identity_frontdesk: \"{}\"\nidentity:\n  sync:\n    upstream: \"{}\"\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n{}{}",
         hive_id,
         worker_uplink,
         storage_path,
@@ -15697,6 +16011,10 @@ async fn add_hive_flow(
             "message": err.to_string(),
         });
     }
+
+    // Distribute the mesh TLS material so this worker's router can present a cert
+    // when wan.mtls is enabled (best-effort; WAN degrades to plaintext without it).
+    distribute_hive_tls(address, &key_path, creds.user.as_str(), hive_id);
 
     let config_routes_yaml = format!(
         "version: 1\nupdated_at: \"{}\"\nroutes: []\nvpns: []\ntaps: []\n",
@@ -16313,7 +16631,7 @@ async fn add_egress_hive_flow(
                 .to_string()
         });
     let hive_yaml = format!(
-        "hive_id: {hive_id}\nrole: egress\nwan:\n  gateway_name: RT.gateway\n  uplinks:\n    - address: \"{uplink}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  sync:\n    enabled: false\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: false\negress:\n  enabled: true\n  lan_cidr: \"{lan_cidr}\"\n  edge_ip: \"{edge_ip}\"\n  wan_iface: \"{wan_iface}\"\n  lan_iface: \"{lan_iface}\"\n  ipv6: \"blocked\"\n{system_nodes}",
+        "hive_id: {hive_id}\nrole: egress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  sync:\n    enabled: false\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: false\negress:\n  enabled: true\n  lan_cidr: \"{lan_cidr}\"\n  edge_ip: \"{edge_ip}\"\n  wan_iface: \"{wan_iface}\"\n  lan_iface: \"{lan_iface}\"\n  ipv6: \"blocked\"\n{system_nodes}",
         hive_id = hive_id,
         uplink = worker_uplink,
         storage = storage_path,
@@ -16327,6 +16645,9 @@ async fn add_egress_hive_flow(
     if let Err(err) = write_remote_file(address, &key_path, creds.user.as_str(), "/etc/fluxbee/hive.yaml", &hive_yaml) {
         return err_payload("CONFIG_FAILED", err.to_string());
     }
+    // Distribute the mesh TLS material so the egress hive's router can present a
+    // cert when wan.mtls is enabled (best-effort; WAN degrades to plaintext).
+    distribute_hive_tls(address, &key_path, creds.user.as_str(), hive_id);
     let config_routes_yaml = format!(
         "version: 1\nupdated_at: \"{}\"\nroutes: []\nvpns: []\ntaps: []\n",
         now_epoch_ms()

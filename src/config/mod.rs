@@ -54,6 +54,11 @@ pub struct RouterConfig {
     pub wan_listen: Option<String>,
     pub wan_uplinks: Vec<String>,
     pub wan_authorized_hives: Vec<String>,
+    /// WAN mTLS peer-auth mode: "disabled" | "permissive" | "required".
+    pub wan_mtls_mode: String,
+    /// Directory holding this hive's mesh TLS material (ca.crt, cert.crt,
+    /// cert.key) — `/var/lib/fluxbee/tls/<hive_id>`.
+    pub tls_dir: PathBuf,
     pub hive_role: String,
     pub nats_mode: String,
     pub nats_port: u16,
@@ -89,6 +94,8 @@ struct WanSection {
     uplinks: Option<Vec<WanUplink>>,
     authorized_hives: Option<Vec<String>>,
     gateway_name: Option<String>,
+    /// WAN mTLS peer-auth mode: "disabled" | "permissive" | "required".
+    mtls: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +162,7 @@ impl RouterConfig {
         let mut wan_listen = None;
         let mut wan_uplinks = Vec::new();
         let mut wan_authorized_hives = Vec::new();
+        let mut wan_mtls_mode = "disabled".to_string();
         let mut hive_role = DEFAULT_HIVE_ROLE.to_string();
         let mut nats_mode = DEFAULT_NATS_MODE.to_string();
         let mut nats_port = DEFAULT_NATS_PORT;
@@ -195,6 +203,12 @@ impl RouterConfig {
             }
             if let Some(name) = wan.gateway_name {
                 gateway_name = name;
+            }
+            if let Some(mode) = wan.mtls {
+                let mode = mode.trim().to_ascii_lowercase();
+                if matches!(mode.as_str(), "disabled" | "permissive" | "required") {
+                    wan_mtls_mode = mode;
+                }
             }
         }
         if let Some(nats) = hive.nats {
@@ -285,6 +299,7 @@ impl RouterConfig {
             (uuid, shm_name)
         };
         let node_socket_path = node_socket_dir.join(format!("{}.sock", router_uuid.simple()));
+        let tls_dir = PathBuf::from("/var/lib/fluxbee/tls").join(&hive_id);
         Ok(Self {
             router_name,
             router_l2_name,
@@ -304,6 +319,8 @@ impl RouterConfig {
             wan_listen,
             wan_uplinks,
             wan_authorized_hives,
+            wan_mtls_mode,
+            tls_dir,
             hive_role,
             nats_mode,
             nats_port,

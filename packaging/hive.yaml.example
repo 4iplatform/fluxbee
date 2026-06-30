@@ -1,0 +1,113 @@
+hive_id: "motherbee"
+role: motherbee
+
+# WAN / inter-hive gateway. A root motherbee has no uplink (workers/egress
+# connect TO it). `wan.mtls` controls inter-hive transport auth:
+#   disabled   - plaintext WAN (default)
+#   permissive - use mTLS when both peers present a cert, accept plaintext (WARN)
+#   required   - reject any peer without a valid mesh cert (fail-closed)
+# The installer provisions the mesh CA + this hive's cert under
+# /var/lib/fluxbee/tls/<hive_id> regardless of mode, so flipping the mode is
+# instant. NOTE: if set to "required", every joined hive must also run
+# "required" (add_hive distributes their cert) or the plaintext join is rejected.
+wan:
+  listen: "0.0.0.0:9000"
+  gateway_name: "RT.gateway"
+  mtls: required
+
+# Local NATS broker for control/data plane.
+nats:
+  mode: embedded
+  port: 4222
+
+# Local admin HTTP API.
+admin:
+  listen: "127.0.0.1:8080"
+
+# Local architect HTTP UI/API (typically exposed through reverse proxy).
+architect:
+  listen: "0.0.0.0:3000"
+
+# Shared filesystem root used by admin/orchestrator.
+storage:
+  path: "/var/lib/fluxbee"
+
+# Identity runtime settings.
+identity:
+  sync:
+    port: 9100
+
+# Government/frontdesk wiring.
+government:
+  identity_frontdesk: "SY.frontdesk.gov@motherbee"
+
+# Blob runtime config.
+blob:
+  enabled: true
+  path: "/var/lib/fluxbee/blob"
+  sync:
+    enabled: true
+    tool: "syncthing"
+    api_port: 8384
+    data_dir: "/var/lib/fluxbee/syncthing"
+
+# Runtime artifact distribution config.
+dist:
+  path: "/var/lib/fluxbee/dist"
+  sync:
+    enabled: true
+    tool: "syncthing"
+
+# Declarative SY topology per hive role. `nodes` is the start order;
+# `wait_for` is the subset the orchestrator blocks on before continuing
+# bootstrap. Workers do not run SY.vault.
+system_nodes:
+  motherbee:
+    # Model D' boot order (enforced by sy_orchestrator::validate_system_nodes):
+    #   1. SY.config.routes FIRST (writer of /jsr-config-<hive> SHM).
+    #   2. All vault consumers SECOND (they register with the router before
+    #      vault emits its bootstrap broadcast; each tolerates VAULT_UNAVAILABLE).
+    #   3. SY.vault LAST — broadcasts only reach already-registered nodes.
+    nodes:
+      - SY.config.routes
+      - SY.identity
+      - SY.opa.rules
+      - SY.admin
+      - SY.architect
+      - SY.storage
+      - SY.cognition
+      - SY.policy
+      - SY.timer
+      - SY.wf-rules
+      - SY.frontdesk.gov
+      - SY.vault
+    wait_for:
+      - SY.config.routes
+      - SY.identity
+      - SY.opa.rules
+      - SY.admin
+      - SY.cognition
+      - SY.policy
+      - SY.timer
+      - SY.vault
+  worker:
+    nodes:
+      - SY.config.routes
+      - SY.identity
+      - SY.opa.rules
+      - SY.cognition
+      - SY.policy
+      - SY.timer
+      - SY.wf-rules
+    wait_for:
+      - SY.config.routes
+      - SY.identity
+      - SY.opa.rules
+      - SY.cognition
+      - SY.policy
+      - SY.timer
+  egress:
+    nodes:
+      - SY.config.routes
+    wait_for:
+      - SY.config.routes
