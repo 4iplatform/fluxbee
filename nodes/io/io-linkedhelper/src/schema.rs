@@ -26,13 +26,19 @@ pub(crate) fn build_configured_schema(
         "transport": {
             "endpoint": "POST /v1/poll",
             "protocol": "http_over_https",
-            "auth": "Authorization: Bearer <installation_key>",
-            "adapter_header": "X-Fluxbee-Adapter-Id"
+            "auth": "Authorization: Bearer <adapter_secret>",
+            "adapter_header": "X-Fluxbee-Adapter-Id",
+            "payload_binding": ["adapter_id", "managed_instance_id", "local_instance_id"]
         },
         "channel": {
-            "mode": "polling",
+            "mode": effective.get("mode").cloned().unwrap_or(Value::String("direct_http_intermediate".to_string())),
             "response_families": ["ack", "result", "heartbeat"],
             "active_adapter_count": adapter_count
+        },
+        "binding": {
+            "managed_instance_id": effective.get("managed_instance_id").cloned().unwrap_or(Value::Null),
+            "tenant_id": effective.get("tenant_id").cloned().unwrap_or(Value::Null),
+            "adapter": effective.get("adapter").cloned().unwrap_or(Value::Null),
         },
         "ingress": {
             "listen": effective.get("listen").cloned().unwrap_or(Value::Null),

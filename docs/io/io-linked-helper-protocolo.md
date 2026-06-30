@@ -49,7 +49,14 @@ Se prioriza:
 - seguridad mínima razonable con certificado.
 
 ## 2.3. Autenticación mínima
-Cada instalación del adapter tendrá una **installation key** única.
+En el camino intermedio vigente, cada adapter usa un **adapter secret** único.
+
+Ese secreto:
+
+- pertenece al adapter;
+- se publica en Vault;
+- el nodo lo resuelve por `vault_ref` al arrancar o al aplicar config;
+- y el adapter lo envía como `Authorization: Bearer <adapter_secret>`.
 
 ## 2.4. Pendientes de seguridad reales
 Siguen abiertos:
@@ -63,18 +70,27 @@ Siguen abiertos:
 # 3. Topología y despliegue inicial
 
 ## 3.1. Instancia única del nodo
-En la primera etapa, el nodo `IO.linkedhelper`:
+En la etapa intermedia vigente, el nodo `IO.linkedhelper`:
 
-- levanta una sola instancia;
-- escucha en un puerto específico a definir;
-- y no se contempla multi-instancia inicialmente.
+- se configura 1:1 con una sola `managed_instance_id`;
+- acepta un solo binding de adapter por instancia;
+- escucha en una dirección/puerto declarativos (`config.listen.address` + `config.listen.port`);
+- y expone HTTP directo temporal mientras no exista Edge.
 
 ## 3.2. Consecuencia
 Esto simplifica:
 - routing externo hacia el nodo;
 - coordinación del estado local;
 - persistencia inicial del estado de canal;
+- validación defensiva del binding `adapter_id ↔ managed_instance_id`;
 - y devolución de resultados/config al adapter correcto.
+
+Forma canónica del binding actual:
+
+- `node_name = IO.linkedhelper.<managed_instance_id>@motherbee`
+- `adapter.adapter_id = <adapter_id>`
+- `adapter.local_instance_id = <local_instance_id>` opcional
+- `adapter.auth = { type: vault_ref, resource_type: linkedhelper_adapter, key: ... }`
 
 ---
 
@@ -89,6 +105,15 @@ El adapter realiza polls periódicos hacia el nodo.
 En cada intercambio:
 - si tiene eventos, los envía;
 - si no tiene eventos, envía heartbeat.
+
+Estado actual implementado:
+
+- el endpoint es `POST /v1/poll`;
+- el header `X-Fluxbee-Adapter-Id` es obligatorio;
+- el body debe incluir `adapter_id` y `managed_instance_id`;
+- `local_instance_id` también debe venir cuando el binding del nodo lo conoce;
+- el nodo acepta `mode = events | heartbeat`;
+- y si `mode` no viene, el runtime actual deriva `heartbeat` cuando `items=[]` y `events` cuando hay items.
 
 ## 4.3. El heartbeat no es solo keepalive
 También sirve para:
@@ -106,8 +131,13 @@ También sirve para:
 Un request puede contener múltiples eventos de:
 
 - distintos profiles;
-- distintas cuentas;
 - distintos tipos de evento.
+
+Nota de estado actual:
+
+- el request puede contener múltiples eventos de distintos profiles;
+- pero todos pertenecen a una misma `managed_instance_id`, porque el nodo vigente es 1:1 por instancia aprobada;
+- múltiples cuentas simultáneas dentro del mismo nodo quedan fuera del modelo vigente.
 
 ## 5.2. Respuesta del nodo
 La respuesta puede devolver:
@@ -241,6 +271,22 @@ Se mantiene el modelo conceptual:
 ## 10.3. `heartbeat`
 Se usa cuando no hay nada más que devolver o como respuesta mínima a un poll vacío.
 
+## 10.5. Envelope HTTP intermedio implementado hoy
+
+Además de `items`, la respuesta HTTP actual del nodo incluye:
+
+- `ok`
+- `accepted_at`
+- `response_id`
+- `adapter_id`
+- `actions`
+
+Estado actual:
+
+- `actions` existe para compatibilidad con el camino intermedio;
+- hoy el nodo responde `actions: []`;
+- las respuestas útiles del canal siguen viajando en `items`.
+
 ## 10.4. Resultados del beacon ya encaminados
 Los casos más firmes hoy son:
 
@@ -255,10 +301,13 @@ Los casos más firmes hoy son:
 
 El nodo debería persistir de forma durable el estado mínimo de coordinación del canal, incluyendo al menos:
 
-- mapping `installation_id / adapter_id ↔ installation_key` o referencia equivalente;
-- mapping `installation_id ↔ profiles descubiertos`;
+- mapping `adapter_id / managed_instance_id ↔ auth key ref` o referencia equivalente;
+- mapping `adapter_id / managed_instance_id ↔ profiles descubiertos`;
 - mapping `external_profile_id ↔ ILK provisorio/definitivo`;
-- mapping `ILK/ICH ↔ installation_id`;
+- último poll observado por adapter;
+- pending deliveries por adapter;
+- último estado conocido de automatización por ICH propio.
+- mapping `ILK/ICH ↔ adapter_id / managed_instance_id`;
 - lista de ILKs provisorios pendientes de promoción;
 - último estado observado de automatización por ICH para LH;
 - cambios pendientes de entregar al adapter;

@@ -33,7 +33,7 @@ pub struct AdapterSnapshot {
     pub tenant_id: String,
     pub label: Option<String>,
     pub dst_node: Option<String>,
-    pub installation_key_ref: String,
+    pub auth_key_ref: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -44,7 +44,8 @@ pub struct AdapterStateRecord {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dst_node: Option<String>,
-    pub installation_key_ref: String,
+    #[serde(alias = "installation_key_ref")]
+    pub auth_key_ref: String,
     #[serde(default)]
     pub config_present: bool,
     #[serde(default)]
@@ -143,7 +144,7 @@ impl LinkedHelperDurableState {
                     tenant_id: snapshot.tenant_id.clone(),
                     label: snapshot.label.clone(),
                     dst_node: snapshot.dst_node.clone(),
-                    installation_key_ref: snapshot.installation_key_ref.clone(),
+                    auth_key_ref: snapshot.auth_key_ref.clone(),
                     config_present: true,
                     known_profile_ids: Vec::new(),
                     last_poll_at_ms: None,
@@ -153,7 +154,7 @@ impl LinkedHelperDurableState {
             record.tenant_id = snapshot.tenant_id.clone();
             record.label = snapshot.label.clone();
             record.dst_node = snapshot.dst_node.clone();
-            record.installation_key_ref = snapshot.installation_key_ref.clone();
+            record.auth_key_ref = snapshot.auth_key_ref.clone();
             record.config_present = true;
             record.updated_at_ms = now_ms;
         }
@@ -176,7 +177,7 @@ impl LinkedHelperDurableState {
                 tenant_id: String::new(),
                 label: None,
                 dst_node: None,
-                installation_key_ref: String::new(),
+                auth_key_ref: String::new(),
                 config_present: false,
                 known_profile_ids: Vec::new(),
                 last_poll_at_ms: None,
@@ -274,7 +275,7 @@ impl LinkedHelperDurableState {
                 tenant_id: tenant_id.to_string(),
                 label: None,
                 dst_node: None,
-                installation_key_ref: String::new(),
+                auth_key_ref: String::new(),
                 config_present: false,
                 known_profile_ids: Vec::new(),
                 last_poll_at_ms: None,

@@ -57,6 +57,8 @@ Mantener el intercambio y retirar pendientes cuando el adapter no tiene nuevos e
 ### Campos mínimos conceptuales
 - `id`
 - `adapter_id`
+- `managed_instance_id`
+- `local_instance_id` opcional
 - `timestamp`
 
 ### Observación
@@ -76,6 +78,8 @@ Su función es permitir que el nodo cree el ILK provisorio y ponga en marcha el 
 ### Campos mínimos conceptuales
 - `id`
 - `adapter_id`
+- `managed_instance_id`
+- `local_instance_id` opcional
 - `external_profile_id`
 - `display_name`
 - `metadata` opcional
@@ -104,6 +108,8 @@ Solo se emite para profiles que ya tengan ILK definitivo/utilizable y cuyo ICH L
 ### Campos mínimos conceptuales
 - `id`
 - `adapter_id`
+- `managed_instance_id`
+- `local_instance_id` opcional
 - `profile_ilk`
 - `contact_name`
 - `contact_external_composite_id`
@@ -245,6 +251,23 @@ Responder cuando no hay nada más que devolver o como respuesta mínima a un pol
 - `type = heartbeat`
 - `timestamp`
 
+## 4.4. Envelope HTTP intermedio vigente
+
+En la implementación actual del nodo, la respuesta HTTP top-level incluye además:
+
+- `ok`
+- `accepted_at`
+- `response_id`
+- `adapter_id`
+- `actions`
+- `items`
+
+Regla actual:
+
+- `items` sigue siendo el carrier principal de `ack` / `result` / `heartbeat`;
+- `actions` existe para compatibilidad con el camino directo sin Edge;
+- en el runtime actual `actions` se devuelve vacío.
+
 ---
 
 # 5. Resultados del beacon que ya quedan encaminados
@@ -281,7 +304,47 @@ El nodo debe poder devolver errores relacionados con:
 
 ---
 
-# 6. Qué sigue vigente de contratos anteriores
+# 6. Request HTTP intermedio vigente
+
+Para el camino intermedio actual, el request al nodo debe incluir:
+
+- header `X-Fluxbee-Adapter-Id`
+- header `Authorization: Bearer <adapter_secret>`
+- body con `adapter_id`
+- body con `managed_instance_id`
+- body con `local_instance_id` cuando aplique
+- `mode = "events" | "heartbeat"`
+- `items = []` o batch de eventos
+
+Shape conceptual mínimo:
+
+```json
+{
+  "request_id": "req_123",
+  "adapter_id": "adp_123",
+  "managed_instance_id": "lhmi_001",
+  "local_instance_id": "123456",
+  "mode": "events",
+  "items": [
+    {
+      "id": "evt_001",
+      "type": "profile_create",
+      "payload": {}
+    }
+  ]
+}
+```
+
+Validaciones defensivas del nodo actual:
+
+- `adapter_id` del body debe coincidir con `X-Fluxbee-Adapter-Id`;
+- `managed_instance_id` debe coincidir con la configuración del nodo;
+- `local_instance_id` debe coincidir cuando el nodo lo tiene configurado;
+- el bearer debe coincidir con el secret resuelto desde Vault.
+
+---
+
+# 7. Qué sigue vigente de contratos anteriores
 
 Se conserva:
 
@@ -303,7 +366,7 @@ Se elimina del mínimo v1:
 
 ---
 
-# 7. Pendientes abiertos reales
+# 8. Pendientes abiertos reales
 
 ## 7.1. Shape exacto de cada payload
 Sigue pendiente cerrar el schema final.
@@ -324,7 +387,7 @@ Quedan tentativos y fuera de cierre en este documento.
 
 ---
 
-# 8. Síntesis
+# 9. Síntesis
 
 Los contratos v1 mínimos quedan así:
 

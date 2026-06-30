@@ -14,7 +14,7 @@ use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing, 
 use fluxbee_sdk::{
     compute_thread_id, resolve_identity_option_from_hive_id, try_handle_default_node_status,
     NodeConfig, NodeUuidMode, OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher,
-    ThreadIdInput, FLUXBEE_NODE_NAME_ENV,
+    ThreadIdInput, VaultCallerOwned, VaultClient, FLUXBEE_NODE_NAME_ENV,
 };
 use io_common::identity::{IdentityError, ResolveOrCreateInput};
 use io_common::io_adapter_config::{
@@ -38,12 +38,11 @@ use io_common::provision::{strict_provision_ilk, IdentityProvisionConfig};
 use io_common::router_message::new_trace_id;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 use crate::schema::{build_configured_schema, build_unconfigured_schema};
 use crate::state_store::{
@@ -92,17 +91,28 @@ fn env(key: &str) -> Option<String> {
 }
 
 #[derive(Debug, Clone)]
+struct AdapterAuthConfig {
+    resource_type: String,
+    key: String,
+}
+
+#[derive(Debug, Clone)]
 struct AdapterRuntime {
+    managed_instance_id: String,
     adapter_id: String,
     tenant_id: String,
-    installation_key: String,
+    local_instance_id: Option<String>,
+    auth: AdapterAuthConfig,
+    adapter_secret: Option<String>,
     label: Option<String>,
     dst_node: Option<String>,
+    mode: String,
+    listen_addr: String,
 }
 
 #[derive(Debug, Clone, Default)]
 struct LinkedHelperRuntimeRegistry {
-    adapters: HashMap<String, AdapterRuntime>,
+    binding: Option<AdapterRuntime>,
     max_request_bytes: usize,
     identity_target: String,
     identity_timeout_ms: u64,
@@ -120,19 +130,23 @@ struct HttpState {
     durable_state: Arc<RwLock<LinkedHelperDurableState>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct PollRequest {
     #[serde(default)]
     request_id: Option<String>,
     #[serde(default)]
     adapter_id: Option<String>,
     #[serde(default)]
-    mode: Option<String>,
+    managed_instance_id: Option<String>,
     #[serde(default)]
+    local_instance_id: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default, alias = "items")]
     items: Vec<PollItem>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct PollItem {
     id: String,
     #[serde(rename = "type")]
@@ -162,8 +176,11 @@ struct ConversationMessagePayload {
 
 #[derive(Debug, Serialize)]
 struct PollResponse {
+    ok: bool,
+    accepted_at: String,
     response_id: String,
     adapter_id: String,
+    actions: Vec<Value>,
     items: Vec<ResponseItem>,
 }
 
@@ -248,7 +265,7 @@ impl From<StoredResponseItem> for ResponseItem {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = Config::from_env();
+    let mut config = Config::from_env();
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,io_linkedhelper=info,fluxbee_sdk=info"));
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
@@ -260,7 +277,7 @@ async fn main() -> Result<()> {
         node_name = %config.node_name,
         router_socket = %config.router_socket.display(),
         state_dir = %config.state_dir.display(),
-        listen_addr = %config.listen_addr,
+        boot_listen_addr = %config.listen_addr,
         self_ilk_id = ?self_ilk_id,
         self_tenant_id = ?self_tenant_id,
         "io-linkedhelper starting"
@@ -285,6 +302,23 @@ async fn main() -> Result<()> {
         "connected to router"
     );
 
+    let vault_client = match (
+        self_ilk_id.as_deref().filter(|value| !value.is_empty()),
+        config
+            .node_name
+            .split('@')
+            .nth(1)
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    ) {
+        (Some(self_ilk), Some(hive_id)) => Some(Arc::new(VaultClient::new(
+            dispatcher.clone(),
+            hive_id.to_string(),
+            VaultCallerOwned::new(self_ilk.to_string(), config.node_name.clone()),
+        ))),
+        _ => None,
+    };
+
     let adapter_contract: Arc<dyn IoAdapterConfigContract> =
         Arc::new(IoLinkedHelperAdapterConfigContract);
     let mut boot_state = bootstrap_io_control_plane_state(&config.state_dir, &config.node_name)
@@ -298,8 +332,8 @@ async fn main() -> Result<()> {
             IoControlPlaneState::default()
         });
 
-    let runtime_registry = Arc::new(RwLock::new(
-        load_runtime_registry(boot_state.effective_config.as_ref()).unwrap_or_else(|err| {
+    let boot_registry = load_runtime_registry(boot_state.effective_config.as_ref())
+        .unwrap_or_else(|err| {
             if boot_state.effective_config.is_some() {
                 boot_state.current_state = IoNodeLifecycleState::FailedConfig;
                 boot_state.last_error = Some(IoControlPlaneErrorInfo {
@@ -313,8 +347,39 @@ async fn main() -> Result<()> {
                 );
             }
             LinkedHelperRuntimeRegistry::default()
-        }),
-    ));
+        });
+    let runtime_registry = Arc::new(RwLock::new(boot_registry));
+    {
+        let mut registry = runtime_registry.write().await;
+        if let Some(listen_addr) = registry
+            .binding
+            .as_ref()
+            .map(|binding| binding.listen_addr.trim())
+            .filter(|value| !value.is_empty())
+        {
+            config.listen_addr = listen_addr.to_string();
+        }
+        if registry.binding.is_some() {
+            if let Err(err) = resolve_runtime_registry_auth(
+                &mut registry,
+                vault_client.as_deref(),
+                Duration::from_secs(5),
+            )
+            .await
+            {
+                boot_state.current_state = IoNodeLifecycleState::FailedConfig;
+                boot_state.last_error = Some(IoControlPlaneErrorInfo {
+                    code: "auth_secret_unavailable".to_string(),
+                    message: err.to_string(),
+                });
+                tracing::warn!(
+                    node_name = %config.node_name,
+                    error = %err,
+                    "boot effective config could not resolve linkedhelper adapter secret; starting in FAILED_CONFIG"
+                );
+            }
+        }
+    }
     let runtime_snapshots = {
         let registry = runtime_registry.read().await;
         runtime_registry_snapshots(&registry)
@@ -374,6 +439,7 @@ async fn main() -> Result<()> {
         adapter_contract,
         runtime_registry,
         durable_state,
+        vault_client,
     ));
 
     if let Some(http_task) = http_task {
@@ -439,6 +505,7 @@ async fn run_router_control_loop(
     adapter_contract: Arc<dyn IoAdapterConfigContract>,
     runtime_registry: Arc<RwLock<LinkedHelperRuntimeRegistry>>,
     durable_state: Arc<RwLock<LinkedHelperDurableState>>,
+    vault_client: Option<Arc<VaultClient>>,
 ) -> Result<()> {
     let control_src = dispatcher.sender_snapshot().uuid().to_string();
     let mut system_rx = dispatcher
@@ -466,6 +533,7 @@ async fn run_router_control_loop(
             adapter_contract.as_ref(),
             runtime_registry.clone(),
             durable_state.clone(),
+            vault_client.clone(),
         )
         .await
         {
@@ -497,6 +565,7 @@ async fn handle_io_control_plane_message(
     adapter_contract: &dyn IoAdapterConfigContract,
     runtime_registry: Arc<RwLock<LinkedHelperRuntimeRegistry>>,
     durable_state: Arc<RwLock<LinkedHelperDurableState>>,
+    vault_client: Option<Arc<VaultClient>>,
 ) -> Option<WireMessage> {
     let command = msg.meta.msg.as_deref().unwrap_or_default();
     if msg.meta.msg_type != SYSTEM_KIND {
@@ -516,7 +585,7 @@ async fn handle_io_control_plane_message(
     if command.eq_ignore_ascii_case("STATUS") {
         let state = control_plane.read().await.clone();
         let metrics = control_metrics.snapshot();
-        let adapter_count = runtime_registry.read().await.adapters.len();
+        let adapter_count = usize::from(runtime_registry.read().await.binding.is_some());
         let payload = serde_json::json!({
             "ok": true,
             "node_name": node_name,
@@ -552,7 +621,7 @@ async fn handle_io_control_plane_message(
                     "metrics".to_string(),
                     serde_json::json!({
                         "control_plane": control_metrics.snapshot(),
-                        "runtime": { "active_adapter_count": runtime_registry.read().await.adapters.len() }
+                        "runtime": { "active_adapter_count": usize::from(runtime_registry.read().await.binding.is_some()) }
                     }),
                 );
             }
@@ -568,6 +637,7 @@ async fn handle_io_control_plane_message(
                 adapter_contract,
                 runtime_registry,
                 durable_state,
+                vault_client,
             )
             .await
         }
@@ -599,6 +669,7 @@ async fn apply_linkedhelper_config_set(
     adapter_contract: &dyn IoAdapterConfigContract,
     runtime_registry: Arc<RwLock<LinkedHelperRuntimeRegistry>>,
     durable_state: Arc<RwLock<LinkedHelperDurableState>>,
+    vault_client: Option<Arc<VaultClient>>,
 ) -> Value {
     let mut state = control_plane.write().await;
 
@@ -663,6 +734,37 @@ async fn apply_linkedhelper_config_set(
             );
         }
     };
+    let previous_listen_addr = state
+        .effective_config
+        .as_ref()
+        .and_then(|cfg| extract_runtime_listen_addr(cfg).ok());
+    let next_listen_addr = extract_runtime_listen_addr(&candidate).ok();
+    let mut registry = registry;
+    if let Err(err) = resolve_runtime_registry_auth(
+        &mut registry,
+        vault_client.as_deref(),
+        Duration::from_secs(5),
+    )
+    .await
+    {
+        state.current_state = IoNodeLifecycleState::FailedConfig;
+        state.last_error = Some(IoControlPlaneErrorInfo {
+            code: "auth_secret_unavailable".to_string(),
+            message: err.to_string(),
+        });
+        control_metrics.record_config_set_error(
+            state.current_state.as_str(),
+            state.config_version,
+            "auth_secret_unavailable",
+        );
+        let redacted = redact_state(&state, adapter_contract);
+        return build_io_config_set_error_payload(
+            node_name,
+            &redacted,
+            "auth_secret_unavailable",
+            err.to_string(),
+        );
+    }
 
     let previous_version = state.config_version;
     state.current_state = IoNodeLifecycleState::Configured;
@@ -717,9 +819,16 @@ async fn apply_linkedhelper_config_set(
         }
         *durable_state.write().await = updated;
     }
-    let apply_hot = vec!["runtime_registry".to_string()];
+    let apply_hot = vec![
+        "runtime_registry".to_string(),
+        "vault_auth_cache".to_string(),
+    ];
     let apply_reinit: Vec<String> = Vec::new();
-    let apply_restart_required: Vec<String> = Vec::new();
+    let apply_restart_required = if previous_listen_addr != next_listen_addr {
+        vec!["http_listener".to_string()]
+    } else {
+        Vec::new()
+    };
     log_config_set_applied(
         node_name,
         payload.schema_version,
@@ -730,7 +839,19 @@ async fn apply_linkedhelper_config_set(
     );
     control_metrics.record_config_set_ok(state.current_state.as_str(), state.config_version);
     let redacted = redact_state(&state, adapter_contract);
-    build_io_config_set_ok_payload(node_name, &redacted)
+    let mut response = build_io_config_set_ok_payload(node_name, &redacted);
+    if let Some(obj) = response.as_object_mut() {
+        obj.insert(
+            "apply".to_string(),
+            serde_json::json!({
+                "mode": "hot_reload",
+                "hot_applied": apply_hot,
+                "reinit_performed": apply_reinit,
+                "restart_required": apply_restart_required
+            }),
+        );
+    }
+    response
 }
 
 fn redact_state(
@@ -746,11 +867,6 @@ fn redact_state(
 }
 
 fn load_runtime_registry(effective_config: Option<&Value>) -> Result<LinkedHelperRuntimeRegistry> {
-    let adapters = effective_config
-        .and_then(|cfg| cfg.get("adapters"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
     let max_request_bytes = effective_config
         .and_then(|cfg| cfg.get("http"))
         .and_then(|http| http.get("max_request_bytes"))
@@ -771,31 +887,64 @@ fn load_runtime_registry(effective_config: Option<&Value>) -> Result<LinkedHelpe
         .and_then(Value::as_u64)
         .unwrap_or(10_000);
 
-    let mut map = HashMap::new();
-    for adapter in adapters {
-        let adapter = adapter
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("config.adapters entries must be objects"))?;
+    let binding = if let Some(cfg) = effective_config {
+        let managed_instance_id = cfg
+            .get("managed_instance_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("managed_instance_id is required"))?
+            .to_string();
+        let tenant_id = cfg
+            .get("tenant_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("tenant_id is required"))?
+            .to_string();
+        let adapter = cfg
+            .get("adapter")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("config.adapter must be an object"))?;
         let adapter_id = adapter
             .get("adapter_id")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("config.adapters[].adapter_id is required"))?
+            .ok_or_else(|| anyhow::anyhow!("adapter.adapter_id is required"))?
             .to_string();
-        let tenant_id = adapter
-            .get("tenant_id")
+        let local_instance_id = adapter
+            .get("local_instance_id")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("config.adapters[].tenant_id is required"))?
-            .to_string();
-        let installation_key = adapter
-            .get("installation_key")
+            .map(ToString::to_string);
+        let auth = adapter
+            .get("auth")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("adapter.auth must be an object"))?;
+        let auth_type = auth
+            .get("type")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("config.adapters[].installation_key is required"))?
+            .ok_or_else(|| anyhow::anyhow!("adapter.auth.type is required"))?;
+        if auth_type != "vault_ref" {
+            return Err(anyhow::anyhow!("adapter.auth.type must be 'vault_ref'"));
+        }
+        let resource_type = auth
+            .get("resource_type")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("adapter.auth.resource_type is required"))?
+            .to_string();
+        let key = auth
+            .get("key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("adapter.auth.key is required"))?
             .to_string();
         let label = adapter
             .get("label")
@@ -809,20 +958,32 @@ fn load_runtime_registry(effective_config: Option<&Value>) -> Result<LinkedHelpe
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToString::to_string);
-        map.insert(
-            adapter_id.clone(),
-            AdapterRuntime {
-                adapter_id,
-                tenant_id,
-                installation_key,
-                label,
-                dst_node,
-            },
-        );
-    }
+        let mode = cfg
+            .get("mode")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("direct_http_intermediate")
+            .to_string();
+        let listen_addr = extract_runtime_listen_addr(cfg)?;
+        Some(AdapterRuntime {
+            managed_instance_id,
+            adapter_id,
+            tenant_id,
+            local_instance_id,
+            auth: AdapterAuthConfig { resource_type, key },
+            adapter_secret: None,
+            label,
+            dst_node,
+            mode,
+            listen_addr,
+        })
+    } else {
+        None
+    };
 
     Ok(LinkedHelperRuntimeRegistry {
-        adapters: map,
+        binding,
         max_request_bytes,
         identity_target,
         identity_timeout_ms,
@@ -831,19 +992,95 @@ fn load_runtime_registry(effective_config: Option<&Value>) -> Result<LinkedHelpe
 
 fn runtime_registry_snapshots(registry: &LinkedHelperRuntimeRegistry) -> Vec<AdapterSnapshot> {
     registry
-        .adapters
-        .values()
+        .binding
+        .iter()
         .map(|adapter| AdapterSnapshot {
             adapter_id: adapter.adapter_id.clone(),
             tenant_id: adapter.tenant_id.clone(),
             label: adapter.label.clone(),
             dst_node: adapter.dst_node.clone(),
-            installation_key_ref:
-                io_common::io_linkedhelper_adapter_config::installation_key_storage_key(
-                    &adapter.adapter_id,
-                ),
+            auth_key_ref: adapter.auth.key.clone(),
         })
         .collect()
+}
+
+async fn resolve_runtime_registry_auth(
+    registry: &mut LinkedHelperRuntimeRegistry,
+    vault_client: Option<&VaultClient>,
+    timeout: Duration,
+) -> Result<()> {
+    let Some(binding) = registry.binding.as_mut() else {
+        return Ok(());
+    };
+    let Some(vault_client) = vault_client else {
+        return Err(anyhow::anyhow!(
+            "vault client unavailable for linkedhelper adapter secret resolution"
+        ));
+    };
+    let resource_type = binding.auth.resource_type.trim();
+    if resource_type != "linkedhelper_adapter" {
+        return Err(anyhow::anyhow!(
+            "unsupported adapter auth resource_type '{}'",
+            binding.auth.resource_type
+        ));
+    }
+    let response = vault_client
+        .get(binding.auth.key.as_str(), timeout)
+        .await
+        .map_err(|err| anyhow::anyhow!("vault get {} failed: {err}", binding.auth.key))?;
+    let secret_value = response
+        .value
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("vault key {} returned no value", binding.auth.key))?;
+    let secret = extract_adapter_secret_from_vault_value(secret_value)?;
+    if secret.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "vault key {} returned an empty adapter secret",
+            binding.auth.key
+        ));
+    }
+    binding.adapter_secret = Some(secret);
+    Ok(())
+}
+
+fn extract_adapter_secret_from_vault_value(value: &Value) -> Result<String> {
+    if let Some(secret) = value.as_str().map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(secret.to_string());
+    }
+    let obj = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("vault secret value must be a string or object"))?;
+    for field in ["adapter_secret", "secret", "token", "bearer_token"] {
+        if let Some(secret) = obj
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(secret.to_string());
+        }
+    }
+    Err(anyhow::anyhow!(
+        "vault secret value must expose adapter_secret, secret, token, or bearer_token"
+    ))
+}
+
+fn extract_runtime_listen_addr(effective_config: &Value) -> Result<String> {
+    let listen = effective_config
+        .get("listen")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("listen is required"))?;
+    let address = listen
+        .get("address")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("listen.address is required"))?;
+    let port = listen
+        .get("port")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("listen.port is required"))?;
+    Ok(format!("{address}:{port}"))
 }
 
 fn hive_id_from_node_name(node_name: &str) -> String {
@@ -896,7 +1133,7 @@ fn build_identity_provision_config(
 async fn get_schema(State(state): State<Arc<HttpState>>) -> Response {
     let snapshot = state.control_plane.read().await.clone();
     let redacted = redact_state(&snapshot, state.adapter_contract.as_ref());
-    let adapter_count = state.runtime_registry.read().await.adapters.len();
+    let adapter_count = usize::from(state.runtime_registry.read().await.binding.is_some());
 
     let body = if let Some(effective) = redacted.effective_config.as_ref() {
         build_configured_schema(
@@ -918,6 +1155,22 @@ async fn post_poll(
     headers: HeaderMap,
     Json(request): Json<PollRequest>,
 ) -> Response {
+    let control_snapshot = state.control_plane.read().await.clone();
+    if control_snapshot.current_state != IoNodeLifecycleState::Configured {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error_code": "node_not_ready",
+                "error_message": control_snapshot
+                    .last_error
+                    .as_ref()
+                    .map(|err| err.message.clone())
+                    .unwrap_or_else(|| "linkedhelper node is not configured".to_string())
+            })),
+        )
+            .into_response();
+    }
+
     let adapter_id_header = match headers
         .get("X-Fluxbee-Adapter-Id")
         .and_then(|value| value.to_str().ok())
@@ -944,7 +1197,7 @@ async fn post_poll(
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({
                     "error_code": "missing_bearer_token",
-                    "error_message": "Authorization: Bearer <installation_key> is required"
+                    "error_message": "Authorization: Bearer <adapter_secret> is required"
                 })),
             )
                 .into_response()
@@ -952,22 +1205,56 @@ async fn post_poll(
     };
 
     let registry = state.runtime_registry.read().await;
-    let Some(runtime) = registry.adapters.get(adapter_id_header) else {
+    let Some(runtime) = registry.binding.as_ref() else {
         return (
-            StatusCode::UNAUTHORIZED,
+            StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({
-                "error_code": "unknown_adapter",
-                "error_message": "adapter_id is not configured"
+                "error_code": "node_binding_unavailable",
+                "error_message": "linkedhelper node has no active managed instance binding"
             })),
         )
             .into_response();
     };
-    if runtime.installation_key != bearer {
+    if runtime.adapter_id != adapter_id_header {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error_code": "adapter_not_allowed",
+                "error_message": "adapter_id is not authorized for this managed instance"
+            })),
+        )
+            .into_response();
+    }
+    let Some(expected_secret) = runtime.adapter_secret.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error_code": "auth_secret_unavailable",
+                "error_message": "linkedhelper node could not resolve its adapter secret"
+            })),
+        )
+            .into_response();
+    };
+    if expected_secret != bearer {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
-                "error_code": "invalid_installation_key",
-                "error_message": "invalid installation key"
+                "error_code": "invalid_adapter_secret",
+                "error_message": "invalid adapter secret"
+            })),
+        )
+            .into_response();
+    }
+    let request_size = serde_json::to_vec(&request).map(|bytes| bytes.len()).unwrap_or(0);
+    if request_size > registry.max_request_bytes {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error_code": "request_too_large",
+                "error_message": format!(
+                    "request body exceeds configured max_request_bytes ({})",
+                    registry.max_request_bytes
+                )
             })),
         )
             .into_response();
@@ -987,6 +1274,45 @@ async fn post_poll(
         )
             .into_response();
     }
+    if request
+        .managed_instance_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        != Some(runtime.managed_instance_id.as_str())
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error_code": "managed_instance_id_mismatch",
+                "error_message": "managed_instance_id does not match this node binding"
+            })),
+        )
+            .into_response();
+    }
+    if let Some(expected_local_instance_id) = runtime
+        .local_instance_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if request
+            .local_instance_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            != Some(expected_local_instance_id)
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error_code": "local_instance_id_mismatch",
+                    "error_message": "local_instance_id does not match this node binding"
+                })),
+            )
+                .into_response();
+        }
+    }
 
     let request_id = request
         .request_id
@@ -1000,7 +1326,7 @@ async fn post_poll(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("heartbeat");
+        .unwrap_or_else(|| if request.items.is_empty() { "heartbeat" } else { "events" });
     let mut durable_state = state.durable_state.read().await.clone();
     durable_state.mark_adapter_poll(&runtime.adapter_id, request_id);
     refresh_pending_profiles_for_adapter(state.as_ref(), &runtime, &mut durable_state);
@@ -1133,18 +1459,24 @@ async fn post_poll(
 
     tracing::debug!(
         adapter_id = %runtime.adapter_id,
+        managed_instance_id = %runtime.managed_instance_id,
         adapter_label = %runtime.label.as_deref().unwrap_or(""),
         tenant_id = %runtime.tenant_id,
+        local_instance_id = %runtime.local_instance_id.as_deref().unwrap_or(""),
         dst_node = %runtime.dst_node.as_deref().unwrap_or(""),
+        mode = %runtime.mode,
         request_id = %request_id,
-        mode = %mode,
+        poll_mode = %mode,
         item_count = request.items.len(),
         "io-linkedhelper poll processed"
     );
 
     Json(PollResponse {
+        ok: true,
+        accepted_at: chrono::Utc::now().to_rfc3339(),
         response_id: format!("resp:{request_id}"),
         adapter_id: runtime.adapter_id,
+        actions: Vec::new(),
         items,
     })
     .into_response()

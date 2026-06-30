@@ -134,6 +134,7 @@ Cuando el adapter recibe que el ICH LH de un profile tiene automatización desac
 El nodo `IO.linkedhelper`:
 
 - recibe eventos del adapter;
+- opera para una sola `managed_instance_id` por instancia de nodo en el camino intermedio vigente;
 - crea o resuelve identidades provisorias cuando haga falta;
 - coordina el estado mínimo necesario del canal;
 - traduce al modelo Fluxbee;
@@ -157,6 +158,15 @@ Pero mientras un profile no tenga identidad/estado suficiente o su ICH propio no
 ### A. Recepción y validación inicial
 Recibir y validar mínimamente los eventos enviados por el adapter.
 
+Esto incluye hoy:
+
+- `adapter_id` del header y del body;
+- `managed_instance_id` del body;
+- `local_instance_id` cuando el binding del nodo la conoce;
+- y el bearer secret del adapter.
+
+El secret no debe vivir inline en config; el nodo lo resuelve desde Vault y lo cachea en memoria.
+
 ### B. Creación de ILK provisorio para profiles nuevos
 Cuando detecta un profile nuevo:
 
@@ -179,6 +189,12 @@ Cuando detecta que el ILK está listo, lo devuelve al adapter mediante beacon/po
 ### G. Cola de resultados por adapter
 Debe mantener una cola o conjunto de resultados pendientes por adapter.
 
+En el estado actual del repo:
+
+- el nodo ya persiste `pending_deliveries` por adapter;
+- drena esa cola durante poll/heartbeat;
+- y colapsa cambios de estado por `ich_id`.
+
 ### H. Gating por profile
 Debe impedir que un profile no listo avance a automatización.
 El bloqueo es por profile; un profile no bloquea a otro.
@@ -194,6 +210,25 @@ Además de monitorear ILKs pendientes, el nodo debe llevar registro de cambios p
 
 ### K. Colapso del último estado por ICH
 Si existe ya un cambio pendiente para un ICH y luego ocurre un nuevo cambio del mismo ICH, debe prevalecer el último estado relevante en vez de enviar ambos, salvo que en el futuro se defina explícitamente otro esquema con versionado/timestamps.
+
+## 4.2.1. Configuración mínima vigente del nodo
+
+En el camino intermedio actual, el nodo debe considerarse configurado con:
+
+- `managed_instance_id`
+- `tenant_id`
+- `listen.address`
+- `listen.port`
+- `adapter.adapter_id`
+- `adapter.local_instance_id` opcional
+- `adapter.auth = { type: vault_ref, resource_type: linkedhelper_adapter, key: ... }`
+- `mode = direct_http_intermediate`
+
+Consecuencias:
+
+- el nodo es 1:1 con una instancia aprobada;
+- no acepta múltiples adapters configurados en paralelo;
+- y queda no operativo si no puede resolver el secret del adapter desde Vault.
 
 ## 4.3. Monitoreo legítimo del nodo
 
@@ -228,7 +263,7 @@ No debería centralizar:
 
 El nodo debería persistir de forma durable, como mínimo:
 
-- mappings installation/adapter ↔ profile ↔ ILK/ICH;
+- mappings adapter/managed_instance ↔ profile ↔ ILK/ICH;
 - ILKs provisorios pendientes;
 - último estado observado de automatización por ICH para LH;
 - cambios pendientes de entregar al adapter;

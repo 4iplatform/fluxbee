@@ -26,7 +26,8 @@
 ## 2. Contrato y mecanismo externo
 
 - [x] Definir primer shape implementable de request/response HTTP
-- [x] Definir headers mínimos de autenticación por installation key
+- [x] Definir headers mínimos de autenticación por adapter secret resuelto desde Vault
+- [x] Definir binding mínimo `adapter_id + managed_instance_id + local_instance_id`
 - [x] Definir envelope mínimo para `heartbeat`
 - [x] Definir envelope mínimo para `profile_create`
 - [x] Definir envelope mínimo para `conversation_message`
@@ -39,7 +40,8 @@
 Nota:
 
 - el JSON exacto sigue siendo tentativo;
-- este bloque apunta a fijar una primera versión implementable, no el contrato final definitivo.
+- este bloque apunta a fijar una primera versión implementable, no el contrato final definitivo;
+- el runtime actual ya valida `managed_instance_id` y `local_instance_id` en `/v1/poll`.
 
 ---
 
@@ -48,21 +50,23 @@ Nota:
 - [x] Crear crate/bin `IO.linkedhelper`
 - [x] Agregar schema base del nodo
 - [x] Definir config mínima inicial
+- [x] Pasar a modelo 1 nodo = 1 `managed_instance_id`
 - [x] Implementar arranque HTTP único
-- [x] Implementar autenticación mínima por installation key
+- [x] Implementar autenticación mínima por secret resuelto desde Vault
 - [x] Implementar parsing inicial de batch
 
 Nota:
 
 - el skeleton actual compila y expone `GET /schema`, `POST /v1/poll` y control-plane básico;
-- el batch ya autentica, procesa `profile_create`, procesa `conversation_message` y responde `heartbeat` / `ack` / `result`;
+- el batch ya autentica, valida binding de instancia, procesa `profile_create`, procesa `conversation_message` y responde `heartbeat` / `ack` / `result`;
 - el monitoreo de SHM y la store durable ya existen en forma MVP.
 
 ---
 
 ## 4. Estado durable mínimo
 
-- [x] Persistir mapping `adapter_id ↔ installation key` o referencia equivalente
+- [x] Persistir mapping `adapter_id ↔ auth key ref` o referencia equivalente
+- [x] Persistir binding `adapter_id ↔ managed_instance_id`
 - [x] Persistir mapping `adapter ↔ profiles descubiertos`
 - [x] Persistir mapping `external_profile_id ↔ ILK`
 - [x] Persistir listado de ILKs provisorios pendientes
@@ -72,7 +76,7 @@ Nota:
 
 Nota:
 
-- el nodo ya persiste una store JSON durable propia con adapters sincronizados, referencia de installation key, metadata básica de poll y pending deliveries por adapter;
+- el nodo ya persiste una store JSON durable propia con adapter sincronizado, referencia de auth key, metadata básica de poll y pending deliveries por adapter;
 - el poll/heartbeat ya drena pending deliveries desde esa store;
 - el nodo ya produce y persiste estado real de profiles, ILKs observados y estados de ICH propios;
 - esta store local cumple para el MVP, pero no debe considerarse el destino final de producción;
