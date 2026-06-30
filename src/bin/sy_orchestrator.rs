@@ -901,6 +901,41 @@ fn ensure_motherbee_mesh_tls(hive_id: &str) {
     }
 }
 
+/// Motherbee boot: ensure the SSH bootstrap key the orchestrator uses to reach
+/// new hives (`add_hive`, key-first) exists. Generated here — not at package
+/// install — so a motherbee provisioned by any path (e.g. the .deb, whose
+/// postinst only creates the dir) has the key before the first `add_hive`.
+/// Idempotent; best-effort (a failure only blocks add_hive, not boot).
+fn ensure_motherbee_ssh_key() {
+    let key = Path::new(MOTHERBEE_SSH_KEY_PATH);
+    if key.exists() {
+        return;
+    }
+    if let Some(dir) = key.parent() {
+        if let Err(err) = fs::create_dir_all(dir) {
+            tracing::warn!(error = %err, "failed to create ssh dir for motherbee key");
+            return;
+        }
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+    match Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-q", "-f", MOTHERBEE_SSH_KEY_PATH])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            let _ = fs::set_permissions(key, fs::Permissions::from_mode(0o600));
+            let pub_path = format!("{MOTHERBEE_SSH_KEY_PATH}.pub");
+            let _ = fs::set_permissions(Path::new(&pub_path), fs::Permissions::from_mode(0o644));
+            tracing::info!(path = MOTHERBEE_SSH_KEY_PATH, "generated motherbee SSH bootstrap key");
+        }
+        Ok(o) => tracing::warn!(
+            stderr = %String::from_utf8_lossy(&o.stderr),
+            "ssh-keygen failed for motherbee key"
+        ),
+        Err(err) => tracing::warn!(error = %err, "ssh-keygen unavailable; motherbee SSH key not generated"),
+    }
+}
+
 /// add_hive: issue a leaf for `hive_id` and distribute the mesh TLS material to
 /// the remote node's `/var/lib/fluxbee/tls/<hive_id>/` over the authenticated SSH
 /// channel. Best-effort (logged): the WAN degrades to plaintext without certs, so
@@ -1003,6 +1038,7 @@ async fn bootstrap_local(
     // before rt-gateway starts (the router loads certs at startup). Then, off the
     // boot path, catch up TLS material for hives provisioned before mTLS existed.
     if state.is_motherbee {
+        ensure_motherbee_ssh_key();
         ensure_motherbee_mesh_tls(&state.hive_id);
         tokio::task::spawn_blocking(reconcile_hive_tls_material);
     }
@@ -14256,6 +14292,73 @@ fn core_bin_paths_for_role(
         .collect())
 }
 
+/// add_hive: push the motherbee's vendor runtime (syncthing binary + manifest +
+/// optional config template) to the worker, so the worker's blob/dist-sync setup
+/// finds the vendored syncthing during finalize. Mirrors `sync_core_to_worker`.
+/// Best-effort by contract of its caller: if the motherbee has no vendor manifest
+/// there is nothing to push, so this returns Ok and the join proceeds.
+fn sync_vendor_to_worker(
+    hive_id: &str,
+    address: &str,
+    key_path: &Path,
+    user: &str,
+) -> Result<(), OrchestratorError> {
+    let Some(manifest_path) = local_vendor_manifest_path() else {
+        tracing::warn!(hive_id = hive_id, "no local vendor manifest; skipping vendor sync to worker");
+        return Ok(());
+    };
+    let bin_path = Path::new(DIST_SYNCTHING_VENDOR_SOURCE_PATH);
+    if !bin_path.exists() {
+        tracing::warn!(hive_id = hive_id, "vendor manifest present but syncthing binary missing; skipping vendor sync");
+        return Ok(());
+    }
+    let cfg_path = local_vendor_component_path("syncthing/config.xml");
+
+    let mut upload_paths = vec![manifest_path.display().to_string(), bin_path.display().to_string()];
+    if let Some(cfg) = &cfg_path {
+        upload_paths.push(cfg.display().to_string());
+    }
+    let upload_refs: Vec<&str> = upload_paths.iter().map(String::as_str).collect();
+
+    let remote_stage = format!("/tmp/fluxbee-vendor-sync-{}", sanitize_unit_suffix(hive_id));
+    ssh_with_key(
+        address,
+        key_path,
+        &format!("rm -rf '{stage}' && mkdir -p '{stage}'", stage = shell_single_quote(&remote_stage)),
+        user,
+    )?;
+    scp_with_key(address, key_path, &upload_refs, &format!("{remote_stage}/"), user)?;
+
+    let mut commands = vec![
+        "set -euo pipefail".to_string(),
+        "mkdir -p /var/lib/fluxbee/dist/vendor/syncthing".to_string(),
+        format!(
+            "install -m 0644 '{stage}/manifest.json' '/var/lib/fluxbee/dist/vendor/manifest.json'",
+            stage = shell_single_quote(&remote_stage),
+        ),
+        format!(
+            "install -m 0755 '{stage}/syncthing' '/var/lib/fluxbee/dist/vendor/syncthing/syncthing'",
+            stage = shell_single_quote(&remote_stage),
+        ),
+    ];
+    if cfg_path.is_some() {
+        commands.push(format!(
+            "install -m 0644 '{stage}/config.xml' '/var/lib/fluxbee/dist/vendor/syncthing/config.xml'",
+            stage = shell_single_quote(&remote_stage),
+        ));
+    }
+    commands.push(format!("rm -rf '{stage}'", stage = shell_single_quote(&remote_stage)));
+    let promote = commands.join(" && ");
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&promote))),
+        user,
+    )?;
+    tracing::info!(hive_id = hive_id, "synced vendor runtime (syncthing) to worker");
+    Ok(())
+}
+
 fn sync_core_to_worker(
     hive_id: &str,
     address: &str,
@@ -15823,6 +15926,13 @@ async fn add_hive_flow(
             "error_code": "CONFIG_FAILED",
             "message": err.to_string(),
         });
+    }
+
+    // Push the vendor runtime (syncthing) so the worker's finalize can set up
+    // blob/dist sync; best-effort — a hiccup must not fail the join (the mTLS
+    // link is already up by now), it just leaves sync unavailable until repaired.
+    if let Err(err) = sync_vendor_to_worker(hive_id, address, &key_path, creds.user.as_str()) {
+        tracing::warn!(hive_id = hive_id, error = %err, "vendor sync to worker failed; blob/dist sync may be unavailable");
     }
 
     let wan_listen = state.wan_listen.clone().unwrap_or_default();

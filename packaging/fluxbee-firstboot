@@ -41,17 +41,18 @@ for _ in $(seq 1 20); do
 done
 
 # The DB consumers (storage/identity) connect to postgres at startup; if they
-# came up before the secret was in the vault they stay "not initialized" until
-# they reconnect. Restart them so they re-register with the router, THEN restart
-# vault last so its VAULT_SECRET_CHANGED broadcast reaches the already-registered
-# consumers (Model D' vault-last ordering — broadcasts only reach nodes that are
-# registered at the moment of emission). Finally re-kick the orchestrator so its
-# sy-storage readiness gate passes.
-echo "== [4/5] reconnect DB consumers (Model D': consumers first, vault last) =="
-systemctl restart sy-storage sy-identity 2>/dev/null || true
-sleep 4
+# came up before the secret was in the vault they stay "not initialized". The
+# secret is now persisted in vault.db, so restart vault FIRST (it comes up
+# holding the secret), THEN the consumers — each PULLS the secret from the live
+# vault on startup. This startup pull is robust because it doesn't depend on
+# broadcast timing (the VAULT_SECRET_CHANGED broadcast still drives runtime
+# secret changes; here we just want the consumers to acquire the existing one).
+# Finally re-kick the orchestrator so its sy-storage readiness gate passes.
+echo "== [4/5] reconnect DB consumers (vault up first, consumers pull the secret) =="
 systemctl restart sy-vault 2>/dev/null || true
-sleep 4
+sleep 6
+systemctl restart sy-storage sy-identity 2>/dev/null || true
+sleep 6
 systemctl reset-failed sy-orchestrator 2>/dev/null || true
 systemctl restart sy-orchestrator
 
