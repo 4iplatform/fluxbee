@@ -495,6 +495,12 @@ struct OrchestratorState {
     // latency regression. The registry is guarded by a brief std mutex (never held
     // across an await); each per-hive lock is an async mutex held for the whole flow.
     hive_topology_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    // SO-04: serialize node lifecycle/config per node_name. run_node/kill_node/
+    // start/restart/remove/config_set each touch identity, the local config file,
+    // systemd and timers across a long unlocked window; two concurrent ops on the
+    // SAME node race and drift those stores. Per-node (not global) so different
+    // nodes still operate concurrently. Same registry pattern as the hive lock.
+    node_lifecycle_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
     rpc: OnceLock<Arc<RouterDispatcher>>,
 }
 
@@ -518,6 +524,24 @@ impl OrchestratorState {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             registry
                 .entry(hive_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+
+    /// SO-04: acquire the per-node lifecycle lock, held for the whole
+    /// run/kill/start/restart/remove/config_set flow so concurrent ops on the
+    /// same node don't drift identity/config/systemd. Keyed by the (validated,
+    /// normalized) node_name; the guard releases on drop, incl. early return.
+    async fn lock_node(&self, node_name: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut registry = self
+                .node_lifecycle_locks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry
+                .entry(node_name.to_string())
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
@@ -652,6 +676,7 @@ async fn main() -> Result<(), OrchestratorError> {
         dist: dist_runtime,
         blob_sync_last_desired: Mutex::new(blob_runtime),
         hive_topology_locks: std::sync::Mutex::new(HashMap::new()),
+        node_lifecycle_locks: std::sync::Mutex::new(HashMap::new()),
         rpc: OnceLock::new(),
     });
     tracing::info!(
@@ -12225,6 +12250,8 @@ async fn set_node_config_flow(
         }
     };
 
+    // SO-04: serialize with any concurrent lifecycle op on this node.
+    let _node_lock = state.lock_node(&node_name).await;
     if target_hive != state.hive_id {
         let mut forwarded_payload = payload.clone();
         if let Some(obj) = forwarded_payload.as_object_mut() {
@@ -12535,6 +12562,10 @@ async fn run_node_flow(
             "node_name": node_name,
         });
     }
+    // SO-04: hold the per-node lock across the whole spawn (identity + config
+    // preflight/write + systemd) so a concurrent run/kill/config on the same node
+    // can't interleave and drift those stores.
+    let _node_lock = state.lock_node(&node_name).await;
     let identity_primary_hive_id = match resolve_identity_primary_hive_id(state) {
         Ok(value) => value,
         Err(err) => {
@@ -13148,6 +13179,8 @@ async fn start_or_restart_node_flow(
         }
     };
 
+    // SO-04: serialize with any concurrent lifecycle op on this node.
+    let _node_lock = state.lock_node(&node_name).await;
     let request_msg = if restart {
         "RESTART_NODE"
     } else {
@@ -13313,6 +13346,8 @@ async fn kill_node_flow(
         });
     };
     let unit = unit_from_node_name(node_name_ref);
+    // SO-04: serialize with any concurrent lifecycle/config op on this node.
+    let _node_lock = state.lock_node(node_name_ref).await;
 
     let force = payload
         .get("force")
@@ -13626,6 +13661,8 @@ async fn remove_node_instance_flow(
         }
     };
 
+    // SO-04: serialize with any concurrent lifecycle op on this node.
+    let _node_lock = state.lock_node(&node_name).await;
     if target_hive != state.hive_id {
         return match forward_system_action_to_hive(
             state,
@@ -19523,6 +19560,7 @@ blob:
             dist: sample_dist_config(),
             blob_sync_last_desired: Mutex::new(sample_blob_config()),
             hive_topology_locks: StdMutex::new(HashMap::new()),
+            node_lifecycle_locks: StdMutex::new(HashMap::new()),
             rpc: OnceLock::new(),
         }
     }
