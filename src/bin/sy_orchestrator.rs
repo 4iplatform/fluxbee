@@ -4345,6 +4345,12 @@ fn egress_nft_ruleset(cfg: &EgressNatConfig) -> String {
     format!(
         "#!/usr/sbin/nft -f\n\
          # BEGIN FLUXBEE EGRESS NAT\n\
+         # SO-08: add + flush + define in ONE atomic `nft -f` transaction, so a\n\
+         # re-apply never has the delete-then-apply gap where ip_forward is on but\n\
+         # the fluxbee_egress table is momentarily absent. `add` is a no-op if the\n\
+         # table exists; `flush` empties it; the block below redefines it.\n\
+         add table {table}\n\
+         flush table {table}\n\
          table {table} {{\n\
          \tchain input {{\n\
          \t\ttype filter hook input priority 0; policy accept;\n\
@@ -4369,6 +4375,14 @@ fn egress_nft_ruleset(cfg: &EgressNatConfig) -> String {
         wan_iface = cfg.wan_iface,
         lan_cidr = cfg.lan_cidr,
     )
+}
+
+/// SO-08: read a kernel sysctl back from `/proc/sys/<rel>` (path form, e.g.
+/// `net/ipv4/ip_forward`). `Some(true)` iff the value is exactly `1`.
+fn read_sysctl_bool(rel: &str) -> Option<bool> {
+    fs::read_to_string(format!("/proc/sys/{rel}"))
+        .ok()
+        .map(|s| s.trim() == "1")
 }
 
 fn apply_sysctl_system() -> Result<(), OrchestratorError> {
@@ -4549,18 +4563,6 @@ fn default_route_via(gateway_ip: &str) -> bool {
     }
 }
 
-fn delete_egress_nft_table_if_present() -> Result<(), OrchestratorError> {
-    if !nft_table_loaded() {
-        return Ok(());
-    }
-    let mut cmd = Command::new("nft");
-    cmd.arg("delete")
-        .arg("table")
-        .arg("inet")
-        .arg("fluxbee_egress");
-    run_cmd(cmd, "nft delete fluxbee-egress table")
-}
-
 /// Smoke-test that the egress path reaches the internet. Tries ICMP first
 /// (cheap), then falls back to an HTTPS GET of the Fluxbee site. The HTTPS leg
 /// avoids the false-negative where a network blocks ICMP but allows 443 (the
@@ -4605,8 +4607,11 @@ fn reconcile_egress_nat(eg: &EgressSection) -> Result<EgressVerification, Orches
         tracing::info!(path = EGRESS_SYSCTL_PATH, "wrote egress sysctl");
     }
     apply_sysctl_system()?;
-    verification.ipv4_forwarding = true;
-    verification.ipv6_blocked = true;
+    // SO-08: report what the kernel actually has now, not an unconditional `true`
+    // — another process/policy could have rejected or reverted the sysctls.
+    verification.ipv4_forwarding = read_sysctl_bool("net/ipv4/ip_forward") == Some(true);
+    verification.ipv6_blocked =
+        read_sysctl_bool("net/ipv6/conf/all/disable_ipv6") == Some(true);
 
     // conntrack tuning: live max + persisted file + modprobe hashsize (boot).
     write_file_if_changed(
@@ -4625,7 +4630,9 @@ fn reconcile_egress_nat(eg: &EgressSection) -> Result<EgressVerification, Orches
     // then verify.
     let ruleset = egress_nft_ruleset(&cfg);
     write_file_if_changed(EGRESS_NFT_PATH, &ruleset)?;
-    delete_egress_nft_table_if_present()?;
+    // SO-08: the ruleset self-flushes atomically (add+flush+define in one
+    // transaction), so there is no separate delete step and thus no window where
+    // ip_forward is on but the fluxbee_egress table is absent.
     let mut apply = Command::new("nft");
     apply.arg("-f").arg(EGRESS_NFT_PATH);
     run_cmd(apply, "nft -f fluxbee-egress")?;
@@ -4826,8 +4833,28 @@ fn syncthing_unit_contents(blob: &BlobRuntimeConfig, service_user: &str) -> Stri
     )
 }
 
+/// SO-06: reject a value that could break or inject directives into a systemd
+/// unit file — a newline/control char, or (for paths) a non-absolute value.
+fn validate_unit_path_field(path: &Path, label: &str) -> Result<(), OrchestratorError> {
+    let s = path.to_string_lossy();
+    if s.chars().any(char::is_control) {
+        return Err(format!("{label} contains control characters").into());
+    }
+    if !path.is_absolute() {
+        return Err(format!("{label} must be an absolute path (got '{s}')").into());
+    }
+    Ok(())
+}
+
 fn ensure_syncthing_unit(blob: &BlobRuntimeConfig) -> Result<(), OrchestratorError> {
     let service_user = resolve_syncthing_service_user(blob)?;
+    // SO-06: service_user and sync_data_dir are interpolated verbatim into a
+    // root-written systemd unit file; reject control chars / non-absolute paths
+    // that could break the unit or inject directives before writing it.
+    if service_user.chars().any(char::is_control) {
+        return Err("syncthing: service user contains control characters".into());
+    }
+    validate_unit_path_field(&blob.sync_data_dir, "blob.sync.data_dir")?;
     let unit_contents = syncthing_unit_contents(blob, &service_user);
     let unit_path =
         Path::new("/etc/systemd/system").join(format!("{SYNCTHING_SERVICE_NAME}.service"));
@@ -17111,6 +17138,18 @@ struct BootstrapCreds {
     password: Option<String>,
 }
 
+/// Whether `user` is a valid unix/ssh login: `^[a-z_][a-z0-9_-]*$`, max 32.
+/// Guards the operator-supplied `ssh_user` before it reaches remote shell/ssh.
+fn is_valid_ssh_user(user: &str) -> bool {
+    let bytes = user.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 32
+        && (bytes[0].is_ascii_lowercase() || bytes[0] == b'_')
+        && bytes
+            .iter()
+            .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
 /// Resolve the SSH bootstrap credentials from the `add_hive` payload. `ssh_user`
 /// is REQUIRED (no default); `ssh_password` is OPTIONAL (empty -> None). The
 /// password never gets a hardcoded fallback and is never logged or persisted.
@@ -17123,6 +17162,11 @@ fn resolve_add_hive_ssh_creds(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or("add_hive: 'ssh_user' is required (admin login for SSH bootstrap)")?;
+    // B-1: constrain to a valid unix/ssh login charset before it is embedded into
+    // remote shell commands / ssh targets (some sites interpolate it unquoted).
+    if !is_valid_ssh_user(&user) {
+        return Err("add_hive: 'ssh_user' must match ^[a-z_][a-z0-9_-]*$ (max 32)".into());
+    }
     // Do NOT trim the password: a legitimate password may have significant
     // leading/trailing spaces. Reject only a whitespace-only value (which is the
     // operator omitting it), keeping the rest verbatim.
@@ -18680,11 +18724,35 @@ mod tests {
             "ruleset must be deterministic for idempotent re-apply"
         );
         assert!(a.contains("table inet fluxbee_egress"));
-        assert!(!a.contains("add table inet fluxbee_egress"));
+        // SO-08: self-flushing atomic apply (add + flush + define) — no separate
+        // delete step, so no window where forwarding is on but the table is gone.
+        assert!(a.contains("add table inet fluxbee_egress"));
+        assert!(a.contains("flush table inet fluxbee_egress"));
         assert!(!a.contains("delete table inet fluxbee_egress"));
         assert!(a.contains("ip saddr 192.168.8.0/24 oifname \"eth0\" masquerade"));
         assert!(a.contains("iifname \"eth1\" oifname \"eth0\" ip saddr 192.168.8.0/24 accept"));
         assert!(a.contains("meta nfproto ipv6 drop"));
+    }
+
+    #[test]
+    fn ssh_user_validation_blocks_metachars() {
+        assert!(is_valid_ssh_user("fluxbee"));
+        assert!(is_valid_ssh_user("root"));
+        assert!(is_valid_ssh_user("_svc-01"));
+        assert!(!is_valid_ssh_user(""));
+        assert!(!is_valid_ssh_user("a'b"));
+        assert!(!is_valid_ssh_user("a b"));
+        assert!(!is_valid_ssh_user("a;b"));
+        assert!(!is_valid_ssh_user("../etc"));
+        assert!(!is_valid_ssh_user("1abc")); // must not start with a digit
+        assert!(!is_valid_ssh_user(&"x".repeat(33)));
+    }
+
+    #[test]
+    fn unit_path_field_rejects_control_and_relative() {
+        assert!(validate_unit_path_field(Path::new("/var/lib/fluxbee/syncthing"), "d").is_ok());
+        assert!(validate_unit_path_field(Path::new("/a\nExecStartPre=/evil"), "d").is_err());
+        assert!(validate_unit_path_field(Path::new("relative/path"), "d").is_err());
     }
 
     #[test]
