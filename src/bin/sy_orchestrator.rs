@@ -800,6 +800,7 @@ async fn run_system_worker(
 /// Write a secret file owner-only from creation (no world-readable window).
 fn write_secret_file_0600(path: &Path, contents: &str) -> Result<(), OrchestratorError> {
     use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -810,6 +811,10 @@ fn write_secret_file_0600(path: &Path, contents: &str) -> Result<(), Orchestrato
         .mode(0o600)
         .open(path)?;
     f.write_all(contents.as_bytes())?;
+    // SO-07: `.mode(0o600)` only applies when the file is CREATED; truncating a
+    // pre-existing wider-mode file keeps the old bits. Re-assert 0600 after write
+    // so a rotation/rewrite of e.g. cert.key can never leave it world-readable.
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
@@ -2093,9 +2098,44 @@ async fn handle_system_message(
     msg: &Message,
     state: &OrchestratorState,
 ) -> Result<(), OrchestratorError> {
-    // SYSTEM origin-authority is now enforced centrally by the router at delivery
-    // time (system_policy::authority); an unauthorized protected SYSTEM action never
-    // reaches this node, so the orchestrator no longer re-checks it here (F4/F15).
+    // SYSTEM origin-authority is enforced centrally by the router at delivery time
+    // (system_policy::authority); an unauthorized protected SYSTEM action should
+    // never reach this node (F4/F15).
+    //
+    // SO-05 (defense in depth): re-check protected actions locally against the
+    // SAME shared policy, so a boundary bypass — a test path, a stale/mixed
+    // router version, a future alternate delivery route, or a
+    // serialize_for_local_delivery regression — cannot execute a critical
+    // mutation here on an unauthorized or unresolved origin. In the normal path
+    // this is a no-op (the message already passed the identical router check).
+    if let Some(action) = msg.meta.msg.as_deref() {
+        if json_router::router::system_policy::is_protected_system_action(action)
+            && !json_router::router::system_policy::authority(
+                action,
+                msg.routing.src_l2_name.as_deref(),
+                &state.hive_id,
+            )
+        {
+            tracing::warn!(
+                action = action,
+                src_uuid = %msg.routing.src,
+                src_l2_name = ?msg.routing.src_l2_name,
+                "SO-05: local authority guard rejected a protected SYSTEM action (router boundary bypass?)"
+            );
+            let _ = send_system_action_response(
+                sender,
+                msg,
+                &format!("{action}_RESPONSE"),
+                serde_json::json!({
+                    "status": "error",
+                    "error_code": "UNAUTHORIZED",
+                    "message": "unauthorized SYSTEM origin",
+                }),
+            )
+            .await;
+            return Ok(());
+        }
+    }
     match msg.meta.msg.as_deref() {
         Some("RUNTIME_UPDATE") => {
             let payload = serde_json::json!({
@@ -12515,12 +12555,11 @@ async fn run_node_flow(
         });
     }
 
-    let unit = payload
-        .get("unit")
-        .and_then(|v| v.as_str())
-        .map(|v| sanitize_unit_suffix(v.trim()))
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| unit_from_node_name(&node_name));
+    // SO-01: the systemd unit is ALWAYS derived from the validated, managed
+    // node_name (`unit_from_node_name` prefixes `fluxbee-node-`), never taken
+    // from the caller — so a lifecycle-authorized caller cannot spawn/register
+    // against an arbitrary host unit (sy-orchestrator, ssh, postgresql, ...).
+    let unit = unit_from_node_name(&node_name);
 
     if target_hive != state.hive_id {
         let mut forwarded_payload = payload.clone();
@@ -12624,6 +12663,35 @@ async fn run_node_flow(
         return payload;
     }
 
+    // SO-03: preflight the local node config BEFORE any SY.identity mutation, so a
+    // re-run against an existing node returns NODE_ALREADY_EXISTS without having
+    // registered/updated identity + the local mapping (which would otherwise
+    // leave orphaned ILK/mapping state that blocks a clean retry).
+    let config_path = match node_effective_config_path(state, &node_name) {
+        Ok(path) => path,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+                "unit": unit,
+            });
+        }
+    };
+    if config_path.exists() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "NODE_ALREADY_EXISTS",
+            "message": format!("node config already exists: {}", config_path.display()),
+            "target": target_hive,
+            "node_name": node_name,
+            "unit": unit,
+            "config": { "path": config_path.display().to_string() },
+        });
+    }
+
     let identity_register = match ensure_node_identity_registered(
         state,
         payload,
@@ -12694,34 +12762,7 @@ async fn run_node_flow(
         "register": identity_register,
         "update": identity_update,
     });
-    let config_path = match node_effective_config_path(state, &node_name) {
-        Ok(path) => path,
-        Err(err) => {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "INVALID_REQUEST",
-                "message": err.to_string(),
-                "target": target_hive,
-                "node_name": node_name,
-                "unit": unit,
-                "identity": identity,
-            });
-        }
-    };
-    if config_path.exists() {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "NODE_ALREADY_EXISTS",
-            "message": format!("node config already exists: {}", config_path.display()),
-            "target": target_hive,
-            "node_name": node_name,
-            "unit": unit,
-            "identity": identity,
-            "config": {
-                "path": config_path.display().to_string(),
-            }
-        });
-    }
+    // (config preflight already done above, before identity mutation — SO-03)
     let package_path = entrypoint.runtime_base.as_ref().map(|_| {
         runtime_package_dir(&runtime_key, &version)
             .display()
@@ -12804,16 +12845,24 @@ async fn run_node_flow(
             "identity": identity,
             "config": node_config,
         }),
-        Err(err) => serde_json::json!({
-            "status": "error",
-            "error_code": "SPAWN_FAILED",
-            "message": err.to_string(),
-            "target": target_hive,
-            "node_name": node_name,
-            "unit": unit,
-            "identity": identity,
-            "config": node_config,
-        }),
+        Err(err) => {
+            // SO-03: the config was written but the process failed to start.
+            // Remove the config (best-effort) so a retry isn't blocked by
+            // NODE_ALREADY_EXISTS and no orphan config lingers with no unit.
+            // Identity registration is an idempotent upsert-by-node_name, so a
+            // retry re-registers cleanly.
+            let _ = std::fs::remove_file(&config_path);
+            serde_json::json!({
+                "status": "error",
+                "error_code": "SPAWN_FAILED",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+                "unit": unit,
+                "identity": identity,
+                "config": node_config,
+            })
+        }
     }
 }
 
@@ -13224,24 +13273,19 @@ async fn kill_node_flow(
         }
     };
 
-    let unit = payload
-        .get("unit")
-        .and_then(|v| v.as_str())
-        .map(|v| sanitize_unit_suffix(v.trim()))
-        .filter(|v| !v.is_empty())
-        .or_else(|| {
-            validated_node_name
-                .as_ref()
-                .map(|name| unit_from_node_name(name))
-        });
-
-    let Some(unit) = unit else {
+    // SO-01: KILL_NODE requires a validated managed node_name and ALWAYS derives
+    // the unit from it (`fluxbee-node-*`); a caller-supplied `unit` is never
+    // honored, so this cannot stop arbitrary host units (sy-orchestrator, ssh,
+    // postgresql, rt-gateway, ...). `validated_node_name` stays `Option` (now
+    // always `Some`) for the purge/forward paths below.
+    let Some(node_name_ref) = validated_node_name.as_deref() else {
         return serde_json::json!({
             "status": "error",
             "error_code": "INVALID_REQUEST",
-            "message": "missing unit or node_name",
+            "message": "node_name is required",
         });
     };
+    let unit = unit_from_node_name(node_name_ref);
 
     let force = payload
         .get("force")

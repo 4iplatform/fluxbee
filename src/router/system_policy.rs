@@ -22,7 +22,7 @@
 /// when the router-resolved origin is authorized. Single source of truth — moved
 /// out of the orchestrator so origin-authority is enforced once, centrally, at
 /// delivery time.
-pub(crate) const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
+pub const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
     "SYSTEM_UPDATE",
     "SYSTEM_SYNC_HINT",
     "SPAWN_NODE",
@@ -45,7 +45,7 @@ pub(crate) const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
 
 /// Whether `action` is a protected SYSTEM action subject to the system authority
 /// gate.
-pub(crate) fn is_protected_system_action(action: &str) -> bool {
+pub fn is_protected_system_action(action: &str) -> bool {
     PROTECTED_SYSTEM_ACTIONS.contains(&action)
 }
 
@@ -66,7 +66,7 @@ pub(crate) fn is_protected_system_action(action: &str) -> bool {
 /// the node registry, overwriting any sender-supplied value), so this is a real
 /// boundary, not a self-asserted one. The `SY.` patterns are also surfaced as
 /// frozen SHM route entries for observability (see `crate::shm::FLAG_FROZEN`).
-pub(crate) fn authority(action: &str, src_l2_name: Option<&str>, hive_id: &str) -> bool {
+pub fn authority(action: &str, src_l2_name: Option<&str>, hive_id: &str) -> bool {
     let Some(name) = src_l2_name.map(str::trim).filter(|value| !value.is_empty()) else {
         return false;
     };

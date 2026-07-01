@@ -1,4 +1,4 @@
-mod system_policy;
+pub mod system_policy;
 
 use std::collections::HashMap;
 use std::fs;
