@@ -238,7 +238,7 @@ Verificacion previa: los 8 findings fueron confirmados contra el codigo actual (
 | SO-2026-06-30-07 | Media/Baja | **Resuelto** — `write_secret_file_0600` re-asegura 0600 post-write. | `0f0400a` |
 | SO-2026-06-30-08 | Baja/Media | **Resuelto** — readback real de sysctl; nft add+flush+define atomico (sin delete-then-apply). | `cec4195` |
 | B-1 (nuevo) | Baja | **Resuelto** — `ssh_user` validado por charset antes de tocar shell/ssh. | `cec4195` |
-| B-2 (nuevo) | Baja | **Abierto** — mismo cleanup-on-early-return que SO-02 (la distribucion de identity-key agrega otro early-return fatal en la ventana SSH-abierta). | — |
-| B-3 (nuevo) | Info | **Diferido** — valores del worker `hive.yaml` van por `tee` (sin shell injection); son derivados internos, riesgo muy bajo. | — |
+| B-2 (nuevo) | Baja | **Resuelto** — best-effort revoke de la bootstrap key en add_hive fallido (worker/egress) + flag `ssh_bootstrap_open` en el resultado de error. | `d37d29a` |
+| B-3 (nuevo) | Info | **Resuelto** — `validate_yaml_scalar` sobre los valores interpolados en el worker/egress `hive.yaml` (rechaza quote/backslash/control-char). | `d37d29a` |
 
-Resueltos: **10/11** — los 3 Altas (SO-01/02/03) + los 4 Media (SO-04/05 + SO-06/08) + los 2 Baja (SO-07 + B-1). SO-02 se cerro con re-validacion 2-VM en el lab Proxmox. Pendientes menores: **B-2** (Baja — flag `ssh_bootstrap_open` en early-returns parciales; la key es self-targeting, riesgo acotado) y **B-3** (Info — valores del worker hive.yaml, van por tee, derivados internos). Tests: `cargo test --bin sy_orchestrator` 108 passed / 0 failed en cada batch.
+Resueltos: **11/11** — los 8 findings originales de la auditoria (SO-01..08) + los 3 nuevos (B-1/B-2/B-3). SO-02 (revoke SSH bootstrap) se cerro con re-validacion 2-VM en el lab Proxmox. Ningun pendiente. Tests: `cargo test --bin sy_orchestrator` 109 passed / 0 failed. Commits: `0f0400a` (SO-01/03/05/07), `cec4195` (SO-06/08/B-1), `57b9e71` (SO-04), `cc76814` (SO-02), `d37d29a` (B-2/B-3).
