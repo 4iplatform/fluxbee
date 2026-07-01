@@ -116,3 +116,108 @@ contained follow-up: SDK (`AnthropicClient` + factory) → vault resolver → `h
 `ai:` section + `HiveFile` → swap the `SY.cognition` constants/gates for the factory →
 AI-node override. See also the audit/lab state in
 `.../memory/fluxbee-audit-lab-state.md`.
+
+## Code-review findings to fold into implementation
+
+Added 2026-06-30 after reviewing this design against the current code. These do not
+invalidate the two-tier target, but they should be handled before treating this note
+as implementation-ready.
+
+### 1. `SY.architect` is missing from the Tier 1 scope
+
+The current note says the only `SY.*` AI consumer is `SY.cognition`, but
+`SY.architect` already runs AI directly:
+
+- It has its own `HiveFile` and `ArchitectNodeConfigFile` with
+  `ai_providers.openai` (`src/bin/sy_architect.rs:200-241`).
+- `build_architect_ai_runtime()` resolves the OpenAI key from Vault, picks a model
+  from merged config/hive settings, and constructs `OpenAiResponsesClient`
+  (`src/bin/sy_architect.rs:6121-6164`).
+- Multiple architect flows build OpenAI function-calling models directly from that
+  runtime (`src/bin/sy_architect.rs:2044-2048`, `src/bin/sy_architect.rs:10202-10206`).
+
+Implementation implication: Tier 1 must explicitly include `SY.architect`, otherwise
+the hive-level provider switch would leave a core `SY.*` node pinned to OpenAI.
+
+### 2. Existing per-SY AI config needs a migration/deprecation plan
+
+The target says "no per-SY config", but current code exposes per-SY AI settings:
+
+- `SY.cognition` accepts `config.semantic_tagger.provider/model` and rejects anything
+  except `openai` today (`src/bin/sy_cognition.rs:2728-2750`).
+- `SY.architect` exposes `config.ai_providers.openai.default_model/max_tokens/
+  temperature/top_p` in its local config contract (`src/bin/sy_architect.rs:11345-11368`).
+
+Implementation implication: define whether these fields are removed, ignored, migrated
+to the hive default, or kept as temporary compatibility aliases. If they stay, they
+conflict with the operator goal of a single hive-level `SY.*` default.
+
+### 3. `hive.yaml` has no canonical AI config, but there is legacy local parsing
+
+The global `config/hive.yaml`, `packaging/hive.yaml.example`, and the shared
+`src/config/mod.rs::HiveFile` still have no canonical `ai:` section. However,
+`SY.architect` has a separate local `HiveFile` that already reads
+`ai_providers.openai` from hive config and merges it with node config
+(`src/bin/sy_architect.rs:200-229`, `src/bin/sy_architect.rs:6167-6189`).
+
+Implementation implication: the new `ai: { provider, model }` section should either
+replace or explicitly supersede the older `ai_providers.openai` shape. Update any
+architect docs/contracts that still mention the legacy shape so operators do not have
+two competing hive-level AI config formats.
+
+### 4. Tier 2 should distinguish dynamic `AI.*` nodes from `SY.frontdesk.gov`
+
+The note groups `ai-generic` and `ai-frontdesk-gov` as "AI-node instance choice".
+The current code treats them differently:
+
+- `ai-generic` is the dynamic AI runner; its effective config contains an optional
+  `behavior.provider`, but the runtime dispatch still keys only on
+  `behavior.kind == "openai_chat"` (`nodes/ai/ai-generic/src/bin/ai_node_runner.rs:248-266`,
+  `nodes/ai/ai-generic/src/bin/ai_node_runner.rs:4963-5008`).
+- `ai-frontdesk-gov` documents itself as `SY.frontdesk.gov`, a system node listed in
+  `hive.yaml`, not a dynamic spawn using `FLUXBEE_NODE_ILK_ID`
+  (`nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs:456-465`).
+- `ai-frontdesk-gov` resolves OpenAI from the root/system tenant, not a dynamic
+  per-node tenant (`nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs:1613-1630`).
+
+Implementation implication: Tier 2 should apply to dynamic `AI.*` instances. If
+`SY.frontdesk.gov` remains a system node, it should inherit Tier 1 unless/until there
+is an explicit decision to make it a configurable AI runtime instance.
+
+### 5. Anthropic support is not just `LlmClient`; multimodal/input parts are OpenAI-specific
+
+The SDK has a provider-agnostic `LlmClient` trait and `FunctionCallingModel` trait,
+but current input shaping and call sites still use OpenAI wire shapes:
+
+- `build_openai_user_content_parts()` emits `input_text`, `input_image`, and
+  `input_file` parts for OpenAI Responses (`crates/fluxbee_ai_sdk/src/text_payload.rs:93-172`).
+- `SY.architect`, `ai-generic`, and `ai-frontdesk-gov` call that helper before sending
+  multimodal turns (`src/bin/sy_architect.rs:10236-10240`,
+  `nodes/ai/ai-generic/src/bin/ai_node_runner.rs:1138-1159`,
+  `nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs:948-966`).
+- `OpenAiFunctionCallingModel` maps tool calls to OpenAI Responses-specific fields
+  (`crates/fluxbee_ai_sdk/src/llm.rs:560-690`).
+
+Implementation implication: add provider-neutral content/input abstractions, or a
+provider-specific builder behind the same factory. Otherwise Anthropic text-only may
+work while attachments/tool paths still fail or silently use OpenAI payload shapes.
+
+### 6. Status, config contracts, and Vault refresh must become provider-aware
+
+`ResourceType::Anthropic` already exists in the vault SDK
+(`crates/fluxbee_sdk/src/vault.rs:89-105`, `crates/fluxbee_sdk/src/vault.rs:140-155`),
+but current consumers and contracts report/listen for OpenAI-specific resources:
+
+- `SY.cognition` listens for `VAULT_SECRET_CHANGED` with `resource_type=openai` and
+  reports OpenAI-specific status/contract fields.
+- `SY.architect` reports `resource_type=openai` in local config get and refreshes
+  OpenAI-specific runtime state.
+- AI node contracts still document allowed behavior as `echo` / `openai_chat` and
+  required resource `openai` (`docs/node-config-control-plane-spec.md:171-245`).
+
+Implementation implication: the selected effective provider must drive:
+
+- Vault resource type (`openai` vs `anthropic`).
+- `CONFIG_GET` resource lists and health/readiness.
+- `VAULT_SECRET_CHANGED` interests.
+- Runtime error parsing and user-facing missing-key/provider-error payloads.

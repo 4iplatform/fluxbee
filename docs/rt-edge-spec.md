@@ -1,0 +1,390 @@
+# Fluxbee — RT.edge Specification
+
+**Status:** v1.0 alpha — implementation design
+**Date:** 2026-06-30
+**Audience:** RT.edge developer (Rust)
+**Related:** `edge-control-protocol-v2.md`, `fc-edge-manager-spec.md`, `05-conectividad.md`, `02-protocolo.md`, `10-identity-v2.md`, `sy-vault-spec.md`
+
+---
+
+## 1. Purpose and Role
+
+RT.edge is the **public ingress runtime** of Fluxbee. It is the only component with a public-internet-facing interface, running on a Fluxbee DMZ host. It terminates user HTTPS, authenticates requests, translates them into Fluxbee L2 envelopes, and forwards them inward over the WAN to motherbee. Responses travel back the same path.
+
+RT.edge is **stateless and reconstructible**: all durable state (certs, keys, tenant assignments) is pushed to it by FC.edge-manager over the control channel and cached locally. A wiped RT.edge re-bootstraps and re-syncs.
+
+What RT.edge does:
+
+- Terminates user HTTPS using its **per-edge** TLS cert (`<edge_id>.fluxbee.ai`).
+- Validates user JWTs locally (stateless) using the JWT public key.
+- Routes `https://<edge_id>.fluxbee.ai/x/<tenant>/<ilk>[/extra]` to the Fluxbee node/WF identified by `<ilk>`.
+- Translates HTTP ⇄ Fluxbee L2 (`http.req` / `http.res` envelopes).
+- Maintains the control channel to FC.edge-manager (`edge-control-protocol-v2.md`).
+- Maintains a WAN connection inward to motherbee (Fluxbee protocol).
+- Enforces per-IP and per-tenant rate limits.
+- Holds the dynamic endpoint registry (ilk → reachable) populated by `EDGE_REGISTER` from IO nodes.
+
+What RT.edge does NOT do:
+
+- Serve HTML or any UI (that is Fluxbee Cloud).
+- Hold any private signing key (JWT private key lives in Fluxbee Cloud / vault).
+- Make tenant-assignment or credential-issuance decisions (that is FC.edge-manager).
+- Talk to other edges.
+
+---
+
+## 2. Architecture
+
+```
+                         Internet
+                            │
+                            ▼ HTTPS :443 (per-edge cert)
+        ┌───────────────────────────────────────────┐
+        │                 RT.edge                    │
+        │                                            │
+        │  ┌──────────────────────────────────────┐  │
+        │  │ HTTPS frontend (axum + rustls)       │  │
+        │  │  - TLS termination (per-edge cert)   │  │
+        │  │  - JWT validation (tower middleware) │  │
+        │  │  - rate limit (tower-governor)       │  │
+        │  │  - path router → ilk                 │  │
+        │  └──────────────┬───────────────────────┘  │
+        │                 │ http.req / http.res        │
+        │  ┌──────────────▼───────────────────────┐  │
+        │  │ L2 translator + endpoint registry    │  │
+        │  │  - ilk → reachability                │  │
+        │  │  - conn_id correlation               │  │
+        │  └──────────────┬───────────────────────┘  │
+        │                 │ L2 envelope                │
+        │  ┌──────────────▼───────────────────────┐  │
+        │  │ WAN client (to motherbee)            │  │
+        │  │  - TLS/mTLS, Fluxbee WAN protocol    │  │
+        │  └──────────────────────────────────────┘  │
+        │                                            │
+        │  ┌──────────────────────────────────────┐  │
+        │  │ Control channel client               │  │
+        │  │  (tokio-tungstenite → FC.edge-mgr)   │  │
+        │  │  - cert/key/tenant state             │  │
+        │  └──────────────────────────────────────┘  │
+        └───────────────────────────────────────────┘
+                            │ WAN/TLS (inward, LAN)
+                            ▼
+                        Motherbee
+```
+
+Four concurrent subsystems sharing in-memory state via `Arc<RwLock<...>>` (or `arc-swap` for read-mostly hot paths like the cert and the registry):
+
+1. **HTTPS frontend** — accepts user traffic.
+2. **L2 translator + registry** — converts and routes.
+3. **WAN client** — Fluxbee connectivity inward.
+4. **Control channel client** — credential/state sync with FC.
+
+---
+
+## 3. Crate Selection
+
+| Concern | Crate |
+|---------|-------|
+| Async runtime | `tokio` |
+| HTTP server | `axum` |
+| TLS | `rustls` + `tokio-rustls` (pure Rust, no OpenSSL) |
+| Middleware | `tower`, `tower-http` |
+| Rate limiting | `tower-governor` |
+| WebSocket (control) | `tokio-tungstenite` |
+| JWT | `jsonwebtoken` (EdDSA support) |
+| Hot-swap state | `arc-swap` |
+| Serialization | `serde`, `serde_json` |
+| Logging/metrics | `tracing`, `tracing-subscriber`, `metrics` |
+
+Rationale matches `edge-control-protocol-v2.md` §13: rustls avoids the OpenSSL chain; axum+tower give composable middleware; tokio-tungstenite is the cleanest WS for the control channel.
+
+---
+
+## 4. HTTP → L2 Envelope
+
+### 4.1 Request envelope (`http.req`)
+
+Built by RT.edge after TLS termination, JWT validation, and path parsing. Sent inward as an L2 message with `meta.msg = "http.req"`, `routing.dst = <ilk>`.
+
+```json
+{
+  "v": 1,
+  "kind": "http.req",
+  "conn_id": "<uuid generated by the edge for correlation>",
+  "ts": "2026-06-30T10:00:00Z",
+  "method": "POST",
+  "path": "/extra/sub/path",
+  "query": { "k": "v" },
+  "headers": { "content-type": "application/json", "...": "filtered" },
+  "principal": {
+    "tenant_id": "tnt:...",
+    "user_ilk": "ilk:...",
+    "scopes": ["..."]
+  },
+  "body_inline": "<string or null>",
+  "body_blob": { "ref": "<blob-id>", "size": 1234567, "ctype": "..." }
+}
+```
+
+Rules:
+
+- `path` is what follows `/x/<tenant>/<ilk>`, so the destination node never sees the mount prefix.
+- `headers` are filtered: hop-by-hop headers and the raw `Authorization` are stripped. The validated identity is in `principal`, not in a raw token.
+- `principal` is present only if a valid JWT was supplied. For an explicitly public endpoint, `principal` is `null`. There is no "unauthenticated but claims an identity" state — either the JWT validated or there is no principal.
+- Body handling per §4.3.
+
+### 4.2 Response envelope (`http.res`)
+
+The destination node replies with `meta.msg = "http.res"`, correlated by `conn_id`.
+
+```json
+{
+  "v": 1,
+  "kind": "http.res",
+  "conn_id": "<same as request>",
+  "status": 200,
+  "headers": { "content-type": "application/json" },
+  "body_inline": "<string or null>",
+  "body_blob": { "ref": "...", "size": 123, "ctype": "..." }
+}
+```
+
+RT.edge maps this back to an HTTP response on the still-open client connection identified by `conn_id`.
+
+### 4.3 Body and blob handling
+
+Fluxbee's max inline L2 message is 128 KiB (per the blob SDK convention: messages above that auto-spill to blob).
+
+- Body ≤ 128 KiB ⇒ `body_inline` (UTF-8 string, or base64 for binary with a flag — see open question §13).
+- Body > 128 KiB, or any file upload / binary stream ⇒ RT.edge writes it to blob via the blob SDK (the same `send`-to-blob mechanism used elsewhere), and the envelope carries `body_blob.ref`. The destination node reads the blob by ref. The reverse applies to large responses.
+
+This is consistent with the existing blob system: RT.edge does not invent its own storage; it uses the blob SDK already present in Fluxbee.
+
+### 4.4 Sync model and timeouts
+
+HTTP is request/response with a client waiting on an open connection. RT.edge holds the client connection open, keyed by `conn_id`, until the `http.res` arrives or a timeout fires.
+
+| Timeout | Default | On expiry |
+|---------|---------|-----------|
+| Inward response | 30 s | `504 Gateway Timeout` to client, drop the pending `conn_id` |
+| Idle client | 60 s | close connection |
+
+Streaming, SSE, and WebSocket upgrade are **out of scope in v1** (Fluxbee has no streaming inter-node contract yet). Requests that ask for an upgrade get `501 Not Implemented`. This is declared explicitly so it does not surface later as a bug.
+
+---
+
+## 5. Path Routing
+
+```
+https://<edge_id>.fluxbee.ai/x/<tenant>/<ilk>[/extra/path...]
+```
+
+- `/x/` is the external-traffic prefix.
+- `<tenant>` is the tenant id (also present in the JWT — they must match, §6).
+- `<ilk>` identifies the destination. It MAY resolve to a node or a WF (both have identity), giving one degree of freedom without edge complexity.
+- `[/extra/path...]` becomes `path` in the envelope.
+
+Routing steps:
+
+1. Parse `tenant`, `ilk`, `extra`.
+2. Confirm `tenant` is in the edge's accepted-tenant set (else `404 Tenant not served by this edge`).
+3. Confirm JWT `tenant` claim matches path `tenant` (else `403`).
+4. Look up `ilk` in the endpoint registry (§7). If absent / unreachable ⇒ `503 Endpoint unavailable`.
+5. Build `http.req`, send inward, await `http.res` by `conn_id`.
+
+---
+
+## 6. JWT Validation
+
+Stateless, no network call at request time.
+
+1. Extract `Authorization: Bearer <jwt>`. Absent ⇒ `principal = null` (continue only if the endpoint is public; otherwise `401`).
+2. Verify signature against the current JWT public key (and the previous key if within grace, per `KEY_ROTATE`). A key under `EMERGENCY_KEY_REVOKE` is rejected immediately.
+3. Verify claims: `exp` not passed, `iat` consistent with key `effective_at`, `aud` includes this edge / `fluxbee.edge`, `tenant` present.
+4. Cross-check `jwt.tenant == path.tenant` (defense in depth; §5 step 3).
+5. Populate `principal { tenant_id, user_ilk, scopes }` into the envelope.
+
+The edge holds JWT **public** keys only. It can verify, never mint.
+
+---
+
+## 7. Endpoint Registry (data plane, EDGE_REGISTER)
+
+This is **not** part of the control channel. It travels over the Fluxbee data plane (WAN/L2), because it is internal routing, not edge administration.
+
+### 7.1 Registration
+
+An IO node that needs a public endpoint sends, over normal L2 (dst = `RT.edge@<edge-hive>`):
+
+```json
+{
+  "meta": { "type": "system", "msg": "EDGE_REGISTER" },
+  "payload": {
+    "ilk": "ilk:...",
+    "tenant_id": "tnt:...",
+    "optional_subpath": "webhooks/stripe"
+  }
+}
+```
+
+RT.edge adds an entry to its in-memory registry and replies (correlated by `trace_id`, mirroring the `CONFIG_CHANGED` / `CONFIG_RESPONSE` pattern):
+
+```json
+{
+  "meta": { "type": "system", "msg": "EDGE_REGISTER_ACK" },
+  "payload": { "ilk": "ilk:...", "url": "https://eu-edge-1.fluxbee.ai/x/tnt:.../ilk:..." }
+}
+```
+
+### 7.2 Lifecycle
+
+- The endpoint is alive while the owning node's L2 path is reachable.
+- Node disappears / unregisters (`EDGE_UNREGISTER`) ⇒ endpoint returns `503`, then is evicted after a grace period.
+- Node returns, re-registers same ilk ⇒ same URL. Idempotent.
+
+### 7.3 Registry vs control channel
+
+The registry is local to RT.edge and rebuilt from `EDGE_REGISTER` traffic. It is **not** synced to FC.edge-manager. FC knows tenants (control channel) but not individual endpoints (data plane). Clean plane separation.
+
+---
+
+## 8. Rate Limiting
+
+`tower-governor`, two layers, defaults pushed via `EDGE_HELLO_ACK` / `CONFIG_UPDATE`:
+
+| Layer | Default | Key |
+|-------|---------|-----|
+| Per source IP | 100 rps | client IP |
+| Per tenant | 1000 rps | path/JWT tenant |
+
+Abnormal tripping emits `EDGE_ERROR { code: RATE_LIMIT_TRIPPED }` to FC. Heavy DDoS is expected to be handled upstream (cloud LB/WAF) in production; the in-edge limiter protects against trivial abuse without that.
+
+---
+
+## 9. Process Lifecycle
+
+### 9.1 Boot
+
+1. Load `/etc/fluxbee/edge.conf` (`edge_id`, FC control URL, motherbee WAN endpoint, expected public IP range).
+2. If `edge.bootstrap` present and no control cert ⇒ bootstrap (`edge-control-protocol-v2.md` §6).
+3. Open control channel; `EDGE_HELLO` with fingerprints; receive cert/keys/tenants via delta resync.
+4. Only once a valid per-edge TLS cert and JWT public key are loaded does the HTTPS listener bind `:443`. Before that, the edge serves nothing (fail closed).
+5. Open WAN to motherbee.
+6. Begin accepting traffic.
+
+### 9.2 Steady state
+
+Four subsystems run concurrently. The HTTPS frontend reads cert and registry via `arc-swap` for lock-free hot paths. Control-channel pushes swap the cert/keys/tenants atomically.
+
+### 9.3 Degraded modes
+
+| Condition | Behavior |
+|-----------|----------|
+| Control channel down | Keep serving with cached state; reconnect with backoff |
+| WAN to motherbee down | New requests get `502 Bad Gateway`; emit `EDGE_ERROR MOTHERBEE_DISCONNECTED`; retry WAN |
+| Clock drift > 300 s | Refuse to terminate user TLS until NTP converges (cert validity untrustworthy) |
+| TLS cert expiring, no rotation received | Emit `EDGE_ERROR EDGE_TLS_CERT_EXPIRING`; keep serving with current cert until it actually expires |
+
+### 9.4 Shutdown (SIGTERM or EDGE_SHUTDOWN)
+
+Stop accepting new requests; drain in-flight up to `drain_seconds`; send `EDGE_GOODBYE`; close control channel and WAN; exit.
+
+---
+
+## 10. HTTP Error Mapping
+
+| Situation | HTTP status |
+|-----------|-------------|
+| No/invalid JWT on a protected endpoint | 401 |
+| JWT tenant ≠ path tenant | 403 |
+| Tenant not served by this edge | 404 |
+| ilk not in registry | 503 |
+| Inward (WAN) down | 502 |
+| Inward response timeout | 504 |
+| Rate limit exceeded | 429 |
+| Streaming/upgrade requested | 501 |
+| Body too large beyond blob ceiling | 413 |
+| Malformed path | 400 |
+| Internal edge error | 500 |
+
+L2-level failures returned by the destination node (e.g. `OPA_NO_TARGET`, node error) map to a sensible HTTP status carried in `http.res.status`; RT.edge passes the node's chosen status through.
+
+---
+
+## 11. Metrics
+
+Emitted via `metrics` crate, scraped or shipped to Fluxbee observability, and summarized to FC via `EDGE_METRICS`:
+
+- Requests total, by status class, by tenant.
+- Latency p50 / p99 (edge-internal and end-to-end inward).
+- Active `conn_id` count (in-flight requests).
+- JWT validation failures (rate; spikes ⇒ `JWT_VALIDATION_FAILURES_HIGH`).
+- Rate-limit trips.
+- WAN reconnects, control-channel reconnects.
+- Bytes in/out.
+
+---
+
+## 12. Local Configuration
+
+`/etc/fluxbee/edge.conf` (the only hand-set file; everything else arrives over the control channel):
+
+```yaml
+edge_id: "eu-edge-1"
+control_url: "wss://edge-control.fluxbee.ai/v2/edge"
+motherbee_wan: "10.0.0.10:9000"
+expected_public_ip_cidr: "203.0.113.0/24"   # for EDGE_PUBLIC_IP_CHANGED self-check
+listen_https: "0.0.0.0:443"
+log_level: "info"
+```
+
+Secrets (bootstrap token, certs, keys) live in their own files per `edge-control-protocol-v2.md` §12.8, not here.
+
+---
+
+## 13. Open Questions
+
+1. **Binary body encoding**: base64 in `body_inline` with a flag, vs always blob for non-UTF-8. Leaning blob-for-binary to keep the inline path text-only.
+2. **`/x/` prefix**: confirm vs `/api/`, `/n/`, `/io/`. Cosmetic but frozen once chosen.
+3. **WF as ilk target**: confirm WFs are addressable by ilk identically to nodes, so the edge needs no special-casing.
+4. **conn_id lifetime store**: in-memory map of `conn_id → pending client connection`. Bound its size; define eviction on timeout to avoid leak under load.
+5. **Public endpoints**: how does the edge know an endpoint is public (no JWT required)? Flag in `EDGE_REGISTER`, or default-all-protected with explicit opt-in. Leaning default-protected.
+6. **Header filtering allowlist**: exact set of headers passed inward vs stripped.
+
+---
+
+## 14. Implementation Checklist
+
+- [ ] Config loader (`edge.conf`)
+- [ ] Control-channel client (per `edge-control-protocol-v2.md` checklist)
+- [ ] rustls HTTPS listener, per-edge cert, hot reload via arc-swap
+- [ ] axum router for `/x/<tenant>/<ilk>/*`
+- [ ] JWT validation middleware (current + grace key, emergency revoke)
+- [ ] tenant-match enforcement (path vs JWT)
+- [ ] tower-governor rate limiting (per-IP, per-tenant)
+- [ ] http.req builder (header filtering, principal injection)
+- [ ] Body handling: inline ≤128 KiB, blob spill via blob SDK
+- [ ] WAN client to motherbee (Fluxbee L2)
+- [ ] conn_id correlation map with timeout eviction
+- [ ] http.res → HTTP response mapping
+- [ ] Endpoint registry: EDGE_REGISTER / EDGE_UNREGISTER / ACK over L2
+- [ ] Registry lifecycle (grace eviction, idempotent re-register)
+- [ ] Error mapping table (§10)
+- [ ] Metrics emission + EDGE_METRICS
+- [ ] Degraded-mode behaviors (§9.3)
+- [ ] Graceful shutdown / drain
+- [ ] 501 for streaming/upgrade
+
+---
+
+## 15. References
+
+| Topic | Document |
+|-------|----------|
+| Control protocol (edge ↔ FC) | `edge-control-protocol-v2.md` |
+| FC side | `fc-edge-manager-spec.md` |
+| WAN protocol (edge ↔ motherbee) | `05-conectividad.md` |
+| L2 message format, framing | `02-protocolo.md` |
+| Identity, tenants, ilk | `10-identity-v2.md` |
+| Blob SDK | `sy-vault-spec.md` / blob docs |
+| Egress sibling | `edge-egress-nat-spec.md` |
