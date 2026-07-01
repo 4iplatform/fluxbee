@@ -230,7 +230,7 @@ Verificacion previa: los 8 findings fueron confirmados contra el codigo actual (
 | ID | Severidad | Estado | Commit |
 | --- | --- | --- | --- |
 | SO-2026-06-30-01 | Alta | **Resuelto** — `unit` siempre derivado de `node_name` (`fluxbee-node-*`); KILL_NODE exige `node_name`. No puede tocar units del host. | `0f0400a` |
-| SO-2026-06-30-02 | Alta | **Abierto** — requiere cambio de default (`harden_ssh=true`) + cleanup en early returns (con B-2) + re-validacion 2-VM en lab antes de mergear. | — |
+| SO-2026-06-30-02 | Alta | **Resuelto** — revoke del acceso SSH de bootstrap (key + sudoers) al finalizar un add_hive exitoso; validado 2-VM en lab (sudoers GONE, 0 entries en authorized_keys, motherbee SSH→worker denied, worker operativo por socket). | `cc76814` |
 | SO-2026-06-30-03 | Alta/Media | **Resuelto** — preflight de config antes de mutar identity; rollback best-effort del config en `SPAWN_FAILED`. | `0f0400a` |
 | SO-2026-06-30-04 | Media | **Resuelto** — lock async por `node_name` en run/kill/start/restart/remove/config_set. | `57b9e71` |
 | SO-2026-06-30-05 | Media | **Resuelto** — guard defensivo local en `handle_system_message` con la misma `system_policy` (ahora `pub`). | `0f0400a` |
@@ -241,4 +241,4 @@ Verificacion previa: los 8 findings fueron confirmados contra el codigo actual (
 | B-2 (nuevo) | Baja | **Abierto** — mismo cleanup-on-early-return que SO-02 (la distribucion de identity-key agrega otro early-return fatal en la ventana SSH-abierta). | — |
 | B-3 (nuevo) | Info | **Diferido** — valores del worker `hive.yaml` van por `tee` (sin shell injection); son derivados internos, riesgo muy bajo. | — |
 
-Resueltos: 8/11 (los 3 Altas menos SO-02, todos los Media/Baja menos el SSH). Pendiente clave: **SO-02 + B-2** (SSH bootstrap), que se trata aparte porque cambia semantica de default y necesita re-validacion end-to-end del join en el lab Proxmox. Tests: `cargo test --bin sy_orchestrator` 108 passed / 0 failed en cada batch.
+Resueltos: **10/11** — los 3 Altas (SO-01/02/03) + los 4 Media (SO-04/05 + SO-06/08) + los 2 Baja (SO-07 + B-1). SO-02 se cerro con re-validacion 2-VM en el lab Proxmox. Pendientes menores: **B-2** (Baja — flag `ssh_bootstrap_open` en early-returns parciales; la key es self-targeting, riesgo acotado) y **B-3** (Info — valores del worker hive.yaml, van por tee, derivados internos). Tests: `cargo test --bin sy_orchestrator` 108 passed / 0 failed en cada batch.
