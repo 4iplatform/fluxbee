@@ -36,6 +36,9 @@ storage:
 identity:
   sync:
     port: 9100
+    # Per-hive HMAC peer-auth on the :9100 inter-hive channel: disabled | required.
+    # The motherbee generates each hive's key and distributes it at add_hive.
+    auth: required
 
 # Government/frontdesk wiring.
 government:

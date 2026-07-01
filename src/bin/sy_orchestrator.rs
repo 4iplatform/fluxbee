@@ -977,6 +977,50 @@ fn distribute_hive_tls_inner(
     Ok(())
 }
 
+/// Motherbee: ensure a per-hive identity HMAC key for `hive_id` exists locally
+/// (the authority side of the :9100 handshake), generating it on first use.
+fn ensure_local_identity_key(
+    hive_id: &str,
+) -> Result<json_router::mesh_hmac::MeshHmacKey, OrchestratorError> {
+    if !json_router::mesh_hmac::is_valid_hive_id(hive_id) {
+        return Err(format!("invalid hive id '{hive_id}' for identity key").into());
+    }
+    let path = json_router::mesh_hmac::key_path(hive_id);
+    if path.exists() {
+        return json_router::mesh_hmac::MeshHmacKey::load_from_file(&path)
+            .map_err(|e| -> OrchestratorError { format!("load identity key: {e}").into() });
+    }
+    let key = json_router::mesh_hmac::MeshHmacKey::generate();
+    key.write_to_file(&path)
+        .map_err(|e| -> OrchestratorError { format!("write identity key: {e}").into() })?;
+    Ok(key)
+}
+
+/// add_hive: distribute the per-hive identity HMAC key to the remote node over
+/// the authenticated SSH channel so its sy-identity can authenticate to the
+/// motherbee's :9100. The caller treats failure as fatal (the worker ships
+/// auth=required and fails closed without the key).
+fn distribute_hive_identity_key_inner(
+    address: &str,
+    key_path: &Path,
+    user: &str,
+    hive_id: &str,
+) -> Result<(), OrchestratorError> {
+    let key = ensure_local_identity_key(hive_id)?;
+    let dir = json_router::mesh_hmac::KEYS_DIR;
+    let remote = format!("{dir}/{hive_id}.key");
+    // Owner-only dir before the write (same TOCTOU care as the TLS key).
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(&format!("mkdir -p '{dir}' && chmod 700 '{dir}'")),
+        user,
+    )?;
+    write_remote_file(address, key_path, user, &remote, &format!("{}\n", key.to_hex()))?;
+    ssh_with_key(address, key_path, &sudo_wrap(&format!("chmod 600 '{remote}'")), user)?;
+    Ok(())
+}
+
 /// Motherbee: (re)distribute mesh TLS material to all already-provisioned hives
 /// that don't have it yet. New hives get certs at `add_hive`; this catches up the
 /// hives created BEFORE mTLS existed (so the operator can flip `wan.mtls` without
@@ -15981,7 +16025,7 @@ async fn add_hive_flow(
         }
     };
     let hive_yaml = format!(
-        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\ngovernment:\n  identity_frontdesk: \"{}\"\nidentity:\n  sync:\n    upstream: \"{}\"\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n{}{}",
+        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\ngovernment:\n  identity_frontdesk: \"{}\"\nidentity:\n  sync:\n    upstream: \"{}\"\n    auth: required\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n{}{}",
         hive_id,
         worker_uplink,
         storage_path,
@@ -16015,6 +16059,19 @@ async fn add_hive_flow(
     // Distribute the mesh TLS material so this worker's router can present a cert
     // when wan.mtls is enabled (best-effort; WAN degrades to plaintext without it).
     distribute_hive_tls(address, &key_path, creds.user.as_str(), hive_id);
+    // Distribute the per-hive identity HMAC key so this worker's sy-identity can
+    // authenticate to the motherbee's :9100. Fatal: the worker template ships
+    // identity.sync.auth=required, so without the key its sy-identity fails
+    // closed and never starts — better to fail the join loudly than silent-misjoin.
+    if let Err(err) =
+        distribute_hive_identity_key_inner(address, &key_path, creds.user.as_str(), hive_id)
+    {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "CONFIG_FAILED",
+            "message": format!("identity HMAC key distribution failed: {err}"),
+        });
+    }
 
     let config_routes_yaml = format!(
         "version: 1\nupdated_at: \"{}\"\nroutes: []\nvpns: []\ntaps: []\n",

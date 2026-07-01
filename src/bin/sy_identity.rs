@@ -215,6 +215,11 @@ struct IdentitySyncSection {
     port: Option<u16>,
     #[serde(default)]
     upstream: Option<String>,
+    /// Per-hive HMAC peer-auth on the :9100 channel: "disabled" (default) |
+    /// "required" (mutual challenge-response handshake at connect; reject peers
+    /// without the hive's key).
+    #[serde(default)]
+    auth: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2864,6 +2869,30 @@ async fn main() -> Result<(), IdentityError> {
     };
     let sync_port = identity_sync_port(&hive);
     let sync_upstream = identity_sync_upstream(&hive);
+    let auth_required = identity_sync_auth_required(&hive);
+    let self_hive = hive.hive_id.clone();
+    // A replica needs its own per-hive HMAC key to run the client handshake.
+    // Fail-closed: auth required but key missing aborts startup (rather than
+    // silently falling back to an unauthenticated channel).
+    let self_auth_key: Option<json_router::mesh_hmac::MeshHmacKey> =
+        if auth_required && !is_primary {
+            let path = identity_hmac_key_path(&self_hive);
+            match json_router::mesh_hmac::MeshHmacKey::load_from_file(&path) {
+                Ok(k) => Some(k),
+                Err(err) => {
+                    return Err(format!(
+                        "identity.sync.auth=required but HMAC key missing at {}: {err}",
+                        path.display()
+                    )
+                    .into());
+                }
+            }
+        } else {
+            None
+        };
+    if auth_required {
+        tracing::info!(role = if is_primary { "primary" } else { "replica" }, "identity sync auth: required (per-hive HMAC)");
+    }
     let sync_listener = if is_primary {
         let bind_addr = format!("0.0.0.0:{sync_port}");
         let listener = TcpListener::bind(&bind_addr).await?;
@@ -2874,7 +2903,7 @@ async fn main() -> Result<(), IdentityError> {
     };
     if !is_primary {
         if let Some(upstream) = sync_upstream.as_deref() {
-            match fetch_full_sync_from_primary(upstream).await {
+            match fetch_full_sync_from_primary(upstream, self_auth_key.as_ref(), &self_hive).await {
                 Ok(store) => {
                     let metrics = store.metrics();
                     runtime.store = store;
@@ -2932,14 +2961,17 @@ async fn main() -> Result<(), IdentityError> {
     let (ingest_tx, mut ingest_rx) = mpsc::channel::<IngestFrame>(IDENTITY_INGEST_CHANNEL_CAP);
     if !is_primary {
         if let Some(upstream) = sync_upstream.clone() {
+            let sub_key = self_auth_key.clone();
+            let sub_hive = self_hive.clone();
             tokio::spawn(async move {
-                run_delta_subscription_loop(upstream, delta_event_tx).await;
+                run_delta_subscription_loop(upstream, delta_event_tx, sub_key, sub_hive).await;
             });
         }
         if let Some(upstream) = sync_upstream.clone() {
             let publish_hive = hive.hive_id.clone();
+            let pub_key = self_auth_key.clone();
             tokio::spawn(async move {
-                run_delta_publish_loop(upstream, publish_hive, upstream_rx).await;
+                run_delta_publish_loop(upstream, publish_hive, upstream_rx, pub_key).await;
             });
         }
     }
@@ -3074,7 +3106,7 @@ async fn main() -> Result<(), IdentityError> {
             } => {
                 if let Some((stream, remote_addr)) = accepted {
                     let chunks = runtime.store.build_full_sync_chunks(IDENTITY_FULL_SYNC_CHUNK_ITEMS);
-                    match handle_sync_connection(stream, chunks, ingest_tx.clone()).await {
+                    match handle_sync_connection(stream, chunks, ingest_tx.clone(), auth_required).await {
                         Ok(Some(subscriber)) => {
                             tracing::info!(remote = %remote_addr, "identity delta subscriber connected");
                             delta_subscribers.push(subscriber);
@@ -3139,6 +3171,20 @@ fn identity_sync_upstream(hive: &HiveFile) -> Option<String> {
         .and_then(|sync| sync.upstream.as_ref())
         .map(|raw| raw.trim().to_string())
         .filter(|raw| !raw.is_empty())
+}
+
+/// Whether the :9100 channel requires the per-hive HMAC handshake.
+fn identity_sync_auth_required(hive: &HiveFile) -> bool {
+    hive.identity
+        .as_ref()
+        .and_then(|identity| identity.sync.as_ref())
+        .and_then(|sync| sync.auth.as_deref())
+        .map(|mode| mode.trim().eq_ignore_ascii_case("required"))
+        .unwrap_or(false)
+}
+
+fn identity_hmac_key_path(hive_id: &str) -> std::path::PathBuf {
+    json_router::mesh_hmac::key_path(hive_id)
 }
 
 fn identity_shm_name(hive_id: &str) -> String {
@@ -3721,19 +3767,187 @@ fn apply_identity_shm_deltas(
     Ok(())
 }
 
+// --- :9100 per-hive HMAC handshake (mutual challenge-response) ---
+
+const AUTH_OP_HELLO: &str = "IDENTITY_AUTH_HELLO";
+const AUTH_OP_CHALLENGE: &str = "IDENTITY_AUTH_CHALLENGE";
+const AUTH_OP_RESPONSE: &str = "IDENTITY_AUTH_RESPONSE";
+const AUTH_OP_OK: &str = "IDENTITY_AUTH_OK";
+const AUTH_OP_ERROR: &str = "IDENTITY_AUTH_ERROR";
+/// Per-read timeout during the handshake, so a peer that connects and stalls
+/// cannot pin the primary's accept path (it awaits the handshake inline).
+const AUTH_HANDSHAKE_READ_TIMEOUT_SECS: u64 = 10;
+
+#[derive(Serialize, Deserialize)]
+struct AuthHello {
+    operation: String,
+    hive: String,
+    nonce: String,
+}
+#[derive(Serialize, Deserialize)]
+struct AuthChallenge {
+    operation: String,
+    nonce: String,
+}
+#[derive(Serialize, Deserialize)]
+struct AuthMac {
+    operation: String,
+    mac: String,
+}
+#[derive(Serialize, Deserialize)]
+struct AuthErrorMsg {
+    operation: String,
+    message: String,
+}
+
+async fn auth_write_line(
+    w: &mut tokio::net::tcp::OwnedWriteHalf,
+    value: &impl Serialize,
+) -> Result<(), IdentityError> {
+    w.write_all(serde_json::to_string(value)?.as_bytes()).await?;
+    w.write_all(b"\n").await?;
+    w.flush().await?;
+    Ok(())
+}
+
+async fn auth_read_line(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+) -> Result<String, IdentityError> {
+    let mut line = String::new();
+    let n = time::timeout(
+        Duration::from_secs(AUTH_HANDSHAKE_READ_TIMEOUT_SECS),
+        reader.read_line(&mut line),
+    )
+    .await
+    .map_err(|_| -> IdentityError { "auth handshake read timeout".into() })??;
+    if n == 0 {
+        return Err("auth handshake: connection closed".into());
+    }
+    Ok(line.trim().to_string())
+}
+
+/// Server side: read HELLO, load the claimed hive's key, challenge, verify the
+/// client's proof, then prove ourselves. Returns the authenticated hive_id. On
+/// any failure sends AUTH_ERROR and errors out (the caller closes the conn).
+async fn server_auth_handshake(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> Result<String, IdentityError> {
+    use json_router::mesh_hmac::{self, MeshHmacKey};
+    let hello: AuthHello = serde_json::from_str(&auth_read_line(reader).await?)
+        .map_err(|e| -> IdentityError { format!("auth hello parse: {e}").into() })?;
+    // Uniform wire-level rejection (no hive-existence / parse-vs-key oracle); the
+    // specific reason is only logged locally via the returned Err.
+    async fn reject(
+        write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+        log: String,
+    ) -> Result<String, IdentityError> {
+        let _ = auth_write_line(
+            write_half,
+            &AuthErrorMsg { operation: AUTH_OP_ERROR.into(), message: "authentication failed".into() },
+        )
+        .await;
+        Err(log.into())
+    }
+    if hello.operation != AUTH_OP_HELLO {
+        return reject(write_half, "auth: expected hello".into()).await;
+    }
+    let hive = hello.hive.trim().to_string();
+    // Validate the attacker-controlled claimed hive_id BEFORE it touches the
+    // filesystem path (guards against `/abs` or `..` traversal in key_path).
+    if !mesh_hmac::is_valid_hive_id(&hive) {
+        return reject(write_half, format!("auth: invalid hive id '{hive}'")).await;
+    }
+    let key = match MeshHmacKey::load_from_file(&identity_hmac_key_path(&hive)) {
+        Ok(k) => k,
+        Err(err) => {
+            return reject(write_half, format!("auth: no key for hive '{hive}': {err}")).await;
+        }
+    };
+    let server_nonce = mesh_hmac::random_nonce();
+    auth_write_line(write_half, &AuthChallenge { operation: AUTH_OP_CHALLENGE.into(), nonce: server_nonce.clone() }).await?;
+    let resp: AuthMac = serde_json::from_str(&auth_read_line(reader).await?)
+        .map_err(|e| -> IdentityError { format!("auth response parse: {e}").into() })?;
+    if resp.operation != AUTH_OP_RESPONSE {
+        return reject(write_half, "auth: expected response".into()).await;
+    }
+    if mesh_hmac::verify_proof(&key, mesh_hmac::CLIENT_CONTEXT, &server_nonce, &hive, &resp.mac).is_err() {
+        return reject(write_half, format!("auth: HMAC verification failed for hive '{hive}'")).await;
+    }
+    let server_proof = mesh_hmac::prove(&key, mesh_hmac::SERVER_CONTEXT, &hello.nonce, &hive);
+    auth_write_line(write_half, &AuthMac { operation: AUTH_OP_OK.into(), mac: server_proof }).await?;
+    Ok(hive)
+}
+
+/// Client side: identify as `self_hive`, answer the primary's challenge, and
+/// verify the primary proves it holds the same key (mutual auth).
+async fn client_auth_handshake(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+    key: &json_router::mesh_hmac::MeshHmacKey,
+    self_hive: &str,
+) -> Result<(), IdentityError> {
+    use json_router::mesh_hmac;
+    let client_nonce = mesh_hmac::random_nonce();
+    auth_write_line(write_half, &AuthHello { operation: AUTH_OP_HELLO.into(), hive: self_hive.to_string(), nonce: client_nonce.clone() }).await?;
+    let challenge: AuthChallenge = serde_json::from_str(&auth_read_line(reader).await?)
+        .map_err(|e| -> IdentityError { format!("auth challenge parse (rejected?): {e}").into() })?;
+    if challenge.operation != AUTH_OP_CHALLENGE {
+        return Err("auth: primary did not challenge (rejected?)".into());
+    }
+    let response = mesh_hmac::prove(key, mesh_hmac::CLIENT_CONTEXT, &challenge.nonce, self_hive);
+    auth_write_line(write_half, &AuthMac { operation: AUTH_OP_RESPONSE.into(), mac: response }).await?;
+    let ok: AuthMac = serde_json::from_str(&auth_read_line(reader).await?)
+        .map_err(|e| -> IdentityError { format!("auth ok parse (rejected?): {e}").into() })?;
+    if ok.operation != AUTH_OP_OK {
+        return Err("auth: primary rejected the handshake".into());
+    }
+    mesh_hmac::verify_proof(key, mesh_hmac::SERVER_CONTEXT, &client_nonce, self_hive, &ok.mac)
+        .map_err(|_| -> IdentityError { "auth: primary HMAC verification failed (wrong key?)".into() })?;
+    Ok(())
+}
+
+/// Replica connect helper: TCP-connect to the primary and run the client auth
+/// handshake when `auth_key` is set. Returns the framed (reader, writer) ready
+/// for the sync protocol.
+async fn connect_and_auth(
+    upstream: &str,
+    auth_key: Option<&json_router::mesh_hmac::MeshHmacKey>,
+    self_hive: &str,
+) -> Result<
+    (
+        BufReader<tokio::net::tcp::OwnedReadHalf>,
+        tokio::net::tcp::OwnedWriteHalf,
+    ),
+    IdentityError,
+> {
+    let stream = TcpStream::connect(upstream).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    if let Some(key) = auth_key {
+        client_auth_handshake(&mut reader, &mut write_half, key, self_hive).await?;
+    }
+    Ok((reader, write_half))
+}
+
 async fn handle_sync_connection(
     stream: TcpStream,
     chunks: Vec<IdentityFullSyncChunk>,
     ingest_tx: mpsc::Sender<IngestFrame>,
+    auth_required: bool,
 ) -> Result<Option<mpsc::UnboundedSender<IdentityDeltaEnvelope>>, IdentityError> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
-    let mut request_line = String::new();
-    let read = reader.read_line(&mut request_line).await?;
-    if read == 0 {
-        return Err("full sync request connection closed".into());
-    }
-    let request: IdentitySyncRequest = serde_json::from_str(request_line.trim())?;
+    // Per-hive HMAC handshake before any protocol message (when required).
+    let authed_hive: Option<String> = if auth_required {
+        Some(server_auth_handshake(&mut reader, &mut write_half).await?)
+    } else {
+        None
+    };
+    // Timed read (via auth_read_line) so a peer that completes the handshake
+    // then stalls cannot pin the inline-awaited accept path indefinitely.
+    let request_line = auth_read_line(&mut reader).await?;
+    let request: IdentitySyncRequest = serde_json::from_str(&request_line)?;
     match request.operation.as_str() {
         SYNC_OP_FULL_SYNC_REQUEST => {
             for chunk in chunks {
@@ -3825,6 +4039,25 @@ async fn handle_sync_connection(
                 write_half.flush().await?;
                 return Ok(None);
             };
+            // Bind the HMAC-authenticated identity to the published-as hive_id:
+            // a peer must not authenticate as one hive and push another's ilks.
+            if let Some(ref authed) = authed_hive {
+                if authed != &publisher_hive {
+                    let payload = IdentitySyncError {
+                        status: "error".to_string(),
+                        error_code: "AUTH_MISMATCH".to_string(),
+                        message: format!(
+                            "authenticated hive '{authed}' may not publish as '{publisher_hive}'"
+                        ),
+                    };
+                    write_half
+                        .write_all(serde_json::to_string(&payload)?.as_bytes())
+                        .await?;
+                    write_half.write_all(b"\n").await?;
+                    write_half.flush().await?;
+                    return Ok(None);
+                }
+            }
             let ack = json!({ "status": "ok", "operation": SYNC_OP_PUBLISH_OK });
             write_half
                 .write_all(serde_json::to_string(&ack)?.as_bytes())
@@ -3858,9 +4091,12 @@ async fn handle_sync_connection(
     }
 }
 
-async fn fetch_full_sync_from_primary(upstream: &str) -> Result<IdentityStore, IdentityError> {
-    let stream = TcpStream::connect(upstream).await?;
-    let (read_half, mut write_half) = stream.into_split();
+async fn fetch_full_sync_from_primary(
+    upstream: &str,
+    auth_key: Option<&json_router::mesh_hmac::MeshHmacKey>,
+    self_hive: &str,
+) -> Result<IdentityStore, IdentityError> {
+    let (mut reader, mut write_half) = connect_and_auth(upstream, auth_key, self_hive).await?;
     let request = IdentitySyncRequest {
         operation: SYNC_OP_FULL_SYNC_REQUEST.to_string(),
         hive_id: None,
@@ -3870,7 +4106,6 @@ async fn fetch_full_sync_from_primary(upstream: &str) -> Result<IdentityStore, I
     write_half.write_all(b"\n").await?;
     write_half.flush().await?;
 
-    let mut reader = BufReader::new(read_half);
     let mut line = String::new();
     let mut expected_chunks: Option<usize> = None;
     let mut received: Vec<Option<IdentityFullSyncChunk>> = Vec::new();
@@ -3998,9 +4233,11 @@ fn broadcast_deltas(
 async fn run_delta_subscription_loop(
     upstream: String,
     sink: mpsc::UnboundedSender<IdentityDeltaEnvelope>,
+    auth_key: Option<json_router::mesh_hmac::MeshHmacKey>,
+    self_hive: String,
 ) {
     loop {
-        match stream_deltas_from_primary(&upstream, &sink).await {
+        match stream_deltas_from_primary(&upstream, &sink, auth_key.as_ref(), &self_hive).await {
             Ok(()) => {
                 tracing::warn!(upstream = %upstream, "identity delta stream closed; reconnecting")
             }
@@ -4015,9 +4252,10 @@ async fn run_delta_subscription_loop(
 async fn stream_deltas_from_primary(
     upstream: &str,
     sink: &mpsc::UnboundedSender<IdentityDeltaEnvelope>,
+    auth_key: Option<&json_router::mesh_hmac::MeshHmacKey>,
+    self_hive: &str,
 ) -> Result<(), IdentityError> {
-    let stream = TcpStream::connect(upstream).await?;
-    let (read_half, mut write_half) = stream.into_split();
+    let (mut reader, mut write_half) = connect_and_auth(upstream, auth_key, self_hive).await?;
     let request = IdentitySyncRequest {
         operation: SYNC_OP_DELTA_SUBSCRIBE.to_string(),
         hive_id: None,
@@ -4027,7 +4265,6 @@ async fn stream_deltas_from_primary(
     write_half.write_all(b"\n").await?;
     write_half.flush().await?;
 
-    let mut reader = BufReader::new(read_half);
     let mut line = String::new();
     let mut last_seq: Option<u64> = None;
     loop {
@@ -4163,9 +4400,10 @@ async fn run_delta_publish_loop(
     upstream: String,
     hive_id: String,
     mut rx: mpsc::UnboundedReceiver<UpstreamFrame>,
+    auth_key: Option<json_router::mesh_hmac::MeshHmacKey>,
 ) {
     loop {
-        match publish_to_primary(&upstream, &hive_id, &mut rx).await {
+        match publish_to_primary(&upstream, &hive_id, &mut rx, auth_key.as_ref()).await {
             Ok(()) => {
                 tracing::warn!(upstream = %upstream, "identity publish channel closed; reconnecting")
             }
@@ -4184,9 +4422,9 @@ async fn publish_to_primary(
     upstream: &str,
     hive_id: &str,
     rx: &mut mpsc::UnboundedReceiver<UpstreamFrame>,
+    auth_key: Option<&json_router::mesh_hmac::MeshHmacKey>,
 ) -> Result<(), IdentityError> {
-    let stream = TcpStream::connect(upstream).await?;
-    let (read_half, mut write_half) = stream.into_split();
+    let (mut reader, mut write_half) = connect_and_auth(upstream, auth_key, hive_id).await?;
     let request = IdentitySyncRequest {
         operation: SYNC_OP_DELTA_PUBLISH.to_string(),
         hive_id: Some(hive_id.to_string()),
@@ -4197,7 +4435,6 @@ async fn publish_to_primary(
     write_half.write_all(b"\n").await?;
     write_half.flush().await?;
 
-    let mut reader = BufReader::new(read_half);
     // Handshake ack (the primary confirms it accepted the publish channel).
     let mut line = String::new();
     let n = reader.read_line(&mut line).await?;
