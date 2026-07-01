@@ -2034,7 +2034,7 @@ async fn handle_admin(
                     Ok(creds) => match resolve_add_hive_role(&msg.payload) {
                         Ok(HiveRole::Egress) => match resolve_add_hive_egress_section(&msg.payload) {
                             Ok(egress) => {
-                                add_egress_hive_flow(
+                                let mut result = add_egress_hive_flow(
                                     state,
                                     &hive_id,
                                     &address,
@@ -2043,7 +2043,20 @@ async fn handle_admin(
                                     egress,
                                     &creds,
                                 )
-                                .await
+                                .await;
+                                // B-2: same as the worker path — on a failed egress join,
+                                // best-effort revoke the (possibly seeded) bootstrap key.
+                                if result.get("status").and_then(|v| v.as_str()) != Some("ok") {
+                                    let revoked =
+                                        best_effort_revoke_bootstrap(&address, creds.user.as_str());
+                                    if let Some(obj) = result.as_object_mut() {
+                                        obj.insert(
+                                            "ssh_bootstrap_open".to_string(),
+                                            serde_json::json!(!revoked),
+                                        );
+                                    }
+                                }
+                                result
                             }
                             Err(err) => serde_json::json!({
                                 "status": "error",
@@ -2052,7 +2065,7 @@ async fn handle_admin(
                             }),
                         },
                         Ok(_) => {
-                            add_hive_flow(
+                            let mut result = add_hive_flow(
                                 state,
                                 &hive_id,
                                 &address,
@@ -2062,7 +2075,21 @@ async fn handle_admin(
                                 dist_sync_probe_timeout_secs,
                                 &creds,
                             )
-                            .await
+                            .await;
+                            // B-2: on a failed join, best-effort revoke the (possibly
+                            // already-seeded) bootstrap SSH access and surface whether it
+                            // may still be open (a retry re-seeds via the password channel).
+                            if result.get("status").and_then(|v| v.as_str()) != Some("ok") {
+                                let revoked =
+                                    best_effort_revoke_bootstrap(&address, creds.user.as_str());
+                                if let Some(obj) = result.as_object_mut() {
+                                    obj.insert(
+                                        "ssh_bootstrap_open".to_string(),
+                                        serde_json::json!(!revoked),
+                                    );
+                                }
+                            }
+                            result
                         }
                         Err(err) => serde_json::json!({
                             "status": "error",
@@ -4856,6 +4883,19 @@ fn syncthing_unit_contents(blob: &BlobRuntimeConfig, service_user: &str) -> Stri
         blob.sync_data_dir.display(),
         blob.sync_api_port
     )
+}
+
+/// B-3: reject a value that would break the double-quoted YAML scalar it is
+/// interpolated into (a `"`, `\`, or control char/newline). These add_hive
+/// values are internal-derived, so this is defensive hardening.
+fn validate_yaml_scalar(value: &str, label: &str) -> Result<(), OrchestratorError> {
+    if value
+        .chars()
+        .any(|c| c.is_control() || c == '"' || c == '\\')
+    {
+        return Err(format!("{label} contains a character unsafe for a YAML scalar").into());
+    }
+    Ok(())
 }
 
 /// SO-06: reject a value that could break or inject directives into a systemd
@@ -16132,6 +16172,24 @@ async fn add_hive_flow(
             });
         }
     };
+    // B-3: reject any interpolated value that would break the double-quoted YAML
+    // scalars below (control char / quote / backslash). These are internal-derived
+    // so this is defensive — failing loud beats writing a malformed worker hive.yaml.
+    for (val, label) in [
+        (hive_id, "hive_id"),
+        (worker_uplink.as_str(), "wan uplink address"),
+        (storage_path.as_str(), "storage.path"),
+        (identity_frontdesk_node_name.as_str(), "identity_frontdesk"),
+        (identity_sync_upstream.as_str(), "identity.sync.upstream"),
+    ] {
+        if let Err(err) = validate_yaml_scalar(val, label) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "CONFIG_FAILED",
+                "message": err.to_string(),
+            });
+        }
+    }
     let hive_yaml = format!(
         "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\ngovernment:\n  identity_frontdesk: \"{}\"\nidentity:\n  sync:\n    upstream: \"{}\"\n    auth: required\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n{}{}",
         hive_id,
@@ -16809,6 +16867,19 @@ async fn add_egress_hive_flow(
                 .to_string_lossy()
                 .to_string()
         });
+    // B-3: reject values unsafe for the double-quoted YAML scalars below (the
+    // egress iface/cidr/ip fields are already allowlist-validated upstream).
+    let dist_path_str = state.dist.path.to_string_lossy().to_string();
+    for (val, label) in [
+        (hive_id, "hive_id"),
+        (worker_uplink.as_str(), "wan uplink address"),
+        (storage_path.as_str(), "storage.path"),
+        (dist_path_str.as_str(), "dist.path"),
+    ] {
+        if let Err(err) = validate_yaml_scalar(val, label) {
+            return err_payload("CONFIG_FAILED", err.to_string());
+        }
+    }
     let hive_yaml = format!(
         "hive_id: {hive_id}\nrole: egress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  sync:\n    enabled: false\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: false\negress:\n  enabled: true\n  lan_cidr: \"{lan_cidr}\"\n  edge_ip: \"{edge_ip}\"\n  wan_iface: \"{wan_iface}\"\n  lan_iface: \"{lan_iface}\"\n  ipv6: \"blocked\"\n{system_nodes}",
         hive_id = hive_id,
@@ -17796,6 +17867,19 @@ fi\n",
     let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
     ssh_with_key(address, key_path, &cmd, user)?;
     Ok(())
+}
+
+/// B-2: on a FAILED add_hive, best-effort revoke the bootstrap SSH access — the
+/// key may have been seeded before the failure. Returns whether the revoke
+/// succeeded (so the caller can report `ssh_bootstrap_open = !revoked`). If the
+/// failure was before seeding / the box is unreachable, the revoke SSH just fails
+/// harmlessly. A retry of add_hive re-seeds the key via the password channel.
+fn best_effort_revoke_bootstrap(address: &str, user: &str) -> bool {
+    let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
+    let Ok(pub_key) = public_key_from_private_key(&key_path) else {
+        return false;
+    };
+    revoke_bootstrap_ssh_access(address, &key_path, user, &pub_key).is_ok()
 }
 
 fn remote_orchestrator_sudoers_contents(user: &str) -> String {
@@ -18859,6 +18943,16 @@ mod tests {
         assert!(validate_unit_path_field(Path::new("/var/lib/fluxbee/syncthing"), "d").is_ok());
         assert!(validate_unit_path_field(Path::new("/a\nExecStartPre=/evil"), "d").is_err());
         assert!(validate_unit_path_field(Path::new("relative/path"), "d").is_err());
+    }
+
+    #[test]
+    fn yaml_scalar_validation_blocks_quote_and_control() {
+        assert!(validate_yaml_scalar("192.168.1.10:9100", "x").is_ok());
+        assert!(validate_yaml_scalar("SY.frontdesk.gov@motherbee", "x").is_ok());
+        assert!(validate_yaml_scalar("/var/lib/fluxbee", "x").is_ok());
+        assert!(validate_yaml_scalar("a\"b", "x").is_err()); // would break the quoted scalar
+        assert!(validate_yaml_scalar("a\nb", "x").is_err());
+        assert!(validate_yaml_scalar("a\\b", "x").is_err());
     }
 
     #[test]
