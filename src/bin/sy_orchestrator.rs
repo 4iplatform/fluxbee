@@ -16546,6 +16546,19 @@ async fn add_hive_flow(
         });
     }
 
+    // SO-02: the worker is online and everything post-bootstrap is socket +
+    // dist-sync, so revoke the bootstrap SSH access (strip the motherbee key from
+    // authorized_keys + drop the sudoers NOPASSWD grant). This is the last SSH op.
+    // Best-effort: a revoke failure must not fail an otherwise-successful join.
+    let ssh_bootstrap_revoked =
+        match revoke_bootstrap_ssh_access(address, &key_path, creds.user.as_str(), &pub_key) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access; key/sudoers may remain on the worker");
+                false
+            }
+        };
+
     serde_json::json!({
         "status": "ok",
         "hive_id": hive_id,
@@ -16555,6 +16568,7 @@ async fn add_hive_flow(
         "restrict_ssh": restrict_ssh_applied,
         "restrict_ssh_mode": restrict_ssh_mode,
         "restrict_ssh_requested": restrict_ssh,
+        "ssh_bootstrap_revoked": ssh_bootstrap_revoked,
         "require_dist_sync": require_dist_sync,
         "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
         "wan_connected": true,
@@ -17031,6 +17045,17 @@ async fn add_egress_hive_flow(
     // working uplink. The egress host verifies it authoritatively and re-checks
     // it every drift tick, degrading to a WARN in its own journal. Transmitting
     // the real value back here is the T-VER-1 follow-up.
+    // SO-02: revoke bootstrap SSH access (key + sudoers) — especially important on
+    // an egress boundary host. Best-effort. Post-bootstrap is socket + dist-sync.
+    let ssh_bootstrap_revoked =
+        match revoke_bootstrap_ssh_access(address, &key_path, creds.user.as_str(), &pub_key) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access on egress; key/sudoers may remain");
+                false
+            }
+        };
+
     serde_json::json!({
         "status": "ok",
         "hive_id": hive_id,
@@ -17047,6 +17072,7 @@ async fn add_egress_hive_flow(
         "restrict_ssh": restrict_ssh_applied,
         "restrict_ssh_mode": restrict_ssh_mode,
         "restrict_ssh_requested": restrict_ssh,
+        "ssh_bootstrap_revoked": ssh_bootstrap_revoked,
         "wan_connected": wan_connected,
         "orchestrator_connected": orchestrator_connected,
         "note": "egress orchestrator active implies NAT applied + ipv4_forwarding + ipv6_blocked (reconcile is fatal at its boot). internet_reachable is verified ONLY on the egress host (degrades to WARN in its journal + re-checked every drift tick); not transmitted to motherbee in v1 (T-VER-1). See the egress journal for live detail.",
@@ -17726,6 +17752,49 @@ chmod 600 ~/.ssh/authorized_keys\n",
     );
     let cmd = format!("bash -lc '{}'", shell_single_quote(&script));
     ssh_with_pass_any(address, &cmd, user, password)?;
+    Ok(())
+}
+
+/// SO-02: revoke the bootstrap SSH access at the end of a successful add_hive.
+/// The deploy model is SSH-is-bootstrap-only (post-bootstrap is router socket +
+/// syncthing dist-sync; verified: no post-bootstrap path SSHes to a worker), so
+/// once the worker/egress is online we remove the motherbee bootstrap key from
+/// its authorized_keys AND drop the /etc/sudoers.d NOPASSWD grant. This is the
+/// LAST SSH op — the key removes itself. Runs as root (sudo_wrap): dropping the
+/// sudoers file mid-command does not revoke the already-elevated session, so the
+/// authorized_keys edit that follows still runs. Best-effort by contract of its
+/// caller (a failure to revoke must not fail an otherwise-successful join, but is
+/// surfaced as `ssh_bootstrap_revoked=false`).
+fn revoke_bootstrap_ssh_access(
+    address: &str,
+    key_path: &Path,
+    user: &str,
+    pub_key: &str,
+) -> Result<(), OrchestratorError> {
+    let key_material = pub_key
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "invalid public key format: missing key material".to_string())?;
+    let script = format!(
+        "set -uo pipefail\n\
+user='{user}'\n\
+rm -f {sudoers} || true\n\
+home_dir=\"$(getent passwd \"$user\" | cut -d: -f6)\"\n\
+if [[ -z \"$home_dir\" ]]; then home_dir=\"/home/$user\"; fi\n\
+auth_keys=\"$home_dir/.ssh/authorized_keys\"\n\
+if [[ -f \"$auth_keys\" ]]; then \
+{{ grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' > \"$auth_keys.tmp\"; }} || true; \
+mv \"$auth_keys.tmp\" \"$auth_keys\" 2>/dev/null || true; \
+chown \"$user:$user\" \"$auth_keys\" 2>/dev/null || true; \
+chmod 600 \"$auth_keys\" 2>/dev/null || true; \
+fi\n",
+        user = user,
+        sudoers = shell_single_quote(ORCH_SUDOERS_PATH),
+        gate_path = shell_single_quote(ORCH_SSH_GATE_PATH),
+        key_material = shell_single_quote(key_material),
+    );
+    let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
+    ssh_with_key(address, key_path, &cmd, user)?;
     Ok(())
 }
 
