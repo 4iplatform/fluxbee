@@ -495,6 +495,12 @@ struct OrchestratorState {
     // latency regression. The registry is guarded by a brief std mutex (never held
     // across an await); each per-hive lock is an async mutex held for the whole flow.
     hive_topology_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    // SO-04: serialize node lifecycle/config per node_name. run_node/kill_node/
+    // start/restart/remove/config_set each touch identity, the local config file,
+    // systemd and timers across a long unlocked window; two concurrent ops on the
+    // SAME node race and drift those stores. Per-node (not global) so different
+    // nodes still operate concurrently. Same registry pattern as the hive lock.
+    node_lifecycle_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
     rpc: OnceLock<Arc<RouterDispatcher>>,
 }
 
@@ -518,6 +524,24 @@ impl OrchestratorState {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             registry
                 .entry(hive_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+
+    /// SO-04: acquire the per-node lifecycle lock, held for the whole
+    /// run/kill/start/restart/remove/config_set flow so concurrent ops on the
+    /// same node don't drift identity/config/systemd. Keyed by the (validated,
+    /// normalized) node_name; the guard releases on drop, incl. early return.
+    async fn lock_node(&self, node_name: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut registry = self
+                .node_lifecycle_locks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry
+                .entry(node_name.to_string())
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
@@ -652,6 +676,7 @@ async fn main() -> Result<(), OrchestratorError> {
         dist: dist_runtime,
         blob_sync_last_desired: Mutex::new(blob_runtime),
         hive_topology_locks: std::sync::Mutex::new(HashMap::new()),
+        node_lifecycle_locks: std::sync::Mutex::new(HashMap::new()),
         rpc: OnceLock::new(),
     });
     tracing::info!(
@@ -800,6 +825,7 @@ async fn run_system_worker(
 /// Write a secret file owner-only from creation (no world-readable window).
 fn write_secret_file_0600(path: &Path, contents: &str) -> Result<(), OrchestratorError> {
     use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -810,6 +836,10 @@ fn write_secret_file_0600(path: &Path, contents: &str) -> Result<(), Orchestrato
         .mode(0o600)
         .open(path)?;
     f.write_all(contents.as_bytes())?;
+    // SO-07: `.mode(0o600)` only applies when the file is CREATED; truncating a
+    // pre-existing wider-mode file keeps the old bits. Re-assert 0600 after write
+    // so a rotation/rewrite of e.g. cert.key can never leave it world-readable.
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
@@ -2004,7 +2034,7 @@ async fn handle_admin(
                     Ok(creds) => match resolve_add_hive_role(&msg.payload) {
                         Ok(HiveRole::Egress) => match resolve_add_hive_egress_section(&msg.payload) {
                             Ok(egress) => {
-                                add_egress_hive_flow(
+                                let mut result = add_egress_hive_flow(
                                     state,
                                     &hive_id,
                                     &address,
@@ -2013,7 +2043,20 @@ async fn handle_admin(
                                     egress,
                                     &creds,
                                 )
-                                .await
+                                .await;
+                                // B-2: same as the worker path — on a failed egress join,
+                                // best-effort revoke the (possibly seeded) bootstrap key.
+                                if result.get("status").and_then(|v| v.as_str()) != Some("ok") {
+                                    let revoked =
+                                        best_effort_revoke_bootstrap(&address, creds.user.as_str());
+                                    if let Some(obj) = result.as_object_mut() {
+                                        obj.insert(
+                                            "ssh_bootstrap_open".to_string(),
+                                            serde_json::json!(!revoked),
+                                        );
+                                    }
+                                }
+                                result
                             }
                             Err(err) => serde_json::json!({
                                 "status": "error",
@@ -2022,7 +2065,7 @@ async fn handle_admin(
                             }),
                         },
                         Ok(_) => {
-                            add_hive_flow(
+                            let mut result = add_hive_flow(
                                 state,
                                 &hive_id,
                                 &address,
@@ -2032,7 +2075,21 @@ async fn handle_admin(
                                 dist_sync_probe_timeout_secs,
                                 &creds,
                             )
-                            .await
+                            .await;
+                            // B-2: on a failed join, best-effort revoke the (possibly
+                            // already-seeded) bootstrap SSH access and surface whether it
+                            // may still be open (a retry re-seeds via the password channel).
+                            if result.get("status").and_then(|v| v.as_str()) != Some("ok") {
+                                let revoked =
+                                    best_effort_revoke_bootstrap(&address, creds.user.as_str());
+                                if let Some(obj) = result.as_object_mut() {
+                                    obj.insert(
+                                        "ssh_bootstrap_open".to_string(),
+                                        serde_json::json!(!revoked),
+                                    );
+                                }
+                            }
+                            result
                         }
                         Err(err) => serde_json::json!({
                             "status": "error",
@@ -2093,9 +2150,44 @@ async fn handle_system_message(
     msg: &Message,
     state: &OrchestratorState,
 ) -> Result<(), OrchestratorError> {
-    // SYSTEM origin-authority is now enforced centrally by the router at delivery
-    // time (system_policy::authority); an unauthorized protected SYSTEM action never
-    // reaches this node, so the orchestrator no longer re-checks it here (F4/F15).
+    // SYSTEM origin-authority is enforced centrally by the router at delivery time
+    // (system_policy::authority); an unauthorized protected SYSTEM action should
+    // never reach this node (F4/F15).
+    //
+    // SO-05 (defense in depth): re-check protected actions locally against the
+    // SAME shared policy, so a boundary bypass — a test path, a stale/mixed
+    // router version, a future alternate delivery route, or a
+    // serialize_for_local_delivery regression — cannot execute a critical
+    // mutation here on an unauthorized or unresolved origin. In the normal path
+    // this is a no-op (the message already passed the identical router check).
+    if let Some(action) = msg.meta.msg.as_deref() {
+        if json_router::router::system_policy::is_protected_system_action(action)
+            && !json_router::router::system_policy::authority(
+                action,
+                msg.routing.src_l2_name.as_deref(),
+                &state.hive_id,
+            )
+        {
+            tracing::warn!(
+                action = action,
+                src_uuid = %msg.routing.src,
+                src_l2_name = ?msg.routing.src_l2_name,
+                "SO-05: local authority guard rejected a protected SYSTEM action (router boundary bypass?)"
+            );
+            let _ = send_system_action_response(
+                sender,
+                msg,
+                &format!("{action}_RESPONSE"),
+                serde_json::json!({
+                    "status": "error",
+                    "error_code": "UNAUTHORIZED",
+                    "message": "unauthorized SYSTEM origin",
+                }),
+            )
+            .await;
+            return Ok(());
+        }
+    }
     match msg.meta.msg.as_deref() {
         Some("RUNTIME_UPDATE") => {
             let payload = serde_json::json!({
@@ -4305,6 +4397,12 @@ fn egress_nft_ruleset(cfg: &EgressNatConfig) -> String {
     format!(
         "#!/usr/sbin/nft -f\n\
          # BEGIN FLUXBEE EGRESS NAT\n\
+         # SO-08: add + flush + define in ONE atomic `nft -f` transaction, so a\n\
+         # re-apply never has the delete-then-apply gap where ip_forward is on but\n\
+         # the fluxbee_egress table is momentarily absent. `add` is a no-op if the\n\
+         # table exists; `flush` empties it; the block below redefines it.\n\
+         add table {table}\n\
+         flush table {table}\n\
          table {table} {{\n\
          \tchain input {{\n\
          \t\ttype filter hook input priority 0; policy accept;\n\
@@ -4329,6 +4427,14 @@ fn egress_nft_ruleset(cfg: &EgressNatConfig) -> String {
         wan_iface = cfg.wan_iface,
         lan_cidr = cfg.lan_cidr,
     )
+}
+
+/// SO-08: read a kernel sysctl back from `/proc/sys/<rel>` (path form, e.g.
+/// `net/ipv4/ip_forward`). `Some(true)` iff the value is exactly `1`.
+fn read_sysctl_bool(rel: &str) -> Option<bool> {
+    fs::read_to_string(format!("/proc/sys/{rel}"))
+        .ok()
+        .map(|s| s.trim() == "1")
 }
 
 fn apply_sysctl_system() -> Result<(), OrchestratorError> {
@@ -4509,18 +4615,6 @@ fn default_route_via(gateway_ip: &str) -> bool {
     }
 }
 
-fn delete_egress_nft_table_if_present() -> Result<(), OrchestratorError> {
-    if !nft_table_loaded() {
-        return Ok(());
-    }
-    let mut cmd = Command::new("nft");
-    cmd.arg("delete")
-        .arg("table")
-        .arg("inet")
-        .arg("fluxbee_egress");
-    run_cmd(cmd, "nft delete fluxbee-egress table")
-}
-
 /// Smoke-test that the egress path reaches the internet. Tries ICMP first
 /// (cheap), then falls back to an HTTPS GET of the Fluxbee site. The HTTPS leg
 /// avoids the false-negative where a network blocks ICMP but allows 443 (the
@@ -4565,8 +4659,11 @@ fn reconcile_egress_nat(eg: &EgressSection) -> Result<EgressVerification, Orches
         tracing::info!(path = EGRESS_SYSCTL_PATH, "wrote egress sysctl");
     }
     apply_sysctl_system()?;
-    verification.ipv4_forwarding = true;
-    verification.ipv6_blocked = true;
+    // SO-08: report what the kernel actually has now, not an unconditional `true`
+    // — another process/policy could have rejected or reverted the sysctls.
+    verification.ipv4_forwarding = read_sysctl_bool("net/ipv4/ip_forward") == Some(true);
+    verification.ipv6_blocked =
+        read_sysctl_bool("net/ipv6/conf/all/disable_ipv6") == Some(true);
 
     // conntrack tuning: live max + persisted file + modprobe hashsize (boot).
     write_file_if_changed(
@@ -4585,7 +4682,9 @@ fn reconcile_egress_nat(eg: &EgressSection) -> Result<EgressVerification, Orches
     // then verify.
     let ruleset = egress_nft_ruleset(&cfg);
     write_file_if_changed(EGRESS_NFT_PATH, &ruleset)?;
-    delete_egress_nft_table_if_present()?;
+    // SO-08: the ruleset self-flushes atomically (add+flush+define in one
+    // transaction), so there is no separate delete step and thus no window where
+    // ip_forward is on but the fluxbee_egress table is absent.
     let mut apply = Command::new("nft");
     apply.arg("-f").arg(EGRESS_NFT_PATH);
     run_cmd(apply, "nft -f fluxbee-egress")?;
@@ -4786,8 +4885,41 @@ fn syncthing_unit_contents(blob: &BlobRuntimeConfig, service_user: &str) -> Stri
     )
 }
 
+/// B-3: reject a value that would break the double-quoted YAML scalar it is
+/// interpolated into (a `"`, `\`, or control char/newline). These add_hive
+/// values are internal-derived, so this is defensive hardening.
+fn validate_yaml_scalar(value: &str, label: &str) -> Result<(), OrchestratorError> {
+    if value
+        .chars()
+        .any(|c| c.is_control() || c == '"' || c == '\\')
+    {
+        return Err(format!("{label} contains a character unsafe for a YAML scalar").into());
+    }
+    Ok(())
+}
+
+/// SO-06: reject a value that could break or inject directives into a systemd
+/// unit file — a newline/control char, or (for paths) a non-absolute value.
+fn validate_unit_path_field(path: &Path, label: &str) -> Result<(), OrchestratorError> {
+    let s = path.to_string_lossy();
+    if s.chars().any(char::is_control) {
+        return Err(format!("{label} contains control characters").into());
+    }
+    if !path.is_absolute() {
+        return Err(format!("{label} must be an absolute path (got '{s}')").into());
+    }
+    Ok(())
+}
+
 fn ensure_syncthing_unit(blob: &BlobRuntimeConfig) -> Result<(), OrchestratorError> {
     let service_user = resolve_syncthing_service_user(blob)?;
+    // SO-06: service_user and sync_data_dir are interpolated verbatim into a
+    // root-written systemd unit file; reject control chars / non-absolute paths
+    // that could break the unit or inject directives before writing it.
+    if service_user.chars().any(char::is_control) {
+        return Err("syncthing: service user contains control characters".into());
+    }
+    validate_unit_path_field(&blob.sync_data_dir, "blob.sync.data_dir")?;
     let unit_contents = syncthing_unit_contents(blob, &service_user);
     let unit_path =
         Path::new("/etc/systemd/system").join(format!("{SYNCTHING_SERVICE_NAME}.service"));
@@ -12158,6 +12290,8 @@ async fn set_node_config_flow(
         }
     };
 
+    // SO-04: serialize with any concurrent lifecycle op on this node.
+    let _node_lock = state.lock_node(&node_name).await;
     if target_hive != state.hive_id {
         let mut forwarded_payload = payload.clone();
         if let Some(obj) = forwarded_payload.as_object_mut() {
@@ -12468,6 +12602,10 @@ async fn run_node_flow(
             "node_name": node_name,
         });
     }
+    // SO-04: hold the per-node lock across the whole spawn (identity + config
+    // preflight/write + systemd) so a concurrent run/kill/config on the same node
+    // can't interleave and drift those stores.
+    let _node_lock = state.lock_node(&node_name).await;
     let identity_primary_hive_id = match resolve_identity_primary_hive_id(state) {
         Ok(value) => value,
         Err(err) => {
@@ -12515,12 +12653,11 @@ async fn run_node_flow(
         });
     }
 
-    let unit = payload
-        .get("unit")
-        .and_then(|v| v.as_str())
-        .map(|v| sanitize_unit_suffix(v.trim()))
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| unit_from_node_name(&node_name));
+    // SO-01: the systemd unit is ALWAYS derived from the validated, managed
+    // node_name (`unit_from_node_name` prefixes `fluxbee-node-`), never taken
+    // from the caller — so a lifecycle-authorized caller cannot spawn/register
+    // against an arbitrary host unit (sy-orchestrator, ssh, postgresql, ...).
+    let unit = unit_from_node_name(&node_name);
 
     if target_hive != state.hive_id {
         let mut forwarded_payload = payload.clone();
@@ -12624,6 +12761,35 @@ async fn run_node_flow(
         return payload;
     }
 
+    // SO-03: preflight the local node config BEFORE any SY.identity mutation, so a
+    // re-run against an existing node returns NODE_ALREADY_EXISTS without having
+    // registered/updated identity + the local mapping (which would otherwise
+    // leave orphaned ILK/mapping state that blocks a clean retry).
+    let config_path = match node_effective_config_path(state, &node_name) {
+        Ok(path) => path,
+        Err(err) => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+                "unit": unit,
+            });
+        }
+    };
+    if config_path.exists() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "NODE_ALREADY_EXISTS",
+            "message": format!("node config already exists: {}", config_path.display()),
+            "target": target_hive,
+            "node_name": node_name,
+            "unit": unit,
+            "config": { "path": config_path.display().to_string() },
+        });
+    }
+
     let identity_register = match ensure_node_identity_registered(
         state,
         payload,
@@ -12694,34 +12860,7 @@ async fn run_node_flow(
         "register": identity_register,
         "update": identity_update,
     });
-    let config_path = match node_effective_config_path(state, &node_name) {
-        Ok(path) => path,
-        Err(err) => {
-            return serde_json::json!({
-                "status": "error",
-                "error_code": "INVALID_REQUEST",
-                "message": err.to_string(),
-                "target": target_hive,
-                "node_name": node_name,
-                "unit": unit,
-                "identity": identity,
-            });
-        }
-    };
-    if config_path.exists() {
-        return serde_json::json!({
-            "status": "error",
-            "error_code": "NODE_ALREADY_EXISTS",
-            "message": format!("node config already exists: {}", config_path.display()),
-            "target": target_hive,
-            "node_name": node_name,
-            "unit": unit,
-            "identity": identity,
-            "config": {
-                "path": config_path.display().to_string(),
-            }
-        });
-    }
+    // (config preflight already done above, before identity mutation — SO-03)
     let package_path = entrypoint.runtime_base.as_ref().map(|_| {
         runtime_package_dir(&runtime_key, &version)
             .display()
@@ -12804,16 +12943,24 @@ async fn run_node_flow(
             "identity": identity,
             "config": node_config,
         }),
-        Err(err) => serde_json::json!({
-            "status": "error",
-            "error_code": "SPAWN_FAILED",
-            "message": err.to_string(),
-            "target": target_hive,
-            "node_name": node_name,
-            "unit": unit,
-            "identity": identity,
-            "config": node_config,
-        }),
+        Err(err) => {
+            // SO-03: the config was written but the process failed to start.
+            // Remove the config (best-effort) so a retry isn't blocked by
+            // NODE_ALREADY_EXISTS and no orphan config lingers with no unit.
+            // Identity registration is an idempotent upsert-by-node_name, so a
+            // retry re-registers cleanly.
+            let _ = std::fs::remove_file(&config_path);
+            serde_json::json!({
+                "status": "error",
+                "error_code": "SPAWN_FAILED",
+                "message": err.to_string(),
+                "target": target_hive,
+                "node_name": node_name,
+                "unit": unit,
+                "identity": identity,
+                "config": node_config,
+            })
+        }
     }
 }
 
@@ -13072,6 +13219,8 @@ async fn start_or_restart_node_flow(
         }
     };
 
+    // SO-04: serialize with any concurrent lifecycle op on this node.
+    let _node_lock = state.lock_node(&node_name).await;
     let request_msg = if restart {
         "RESTART_NODE"
     } else {
@@ -13224,24 +13373,21 @@ async fn kill_node_flow(
         }
     };
 
-    let unit = payload
-        .get("unit")
-        .and_then(|v| v.as_str())
-        .map(|v| sanitize_unit_suffix(v.trim()))
-        .filter(|v| !v.is_empty())
-        .or_else(|| {
-            validated_node_name
-                .as_ref()
-                .map(|name| unit_from_node_name(name))
-        });
-
-    let Some(unit) = unit else {
+    // SO-01: KILL_NODE requires a validated managed node_name and ALWAYS derives
+    // the unit from it (`fluxbee-node-*`); a caller-supplied `unit` is never
+    // honored, so this cannot stop arbitrary host units (sy-orchestrator, ssh,
+    // postgresql, rt-gateway, ...). `validated_node_name` stays `Option` (now
+    // always `Some`) for the purge/forward paths below.
+    let Some(node_name_ref) = validated_node_name.as_deref() else {
         return serde_json::json!({
             "status": "error",
             "error_code": "INVALID_REQUEST",
-            "message": "missing unit or node_name",
+            "message": "node_name is required",
         });
     };
+    let unit = unit_from_node_name(node_name_ref);
+    // SO-04: serialize with any concurrent lifecycle/config op on this node.
+    let _node_lock = state.lock_node(node_name_ref).await;
 
     let force = payload
         .get("force")
@@ -13555,6 +13701,8 @@ async fn remove_node_instance_flow(
         }
     };
 
+    // SO-04: serialize with any concurrent lifecycle op on this node.
+    let _node_lock = state.lock_node(&node_name).await;
     if target_hive != state.hive_id {
         return match forward_system_action_to_hive(
             state,
@@ -16024,6 +16172,24 @@ async fn add_hive_flow(
             });
         }
     };
+    // B-3: reject any interpolated value that would break the double-quoted YAML
+    // scalars below (control char / quote / backslash). These are internal-derived
+    // so this is defensive — failing loud beats writing a malformed worker hive.yaml.
+    for (val, label) in [
+        (hive_id, "hive_id"),
+        (worker_uplink.as_str(), "wan uplink address"),
+        (storage_path.as_str(), "storage.path"),
+        (identity_frontdesk_node_name.as_str(), "identity_frontdesk"),
+        (identity_sync_upstream.as_str(), "identity.sync.upstream"),
+    ] {
+        if let Err(err) = validate_yaml_scalar(val, label) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "CONFIG_FAILED",
+                "message": err.to_string(),
+            });
+        }
+    }
     let hive_yaml = format!(
         "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\ngovernment:\n  identity_frontdesk: \"{}\"\nidentity:\n  sync:\n    upstream: \"{}\"\n    auth: required\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n{}{}",
         hive_id,
@@ -16438,6 +16604,19 @@ async fn add_hive_flow(
         });
     }
 
+    // SO-02: the worker is online and everything post-bootstrap is socket +
+    // dist-sync, so revoke the bootstrap SSH access (strip the motherbee key from
+    // authorized_keys + drop the sudoers NOPASSWD grant). This is the last SSH op.
+    // Best-effort: a revoke failure must not fail an otherwise-successful join.
+    let ssh_bootstrap_revoked =
+        match revoke_bootstrap_ssh_access(address, &key_path, creds.user.as_str(), &pub_key) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access; key/sudoers may remain on the worker");
+                false
+            }
+        };
+
     serde_json::json!({
         "status": "ok",
         "hive_id": hive_id,
@@ -16447,6 +16626,7 @@ async fn add_hive_flow(
         "restrict_ssh": restrict_ssh_applied,
         "restrict_ssh_mode": restrict_ssh_mode,
         "restrict_ssh_requested": restrict_ssh,
+        "ssh_bootstrap_revoked": ssh_bootstrap_revoked,
         "require_dist_sync": require_dist_sync,
         "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
         "wan_connected": true,
@@ -16687,6 +16867,19 @@ async fn add_egress_hive_flow(
                 .to_string_lossy()
                 .to_string()
         });
+    // B-3: reject values unsafe for the double-quoted YAML scalars below (the
+    // egress iface/cidr/ip fields are already allowlist-validated upstream).
+    let dist_path_str = state.dist.path.to_string_lossy().to_string();
+    for (val, label) in [
+        (hive_id, "hive_id"),
+        (worker_uplink.as_str(), "wan uplink address"),
+        (storage_path.as_str(), "storage.path"),
+        (dist_path_str.as_str(), "dist.path"),
+    ] {
+        if let Err(err) = validate_yaml_scalar(val, label) {
+            return err_payload("CONFIG_FAILED", err.to_string());
+        }
+    }
     let hive_yaml = format!(
         "hive_id: {hive_id}\nrole: egress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  sync:\n    enabled: false\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: false\negress:\n  enabled: true\n  lan_cidr: \"{lan_cidr}\"\n  edge_ip: \"{edge_ip}\"\n  wan_iface: \"{wan_iface}\"\n  lan_iface: \"{lan_iface}\"\n  ipv6: \"blocked\"\n{system_nodes}",
         hive_id = hive_id,
@@ -16923,6 +17116,17 @@ async fn add_egress_hive_flow(
     // working uplink. The egress host verifies it authoritatively and re-checks
     // it every drift tick, degrading to a WARN in its own journal. Transmitting
     // the real value back here is the T-VER-1 follow-up.
+    // SO-02: revoke bootstrap SSH access (key + sudoers) — especially important on
+    // an egress boundary host. Best-effort. Post-bootstrap is socket + dist-sync.
+    let ssh_bootstrap_revoked =
+        match revoke_bootstrap_ssh_access(address, &key_path, creds.user.as_str(), &pub_key) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access on egress; key/sudoers may remain");
+                false
+            }
+        };
+
     serde_json::json!({
         "status": "ok",
         "hive_id": hive_id,
@@ -16939,6 +17143,7 @@ async fn add_egress_hive_flow(
         "restrict_ssh": restrict_ssh_applied,
         "restrict_ssh_mode": restrict_ssh_mode,
         "restrict_ssh_requested": restrict_ssh,
+        "ssh_bootstrap_revoked": ssh_bootstrap_revoked,
         "wan_connected": wan_connected,
         "orchestrator_connected": orchestrator_connected,
         "note": "egress orchestrator active implies NAT applied + ipv4_forwarding + ipv6_blocked (reconcile is fatal at its boot). internet_reachable is verified ONLY on the egress host (degrades to WARN in its journal + re-checked every drift tick); not transmitted to motherbee in v1 (T-VER-1). See the egress journal for live detail.",
@@ -17067,6 +17272,18 @@ struct BootstrapCreds {
     password: Option<String>,
 }
 
+/// Whether `user` is a valid unix/ssh login: `^[a-z_][a-z0-9_-]*$`, max 32.
+/// Guards the operator-supplied `ssh_user` before it reaches remote shell/ssh.
+fn is_valid_ssh_user(user: &str) -> bool {
+    let bytes = user.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 32
+        && (bytes[0].is_ascii_lowercase() || bytes[0] == b'_')
+        && bytes
+            .iter()
+            .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
 /// Resolve the SSH bootstrap credentials from the `add_hive` payload. `ssh_user`
 /// is REQUIRED (no default); `ssh_password` is OPTIONAL (empty -> None). The
 /// password never gets a hardcoded fallback and is never logged or persisted.
@@ -17079,6 +17296,11 @@ fn resolve_add_hive_ssh_creds(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or("add_hive: 'ssh_user' is required (admin login for SSH bootstrap)")?;
+    // B-1: constrain to a valid unix/ssh login charset before it is embedded into
+    // remote shell commands / ssh targets (some sites interpolate it unquoted).
+    if !is_valid_ssh_user(&user) {
+        return Err("add_hive: 'ssh_user' must match ^[a-z_][a-z0-9_-]*$ (max 32)".into());
+    }
     // Do NOT trim the password: a legitimate password may have significant
     // leading/trailing spaces. Reject only a whitespace-only value (which is the
     // operator omitting it), keeping the rest verbatim.
@@ -17602,6 +17824,62 @@ chmod 600 ~/.ssh/authorized_keys\n",
     let cmd = format!("bash -lc '{}'", shell_single_quote(&script));
     ssh_with_pass_any(address, &cmd, user, password)?;
     Ok(())
+}
+
+/// SO-02: revoke the bootstrap SSH access at the end of a successful add_hive.
+/// The deploy model is SSH-is-bootstrap-only (post-bootstrap is router socket +
+/// syncthing dist-sync; verified: no post-bootstrap path SSHes to a worker), so
+/// once the worker/egress is online we remove the motherbee bootstrap key from
+/// its authorized_keys AND drop the /etc/sudoers.d NOPASSWD grant. This is the
+/// LAST SSH op — the key removes itself. Runs as root (sudo_wrap): dropping the
+/// sudoers file mid-command does not revoke the already-elevated session, so the
+/// authorized_keys edit that follows still runs. Best-effort by contract of its
+/// caller (a failure to revoke must not fail an otherwise-successful join, but is
+/// surfaced as `ssh_bootstrap_revoked=false`).
+fn revoke_bootstrap_ssh_access(
+    address: &str,
+    key_path: &Path,
+    user: &str,
+    pub_key: &str,
+) -> Result<(), OrchestratorError> {
+    let key_material = pub_key
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "invalid public key format: missing key material".to_string())?;
+    let script = format!(
+        "set -uo pipefail\n\
+user='{user}'\n\
+rm -f {sudoers} || true\n\
+home_dir=\"$(getent passwd \"$user\" | cut -d: -f6)\"\n\
+if [[ -z \"$home_dir\" ]]; then home_dir=\"/home/$user\"; fi\n\
+auth_keys=\"$home_dir/.ssh/authorized_keys\"\n\
+if [[ -f \"$auth_keys\" ]]; then \
+{{ grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' > \"$auth_keys.tmp\"; }} || true; \
+mv \"$auth_keys.tmp\" \"$auth_keys\" 2>/dev/null || true; \
+chown \"$user:$user\" \"$auth_keys\" 2>/dev/null || true; \
+chmod 600 \"$auth_keys\" 2>/dev/null || true; \
+fi\n",
+        user = user,
+        sudoers = shell_single_quote(ORCH_SUDOERS_PATH),
+        gate_path = shell_single_quote(ORCH_SSH_GATE_PATH),
+        key_material = shell_single_quote(key_material),
+    );
+    let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
+    ssh_with_key(address, key_path, &cmd, user)?;
+    Ok(())
+}
+
+/// B-2: on a FAILED add_hive, best-effort revoke the bootstrap SSH access — the
+/// key may have been seeded before the failure. Returns whether the revoke
+/// succeeded (so the caller can report `ssh_bootstrap_open = !revoked`). If the
+/// failure was before seeding / the box is unreachable, the revoke SSH just fails
+/// harmlessly. A retry of add_hive re-seeds the key via the password channel.
+fn best_effort_revoke_bootstrap(address: &str, user: &str) -> bool {
+    let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
+    let Ok(pub_key) = public_key_from_private_key(&key_path) else {
+        return false;
+    };
+    revoke_bootstrap_ssh_access(address, &key_path, user, &pub_key).is_ok()
 }
 
 fn remote_orchestrator_sudoers_contents(user: &str) -> String {
@@ -18636,11 +18914,45 @@ mod tests {
             "ruleset must be deterministic for idempotent re-apply"
         );
         assert!(a.contains("table inet fluxbee_egress"));
-        assert!(!a.contains("add table inet fluxbee_egress"));
+        // SO-08: self-flushing atomic apply (add + flush + define) — no separate
+        // delete step, so no window where forwarding is on but the table is gone.
+        assert!(a.contains("add table inet fluxbee_egress"));
+        assert!(a.contains("flush table inet fluxbee_egress"));
         assert!(!a.contains("delete table inet fluxbee_egress"));
         assert!(a.contains("ip saddr 192.168.8.0/24 oifname \"eth0\" masquerade"));
         assert!(a.contains("iifname \"eth1\" oifname \"eth0\" ip saddr 192.168.8.0/24 accept"));
         assert!(a.contains("meta nfproto ipv6 drop"));
+    }
+
+    #[test]
+    fn ssh_user_validation_blocks_metachars() {
+        assert!(is_valid_ssh_user("fluxbee"));
+        assert!(is_valid_ssh_user("root"));
+        assert!(is_valid_ssh_user("_svc-01"));
+        assert!(!is_valid_ssh_user(""));
+        assert!(!is_valid_ssh_user("a'b"));
+        assert!(!is_valid_ssh_user("a b"));
+        assert!(!is_valid_ssh_user("a;b"));
+        assert!(!is_valid_ssh_user("../etc"));
+        assert!(!is_valid_ssh_user("1abc")); // must not start with a digit
+        assert!(!is_valid_ssh_user(&"x".repeat(33)));
+    }
+
+    #[test]
+    fn unit_path_field_rejects_control_and_relative() {
+        assert!(validate_unit_path_field(Path::new("/var/lib/fluxbee/syncthing"), "d").is_ok());
+        assert!(validate_unit_path_field(Path::new("/a\nExecStartPre=/evil"), "d").is_err());
+        assert!(validate_unit_path_field(Path::new("relative/path"), "d").is_err());
+    }
+
+    #[test]
+    fn yaml_scalar_validation_blocks_quote_and_control() {
+        assert!(validate_yaml_scalar("192.168.1.10:9100", "x").is_ok());
+        assert!(validate_yaml_scalar("SY.frontdesk.gov@motherbee", "x").is_ok());
+        assert!(validate_yaml_scalar("/var/lib/fluxbee", "x").is_ok());
+        assert!(validate_yaml_scalar("a\"b", "x").is_err()); // would break the quoted scalar
+        assert!(validate_yaml_scalar("a\nb", "x").is_err());
+        assert!(validate_yaml_scalar("a\\b", "x").is_err());
     }
 
     #[test]
@@ -19411,6 +19723,7 @@ blob:
             dist: sample_dist_config(),
             blob_sync_last_desired: Mutex::new(sample_blob_config()),
             hive_topology_locks: StdMutex::new(HashMap::new()),
+            node_lifecycle_locks: StdMutex::new(HashMap::new()),
             rpc: OnceLock::new(),
         }
     }
