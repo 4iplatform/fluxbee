@@ -2886,6 +2886,28 @@ fn handle_vault_secret_changed(
         my_ilk = %control_state.self_ilk_id,
         "sy.storage handle_vault_secret_changed: entered"
     );
+    // Fail-closed origin check (F-03): the reaction is exit(0) (systemd
+    // restart), so only the LOCAL SY.vault may trigger it. src_l2_name is
+    // stamped authoritatively by the router; a forged VAULT_SECRET_CHANGED from
+    // any other node (or another hive's vault) must NOT be able to restart-loop
+    // this storage node. Own hive is the `@<hive>` suffix of our node_name.
+    let own_hive = node_name
+        .rsplit_once('@')
+        .map(|(_, h)| h.trim())
+        .unwrap_or("");
+    let expected_origin = format!("SY.vault@{own_hive}");
+    match msg.routing.src_l2_name.as_deref().map(str::trim) {
+        Some(origin) if !own_hive.is_empty() && origin == expected_origin => {}
+        other => {
+            tracing::warn!(
+                node_name = %node_name,
+                src_l2_name = %other.unwrap_or("<none>"),
+                expected = %expected_origin,
+                "VAULT_SECRET_CHANGED from a non-vault / cross-hive origin; refusing to restart storage"
+            );
+            return;
+        }
+    }
     let payload: VaultSecretChangedPayload = match serde_json::from_value(msg.payload.clone()) {
         Ok(p) => p,
         Err(err) => {

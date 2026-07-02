@@ -73,6 +73,7 @@ const RPC_CH_ADMIN: &str = "admin";
 const RPC_CH_SYSTEM: &str = "system";
 const MSG_ILK_REGISTER: &str = "ILK_REGISTER";
 const MSG_ILK_UPDATE: &str = "ILK_UPDATE";
+const MSG_ILK_DELETE: &str = "ILK_DELETE";
 const SY_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
 const ADD_HIVE_SOCKET_READY_PROBE_TIMEOUT_SECS: u64 = 10;
 const SYNCTHING_SERVICE_NAME: &str = "fluxbee-syncthing";
@@ -989,10 +990,13 @@ fn distribute_hive_tls_inner(
     // which leaves the new file at the umask default (often world-readable) until
     // the chmod below. An owner-only directory blocks traversal in that window, so
     // cert.key is never readable by another local user even transiently.
+    let quoted_dir = shell_single_quote(&dir);
     ssh_with_key(
         address,
         key_path,
-        &sudo_wrap(&format!("mkdir -p '{dir}' && chmod 700 '{dir}'")),
+        &sudo_bash_wrap(&format!(
+            "mkdir -p '{quoted_dir}' && chmod 700 '{quoted_dir}'"
+        )),
         user,
     )?;
     write_remote_file(address, key_path, user, &format!("{dir}/ca.crt"), ca.ca_cert_pem())?;
@@ -1001,7 +1005,7 @@ fn distribute_hive_tls_inner(
     ssh_with_key(
         address,
         key_path,
-        &sudo_wrap(&format!("chmod 600 '{dir}/cert.key'")),
+        &sudo_wrap(&format!("chmod 600 '{}/cert.key'", shell_single_quote(&dir))),
         user,
     )?;
     Ok(())
@@ -1040,14 +1044,22 @@ fn distribute_hive_identity_key_inner(
     let dir = json_router::mesh_hmac::KEYS_DIR;
     let remote = format!("{dir}/{hive_id}.key");
     // Owner-only dir before the write (same TOCTOU care as the TLS key).
+    let quoted_dir = shell_single_quote(dir);
     ssh_with_key(
         address,
         key_path,
-        &sudo_wrap(&format!("mkdir -p '{dir}' && chmod 700 '{dir}'")),
+        &sudo_bash_wrap(&format!(
+            "mkdir -p '{quoted_dir}' && chmod 700 '{quoted_dir}'"
+        )),
         user,
     )?;
     write_remote_file(address, key_path, user, &remote, &format!("{}\n", key.to_hex()))?;
-    ssh_with_key(address, key_path, &sudo_wrap(&format!("chmod 600 '{remote}'")), user)?;
+    ssh_with_key(
+        address,
+        key_path,
+        &sudo_wrap(&format!("chmod 600 '{}'", shell_single_quote(&remote))),
+        user,
+    )?;
     Ok(())
 }
 
@@ -2047,12 +2059,23 @@ async fn handle_admin(
                                 // B-2: same as the worker path — on a failed egress join,
                                 // best-effort revoke the (possibly seeded) bootstrap key.
                                 if result.get("status").and_then(|v| v.as_str()) != Some("ok") {
-                                    let revoked =
-                                        best_effort_revoke_bootstrap(&address, creds.user.as_str());
+                                    let revoke = best_effort_revoke_bootstrap(
+                                        &address,
+                                        creds.user.as_str(),
+                                        creds.password.as_deref(),
+                                    );
                                     if let Some(obj) = result.as_object_mut() {
                                         obj.insert(
                                             "ssh_bootstrap_open".to_string(),
-                                            serde_json::json!(!revoked),
+                                            serde_json::json!(!revoke.closed()),
+                                        );
+                                        obj.insert(
+                                            "ssh_key_removed".to_string(),
+                                            serde_json::json!(revoke.ssh_key_removed),
+                                        );
+                                        obj.insert(
+                                            "sudoers_removed".to_string(),
+                                            serde_json::json!(revoke.sudoers_removed),
                                         );
                                     }
                                 }
@@ -2080,12 +2103,23 @@ async fn handle_admin(
                             // already-seeded) bootstrap SSH access and surface whether it
                             // may still be open (a retry re-seeds via the password channel).
                             if result.get("status").and_then(|v| v.as_str()) != Some("ok") {
-                                let revoked =
-                                    best_effort_revoke_bootstrap(&address, creds.user.as_str());
+                                let revoke = best_effort_revoke_bootstrap(
+                                    &address,
+                                    creds.user.as_str(),
+                                    creds.password.as_deref(),
+                                );
                                 if let Some(obj) = result.as_object_mut() {
                                     obj.insert(
                                         "ssh_bootstrap_open".to_string(),
-                                        serde_json::json!(!revoked),
+                                        serde_json::json!(!revoke.closed()),
+                                    );
+                                    obj.insert(
+                                        "ssh_key_removed".to_string(),
+                                        serde_json::json!(revoke.ssh_key_removed),
+                                    );
+                                    obj.insert(
+                                        "sudoers_removed".to_string(),
+                                        serde_json::json!(revoke.sudoers_removed),
                                     );
                                 }
                             }
@@ -4895,6 +4929,45 @@ fn validate_yaml_scalar(value: &str, label: &str) -> Result<(), OrchestratorErro
     {
         return Err(format!("{label} contains a character unsafe for a YAML scalar").into());
     }
+    Ok(())
+}
+
+fn validate_runtime_sync_tool(value: &str, label: &str) -> Result<(), OrchestratorError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+    if !valid_token(value) {
+        return Err(format!("{label} must contain only [A-Za-z0-9._-]").into());
+    }
+    validate_yaml_scalar(value, label)
+}
+
+fn validate_remote_hive_path(path: &Path, label: &str) -> Result<(), OrchestratorError> {
+    validate_unit_path_field(path, label)?;
+    let value = path.to_string_lossy();
+    validate_yaml_scalar(value.as_ref(), label)
+}
+
+fn validate_blob_runtime_for_remote_hive(blob: &BlobRuntimeConfig) -> Result<(), OrchestratorError> {
+    validate_remote_hive_path(&blob.path, "blob.path")?;
+    validate_remote_hive_path(&blob.sync_data_dir, "blob.sync.data_dir")?;
+    validate_runtime_sync_tool(&blob.sync_tool, "blob.sync.tool")?;
+    Ok(())
+}
+
+fn validate_dist_runtime_for_remote_hive(dist: &DistRuntimeConfig) -> Result<(), OrchestratorError> {
+    validate_remote_hive_path(&dist.path, "dist.path")?;
+    validate_runtime_sync_tool(&dist.sync_tool, "dist.sync.tool")?;
+    Ok(())
+}
+
+fn validate_runtime_for_remote_hive(
+    blob: &BlobRuntimeConfig,
+    dist: &DistRuntimeConfig,
+) -> Result<(), OrchestratorError> {
+    validate_blob_runtime_for_remote_hive(blob)?;
+    validate_dist_runtime_for_remote_hive(dist)?;
     Ok(())
 }
 
@@ -11435,6 +11508,7 @@ async fn ensure_node_identity_registered(
     Ok(Some(serde_json::json!({
         "status": "ok",
         "ilk_id": resolved_ilk_id,
+        "requested_ilk_id": requested_ilk_id,
         "ilk_type": ilk_type,
         "target": identity_target,
     })))
@@ -11479,6 +11553,136 @@ async fn apply_node_identity_update(
         "ilk_id": ilk_id,
         "target": identity_target,
     })))
+}
+
+fn identity_register_field<'a>(
+    identity_register: &'a Option<serde_json::Value>,
+    field: &str,
+) -> Option<&'a str> {
+    identity_register
+        .as_ref()
+        .and_then(|value| value.get(field))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn node_identity_created_this_attempt(
+    payload: &serde_json::Value,
+    preexisting_ilk_id: Option<&str>,
+    identity_register: &Option<serde_json::Value>,
+) -> bool {
+    if preexisting_ilk_id.is_some() || payload.get("ilk_id").is_some() {
+        return false;
+    }
+    let Some(resolved) = identity_register_field(identity_register, "ilk_id") else {
+        return false;
+    };
+    let Some(requested) = identity_register_field(identity_register, "requested_ilk_id") else {
+        return false;
+    };
+    resolved == requested
+}
+
+async fn delete_node_ilk_for_spawn_rollback(
+    state: &OrchestratorState,
+    identity_primary_hive_id: &str,
+    ilk_id: &str,
+) -> serde_json::Value {
+    let identity_target = format!("SY.identity@{}", identity_primary_hive_id);
+    let response = orchestrator_identity_system_call_ok(
+        state,
+        &identity_target,
+        MSG_ILK_DELETE,
+        serde_json::json!({ "ilk_id": ilk_id }),
+        system_forward_timeout(),
+    )
+    .await;
+    match response {
+        Ok(payload) => serde_json::json!({
+            "status": "ok",
+            "target": identity_target,
+            "ilk_id": ilk_id,
+            "deleted": payload
+                .get("deleted")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true),
+            "payload": payload,
+        }),
+        Err(err) => {
+            let (error_code, message) = identity_error_code_and_message(&err);
+            serde_json::json!({
+                "status": "error",
+                "target": identity_target,
+                "ilk_id": ilk_id,
+                "error_code": error_code,
+                "message": message,
+            })
+        }
+    }
+}
+
+async fn rollback_node_identity_after_failed_spawn(
+    state: &OrchestratorState,
+    payload: &serde_json::Value,
+    identity_primary_hive_id: &str,
+    node_name: &str,
+    preexisting_ilk_id: Option<&str>,
+    identity_register: &Option<serde_json::Value>,
+) -> serde_json::Value {
+    let remove_local_mapping = preexisting_ilk_id.is_none();
+    let created_remote_ilk =
+        node_identity_created_this_attempt(payload, preexisting_ilk_id, identity_register);
+    let identity_ilk_id = identity_register_field(identity_register, "ilk_id");
+
+    let mut rollback = serde_json::json!({
+        "status": "ok",
+        "node_name": node_name,
+        "local_mapping_removed": false,
+        "remote_ilk_deleted": false,
+        "remote_ilk_delete_attempted": false,
+        "created_remote_ilk": created_remote_ilk,
+    });
+
+    if remove_local_mapping {
+        match remove_node_ilk_mapping(state, node_name) {
+            Ok(removed) => {
+                rollback["local_mapping_removed"] = serde_json::json!(removed);
+            }
+            Err(err) => {
+                rollback["status"] = serde_json::json!("error");
+                rollback["local_mapping_error"] = serde_json::json!(err.to_string());
+            }
+        }
+    }
+
+    if created_remote_ilk {
+        if let Some(ilk_id) = identity_ilk_id {
+            rollback["remote_ilk_delete_attempted"] = serde_json::json!(true);
+            let delete = delete_node_ilk_for_spawn_rollback(
+                state,
+                identity_primary_hive_id,
+                ilk_id,
+            )
+            .await;
+            rollback["remote_ilk_deleted"] = serde_json::json!(
+                delete
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|status| status == "ok")
+            );
+            if delete
+                .get("status")
+                .and_then(|value| value.as_str())
+                != Some("ok")
+            {
+                rollback["status"] = serde_json::json!("error");
+            }
+            rollback["remote_ilk_delete"] = delete;
+        }
+    }
+
+    rollback
 }
 
 async fn get_node_config_flow(
@@ -12790,6 +12994,8 @@ async fn run_node_flow(
         });
     }
 
+    let (preexisting_ilk_id, _preexisting_tenant_id) =
+        load_persisted_node_identity(state, &node_name);
     let identity_register = match ensure_node_identity_registered(
         state,
         payload,
@@ -12825,6 +13031,15 @@ async fn run_node_flow(
             {
                 Ok(value) => value,
                 Err(err) => {
+                    let identity_rollback = rollback_node_identity_after_failed_spawn(
+                        state,
+                        payload,
+                        &identity_primary_hive_id,
+                        &node_name,
+                        preexisting_ilk_id.as_deref(),
+                        &identity_register,
+                    )
+                    .await;
                     return serde_json::json!({
                         "status": "error",
                         "error_code": "IDENTITY_UPDATE_FAILED",
@@ -12832,6 +13047,8 @@ async fn run_node_flow(
                         "target": target_hive,
                         "node_name": node_name,
                         "unit": unit,
+                        "identity_register": identity_register,
+                        "identity_rollback": identity_rollback,
                     });
                 }
             }
@@ -12879,6 +13096,15 @@ async fn run_node_flow(
     ) {
         Ok(value) => value,
         Err(err) => {
+            let identity_rollback = rollback_node_identity_after_failed_spawn(
+                state,
+                payload,
+                &identity_primary_hive_id,
+                &node_name,
+                preexisting_ilk_id.as_deref(),
+                &identity_register,
+            )
+            .await;
             return serde_json::json!({
                 "status": "error",
                 "error_code": "CONFIG_WRITE_FAILED",
@@ -12887,6 +13113,7 @@ async fn run_node_flow(
                 "node_name": node_name,
                 "unit": unit,
                 "identity": identity,
+                "identity_rollback": identity_rollback,
             });
         }
     };
@@ -12946,10 +13173,18 @@ async fn run_node_flow(
         Err(err) => {
             // SO-03: the config was written but the process failed to start.
             // Remove the config (best-effort) so a retry isn't blocked by
-            // NODE_ALREADY_EXISTS and no orphan config lingers with no unit.
-            // Identity registration is an idempotent upsert-by-node_name, so a
-            // retry re-registers cleanly.
+            // NODE_ALREADY_EXISTS and no orphan config lingers with no unit. Then
+            // roll back any identity/mapping state created by this spawn attempt.
             let _ = std::fs::remove_file(&config_path);
+            let identity_rollback = rollback_node_identity_after_failed_spawn(
+                state,
+                payload,
+                &identity_primary_hive_id,
+                &node_name,
+                preexisting_ilk_id.as_deref(),
+                &identity_register,
+            )
+            .await;
             serde_json::json!({
                 "status": "error",
                 "error_code": "SPAWN_FAILED",
@@ -12959,6 +13194,7 @@ async fn run_node_flow(
                 "unit": unit,
                 "identity": identity,
                 "config": node_config,
+                "identity_rollback": identity_rollback,
             })
         }
     }
@@ -14337,6 +14573,23 @@ fn build_managed_node_run_command(
     )
 }
 
+fn shell_single_quote_path(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    shell_single_quote(value.as_ref())
+}
+
+fn worker_remote_base_dirs_command(blob: &BlobRuntimeConfig) -> String {
+    let blob_active_dir = blob.path.join("active");
+    let blob_staging_dir = blob.path.join("staging");
+    sudo_wrap(&format!(
+        "mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers '{}' '{}' '{}' '{}'",
+        shell_single_quote_path(&blob.path),
+        shell_single_quote_path(&blob_active_dir),
+        shell_single_quote_path(&blob_staging_dir),
+        shell_single_quote_path(&blob.sync_data_dir),
+    ))
+}
+
 fn shell_single_quote(value: &str) -> String {
     value.replace('\'', "'\"'\"'")
 }
@@ -15585,6 +15838,13 @@ async fn add_hive_flow(
     let _topology_guard = state.lock_hive_topology(hive_id).await;
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
+    if let Err(err) = validate_runtime_for_remote_hive(&desired_blob, &desired_dist) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "CONFIG_FAILED",
+            "message": format!("invalid blob/dist runtime config for worker hive.yaml: {err}"),
+        });
+    }
     let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
     let syncthing_expected = desired_sync.sync_enabled
         && (blob_sync_tool_is_syncthing(&desired_sync)
@@ -16099,18 +16359,10 @@ async fn add_hive_flow(
         tracing::warn!(error = %history_err, "failed to persist add_hive core deployment history");
     }
 
-    let blob_active_dir = state.blob.path.join("active");
-    let blob_staging_dir = state.blob.path.join("staging");
     if let Err(err) = ssh_with_key(
         address,
         &key_path,
-        &sudo_wrap(&format!(
-            "mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers '{}' '{}' '{}' '{}'",
-            state.blob.path.display(),
-            blob_active_dir.display(),
-            blob_staging_dir.display(),
-            state.blob.sync_data_dir.display()
-        )),
+        &worker_remote_base_dirs_command(&desired_blob),
         creds.user.as_str(),
     ) {
         return serde_json::json!({
@@ -16175,12 +16427,20 @@ async fn add_hive_flow(
     // B-3: reject any interpolated value that would break the double-quoted YAML
     // scalars below (control char / quote / backslash). These are internal-derived
     // so this is defensive — failing loud beats writing a malformed worker hive.yaml.
+    let blob_path_str = desired_blob.path.to_string_lossy().to_string();
+    let blob_sync_data_dir_str = desired_blob.sync_data_dir.to_string_lossy().to_string();
+    let dist_path_str = desired_dist.path.to_string_lossy().to_string();
     for (val, label) in [
         (hive_id, "hive_id"),
         (worker_uplink.as_str(), "wan uplink address"),
         (storage_path.as_str(), "storage.path"),
         (identity_frontdesk_node_name.as_str(), "identity_frontdesk"),
         (identity_sync_upstream.as_str(), "identity.sync.upstream"),
+        (blob_path_str.as_str(), "blob.path"),
+        (desired_blob.sync_tool.as_str(), "blob.sync.tool"),
+        (blob_sync_data_dir_str.as_str(), "blob.sync.data_dir"),
+        (dist_path_str.as_str(), "dist.path"),
+        (desired_dist.sync_tool.as_str(), "dist.sync.tool"),
     ] {
         if let Err(err) = validate_yaml_scalar(val, label) {
             return serde_json::json!({
@@ -16669,6 +16929,12 @@ async fn add_egress_hive_flow(
         Ok(cfg) => cfg,
         Err(err) => return err_payload("INVALID_REQUEST", err.to_string()),
     };
+    if let Err(err) = validate_dist_runtime_for_remote_hive(&state.dist) {
+        return err_payload(
+            "CONFIG_FAILED",
+            format!("invalid dist runtime config for egress hive.yaml: {err}"),
+        );
+    }
     let root = hives_root();
     let hive_dir = root.join(hive_id);
     if hive_exists(&state.state_dir, hive_id) {
@@ -17272,6 +17538,18 @@ struct BootstrapCreds {
     password: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BootstrapRevokeOutcome {
+    ssh_key_removed: bool,
+    sudoers_removed: bool,
+}
+
+impl BootstrapRevokeOutcome {
+    fn closed(self) -> bool {
+        self.ssh_key_removed
+    }
+}
+
 /// Whether `user` is a valid unix/ssh login: `^[a-z_][a-z0-9_-]*$`, max 32.
 /// Guards the operator-supplied `ssh_user` before it reaches remote shell/ssh.
 fn is_valid_ssh_user(user: &str) -> bool {
@@ -17869,17 +18147,82 @@ fi\n",
     Ok(())
 }
 
+fn bootstrap_authorized_key_cleanup_script(pub_key: &str) -> Result<String, OrchestratorError> {
+    let key_material = pub_key
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "invalid public key format: missing key material".to_string())?;
+    Ok(format!(
+        "set -uo pipefail\n\
+auth_keys=\"$HOME/.ssh/authorized_keys\"\n\
+if [[ -f \"$auth_keys\" ]]; then \
+{{ grep -Fv '{gate_path}' \"$auth_keys\" | grep -Fv '{key_material}' > \"$auth_keys.tmp\"; }} || true; \
+mv \"$auth_keys.tmp\" \"$auth_keys\" 2>/dev/null || true; \
+chmod 600 \"$auth_keys\" 2>/dev/null || true; \
+fi\n",
+        gate_path = shell_single_quote(ORCH_SSH_GATE_PATH),
+        key_material = shell_single_quote(key_material),
+    ))
+}
+
+fn revoke_bootstrap_authorized_key_with_key(
+    address: &str,
+    key_path: &Path,
+    user: &str,
+    pub_key: &str,
+) -> Result<(), OrchestratorError> {
+    let script = bootstrap_authorized_key_cleanup_script(pub_key)?;
+    let cmd = format!("bash -lc '{}'", shell_single_quote(&script));
+    ssh_with_key(address, key_path, &cmd, user)
+}
+
+fn revoke_bootstrap_authorized_key_with_pass(
+    address: &str,
+    user: &str,
+    password: &str,
+    pub_key: &str,
+) -> Result<(), OrchestratorError> {
+    let script = bootstrap_authorized_key_cleanup_script(pub_key)?;
+    let cmd = format!("bash -lc '{}'", shell_single_quote(&script));
+    ssh_with_pass_any(address, &cmd, user, password)
+}
+
 /// B-2: on a FAILED add_hive, best-effort revoke the bootstrap SSH access — the
-/// key may have been seeded before the failure. Returns whether the revoke
-/// succeeded (so the caller can report `ssh_bootstrap_open = !revoked`). If the
-/// failure was before seeding / the box is unreachable, the revoke SSH just fails
-/// harmlessly. A retry of add_hive re-seeds the key via the password channel.
-fn best_effort_revoke_bootstrap(address: &str, user: &str) -> bool {
+/// key may have been seeded before the failure. Try full sudo cleanup first; if
+/// sudo setup was the failure, fall back to removing authorized_keys as the user
+/// (by key, then password if supplied). A retry re-seeds through the password
+/// channel.
+fn best_effort_revoke_bootstrap(
+    address: &str,
+    user: &str,
+    password: Option<&str>,
+) -> BootstrapRevokeOutcome {
     let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
     let Ok(pub_key) = public_key_from_private_key(&key_path) else {
-        return false;
+        return BootstrapRevokeOutcome {
+            ssh_key_removed: false,
+            sudoers_removed: false,
+        };
     };
-    revoke_bootstrap_ssh_access(address, &key_path, user, &pub_key).is_ok()
+    if revoke_bootstrap_ssh_access(address, &key_path, user, &pub_key).is_ok() {
+        return BootstrapRevokeOutcome {
+            ssh_key_removed: true,
+            sudoers_removed: true,
+        };
+    }
+
+    let ssh_key_removed =
+        revoke_bootstrap_authorized_key_with_key(address, &key_path, user, &pub_key).is_ok()
+            || password
+                .filter(|value| !value.trim().is_empty())
+                .is_some_and(|value| {
+                    revoke_bootstrap_authorized_key_with_pass(address, user, value, &pub_key).is_ok()
+                });
+
+    BootstrapRevokeOutcome {
+        ssh_key_removed,
+        sudoers_removed: false,
+    }
 }
 
 fn remote_orchestrator_sudoers_contents(user: &str) -> String {
@@ -18482,6 +18825,10 @@ fn sudo_wrap(cmd: &str) -> String {
     format!("sudo -n {}", cmd)
 }
 
+fn sudo_bash_wrap(cmd: &str) -> String {
+    format!("sudo -n bash -lc '{}'", shell_single_quote(cmd))
+}
+
 /// Like `ssh_with_key`, but writes `stdin_data` to the remote command's stdin.
 /// Used to hand a sudo password to a remote `sudo -S` WITHOUT placing it in the
 /// ssh argv (visible in the local `ps`) or in the command string (a verbose
@@ -18956,6 +19303,51 @@ mod tests {
     }
 
     #[test]
+    fn remote_hive_runtime_validation_blocks_yaml_breakers() {
+        let blob = sample_blob_config();
+        let dist = sample_dist_config();
+        assert!(validate_runtime_for_remote_hive(&blob, &dist).is_ok());
+
+        let mut bad_blob = blob.clone();
+        bad_blob.path = PathBuf::from("/var/lib/fluxbee/bad\"path");
+        assert!(validate_runtime_for_remote_hive(&bad_blob, &dist).is_err());
+
+        let mut bad_blob = blob.clone();
+        bad_blob.sync_data_dir = PathBuf::from("/var/lib/fluxbee/bad\\path");
+        assert!(validate_runtime_for_remote_hive(&bad_blob, &dist).is_err());
+
+        let mut bad_dist = dist.clone();
+        bad_dist.path = PathBuf::from("/var/lib/fluxbee/bad\npath");
+        assert!(validate_runtime_for_remote_hive(&blob, &bad_dist).is_err());
+
+        let mut bad_dist = dist.clone();
+        bad_dist.sync_tool = "sync;thing".to_string();
+        assert!(validate_runtime_for_remote_hive(&blob, &bad_dist).is_err());
+    }
+
+    #[test]
+    fn worker_remote_base_dirs_command_shell_quotes_single_quotes() {
+        let mut blob = sample_blob_config();
+        blob.path = PathBuf::from("/var/lib/fluxbee/blob'quoted");
+        let cmd = worker_remote_base_dirs_command(&blob);
+        assert!(cmd.starts_with("sudo -n mkdir -p "));
+        assert!(cmd.contains("/var/lib/fluxbee/blob'\"'\"'quoted"));
+        assert!(cmd.contains("/var/lib/fluxbee/blob'\"'\"'quoted/active"));
+        assert!(cmd.contains("/var/lib/fluxbee/blob'\"'\"'quoted/staging"));
+    }
+
+    #[test]
+    fn sudo_bash_wrap_keeps_compound_command_under_sudo() {
+        let cmd = sudo_bash_wrap(
+            "mkdir -p '/var/lib/fluxbee/identity/keys' && chmod 700 '/var/lib/fluxbee/identity/keys'",
+        );
+
+        assert!(cmd.starts_with("sudo -n bash -lc '"));
+        assert!(cmd.contains("&& chmod 700"));
+        assert!(!cmd.starts_with("sudo -n mkdir"));
+    }
+
+    #[test]
     fn egress_nft_boot_unit_loads_before_network_and_is_idempotent() {
         let unit = egress_nft_boot_unit_contents("/usr/sbin/nft");
         // F17: must load before any interface is configured so no packet is
@@ -19065,6 +19457,52 @@ mod tests {
         assert!(resolve_add_hive_ssh_creds(&serde_json::json!({})).is_err());
         assert!(resolve_add_hive_ssh_creds(&serde_json::json!({"ssh_user": ""})).is_err());
         assert!(resolve_add_hive_ssh_creds(&serde_json::json!({"ssh_user": "   "})).is_err());
+    }
+
+    #[test]
+    fn node_identity_created_this_attempt_only_for_new_generated_ilk() {
+        let register = Some(serde_json::json!({
+            "status": "ok",
+            "ilk_id": "ilk:11111111-1111-1111-1111-111111111111",
+            "requested_ilk_id": "ilk:11111111-1111-1111-1111-111111111111",
+        }));
+        assert!(node_identity_created_this_attempt(
+            &serde_json::json!({}),
+            None,
+            &register
+        ));
+
+        assert!(!node_identity_created_this_attempt(
+            &serde_json::json!({}),
+            Some("ilk:22222222-2222-2222-2222-222222222222"),
+            &register
+        ));
+        assert!(!node_identity_created_this_attempt(
+            &serde_json::json!({"ilk_id": "ilk:11111111-1111-1111-1111-111111111111"}),
+            None,
+            &register
+        ));
+
+        let canonical_existing = Some(serde_json::json!({
+            "status": "ok",
+            "ilk_id": "ilk:33333333-3333-3333-3333-333333333333",
+            "requested_ilk_id": "ilk:11111111-1111-1111-1111-111111111111",
+        }));
+        assert!(!node_identity_created_this_attempt(
+            &serde_json::json!({}),
+            None,
+            &canonical_existing
+        ));
+    }
+
+    #[test]
+    fn bootstrap_authorized_key_cleanup_script_is_user_level() {
+        let public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyMaterial fluxbee-orchestrator";
+        let script = bootstrap_authorized_key_cleanup_script(public_key).expect("script");
+        assert!(!script.contains("sudo"));
+        assert!(script.contains("$HOME/.ssh/authorized_keys"));
+        assert!(script.contains(ORCH_SSH_GATE_PATH));
+        assert!(script.contains("AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyMaterial"));
     }
 
     #[test]

@@ -934,13 +934,30 @@ fn open_identity_shm_reader(name: &str) -> Result<IdentityShmReader, IdentityShm
 }
 
 fn is_permission_lookup_unavailable(err: &IdentityShmError) -> bool {
-    match err {
+    let is_perm = match err {
         IdentityShmError::Nix(errno) => {
             matches!(*errno, nix::errno::Errno::EACCES | nix::errno::Errno::EPERM)
         }
         IdentityShmError::Io(io_err) => io_err.kind() == std::io::ErrorKind::PermissionDenied,
         _ => false,
+    };
+    if is_perm {
+        // F-09: an EXISTING identity SHM region that is present but unreadable
+        // (EACCES/EPERM) is otherwise laundered into a clean "not found",
+        // silently degrading lookups to RPC/provisioning and hiding a uid/gid
+        // mismatch between sy.identity and this consumer. Surface it loudly, once
+        // per process, so the misinstall is diagnosable (behavior unchanged —
+        // still fail-closed toward miss).
+        static WARNED: atomic::AtomicBool = atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::error!(
+                "identity SHM present but unreadable (EACCES/EPERM): identity lookups will \
+                 degrade to miss/provisioning. sy.identity and this consumer likely run under \
+                 different uid/gid — align the service user/group so the 0600 region is readable."
+            );
+        }
     }
+    is_perm
 }
 
 fn resolve_ich_mapping_from_region(

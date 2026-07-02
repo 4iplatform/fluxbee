@@ -43,8 +43,8 @@ It must allow:
 
 It explicitly does **NOT** carry:
 
-- User HTTP traffic. Browsers and API clients connect directly to RT.edges using the per-edge cert. RT.edges translate to Fluxbee L2 and forward via WAN to motherbee.
-- Endpoint registration of IO.api or any application node (`EDGE_REGISTER` / `EDGE_UNREGISTER`). That is Fluxbee data plane, over the WAN protocol between motherbee and RT.edge as standard L2 messages (see `rt-edge-spec.md`).
+- User HTTP traffic. Browsers and API clients connect directly to RT.edges using the per-edge cert. RT.edges translate requests to Fluxbee messages and inject them into the local edge router; that router / `RT.gateway` owns the WAN path to motherbee.
+- Endpoint registration of IO.api or any application node (`EDGE_REGISTER` / `EDGE_UNREGISTER`). That is Fluxbee data plane, routed to RT.edge as standard L2 messages through the local edge router / WAN path as needed (see `rt-edge-spec.md`).
 - Admin queries against Fluxbee data. FC.edge-manager performs those as a regular HTTPS client of an RT.edge using its own admin-scoped JWT.
 
 ---
@@ -162,7 +162,7 @@ Unknown `msg_type` ⇒ log + discard, do not close. Unknown fields ⇒ ignore.
 
 | File | Perms | Content |
 |------|-------|---------|
-| `/etc/fluxbee/edge.conf` | `0644` | `edge_id`, FC control URL, motherbee WAN endpoint |
+| `/etc/fluxbee/edge.conf` | `0644` | `edge_id`, FC control URL, local router socket, core ingress L2 target |
 | `/etc/fluxbee/edge.bootstrap` | `0600` | The bootstrap token (pre-bootstrap only) |
 | `/etc/fluxbee/edge.ca.pem` | `0644` | Pinned FC CA bundle |
 
@@ -245,7 +245,8 @@ First message after every mTLS connect. Reports state fingerprints for delta res
       "tenants_count": 128,
       "edge_tls_cert_fingerprint": "sha256:...",
       "jwt_key_id": "fc-jwt-key-2026-06",
-      "motherbee_connected": true,
+      "router_connected": true,
+      "core_ingress_reachable": true,
       "uptime_seconds": 3600,
       "clock_drift_seconds": 0.4
     }
@@ -280,7 +281,7 @@ After ACK, FC pushes only the deltas implied by the fingerprint comparison (§9)
 
 ### 7.3 EDGE_HEARTBEAT
 
-Every 30 s. Payload: `uptime_seconds`, `motherbee_connected`, `active_requests`, `memory_mb`, `cpu_percent`. No per-heartbeat ack required (WS ping covers liveness); FC may piggyback config nudges on an optional `EDGE_HEARTBEAT_ACK`.
+Every 30 s. Payload: `uptime_seconds`, `router_connected`, `core_ingress_reachable`, `active_requests`, `memory_mb`, `cpu_percent`. `router_connected` is RT.edge's local router socket state. `core_ingress_reachable` is derived from recent successful sends / responses to the configured core ingress L2 target, not from running identity on the edge. No per-heartbeat ack required (WS ping covers liveness); FC may piggyback config nudges on an optional `EDGE_HEARTBEAT_ACK`.
 
 ### 7.4 EDGE_PUBLIC_IP_CHANGED (validated, C3)
 
@@ -307,11 +308,11 @@ Optional, every 60 s if enabled: totals, by-status, by-tenant, latency p50/p99, 
 ```json
 {
   "msg_type": "EDGE_ERROR",
-  "payload": { "severity": "warning", "code": "MOTHERBEE_DISCONNECTED", "message": "...", "details": {} }
+  "payload": { "severity": "warning", "code": "ROUTER_DISCONNECTED", "message": "...", "details": {} }
 }
 ```
 
-Severities: `info | warning | error | critical`. Codes include `MOTHERBEE_DISCONNECTED`, `MOTHERBEE_RECONNECTED`, `EDGE_TLS_CERT_EXPIRING`, `RATE_LIMIT_TRIPPED`, `JWT_VALIDATION_FAILURES_HIGH`, `CLOCK_DRIFT` (C5), `INTERNAL_ERROR`.
+Severities: `info | warning | error | critical`. Codes include `ROUTER_DISCONNECTED`, `ROUTER_RECONNECTED`, `CORE_INGRESS_UNREACHABLE`, `CORE_INGRESS_REACHABLE`, `EDGE_TLS_CERT_EXPIRING`, `RATE_LIMIT_TRIPPED`, `JWT_VALIDATION_FAILURES_HIGH`, `CLOCK_DRIFT` (C5), `INTERNAL_ERROR`.
 
 ### 7.7 EDGE_GOODBYE
 
@@ -570,7 +571,7 @@ Multi-FC failover (single FC assumed, manual failover); ordering beyond TCP; rep
 | FC.edge-manager implementation | `fc-edge-manager-spec.md` |
 | Vault (JWT key, FC CA key) | `sy-vault-spec.md` |
 | Identity / tenants | `10-identity-v2.md` |
-| WAN (edge ↔ motherbee data channel) | `05-conectividad.md` |
+| WAN (local edge router ↔ motherbee data channel) | `05-conectividad.md` |
 | Egress NAT (sibling edge concern) | `edge-egress-nat-spec.md` |
 | Deep hardening (CRL, TPM, isolation) | `edge-security-hardening.md` (to be written) |
 

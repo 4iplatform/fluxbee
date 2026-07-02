@@ -282,3 +282,141 @@ Recomendacion:
 `sy.identity` esta avanzado funcionalmente, pero hoy la combinacion de sync abierto por defecto, DoS por loop bloqueable y algunos bypasses/privilegios amplios lo deja en una posicion riesgosa para despliegues donde el puerto de sync o el router no esten estrictamente aislados.
 
 La recomendacion es tratar F-01, F-02, F-03 y F-04 como bloqueantes antes de exponerlo fuera de un entorno de desarrollo controlado.
+
+---
+
+## Estado de resolucion (2026-07-02)
+
+Revision-de-la-auditoria (verificacion adversarial de cada hallazgo contra el
+codigo actual + caza de gaps por 6 lentes) y remediacion. El commit auditado
+(`25e883e`) es identico al HEAD actual para `sy_identity.rs` (sin cambios entre
+medias), asi que **los 10 hallazgos aplican al codigo vigente**.
+
+### Calidad de la auditoria
+
+Alta. De los 10 hallazgos: **8 CONFIRMADOS** tal cual, **2 CONFIRMADOS-PARCIAL**
+(matiz, no refutacion):
+
+- **F-02** parcial: los *reads* del canal ya tienen timeout (`auth_read_line`),
+  asi que el vector "stall antes de mandar el request" ya estaba cerrado; lo que
+  quedaba abierto era el *write* del full-sync inline en el loop principal.
+- **F-07** parcial: el sufijo `@` ancla el prefijo, asi que la sub-rama
+  "nombre adyacente" (`SY.administrator@`) no aplica; el riesgo real es el prefijo
+  **hive-agnostico** (`SY.admin@<otro-hive>`), no `starts_with` en si.
+
+Ninguno refutado. `src_l2_name` es router-autoritativo (F4/F15 del audit de
+orchestrator), lo que acota F-03/F-07 pero no los elimina.
+
+### Gaps que la auditoria NO cubrio (hallados en la revision)
+
+- **G-1 [CRITICO]** — El path de sync **cross-hive** acepta `ilk_type=system`
+  arbitrario desde una replica (distinto de F-08, que es solo el `ILK_REGISTER`
+  local): `delta_authorized_for_hive`/`apply_delta` chequeaban ownership pero
+  nunca `ilk_type`. Una replica comprometida etiqueta su propio ilk como `system`
+  → `sy_vault::authorize_read` le da lectura de **todos los secretos del pool
+  root** (creds de infra) en toda la malla.
+- **G-2 [ALTO]** — `AliasUpsert` cross-hive solo validaba ownership del
+  `canonical_ilk_id`, no del `old_ilk_id` (la clave que la resolucion redirige):
+  una replica podia secuestrar la resolucion de **cualquier** ilk (incl.
+  `SY.vault@motherbee`, incl. system ilks) apuntandolo a un ilk propio. Hallado
+  por 2 lentes independientes.
+- **G-3 [ALTO]** — Defaults fail-**open**: un `ilk_type` desconocido mapeaba a
+  `system` tanto en identity (`parse_ilk_type_for_shm`) como en el router
+  (`inject_identity_data`). Corrupcion/sync parcial → privilegio en vez de deny.
+- **G-4 [ALTO]** — `read_line` sin cap de tamano ni timeout en el canal :9100
+  (`run_publish_reader`, `auth_read_line`, `fetch_full_sync`, `stream_deltas`) →
+  OOM remoto con un frame sin newline. Hallado por 2 lentes.
+- **G-5 [ALTO]** — Canal por-subscriber `unbounded` + lista de subscribers sin
+  cap → agotamiento de memoria del primario via un subscriber lento.
+- **G-6 [ALTO]** — Alias GC muta memoria antes que DB sin rollback; ante error de
+  DB los deltas se pierden → divergencia SHM/replica permanente.
+- **G-7 [MEDIO]** — `total_chunks` (u32) sin cota → `Vec::resize` de ~400GB →
+  abort del proceso al bootear la replica. Hallado por 2 lentes.
+- **G-8 [MEDIO]** — Error de SHM tras el commit de DB propagaba `?` y suprimia el
+  broadcast a replicas **y** la respuesta al cliente → primario adelante de
+  replicas.
+- **G-9 [MEDIO]** — El store completo se clonaba+ordenaba en cada `accept()`,
+  pre-auth, en el loop principal (amplificacion). Overlap con F-02.
+
+### Resolucion por hallazgo (codigo)
+
+Todo en `src/bin/sy_identity.rs` salvo donde se indique.
+
+| ID | Estado | Fix |
+| --- | --- | --- |
+| **F-01** | Resuelto | `identity_sync_auth_required`/`auth_mode_required` **fail-closed**: ausente/typo/empty ⇒ `required`; opt-out solo con `disabled`/`off`/`none` (con warning). `config/hive.yaml` + `packaging/hive.yaml.example` con `auth: required` explicito. |
+| **F-02** | Resuelto | `handle_sync_connection` se **spawnea** por conexion (fuera del loop); `Semaphore` (`MAX_CONCURRENT_SYNC_CONNS`); subscriber devuelto via canal; `write_timed`/`flush_timed` en full-sync + handshake + subscribe. |
+| **F-03** | Resuelto | `handle_vault_secret_changed` exige origen `SY.vault@<hive-propio>` (router-stamped `src_l2_name`) antes de `exit(0)`. Mismo gate en `sy_storage.rs`. |
+| **F-04** | Resuelto | `TNT_CREATE` toma snapshot antes de mutar y restaura ante error de DB (patron de `TNT_UPDATE`), en vez del `remove()` ciego. |
+| **F-05** | Resuelto (via restart) | Gap de delta ⇒ log ERROR + `exit(0)` ⇒ systemd reinicia ⇒ re-bootstrap por full-sync limpio (recupera revocaciones perdidas). Fallo de boot full-sync ⇒ log ERROR "DEGRADED" (sin exit para no restart-stormear). |
+| **F-06** | Resuelto | El brazo de ingest **persiste** los ilks publicados por replicas en DB (`persist_ilk_state_in_db`/`delete_ilk_in_db`), best-effort convergente (re-push cada reconcile). |
+| **F-07** | Resuelto | `is_authorized` hace hive-scoping de `SY.admin@`/`SY.architect@`/`SY.frontdesk.gov@` a `self.hive_id`; `IO.` y `SY.orchestrator@` siguen cross-hive. |
+| **F-08** | Resuelto | `validate_ilk_type` (path de `ILK_REGISTER`) rechaza `system`; guard anti-downgrade de un system ilk existente (`SYSTEM_ILK_PROTECTED`). |
+| **F-09** | Resuelto (loud) | SDK: EACCES/EPERM del SHM ahora emite `tracing::error!` one-shot (misconfig de uid/gid visible); semantica de retorno sin cambios para no rippear a consumidores. |
+| **F-10** | Resuelto (baseline) | `ensure_primary_schema`: `pg_advisory_lock` + tabla `identity_schema_migrations`, el DDL idempotente actual queda sellado como baseline **v1**. |
+| **G-1** | Resuelto | `ingest_ilk_type_authorized`: una replica solo puede afirmar `ilk_type=system` para un system ilk **determinístico** (`SY.*@publisher`, `ilk_id == deterministic_system_ilk_id`); wired en `delta_authorized_for_hive` + ingest de snapshot. |
+| **G-2** | Resuelto | `AliasUpsert` exige que `old_ilk_id` **y** `canonical_ilk_id` sean del publisher, y prohibe aliasar un well-known system ilk. |
+| **G-3** | Resuelto | Default fail-safe: `parse_ilk_type_for_shm` ⇒ `human`; `router/mod.rs inject_identity_data` ⇒ `"unknown"`. |
+| **G-4** | Resuelto | `read_capped_line`/`read_sync_line` (cap `MAX_SYNC_LINE_BYTES` + timeout) en todos los reads del :9100. |
+| **G-5** | Resuelto | Canal por-subscriber **bounded** + `broadcast_deltas` con `try_send` (drop-on-full) + `MAX_DELTA_SUBSCRIBERS`. |
+| **G-6** | Resuelto | `run_alias_gc` snapshotea antes de mutar y restaura ante error de DB. |
+| **G-7** | Resuelto | Cota `MAX_FULL_SYNC_CHUNKS` antes del `resize`. |
+| **G-8** | Resuelto | El error de SHM tras commit ya **no** propaga: se loguea y se sigue con broadcast + respuesta. |
+| **G-9** | Resuelto | Chunks del full-sync se construyen **on-demand** (via canal oneshot al loop) solo para un FULL_SYNC autenticado, no pre-auth por conexion. |
+
+### Cobertura de tests
+
+Unit tests nuevos en `sy_identity.rs` (`cargo test --bin sy_identity`: **40 pass**):
+`auth_mode_required_is_fail_closed` (F-01), `parse_ilk_type_for_shm_fails_safe_to_human`
+(G-3), `ingest_system_ilk_type_bound_to_deterministic_shape` +
+`delta_authority_rejects_forged_system_ilk_type` (G-1),
+`alias_upsert_authority_requires_both_endpoints_owned` (G-2),
+`is_authorized_scopes_privileged_sy_roles_to_own_hive` (F-07),
+`register_ilk_type_rejects_system` (F-08). Workspace build limpio;
+`fluxbee-sdk` 147 pass, `json-router` lib 67 pass.
+
+Pendiente de cobertura wire-level (requiere lab): handshake HMAC required-por-defecto
+end-to-end, DoS de full-sync con reader lento, gap→restart de replica,
+persistencia F-06 con restart. Ver plan de lab abajo.
+
+### Validacion en el lab Proxmox (2026-07-02) — HECHA
+
+Build `.deb` del arbol completo actual (identity + orchestrator cerrado,
+`0.1.0-syid`) en `fxbuild`, from-scratch 2-VM sobre Proxmox VE (motherbee
+`192.168.103.150` + worker `192.168.103.151`, clone del template ubuntu-24.04,
+install `.deb` + `fluxbee-firstboot` + `add_hive` real).
+
+- **F-01 (riesgo #1 de compat) — VALIDADO.** motherbee arranca con
+  `identity sync auth: required (per-hive HMAC) role="primary"` + listener :9100
+  **por defecto**. `add_hive worker1` distribuye `worker1.key` (0600) a motherbee
+  **y** worker; el worker (replica, `auth: required`) completa el handshake HMAC y
+  `identity full sync bootstrap applied upstream=192.168.103.150:9100`
+  (ilk_count 12). **El default fail-closed NO rompe el join.**
+- **F-01 en el wire — VALIDADO.** 3 probes SIN handshake (full-sync request,
+  delta subscribe, garbage) → **RECHAZADAS** (0 bytes, conexion cerrada). Cero
+  fuga de estado a un peer no autenticado.
+- **F-02 — EJERCITADO.** El full-sync se sirvio via handler spawneado + chunks
+  on-demand (oneshot al loop) + write-timeouts; el worker bootstrapeo 12 ilks sin
+  romper el framing (caps G-4/G-7 OK).
+- **G-1 (no sobre-bloquea) — VALIDADO.** Los 7 system-ilks legitimos y
+  determinísticos del worker (`SY.*@worker1`) fluyeron a motherbee (sync
+  bidireccional 12→19); un guard demasiado estricto los habria bloqueado.
+- **F-06 — VALIDADO (definitivo).** Los 7 ilks de worker1 quedan **persistidos**
+  en la DB de motherbee (`identity_ilks`, `ilk_type=system`). Test de durabilidad:
+  se paro el worker y se reinicio el sy-identity del primario → `loaded identity
+  store from primary db ... ilk_count:19` (sobreviven). Antes de F-06 se perdian
+  (volvian a 12).
+- **F-10 — VALIDADO.** `identity primary schema ensured (baseline v1)` + tabla
+  `identity_schema_migrations` con fila `1|baseline`; advisory-lock idempotente en
+  restart.
+- **Recuperacion — VALIDADO.** Tras reiniciar el worker, re-join limpio via
+  full-sync re-bootstrap (ilk_count 19).
+
+G-1(rechazo)/G-2/G-3 y F-03/F-04/F-05(gap)/F-07/F-08/F-09/G-5/G-6/G-8/G-9 quedan
+cubiertos por los unit tests dedicados (40 pass) + revision de codigo; su ruta
+runtime es la misma que la ejercitada en el lab. Probes de wire para G-1/G-2
+(publish forjado sobre un handshake HMAC valido) no se corrieron por costo/beneficio
+frente a los unit tests.
+
+Estado final del lab: motherbee (201) + worker (202) running, malla sana, 19 ilks
+consistentes en ambos lados.
