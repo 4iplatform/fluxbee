@@ -1,0 +1,9 @@
+# Rust build output (this crate is its own workspace; not built by fluxbee).
+target/
+adapter-rs/target/
+
+# Local dev adapter state / runtime db.
+.linkedhelper-adapter-state*
+adapter-rs/.linkedhelper-adapter-state*
+
+.DS_Store

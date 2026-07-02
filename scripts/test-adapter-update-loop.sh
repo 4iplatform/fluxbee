@@ -14,7 +14,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ADAPTER_CRATE="${ADAPTER_CRATE:-$HOME/repos/fluxbee_cloud/adapters/linked-helper/adapter-rs}"
+ADAPTER_CRATE="${ADAPTER_CRATE:-$HERE/../nodes/io/adapters/linked-helper/adapter-rs}"
 PORT="${PORT:-8799}"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/lh-update-XXXXXX")"
 MOCK_PID=""

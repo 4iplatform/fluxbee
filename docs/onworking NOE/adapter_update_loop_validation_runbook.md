@@ -18,8 +18,7 @@ unit tests en `fluxbee_cloud` y el E2E vivo previo.
 ## 1. Harness local (mecánica) — validado
 
 ```bash
-ADAPTER_CRATE=~/repos/fluxbee_cloud/adapters/linked-helper/adapter-rs \
-  bash scripts/test-adapter-update-loop.sh
+bash scripts/test-adapter-update-loop.sh
 ```
 
 Construye v1 (versión actual) y v2 (`0.2.0`), y corre 3 escenarios:
@@ -40,8 +39,7 @@ Prerrequisitos (ver memoria `proxmox-test-env`):
 - La VM con salida a internet (rustup + deps de crate; edition 2024 necesita Rust ≥ 1.85, más nuevo que el `cargo` de apt).
 
 ```bash
-VMID=201 ADAPTER_CRATE=~/repos/fluxbee_cloud/adapters/linked-helper/adapter-rs \
-  bash scripts/test-adapter-update-loop-vm.sh
+VMID=201 bash scripts/test-adapter-update-loop-vm.sh
 ```
 
 Flujo: sube el fuente del crate + el mock → instala toolchain y compila v1/v2/**v2crash**
@@ -74,7 +72,7 @@ Notas operativas del harness (aprendidas al correrlo):
 
 ## 2b. Instalación como servicio (Linux) — packaging
 
-En `fluxbee_cloud/adapters/linked-helper/packaging/`:
+En `nodes/io/adapters/linked-helper/packaging/` (repo fluxbee):
 - `install-linkedhelper-adapter.sh --cloud <url> --token <tok> [--binary … --partitions-root … --interval …]` — usuario de sistema `fluxbee-lh`, binario en `/opt/fluxbee/lh-adapter` (**escribible por el servicio** para el self-update), estado en `/var/lib/fluxbee/lh-adapter`, unidad systemd (`Restart=always`), enroll idempotente, `enable --now`.
 - `uninstall-linkedhelper-adapter.sh [--purge]` — quita servicio+binario; `--purge` borra estado+usuario (clean slate).
 - `fluxbee-lh-adapter.service` — unidad de referencia (la efectiva la genera el installer).

@@ -1,0 +1,25 @@
+# Standalone workspace: the LinkedHelper adapter lives in the fluxbee repo but is
+# NOT built/deployed as part of fluxbee. Declaring its own [workspace] keeps it
+# independent of both the fluxbee root workspace and the nodes/io workspace it
+# sits under (same pattern nodes/io uses relative to the repo root).
+[workspace]
+
+[package]
+name = "adapter-rs"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# Test-only fault injection: when enabled, the binary exits right after the
+# self-update boot-gate, simulating a crash-looping post-update binary so the
+# supervised-rollback path can be validated (see the VM harness). Off in prod.
+test-crash-on-boot = []
+
+[dependencies]
+clap = { version = "4.5.38", features = ["derive"] }
+reqwest = { version = "0.12.23", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+time = { version = "0.3.44", features = ["formatting"] }

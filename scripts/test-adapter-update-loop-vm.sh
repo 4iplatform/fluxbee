@@ -20,7 +20,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PVE="$HERE/../lab/pve.py"
-ADAPTER_CRATE="${ADAPTER_CRATE:-$HOME/repos/fluxbee_cloud/adapters/linked-helper/adapter-rs}"
+ADAPTER_CRATE="${ADAPTER_CRATE:-$HERE/../nodes/io/adapters/linked-helper/adapter-rs}"
 VMID="${VMID:?set VMID to a clean Ubuntu VM in the dev pool}"
 PORT="${PORT:-8799}"
 BASELINE="update-loop-baseline"

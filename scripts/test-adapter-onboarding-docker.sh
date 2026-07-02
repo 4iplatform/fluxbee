@@ -15,7 +15,7 @@
 # PRECONDITIONS (you do these):
 #   1. Cloud running locally started WITH:
 #        FLUXBEE_LH_ADAPTER_RELEASES_PATH=<releases-dir>/manifest.json
-#        FLUXBEE_LH_ADAPTER_INSTALL_SCRIPT=<repo>/adapters/linked-helper/packaging/install-linkedhelper-adapter.sh
+#        FLUXBEE_LH_ADAPTER_INSTALL_SCRIPT=<fluxbee>/nodes/io/adapters/linked-helper/packaging/install-linkedhelper-adapter.sh
 #      (releases-dir must match --releases-dir below; default printed on run)
 #   2. An enrollment token issued from the UI ("Generate installation token").
 #
@@ -26,7 +26,8 @@
 set -euo pipefail
 
 TOKEN=""
-CRATE="${ADAPTER_CRATE:-$HOME/repos/fluxbee_cloud/adapters/linked-helper/adapter-rs}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CRATE="${ADAPTER_CRATE:-$HERE/../nodes/io/adapters/linked-helper/adapter-rs}"
 RELEASES_DIR="${RELEASES_DIR:-/private/tmp/lh-releases}"
 CLOUD="http://host.docker.internal:3002"     # reachable from inside the container
 HOST_CLOUD="http://localhost:3002"           # reachable from this Mac (pre-checks)

@@ -1,0 +1,25 @@
+# Reference systemd unit for the Fluxbee LinkedHelper adapter.
+#
+# NOTE: install-linkedhelper-adapter.sh generates the *effective* unit (with the
+# real paths, interval, and optional --partitions-root substituted). This file
+# documents the intended shape and the two load-bearing choices:
+#   - Restart=always drives the supervised self-update restart (the adapter
+#     exits after swapping its binary and systemd brings up the new one, which
+#     the boot-gate counts for crash-loop rollback).
+#   - The binary lives in a service-user-owned dir with NO ProtectSystem/
+#     ReadOnlyPaths over it, so the self-update can replace it in place.
+[Unit]
+Description=Fluxbee LinkedHelper adapter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fluxbee-lh
+Group=fluxbee-lh
+ExecStart=/opt/fluxbee/lh-adapter/adapter-rs --state-file /var/lib/fluxbee/lh-adapter/state.json run --interval-seconds 60
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
