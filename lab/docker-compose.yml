@@ -36,6 +36,11 @@ services:
       - "8080:8080"
       # Architect HTTP UI/API.
       - "3000:3000"
+      # Temporary direct HTTP ingress for IO.linkedhelper nodes in the no-Edge path.
+      # Range, not a single port: the cloud allocates one port per managed
+      # instance (19091 + N), so every provisioned node must be reachable from
+      # the host for the cloud's /schema probe and the adapter's /v1/poll.
+      - "19091-19100:19091-19100"
     networks:
       - flux
 

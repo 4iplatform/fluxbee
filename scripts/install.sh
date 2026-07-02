@@ -23,6 +23,8 @@ IO_API_RUNTIME_NAME="${IO_API_RUNTIME_NAME:-io.api}"
 IO_API_RUNTIME_VERSION="${IO_API_RUNTIME_VERSION:-1.0.0}"
 IO_SLACK_RUNTIME_NAME="${IO_SLACK_RUNTIME_NAME:-io.slack}"
 IO_SLACK_RUNTIME_VERSION="${IO_SLACK_RUNTIME_VERSION:-1.0.0}"
+IO_LINKEDHELPER_RUNTIME_NAME="${IO_LINKEDHELPER_RUNTIME_NAME:-io.linkedhelper}"
+IO_LINKEDHELPER_RUNTIME_VERSION="${IO_LINKEDHELPER_RUNTIME_VERSION:-1.0.0}"
 REQUESTED_BIN_DIR="${BIN_DIR:-}"
 BIN_DIR="$ROOT_DIR/target/release"
 STATE_ROOT_DIR="$STATE_DIR/state"
@@ -241,8 +243,8 @@ echo "Building sy-frontdesk-gov system binary..."
 cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
 echo "Building ai.generic runtime binary..."
 cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner
-echo "Building IO runtime binaries (io.api, io.slack)..."
-cargo build --release --manifest-path nodes/io/Cargo.toml -p io-api -p io-slack
+echo "Building IO runtime binaries (io.api, io.slack, io.linkedhelper)..."
+cargo build --release --manifest-path nodes/io/Cargo.toml -p io-api -p io-slack -p io-linkedhelper
 
 go_required=0
 for go_dir in "go/sy-opa-rules" "go/sy-timer" "go/sy-wf-rules" "go/nodes/wf/wf-generic"; do
@@ -903,6 +905,22 @@ bash "$ROOT_DIR/scripts/publish-io-runtime.sh" \
   --runtime "$IO_SLACK_RUNTIME_NAME" \
   --version "$IO_SLACK_RUNTIME_VERSION" \
   --binary "$io_slack_bin" \
+  --dist-root "$STATE_DIR/dist" \
+  --set-current \
+  --sudo \
+  --skip-build
+
+io_linkedhelper_bin="$ROOT_DIR/nodes/io/target/release/io-linkedhelper"
+if [[ ! -f "$io_linkedhelper_bin" ]]; then
+  echo "Error: io.linkedhelper build completed but binary is missing: $io_linkedhelper_bin" >&2
+  exit 1
+fi
+
+echo "Publishing base runtime $IO_LINKEDHELPER_RUNTIME_NAME@$IO_LINKEDHELPER_RUNTIME_VERSION into $STATE_DIR/dist/runtimes..."
+bash "$ROOT_DIR/scripts/publish-io-linkedhelper-runtime.sh" \
+  --runtime "$IO_LINKEDHELPER_RUNTIME_NAME" \
+  --version "$IO_LINKEDHELPER_RUNTIME_VERSION" \
+  --binary "$io_linkedhelper_bin" \
   --dist-root "$STATE_DIR/dist" \
   --set-current \
   --sudo \

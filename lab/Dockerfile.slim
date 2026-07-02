@@ -37,7 +37,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     cargo build --release --bins \
   && cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov \
   && cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner \
-  && cargo build --release --manifest-path nodes/io/Cargo.toml -p io-api -p io-slack \
+  && cargo build --release --manifest-path nodes/io/Cargo.toml -p io-api -p io-slack -p io-linkedhelper \
   && (cd go/sy-opa-rules && go build -o sy-opa-rules .) \
   && (cd go/sy-timer && go build -o sy-timer .) \
   && (cd go/sy-wf-rules && go build -o sy-wf-rules .) \

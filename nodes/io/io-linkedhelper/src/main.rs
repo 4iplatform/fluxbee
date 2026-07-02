@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod auth;
 mod schema;
 mod state_store;
 
@@ -34,8 +35,13 @@ use io_common::io_control_plane_logging::{
 use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
 use io_common::io_control_plane_store::persist_io_control_plane_state;
 use io_common::io_linkedhelper_adapter_config::IoLinkedHelperAdapterConfigContract;
-use io_common::provision::{strict_provision_ilk, IdentityProvisionConfig};
-use io_common::router_message::new_trace_id;
+use io_common::io_context::{
+    wrap_in_meta_context, ConversationRef, IoContext, MessageRef, PartyRef, ReplyTarget,
+};
+use io_common::provision::{
+    ensure_own_ich, strict_provision_ilk, EnsureOwnIchResult, IdentityProvisionConfig,
+};
+use io_common::router_message::{build_user_message, new_trace_id, DEFAULT_TTL};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -44,6 +50,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
+use crate::auth::{AdapterAuthValidator, AuthRejection, AuthStatus, InboundAuthRequest};
 use crate::schema::{build_configured_schema, build_unconfigured_schema};
 use crate::state_store::{
     load_linkedhelper_state, persist_linkedhelper_state, AdapterSnapshot, LinkedHelperDurableState,
@@ -114,8 +121,13 @@ struct AdapterRuntime {
 struct LinkedHelperRuntimeRegistry {
     binding: Option<AdapterRuntime>,
     max_request_bytes: usize,
+    dedup_max_entries: usize,
     identity_target: String,
     identity_timeout_ms: u64,
+    /// The node's own managed-instance ICH (`ICH.linkedhelper.<managed_instance_id>`),
+    /// set once `ensure_own_ich` succeeds. `None` means the node has not yet
+    /// registered its own ICH and must not be treated as operational.
+    own_ich_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -263,6 +275,67 @@ impl From<StoredResponseItem> for ResponseItem {
     }
 }
 
+impl ResponseItem {
+    /// A response is retryable when it is an error `Result` the adapter should
+    /// re-send. Such outcomes must NOT be recorded in the idempotency ledger,
+    /// so the adapter can retry them on the next poll.
+    fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            ResponseItem::Result {
+                retryable: Some(true),
+                ..
+            }
+        )
+    }
+
+    /// Durable-state projection used to persist a terminal response for
+    /// idempotent replay.
+    fn to_stored(&self) -> StoredResponseItem {
+        match self {
+            ResponseItem::Ack {
+                response_id,
+                adapter_id,
+                event_id,
+            } => StoredResponseItem::Ack {
+                response_id: response_id.clone(),
+                adapter_id: adapter_id.clone(),
+                event_id: event_id.clone(),
+            },
+            ResponseItem::Result {
+                response_id,
+                adapter_id,
+                event_id,
+                status,
+                result_type,
+                payload,
+                error_code,
+                error_message,
+                retryable,
+            } => StoredResponseItem::Result {
+                response_id: response_id.clone(),
+                adapter_id: adapter_id.clone(),
+                event_id: event_id.clone(),
+                status: status.clone(),
+                result_type: result_type.clone(),
+                payload: payload.clone(),
+                error_code: error_code.clone(),
+                error_message: error_message.clone(),
+                retryable: *retryable,
+            },
+            ResponseItem::Heartbeat {
+                response_id,
+                adapter_id,
+                timestamp,
+            } => StoredResponseItem::Heartbeat {
+                response_id: response_id.clone(),
+                adapter_id: adapter_id.clone(),
+                timestamp: timestamp.clone(),
+            },
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut config = Config::from_env();
@@ -360,23 +433,71 @@ async fn main() -> Result<()> {
             config.listen_addr = listen_addr.to_string();
         }
         if registry.binding.is_some() {
-            if let Err(err) = resolve_runtime_registry_auth(
+            match resolve_runtime_registry_auth(
                 &mut registry,
                 vault_client.as_deref(),
                 Duration::from_secs(5),
             )
             .await
             {
-                boot_state.current_state = IoNodeLifecycleState::FailedConfig;
-                boot_state.last_error = Some(IoControlPlaneErrorInfo {
-                    code: "auth_secret_unavailable".to_string(),
-                    message: err.to_string(),
-                });
-                tracing::warn!(
-                    node_name = %config.node_name,
-                    error = %err,
-                    "boot effective config could not resolve linkedhelper adapter secret; starting in FAILED_CONFIG"
-                );
+                Err(err) => {
+                    boot_state.current_state = IoNodeLifecycleState::FailedConfig;
+                    boot_state.last_error = Some(IoControlPlaneErrorInfo {
+                        code: "auth_secret_unavailable".to_string(),
+                        message: err.to_string(),
+                    });
+                    tracing::warn!(
+                        node_name = %config.node_name,
+                        error = %err,
+                        "boot effective config could not resolve linkedhelper adapter secret; starting in FAILED_CONFIG"
+                    );
+                }
+                Ok(()) => {
+                    let managed_instance_id = registry
+                        .binding
+                        .as_ref()
+                        .map(|binding| binding.managed_instance_id.clone());
+                    if let Some(managed_instance_id) = managed_instance_id {
+                        let identity_cfg = build_identity_provision_config(
+                            &registry,
+                            &hive_id_from_node_name(&config.node_name),
+                        );
+                        match ensure_linkedhelper_own_ich(
+                            &dispatcher,
+                            &identity_cfg,
+                            self_ilk_id.as_deref(),
+                            self_tenant_id.as_deref(),
+                            &managed_instance_id,
+                        )
+                        .await
+                        {
+                            Ok(result) => {
+                                tracing::info!(
+                                    node_name = %config.node_name,
+                                    managed_instance_id = %managed_instance_id,
+                                    self_ilk_id = %result.ilk_id,
+                                    own_ich_id = %result.ich_id,
+                                    enabled = result.enabled,
+                                    "io-linkedhelper own managed-instance ICH ensured at boot"
+                                );
+                                registry.own_ich_id = Some(result.ich_id);
+                            }
+                            Err(err) => {
+                                boot_state.current_state = IoNodeLifecycleState::FailedConfig;
+                                boot_state.last_error = Some(IoControlPlaneErrorInfo {
+                                    code: "own_ich_registration_failed".to_string(),
+                                    message: err.to_string(),
+                                });
+                                tracing::warn!(
+                                    node_name = %config.node_name,
+                                    managed_instance_id = %managed_instance_id,
+                                    error = %err,
+                                    "failed to ensure own managed-instance ICH at boot; starting in FAILED_CONFIG"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -440,6 +561,8 @@ async fn main() -> Result<()> {
         runtime_registry,
         durable_state,
         vault_client,
+        self_ilk_id.clone(),
+        self_tenant_id.clone(),
     ));
 
     if let Some(http_task) = http_task {
@@ -496,6 +619,7 @@ async fn try_bind_http_listener(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_router_control_loop(
     dispatcher: Arc<RouterDispatcher>,
     node_name: String,
@@ -506,6 +630,8 @@ async fn run_router_control_loop(
     runtime_registry: Arc<RwLock<LinkedHelperRuntimeRegistry>>,
     durable_state: Arc<RwLock<LinkedHelperDurableState>>,
     vault_client: Option<Arc<VaultClient>>,
+    self_ilk_id: Option<String>,
+    self_tenant_id: Option<String>,
 ) -> Result<()> {
     let control_src = dispatcher.sender_snapshot().uuid().to_string();
     let mut system_rx = dispatcher
@@ -528,12 +654,15 @@ async fn run_router_control_loop(
             &node_name,
             &control_src,
             &state_dir,
+            &dispatcher,
             control_plane.clone(),
             control_metrics.clone(),
             adapter_contract.as_ref(),
             runtime_registry.clone(),
             durable_state.clone(),
             vault_client.clone(),
+            self_ilk_id.as_deref(),
+            self_tenant_id.as_deref(),
         )
         .await
         {
@@ -555,17 +684,21 @@ fn build_io_linkedhelper_rpc_profile(
         .build()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_io_control_plane_message(
     msg: &WireMessage,
     node_name: &str,
     control_src: &str,
     state_dir: &Path,
+    dispatcher: &Arc<RouterDispatcher>,
     control_plane: Arc<RwLock<IoControlPlaneState>>,
     control_metrics: Arc<IoControlPlaneMetrics>,
     adapter_contract: &dyn IoAdapterConfigContract,
     runtime_registry: Arc<RwLock<LinkedHelperRuntimeRegistry>>,
     durable_state: Arc<RwLock<LinkedHelperDurableState>>,
     vault_client: Option<Arc<VaultClient>>,
+    self_ilk_id: Option<&str>,
+    self_tenant_id: Option<&str>,
 ) -> Option<WireMessage> {
     let command = msg.meta.msg.as_deref().unwrap_or_default();
     if msg.meta.msg_type != SYSTEM_KIND {
@@ -585,7 +718,10 @@ async fn handle_io_control_plane_message(
     if command.eq_ignore_ascii_case("STATUS") {
         let state = control_plane.read().await.clone();
         let metrics = control_metrics.snapshot();
-        let adapter_count = usize::from(runtime_registry.read().await.binding.is_some());
+        let (adapter_count, own_ich_id) = {
+            let registry = runtime_registry.read().await;
+            (usize::from(registry.binding.is_some()), registry.own_ich_id.clone())
+        };
         let payload = serde_json::json!({
             "ok": true,
             "node_name": node_name,
@@ -596,7 +732,8 @@ async fn handle_io_control_plane_message(
             "last_error": state.last_error,
             "metrics": { "control_plane": metrics },
             "runtime": {
-                "active_adapter_count": adapter_count
+                "active_adapter_count": adapter_count,
+                "own_ich_id": own_ich_id
             }
         });
         return Some(build_system_reply(msg, control_src, "STATUS_RESPONSE", payload));
@@ -617,11 +754,18 @@ async fn handle_io_control_plane_message(
                 build_io_adapter_contract_payload(adapter_contract, state.effective_config.as_ref()),
             );
             if let Some(obj) = payload.as_object_mut() {
+                let (adapter_count, own_ich_id) = {
+                    let registry = runtime_registry.read().await;
+                    (usize::from(registry.binding.is_some()), registry.own_ich_id.clone())
+                };
                 obj.insert(
                     "metrics".to_string(),
                     serde_json::json!({
                         "control_plane": control_metrics.snapshot(),
-                        "runtime": { "active_adapter_count": usize::from(runtime_registry.read().await.binding.is_some()) }
+                        "runtime": {
+                            "active_adapter_count": adapter_count,
+                            "own_ich_id": own_ich_id
+                        }
                     }),
                 );
             }
@@ -632,12 +776,15 @@ async fn handle_io_control_plane_message(
                 &set_payload,
                 node_name,
                 state_dir,
+                dispatcher,
                 control_plane.clone(),
                 control_metrics,
                 adapter_contract,
                 runtime_registry,
                 durable_state,
                 vault_client,
+                self_ilk_id,
+                self_tenant_id,
             )
             .await
         }
@@ -660,16 +807,20 @@ async fn handle_io_control_plane_message(
     Some(response)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_linkedhelper_config_set(
     payload: &fluxbee_sdk::node_config::NodeConfigSetPayload,
     node_name: &str,
     state_dir: &Path,
+    dispatcher: &Arc<RouterDispatcher>,
     control_plane: Arc<RwLock<IoControlPlaneState>>,
     control_metrics: Arc<IoControlPlaneMetrics>,
     adapter_contract: &dyn IoAdapterConfigContract,
     runtime_registry: Arc<RwLock<LinkedHelperRuntimeRegistry>>,
     durable_state: Arc<RwLock<LinkedHelperDurableState>>,
     vault_client: Option<Arc<VaultClient>>,
+    self_ilk_id: Option<&str>,
+    self_tenant_id: Option<&str>,
 ) -> Value {
     let mut state = control_plane.write().await;
 
@@ -764,6 +915,57 @@ async fn apply_linkedhelper_config_set(
             "auth_secret_unavailable",
             err.to_string(),
         );
+    }
+
+    // Ensure the node owns its managed-instance ICH before going operational
+    // (§3.8 / acceptance criteria: no own ICH => not operational).
+    if let Some(managed_instance_id) = registry
+        .binding
+        .as_ref()
+        .map(|binding| binding.managed_instance_id.clone())
+    {
+        let identity_cfg =
+            build_identity_provision_config(&registry, &hive_id_from_node_name(node_name));
+        match ensure_linkedhelper_own_ich(
+            dispatcher,
+            &identity_cfg,
+            self_ilk_id,
+            self_tenant_id,
+            &managed_instance_id,
+        )
+        .await
+        {
+            Ok(result) => {
+                tracing::info!(
+                    node_name = %node_name,
+                    managed_instance_id = %managed_instance_id,
+                    self_ilk_id = %result.ilk_id,
+                    own_ich_id = %result.ich_id,
+                    enabled = result.enabled,
+                    "io-linkedhelper own managed-instance ICH ensured on CONFIG_SET"
+                );
+                registry.own_ich_id = Some(result.ich_id);
+            }
+            Err(err) => {
+                state.current_state = IoNodeLifecycleState::FailedConfig;
+                state.last_error = Some(IoControlPlaneErrorInfo {
+                    code: "own_ich_registration_failed".to_string(),
+                    message: err.to_string(),
+                });
+                control_metrics.record_config_set_error(
+                    state.current_state.as_str(),
+                    state.config_version,
+                    "own_ich_registration_failed",
+                );
+                let redacted = redact_state(&state, adapter_contract);
+                return build_io_config_set_error_payload(
+                    node_name,
+                    &redacted,
+                    "own_ich_registration_failed",
+                    err.to_string(),
+                );
+            }
+        }
     }
 
     let previous_version = state.config_version;
@@ -873,6 +1075,13 @@ fn load_runtime_registry(effective_config: Option<&Value>) -> Result<LinkedHelpe
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(256 * 1024);
+    let dedup_max_entries = effective_config
+        .and_then(|cfg| cfg.get("http"))
+        .and_then(|http| http.get("dedup_max_entries"))
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(10_000);
     let identity_target = effective_config
         .and_then(|cfg| cfg.get("identity"))
         .and_then(|identity| identity.get("target"))
@@ -985,8 +1194,10 @@ fn load_runtime_registry(effective_config: Option<&Value>) -> Result<LinkedHelpe
     Ok(LinkedHelperRuntimeRegistry {
         binding,
         max_request_bytes,
+        dedup_max_entries,
         identity_target,
         identity_timeout_ms,
+        own_ich_id: None,
     })
 }
 
@@ -1100,6 +1311,50 @@ fn linkedhelper_contact_channel() -> &'static str {
     "linkedhelper_contact"
 }
 
+/// Channel type used to register the node's OWN ICH
+/// (`ICH.linkedhelper.<managed_instance_id>`). Kept distinct from the profile
+/// channel so a managed instance can never collide with an external profile id.
+fn linkedhelper_managed_instance_channel() -> &'static str {
+    "linkedhelper_managed_instance"
+}
+
+/// Register (idempotently) the node's own managed-instance ICH with SY.identity.
+/// Per the intermediate spec (§3.8, acceptance criteria) the node must own
+/// `ICH.linkedhelper.<managed_instance_id>` and must not be operational without
+/// it — callers treat a failure here as `own_ich_registration_failed`.
+async fn ensure_linkedhelper_own_ich(
+    dispatcher: &Arc<RouterDispatcher>,
+    identity_cfg: &IdentityProvisionConfig,
+    self_ilk_id: Option<&str>,
+    self_tenant_id: Option<&str>,
+    managed_instance_id: &str,
+) -> Result<EnsureOwnIchResult> {
+    let self_ilk_id = self_ilk_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("missing self_ilk_id for IO.linkedhelper own ICH registration")
+        })?;
+    let self_tenant_id = self_tenant_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("missing self_tenant_id for IO.linkedhelper own ICH registration")
+        })?;
+    let result = ensure_own_ich(
+        dispatcher,
+        identity_cfg,
+        identity_cfg.target.as_str(),
+        self_ilk_id,
+        self_tenant_id,
+        linkedhelper_managed_instance_channel(),
+        managed_instance_id,
+    )
+    .await
+    .map_err(|err| anyhow::anyhow!("own ICH registration failed: {err}"))?;
+    Ok(result)
+}
+
 fn normalize_registration_status(status: &str) -> &'static str {
     match status.trim() {
         "complete" => "complete",
@@ -1171,39 +1426,6 @@ async fn post_poll(
             .into_response();
     }
 
-    let adapter_id_header = match headers
-        .get("X-Fluxbee-Adapter-Id")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        Some(value) => value,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error_code": "missing_adapter_id",
-                    "error_message": "X-Fluxbee-Adapter-Id header is required"
-                })),
-            )
-                .into_response()
-        }
-    };
-
-    let bearer = match extract_bearer_token(&headers) {
-        Some(value) => value,
-        None => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "error_code": "missing_bearer_token",
-                    "error_message": "Authorization: Bearer <adapter_secret> is required"
-                })),
-            )
-                .into_response()
-        }
-    };
-
     let registry = state.runtime_registry.read().await;
     let Some(runtime) = registry.binding.as_ref() else {
         return (
@@ -1215,36 +1437,7 @@ async fn post_poll(
         )
             .into_response();
     };
-    if runtime.adapter_id != adapter_id_header {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error_code": "adapter_not_allowed",
-                "error_message": "adapter_id is not authorized for this managed instance"
-            })),
-        )
-            .into_response();
-    }
-    let Some(expected_secret) = runtime.adapter_secret.as_deref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error_code": "auth_secret_unavailable",
-                "error_message": "linkedhelper node could not resolve its adapter secret"
-            })),
-        )
-            .into_response();
-    };
-    if expected_secret != bearer {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error_code": "invalid_adapter_secret",
-                "error_message": "invalid adapter secret"
-            })),
-        )
-            .into_response();
-    }
+
     let request_size = serde_json::to_vec(&request).map(|bytes| bytes.len()).unwrap_or(0);
     if request_size > registry.max_request_bytes {
         return (
@@ -1259,60 +1452,33 @@ async fn post_poll(
         )
             .into_response();
     }
+
+    // Adapter authentication/authorization is delegated to the isolated
+    // `AdapterAuthValidator` (auth contract §6/§10) so it can later move to the
+    // Edge without touching the poll handler.
+    let validator = AdapterAuthValidator::new(
+        runtime.adapter_id.clone(),
+        runtime.managed_instance_id.clone(),
+        runtime.local_instance_id.clone(),
+        runtime.adapter_secret.clone(),
+    );
+    let auth_request = InboundAuthRequest {
+        header_adapter_id: headers
+            .get("X-Fluxbee-Adapter-Id")
+            .and_then(|value| value.to_str().ok()),
+        bearer: extract_bearer_token(&headers),
+        body_adapter_id: request.adapter_id.as_deref(),
+        body_managed_instance_id: request.managed_instance_id.as_deref(),
+        body_local_instance_id: request.local_instance_id.as_deref(),
+    };
+    if let Err(rejection) = validator.validate(&auth_request) {
+        return auth_rejection_response(rejection);
+    }
+
     let runtime = runtime.clone();
     let identity_cfg = build_identity_provision_config(&registry, &state.hive_id);
+    let dedup_max_entries = registry.dedup_max_entries;
     drop(registry);
-
-    if request.adapter_id.as_deref().map(str::trim).filter(|v| !v.is_empty()) != Some(adapter_id_header)
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error_code": "adapter_id_mismatch",
-                "error_message": "adapter_id body/header mismatch"
-            })),
-        )
-            .into_response();
-    }
-    if request
-        .managed_instance_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        != Some(runtime.managed_instance_id.as_str())
-    {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error_code": "managed_instance_id_mismatch",
-                "error_message": "managed_instance_id does not match this node binding"
-            })),
-        )
-            .into_response();
-    }
-    if let Some(expected_local_instance_id) = runtime
-        .local_instance_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if request
-            .local_instance_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            != Some(expected_local_instance_id)
-        {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error_code": "local_instance_id_mismatch",
-                    "error_message": "local_instance_id does not match this node binding"
-                })),
-            )
-                .into_response();
-        }
-    }
 
     let request_id = request
         .request_id
@@ -1362,6 +1528,8 @@ async fn post_poll(
         let mut responses = Vec::with_capacity(request.items.len());
         for item in &request.items {
             let event_id = item.id.trim();
+            // Events with no stable id/type get a validation error but are NOT
+            // recorded for idempotent replay (there is no reliable dedup key).
             if event_id.is_empty() || item.item_type.trim().is_empty() {
                 responses.push(ResponseItem::Result {
                     response_id: format!("resp:{request_id}:invalid"),
@@ -1376,6 +1544,27 @@ async fn post_poll(
                 });
                 continue;
             }
+
+            // Idempotency: if this event already reached a terminal outcome,
+            // replay the recorded response(s) instead of re-running side effects.
+            let dedup_key = format!(
+                "{}:{}:{}",
+                runtime.managed_instance_id, runtime.adapter_id, event_id
+            );
+            if let Some(record) = durable_state.processed_event(&dedup_key) {
+                tracing::debug!(
+                    node_name = %state.node_name,
+                    adapter_id = %runtime.adapter_id,
+                    event_id = %event_id,
+                    "linkedhelper replayed idempotent response for duplicate event"
+                );
+                for stored in record.responses.clone() {
+                    responses.push(ResponseItem::from(stored));
+                }
+                continue;
+            }
+
+            let mut item_responses: Vec<ResponseItem> = Vec::new();
             if item.item_type.eq_ignore_ascii_case("profile_create") {
                 process_profile_create(
                     &state,
@@ -1384,12 +1573,10 @@ async fn post_poll(
                     &mut durable_state,
                     request_id,
                     item,
-                    &mut responses,
+                    &mut item_responses,
                 )
                 .await;
-                continue;
-            }
-            if item.item_type.eq_ignore_ascii_case("conversation_message") {
+            } else if item.item_type.eq_ignore_ascii_case("conversation_message") {
                 process_conversation_message(
                     &state,
                     &runtime,
@@ -1397,25 +1584,35 @@ async fn post_poll(
                     &mut durable_state,
                     request_id,
                     item,
-                    &mut responses,
+                    &mut item_responses,
                 )
                 .await;
-                continue;
+            } else {
+                item_responses.push(ResponseItem::Result {
+                    response_id: format!("resp:{request_id}:{event_id}:unsupported"),
+                    adapter_id: runtime.adapter_id.clone(),
+                    event_id: item.id.clone(),
+                    status: "error".to_string(),
+                    result_type: "unsupported_event_type".to_string(),
+                    payload: None,
+                    error_code: Some("unsupported_event_type".to_string()),
+                    error_message: Some(format!(
+                        "event type '{}' is not implemented yet",
+                        item.item_type
+                    )),
+                    retryable: Some(false),
+                });
             }
-            responses.push(ResponseItem::Result {
-                response_id: format!("resp:{request_id}:{event_id}:unsupported"),
-                adapter_id: runtime.adapter_id.clone(),
-                event_id: item.id.clone(),
-                status: "error".to_string(),
-                result_type: "unsupported_event_type".to_string(),
-                payload: None,
-                error_code: Some("unsupported_event_type".to_string()),
-                error_message: Some(format!(
-                    "event type '{}' is not implemented yet",
-                    item.item_type
-                )),
-                retryable: Some(false),
-            });
+
+            // Record only terminal outcomes; a retryable failure must be left
+            // un-recorded so the adapter can retry it on a later poll.
+            let retryable = item_responses.iter().any(ResponseItem::is_retryable);
+            if !retryable && !item_responses.is_empty() {
+                let stored: Vec<StoredResponseItem> =
+                    item_responses.iter().map(ResponseItem::to_stored).collect();
+                durable_state.record_processed_event(dedup_key, stored, dedup_max_entries);
+            }
+            responses.append(&mut item_responses);
         }
         responses.extend(pending_deliveries);
         responses
@@ -1480,6 +1677,23 @@ async fn post_poll(
         items,
     })
     .into_response()
+}
+
+fn auth_rejection_response(rejection: AuthRejection) -> Response {
+    let status = match rejection.status {
+        AuthStatus::BadRequest => StatusCode::BAD_REQUEST,
+        AuthStatus::Unauthorized => StatusCode::UNAUTHORIZED,
+        AuthStatus::Forbidden => StatusCode::FORBIDDEN,
+        AuthStatus::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "error_code": rejection.error_code,
+            "error_message": rejection.error_message
+        })),
+    )
+        .into_response()
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -2134,60 +2348,60 @@ async fn process_conversation_message(
     let trace_id = new_trace_id();
     let profile_ilk_owned = profile_ilk.to_string();
     let sender = state.dispatcher.sender_snapshot();
-    let conversation_msg = WireMessage {
-        routing: Routing {
-            src: sender.uuid().to_string(),
-            src_l2_name: None,
-            dst: Destination::Unicast(dst_node.clone()),
-            ttl: 16,
-            trace_id: trace_id.clone(),
+    let src_uuid = sender.uuid().to_string();
+
+    // Canonical inbound envelope: build the io-common `IoContext` + go through
+    // `build_user_message`, so IO.linkedhelper emits the exact same shape as
+    // io.slack / io.api instead of a hand-rolled `context.io`. `meta.ich` is
+    // derived as `linkedhelper://<managed_instance_id>` (the node's own
+    // managed-instance handle, mirroring `slack://<binding>`); `src_ilk` is the
+    // contact, `dst_ilk` the target profile. LinkedHelper-specific routing +
+    // reply metadata lives in `reply_target` (kind `linkedhelper_poll`).
+    let io_context = IoContext {
+        channel: linkedhelper_profile_channel().to_string(),
+        entrypoint: PartyRef {
+            kind: "linkedhelper_managed_instance".to_string(),
+            id: runtime.managed_instance_id.clone(),
         },
-        meta: Meta {
-            msg_type: "user".to_string(),
-            msg: None,
-            src_ilk: Some(contact_src_ilk.clone()),
-            dst_ilk: Some(profile_ilk_owned.clone()),
-            ich: contact_ich_id.clone(),
+        sender: PartyRef {
+            kind: linkedhelper_contact_channel().to_string(),
+            id: contact_external_id.to_string(),
+        },
+        conversation: ConversationRef {
+            kind: "linkedhelper_conversation".to_string(),
+            id: conversation_external_id.to_string(),
             thread_id: Some(thread_id.clone()),
-            scope: None,
-            target: None,
-            action: None,
-            priority: None,
-            context: Some(serde_json::json!({
-                "io": {
-                    "channel": linkedhelper_profile_channel(),
-                    "adapter": {
-                        "id": runtime.adapter_id
-                    },
-                    "entrypoint": {
-                        "id": runtime.adapter_id
-                    },
-                    "sender": {
-                        "id": contact_external_id,
-                        "display_name": contact_name
-                    },
-                    "recipient": {
-                        "id": profile_ilk_owned
-                    },
-                    "conversation": {
-                        "id": conversation_external_id,
-                        "thread_id": thread_id
-                    },
-                    "message": {
-                        "id": item.id,
-                        "request_id": request_id
-                    },
-                    "linkedhelper": {
-                        "external_profile_id": profile.external_profile_id,
-                        "contact_lh_person_id": payload.contact_lh_person_id,
-                        "profile_ilk": profile_ilk
-                    }
-                }
-            })),
-            ..Meta::default()
         },
-        payload: message_payload,
+        message: MessageRef {
+            id: item.id.clone(),
+            timestamp: None,
+        },
+        reply_target: ReplyTarget {
+            kind: "linkedhelper_poll".to_string(),
+            address: runtime.adapter_id.clone(),
+            params: serde_json::json!({
+                "adapter_id": runtime.adapter_id,
+                "managed_instance_id": runtime.managed_instance_id,
+                "external_profile_id": profile.external_profile_id,
+                "profile_ilk": profile_ilk_owned,
+                "contact_external_id": contact_external_id,
+                "contact_display_name": contact_name,
+                "contact_lh_person_id": payload.contact_lh_person_id,
+                "conversation_external_id": conversation_external_id,
+                "request_id": request_id,
+            }),
+        },
     };
+    let conversation_msg = build_user_message(
+        &src_uuid,
+        Some(dst_node.clone()),
+        DEFAULT_TTL,
+        trace_id.clone(),
+        Some(contact_src_ilk.clone()),
+        Some(profile_ilk_owned.clone()),
+        wrap_in_meta_context(&io_context),
+        message_payload,
+    );
 
     if let Err(err) = sender.send(conversation_msg).await {
         tracing::warn!(

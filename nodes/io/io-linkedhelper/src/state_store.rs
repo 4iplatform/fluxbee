@@ -25,6 +25,12 @@ pub struct LinkedHelperDurableState {
     pub own_ichs: HashMap<String, IchStateRecord>,
     #[serde(default)]
     pub pending_deliveries: HashMap<String, Vec<PendingDeliveryRecord>>,
+    /// Idempotency ledger: terminal responses keyed by processed event, so a
+    /// re-polled `event_id` replays the same result instead of re-running side
+    /// effects (double router dispatch, double provision). Retryable failures
+    /// are intentionally NOT recorded so the adapter can retry them.
+    #[serde(default)]
+    pub processed_events: HashMap<String, ProcessedEventRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +91,13 @@ pub struct IchStateRecord {
     pub owner_l2_name: Option<String>,
     pub automation_enabled: bool,
     pub observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProcessedEventRecord {
+    pub event_key: String,
+    pub processed_at_ms: u64,
+    pub responses: Vec<StoredResponseItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -294,6 +307,48 @@ impl LinkedHelperDurableState {
         adapter.updated_at_ms = now_ms;
     }
 
+    /// Return the recorded terminal responses for a previously-processed event,
+    /// if any. Presence means the event was handled to a terminal (non-retryable)
+    /// outcome and should be replayed rather than re-processed.
+    pub fn processed_event(&self, event_key: &str) -> Option<&ProcessedEventRecord> {
+        self.processed_events.get(event_key)
+    }
+
+    /// Record the terminal responses for an event, bounding the ledger to
+    /// `max_entries` by evicting the oldest entry when full.
+    pub fn record_processed_event(
+        &mut self,
+        event_key: String,
+        responses: Vec<StoredResponseItem>,
+        max_entries: usize,
+    ) {
+        let max = max_entries.max(1);
+        let now_ms = now_epoch_ms();
+        self.processed_events.insert(
+            event_key.clone(),
+            ProcessedEventRecord {
+                event_key,
+                processed_at_ms: now_ms,
+                responses,
+            },
+        );
+        while self.processed_events.len() > max {
+            let Some(oldest_key) = self
+                .processed_events
+                .values()
+                .min_by(|a, b| {
+                    a.processed_at_ms
+                        .cmp(&b.processed_at_ms)
+                        .then_with(|| a.event_key.cmp(&b.event_key))
+                })
+                .map(|record| record.event_key.clone())
+            else {
+                break;
+            };
+            self.processed_events.remove(&oldest_key);
+        }
+    }
+
     pub fn upsert_ich_state(
         &mut self,
         ich_id: &str,
@@ -403,4 +458,57 @@ pub fn now_epoch_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ack(event_id: &str) -> StoredResponseItem {
+        StoredResponseItem::Ack {
+            response_id: format!("resp:{event_id}"),
+            adapter_id: "adp_123".to_string(),
+            event_id: event_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn processed_event_roundtrips() {
+        let mut state = LinkedHelperDurableState::default();
+        assert!(state.processed_event("k1").is_none());
+        state.record_processed_event("k1".to_string(), vec![ack("e1")], 100);
+        let record = state.processed_event("k1").expect("recorded");
+        assert_eq!(record.event_key, "k1");
+        assert_eq!(record.responses, vec![ack("e1")]);
+    }
+
+    #[test]
+    fn record_processed_event_evicts_oldest_when_over_capacity() {
+        let mut state = LinkedHelperDurableState::default();
+        // Force distinct, increasing timestamps so eviction order is deterministic.
+        for (idx, key) in ["a", "b", "c"].iter().enumerate() {
+            state.processed_events.insert(
+                (*key).to_string(),
+                ProcessedEventRecord {
+                    event_key: (*key).to_string(),
+                    processed_at_ms: idx as u64,
+                    responses: vec![ack(key)],
+                },
+            );
+        }
+        // Inserting a 4th with capacity 3 evicts the oldest ("a").
+        state.record_processed_event("d".to_string(), vec![ack("d")], 3);
+        assert_eq!(state.processed_events.len(), 3);
+        assert!(state.processed_event("a").is_none());
+        assert!(state.processed_event("b").is_some());
+        assert!(state.processed_event("d").is_some());
+    }
+
+    #[test]
+    fn record_processed_event_treats_zero_capacity_as_one() {
+        let mut state = LinkedHelperDurableState::default();
+        state.record_processed_event("k1".to_string(), vec![ack("e1")], 0);
+        state.record_processed_event("k2".to_string(), vec![ack("e2")], 0);
+        assert_eq!(state.processed_events.len(), 1);
+    }
 }
