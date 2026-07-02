@@ -48,7 +48,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::auth::{AdapterAuthValidator, AuthRejection, AuthStatus, InboundAuthRequest};
 use crate::schema::{build_configured_schema, build_unconfigured_schema};
@@ -140,6 +140,12 @@ struct HttpState {
     adapter_contract: Arc<dyn IoAdapterConfigContract>,
     runtime_registry: Arc<RwLock<LinkedHelperRuntimeRegistry>>,
     durable_state: Arc<RwLock<LinkedHelperDurableState>>,
+    /// Serializes the durable-state mutation section of `/v1/poll`. The handler
+    /// reads-clones-mutates-writes the durable state, which would race under
+    /// concurrent polls (a poll would clobber another's processed_events /
+    /// pending_deliveries / profile promotions). One managed instance = one
+    /// adapter, so serializing polls here is correct and not a throughput issue.
+    poll_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -537,6 +543,7 @@ async fn main() -> Result<()> {
         adapter_contract: adapter_contract.clone(),
         runtime_registry: runtime_registry.clone(),
         durable_state: durable_state.clone(),
+        poll_lock: Arc::new(Mutex::new(())),
     });
 
     let http_task = match try_bind_http_listener(
@@ -1318,6 +1325,22 @@ fn linkedhelper_managed_instance_channel() -> &'static str {
     "linkedhelper_managed_instance"
 }
 
+/// Canonical LinkedHelper conversation thread id. Keyed on the managed instance
+/// (stable across adapter re-enroll/migrate/rebind) + the external conversation
+/// id — NOT the adapter binding — so cognition continuity survives binding
+/// changes. Consistent with the envelope entrypoint (managed_instance).
+fn linkedhelper_thread_id(
+    managed_instance_id: &str,
+    conversation_external_id: &str,
+) -> Result<String, String> {
+    compute_thread_id(ThreadIdInput::PersistentChannel {
+        channel_type: linkedhelper_profile_channel(),
+        entrypoint_id: Some(managed_instance_id),
+        conversation_id: conversation_external_id,
+    })
+    .map_err(|err| err.to_string())
+}
+
 /// Register (idempotently) the node's own managed-instance ICH with SY.identity.
 /// Per the intermediate spec (§3.8, acceptance criteria) the node must own
 /// `ICH.linkedhelper.<managed_instance_id>` and must not be operational without
@@ -1493,6 +1516,10 @@ async fn post_poll(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| if request.items.is_empty() { "heartbeat" } else { "events" });
+    // Serialize the read-clone-mutate-writeback of durable state so concurrent
+    // polls can't clobber each other's changes (processed_events, deliveries,
+    // profile/automation state). Held until the handler returns.
+    let _poll_guard = state.poll_lock.lock().await;
     let mut durable_state = state.durable_state.read().await.clone();
     durable_state.mark_adapter_poll(&runtime.adapter_id, request_id);
     refresh_pending_profiles_for_adapter(state.as_ref(), &runtime, &mut durable_state);
@@ -2323,11 +2350,7 @@ async fn process_conversation_message(
         }
     };
 
-    let thread_id = match compute_thread_id(ThreadIdInput::PersistentChannel {
-        channel_type: linkedhelper_profile_channel(),
-        entrypoint_id: Some(runtime.adapter_id.as_str()),
-        conversation_id: conversation_external_id,
-    }) {
+    let thread_id = match linkedhelper_thread_id(&runtime.managed_instance_id, conversation_external_id) {
         Ok(thread_id) => thread_id,
         Err(err) => {
             responses.push(ResponseItem::Result {
@@ -2338,7 +2361,7 @@ async fn process_conversation_message(
                 result_type: "validation_error".to_string(),
                 payload: None,
                 error_code: Some("invalid_conversation_external_id".to_string()),
-                error_message: Some(err.to_string()),
+                error_message: Some(err),
                 retryable: Some(false),
             });
             return;
@@ -2590,5 +2613,76 @@ fn build_system_reply(
             ..Meta::default()
         },
         payload,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thread_id_is_keyed_on_managed_instance() {
+        let a = linkedhelper_thread_id("lhmi_1", "conv_1").unwrap();
+        // Stable: same managed instance + conversation => same thread id, so
+        // continuity survives even when the adapter binding changes.
+        assert_eq!(a, linkedhelper_thread_id("lhmi_1", "conv_1").unwrap());
+        // Distinct per managed instance and per conversation.
+        assert_ne!(a, linkedhelper_thread_id("lhmi_2", "conv_1").unwrap());
+        assert_ne!(a, linkedhelper_thread_id("lhmi_1", "conv_2").unwrap());
+    }
+
+    fn result_item(retryable: Option<bool>) -> ResponseItem {
+        ResponseItem::Result {
+            response_id: "resp:x".to_string(),
+            adapter_id: "adp".to_string(),
+            event_id: "evt".to_string(),
+            status: "success".to_string(),
+            result_type: "conversation_processed".to_string(),
+            payload: Some(serde_json::json!({ "k": "v" })),
+            error_code: None,
+            error_message: None,
+            retryable,
+        }
+    }
+
+    #[test]
+    fn is_retryable_only_for_retryable_result() {
+        let ack = ResponseItem::Ack {
+            response_id: "r".to_string(),
+            adapter_id: "a".to_string(),
+            event_id: "e".to_string(),
+        };
+        assert!(!ack.is_retryable());
+        assert!(result_item(Some(true)).is_retryable());
+        assert!(!result_item(Some(false)).is_retryable());
+        assert!(!result_item(None).is_retryable());
+    }
+
+    #[test]
+    fn to_stored_roundtrips_through_from() {
+        let item = result_item(Some(false));
+        let stored = item.to_stored();
+        let back = ResponseItem::from(stored);
+        // ResponseItem has no PartialEq; compare via their JSON projections.
+        assert_eq!(
+            serde_json::to_value(&item).unwrap(),
+            serde_json::to_value(&back).unwrap()
+        );
+    }
+
+    #[test]
+    fn auth_rejection_maps_to_http_status() {
+        let validator = AdapterAuthValidator::new("adp", "mi", None, Some("s3cret".to_string()));
+        let rejection = validator
+            .validate(&InboundAuthRequest {
+                header_adapter_id: None,
+                bearer: Some("s3cret"),
+                body_adapter_id: Some("adp"),
+                body_managed_instance_id: Some("mi"),
+                body_local_instance_id: None,
+            })
+            .expect_err("missing adapter-id header should be rejected");
+        let response = auth_rejection_response(rejection);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

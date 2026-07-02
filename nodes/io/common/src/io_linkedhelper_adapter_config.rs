@@ -146,7 +146,7 @@ impl IoAdapterConfigContract for IoLinkedHelperAdapterConfigContract {
             .filter(|value| !value.is_empty());
         let mut descriptor = NodeSecretDescriptor::new(
             "config.adapter.auth.key",
-            key.unwrap_or("linkedhelper/adapters/<adapter_id>"),
+            key.unwrap_or("linkedhelper:adapters:<adapter_id>"),
         );
         descriptor.required = true;
         descriptor.configured = key.is_some();
