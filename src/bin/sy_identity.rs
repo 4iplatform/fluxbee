@@ -4,13 +4,14 @@ use std::fs::OpenOptions;
 use std::future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time;
 use tokio_postgres::{error::SqlState, Config as PgConfig, NoTls};
 use tracing_subscriber::EnvFilter;
@@ -64,6 +65,36 @@ const IDENTITY_PUBLISH_RECONCILE_SECS: u64 = 30;
 // Bound on the primary's ingest queue: a flooding/buggy replica applies
 // backpressure to its own publish connection instead of growing primary memory.
 const IDENTITY_INGEST_CHANNEL_CAP: usize = 4096;
+// Hard cap on a single :9100 sync frame (one JSON line). A peer that streams
+// bytes without a newline would otherwise grow the read buffer without bound and
+// OOM the process (G-4). 16 MiB is far above any legitimate full-sync chunk
+// (IDENTITY_FULL_SYNC_CHUNK_ITEMS records) or delta frame.
+const MAX_SYNC_LINE_BYTES: usize = 16 * 1024 * 1024;
+// Idle read timeout for post-handshake sync frames: a peer that stops sending
+// mid-stream is dropped rather than pinning a reader task forever (G-4). Sized
+// generously for large full-syncs over a slow WAN link (per-frame, not total).
+const IDENTITY_SYNC_READ_IDLE_SECS: u64 = 60;
+// Upper bound on the advertised full-sync chunk count, checked before allocating
+// the reassembly buffer, so a crafted/corrupted total_chunks (u32, up to ~4.3e9)
+// cannot drive a multi-hundred-GB allocation that aborts a booting replica
+// (G-7). 65_536 chunks * 256 items/chunk = ~16.7M records, far above any real
+// store; the reassembly Vec is then at most ~a few MB.
+const MAX_FULL_SYNC_CHUNKS: usize = 65_536;
+// Cap on concurrently-registered delta subscribers on the primary. Auth already
+// gates who may subscribe (F-01); this bounds fan-out fd/memory even so (G-5).
+const MAX_DELTA_SUBSCRIBERS: usize = 256;
+// Per-subscriber outbound delta queue depth. A bounded channel means a slow/
+// stuck subscriber is dropped (recovers via full-sync on reconnect) instead of
+// letting healthy mesh activity grow primary memory without bound (G-5).
+const IDENTITY_SUBSCRIBER_CHANNEL_CAP: usize = 1024;
+// Cap on concurrently-handled :9100 sync connections. Each accepted connection
+// is handled in its own task (F-02); this bounds the fan-out so a connect storm
+// cannot exhaust fds/memory. Excess connections are dropped and the peer retries.
+const MAX_CONCURRENT_SYNC_CONNS: usize = 64;
+// Write deadline for a single sync frame. A peer that stops reading mid-stream
+// (e.g. during full-sync) is dropped rather than pinning its handler task
+// forever (F-02). Generous for large frames over a slow WAN link.
+const IDENTITY_SYNC_WRITE_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_IDENTITY_SHM_MAX_ILKS: u32 = 8_192;
 const DEFAULT_IDENTITY_SHM_MAX_TENANTS: u32 = 1_024;
 const DEFAULT_IDENTITY_SHM_MAX_VOCABULARY: u32 = 4_096;
@@ -911,6 +942,13 @@ impl IdentityStore {
                 if existing.deleted_at_ms.is_some() {
                     return Err("ILK_NOT_FOUND".to_string());
                 }
+                // Never let ILK_REGISTER mutate/downgrade a system ilk (minted
+                // only by ensure_system_ilks_from_hive). Closes the node_name-match
+                // hijack where a register could overwrite e.g. SY.vault@hive —
+                // breaking that service's root-pool access/routing. (F-08)
+                if existing.ilk_type.trim() == "system" {
+                    return Err("SYSTEM_ILK_PROTECTED".to_string());
+                }
                 let tenant_change = existing.tenant_id != req.tenant_id;
                 if tenant_change && !existing.registration_status.eq("temporary") {
                     return Err("INVALID_TENANT_TRANSITION".to_string());
@@ -1604,6 +1642,35 @@ fn ilk_owning_hive(ilk: &IlkRecord) -> Option<String> {
         .filter(|h| !h.is_empty())
 }
 
+/// A replica-pushed ilk may assert `ilk_type = "system"` ONLY when it is a
+/// genuine deterministic SY.* system ilk of the publisher's own hive: node_name
+/// `SY.<svc>@<publisher_hive>` whose `ilk_id` is the deterministic system id.
+/// This stops a compromised/buggy worker from relabelling an arbitrary owned
+/// (agent/human) ilk as `system` — the exact type `sy_vault::authorize_read`
+/// treats as a root-tenant pool master key. Non-system types are always allowed
+/// for owned ilks (unknown strings fail safe to non-privileged in SHM).
+fn ingest_ilk_type_authorized(ilk: &IlkRecord, publisher_hive: &str) -> bool {
+    if ilk.ilk_type.trim() != "system" {
+        return true;
+    }
+    let Some(node_name) = ilk
+        .identification
+        .get("node_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    else {
+        return false;
+    };
+    if !node_name.starts_with("SY.") {
+        return false;
+    }
+    if ilk_owning_hive(ilk).as_deref() != Some(publisher_hive) {
+        return false;
+    }
+    ilk.ilk_id == deterministic_system_ilk_id(node_name)
+}
+
 /// Per-hive authority: is `publisher_hive` allowed to push this delta? A replica
 /// may only upsert/delete ilks it owns (`@<publisher_hive>`). For `IlkDelete`
 /// (which carries only an ilk_id) ownership is resolved against the existing ilk
@@ -1624,6 +1691,11 @@ fn delta_authorized_for_hive(
             if ilk_owning_hive(ilk).as_deref() != Some(publisher_hive) {
                 return false;
             }
+            // A replica must not mint a privileged `system` identity for an ilk
+            // it merely owns; `system` is bound to the deterministic SY.* shape.
+            if !ingest_ilk_type_authorized(ilk, publisher_hive) {
+                return false;
+            }
             match store.ilks.get(&ilk.ilk_id) {
                 Some(existing) => ilk_owning_hive(existing).as_deref() == Some(publisher_hive),
                 None => true,
@@ -1635,12 +1707,26 @@ fn delta_authorized_for_hive(
             .and_then(ilk_owning_hive)
             .as_deref()
             == Some(publisher_hive),
-        IdentityDelta::AliasUpsert { alias } => store
-            .ilks
-            .get(&alias.canonical_ilk_id)
-            .and_then(ilk_owning_hive)
-            .as_deref()
-            == Some(publisher_hive),
+        IdentityDelta::AliasUpsert { alias } => {
+            // Both the redirected source id (`old_ilk_id`, the key the alias is
+            // stored under and the id whose resolution it hijacks) AND the
+            // canonical target must be owned by the publisher. Checking only the
+            // canonical let a replica shadow ANY ilk id — including other hives'
+            // system ilks — by aliasing it onto an ilk it owns. Never allow
+            // shadowing a well-known system ilk's id.
+            if store
+                .ilks
+                .get(&alias.old_ilk_id)
+                .map(is_well_known_system_ilk)
+                .unwrap_or(false)
+            {
+                return false;
+            }
+            let owned_by_publisher = |id: &str| {
+                store.ilks.get(id).and_then(ilk_owning_hive).as_deref() == Some(publisher_hive)
+            };
+            owned_by_publisher(&alias.old_ilk_id) && owned_by_publisher(&alias.canonical_ilk_id)
+        }
         IdentityDelta::AliasDelete { old_ilk_id } => store
             .ilks
             .get(old_ilk_id)
@@ -1785,11 +1871,12 @@ impl IdentityRuntime {
                 "identity received ILK_PROVISION request"
             );
         }
-        // Vault broadcast: react before the auth check because the
-        // broadcast carries no auth-bearing fields (metadata only) and is
-        // meant for every node in the hive to consume.
+        // Vault broadcast: handled before the table-driven auth check (which has
+        // no entry for VAULT_SECRET_CHANGED). handle_vault_secret_changed does
+        // its OWN fail-closed origin check on the router-stamped src_l2_name so a
+        // forged broadcast cannot restart-loop the identity primary.
         if action == MSG_VAULT_SECRET_CHANGED {
-            handle_vault_secret_changed(msg, self.is_primary, node_name);
+            handle_vault_secret_changed(msg, self.is_primary, node_name, src_l2_name, &self.hive_id);
             return Ok(Vec::new());
         }
         if !self.is_authorized(action, src_l2_name) {
@@ -2348,7 +2435,21 @@ impl IdentityRuntime {
             }
             MSG_TNT_CREATE => match serde_json::from_value::<TntCreateRequest>(msg.payload.clone())
             {
-                Ok(req) => match self.store.create_tenant(req) {
+                Ok(req) => {
+                    // Snapshot BEFORE the mutation and restore on DB failure —
+                    // mirroring TNT_UPDATE/ILK_DELETE. create_tenant is idempotent:
+                    // for an already-existing tenant it returns created=false
+                    // WITHOUT mutating the store, so the old blind
+                    // `tenants.remove(tenant_id)` on DB error would evict a
+                    // pre-existing (possibly root) tenant. Snapshot-restore is a
+                    // no-op for the dedup path and a correct rollback for a real
+                    // create.
+                    let snapshot = if self.is_primary && self.db_config.is_some() {
+                        Some(self.store.clone())
+                    } else {
+                        None
+                    };
+                    match self.store.create_tenant(req) {
                     Ok(ok) => {
                         if let Some(tenant_id) = ok
                             .get("tenant_id")
@@ -2361,7 +2462,9 @@ impl IdentityRuntime {
                                         if let Err(err) =
                                             upsert_tenant_in_db(database_config, &tenant).await
                                         {
-                                            self.store.tenants.remove(&tenant_id);
+                                            if let Some(snapshot) = snapshot {
+                                                self.store = snapshot;
+                                            }
                                             db_write_error_payload(
                                                 "failed to persist tenant",
                                                 err.as_ref(),
@@ -2392,7 +2495,8 @@ impl IdentityRuntime {
                         }
                     }
                     Err(code) => error_payload(&code, "failed to create tenant"),
-                },
+                    }
+                }
                 Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
             },
             MSG_TNT_UPDATE => match serde_json::from_value::<TntUpdateRequest>(msg.payload.clone())
@@ -2588,21 +2692,41 @@ impl IdentityRuntime {
         if !deltas.is_empty() {
             if let Some(writer) = identity_shm {
                 let shm_apply_started = Instant::now();
-                apply_identity_shm_deltas(writer, &self.store, action, &deltas)?;
-                let shm_state = writer.debug_state();
-                tracing::info!(
-                    action,
-                    trace_id = %trace_id,
-                    delta_count = deltas.len(),
-                    elapsed_us = shm_apply_started.elapsed().as_micros() as u64,
-                    shm_seq = shm_state.map(|s| s.seq),
-                    shm_tenant_count = shm_state.map(|s| s.tenant_count),
-                    shm_ilk_count = shm_state.map(|s| s.ilk_count),
-                    shm_ich_count = shm_state.map(|s| s.ich_count),
-                    shm_mapping_count = shm_state.map(|s| s.ich_mapping_count),
-                    shm_updated_at = shm_state.map(|s| s.updated_at),
-                    "identity shm delta apply completed"
-                );
+                // G-8: a LOCAL SHM write failure must NOT suppress replication of
+                // an already-committed (DB) change or the client response. The
+                // old `?` here returned Err out of the handler, so the caller
+                // skipped broadcast_deltas AND send_system_response, leaving the
+                // primary ahead of replicas and the caller hung. Log and press on;
+                // the local SHM is stale until the next successful apply, but the
+                // durable store, replicas, and the response stay consistent.
+                match apply_identity_shm_deltas(writer, &self.store, action, &deltas) {
+                    Ok(()) => {
+                        let shm_state = writer.debug_state();
+                        tracing::info!(
+                            action,
+                            trace_id = %trace_id,
+                            delta_count = deltas.len(),
+                            elapsed_us = shm_apply_started.elapsed().as_micros() as u64,
+                            shm_seq = shm_state.map(|s| s.seq),
+                            shm_tenant_count = shm_state.map(|s| s.tenant_count),
+                            shm_ilk_count = shm_state.map(|s| s.ilk_count),
+                            shm_ich_count = shm_state.map(|s| s.ich_count),
+                            shm_mapping_count = shm_state.map(|s| s.ich_mapping_count),
+                            shm_updated_at = shm_state.map(|s| s.updated_at),
+                            "identity shm delta apply completed"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            action,
+                            trace_id = %trace_id,
+                            delta_count = deltas.len(),
+                            error = %err,
+                            "identity shm delta apply FAILED; broadcasting delta and \
+                             responding anyway (local SHM stale until next apply)"
+                        );
+                    }
+                }
             }
         }
 
@@ -2630,6 +2754,17 @@ impl IdentityRuntime {
                 }
             })
             .collect();
+        // Snapshot before mutating memory so a DB GC failure rolls back cleanly.
+        // Otherwise (G-6) memory drops the expired alias / tombstones the ilk,
+        // the DB write errors and the deltas built from `expired_aliases` are
+        // discarded, and the NEXT cycle recomputes an empty expired set from the
+        // already-mutated memory — so SHM and every replica keep the expired
+        // alias and the un-tombstoned ilk indefinitely.
+        let snapshot = if self.is_primary && self.db_config.is_some() {
+            Some(self.store.clone())
+        } else {
+            None
+        };
         let removed_local = self.store.gc_expired_aliases(now_ms);
         if removed_local > 0 {
             tracing::info!(removed = removed_local, "identity alias gc applied locally");
@@ -2637,12 +2772,26 @@ impl IdentityRuntime {
 
         if self.is_primary {
             if let Some(database_config) = self.db_config.as_ref() {
-                let removed_db = gc_aliases_in_db(database_config).await?;
-                if removed_db > 0 {
-                    tracing::info!(
-                        removed = removed_db,
-                        "identity alias gc applied in database"
-                    );
+                match gc_aliases_in_db(database_config).await {
+                    Ok(removed_db) => {
+                        if removed_db > 0 {
+                            tracing::info!(
+                                removed = removed_db,
+                                "identity alias gc applied in database"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(snapshot) = snapshot {
+                            self.store = snapshot;
+                        }
+                        tracing::warn!(
+                            error = %err,
+                            "identity alias gc DB write failed; rolled back in-memory gc, \
+                             will retry next cycle (keeps memory/SHM/replicas consistent)"
+                        );
+                        return Ok(Vec::new());
+                    }
                 }
             }
         }
@@ -2689,7 +2838,26 @@ impl IdentityRuntime {
         let Some(prefixes) = self.allowed_prefixes.get(action) else {
             return false;
         };
-        prefixes.iter().any(|prefix| name.starts_with(prefix))
+        // Same-hive-only roles: a privileged SY control-plane identity from
+        // ANOTHER hive must not administer THIS hive's identity authority (F-07 —
+        // mirrors the router's system_policy::authority same-hive rule for these
+        // roles). IO.* (worker IO provisioning against the sole motherbee
+        // authority) and SY.orchestrator@ (cross-hive control plane) are
+        // legitimately cross-hive and keep the plain prefix grant.
+        const SAME_HIVE_ONLY_PREFIXES: [&str; 3] =
+            ["SY.admin@", "SY.architect@", "SY.frontdesk.gov@"];
+        prefixes.iter().any(|prefix| {
+            if !name.starts_with(prefix) {
+                return false;
+            }
+            if SAME_HIVE_ONLY_PREFIXES.contains(prefix) {
+                // The `@<hive>` suffix must equal our own hive. Fail-closed on a
+                // missing/malformed suffix.
+                name.rsplit_once('@').map(|(_, h)| h) == Some(self.hive_id.as_str())
+            } else {
+                true
+            }
+        })
     }
 }
 
@@ -2910,7 +3078,12 @@ async fn main() -> Result<(), IdentityError> {
                     tracing::info!(upstream = %upstream, metrics = %metrics, "identity full sync bootstrap applied");
                 }
                 Err(err) => {
-                    tracing::warn!(upstream = %upstream, error = %err, "identity full sync bootstrap failed; starting with local in-memory state");
+                    // F-05: surface this LOUDLY (a replica running on stale/empty
+                    // state serves inconsistent identity to router/vault/IO). We
+                    // do NOT exit here — the primary may be briefly unreachable
+                    // during firstboot ordering, and exiting would restart-storm.
+                    // A delta gap after a successful boot DOES exit for re-sync.
+                    tracing::error!(upstream = %upstream, error = %err, "identity full sync bootstrap FAILED; replica is DEGRADED and starting with local in-memory state (will converge once the delta stream reconnects)");
                 }
             }
         } else {
@@ -2994,8 +3167,18 @@ async fn main() -> Result<(), IdentityError> {
     let mut publish_reconcile_tick =
         time::interval(Duration::from_secs(IDENTITY_PUBLISH_RECONCILE_SECS));
     let sync_listener = sync_listener;
-    let mut delta_subscribers: Vec<mpsc::UnboundedSender<IdentityDeltaEnvelope>> = Vec::new();
+    let mut delta_subscribers: Vec<mpsc::Sender<IdentityDeltaEnvelope>> = Vec::new();
     let mut next_delta_seq: u64 = 1;
+    // F-02: each accepted :9100 connection is handled in its own task so a slow
+    // reader cannot pin the event loop. The semaphore caps concurrent handlers;
+    // handlers return a registered subscriber over `new_sub_rx` and request an
+    // on-demand full-sync snapshot over `chunks_req_rx` (built here, on the loop,
+    // only for authenticated FULL_SYNC requests — G-9).
+    let sync_conn_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_SYNC_CONNS));
+    let (new_sub_tx, mut new_sub_rx) =
+        mpsc::unbounded_channel::<mpsc::Sender<IdentityDeltaEnvelope>>();
+    let (chunks_req_tx, mut chunks_req_rx) =
+        mpsc::unbounded_channel::<oneshot::Sender<Arc<Vec<IdentityFullSyncChunk>>>>();
     let mut system_rx = dispatcher
         .take_command_receiver(RPC_CH_SYSTEM)
         .await
@@ -3045,15 +3228,48 @@ async fn main() -> Result<(), IdentityError> {
                             }
                         }
                         IngestFrame::Snapshot { publisher_hive, ilks } => {
-                            if ilks.iter().all(|ilk| ilk_owning_hive(ilk).as_deref() == Some(publisher_hive.as_str())) {
+                            if ilks.iter().all(|ilk| {
+                                ilk_owning_hive(ilk).as_deref() == Some(publisher_hive.as_str())
+                                    && ingest_ilk_type_authorized(ilk, publisher_hive.as_str())
+                            }) {
                                 runtime.store.reconcile_hive_ilks(&publisher_hive, ilks)
                             } else {
-                                tracing::warn!(hive = %publisher_hive, "rejected publish snapshot containing foreign ilks");
+                                tracing::warn!(hive = %publisher_hive, "rejected publish snapshot containing foreign or unauthorized-system ilks");
                                 Vec::new()
                             }
                         }
                     }};
                     if !applied.is_empty() {
+                        // F-06: persist replica-published ilks so they survive a
+                        // primary restart. Previously these were memory/SHM/
+                        // broadcast only, so a primary restart while the owning
+                        // worker was down dropped them from the global (DB-backed)
+                        // view. Best-effort: on failure the worker re-pushes its
+                        // full self-owned set on the next reconcile tick, so this
+                        // converges. (Aliases are TTL'd/regenerable, not persisted
+                        // on this path.)
+                        if is_primary {
+                            if let Some(cfg) = runtime.db_config.as_ref() {
+                                for delta in &applied {
+                                    let res = match delta {
+                                        IdentityDelta::IlkUpsert { ilk } => {
+                                            persist_ilk_state_in_db(cfg, ilk, None).await
+                                        }
+                                        IdentityDelta::IlkDelete { ilk_id } => {
+                                            delete_ilk_in_db(cfg, ilk_id).await
+                                        }
+                                        _ => Ok(()),
+                                    };
+                                    if let Err(err) = res {
+                                        tracing::warn!(
+                                            error = %err,
+                                            "identity failed to persist replica-published ilk; \
+                                             will re-persist on the next reconcile tick"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         if let Some(writer) = identity_shm.as_mut() {
                             if let Err(err) = sync_identity_shm_mappings(writer, &runtime.store) {
                                 tracing::warn!(error = %err, "identity shm sync failed after replica ingest");
@@ -3105,17 +3321,71 @@ async fn main() -> Result<(), IdentityError> {
                 }
             } => {
                 if let Some((stream, remote_addr)) = accepted {
-                    let chunks = runtime.store.build_full_sync_chunks(IDENTITY_FULL_SYNC_CHUNK_ITEMS);
-                    match handle_sync_connection(stream, chunks, ingest_tx.clone(), auth_required).await {
-                        Ok(Some(subscriber)) => {
-                            tracing::info!(remote = %remote_addr, "identity delta subscriber connected");
-                            delta_subscribers.push(subscriber);
+                    // F-02: handle the connection OFF the main loop so a slow
+                    // reader (e.g. during full-sync streaming) cannot pin the
+                    // event loop. Bound concurrency with a semaphore so a connect
+                    // storm cannot exhaust fds/memory (excess dropped, peer retries).
+                    match Arc::clone(&sync_conn_sem).try_acquire_owned() {
+                        Ok(permit) => {
+                            let ingest_tx2 = ingest_tx.clone();
+                            let chunks_req_tx2 = chunks_req_tx.clone();
+                            let new_sub_tx2 = new_sub_tx.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                match handle_sync_connection(
+                                    stream,
+                                    chunks_req_tx2,
+                                    ingest_tx2,
+                                    auth_required,
+                                )
+                                .await
+                                {
+                                    Ok(Some(subscriber)) => {
+                                        // Registration happens on the main loop
+                                        // (new_sub branch) so delta_subscribers is
+                                        // only ever touched there.
+                                        let _ = new_sub_tx2.send(subscriber);
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) => {
+                                        tracing::warn!(remote = %remote_addr, error = %err, "identity sync request failed");
+                                    }
+                                }
+                            });
                         }
-                        Ok(None) => {}
-                        Err(err) => {
-                            tracing::warn!(remote = %remote_addr, error = %err, "identity sync request failed");
+                        Err(_) => {
+                            tracing::warn!(
+                                remote = %remote_addr,
+                                cap = MAX_CONCURRENT_SYNC_CONNS,
+                                "identity sync connection cap reached; dropping connection"
+                            );
                         }
                     }
+                }
+            }
+            maybe_new_sub = new_sub_rx.recv() => {
+                if let Some(subscriber) = maybe_new_sub {
+                    if delta_subscribers.len() >= MAX_DELTA_SUBSCRIBERS {
+                        // Cap fan-out (G-5): drop the sender (its task exits when
+                        // the channel closes). The peer retries later.
+                        tracing::warn!(
+                            cap = MAX_DELTA_SUBSCRIBERS,
+                            "identity delta subscriber cap reached; rejecting new subscriber"
+                        );
+                    } else {
+                        tracing::info!("identity delta subscriber connected");
+                        delta_subscribers.push(subscriber);
+                    }
+                }
+            }
+            maybe_chunks_req = chunks_req_rx.recv() => {
+                if let Some(reply) = maybe_chunks_req {
+                    // On-demand full-sync snapshot for an authenticated FULL_SYNC
+                    // request (G-9): bounded CPU (clone+sort), no I/O — the
+                    // streaming to the peer happens in the spawned handler task.
+                    let chunks =
+                        Arc::new(runtime.store.build_full_sync_chunks(IDENTITY_FULL_SYNC_CHUNK_ITEMS));
+                    let _ = reply.send(chunks);
                 }
             }
             maybe_msg = system_rx.recv() => {
@@ -3174,13 +3444,48 @@ fn identity_sync_upstream(hive: &HiveFile) -> Option<String> {
 }
 
 /// Whether the :9100 channel requires the per-hive HMAC handshake.
+///
+/// FAIL-CLOSED: auth is REQUIRED unless the operator explicitly opts out with a
+/// recognized token. An absent `identity.sync.auth`, an empty value, or any typo
+/// (`require`, `enabled`, `true`, …) all resolve to `required` — a config
+/// mistake can no longer silently leave the identity authority's replication
+/// channel open to exfiltration/poisoning. The only way to run without auth is a
+/// deliberate, loudly-logged `disabled`/`off`/`none`.
 fn identity_sync_auth_required(hive: &HiveFile) -> bool {
-    hive.identity
+    let raw = hive
+        .identity
         .as_ref()
         .and_then(|identity| identity.sync.as_ref())
-        .and_then(|sync| sync.auth.as_deref())
-        .map(|mode| mode.trim().eq_ignore_ascii_case("required"))
-        .unwrap_or(false)
+        .and_then(|sync| sync.auth.as_deref());
+    auth_mode_required(raw)
+}
+
+/// Fail-closed core of [`identity_sync_auth_required`]: an absent value, empty
+/// string, or any unrecognized token resolves to REQUIRED; only the explicit,
+/// loudly-logged `disabled`/`off`/`none` disables auth.
+fn auth_mode_required(raw: Option<&str>) -> bool {
+    match raw {
+        None => true,
+        Some(mode) => match mode.trim().to_ascii_lowercase().as_str() {
+            "required" | "" => true,
+            "disabled" | "off" | "none" => {
+                tracing::warn!(
+                    "identity.sync.auth={} — :9100 identity sync authentication is DISABLED. \
+                     Any host reaching the port can exfiltrate and poison identity state. \
+                     Only use this on a strictly isolated/loopback network.",
+                    mode.trim()
+                );
+                false
+            }
+            other => {
+                tracing::warn!(
+                    "identity.sync.auth='{other}' is unrecognized; treating as REQUIRED \
+                     (fail-closed). Use 'required', or (insecure) 'disabled'."
+                );
+                true
+            }
+        },
+    }
 }
 
 fn identity_hmac_key_path(hive_id: &str) -> std::path::PathBuf {
@@ -3222,7 +3527,19 @@ fn parse_ilk_type_for_shm(value: &str) -> u8 {
         "human" => SHM_ILK_TYPE_HUMAN,
         "agent" => SHM_ILK_TYPE_AGENT,
         "system" => SHM_ILK_TYPE_SYSTEM,
-        _ => SHM_ILK_TYPE_SYSTEM,
+        // Fail SAFE, not open: an unrecognized/empty ilk_type must NOT be
+        // published as the most-privileged `system` type (vault treats `system`
+        // as a root-pool master key). Map the unknown to the least-privileged
+        // `human` so corruption / a partial sync / a bad writer denies rather
+        // than grants. Legit `system` ilks always carry the exact "system"
+        // string; anything else here is a bug worth surfacing.
+        other => {
+            tracing::warn!(
+                ilk_type = %other,
+                "unrecognized ilk_type published to SHM; defaulting to human (fail-safe)"
+            );
+            SHM_ILK_TYPE_HUMAN
+        }
     }
 }
 
@@ -3800,26 +4117,110 @@ struct AuthErrorMsg {
     message: String,
 }
 
+/// Write `buf` with a hard deadline (F-02): a peer that stops reading cannot pin
+/// the writer task. On timeout the connection is errored and the caller drops it.
+async fn write_timed(
+    w: &mut tokio::net::tcp::OwnedWriteHalf,
+    buf: &[u8],
+) -> Result<(), IdentityError> {
+    time::timeout(
+        Duration::from_secs(IDENTITY_SYNC_WRITE_TIMEOUT_SECS),
+        w.write_all(buf),
+    )
+    .await
+    .map_err(|_| -> IdentityError { "sync write timeout".into() })??;
+    Ok(())
+}
+
+/// Flush with the same deadline as [`write_timed`].
+async fn flush_timed(w: &mut tokio::net::tcp::OwnedWriteHalf) -> Result<(), IdentityError> {
+    time::timeout(
+        Duration::from_secs(IDENTITY_SYNC_WRITE_TIMEOUT_SECS),
+        w.flush(),
+    )
+    .await
+    .map_err(|_| -> IdentityError { "sync flush timeout".into() })??;
+    Ok(())
+}
+
 async fn auth_write_line(
     w: &mut tokio::net::tcp::OwnedWriteHalf,
     value: &impl Serialize,
 ) -> Result<(), IdentityError> {
-    w.write_all(serde_json::to_string(value)?.as_bytes()).await?;
-    w.write_all(b"\n").await?;
-    w.flush().await?;
+    write_timed(w, serde_json::to_string(value)?.as_bytes()).await?;
+    write_timed(w, b"\n").await?;
+    flush_timed(w).await?;
     Ok(())
+}
+
+/// Read one `\n`-terminated frame with a HARD size cap (G-4). Unlike
+/// `read_line`/`read_until`, which grow the buffer until EOF or newline, this
+/// errors once `max_bytes` is exceeded, so a peer streaming bytes with no
+/// newline cannot OOM the process. Uses the `AsyncBufRead` fill/consume API to
+/// avoid per-byte awaits. Returns the number of bytes read into `line`.
+async fn read_capped_line(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    line: &mut String,
+    max_bytes: usize,
+) -> Result<usize, IdentityError> {
+    let mut raw: Vec<u8> = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            break; // EOF
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            raw.extend_from_slice(&available[..=pos]);
+            let consumed = pos + 1;
+            reader.consume(consumed);
+            break;
+        }
+        raw.extend_from_slice(available);
+        let consumed = available.len();
+        reader.consume(consumed);
+        if raw.len() > max_bytes {
+            return Err(format!("sync frame exceeds max line size {max_bytes}").into());
+        }
+    }
+    if raw.len() > max_bytes {
+        return Err(format!("sync frame exceeds max line size {max_bytes}").into());
+    }
+    let n = raw.len();
+    match std::str::from_utf8(&raw) {
+        Ok(s) => line.push_str(s),
+        Err(_) => return Err("sync frame is not valid utf-8".into()),
+    }
+    Ok(n)
+}
+
+/// Capped read (G-4) with an optional idle deadline for the whole frame. On
+/// timeout the connection is errored (and the caller closes it), so a peer that
+/// stalls mid-frame cannot pin a reader task.
+async fn read_sync_line(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    line: &mut String,
+    max_bytes: usize,
+    timeout: Option<Duration>,
+) -> Result<usize, IdentityError> {
+    match timeout {
+        Some(d) => time::timeout(d, read_capped_line(reader, line, max_bytes))
+            .await
+            .map_err(|_| -> IdentityError { "sync read timeout".into() })?,
+        None => read_capped_line(reader, line, max_bytes).await,
+    }
 }
 
 async fn auth_read_line(
     reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
 ) -> Result<String, IdentityError> {
     let mut line = String::new();
-    let n = time::timeout(
-        Duration::from_secs(AUTH_HANDSHAKE_READ_TIMEOUT_SECS),
-        reader.read_line(&mut line),
+    let n = read_sync_line(
+        reader,
+        &mut line,
+        MAX_SYNC_LINE_BYTES,
+        Some(Duration::from_secs(AUTH_HANDSHAKE_READ_TIMEOUT_SECS)),
     )
-    .await
-    .map_err(|_| -> IdentityError { "auth handshake read timeout".into() })??;
+    .await?;
     if n == 0 {
         return Err("auth handshake: connection closed".into());
     }
@@ -3932,10 +4333,10 @@ async fn connect_and_auth(
 
 async fn handle_sync_connection(
     stream: TcpStream,
-    chunks: Vec<IdentityFullSyncChunk>,
+    chunks_req_tx: mpsc::UnboundedSender<oneshot::Sender<Arc<Vec<IdentityFullSyncChunk>>>>,
     ingest_tx: mpsc::Sender<IngestFrame>,
     auth_required: bool,
-) -> Result<Option<mpsc::UnboundedSender<IdentityDeltaEnvelope>>, IdentityError> {
+) -> Result<Option<mpsc::Sender<IdentityDeltaEnvelope>>, IdentityError> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     // Per-hive HMAC handshake before any protocol message (when required).
@@ -3944,31 +4345,44 @@ async fn handle_sync_connection(
     } else {
         None
     };
-    // Timed read (via auth_read_line) so a peer that completes the handshake
-    // then stalls cannot pin the inline-awaited accept path indefinitely.
+    // Timed read (via auth_read_line) plus this whole function now running in a
+    // per-connection task (F-02) so a peer that stalls cannot pin the main loop.
     let request_line = auth_read_line(&mut reader).await?;
     let request: IdentitySyncRequest = serde_json::from_str(&request_line)?;
     match request.operation.as_str() {
         SYNC_OP_FULL_SYNC_REQUEST => {
-            for chunk in chunks {
-                let encoded = serde_json::to_string(&chunk)?;
-                write_half.write_all(encoded.as_bytes()).await?;
-                write_half.write_all(b"\n").await?;
+            // Build the snapshot on-demand via the main loop (G-9: only for an
+            // authenticated FULL_SYNC, never eagerly per connection). The
+            // (potentially slow) streaming below runs in this spawned task, off
+            // the main loop (F-02), with per-write deadlines.
+            let (reply_tx, reply_rx) = oneshot::channel();
+            chunks_req_tx.send(reply_tx).map_err(|_| -> IdentityError {
+                "identity main loop unavailable for full sync".into()
+            })?;
+            let chunks = reply_rx
+                .await
+                .map_err(|_| -> IdentityError { "full sync snapshot request dropped".into() })?;
+            for chunk in chunks.iter() {
+                let encoded = serde_json::to_string(chunk)?;
+                write_timed(&mut write_half, encoded.as_bytes()).await?;
+                write_timed(&mut write_half, b"\n").await?;
             }
-            write_half.flush().await?;
+            flush_timed(&mut write_half).await?;
             Ok(None)
         }
         SYNC_OP_DELTA_SUBSCRIBE => {
-            let (tx, mut rx) = mpsc::unbounded_channel::<IdentityDeltaEnvelope>();
+            // Bounded (G-5): a slow subscriber whose queue fills is dropped by
+            // broadcast_deltas (it recovers via full-sync on reconnect) instead
+            // of buffering deltas without bound and exhausting primary memory.
+            let (tx, mut rx) =
+                mpsc::channel::<IdentityDeltaEnvelope>(IDENTITY_SUBSCRIBER_CHANNEL_CAP);
             let ack = json!({
                 "status": "ok",
                 "operation": "IDENTITY_DELTA_SUBSCRIBED"
             });
-            write_half
-                .write_all(serde_json::to_string(&ack)?.as_bytes())
-                .await?;
-            write_half.write_all(b"\n").await?;
-            write_half.flush().await?;
+            write_timed(&mut write_half, serde_json::to_string(&ack)?.as_bytes()).await?;
+            write_timed(&mut write_half, b"\n").await?;
+            flush_timed(&mut write_half).await?;
             tokio::spawn(async move {
                 while let Some(envelope) = rx.recv().await {
                     let encoded = match serde_json::to_string(&envelope) {
@@ -3980,13 +4394,13 @@ async fn handle_sync_connection(
                     };
                     let mut acked = false;
                     for attempt in 1..=IDENTITY_DELTA_MAX_RETRIES {
-                        if write_half.write_all(encoded.as_bytes()).await.is_err() {
+                        if write_timed(&mut write_half, encoded.as_bytes()).await.is_err() {
                             return;
                         }
-                        if write_half.write_all(b"\n").await.is_err() {
+                        if write_timed(&mut write_half, b"\n").await.is_err() {
                             return;
                         }
-                        if write_half.flush().await.is_err() {
+                        if flush_timed(&mut write_half).await.is_err() {
                             return;
                         }
                         match wait_for_delta_ack(&mut reader, envelope.seq).await {
@@ -4112,7 +4526,13 @@ async fn fetch_full_sync_from_primary(
 
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await?;
+        let n = read_sync_line(
+            &mut reader,
+            &mut line,
+            MAX_SYNC_LINE_BYTES,
+            Some(Duration::from_secs(IDENTITY_SYNC_READ_IDLE_SECS)),
+        )
+        .await?;
         if n == 0 {
             break;
         }
@@ -4140,6 +4560,15 @@ async fn fetch_full_sync_from_primary(
         let idx = chunk.chunk as usize;
         if total == 0 || idx == 0 || idx > total {
             return Err("invalid chunk numbering in full sync payload".into());
+        }
+        // G-7: bound the advertised chunk count BEFORE allocating the reassembly
+        // buffer, so a crafted/corrupted total_chunks cannot drive a huge alloc
+        // that aborts the process.
+        if total > MAX_FULL_SYNC_CHUNKS {
+            return Err(format!(
+                "full sync total_chunks {total} exceeds max {MAX_FULL_SYNC_CHUNKS}"
+            )
+            .into());
         }
 
         if let Some(expected) = expected_chunks {
@@ -4214,7 +4643,7 @@ fn push_local_deltas_upstream(
 }
 
 fn broadcast_deltas(
-    subscribers: &mut Vec<mpsc::UnboundedSender<IdentityDeltaEnvelope>>,
+    subscribers: &mut Vec<mpsc::Sender<IdentityDeltaEnvelope>>,
     deltas: &[IdentityDeltaEnvelope],
 ) {
     if deltas.is_empty() {
@@ -4222,7 +4651,10 @@ fn broadcast_deltas(
     }
     subscribers.retain(|tx| {
         for delta in deltas {
-            if tx.send(delta.clone()).is_err() {
+            // Non-blocking (G-5): a subscriber whose bounded queue is full (slow
+            // or stuck) is DROPPED rather than blocking the main loop or letting
+            // memory grow without bound. It recovers via full-sync on reconnect.
+            if tx.try_send(delta.clone()).is_err() {
                 return false;
             }
         }
@@ -4269,7 +4701,9 @@ async fn stream_deltas_from_primary(
     let mut last_seq: Option<u64> = None;
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await?;
+        // Size-capped (G-4) but NO idle timeout: this is a long-poll for deltas
+        // that may be sparse on a quiet mesh; a timeout would churn reconnects.
+        let n = read_sync_line(&mut reader, &mut line, MAX_SYNC_LINE_BYTES, None).await?;
         if n == 0 {
             return Ok(());
         }
@@ -4299,11 +4733,23 @@ async fn stream_deltas_from_primary(
                         continue;
                     }
                     if envelope.seq != last.saturating_add(1) {
-                        return Err(format!(
-                            "delta stream sequence gap/out-of-order: prev={} current={}",
-                            last, envelope.seq
-                        )
-                        .into());
+                        // F-05: a sequence gap means we missed one or more deltas
+                        // — possibly a revocation/demotion, which vault trusts
+                        // (lost => privilege RETENTION on this replica). The
+                        // replica store lives on the main loop and cannot be
+                        // swapped from this task, so recover the same way the
+                        // vault-secret path does: exit(0) and let systemd restart
+                        // us, which re-runs the boot full-sync and rebuilds a
+                        // consistent store. Silently re-subscribing (the old
+                        // behavior) would adopt the gap as a fresh baseline and
+                        // keep serving stale identity indefinitely.
+                        tracing::error!(
+                            prev = last,
+                            current = envelope.seq,
+                            "identity delta stream sequence gap; exiting for a clean full-sync \
+                             re-bootstrap on systemd-managed restart"
+                        );
+                        std::process::exit(0);
                     }
                 }
                 if sink.send(envelope.clone()).is_err() {
@@ -4323,12 +4769,13 @@ async fn wait_for_delta_ack(
     let mut line = String::new();
     loop {
         line.clear();
-        let read = time::timeout(
-            Duration::from_millis(IDENTITY_DELTA_ACK_TIMEOUT_MS),
-            reader.read_line(&mut line),
+        let read = read_sync_line(
+            reader,
+            &mut line,
+            MAX_SYNC_LINE_BYTES,
+            Some(Duration::from_millis(IDENTITY_DELTA_ACK_TIMEOUT_MS)),
         )
-        .await
-        .map_err(|_| "delta ack timeout".to_string())??;
+        .await?;
         if read == 0 {
             return Err("delta subscriber closed while waiting ack".into());
         }
@@ -4437,7 +4884,13 @@ async fn publish_to_primary(
 
     // Handshake ack (the primary confirms it accepted the publish channel).
     let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
+    let n = read_sync_line(
+        &mut reader,
+        &mut line,
+        MAX_SYNC_LINE_BYTES,
+        Some(Duration::from_secs(AUTH_HANDSHAKE_READ_TIMEOUT_SECS)),
+    )
+    .await?;
     if n == 0 {
         return Err("publish handshake connection closed".into());
     }
@@ -4507,7 +4960,10 @@ async fn run_publish_reader(
     let mut last_seq: Option<u64> = None;
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await?;
+        // Size-capped (G-4) but NO idle timeout: a replica's publish stream is a
+        // long-poll (reconcile snapshots + on-change deltas), sparse on a quiet
+        // mesh; a timeout would churn reconnects. The cap stops the OOM vector.
+        let n = read_sync_line(reader, &mut line, MAX_SYNC_LINE_BYTES, None).await?;
         if n == 0 {
             return Ok(());
         }
@@ -4826,8 +5282,14 @@ fn parse_prefixed_uuid(value: &str, prefix: &str) -> Result<Uuid, String> {
     Uuid::parse_str(raw).map_err(|_| "INVALID_REQUEST".to_string())
 }
 
+/// Validator for `ilk_type` arriving via ILK_REGISTER (frontdesk/orchestrator).
+/// External registrars may only mint `human`/`agent` principals. `"system"` is
+/// reserved for SY-internal creation (`ensure_system_ilks_from_hive`, driven by
+/// hive.yaml system_nodes) and is exactly the type `sy_vault::authorize_read`
+/// treats as a root-tenant pool master key — a compromised/buggy frontdesk must
+/// not be able to stamp an external identity `system`. (F-08)
 fn validate_ilk_type(value: &str) -> Result<(), String> {
-    if matches!(value.trim(), "human" | "agent" | "system") {
+    if matches!(value.trim(), "human" | "agent") {
         return Ok(());
     }
     Err("INVALID_REQUEST".to_string())
@@ -5063,6 +5525,26 @@ async fn ensure_primary_schema(database_config: &PgConfig) -> Result<(), Identit
         }
     });
 
+    // F-10: serialize concurrent schema runs (primary + a fast restart) with a
+    // session advisory lock, and keep an auditable, ordered version trail in
+    // identity_schema_migrations instead of ad-hoc CREATE/ALTER IF NOT EXISTS
+    // with no drift/version visibility. The current idempotent DDL is baseline
+    // "v1": existing DBs run it as a no-op and simply get stamped. Future
+    // breaking/backfill changes get their own numbered, transactional migration.
+    const IDENTITY_SCHEMA_LOCK_KEY: i64 = 0x1DEA_0001;
+    client
+        .execute("SELECT pg_advisory_lock($1)", &[&IDENTITY_SCHEMA_LOCK_KEY])
+        .await?;
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS identity_schema_migrations (\n\
+             version INTEGER PRIMARY KEY,\n\
+             name TEXT NOT NULL,\n\
+             applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n\
+             );",
+        )
+        .await?;
+
     client
         .batch_execute(
             r#"
@@ -5184,7 +5666,20 @@ CREATE INDEX IF NOT EXISTS idx_identity_ichs_owner
         )
         .await?;
 
-    tracing::info!("identity primary schema ensured");
+    // Stamp the baseline version (idempotent). Future migrations append higher
+    // versions, each in its own transaction, keyed off this table.
+    client
+        .execute(
+            "INSERT INTO identity_schema_migrations (version, name) VALUES (1, 'baseline') \
+             ON CONFLICT (version) DO NOTHING",
+            &[],
+        )
+        .await?;
+    let _ = client
+        .execute("SELECT pg_advisory_unlock($1)", &[&IDENTITY_SCHEMA_LOCK_KEY])
+        .await;
+
+    tracing::info!("identity primary schema ensured (baseline v1)");
     Ok(())
 }
 
@@ -6081,7 +6576,13 @@ fn extract_postgres_url_from_vault_value(value: &Value) -> Option<String> {
 /// reaction is `exit(0)` so systemd reboots the node and identity
 /// re-resolves vault with the secret cleanly. See `handle_vault_secret_changed`
 /// in `sy_storage.rs` for the rationale (Model D' VA-J'-13).
-fn handle_vault_secret_changed(msg: &Message, is_primary: bool, node_name: &str) {
+fn handle_vault_secret_changed(
+    msg: &Message,
+    is_primary: bool,
+    node_name: &str,
+    src_l2_name: Option<&str>,
+    hive_id: &str,
+) {
     tracing::info!(
         node_name = %node_name,
         is_primary = is_primary,
@@ -6095,6 +6596,25 @@ fn handle_vault_secret_changed(msg: &Message, is_primary: bool, node_name: &str)
             "sy.identity handle_vault_secret_changed: not primary, ignoring"
         );
         return;
+    }
+    // Fail-closed origin check: the reaction is exit(0) (systemd restart), so
+    // only the LOCAL SY.vault may trigger it. src_l2_name is stamped
+    // authoritatively by the router; a VAULT_SECRET_CHANGED forged by any other
+    // node (or another hive's vault) must NOT be able to restart-loop the
+    // identity primary. (F-03: this handler runs before is_authorized, and the
+    // auth table has no entry for this action, so this is the enforced gate.)
+    let expected_origin = format!("SY.vault@{}", hive_id.trim());
+    match src_l2_name.map(str::trim) {
+        Some(origin) if origin == expected_origin => {}
+        other => {
+            tracing::warn!(
+                node_name = %node_name,
+                src_l2_name = %other.unwrap_or("<none>"),
+                expected = %expected_origin,
+                "VAULT_SECRET_CHANGED from a non-vault / cross-hive origin; refusing to restart identity"
+            );
+            return;
+        }
     }
     let payload: VaultSecretChangedPayload = match serde_json::from_value(msg.payload.clone()) {
         Ok(p) => p,
@@ -7300,7 +7820,10 @@ mod tests {
         let hive = node_name.rsplit_once('@').map(|(_, h)| h).unwrap_or("");
         IlkRecord {
             ilk_id: ilk_id.to_string(),
-            ilk_type: "system".to_string(),
+            // Non-privileged default so per-hive OWNERSHIP tests are not entangled
+            // with the system-type authority binding (tested separately). Tests
+            // that need a `system` ilk set it explicitly.
+            ilk_type: "agent".to_string(),
             registration_status: "complete".to_string(),
             tenant_id: "tnt:00000000-0000-0000-0000-000000000001".to_string(),
             identification: json!({ "node_name": node_name, "hive_id": hive }),
@@ -7492,5 +8015,179 @@ mod tests {
         assert!(owned
             .iter()
             .all(|i| ilk_owning_hive(i).as_deref() == Some("worker1")));
+    }
+
+    // ---- F-01: fail-closed identity.sync.auth ----
+    #[test]
+    fn auth_mode_required_is_fail_closed() {
+        // Absent / empty / whitespace / typo => REQUIRED.
+        assert!(auth_mode_required(None));
+        assert!(auth_mode_required(Some("")));
+        assert!(auth_mode_required(Some("   ")));
+        assert!(auth_mode_required(Some("require")));
+        assert!(auth_mode_required(Some("requird")));
+        assert!(auth_mode_required(Some("enabled")));
+        assert!(auth_mode_required(Some("true")));
+        // Explicit required (any case / padding) => required.
+        assert!(auth_mode_required(Some("required")));
+        assert!(auth_mode_required(Some("REQUIRED")));
+        assert!(auth_mode_required(Some("  Required  ")));
+        // Only the explicit opt-out tokens disable auth.
+        assert!(!auth_mode_required(Some("disabled")));
+        assert!(!auth_mode_required(Some("off")));
+        assert!(!auth_mode_required(Some("none")));
+        assert!(!auth_mode_required(Some("  DISABLED ")));
+    }
+
+    // ---- G-3: fail-safe SHM ilk_type default ----
+    #[test]
+    fn parse_ilk_type_for_shm_fails_safe_to_human() {
+        assert_eq!(parse_ilk_type_for_shm("human"), SHM_ILK_TYPE_HUMAN);
+        assert_eq!(parse_ilk_type_for_shm("agent"), SHM_ILK_TYPE_AGENT);
+        assert_eq!(parse_ilk_type_for_shm("system"), SHM_ILK_TYPE_SYSTEM);
+        // Unknown / empty / mis-cased must NOT become the privileged system type.
+        assert_eq!(parse_ilk_type_for_shm(""), SHM_ILK_TYPE_HUMAN);
+        assert_eq!(parse_ilk_type_for_shm("System"), SHM_ILK_TYPE_HUMAN);
+        assert_eq!(parse_ilk_type_for_shm("worker"), SHM_ILK_TYPE_HUMAN);
+    }
+
+    // ---- G-1: replica may assert ilk_type=system only for its deterministic SY ilk ----
+    #[test]
+    fn ingest_system_ilk_type_bound_to_deterministic_shape() {
+        // Non-system types are always allowed for an owned ilk.
+        assert!(ingest_ilk_type_authorized(&ilk_for("AI.bot@worker1", "ilk:a"), "worker1"));
+        // A genuine deterministic SY.* system ilk of the publisher is allowed.
+        let node = "SY.vault@worker1";
+        let mut sys = ilk_for(node, &deterministic_system_ilk_id(node));
+        sys.ilk_type = "system".to_string();
+        assert!(ingest_ilk_type_authorized(&sys, "worker1"));
+        // Relabelling an arbitrary owned (non-SY) ilk as system is rejected.
+        let mut evil = ilk_for("AI.evil@worker1", "ilk:evil");
+        evil.ilk_type = "system".to_string();
+        assert!(!ingest_ilk_type_authorized(&evil, "worker1"));
+        // SY-named but non-deterministic ilk_id is rejected (id must match shape).
+        let mut fake = ilk_for("SY.vault@worker1", "ilk:not-the-real-id");
+        fake.ilk_type = "system".to_string();
+        assert!(!ingest_ilk_type_authorized(&fake, "worker1"));
+        // Ownership still required: a deterministic system ilk of ANOTHER hive.
+        let node2 = "SY.vault@worker2";
+        let mut other = ilk_for(node2, &deterministic_system_ilk_id(node2));
+        other.ilk_type = "system".to_string();
+        assert!(!ingest_ilk_type_authorized(&other, "worker1"));
+    }
+
+    #[test]
+    fn delta_authority_rejects_forged_system_ilk_type() {
+        let store = IdentityStore::default();
+        // A replica cannot mint a system-typed identity for an arbitrary owned ilk.
+        let mut evil = ilk_for("AI.evil@worker1", "ilk:evil");
+        evil.ilk_type = "system".to_string();
+        assert!(!delta_authorized_for_hive(
+            &IdentityDelta::IlkUpsert { ilk: evil },
+            "worker1",
+            &store
+        ));
+        // It CAN push its own agent ilk and its genuine deterministic system ilk.
+        assert!(delta_authorized_for_hive(
+            &IdentityDelta::IlkUpsert { ilk: ilk_for("AI.ok@worker1", "ilk:ok") },
+            "worker1",
+            &store
+        ));
+        let node = "SY.vault@worker1";
+        let mut sys = ilk_for(node, &deterministic_system_ilk_id(node));
+        sys.ilk_type = "system".to_string();
+        assert!(delta_authorized_for_hive(
+            &IdentityDelta::IlkUpsert { ilk: sys },
+            "worker1",
+            &store
+        ));
+    }
+
+    // ---- G-2: AliasUpsert authority must own BOTH endpoints, never shadow system ----
+    #[test]
+    fn alias_upsert_authority_requires_both_endpoints_owned() {
+        let mut store = IdentityStore::default();
+        store
+            .ilks
+            .insert("ilk:mb".into(), ilk_for("SY.vault@motherbee", "ilk:mb"));
+        store
+            .ilks
+            .insert("ilk:w-old".into(), ilk_for("AI.old@worker1", "ilk:w-old"));
+        store
+            .ilks
+            .insert("ilk:w-canon".into(), ilk_for("AI.canon@worker1", "ilk:w-canon"));
+        let alias = |old: &str, canon: &str| IdentityDelta::AliasUpsert {
+            alias: AliasSnapshotRecord {
+                old_ilk_id: old.to_string(),
+                canonical_ilk_id: canon.to_string(),
+                expires_at_ms: 9_999_999_999_999,
+            },
+        };
+        // Legit merge: both endpoints owned by worker1.
+        assert!(delta_authorized_for_hive(
+            &alias("ilk:w-old", "ilk:w-canon"),
+            "worker1",
+            &store
+        ));
+        // Hijack: redirect motherbee's ilk onto a worker1 ilk — old_ilk_id not
+        // owned by worker1 => rejected (G-2 core).
+        assert!(!delta_authorized_for_hive(
+            &alias("ilk:mb", "ilk:w-canon"),
+            "worker1",
+            &store
+        ));
+        // Unknown source, and canonical-not-owned, both rejected.
+        assert!(!delta_authorized_for_hive(
+            &alias("ilk:nope", "ilk:w-canon"),
+            "worker1",
+            &store
+        ));
+        assert!(!delta_authorized_for_hive(
+            &alias("ilk:w-old", "ilk:mb"),
+            "worker1",
+            &store
+        ));
+        // Even an OWNED well-known system ilk may not be an alias source.
+        let mut wk = ilk_for("SY.identity@worker1", "ilk:wk");
+        wk.identification = json!({
+            "node_name": "SY.identity@worker1", "hive_id": "worker1", "source": "hive.system_nodes"
+        });
+        store.ilks.insert("ilk:wk".into(), wk);
+        assert!(!delta_authorized_for_hive(
+            &alias("ilk:wk", "ilk:w-canon"),
+            "worker1",
+            &store
+        ));
+    }
+
+    // ---- F-07: privileged SY roles are same-hive-only; IO/orchestrator cross-hive ----
+    #[test]
+    fn is_authorized_scopes_privileged_sy_roles_to_own_hive() {
+        let hive = test_hive(Some("SY.frontdesk.gov@motherbee"));
+        let runtime = IdentityRuntime::new(&hive, PathBuf::from("/tmp"), true, None);
+        // Same-hive privileged roles allowed.
+        assert!(runtime.is_authorized(MSG_TNT_CREATE, Some("SY.admin@motherbee")));
+        assert!(runtime.is_authorized("CONFIG_SET", Some("SY.admin@motherbee")));
+        assert!(runtime.is_authorized(MSG_ILK_SET_DEFINITION, Some("SY.architect@motherbee")));
+        // Cross-hive privileged SY roles REJECTED.
+        assert!(!runtime.is_authorized(MSG_TNT_CREATE, Some("SY.admin@worker1")));
+        assert!(!runtime.is_authorized("CONFIG_SET", Some("SY.admin@worker1")));
+        assert!(!runtime.is_authorized(MSG_ILK_SET_DEFINITION, Some("SY.architect@worker1")));
+        assert!(!runtime.is_authorized(MSG_TNT_CREATE, Some("SY.frontdesk.gov@worker1")));
+        // IO provisioning stays legitimately cross-hive.
+        assert!(runtime.is_authorized(MSG_ILK_PROVISION, Some("IO.api@worker1")));
+        // Orchestrator control-plane stays legitimately cross-hive.
+        assert!(runtime.is_authorized(MSG_ILK_REGISTER, Some("SY.orchestrator@worker1")));
+        assert!(runtime.is_authorized(MSG_ILK_DELETE, Some("SY.orchestrator@worker1")));
+    }
+
+    // ---- F-08: ILK_REGISTER may not mint 'system' ----
+    #[test]
+    fn register_ilk_type_rejects_system() {
+        assert!(validate_ilk_type("human").is_ok());
+        assert!(validate_ilk_type("agent").is_ok());
+        assert!(validate_ilk_type("system").is_err());
+        assert!(validate_ilk_type("System").is_err());
+        assert!(validate_ilk_type(" system ").is_err());
     }
 }

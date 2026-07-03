@@ -16,6 +16,17 @@ PG_URL="postgresql://${PG_USER}:${PG_PASS}@127.0.0.1:5432"
 ROOT_TENANT="tnt:00000000-0000-0000-0000-000000000001"
 HIVE_ID="$(awk -F': ' '/^hive_id:/{gsub(/"/,"",$2);print $2;exit}' /etc/fluxbee/hive.yaml 2>/dev/null || echo motherbee)"
 
+wait_hive_ready() {
+  local attempts="${1:-60}"
+  local r=""
+  for _ in $(seq 1 "$attempts"); do
+    r="$(curl -s -m3 "$ADMIN/hives" 2>/dev/null || true)"
+    case "$r" in *'"status":"ok"'*) echo "  HIVE READY"; return 0;; esac
+    sleep 2
+  done
+  return 1
+}
+
 echo "== [1/5] postgresql + DB bootstrap =="
 systemctl enable --now postgresql 2>/dev/null \
   || pg_ctlcluster "$(ls /usr/lib/postgresql/ 2>/dev/null | head -1)" main start 2>/dev/null || true
@@ -49,17 +60,28 @@ done
 # secret changes; here we just want the consumers to acquire the existing one).
 # Finally re-kick the orchestrator so its sy-storage readiness gate passes.
 echo "== [4/5] reconnect DB consumers (vault up first, consumers pull the secret) =="
-systemctl restart sy-vault 2>/dev/null || true
-sleep 6
-systemctl restart sy-storage sy-identity 2>/dev/null || true
-sleep 6
-systemctl reset-failed sy-orchestrator 2>/dev/null || true
-systemctl restart sy-orchestrator
+HIVE_READY=0
+for attempt in $(seq 1 6); do
+  systemctl restart sy-vault 2>/dev/null || true
+  sleep 4
+  systemctl restart sy-storage sy-identity 2>/dev/null || true
+  sleep 4
+  systemctl reset-failed sy-orchestrator 2>/dev/null || true
+  systemctl restart sy-orchestrator 2>/dev/null || true
+  if wait_hive_ready 10; then
+    HIVE_READY=1
+    break
+  fi
+  echo "  DB reconnect attempt $attempt did not reach hive ready; retrying"
+done
 
 echo "== [5/5] wait hive ready =="
-for _ in $(seq 1 60); do
-  curl -s -m3 "$ADMIN/hives" 2>/dev/null | grep -q '"status":"ok"' && { echo "  HIVE READY"; break; }
-  sleep 2
-done
+if [ "$HIVE_READY" != "1" ] && wait_hive_ready 60; then
+  HIVE_READY=1
+fi
 echo -n "services: "; systemctl is-active rt-gateway sy-orchestrator sy-identity sy-admin sy-vault sy-storage sy-architect 2>&1 | tr '\n' ' '; echo
+if [ "$HIVE_READY" != "1" ]; then
+  echo "first-boot failed: hive did not become ready." >&2
+  exit 1
+fi
 echo "first-boot done."

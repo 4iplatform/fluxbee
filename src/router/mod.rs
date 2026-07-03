@@ -4785,7 +4785,11 @@ fn inject_identity_data(root: &mut serde_json::Value, snapshot: &crate::shm::Ide
             0 => "human",
             1 => "agent",
             2 => "system",
-            _ => "system",
+            // Fail SAFE: an out-of-range byte must NOT be up-converted to the
+            // privileged `system` type in the OPA input. Present it as "unknown"
+            // (matching the SDK's ilk_type_from_shm) so any policy gating on
+            // ilk_type == "system" denies rather than grants.
+            _ => "unknown",
         };
         let handler_node = fixed_str(&ilk.handler_node);
         let payload = serde_json::json!({

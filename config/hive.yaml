@@ -29,6 +29,11 @@ storage:
 identity:
   sync:
     port: 9100
+    # Per-hive HMAC auth on the :9100 replication channel. REQUIRED by default
+    # (the code fails closed even if this line is absent). Only set to "disabled"
+    # on a strictly isolated/loopback network — it lets any reachable host
+    # exfiltrate and poison identity state.
+    auth: required
 
 # Government/frontdesk wiring.
 government:
