@@ -102,6 +102,10 @@ pub fn load_runtime_snapshot(
                 status: row.get(2)?,
                 report_to_kind: row.get(3)?,
                 report_to_url: row.get(4)?,
+                // The SQLite mirror does not track node-reported control state;
+                // the JSON state is the source of truth for these.
+                operational_state: None,
+                last_node_directive: None,
             });
         }
     }

@@ -7,7 +7,7 @@ mod runtime_db;
 mod self_update;
 mod state;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -88,6 +88,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             version,
             partitions_root,
             interval_seconds,
+            admin_resync_seconds,
             once,
         } => {
             let mut state = if state_path.exists() {
@@ -134,6 +135,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &state_path,
                 partitions_root,
                 interval_seconds,
+                admin_resync_seconds,
                 once,
             )?;
         }
@@ -280,6 +282,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 partitions_root.as_deref(),
                 started_at,
                 false,
+                CloudContact::Forced,
+                false,
             )?;
 
             print_json(&serde_json::json!({
@@ -290,7 +294,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "status": cycle.status,
                 "lhRootStatus": cycle.lh_root_status,
                 "instancesCount": cycle.instances_count,
-                "compatibility": cycle.alive_response.compatibility,
+                "compatibility": cycle.alive_response.as_ref().map(|response| &response.compatibility),
             }))?;
         }
         AdapterCommand::Scan { partitions_root } => {
@@ -339,6 +343,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         AdapterCommand::Run {
             partitions_root,
             interval_seconds,
+            admin_resync_seconds,
             once,
         } => {
             let mut state = read_adapter_state_with_runtime(&state_path)?;
@@ -347,6 +352,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &state_path,
                 partitions_root,
                 interval_seconds,
+                admin_resync_seconds,
                 once,
             )?;
         }
@@ -355,14 +361,86 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Whether a cycle must contact Fluxbee Cloud (`Forced`, e.g. the explicit
+/// `alive` command) or only when there is pending administrative work
+/// (`OnDemand`, the service loop). `OnDemand` is what reduces Cloud to an
+/// administrative control plane instead of a permanent heartbeat target: the
+/// adapter contacts Cloud only while it is waiting on an administrative
+/// definition (enrollment, approval, provisioning) or a node directive told it
+/// to reconsider — never as a periodic keepalive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloudContact {
+    Forced,
+    OnDemand,
+}
+
 struct AliveCycleResult {
     status: String,
     lh_root_status: String,
     instances_count: usize,
     discovery_sent: bool,
+    /// True when this cycle actually contacted Cloud (discovery and/or alive).
+    cloud_contacted: bool,
     warnings: Vec<String>,
-    alive_response: cloud_client::AdapterAliveResponse,
+    /// Present only when Cloud was contacted this cycle (`None` on a pure
+    /// runtime cycle that only polled the node).
+    alive_response: Option<cloud_client::AdapterAliveResponse>,
     node_reports: Vec<Value>,
+}
+
+/**
+ * Decides whether the adapter has administrative work that requires contacting
+ * Fluxbee Cloud. In the on-demand model the adapter talks to Cloud only while it
+ * is waiting on an administrative definition or a node asked it to reconsider;
+ * once every discovered instance is actively bound to a runtime destination it
+ * goes quiet on the Cloud plane and keeps only the adapter↔node runtime poll.
+ */
+fn has_pending_admin_work(state: &AdapterState, discovery_changed: bool) -> bool {
+    // A node directive asked the adapter to re-obtain its destination or recover
+    // credentials.
+    if state.runtime.needs_admin_sync {
+        return true;
+    }
+    if state.runtime.adapter_status.as_deref() == Some("needs_reenrollment") {
+        return true;
+    }
+    // Local discovery changed → Cloud must be told (new/removed local instances).
+    if discovery_changed {
+        return true;
+    }
+    // Any discovered (non-ignored) instance Cloud has not yet turned into an
+    // active binding with a runtime destination → still awaiting approval /
+    // provisioning, so keep polling Cloud.
+    state.runtime.cloud_discovered_instances.iter().any(|discovered| {
+        if discovered.status.eq_ignore_ascii_case("ignored") {
+            return false;
+        }
+        let actively_bound = state.runtime.desired_bindings.iter().any(|binding| {
+            binding.local_instance_id == discovered.local_instance_id
+                && binding.status == "active"
+                && binding
+                    .report_to_url
+                    .as_deref()
+                    .map(|url| !url.trim().is_empty())
+                    .unwrap_or(false)
+        });
+        !actively_bound
+    })
+}
+
+/**
+ * Decides whether the optional slow administrative re-sync is due. Off (returns
+ * false) when no interval is configured — the default pure on-demand model. When
+ * configured, Cloud is contacted at least once per interval even with no pending
+ * work (and always once per process start, when there is no prior contact yet),
+ * so Cloud can push updates/admin changes to an otherwise-quiet adapter.
+ */
+fn admin_resync_due(interval_seconds: Option<u64>, since_last_contact: Option<Duration>) -> bool {
+    match (interval_seconds.filter(|value| *value > 0), since_last_contact) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(interval), Some(elapsed)) => elapsed.as_secs() >= interval,
+    }
 }
 
 /**
@@ -379,10 +457,17 @@ fn run_service_loop(
     state_path: &Path,
     partitions_root: Option<String>,
     interval_seconds: Option<u64>,
+    admin_resync_seconds: Option<u64>,
     once: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(value) = interval_seconds {
         state.poll_interval_seconds = value.max(5);
+        persist_adapter_state_artifacts(state_path, state)?;
+    }
+    if let Some(value) = admin_resync_seconds {
+        // 0 disables the slow re-sync (pure on-demand); any positive value is the
+        // floor cadence at which Cloud is contacted even with no pending work.
+        state.admin_resync_interval_seconds = if value == 0 { None } else { Some(value) };
         persist_adapter_state_artifacts(state_path, state)?;
     }
 
@@ -415,14 +500,27 @@ fn run_service_loop(
     let mut announced_update_releases: HashSet<String> = HashSet::new();
 
     let started_at = Instant::now();
+    // Wall-clock of the last cycle that actually contacted Cloud, tracked
+    // in-memory to drive the optional slow admin re-sync. `None` on process
+    // start means the first cycle re-syncs (also covers restarts).
+    let mut last_cloud_contact: Option<Instant> = None;
     loop {
+        let resync_due = admin_resync_due(
+            state.admin_resync_interval_seconds,
+            last_cloud_contact.map(|instant| instant.elapsed()),
+        );
         let cycle = run_alive_cycle(
             state,
             state_path,
             partitions_root.as_deref(),
             started_at,
             true,
+            CloudContact::OnDemand,
+            resync_due,
         )?;
+        if cycle.cloud_contacted {
+            last_cloud_contact = Some(Instant::now());
+        }
 
         if !update_finalized {
             finalize_pending_update(state, state_path)?;
@@ -437,23 +535,33 @@ fn run_service_loop(
             "status": cycle.status,
             "lhRootStatus": cycle.lh_root_status,
             "instancesCount": cycle.instances_count,
+            "cloudContacted": cycle.cloud_contacted,
             "discoverySent": cycle.discovery_sent,
-            "desiredStateChanged": cycle.alive_response.desired_state_changed,
-            "desiredStateVersion": cycle.alive_response.desired_state_version,
-            "compatibility": cycle.alive_response.compatibility,
+            "desiredStateChanged": cycle
+                .alive_response
+                .as_ref()
+                .map(|response| response.desired_state_changed),
+            "desiredStateVersion": cycle
+                .alive_response
+                .as_ref()
+                .map(|response| response.desired_state_version),
+            "compatibility": cycle.alive_response.as_ref().map(|response| &response.compatibility),
             "warnings": cycle.warnings,
             "nodeReports": cycle.node_reports,
         }))?;
 
-        // Evaluate the Cloud update directive. A required update that applies
-        // successfully re-execs and never returns here.
-        maybe_apply_update(
-            state,
-            state_path,
-            &cycle.alive_response.update,
-            &mut failed_update_releases,
-            &mut announced_update_releases,
-        );
+        // Evaluate the Cloud update directive only when Cloud was contacted this
+        // cycle (on-demand model). A required update that applies successfully
+        // re-execs and never returns here.
+        if let Some(alive_response) = &cycle.alive_response {
+            maybe_apply_update(
+                state,
+                state_path,
+                &alive_response.update,
+                &mut failed_update_releases,
+                &mut announced_update_releases,
+            );
+        }
 
         if once {
             break;
@@ -721,15 +829,40 @@ fn apply_alive_desired_state(
     state.runtime.last_known_desired_state_version = Some(alive_response.desired_state_version);
 
     if let Some(desired_state) = &alive_response.desired_state {
+        // Cloud owns kind/url/status; the node-reported control state
+        // (operational_state / last directive) is preserved across a rebuild so
+        // a version bump doesn't drop it before the next node poll repopulates it.
+        let previous: HashMap<String, (Option<String>, Option<String>)> = state
+            .runtime
+            .desired_bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.local_instance_id.clone(),
+                    (
+                        binding.operational_state.clone(),
+                        binding.last_node_directive.clone(),
+                    ),
+                )
+            })
+            .collect();
         state.runtime.desired_bindings = desired_state
             .bindings
             .iter()
-            .map(|binding| AdapterDesiredBindingState {
-                local_instance_id: binding.local_instance_id.clone(),
-                managed_instance_id: binding.managed_instance_id.clone(),
-                status: binding.status.clone(),
-                report_to_kind: binding.report_to.as_ref().map(|report_to| report_to.kind.clone()),
-                report_to_url: binding.report_to.as_ref().map(|report_to| report_to.url.clone()),
+            .map(|binding| {
+                let (operational_state, last_node_directive) = previous
+                    .get(&binding.local_instance_id)
+                    .cloned()
+                    .unwrap_or((None, None));
+                AdapterDesiredBindingState {
+                    local_instance_id: binding.local_instance_id.clone(),
+                    managed_instance_id: binding.managed_instance_id.clone(),
+                    status: binding.status.clone(),
+                    report_to_kind: binding.report_to.as_ref().map(|report_to| report_to.kind.clone()),
+                    report_to_url: binding.report_to.as_ref().map(|report_to| report_to.url.clone()),
+                    operational_state,
+                    last_node_directive,
+                }
             })
             .collect();
     }
@@ -780,6 +913,8 @@ fn run_alive_cycle(
     partitions_root_arg: Option<&str>,
     started_at: Instant,
     send_discovery_if_changed: bool,
+    cloud_contact: CloudContact,
+    resync_due: bool,
 ) -> Result<AliveCycleResult, Box<dyn std::error::Error>> {
     let partitions_root = resolve_partitions_root(state, partitions_root_arg);
     let scan_started_at = current_timestamp_iso();
@@ -815,17 +950,86 @@ fn run_alive_cycle(
         .collect();
     let discovery_hash = compute_discovery_hash(&discovery_items)?;
     let now = current_timestamp_iso();
+    let discovery_changed = state.runtime.last_discovery_hash.as_ref() != Some(&discovery_hash);
+
+    // On-demand Cloud contact: the explicit `alive` command forces it; the
+    // service loop contacts Cloud only while there is pending administrative work
+    // (waiting on approval/provisioning, or a node directive told the adapter to
+    // reconsider). Otherwise this is a pure runtime cycle: scan + poll the node,
+    // no Cloud call.
+    let contact_cloud = matches!(cloud_contact, CloudContact::Forced)
+        || has_pending_admin_work(state, discovery_changed)
+        || resync_due;
+
     let mut discovery_sent = false;
-    if send_discovery_if_changed
-        && status != "needs_reenrollment"
-        && state.runtime.last_discovery_hash.as_ref() != Some(&discovery_hash)
-    {
-        let discovery_response = match send_discovery(
-            &state.sync_config.discovery_url,
+    let mut alive_response: Option<cloud_client::AdapterAliveResponse> = None;
+
+    if contact_cloud {
+        if send_discovery_if_changed && status != "needs_reenrollment" && discovery_changed {
+            let discovery_response = match send_discovery(
+                &state.sync_config.discovery_url,
+                &state.adapter_secret,
+                &AdapterDiscoveryRequest {
+                    adapter_type: state.adapter_type.clone(),
+                    instances: discovery_items,
+                },
+            ) {
+                Ok(response) => response,
+                Err(error) => {
+                    persist_cloud_error_state(state, state_path, &error, &status)?;
+                    return Err(Box::new(error));
+                }
+            };
+
+            state.runtime.last_successful_discovery_at = Some(now.clone());
+            state.runtime.last_discovery_hash = Some(discovery_hash);
+            state.runtime.cloud_last_response_status = Some(String::from("discovery_accepted"));
+            state.runtime.cloud_discovered_instances = discovery_response
+                .result
+                .items
+                .iter()
+                .map(|item| AdapterCloudDiscoveredInstanceState {
+                    discovered_instance_id: item.discovered_instance_id.clone(),
+                    local_instance_id: item.local_instance_id.clone(),
+                    status: item.status.clone(),
+                    managed_instance_id: item.managed_instance_id.clone(),
+                    report_to: item.report_to.clone(),
+                })
+                .collect();
+            discovery_sent = true;
+        }
+
+        let response = match send_alive(
+            &state.alive_url(),
             &state.adapter_secret,
-            &AdapterDiscoveryRequest {
+            &AdapterAliveRequest {
                 adapter_type: state.adapter_type.clone(),
-                instances: discovery_items,
+                adapter_version: ADAPTER_VERSION.to_string(),
+                adapter_build: state.adapter_build.clone(),
+                os: current_os(),
+                arch: current_arch(),
+                status: status.clone(),
+                reported_at: now.clone(),
+                last_known_desired_state_version: state.runtime.last_known_desired_state_version,
+                service: Some(AdapterAliveServicePayload {
+                    mode: Some(String::from("daemon")),
+                    uptime_seconds: Some(started_at.elapsed().as_secs()),
+                    last_successful_discovery_at: state.runtime.last_successful_discovery_at.clone(),
+                    last_error_code: state.runtime.last_error_code.clone(),
+                    last_error_message: state.runtime.last_error_message.clone(),
+                }),
+                linkedhelper: Some(AdapterAliveLinkedHelperPayload {
+                    lh_root_status: Some(lh_root_status.clone()),
+                    lh_root_path: partitions_root.clone(),
+                    instances_count: Some(instances_count),
+                    schema_signature: Some(compute_schema_signature(&scan_result)?),
+                    compatibility_status: Some(compatibility_status.clone()),
+                    capabilities: Some(vec![
+                        String::from("linkedhelper.discovery.v1"),
+                        String::from("linkedhelper.li_accounts.v1"),
+                        String::from("linkedhelper.summary.v1"),
+                    ]),
+                }),
             },
         ) {
             Ok(response) => response,
@@ -835,83 +1039,43 @@ fn run_alive_cycle(
             }
         };
 
-        state.runtime.last_successful_discovery_at = Some(now.clone());
-        state.runtime.last_discovery_hash = Some(discovery_hash);
-        state.runtime.cloud_last_response_status = Some(String::from("discovery_accepted"));
-        state.runtime.cloud_discovered_instances = discovery_response
-            .result
-            .items
-            .iter()
-            .map(|item| AdapterCloudDiscoveredInstanceState {
-                discovered_instance_id: item.discovered_instance_id.clone(),
-                local_instance_id: item.local_instance_id.clone(),
-                status: item.status.clone(),
-                managed_instance_id: item.managed_instance_id.clone(),
-                report_to: item.report_to.clone(),
-            })
-            .collect();
-        discovery_sent = true;
+        apply_alive_desired_state(state, &response);
+        state.runtime.adapter_status = Some(status.clone());
+        state.runtime.last_successful_alive_at = Some(now.clone());
+        state.runtime.cloud_last_response_status = Some(response.adapter_status.clone());
+        state.runtime.last_error_code = None;
+        state.runtime.last_error_message = None;
+        // A successful alive IS the administrative sync: clear the pending-admin
+        // flag. A node directive below may re-raise it, which reopens the cycle
+        // on the next (on-demand) contact with Cloud.
+        state.runtime.needs_admin_sync = false;
+        alive_response = Some(response);
+    } else {
+        // Pure runtime cycle — no pending administrative work, so Cloud is not
+        // contacted; just refresh the locally-derived status.
+        state.runtime.adapter_status = Some(status.clone());
     }
 
-    let alive_response = match send_alive(
-        &state.alive_url(),
-        &state.adapter_secret,
-        &AdapterAliveRequest {
-            adapter_type: state.adapter_type.clone(),
-            adapter_version: ADAPTER_VERSION.to_string(),
-            adapter_build: state.adapter_build.clone(),
-            os: current_os(),
-            arch: current_arch(),
-            status: status.clone(),
-            reported_at: now.clone(),
-            last_known_desired_state_version: state.runtime.last_known_desired_state_version,
-            service: Some(AdapterAliveServicePayload {
-                mode: Some(String::from("daemon")),
-                uptime_seconds: Some(started_at.elapsed().as_secs()),
-                last_successful_discovery_at: state.runtime.last_successful_discovery_at.clone(),
-                last_error_code: state.runtime.last_error_code.clone(),
-                last_error_message: state.runtime.last_error_message.clone(),
-            }),
-            linkedhelper: Some(AdapterAliveLinkedHelperPayload {
-                lh_root_status: Some(lh_root_status.clone()),
-                lh_root_path: partitions_root.clone(),
-                instances_count: Some(instances_count),
-                schema_signature: Some(compute_schema_signature(&scan_result)?),
-                compatibility_status: Some(compatibility_status.clone()),
-                capabilities: Some(vec![
-                    String::from("linkedhelper.discovery.v1"),
-                    String::from("linkedhelper.li_accounts.v1"),
-                    String::from("linkedhelper.summary.v1"),
-                ]),
-            }),
-        },
-    ) {
-        Ok(response) => response,
-        Err(error) => {
-            persist_cloud_error_state(state, state_path, &error, &status)?;
-            return Err(Box::new(error));
-        }
-    };
-
-    apply_alive_desired_state(state, &alive_response);
-    state.runtime.adapter_status = Some(status.clone());
-    state.runtime.last_successful_alive_at = Some(now.clone());
+    // Scan-derived runtime fields are refreshed every cycle, whether or not Cloud
+    // was contacted.
     state.runtime.last_scan_at = Some(scan_started_at);
     state.runtime.last_seen_instances_count = Some(instances_count);
     state.runtime.lh_root_status = Some(lh_root_status.clone());
-    state.runtime.cloud_last_response_status = Some(alive_response.adapter_status.clone());
-    state.runtime.last_error_code = None;
-    state.runtime.last_error_message = None;
 
     persist_adapter_state_artifacts(state_path, state)?;
 
-    let node_reports = report_active_bindings_to_nodes(state, &now);
+    let (node_reports, control_summary) = report_active_bindings_to_nodes(state, &now);
+    apply_node_control_summary(state, &control_summary);
+    if control_summary.changed_state() {
+        persist_adapter_state_artifacts(state_path, state)?;
+    }
 
     Ok(AliveCycleResult {
         status,
         lh_root_status,
         instances_count,
         discovery_sent,
+        cloud_contacted: contact_cloud,
         warnings: scan_result.warnings,
         alive_response,
         node_reports,
@@ -919,12 +1083,74 @@ fn run_alive_cycle(
 }
 
 /**
- * Reports each active binding to its IO.linkedhelper node over the intermediate
- * `direct_node_http` path. This phase only sends heartbeats (no events yet).
- * A node being unreachable is recorded per binding and never aborts the cycle.
+ * Aggregated reaction to the node control directives collected while polling.
+ * Applied to the adapter state after the poll loop (borrow-safe).
  */
-fn report_active_bindings_to_nodes(state: &AdapterState, now: &str) -> Vec<Value> {
+#[derive(Debug, Default)]
+struct NodeControlSummary {
+    /// A node asked the adapter to re-obtain its runtime destination from Cloud
+    /// (stale instance→node mapping); reopens the administrative cycle.
+    needs_admin_sync: bool,
+    /// A node reported the adapter's credentials as invalid; recover them from Cloud.
+    needs_reenrollment: bool,
+    /// (local_instance_id, operational_state, directive) to persist per binding.
+    binding_updates: Vec<(String, Option<String>, Option<String>)>,
+}
+
+impl NodeControlSummary {
+    fn changed_state(&self) -> bool {
+        self.needs_admin_sync || self.needs_reenrollment || !self.binding_updates.is_empty()
+    }
+
+    /// Fold one node's control directive for a binding into the summary.
+    fn record(
+        &mut self,
+        local_instance_id: &str,
+        directive: Option<&str>,
+        operational_state: Option<String>,
+    ) {
+        match directive {
+            // Credentials no longer valid → recover them from Cloud.
+            Some(report_client::directive::REENROLL) => {
+                self.needs_reenrollment = true;
+                self.needs_admin_sync = true;
+            }
+            // Stale mapping → re-ask Cloud where this instance must report.
+            Some(report_client::directive::REPROVISION) => {
+                self.needs_admin_sync = true;
+            }
+            // `pause` (administratively disabled): no Cloud action — the adapter
+            // keeps status-polling the node (recorded per binding below) until it
+            // flips back to enabled. `retry`/`continue`: nothing to reconsider.
+            Some(report_client::directive::PAUSE)
+            | Some(report_client::directive::RETRY)
+            | Some(report_client::directive::CONTINUE)
+            | None => {}
+            // Unknown/future directive: don't act, just record it below.
+            Some(_) => {}
+        }
+        self.binding_updates.push((
+            local_instance_id.to_string(),
+            operational_state,
+            directive.map(str::to_string),
+        ));
+    }
+}
+
+/**
+ * Polls each active binding's IO.linkedhelper node over the intermediate
+ * `direct_node_http` path (heartbeat/status; no events yet), and reads the
+ * node's control directive so the adapter — not a permanent Cloud heartbeat —
+ * learns when to reconsider its situation. A node being unreachable is recorded
+ * per binding and never aborts the cycle. Returns the per-binding reports plus a
+ * summary of directives to apply to the adapter state.
+ */
+fn report_active_bindings_to_nodes(
+    state: &AdapterState,
+    now: &str,
+) -> (Vec<Value>, NodeControlSummary) {
     let mut node_reports: Vec<Value> = Vec::new();
+    let mut summary = NodeControlSummary::default();
 
     for binding in &state.runtime.desired_bindings {
         if binding.status != "active" {
@@ -961,12 +1187,27 @@ fn report_active_bindings_to_nodes(state: &AdapterState, now: &str) -> Vec<Value
             &request_id,
         ) {
             Ok(outcome) => {
+                let control = outcome.control.as_ref();
+                let directive = control.and_then(|control| control.directive.clone());
+                let operational_state =
+                    control.and_then(|control| control.operational_state.clone());
+                let reason = control.and_then(|control| control.reason.clone());
+                let retry_after_seconds = control.and_then(|control| control.retry_after_seconds);
+                summary.record(
+                    &binding.local_instance_id,
+                    directive.as_deref(),
+                    operational_state.clone(),
+                );
                 node_reports.push(serde_json::json!({
                     "localInstanceId": binding.local_instance_id,
                     "managedInstanceId": binding.managed_instance_id,
                     "url": url,
                     "ok": outcome.ok,
                     "statusCode": outcome.status_code,
+                    "directive": directive,
+                    "operationalState": operational_state,
+                    "reason": reason,
+                    "retryAfterSeconds": retry_after_seconds,
                 }));
             }
             Err(error) => {
@@ -974,19 +1215,61 @@ fn report_active_bindings_to_nodes(state: &AdapterState, now: &str) -> Vec<Value
                     "node report failed for binding {} ({}): {}",
                     binding.local_instance_id, url, error
                 );
+                let control = error.control.as_ref();
+                let directive = control.and_then(|control| control.directive.clone());
+                let operational_state =
+                    control.and_then(|control| control.operational_state.clone());
+                let reason = control.and_then(|control| control.reason.clone());
+                let retry_after_seconds = control.and_then(|control| control.retry_after_seconds);
+                summary.record(
+                    &binding.local_instance_id,
+                    directive.as_deref(),
+                    operational_state.clone(),
+                );
                 node_reports.push(serde_json::json!({
                     "localInstanceId": binding.local_instance_id,
                     "managedInstanceId": binding.managed_instance_id,
                     "url": url,
                     "ok": false,
                     "statusCode": error.status_code,
+                    "errorCode": error.error_code,
+                    "directive": directive,
+                    "operationalState": operational_state,
+                    "reason": reason,
+                    "retryAfterSeconds": retry_after_seconds,
                     "error": error.message,
                 }));
             }
         }
     }
 
-    node_reports
+    (node_reports, summary)
+}
+
+/**
+ * Applies the collected node control directives to the adapter state: records
+ * per-binding operational state / last directive, and raises the pending-admin
+ * flags (`needs_admin_sync` / re-enrollment) that reopen the administrative
+ * cycle against Fluxbee Cloud.
+ */
+fn apply_node_control_summary(state: &mut AdapterState, summary: &NodeControlSummary) {
+    for (local_instance_id, operational_state, directive) in &summary.binding_updates {
+        if let Some(binding) = state
+            .runtime
+            .desired_bindings
+            .iter_mut()
+            .find(|binding| &binding.local_instance_id == local_instance_id)
+        {
+            binding.operational_state = operational_state.clone();
+            binding.last_node_directive = directive.clone();
+        }
+    }
+    if summary.needs_admin_sync {
+        state.runtime.needs_admin_sync = true;
+    }
+    if summary.needs_reenrollment {
+        state.runtime.adapter_status = Some(String::from("needs_reenrollment"));
+    }
 }
 
 fn resolve_state_path(raw_state_file: Option<&str>) -> PathBuf {
@@ -1237,5 +1520,162 @@ mod tests {
         assert!(!boot_gate_should_rollback(MAX_UPDATE_BOOT_ATTEMPTS - 1));
         assert!(boot_gate_should_rollback(MAX_UPDATE_BOOT_ATTEMPTS));
         assert!(boot_gate_should_rollback(MAX_UPDATE_BOOT_ATTEMPTS + 5));
+    }
+
+    fn base_state() -> AdapterState {
+        serde_json::from_value(serde_json::json!({
+            "cloudBaseUrl": "http://cloud",
+            "adapterId": "adp_1",
+            "adapterSecret": "s",
+            "tenantId": "tnt_1",
+            "syncConfig": {
+                "cloudBaseUrl": "http://cloud",
+                "discoveryUrl": "http://cloud/discovery",
+                "syncUrl": null,
+                "reportTo": null
+            },
+            "enrolledAt": "2026-01-01T00:00:00Z"
+        }))
+        .expect("valid base adapter state")
+    }
+
+    fn discovered(local_id: &str, status: &str) -> AdapterCloudDiscoveredInstanceState {
+        AdapterCloudDiscoveredInstanceState {
+            discovered_instance_id: format!("disc_{local_id}"),
+            local_instance_id: local_id.to_string(),
+            status: status.to_string(),
+            managed_instance_id: None,
+            report_to: None,
+        }
+    }
+
+    fn active_binding(local_id: &str, url: Option<&str>) -> AdapterDesiredBindingState {
+        AdapterDesiredBindingState {
+            local_instance_id: local_id.to_string(),
+            managed_instance_id: format!("lhmi_{local_id}"),
+            status: "active".to_string(),
+            report_to_kind: Some("direct_node_http".to_string()),
+            report_to_url: url.map(str::to_string),
+            operational_state: None,
+            last_node_directive: None,
+        }
+    }
+
+    #[test]
+    fn pending_admin_work_when_discovery_changed() {
+        // A change in local discovery must be reported to Cloud.
+        assert!(has_pending_admin_work(&base_state(), true));
+    }
+
+    #[test]
+    fn pending_admin_work_when_flags_set() {
+        let mut state = base_state();
+        state.runtime.needs_admin_sync = true;
+        assert!(has_pending_admin_work(&state, false));
+
+        let mut state = base_state();
+        state.runtime.adapter_status = Some("needs_reenrollment".to_string());
+        assert!(has_pending_admin_work(&state, false));
+    }
+
+    #[test]
+    fn pending_admin_work_while_awaiting_binding() {
+        let mut state = base_state();
+        // Discovered but not yet actively bound → still awaiting an admin decision.
+        state.runtime.cloud_discovered_instances = vec![discovered("111", "new")];
+        assert!(has_pending_admin_work(&state, false));
+    }
+
+    #[test]
+    fn bound_without_destination_is_still_pending() {
+        let mut state = base_state();
+        state.runtime.cloud_discovered_instances = vec![discovered("111", "linked")];
+        // Active binding but no runtime destination yet (provisioning incomplete).
+        state.runtime.desired_bindings = vec![active_binding("111", None)];
+        assert!(has_pending_admin_work(&state, false));
+    }
+
+    #[test]
+    fn no_pending_admin_work_when_all_bound() {
+        let mut state = base_state();
+        state.runtime.cloud_discovered_instances = vec![discovered("111", "linked")];
+        state.runtime.desired_bindings =
+            vec![active_binding("111", Some("http://node:19091/v1/poll"))];
+        // Everything is bound with a destination → the adapter goes quiet on the
+        // Cloud plane (on-demand model).
+        assert!(!has_pending_admin_work(&state, false));
+    }
+
+    #[test]
+    fn ignored_discovered_instance_is_not_pending() {
+        let mut state = base_state();
+        state.runtime.cloud_discovered_instances = vec![discovered("111", "ignored")];
+        assert!(!has_pending_admin_work(&state, false));
+    }
+
+    #[test]
+    fn summary_reenroll_sets_both_flags() {
+        let mut summary = NodeControlSummary::default();
+        summary.record(
+            "111",
+            Some(report_client::directive::REENROLL),
+            Some("enabled".to_string()),
+        );
+        assert!(summary.needs_reenrollment);
+        assert!(summary.needs_admin_sync);
+    }
+
+    #[test]
+    fn summary_reprovision_sets_admin_sync_only() {
+        let mut summary = NodeControlSummary::default();
+        summary.record("111", Some(report_client::directive::REPROVISION), None);
+        assert!(!summary.needs_reenrollment);
+        assert!(summary.needs_admin_sync);
+    }
+
+    #[test]
+    fn summary_continue_sets_no_admin_flags() {
+        let mut summary = NodeControlSummary::default();
+        summary.record(
+            "111",
+            Some(report_client::directive::CONTINUE),
+            Some("enabled".to_string()),
+        );
+        assert!(!summary.needs_reenrollment);
+        assert!(!summary.needs_admin_sync);
+        // It still records the per-binding update.
+        assert!(summary.changed_state());
+    }
+
+    #[test]
+    fn admin_resync_due_respects_interval() {
+        // Disabled by default (no interval) → never due, regardless of elapsed.
+        assert!(!admin_resync_due(None, None));
+        assert!(!admin_resync_due(None, Some(Duration::from_secs(10_000))));
+        assert!(!admin_resync_due(Some(0), Some(Duration::from_secs(10_000))));
+        // Configured but never contacted this run → due (also covers restarts).
+        assert!(admin_resync_due(Some(3600), None));
+        // Configured: due only once the interval has elapsed.
+        assert!(!admin_resync_due(Some(3600), Some(Duration::from_secs(60))));
+        assert!(admin_resync_due(Some(3600), Some(Duration::from_secs(3600))));
+        assert!(admin_resync_due(Some(3600), Some(Duration::from_secs(7200))));
+    }
+
+    #[test]
+    fn apply_summary_updates_bindings_and_flags() {
+        let mut state = base_state();
+        state.runtime.desired_bindings = vec![active_binding("111", Some("http://node/v1/poll"))];
+        let mut summary = NodeControlSummary::default();
+        summary.record(
+            "111",
+            Some(report_client::directive::PAUSE),
+            Some("disabled".to_string()),
+        );
+        summary.needs_admin_sync = true;
+        apply_node_control_summary(&mut state, &summary);
+        let binding = &state.runtime.desired_bindings[0];
+        assert_eq!(binding.operational_state.as_deref(), Some("disabled"));
+        assert_eq!(binding.last_node_directive.as_deref(), Some("pause"));
+        assert!(state.runtime.needs_admin_sync);
     }
 }

@@ -174,15 +174,45 @@ Reglas:
 
 ## 8. Response mínima
 
+Toda respuesta de `/v1/poll` (éxito **y** reject) incluye un bloque `control`
+machine-actionable, para que el adapter aprenda su situación desde el plano
+runtime (el nodo) en lugar de depender de un heartbeat permanente contra Cloud
+(ver el replanteo `integracion_linked_helper_actualizado.md`).
+
 ```json
 {
   "ok": true,
+  "accepted_at": "2026-06-29T00:00:00Z",
   "actions": [],
-  "accepted_at": "2026-06-29T00:00:00Z"
+  "control": {
+    "operational_state": "enabled",
+    "directive": "continue",
+    "reason": null,
+    "retry_after_seconds": null
+  },
+  "items": []
 }
 ```
 
-En MVP, `actions` queda siempre vacío.
+`control.directive` ∈ `continue | pause | reenroll | reprovision | retry`:
+
+- `continue` — todo OK, seguir operando.
+- `pause` — instancia administrativamente `disabled` (`operational_state=disabled`):
+  dejar de emitir eventos y consultar estado hasta que vuelva a `enabled`.
+- `reenroll` — credenciales inválidas (secreto rotado/revocado): recontactar Cloud
+  para recuperar credenciales administrativas.
+- `reprovision` — mapping instancia→nodo stale (el adapter no está ligado a este
+  nodo, o hay mismatch de managed/local): re-pedir a Cloud el destino runtime.
+- `retry` — condición transitoria del nodo: reintentar el poll más tarde
+  (`retry_after_seconds` sugiere el backoff).
+
+`operational_state` ∈ `enabled | disabled` es a nivel **nodo/managed-instance**
+(1 cuenta LinkedHelper = 1 nodo). El toggle administrativo de disable está
+**diferido**: hoy el nodo reporta `enabled` por defecto y el camino
+`pause`/`disabled` (reject `409 instance_disabled` en modo events, `pause` en el
+control) queda cableado y testeado para cuando se agregue la fuente del toggle.
+
+En esta etapa `actions` queda siempre vacío.
 
 ---
 
@@ -235,6 +265,22 @@ Casos:
 - secret no resuelto;
 - nodo sin ICH;
 - config incompleta.
+
+### Bloque `control` en los rejects
+
+Además de `error_code`/`error_message`, **cada reject incluye el bloque `control`**
+(§8) con la directiva accionable derivada del `error_code`:
+
+| `error_code` | HTTP | `directive` |
+|---|---|---|
+| `invalid_adapter_secret` | 401 | `reenroll` |
+| `adapter_not_allowed` / `managed_instance_id_mismatch` / `local_instance_id_mismatch` | 403 | `reprovision` |
+| `node_not_ready` / `node_binding_unavailable` / `auth_secret_unavailable` / `durable_state_unavailable` | 503/500 | `retry` |
+| `instance_disabled` (events en instancia disabled) | 409 | `pause` |
+| request malformada (`missing_adapter_id`, `invalid_mode`, etc.) | 400 | `continue` |
+
+Así el adapter reacciona (reabrir el ciclo administrativo contra Cloud / pausar /
+reintentar) sin depender de un heartbeat permanente.
 
 ---
 

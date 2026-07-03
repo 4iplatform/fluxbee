@@ -192,6 +192,131 @@ struct ConversationMessagePayload {
     content: Value,
 }
 
+/// Operational-enablement values carried in the `/v1/poll` control block. This
+/// is a node/managed-instance-level switch (1 LinkedHelper account = 1 node), not
+/// a per-profile one — sourced from the node's own managed-instance ICH `enabled`
+/// flag (SY.identity), so enable/disable is enforced by Fluxbee, never by a
+/// permanent adapter↔Cloud heartbeat.
+const OPERATIONAL_ENABLED: &str = "enabled";
+const OPERATIONAL_DISABLED: &str = "disabled";
+
+/// Directives the node hands back to the adapter so the adapter — not a
+/// permanent Cloud heartbeat — can decide what to do next. See the LinkedHelper
+/// replanteo: the adapter contacts Fluxbee Cloud only when the node tells it its
+/// situation changed.
+mod poll_directive {
+    /// Everything is fine; keep operating (send heartbeats/events).
+    pub const CONTINUE: &str = "continue";
+    /// The managed instance is administratively disabled; stop emitting events
+    /// and keep polling status until it flips back to enabled.
+    pub const PAUSE: &str = "pause";
+    /// The adapter's credentials are no longer valid; re-contact Fluxbee Cloud
+    /// to recover administrative credentials (re-enrollment).
+    pub const REENROLL: &str = "reenroll";
+    /// The adapter's instance→node mapping is stale (this node isn't bound to
+    /// it); re-contact Fluxbee Cloud to obtain a fresh runtime destination.
+    pub const REPROVISION: &str = "reprovision";
+    /// A transient node-side condition; just retry the runtime poll later.
+    pub const RETRY: &str = "retry";
+}
+
+/// Suggested backoff (seconds) for `retry` directives (transient node states).
+const POLL_RETRY_BACKOFF_SECONDS: u64 = 15;
+/// Suggested backoff (seconds) before the adapter re-contacts Cloud on a
+/// `reprovision`/`reenroll` directive, so a stale mapping can't hammer Cloud.
+const POLL_ADMIN_BACKOFF_SECONDS: u64 = 30;
+
+/// Machine-actionable control block attached to EVERY `/v1/poll` response
+/// (success and reject) so the adapter always learns its current situation from
+/// the runtime plane instead of a permanent Cloud heartbeat.
+#[derive(Debug, Clone, Serialize)]
+struct PollControl {
+    operational_state: &'static str,
+    directive: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after_seconds: Option<u64>,
+}
+
+impl PollControl {
+    /// Control block for a healthy response: keep operating, unless the managed
+    /// instance is administratively disabled (then `pause`).
+    fn operating(operational_state: &'static str) -> Self {
+        if operational_state == OPERATIONAL_DISABLED {
+            Self {
+                operational_state,
+                directive: poll_directive::PAUSE,
+                reason: Some("instance_disabled".to_string()),
+                retry_after_seconds: Some(POLL_RETRY_BACKOFF_SECONDS),
+            }
+        } else {
+            Self {
+                operational_state,
+                directive: poll_directive::CONTINUE,
+                reason: None,
+                retry_after_seconds: None,
+            }
+        }
+    }
+
+    /// Control block for a rejection, derived from the stable `error_code`.
+    fn for_reject(error_code: &str, operational_state: &'static str) -> Self {
+        let (directive, retry_after_seconds) = match error_code {
+            // The adapter secret no longer matches what the node resolved from
+            // Vault (rotated/revoked) → recover credentials from Cloud.
+            "invalid_adapter_secret" => (poll_directive::REENROLL, Some(POLL_ADMIN_BACKOFF_SECONDS)),
+            // The adapter is targeting a node that isn't bound to it, or its
+            // managed/local-instance mapping is stale → re-ask Cloud where this
+            // instance must report.
+            "adapter_not_allowed"
+            | "managed_instance_id_mismatch"
+            | "local_instance_id_mismatch" => {
+                (poll_directive::REPROVISION, Some(POLL_ADMIN_BACKOFF_SECONDS))
+            }
+            // Transient node-side conditions → retry the runtime poll later.
+            "node_not_ready"
+            | "node_binding_unavailable"
+            | "auth_secret_unavailable"
+            | "durable_state_unavailable" => {
+                (poll_directive::RETRY, Some(POLL_RETRY_BACKOFF_SECONDS))
+            }
+            // Administrative disable surfaced as a reject while sending events.
+            "instance_disabled" => (poll_directive::PAUSE, Some(POLL_RETRY_BACKOFF_SECONDS)),
+            // Malformed adapter requests: nothing administratively changed, the
+            // adapter should fix the request and keep operating.
+            _ => (poll_directive::CONTINUE, None),
+        };
+        Self {
+            operational_state,
+            directive,
+            reason: Some(error_code.to_string()),
+            retry_after_seconds,
+        }
+    }
+}
+
+/// Build a `/v1/poll` reject carrying the control block, so every non-2xx
+/// response tells the adapter what to do next (retry / reprovision / reenroll /
+/// pause) rather than being a mute HTTP status.
+fn poll_reject(
+    status: StatusCode,
+    error_code: &str,
+    error_message: impl Into<String>,
+    operational_state: &'static str,
+) -> Response {
+    let control = PollControl::for_reject(error_code, operational_state);
+    (
+        status,
+        Json(serde_json::json!({
+            "error_code": error_code,
+            "error_message": error_message.into(),
+            "control": control,
+        })),
+    )
+        .into_response()
+}
+
 #[derive(Debug, Serialize)]
 struct PollResponse {
     ok: bool,
@@ -199,6 +324,7 @@ struct PollResponse {
     response_id: String,
     adapter_id: String,
     actions: Vec<Value>,
+    control: PollControl,
     items: Vec<ResponseItem>,
 }
 
@@ -1435,45 +1561,51 @@ async fn post_poll(
 ) -> Response {
     let control_snapshot = state.control_plane.read().await.clone();
     if control_snapshot.current_state != IoNodeLifecycleState::Configured {
-        return (
+        return poll_reject(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error_code": "node_not_ready",
-                "error_message": control_snapshot
-                    .last_error
-                    .as_ref()
-                    .map(|err| err.message.clone())
-                    .unwrap_or_else(|| "linkedhelper node is not configured".to_string())
-            })),
-        )
-            .into_response();
+            "node_not_ready",
+            control_snapshot
+                .last_error
+                .as_ref()
+                .map(|err| err.message.clone())
+                .unwrap_or_else(|| "linkedhelper node is not configured".to_string()),
+            OPERATIONAL_ENABLED,
+        );
     }
 
     let registry = state.runtime_registry.read().await;
     let Some(runtime) = registry.binding.as_ref() else {
-        return (
+        return poll_reject(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error_code": "node_binding_unavailable",
-                "error_message": "linkedhelper node has no active managed instance binding"
-            })),
-        )
-            .into_response();
+            "node_binding_unavailable",
+            "linkedhelper node has no active managed instance binding",
+            OPERATIONAL_ENABLED,
+        );
     };
+    // Node/managed-instance-level operational state (1 LinkedHelper account = 1
+    // node), surfaced to the adapter in every control block below so enable/
+    // disable is enforced here, not via a permanent Cloud heartbeat.
+    //
+    // The administrative enable/disable *toggle* is deferred (product decision),
+    // so the node reports `enabled` by default today; the disable path (`pause`
+    // directive + `instance_disabled` reject) is wired and unit-tested, ready for
+    // when the toggle's source is added (Cloud-administered config / identity).
+    // NOTE: do NOT source this from the own-ICH `enabled` flag — a freshly
+    // registered ICH is `enabled=false`, which would wrongly disable every new
+    // node and block normal event flow.
+    let operational_state = OPERATIONAL_ENABLED;
 
     let request_size = serde_json::to_vec(&request).map(|bytes| bytes.len()).unwrap_or(0);
     if request_size > registry.max_request_bytes {
-        return (
+        return poll_reject(
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({
-                "error_code": "request_too_large",
-                "error_message": format!(
-                    "request body exceeds configured max_request_bytes ({})",
-                    registry.max_request_bytes
-                )
-            })),
-        )
-            .into_response();
+            "request_too_large",
+            format!(
+                "request body exceeds configured max_request_bytes ({})",
+                registry.max_request_bytes
+            ),
+            operational_state,
+        );
     }
 
     // Adapter authentication/authorization is delegated to the isolated
@@ -1495,7 +1627,7 @@ async fn post_poll(
         body_local_instance_id: request.local_instance_id.as_deref(),
     };
     if let Err(rejection) = validator.validate(&auth_request) {
-        return auth_rejection_response(rejection);
+        return auth_rejection_response(rejection, operational_state);
     }
 
     let runtime = runtime.clone();
@@ -1531,26 +1663,36 @@ async fn post_poll(
 
     let mut items = if mode.eq_ignore_ascii_case("heartbeat") {
         if !request.items.is_empty() {
-            return (
+            return poll_reject(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error_code": "invalid_heartbeat_request",
-                    "error_message": "heartbeat requests must not include items"
-                })),
-            )
-                .into_response();
+                "invalid_heartbeat_request",
+                "heartbeat requests must not include items",
+                operational_state,
+            );
         }
+        // Heartbeat/status polls always succeed (200) and carry the operational
+        // state in the control block, so a disabled instance can keep polling
+        // status until it is re-enabled.
         pending_deliveries
     } else if mode.eq_ignore_ascii_case("events") {
+        // An administratively disabled managed instance must not emit events:
+        // reject with a `pause` directive so the adapter drops to status-polling
+        // until it flips back to enabled (enforcement lives here, not in Cloud).
+        if operational_state == OPERATIONAL_DISABLED {
+            return poll_reject(
+                StatusCode::CONFLICT,
+                "instance_disabled",
+                "managed instance is administratively disabled; events are not accepted",
+                operational_state,
+            );
+        }
         if request.items.is_empty() {
-            return (
+            return poll_reject(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error_code": "empty_events_batch",
-                    "error_message": "events requests must include at least one item"
-                })),
-            )
-                .into_response();
+                "empty_events_batch",
+                "events requests must include at least one item",
+                operational_state,
+            );
         }
         let mut responses = Vec::with_capacity(request.items.len());
         for item in &request.items {
@@ -1644,14 +1786,12 @@ async fn post_poll(
         responses.extend(pending_deliveries);
         responses
     } else {
-        return (
+        return poll_reject(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error_code": "invalid_mode",
-                "error_message": "mode must be 'events' or 'heartbeat'"
-            })),
-        )
-            .into_response();
+            "invalid_mode",
+            "mode must be 'events' or 'heartbeat'",
+            operational_state,
+        );
     };
     if items.is_empty() {
         items.push(ResponseItem::Heartbeat {
@@ -1670,14 +1810,12 @@ async fn post_poll(
             error = %err,
             "failed to persist linkedhelper durable state while processing poll"
         );
-        return (
+        return poll_reject(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error_code": "durable_state_unavailable",
-                "error_message": "linkedhelper durable state is temporarily unavailable"
-            })),
-        )
-            .into_response();
+            "durable_state_unavailable",
+            "linkedhelper durable state is temporarily unavailable",
+            operational_state,
+        );
     }
     *state.durable_state.write().await = durable_state;
 
@@ -1701,26 +1839,27 @@ async fn post_poll(
         response_id: format!("resp:{request_id}"),
         adapter_id: runtime.adapter_id,
         actions: Vec::new(),
+        control: PollControl::operating(operational_state),
         items,
     })
     .into_response()
 }
 
-fn auth_rejection_response(rejection: AuthRejection) -> Response {
+fn auth_rejection_response(rejection: AuthRejection, operational_state: &'static str) -> Response {
     let status = match rejection.status {
         AuthStatus::BadRequest => StatusCode::BAD_REQUEST,
         AuthStatus::Unauthorized => StatusCode::UNAUTHORIZED,
         AuthStatus::Forbidden => StatusCode::FORBIDDEN,
         AuthStatus::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
     };
-    (
+    // Carry the same control block as any other reject so the adapter can map an
+    // auth failure to an administrative action (reenroll / reprovision).
+    poll_reject(
         status,
-        Json(serde_json::json!({
-            "error_code": rejection.error_code,
-            "error_message": rejection.error_message
-        })),
+        &rejection.error_code,
+        rejection.error_message,
+        operational_state,
     )
-        .into_response()
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -2682,7 +2821,90 @@ mod tests {
                 body_local_instance_id: None,
             })
             .expect_err("missing adapter-id header should be rejected");
-        let response = auth_rejection_response(rejection);
+        let response = auth_rejection_response(rejection, OPERATIONAL_ENABLED);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn operating_control_is_continue_when_enabled() {
+        let control = PollControl::operating(OPERATIONAL_ENABLED);
+        assert_eq!(control.operational_state, OPERATIONAL_ENABLED);
+        assert_eq!(control.directive, poll_directive::CONTINUE);
+        assert!(control.reason.is_none());
+    }
+
+    #[test]
+    fn operating_control_is_pause_when_disabled() {
+        let control = PollControl::operating(OPERATIONAL_DISABLED);
+        assert_eq!(control.operational_state, OPERATIONAL_DISABLED);
+        assert_eq!(control.directive, poll_directive::PAUSE);
+        assert_eq!(control.reason.as_deref(), Some("instance_disabled"));
+    }
+
+    #[test]
+    fn reject_control_maps_error_codes_to_directives() {
+        // Credential failure => recover credentials from Cloud.
+        assert_eq!(
+            PollControl::for_reject("invalid_adapter_secret", OPERATIONAL_ENABLED).directive,
+            poll_directive::REENROLL
+        );
+        // Stale instance→node mapping => re-ask Cloud for the runtime destination.
+        for code in [
+            "adapter_not_allowed",
+            "managed_instance_id_mismatch",
+            "local_instance_id_mismatch",
+        ] {
+            assert_eq!(
+                PollControl::for_reject(code, OPERATIONAL_ENABLED).directive,
+                poll_directive::REPROVISION,
+                "{code} should map to reprovision"
+            );
+        }
+        // Transient node-side conditions => retry the runtime poll.
+        for code in [
+            "node_not_ready",
+            "node_binding_unavailable",
+            "auth_secret_unavailable",
+            "durable_state_unavailable",
+        ] {
+            assert_eq!(
+                PollControl::for_reject(code, OPERATIONAL_ENABLED).directive,
+                poll_directive::RETRY,
+                "{code} should map to retry"
+            );
+        }
+        // Administrative disable => pause.
+        assert_eq!(
+            PollControl::for_reject("instance_disabled", OPERATIONAL_DISABLED).directive,
+            poll_directive::PAUSE
+        );
+        // Malformed request => nothing administratively changed.
+        assert_eq!(
+            PollControl::for_reject("invalid_mode", OPERATIONAL_ENABLED).directive,
+            poll_directive::CONTINUE
+        );
+        // The reason always echoes the stable error code.
+        assert_eq!(
+            PollControl::for_reject("invalid_mode", OPERATIONAL_ENABLED).reason.as_deref(),
+            Some("invalid_mode")
+        );
+    }
+
+    #[test]
+    fn poll_response_serializes_control_block() {
+        let response = PollResponse {
+            ok: true,
+            accepted_at: "2026-07-03T00:00:00Z".to_string(),
+            response_id: "resp:x".to_string(),
+            adapter_id: "adp".to_string(),
+            actions: Vec::new(),
+            control: PollControl::operating(OPERATIONAL_ENABLED),
+            items: Vec::new(),
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["control"]["operational_state"], "enabled");
+        assert_eq!(value["control"]["directive"], "continue");
+        // reason/retry_after are omitted when absent (skip_serializing_if).
+        assert!(value["control"].get("reason").is_none());
     }
 }

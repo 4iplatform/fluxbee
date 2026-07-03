@@ -32,6 +32,12 @@ pub enum AdapterCommand {
         partitions_root: Option<String>,
         #[arg(long)]
         interval_seconds: Option<u64>,
+        /// Optional slow administrative re-sync interval (seconds). When set, the
+        /// adapter contacts Cloud at least this often even with no pending work,
+        /// so Cloud can push updates/admin changes to an otherwise-quiet adapter.
+        /// Off by default (pure on-demand).
+        #[arg(long)]
+        admin_resync_seconds: Option<u64>,
         #[arg(long, default_value_t = false)]
         once: bool,
     },
@@ -72,12 +78,19 @@ pub enum AdapterCommand {
         #[arg(long)]
         partitions_root: String,
     },
-    /// Runs the adapter loop with periodic alive and incremental discovery.
+    /// Runs the adapter loop: continuous runtime poll to the node, on-demand
+    /// administrative contact with Cloud.
     Run {
         #[arg(long)]
         partitions_root: Option<String>,
         #[arg(long)]
         interval_seconds: Option<u64>,
+        /// Optional slow administrative re-sync interval (seconds). When set, the
+        /// adapter contacts Cloud at least this often even with no pending work,
+        /// so Cloud can push updates/admin changes to an otherwise-quiet adapter.
+        /// Off by default (pure on-demand).
+        #[arg(long)]
+        admin_resync_seconds: Option<u64>,
         #[arg(long, default_value_t = false)]
         once: bool,
     },

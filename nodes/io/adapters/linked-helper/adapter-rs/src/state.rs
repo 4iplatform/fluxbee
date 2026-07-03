@@ -33,6 +33,12 @@ pub struct AdapterState {
     pub lh_root_path: Option<String>,
     #[serde(rename = "pollIntervalSeconds", default = "default_poll_interval_seconds")]
     pub poll_interval_seconds: u64,
+    /// Optional slow administrative re-sync interval (seconds). `None`/0 = pure
+    /// on-demand (Cloud contacted only when there is pending admin work). When
+    /// set, the adapter also contacts Cloud at least this often so Cloud can push
+    /// updates/admin changes to an otherwise-quiet adapter.
+    #[serde(rename = "adminResyncIntervalSeconds", default)]
+    pub admin_resync_interval_seconds: Option<u64>,
     #[serde(default)]
     pub runtime: AdapterRuntimeState,
 }
@@ -68,6 +74,12 @@ pub struct AdapterRuntimeState {
     pub last_known_desired_state_version: Option<u64>,
     #[serde(rename = "desiredBindings", default)]
     pub desired_bindings: Vec<AdapterDesiredBindingState>,
+    /// Set when a node `/v1/poll` directive tells the adapter its administrative
+    /// situation changed (stale mapping / needs credentials) and it must
+    /// re-contact Fluxbee Cloud. This — not a permanent Cloud heartbeat — is what
+    /// reopens the administrative cycle; it is cleared after a successful `alive`.
+    #[serde(rename = "needsAdminSync", default)]
+    pub needs_admin_sync: bool,
     /// Set just before a self-update swaps the binary and re-execs; the new
     /// binary finalizes it on its first healthy alive (deletes the retained
     /// previous binary and records `last_update`). Persisted in the JSON state
@@ -154,6 +166,15 @@ pub struct AdapterDesiredBindingState {
     pub report_to_kind: Option<String>,
     #[serde(rename = "reportToUrl", default)]
     pub report_to_url: Option<String>,
+    /// Last operational state (`enabled`/`disabled`) the node reported for this
+    /// binding in its `/v1/poll` control block. Node/managed-instance level
+    /// (1 account = 1 node); when `disabled` the adapter must not emit events.
+    #[serde(rename = "operationalState", default)]
+    pub operational_state: Option<String>,
+    /// Last control directive the node returned for this binding (`continue` /
+    /// `pause` / `reenroll` / `reprovision` / `retry`). Kept for visibility.
+    #[serde(rename = "lastNodeDirective", default)]
+    pub last_node_directive: Option<String>,
 }
 
 impl AdapterState {
@@ -173,6 +194,7 @@ impl AdapterState {
             enrolled_at: current_unix_timestamp_string(),
             lh_root_path: None,
             poll_interval_seconds: default_poll_interval_seconds(),
+            admin_resync_interval_seconds: None,
             runtime: AdapterRuntimeState::default(),
         }
     }
