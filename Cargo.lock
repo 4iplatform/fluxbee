@@ -3025,6 +3025,8 @@ dependencies = [
  "futures",
  "hex",
  "hmac",
+ "hyper",
+ "hyper-util",
  "lancedb",
  "memmap2",
  "nix",
