@@ -98,6 +98,7 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "run_node",
     "set_node_config",
     "get_node_status",
+    "externalize",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -3439,6 +3440,137 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     },
 ];
 
+/// `externalize` — an IO node self-exposes one of its channels (`ICH`) as a public
+/// URL on the edge (v6 §7). Resolves `ICH -> owner_l2_name` from identity SHM (admin
+/// runs where identity lives) and pushes the row to the edge as a `CONFIG_CHANGED`
+/// (subsystem `endpoints`; the edge whole-map-replaces its cache).
+///
+/// ⚠️ FIRST CUT — deliberately incomplete (v6 §11.1 / §12):
+/// - **NO AUTHZ GATE.** The `IO.`-prefix + `owner == requester` self-service check is
+///   DEFERRED (door open) until the admin plane complexifies. Unauthenticated.
+/// - **No durable binding.** The `ICH` "externalized" attribute in `SY.identity`
+///   (molde `MSG_ICH_SET_ENABLED`) is not written yet, so this does not survive an edge
+///   reimage on its own and pushes ONE row (whole-map replace) — single endpoint for now.
+/// - **No token.** `auth_mode=shared-secret` carries a caller-supplied `secret`; the
+///   vault-minted channel token is deferred.
+async fn handle_externalize(
+    ctx: &AdminContext,
+    client: &Arc<RouterDispatcher>,
+    params: serde_json::Value,
+) -> Result<InternalAdminDispatchResult, AdminError> {
+    let get_str = |key: &str| {
+        params
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+    };
+    let Some(ich) = get_str("ich") else {
+        return Ok(internal_invalid_request("externalize", "missing payload.ich"));
+    };
+    let Some(edge_node) = get_str("edge_node") else {
+        return Ok(internal_invalid_request(
+            "externalize",
+            "missing payload.edge_node (the SY.edge L2 name to publish on)",
+        ));
+    };
+    let inbound_family = get_str("inbound_family").unwrap_or_else(|| "user".to_string());
+    let auth_mode = get_str("auth_mode").unwrap_or_else(|| "public".to_string());
+    let secret = get_str("secret");
+    let methods = params.get("methods").and_then(|v| v.as_array()).map(|a| {
+        a.iter()
+            .filter_map(|m| m.as_str().map(ToString::to_string))
+            .collect::<Vec<String>>()
+    });
+
+    // Resolve ICH -> owner_l2_name from identity SHM.
+    let owner_l2_name =
+        match fluxbee_sdk::identity::list_ich_options_from_hive_config(&ctx.config_dir) {
+            Ok(options) => options
+                .into_iter()
+                .find(|o| o.ich_id == ich)
+                .and_then(|o| o.owner_l2_name),
+            Err(err) => {
+                return Ok(internal_invalid_request(
+                    "externalize",
+                    &format!("identity SHM unavailable for ICH resolve: {err}"),
+                ))
+            }
+        };
+    let Some(owner_l2_name) = owner_l2_name else {
+        return Ok(internal_invalid_request(
+            "externalize",
+            &format!("no ICH '{ich}' with an owner in identity"),
+        ));
+    };
+
+    // Build the edge row and push it via CONFIG_CHANGED (subsystem "endpoints").
+    let mut row = serde_json::json!({
+        "ich": ich,
+        "owner_l2_name": owner_l2_name,
+        "inbound_family": inbound_family,
+        "auth_mode": auth_mode,
+    });
+    if let Some(secret) = &secret {
+        row["secret"] = serde_json::json!(secret);
+    }
+    if let Some(methods) = &methods {
+        row["methods"] = serde_json::json!(methods);
+    }
+    let version = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let config = serde_json::json!({ "endpoints": [row] });
+
+    let sender = client.sender_snapshot();
+    let msg = Message {
+        routing: Routing {
+            src: sender.uuid().to_string(),
+            src_l2_name: None,
+            dst: Destination::Unicast(edge_node.clone()),
+            ttl: 16,
+            trace_id: Uuid::new_v4().to_string(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(MSG_CONFIG_CHANGED.to_string()),
+            scope: Some(SCOPE_GLOBAL.to_string()),
+            ..Meta::default()
+        },
+        payload: serde_json::to_value(ConfigChangedPayload {
+            subsystem: "endpoints".to_string(),
+            action: Some("set".to_string()),
+            auto_apply: Some(true),
+            version,
+            config,
+        })?,
+    };
+    sender.send(msg).await?;
+    tracing::info!(
+        ich = %ich,
+        owner = %owner_l2_name,
+        edge = %edge_node,
+        version = version,
+        "externalize: pushed endpoint to edge (⚠️ UNAUTHENTICATED — v6 §11.1)"
+    );
+
+    Ok(InternalAdminDispatchResult {
+        http_status: 200,
+        envelope: serde_json::json!({
+            "status": "ok",
+            "action": "externalize",
+            "payload": {
+                "url": format!("/e/{ich}"),
+                "ich": ich,
+                "owner_l2_name": owner_l2_name,
+                "version": version,
+            }
+        }),
+    })
+}
+
 async fn dispatch_internal_admin_command(
     ctx: &AdminContext,
     client: &Arc<RouterDispatcher>,
@@ -3479,6 +3611,11 @@ async fn dispatch_internal_admin_command(
                     }
                 }),
             });
+        }
+        // externalize — an IO node self-exposes its own channel (ICH) on the edge
+        // (v6 §7). ⚠️ NO AUTHZ GATE YET (deferred by decision — v6 §11.1). Door open.
+        "externalize" => {
+            return handle_externalize(ctx, client, params).await;
         }
         "executor_execute_plan" => {
             if target.is_some() {

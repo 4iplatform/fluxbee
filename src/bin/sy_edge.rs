@@ -87,8 +87,8 @@ mod http_ingress {
 const RPC_CH_SYSTEM: &str = "system";
 
 /// `CONFIG_CHANGED` subsystem that carries the edge's reverse-proxy table
-/// (`hash -> {ilk, handler_node, inbound_family, auth}`) pushed by the core
-/// authority via `NODE_CONFIG_SET` (spec §5.1). Also accepts the generic
+/// (`ich -> {owner_l2_name, inbound_family, auth}`) pushed by the core
+/// authority via `NODE_CONFIG_SET` (v6 §7). Also accepts the generic
 /// `node_config` wrapper.
 const ENDPOINTS_SUBSYSTEM: &str = "endpoints";
 const NODE_CONFIG_SUBSYSTEM: &str = "node_config";
@@ -480,16 +480,19 @@ enum AuthMode {
     SharedSecret,
 }
 
-/// One row of the reverse-proxy table (seed file or `NODE_CONFIG_SET` push).
+/// One row of the reverse-proxy table, pushed by the core authority via
+/// `NODE_CONFIG_SET` (the edge is born with NONE — v6 §6). The public URL is
+/// `/e/<ich>`; the `ICH` is the channel identity (v6 §4). The edge holds **no
+/// `ilk`** — the frontier: it routes on `ICH -> owner_l2_name` handed to it
+/// pre-resolved, and never resolves identity (I6).
 #[derive(Debug, Clone, Deserialize)]
 struct EndpointRow {
-    hash: String,
-    /// Published target ilk (carried inward for the handler's own info/authz).
-    ilk: String,
-    /// The **pre-resolved** handler L2 name (Option Z): the core authority
-    /// resolved `ilk -> handler_node` at publication time and cached it here, so
-    /// the identity-less edge forwards by name with no request-time resolve.
-    handler_node: String,
+    /// The channel `ICH` — the URL is `/e/<ich>`. Opaque to the edge; the core
+    /// minted/resolved it and pushed it down.
+    ich: String,
+    /// The owning node's L2 name (Option Z, pre-resolved by the core). The edge
+    /// forwards to it by name and stamps `meta.ich` so the node knows its channel.
+    owner_l2_name: String,
     /// The `msg_type`/subject the target speaks (Option A): the edge labels the
     /// forwarded message with exactly this family.
     inbound_family: String,
@@ -510,8 +513,7 @@ struct EndpointsFile {
 
 #[derive(Debug, Clone)]
 struct EndpointEntry {
-    ilk: String,
-    handler_node: String,
+    owner_l2_name: String,
     inbound_family: String,
     auth_mode: AuthMode,
     secret: Option<String>,
@@ -520,14 +522,15 @@ struct EndpointEntry {
     tenant_id: Option<String>,
 }
 
+/// Index the rows by `ICH` (the URL key). No `ilk` anywhere — the edge is outside
+/// the identity frontier (I6).
 fn rows_to_registry(rows: Vec<EndpointRow>) -> HashMap<String, EndpointEntry> {
     let mut registry = HashMap::with_capacity(rows.len());
     for row in rows {
         registry.insert(
-            row.hash,
+            row.ich,
             EndpointEntry {
-                ilk: row.ilk,
-                handler_node: row.handler_node,
+                owner_l2_name: row.owner_l2_name,
                 inbound_family: row.inbound_family,
                 auth_mode: row.auth_mode,
                 secret: row.secret,
@@ -575,9 +578,9 @@ async fn run_frontend(
     tls: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<(), SyEdgeError> {
     let app = Router::new()
-        .route("/e/:hash", any(invoke_root))
-        .route("/e/:hash/*extra", any(invoke_extra))
-        .route("/b/:hash", any(blob_stub))
+        .route("/e/:ich", any(invoke_root))
+        .route("/e/:ich/*extra", any(invoke_extra))
+        .route("/b/:ich", any(blob_stub))
         .route("/healthz", any(|| async { "ok" }))
         .with_state(state);
     let listener = TcpListener::bind(&listen).await?;
@@ -690,18 +693,18 @@ async fn fetch_tls_config_from_vault(
 
 async fn invoke_root(
     State(state): State<Arc<FrontendState>>,
-    AxumPath(hash): AxumPath<String>,
+    AxumPath(ich): AxumPath<String>,
     req: Request,
 ) -> Response {
-    invoke(state, hash, String::new(), req).await
+    invoke(state, ich, String::new(), req).await
 }
 
 async fn invoke_extra(
     State(state): State<Arc<FrontendState>>,
-    AxumPath((hash, extra)): AxumPath<(String, String)>,
+    AxumPath((ich, extra)): AxumPath<(String, String)>,
     req: Request,
 ) -> Response {
-    invoke(state, hash, extra, req).await
+    invoke(state, ich, extra, req).await
 }
 
 async fn blob_stub(AxumPath(_hash): AxumPath<String>) -> Response {
@@ -713,13 +716,13 @@ async fn blob_stub(AxumPath(_hash): AxumPath<String>) -> Response {
     )
 }
 
-async fn invoke(state: Arc<FrontendState>, hash: String, extra: String, req: Request) -> Response {
+async fn invoke(state: Arc<FrontendState>, ich: String, extra: String, req: Request) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
 
-    // 1. Registry lookup — the hash is the first capability gate. Clone the row
-    //    out of the lock so nothing is held across the inward await.
+    // 1. Registry lookup — the ICH (URL) is the first capability gate. Clone the
+    //    row out of the lock so nothing is held across the inward await.
     let entry = {
         let registry = match state.registry.read() {
             Ok(guard) => guard,
@@ -731,7 +734,7 @@ async fn invoke(state: Arc<FrontendState>, hash: String, extra: String, req: Req
                 )
             }
         };
-        match registry.get(&hash) {
+        match registry.get(&ich) {
             Some(entry) => entry.clone(),
             None => return http_error(StatusCode::NOT_FOUND, "NOT_FOUND", "no such endpoint"),
         }
@@ -820,18 +823,19 @@ async fn invoke(state: Arc<FrontendState>, hash: String, extra: String, req: Req
             src: state.sender.uuid().to_string(),
             // REQUIRED: the handler's reply routes back cross-hive BY NAME.
             src_l2_name: Some(state.sender.full_name().to_string()),
-            // Option Z: forward by the pre-resolved handler name (LSA cross-hive).
-            dst: Destination::Unicast(entry.handler_node.clone()),
+            // Option Z: forward by the pre-resolved owner L2 name (LSA cross-hive).
+            dst: Destination::Unicast(entry.owner_l2_name.clone()),
             ttl: state.ttl,
             trace_id: Uuid::new_v4().to_string(),
         },
         meta: Meta {
             // Option A: the target's own declared family.
             msg_type: entry.inbound_family.clone(),
-            // Carried for the handler's info/authz; routing does not depend on it.
-            dst_ilk: Some(entry.ilk.clone()),
-            // The edge's own a-fuego ilk. Core is the first trusted identity
-            // boundary and may re-derive/ignore it (spec §12).
+            // The channel identity (v6 §4): the owning node disambiguates which of
+            // its channels this request is for. Opaque tag; the edge never resolves it.
+            ich: Some(ich.clone()),
+            // The edge's own a-fuego self label. Core is the first trusted identity
+            // boundary and may re-derive/ignore it (v6 §6). NO dst_ilk (frontier, I6).
             src_ilk: Some(state.self_ilk.clone()),
             context: Some(Value::Object(ctx)),
             ..Meta::default()
@@ -1013,14 +1017,15 @@ mod tests {
     }
 
     #[test]
-    fn registry_file_parses_z_rows() {
+    fn registry_file_parses_ich_rows() {
         let raw = r#"{"endpoints":[
-            {"hash":"h1","ilk":"ilk:a","handler_node":"AI.handler@motherbee","inbound_family":"user","auth_mode":"public","methods":["POST"]},
-            {"hash":"h2","ilk":"ilk:b","handler_node":"IO.api@motherbee","inbound_family":"text","auth_mode":"shared-secret","secret":"s3cr3t"}
+            {"ich":"ich:1111","owner_l2_name":"IO.cloud@motherbee","inbound_family":"user","auth_mode":"public","methods":["POST"]},
+            {"ich":"ich:2222","owner_l2_name":"IO.web@motherbee","inbound_family":"text","auth_mode":"shared-secret","secret":"s3cr3t"}
         ]}"#;
         let parsed: EndpointsFile = serde_json::from_str(raw).expect("parse");
         assert_eq!(parsed.endpoints.len(), 2);
-        assert_eq!(parsed.endpoints[0].handler_node, "AI.handler@motherbee");
+        assert_eq!(parsed.endpoints[0].ich, "ich:1111");
+        assert_eq!(parsed.endpoints[0].owner_l2_name, "IO.cloud@motherbee");
         assert_eq!(parsed.endpoints[0].inbound_family, "user");
         assert_eq!(parsed.endpoints[0].auth_mode, AuthMode::Public);
         assert_eq!(parsed.endpoints[1].auth_mode, AuthMode::SharedSecret);
@@ -1030,12 +1035,12 @@ mod tests {
     #[test]
     fn extract_endpoint_rows_handles_direct_and_wrapped() {
         let direct = json!({ "endpoints": [
-            {"hash":"h","ilk":"ilk:x","handler_node":"AI.h@motherbee","inbound_family":"user","auth_mode":"public"}
+            {"ich":"ich:1","owner_l2_name":"IO.cloud@motherbee","inbound_family":"user","auth_mode":"public"}
         ]});
         assert_eq!(extract_endpoint_rows(&direct).unwrap().len(), 1);
 
         let wrapped = json!({ "node_name": "SY.edge@ingress1", "patch": { "endpoints": [
-            {"hash":"h","ilk":"ilk:x","handler_node":"AI.h@motherbee","inbound_family":"user","auth_mode":"public"}
+            {"ich":"ich:1","owner_l2_name":"IO.cloud@motherbee","inbound_family":"user","auth_mode":"public"}
         ] }});
         assert_eq!(extract_endpoint_rows(&wrapped).unwrap().len(), 1);
 
@@ -1045,14 +1050,14 @@ mod tests {
     }
 
     #[test]
-    fn rows_to_registry_indexes_by_hash() {
+    fn rows_to_registry_indexes_by_ich() {
         let rows: Vec<EndpointRow> = serde_json::from_value(json!([
-            {"hash":"abc","ilk":"ilk:a","handler_node":"AI.h@motherbee","inbound_family":"user","auth_mode":"public"}
+            {"ich":"ich:abc","owner_l2_name":"IO.cloud@motherbee","inbound_family":"user","auth_mode":"public"}
         ]))
         .unwrap();
         let reg = rows_to_registry(rows);
-        let entry = reg.get("abc").expect("indexed");
-        assert_eq!(entry.handler_node, "AI.h@motherbee");
+        let entry = reg.get("ich:abc").expect("indexed");
+        assert_eq!(entry.owner_l2_name, "IO.cloud@motherbee");
         assert_eq!(entry.inbound_family, "user");
     }
 

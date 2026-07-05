@@ -15,3 +15,6 @@ nodes/io/target
 /local-playground/
 /tmp/
 /dist/
+
+# Real *.fluxbee.ai TLS cert + private key — deployed via vault/out-of-band, never committed
+sslcert/
