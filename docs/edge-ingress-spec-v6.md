@@ -282,19 +282,21 @@ pushes (defense-in-depth; but the edge is a DMZ cache — if the DMZ is compromi
 and the **durable** authority is inside, I3). The heavy "protected-action + admin-origin + edge-gate"
 stack proposed earlier was defending a threat this model removes.
 
-### 11.1 ⏳ PENDING (DEFERRED BY DECISION) — the `externalize` authz gate is NOT built yet
+### 11.1 ✅ CLOSED — the `externalize`/`unexternalize` authz gate
 
-**Status: the door is intentionally left OPEN for the first cut.** The `IO.`-prefix + owner-check
-above is the *design*; it is **not implemented yet** — the first `externalize` accepts the request
-**without** the origin/owner gate. Rationale (user decision, this session): the **admin plane must
-complexify first** (more commands, planes, roles), and the authz doors get **closed properly then** —
-not patched prematurely onto a chain that today does not even gate the `ADMIN_COMMAND` entry
-(`sy_admin.rs:2730` dispatches with no origin check; the effective mutation gate is the orchestrator's
-`is_allowed_admin_source_name`, and `SY.admin` relays under its own origin). The correct fix is a
-**dedicated, explicit gate** added when admin's authz model matures.
+**Status: implemented + lab-validated (2026-07-05).** `SY.admin` gates node-originated
+`externalize`/`unexternalize` in `authorize_channel_command` (`sy_admin.rs`), threading the
+router-stamped `caller_l2_name` (`msg.routing.src_l2_name`, un-forgeable) down to the handlers:
+- **I1** — `caller` must start with `IO.` (only IO nodes may open/close a public channel).
+- **I8** — the identity-resolved `owner_l2_name` of the `ICH` must equal `caller` (you act only on
+  your OWN channel). Neither value comes from `params`.
+- Trusted internal paths (HTTP operator / architect executor) pass `caller = None` and bypass — the
+  gate is specifically about untrusted node origins.
 
-> **⚠️ Until this closes, `externalize` is UNAUTHENTICATED. Must NOT ship to production.** This is
-> the reopened form of audit gap #1 — tracked here on purpose, not forgotten.
+Rejections return `UNAUTHORIZED` (HTTP 403). Lab proof: `IO.cloud` externalizing its own ICH →
+`ok` → `curl /e/<ich>` 200; a second node `IO.web` attempting the SAME ICH → `UNAUTHORIZED` "a node
+may act only on its own channel (I8); owner=IO.cloud@…, caller=IO.web@…". Unit-tested
+(`externalize_authz_gate_io_prefix_and_ownership`). This closes the reopened form of audit gap #1.
 
 ---
 

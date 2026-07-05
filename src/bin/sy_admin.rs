@@ -1818,6 +1818,7 @@ impl FunctionTool for AdminExecutorStepTool {
             &self.step.action,
             target.as_deref(),
             params,
+            None, // executor/architect path — trusted internal origin
         )
         .await
         .map_err(|err| fluxbee_ai_sdk::AiSdkError::Protocol(err.to_string()))?;
@@ -1873,6 +1874,7 @@ impl FunctionTool for AdminExecutorHelpTool {
                 "action": requested_action,
                 "action_name": requested_action
             }),
+            None, // read-only help lookup — trusted internal origin
         )
         .await
         .map_err(|err| fluxbee_ai_sdk::AiSdkError::Protocol(err.to_string()))?;
@@ -2793,6 +2795,9 @@ async fn handle_internal_admin_command(
         &action,
         parsed.target.as_deref(),
         parsed.params,
+        // The node's un-forgeable identity, stamped by the router (mod.rs:975 local / peer path
+        // cross-hive). This is the authz origin — never the payload.
+        msg.routing.src_l2_name.as_deref(),
     )
     .await?;
     let status = internal
@@ -3444,21 +3449,22 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
 
 /// `externalize` — an IO node self-exposes one of its channels (`ICH`) as a public
 /// URL on the edge (v6 §7). Resolves `ICH -> owner_l2_name` from identity SHM (admin
-/// runs where identity lives) and pushes the row to the edge as a `CONFIG_CHANGED`
-/// (subsystem `endpoints`; the edge whole-map-replaces its cache).
+/// runs where identity lives) and OPENS the URL on the edge via the `EDGE_OPEN_URL`
+/// service command (§7.6, addressed + acked; NOT a config push), blocking on the ack.
 ///
-/// ⚠️ FIRST CUT — deliberately incomplete (v6 §11.1 / §12):
-/// - **NO AUTHZ GATE.** The `IO.`-prefix + `owner == requester` self-service check is
-///   DEFERRED (door open) until the admin plane complexifies. Unauthenticated.
-/// - **No durable binding.** The `ICH` "externalized" attribute in `SY.identity`
-///   (molde `MSG_ICH_SET_ENABLED`) is not written yet, so this does not survive an edge
-///   reimage on its own and pushes ONE row (whole-map replace) — single endpoint for now.
-/// - **No token.** `auth_mode=shared-secret` carries a caller-supplied `secret`; the
-///   vault-minted channel token is deferred.
+/// **Authz (v6 §11.1): CLOSED.** A node-originated externalize must come from an `IO.*`
+/// node (I1) and may only expose its OWN channel (I8: resolved owner == router-stamped
+/// caller); see `authorize_channel_command`. Trusted internal paths (operator/executor)
+/// bypass.
+///
+/// Still deferred (v6 §12/§8): the durable `ICH` "externalized" attribute in `SY.identity`
+/// (so it survives an edge reimage) and the vault-minted channel token for
+/// `auth_mode=shared-secret` (which currently carries a caller-supplied `secret`).
 async fn handle_externalize(
     ctx: &AdminContext,
     client: &Arc<RouterDispatcher>,
     params: serde_json::Value,
+    caller_l2_name: Option<&str>,
 ) -> Result<InternalAdminDispatchResult, AdminError> {
     let get_str = |key: &str| {
         params
@@ -3507,6 +3513,13 @@ async fn handle_externalize(
         ));
     };
 
+    // Authz gate (v6 §11.1). A node-originated externalize must come from an IO.* node (I1) and may
+    // only expose ITS OWN channel (I8). `owner_l2_name` came from identity, `caller` from the router
+    // — neither from `params`. `caller == None` is a trusted internal path (HTTP operator / executor).
+    if let Err(reason) = authorize_channel_command(caller_l2_name, &owner_l2_name) {
+        return Ok(internal_unauthorized("externalize", &reason));
+    }
+
     // Build the endpoint row (the EDGE_OPEN_URL payload IS one row) and OPEN the URL on
     // the edge via a verified service command (§7) — NOT a config push. We BLOCK on the
     // edge's ack: the URL is "published" only once the edge confirms it holds the row.
@@ -3545,7 +3558,7 @@ async fn handle_externalize(
                 ich = %ich,
                 owner = %owner_l2_name,
                 edge = %edge_node,
-                "externalize: edge opened URL (ACKed) (⚠️ UNAUTHENTICATED — v6 §11.1)"
+                "externalize: edge opened URL (ACKed)"
             );
             Ok(InternalAdminDispatchResult {
                 http_status: 200,
@@ -3580,11 +3593,12 @@ async fn handle_externalize(
 
 /// `unexternalize` — the inverse of `externalize` (§7): close a public URL. The owning IO
 /// node (through SY.admin) asks to take a channel offline; admin sends `EDGE_CLOSE_URL` to
-/// the edge and blocks on the ack. Same open authz posture as externalize (§11.1 PENDING).
+/// the edge and blocks on the ack. Same authz gate as externalize (§11.1): IO.* + owner==caller.
 async fn handle_unexternalize(
-    _ctx: &AdminContext,
+    ctx: &AdminContext,
     client: &Arc<RouterDispatcher>,
     params: serde_json::Value,
+    caller_l2_name: Option<&str>,
 ) -> Result<InternalAdminDispatchResult, AdminError> {
     let get_str = |key: &str| {
         params
@@ -3603,6 +3617,31 @@ async fn handle_unexternalize(
             "missing payload.edge_node (the SY.edge L2 name to close the URL on)",
         ));
     };
+    // Authz gate (v6 §11.1), symmetric to externalize: a node may only close ITS OWN channel.
+    // Skip the identity resolve entirely on the trusted internal path (caller None).
+    if caller_l2_name.is_some() {
+        let owner = match fluxbee_sdk::identity::list_ich_options_from_hive_config(&ctx.config_dir) {
+            Ok(options) => options
+                .into_iter()
+                .find(|o| o.ich_id == ich)
+                .and_then(|o| o.owner_l2_name),
+            Err(err) => {
+                return Ok(internal_invalid_request(
+                    "unexternalize",
+                    &format!("identity SHM unavailable for ICH resolve: {err}"),
+                ))
+            }
+        };
+        let Some(owner) = owner else {
+            return Ok(internal_invalid_request(
+                "unexternalize",
+                &format!("no ICH '{ich}' with an owner in identity"),
+            ));
+        };
+        if let Err(reason) = authorize_channel_command(caller_l2_name, &owner) {
+            return Ok(internal_unauthorized("unexternalize", &reason));
+        }
+    }
     match send_system_request_with_meta(
         client,
         &edge_node,
@@ -3657,6 +3696,10 @@ async fn dispatch_internal_admin_command(
     action: &str,
     target: Option<&str>,
     params: serde_json::Value,
+    // The router-stamped, un-forgeable L2 name of the ORIGINATING node (`msg.routing.src_l2_name`),
+    // or `None` for trusted internal paths (HTTP operator / executor). Used to authorize
+    // self-service actions like `externalize` (v6 §11.1). Do NOT trust anything in `params` for authz.
+    caller_l2_name: Option<&str>,
 ) -> Result<InternalAdminDispatchResult, AdminError> {
     match action {
         "executor_validate_plan" => {
@@ -3693,12 +3736,12 @@ async fn dispatch_internal_admin_command(
             });
         }
         // externalize — an IO node self-exposes its own channel (ICH) on the edge
-        // (v6 §7). ⚠️ NO AUTHZ GATE YET (deferred by decision — v6 §11.1). Door open.
+        // (v6 §7). Authz gate CLOSED (v6 §11.1): IO.* + owner==caller, enforced in the handler.
         "externalize" => {
-            return handle_externalize(ctx, client, params).await;
+            return handle_externalize(ctx, client, params, caller_l2_name).await;
         }
         "unexternalize" => {
-            return handle_unexternalize(ctx, client, params).await;
+            return handle_unexternalize(ctx, client, params, caller_l2_name).await;
         }
         "executor_execute_plan" => {
             if target.is_some() {
@@ -3989,6 +4032,40 @@ fn internal_invalid_request(action: &str, detail: &str) -> InternalAdminDispatch
             "error_detail": detail,
         }),
     }
+}
+
+fn internal_unauthorized(action: &str, detail: &str) -> InternalAdminDispatchResult {
+    InternalAdminDispatchResult {
+        http_status: 403,
+        envelope: serde_json::json!({
+            "status": "error",
+            "action": action,
+            "payload": serde_json::Value::Null,
+            "error_code": "UNAUTHORIZED",
+            "error_detail": detail,
+        }),
+    }
+}
+
+/// Authorize a node-originated channel service command (`externalize`/`unexternalize`, v6 §11.1):
+/// the caller must be an `IO.*` node (I1) and may only act on ITS OWN channel (I8: the identity-
+/// resolved `owner_l2_name` must equal the router-stamped, un-forgeable caller). A `None` caller is
+/// a trusted internal path (HTTP operator / architect executor) and is allowed. Pure — unit-tested.
+fn authorize_channel_command(caller_l2_name: Option<&str>, owner_l2_name: &str) -> Result<(), String> {
+    let Some(caller) = caller_l2_name else {
+        return Ok(());
+    };
+    if !caller.starts_with("IO.") {
+        return Err(format!(
+            "only IO.* nodes may open/close a public channel (I1); caller={caller}"
+        ));
+    }
+    if owner_l2_name != caller {
+        return Err(format!(
+            "a node may act only on its own channel (I8); channel owner={owner_l2_name}, caller={caller}"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -12448,6 +12525,22 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::broadcast;
     use zip::write::FileOptions;
+
+    #[test]
+    fn externalize_authz_gate_io_prefix_and_ownership() {
+        let owner = "IO.cloud@motherbee";
+        // Trusted internal path (no router-stamped origin) is always allowed.
+        assert!(authorize_channel_command(None, owner).is_ok());
+        // The owner externalizing its own channel is allowed (I1 + I8).
+        assert!(authorize_channel_command(Some("IO.cloud@motherbee"), owner).is_ok());
+        // A non-IO node is rejected (I1) even if the name matched some owner.
+        assert!(authorize_channel_command(Some("SY.admin@motherbee"), owner).is_err());
+        assert!(authorize_channel_command(Some("AI.sales@motherbee"), owner).is_err());
+        // An IO node may NOT externalize someone else's channel (I8).
+        assert!(authorize_channel_command(Some("IO.other@motherbee"), owner).is_err());
+        // Same node name, different hive is still a different node — rejected (I8, exact match).
+        assert!(authorize_channel_command(Some("IO.cloud@worker1"), owner).is_err());
+    }
 
     fn test_temp_dir(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()

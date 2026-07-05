@@ -138,18 +138,26 @@ async fn main() -> Result<(), DynError> {
             })
             .await
         {
-            Ok(res) => tracing::info!(
+            Ok(res) if res.status.eq_ignore_ascii_case("ok") => tracing::info!(
+                target = %admin_target,
+                edge_node = %edge_node,
+                result = %res.payload,
+                "IO.cloud -> SY.admin externalize OK (public URL published on the edge)"
+            ),
+            // The RPC round-tripped but admin refused (e.g. the §11.1 authz gate): status != ok.
+            Ok(res) => tracing::warn!(
                 target = %admin_target,
                 edge_node = %edge_node,
                 status = %res.status,
-                result = %res.payload,
-                "IO.cloud -> SY.admin externalize OK (public URL published on the edge)"
+                error_code = ?res.error_code,
+                error_detail = ?res.error_detail,
+                "IO.cloud -> SY.admin externalize REJECTED"
             ),
             Err(err) => tracing::warn!(
                 target = %admin_target,
                 edge_node = %edge_node,
                 error = %err,
-                "IO.cloud -> SY.admin externalize failed"
+                "IO.cloud -> SY.admin externalize failed (transport)"
             ),
         }
     } else {
