@@ -287,13 +287,22 @@ Parked consciously — the edge receives `ICH → owner_l2_name` either way.
 
 ## 13. `add_ingress` — provisioning (alpha deployability blockers)
 
-- **H1 — package `sy-edge`** (binary + systemd unit); today the manifest gate returns
-  `MANIFEST_INVALID` and the unit ExecStart points nowhere.
-- **H2 — ship an ingress `system_nodes` template** (`[SY.config.routes, SY.edge]`); today
-  `system_nodes_for_role(_, Ingress)` errors to `CONFIG_FAILED`.
-- **H3 — TLS field on `IngressSection`, fail-closed.** Today the `edge:` block writes only `listen`
-  + `endpoints_path`; with no TLS the door binds **cleartext**. Carry TLS material (prefer
-  `tls_vault_key`); on `role: ingress` **no TLS ⇒ no listen** (fail-closed).
+**H1/H2/H3 RESOLVED + lab-validated (commit `1c2f507`).**
+
+- **H1 — package `sy-edge` — DONE.** `packaging/build-deb.sh` adds `sy-edge:sy_edge` to
+  `RUST_BINS` (staged into `/usr/bin` + `dist/core/bin`, auto-hashed into the core manifest) and a
+  dedicated unit `After/Wants=rt-gateway.service sy-vault.service` (it fetches TLS from vault at
+  boot). `deb-prerm` stops it; `scripts/install.sh` has dev-path parity. Verified inside the built
+  `.deb`: binary + unit + manifest entry present — the `MANIFEST_INVALID` gate now passes.
+- **H2 — ingress `system_nodes` template — DONE.** `config/hive.yaml` +
+  `packaging/hive.yaml.example` ship `system_nodes.ingress = [SY.config.routes, SY.edge]`, so
+  `system_nodes_for_role(_, Ingress)` resolves and `add_hive role=ingress` no longer aborts.
+- **H3 — TLS on `IngressSection`, fail-closed — DONE.** `IngressSection` accepts
+  `ingress.tls_vault_key` + `vault_hive` (YAML-scalar-guarded) and renders them into the remote
+  `edge:` block; absent them the edge sets `tls_requested=false` and binds cleartext, so an HTTPS
+  ingress **requires** `tls_vault_key` + the secret seeded (owner `SY.edge@<edge_hive>`).
+  Lab-proof: real `*.fluxbee.ai` cert seeded into `SY.vault`, edge fetched it by its deterministic
+  ilk and bound HTTPS; `curl https .../e/<ich>` → 200 with the Sectigo cert served.
 - **Edge born zero:** the seed file is empty/absent; endpoints arrive only via externalize.
   (Kills M1's "malformed seed → silent all-404": there is no seed.)
 
