@@ -376,6 +376,7 @@ sy_storage_bin="$(pick_bin sy_storage)" || { echo "Missing binary: $BIN_DIR/sy_s
 sy_identity_bin="$(pick_bin sy_identity)" || { echo "Missing binary: $BIN_DIR/sy_identity" >&2; missing=1; }
 sy_cognition_bin="$(pick_bin sy_cognition)" || { echo "Missing binary: $BIN_DIR/sy_cognition" >&2; missing=1; }
 sy_policy_bin="$(pick_bin sy_policy)" || { echo "Missing binary: $BIN_DIR/sy_policy" >&2; missing=1; }
+sy_edge_bin="$(pick_bin sy_edge)" || { echo "Missing binary: $BIN_DIR/sy_edge" >&2; missing=1; }
 sy_frontdesk_gov_bin="$(pick_bin sy-frontdesk-gov)" || { echo "Missing binary: $BIN_DIR/sy-frontdesk-gov" >&2; missing=1; }
 sy_opa_rules_bin=""
 if [[ -f "$ROOT_DIR/go/sy-opa-rules/sy-opa-rules" ]]; then
@@ -435,6 +436,7 @@ sudo install -m 0755 "$sy_storage_bin" /usr/bin/sy-storage
 sudo install -m 0755 "$sy_identity_bin" /usr/bin/sy-identity
 sudo install -m 0755 "$sy_cognition_bin" /usr/bin/sy-cognition
 sudo install -m 0755 "$sy_policy_bin" /usr/bin/sy-policy
+sudo install -m 0755 "$sy_edge_bin" /usr/bin/sy-edge
 sudo install -m 0755 "$sy_opa_rules_bin" /usr/bin/sy-opa-rules
 sudo install -m 0755 "$sy_timer_bin" /usr/bin/sy-timer
 sudo install -m 0755 "$sy_wf_rules_bin" /usr/bin/sy-wf-rules
@@ -452,6 +454,7 @@ sudo install -m 0755 "$sy_storage_bin" "$STATE_DIR/dist/core/bin/sy-storage"
 sudo install -m 0755 "$sy_identity_bin" "$STATE_DIR/dist/core/bin/sy-identity"
 sudo install -m 0755 "$sy_cognition_bin" "$STATE_DIR/dist/core/bin/sy-cognition"
 sudo install -m 0755 "$sy_policy_bin" "$STATE_DIR/dist/core/bin/sy-policy"
+sudo install -m 0755 "$sy_edge_bin" "$STATE_DIR/dist/core/bin/sy-edge"
 sudo install -m 0755 "$sy_opa_rules_bin" "$STATE_DIR/dist/core/bin/sy-opa-rules"
 sudo install -m 0755 "$sy_timer_bin" "$STATE_DIR/dist/core/bin/sy-timer"
 sudo install -m 0755 "$sy_wf_rules_bin" "$STATE_DIR/dist/core/bin/sy-wf-rules"
@@ -478,6 +481,8 @@ sy_cognition_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-cognition" | awk '{pr
 sy_cognition_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-cognition")"
 sy_policy_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-policy" | awk '{print $1}')"
 sy_policy_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-policy")"
+sy_edge_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-edge" | awk '{print $1}')"
+sy_edge_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-edge")"
 sy_timer_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-timer" | awk '{print $1}')"
 sy_timer_size="$(stat -c %s "$STATE_DIR/dist/core/bin/sy-timer")"
 sy_wf_rules_sha="$(sha256sum "$STATE_DIR/dist/core/bin/sy-wf-rules" | awk '{print $1}')"
@@ -514,6 +519,7 @@ cat >"$core_manifest_tmp" <<EOF
     "sy-storage": {"service": "sy-storage", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_storage_sha", "size": $sy_storage_size},
     "sy-cognition": {"service": "sy-cognition", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_cognition_sha", "size": $sy_cognition_size},
     "sy-policy": {"service": "sy-policy", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_policy_sha", "size": $sy_policy_size},
+    "sy-edge": {"service": "sy-edge", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_edge_sha", "size": $sy_edge_size},
     "sy-timer": {"service": "sy-timer", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_timer_sha", "size": $sy_timer_size},
     "sy-wf-rules": {"service": "sy-wf-rules", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_wf_rules_sha", "size": $sy_wf_rules_size},
     "sy-frontdesk-gov": {"service": "sy-frontdesk-gov", "version": "$core_version", "build_id": "$core_build_id", "sha256": "$sy_frontdesk_gov_sha", "size": $sy_frontdesk_gov_size},
@@ -569,6 +575,7 @@ verify_core_component "sy-orchestrator" "$sy_orch_sha" "$sy_orch_size"
 verify_core_component "sy-storage" "$sy_storage_sha" "$sy_storage_size"
 verify_core_component "sy-cognition" "$sy_cognition_sha" "$sy_cognition_size"
 verify_core_component "sy-policy" "$sy_policy_sha" "$sy_policy_size"
+verify_core_component "sy-edge" "$sy_edge_sha" "$sy_edge_size"
 verify_core_component "sy-timer" "$sy_timer_sha" "$sy_timer_size"
 verify_core_component "sy-wf-rules" "$sy_wf_rules_sha" "$sy_wf_rules_size"
 verify_core_component "sy-frontdesk-gov" "$sy_frontdesk_gov_sha" "$sy_frontdesk_gov_size"
@@ -1080,6 +1087,13 @@ install_unit \
   "/usr/bin/sy-frontdesk-gov" \
   "network.target rt-gateway.service sy-identity.service" \
   "rt-gateway.service sy-identity.service"
+# sy-edge needs the router up + SY.vault reachable (public TLS cert fetch at boot);
+# self-gates on role==ingress, so shipping the unit everywhere is safe.
+install_unit \
+  "sy-edge" \
+  "/usr/bin/sy-edge" \
+  "network.target rt-gateway.service sy-vault.service" \
+  "rt-gateway.service sy-vault.service"
 sudo systemctl daemon-reload
 
 if [[ "$RESTART_ORCHESTRATOR_AFTER_INSTALL" == "1" ]]; then

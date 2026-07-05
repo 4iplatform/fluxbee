@@ -190,6 +190,15 @@ struct IngressSection {
     /// Defaults to empty; rows are then pushed live via NODE_CONFIG_SET (spec §5.1).
     #[serde(default)]
     endpoints_json: Option<serde_json::Value>,
+    /// SY.vault secret key holding the public TLS material `{cert, key}` (PEM). When
+    /// set, it is rendered into the remote `edge:` block so SY.edge fetches its cert
+    /// from vault at boot and serves HTTPS fail-closed (spec §8 / blocker H3). The
+    /// secret must be seeded (owner_node = `SY.edge@<edge_hive>`) BEFORE the join.
+    #[serde(default)]
+    tls_vault_key: Option<String>,
+    /// Hive whose SY.vault holds the TLS secret. Defaults (at the edge) to `motherbee`.
+    #[serde(default)]
+    vault_hive: Option<String>,
 }
 
 fn resolve_add_hive_ingress_section(
@@ -217,9 +226,21 @@ fn resolve_add_hive_ingress_section(
     // The scalar is interpolated into the double-quoted hive.yaml `edge:` block —
     // guard against YAML injection at request time (mirrors the egress guard).
     validate_yaml_scalar(&listen, "ingress.listen")?;
+    // Optional TLS wiring: the vault secret key + hive holding the public cert.
+    // Same YAML-injection guard, since both are interpolated into the edge: block.
+    let tls_vault_key = get_str("tls_vault_key");
+    if let Some(key) = tls_vault_key.as_deref() {
+        validate_yaml_scalar(key, "ingress.tls_vault_key")?;
+    }
+    let vault_hive = get_str("vault_hive");
+    if let Some(hive) = vault_hive.as_deref() {
+        validate_yaml_scalar(hive, "ingress.vault_hive")?;
+    }
     Ok(IngressSection {
         listen: Some(listen),
         endpoints_json: ing.get("endpoints_json").cloned(),
+        tls_vault_key,
+        vault_hive,
     })
 }
 
@@ -17737,6 +17758,17 @@ async fn add_ingress_hive_flow(
         });
     let dist_path_str = state.dist.path.to_string_lossy().to_string();
     let edge_listen = ingress.listen.clone().unwrap_or_default();
+    // Render the TLS block only when a vault key was supplied. Absent it, the edge
+    // sets tls_requested=false and binds plaintext — so an HTTPS ingress REQUIRES
+    // ingress.tls_vault_key (and the secret seeded under owner SY.edge@<edge_hive>).
+    // Both scalars were YAML-scalar-validated in resolve_add_hive_ingress_section.
+    let edge_tls_yaml = match ingress.tls_vault_key.as_deref() {
+        Some(key) if !key.is_empty() => {
+            let vault_hive = ingress.vault_hive.as_deref().unwrap_or("motherbee");
+            format!("  tls_vault_key: \"{key}\"\n  vault_hive: \"{vault_hive}\"\n")
+        }
+        _ => String::new(),
+    };
     for (val, label) in [
         (hive_id, "hive_id"),
         (worker_uplink.as_str(), "wan uplink address"),
@@ -17749,12 +17781,13 @@ async fn add_ingress_hive_flow(
         }
     }
     let hive_yaml = format!(
-        "hive_id: {hive_id}\nrole: ingress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  sync:\n    enabled: false\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: false\nedge:\n  listen: \"{edge_listen}\"\n  endpoints_path: \"/etc/fluxbee/edge.endpoints.json\"\n{system_nodes}",
+        "hive_id: {hive_id}\nrole: ingress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  sync:\n    enabled: false\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: false\nedge:\n  listen: \"{edge_listen}\"\n  endpoints_path: \"/etc/fluxbee/edge.endpoints.json\"\n{edge_tls}{system_nodes}",
         hive_id = hive_id,
         uplink = worker_uplink,
         storage = storage_path,
         dist_path = state.dist.path.display(),
         edge_listen = edge_listen,
+        edge_tls = edge_tls_yaml,
         system_nodes = render_system_nodes_yaml(HiveRole::Ingress, &ingress_system_nodes),
     );
     if let Err(err) = write_remote_file(address, &key_path, creds.user.as_str(), "/etc/fluxbee/hive.yaml", &hive_yaml) {

@@ -114,3 +114,27 @@ system_nodes:
       - SY.config.routes
     wait_for:
       - SY.config.routes
+  # ingress hive: the public HTTP(S) door. SY.edge binds :443 (fail-closed on
+  # role==ingress) and reverse-proxies /e/<ich> into the mesh. No SY.identity here
+  # (identity frontier) — the edge forwards by pre-resolved owner name (Option Z).
+  ingress:
+    nodes:
+      - SY.config.routes
+      - SY.edge
+    wait_for:
+      - SY.config.routes
+
+# --- edge: the public ingress door (only used when role: ingress) ---
+# Uncommented on an ingress hive. SY.edge serves the public HTTPS door and
+# fetches its TLS cert from SY.vault at boot (fail-closed: it refuses to bind
+# plaintext once a cert is requested). Seed the cert first via SY.admin:
+#   POST /hives/<vault_hive>/vault/secrets
+#   {key:"edge_tls_fluxbee_ai", value:{cert:"<PEM chain>", key:"<PEM key>"},
+#    metadata:{resource_type:"tls", owner_node:"SY.edge@<edge_hive>"}}
+# owner_node MUST be the edge's fully-qualified name so the dedicated-owner read
+# authorizes (the edge has no identity SHM; authz is by its deterministic ilk).
+# edge:
+#   listen: "0.0.0.0:443"
+#   tls_vault_key: "edge_tls_fluxbee_ai"
+#   vault_hive: "motherbee"
+#   endpoints_path: "/etc/fluxbee/edge.endpoints.json"
