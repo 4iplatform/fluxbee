@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "common",
   "io-api",
+  "io-cloud",
   "io-linkedhelper",
   "io-sim",
   "io-slack",

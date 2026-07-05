@@ -149,6 +149,7 @@ struct SystemNodesSection {
     motherbee: Option<RoleSystemNodes>,
     worker: Option<RoleSystemNodes>,
     egress: Option<RoleSystemNodes>,
+    ingress: Option<RoleSystemNodes>,
 }
 
 /// Egress NAT parameters. On a `role: egress` hive this carries the LAN/WAN
@@ -176,12 +177,80 @@ fn default_ipv6_policy() -> String {
     "blocked".to_string()
 }
 
-/// Resolved hive role. `SY.orchestrator` is ternary: motherbee | worker | egress.
+/// Ingress edge-frontend parameters. On a `role: ingress` hive this drives the
+/// `SY.edge` public `:443` frontend, written into the remote hive.yaml `edge:`
+/// section (sy_edge reads it and, gated on `role==ingress`, binds the door). See
+/// docs/edge-ingress-spec-v3.md.
+#[derive(Debug, Clone, Deserialize)]
+struct IngressSection {
+    listen: Option<String>,
+    /// Initial endpoint registry written to the remote
+    /// `/etc/fluxbee/edge.endpoints.json`. Each row is
+    /// `{hash, ilk, handler_node, inbound_family, auth_mode, ...}` (Option A/Z).
+    /// Defaults to empty; rows are then pushed live via NODE_CONFIG_SET (spec §5.1).
+    #[serde(default)]
+    endpoints_json: Option<serde_json::Value>,
+    /// SY.vault secret key holding the public TLS material `{cert, key}` (PEM). When
+    /// set, it is rendered into the remote `edge:` block so SY.edge fetches its cert
+    /// from vault at boot and serves HTTPS fail-closed (spec §8 / blocker H3). The
+    /// secret must be seeded (owner_node = `SY.edge@<edge_hive>`) BEFORE the join.
+    #[serde(default)]
+    tls_vault_key: Option<String>,
+    /// Hive whose SY.vault holds the TLS secret. Defaults (at the edge) to `motherbee`.
+    #[serde(default)]
+    vault_hive: Option<String>,
+}
+
+fn resolve_add_hive_ingress_section(
+    payload: &serde_json::Value,
+) -> Result<IngressSection, OrchestratorError> {
+    let ing = payload
+        .get("ingress")
+        .and_then(|v| v.as_object())
+        .ok_or("add_hive role=ingress requires an 'ingress' object (listen, optional endpoints_json)")?;
+    let get_str = |key: &str| {
+        ing.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    // A public listener must be EXPLICIT — no safe default for a :443 bind.
+    let listen = get_str("listen")
+        .ok_or("add_hive role=ingress requires 'ingress.listen' (host:port for the public frontend)")?;
+    if listen.parse::<std::net::SocketAddr>().is_err() {
+        return Err(format!(
+            "invalid ingress.listen '{listen}' (want host:port, e.g. 0.0.0.0:443)"
+        )
+        .into());
+    }
+    // The scalar is interpolated into the double-quoted hive.yaml `edge:` block —
+    // guard against YAML injection at request time (mirrors the egress guard).
+    validate_yaml_scalar(&listen, "ingress.listen")?;
+    // Optional TLS wiring: the vault secret key + hive holding the public cert.
+    // Same YAML-injection guard, since both are interpolated into the edge: block.
+    let tls_vault_key = get_str("tls_vault_key");
+    if let Some(key) = tls_vault_key.as_deref() {
+        validate_yaml_scalar(key, "ingress.tls_vault_key")?;
+    }
+    let vault_hive = get_str("vault_hive");
+    if let Some(hive) = vault_hive.as_deref() {
+        validate_yaml_scalar(hive, "ingress.vault_hive")?;
+    }
+    Ok(IngressSection {
+        listen: Some(listen),
+        endpoints_json: ing.get("endpoints_json").cloned(),
+        tls_vault_key,
+        vault_hive,
+    })
+}
+
+/// Resolved hive role. `SY.orchestrator` supports motherbee | worker | egress | ingress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HiveRole {
     Motherbee,
     Worker,
     Egress,
+    Ingress,
 }
 
 impl HiveRole {
@@ -192,6 +261,8 @@ impl HiveRole {
             Some(HiveRole::Worker)
         } else if is_egress_role(role) {
             Some(HiveRole::Egress)
+        } else if is_ingress_role(role) {
+            Some(HiveRole::Ingress)
         } else {
             None
         }
@@ -202,6 +273,7 @@ impl HiveRole {
             HiveRole::Motherbee => "motherbee",
             HiveRole::Worker => "worker",
             HiveRole::Egress => "egress",
+            HiveRole::Ingress => "ingress",
         }
     }
 }
@@ -612,10 +684,11 @@ async fn main() -> Result<(), OrchestratorError> {
     let is_motherbee = is_mother_role(hive.role.as_deref());
     let is_worker = is_worker_role(hive.role.as_deref());
     let is_egress = is_egress_role(hive.role.as_deref());
-    if !is_motherbee && !is_worker && !is_egress {
+    let is_ingress = is_ingress_role(hive.role.as_deref());
+    if !is_motherbee && !is_worker && !is_egress && !is_ingress {
         tracing::warn!(
             role = ?hive.role,
-            "SY.orchestrator supports only role=motherbee|worker|egress; exiting"
+            "SY.orchestrator supports only role=motherbee|worker|egress|ingress; exiting"
         );
         return Ok(());
     }
@@ -2058,6 +2131,49 @@ async fn handle_admin(
                                 .await;
                                 // B-2: same as the worker path — on a failed egress join,
                                 // best-effort revoke the (possibly seeded) bootstrap key.
+                                if result.get("status").and_then(|v| v.as_str()) != Some("ok") {
+                                    let revoke = best_effort_revoke_bootstrap(
+                                        &address,
+                                        creds.user.as_str(),
+                                        creds.password.as_deref(),
+                                    );
+                                    if let Some(obj) = result.as_object_mut() {
+                                        obj.insert(
+                                            "ssh_bootstrap_open".to_string(),
+                                            serde_json::json!(!revoke.closed()),
+                                        );
+                                        obj.insert(
+                                            "ssh_key_removed".to_string(),
+                                            serde_json::json!(revoke.ssh_key_removed),
+                                        );
+                                        obj.insert(
+                                            "sudoers_removed".to_string(),
+                                            serde_json::json!(revoke.sudoers_removed),
+                                        );
+                                    }
+                                }
+                                result
+                            }
+                            Err(err) => serde_json::json!({
+                                "status": "error",
+                                "error_code": "INVALID_REQUEST",
+                                "message": err.to_string(),
+                            }),
+                        },
+                        Ok(HiveRole::Ingress) => match resolve_add_hive_ingress_section(&msg.payload) {
+                            Ok(ingress) => {
+                                let mut result = add_ingress_hive_flow(
+                                    state,
+                                    &hive_id,
+                                    &address,
+                                    harden_ssh,
+                                    restrict_ssh,
+                                    ingress,
+                                    &creds,
+                                )
+                                .await;
+                                // Same failure tail as worker/egress: on a failed
+                                // ingress join, best-effort revoke the seeded key.
                                 if result.get("status").and_then(|v| v.as_str()) != Some("ok") {
                                     let revoke = best_effort_revoke_bootstrap(
                                         &address,
@@ -3549,6 +3665,7 @@ fn system_nodes_for_role(
         HiveRole::Motherbee => section.motherbee.as_ref(),
         HiveRole::Worker => section.worker.as_ref(),
         HiveRole::Egress => section.egress.as_ref(),
+        HiveRole::Ingress => section.ingress.as_ref(),
     }
     .ok_or_else(|| {
         format!(
@@ -4819,7 +4936,7 @@ fn reconcile_egress(state: &OrchestratorState) -> Result<(), OrchestratorError> 
                 reconcile_worker_egress(gateway_ip, &eg.ipv6)?;
             }
         }
-        HiveRole::Motherbee => {}
+        HiveRole::Motherbee | HiveRole::Ingress => {}
     }
     Ok(())
 }
@@ -17416,6 +17533,500 @@ async fn add_egress_hive_flow(
     })
 }
 
+/// Provision an INGRESS hive (public HTTP frontend). Near-verbatim clone of
+/// `add_egress_hive_flow` with these deltas: no egress NAT; `role: ingress` +
+/// an `edge:` section in the remote hive.yaml (drives the SY.edge frontend); a
+/// remote `/etc/fluxbee/edge.endpoints.json` seed; and the ingress node set
+/// (SY.config.routes + SY.edge). Like egress it runs NO sy-identity, so it does
+/// NOT distribute an identity key; SY.edge forwards by the pre-resolved
+/// handler_node cached in its endpoint table (Option Z, spec §6), never resolving
+/// dst_ilk itself. The public listener config lives in hive.yaml, read by sy_edge
+/// gated on role==ingress.
+async fn add_ingress_hive_flow(
+    state: &OrchestratorState,
+    hive_id: &str,
+    address: &str,
+    harden_ssh: bool,
+    restrict_ssh: bool,
+    ingress: IngressSection,
+    creds: &BootstrapCreds,
+) -> serde_json::Value {
+    let err_payload = |code: &str, msg: String| {
+        serde_json::json!({ "status": "error", "error_code": code, "message": msg })
+    };
+
+    if !valid_hive_id(hive_id) {
+        return err_payload("INVALID_HIVE_ID", "invalid hive_id".to_string());
+    }
+    if !valid_address(address) {
+        return err_payload("INVALID_ADDRESS", "invalid address".to_string());
+    }
+    let _topology_guard = state.lock_hive_topology(hive_id).await;
+    if let Err(err) = validate_dist_runtime_for_remote_hive(&state.dist) {
+        return err_payload(
+            "CONFIG_FAILED",
+            format!("invalid dist runtime config for ingress hive.yaml: {err}"),
+        );
+    }
+    let root = hives_root();
+    let hive_dir = root.join(hive_id);
+    if hive_exists(&state.state_dir, hive_id) {
+        if hive_status(&root, hive_id).as_deref() == Some("pending") {
+            tracing::warn!(
+                hive_id = hive_id,
+                "ingress hive is pending; resuming add_hive to complete finalize (idempotent)"
+            );
+        } else {
+            return err_payload("HIVE_EXISTS", "hive already exists".to_string());
+        }
+    }
+    if hive_partial_exists(hive_id) {
+        if !hive_dir_is_direct_child(&hive_dir, &root) {
+            return err_payload(
+                "INVALID_HIVE_ID",
+                "refusing to clean hive dir outside hives_root".to_string(),
+            );
+        }
+        if let Err(err) = fs::remove_dir_all(&hive_dir) {
+            return err_payload("IO_ERROR", format!("failed to clean stale hive dir: {err}"));
+        }
+    }
+    let wan_listen = state.wan_listen.clone().unwrap_or_default();
+    if wan_listen.is_empty() {
+        return err_payload(
+            "MISSING_WAN_LISTEN",
+            "wan.listen missing in hive.yaml".to_string(),
+        );
+    }
+    if !state.wan_authorized_hives.is_empty()
+        && !state
+            .wan_authorized_hives
+            .iter()
+            .any(|allowed| allowed.trim() == hive_id)
+    {
+        return err_payload(
+            "WAN_NOT_AUTHORIZED",
+            format!("hive '{hive_id}' not present in wan.authorized_hives"),
+        );
+    }
+    if !hive_dir_is_direct_child(&hive_dir, &root) {
+        return err_payload(
+            "INVALID_HIVE_ID",
+            "refusing to create hive dir outside hives_root".to_string(),
+        );
+    }
+    if let Err(err) = fs::create_dir_all(&hive_dir) {
+        return err_payload("IO_ERROR", err.to_string());
+    }
+
+    // SSH bootstrap (key-first probe, password fallback) — identical to egress.
+    let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
+    if !key_path.exists() {
+        return err_payload(
+            "SSH_KEY_FAILED",
+            format!("motherbee ssh key missing (expected '{}')", key_path.display()),
+        );
+    }
+    let pub_key = match public_key_from_private_key(&key_path) {
+        Ok(data) => data,
+        Err(err) => return err_payload("SSH_KEY_FAILED", err.to_string()),
+    };
+    match ssh_with_key(address, &key_path, "true", creds.user.as_str()) {
+        Ok(()) => {}
+        Err(key_err) => {
+            let password = match creds.password.as_deref() {
+                Some(p) => p,
+                None => {
+                    return ssh_bootstrap_error_payload(&format!(
+                        "key probe failed and no ssh_password supplied for password bootstrap: {key_err}"
+                    ));
+                }
+            };
+            if let Err(err) = apply_remote_unrestricted_authorized_key_with_pass(
+                address,
+                &pub_key,
+                creds.user.as_str(),
+                password,
+            ) {
+                return ssh_bootstrap_error_payload(&err.to_string());
+            }
+        }
+    }
+    if let Err(err) = ensure_remote_orchestrator_sudoers_with_access(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        creds.password.as_deref().unwrap_or(""),
+    ) {
+        return err_payload("SUDO_SETUP_FAILED", err.to_string());
+    }
+    if let Err(err) = ssh_with_key(
+        address,
+        &key_path,
+        "sudo -n /bin/bash -lc 'exit 0'",
+        creds.user.as_str(),
+    ) {
+        return err_payload(
+            "SSH_KEY_FAILED",
+            format!("key access verification failed: {err}"),
+        );
+    }
+
+    // Resolve the ingress profile template from motherbee's own hive.yaml.
+    let core_manifest = match load_core_manifest() {
+        Ok(m) => m,
+        Err(err) => return err_payload("MANIFEST_INVALID", err.to_string()),
+    };
+    let local_hive = match load_hive(&state.config_dir) {
+        Ok(h) => h,
+        Err(err) => {
+            return err_payload(
+                "CONFIG_FAILED",
+                format!("failed to read local hive.yaml: {err}"),
+            )
+        }
+    };
+    let ingress_system_nodes = match system_nodes_for_role(&local_hive, HiveRole::Ingress) {
+        Ok(s) => s,
+        Err(err) => {
+            return err_payload(
+                "CONFIG_FAILED",
+                format!("invalid ingress system_nodes template on motherbee: {err}"),
+            )
+        }
+    };
+    for node_name in &ingress_system_nodes.nodes {
+        let service = name_to_service(node_name);
+        if !core_manifest.components.contains_key(&service) {
+            return err_payload(
+                "MANIFEST_INVALID",
+                format!("core manifest missing configured ingress service '{service}'"),
+            );
+        }
+    }
+
+    if let Err(err) = sync_core_to_worker(
+        hive_id,
+        address,
+        &key_path,
+        creds.user.as_str(),
+        false,
+        true,
+        HiveRole::Ingress,
+    ) {
+        append_single_deployment_history(
+            state,
+            "core",
+            "add_hive",
+            hive_id,
+            "error",
+            Some("CORE_SYNC_FAILED".to_string()),
+            local_core_manifest_hash().ok().flatten(),
+        );
+        return err_payload("CORE_SYNC_FAILED", err.to_string());
+    }
+
+    if let Err(err) = ssh_with_key(
+        address,
+        &key_path,
+        &sudo_wrap(
+            "mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers",
+        ),
+        creds.user.as_str(),
+    ) {
+        return err_payload("CONFIG_FAILED", err.to_string());
+    }
+
+    // Build and write the minimal ingress hive.yaml (role: ingress + edge:).
+    let worker_uplink = match resolve_worker_uplink_address(&wan_listen, address) {
+        Ok(value) => value,
+        Err(err) => {
+            return err_payload(
+                "CONFIG_FAILED",
+                format!("resolve ingress uplink failed: {err}"),
+            )
+        }
+    };
+    let storage_path = state
+        .storage_path
+        .try_lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_else(|_| {
+            json_router::paths::storage_root_dir()
+                .to_string_lossy()
+                .to_string()
+        });
+    let dist_path_str = state.dist.path.to_string_lossy().to_string();
+    let edge_listen = ingress.listen.clone().unwrap_or_default();
+    // Render the TLS block only when a vault key was supplied. Absent it, the edge
+    // sets tls_requested=false and binds plaintext — so an HTTPS ingress REQUIRES
+    // ingress.tls_vault_key (and the secret seeded under owner SY.edge@<edge_hive>).
+    // Both scalars were YAML-scalar-validated in resolve_add_hive_ingress_section.
+    let edge_tls_yaml = match ingress.tls_vault_key.as_deref() {
+        Some(key) if !key.is_empty() => {
+            let vault_hive = ingress.vault_hive.as_deref().unwrap_or("motherbee");
+            format!("  tls_vault_key: \"{key}\"\n  vault_hive: \"{vault_hive}\"\n")
+        }
+        _ => String::new(),
+    };
+    for (val, label) in [
+        (hive_id, "hive_id"),
+        (worker_uplink.as_str(), "wan uplink address"),
+        (storage_path.as_str(), "storage.path"),
+        (dist_path_str.as_str(), "dist.path"),
+        (edge_listen.as_str(), "edge.listen"),
+    ] {
+        if let Err(err) = validate_yaml_scalar(val, label) {
+            return err_payload("CONFIG_FAILED", err.to_string());
+        }
+    }
+    let hive_yaml = format!(
+        "hive_id: {hive_id}\nrole: ingress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  sync:\n    enabled: false\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: false\nedge:\n  listen: \"{edge_listen}\"\n  endpoints_path: \"/etc/fluxbee/edge.endpoints.json\"\n{edge_tls}{system_nodes}",
+        hive_id = hive_id,
+        uplink = worker_uplink,
+        storage = storage_path,
+        dist_path = state.dist.path.display(),
+        edge_listen = edge_listen,
+        edge_tls = edge_tls_yaml,
+        system_nodes = render_system_nodes_yaml(HiveRole::Ingress, &ingress_system_nodes),
+    );
+    if let Err(err) = write_remote_file(address, &key_path, creds.user.as_str(), "/etc/fluxbee/hive.yaml", &hive_yaml) {
+        return err_payload("CONFIG_FAILED", err.to_string());
+    }
+    distribute_hive_tls(address, &key_path, creds.user.as_str(), hive_id);
+    let config_routes_yaml = format!(
+        "version: 1\nupdated_at: \"{}\"\nroutes: []\nvpns: []\ntaps: []\n",
+        now_epoch_ms()
+    );
+    if let Err(err) = write_remote_file(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        "/etc/fluxbee/sy-config-routes.yaml",
+        &config_routes_yaml,
+    ) {
+        return err_payload("CONFIG_FAILED", err.to_string());
+    }
+    // Seed the endpoint registry so the frontend's load_registry never starts
+    // empty-by-accident (a missing file 404s every /e/<hash>).
+    let endpoints_json = ingress
+        .endpoints_json
+        .as_ref()
+        .and_then(|v| serde_json::to_string_pretty(v).ok())
+        .unwrap_or_else(|| "{\n  \"endpoints\": []\n}\n".to_string());
+    if let Err(err) = write_remote_file(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        "/etc/fluxbee/edge.endpoints.json",
+        &endpoints_json,
+    ) {
+        return err_payload("CONFIG_FAILED", err.to_string());
+    }
+
+    // systemd units: rt-gateway + sy-orchestrator + the ingress SY nodes.
+    let mut units: Vec<(String, String)> = vec![
+        ("rt-gateway".to_string(), "/usr/bin/rt-gateway".to_string()),
+        (
+            "sy-orchestrator".to_string(),
+            "/usr/bin/sy-orchestrator".to_string(),
+        ),
+    ];
+    for node_name in &ingress_system_nodes.nodes {
+        let service = name_to_service(node_name);
+        units.push((service.clone(), service_to_exec(&service)));
+    }
+    for (name, exec_path) in &units {
+        let unit = if name == "sy-orchestrator" {
+            format!("[Unit]\nDescription=Fluxbee {name}\nAfter=network.target rt-gateway.service\nWants=rt-gateway.service\nRequires=rt-gateway.service\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n")
+        } else {
+            format!("[Unit]\nDescription=Fluxbee {name}\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n")
+        };
+        let unit_path = format!("/etc/systemd/system/{name}.service");
+        if let Err(err) = write_remote_file(address, &key_path, creds.user.as_str(), &unit_path, &unit) {
+            return err_payload("SERVICE_FAILED", format!("{name}: {err}"));
+        }
+    }
+    if let Err(err) = ssh_with_key(
+        address,
+        &key_path,
+        &sudo_wrap("systemctl daemon-reload"),
+        creds.user.as_str(),
+    ) {
+        return err_payload("SERVICE_FAILED", err.to_string());
+    }
+    for name in ["rt-gateway", "sy-orchestrator"] {
+        if let Err(err) = ssh_with_key(
+            address,
+            &key_path,
+            &sudo_wrap(&format!("systemctl enable {name}")),
+            creds.user.as_str(),
+        ) {
+            return err_payload("SERVICE_FAILED", format!("enable {name}: {err}"));
+        }
+        let inner = format!(
+            "systemctl restart {name} || (systemctl reset-failed {name} || true; sleep 1; systemctl start {name})"
+        );
+        let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&inner)));
+        if let Err(err) = ssh_with_key(address, &key_path, &cmd, creds.user.as_str()) {
+            return err_payload("SERVICE_FAILED", format!("start {name}: {err}"));
+        }
+    }
+    if let Err(err) = remote_wait_service_active(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        "sy-orchestrator",
+        CORE_SERVICE_HEALTH_TIMEOUT_SECS,
+    ) {
+        let journal = remote_service_journal_tail(address, &key_path, creds.user.as_str(), "sy-orchestrator", 120);
+        return err_payload(
+            "SERVICE_FAILED",
+            match journal {
+                Some(tail) => format!("sy-orchestrator failed health gate: {err}; journal={tail}"),
+                None => format!("sy-orchestrator failed health gate: {err}"),
+            },
+        );
+    }
+
+    let mut wan_connected = true;
+    if let Err(err) = wait_for_wan(&state.hive_id, hive_id, Duration::from_secs(60)) {
+        tracing::warn!(hive_id = hive_id, error = %err, "ingress WAN not ready in time");
+        wan_connected = false;
+    }
+    let mut orchestrator_connected = false;
+    if wan_connected {
+        orchestrator_connected =
+            wait_for_remote_orchestrator_node(&state.hive_id, hive_id, Duration::from_secs(60))
+                .is_ok();
+    }
+
+    let info_payload = serde_json::json!({
+        "hive_id": hive_id,
+        "address": address,
+        "role": "ingress",
+        "created_at": now_epoch_ms().to_string(),
+        "status": "pending",
+        "ssh_user": creds.user,
+    });
+    if let Err(err) = write_hive_info(&root, hive_id, &info_payload) {
+        return err_payload("IO_ERROR", err.to_string());
+    }
+
+    if !wan_connected {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "WAN_TIMEOUT",
+            "message": "ingress WAN did not become ready",
+            "hive_id": hive_id,
+            "address": address,
+            "ingress_role": "ingress",
+            "wan_connected": false,
+        });
+    }
+    if !orchestrator_connected {
+        let journal = remote_service_journal_tail(address, &key_path, creds.user.as_str(), "sy-orchestrator", 120);
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "ORCHESTRATOR_TIMEOUT",
+            "message": match journal {
+                Some(tail) => format!("ingress orchestrator not observed in LSA; journal={tail}"),
+                None => "ingress orchestrator not observed in LSA".to_string(),
+            },
+            "hive_id": hive_id,
+            "address": address,
+            "ingress_role": "ingress",
+            "wan_connected": true,
+            "orchestrator_connected": false,
+        });
+    }
+
+    // SSH hardening (ingress is an internet-facing boundary; fatal, like egress).
+    let ssh_controls = match apply_add_hive_ssh_controls_after_finalize(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &pub_key,
+        restrict_ssh,
+        harden_ssh,
+    ) {
+        Ok(c) => c,
+        Err(err) => {
+            let err_text = err.to_string();
+            let error_code = if err_text.to_ascii_lowercase().contains("harden") {
+                "SSH_HARDEN_FAILED"
+            } else {
+                "SSH_KEY_FAILED"
+            };
+            tracing::warn!(hive_id = hive_id, error = %err_text, "ingress ssh hardening failed");
+            return serde_json::json!({
+                "status": "error",
+                "error_code": error_code,
+                "message": err_text,
+                "hive_id": hive_id,
+                "address": address,
+                "ingress_role": "ingress",
+                "harden_ssh": harden_ssh,
+                "harden_ssh_applied": false,
+                "restrict_ssh": false,
+                "restrict_ssh_requested": restrict_ssh,
+                "wan_connected": true,
+                "orchestrator_connected": true,
+            });
+        }
+    };
+    let restrict_ssh_applied = ssh_controls.restrict_ssh_applied;
+    let restrict_ssh_mode = ssh_controls.restrict_ssh_mode;
+
+    let connected_info = serde_json::json!({
+        "hive_id": hive_id,
+        "address": address,
+        "role": "ingress",
+        "created_at": now_epoch_ms().to_string(),
+        "status": "connected",
+        "ssh_user": creds.user,
+    });
+    if let Err(err) = write_hive_info(&root, hive_id, &connected_info) {
+        return err_payload("IO_ERROR", err.to_string());
+    }
+
+    append_single_deployment_history(
+        state,
+        "core",
+        "add_hive",
+        hive_id,
+        "ok",
+        None,
+        local_core_manifest_hash().ok().flatten(),
+    );
+
+    let ssh_bootstrap_revoked =
+        match revoke_bootstrap_ssh_access(address, &key_path, creds.user.as_str(), &pub_key) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access on ingress; key/sudoers may remain");
+                false
+            }
+        };
+
+    serde_json::json!({
+        "status": "ok",
+        "hive_id": hive_id,
+        "address": address,
+        "ingress_role": "ingress",
+        "ingress_listen": edge_listen,
+        "harden_ssh": harden_ssh,
+        "harden_ssh_applied": harden_ssh,
+        "restrict_ssh": restrict_ssh_applied,
+        "restrict_ssh_mode": restrict_ssh_mode,
+        "restrict_ssh_requested": restrict_ssh,
+        "ssh_bootstrap_revoked": ssh_bootstrap_revoked,
+        "wan_connected": wan_connected,
+        "orchestrator_connected": orchestrator_connected,
+        "note": "ingress SY.edge frontend binds the public listener from hive.yaml edge.listen (gated on role==ingress). It forwards by the pre-resolved handler_node cached in its endpoint table (Option Z); ingress runs no sy-identity.",
+    })
+}
+
 fn ssh_bootstrap_error_payload(error: &str) -> serde_json::Value {
     let lower = error.to_ascii_lowercase();
     let code = if lower.contains("connection timed out") || lower.contains("operation timed out") {
@@ -17523,7 +18134,7 @@ fn resolve_add_hive_role(payload: &serde_json::Value) -> Result<HiveRole, Orches
         Some(serde_json::Value::String(raw)) => HiveRole::from_role(Some(raw))
             .filter(|r| *r != HiveRole::Motherbee)
             .ok_or_else(|| {
-                format!("add_hive: unsupported role '{raw}' (use worker|egress)").into()
+                format!("add_hive: unsupported role '{raw}' (use worker|egress|ingress)").into()
             }),
         // A present-but-non-string role is a malformed request, not a worker.
         Some(other) => Err(format!("add_hive: 'role' must be a string, got {other}").into()),
@@ -18981,6 +19592,10 @@ fn is_egress_role(role: Option<&str>) -> bool {
     matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "egress")
 }
 
+fn is_ingress_role(role: Option<&str>) -> bool {
+    matches!(role.map(|r| r.trim().to_ascii_lowercase()), Some(ref r) if r == "ingress")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -19400,6 +20015,40 @@ mod tests {
     }
 
     #[test]
+    fn ingress_role_accepts_sy_edge() {
+        let section = RoleSystemNodes {
+            nodes: vec!["SY.config.routes".to_string(), "SY.edge".to_string()],
+            wait_for: vec!["SY.config.routes".to_string()],
+        };
+        assert!(validate_system_nodes(&section, HiveRole::Ingress).is_ok());
+    }
+
+    #[test]
+    fn resolve_add_hive_ingress_section_requires_and_validates_listen() {
+        // happy: explicit listen (no core_ingress_l2 — Z routes by cached handler_node)
+        let s = resolve_add_hive_ingress_section(&serde_json::json!({
+            "ingress": { "listen": "0.0.0.0:443" }
+        }))
+        .unwrap();
+        assert_eq!(s.listen.as_deref(), Some("0.0.0.0:443"));
+        // missing ingress object → rejected
+        assert!(resolve_add_hive_ingress_section(&serde_json::json!({})).is_err());
+        // missing listen → rejected (no default for a public bind)
+        assert!(resolve_add_hive_ingress_section(&serde_json::json!({ "ingress": {} })).is_err());
+        // non host:port listen → rejected
+        assert!(resolve_add_hive_ingress_section(&serde_json::json!({
+            "ingress": { "listen": "not-a-socket" }
+        }))
+        .is_err());
+        // YAML-injection in listen → rejected by validate_yaml_scalar (newline
+        // can't form a host:port anyway, but assert the guard path holds)
+        assert!(resolve_add_hive_ingress_section(&serde_json::json!({
+            "ingress": { "listen": "0.0.0.0:443\nmalicious: true" }
+        }))
+        .is_err());
+    }
+
+    #[test]
     fn resolve_add_hive_role_defaults_and_validates() {
         assert_eq!(
             resolve_add_hive_role(&serde_json::json!({})).unwrap(),
@@ -19408,6 +20057,10 @@ mod tests {
         assert_eq!(
             resolve_add_hive_role(&serde_json::json!({"role": "egress"})).unwrap(),
             HiveRole::Egress
+        );
+        assert_eq!(
+            resolve_add_hive_role(&serde_json::json!({"role": "ingress"})).unwrap(),
+            HiveRole::Ingress
         );
         assert_eq!(
             resolve_add_hive_role(&serde_json::json!({"role": "WORKER"})).unwrap(),

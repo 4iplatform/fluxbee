@@ -19,10 +19,12 @@ trap 'rm -rf "$STAGE"' EXIT
 # core service binaries: <installed-name>=<cargo --bin or go marker>
 RUST_BINS=(rt-gateway:json-router sy-admin:sy_admin sy-config-routes:sy_config_routes
   sy-architect:sy_architect sy-vault:sy_vault sy-orchestrator:sy_orchestrator
-  sy-storage:sy_storage sy-identity:sy_identity sy-cognition:sy_cognition sy-policy:sy_policy)
+  sy-storage:sy_storage sy-identity:sy_identity sy-cognition:sy_cognition sy-policy:sy_policy
+  sy-edge:sy_edge)
 GO_BINS=(sy-opa-rules:go/sy-opa-rules sy-timer:go/sy-timer sy-wf-rules:go/sy-wf-rules
   wf-generic:go/nodes/wf/wf-generic)
-# units (14): every core service EXCEPT wf-generic (a runtime the orchestrator spawns)
+# units: every core service EXCEPT wf-generic (a runtime the orchestrator spawns).
+# sy-edge gets a dedicated unit below (custom rt-gateway+sy-vault ordering).
 UNITS=(rt-gateway sy-config-routes sy-opa-rules sy-admin sy-architect sy-vault
   sy-orchestrator sy-storage sy-identity sy-cognition sy-policy sy-timer sy-wf-rules sy-frontdesk-gov)
 
@@ -118,6 +120,11 @@ gen_unit() { # <name> [after] [wants]
 for u in "${UNITS[@]}"; do gen_unit "$u"; done
 gen_unit sy-frontdesk-gov "network.target rt-gateway.service sy-identity.service" \
   "rt-gateway.service sy-identity.service"
+# sy-edge (ingress public door) needs the router up to connect and SY.vault reachable
+# to fetch its public TLS cert at boot; the binary self-gates on role==ingress, so the
+# unit ships on every node but only binds :443 where hive.yaml says role: ingress.
+gen_unit sy-edge "network.target rt-gateway.service sy-vault.service" \
+  "rt-gateway.service sy-vault.service"
 
 # config template + first-boot helper. The packaging template is a clean
 # fresh-motherbee config (no lab uplink; wan.mtls set) — distinct from the dev
@@ -140,7 +147,7 @@ Installed-Size: ${INSTALLED_KB}
 Maintainer: 4i Platform <ops@4iplatform.com>
 Description: Fluxbee internal-network orchestration mesh
  Core services (router, orchestrator, identity, vault, storage, admin,
- architect, cognition, policy, timer, wf-rules, opa-rules, frontdesk).
+ architect, cognition, policy, timer, wf-rules, opa-rules, frontdesk, edge).
  Binaries + dist/core manifest (hashes baked at build), systemd units, and a
  first-boot helper. Run 'sudo fluxbee-firstboot' after install.
 EOF

@@ -128,3 +128,12 @@ system_nodes:
       - SY.config.routes
     wait_for:
       - SY.config.routes
+  # ingress hive: the public HTTP(S) door. SY.edge binds :443 (fail-closed on
+  # role==ingress) and reverse-proxies /e/<ich> into the mesh. No SY.identity here
+  # (identity frontier) — the edge forwards by pre-resolved owner name (Option Z).
+  ingress:
+    nodes:
+      - SY.config.routes
+      - SY.edge
+    wait_for:
+      - SY.config.routes

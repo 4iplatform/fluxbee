@@ -55,3 +55,5 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem", "x509-parser"] }
 rustls-pemfile = "2"
 x509-parser = "0.16"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
