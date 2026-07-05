@@ -27,7 +27,8 @@ use fluxbee_ai_sdk::{
 use fluxbee_sdk::nats::{NatsClient, NatsRequestEnvelope, NatsResponseEnvelope};
 use fluxbee_sdk::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, VaultSecretChangedPayload,
-    VaultSecretInterest, MSG_CONFIG_CHANGED, MSG_NODE_STATUS_GET, MSG_TTL_EXCEEDED,
+    VaultSecretInterest, MSG_CONFIG_CHANGED, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE,
+    MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE, MSG_NODE_STATUS_GET, MSG_TTL_EXCEEDED,
     MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
@@ -99,6 +100,7 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "set_node_config",
     "get_node_status",
     "externalize",
+    "unexternalize",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -3505,7 +3507,11 @@ async fn handle_externalize(
         ));
     };
 
-    // Build the edge row and push it via CONFIG_CHANGED (subsystem "endpoints").
+    // Build the endpoint row (the EDGE_OPEN_URL payload IS one row) and OPEN the URL on
+    // the edge via a verified service command (§7) — NOT a config push. We BLOCK on the
+    // edge's ack: the URL is "published" only once the edge confirms it holds the row.
+    // As an addressed request/response it routes cross-hive like any node RPC (no router
+    // special-casing, unlike CONFIG_CHANGED which the peer router swallows).
     let mut row = serde_json::json!({
         "ich": ich,
         "owner_l2_name": owner_l2_name,
@@ -3518,57 +3524,131 @@ async fn handle_externalize(
     if let Some(methods) = &methods {
         row["methods"] = serde_json::json!(methods);
     }
-    let version = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let config = serde_json::json!({ "endpoints": [row] });
+    match send_system_request_with_meta(
+        client,
+        &edge_node,
+        MSG_EDGE_OPEN_URL,
+        MSG_EDGE_OPEN_URL_RESPONSE,
+        row,
+        16,
+        None,
+        None,
+        Some(edge_node.clone()),
+        None,
+        None,
+        Duration::from_secs(15),
+    )
+    .await
+    {
+        Ok(payload) if payload.get("status").and_then(|v| v.as_str()) == Some("ok") => {
+            tracing::info!(
+                ich = %ich,
+                owner = %owner_l2_name,
+                edge = %edge_node,
+                "externalize: edge opened URL (ACKed) (⚠️ UNAUTHENTICATED — v6 §11.1)"
+            );
+            Ok(InternalAdminDispatchResult {
+                http_status: 200,
+                envelope: serde_json::json!({
+                    "status": "ok",
+                    "action": "externalize",
+                    "payload": {
+                        "url": format!("/e/{ich}"),
+                        "ich": ich,
+                        "owner_l2_name": owner_l2_name,
+                        "edge_node": edge_node,
+                    }
+                }),
+            })
+        }
+        Ok(payload) => {
+            let err = payload
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("edge rejected open_url");
+            Ok(internal_invalid_request(
+                "externalize",
+                &format!("edge did not open URL '{ich}': {err}"),
+            ))
+        }
+        Err(err) => Ok(internal_invalid_request(
+            "externalize",
+            &format!("edge unreachable / open_url failed for '{ich}': {err}"),
+        )),
+    }
+}
 
-    let sender = client.sender_snapshot();
-    let msg = Message {
-        routing: Routing {
-            src: sender.uuid().to_string(),
-            src_l2_name: None,
-            dst: Destination::Unicast(edge_node.clone()),
-            ttl: 16,
-            trace_id: Uuid::new_v4().to_string(),
-        },
-        meta: Meta {
-            msg_type: SYSTEM_KIND.to_string(),
-            msg: Some(MSG_CONFIG_CHANGED.to_string()),
-            scope: Some(SCOPE_GLOBAL.to_string()),
-            ..Meta::default()
-        },
-        payload: serde_json::to_value(ConfigChangedPayload {
-            subsystem: "endpoints".to_string(),
-            action: Some("set".to_string()),
-            auto_apply: Some(true),
-            version,
-            config,
-        })?,
+/// `unexternalize` — the inverse of `externalize` (§7): close a public URL. The owning IO
+/// node (through SY.admin) asks to take a channel offline; admin sends `EDGE_CLOSE_URL` to
+/// the edge and blocks on the ack. Same open authz posture as externalize (§11.1 PENDING).
+async fn handle_unexternalize(
+    _ctx: &AdminContext,
+    client: &Arc<RouterDispatcher>,
+    params: serde_json::Value,
+) -> Result<InternalAdminDispatchResult, AdminError> {
+    let get_str = |key: &str| {
+        params
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
     };
-    sender.send(msg).await?;
-    tracing::info!(
-        ich = %ich,
-        owner = %owner_l2_name,
-        edge = %edge_node,
-        version = version,
-        "externalize: pushed endpoint to edge (⚠️ UNAUTHENTICATED — v6 §11.1)"
-    );
-
-    Ok(InternalAdminDispatchResult {
-        http_status: 200,
-        envelope: serde_json::json!({
-            "status": "ok",
-            "action": "externalize",
-            "payload": {
-                "url": format!("/e/{ich}"),
-                "ich": ich,
-                "owner_l2_name": owner_l2_name,
-                "version": version,
-            }
-        }),
-    })
+    let Some(ich) = get_str("ich") else {
+        return Ok(internal_invalid_request("unexternalize", "missing payload.ich"));
+    };
+    let Some(edge_node) = get_str("edge_node") else {
+        return Ok(internal_invalid_request(
+            "unexternalize",
+            "missing payload.edge_node (the SY.edge L2 name to close the URL on)",
+        ));
+    };
+    match send_system_request_with_meta(
+        client,
+        &edge_node,
+        MSG_EDGE_CLOSE_URL,
+        MSG_EDGE_CLOSE_URL_RESPONSE,
+        serde_json::json!({ "ich": ich }),
+        16,
+        None,
+        None,
+        Some(edge_node.clone()),
+        None,
+        None,
+        Duration::from_secs(15),
+    )
+    .await
+    {
+        Ok(payload) if payload.get("status").and_then(|v| v.as_str()) == Some("ok") => {
+            let closed = payload
+                .get("closed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            tracing::info!(ich = %ich, edge = %edge_node, closed, "unexternalize: edge closed URL (ACKed)");
+            Ok(InternalAdminDispatchResult {
+                http_status: 200,
+                envelope: serde_json::json!({
+                    "status": "ok",
+                    "action": "unexternalize",
+                    "payload": { "ich": ich, "edge_node": edge_node, "closed": closed }
+                }),
+            })
+        }
+        Ok(payload) => {
+            let err = payload
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("edge rejected close_url");
+            Ok(internal_invalid_request(
+                "unexternalize",
+                &format!("edge did not close URL '{ich}': {err}"),
+            ))
+        }
+        Err(err) => Ok(internal_invalid_request(
+            "unexternalize",
+            &format!("edge unreachable / close_url failed for '{ich}': {err}"),
+        )),
+    }
 }
 
 async fn dispatch_internal_admin_command(
@@ -3616,6 +3696,9 @@ async fn dispatch_internal_admin_command(
         // (v6 §7). ⚠️ NO AUTHZ GATE YET (deferred by decision — v6 §11.1). Door open.
         "externalize" => {
             return handle_externalize(ctx, client, params).await;
+        }
+        "unexternalize" => {
+            return handle_unexternalize(ctx, client, params).await;
         }
         "executor_execute_plan" => {
             if target.is_some() {

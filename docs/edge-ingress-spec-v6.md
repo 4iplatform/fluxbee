@@ -162,13 +162,29 @@ IO node (e.g. IO.cloud) ── externalize {ich, inbound_family, auth_mode} ─�
      ├─ resolve ICH → owner_l2_name (identity SHM) ; owner == src_l2_name?   ◄── I8, one-to-one
      ├─ if auth_mode=shared-secret: mint token → vault_put owned-by node ilk (§8)
      ├─ record durable binding (inside the mesh, §12)
-     └─ push resolved cache cross-hive → SY.orchestrator@<ingress-hive> (relay)
-          → LOCAL CONFIG_CHANGED subsystem "endpoints" (real src_l2_name) → edge
-   edge: version gate → whole-map replace of SHM cache
-   response to the node: { url:"/e/<ich>", token? }
+     └─ EDGE_OPEN_URL {row} ──► SY.edge@<ingress-hive>    # addressed service command (§7.6)
+          admin BLOCKS on EDGE_OPEN_URL_RESPONSE           # the URL is "published" only once the edge acks
+   edge: upsert the row by ich  →  EDGE_OPEN_URL_RESPONSE { ok, url }
+   response to the node: { url:"/e/<ich>", token? }        # whole chain synchronous: IO ◄ admin ◄ edge
 ```
 The externalize request travels the **internal mesh** (IO.cloud → SY.admin), never through the edge
 — so there is no bootstrap chicken-and-egg (§10).
+
+### 7.6 The admin→edge leg is a COMMAND, not a config push (lab-corrected)
+Opening/closing a URL is a **verified service directive**, not the edge's config. It is delivered as
+an **addressed request/response**: `EDGE_OPEN_URL` / `EDGE_CLOSE_URL` (Unicast to the edge, acked with
+`*_RESPONSE`). Consequences:
+- **Cross-hive works with zero router changes.** An addressed command routes like any node RPC
+  (`ForwardHive`); it is NOT a `CONFIG_CHANGED` broadcast, which the peer router intentionally
+  swallows (`mod.rs:3578`) — that swallow is correct for route/OPA config but silently dropped the
+  endpoint push to a remote edge (the bug the ingress lab surfaced).
+- **Synchronous confirmation.** Admin blocks on the ack, so the IO node is told `ok` only after the
+  edge actually holds the row. No fire-and-forget.
+- **Per-URL, not whole-table-replace.** Each `EDGE_OPEN_URL` upserts one `ich`; `EDGE_CLOSE_URL`
+  removes one. (The old whole-map replace wiped every other URL on each externalize — gone.)
+- **Distinct from `node_config` (§9).** `set/get_node_config` is the edge's OWN config; it never
+  carried endpoints. The prior `CONFIG_CHANGED subsystem=endpoints`/`node_config` overload was the
+  "under-the-table" muddle and is removed from the edge.
 
 ### 7.5 Request path (runtime)
 Per external request to `/e/<ich>`:
@@ -208,11 +224,17 @@ clients), **vault** (durable; survives an edge reimage via the re-push; node re-
 
 The edge's **own** params (DNS resolver, NIC/public-IP `expected_public_ip_cidr`, `listen`, TLS
 material, `log_level`) are ordinary **node config** via generic `set/get_node_config` — through
-admin, like any node. Distinct from externalize (§5).
+admin, like any node. Distinct from externalize (§5/§7.6): `node_config` is the edge configuring
+**itself**; it NEVER carries the URL table (a service the edge gives to others).
 
-Gap: today the edge reads config **only at boot** (`Config::load`). Add a **`config` subsystem
-handler** (symmetric to `endpoints`) so params apply live. Live: `log_level`, DNS resolver.
-Restart-required: rebind `:443`, change NIC, swap TLS.
+**Corrected (lab):** the edge used to treat `CONFIG_CHANGED subsystem="endpoints"` **and**
+`"node_config"` identically — both replaced the endpoint table. That conflation is removed; the
+endpoint table is now driven only by `EDGE_OPEN_URL`/`EDGE_CLOSE_URL` (§7.6), and `node_config` is
+free for its real purpose.
+
+Gap (still open): today the edge reads its own config **only at boot** (`Config::load`). Add a
+`node_config` handler so params apply live. Live: `log_level`, DNS resolver. Restart-required:
+rebind `:443`, change NIC, swap TLS.
 
 **DNS split:** the edge's own *resolver* is node config (here). The public *zone record*
 (`fluxbee.ai/e/…` → edge IP) is an external DNS-zone op at core, deferred behind the wildcard cert.

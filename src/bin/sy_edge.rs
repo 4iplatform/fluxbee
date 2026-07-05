@@ -12,8 +12,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
 use fluxbee_sdk::protocol::{
-    ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, MSG_TTL_EXCEEDED,
-    MSG_UNREACHABLE, SYSTEM_KIND,
+    Destination, Message, Meta, Routing, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE,
+    MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
@@ -86,13 +86,6 @@ mod http_ingress {
 
 const RPC_CH_SYSTEM: &str = "system";
 
-/// `CONFIG_CHANGED` subsystem that carries the edge's reverse-proxy table
-/// (`ich -> {owner_l2_name, inbound_family, auth}`) pushed by the core
-/// authority via `NODE_CONFIG_SET` (v6 §7). Also accepts the generic
-/// `node_config` wrapper.
-const ENDPOINTS_SUBSYSTEM: &str = "endpoints";
-const NODE_CONFIG_SUBSYSTEM: &str = "node_config";
-
 /// Hop-by-hop + auth headers stripped before a request crosses inward. Entry auth
 /// is already gated at the door; the raw bearer token never travels inward (§3).
 const STRIPPED_REQUEST_HEADERS: &[&str] = &[
@@ -122,8 +115,8 @@ struct Config {
     /// (fail-closed role gate, `resolve_http_listen`). Absent ⇒ the node connects
     /// to the mesh but serves no public door.
     http_listen: Option<String>,
-    /// Seed for the reverse-proxy table (`hash -> {...}`). Live updates then
-    /// arrive over the mesh via `NODE_CONFIG_SET` (§5.1).
+    /// Seed for the reverse-proxy table (`ich -> {...}`). Born-zero in production;
+    /// live URLs then arrive one at a time via `EDGE_OPEN_URL` / `EDGE_CLOSE_URL` (§7).
     endpoints_path: Option<PathBuf>,
     /// Public TLS material from disk. When both are `Some` the frontend serves HTTPS.
     tls_cert: Option<PathBuf>,
@@ -176,9 +169,9 @@ async fn main() -> Result<(), SyEdgeError> {
         .await
         .map_err(|err| format!("sy-edge system receiver: {err}"))?;
 
-    // The reverse-proxy table: seeded from disk, then hot-swapped in place when
-    // the core authority pushes `NODE_CONFIG_SET` (spec §5.1). Shared (read) by
-    // the frontend and (write) by the system loop below.
+    // The reverse-proxy table: seeded from disk (born-zero in prod), then mutated one
+    // URL at a time by `EDGE_OPEN_URL` / `EDGE_CLOSE_URL` service commands (§7). Shared
+    // (read) by the frontend and (write) by the system loop below.
     let registry: Arc<RwLock<HashMap<String, EndpointEntry>>> = Arc::new(RwLock::new(
         config
             .endpoints_path
@@ -252,35 +245,23 @@ async fn main() -> Result<(), SyEdgeError> {
         }
     }
 
-    // System channel: default node status + live endpoint-table pushes
-    // (`NODE_CONFIG_SET` / `CONFIG_CHANGED`, §5.1). This loop is the process's
-    // only blocking await — it keeps main() alive.
-    let mut applied_version: u64 = 0;
+    // System channel: default node status + the URL-service command plane. Opening or
+    // closing a public URL is a VERIFIED SERVICE DIRECTIVE from SY.admin, delivered as an
+    // addressed request/response (`EDGE_OPEN_URL` / `EDGE_CLOSE_URL`, §7) — NOT a config
+    // push. Each command mutates one row (upsert/remove) and is acked, so it routes
+    // cross-hive like any node RPC and the caller stays blocked until it lands. This loop
+    // is the process's only blocking await — it keeps main() alive.
     while let Some(msg) = system_rx.recv().await {
-        if let Some(payload) = as_config_changed(&msg) {
-            if payload.subsystem == ENDPOINTS_SUBSYSTEM || payload.subsystem == NODE_CONFIG_SUBSYSTEM
-            {
-                // Monotonic version gate (apply_mode = replace, §5.1). version 0
-                // (unset) always applies.
-                if payload.version != 0 && payload.version <= applied_version {
-                    tracing::debug!(version = payload.version, applied = applied_version, "sy-edge ignoring stale endpoints config");
-                    continue;
-                }
-                if let Some(rows) = extract_endpoint_rows(&payload.config) {
-                    let count = rows.len();
-                    let next = rows_to_registry(rows);
-                    match registry.write() {
-                        Ok(mut guard) => *guard = next,
-                        Err(_) => {
-                            tracing::error!("sy-edge registry lock poisoned; endpoint update dropped");
-                            continue;
-                        }
-                    }
-                    applied_version = payload.version;
-                    tracing::info!(endpoints = count, version = payload.version, "sy-edge endpoint table replaced via NODE_CONFIG_SET");
-                }
+        match msg.meta.msg.as_deref() {
+            Some(MSG_EDGE_OPEN_URL) => {
+                apply_open_url(&sender, &registry, &msg, config.ttl).await;
                 continue;
             }
+            Some(MSG_EDGE_CLOSE_URL) => {
+                apply_close_url(&sender, &registry, &msg, config.ttl).await;
+                continue;
+            }
+            _ => {}
         }
         match try_handle_default_node_status(&sender, &msg).await {
             Ok(true) => {}
@@ -316,23 +297,109 @@ fn build_sy_edge_rpc_profile() -> Result<OperationalRouteProfile, RpcError> {
         .build()
 }
 
-/// Parse a `CONFIG_CHANGED` broadcast (or `None` if this message isn't one).
-fn as_config_changed(msg: &Message) -> Option<ConfigChangedPayload> {
-    if msg.meta.msg_type != SYSTEM_KIND || msg.meta.msg.as_deref() != Some(MSG_CONFIG_CHANGED) {
-        return None;
-    }
-    serde_json::from_value::<ConfigChangedPayload>(msg.payload.clone()).ok()
+/// `EDGE_OPEN_URL` (§7): SY.admin opens one public URL on this edge on behalf of an IO
+/// node. The payload IS one endpoint row (`ich`, `owner_l2_name`, `inbound_family`, auth).
+/// Upsert by `ich` (idempotent on retry), then ack — the caller (admin, and through it the
+/// IO node) stays blocked until this lands. NOTE: this is a service directive, NOT config.
+async fn apply_open_url(
+    sender: &NodeSender,
+    registry: &Arc<RwLock<HashMap<String, EndpointEntry>>>,
+    msg: &Message,
+    ttl: u8,
+) {
+    let outcome: Result<(String, usize), String> = (|| {
+        let row: EndpointRow = serde_json::from_value(msg.payload.clone())
+            .map_err(|err| format!("invalid EDGE_OPEN_URL payload: {err}"))?;
+        let (ich, entry) = row_to_entry(row);
+        let mut guard = registry
+            .write()
+            .map_err(|_| "registry lock poisoned".to_string())?;
+        guard.insert(ich.clone(), entry);
+        let count = guard.len();
+        Ok((ich, count))
+    })();
+    let payload = match &outcome {
+        Ok((ich, count)) => {
+            tracing::info!(ich = %ich, endpoints = count, trace_id = %msg.routing.trace_id, "sy-edge opened URL (EDGE_OPEN_URL)");
+            json!({ "status": "ok", "ich": ich, "url": format!("/e/{ich}") })
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, trace_id = %msg.routing.trace_id, "sy-edge EDGE_OPEN_URL failed");
+            json!({ "status": "error", "error": err })
+        }
+    };
+    send_edge_reply(sender, msg, MSG_EDGE_OPEN_URL_RESPONSE, payload, ttl).await;
 }
 
-/// Pull the `endpoints` array out of a `CONFIG_CHANGED.config`, tolerating the
-/// generic node-config wrapper (`config.patch.endpoints` / `config.config.endpoints`)
-/// as well as a direct `config.endpoints`.
-fn extract_endpoint_rows(config: &Value) -> Option<Vec<EndpointRow>> {
-    let arr = config
-        .get("endpoints")
-        .or_else(|| config.get("patch").and_then(|p| p.get("endpoints")))
-        .or_else(|| config.get("config").and_then(|p| p.get("endpoints")))?;
-    serde_json::from_value::<Vec<EndpointRow>>(arr.clone()).ok()
+/// `EDGE_CLOSE_URL` (§7): SY.admin closes a public URL. Payload is `{ich}`. Remove the row
+/// (idempotent — closing an already-absent URL is `ok`), then ack.
+async fn apply_close_url(
+    sender: &NodeSender,
+    registry: &Arc<RwLock<HashMap<String, EndpointEntry>>>,
+    msg: &Message,
+    ttl: u8,
+) {
+    let outcome: Result<(String, bool), String> = (|| {
+        let ich = msg
+            .payload
+            .get("ich")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "missing ich".to_string())?
+            .to_string();
+        let mut guard = registry
+            .write()
+            .map_err(|_| "registry lock poisoned".to_string())?;
+        let existed = guard.remove(&ich).is_some();
+        Ok((ich, existed))
+    })();
+    let payload = match &outcome {
+        Ok((ich, existed)) => {
+            tracing::info!(ich = %ich, existed, trace_id = %msg.routing.trace_id, "sy-edge closed URL (EDGE_CLOSE_URL)");
+            json!({ "status": "ok", "ich": ich, "closed": existed })
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, trace_id = %msg.routing.trace_id, "sy-edge EDGE_CLOSE_URL failed");
+            json!({ "status": "error", "error": err })
+        }
+    };
+    send_edge_reply(sender, msg, MSG_EDGE_CLOSE_URL_RESPONSE, payload, ttl).await;
+}
+
+/// Reply to a service command by name (router-stamped `src_l2_name`, so it routes back
+/// cross-hive), preserving the request's `trace_id` for the caller's pending matcher.
+async fn send_edge_reply(
+    sender: &NodeSender,
+    req: &Message,
+    resp_msg: &str,
+    payload: Value,
+    ttl: u8,
+) {
+    let dst = req
+        .routing
+        .src_l2_name
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| req.routing.src.clone());
+    let reply = Message {
+        routing: Routing {
+            src: sender.uuid().to_string(),
+            src_l2_name: None,
+            dst: Destination::Unicast(dst),
+            ttl,
+            trace_id: req.routing.trace_id.clone(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(resp_msg.to_string()),
+            ..Meta::default()
+        },
+        payload,
+    };
+    if let Err(err) = sender.send(reply).await {
+        tracing::warn!(error = %err, trace_id = %req.routing.trace_id, "sy-edge failed to send command reply");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -480,8 +547,8 @@ enum AuthMode {
     SharedSecret,
 }
 
-/// One row of the reverse-proxy table, pushed by the core authority via
-/// `NODE_CONFIG_SET` (the edge is born with NONE — v6 §6). The public URL is
+/// One row of the reverse-proxy table, opened by SY.admin via `EDGE_OPEN_URL`
+/// (the edge is born with NONE — v6 §6). The public URL is
 /// `/e/<ich>`; the `ICH` is the channel identity (v6 §4). The edge holds **no
 /// `ilk`** — the frontier: it routes on `ICH -> owner_l2_name` handed to it
 /// pre-resolved, and never resolves identity (I6).
@@ -524,20 +591,26 @@ struct EndpointEntry {
 
 /// Index the rows by `ICH` (the URL key). No `ilk` anywhere — the edge is outside
 /// the identity frontier (I6).
+/// Split one row into its `ich` key and the entry stored in the registry.
+fn row_to_entry(row: EndpointRow) -> (String, EndpointEntry) {
+    (
+        row.ich,
+        EndpointEntry {
+            owner_l2_name: row.owner_l2_name,
+            inbound_family: row.inbound_family,
+            auth_mode: row.auth_mode,
+            secret: row.secret,
+            methods: row.methods,
+            tenant_id: row.tenant_id,
+        },
+    )
+}
+
 fn rows_to_registry(rows: Vec<EndpointRow>) -> HashMap<String, EndpointEntry> {
     let mut registry = HashMap::with_capacity(rows.len());
     for row in rows {
-        registry.insert(
-            row.ich,
-            EndpointEntry {
-                owner_l2_name: row.owner_l2_name,
-                inbound_family: row.inbound_family,
-                auth_mode: row.auth_mode,
-                secret: row.secret,
-                methods: row.methods,
-                tenant_id: row.tenant_id,
-            },
-        );
+        let (ich, entry) = row_to_entry(row);
+        registry.insert(ich, entry);
     }
     registry
 }
@@ -1033,20 +1106,36 @@ mod tests {
     }
 
     #[test]
-    fn extract_endpoint_rows_handles_direct_and_wrapped() {
-        let direct = json!({ "endpoints": [
-            {"ich":"ich:1","owner_l2_name":"IO.cloud@motherbee","inbound_family":"user","auth_mode":"public"}
-        ]});
-        assert_eq!(extract_endpoint_rows(&direct).unwrap().len(), 1);
+    fn row_to_entry_keys_by_ich_and_carries_fields() {
+        // The EDGE_OPEN_URL payload IS one row; open_url upserts it by ich.
+        let row: EndpointRow = serde_json::from_value(json!({
+            "ich": "ich:1",
+            "owner_l2_name": "IO.cloud@motherbee",
+            "inbound_family": "user",
+            "auth_mode": "shared-secret",
+            "secret": "s3cr3t"
+        }))
+        .unwrap();
+        let (ich, entry) = row_to_entry(row);
+        assert_eq!(ich, "ich:1");
+        assert_eq!(entry.owner_l2_name, "IO.cloud@motherbee");
+        assert_eq!(entry.inbound_family, "user");
 
-        let wrapped = json!({ "node_name": "SY.edge@ingress1", "patch": { "endpoints": [
-            {"ich":"ich:1","owner_l2_name":"IO.cloud@motherbee","inbound_family":"user","auth_mode":"public"}
-        ] }});
-        assert_eq!(extract_endpoint_rows(&wrapped).unwrap().len(), 1);
-
-        // A NODE_CONFIG_SET carrying no endpoints section yields None.
-        let none = json!({ "node_name": "SY.edge@ingress1", "patch": { "other": 1 } });
-        assert!(extract_endpoint_rows(&none).is_none());
+        // Two opens accumulate (upsert), not replace — a second URL does not wipe the first.
+        let mut reg: HashMap<String, EndpointEntry> = HashMap::new();
+        let (k1, e1) = row_to_entry(
+            serde_json::from_value(json!({"ich":"ich:a","owner_l2_name":"IO.a@h","inbound_family":"user","auth_mode":"public"})).unwrap(),
+        );
+        reg.insert(k1, e1);
+        let (k2, e2) = row_to_entry(
+            serde_json::from_value(json!({"ich":"ich:b","owner_l2_name":"IO.b@h","inbound_family":"user","auth_mode":"public"})).unwrap(),
+        );
+        reg.insert(k2, e2);
+        assert_eq!(reg.len(), 2);
+        // close removes exactly one.
+        reg.remove("ich:a");
+        assert_eq!(reg.len(), 1);
+        assert!(reg.contains_key("ich:b"));
     }
 
     #[test]

@@ -462,6 +462,17 @@ pub const MSG_OPA_RELOAD: &str = "OPA_RELOAD";
 pub const MSG_NODE_STATUS_GET: &str = "NODE_STATUS_GET";
 pub const MSG_NODE_STATUS_GET_RESPONSE: &str = "NODE_STATUS_GET_RESPONSE";
 
+// SY.edge URL-service command plane (SY.admin -> SY.edge). These are VERIFIED SERVICE
+// DIRECTIVES, not config: SY.admin opens/closes one public URL (an `ICH`) on the edge's
+// forwarding table on behalf of the owning IO node. They are addressed Unicast to the
+// edge and acked (request/response), so they route cross-hive like any node RPC — and
+// they are DELIBERATELY distinct from CONFIG_CHANGED / `node_config` (§9), which is the
+// edge's OWN configuration (listen, TLS, log_level, DNS resolver).
+pub const MSG_EDGE_OPEN_URL: &str = "EDGE_OPEN_URL";
+pub const MSG_EDGE_OPEN_URL_RESPONSE: &str = "EDGE_OPEN_URL_RESPONSE";
+pub const MSG_EDGE_CLOSE_URL: &str = "EDGE_CLOSE_URL";
+pub const MSG_EDGE_CLOSE_URL_RESPONSE: &str = "EDGE_CLOSE_URL_RESPONSE";
+
 pub const SCOPE_VPN: &str = "vpn";
 pub const SCOPE_GLOBAL: &str = "global";
 
