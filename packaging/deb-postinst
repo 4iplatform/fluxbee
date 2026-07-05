@@ -28,6 +28,10 @@ fi
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || true
     systemctl enable sy-orchestrator.service >/dev/null 2>&1 || true
+    # IO.cloud singleton: enabled everywhere but self-limited to role: motherbee via the
+    # unit's ExecCondition, so it only ever runs on the motherbee. Restart=always lets it
+    # wait out the mesh coming up (rt-gateway/identity/admin) after first-boot.
+    systemctl enable io-cloud.service >/dev/null 2>&1 || true
 fi
 
 echo "fluxbee installed. Edit /etc/fluxbee/hive.yaml, then run:  sudo fluxbee-firstboot"

@@ -244,7 +244,7 @@ cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
 echo "Building ai.generic runtime binary..."
 cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner
 echo "Building IO runtime binaries (io.api, io.slack, io.linkedhelper)..."
-cargo build --release --manifest-path nodes/io/Cargo.toml -p io-api -p io-slack -p io-linkedhelper
+cargo build --release --manifest-path nodes/io/Cargo.toml -p io-api -p io-slack -p io-linkedhelper -p io-cloud
 
 go_required=0
 for go_dir in "go/sy-opa-rules" "go/sy-timer" "go/sy-wf-rules" "go/nodes/wf/wf-generic"; do
@@ -443,6 +443,9 @@ sudo install -m 0755 "$sy_opa_rules_bin" /usr/bin/sy-opa-rules
 sudo install -m 0755 "$sy_timer_bin" /usr/bin/sy-timer
 sudo install -m 0755 "$sy_wf_rules_bin" /usr/bin/sy-wf-rules
 sudo install -m 0755 "$sy_frontdesk_gov_bin" /usr/bin/sy-frontdesk-gov
+# io-cloud: the singleton in-mesh Fluxbee Cloud adapter (motherbee only), baked like a
+# SY node — NOT published as a runtime package (unlike io-api/io-slack above).
+sudo install -m 0755 "$ROOT_DIR/nodes/io/target/release/io-cloud" /usr/bin/io-cloud
 sudo install -m 0755 "$wf_generic_bin" /usr/bin/wf-generic
 
 echo "Updating core source repo in $STATE_DIR/dist/core/bin..."
@@ -1112,7 +1115,27 @@ install_unit \
   "/usr/bin/sy-edge" \
   "network.target rt-gateway.service sy-vault.service" \
   "rt-gateway.service sy-vault.service"
+# io-cloud: custom unit (install_unit can't express ExecCondition/EnvironmentFile). Singleton,
+# gated to role: motherbee so it only runs on the motherbee even though enabled everywhere.
+cat <<'IOUNIT' | sudo tee /etc/systemd/system/io-cloud.service >/dev/null
+[Unit]
+Description=Fluxbee IO.cloud (singleton in-mesh Fluxbee Cloud adapter, motherbee only)
+After=network.target rt-gateway.service sy-identity.service sy-admin.service
+Wants=rt-gateway.service sy-identity.service sy-admin.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/fluxbee/io-cloud.env
+ExecCondition=/bin/sh -c 'grep -qE "^role:[[:space:]]*motherbee" /etc/fluxbee/hive.yaml'
+ExecStart=/usr/bin/io-cloud
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+IOUNIT
 sudo systemctl daemon-reload
+sudo systemctl enable io-cloud.service >/dev/null 2>&1 || true
 
 if [[ "$RESTART_ORCHESTRATOR_AFTER_INSTALL" == "1" ]]; then
   if install_service_exists "sy-orchestrator"; then

@@ -31,6 +31,9 @@ UNITS=(rt-gateway sy-config-routes sy-opa-rules sy-admin sy-architect sy-vault
 echo "== [1/5] build rust =="
 cargo build --release --bins
 cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
+# IO.cloud: the singleton in-mesh Fluxbee Cloud adapter (one per system, motherbee only).
+# Lives in the separate nodes/io workspace, so it needs its own manifest-path build.
+cargo build --release --manifest-path nodes/io/Cargo.toml -p io-cloud
 echo "== [2/5] build go =="
 (cd go/sy-opa-rules && go build -o sy-opa-rules .)
 (cd go/sy-timer && go build -o sy-timer .)
@@ -53,6 +56,10 @@ stage_bin sy-frontdesk-gov "target/release/sy-frontdesk-gov"
 for pair in "${GO_BINS[@]}"; do
   stage_bin "${pair%%:*}" "${pair##*:}/$(basename "${pair##*:}")"
 done
+# io-cloud installs to /usr/bin ONLY (not dist/core/bin): it is a motherbee-only singleton,
+# not a role-synced core component, so it must not enter the core manifest that the
+# orchestrator ships to workers.
+install -m0755 nodes/io/target/release/io-cloud "$DEST/usr/bin/io-cloud"
 
 # dist/core manifest with the staged binaries' real hashes (baked in).
 python3 - "$DEST/var/lib/fluxbee/dist/core" "$VERSION" "$BUILD_ID" <<'PY'
@@ -126,6 +133,29 @@ gen_unit sy-frontdesk-gov "network.target rt-gateway.service sy-identity.service
 gen_unit sy-edge "network.target rt-gateway.service sy-vault.service" \
   "rt-gateway.service sy-vault.service"
 
+# io-cloud: the singleton in-mesh Fluxbee Cloud adapter — one per SYSTEM, on motherbee.
+# Custom unit (not gen_unit): it needs SY.identity (register its own ICH) + SY.admin
+# (externalize) up first, an optional EnvironmentFile for deployment overrides (e.g.
+# IO_CLOUD_EDGE_NODE to publish a URL), and an ExecCondition that gates it to
+# `role: motherbee` — so even though the unit is enabled, it only runs on the motherbee.
+cat > "$DEST/lib/systemd/system/io-cloud.service" <<'UNIT'
+[Unit]
+Description=Fluxbee IO.cloud (singleton in-mesh Fluxbee Cloud adapter, motherbee only)
+After=network.target rt-gateway.service sy-identity.service sy-admin.service
+Wants=rt-gateway.service sy-identity.service sy-admin.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/fluxbee/io-cloud.env
+ExecCondition=/bin/sh -c 'grep -qE "^role:[[:space:]]*motherbee" /etc/fluxbee/hive.yaml'
+ExecStart=/usr/bin/io-cloud
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 # config template + first-boot helper. The packaging template is a clean
 # fresh-motherbee config (no lab uplink; wan.mtls set) — distinct from the dev
 # config/hive.yaml the lab uses.
@@ -147,7 +177,8 @@ Installed-Size: ${INSTALLED_KB}
 Maintainer: 4i Platform <ops@4iplatform.com>
 Description: Fluxbee internal-network orchestration mesh
  Core services (router, orchestrator, identity, vault, storage, admin,
- architect, cognition, policy, timer, wf-rules, opa-rules, frontdesk, edge).
+ architect, cognition, policy, timer, wf-rules, opa-rules, frontdesk, edge)
+ plus the singleton IO.cloud in-mesh Fluxbee Cloud adapter (motherbee).
  Binaries + dist/core manifest (hashes baked at build), systemd units, and a
  first-boot helper. Run 'sudo fluxbee-firstboot' after install.
 EOF

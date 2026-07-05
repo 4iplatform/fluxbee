@@ -243,11 +243,17 @@ rebind `:443`, change NIC, swap TLS.
 
 ## 10. `IO.cloud` — the cloud manager, in-mesh, and the bootstrap
 
-- Same species as `IO.linkedhelper`: the in-mesh adapter for the external system that is Fluxbee
-  Cloud. Not a new concept.
-- **The first node to externalize.** Spawned in-mesh → self-provisions its ilk (`ILK_PROVISION`) →
-  registers its channel `ICH` (identity plane) → sends `externalize {ich}` to `SY.admin` (command
-  plane). All **over the internal mesh**, not through the edge — so there is **no chicken-and-egg**.
+- Same code species as `IO.linkedhelper` (an in-mesh IO adapter for an external system, here Fluxbee
+  Cloud) — but a **different deployment shape**: it is a **SINGLETON, one per system, on the
+  motherbee**, so it is **baked into the core `.deb`** (binary + `io-cloud.service`), NOT published as
+  a per-tenant runtime package like `io-api`/`io-slack`. The unit is enabled everywhere but an
+  `ExecCondition` gates it to `role: motherbee`, so it only ever runs on the motherbee. It comes up
+  after `rt-gateway`/`SY.identity`/`SY.admin` and retries registration until the mesh is ready.
+- **The first node to externalize.** On boot → gets its ilk (orchestrator-injected
+  `FLUXBEE_NODE_ILK_ID` if spawned, else self-provisions via `ILK_PROVISION`) → registers its channel
+  `ICH` (identity plane) → optionally sends `externalize {ich}` to `SY.admin` (command plane, opt-in
+  via `IO_CLOUD_EDGE_NODE`; opening a public URL is deliberate, not automatic). All **over the
+  internal mesh**, not through the edge — so there is **no chicken-and-egg**.
   Its `ICH` routes only to `IO.cloud`. Then external traffic reaches the mesh **only** as ordinary
   app traffic to `IO.cloud` (I2); `IO.cloud → SY.admin`/`archi`/`frontdesk` are internal calls.
 - **Agent, not authority.** Holds no authoritative binding. In-mesh so it can read ilk-space, but

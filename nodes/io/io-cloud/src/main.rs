@@ -83,7 +83,10 @@ async fn main() -> Result<(), DynError> {
     });
     let channel_type = env_or("IO_CLOUD_CHANNEL_TYPE", "cloud");
     let channel_address = env_or("IO_CLOUD_CHANNEL_ADDRESS", "demo");
-    let own_ich = match ensure_own_channel(
+    // As an enabled boot unit, IO.cloud may come up before the mesh (SY.identity/SY.admin)
+    // is fully ready. Retry the channel registration; if it can't land, exit non-zero so
+    // systemd restarts us for a fresh attempt (a singleton with no ICH is useless anyway).
+    let own_ich = match ensure_own_channel_with_retry(
         &dispatcher,
         &identity_target,
         &self_tenant,
@@ -100,14 +103,11 @@ async fn main() -> Result<(), DynError> {
                 address = %channel_address,
                 "IO.cloud own channel ICH ready — externalize this ich on SY.edge to publish it"
             );
-            Some(ich_id)
+            ich_id
         }
         Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "IO.cloud own channel registration failed; externalize will have no ICH to resolve"
-            );
-            None
+            tracing::error!(error = %err, "IO.cloud channel registration exhausted retries; exiting for systemd to restart");
+            return Err(err.into());
         }
     };
 
@@ -119,7 +119,7 @@ async fn main() -> Result<(), DynError> {
     // (spec §11.1 — PENDING); admin accepts this without an origin/owner check for now.
     let admin_hive = env_or("IO_CLOUD_ADMIN_HIVE", &hive_id);
     let admin_target = format!("SY.admin@{admin_hive}");
-    if let (Some(ich), Some(edge_node)) = (own_ich.as_deref(), env("IO_CLOUD_EDGE_NODE")) {
+    if let Some(edge_node) = env("IO_CLOUD_EDGE_NODE") {
         let inbound_family = env_or("IO_CLOUD_INBOUND_FAMILY", "user");
         let auth_mode = env_or("IO_CLOUD_AUTH_MODE", "public");
         match dispatcher
@@ -128,7 +128,7 @@ async fn main() -> Result<(), DynError> {
                 action: "externalize",
                 target: None,
                 params: json!({
-                    "ich": ich,
+                    "ich": own_ich,
                     "edge_node": edge_node,
                     "inbound_family": inbound_family,
                     "auth_mode": auth_mode,
@@ -160,6 +160,44 @@ async fn main() -> Result<(), DynError> {
 
     let mut incoming = dispatcher.take_command_receiver(RPC_CH_INCOMING).await?;
     run_loop(&sender, &full_name, &mut incoming).await
+}
+
+/// Retry `ensure_own_channel` while the mesh is still starting (SY.identity/SY.admin not yet
+/// reachable). Bounded so a genuinely broken deploy exits (systemd restarts) rather than
+/// hanging forever. Tunable via `IO_CLOUD_REGISTER_ATTEMPTS` (default 30) at 2s apart.
+async fn ensure_own_channel_with_retry(
+    dispatcher: &Arc<RouterDispatcher>,
+    identity_target: &str,
+    self_tenant: &str,
+    channel_type: &str,
+    channel_address: &str,
+) -> Result<String, String> {
+    let max_attempts: u32 = env("IO_CLOUD_REGISTER_ATTEMPTS")
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(30);
+    let mut last_err = String::new();
+    for attempt in 1..=max_attempts {
+        match ensure_own_channel(
+            dispatcher,
+            identity_target,
+            self_tenant,
+            channel_type,
+            channel_address,
+        )
+        .await
+        {
+            Ok(ich) => return Ok(ich),
+            Err(err) => {
+                tracing::warn!(attempt, max = max_attempts, error = %err, "IO.cloud channel registration failed; mesh may still be starting — retrying");
+                last_err = err;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    Err(format!(
+        "channel registration failed after {max_attempts} attempts: {last_err}"
+    ))
 }
 
 /// Ensure IO.cloud owns a channel/ICH in SY.identity, self-provisioning its ilk when the
