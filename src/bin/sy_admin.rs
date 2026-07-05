@@ -3525,14 +3525,49 @@ async fn handle_externalize(
     // edge's ack: the URL is "published" only once the edge confirms it holds the row.
     // As an addressed request/response it routes cross-hive like any node RPC (no router
     // special-casing, unlike CONFIG_CHANGED which the peer router swallows).
+    // For a shared-secret channel, store the secret in VAULT owned by the edge (so the edge
+    // re-fetches it by ref at boot — §8 / warm-start) and ship only the `secret_ref` to the
+    // edge, never the value. The vault key is stable per ICH so re-externalize is idempotent.
+    let secret_ref = if auth_mode.eq_ignore_ascii_case("shared-secret") {
+        let Some(secret) = &secret else {
+            return Ok(internal_invalid_request(
+                "externalize",
+                "auth_mode=shared-secret requires a 'secret'",
+            ));
+        };
+        let secret_ref = format!("edge_channel_secret:{ich}");
+        let (status, body) = handle_vault_command(
+            ctx,
+            client,
+            "vault_put",
+            serde_json::json!({
+                "key": secret_ref,
+                "value": { "secret": secret },
+                "metadata": { "resource_type": "bearer_token", "owner_node": edge_node },
+            }),
+            Some(ctx.hive_id.clone()),
+        )
+        .await?;
+        if status != 200 {
+            return Ok(internal_invalid_request(
+                "externalize",
+                &format!("failed to store channel secret in vault (owner {edge_node}): {body}"),
+            ));
+        }
+        Some(secret_ref)
+    } else {
+        None
+    };
+
     let mut row = serde_json::json!({
         "ich": ich,
         "owner_l2_name": owner_l2_name,
         "inbound_family": inbound_family,
         "auth_mode": auth_mode,
     });
-    if let Some(secret) = &secret {
-        row["secret"] = serde_json::json!(secret);
+    if let Some(secret_ref) = &secret_ref {
+        // Only the vault key travels to the edge — never the secret value.
+        row["secret_ref"] = serde_json::json!(secret_ref);
     }
     if let Some(methods) = &methods {
         row["methods"] = serde_json::json!(methods);

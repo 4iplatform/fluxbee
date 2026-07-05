@@ -180,6 +180,18 @@ async fn main() -> Result<(), SyEdgeError> {
             .unwrap_or_default(),
     ));
 
+    // Warm-start step 2 (§8): rows reloaded from disk carry only a `secret_ref` (never the
+    // secret value). Re-fetch each secret from vault now, so shared-secret channels come back
+    // ready — before the door opens.
+    resolve_secrets(
+        &dispatcher,
+        &self_ilk,
+        &self_name,
+        &config.vault_hive,
+        &registry,
+    )
+    .await;
+
     // Ingress-hive role: run the public HTTPS door. Fail-closed — absent on any
     // other role (`resolve_http_listen`).
     if let Some(listen) = config.http_listen.clone() {
@@ -260,6 +272,15 @@ async fn main() -> Result<(), SyEdgeError> {
                     config.endpoints_path.as_deref(),
                     &msg,
                     config.ttl,
+                )
+                .await;
+                // If the just-opened row shipped a `secret_ref` (not the value), fetch it now.
+                resolve_secrets(
+                    &dispatcher,
+                    &self_ilk,
+                    &self_name,
+                    &config.vault_hive,
+                    &registry,
                 )
                 .await;
                 continue;
@@ -596,10 +617,15 @@ struct EndpointRow {
     inbound_family: String,
     auth_mode: AuthMode,
     /// The shared-secret VALUE. Held in RAM but NEVER persisted to disk (§8): the
-    /// on-disk route table omits it, so a DMZ disk leak exposes no credentials. A
-    /// future `secret_ref` will let the edge re-fetch it from vault at boot.
+    /// on-disk route table omits it, so a DMZ disk leak exposes no credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     secret: Option<String>,
+    /// Vault key of the shared-secret (§8). This IS persisted (it's just a name, not a
+    /// credential); at boot / open the edge re-fetches the secret VALUE from vault by
+    /// this ref (dedicated-owner read, like the TLS cert), so shared-secret channels
+    /// warm-start without the secret ever touching disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secret_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     methods: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -617,7 +643,11 @@ struct EndpointEntry {
     owner_l2_name: String,
     inbound_family: String,
     auth_mode: AuthMode,
+    /// The resolved secret VALUE (RAM only). Populated either directly from an
+    /// EDGE_OPEN_URL that carried it, or fetched from vault by `secret_ref`.
     secret: Option<String>,
+    /// Vault key to (re-)fetch `secret` from — the durable, disk-safe form.
+    secret_ref: Option<String>,
     methods: Option<Vec<String>>,
     #[allow(dead_code)]
     tenant_id: Option<String>,
@@ -634,6 +664,7 @@ fn row_to_entry(row: EndpointRow) -> (String, EndpointEntry) {
             inbound_family: row.inbound_family,
             auth_mode: row.auth_mode,
             secret: row.secret,
+            secret_ref: row.secret_ref,
             methods: row.methods,
             tenant_id: row.tenant_id,
         },
@@ -684,7 +715,8 @@ fn registry_to_persisted_rows(reg: &HashMap<String, EndpointEntry>) -> Vec<Endpo
             owner_l2_name: e.owner_l2_name.clone(),
             inbound_family: e.inbound_family.clone(),
             auth_mode: e.auth_mode,
-            secret: None, // NEVER persist the secret to disk
+            secret: None,                       // NEVER persist the secret VALUE
+            secret_ref: e.secret_ref.clone(),   // persist the vault REF (just a name)
             methods: e.methods.clone(),
             tenant_id: e.tenant_id.clone(),
         })
@@ -842,6 +874,61 @@ async fn fetch_tls_config_from_vault(
         .and_then(|v| v.as_str())
         .ok_or("edge tls secret is missing a 'key' PEM field")?;
     tls_config_from_pem(cert.as_bytes(), key.as_bytes())
+}
+
+/// Resolve any registry entries that carry a `secret_ref` but not yet the secret VALUE by
+/// fetching it from `SY.vault@<vault_hive>` (dedicated-owner read via the edge's deterministic
+/// ilk — the same path as the TLS cert). Called at boot (warm-started rows carry only the ref)
+/// and after an `EDGE_OPEN_URL` that shipped a ref. Best-effort: a failure leaves the channel
+/// rejecting until the next resolve, never crashes the edge.
+async fn resolve_secrets(
+    dispatcher: &Arc<RouterDispatcher>,
+    self_ilk: &str,
+    self_name: &str,
+    vault_hive: &str,
+    registry: &Arc<RwLock<HashMap<String, EndpointEntry>>>,
+) {
+    let pending: Vec<(String, String)> = match registry.read() {
+        Ok(guard) => guard
+            .iter()
+            .filter(|(_, e)| e.secret.is_none() && e.secret_ref.is_some())
+            .map(|(ich, e)| (ich.clone(), e.secret_ref.clone().unwrap_or_default()))
+            .filter(|(_, r)| !r.is_empty())
+            .collect(),
+        Err(_) => return,
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let client = fluxbee_sdk::VaultClient::new(
+        Arc::clone(dispatcher),
+        vault_hive.to_string(),
+        fluxbee_sdk::VaultCallerOwned::new(self_ilk.to_string(), self_name.to_string()),
+    );
+    for (ich, secret_ref) in pending {
+        match client.get(&secret_ref, Duration::from_secs(15)).await {
+            Ok(resp) => {
+                let secret = resp
+                    .value
+                    .as_ref()
+                    .and_then(|v| v.get("secret"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                match secret {
+                    Some(secret) => {
+                        if let Ok(mut guard) = registry.write() {
+                            if let Some(entry) = guard.get_mut(&ich) {
+                                entry.secret = Some(secret);
+                            }
+                        }
+                        tracing::info!(ich = %ich, secret_ref = %secret_ref, "sy-edge resolved channel secret from vault");
+                    }
+                    None => tracing::warn!(ich = %ich, secret_ref = %secret_ref, "vault secret has no 'secret' field; channel stays closed to auth"),
+                }
+            }
+            Err(err) => tracing::warn!(ich = %ich, secret_ref = %secret_ref, error = %err, "sy-edge could not fetch channel secret from vault (channel rejects until resolved)"),
+        }
+    }
 }
 
 async fn invoke_root(
@@ -1160,22 +1247,25 @@ mod tests {
         let mut reg: HashMap<String, EndpointEntry> = HashMap::new();
         reg.insert(
             "ich:pub".into(),
-            EndpointEntry { owner_l2_name: "IO.a@h".into(), inbound_family: "user".into(), auth_mode: AuthMode::Public, secret: None, methods: None, tenant_id: None },
+            EndpointEntry { owner_l2_name: "IO.a@h".into(), inbound_family: "user".into(), auth_mode: AuthMode::Public, secret: None, secret_ref: None, methods: None, tenant_id: None },
         );
         reg.insert(
             "ich:sec".into(),
-            EndpointEntry { owner_l2_name: "IO.b@h".into(), inbound_family: "user".into(), auth_mode: AuthMode::SharedSecret, secret: Some("s3cr3t".into()), methods: None, tenant_id: None },
+            EndpointEntry { owner_l2_name: "IO.b@h".into(), inbound_family: "user".into(), auth_mode: AuthMode::SharedSecret, secret: Some("s3cr3t".into()), secret_ref: Some("edge_channel_secret:ich:sec".into()), methods: None, tenant_id: None },
         );
         persist_registry(&path, &reg);
 
-        // The routes survive a reload (warm-start), but the secret VALUE never hit disk.
+        // The routes survive a reload (warm-start). The secret VALUE never hit disk, but the
+        // secret_ref (just a vault key name) DID — so the edge can re-fetch it at boot.
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("s3cr3t"), "secret value leaked to the on-disk route table");
+        assert!(raw.contains("edge_channel_secret:ich:sec"), "secret_ref must be persisted");
         let loaded = load_registry(&path);
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded["ich:pub"].owner_l2_name, "IO.a@h");
         assert_eq!(loaded["ich:sec"].auth_mode, AuthMode::SharedSecret);
-        assert!(loaded["ich:sec"].secret.is_none(), "secret must reload as None (fetched from vault later)");
+        assert!(loaded["ich:sec"].secret.is_none(), "secret must reload as None (fetched from vault by ref)");
+        assert_eq!(loaded["ich:sec"].secret_ref.as_deref(), Some("edge_channel_secret:ich:sec"));
         let _ = std::fs::remove_file(&path);
     }
 

@@ -202,21 +202,27 @@ payload             = body passthrough (JSON / utf8 / base64)
 
 ---
 
-## 8. The entry token — minted by admin, stored in vault
+## 8. The entry token — in vault, fetched by the edge (secret_ref)
 
 If `auth_mode = shared-secret`, the channel needs an entry credential. Because **vault writes are
-admin-only** (`handle_put` requires `is_well_known_admin`), the node cannot mint its own — **admin
-mints it during externalize**:
-- admin mints a random token → `vault_put` **owned by the node's ilk** (dedicated-owner: the node
-  can read it back, `secret.ilk == caller.src_ilk`);
-- admin places it in the edge row (`secret`) and returns it in the externalize response.
+admin-only** (`handle_put` requires `is_well_known_admin`), the flow routes through admin.
 
-Token lands in three places, one flow: **edge** (door check), **response** (the node → its external
-clients), **vault** (durable; survives an edge reimage via the re-push; node re-reads; rotation via
-`vault_rotate`, an admin action).
+**Implemented (`secret_ref`, lab-validated 2026-07-05):** on `externalize` of a shared-secret channel,
+admin `vault_put`s the secret **owned by the EDGE's ilk** (`owner_node = SY.edge@<hive>`, so the edge —
+which has no identity SHM — reads it back by its deterministic-owner match, like the TLS cert), under a
+stable key `edge_channel_secret:<ich>`. The `EDGE_OPEN_URL` ships only the **`secret_ref`** (the vault
+key), NEVER the value. The edge fetches the secret from vault by ref (`resolve_secrets`) on open AND at
+boot — so shared-secret channels **warm-start** and the value **never touches the DMZ disk** (only the
+ref is persisted). The edge checks `Authorization: Bearer <secret>` locally against the fetched value.
+Lab: `curl` no-auth/wrong → 401, correct → 200; kill+restart edge → re-fetch by ref → 200; grep of the
+on-disk file for the secret value = 0.
 
-- **Alpha:** the edge checks `Authorization: Bearer <token>` **locally** against the row secret.
-- **Deferred (hardening):** the edge asks the vault per request so the token never sits on the DMZ.
+**Deferred:**
+- **admin-MINT.** Today the caller supplies the secret; §8's fuller shape has admin generate a strong
+  random token during externalize and return it in the response (the node → its external clients).
+  Orthogonal to the storage above — a small change when wanted. Rotation via `vault_rotate`.
+- **Per-request vault check (hardening):** the edge asks vault per request so the token never sits in
+  DMZ RAM at all (today it's fetched once into RAM).
 
 ---
 

@@ -122,17 +122,23 @@ async fn main() -> Result<(), DynError> {
     if let Some(edge_node) = env("IO_CLOUD_EDGE_NODE") {
         let inbound_family = env_or("IO_CLOUD_INBOUND_FAMILY", "user");
         let auth_mode = env_or("IO_CLOUD_AUTH_MODE", "public");
+        // For a shared-secret channel, the caller supplies the secret; admin stores it in vault
+        // owned by the edge and ships only a secret_ref (§8). Opt-in via IO_CLOUD_SECRET.
+        let mut params = json!({
+            "ich": own_ich,
+            "edge_node": edge_node,
+            "inbound_family": inbound_family,
+            "auth_mode": auth_mode,
+        });
+        if let Some(secret) = env("IO_CLOUD_SECRET") {
+            params["secret"] = json!(secret);
+        }
         match dispatcher
             .send_admin_rpc(AdminCommandRequest {
                 admin_target: &admin_target,
                 action: "externalize",
                 target: None,
-                params: json!({
-                    "ich": own_ich,
-                    "edge_node": edge_node,
-                    "inbound_family": inbound_family,
-                    "auth_mode": auth_mode,
-                }),
+                params: params.clone(),
                 request_id: None,
                 timeout: Duration::from_secs(15),
             })
