@@ -19,7 +19,7 @@ use fluxbee_sdk::{
     try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
     PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher, RpcError, RpcRequestLabels,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -254,11 +254,25 @@ async fn main() -> Result<(), SyEdgeError> {
     while let Some(msg) = system_rx.recv().await {
         match msg.meta.msg.as_deref() {
             Some(MSG_EDGE_OPEN_URL) => {
-                apply_open_url(&sender, &registry, &msg, config.ttl).await;
+                apply_open_url(
+                    &sender,
+                    &registry,
+                    config.endpoints_path.as_deref(),
+                    &msg,
+                    config.ttl,
+                )
+                .await;
                 continue;
             }
             Some(MSG_EDGE_CLOSE_URL) => {
-                apply_close_url(&sender, &registry, &msg, config.ttl).await;
+                apply_close_url(
+                    &sender,
+                    &registry,
+                    config.endpoints_path.as_deref(),
+                    &msg,
+                    config.ttl,
+                )
+                .await;
                 continue;
             }
             _ => {}
@@ -304,6 +318,7 @@ fn build_sy_edge_rpc_profile() -> Result<OperationalRouteProfile, RpcError> {
 async fn apply_open_url(
     sender: &NodeSender,
     registry: &Arc<RwLock<HashMap<String, EndpointEntry>>>,
+    endpoints_path: Option<&std::path::Path>,
     msg: &Message,
     ttl: u8,
 ) {
@@ -321,6 +336,7 @@ async fn apply_open_url(
     let payload = match &outcome {
         Ok((ich, count)) => {
             tracing::info!(ich = %ich, endpoints = count, trace_id = %msg.routing.trace_id, "sy-edge opened URL (EDGE_OPEN_URL)");
+            persist_after_change(registry, endpoints_path);
             json!({ "status": "ok", "ich": ich, "url": format!("/e/{ich}") })
         }
         Err(err) => {
@@ -331,11 +347,23 @@ async fn apply_open_url(
     send_edge_reply(sender, msg, MSG_EDGE_OPEN_URL_RESPONSE, payload, ttl).await;
 }
 
+/// Persist the route table after a successful open/close, outside the write lock (the
+/// single-threaded system loop is the only writer, so no concurrent mutation races us).
+fn persist_after_change(
+    registry: &Arc<RwLock<HashMap<String, EndpointEntry>>>,
+    endpoints_path: Option<&std::path::Path>,
+) {
+    if let (Some(path), Ok(guard)) = (endpoints_path, registry.read()) {
+        persist_registry(path, &guard);
+    }
+}
+
 /// `EDGE_CLOSE_URL` (§7): SY.admin closes a public URL. Payload is `{ich}`. Remove the row
 /// (idempotent — closing an already-absent URL is `ok`), then ack.
 async fn apply_close_url(
     sender: &NodeSender,
     registry: &Arc<RwLock<HashMap<String, EndpointEntry>>>,
+    endpoints_path: Option<&std::path::Path>,
     msg: &Message,
     ttl: u8,
 ) {
@@ -357,6 +385,9 @@ async fn apply_close_url(
     let payload = match &outcome {
         Ok((ich, existed)) => {
             tracing::info!(ich = %ich, existed, trace_id = %msg.routing.trace_id, "sy-edge closed URL (EDGE_CLOSE_URL)");
+            if *existed {
+                persist_after_change(registry, endpoints_path);
+            }
             json!({ "status": "ok", "ich": ich, "closed": existed })
         }
         Err(err) => {
@@ -540,7 +571,7 @@ fn env(key: &str) -> Option<String> {
 // OWN family (Option A) BY NAME to the pre-resolved handler (Option Z, §3/§6).
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum AuthMode {
     Public,
@@ -552,7 +583,7 @@ enum AuthMode {
 /// `/e/<ich>`; the `ICH` is the channel identity (v6 §4). The edge holds **no
 /// `ilk`** — the frontier: it routes on `ICH -> owner_l2_name` handed to it
 /// pre-resolved, and never resolves identity (I6).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EndpointRow {
     /// The channel `ICH` — the URL is `/e/<ich>`. Opaque to the edge; the core
     /// minted/resolved it and pushed it down.
@@ -564,15 +595,18 @@ struct EndpointRow {
     /// forwarded message with exactly this family.
     inbound_family: String,
     auth_mode: AuthMode,
-    #[serde(default)]
+    /// The shared-secret VALUE. Held in RAM but NEVER persisted to disk (§8): the
+    /// on-disk route table omits it, so a DMZ disk leak exposes no credentials. A
+    /// future `secret_ref` will let the edge re-fetch it from vault at boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     secret: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     methods: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     tenant_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EndpointsFile {
     #[serde(default)]
     endpoints: Vec<EndpointRow>,
@@ -615,8 +649,12 @@ fn rows_to_registry(rows: Vec<EndpointRow>) -> HashMap<String, EndpointEntry> {
     registry
 }
 
-/// Load the static `hash -> endpoint` seed. A missing file is fine (empty
-/// registry, every request 404s) so the frontend can boot before any publish.
+/// Load the `ich -> endpoint` route table from disk — the edge's own persisted cache
+/// (written by `persist_registry` on every open/close), so a restart/reboot warm-starts
+/// instead of born-zero (no 404 window). A missing/empty file is fine (empty registry,
+/// every request 404s) — that's the true first boot before any URL is opened. Secrets are
+/// NOT on disk; shared-secret channels come back without their secret until re-opened
+/// (or, later, re-fetched from vault by `secret_ref`).
 fn load_registry(path: &std::path::Path) -> HashMap<String, EndpointEntry> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
@@ -633,6 +671,48 @@ fn load_registry(path: &std::path::Path) -> HashMap<String, EndpointEntry> {
         }
     };
     rows_to_registry(parsed.endpoints)
+}
+
+/// Serialize the live registry back to rows for on-disk persistence, **omitting the
+/// shared-secret value** (§8: credentials never touch the DMZ disk — only the route
+/// survives; the secret is re-fetched from vault at boot in a later step).
+fn registry_to_persisted_rows(reg: &HashMap<String, EndpointEntry>) -> Vec<EndpointRow> {
+    let mut rows: Vec<EndpointRow> = reg
+        .iter()
+        .map(|(ich, e)| EndpointRow {
+            ich: ich.clone(),
+            owner_l2_name: e.owner_l2_name.clone(),
+            inbound_family: e.inbound_family.clone(),
+            auth_mode: e.auth_mode,
+            secret: None, // NEVER persist the secret to disk
+            methods: e.methods.clone(),
+            tenant_id: e.tenant_id.clone(),
+        })
+        .collect();
+    // Stable order so the file diffs cleanly and the write is deterministic.
+    rows.sort_by(|a, b| a.ich.cmp(&b.ich));
+    rows
+}
+
+/// Persist the route table to disk atomically (temp + rename) so the edge warm-starts
+/// after a restart/reboot instead of born-zero (no 404 window). Best-effort: a failure
+/// only costs the warm-start, never the in-memory update. The edge OWNS its routes; this
+/// is its own operational cache, NOT authority over anyone (I3 relaxed only for routes).
+fn persist_registry(path: &std::path::Path, reg: &HashMap<String, EndpointEntry>) {
+    let file = EndpointsFile {
+        endpoints: registry_to_persisted_rows(reg),
+    };
+    let json = match serde_json::to_vec_pretty(&file) {
+        Ok(json) => json,
+        Err(err) => {
+            tracing::warn!(error = %err, "sy-edge could not serialize route table; skipping persist");
+            return;
+        }
+    };
+    let tmp = path.with_extension("json.tmp");
+    if let Err(err) = std::fs::write(&tmp, &json).and_then(|_| std::fs::rename(&tmp, path)) {
+        tracing::warn!(path = %path.display(), error = %err, "sy-edge route table persist failed (warm-start only; runtime unaffected)");
+    }
 }
 
 struct FrontendState {
@@ -1072,6 +1152,32 @@ fn http_error(status: StatusCode, code: &str, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_routes_round_trip_and_never_leak_the_secret() {
+        let path = std::env::temp_dir().join(format!("sy-edge-persist-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut reg: HashMap<String, EndpointEntry> = HashMap::new();
+        reg.insert(
+            "ich:pub".into(),
+            EndpointEntry { owner_l2_name: "IO.a@h".into(), inbound_family: "user".into(), auth_mode: AuthMode::Public, secret: None, methods: None, tenant_id: None },
+        );
+        reg.insert(
+            "ich:sec".into(),
+            EndpointEntry { owner_l2_name: "IO.b@h".into(), inbound_family: "user".into(), auth_mode: AuthMode::SharedSecret, secret: Some("s3cr3t".into()), methods: None, tenant_id: None },
+        );
+        persist_registry(&path, &reg);
+
+        // The routes survive a reload (warm-start), but the secret VALUE never hit disk.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("s3cr3t"), "secret value leaked to the on-disk route table");
+        let loaded = load_registry(&path);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded["ich:pub"].owner_l2_name, "IO.a@h");
+        assert_eq!(loaded["ich:sec"].auth_mode, AuthMode::SharedSecret);
+        assert!(loaded["ich:sec"].secret.is_none(), "secret must reload as None (fetched from vault later)");
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn rpc_error_mapping_matches_spec_basics() {

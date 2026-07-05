@@ -302,6 +302,19 @@ may act only on its own channel (I8); owner=IO.cloud@…, caller=IO.web@…". Un
 
 ## 12. Where the durable binding lives (the one open item)
 
+**Implemented (step 1, 2026-07-05): the edge warm-starts from its own on-disk route cache.** The edge
+now persists its route table (`ich → owner_l2_name, inbound_family, auth_mode, methods`) to
+`edge.endpoints.json` on every `EDGE_OPEN_URL`/`EDGE_CLOSE_URL` (atomic temp+rename) and reloads it at
+boot — so a restart/reboot recovers instantly (no 404 window) instead of born-zero. This relaxes I3
+**only for the routes** (the edge's own operational state); it holds **no secrets** — the shared-secret
+value is NEVER written to disk (only the route survives; a future `secret_ref` will re-fetch it from
+vault at boot, like the TLS cert). Lab-validated: open URL → kill edge → it reloads `endpoints=1` and
+serves 200 with no re-externalize; the secret never hits disk.
+
+The disk cache covers restart/reboot. A **reimage** (disk wiped) still relies on re-externalize
+(the IO nodes re-open at their own boot — option (a), chosen for simplicity). A durable-in-identity
+backstop (below) is deferred; add it only if "edge empty until the IO nodes reboot" becomes a problem.
+
 The externalized-channel binding is authoritative **inside the mesh**. Two shapes, both inside, both
 edge-invisible:
 - **As an `ICH` attribute in `SY.identity`** — reuse `IchEntry.enabled`/flags for an "externalized"
@@ -333,8 +346,9 @@ Parked consciously — the edge receives `ICH → owner_l2_name` either way.
   ingress **requires** `tls_vault_key` + the secret seeded (owner `SY.edge@<edge_hive>`).
   Lab-proof: real `*.fluxbee.ai` cert seeded into `SY.vault`, edge fetched it by its deterministic
   ilk and bound HTTPS; `curl https .../e/<ich>` → 200 with the Sectigo cert served.
-- **Edge born zero:** the seed file is empty/absent; endpoints arrive only via externalize.
-  (Kills M1's "malformed seed → silent all-404": there is no seed.)
+- **Edge born zero, then warm:** on the FIRST boot the seed file is empty/absent and endpoints
+  arrive only via externalize (kills M1's "malformed seed → all-404"). From then on the edge
+  **persists** its route table there (§12) and warm-starts from it on later restarts/reboots.
 
 ---
 
