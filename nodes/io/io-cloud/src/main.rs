@@ -144,12 +144,18 @@ async fn main() -> Result<(), DynError> {
             })
             .await
         {
-            Ok(res) if res.status.eq_ignore_ascii_case("ok") => tracing::info!(
-                target = %admin_target,
-                edge_node = %edge_node,
-                result = %res.payload,
-                "IO.cloud -> SY.admin externalize OK (public URL published on the edge)"
-            ),
+            Ok(res) if res.status.eq_ignore_ascii_case("ok") => {
+                // For a shared-secret channel admin returns the entry token (§8); a real IO node
+                // hands it to its external clients as `Authorization: Bearer <token>`.
+                let token = res.payload.get("token").and_then(|v| v.as_str());
+                tracing::info!(
+                    target = %admin_target,
+                    edge_node = %edge_node,
+                    entry_token = ?token,
+                    result = %res.payload,
+                    "IO.cloud -> SY.admin externalize OK (public URL published on the edge)"
+                );
+            }
             // The RPC round-tripped but admin refused (e.g. the §11.1 authz gate): status != ok.
             Ok(res) => tracing::warn!(
                 target = %admin_target,

@@ -3525,15 +3525,15 @@ async fn handle_externalize(
     // edge's ack: the URL is "published" only once the edge confirms it holds the row.
     // As an addressed request/response it routes cross-hive like any node RPC (no router
     // special-casing, unlike CONFIG_CHANGED which the peer router swallows).
-    // For a shared-secret channel, store the secret in VAULT owned by the edge (so the edge
-    // re-fetches it by ref at boot — §8 / warm-start) and ship only the `secret_ref` to the
-    // edge, never the value. The vault key is stable per ICH so re-externalize is idempotent.
-    let secret_ref = if auth_mode.eq_ignore_ascii_case("shared-secret") {
-        let Some(secret) = &secret else {
-            return Ok(internal_invalid_request(
-                "externalize",
-                "auth_mode=shared-secret requires a 'secret'",
-            ));
+    // For a shared-secret channel: the entry token (§8). Admin MINTS a strong random token when
+    // the caller did not supply one (a caller-chosen `secret` is honored as an explicit opt-out).
+    // Either way the token is stored in VAULT owned by the edge (so the edge re-fetches it by ref
+    // at boot — warm-start) and only the `secret_ref` (never the value) is shipped to the edge.
+    // The minted/used token is returned to the caller so it can hand it to its external clients.
+    let (secret_ref, entry_token) = if auth_mode.eq_ignore_ascii_case("shared-secret") {
+        let token = match &secret {
+            Some(supplied) => supplied.clone(),
+            None => mint_entry_token(), // §8: admin-minted strong token
         };
         let secret_ref = format!("edge_channel_secret:{ich}");
         let (status, body) = handle_vault_command(
@@ -3542,7 +3542,7 @@ async fn handle_externalize(
             "vault_put",
             serde_json::json!({
                 "key": secret_ref,
-                "value": { "secret": secret },
+                "value": { "secret": token },
                 "metadata": { "resource_type": "bearer_token", "owner_node": edge_node },
             }),
             Some(ctx.hive_id.clone()),
@@ -3551,12 +3551,12 @@ async fn handle_externalize(
         if status != 200 {
             return Ok(internal_invalid_request(
                 "externalize",
-                &format!("failed to store channel secret in vault (owner {edge_node}): {body}"),
+                &format!("failed to store channel token in vault (owner {edge_node}): {body}"),
             ));
         }
-        Some(secret_ref)
+        (Some(secret_ref), Some(token))
     } else {
-        None
+        (None, None)
     };
 
     let mut row = serde_json::json!({
@@ -3605,6 +3605,10 @@ async fn handle_externalize(
                         "ich": ich,
                         "owner_l2_name": owner_l2_name,
                         "edge_node": edge_node,
+                        // The entry token for shared-secret channels (§8): the caller hands this
+                        // to its external clients as `Authorization: Bearer <token>`. Absent for
+                        // public channels. Minted by admin unless the caller supplied a secret.
+                        "token": entry_token,
                     }
                 }),
             })
@@ -4086,6 +4090,12 @@ fn internal_unauthorized(action: &str, detail: &str) -> InternalAdminDispatchRes
 /// the caller must be an `IO.*` node (I1) and may only act on ITS OWN channel (I8: the identity-
 /// resolved `owner_l2_name` must equal the router-stamped, un-forgeable caller). A `None` caller is
 /// a trusted internal path (HTTP operator / architect executor) and is allowed. Pure — unit-tested.
+/// Mint a strong entry token for a shared-secret channel (§8): 256 bits of randomness as
+/// URL-safe hex (two v4 UUIDs). Stronger than a caller-chosen secret and safe in a Bearer header.
+fn mint_entry_token() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
 fn authorize_channel_command(caller_l2_name: Option<&str>, owner_l2_name: &str) -> Result<(), String> {
     let Some(caller) = caller_l2_name else {
         return Ok(());

@@ -217,10 +217,13 @@ ref is persisted). The edge checks `Authorization: Bearer <secret>` locally agai
 Lab: `curl` no-auth/wrong → 401, correct → 200; kill+restart edge → re-fetch by ref → 200; grep of the
 on-disk file for the secret value = 0.
 
+**admin-MINT — DONE (lab-validated 2026-07-05).** When the caller does NOT supply a `secret`, admin
+mints a strong random token (256 bits, two v4 UUIDs — `mint_entry_token`), stores it in vault as
+above, and returns it in the externalize response `payload.token` (the node → its external clients).
+A caller-supplied `secret` is still honored as an explicit opt-out. Lab: externalize shared-secret
+with no secret → response carried a 64-hex token → `curl` with `Bearer <token>` → 200.
+
 **Deferred:**
-- **admin-MINT.** Today the caller supplies the secret; §8's fuller shape has admin generate a strong
-  random token during externalize and return it in the response (the node → its external clients).
-  Orthogonal to the storage above — a small change when wanted. Rotation via `vault_rotate`.
 - **Per-request vault check (hardening):** the edge asks vault per request so the token never sits in
   DMZ RAM at all (today it's fetched once into RAM).
 
@@ -238,9 +241,13 @@ admin, like any node. Distinct from externalize (§5/§7.6): `node_config` is th
 endpoint table is now driven only by `EDGE_OPEN_URL`/`EDGE_CLOSE_URL` (§7.6), and `node_config` is
 free for its real purpose.
 
-Gap (still open): today the edge reads its own config **only at boot** (`Config::load`). Add a
-`node_config` handler so params apply live. Live: `log_level`, DNS resolver. Restart-required:
-rebind `:443`, change NIC, swap TLS.
+**DONE (lab-validated 2026-07-05).** The edge handles `CONFIG_SET`/`CONFIG_GET` (`apply_node_config`,
+via the generic `set/get_node_config` admin surface) and applies its OWN config live where it can: a
+`log_level` change reloads the tracing filter in-process (no restart), and any other key is reported
+back as `restart_required` (rebind `:443`, change NIC, swap TLS need a process restart). `CONFIG_GET`
+returns the effective `log_level`. Lab: `config-set log_level` → `applied:[log_level]` + the filter
+changed live; `config-set listen` → `restart_required:[listen]`; `config-get` → the effective level.
+(Deferred: live DNS resolver — the current edge forwards by mesh L2 name, no DNS in the hot path.)
 
 **DNS split:** the edge's own *resolver* is node config (here). The public *zone record*
 (`fluxbee.ai/e/…` → edge IP) is an external DNS-zone op at core, deferred behind the wildcard cert.

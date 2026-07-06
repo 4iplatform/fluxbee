@@ -16,8 +16,10 @@ use fluxbee_sdk::protocol::{
     MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
-    PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher, RpcError, RpcRequestLabels,
+    build_node_config_response_message, is_node_config_get_message, is_node_config_set_message,
+    parse_node_config_request, try_handle_default_node_status, NodeConfig, NodeConfigControlRequest,
+    NodeSender, NodeUuidMode, OperationalRouteProfile, PendingMatcher, RouteMatch, RouteTarget,
+    RouterDispatcher, RpcError, RpcRequestLabels,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -127,12 +129,40 @@ struct Config {
     vault_hive: String,
 }
 
+/// Reloads the tracing filter live (§9 node_config: `log_level`). Boxed so the caller never
+/// names tracing-subscriber's `reload::Handle<_, _>` generics. Returns Err on a bad filter.
+type LogReload = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
 #[tokio::main]
 async fn main() -> Result<(), SyEdgeError> {
+    use tracing_subscriber::prelude::*;
     let config = Config::load();
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,sy_edge=debug,fluxbee_sdk=info"));
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    let initial_log = std::env::var("RUST_LOG")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "info,sy_edge=debug,fluxbee_sdk=info".to_string());
+    let env_filter =
+        EnvFilter::try_new(&initial_log).unwrap_or_else(|_| EnvFilter::new("info"));
+    let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+    // Current level string (EnvFilter can't be read back) + a boxed reloader for node_config.
+    let current_log = Arc::new(std::sync::Mutex::new(initial_log));
+    let log_reload: LogReload = {
+        let current = Arc::clone(&current_log);
+        Arc::new(move |level: &str| {
+            let filter = EnvFilter::try_new(level).map_err(|err| err.to_string())?;
+            reload_handle
+                .reload(filter)
+                .map_err(|err| err.to_string())?;
+            if let Ok(mut guard) = current.lock() {
+                *guard = level.to_string();
+            }
+            Ok(())
+        })
+    };
 
     tracing::info!(
         node_name = %config.node_name,
@@ -298,6 +328,12 @@ async fn main() -> Result<(), SyEdgeError> {
             }
             _ => {}
         }
+        // node_config (§9): the edge's OWN config, live where it can. Distinct surface from the
+        // URL commands above — this configures the edge itself, never other nodes' endpoints.
+        if is_node_config_set_message(&msg) || is_node_config_get_message(&msg) {
+            apply_node_config(&sender, &config.node_name, &log_reload, &current_log, &msg).await;
+            continue;
+        }
         match try_handle_default_node_status(&sender, &msg).await {
             Ok(true) => {}
             Ok(false) => {
@@ -451,6 +487,75 @@ async fn send_edge_reply(
     };
     if let Err(err) = sender.send(reply).await {
         tracing::warn!(error = %err, trace_id = %req.routing.trace_id, "sy-edge failed to send command reply");
+    }
+}
+
+/// node_config (§9): apply the edge's OWN config live where possible, and reply. Today `log_level`
+/// applies live (tracing reload); every other key is reported as `restart_required` (rebind :443,
+/// swap TLS, change NIC need a process restart). This is the edge configuring ITSELF — never the
+/// URL table (that's EDGE_OPEN_URL/CLOSE_URL).
+async fn apply_node_config(
+    sender: &NodeSender,
+    node_name: &str,
+    log_reload: &LogReload,
+    current_log: &Arc<std::sync::Mutex<String>>,
+    msg: &Message,
+) {
+    let current = || {
+        current_log
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    };
+    let payload = match parse_node_config_request(msg) {
+        Ok(NodeConfigControlRequest::Get(_)) => json!({
+            "ok": true,
+            "node_name": node_name,
+            "state": "ok",
+            "effective_config": { "log_level": current() },
+        }),
+        Ok(NodeConfigControlRequest::Set(req)) => {
+            let cfg = req.config.as_object().cloned().unwrap_or_default();
+            let mut applied: Vec<String> = Vec::new();
+            let mut restart_required: Vec<String> = Vec::new();
+            let mut error: Option<String> = None;
+            for (key, value) in &cfg {
+                match key.as_str() {
+                    "log_level" => match value.as_str() {
+                        Some(level) => match log_reload(level) {
+                            Ok(()) => {
+                                applied.push("log_level".to_string());
+                                tracing::info!(log_level = %level, "sy-edge applied log_level live (node_config §9)");
+                            }
+                            Err(err) => error = Some(format!("log_level: {err}")),
+                        },
+                        None => error = Some("log_level must be a string".to_string()),
+                    },
+                    other => restart_required.push(other.to_string()),
+                }
+            }
+            let ok = error.is_none();
+            json!({
+                "ok": ok,
+                "node_name": node_name,
+                "state": if ok { "applied" } else { "error" },
+                "config_version": req.config_version,
+                "effective_config": { "log_level": current() },
+                "applied": applied,
+                "restart_required": restart_required,
+                "error": error.map(|detail| json!({ "code": "CONFIG_APPLY_FAILED", "detail": detail })),
+            })
+        }
+        Err(err) => json!({
+            "ok": false,
+            "node_name": node_name,
+            "state": "error",
+            "error": { "code": "INVALID_CONFIG", "detail": err.to_string() },
+        }),
+    };
+    let reply = build_node_config_response_message(msg, sender.uuid(), payload);
+    if let Err(err) = sender.send(reply).await {
+        tracing::warn!(error = %err, "sy-edge failed to send node_config response");
     }
 }
 
