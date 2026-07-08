@@ -180,16 +180,10 @@ fn default_ipv6_policy() -> String {
 /// Ingress edge-frontend parameters. On a `role: ingress` hive this drives the
 /// `SY.edge` public `:443` frontend, written into the remote hive.yaml `edge:`
 /// section (sy_edge reads it and, gated on `role==ingress`, binds the door). See
-/// docs/edge-ingress-spec-v3.md.
+/// docs/edge-ingress-spec-v6.md.
 #[derive(Debug, Clone, Deserialize)]
 struct IngressSection {
     listen: Option<String>,
-    /// Initial endpoint registry written to the remote
-    /// `/etc/fluxbee/edge.endpoints.json`. Each row is
-    /// `{hash, ilk, handler_node, inbound_family, auth_mode, ...}` (Option A/Z).
-    /// Defaults to empty; rows are then pushed live via NODE_CONFIG_SET (spec §5.1).
-    #[serde(default)]
-    endpoints_json: Option<serde_json::Value>,
     /// SY.vault secret key holding the public TLS material `{cert, key}` (PEM). When
     /// set, it is rendered into the remote `edge:` block so SY.edge fetches its cert
     /// from vault at boot and serves HTTPS fail-closed (spec §8 / blocker H3). The
@@ -204,10 +198,9 @@ struct IngressSection {
 fn resolve_add_hive_ingress_section(
     payload: &serde_json::Value,
 ) -> Result<IngressSection, OrchestratorError> {
-    let ing = payload
-        .get("ingress")
-        .and_then(|v| v.as_object())
-        .ok_or("add_hive role=ingress requires an 'ingress' object (listen, optional endpoints_json)")?;
+    let ing = payload.get("ingress").and_then(|v| v.as_object()).ok_or(
+        "add_hive role=ingress requires an 'ingress' object (listen, optional endpoints_json)",
+    )?;
     let get_str = |key: &str| {
         ing.get(key)
             .and_then(|v| v.as_str())
@@ -215,22 +208,43 @@ fn resolve_add_hive_ingress_section(
             .filter(|s| !s.is_empty())
     };
     // A public listener must be EXPLICIT — no safe default for a :443 bind.
-    let listen = get_str("listen")
-        .ok_or("add_hive role=ingress requires 'ingress.listen' (host:port for the public frontend)")?;
-    if listen.parse::<std::net::SocketAddr>().is_err() {
-        return Err(format!(
-            "invalid ingress.listen '{listen}' (want host:port, e.g. 0.0.0.0:443)"
-        )
-        .into());
-    }
+    let listen = get_str("listen").ok_or(
+        "add_hive role=ingress requires 'ingress.listen' (host:port for the public frontend)",
+    )?;
+    let listen_addr: std::net::SocketAddr = listen.parse().map_err(|_| {
+        format!("invalid ingress.listen '{listen}' (want host:port, e.g. 0.0.0.0:443)")
+    })?;
     // The scalar is interpolated into the double-quoted hive.yaml `edge:` block —
     // guard against YAML injection at request time (mirrors the egress guard).
     validate_yaml_scalar(&listen, "ingress.listen")?;
-    // Optional TLS wiring: the vault secret key + hive holding the public cert.
-    // Same YAML-injection guard, since both are interpolated into the edge: block.
+    let allow_plaintext = match ing.get("allow_plaintext") {
+        Some(value) => value
+            .as_bool()
+            .ok_or("ingress.allow_plaintext must be boolean")?,
+        None => false,
+    };
     let tls_vault_key = get_str("tls_vault_key");
     if let Some(key) = tls_vault_key.as_deref() {
         validate_yaml_scalar(key, "ingress.tls_vault_key")?;
+    }
+    if tls_vault_key.is_none() {
+        if !allow_plaintext {
+            return Err(
+                "add_hive role=ingress requires ingress.tls_vault_key; set ingress.allow_plaintext=true only for explicit dev plaintext"
+                    .into(),
+            );
+        }
+        if listen_addr.port() == 443 {
+            return Err("ingress.allow_plaintext=true is not allowed on port 443".into());
+        }
+    }
+    if let Some(seed) = ing.get("endpoints_json") {
+        if !ingress_endpoints_seed_is_empty(seed) {
+            return Err(
+                "ingress.endpoints_json is no longer accepted; publish URLs with externalize"
+                    .into(),
+            );
+        }
     }
     let vault_hive = get_str("vault_hive");
     if let Some(hive) = vault_hive.as_deref() {
@@ -238,10 +252,17 @@ fn resolve_add_hive_ingress_section(
     }
     Ok(IngressSection {
         listen: Some(listen),
-        endpoints_json: ing.get("endpoints_json").cloned(),
         tls_vault_key,
         vault_hive,
     })
+}
+
+fn ingress_endpoints_seed_is_empty(value: &serde_json::Value) -> bool {
+    value
+        .get("endpoints")
+        .and_then(|endpoints| endpoints.as_array())
+        .map(|endpoints| endpoints.is_empty())
+        .unwrap_or(false)
 }
 
 /// Resolved hive role. `SY.orchestrator` supports motherbee | worker | egress | ingress.
@@ -929,11 +950,8 @@ fn ensure_mesh_ca() -> Result<json_router::mesh_tls::MeshCa, OrchestratorError> 
     let ca_crt = dir.join("ca.crt");
     let ca_key = dir.join("ca.key");
     let load = || {
-        MeshCa::from_pem(
-            &fs::read_to_string(&ca_crt)?,
-            &fs::read_to_string(&ca_key)?,
-        )
-        .map_err(|e| OrchestratorError::from(format!("load mesh CA: {e}")))
+        MeshCa::from_pem(&fs::read_to_string(&ca_crt)?, &fs::read_to_string(&ca_key)?)
+            .map_err(|e| OrchestratorError::from(format!("load mesh CA: {e}")))
     };
     if ca_crt.exists() && ca_key.exists() {
         return load();
@@ -978,7 +996,9 @@ fn write_local_hive_tls(
     ca: &json_router::mesh_tls::MeshCa,
     hive_id: &str,
 ) -> Result<(), OrchestratorError> {
-    let leaf = ca.issue_leaf(hive_id).map_err(|e| format!("issue leaf: {e}"))?;
+    let leaf = ca
+        .issue_leaf(hive_id)
+        .map_err(|e| format!("issue leaf: {e}"))?;
     let dir = Path::new(MESH_TLS_BASE_DIR).join(hive_id);
     fs::create_dir_all(&dir)?;
     let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
@@ -1023,20 +1043,33 @@ fn ensure_motherbee_ssh_key() {
         let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
     }
     match Command::new("ssh-keygen")
-        .args(["-t", "ed25519", "-N", "", "-q", "-f", MOTHERBEE_SSH_KEY_PATH])
+        .args([
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-q",
+            "-f",
+            MOTHERBEE_SSH_KEY_PATH,
+        ])
         .output()
     {
         Ok(o) if o.status.success() => {
             let _ = fs::set_permissions(key, fs::Permissions::from_mode(0o600));
             let pub_path = format!("{MOTHERBEE_SSH_KEY_PATH}.pub");
             let _ = fs::set_permissions(Path::new(&pub_path), fs::Permissions::from_mode(0o644));
-            tracing::info!(path = MOTHERBEE_SSH_KEY_PATH, "generated motherbee SSH bootstrap key");
+            tracing::info!(
+                path = MOTHERBEE_SSH_KEY_PATH,
+                "generated motherbee SSH bootstrap key"
+            );
         }
         Ok(o) => tracing::warn!(
             stderr = %String::from_utf8_lossy(&o.stderr),
             "ssh-keygen failed for motherbee key"
         ),
-        Err(err) => tracing::warn!(error = %err, "ssh-keygen unavailable; motherbee SSH key not generated"),
+        Err(err) => {
+            tracing::warn!(error = %err, "ssh-keygen unavailable; motherbee SSH key not generated")
+        }
     }
 }
 
@@ -1057,7 +1090,9 @@ fn distribute_hive_tls_inner(
     hive_id: &str,
 ) -> Result<(), OrchestratorError> {
     let ca = ensure_mesh_ca()?;
-    let leaf = ca.issue_leaf(hive_id).map_err(|e| format!("issue leaf: {e}"))?;
+    let leaf = ca
+        .issue_leaf(hive_id)
+        .map_err(|e| format!("issue leaf: {e}"))?;
     let dir = format!("/var/lib/fluxbee/tls/{hive_id}");
     // Create the dir 0700 BEFORE writing: write_remote_file streams via `tee`,
     // which leaves the new file at the umask default (often world-readable) until
@@ -1072,13 +1107,34 @@ fn distribute_hive_tls_inner(
         )),
         user,
     )?;
-    write_remote_file(address, key_path, user, &format!("{dir}/ca.crt"), ca.ca_cert_pem())?;
-    write_remote_file(address, key_path, user, &format!("{dir}/cert.crt"), &leaf.cert_pem)?;
-    write_remote_file(address, key_path, user, &format!("{dir}/cert.key"), &leaf.key_pem)?;
+    write_remote_file(
+        address,
+        key_path,
+        user,
+        &format!("{dir}/ca.crt"),
+        ca.ca_cert_pem(),
+    )?;
+    write_remote_file(
+        address,
+        key_path,
+        user,
+        &format!("{dir}/cert.crt"),
+        &leaf.cert_pem,
+    )?;
+    write_remote_file(
+        address,
+        key_path,
+        user,
+        &format!("{dir}/cert.key"),
+        &leaf.key_pem,
+    )?;
     ssh_with_key(
         address,
         key_path,
-        &sudo_wrap(&format!("chmod 600 '{}/cert.key'", shell_single_quote(&dir))),
+        &sudo_wrap(&format!(
+            "chmod 600 '{}/cert.key'",
+            shell_single_quote(&dir)
+        )),
         user,
     )?;
     Ok(())
@@ -1126,7 +1182,13 @@ fn distribute_hive_identity_key_inner(
         )),
         user,
     )?;
-    write_remote_file(address, key_path, user, &remote, &format!("{}\n", key.to_hex()))?;
+    write_remote_file(
+        address,
+        key_path,
+        user,
+        &remote,
+        &format!("{}\n", key.to_hex()),
+    )?;
     ssh_with_key(
         address,
         key_path,
@@ -1170,7 +1232,9 @@ fn reconcile_hive_tls_material() {
         if ssh_with_key(
             address,
             &key_path,
-            &sudo_wrap(&format!("test -f '/var/lib/fluxbee/tls/{hive_id}/cert.crt'")),
+            &sudo_wrap(&format!(
+                "test -f '/var/lib/fluxbee/tls/{hive_id}/cert.crt'"
+            )),
             user,
         )
         .is_ok()
@@ -1181,7 +1245,10 @@ fn reconcile_hive_tls_material() {
         filled += 1;
     }
     if filled > 0 {
-        tracing::info!(count = filled, "distributed mesh TLS material to existing hives");
+        tracing::info!(
+            count = filled,
+            "distributed mesh TLS material to existing hives"
+        );
     }
 }
 
@@ -2117,7 +2184,8 @@ async fn handle_admin(
                         "message": err.to_string(),
                     }),
                     Ok(creds) => match resolve_add_hive_role(&msg.payload) {
-                        Ok(HiveRole::Egress) => match resolve_add_hive_egress_section(&msg.payload) {
+                        Ok(HiveRole::Egress) => match resolve_add_hive_egress_section(&msg.payload)
+                        {
                             Ok(egress) => {
                                 let mut result = add_egress_hive_flow(
                                     state,
@@ -2160,49 +2228,51 @@ async fn handle_admin(
                                 "message": err.to_string(),
                             }),
                         },
-                        Ok(HiveRole::Ingress) => match resolve_add_hive_ingress_section(&msg.payload) {
-                            Ok(ingress) => {
-                                let mut result = add_ingress_hive_flow(
-                                    state,
-                                    &hive_id,
-                                    &address,
-                                    harden_ssh,
-                                    restrict_ssh,
-                                    ingress,
-                                    &creds,
-                                )
-                                .await;
-                                // Same failure tail as worker/egress: on a failed
-                                // ingress join, best-effort revoke the seeded key.
-                                if result.get("status").and_then(|v| v.as_str()) != Some("ok") {
-                                    let revoke = best_effort_revoke_bootstrap(
+                        Ok(HiveRole::Ingress) => {
+                            match resolve_add_hive_ingress_section(&msg.payload) {
+                                Ok(ingress) => {
+                                    let mut result = add_ingress_hive_flow(
+                                        state,
+                                        &hive_id,
                                         &address,
-                                        creds.user.as_str(),
-                                        creds.password.as_deref(),
-                                    );
-                                    if let Some(obj) = result.as_object_mut() {
-                                        obj.insert(
-                                            "ssh_bootstrap_open".to_string(),
-                                            serde_json::json!(!revoke.closed()),
+                                        harden_ssh,
+                                        restrict_ssh,
+                                        ingress,
+                                        &creds,
+                                    )
+                                    .await;
+                                    // Same failure tail as worker/egress: on a failed
+                                    // ingress join, best-effort revoke the seeded key.
+                                    if result.get("status").and_then(|v| v.as_str()) != Some("ok") {
+                                        let revoke = best_effort_revoke_bootstrap(
+                                            &address,
+                                            creds.user.as_str(),
+                                            creds.password.as_deref(),
                                         );
-                                        obj.insert(
-                                            "ssh_key_removed".to_string(),
-                                            serde_json::json!(revoke.ssh_key_removed),
-                                        );
-                                        obj.insert(
-                                            "sudoers_removed".to_string(),
-                                            serde_json::json!(revoke.sudoers_removed),
-                                        );
+                                        if let Some(obj) = result.as_object_mut() {
+                                            obj.insert(
+                                                "ssh_bootstrap_open".to_string(),
+                                                serde_json::json!(!revoke.closed()),
+                                            );
+                                            obj.insert(
+                                                "ssh_key_removed".to_string(),
+                                                serde_json::json!(revoke.ssh_key_removed),
+                                            );
+                                            obj.insert(
+                                                "sudoers_removed".to_string(),
+                                                serde_json::json!(revoke.sudoers_removed),
+                                            );
+                                        }
                                     }
+                                    result
                                 }
-                                result
+                                Err(err) => serde_json::json!({
+                                    "status": "error",
+                                    "error_code": "INVALID_REQUEST",
+                                    "message": err.to_string(),
+                                }),
                             }
-                            Err(err) => serde_json::json!({
-                                "status": "error",
-                                "error_code": "INVALID_REQUEST",
-                                "message": err.to_string(),
-                            }),
-                        },
+                        }
                         Ok(_) => {
                             let mut result = add_hive_flow(
                                 state,
@@ -2246,7 +2316,7 @@ async fn handle_admin(
                             "error_code": "INVALID_REQUEST",
                             "message": err.to_string(),
                         }),
-                    }
+                    },
                 }
             } else {
                 serde_json::json!({
@@ -3802,6 +3872,16 @@ fn service_to_exec(service: &str) -> String {
     format!("/usr/bin/{}", service)
 }
 
+fn core_service_unit_contents(name: &str, exec_path: &str) -> String {
+    if name == "sy-orchestrator" {
+        format!("[Unit]\nDescription=Fluxbee {name}\nAfter=network.target rt-gateway.service\nWants=rt-gateway.service\nRequires=rt-gateway.service\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n")
+    } else if name == "sy-edge" {
+        format!("[Unit]\nDescription=Fluxbee {name}\nAfter=network.target rt-gateway.service\nWants=rt-gateway.service\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n")
+    } else {
+        format!("[Unit]\nDescription=Fluxbee {name}\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n")
+    }
+}
+
 fn render_system_nodes_yaml(role: HiveRole, section: &RoleSystemNodes) -> String {
     let mut out = format!("system_nodes:\n  {}:\n    nodes:\n", role.as_str());
     for name in &section.nodes {
@@ -4813,8 +4893,7 @@ fn reconcile_egress_nat(eg: &EgressSection) -> Result<EgressVerification, Orches
     // SO-08: report what the kernel actually has now, not an unconditional `true`
     // — another process/policy could have rejected or reverted the sysctls.
     verification.ipv4_forwarding = read_sysctl_bool("net/ipv4/ip_forward") == Some(true);
-    verification.ipv6_blocked =
-        read_sysctl_bool("net/ipv6/conf/all/disable_ipv6") == Some(true);
+    verification.ipv6_blocked = read_sysctl_bool("net/ipv6/conf/all/disable_ipv6") == Some(true);
 
     // conntrack tuning: live max + persisted file + modprobe hashsize (boot).
     write_file_if_changed(
@@ -5066,14 +5145,18 @@ fn validate_remote_hive_path(path: &Path, label: &str) -> Result<(), Orchestrato
     validate_yaml_scalar(value.as_ref(), label)
 }
 
-fn validate_blob_runtime_for_remote_hive(blob: &BlobRuntimeConfig) -> Result<(), OrchestratorError> {
+fn validate_blob_runtime_for_remote_hive(
+    blob: &BlobRuntimeConfig,
+) -> Result<(), OrchestratorError> {
     validate_remote_hive_path(&blob.path, "blob.path")?;
     validate_remote_hive_path(&blob.sync_data_dir, "blob.sync.data_dir")?;
     validate_runtime_sync_tool(&blob.sync_tool, "blob.sync.tool")?;
     Ok(())
 }
 
-fn validate_dist_runtime_for_remote_hive(dist: &DistRuntimeConfig) -> Result<(), OrchestratorError> {
+fn validate_dist_runtime_for_remote_hive(
+    dist: &DistRuntimeConfig,
+) -> Result<(), OrchestratorError> {
     validate_remote_hive_path(&dist.path, "dist.path")?;
     validate_runtime_sync_tool(&dist.sync_tool, "dist.sync.tool")?;
     Ok(())
@@ -8310,8 +8393,10 @@ fn remove_hive_cleanup_full_script(egress_teardown: bool) -> String {
 }
 
 fn remove_hive_cleanup_local_flow(egress_teardown: bool) -> serde_json::Value {
-    let deferred_script =
-        format!("sleep 1; {}", remove_hive_cleanup_full_script(egress_teardown));
+    let deferred_script = format!(
+        "sleep 1; {}",
+        remove_hive_cleanup_full_script(egress_teardown)
+    );
     let deferred_cmd = remove_hive_cleanup_shell_command(&deferred_script);
     match Command::new("bash").arg("-lc").arg(deferred_cmd).spawn() {
         Ok(_) => serde_json::json!({
@@ -11776,23 +11861,13 @@ async fn rollback_node_identity_after_failed_spawn(
     if created_remote_ilk {
         if let Some(ilk_id) = identity_ilk_id {
             rollback["remote_ilk_delete_attempted"] = serde_json::json!(true);
-            let delete = delete_node_ilk_for_spawn_rollback(
-                state,
-                identity_primary_hive_id,
-                ilk_id,
-            )
-            .await;
-            rollback["remote_ilk_deleted"] = serde_json::json!(
-                delete
-                    .get("status")
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|status| status == "ok")
-            );
-            if delete
+            let delete =
+                delete_node_ilk_for_spawn_rollback(state, identity_primary_hive_id, ilk_id).await;
+            rollback["remote_ilk_deleted"] = serde_json::json!(delete
                 .get("status")
                 .and_then(|value| value.as_str())
-                != Some("ok")
-            {
+                .is_some_and(|status| status == "ok"));
+            if delete.get("status").and_then(|value| value.as_str()) != Some("ok") {
                 rollback["status"] = serde_json::json!("error");
             }
             rollback["remote_ilk_delete"] = delete;
@@ -14866,17 +14941,26 @@ fn sync_vendor_to_worker(
     user: &str,
 ) -> Result<(), OrchestratorError> {
     let Some(manifest_path) = local_vendor_manifest_path() else {
-        tracing::warn!(hive_id = hive_id, "no local vendor manifest; skipping vendor sync to worker");
+        tracing::warn!(
+            hive_id = hive_id,
+            "no local vendor manifest; skipping vendor sync to worker"
+        );
         return Ok(());
     };
     let bin_path = Path::new(DIST_SYNCTHING_VENDOR_SOURCE_PATH);
     if !bin_path.exists() {
-        tracing::warn!(hive_id = hive_id, "vendor manifest present but syncthing binary missing; skipping vendor sync");
+        tracing::warn!(
+            hive_id = hive_id,
+            "vendor manifest present but syncthing binary missing; skipping vendor sync"
+        );
         return Ok(());
     }
     let cfg_path = local_vendor_component_path("syncthing/config.xml");
 
-    let mut upload_paths = vec![manifest_path.display().to_string(), bin_path.display().to_string()];
+    let mut upload_paths = vec![
+        manifest_path.display().to_string(),
+        bin_path.display().to_string(),
+    ];
     if let Some(cfg) = &cfg_path {
         upload_paths.push(cfg.display().to_string());
     }
@@ -14886,10 +14970,19 @@ fn sync_vendor_to_worker(
     ssh_with_key(
         address,
         key_path,
-        &format!("rm -rf '{stage}' && mkdir -p '{stage}'", stage = shell_single_quote(&remote_stage)),
+        &format!(
+            "rm -rf '{stage}' && mkdir -p '{stage}'",
+            stage = shell_single_quote(&remote_stage)
+        ),
         user,
     )?;
-    scp_with_key(address, key_path, &upload_refs, &format!("{remote_stage}/"), user)?;
+    scp_with_key(
+        address,
+        key_path,
+        &upload_refs,
+        &format!("{remote_stage}/"),
+        user,
+    )?;
 
     let mut commands = vec![
         "set -euo pipefail".to_string(),
@@ -14909,7 +15002,10 @@ fn sync_vendor_to_worker(
             stage = shell_single_quote(&remote_stage),
         ));
     }
-    commands.push(format!("rm -rf '{stage}'", stage = shell_single_quote(&remote_stage)));
+    commands.push(format!(
+        "rm -rf '{stage}'",
+        stage = shell_single_quote(&remote_stage)
+    ));
     let promote = commands.join(" && ");
     ssh_with_key(
         address,
@@ -14917,7 +15013,10 @@ fn sync_vendor_to_worker(
         &sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&promote))),
         user,
     )?;
-    tracing::info!(hive_id = hive_id, "synced vendor runtime (syncthing) to worker");
+    tracing::info!(
+        hive_id = hive_id,
+        "synced vendor runtime (syncthing) to worker"
+    );
     Ok(())
 }
 
@@ -15283,19 +15382,9 @@ fn remote_wait_service_active(
         service = service_q
     );
     let check_running = || -> Result<bool, OrchestratorError> {
-        ssh_with_key(
-            address,
-            key_path,
-            &sudo_wrap(&is_active_cmd),
-            user,
-        )?;
-        let substate = ssh_with_key_output(
-            address,
-            key_path,
-            &sudo_wrap(&substate_cmd),
-            user,
-        )
-        .unwrap_or_default();
+        ssh_with_key(address, key_path, &sudo_wrap(&is_active_cmd), user)?;
+        let substate = ssh_with_key_output(address, key_path, &sudo_wrap(&substate_cmd), user)
+            .unwrap_or_default();
         Ok(substate.trim() == "running")
     };
 
@@ -15316,13 +15405,9 @@ fn remote_wait_service_active(
             Err(err) => {
                 stable = 0;
                 last_err = Some(err.to_string());
-                let summary = ssh_with_key_output(
-                    address,
-                    key_path,
-                    &sudo_wrap(&state_summary_cmd),
-                    user,
-                )
-                .unwrap_or_default();
+                let summary =
+                    ssh_with_key_output(address, key_path, &sudo_wrap(&state_summary_cmd), user)
+                        .unwrap_or_default();
                 let summary = summary.trim();
                 if !summary.is_empty() {
                     last_state_summary = Some(summary.to_string());
@@ -15386,13 +15471,8 @@ fn restart_remote_core_services_with_health_gate(
             "core sync: restarting remote service"
         );
         let restart_cmd = format!("systemctl restart {}", service);
-        ssh_with_key(
-            address,
-            key_path,
-            &sudo_wrap(&restart_cmd),
-            user,
-        )
-        .map_err(|err| format!("failed to restart service '{}': {}", service, err))?;
+        ssh_with_key(address, key_path, &sudo_wrap(&restart_cmd), user)
+            .map_err(|err| format!("failed to restart service '{}': {}", service, err))?;
         remote_wait_service_active(
             address,
             key_path,
@@ -16119,23 +16199,29 @@ async fn add_hive_flow(
                     // the F9 pending-resume path); anything else is a real
                     // FINALIZE_FAILED from a non-ok worker payload.
                     let err_text = err.to_string();
-                    append_add_hive_finalize_history(state, hive_id, "error", Some(err_text.clone()));
-                    let (error_code, retryable, message) =
-                        if is_socket_only_unreachable_error(&err_text) {
-                            (
+                    append_add_hive_finalize_history(
+                        state,
+                        hive_id,
+                        "error",
+                        Some(err_text.clone()),
+                    );
+                    let (error_code, retryable, message) = if is_socket_only_unreachable_error(
+                        &err_text,
+                    ) {
+                        (
                                 "WORKER_SOCKET_UNREACHABLE",
                                 true,
                                 format!(
                                     "worker orchestrator online but socket finalize unreachable/timeout; not reprovisioning over SSH: {err_text}"
                                 ),
                             )
-                        } else {
-                            (
-                                "FINALIZE_FAILED",
-                                false,
-                                format!("worker socket-only finalize failed: {err_text}"),
-                            )
-                        };
+                    } else {
+                        (
+                            "FINALIZE_FAILED",
+                            false,
+                            format!("worker socket-only finalize failed: {err_text}"),
+                        )
+                    };
                     return serde_json::json!({
                         "status": "error",
                         "error_code": error_code,
@@ -16416,10 +16502,19 @@ async fn add_hive_flow(
     let core_deploy_started_at = now_epoch_ms();
     let core_deploy_started = Instant::now();
     let local_core_hash = local_core_manifest_hash().ok().flatten();
-    let remote_core_hash_before = remote_core_manifest_hash(address, &key_path, creds.user.as_str()).ok().flatten();
-    if let Err(err) =
-        sync_core_to_worker(hive_id, address, &key_path, creds.user.as_str(), false, true, HiveRole::Worker)
-    {
+    let remote_core_hash_before =
+        remote_core_manifest_hash(address, &key_path, creds.user.as_str())
+            .ok()
+            .flatten();
+    if let Err(err) = sync_core_to_worker(
+        hive_id,
+        address,
+        &key_path,
+        creds.user.as_str(),
+        false,
+        true,
+        HiveRole::Worker,
+    ) {
         let entry = DeploymentHistoryEntry {
             deployment_id: Uuid::new_v4().to_string(),
             category: "core".to_string(),
@@ -16450,7 +16545,9 @@ async fn add_hive_flow(
             "message": err.to_string(),
         });
     }
-    let remote_core_hash_after = remote_core_manifest_hash(address, &key_path, creds.user.as_str()).ok().flatten();
+    let remote_core_hash_after = remote_core_manifest_hash(address, &key_path, creds.user.as_str())
+        .ok()
+        .flatten();
     let entry = DeploymentHistoryEntry {
         deployment_id: Uuid::new_v4().to_string(),
         category: "core".to_string(),
@@ -16591,7 +16688,13 @@ async fn add_hive_flow(
         worker_egress_yaml,
         render_system_nodes_yaml(HiveRole::Worker, &worker_system_nodes)
     );
-    if let Err(err) = write_remote_file(address, &key_path, creds.user.as_str(), "/etc/fluxbee/hive.yaml", &hive_yaml) {
+    if let Err(err) = write_remote_file(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        "/etc/fluxbee/hive.yaml",
+        &hive_yaml,
+    ) {
         return serde_json::json!({
             "status": "error",
             "error_code": "CONFIG_FAILED",
@@ -16661,7 +16764,9 @@ async fn add_hive_flow(
             )
         };
         let unit_path = format!("/etc/systemd/system/{name}.service");
-        if let Err(err) = write_remote_file(address, &key_path, creds.user.as_str(), &unit_path, &unit) {
+        if let Err(err) =
+            write_remote_file(address, &key_path, creds.user.as_str(), &unit_path, &unit)
+        {
             return serde_json::json!({
                 "status": "error",
                 "error_code": "SERVICE_FAILED",
@@ -16725,7 +16830,13 @@ async fn add_hive_flow(
         "sy-orchestrator",
         CORE_SERVICE_HEALTH_TIMEOUT_SECS,
     ) {
-        let journal_tail = remote_service_journal_tail(address, &key_path, creds.user.as_str(), "sy-orchestrator", 120);
+        let journal_tail = remote_service_journal_tail(
+            address,
+            &key_path,
+            creds.user.as_str(),
+            "sy-orchestrator",
+            120,
+        );
         return serde_json::json!({
             "status": "error",
             "error_code": "SERVICE_FAILED",
@@ -16799,7 +16910,13 @@ async fn add_hive_flow(
     if !orchestrator_connected {
         let detail = orchestrator_wait_error
             .unwrap_or_else(|| "worker orchestrator not observed in LSA".to_string());
-        let journal_tail = remote_service_journal_tail(address, &key_path, creds.user.as_str(), "sy-orchestrator", 120);
+        let journal_tail = remote_service_journal_tail(
+            address,
+            &key_path,
+            creds.user.as_str(),
+            "sy-orchestrator",
+            120,
+        );
         return serde_json::json!({
             "status": "error",
             "error_code": "WORKER_ORCHESTRATOR_TIMEOUT",
@@ -16985,14 +17102,18 @@ async fn add_hive_flow(
     // dist-sync, so revoke the bootstrap SSH access (strip the motherbee key from
     // authorized_keys + drop the sudoers NOPASSWD grant). This is the last SSH op.
     // Best-effort: a revoke failure must not fail an otherwise-successful join.
-    let ssh_bootstrap_revoked =
-        match revoke_bootstrap_ssh_access(address, &key_path, creds.user.as_str(), &pub_key) {
-            Ok(()) => true,
-            Err(err) => {
-                tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access; key/sudoers may remain on the worker");
-                false
-            }
-        };
+    let ssh_bootstrap_revoked = match revoke_bootstrap_ssh_access(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &pub_key,
+    ) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access; key/sudoers may remain on the worker");
+            false
+        }
+    };
 
     serde_json::json!({
         "status": "ok",
@@ -17205,9 +17326,15 @@ async fn add_egress_hive_flow(
     }
 
     // Push the egress core component set.
-    if let Err(err) =
-        sync_core_to_worker(hive_id, address, &key_path, creds.user.as_str(), false, true, HiveRole::Egress)
-    {
+    if let Err(err) = sync_core_to_worker(
+        hive_id,
+        address,
+        &key_path,
+        creds.user.as_str(),
+        false,
+        true,
+        HiveRole::Egress,
+    ) {
         append_single_deployment_history(
             state,
             "core",
@@ -17275,7 +17402,13 @@ async fn add_egress_hive_flow(
         lan_iface = nat.lan_iface,
         system_nodes = render_system_nodes_yaml(HiveRole::Egress, &egress_system_nodes),
     );
-    if let Err(err) = write_remote_file(address, &key_path, creds.user.as_str(), "/etc/fluxbee/hive.yaml", &hive_yaml) {
+    if let Err(err) = write_remote_file(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        "/etc/fluxbee/hive.yaml",
+        &hive_yaml,
+    ) {
         return err_payload("CONFIG_FAILED", err.to_string());
     }
     // Distribute the mesh TLS material so the egress hive's router can present a
@@ -17314,7 +17447,9 @@ async fn add_egress_hive_flow(
             format!("[Unit]\nDescription=Fluxbee {name}\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n")
         };
         let unit_path = format!("/etc/systemd/system/{name}.service");
-        if let Err(err) = write_remote_file(address, &key_path, creds.user.as_str(), &unit_path, &unit) {
+        if let Err(err) =
+            write_remote_file(address, &key_path, creds.user.as_str(), &unit_path, &unit)
+        {
             return err_payload("SERVICE_FAILED", format!("{name}: {err}"));
         }
     }
@@ -17350,7 +17485,13 @@ async fn add_egress_hive_flow(
         "sy-orchestrator",
         CORE_SERVICE_HEALTH_TIMEOUT_SECS,
     ) {
-        let journal = remote_service_journal_tail(address, &key_path, creds.user.as_str(), "sy-orchestrator", 120);
+        let journal = remote_service_journal_tail(
+            address,
+            &key_path,
+            creds.user.as_str(),
+            "sy-orchestrator",
+            120,
+        );
         return err_payload(
             "SERVICE_FAILED",
             match journal {
@@ -17406,7 +17547,13 @@ async fn add_egress_hive_flow(
         });
     }
     if !orchestrator_connected {
-        let journal = remote_service_journal_tail(address, &key_path, creds.user.as_str(), "sy-orchestrator", 120);
+        let journal = remote_service_journal_tail(
+            address,
+            &key_path,
+            creds.user.as_str(),
+            "sy-orchestrator",
+            120,
+        );
         return serde_json::json!({
             "status": "error",
             "error_code": "ORCHESTRATOR_TIMEOUT",
@@ -17501,14 +17648,18 @@ async fn add_egress_hive_flow(
     // the real value back here is the T-VER-1 follow-up.
     // SO-02: revoke bootstrap SSH access (key + sudoers) — especially important on
     // an egress boundary host. Best-effort. Post-bootstrap is socket + dist-sync.
-    let ssh_bootstrap_revoked =
-        match revoke_bootstrap_ssh_access(address, &key_path, creds.user.as_str(), &pub_key) {
-            Ok(()) => true,
-            Err(err) => {
-                tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access on egress; key/sudoers may remain");
-                false
-            }
-        };
+    let ssh_bootstrap_revoked = match revoke_bootstrap_ssh_access(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &pub_key,
+    ) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access on egress; key/sudoers may remain");
+            false
+        }
+    };
 
     serde_json::json!({
         "status": "ok",
@@ -17551,9 +17702,7 @@ async fn add_ingress_hive_flow(
     ingress: IngressSection,
     creds: &BootstrapCreds,
 ) -> serde_json::Value {
-    let err_payload = |code: &str, msg: String| {
-        serde_json::json!({ "status": "error", "error_code": code, "message": msg })
-    };
+    let err_payload = |code: &str, msg: String| serde_json::json!({ "status": "error", "error_code": code, "message": msg });
 
     if !valid_hive_id(hive_id) {
         return err_payload("INVALID_HIVE_ID", "invalid hive_id".to_string());
@@ -17624,7 +17773,10 @@ async fn add_ingress_hive_flow(
     if !key_path.exists() {
         return err_payload(
             "SSH_KEY_FAILED",
-            format!("motherbee ssh key missing (expected '{}')", key_path.display()),
+            format!(
+                "motherbee ssh key missing (expected '{}')",
+                key_path.display()
+            ),
         );
     }
     let pub_key = match public_key_from_private_key(&key_path) {
@@ -17790,7 +17942,13 @@ async fn add_ingress_hive_flow(
         edge_tls = edge_tls_yaml,
         system_nodes = render_system_nodes_yaml(HiveRole::Ingress, &ingress_system_nodes),
     );
-    if let Err(err) = write_remote_file(address, &key_path, creds.user.as_str(), "/etc/fluxbee/hive.yaml", &hive_yaml) {
+    if let Err(err) = write_remote_file(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        "/etc/fluxbee/hive.yaml",
+        &hive_yaml,
+    ) {
         return err_payload("CONFIG_FAILED", err.to_string());
     }
     distribute_hive_tls(address, &key_path, creds.user.as_str(), hive_id);
@@ -17807,13 +17965,9 @@ async fn add_ingress_hive_flow(
     ) {
         return err_payload("CONFIG_FAILED", err.to_string());
     }
-    // Seed the endpoint registry so the frontend's load_registry never starts
-    // empty-by-accident (a missing file 404s every /e/<hash>).
-    let endpoints_json = ingress
-        .endpoints_json
-        .as_ref()
-        .and_then(|v| serde_json::to_string_pretty(v).ok())
-        .unwrap_or_else(|| "{\n  \"endpoints\": []\n}\n".to_string());
+    // The edge is born without public routes. URLs are opened one at a time by
+    // SY.admin through EDGE_OPEN_URL after ownership has been resolved.
+    let endpoints_json = "{\n  \"endpoints\": []\n}\n".to_string();
     if let Err(err) = write_remote_file(
         address,
         &key_path,
@@ -17837,13 +17991,11 @@ async fn add_ingress_hive_flow(
         units.push((service.clone(), service_to_exec(&service)));
     }
     for (name, exec_path) in &units {
-        let unit = if name == "sy-orchestrator" {
-            format!("[Unit]\nDescription=Fluxbee {name}\nAfter=network.target rt-gateway.service\nWants=rt-gateway.service\nRequires=rt-gateway.service\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n")
-        } else {
-            format!("[Unit]\nDescription=Fluxbee {name}\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n")
-        };
+        let unit = core_service_unit_contents(name, exec_path);
         let unit_path = format!("/etc/systemd/system/{name}.service");
-        if let Err(err) = write_remote_file(address, &key_path, creds.user.as_str(), &unit_path, &unit) {
+        if let Err(err) =
+            write_remote_file(address, &key_path, creds.user.as_str(), &unit_path, &unit)
+        {
             return err_payload("SERVICE_FAILED", format!("{name}: {err}"));
         }
     }
@@ -17855,7 +18007,14 @@ async fn add_ingress_hive_flow(
     ) {
         return err_payload("SERVICE_FAILED", err.to_string());
     }
-    for name in ["rt-gateway", "sy-orchestrator"] {
+    let mut services_to_start = vec!["rt-gateway".to_string(), "sy-orchestrator".to_string()];
+    for node_name in &ingress_system_nodes.nodes {
+        let service = name_to_service(node_name);
+        if !services_to_start.iter().any(|name| name == &service) {
+            services_to_start.push(service);
+        }
+    }
+    for name in &services_to_start {
         if let Err(err) = ssh_with_key(
             address,
             &key_path,
@@ -17879,7 +18038,13 @@ async fn add_ingress_hive_flow(
         "sy-orchestrator",
         CORE_SERVICE_HEALTH_TIMEOUT_SECS,
     ) {
-        let journal = remote_service_journal_tail(address, &key_path, creds.user.as_str(), "sy-orchestrator", 120);
+        let journal = remote_service_journal_tail(
+            address,
+            &key_path,
+            creds.user.as_str(),
+            "sy-orchestrator",
+            120,
+        );
         return err_payload(
             "SERVICE_FAILED",
             match journal {
@@ -17888,7 +18053,26 @@ async fn add_ingress_hive_flow(
             },
         );
     }
-
+    for node_name in &ingress_system_nodes.wait_for {
+        let service = name_to_service(node_name);
+        if let Err(err) = remote_wait_service_active(
+            address,
+            &key_path,
+            creds.user.as_str(),
+            &service,
+            CORE_SERVICE_HEALTH_TIMEOUT_SECS,
+        ) {
+            let journal =
+                remote_service_journal_tail(address, &key_path, creds.user.as_str(), &service, 120);
+            return err_payload(
+                "SERVICE_FAILED",
+                match journal {
+                    Some(tail) => format!("{service} failed health gate: {err}; journal={tail}"),
+                    None => format!("{service} failed health gate: {err}"),
+                },
+            );
+        }
+    }
     let mut wan_connected = true;
     if let Err(err) = wait_for_wan(&state.hive_id, hive_id, Duration::from_secs(60)) {
         tracing::warn!(hive_id = hive_id, error = %err, "ingress WAN not ready in time");
@@ -17925,7 +18109,13 @@ async fn add_ingress_hive_flow(
         });
     }
     if !orchestrator_connected {
-        let journal = remote_service_journal_tail(address, &key_path, creds.user.as_str(), "sy-orchestrator", 120);
+        let journal = remote_service_journal_tail(
+            address,
+            &key_path,
+            creds.user.as_str(),
+            "sy-orchestrator",
+            120,
+        );
         return serde_json::json!({
             "status": "error",
             "error_code": "ORCHESTRATOR_TIMEOUT",
@@ -17939,6 +18129,36 @@ async fn add_ingress_hive_flow(
             "wan_connected": true,
             "orchestrator_connected": false,
         });
+    }
+    let mut edge_service_active = false;
+    if ingress_system_nodes
+        .nodes
+        .iter()
+        .any(|name| name.trim() == "SY.edge")
+    {
+        if let Err(err) = remote_wait_service_active(
+            address,
+            &key_path,
+            creds.user.as_str(),
+            "sy-edge",
+            CORE_SERVICE_HEALTH_TIMEOUT_SECS,
+        ) {
+            let journal = remote_service_journal_tail(
+                address,
+                &key_path,
+                creds.user.as_str(),
+                "sy-edge",
+                120,
+            );
+            return err_payload(
+                "SERVICE_FAILED",
+                match journal {
+                    Some(tail) => format!("sy-edge failed health gate: {err}; journal={tail}"),
+                    None => format!("sy-edge failed health gate: {err}"),
+                },
+            );
+        }
+        edge_service_active = true;
     }
 
     // SSH hardening (ingress is an internet-facing boundary; fatal, like egress).
@@ -17972,6 +18192,7 @@ async fn add_ingress_hive_flow(
                 "restrict_ssh_requested": restrict_ssh,
                 "wan_connected": true,
                 "orchestrator_connected": true,
+                "edge_service_active": edge_service_active,
             });
         }
     };
@@ -18000,14 +18221,18 @@ async fn add_ingress_hive_flow(
         local_core_manifest_hash().ok().flatten(),
     );
 
-    let ssh_bootstrap_revoked =
-        match revoke_bootstrap_ssh_access(address, &key_path, creds.user.as_str(), &pub_key) {
-            Ok(()) => true,
-            Err(err) => {
-                tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access on ingress; key/sudoers may remain");
-                false
-            }
-        };
+    let ssh_bootstrap_revoked = match revoke_bootstrap_ssh_access(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        &pub_key,
+    ) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access on ingress; key/sudoers may remain");
+            false
+        }
+    };
 
     serde_json::json!({
         "status": "ok",
@@ -18023,6 +18248,7 @@ async fn add_ingress_hive_flow(
         "ssh_bootstrap_revoked": ssh_bootstrap_revoked,
         "wan_connected": wan_connected,
         "orchestrator_connected": orchestrator_connected,
+        "edge_service_active": edge_service_active,
         "note": "ingress SY.edge frontend binds the public listener from hive.yaml edge.listen (gated on role==ingress). It forwards by the pre-resolved handler_node cached in its endpoint table (Option Z); ingress runs no sy-identity.",
     })
 }
@@ -18450,14 +18676,7 @@ fn apply_add_hive_ssh_controls_after_finalize(
             pub_key,
             &source_patterns,
         )
-        .and_then(|_| {
-            ssh_with_key(
-                address,
-                key_path,
-                "sudo -n /bin/bash -lc 'exit 0'",
-                user,
-            )
-        });
+        .and_then(|_| ssh_with_key(address, key_path, "sudo -n /bin/bash -lc 'exit 0'", user));
         match restrict_result {
             Ok(()) => {
                 restrict_ssh_applied = true;
@@ -18539,20 +18758,10 @@ if command -v sshd >/dev/null 2>&1; then
 elif [ -x /usr/sbin/sshd ]; then
   /usr/sbin/sshd -t >/dev/null 2>&1 || true
 fi'"#;
-    ssh_with_key(
-        address,
-        key_path,
-        &sudo_wrap(set_password_auth_cmd),
-        user,
-    )?;
+    ssh_with_key(address, key_path, &sudo_wrap(set_password_auth_cmd), user)?;
 
     let restart_ssh_cmd = r#"bash -lc "systemctl restart sshd || systemctl restart ssh || service sshd restart || service ssh restart""#;
-    ssh_with_key(
-        address,
-        key_path,
-        &sudo_wrap(restart_ssh_cmd),
-        user,
-    )?;
+    ssh_with_key(address, key_path, &sudo_wrap(restart_ssh_cmd), user)?;
     Ok(())
 }
 
@@ -18827,7 +19036,8 @@ fn best_effort_revoke_bootstrap(
             || password
                 .filter(|value| !value.trim().is_empty())
                 .is_some_and(|value| {
-                    revoke_bootstrap_authorized_key_with_pass(address, user, value, &pub_key).is_ok()
+                    revoke_bootstrap_authorized_key_with_pass(address, user, value, &pub_key)
+                        .is_ok()
                 });
 
     BootstrapRevokeOutcome {
@@ -18860,13 +19070,7 @@ fn ensure_remote_orchestrator_sudoers_with_access(
     let local_tmp_str = local_tmp.to_string_lossy().to_string();
     let local_refs = [local_tmp_str.as_str()];
     let remote_tmp = format!("/tmp/fluxbee-orchestrator-sudoers-{}", now_epoch_ms());
-    let upload_result = scp_with_key(
-        address,
-        key_path,
-        &local_refs,
-        &remote_tmp,
-        user,
-    );
+    let upload_result = scp_with_key(address, key_path, &local_refs, &remote_tmp, user);
     if let Err(err) = upload_result {
         let _ = fs::remove_file(&local_tmp);
         return Err(format!("failed to upload sudoers bootstrap: {err}").into());
@@ -18905,13 +19109,9 @@ fn ensure_remote_orchestrator_sudoers_with_access(
         user,
     )
     .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (systemctl): {err}"))?;
-    ssh_with_key(
-        address,
-        key_path,
-        &sudo_wrap("systemd-run --version"),
-        user,
-    )
-    .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (systemd-run): {err}"))?;
+    ssh_with_key(address, key_path, &sudo_wrap("systemd-run --version"), user).map_err(|err| {
+        format!("sudo -n unavailable after sudoers bootstrap (systemd-run): {err}")
+    })?;
     ssh_with_key(
         address,
         key_path,
@@ -18919,13 +19119,8 @@ fn ensure_remote_orchestrator_sudoers_with_access(
         user,
     )
     .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (install): {err}"))?;
-    ssh_with_key(
-        address,
-        key_path,
-        &sudo_wrap("/bin/chmod --version"),
-        user,
-    )
-    .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (chmod): {err}"))?;
+    ssh_with_key(address, key_path, &sudo_wrap("/bin/chmod --version"), user)
+        .map_err(|err| format!("sudo -n unavailable after sudoers bootstrap (chmod): {err}"))?;
     ssh_with_key(
         address,
         key_path,
@@ -18972,7 +19167,10 @@ fn askpass_script(password: &str) -> Result<PathBuf, OrchestratorError> {
     let dir = std::env::temp_dir();
     let seq = ASKPASS_SEQ.fetch_add(1, Ordering::Relaxed);
     let path = dir.join(format!("jsr-askpass-{}-{}.sh", now_epoch_ms(), seq));
-    let contents = format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", shell_single_quote(password));
+    let contents = format!(
+        "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+        shell_single_quote(password)
+    );
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -19675,7 +19873,10 @@ mod tests {
             timeout_ms: 60000,
         }
         .to_string();
-        assert!(is_socket_only_unreachable_error(&unreachable), "{unreachable}");
+        assert!(
+            is_socket_only_unreachable_error(&unreachable),
+            "{unreachable}"
+        );
         assert!(is_socket_only_unreachable_error(&ttl), "{ttl}");
         assert!(is_socket_only_unreachable_error(&timeout), "{timeout}");
 
@@ -19787,8 +19988,18 @@ mod tests {
         // ACCEPT: real Linux iface names — VLAN '.', bridge/bond '-', predictable
         // (ens/enp), wireguard/tun, and a full 15-char name at the IFNAMSIZ cap.
         for name in [
-            "eth0", "eth1", "ens5", "enp3s0", "enp0s3", "wlan0", "br-lan", "eth0.100", "bond0",
-            "wg0", "tun0", "abcdef123456789", // 15 chars
+            "eth0",
+            "eth1",
+            "ens5",
+            "enp3s0",
+            "enp0s3",
+            "wlan0",
+            "br-lan",
+            "eth0.100",
+            "bond0",
+            "wg0",
+            "tun0",
+            "abcdef123456789", // 15 chars
         ] {
             let mut w = egress_section(true);
             w.wan_iface = Some(name.to_string());
@@ -19844,7 +20055,16 @@ mod tests {
         // valid_hive_id (now run FIRST in both add flows) forbids every char
         // that could escape hives_root via join: '/', '.', '..'.
         for bad in [
-            "", "..", ".", "../victim", "a/b", "a.b", "../../etc", "foo/../bar", "a\0b", "héllo",
+            "",
+            "..",
+            ".",
+            "../victim",
+            "a/b",
+            "a.b",
+            "../../etc",
+            "foo/../bar",
+            "a\0b",
+            "héllo",
         ] {
             assert!(!valid_hive_id(bad), "hive_id {bad:?} must be rejected");
         }
@@ -19860,10 +20080,7 @@ mod tests {
         assert!(!hive_dir_is_direct_child(&root.join("../victim"), root));
         assert!(!hive_dir_is_direct_child(&root.join("a").join("b"), root));
         assert!(!hive_dir_is_direct_child(root, root)); // root itself, no child component
-        assert!(!hive_dir_is_direct_child(
-            Path::new("/etc/passwd"),
-            root
-        ));
+        assert!(!hive_dir_is_direct_child(Path::new("/etc/passwd"), root));
     }
 
     #[test]
@@ -20025,16 +20242,30 @@ mod tests {
 
     #[test]
     fn resolve_add_hive_ingress_section_requires_and_validates_listen() {
-        // happy: explicit listen (no core_ingress_l2 — Z routes by cached handler_node)
+        // happy: explicit listen plus TLS vault key.
         let s = resolve_add_hive_ingress_section(&serde_json::json!({
-            "ingress": { "listen": "0.0.0.0:443" }
+            "ingress": { "listen": "0.0.0.0:443", "tls_vault_key": "edge_tls" }
         }))
         .unwrap();
         assert_eq!(s.listen.as_deref(), Some("0.0.0.0:443"));
+        assert_eq!(s.tls_vault_key.as_deref(), Some("edge_tls"));
         // missing ingress object → rejected
         assert!(resolve_add_hive_ingress_section(&serde_json::json!({})).is_err());
         // missing listen → rejected (no default for a public bind)
         assert!(resolve_add_hive_ingress_section(&serde_json::json!({ "ingress": {} })).is_err());
+        // missing TLS is rejected unless plaintext is explicit.
+        assert!(resolve_add_hive_ingress_section(&serde_json::json!({
+            "ingress": { "listen": "0.0.0.0:8443" }
+        }))
+        .is_err());
+        assert!(resolve_add_hive_ingress_section(&serde_json::json!({
+            "ingress": { "listen": "127.0.0.1:8080", "allow_plaintext": true }
+        }))
+        .is_ok());
+        assert!(resolve_add_hive_ingress_section(&serde_json::json!({
+            "ingress": { "listen": "0.0.0.0:443", "allow_plaintext": true }
+        }))
+        .is_err());
         // non host:port listen → rejected
         assert!(resolve_add_hive_ingress_section(&serde_json::json!({
             "ingress": { "listen": "not-a-socket" }
@@ -20046,6 +20277,31 @@ mod tests {
             "ingress": { "listen": "0.0.0.0:443\nmalicious: true" }
         }))
         .is_err());
+        assert!(resolve_add_hive_ingress_section(&serde_json::json!({
+            "ingress": {
+                "listen": "0.0.0.0:443",
+                "tls_vault_key": "edge_tls",
+                "endpoints_json": { "endpoints": [{ "ich": "ich:seed" }] }
+            }
+        }))
+        .is_err());
+        assert!(resolve_add_hive_ingress_section(&serde_json::json!({
+            "ingress": {
+                "listen": "0.0.0.0:443",
+                "tls_vault_key": "edge_tls",
+                "endpoints_json": { "endpoints": [] }
+            }
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn sy_edge_unit_matches_ingress_dependencies() {
+        let unit = core_service_unit_contents("sy-edge", "/usr/bin/sy-edge");
+        assert!(unit.contains("After=network.target rt-gateway.service"));
+        assert!(unit.contains("Wants=rt-gateway.service"));
+        assert!(!unit.contains("sy-vault.service"));
+        assert!(unit.contains("ExecStart=/usr/bin/sy-edge"));
     }
 
     #[test]
@@ -20093,9 +20349,10 @@ mod tests {
         assert!(creds.password.is_none());
 
         // empty ssh_password is treated as None.
-        let creds =
-            resolve_add_hive_ssh_creds(&serde_json::json!({"ssh_user": "admin", "ssh_password": "   "}))
-                .unwrap();
+        let creds = resolve_add_hive_ssh_creds(
+            &serde_json::json!({"ssh_user": "admin", "ssh_password": "   "}),
+        )
+        .unwrap();
         assert!(creds.password.is_none());
 
         // A password with significant surrounding spaces is preserved verbatim
@@ -20150,7 +20407,8 @@ mod tests {
 
     #[test]
     fn bootstrap_authorized_key_cleanup_script_is_user_level() {
-        let public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyMaterial fluxbee-orchestrator";
+        let public_key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyMaterial fluxbee-orchestrator";
         let script = bootstrap_authorized_key_cleanup_script(public_key).expect("script");
         assert!(!script.contains("sudo"));
         assert!(script.contains("$HOME/.ssh/authorized_keys"));
@@ -20166,8 +20424,8 @@ mod tests {
         // interpretation) and be owner-only on disk.
         for pw in [
             "plain",
-            "p$a`ss`", // $ and backticks would command-substitute under echo "..."
-            "trailing\\", // a trailing backslash broke the quoting under echo "..."
+            "p$a`ss`",       // $ and backticks would command-substitute under echo "..."
+            "trailing\\",    // a trailing backslash broke the quoting under echo "..."
             "quote'd\"both", // single + double quotes
             "$(touch /tmp/jsr-askpass-pwned)", // command substitution attempt
             "  spaced  ",
@@ -20178,7 +20436,10 @@ mod tests {
             assert_eq!(mode, 0, "askpass file must have no group/other perms");
             // Running the helper must print the password back verbatim.
             let out = Command::new("sh").arg(&path).output().expect("run askpass");
-            assert!(out.status.success(), "askpass script must execute cleanly for {pw:?}");
+            assert!(
+                out.status.success(),
+                "askpass script must execute cleanly for {pw:?}"
+            );
             assert_eq!(
                 String::from_utf8_lossy(&out.stdout),
                 format!("{pw}\n"),
@@ -20322,7 +20583,9 @@ mod tests {
         // Ordering is load-bearing: the NAT teardown MUST run before the base
         // service-kill loop, which SIGKILLs the sy-orchestrator cgroup this very
         // script lives in. nft-delete must precede the systemctl kill of services.
-        let nft_at = egress.find("nft delete table").expect("nft teardown present");
+        let nft_at = egress
+            .find("nft delete table")
+            .expect("nft teardown present");
         let kill_at = egress
             .find("systemctl kill")
             .expect("base service kill present");
@@ -21258,8 +21521,8 @@ blob:
             "remove_hive",
             "kill_node",
             "run_node",
-            "start_node",          // not catalogued by classify_admin_action; named explicitly
-            "restart_node",        // idem
+            "start_node",   // not catalogued by classify_admin_action; named explicitly
+            "restart_node", // idem
             "set_node_config",
             "set_storage",
             "remove_node_instance",
@@ -21294,8 +21557,11 @@ blob:
     #[test]
     fn f8_is_allowed_admin_source_name_accepts_only_local_admin() {
         let state = sample_orchestrator_state_for_tests(); // hive_id == "motherbee"
-        // The only authorized origin is this hive's SY.admin (trimmed).
-        assert!(is_allowed_admin_source_name(&state, Some("SY.admin@motherbee")));
+                                                           // The only authorized origin is this hive's SY.admin (trimmed).
+        assert!(is_allowed_admin_source_name(
+            &state,
+            Some("SY.admin@motherbee")
+        ));
         assert!(is_allowed_admin_source_name(
             &state,
             Some("  SY.admin@motherbee  ")

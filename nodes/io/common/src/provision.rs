@@ -10,7 +10,8 @@ use fluxbee_sdk::protocol::{
 };
 use fluxbee_sdk::{
     stable_ich_id, PendingMatcher, RouteMatch, RouterDispatcher, RpcError, RpcRequestLabels,
-    MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION, MSG_ILK_PROVISION_RESPONSE,
+    MSG_ICH_SET_ENABLED, MSG_ICH_SET_ENABLED_RESPONSE, MSG_ILK_ADD_CHANNEL, MSG_ILK_PROVISION,
+    MSG_ILK_PROVISION_RESPONSE,
 };
 
 use crate::identity::{IdentityError, IdentityProvisioner, ResolveOrCreateInput};
@@ -222,17 +223,84 @@ pub async fn ensure_own_ich(
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(|v| v.to_string());
-    let enabled = msg
+    let mut enabled = msg
         .payload
         .get("enabled")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    if !enabled {
+        enabled = set_ich_enabled(dispatcher, config, target, &ich_id, true).await?;
+    }
     Ok(EnsureOwnIchResult {
         ilk_id,
         ich_id,
         owner_l2_name,
         enabled,
     })
+}
+
+pub async fn set_ich_enabled(
+    dispatcher: &Arc<RouterDispatcher>,
+    config: &IdentityProvisionConfig,
+    target: &str,
+    ich_id: &str,
+    enabled: bool,
+) -> Result<bool, IdentityError> {
+    let sender = dispatcher.sender_snapshot();
+    let req = WireMessage {
+        routing: Routing {
+            src: String::new(),
+            src_l2_name: Some(sender.full_name().to_string()),
+            dst: Destination::Unicast(target.to_string()),
+            ttl: 16,
+            trace_id: String::new(),
+        },
+        meta: Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(MSG_ICH_SET_ENABLED.to_string()),
+            ..Meta::default()
+        },
+        payload: serde_json::json!({
+            "ich_id": ich_id,
+            "enabled": enabled,
+        }),
+    };
+    let matcher = system_request_matcher(MSG_ICH_SET_ENABLED_RESPONSE);
+    let labels = RpcRequestLabels::new(target, MSG_ICH_SET_ENABLED, MSG_ICH_SET_ENABLED_RESPONSE);
+    let msg = dispatcher
+        .send_with_matcher(req, matcher, labels, config.timeout)
+        .await
+        .map_err(map_rpc_err)?;
+    if msg.meta.msg.as_deref() != Some(MSG_ICH_SET_ENABLED_RESPONSE) {
+        if msg.meta.msg.as_deref() == Some(MSG_UNREACHABLE)
+            || msg.meta.msg.as_deref() == Some(MSG_TTL_EXCEEDED)
+        {
+            return Err(IdentityError::Unavailable);
+        }
+        return Err(IdentityError::Other(
+            "invalid ICH_SET_ENABLED response".to_string(),
+        ));
+    }
+    let status = msg
+        .payload
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !status.eq_ignore_ascii_case("ok") {
+        let code = msg
+            .payload
+            .get("error_code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("error");
+        return Err(IdentityError::Other(format!(
+            "ICH_SET_ENABLED rejected: {code}"
+        )));
+    }
+    Ok(msg
+        .payload
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(enabled))
 }
 
 #[async_trait]
@@ -334,28 +402,28 @@ mod tests {
 
     #[test]
     fn stable_ich_id_is_deterministic() {
-        let a = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a")
-            .expect("stable ich id");
-        let b = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a")
-            .expect("stable ich id");
+        let a =
+            stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a").expect("stable ich id");
+        let b =
+            stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a").expect("stable ich id");
         assert_eq!(a, b);
     }
 
     #[test]
     fn stable_ich_id_changes_when_input_changes() {
-        let a = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a")
-            .expect("stable ich id");
-        let b = stable_ich_id("sim-new", "user.provision.abc2", "tnt:tenant-a")
-            .expect("stable ich id");
+        let a =
+            stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a").expect("stable ich id");
+        let b =
+            stable_ich_id("sim-new", "user.provision.abc2", "tnt:tenant-a").expect("stable ich id");
         assert_ne!(a, b);
     }
 
     #[test]
     fn stable_ich_id_changes_when_tenant_changes() {
-        let a = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a")
-            .expect("stable ich id");
-        let b = stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-b")
-            .expect("stable ich id");
+        let a =
+            stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-a").expect("stable ich id");
+        let b =
+            stable_ich_id("sim-new", "user.provision.abc1", "tnt:tenant-b").expect("stable ich id");
         assert_ne!(a, b);
     }
 }

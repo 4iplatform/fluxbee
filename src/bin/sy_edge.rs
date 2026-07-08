@@ -13,13 +13,14 @@ use axum::routing::any;
 use axum::Router;
 use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE,
-    MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
+    MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
+    MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, is_node_config_get_message, is_node_config_set_message,
-    parse_node_config_request, try_handle_default_node_status, NodeConfig, NodeConfigControlRequest,
-    NodeSender, NodeUuidMode, OperationalRouteProfile, PendingMatcher, RouteMatch, RouteTarget,
-    RouterDispatcher, RpcError, RpcRequestLabels,
+    parse_node_config_request, try_handle_default_node_status, NodeConfig,
+    NodeConfigControlRequest, NodeSender, NodeUuidMode, OperationalRouteProfile, PendingMatcher,
+    RouteMatch, RouteTarget, RouterDispatcher, RpcError, RpcRequestLabels,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -72,9 +73,7 @@ mod http_ingress {
         Ok(serde_json::to_vec(message)?.len())
     }
 
-    pub fn ensure_http_envelope_within_limit(
-        message: &Message,
-    ) -> Result<usize, HttpIngressError> {
+    pub fn ensure_http_envelope_within_limit(message: &Message) -> Result<usize, HttpIngressError> {
         let size = message_envelope_size(message)?;
         if size > HTTP_ENVELOPE_INLINE_LIMIT_BYTES {
             return Err(HttpIngressError::EnvelopeTooLarge {
@@ -141,8 +140,7 @@ async fn main() -> Result<(), SyEdgeError> {
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "info,sy_edge=debug,fluxbee_sdk=info".to_string());
-    let env_filter =
-        EnvFilter::try_new(&initial_log).unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_new(&initial_log).unwrap_or_else(|_| EnvFilter::new("info"));
     let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
     tracing_subscriber::registry()
         .with(filter_layer)
@@ -278,6 +276,7 @@ async fn main() -> Result<(), SyEdgeError> {
                 "sy-edge: TLS requested but no valid cert loaded; refusing to bind the public \
                  listener in plaintext (fail-closed). Fix the vault secret / cert files and restart."
             );
+            return Err("TLS requested but no valid cert loaded".into());
         } else {
             tokio::spawn(async move {
                 if let Err(err) = run_frontend(listen, state, tls).await {
@@ -324,6 +323,10 @@ async fn main() -> Result<(), SyEdgeError> {
                     config.ttl,
                 )
                 .await;
+                continue;
+            }
+            Some(MSG_EDGE_LIST_URLS) => {
+                apply_list_urls(&sender, &registry, &msg, config.ttl).await;
                 continue;
             }
             _ => {}
@@ -380,8 +383,10 @@ async fn apply_open_url(
     ttl: u8,
 ) {
     let outcome: Result<(String, usize), String> = (|| {
+        authorize_edge_service_command(msg, MSG_EDGE_OPEN_URL)?;
         let row: EndpointRow = serde_json::from_value(msg.payload.clone())
             .map_err(|err| format!("invalid EDGE_OPEN_URL payload: {err}"))?;
+        validate_endpoint_row_for_open(&row)?;
         let (ich, entry) = row_to_entry(row);
         let mut guard = registry
             .write()
@@ -425,6 +430,7 @@ async fn apply_close_url(
     ttl: u8,
 ) {
     let outcome: Result<(String, bool), String> = (|| {
+        authorize_edge_service_command(msg, MSG_EDGE_CLOSE_URL)?;
         let ich = msg
             .payload
             .get("ich")
@@ -453,6 +459,85 @@ async fn apply_close_url(
         }
     };
     send_edge_reply(sender, msg, MSG_EDGE_CLOSE_URL_RESPONSE, payload, ttl).await;
+}
+
+async fn apply_list_urls(
+    sender: &NodeSender,
+    registry: &Arc<RwLock<HashMap<String, EndpointEntry>>>,
+    msg: &Message,
+    ttl: u8,
+) {
+    let payload = match authorize_edge_service_command(msg, MSG_EDGE_LIST_URLS) {
+        Ok(()) => {
+            let rows = registry
+                .read()
+                .map(|guard| registry_to_persisted_rows(&guard))
+                .unwrap_or_default();
+            let channels: Vec<Value> = rows
+                .into_iter()
+                .map(|row| {
+                    let ich = row.ich;
+                    let url = format!("/e/{ich}");
+                    json!({
+                        "ich": ich,
+                        "url": url,
+                        "owner_l2_name": row.owner_l2_name,
+                        "inbound_family": row.inbound_family,
+                        "auth_mode": row.auth_mode,
+                        "secret_ref": row.secret_ref,
+                        "methods": row.methods,
+                        "tenant_id": row.tenant_id,
+                    })
+                })
+                .collect();
+            let version = channels.len();
+            json!({ "status": "ok", "channels": channels, "version": version })
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, trace_id = %msg.routing.trace_id, "sy-edge EDGE_LIST_URLS failed");
+            json!({ "status": "error", "error": err })
+        }
+    };
+    send_edge_reply(sender, msg, MSG_EDGE_LIST_URLS_RESPONSE, payload, ttl).await;
+}
+
+fn authorize_edge_service_command(msg: &Message, action: &str) -> Result<(), String> {
+    match msg.routing.src_l2_name.as_deref().map(str::trim) {
+        Some("SY.admin@motherbee") => Ok(()),
+        Some(src) if src.is_empty() => Err(format!("{action} requires router-stamped source")),
+        Some(src) => Err(format!("{action} not authorized from {src}")),
+        None => Err(format!("{action} requires router-stamped source")),
+    }
+}
+
+fn validate_endpoint_row_for_open(row: &EndpointRow) -> Result<(), String> {
+    if row.ich.trim().is_empty() {
+        return Err("ich must not be empty".to_string());
+    }
+    let owner = row.owner_l2_name.trim();
+    if owner.is_empty() || !owner.starts_with("IO.") || !owner.contains('@') {
+        return Err(format!(
+            "owner_l2_name must be a fully-qualified IO.* node, got '{owner}'"
+        ));
+    }
+    let family = row.inbound_family.trim();
+    if family.is_empty() {
+        return Err("inbound_family must not be empty".to_string());
+    }
+    if family.eq_ignore_ascii_case(SYSTEM_KIND) {
+        return Err("inbound_family must not be system".to_string());
+    }
+    if row.auth_mode == AuthMode::SharedSecret
+        && !non_empty_str(row.secret.as_deref())
+        && !non_empty_str(row.secret_ref.as_deref())
+    {
+        return Err("shared-secret endpoints require secret or secret_ref".to_string());
+    }
+    Ok(())
+}
+
+fn non_empty_str(value: Option<&str>) -> bool {
+    value.map(str::trim).is_some_and(|value| !value.is_empty())
 }
 
 /// Reply to a service command by name (router-stamped `src_l2_name`, so it routes back
@@ -762,16 +847,23 @@ struct EndpointEntry {
 /// the identity frontier (I6).
 /// Split one row into its `ich` key and the entry stored in the registry.
 fn row_to_entry(row: EndpointRow) -> (String, EndpointEntry) {
+    let ich = row.ich.trim().to_string();
     (
-        row.ich,
+        ich,
         EndpointEntry {
-            owner_l2_name: row.owner_l2_name,
-            inbound_family: row.inbound_family,
+            owner_l2_name: row.owner_l2_name.trim().to_string(),
+            inbound_family: row.inbound_family.trim().to_string(),
             auth_mode: row.auth_mode,
             secret: row.secret,
-            secret_ref: row.secret_ref,
+            secret_ref: row
+                .secret_ref
+                .map(|secret_ref| secret_ref.trim().to_string())
+                .filter(|secret_ref| !secret_ref.is_empty()),
             methods: row.methods,
-            tenant_id: row.tenant_id,
+            tenant_id: row
+                .tenant_id
+                .map(|tenant_id| tenant_id.trim().to_string())
+                .filter(|tenant_id| !tenant_id.is_empty()),
         },
     )
 }
@@ -820,8 +912,8 @@ fn registry_to_persisted_rows(reg: &HashMap<String, EndpointEntry>) -> Vec<Endpo
             owner_l2_name: e.owner_l2_name.clone(),
             inbound_family: e.inbound_family.clone(),
             auth_mode: e.auth_mode,
-            secret: None,                       // NEVER persist the secret VALUE
-            secret_ref: e.secret_ref.clone(),   // persist the vault REF (just a name)
+            secret: None,                     // NEVER persist the secret VALUE
+            secret_ref: e.secret_ref.clone(), // persist the vault REF (just a name)
             methods: e.methods.clone(),
             tenant_id: e.tenant_id.clone(),
         })
@@ -919,7 +1011,10 @@ async fn run_frontend(
 }
 
 /// Build a rustls server config from in-memory PEM cert chain + private key.
-fn tls_config_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<rustls::ServerConfig, SyEdgeError> {
+fn tls_config_from_pem(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> Result<rustls::ServerConfig, SyEdgeError> {
     // rustls 0.23 needs a process crypto provider before ServerConfig::builder()
     // (mirrors src/mesh_tls.rs). Idempotent: ignore "already installed".
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1028,10 +1123,14 @@ async fn resolve_secrets(
                         }
                         tracing::info!(ich = %ich, secret_ref = %secret_ref, "sy-edge resolved channel secret from vault");
                     }
-                    None => tracing::warn!(ich = %ich, secret_ref = %secret_ref, "vault secret has no 'secret' field; channel stays closed to auth"),
+                    None => {
+                        tracing::warn!(ich = %ich, secret_ref = %secret_ref, "vault secret has no 'secret' field; channel stays closed to auth")
+                    }
                 }
             }
-            Err(err) => tracing::warn!(ich = %ich, secret_ref = %secret_ref, error = %err, "sy-edge could not fetch channel secret from vault (channel rejects until resolved)"),
+            Err(err) => {
+                tracing::warn!(ich = %ich, secret_ref = %secret_ref, error = %err, "sy-edge could not fetch channel secret from vault (channel rejects until resolved)")
+            }
         }
     }
 }
@@ -1087,7 +1186,10 @@ async fn invoke(state: Arc<FrontendState>, ich: String, extra: String, req: Requ
 
     // 2. Method allowlist (if the row constrains methods).
     if let Some(allowed) = &entry.methods {
-        if !allowed.iter().any(|m| m.eq_ignore_ascii_case(method.as_str())) {
+        if !allowed
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(method.as_str()))
+        {
             return http_error(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "METHOD_NOT_ALLOWED",
@@ -1132,10 +1234,7 @@ async fn invoke(state: Arc<FrontendState>, ich: String, extra: String, req: Requ
         match std::str::from_utf8(&body) {
             Ok(text) => (Some(text.to_string()), Some(HttpBodyEncoding::Utf8)),
             // Non-UTF-8 bodies ride as base64 so the node can recover raw bytes.
-            Err(_) => (
-                Some(base64_encode(&body)),
-                Some(HttpBodyEncoding::Base64),
-            ),
+            Err(_) => (Some(base64_encode(&body)), Some(HttpBodyEncoding::Base64)),
         }
     };
 
@@ -1188,7 +1287,11 @@ async fn invoke(state: Arc<FrontendState>, ich: String, extra: String, req: Requ
         payload,
     };
     if let Err(err) = ensure_http_envelope_within_limit(&message) {
-        return http_error(StatusCode::PAYLOAD_TOO_LARGE, "REQ_TOO_LARGE", &err.to_string());
+        return http_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "REQ_TOO_LARGE",
+            &err.to_string(),
+        );
     }
 
     // 6. Await the reply correlated PURELY by trace_id — the reply family is
@@ -1226,8 +1329,8 @@ async fn invoke(state: Arc<FrontendState>, ich: String, extra: String, req: Requ
                 .into_response()
         }
         Err(err) => {
-            let status =
-                StatusCode::from_u16(rpc_error_to_http_status(&err)).unwrap_or(StatusCode::BAD_GATEWAY);
+            let status = StatusCode::from_u16(rpc_error_to_http_status(&err))
+                .unwrap_or(StatusCode::BAD_GATEWAY);
             http_error(status, rpc_error_code(&err), &err.to_string())
         }
     }
@@ -1275,7 +1378,11 @@ fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
     headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer ")))
+        .and_then(|value| {
+            value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+        })
         .map(|token| token.trim() == expected)
         .unwrap_or(false)
 }
@@ -1307,8 +1414,7 @@ fn normalize_extra_path(extra: &str) -> String {
 
 /// Minimal std-only base64 (standard alphabet, padded) for non-UTF-8 bodies.
 fn base64_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -1347,30 +1453,59 @@ mod tests {
 
     #[test]
     fn persisted_routes_round_trip_and_never_leak_the_secret() {
-        let path = std::env::temp_dir().join(format!("sy-edge-persist-{}.json", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("sy-edge-persist-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let mut reg: HashMap<String, EndpointEntry> = HashMap::new();
         reg.insert(
             "ich:pub".into(),
-            EndpointEntry { owner_l2_name: "IO.a@h".into(), inbound_family: "user".into(), auth_mode: AuthMode::Public, secret: None, secret_ref: None, methods: None, tenant_id: None },
+            EndpointEntry {
+                owner_l2_name: "IO.a@h".into(),
+                inbound_family: "user".into(),
+                auth_mode: AuthMode::Public,
+                secret: None,
+                secret_ref: None,
+                methods: None,
+                tenant_id: None,
+            },
         );
         reg.insert(
             "ich:sec".into(),
-            EndpointEntry { owner_l2_name: "IO.b@h".into(), inbound_family: "user".into(), auth_mode: AuthMode::SharedSecret, secret: Some("s3cr3t".into()), secret_ref: Some("edge_channel_secret:ich:sec".into()), methods: None, tenant_id: None },
+            EndpointEntry {
+                owner_l2_name: "IO.b@h".into(),
+                inbound_family: "user".into(),
+                auth_mode: AuthMode::SharedSecret,
+                secret: Some("s3cr3t".into()),
+                secret_ref: Some("edge_channel_secret:ich:sec".into()),
+                methods: None,
+                tenant_id: None,
+            },
         );
         persist_registry(&path, &reg);
 
         // The routes survive a reload (warm-start). The secret VALUE never hit disk, but the
         // secret_ref (just a vault key name) DID — so the edge can re-fetch it at boot.
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(!raw.contains("s3cr3t"), "secret value leaked to the on-disk route table");
-        assert!(raw.contains("edge_channel_secret:ich:sec"), "secret_ref must be persisted");
+        assert!(
+            !raw.contains("s3cr3t"),
+            "secret value leaked to the on-disk route table"
+        );
+        assert!(
+            raw.contains("edge_channel_secret:ich:sec"),
+            "secret_ref must be persisted"
+        );
         let loaded = load_registry(&path);
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded["ich:pub"].owner_l2_name, "IO.a@h");
         assert_eq!(loaded["ich:sec"].auth_mode, AuthMode::SharedSecret);
-        assert!(loaded["ich:sec"].secret.is_none(), "secret must reload as None (fetched from vault by ref)");
-        assert_eq!(loaded["ich:sec"].secret_ref.as_deref(), Some("edge_channel_secret:ich:sec"));
+        assert!(
+            loaded["ich:sec"].secret.is_none(),
+            "secret must reload as None (fetched from vault by ref)"
+        );
+        assert_eq!(
+            loaded["ich:sec"].secret_ref.as_deref(),
+            Some("edge_channel_secret:ich:sec")
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1410,17 +1545,21 @@ mod tests {
     fn row_to_entry_keys_by_ich_and_carries_fields() {
         // The EDGE_OPEN_URL payload IS one row; open_url upserts it by ich.
         let row: EndpointRow = serde_json::from_value(json!({
-            "ich": "ich:1",
-            "owner_l2_name": "IO.cloud@motherbee",
-            "inbound_family": "user",
+            "ich": " ich:1 ",
+            "owner_l2_name": " IO.cloud@motherbee ",
+            "inbound_family": " user ",
             "auth_mode": "shared-secret",
-            "secret": "s3cr3t"
+            "secret": "s3cr3t",
+            "secret_ref": " edge_channel_secret:ich:1 ",
+            "tenant_id": " tenant-a "
         }))
         .unwrap();
         let (ich, entry) = row_to_entry(row);
         assert_eq!(ich, "ich:1");
         assert_eq!(entry.owner_l2_name, "IO.cloud@motherbee");
         assert_eq!(entry.inbound_family, "user");
+        assert_eq!(entry.secret_ref.as_deref(), Some("edge_channel_secret:ich:1"));
+        assert_eq!(entry.tenant_id.as_deref(), Some("tenant-a"));
 
         // Two opens accumulate (upsert), not replace — a second URL does not wipe the first.
         let mut reg: HashMap<String, EndpointEntry> = HashMap::new();
@@ -1449,6 +1588,86 @@ mod tests {
         let entry = reg.get("ich:abc").expect("indexed");
         assert_eq!(entry.owner_l2_name, "IO.cloud@motherbee");
         assert_eq!(entry.inbound_family, "user");
+    }
+
+    fn edge_command_from(src_l2_name: Option<&str>) -> Message {
+        Message {
+            routing: Routing {
+                src: "src-uuid".to_string(),
+                src_l2_name: src_l2_name.map(ToString::to_string),
+                dst: Destination::Unicast("SY.edge@ingress1".to_string()),
+                ttl: 16,
+                trace_id: "trace".to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some(MSG_EDGE_OPEN_URL.to_string()),
+                ..Meta::default()
+            },
+            payload: Value::Null,
+        }
+    }
+
+    #[test]
+    fn edge_service_commands_require_motherbee_admin_origin() {
+        assert!(authorize_edge_service_command(
+            &edge_command_from(Some("SY.admin@motherbee")),
+            MSG_EDGE_OPEN_URL
+        )
+        .is_ok());
+        assert!(authorize_edge_service_command(
+            &edge_command_from(Some("SY.admin@ingress1")),
+            MSG_EDGE_OPEN_URL
+        )
+        .is_err());
+        assert!(authorize_edge_service_command(
+            &edge_command_from(Some("IO.cloud@motherbee")),
+            MSG_EDGE_OPEN_URL
+        )
+        .is_err());
+        assert!(
+            authorize_edge_service_command(&edge_command_from(None), MSG_EDGE_OPEN_URL).is_err()
+        );
+    }
+
+    #[test]
+    fn open_url_payload_rejects_non_io_owner_and_system_family() {
+        let good: EndpointRow = serde_json::from_value(json!({
+            "ich": "ich:ok",
+            "owner_l2_name": "IO.cloud@motherbee",
+            "inbound_family": "user",
+            "auth_mode": "public"
+        }))
+        .unwrap();
+        assert!(validate_endpoint_row_for_open(&good).is_ok());
+
+        let bad_owner: EndpointRow = serde_json::from_value(json!({
+            "ich": "ich:bad",
+            "owner_l2_name": "SY.identity@motherbee",
+            "inbound_family": "user",
+            "auth_mode": "public"
+        }))
+        .unwrap();
+        assert!(validate_endpoint_row_for_open(&bad_owner).is_err());
+
+        let system_family: EndpointRow = serde_json::from_value(json!({
+            "ich": "ich:bad",
+            "owner_l2_name": "IO.cloud@motherbee",
+            "inbound_family": " System ",
+            "auth_mode": "public"
+        }))
+        .unwrap();
+        assert!(validate_endpoint_row_for_open(&system_family).is_err());
+
+        let no_secret: EndpointRow = serde_json::from_value(json!({
+            "ich": "ich:bad",
+            "owner_l2_name": "IO.cloud@motherbee",
+            "inbound_family": "user",
+            "auth_mode": "shared-secret",
+            "secret_ref": "   "
+        }))
+        .unwrap();
+        assert!(validate_endpoint_row_for_open(&no_secret).is_err());
     }
 
     #[test]

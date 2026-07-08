@@ -28,8 +28,9 @@ use fluxbee_sdk::nats::{NatsClient, NatsRequestEnvelope, NatsResponseEnvelope};
 use fluxbee_sdk::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, VaultSecretChangedPayload,
     VaultSecretInterest, MSG_CONFIG_CHANGED, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE,
-    MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE, MSG_NODE_STATUS_GET, MSG_TTL_EXCEEDED,
-    MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL, SYSTEM_KIND,
+    MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
+    MSG_NODE_STATUS_GET, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL,
+    SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, classify_admin_action, classify_system_message,
@@ -101,6 +102,7 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "get_node_status",
     "externalize",
     "unexternalize",
+    "list_externalized",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -3475,7 +3477,10 @@ async fn handle_externalize(
             .map(ToString::to_string)
     };
     let Some(ich) = get_str("ich") else {
-        return Ok(internal_invalid_request("externalize", "missing payload.ich"));
+        return Ok(internal_invalid_request(
+            "externalize",
+            "missing payload.ich",
+        ));
     };
     let Some(edge_node) = get_str("edge_node") else {
         return Ok(internal_invalid_request(
@@ -3492,13 +3497,14 @@ async fn handle_externalize(
             .collect::<Vec<String>>()
     });
 
-    // Resolve ICH -> owner_l2_name from identity SHM.
+    // Resolve ICH -> owner_l2_name from identity SHM, and require the channel to
+    // be enabled before it can become public.
     let owner_l2_name =
         match fluxbee_sdk::identity::list_ich_options_from_hive_config(&ctx.config_dir) {
-            Ok(options) => options
-                .into_iter()
-                .find(|o| o.ich_id == ich)
-                .and_then(|o| o.owner_l2_name),
+            Ok(options) => match resolve_externalize_owner(options, &ich) {
+                Ok(owner) => owner,
+                Err(detail) => return Ok(internal_invalid_request("externalize", &detail)),
+            },
             Err(err) => {
                 return Ok(internal_invalid_request(
                     "externalize",
@@ -3506,12 +3512,6 @@ async fn handle_externalize(
                 ))
             }
         };
-    let Some(owner_l2_name) = owner_l2_name else {
-        return Ok(internal_invalid_request(
-            "externalize",
-            &format!("no ICH '{ich}' with an owner in identity"),
-        ));
-    };
 
     // Authz gate (v6 §11.1). A node-originated externalize must come from an IO.* node (I1) and may
     // only expose ITS OWN channel (I8). `owner_l2_name` came from identity, `caller` from the router
@@ -3630,6 +3630,24 @@ async fn handle_externalize(
     }
 }
 
+fn resolve_externalize_owner(
+    options: Vec<fluxbee_sdk::identity::IdentityIchOption>,
+    ich: &str,
+) -> Result<String, String> {
+    let Some(option) = options.into_iter().find(|o| o.ich_id == ich) else {
+        return Err(format!("no ICH '{ich}' with an owner in identity"));
+    };
+    let Some(owner_l2_name) = option.owner_l2_name else {
+        return Err(format!("no ICH '{ich}' with an owner in identity"));
+    };
+    if !option.enabled {
+        return Err(format!(
+            "ICH '{ich}' is disabled; enable the channel before externalize"
+        ));
+    }
+    Ok(owner_l2_name)
+}
+
 /// `unexternalize` — the inverse of `externalize` (§7): close a public URL. The owning IO
 /// node (through SY.admin) asks to take a channel offline; admin sends `EDGE_CLOSE_URL` to
 /// the edge and blocks on the ack. Same authz gate as externalize (§11.1): IO.* + owner==caller.
@@ -3648,7 +3666,10 @@ async fn handle_unexternalize(
             .map(ToString::to_string)
     };
     let Some(ich) = get_str("ich") else {
-        return Ok(internal_invalid_request("unexternalize", "missing payload.ich"));
+        return Ok(internal_invalid_request(
+            "unexternalize",
+            "missing payload.ich",
+        ));
     };
     let Some(edge_node) = get_str("edge_node") else {
         return Ok(internal_invalid_request(
@@ -3659,7 +3680,8 @@ async fn handle_unexternalize(
     // Authz gate (v6 §11.1), symmetric to externalize: a node may only close ITS OWN channel.
     // Skip the identity resolve entirely on the trusted internal path (caller None).
     if caller_l2_name.is_some() {
-        let owner = match fluxbee_sdk::identity::list_ich_options_from_hive_config(&ctx.config_dir) {
+        let owner = match fluxbee_sdk::identity::list_ich_options_from_hive_config(&ctx.config_dir)
+        {
             Ok(options) => options
                 .into_iter()
                 .find(|o| o.ich_id == ich)
@@ -3729,6 +3751,106 @@ async fn handle_unexternalize(
     }
 }
 
+async fn handle_list_externalized(
+    client: &Arc<RouterDispatcher>,
+    params: serde_json::Value,
+    caller_l2_name: Option<&str>,
+) -> Result<InternalAdminDispatchResult, AdminError> {
+    let get_str = |key: &str| {
+        params
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+    };
+    let Some(edge_node) = get_str("edge_node") else {
+        return Ok(internal_invalid_request(
+            "list_externalized",
+            "missing payload.edge_node (the SY.edge L2 name to list)",
+        ));
+    };
+    match send_system_request_with_meta(
+        client,
+        &edge_node,
+        MSG_EDGE_LIST_URLS,
+        MSG_EDGE_LIST_URLS_RESPONSE,
+        serde_json::json!({}),
+        16,
+        None,
+        None,
+        Some(edge_node.clone()),
+        None,
+        None,
+        Duration::from_secs(15),
+    )
+    .await
+    {
+        Ok(payload) if payload.get("status").and_then(|v| v.as_str()) == Some("ok") => {
+            let channels = payload
+                .get("channels")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let channels = match filter_externalized_channels_for_caller(channels, caller_l2_name) {
+                Ok(channels) => channels,
+                Err(reason) => return Ok(internal_unauthorized("list_externalized", &reason)),
+            };
+            let version = channels.len();
+            Ok(InternalAdminDispatchResult {
+                http_status: 200,
+                envelope: serde_json::json!({
+                    "status": "ok",
+                    "action": "list_externalized",
+                    "payload": {
+                        "edge_node": edge_node,
+                        "channels": channels,
+                        "version": version,
+                    }
+                }),
+            })
+        }
+        Ok(payload) => {
+            let err = payload
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("edge rejected list_externalized");
+            Ok(internal_invalid_request(
+                "list_externalized",
+                &format!("edge did not list externalized URLs: {err}"),
+            ))
+        }
+        Err(err) => Ok(internal_invalid_request(
+            "list_externalized",
+            &format!("edge unreachable / list_externalized failed: {err}"),
+        )),
+    }
+}
+
+fn filter_externalized_channels_for_caller(
+    channels: Vec<serde_json::Value>,
+    caller_l2_name: Option<&str>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let Some(caller) = caller_l2_name.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(channels);
+    };
+    if !caller.starts_with("IO.") {
+        return Err(format!(
+            "only IO.* nodes may list their own public channels; caller={caller}"
+        ));
+    }
+    Ok(channels
+        .into_iter()
+        .filter(|channel| {
+            channel
+                .get("owner_l2_name")
+                .and_then(|v| v.as_str())
+                .map(|owner| owner == caller)
+                .unwrap_or(false)
+        })
+        .collect())
+}
+
 async fn dispatch_internal_admin_command(
     ctx: &AdminContext,
     client: &Arc<RouterDispatcher>,
@@ -3781,6 +3903,9 @@ async fn dispatch_internal_admin_command(
         }
         "unexternalize" => {
             return handle_unexternalize(ctx, client, params, caller_l2_name).await;
+        }
+        "list_externalized" => {
+            return handle_list_externalized(client, params, caller_l2_name).await;
         }
         "executor_execute_plan" => {
             if target.is_some() {
@@ -4096,7 +4221,10 @@ fn mint_entry_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
-fn authorize_channel_command(caller_l2_name: Option<&str>, owner_l2_name: &str) -> Result<(), String> {
+fn authorize_channel_command(
+    caller_l2_name: Option<&str>,
+    owner_l2_name: &str,
+) -> Result<(), String> {
     let Some(caller) = caller_l2_name else {
         return Ok(());
     };
@@ -6803,7 +6931,13 @@ async fn handle_admin_query(
     }
     let payload = normalize_admin_payload(action, serde_json::json!({}), hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
-    let response = send_admin_request(client, request, admin_action_timeout(action), &admin_node_name(&ctx.hive_id)).await;
+    let response = send_admin_request(
+        client,
+        request,
+        admin_action_timeout(action),
+        &admin_node_name(&ctx.hive_id),
+    )
+    .await;
     Ok(build_admin_http_response(action, response))
 }
 
@@ -6816,7 +6950,13 @@ async fn handle_admin_query_with_payload(
 ) -> Result<(u16, String), AdminError> {
     let payload = normalize_admin_payload(action, payload, hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
-    let response = send_admin_request(client, request, admin_action_timeout(action), &admin_node_name(&ctx.hive_id)).await;
+    let response = send_admin_request(
+        client,
+        request,
+        admin_action_timeout(action),
+        &admin_node_name(&ctx.hive_id),
+    )
+    .await;
     Ok(build_admin_http_response(action, response))
 }
 
@@ -9857,8 +9997,8 @@ async fn query_runtime_usage_global_visible(
         admin_action_timeout("get_runtime"),
         &admin_node_name(&ctx.hive_id),
     )
-        .await
-        .map_err(|err| err.to_string())?;
+    .await
+    .map_err(|err| err.to_string())?;
     if !payload_is_ok(&payload) {
         return Err(payload_error_detail(&payload)
             .unwrap_or_else(|| "failed to query runtime usage".to_string()));
@@ -10711,7 +10851,13 @@ async fn handle_admin_command(
     let payload = normalize_admin_payload(action, payload, hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
     let target_hive = extract_hive_from_target(&request.target);
-    let mut response = send_admin_request(client, request, admin_action_timeout(action), &admin_node_name(&ctx.hive_id)).await;
+    let mut response = send_admin_request(
+        client,
+        request,
+        admin_action_timeout(action),
+        &admin_node_name(&ctx.hive_id),
+    )
+    .await;
     if let Ok(ref payload) = response {
         if let Some(status) = payload.get("status").and_then(|v| v.as_str()) {
             if status == "ok" {
@@ -12585,6 +12731,71 @@ mod tests {
         assert!(authorize_channel_command(Some("IO.other@motherbee"), owner).is_err());
         // Same node name, different hive is still a different node — rejected (I8, exact match).
         assert!(authorize_channel_command(Some("IO.cloud@worker1"), owner).is_err());
+    }
+
+    fn ich_option(
+        ich_id: &str,
+        owner_l2_name: Option<&str>,
+        enabled: bool,
+    ) -> fluxbee_sdk::identity::IdentityIchOption {
+        fluxbee_sdk::identity::IdentityIchOption {
+            ich_id: ich_id.to_string(),
+            channel_type: "http".to_string(),
+            address: "addr".to_string(),
+            is_primary: false,
+            owner_l2_name: owner_l2_name.map(ToString::to_string),
+            enabled,
+            ilks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn externalize_requires_enabled_ich_with_owner() {
+        assert_eq!(
+            resolve_externalize_owner(
+                vec![ich_option("ich:ok", Some("IO.cloud@motherbee"), true)],
+                "ich:ok"
+            )
+            .unwrap(),
+            "IO.cloud@motherbee"
+        );
+        assert!(resolve_externalize_owner(
+            vec![ich_option(
+                "ich:disabled",
+                Some("IO.cloud@motherbee"),
+                false
+            )],
+            "ich:disabled"
+        )
+        .is_err());
+        assert!(resolve_externalize_owner(
+            vec![ich_option("ich:no-owner", None, true)],
+            "ich:no-owner"
+        )
+        .is_err());
+        assert!(resolve_externalize_owner(Vec::new(), "ich:missing").is_err());
+    }
+
+    #[test]
+    fn list_externalized_filters_to_callers_own_channels() {
+        let channels = vec![
+            json!({"ich":"ich:a","owner_l2_name":"IO.cloud@motherbee"}),
+            json!({"ich":"ich:b","owner_l2_name":"IO.other@motherbee"}),
+        ];
+        assert_eq!(
+            filter_externalized_channels_for_caller(channels.clone(), None)
+                .unwrap()
+                .len(),
+            2
+        );
+        let own =
+            filter_externalized_channels_for_caller(channels.clone(), Some("IO.cloud@motherbee"))
+                .unwrap();
+        assert_eq!(own.len(), 1);
+        assert_eq!(own[0]["ich"], json!("ich:a"));
+        assert!(
+            filter_externalized_channels_for_caller(channels, Some("SY.admin@motherbee"),).is_err()
+        );
     }
 
     fn test_temp_dir(prefix: &str) -> PathBuf {
@@ -14490,15 +14701,9 @@ mod tests {
     #[test]
     fn admin_origin_authorized_rejects_malformed_src_l2_name() {
         // No `@` separator.
-        assert!(!admin_origin_authorized(
-            "motherbee",
-            Some("SY.architect")
-        ));
+        assert!(!admin_origin_authorized("motherbee", Some("SY.architect")));
         // Empty hive part.
-        assert!(!admin_origin_authorized(
-            "motherbee",
-            Some("SY.architect@")
-        ));
+        assert!(!admin_origin_authorized("motherbee", Some("SY.architect@")));
     }
 
     /// H4.3 — Admin's executor hot-refresh filters incoming

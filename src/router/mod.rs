@@ -27,19 +27,20 @@ use crate::shm::{
     OpaSnapshot, RemoteHiveEntry, RemoteNodeEntry, RemoteRouteEntry, RemoteTapEntry,
     RemoteVpnEntry, RouterRegionReader, RouterRegionWriter, TapEntry, VpnAssignment, ACTION_DROP,
     ACTION_FORWARD, FLAG_ACTIVE, FLAG_DELETED, FLAG_FROZEN, FLAG_STALE, HEARTBEAT_STALE_MS,
-    HIVE_FLAG_SELF,
-    MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING,
+    HIVE_FLAG_SELF, MATCH_EXACT, MATCH_GLOB, MATCH_PREFIX, OPA_STATUS_ERROR, OPA_STATUS_LOADING,
 };
-use fluxbee_sdk::classify_routed_message;
 use fluxbee_sdk::protocol::{
     build_announce, build_lsa, build_router_hello, build_ttl_exceeded, build_unreachable,
     build_wan_accept, build_wan_hello, build_wan_reject, Destination, LsaNode, LsaPayload,
     LsaRoute, LsaTap, LsaVpn, Message, Meta, NodeAnnouncePayload, NodeHelloPayload,
     OpaReloadPayload, RouterHelloPayload, WanAcceptPayload, WanHelloPayload, WanNegotiated,
-    WanRejectPayload, WanTimers, MSG_CONFIG_CHANGED, MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD,
+    WanRejectPayload, WanTimers, MSG_CONFIG_CHANGED, MSG_EDGE_CLOSE_URL,
+    MSG_EDGE_CLOSE_URL_RESPONSE, MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE,
+    MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE, MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD,
     MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_WITHDRAW, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::socket::connection::{read_frame, write_frame};
+use fluxbee_sdk::{classify_routed_message, MSG_VAULT_GET, MSG_VAULT_GET_RESPONSE};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RouterError {
@@ -2493,7 +2494,10 @@ async fn tls_accept(
 /// uses TLS whenever the mode is not "disabled" (its effective mode is already
 /// "disabled" if no TLS material loaded). Rollout order is server-first: a new
 /// (TLS) client only appears after its uplink is at least `permissive`.
-async fn connect_wan_connection(stream: TcpStream, ctx: &Arc<WanContext>) -> Result<(), RouterError> {
+async fn connect_wan_connection(
+    stream: TcpStream,
+    ctx: &Arc<WanContext>,
+) -> Result<(), RouterError> {
     if ctx.wan_mtls_mode == "disabled" {
         return handle_wan_connection(stream, None, Arc::clone(ctx), true).await;
     }
@@ -5184,15 +5188,72 @@ fn is_system_node(name: &str) -> bool {
     name.starts_with("SY.") || name.starts_with("RT.")
 }
 
+fn is_edge_node(name: &str) -> bool {
+    name.split_once('@')
+        .map(|(role, _)| role == "SY.edge")
+        .unwrap_or(name == "SY.edge")
+}
+
+fn is_io_node(name: &str) -> bool {
+    name.split_once('@')
+        .map(|(role, _)| role.starts_with("IO."))
+        .unwrap_or_else(|| name.starts_with("IO."))
+}
+
+fn is_vault_node(name: &str) -> bool {
+    name.split_once('@')
+        .map(|(role, _)| role == "SY.vault")
+        .unwrap_or(name == "SY.vault")
+}
+
 fn is_global_scope(meta: &Meta) -> bool {
     matches!(meta.scope.as_deref(), Some(SCOPE_GLOBAL))
 }
 
 fn vpn_allows(src_name: &str, src_vpn: u32, dst_vpn: u32) -> bool {
-    if is_system_node(src_name) {
+    if is_system_node(src_name) && !is_edge_node(src_name) {
         return true;
     }
     src_vpn == dst_vpn
+}
+
+fn edge_service_control_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> bool {
+    if !is_edge_node(dst_name) || meta.msg_type != SYSTEM_KIND {
+        return false;
+    }
+    if src_name != "SY.admin@motherbee" {
+        return false;
+    }
+    matches!(meta.msg.as_deref(), Some(action) if action == MSG_EDGE_OPEN_URL || action == MSG_EDGE_CLOSE_URL || action == MSG_EDGE_LIST_URLS)
+}
+
+fn edge_service_control_response_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> bool {
+    if !is_edge_node(src_name) || dst_name != "SY.admin@motherbee" || meta.msg_type != SYSTEM_KIND {
+        return false;
+    }
+    matches!(meta.msg.as_deref(), Some(action) if action == MSG_EDGE_OPEN_URL_RESPONSE || action == MSG_EDGE_CLOSE_URL_RESPONSE || action == MSG_EDGE_LIST_URLS_RESPONSE)
+}
+
+fn is_edge_service_control_message(meta: &Meta, dst_name: &str) -> bool {
+    is_edge_node(dst_name)
+        && meta.msg_type == SYSTEM_KIND
+        && matches!(meta.msg.as_deref(), Some(action) if action == MSG_EDGE_OPEN_URL || action == MSG_EDGE_CLOSE_URL || action == MSG_EDGE_LIST_URLS)
+}
+
+fn edge_data_path_allowed(src_name: &str, dst_name: &str) -> bool {
+    (is_edge_node(src_name) && is_io_node(dst_name))
+        || (is_io_node(src_name) && is_edge_node(dst_name))
+}
+
+fn edge_vault_read_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> bool {
+    if meta.msg_type != SYSTEM_KIND {
+        return false;
+    }
+    match meta.msg.as_deref() {
+        Some(MSG_VAULT_GET) => is_edge_node(src_name) && is_vault_node(dst_name),
+        Some(MSG_VAULT_GET_RESPONSE) => is_vault_node(src_name) && is_edge_node(dst_name),
+        _ => false,
+    }
 }
 
 fn vpn_allows_between(
@@ -5202,6 +5263,15 @@ fn vpn_allows_between(
     dst_name: &str,
     dst_vpn: u32,
 ) -> bool {
+    if is_edge_node(src_name) || is_edge_node(dst_name) {
+        if is_edge_service_control_message(meta, dst_name) {
+            return edge_service_control_allowed(meta, src_name, dst_name);
+        }
+        return edge_service_control_allowed(meta, src_name, dst_name)
+            || edge_service_control_response_allowed(meta, src_name, dst_name)
+            || edge_data_path_allowed(src_name, dst_name)
+            || edge_vault_read_allowed(meta, src_name, dst_name);
+    }
     if meta.msg_type == SYSTEM_KIND && is_global_scope(meta) {
         return true;
     }
@@ -5907,6 +5977,174 @@ mod tests {
         let entry = guard.get(expected_hive).expect("missing hive state");
         assert_eq!(entry.router_uuid, *peer_router_uuid.as_bytes());
         assert_eq!(entry.router_name, peer_router_name);
+    }
+
+    #[test]
+    fn edge_does_not_inherit_blanket_system_vpn_bypass() {
+        let meta = Meta {
+            msg_type: "user".to_string(),
+            ..Meta::default()
+        };
+        let global_system = Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            scope: Some(SCOPE_GLOBAL.to_string()),
+            ..Meta::default()
+        };
+
+        assert!(vpn_allows_between(
+            &meta,
+            "SY.identity@motherbee",
+            1,
+            "AI.worker@worker1",
+            2
+        ));
+        assert!(!vpn_allows_between(
+            &meta,
+            "SY.edge@ingress1",
+            1,
+            "AI.worker@worker1",
+            2
+        ));
+        assert!(!vpn_allows_between(
+            &meta,
+            "SY.edge@ingress1",
+            1,
+            "SY.identity@ingress1",
+            1
+        ));
+        assert!(vpn_allows_between(
+            &global_system,
+            "SY.identity@motherbee",
+            1,
+            "AI.worker@worker1",
+            2
+        ));
+        assert!(!vpn_allows_between(
+            &global_system,
+            "SY.edge@ingress1",
+            1,
+            "SY.identity@motherbee",
+            2
+        ));
+        assert!(!vpn_allows_between(
+            &global_system,
+            "SY.identity@motherbee",
+            2,
+            "SY.edge@ingress1",
+            1
+        ));
+        assert!(vpn_allows_between(
+            &meta,
+            "SY.edge@ingress1",
+            1,
+            "IO.cloud@motherbee",
+            2
+        ));
+        assert!(vpn_allows_between(
+            &meta,
+            "IO.cloud@motherbee",
+            2,
+            "SY.edge@ingress1",
+            1
+        ));
+    }
+
+    #[test]
+    fn edge_vault_path_is_read_only_and_explicit() {
+        let vault_get = Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(MSG_VAULT_GET.to_string()),
+            ..Meta::default()
+        };
+        let vault_get_response = Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(MSG_VAULT_GET_RESPONSE.to_string()),
+            ..Meta::default()
+        };
+        let vault_put = Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some("VAULT_PUT".to_string()),
+            ..Meta::default()
+        };
+
+        assert!(vpn_allows_between(
+            &vault_get,
+            "SY.edge@ingress1",
+            1,
+            "SY.vault@motherbee",
+            2
+        ));
+        assert!(vpn_allows_between(
+            &vault_get_response,
+            "SY.vault@motherbee",
+            2,
+            "SY.edge@ingress1",
+            1
+        ));
+        assert!(!vpn_allows_between(
+            &vault_put,
+            "SY.edge@ingress1",
+            1,
+            "SY.vault@motherbee",
+            2
+        ));
+    }
+
+    #[test]
+    fn edge_control_routing_is_admin_motherbee_only() {
+        let open = Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(MSG_EDGE_OPEN_URL.to_string()),
+            ..Meta::default()
+        };
+        let open_response = Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(MSG_EDGE_OPEN_URL_RESPONSE.to_string()),
+            ..Meta::default()
+        };
+
+        assert!(vpn_allows_between(
+            &open,
+            "SY.admin@motherbee",
+            1,
+            "SY.edge@ingress1",
+            2
+        ));
+        assert!(!vpn_allows_between(
+            &open,
+            "SY.admin@ingress1",
+            2,
+            "SY.edge@ingress1",
+            2
+        ));
+        assert!(!vpn_allows_between(
+            &open,
+            "SY.orchestrator@motherbee",
+            1,
+            "SY.edge@ingress1",
+            2
+        ));
+        assert!(vpn_allows_between(
+            &open_response,
+            "SY.edge@ingress1",
+            2,
+            "SY.admin@motherbee",
+            1
+        ));
+        assert!(!vpn_allows_between(
+            &open_response,
+            "SY.edge@ingress1",
+            2,
+            "SY.admin@ingress1",
+            2
+        ));
+        assert!(!vpn_allows_between(
+            &open,
+            "SY.edge@ingress1",
+            2,
+            "SY.admin@motherbee",
+            1
+        ));
     }
 
     #[test]

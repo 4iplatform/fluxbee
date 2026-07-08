@@ -24,7 +24,7 @@ RUST_BINS=(rt-gateway:json-router sy-admin:sy_admin sy-config-routes:sy_config_r
 GO_BINS=(sy-opa-rules:go/sy-opa-rules sy-timer:go/sy-timer sy-wf-rules:go/sy-wf-rules
   wf-generic:go/nodes/wf/wf-generic)
 # units: every core service EXCEPT wf-generic (a runtime the orchestrator spawns).
-# sy-edge gets a dedicated unit below (custom rt-gateway+sy-vault ordering).
+# sy-edge gets a dedicated unit below (custom rt-gateway ordering).
 UNITS=(rt-gateway sy-config-routes sy-opa-rules sy-admin sy-architect sy-vault
   sy-orchestrator sy-storage sy-identity sy-cognition sy-policy sy-timer sy-wf-rules sy-frontdesk-gov)
 
@@ -127,11 +127,12 @@ gen_unit() { # <name> [after] [wants]
 for u in "${UNITS[@]}"; do gen_unit "$u"; done
 gen_unit sy-frontdesk-gov "network.target rt-gateway.service sy-identity.service" \
   "rt-gateway.service sy-identity.service"
-# sy-edge (ingress public door) needs the router up to connect and SY.vault reachable
-# to fetch its public TLS cert at boot; the binary self-gates on role==ingress, so the
-# unit ships on every node but only binds :443 where hive.yaml says role: ingress.
-gen_unit sy-edge "network.target rt-gateway.service sy-vault.service" \
-  "rt-gateway.service sy-vault.service"
+# sy-edge (ingress public door) needs the local router up to connect. Its public
+# TLS material lives in the motherbee vault over the mesh, so systemd cannot model
+# that dependency locally; the binary fails closed and Restart=always retries until
+# the remote vault path is reachable.
+gen_unit sy-edge "network.target rt-gateway.service" \
+  "rt-gateway.service"
 
 # io-cloud: the singleton in-mesh Fluxbee Cloud adapter — one per SYSTEM, on motherbee.
 # Custom unit (not gen_unit): it needs SY.identity (register its own ICH) + SY.admin

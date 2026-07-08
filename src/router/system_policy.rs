@@ -25,6 +25,9 @@
 pub const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
     "SYSTEM_UPDATE",
     "SYSTEM_SYNC_HINT",
+    "EDGE_OPEN_URL",
+    "EDGE_CLOSE_URL",
+    "EDGE_LIST_URLS",
     "SPAWN_NODE",
     "KILL_NODE",
     "START_NODE",
@@ -42,6 +45,15 @@ pub const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
     "ADD_HIVE_FINALIZE",
     "REMOVE_HIVE_CLEANUP",
 ];
+
+const PRIMARY_HIVE_ID: &str = "motherbee";
+
+fn is_edge_service_action(action: &str) -> bool {
+    matches!(
+        action,
+        "EDGE_OPEN_URL" | "EDGE_CLOSE_URL" | "EDGE_LIST_URLS"
+    )
+}
 
 /// Whether `action` is a protected SYSTEM action subject to the system authority
 /// gate.
@@ -73,6 +85,9 @@ pub fn authority(action: &str, src_l2_name: Option<&str>, hive_id: &str) -> bool
     let Some((role, hive)) = name.split_once('@') else {
         return false;
     };
+    if is_edge_service_action(action) {
+        return role == "SY.admin" && hive == PRIMARY_HIVE_ID;
+    }
     if role == "SY.orchestrator" {
         // Any hive, but the hive label must be non-empty (rejects "SY.orchestrator@").
         return !hive.is_empty();
@@ -95,12 +110,16 @@ mod tests {
     fn authority_enforces_role_and_hive_scope() {
         let hive = "motherbee";
         let act = "SPAWN_NODE"; // a mutation, strict scope
-        // SY.orchestrator: any hive (cross-hive forwards).
+                                // SY.orchestrator: any hive (cross-hive forwards).
         assert!(authority(act, Some("SY.orchestrator@motherbee"), hive));
         assert!(authority(act, Some("SY.orchestrator@worker1"), hive));
         assert!(authority(act, Some("  SY.orchestrator@worker1  "), hive));
         // Exact role label (rejects relay/sub-name spoof) + non-empty hive.
-        assert!(!authority(act, Some("SY.orchestrator.relay.123@motherbee"), hive));
+        assert!(!authority(
+            act,
+            Some("SY.orchestrator.relay.123@motherbee"),
+            hive
+        ));
         assert!(!authority(act, Some("SY.orchestrator@"), hive));
         // same-hive control plane.
         for role in ["SY.admin", "SY.wf-rules", "WF.orch.diag"] {
@@ -119,21 +138,47 @@ mod tests {
             Some("SY.config-routes@motherbee"),
             Some("SY.identity@motherbee"),
         ] {
-            assert!(!authority(act, bad, hive), "{bad:?} must be rejected for {act}");
+            assert!(
+                !authority(act, bad, hive),
+                "{bad:?} must be rejected for {act}"
+            );
         }
         // NODE_STATUS_GET read-probe opens to config-routes/vault same-hive only.
-        assert!(authority("NODE_STATUS_GET", Some("SY.config-routes@motherbee"), hive));
-        assert!(authority("NODE_STATUS_GET", Some("SY.vault@motherbee"), hive));
-        assert!(!authority("NODE_STATUS_GET", Some("SY.config-routes@worker1"), hive));
-        assert!(!authority("SPAWN_NODE", Some("SY.config-routes@motherbee"), hive));
-        assert!(!authority("NODE_STATUS_GET", Some("AI.evil@motherbee"), hive));
+        assert!(authority(
+            "NODE_STATUS_GET",
+            Some("SY.config-routes@motherbee"),
+            hive
+        ));
+        assert!(authority(
+            "NODE_STATUS_GET",
+            Some("SY.vault@motherbee"),
+            hive
+        ));
+        assert!(!authority(
+            "NODE_STATUS_GET",
+            Some("SY.config-routes@worker1"),
+            hive
+        ));
+        assert!(!authority(
+            "SPAWN_NODE",
+            Some("SY.config-routes@motherbee"),
+            hive
+        ));
+        assert!(!authority(
+            "NODE_STATUS_GET",
+            Some("AI.evil@motherbee"),
+            hive
+        ));
     }
 
     #[test]
-    fn protected_set_is_the_18_actions() {
+    fn protected_set_is_the_21_actions() {
         for action in [
             "SYSTEM_UPDATE",
             "SYSTEM_SYNC_HINT",
+            "EDGE_OPEN_URL",
+            "EDGE_CLOSE_URL",
+            "EDGE_LIST_URLS",
             "SPAWN_NODE",
             "KILL_NODE",
             "START_NODE",
@@ -151,11 +196,30 @@ mod tests {
             "ADD_HIVE_FINALIZE",
             "REMOVE_HIVE_CLEANUP",
         ] {
-            assert!(is_protected_system_action(action), "{action} must be protected");
+            assert!(
+                is_protected_system_action(action),
+                "{action} must be protected"
+            );
         }
-        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 18);
+        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 21);
         for action in ["RUNTIME_UPDATE", "HELLO", "LSA", "", "TOTALLY_UNKNOWN"] {
             assert!(!is_protected_system_action(action));
+        }
+    }
+
+    #[test]
+    fn edge_service_actions_are_motherbee_admin_only() {
+        let ingress_hive = "edge-1";
+        for action in ["EDGE_OPEN_URL", "EDGE_CLOSE_URL", "EDGE_LIST_URLS"] {
+            assert!(authority(action, Some("SY.admin@motherbee"), ingress_hive));
+            assert!(!authority(action, Some("SY.admin@edge-1"), ingress_hive));
+            assert!(!authority(
+                action,
+                Some("SY.orchestrator@motherbee"),
+                ingress_hive
+            ));
+            assert!(!authority(action, Some("IO.cloud@motherbee"), ingress_hive));
+            assert!(!authority(action, None, ingress_hive));
         }
     }
 }

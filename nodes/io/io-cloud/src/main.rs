@@ -79,7 +79,10 @@ async fn main() -> Result<(), DynError> {
     let identity_hive = env_or("IO_CLOUD_IDENTITY_HIVE", &hive_id);
     let identity_target = format!("SY.identity@{identity_hive}");
     let self_tenant = fluxbee_sdk::read_self_tenant_from_env().unwrap_or_else(|| {
-        env_or("IO_CLOUD_TENANT_ID", "tnt:00000000-0000-0000-0000-000000000001")
+        env_or(
+            "IO_CLOUD_TENANT_ID",
+            "tnt:00000000-0000-0000-0000-000000000001",
+        )
     });
     let channel_type = env_or("IO_CLOUD_CHANNEL_TYPE", "cloud");
     let channel_address = env_or("IO_CLOUD_CHANNEL_ADDRESS", "demo");
@@ -101,7 +104,7 @@ async fn main() -> Result<(), DynError> {
                 tenant = %self_tenant,
                 channel_type = %channel_type,
                 address = %channel_address,
-                "IO.cloud own channel ICH ready — externalize this ich on SY.edge to publish it"
+                "IO.cloud own channel ICH enabled — ready to externalize on SY.edge"
             );
             ich_id
         }
@@ -115,8 +118,8 @@ async fn main() -> Result<(), DynError> {
     // public URL on the edge. This is the same node→admin ADMIN_COMMAND path a real deploy
     // uses; it is self-service (requester owns the ICH). Opt-in via `IO_CLOUD_EDGE_NODE`
     // (the `SY.edge` L2 name to publish on) so an unconfigured IO.cloud just registers its
-    // channel and waits. NOTE: the `externalize` authz gate is intentionally still open
-    // (spec §11.1 — PENDING); admin accepts this without an origin/owner check for now.
+    // channel and waits. SY.admin authorizes this by router-stamped IO.* origin plus
+    // `requester == ICH owner`.
     let admin_hive = env_or("IO_CLOUD_ADMIN_HIVE", &hive_id);
     let admin_target = format!("SY.admin@{admin_hive}");
     if let Some(edge_node) = env("IO_CLOUD_EDGE_NODE") {
@@ -133,6 +136,41 @@ async fn main() -> Result<(), DynError> {
         if let Some(secret) = env("IO_CLOUD_SECRET") {
             params["secret"] = json!(secret);
         }
+        tokio::spawn(publish_channel_on_edge_with_retry(
+            dispatcher.clone(),
+            admin_target,
+            edge_node,
+            params,
+        ));
+    } else {
+        tracing::info!(
+            "IO.cloud not externalizing (set IO_CLOUD_EDGE_NODE to publish); handling inbound only"
+        );
+    }
+
+    let mut incoming = dispatcher.take_command_receiver(RPC_CH_INCOMING).await?;
+    run_loop(&sender, &full_name, &mut incoming).await
+}
+
+/// Keep IO.cloud running while the ingress hive is still converging. A boot race where
+/// SY.admin is ready before SY.edge should not require manually restarting IO.cloud.
+async fn publish_channel_on_edge_with_retry(
+    dispatcher: Arc<RouterDispatcher>,
+    admin_target: String,
+    edge_node: String,
+    params: serde_json::Value,
+) {
+    let max_attempts: u64 = env("IO_CLOUD_EXTERNALIZE_ATTEMPTS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let retry_delay_secs: u64 = env("IO_CLOUD_EXTERNALIZE_RETRY_SECONDS")
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(5);
+    let mut attempt = 0_u64;
+
+    loop {
+        attempt = attempt.saturating_add(1);
         match dispatcher
             .send_admin_rpc(AdminCommandRequest {
                 admin_target: &admin_target,
@@ -153,33 +191,81 @@ async fn main() -> Result<(), DynError> {
                     edge_node = %edge_node,
                     entry_token = ?token,
                     result = %res.payload,
+                    attempts = attempt,
                     "IO.cloud -> SY.admin externalize OK (public URL published on the edge)"
                 );
+                return;
             }
-            // The RPC round-tripped but admin refused (e.g. the §11.1 authz gate): status != ok.
-            Ok(res) => tracing::warn!(
-                target = %admin_target,
-                edge_node = %edge_node,
-                status = %res.status,
-                error_code = ?res.error_code,
-                error_detail = ?res.error_detail,
-                "IO.cloud -> SY.admin externalize REJECTED"
-            ),
-            Err(err) => tracing::warn!(
-                target = %admin_target,
-                edge_node = %edge_node,
-                error = %err,
-                "IO.cloud -> SY.admin externalize failed (transport)"
-            ),
+            // The RPC round-tripped but admin refused. Authz/schema errors are terminal; edge
+            // reachability races keep retrying.
+            Ok(res) => {
+                let detail = res
+                    .error_detail
+                    .as_ref()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| res.payload.to_string());
+                let code = res.error_code.clone().unwrap_or_default();
+                if !externalize_rejection_is_retryable(&code, &detail)
+                    || externalize_attempts_exhausted(attempt, max_attempts)
+                {
+                    tracing::warn!(
+                        target = %admin_target,
+                        edge_node = %edge_node,
+                        status = %res.status,
+                        error_code = ?res.error_code,
+                        error_detail = ?res.error_detail,
+                        attempts = attempt,
+                        "IO.cloud -> SY.admin externalize REJECTED"
+                    );
+                    return;
+                }
+                tracing::warn!(
+                    target = %admin_target,
+                    edge_node = %edge_node,
+                    status = %res.status,
+                    error_code = ?res.error_code,
+                    error_detail = ?res.error_detail,
+                    attempts = attempt,
+                    "IO.cloud -> SY.admin externalize rejected by a retryable edge condition; retrying"
+                );
+            }
+            Err(err) => {
+                if externalize_attempts_exhausted(attempt, max_attempts) {
+                    tracing::warn!(
+                        target = %admin_target,
+                        edge_node = %edge_node,
+                        error = %err,
+                        attempts = attempt,
+                        "IO.cloud -> SY.admin externalize failed (transport); retries exhausted"
+                    );
+                    return;
+                }
+                tracing::warn!(
+                    target = %admin_target,
+                    edge_node = %edge_node,
+                    error = %err,
+                    attempts = attempt,
+                    "IO.cloud -> SY.admin externalize failed (transport); retrying"
+                );
+            }
         }
-    } else {
-        tracing::info!(
-            "IO.cloud not externalizing (set IO_CLOUD_EDGE_NODE to publish); handling inbound only"
-        );
-    }
 
-    let mut incoming = dispatcher.take_command_receiver(RPC_CH_INCOMING).await?;
-    run_loop(&sender, &full_name, &mut incoming).await
+        tokio::time::sleep(Duration::from_secs(retry_delay_secs)).await;
+    }
+}
+
+fn externalize_attempts_exhausted(attempt: u64, max_attempts: u64) -> bool {
+    max_attempts != 0 && attempt >= max_attempts
+}
+
+fn externalize_rejection_is_retryable(error_code: &str, detail: &str) -> bool {
+    let combined = format!("{error_code} {detail}").to_ascii_lowercase();
+    combined.contains("edge unreachable")
+        || combined.contains("open_url failed")
+        || combined.contains("node_not_found")
+        || combined.contains("timed out")
+        || combined.contains("timeout")
+        || combined.contains("unreachable")
 }
 
 /// Retry `ensure_own_channel` while the mesh is still starting (SY.identity/SY.admin not yet
@@ -270,6 +356,12 @@ async fn ensure_own_channel(
     )
     .await
     .map_err(|e| format!("ensure_own_ich failed: {e}"))?;
+    tracing::info!(
+        ich_id = %result.ich_id,
+        owner_l2_name = ?result.owner_l2_name,
+        enabled = result.enabled,
+        "IO.cloud own ICH ensured"
+    );
     Ok(result.ich_id)
 }
 

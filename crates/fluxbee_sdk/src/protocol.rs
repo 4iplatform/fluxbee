@@ -472,6 +472,8 @@ pub const MSG_EDGE_OPEN_URL: &str = "EDGE_OPEN_URL";
 pub const MSG_EDGE_OPEN_URL_RESPONSE: &str = "EDGE_OPEN_URL_RESPONSE";
 pub const MSG_EDGE_CLOSE_URL: &str = "EDGE_CLOSE_URL";
 pub const MSG_EDGE_CLOSE_URL_RESPONSE: &str = "EDGE_CLOSE_URL_RESPONSE";
+pub const MSG_EDGE_LIST_URLS: &str = "EDGE_LIST_URLS";
+pub const MSG_EDGE_LIST_URLS_RESPONSE: &str = "EDGE_LIST_URLS_RESPONSE";
 
 pub const SCOPE_VPN: &str = "vpn";
 pub const SCOPE_GLOBAL: &str = "global";

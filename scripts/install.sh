@@ -1108,13 +1108,14 @@ install_unit \
   "/usr/bin/sy-frontdesk-gov" \
   "network.target rt-gateway.service sy-identity.service" \
   "rt-gateway.service sy-identity.service"
-# sy-edge needs the router up + SY.vault reachable (public TLS cert fetch at boot);
-# self-gates on role==ingress, so shipping the unit everywhere is safe.
+# sy-edge needs the local router up. Its TLS cert is fetched from the motherbee
+# vault over the mesh, so the binary fails closed and Restart=always retries until
+# that remote path is reachable.
 install_unit \
   "sy-edge" \
   "/usr/bin/sy-edge" \
-  "network.target rt-gateway.service sy-vault.service" \
-  "rt-gateway.service sy-vault.service"
+  "network.target rt-gateway.service" \
+  "rt-gateway.service"
 # io-cloud: custom unit (install_unit can't express ExecCondition/EnvironmentFile). Singleton,
 # gated to role: motherbee so it only runs on the motherbee even though enabled everywhere.
 cat <<'IOUNIT' | sudo tee /etc/systemd/system/io-cloud.service >/dev/null

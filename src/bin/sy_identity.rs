@@ -1363,6 +1363,19 @@ impl IdentityStore {
         }))
     }
 
+    fn ich_owner_l2_name(&self, ich_id: &str) -> Result<Option<String>, String> {
+        let _ = parse_prefixed_uuid(ich_id, "ich")?;
+        for ilk in self.ilks.values() {
+            if ilk.deleted_at_ms.is_some() {
+                continue;
+            }
+            if let Some(channel) = ilk.channels.iter().find(|channel| channel.ich_id == ich_id) {
+                return Ok(channel.owner_l2_name.clone());
+            }
+        }
+        Err("ICH_NOT_FOUND".to_string())
+    }
+
     fn approve_tenant(&mut self, req: TntApproveRequest) -> Result<Value, String> {
         let _ = parse_prefixed_uuid(&req.tenant_id, "tnt")?;
         let _ = parse_prefixed_uuid(&req.approved_by, "ilk")?;
@@ -1577,8 +1590,7 @@ impl IdentityStore {
         hive_id: &str,
         incoming: Vec<IlkRecord>,
     ) -> Vec<IdentityDelta> {
-        let incoming_ids: HashSet<String> =
-            incoming.iter().map(|ilk| ilk.ilk_id.clone()).collect();
+        let incoming_ids: HashSet<String> = incoming.iter().map(|ilk| ilk.ilk_id.clone()).collect();
         let stale: Vec<String> = self
             .ilks
             .values()
@@ -1623,11 +1635,7 @@ impl IdentityStore {
 /// only push ilks whose node_name ends with `@<its-own-hive>`. Falls back to the
 /// explicit `identification.hive_id` only when the node_name carries no `@`.
 fn ilk_owning_hive(ilk: &IlkRecord) -> Option<String> {
-    if let Some(node_name) = ilk
-        .identification
-        .get("node_name")
-        .and_then(|v| v.as_str())
-    {
+    if let Some(node_name) = ilk.identification.get("node_name").and_then(|v| v.as_str()) {
         if let Some((_, hive)) = node_name.rsplit_once('@') {
             let hive = hive.trim();
             if !hive.is_empty() {
@@ -1701,12 +1709,9 @@ fn delta_authorized_for_hive(
                 None => true,
             }
         }
-        IdentityDelta::IlkDelete { ilk_id } => store
-            .ilks
-            .get(ilk_id)
-            .and_then(ilk_owning_hive)
-            .as_deref()
-            == Some(publisher_hive),
+        IdentityDelta::IlkDelete { ilk_id } => {
+            store.ilks.get(ilk_id).and_then(ilk_owning_hive).as_deref() == Some(publisher_hive)
+        }
         IdentityDelta::AliasUpsert { alias } => {
             // Both the redirected source id (`old_ilk_id`, the key the alias is
             // stored under and the id whose resolution it hijacks) AND the
@@ -1727,12 +1732,14 @@ fn delta_authorized_for_hive(
             };
             owned_by_publisher(&alias.old_ilk_id) && owned_by_publisher(&alias.canonical_ilk_id)
         }
-        IdentityDelta::AliasDelete { old_ilk_id } => store
-            .ilks
-            .get(old_ilk_id)
-            .and_then(ilk_owning_hive)
-            .as_deref()
-            == Some(publisher_hive),
+        IdentityDelta::AliasDelete { old_ilk_id } => {
+            store
+                .ilks
+                .get(old_ilk_id)
+                .and_then(ilk_owning_hive)
+                .as_deref()
+                == Some(publisher_hive)
+        }
         // Tenants are primary-authoritative; never accepted from a replica push.
         IdentityDelta::TenantUpsert { .. } => false,
     }
@@ -1876,7 +1883,13 @@ impl IdentityRuntime {
         // its OWN fail-closed origin check on the router-stamped src_l2_name so a
         // forged broadcast cannot restart-loop the identity primary.
         if action == MSG_VAULT_SECRET_CHANGED {
-            handle_vault_secret_changed(msg, self.is_primary, node_name, src_l2_name, &self.hive_id);
+            handle_vault_secret_changed(
+                msg,
+                self.is_primary,
+                node_name,
+                src_l2_name,
+                &self.hive_id,
+            );
             return Ok(Vec::new());
         }
         if !self.is_authorized(action, src_l2_name) {
@@ -2198,33 +2211,49 @@ impl IdentityRuntime {
                 match serde_json::from_value::<IchSetEnabledRequest>(msg.payload.clone()) {
                     Ok(req) => {
                         if let Value::Bool(enabled) = req.enabled {
-                            let snapshot = if self.is_primary && self.db_config.is_some() {
-                                Some(self.store.clone())
+                            if let Err(payload) = authorize_ich_enabled_mutation(
+                                &self.store,
+                                &req.ich_id,
+                                src_l2_name,
+                            ) {
+                                payload
                             } else {
-                                None
-                            };
-                            match self.store.set_ich_enabled(&req.ich_id, enabled) {
-                                Ok(ok) => {
-                                    if let Some(ilk_id) = ok.get("ilk_id").and_then(Value::as_str) {
-                                        if let Some(ilk) = self.store.ilks.get(ilk_id).cloned() {
-                                            if self.is_primary {
-                                                if let Some(database_config) =
-                                                    self.db_config.as_ref()
-                                                {
-                                                    if let Err(err) = persist_ilk_state_in_db(
-                                                        database_config,
-                                                        &ilk,
-                                                        None,
-                                                    )
-                                                    .await
+                                let snapshot = if self.is_primary && self.db_config.is_some() {
+                                    Some(self.store.clone())
+                                } else {
+                                    None
+                                };
+                                match self.store.set_ich_enabled(&req.ich_id, enabled) {
+                                    Ok(ok) => {
+                                        if let Some(ilk_id) =
+                                            ok.get("ilk_id").and_then(Value::as_str)
+                                        {
+                                            if let Some(ilk) = self.store.ilks.get(ilk_id).cloned()
+                                            {
+                                                if self.is_primary {
+                                                    if let Some(database_config) =
+                                                        self.db_config.as_ref()
                                                     {
-                                                        if let Some(snapshot) = snapshot {
-                                                            self.store = snapshot;
-                                                        }
-                                                        db_write_error_payload(
+                                                        if let Err(err) = persist_ilk_state_in_db(
+                                                            database_config,
+                                                            &ilk,
+                                                            None,
+                                                        )
+                                                        .await
+                                                        {
+                                                            if let Some(snapshot) = snapshot {
+                                                                self.store = snapshot;
+                                                            }
+                                                            db_write_error_payload(
                                                             "failed to persist ich enabled update",
                                                             err.as_ref(),
                                                         )
+                                                        } else {
+                                                            deltas.push(delta_envelope(
+                                                                IdentityDelta::IlkUpsert { ilk },
+                                                            ));
+                                                            ok
+                                                        }
                                                     } else {
                                                         deltas.push(delta_envelope(
                                                             IdentityDelta::IlkUpsert { ilk },
@@ -2238,20 +2267,15 @@ impl IdentityRuntime {
                                                     ok
                                                 }
                                             } else {
-                                                deltas.push(delta_envelope(
-                                                    IdentityDelta::IlkUpsert { ilk },
-                                                ));
                                                 ok
                                             }
                                         } else {
                                             ok
                                         }
-                                    } else {
-                                        ok
                                     }
-                                }
-                                Err(code) => {
-                                    error_payload(&code, "failed to set ich enabled state")
+                                    Err(code) => {
+                                        error_payload(&code, "failed to set ich enabled state")
+                                    }
                                 }
                             }
                         } else {
@@ -2450,25 +2474,31 @@ impl IdentityRuntime {
                         None
                     };
                     match self.store.create_tenant(req) {
-                    Ok(ok) => {
-                        if let Some(tenant_id) = ok
-                            .get("tenant_id")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                        {
-                            if let Some(tenant) = self.store.tenants.get(&tenant_id).cloned() {
-                                if self.is_primary {
-                                    if let Some(database_config) = self.db_config.as_ref() {
-                                        if let Err(err) =
-                                            upsert_tenant_in_db(database_config, &tenant).await
-                                        {
-                                            if let Some(snapshot) = snapshot {
-                                                self.store = snapshot;
+                        Ok(ok) => {
+                            if let Some(tenant_id) = ok
+                                .get("tenant_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                            {
+                                if let Some(tenant) = self.store.tenants.get(&tenant_id).cloned() {
+                                    if self.is_primary {
+                                        if let Some(database_config) = self.db_config.as_ref() {
+                                            if let Err(err) =
+                                                upsert_tenant_in_db(database_config, &tenant).await
+                                            {
+                                                if let Some(snapshot) = snapshot {
+                                                    self.store = snapshot;
+                                                }
+                                                db_write_error_payload(
+                                                    "failed to persist tenant",
+                                                    err.as_ref(),
+                                                )
+                                            } else {
+                                                deltas.push(delta_envelope(
+                                                    IdentityDelta::TenantUpsert { tenant },
+                                                ));
+                                                ok
                                             }
-                                            db_write_error_payload(
-                                                "failed to persist tenant",
-                                                err.as_ref(),
-                                            )
                                         } else {
                                             deltas.push(delta_envelope(
                                                 IdentityDelta::TenantUpsert { tenant },
@@ -2482,19 +2512,13 @@ impl IdentityRuntime {
                                         ok
                                     }
                                 } else {
-                                    deltas.push(delta_envelope(IdentityDelta::TenantUpsert {
-                                        tenant,
-                                    }));
                                     ok
                                 }
                             } else {
                                 ok
                             }
-                        } else {
-                            ok
                         }
-                    }
-                    Err(code) => error_payload(&code, "failed to create tenant"),
+                        Err(code) => error_payload(&code, "failed to create tenant"),
                     }
                 }
                 Err(err) => error_payload("INVALID_REQUEST", &err.to_string()),
@@ -3042,24 +3066,27 @@ async fn main() -> Result<(), IdentityError> {
     // A replica needs its own per-hive HMAC key to run the client handshake.
     // Fail-closed: auth required but key missing aborts startup (rather than
     // silently falling back to an unauthenticated channel).
-    let self_auth_key: Option<json_router::mesh_hmac::MeshHmacKey> =
-        if auth_required && !is_primary {
-            let path = identity_hmac_key_path(&self_hive);
-            match json_router::mesh_hmac::MeshHmacKey::load_from_file(&path) {
-                Ok(k) => Some(k),
-                Err(err) => {
-                    return Err(format!(
-                        "identity.sync.auth=required but HMAC key missing at {}: {err}",
-                        path.display()
-                    )
-                    .into());
-                }
+    let self_auth_key: Option<json_router::mesh_hmac::MeshHmacKey> = if auth_required && !is_primary
+    {
+        let path = identity_hmac_key_path(&self_hive);
+        match json_router::mesh_hmac::MeshHmacKey::load_from_file(&path) {
+            Ok(k) => Some(k),
+            Err(err) => {
+                return Err(format!(
+                    "identity.sync.auth=required but HMAC key missing at {}: {err}",
+                    path.display()
+                )
+                .into());
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
     if auth_required {
-        tracing::info!(role = if is_primary { "primary" } else { "replica" }, "identity sync auth: required (per-hive HMAC)");
+        tracing::info!(
+            role = if is_primary { "primary" } else { "replica" },
+            "identity sync auth: required (per-hive HMAC)"
+        );
     }
     let sync_listener = if is_primary {
         let bind_addr = format!("0.0.0.0:{sync_port}");
@@ -4245,7 +4272,10 @@ async fn server_auth_handshake(
     ) -> Result<String, IdentityError> {
         let _ = auth_write_line(
             write_half,
-            &AuthErrorMsg { operation: AUTH_OP_ERROR.into(), message: "authentication failed".into() },
+            &AuthErrorMsg {
+                operation: AUTH_OP_ERROR.into(),
+                message: "authentication failed".into(),
+            },
         )
         .await;
         Err(log.into())
@@ -4266,17 +4296,43 @@ async fn server_auth_handshake(
         }
     };
     let server_nonce = mesh_hmac::random_nonce();
-    auth_write_line(write_half, &AuthChallenge { operation: AUTH_OP_CHALLENGE.into(), nonce: server_nonce.clone() }).await?;
+    auth_write_line(
+        write_half,
+        &AuthChallenge {
+            operation: AUTH_OP_CHALLENGE.into(),
+            nonce: server_nonce.clone(),
+        },
+    )
+    .await?;
     let resp: AuthMac = serde_json::from_str(&auth_read_line(reader).await?)
         .map_err(|e| -> IdentityError { format!("auth response parse: {e}").into() })?;
     if resp.operation != AUTH_OP_RESPONSE {
         return reject(write_half, "auth: expected response".into()).await;
     }
-    if mesh_hmac::verify_proof(&key, mesh_hmac::CLIENT_CONTEXT, &server_nonce, &hive, &resp.mac).is_err() {
-        return reject(write_half, format!("auth: HMAC verification failed for hive '{hive}'")).await;
+    if mesh_hmac::verify_proof(
+        &key,
+        mesh_hmac::CLIENT_CONTEXT,
+        &server_nonce,
+        &hive,
+        &resp.mac,
+    )
+    .is_err()
+    {
+        return reject(
+            write_half,
+            format!("auth: HMAC verification failed for hive '{hive}'"),
+        )
+        .await;
     }
     let server_proof = mesh_hmac::prove(&key, mesh_hmac::SERVER_CONTEXT, &hello.nonce, &hive);
-    auth_write_line(write_half, &AuthMac { operation: AUTH_OP_OK.into(), mac: server_proof }).await?;
+    auth_write_line(
+        write_half,
+        &AuthMac {
+            operation: AUTH_OP_OK.into(),
+            mac: server_proof,
+        },
+    )
+    .await?;
     Ok(hive)
 }
 
@@ -4290,21 +4346,46 @@ async fn client_auth_handshake(
 ) -> Result<(), IdentityError> {
     use json_router::mesh_hmac;
     let client_nonce = mesh_hmac::random_nonce();
-    auth_write_line(write_half, &AuthHello { operation: AUTH_OP_HELLO.into(), hive: self_hive.to_string(), nonce: client_nonce.clone() }).await?;
-    let challenge: AuthChallenge = serde_json::from_str(&auth_read_line(reader).await?)
-        .map_err(|e| -> IdentityError { format!("auth challenge parse (rejected?): {e}").into() })?;
+    auth_write_line(
+        write_half,
+        &AuthHello {
+            operation: AUTH_OP_HELLO.into(),
+            hive: self_hive.to_string(),
+            nonce: client_nonce.clone(),
+        },
+    )
+    .await?;
+    let challenge: AuthChallenge =
+        serde_json::from_str(&auth_read_line(reader).await?).map_err(|e| -> IdentityError {
+            format!("auth challenge parse (rejected?): {e}").into()
+        })?;
     if challenge.operation != AUTH_OP_CHALLENGE {
         return Err("auth: primary did not challenge (rejected?)".into());
     }
     let response = mesh_hmac::prove(key, mesh_hmac::CLIENT_CONTEXT, &challenge.nonce, self_hive);
-    auth_write_line(write_half, &AuthMac { operation: AUTH_OP_RESPONSE.into(), mac: response }).await?;
+    auth_write_line(
+        write_half,
+        &AuthMac {
+            operation: AUTH_OP_RESPONSE.into(),
+            mac: response,
+        },
+    )
+    .await?;
     let ok: AuthMac = serde_json::from_str(&auth_read_line(reader).await?)
         .map_err(|e| -> IdentityError { format!("auth ok parse (rejected?): {e}").into() })?;
     if ok.operation != AUTH_OP_OK {
         return Err("auth: primary rejected the handshake".into());
     }
-    mesh_hmac::verify_proof(key, mesh_hmac::SERVER_CONTEXT, &client_nonce, self_hive, &ok.mac)
-        .map_err(|_| -> IdentityError { "auth: primary HMAC verification failed (wrong key?)".into() })?;
+    mesh_hmac::verify_proof(
+        key,
+        mesh_hmac::SERVER_CONTEXT,
+        &client_nonce,
+        self_hive,
+        &ok.mac,
+    )
+    .map_err(|_| -> IdentityError {
+        "auth: primary HMAC verification failed (wrong key?)".into()
+    })?;
     Ok(())
 }
 
@@ -4394,7 +4475,10 @@ async fn handle_sync_connection(
                     };
                     let mut acked = false;
                     for attempt in 1..=IDENTITY_DELTA_MAX_RETRIES {
-                        if write_timed(&mut write_half, encoded.as_bytes()).await.is_err() {
+                        if write_timed(&mut write_half, encoded.as_bytes())
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                         if write_timed(&mut write_half, b"\n").await.is_err() {
@@ -4481,9 +4565,13 @@ async fn handle_sync_connection(
             // Read the publish stream until the replica disconnects; the main
             // loop applies + re-broadcasts the ingested frames.
             tokio::spawn(async move {
-                if let Err(err) =
-                    run_publish_reader(&mut reader, &mut write_half, publisher_hive.clone(), ingest_tx)
-                        .await
+                if let Err(err) = run_publish_reader(
+                    &mut reader,
+                    &mut write_half,
+                    publisher_hive.clone(),
+                    ingest_tx,
+                )
+                .await
                 {
                     tracing::warn!(hive = %publisher_hive, error = %err, "identity publish reader ended");
                 }
@@ -4972,7 +5060,10 @@ async fn run_publish_reader(
             continue;
         }
         let value: Value = serde_json::from_str(raw)?;
-        let operation = value.get("operation").and_then(|v| v.as_str()).unwrap_or("");
+        let operation = value
+            .get("operation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let seq = value.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
         if seq == 0 {
             return Err("publish frame with seq=0 is invalid".into());
@@ -5188,6 +5279,27 @@ fn unauthorized_identity_source_payload(
         "src_uuid": src_uuid,
         "src_l2_name": src_l2_name,
     })
+}
+
+fn authorize_ich_enabled_mutation(
+    store: &IdentityStore,
+    ich_id: &str,
+    src_l2_name: Option<&str>,
+) -> Result<(), Value> {
+    let Some(caller) = src_l2_name
+        .map(str::trim)
+        .filter(|value| value.starts_with("IO."))
+    else {
+        return Ok(());
+    };
+    match store.ich_owner_l2_name(ich_id) {
+        Ok(Some(owner)) if owner == caller => Ok(()),
+        Ok(_) => Err(error_payload(
+            "UNAUTHORIZED",
+            "IO callers may only change enabled state for their own ICH",
+        )),
+        Err(code) => Err(error_payload(&code, "failed to set ich enabled state")),
+    }
 }
 
 fn error_payload(error_code: &str, message: &str) -> Value {
@@ -5676,7 +5788,10 @@ CREATE INDEX IF NOT EXISTS idx_identity_ichs_owner
         )
         .await?;
     let _ = client
-        .execute("SELECT pg_advisory_unlock($1)", &[&IDENTITY_SCHEMA_LOCK_KEY])
+        .execute(
+            "SELECT pg_advisory_unlock($1)",
+            &[&IDENTITY_SCHEMA_LOCK_KEY],
+        )
         .await;
 
     tracing::info!("identity primary schema ensured (baseline v1)");
@@ -7356,6 +7471,53 @@ mod tests {
     }
 
     #[test]
+    fn io_callers_can_enable_only_their_own_ich() {
+        let mut store = IdentityStore::default();
+        store.ilks.insert(
+            "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+            IlkRecord {
+                ilk_id: "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string(),
+                ilk_type: "agent".to_string(),
+                registration_status: "complete".to_string(),
+                tenant_id: "tnt:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string(),
+                identification: json!({}),
+                definition: json!({}),
+                channels: vec![ChannelRecord {
+                    ich_id: "ich:cccccccc-cccc-cccc-cccc-cccccccccccc".to_string(),
+                    channel_type: "cloud".to_string(),
+                    address: "demo".to_string(),
+                    owner_l2_name: Some("IO.cloud@motherbee".to_string()),
+                    enabled: false,
+                }],
+                deleted_at_ms: None,
+            },
+        );
+
+        assert!(authorize_ich_enabled_mutation(
+            &store,
+            "ich:cccccccc-cccc-cccc-cccc-cccccccccccc",
+            Some("IO.cloud@motherbee")
+        )
+        .is_ok());
+        assert!(authorize_ich_enabled_mutation(
+            &store,
+            "ich:cccccccc-cccc-cccc-cccc-cccccccccccc",
+            Some("SY.admin@motherbee")
+        )
+        .is_ok());
+        let denied = authorize_ich_enabled_mutation(
+            &store,
+            "ich:cccccccc-cccc-cccc-cccc-cccccccccccc",
+            Some("IO.other@motherbee"),
+        )
+        .expect_err("other IO must not toggle this ICH");
+        assert_eq!(
+            denied.get("error_code").and_then(Value::as_str),
+            Some("UNAUTHORIZED")
+        );
+    }
+
+    #[test]
     fn set_ilk_definition_updates_agent_definition_and_normalizes_hashes() {
         let mut store = IdentityStore::default();
         store.tenants.insert(
@@ -7850,18 +8012,24 @@ mod tests {
         let store = IdentityStore::default();
         // A replica may push its own `@hive` ilk.
         assert!(delta_authorized_for_hive(
-            &IdentityDelta::IlkUpsert { ilk: ilk_for("SY.storage@worker1", "ilk:w") },
+            &IdentityDelta::IlkUpsert {
+                ilk: ilk_for("SY.storage@worker1", "ilk:w")
+            },
             "worker1",
             &store
         ));
         // It may NOT forge a `@motherbee` or another hive's ilk.
         assert!(!delta_authorized_for_hive(
-            &IdentityDelta::IlkUpsert { ilk: ilk_for("SY.storage@motherbee", "ilk:m") },
+            &IdentityDelta::IlkUpsert {
+                ilk: ilk_for("SY.storage@motherbee", "ilk:m")
+            },
             "worker1",
             &store
         ));
         assert!(!delta_authorized_for_hive(
-            &IdentityDelta::IlkUpsert { ilk: ilk_for("SY.x@worker2", "ilk:w2") },
+            &IdentityDelta::IlkUpsert {
+                ilk: ilk_for("SY.x@worker2", "ilk:w2")
+            },
             "worker1",
             &store
         ));
@@ -7887,17 +8055,23 @@ mod tests {
             .ilks
             .insert("ilk:w".into(), ilk_for("SY.storage@worker1", "ilk:w"));
         assert!(delta_authorized_for_hive(
-            &IdentityDelta::IlkDelete { ilk_id: "ilk:w".into() },
+            &IdentityDelta::IlkDelete {
+                ilk_id: "ilk:w".into()
+            },
             "worker1",
             &store2
         ));
         assert!(!delta_authorized_for_hive(
-            &IdentityDelta::IlkDelete { ilk_id: "ilk:w".into() },
+            &IdentityDelta::IlkDelete {
+                ilk_id: "ilk:w".into()
+            },
             "worker2",
             &store2
         ));
         assert!(!delta_authorized_for_hive(
-            &IdentityDelta::IlkDelete { ilk_id: "ilk:unknown".into() },
+            &IdentityDelta::IlkDelete {
+                ilk_id: "ilk:unknown".into()
+            },
             "worker1",
             &store2
         ));
@@ -7907,12 +8081,14 @@ mod tests {
     fn authority_rejects_ilk_id_collision_with_other_hive() {
         let mut store = IdentityStore::default();
         // motherbee owns ilk_id "ilk:shared".
-        store
-            .ilks
-            .insert("ilk:shared".into(), ilk_for("SY.storage@motherbee", "ilk:shared"));
+        store.ilks.insert(
+            "ilk:shared".into(),
+            ilk_for("SY.storage@motherbee", "ilk:shared"),
+        );
         // worker1 tries to hijack that ilk_id with a forged `@worker1` node_name.
-        let collide =
-            IdentityDelta::IlkUpsert { ilk: ilk_for("SY.evil@worker1", "ilk:shared") };
+        let collide = IdentityDelta::IlkUpsert {
+            ilk: ilk_for("SY.evil@worker1", "ilk:shared"),
+        };
         assert!(
             !delta_authorized_for_hive(&collide, "worker1", &store),
             "delta path must reject ilk_id collision"
@@ -7920,7 +8096,10 @@ mod tests {
         // The snapshot/reconcile path must also skip it, leaving motherbee intact.
         let deltas =
             store.reconcile_hive_ilks("worker1", vec![ilk_for("SY.evil@worker1", "ilk:shared")]);
-        assert!(deltas.is_empty(), "reconcile must not overwrite foreign ilk_id");
+        assert!(
+            deltas.is_empty(),
+            "reconcile must not overwrite foreign ilk_id"
+        );
         assert_eq!(
             ilk_owning_hive(store.ilks.get("ilk:shared").unwrap()).as_deref(),
             Some("motherbee")
@@ -7940,14 +8119,22 @@ mod tests {
         // (the mesh-DOS the reviewer flagged).
         let deltas =
             store.reconcile_hive_ilks("worker1", vec![ilk_for("SY.other@worker1", "ilk:other")]);
-        assert!(store.ilks.contains_key("ilk:sys"), "system ilk must survive reconcile");
+        assert!(
+            store.ilks.contains_key("ilk:sys"),
+            "system ilk must survive reconcile"
+        );
         assert!(store.ilks.contains_key("ilk:other"));
         assert!(!deltas
             .iter()
             .any(|d| matches!(d, IdentityDelta::IlkDelete { ilk_id } if ilk_id == "ilk:sys")));
         // apply_delta is the net: a direct IlkDelete of a well-known ilk is a no-op.
-        store.apply_delta(IdentityDelta::IlkDelete { ilk_id: "ilk:sys".into() });
-        assert!(store.ilks.contains_key("ilk:sys"), "apply_delta must not remove a system ilk");
+        store.apply_delta(IdentityDelta::IlkDelete {
+            ilk_id: "ilk:sys".into(),
+        });
+        assert!(
+            store.ilks.contains_key("ilk:sys"),
+            "apply_delta must not remove a system ilk"
+        );
     }
 
     #[test]
@@ -7974,7 +8161,10 @@ mod tests {
         assert!(store.ilks.contains_key("ilk:mb"), "other hive untouched");
         assert!(store.ilks.contains_key("ilk:w1a"));
         assert!(store.ilks.contains_key("ilk:w1c"), "new ilk added");
-        assert!(!store.ilks.contains_key("ilk:w1b"), "absent ilk hard-removed");
+        assert!(
+            !store.ilks.contains_key("ilk:w1b"),
+            "absent ilk hard-removed"
+        );
         // w1a is byte-identical -> no-op skipped; only w1c upsert + w1b delete.
         let upserts = deltas
             .iter()
@@ -8055,7 +8245,10 @@ mod tests {
     #[test]
     fn ingest_system_ilk_type_bound_to_deterministic_shape() {
         // Non-system types are always allowed for an owned ilk.
-        assert!(ingest_ilk_type_authorized(&ilk_for("AI.bot@worker1", "ilk:a"), "worker1"));
+        assert!(ingest_ilk_type_authorized(
+            &ilk_for("AI.bot@worker1", "ilk:a"),
+            "worker1"
+        ));
         // A genuine deterministic SY.* system ilk of the publisher is allowed.
         let node = "SY.vault@worker1";
         let mut sys = ilk_for(node, &deterministic_system_ilk_id(node));
@@ -8089,7 +8282,9 @@ mod tests {
         ));
         // It CAN push its own agent ilk and its genuine deterministic system ilk.
         assert!(delta_authorized_for_hive(
-            &IdentityDelta::IlkUpsert { ilk: ilk_for("AI.ok@worker1", "ilk:ok") },
+            &IdentityDelta::IlkUpsert {
+                ilk: ilk_for("AI.ok@worker1", "ilk:ok")
+            },
             "worker1",
             &store
         ));
@@ -8113,9 +8308,10 @@ mod tests {
         store
             .ilks
             .insert("ilk:w-old".into(), ilk_for("AI.old@worker1", "ilk:w-old"));
-        store
-            .ilks
-            .insert("ilk:w-canon".into(), ilk_for("AI.canon@worker1", "ilk:w-canon"));
+        store.ilks.insert(
+            "ilk:w-canon".into(),
+            ilk_for("AI.canon@worker1", "ilk:w-canon"),
+        );
         let alias = |old: &str, canon: &str| IdentityDelta::AliasUpsert {
             alias: AliasSnapshotRecord {
                 old_ilk_id: old.to_string(),
