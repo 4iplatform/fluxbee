@@ -1071,7 +1071,13 @@ install_unit() {
   local exec="$2"
   local after_units="${3:-network.target}"
   local wants_units="${4:-}"
+  local role_regex="${5:-}"
   local path="/etc/systemd/system/${name}.service"
+  # Role-restricted units mirror the binary's own hive-role guard as an ExecCondition,
+  # so a foreign-role start (e.g. pulled in via another unit's Wants=) skips cleanly
+  # instead of crash-looping on the binary's wrong-role exit under Restart=always.
+  local cond_line=""
+  [[ -n "$role_regex" ]] && cond_line="ExecCondition=/bin/sh -c 'grep -qE \"^role:[[:space:]]*(${role_regex})\" /etc/fluxbee/hive.yaml'"
   cat <<EOF | sudo tee "$path" >/dev/null
 [Unit]
 Description=Fluxbee ${name}
@@ -1080,6 +1086,7 @@ $(if [[ -n "$wants_units" ]]; then printf 'Wants=%s\n' "$wants_units"; fi)
 
 [Service]
 Type=simple
+${cond_line}
 ExecStart=${exec}
 Restart=always
 RestartSec=5
@@ -1093,12 +1100,12 @@ echo "Installing systemd units..."
 install_unit "rt-gateway" "/usr/bin/rt-gateway"
 install_unit "sy-config-routes" "/usr/bin/sy-config-routes"
 install_unit "sy-opa-rules" "/usr/bin/sy-opa-rules"
-install_unit "sy-admin" "/usr/bin/sy-admin"
+install_unit "sy-admin" "/usr/bin/sy-admin" "network.target" "" "motherbee"
 install_unit "sy-architect" "/usr/bin/sy-architect"
 install_unit "sy-vault" "/usr/bin/sy-vault"
 install_unit "sy-orchestrator" "/usr/bin/sy-orchestrator"
-install_unit "sy-storage" "/usr/bin/sy-storage"
-install_unit "sy-identity" "/usr/bin/sy-identity"
+install_unit "sy-storage" "/usr/bin/sy-storage" "network.target" "" "motherbee"
+install_unit "sy-identity" "/usr/bin/sy-identity" "network.target" "" "motherbee|worker"
 install_unit "sy-cognition" "/usr/bin/sy-cognition"
 install_unit "sy-policy" "/usr/bin/sy-policy"
 install_unit "sy-timer" "/usr/bin/sy-timer"

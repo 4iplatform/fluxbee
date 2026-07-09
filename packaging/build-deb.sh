@@ -116,15 +116,29 @@ fi
 # systemd units (mirrors scripts/install.sh install_unit). Not enabled here; the
 # postinst enables only sy-orchestrator, which brings up the rest (its bootstrap
 # starts rt-gateway + the SY services in the Model D' order).
-gen_unit() { # <name> [after] [wants]
-  local name="$1" after="${2:-network.target}" wants="${3:-}"
+gen_unit() { # <name> [after] [wants] [role_regex]
+  local name="$1" after="${2:-network.target}" wants="${3:-}" role_regex="${4:-}"
   { echo "[Unit]"; echo "Description=Fluxbee $name"; echo "After=$after"
     [ -n "$wants" ] && echo "Wants=$wants"
-    echo; echo "[Service]"; echo "Type=simple"; echo "ExecStart=/usr/bin/$name"
+    echo; echo "[Service]"; echo "Type=simple"
+    # Role-restricted units mirror the binary's own hive-role guard as an ExecCondition,
+    # so a foreign-role start (e.g. pulled in via another unit's Wants=) skips cleanly
+    # instead of crash-looping on the binary's wrong-role exit under Restart=always.
+    [ -n "$role_regex" ] && echo "ExecCondition=/bin/sh -c 'grep -qE \"^role:[[:space:]]*($role_regex)\" /etc/fluxbee/hive.yaml'"
+    echo "ExecStart=/usr/bin/$name"
     echo "Restart=always"; echo "RestartSec=5"; echo
     echo "[Install]"; echo "WantedBy=multi-user.target"; } > "$DEST/lib/systemd/system/$name.service"
 }
-for u in "${UNITS[@]}"; do gen_unit "$u"; done
+# Units whose binary exits on the wrong hive role (sy-admin/sy-storage=motherbee,
+# sy-identity=motherbee|worker) get an ExecCondition mirroring that guard — otherwise a
+# Wants= pull-in (e.g. io-cloud.service) starts them on a foreign role and Restart=always
+# turns the binary's clean wrong-role exit into an infinite crash-loop.
+unit_role_gate() { case "$1" in
+  sy-admin|sy-storage) echo "motherbee" ;;
+  sy-identity) echo "motherbee|worker" ;;
+  *) echo "" ;;
+esac; }
+for u in "${UNITS[@]}"; do gen_unit "$u" "network.target" "" "$(unit_role_gate "$u")"; done
 gen_unit sy-frontdesk-gov "network.target rt-gateway.service sy-identity.service" \
   "rt-gateway.service sy-identity.service"
 # sy-edge (ingress public door) needs the local router up to connect. Its public
