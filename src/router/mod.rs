@@ -2843,11 +2843,34 @@ async fn handle_wan_message(
         return Ok(());
     };
 
+    // EDGE-01: bind the origin-hive to the mTLS-authenticated LSA bucket, not the
+    // self-asserted node name. `src_info.hive_id` is the bucket the src UUID resolved in,
+    // and apply_lsa_payload only lets a peer write nodes into its OWN (cert-bound) bucket,
+    // so a hive authenticated as P can only assert identities of the form `role@P`. Rewrite
+    // any name whose `@hive` suffix disagrees with the bucket: a forged "SY.admin@motherbee"
+    // advertised by an attacker hive becomes "SY.admin@<attacker>", which authority() denies.
+    // Legitimate names (suffix already == bucket) are unchanged. Correct-and-continue + warn
+    // (availability over fail-closed; the origin gate still denies the forged identity).
+    let canonical_src_name = canonical_wan_src_name(&src_info.name, &src_info.hive_id);
+    if canonical_src_name != src_info.name {
+        tracing::warn!(
+            resolved_name = %src_info.name,
+            bucket_hive = %src_info.hive_id,
+            canonical = %canonical_src_name,
+            "wan src name suffix rebound to authenticated bucket hive"
+        );
+    }
+    let src_info = RemoteNodeInfo {
+        name: canonical_src_name,
+        ..src_info
+    };
+
     // F4/F15: stamp the router-authoritative cross-hive L2 name (resolved from the
     // LSA snapshot) over whatever the WAN frame carried, BEFORE the origin gate in
     // serialize_for_local_delivery. Unlike the local (:915) and peer (:3413) paths
     // the WAN handler never stamped src_l2_name, so a remote peer could otherwise
     // spoof it (e.g. claim SY.orchestrator@<hive>) to pass the protected-action gate.
+    // The name is now canonicalized to the authenticated bucket hive (EDGE-01 above).
     let mut msg = msg.clone();
     msg.routing.src_l2_name = Some(src_info.name.clone());
 
@@ -3921,6 +3944,19 @@ fn normalize_name(name: &str, hive_id: &str) -> String {
     } else {
         format!("{}@{}", name, hive_id)
     }
+}
+
+/// EDGE-01: canonicalize a WAN-resolved src name to `role@bucket_hive`, where `bucket_hive`
+/// is the mTLS-authenticated LSA bucket the src UUID resolved in (`find_remote_node` derives
+/// it from the node's hive_index, and `apply_lsa_payload` rejects any LSA whose `hive` != the
+/// cert-bound peer_hive — so the bucket is authenticated). The role is the substring before the
+/// first `@` (role labels like `SY.admin`/`IO.cloud` never contain `@`); the self-asserted
+/// `@hive` suffix carried inside the LSA node name is discarded. A peer authenticated as hive
+/// `P` can therefore only assert an origin identity of the form `role@P` and cannot forge a
+/// specific-hive identity (e.g. `SY.admin@motherbee`) unless it genuinely is that hive.
+fn canonical_wan_src_name(name: &str, bucket_hive: &str) -> String {
+    let role = name.split_once('@').map(|(r, _)| r).unwrap_or(name).trim();
+    format!("{}@{}", role, bucket_hive)
 }
 
 struct RemoteNodeInfo {
@@ -6145,6 +6181,67 @@ mod tests {
             "SY.admin@motherbee",
             1
         ));
+    }
+
+    #[test]
+    fn canonical_wan_src_name_binds_role_to_bucket_hive() {
+        // suffix already matches the authenticated bucket -> unchanged
+        assert_eq!(
+            canonical_wan_src_name("SY.admin@motherbee", "motherbee"),
+            "SY.admin@motherbee"
+        );
+        // forged foreign suffix -> rewritten to the authenticated bucket
+        assert_eq!(
+            canonical_wan_src_name("SY.admin@motherbee", "attacker"),
+            "SY.admin@attacker"
+        );
+        // bare name (no suffix) -> gets the bucket appended
+        assert_eq!(
+            canonical_wan_src_name("SY.orchestrator", "worker1"),
+            "SY.orchestrator@worker1"
+        );
+        // only the FIRST '@' delimits the role (role labels never contain '@')
+        assert_eq!(
+            canonical_wan_src_name("IO.cloud@a@b", "worker1"),
+            "IO.cloud@worker1"
+        );
+    }
+
+    #[test]
+    fn edge01_wan_canonicalization_defeats_cross_hive_name_forgery() {
+        use system_policy::authority;
+        let receiving_hive = "ingress1";
+
+        // ATTACK: a hive authenticated as "attacker" advertises a node NAMED
+        // "SY.admin@motherbee" in its OWN LSA bucket. Pre-fix the WAN handler stamped the
+        // raw name and authority() authorized EDGE_OPEN_URL; post-fix the name is rebound to
+        // the authenticated bucket, so the forged motherbee attribution is destroyed.
+        let forged_admin = canonical_wan_src_name("SY.admin@motherbee", "attacker");
+        assert_eq!(forged_admin, "SY.admin@attacker");
+        assert!(
+            !authority("EDGE_OPEN_URL", Some(&forged_admin), receiving_hive),
+            "forged SY.admin@motherbee from an attacker bucket must be denied"
+        );
+
+        // Same forgery against the SY.orchestrator skeleton key: the hive label is forced to
+        // the true origin bucket (SY.orchestrator@<any> stays allowed by design, but it is now
+        // truthfully attributed to the attacker hive, not motherbee).
+        assert_eq!(
+            canonical_wan_src_name("SY.orchestrator@motherbee", "attacker"),
+            "SY.orchestrator@attacker"
+        );
+
+        // PRESERVATION: the legitimate admin->edge command (SY.admin resolved in the motherbee
+        // bucket over the direct motherbee<->ingress session) is unchanged and still allowed.
+        let legit_admin = canonical_wan_src_name("SY.admin@motherbee", "motherbee");
+        assert_eq!(legit_admin, "SY.admin@motherbee");
+        assert!(authority("EDGE_OPEN_URL", Some(&legit_admin), receiving_hive));
+
+        // PRESERVATION: a legitimate cross-hive orchestrator (resolved in its own bucket) is
+        // still authorized for a protected action.
+        let legit_orch = canonical_wan_src_name("SY.orchestrator@worker1", "worker1");
+        assert_eq!(legit_orch, "SY.orchestrator@worker1");
+        assert!(authority("SPAWN_NODE", Some(&legit_orch), receiving_hive));
     }
 
     #[test]
