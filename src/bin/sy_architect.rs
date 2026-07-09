@@ -6679,16 +6679,13 @@ fn protected_architect_system_action_response(action: &str) -> Option<&'static s
 }
 
 fn architect_origin_authorized(hive_id: &str, src_l2_name: Option<&str>) -> bool {
-    let Some(src) = src_l2_name.map(str::trim).filter(|v| !v.is_empty()) else {
-        return false;
-    };
-    let Some((node, hive)) = src.split_once('@') else {
-        return false;
-    };
-    if hive.is_empty() || hive != hive_id {
-        return false;
-    }
-    matches!(node, "SY.admin" | "SY.config-routes" | "SY.vault")
+    // Same-hive origin allowlist, via the shared system-policy seam (one source of truth
+    // for the parse + same-hive rule; this subsystem only supplies its allowlist).
+    json_router::router::system_policy::same_hive_role_allowed(
+        hive_id,
+        src_l2_name,
+        &["SY.admin", "SY.config-routes", "SY.vault"],
+    )
 }
 
 /// Build a `FORBIDDEN` system response payload for an unauthorized

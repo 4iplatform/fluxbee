@@ -48,6 +48,13 @@ pub const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
 
 const PRIMARY_HIVE_ID: &str = "motherbee";
 
+/// The single node authorized to COMMAND an edge (open/close/list URLs) and to receive its
+/// control responses: `SY.admin` on the primary hive. Canonical name — the router's
+/// edge-control reachability gates and the edge's own service-command check all reference
+/// THIS constant so the copies of the literal cannot drift. (`authority()`'s edge branch
+/// composes the same decision from role + PRIMARY_HIVE_ID.)
+pub const EDGE_CONTROL_AUTHORITY: &str = "SY.admin@motherbee";
+
 fn is_edge_service_action(action: &str) -> bool {
     matches!(
         action,
@@ -102,9 +109,66 @@ pub fn authority(action: &str, src_l2_name: Option<&str>, hive_id: &str) -> bool
     action == "NODE_STATUS_GET" && matches!(role, "SY.config-routes" | "SY.vault")
 }
 
+/// Shared "same-hive origin allowlist" primitive — the ONE place the per-subsystem origin
+/// gates (SY.admin, SY.architect, ...) express the common rule "the router-authoritative
+/// `src_l2_name` must parse to `<role>@<this-hive>` and `role` must be in the caller's
+/// allowlist". Each subsystem passes only its allowlist (data); the parse + same-hive check
+/// lives here so it can't drift across copies. Part of the system-policy seam: when the
+/// backing moves to a Rego-backed system region, these callers keep calling one contract.
+pub fn same_hive_role_allowed(
+    hive_id: &str,
+    src_l2_name: Option<&str>,
+    allowed_roles: &[&str],
+) -> bool {
+    let Some(src) = src_l2_name.map(str::trim).filter(|v| !v.is_empty()) else {
+        return false;
+    };
+    let Some((role, hive)) = src.split_once('@') else {
+        return false;
+    };
+    if hive.is_empty() || hive != hive_id {
+        return false;
+    }
+    allowed_roles.contains(&role)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_hive_role_allowed_requires_same_hive_and_allowlist() {
+        let allow = ["SY.architect", "SY.config-routes", "SY.vault"];
+        // in-allowlist + same hive -> allowed
+        assert!(same_hive_role_allowed(
+            "motherbee",
+            Some("SY.architect@motherbee"),
+            &allow
+        ));
+        // trims whitespace like the origin gates did
+        assert!(same_hive_role_allowed(
+            "motherbee",
+            Some("  SY.vault@motherbee  "),
+            &allow
+        ));
+        // wrong hive -> denied (same-hive scope)
+        assert!(!same_hive_role_allowed(
+            "motherbee",
+            Some("SY.architect@worker1"),
+            &allow
+        ));
+        // role not in allowlist -> denied
+        assert!(!same_hive_role_allowed(
+            "motherbee",
+            Some("IO.slack@motherbee"),
+            &allow
+        ));
+        // None / empty / no '@' / empty hive -> denied
+        assert!(!same_hive_role_allowed("motherbee", None, &allow));
+        assert!(!same_hive_role_allowed("motherbee", Some("   "), &allow));
+        assert!(!same_hive_role_allowed("motherbee", Some("SY.architect"), &allow));
+        assert!(!same_hive_role_allowed("motherbee", Some("SY.architect@"), &allow));
+    }
 
     #[test]
     fn authority_enforces_role_and_hive_scope() {

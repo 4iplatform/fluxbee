@@ -503,7 +503,7 @@ async fn apply_list_urls(
 
 fn authorize_edge_service_command(msg: &Message, action: &str) -> Result<(), String> {
     match msg.routing.src_l2_name.as_deref().map(str::trim) {
-        Some("SY.admin@motherbee") => Ok(()),
+        Some(src) if src == json_router::router::system_policy::EDGE_CONTROL_AUTHORITY => Ok(()),
         Some(src) if src.is_empty() => Err(format!("{action} requires router-stamped source")),
         Some(src) => Err(format!("{action} not authorized from {src}")),
         None => Err(format!("{action} requires router-stamped source")),

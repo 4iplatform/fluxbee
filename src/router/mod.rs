@@ -5246,25 +5246,18 @@ fn is_global_scope(meta: &Meta) -> bool {
     matches!(meta.scope.as_deref(), Some(SCOPE_GLOBAL))
 }
 
-fn vpn_allows(src_name: &str, src_vpn: u32, dst_vpn: u32) -> bool {
-    if is_system_node(src_name) && !is_edge_node(src_name) {
-        return true;
-    }
-    src_vpn == dst_vpn
-}
-
 fn edge_service_control_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> bool {
     if !is_edge_node(dst_name) || meta.msg_type != SYSTEM_KIND {
         return false;
     }
-    if src_name != "SY.admin@motherbee" {
+    if src_name != system_policy::EDGE_CONTROL_AUTHORITY {
         return false;
     }
     matches!(meta.msg.as_deref(), Some(action) if action == MSG_EDGE_OPEN_URL || action == MSG_EDGE_CLOSE_URL || action == MSG_EDGE_LIST_URLS)
 }
 
 fn edge_service_control_response_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> bool {
-    if !is_edge_node(src_name) || dst_name != "SY.admin@motherbee" || meta.msg_type != SYSTEM_KIND {
+    if !is_edge_node(src_name) || dst_name != system_policy::EDGE_CONTROL_AUTHORITY || meta.msg_type != SYSTEM_KIND {
         return false;
     }
     matches!(meta.msg.as_deref(), Some(action) if action == MSG_EDGE_OPEN_URL_RESPONSE || action == MSG_EDGE_CLOSE_URL_RESPONSE || action == MSG_EDGE_LIST_URLS_RESPONSE)
@@ -5327,10 +5320,6 @@ fn vpn_allows_between(
         return true;
     }
     src_vpn == dst_vpn
-}
-
-fn can_route(src: &NodeHandle, dst: &NodeHandle) -> bool {
-    vpn_allows(&src.name, src.vpn_id, dst.vpn_id)
 }
 
 fn pattern_match(pattern: &str, name: &str) -> bool {
