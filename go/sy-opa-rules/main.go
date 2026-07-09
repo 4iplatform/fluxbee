@@ -178,6 +178,27 @@ type RouterStatus struct {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
+	// Standalone compile mode (OPA-dual): compile a .rego file to a .wasm artifact with the
+	// SAME OPA Go compiler the node uses at runtime — used to BAKE the SYSTEM policy at
+	// build/dev time (the non-user path). Usage:
+	//   sy-opa-rules compile-file <rego-path> <entrypoint> <out-wasm-path>
+	if len(os.Args) >= 5 && os.Args[1] == "compile-file" {
+		regoPath, entrypoint, outPath := os.Args[2], os.Args[3], os.Args[4]
+		rego, err := os.ReadFile(regoPath)
+		if err != nil {
+			log.Fatalf("compile-file: read %s: %v", regoPath, err)
+		}
+		wasm, hash, ms, err := compileRego(string(rego), entrypoint)
+		if err != nil {
+			log.Fatalf("compile-file: compile %s: %v", regoPath, err)
+		}
+		if err := os.WriteFile(outPath, wasm, 0o644); err != nil {
+			log.Fatalf("compile-file: write %s: %v", outPath, err)
+		}
+		fmt.Printf("compiled %s -> %s (%d bytes, %s, %dms)\n", regoPath, outPath, len(wasm), hash, ms)
+		return
+	}
+
 	hiveID, err := loadHiveID()
 	if err != nil {
 		log.Fatalf("failed to load hive.yaml: %v", err)

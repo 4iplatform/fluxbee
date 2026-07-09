@@ -171,11 +171,14 @@ impl OpaResolver {
         (self.policy_version, self.opa_load_status)
     }
 
-    fn eval_target(
+    /// Run the loaded policy for `input` and return the raw result JSON + its dump source.
+    /// Shared by the USER routing path (`eval_target`) and the SYSTEM authority path
+    /// (`evaluate_allow`) — same eval loop, different result parse.
+    fn eval_to_json(
         &mut self,
         input: &Value,
         dynamic_data: Option<&Value>,
-    ) -> Result<Option<String>, OpaError> {
+    ) -> Result<(String, OpaDumpSource), OpaError> {
         let wasm = self.wasm.as_mut().ok_or(OpaError::NotLoaded)?;
         wasm.store.data_mut().last_error = None;
 
@@ -222,7 +225,15 @@ impl OpaResolver {
         }
 
         let result_ptr = wasm.opa_eval_ctx_get_result.call(&mut wasm.store, ctx)?;
-        let (json, dump_source) = wasm.dump_value(result_ptr)?;
+        wasm.dump_value(result_ptr)
+    }
+
+    fn eval_target(
+        &mut self,
+        input: &Value,
+        dynamic_data: Option<&Value>,
+    ) -> Result<Option<String>, OpaError> {
+        let (json, dump_source) = self.eval_to_json(input, dynamic_data)?;
         let target = parse_target_from_result(&json, dump_source);
         if let Err(err) = &target {
             tracing::warn!(
@@ -232,6 +243,22 @@ impl OpaResolver {
             );
         }
         target
+    }
+
+    /// OPA-dual SYSTEM layer: evaluate the loaded policy's boolean `allow` entrypoint for a
+    /// pre-built input (`{action, src_l2_name, hive_id}`). Mirrors `eval_target` but parses a
+    /// boolean instead of a routing target. Fail-closed: a policy that does not set `allow`
+    /// (or an unexpected result shape) yields `false`.
+    pub fn evaluate_allow(
+        &mut self,
+        input: &Value,
+        dynamic_data: Option<&Value>,
+    ) -> Result<bool, OpaError> {
+        if !self.policy_loaded {
+            return Err(OpaError::NotLoaded);
+        }
+        let (json, dump_source) = self.eval_to_json(input, dynamic_data)?;
+        parse_bool_from_result(&json, dump_source)
     }
 }
 
@@ -631,6 +658,37 @@ fn extract_target(value: &Value) -> Option<String> {
             }
             if let Some(target) = map.get("target") {
                 return extract_target(target);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// SYSTEM authority parse: extract the boolean `allow` decision from an OPA eval result.
+/// Fail-closed — a missing/unexpected shape yields `false` (deny). Mirrors
+/// `parse_target_from_result` but for the boolean entrypoint.
+fn parse_bool_from_result(json: &str, dump_source: OpaDumpSource) -> Result<bool, OpaError> {
+    let value: Value = serde_json::from_str(json).map_err(|err| OpaError::ResultParse {
+        dump_source: dump_source.as_export_name(),
+        detail: err.to_string(),
+    })?;
+    Ok(extract_allow(&value).unwrap_or(false))
+}
+
+/// Walk the OPA result set for a boolean, descending `result`/`expressions`/`value`/`allow`
+/// (the same nesting `extract_target` handles) and returning the first boolean found.
+fn extract_allow(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(b) => Some(*b),
+        Value::Array(items) => items.iter().find_map(extract_allow),
+        Value::Object(map) => {
+            for key in ["result", "expressions", "value", "allow"] {
+                if let Some(inner) = map.get(key) {
+                    if let Some(b) = extract_allow(inner) {
+                        return Some(b);
+                    }
+                }
             }
             None
         }
@@ -1327,6 +1385,69 @@ fn json_to_opa_value(
 mod tests {
     use super::{build_opa_input, merge_opa_data, parse_target_from_result, OpaDumpSource, OpaError};
     use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
+
+    #[test]
+    fn system_opa_allow_matches_rust_authority_shadow() {
+        // Shadow-verify: the compiled SYSTEM policy (policy/system.wasm ← policy/system.rego)
+        // must produce the SAME allow/deny as the Rust system_policy::authority() table across a
+        // matrix of protected actions × origin names × hives. This byte-identity proof is what
+        // gates swapping authority()'s backing to OPA.
+        use super::OpaResolver;
+        use crate::router::system_policy::authority;
+
+        const WASM: &[u8] = include_bytes!("../policy/system.wasm");
+        let mut resolver = OpaResolver::new();
+        resolver
+            .reload(1, Some("fluxbee/system/allow".to_string()), WASM, None)
+            .expect("load system.wasm");
+
+        let actions = [
+            "EDGE_OPEN_URL",
+            "EDGE_CLOSE_URL",
+            "EDGE_LIST_URLS",
+            "SPAWN_NODE",
+            "KILL_NODE",
+            "NODE_STATUS_GET",
+            "NODE_CONFIG_SET",
+            "ADD_HIVE_FINALIZE",
+            "SYSTEM_UPDATE",
+        ];
+        let names: [Option<&str>; 14] = [
+            Some("SY.admin@motherbee"),
+            Some("SY.admin@worker1"),
+            Some("SY.admin@edge-1"),
+            Some("SY.orchestrator@motherbee"),
+            Some("SY.orchestrator@worker1"),
+            Some("SY.orchestrator@"),
+            Some("SY.wf-rules@motherbee"),
+            Some("WF.orch.diag@motherbee"),
+            Some("SY.config-routes@motherbee"),
+            Some("SY.vault@motherbee"),
+            Some("IO.cloud@motherbee"),
+            Some("  SY.admin@motherbee  "),
+            Some(""),
+            None,
+        ];
+        let hives = ["motherbee", "ingress1"];
+
+        for action in actions {
+            for name in names {
+                for hive in hives {
+                    let rust = authority(action, name, hive);
+                    let input = serde_json::json!({
+                        "action": action,
+                        "src_l2_name": name,
+                        "hive_id": hive,
+                    });
+                    let opa = resolver.evaluate_allow(&input, None).expect("eval allow");
+                    assert_eq!(
+                        opa, rust,
+                        "OPA/authority mismatch: action={action} name={name:?} hive={hive} (opa={opa} rust={rust})"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn build_opa_input_golden_shape_is_additive() {
