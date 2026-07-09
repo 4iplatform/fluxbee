@@ -2862,26 +2862,20 @@ impl IdentityRuntime {
         let Some(prefixes) = self.allowed_prefixes.get(action) else {
             return false;
         };
-        // Same-hive-only roles: a privileged SY control-plane identity from
-        // ANOTHER hive must not administer THIS hive's identity authority (F-07 —
-        // mirrors the router's system_policy::authority same-hive rule for these
-        // roles). IO.* (worker IO provisioning against the sole motherbee
-        // authority) and SY.orchestrator@ (cross-hive control plane) are
-        // legitimately cross-hive and keep the plain prefix grant.
+        // Same-hive-only roles: a privileged SY control-plane identity from ANOTHER hive must
+        // not administer THIS hive's identity authority (F-07). The same-hive scoping LOGIC now
+        // lives in system_policy::prefix_allowed_same_hive_scoped — shared with the router's
+        // authority() rule so the two can't drift; only the per-message allowlist DATA stays
+        // here. IO.* (worker IO provisioning against the sole motherbee authority) and
+        // SY.orchestrator@ (cross-hive control plane) are legitimately cross-hive.
         const SAME_HIVE_ONLY_PREFIXES: [&str; 3] =
             ["SY.admin@", "SY.architect@", "SY.frontdesk.gov@"];
-        prefixes.iter().any(|prefix| {
-            if !name.starts_with(prefix) {
-                return false;
-            }
-            if SAME_HIVE_ONLY_PREFIXES.contains(prefix) {
-                // The `@<hive>` suffix must equal our own hive. Fail-closed on a
-                // missing/malformed suffix.
-                name.rsplit_once('@').map(|(_, h)| h) == Some(self.hive_id.as_str())
-            } else {
-                true
-            }
-        })
+        json_router::router::system_policy::prefix_allowed_same_hive_scoped(
+            name,
+            &self.hive_id,
+            prefixes,
+            &SAME_HIVE_ONLY_PREFIXES,
+        )
     }
 }
 

@@ -132,9 +132,80 @@ pub fn same_hive_role_allowed(
     allowed_roles.contains(&role)
 }
 
+/// Prefix-based origin allowlist with a same-hive constraint on privileged prefixes — the
+/// identity-style authority shape, shared so its same-hive scoping can't drift from the
+/// router's `authority()` rule (F-07). `name` is allowed iff it starts with one of
+/// `allowed_prefixes` AND — if that matched prefix is in `same_hive_only` — the `@<hive>`
+/// suffix equals `hive_id` (fail-closed on a missing/malformed suffix). Prefixes NOT in
+/// `same_hive_only` (e.g. `IO.`, `SY.orchestrator@`) are legitimately cross-hive. The
+/// per-message allowlist DATA stays with the caller; only this scoping LOGIC is centralized.
+pub fn prefix_allowed_same_hive_scoped(
+    name: &str,
+    hive_id: &str,
+    allowed_prefixes: &[&str],
+    same_hive_only: &[&str],
+) -> bool {
+    allowed_prefixes.iter().any(|prefix| {
+        if !name.starts_with(prefix) {
+            return false;
+        }
+        if same_hive_only.contains(prefix) {
+            name.rsplit_once('@').map(|(_, h)| h) == Some(hive_id)
+        } else {
+            true
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_allowed_same_hive_scoped_enforces_scope() {
+        let prefixes = ["IO.", "SY.admin@", "SY.orchestrator@"];
+        let same_hive_only = ["SY.admin@"];
+        // cross-hive prefix (IO.) allowed from any hive
+        assert!(prefix_allowed_same_hive_scoped(
+            "IO.wapp@worker1",
+            "motherbee",
+            &prefixes,
+            &same_hive_only
+        ));
+        // cross-hive orchestrator allowed from another hive
+        assert!(prefix_allowed_same_hive_scoped(
+            "SY.orchestrator@worker1",
+            "motherbee",
+            &prefixes,
+            &same_hive_only
+        ));
+        // same-hive-only prefix: allowed on own hive, denied cross-hive
+        assert!(prefix_allowed_same_hive_scoped(
+            "SY.admin@motherbee",
+            "motherbee",
+            &prefixes,
+            &same_hive_only
+        ));
+        assert!(!prefix_allowed_same_hive_scoped(
+            "SY.admin@worker1",
+            "motherbee",
+            &prefixes,
+            &same_hive_only
+        ));
+        // no prefix match -> denied; malformed same-hive suffix -> fail-closed
+        assert!(!prefix_allowed_same_hive_scoped(
+            "WF.invoice@motherbee",
+            "motherbee",
+            &prefixes,
+            &same_hive_only
+        ));
+        assert!(!prefix_allowed_same_hive_scoped(
+            "SY.admin",
+            "motherbee",
+            &prefixes,
+            &same_hive_only
+        ));
+    }
 
     #[test]
     fn same_hive_role_allowed_requires_same_hive_and_allowlist() {
