@@ -5276,7 +5276,19 @@ fn is_edge_service_control_message(meta: &Meta, dst_name: &str) -> bool {
         && matches!(meta.msg.as_deref(), Some(action) if action == MSG_EDGE_OPEN_URL || action == MSG_EDGE_CLOSE_URL || action == MSG_EDGE_LIST_URLS)
 }
 
-fn edge_data_path_allowed(src_name: &str, dst_name: &str) -> bool {
+fn edge_data_path_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> bool {
+    // EDGE-05: the edge<->IO data path carries ONLY the channel's inbound_family
+    // (validate_endpoint_row_for_open rejects family=="system", and IO handlers reply in that
+    // same non-system family). The edge's only legitimate SYSTEM traffic is with SY.admin
+    // (control acks) and SY.vault (cert/secret) — both non-IO, gated by the sibling OR terms;
+    // the router's own UNREACHABLE/TTL frames are RT.*-originated (not is_io_node). So a SYSTEM
+    // frame on an edge<->IO pair is never legitimate: reject it. This bounds a compromised edge
+    // (can't originate SYSTEM verbs at IO nodes) and a rogue IO (can't land a SYSTEM frame on
+    // the edge, closing the RouteMatch::Any reply-shadowing risk). Owner-scoping (only
+    // externalized IO owners) is Phase 2, deferred — see the EDGE-05 audit note.
+    if meta.msg_type == SYSTEM_KIND {
+        return false;
+    }
     (is_edge_node(src_name) && is_io_node(dst_name))
         || (is_io_node(src_name) && is_edge_node(dst_name))
 }
@@ -5305,7 +5317,7 @@ fn vpn_allows_between(
         }
         return edge_service_control_allowed(meta, src_name, dst_name)
             || edge_service_control_response_allowed(meta, src_name, dst_name)
-            || edge_data_path_allowed(src_name, dst_name)
+            || edge_data_path_allowed(meta, src_name, dst_name)
             || edge_vault_read_allowed(meta, src_name, dst_name);
     }
     if meta.msg_type == SYSTEM_KIND && is_global_scope(meta) {
@@ -6082,6 +6094,65 @@ mod tests {
             2,
             "SY.edge@ingress1",
             1
+        ));
+    }
+
+    #[test]
+    fn edge_data_path_rejects_system_msg_type() {
+        // EDGE-05: the edge<->IO data path is DATA-family only. A SYSTEM frame on an edge<->IO
+        // pair is never legitimate (the edge forwards under the channel's inbound_family, which
+        // validate_endpoint_row_for_open proves != "system"; IO handlers reply in that same
+        // family). Reject both directions, for an arbitrary/unprotected SYSTEM verb AND a
+        // protected one that is NOT an edge-service action (so it reaches the data-path term).
+        let sys_bare = Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            ..Meta::default()
+        };
+        let sys_protected = Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some("SPAWN_NODE".to_string()),
+            ..Meta::default()
+        };
+        for m in [&sys_bare, &sys_protected] {
+            // compromised edge -> IO node: cannot originate SYSTEM at an IO node
+            assert!(!vpn_allows_between(m, "SY.edge@ingress1", 1, "IO.cloud@motherbee", 2));
+            // rogue IO node -> edge: cannot land a SYSTEM frame on the edge (reply-shadowing)
+            assert!(!vpn_allows_between(m, "IO.cloud@motherbee", 2, "SY.edge@ingress1", 1));
+        }
+
+        // Preservation: the legitimate data-family forward + reply stay allowed.
+        let user = Meta {
+            msg_type: "user".to_string(),
+            ..Meta::default()
+        };
+        assert!(vpn_allows_between(&user, "SY.edge@ingress1", 1, "IO.cloud@motherbee", 2));
+        assert!(vpn_allows_between(&user, "IO.cloud@motherbee", 2, "SY.edge@ingress1", 1));
+
+        // Regression: the edge's SYSTEM traffic with SY.vault and SY.admin (non-IO peers) rides
+        // the sibling OR terms and is NOT touched by the edge<->IO SYSTEM guard.
+        let vault_get = Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(MSG_VAULT_GET.to_string()),
+            ..Meta::default()
+        };
+        assert!(vpn_allows_between(
+            &vault_get,
+            "SY.edge@ingress1",
+            1,
+            "SY.vault@motherbee",
+            1
+        ));
+        let open = Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(MSG_EDGE_OPEN_URL.to_string()),
+            ..Meta::default()
+        };
+        assert!(vpn_allows_between(
+            &open,
+            "SY.admin@motherbee",
+            1,
+            "SY.edge@ingress1",
+            2
         ));
     }
 
