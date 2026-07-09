@@ -5,18 +5,23 @@
 //! `SY.opa.rules` node, loaded by the router's `OpaResolver` (see `crate::opa`).
 //! It selects routing targets and (in future) may *narrow* authority.
 //!
-//! This SYSTEM layer is the authoritative half: the `SY.` origin-authority rules.
-//! It is intentionally a fixed Rust table — structurally unreachable from the
-//! `/opa/policy*` authoring endpoints (those only reach the user OPA blob), so it
-//! is non-user-editable by construction, with no SHM region, file, or RPC to
-//! tamper with. The operator accepts these `SY.` rules as hardcoded for now.
+//! This SYSTEM layer is the authoritative half: the `SY.` origin-authority rules. They live as
+//! Rego in `policy/system.rego`, compiled to the baked `policy/system.wasm` (build-time, with
+//! the SAME OPA compiler the user path uses — the `sy-opa-rules compile-file` mode — so it is
+//! non-user-editable and structurally unreachable from the `/opa/policy*` authoring endpoints).
+//! `authorize_system()` evaluates that policy at the delivery gate; `authority()` — the
+//! byte-identical Rust table, SHADOW-VERIFIED against the Rego in tests — is the load-failure
+//! FALLBACK and the sync spec. A future runtime-editable backing (a second SHM region +
+//! privileged writer, "OPA-dual Phase 4") only changes how the resolver is FED — not the call
+//! sites nor `authorize_system()`'s contract.
 //!
-//! `authority()` is a STABLE SEAM: a future protected, Rego-backed system layer
-//! (a second OPA module/region) can replace the backing without changing the
-//! router's call sites or the composition order. Composition contract:
-//! `final_allow = system_allow AND user_allow`, and a SYSTEM deny is FINAL — the
-//! user layer may only narrow, never broaden, and can never sever the cross-hive
+//! Composition contract: `final_allow = system_allow AND user_allow`, and a SYSTEM deny is
+//! FINAL — the user layer may only narrow, never broaden, and can never sever the cross-hive
 //! control plane (`SY.orchestrator@<any-hive>`).
+
+use std::sync::{Mutex, OnceLock};
+
+use crate::opa::OpaResolver;
 
 /// Protected SYSTEM actions (matched on `meta.msg`) that a node may only act on
 /// when the router-resolved origin is authorized. Single source of truth — moved
@@ -109,6 +114,46 @@ pub fn authority(action: &str, src_l2_name: Option<&str>, hive_id: &str) -> bool
     action == "NODE_STATUS_GET" && matches!(role, "SY.config-routes" | "SY.vault")
 }
 
+/// The BAKED system policy resolver: `policy/system.wasm` (compiled from `policy/system.rego`).
+/// Hive-agnostic — `hive_id` is an INPUT, not baked — so ONE resolver serves every hive. Lazily
+/// loaded once; on load failure it stays unloaded and `authorize_system` falls back to the
+/// byte-identical Rust `authority()` table (fail-safe).
+static SYSTEM_POLICY_OPA: OnceLock<Mutex<OpaResolver>> = OnceLock::new();
+
+fn system_policy_opa() -> &'static Mutex<OpaResolver> {
+    SYSTEM_POLICY_OPA.get_or_init(|| {
+        const WASM: &[u8] = include_bytes!("../../policy/system.wasm");
+        let mut resolver = OpaResolver::new();
+        if let Err(err) = resolver.reload(1, Some("fluxbee/system/allow".to_string()), WASM, None)
+        {
+            tracing::warn!(error = %err, "system-policy OPA failed to load; using the Rust authority() fallback");
+        }
+        Mutex::new(resolver)
+    })
+}
+
+/// SYSTEM authority decision, OPA-BACKED — this is what the router's delivery gate calls.
+/// Evaluates the baked Rego policy (entrypoint `fluxbee/system/allow`) with input
+/// `{action, src_l2_name, hive_id}`, and FALLS BACK to the byte-identical Rust `authority()` if
+/// the policy is not loaded or errs (so a wasm load failure never opens or closes the gate
+/// wrongly). The Rego and the fallback are kept in lock-step by the shadow-verify test.
+///
+/// NOTE: locks a Mutex + runs a wasm eval per protected-action delivery — control-plane path
+/// only (protected SYSTEM actions), and the policy is a tiny fixed program.
+pub fn authorize_system(action: &str, src_l2_name: Option<&str>, hive_id: &str) -> bool {
+    if let Ok(mut resolver) = system_policy_opa().lock() {
+        let input = serde_json::json!({
+            "action": action,
+            "src_l2_name": src_l2_name,
+            "hive_id": hive_id,
+        });
+        if let Ok(allow) = resolver.evaluate_allow(&input, None) {
+            return allow;
+        }
+    }
+    authority(action, src_l2_name, hive_id)
+}
+
 /// Shared "same-hive origin allowlist" primitive — the ONE place the per-subsystem origin
 /// gates (SY.admin, SY.architect, ...) express the common rule "the router-authoritative
 /// `src_l2_name` must parse to `<role>@<this-hive>` and `role` must be in the caller's
@@ -160,6 +205,50 @@ pub fn prefix_allowed_same_hive_scoped(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorize_system_matches_authority_via_baked_wasm() {
+        // The production gate entry (authorize_system, OPA-backed by the lazily-loaded baked
+        // system.wasm) must agree with the Rust authority() fallback across the matrix — proving
+        // the wired-in Rego policy is byte-identical and the gate's behavior is unchanged.
+        let actions = [
+            "EDGE_OPEN_URL",
+            "EDGE_CLOSE_URL",
+            "EDGE_LIST_URLS",
+            "SPAWN_NODE",
+            "KILL_NODE",
+            "NODE_STATUS_GET",
+            "NODE_CONFIG_SET",
+            "ADD_HIVE_FINALIZE",
+            "SYSTEM_UPDATE",
+        ];
+        let names: [Option<&str>; 13] = [
+            Some("SY.admin@motherbee"),
+            Some("SY.admin@worker1"),
+            Some("SY.admin@edge-1"),
+            Some("SY.orchestrator@motherbee"),
+            Some("SY.orchestrator@worker1"),
+            Some("SY.orchestrator@"),
+            Some("SY.wf-rules@motherbee"),
+            Some("WF.orch.diag@motherbee"),
+            Some("SY.config-routes@motherbee"),
+            Some("SY.vault@motherbee"),
+            Some("IO.cloud@motherbee"),
+            Some(""),
+            None,
+        ];
+        for action in actions {
+            for name in names {
+                for hive in ["motherbee", "ingress1"] {
+                    assert_eq!(
+                        authorize_system(action, name, hive),
+                        authority(action, name, hive),
+                        "authorize_system != authority for action={action} name={name:?} hive={hive}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn prefix_allowed_same_hive_scoped_enforces_scope() {

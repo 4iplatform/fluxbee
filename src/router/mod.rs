@@ -5737,12 +5737,14 @@ async fn serialize_for_local_delivery(
     msg: &Message,
 ) -> Result<Option<Vec<u8>>, RouterError> {
     if msg.meta.msg_type == SYSTEM_KIND {
-        // OPA-dual SYSTEM (authority) layer: a fixed, non-user-editable Rust
-        // policy. System DENY is final. (The user/OPA layer handles routing and,
-        // in future, may only narrow this — never broaden it.)
+        // OPA-dual SYSTEM (authority) layer: the baked, non-user-editable Rego policy
+        // (policy/system.rego -> system.wasm), evaluated via authorize_system() with the Rust
+        // authority() table as the byte-identical load-failure fallback. System DENY is final.
+        // (The user/OPA layer handles routing and, in future, may only narrow this — never
+        // broaden it.)
         let action = msg.meta.msg.as_deref().unwrap_or_default();
         if system_policy::is_protected_system_action(action)
-            && !system_policy::authority(action, msg.routing.src_l2_name.as_deref(), hive_id)
+            && !system_policy::authorize_system(action, msg.routing.src_l2_name.as_deref(), hive_id)
         {
             tracing::warn!(
                 action = action,
