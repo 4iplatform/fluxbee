@@ -3879,6 +3879,12 @@ async fn dispatch_internal_admin_command(
     // self-service actions like `externalize` (v6 §11.1). Do NOT trust anything in `params` for authz.
     caller_l2_name: Option<&str>,
 ) -> Result<InternalAdminDispatchResult, AdminError> {
+    // EDGE-06 (scoped to the Fluxbee Cloud relay): the provisioning actions IO.cloud relays are
+    // exposed behind an internet token via io.cloud, so over the MESH they may only originate from
+    // IO.cloud. The operator HTTP path + the internal executor are caller==None and stay trusted.
+    if let Err(detail) = authorize_cloud_relay(caller_l2_name, action) {
+        return Ok(internal_unauthorized(action, &detail));
+    }
     match action {
         "executor_validate_plan" => {
             let plan = match parse_executor_plan(params) {
@@ -4256,6 +4262,28 @@ fn authorize_channel_command(
         ));
     }
     Ok(())
+}
+
+/// Relay gate for the Fluxbee Cloud provisioning actions (`IO_CLOUD_EXPOSED_ACTIONS`). These are
+/// reachable from the internet (Cloud -> edge -> IO.cloud -> here), so over the MESH they may ONLY
+/// originate from IO.cloud — the internal relay. `caller==None` is a trusted internal path (the
+/// operator HTTP server / the executor) and is allowed. Non-exposed actions are untouched. This
+/// closes the EDGE-06 confused-deputy for the relay: the SAME `IO_CLOUD_EXPOSED_ACTIONS` the
+/// `list_cloud_actions` capability query advertises is what this gate enforces (advertised ==
+/// permitted). `caller` is the router-stamped, un-forgeable src_l2_name — never trusted from params.
+fn authorize_cloud_relay(caller_l2_name: Option<&str>, action: &str) -> Result<(), String> {
+    if !IO_CLOUD_EXPOSED_ACTIONS.contains(&action) {
+        return Ok(());
+    }
+    let Some(caller) = caller_l2_name else {
+        return Ok(());
+    };
+    if caller.starts_with("IO.cloud@") {
+        return Ok(());
+    }
+    Err(format!(
+        "only IO.cloud may relay '{action}' over the mesh (Fluxbee Cloud provisioning gate); caller={caller}"
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -12771,6 +12799,23 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::broadcast;
     use zip::write::FileOptions;
+
+    #[test]
+    fn cloud_relay_gate_allows_only_iocloud_over_mesh() {
+        // A non-exposed action is untouched regardless of caller.
+        assert!(authorize_cloud_relay(Some("AI.worker@motherbee"), "list_nodes").is_ok());
+        for action in IO_CLOUD_EXPOSED_ACTIONS {
+            // Trusted internal path (caller==None: HTTP operator / executor) — allowed.
+            assert!(authorize_cloud_relay(None, action).is_ok());
+            // Over the mesh, ONLY IO.cloud may relay it (any hive).
+            assert!(authorize_cloud_relay(Some("IO.cloud@motherbee"), action).is_ok());
+            assert!(authorize_cloud_relay(Some("IO.cloud@worker1"), action).is_ok());
+            // Any other mesh caller is denied — this is the EDGE-06 close for the relay.
+            assert!(authorize_cloud_relay(Some("IO.slack@motherbee"), action).is_err());
+            assert!(authorize_cloud_relay(Some("AI.worker@motherbee"), action).is_err());
+            assert!(authorize_cloud_relay(Some("SY.orchestrator@motherbee"), action).is_err());
+        }
+    }
 
     #[test]
     fn cloud_actions_catalog_is_the_exposed_registry_subset() {
