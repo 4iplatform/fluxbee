@@ -138,7 +138,7 @@ async fn main() -> Result<(), DynError> {
         }
         tokio::spawn(publish_channel_on_edge_with_retry(
             dispatcher.clone(),
-            admin_target,
+            admin_target.clone(),
             edge_node,
             params,
         ));
@@ -149,7 +149,7 @@ async fn main() -> Result<(), DynError> {
     }
 
     let mut incoming = dispatcher.take_command_receiver(RPC_CH_INCOMING).await?;
-    run_loop(&sender, &full_name, &mut incoming).await
+    run_loop(&sender, &full_name, &dispatcher, &admin_target, &mut incoming).await
 }
 
 /// Keep IO.cloud running while the ingress hive is still converging. A boot race where
@@ -368,6 +368,8 @@ async fn ensure_own_channel(
 async fn run_loop(
     sender: &NodeSender,
     full_name: &str,
+    dispatcher: &Arc<RouterDispatcher>,
+    admin_target: &str,
     incoming: &mut RpcCommandReceiver,
 ) -> Result<(), DynError> {
     loop {
@@ -381,17 +383,29 @@ async fn run_loop(
             continue;
         }
 
-        // A request the edge forwarded under our channel. `meta.ich` is which channel
-        // it is for (the discriminator, spec §4/§7.5); alpha echoes, a real IO.cloud
-        // dispatches by ich to the matching Fluxbee Cloud tenant.
+        // A request the edge forwarded under our channel. `meta.ich` = which channel (§4/§7.5).
+        // IO.cloud is the internal Fluxbee Cloud relay (spec §3): the body is `{op, tenant_id,
+        // params}` and we translate it into the matching ADMIN_COMMAND(s), returning the result.
         let ich = msg.meta.ich.clone().unwrap_or_default();
+        let op = msg
+            .payload
+            .get("op")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         tracing::info!(
             trace_id = %msg.routing.trace_id,
             ich = %ich,
-            family = %msg.meta.msg_type,
+            op = %op,
             routed_from = %msg.routing.src,
-            "IO.cloud received a channel request"
+            "IO.cloud received a Cloud request"
         );
+
+        let mut response = dispatch_cloud_op(dispatcher, admin_target, &msg.payload).await;
+        if let Some(obj) = response.as_object_mut() {
+            obj.insert("handled_by".to_string(), json!(full_name));
+            obj.insert("ich".to_string(), json!(ich));
+        }
 
         let reply = Message {
             routing: Routing {
@@ -402,19 +416,150 @@ async fn run_loop(
                 trace_id: msg.routing.trace_id.clone(),
             },
             meta: Meta {
-                // reply in the same family, echo the channel back
+                // reply in the same family, carry the channel back
                 msg_type: msg.meta.msg_type.clone(),
                 ich: msg.meta.ich.clone(),
                 ..Meta::default()
             },
-            payload: json!({
-                "status": "ok",
-                "handled_by": full_name,
-                "ich": ich,
-                "echo": msg.payload,
-            }),
+            payload: response,
         };
         sender.send(reply).await?;
+    }
+}
+
+/// Error response payload for a rejected/malformed Cloud request.
+fn cloud_error(detail: &str) -> serde_json::Value {
+    json!({ "status": "error", "error_detail": detail })
+}
+
+/// Pure translation of a Cloud op into the admin `(action, params)`, injecting the tenant claim.
+/// Returns `Err(error_payload)` for a missing/unknown op or a missing tenant. Kept pure (no admin
+/// call) so it is unit-testable; the ops mirror IO_CLOUD_EXPOSED_ACTIONS (admin's single source).
+fn translate_cloud_op(
+    op: &str,
+    tenant_id: Option<&str>,
+    params: &serde_json::Value,
+) -> Result<(&'static str, serde_json::Value), serde_json::Value> {
+    match op {
+        "put_token" => {
+            let tenant_id = tenant_id.ok_or_else(|| cloud_error("put_token requires tenant_id"))?;
+            Ok((
+                "vault_put",
+                json!({
+                    "key": params.get("key"),
+                    "value": params.get("value"),
+                    "metadata": {
+                        "resource_type": params.get("resource_type"),
+                        "owner_node": params.get("owner_node"),
+                        "tenant_id": tenant_id,
+                    },
+                }),
+            ))
+        }
+        "provision_node" => {
+            let tenant_id =
+                tenant_id.ok_or_else(|| cloud_error("provision_node requires tenant_id"))?;
+            let mut p = json!({
+                "node_name": params.get("node_name"),
+                "tenant_id": tenant_id,
+            });
+            if let Some(rt) = params.get("runtime") {
+                p["runtime"] = rt.clone();
+            }
+            Ok(("run_node", p))
+        }
+        "" => Err(cloud_error("missing 'op'")),
+        other => Err(cloud_error(&format!("unknown op '{other}'"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translate_put_token_injects_tenant_and_builds_vault_put() {
+        let params = json!({
+            "key": "wapp_token:acme",
+            "value": {"token": "abc"},
+            "resource_type": "bearer_token",
+            "owner_node": "IO.wapp@motherbee"
+        });
+        let (action, p) = translate_cloud_op("put_token", Some("tnt:acme"), &params).unwrap();
+        assert_eq!(action, "vault_put");
+        assert_eq!(p["key"], "wapp_token:acme");
+        assert_eq!(p["value"]["token"], "abc");
+        assert_eq!(p["metadata"]["resource_type"], "bearer_token");
+        assert_eq!(p["metadata"]["owner_node"], "IO.wapp@motherbee");
+        assert_eq!(p["metadata"]["tenant_id"], "tnt:acme"); // injected from the claim
+    }
+
+    #[test]
+    fn translate_provision_node_requires_tenant_and_passes_runtime() {
+        let params = json!({"node_name": "IO.wapp@motherbee", "runtime": "io.generic"});
+        let (action, p) = translate_cloud_op("provision_node", Some("tnt:acme"), &params).unwrap();
+        assert_eq!(action, "run_node");
+        assert_eq!(p["node_name"], "IO.wapp@motherbee");
+        assert_eq!(p["tenant_id"], "tnt:acme");
+        assert_eq!(p["runtime"], "io.generic");
+    }
+
+    #[test]
+    fn translate_rejects_missing_tenant_unknown_and_empty_op() {
+        assert!(translate_cloud_op("put_token", None, &json!({})).is_err());
+        assert!(translate_cloud_op("provision_node", None, &json!({})).is_err());
+        assert!(translate_cloud_op("", Some("tnt:x"), &json!({})).is_err());
+        let err = translate_cloud_op("frobnicate", Some("tnt:x"), &json!({})).unwrap_err();
+        assert_eq!(err["status"], "error");
+    }
+}
+
+/// Translate a Cloud request (`{op, tenant_id, params}`) into the matching ADMIN_COMMAND and
+/// return the response payload. IO.cloud is the internal Fluxbee Cloud relay (spec §3): it injects
+/// the (trusted for the MVP — §1.2) tenant claim into each admin call and relays over the same
+/// `send_admin_rpc` seam it already uses for externalize. The ops mirror IO_CLOUD_EXPOSED_ACTIONS
+/// (SY.admin's single source):
+///   put_token       -> vault_put   (store a provider token owned by the target IO node)
+///   provision_node  -> run_node    (spawn IO.<provider>@<tenant>; requires tenant_id)
+/// For an owner-scoped token the caller must provision_node BEFORE put_token (Caveat B: the
+/// `owner_node -> ilk` resolution needs the target node registered in identity SHM first).
+async fn dispatch_cloud_op(
+    dispatcher: &Arc<RouterDispatcher>,
+    admin_target: &str,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    let op = request.get("op").and_then(|v| v.as_str()).unwrap_or("");
+    let tenant_id = request.get("tenant_id").and_then(|v| v.as_str());
+    let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+    // The hive the admin action targets (MVP: the admin's own hive, e.g. motherbee).
+    let hive = admin_target.split_once('@').map(|(_, h)| h.to_string());
+
+    let (action, admin_params) = match translate_cloud_op(op, tenant_id, &params) {
+        Ok(pair) => pair,
+        Err(error_payload) => return error_payload,
+    };
+
+    match dispatcher
+        .send_admin_rpc(AdminCommandRequest {
+            admin_target,
+            action,
+            target: hive.as_deref(),
+            params: admin_params,
+            request_id: None,
+            timeout: Duration::from_secs(20),
+        })
+        .await
+    {
+        Ok(res) if res.status.eq_ignore_ascii_case("ok") => {
+            json!({ "status": "ok", "op": op, "result": res.payload })
+        }
+        Ok(res) => json!({
+            "status": "error",
+            "op": op,
+            "error_code": res.error_code,
+            "error_detail": res.error_detail.unwrap_or(res.payload),
+        }),
+        Err(e) => cloud_error(&format!("admin call failed: {e}")),
     }
 }
 
