@@ -5319,8 +5319,11 @@ fn vpn_allows_between(
         if is_edge_service_control_message(meta, dst_name) {
             return edge_service_control_allowed(meta, src_name, dst_name);
         }
-        return edge_service_control_allowed(meta, src_name, dst_name)
-            || edge_service_control_response_allowed(meta, src_name, dst_name)
+        // The control-command case already returned above via the exclusive
+        // is_edge_service_control_message gate, so edge_service_control_allowed can never be true
+        // here — the remaining legitimate edge traffic is a control RESPONSE, the data path, or a
+        // vault read.
+        return edge_service_control_response_allowed(meta, src_name, dst_name)
             || edge_data_path_allowed(meta, src_name, dst_name)
             || edge_vault_read_allowed(meta, src_name, dst_name);
     }

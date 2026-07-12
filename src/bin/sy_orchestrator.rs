@@ -59,7 +59,7 @@ type OrchestratorError = Box<dyn std::error::Error + Send + Sync>;
 const MOTHERBEE_SSH_KEY_PATH: &str = "/var/lib/fluxbee/ssh/motherbee.key";
 const MESH_TLS_BASE_DIR: &str = "/var/lib/fluxbee/tls";
 const MESH_CA_DIR: &str = "/var/lib/fluxbee/tls/ca";
-const PRIMARY_HIVE_ID: &str = "motherbee";
+use json_router::router::system_policy::PRIMARY_HIVE_ID;
 const ORCH_SUDOERS_PATH: &str = "/etc/sudoers.d/fluxbee-orchestrator";
 const ORCH_SSH_GATE_PATH: &str = "/usr/local/bin/fluxbee-ssh-gate.sh";
 const RUNTIME_VERIFY_INTERVAL_SECS: u64 = 300;

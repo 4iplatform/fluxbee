@@ -42,7 +42,7 @@ use json_router::nats::{
 };
 
 type StorageError = Box<dyn std::error::Error + Send + Sync>;
-const PRIMARY_HIVE_ID: &str = "motherbee";
+use json_router::router::system_policy::PRIMARY_HIVE_ID;
 
 const NATS_ERROR_LOG_EVERY: u64 = 20;
 const INBOX_REPLAY_BATCH_SIZE: i64 = 200;

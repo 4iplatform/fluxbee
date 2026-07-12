@@ -95,10 +95,6 @@ impl OpaResolver {
         }
     }
 
-    pub fn resolve_target(&mut self, msg: &Message) -> Result<Option<String>, OpaError> {
-        self.resolve_target_with_data(msg, None)
-    }
-
     pub fn resolve_target_with_data(
         &mut self,
         msg: &Message,

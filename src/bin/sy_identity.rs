@@ -34,7 +34,7 @@ use json_router::shm::{
 };
 
 type IdentityError = Box<dyn std::error::Error + Send + Sync>;
-const PRIMARY_HIVE_ID: &str = "motherbee";
+use json_router::router::system_policy::PRIMARY_HIVE_ID;
 
 const DEFAULT_DEFAULT_TENANT_NAME: &str = "fluxbee";
 const DEFAULT_ROOT_TENANT_ID: &str = "tnt:00000000-0000-0000-0000-000000000001";

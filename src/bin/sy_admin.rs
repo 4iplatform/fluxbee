@@ -56,7 +56,7 @@ use json_router::shm::{
 use sha2::{Digest, Sha256};
 
 type AdminError = Box<dyn std::error::Error + Send + Sync>;
-const PRIMARY_HIVE_ID: &str = "motherbee";
+use json_router::router::system_policy::PRIMARY_HIVE_ID;
 const DEFAULT_BLOB_ROOT: &str = "/var/lib/fluxbee/blob";
 const MSG_ADMIN_COMMAND: &str = "ADMIN_COMMAND";
 const MSG_ADMIN_COMMAND_RESPONSE: &str = "ADMIN_COMMAND_RESPONSE";

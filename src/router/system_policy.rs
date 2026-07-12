@@ -51,7 +51,9 @@ pub const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
     "REMOVE_HIVE_CLEANUP",
 ];
 
-const PRIMARY_HIVE_ID: &str = "motherbee";
+/// The primary hive — the single motherbee. Canonical source for the whole system; the bins
+/// import THIS one instead of each redefining it, so the value cannot drift.
+pub const PRIMARY_HIVE_ID: &str = "motherbee";
 
 /// The single node authorized to COMMAND an edge (open/close/list URLs) and to receive its
 /// control responses: `SY.admin` on the primary hive. Canonical name — the router's
