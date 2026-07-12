@@ -105,6 +105,20 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "list_externalized",
 ];
 
+/// The admin actions IO.cloud (the internal Fluxbee Cloud relay) may invoke on behalf of Cloud.
+/// SINGLE SOURCE, read by BOTH the `list_cloud_actions` capability query (so Cloud discovers its
+/// surface without a duplicated hardcoded list) AND — once built — the io.cloud relay authz gate
+/// (so "what is advertised" == "what is permitted"; they cannot drift). Tier-1 provisioning set
+/// (io-cloud-spec-v1 §3.2): create the tenant + ilk definition, store the provider token in vault,
+/// spawn/start the IO node. A subset of ADMIN_EXECUTOR_PILOT_ACTIONS.
+const IO_CLOUD_EXPOSED_ACTIONS: &[&str] = &[
+    "create_tenant",
+    "set_ilk_definition",
+    "vault_put",
+    "run_node",
+    "start_node",
+];
+
 #[derive(Debug, Deserialize)]
 struct HiveFile {
     hive_id: String,
@@ -2943,7 +2957,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "7";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "8";
 
 const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
@@ -2961,6 +2975,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "list_admin_actions",
         route: InternalActionRoute::Query("list_admin_actions"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "list_cloud_actions",
+        route: InternalActionRoute::Query("list_cloud_actions"),
         requires_target: false,
         allow_legacy_hive_id: false,
     },
@@ -6923,6 +6943,9 @@ async fn handle_admin_query(
     if action == "list_admin_actions" {
         return Ok(build_admin_actions_catalog_response());
     }
+    if action == "list_cloud_actions" {
+        return Ok(build_cloud_actions_catalog_response());
+    }
     if matches!(action, "list_ilks" | "list_tenants") {
         return handle_identity_query(ctx, client, action, hive).await;
     }
@@ -6945,6 +6968,9 @@ async fn handle_admin_query_with_payload(
     payload: serde_json::Value,
     hive: Option<String>,
 ) -> Result<(u16, String), AdminError> {
+    if action == "list_cloud_actions" {
+        return Ok(build_cloud_actions_catalog_response());
+    }
     let payload = normalize_admin_payload(action, payload, hive.as_deref());
     let request = build_admin_request(ctx, action, payload, hive);
     let response = send_admin_request(
@@ -6967,6 +6993,35 @@ fn build_admin_actions_catalog_response() -> (u16, String) {
         serde_json::json!({
             "status": "ok",
             "action": "list_admin_actions",
+            "payload": {
+                "registry_version": INTERNAL_ACTION_REGISTRY_VERSION,
+                "actions": actions,
+            },
+            "error_code": serde_json::Value::Null,
+            "error_detail": serde_json::Value::Null,
+        })
+        .to_string(),
+    )
+}
+
+/// Capability query for IO.cloud / Fluxbee Cloud: the SAME registry projection as
+/// `build_admin_actions_catalog_response`, but filtered to `IO_CLOUD_EXPOSED_ACTIONS` — so Cloud
+/// discovers exactly the provisioning surface it may invoke (create tenant/ilk, put token, spawn
+/// node) from ONE source, never a duplicated hardcoded list. When the io.cloud relay authz gate
+/// lands it MUST read the same `IO_CLOUD_EXPOSED_ACTIONS`, so advertised == enforced.
+fn build_cloud_actions_catalog_response() -> (u16, String) {
+    let exposed: std::collections::HashSet<&str> =
+        IO_CLOUD_EXPOSED_ACTIONS.iter().copied().collect();
+    let actions: Vec<serde_json::Value> = INTERNAL_ACTION_REGISTRY
+        .iter()
+        .filter(|spec| exposed.contains(spec.action))
+        .map(build_admin_action_doc)
+        .collect();
+    (
+        200,
+        serde_json::json!({
+            "status": "ok",
+            "action": "list_cloud_actions",
             "payload": {
                 "registry_version": INTERNAL_ACTION_REGISTRY_VERSION,
                 "actions": actions,
@@ -7506,6 +7561,9 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
 fn admin_action_summary(action: &str) -> &'static str {
     match action {
         "list_admin_actions" => "List the dynamic admin action catalog and help metadata.",
+        "list_cloud_actions" => {
+            "List the provisioning actions IO.cloud (Fluxbee Cloud) may invoke — the exposed subset."
+        }
         "get_admin_action_help" => "Return help metadata for one admin action.",
         "publish_runtime_package" => "Publish one runtime package into dist/manifest on motherbee.",
         "hive_status" => "Read the local hive status summary.",
@@ -12713,6 +12771,34 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::broadcast;
     use zip::write::FileOptions;
+
+    #[test]
+    fn cloud_actions_catalog_is_the_exposed_registry_subset() {
+        // Every IO.cloud-exposed action must exist in the registry, else a typo would silently
+        // drop it from Cloud's discoverable surface (and later from the authz gate).
+        let registry: std::collections::HashSet<&str> =
+            INTERNAL_ACTION_REGISTRY.iter().map(|s| s.action).collect();
+        for action in IO_CLOUD_EXPOSED_ACTIONS {
+            assert!(
+                registry.contains(action),
+                "IO_CLOUD_EXPOSED_ACTIONS lists '{action}' not in INTERNAL_ACTION_REGISTRY"
+            );
+        }
+        // The capability projection returns exactly the exposed set.
+        let (status, body) = build_cloud_actions_catalog_response();
+        assert_eq!(status, 200);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["action"], "list_cloud_actions");
+        let got: std::collections::HashSet<&str> = v["payload"]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["action"].as_str().unwrap())
+            .collect();
+        let want: std::collections::HashSet<&str> =
+            IO_CLOUD_EXPOSED_ACTIONS.iter().copied().collect();
+        assert_eq!(got, want);
+    }
 
     #[test]
     fn externalize_authz_gate_io_prefix_and_ownership() {
