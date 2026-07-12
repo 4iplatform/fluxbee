@@ -600,7 +600,7 @@ async fn handle_node(
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing HELLO"))?;
 
     let msg: Message = serde_json::from_slice(&frame)?;
-    if msg.meta.msg_type != SYSTEM_KIND || msg.meta.msg.as_deref() != Some(MSG_HELLO) {
+    if !is_system_kind(&msg.meta.msg_type) || msg.meta.msg.as_deref() != Some(MSG_HELLO) {
         return Err(RouterError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             "expected HELLO",
@@ -741,7 +741,7 @@ async fn handle_node(
                     "message received"
                 );
                 maybe_publish_turn(&nats_publisher, &nats_publish_errors, &msg);
-                if msg.meta.msg_type == SYSTEM_KIND {
+                if is_system_kind(&msg.meta.msg_type) {
                     if msg.meta.msg.as_deref() == Some(MSG_WITHDRAW) {
                         break;
                     }
@@ -2621,7 +2621,7 @@ where
         .await?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing HELLO"))?;
     let msg: Message = serde_json::from_slice(&frame)?;
-    if msg.meta.msg_type != SYSTEM_KIND || msg.meta.msg.as_deref() != Some(MSG_HELLO) {
+    if !is_system_kind(&msg.meta.msg_type) || msg.meta.msg.as_deref() != Some(MSG_HELLO) {
         writer_task.abort();
         return Ok(());
     }
@@ -2761,7 +2761,7 @@ async fn handle_wan_message(
 ) -> Result<(), RouterError> {
     let mut msg = msg.clone();
     assign_thread_seq_if_missing(&mut msg, &ctx.thread_sequences).await;
-    if msg.meta.msg_type == SYSTEM_KIND {
+    if is_system_kind(&msg.meta.msg_type) {
         if msg.meta.msg.as_deref() == Some(MSG_LSA) {
             let payload: LsaPayload = match serde_json::from_value(msg.payload.clone()) {
                 Ok(payload) => payload,
@@ -3484,7 +3484,7 @@ async fn handle_peer_incoming(
         .await?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing HELLO"))?;
     let msg: Message = serde_json::from_slice(&frame)?;
-    if msg.meta.msg_type != SYSTEM_KIND || msg.meta.msg.as_deref() != Some(MSG_HELLO) {
+    if !is_system_kind(&msg.meta.msg_type) || msg.meta.msg.as_deref() != Some(MSG_HELLO) {
         return Ok(());
     }
     let payload: RouterHelloPayload = serde_json::from_value(msg.payload)?;
@@ -3585,7 +3585,7 @@ async fn handle_peer_message(
         Ok(uuid) => uuid,
         Err(_) => return Ok(()),
     };
-    if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_CONFIG_CHANGED) {
+    if is_system_kind(&msg.meta.msg_type) && msg.meta.msg.as_deref() == Some(MSG_CONFIG_CHANGED) {
         let _ = refresh_config(
             config_reader,
             static_routes,
@@ -3604,7 +3604,7 @@ async fn handle_peer_message(
         tracing::info!("config changed applied (peer)");
         return Ok(());
     }
-    if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD) {
+    if is_system_kind(&msg.meta.msg_type) && msg.meta.msg.as_deref() == Some(MSG_OPA_RELOAD) {
         let payload: OpaReloadPayload = serde_json::from_value(msg.payload.clone())?;
         apply_opa_reload(opa, opa_reader, shm, hive_id, &payload).await;
         tracing::info!("opa reload applied (peer)");
@@ -3615,7 +3615,7 @@ async fn handle_peer_message(
         peer_guard.get(&src_uuid).cloned()
     };
     let Some(src_node) = src_node else {
-        if msg.meta.msg_type == SYSTEM_KIND {
+        if is_system_kind(&msg.meta.msg_type) {
             if let Some(msg_kind) = msg.meta.msg.as_deref() {
                 if msg_kind == MSG_UNREACHABLE || msg_kind == MSG_TTL_EXCEEDED {
                     if let Destination::Unicast(dst) = &msg.routing.dst {
@@ -5246,8 +5246,19 @@ fn is_global_scope(meta: &Meta) -> bool {
     matches!(meta.scope.as_deref(), Some(SCOPE_GLOBAL))
 }
 
+/// Whether a frame's `msg_type` is the SYSTEM kind — CASE-INSENSITIVE, matching how every edge/IO
+/// node classifies control-plane traffic (`eq_ignore_ascii_case`, e.g. io-slack/io-api
+/// is_control_plane_msg_type). The router MUST agree: a case-sensitive `== SYSTEM_KIND` let a frame
+/// stamped `msg_type="SYSTEM"` slip past every SYSTEM gate here (EDGE-05 edge<->IO reject, the
+/// protected-action authority gate, the edge-control gates) while the destination node still ran it
+/// as control-plane — a full gate bypass by case. Use this everywhere the router decides on the
+/// SYSTEM kind.
+fn is_system_kind(msg_type: &str) -> bool {
+    msg_type.eq_ignore_ascii_case(SYSTEM_KIND)
+}
+
 fn edge_service_control_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> bool {
-    if !is_edge_node(dst_name) || meta.msg_type != SYSTEM_KIND {
+    if !is_edge_node(dst_name) || !is_system_kind(&meta.msg_type) {
         return false;
     }
     if src_name != system_policy::EDGE_CONTROL_AUTHORITY {
@@ -5257,7 +5268,7 @@ fn edge_service_control_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> 
 }
 
 fn edge_service_control_response_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> bool {
-    if !is_edge_node(src_name) || dst_name != system_policy::EDGE_CONTROL_AUTHORITY || meta.msg_type != SYSTEM_KIND {
+    if !is_edge_node(src_name) || dst_name != system_policy::EDGE_CONTROL_AUTHORITY || !is_system_kind(&meta.msg_type) {
         return false;
     }
     matches!(meta.msg.as_deref(), Some(action) if action == MSG_EDGE_OPEN_URL_RESPONSE || action == MSG_EDGE_CLOSE_URL_RESPONSE || action == MSG_EDGE_LIST_URLS_RESPONSE)
@@ -5265,7 +5276,7 @@ fn edge_service_control_response_allowed(meta: &Meta, src_name: &str, dst_name: 
 
 fn is_edge_service_control_message(meta: &Meta, dst_name: &str) -> bool {
     is_edge_node(dst_name)
-        && meta.msg_type == SYSTEM_KIND
+        && is_system_kind(&meta.msg_type)
         && matches!(meta.msg.as_deref(), Some(action) if action == MSG_EDGE_OPEN_URL || action == MSG_EDGE_CLOSE_URL || action == MSG_EDGE_LIST_URLS)
 }
 
@@ -5279,7 +5290,7 @@ fn edge_data_path_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> bool {
     // (can't originate SYSTEM verbs at IO nodes) and a rogue IO (can't land a SYSTEM frame on
     // the edge, closing the RouteMatch::Any reply-shadowing risk). Owner-scoping (only
     // externalized IO owners) is Phase 2, deferred — see the EDGE-05 audit note.
-    if meta.msg_type == SYSTEM_KIND {
+    if is_system_kind(&meta.msg_type) {
         return false;
     }
     (is_edge_node(src_name) && is_io_node(dst_name))
@@ -5287,7 +5298,7 @@ fn edge_data_path_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> bool {
 }
 
 fn edge_vault_read_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> bool {
-    if meta.msg_type != SYSTEM_KIND {
+    if !is_system_kind(&meta.msg_type) {
         return false;
     }
     match meta.msg.as_deref() {
@@ -5313,7 +5324,7 @@ fn vpn_allows_between(
             || edge_data_path_allowed(meta, src_name, dst_name)
             || edge_vault_read_allowed(meta, src_name, dst_name);
     }
-    if meta.msg_type == SYSTEM_KIND && is_global_scope(meta) {
+    if is_system_kind(&meta.msg_type) && is_global_scope(meta) {
         return true;
     }
     if is_system_node(src_name) || is_system_node(dst_name) {
@@ -5708,7 +5719,7 @@ fn maybe_publish_turn(
 }
 
 fn should_publish_turn(msg: &Message) -> bool {
-    if msg.meta.msg_type == SYSTEM_KIND {
+    if is_system_kind(&msg.meta.msg_type) {
         return false;
     }
     if msg.meta.msg_type == "admin" || msg.meta.msg_type == "query_response" {
@@ -5718,7 +5729,7 @@ fn should_publish_turn(msg: &Message) -> bool {
 }
 
 fn should_enrich_with_memory_package(msg: &Message) -> bool {
-    if msg.meta.msg_type == SYSTEM_KIND {
+    if is_system_kind(&msg.meta.msg_type) {
         return false;
     }
     if msg.meta.msg_type == "admin" || msg.meta.msg_type == "query_response" {
@@ -5736,7 +5747,7 @@ async fn serialize_for_local_delivery(
     hive_id: &str,
     msg: &Message,
 ) -> Result<Option<Vec<u8>>, RouterError> {
-    if msg.meta.msg_type == SYSTEM_KIND {
+    if is_system_kind(&msg.meta.msg_type) {
         // OPA-dual SYSTEM (authority) layer: the baked, non-user-editable Rego policy
         // (policy/system.rego -> system.wasm), evaluated via authorize_system() with the Rust
         // authority() table as the byte-identical load-failure fallback. System DENY is final.
@@ -6086,6 +6097,29 @@ mod tests {
             "SY.edge@ingress1",
             1
         ));
+    }
+
+    #[test]
+    fn system_kind_classification_is_case_insensitive() {
+        // The router MUST agree with the nodes (eq_ignore_ascii_case). Otherwise a frame stamped
+        // msg_type="SYSTEM" bypasses every SYSTEM gate here while the node still runs it as
+        // control-plane (the audited HIGH gate-bypass). Guard all four casings.
+        for mt in ["system", "SYSTEM", "System", "sYsTeM"] {
+            assert!(is_system_kind(mt), "is_system_kind({mt}) must be true");
+        }
+        assert!(!is_system_kind("user"));
+        assert!(!is_system_kind("admin"));
+
+        // Regression: an UPPERCASE 'SYSTEM' frame on the edge<->IO path is still rejected (the
+        // EDGE-05 guard used to only match lowercase "system" and let this through).
+        for mt in ["SYSTEM", "System"] {
+            let sys = Meta {
+                msg_type: mt.to_string(),
+                ..Meta::default()
+            };
+            assert!(!vpn_allows_between(&sys, "SY.edge@ingress1", 1, "IO.cloud@motherbee", 2));
+            assert!(!vpn_allows_between(&sys, "IO.cloud@motherbee", 2, "SY.edge@ingress1", 1));
+        }
     }
 
     #[test]
