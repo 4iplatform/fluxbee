@@ -1,11 +1,19 @@
 # Fluxbee SYSTEM origin-authority policy (OPA-dual, capa SYSTEM).
 #
 # This is the Rego backing for `src/router/system_policy.rs :: authority()`. It is the
-# NON-user-editable half of the two-layer policy model: compiled to WASM and loaded by the
-# router into the dedicated `/jsr-opa-sys-<hive>` region (never the user `/opa/policy*` path).
+# NON-user-editable half of the two-layer policy model. Authoring/loading TODAY (baked stage):
+#   1. a developer edits THIS file, then recompiles it to `policy/system.wasm` with the same OPA
+#      compiler the user path uses: `sy-opa-rules compile-file policy/system.rego fluxbee/system/allow policy/system.wasm`
+#      (build in the fxbuild Linux container; the Go tool is Linux-only). Commit both files.
+#   2. the router BAKES that wasm into the binary via `include_bytes!` and evaluates it through
+#      `authorize_system()` (a lazy singleton) — there is NO SHM region and NO runtime writer for
+#      the system layer (that is the future "OPA-dual Phase 4": a privileged `/jsr-opa-sys-<hive>`
+#      region + writer, which only changes HOW the resolver is fed, not this policy).
+# So the system rules are non-user-editable by construction (unreachable from `/opa/policy*`) and
+# only change on a rebuild+redeploy. Keeping this `.rego` and `system.wasm` in sync is a MANUAL
+# dev step, guarded by the shadow-verify tests (they fail if the baked wasm diverges from authority()).
 #
-# Contract (must stay BYTE-IDENTICAL to authority() — shadow-verified in tests before it
-# becomes the backing):
+# Contract (must stay BYTE-IDENTICAL to authority() — shadow-verified in tests):
 #   input  = { "action": <verb>, "src_l2_name": <router-stamped name>, "hive_id": <this hive> }
 #   output = allow (boolean)   ; entrypoint: fluxbee/system/allow
 #
