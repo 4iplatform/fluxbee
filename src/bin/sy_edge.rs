@@ -25,6 +25,7 @@ use fluxbee_sdk::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -87,21 +88,26 @@ mod http_ingress {
 
 const RPC_CH_SYSTEM: &str = "system";
 
-/// Hop-by-hop + auth headers stripped before a request crosses inward. Entry auth
-/// is already gated at the door; the raw bearer token never travels inward (§3).
-const STRIPPED_REQUEST_HEADERS: &[&str] = &[
-    "authorization",
-    "host",
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-    "content-length",
+/// Request headers the edge forwards INWARD — a strict ALLOWLIST (fail-closed, §7.5/M2).
+/// Only these named-safe headers reach the internal IO node; EVERYTHING else — the raw
+/// `Authorization` bearer (already consumed at the door, §3), every hop-by-hop header, and
+/// any attacker-settable header (`Cookie`, `X-Forwarded-*`, spoofed trust/identity headers) —
+/// is dropped by default, so an external client can neither smuggle state nor forge trust
+/// inward. New forward-worthy headers are added here deliberately, one at a time (I7).
+const ALLOWED_REQUEST_HEADERS: &[&str] = &[
+    "content-type",
+    "accept",
+    "accept-language",
+    "user-agent",
+    "x-request-id",
 ];
+
+/// Default cap on concurrent in-flight edge requests (L1, §15.6). The edge holds one pending
+/// entry per request until the inward handler replies (up to `handler_timeout_ms`); an
+/// unbounded map is a DoS surface (slow/dead handler or a flood grows RAM without limit). At
+/// the cap the next request is shed FAST with 503 instead of enqueued. Overridable via
+/// `MAX_INFLIGHT`.
+const DEFAULT_MAX_INFLIGHT: usize = 1024;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -112,6 +118,8 @@ struct Config {
     config_dir: PathBuf,
     ttl: u8,
     handler_timeout_ms: u64,
+    /// Max concurrent in-flight requests before the door sheds load with 503 (L1, §15.6).
+    max_inflight: usize,
     /// Public HTTP frontend bind address. Present ONLY on the ingress-hive role
     /// (fail-closed role gate, `resolve_http_listen`). Absent ⇒ the node connects
     /// to the mesh but serves no public door.
@@ -235,6 +243,7 @@ async fn main() -> Result<(), SyEdgeError> {
             self_ilk: self_ilk.clone(),
             ttl: config.ttl,
             timeout: Duration::from_millis(config.handler_timeout_ms),
+            inflight: Arc::new(Semaphore::new(config.max_inflight)),
         });
         // TLS: vault-sourced (preferred) or on-disk PEM. FAIL-CLOSED — if TLS is
         // requested but the material can't be built, do NOT fall back to plaintext
@@ -762,6 +771,10 @@ impl Config {
             handler_timeout_ms: env("HANDLER_TIMEOUT_MS")
                 .and_then(|raw| raw.parse().ok())
                 .unwrap_or(30_000),
+            max_inflight: env("MAX_INFLIGHT")
+                .and_then(|raw| raw.parse().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(DEFAULT_MAX_INFLIGHT),
             http_listen,
             endpoints_path: Some(PathBuf::from(endpoints_path)),
             tls_cert,
@@ -952,6 +965,9 @@ struct FrontendState {
     self_ilk: String,
     ttl: u8,
     timeout: Duration,
+    /// In-flight request limiter (L1, §15.6): a permit is held for each request's whole
+    /// lifetime; when none is free the door returns 503 instead of enqueuing unbounded.
+    inflight: Arc<Semaphore>,
 }
 
 async fn run_frontend(
@@ -1161,6 +1177,21 @@ async fn blob_stub(AxumPath(_hash): AxumPath<String>) -> Response {
 }
 
 async fn invoke(state: Arc<FrontendState>, ich: String, extra: String, req: Request) -> Response {
+    // 0. Backpressure (L1, §15.6): bound concurrent in-flight requests. Acquire a permit
+    //    BEFORE any inward work; hold it for the whole request (dropped on return, after the
+    //    reply resolves). When the edge is already at capacity, shed load fast with 503 so a
+    //    slow/dead handler or a flood cannot grow the pending map unbounded (DoS).
+    let _permit = match Arc::clone(&state.inflight).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return http_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SERVICE_UNAVAILABLE",
+                "edge at capacity; retry shortly",
+            )
+        }
+    };
+
     let method = req.method().clone();
     let uri = req.uri().clone();
     let headers = req.headers().clone();
@@ -1387,12 +1418,17 @@ fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Forward ONLY allowlisted request headers inward (§7.5/M2, fail-closed). Any header not
+/// explicitly in `ALLOWED_REQUEST_HEADERS` — including `Authorization`, `Cookie`,
+/// `X-Forwarded-*`, hop-by-hop headers, and any spoofed trust header — is dropped, so an
+/// external caller can never influence or impersonate to the internal IO node. Names are
+/// matched case-insensitively.
 fn filter_request_headers(headers: &HeaderMap) -> Vec<HttpHeader> {
     headers
         .iter()
         .filter_map(|(name, value)| {
             let name = name.as_str().to_ascii_lowercase();
-            if STRIPPED_REQUEST_HEADERS.contains(&name.as_str()) {
+            if !ALLOWED_REQUEST_HEADERS.contains(&name.as_str()) {
                 return None;
             }
             let value = value.to_str().ok()?;
@@ -1683,20 +1719,45 @@ mod tests {
     }
 
     #[test]
-    fn filter_request_headers_strips_auth_and_hop_by_hop() {
+    fn filter_request_headers_allowlist_is_fail_closed() {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer x".parse().unwrap());
         headers.insert("host", "edge.fluxbee.ai".parse().unwrap());
         headers.insert("connection", "keep-alive".parse().unwrap());
+        headers.insert("cookie", "session=abc".parse().unwrap());
+        headers.insert("x-forwarded-for", "10.0.0.1".parse().unwrap());
         headers.insert("content-type", "application/json".parse().unwrap());
-        headers.insert("x-custom", "keep-me".parse().unwrap());
+        headers.insert("x-custom", "smuggled".parse().unwrap());
         let filtered = filter_request_headers(&headers);
         let names: Vec<&str> = filtered.iter().map(|h| h.name.as_str()).collect();
+        // Allowlisted -> passes inward.
         assert!(names.contains(&"content-type"));
-        assert!(names.contains(&"x-custom"));
+        // Everything NOT named — the raw bearer, hop-by-hop, and any attacker-settable
+        // header — is dropped by default (fail-closed). x-custom must NOT smuggle through.
         assert!(!names.contains(&"authorization"));
         assert!(!names.contains(&"host"));
         assert!(!names.contains(&"connection"));
+        assert!(!names.contains(&"cookie"));
+        assert!(!names.contains(&"x-forwarded-for"));
+        assert!(!names.contains(&"x-custom"));
+    }
+
+    #[test]
+    fn inflight_bound_sheds_load_at_capacity() {
+        // The edge holds one semaphore permit per in-flight request; at the cap the next
+        // acquisition fails, which invoke() turns into a fast 503. This locks that contract
+        // (the full HTTP-path 503 is exercised in the lab flood test). try_acquire_owned is
+        // non-blocking, so no async runtime is needed here.
+        let sem = Arc::new(Semaphore::new(2));
+        let p1 = Arc::clone(&sem).try_acquire_owned().expect("permit 1");
+        let _p2 = Arc::clone(&sem).try_acquire_owned().expect("permit 2");
+        assert!(
+            Arc::clone(&sem).try_acquire_owned().is_err(),
+            "at capacity the (cap+1)th request must be shed (-> 503)"
+        );
+        drop(p1); // request completes -> slot frees -> next admitted
+        assert!(Arc::clone(&sem).try_acquire_owned().is_ok());
+        assert!(DEFAULT_MAX_INFLIGHT > 0, "the default cap must be positive");
     }
 
     #[test]
