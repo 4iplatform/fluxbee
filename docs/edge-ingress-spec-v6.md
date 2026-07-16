@@ -114,8 +114,13 @@ not create the channel; it exposes it.
 - **Holds:** its own TLS cert/key; a live routing cache `ICH → { owner_l2_name, inbound_family,
   auth_mode, secret?, methods? }` (SHM, `Arc<RwLock<HashMap>>`, whole-map replace, monotonic
   version); its own node config (§9). **No `ilk`, no identity SHM, no authoritative set.**
-- **Reachability constrained (M3):** its `sy-config-routes` lists only the IO handler nodes it
-  forwards to — no blanket system-node reachability.
+- **Reachability constrained (M3 — partial, code-verified):** blanket DMZ→system reachability is
+  denied, but NOT via `sy-config-routes` (the ingress's is generated empty). The actual gate is the
+  router's `vpn_allows_between` edge rule (`src/router/mod.rs`): it short-circuits on any edge src/dst
+  and today permits the edge to reach any `IO.`-node (data) + `SY.admin@motherbee` (control) +
+  `SY.vault` (VAULT_GET only), rejecting all other system nodes. Per-handler owner-scoping (edge
+  reaches ONLY the owners of its currently-externalized channels) is **deferred to EDGE-05 Phase 2** —
+  it needs a durable `SY.identity` "externalized" attribute first, else the check is self-certifying.
 
 ---
 
@@ -347,9 +352,12 @@ Parked consciously — the edge receives `ICH → owner_l2_name` either way.
 
 - **H1 — package `sy-edge` — DONE.** `packaging/build-deb.sh` adds `sy-edge:sy_edge` to
   `RUST_BINS` (staged into `/usr/bin` + `dist/core/bin`, auto-hashed into the core manifest) and a
-  dedicated unit `After/Wants=rt-gateway.service sy-vault.service` (it fetches TLS from vault at
-  boot). `deb-prerm` stops it; `scripts/install.sh` has dev-path parity. Verified inside the built
-  `.deb`: binary + unit + manifest entry present — the `MANIFEST_INVALID` gate now passes.
+  dedicated unit `After=network.target rt-gateway.service` / `Wants=rt-gateway.service`. **Note (code-
+  verified):** the unit does NOT order `sy-vault.service` — an ingress hive has no local `sy-vault`;
+  the edge fetches its TLS cert from the **motherbee** `SY.vault` over the mesh at boot
+  (`fetch_tls_config_from_vault`), fail-closed, with `Restart=always` retrying until the mesh is up.
+  `deb-prerm` stops it; `scripts/install.sh` has dev-path parity (identical unit ordering). Verified
+  inside the built `.deb`: binary + unit + manifest entry present — the `MANIFEST_INVALID` gate now passes.
 - **H2 — ingress `system_nodes` template — DONE.** `config/hive.yaml` +
   `packaging/hive.yaml.example` ship `system_nodes.ingress = [SY.config.routes, SY.edge]`, so
   `system_nodes_for_role(_, Ingress)` resolves and `add_hive role=ingress` no longer aborts.
@@ -383,8 +391,11 @@ nodes. This is the design valve, not a rule to remember.
 3. Edge **born zero** (no seed) + converge from pushes (§6).
 4. Admin-minted entry token → vault owned-by-node, edge-local check (§8).
 5. Package `sy-edge` (H1), ingress `system_nodes` template (H2), fail-closed public TLS (H3).
-6. Header allowlist (M2), bounded pending map → 503 (L1), return-leg `UNREACHABLE` handling (M4),
-   scope down edge reachability (M3).
+6. Header allowlist (**M2 — DONE**: `ALLOWED_REQUEST_HEADERS` fail-closed allowlist, raw bearer +
+   every unnamed header dropped inward), bounded pending map → 503 (**L1 — DONE**: `MAX_INFLIGHT`
+   semaphore in `invoke`, sheds fast at capacity), return-leg `UNREACHABLE` handling (**M4 — DONE**:
+   fast 502, not a blocked timeout), scope down edge reachability (**M3 — partial**: router
+   `vpn_allows_between` edge gate; per-handler owner-scope deferred to EDGE-05 Phase 2).
 7. Declare the cross-hive topology limit (H4): **adjacent-hub-or-same-hive only** (LSA is one WAN
    hop); multi-hop relay deferred.
 

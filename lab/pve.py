@@ -8,7 +8,7 @@ hive entirely through the single Proxmox API endpoint: no SSH, no expect, no
 sudo, no per-VM tunnel.
 
 Auth / config via env:
-  PVE_HOST      (req)  Proxmox host/IP, e.g. 192.168.103.144  (or 127.0.0.1 if tunneled)
+  PVE_HOST      (req)  Proxmox host/IP, e.g. 192.168.4.165  (or 127.0.0.1 if tunneled)
   PVE_TOKEN     (req)  API token: 'user@realm!tokenid=secret'
   PVE_NODE             node name (auto-detected if a single node)
   PVE_PORT             default 8006
