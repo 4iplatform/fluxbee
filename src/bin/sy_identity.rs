@@ -109,6 +109,7 @@ const SHM_REG_STATUS_COMPLETE: u8 = 2;
 const SHM_TENANT_STATUS_PENDING: u8 = 0;
 const SHM_TENANT_STATUS_ACTIVE: u8 = 1;
 const SHM_TENANT_STATUS_SUSPENDED: u8 = 2;
+const MOTHERBEE_PACKAGED_NON_SYSTEM_NODES: &[&str] = &["IO.blob"];
 
 const MSG_ILK_PROVISION: &str = "ILK_PROVISION";
 const MSG_ILK_PROVISION_RESPONSE: &str = "ILK_PROVISION_RESPONSE";
@@ -5145,11 +5146,16 @@ fn system_nodes_for_hive(hive: &HiveFile) -> Result<Vec<String>, String> {
     let mut out = Vec::with_capacity(nodes.len());
     for raw_name in nodes {
         let name = raw_name.trim();
-        if !name.starts_with("SY.") {
-            return Err(format!("system node '{name}' must use SY.* naming"));
-        }
         if !seen_nodes.insert(name.to_string()) {
             return Err(format!("duplicate system node '{name}'"));
+        }
+        if !name.starts_with("SY.") {
+            if is_primary && MOTHERBEE_PACKAGED_NON_SYSTEM_NODES.contains(&name) {
+                continue;
+            }
+            return Err(format!(
+                "lifecycle node '{name}' must use SY.* naming or be an allowlisted motherbee packaged node"
+            ));
         }
         out.push(name.to_string());
     }
@@ -7321,6 +7327,45 @@ mod tests {
             .ensure_system_ilks_from_hive(&hive)
             .expect("seed system ilks idempotently");
         assert!(changed_again.is_empty());
+    }
+
+    #[test]
+    fn packaged_io_blob_is_lifecycle_managed_without_system_ilk() {
+        let mut hive = test_hive(Some("SY.frontdesk.gov@motherbee"));
+        hive.system_nodes
+            .as_mut()
+            .and_then(|section| section.motherbee.as_mut())
+            .expect("motherbee system nodes")
+            .nodes
+            .push("IO.blob".to_string());
+
+        let system_nodes = system_nodes_for_hive(&hive).expect("read system authorities");
+        assert_eq!(system_nodes, vec!["SY.identity", "SY.architect"]);
+
+        let mut store = IdentityStore::default();
+        let changed = store
+            .ensure_system_ilks_from_hive(&hive)
+            .expect("seed only system authorities");
+        assert_eq!(changed.len(), 2);
+        assert!(!store.ilks.values().any(|ilk| {
+            ilk.identification
+                .get("system_node")
+                .and_then(Value::as_str)
+                == Some("IO.blob")
+        }));
+    }
+
+    #[test]
+    fn identity_rejects_unallowlisted_io_lifecycle_node() {
+        let mut hive = test_hive(None);
+        hive.system_nodes
+            .as_mut()
+            .and_then(|section| section.motherbee.as_mut())
+            .expect("motherbee system nodes")
+            .nodes
+            .push("IO.cloud".to_string());
+
+        assert!(system_nodes_for_hive(&hive).is_err());
     }
 
     #[test]

@@ -43,9 +43,12 @@ Todos los nodos acceden al mismo repositorio blob vía filesystem local.
 
 - El archivo puede ser referenciado en un mensaje (`BlobRef`)
 - Otros nodos pueden leerlo
-- Syncthing lo replica a otras islas (si está habilitado)
+- Syncthing lo replica a otras islas internas (si está habilitado)
 
-**`staging/` no se replica.** Es local a cada isla. Solo `active/` es visible para Syncthing.
+**`staging/` no se replica.** Es local a cada isla. El folder interno `fluxbee-blob` replica
+`active/` entre hives de trabajo. La publicacion externa usa otro folder, `fluxbee-blob-public`, que
+replica exclusivamente `public/` desde motherbee (`sendonly`) hacia ingress (`receiveonly`); nunca
+expone `active/` al DMZ.
 
 **Subdirectorio prefix** — Primeros 2 caracteres del hash (extraídos del `blob_name`). Distribuye archivos en hasta 256 subdirectorios para evitar directorios con miles de entradas.
 
@@ -585,9 +588,19 @@ Semántica conservadora:
 | **Router** | No toca blobs. Rutea mensajes con `BlobRef` como cualquier otro payload |
 | **Canal de transporte** | No toca blobs. Transporta mensajes con `BlobRef` sin inspección de contenido |
 | **OPA** | No toca blobs. No lee payload |
-| **Syncthing** | Replica solo `active/` entre islas. `staging/` es local. Transparente |
+| **Syncthing** | Replica `active/` entre hives internos y, por un folder separado one-way, `public/` hacia ingress. `staging/` es local |
 | **Nodos (todos)** | Usan `fluxbee_sdk::blob` para put/promote/resolve |
 | **SY.storage** | Persiste metadata de mensajes que contienen `BlobRef` (no el blob en sí) |
+
+---
+
+## 11.1 Publicacion externa (contrato separado)
+
+`active/` sigue siendo el spool interno compartido y no adquiere ownership por tenant. Exponer un
+artefacto no replica `active/` al DMZ ni convierte un `BlobRef` en URL. El circuito definido en
+`io-blob-spec-v1.md` registra ownership de la **publicacion** en `SY.admin`, cura una copia por SHA-256
+completo mediante `IO.blob` y replica solo la carpeta dedicada `public/` al ingress. La URL usa una
+capability random; nunca usa `blob_name` ni el hash como namespace publico.
 
 ---
 

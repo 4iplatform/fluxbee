@@ -31,7 +31,7 @@ import rego.v1
 default allow := false
 
 # Edge service commands (open/close/list URLs): only SY.admin on the primary hive.
-edge_service_actions := {"EDGE_OPEN_URL", "EDGE_CLOSE_URL", "EDGE_LIST_URLS"}
+edge_service_actions := {"EDGE_OPEN_URL", "EDGE_CLOSE_URL", "EDGE_LIST_URLS", "EDGE_PUBLISH_BLOB", "EDGE_UNPUBLISH_BLOB"}
 
 # Parse "<role>@<hive>" from the router-authoritative (already-stamped) src_l2_name, splitting
 # on the FIRST '@' (mirrors Rust split_once('@')). Undefined when the name is empty or has no

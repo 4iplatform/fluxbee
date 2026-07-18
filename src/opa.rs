@@ -1379,7 +1379,9 @@ fn json_to_opa_value(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_opa_input, merge_opa_data, parse_target_from_result, OpaDumpSource, OpaError};
+    use super::{
+        build_opa_input, merge_opa_data, parse_target_from_result, OpaDumpSource, OpaError,
+    };
     use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 
     #[test]
@@ -1401,6 +1403,8 @@ mod tests {
             "EDGE_OPEN_URL",
             "EDGE_CLOSE_URL",
             "EDGE_LIST_URLS",
+            "EDGE_PUBLISH_BLOB",
+            "EDGE_UNPUBLISH_BLOB",
             "SPAWN_NODE",
             "KILL_NODE",
             "NODE_STATUS_GET",
@@ -1467,10 +1471,7 @@ mod tests {
         assert_eq!(input["routing"]["src"], "uuid-123");
         assert_eq!(input["meta"]["msg"], "SPAWN_NODE");
         // New additive fields.
-        assert_eq!(
-            input["routing"]["src_l2_name"],
-            "SY.orchestrator@motherbee"
-        );
+        assert_eq!(input["routing"]["src_l2_name"], "SY.orchestrator@motherbee");
         assert_eq!(input["action"], "SPAWN_NODE");
         // Exactly these top-level keys (catches an accidental shape change).
         let obj = input.as_object().expect("input is an object");

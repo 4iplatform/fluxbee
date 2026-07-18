@@ -1,20 +1,24 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::{Read, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::body::to_bytes;
+use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::{Path as AxumPath, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
 use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE,
     MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
-    MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
+    MSG_EDGE_PUBLISH_BLOB, MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB,
+    MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, is_node_config_get_message, is_node_config_set_message,
@@ -24,8 +28,11 @@ use fluxbee_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -108,6 +115,8 @@ const ALLOWED_REQUEST_HEADERS: &[&str] = &[
 /// the cap the next request is shed FAST with 503 instead of enqueued. Overridable via
 /// `MAX_INFLIGHT`.
 const DEFAULT_MAX_INFLIGHT: usize = 1024;
+const DEFAULT_PUBLIC_MAX_INFLIGHT: usize = 128;
+const DEFAULT_PUBLIC_READY_TIMEOUT_MS: u64 = 60_000;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -127,6 +136,10 @@ struct Config {
     /// Seed for the reverse-proxy table (`ich -> {...}`). Born-zero in production;
     /// live URLs then arrive one at a time via `EDGE_OPEN_URL` / `EDGE_CLOSE_URL` (§7).
     endpoints_path: Option<PathBuf>,
+    publications_path: PathBuf,
+    blob_public_root: PathBuf,
+    public_max_inflight: usize,
+    public_ready_timeout_ms: u64,
     /// Public TLS material from disk. When both are `Some` the frontend serves HTTPS.
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
@@ -215,6 +228,8 @@ async fn main() -> Result<(), SyEdgeError> {
             .map(load_registry)
             .unwrap_or_default(),
     ));
+    let public_registry: Arc<RwLock<HashMap<String, PublicArtifactRow>>> =
+        Arc::new(RwLock::new(load_public_registry(&config.publications_path)));
 
     // Warm-start step 2 (§8): rows reloaded from disk carry only a `secret_ref` (never the
     // secret value). Re-fetch each secret from vault now, so shared-secret channels come back
@@ -234,16 +249,20 @@ async fn main() -> Result<(), SyEdgeError> {
         tracing::info!(
             listen = %listen,
             endpoints = registry.read().map(|r| r.len()).unwrap_or(0),
+            publications = public_registry.read().map(|r| r.len()).unwrap_or(0),
             "sy-edge starting public HTTP frontend"
         );
         let state = Arc::new(FrontendState {
             dispatcher: Arc::clone(&dispatcher),
             sender: sender.clone(),
             registry: Arc::clone(&registry),
+            public_registry: Arc::clone(&public_registry),
+            blob_public_root: config.blob_public_root.clone(),
             self_ilk: self_ilk.clone(),
             ttl: config.ttl,
             timeout: Duration::from_millis(config.handler_timeout_ms),
             inflight: Arc::new(Semaphore::new(config.max_inflight)),
+            public_inflight: Arc::new(Semaphore::new(config.public_max_inflight)),
         });
         // TLS: vault-sourced (preferred) or on-disk PEM. FAIL-CLOSED — if TLS is
         // requested but the material can't be built, do NOT fall back to plaintext
@@ -336,6 +355,30 @@ async fn main() -> Result<(), SyEdgeError> {
             }
             Some(MSG_EDGE_LIST_URLS) => {
                 apply_list_urls(&sender, &registry, &msg, config.ttl).await;
+                continue;
+            }
+            Some(MSG_EDGE_PUBLISH_BLOB) => {
+                apply_publish_blob(
+                    &sender,
+                    &public_registry,
+                    &config.publications_path,
+                    &config.blob_public_root,
+                    &msg,
+                    config.ttl,
+                    Duration::from_millis(config.public_ready_timeout_ms),
+                )
+                .await;
+                continue;
+            }
+            Some(MSG_EDGE_UNPUBLISH_BLOB) => {
+                apply_unpublish_blob(
+                    &sender,
+                    &public_registry,
+                    &config.publications_path,
+                    &msg,
+                    config.ttl,
+                )
+                .await;
                 continue;
             }
             _ => {}
@@ -510,6 +553,326 @@ async fn apply_list_urls(
     send_edge_reply(sender, msg, MSG_EDGE_LIST_URLS_RESPONSE, payload, ttl).await;
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PublicArtifactRow {
+    key: String,
+    publication_id: String,
+    public_name: String,
+    sha256: String,
+    size: u64,
+    content_type: String,
+    presentation: String,
+    expires_at: u64,
+    content_policy: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+struct PublicArtifactsFile {
+    #[serde(default)]
+    publications: Vec<PublicArtifactRow>,
+}
+
+async fn apply_publish_blob(
+    sender: &NodeSender,
+    registry: &Arc<RwLock<HashMap<String, PublicArtifactRow>>>,
+    publications_path: &std::path::Path,
+    public_root: &std::path::Path,
+    msg: &Message,
+    ttl: u8,
+    ready_timeout: Duration,
+) {
+    let outcome: Result<PublicArtifactRow, String> = async {
+        authorize_edge_service_command(msg, MSG_EDGE_PUBLISH_BLOB)?;
+        let row: PublicArtifactRow = serde_json::from_value(msg.payload.clone())
+            .map_err(|err| format!("invalid EDGE_PUBLISH_BLOB payload: {err}"))?;
+        validate_public_artifact_row(&row)?;
+        wait_for_public_artifact_ready(public_root, &row, ready_timeout).await?;
+        {
+            let mut guard = registry
+                .write()
+                .map_err(|_| "public registry lock poisoned".to_string())?;
+            if let Some(existing) = guard.get(&row.key) {
+                if existing != &row {
+                    return Err("public capability already exists with different facts".to_string());
+                }
+            }
+            if guard.values().any(|existing| {
+                existing.publication_id == row.publication_id && existing.key != row.key
+            }) {
+                return Err("publication_id already exists with a different capability".to_string());
+            }
+            let previous = guard.insert(row.key.clone(), row.clone());
+            if let Err(err) = persist_public_registry(publications_path, &guard) {
+                match previous {
+                    Some(previous) => {
+                        guard.insert(row.key.clone(), previous);
+                    }
+                    None => {
+                        guard.remove(&row.key);
+                    }
+                }
+                return Err(err);
+            }
+        }
+        Ok(row)
+    }
+    .await;
+    let payload = match outcome {
+        Ok(row) => {
+            tracing::info!(
+                publication_id = %row.publication_id,
+                key = %row.key,
+                public_name = %row.public_name,
+                "sy-edge published public artifact after local readiness verification"
+            );
+            json!({
+                "status": "ok",
+                "publication_id": row.publication_id,
+                "url": format!("/public/{}", row.key),
+                "ready": true,
+            })
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, trace_id = %msg.routing.trace_id, "sy-edge EDGE_PUBLISH_BLOB failed");
+            json!({"status": "error", "error": err})
+        }
+    };
+    send_edge_reply(sender, msg, MSG_EDGE_PUBLISH_BLOB_RESPONSE, payload, ttl).await;
+}
+
+async fn apply_unpublish_blob(
+    sender: &NodeSender,
+    registry: &Arc<RwLock<HashMap<String, PublicArtifactRow>>>,
+    publications_path: &std::path::Path,
+    msg: &Message,
+    ttl: u8,
+) {
+    let outcome: Result<(String, bool), String> = (|| {
+        authorize_edge_service_command(msg, MSG_EDGE_UNPUBLISH_BLOB)?;
+        let publication_id = msg
+            .payload
+            .get("publication_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| valid_prefixed_uuid(value, "pub"))
+            .ok_or_else(|| "publication_id must be pub:<uuid>".to_string())?
+            .to_string();
+        let mut guard = registry
+            .write()
+            .map_err(|_| "public registry lock poisoned".to_string())?;
+        let key = guard
+            .iter()
+            .find(|(_, row)| row.publication_id == publication_id)
+            .map(|(key, _)| key.clone());
+        let removed_row = key.as_ref().and_then(|key| guard.remove(key));
+        let removed = removed_row.is_some();
+        if removed {
+            if let Err(err) = persist_public_registry(publications_path, &guard) {
+                if let (Some(key), Some(row)) = (key, removed_row) {
+                    guard.insert(key, row);
+                }
+                return Err(err);
+            }
+        }
+        Ok((publication_id, removed))
+    })();
+    let payload = match outcome {
+        Ok((publication_id, removed)) => {
+            tracing::info!(publication_id = %publication_id, removed, "sy-edge unpublished public artifact");
+            json!({"status": "ok", "publication_id": publication_id, "removed": removed})
+        }
+        Err(err) => json!({"status": "error", "error": err}),
+    };
+    send_edge_reply(sender, msg, MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, payload, ttl).await;
+}
+
+fn validate_public_artifact_row(row: &PublicArtifactRow) -> Result<(), String> {
+    if !is_lower_hex_64(&row.key) {
+        return Err("key must be 64 lowercase hex characters".to_string());
+    }
+    if !valid_prefixed_uuid(&row.publication_id, "pub") {
+        return Err("publication_id must be pub:<uuid>".to_string());
+    }
+    if !is_lower_hex_64(&row.public_name)
+        || !is_lower_hex_64(&row.sha256)
+        || row.public_name != row.sha256
+    {
+        return Err("public_name and sha256 must be the same lowercase SHA-256".to_string());
+    }
+    if !matches!(row.presentation.as_str(), "inline" | "attachment") {
+        return Err("presentation must be inline or attachment".to_string());
+    }
+    match row.content_policy.as_str() {
+        "sandboxed-html-v1" if row.content_type == "text/html; charset=utf-8" => {}
+        "static-v1" if allowed_static_content_type(&row.content_type) => {}
+        "download-v1"
+            if row.content_type == "application/octet-stream"
+                && row.presentation == "attachment" => {}
+        _ => return Err("content_type/content_policy combination is not allowed".to_string()),
+    }
+    Ok(())
+}
+
+fn allowed_static_content_type(value: &str) -> bool {
+    matches!(
+        value,
+        "text/plain; charset=utf-8"
+            | "application/json; charset=utf-8"
+            | "application/pdf"
+            | "image/png"
+            | "image/jpeg"
+            | "image/webp"
+            | "image/gif"
+    )
+}
+
+fn is_lower_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_prefixed_uuid(value: &str, prefix: &str) -> bool {
+    value
+        .strip_prefix(&format!("{prefix}:"))
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+        .is_some()
+}
+
+async fn wait_for_public_artifact_ready(
+    public_root: &std::path::Path,
+    row: &PublicArtifactRow,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let root = public_root.to_path_buf();
+        let row = row.clone();
+        let last_error =
+            match tokio::task::spawn_blocking(move || verify_public_artifact_file(&root, &row))
+                .await
+            {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(err)) => err,
+                Err(err) => format!("readiness worker failed: {err}"),
+            };
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "public artifact readiness timed out after {}ms: {last_error}",
+                timeout.as_millis()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn verify_public_artifact_file(
+    public_root: &std::path::Path,
+    row: &PublicArtifactRow,
+) -> Result<(), String> {
+    let canonical_root = public_root
+        .canonicalize()
+        .map_err(|err| format!("public root unavailable: {err}"))?;
+    let path = public_root.join(&row.public_name);
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|err| format!("public artifact unavailable: {err}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("public artifact must be a regular non-symlink file".to_string());
+    }
+    if metadata.len() != row.size {
+        return Err(format!(
+            "public artifact size mismatch: expected={} actual={}",
+            row.size,
+            metadata.len()
+        ));
+    }
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|err| format!("canonicalize public artifact: {err}"))?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err("public artifact resolves outside public root".to_string());
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|err| format!("open public artifact: {err}"))?;
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|err| format!("read public artifact: {err}"))?;
+        if count == 0 {
+            break;
+        }
+        total = total.saturating_add(count as u64);
+        if total > row.size {
+            return Err("public artifact grew while hashing".to_string());
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if total != row.size || actual != row.sha256 {
+        return Err("public artifact SHA-256 verification failed".to_string());
+    }
+    Ok(())
+}
+
+fn load_public_registry(path: &std::path::Path) -> HashMap<String, PublicArtifactRow> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(err) => {
+            tracing::error!(path = %path.display(), error = %err, "sy-edge public registry read failed; starting empty");
+            return HashMap::new();
+        }
+    };
+    let parsed: PublicArtifactsFile = match serde_json::from_slice(&raw) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::error!(path = %path.display(), error = %err, "sy-edge public registry invalid; starting empty");
+            return HashMap::new();
+        }
+    };
+    parsed
+        .publications
+        .into_iter()
+        .filter(|row| validate_public_artifact_row(row).is_ok())
+        .map(|row| (row.key.clone(), row))
+        .collect()
+}
+
+fn persist_public_registry(
+    path: &std::path::Path,
+    registry: &HashMap<String, PublicArtifactRow>,
+) -> Result<(), String> {
+    let mut publications: Vec<_> = registry.values().cloned().collect();
+    publications.sort_by(|left, right| left.key.cmp(&right.key));
+    let data = serde_json::to_vec_pretty(&PublicArtifactsFile { publications })
+        .map_err(|err| format!("serialize public registry: {err}"))?;
+    let temp = path.with_extension("json.tmp");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("create public registry directory: {err}"))?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o640)
+        .open(&temp)
+        .map_err(|err| format!("open temporary public registry: {err}"))?;
+    file.write_all(&data)
+        .and_then(|_| file.sync_all())
+        .map_err(|err| format!("write temporary public registry: {err}"))?;
+    std::fs::rename(&temp, path).map_err(|err| format!("install public registry: {err}"))?;
+    Ok(())
+}
+
 fn authorize_edge_service_command(msg: &Message, action: &str) -> Result<(), String> {
     match msg.routing.src_l2_name.as_deref().map(str::trim) {
         Some(src) if src == json_router::router::system_policy::EDGE_CONTROL_AUTHORITY => Ok(()),
@@ -674,6 +1037,14 @@ struct EdgeSection {
     listen: Option<String>,
     #[serde(default)]
     endpoints_path: Option<String>,
+    #[serde(default)]
+    publications_path: Option<String>,
+    #[serde(default)]
+    blob_public_root: Option<String>,
+    #[serde(default)]
+    public_max_inflight: Option<usize>,
+    #[serde(default)]
+    public_ready_timeout_ms: Option<u64>,
     /// Public TLS cert chain (PEM) + private key (PEM) from DISK. When both are
     /// set the frontend serves HTTPS. Alternatively `tls_vault_key` pulls the same
     /// material from SY.vault (preferred — no cert on the DMZ box's config).
@@ -745,6 +1116,12 @@ impl Config {
         let endpoints_path = env("SY_EDGE_ENDPOINTS")
             .or_else(|| edge.as_ref().and_then(|e| e.endpoints_path.clone()))
             .unwrap_or_else(|| "/etc/fluxbee/edge.endpoints.json".to_string());
+        let publications_path = env("SY_EDGE_PUBLICATIONS")
+            .or_else(|| edge.as_ref().and_then(|e| e.publications_path.clone()))
+            .unwrap_or_else(|| "/var/lib/fluxbee/state/sy-edge/publications.json".to_string());
+        let blob_public_root = env("SY_EDGE_BLOB_PUBLIC_ROOT")
+            .or_else(|| edge.as_ref().and_then(|e| e.blob_public_root.clone()))
+            .unwrap_or_else(|| "/var/lib/fluxbee/blob/public".to_string());
         let tls_cert = env("SY_EDGE_TLS_CERT")
             .or_else(|| edge.as_ref().and_then(|e| e.tls_cert.clone()))
             .map(PathBuf::from);
@@ -777,6 +1154,18 @@ impl Config {
                 .unwrap_or(DEFAULT_MAX_INFLIGHT),
             http_listen,
             endpoints_path: Some(PathBuf::from(endpoints_path)),
+            publications_path: PathBuf::from(publications_path),
+            blob_public_root: PathBuf::from(blob_public_root),
+            public_max_inflight: env("SY_EDGE_PUBLIC_MAX_INFLIGHT")
+                .and_then(|raw| raw.parse().ok())
+                .or_else(|| edge.as_ref().and_then(|e| e.public_max_inflight))
+                .filter(|&value| value > 0)
+                .unwrap_or(DEFAULT_PUBLIC_MAX_INFLIGHT),
+            public_ready_timeout_ms: env("SY_EDGE_PUBLIC_READY_TIMEOUT_MS")
+                .and_then(|raw| raw.parse().ok())
+                .or_else(|| edge.as_ref().and_then(|e| e.public_ready_timeout_ms))
+                .filter(|&value| value > 0)
+                .unwrap_or(DEFAULT_PUBLIC_READY_TIMEOUT_MS),
             tls_cert,
             tls_key,
             tls_vault_key,
@@ -961,6 +1350,8 @@ struct FrontendState {
     dispatcher: Arc<RouterDispatcher>,
     sender: NodeSender,
     registry: Arc<RwLock<HashMap<String, EndpointEntry>>>,
+    public_registry: Arc<RwLock<HashMap<String, PublicArtifactRow>>>,
+    blob_public_root: PathBuf,
     /// The edge's own deterministic ("a fuego") system ilk, stamped as `src_ilk`.
     self_ilk: String,
     ttl: u8,
@@ -968,6 +1359,7 @@ struct FrontendState {
     /// In-flight request limiter (L1, §15.6): a permit is held for each request's whole
     /// lifetime; when none is free the door returns 503 instead of enqueuing unbounded.
     inflight: Arc<Semaphore>,
+    public_inflight: Arc<Semaphore>,
 }
 
 async fn run_frontend(
@@ -978,7 +1370,7 @@ async fn run_frontend(
     let app = Router::new()
         .route("/e/:ich", any(invoke_root))
         .route("/e/:ich/*extra", any(invoke_extra))
-        .route("/b/:ich", any(blob_stub))
+        .route("/public/:key", any(serve_public_artifact))
         .route("/healthz", any(|| async { "ok" }))
         .with_state(state);
     let listener = TcpListener::bind(&listen).await?;
@@ -1167,13 +1559,244 @@ async fn invoke_extra(
     invoke(state, ich, extra, req).await
 }
 
-async fn blob_stub(AxumPath(_hash): AxumPath<String>) -> Response {
-    // §8 blob egress is a later increment.
+async fn serve_public_artifact(
+    State(state): State<Arc<FrontendState>>,
+    AxumPath(key): AxumPath<String>,
+    req: Request,
+) -> Response {
+    if !matches!(*req.method(), Method::GET | Method::HEAD) {
+        return Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header(header::ALLOW, "GET, HEAD")
+            .body(Body::empty())
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+    }
+    if !is_lower_hex_64(&key) {
+        return public_not_found();
+    }
+    let row = match state
+        .public_registry
+        .read()
+        .ok()
+        .and_then(|guard| guard.get(&key).cloned())
+    {
+        Some(row) => row,
+        None => return public_not_found(),
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if row.expires_at <= now {
+        return public_not_found();
+    }
+
+    let etag = format!("\"{}\"", row.sha256);
+    if request_etag_matches(req.headers(), &etag) {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, etag)
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::empty())
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+    }
+    let permit = match Arc::clone(&state.public_inflight).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return http_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "PUBLIC_BUSY",
+                "public artifact capacity exhausted",
+            )
+        }
+    };
+    let root = state.blob_public_root.clone();
+    let open_row = row.clone();
+    let file = match tokio::task::spawn_blocking(move || {
+        open_public_artifact_file(&root, &open_row)
+    })
+    .await
+    {
+        Ok(Ok(file)) => file,
+        Ok(Err(err)) => {
+            tracing::warn!(publication_id = %row.publication_id, error = %err, "public artifact file unavailable");
+            return public_not_found();
+        }
+        Err(err) => {
+            tracing::warn!(publication_id = %row.publication_id, error = %err, "public artifact open worker failed");
+            return public_not_found();
+        }
+    };
+
+    let (start, end, partial) = match parse_single_byte_range(
+        req.headers()
+            .get(header::RANGE)
+            .and_then(|value| value.to_str().ok()),
+        row.size,
+    ) {
+        Ok(range) => range,
+        Err(()) => {
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::CONTENT_RANGE, format!("bytes */{}", row.size))
+                .header(header::ACCEPT_RANGES, "bytes")
+                .body(Body::empty())
+                .unwrap_or_else(|_| Response::new(Body::empty()));
+        }
+    };
+    let content_length = if row.size == 0 { 0 } else { end - start + 1 };
+    let mut builder = Response::builder()
+        .status(if partial {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        })
+        .header(header::CONTENT_TYPE, row.content_type.as_str())
+        .header(header::CONTENT_LENGTH, content_length.to_string())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
+        .header("x-robots-tag", "noindex, nofollow, noarchive")
+        .header("referrer-policy", "no-referrer")
+        .header(
+            header::CONTENT_DISPOSITION,
+            if row.presentation == "attachment" {
+                format!("attachment; filename=\"{}\"", row.public_name)
+            } else {
+                "inline".to_string()
+            },
+        );
+    if partial {
+        builder = builder.header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{}", row.size),
+        );
+    }
+    if row.content_policy == "sandboxed-html-v1" {
+        builder = builder.header(
+            header::CONTENT_SECURITY_POLICY,
+            "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; \
+             style-src 'unsafe-inline'; img-src data: blob:; font-src data:; \
+             connect-src 'none'; form-action 'none'; object-src 'none'; base-uri 'none'",
+        );
+    }
+    if req.method() == Method::HEAD || content_length == 0 {
+        drop(permit);
+        return builder
+            .body(Body::empty())
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+    }
+
+    let mut file = tokio::fs::File::from_std(file);
+    if let Err(err) = file.seek(SeekFrom::Start(start)).await {
+        tracing::warn!(publication_id = %row.publication_id, error = %err, "public artifact seek failed");
+        return public_not_found();
+    }
+    let stream = futures::stream::try_unfold(
+        (file, permit, content_length),
+        |(mut file, permit, remaining): (tokio::fs::File, OwnedSemaphorePermit, u64)| async move {
+            if remaining == 0 {
+                return Ok(None);
+            }
+            let mut buffer = vec![0_u8; remaining.min(64 * 1024) as usize];
+            let count = file.read(&mut buffer).await?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "public artifact changed during response",
+                ));
+            }
+            buffer.truncate(count);
+            Ok(Some((
+                Bytes::from(buffer),
+                (file, permit, remaining - count as u64),
+            )))
+        },
+    );
+    builder
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+fn public_not_found() -> Response {
     http_error(
-        StatusCode::NOT_IMPLEMENTED,
-        "BLOB_NOT_IMPLEMENTED",
-        "blob egress not implemented yet",
+        StatusCode::NOT_FOUND,
+        "PUBLIC_ARTIFACT_NOT_FOUND",
+        "public artifact not found",
     )
+}
+
+fn request_etag_matches(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|candidate| candidate == "*" || candidate == etag)
+        })
+}
+
+fn parse_single_byte_range(value: Option<&str>, size: u64) -> Result<(u64, u64, bool), ()> {
+    let Some(value) = value else {
+        return Ok((0, size.saturating_sub(1), false));
+    };
+    let raw = value.strip_prefix("bytes=").ok_or(())?;
+    if raw.contains(',') || raw.is_empty() || size == 0 {
+        return Err(());
+    }
+    let (start, end) = raw.split_once('-').ok_or(())?;
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().map_err(|_| ())?;
+        if suffix == 0 {
+            return Err(());
+        }
+        let start = size.saturating_sub(suffix.min(size));
+        return Ok((start, size - 1, true));
+    }
+    let start = start.parse::<u64>().map_err(|_| ())?;
+    if start >= size {
+        return Err(());
+    }
+    let end = if end.is_empty() {
+        size - 1
+    } else {
+        end.parse::<u64>().map_err(|_| ())?.min(size - 1)
+    };
+    if end < start {
+        return Err(());
+    }
+    Ok((start, end, true))
+}
+
+fn open_public_artifact_file(
+    public_root: &std::path::Path,
+    row: &PublicArtifactRow,
+) -> Result<std::fs::File, String> {
+    let canonical_root = public_root
+        .canonicalize()
+        .map_err(|err| format!("public root unavailable: {err}"))?;
+    let path = public_root.join(&row.public_name);
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|err| format!("public artifact unavailable: {err}"))?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err("public artifact resolves outside public root".to_string());
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|err| format!("open public artifact: {err}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|err| format!("stat public artifact: {err}"))?;
+    if !metadata.is_file() || metadata.len() != row.size {
+        return Err("public artifact file facts changed".to_string());
+    }
+    Ok(file)
 }
 
 async fn invoke(state: Arc<FrontendState>, ich: String, extra: String, req: Request) -> Response {
@@ -1594,7 +2217,10 @@ mod tests {
         assert_eq!(ich, "ich:1");
         assert_eq!(entry.owner_l2_name, "IO.cloud@motherbee");
         assert_eq!(entry.inbound_family, "user");
-        assert_eq!(entry.secret_ref.as_deref(), Some("edge_channel_secret:ich:1"));
+        assert_eq!(
+            entry.secret_ref.as_deref(),
+            Some("edge_channel_secret:ich:1")
+        );
         assert_eq!(entry.tenant_id.as_deref(), Some("tenant-a"));
 
         // Two opens accumulate (upsert), not replace — a second URL does not wipe the first.
@@ -1774,6 +2400,66 @@ mod tests {
         assert_eq!(normalize_extra_path(""), "/");
         assert_eq!(normalize_extra_path("webhooks/stripe"), "/webhooks/stripe");
         assert_eq!(normalize_extra_path("/already"), "/already");
+    }
+
+    fn sample_public_row(data: &[u8]) -> PublicArtifactRow {
+        let sha256 = format!("{:x}", Sha256::digest(data));
+        PublicArtifactRow {
+            key: "ab".repeat(32),
+            publication_id: format!("pub:{}", Uuid::new_v4()),
+            public_name: sha256.clone(),
+            sha256,
+            size: data.len() as u64,
+            content_type: "text/html; charset=utf-8".to_string(),
+            presentation: "inline".to_string(),
+            expires_at: u64::MAX,
+            content_policy: "sandboxed-html-v1".to_string(),
+        }
+    }
+
+    #[test]
+    fn public_registry_round_trips_and_file_facts_are_verified() {
+        let root = std::env::temp_dir().join(format!("sy-edge-public-{}", Uuid::new_v4()));
+        let public_root = root.join("public");
+        let registry_path = root.join("state/publications.json");
+        std::fs::create_dir_all(&public_root).unwrap();
+        let data = b"<!doctype html><script>document.body.textContent='ok'</script>";
+        let row = sample_public_row(data);
+        std::fs::write(public_root.join(&row.public_name), data).unwrap();
+        assert!(validate_public_artifact_row(&row).is_ok());
+        verify_public_artifact_file(&public_root, &row).unwrap();
+
+        let mut registry = HashMap::new();
+        registry.insert(row.key.clone(), row.clone());
+        persist_public_registry(&registry_path, &registry).unwrap();
+        assert_eq!(
+            load_public_registry(&registry_path).get(&row.key),
+            Some(&row)
+        );
+
+        std::fs::write(public_root.join(&row.public_name), b"changed").unwrap();
+        assert!(verify_public_artifact_file(&public_root, &row).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn public_byte_ranges_accept_one_bounded_range() {
+        assert_eq!(parse_single_byte_range(None, 100), Ok((0, 99, false)));
+        assert_eq!(
+            parse_single_byte_range(Some("bytes=10-19"), 100),
+            Ok((10, 19, true))
+        );
+        assert_eq!(
+            parse_single_byte_range(Some("bytes=-10"), 100),
+            Ok((90, 99, true))
+        );
+        assert_eq!(
+            parse_single_byte_range(Some("bytes=95-"), 100),
+            Ok((95, 99, true))
+        );
+        assert!(parse_single_byte_range(Some("bytes=0-1,4-5"), 100).is_err());
+        assert!(parse_single_byte_range(Some("bytes=100-"), 100).is_err());
+        assert!(parse_single_byte_range(Some("bytes=0-0"), 0).is_err());
     }
 
     #[test]

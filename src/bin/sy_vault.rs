@@ -184,9 +184,9 @@ async fn main() -> Result<(), VaultError> {
     // Model D' / Phase J'-13: vault is self-contained and does NOT wait
     // for identity SHM. It computes every system ILK it needs locally with
     // the same deterministic formula identity uses to seed SHM. This
-    // eliminates the legacy chicken-and-egg where vault had to boot AFTER
-    // identity even though identity itself needs vault to resolve its
-    // postgres secret. Order is now: SY.config.routes → SY.vault → SY.identity.
+    // eliminates the legacy chicken-and-egg even though identity needs vault
+    // to resolve its postgres secret. The lifecycle still starts vault last so
+    // its bootstrap broadcasts reach consumers already registered in router.
     let self_ilk_id = fluxbee_sdk::deterministic_system_ilk_id(&node_name);
     tracing::info!(self_ilk_id = %self_ilk_id, "self system ILK computed deterministically (no SHM wait)");
 
@@ -207,7 +207,7 @@ async fn main() -> Result<(), VaultError> {
         set
     };
 
-    // Well-known SY system ILKs — the full `system_nodes` list from
+    // Well-known SY system ILKs — the SY.* entries from `system_nodes` in
     // hive.yaml plus the admin/architect override set. Used by
     // `authorize_read` to grant root-tenant pool reads to any SY system
     // caller WITHOUT requiring identity SHM to be populated. This is the
@@ -328,7 +328,7 @@ impl HandlerOutcome {
 
 /// Compute the set of well-known SY system ILKs from `hive.yaml`. Includes
 /// `self_ilk` (vault), `well_known_admin_ilks` (admin + architect), and
-/// every entry in `system_nodes.<role>.nodes` mapped via
+/// every SY.* entry in `system_nodes.<role>.nodes` mapped via
 /// `deterministic_system_ilk_id`. Reads `hive.yaml` directly from disk;
 /// does NOT depend on identity SHM being populated. This is what closes
 /// the boot chicken-and-egg in Model D'.
@@ -369,6 +369,14 @@ fn compute_well_known_system_ilks(
     {
         for entry in nodes {
             if let Some(name) = entry.as_str() {
+                let name = name.trim();
+                if !name.starts_with("SY.") {
+                    tracing::debug!(
+                        node = name,
+                        "skipping non-SY lifecycle node in well-known system ILK set"
+                    );
+                    continue;
+                }
                 let l2 = if name.contains('@') {
                     name.to_string()
                 } else {
@@ -1665,6 +1673,41 @@ mod tests {
 
         authorize_read(&caller, &metadata, &well_known_system_ilks, true)
             .expect("well-known system caller reads root pool");
+    }
+
+    #[test]
+    fn well_known_system_ilks_exclude_packaged_io_lifecycle_nodes() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "fluxbee-vault-system-ilks-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&config_dir).expect("create config dir");
+        fs::write(
+            config_dir.join("hive.yaml"),
+            "hive_id: motherbee\nrole: motherbee\nsystem_nodes:\n  motherbee:\n    nodes:\n      - SY.identity\n      - IO.blob\n",
+        )
+        .expect("write hive config");
+
+        let self_ilk = fluxbee_sdk::deterministic_system_ilk_id("SY.vault@motherbee");
+        let admin_ilk = fluxbee_sdk::deterministic_system_ilk_id("SY.admin@motherbee");
+        let admin_set = HashSet::from([admin_ilk.clone()]);
+        let system_ilks =
+            compute_well_known_system_ilks(&config_dir, "motherbee", &self_ilk, &admin_set);
+
+        assert!(system_ilks.contains(&self_ilk));
+        assert!(system_ilks.contains(&admin_ilk));
+        assert!(
+            system_ilks.contains(&fluxbee_sdk::deterministic_system_ilk_id(
+                "SY.identity@motherbee"
+            ))
+        );
+        assert!(
+            !system_ilks.contains(&fluxbee_sdk::deterministic_system_ilk_id(
+                "IO.blob@motherbee"
+            ))
+        );
+
+        fs::remove_dir_all(config_dir).expect("remove config dir");
     }
 
     #[test]

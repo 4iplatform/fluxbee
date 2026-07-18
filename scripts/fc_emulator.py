@@ -17,10 +17,14 @@ exercised end-to-end with real security:
 
 The edge exposes one channel as `<edge>/e/<ich>`; the request body is the cloud op envelope
 `{op, tenant_id, params}` (spec docs/io-cloud-spec-v1.md §1.2 — the tenant is Cloud-asserted).
-The entry `token` is the shared-secret minted by SY.admin at externalize (spec §8) and handed to
-FC out-of-band; the edge checks `Authorization: Bearer <token>` at the door.
+The entry `token` is the `IO_CLOUD_SECRET` service bearer configured in both IO.cloud and FC; SY.admin
+stores it in vault during externalize and the edge checks `Authorization: Bearer <token>` at the door.
 
 Usage:
+  # create an active tenant (no tenant_id is sent for this operation)
+  fc_emulator.py --edge https://192.168.4.41:8443 --ich ich:<uuid> --token <tok> --insecure \
+      create-tenant --name Acme --domain acme.example
+
   # store a provider token (the "guardar tokens" path)
   fc_emulator.py --edge https://192.168.4.41:8443 --ich ich:<uuid> --token <tok> --insecure \
       put-token --key wapp_token:acme --value-token sk-live-xyz --resource-type bearer_token
@@ -46,6 +50,7 @@ import ssl
 import sys
 import urllib.error
 import urllib.request
+import uuid
 
 DEFAULT_TENANT = "tnt:00000000-0000-0000-0000-000000000001"
 
@@ -69,12 +74,20 @@ class FluxbeeCloudClient:
         else:
             self._ctx = None  # plaintext http
 
-    def call(self, op, params, token="__default__"):
+    def call(self, op, params, token="__default__", tenant="__default__"):
         """POST one cloud op. `token` overrides the instance token (for probe cases:
         None = send no Authorization header; a string = send that bearer). Returns
         (http_status, parsed_body_or_text)."""
         tok = self.token if token == "__default__" else token
-        body = json.dumps({"op": op, "tenant_id": self.tenant, "params": params}).encode()
+        tenant_id = self.tenant if tenant == "__default__" else tenant
+        envelope = {
+            "op": op,
+            "request_id": str(uuid.uuid4()),
+            "params": params,
+        }
+        if tenant_id is not None:
+            envelope["tenant_id"] = tenant_id
+        body = json.dumps(envelope).encode()
         headers = {"Content-Type": "application/json"}
         if tok is not None:
             headers["Authorization"] = "Bearer %s" % tok
@@ -90,17 +103,30 @@ class FluxbeeCloudClient:
                      "LAN?)" % (self.url, e.reason))
 
     # --- cloud ops (spec io-cloud-spec-v1.md) ----------------------------------------
-    def put_token(self, key, value_token, resource_type):
-        return self.call("put_token", {
+    def create_tenant(self, name, domain=None, status="active"):
+        params = {"name": name, "status": status}
+        if domain:
+            params["domain"] = domain
+        return self.call("create_tenant", params, tenant=None)
+
+    def put_token(self, key, value_token, resource_type, owner_node=None):
+        params = {
             "key": key,
             "value": {"token": value_token},
             "resource_type": resource_type,
-        })
+        }
+        if owner_node:
+            params["owner_node"] = owner_node
+        return self.call("put_token", params)
 
-    def provision_node(self, node_name, runtime=None):
+    def provision_node(self, node_name, runtime=None, runtime_version="current", config=None):
         params = {"node_name": node_name}
         if runtime:
             params["runtime"] = runtime
+        if runtime_version:
+            params["runtime_version"] = runtime_version
+        if config is not None:
+            params["config"] = config
         return self.call("provision_node", params)
 
 
@@ -120,14 +146,28 @@ def _emit(status, body):
     print(json.dumps(body, indent=2) if isinstance(body, dict) else body)
 
 
+def cmd_create_tenant(c, a):
+    status, body = c.create_tenant(a.name, a.domain, a.status)
+    _emit(status, body)
+    return 0 if (status == 200 and _ok(body)) else 1
+
+
 def cmd_put_token(c, a):
-    status, body = c.put_token(a.key, a.value_token, a.resource_type)
+    status, body = c.put_token(a.key, a.value_token, a.resource_type, a.owner_node)
     _emit(status, body)
     return 0 if (status == 200 and _ok(body)) else 1
 
 
 def cmd_provision_node(c, a):
-    status, body = c.provision_node(a.node_name, a.runtime)
+    config = None
+    if a.config_json:
+        try:
+            config = json.loads(a.config_json)
+        except json.JSONDecodeError as exc:
+            sys.exit("invalid --config-json: %s" % exc)
+        if not isinstance(config, dict):
+            sys.exit("--config-json must decode to a JSON object")
+    status, body = c.provision_node(a.node_name, a.runtime, a.runtime_version, config)
     _emit(status, body)
     # A missing io.wapp runtime is a real, expected error until one is published — surface it
     # honestly rather than pretending success.
@@ -174,15 +214,25 @@ def main():
     p.add_argument("--timeout", type=int, default=15)
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    s = sub.add_parser("create-tenant", help="create an active tenant via the edge")
+    s.add_argument("--name", required=True)
+    s.add_argument("--domain", default=None)
+    s.add_argument("--status", choices=("active", "pending", "suspended"), default="active")
+    s.set_defaults(fn=cmd_create_tenant)
+
     s = sub.add_parser("put-token", help="store a provider token via the edge")
     s.add_argument("--key", required=True)
     s.add_argument("--value-token", required=True)
     s.add_argument("--resource-type", default="bearer_token")
+    s.add_argument("--owner-node", default=None,
+                   help="optional IO.* owner; omit for the tenant pool")
     s.set_defaults(fn=cmd_put_token)
 
     s = sub.add_parser("provision-node", help="launch a node via the edge (needs an io.wapp runtime)")
     s.add_argument("--node-name", required=True)
     s.add_argument("--runtime", default=None)
+    s.add_argument("--runtime-version", default="current")
+    s.add_argument("--config-json", default=None, help="runtime config as one JSON object")
     s.set_defaults(fn=cmd_provision_node)
 
     sub.add_parser("probe", help="full security probe: no/wrong token 401, correct 200").set_defaults(fn=cmd_probe)

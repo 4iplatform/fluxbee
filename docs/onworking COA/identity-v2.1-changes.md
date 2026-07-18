@@ -266,28 +266,28 @@ At startup, `sy.identity` reads the active role's `system_nodes` list from `hive
 - Identification includes `node_name`, `system_node`, `service` (derived from the node name: `SY.config.routes` → `sy-config-routes`), `hive_id`, and `source: hive.system_nodes`.
 - `registration_status`: `complete`.
 
-`SY.identity` must be the first configured `system_nodes` entry. Workers use their own `system_nodes.worker` list; workers do not run `SY.vault` unless the product topology is explicitly changed later.
+`SY.config.routes` must be the first configured `system_nodes` entry. Workers use their own `system_nodes.worker` list; workers do not run `SY.vault` unless the product topology is explicitly changed later. The motherbee list may also contain an explicitly allowlisted packaged worker such as `IO.blob`; Identity validates but skips that entry because it is lifecycle-managed without becoming a `system` authority. Vault applies the same `SY.*` filter when deriving its local allowlist, so a packaged worker does not gain root-pool secret access from this list.
 
 #### Compact YAML schema
 
-`hive.yaml`'s `system_nodes` section is a per-role object with two lists. The orchestrator iterates `nodes` to drive `systemd_start`; the bootstrap wait blocks on `wait_for`. Service names are derived from the base name (`SY.X.Y` → `sy-x-y`); the exec path is `/usr/bin/<service>`. No per-entry `start` / `critical` / `exec` / `service` fields — those are constants in code.
+Each role in `hive.yaml`'s `system_nodes` section has two lists. The orchestrator iterates `nodes` to drive `systemd_start`; the bootstrap wait blocks on `wait_for`. Service names are derived from the base name (`SY.X.Y` → `sy-x-y`), with exact packaged exceptions such as `IO.blob` → `io-blob`; the exec path is `/usr/bin/<service>`. No per-entry `start` / `critical` / `exec` / `service` fields — those are constants in code.
 
 ```yaml
 system_nodes:
   motherbee:
-    nodes: [SY.identity, SY.config.routes, SY.opa.rules, SY.admin, SY.architect,
-            SY.vault, SY.storage, SY.cognition, SY.policy, SY.timer,
-            SY.wf-rules, SY.frontdesk.gov]
-    wait_for: [SY.identity, SY.config.routes, SY.opa.rules, SY.admin,
-               SY.cognition, SY.policy, SY.timer]
+    nodes: [SY.config.routes, SY.identity, SY.opa.rules, SY.admin, IO.blob, SY.architect,
+            SY.storage, SY.cognition, SY.policy, SY.timer, SY.wf-rules,
+            SY.frontdesk.gov, SY.vault]
+    wait_for: [SY.config.routes, SY.identity, SY.opa.rules, SY.admin, IO.blob,
+               SY.cognition, SY.policy, SY.timer, SY.vault]
   worker:
-    nodes: [SY.identity, SY.config.routes, SY.opa.rules, SY.cognition,
+    nodes: [SY.config.routes, SY.identity, SY.opa.rules, SY.cognition,
             SY.policy, SY.timer, SY.wf-rules]
-    wait_for: [SY.identity, SY.config.routes, SY.opa.rules, SY.cognition,
+    wait_for: [SY.config.routes, SY.identity, SY.opa.rules, SY.cognition,
                SY.policy, SY.timer]
 ```
 
-Validation enforced at orchestrator + identity boot: `nodes[0]` must be `SY.identity`; every name must start with `SY.`; `wait_for` must be a subset of `nodes`; workers reject `SY.vault`; no duplicates.
+Validation enforced at orchestrator + identity boot: `nodes[0]` must be `SY.config.routes`; names must start with `SY.` except exact allowlisted motherbee packaged workers; `wait_for` must be a subset of `nodes`; non-motherbee roles reject `SY.vault`; no duplicates. Identity seeds deterministic `system` ILKs only for the `SY.*` entries.
 
 ### 2.10 Each SY reads its own ILK at boot
 

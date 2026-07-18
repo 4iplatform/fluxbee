@@ -1,6 +1,7 @@
 # IO.cloud — spec v1 (el representante interno de Fluxbee Cloud)
 
-Estado: **borrador alpha**. Fecha: 2026-07-09. Branch: `daily_onworking_coa`.
+Estado: **alpha implementada para provisioning**. Fecha de actualización: 2026-07-17. Branch:
+`daily_onworking_coa`.
 Alcance: define QUÉ es `IO.cloud`, su rol de provisioning, el seam `IO.cloud → SY.admin`, el
 modelo de confianza y de vault, y los pendientes/seguridad a tener presentes. **No** define los
 adaptadores por-proveedor (`IO.wapp`, etc.) — esos son "otra vida", con canal y seguridad propios.
@@ -40,10 +41,11 @@ adaptador, canal y seguridad.
   semi-confiable del control-plane, **no** un bearer token por usuario.
 - **Tier 2 — usuario final vía Cloud**: scopeado siempre a su tenant (usa sus nodos). Autenticado por
   su **sesión** OAuth.
-- **Requisito transversal (la pieza que hoy NO existe):** hilar el **tenant/subject verificado**
-  desde Cloud hasta `SY.admin`/`SY.identity`/`SY.vault`. Sin eso, cada acción es un *confused deputy*
-  (ver §8.1). El modelo: el token autentica a *Cloud-como-servicio*; Cloud **asegura** el tenant por
-  request (claim avalado por su OAuth); admin **scopea** a ese tenant confiando en Cloud.
+- **Decisión alpha (2026-07-17):** el bearer de servicio configurado como `IO_CLOUD_SECRET` es la
+  autoridad de Fluxbee Cloud. El edge valida ese bearer y Cloud **asegura** el `tenant_id` de cada
+  request. `IO.cloud` valida el origen contra `IO_CLOUD_EDGE_NODE` + su ICH propio, acepta solo el catálogo §3.2 e
+  inyecta el tenant en las llamadas admin. Una identidad/firma por usuario final queda diferida para
+  producción; no se agregó un segundo mecanismo de auth paralelo.
 
 ---
 
@@ -58,22 +60,27 @@ Lo que `IO.cloud` hace HOY (`nodes/io/io-cloud/src/main.rs`):
 3. **Registra su ICH** (`ensure_own_ich` en `nodes/io/common/src/provision.rs`): `ILK_ADD_CHANNEL` +
    `set_ich_enabled(true)`. El owner se estampa server-side desde `src_l2_name` → el ICH queda owned
    by `IO.cloud`.
-4. **Self-externalize condicional** (solo si `IO_CLOUD_EDGE_NODE` seteado): `send_admin_rpc(
-   action:"externalize", ...)` a `SY.admin`, retry hasta que el edge exista
-   (`publish_channel_on_edge_with_retry`). Es la **única** llamada admin que hace.
-5. **Handler = echo puro** (`run_loop`): lee `meta.ich`, responde en la misma familia con
-   `{status:"ok", handled_by, ich, echo:payload}`. **Sin** dispatch por ich, **sin** tenant/subject,
-   **sin** provisioning, **sin** cliente saliente.
+4. **Self-externalize condicional y fail-closed**: si `IO_CLOUD_EDGE_NODE` está seteado también exige
+   `IO_CLOUD_SECRET`; publica `auth_mode:"shared-secret"`, `methods:["POST"]` y reintenta hasta que el
+   edge exista (`publish_channel_on_edge_with_retry`). No registra el bearer ni el payload completo.
+5. **Gate local de entrada** (`authorize_cloud_message`): acepta únicamente mensajes con origen
+   router-stamped igual a `IO_CLOUD_EDGE_NODE` y `meta.ich` igual al ICH propio de `IO.cloud`.
+6. **Relay real y acotado** (`translate_cloud_op` + `dispatch_cloud_op`): traduce
+   `create_tenant`→`create_tenant`, `put_token`→`vault_put` y `provision_node`→`run_node`, propaga
+   `request_id` y devuelve respuestas shapeadas sin lectura de secretos.
+7. **Catch-all sin respuestas espurias**: como `RouteMatch::Any` también recibe notificaciones internas,
+   los mensajes cuyo origen router-stamped no sea el edge configurado se ignoran sin responder. Una
+   petición que sí llega desde ese edge pero no cumple ICH/método/contrato recibe el rechazo shapeado.
 
 Lo que **NO** tiene hoy:
 - Sin dispatch por `ich` a tenant/conversación (el comentario "a real IO.cloud dispatches by ich" es
   solo eso, un comentario).
 - Sin cliente saliente a ningún backend externo (deps: `fluxbee-sdk`, `io-common`, `serde_json`,
   `tokio`, `tracing` — **cero** `reqwest`/`hyper`/`axum`).
-- Sin handler de relay de comandos admin (solo es *cliente* de `externalize`).
-- Sin hilado de tenant/subject en el path del request.
+- Sin identidad/firma de usuario final; en alpha el bearer de servicio es la autoridad y el tenant es
+  un claim confiado de Cloud.
 - Nunca escribe a vault (para shared-secret solo pasa `IO_CLOUD_SECRET` como `params.secret` y admin
-  lo guarda).
+  lo guarda). Para tokens de proveedor escribe siempre vía `SY.admin`, nunca directo.
 
 > El molde de IO.cloud (nodo real + externalize + handler) sirve; falta la lógica de producto.
 > Ver también EDGE-09 en `docs/audits/2026-07-06-sy-edge-ingress-audit.md`.
@@ -122,10 +129,12 @@ El subconjunto acotado que `IO.cloud` expone (NO "todo admin"). Cada acción, su
 | Acción | Ruta | Destino | Notas |
 |---|---|---|---|
 | `create_tenant` | Command | `SY.identity` (`TNT_CREATE`) | tenant_id = `tnt:<uuid>` |
-| `set_ilk_definition` / `ILK_PROVISION` | Command | `SY.identity` | ilk del nodo IO |
-| `vault_put` | Command | `SY.vault` | secret owned-by `IO.<x>@<tenant>` (ver §4) |
-| `run_node` (start/restart) | Command | `SY.orchestrator` | spawn del nodo IO; **requiere tenant** |
-| `externalize` / `unexternalize` / `list_externalized` | inline | edge | webhooks inbound; **ya con authz I1+I8** |
+| `put_token` → `vault_put` | Command | `SY.vault` | pool del tenant u owner `IO.*` ya registrado; descarta `ilk`/ownership crudo (ver §4) |
+| `provision_node` → `run_node` | Command | `SY.orchestrator` | spawn de un nodo `IO.*`; **requiere tenant** |
+
+`externalize` se usa internamente durante el bootstrap de `IO.cloud`, pero no forma parte del API
+público de Cloud. `set_ilk_definition`, `start_node`, lecturas de vault y el resto de admin tampoco se
+exponen. `IO_CLOUD_EXPOSED_ACTIONS` en `SY.admin` contiene exactamente las tres acciones de la tabla.
 
 Fuera del catálogo día-1 (NO exponer al token público): `add_hive` (toma `ssh_user`/`ssh_password`),
 `vault_get`/lectura cruda de secretos, `executor_execute_plan` (LLM → acciones = prompt-injection→root),
@@ -142,8 +151,9 @@ Confirmado en código (`src/bin/sy_vault.rs :: authorize_read`, `resolve_caller`
   (ilks deterministas). ⇒ **`IO.cloud` nunca escribe vault directo**; lo hace **vía `ADMIN_COMMAND
   vault_put`** y admin escribe como `SY.admin`.
 - **Dueño designado por ilk.** Admin acepta `metadata.owner_node` (nombre L2 amigable) y lo resuelve a
-  `metadata.ilk` (vía identity SHM `find_ilk_by_handler_node_from_hive_config`, else fallback
-  determinista). El secreto queda owned por ESE ilk, **no** por el del escritor.
+  `metadata.ilk` vía identity SHM (`find_ilk_by_handler_node_from_hive_config`). El fallback
+  determinista se permite solo para nodos `SY.*`; un owner dinámico `IO.*` no registrado falla de
+  forma explícita. El secreto queda owned por ESE ilk, **no** por el del escritor.
 - **Lectura por match de ilk, sin bypass de admin.** `authorize_read`: si el secreto tiene `owner_ilk`
   y `caller.ilk_id == owner_ilk` → OK; **el admin/escritor NO puede releerlo** (doc explícito: "No admin
   bypass"). Tests: `authorize_read_denies_dedicated_secret_to_different_ilk`.
@@ -166,25 +176,30 @@ que `IO.cloud` orquesta:
 
 1. **Tenant** existe (Tier 1, del OAuth de Cloud). Si es nuevo: `create_tenant`.
 2. Cloud corre el registro de WhatsApp (externo) → obtiene el credential. **Cloud no se queda con nada.**
-3. **Provision del ilk** de `IO.wapp@<tenant>` (`ILK_PROVISION`, tipo `agent`) — **antes** del vault_put
-   (Caveat B: el owner→ilk debe resolver al ilk real registrado).
-4. **`vault_put`** del credential, `owner_node = IO.wapp@<tenant>`, scopeado → solo `IO.wapp` lo lee.
-5. **`run_node`** de `IO.wapp` (runtime `io.wapp`, con `tenant_id`; systemd `fluxbee-node-<name>`).
+3. Elegir el orden según el secreto:
+   - si el nodo lo necesita en el primer boot, **`put_token` sin `owner_node`** lo guarda en el pool
+     del tenant;
+   - para un secreto dedicado, ejecutar primero **`provision_node`**, que registra el ilk real, y luego
+     `put_token` con `owner_node = IO.wapp@<tenant>`.
+4. **`provision_node`** de `IO.wapp` (runtime `io.wapp`, con `tenant_id`; systemd
+   `fluxbee-node-<name>`). Los nodos managed se registran como principals `agent`, no `system`.
+5. **`put_token` owner-scoped** posterior al registro, cuando se requiera que solo ese nodo lo lea.
 6. **`externalize`** del canal inbound de `IO.wapp` (URL pública para los **webhooks** de WhatsApp) — el
    flujo ya endurecido esta sesión.
 7. `IO.wapp` corriendo: **outbound** (cliente a la API de WhatsApp, lee su token de vault) + **inbound**
    (webhook → edge → `IO.wapp`).
 
-> **Ojo (net-new):** hoy NO existe (a) runtime `io.wapp`, (b) una orquestación "provisionar nodo IO para
-> un tenant" que ate create_tenant→ilk→vault→spawn→externalize. Son piezas a construir sobre el plumbing
-> genérico de managed-node (§6).
+> **Ojo (net-new):** hoy NO existe el runtime `io.wapp`. El relay genérico de tenant/token/spawn ya
+> existe; una transacción compuesta con rollback y externalize del adaptador sigue siendo trabajo de
+> producto sobre el plumbing managed-node (§6).
 
 ---
 
 ## 6. Cómo se crean tenant / ilk / nodo (grounded)
 
 - **Tenant:** `create_tenant` (admin) → `SY.identity :: TNT_CREATE` → `IdentityStore::create_tenant`
-  (mint `tenant_id = tnt:<uuid>`, status default `pending`). Autorizado en identity solo para
+  (mint `tenant_id = tnt:<uuid>`). El default genérico es `pending`; `IO.cloud` envía `active` por
+  default porque el bearer de Cloud es la autoridad alpha. Autorizado en identity solo para
   `SY.admin@`/`SY.architect@`/`SY.frontdesk.gov@` **same-hive** — **`IO.*` no puede crear tenants
   directo**, solo vía admin. Root tenant = `tnt:00000000-…-0001` (`fluxbee`, guarda secretos de infra).
 - **Ilk de nodo IO:** `ILK_PROVISION` (autorizado por prefijo `IO.`, cross-hive) →
@@ -193,7 +208,8 @@ que `IO.cloud` orquesta:
   `ILK_ADD_CHANNEL`/`ICH_SET_ENABLED`) es un paso aparte, no codificado como un flow único.
 - **Spawn:** `run_node` (admin) → `SY.orchestrator :: run_node_flow` → `SPAWN_NODE`. Runtime = primeros
   2 segmentos del nombre (`IO.wapp.<x>` → `io.wapp`). **Requiere `tenant_id`** para `IO.`/`AI.`
-  (`run_node_args_require_tenant`). Inyecta `FLUXBEE_NODE_ILK_ID`/`FLUXBEE_NODE_TENANT_ID` al unit.
+  (`run_node_args_require_tenant`). Inyecta `FLUXBEE_NODE_ILK_ID`/`FLUXBEE_NODE_TENANT_ID` al unit y
+  registra workloads managed (`AI`/`IO`/`WF`/`RT`) como principals `agent`.
 - **Namespacing:** `ilk_id` es `ilk:<uuid>` (random para IO/AI); el `node@hive` va en
   `identification.node_name`/`ChannelRecord.owner_l2_name`. Solo los SY.* tienen ilk determinista
   (SHA256 del nombre).
@@ -208,40 +224,48 @@ que `IO.cloud` orquesta:
 - Cuando se expongan reads grandes, dos problemas distintos:
   - **Estructurado grande** (list nodes, inventory) → **paginación** (cursor desde admin, pasado punta a
     punta). Blob NO sirve acá.
-  - **Opaco grande** (archivo, contexto LLM) → **blob por hash** (out-of-band). Idea del operador:
-    un `IO.blob` que expone `/blob/<hash>` en el edge, scopeado por tenant. Content-addressed ⇒ una sola
-    superficie, no canal-por-IO.
+  - **Opaco grande** (archivo, contexto LLM) → public artifact out-of-band. El productor llama directo
+    a `SY.admin` para conservar su identidad; admin deriva tenant y usa `IO.blob` solo como curator.
+    La URL es `/public/<capability>`, no contiene el hash. V1 es link-capability; el acceso verificado
+    por tenant se agrega luego mediante Cloud. Ver `io-blob-spec-v1.md`.
   - Complementos: **gzip** del payload (~10x, previsto), y solo si hace falta, chunking multi-frame.
 
 ---
 
 ## 8. Consideraciones de seguridad (tener presentes)
 
-### 8.1 EDGE-06 — confused deputy del `ADMIN_COMMAND` de la malla (EL grande)
-Confirmado en código:
+### 8.1 EDGE-06 — gate del relay Cloud (cerrado para el catálogo alpha)
+El `ADMIN_COMMAND` general no está router-origin-gated, por lo que el riesgo histórico de
+*confused deputy* sigue siendo relevante para acciones fuera de esta vertical. El relay público de
+Cloud queda acotado por tres controles coordinados:
+
+- `SY.edge` valida el bearer `IO_CLOUD_SECRET`, acepta solo `POST` y remueve `Authorization` antes de
+  reenviar.
+- `IO.cloud` exige el origen router-stamped configurado en `IO_CLOUD_EDGE_NODE`, su ICH propio y
+  traduce solo tres operaciones;
+  un payload no puede elegir un action admin arbitrario.
+- `SY.admin::authorize_cloud_relay` permite `create_tenant`, `vault_put` y `run_node` por mesh solo
+  desde el singleton `IO.cloud` de su propio hive. `IO_CLOUD_EXPOSED_ACTIONS` es la misma fuente usada
+  por el catálogo publicado.
+
+Por lo tanto, internet no obtiene acceso al dispatcher admin general. La autorización de usuario
+final continúa diferida: en alpha el bearer de servicio autoriza a Cloud a asegurar cualquier
+`tenant_id` canónico.
+
+Antecedente confirmado en código:
 - El path `ADMIN_COMMAND` **NO está router-origin-gated**: el gate de autoridad del router
   (`serialize_for_local_delivery` → `system_policy::authority`) **solo dispara para `msg_type == SYSTEM`**;
   `ADMIN_COMMAND` es `msg_type = "admin"` → **lo bypassea** y llega a admin sin control.
-- Dentro de admin, **solo** `externalize`/`unexternalize`/`list_externalized` tienen gate de caller
-  (`authorize_channel_command`: I1 caller `IO.*` + I8 `owner == caller`). **Todo el resto**
-  (`create_tenant`, `vault_put`, `set_ilk_definition`, `run_node`, `set_node_config`, `add_hive`,
-  rutas…) **ignora `caller_l2_name`** → cualquier nodo de la malla que pueda direccionar `SY.admin` las
-  ejecuta con la **autoridad prestada de admin** (admin re-estampa `src_l2_name = SY.admin@hive` al
-  forwardear al subsistema, que confía por eso). `executor_execute_plan` también es alcanzable ungated.
-- **Implicancia para este spec:** `IO.cloud` va a ser exactamente ese relay, ahora con internet adelante.
-  **Ponerle un token público adelante weaponiza el confused-deputy.** ⇒ **REQUISITO:** el seam
-  `IO.cloud → SY.admin` necesita su **propia authz explícita y auditada** — un allowlist
-  `action → permitido` + el **tenant asegurado** en cada request + logging — **no** el `ADMIN_COMMAND`
-  ungated. Si no, se construye un bypass de internet de los gates que ya cerramos.
-  (Refs: `src/router/mod.rs :: serialize_for_local_delivery`; `src/bin/sy_admin.rs ::
-  dispatch_internal_admin_command` fall-through, `authorize_channel_command`, `send_admin_request`.)
+- Acciones fuera de `IO_CLOUD_EXPOSED_ACTIONS` conservan sus gates propios o el comportamiento
+  general previo; endurecer todo `ADMIN_COMMAND` es una tarea separada para no cambiar circuitos
+  internos existentes.
 
 ### 8.2 Caveat B — ordering del `owner_node → ilk` para nodos dinámicos
 El `owner_node → ilk` en `vault_put` resuelve vía identity SHM **al momento de escribir**. Para un nodo
-**dinámico** (`IO.wapp`), si el nodo **no está registrado aún**, cae al fallback determinista, que **no**
-matchea el ilk random del nodo → `IO.wapp` sería **denegado en la lectura**. (El edge no sufre esto por ser
-SYSTEM con ilk determinista.) ⇒ **Provisionar/registrar el ilk de `IO.wapp` ANTES del `vault_put`** (o
-garantizar que el write resuelve su ilk real). (`src/bin/sy_admin.rs :: normalize_vault_put_payload`.)
+dinámico no registrado, admin ahora falla de forma explícita; ya no escribe con un ilk determinista
+incorrecto. Un token owner-scoped se guarda después de `provision_node`. Si es necesario para el
+primer boot se omite `owner_node` y se usa el pool del tenant. Los nodos `SY.*` conservan el fallback
+determinista legítimo. (`src/bin/sy_admin.rs :: normalize_vault_put_payload`.)
 
 ### 8.3 Caveat C — vault autoriza lectura sobre `meta.src_ilk` *aseverado*
 `authorize_read` matchea el `owner_ilk` contra **`caller.ilk_id`, que sale de `meta.src_ilk`** — un campo
@@ -258,8 +282,12 @@ no para authz de lectura. **Riesgo:** el aislamiento de secretos por-ilk descans
   **acotado y auditable**, no root arbitrario. A futuro: tokens cortos/rotables, no un bearer eterno.
 - **No egress de secretos**: `IO.cloud` filtra/shapea las responses; nunca deja salir secretos crudos /
   creds por el HTTPS de vuelta. `vault_get` fuera del catálogo público.
-- **Aislamiento por-tenant** descansa en (a) Cloud honesto (tiene el OAuth) y (b) la validación del claim
-  de tenant en admin. Hoy ese hilado **no existe** (es el requisito transversal de §1.2).
+- **Ownership de vault no aseverable:** `put_token` descarta `metadata.ilk`, `owner_ilk`, `owner_l2`
+  y `tenant_id`; solo acepta `owner_node` `IO.*` para que admin resuelva el ilk real, o ausencia para
+  usar el pool del tenant autenticado.
+- **Aislamiento por-tenant alpha** descansa en Cloud honesto: el bearer de servicio le permite asegurar
+  un `tenant_id` canónico y `IO.cloud` lo sobreescribe en metadata/config antes del relay. La firma o
+  identidad de usuario final es el endurecimiento pendiente para producción.
 - **Ya cerrado esta sesión (no re-abrir):** EDGE-01 (origin binding cross-hive, `a5a5912`), EDGE-05
   (edge↔IO rechaza SYSTEM, `b1932e1`), authz de externalize (I1+I8, `99d1d85`). El edge no se toca.
 
@@ -267,33 +295,33 @@ no para authz de lectura. **Riesgo:** el aislamiento de secretos por-ilk descans
 
 ## 9. Problemas pendientes / futuro (ya conversados)
 
-1. **Hilado de tenant/subject** Cloud→admin (el requisito transversal). Sin esto no hay authz per-tenant.
-   Es la pieza de la que cuelga todo. **Bloqueante para producción; no para el "ver primero" logueado.**
-2. **Gate del seam `IO.cloud → SY.admin`** (cerrar el confused-deputy §8.1): allowlist action→permitido +
-   tenant + logging. Alternativa de fondo: origin-gatear el `ADMIN_COMMAND` de la malla.
-3. **`IO.archi` (caso 2, diferido — "ahora no"):** forwarding HTTP per-tenant a `SY.architect` (`:3000`)
+1. **Identidad/firma de usuario final Cloud→tenant.** Diferida por decisión alpha; necesaria antes de
+   entregar autoridad de provisioning a tokens de usuario o ampliar el catálogo.
+2. **Runtime de producto.** No existe `io.wapp`; debe implementarse y publicarse antes de lanzar ese
+   adaptador. Los runtimes existentes sí pueden provisionarse con el relay genérico.
+3. **Consumo del secreto por el runtime.** `put_token` deja el token disponible en Vault; cada runtime
+   específico debe leerlo con los helpers Vault canónicos. Esto no crea automáticamente una
+   `token_ref` en configuraciones de runtimes existentes; por ejemplo, `IO.api` conserva hoy su
+   contrato inline/`local_file:`.
+4. **Transacción compuesta de provisioning.** Las tres primitivas son funcionales, pero no hay rollback
+   atómico create_tenant→token→spawn→externalize ante fallas intermedias.
+5. **`IO.archi` (caso 2, diferido — "ahora no"):** forwarding HTTP per-tenant a `SY.architect` (`:3000`)
    tras login. Temas: aislamiento de tenant, auth de sesión, y **streaming (websocket/SSE)** que el edge
    hoy no hace (es request/response). Charlar aparte.
-4. **`IO.blob` + paginación** (§7): reads grandes. Blob para opaco, paginación para estructurado.
-5. **Atributo durable `externalized` en `SY.identity`** — prerequisito para EDGE-05 Fase 2 (acotar edge→IO
+6. **`IO.blob` + paginación** (§7): reads grandes. Blob para opaco, paginación para estructurado.
+7. **Atributo durable `externalized` en `SY.identity`** — prerequisito para EDGE-05 Fase 2 (acotar edge→IO
    a solo owners externalizados). Hoy diferido (`sy_admin.rs`); sin él, la fuente del allowlist sería el
    edge comprometido (auto-certificado).
-6. **Net-new de provisioning:** no existe runtime `io.wapp` ni una orquestación "provisionar nodo IO para
-   tenant" (create_tenant→ilk→vault→spawn→externalize atados). Construir sobre managed-node.
-7. **Inconsistencia a verificar:** `derive_ilk_type_for_node` (orchestrator) devuelve `"system"` para `IO.*`,
-   pero `ILK_REGISTER` rechaza `system` → un `ILK_REGISTER` orchestrator-driven para `IO.*` fallaría; los
-   nodos IO dependen del self-provision (`ILK_PROVISION`, human/agent). Confirmar antes de diseñar el spawn
-   de `IO.wapp`.
-8. **Dispatch real de `IO.cloud`:** hoy es echo. El nodo objetivo enruta por `meta.ich` a
-   tenant/conversación y (si aplica) habla con el backend de Cloud (cliente saliente, hoy inexistente).
+8. **Producto conversacional de `IO.cloud`.** El provisioning está implementado; dispatch a
+   conversaciones y un cliente saliente al backend Cloud siguen fuera de este contrato.
 
 ---
 
-## 10. Preguntas abiertas para cerrar antes de codear
+## 10. Decisiones cerradas para el alpha
 
-- ¿El **claim de tenant** viaja en el payload firmado por Cloud, y admin lo valida cómo (confía en el token
-  de servicio de Cloud, o hay una firma per-request)? — De esto cuelga §9.1.
-- ¿El **gate del seam** (§9.2) se hace en `IO.cloud` (traduce/valida y solo emite acciones del catálogo) o
-  en `SY.admin` (origin-gate del `ADMIN_COMMAND`)? Probablemente ambos (defensa en capas).
-- ¿`IO.cloud` **crea el tenant** o lo hace Cloud por otro canal de servicio y `IO.cloud` solo provisiona
-  dentro de un tenant ya creado?
+- El bearer de servicio de Cloud es la autoridad y el payload transporta el `tenant_id` asegurado por
+  Cloud; no hay firma per-request adicional en esta etapa.
+- El gate se aplica en ambos extremos del seam: traducción allowlisted en `IO.cloud` y caller gate en
+  `SY.admin` sobre el mismo catálogo.
+- `IO.cloud` puede crear tenants y los crea `active` por default. También puede guardar tokens y lanzar
+  nodos `IO.*` dentro de un tenant existente.

@@ -16,6 +16,8 @@ nats:
 # Local admin HTTP API.
 admin:
   listen: "127.0.0.1:8080"
+  # Optional absolute content origin returned alongside /public/<key>.
+  # public_base_url: "https://content.example.com"
 
 # Local architect HTTP UI/API (typically exposed through reverse proxy).
 architect:
@@ -45,6 +47,7 @@ blob:
   path: "/var/lib/fluxbee/blob"
   sync:
     enabled: true
+    public_enabled: true
     tool: "syncthing"
     api_port: 8384
     data_dir: "/var/lib/fluxbee/syncthing"
@@ -56,9 +59,11 @@ dist:
     enabled: true
     tool: "syncthing"
 
-# Declarative SY topology per hive role. `nodes` is the start order;
+# Declarative packaged platform topology per hive role. `nodes` is the start order;
 # `wait_for` is the subset the orchestrator blocks on before continuing
-# bootstrap. Workers do not run SY.vault.
+# bootstrap. IO.blob is a motherbee worker managed by this lifecycle, not a
+# system authority; Identity seeds deterministic ILKs only for the SY.* entries.
+# Workers do not run SY.vault.
 system_nodes:
   motherbee:
     # Model D' boot order (enforced by sy_orchestrator::validate_system_nodes):
@@ -90,6 +95,7 @@ system_nodes:
       - SY.identity
       - SY.opa.rules
       - SY.admin
+      - IO.blob
       - SY.architect
       - SY.storage
       - SY.cognition
@@ -103,6 +109,7 @@ system_nodes:
       - SY.identity
       - SY.opa.rules
       - SY.admin
+      - IO.blob
       - SY.cognition
       - SY.policy
       - SY.timer

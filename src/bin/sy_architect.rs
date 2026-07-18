@@ -6760,7 +6760,8 @@ async fn handle_architect_system_message(
     if msg.meta.msg_type == SYSTEM_KIND {
         if let Some(action) = msg.meta.msg.as_deref() {
             if let Some(response_msg) = protected_architect_system_action_response(action) {
-                if !architect_origin_authorized(&state.hive_id, msg.routing.src_l2_name.as_deref()) {
+                if !architect_origin_authorized(&state.hive_id, msg.routing.src_l2_name.as_deref())
+                {
                     let forbidden =
                         build_architect_forbidden_response(msg, sender.uuid(), response_msg);
                     sender.send(forbidden).await?;
@@ -26957,10 +26958,7 @@ mod tests {
 
     #[test]
     fn unknown_actions_are_not_protected_on_architect() {
-        assert_eq!(
-            protected_architect_system_action_response("WHATEVER"),
-            None
-        );
+        assert_eq!(protected_architect_system_action_response("WHATEVER"), None);
         assert_eq!(protected_architect_system_action_response(""), None);
     }
 

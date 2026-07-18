@@ -755,8 +755,9 @@ pub fn wait_for_self_system_ilk_id(
 /// should target the fixed Fluxbee root tenant (which any system-type caller can read).
 pub const DEFAULT_ROOT_TENANT_ID: &str = "tnt:00000000-0000-0000-0000-000000000001";
 
-/// Compute the deterministic ILK assigned by `SY.identity` to a system
-/// node listed in `hive.yaml system_nodes`.
+/// Compute the deterministic ILK assigned by `SY.identity` to a `SY.*` system
+/// node listed in `hive.yaml system_nodes`. Non-SY packaged lifecycle entries
+/// do not receive deterministic system ILKs.
 ///
 /// `node_name` must be the fully qualified L2 name (e.g.
 /// `"SY.admin@motherbee"`). The function is pure — same input always yields

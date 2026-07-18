@@ -75,7 +75,7 @@ for attempt in $(seq 1 6); do
   echo "  DB reconnect attempt $attempt did not reach hive ready; retrying"
 done
 
-echo "== [5/5] wait hive ready =="
+echo "== [5/5] wait hive ready + start motherbee singleton nodes =="
 if [ "$HIVE_READY" != "1" ] && wait_hive_ready 60; then
   HIVE_READY=1
 fi
@@ -84,4 +84,5 @@ if [ "$HIVE_READY" != "1" ]; then
   echo "first-boot failed: hive did not become ready." >&2
   exit 1
 fi
+systemctl start io-cloud io-blob 2>/dev/null || true
 echo "first-boot done."

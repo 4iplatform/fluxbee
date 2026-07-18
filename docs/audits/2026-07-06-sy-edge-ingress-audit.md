@@ -69,7 +69,7 @@ Estado al 2026-07-08 en working tree local, pendiente de commit:
 - `EDGE-2026-07-06-06`: Mitigado. `SY.admin externalize` exige que el ICH exista, tenga owner y este `enabled=true`. Los nodos IO auto-habilitan su propio ICH al arrancar por el flujo canonico `ICH_SET_ENABLED`, y `SY.identity` restringe a los callers `IO.*` a mutar solo su propio ICH.
 - `EDGE-2026-07-06-07`: Mitigado localmente. Se agrego `EDGE_LIST_URLS` en `SY.edge` y `list_externalized` en `SY.admin`, con filtrado para que un `IO.*` vea solo sus canales.
 - `EDGE-2026-07-06-08`: Mitigado localmente. `add_ingress` ya no acepta seed normal de endpoints; rechaza `ingress.endpoints_json` no vacio y escribe un registry vacio.
-- `EDGE-2026-07-06-09`: Parcial. `IO.cloud` sigue siendo stub/simple de producto, pero el circuito alpha quedo operativo: asegura y habilita su ICH, reintenta `externalize` hasta que `SY.edge@ingress1` exista, y responde requests edge-forwarded para smoke/E2E.
+- `EDGE-2026-07-06-09`: Cerrado para provisioning alpha al 2026-07-17. `IO.cloud` autentica la entrada de Cloud y relaya creación de tenant, guardado de tokens y lanzamiento de nodos. El producto conversacional y los runtimes específicos siguen fuera del alcance.
 
 Validacion local agregada:
 
@@ -92,6 +92,89 @@ Validacion lab Proxmox ejecutada el 2026-07-08:
 - `SY.admin@motherbee` registro `externalize: edge opened URL (ACKed)` para `SY.edge@ingress1`; no hubo `UNREACHABLE` nuevo despues del fix de routing de responses.
 - Prueba HTTPS desde la red de las VMs: `curl -k https://192.168.103.151/e/ich:14b66389-d425-531c-a140-a591d25e8f39` devolvio `HTTP/1.1 200 OK` con `handled_by:"IO.cloud@motherbee"`.
 - La prueba desde el host macOS hacia `192.168.103.151:443` fallo por ruta host->VM (`No route to host`); no es falla del ingress, ya que VM->ingress y localhost->edge respondieron 200.
+
+### Actualizacion 2026-07-17 - provisioning de Fluxbee Cloud
+
+- Se decidió que el bearer de servicio de Cloud es la autoridad alpha. `IO_CLOUD_SECRET` es
+  obligatorio al externalizar `IO.cloud`; el endpoint queda `shared-secret` y limitado a `POST`.
+- `IO.cloud` valida el origen router-stamped configurado en `IO_CLOUD_EDGE_NODE` y su ICH propio.
+  Traduce únicamente
+  `create_tenant`, `put_token` y `provision_node`; no acepta un action admin elegido por el payload.
+- `SY.admin` aplica un segundo gate para que `create_tenant`, `vault_put` y `run_node` solo puedan
+  originarse por mesh en el singleton `IO.cloud` de su propio hive. El mismo catálogo alimenta
+  discovery y enforcement.
+- Los tenants creados por Cloud quedan `active` por default. El `tenant_id` canónico se inyecta en
+  metadata de vault y config de nodo, reemplazando valores enviados dentro de `params`.
+- `put_token` descarta `metadata.ilk`, `owner_ilk`, `owner_l2` y cualquier tenant inyectado por el
+  payload; el owner solo puede ser un `owner_node` `IO.*` resuelto por admin o el pool del tenant.
+- El orchestrator registra workloads managed como principals `agent`. Vault conserva fallback de ilk
+  determinista solo para `SY.*`; un owner dinámico no registrado ahora falla explícitamente.
+- Se agregó configuración de instalación sin secreto embebido: `/etc/fluxbee/io-cloud.env.example`.
+- Validación local: `io-cloud` 5/5, `SY.admin` 81/81, `SY.edge` 13/13, `SY.identity` 41/41 y
+  `SY.orchestrator` 118/118. También pasan `git diff --check`, sintaxis de los scripts de packaging y
+  parsing del emulador Cloud.
+
+Validación E2E Proxmox ejecutada el 2026-07-17:
+
+- La API Proxmox en `https://127.0.0.1:8006` respondió con la nueva credencial. Se usaron VM 201
+  `fb-mb` (`motherbee`), VM 203 `fb-ingress` (`ingress1`, `SY.edge` en `192.168.4.41:8443`) y VM 210
+  `fb-build`.
+- Se construyó e instaló en VM 201 `fluxbee_0.1.0-iocloudalpha3_amd64.deb`, SHA256
+  `ce8edb8ff527d99dc3369cf803909446b7ef3ccd1d3bacc6f3525d14031aaecb`.
+- El upgrade recuperó automáticamente `rt-gateway`, `sy-admin`, `sy-identity`, `sy-vault`,
+  `sy-orchestrator` e `io-cloud`; todos quedaron `active` y no hubo units fallidas. Esto valida el
+  reinicio de orchestrator/IO.cloud agregado a `deb-postinst` para upgrades, sin arrancar servicios en
+  una instalación fresca antes de `fluxbee-firstboot`.
+- `IO.cloud@motherbee` reexternalizó en el primer intento el ICH
+  `ich:14b66389-d425-531c-a140-a591d25e8f39`. Los mensajes no solicitados de `SY.vault` recibidos por
+  el `RouteMatch::Any` fueron ignorados y ya no generaron respuestas `UNAUTHORIZED` espurias.
+- El probe HTTPS público validó `401` sin bearer, `401` con bearer incorrecto y `200` con el bearer
+  correcto más persistencia efectiva de `put_token`.
+- Cloud creó y dejó activo el tenant `tnt:d68f7a8b-168f-48a1-aef9-9c7b2685e8b3`; `put_token` escribió
+  en su pool con `changed=true`, `version=1`, sin devolver el secreto.
+- Cloud lanzó `IO.api.cloudready@motherbee` con runtime publicado `io.api@1.0.0`. Identity registró el
+  ILK `ilk:e68e24b6-6c3a-4e36-b1a3-1bc448113709` como `agent`; la unit quedó `active`, escuchando en
+  `127.0.0.1:18082`, con `status=configured`, `accepts_business_traffic=true`, una API key activa y
+  `last_error=null`.
+- La instancia `IO.api` rechazó un bearer incorrecto con `401`. Un POST autenticado atravesó auth y
+  llegó a Frontdesk, que en este lab devolvió un payload no estructurado y produjo `502
+  invalid_frontdesk_response`; ese resultado es downstream del circuito Cloud/Ingress/provisioning.
+- Límite conservado: `put_token` escribe en Vault, pero `IO.api` materializa sus API keys mediante su
+  contrato existente inline/`local_file:`. No se agregó una referencia Vault nueva al runtime. El
+  consumo de tokens de proveedor deberá implementarlo el runtime específico (por ejemplo `io.wapp`,
+  que aún no existe) usando los helpers Vault canónicos.
+
+### Actualizacion 2026-07-17 - artefactos publicos `/public`
+
+- Implementado localmente `publish_artifact`/`unpublish_artifact` en `SY.admin`: acepta solo
+  producers `AI.*`, `IO.*` o `WF.*` router-stamped, resuelve tenant en Identity, ordena curate a
+  `IO.blob`, mantiene ledger durable y espera el ACK de readiness de edge.
+- Implementado registry separado y `/public/:key` en `SY.edge`: capability de 256 bits, expiry,
+  archivo no-follow bajo root canonico, hash/tamano al publish, `GET`/`HEAD`, ETag, single range,
+  semaphore de streaming y CSP fija para HTML autocontenido con JS sin red.
+- El router protege publish/unpublish con la misma autoridad exacta `SY.admin@motherbee` usada por
+  open/close/list; el Rego bakeado fue regenerado.
+- `add_ingress` copia Syncthing, configura `fluxbee-blob-public` en `receiveonly`, intercambia IDs
+  mediante `ADD_HIVE_FINALIZE` y enlaza motherbee en `sendonly`. El perfil publico excluye
+  explicitamente `active/` y `dist/`.
+- Validacion Proxmox desde clon limpio (`VM 204`, luego eliminada): paquete
+  `0.1.0-publicblob3` (`sha256:6d514ffdfcd784901fecfd12f83bc4fe8363c4988f17e8c46003e77cb337267e`).
+  `POST /hives` devolvio `200` con `edge_service_active`, `public_sync_ready`,
+  `syncthing_peer_linked`, `syncthing_peer_connected`, WAN y Orchestrator en `true`.
+- La replica transfirio un HTML autocontenido de 141 bytes con SHA-256
+  `ec2d5962e80b49e2d684b022adada67a8b3471105420f97f51f5e14cea341823`. Edge lo sirvio por
+  `/public/<capability>` antes y despues de reboot con `200`, ETag, CSP sandbox con JS inline;
+  tambien se verificaron `HEAD`, `206 Range` y `304 If-None-Match`.
+- `DELETE /hives/ingress-public-test` devolvio `200`, ejecuto cleanup remoto por socket y
+  `syncthing_peer_cleanup=local_unlinked`. Motherbee conservo XML valido, API Syncthing `OK` y
+  servicios Orchestrator/IO.blob activos; el clon temporal fue destruido y el builder restaurado.
+- Durante el lab se corrigieron tres fallas de instalacion: el compound command de directorios no
+  quedaba entero bajo sudo; los peers se insertaban dentro de `<defaults>` en Syncthing 2.x y no
+  tenian address TCP deterministica; la primera remocion de peers self-closing podia consumir el
+  folder template. Los tres casos tienen regresion automatizada.
+- Estado: infraestructura E2E validada. Queda pendiente como smoke de producto el recorrido en vivo
+  AI/IO -> `SY.admin` -> `IO.blob` -> Edge para publish/expiry/unpublish; esos contratos estan
+  cubiertos por tests locales pero no se simulo identidad de productor en el lab.
 
 ## Hallazgos
 
@@ -278,26 +361,33 @@ Recomendacion:
 - Actualizar comentarios y docs para eliminar el shape legacy.
 - Agregar test con payload legacy para confirmar rechazo explicito.
 
-### EDGE-2026-07-06-09 - Baja/Media - `IO.cloud` es un stub y no implementa todavia Fluxbee Cloud real
+### EDGE-2026-07-06-09 - Baja/Media - provisioning de Fluxbee Cloud incompleto
 
-Estado: Abierto como producto Cloud; smoke ingress validado
+Estado: Cerrado para provisioning alpha; producto conversacional y runtimes específicos pendientes
 
 Evidencia:
 
-- El componente implementado se llama `IO.cloud`; no hay un nodo `sy.cloud` en el codigo revisado (`nodes/io/io-cloud/src/main.rs:329-343`).
-- `IO.cloud` registra/provisiona su ICH y, si `IO_CLOUD_EDGE_NODE` esta seteado, pide `externalize` (`nodes/io/io-cloud/src/main.rs:72-174`).
-- El handler actual responde basicamente con echo/metadata de la request (`nodes/io/io-cloud/src/main.rs:292-325`).
-- La propia spec ubica `IO.cloud` como nodo IO singleton y deja autenticacion/subject authz de cloud fuera del alpha inmediato (`docs/edge-ingress-spec-v6.md:257-278`, `docs/edge-ingress-spec-v6.md:392`).
+- El componente se llama `IO.cloud`; `SY.edge` es la frontera pública y no existe un nodo `sy.cloud`.
+- `IO.cloud` registra/habilita su ICH y externaliza con bearer compartido, fail-closed si falta el
+  secreto.
+- El handler implementa las operaciones `create_tenant`, `put_token` y `provision_node`, con allowlist,
+  tenant canónico y correlación por `request_id`.
+- El caller queda autenticado como Cloud-como-servicio. La identidad de usuario final se difiere por
+  decisión explícita del contrato alpha.
 
 Impacto:
 
-El camino sirve para validar la columna vertebral de edge hacia un IO node, pero no equivale a "servir Fluxbee Cloud" en sentido funcional. Falta definir endpoints, subjects, autorizacion de usuarios/tenants, comandos cloud reales y reconciliacion con identity/edge.
+Fluxbee Cloud ya puede crear tenants, guardar tokens y lanzar nodos mediante el endpoint ingress. No
+existe todavía una transacción compuesta con rollback, un runtime `io.wapp`, ni dispatch
+conversacional/cliente saliente al backend Cloud. Antes de producción también falta identidad de
+usuario final ligada al tenant.
 
 Recomendacion:
 
-- Mantener `IO.cloud` como smoke-test de ingress, pero documentarlo explicitamente como stub alpha.
-- Separar criterios de aceptacion: "edge path operativo" vs "Cloud product funcional".
-- Definir un contrato minimo de Cloud antes de declararlo servido por ingress.
+- Mantener el probe E2E de las tres operaciones como smoke test de release del paquete Linux.
+- Implementar y publicar cada runtime de producto antes de solicitarlo con `provision_node`.
+- Agregar identidad de usuario final y una transacción compuesta solo cuando el contrato de producto
+  lo requiera; no ampliar el bearer alpha a acciones admin generales.
 
 ## No regresiones / piezas positivas observadas
 

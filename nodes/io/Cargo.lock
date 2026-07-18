@@ -705,6 +705,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-blob"
+version = "0.1.0"
+dependencies = [
+ "fluxbee-sdk",
+ "nix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "io-cloud"
 version = "0.1.0"
 dependencies = [
@@ -714,6 +730,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

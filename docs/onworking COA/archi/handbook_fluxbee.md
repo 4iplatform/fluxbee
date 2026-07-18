@@ -171,6 +171,39 @@ Do not assume an `IO.*` node should do:
 - policy resolution
 - generic relay of business traffic
 
+### 4.3.1 Public generated artifacts (`/public/<key>`)
+
+Use this circuit when an `AI.*`, `IO.*`, or `WF.*` producer must expose an already-generated file
+through the public edge, including a self-contained interactive HTML report.
+
+The ownership and call path are fixed:
+
+1. The producer writes and promotes the content with the Blob SDK and obtains a `BlobRef`.
+2. The same producer calls `SY.admin@<hive>` with
+   `RouterDispatcher::send_admin_rpc(AdminCommandRequest { action: "publish_artifact", target: None, ... })`.
+3. The router-stamped producer identity is authoritative. Admin resolves its tenant, authorizes and
+   records the publication, `IO.blob` curates the bytes, and `SY.edge` serves `/public/<key>`.
+4. The producer retains the returned `publication_id` and calls `unpublish_artifact` with that id
+   when the link must be revoked.
+
+Rules for Archi:
+
+- Publication is behavior implemented inside the producer runtime. It is **not** an HTTP/SCMD
+  Admin operation and must not be emitted as an Admin executor step.
+- When designing or packaging such a producer, require the runtime to use the existing Blob SDK and
+  generic `send_admin_rpc` path. Do not invent an `IO.*` relay, a second public server, or a new edge API.
+- `publish_artifact` accepts only `blob_ref`, optional `presentation` (`inline` or `attachment`), and
+  optional `expires_in_secs`. It does not accept `tenant_id`, publisher identity, paths, public keys,
+  raw headers, SHA-256 filenames, or CSP.
+- Query `get_admin_action_help publish_artifact` and `get_admin_action_help unpublish_artifact` for
+  the live request and response contracts before specifying implementation details.
+- The v1 URL is a bearer capability: anyone with the link can read it until expiry or unpublish.
+  There is no public listing, upload endpoint, login, or tenant/session check on each read yet.
+- Inline HTML may contain self-contained JavaScript for local interaction. It cannot call network
+  APIs; edge enforces the fixed sandbox/CSP policy. Multi-file sites and service workers are out of scope.
+- If expiration is not specified, Admin defaults to 24 hours and clamps requested lifetimes to the
+  supported range. Do not build independent expiry policy into the producer.
+
 ### 4.4 SY nodes
 
 These are system infrastructure:
@@ -616,5 +649,6 @@ This handbook is the concise operational layer for Archi. Broader platform detai
 - [10-identity-layer3.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/10-identity-layer3.md)
 - [SY_nodes_spec.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/SY_nodes_spec.md)
 - [executor_manifest_pilot_spec.md](/Users/cagostino/Documents/GitHub/fluxbee/docs/executor_manifest_pilot_spec.md)
+- [io-blob-spec-v1.md](../../io-blob-spec-v1.md)
 
 If this handbook conflicts with live action contracts, the live action contracts from `get_admin_action_help(...)` win for request shape, and this handbook wins for high-level planning intent.

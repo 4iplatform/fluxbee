@@ -274,13 +274,20 @@ changed live; `config-set listen` → `restart_required:[listen]`; `config-get` 
   internal mesh**, not through the edge — so there is **no chicken-and-egg**.
   Its `ICH` routes only to `IO.cloud`. Then external traffic reaches the mesh **only** as ordinary
   app traffic to `IO.cloud` (I2); `IO.cloud → SY.admin`/`archi`/`frontdesk` are internal calls.
-- **Agent, not authority.** Holds no authoritative binding. In-mesh so it can read ilk-space, but
-  it **stays in ilk/ICH-space**; it needs **no identity SHM whole-table view** — it speaks ICHs and
-  lets the core resolve. Scope: a small allowlist (`externalize`/`unexternalize`/`list_externalized`
-  for its own channels), never general admin — the one auditable operational firewall (I2 bound).
+- **Entrada Cloud autenticada.** Si se configura `IO_CLOUD_EDGE_NODE`, el bootstrap exige
+  `IO_CLOUD_SECRET` y externaliza el ICH como `shared-secret`, solo `POST`. El edge valida el bearer y
+  no lo forwardea. `IO.cloud` además exige el origen router-stamped configurado en
+  `IO_CLOUD_EDGE_NODE` y su propio ICH.
+- **Relay de provisioning alpha.** Traduce solo `create_tenant`, `put_token` y `provision_node` a
+  `create_tenant`, `vault_put` y `run_node`. `SY.admin` vuelve a gatear esas acciones para que por mesh
+  solo puedan originarse en el singleton `IO.cloud` del mismo hive que admin. El bearer de servicio
+  de Cloud es la autoridad alpha para
+  crear tenants y asegurar el `tenant_id`.
+- **Agente acotado, no admin general.** Permanece en ilk/ICH-space y no necesita una vista SHM completa
+  de identity. Las respuestas no exponen lecturas de vault ni secretos.
 - Lives **inside the mesh, not in the DMZ hive** — must not share blast radius with the edge.
-- Deferred: the end-user ilk as a *subject claim* inside the command, `SY.policy` over `(IO.cloud
-  transport principal) + (user ilk subject)`.
+- Deferred para producción: el end-user ilk/subject dentro del comando y `SY.policy` sobre
+  `(IO.cloud transport principal) + (user ilk subject)`.
 
 ---
 
@@ -373,11 +380,22 @@ Parked consciously — the edge receives `ICH → owner_l2_name` either way.
 
 ---
 
-## 14. Special cases live on the IO side (I7)
+## 14. Static public artifacts: bounded local-serving exception
 
-The edge is `ICH → forward`, forever. New kind of thing to expose → *which IO node adapts it?* —
-`IO.web` for artifacts, `IO.blob` for blobs. Zero new edge code; all evolution in the cheap inside
-nodes. This is the design valve, not a rule to remember.
+El path normal del edge sigue siendo `ICH → forward`: webhooks, APIs y comandos viven en nodos IO.
+Los artefactos grandes son la unica excepcion aceptada porque sus bytes no caben ni deben viajar por
+el envelope de la malla. Para `/public/<key>`, `SY.edge` sirve un archivo desde una replica local
+receive-only y solo si existe una row empujada por `SY.admin`.
+
+La autoridad no se mueve al edge: el productor llama directo a admin, admin deriva su tenant y ordena
+a `IO.blob` curar el archivo. Edge conserva solo `{capability -> public_name + policy + expiry}` y no
+lista ni resuelve tenants. Ver `io-blob-spec-v1.md` para los limites de esta excepcion.
+
+**Estado 2026-07-17:** implementado y validado en Proxmox desde un clon limpio. `add_ingress`
+instala Syncthing y enlaza únicamente `fluxbee-blob-public` (`sendonly` motherbee, `receiveonly`
+ingress); `/public/:key` sirve el registry ACKeado por admin con expiry, ETag, ranges, semaphore y
+sandbox HTML. El lab verifico replica real, serving tras reboot y teardown simetrico. Resta como
+smoke de producto ejecutar publish/expiry/unpublish desde un AI/IO real.
 
 ---
 
@@ -400,7 +418,8 @@ nodes. This is the design valve, not a rule to remember.
    hop); multi-hop relay deferred.
 
 **Deferred by design:** the durable-binding shape decision (§12); edge-asks-vault token check;
-`IO.cloud` end-user-ilk subject authz; blob egress; multi-hop cross-hive; JWT/ACME + public-zone
+`IO.cloud` end-user-ilk subject authz (el bearer Cloud es autoridad alpha); validacion tenant por cada
+GET de artefacto (v1 empieza con link-capability); multi-hop cross-hive; JWT/ACME + public-zone
 DNS (wildcard sidesteps); WS/SSE upgrade (501 stub only); the edge `config` subsystem (thread B) if
 not needed for the first proof.
 
@@ -414,8 +433,9 @@ not needed for the first proof.
    and proves the real self-service flow.
 3. **Admin-minted token** → vault owned-by-node, edge-local door check.
 4. **H1 + H2 + H3** — a real from-scratch TLS-serving ingress that boots **zero** and converges.
-5. **`IO.cloud`** — the thin in-mesh cloud manager; first real externalize (bootstrap). Can run in
-   parallel with 2–4.
+5. **`IO.cloud` — DONE para provisioning alpha:** bootstrap externalize autenticado y relay acotado de
+   tenant/token/spawn. El runtime de cada producto y la identidad de usuario final son verticales
+   posteriores.
 6. **M2/M3/M4/L1** — finish the non-deferred alpha surface.
 7. Thread B (`config` subsystem) + spec/checklist cleanup.
 
