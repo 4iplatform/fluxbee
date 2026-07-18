@@ -36,8 +36,10 @@ use fluxbee_sdk::protocol::{
     OpaReloadPayload, RouterHelloPayload, WanAcceptPayload, WanHelloPayload, WanNegotiated,
     WanRejectPayload, WanTimers, MSG_CONFIG_CHANGED, MSG_EDGE_CLOSE_URL,
     MSG_EDGE_CLOSE_URL_RESPONSE, MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE,
-    MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE, MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD,
-    MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_WITHDRAW, SCOPE_GLOBAL, SYSTEM_KIND,
+    MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE, MSG_EDGE_PUBLISH_BLOB,
+    MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB, MSG_EDGE_UNPUBLISH_BLOB_RESPONSE,
+    MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_WITHDRAW,
+    SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::socket::connection::{read_frame, write_frame};
 use fluxbee_sdk::{classify_routed_message, MSG_VAULT_GET, MSG_VAULT_GET_RESPONSE};
@@ -1391,17 +1393,31 @@ async fn fanout_taps_for_unicast(
     if src_name.is_empty() {
         return;
     }
-    // If dst_label is a UUID, resolve back to the L2 name of the target
-    // node so tap matching (which is by L2 name) still works.
+    // If dst_label is a UUID, resolve back to the L2 name of the target node
+    // so tap matching (which is by L2 name) still works. Resolve it the SAME
+    // way the rest of the router does (handle_message/wan/peer): local `nodes`,
+    // then `peer_nodes`, then the cross-hive LSA snapshot via `find_remote_node`.
+    // Without the LSA fallback a tap whose match_dst lives on another hive never
+    // matches a UUID-addressed message (e.g. replies, which target the source
+    // node's UUID via build_system_reply), so cross-hive response taps silently
+    // never fired.
     let dst_name_owned: String = if let Ok(dst_uuid) = Uuid::parse_str(dst_label) {
-        let nodes_guard = nodes.lock().await;
-        match nodes_guard.get(&dst_uuid) {
-            Some(handle) => handle.name.clone(),
+        let local = {
+            let nodes_guard = nodes.lock().await;
+            nodes_guard.get(&dst_uuid).map(|handle| handle.name.clone())
+        };
+        let peered = if local.is_none() {
+            let peer_guard = peer_nodes.lock().await;
+            peer_guard.get(&dst_uuid).map(|p| p.name.clone())
+        } else {
+            None
+        };
+        match local.or(peered) {
+            Some(name) => name,
             None => {
-                let peer_guard = peer_nodes.lock().await;
-                peer_guard
-                    .get(&dst_uuid)
-                    .map(|p| p.name.clone())
+                let snapshot = lsa_snapshot.lock().await;
+                find_remote_node(&snapshot, dst_uuid)
+                    .map(|info| info.name)
                     .unwrap_or_default()
             }
         }
@@ -5264,20 +5280,35 @@ fn edge_service_control_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> 
     if src_name != system_policy::EDGE_CONTROL_AUTHORITY {
         return false;
     }
-    matches!(meta.msg.as_deref(), Some(action) if action == MSG_EDGE_OPEN_URL || action == MSG_EDGE_CLOSE_URL || action == MSG_EDGE_LIST_URLS)
+    matches!(meta.msg.as_deref(), Some(action) if action == MSG_EDGE_OPEN_URL
+        || action == MSG_EDGE_CLOSE_URL
+        || action == MSG_EDGE_LIST_URLS
+        || action == MSG_EDGE_PUBLISH_BLOB
+        || action == MSG_EDGE_UNPUBLISH_BLOB)
 }
 
 fn edge_service_control_response_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> bool {
-    if !is_edge_node(src_name) || dst_name != system_policy::EDGE_CONTROL_AUTHORITY || !is_system_kind(&meta.msg_type) {
+    if !is_edge_node(src_name)
+        || dst_name != system_policy::EDGE_CONTROL_AUTHORITY
+        || !is_system_kind(&meta.msg_type)
+    {
         return false;
     }
-    matches!(meta.msg.as_deref(), Some(action) if action == MSG_EDGE_OPEN_URL_RESPONSE || action == MSG_EDGE_CLOSE_URL_RESPONSE || action == MSG_EDGE_LIST_URLS_RESPONSE)
+    matches!(meta.msg.as_deref(), Some(action) if action == MSG_EDGE_OPEN_URL_RESPONSE
+        || action == MSG_EDGE_CLOSE_URL_RESPONSE
+        || action == MSG_EDGE_LIST_URLS_RESPONSE
+        || action == MSG_EDGE_PUBLISH_BLOB_RESPONSE
+        || action == MSG_EDGE_UNPUBLISH_BLOB_RESPONSE)
 }
 
 fn is_edge_service_control_message(meta: &Meta, dst_name: &str) -> bool {
     is_edge_node(dst_name)
         && is_system_kind(&meta.msg_type)
-        && matches!(meta.msg.as_deref(), Some(action) if action == MSG_EDGE_OPEN_URL || action == MSG_EDGE_CLOSE_URL || action == MSG_EDGE_LIST_URLS)
+        && matches!(meta.msg.as_deref(), Some(action) if action == MSG_EDGE_OPEN_URL
+            || action == MSG_EDGE_CLOSE_URL
+            || action == MSG_EDGE_LIST_URLS
+            || action == MSG_EDGE_PUBLISH_BLOB
+            || action == MSG_EDGE_UNPUBLISH_BLOB)
 }
 
 fn edge_data_path_allowed(meta: &Meta, src_name: &str, dst_name: &str) -> bool {
@@ -6120,8 +6151,20 @@ mod tests {
                 msg_type: mt.to_string(),
                 ..Meta::default()
             };
-            assert!(!vpn_allows_between(&sys, "SY.edge@ingress1", 1, "IO.cloud@motherbee", 2));
-            assert!(!vpn_allows_between(&sys, "IO.cloud@motherbee", 2, "SY.edge@ingress1", 1));
+            assert!(!vpn_allows_between(
+                &sys,
+                "SY.edge@ingress1",
+                1,
+                "IO.cloud@motherbee",
+                2
+            ));
+            assert!(!vpn_allows_between(
+                &sys,
+                "IO.cloud@motherbee",
+                2,
+                "SY.edge@ingress1",
+                1
+            ));
         }
     }
 
@@ -6143,9 +6186,21 @@ mod tests {
         };
         for m in [&sys_bare, &sys_protected] {
             // compromised edge -> IO node: cannot originate SYSTEM at an IO node
-            assert!(!vpn_allows_between(m, "SY.edge@ingress1", 1, "IO.cloud@motherbee", 2));
+            assert!(!vpn_allows_between(
+                m,
+                "SY.edge@ingress1",
+                1,
+                "IO.cloud@motherbee",
+                2
+            ));
             // rogue IO node -> edge: cannot land a SYSTEM frame on the edge (reply-shadowing)
-            assert!(!vpn_allows_between(m, "IO.cloud@motherbee", 2, "SY.edge@ingress1", 1));
+            assert!(!vpn_allows_between(
+                m,
+                "IO.cloud@motherbee",
+                2,
+                "SY.edge@ingress1",
+                1
+            ));
         }
 
         // Preservation: the legitimate data-family forward + reply stay allowed.
@@ -6153,8 +6208,20 @@ mod tests {
             msg_type: "user".to_string(),
             ..Meta::default()
         };
-        assert!(vpn_allows_between(&user, "SY.edge@ingress1", 1, "IO.cloud@motherbee", 2));
-        assert!(vpn_allows_between(&user, "IO.cloud@motherbee", 2, "SY.edge@ingress1", 1));
+        assert!(vpn_allows_between(
+            &user,
+            "SY.edge@ingress1",
+            1,
+            "IO.cloud@motherbee",
+            2
+        ));
+        assert!(vpn_allows_between(
+            &user,
+            "IO.cloud@motherbee",
+            2,
+            "SY.edge@ingress1",
+            1
+        ));
 
         // Regression: the edge's SYSTEM traffic with SY.vault and SY.admin (non-IO peers) rides
         // the sibling OR terms and is NOT touched by the edge<->IO SYSTEM guard.
@@ -6237,6 +6304,16 @@ mod tests {
             msg: Some(MSG_EDGE_OPEN_URL_RESPONSE.to_string()),
             ..Meta::default()
         };
+        let publish_blob = Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(MSG_EDGE_PUBLISH_BLOB.to_string()),
+            ..Meta::default()
+        };
+        let publish_blob_response = Meta {
+            msg_type: SYSTEM_KIND.to_string(),
+            msg: Some(MSG_EDGE_PUBLISH_BLOB_RESPONSE.to_string()),
+            ..Meta::default()
+        };
 
         assert!(vpn_allows_between(
             &open,
@@ -6279,6 +6356,27 @@ mod tests {
             2,
             "SY.admin@motherbee",
             1
+        ));
+        assert!(vpn_allows_between(
+            &publish_blob,
+            "SY.admin@motherbee",
+            1,
+            "SY.edge@ingress1",
+            2
+        ));
+        assert!(vpn_allows_between(
+            &publish_blob_response,
+            "SY.edge@ingress1",
+            2,
+            "SY.admin@motherbee",
+            1
+        ));
+        assert!(!vpn_allows_between(
+            &publish_blob,
+            "SY.orchestrator@motherbee",
+            1,
+            "SY.edge@ingress1",
+            2
         ));
     }
 
@@ -6334,7 +6432,11 @@ mod tests {
         // bucket over the direct motherbee<->ingress session) is unchanged and still allowed.
         let legit_admin = canonical_wan_src_name("SY.admin@motherbee", "motherbee");
         assert_eq!(legit_admin, "SY.admin@motherbee");
-        assert!(authority("EDGE_OPEN_URL", Some(&legit_admin), receiving_hive));
+        assert!(authority(
+            "EDGE_OPEN_URL",
+            Some(&legit_admin),
+            receiving_hive
+        ));
 
         // PRESERVATION: a legitimate cross-hive orchestrator (resolved in its own bucket) is
         // still authorized for a protected action.

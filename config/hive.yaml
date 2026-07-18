@@ -16,6 +16,8 @@ nats:
 # Local admin HTTP API.
 admin:
   listen: "127.0.0.1:8080"
+  # Optional absolute content origin returned alongside /public/<key>.
+  # public_base_url: "https://content.example.com"
 
 # Local architect HTTP UI/API (typically exposed through reverse proxy).
 architect:
@@ -45,6 +47,7 @@ blob:
   path: "/var/lib/fluxbee/blob"
   sync:
     enabled: true
+    public_enabled: true
     tool: "syncthing"
     api_port: 8384
     data_dir: "/var/lib/fluxbee/syncthing"

@@ -1,8 +1,8 @@
 # Fluxbee — Referencia completa de acciones SY.admin
 
-**Fecha extracción:** 2026-05-11  
+**Fecha extracción:** 2026-07-17
 **Fuente:** `src/bin/sy_admin.rs`  
-**Total acciones:** 75
+**Total acciones:** 86
 **Propósito:** Documentar exactamente qué información está disponible en el help de admin para los modelos que usan `get_admin_action_help`.
 
 ---
@@ -54,6 +54,39 @@ Semántica:
 - **Descripción:** Retorna help metadata para una acción admin específica.
 - **Read-only:** sí
 - **Path param:** `action` — nombre de la acción, e.g. `add_hive`
+
+---
+
+## Categoría 1b — Publicación de artefactos (2 acciones mesh-only)
+
+Estas acciones aparecen en `list_admin_actions` y tienen contrato completo en
+`get_admin_action_help`, pero `executor_available=false`: no tienen endpoint HTTP/SCMD y no pueden
+ser pasos del Admin executor. Las invoca directamente el nodo productor mediante
+`RouterDispatcher::send_admin_rpc`; el router estampa su identidad.
+
+### `publish_artifact`
+- **Transporte:** `ADMIN_COMMAND` directo a `SY.admin@<hive>`
+- **Descripción:** Publica un `BlobRef` existente a través de `SY.edge /public/<key>`.
+- **Read-only:** no | **Requiere CONFIRM:** no | **Executor:** no disponible
+- **Caller permitido:** nodo gestionado y fully-qualified `AI.*`, `IO.*` o `WF.*`.
+- **Target:** `None`; no se acepta `payload.target`.
+- **Campos requeridos:**
+  - `blob_ref` (object): `{type, blob_name, size, mime, filename_original, spool_day}` de contenido ya promovido a `active/` y disponible para `IO.blob`.
+- **Campos opcionales:**
+  - `presentation` (enum `inline|attachment`): Admin aplica la policy fija por MIME.
+  - `expires_in_secs` (u64): default 86400; clamp 60..2592000.
+- **Respuesta:** `publication_id`, `url`, `public_url` (si Admin tiene base pública), `expires_at`, `edge_node`, `content_type`, `presentation`.
+- **Prohibido:** `tenant_id`, `publisher_l2_name`, paths, bytes, public key, SHA-256 filename, headers o CSP. Admin deriva/minta esos valores.
+- **Semántica pública:** v1 es link-capability; cualquiera con el enlace puede leer hasta expiry o revocación. HTML inline admite JS autocontenido, pero edge bloquea red con la policy `sandboxed-html-v1`.
+
+### `unpublish_artifact`
+- **Transporte:** `ADMIN_COMMAND` directo a `SY.admin@<hive>`
+- **Descripción:** Revoca una publicación propia y libera su referencia curada.
+- **Read-only:** no | **Requiere CONFIRM:** no | **Executor:** no disponible
+- **Caller permitido:** exactamente el mismo `publisher_l2_name` estampado que creó la publicación.
+- **Target:** `None`.
+- **Campo requerido:** `publication_id` (string `pub:<uuid>`) retornado por `publish_artifact`.
+- **Semántica:** idempotente después de completar la revocación; responde solo después de que edge remueve la publicación.
 
 ---
 

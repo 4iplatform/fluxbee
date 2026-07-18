@@ -33,6 +33,8 @@ pub const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
     "EDGE_OPEN_URL",
     "EDGE_CLOSE_URL",
     "EDGE_LIST_URLS",
+    "EDGE_PUBLISH_BLOB",
+    "EDGE_UNPUBLISH_BLOB",
     "SPAWN_NODE",
     "KILL_NODE",
     "START_NODE",
@@ -65,7 +67,11 @@ pub const EDGE_CONTROL_AUTHORITY: &str = "SY.admin@motherbee";
 fn is_edge_service_action(action: &str) -> bool {
     matches!(
         action,
-        "EDGE_OPEN_URL" | "EDGE_CLOSE_URL" | "EDGE_LIST_URLS"
+        "EDGE_OPEN_URL"
+            | "EDGE_CLOSE_URL"
+            | "EDGE_LIST_URLS"
+            | "EDGE_PUBLISH_BLOB"
+            | "EDGE_UNPUBLISH_BLOB"
     )
 }
 
@@ -217,6 +223,8 @@ mod tests {
             "EDGE_OPEN_URL",
             "EDGE_CLOSE_URL",
             "EDGE_LIST_URLS",
+            "EDGE_PUBLISH_BLOB",
+            "EDGE_UNPUBLISH_BLOB",
             "SPAWN_NODE",
             "KILL_NODE",
             "NODE_STATUS_GET",
@@ -328,8 +336,16 @@ mod tests {
         // None / empty / no '@' / empty hive -> denied
         assert!(!same_hive_role_allowed("motherbee", None, &allow));
         assert!(!same_hive_role_allowed("motherbee", Some("   "), &allow));
-        assert!(!same_hive_role_allowed("motherbee", Some("SY.architect"), &allow));
-        assert!(!same_hive_role_allowed("motherbee", Some("SY.architect@"), &allow));
+        assert!(!same_hive_role_allowed(
+            "motherbee",
+            Some("SY.architect"),
+            &allow
+        ));
+        assert!(!same_hive_role_allowed(
+            "motherbee",
+            Some("SY.architect@"),
+            &allow
+        ));
     }
 
     #[test]
@@ -398,13 +414,15 @@ mod tests {
     }
 
     #[test]
-    fn protected_set_is_the_21_actions() {
+    fn protected_set_is_the_23_actions() {
         for action in [
             "SYSTEM_UPDATE",
             "SYSTEM_SYNC_HINT",
             "EDGE_OPEN_URL",
             "EDGE_CLOSE_URL",
             "EDGE_LIST_URLS",
+            "EDGE_PUBLISH_BLOB",
+            "EDGE_UNPUBLISH_BLOB",
             "SPAWN_NODE",
             "KILL_NODE",
             "START_NODE",
@@ -427,7 +445,7 @@ mod tests {
                 "{action} must be protected"
             );
         }
-        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 21);
+        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 23);
         for action in ["RUNTIME_UPDATE", "HELLO", "LSA", "", "TOTALLY_UNKNOWN"] {
             assert!(!is_protected_system_action(action));
         }
@@ -436,7 +454,13 @@ mod tests {
     #[test]
     fn edge_service_actions_are_motherbee_admin_only() {
         let ingress_hive = "edge-1";
-        for action in ["EDGE_OPEN_URL", "EDGE_CLOSE_URL", "EDGE_LIST_URLS"] {
+        for action in [
+            "EDGE_OPEN_URL",
+            "EDGE_CLOSE_URL",
+            "EDGE_LIST_URLS",
+            "EDGE_PUBLISH_BLOB",
+            "EDGE_UNPUBLISH_BLOB",
+        ] {
             assert!(authority(action, Some("SY.admin@motherbee"), ingress_hive));
             assert!(!authority(action, Some("SY.admin@edge-1"), ingress_hive));
             assert!(!authority(

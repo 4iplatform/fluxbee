@@ -474,6 +474,20 @@ pub const MSG_EDGE_CLOSE_URL: &str = "EDGE_CLOSE_URL";
 pub const MSG_EDGE_CLOSE_URL_RESPONSE: &str = "EDGE_CLOSE_URL_RESPONSE";
 pub const MSG_EDGE_LIST_URLS: &str = "EDGE_LIST_URLS";
 pub const MSG_EDGE_LIST_URLS_RESPONSE: &str = "EDGE_LIST_URLS_RESPONSE";
+pub const MSG_EDGE_PUBLISH_BLOB: &str = "EDGE_PUBLISH_BLOB";
+pub const MSG_EDGE_PUBLISH_BLOB_RESPONSE: &str = "EDGE_PUBLISH_BLOB_RESPONSE";
+pub const MSG_EDGE_UNPUBLISH_BLOB: &str = "EDGE_UNPUBLISH_BLOB";
+pub const MSG_EDGE_UNPUBLISH_BLOB_RESPONSE: &str = "EDGE_UNPUBLISH_BLOB_RESPONSE";
+
+// IO.blob curator worker plane (SY.admin -> IO.blob). These commands never publish a URL and
+// carry no external bytes: admin has already authorized the producer and resolved its tenant;
+// IO.blob only materializes/releases the curated local public copy and reports status.
+pub const MSG_BLOB_CURATE: &str = "BLOB_CURATE";
+pub const MSG_BLOB_CURATE_RESPONSE: &str = "BLOB_CURATE_RESPONSE";
+pub const MSG_BLOB_RELEASE: &str = "BLOB_RELEASE";
+pub const MSG_BLOB_RELEASE_RESPONSE: &str = "BLOB_RELEASE_RESPONSE";
+pub const MSG_BLOB_STATUS_GET: &str = "BLOB_STATUS_GET";
+pub const MSG_BLOB_STATUS_GET_RESPONSE: &str = "BLOB_STATUS_GET_RESPONSE";
 
 pub const SCOPE_VPN: &str = "vpn";
 pub const SCOPE_GLOBAL: &str = "global";

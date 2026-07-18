@@ -90,7 +90,10 @@ pub fn classify_admin_action(action: &str) -> Option<ActionClass> {
         | "get_runtime"
         | "get_runtimes"
         | "node_control_config_get" => Some(ActionClass::Read),
-        "set_node_config" | "node_control_config_set" => Some(ActionClass::Write),
+        "set_node_config"
+        | "node_control_config_set"
+        | "publish_artifact"
+        | "unpublish_artifact" => Some(ActionClass::Write),
         "add_route"
         | "delete_route"
         | "add_vpn"

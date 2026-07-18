@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
-use std::io::{self, Cursor};
-use std::os::unix::fs::PermissionsExt;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Cursor, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
+use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::future;
 use tar::{Archive, Builder};
@@ -24,13 +25,16 @@ use fluxbee_ai_sdk::{
     FunctionCallingConfig, FunctionCallingRunner, FunctionLoopItem, FunctionRunInput, FunctionTool,
     FunctionToolDefinition, FunctionToolRegistry, ModelSettings, OpenAiResponsesClient,
 };
+use fluxbee_sdk::blob::{BlobRef, BlobToolkit};
 use fluxbee_sdk::nats::{NatsClient, NatsRequestEnvelope, NatsResponseEnvelope};
 use fluxbee_sdk::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, VaultSecretChangedPayload,
-    VaultSecretInterest, MSG_CONFIG_CHANGED, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE,
+    VaultSecretInterest, MSG_BLOB_CURATE, MSG_BLOB_CURATE_RESPONSE, MSG_BLOB_RELEASE,
+    MSG_BLOB_RELEASE_RESPONSE, MSG_CONFIG_CHANGED, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE,
     MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
-    MSG_NODE_STATUS_GET, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL,
-    SYSTEM_KIND,
+    MSG_EDGE_PUBLISH_BLOB, MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB,
+    MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_NODE_STATUS_GET, MSG_TTL_EXCEEDED, MSG_UNREACHABLE,
+    MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, classify_admin_action, classify_system_message,
@@ -58,6 +62,10 @@ use sha2::{Digest, Sha256};
 type AdminError = Box<dyn std::error::Error + Send + Sync>;
 use json_router::router::system_policy::PRIMARY_HIVE_ID;
 const DEFAULT_BLOB_ROOT: &str = "/var/lib/fluxbee/blob";
+const PUBLICATION_LEDGER_SCHEMA_VERSION: u32 = 1;
+const PUBLICATION_DEFAULT_EXPIRES_SECS: u64 = 86_400;
+const PUBLICATION_MAX_EXPIRES_SECS: u64 = 30 * 86_400;
+const PUBLICATION_MIN_EXPIRES_SECS: u64 = 60;
 const MSG_ADMIN_COMMAND: &str = "ADMIN_COMMAND";
 const MSG_ADMIN_COMMAND_RESPONSE: &str = "ADMIN_COMMAND_RESPONSE";
 const DEFAULT_ADMIN_EXECUTOR_MODEL: &str = "gpt-5.4-mini";
@@ -107,17 +115,11 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
 
 /// The admin actions IO.cloud (the internal Fluxbee Cloud relay) may invoke on behalf of Cloud.
 /// SINGLE SOURCE, read by BOTH the `list_cloud_actions` capability query (so Cloud discovers its
-/// surface without a duplicated hardcoded list) AND — once built — the io.cloud relay authz gate
-/// (so "what is advertised" == "what is permitted"; they cannot drift). Tier-1 provisioning set
-/// (io-cloud-spec-v1 §3.2): create the tenant + ilk definition, store the provider token in vault,
-/// spawn/start the IO node. A subset of ADMIN_EXECUTOR_PILOT_ACTIONS.
-const IO_CLOUD_EXPOSED_ACTIONS: &[&str] = &[
-    "create_tenant",
-    "set_ilk_definition",
-    "vault_put",
-    "run_node",
-    "start_node",
-];
+/// surface without a duplicated hardcoded list) AND the io.cloud relay authz gate (so "what is
+/// advertised" == "what is permitted"; they cannot drift). Tier-1 provisioning set
+/// (io-cloud-spec-v1 §3.2): create the tenant, store provider tokens in vault and spawn the IO node.
+/// A subset of ADMIN_EXECUTOR_PILOT_ACTIONS.
+const IO_CLOUD_EXPOSED_ACTIONS: &[&str] = &["create_tenant", "vault_put", "run_node"];
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -132,6 +134,8 @@ struct HiveFile {
 #[derive(Debug, Deserialize)]
 struct AdminSection {
     listen: Option<String>,
+    public_edge_node: Option<String>,
+    public_base_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,6 +303,62 @@ struct AdminContext {
     /// hot-refresh path so refreshes flow through the same router
     /// connection as ordinary admin/system traffic.
     rpc: Arc<RouterDispatcher>,
+    public_edge_node: Option<String>,
+    public_base_url: Option<String>,
+    publication_ledger_path: PathBuf,
+    publication_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishArtifactParams {
+    blob_ref: BlobRef,
+    #[serde(default)]
+    presentation: Option<String>,
+    #[serde(default)]
+    expires_in_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnpublishArtifactParams {
+    publication_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AdminPublicationRecord {
+    publication_id: String,
+    key: String,
+    tenant_id: String,
+    publisher_l2_name: String,
+    blob_ref: BlobRef,
+    public_name: String,
+    sha256: String,
+    size: u64,
+    content_type: String,
+    presentation: String,
+    content_policy: String,
+    expires_at: u64,
+    edge_node: String,
+    status: String,
+    created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    released_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AdminPublicationLedger {
+    schema_version: u32,
+    publications: BTreeMap<String, AdminPublicationRecord>,
+}
+
+impl Default for AdminPublicationLedger {
+    fn default() -> Self {
+        Self {
+            schema_version: PUBLICATION_LEDGER_SCHEMA_VERSION,
+            publications: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -523,6 +583,28 @@ async fn main() -> Result<(), AdminError> {
     .await?;
     let executor_configured = Arc::new(AtomicBool::new(initial_executor_runtime.is_some()));
     let executor_runtime = Arc::new(Mutex::new(initial_executor_runtime));
+    let public_edge_node = std::env::var("SY_ADMIN_PUBLIC_EDGE_NODE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            hive.admin
+                .as_ref()
+                .and_then(|admin| admin.public_edge_node.clone())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        });
+    let public_base_url = std::env::var("SY_ADMIN_PUBLIC_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            hive.admin
+                .as_ref()
+                .and_then(|admin| admin.public_base_url.clone())
+                .map(|value| value.trim().trim_end_matches('/').to_string())
+                .filter(|value| !value.is_empty())
+        });
     let http_ctx = AdminContext {
         config_dir: config_dir.clone(),
         state_dir: state_dir.clone(),
@@ -537,6 +619,10 @@ async fn main() -> Result<(), AdminError> {
         executor_runtime,
         executor_configured,
         rpc: Arc::clone(&router_client),
+        public_edge_node,
+        public_base_url,
+        publication_ledger_path: state_dir.join("sy-admin/publications.json"),
+        publication_lock: Arc::new(Mutex::new(())),
     };
     let internal_ctx = http_ctx.clone();
     let system_ctx = http_ctx.clone();
@@ -940,6 +1026,7 @@ fn executor_visible_action_specs(
 
     INTERNAL_ACTION_REGISTRY
         .iter()
+        .filter(|spec| admin_action_executor_available(spec.action))
         .filter(|spec| {
             allowlist
                 .as_ref()
@@ -1202,6 +1289,11 @@ fn validate_executor_plan(plan: &AdminExecutorPlan) -> Result<(), String> {
         }
         let spec = resolve_internal_action_spec(action)
             .map_err(|detail| format!("{step_label}.action {detail}: '{action}'"))?;
+        if !admin_action_executor_available(action) {
+            return Err(format!(
+                "{step_label}.action '{action}' is mesh-only and cannot run through the admin executor"
+            ));
+        }
         let function_schema = build_admin_executor_function_definition(spec).parameters_json_schema;
         validate_executor_arg_literals(&step.args, &format!("{step_label}.args"))?;
         validate_value_against_schema(&step.args, &function_schema, &format!("{step_label}.args"))?;
@@ -2957,7 +3049,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "8";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "9";
 
 const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
@@ -2993,6 +3085,18 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "publish_runtime_package",
         route: InternalActionRoute::Command("publish_runtime_package"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "publish_artifact",
+        route: InternalActionRoute::Command("publish_artifact"),
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "unpublish_artifact",
+        route: InternalActionRoute::Command("unpublish_artifact"),
         requires_target: false,
         allow_legacy_hive_id: false,
     },
@@ -3466,6 +3570,598 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     },
 ];
 
+async fn handle_publish_artifact(
+    ctx: &AdminContext,
+    client: &Arc<RouterDispatcher>,
+    params: serde_json::Value,
+    caller_l2_name: Option<&str>,
+) -> Result<InternalAdminDispatchResult, AdminError> {
+    let action = "publish_artifact";
+    let caller = match authorize_artifact_publisher(caller_l2_name) {
+        Ok(caller) => caller,
+        Err(detail) => return Ok(internal_unauthorized(action, &detail)),
+    };
+    let request: PublishArtifactParams = match serde_json::from_value(params) {
+        Ok(request) => request,
+        Err(err) => {
+            return Ok(internal_invalid_request(
+                action,
+                &format!("invalid publish_artifact params: {err}"),
+            ))
+        }
+    };
+    if let Err(err) = BlobToolkit::validate_blob_ref(&request.blob_ref) {
+        return Ok(internal_invalid_request(action, &err.to_string()));
+    }
+    let (tenant_id, publisher_l2_name) = match resolve_artifact_publisher(ctx, &caller) {
+        Ok(identity) => identity,
+        Err(detail) => return Ok(internal_unauthorized(action, &detail)),
+    };
+    let edge_node = match resolve_public_edge_node(ctx) {
+        Ok(edge) => edge,
+        Err(detail) => {
+            return Ok(internal_service_error(
+                action,
+                "EDGE_NOT_CONFIGURED",
+                &detail,
+            ))
+        }
+    };
+    let (content_type, presentation, content_policy) =
+        match normalize_public_presentation(&request.blob_ref, request.presentation.as_deref()) {
+            Ok(policy) => policy,
+            Err(detail) => return Ok(internal_invalid_request(action, &detail)),
+        };
+    let expires_in_secs = request
+        .expires_in_secs
+        .unwrap_or(PUBLICATION_DEFAULT_EXPIRES_SECS)
+        .clamp(PUBLICATION_MIN_EXPIRES_SECS, PUBLICATION_MAX_EXPIRES_SECS);
+    let now = Utc::now().timestamp().max(0) as u64;
+    let expires_at = now.saturating_add(expires_in_secs);
+    let publication_id = format!("pub:{}", Uuid::new_v4());
+    let key = mint_public_capability();
+    let _publication_guard = ctx.publication_lock.lock().await;
+
+    let curate = send_system_request_with_meta(
+        client,
+        &format!("IO.blob@{}", ctx.hive_id),
+        MSG_BLOB_CURATE,
+        MSG_BLOB_CURATE_RESPONSE,
+        serde_json::json!({
+            "publication_id": publication_id,
+            "tenant_id": tenant_id,
+            "publisher_l2_name": publisher_l2_name,
+            "blob_ref": request.blob_ref,
+        }),
+        16,
+        None,
+        None,
+        Some(format!("IO.blob@{}", ctx.hive_id)),
+        None,
+        None,
+        Duration::from_secs(30),
+    )
+    .await;
+    let curate = match curate {
+        Ok(payload) if payload.get("status").and_then(|value| value.as_str()) == Some("ok") => {
+            payload
+        }
+        Ok(payload) => {
+            return Ok(internal_service_error(
+                action,
+                payload
+                    .get("error_code")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("BLOB_CURATE_FAILED"),
+                &format!("IO.blob rejected publication: {payload}"),
+            ))
+        }
+        Err(err) => {
+            return Ok(internal_service_error(
+                action,
+                "BLOB_CURATE_FAILED",
+                &format!("IO.blob unavailable: {err}"),
+            ))
+        }
+    };
+    let public_name = curate
+        .get("public_name")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let sha256 = curate
+        .get("sha256")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let size = curate
+        .get("size")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(u64::MAX);
+    if !is_lower_sha256(&public_name) || public_name != sha256 || size != request.blob_ref.size {
+        let _ = release_curated_blob(client, ctx, &publication_id).await;
+        return Ok(internal_service_error(
+            action,
+            "BLOB_CURATE_INVALID_RESPONSE",
+            "IO.blob returned inconsistent public_name, sha256 or size",
+        ));
+    }
+
+    let mut ledger = match load_admin_publication_ledger(&ctx.publication_ledger_path) {
+        Ok(ledger) => ledger,
+        Err(err) => {
+            let _ = release_curated_blob(client, ctx, &publication_id).await;
+            return Ok(internal_service_error(action, "LEDGER_FAILED", &err));
+        }
+    };
+    let mut record = AdminPublicationRecord {
+        publication_id: publication_id.clone(),
+        key: key.clone(),
+        tenant_id: tenant_id.clone(),
+        publisher_l2_name: publisher_l2_name.clone(),
+        blob_ref: request.blob_ref,
+        public_name: public_name.clone(),
+        sha256: sha256.clone(),
+        size,
+        content_type: content_type.clone(),
+        presentation: presentation.clone(),
+        content_policy: content_policy.clone(),
+        expires_at,
+        edge_node: edge_node.clone(),
+        status: "curated".to_string(),
+        created_at: now,
+        released_at: None,
+    };
+    ledger
+        .publications
+        .insert(publication_id.clone(), record.clone());
+    if let Err(err) = persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger) {
+        let _ = release_curated_blob(client, ctx, &publication_id).await;
+        return Ok(internal_service_error(action, "LEDGER_FAILED", &err));
+    }
+
+    let edge_result = send_system_request_with_meta(
+        client,
+        &edge_node,
+        MSG_EDGE_PUBLISH_BLOB,
+        MSG_EDGE_PUBLISH_BLOB_RESPONSE,
+        serde_json::json!({
+            "key": key,
+            "publication_id": publication_id,
+            "public_name": public_name,
+            "sha256": sha256,
+            "size": size,
+            "content_type": content_type,
+            "presentation": presentation,
+            "expires_at": expires_at,
+            "content_policy": content_policy,
+        }),
+        16,
+        None,
+        None,
+        Some(edge_node.clone()),
+        None,
+        None,
+        Duration::from_secs(75),
+    )
+    .await;
+    match edge_result {
+        Ok(payload) if payload.get("status").and_then(|value| value.as_str()) == Some("ok") => {}
+        result => {
+            let _ = release_curated_blob(client, ctx, &publication_id).await;
+            ledger.publications.remove(&publication_id);
+            let _ = persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger);
+            let detail = match result {
+                Ok(payload) => format!("edge rejected publication: {payload}"),
+                Err(err) => format!("edge unavailable while publishing: {err}"),
+            };
+            return Ok(internal_service_error(
+                action,
+                "EDGE_PUBLISH_FAILED",
+                &detail,
+            ));
+        }
+    }
+
+    record.status = "published".to_string();
+    ledger
+        .publications
+        .insert(publication_id.clone(), record.clone());
+    if let Err(err) = persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger) {
+        let _ = unpublish_edge_blob(client, &edge_node, &publication_id).await;
+        let _ = release_curated_blob(client, ctx, &publication_id).await;
+        return Ok(internal_service_error(action, "LEDGER_FAILED", &err));
+    }
+    let path = format!("/public/{key}");
+    let public_url = ctx
+        .public_base_url
+        .as_ref()
+        .map(|base| format!("{base}{path}"));
+    tracing::info!(
+        publication_id = %publication_id,
+        tenant_id = %tenant_id,
+        publisher = %publisher_l2_name,
+        edge = %edge_node,
+        expires_at,
+        "public artifact published and ACKed"
+    );
+    Ok(InternalAdminDispatchResult {
+        http_status: 200,
+        envelope: serde_json::json!({
+            "status": "ok",
+            "action": action,
+            "payload": {
+                "publication_id": publication_id,
+                "url": path,
+                "public_url": public_url,
+                "expires_at": expires_at,
+                "edge_node": edge_node,
+                "content_type": record.content_type,
+                "presentation": record.presentation,
+            }
+        }),
+    })
+}
+
+async fn handle_unpublish_artifact(
+    ctx: &AdminContext,
+    client: &Arc<RouterDispatcher>,
+    params: serde_json::Value,
+    caller_l2_name: Option<&str>,
+) -> Result<InternalAdminDispatchResult, AdminError> {
+    let action = "unpublish_artifact";
+    let caller = match authorize_artifact_publisher(caller_l2_name) {
+        Ok(caller) => caller,
+        Err(detail) => return Ok(internal_unauthorized(action, &detail)),
+    };
+    let request: UnpublishArtifactParams = match serde_json::from_value(params) {
+        Ok(request) => request,
+        Err(err) => return Ok(internal_invalid_request(action, &err.to_string())),
+    };
+    if !valid_prefixed_uuid(&request.publication_id, "pub") {
+        return Ok(internal_invalid_request(
+            action,
+            "publication_id must be pub:<uuid>",
+        ));
+    }
+    let _publication_guard = ctx.publication_lock.lock().await;
+    let mut ledger = match load_admin_publication_ledger(&ctx.publication_ledger_path) {
+        Ok(ledger) => ledger,
+        Err(err) => return Ok(internal_service_error(action, "LEDGER_FAILED", &err)),
+    };
+    let Some(mut record) = ledger.publications.get(&request.publication_id).cloned() else {
+        return Ok(internal_invalid_request(action, "publication not found"));
+    };
+    if record.publisher_l2_name != caller {
+        return Ok(internal_unauthorized(
+            action,
+            "a node may unpublish only its own publication",
+        ));
+    }
+    if record.status == "unpublished" {
+        return Ok(InternalAdminDispatchResult {
+            http_status: 200,
+            envelope: serde_json::json!({
+                "status": "ok",
+                "action": action,
+                "payload": {"publication_id": request.publication_id, "unpublished": false}
+            }),
+        });
+    }
+    if let Err(err) = unpublish_edge_blob(client, &record.edge_node, &record.publication_id).await {
+        return Ok(internal_service_error(
+            action,
+            "EDGE_UNPUBLISH_FAILED",
+            &err,
+        ));
+    }
+    record.status = "edge_removed".to_string();
+    ledger
+        .publications
+        .insert(record.publication_id.clone(), record.clone());
+    if let Err(err) = persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger) {
+        return Ok(internal_service_error(action, "LEDGER_FAILED", &err));
+    }
+    if let Err(err) = release_curated_blob(client, ctx, &record.publication_id).await {
+        return Ok(internal_service_error(action, "BLOB_RELEASE_FAILED", &err));
+    }
+    record.status = "unpublished".to_string();
+    record.released_at = Some(Utc::now().timestamp().max(0) as u64);
+    ledger
+        .publications
+        .insert(record.publication_id.clone(), record.clone());
+    if let Err(err) = persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger) {
+        return Ok(internal_service_error(action, "LEDGER_FAILED", &err));
+    }
+    Ok(InternalAdminDispatchResult {
+        http_status: 200,
+        envelope: serde_json::json!({
+            "status": "ok",
+            "action": action,
+            "payload": {"publication_id": record.publication_id, "unpublished": true}
+        }),
+    })
+}
+
+fn authorize_artifact_publisher(caller_l2_name: Option<&str>) -> Result<String, String> {
+    let caller = caller_l2_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "publish_artifact is mesh-only and requires a router-stamped producer".to_string()
+        })?;
+    if !(caller.starts_with("AI.") || caller.starts_with("IO.") || caller.starts_with("WF.")) {
+        return Err(format!(
+            "only AI.*, IO.* or WF.* producers may publish artifacts; caller={caller}"
+        ));
+    }
+    let Some((node, hive)) = caller.rsplit_once('@') else {
+        return Err("publisher must use a fully-qualified L2 name".to_string());
+    };
+    if node.is_empty() || hive.is_empty() {
+        return Err("publisher must use a fully-qualified L2 name".to_string());
+    }
+    Ok(caller.to_string())
+}
+
+fn resolve_artifact_publisher(
+    ctx: &AdminContext,
+    caller: &str,
+) -> Result<(String, String), String> {
+    let option =
+        fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_config(&ctx.config_dir, caller)
+            .map_err(|err| format!("identity SHM unavailable: {err}"))?
+            .map(|(_, option)| option)
+            .ok_or_else(|| format!("publisher '{caller}' is not registered in identity"))?;
+    if option.handler_node.as_deref() != Some(caller) || option.registration_status != "complete" {
+        return Err(format!(
+            "publisher '{caller}' does not have a complete active identity registration"
+        ));
+    }
+    if !valid_prefixed_uuid(&option.tenant_id, "tnt") {
+        return Err("publisher identity has an invalid tenant_id".to_string());
+    }
+    Ok((option.tenant_id, caller.to_string()))
+}
+
+fn resolve_public_edge_node(ctx: &AdminContext) -> Result<String, String> {
+    if let Some(edge) = ctx.public_edge_node.as_deref() {
+        return validate_public_edge_node(edge).map(str::to_string);
+    }
+    let hives_root = ctx
+        .state_dir
+        .parent()
+        .unwrap_or(ctx.state_dir.as_path())
+        .join("hives");
+    let mut candidates = Vec::new();
+    let entries = fs::read_dir(&hives_root).map_err(|err| {
+        format!(
+            "cannot inspect ingress inventory '{}': {err}",
+            hives_root.display()
+        )
+    })?;
+    for entry in entries.flatten() {
+        let info_path = entry.path().join("info.yaml");
+        let Ok(raw) = fs::read_to_string(&info_path) else {
+            continue;
+        };
+        let Ok(info) = serde_yaml::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if info.get("role").and_then(|value| value.as_str()) != Some("ingress")
+            || info.get("status").and_then(|value| value.as_str()) != Some("connected")
+        {
+            continue;
+        }
+        let hive_id = info
+            .get("hive_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim();
+        if !hive_id.is_empty() {
+            candidates.push(format!("SY.edge@{hive_id}"));
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [edge] => Ok(edge.clone()),
+        [] => Err("no connected ingress hive; configure admin.public_edge_node".to_string()),
+        _ => Err(format!(
+            "multiple connected ingress hives ({}) require admin.public_edge_node",
+            candidates.join(", ")
+        )),
+    }
+}
+
+fn validate_public_edge_node(edge: &str) -> Result<&str, String> {
+    let edge = edge.trim();
+    if edge.starts_with("SY.edge@") && edge.len() > "SY.edge@".len() {
+        Ok(edge)
+    } else {
+        Err("admin.public_edge_node must be SY.edge@<hive>".to_string())
+    }
+}
+
+fn normalize_public_presentation(
+    blob_ref: &BlobRef,
+    requested: Option<&str>,
+) -> Result<(String, String, String), String> {
+    let requested = requested.unwrap_or("inline").trim().to_ascii_lowercase();
+    if !matches!(requested.as_str(), "inline" | "attachment") {
+        return Err("presentation must be inline or attachment".to_string());
+    }
+    let mime = blob_ref.mime.trim().to_ascii_lowercase();
+    let (content_type, inline_allowed, policy) = match mime.as_str() {
+        "text/html" => (
+            "text/html; charset=utf-8".to_string(),
+            true,
+            "sandboxed-html-v1".to_string(),
+        ),
+        "text/plain" => (
+            "text/plain; charset=utf-8".to_string(),
+            true,
+            "static-v1".to_string(),
+        ),
+        "application/json" => (
+            "application/json; charset=utf-8".to_string(),
+            true,
+            "static-v1".to_string(),
+        ),
+        "application/pdf" | "image/png" | "image/jpeg" | "image/webp" | "image/gif" => {
+            (mime, true, "static-v1".to_string())
+        }
+        _ => (
+            "application/octet-stream".to_string(),
+            false,
+            "download-v1".to_string(),
+        ),
+    };
+    let presentation = if requested == "inline" && inline_allowed {
+        "inline"
+    } else {
+        "attachment"
+    };
+    Ok((content_type, presentation.to_string(), policy))
+}
+
+fn mint_public_capability() -> String {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_prefixed_uuid(value: &str, prefix: &str) -> bool {
+    value
+        .trim()
+        .strip_prefix(&format!("{prefix}:"))
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+        .is_some()
+}
+
+fn load_admin_publication_ledger(path: &Path) -> Result<AdminPublicationLedger, String> {
+    let raw = match fs::read(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(AdminPublicationLedger::default())
+        }
+        Err(err) => return Err(format!("read publication ledger: {err}")),
+    };
+    let ledger: AdminPublicationLedger =
+        serde_json::from_slice(&raw).map_err(|err| format!("parse publication ledger: {err}"))?;
+    if ledger.schema_version != PUBLICATION_LEDGER_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported publication ledger schema {}",
+            ledger.schema_version
+        ));
+    }
+    Ok(ledger)
+}
+
+fn persist_admin_publication_ledger(
+    path: &Path,
+    ledger: &AdminPublicationLedger,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "publication ledger path has no parent".to_string())?;
+    fs::create_dir_all(parent).map_err(|err| format!("create publication ledger dir: {err}"))?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o750))
+        .map_err(|err| format!("chmod publication ledger dir: {err}"))?;
+    let temp = parent.join(format!(
+        ".publications-{}-{}.tmp",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let result = (|| -> Result<(), String> {
+        let data = serde_json::to_vec_pretty(ledger)
+            .map_err(|err| format!("serialize publication ledger: {err}"))?;
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o640)
+            .open(&temp)
+            .map_err(|err| format!("create publication ledger temp: {err}"))?;
+        file.write_all(&data)
+            .map_err(|err| format!("write publication ledger: {err}"))?;
+        file.sync_all()
+            .map_err(|err| format!("sync publication ledger: {err}"))?;
+        drop(file);
+        fs::rename(&temp, path).map_err(|err| format!("replace publication ledger: {err}"))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o640))
+            .map_err(|err| format!("chmod publication ledger: {err}"))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+async fn release_curated_blob(
+    client: &Arc<RouterDispatcher>,
+    ctx: &AdminContext,
+    publication_id: &str,
+) -> Result<(), String> {
+    let target = format!("IO.blob@{}", ctx.hive_id);
+    let payload = send_system_request_with_meta(
+        client,
+        &target,
+        MSG_BLOB_RELEASE,
+        MSG_BLOB_RELEASE_RESPONSE,
+        serde_json::json!({"publication_id": publication_id}),
+        16,
+        None,
+        None,
+        Some(target.clone()),
+        None,
+        None,
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+    if payload.get("status").and_then(|value| value.as_str()) == Some("ok") {
+        Ok(())
+    } else {
+        Err(format!("IO.blob release rejected: {payload}"))
+    }
+}
+
+async fn unpublish_edge_blob(
+    client: &Arc<RouterDispatcher>,
+    edge_node: &str,
+    publication_id: &str,
+) -> Result<(), String> {
+    let payload = send_system_request_with_meta(
+        client,
+        edge_node,
+        MSG_EDGE_UNPUBLISH_BLOB,
+        MSG_EDGE_UNPUBLISH_BLOB_RESPONSE,
+        serde_json::json!({"publication_id": publication_id}),
+        16,
+        None,
+        None,
+        Some(edge_node.to_string()),
+        None,
+        None,
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+    if payload.get("status").and_then(|value| value.as_str()) == Some("ok") {
+        Ok(())
+    } else {
+        Err(format!("edge unpublish rejected: {payload}"))
+    }
+}
+
 /// `externalize` — an IO node self-exposes one of its channels (`ICH`) as a public
 /// URL on the edge (v6 §7). Resolves `ICH -> owner_l2_name` from identity SHM (admin
 /// runs where identity lives) and OPENS the URL on the edge via the `EDGE_OPEN_URL`
@@ -3882,10 +4578,28 @@ async fn dispatch_internal_admin_command(
     // EDGE-06 (scoped to the Fluxbee Cloud relay): the provisioning actions IO.cloud relays are
     // exposed behind an internet token via io.cloud, so over the MESH they may only originate from
     // IO.cloud. The operator HTTP path + the internal executor are caller==None and stay trusted.
-    if let Err(detail) = authorize_cloud_relay(caller_l2_name, action) {
+    if let Err(detail) = authorize_cloud_relay(caller_l2_name, action, &ctx.hive_id) {
         return Ok(internal_unauthorized(action, &detail));
     }
     match action {
+        "publish_artifact" => {
+            if target.is_some() {
+                return Ok(internal_invalid_request(
+                    action,
+                    "payload.target is not accepted for publish_artifact",
+                ));
+            }
+            return handle_publish_artifact(ctx, client, params, caller_l2_name).await;
+        }
+        "unpublish_artifact" => {
+            if target.is_some() {
+                return Ok(internal_invalid_request(
+                    action,
+                    "payload.target is not accepted for unpublish_artifact",
+                ));
+            }
+            return handle_unpublish_artifact(ctx, client, params, caller_l2_name).await;
+        }
         "executor_validate_plan" => {
             let plan = match parse_executor_plan(params) {
                 Ok(plan) => plan,
@@ -4234,6 +4948,23 @@ fn internal_unauthorized(action: &str, detail: &str) -> InternalAdminDispatchRes
     }
 }
 
+fn internal_service_error(
+    action: &str,
+    error_code: &str,
+    detail: &str,
+) -> InternalAdminDispatchResult {
+    InternalAdminDispatchResult {
+        http_status: 502,
+        envelope: serde_json::json!({
+            "status": "error",
+            "action": action,
+            "payload": serde_json::Value::Null,
+            "error_code": error_code,
+            "error_detail": detail,
+        }),
+    }
+}
+
 /// Authorize a node-originated channel service command (`externalize`/`unexternalize`, v6 §11.1):
 /// the caller must be an `IO.*` node (I1) and may only act on ITS OWN channel (I8: the identity-
 /// resolved `owner_l2_name` must equal the router-stamped, un-forgeable caller). A `None` caller is
@@ -4266,23 +4997,28 @@ fn authorize_channel_command(
 
 /// Relay gate for the Fluxbee Cloud provisioning actions (`IO_CLOUD_EXPOSED_ACTIONS`). These are
 /// reachable from the internet (Cloud -> edge -> IO.cloud -> here), so over the MESH they may ONLY
-/// originate from IO.cloud — the internal relay. `caller==None` is a trusted internal path (the
-/// operator HTTP server / the executor) and is allowed. Non-exposed actions are untouched. This
+/// originate from the singleton IO.cloud in this admin's hive — the internal relay. `caller==None`
+/// is a trusted internal path (the operator HTTP server / the executor) and is allowed. Non-exposed actions are untouched. This
 /// closes the EDGE-06 confused-deputy for the relay: the SAME `IO_CLOUD_EXPOSED_ACTIONS` the
 /// `list_cloud_actions` capability query advertises is what this gate enforces (advertised ==
 /// permitted). `caller` is the router-stamped, un-forgeable src_l2_name — never trusted from params.
-fn authorize_cloud_relay(caller_l2_name: Option<&str>, action: &str) -> Result<(), String> {
+fn authorize_cloud_relay(
+    caller_l2_name: Option<&str>,
+    action: &str,
+    admin_hive: &str,
+) -> Result<(), String> {
     if !IO_CLOUD_EXPOSED_ACTIONS.contains(&action) {
         return Ok(());
     }
     let Some(caller) = caller_l2_name else {
         return Ok(());
     };
-    if caller.starts_with("IO.cloud@") {
+    let expected = format!("IO.cloud@{admin_hive}");
+    if caller == expected {
         return Ok(());
     }
     Err(format!(
-        "only IO.cloud may relay '{action}' over the mesh (Fluxbee Cloud provisioning gate); caller={caller}"
+        "only {expected} may relay '{action}' over the mesh (Fluxbee Cloud provisioning gate); caller={caller}"
     ))
 }
 
@@ -7034,9 +7770,9 @@ fn build_admin_actions_catalog_response() -> (u16, String) {
 
 /// Capability query for IO.cloud / Fluxbee Cloud: the SAME registry projection as
 /// `build_admin_actions_catalog_response`, but filtered to `IO_CLOUD_EXPOSED_ACTIONS` — so Cloud
-/// discovers exactly the provisioning surface it may invoke (create tenant/ilk, put token, spawn
-/// node) from ONE source, never a duplicated hardcoded list. When the io.cloud relay authz gate
-/// lands it MUST read the same `IO_CLOUD_EXPOSED_ACTIONS`, so advertised == enforced.
+/// discovers exactly the provisioning surface it may invoke (create tenant, put token, spawn node)
+/// from ONE source, never a duplicated hardcoded list. The relay authz gate reads the same
+/// `IO_CLOUD_EXPOSED_ACTIONS`, so advertised == enforced.
 fn build_cloud_actions_catalog_response() -> (u16, String) {
     let exposed: std::collections::HashSet<&str> =
         IO_CLOUD_EXPOSED_ACTIONS.iter().copied().collect();
@@ -7218,6 +7954,12 @@ fn merge_admin_executor_local_config(
                 resolve_internal_action_spec(action).map_err(|err| {
                     format!("config.catalog.actions contains invalid action '{action}': {err}")
                 })?;
+                if !admin_action_executor_available(action) {
+                    return Err(format!(
+                        "config.catalog.actions contains mesh-only action '{action}', which is not available to the admin executor"
+                    )
+                    .into());
+                }
                 actions.push(action.to_string());
             }
             catalog_cfg.actions = Some(actions);
@@ -7438,6 +8180,7 @@ async fn apply_admin_executor_config_set(
 
 fn build_admin_action_doc(spec: &InternalActionSpec) -> serde_json::Value {
     let path_patterns = admin_action_path_patterns(spec.action);
+    let execution_preference = admin_action_execution_preference(spec.action);
     let (handler, canonical_action) = match spec.route {
         InternalActionRoute::Query(canonical) => ("query", Some(canonical)),
         InternalActionRoute::Command(canonical) => ("command", Some(canonical)),
@@ -7451,6 +8194,7 @@ fn build_admin_action_doc(spec: &InternalActionSpec) -> serde_json::Value {
         InternalActionRoute::TimerRpc(canonical) => ("timer_rpc", Some(canonical)),
     };
     serde_json::json!({
+        "name": spec.action,
         "action": spec.action,
         "handler": handler,
         "canonical_action": canonical_action,
@@ -7458,16 +8202,30 @@ fn build_admin_action_doc(spec: &InternalActionSpec) -> serde_json::Value {
         "allow_legacy_hive_id": spec.allow_legacy_hive_id,
         "read_only": admin_action_is_read_only(spec.action),
         "confirmation_required": admin_action_requires_confirmation(spec.action),
+        "executor_available": admin_action_executor_available(spec.action),
+        "description": admin_action_summary(spec.action),
         "summary": admin_action_summary(spec.action),
         "path_patterns": path_patterns,
-        "path_patterns_are_templates": true,
-        "execution_preference": "example_scmd",
+        "path_patterns_are_templates": !path_patterns.is_empty(),
+        "execution_preference": execution_preference,
         "request_contract": admin_action_request_contract(spec.action),
         "executor_contract": admin_action_executor_contract(spec),
     })
 }
 
 fn admin_action_executor_contract(spec: &InternalActionSpec) -> serde_json::Value {
+    if !admin_action_executor_available(spec.action) {
+        return serde_json::json!({
+            "kind": "unavailable",
+            "available": false,
+            "function_schema": serde_json::Value::Null,
+            "description": "This action requires the router-stamped identity of the producer and cannot run through the HTTP/operator admin executor.",
+            "notes": [
+                "Call RouterDispatcher::send_admin_rpc from the AI.*, IO.* or WF.* producer process.",
+                "The producer must not supply or override src_l2_name, tenant_id or publisher_l2_name."
+            ],
+        });
+    }
     let schema = build_admin_executor_function_definition(spec).parameters_json_schema;
     let notes = if matches!(
         spec.action,
@@ -7513,11 +8271,29 @@ fn admin_action_executor_contract(spec: &InternalActionSpec) -> serde_json::Valu
     })
 }
 
+fn admin_action_is_mesh_only(action: &str) -> bool {
+    matches!(action, "publish_artifact" | "unpublish_artifact")
+}
+
+fn admin_action_executor_available(action: &str) -> bool {
+    !admin_action_is_mesh_only(action)
+}
+
+fn admin_action_execution_preference(action: &str) -> &'static str {
+    if admin_action_is_mesh_only(action) {
+        "mesh_admin_rpc_from_producer"
+    } else {
+        "example_scmd"
+    }
+}
+
 fn admin_action_is_read_only(action: &str) -> bool {
     !matches!(
         action,
         "add_hive"
             | "publish_runtime_package"
+            | "publish_artifact"
+            | "unpublish_artifact"
             | "remove_hive"
             | "add_route"
             | "delete_route"
@@ -7594,6 +8370,12 @@ fn admin_action_summary(action: &str) -> &'static str {
         }
         "get_admin_action_help" => "Return help metadata for one admin action.",
         "publish_runtime_package" => "Publish one runtime package into dist/manifest on motherbee.",
+        "publish_artifact" => {
+            "Publish an existing BlobRef through SY.edge. Mesh-only: the router-stamped AI.*, IO.* or WF.* caller becomes the publication owner."
+        }
+        "unpublish_artifact" => {
+            "Revoke a public artifact owned by the calling producer. Mesh-only and identity-bound."
+        }
         "hive_status" => "Read the local hive status summary.",
         "list_hives" => "List all known hives.",
         "get_hive" => "Read one hive definition.",
@@ -7806,6 +8588,33 @@ fn admin_action_request_contract(action: &str) -> serde_json::Value {
         || !required_fields.is_empty()
         || !optional_fields.is_empty()
         || !example_payload.is_null();
+    if admin_action_is_mesh_only(action) {
+        return serde_json::json!({
+            "transport": "mesh_direct_to_sy_admin",
+            "method": MSG_ADMIN_COMMAND,
+            "path_patterns": path_patterns,
+            "path_patterns_are_templates": false,
+            "execution_preference": admin_action_execution_preference(action),
+            "path_params": [],
+            "body": {
+                "kind": "admin_rpc_params",
+                "required": true,
+                "required_fields": required_fields,
+                "optional_fields": optional_fields,
+            },
+            "example_payload": example_payload,
+            "example_scmd": serde_json::Value::Null,
+            "admin_rpc": {
+                "sdk_helper": "RouterDispatcher::send_admin_rpc",
+                "admin_target": "SY.admin@<hive>",
+                "action": action,
+                "target": serde_json::Value::Null,
+                "params": example_payload,
+                "response_message": MSG_ADMIN_COMMAND_RESPONSE,
+            },
+            "notes": admin_action_request_notes(action),
+        });
+    }
     serde_json::json!({
         "transport": "http_via_sy_admin",
         "method": admin_action_primary_method(action),
@@ -7991,6 +8800,8 @@ fn admin_action_body_required(action: &str) -> bool {
         action,
         "add_hive"
             | "publish_runtime_package"
+            | "publish_artifact"
+            | "unpublish_artifact"
             | "run_node"
             | "start_node"
             | "restart_node"
@@ -8026,6 +8837,16 @@ fn admin_action_body_required(action: &str) -> bool {
 
 fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
     match action {
+        "publish_artifact" => vec![admin_action_body_field(
+            "blob_ref",
+            "object",
+            "Active BlobRef object with type, blob_name, size, mime, filename_original and spool_day. Bytes and filesystem paths are not accepted.",
+        )],
+        "unpublish_artifact" => vec![admin_action_body_field(
+            "publication_id",
+            "string",
+            "Publication id returned by publish_artifact, in pub:<uuid> form.",
+        )],
         "add_hive" => vec![
             admin_action_body_field("hive_id", "string", "Unique hive id to create."),
             admin_action_body_field(
@@ -8210,6 +9031,18 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
 
 fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
     match action {
+        "publish_artifact" => vec![
+            admin_action_body_field(
+                "presentation",
+                "enum(inline|attachment)",
+                "Requested presentation. Admin applies the fixed MIME policy and may reject unsafe combinations.",
+            ),
+            admin_action_body_field(
+                "expires_in_secs",
+                "u64",
+                "Capability lifetime in seconds. Defaults to 86400 and is clamped to 60..2592000.",
+            ),
+        ],
         "publish_runtime_package" => vec![
             admin_action_body_field(
                 "set_current",
@@ -8236,12 +9069,17 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "role",
                 "string",
-                "Hive role to provision. Accepted values: worker (default), egress. Use egress to stand up a NAT gateway host that gives internal hives outbound internet access.",
+                "Hive role to provision. Accepted values: worker (default), egress, ingress. Use egress for outbound NAT and ingress for the public SY.edge frontier.",
             ),
             admin_action_body_field(
                 "egress",
                 "object",
                 "Required when role=egress (ignored otherwise). Host-specific NAT parameters: lan_cidr (IPv4 CIDR of the internal LAN, required), wan_iface (internet-facing interface name, required), lan_iface (LAN-facing interface name, required), edge_ip (optional, defaults to the first usable IP of lan_cidr), ipv6 (optional, only \"blocked\" is supported).",
+            ),
+            admin_action_body_field(
+                "ingress",
+                "object",
+                "Required when role=ingress (ignored otherwise). Public edge parameters: listen (required host:port), tls_vault_key and vault_hive for HTTPS, or allow_plaintext=true only for an explicit non-443 development listener.",
             ),
             admin_action_body_field(
                 "harden_ssh",
@@ -8626,6 +9464,21 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
 
 fn admin_action_example_payload(action: &str) -> serde_json::Value {
     match action {
+        "publish_artifact" => serde_json::json!({
+            "blob_ref": {
+                "type": "blob_ref",
+                "blob_name": "report_0123456789abcdef.html",
+                "size": 12345,
+                "mime": "text/html",
+                "filename_original": "report.html",
+                "spool_day": "2026-07-17"
+            },
+            "presentation": "inline",
+            "expires_in_secs": 86400
+        }),
+        "unpublish_artifact" => serde_json::json!({
+            "publication_id": "pub:550e8400-e29b-41d4-a716-446655440000"
+        }),
         "publish_runtime_package" => serde_json::json!({
             "source": {
                 "kind": "bundle_upload",
@@ -9077,6 +9930,21 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
 
 fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
     match action {
+        "publish_artifact" => vec![
+            "Mesh-only producer operation; there is no HTTP, SCMD or admin-executor publication endpoint.",
+            "The caller must be a running, fully-qualified AI.*, IO.* or WF.* managed node. The router stamps src_l2_name and SY.admin resolves its tenant through Identity.",
+            "Call RouterDispatcher::send_admin_rpc with target=None. Do not send tenant_id, publisher_l2_name, path, public key, sha256, raw headers or CSP.",
+            "blob_ref must already identify promoted active content available to IO.blob; bytes never travel in ADMIN_COMMAND.",
+            "The returned payload includes publication_id, url, optional public_url, expires_at, edge_node, content_type and presentation.",
+            "A /public/<key> URL is a bearer capability: anyone with the link can read it until expiry or unpublish.",
+            "Inline HTML may contain self-contained JavaScript, but edge applies sandboxed-html-v1 with network access disabled.",
+        ],
+        "unpublish_artifact" => vec![
+            "Mesh-only producer operation; there is no HTTP, SCMD or admin-executor unpublish endpoint.",
+            "Only the same router-stamped producer L2 name that created the publication may revoke it.",
+            "Call RouterDispatcher::send_admin_rpc with target=None and the publication_id returned by publish_artifact.",
+            "The operation is idempotent after a completed unpublish and waits for edge removal before returning success.",
+        ],
         "publish_runtime_package" => vec![
             "Motherbee-only operation.",
             "Supported source kinds: inline_package and bundle_upload.",
@@ -11482,11 +12350,18 @@ fn normalize_vault_put_payload(
                 )
             {
                 Some(ilk.ilk_id)
-            } else {
-                // Fall back to deterministic computation for SY system
-                // nodes — they may not be visible in SHM yet at the moment
-                // the operator runs the put, but their ILK is computable.
+            } else if owner_node_has_deterministic_ilk(&handler_node) {
+                // SY system nodes are the only principals with deterministic ILKs. They may not
+                // be visible in SHM yet during bootstrap, but their identity is still derivable.
                 Some(fluxbee_sdk::deterministic_system_ilk_id(&handler_node))
+            } else {
+                // Dynamic AI/IO/WF/RT identities are random. A deterministic fallback here writes
+                // an unreadable secret, so fail explicitly and let the caller register/spawn the
+                // owner first (or omit owner_node for a tenant-pool secret).
+                return Err(format!(
+                    "metadata.owner_node '{}' is not registered in identity; register/spawn it first or omit owner_node for a tenant-pool secret",
+                    handler_node
+                ));
             }
         }
         (None, None) => None, // pool secret
@@ -11498,6 +12373,10 @@ fn normalize_vault_put_payload(
     }
 
     Ok(payload)
+}
+
+fn owner_node_has_deterministic_ilk(handler_node: &str) -> bool {
+    handler_node.starts_with("SY.")
 }
 
 async fn handle_hive_update_command(
@@ -12794,7 +13673,7 @@ fn build_opa_query_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::broadcast;
@@ -12803,22 +13682,49 @@ mod tests {
     #[test]
     fn cloud_relay_gate_allows_only_iocloud_over_mesh() {
         // A non-exposed action is untouched regardless of caller.
-        assert!(authorize_cloud_relay(Some("AI.worker@motherbee"), "list_nodes").is_ok());
+        assert!(
+            authorize_cloud_relay(Some("AI.worker@motherbee"), "list_nodes", "motherbee").is_ok()
+        );
         for action in IO_CLOUD_EXPOSED_ACTIONS {
             // Trusted internal path (caller==None: HTTP operator / executor) — allowed.
-            assert!(authorize_cloud_relay(None, action).is_ok());
-            // Over the mesh, ONLY IO.cloud may relay it (any hive).
-            assert!(authorize_cloud_relay(Some("IO.cloud@motherbee"), action).is_ok());
-            assert!(authorize_cloud_relay(Some("IO.cloud@worker1"), action).is_ok());
+            assert!(authorize_cloud_relay(None, action, "motherbee").is_ok());
+            // Over the mesh, ONLY the singleton IO.cloud in the admin's hive may relay it.
+            assert!(authorize_cloud_relay(Some("IO.cloud@motherbee"), action, "motherbee").is_ok());
+            assert!(authorize_cloud_relay(Some("IO.cloud@worker1"), action, "motherbee").is_err());
             // Any other mesh caller is denied — this is the EDGE-06 close for the relay.
-            assert!(authorize_cloud_relay(Some("IO.slack@motherbee"), action).is_err());
-            assert!(authorize_cloud_relay(Some("AI.worker@motherbee"), action).is_err());
-            assert!(authorize_cloud_relay(Some("SY.orchestrator@motherbee"), action).is_err());
+            assert!(
+                authorize_cloud_relay(Some("IO.slack@motherbee"), action, "motherbee").is_err()
+            );
+            assert!(
+                authorize_cloud_relay(Some("AI.worker@motherbee"), action, "motherbee").is_err()
+            );
+            assert!(
+                authorize_cloud_relay(Some("SY.orchestrator@motherbee"), action, "motherbee")
+                    .is_err()
+            );
         }
     }
 
     #[test]
+    fn only_system_nodes_use_deterministic_vault_owner_fallback() {
+        assert!(owner_node_has_deterministic_ilk("SY.edge@ingress1"));
+        assert!(owner_node_has_deterministic_ilk("SY.architect@motherbee"));
+        assert!(!owner_node_has_deterministic_ilk(
+            "IO.linkedhelper.demo@motherbee"
+        ));
+        assert!(!owner_node_has_deterministic_ilk("AI.demo@motherbee"));
+    }
+
+    #[test]
     fn cloud_actions_catalog_is_the_exposed_registry_subset() {
+        let expected_surface: std::collections::HashSet<&str> =
+            ["create_tenant", "vault_put", "run_node"]
+                .into_iter()
+                .collect();
+        let configured_surface: std::collections::HashSet<&str> =
+            IO_CLOUD_EXPOSED_ACTIONS.iter().copied().collect();
+        assert_eq!(configured_surface, expected_surface);
+
         // Every IO.cloud-exposed action must exist in the registry, else a typo would silently
         // drop it from Cloud's discoverable surface (and later from the authz gate).
         let registry: std::collections::HashSet<&str> =
@@ -12840,9 +13746,7 @@ mod tests {
             .iter()
             .map(|a| a["action"].as_str().unwrap())
             .collect();
-        let want: std::collections::HashSet<&str> =
-            IO_CLOUD_EXPOSED_ACTIONS.iter().copied().collect();
-        assert_eq!(got, want);
+        assert_eq!(got, expected_surface);
     }
 
     #[test]
@@ -14832,6 +15736,136 @@ mod tests {
         assert!(!admin_origin_authorized("motherbee", Some("SY.architect")));
         // Empty hive part.
         assert!(!admin_origin_authorized("motherbee", Some("SY.architect@")));
+    }
+
+    #[test]
+    fn artifact_publishers_require_router_stamped_managed_node_names() {
+        for allowed in [
+            "AI.report@motherbee",
+            "IO.generator@worker1",
+            "WF.monthly@motherbee",
+        ] {
+            assert_eq!(
+                authorize_artifact_publisher(Some(allowed)).as_deref(),
+                Ok(allowed)
+            );
+        }
+        for denied in [
+            None,
+            Some(""),
+            Some("SY.admin@motherbee"),
+            Some("AI.report"),
+            Some("IO.cloud@"),
+        ] {
+            assert!(authorize_artifact_publisher(denied).is_err());
+        }
+    }
+
+    #[test]
+    fn public_artifact_actions_expose_mesh_only_help_and_stay_out_of_executor() {
+        let publish =
+            resolve_internal_action_spec("publish_artifact").expect("publish action must exist");
+        let unpublish = resolve_internal_action_spec("unpublish_artifact")
+            .expect("unpublish action must exist");
+        assert!(!publish.requires_target);
+        assert!(!unpublish.requires_target);
+        assert!(!admin_action_is_read_only("publish_artifact"));
+        assert!(!admin_action_is_read_only("unpublish_artifact"));
+
+        let doc = build_admin_action_doc(publish);
+        assert_eq!(doc["name"], json!("publish_artifact"));
+        assert_eq!(doc["executor_available"], json!(false));
+        assert_eq!(
+            doc["execution_preference"],
+            json!("mesh_admin_rpc_from_producer")
+        );
+        assert_eq!(doc["path_patterns"], json!([]));
+        assert_eq!(doc["path_patterns_are_templates"], json!(false));
+        assert_eq!(
+            doc["request_contract"]["transport"],
+            json!("mesh_direct_to_sy_admin")
+        );
+        assert_eq!(doc["request_contract"]["method"], json!(MSG_ADMIN_COMMAND));
+        assert_eq!(doc["request_contract"]["admin_rpc"]["target"], Value::Null);
+        assert_eq!(doc["executor_contract"]["kind"], json!("unavailable"));
+        assert_eq!(doc["executor_contract"]["function_schema"], Value::Null);
+
+        let required = admin_action_body_required_fields("publish_artifact");
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0]["name"], json!("blob_ref"));
+        let optional = admin_action_body_optional_fields("publish_artifact");
+        assert_eq!(optional.len(), 2);
+        assert_eq!(optional[0]["name"], json!("presentation"));
+        assert_eq!(optional[1]["name"], json!("expires_in_secs"));
+
+        let (status, body) = build_admin_action_help_response("unpublish_artifact");
+        assert_eq!(status, 200);
+        let body: Value = serde_json::from_str(&body).expect("valid action help response");
+        assert_eq!(body["payload"]["registry_version"], json!("9"));
+        assert_eq!(
+            body["payload"]["entry"]["request_contract"]["admin_rpc"]["action"],
+            json!("unpublish_artifact")
+        );
+
+        let executor_actions: Vec<&str> = executor_visible_action_specs(None)
+            .into_iter()
+            .map(|spec| spec.action)
+            .collect();
+        assert!(!executor_actions.contains(&"publish_artifact"));
+        assert!(!executor_actions.contains(&"unpublish_artifact"));
+    }
+
+    #[test]
+    fn executor_plan_rejects_mesh_only_artifact_publication() {
+        let err = parse_executor_plan(json!({
+            "plan_version": "0.1",
+            "kind": "executor_plan",
+            "metadata": {
+                "name": "invalid-publication-plan",
+                "target_hive": "motherbee"
+            },
+            "execution": {
+                "strict": true,
+                "stop_on_error": true,
+                "allow_help_lookup": true,
+                "steps": [{
+                    "id": "s1",
+                    "action": "publish_artifact",
+                    "args": {}
+                }]
+            }
+        }))
+        .expect_err("mesh-only action must not enter an executor plan");
+
+        assert!(err.contains("mesh-only"));
+        assert!(err.contains("cannot run through the admin executor"));
+    }
+
+    #[test]
+    fn public_artifact_policy_is_fixed_by_mime_and_presentation() {
+        let html = BlobRef {
+            ref_type: "blob_ref".to_string(),
+            blob_name: "report_0123456789abcdef.html".to_string(),
+            size: 42,
+            mime: "text/html".to_string(),
+            filename_original: "report.html".to_string(),
+            spool_day: "2026-07-17".to_string(),
+        };
+        assert_eq!(
+            normalize_public_presentation(&html, Some("inline")).unwrap(),
+            (
+                "text/html; charset=utf-8".to_string(),
+                "inline".to_string(),
+                "sandboxed-html-v1".to_string()
+            )
+        );
+        assert_eq!(
+            normalize_public_presentation(&html, Some("attachment"))
+                .unwrap()
+                .1,
+            "attachment"
+        );
+        assert!(normalize_public_presentation(&html, Some("raw-headers")).is_err());
     }
 
     /// H4.3 — Admin's executor hot-refresh filters incoming

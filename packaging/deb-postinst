@@ -1,8 +1,8 @@
 #!/bin/sh
-# fluxbee .deb postinst: system user, dirs, units. Does NOT start services — the
-# orchestrator crash-loops until the first-boot secret lands, so bringing it up
-# is `fluxbee-firstboot`'s job (postgres + vault_put). Only sy-orchestrator is
-# enabled; its bootstrap brings up rt-gateway + the SY services in order.
+# fluxbee .deb postinst: system user, dirs, units. A fresh install does NOT start
+# services: `fluxbee-firstboot` owns that transition after provisioning secrets.
+# During an upgrade, prerm stopped the old processes, so start the orchestrator
+# and the motherbee singleton nodes again after the new binaries and units are installed.
 set -e
 
 if ! getent passwd fluxbee >/dev/null 2>&1; then
@@ -13,8 +13,9 @@ fi
 install -d /etc/fluxbee
 install -d -m 0700 /var/lib/fluxbee/ssh
 install -d -m 0700 /var/lib/fluxbee/tls
-for d in state/nodes state/cookbook hives opa/current opa/staged opa/backup \
-         wf-rules modules blob syncthing nats dist/runtimes dist/vendor; do
+for d in state/nodes state/cookbook state/sy-admin state/sy-edge hives opa/current opa/staged opa/backup \
+         wf-rules modules blob blob/public state/io-blob syncthing nats \
+         dist/runtimes dist/vendor; do
     install -d "/var/lib/fluxbee/$d"
 done
 install -d /run/fluxbee/routers
@@ -32,6 +33,12 @@ if [ -d /run/systemd/system ]; then
     # unit's ExecCondition, so it only ever runs on the motherbee. Restart=always lets it
     # wait out the mesh coming up (rt-gateway/identity/admin) after first-boot.
     systemctl enable io-cloud.service >/dev/null 2>&1 || true
+    systemctl enable io-blob.service >/dev/null 2>&1 || true
+    if [ -n "${2:-}" ]; then
+        systemctl start sy-orchestrator.service >/dev/null 2>&1 || true
+        systemctl start io-cloud.service >/dev/null 2>&1 || true
+        systemctl start io-blob.service >/dev/null 2>&1 || true
+    fi
 fi
 
 echo "fluxbee installed. Edit /etc/fluxbee/hive.yaml, then run:  sudo fluxbee-firstboot"

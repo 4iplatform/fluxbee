@@ -173,7 +173,8 @@ pub fn verify_proof(
     let want = hex::decode(mac_hex.trim()).map_err(|_| MeshHmacError::MacMismatch)?;
     let mut mac = HmacSha256::new_from_slice(&key.0).expect("HMAC accepts any key length");
     mac.update(&proof_input(context, nonce, hive));
-    mac.verify_slice(&want).map_err(|_| MeshHmacError::MacMismatch)
+    mac.verify_slice(&want)
+        .map_err(|_| MeshHmacError::MacMismatch)
 }
 
 #[cfg(test)]

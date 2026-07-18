@@ -23,7 +23,10 @@ fn main() {
             eprintln!("wrote CA to {}", dir.display());
         }
         Some("issue") => {
-            let ca_dir = Path::new(args.get(2).expect("usage: issue <ca_dir> <hive_id> <out_dir>"));
+            let ca_dir = Path::new(
+                args.get(2)
+                    .expect("usage: issue <ca_dir> <hive_id> <out_dir>"),
+            );
             let hive_id = args.get(3).expect("hive_id");
             let out = Path::new(args.get(4).expect("out_dir"));
             let ca = MeshCa::from_pem(

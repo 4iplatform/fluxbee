@@ -88,6 +88,7 @@ const REMOVE_HIVE_SOCKET_CLEANUP_TIMEOUT_SECS: u64 = 8;
 const SSH_HARDEN_VERIFY_RETRIES: usize = 6;
 const SSH_HARDEN_VERIFY_DELAY_MS: u64 = 1000;
 const SYNCTHING_FOLDER_BLOB_ID: &str = "fluxbee-blob";
+const SYNCTHING_FOLDER_BLOB_PUBLIC_ID: &str = "fluxbee-blob-public";
 const SYNCTHING_FOLDER_DIST_ID: &str = "fluxbee-dist";
 const SYNCTHING_FOLDER_TYPE_SEND_RECEIVE: &str = "sendreceive";
 const SYNCTHING_FOLDER_TYPE_SEND_ONLY: &str = "sendonly";
@@ -356,6 +357,7 @@ struct BlobSection {
 #[derive(Debug, Deserialize)]
 struct BlobSyncSection {
     enabled: Option<bool>,
+    public_enabled: Option<bool>,
     tool: Option<String>,
     api_port: Option<u16>,
     data_dir: Option<String>,
@@ -389,6 +391,7 @@ struct BlobRuntimeConfig {
     enabled: bool,
     path: PathBuf,
     sync_enabled: bool,
+    public_sync_enabled: bool,
     sync_tool: String,
     sync_api_port: u16,
     sync_data_dir: PathBuf,
@@ -3600,6 +3603,10 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
     let mut enabled = DEFAULT_BLOB_ENABLED;
     let mut path = PathBuf::from(DEFAULT_BLOB_PATH);
     let mut sync_enabled = DEFAULT_BLOB_SYNC_ENABLED;
+    let mut public_sync_enabled = matches!(
+        HiveRole::from_role(hive.role.as_deref()),
+        Some(HiveRole::Motherbee | HiveRole::Ingress)
+    );
     let mut sync_tool = DEFAULT_BLOB_SYNC_TOOL.to_string();
     let mut sync_api_port = DEFAULT_BLOB_SYNC_API_PORT;
     let mut sync_data_dir = PathBuf::from(DEFAULT_BLOB_SYNC_DATA_DIR);
@@ -3624,6 +3631,9 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
         if let Some(sync) = blob.sync.as_ref() {
             if let Some(value) = sync.enabled {
                 sync_enabled = value;
+            }
+            if let Some(value) = sync.public_enabled {
+                public_sync_enabled = value;
             }
             if let Some(value) = sync.tool.as_ref() {
                 let value = value.trim().to_ascii_lowercase();
@@ -3673,6 +3683,7 @@ fn blob_runtime_from_hive(hive: &HiveFile) -> BlobRuntimeConfig {
         enabled,
         path,
         sync_enabled,
+        public_sync_enabled,
         sync_tool,
         sync_api_port,
         sync_data_dir,
@@ -3945,6 +3956,10 @@ fn ensure_dirs(
         ensure_dir_permissions_0750(&blob.path.join("active"))?;
         ensure_dir_permissions_0750(&blob.path.join("staging"))?;
     }
+    if blob.public_sync_enabled {
+        ensure_dir_permissions_0750(&blob.path)?;
+        ensure_dir_permissions_0750(&blob.path.join("public"))?;
+    }
     if blob.sync_enabled {
         ensure_dir_permissions_0750(&blob.sync_data_dir)?;
     }
@@ -3952,13 +3967,23 @@ fn ensure_dirs(
         let service_user = resolve_syncthing_service_user(blob)?;
         if service_user == "root" {
             ensure_owned_dir(&blob.path, "root")?;
-            ensure_owned_dir(&blob.path.join("active"), "root")?;
-            ensure_owned_dir(&blob.path.join("staging"), "root")?;
+            if blob.enabled {
+                ensure_owned_dir(&blob.path.join("active"), "root")?;
+                ensure_owned_dir(&blob.path.join("staging"), "root")?;
+            }
+            if blob.public_sync_enabled {
+                ensure_owned_dir(&blob.path.join("public"), "root")?;
+            }
             ensure_owned_dir(&blob.sync_data_dir, "root")?;
         } else {
             ensure_owned_dir(&blob.path, &service_user)?;
-            ensure_owned_dir(&blob.path.join("active"), &service_user)?;
-            ensure_owned_dir(&blob.path.join("staging"), &service_user)?;
+            if blob.enabled {
+                ensure_owned_dir(&blob.path.join("active"), &service_user)?;
+                ensure_owned_dir(&blob.path.join("staging"), &service_user)?;
+            }
+            if blob.public_sync_enabled {
+                ensure_owned_dir(&blob.path.join("public"), &service_user)?;
+            }
             ensure_owned_dir(&blob.sync_data_dir, &service_user)?;
         }
     }
@@ -3977,6 +4002,18 @@ fn ensure_dirs(
 
 fn blob_sync_folder_path(blob: &BlobRuntimeConfig) -> PathBuf {
     blob.path.join("active")
+}
+
+fn blob_public_sync_folder_path(blob: &BlobRuntimeConfig) -> PathBuf {
+    blob.path.join("public")
+}
+
+fn blob_public_syncthing_folder_type(is_motherbee: bool) -> &'static str {
+    if is_motherbee {
+        SYNCTHING_FOLDER_TYPE_SEND_ONLY
+    } else {
+        SYNCTHING_FOLDER_TYPE_RECEIVE_ONLY
+    }
 }
 
 fn blob_sync_tool_is_syncthing(blob: &BlobRuntimeConfig) -> bool {
@@ -5231,6 +5268,51 @@ fn syncthing_api_key(sync: &BlobRuntimeConfig) -> Result<String, OrchestratorErr
     Ok(api_key)
 }
 
+fn syncthing_device_connected(
+    sync: &BlobRuntimeConfig,
+    device_id: &str,
+) -> Result<bool, OrchestratorError> {
+    if !valid_syncthing_device_id(device_id) {
+        return Err(format!("invalid syncthing device id '{device_id}'").into());
+    }
+    let api_key = syncthing_api_key(sync)?;
+    let endpoint = format!(
+        "http://127.0.0.1:{}/rest/system/connections",
+        sync.sync_api_port
+    );
+    let mut cmd = Command::new("curl");
+    cmd.arg("-fsS")
+        .arg("-H")
+        .arg(format!("X-API-Key: {api_key}"))
+        .arg(&endpoint);
+    let out = run_cmd_output(cmd, "syncthing system connections")?;
+    let payload: serde_json::Value = serde_json::from_str(&out)
+        .map_err(|err| format!("invalid syncthing connections payload: {err}"))?;
+    Ok(payload
+        .get("connections")
+        .and_then(|value| value.get(device_id))
+        .and_then(|value| value.get("connected"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false))
+}
+
+async fn wait_for_syncthing_device_connected(
+    sync: &BlobRuntimeConfig,
+    device_id: &str,
+    timeout: Duration,
+) -> Result<(), OrchestratorError> {
+    let start = Instant::now();
+    loop {
+        if syncthing_device_connected(sync, device_id).unwrap_or(false) {
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            return Err(format!("syncthing peer connection timeout device_id={device_id}").into());
+        }
+        time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SyncthingFolderStatus {
     state: String,
@@ -5353,6 +5435,24 @@ fn valid_syncthing_device_id(device_id: &str) -> bool {
     }
     id.chars()
         .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '-')
+}
+
+fn valid_syncthing_peer_address(address: &str) -> bool {
+    address
+        .trim()
+        .strip_prefix("tcp://")
+        .is_some_and(|socket| socket.parse::<std::net::SocketAddr>().is_ok())
+}
+
+fn syncthing_tcp_address_for_host(host: &str) -> Result<String, OrchestratorError> {
+    let normalized = host.trim().trim_start_matches('[').trim_end_matches(']');
+    let ip = normalized
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| format!("invalid IP address '{host}' for explicit Syncthing peer address"))?;
+    Ok(format!(
+        "tcp://{}",
+        format_host_port(&ip.to_string(), SYNCTHING_SYNC_PORT_TCP)
+    ))
 }
 
 fn extract_first_syncthing_device_id(config_xml: &str) -> Option<String> {
@@ -5567,47 +5667,162 @@ fn ensure_syncthing_folder_in_config_xml(
     Ok((out, true))
 }
 
+fn ensure_isolated_syncthing_folder_in_config_xml(
+    config_xml: &str,
+    folder_id: &str,
+    folder_path: &str,
+    folder_label: &str,
+    folder_type: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let existing = Regex::new(&format!(
+        r#"(?s)<folder\b[^>]*\bid=\"{}\"[^>]*>.*?</folder>"#,
+        regex::escape(folder_id)
+    ))?;
+    if existing.is_match(config_xml) {
+        return ensure_syncthing_folder_in_config_xml(
+            config_xml,
+            folder_id,
+            folder_path,
+            folder_label,
+            folder_type,
+        );
+    }
+
+    // A public folder must start with only this device. Cloning active/dist as a
+    // template would inherit their peers and accidentally share public bytes.
+    let new_block = minimal_syncthing_folder_block(
+        config_xml,
+        folder_id,
+        folder_path,
+        folder_label,
+        folder_type,
+    )?;
+    let insert_at = config_xml
+        .rfind("</configuration>")
+        .unwrap_or(config_xml.len());
+    let mut out = String::with_capacity(config_xml.len() + new_block.len() + 8);
+    out.push_str(&config_xml[..insert_at]);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("  ");
+    out.push_str(&new_block);
+    out.push('\n');
+    out.push_str(&config_xml[insert_at..]);
+    Ok((out, true))
+}
+
 fn ensure_syncthing_top_level_device_in_config_xml(
     config_xml: &str,
     device_id: &str,
     device_name: &str,
+    peer_address: Option<&str>,
 ) -> Result<(String, bool), OrchestratorError> {
     let normalized_id = device_id.trim();
     if !valid_syncthing_device_id(normalized_id) {
         return Err(format!("invalid syncthing device id '{}'", device_id).into());
     }
-
-    let header_end = config_xml
-        .find("<folder")
-        .or_else(|| config_xml.find("</configuration>"))
-        .unwrap_or(config_xml.len());
-    let header = &config_xml[..header_end];
-    let device_re = Regex::new(&format!(
-        r#"<device\b[^>]*\bid="{}"[^>]*>"#,
-        regex::escape(normalized_id)
-    ))?;
-    if device_re.is_match(header) {
-        return Ok((config_xml.to_string(), false));
+    let desired_address = peer_address.unwrap_or("dynamic").trim();
+    if desired_address.is_empty() {
+        return Err("syncthing peer address cannot be empty".into());
     }
 
-    let name = if device_name.trim().is_empty() {
-        normalized_id
-    } else {
-        device_name.trim()
-    };
-    let new_device = format!(
-        "  <device id=\"{}\" name=\"{}\" compression=\"metadata\" introducer=\"false\" skipIntroductionRemovals=\"false\" introducedBy=\"\"></device>\n",
-        xml_escape_attr(normalized_id),
-        xml_escape_attr(name),
-    );
-    let mut out = String::with_capacity(config_xml.len() + new_device.len() + 1);
-    out.push_str(&config_xml[..header_end]);
+    let (self_closing_device_re, device_re) = syncthing_named_device_regexes(normalized_id)?;
+    let defaults_re = Regex::new(r#"(?s)<defaults>.*?</defaults>"#)?;
+    let mut updated = config_xml.to_string();
+    let mut changed = false;
+
+    // Syncthing 2.x contains a folder template inside <defaults>. Older Fluxbee
+    // code inserted peer devices before the first <folder>, which placed them
+    // inside <defaults> and made them non-routable. Remove that malformed shape
+    // before reconciling the real root-level device.
+    if let Some(defaults) = defaults_re.find(&updated) {
+        let rewritten = self_closing_device_re
+            .replace_all(defaults.as_str(), "")
+            .into_owned();
+        let rewritten = device_re.replace_all(&rewritten, "").into_owned();
+        if rewritten != defaults.as_str() {
+            updated.replace_range(defaults.start()..defaults.end(), &rewritten);
+            changed = true;
+        }
+    }
+
+    if let Some(existing) = device_re.find(&updated) {
+        let block = existing.as_str();
+        let address_re = Regex::new(r#"<address>[^<]*</address>"#)?;
+        let escaped_address = xml_escape_attr(desired_address);
+        let rewritten = if address_re.is_match(block) {
+            address_re
+                .replace(
+                    block,
+                    format!("<address>{escaped_address}</address>").as_str(),
+                )
+                .into_owned()
+        } else {
+            let tag_end = block
+                .find('>')
+                .ok_or("invalid syncthing peer device block")?;
+            format!(
+                "{}\n    <address>{}</address>{}",
+                &block[..=tag_end],
+                escaped_address,
+                &block[tag_end + 1..]
+            )
+        };
+        if rewritten != block {
+            updated.replace_range(existing.start()..existing.end(), &rewritten);
+            changed = true;
+        }
+        return Ok((updated, changed));
+    }
+
+    if let Some(existing) = self_closing_device_re.find(&updated) {
+        let replacement = syncthing_peer_device_block(normalized_id, device_name, desired_address);
+        updated.replace_range(existing.start()..existing.end(), &replacement);
+        return Ok((updated, true));
+    }
+
+    let new_device = syncthing_peer_device_block(normalized_id, device_name, desired_address);
+    let insert_at = updated.rfind("</configuration>").unwrap_or(updated.len());
+    let mut out = String::with_capacity(updated.len() + new_device.len() + 1);
+    out.push_str(&updated[..insert_at]);
     if !out.ends_with('\n') {
         out.push('\n');
     }
     out.push_str(&new_device);
-    out.push_str(&config_xml[header_end..]);
+    out.push_str(&updated[insert_at..]);
     Ok((out, true))
+}
+
+fn syncthing_named_device_regexes(device_id: &str) -> Result<(Regex, Regex), OrchestratorError> {
+    let escaped_id = regex::escape(device_id);
+    // The full-block pattern deliberately excludes '/' from the opening tag.
+    // Otherwise a self-closing peer can backtrack into the `>.*?</device>` arm
+    // and consume the following Syncthing <defaults> folder up to its template
+    // device closing tag.
+    let self_closing = Regex::new(&format!(
+        r#"(?s)\n?[ \t]*<device\b[^>/]*\bid="{}"[^>/]*\bname="[^"]*"[^>/]*/>[ \t]*\n?"#,
+        escaped_id
+    ))?;
+    let full = Regex::new(&format!(
+        r#"(?s)\n?[ \t]*<device\b[^>/]*\bid="{}"[^>/]*\bname="[^"]*"[^>/]*>.*?</device>[ \t]*\n?"#,
+        escaped_id
+    ))?;
+    Ok((self_closing, full))
+}
+
+fn syncthing_peer_device_block(device_id: &str, device_name: &str, address: &str) -> String {
+    let name = if device_name.trim().is_empty() {
+        device_id
+    } else {
+        device_name.trim()
+    };
+    format!(
+        "  <device id=\"{}\" name=\"{}\" compression=\"metadata\" introducer=\"false\" skipIntroductionRemovals=\"false\" introducedBy=\"\">\n    <address>{}</address>\n  </device>\n",
+        xml_escape_attr(device_id),
+        xml_escape_attr(name),
+        xml_escape_attr(address),
+    )
 }
 
 fn ensure_syncthing_folder_has_device(
@@ -5659,17 +5874,23 @@ fn reconcile_syncthing_peer_xml(
     dist: &DistRuntimeConfig,
     peer_device_id: &str,
     peer_name: &str,
+    peer_address: Option<&str>,
     is_motherbee: bool,
+    public_only: bool,
 ) -> Result<(String, bool), OrchestratorError> {
     let mut updated = config_xml.to_string();
     let mut changed = false;
 
-    let (next, top_changed) =
-        ensure_syncthing_top_level_device_in_config_xml(&updated, peer_device_id, peer_name)?;
+    let (next, top_changed) = ensure_syncthing_top_level_device_in_config_xml(
+        &updated,
+        peer_device_id,
+        peer_name,
+        peer_address,
+    )?;
     updated = next;
     changed |= top_changed;
 
-    if blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+    if !public_only && blob.enabled && blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
         let blob_sync_path = blob_sync_folder_path(blob);
         let (next, folder_changed) = ensure_syncthing_folder_in_config_xml(
             &updated,
@@ -5686,7 +5907,27 @@ fn reconcile_syncthing_peer_xml(
         changed |= device_changed;
     }
 
-    if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
+    if public_only && blob.public_sync_enabled && blob_sync_tool_is_syncthing(blob) {
+        let public_path = blob_public_sync_folder_path(blob);
+        let (next, folder_changed) = ensure_isolated_syncthing_folder_in_config_xml(
+            &updated,
+            SYNCTHING_FOLDER_BLOB_PUBLIC_ID,
+            &public_path.display().to_string(),
+            "Fluxbee Blob Public",
+            blob_public_syncthing_folder_type(is_motherbee),
+        )?;
+        updated = next;
+        changed |= folder_changed;
+        let (next, device_changed) = ensure_syncthing_folder_has_device(
+            &updated,
+            SYNCTHING_FOLDER_BLOB_PUBLIC_ID,
+            peer_device_id,
+        )?;
+        updated = next;
+        changed |= device_changed;
+    }
+
+    if !public_only && dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
         let (next, folder_changed) = ensure_syncthing_folder_in_config_xml(
             &updated,
             SYNCTHING_FOLDER_DIST_ID,
@@ -5711,7 +5952,9 @@ fn ensure_local_syncthing_peer_link(
     dist: &DistRuntimeConfig,
     peer_device_id: &str,
     peer_name: &str,
+    peer_address: Option<&str>,
     is_motherbee: bool,
+    public_only: bool,
 ) -> Result<bool, OrchestratorError> {
     let config_path = sync.sync_data_dir.join("config.xml");
     let current = fs::read_to_string(&config_path)?;
@@ -5721,7 +5964,9 @@ fn ensure_local_syncthing_peer_link(
         dist,
         peer_device_id,
         peer_name,
+        peer_address,
         is_motherbee,
+        public_only,
     )?;
     if changed {
         fs::write(&config_path, updated)?;
@@ -5735,7 +5980,9 @@ async fn ensure_syncthing_peer_link_runtime(
     dist: &DistRuntimeConfig,
     peer_device_id: &str,
     peer_name: &str,
+    peer_address: Option<&str>,
     is_motherbee: bool,
+    public_only: bool,
 ) -> Result<(), OrchestratorError> {
     if !sync.sync_enabled {
         return Ok(());
@@ -5749,7 +5996,9 @@ async fn ensure_syncthing_peer_link_runtime(
         dist,
         peer_device_id,
         peer_name,
+        peer_address,
         is_motherbee,
+        public_only,
     )?;
     if !changed {
         return Ok(());
@@ -5817,23 +6066,18 @@ fn remove_syncthing_top_level_device_from_config_xml(
     if !valid_syncthing_device_id(normalized_id) {
         return Err(format!("invalid syncthing device id '{}'", device_id).into());
     }
-    let header_end = config_xml
-        .find("<folder")
-        .or_else(|| config_xml.find("</configuration>"))
-        .unwrap_or(config_xml.len());
-    let header = &config_xml[..header_end];
-    let device_re = Regex::new(&format!(
-        r#"(?s)\n?[ \t]*<device\b[^>]*\bid="{}"[^>]*(?:/>|>.*?</device>)[ \t]*\n?"#,
-        regex::escape(normalized_id)
-    ))?;
-    let rewritten = device_re.replace_all(header, "").into_owned();
-    if rewritten == header {
+    // Named device blocks are peer declarations. Folder membership entries are
+    // self-closing and have no name, so this also cleans peers misplaced inside
+    // Syncthing 2.x <defaults> without touching folder membership.
+    let (self_closing_device_re, device_re) = syncthing_named_device_regexes(normalized_id)?;
+    let rewritten = self_closing_device_re
+        .replace_all(config_xml, "")
+        .into_owned();
+    let rewritten = device_re.replace_all(&rewritten, "").into_owned();
+    if rewritten == config_xml {
         return Ok((config_xml.to_string(), false));
     }
-    let mut out = String::with_capacity(config_xml.len());
-    out.push_str(&rewritten);
-    out.push_str(&config_xml[header_end..]);
-    Ok((out, true))
+    Ok((rewritten, true))
 }
 
 fn reconcile_syncthing_peer_removal_xml(
@@ -5845,9 +6089,19 @@ fn reconcile_syncthing_peer_removal_xml(
     let mut updated = config_xml.to_string();
     let mut changed = false;
 
-    if blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+    if blob.enabled && blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
         let (next, folder_changed) =
             remove_syncthing_folder_device(&updated, SYNCTHING_FOLDER_BLOB_ID, peer_device_id)?;
+        updated = next;
+        changed |= folder_changed;
+    }
+
+    if blob.public_sync_enabled && blob_sync_tool_is_syncthing(blob) {
+        let (next, folder_changed) = remove_syncthing_folder_device(
+            &updated,
+            SYNCTHING_FOLDER_BLOB_PUBLIC_ID,
+            peer_device_id,
+        )?;
         updated = next;
         changed |= folder_changed;
     }
@@ -5926,7 +6180,7 @@ fn reconcile_syncthing_folders_xml(
     let mut updated = config_xml.to_string();
     let mut changed_folders = Vec::new();
 
-    if blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+    if blob.enabled && blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
         let blob_sync_path = blob_sync_folder_path(blob);
         let (next, changed) = ensure_syncthing_folder_in_config_xml(
             &updated,
@@ -5937,6 +6191,21 @@ fn reconcile_syncthing_folders_xml(
         )?;
         if changed {
             changed_folders.push(SYNCTHING_FOLDER_BLOB_ID.to_string());
+        }
+        updated = next;
+    }
+
+    if blob.public_sync_enabled && blob_sync_tool_is_syncthing(blob) {
+        let public_path = blob_public_sync_folder_path(blob);
+        let (next, changed) = ensure_isolated_syncthing_folder_in_config_xml(
+            &updated,
+            SYNCTHING_FOLDER_BLOB_PUBLIC_ID,
+            &public_path.display().to_string(),
+            "Fluxbee Blob Public",
+            blob_public_syncthing_folder_type(is_motherbee),
+        )?;
+        if changed {
+            changed_folders.push(SYNCTHING_FOLDER_BLOB_PUBLIC_ID.to_string());
         }
         updated = next;
     }
@@ -5990,10 +6259,17 @@ fn ensure_syncthing_folder_markers(
 ) -> Result<Vec<String>, OrchestratorError> {
     let mut repaired = Vec::new();
 
-    if blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
+    if blob.enabled && blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
         let blob_sync_path = blob_sync_folder_path(blob);
         if ensure_syncthing_folder_marker(&blob_sync_path)? {
             repaired.push(SYNCTHING_FOLDER_BLOB_ID.to_string());
+        }
+    }
+
+    if blob.public_sync_enabled && blob_sync_tool_is_syncthing(blob) {
+        let public_path = blob_public_sync_folder_path(blob);
+        if ensure_syncthing_folder_marker(&public_path)? {
+            repaired.push(SYNCTHING_FOLDER_BLOB_PUBLIC_ID.to_string());
         }
     }
 
@@ -6138,7 +6414,10 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
     let api_healthy = syncthing_api_healthy(desired_sync.sync_api_port).await;
     let mut folders_healthy = true;
     if service_active && api_healthy {
-        if desired_blob.sync_enabled && blob_sync_tool_is_syncthing(&desired_blob) {
+        if desired_blob.enabled
+            && desired_blob.sync_enabled
+            && blob_sync_tool_is_syncthing(&desired_blob)
+        {
             match syncthing_folder_healthy(&desired_sync, SYNCTHING_FOLDER_BLOB_ID) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -6154,6 +6433,26 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
                         folder = SYNCTHING_FOLDER_BLOB_ID,
                         error = %err,
                         "failed to verify syncthing folder health; scheduling runtime reconcile"
+                    );
+                }
+            }
+        }
+        if desired_blob.public_sync_enabled && blob_sync_tool_is_syncthing(&desired_blob) {
+            match syncthing_folder_healthy(&desired_sync, SYNCTHING_FOLDER_BLOB_PUBLIC_ID) {
+                Ok(true) => {}
+                Ok(false) => {
+                    folders_healthy = false;
+                    tracing::warn!(
+                        folder = SYNCTHING_FOLDER_BLOB_PUBLIC_ID,
+                        "syncthing public blob folder unhealthy; scheduling runtime reconcile"
+                    );
+                }
+                Err(err) => {
+                    folders_healthy = false;
+                    tracing::warn!(
+                        folder = SYNCTHING_FOLDER_BLOB_PUBLIC_ID,
+                        error = %err,
+                        "failed to verify public blob folder health; scheduling runtime reconcile"
                     );
                 }
             }
@@ -11248,12 +11547,11 @@ fn enumerate_routing_references_to(
     }
 }
 
-fn derive_ilk_type_for_node(node_name: &str) -> &'static str {
-    if node_name.starts_with("AI.") {
-        "agent"
-    } else {
-        "system"
-    }
+fn derive_ilk_type_for_node(_node_name: &str) -> &'static str {
+    // Every orchestrator-managed instance is a workload principal. `system` is reserved for
+    // SY-internal ILKs minted from hive.yaml by SY.identity and is intentionally rejected by
+    // ILK_REGISTER (F-08). This covers AI.*, IO.*, WF.* and managed RT.* instances uniformly.
+    "agent"
 }
 
 fn resolve_tenant_id_for_node(payload: &serde_json::Value) -> Option<String> {
@@ -14782,6 +15080,20 @@ fn worker_remote_base_dirs_command(blob: &BlobRuntimeConfig) -> String {
     ))
 }
 
+fn ingress_remote_base_dirs_command(blob: &BlobRuntimeConfig) -> String {
+    let public_dir = blob_public_sync_folder_path(blob);
+    sudo_bash_wrap(&format!(
+        "getent passwd fluxbee >/dev/null 2>&1 || useradd --system --user-group --home-dir /var/lib/fluxbee --no-create-home --shell /usr/sbin/nologin fluxbee; mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/state/sy-edge /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers '{}' '{}' '{}' && chown -R fluxbee:fluxbee '{}' '{}' && chmod 0750 '{}' '{}' /var/lib/fluxbee/state/sy-edge",
+        shell_single_quote_path(&blob.path),
+        shell_single_quote_path(&public_dir),
+        shell_single_quote_path(&blob.sync_data_dir),
+        shell_single_quote_path(&public_dir),
+        shell_single_quote_path(&blob.sync_data_dir),
+        shell_single_quote_path(&blob.path),
+        shell_single_quote_path(&public_dir),
+    ))
+}
+
 fn shell_single_quote(value: &str) -> String {
     value.replace('\'', "'\"'\"'")
 }
@@ -15614,6 +15926,22 @@ async fn add_hive_finalize_local_flow(
         .filter(|value| !value.is_empty())
         .unwrap_or("motherbee")
         .to_string();
+    let syncthing_peer_address = payload
+        .get("syncthing_peer_address")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    if let Some(address) = syncthing_peer_address.as_deref() {
+        if !valid_syncthing_peer_address(address) {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "INVALID_REQUEST",
+                "message": format!("invalid syncthing_peer_address '{address}'"),
+                "hive_id": state.hive_id,
+            });
+        }
+    }
     let mut updated: Vec<String> = Vec::new();
     let mut unchanged: Vec<String> = Vec::new();
     let mut restarted: Vec<String> = Vec::new();
@@ -15746,7 +16074,9 @@ async fn add_hive_finalize_local_flow(
             &desired_dist,
             peer_device_id,
             &syncthing_peer_name,
+            syncthing_peer_address.as_deref(),
             state.is_motherbee,
+            state.role == HiveRole::Ingress,
         )
         .await
         {
@@ -15776,15 +16106,25 @@ async fn add_hive_finalize_local_flow(
         None
     };
     let runtime_manifest_ready = local_runtime_manifest_ready_for_spawn();
-    let (service_active, api_healthy, folder_status, dist_sync_ready, dist_sync_errors) =
-        if !desired_dist.sync_enabled || !dist_sync_tool_is_syncthing(&desired_dist) {
-            (false, false, None, true, Vec::new())
-        } else {
+    let dist_probe_enabled =
+        desired_dist.sync_enabled && dist_sync_tool_is_syncthing(&desired_dist);
+    let public_probe_enabled = state.role == HiveRole::Ingress
+        && desired_blob.public_sync_enabled
+        && blob_sync_tool_is_syncthing(&desired_sync);
+    let probe_folder_id = if dist_probe_enabled {
+        Some(SYNCTHING_FOLDER_DIST_ID)
+    } else if public_probe_enabled {
+        Some(SYNCTHING_FOLDER_BLOB_PUBLIC_ID)
+    } else {
+        None
+    };
+    let (service_active, api_healthy, folder_status, folder_converged, sync_errors) =
+        if let Some(folder_id) = probe_folder_id {
             match wait_for_syncthing_folder_convergence(
                 state,
                 &desired_blob,
                 &desired_dist,
-                SYNCTHING_FOLDER_DIST_ID,
+                folder_id,
                 dist_sync_probe_timeout_secs.saturating_mul(1000),
                 true,
             )
@@ -15804,7 +16144,7 @@ async fn add_hive_finalize_local_flow(
                         probe.service_active,
                         probe.api_healthy,
                         probe.folder_status,
-                        probe.service_active && probe.api_healthy && probe.converged,
+                        probe.converged,
                         errors,
                     )
                 }
@@ -15816,6 +16156,13 @@ async fn add_hive_finalize_local_flow(
                     vec![err.to_string()],
                 ),
             }
+        } else if desired_sync.sync_enabled {
+            let service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
+            let api_healthy =
+                service_active && syncthing_api_healthy(desired_sync.sync_api_port).await;
+            (service_active, api_healthy, None, false, Vec::new())
+        } else {
+            (false, false, None, false, Vec::new())
         };
     let folder_healthy = folder_status
         .as_ref()
@@ -15828,6 +16175,23 @@ async fn add_hive_finalize_local_flow(
         .as_ref()
         .map(|status| status.need_total_items)
         .unwrap_or(0);
+    let public_sync_ready = !public_probe_enabled
+        || (service_active && api_healthy && folder_healthy && folder_converged);
+    let dist_sync_ready =
+        !dist_probe_enabled || (service_active && api_healthy && folder_converged);
+    if !public_sync_ready {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "SYNC_SETUP_FAILED",
+            "message": "ingress public Syncthing folder did not become healthy",
+            "hive_id": state.hive_id,
+            "service_active": service_active,
+            "api_healthy": api_healthy,
+            "folder_healthy": folder_healthy,
+            "folder_state": folder_state,
+            "errors": sync_errors,
+        });
+    }
 
     serde_json::json!({
         "status": "ok",
@@ -15840,9 +16204,10 @@ async fn add_hive_finalize_local_flow(
         "folder_healthy": folder_healthy,
         "folder_state": folder_state,
         "folder_need_total_items": folder_need_total_items,
+        "public_sync_ready": public_sync_ready,
         "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
         "dist_sync_ready": dist_sync_ready,
-        "dist_sync_errors": dist_sync_errors,
+        "dist_sync_errors": sync_errors,
         "core_sync_pending": core_sync_pending,
         "syncthing_peer_linked": syncthing_peer_linked,
         "syncthing_device_id": syncthing_device_id,
@@ -15894,6 +16259,7 @@ async fn add_hive_finalize_via_socket(
     dist_sync_probe_timeout_secs: u64,
     syncthing_peer_device_id: Option<&str>,
     syncthing_peer_name: Option<&str>,
+    syncthing_peer_address: Option<&str>,
 ) -> Result<serde_json::Value, OrchestratorError> {
     // Socket-only path is an optimization. Keep it bounded so add_hive still has
     // enough budget to fall back to SSH bootstrap within admin timeout (180s).
@@ -15911,6 +16277,7 @@ async fn add_hive_finalize_via_socket(
             "dist_sync_probe_timeout_secs": dist_sync_probe_timeout_secs,
             "syncthing_peer_device_id": syncthing_peer_device_id,
             "syncthing_peer_name": syncthing_peer_name,
+            "syncthing_peer_address": syncthing_peer_address,
         }),
         Duration::from_secs(timeout_secs),
     )
@@ -16184,6 +16551,7 @@ async fn add_hive_flow(
                 dist_sync_probe_timeout_secs,
                 mother_syncthing_device_id.as_deref(),
                 Some(&state.hive_id),
+                None,
             )
             .await
             {
@@ -16261,7 +16629,9 @@ async fn add_hive_flow(
                         &desired_dist,
                         &peer_device_id,
                         hive_id,
+                        None,
                         state.is_motherbee,
+                        false,
                     )
                     .await
                     {
@@ -16945,6 +17315,7 @@ async fn add_hive_flow(
         dist_sync_probe_timeout_secs,
         mother_syncthing_device_id.as_deref(),
         Some(&state.hive_id),
+        None,
     )
     .await
     {
@@ -16998,7 +17369,9 @@ async fn add_hive_flow(
             &desired_dist,
             &peer_device_id,
             hive_id,
+            None,
             state.is_motherbee,
+            false,
         )
         .await
         {
@@ -17717,6 +18090,19 @@ async fn add_ingress_hive_flow(
             format!("invalid dist runtime config for ingress hive.yaml: {err}"),
         );
     }
+    if let Err(err) = validate_blob_runtime_for_remote_hive(&state.blob) {
+        return err_payload(
+            "CONFIG_FAILED",
+            format!("invalid blob runtime config for ingress hive.yaml: {err}"),
+        );
+    }
+    if !state.blob.public_sync_enabled || !state.blob.sync_enabled {
+        return err_payload(
+            "CONFIG_FAILED",
+            "motherbee blob.sync.enabled and blob.sync.public_enabled must be true before adding an ingress"
+                .to_string(),
+        );
+    }
     let root = hives_root();
     let hive_dir = root.join(hive_id);
     if hive_exists(&state.state_dir, hive_id) {
@@ -17878,12 +18264,23 @@ async fn add_ingress_hive_flow(
         return err_payload("CORE_SYNC_FAILED", err.to_string());
     }
 
+    if let Err(err) = sync_vendor_to_worker(hive_id, address, &key_path, creds.user.as_str()) {
+        append_single_deployment_history(
+            state,
+            "vendor",
+            "add_hive",
+            hive_id,
+            "error",
+            Some("VENDOR_SYNC_FAILED".to_string()),
+            local_syncthing_vendor_hash().ok().flatten(),
+        );
+        return err_payload("VENDOR_SYNC_FAILED", err.to_string());
+    }
+
     if let Err(err) = ssh_with_key(
         address,
         &key_path,
-        &sudo_wrap(
-            "mkdir -p /etc/fluxbee /var/lib/fluxbee/state/nodes /var/lib/fluxbee/opa/current /var/lib/fluxbee/opa/staged /var/lib/fluxbee/opa/backup /var/lib/fluxbee/nats /var/lib/fluxbee/dist /var/lib/fluxbee/dist/runtimes /var/lib/fluxbee/dist/core/bin /var/lib/fluxbee/dist/vendor /var/run/fluxbee/routers",
-        ),
+        &ingress_remote_base_dirs_command(&state.blob),
         creds.user.as_str(),
     ) {
         return err_payload("CONFIG_FAILED", err.to_string());
@@ -17899,6 +18296,26 @@ async fn add_ingress_hive_flow(
             )
         }
     };
+    let mother_syncthing_address = match parse_host_port(&worker_uplink)
+        .and_then(|(host, _)| syncthing_tcp_address_for_host(&host))
+    {
+        Ok(value) => value,
+        Err(err) => {
+            return err_payload(
+                "CONFIG_FAILED",
+                format!("resolve motherbee Syncthing address failed: {err}"),
+            )
+        }
+    };
+    let ingress_syncthing_address = match syncthing_tcp_address_for_host(address) {
+        Ok(value) => value,
+        Err(err) => {
+            return err_payload(
+                "CONFIG_FAILED",
+                format!("resolve ingress Syncthing address failed: {err}"),
+            )
+        }
+    };
     let storage_path = state
         .storage_path
         .try_lock()
@@ -17909,6 +18326,9 @@ async fn add_ingress_hive_flow(
                 .to_string()
         });
     let dist_path_str = state.dist.path.to_string_lossy().to_string();
+    let blob_path_str = state.blob.path.to_string_lossy().to_string();
+    let blob_sync_data_dir_str = state.blob.sync_data_dir.to_string_lossy().to_string();
+    let blob_sync_tool = state.blob.sync_tool.trim().to_string();
     let edge_listen = ingress.listen.clone().unwrap_or_default();
     // Render the TLS block only when a vault key was supplied. Absent it, the edge
     // sets tls_requested=false and binds plaintext — so an HTTPS ingress REQUIRES
@@ -17926,6 +18346,9 @@ async fn add_ingress_hive_flow(
         (worker_uplink.as_str(), "wan uplink address"),
         (storage_path.as_str(), "storage.path"),
         (dist_path_str.as_str(), "dist.path"),
+        (blob_path_str.as_str(), "blob.path"),
+        (blob_sync_data_dir_str.as_str(), "blob.sync.data_dir"),
+        (blob_sync_tool.as_str(), "blob.sync.tool"),
         (edge_listen.as_str(), "edge.listen"),
     ] {
         if let Err(err) = validate_yaml_scalar(val, label) {
@@ -17933,11 +18356,15 @@ async fn add_ingress_hive_flow(
         }
     }
     let hive_yaml = format!(
-        "hive_id: {hive_id}\nrole: ingress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  sync:\n    enabled: false\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: false\nedge:\n  listen: \"{edge_listen}\"\n  endpoints_path: \"/etc/fluxbee/edge.endpoints.json\"\n{edge_tls}{system_nodes}",
+        "hive_id: {hive_id}\nrole: ingress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  path: \"{blob_path}\"\n  sync:\n    enabled: true\n    public_enabled: true\n    tool: \"{blob_sync_tool}\"\n    api_port: {blob_sync_api_port}\n    data_dir: \"{blob_sync_data_dir}\"\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: false\nedge:\n  listen: \"{edge_listen}\"\n  endpoints_path: \"/etc/fluxbee/edge.endpoints.json\"\n  publications_path: \"/var/lib/fluxbee/state/sy-edge/publications.json\"\n  blob_public_root: \"{blob_path}/public\"\n{edge_tls}{system_nodes}",
         hive_id = hive_id,
         uplink = worker_uplink,
         storage = storage_path,
         dist_path = state.dist.path.display(),
+        blob_path = state.blob.path.display(),
+        blob_sync_tool = blob_sync_tool,
+        blob_sync_api_port = state.blob.sync_api_port,
+        blob_sync_data_dir = state.blob.sync_data_dir.display(),
         edge_listen = edge_listen,
         edge_tls = edge_tls_yaml,
         system_nodes = render_system_nodes_yaml(HiveRole::Ingress, &ingress_system_nodes),
@@ -17948,6 +18375,16 @@ async fn add_ingress_hive_flow(
         creds.user.as_str(),
         "/etc/fluxbee/hive.yaml",
         &hive_yaml,
+    ) {
+        return err_payload("CONFIG_FAILED", err.to_string());
+    }
+    let publications_json = "{\n  \"publications\": []\n}\n".to_string();
+    if let Err(err) = write_remote_file(
+        address,
+        &key_path,
+        creds.user.as_str(),
+        "/var/lib/fluxbee/state/sy-edge/publications.json",
+        &publications_json,
     ) {
         return err_payload("CONFIG_FAILED", err.to_string());
     }
@@ -18130,6 +18567,85 @@ async fn add_ingress_hive_flow(
             "orchestrator_connected": false,
         });
     }
+
+    let desired_blob = current_blob_runtime_config(state);
+    let desired_dist = current_dist_runtime_config(state);
+    let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
+    if let Err(err) =
+        ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee).await
+    {
+        return err_payload(
+            "SYNC_SETUP_FAILED",
+            format!("motherbee public Syncthing setup failed: {err}"),
+        );
+    }
+    let mother_device_id = match local_syncthing_device_id(&desired_sync) {
+        Ok(device_id) => device_id,
+        Err(err) => {
+            return err_payload(
+                "SYNC_SETUP_FAILED",
+                format!("motherbee Syncthing device ID unavailable: {err}"),
+            )
+        }
+    };
+    let finalize = match add_hive_finalize_via_socket(
+        state,
+        hive_id,
+        address,
+        false,
+        DIST_SYNC_PROBE_TIMEOUT_SECS,
+        Some(&mother_device_id),
+        Some(&state.hive_id),
+        Some(&mother_syncthing_address),
+    )
+    .await
+    {
+        Ok(finalize) => finalize,
+        Err(err) => {
+            return err_payload(
+                "SYNC_SETUP_FAILED",
+                format!("ingress public Syncthing finalize failed: {err}"),
+            )
+        }
+    };
+    let ingress_syncthing_device_id = match syncthing_device_id_from_finalize_payload(&finalize) {
+        Some(device_id) => device_id,
+        None => {
+            return err_payload(
+                "SYNC_SETUP_FAILED",
+                "ingress finalize did not return a valid Syncthing device ID".to_string(),
+            )
+        }
+    };
+    if let Err(err) = ensure_syncthing_peer_link_runtime(
+        &desired_sync,
+        &desired_blob,
+        &desired_dist,
+        &ingress_syncthing_device_id,
+        hive_id,
+        Some(&ingress_syncthing_address),
+        state.is_motherbee,
+        true,
+    )
+    .await
+    {
+        return err_payload(
+            "SYNC_SETUP_FAILED",
+            format!("motherbee could not link ingress public Syncthing peer: {err}"),
+        );
+    }
+    if let Err(err) = wait_for_syncthing_device_connected(
+        &desired_sync,
+        &ingress_syncthing_device_id,
+        Duration::from_secs(SYNCTHING_BOOTSTRAP_TIMEOUT_SECS),
+    )
+    .await
+    {
+        return err_payload(
+            "SYNC_SETUP_FAILED",
+            format!("ingress public Syncthing peer did not connect: {err}"),
+        );
+    }
     let mut edge_service_active = false;
     if ingress_system_nodes
         .nodes
@@ -18206,6 +18722,8 @@ async fn add_ingress_hive_flow(
         "created_at": now_epoch_ms().to_string(),
         "status": "connected",
         "ssh_user": creds.user,
+        "syncthing_device_id": ingress_syncthing_device_id,
+        "syncthing_profile": "public-receiveonly",
     });
     if let Err(err) = write_hive_info(&root, hive_id, &connected_info) {
         return err_payload("IO_ERROR", err.to_string());
@@ -18249,7 +18767,12 @@ async fn add_ingress_hive_flow(
         "wan_connected": wan_connected,
         "orchestrator_connected": orchestrator_connected,
         "edge_service_active": edge_service_active,
-        "note": "ingress SY.edge frontend binds the public listener from hive.yaml edge.listen (gated on role==ingress). It forwards by the pre-resolved handler_node cached in its endpoint table (Option Z); ingress runs no sy-identity.",
+        "syncthing_peer_linked": true,
+        "syncthing_peer_connected": true,
+        "syncthing_device_id": ingress_syncthing_device_id,
+        "syncthing_folder_id": SYNCTHING_FOLDER_BLOB_PUBLIC_ID,
+        "finalize": finalize,
+        "note": "ingress SY.edge serves its ICH routes and the allowlisted /public capability URLs. Syncthing receives only fluxbee-blob-public; active blobs and dist are not shared with ingress.",
     })
 }
 
@@ -20169,6 +20692,16 @@ mod tests {
     }
 
     #[test]
+    fn ingress_remote_base_dirs_command_keeps_all_mutations_under_sudo() {
+        let cmd = ingress_remote_base_dirs_command(&sample_blob_config());
+
+        assert!(cmd.starts_with("sudo -n bash -lc '"));
+        assert!(cmd.contains("; mkdir -p /etc/fluxbee"));
+        assert!(cmd.contains("&& chown -R fluxbee:fluxbee"));
+        assert!(cmd.contains("&& chmod 0750"));
+    }
+
+    #[test]
     fn sudo_bash_wrap_keeps_compound_command_under_sudo() {
         let cmd = sudo_bash_wrap(
             "mkdir -p '/var/lib/fluxbee/identity/keys' && chmod 700 '/var/lib/fluxbee/identity/keys'",
@@ -20516,6 +21049,7 @@ mod tests {
             enabled: true,
             path: PathBuf::from("/var/lib/fluxbee/blob"),
             sync_enabled: true,
+            public_sync_enabled: true,
             sync_tool: "syncthing".to_string(),
             sync_api_port: 8384,
             sync_data_dir: PathBuf::from("/var/lib/fluxbee/syncthing"),
@@ -20527,6 +21061,126 @@ mod tests {
             gc_staging_ttl_hours: DEFAULT_BLOB_GC_STAGING_TTL_HOURS,
             gc_active_retain_days: DEFAULT_BLOB_GC_ACTIVE_RETAIN_DAYS,
         }
+    }
+
+    #[test]
+    fn ingress_public_peer_profile_never_attaches_private_folders() {
+        const INGRESS_DEVICE_ID: &str = "INGRESS-DEVICE-ID-1234567890";
+        let base = sample_syncthing_config_with_peer();
+        let blob = sample_blob_config();
+        let dist = sample_dist_config();
+        let (mother, changed) = reconcile_syncthing_peer_xml(
+            &base,
+            &blob,
+            &dist,
+            INGRESS_DEVICE_ID,
+            "ingress-1",
+            Some("tcp://192.0.2.10:22000"),
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(changed);
+        assert!(mother.contains("<address>tcp://192.0.2.10:22000</address>"));
+        assert!(mother.contains(&format!("id=\"{}\"", SYNCTHING_FOLDER_BLOB_PUBLIC_ID)));
+        assert!(mother.contains("type=\"sendonly\""));
+        let public_folder = Regex::new(&format!(
+            r#"(?s)<folder\b[^>]*\bid=\"{}\"[^>]*>.*?</folder>"#,
+            SYNCTHING_FOLDER_BLOB_PUBLIC_ID
+        ))
+        .unwrap()
+        .find(&mother)
+        .unwrap()
+        .as_str();
+        assert!(public_folder.contains(INGRESS_DEVICE_ID));
+        assert!(!public_folder.contains(PEER_DEVICE_ID));
+        for private_id in [SYNCTHING_FOLDER_BLOB_ID, SYNCTHING_FOLDER_DIST_ID] {
+            let private_folder = Regex::new(&format!(
+                r#"(?s)<folder\b[^>]*\bid=\"{}\"[^>]*>.*?</folder>"#,
+                private_id
+            ))
+            .unwrap()
+            .find(&mother)
+            .unwrap()
+            .as_str();
+            assert!(!private_folder.contains(INGRESS_DEVICE_ID));
+        }
+
+        let mut ingress_blob = blob.clone();
+        ingress_blob.enabled = false;
+        let mut ingress_dist = dist.clone();
+        ingress_dist.sync_enabled = false;
+        let ingress_base = format!(
+            "<configuration version=\"37\">\n  <device id=\"{local}\" name=\"ingress-1\"></device>\n</configuration>",
+            local = LOCAL_DEVICE_ID,
+        );
+        let (ingress, _) = reconcile_syncthing_peer_xml(
+            &ingress_base,
+            &ingress_blob,
+            &ingress_dist,
+            INGRESS_DEVICE_ID,
+            "motherbee",
+            Some("tcp://192.0.2.1:22000"),
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(ingress.contains("type=\"receiveonly\""));
+        assert!(!ingress.contains(&format!("id=\"{}\"", SYNCTHING_FOLDER_BLOB_ID)));
+        assert!(!ingress.contains(&format!("id=\"{}\"", SYNCTHING_FOLDER_DIST_ID)));
+    }
+
+    #[test]
+    fn syncthing_v2_defaults_peer_is_migrated_to_root_with_explicit_address() {
+        const REMOTE_DEVICE_ID: &str = "REMOTE-DEVICE-ID-1234567890";
+        let config = format!(
+            "<configuration version=\"51\">\n  <device id=\"{local}\" name=\"local\"><address>dynamic</address></device>\n  <defaults>\n    <device id=\"{remote}\" name=\"misplaced\"></device>\n    <folder id=\"\" path=\"\"><device id=\"{local}\"/></folder>\n  </defaults>\n</configuration>\n",
+            local = LOCAL_DEVICE_ID,
+            remote = REMOTE_DEVICE_ID,
+        );
+
+        let (updated, changed) = ensure_syncthing_top_level_device_in_config_xml(
+            &config,
+            REMOTE_DEVICE_ID,
+            "ingress-public-test",
+            Some("tcp://192.0.2.44:22000"),
+        )
+        .unwrap();
+
+        assert!(changed);
+        let defaults = Regex::new(r#"(?s)<defaults>.*?</defaults>"#)
+            .unwrap()
+            .find(&updated)
+            .unwrap();
+        assert!(!defaults.as_str().contains(REMOTE_DEVICE_ID));
+        let after_defaults = &updated[defaults.end()..];
+        assert!(after_defaults.contains(REMOTE_DEVICE_ID));
+        assert!(after_defaults.contains("<address>tcp://192.0.2.44:22000</address>"));
+
+        let (idempotent, changed_again) = ensure_syncthing_top_level_device_in_config_xml(
+            &updated,
+            REMOTE_DEVICE_ID,
+            "ingress-public-test",
+            Some("tcp://192.0.2.44:22000"),
+        )
+        .unwrap();
+        assert!(!changed_again);
+        assert_eq!(idempotent, updated);
+    }
+
+    #[test]
+    fn syncthing_peer_address_is_an_explicit_ip_socket() {
+        assert_eq!(
+            syncthing_tcp_address_for_host("192.0.2.7").unwrap(),
+            "tcp://192.0.2.7:22000"
+        );
+        assert_eq!(
+            syncthing_tcp_address_for_host("2001:db8::7").unwrap(),
+            "tcp://[2001:db8::7]:22000"
+        );
+        assert!(syncthing_tcp_address_for_host("peer.example").is_err());
+        assert!(valid_syncthing_peer_address("tcp://192.0.2.7:22000"));
+        assert!(!valid_syncthing_peer_address("dynamic"));
     }
 
     fn sample_dist_config() -> DistRuntimeConfig {
@@ -20687,6 +21341,54 @@ blob:
         assert!(updated.contains(LOCAL_DEVICE_ID));
         assert!(updated.contains(SYNCTHING_FOLDER_BLOB_ID));
         assert!(updated.contains(SYNCTHING_FOLDER_DIST_ID));
+    }
+
+    #[test]
+    fn peer_removal_cleans_root_peer_after_folders_and_legacy_defaults_peer() {
+        let config = format!(
+            "<configuration version=\"51\">\n  <defaults>\n    <device id=\"{peer}\" name=\"legacy\"></device>\n    <folder id=\"\" path=\"\"><device id=\"{local}\"/></folder>\n  </defaults>\n  <folder id=\"{public}\" path=\"/blob/public\"><device id=\"{local}\"/><device id=\"{peer}\"/></folder>\n  <device id=\"{peer}\" name=\"ingress\"><address>tcp://192.0.2.44:22000</address></device>\n</configuration>\n",
+            peer = PEER_DEVICE_ID,
+            local = LOCAL_DEVICE_ID,
+            public = SYNCTHING_FOLDER_BLOB_PUBLIC_ID,
+        );
+        let mut blob = sample_blob_config();
+        blob.enabled = false;
+        blob.sync_enabled = false;
+        blob.public_sync_enabled = true;
+        let mut dist = sample_dist_config();
+        dist.sync_enabled = false;
+
+        let (updated, changed) =
+            reconcile_syncthing_peer_removal_xml(&config, &blob, &dist, PEER_DEVICE_ID)
+                .expect("peer removal must succeed");
+
+        assert!(changed);
+        assert!(!updated.contains(PEER_DEVICE_ID));
+        assert!(updated.contains(LOCAL_DEVICE_ID));
+        assert!(updated.contains(SYNCTHING_FOLDER_BLOB_PUBLIC_ID));
+    }
+
+    #[test]
+    fn peer_removal_does_not_consume_defaults_after_self_closing_peer() {
+        const WORKER_DEVICE_ID: &str = "WORKER-DEVICE-ID-1234567890";
+        let config = format!(
+            "<configuration version=\"51\">\n  <defaults>\n    <device id=\"{worker}\" name=\"worker1\" />\n    <device id=\"{peer}\" name=\"legacy-ingress\" />\n    <folder id=\"\" path=\"\">\n      <device id=\"{local}\" />\n      <minDiskFree unit=\"%\">1</minDiskFree>\n    </folder>\n    <device id=\"\" compression=\"metadata\">\n      <address>dynamic</address>\n    </device>\n  </defaults>\n</configuration>\n",
+            worker = WORKER_DEVICE_ID,
+            peer = PEER_DEVICE_ID,
+            local = LOCAL_DEVICE_ID,
+        );
+
+        let (updated, changed) =
+            remove_syncthing_top_level_device_from_config_xml(&config, PEER_DEVICE_ID)
+                .expect("peer removal must succeed");
+
+        assert!(changed);
+        assert!(!updated.contains(PEER_DEVICE_ID));
+        assert!(updated.contains(WORKER_DEVICE_ID));
+        assert!(updated.contains("<folder id=\"\" path=\"\">"));
+        assert!(updated.contains("<minDiskFree unit=\"%\">1</minDiskFree>"));
+        assert!(updated.contains("<device id=\"\" compression=\"metadata\">"));
+        assert!(updated.contains("</defaults>"));
     }
 
     #[test]
@@ -21966,6 +22668,18 @@ blob:
             managed_spawn_disallowed_reason("SY.frontdesk.gov@motherbee"),
             Some("managed spawn does not support SY.* nodes")
         );
+    }
+
+    #[test]
+    fn managed_nodes_register_as_agent_principals() {
+        for node_name in [
+            "AI.demo@motherbee",
+            "IO.linkedhelper.demo@motherbee",
+            "WF.invoice@motherbee",
+            "RT.edge.buffer@motherbee",
+        ] {
+            assert_eq!(derive_ilk_type_for_node(node_name), "agent");
+        }
     }
 
     #[test]

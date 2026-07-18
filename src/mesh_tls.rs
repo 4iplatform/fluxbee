@@ -310,7 +310,8 @@ mod tests {
         let ca = MeshCa::generate().unwrap();
         let leaf = ca.issue_leaf("worker1").unwrap();
 
-        let mat = MeshTlsMaterial::from_pem(&leaf.cert_pem, &leaf.key_pem, ca.ca_cert_pem()).unwrap();
+        let mat =
+            MeshTlsMaterial::from_pem(&leaf.cert_pem, &leaf.key_pem, ca.ca_cert_pem()).unwrap();
         assert!(mat.server_config().is_ok());
         assert!(mat.client_config().is_ok());
 
@@ -326,7 +327,8 @@ mod tests {
         // load against the ORIGINAL ca cert (same key => same chain).
         let reloaded = MeshCa::from_pem(ca.ca_cert_pem(), ca.ca_key_pem()).unwrap();
         let leaf = reloaded.issue_leaf("egress1").unwrap();
-        let mat = MeshTlsMaterial::from_pem(&leaf.cert_pem, &leaf.key_pem, ca.ca_cert_pem()).unwrap();
+        let mat =
+            MeshTlsMaterial::from_pem(&leaf.cert_pem, &leaf.key_pem, ca.ca_cert_pem()).unwrap();
         assert!(mat.client_config().is_ok());
         let certs = certs_from_pem(&leaf.cert_pem).unwrap();
         assert_eq!(peer_hive_from_cert(&certs[0]).as_deref(), Some("egress1"));
@@ -362,7 +364,10 @@ mod tests {
         let client = tokio::spawn(async move {
             // CA-only verifier ignores the server name; any valid DNS name works.
             let name = rustls::pki_types::ServerName::try_from("mesh").unwrap();
-            let mut tls = connector.connect(name, client_io).await.expect("client handshake");
+            let mut tls = connector
+                .connect(name, client_io)
+                .await
+                .expect("client handshake");
             let certs = tls.get_ref().1.peer_certificates().unwrap().to_vec();
             let hive = peer_hive_from_cert(&certs[0]).unwrap();
             tls.write_all(b"x").await.unwrap();
@@ -372,8 +377,16 @@ mod tests {
         });
 
         // mutual auth succeeded; each side sees the OTHER's hive identity.
-        assert_eq!(server.await.unwrap(), "worker1", "server sees the client hive");
-        assert_eq!(client.await.unwrap(), "motherbee", "client sees the server hive");
+        assert_eq!(
+            server.await.unwrap(),
+            "worker1",
+            "server sees the client hive"
+        );
+        assert_eq!(
+            client.await.unwrap(),
+            "motherbee",
+            "client sees the server hive"
+        );
     }
 
     #[tokio::test]
@@ -399,7 +412,10 @@ mod tests {
             connector.connect(name, client_io).await.is_ok()
         });
         // The server must reject the attacker's foreign-CA client cert.
-        assert!(!server.await.unwrap(), "foreign-CA client cert must be rejected");
+        assert!(
+            !server.await.unwrap(),
+            "foreign-CA client cert must be rejected"
+        );
         let _ = client.await;
     }
 

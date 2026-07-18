@@ -203,6 +203,7 @@ INSTALL_RESTART_SERVICES=(
   "sy-vault"
   "fluxbee-syncthing"
 )
+INSTALL_SINGLETON_SERVICES=("io-cloud" "io-blob")
 
 # SY.frontdesk.gov depends on the router and then on SY.identity for registration
 # handoffs. During install we tear down volatile router/SHM state, so restoring
@@ -211,7 +212,7 @@ INSTALL_RESTART_SERVICES=(
 # restart until after rt-gateway and sy-identity are back.
 
 if [[ "$CLEAN_RUNTIME_VOLATILE_ON_INSTALL" == "1" ]]; then
-  for svc in sy-orchestrator "${INSTALL_RESTART_SERVICES[@]}"; do
+  for svc in sy-orchestrator "${INSTALL_RESTART_SERVICES[@]}" "${INSTALL_SINGLETON_SERVICES[@]}"; do
     if install_service_is_active "$svc"; then
       INSTALL_WAS_ACTIVE["$svc"]=1
     fi
@@ -243,8 +244,8 @@ echo "Building sy-frontdesk-gov system binary..."
 cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
 echo "Building ai.generic runtime binary..."
 cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner
-echo "Building IO runtime binaries (io.api, io.slack, io.linkedhelper)..."
-cargo build --release --manifest-path nodes/io/Cargo.toml -p io-api -p io-slack -p io-linkedhelper -p io-cloud
+echo "Building IO runtime binaries and motherbee singletons..."
+cargo build --release --manifest-path nodes/io/Cargo.toml -p io-api -p io-slack -p io-linkedhelper -p io-cloud -p io-blob
 
 go_required=0
 for go_dir in "go/sy-opa-rules" "go/sy-timer" "go/sy-wf-rules" "go/nodes/wf/wf-generic"; do
@@ -294,6 +295,8 @@ sudo install -d "$STATE_DIR"
 sudo install -d -m 0700 "$STATE_DIR/ssh"
 sudo install -d "$STATE_DIR/state/nodes"
 sudo install -d "$STATE_DIR/state/cookbook"
+sudo install -d "$STATE_DIR/state/sy-admin"
+sudo install -d "$STATE_DIR/state/sy-edge"
 sudo install -d "$STATE_DIR/hives"
 sudo install -d "$STATE_DIR/opa"
 sudo install -d "$STATE_DIR/opa/current"
@@ -302,6 +305,8 @@ sudo install -d "$STATE_DIR/opa/backup"
 sudo install -d "$STATE_DIR/wf-rules"
 sudo install -d "$STATE_DIR/modules"
 sudo install -d "$STATE_DIR/blob"
+sudo install -d "$STATE_DIR/blob/public"
+sudo install -d "$STATE_DIR/state/io-blob"
 sudo install -d "$STATE_DIR/syncthing"
 sudo install -d "$STATE_DIR/vendor"
 sudo install -d "$STATE_DIR/vendor/bin"
@@ -322,6 +327,9 @@ sudo chown -R fluxbee:fluxbee "$STATE_DIR/blob"
 if [[ "$CLEAN_RUNTIME_VOLATILE_ON_INSTALL" == "1" ]]; then
   stop_install_service "sy-orchestrator"
   for svc in "${INSTALL_RESTART_SERVICES[@]}"; do
+    stop_install_service "$svc"
+  done
+  for svc in "${INSTALL_SINGLETON_SERVICES[@]}"; do
     stop_install_service "$svc"
   done
   cleanup_volatile_runtime_artifacts
@@ -446,6 +454,9 @@ sudo install -m 0755 "$sy_frontdesk_gov_bin" /usr/bin/sy-frontdesk-gov
 # io-cloud: the singleton in-mesh Fluxbee Cloud adapter (motherbee only), baked like a
 # SY node — NOT published as a runtime package (unlike io-api/io-slack above).
 sudo install -m 0755 "$ROOT_DIR/nodes/io/target/release/io-cloud" /usr/bin/io-cloud
+sudo install -m 0600 "$ROOT_DIR/packaging/io-cloud.env.example" /etc/fluxbee/io-cloud.env.example
+sudo install -m 0755 "$ROOT_DIR/nodes/io/target/release/io-blob" /usr/bin/io-blob
+sudo install -m 0600 "$ROOT_DIR/packaging/io-blob.env.example" /etc/fluxbee/io-blob.env.example
 sudo install -m 0755 "$wf_generic_bin" /usr/bin/wf-generic
 
 echo "Updating core source repo in $STATE_DIR/dist/core/bin..."
@@ -1142,8 +1153,37 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 IOUNIT
+# io-blob: no ICH and no public listener. It accepts only router-stamped worker
+# commands from SY.admin in the configured motherbee hive.
+cat <<'IOUNIT' | sudo tee /etc/systemd/system/io-blob.service >/dev/null
+[Unit]
+Description=Fluxbee IO.blob (public artifact curator, motherbee only)
+After=network.target rt-gateway.service sy-admin.service
+Wants=rt-gateway.service sy-admin.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/fluxbee/io-blob.env
+ExecCondition=/bin/sh -c 'grep -qE "^role:[[:space:]]*motherbee" /etc/fluxbee/hive.yaml'
+Group=fluxbee
+UMask=0027
+ExecStart=/usr/bin/io-blob
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+IOUNIT
 sudo systemctl daemon-reload
 sudo systemctl enable io-cloud.service >/dev/null 2>&1 || true
+sudo systemctl enable io-blob.service >/dev/null 2>&1 || true
+
+for svc in "${INSTALL_SINGLETON_SERVICES[@]}"; do
+  if [[ "${INSTALL_WAS_ACTIVE[$svc]:-0}" == "1" ]] && install_service_exists "$svc"; then
+    echo "Restarting ${svc}.service to restore pre-install state..."
+    sudo systemctl restart "${svc}.service"
+  fi
+done
 
 if [[ "$RESTART_ORCHESTRATOR_AFTER_INSTALL" == "1" ]]; then
   if install_service_exists "sy-orchestrator"; then

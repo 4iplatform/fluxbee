@@ -6,14 +6,13 @@
 //! mesh, talks to `SY.admin` for scoped commands (its `externalize`/`unexternalize`
 //! set), and is the only inbound path from Fluxbee Cloud into the mesh (I2).
 //!
-//! This first cut is deliberately lean and grows into the real thing:
+//! The Cloud control-plane surface is deliberately small:
 //! - it CONNECTS to the mesh as `IO.cloud`;
-//! - it proves the node → `SY.admin` capability with a scoped read (`list_admin_actions`)
-//!   — the same channel it will later use to `externalize` its own channel;
-//! - it HANDLES requests forwarded from the edge under its declared family, reading
-//!   `meta.ich` (the channel the request is for) and echoing — so it is a valid edge
-//!   handler for the end-to-end test. A real `IO.cloud` dispatches by `meta.ich` to the
-//!   matching Fluxbee Cloud tenant/conversation.
+//! - it externalizes exactly one shared-secret, POST-only ICH on `SY.edge`;
+//! - it accepts Cloud operations only when the router-stamped source is the configured `SY.edge`
+//!   and the request targets that exact ICH;
+//! - it relays the bounded provisioning set (`create_tenant`, `put_token`,
+//!   `provision_node`) to `SY.admin`.
 //!
 //! Env: `IO_CLOUD_NODE_NAME` (default `IO.cloud`), `IO_CLOUD_ROUTER_SOCKET_DIR`,
 //! `IO_CLOUD_UUID_PERSISTENCE_DIR`, `IO_CLOUD_CONFIG_DIR`, `IO_CLOUD_NODE_VERSION`,
@@ -35,6 +34,7 @@ use io_common::provision::{ensure_own_ich, strict_provision_ilk, IdentityProvisi
 use serde_json::json;
 use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -115,31 +115,34 @@ async fn main() -> Result<(), DynError> {
     };
 
     // Self-externalize (spec §7): IO.cloud asks SY.admin to publish its own channel as a
-    // public URL on the edge. This is the same node→admin ADMIN_COMMAND path a real deploy
+    // shared-secret URL on the edge. This is the same node→admin ADMIN_COMMAND path a real deploy
     // uses; it is self-service (requester owns the ICH). Opt-in via `IO_CLOUD_EDGE_NODE`
     // (the `SY.edge` L2 name to publish on) so an unconfigured IO.cloud just registers its
     // channel and waits. SY.admin authorizes this by router-stamped IO.* origin plus
     // `requester == ICH owner`.
     let admin_hive = env_or("IO_CLOUD_ADMIN_HIVE", &hive_id);
     let admin_target = format!("SY.admin@{admin_hive}");
-    if let Some(edge_node) = env("IO_CLOUD_EDGE_NODE") {
+    let cloud_edge_node = env("IO_CLOUD_EDGE_NODE");
+    if let Some(edge_node) = cloud_edge_node.as_deref() {
         let inbound_family = env_or("IO_CLOUD_INBOUND_FAMILY", "user");
-        let auth_mode = env_or("IO_CLOUD_AUTH_MODE", "public");
-        // For a shared-secret channel, the caller supplies the secret; admin stores it in vault
-        // owned by the edge and ships only a secret_ref (§8). Opt-in via IO_CLOUD_SECRET.
-        let mut params = json!({
+        // The configured Cloud service token is the alpha trust anchor: edge verifies it before
+        // forwarding and strips Authorization at the frontier. There is intentionally no public
+        // fallback for this mutation endpoint.
+        let service_token = env("IO_CLOUD_SECRET").ok_or(
+            "IO_CLOUD_SECRET is required when IO_CLOUD_EDGE_NODE is set (Cloud endpoint is shared-secret only)",
+        )?;
+        let params = json!({
             "ich": own_ich,
             "edge_node": edge_node,
             "inbound_family": inbound_family,
-            "auth_mode": auth_mode,
+            "auth_mode": "shared-secret",
+            "secret": service_token,
+            "methods": ["POST"],
         });
-        if let Some(secret) = env("IO_CLOUD_SECRET") {
-            params["secret"] = json!(secret);
-        }
         tokio::spawn(publish_channel_on_edge_with_retry(
             dispatcher.clone(),
             admin_target.clone(),
-            edge_node,
+            edge_node.to_string(),
             params,
         ));
     } else {
@@ -149,7 +152,16 @@ async fn main() -> Result<(), DynError> {
     }
 
     let mut incoming = dispatcher.take_command_receiver(RPC_CH_INCOMING).await?;
-    run_loop(&sender, &full_name, &dispatcher, &admin_target, &mut incoming).await
+    run_loop(
+        &sender,
+        &full_name,
+        &own_ich,
+        cloud_edge_node.as_deref(),
+        &dispatcher,
+        &admin_target,
+        &mut incoming,
+    )
+    .await
 }
 
 /// Keep IO.cloud running while the ingress hive is still converging. A boot race where
@@ -183,16 +195,15 @@ async fn publish_channel_on_edge_with_retry(
             .await
         {
             Ok(res) if res.status.eq_ignore_ascii_case("ok") => {
-                // For a shared-secret channel admin returns the entry token (§8); a real IO node
-                // hands it to its external clients as `Authorization: Bearer <token>`.
-                let token = res.payload.get("token").and_then(|v| v.as_str());
+                let url = res.payload.get("url").and_then(|v| v.as_str());
+                let ich = res.payload.get("ich").and_then(|v| v.as_str());
                 tracing::info!(
                     target = %admin_target,
                     edge_node = %edge_node,
-                    entry_token = ?token,
-                    result = %res.payload,
+                    url = ?url,
+                    ich = ?ich,
                     attempts = attempt,
-                    "IO.cloud -> SY.admin externalize OK (public URL published on the edge)"
+                    "IO.cloud -> SY.admin externalize OK (authenticated Cloud URL published on the edge)"
                 );
                 return;
             }
@@ -368,6 +379,8 @@ async fn ensure_own_channel(
 async fn run_loop(
     sender: &NodeSender,
     full_name: &str,
+    own_ich: &str,
+    cloud_edge_node: Option<&str>,
     dispatcher: &Arc<RouterDispatcher>,
     admin_target: &str,
     incoming: &mut RpcCommandReceiver,
@@ -380,6 +393,17 @@ async fn run_loop(
         };
 
         if try_handle_default_node_status(sender, &msg).await? {
+            continue;
+        }
+
+        // RouteMatch::Any also receives unsolicited mesh notifications (for example VAULT
+        // changes). They are not Cloud requests and must not get a reply from IO.cloud.
+        if !message_from_configured_edge(&msg, cloud_edge_node) {
+            tracing::debug!(
+                trace_id = %msg.routing.trace_id,
+                src_l2_name = ?msg.routing.src_l2_name,
+                "IO.cloud ignored a non-edge mesh message"
+            );
             continue;
         }
 
@@ -401,8 +425,34 @@ async fn run_loop(
             "IO.cloud received a Cloud request"
         );
 
-        let mut response = dispatch_cloud_op(dispatcher, admin_target, &msg.payload).await;
+        let mut response = match authorize_cloud_message(&msg, own_ich, cloud_edge_node) {
+            Ok(()) => dispatch_cloud_op(dispatcher, admin_target, &msg.payload).await,
+            Err(detail) => {
+                tracing::warn!(
+                    trace_id = %msg.routing.trace_id,
+                    src_l2_name = ?msg.routing.src_l2_name,
+                    ich = ?msg.meta.ich,
+                    "IO.cloud rejected request outside the authenticated edge channel"
+                );
+                cloud_error_code("UNAUTHORIZED", detail)
+            }
+        };
         if let Some(obj) = response.as_object_mut() {
+            if obj
+                .get("request_id")
+                .map(|value| value.is_null())
+                .unwrap_or(true)
+            {
+                if let Some(request_id) = msg
+                    .payload
+                    .get("request_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    obj.insert("request_id".to_string(), json!(request_id));
+                }
+            }
             obj.insert("handled_by".to_string(), json!(full_name));
             obj.insert("ich".to_string(), json!(ich));
         }
@@ -427,9 +477,82 @@ async fn run_loop(
     }
 }
 
+/// The bearer is verified by SY.edge, so the exact configured edge origin and ICH are the internal
+/// proof that this request passed through that authenticated door.
+fn authorize_cloud_message(
+    msg: &Message,
+    own_ich: &str,
+    cloud_edge_node: Option<&str>,
+) -> Result<(), &'static str> {
+    let Some(trusted_edge) = cloud_edge_node
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err("Cloud endpoint is not configured");
+    };
+    if msg.routing.src_l2_name.as_deref().map(str::trim) != Some(trusted_edge) {
+        return Err("Cloud operation did not originate from the configured SY.edge");
+    }
+    if msg.meta.ich.as_deref() != Some(own_ich) {
+        return Err("Cloud operation targeted an unexpected ICH");
+    }
+    Ok(())
+}
+
+fn message_from_configured_edge(msg: &Message, cloud_edge_node: Option<&str>) -> bool {
+    let Some(trusted_edge) = cloud_edge_node
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    msg.routing.src_l2_name.as_deref().map(str::trim) == Some(trusted_edge)
+}
+
 /// Error response payload for a rejected/malformed Cloud request.
 fn cloud_error(detail: &str) -> serde_json::Value {
     json!({ "status": "error", "error_detail": detail })
+}
+
+fn cloud_error_code(code: &str, detail: &str) -> serde_json::Value {
+    json!({ "status": "error", "error_code": code, "error_detail": detail })
+}
+
+fn required_string(params: &serde_json::Value, field: &str) -> Result<String, serde_json::Value> {
+    params
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| cloud_error(&format!("missing or invalid params.{field}")))
+}
+
+fn require_tenant_id(tenant_id: Option<&str>, op: &str) -> Result<String, serde_json::Value> {
+    let tenant_id = tenant_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| cloud_error(&format!("{op} requires tenant_id")))?;
+    let valid = tenant_id
+        .strip_prefix("tnt:")
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+        .is_some();
+    if !valid {
+        return Err(cloud_error(&format!(
+            "{op} requires canonical tenant_id tnt:<uuid>"
+        )));
+    }
+    Ok(tenant_id.to_string())
+}
+
+fn copy_optional_field(
+    src: &serde_json::Value,
+    dst: &mut serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) {
+    if let Some(value) = src.get(field) {
+        dst.insert(field.to_string(), value.clone());
+    }
 }
 
 /// Pure translation of a Cloud op into the admin `(action, params)`, injecting the tenant claim.
@@ -441,32 +564,104 @@ fn translate_cloud_op(
     params: &serde_json::Value,
 ) -> Result<(&'static str, serde_json::Value), serde_json::Value> {
     match op {
+        "create_tenant" => {
+            let name = required_string(params, "name")?;
+            let mut tenant = serde_json::Map::new();
+            tenant.insert("name".to_string(), json!(name));
+            // Cloud's service token is the authority in the alpha contract, so Cloud-created
+            // tenants are immediately usable unless it explicitly requests another state.
+            tenant.insert(
+                "status".to_string(),
+                params
+                    .get("status")
+                    .cloned()
+                    .unwrap_or_else(|| json!("active")),
+            );
+            for field in ["domain", "settings", "sponsor_tenant_id"] {
+                copy_optional_field(params, &mut tenant, field);
+            }
+            Ok(("create_tenant", serde_json::Value::Object(tenant)))
+        }
         "put_token" => {
-            let tenant_id = tenant_id.ok_or_else(|| cloud_error("put_token requires tenant_id"))?;
+            let tenant_id = require_tenant_id(tenant_id, "put_token")?;
+            let key = required_string(params, "key")?;
+            let value = params
+                .get("value")
+                .filter(|value| !value.is_null())
+                .cloned()
+                .ok_or_else(|| cloud_error("missing params.value"))?;
+            let mut metadata = params
+                .get("metadata")
+                .and_then(|value| value.as_object())
+                .cloned()
+                .unwrap_or_default();
+            let owner_node = params
+                .get("owner_node")
+                .or_else(|| metadata.get("owner_node"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            // Cloud may add descriptive metadata, but tenant and ownership are authority fields.
+            // In particular, accepting metadata.ilk would bypass admin's owner_node resolution.
+            for authority_field in ["tenant_id", "ilk", "owner_ilk", "owner_l2", "owner_node"] {
+                metadata.remove(authority_field);
+            }
+            if let Some(resource_type) = params.get("resource_type") {
+                metadata.insert("resource_type".to_string(), resource_type.clone());
+            }
+            let resource_type = metadata
+                .get("resource_type")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    cloud_error(
+                        "put_token requires params.resource_type or params.metadata.resource_type",
+                    )
+                })?;
+            metadata.insert("resource_type".to_string(), json!(resource_type));
+            metadata.insert("tenant_id".to_string(), json!(tenant_id));
+            if let Some(owner_node) = owner_node {
+                if !owner_node.starts_with("IO.") {
+                    return Err(cloud_error("put_token owner_node must be an IO.* node"));
+                }
+                metadata.insert("owner_node".to_string(), json!(owner_node));
+            } else {
+                metadata.remove("owner_node");
+            }
             Ok((
                 "vault_put",
-                json!({
-                    "key": params.get("key"),
-                    "value": params.get("value"),
-                    "metadata": {
-                        "resource_type": params.get("resource_type"),
-                        "owner_node": params.get("owner_node"),
-                        "tenant_id": tenant_id,
-                    },
-                }),
+                json!({ "key": key, "value": value, "metadata": metadata }),
             ))
         }
         "provision_node" => {
-            let tenant_id =
-                tenant_id.ok_or_else(|| cloud_error("provision_node requires tenant_id"))?;
-            let mut p = json!({
-                "node_name": params.get("node_name"),
-                "tenant_id": tenant_id,
-            });
-            if let Some(rt) = params.get("runtime") {
-                p["runtime"] = rt.clone();
+            let tenant_id = require_tenant_id(tenant_id, "provision_node")?;
+            let node_name = required_string(params, "node_name")?;
+            if !node_name.starts_with("IO.") {
+                return Err(cloud_error("provision_node may launch only IO.* nodes"));
             }
-            Ok(("run_node", p))
+            let mut provision = serde_json::Map::new();
+            provision.insert("node_name".to_string(), json!(node_name));
+            provision.insert("tenant_id".to_string(), json!(tenant_id));
+            for field in [
+                "runtime",
+                "runtime_version",
+                "add_channels",
+                "identity_change_reason",
+            ] {
+                copy_optional_field(params, &mut provision, field);
+            }
+            if let Some(config) = params.get("config") {
+                let mut config = config
+                    .as_object()
+                    .cloned()
+                    .ok_or_else(|| cloud_error("params.config must be an object"))?;
+                config.insert("tenant_id".to_string(), json!(tenant_id));
+                provision.insert("config".to_string(), serde_json::Value::Object(config));
+            }
+            Ok(("run_node", serde_json::Value::Object(provision)))
         }
         "" => Err(cloud_error("missing 'op'")),
         other => Err(cloud_error(&format!("unknown op '{other}'"))),
@@ -483,33 +678,105 @@ mod tests {
             "key": "wapp_token:acme",
             "value": {"token": "abc"},
             "resource_type": "bearer_token",
-            "owner_node": "IO.wapp@motherbee"
+            "owner_node": "IO.wapp@motherbee",
+            "metadata": {
+                "tenant_id": "tnt:22222222-2222-4222-8222-222222222222",
+                "ilk": "ilk:22222222-2222-4222-8222-222222222222",
+                "owner_ilk": "ilk:33333333-3333-4333-8333-333333333333",
+                "description": "WhatsApp token"
+            }
         });
-        let (action, p) = translate_cloud_op("put_token", Some("tnt:acme"), &params).unwrap();
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        let (action, p) = translate_cloud_op("put_token", Some(tenant), &params).unwrap();
         assert_eq!(action, "vault_put");
         assert_eq!(p["key"], "wapp_token:acme");
         assert_eq!(p["value"]["token"], "abc");
         assert_eq!(p["metadata"]["resource_type"], "bearer_token");
         assert_eq!(p["metadata"]["owner_node"], "IO.wapp@motherbee");
-        assert_eq!(p["metadata"]["tenant_id"], "tnt:acme"); // injected from the claim
+        assert_eq!(p["metadata"]["tenant_id"], tenant); // injected from the claim
+        assert_eq!(p["metadata"]["description"], "WhatsApp token");
+        assert!(p["metadata"].get("ilk").is_none());
+        assert!(p["metadata"].get("owner_ilk").is_none());
     }
 
     #[test]
     fn translate_provision_node_requires_tenant_and_passes_runtime() {
-        let params = json!({"node_name": "IO.wapp@motherbee", "runtime": "io.generic"});
-        let (action, p) = translate_cloud_op("provision_node", Some("tnt:acme"), &params).unwrap();
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        let params = json!({
+            "node_name": "IO.wapp@motherbee",
+            "runtime": "io.generic",
+            "runtime_version": "current",
+            "config": {"provider": "wapp", "tenant_id": "tnt:spoofed"}
+        });
+        let (action, p) = translate_cloud_op("provision_node", Some(tenant), &params).unwrap();
         assert_eq!(action, "run_node");
         assert_eq!(p["node_name"], "IO.wapp@motherbee");
-        assert_eq!(p["tenant_id"], "tnt:acme");
+        assert_eq!(p["tenant_id"], tenant);
         assert_eq!(p["runtime"], "io.generic");
+        assert_eq!(p["runtime_version"], "current");
+        assert_eq!(p["config"]["provider"], "wapp");
+        assert_eq!(p["config"]["tenant_id"], tenant);
+    }
+
+    #[test]
+    fn translate_create_tenant_defaults_to_active() {
+        let (action, p) = translate_cloud_op(
+            "create_tenant",
+            None,
+            &json!({"name": "Acme", "domain": "acme.example"}),
+        )
+        .unwrap();
+        assert_eq!(action, "create_tenant");
+        assert_eq!(p["name"], "Acme");
+        assert_eq!(p["status"], "active");
+        assert_eq!(p["domain"], "acme.example");
+    }
+
+    #[test]
+    fn cloud_message_requires_edge_origin_and_own_ich() {
+        let mut msg = Message {
+            routing: Routing {
+                src: "edge-uuid".to_string(),
+                src_l2_name: Some("SY.edge@ingress1".to_string()),
+                dst: Destination::Unicast("IO.cloud@motherbee".to_string()),
+                ttl: 16,
+                trace_id: "trace".to_string(),
+            },
+            meta: Meta {
+                msg_type: "user".to_string(),
+                ich: Some("ich:own".to_string()),
+                ..Meta::default()
+            },
+            payload: json!({}),
+        };
+        assert!(message_from_configured_edge(&msg, Some("SY.edge@ingress1")));
+        assert!(authorize_cloud_message(&msg, "ich:own", Some("SY.edge@ingress1")).is_ok());
+        msg.routing.src_l2_name = Some("SY.edge@ingress2".to_string());
+        assert!(!message_from_configured_edge(
+            &msg,
+            Some("SY.edge@ingress1")
+        ));
+        assert!(authorize_cloud_message(&msg, "ich:own", Some("SY.edge@ingress1")).is_err());
+        msg.routing.src_l2_name = Some("IO.other@motherbee".to_string());
+        assert!(!message_from_configured_edge(
+            &msg,
+            Some("SY.edge@ingress1")
+        ));
+        assert!(authorize_cloud_message(&msg, "ich:own", Some("SY.edge@ingress1")).is_err());
+        msg.routing.src_l2_name = Some("SY.edge@ingress1".to_string());
+        msg.meta.ich = Some("ich:other".to_string());
+        assert!(authorize_cloud_message(&msg, "ich:own", Some("SY.edge@ingress1")).is_err());
+        assert!(!message_from_configured_edge(&msg, None));
+        assert!(authorize_cloud_message(&msg, "ich:other", None).is_err());
     }
 
     #[test]
     fn translate_rejects_missing_tenant_unknown_and_empty_op() {
         assert!(translate_cloud_op("put_token", None, &json!({})).is_err());
         assert!(translate_cloud_op("provision_node", None, &json!({})).is_err());
-        assert!(translate_cloud_op("", Some("tnt:x"), &json!({})).is_err());
-        let err = translate_cloud_op("frobnicate", Some("tnt:x"), &json!({})).unwrap_err();
+        assert!(translate_cloud_op("provision_node", Some("tnt:not-a-uuid"), &json!({})).is_err());
+        assert!(translate_cloud_op("", None, &json!({})).is_err());
+        let err = translate_cloud_op("frobnicate", None, &json!({})).unwrap_err();
         assert_eq!(err["status"], "error");
     }
 }
@@ -519,10 +786,12 @@ mod tests {
 /// the (trusted for the MVP — §1.2) tenant claim into each admin call and relays over the same
 /// `send_admin_rpc` seam it already uses for externalize. The ops mirror IO_CLOUD_EXPOSED_ACTIONS
 /// (SY.admin's single source):
-///   put_token       -> vault_put   (store a provider token owned by the target IO node)
-///   provision_node  -> run_node    (spawn IO.<provider>@<tenant>; requires tenant_id)
+///   create_tenant   -> create_tenant (Cloud-created tenants default to active)
+///   put_token       -> vault_put     (store a provider token in the tenant pool or for one IO node)
+///   provision_node  -> run_node      (spawn IO.<provider>@<tenant>; requires tenant_id)
 /// For an owner-scoped token the caller must provision_node BEFORE put_token (Caveat B: the
-/// `owner_node -> ilk` resolution needs the target node registered in identity SHM first).
+/// `owner_node -> ilk` resolution needs the target node registered in identity SHM first). Tokens
+/// needed during first boot must be stored in the tenant pool by omitting owner_node.
 async fn dispatch_cloud_op(
     dispatcher: &Arc<RouterDispatcher>,
     admin_target: &str,
@@ -531,6 +800,11 @@ async fn dispatch_cloud_op(
     let op = request.get("op").and_then(|v| v.as_str()).unwrap_or("");
     let tenant_id = request.get("tenant_id").and_then(|v| v.as_str());
     let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+    let request_id = request
+        .get("request_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     // The hive the admin action targets (MVP: the admin's own hive, e.g. motherbee).
     let hive = admin_target.split_once('@').map(|(_, h)| h.to_string());
 
@@ -545,17 +819,23 @@ async fn dispatch_cloud_op(
             action,
             target: hive.as_deref(),
             params: admin_params,
-            request_id: None,
-            timeout: Duration::from_secs(20),
+            request_id,
+            timeout: Duration::from_secs(if action == "run_node" { 25 } else { 20 }),
         })
         .await
     {
         Ok(res) if res.status.eq_ignore_ascii_case("ok") => {
-            json!({ "status": "ok", "op": op, "result": res.payload })
+            json!({
+                "status": "ok",
+                "op": op,
+                "request_id": res.request_id,
+                "result": res.payload,
+            })
         }
         Ok(res) => json!({
             "status": "error",
             "op": op,
+            "request_id": res.request_id,
             "error_code": res.error_code,
             "error_detail": res.error_detail.unwrap_or(res.payload),
         }),
