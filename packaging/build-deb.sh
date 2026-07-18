@@ -56,9 +56,9 @@ stage_bin sy-frontdesk-gov "target/release/sy-frontdesk-gov"
 for pair in "${GO_BINS[@]}"; do
   stage_bin "${pair%%:*}" "${pair##*:}/$(basename "${pair##*:}")"
 done
-# io-cloud installs to /usr/bin ONLY (not dist/core/bin): it is a motherbee-only singleton,
-# not a role-synced core component, so it must not enter the core manifest that the
-# orchestrator ships to workers.
+# io-cloud and io-blob install to /usr/bin ONLY (not dist/core/bin): they are
+# motherbee-only singletons, not role-synced core components, so they must not
+# enter the core manifest that the orchestrator ships to workers.
 install -m0755 nodes/io/target/release/io-cloud "$DEST/usr/bin/io-cloud"
 install -m0755 nodes/io/target/release/io-blob "$DEST/usr/bin/io-blob"
 

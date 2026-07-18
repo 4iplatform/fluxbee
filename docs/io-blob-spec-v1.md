@@ -223,6 +223,13 @@ HTML+JS arbitrario sigue permitido dentro del sandbox; no obtiene APIs Fluxbee.
 - `IO_BLOB_LEDGER_PATH` default `/var/lib/fluxbee/state/io-blob/publications.json`;
 - `IO_BLOB_MAX_BYTES` default al limite canonico de Blob SDK.
 
+Forma parte de `system_nodes.motherbee` como nodo empaquetado de lifecycle: Orchestrator inicia,
+espera y supervisa `io-blob.service` junto con la topologia base. Esta inclusion no cambia su
+frontera de identidad: sigue siendo un worker `IO.*` visible en el inventario de nodos administrados
+y `SY.identity` no le crea una ILK deterministica de tipo `system`. `SY.vault` tambien excluye
+entradas no `SY.*` al construir su allowlist local de autoridades conocidas, por lo que estar en
+este lifecycle no otorga acceso al pool de secretos del tenant raiz.
+
 Responsabilidades:
 
 - caller gate exacto `SY.admin@<hive>`;

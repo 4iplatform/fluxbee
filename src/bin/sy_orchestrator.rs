@@ -74,7 +74,8 @@ const RPC_CH_SYSTEM: &str = "system";
 const MSG_ILK_REGISTER: &str = "ILK_REGISTER";
 const MSG_ILK_UPDATE: &str = "ILK_UPDATE";
 const MSG_ILK_DELETE: &str = "ILK_DELETE";
-const SY_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
+const LIFECYCLE_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
+const MOTHERBEE_PACKAGED_NON_SYSTEM_NODES: &[&str] = &["IO.blob"];
 const ADD_HIVE_SOCKET_READY_PROBE_TIMEOUT_SECS: u64 = 10;
 const SYNCTHING_SERVICE_NAME: &str = "fluxbee-syncthing";
 const SYNCTHING_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
@@ -1315,19 +1316,22 @@ async fn bootstrap_local(
         tracing::info!(
             service = service.as_str(),
             node = node_name.as_str(),
-            "starting configured system node"
+            "starting configured lifecycle node"
         );
         if let Err(err) = systemd_start(&service) {
             tracing::warn!(service = service.as_str(), error = %err, "failed to start service");
         }
     }
 
-    if let Err(err) =
-        wait_for_sy_nodes(state, Duration::from_secs(SY_NODES_BOOTSTRAP_TIMEOUT_SECS)).await
+    if let Err(err) = wait_for_lifecycle_nodes(
+        state,
+        Duration::from_secs(LIFECYCLE_NODES_BOOTSTRAP_TIMEOUT_SECS),
+    )
+    .await
     {
         tracing::warn!(
             error = %err,
-            "sy nodes did not fully bootstrap before timeout; continuing and relying on watchdog restarts"
+            "lifecycle nodes did not fully bootstrap before timeout; continuing and relying on watchdog restarts"
         );
     }
     if state.is_motherbee {
@@ -1655,11 +1659,13 @@ async fn wait_for_router_ready(
     }
 }
 
-async fn wait_for_sy_nodes(
+async fn wait_for_lifecycle_nodes(
     state: &OrchestratorState,
     timeout: Duration,
 ) -> Result<(), OrchestratorError> {
-    // Only router-connected SY nodes are visible in router SHM.
+    // Only router-connected nodes are visible in router SHM. The declarative
+    // lifecycle includes SY authorities plus explicitly allowlisted packaged
+    // workers such as the motherbee IO.blob singleton.
     let required: Vec<String> = state
         .system_nodes
         .wait_for
@@ -1667,7 +1673,7 @@ async fn wait_for_sy_nodes(
         .map(|name| name.trim().to_string())
         .collect();
     if required.is_empty() {
-        tracing::info!("no configured sy nodes marked for bootstrap wait");
+        tracing::info!("no configured lifecycle nodes marked for bootstrap wait");
         return Ok(());
     }
     let start = Instant::now();
@@ -1689,15 +1695,15 @@ async fn wait_for_sy_nodes(
                 }
             }
             if missing.is_empty() {
-                tracing::info!("sy nodes connected");
+                tracing::info!("lifecycle nodes connected");
                 return Ok(());
             }
             last_missing = missing;
         }
         if start.elapsed() >= timeout {
-            tracing::error!(missing = ?last_missing, "sy nodes bootstrap timeout");
+            tracing::error!(missing = ?last_missing, "lifecycle nodes bootstrap timeout");
             return Err(format!(
-                "sy nodes bootstrap timeout (missing: {})",
+                "lifecycle nodes bootstrap timeout (missing: {})",
                 last_missing.join(", ")
             )
             .into());
@@ -3823,15 +3829,23 @@ fn validate_system_nodes(
     let mut seen_services = HashSet::new();
     for raw_name in nodes {
         let name = raw_name.trim();
-        if !name.starts_with("SY.") {
+        let is_sy_node = name.starts_with("SY.");
+        let is_packaged_non_system_node =
+            is_motherbee && MOTHERBEE_PACKAGED_NON_SYSTEM_NODES.contains(&name);
+        if !is_sy_node && !is_packaged_non_system_node {
             return Err(format!(
-                "invalid hive.yaml: system node '{}' must use SY.* naming",
+                "invalid hive.yaml: lifecycle node '{}' must use SY.* naming or be an allowlisted motherbee packaged node",
                 raw_name
             )
             .into());
         }
         let service = name_to_service(name);
-        if !valid_token(&service) || !service.starts_with("sy-") {
+        let valid_service_prefix = if is_sy_node {
+            service.starts_with("sy-")
+        } else {
+            service.starts_with("io-")
+        };
+        if !valid_token(&service) || !valid_service_prefix {
             return Err(format!(
                 "invalid hive.yaml: system node '{}' yields invalid service '{}'",
                 name, service
@@ -3872,9 +3886,12 @@ fn validate_system_nodes(
     Ok(())
 }
 
-/// `SY.config.routes` → `sy-config-routes`. Lowercase, `.` → `-`, prefix preserved.
+/// Map an allowlisted declarative node to its packaged systemd service.
 fn name_to_service(node_name: &str) -> String {
     let trimmed = node_name.trim();
+    if trimmed == "IO.blob" {
+        return "io-blob".to_string();
+    }
     let base = trimmed.strip_prefix("SY.").unwrap_or(trimmed);
     format!("sy-{}", base.to_ascii_lowercase().replace('.', "-"))
 }
@@ -20771,6 +20788,40 @@ mod tests {
             wait_for: vec!["SY.config.routes".to_string()],
         };
         assert!(validate_system_nodes(&section, HiveRole::Ingress).is_ok());
+    }
+
+    #[test]
+    fn motherbee_role_accepts_packaged_io_blob_worker() {
+        let section = RoleSystemNodes {
+            nodes: vec![
+                "SY.config.routes".to_string(),
+                "SY.admin".to_string(),
+                "IO.blob".to_string(),
+                "SY.vault".to_string(),
+            ],
+            wait_for: vec!["IO.blob".to_string()],
+        };
+        assert!(validate_system_nodes(&section, HiveRole::Motherbee).is_ok());
+        assert_eq!(name_to_service("IO.blob"), "io-blob");
+    }
+
+    #[test]
+    fn packaged_io_blob_worker_is_motherbee_only_and_allowlist_is_exact() {
+        let worker = RoleSystemNodes {
+            nodes: vec!["SY.config.routes".to_string(), "IO.blob".to_string()],
+            wait_for: vec![],
+        };
+        assert!(validate_system_nodes(&worker, HiveRole::Worker).is_err());
+
+        let unknown_io = RoleSystemNodes {
+            nodes: vec![
+                "SY.config.routes".to_string(),
+                "IO.cloud".to_string(),
+                "SY.vault".to_string(),
+            ],
+            wait_for: vec![],
+        };
+        assert!(validate_system_nodes(&unknown_io, HiveRole::Motherbee).is_err());
     }
 
     #[test]

@@ -65,9 +65,11 @@ dist:
     enabled: true
     tool: "syncthing"
 
-# Declarative SY topology per hive role. `nodes` is the start order;
+# Declarative packaged platform topology per hive role. `nodes` is the start order;
 # `wait_for` is the subset the orchestrator blocks on before continuing
-# bootstrap. Workers do not run SY.vault.
+# bootstrap. IO.blob is a motherbee worker managed by this lifecycle, not a
+# system authority; Identity seeds deterministic ILKs only for the SY.* entries.
+# Workers do not run SY.vault.
 system_nodes:
   motherbee:
     # Model D' boot order (enforced by sy_orchestrator::validate_system_nodes):
@@ -80,6 +82,7 @@ system_nodes:
       - SY.identity
       - SY.opa.rules
       - SY.admin
+      - IO.blob
       - SY.architect
       - SY.storage
       - SY.cognition
@@ -93,6 +96,7 @@ system_nodes:
       - SY.identity
       - SY.opa.rules
       - SY.admin
+      - IO.blob
       - SY.cognition
       - SY.policy
       - SY.timer

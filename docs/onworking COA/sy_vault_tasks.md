@@ -498,7 +498,7 @@ Y los consumers (identity incluido) pueden leer su postgres pool secret al boot 
 **Tareas:**
 
 - [x] VA-J'-13b-1. Reemplazar `wait_for_self_system_ilk_id` por `deterministic_system_ilk_id(&node_name)` en sy_vault.rs.
-- [x] VA-J'-13b-2. Función `compute_well_known_system_ilks(config_dir, hive_id, self_ilk, admin_set)` que lee `system_nodes.<role>.nodes` de hive.yaml y mapea con `deterministic_system_ilk_id`.
+- [x] VA-J'-13b-2. Función `compute_well_known_system_ilks(config_dir, hive_id, self_ilk, admin_set)` que lee las entradas `SY.*` de `system_nodes.<role>.nodes` en hive.yaml y las mapea con `deterministic_system_ilk_id`. Entradas de lifecycle empaquetadas no-SY, como `IO.blob`, se excluyen de la allowlist de Vault.
 - [x] VA-J'-13b-3. `authorize_read` toma `well_known_system_ilks` y lo usa para root-tenant pool universal sin requerir SHM.
 - [x] VA-J'-13b-4. `handle_vault_message` propaga el set a `handle_get`. `handle_put/rotate/delete/rollback` no necesitan (solo well_known_admin_ilks).
 - [x] VA-J'-13b-5. **Self-ILK determinístico propagado a los 7 SY nodes restantes** (sy_config_routes, sy_admin, sy_architect, sy_storage, sy_cognition, sy_policy, ai-frontdesk-gov). Antes solo vault e identity computaban su propio ILK localmente; los demás esperaban hasta 30s a que identity escribiera SHM. Ahora todos los SY arrancan self-contained: `let self_ilk_id = deterministic_system_ilk_id(&node_name)`. Cero functional change (mismo valor de ILK) + cero wait al boot.
