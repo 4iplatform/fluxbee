@@ -2193,8 +2193,13 @@ async fn handle_admin(
                                 )
                                 .await;
                                 // B-2: same as the worker path — on a failed egress join,
-                                // best-effort revoke the (possibly seeded) bootstrap key.
-                                if result.get("status").and_then(|v| v.as_str()) != Some("ok") {
+                                // best-effort revoke the (possibly seeded) bootstrap key. NOT for
+                                // key_only_persist: on any of its error paths we KEEP the
+                                // motherbee key as the recovery channel (the per-spoke private
+                                // key may have been discarded), so a failed join is never a strand.
+                                if result.get("status").and_then(|v| v.as_str()) != Some("ok")
+                                    && ssh_access != SshAccess::KeyOnlyPersist
+                                {
                                     let revoke = best_effort_revoke_bootstrap(
                                         &address,
                                         creds.user.as_str(),
@@ -2238,8 +2243,11 @@ async fn handle_admin(
                                     )
                                     .await;
                                     // Same failure tail as worker/egress: on a failed
-                                    // ingress join, best-effort revoke the seeded key.
-                                    if result.get("status").and_then(|v| v.as_str()) != Some("ok") {
+                                    // ingress join, best-effort revoke the seeded key. Skipped for
+                                    // key_only_persist (keep the motherbee key as recovery).
+                                    if result.get("status").and_then(|v| v.as_str()) != Some("ok")
+                                        && ssh_access != SshAccess::KeyOnlyPersist
+                                    {
                                         let revoke = best_effort_revoke_bootstrap(
                                             &address,
                                             creds.user.as_str(),
@@ -2285,7 +2293,10 @@ async fn handle_admin(
                             // B-2: on a failed join, best-effort revoke the (possibly
                             // already-seeded) bootstrap SSH access and surface whether it
                             // may still be open (a retry re-seeds via the password channel).
-                            if result.get("status").and_then(|v| v.as_str()) != Some("ok") {
+                            // Skipped for key_only_persist (keep the motherbee key as recovery).
+                            if result.get("status").and_then(|v| v.as_str()) != Some("ok")
+                                && ssh_access != SshAccess::KeyOnlyPersist
+                            {
                                 let revoke = best_effort_revoke_bootstrap(
                                     &address,
                                     creds.user.as_str(),
@@ -19427,17 +19438,43 @@ struct AddHiveSshControlsResult {
     restrict_ssh_mode: String,
 }
 
+/// Comment stamped on every per-spoke recovery key. Doubles as the authorized_keys dedup
+/// marker so a retried/failed persist never accumulates orphaned recovery entries.
+const SPOKE_RECOVERY_KEY_COMMENT: &str = "fluxbee-spoke-recovery";
+
+/// Monotonic suffix for per-spoke key scratch dirs, so two concurrent add_hive calls that land
+/// in the same millisecond can never clobber each other's private-key file.
+static SPOKE_KEY_SCRATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn spoke_key_scratch_dir(kind: &str) -> PathBuf {
+    let seq = SPOKE_KEY_SCRATCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    orchestrator_runtime_dir().join(format!(
+        "spoke-{kind}-{}-{}-{seq}",
+        std::process::id(),
+        now_epoch_ms()
+    ))
+}
+
 /// Generate an ephemeral per-spoke ed25519 keypair in a 0700 scratch dir under the
 /// orchestrator runtime dir and return (private_pem, public_openssh). The scratch dir is
 /// removed before returning — the caller holds the material in memory (and writes the private
 /// half to a 0600 temp only for the verify-before-revoke probe). Mirrors ensure_motherbee_ssh_key.
 fn generate_spoke_ssh_keypair() -> Result<(String, String), OrchestratorError> {
-    let dir = orchestrator_runtime_dir().join(format!("spoke-keygen-{}", now_epoch_ms()));
+    let dir = spoke_key_scratch_dir("keygen");
     fs::create_dir_all(&dir)?;
     let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     let key_path = dir.join("spoke.key");
     let out = Command::new("ssh-keygen")
-        .args(["-t", "ed25519", "-N", "", "-q", "-C", "fluxbee-spoke-recovery", "-f"])
+        .args([
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-q",
+            "-C",
+            SPOKE_RECOVERY_KEY_COMMENT,
+            "-f",
+        ])
         .arg(&key_path)
         .output();
     let result = (|| -> Result<(String, String), OrchestratorError> {
@@ -19473,12 +19510,16 @@ fn append_spoke_authorized_key_with_key(
     user: &str,
     spoke_pub: &str,
 ) -> Result<(), OrchestratorError> {
-    let key_material = spoke_pub
+    // Validate the key format up front (a malformed key would silently no-op the sshd match).
+    spoke_pub
         .split_whitespace()
         .nth(1)
         .ok_or_else(|| "invalid spoke public key format: missing key material".to_string())?;
     let entry =
         format!("no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty {spoke_pub}");
+    // Dedup by the recovery-key marker (never the MB key's comment) so a retried or
+    // previously-failed persist never accumulates orphaned recovery keys, and the MB bootstrap
+    // key — the live channel here — is always preserved.
     let script = format!(
         "set -euo pipefail\n\
 user='{user}'\n\
@@ -19490,13 +19531,13 @@ mkdir -p \"$ssh_dir\"\n\
 chown \"$user:$user\" \"$ssh_dir\"\n\
 chmod 700 \"$ssh_dir\"\n\
 touch \"$auth_keys\"\n\
-grep -Fv '{key_material}' \"$auth_keys\" > \"$auth_keys.tmp\" || true\n\
+grep -Fv '{marker}' \"$auth_keys\" > \"$auth_keys.tmp\" || true\n\
 mv \"$auth_keys.tmp\" \"$auth_keys\"\n\
 printf '%s\\n' '{entry}' >> \"$auth_keys\"\n\
 chown \"$user:$user\" \"$auth_keys\"\n\
 chmod 600 \"$auth_keys\"\n",
         user = user,
-        key_material = shell_single_quote(key_material),
+        marker = SPOKE_RECOVERY_KEY_COMMENT,
         entry = shell_single_quote(&entry),
     );
     let cmd = sudo_wrap(&format!("bash -lc '{}'", shell_single_quote(&script)));
@@ -19588,16 +19629,20 @@ async fn finalize_spoke_key_persist(
     verify_remote_ssh_hardening_with_access(address, mb_key_path, user)
         .map_err(|err| format!("ssh hardening verification failed: {err}"))?;
 
-    // VERIFY-BEFORE-REVOKE via the PER-SPOKE key.
-    let verify_dir = orchestrator_runtime_dir().join(format!("spoke-verify-{}", now_epoch_ms()));
+    // VERIFY-BEFORE-REVOKE via the PER-SPOKE key: write the private half to a 0600 scratch,
+    // probe `sudo -n`, then ALWAYS remove the scratch — even if the write itself fails (so the
+    // private key never lingers on disk on an error path).
+    let verify_dir = spoke_key_scratch_dir("verify");
     fs::create_dir_all(&verify_dir)?;
     let _ = fs::set_permissions(&verify_dir, fs::Permissions::from_mode(0o700));
     let verify_key = verify_dir.join("id");
-    fs::write(&verify_key, &priv_pem)?;
-    let _ = fs::set_permissions(&verify_key, fs::Permissions::from_mode(0o600));
-    let per_spoke_ok =
-        verify_remote_key_access_after_hardening(address, &verify_key, user).is_ok();
+    let per_spoke_probe = (|| -> Result<bool, OrchestratorError> {
+        fs::write(&verify_key, &priv_pem)?;
+        let _ = fs::set_permissions(&verify_key, fs::Permissions::from_mode(0o600));
+        Ok(verify_remote_key_access_after_hardening(address, &verify_key, user).is_ok())
+    })();
     let _ = fs::remove_dir_all(&verify_dir);
+    let per_spoke_ok = per_spoke_probe?;
 
     if !per_spoke_ok {
         tracing::warn!(
