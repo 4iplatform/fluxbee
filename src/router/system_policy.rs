@@ -112,6 +112,11 @@ pub fn authority(action: &str, src_l2_name: Option<&str>, hive_id: &str) -> bool
     if is_edge_service_action(action) {
         return role == "SY.admin" && hive == PRIMARY_HIVE_ID;
     }
+    // Option B (WAN multi-hop reachability): only the primary hub's gateway router may vouch
+    // transitive reachability. Byte-identical to system.rego rule (6); shadow-verified.
+    if action == "WAN_REACHABILITY_VOUCH" {
+        return role == "RT.gateway" && hive == PRIMARY_HIVE_ID;
+    }
     if matches!(
         action,
         "CONFIG_GET" | "CONFIG_SET" | "SYSTEM_UPDATE" | "SYSTEM_SYNC_HINT"
@@ -135,17 +140,24 @@ pub fn authority(action: &str, src_l2_name: Option<&str>, hive_id: &str) -> bool
 
 /// Option B (WAN multi-hop reachability, edge-multihop-reachability-spec-v1): may the mTLS-
 /// authenticated `voucher_hive` VOUCH transitive reachability of other hives' nodes to a spoke?
-/// Only the primary hub may — it is the star's single relay. This is the SYSTEM rule that replaces
-/// the hardcoded LSA bucket check for the (separate) reachability plane; it is the Rust fallback /
-/// spec, to be kept in lock-step with `policy/system.rego` (future entrypoint
-/// `fluxbee/system/wan_reachability_admit`), shadow-verified like `authority()`.
+/// Only the primary hub may — it is the star's single relay.
+///
+/// OPA-BACKED, exactly like the rest of the SYSTEM authority surface: it evaluates the baked
+/// `system.wasm` (`policy/system.rego` rule (6), action `WAN_REACHABILITY_VOUCH`) through
+/// `authorize_system`, with the byte-identical Rust `authority()` table as the load-failure
+/// fallback (shadow-verified). The voucher is identified by its gateway router name
+/// `RT.gateway@<voucher_hive>`; `hive_id` is irrelevant to this rule so the primary hive is passed.
 ///
 /// A vouched node is admitted for DATA delivery ONLY; SYSTEM authority stays strict and is denied
 /// for a `via_hub` origin at the delivery gate (see `serialize_for_local_delivery`). So allowing the
 /// hub to vouch reachability cannot grant it the power to fabricate cross-hive control-plane
 /// authority between spokes.
 pub fn wan_reachability_voucher_allowed(voucher_hive: &str) -> bool {
-    voucher_hive.trim() == PRIMARY_HIVE_ID
+    authorize_system(
+        "WAN_REACHABILITY_VOUCH",
+        Some(&format!("RT.gateway@{}", voucher_hive.trim())),
+        PRIMARY_HIVE_ID,
+    )
 }
 
 /// The BAKED system policy resolver: `policy/system.wasm` (compiled from `policy/system.rego`).
@@ -260,8 +272,9 @@ mod tests {
             "SYSTEM_SYNC_HINT",
             "ADD_HIVE_FINALIZE",
             "SYSTEM_UPDATE",
+            "WAN_REACHABILITY_VOUCH",
         ];
-        let names: [Option<&str>; 13] = [
+        let names: [Option<&str>; 16] = [
             Some("SY.admin@motherbee"),
             Some("SY.admin@worker1"),
             Some("SY.admin@edge-1"),
@@ -273,6 +286,9 @@ mod tests {
             Some("SY.config-routes@motherbee"),
             Some("SY.vault@motherbee"),
             Some("IO.cloud@motherbee"),
+            Some("RT.gateway@motherbee"),
+            Some("RT.gateway@worker1"),
+            Some("RT.gateway@ingress1"),
             Some(""),
             None,
         ];

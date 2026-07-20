@@ -37,6 +37,11 @@ edge_service_actions := {"EDGE_OPEN_URL", "EDGE_CLOSE_URL", "EDGE_LIST_URLS", "E
 # managed nodes or orchestrators on workers.
 node_control_actions := {"CONFIG_GET", "CONFIG_SET", "SYSTEM_UPDATE", "SYSTEM_SYNC_HINT"}
 
+# Option B (WAN multi-hop reachability): router-internal vouch action, decided ONLY by rule (6)
+# below. Excluded from the broad control-plane grants (3)/(4) so it is never granted to
+# SY.orchestrator/SY.admin — only the primary hub's gateway router may vouch.
+reachability_actions := {"WAN_REACHABILITY_VOUCH"}
+
 # Parse "<role>@<hive>" from the router-authoritative (already-stamped) src_l2_name, splitting
 # on the FIRST '@' (mirrors Rust split_once('@')). Undefined when the name is empty or has no
 # '@' with a non-empty role — which makes every allow rule below fail -> default false.
@@ -72,6 +77,7 @@ allow if {
 # (3) SY.orchestrator@<any non-empty hive> — the cross-hive control plane (system-final).
 allow if {
 	not input.action in edge_service_actions
+	not input.action in reachability_actions
 	parsed.role == "SY.orchestrator"
 	parsed.hive != ""
 }
@@ -80,6 +86,7 @@ allow if {
 allow if {
 	not input.action in edge_service_actions
 	not input.action in node_control_actions
+	not input.action in reachability_actions
 	parsed.role != "SY.orchestrator"
 	parsed.hive == input.hive_id
 	parsed.role in {"SY.admin", "SY.wf-rules", "WF.orch.diag"}
@@ -92,4 +99,15 @@ allow if {
 	parsed.hive == input.hive_id
 	input.action == "NODE_STATUS_GET"
 	parsed.role in {"SY.config-routes", "SY.vault"}
+}
+
+# (6) Option B (WAN multi-hop reachability, edge-multihop-reachability-spec-v1): only the primary
+# hub's gateway router may VOUCH transitive reachability of other hives' nodes. The router asks
+# with action WAN_REACHABILITY_VOUCH and src_l2_name = the advertising peer's gateway router name
+# (RT.gateway@<peer_hive>). A vouch grants DATA-plane reachability only; SYSTEM authority stays
+# strict (a via_hub origin is denied at the delivery gate, independent of this rule).
+allow if {
+	input.action == "WAN_REACHABILITY_VOUCH"
+	parsed.role == "RT.gateway"
+	parsed.hive == "motherbee"
 }
