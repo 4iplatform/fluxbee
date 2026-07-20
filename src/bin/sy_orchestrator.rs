@@ -1271,6 +1271,21 @@ async fn bootstrap_local(
     let core_bins = core_bin_paths_for_role(&core_manifest, state.role)?;
     validate_core_manifest_for_bins(&core_bins)?;
 
+    // Spoke self-heal: a category=core update swaps this role's binaries, but the systemd unit
+    // files were written once at add_hive. Re-render them from THIS binary's templates on every
+    // boot (idempotent: only writes/reloads on a real diff), so a unit-file change that shipped
+    // with a new orchestrator binary lands the first time the new orchestrator comes up —
+    // without a fresh add_hive re-provision. Motherbee is skipped (its units are the .deb's).
+    if !state.is_motherbee {
+        match regen_local_core_units(&core_manifest, state.role) {
+            Ok(true) => tracing::info!("bootstrap: regenerated core units to match current templates"),
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(error = %err, "bootstrap: core unit regen failed (non-fatal)")
+            }
+        }
+    }
+
     // Motherbee is the mesh CA: ensure the CA + its own WAN-mTLS material exist
     // before rt-gateway starts (the router loads certs at startup). Then, off the
     // boot path, catch up TLS material for hives provisioned before mTLS existed.
@@ -3223,14 +3238,46 @@ async fn apply_system_update_local(
                 installed.push(name.clone());
             }
 
-            match restart_local_core_services_with_health_gate().await {
-                Ok(restarted) => Ok(SystemUpdateApplyResult {
-                    status: "ok".to_string(),
-                    updated,
+            // Unit-file changes (TimeoutStopSec, dependency edits) ride a category=core update:
+            // after swapping binaries, re-render this role's units and daemon-reload BEFORE the
+            // restart, so the new binaries start under the new units. A regen failure is treated
+            // like a health-gate failure — roll the binaries back so binaries+units stay
+            // consistent (regenerated unit files are benign to leave in place: a unit adding
+            // TimeoutStopSec still runs the rolled-back binary fine).
+            if let Err(err) = regen_local_core_units(&manifest, state.role) {
+                let rollback_note = match rollback_local_core_binaries(
+                    &updated,
+                    &backup_dir,
+                    &created_without_backup,
+                ) {
+                    Ok(()) => "rollback applied".to_string(),
+                    Err(rb_err) => format!("rollback failed: {rb_err}"),
+                };
+                return Ok(SystemUpdateApplyResult {
+                    status: "rollback".to_string(),
+                    updated: Vec::new(),
                     unchanged,
-                    restarted,
-                    errors: Vec::new(),
-                }),
+                    restarted: Vec::new(),
+                    errors: vec![format!("core unit regen failed: {err}; {rollback_note}")],
+                });
+            }
+
+            match restart_local_core_services_with_health_gate().await {
+                Ok(restarted) => {
+                    // sy-orchestrator excludes itself from the in-process restart above, so if
+                    // its own binary was swapped, schedule a detached self-restart to pick it up
+                    // (and its regenerated unit) hands-off.
+                    if updated.iter().any(|n| n == "sy-orchestrator") {
+                        schedule_orchestrator_self_restart();
+                    }
+                    Ok(SystemUpdateApplyResult {
+                        status: "ok".to_string(),
+                        updated,
+                        unchanged,
+                        restarted,
+                        errors: Vec::new(),
+                    })
+                }
                 Err(err) => {
                     let rollback_note = match rollback_local_core_binaries(
                         &updated,
@@ -3882,6 +3929,65 @@ fn core_service_unit_contents(name: &str, exec_path: &str) -> String {
         "After=network.target"
     };
     format!("[Unit]\nDescription=Fluxbee {name}\n{unit_deps}\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\nTimeoutStopSec=15\n\n[Install]\nWantedBy=multi-user.target\n")
+}
+
+/// Re-render every core systemd unit this spoke role owns from the RUNNING binary's
+/// templates (core_service_unit_contents) and write each only if the content changed, then
+/// `daemon-reload` iff anything changed. This lets unit-file changes (TimeoutStopSec,
+/// dependency edits) reach an already-joined spoke through a `category=core` update +
+/// orchestrator restart, instead of ONLY via a fresh add_hive re-provision. Motherbee's units
+/// are owned by the .deb under /lib/systemd/system and must not be shadowed, so this is
+/// spoke-only (motherbee returns Ok(false) without touching the filesystem).
+fn regen_local_core_units(
+    manifest: &CoreManifest,
+    role: HiveRole,
+) -> Result<bool, OrchestratorError> {
+    if role == HiveRole::Motherbee {
+        return Ok(false);
+    }
+    let names = core_component_names_for_role(manifest, role)?;
+    let mut changed = false;
+    for name in &names {
+        let unit = core_service_unit_contents(name, &service_to_exec(name));
+        let path = format!("/etc/systemd/system/{name}.service");
+        if write_file_if_changed(&path, &unit)? {
+            changed = true;
+            tracing::info!(unit = %name, "regenerated core systemd unit to match current template");
+        }
+    }
+    if changed {
+        let mut reload = Command::new("systemctl");
+        reload.arg("daemon-reload");
+        run_cmd(reload, "systemctl daemon-reload (core unit regen)")?;
+    }
+    Ok(changed)
+}
+
+/// Schedule a detached, out-of-band restart of sy-orchestrator so a freshly-swapped
+/// /usr/bin/sy-orchestrator binary (and its regenerated unit) take effect hands-off. NEVER
+/// restart inline: we are mid-apply under the runtime lifecycle lock and would kill our own
+/// reply. A transient `systemd-run` timer (fixed unit name so repeated updates coalesce
+/// instead of stacking) fires ~2s after the response is delivered. Best-effort: on failure we
+/// log and leave the operator to `systemctl restart sy-orchestrator`.
+fn schedule_orchestrator_self_restart() {
+    let mut cmd = Command::new("systemd-run");
+    cmd.args([
+        "--on-active=2s",
+        "--unit=fluxbee-orch-selfrestart",
+        "--collect",
+        "systemctl",
+        "restart",
+        "sy-orchestrator",
+    ]);
+    match run_cmd(cmd, "schedule orchestrator self-restart") {
+        Ok(()) => {
+            tracing::info!("scheduled orchestrator self-restart (~2s) to pick up the new binary")
+        }
+        Err(err) => tracing::warn!(
+            error = %err,
+            "failed to schedule orchestrator self-restart; run 'systemctl restart sy-orchestrator' to pick up the new binary"
+        ),
+    }
 }
 
 fn render_system_nodes_yaml(role: HiveRole, section: &RoleSystemNodes) -> String {
