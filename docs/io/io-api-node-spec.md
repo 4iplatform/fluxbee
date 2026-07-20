@@ -1,1065 +1,343 @@
-# IO.api - Especificacion Tecnica
+# IO.api - Edge-native instanced ingress specification
 
-**Estado:** propuesta normativa para implementacion
-**Fecha:** 2026-04-10
-**Audiencia:** arquitectura, backend, desarrollo, ops, integradores
-**Tipo de nodo:** `IO.*`
-**Runtime recomendado:** `io.api`
-**Alcance:** nodo IO HTTP/API de proposito general para ingreso de mensajes desde sistemas externos hacia Fluxbee
+**Status:** alpha implementation contract
 
----
+**Updated:** 2026-07-19
 
-## 0. Proposito
+**Related:** `edge-ingress-spec-v6.md`, `io-blob-spec-v1.md`, `io-cloud-spec-v1.md`
 
-`IO.api` define un adapter HTTP general para Fluxbee.
+## 1. Purpose
 
-Su funcion es:
+`IO.api` exposes a bounded JSON ingress from Internet into one Fluxbee tenant. It is a managed,
+instanced `IO.*` runtime. It is not an HTTP server and does not own a public network interface.
 
-- exponer un endpoint HTTP de ingreso;
-- autenticar al caller externo;
-- validar el request segun el contrato efectivo de la instancia;
-- derivar el sujeto conversacional efectivo;
-- materializar attachments en blob storage cuando corresponda;
-- aplicar relay comun de `io-common`;
-- publicar un mensaje canonico al router.
+The only public path is:
 
-`IO.api` no es:
+```text
+Internet HTTPS
+  -> SY.edge /e/<ich>                 bearer + method + size gate
+  -> Fluxbee message over router      io.api.inbound.v1
+  -> IO.api.<instance>@<hive>         Edge/ICH gate + business validation
+  -> identity / frontdesk / relay
+  -> fixed internal destination
+```
 
-- una API directa al router;
-- una API de administracion del sistema;
-- una capa de memoria cognitiva;
-- una base de datos de mensajes;
-- un reemplazo de `SY.identity`, `SY.storage`, `SY.admin` o `SY.cognition`.
+This contract replaces the removed direct-HTTP implementation based on Axum, local API keys,
+multipart uploads and outbound webhooks.
 
----
+## 2. Deployment model
 
-## 1. Relacion con la arquitectura general
+- Runtime key: `io.api`.
+- Node shape: managed and instanced, like `ai.generic` nodes.
+- Example names: `IO.api.orders@worker-1`, `IO.api.partner-a@motherbee`.
+- One instance belongs to one Orchestrator-injected tenant.
+- One instance owns one stable `api_channel_id` and therefore one ICH/public URL.
+- Multiple APIs are multiple managed instances. They may target the same or different Edge nodes.
+- The runtime is seeded under `dist/runtimes/io.api/<version>` by install/package flows.
+- There is no `io-api.service` singleton and no `/usr/bin/io-api` service lifecycle.
 
-Dentro de Fluxbee, `IO.api` es un nodo IO mas. El medio externo es HTTP.
+Orchestrator must inject:
 
-Por lo tanto:
+- `FLUXBEE_NODE_NAME`;
+- `FLUXBEE_NODE_ILK_ID`;
+- `FLUXBEE_NODE_TENANT_ID`;
+- managed `config.json` and normal node socket paths.
 
-- el mundo externo habla HTTP con `IO.api`;
-- `IO.api` habla protocolo Fluxbee con el router;
-- el router sigue siendo el unico responsable de routing interno;
-- cognition no participa del relay del IO;
-- identity sigue siendo la fuente de verdad de ILK/ICH/tenant.
+## 3. Identity and publication
 
-### 1.1 Responsabilidades
+### 3.1 Own channel
 
-`IO.api` es responsable de:
+The instance calls `ensure_own_ich` with:
 
-- exponer `POST /` como endpoint principal de ingreso;
-- exponer `GET /` como endpoint principal de introspeccion;
-- mantener `POST /messages` y `GET /schema` como aliases legacy compatibles;
-- autenticar y autorizar al caller externo;
-- validar el request segun el contrato efectivo de la instancia;
-- construir un `ResolveOrCreateInput` segun el `subject_mode` de la instancia;
-- delegar la resolucion/provision de identidad al pipeline comun de `io-common`;
-- decidir si el sujeto requiere regularizacion por `SY.frontdesk.gov` segun su estado de registro;
-- construir `frontdesk_handoff` cuando esa regularizacion sea necesaria;
-- construir un mensaje `text/v1` canonico;
-- pasar por el relay comun;
-- enviar al router por `fluxbee_sdk::NodeSender::send`;
-- adjuntar `meta.context.response_envelope` cuando el hop a frontdesk requiere respuesta estructurada;
-- consumir respuesta estructurada síncrona de frontdesk sobre payload `text` cuando el request necesita regularizacion por frontdesk;
-- adjuntar `meta.context.io.reply_target` cuando la integracion autenticada requiere callback final;
-- entregar callbacks finales por `webhook_post` cuando vuelve un mensaje terminal con `reply_target` preservado.
+- `channel_type = api_channel`;
+- `address = config.io.api_channel_id`;
+- `ilk_id = FLUXBEE_NODE_ILK_ID`;
+- `tenant_id = FLUXBEE_NODE_TENANT_ID`.
 
-### 1.2 No-responsabilidades
+Identity stamps the node as owner. Admin later verifies that router-stamped caller and ICH owner are
+the same before externalizing.
 
-`IO.api` no debe:
+ICH writes target the canonical primary `SY.identity@motherbee`, including when IO.api runs on a
+worker. Tenant/ILK reads use the worker's replicated local Identity SHM.
 
-- tomar decisiones de routing de negocio;
-- persistir conversacion como fuente de verdad;
-- reemplazar la capa de storage;
-- reemplazar la capa de identity;
-- acoplarse a cognition;
-- exponer bypass administrativos a nodos internos.
+### 3.2 Public bearer
 
----
+The public bearer is not part of `CONFIG_SET`, managed state or process arguments. `IO.api` invokes
+`SY.admin externalize` without a secret. Admin uses the existing ingress mechanism to:
 
-## 2. Principios de diseno
+1. mint a 256-bit token;
+2. store it in Vault as `edge_channel_secret:<ich>`, dedicated to the selected Edge;
+3. send only that `secret_ref` to Edge;
+4. return the token to IO.api.
 
-### 2.1 Runtime generico, contrato efectivo por instancia
+IO.api keeps the returned token only in memory. A newly minted token is emitted once in the
+authorized successful `CONFIG_SET` response as `runtime.publication.entry_token`. It is never
+returned by `CONFIG_GET` and is not written to the managed config or state snapshot. The deploy
+helper deliberately avoids writing the response containing it to its log.
 
-`IO.api` es un runtime generico capaz de soportar varios modos de ingreso, autenticacion y resolucion de sujeto.
+### 3.3 Externalize
 
-Sin embargo, una instancia concreta debe exponer un contrato HTTP efectivo y deterministico derivado de su configuracion.
-
-### 2.2 Separacion entre caller autenticado y sujeto conversacional
-
-`IO.api` debe distinguir entre:
-
-- caller autenticado: la entidad que invoca el endpoint HTTP;
-- sujeto conversacional efectivo: la entidad que sera representada internamente como sujeto del mensaje.
-- tenant efectivo: el tenant derivado de la API key autenticada.
-- destino efectivo del request: el `dst_node` configurado o overrideado por request.
-
-Ambos pueden coincidir o no.
-
-### 2.3 Identidad por pipeline comun de IO
-
-`IO.api` no implementa una source of truth de identidad separada del resto de los nodos IO.
-
-Sin embargo, para `subject_mode = explicit_subject`, el contrato HTTP puede exigir una resolucion de identidad sincronica antes de devolver respuesta HTTP.
-
-Regla normativa:
-
-1. el nodo autentica al caller;
-2. en `caller_is_subject`, mantiene el comportamiento asincrono de ingress;
-3. en `explicit_subject`, determina el modo de identificacion desde el payload;
-4. en `explicit_subject`, no devuelve respuesta exitosa ni emite al router hasta conocer el resultado de identity para ese request.
-
-Esto no convierte a `IO.api` en source of truth de identidad. Sigue delegando a identity, pero cambia el punto en el que responde HTTP.
-
-### 2.4 Relay pre-router
-
-Todo mensaje de ingreso debe pasar por el relay comun de `io-common`.
-
-La superficie formal de configuracion del relay es:
-
-- `config.io.relay.window_ms`
-- `config.io.relay.max_open_sessions`
-- `config.io.relay.max_fragments_per_session`
-- `config.io.relay.max_bytes_per_session`
-
-Regla:
-
-- `window_ms > 0` implica consolidacion;
-- `window_ms = 0` implica passthrough inmediato.
-
-### 2.5 Endpoint parcialmente sincronico segun `subject_mode`
-
-`POST /` no espera el resultado final del sistema, pero tampoco es completamente asincrono en todos los modos.
-
-Regla normativa:
-
-- `caller_is_subject`: mantiene respuesta asincrona de ingress;
-- `explicit_subject`: espera el resultado de la etapa de identity requerida por el request antes de devolver respuesta HTTP.
-
-En ningun caso responde con el resultado final del AI/frontdesk/workflow, salvo la excepcion estructurada del camino `SY.frontdesk.gov` definida en la seccion de contrato HTTP.
-
----
-
-## 3. Naming, runtime e instancias
-
-### 3.1 Runtime
-
-Nombre recomendado:
-
-- `io.api`
-
-### 3.2 Ejemplos de instancia
-
-- `IO.api.frontdesk@worker-220`
-- `IO.api.portal@worker-220`
-- `IO.api.partner1@worker-220`
-- `IO.api.ingress@motherbee`
-
-### 3.3 Multi-instancia
-
-`IO.api` debe soportar multi-instancia.
-
-Patron recomendado:
-
-- una instancia = un listener HTTP = un contrato efectivo
-
-Esto no cambia el pipeline comun de identidad ni relay. Cada instancia aplica el mismo flujo IO sobre su propio contrato HTTP y su propia configuracion.
-
-### 3.4 ICH local de `IO.api`
-
-Para `IO.api`, el `ICH` debe interpretarse como el **asset/canal local de ingreso** operado por la instancia, no como el sujeto externo autenticado ni como el `external_user_id`.
-
-Criterio actual acordado para esta familia:
-
-- una instancia concreta de `IO.api` opera un canal API estable identificado por `api_channel_id`;
-- el listener/entrypoint HTTP sigue siendo runtime de ingreso, no identidad canonica del `ICH`;
-- el `ICH` no debe derivarse del interlocutor externo ni del bind tecnico.
-
-Consecuencia:
-
-- el caller autenticado y el sujeto conversacional efectivo siguen resolviéndose por auth + identity;
-- el `ICH` de `IO.api` representa el canal API local/estable operado por la instancia.
-
-### 3.5 Estado actual del runtime respecto a ILK interno e ICH
-
-Lectura ajustada al estado real actual del repo:
-
-- `IO.api` ya lee `self_ilk_id` y `self_tenant_id` desde env al boot;
-- hoy esos valores también se usan para asegurar el alta del `ICH` propio de la instancia vía `ILK_ADD_CHANNEL`;
-- el identificador canonico de ese canal es `api_channel_id`;
-- `listen.address` sigue existiendo como dato técnico de bind/runtime;
-- el cálculo actual de `thread_id` para `IO.api` ya usa `ThreadIdInput::PersistentChannel` con:
-  - `channel_type = "api"`
-  - `entrypoint_id = api_channel_id`
-  - `conversation_id` canónico del request
-
-Conclusión práctica:
-
-- la continuidad conversacional ya incorpora la identidad lógica estable del canal;
-- `meta.ich` ya se alinea al canal API estable, no al bind técnico;
-- el `ICH` propio de la instancia ya se intenta registrar explícitamente contra identity usando `self_ilk_id + api_channel_id`.
-
-### 3.6 Estado actual del alta de ICH propio
-
-El camino operativo actual para `IO.api` es:
-
-- usar `self_ilk_id` y `self_tenant_id` inyectados al boot;
-- calcular un `ich_id` estable a partir de `channel_type + address + tenant`;
-- solicitar `ILK_ADD_CHANNEL` a `SY.identity` con:
-  - `channel_type = "api_channel"`
-  - `address = api_channel_id`
-  - `ilk_id = self_ilk_id`
-
-Si el alta falla:
-
-- el nodo marca `FAILED_CONFIG` al boot;
-- y en `CONFIG_SET` rechaza el cambio de `listen` si no puede asegurar el `ICH` correspondiente.
-
-Gap residual:
-
-- la validación local de `SY.identity` queda condicionada al entorno de build disponible;
-- pero el contrato ya no está bloqueado conceptualmente por core para `IO.api`.
-
-### 3.7 Relación actual entre `api_channel_id` e `integration_id`
-
-En el estado actual de `IO.api`, ambos conceptos conviven pero **no cumplen el mismo rol**.
-
-`api_channel_id`:
-
-- identifica el canal local/estable del nodo;
-- es la base del `ICH` propio;
-- participa en `meta.ich` y en el carrier conversacional del canal.
-
-`integration_id`:
-
-- sigue identificando la integración funcional autenticada;
-- hoy se usa en auth inbound (`auth.api_keys[*].integration_id`);
-- hoy se usa para resolver callback/webhook final y política asociada.
-
-Regla vigente:
-
-- `api_channel_id` manda para identidad del canal / `ICH`;
-- `integration_id` solo debe seguir existiendo donde todavía resuelve auth, callback o política funcional.
-
-Decisión diferida:
-
-- cuando se cierre mejor el modelo de instancia, tenant, ownership y secrets/tokens de API, debe revisarse si `integration_id`:
-  - permanece como concepto separado,
-  - queda como alias,
-  - o pasa a ser metadata del `api_channel_id`.
-
----
-
-## 4. Estados del nodo
-
-`IO.api` debe implementar al menos:
-
-- `UNCONFIGURED`
-- `CONFIGURED`
-- `FAILED_CONFIG`
-
-### 4.1 UNCONFIGURED
-
-El nodo arranco, pero todavia no tiene configuracion efectiva suficiente para aceptar trafico de negocio.
-
-En este estado:
-
-- debe exponer `GET /`;
-- no debe aceptar `POST /` para trafico de negocio;
-- debe responder `503 Service Unavailable` con `error_code=node_not_configured` en `POST /`.
-
-Interpretacion respecto a `ICH`:
-- `IO.api` puede quedar vivo y observable aun cuando todavia no tenga material suficiente para operar su `ICH` local;
-- mientras eso ocurra, no debe aceptar trafico operativo real;
-- en el estado actual del repo, esa no-operatividad se expresa mediante falta de configuracion efectiva suficiente.
-
-### 4.2 CONFIGURED
-
-El nodo tiene listener, auth, `subject_mode`, accepted content types y relay definidos, y puede aceptar trafico de negocio.
-
-### 4.3 FAILED_CONFIG
-
-La configuracion es invalida o insuficiente para operar correctamente.
-
-En este estado:
-
-- debe seguir vivo;
-- debe exponer `GET /`;
-- no debe aceptar `POST /`;
-- debe reportar explicitamente el motivo del fallo en schema/status/control plane.
-
-Interpretacion respecto a `ICH`:
-- para `IO.api`, el `ICH` local esta atado al entrypoint/listener de la instancia;
-- si la instancia no tiene material suficiente para operar ese canal local, puede permanecer viva para control-plane, pero no debe procesar trafico de negocio.
-
----
-
-## 5. Configuracion de instancia
-
-### 5.1 Modelo vigente
-
-`IO.api` debe alinearse con el modelo general de nodos IO en este repo:
-
-- bootstrap/infrastructure config por orchestrator `config.json`;
-- runtime/business config node-owned por `CONFIG_GET` / `CONFIG_SET`;
-- `CONFIG_CHANGED` como senal informativa de infraestructura, no como camino canonico de hot reload del adapter.
-
-### 5.2 Config minima para pasar a CONFIGURED
-
-Una instancia no debe pasar a `CONFIGURED` si falta alguno de estos grupos:
-
-- `listen.address`
-- `listen.port`
-- `auth.mode`
-- `ingress.subject_mode`
-- `ingress.accepted_content_types`
-- `config.io.relay.*` valido
-
-Ademas:
-
-- si `auth.mode = api_key`, debe existir al menos una credencial activa valida;
-- si una integracion exige callback final (`final_reply_required=true`), debe existir configuracion valida de webhook para esa integracion.
-
-### 5.3 Secrets
-
-Los secretos del nodo no deben quedar expuestos en `${STATE_DIR}` ni en respuestas publicas.
-
-Reglas vigentes:
-
-- `CONFIG_SET` puede aceptar secretos inline;
-- `CONFIG_GET` y `CONFIG_RESPONSE` deben devolver secretos redacted;
-- la metadata de secretos debe salir via `contract.secrets[*]`;
-- el nodo no debe persistir secretos en `${STATE_DIR}`;
-- el mecanismo concreto de persistencia local de secretos queda como decision de implementacion del adapter mientras no contradiga el contrato comun.
-
-Ejemplos de secretos de `IO.api`:
-
-- API keys inbound;
-- secretos HMAC de webhook outbound;
-- referencias locales de firma HMAC por integracion.
-
-### 5.4 Ownership model de API keys en `IO.api`
-
-Para `IO.api`, v1 cierra explicitamente este reparto de responsabilidades:
-
-- la creacion, rotacion y revocacion logica de API keys pertenece al control plane;
-- la entrega inicial de la key a la instancia pertenece al flujo de bootstrap por orchestrator o a `CONFIG_SET`;
-- la materializacion local utilizable en runtime pertenece al propio nodo `IO.api`;
-- `${STATE_DIR}` nunca debe contener secretos;
-- `CONFIG_GET` y `CONFIG_RESPONSE` nunca deben devolver el valor crudo.
-
-Lectura operativa:
-
-### 5.5 Modelo de configuracion de integraciones
-
-`IO.api` ya implementa el modelo:
-
-- `auth.api_keys[*]`
-- `integrations[*]`
-
-Reglas:
-
-- cada API key autentica al caller inbound;
-- cada API key resuelve exactamente un `integration_id`;
-- la integracion resuelta define la politica de callback final;
-- la configuracion de webhook outbound pertenece a la integracion, no al body del request.
-
-Campos minimos actuales:
-
-- `auth.api_keys[*].key_id`
-- `auth.api_keys[*].tenant_id`
-- `auth.api_keys[*].integration_id`
-- `auth.api_keys[*].token` o `token_ref`
-- `integrations[*].integration_id`
-- `integrations[*].tenant_id`
-- `integrations[*].final_reply_required`
-- `integrations[*].webhook.enabled`
-- `integrations[*].webhook.url`
-- `integrations[*].webhook.secret_ref`
-- `integrations[*].webhook.timeout_ms`
-- `integrations[*].webhook.max_retries`
-- `integrations[*].webhook.initial_backoff_ms`
-- `integrations[*].webhook.max_backoff_ms`
-
-Regla importante:
-
-- `IO.api` no acepta `webhook_url`, `webhook_secret` ni override equivalente dentro del request HTTP de ingreso.
-
-- `architect`, un operador humano o una futura herramienta admin pueden decidir que keys deben existir;
-- el nodo no genera API keys;
-- el nodo recibe la key ya provisionada por control plane;
-- el nodo la persiste localmente fuera de `${STATE_DIR}` y la usa como fuente de runtime.
-
-### 5.5 Decision v1 para persistencia local de secrets
-
-Para `IO.api`, v1 adopta explicitamente `secrets.json` local como decision de implementacion del adapter, siguiendo el precedente ya documentado en AI Nodes.
-
-Reglas para `IO.api` v1:
-
-- las API keys pueden entrar inline por `CONFIG_SET` o por bootstrap config;
-- el nodo debe separarlas de la config visible;
-- el nodo debe persistirlas localmente en `secrets.json`;
-- `secrets.json` no forma parte de `${STATE_DIR}`;
-- `config.json` puede transportar bootstrap config, pero no debe ser la fuente primaria del secreto a largo plazo cuando ya existe materializacion local valida.
-
-Esto debe leerse como una decision explicita de `IO.api` v1, no como una generalizacion automatica a todos los `IO.*`.
-
----
-
-## 6. Seguridad
-
-### 6.1 Objetivo
-
-`IO.api` debe autenticar al caller externo que invoca el endpoint HTTP.
-
-Esa autenticacion no equivale automaticamente a la identidad conversacional interna.
-
-### 6.2 Modos de autenticacion
-
-Obligatorio en v1:
-
-- `api_key`
-
-Previstos para fases posteriores:
-
-- `hmac_signature`
-- `mTLS`
-- `allowlist_ip` como control complementario
-
-### 6.3 Transporte recomendado para API key
-
-Se recomienda:
-
-- `Authorization: Bearer <token>`
-
-Ese bearer token puede ser una API key opaca. No implica OAuth ni JWT.
-
-### 6.4 Multiples credenciales activas
-
-Una instancia debe poder soportar multiples credenciales activas simultaneamente.
-
-Eso permite:
-
-- rotacion sin downtime;
-- separacion de consumidores;
-- revocacion selectiva.
-
-### 6.4.1 Tenant scoping de API keys
-
-En `IO.api`, cada API key debe declarar explicitamente un `tenant_id`.
-
-Reglas:
-
-- la autenticacion valida el token;
-- la autorizacion deriva el tenant efectivo desde la key autenticada;
-- `IO.api` debe validar fail-closed que ese `tenant_id` exista;
-- si el tenant de la key no existe, el request debe rechazarse;
-- el request HTTP no define tenancy propia.
-
-### 6.5 TLS
-
-Fuera de dev, el acceso al endpoint debe ocurrir sobre:
-
-- HTTPS, o
-- HTTP detras de reverse proxy con terminacion TLS controlada.
-
-### 6.6 Higiene de logs
-
-El nodo no debe loggear en claro:
-
-- API keys;
-- secretos;
-- payloads completos con PII;
-- attachments;
-- headers sensibles.
-
----
-
-## 7. Modos de resolucion del sujeto
-
-### 7.1 Regla de configuracion
-
-En v1, `subject_mode` es configuracion de instancia, no switch por request.
-
-La instancia concreta elige uno y `GET /` debe reflejarlo.
-
-### 7.2 `explicit_subject`
-
-El request incluye explicitamente la informacion del sujeto final.
-
-Es el modo recomendado para integradores de servicio que hablan en nombre de multiples personas.
-
-`explicit_subject` admite dos modos de identificacion por payload:
-
-- `by_ilk`: el request incluye `subject.ilk`;
-- `by_data`: el request no incluye `subject.ilk` util y la identidad se intenta resolver/provisionar a partir de datos del sujeto.
-
-Reglas:
-
-- el objeto `subject` sigue siendo el carrier normativo del sujeto explicito;
-- dentro de `subject`, los campos de identidad pasan a ser opcionales a nivel de shape;
-- el request debe caer en uno de los dos modos validos;
-- si `subject.ilk` viene no vacio, el request entra en `by_ilk`;
-- si `subject.ilk` no viene o viene vacio, el request entra en `by_data`;
-- esos campos alimentan a identity, pero no reemplazan a `SY.identity`.
-
-#### 7.2.1 Modo `by_ilk`
-
-Cuando `subject.ilk` viene con un valor no vacio:
-
-- `IO.api` debe consultar a identity si ese ILK existe;
-- si existe, puede continuar el flujo y responder exito;
-- si no existe, debe rechazar el request;
-- en este modo no debe hacer provision por datos del sujeto;
-- el pipeline interno debe usar ese `ilk` como `src_ilk` efectivo sin volver a resolverlo por `(channel, external_id)`;
-- si el payload incluye ademas `display_name`, `email`, `company_name` u otros campos de identidad, esos campos se aceptan pero se ignoran completamente en este modo.
-
-#### 7.2.2 Modo `by_data`
-
-Cuando `subject.ilk` no esta presente o viene vacio:
-
-- `IO.api` debe validar primero que existan los campos minimos requeridos para identity;
-- si esos campos faltan o vienen vacios, debe rechazar el request;
-- si la validacion minima pasa, debe consultar a identity y esperar el resultado;
-- solo si identity responde exito el nodo puede emitir al router y devolver respuesta HTTP exitosa.
-
-Para `IO.api` se cierra, por ahora, esta validacion minima de `by_data`:
-
-- `subject.external_user_id`
-- `subject.display_name`
-- `subject.email`
-
-Lectura:
-
-- el tenant ya no se toma del body sino de la API key autenticada;
-- pueden admitirse campos adicionales, por ejemplo `phone`, pero no reemplazan a los minimos obligatorios.
-
-Si el payload incluye `phone` u otro dato adicional:
-
-- se trata como dato de identidad complementario;
-- puede formar parte del payload hacia identity cuando el adapter implemente esa llamada;
-- no crea automaticamente un `ICH` nuevo;
-- no vincula automaticamente ese telefono a otro canal como WhatsApp o telefonia;
-- el `ICH` canonico de `IO.api` sigue siendo el del canal `api` y su referencia estable de ingreso.
-
-Campos opcionales de metadata admitidos en `by_data`:
-
-- `subject.company_name`
-- `subject.attributes`
-
-Reglas:
-
-- `company_name` es metadata del humano o de su compania, no tenancy;
-- `attributes` debe ser un objeto y permite metadata adicional extensible;
-- `subject.tenant_id` y `subject.tenant_hint` no son validos en `IO.api`.
-
-### 7.3 `caller_is_subject`
-
-La identidad del sujeto se deriva del caller autenticado.
-
-Es el modo recomendado para credenciales emitidas por usuario o por sujeto final.
-
-Reglas:
-
-- el payload no necesita `subject`;
-- la referencia estable del sujeto se deriva del contexto autenticado;
-- si el request incluye `subject` y la instancia no lo admite, debe rechazarse con `422 invalid_payload`.
-
-### 7.4 `mapped_subject`
-
-Modo previsto para fase posterior.
-
-No es obligatorio para v1.
-
----
-
-## 8. Contrato HTTP
-
-### 8.1 Endpoints obligatorios en v1
-
-- `POST /`
-- `GET /`
-
-Aliases legacy compatibles:
-
-- `POST /messages`
-- `GET /schema`
-
-### 8.2 Naturaleza de `POST /`
-
-`POST /` tiene comportamiento distinto segun `subject_mode`.
-
-#### `caller_is_subject`
-
-Mantiene la semantica asincrona:
-
-- autentica;
-- valida;
-- acepta el ingress;
-- devuelve `202 Accepted` cuando el request fue retenido por relay o emitido hacia el sistema.
-
-#### `explicit_subject`
-
-Tiene una etapa sincronica previa:
-
-- autentica;
-- valida el modo de identificacion del payload;
-- consulta a identity;
-- solo si esa etapa es exitosa puede emitir al router y devolver respuesta HTTP exitosa.
-
-La respuesta exitosa recomendada sigue siendo:
-
-- `202 Accepted`
-
-pero solo despues de la etapa de identity de `explicit_subject`.
-
-En `explicit_subject`, la respuesta HTTP exitosa debe incluir ademas el `ilk` efectivo resuelto o creado, para permitir que el integrador lo reutilice en requests futuros.
-
-Se mantiene `202 Accepted` tambien en `explicit_subject`, incluso cuando identity ya fue resuelta antes de responder, porque sigue siendo el codigo mas estandar para un ingress que acepta y publica trabajo dentro del sistema sin prometer resultado final de negocio.
-
-Excepcion cerrada de esta version:
-
-- si el sujeto de `explicit_subject by_data` no esta registrado completamente, `IO.api` debe intermediar un `frontdesk_handoff` antes de continuar al `dst_final`;
-- si ese handoff devuelve un resultado estructurado no exitoso, `IO.api` responde con el envelope HTTP de frontdesk;
-- si devuelve `ok`, `IO.api` continua el mensaje original al `dst_final` y responde `202 Accepted`;
-- si el caller fija explicitamente `dst_node = SY.frontdesk.gov`, `IO.api` conserva un camino tecnico/terminal que responde directamente con ese mismo envelope estructurado.
-
-### 8.3 Matriz de respuestas HTTP segun regularizacion frontdesk y destino efectivo
-
-`IO.api` tiene dos familias de respuesta:
-
-- camino normal de ingress via router;
-- camino estructurado sincronico cuando frontdesk bloquea la continuacion o cuando el request apunta explicitamente a `SY.frontdesk.gov`.
-
-#### 8.3.1 Camino normal via router
-
-Si el request no apunta efectivamente a `SY.frontdesk.gov`, `IO.api` mantiene semantica de ingress:
-
-- responde `202 Accepted` cuando autentico, valido el payload, resolvio identity si hacia falta y pudo publicar o retener el mensaje internamente;
-- no espera resultado final de negocio;
-- el body de exito incluye metadatos de aceptacion como `request_id`, `trace_id`, `ilk` y `relay_status`.
-
-#### 8.3.2 Camino con regularizacion por frontdesk
-
-Si `IO.api` detecta que el sujeto de `explicit_subject by_data` no esta registrado completamente, debe:
-
-1. construir `frontdesk_handoff`;
-2. enviarlo a `SY.frontdesk.gov@<hive>`;
-3. esperar respuesta estructurada compatible con el envelope enviado;
-4. decidir si continua o no el mensaje original al `dst_final`.
-
-Casos normativos:
-
-- `success = true` -> continuar el mensaje original al `dst_final` y responder `202 Accepted`
-- `success = false` y `error_code = "missing_required_fields"` -> `422 Unprocessable Entity`
-- `success = false` y `error_code = "invalid_request"` -> `422 Unprocessable Entity`
-- `success = false` y `error_code = "identity_unavailable"` -> `503 Service Unavailable`
-- `success = false` y `error_code = "register_failed"` -> `502 Bad Gateway`
-- `success = false` con cualquier otro `error_code` o sin `error_code` -> `502 Bad Gateway`
-
-El body devuelto por `IO.api` en este camino depende del resultado:
-
-- `ok` -> envelope `accepted` del ingress comun;
-- `success = false` -> envelope estructurado HTTP de frontdesk:
-  - `success`
-  - `human_message`
-  - `error_code`
-
-En particular, `needs_input` no se trata como exito HTTP en `IO.api`, porque el modo API no continua conversacionalmente ni puede completar el registro interactuando con el caller.
-
-#### 8.3.3 Camino tecnico con `dst_node = SY.frontdesk.gov`
-
-Si el caller fija explicitamente `options.routing.dst_node = "SY.frontdesk.gov@..."`, `IO.api` conserva un camino tecnico/terminal:
-
-- construye `frontdesk_handoff`;
-- agrega `meta.context.response_envelope`;
-- espera respuesta estructurada compatible;
-- responde directamente con ese payload estructurado;
-- no reinyecta luego el mensaje original a otro `dst_final`.
-
-Este camino sirve para debug, validacion o integraciones muy especificas, pero no es el flujo canonico de producto.
-
-#### 8.3.4 Errores de transporte o integracion en el camino frontdesk
-
-Si existe handoff a frontdesk, tambien existen errores previos o laterales a la respuesta estructurada esperada:
-
-- timeout esperando la reply de frontdesk -> `504 Gateway Timeout` con `error_code = "frontdesk_timeout"`
-- reply recibida pero con payload no parseable como respuesta estructurada valida -> `502 Bad Gateway` con `error_code = "invalid_frontdesk_response"`
-- imposibilidad de enviar el handoff al router o indisponibilidad del canal de salida -> `503 Service Unavailable` con `error_code = "router_unavailable"`
-- cierre inesperado del waiter de reply antes de recibir respuesta valida -> `503 Service Unavailable` con `error_code = "frontdesk_unavailable"`
-
-Estos casos no representan resultado funcional de frontdesk; representan fallo de transporte o correlacion del handoff.
-
-### 8.4 Codigos de error recomendados
-
-- `400 Bad Request`
-- `401 Unauthorized`
-- `403 Forbidden`
-- `404 Not Found` para `ilk_does_not_exist`
-- `413 Payload Too Large`
-- `415 Unsupported Media Type`
-- `422 Unprocessable Entity`
-- `503 Service Unavailable`
-- `504 Gateway Timeout`
-
-### 8.5 Tipificacion inicial de errores HTTP
-
-Errores que conviene estandarizar desde esta fase:
-
-- `invalid_json`
-- `unauthorized`
-- `tenant_not_found`
-- `node_not_configured`
-- `invalid_payload`
-- `subject_identification_mode_invalid`
-- `subject_data_incomplete`
-- `ilk_does_not_exist`
-- `identity_unavailable`
-- `identity_timeout`
-- `frontdesk_timeout`
-- `invalid_frontdesk_response`
-- `router_unavailable`
-- `frontdesk_unavailable`
-- `unsupported_attachment_mime`
-- `attachment_too_large`
-- `attachments_too_large`
-
-Tratamiento recomendado:
-
-- `identity_timeout`: `504 Gateway Timeout`, cuando identity no responde dentro del tiempo esperado;
-- `identity_unavailable`: `503 Service Unavailable`, cuando identity esta inalcanzable, devuelve `UNREACHABLE`/`TTL_EXCEEDED` o el adapter no puede establecer la llamada requerida.
-
----
-
-## 9. `GET /`
-
-### 9.1 Objetivo
-
-`GET /` debe describir el contrato efectivo de la instancia en ejecucion.
-
-No debe devolver una union ambigua de todos los modos posibles del runtime.
-
-### 9.2 Contenido minimo esperado
-
-En estado configurado, debe devolver al menos:
-
-- estado efectivo;
-- nombre de instancia;
-- runtime;
-- `subject_mode` efectivo;
-- auth efectiva;
-- accepted content types;
-- campos requeridos y opcionales;
-- limites de tamano;
-- metadata de attachments;
-- metadata de relay;
-- metadata de secretos redacted;
-- fuente del tenant del request cuando aplique;
-- informacion suficiente para construir un `CONFIG_SET` valido o para integrar contra `POST /`.
-
-### 9.3 Relacion con Control Plane
-
-`GET /` es introspeccion HTTP del contrato de ingreso.
-
-No reemplaza:
-
-- `CONFIG_GET`
-- `CONFIG_SET`
-- `CONFIG_RESPONSE`
-
-El control plane sigue siendo el camino canonico para runtime/business config node-owned.
-
----
-
-## 10. Formas de request soportadas
-
-### 10.1 `application/json`
-
-Debe soportarse para casos sin archivos binarios.
-
-### 10.2 `multipart/form-data`
-
-Debe soportarse desde dia 0 para permitir attachments directos.
-
-Camino recomendado:
-
-- una parte `metadata` con JSON;
-- una o mas partes de archivo.
-
-### 10.3 Base64 en JSON
-
-No es el camino recomendado para v1.
-
----
-
-## 11. Estructura logica del request
-
-La estructura logica recomendada es:
-
-- `subject` o equivalente, segun `subject_mode`
-- `message`
-- `options` opcional
-
-Reglas:
-
-- `message` es obligatorio;
-- `subject` puede ser obligatorio, opcional o invalido segun `subject_mode`;
-- `options.routing.dst_node` puede overridear el destino Fluxbee por request;
-- `options.routing.dst_node` define el `dst_final` del request cuando viene presente;
-- `IO.api` puede intermediar frontdesk antes de llegar a ese `dst_final` si el sujeto no esta completo;
-- debe existir al menos uno de:
-  - `message.text`
-  - uno o mas attachments
-
----
-
-## 12. Attachments y blobs
-
-### 12.1 Principio
-
-Los archivos no deben circular internamente como binario inline una vez ingresados al sistema.
-
-`IO.api` debe materializarlos en blob storage y emitir referencias canonicas en el mensaje interno.
-
-### 12.2 Flujo
-
-1. el request HTTP ingresa con uno o mas archivos;
-2. `IO.api` valida limites y tipos;
-3. escribe en staging/local segun la implementacion de blobs vigente;
-4. promueve a estado consumible;
-5. construye `blob_ref` canonico;
-6. emite el mensaje interno con `attachments[]`.
-
-### 12.3 Regla de contrato
-
-El mensaje interno no debe transportar el binario inline.
-
-Debe transportar referencias canonicas compatibles con `text/v1`.
-
----
-
-## 13. Construccion del mensaje interno
-
-### 13.1 Regla general
-
-Luego de autenticar, validar y derivar el sujeto, `IO.api` debe construir un mensaje Fluxbee canonico.
-
-### 13.2 Carriers vigentes
-
-La implementacion debe seguir los carriers reales del repo:
-
-- identidad en `meta.src_ilk`
-- thread en `meta.thread_id`
-- metadata de canal bajo `meta.context.io.*`
-- payload textual canonico `text/v1`
-
-`IO.api` no debe usar wording conceptual viejo como sustituto de esos carriers reales.
-
-### 13.3 Salida al router
-
-El mensaje debe salir al router por `fluxbee_sdk::NodeSender::send`.
-
-`IO.api` no debe reimplementar localmente la decision `content` vs `content_ref` para `text/v1`.
-
-### 13.4 Relay antes del router
-
-El mensaje construido no se envia inmediatamente al router si la politica de relay indica consolidacion.
-
-Primero pasa por el relay comun de `io-common`.
-
-### 13.5 Camino especial de `frontdesk_handoff`
-
-Cuando `IO.api` detecta que el sujeto de `explicit_subject by_data` no esta registrado completamente, usa un contrato interno distinto antes de continuar al `dst_final`:
-
-- `payload.type = "frontdesk_handoff"`
-- `payload.schema_version = 1`
-- `payload.operation = "complete_registration"`
-- `payload.subject.*` con los datos del humano
-- `payload.tenant_id` con el tenant derivado de la API key
-- `payload.context` con metadata de integracion
-
-El carrier conserva:
-
-- `meta.src_ilk`
-- `meta.thread_id`
-- `meta.context.io.*`
-
-En este camino:
-
-- no se usa `text/v1` como payload hacia frontdesk;
-- `IO.api` agrega `meta.context.response_envelope` al mensaje hacia frontdesk;
-- `IO.api` espera una reply `payload.type = "text"` con JSON estructurado compatible con ese envelope;
-- si `success = true`, continua luego el mensaje original al `dst_final`;
-- si `success = false`, devuelve ese resultado estructurado por HTTP.
-
-Envelope concreto validado en este primer corte:
+The fixed Admin call is:
 
 ```json
 {
-  "kind": "json_object_v1",
-  "required": ["success", "human_message"],
-  "properties": {
-    "success": { "type": "boolean" },
-    "human_message": { "type": "string" },
-    "error_code": {
-      "type": "string",
-      "enum": [
-        "missing_required_fields",
-        "invalid_request",
-        "identity_unavailable",
-        "register_failed",
-        "unknown"
-      ]
+  "action": "externalize",
+  "params": {
+    "ich": "ich:<uuid>",
+    "edge_node": "SY.edge@ingress-1",
+    "inbound_family": "io.api.inbound.v1",
+    "auth_mode": "shared-secret",
+    "methods": ["POST"]
+  }
+}
+```
+
+The runtime reconciles periodically through `list_externalized`. It adopts an existing exact row
+without rotating its bearer. If the row disappeared while the process remains alive, IO.api
+re-externalizes with the token retained in memory. On first publication Admin mints the token.
+
+When channel or Edge changes, IO.api closes the previous route before opening the new one and
+disables the old ICH after `unexternalize`. `edge.publish=false` performs the teardown without
+opening a replacement. Normal process restart leaves the Edge row intact, matching IO.cloud and
+Edge warm-start behavior.
+
+## 4. Effective configuration
+
+Minimum configuration:
+
+```json
+{
+  "edge": {
+    "node": "SY.edge@ingress-1",
+    "publish": true
+  },
+  "io": {
+    "api_channel_id": "orders",
+    "dst_node": "AI.orders@worker-1",
+    "relay": {
+      "window_ms": 0,
+      "max_open_sessions": 10000,
+      "max_fragments_per_session": 8,
+      "max_bytes_per_session": 262144
+    }
+  },
+  "ingress": {
+    "subject_mode": "explicit_subject"
+  }
+}
+```
+
+`caller_is_subject` uses a principal fixed by the instance:
+
+```json
+{
+  "ingress": {
+    "subject_mode": "caller_is_subject",
+    "caller_identity": {
+      "external_user_id": "partner-service",
+      "display_name": "Partner service",
+      "email": "service@example.com"
     }
   }
 }
 ```
 
-Regla de semántica:
+Rules:
 
-- `error_code` es opcional por ausencia;
-- en v1 no debe enviarse como `null`;
-- si el campo está presente, debe ser `string`.
+- `edge.node` is a fully qualified `SY.edge@<hive>`.
+- `edge.publish` defaults to true.
+- `io.api_channel_id` is stable and at most 256 bytes.
+- `io.dst_node` is Admin-controlled and cannot be overridden per request.
+- `ingress.subject_mode` is `explicit_subject` or `caller_is_subject`.
+- `caller_is_subject` requires `ingress.caller_identity.external_user_id`.
+- Relay config follows the shared `io-common` contract.
+- `node.*` and `runtime.*` remain infrastructure sections and may require restart.
+- `node.frontdesk_target` (or `IO_API_FRONTDESK_TARGET`) is infrastructure wiring for the
+  intermediate registration handoff. It defaults to the canonical singleton
+  `SY.frontdesk.gov@motherbee`.
 
----
+The following old fields are rejected rather than ignored:
 
-## 14. Webhook outbound final
+- `listen`;
+- `auth` / `auth.api_keys`;
+- `integrations` / webhook configuration;
+- `blob` and multipart/attachment limits;
+- Edge credentials (`secret`, `token`, `token_ref`), methods, auth mode, inbound family or upstream.
 
-`IO.api` mantiene `POST /` asincronico con `202 Accepted`.
+## 5. Edge data contract
 
-El callback final se resuelve despues, cuando vuelve un mensaje terminal hacia `IO.api` con:
+Edge exposes only `POST /e/<ich>`. A request body must fit Edge's canonical 64 KiB message envelope.
+Edge validates the bearer, removes `Authorization`, parses JSON when possible and forwards:
 
-- `meta.context.io.reply_target.kind = "webhook_post"`
-- `reply_target.address = integration_id`
+```text
+meta.msg_type = io.api.inbound.v1
+meta.ich      = <instance ICH>
+routing.dst   = <resolved IO.api instance name>
+context       = {method:"POST", path:"/", query?, headers?}
+payload       = <JSON body>
+```
 
-Propiedades actuales de v1:
+IO.api validates again:
 
-- contrato externo propio de webhook, no exposicion cruda del payload interno de Fluxbee;
-- HMAC `SHA256` por integracion;
-- exito solo ante `2xx`;
-- retries acotados en memoria por proceso;
-- sin durabilidad cross-restart;
-- attachments inline con `content_base64`;
-- si el payload terminal no puede materializarse, se degrada a `result.status = "error"`.
+- router-stamped `src_l2_name` equals configured `edge.node`;
+- `meta.ich` equals the currently published own ICH;
+- family is `io.api.inbound.v1`;
+- context method is POST and path is `/`;
+- lifecycle is CONFIGURED and publication is active;
+- payload is a JSON object.
 
-Pendiente deliberado en v1:
+The node replies to the Edge UUID with the same trace and ICH. Edge returns that payload as HTTP
+200 JSON. Application failure is represented by `status=error` and `error_code`; transport failures
+remain Edge 502/504.
 
-- falta cerrar una politica formal del limite global del body HTTP webhook ya materializado.
+## 6. Request contract
 
----
+`explicit_subject by_data`:
 
-## 15. Operacion y despliegue
+```json
+{
+  "request_id": "optional-caller-id",
+  "subject": {
+    "external_user_id": "customer-42",
+    "display_name": "Ada Lovelace",
+    "email": "ada@example.com",
+    "phone": "+54...",
+    "company_name": "Example",
+    "attributes": {}
+  },
+  "message": {
+    "text": "Create the report",
+    "external_message_id": "msg-42",
+    "timestamp": "2026-07-19T12:00:00Z"
+  },
+  "options": {
+    "metadata": {"conversation_id":"case-9"},
+    "relay": {"final":true}
+  }
+}
+```
 
-### 15.1 Modelo
+`explicit_subject by_ilk` replaces subject data with an `ilk`. IO.api lists Identity ILKs and
+requires an exact `(ilk_id, instance tenant_id)` match. Unknown and cross-tenant ILKs return the
+same `subject_not_found` error.
 
-`IO.api` debe desplegarse como business node estandar del sistema.
+Prohibited request authority fields:
 
-Cada instancia debe crearse con:
+- `subject.tenant_id` and `subject.tenant_hint`;
+- `options.routing` and any `dst_node` override;
+- attachments or multipart data.
 
-- un `node_name` concreto;
-- el runtime `io.api`;
-- su bootstrap config;
-- sus secretos asociados.
+Large/generated files use the Blob toolchain and publication mechanism, not an Edge message frame.
 
-### 15.2 Multi-instancia
+## 7. Internal processing
 
-Para soportar multiples contratos simultaneos se recomienda levantar multiples instancias, no multiplexar contratos radicalmente distintos en una sola instancia.
+- Tenant always comes from `FLUXBEE_NODE_TENANT_ID`.
+- `caller_is_subject` identity comes from instance config.
+- `explicit_subject by_data` resolves/provisions through Identity.
+- Temporary/incomplete explicit subjects use the existing Frontdesk structured handoff. Frontdesk
+  must be `CONFIGURED`; its canonical `type=error` response is surfaced as
+  `frontdesk_unavailable`, not as a malformed response envelope.
+- The synchronous Frontdesk RPC accepts only a correlated `user` reply as success and classifies
+  `SYSTEM/UNREACHABLE` and `SYSTEM/TTL_EXCEEDED` as transport errors.
+- Message payload is canonical `text/v1`.
+- Conversation thread uses `PersistentChannel(api_channel_id, conversation_id)`.
+- Relay uses shared `io-common`; request routing override is always `None`.
+- Final outbound webhook delivery does not exist in this version.
 
----
+Accepted response example:
 
-## 16. Observabilidad
+```json
+{
+  "status": "accepted",
+  "accepted": true,
+  "request_id": "req_...",
+  "trace_id": "...",
+  "relay": "flushed_immediately",
+  "subject_ilk": "ilk:<uuid>",
+  "handled_by": "IO.api.orders@worker-1"
+}
+```
 
-`IO.api` deberia exponer como minimo:
+Error example:
 
-- requests aceptados;
-- requests rechazados por auth;
-- requests rechazados por schema;
-- relay holds y relay flushes;
-- attachments recibidos;
-- bytes ingresados;
-- errores de blob;
-- errores outbound webhook;
-- retries outbound webhook;
-- deliveries outbound agotados.
+```json
+{
+  "status": "error",
+  "error_code": "routing_override_forbidden",
+  "error_detail": "options.routing is not accepted; destination belongs to instance configuration"
+}
+```
 
-Logs recomendados:
+## 8. Control plane and status
 
-- `request_id`
-- `trace_id`
-- `node_name`
-- motivo de rechazo o aceptacion
+Only router-stamped configured Admin or Orchestrator origins may invoke `CONFIG_GET/SET`. The Router
+also treats the effective `CONFIG_GET` and `CONFIG_SET` verbs as protected SYSTEM actions.
 
-Sin incluir payload sensible completo ni secretos.
+Config replace is transactional: an invalid candidate does not destroy the last working config.
+Valid destination, relay, ingress and publication changes hot-apply. `node.*`/`runtime.*` changes are
+reported as restart-required.
 
----
+`CONFIG_GET` and successful `CONFIG_SET` include:
 
-## 17. Decisiones cerradas en esta version
+```json
+{
+  "runtime": {
+    "transport": "router_socket",
+    "public_frontier": "SY.edge",
+    "inbound_family": "io.api.inbound.v1",
+    "publication": {
+      "status": "published",
+      "ich": "ich:<uuid>",
+      "edge_node": "SY.edge@ingress-1",
+      "url": "/e/ich:<uuid>",
+      "credential_pending": false,
+      "last_error": null
+    }
+  }
+}
+```
 
-1. `IO.api` sera un nuevo tipo de nodo IO oficial.
-2. Su runtime sera generico, pero el contrato efectivo sera por configuracion de instancia.
-3. Debe soportar multiples instancias.
-4. Se recomienda una instancia por listener/contrato.
-5. Debe usar el relay comun de `io-common`.
-6. Debe soportar `api_key` como modo obligatorio en v1.
-7. El carrier recomendado para la API key es `Authorization: Bearer <token>`.
-8. Debe distinguir caller autenticado de sujeto conversacional.
-9. Debe soportar `explicit_subject` y `caller_is_subject` en v1.
-10. `subject_mode` es configuracion de instancia, no switch por request en v1.
-11. Debe exponer `POST /` y `GET /`.
-12. `POST /` es asincrono y responde `202 Accepted` cuando acepta el ingreso.
-13. `GET /` describe el contrato efectivo de la instancia.
-14. `POST /messages` y `GET /schema` pueden mantenerse como aliases legacy.
-14. Debe soportar attachments desde dia 0.
-15. El camino recomendado para attachments es `multipart/form-data`.
-16. Internamente, los archivos deben convertirse a blobs canonicos.
-17. La identidad sigue el pipeline comun de `io-common`.
-18. La configuracion del relay sigue `config.io.relay.*`.
-19. La configuracion runtime/business del nodo sigue `CONFIG_GET` / `CONFIG_SET`.
-20. Los carriers del mensaje interno deben seguir el protocolo real vigente del repo.
-21. Cada API key de `IO.api` es tenant-scoped y define el tenant efectivo del request.
-22. `tenant_hint` deja de ser parte del contrato HTTP de `IO.api`.
-23. `company_name` y `attributes` se tratan como metadata, no como tenancy.
-24. El callback final v1 usa `meta.context.io.reply_target` con `kind = "webhook_post"`.
-25. El webhook outbound se resuelve por integracion autenticada (`integration_id`), no por request.
-26. El contrato saliente del webhook es externo a Fluxbee y no reutiliza crudo el payload canónico interno.
-27. Los attachments outbound de v1 se entregan inline como `content_base64`.
-28. El delivery outbound v1 es best-effort en memoria con HMAC y retries acotados.
+Publication states are `unconfigured`, `published`, `disabled` or `error`.
 
----
+When Admin minted a new bearer, the successful `CONFIG_SET` response contains it once:
 
-## 18. Fuera de alcance para esta version
+```json
+{"runtime":{"publication":{"entry_token":"<bearer>","entry_token_one_time":true}}}
+```
 
-- `mapped_subject` completo;
-- HMAC y mTLS como auth obligatoria;
-- policy/OPA especifica para `IO.api`;
-- persistencia historica de respuestas outbound;
-- discovery remoto dinamico de mappings externos de sujetos.
+The caller must retain it for the external client. Later `CONFIG_GET` calls expose only
+`credential_pending`, never the bearer value.
 
----
+## 9. Security invariants
 
-## 19. Recomendacion de implementacion por fases
+1. No TCP listener or direct Internet route exists on IO.api.
+2. Edge is the only public auth and size frontier.
+3. Edge origin and own ICH are checked again in IO.api.
+4. Tenant comes only from managed instance identity.
+5. An explicit ILK must belong to that tenant.
+6. Public request data cannot choose the internal destination.
+7. Config contains neither a bearer nor a Vault reference; Admin owns credential creation.
+8. Only the owning IO node can externalize its ICH through Admin.
+9. One instance/ICH can be rotated or removed without changing another API instance.
+10. Multipart, arbitrary HTTP headers/status forwarding and outbound callback HTTP are absent.
 
-### Fase 1
+## 10. Operational flow
 
-- runtime `io.api`
-- configuracion de instancia
-- `POST /`
-- `GET /`
-- auth `api_key`
-- `subject_mode=explicit_subject`
-- `subject_mode=caller_is_subject`
-- `application/json`
-- `multipart/form-data`
-- attachments -> `blob_ref`
-- relay comun de `io-common`
-- sin callback final
+The canonical helper is `scripts/deploy-io-api.sh`. It performs:
 
-### Fase 2
+1. publish `io.api` and update the runtime manifest;
+2. spawn/restart the managed instance through Admin/Orchestrator;
+3. send the typed `CONFIG_SET` and capture a newly issued one-time bearer, when present;
+4. poll `control/config-get` until `runtime.publication.status=published`.
 
-- outbound webhook
-- HMAC outbound
-- retries/idempotencia outbound
-- `mapped_subject`
-- auth adicionales
+No local `/schema` or HTTP port probe is valid for this runtime.
+
+Current Edge v6 placement is constrained by `EDGE-H4`: ingress forwarding resolves one WAN hop.
+An IO.api instance must therefore run in a hive directly adjacent to its configured ingress Edge.
+Publishing a worker instance behind motherbee is valid control-plane state, but requests return
+`HANDLER_UNREACHABLE` until that worker has direct ingress adjacency or WAN multihop is implemented.
+
+Permanent removal is an ordered operation: apply `edge.publish=false`, stop the managed node with
+`DELETE /hives/{hive}/nodes/{node}`, wait until it is no longer router-visible, then call
+`DELETE /hives/{hive}/nodes/{node}/instance`. Killing a node alone intentionally preserves its
+instance and publication intent for restart recovery.

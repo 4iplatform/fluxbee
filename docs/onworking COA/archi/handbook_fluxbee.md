@@ -110,6 +110,26 @@ Rules:
 - `AI.chat@motherbee` is a node.
 - `ai.generic` is a runtime.
 
+### 2.3 Creating an Internet-facing `IO.api`
+
+`IO.api` is an instanced runtime, not a singleton service and not a direct HTTP listener. Each
+instance owns one ICH and publishes `/e/<ich>` through the configured `SY.edge`.
+
+Required sequence:
+
+1. Choose a tenant, unique node name, `api_channel_id`, fixed `dst_node` and Edge node.
+2. Spawn `runtime=io.api` through `run_node`; Orchestrator injects the instance ILK/tenant.
+3. Apply the Edge-native config without credentials. IO.api self-externalizes and `SY.admin` mints
+   and stores the Edge bearer through the canonical ingress flow.
+4. Capture `runtime.publication.entry_token` from the successful `CONFIG_SET` response when present;
+   it is a one-time delivery and must not be logged or requested through Vault.
+5. Read node `CONFIG_GET` until `runtime.publication.status=published`; return its `ich`/`url` and
+   the separately captured bearer to the operator.
+
+Do not generate `listen`, `auth.api_keys`, `integrations`, webhook, multipart or attachment config.
+Do not place tenant or `dst_node` in the public request. The full contract is
+`docs/io/io-api-node-spec.md`; the operational helper is `scripts/deploy-io-api.sh`.
+
 ---
 
 ## 3. Placement, Hive, and Scope

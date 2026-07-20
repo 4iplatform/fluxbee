@@ -138,9 +138,9 @@ Pendiente:
 
 Estado:
 
-- `IO.api.*`: pendiente de adopcion;
-- plan/checklist: parcialmente cumplidos;
-- criterio de aceptacion: parcialmente cubierto, a cerrar con runtime y durable.
+- `IO.api.*`: adoptado sobre `RelayBuffer` dentro del runtime Edge-native;
+- plan/checklist: implementado para passthrough y ventanas configurables;
+- pendiente operativo: validacion E2E durable en laboratorio.
 
 ---
 

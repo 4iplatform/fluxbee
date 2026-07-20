@@ -42,6 +42,8 @@ pub const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
     "REMOVE_NODE_INSTANCE",
     "NODE_CONFIG_SET",
     "NODE_CONFIG_GET",
+    "CONFIG_SET",
+    "CONFIG_GET",
     "NODE_STATE_GET",
     "NODE_STATUS_GET",
     "GET_VERSIONS",
@@ -90,6 +92,8 @@ pub fn is_protected_system_action(action: &str) -> bool {
 ///   the cross-hive control plane and must never be denied by a user layer.
 /// - `SY.admin` / `SY.wf-rules` / `WF.orch.diag`: same-hive control plane, all
 ///   protected actions.
+/// - `SY.admin@motherbee`: cross-hive `CONFIG_GET` / `CONFIG_SET` and runtime distribution,
+///   because the global Admin forwards those requests directly to managed nodes/orchestrators.
 /// - `SY.config-routes` / `SY.vault`: same-hive, ONLY for `NODE_STATUS_GET` — a
 ///   read-only health probe that SY.architect intentionally opens to these nodes;
 ///   honoring it here keeps one consistent probe policy across every receiver.
@@ -107,6 +111,13 @@ pub fn authority(action: &str, src_l2_name: Option<&str>, hive_id: &str) -> bool
     };
     if is_edge_service_action(action) {
         return role == "SY.admin" && hive == PRIMARY_HIVE_ID;
+    }
+    if matches!(
+        action,
+        "CONFIG_GET" | "CONFIG_SET" | "SYSTEM_UPDATE" | "SYSTEM_SYNC_HINT"
+    ) {
+        return role == "SY.admin" && hive == PRIMARY_HIVE_ID
+            || role == "SY.orchestrator" && !hive.is_empty();
     }
     if role == "SY.orchestrator" {
         // Any hive, but the hive label must be non-empty (rejects "SY.orchestrator@").
@@ -229,6 +240,9 @@ mod tests {
             "KILL_NODE",
             "NODE_STATUS_GET",
             "NODE_CONFIG_SET",
+            "CONFIG_SET",
+            "CONFIG_GET",
+            "SYSTEM_SYNC_HINT",
             "ADD_HIVE_FINALIZE",
             "SYSTEM_UPDATE",
         ];
@@ -414,7 +428,30 @@ mod tests {
     }
 
     #[test]
-    fn protected_set_is_the_23_actions() {
+    fn primary_admin_can_control_managed_nodes_cross_hive() {
+        for action in [
+            "CONFIG_GET",
+            "CONFIG_SET",
+            "SYSTEM_UPDATE",
+            "SYSTEM_SYNC_HINT",
+        ] {
+            assert!(authority(action, Some("SY.admin@motherbee"), "worker-220"));
+            assert!(!authority(
+                action,
+                Some("SY.admin@worker-220"),
+                "worker-220"
+            ));
+            assert!(!authority(action, Some("SY.admin@other"), "worker-220"));
+        }
+        assert!(!authority(
+            "SPAWN_NODE",
+            Some("SY.admin@motherbee"),
+            "worker-220"
+        ));
+    }
+
+    #[test]
+    fn protected_set_is_the_25_actions() {
         for action in [
             "SYSTEM_UPDATE",
             "SYSTEM_SYNC_HINT",
@@ -430,6 +467,8 @@ mod tests {
             "REMOVE_NODE_INSTANCE",
             "NODE_CONFIG_SET",
             "NODE_CONFIG_GET",
+            "CONFIG_SET",
+            "CONFIG_GET",
             "NODE_STATE_GET",
             "NODE_STATUS_GET",
             "GET_VERSIONS",
@@ -445,7 +484,7 @@ mod tests {
                 "{action} must be protected"
             );
         }
-        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 23);
+        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 25);
         for action in ["RUNTIME_UPDATE", "HELLO", "LSA", "", "TOTALLY_UNKNOWN"] {
             assert!(!is_protected_system_action(action));
         }

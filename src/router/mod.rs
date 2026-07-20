@@ -1338,7 +1338,7 @@ async fn handle_message(
     }
 
     if !senders.is_empty() {
-        if let Some(data) = serialize_for_local_delivery(memory_reader, hive_id, &msg).await? {
+        if let Some(data) = serialize_for_local_delivery(memory_reader, hive_id, &msg, false).await? {
             for sender in senders {
                 let _ = sender.send(data.clone());
             }
@@ -1564,7 +1564,7 @@ async fn fanout_taps_for_unicast(
                     );
                     continue;
                 }
-                let data = match serialize_for_local_delivery(memory_reader, hive_id, &copy).await {
+                let data = match serialize_for_local_delivery(memory_reader, hive_id, &copy, false).await {
                     Ok(Some(data)) => data,
                     Ok(None) => continue, // suppressed: protected SYSTEM from unauthorized origin
                     Err(err) => {
@@ -2880,9 +2880,23 @@ async fn handle_wan_message(
         let snapshot = ctx.lsa_snapshot.lock().await;
         find_remote_node(&snapshot, src_uuid)
     };
-    let Some(src_info) = src_info else {
-        return Ok(());
+    // Option B (multi-hop): a frame relayed via the hub carries the ORIGIN spoke's src, which is
+    // not in this router's directly-authenticated LSA snapshot. Fall back to the hub-vouched
+    // reachability table so the terminal gate ADMITS it for DATA delivery instead of silently
+    // dropping (the EDGE-H4 failure). The resulting src_info is `via_hub`, and SYSTEM authority is
+    // denied for it downstream in serialize_for_local_delivery — so this relaxation is data-plane
+    // only and cannot smuggle cross-hive control-plane authority.
+    let src_info = match src_info {
+        Some(info) => info,
+        None => {
+            let reach = ctx.reachability.lock().await;
+            match find_reachable_node(&reach, src_uuid) {
+                Some(info) => info,
+                None => return Ok(()),
+            }
+        }
     };
+    let src_via_hub = src_info.via_hub;
 
     // EDGE-01: bind the origin-hive to the mTLS-authenticated LSA bucket, not the
     // self-asserted node name. `src_info.hive_id` is the bucket the src UUID resolved in,
@@ -3184,7 +3198,7 @@ async fn handle_wan_message(
 
     if !senders.is_empty() {
         if let Some(data) =
-            serialize_for_local_delivery(&ctx.memory_reader, &ctx.hive_id, &msg).await?
+            serialize_for_local_delivery(&ctx.memory_reader, &ctx.hive_id, &msg, src_via_hub).await?
         {
             for sender in senders {
                 let _ = sender.send(data.clone());
@@ -3976,7 +3990,7 @@ async fn handle_peer_message(
     }
 
     if !senders.is_empty() {
-        if let Some(data) = serialize_for_local_delivery(memory_reader, hive_id, &msg).await? {
+        if let Some(data) = serialize_for_local_delivery(memory_reader, hive_id, &msg, false).await? {
             for sender in senders {
                 let _ = sender.send(data.clone());
             }
@@ -5892,6 +5906,7 @@ async fn serialize_for_local_delivery(
     memory_reader: &Arc<Mutex<Option<MemoryRegionReader>>>,
     hive_id: &str,
     msg: &Message,
+    src_via_hub: bool,
 ) -> Result<Option<Vec<u8>>, RouterError> {
     if is_system_kind(&msg.meta.msg_type) {
         // OPA-dual SYSTEM (authority) layer: the baked, non-user-editable Rego policy
@@ -5900,16 +5915,28 @@ async fn serialize_for_local_delivery(
         // (The user/OPA layer handles routing and, in future, may only narrow this — never
         // broaden it.)
         let action = msg.meta.msg.as_deref().unwrap_or_default();
-        if system_policy::is_protected_system_action(action)
-            && !system_policy::authorize_system(action, msg.routing.src_l2_name.as_deref(), hive_id)
-        {
-            tracing::warn!(
-                action = action,
-                src_uuid = %msg.routing.src,
-                src_l2_name = ?msg.routing.src_l2_name,
-                "router dropped protected SYSTEM action from unauthorized origin"
-            );
-            return Ok(None);
+        if system_policy::is_protected_system_action(action) {
+            // Option B security invariant: a src learned TRANSITIVELY via the hub's reachability
+            // vouch (`src_via_hub`) is admitted for DATA delivery but NEVER granted SYSTEM
+            // authority — it is denied here WITHOUT consulting authority()/the allow policy, so a
+            // compromised hub cannot fabricate cross-hive control-plane authority between spokes.
+            // A directly-authenticated src still goes through the normal authority gate.
+            let authorized = !src_via_hub
+                && system_policy::authorize_system(
+                    action,
+                    msg.routing.src_l2_name.as_deref(),
+                    hive_id,
+                );
+            if !authorized {
+                tracing::warn!(
+                    action = action,
+                    src_uuid = %msg.routing.src,
+                    src_l2_name = ?msg.routing.src_l2_name,
+                    src_via_hub = src_via_hub,
+                    "router dropped protected SYSTEM action from unauthorized origin"
+                );
+                return Ok(None);
+            }
         }
     }
     let mut enriched = msg.clone();

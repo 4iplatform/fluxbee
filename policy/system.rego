@@ -33,6 +33,10 @@ default allow := false
 # Edge service commands (open/close/list URLs): only SY.admin on the primary hive.
 edge_service_actions := {"EDGE_OPEN_URL", "EDGE_CLOSE_URL", "EDGE_LIST_URLS", "EDGE_PUBLISH_BLOB", "EDGE_UNPUBLISH_BLOB"}
 
+# Live node config and runtime distribution are forwarded directly by the singleton Admin to
+# managed nodes or orchestrators on workers.
+node_control_actions := {"CONFIG_GET", "CONFIG_SET", "SYSTEM_UPDATE", "SYSTEM_SYNC_HINT"}
+
 # Parse "<role>@<hive>" from the router-authoritative (already-stamped) src_l2_name, splitting
 # on the FIRST '@' (mirrors Rust split_once('@')). Undefined when the name is empty or has no
 # '@' with a non-empty role — which makes every allow rule below fail -> default false.
@@ -58,22 +62,30 @@ allow if {
 	parsed.hive == "motherbee"
 }
 
-# (2) SY.orchestrator@<any non-empty hive> — the cross-hive control plane (system-final).
+# (2) The primary Admin may forward managed-node config and runtime distribution cross-hive.
+allow if {
+	input.action in node_control_actions
+	parsed.role == "SY.admin"
+	parsed.hive == "motherbee"
+}
+
+# (3) SY.orchestrator@<any non-empty hive> — the cross-hive control plane (system-final).
 allow if {
 	not input.action in edge_service_actions
 	parsed.role == "SY.orchestrator"
 	parsed.hive != ""
 }
 
-# (3) Same-hive privileged control-plane roles, all protected actions.
+# (4) Same-hive privileged control-plane roles, all protected actions.
 allow if {
 	not input.action in edge_service_actions
+	not input.action in node_control_actions
 	parsed.role != "SY.orchestrator"
 	parsed.hive == input.hive_id
 	parsed.role in {"SY.admin", "SY.wf-rules", "WF.orch.diag"}
 }
 
-# (4) Read-only health probe opened to config/vault, same hive only (never mutations).
+# (5) Read-only health probe opened to config/vault, same hive only (never mutations).
 allow if {
 	not input.action in edge_service_actions
 	parsed.role != "SY.orchestrator"

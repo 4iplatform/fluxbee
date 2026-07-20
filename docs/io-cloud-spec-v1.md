@@ -300,9 +300,9 @@ no para authz de lectura. **Riesgo:** el aislamiento de secretos por-ilk descans
 2. **Runtime de producto.** No existe `io.wapp`; debe implementarse y publicarse antes de lanzar ese
    adaptador. Los runtimes existentes sí pueden provisionarse con el relay genérico.
 3. **Consumo del secreto por el runtime.** `put_token` deja el token disponible en Vault; cada runtime
-   específico debe leerlo con los helpers Vault canónicos. Esto no crea automáticamente una
-   `token_ref` en configuraciones de runtimes existentes; por ejemplo, `IO.api` conserva hoy su
-   contrato inline/`local_file:`.
+   específico debe leerlo con los helpers Vault canónicos. `IO.api` es una excepción deliberada:
+   su bearer de ingreso no viene de `put_token` ni de config, sino que Admin lo genera durante
+   `externalize` y lo dedica al Edge.
 4. **Transacción compuesta de provisioning.** Las tres primitivas son funcionales, pero no hay rollback
    atómico create_tenant→token→spawn→externalize ante fallas intermedias.
 5. **`IO.archi` (caso 2, diferido — "ahora no"):** forwarding HTTP per-tenant a `SY.architect` (`:3000`)

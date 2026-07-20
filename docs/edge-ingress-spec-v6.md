@@ -165,7 +165,7 @@ IO node (e.g. IO.cloud) ── externalize {ich, inbound_family, auth_mode} ─�
    admin:
      ├─ grant check: src_l2_name starts with "IO."                 ◄── I1
      ├─ resolve ICH → owner_l2_name (identity SHM) ; owner == src_l2_name?   ◄── I8, one-to-one
-     ├─ if auth_mode=shared-secret: mint token → vault_put owned-by node ilk (§8)
+     ├─ if auth_mode=shared-secret: mint token → vault_put owned by target Edge (§8)
      ├─ record durable binding (inside the mesh, §12)
      └─ EDGE_OPEN_URL {row} ──► SY.edge@<ingress-hive>    # addressed service command (§7.6)
           admin BLOCKS on EDGE_OPEN_URL_RESPONSE           # the URL is "published" only once the edge acks
@@ -288,6 +288,27 @@ changed live; `config-set listen` → `restart_required:[listen]`; `config-get` 
 - Lives **inside the mesh, not in the DMZ hive** — must not share blast radius with the edge.
 - Deferred para producción: el end-user ilk/subject dentro del comando y `SY.policy` sobre
   `(IO.cloud transport principal) + (user ilk subject)`.
+
+### 10.1 `IO.api` - instancias publicas sobre el mismo circuito
+
+`IO.api` adopta el circuito de esta spec sin agregar una segunda superficie HTTP:
+
+- es un runtime dinamico `io.api`, instanciado por Orchestrator como los nodos AI;
+- cada instancia recibe ILK/tenant, registra un `api_channel_id` propio y obtiene un ICH distinto;
+- pide `externalize` sin credencial para que Admin genere y persista el bearer canonico;
+- se auto-externaliza como `shared-secret`, `POST` only, familia `io.api.inbound.v1`;
+- no abre listener TCP/HTTP y recibe exclusivamente el mensaje Edge por router socket;
+- vuelve a verificar `src_l2_name == edge configurado` y `meta.ich == ICH propio`;
+- tenant y destino pertenecen a la instancia; el request no puede inyectarlos;
+- varias instancias pueden publicar varias URLs en el mismo Edge porque el registry ya esta
+  indexado por ICH y Admin verifica ownership uno-a-uno.
+
+El token nuevo se entrega una sola vez en la respuesta autorizada de `CONFIG_SET`; no forma parte
+del config ni se expone por `CONFIG_GET`. El reconcile adopta una fila Edge existente sin rotarla y
+solo vuelve a externalizar cuando falta o deriva del contrato fijo.
+
+El contrato viejo de API keys internas, multipart y webhook HTTP fue eliminado para mantener el
+envelope de 64 KiB y el Edge como unica frontera de red. Ver `docs/io/io-api-node-spec.md`.
 
 ---
 

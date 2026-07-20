@@ -4008,6 +4008,10 @@ fn ensure_dirs(
     fs::create_dir_all(dist.path.join("runtimes"))?;
     fs::create_dir_all(dist.path.join("core").join("bin"))?;
     fs::create_dir_all(dist.path.join("vendor"))?;
+    if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
+        let service_user = resolve_syncthing_service_user(blob)?;
+        ensure_owned_tree(&dist.path, &service_user)?;
+    }
     fs::create_dir_all(runtimes_root())?;
     fs::create_dir_all(Path::new(DIST_CORE_BIN_SOURCE_DIR))?;
     fs::create_dir_all(Path::new(DIST_VENDOR_ROOT_DIR))?;
@@ -4143,6 +4147,28 @@ fn ensure_owned_dir(path: &Path, user: &str) -> Result<(), OrchestratorError> {
     let mut chown = Command::new("chown");
     chown.arg(format!("{user}:{group}")).arg(path);
     run_cmd(chown, "chown syncthing dir ownership")
+}
+
+fn ensure_owned_tree(path: &Path, user: &str) -> Result<(), OrchestratorError> {
+    ensure_dir_permissions_0750(path)?;
+    let group = linux_user_primary_group(user).unwrap_or_else(|| user.to_string());
+    let mut chown = Command::new("chown");
+    chown.arg("-R").arg(format!("{user}:{group}")).arg(path);
+    run_cmd(chown, "chown syncthing tree ownership")
+}
+
+fn ensure_owned_file(path: &Path, user: &str) -> Result<(), OrchestratorError> {
+    if !path.is_file() {
+        return Err(format!(
+            "syncthing ownership target is not a file: {}",
+            path.display()
+        )
+        .into());
+    }
+    let group = linux_user_primary_group(user).unwrap_or_else(|| user.to_string());
+    let mut chown = Command::new("chown");
+    chown.arg(format!("{user}:{group}")).arg(path);
+    run_cmd(chown, "chown syncthing file ownership")
 }
 
 fn syncthing_binary_available() -> bool {
@@ -5130,7 +5156,7 @@ fn ensure_syncthing_installed() -> Result<(), OrchestratorError> {
     Ok(())
 }
 
-fn ensure_local_syncthing_vendor_layout() -> Result<(), OrchestratorError> {
+fn ensure_local_syncthing_vendor_layout(service_user: &str) -> Result<(), OrchestratorError> {
     if !Path::new(SYNCTHING_INSTALL_PATH).exists() {
         return Err("syncthing installed binary missing while ensuring vendor layout".into());
     }
@@ -5151,6 +5177,7 @@ fn ensure_local_syncthing_vendor_layout() -> Result<(), OrchestratorError> {
             DIST_SYNCTHING_VENDOR_SOURCE_PATH
         ),
     )?;
+    ensure_owned_file(target_path, service_user)?;
     Ok(())
 }
 
@@ -6319,7 +6346,8 @@ async fn ensure_blob_sync_runtime(
     let repaired_markers = ensure_syncthing_folder_markers(blob, dist)?;
 
     ensure_syncthing_installed()?;
-    ensure_local_syncthing_vendor_layout()?;
+    let service_user = resolve_syncthing_service_user(&sync)?;
+    ensure_local_syncthing_vendor_layout(&service_user)?;
     ensure_syncthing_unit(&sync)?;
     ensure_syncthing_firewall_local();
     tracing::info!(
@@ -14603,15 +14631,15 @@ async fn remove_node_instance_flow(
 async fn delete_ilk_for_teardown(
     state: &OrchestratorState,
     ilk_id: &str,
-    target_hive: &str,
+    _target_hive: &str,
 ) -> serde_json::Value {
-    let admin_target = ensure_l2_name("SY.admin", target_hive);
+    let admin_target = teardown_admin_target();
     let response = orchestrator_admin_command(
         state,
         AdminCommandRequest {
             admin_target: &admin_target,
             action: "delete_ilk",
-            target: Some(target_hive),
+            target: Some(PRIMARY_HIVE_ID),
             params: serde_json::json!({ "ilk_id": ilk_id }),
             request_id: None,
             timeout: Duration::from_secs(15),
@@ -14660,17 +14688,21 @@ async fn delete_ilk_for_teardown(
 async fn delete_ilk_for_teardown(
     _state: &OrchestratorState,
     ilk_id: &str,
-    target_hive: &str,
+    _target_hive: &str,
 ) -> serde_json::Value {
     if let Some(canned) = take_test_ilk_delete_result() {
         return canned;
     }
     serde_json::json!({
         "status": "ok",
-        "target": ensure_l2_name("SY.admin", target_hive),
+        "target": teardown_admin_target(),
         "ilk_id": ilk_id,
         "deleted": true,
     })
+}
+
+fn teardown_admin_target() -> String {
+    ensure_l2_name("SY.admin", PRIMARY_HIVE_ID)
 }
 
 #[cfg(test)]
@@ -14692,7 +14724,7 @@ fn take_test_ilk_delete_result() -> Option<serde_json::Value> {
         .take()
 }
 
-/// Routes vault list+delete through `SY.admin@<target_hive>` to purge every
+/// Routes vault list+delete through the singleton primary Admin to purge every
 /// secret whose metadata is dedicated to `ilk_id`. List is open in vault, but
 /// delete requires admin-class privileges (the doomed ILK no longer exists at
 /// teardown time and cannot self-delete), so this helper consistently uses the
@@ -14706,15 +14738,15 @@ fn take_test_ilk_delete_result() -> Option<serde_json::Value> {
 async fn purge_vault_secrets_for_ilk(
     state: &OrchestratorState,
     ilk_id: &str,
-    target_hive: &str,
+    _target_hive: &str,
 ) -> serde_json::Value {
-    let admin_target = ensure_l2_name("SY.admin", target_hive);
+    let admin_target = teardown_admin_target();
     let list_resp = match orchestrator_admin_command(
         state,
         AdminCommandRequest {
             admin_target: &admin_target,
             action: "vault_list",
-            target: Some(target_hive),
+            target: Some(PRIMARY_HIVE_ID),
             params: serde_json::json!({ "filter": { "ilk": ilk_id } }),
             request_id: None,
             timeout: Duration::from_secs(15),
@@ -14778,7 +14810,7 @@ async fn purge_vault_secrets_for_ilk(
             AdminCommandRequest {
                 admin_target: &admin_target,
                 action: "vault_delete",
-                target: Some(target_hive),
+                target: Some(PRIMARY_HIVE_ID),
                 params: serde_json::json!({ "key": key }),
                 request_id: None,
                 timeout: Duration::from_secs(10),
@@ -14821,14 +14853,14 @@ async fn purge_vault_secrets_for_ilk(
 async fn purge_vault_secrets_for_ilk(
     _state: &OrchestratorState,
     ilk_id: &str,
-    target_hive: &str,
+    _target_hive: &str,
 ) -> serde_json::Value {
     if let Some(canned) = take_test_vault_purge_result() {
         return canned;
     }
     serde_json::json!({
         "status": "ok",
-        "target": ensure_l2_name("SY.admin", target_hive),
+        "target": teardown_admin_target(),
         "ilk_id": ilk_id,
         "scanned": 0,
         "deleted": 0,
@@ -24408,6 +24440,19 @@ blob:
             response["routing_references"]["taps"],
             serde_json::json!([])
         );
+    }
+
+    #[tokio::test]
+    async fn worker_teardown_uses_primary_admin_for_identity_and_vault() {
+        let _guard = teardown_test_serial_guard();
+        let state = sample_orchestrator_state_for_tests();
+        let ilk_id = "ilk:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+
+        let ilk_delete = delete_ilk_for_teardown(&state, ilk_id, "worker1").await;
+        let vault_purge = purge_vault_secrets_for_ilk(&state, ilk_id, "worker1").await;
+
+        assert_eq!(ilk_delete["target"], "SY.admin@motherbee");
+        assert_eq!(vault_purge["target"], "SY.admin@motherbee");
     }
 
     fn ilk_map_tmp_dir(label: &str) -> PathBuf {

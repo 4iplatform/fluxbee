@@ -147,8 +147,8 @@ La secuencia propuesta busca:
 - [x] RER-R7.3 Adjuntar ese envelope al mensaje hacia el nodo target sin mezclarlo con payload de negocio.
 - [ ] RER-R7.3.b Preservar `final_response_contract` cuando `IO.api` espere una respuesta final recompuesta tras hops intermedios.
 - [x] RER-R7.4 Esperar la respuesta y parsearla con helpers de `io-common`.
-- [x] RER-R7.5 Mapear la respuesta estructurada al contrato HTTP de `IO.api`.
-- [x] RER-R7.6 Mantener el caso v1 con status HTTP acotados, sin expandir todavía la taxonomía fina.
+- [x] RER-R7.5 Mapear la respuesta estructurada al payload JSON que IO.api devuelve por Edge.
+- [x] RER-R7.6 Mantener el caso v1 con errores de aplicación dentro del payload JSON de Edge.
 - [x] RER-R7.7 Asegurar que `IO.api` no asuma soporte universal del envelope en cualquier nodo target.
 
 ---

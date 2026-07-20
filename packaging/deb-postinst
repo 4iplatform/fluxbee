@@ -19,7 +19,10 @@ for d in state/nodes state/cookbook state/sy-admin state/sy-edge hives opa/curre
     install -d "/var/lib/fluxbee/$d"
 done
 install -d /run/fluxbee/routers
-chown -R fluxbee:fluxbee /var/lib/fluxbee/syncthing /var/lib/fluxbee/blob 2>/dev/null || true
+chown -R fluxbee:fluxbee \
+    /var/lib/fluxbee/syncthing \
+    /var/lib/fluxbee/blob \
+    /var/lib/fluxbee/dist 2>/dev/null || true
 
 # Seed a config if none exists yet (the operator edits this before first-boot).
 if [ ! -f /etc/fluxbee/hive.yaml ] && [ -f /etc/fluxbee/hive.yaml.example ]; then

@@ -10,60 +10,53 @@ Usage:
   deploy-io-api.sh --base <url> --hive-id <id> --version <ver> [options]
 
 Required:
-  --base <url>                 Admin API base URL (example: http://127.0.0.1:8080)
-  --hive-id <id>               Target hive ID (example: motherbee)
-  --version <ver>              Runtime version to publish (example: 0.1.0)
+  --base <url>                 SY.admin HTTP base URL
+  --hive-id <id>               Hive where the IO.api instance runs
+  --version <ver>              io.api runtime version to publish
 
-Options:
-  --node-name <name@hive>      If provided, script will also spawn/restart node
+Instance options:
+  --node-name <name@hive>      Spawn or update one managed IO.api instance
+  --tenant-id <tnt:uuid>       Tenant injected by Orchestrator (required for new spawn)
+  --config-json <file>         Complete Edge-native IO.api config
+  --edge-node <SY.edge@hive>   Convenience config builder: Edge owner of the public URL
+  --api-channel-id <id>        Stable channel address used to create the instance ICH
+  --dst-node <name>            Fixed internal destination; requests cannot override it
+  --subject-mode <mode>        explicit_subject or caller_is_subject (default: explicit_subject)
+  --caller-external-id <id>    Required when subject-mode=caller_is_subject
+  --publish <true|false>       Desired Edge publication state (default: true)
+  --relay-window-ms <ms>       Relay window (default: 0, immediate passthrough)
+
+Runtime/update options:
   --runtime <name>             Runtime key (default: io.api)
-  --runtime-version <ver>      Runtime version for spawn payload (default: current)
+  --runtime-version <ver>      Version selected by spawn (default: current)
   --update-scope <targeted|global>
-                               SYSTEM_UPDATE scope (default: targeted)
-  --tenant-id <id>             Tenant ID for spawn identity registration (required in some hives)
-  --config-json <file>         JSON file with spawn config object
-  --listen-address <addr>      Convenience: set listen.address in spawn config
-  --listen-port <port>         Convenience: set listen.port in spawn config
-  --dst-node <name>            Convenience: set io.dst_node in spawn config
-  --blob-root <path>           Convenience: set blob.path in spawn config
-  --identity-target <name>     Convenience: add identity_target to spawn config
-  --identity-timeout-ms <ms>   Convenience: add identity_timeout_ms to spawn config
-  --api-key <token>            Apply business config via CONFIG_SET with this bearer token
-                               (default: $API_KEY from environment if set)
-  --api-key-id <id>            key_id for auth.api_keys[] (default: support-main)
-  --relay-window-ms <ms>       io.relay.window_ms for CONFIG_SET (default: 300000)
-  --relay-max-open-sessions <n>
-                               io.relay.max_open_sessions (default: 10000)
-  --relay-max-fragments <n>    io.relay.max_fragments_per_session (default: 8)
-  --relay-max-bytes <n>        io.relay.max_bytes_per_session (default: 262144)
-  --skip-config-set            Skip CONFIG_SET/restart/schema validation step
-  --spawn                      Force spawn step (requires --node-name and config source)
-  --update-existing            Existing node code update: reuse current config + restart unit (spawn only if unit missing)
-  --skip-spawn                 Skip spawn step (default unless --node-name is set)
-  --kill-first                 If spawning, call DELETE node before POST node
-  --reuse-existing-config      When spawning, fetch config from GET /hives/{id}/nodes/{name}/config
-  --sync-hint                  Run sync-hint before each update attempt
-  --update-retries <n>         Retries when update returns sync_pending (default: 8)
-  --retry-delay-s <seconds>    Delay between retries (default: 2)
-  --allow-sync-pending         Continue deploy even if update stays in sync_pending after retries
-  --sudo                       Pass --sudo to publish script
-  --skip-build                 Pass --skip-build to publish script
-  --dist-root <path>           Pass --dist-root to publish script
-  --log-file <path>            Log file path (default: /tmp/deploy-io-api-<ts>.log)
+  --spawn                      Force spawn (implied by --node-name unless --update-existing)
+  --update-existing            Restart an existing unit on the new runtime before CONFIG_SET
+  --kill-first                 Delete the managed node before spawning it
+  --skip-spawn                 Publish/update only
+  --skip-config-set            Do not send the typed config to the running node
+  --sync-hint                  Wait for dist sync before update attempts
+  --update-retries <n>         Default: 8
+  --retry-delay-s <seconds>    Default: 2
+  --allow-sync-pending         Continue when runtime sync remains pending
+  --dist-root <path>           Dist root passed to publish helper
+  --sudo                       Use sudo for local publish/restart operations
+  --skip-build                 Reuse an existing io-api release binary
+  --log-file <path>            Deployment log path
   -h, --help                   Show help
 
-Notes:
-  - The script parses manifest_version/manifest_hash from publish output automatically.
-  - On update status=sync_pending, it retries according to --update-retries.
-  - Default spawn config may be empty and leaves business config to CONFIG_SET.
+The runtime exposes no local HTTP port. Readiness is checked through
+POST /hives/{hive}/nodes/{node}/control/config-get and runtime.publication.status.
+SY.admin mints the Edge bearer. When newly issued, this helper prints it once without
+writing it to the deployment log.
 EOF
 }
 
 require_cmd() {
-  if ! command -v "$1" >/dev/null 2>&1; then
+  command -v "$1" >/dev/null 2>&1 || {
     echo "Error: missing command: $1" >&2
     exit 1
-  fi
+  }
 }
 
 BASE=""
@@ -72,34 +65,28 @@ VERSION=""
 RUNTIME="io.api"
 RUNTIME_VERSION="current"
 UPDATE_SCOPE="targeted"
-TENANT_ID=""
 NODE_NAME=""
+TENANT_ID=""
 CONFIG_JSON=""
-LISTEN_ADDRESS=""
-LISTEN_PORT=""
+EDGE_NODE=""
+API_CHANNEL_ID=""
 DST_NODE=""
-BLOB_ROOT=""
-IDENTITY_TARGET=""
-IDENTITY_TIMEOUT_MS=""
-API_KEY_VALUE="${API_KEY:-}"
-API_KEY_ID="support-main"
-RELAY_WINDOW_MS="300000"
-RELAY_MAX_OPEN_SESSIONS="10000"
-RELAY_MAX_FRAGMENTS="8"
-RELAY_MAX_BYTES="262144"
-SKIP_CONFIG_SET=0
+SUBJECT_MODE="explicit_subject"
+CALLER_EXTERNAL_ID=""
+PUBLISH="true"
+RELAY_WINDOW_MS="0"
 DO_SPAWN=0
-FORCE_SKIP_SPAWN=0
-KILL_FIRST=0
-REUSE_EXISTING_CONFIG=0
 UPDATE_EXISTING=0
+KILL_FIRST=0
+SKIP_SPAWN=0
+SKIP_CONFIG_SET=0
 USE_SYNC_HINT=0
 UPDATE_RETRIES=8
 RETRY_DELAY_S=2
 ALLOW_SYNC_PENDING=0
+DIST_ROOT=""
 USE_SUDO=0
 SKIP_BUILD=0
-DIST_ROOT=""
 LOG_FILE="/tmp/deploy-io-api-$(date +%Y%m%d-%H%M%S).log"
 
 while [[ $# -gt 0 ]]; do
@@ -110,34 +97,28 @@ while [[ $# -gt 0 ]]; do
     --runtime) RUNTIME="${2:-}"; shift 2 ;;
     --runtime-version) RUNTIME_VERSION="${2:-}"; shift 2 ;;
     --update-scope) UPDATE_SCOPE="${2:-}"; shift 2 ;;
-    --tenant-id) TENANT_ID="${2:-}"; shift 2 ;;
     --node-name) NODE_NAME="${2:-}"; shift 2 ;;
+    --tenant-id) TENANT_ID="${2:-}"; shift 2 ;;
     --config-json) CONFIG_JSON="${2:-}"; shift 2 ;;
-    --listen-address) LISTEN_ADDRESS="${2:-}"; shift 2 ;;
-    --listen-port) LISTEN_PORT="${2:-}"; shift 2 ;;
+    --edge-node) EDGE_NODE="${2:-}"; shift 2 ;;
+    --api-channel-id) API_CHANNEL_ID="${2:-}"; shift 2 ;;
     --dst-node) DST_NODE="${2:-}"; shift 2 ;;
-    --blob-root) BLOB_ROOT="${2:-}"; shift 2 ;;
-    --identity-target) IDENTITY_TARGET="${2:-}"; shift 2 ;;
-    --identity-timeout-ms) IDENTITY_TIMEOUT_MS="${2:-}"; shift 2 ;;
-    --api-key) API_KEY_VALUE="${2:-}"; shift 2 ;;
-    --api-key-id) API_KEY_ID="${2:-}"; shift 2 ;;
+    --subject-mode) SUBJECT_MODE="${2:-}"; shift 2 ;;
+    --caller-external-id) CALLER_EXTERNAL_ID="${2:-}"; shift 2 ;;
+    --publish) PUBLISH="${2:-}"; shift 2 ;;
     --relay-window-ms) RELAY_WINDOW_MS="${2:-}"; shift 2 ;;
-    --relay-max-open-sessions) RELAY_MAX_OPEN_SESSIONS="${2:-}"; shift 2 ;;
-    --relay-max-fragments) RELAY_MAX_FRAGMENTS="${2:-}"; shift 2 ;;
-    --relay-max-bytes) RELAY_MAX_BYTES="${2:-}"; shift 2 ;;
-    --skip-config-set) SKIP_CONFIG_SET=1; shift ;;
     --spawn) DO_SPAWN=1; shift ;;
     --update-existing) UPDATE_EXISTING=1; shift ;;
-    --skip-spawn) FORCE_SKIP_SPAWN=1; shift ;;
     --kill-first) KILL_FIRST=1; shift ;;
-    --reuse-existing-config) REUSE_EXISTING_CONFIG=1; shift ;;
+    --skip-spawn) SKIP_SPAWN=1; shift ;;
+    --skip-config-set) SKIP_CONFIG_SET=1; shift ;;
     --sync-hint) USE_SYNC_HINT=1; shift ;;
     --update-retries) UPDATE_RETRIES="${2:-}"; shift 2 ;;
     --retry-delay-s) RETRY_DELAY_S="${2:-}"; shift 2 ;;
     --allow-sync-pending) ALLOW_SYNC_PENDING=1; shift ;;
+    --dist-root) DIST_ROOT="${2:-}"; shift 2 ;;
     --sudo) USE_SUDO=1; shift ;;
     --skip-build) SKIP_BUILD=1; shift ;;
-    --dist-root) DIST_ROOT="${2:-}"; shift 2 ;;
     --log-file) LOG_FILE="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Error: unknown option: $1" >&2; usage; exit 1 ;;
@@ -149,405 +130,20 @@ if [[ -z "$BASE" || -z "$HIVE_ID" || -z "$VERSION" ]]; then
   usage
   exit 1
 fi
-
-case "$UPDATE_SCOPE" in
-  targeted|global) ;;
-  *)
-    echo "Error: --update-scope must be targeted or global (got '$UPDATE_SCOPE')" >&2
-    exit 1
-    ;;
-esac
-
-if [[ "$FORCE_SKIP_SPAWN" == "1" ]]; then
-  DO_SPAWN=0
-elif [[ -n "$NODE_NAME" ]]; then
+case "$UPDATE_SCOPE" in targeted|global) ;; *) echo "Error: invalid --update-scope" >&2; exit 1 ;; esac
+case "$SUBJECT_MODE" in explicit_subject|caller_is_subject) ;; *) echo "Error: invalid --subject-mode" >&2; exit 1 ;; esac
+case "$PUBLISH" in true|false) ;; *) echo "Error: --publish must be true or false" >&2; exit 1 ;; esac
+if [[ "$SUBJECT_MODE" == "caller_is_subject" && -z "$CALLER_EXTERNAL_ID" && -z "$CONFIG_JSON" ]]; then
+  echo "Error: caller_is_subject requires --caller-external-id" >&2
+  exit 1
+fi
+if [[ -n "$NODE_NAME" && "$SKIP_SPAWN" != "1" && "$UPDATE_EXISTING" != "1" ]]; then
   DO_SPAWN=1
 fi
-
-if [[ "$UPDATE_EXISTING" == "1" ]]; then
-  if [[ -z "$NODE_NAME" ]]; then
-    echo "Error: --update-existing requires --node-name" >&2
-    exit 1
-  fi
-  DO_SPAWN=0
-  KILL_FIRST=0
-  REUSE_EXISTING_CONFIG=1
+if [[ "$UPDATE_EXISTING" == "1" && -z "$NODE_NAME" ]]; then
+  echo "Error: --update-existing requires --node-name" >&2
+  exit 1
 fi
-
-mkdir -p "$(dirname "$LOG_FILE")"
-touch "$LOG_FILE"
-
-log() {
-  local msg="$1"
-  echo "[$(date -Iseconds)] $msg" | tee -a "$LOG_FILE"
-}
-
-sanitize_config_json() {
-  local source_path="${1:-}"
-  SANITIZE_CONFIG_SOURCE="$source_path" python3 - <<'PY'
-import json
-import os
-import sys
-
-source = (os.environ.get("SANITIZE_CONFIG_SOURCE") or "").strip()
-if source:
-    with open(source, "r", encoding="utf-8-sig") as f:
-        raw = f.read()
-else:
-    raw = sys.stdin.read()
-
-if not raw.strip():
-    print(f"Warning: empty config payload for sanitize (source={source or 'stdin'}); using {{}}", file=sys.stderr)
-    print("{}")
-    raise SystemExit(0)
-
-try:
-    cfg = json.loads(raw)
-except Exception as e:
-    print(f"Warning: invalid config JSON for sanitize (source={source or 'stdin'}): {e}; using {{}}", file=sys.stderr)
-    print("{}")
-    raise SystemExit(0)
-
-if not isinstance(cfg, dict):
-    print(f"Warning: config JSON root must be object (source={source or 'stdin'}); using {{}}", file=sys.stderr)
-    print("{}")
-    raise SystemExit(0)
-
-cfg.pop("_system", None)
-cfg.pop("identity_fallback_target", None)
-ident = cfg.get("identity")
-if isinstance(ident, dict):
-    ident.pop("fallback_target", None)
-
-print(json.dumps(cfg, separators=(",", ":")))
-PY
-}
-
-build_spawn_config_json() {
-  if [[ "$REUSE_EXISTING_CONFIG" == "1" ]]; then
-    fetch_existing_config_json
-    return
-  fi
-
-  if [[ -n "$CONFIG_JSON" ]]; then
-    if [[ ! -f "$CONFIG_JSON" ]]; then
-      echo "Error: --config-json not found: $CONFIG_JSON" >&2
-      exit 1
-    fi
-    sanitize_config_json "$CONFIG_JSON"
-    return
-  fi
-
-  LISTEN_ADDRESS="$LISTEN_ADDRESS" \
-  LISTEN_PORT="$LISTEN_PORT" \
-  DST_NODE="$DST_NODE" \
-  BLOB_ROOT="$BLOB_ROOT" \
-  IDENTITY_TARGET="$IDENTITY_TARGET" \
-  IDENTITY_TIMEOUT_MS="$IDENTITY_TIMEOUT_MS" \
-  python3 - <<'PY'
-import json
-import os
-
-listen_address = os.environ.get("LISTEN_ADDRESS", "")
-listen_port = os.environ.get("LISTEN_PORT", "")
-dst_node = os.environ.get("DST_NODE", "")
-blob_root = os.environ.get("BLOB_ROOT", "")
-identity_target = os.environ.get("IDENTITY_TARGET", "")
-identity_timeout_ms = os.environ.get("IDENTITY_TIMEOUT_MS", "")
-
-cfg = {
-}
-
-if listen_address and listen_port:
-    cfg["listen"] = {
-        "address": listen_address,
-        "port": int(listen_port)
-    }
-elif listen_address or listen_port:
-    raise SystemExit("listen.address and listen.port must be provided together")
-
-if dst_node:
-    cfg.setdefault("io", {})["dst_node"] = dst_node
-if blob_root:
-    cfg.setdefault("blob", {})["path"] = blob_root
-if identity_target:
-    cfg["identity_target"] = identity_target
-if identity_timeout_ms:
-    cfg["identity_timeout_ms"] = int(identity_timeout_ms)
-
-print(json.dumps(cfg, separators=(",", ":")))
-PY
-}
-
-fetch_existing_config_json() {
-  if [[ -z "$NODE_NAME" ]]; then
-    echo "Error: --reuse-existing-config requires --node-name" >&2
-    exit 1
-  fi
-  log "step=get_existing_config node_name=$NODE_NAME" >&2
-  local raw
-  raw="$(curl -sS -X GET "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/config" | tee -a "$LOG_FILE" >&2)"
-  RAW_JSON="$raw" python3 - <<'PY' | sanitize_config_json
-import json
-import os
-import sys
-raw = (os.environ.get("RAW_JSON") or "").strip()
-if not raw:
-    print("Error: empty response from get config", file=sys.stderr)
-    sys.exit(1)
-try:
-    d = json.loads(raw)
-except Exception as e:
-    print(f"Error: invalid JSON from get config: {e}", file=sys.stderr)
-    sys.exit(1)
-
-status = d.get("status")
-if status and status != "ok":
-    print(f"Error: get config returned status={status}", file=sys.stderr)
-    sys.exit(1)
-
-payload = d.get("payload")
-cfg = None
-if isinstance(payload, dict):
-    if isinstance(payload.get("config"), dict):
-        cfg = payload["config"]
-    elif isinstance(payload.get("node"), dict) and isinstance(payload["node"].get("config"), dict):
-        cfg = payload["node"]["config"]
-    elif isinstance(payload.get("data"), dict) and isinstance(payload["data"].get("config"), dict):
-        cfg = payload["data"]["config"]
-
-if cfg is None and isinstance(d.get("config"), dict):
-    cfg = d["config"]
-
-if cfg is None:
-    print("Error: could not locate config object in get config response", file=sys.stderr)
-    sys.exit(1)
-
-print(json.dumps(cfg, separators=(",", ":")))
-PY
-}
-
-derive_unit_name() {
-  local node="$1"
-  local base="${node%@*}"
-  local hive="${node##*@}"
-  if [[ "$base" == "$node" ]]; then
-    hive="$HIVE_ID"
-  fi
-  echo "fluxbee-node-${base}-${hive}.service"
-}
-
-restart_existing_unit_if_present() {
-  local node="$1"
-  local unit
-  unit="$(derive_unit_name "$node")"
-  local systemctl_cmd=("systemctl")
-  if [[ "$USE_SUDO" == "1" ]]; then
-    systemctl_cmd=("sudo" "systemctl")
-  fi
-
-  if "${systemctl_cmd[@]}" cat "$unit" >/dev/null 2>&1; then
-    log "step=restart_existing unit=$unit"
-    "${systemctl_cmd[@]}" restart "$unit"
-    log "restart_ok unit=$unit"
-    return 0
-  fi
-
-  log "restart_skipped unit_not_found=$unit"
-  return 1
-}
-
-next_config_version() {
-  python3 - <<'PY'
-import time
-print(int(time.time() * 1000))
-PY
-}
-
-build_runtime_config_json() {
-  local effective_dst_node="${DST_NODE:-resolve}"
-  CONFIG_LISTEN_ADDRESS="$LISTEN_ADDRESS" \
-  CONFIG_LISTEN_PORT="$LISTEN_PORT" \
-  CONFIG_API_KEY="$API_KEY_VALUE" \
-  CONFIG_API_KEY_ID="$API_KEY_ID" \
-  CONFIG_DST_NODE="$effective_dst_node" \
-  CONFIG_RELAY_WINDOW_MS="$RELAY_WINDOW_MS" \
-  CONFIG_RELAY_MAX_OPEN_SESSIONS="$RELAY_MAX_OPEN_SESSIONS" \
-  CONFIG_RELAY_MAX_FRAGMENTS="$RELAY_MAX_FRAGMENTS" \
-  CONFIG_RELAY_MAX_BYTES="$RELAY_MAX_BYTES" \
-  python3 - <<'PY'
-import json
-import os
-
-payload = {
-    "listen": {
-        "address": os.environ["CONFIG_LISTEN_ADDRESS"],
-        "port": int(os.environ["CONFIG_LISTEN_PORT"]),
-    },
-    "auth": {
-        "mode": "api_key",
-        "api_keys": [
-            {
-                "key_id": os.environ["CONFIG_API_KEY_ID"],
-                "token": os.environ["CONFIG_API_KEY"],
-            }
-        ],
-    },
-    "ingress": {
-        "subject_mode": "explicit_subject",
-        "accepted_content_types": [
-            "application/json",
-            "multipart/form-data",
-        ],
-        "max_request_bytes": 262144,
-        "max_attachments_per_request": 4,
-        "max_attachment_size_bytes": 10485760,
-        "max_total_attachment_bytes": 20971520,
-        "allowed_mime_types": [
-            "image/png",
-            "image/jpeg",
-            "application/pdf",
-            "text/plain",
-            "application/json",
-        ],
-    },
-    "io": {
-        "dst_node": os.environ["CONFIG_DST_NODE"],
-        "relay": {
-            "window_ms": int(os.environ["CONFIG_RELAY_WINDOW_MS"]),
-            "max_open_sessions": int(os.environ["CONFIG_RELAY_MAX_OPEN_SESSIONS"]),
-            "max_fragments_per_session": int(os.environ["CONFIG_RELAY_MAX_FRAGMENTS"]),
-            "max_bytes_per_session": int(os.environ["CONFIG_RELAY_MAX_BYTES"]),
-        },
-    },
-}
-
-print(json.dumps(payload, separators=(",", ":")))
-PY
-}
-
-apply_runtime_config() {
-  if [[ "$SKIP_CONFIG_SET" == "1" ]]; then
-    log "config_set_skipped explicit_flag=1"
-    return 0
-  fi
-  if [[ -z "$NODE_NAME" ]]; then
-    log "config_set_skipped reason=node_name_missing"
-    return 0
-  fi
-  if [[ -z "$LISTEN_ADDRESS" || -z "$LISTEN_PORT" ]]; then
-    log "config_set_skipped reason=listen_missing"
-    return 0
-  fi
-  if [[ -z "$API_KEY_VALUE" ]]; then
-    log "config_set_skipped reason=api_key_missing set=--api-key_or_env_API_KEY"
-    return 0
-  fi
-
-  local config_version runtime_config payload resp status error_code
-  config_version="$(next_config_version)"
-  runtime_config="$(build_runtime_config_json)"
-  log "step=config_set config_version=$config_version relay_window_ms=$RELAY_WINDOW_MS dst_node=${DST_NODE:-resolve}"
-
-  payload="$(
-    NODE_NAME="$NODE_NAME" \
-    CONFIG_VERSION="$config_version" \
-    RUNTIME_CONFIG_JSON="$runtime_config" \
-    python3 - <<'PY'
-import json
-import os
-
-print(json.dumps({
-    "requested_by": "deploy-io-api.sh",
-    "schema_version": 1,
-    "config_version": int(os.environ["CONFIG_VERSION"]),
-    "apply_mode": "replace",
-    "config": json.loads(os.environ["RUNTIME_CONFIG_JSON"]),
-}, separators=(",", ":")))
-PY
-  )"
-
-  resp="$(curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/control/config-set" \
-    -H "Content-Type: application/json" \
-    -d "$payload" | tee -a "$LOG_FILE")"
-
-  status="$(RAW_JSON="$resp" python3 - <<'PY'
-import json
-import os
-import sys
-raw = (os.environ.get("RAW_JSON") or "").strip()
-try:
-    data = json.loads(raw)
-except Exception:
-    print("invalid_json")
-    sys.exit(0)
-print(data.get("status", ""))
-PY
-)"
-
-  error_code="$(RAW_JSON="$resp" python3 - <<'PY'
-import json
-import os
-import sys
-raw = (os.environ.get("RAW_JSON") or "").strip()
-try:
-    data = json.loads(raw)
-except Exception:
-    print("")
-    sys.exit(0)
-print(data.get("error_code") or "")
-PY
-)"
-
-  if [[ "$status" == "ok" ]]; then
-    log "config_set_ok config_version=$config_version"
-    return 0
-  fi
-  if [[ "$error_code" == "TIMEOUT" ]]; then
-    log "config_set_timeout config_version=$config_version continuing_with_restart_and_probe=1"
-    return 0
-  fi
-
-  log "config_set_failed status=${status:-unknown} error_code=${error_code:-none}"
-  return 1
-}
-
-probe_schema_ready() {
-  if [[ -z "$LISTEN_ADDRESS" || -z "$LISTEN_PORT" ]]; then
-    log "schema_probe_skipped reason=listen_missing"
-    return 0
-  fi
-
-  local url="http://$LISTEN_ADDRESS:$LISTEN_PORT/schema"
-  local attempt body status
-  for attempt in $(seq 1 20); do
-    body="$(curl -sS "$url" 2>/dev/null || true)"
-    status="$(RAW_JSON="$body" python3 - <<'PY'
-import json
-import os
-import sys
-raw = (os.environ.get("RAW_JSON") or "").strip()
-if not raw:
-    print("")
-    sys.exit(0)
-try:
-    data = json.loads(raw)
-except Exception:
-    print("")
-    sys.exit(0)
-print(data.get("status") or "")
-PY
-)"
-    if [[ "$status" == "configured" ]]; then
-      log "schema_probe_ok url=$url attempt=$attempt"
-      return 0
-    fi
-    sleep 1
-  done
-
-  log "schema_probe_failed url=$url"
-  return 1
-}
 
 require_cmd bash
 require_cmd curl
@@ -556,213 +152,240 @@ require_cmd awk
 require_cmd sed
 require_cmd grep
 
-log "starting deploy; log_file=$LOG_FILE"
-log "step=publish runtime=$RUNTIME version=$VERSION"
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE"
 
+log() {
+  echo "[$(date -Iseconds)] $*" | tee -a "$LOG_FILE"
+}
+
+json_status() {
+  RAW_JSON="$1" python3 - <<'PY'
+import json, os
+try:
+    value = json.loads(os.environ.get("RAW_JSON", ""))
+    print(value.get("status", ""))
+except Exception:
+    print("invalid_json")
+PY
+}
+
+build_runtime_config() {
+  if [[ -n "$CONFIG_JSON" ]]; then
+    [[ -f "$CONFIG_JSON" ]] || { echo "Error: config file not found: $CONFIG_JSON" >&2; exit 1; }
+    python3 - "$CONFIG_JSON" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8-sig"))
+if not isinstance(value, dict):
+    raise SystemExit("IO.api config root must be an object")
+value.pop("_system", None)
+print(json.dumps(value, separators=(",", ":")))
+PY
+    return
+  fi
+  for item in EDGE_NODE API_CHANNEL_ID DST_NODE; do
+    if [[ -z "${!item}" ]]; then
+      echo "Error: --edge-node, --api-channel-id and --dst-node are required without --config-json" >&2
+      exit 1
+    fi
+  done
+  EDGE_NODE="$EDGE_NODE" API_CHANNEL_ID="$API_CHANNEL_ID" \
+  DST_NODE="$DST_NODE" SUBJECT_MODE="$SUBJECT_MODE" CALLER_EXTERNAL_ID="$CALLER_EXTERNAL_ID" \
+  PUBLISH="$PUBLISH" RELAY_WINDOW_MS="$RELAY_WINDOW_MS" python3 - <<'PY'
+import json, os
+ingress = {"subject_mode": os.environ["SUBJECT_MODE"]}
+if os.environ["SUBJECT_MODE"] == "caller_is_subject":
+    ingress["caller_identity"] = {"external_user_id": os.environ["CALLER_EXTERNAL_ID"]}
+value = {
+    "edge": {
+        "node": os.environ["EDGE_NODE"],
+        "publish": os.environ["PUBLISH"] == "true",
+    },
+    "io": {
+        "api_channel_id": os.environ["API_CHANNEL_ID"],
+        "dst_node": os.environ["DST_NODE"],
+        "relay": {
+            "window_ms": int(os.environ["RELAY_WINDOW_MS"]),
+            "max_open_sessions": 10000,
+            "max_fragments_per_session": 8,
+            "max_bytes_per_session": 262144,
+        },
+    },
+    "ingress": ingress,
+}
+print(json.dumps(value, separators=(",", ":")))
+PY
+}
+
+derive_publish() {
+  RUNTIME_CONFIG_JSON="$1" python3 - <<'PY'
+import json, os
+value = json.loads(os.environ["RUNTIME_CONFIG_JSON"])
+print("true" if value.get("edge", {}).get("publish", True) else "false")
+PY
+}
+
+publication_field() {
+  RAW_JSON="$1" FIELD="$2" python3 - <<'PY'
+import json, os
+try:
+    value = json.loads(os.environ.get("RAW_JSON", ""))
+except Exception:
+    raise SystemExit
+field = os.environ["FIELD"]
+def find(v):
+    if isinstance(v, dict):
+        publication = v.get("publication")
+        if isinstance(publication, dict) and field in publication:
+            return publication[field]
+        for child in v.values():
+            result = find(child)
+            if result is not None:
+                return result
+    elif isinstance(v, list):
+        for child in v:
+            result = find(child)
+            if result is not None:
+                return result
+    return None
+result = find(value)
+if isinstance(result, bool):
+    print("true" if result else "false")
+elif result is not None:
+    print(result)
+PY
+}
+
+derive_unit_name() {
+  local base="${1%@*}"
+  local hive="${1##*@}"
+  echo "fluxbee-node-${base}-${hive}.service"
+}
+
+restart_existing() {
+  local unit
+  unit="$(derive_unit_name "$NODE_NAME")"
+  local cmd=(systemctl)
+  [[ "$USE_SUDO" == "1" ]] && cmd=(sudo systemctl)
+  if "${cmd[@]}" cat "$unit" >/dev/null 2>&1; then
+    log "restart unit=$unit"
+    "${cmd[@]}" restart "$unit"
+    return 0
+  fi
+  log "restart skipped; unit not found: $unit"
+  return 1
+}
+
+log "publish runtime=$RUNTIME version=$VERSION"
 publish_cmd=(bash "$PUBLISH_SCRIPT" --version "$VERSION" --runtime "$RUNTIME" --set-current)
-if [[ "$USE_SUDO" == "1" ]]; then
-  publish_cmd+=(--sudo)
-fi
-if [[ "$SKIP_BUILD" == "1" ]]; then
-  publish_cmd+=(--skip-build)
-fi
-if [[ -n "$DIST_ROOT" ]]; then
-  publish_cmd+=(--dist-root "$DIST_ROOT")
-fi
-
+[[ "$USE_SUDO" == "1" ]] && publish_cmd+=(--sudo)
+[[ "$SKIP_BUILD" == "1" ]] && publish_cmd+=(--skip-build)
+[[ -n "$DIST_ROOT" ]] && publish_cmd+=(--dist-root "$DIST_ROOT")
 publish_out="$("${publish_cmd[@]}" 2>&1 | tee -a "$LOG_FILE")"
-
-MANIFEST_VERSION="$(echo "$publish_out" | awk -F= '/^manifest_version=/{print $2}' | tail -n1 | tr -d '[:space:]')"
-MANIFEST_HASH="$(echo "$publish_out" | awk -F= '/^manifest_hash=/{print $2}' | tail -n1 | tr -d '[:space:]')"
-
-if [[ -z "$MANIFEST_VERSION" || -z "$MANIFEST_HASH" ]]; then
-  log "error: failed parsing manifest_version/hash from publish output"
-  exit 1
-fi
-
-log "publish_ok manifest_version=$MANIFEST_VERSION manifest_hash=$MANIFEST_HASH"
-log "update_scope=$UPDATE_SCOPE runtime=$RUNTIME target_version=$VERSION"
+manifest_version="$(echo "$publish_out" | awk -F= '/^manifest_version=/{print $2}' | tail -n1 | tr -d '[:space:]')"
+manifest_hash="$(echo "$publish_out" | awk -F= '/^manifest_hash=/{print $2}' | tail -n1 | tr -d '[:space:]')"
+[[ -n "$manifest_version" && -n "$manifest_hash" ]] || { log "publish manifest parse failed"; exit 1; }
 
 if [[ "$UPDATE_SCOPE" == "targeted" ]]; then
-  update_payload="$(python3 - <<PY
-import json
-print(json.dumps({
-  "category": "runtime",
-  "manifest_version": int("${MANIFEST_VERSION}"),
-  "manifest_hash": "${MANIFEST_HASH}",
-  "runtime": "${RUNTIME}",
-  "runtime_version": "${VERSION}",
-}, separators=(",", ":")))
+  update_payload="$(MANIFEST_VERSION="$manifest_version" MANIFEST_HASH="$manifest_hash" RUNTIME="$RUNTIME" VERSION="$VERSION" python3 - <<'PY'
+import json, os
+print(json.dumps({"category":"runtime", "manifest_version":int(os.environ["MANIFEST_VERSION"]),
+ "manifest_hash":os.environ["MANIFEST_HASH"], "runtime":os.environ["RUNTIME"],
+ "runtime_version":os.environ["VERSION"]}, separators=(",", ":")))
 PY
 )"
 else
-  update_payload="$(python3 - <<PY
-import json
+  update_payload="$(MANIFEST_VERSION="$manifest_version" MANIFEST_HASH="$manifest_hash" python3 - <<'PY'
+import json, os
+print(json.dumps({"category":"runtime", "manifest_version":int(os.environ["MANIFEST_VERSION"]),
+ "manifest_hash":os.environ["MANIFEST_HASH"]}, separators=(",", ":")))
+PY
+)"
+fi
+
+update_status=""
+for attempt in $(seq 1 "$UPDATE_RETRIES"); do
+  if [[ "$USE_SYNC_HINT" == "1" ]]; then
+    curl -sS -X POST "$BASE/hives/$HIVE_ID/sync-hint" -H 'Content-Type: application/json' \
+      -d '{"channel":"dist","wait_for_idle":true,"timeout_ms":30000}' >>"$LOG_FILE"
+  fi
+  response="$(curl -sS -X POST "$BASE/hives/$HIVE_ID/update" -H 'Content-Type: application/json' -d "$update_payload" | tee -a "$LOG_FILE")"
+  update_status="$(json_status "$response")"
+  [[ "$update_status" == "ok" ]] && break
+  [[ "$update_status" == "sync_pending" ]] || { log "runtime update failed status=$update_status"; exit 1; }
+  sleep "$RETRY_DELAY_S"
+done
+if [[ "$update_status" != "ok" && "$ALLOW_SYNC_PENDING" != "1" ]]; then
+  log "runtime update remains $update_status"
+  exit 1
+fi
+
+if [[ -z "$NODE_NAME" || "$SKIP_SPAWN" == "1" ]]; then
+  log "deploy complete: runtime published and update requested"
+  exit 0
+fi
+
+runtime_config="$(build_runtime_config)"
+desired_publish="$(derive_publish "$runtime_config")"
+
+if [[ "$UPDATE_EXISTING" == "1" ]]; then
+  restart_existing || { log "existing IO.api unit not found"; exit 1; }
+elif [[ "$DO_SPAWN" == "1" ]]; then
+  [[ -n "$TENANT_ID" ]] || { log "new spawn requires --tenant-id"; exit 1; }
+  spawn_payload="$(NODE_NAME="$NODE_NAME" TENANT_ID="$TENANT_ID" RUNTIME="$RUNTIME" RUNTIME_VERSION="$RUNTIME_VERSION" RUNTIME_CONFIG_JSON="$runtime_config" python3 - <<'PY'
+import json, os
 print(json.dumps({
-  "category": "runtime",
-  "manifest_version": int("${MANIFEST_VERSION}"),
-  "manifest_hash": "${MANIFEST_HASH}",
+  "node_name":os.environ["NODE_NAME"], "tenant_id":os.environ["TENANT_ID"],
+  "runtime":os.environ["RUNTIME"], "runtime_version":os.environ["RUNTIME_VERSION"],
+  "config":json.loads(os.environ["RUNTIME_CONFIG_JSON"])
 }, separators=(",", ":")))
 PY
 )"
+  if [[ "$KILL_FIRST" == "1" ]]; then
+    curl -sS -X DELETE "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME" >>"$LOG_FILE" || true
+  fi
+  response="$(curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes" -H 'Content-Type: application/json' -d "$spawn_payload" | tee -a "$LOG_FILE")"
+  [[ "$(json_status "$response")" == "ok" ]] || { log "spawn failed"; exit 1; }
 fi
 
-attempt=1
-UPDATE_STATUS=""
-while [[ "$attempt" -le "$UPDATE_RETRIES" ]]; do
-  if [[ "$USE_SYNC_HINT" == "1" ]]; then
-    log "step=sync_hint attempt=$attempt"
-    curl -sS -X POST "$BASE/hives/$HIVE_ID/sync-hint" \
-      -H "Content-Type: application/json" \
-      -d '{"channel":"dist","wait_for_idle":true,"timeout_ms":30000}' | tee -a "$LOG_FILE" >/dev/null
-  fi
-
-  log "step=update attempt=$attempt"
-  update_resp="$(curl -sS -X POST "$BASE/hives/$HIVE_ID/update" \
-    -H "Content-Type: application/json" \
-    -d "$update_payload" | tee -a "$LOG_FILE")"
-
-  UPDATE_STATUS="$(RAW_JSON="$update_resp" python3 - <<'PY'
-import json
-import os
-import sys
-raw = (os.environ.get("RAW_JSON") or "").strip()
-try:
-    d = json.loads(raw)
-except Exception:
-    print("invalid_json")
-    sys.exit(0)
-status = d.get("status")
-if not status:
-    status = (d.get("payload") or {}).get("status", "")
-print(status or "")
+entry_token=""
+if [[ "$SKIP_CONFIG_SET" != "1" ]]; then
+  config_version="$(python3 - <<'PY'
+import time
+print(int(time.time() * 1000))
 PY
 )"
-
-  if [[ "$UPDATE_STATUS" == "ok" ]]; then
-    log "update_ok"
-    break
-  fi
-
-  if [[ "$UPDATE_STATUS" == "sync_pending" ]]; then
-    log "update_sync_pending attempt=$attempt sleeping=${RETRY_DELAY_S}s"
-    sleep "$RETRY_DELAY_S"
-    attempt=$((attempt + 1))
-    continue
-  fi
-
-  log "update_failed status=${UPDATE_STATUS:-unknown}"
-  exit 1
-done
-
-if [[ "$UPDATE_STATUS" != "ok" ]]; then
-  if [[ "$UPDATE_STATUS" == "sync_pending" && "$ALLOW_SYNC_PENDING" == "1" ]]; then
-    log "update_not_ready status=$UPDATE_STATUS after $UPDATE_RETRIES attempts; continuing because --allow-sync-pending is set"
-  else
-    log "update_not_ready status=$UPDATE_STATUS after $UPDATE_RETRIES attempts"
-    exit 1
-  fi
+  config_payload="$(NODE_NAME="$NODE_NAME" CONFIG_VERSION="$config_version" RUNTIME_CONFIG_JSON="$runtime_config" python3 - <<'PY'
+import json, os
+print(json.dumps({"requested_by":"deploy-io-api.sh", "schema_version":1,
+ "config_version":int(os.environ["CONFIG_VERSION"]), "apply_mode":"replace",
+ "config":json.loads(os.environ["RUNTIME_CONFIG_JSON"])}, separators=(",", ":")))
+PY
+)"
+  response="$(curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/control/config-set" -H 'Content-Type: application/json' -d "$config_payload")"
+  [[ "$(json_status "$response")" == "ok" ]] || { log "CONFIG_SET failed"; exit 1; }
+  entry_token="$(publication_field "$response" entry_token)"
+  log "CONFIG_SET applied; credential_issued=$([[ -n "$entry_token" ]] && echo true || echo false)"
 fi
 
-if [[ "$DO_SPAWN" != "1" ]]; then
-  if [[ "$UPDATE_EXISTING" == "1" && -n "$NODE_NAME" ]]; then
-    if restart_existing_unit_if_present "$NODE_NAME"; then
-      log "update_existing: existing unit found; proceeding to config_set/restart node_name=$NODE_NAME"
+expected="published"
+[[ "$desired_publish" == "false" ]] && expected="disabled"
+for attempt in $(seq 1 30); do
+  response="$(curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME/control/config-get" -H 'Content-Type: application/json' -d '{}' | tee -a "$LOG_FILE")"
+  publication="$(publication_field "$response" status)"
+  if [[ "$publication" == "$expected" ]]; then
+    publication_url="$(publication_field "$response" url)"
+    log "deploy complete node=$NODE_NAME publication=$publication url=$publication_url"
+    if [[ -n "$entry_token" ]]; then
+      printf 'entry_token=%s\n' "$entry_token"
+      printf 'entry_token_one_time=true\n'
     else
-      DO_SPAWN=1
-      REUSE_EXISTING_CONFIG=1
-      log "update_existing: unit missing, falling back to spawn node_name=$NODE_NAME"
+      log "entry token was not reissued; retain the credential from the original externalize"
     fi
-  else
-    log "deploy completed (publish+update). spawn/config skipped."
     exit 0
   fi
-fi
+  sleep 1
+done
 
-if [[ -z "$NODE_NAME" ]]; then
-  log "error: spawn requested but --node-name missing"
-  exit 1
-fi
-
-if [[ "$DO_SPAWN" == "1" ]]; then
-  if [[ -z "$TENANT_ID" && -z "${ORCH_DEFAULT_TENANT_ID:-}" ]]; then
-    log "warning: spawn may fail with IDENTITY_REGISTER_FAILED because tenant_id is missing; set --tenant-id or ORCH_DEFAULT_TENANT_ID"
-  fi
-
-  spawn_cfg_json="$(build_spawn_config_json)"
-  log "step=spawn_config config=$spawn_cfg_json"
-
-  spawn_payload="$(NODE_NAME="$NODE_NAME" RUNTIME="$RUNTIME" RUNTIME_VERSION="$RUNTIME_VERSION" TENANT_ID="$TENANT_ID" SPAWN_CFG_JSON="$spawn_cfg_json" python3 - <<'PY'
-import json
-import os
-cfg = json.loads(os.environ["SPAWN_CFG_JSON"])
-tenant_id = os.environ.get("TENANT_ID", "").strip()
-if tenant_id:
-    cfg.setdefault("tenant_id", tenant_id)
-
-payload = {
-  "node_name": os.environ["NODE_NAME"],
-  "runtime": os.environ["RUNTIME"],
-  "runtime_version": os.environ["RUNTIME_VERSION"],
-  "config": cfg,
-}
-if tenant_id:
-    payload["tenant_id"] = tenant_id
-
-print(json.dumps(payload, separators=(",", ":")))
-PY
-)"
-
-  if [[ "$KILL_FIRST" == "1" ]]; then
-    log "step=kill_first node_name=$NODE_NAME"
-    curl -sS -X DELETE "$BASE/hives/$HIVE_ID/nodes/$NODE_NAME" | tee -a "$LOG_FILE" >/dev/null || true
-  fi
-
-  log "step=spawn node_name=$NODE_NAME"
-  spawn_resp="$(curl -sS -X POST "$BASE/hives/$HIVE_ID/nodes" \
-    -H "Content-Type: application/json" \
-    -d "$spawn_payload" | tee -a "$LOG_FILE")"
-
-  spawn_status="$(RAW_JSON="$spawn_resp" python3 - <<'PY'
-import json
-import os
-import sys
-raw = (os.environ.get("RAW_JSON") or "").strip()
-try:
-    d = json.loads(raw)
-except Exception:
-    print("invalid_json")
-    sys.exit(0)
-print(d.get("status",""))
-PY
-)"
-
-  spawn_error_code="$(RAW_JSON="$spawn_resp" python3 - <<'PY'
-import json
-import os
-import sys
-raw = (os.environ.get("RAW_JSON") or "").strip()
-try:
-    d = json.loads(raw)
-except Exception:
-    print("")
-    sys.exit(0)
-print(d.get("error_code") or (d.get("payload") or {}).get("error_code") or "")
-PY
-)"
-
-  if [[ "$spawn_status" != "ok" ]]; then
-    if [[ "$spawn_error_code" == "NODE_ALREADY_EXISTS" && "$UPDATE_EXISTING" == "1" ]]; then
-      log "spawn_node_already_exists; continuing with config_set/restart for update flow"
-    else
-      log "spawn_failed status=${spawn_status:-unknown}"
-      exit 1
-    fi
-  fi
-fi
-
-apply_runtime_config
-restart_existing_unit_if_present "$NODE_NAME"
-probe_schema_ready
-
-log "deploy completed (publish+update+spawn+config_set+restart) node_name=$NODE_NAME"
+log "publication did not reach expected state=$expected"
+exit 1

@@ -5,7 +5,8 @@ This subtree hosts IO crates isolated from core routing/AI crates.
 ## Crates
 
 - `crates/io-common`: shared IO helpers (dedup, identity lookup, io context, inbound relay/sessionization).
-- `crates/io-api`: generic HTTP ingress IO node (`GET /`, `POST /`, auth bearer, relay, attachments/blob; legacy aliases: `GET /schema`, `POST /messages`).
+- `crates/io-api`: instanced Edge ingress node. It owns one ICH, externalizes through
+  `SY.admin`, receives `io.api.inbound.v1` over the router socket and has no HTTP listener.
 - `crates/io-sim`: simulation IO node for local/Linux E2E tests (stdin/--once inbound, log-only outbound).
 - `crates/io-slack`: Slack IO node (Socket Mode inbound, Web API outbound).
 
@@ -70,12 +71,22 @@ Use those values with:
 
 Deploy runbook:
 - `docs/io/io-slack-deploy-runbook.md`
-- `docs/onworking NOE/io-api-runtime-validation-runbook.md`
+- `docs/io/io-api-node-spec.md`
 
 Deploy helper for `IO.api`:
 
 ```bash
-bash scripts/deploy-io-api.sh --base http://127.0.0.1:8080 --hive-id motherbee --version 0.1.0 --node-name IO.api.frontdesk@motherbee --update-existing --sync-hint --sudo
+bash scripts/deploy-io-api.sh \
+  --base http://127.0.0.1:8080 \
+  --hive-id motherbee \
+  --version 1.0.0 \
+  --node-name IO.api.orders@motherbee \
+  --tenant-id tnt:11111111-1111-4111-8111-111111111111 \
+  --edge-node SY.edge@ingress-1 \
+  --api-channel-id orders \
+  --dst-node AI.orders@motherbee \
+  --sync-hint \
+  --sudo
 ```
 
 ## Run (linux target expected in production)
@@ -84,14 +95,23 @@ bash scripts/deploy-io-api.sh --base http://127.0.0.1:8080 --hive-id motherbee -
 
 Managed runtime note:
 
-- `io-api` expects `FLUXBEE_NODE_NAME` and managed `config.json` under `/var/lib/fluxbee/nodes/IO/<node_name>/config.json`
-- the process can boot with bootstrap config that is empty or minimal and remain non-configured until `CONFIG_SET`
-- canonical runtime/business config stays in `CONFIG_GET` / `CONFIG_SET`
+- `io-api` requires `FLUXBEE_NODE_NAME`, `FLUXBEE_NODE_ILK_ID` and
+  `FLUXBEE_NODE_TENANT_ID` from Orchestrator.
+- It reads managed `config.json` under `/var/lib/fluxbee/nodes/IO/<node_name>/config.json`.
+- It can boot unconfigured and receive the canonical business config through `CONFIG_SET`.
+- `SY.admin externalize` mints and stores the Edge bearer. It is never accepted in node config or
+  persisted by IO.api; the deploy helper prints a newly issued token once without logging it.
+- Public requests terminate at `SY.edge`; Edge validates the bearer and forwards one message over
+  the internal router socket. Requests cannot choose their tenant, ICH or destination.
+- Publication state and URL are available through Admin's node `control/config-get` response under
+  `runtime.publication`.
 
 Useful helpers:
 
 - `scripts/publish-io-api-runtime.sh`
 - `scripts/deploy-io-api.sh`
+
+### IO.slack
 
 Required env vars:
 

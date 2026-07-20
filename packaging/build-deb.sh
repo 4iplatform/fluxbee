@@ -31,9 +31,9 @@ UNITS=(rt-gateway sy-config-routes sy-opa-rules sy-admin sy-architect sy-vault
 echo "== [1/5] build rust =="
 cargo build --release --bins
 cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
-# IO.cloud and IO.blob are motherbee-only singletons. They live in the separate
-# nodes/io workspace, so they need their own manifest-path build.
-cargo build --release --manifest-path nodes/io/Cargo.toml -p io-cloud -p io-blob
+# IO.cloud/IO.blob are motherbee singletons. IO.api is an instanced runtime bundled
+# into dist/runtimes so a clean install can spawn it through Orchestrator like ai.generic.
+cargo build --release --manifest-path nodes/io/Cargo.toml -p io-api -p io-cloud -p io-blob
 echo "== [2/5] build go =="
 (cd go/sy-opa-rules && go build -o sy-opa-rules .)
 (cd go/sy-timer && go build -o sy-timer .)
@@ -61,6 +61,16 @@ done
 # enter the core manifest that the orchestrator ships to workers.
 install -m0755 nodes/io/target/release/io-cloud "$DEST/usr/bin/io-cloud"
 install -m0755 nodes/io/target/release/io-blob "$DEST/usr/bin/io-blob"
+
+# Seed the instanced IO.api runtime in the package. It deliberately has no systemd unit and no
+# /usr/bin singleton: Orchestrator launches named instances from this signed/synced runtime tree.
+bash scripts/publish-io-api-runtime.sh \
+  --runtime io.api \
+  --version "$VERSION" \
+  --binary nodes/io/target/release/io-api \
+  --dist-root "$DEST/var/lib/fluxbee/dist" \
+  --set-current \
+  --skip-build
 
 # dist/core manifest with the staged binaries' real hashes (baked in).
 python3 - "$DEST/var/lib/fluxbee/dist/core" "$VERSION" "$BUILD_ID" <<'PY'
@@ -218,8 +228,8 @@ Maintainer: 4i Platform <ops@4iplatform.com>
 Description: Fluxbee internal-network orchestration mesh
  Core services (router, orchestrator, identity, vault, storage, admin,
  architect, cognition, policy, timer, wf-rules, opa-rules, frontdesk, edge)
- plus the singleton IO.cloud adapter and IO.blob public artifact curator
- (motherbee).
+ plus the singleton IO.cloud adapter, IO.blob public artifact curator (motherbee),
+ and the instanced io.api runtime seeded under dist/runtimes.
  Binaries + dist/core manifest (hashes baked at build), systemd units, and a
  first-boot helper. Run 'sudo fluxbee-firstboot' after install.
 EOF

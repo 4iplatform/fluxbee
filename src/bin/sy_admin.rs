@@ -4172,9 +4172,9 @@ async fn unpublish_edge_blob(
 /// caller); see `authorize_channel_command`. Trusted internal paths (operator/executor)
 /// bypass.
 ///
-/// Still deferred (v6 §12/§8): the durable `ICH` "externalized" attribute in `SY.identity`
-/// (so it survives an edge reimage) and the vault-minted channel token for
-/// `auth_mode=shared-secret` (which currently carries a caller-supplied `secret`).
+/// Still deferred (v6 §12): the durable `ICH` "externalized" attribute in `SY.identity`
+/// for reconstruction after an Edge reimage. Shared-secret token minting and Edge-owned Vault
+/// persistence are implemented below.
 async fn handle_externalize(
     ctx: &AdminContext,
     client: &Arc<RouterDispatcher>,

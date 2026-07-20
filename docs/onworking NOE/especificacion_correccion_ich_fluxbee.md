@@ -239,7 +239,7 @@ Ejemplos:
 | `IO.whatsapp` | número propio, phone_number_id, business account id, asset id |
 | `IO.gmail` | cuenta propia, mailbox id, asset id |
 | `IO.slack` | app/workspace/channel/inbox propio, asset id |
-| `IO.api` | endpoint/asset/client config propio; inicialmente puede atarse al puerto/entrypoint local y refinarse luego el material exacto de unicidad |
+| `IO.api` | `api_channel_id` estable de la instancia, registrado como ICH propio y externalizado por Admin/Edge |
 
 El nodo IO es responsable de proveer a Identity el dato correcto. Identity no debería inferir que el `ICH` pertenece al interlocutor externo.
 
