@@ -226,8 +226,7 @@ Version: ${VERSION}
 Section: net
 Priority: optional
 Architecture: ${ARCH}
-Depends: adduser, openssl, libc6 (>= 2.39)
-Recommends: postgresql
+Depends: adduser, openssl, libc6 (>= 2.39), postgresql
 Installed-Size: ${INSTALLED_KB}
 Maintainer: 4i Platform <ops@4iplatform.com>
 Description: Fluxbee internal-network orchestration mesh

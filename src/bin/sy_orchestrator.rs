@@ -3870,13 +3870,18 @@ fn service_to_exec(service: &str) -> String {
 }
 
 fn core_service_unit_contents(name: &str, exec_path: &str) -> String {
-    if name == "sy-orchestrator" {
-        format!("[Unit]\nDescription=Fluxbee {name}\nAfter=network.target rt-gateway.service\nWants=rt-gateway.service\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n")
-    } else if name == "sy-edge" {
-        format!("[Unit]\nDescription=Fluxbee {name}\nAfter=network.target rt-gateway.service\nWants=rt-gateway.service\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n")
+    // sy-orchestrator and sy-edge want rt-gateway up first (After+Wants, deliberately NOT
+    // Requires: the orchestrator exits cleanly on SIGTERM without tearing down managed nodes,
+    // so a hard Requires would only couple stop-ordering and risk a cascade restart). Everyone
+    // else only needs the network. TimeoutStopSec caps the stop window as a safety net,
+    // matching the packaged units (build-deb.sh gen_unit) so every fluxbee unit — packaged or
+    // orchestrator-provisioned on a spoke — has the same 15s floor before SIGKILL.
+    let unit_deps = if name == "sy-orchestrator" || name == "sy-edge" {
+        "After=network.target rt-gateway.service\nWants=rt-gateway.service"
     } else {
-        format!("[Unit]\nDescription=Fluxbee {name}\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n")
-    }
+        "After=network.target"
+    };
+    format!("[Unit]\nDescription=Fluxbee {name}\n{unit_deps}\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\nTimeoutStopSec=15\n\n[Install]\nWantedBy=multi-user.target\n")
 }
 
 fn render_system_nodes_yaml(role: HiveRole, section: &RoleSystemNodes) -> String {
@@ -17142,15 +17147,7 @@ async fn add_hive_flow(
     );
 
     for (name, exec_path) in &worker_units {
-        let unit = if *name == "sy-orchestrator" {
-            format!(
-                "[Unit]\nDescription=Fluxbee {name}\nAfter=network.target rt-gateway.service\nWants=rt-gateway.service\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
-            )
-        } else {
-            format!(
-                "[Unit]\nDescription=Fluxbee {name}\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
-            )
-        };
+        let unit = core_service_unit_contents(name, exec_path);
         let unit_path = format!("/etc/systemd/system/{name}.service");
         if let Err(err) =
             write_remote_file(address, &key_path, creds.user.as_str(), &unit_path, &unit)
@@ -17832,11 +17829,7 @@ async fn add_egress_hive_flow(
         units.push((service.clone(), service_to_exec(&service)));
     }
     for (name, exec_path) in &units {
-        let unit = if name == "sy-orchestrator" {
-            format!("[Unit]\nDescription=Fluxbee {name}\nAfter=network.target rt-gateway.service\nWants=rt-gateway.service\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n")
-        } else {
-            format!("[Unit]\nDescription=Fluxbee {name}\nAfter=network.target\n\n[Service]\nType=simple\nExecStart={exec_path}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n")
-        };
+        let unit = core_service_unit_contents(name, exec_path);
         let unit_path = format!("/etc/systemd/system/{name}.service");
         if let Err(err) =
             write_remote_file(address, &key_path, creds.user.as_str(), &unit_path, &unit)
@@ -20887,6 +20880,32 @@ mod tests {
         assert!(unit.contains("Wants=rt-gateway.service"));
         assert!(!unit.contains("sy-vault.service"));
         assert!(unit.contains("ExecStart=/usr/bin/sy-edge"));
+    }
+
+    #[test]
+    fn core_service_unit_has_timeout_stop_and_role_correct_deps() {
+        // Every orchestrator-provisioned unit (spoke or motherbee-managed) carries the same
+        // 15s stop floor as the packaged units (build-deb.sh gen_unit) so a hung stop can never
+        // fall back to systemd's 90s default before SIGKILL — the residual behind the spoke
+        // sy-orchestrator "stop-sigterm timed out" incidents.
+        for name in ["sy-orchestrator", "sy-edge", "sy-identity", "rt-gateway"] {
+            let unit = core_service_unit_contents(name, "/usr/bin/x");
+            assert!(
+                unit.contains("TimeoutStopSec=15"),
+                "{name} unit missing TimeoutStopSec"
+            );
+            // After+Wants rt-gateway, deliberately NOT Requires (no cascade coupling).
+            assert!(!unit.contains("Requires="), "{name} must not use Requires=");
+        }
+        // sy-orchestrator / sy-edge order after rt-gateway; plain SY nodes only need the network.
+        for gated in ["sy-orchestrator", "sy-edge"] {
+            let unit = core_service_unit_contents(gated, "/usr/bin/x");
+            assert!(unit.contains("After=network.target rt-gateway.service"));
+            assert!(unit.contains("Wants=rt-gateway.service"));
+        }
+        let plain = core_service_unit_contents("sy-identity", "/usr/bin/x");
+        assert!(plain.contains("After=network.target\n"));
+        assert!(!plain.contains("rt-gateway"));
     }
 
     #[test]
