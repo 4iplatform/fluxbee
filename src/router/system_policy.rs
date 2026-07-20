@@ -133,6 +133,21 @@ pub fn authority(action: &str, src_l2_name: Option<&str>, hive_id: &str) -> bool
     action == "NODE_STATUS_GET" && matches!(role, "SY.config-routes" | "SY.vault")
 }
 
+/// Option B (WAN multi-hop reachability, edge-multihop-reachability-spec-v1): may the mTLS-
+/// authenticated `voucher_hive` VOUCH transitive reachability of other hives' nodes to a spoke?
+/// Only the primary hub may — it is the star's single relay. This is the SYSTEM rule that replaces
+/// the hardcoded LSA bucket check for the (separate) reachability plane; it is the Rust fallback /
+/// spec, to be kept in lock-step with `policy/system.rego` (future entrypoint
+/// `fluxbee/system/wan_reachability_admit`), shadow-verified like `authority()`.
+///
+/// A vouched node is admitted for DATA delivery ONLY; SYSTEM authority stays strict and is denied
+/// for a `via_hub` origin at the delivery gate (see `serialize_for_local_delivery`). So allowing the
+/// hub to vouch reachability cannot grant it the power to fabricate cross-hive control-plane
+/// authority between spokes.
+pub fn wan_reachability_voucher_allowed(voucher_hive: &str) -> bool {
+    voucher_hive.trim() == PRIMARY_HIVE_ID
+}
+
 /// The BAKED system policy resolver: `policy/system.wasm` (compiled from `policy/system.rego`).
 /// Hive-agnostic — `hive_id` is an INPUT, not baked — so ONE resolver serves every hive. Lazily
 /// loaded once; on load failure it stays unloaded and `authorize_system` falls back to the

@@ -31,15 +31,15 @@ use crate::shm::{
 };
 use fluxbee_sdk::protocol::{
     build_announce, build_lsa, build_router_hello, build_ttl_exceeded, build_unreachable,
-    build_wan_accept, build_wan_hello, build_wan_reject, Destination, LsaNode, LsaPayload,
-    LsaRoute, LsaTap, LsaVpn, Message, Meta, NodeAnnouncePayload, NodeHelloPayload,
-    OpaReloadPayload, RouterHelloPayload, WanAcceptPayload, WanHelloPayload, WanNegotiated,
-    WanRejectPayload, WanTimers, MSG_CONFIG_CHANGED, MSG_EDGE_CLOSE_URL,
-    MSG_EDGE_CLOSE_URL_RESPONSE, MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE,
-    MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE, MSG_EDGE_PUBLISH_BLOB,
-    MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB, MSG_EDGE_UNPUBLISH_BLOB_RESPONSE,
-    MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_WITHDRAW,
-    SCOPE_GLOBAL, SYSTEM_KIND,
+    build_wan_accept, build_wan_hello, build_wan_reachability, build_wan_reject, Destination,
+    LsaNode, LsaPayload, LsaRoute, LsaTap, LsaVpn, Message, Meta, NodeAnnouncePayload,
+    NodeHelloPayload, OpaReloadPayload, RouterHelloPayload, WanAcceptPayload, WanHelloPayload,
+    WanNegotiated, WanReachabilityEntry, WanReachabilityPayload, WanRejectPayload, WanTimers,
+    MSG_CONFIG_CHANGED, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE, MSG_EDGE_LIST_URLS,
+    MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
+    MSG_EDGE_PUBLISH_BLOB, MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB,
+    MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD, MSG_TTL_EXCEEDED,
+    MSG_UNREACHABLE, MSG_WAN_REACHABILITY, MSG_WITHDRAW, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::socket::connection::{read_frame, write_frame};
 use fluxbee_sdk::{classify_routed_message, MSG_VAULT_GET, MSG_VAULT_GET_RESPONSE};
@@ -698,7 +698,15 @@ async fn handle_node(
             },
         );
     }
-    rebuild_fib(&fib, &nodes, &peer_nodes, &static_routes, &lsa_snapshot, &reachability).await;
+    rebuild_fib(
+        &fib,
+        &nodes,
+        &peer_nodes,
+        &static_routes,
+        &lsa_snapshot,
+        &reachability,
+    )
+    .await;
     if is_gateway {
         let _ = broadcast_lsa_direct(
             router_uuid,
@@ -940,7 +948,15 @@ async fn handle_node(
             }
         }
     }
-    rebuild_fib(&fib, &nodes, &peer_nodes, &static_routes, &lsa_snapshot, &reachability).await;
+    rebuild_fib(
+        &fib,
+        &nodes,
+        &peer_nodes,
+        &static_routes,
+        &lsa_snapshot,
+        &reachability,
+    )
+    .await;
     if is_gateway {
         let _ = broadcast_lsa_direct(
             router_uuid,
@@ -1063,6 +1079,11 @@ async fn handle_message(
                             let snapshot = lsa_snapshot.lock().await;
                             find_remote_node(&snapshot, dst_uuid)
                         };
+                        // Option B: fall back to hub-vouched reachability (forwards via next_hop_hive).
+                        let remote = match remote {
+                            Some(info) => Some(info),
+                            None => find_reachable_node(&*reachability.lock().await, dst_uuid),
+                        };
                         if let Some(remote) = remote {
                             if vpn_allows_between(
                                 &msg.meta,
@@ -1072,7 +1093,7 @@ async fn handle_message(
                                 remote.vpn_id,
                             ) {
                                 forward_to_hive(
-                                    &remote.hive_id,
+                                    &remote.next_hop_hive,
                                     &msg,
                                     is_gateway,
                                     peer_routers,
@@ -1338,7 +1359,9 @@ async fn handle_message(
     }
 
     if !senders.is_empty() {
-        if let Some(data) = serialize_for_local_delivery(memory_reader, hive_id, &msg, false).await? {
+        if let Some(data) =
+            serialize_for_local_delivery(memory_reader, hive_id, &msg, false).await?
+        {
             for sender in senders {
                 let _ = sender.send(data.clone());
             }
@@ -1564,7 +1587,9 @@ async fn fanout_taps_for_unicast(
                     );
                     continue;
                 }
-                let data = match serialize_for_local_delivery(memory_reader, hive_id, &copy, false).await {
+                let data = match serialize_for_local_delivery(memory_reader, hive_id, &copy, false)
+                    .await
+                {
                     Ok(Some(data)) => data,
                     Ok(None) => continue, // suppressed: protected SYSTEM from unauthorized origin
                     Err(err) => {
@@ -2051,6 +2076,130 @@ async fn broadcast_lsa(ctx: &WanContext, target_hive: Option<&str>) -> Result<()
     Ok(())
 }
 
+/// Option B: the hub advertises which spoke nodes are reachable THROUGH it, so a spoke can resolve
+/// and forward toward a non-adjacent hive. Sent to each WAN peer with SPLIT-HORIZON (a peer is
+/// never told its own nodes). A leaf with fewer than 2 WAN peers naturally sends nothing. Authored
+/// in THIS router's own authenticated bucket (`origin_hive == this hive`), so it never violates the
+/// EDGE-01 LSA bucket binding; the receiver additionally gates on the voucher being the primary hub.
+async fn broadcast_reachability(ctx: &WanContext) -> Result<(), RouterError> {
+    let peers: Vec<(String, WanPeer)> = {
+        let guard = ctx.wan_peers.lock().await;
+        guard.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    if peers.len() < 2 {
+        return Ok(()); // only a hub (>=2 peers) can relay between spokes
+    }
+    let state: Vec<(String, Vec<LsaNode>)> = {
+        let guard = ctx.lsa_state.lock().await;
+        guard
+            .iter()
+            .filter(|(_, st)| st.flags & FLAG_STALE == 0)
+            .map(|(hive, st)| (hive.clone(), st.nodes.clone()))
+            .collect()
+    };
+    let seq = now_epoch_ms();
+    for (target_hive, peer) in peers.iter() {
+        let mut entries: Vec<WanReachabilityEntry> = Vec::new();
+        for (origin_hive, nodes) in state.iter() {
+            if origin_hive == target_hive {
+                continue; // split-horizon: the target learns its own nodes via its own LSA
+            }
+            for node in nodes {
+                entries.push(WanReachabilityEntry {
+                    uuid: node.uuid.clone(),
+                    name: node.name.clone(),
+                    hive_id: origin_hive.clone(),
+                    vpn_id: node.vpn_id,
+                });
+            }
+        }
+        if entries.is_empty() {
+            continue;
+        }
+        let payload = WanReachabilityPayload {
+            origin_hive: ctx.hive_id.clone(),
+            router_id: ctx.router_uuid.to_string(),
+            router_name: ctx.router_name.clone(),
+            seq,
+            timestamp: seq.to_string(),
+            entries,
+        };
+        let msg = build_wan_reachability(
+            &ctx.router_uuid.to_string(),
+            &peer.router_uuid.to_string(),
+            &Uuid::new_v4().to_string(),
+            payload,
+        );
+        if let Ok(data) = serde_json::to_vec(&msg) {
+            let _ = peer.sender.send(data);
+        }
+    }
+    Ok(())
+}
+
+/// Ingest a hub-authored `MSG_WAN_REACHABILITY` (Option B). Gated: only the primary hub may vouch
+/// (`system_policy::wan_reachability_voucher_allowed`) and only for its own authenticated bucket
+/// (`payload.origin_hive == peer_hive`, EDGE-01-style). Replaces this voucher's entry set in the
+/// reachability table and rebuilds the FIB so the new routes take effect immediately.
+async fn apply_wan_reachability(ctx: &WanContext, peer_hive: &str, msg: &Message) {
+    if !system_policy::wan_reachability_voucher_allowed(peer_hive) {
+        tracing::warn!(peer_hive = %peer_hive, "rejected WAN_REACHABILITY: voucher is not the authorized hub");
+        return;
+    }
+    let payload: WanReachabilityPayload = match serde_json::from_value(msg.payload.clone()) {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::warn!(peer_hive = %peer_hive, error = %err, "WAN_REACHABILITY parse error");
+            return;
+        }
+    };
+    if payload.origin_hive != peer_hive {
+        tracing::warn!(
+            payload_hive = %payload.origin_hive,
+            peer_hive = %peer_hive,
+            "WAN_REACHABILITY bucket mismatch; rejected"
+        );
+        return;
+    }
+    let now = now_epoch_ms();
+    {
+        let mut table = ctx.reachability.lock().await;
+        // Replace the full set vouched by this hub (removed nodes disappear on the next beacon).
+        table.retain(|_, entry| entry.next_hop_hive != peer_hive);
+        for entry in payload.entries {
+            let Ok(uuid) = Uuid::parse_str(&entry.uuid) else {
+                continue;
+            };
+            // Never accept a reachability entry for THIS hive (self) or for the voucher's own hive
+            // (that would be a normal directly-authenticated LSA node, not a transitive vouch).
+            if entry.hive_id == ctx.hive_id || entry.hive_id == peer_hive || entry.name.is_empty() {
+                continue;
+            }
+            table.insert(
+                uuid,
+                ReachabilityEntry {
+                    name: entry.name,
+                    origin_hive: entry.hive_id,
+                    next_hop_hive: peer_hive.to_string(),
+                    vpn_id: entry.vpn_id,
+                    last_seq: payload.seq,
+                    last_updated: now,
+                },
+            );
+        }
+    }
+    rebuild_fib(
+        &ctx.fib,
+        &ctx.nodes,
+        &ctx.peer_nodes,
+        &ctx.static_routes,
+        &ctx.lsa_snapshot,
+        &ctx.reachability,
+    )
+    .await;
+    tracing::debug!(peer_hive = %peer_hive, "WAN_REACHABILITY applied");
+}
+
 async fn broadcast_lsa_direct(
     router_uuid: Uuid,
     router_name: &str,
@@ -2398,6 +2547,8 @@ async fn lsa_broadcast_loop(ctx: Arc<WanContext>) {
         ticker.tick().await;
         write_lsa_state(&ctx).await;
         let _ = broadcast_lsa(&ctx, None).await;
+        // Option B: the hub re-advertises transitive reachability alongside its LSA beacon.
+        let _ = broadcast_reachability(&ctx).await;
     }
 }
 
@@ -2425,6 +2576,25 @@ async fn lsa_stale_loop(ctx: Arc<WanContext>) {
         }
         if changed {
             write_lsa_state(&ctx).await;
+        }
+        // Option B: expire hub-vouched reachability entries the hub stopped refreshing, then
+        // rebuild the FIB if any were dropped so dead multi-hop routes don't linger.
+        let reachability_dropped = {
+            let mut table = ctx.reachability.lock().await;
+            let before = table.len();
+            table.retain(|_, entry| now.saturating_sub(entry.last_updated) <= ctx.dead_interval_ms);
+            before != table.len()
+        };
+        if reachability_dropped {
+            rebuild_fib(
+                &ctx.fib,
+                &ctx.nodes,
+                &ctx.peer_nodes,
+                &ctx.static_routes,
+                &ctx.lsa_snapshot,
+                &ctx.reachability,
+            )
+            .await;
         }
     }
 }
@@ -2853,6 +3023,10 @@ async fn handle_wan_message(
             }
             return Ok(());
         }
+        if msg.meta.msg.as_deref() == Some(MSG_WAN_REACHABILITY) {
+            apply_wan_reachability(ctx, peer_hive, &msg).await;
+            return Ok(());
+        }
         if let Some(kind) = msg.meta.msg.as_deref() {
             if kind == MSG_UNREACHABLE || kind == MSG_TTL_EXCEEDED {
                 if let Destination::Unicast(dst) = &msg.routing.dst {
@@ -2983,6 +3157,10 @@ async fn handle_wan_message(
                             let snapshot = ctx.lsa_snapshot.lock().await;
                             find_remote_node(&snapshot, dst_uuid)
                         };
+                        let remote = match remote {
+                            Some(info) => Some(info),
+                            None => find_reachable_node(&*ctx.reachability.lock().await, dst_uuid),
+                        };
                         if let Some(remote) = remote {
                             if vpn_allows_between(
                                 &msg.meta,
@@ -2992,7 +3170,7 @@ async fn handle_wan_message(
                                 remote.vpn_id,
                             ) {
                                 forward_to_hive(
-                                    &remote.hive_id,
+                                    &remote.next_hop_hive,
                                     &msg,
                                     true,
                                     &ctx.peer_routers,
@@ -3198,7 +3376,8 @@ async fn handle_wan_message(
 
     if !senders.is_empty() {
         if let Some(data) =
-            serialize_for_local_delivery(&ctx.memory_reader, &ctx.hive_id, &msg, src_via_hub).await?
+            serialize_for_local_delivery(&ctx.memory_reader, &ctx.hive_id, &msg, src_via_hub)
+                .await?
         {
             for sender in senders {
                 let _ = sender.send(data.clone());
@@ -3269,7 +3448,15 @@ async fn peer_discovery_loop(
             let mut peer_guard = peer_routers.lock().await;
             *peer_guard = updated_routers;
         }
-        rebuild_fib(&fib, &nodes, &peer_nodes, &static_routes, &lsa_snapshot, &reachability).await;
+        rebuild_fib(
+            &fib,
+            &nodes,
+            &peer_nodes,
+            &static_routes,
+            &lsa_snapshot,
+            &reachability,
+        )
+        .await;
 
         for peer_uuid in peer_uuids {
             if should_initiate_peer(self_uuid, peer_uuid) {
@@ -3747,6 +3934,10 @@ async fn handle_peer_message(
                         let snapshot = lsa_snapshot.lock().await;
                         find_remote_node(&snapshot, dst_uuid)
                     };
+                    let remote = match remote {
+                        Some(info) => Some(info),
+                        None => find_reachable_node(&*reachability.lock().await, dst_uuid),
+                    };
                     if let Some(remote) = remote {
                         if vpn_allows_between(
                             &msg.meta,
@@ -3757,7 +3948,7 @@ async fn handle_peer_message(
                         ) {
                             if let Some(peer) = peers.lock().await.get(peer_uuid).cloned() {
                                 forward_to_hive(
-                                    &remote.hive_id,
+                                    &remote.next_hop_hive,
                                     &msg,
                                     is_gateway,
                                     peer_routers,
@@ -3990,7 +4181,9 @@ async fn handle_peer_message(
     }
 
     if !senders.is_empty() {
-        if let Some(data) = serialize_for_local_delivery(memory_reader, hive_id, &msg, false).await? {
+        if let Some(data) =
+            serialize_for_local_delivery(memory_reader, hive_id, &msg, false).await?
+        {
             for sender in senders {
                 let _ = sender.send(data.clone());
             }
@@ -4405,7 +4598,15 @@ async fn refresh_config(
                 "config snapshot updated"
             );
             reassign_vpns(&snapshot, nodes, shm).await;
-            rebuild_fib(fib, nodes, peer_nodes, static_routes, lsa_snapshot, reachability).await;
+            rebuild_fib(
+                fib,
+                nodes,
+                peer_nodes,
+                static_routes,
+                lsa_snapshot,
+                reachability,
+            )
+            .await;
         }
         last_snapshot = Some(snapshot);
         break;
@@ -5041,7 +5242,15 @@ async fn refresh_lsa(
             let mut guard = lsa_snapshot.lock().await;
             *guard = Some(snapshot.clone());
         }
-        rebuild_fib(fib, nodes, peer_nodes, static_routes, lsa_snapshot, reachability).await;
+        rebuild_fib(
+            fib,
+            nodes,
+            peer_nodes,
+            static_routes,
+            lsa_snapshot,
+            reachability,
+        )
+        .await;
     }
     snapshot
 }
@@ -6519,6 +6728,75 @@ mod tests {
         ));
     }
 
+    // ---- Option B: WAN multi-hop reachability (edge-multihop-reachability-spec-v1) ----
+
+    #[test]
+    fn wan_reachability_only_primary_hub_may_vouch() {
+        assert!(system_policy::wan_reachability_voucher_allowed("motherbee"));
+        assert!(!system_policy::wan_reachability_voucher_allowed("worker1"));
+        assert!(!system_policy::wan_reachability_voucher_allowed("ingress1"));
+        assert!(!system_policy::wan_reachability_voucher_allowed(""));
+    }
+
+    #[test]
+    fn find_reachable_node_marks_via_hub_and_next_hop() {
+        let mut table = std::collections::HashMap::new();
+        let uuid = Uuid::new_v4();
+        table.insert(
+            uuid,
+            ReachabilityEntry {
+                name: "IO.api.orders@worker1".to_string(),
+                origin_hive: "worker1".to_string(),
+                next_hop_hive: "motherbee".to_string(),
+                vpn_id: 0,
+                last_seq: 1,
+                last_updated: 0,
+            },
+        );
+        let info = find_reachable_node(&table, uuid).expect("resolves");
+        assert!(info.via_hub);
+        assert_eq!(info.hive_id, "worker1"); // origin — for canonical name + authority
+        assert_eq!(info.next_hop_hive, "motherbee"); // forward target (a direct WAN peer)
+        assert!(find_reachable_node(&table, Uuid::new_v4()).is_none());
+    }
+
+    #[tokio::test]
+    async fn via_hub_src_is_denied_system_authority_but_direct_src_is_allowed() {
+        // The security invariant: a transitively hub-vouched origin, even bearing an authoritative
+        // name (SY.orchestrator@<hive> is normally the cross-hive control plane), must NOT pass the
+        // protected-SYSTEM gate. The SAME frame from a directly-authenticated src is admitted.
+        let memory_reader = Arc::new(Mutex::new(None::<MemoryRegionReader>));
+        let msg = Message {
+            routing: Routing {
+                src: Uuid::new_v4().to_string(),
+                src_l2_name: Some("SY.orchestrator@worker1".to_string()),
+                dst: Destination::Unicast("SY.orchestrator@motherbee".to_string()),
+                ttl: 16,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: SYSTEM_KIND.to_string(),
+                msg: Some("SPAWN_NODE".to_string()),
+                ..Meta::default()
+            },
+            payload: serde_json::json!({}),
+        };
+        let direct = serialize_for_local_delivery(&memory_reader, "motherbee", &msg, false)
+            .await
+            .unwrap();
+        assert!(
+            direct.is_some(),
+            "directly-authenticated orchestrator is allowed"
+        );
+        let vouched = serialize_for_local_delivery(&memory_reader, "motherbee", &msg, true)
+            .await
+            .unwrap();
+        assert!(
+            vouched.is_none(),
+            "hub-vouched (via_hub) origin must be denied SYSTEM authority"
+        );
+    }
+
     #[test]
     fn canonical_wan_src_name_binds_role_to_bucket_hive() {
         // suffix already matches the authenticated bucket -> unchanged
@@ -7148,6 +7426,7 @@ mod tests {
             Uuid::new_v4(),
             false,
             &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new())),
             None,
         )
         .await
@@ -7226,6 +7505,7 @@ mod tests {
             Uuid::new_v4(),
             false,
             &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new())),
             None,
         )
         .await
@@ -7356,6 +7636,7 @@ mod tests {
             router_uuid,
             false,
             &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(HashMap::<Uuid, ReachabilityEntry>::new())),
             &Arc::new(Mutex::new(HashMap::<String, u64>::new())),
         )
         .await
