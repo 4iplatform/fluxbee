@@ -137,7 +137,10 @@ gen_unit() { # <name> [after] [wants] [role_regex]
     # instead of crash-looping on the binary's wrong-role exit under Restart=always.
     [ -n "$role_regex" ] && echo "ExecCondition=/bin/sh -c 'grep -qE \"^role:[[:space:]]*($role_regex)\" /etc/fluxbee/hive.yaml'"
     echo "ExecStart=/usr/bin/$name"
-    echo "Restart=always"; echo "RestartSec=5"; echo
+    echo "Restart=always"; echo "RestartSec=5"
+    # Bound shutdown so a stop/restart/upgrade can't hang on the systemd default (90s) then SIGKILL.
+    # The binaries exit promptly on SIGTERM; sy-orchestrator no longer tears the hive down on exit.
+    echo "TimeoutStopSec=15"; echo
     echo "[Install]"; echo "WantedBy=multi-user.target"; } > "$DEST/lib/systemd/system/$name.service"
 }
 # Units whose binary exits on the wrong hive role (sy-admin/sy-storage=motherbee,
@@ -177,6 +180,7 @@ ExecCondition=/bin/sh -c 'grep -qE "^role:[[:space:]]*motherbee" /etc/fluxbee/hi
 ExecStart=/usr/bin/io-cloud
 Restart=always
 RestartSec=5
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target
@@ -199,6 +203,7 @@ UMask=0027
 ExecStart=/usr/bin/io-blob
 Restart=always
 RestartSec=5
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target

@@ -1102,6 +1102,7 @@ ${cond_line}
 ExecStart=${exec}
 Restart=always
 RestartSec=5
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target

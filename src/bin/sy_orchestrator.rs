@@ -882,13 +882,20 @@ async fn main() -> Result<(), OrchestratorError> {
                 }
             }
             _ = sigterm.recv() => {
-                tracing::warn!("SIGTERM received; shutting down");
-                shutdown_sequence(&state).await;
+                // The orchestrator is a SUPERVISOR, not the owner of the hive's service processes:
+                // rt-gateway and the SY.* nodes are independent systemd units (only sy-orchestrator
+                // is `enabled`). Its own restart/upgrade must be TRANSPARENT to them — a package
+                // upgrade or `systemctl restart sy-orchestrator` must never blip the running hive —
+                // so we exit PROMPTLY and do NOT tear services down here. The next orchestrator boot
+                // idempotently re-adopts whatever is already running. Deliberate machine shutdown is
+                // handled by systemd stopping every active unit; a deliberate hive teardown, if ever
+                // needed, is an explicit operation, not this process's exit path. (Fixes the
+                // io-api-audit residual: apt upgrade previously hung 90s here then SIGKILLed.)
+                tracing::info!("SIGTERM received; orchestrator exiting (managed services keep running)");
                 return Ok(());
             }
             _ = sigint.recv() => {
-                tracing::warn!("SIGINT received; shutting down");
-                shutdown_sequence(&state).await;
+                tracing::info!("SIGINT received; orchestrator exiting (managed services keep running)");
                 return Ok(());
             }
         }
@@ -1894,44 +1901,6 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
             }
         }
         _ => {}
-    }
-}
-
-async fn shutdown_sequence(state: &OrchestratorState) {
-    let tracked = state.tracked_nodes.lock().await;
-    for node in tracked.iter() {
-        tracing::warn!(
-            node = node.as_str(),
-            "shutdown pending; node still connected"
-        );
-    }
-    drop(tracked);
-
-    time::sleep(Duration::from_secs(10)).await;
-
-    let mut shutdown_services: Vec<String> = state
-        .system_nodes
-        .nodes
-        .iter()
-        .map(|name| name_to_service(name))
-        .collect();
-    shutdown_services.reverse();
-    for service in &shutdown_services {
-        if let Err(err) = systemd_stop(service) {
-            tracing::warn!(service = service.as_str(), error = %err, "failed to stop service");
-        }
-    }
-    if let Err(err) = systemd_stop("rt-gateway") {
-        tracing::warn!(service = "rt-gateway", error = %err, "failed to stop service");
-    }
-    if systemd_is_active(SYNCTHING_SERVICE_NAME) {
-        if let Err(err) = systemd_stop(SYNCTHING_SERVICE_NAME) {
-            tracing::warn!(
-                service = SYNCTHING_SERVICE_NAME,
-                error = %err,
-                "failed to stop service"
-            );
-        }
     }
 }
 
