@@ -80,6 +80,9 @@ pub struct Router {
     broadcast_cache: Arc<Mutex<BroadcastCache>>,
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     lsa_state: Arc<Mutex<std::collections::HashMap<String, RemoteHiveState>>>,
+    /// Hub-vouched multi-hop reachability table (Option B). Populated ONLY on spokes, from the
+    /// hub's `MSG_WAN_REACHABILITY` advertisements. Kept separate from `lsa_state`/the LSA snapshot.
+    reachability: Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
     lsa_seq: Arc<Mutex<u64>>,
     thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
     nats_publisher: Option<Arc<NatsPublisher>>,
@@ -155,6 +158,7 @@ impl Router {
             broadcast_cache: Arc::new(Mutex::new(BroadcastCache::new())),
             wan_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             lsa_state: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            reachability: Arc::new(Mutex::new(std::collections::HashMap::new())),
             lsa_seq: Arc::new(Mutex::new(0)),
             thread_sequences: Arc::new(Mutex::new(HashMap::new())),
             nats_publisher,
@@ -218,6 +222,7 @@ impl Router {
         let vpn_rules_pd = Arc::clone(&self.vpn_rules);
         let tap_rules_pd = Arc::clone(&self.tap_rules);
         let lsa_snapshot_pd = Arc::clone(&self.lsa_snapshot);
+        let reachability_pd = Arc::clone(&self.reachability);
         let fib_pd = Arc::clone(&self.fib);
         let config_reader_pd = Arc::clone(&self.config_reader);
         let lsa_reader_pd = Arc::clone(&self.lsa_reader);
@@ -258,6 +263,7 @@ impl Router {
                 opa_reader_pd,
                 memory_reader_pd,
                 lsa_snapshot_pd,
+                reachability_pd,
                 fib_pd,
                 thread_sequences_pd,
                 is_gateway,
@@ -271,6 +277,7 @@ impl Router {
         let peer_nodes = Arc::clone(&self.peer_nodes);
         let static_routes = Arc::clone(&self.static_routes);
         let fib = Arc::clone(&self.fib);
+        let reachability = Arc::clone(&self.reachability);
         let hive_id = self.cfg.hive_id.clone();
         tokio::spawn(async move {
             lsa_refresh_loop(
@@ -281,6 +288,7 @@ impl Router {
                 peer_nodes,
                 static_routes,
                 fib,
+                reachability,
             )
             .await;
         });
@@ -304,6 +312,7 @@ impl Router {
         let identity_frontdesk_node_name = self.cfg.identity_frontdesk_node_name.clone();
         let wan_peers = Arc::clone(&self.wan_peers);
         let lsa_snapshot = Arc::clone(&self.lsa_snapshot);
+        let reachability = Arc::clone(&self.reachability);
         let thread_sequences = Arc::clone(&self.thread_sequences);
         let is_gateway = self.cfg.is_gateway;
         let router_uuid = self.cfg.router_uuid;
@@ -335,6 +344,7 @@ impl Router {
                 let wan_peers = Arc::clone(&wan_peers);
                 let lsa_reader = Arc::clone(&lsa_reader);
                 let lsa_snapshot = Arc::clone(&lsa_snapshot);
+                let reachability = Arc::clone(&reachability);
                 let thread_sequences = Arc::clone(&thread_sequences);
                 let is_gateway = is_gateway;
                 tokio::spawn(async move {
@@ -360,6 +370,7 @@ impl Router {
                         identity_frontdesk_node_name,
                         wan_peers,
                         lsa_snapshot,
+                        reachability,
                         thread_sequences,
                         is_gateway,
                     )
@@ -441,6 +452,7 @@ impl Router {
                 peers: Arc::clone(&self.peers),
                 wan_peers: Arc::clone(&self.wan_peers),
                 lsa_state: Arc::clone(&self.lsa_state),
+                reachability: Arc::clone(&self.reachability),
                 lsa_writer: Arc::clone(&self.lsa_writer),
                 lsa_snapshot: Arc::clone(&self.lsa_snapshot),
                 static_routes: Arc::clone(&self.static_routes),
@@ -494,6 +506,7 @@ impl Router {
             let config_reader = Arc::clone(&self.config_reader);
             let lsa_reader = Arc::clone(&self.lsa_reader);
             let lsa_snapshot = Arc::clone(&self.lsa_snapshot);
+            let reachability = Arc::clone(&self.reachability);
             let static_routes = Arc::clone(&self.static_routes);
             let vpn_rules = Arc::clone(&self.vpn_rules);
             let tap_rules = Arc::clone(&self.tap_rules);
@@ -521,6 +534,7 @@ impl Router {
                     config_reader,
                     lsa_reader,
                     lsa_snapshot,
+                    reachability,
                     static_routes,
                     vpn_rules,
                     tap_rules,
@@ -560,6 +574,7 @@ async fn handle_node(
     config_reader: Arc<Mutex<Option<ConfigRegionReader>>>,
     lsa_reader: Arc<Mutex<Option<LsaRegionReader>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
+    reachability: Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
     vpn_rules: Arc<Mutex<Vec<VpnAssignment>>>,
     tap_rules: Arc<Mutex<Vec<TapEntry>>>,
@@ -635,6 +650,7 @@ async fn handle_node(
         &shm,
         &fib,
         &lsa_snapshot,
+        &reachability,
         false,
     )
     .await;
@@ -645,6 +661,7 @@ async fn handle_node(
         let peer_nodes = Arc::clone(&peer_nodes);
         let static_routes = Arc::clone(&static_routes);
         let fib = Arc::clone(&fib);
+        let reachability = Arc::clone(&reachability);
         let hive_id = hive_id.to_string();
         tokio::spawn(async move {
             let _ = refresh_lsa(
@@ -655,6 +672,7 @@ async fn handle_node(
                 &peer_nodes,
                 &static_routes,
                 &fib,
+                &reachability,
             )
             .await;
         });
@@ -680,7 +698,7 @@ async fn handle_node(
             },
         );
     }
-    rebuild_fib(&fib, &nodes, &peer_nodes, &static_routes, &lsa_snapshot).await;
+    rebuild_fib(&fib, &nodes, &peer_nodes, &static_routes, &lsa_snapshot, &reachability).await;
     if is_gateway {
         let _ = broadcast_lsa_direct(
             router_uuid,
@@ -760,6 +778,7 @@ async fn handle_node(
                             &shm,
                             &fib,
                             &lsa_snapshot,
+                            &reachability,
                             true,
                         )
                         .await;
@@ -867,6 +886,7 @@ async fn handle_node(
                     &shm,
                     &fib,
                     &lsa_snapshot,
+                    &reachability,
                     false,
                 )
                 .await;
@@ -878,6 +898,7 @@ async fn handle_node(
                     &peer_nodes,
                     &static_routes,
                     &fib,
+                    &reachability,
                 )
                 .await;
                 handle_message(
@@ -897,6 +918,7 @@ async fn handle_node(
                     router_uuid,
                     is_gateway,
                     &lsa_snapshot,
+                    &reachability,
                     snapshot.as_ref(),
                 )
                 .await?;
@@ -918,7 +940,7 @@ async fn handle_node(
             }
         }
     }
-    rebuild_fib(&fib, &nodes, &peer_nodes, &static_routes, &lsa_snapshot).await;
+    rebuild_fib(&fib, &nodes, &peer_nodes, &static_routes, &lsa_snapshot, &reachability).await;
     if is_gateway {
         let _ = broadcast_lsa_direct(
             router_uuid,
@@ -956,6 +978,7 @@ async fn handle_message(
     router_uuid: Uuid,
     is_gateway: bool,
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
+    reachability: &Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
     snapshot: Option<&ConfigSnapshot>,
 ) -> Result<(), RouterError> {
     let mut msg = msg.clone();
@@ -2349,6 +2372,7 @@ async fn lsa_refresh_loop(
     peer_nodes: Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
+    reachability: Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
 ) {
     let mut ticker = time::interval(Duration::from_secs(5));
     loop {
@@ -2361,6 +2385,7 @@ async fn lsa_refresh_loop(
             &peer_nodes,
             &static_routes,
             &fib,
+            &reachability,
         )
         .await;
     }
@@ -3197,6 +3222,7 @@ async fn peer_discovery_loop(
     opa_reader: Arc<Mutex<Option<OpaRegionReader>>>,
     memory_reader: Arc<Mutex<Option<MemoryRegionReader>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
+    reachability: Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
     thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
     is_gateway: bool,
@@ -3229,7 +3255,7 @@ async fn peer_discovery_loop(
             let mut peer_guard = peer_routers.lock().await;
             *peer_guard = updated_routers;
         }
-        rebuild_fib(&fib, &nodes, &peer_nodes, &static_routes, &lsa_snapshot).await;
+        rebuild_fib(&fib, &nodes, &peer_nodes, &static_routes, &lsa_snapshot, &reachability).await;
 
         for peer_uuid in peer_uuids {
             if should_initiate_peer(self_uuid, peer_uuid) {
@@ -3258,6 +3284,7 @@ async fn peer_discovery_loop(
                     let vpn_rules = Arc::clone(&vpn_rules);
                     let tap_rules = Arc::clone(&tap_rules);
                     let lsa_snapshot = Arc::clone(&lsa_snapshot);
+                    let reachability = Arc::clone(&reachability);
                     let thread_sequences = Arc::clone(&thread_sequences);
                     let is_gateway = is_gateway;
                     let socket_dir = socket_dir.clone();
@@ -3287,6 +3314,7 @@ async fn peer_discovery_loop(
                             &hive_id,
                             &identity_frontdesk_node_name,
                             lsa_snapshot,
+                            reachability,
                             fib,
                             thread_sequences,
                             is_gateway,
@@ -3390,6 +3418,7 @@ async fn connect_to_peer(
     hive_id: &str,
     identity_frontdesk_node_name: &str,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
+    reachability: Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
     fib: Arc<Mutex<Vec<FibEntry>>>,
     thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
     is_gateway: bool,
@@ -3454,6 +3483,7 @@ async fn connect_to_peer(
                         self_uuid,
                         is_gateway,
                         &lsa_snapshot,
+                        &reachability,
                         &thread_sequences,
                     )
                     .await?;
@@ -3492,6 +3522,7 @@ async fn handle_peer_incoming(
     identity_frontdesk_node_name: String,
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
+    reachability: Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
     thread_sequences: Arc<Mutex<HashMap<String, u64>>>,
     is_gateway: bool,
 ) -> Result<(), RouterError> {
@@ -3553,6 +3584,7 @@ async fn handle_peer_incoming(
                         router_uuid,
                         is_gateway,
                         &lsa_snapshot,
+                        &reachability,
                         &thread_sequences,
                     )
                     .await?;
@@ -3593,6 +3625,7 @@ async fn handle_peer_message(
     router_uuid: Uuid,
     is_gateway: bool,
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
+    reachability: &Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
     thread_sequences: &Arc<Mutex<HashMap<String, u64>>>,
 ) -> Result<(), RouterError> {
     let mut msg = msg.clone();
@@ -3614,6 +3647,7 @@ async fn handle_peer_message(
             shm,
             fib,
             lsa_snapshot,
+            reachability,
             true,
         )
         .await;
@@ -3664,6 +3698,7 @@ async fn handle_peer_message(
         peer_nodes,
         static_routes,
         fib,
+        reachability,
     )
     .await;
     let mut senders: Vec<mpsc::UnboundedSender<Vec<u8>>> = Vec::new();
@@ -3978,7 +4013,31 @@ fn canonical_wan_src_name(name: &str, bucket_hive: &str) -> String {
 struct RemoteNodeInfo {
     name: String,
     vpn_id: u32,
+    /// Origin hive of the node (where it is locally attached). Used for the canonical `role@hive`
+    /// name binding and the SYSTEM-authority decision.
     hive_id: String,
+    /// Hive to forward toward to reach this node. Equals `hive_id` for a directly-learned node;
+    /// for a hub-vouched (`via_hub`) node it is the vouching hub (a direct WAN peer).
+    next_hop_hive: String,
+    /// True when this node was learned transitively from the hub's reachability advertisement
+    /// (not a directly mTLS-authenticated LSA). Admitted for DATA delivery, denied SYSTEM authority.
+    via_hub: bool,
+}
+
+/// One hub-vouched reachable node in a spoke's `reachability` table (Option B,
+/// edge-multihop-reachability-spec-v1). Never merged into the identity-bearing LSA snapshot.
+#[derive(Clone, Debug)]
+struct ReachabilityEntry {
+    name: String,
+    /// The node's origin hive (the spoke it is locally attached to).
+    origin_hive: String,
+    /// The vouching hub to forward toward (a direct WAN peer of this router).
+    next_hop_hive: String,
+    vpn_id: u32,
+    /// Advertisement sequence from the vouching hub, for out-of-order / staleness dedup.
+    last_seq: u64,
+    /// Local receive time (ms); entries expire when no advertisement refreshes them.
+    last_updated: u64,
 }
 
 fn find_remote_node(snapshot: &Option<LsaSnapshot>, uuid: Uuid) -> Option<RemoteNodeInfo> {
@@ -4013,10 +4072,30 @@ fn find_remote_node(snapshot: &Option<LsaSnapshot>, uuid: Uuid) -> Option<Remote
         return Some(RemoteNodeInfo {
             name,
             vpn_id: node.vpn_id,
+            next_hop_hive: hive_id.clone(),
             hive_id,
+            via_hub: false,
         });
     }
     None
+}
+
+/// Resolve a node UUID against the hub-vouched reachability table (Option B). Returns a
+/// `RemoteNodeInfo` flagged `via_hub` whose `next_hop_hive` is the vouching hub (a direct WAN
+/// peer) — the forwarding target — while `hive_id` is the node's ORIGIN hive, used only for the
+/// canonical name binding. A `via_hub` result is admitted for DATA delivery but denied SYSTEM
+/// authority (see `serialize_for_local_delivery`).
+fn find_reachable_node(
+    reachability: &std::collections::HashMap<Uuid, ReachabilityEntry>,
+    uuid: Uuid,
+) -> Option<RemoteNodeInfo> {
+    reachability.get(&uuid).map(|entry| RemoteNodeInfo {
+        name: entry.name.clone(),
+        vpn_id: entry.vpn_id,
+        hive_id: entry.origin_hive.clone(),
+        next_hop_hive: entry.next_hop_hive.clone(),
+        via_hub: true,
+    })
 }
 
 fn ensure_parent_dir(path: &Path) -> io::Result<()> {
@@ -4104,6 +4183,7 @@ struct WanContext {
     peers: Arc<Mutex<std::collections::HashMap<Uuid, PeerHandle>>>,
     wan_peers: Arc<Mutex<std::collections::HashMap<String, WanPeer>>>,
     lsa_state: Arc<Mutex<std::collections::HashMap<String, RemoteHiveState>>>,
+    reachability: Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
     lsa_writer: Arc<Mutex<Option<LsaRegionWriter>>>,
     lsa_snapshot: Arc<Mutex<Option<LsaSnapshot>>>,
     static_routes: Arc<Mutex<Vec<StaticRoute>>>,
@@ -4144,6 +4224,9 @@ struct StaticRoute {
 const ADMIN_DISTANCE_LOCAL: u8 = 0;
 const ADMIN_DISTANCE_STATIC: u8 = 1;
 const ADMIN_DISTANCE_LSA: u8 = 2;
+/// Hub-vouched multi-hop reachability (Option B). Strictly LESS preferred than a directly-learned
+/// LSA node for the same name, so a direct route always wins when both exist.
+const ADMIN_DISTANCE_REACHABILITY: u8 = 3;
 
 #[derive(Clone, Debug)]
 enum FibSource {
@@ -4152,6 +4235,8 @@ enum FibSource {
     StaticRoute,
     LsaNode,
     LsaRoute,
+    /// Hub-vouched multi-hop reachability (Option B): forwards toward the vouching hub next-hop.
+    ReachableNode,
 }
 
 #[derive(Clone, Debug)]
@@ -4227,6 +4312,7 @@ async fn refresh_config(
     shm: &Arc<Mutex<RouterRegionWriter>>,
     fib: &Arc<Mutex<Vec<FibEntry>>>,
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
+    reachability: &Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
     force: bool,
 ) -> Option<ConfigSnapshot> {
     let mut last_snapshot = None;
@@ -4305,7 +4391,7 @@ async fn refresh_config(
                 "config snapshot updated"
             );
             reassign_vpns(&snapshot, nodes, shm).await;
-            rebuild_fib(fib, nodes, peer_nodes, static_routes, lsa_snapshot).await;
+            rebuild_fib(fib, nodes, peer_nodes, static_routes, lsa_snapshot, reachability).await;
         }
         last_snapshot = Some(snapshot);
         break;
@@ -4933,6 +5019,7 @@ async fn refresh_lsa(
     peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
     fib: &Arc<Mutex<Vec<FibEntry>>>,
+    reachability: &Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
 ) -> Option<LsaSnapshot> {
     let snapshot = read_lsa_snapshot_for_routing(lsa_reader, hive_id, HEARTBEAT_STALE_MS).await;
     if let Some(snapshot) = snapshot.clone() {
@@ -4940,7 +5027,7 @@ async fn refresh_lsa(
             let mut guard = lsa_snapshot.lock().await;
             *guard = Some(snapshot.clone());
         }
-        rebuild_fib(fib, nodes, peer_nodes, static_routes, lsa_snapshot).await;
+        rebuild_fib(fib, nodes, peer_nodes, static_routes, lsa_snapshot, reachability).await;
     }
     snapshot
 }
@@ -5062,6 +5149,7 @@ async fn rebuild_fib(
     peer_nodes: &Arc<Mutex<std::collections::HashMap<Uuid, PeerNode>>>,
     static_routes: &Arc<Mutex<Vec<StaticRoute>>>,
     lsa_snapshot: &Arc<Mutex<Option<LsaSnapshot>>>,
+    reachability: &Arc<Mutex<std::collections::HashMap<Uuid, ReachabilityEntry>>>,
 ) {
     let nodes_snapshot: Vec<(Uuid, NodeHandle)> = {
         let nodes_guard = nodes.lock().await;
@@ -5212,6 +5300,27 @@ async fn rebuild_fib(
                 metric: route.metric,
                 installed_at: updated_at,
                 action: route.action,
+            });
+        }
+    }
+
+    // Option B: hub-vouched multi-hop reachability. Each entry forwards toward its vouching hub
+    // (next_hop_hive, a direct WAN peer); the hub re-resolves the unchanged dst onward. Installed
+    // at ADMIN_DISTANCE_REACHABILITY so a directly-learned LSA node for the same name always wins.
+    {
+        let reach_guard = reachability.lock().await;
+        for entry in reach_guard.values() {
+            entries.push(FibEntry {
+                pattern: entry.name.clone(),
+                match_kind: MATCH_EXACT,
+                vpn_id: entry.vpn_id,
+                source: FibSource::ReachableNode,
+                next_hop: Some(FibNextHop::Hive(entry.next_hop_hive.clone())),
+                admin_distance: ADMIN_DISTANCE_REACHABILITY,
+                priority: 0,
+                metric: 0,
+                installed_at: entry.last_updated,
+                action: ACTION_FORWARD,
             });
         }
     }
@@ -5509,7 +5618,9 @@ async fn resolve_by_name_inner(
                 }
                 return Ok(ResolvedRoute::Unreachable("VPN_BLOCKED"));
             }
-            FibSource::LsaNode => {
+            // LsaNode = directly-learned remote hive; ReachableNode = hub-vouched multi-hop
+            // (its next_hop is the vouching hub). Both forward via FibNextHop::Hive.
+            FibSource::LsaNode | FibSource::ReachableNode => {
                 let Some(FibNextHop::Hive(hive)) = &entry.next_hop else {
                     continue;
                 };
@@ -5533,9 +5644,10 @@ async fn resolve_by_name_any_hive(
     let fib_guard = fib.lock().await;
     for entry in fib_guard.iter() {
         let matched = match entry.source {
-            FibSource::LocalNode | FibSource::PeerNode | FibSource::LsaNode => {
-                match_any_hive(base, &entry.pattern)
-            }
+            FibSource::LocalNode
+            | FibSource::PeerNode
+            | FibSource::LsaNode
+            | FibSource::ReachableNode => match_any_hive(base, &entry.pattern),
             FibSource::StaticRoute | FibSource::LsaRoute => {
                 let target = format!("{}@*", base);
                 pattern_match_kind(entry.match_kind, &entry.pattern, &target)
@@ -5592,7 +5704,7 @@ async fn resolve_by_name_any_hive(
                 }
                 return Ok(ResolvedRoute::Unreachable("VPN_BLOCKED"));
             }
-            FibSource::LsaNode => {
+            FibSource::LsaNode | FibSource::ReachableNode => {
                 let Some(FibNextHop::Hive(hive)) = &entry.next_hop else {
                     continue;
                 };

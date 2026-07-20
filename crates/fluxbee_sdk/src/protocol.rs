@@ -428,6 +428,31 @@ pub struct LsaTap {
     pub enabled: bool,
 }
 
+/// Hub-authored multi-hop reachability advertisement payload (`MSG_WAN_REACHABILITY`).
+/// `origin_hive`/`router_id` identify the AUTHORING hub (must equal the mTLS-authenticated peer
+/// bucket on ingest, same as `LsaPayload.hive`). `entries` list spoke nodes reachable via the hub;
+/// each entry's `hive_id` is the node's ORIGIN hive (the spoke it lives on), never the hub.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WanReachabilityPayload {
+    pub origin_hive: String,
+    #[serde(default)]
+    pub router_id: String,
+    #[serde(default)]
+    pub router_name: String,
+    pub seq: u64,
+    pub timestamp: String,
+    pub entries: Vec<WanReachabilityEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WanReachabilityEntry {
+    pub uuid: String,
+    pub name: String,
+    /// The node's origin hive (the spoke it is locally attached to), NOT the vouching hub.
+    pub hive_id: String,
+    pub vpn_id: u32,
+}
+
 impl Message {
     /// Returns the L2 canonical name of the sender as stamped by the router.
     ///
@@ -449,6 +474,12 @@ pub const MSG_TTL_EXCEEDED: &str = "TTL_EXCEEDED";
 pub const MSG_ECHO: &str = "ECHO";
 pub const MSG_ECHO_REPLY: &str = "ECHO_REPLY";
 pub const MSG_LSA: &str = "LSA";
+/// Hub-authored multi-hop reachability advertisement (Option B, edge-multihop-reachability-spec-v1).
+/// Emitted ONLY by a gateway (hub) in its own authenticated bucket, listing spoke nodes reachable
+/// through it so a spoke can resolve+forward to a non-adjacent hive. It is DISTINCT from `LSA`: it
+/// never writes the identity-bearing LSA snapshot and its entries are treated as `via_hub`
+/// (transitively learned) — admitted for data delivery but denied SYSTEM authority.
+pub const MSG_WAN_REACHABILITY: &str = "WAN_REACHABILITY";
 pub const MSG_WAN_ACCEPT: &str = "WAN_ACCEPT";
 pub const MSG_WAN_REJECT: &str = "WAN_REJECT";
 pub const MSG_TIME_SYNC: &str = "TIME_SYNC";
@@ -670,6 +701,23 @@ pub fn build_lsa(src: &str, dst: &str, trace_id: &str, payload: LsaPayload) -> M
         1,
         trace_id,
         MSG_LSA,
+        json!(payload),
+    )
+}
+
+/// Build a hub-authored `MSG_WAN_REACHABILITY` advertisement (ttl=1, single WAN hop to the peer).
+pub fn build_wan_reachability(
+    src: &str,
+    dst: &str,
+    trace_id: &str,
+    payload: WanReachabilityPayload,
+) -> Message {
+    build_system_message(
+        src,
+        Destination::Unicast(dst.to_string()),
+        1,
+        trace_id,
+        MSG_WAN_REACHABILITY,
         json!(payload),
     )
 }
