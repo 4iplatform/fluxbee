@@ -97,9 +97,10 @@ Default (`ssh_access:"revoke"`, or field absent) = **exactly today's behavior** 
   `storage_postgres_url`). Lab-verified that owner_node=SY.orchestrator makes the secret
   orchestrator-ILK-only (admin/operator read = UNAUTHORIZED), which defeats recovery; a pool
   secret is readable by SY system callers + the admin, so an operator can break-glass it.
-- **Wire `reconcile_hive_tls_material` to use the per-spoke key** (read `ssh:<hive_id>` from the
-  vault instead of `motherbee.key`) as a **fast-follow** — that closes the latent contradiction
-  and makes standing key access actually usable by the orchestrator. Separate change.
+- **DONE (commit e58d21a)**: `reconcile_hive_tls_material` now reads `ssh:<hive_id>` from the
+  vault for a key_only_persist hive (falls back to `motherbee.key` for revoke/legacy hives),
+  closing the reconcile↔revoke contradiction. Lab-verified: MB reconcile logs "reaching
+  key_only_persist hive via its per-spoke recovery key" for the persist hive and reaches it.
 - **Blast radius**: a vault compromise now yields sudo-capable shell on every persist-spoke. This
   is the accepted cost of a recovery path; document it in the security model.
 
