@@ -19556,7 +19556,7 @@ async fn vault_put_spoke_ssh_key(
     priv_pem: &str,
 ) -> Result<String, OrchestratorError> {
     let admin_target = teardown_admin_target();
-    let key = format!("ssh/{hive_id}");
+    let key = format!("ssh:{hive_id}");
     let params = serde_json::json!({
         "key": key,
         "value": { "private_key": priv_pem, "format": "openssh" },
@@ -19595,7 +19595,7 @@ async fn vault_put_spoke_ssh_key(
     hive_id: &str,
     _priv_pem: &str,
 ) -> Result<String, OrchestratorError> {
-    Ok(format!("ssh/{hive_id}"))
+    Ok(format!("ssh:{hive_id}"))
 }
 
 struct SpokeKeyPersistResult {

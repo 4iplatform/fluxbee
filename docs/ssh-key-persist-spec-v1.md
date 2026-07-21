@@ -26,9 +26,9 @@ After `add_hive {..., ssh_access:"key_only_persist"}`:
 - `PasswordAuthentication no` (hardened).
 - The `/etc/sudoers.d/fluxbee-orchestrator` NOPASSWD grant is **kept** (the per-spoke key
   needs sudo to be a real recovery path).
-- The per-spoke **private** key is in the vault under `ssh/<hive_id>`.
+- The per-spoke **private** key is in the vault under `ssh:<hive_id>`.
 - Response: `ssh_bootstrap_revoked:true` (MB key gone), `ssh_access:"key_only"`,
-  `spoke_key_vault_ref:"ssh/<hive_id>"`.
+  `spoke_key_vault_ref:"ssh:<hive_id>"`.
 
 Default (`ssh_access:"revoke"`, or field absent) = **exactly today's behavior** — no change.
 
@@ -65,7 +65,7 @@ Default (`ssh_access:"revoke"`, or field absent) = **exactly today's behavior** 
 3. `vault_put_spoke_ssh_key(state, hive_id, priv_pem)` near `purge_vault_secrets_for_ilk`, with
    the same `cfg(test)`/`cfg(not(test))` split so unit tests never hit the mesh. Real impl:
    `orchestrator_admin_command(action="vault_put", target=Some(PRIMARY_HIVE_ID),
-   params={key:"ssh/<hive_id>", value:{private_key:priv_pem}, metadata:{resource_type:"ssh",
+   params={key:"ssh:<hive_id>", value:{private_key:priv_pem}, metadata:{resource_type:"ssh",
    tenant_id:DEFAULT_ROOT_TENANT_ID, owner_node:"SY.orchestrator", description:...}})`.
    **NEVER `tracing` the params** (private key).
 4. New helper `finalize_spoke_key_persist(address, mb_key_path, mb_pub, user, hive_id, state)`
@@ -94,7 +94,7 @@ Default (`ssh_access:"revoke"`, or field absent) = **exactly today's behavior** 
 - **owner_node scoping**: `SY.orchestrator` (least-priv; only the orchestrator ILK + the admin
   can read it) vs. omit (root-tenant pool like `storage_postgres_url`, any SY caller reads it).
   Recommend `SY.orchestrator` unless a non-orchestrator recovery reader is intended.
-- **Wire `reconcile_hive_tls_material` to use the per-spoke key** (read `ssh/<hive_id>` from the
+- **Wire `reconcile_hive_tls_material` to use the per-spoke key** (read `ssh:<hive_id>` from the
   vault instead of `motherbee.key`) as a **fast-follow** — that closes the latent contradiction
   and makes standing key access actually usable by the orchestrator. Separate change.
 - **Blast radius**: a vault compromise now yields sudo-capable shell on every persist-spoke. This
