@@ -1,8 +1,11 @@
 use std::collections::VecDeque;
+use std::fmt;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -12,6 +15,114 @@ use crate::function_calling::{
     FunctionCallingModel, FunctionLoopItem, FunctionModelTurnRequest, FunctionModelTurnResponse,
     FunctionToolCall,
 };
+use crate::text_payload::ModelContentPart;
+
+pub const DEFAULT_HIVE_AI_PROVIDER: AiProvider = AiProvider::OpenAi;
+pub const DEFAULT_HIVE_OPENAI_MODEL: &str = "gpt-5.5";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AiProvider {
+    #[default]
+    OpenAi,
+    Anthropic,
+}
+
+impl AiProvider {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+
+    pub fn resource_type(self) -> fluxbee_sdk::ResourceType {
+        match self {
+            Self::OpenAi => fluxbee_sdk::ResourceType::Openai,
+            Self::Anthropic => fluxbee_sdk::ResourceType::Anthropic,
+        }
+    }
+}
+
+impl fmt::Display for AiProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AiProvider {
+    type Err = AiSdkError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "openai" => Ok(Self::OpenAi),
+            "anthropic" => Ok(Self::Anthropic),
+            other => Err(AiSdkError::Protocol(format!(
+                "unsupported AI provider '{other}' (expected openai or anthropic)"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AiProviderModelConfig {
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct AiProviderConfigs {
+    #[serde(default)]
+    pub openai: Option<AiProviderModelConfig>,
+    #[serde(default)]
+    pub anthropic: Option<AiProviderModelConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct HiveAiConfig {
+    #[serde(default)]
+    pub default_provider: AiProvider,
+    #[serde(default)]
+    pub providers: AiProviderConfigs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveAiEngine {
+    pub provider: AiProvider,
+    pub model: String,
+}
+
+impl HiveAiConfig {
+    pub fn effective(&self) -> Result<EffectiveAiEngine> {
+        let config = match self.default_provider {
+            AiProvider::OpenAi => self.providers.openai.as_ref(),
+            AiProvider::Anthropic => self.providers.anthropic.as_ref(),
+        }
+        .ok_or_else(|| {
+            AiSdkError::Protocol(format!(
+                "hive ai.providers.{} is required for selected default_provider",
+                self.default_provider
+            ))
+        })?;
+        let model = config.model.trim();
+        if model.is_empty() {
+            return Err(AiSdkError::Protocol(format!(
+                "hive ai.providers.{}.model must not be empty",
+                self.default_provider
+            )));
+        }
+        Ok(EffectiveAiEngine {
+            provider: self.default_provider,
+            model: model.to_string(),
+        })
+    }
+
+    pub fn fallback() -> EffectiveAiEngine {
+        EffectiveAiEngine {
+            provider: DEFAULT_HIVE_AI_PROVIDER,
+            model: DEFAULT_HIVE_OPENAI_MODEL.to_string(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmRequest {
@@ -19,7 +130,7 @@ pub struct LlmRequest {
     pub system: Option<String>,
     pub input: String,
     #[serde(default)]
-    pub input_parts: Option<Vec<Value>>,
+    pub input_parts: Option<Vec<ModelContentPart>>,
     #[serde(default)]
     pub output_schema: Option<OutputSchemaSpec>,
     pub max_output_tokens: Option<u32>,
@@ -347,17 +458,48 @@ fn build_openai_input_items(request: &LlmRequest) -> Vec<Value> {
             "content": [{"type":"input_text","text": system}],
         }));
     }
-    let user_content = request.input_parts.clone().unwrap_or_else(|| {
-        vec![json!({
-            "type":"input_text",
-            "text": request.input
-        })]
-    });
+    let user_content = request
+        .input_parts
+        .as_ref()
+        .map(|parts| parts.iter().map(model_part_to_openai).collect::<Vec<_>>())
+        .unwrap_or_else(|| {
+            vec![json!({
+                "type":"input_text",
+                "text": request.input
+            })]
+        });
     input.push(json!({
         "role": "user",
         "content": user_content,
     }));
     input
+}
+
+fn model_part_to_openai(part: &ModelContentPart) -> Value {
+    match part {
+        ModelContentPart::Text { text } => json!({
+            "type": "input_text",
+            "text": text,
+        }),
+        ModelContentPart::Image {
+            media_type,
+            data_base64,
+            detail,
+        } => json!({
+            "type": "input_image",
+            "image_url": format!("data:{media_type};base64,{data_base64}"),
+            "detail": detail.clone().unwrap_or_else(|| "auto".to_string()),
+        }),
+        ModelContentPart::Document {
+            media_type,
+            filename,
+            data_base64,
+        } => json!({
+            "type": "input_file",
+            "filename": filename,
+            "file_data": format!("data:{media_type};base64,{data_base64}"),
+        }),
+    }
 }
 
 fn build_openai_response_format(output_schema: &OutputSchemaSpec) -> Result<Value> {
@@ -608,7 +750,7 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
                     FunctionLoopItem::UserContentParts { content } => {
                         input.push(json!({
                             "role": "user",
-                            "content": content,
+                            "content": content.iter().map(model_part_to_openai).collect::<Vec<_>>(),
                         }));
                     }
                     FunctionLoopItem::ToolResult { result } => {
@@ -624,6 +766,7 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
                             "output": output_text,
                         }));
                     }
+                    FunctionLoopItem::AssistantToolCalls { .. } => {}
                     other => input.push(loop_item_to_openai_input(other)),
                 }
             }
@@ -801,11 +944,15 @@ fn loop_item_to_openai_input(item: FunctionLoopItem) -> Value {
         }),
         FunctionLoopItem::UserContentParts { content } => json!({
             "role": "user",
-            "content": content,
+            "content": content.iter().map(model_part_to_openai).collect::<Vec<_>>(),
         }),
         FunctionLoopItem::AssistantText { content } => json!({
             "role": "assistant",
             "content": [{"type":"output_text","text": content}],
+        }),
+        FunctionLoopItem::AssistantToolCalls { content, .. } => json!({
+            "role": "assistant",
+            "content": content.map(|text| vec![json!({"type":"output_text","text":text})]).unwrap_or_default(),
         }),
         FunctionLoopItem::ToolResult { result } => {
             let output_text = match result.output {
@@ -817,6 +964,497 @@ fn loop_item_to_openai_input(item: FunctionLoopItem) -> Value {
                 "call_id": result.call_id,
                 "output": output_text,
             })
+        }
+    }
+}
+
+const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 1024;
+const ANTHROPIC_MAX_ATTEMPTS: usize = 3;
+
+#[derive(Clone)]
+pub struct AnthropicMessagesClient {
+    http: reqwest::Client,
+    api_key: String,
+    base_url: String,
+}
+
+impl AnthropicMessagesClient {
+    pub fn new(api_key: impl Into<String>) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            api_key: api_key.into(),
+            base_url: ANTHROPIC_MESSAGES_URL.to_string(),
+        }
+    }
+
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
+        self
+    }
+
+    pub fn function_model(
+        self,
+        model: impl Into<String>,
+        system: Option<String>,
+        model_settings: ModelSettings,
+    ) -> AnthropicFunctionCallingModel {
+        AnthropicFunctionCallingModel {
+            client: self,
+            model: model.into(),
+            system,
+            model_settings,
+        }
+    }
+
+    async fn send(&self, body: &Value) -> Result<Value> {
+        for attempt in 0..ANTHROPIC_MAX_ATTEMPTS {
+            let response = match self
+                .http
+                .post(&self.base_url)
+                .header(ACCEPT, "application/json")
+                .header(CONTENT_TYPE, "application/json")
+                .header(
+                    HeaderName::from_static("anthropic-version"),
+                    HeaderValue::from_static(ANTHROPIC_VERSION),
+                )
+                .header(HeaderName::from_static("x-api-key"), &self.api_key)
+                .json(body)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(err) if attempt + 1 < ANTHROPIC_MAX_ATTEMPTS => {
+                    tokio::time::sleep(anthropic_retry_delay(attempt, None)).await;
+                    tracing::warn!(attempt = attempt + 1, error = %err, "retrying Anthropic transport error");
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
+            let status = response.status();
+            let headers = response.headers().clone();
+            let request_id = headers
+                .get("request-id")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let value: Value = response.json().await?;
+            if status.is_success() {
+                return Ok(value);
+            }
+            if attempt + 1 < ANTHROPIC_MAX_ATTEMPTS
+                && anthropic_should_retry(status.as_u16(), &headers)
+            {
+                let retry_after = anthropic_retry_after(&headers);
+                tokio::time::sleep(anthropic_retry_delay(attempt, retry_after)).await;
+                tracing::warn!(attempt = attempt + 1, status = %status, request_id = %request_id, "retrying Anthropic response");
+                continue;
+            }
+            let error_type = value
+                .pointer("/error/type")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown_error");
+            let message = value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("Anthropic request failed");
+            return Err(AiSdkError::Protocol(format!(
+                "anthropic error status={} type={} request_id={} message={}",
+                status, error_type, request_id, message
+            )));
+        }
+        Err(AiSdkError::Protocol(
+            "Anthropic retry loop exhausted unexpectedly".to_string(),
+        ))
+    }
+}
+
+fn anthropic_should_retry(status: u16, headers: &reqwest::header::HeaderMap) -> bool {
+    match headers
+        .get("x-should-retry")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some("true") => return true,
+        Some("false") => return false,
+        _ => {}
+    }
+    matches!(status, 408 | 409 | 429) || status >= 500
+}
+
+fn anthropic_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    if let Some(ms) = headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Some(Duration::from_millis(ms).min(Duration::from_secs(60)));
+    }
+    headers
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|seconds| Duration::from_secs_f64(seconds.min(60.0)))
+}
+
+fn anthropic_retry_delay(attempt: usize, server_delay: Option<Duration>) -> Duration {
+    if let Some(delay) = server_delay {
+        return delay;
+    }
+    let base_ms = 500_u64.saturating_mul(1_u64 << attempt.min(4));
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+    let jitter_percent = 75 + (nanos % 51);
+    Duration::from_millis(base_ms.saturating_mul(jitter_percent) / 100)
+}
+
+#[async_trait]
+impl LlmClient for AnthropicMessagesClient {
+    async fn generate(&self, request: LlmRequest) -> Result<LlmResponse> {
+        let content = match request.input_parts.as_ref() {
+            Some(parts) => parts
+                .iter()
+                .map(model_part_to_anthropic)
+                .collect::<Result<Vec<_>>>()?,
+            None => vec![json!({"type":"text", "text": request.input})],
+        };
+        let max_tokens = request
+            .model_settings
+            .as_ref()
+            .and_then(|settings| settings.max_output_tokens)
+            .or(request.max_output_tokens)
+            .unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS);
+        let mut body = serde_json::Map::new();
+        body.insert("model".to_string(), Value::String(request.model));
+        body.insert("max_tokens".to_string(), Value::from(max_tokens));
+        body.insert(
+            "messages".to_string(),
+            json!([{"role":"user", "content":content}]),
+        );
+        if let Some(system) = request.system.filter(|value| !value.trim().is_empty()) {
+            body.insert("system".to_string(), Value::String(system));
+        }
+        if let Some(temperature) = request
+            .model_settings
+            .as_ref()
+            .and_then(|settings| settings.temperature)
+        {
+            body.insert("temperature".to_string(), Value::from(temperature));
+        }
+        if let Some(top_p) = request
+            .model_settings
+            .as_ref()
+            .and_then(|settings| settings.top_p)
+        {
+            body.insert("top_p".to_string(), Value::from(top_p));
+        }
+        if let Some(output_schema) = &request.output_schema {
+            output_schema.validate()?;
+            body.insert(
+                "output_config".to_string(),
+                json!({
+                    "format": {
+                        "type": "json_schema",
+                        "schema": output_schema.json_schema(),
+                    }
+                }),
+            );
+        }
+        let value = self.send(&Value::Object(body)).await?;
+        let text = anthropic_response_text(&value)?;
+        let text = match &request.output_schema {
+            Some(output_schema) => validate_structured_output(&text, output_schema)?,
+            None => text,
+        };
+        Ok(LlmResponse { content: text })
+    }
+}
+
+fn model_part_to_anthropic(part: &ModelContentPart) -> Result<Value> {
+    match part {
+        ModelContentPart::Text { text } => Ok(json!({"type":"text", "text":text})),
+        ModelContentPart::Image {
+            media_type,
+            data_base64,
+            ..
+        } => match media_type.as_str() {
+            "image/jpeg" | "image/png" | "image/gif" | "image/webp" => Ok(json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": data_base64,
+                }
+            })),
+            _ => Err(AiSdkError::Protocol(format!(
+                "anthropic unsupported image media_type={media_type}"
+            ))),
+        },
+        ModelContentPart::Document {
+            media_type,
+            filename,
+            data_base64,
+        } => {
+            if media_type != "application/pdf" {
+                return Err(AiSdkError::Protocol(format!(
+                    "anthropic unsupported document media_type={media_type} filename={filename}"
+                )));
+            }
+            Ok(json!({
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": data_base64,
+                },
+                "title": filename,
+            }))
+        }
+    }
+}
+
+fn anthropic_response_text(value: &Value) -> Result<String> {
+    let text = value
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("");
+    if text.is_empty() {
+        return Err(AiSdkError::Protocol(
+            "anthropic response missing text content".to_string(),
+        ));
+    }
+    Ok(text)
+}
+
+#[derive(Clone)]
+pub struct AnthropicFunctionCallingModel {
+    client: AnthropicMessagesClient,
+    model: String,
+    system: Option<String>,
+    model_settings: ModelSettings,
+}
+
+#[async_trait]
+impl FunctionCallingModel for AnthropicFunctionCallingModel {
+    async fn run_turn(
+        &self,
+        request: FunctionModelTurnRequest,
+    ) -> Result<FunctionModelTurnResponse> {
+        let (system, messages) = build_anthropic_function_messages(&self.system, &request.items)?;
+        let tools = request
+            .tools
+            .into_iter()
+            .map(|tool| {
+                json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.parameters_json_schema,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut body = serde_json::Map::new();
+        body.insert("model".to_string(), Value::String(self.model.clone()));
+        body.insert("messages".to_string(), Value::Array(messages));
+        body.insert("tools".to_string(), Value::Array(tools));
+        body.insert(
+            "max_tokens".to_string(),
+            Value::from(
+                self.model_settings
+                    .max_output_tokens
+                    .unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS),
+            ),
+        );
+        if !system.is_empty() {
+            body.insert("system".to_string(), Value::String(system));
+        }
+        if let Some(temperature) = self.model_settings.temperature {
+            body.insert("temperature".to_string(), Value::from(temperature));
+        }
+        if let Some(top_p) = self.model_settings.top_p {
+            body.insert("top_p".to_string(), Value::from(top_p));
+        }
+        let value = self.client.send(&Value::Object(body)).await?;
+        let mut assistant_text = Vec::new();
+        let mut tool_calls = Vec::new();
+        if let Some(content) = value.get("content").and_then(Value::as_array) {
+            for block in content {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                            assistant_text.push(text.to_string());
+                        }
+                    }
+                    Some("tool_use") => {
+                        let call_id = block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let name = block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        if !call_id.is_empty() && !name.is_empty() {
+                            tool_calls.push(FunctionToolCall {
+                                call_id,
+                                response_id: None,
+                                name,
+                                arguments: block.get("input").cloned().unwrap_or_else(|| json!({})),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let tokens_used = value
+            .get("usage")
+            .map(|usage| {
+                usage
+                    .get("input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .saturating_add(
+                        usage
+                            .get("output_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    )
+            })
+            .unwrap_or(0) as u32;
+        Ok(FunctionModelTurnResponse {
+            assistant_text: if assistant_text.is_empty() {
+                None
+            } else {
+                Some(assistant_text.join(""))
+            },
+            tool_calls,
+            tokens_used,
+        })
+    }
+}
+
+fn build_anthropic_function_messages(
+    configured_system: &Option<String>,
+    items: &[FunctionLoopItem],
+) -> Result<(String, Vec<Value>)> {
+    let mut system_parts = configured_system.iter().cloned().collect::<Vec<_>>();
+    let mut messages = Vec::new();
+    let mut index = 0usize;
+    while index < items.len() {
+        match &items[index] {
+            FunctionLoopItem::SystemText { content } => system_parts.push(content.clone()),
+            FunctionLoopItem::UserText { content } => messages.push(json!({
+                "role": "user",
+                "content": [{"type":"text", "text":content}],
+            })),
+            FunctionLoopItem::UserContentParts { content } => messages.push(json!({
+                "role": "user",
+                "content": content.iter().map(model_part_to_anthropic).collect::<Result<Vec<_>>>()?,
+            })),
+            FunctionLoopItem::AssistantText { content } => messages.push(json!({
+                "role": "assistant",
+                "content": [{"type":"text", "text":content}],
+            })),
+            FunctionLoopItem::AssistantToolCalls { content, calls } => {
+                let mut blocks = Vec::new();
+                if let Some(text) = content.as_deref().filter(|value| !value.is_empty()) {
+                    blocks.push(json!({"type":"text", "text":text}));
+                }
+                blocks.extend(calls.iter().map(|call| {
+                    json!({
+                        "type": "tool_use",
+                        "id": call.call_id,
+                        "name": call.name,
+                        "input": call.arguments,
+                    })
+                }));
+                messages.push(json!({"role":"assistant", "content":blocks}));
+            }
+            FunctionLoopItem::ToolResult { .. } => {
+                let mut blocks = Vec::new();
+                while index < items.len() {
+                    let FunctionLoopItem::ToolResult { result } = &items[index] else {
+                        break;
+                    };
+                    let output = match &result.output {
+                        Value::String(value) => value.clone(),
+                        value => serde_json::to_string(value)?,
+                    };
+                    blocks.push(json!({
+                        "type": "tool_result",
+                        "tool_use_id": result.call_id,
+                        "content": output,
+                        "is_error": result.is_error,
+                    }));
+                    index += 1;
+                }
+                messages.push(json!({"role":"user", "content":blocks}));
+                continue;
+            }
+        }
+        index += 1;
+    }
+    Ok((system_parts.join("\n\n"), messages))
+}
+
+pub fn create_llm_client(
+    provider: AiProvider,
+    api_key: impl Into<String>,
+    base_url: Option<String>,
+) -> Arc<dyn LlmClient> {
+    let api_key = api_key.into();
+    match provider {
+        AiProvider::OpenAi => {
+            let mut client = OpenAiResponsesClient::new(api_key);
+            if let Some(base_url) = base_url {
+                client = client.with_base_url(base_url);
+            }
+            Arc::new(client)
+        }
+        AiProvider::Anthropic => {
+            let mut client = AnthropicMessagesClient::new(api_key);
+            if let Some(base_url) = base_url {
+                client = client.with_base_url(base_url);
+            }
+            Arc::new(client)
+        }
+    }
+}
+
+pub fn create_function_calling_model(
+    provider: AiProvider,
+    api_key: impl Into<String>,
+    base_url: Option<String>,
+    model: impl Into<String>,
+    system: Option<String>,
+    model_settings: ModelSettings,
+) -> Arc<dyn FunctionCallingModel> {
+    let api_key = api_key.into();
+    let model = model.into();
+    match provider {
+        AiProvider::OpenAi => {
+            let mut client = OpenAiResponsesClient::new(api_key);
+            if let Some(base_url) = base_url {
+                client = client.with_base_url(base_url);
+            }
+            Arc::new(client.function_model(model, system, model_settings))
+        }
+        AiProvider::Anthropic => {
+            let mut client = AnthropicMessagesClient::new(api_key);
+            if let Some(base_url) = base_url {
+                client = client.with_base_url(base_url);
+            }
+            Arc::new(client.function_model(model, system, model_settings))
         }
     }
 }
@@ -923,8 +1561,14 @@ mod tests {
     fn user_content_parts_are_forwarded_verbatim() {
         let item = loop_item_to_openai_input(FunctionLoopItem::UserContentParts {
             content: vec![
-                json!({"type":"input_text","text":"hola"}),
-                json!({"type":"input_image","image_url":"data:image/jpeg;base64,AAA"}),
+                ModelContentPart::Text {
+                    text: "hola".to_string(),
+                },
+                ModelContentPart::Image {
+                    media_type: "image/jpeg".to_string(),
+                    data_base64: "AAA".to_string(),
+                    detail: None,
+                },
             ],
         });
         assert_eq!(item["role"], "user");
@@ -973,8 +1617,14 @@ mod tests {
             system: None,
             input: "fallback".to_string(),
             input_parts: Some(vec![
-                json!({"type":"input_text","text":"texto"}),
-                json!({"type":"input_image","image_url":"data:image/png;base64,AAA"}),
+                ModelContentPart::Text {
+                    text: "texto".to_string(),
+                },
+                ModelContentPart::Image {
+                    media_type: "image/png".to_string(),
+                    data_base64: "AAA".to_string(),
+                    detail: None,
+                },
             ]),
             output_schema: None,
             max_output_tokens: None,
@@ -1218,6 +1868,79 @@ mod tests {
 
         let body = body_rx.recv().expect("captured body");
         assert!(body.get("text").is_none());
+        handle.join().expect("server thread");
+    }
+
+    #[test]
+    fn hive_ai_fallback_is_openai_gpt_5_5() {
+        let engine = HiveAiConfig::fallback();
+        assert_eq!(engine.provider, AiProvider::OpenAi);
+        assert_eq!(engine.model, "gpt-5.5");
+    }
+
+    #[test]
+    fn ai_provider_parsing_is_strict() {
+        assert_eq!("openai".parse::<AiProvider>().unwrap(), AiProvider::OpenAi);
+        assert_eq!(
+            "anthropic".parse::<AiProvider>().unwrap(),
+            AiProvider::Anthropic
+        );
+        assert!("gemini".parse::<AiProvider>().is_err());
+    }
+
+    #[test]
+    fn hive_ai_selects_only_the_default_provider_model() {
+        let config: HiveAiConfig = serde_yaml::from_str(
+            r#"
+default_provider: anthropic
+providers:
+  openai:
+    model: gpt-5.5
+  anthropic:
+    model: claude-sonnet-4-5
+"#,
+        )
+        .expect("valid hive AI config");
+        let engine = config.effective().expect("effective engine");
+        assert_eq!(engine.provider, AiProvider::Anthropic);
+        assert_eq!(engine.model, "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn anthropic_retry_policy_matches_official_status_contract() {
+        let headers = reqwest::header::HeaderMap::new();
+        assert!(anthropic_should_retry(408, &headers));
+        assert!(anthropic_should_retry(409, &headers));
+        assert!(anthropic_should_retry(429, &headers));
+        assert!(anthropic_should_retry(500, &headers));
+        assert!(!anthropic_should_retry(400, &headers));
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_client_uses_messages_shape() {
+        let (base_url, body_rx, handle) = spawn_single_response_server(json!({
+            "content": [{"type":"text", "text":"hola"}],
+            "usage": {"input_tokens": 3, "output_tokens": 2}
+        }));
+        let client = AnthropicMessagesClient::new("test-key").with_base_url(base_url);
+        let response = client
+            .generate(LlmRequest {
+                model: "claude-sonnet-4-5".to_string(),
+                system: Some("sys".to_string()),
+                input: "entrada".to_string(),
+                input_parts: None,
+                output_schema: None,
+                max_output_tokens: Some(64),
+                model_settings: None,
+            })
+            .await
+            .expect("generate should succeed");
+        assert_eq!(response.content, "hola");
+        let body = body_rx.recv().expect("captured body");
+        assert_eq!(body["model"], "claude-sonnet-4-5");
+        assert_eq!(body["system"], "sys");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"][0]["type"], "text");
         handle.join().expect("server thread");
     }
 }

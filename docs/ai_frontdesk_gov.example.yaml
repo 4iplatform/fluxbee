@@ -18,8 +18,7 @@ runtime:
   metrics_log_interval_ms: 30000
 
 behavior:
-  kind: "openai_chat"
-  model: "gpt-4.1-mini"
+  kind: "ai_chat"
   instructions:
     source: "inline"
     value: |

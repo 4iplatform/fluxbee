@@ -1,6 +1,16 @@
 hive_id: "motherbee"
 role: motherbee
 
+# Hive-wide AI engine used by SY.* consumers. If this section is omitted,
+# the runtime falls back to OpenAI with model gpt-5.5.
+ai:
+  default_provider: openai
+  providers:
+    openai:
+      model: "gpt-5.5"
+    # anthropic:
+    #   model: "claude-sonnet-4-5"
+
 # WAN / inter-hive gateway.
 wan:
   listen: "0.0.0.0:9000"

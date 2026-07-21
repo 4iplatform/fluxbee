@@ -40,18 +40,18 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::any;
 use axum::{Json, Router};
 use fluxbee_ai_sdk::{
-    build_openai_user_content_parts, extract_text, resolve_model_input_from_payload_with_options,
-    ConversationSummary, FunctionCallingConfig, FunctionCallingRunner, FunctionLoopItem,
-    FunctionRunInput, FunctionTool, FunctionToolDefinition, FunctionToolProvider,
-    FunctionToolRegistry, ImmediateConversationMemory, ImmediateInteraction,
-    ImmediateInteractionKind, ImmediateOperation, ImmediateRole, ModelInputOptions, ModelSettings,
-    OpenAiResponsesClient,
+    build_model_user_content_parts, create_function_calling_model, extract_text,
+    resolve_model_input_from_payload_with_options, AiProvider, ConversationSummary,
+    FunctionCallingConfig, FunctionCallingRunner, FunctionLoopItem, FunctionRunInput, FunctionTool,
+    FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry, HiveAiConfig,
+    ImmediateConversationMemory, ImmediateInteraction, ImmediateInteractionKind,
+    ImmediateOperation, ImmediateRole, ModelInputOptions, ModelSettings,
 };
 use fluxbee_sdk::blob::{BlobConfig, BlobRef, BlobToolkit};
 use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{
-    Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest,
-    is_system_kind, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
+    is_system_kind, Destination, Message, Meta, Routing, VaultSecretChangedPayload,
+    VaultSecretInterest, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::rpc::{AdminCommandRequest, OperationalRouteProfile, RouterDispatcher};
 use fluxbee_sdk::{
@@ -78,7 +78,6 @@ use uuid::Uuid;
 type ArchitectError = Box<dyn std::error::Error + Send + Sync>;
 
 const DEFAULT_ARCHITECT_LISTEN: &str = "127.0.0.1:3000";
-const DEFAULT_ARCHITECT_MODEL: &str = "gpt-5.4-mini";
 const ROUTER_RECONNECT_DELAY_SECS: u64 = 2;
 const CHAT_SESSIONS_TABLE: &str = "sessions";
 const CHAT_MESSAGES_TABLE: &str = "messages";
@@ -201,7 +200,7 @@ const FAVICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0
 struct HiveFile {
     hive_id: String,
     architect: Option<ArchitectSection>,
-    ai_providers: Option<AiProvidersSection>,
+    ai: Option<HiveAiConfig>,
     blob: Option<BlobSection>,
 }
 
@@ -215,30 +214,13 @@ struct BlobSection {
     path: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-struct AiProvidersSection {
-    openai: Option<OpenAiSection>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-struct OpenAiSection {
-    default_model: Option<String>,
-    max_tokens: Option<u32>,
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ArchitectNodeConfigFile {
-    ai_providers: Option<AiProvidersSection>,
-}
-
 #[derive(Clone)]
 struct ArchitectAiRuntime {
+    provider: AiProvider,
     model: String,
     instructions: String,
     model_settings: ModelSettings,
-    client: OpenAiResponsesClient,
+    api_key: String,
 }
 
 #[derive(Clone)]
@@ -2041,7 +2023,10 @@ async fn classify_failure_with_ai(
         Error: {error_text}"
     );
 
-    let model = runtime.client.clone().function_model(
+    let model = create_function_calling_model(
+        runtime.provider,
+        runtime.api_key.clone(),
+        None,
         runtime.model.clone(),
         None,
         runtime.model_settings.clone(),
@@ -2050,7 +2035,7 @@ async fn classify_failure_with_ai(
     let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
     let result = runner
         .run_with_input(
-            &model,
+            model.as_ref(),
             &tools,
             FunctionRunInput {
                 current_user_message: prompt,
@@ -3574,7 +3559,10 @@ async fn run_designer_with_context(
     let cookbook = read_design_cookbook(&context.state_dir);
     let handbook = read_handbook_text();
     let system_prompt = build_designer_prompt(&cookbook, handbook.as_deref());
-    let model = runtime.client.clone().function_model(
+    let model = create_function_calling_model(
+        runtime.provider,
+        runtime.api_key.clone(),
+        None,
         runtime.model.clone(),
         Some(system_prompt),
         runtime.model_settings.clone(),
@@ -3620,7 +3608,7 @@ async fn run_designer_with_context(
     let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
     let result = runner
         .run_with_input(
-            &model,
+            model.as_ref(),
             &tools,
             FunctionRunInput {
                 current_user_message: input_text,
@@ -3796,7 +3784,10 @@ async fn run_design_auditor_with_context(
         })?;
     let handbook = read_handbook_text();
     let system_prompt = build_design_auditor_prompt(handbook.as_deref());
-    let model = runtime.client.clone().function_model(
+    let model = create_function_calling_model(
+        runtime.provider,
+        runtime.api_key.clone(),
+        None,
         runtime.model.clone(),
         Some(system_prompt),
         runtime.model_settings.clone(),
@@ -3824,7 +3815,7 @@ async fn run_design_auditor_with_context(
     let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
     let result = runner
         .run_with_input(
-            &model,
+            model.as_ref(),
             &tools,
             FunctionRunInput {
                 current_user_message: input_text,
@@ -3931,7 +3922,10 @@ async fn run_real_programmer_with_context(
     let cookbook = read_artifact_cookbook(&context.state_dir);
     let handbook = read_handbook_text();
     let system_prompt = build_real_programmer_prompt(&cookbook, handbook.as_deref());
-    let model = runtime.client.clone().function_model(
+    let model = create_function_calling_model(
+        runtime.provider,
+        runtime.api_key.clone(),
+        None,
         runtime.model.clone(),
         Some(system_prompt),
         runtime.model_settings.clone(),
@@ -3953,7 +3947,7 @@ async fn run_real_programmer_with_context(
     let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
     let result = runner
         .run_with_input(
-            &model,
+            model.as_ref(),
             &tools,
             FunctionRunInput {
                 current_user_message: input_text,
@@ -5343,7 +5337,10 @@ async fn run_plan_compiler_with_context(
         }
     });
 
-    let model = runtime.client.clone().function_model(
+    let model = create_function_calling_model(
+        runtime.provider,
+        runtime.api_key.clone(),
+        None,
         runtime.model.clone(),
         Some(system_prompt),
         runtime.model_settings.clone(),
@@ -5400,7 +5397,7 @@ async fn run_plan_compiler_with_context(
     let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
     let result = runner
         .run_with_input(
-            &model,
+            model.as_ref(),
             &tools,
             FunctionRunInput {
                 current_user_message: input_text,
@@ -5909,7 +5906,6 @@ async fn main() -> Result<(), ArchitectError> {
     let socket_dir = json_router::paths::router_socket_dir();
 
     let hive = load_hive(&config_dir)?;
-    let node_config_file = load_architect_node_config(&hive.hive_id)?;
     let node_name = architect_node_name(&hive.hive_id);
     // Model D': self-ILK is deterministic from L2 name (no SHM wait).
     let self_ilk_id = fluxbee_sdk::deterministic_system_ilk_id(&node_name);
@@ -5941,14 +5937,8 @@ async fn main() -> Result<(), ArchitectError> {
     let incoming_rx = rpc.take_command_receiver("incoming").await?;
     tracing::info!(node = %node_name, "sy.architect canonical RouterDispatcher connected");
 
-    let ai_runtime = build_architect_ai_runtime(
-        Arc::clone(&rpc),
-        &node_name,
-        &self_ilk_id,
-        node_config_file.as_ref(),
-        &hive,
-    )
-    .await;
+    let ai_runtime =
+        build_architect_ai_runtime(Arc::clone(&rpc), &node_name, &self_ilk_id, &hive).await;
     let agent_asset_catalog = bootstrap_agent_asset_catalog_from_config_dir(&config_dir)
         .unwrap_or_else(|err| {
             tracing::warn!(error = %err, "failed to bootstrap agent asset catalog");
@@ -6091,18 +6081,6 @@ fn load_hive(config_dir: &Path) -> Result<HiveFile, ArchitectError> {
     Ok(serde_yaml::from_str(&data)?)
 }
 
-fn load_architect_node_config(
-    hive_id: &str,
-) -> Result<Option<ArchitectNodeConfigFile>, ArchitectError> {
-    let path = architect_config_path(hive_id);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = fs::read_to_string(&path)?;
-    let parsed = serde_json::from_str(&raw)?;
-    Ok(Some(parsed))
-}
-
 fn architect_node_dir(hive_id: &str) -> PathBuf {
     json_router::paths::storage_root_dir()
         .join("nodes")
@@ -6114,23 +6092,26 @@ fn architect_node_name(hive_id: &str) -> String {
     format!("SY.architect@{hive_id}")
 }
 
-fn architect_config_path(hive_id: &str) -> PathBuf {
-    architect_node_dir(hive_id).join("config.json")
-}
-
 async fn build_architect_ai_runtime(
     rpc: Arc<RouterDispatcher>,
     node_name: &str,
     self_ilk_id: &str,
-    config: Option<&ArchitectNodeConfigFile>,
     hive: &HiveFile,
 ) -> Option<ArchitectAiRuntime> {
-    let openai = merged_openai_section(config, hive);
-    let api_key = match resolve_architect_openai_api_key_from_vault(
+    let engine = match hive.ai.as_ref().map(HiveAiConfig::effective).transpose() {
+        Ok(Some(engine)) => engine,
+        Ok(None) => HiveAiConfig::fallback(),
+        Err(err) => {
+            tracing::error!(error = %err, "invalid hive ai configuration");
+            return None;
+        }
+    };
+    let api_key = match resolve_architect_ai_api_key_from_vault(
         rpc,
         hive,
         node_name,
         self_ilk_id,
+        engine.provider,
     )
     .await
     {
@@ -6139,66 +6120,32 @@ async fn build_architect_ai_runtime(
         Err(err) => {
             tracing::warn!(
                 error = %err,
-                "sy.architect OpenAI vault resource lookup failed"
+                provider = %engine.provider,
+                "sy.architect AI vault resource lookup failed"
             );
             return None;
         }
     };
-    let model = openai
-        .as_ref()
-        .and_then(|section| section.default_model.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_ARCHITECT_MODEL)
-        .to_string();
-
     Some(ArchitectAiRuntime {
-        model,
+        provider: engine.provider,
+        model: engine.model,
         instructions: build_archi_prompt(read_handbook_text().as_deref()),
-        model_settings: ModelSettings {
-            temperature: openai.as_ref().and_then(|s| s.temperature),
-            top_p: openai.as_ref().and_then(|s| s.top_p),
-            max_output_tokens: openai.as_ref().and_then(|s| s.max_tokens),
-        },
-        client: OpenAiResponsesClient::new(api_key),
+        model_settings: ModelSettings::default(),
+        api_key,
     })
 }
 
-fn merged_openai_section(
-    config: Option<&ArchitectNodeConfigFile>,
-    hive: &HiveFile,
-) -> Option<OpenAiSection> {
-    let config_openai = config
-        .and_then(|cfg| cfg.ai_providers.as_ref())
-        .and_then(|providers| providers.openai.clone());
-    let hive_openai = hive
-        .ai_providers
-        .as_ref()
-        .and_then(|providers| providers.openai.clone());
-
-    match (config_openai, hive_openai) {
-        (Some(cfg), Some(hive_cfg)) => Some(OpenAiSection {
-            default_model: cfg.default_model.or(hive_cfg.default_model),
-            max_tokens: cfg.max_tokens.or(hive_cfg.max_tokens),
-            temperature: cfg.temperature.or(hive_cfg.temperature),
-            top_p: cfg.top_p.or(hive_cfg.top_p),
-        }),
-        (Some(cfg), None) => Some(cfg),
-        (None, Some(hive_cfg)) => Some(hive_cfg),
-        (None, None) => None,
-    }
-}
-
-async fn resolve_architect_openai_api_key_from_vault(
+async fn resolve_architect_ai_api_key_from_vault(
     rpc: Arc<RouterDispatcher>,
     hive: &HiveFile,
     node_name: &str,
     self_ilk_id: &str,
+    provider: AiProvider,
 ) -> Result<Option<String>, ArchitectError> {
     let vault_client = architect_vault_client(rpc, &hive.hive_id, node_name, self_ilk_id);
     let value = vault_client
         .resolve_resource(
-            fluxbee_sdk::ResourceType::Openai,
+            provider.resource_type(),
             fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
             Duration::from_secs(5),
         )
@@ -6243,12 +6190,10 @@ fn vault_response_openai_api_key(value: &Value) -> Option<String> {
 
 async fn refresh_architect_ai_runtime(state: &ArchitectState) -> Result<bool, ArchitectError> {
     let hive = load_hive(&state.config_dir)?;
-    let node_config = load_architect_node_config(&hive.hive_id)?;
     let runtime = build_architect_ai_runtime(
         Arc::clone(&state.rpc),
         &state.node_name,
         &state.self_ilk_id,
-        node_config.as_ref(),
         &hive,
     )
     .await;
@@ -6811,7 +6756,7 @@ async fn handle_architect_system_message(
     }
 }
 
-/// Handle `VAULT_SECRET_CHANGED` for architect: refresh both openai and
+/// Handle `VAULT_SECRET_CHANGED` for architect: refresh both the selected AI provider and
 /// messages-db runtimes on the relevant event. Architect has TWO vault
 /// resources (openai for the chat model, postgres for the messages
 /// viewer), each independently hot-rebuildable, so we filter per
@@ -6830,8 +6775,21 @@ async fn handle_vault_secret_changed_architect(state: &ArchitectState, msg: &Mes
             return;
         }
     };
-    let interest_openai = VaultSecretInterest {
-        resource_type: "openai",
+    let provider = load_hive(&state.config_dir)
+        .ok()
+        .and_then(|hive| {
+            hive.ai
+                .as_ref()
+                .map(HiveAiConfig::effective)
+                .transpose()
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_else(HiveAiConfig::fallback)
+        .provider;
+    let ai_resource_type = provider.to_string();
+    let interest_ai = VaultSecretInterest {
+        resource_type: &ai_resource_type,
         my_tenant: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
         my_ilk: Some(state.self_ilk_id.as_str()),
         system_caller: true,
@@ -6842,9 +6800,9 @@ async fn handle_vault_secret_changed_architect(state: &ArchitectState, msg: &Mes
         my_ilk: Some(state.self_ilk_id.as_str()),
         system_caller: true,
     };
-    let matched_openai = payload.matches_interest(&interest_openai);
+    let matched_ai = payload.matches_interest(&interest_ai);
     let matched_postgres = payload.matches_interest(&interest_postgres);
-    if !matched_openai && !matched_postgres {
+    if !matched_ai && !matched_postgres {
         tracing::info!(
             node_name = %state.node_name,
             resource_type = %payload.resource_type,
@@ -6852,15 +6810,17 @@ async fn handle_vault_secret_changed_architect(state: &ArchitectState, msg: &Mes
             payload_ilk = %payload.ilk.as_deref().unwrap_or(""),
             my_tenant = %fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
             my_ilk = %state.self_ilk_id,
-            "sy.architect VAULT_SECRET_CHANGED matches neither openai nor postgres interest; ignoring"
+            provider = %provider,
+            "sy.architect VAULT_SECRET_CHANGED matches neither AI nor postgres interest; ignoring"
         );
     }
-    if matched_openai {
+    if matched_ai {
         tracing::info!(
             node_name = %state.node_name,
             op = %payload.op.as_str(),
             version = payload.version,
-            "VAULT_SECRET_CHANGED (openai) matches interest; refreshing architect ai runtime"
+            provider = %provider,
+            "VAULT_SECRET_CHANGED matches AI interest; refreshing architect ai runtime"
         );
         if let Err(err) = refresh_architect_ai_runtime(state).await {
             tracing::warn!(error = %err, "architect ai runtime refresh failed after broadcast");
@@ -10197,7 +10157,10 @@ async fn handle_ai_chat(
         })?;
     let memory = build_session_immediate_memory(state, session).await?;
 
-    let model = runtime.client.clone().function_model(
+    let model = create_function_calling_model(
+        runtime.provider,
+        runtime.api_key.clone(),
+        None,
         runtime.model.clone(),
         Some(runtime.instructions.clone()),
         runtime.model_settings.clone(),
@@ -10231,7 +10194,7 @@ async fn handle_ai_chat(
             .map_err(|err| -> ArchitectError {
                 format!("failed to resolve attachment payload for model input: {err}").into()
             })?;
-            Some(build_openai_user_content_parts(&resolved).await.map_err(
+            Some(build_model_user_content_parts(&resolved).await.map_err(
                 |err| -> ArchitectError {
                     format!("failed to build OpenAI input parts from attachments: {err}").into()
                 },
@@ -10240,7 +10203,7 @@ async fn handle_ai_chat(
 
     let result = runner
         .run_with_input(
-            &model,
+            model.as_ref(),
             &tools,
             FunctionRunInput {
                 current_user_message: input.to_string(),
@@ -11275,7 +11238,7 @@ fn handle_meta_scmd(raw: &str) -> Option<Value> {
                 "SCMD: curl -X POST /hives/motherbee/sync-hint -d '{\"channel\":\"blob\",\"wait_for_idle\":true,\"timeout_ms\":30000}'",
                 "SCMD: curl -X POST /hives/motherbee/nodes -d '{\"node_name\":\"AI.chat@motherbee\",\"runtime_version\":\"current\"}'",
                 "SCMD: curl -X POST /hives/motherbee/identity/ilks/ilk:550e8400-e29b-41d4-a716-446655440000/definition -d '{\"definition\":{\"role_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"skill_hashes\":[],\"handbook_hashes\":[],\"personality_hash\":\"4444444444444444444444444444444444444444444444444444444444444444\"}}'",
-                "SCMD: curl -X PUT /hives/motherbee/nodes/SY.frontdesk.gov@motherbee/config -d '{\"openai\":{\"default_model\":\"gpt-4.1-mini\"}}'"
+                "Configure the hive-wide ai.default_provider and ai.providers.<provider>.model in hive.yaml."
             ]
         }
     }))
@@ -11311,13 +11274,18 @@ async fn handle_architect_local_config_get(
     state: &ArchitectState,
 ) -> Result<Value, ArchitectError> {
     let hive = load_hive(&state.config_dir)?;
-    let node_config = load_architect_node_config(&state.hive_id)?;
-    let merged = merged_openai_section(node_config.as_ref(), &hive);
+    let engine = hive
+        .ai
+        .as_ref()
+        .map(HiveAiConfig::effective)
+        .transpose()
+        .map_err(|err| -> ArchitectError { err.into() })?
+        .unwrap_or_else(HiveAiConfig::fallback);
     let configured = state.ai_configured.load(Ordering::Relaxed);
     let messages_db_configured = state.messages_db_configured.load(Ordering::Relaxed);
     let resources = json!([
         {
-            "resource_type": "openai",
+            "resource_type": engine.provider.to_string(),
             "required": true,
             "configured": configured,
             "scope": "pool (tenant or root)"
@@ -11341,13 +11309,9 @@ async fn handle_architect_local_config_get(
             "state": if configured { "configured" } else { "missing_secret" },
             "messages_db_state": if messages_db_configured { "configured" } else { "missing_secret" },
             "config": {
-                "ai_providers": {
-                    "openai": {
-                        "default_model": merged.as_ref().and_then(|openai| openai.default_model.clone()).map(Value::String).unwrap_or(Value::Null),
-                        "max_tokens": merged.as_ref().and_then(|openai| openai.max_tokens.map(Value::from)).unwrap_or(Value::Null),
-                        "temperature": merged.as_ref().and_then(|openai| openai.temperature.map(Value::from)).unwrap_or(Value::Null),
-                        "top_p": merged.as_ref().and_then(|openai| openai.top_p.map(Value::from)).unwrap_or(Value::Null)
-                    }
+                "ai": {
+                    "default_provider": engine.provider.to_string(),
+                    "model": engine.model
                 }
             },
             "contract": {
@@ -11355,15 +11319,10 @@ async fn handle_architect_local_config_get(
                 "node_kind": "SY.architect",
                 "supports": ["CONFIG_GET", "CONFIG_SET"],
                 "required_fields": [],
-                "optional_fields": [
-                    "config.ai_providers.openai.default_model",
-                    "config.ai_providers.openai.max_tokens",
-                    "config.ai_providers.openai.temperature",
-                    "config.ai_providers.openai.top_p"
-                ],
+                "optional_fields": [],
                 "resources": resources,
                 "notes": [
-                    "Model D': openai + postgres credentials live entirely in SY.vault. Operator loads them with vault_put + resource_type=<openai|postgres>; architect resolves from the pool on boot/refresh.",
+                    "The AI provider/model are hive-wide and configured only in hive.yaml; CONFIG_SET does not override them.",
                     "CONFIG_SET on SY.architect takes no secret-bearing fields (api_key/api_key_ref/messages_db_url/messages_db_url_ref are rejected).",
                     "The postgres resource is optional; if present, architect enables the messages log viewer against ARCHITECT_MESSAGES_DB_NAME on the resolved cluster."
                 ]
@@ -11414,17 +11373,10 @@ async fn handle_architect_local_config_set(
 /// surface. OpenAI + messages-db credentials live entirely in SY.vault.
 fn reject_architect_secret_fields(body: &Value) -> Result<(), ArchitectError> {
     let config_root = body.get("config").unwrap_or(body);
-    let openai = config_root
-        .get("ai_providers")
-        .and_then(|providers| providers.get("openai"));
-    if let Some(openai) = openai {
-        for forbidden in ["api_key", "api_key_ref"] {
-            if openai.get(forbidden).is_some() {
-                return Err(format!(
-                    "config.ai_providers.openai.{forbidden} is no longer accepted; load the openai secret via vault_put (resource_type=openai) and architect will discover it from the pool"
-                ).into());
-            }
-        }
+    if config_root.get("ai_providers").is_some() || config_root.get("ai").is_some() {
+        return Err(
+            "AI provider/model are hive-wide; configure the ai section in hive.yaml".into(),
+        );
     }
     let storage = config_root.get("storage");
     if let Some(storage) = storage {

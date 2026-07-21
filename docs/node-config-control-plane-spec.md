@@ -205,8 +205,9 @@ Example:
   "state": "configured",
   "config": {
     "behavior": {
-      "kind": "openai_chat",
-      "model": "gpt-4.1-mini"
+      "kind": "ai_chat",
+      "vault_key": "ai/chat",
+      "model": "gpt-5.5"
     }
   },
     "contract": {
@@ -215,11 +216,12 @@ Example:
       "supports": ["CONFIG_GET", "CONFIG_SET"],
       "required_fields": [
         "behavior.kind",
+        "behavior.vault_key",
         "behavior.model"
       ],
       "field_values": {
         "behavior.kind": {
-          "allowed": ["echo", "openai_chat"]
+          "allowed": ["echo", "ai_chat"]
         }
       },
       "optional_fields": [
@@ -228,7 +230,7 @@ Example:
     ],
     "resources": [
       {
-        "resource_type": "openai",
+        "resource_type": "openai|anthropic",
         "required": true,
         "configured": true,
         "provider": "SY.vault"
@@ -239,14 +241,15 @@ Example:
         "apply_mode": "replace",
         "config": {
           "behavior": {
-            "kind": "openai_chat",
-            "model": "gpt-4.1-mini"
+            "kind": "ai_chat",
+            "vault_key": "ai/chat",
+            "model": "gpt-5.5"
           }
         }
       }
     ],
     "notes": [
-      "Prompt and OpenAI key are node-level concerns.",
+      "The Vault key selects access/provider; behavior.model selects the model.",
       "CONFIG_SET may override in-memory behavior depending on node implementation."
     ]
   }

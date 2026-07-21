@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use fluxbee_ai_sdk::errors::AiSdkError;
-use fluxbee_ai_sdk::{LlmClient, LlmRequest, ModelSettings, OpenAiResponsesClient};
+use fluxbee_ai_sdk::{create_llm_client, LlmClient, LlmRequest, ModelSettings};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::time;
@@ -34,13 +34,6 @@ struct RawSemanticTaggerResponse {
 pub(super) async fn run_semantic_tagger_ai(
     input: SemanticTaggerAiInput<'_>,
 ) -> Result<SemanticTaggerOutput, AiSdkError> {
-    if !input.config.provider.trim().eq_ignore_ascii_case("openai") {
-        return Err(AiSdkError::Protocol(format!(
-            "unsupported semantic_tagger provider={}",
-            input.config.provider
-        )));
-    }
-
     if input.text.trim().is_empty() {
         return Ok(SemanticTaggerOutput::default());
     }
@@ -59,10 +52,10 @@ pub(super) async fn run_semantic_tagger_ai(
         output_schema: None,
     };
 
-    let client = OpenAiResponsesClient::new(input.api_key);
+    let client = create_llm_client(input.config.provider, input.api_key, None);
     let response = time::timeout(
         Duration::from_millis(input.config.timeout_ms),
-        LlmClient::generate(&client, request),
+        LlmClient::generate(client.as_ref(), request),
     )
     .await
     .map_err(|_| {

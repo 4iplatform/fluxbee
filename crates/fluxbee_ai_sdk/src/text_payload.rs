@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use base64::Engine as _;
 use fluxbee_sdk::blob::{BlobConfig, BlobRef, BlobToolkit, ResolveRetryConfig};
 use fluxbee_sdk::payload::TextV1Payload;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::fs as tokio_fs;
 
@@ -75,13 +76,32 @@ pub struct ResolvedModelInput {
     pub attachments: Vec<ResolvedModelAttachment>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ModelContentPart {
+    Text {
+        text: String,
+    },
+    Image {
+        media_type: String,
+        data_base64: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    Document {
+        media_type: String,
+        filename: String,
+        data_base64: String,
+    },
+}
+
 #[derive(Debug, Clone)]
-pub struct OpenAiUserContentOptions {
+pub struct ModelUserContentOptions {
     pub image_detail: Option<String>,
     pub max_text_chars: usize,
 }
 
-impl Default for OpenAiUserContentOptions {
+impl Default for ModelUserContentOptions {
     fn default() -> Self {
         Self {
             image_detail: Some("auto".to_string()),
@@ -90,37 +110,35 @@ impl Default for OpenAiUserContentOptions {
     }
 }
 
-pub async fn build_openai_user_content_parts(
+pub async fn build_model_user_content_parts(
     input: &ResolvedModelInput,
-) -> std::result::Result<Vec<Value>, ModelInputPayloadError> {
-    build_openai_user_content_parts_with_options(input, &OpenAiUserContentOptions::default()).await
+) -> std::result::Result<Vec<ModelContentPart>, ModelInputPayloadError> {
+    build_model_user_content_parts_with_options(input, &ModelUserContentOptions::default()).await
 }
 
-pub async fn build_openai_user_content_parts_with_options(
+pub async fn build_model_user_content_parts_with_options(
     input: &ResolvedModelInput,
-    options: &OpenAiUserContentOptions,
-) -> std::result::Result<Vec<Value>, ModelInputPayloadError> {
+    options: &ModelUserContentOptions,
+) -> std::result::Result<Vec<ModelContentPart>, ModelInputPayloadError> {
     let mut parts = Vec::new();
     if !input.main_text.trim().is_empty() {
-        parts.push(serde_json::json!({
-            "type": "input_text",
-            "text": input.main_text,
-        }));
+        parts.push(ModelContentPart::Text {
+            text: input.main_text.clone(),
+        });
     }
 
     for attachment in &input.attachments {
-        validate_attachment_for_openai(attachment)?;
+        validate_model_attachment(attachment)?;
 
         if let Some(text) = &attachment.text_content {
-            parts.push(serde_json::json!({
-                "type": "input_text",
-                "text": format!(
+            parts.push(ModelContentPart::Text {
+                text: format!(
                     "Attachment ({}, {}):\n{}",
                     attachment.blob_ref.filename_original,
                     attachment.blob_ref.mime,
                     truncate_chars(text, options.max_text_chars)
-                )
-            }));
+                ),
+            });
             continue;
         }
 
@@ -139,12 +157,11 @@ pub async fn build_openai_user_content_parts_with_options(
                 }
             })?;
             let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-            let image_url = format!("data:{};base64,{}", attachment.blob_ref.mime, encoded);
-            parts.push(serde_json::json!({
-                "type": "input_image",
-                "image_url": image_url,
-                "detail": options.image_detail.clone().unwrap_or_else(|| "auto".to_string()),
-            }));
+            parts.push(ModelContentPart::Image {
+                media_type: attachment.blob_ref.mime.clone(),
+                data_base64: encoded,
+                detail: options.image_detail.clone(),
+            });
             continue;
         }
 
@@ -162,11 +179,11 @@ pub async fn build_openai_user_content_parts_with_options(
             }
         })?;
         let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-        parts.push(serde_json::json!({
-            "type": "input_file",
-            "filename": canonical_attachment_filename(attachment),
-            "file_data": build_openai_file_data_url(&attachment.blob_ref.mime, &encoded)?,
-        }));
+        parts.push(ModelContentPart::Document {
+            media_type: attachment.blob_ref.mime.clone(),
+            filename: canonical_attachment_filename(attachment),
+            data_base64: encoded,
+        });
     }
 
     Ok(parts)
@@ -458,7 +475,7 @@ fn canonical_attachment_filename(attachment: &ResolvedModelAttachment) -> String
     }
 }
 
-fn validate_attachment_for_openai(
+fn validate_model_attachment(
     attachment: &ResolvedModelAttachment,
 ) -> std::result::Result<(), ModelInputPayloadError> {
     if attachment.blob_ref.mime.trim().is_empty() {
@@ -474,19 +491,6 @@ fn validate_attachment_for_openai(
         )));
     }
     Ok(())
-}
-
-fn build_openai_file_data_url(
-    mime: &str,
-    base64_data: &str,
-) -> std::result::Result<String, ModelInputPayloadError> {
-    let mime = mime.trim();
-    if mime.is_empty() {
-        return Err(ModelInputPayloadError::InvalidAttachment(
-            "cannot build input_file without mime".to_string(),
-        ));
-    }
-    Ok(format!("data:{mime};base64,{base64_data}"))
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -828,7 +832,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_openai_user_content_parts_serializes_text_and_image() {
+    async fn build_model_user_content_parts_serializes_text_and_image() {
         let root = temp_blob_root();
         let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
         let image_blob = BlobRef {
@@ -857,21 +861,20 @@ mod tests {
                 text_content: None,
             }],
         };
-        let parts = build_openai_user_content_parts(&input)
+        let parts = build_model_user_content_parts(&input)
             .await
             .expect("parts should build");
-        assert_eq!(parts[0]["type"], "input_text");
-        assert_eq!(parts[1]["type"], "input_image");
-        assert_eq!(parts[1]["detail"], "auto");
-        assert!(parts[1]["image_url"]
-            .as_str()
-            .expect("image_url should be string")
-            .starts_with("data:image/png;base64,"));
+        assert!(matches!(&parts[0], ModelContentPart::Text { text } if text == "mirÃ¡"));
+        assert!(matches!(
+            &parts[1],
+            ModelContentPart::Image { media_type, data_base64, detail }
+                if media_type == "image/png" && !data_base64.is_empty() && detail.as_deref() == Some("auto")
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn build_openai_user_content_parts_serializes_non_image_as_input_file() {
+    async fn build_model_user_content_parts_serializes_non_image_as_document() {
         let root = temp_blob_root();
         let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
         let file_blob = BlobRef {
@@ -899,20 +902,19 @@ mod tests {
                 text_content: None,
             }],
         };
-        let parts = build_openai_user_content_parts(&input)
+        let parts = build_model_user_content_parts(&input)
             .await
             .expect("pdf should map to input_file");
-        assert_eq!(parts[1]["type"], "input_file");
-        assert_eq!(parts[1]["filename"], "doc.pdf");
-        assert!(parts[1]["file_data"]
-            .as_str()
-            .expect("file_data should be string")
-            .starts_with("data:application/pdf;base64,"));
+        assert!(matches!(
+            &parts[1],
+            ModelContentPart::Document { media_type, filename, data_base64 }
+                if media_type == "application/pdf" && filename == "doc.pdf" && !data_base64.is_empty()
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn build_openai_user_content_parts_serializes_docx_as_data_url_file() {
+    async fn build_model_user_content_parts_serializes_docx_as_document() {
         let root = temp_blob_root();
         let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
         let file_blob = BlobRef {
@@ -941,24 +943,20 @@ mod tests {
                 text_content: None,
             }],
         };
-        let parts = build_openai_user_content_parts(&input)
+        let parts = build_model_user_content_parts(&input)
             .await
             .expect("docx should map to input_file");
-        assert_eq!(parts[1]["type"], "input_file");
-        assert_eq!(parts[1]["filename"], "report.docx");
-        assert!(
-            parts[1]["file_data"]
-                .as_str()
-                .expect("file_data should be string")
-                .starts_with(
-                    "data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,"
-                )
-        );
+        assert!(matches!(
+            &parts[1],
+            ModelContentPart::Document { media_type, filename, data_base64 }
+                if media_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    && filename == "report.docx" && !data_base64.is_empty()
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn build_openai_user_content_parts_rejects_attachment_without_mime() {
+    async fn build_model_user_content_parts_rejects_attachment_without_mime() {
         let input = ResolvedModelInput {
             main_text: "mira".to_string(),
             prompt_text: "mira".to_string(),
@@ -975,7 +973,7 @@ mod tests {
                 text_content: None,
             }],
         };
-        let err = build_openai_user_content_parts(&input)
+        let err = build_model_user_content_parts(&input)
             .await
             .expect_err("missing mime must fail");
         assert_eq!(err.code(), "invalid_attachment");
@@ -983,7 +981,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_openai_user_content_parts_supports_image_detail_override() {
+    async fn build_model_user_content_parts_supports_image_detail_override() {
         let root = temp_blob_root();
         let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
         let image_blob = BlobRef {
@@ -1011,20 +1009,22 @@ mod tests {
                 text_content: None,
             }],
         };
-        let opts = OpenAiUserContentOptions {
+        let opts = ModelUserContentOptions {
             image_detail: Some("high".to_string()),
             ..Default::default()
         };
-        let parts = build_openai_user_content_parts_with_options(&input, &opts)
+        let parts = build_model_user_content_parts_with_options(&input, &opts)
             .await
             .expect("image with detail should work");
-        assert_eq!(parts[1]["type"], "input_image");
-        assert_eq!(parts[1]["detail"], "high");
+        assert!(matches!(
+            &parts[1],
+            ModelContentPart::Image { detail, .. } if detail.as_deref() == Some("high")
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn build_openai_user_content_parts_does_not_downgrade_image_to_text() {
+    async fn build_model_user_content_parts_does_not_downgrade_image_to_text() {
         let root = temp_blob_root();
         let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
         let image_blob = BlobRef {
@@ -1054,21 +1054,21 @@ mod tests {
             }],
         };
 
-        let parts = build_openai_user_content_parts(&input)
+        let parts = build_model_user_content_parts(&input)
             .await
             .expect("image attachment should serialize");
 
         assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0]["type"], "input_image");
+        assert!(matches!(&parts[0], ModelContentPart::Image { .. }));
         assert!(parts
             .iter()
-            .all(|part| part.get("type").and_then(Value::as_str) != Some("input_text")));
+            .all(|part| !matches!(part, ModelContentPart::Text { .. })));
 
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
-    async fn build_openai_user_content_parts_keeps_one_output_per_attachment() {
+    async fn build_model_user_content_parts_keeps_one_output_per_attachment() {
         let root = temp_blob_root();
         let toolkit = blob_toolkit(Some(&root)).expect("toolkit");
 
@@ -1138,16 +1138,18 @@ mod tests {
             ],
         };
 
-        let parts = build_openai_user_content_parts(&input)
+        let parts = build_model_user_content_parts(&input)
             .await
             .expect("attachments should map to input parts");
 
         // With empty main text, each attachment must produce exactly one output part.
         assert_eq!(parts.len(), input.attachments.len());
-        assert_eq!(parts[0]["type"], "input_text");
-        assert_eq!(parts[1]["type"], "input_image");
-        assert_eq!(parts[2]["type"], "input_file");
-        assert_eq!(parts[2]["filename"], "report.docx");
+        assert!(matches!(&parts[0], ModelContentPart::Text { .. }));
+        assert!(matches!(&parts[1], ModelContentPart::Image { .. }));
+        assert!(matches!(
+            &parts[2],
+            ModelContentPart::Document { filename, .. } if filename == "report.docx"
+        ));
 
         let _ = std::fs::remove_dir_all(root);
     }

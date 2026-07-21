@@ -1,6 +1,16 @@
 hive_id: "motherbee"
 role: motherbee
 
+# Hive-wide AI engine used by SY.* consumers. Credentials remain in SY.vault
+# under the selected provider's resource_type (openai or anthropic).
+ai:
+  default_provider: openai
+  providers:
+    openai:
+      model: "gpt-5.5"
+    # anthropic:
+    #   model: "claude-sonnet-4-5"
+
 # WAN / inter-hive gateway. A root motherbee has no uplink (workers/egress
 # connect TO it). `wan.mtls` controls inter-hive transport auth:
 #   disabled   - plaintext WAN (default)

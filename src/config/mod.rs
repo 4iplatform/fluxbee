@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fluxbee_ai_sdk::{EffectiveAiEngine, HiveAiConfig};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -32,6 +33,8 @@ pub enum ConfigError {
     Yaml(#[from] serde_yaml::Error),
     #[error("uuid error: {0}")]
     Uuid(#[from] uuid::Error),
+    #[error("invalid configuration: {0}")]
+    Invalid(String),
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +74,7 @@ pub struct RouterConfig {
     pub blob_sync_api_port: u16,
     pub blob_sync_data_dir: PathBuf,
     pub identity_frontdesk_node_name: String,
+    pub ai: EffectiveAiEngine,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +85,7 @@ struct HiveFile {
     nats: Option<NatsSection>,
     blob: Option<BlobSection>,
     government: Option<GovernmentSection>,
+    ai: Option<HiveAiConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,6 +186,13 @@ impl RouterConfig {
         }
         let data = std::fs::read_to_string(&hive_path)?;
         let hive: HiveFile = serde_yaml::from_str(&data)?;
+        let ai = hive
+            .ai
+            .as_ref()
+            .map(HiveAiConfig::effective)
+            .transpose()
+            .map_err(|err| ConfigError::Invalid(err.to_string()))?
+            .unwrap_or_else(HiveAiConfig::fallback);
         let hive_id = hive.hive_id;
         let mut identity_frontdesk_node_name =
             format!("{DEFAULT_IDENTITY_FRONTDESK_NODE_BASE}@{hive_id}");
@@ -333,6 +345,7 @@ impl RouterConfig {
             blob_sync_api_port,
             blob_sync_data_dir,
             identity_frontdesk_node_name,
+            ai,
         })
     }
 }

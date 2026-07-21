@@ -27,13 +27,13 @@
     }
   },
   "behavior": {
-    "kind": "openai_chat",
-    "model": "gpt-4.1-mini",
+    "kind": "ai_chat",
+    "vault_key": "ai/common",
+    "model": "gpt-5.5",
     "instructions": {
       "source": "inline",
       "value": "Respond briefly and clearly in Spanish.",
       "trim": true
-    },
-    "api_key_env": "OPENAI_API_KEY"
+    }
   }
 }

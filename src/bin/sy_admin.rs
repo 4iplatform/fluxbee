@@ -22,19 +22,21 @@ use zip::ZipArchive;
 
 use async_trait::async_trait;
 use fluxbee_ai_sdk::{
-    FunctionCallingConfig, FunctionCallingRunner, FunctionLoopItem, FunctionRunInput, FunctionTool,
-    FunctionToolDefinition, FunctionToolRegistry, ModelSettings, OpenAiResponsesClient,
+    create_function_calling_model, AiProvider, FunctionCallingConfig, FunctionCallingRunner,
+    FunctionLoopItem, FunctionRunInput, FunctionTool, FunctionToolDefinition, FunctionToolRegistry,
+    HiveAiConfig, ModelSettings,
 };
 use fluxbee_sdk::blob::{BlobRef, BlobToolkit};
 use fluxbee_sdk::nats::{NatsClient, NatsRequestEnvelope, NatsResponseEnvelope};
 use fluxbee_sdk::protocol::{
-    ConfigChangedPayload, Destination, Message, Meta, Routing, VaultSecretChangedPayload,
-    VaultSecretInterest, MSG_BLOB_CURATE, MSG_BLOB_CURATE_RESPONSE, MSG_BLOB_RELEASE,
-    MSG_BLOB_RELEASE_RESPONSE, MSG_CONFIG_CHANGED, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE,
-    MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
-    MSG_EDGE_PUBLISH_BLOB, MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB,
-    MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_NODE_STATUS_GET, MSG_TTL_EXCEEDED, MSG_UNREACHABLE,
-    is_system_kind, MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL, SYSTEM_KIND,
+    is_system_kind, ConfigChangedPayload, Destination, Message, Meta, Routing,
+    VaultSecretChangedPayload, VaultSecretInterest, MSG_BLOB_CURATE, MSG_BLOB_CURATE_RESPONSE,
+    MSG_BLOB_RELEASE, MSG_BLOB_RELEASE_RESPONSE, MSG_CONFIG_CHANGED, MSG_EDGE_CLOSE_URL,
+    MSG_EDGE_CLOSE_URL_RESPONSE, MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE,
+    MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE, MSG_EDGE_PUBLISH_BLOB,
+    MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB, MSG_EDGE_UNPUBLISH_BLOB_RESPONSE,
+    MSG_NODE_STATUS_GET, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL,
+    SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, classify_admin_action, classify_system_message,
@@ -68,7 +70,6 @@ const PUBLICATION_MAX_EXPIRES_SECS: u64 = 30 * 86_400;
 const PUBLICATION_MIN_EXPIRES_SECS: u64 = 60;
 const MSG_ADMIN_COMMAND: &str = "ADMIN_COMMAND";
 const MSG_ADMIN_COMMAND_RESPONSE: &str = "ADMIN_COMMAND_RESPONSE";
-const DEFAULT_ADMIN_EXECUTOR_MODEL: &str = "gpt-5.4-mini";
 const ADMIN_EXECUTOR_CONFIG_SCHEMA_VERSION: u32 = 1;
 const ADMIN_EXECUTOR_DEFAULT_CATALOG_MODE: &str = "full";
 const ADMIN_EXECUTOR_PLAN_KIND: &str = "executor_plan";
@@ -129,6 +130,7 @@ struct HiveFile {
     wan: Option<WanSection>,
     blob: Option<BlobSection>,
     storage: Option<StorageSection>,
+    ai: Option<HiveAiConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,19 +151,6 @@ struct BlobSection {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
-struct AiProvidersSection {
-    openai: Option<OpenAiSection>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
-struct OpenAiSection {
-    default_model: Option<String>,
-    max_tokens: Option<u32>,
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 struct AdminExecutorCatalogConfig {
     mode: Option<String>,
     actions: Option<Vec<String>>,
@@ -173,15 +162,15 @@ struct AdminExecutorNodeConfigFile {
     schema_version: u32,
     #[serde(default)]
     config_version: u64,
-    ai_providers: Option<AiProvidersSection>,
     catalog: Option<AdminExecutorCatalogConfig>,
 }
 
 #[derive(Clone)]
 struct AdminExecutorAiRuntime {
+    provider: AiProvider,
     model: String,
     model_settings: ModelSettings,
-    client: OpenAiResponsesClient,
+    api_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -886,14 +875,6 @@ fn save_admin_executor_node_config(
     Ok(path)
 }
 
-fn merged_admin_executor_openai_section(
-    config: Option<&AdminExecutorNodeConfigFile>,
-) -> Option<OpenAiSection> {
-    config
-        .and_then(|cfg| cfg.ai_providers.as_ref())
-        .and_then(|providers| providers.openai.clone())
-}
-
 /// Build the admin executor AI runtime by discovering the `openai` resource
 /// in SY.vault (Model D' pool match: dedicated → tenant pool → root-tenant pool).
 /// Returns `Ok(None)` (degraded) on any of:
@@ -910,15 +891,15 @@ async fn build_admin_executor_ai_runtime(
     self_ilk_id: &str,
     my_tenant: &str,
 ) -> Result<Option<AdminExecutorAiRuntime>, AdminError> {
-    let config = load_admin_executor_node_config(hive_id)?;
-    let openai = merged_admin_executor_openai_section(config.as_ref()).unwrap_or_default();
-    let model = openai
-        .default_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_ADMIN_EXECUTOR_MODEL)
-        .to_string();
+    let hive_raw = fs::read_to_string(json_router::paths::config_dir().join("hive.yaml"))?;
+    let hive: HiveFile = serde_yaml::from_str(&hive_raw)?;
+    let engine = hive
+        .ai
+        .as_ref()
+        .map(HiveAiConfig::effective)
+        .transpose()
+        .map_err(|err| -> AdminError { err.into() })?
+        .unwrap_or_else(HiveAiConfig::fallback);
     let vault_client = fluxbee_sdk::VaultClient::new(
         rpc,
         hive_id.to_string(),
@@ -926,7 +907,7 @@ async fn build_admin_executor_ai_runtime(
     );
     let value = vault_client
         .resolve_resource(
-            fluxbee_sdk::ResourceType::Openai,
+            engine.provider.resource_type(),
             my_tenant,
             Duration::from_secs(5),
         )
@@ -937,7 +918,8 @@ async fn build_admin_executor_ai_runtime(
         Err(err) => {
             tracing::warn!(
                 error = %err,
-                "SY.admin executor OpenAI vault resource lookup failed; running degraded"
+                provider = %engine.provider,
+                "SY.admin executor AI vault resource lookup failed; running degraded"
             );
             return Ok(None);
         }
@@ -946,13 +928,10 @@ async fn build_admin_executor_ai_runtime(
         return Ok(None);
     };
     Ok(Some(AdminExecutorAiRuntime {
-        model,
-        model_settings: ModelSettings {
-            temperature: openai.temperature,
-            top_p: openai.top_p,
-            max_output_tokens: openai.max_tokens,
-        },
-        client: OpenAiResponsesClient::new(api_key),
+        provider: engine.provider,
+        model: engine.model,
+        model_settings: ModelSettings::default(),
+        api_key,
     }))
 }
 
@@ -2073,7 +2052,10 @@ Step to review:\n{}",
             serde_json::to_string_pretty(step).unwrap_or_default()
         );
 
-        let model = runtime.client.clone().function_model(
+        let model = create_function_calling_model(
+            runtime.provider,
+            runtime.api_key.clone(),
+            None,
             runtime.model.clone(),
             Some(prompt),
             runtime.model_settings.clone(),
@@ -2081,7 +2063,7 @@ Step to review:\n{}",
         let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
         let _ = runner
             .run_with_input(
-                &model,
+                model.as_ref(),
                 &tools,
                 FunctionRunInput {
                     current_user_message: format!("Review step '{}' ({}).", step.id, step.action),
@@ -2548,7 +2530,10 @@ async fn execute_admin_executor_plan(
                 })?;
         }
 
-        let model = runtime.client.clone().function_model(
+        let model = create_function_calling_model(
+            runtime.provider,
+            runtime.api_key.clone(),
+            None,
             runtime.model.clone(),
             Some(admin_executor_prompt(&resolved_step, &request.plan)),
             runtime.model_settings.clone(),
@@ -2556,7 +2541,7 @@ async fn execute_admin_executor_plan(
         let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
         let result = runner
             .run_with_input(
-                &model,
+                model.as_ref(),
                 &tools,
                 FunctionRunInput {
                     current_user_message: format!(
@@ -2777,8 +2762,8 @@ async fn handle_system_command(
 }
 
 /// Handle a `VAULT_SECRET_CHANGED` broadcast for the admin executor.
-/// Admin's only vault-resolved secret is the OpenAI api_key; the runtime
-/// (`OpenAiResponsesClient`) is hot-rebuildable via
+/// Admin's only vault-resolved secret is the hive-selected AI api_key; the runtime
+/// (provider-neutral AI SDK runtime) is hot-rebuildable via
 /// `refresh_admin_executor_ai_runtime`, so no exit() needed — we refresh
 /// in-memory and the executor picks up the new key on the next call.
 async fn handle_vault_secret_changed_admin(ctx: &AdminContext, msg: &Message) {
@@ -2795,8 +2780,21 @@ async fn handle_vault_secret_changed_admin(ctx: &AdminContext, msg: &Message) {
             return;
         }
     };
+    let provider = load_hive(&ctx.config_dir)
+        .ok()
+        .and_then(|hive| {
+            hive.ai
+                .as_ref()
+                .map(HiveAiConfig::effective)
+                .transpose()
+                .ok()
+                .flatten()
+        })
+        .unwrap_or_else(HiveAiConfig::fallback)
+        .provider;
+    let resource_type = provider.to_string();
     let interest = VaultSecretInterest {
-        resource_type: "openai",
+        resource_type: &resource_type,
         my_tenant: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
         my_ilk: Some(ctx.self_ilk_id.as_str()),
         system_caller: true,
@@ -2809,7 +2807,8 @@ async fn handle_vault_secret_changed_admin(ctx: &AdminContext, msg: &Message) {
             payload_ilk = %payload.ilk.as_deref().unwrap_or(""),
             my_tenant = %fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
             my_ilk = %ctx.self_ilk_id,
-            "sy.admin VAULT_SECRET_CHANGED does not match interest (resource_type=openai); ignoring"
+            provider = %provider,
+            "sy.admin VAULT_SECRET_CHANGED does not match AI provider interest; ignoring"
         );
         return;
     }
@@ -2817,7 +2816,8 @@ async fn handle_vault_secret_changed_admin(ctx: &AdminContext, msg: &Message) {
         node_name = %ctx.node_name,
         op = %payload.op.as_str(),
         version = payload.version,
-        "VAULT_SECRET_CHANGED (openai) matches interest; refreshing executor runtime"
+        provider = %provider,
+        "VAULT_SECRET_CHANGED matches AI provider interest; refreshing executor runtime"
     );
     match refresh_admin_executor_ai_runtime(ctx).await {
         Ok(configured) => {
@@ -7870,18 +7870,10 @@ fn build_admin_executor_function_catalog_response(
 /// `resource_type=openai`; the executor resolves them at boot/refresh.
 fn reject_admin_executor_secret_fields(payload: &serde_json::Value) -> Result<(), AdminError> {
     let config_root = payload.get("config").unwrap_or(payload);
-    let openai = config_root
-        .get("ai_providers")
-        .and_then(|providers| providers.get("openai"));
-    let Some(openai) = openai else {
-        return Ok(());
-    };
-    for forbidden in ["api_key", "api_key_ref"] {
-        if openai.get(forbidden).is_some() {
-            return Err(format!(
-                "config.ai_providers.openai.{forbidden} is no longer accepted; load the openai secret via vault_put (resource_type=openai) and admin will discover it from the pool"
-            ).into());
-        }
+    if config_root.get("ai_providers").is_some() || config_root.get("ai").is_some() {
+        return Err(
+            "AI provider/model are hive-wide; configure the ai section in hive.yaml".into(),
+        );
     }
     Ok(())
 }
@@ -7896,37 +7888,6 @@ fn merge_admin_executor_local_config(
     }
     let mut changed = false;
     let config_root = payload.get("config").unwrap_or(payload);
-
-    if let Some(openai) = config_root
-        .get("ai_providers")
-        .and_then(|providers| providers.get("openai"))
-        .and_then(serde_json::Value::as_object)
-    {
-        let provider = merged
-            .ai_providers
-            .get_or_insert_with(AiProvidersSection::default);
-        let openai_cfg = provider.openai.get_or_insert_with(OpenAiSection::default);
-        if let Some(value) = openai.get("default_model") {
-            openai_cfg.default_model = value
-                .as_str()
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(ToString::to_string);
-            changed = true;
-        }
-        if let Some(value) = openai.get("max_tokens") {
-            openai_cfg.max_tokens = value.as_u64().map(|v| v as u32);
-            changed = true;
-        }
-        if let Some(value) = openai.get("temperature") {
-            openai_cfg.temperature = value.as_f64().map(|v| v as f32);
-            changed = true;
-        }
-        if let Some(value) = openai.get("top_p") {
-            openai_cfg.top_p = value.as_f64().map(|v| v as f32);
-            changed = true;
-        }
-    }
 
     if let Some(catalog) = config_root
         .get("catalog")
@@ -7981,7 +7942,14 @@ fn build_admin_executor_config_get_payload(
     ctx: &AdminContext,
 ) -> Result<serde_json::Value, AdminError> {
     let node_config = load_admin_executor_node_config(&ctx.hive_id)?;
-    let merged = merged_admin_executor_openai_section(node_config.as_ref());
+    let hive = load_hive(&json_router::paths::config_dir())?;
+    let engine = hive
+        .ai
+        .as_ref()
+        .map(HiveAiConfig::effective)
+        .transpose()
+        .map_err(|err| -> AdminError { err.into() })?
+        .unwrap_or_else(HiveAiConfig::fallback);
     let config_version = node_config
         .as_ref()
         .map(|cfg| cfg.config_version)
@@ -7995,7 +7963,7 @@ fn build_admin_executor_config_get_payload(
     let configured = ctx.executor_configured.load(Ordering::Relaxed);
     let resources = serde_json::json!([
         {
-            "resource_type": "openai",
+            "resource_type": engine.provider.to_string(),
             "required": true,
             "configured": configured,
             "scope": "pool (tenant or root)"
@@ -8009,13 +7977,9 @@ fn build_admin_executor_config_get_payload(
         "schema_version": schema_version,
         "config_version": config_version,
         "config": {
-            "ai_providers": {
-                "openai": {
-                    "default_model": merged.as_ref().and_then(|openai| openai.default_model.clone()).map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
-                    "max_tokens": merged.as_ref().and_then(|openai| openai.max_tokens.map(serde_json::Value::from)).unwrap_or(serde_json::Value::Null),
-                    "temperature": merged.as_ref().and_then(|openai| openai.temperature.map(serde_json::Value::from)).unwrap_or(serde_json::Value::Null),
-                    "top_p": merged.as_ref().and_then(|openai| openai.top_p.map(serde_json::Value::from)).unwrap_or(serde_json::Value::Null)
-                }
+            "ai": {
+                "default_provider": engine.provider.to_string(),
+                "model": engine.model
             },
             "catalog": {
                 "mode": admin_executor_catalog_mode(node_config.as_ref()),
@@ -8033,17 +7997,12 @@ fn build_admin_executor_config_get_payload(
             "supports": ["CONFIG_GET", "CONFIG_SET"],
             "required_fields": [],
             "optional_fields": [
-                "config.ai_providers.openai.default_model",
-                "config.ai_providers.openai.max_tokens",
-                "config.ai_providers.openai.temperature",
-                "config.ai_providers.openai.top_p",
                 "config.catalog.mode",
                 "config.catalog.actions"
             ],
             "resources": resources,
             "notes": [
-                "Model D': openai credentials live entirely in SY.vault. Operator loads them with vault_put + resource_type=openai; admin resolves from the pool on boot/refresh.",
-                "CONFIG_SET on SY.admin takes no secret-bearing fields (api_key/api_key_ref are rejected).",
+                "The AI provider/model are configured hive-wide in hive.yaml and cannot be overridden by CONFIG_SET.",
                 "Catalog mode defaults to full. Use subset only when intentionally constraining the executor-visible action set."
             ]
         },
@@ -8141,7 +8100,7 @@ async fn apply_admin_executor_config_set(
         return admin_executor_config_error_response(
             ctx,
             "invalid_config",
-            "config-set requires at least one executor config field (default_model, max_tokens, temperature, top_p, catalog.mode, catalog.actions)",
+            "config-set requires at least one executor catalog field (catalog.mode, catalog.actions)",
         );
     }
 
@@ -8168,20 +8127,12 @@ async fn apply_admin_executor_config_set(
         "config_version": merged_config.config_version,
         "apply_mode": "replace",
         "config": {
-            "ai_providers": {
-                "openai": {
-                    "default_model": merged_config.ai_providers.as_ref().and_then(|p| p.openai.as_ref()).and_then(|o| o.default_model.clone()).map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
-                    "max_tokens": merged_config.ai_providers.as_ref().and_then(|p| p.openai.as_ref()).and_then(|o| o.max_tokens.map(serde_json::Value::from)).unwrap_or(serde_json::Value::Null),
-                    "temperature": merged_config.ai_providers.as_ref().and_then(|p| p.openai.as_ref()).and_then(|o| o.temperature.map(serde_json::Value::from)).unwrap_or(serde_json::Value::Null),
-                    "top_p": merged_config.ai_providers.as_ref().and_then(|p| p.openai.as_ref()).and_then(|o| o.top_p.map(serde_json::Value::from)).unwrap_or(serde_json::Value::Null)
-                }
-            },
             "catalog": {
                 "mode": admin_executor_catalog_mode(Some(&merged_config)),
                 "actions": merged_config.catalog.as_ref().and_then(|catalog| catalog.actions.clone()).map(serde_json::Value::from).unwrap_or(serde_json::Value::Null)
             }
         },
-        "message": "SY.admin executor non-secret config persisted (Model D': openai credentials live in vault)."
+        "message": "SY.admin executor catalog config persisted; AI provider/model remain hive-wide."
     }))
 }
 
@@ -9556,8 +9507,10 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
         }),
         "set_node_config" => serde_json::json!({
             "config": {
-                "openai": {
-                    "default_model": "gpt-4.1-mini"
+                "behavior": {
+                    "kind": "ai_chat",
+                    "vault_key": "ai/sales",
+                    "model": "gpt-5.5"
                 }
             },
             "replace": false,
@@ -9808,7 +9761,7 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
             r#"curl -X POST /hives/motherbee/nodes/WF.invoice@motherbee/control/config-get -d '{"requested_by":"archi"}'"#
         }
         "node_control_config_set" => {
-            r#"current="$(curl -sS -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-get -d '{"requested_by":"archi"}' | jq -r '.payload.response.config_version')"; next="$((current + 1))"; curl -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-set -d "{\"node_name\":\"AI.sales@motherbee\",\"subsystem\":\"ai_node\",\"schema_version\":1,\"config_version\":${next},\"apply_mode\":\"replace\",\"config\":{\"behavior\":{\"kind\":\"openai_chat\",\"model\":\"gpt-4.1-mini\"}}}""#
+            r#"current="$(curl -sS -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-get -d '{"requested_by":"archi"}' | jq -r '.payload.response.config_version')"; next="$((current + 1))"; curl -X POST /hives/motherbee/nodes/AI.sales@motherbee/control/config-set -d "{\"node_name\":\"AI.sales@motherbee\",\"subsystem\":\"ai_node\",\"schema_version\":1,\"config_version\":${next},\"apply_mode\":\"replace\",\"config\":{\"behavior\":{\"kind\":\"ai_chat\",\"vault_key\":\"ai/sales\",\"model\":\"gpt-5.5\"}}}""#
         }
         "list_ilks" => "curl -X GET /hives/motherbee/identity/ilks",
         "get_ilk" => {
@@ -10027,13 +9980,13 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The payload.config object is node-defined and is not interpreted by SY.admin.",
             "Before mutating AI.* or IO.*, call node_control_config_get and set config_version to response.config_version + 1. A smaller value is stale; an equal value is idempotent and will not apply a change.",
             "Do not use config_version from get_node_config/_system as a substitute unless it exactly matches the live CONFIG_GET response; the canonical source is node_control_config_get.",
-            "For ai.generic OpenAI chat, use config.behavior.kind=openai_chat. Do not use openai as behavior.kind.",
+            "For ai.generic chat, use config.behavior.kind=ai_chat with both vault_key and model. Vault metadata selects the provider; the key never selects the model.",
             "Do not put cognitive assets under CONFIG_SET config.assets. Apply role_hash, skill_hashes, handbook_hashes, and personality_hash with set_ilk_definition against the agent ILK.",
             "For WF.* v1, CONFIG_SET is persist-only and returns restart_required; it does not hot-apply CONFIG_CHANGED.",
             "For WF.* v1, do not mutate _system through CONFIG_SET. Managed package/runtime metadata remains owned by orchestrator.",
             "For SY.storage v1, the canonical secret field is config.database.postgres_url and the apply is persist-only until sy-storage is restarted.",
             "For SY.identity v1, the canonical secret field is config.database.postgres_url and the apply is persist-only until sy-identity is restarted.",
-            "For SY.cognition, the canonical AI secret field is config.secrets.openai.api_key and semantic controls live under config.semantic_tagger.*.",
+            "For SY.cognition, provider/model are hive-wide in hive.yaml; CONFIG_SET only accepts non-engine semantic controls.",
             "For SY.config.routes v2, CONFIG_SET replaces selected sections of the node-owned effective routes/vpns/taps config; use add/delete actions when you want explicit domain mutations instead of a control-plane config replace.",
         ],
         "list_routes" | "list_vpns" | "list_taps" => vec![
@@ -13718,19 +13671,24 @@ mod tests {
             // The primary orchestrator may relay ONLY vault_put (per-spoke recovery key during
             // add_hive); it is denied the other exposed actions (create_tenant / run_node).
             if *action == "vault_put" {
-                assert!(
-                    authorize_cloud_relay(Some("SY.orchestrator@motherbee"), action, "motherbee")
-                        .is_ok()
-                );
+                assert!(authorize_cloud_relay(
+                    Some("SY.orchestrator@motherbee"),
+                    action,
+                    "motherbee"
+                )
+                .is_ok());
             } else {
-                assert!(
-                    authorize_cloud_relay(Some("SY.orchestrator@motherbee"), action, "motherbee")
-                        .is_err()
-                );
+                assert!(authorize_cloud_relay(
+                    Some("SY.orchestrator@motherbee"),
+                    action,
+                    "motherbee"
+                )
+                .is_err());
             }
             // A spoke orchestrator is never allowed, even for vault_put.
             assert!(
-                authorize_cloud_relay(Some("SY.orchestrator@worker1"), action, "motherbee").is_err()
+                authorize_cloud_relay(Some("SY.orchestrator@worker1"), action, "motherbee")
+                    .is_err()
             );
         }
     }

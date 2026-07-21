@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use chrono::{SecondsFormat, TimeZone, Utc};
+use fluxbee_ai_sdk::{EffectiveAiEngine, HiveAiConfig};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -144,6 +145,7 @@ struct HiveFile {
     government: Option<GovernmentSection>,
     system_nodes: Option<SystemNodesSection>,
     egress: Option<EgressSection>,
+    ai: Option<HiveAiConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -584,6 +586,7 @@ struct OrchestratorState {
     egress: Option<EgressSection>,
     blob: BlobRuntimeConfig,
     dist: DistRuntimeConfig,
+    ai: EffectiveAiEngine,
     blob_sync_last_desired: Mutex<BlobRuntimeConfig>,
     // F18: serialize add_hive/remove_hive per hive_id. The TOCTOU window is the
     // exists-check -> remove_dir_all -> create_dir_all -> info.yaml write sequence;
@@ -749,6 +752,13 @@ async fn main() -> Result<(), OrchestratorError> {
     let dist_runtime = dist_runtime_from_hive(&hive);
     let storage_path = storage_path_from_hive(&hive);
     let system_nodes = system_nodes_for_role(&hive, role)?;
+    let ai = hive
+        .ai
+        .as_ref()
+        .map(HiveAiConfig::effective)
+        .transpose()
+        .map_err(|err| -> OrchestratorError { err.into() })?
+        .unwrap_or_else(HiveAiConfig::fallback);
     let runtime_manifest = load_runtime_manifest();
     let state = Arc::new(OrchestratorState {
         hive_id: hive.hive_id.clone(),
@@ -773,6 +783,7 @@ async fn main() -> Result<(), OrchestratorError> {
         egress: hive.egress.clone(),
         blob: blob_runtime.clone(),
         dist: dist_runtime,
+        ai,
         blob_sync_last_desired: Mutex::new(blob_runtime),
         hive_topology_locks: std::sync::Mutex::new(HashMap::new()),
         node_lifecycle_locks: std::sync::Mutex::new(HashMap::new()),
@@ -1386,7 +1397,9 @@ async fn bootstrap_local(
     // without a fresh add_hive re-provision. Motherbee is skipped (its units are the .deb's).
     if !state.is_motherbee {
         match regen_local_core_units(&core_manifest, state.role) {
-            Ok(true) => tracing::info!("bootstrap: regenerated core units to match current templates"),
+            Ok(true) => {
+                tracing::info!("bootstrap: regenerated core units to match current templates")
+            }
             Ok(false) => {}
             Err(err) => {
                 tracing::warn!(error = %err, "bootstrap: core unit regen failed (non-fatal)")
@@ -17349,6 +17362,7 @@ async fn add_hive_flow(
         (blob_sync_data_dir_str.as_str(), "blob.sync.data_dir"),
         (dist_path_str.as_str(), "dist.path"),
         (desired_dist.sync_tool.as_str(), "dist.sync.tool"),
+        (state.ai.model.as_str(), "ai.providers.<default>.model"),
     ] {
         if let Err(err) = validate_yaml_scalar(val, label) {
             return serde_json::json!({
@@ -17358,9 +17372,14 @@ async fn add_hive_flow(
             });
         }
     }
+    let ai_yaml = format!(
+        "ai:\n  default_provider: {}\n  providers:\n    {}:\n      model: \"{}\"\n",
+        state.ai.provider, state.ai.provider, state.ai.model
+    );
     let hive_yaml = format!(
-        "hive_id: {}\nrole: worker\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\ngovernment:\n  identity_frontdesk: \"{}\"\nidentity:\n  sync:\n    upstream: \"{}\"\n    auth: required\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n{}{}",
+        "hive_id: {}\nrole: worker\n{}wan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{}\"\ngovernment:\n  identity_frontdesk: \"{}\"\nidentity:\n  sync:\n    upstream: \"{}\"\n    auth: required\nblob:\n  enabled: {}\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n    api_port: {}\n    data_dir: \"{}\"\n  gc:\n    enabled: {}\n    interval_secs: {}\n    apply: {}\n    staging_ttl_hours: {}\n    active_retain_days: {}\ndist:\n  path: \"{}\"\n  sync:\n    enabled: {}\n    tool: \"{}\"\n{}{}",
         hive_id,
+        ai_yaml,
         worker_uplink,
         storage_path,
         identity_frontdesk_node_name,
@@ -17824,18 +17843,15 @@ async fn add_hive_flow(
     // full SO-02 bootstrap revoke (MB key + sudoers).
     let ssh_bootstrap_revoked = match persist_revoked {
         Some(revoked) => revoked,
-        None => match revoke_bootstrap_ssh_access(
-            address,
-            &key_path,
-            creds.user.as_str(),
-            &pub_key,
-        ) {
-            Ok(()) => true,
-            Err(err) => {
-                tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access; key/sudoers may remain on the worker");
-                false
+        None => {
+            match revoke_bootstrap_ssh_access(address, &key_path, creds.user.as_str(), &pub_key) {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access; key/sudoers may remain on the worker");
+                    false
+                }
             }
-        },
+        }
     };
 
     serde_json::json!({
@@ -18410,18 +18426,15 @@ async fn add_egress_hive_flow(
     // an egress boundary host. Best-effort. Post-bootstrap is socket + dist-sync.
     let ssh_bootstrap_revoked = match persist_revoked {
         Some(revoked) => revoked,
-        None => match revoke_bootstrap_ssh_access(
-            address,
-            &key_path,
-            creds.user.as_str(),
-            &pub_key,
-        ) {
-            Ok(()) => true,
-            Err(err) => {
-                tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access on egress; key/sudoers may remain");
-                false
+        None => {
+            match revoke_bootstrap_ssh_access(address, &key_path, creds.user.as_str(), &pub_key) {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access on egress; key/sudoers may remain");
+                    false
+                }
             }
-        },
+        }
     };
 
     serde_json::json!({
@@ -19171,18 +19184,15 @@ async fn add_ingress_hive_flow(
 
     let ssh_bootstrap_revoked = match persist_revoked {
         Some(revoked) => revoked,
-        None => match revoke_bootstrap_ssh_access(
-            address,
-            &key_path,
-            creds.user.as_str(),
-            &pub_key,
-        ) {
-            Ok(()) => true,
-            Err(err) => {
-                tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access on ingress; key/sudoers may remain");
-                false
+        None => {
+            match revoke_bootstrap_ssh_access(address, &key_path, creds.user.as_str(), &pub_key) {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!(hive_id = hive_id, error = %err, "SO-02: failed to revoke bootstrap SSH access on ingress; key/sudoers may remain");
+                    false
+                }
             }
-        },
+        }
     };
 
     serde_json::json!({
@@ -19904,14 +19914,18 @@ async fn finalize_spoke_key_persist(
         }
     };
 
-    let ssh_bootstrap_revoked =
-        match revoke_bootstrap_authorized_key_with_key(address, mb_key_path, user, mb_pub_key) {
-            Ok(()) => true,
-            Err(err) => {
-                tracing::warn!(hive_id = hive_id, error = %err, "key_only_persist: failed to remove the motherbee bootstrap key; it may remain in authorized_keys");
-                false
-            }
-        };
+    let ssh_bootstrap_revoked = match revoke_bootstrap_authorized_key_with_key(
+        address,
+        mb_key_path,
+        user,
+        mb_pub_key,
+    ) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(hive_id = hive_id, error = %err, "key_only_persist: failed to remove the motherbee bootstrap key; it may remain in authorized_keys");
+            false
+        }
+    };
 
     Ok(SpokeKeyPersistResult {
         restrict_ssh_applied: false,
@@ -21896,7 +21910,8 @@ mod tests {
     #[test]
     fn resolve_add_hive_ssh_creds_accepts_and_validates_ssh_key() {
         // A PEM private key is kept VERBATIM (newlines preserved — never trimmed).
-        let pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAAB3Nz\n-----END OPENSSH PRIVATE KEY-----\n";
+        let pem =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAAB3Nz\n-----END OPENSSH PRIVATE KEY-----\n";
         let creds =
             resolve_add_hive_ssh_creds(&serde_json::json!({"ssh_user": "ubuntu", "ssh_key": pem}))
                 .unwrap();
@@ -21935,7 +21950,9 @@ mod tests {
         assert!(add_hive_result_is_transient(&serde_json::json!({
             "message": "ssh: connect to host h port 22: Connection refused"
         })));
-        assert!(add_hive_result_is_transient(&serde_json::json!({ "retryable": true })));
+        assert!(add_hive_result_is_transient(
+            &serde_json::json!({ "retryable": true })
+        ));
         assert!(!add_hive_result_is_transient(&serde_json::json!({
             "message": "Permission denied (publickey)"
         })));
@@ -22816,6 +22833,7 @@ blob:
             egress: None,
             blob: sample_blob_config(),
             dist: sample_dist_config(),
+            ai: HiveAiConfig::fallback(),
             blob_sync_last_desired: Mutex::new(sample_blob_config()),
             hive_topology_locks: StdMutex::new(HashMap::new()),
             node_lifecycle_locks: StdMutex::new(HashMap::new()),
