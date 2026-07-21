@@ -577,11 +577,15 @@ El router es el centro de routing **y** de autoridad de la malla. La política s
 modela en **dos capas** que el router compone (ver `docs/onworking COA/opa-dual.md`):
 
 - **Capa SYSTEM (autoritativa, NO editable por usuario).** Las reglas `SY.` de
-  origen-autoridad, hoy una tabla fija en Rust: `src/router/system_policy.rs`
-  (`authority()` + `is_protected_system_action()`). Inalcanzable desde los
-  endpoints `/opa/policy*` (esos solo llegan al blob OPA del usuario), así que es
-  no editable por construcción. `authority()` es un **seam estable**: una futura
-  capa system en Rego puede reemplazar el backing sin cambiar los call-sites.
+  origen-autoridad viven en `src/router/system_policy.rs`
+  (`authority()` + `is_protected_system_action()`). Ya es **OPA-backed**: el gate de
+  entrega llama `authorize_system()`, que evalúa el `policy/system.wasm` baked
+  (compilado de `policy/system.rego`); la tabla Rust `authority()` es solo el
+  **fallback** ante fallo de carga del wasm (byte-idéntica, shadow-verified en tests).
+  Inalcanzable desde los endpoints `/opa/policy*` (esos solo llegan al blob OPA del
+  usuario), así que es no editable por construcción. `authorize_system()` es un
+  **seam estable**: una futura capa system runtime-editable solo cambia cómo se
+  alimenta el resolver, no los call-sites.
 - **Capa USER.** OPA (§8.1–8.6): selecciona target de routing y, a futuro, podrá
   *estrechar* autoridad.
 
@@ -593,11 +597,12 @@ es **autoritativo** (lo resuelve el router del UUID origen contra su registro de
 nodos en delivery local / WAN / peer, sobreescribiendo cualquier valor que haya
 puesto el emisor — ver el test de spoof), así que es una barrera real.
 
-Acciones protegidas (18): `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT`, `SPAWN_NODE`,
-`KILL_NODE`, `START_NODE`, `RESTART_NODE`, `REMOVE_NODE_INSTANCE`, `NODE_CONFIG_SET`,
-`NODE_CONFIG_GET`, `NODE_STATE_GET`, `NODE_STATUS_GET`, `GET_VERSIONS`,
-`GET_RUNTIMES`, `GET_RUNTIME`, `LIST_NODES`, `INVENTORY_REQUEST`,
-`ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP`.
+Acciones protegidas (25): `SYSTEM_UPDATE`, `SYSTEM_SYNC_HINT`, `EDGE_OPEN_URL`,
+`EDGE_CLOSE_URL`, `EDGE_LIST_URLS`, `EDGE_PUBLISH_BLOB`, `EDGE_UNPUBLISH_BLOB`,
+`SPAWN_NODE`, `KILL_NODE`, `START_NODE`, `RESTART_NODE`, `REMOVE_NODE_INSTANCE`,
+`NODE_CONFIG_SET`, `NODE_CONFIG_GET`, `CONFIG_SET`, `CONFIG_GET`, `NODE_STATE_GET`,
+`NODE_STATUS_GET`, `GET_VERSIONS`, `GET_RUNTIMES`, `GET_RUNTIME`, `LIST_NODES`,
+`INVENTORY_REQUEST`, `ADD_HIVE_FINALIZE`, `REMOVE_HIVE_CLEANUP`.
 
 Allow-list `SY.` (sobre el `src_l2_name` autoritativo):
 
@@ -608,6 +613,8 @@ Allow-list `SY.` (sobre el `src_l2_name` autoritativo):
 | `SY.wf-rules@<hive>` | same-hive | todas |
 | `WF.orch.diag@<hive>` | same-hive | todas |
 | `SY.config-routes@<hive>`, `SY.vault@<hive>` | same-hive | **solo** `NODE_STATUS_GET` (probe read-only) |
+| `SY.admin@motherbee` | primary | **solo** `EDGE_*` (`EDGE_OPEN_URL`/`EDGE_CLOSE_URL`/`EDGE_LIST_URLS`/`EDGE_PUBLISH_BLOB`/`EDGE_UNPUBLISH_BLOB`) + `CONFIG_GET`/`CONFIG_SET` cross-hive |
+| `RT.gateway@motherbee` | primary | **solo** `WAN_REACHABILITY_VOUCH` (Option B: solo el hub primario puede vouchear reachability transitiva; no está en la lista de protegidas, es un gate de autoridad aparte) |
 
 El rol se matchea exacto (`split_once('@')`), así que un `SY.orchestrator.relay@h`
 NO pasa como `SY.orchestrator`. Cross-hive solo para `SY.orchestrator` (cierra el

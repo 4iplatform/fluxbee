@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::protocol::{
-    Destination, Message, Meta, Routing, MSG_CONFIG_GET, MSG_CONFIG_RESPONSE, MSG_CONFIG_SET,
-    SYSTEM_KIND,
+    is_system_kind, Destination, Message, Meta, Routing, MSG_CONFIG_GET, MSG_CONFIG_RESPONSE,
+    MSG_CONFIG_SET, SYSTEM_KIND,
 };
 
 pub const NODE_CONFIG_CONTROL_TARGET: &str = "node_config_control";
@@ -103,28 +103,28 @@ pub enum NodeConfigControlError {
 }
 
 pub fn is_node_config_get_message(msg: &Message) -> bool {
-    msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_CONFIG_GET)
+    is_system_kind(&msg.meta.msg_type) && msg.meta.msg.as_deref() == Some(MSG_CONFIG_GET)
 }
 
 pub fn is_node_config_set_message(msg: &Message) -> bool {
-    msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_CONFIG_SET)
+    is_system_kind(&msg.meta.msg_type) && msg.meta.msg.as_deref() == Some(MSG_CONFIG_SET)
 }
 
 pub fn is_node_config_response_message(msg: &Message) -> bool {
-    msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_CONFIG_RESPONSE)
+    is_system_kind(&msg.meta.msg_type) && msg.meta.msg.as_deref() == Some(MSG_CONFIG_RESPONSE)
 }
 
 pub fn parse_node_config_request(
     msg: &Message,
 ) -> Result<NodeConfigControlRequest, NodeConfigControlError> {
     match msg.meta.msg.as_deref() {
-        Some(MSG_CONFIG_GET) if msg.meta.msg_type == SYSTEM_KIND => Ok(
+        Some(MSG_CONFIG_GET) if is_system_kind(&msg.meta.msg_type) => Ok(
             NodeConfigControlRequest::Get(serde_json::from_value(msg.payload.clone())?),
         ),
-        Some(MSG_CONFIG_SET) if msg.meta.msg_type == SYSTEM_KIND => Ok(
+        Some(MSG_CONFIG_SET) if is_system_kind(&msg.meta.msg_type) => Ok(
             NodeConfigControlRequest::Set(serde_json::from_value(msg.payload.clone())?),
         ),
-        Some(other) if msg.meta.msg_type == SYSTEM_KIND => {
+        Some(other) if is_system_kind(&msg.meta.msg_type) => {
             Err(NodeConfigControlError::InvalidMessage(format!(
                 "unsupported system msg '{other}' for node config control"
             )))
@@ -348,6 +348,47 @@ mod tests {
 
         let parsed = parse_node_config_request(&msg).unwrap();
         assert_eq!(parsed, NodeConfigControlRequest::Set(payload));
+    }
+
+    #[test]
+    fn msg_type_classification_is_case_insensitive() {
+        // Audit #14: the router classifies system-kind traffic case-insensitively
+        // (eq_ignore_ascii_case) and authorizes it there. A node that then re-checked
+        // the msg_type with a case-sensitive `== SYSTEM_KIND` would silently DROP an
+        // authorized "System"/"SYSTEM" frame the router already forwarded. The node-side
+        // helpers MUST agree with the router (via is_system_kind).
+        let payload = NodeConfigGetPayload {
+            node_name: "AI.chat@motherbee".to_string(),
+            ..Default::default()
+        };
+        let mut msg = build_node_config_get_message(
+            "node-src-1",
+            "AI.chat@motherbee",
+            &payload,
+            &NodeConfigEnvelopeOptions::default(),
+            "trace-case",
+        )
+        .unwrap();
+
+        for kind in ["system", "System", "SYSTEM", "SyStEm"] {
+            msg.meta.msg_type = kind.to_string();
+            assert!(
+                is_node_config_get_message(&msg),
+                "is_node_config_get_message must accept msg_type={kind:?}"
+            );
+            assert!(
+                matches!(
+                    parse_node_config_request(&msg),
+                    Ok(NodeConfigControlRequest::Get(_))
+                ),
+                "parse_node_config_request must accept msg_type={kind:?}"
+            );
+        }
+
+        // A genuinely different kind is still rejected.
+        msg.meta.msg_type = "command".to_string();
+        assert!(!is_node_config_get_message(&msg));
+        assert!(parse_node_config_request(&msg).is_err());
     }
 
     #[test]

@@ -25,9 +25,11 @@ pub use immediate_memory::{
     ImmediateInteractionKind, ImmediateOperation, ImmediateRole,
 };
 pub use llm::{
-    build_output_schema_fallback_instruction, LlmClient, LlmRequest, LlmResponse, LlmStreamEvent,
-    MockLlmClient, ModelSettings, OpenAiFunctionCallingModel, OpenAiResponsesClient,
-    OutputSchemaSpec,
+    build_output_schema_fallback_instruction, create_function_calling_model, create_llm_client,
+    AiProvider, AiProviderConfigs, AiProviderModelConfig, AnthropicFunctionCallingModel,
+    AnthropicMessagesClient, EffectiveAiEngine, HiveAiConfig, LlmClient, LlmRequest, LlmResponse,
+    LlmStreamEvent, MockLlmClient, ModelSettings, OpenAiFunctionCallingModel,
+    OpenAiResponsesClient, OutputSchemaSpec, DEFAULT_HIVE_AI_PROVIDER, DEFAULT_HIVE_OPENAI_MODEL,
 };
 pub use message::{
     build_reply_message, build_reply_message_runtime_src,
@@ -48,11 +50,11 @@ pub use summary_refresh::{
 };
 pub use text_payload::{
     build_model_input_from_payload, build_model_input_from_payload_with_options,
-    build_openai_user_content_parts, build_openai_user_content_parts_with_options,
+    build_model_user_content_parts, build_model_user_content_parts_with_options,
     build_text_response, build_text_response_with_options, extract_text,
     resolve_model_input_from_payload, resolve_model_input_from_payload_with_options,
-    ModelInputOptions, ModelInputPayloadError, OpenAiUserContentOptions, ResolvedModelAttachment,
-    ResolvedModelInput, TextResponseOptions,
+    ModelContentPart, ModelInputOptions, ModelInputPayloadError, ModelUserContentOptions,
+    ResolvedModelAttachment, ResolvedModelInput, TextResponseOptions,
 };
 pub use thread_state::{LanceDbThreadStateStore, ThreadStateRecord, ThreadStateStore};
 pub use thread_state_tools::{

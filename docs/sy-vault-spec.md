@@ -981,7 +981,7 @@ This intentionally destroys vault contents. The next vault boot generates a new 
 - OPA integration (planned)
 - L2/admin verb to query audit log
 - Automatic audit log rotation
-- Hot-reload notification on secret change (consumers re-query as needed)
+- ~~Hot-reload notification on secret change~~ — **IMPLEMENTED** (moved out of this list): `sy_vault.rs` broadcasts `VAULT_SECRET_CHANGED` on put/rotate/delete/rollback plus a bootstrap fan-out, so consumers are woken rather than only polling
 - Multi-instance / replication
 - Cross-hive vault federation
 - Support for new node-local plaintext `secrets.json` writes once vault is enabled

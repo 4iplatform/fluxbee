@@ -42,6 +42,8 @@ pub const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
     "REMOVE_NODE_INSTANCE",
     "NODE_CONFIG_SET",
     "NODE_CONFIG_GET",
+    "CONFIG_SET",
+    "CONFIG_GET",
     "NODE_STATE_GET",
     "NODE_STATUS_GET",
     "GET_VERSIONS",
@@ -90,6 +92,8 @@ pub fn is_protected_system_action(action: &str) -> bool {
 ///   the cross-hive control plane and must never be denied by a user layer.
 /// - `SY.admin` / `SY.wf-rules` / `WF.orch.diag`: same-hive control plane, all
 ///   protected actions.
+/// - `SY.admin@motherbee`: cross-hive `CONFIG_GET` / `CONFIG_SET` and runtime distribution,
+///   because the global Admin forwards those requests directly to managed nodes/orchestrators.
 /// - `SY.config-routes` / `SY.vault`: same-hive, ONLY for `NODE_STATUS_GET` — a
 ///   read-only health probe that SY.architect intentionally opens to these nodes;
 ///   honoring it here keeps one consistent probe policy across every receiver.
@@ -108,6 +112,18 @@ pub fn authority(action: &str, src_l2_name: Option<&str>, hive_id: &str) -> bool
     if is_edge_service_action(action) {
         return role == "SY.admin" && hive == PRIMARY_HIVE_ID;
     }
+    // Option B (WAN multi-hop reachability): only the primary hub's gateway router may vouch
+    // transitive reachability. Byte-identical to system.rego rule (6); shadow-verified.
+    if action == "WAN_REACHABILITY_VOUCH" {
+        return role == "RT.gateway" && hive == PRIMARY_HIVE_ID;
+    }
+    if matches!(
+        action,
+        "CONFIG_GET" | "CONFIG_SET" | "SYSTEM_UPDATE" | "SYSTEM_SYNC_HINT"
+    ) {
+        return role == "SY.admin" && hive == PRIMARY_HIVE_ID
+            || role == "SY.orchestrator" && !hive.is_empty();
+    }
     if role == "SY.orchestrator" {
         // Any hive, but the hive label must be non-empty (rejects "SY.orchestrator@").
         return !hive.is_empty();
@@ -120,6 +136,28 @@ pub fn authority(action: &str, src_l2_name: Option<&str>, hive_id: &str) -> bool
     }
     // Read-only health probe opened to the config/vault nodes (never mutations).
     action == "NODE_STATUS_GET" && matches!(role, "SY.config-routes" | "SY.vault")
+}
+
+/// Option B (WAN multi-hop reachability, edge-multihop-reachability-spec-v1): may the mTLS-
+/// authenticated `voucher_hive` VOUCH transitive reachability of other hives' nodes to a spoke?
+/// Only the primary hub may — it is the star's single relay.
+///
+/// OPA-BACKED, exactly like the rest of the SYSTEM authority surface: it evaluates the baked
+/// `system.wasm` (`policy/system.rego` rule (6), action `WAN_REACHABILITY_VOUCH`) through
+/// `authorize_system`, with the byte-identical Rust `authority()` table as the load-failure
+/// fallback (shadow-verified). The voucher is identified by its gateway router name
+/// `RT.gateway@<voucher_hive>`; `hive_id` is irrelevant to this rule so the primary hive is passed.
+///
+/// A vouched node is admitted for DATA delivery ONLY; SYSTEM authority stays strict and is denied
+/// for a `via_hub` origin at the delivery gate (see `serialize_for_local_delivery`). So allowing the
+/// hub to vouch reachability cannot grant it the power to fabricate cross-hive control-plane
+/// authority between spokes.
+pub fn wan_reachability_voucher_allowed(voucher_hive: &str) -> bool {
+    authorize_system(
+        "WAN_REACHABILITY_VOUCH",
+        Some(&format!("RT.gateway@{}", voucher_hive.trim())),
+        PRIMARY_HIVE_ID,
+    )
 }
 
 /// The BAKED system policy resolver: `policy/system.wasm` (compiled from `policy/system.rego`).
@@ -229,10 +267,14 @@ mod tests {
             "KILL_NODE",
             "NODE_STATUS_GET",
             "NODE_CONFIG_SET",
+            "CONFIG_SET",
+            "CONFIG_GET",
+            "SYSTEM_SYNC_HINT",
             "ADD_HIVE_FINALIZE",
             "SYSTEM_UPDATE",
+            "WAN_REACHABILITY_VOUCH",
         ];
-        let names: [Option<&str>; 13] = [
+        let names: [Option<&str>; 16] = [
             Some("SY.admin@motherbee"),
             Some("SY.admin@worker1"),
             Some("SY.admin@edge-1"),
@@ -244,6 +286,9 @@ mod tests {
             Some("SY.config-routes@motherbee"),
             Some("SY.vault@motherbee"),
             Some("IO.cloud@motherbee"),
+            Some("RT.gateway@motherbee"),
+            Some("RT.gateway@worker1"),
+            Some("RT.gateway@ingress1"),
             Some(""),
             None,
         ];
@@ -414,7 +459,71 @@ mod tests {
     }
 
     #[test]
-    fn protected_set_is_the_23_actions() {
+    fn primary_admin_can_control_managed_nodes_cross_hive() {
+        for action in [
+            "CONFIG_GET",
+            "CONFIG_SET",
+            "SYSTEM_UPDATE",
+            "SYSTEM_SYNC_HINT",
+        ] {
+            assert!(authority(action, Some("SY.admin@motherbee"), "worker-220"));
+            assert!(!authority(
+                action,
+                Some("SY.admin@worker-220"),
+                "worker-220"
+            ));
+            assert!(!authority(action, Some("SY.admin@other"), "worker-220"));
+        }
+        assert!(!authority(
+            "SPAWN_NODE",
+            Some("SY.admin@motherbee"),
+            "worker-220"
+        ));
+    }
+
+    #[test]
+    fn config_control_denies_non_sy_origins_and_admits_orchestrator() {
+        // Lock-in for the CONFIG_SET/CONFIG_GET origin-authz gate (the io.api revamp
+        // moved these into node_control_actions). Only the singleton motherbee Admin and
+        // an SY.orchestrator may drive node config; any non-SY origin (a compromised or
+        // rogue application node on the same VPN) MUST be denied at the delivery gate,
+        // and the router remains the authority regardless of msg_type letter-case.
+        let hive = "worker-220";
+        for action in ["CONFIG_GET", "CONFIG_SET"] {
+            // Admitted authorities.
+            assert!(
+                authority(action, Some("SY.admin@motherbee"), hive),
+                "{action}: SY.admin@motherbee must be admitted"
+            );
+            assert!(
+                authority(action, Some("SY.orchestrator@worker-220"), hive),
+                "{action}: SY.orchestrator@<hive> must be admitted"
+            );
+            // Denied: non-SY application origins on the same VPN.
+            for rogue in [
+                Some("IO.api@worker-220"),
+                Some("AI.evil@motherbee"),
+                Some("IO.slack@worker-220"),
+                Some("WF.orch.diag@worker-220"),
+                Some("SY.admin@worker-220"), // non-motherbee Admin is NOT node_control authority
+                None,                        // unstamped / transitively-vouched origin
+            ] {
+                assert!(
+                    !authority(action, rogue, hive),
+                    "{action}: origin {rogue:?} must be denied"
+                );
+                // The OPA-backed production gate must agree with the Rust table.
+                assert_eq!(
+                    authorize_system(action, rogue, hive),
+                    authority(action, rogue, hive),
+                    "{action}: authorize_system disagrees with authority for {rogue:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn protected_set_is_the_25_actions() {
         for action in [
             "SYSTEM_UPDATE",
             "SYSTEM_SYNC_HINT",
@@ -430,6 +539,8 @@ mod tests {
             "REMOVE_NODE_INSTANCE",
             "NODE_CONFIG_SET",
             "NODE_CONFIG_GET",
+            "CONFIG_SET",
+            "CONFIG_GET",
             "NODE_STATE_GET",
             "NODE_STATUS_GET",
             "GET_VERSIONS",
@@ -445,7 +556,7 @@ mod tests {
                 "{action} must be protected"
             );
         }
-        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 23);
+        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 25);
         for action in ["RUNTIME_UPDATE", "HELLO", "LSA", "", "TOTALLY_UNKNOWN"] {
             assert!(!is_protected_system_action(action));
         }

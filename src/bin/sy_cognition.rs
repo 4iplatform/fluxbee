@@ -14,12 +14,13 @@ use tokio_postgres::{Config as PgConfig, NoTls, Row};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+use fluxbee_ai_sdk::{AiProvider, HiveAiConfig};
 use fluxbee_sdk::nats::{publish_local, resolve_local_nats_endpoint};
 use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{
-    Destination, EpisodeSummary, MemoryContextSummary, MemoryPackage, MemoryPackageTruncated,
-    MemoryReasonSummary, MemorySummary, Message, Meta, Routing, VaultSecretChangedPayload,
-    VaultSecretInterest, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
+    is_system_kind, Destination, EpisodeSummary, MemoryContextSummary, MemoryPackage,
+    MemoryPackageTruncated, MemoryReasonSummary, MemorySummary, Message, Meta, Routing,
+    VaultSecretChangedPayload, VaultSecretInterest, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, managed_node_config_path, managed_node_instance_dir,
@@ -61,8 +62,6 @@ const COGNITION_TURNS_SID: u32 = 27;
 const DURABLE_QUEUE_TURNS: &str = "durable.sy-cognition.turns";
 const COGNITION_DEFAULT_CONTEXT_OPEN_THRESHOLD: f64 = 0.5;
 const COGNITION_DEFAULT_REASON_OPEN_THRESHOLD: f64 = 0.5;
-const COGNITION_DEFAULT_SEMANTIC_TAGGER_PROVIDER: &str = "openai";
-const COGNITION_DEFAULT_SEMANTIC_TAGGER_MODEL: &str = "gpt-4.1-mini";
 const COGNITION_DEFAULT_SEMANTIC_TAGGER_TIMEOUT_MS: u64 = 8_000;
 const COGNITION_CONTEXT_DECAY_FACTOR: f64 = 0.85;
 const COGNITION_REASON_DECAY_FACTOR: f64 = 0.75;
@@ -146,18 +145,24 @@ impl Default for CognitionThresholds {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CognitionSemanticTaggerConfig {
-    provider: String,
+    #[serde(skip, default)]
+    provider: AiProvider,
+    #[serde(skip, default = "default_cognition_model")]
     model: String,
     timeout_ms: u64,
     max_tags: usize,
     max_reason_signals: usize,
 }
 
+fn default_cognition_model() -> String {
+    fluxbee_ai_sdk::DEFAULT_HIVE_OPENAI_MODEL.to_string()
+}
+
 impl Default for CognitionSemanticTaggerConfig {
     fn default() -> Self {
         Self {
-            provider: COGNITION_DEFAULT_SEMANTIC_TAGGER_PROVIDER.to_string(),
-            model: COGNITION_DEFAULT_SEMANTIC_TAGGER_MODEL.to_string(),
+            provider: AiProvider::OpenAi,
+            model: default_cognition_model(),
             timeout_ms: COGNITION_DEFAULT_SEMANTIC_TAGGER_TIMEOUT_MS,
             max_tags: COGNITION_MAX_TAGS,
             max_reason_signals: COGNITION_MAX_REASON_SIGNALS,
@@ -455,6 +460,8 @@ struct HiveFile {
     hive_id: String,
     #[serde(default)]
     nats: Option<NatsSection>,
+    #[serde(default)]
+    ai: Option<HiveAiConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -477,6 +484,13 @@ async fn main() -> Result<(), CognitionError> {
 
     let config_dir = json_router::paths::config_dir();
     let hive = load_hive(&config_dir)?;
+    let ai_engine = hive
+        .ai
+        .as_ref()
+        .map(HiveAiConfig::effective)
+        .transpose()
+        .map_err(|err| -> CognitionError { err.into() })?
+        .unwrap_or_else(HiveAiConfig::fallback);
     // Model D': self-ILK is deterministic from L2 name (no SHM wait).
     let self_ilk_id =
         fluxbee_sdk::deterministic_system_ilk_id(&format!("SY.cognition@{}", hive.hive_id));
@@ -498,10 +512,11 @@ async fn main() -> Result<(), CognitionError> {
     // ephemeral router connection). Boot starts in `Missing`; the state
     // flips to `LocalFile` after the first successful resolve in a
     // semantic call. Operator can probe with a CONFIG_GET after boot.
-    let control_state = Arc::new(Mutex::new(bootstrap_cognition_control_state(
-        &node_name,
-        CognitionAiSecretSource::Missing,
-    )?));
+    let mut initial_control_state =
+        bootstrap_cognition_control_state(&node_name, CognitionAiSecretSource::Missing)?;
+    initial_control_state.semantic_tagger.provider = ai_engine.provider;
+    initial_control_state.semantic_tagger.model = ai_engine.model;
+    let control_state = Arc::new(Mutex::new(initial_control_state));
     let runtime_state = Arc::new(Mutex::new(CognitionRuntimeState::default()));
     let nats_subscribe_errors = Arc::new(AtomicU64::new(0));
 
@@ -702,10 +717,10 @@ async fn handle_turn_payload(
         let mut state = app_state.runtime_state.lock().await;
         state.semantic_tagger_calls_total = state.semantic_tagger_calls_total.saturating_add(1);
         state.last_semantic_model = Some(semantic_tagger_config.model.clone());
-        state.last_semantic_impl = Some("openai_responses".to_string());
+        state.last_semantic_impl = Some(format!("{}_sdk", semantic_tagger_config.provider));
     }
 
-    let Some(api_key) = resolve_cognition_openai_api_key(&app_state).await else {
+    let Some(api_key) = resolve_cognition_ai_api_key(&app_state).await else {
         {
             let mut control = app_state.control_state.lock().await;
             control.ai_secret_source = CognitionAiSecretSource::Missing;
@@ -721,7 +736,8 @@ async fn handle_turn_payload(
         tracing::warn!(
             trace_id = %msg.routing.trace_id,
             thread_id = %thread_id,
-            "sy.cognition semantic tagger skipped turn because OpenAI api key not resolvable from vault"
+            provider = %semantic_tagger_config.provider,
+            "sy.cognition semantic tagger skipped turn because AI api key is not resolvable from vault"
         );
         return Ok(());
     };
@@ -1588,8 +1604,14 @@ async fn resolve_storage_database_url(app_state: &CognitionAppState) -> Option<S
     .await
 }
 
-async fn resolve_cognition_openai_api_key(app_state: &CognitionAppState) -> Option<String> {
-    resolve_cognition_resource(app_state, fluxbee_sdk::ResourceType::Openai, "api_key").await
+async fn resolve_cognition_ai_api_key(app_state: &CognitionAppState) -> Option<String> {
+    let provider = app_state
+        .control_state
+        .lock()
+        .await
+        .semantic_tagger
+        .provider;
+    resolve_cognition_resource(app_state, provider.resource_type(), "api_key").await
 }
 
 /// Discover the named resource via the shared `VaultClient` (Model D' pool
@@ -1907,8 +1929,15 @@ async fn handle_vault_secret_changed_cognition(msg: &Message, app_state: &Cognit
             return;
         }
     };
-    let interest_openai = VaultSecretInterest {
-        resource_type: "openai",
+    let ai_resource_type = app_state
+        .control_state
+        .lock()
+        .await
+        .semantic_tagger
+        .provider
+        .to_string();
+    let interest_ai = VaultSecretInterest {
+        resource_type: &ai_resource_type,
         my_tenant: fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
         my_ilk: Some(app_state.self_ilk_id.as_str()),
         system_caller: true,
@@ -1919,9 +1948,9 @@ async fn handle_vault_secret_changed_cognition(msg: &Message, app_state: &Cognit
         my_ilk: Some(app_state.self_ilk_id.as_str()),
         system_caller: true,
     };
-    let matched_openai = payload.matches_interest(&interest_openai);
+    let matched_ai = payload.matches_interest(&interest_ai);
     let matched_postgres = payload.matches_interest(&interest_postgres);
-    if !matched_openai && !matched_postgres {
+    if !matched_ai && !matched_postgres {
         tracing::info!(
             node_name = %app_state.node_name,
             resource_type = %payload.resource_type,
@@ -1929,17 +1958,17 @@ async fn handle_vault_secret_changed_cognition(msg: &Message, app_state: &Cognit
             payload_ilk = %payload.ilk.as_deref().unwrap_or(""),
             my_tenant = %fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
             my_ilk = %app_state.self_ilk_id,
-            "sy.cognition VAULT_SECRET_CHANGED matches neither openai nor postgres interest; ignoring"
+            "sy.cognition VAULT_SECRET_CHANGED matches neither AI nor postgres interest; ignoring"
         );
     }
-    if matched_openai {
+    if matched_ai {
         tracing::info!(
             node_name = %app_state.node_name,
             op = %payload.op.as_str(),
             version = payload.version,
             "VAULT_SECRET_CHANGED (openai) matches; probing fresh value"
         );
-        let resolved = resolve_cognition_openai_api_key(app_state).await.is_some();
+        let resolved = resolve_cognition_ai_api_key(app_state).await.is_some();
         let next_source = if resolved {
             CognitionAiSecretSource::LocalFile
         } else {
@@ -1986,7 +2015,7 @@ async fn process_router_message(
     if try_handle_default_node_status(sender, msg).await? {
         return Ok(());
     }
-    if msg.meta.msg_type != SYSTEM_KIND {
+    if !is_system_kind(&msg.meta.msg_type) {
         return Ok(());
     }
     let Some(command) = msg.meta.msg.as_deref() else {
@@ -2105,7 +2134,7 @@ fn build_status_payload(
 ) -> Value {
     let degraded_reasons = cognition_degraded_reasons(control_state);
     let ai_provider = json!({
-        "provider": "openai",
+        "provider": control_state.semantic_tagger.provider,
         "configured": control_state.ai_secret_source != CognitionAiSecretSource::Missing,
         "source": control_state.ai_secret_source.as_str()
     });
@@ -2116,7 +2145,7 @@ fn build_status_payload(
         "max_tags": control_state.semantic_tagger.max_tags,
         "max_reason_signals": control_state.semantic_tagger.max_reason_signals,
         "ai_required": true,
-        "implementation_status": "openai_responses"
+        "implementation_status": "provider_neutral_sdk"
     });
     let degraded_semantics_policy = json!({
         "ai_required": true,
@@ -2222,7 +2251,7 @@ fn build_cognition_config_get_payload(
     let configured = control_state.ai_secret_source != CognitionAiSecretSource::Missing;
     let resources = json!([
         {
-            "resource_type": "openai",
+            "resource_type": control_state.semantic_tagger.provider.to_string(),
             "required": true,
             "configured": configured,
             "scope": "pool (tenant or root)",
@@ -2244,7 +2273,7 @@ fn build_cognition_config_get_payload(
                 .to_string(),
         ),
         Value::String(
-            "Model D': openai + postgres credentials live entirely in SY.vault. Operator loads them with vault_put + resource_type=<openai|postgres>; cognition resolves from the pool on boot/refresh."
+            "AI + postgres credentials live entirely in SY.vault. The hive-wide AI provider selects resource_type=openai|anthropic."
                 .to_string(),
         ),
         Value::String(
@@ -2278,11 +2307,10 @@ fn build_cognition_config_get_payload(
             "enabled": true,
             "resolved_from": "vault://resource_type=postgres"
         },
-        "ai_providers": {
-            "openai": {
-                "provider": "openai",
-                "resolved_from": "vault://resource_type=openai"
-            }
+        "ai": {
+            "default_provider": control_state.semantic_tagger.provider,
+            "model": control_state.semantic_tagger.model,
+            "resolved_from": format!("vault://resource_type={}", control_state.semantic_tagger.provider)
         },
         "semantic_tagger": {
             "provider": control_state.semantic_tagger.provider,
@@ -2291,7 +2319,7 @@ fn build_cognition_config_get_payload(
             "max_tags": control_state.semantic_tagger.max_tags,
             "max_reason_signals": control_state.semantic_tagger.max_reason_signals,
             "ai_required": true,
-            "implementation_status": "openai_responses"
+            "implementation_status": "provider_neutral_sdk"
         },
         "degraded_semantics_policy": {
             "ai_required": true,
@@ -2359,8 +2387,6 @@ fn build_cognition_config_get_payload(
         "supports": ["CONFIG_GET", "CONFIG_SET"],
         "required_fields": [],
         "optional_fields": [
-            "config.semantic_tagger.provider",
-            "config.semantic_tagger.model",
             "config.semantic_tagger.timeout_ms",
             "config.semantic_tagger.max_tags",
             "config.semantic_tagger.max_reason_signals",
@@ -2451,7 +2477,10 @@ fn apply_cognition_config_set(
             ));
         }
     };
-    let semantic_tagger = match extract_cognition_semantic_tagger_config(&msg.payload) {
+    let semantic_tagger = match extract_cognition_semantic_tagger_config(
+        &msg.payload,
+        &control_state.semantic_tagger,
+    ) {
         Ok(value) => value,
         Err(err) => {
             return Ok(config_error_response(
@@ -2489,7 +2518,7 @@ fn apply_cognition_config_set(
                 "max_tags": control_state.semantic_tagger.max_tags,
                 "max_reason_signals": control_state.semantic_tagger.max_reason_signals,
                 "ai_required": true,
-                "implementation_status": "openai_responses"
+                "implementation_status": "provider_neutral_sdk"
             },
             "thresholds": {
                 "context_open": control_state.thresholds.context_open,
@@ -2669,17 +2698,10 @@ fn reject_cognition_secret_fields(body: &Value) -> Result<(), CognitionError> {
             }
         }
     }
-    if let Some(openai) = config_root
-        .get("ai_providers")
-        .and_then(|value| value.get("openai"))
-    {
-        for forbidden in ["api_key", "api_key_ref"] {
-            if openai.get(forbidden).is_some() {
-                return Err(format!(
-                    "config.ai_providers.openai.{forbidden} is no longer accepted; load the openai secret via vault_put (resource_type=openai) and cognition will discover it from the pool"
-                ).into());
-            }
-        }
+    if config_root.get("ai_providers").is_some() || config_root.get("ai").is_some() {
+        return Err(
+            "AI provider/model are hive-wide; configure the ai section in hive.yaml".into(),
+        );
     }
     if let Some(storage) = config_root.get("storage") {
         for forbidden in ["postgres_url", "postgres_url_ref"] {
@@ -2723,6 +2745,7 @@ fn extract_cognition_thresholds(
 
 fn extract_cognition_semantic_tagger_config(
     body: &Value,
+    current: &CognitionSemanticTaggerConfig,
 ) -> Result<Option<CognitionSemanticTaggerConfig>, CognitionError> {
     let Some(config) = body
         .get("config")
@@ -2730,24 +2753,12 @@ fn extract_cognition_semantic_tagger_config(
     else {
         return Ok(None);
     };
-    let mut merged = CognitionSemanticTaggerConfig::default();
-    if let Some(provider) = config.get("provider").and_then(Value::as_str) {
-        let provider = provider.trim();
-        if provider.is_empty() {
-            return Err("config.semantic_tagger.provider must not be empty".into());
-        }
-        if !provider.eq_ignore_ascii_case("openai") {
-            return Err("config.semantic_tagger.provider currently supports only 'openai'".into());
-        }
-        merged.provider = provider.to_string();
+    if config.get("provider").is_some() || config.get("model").is_some() {
+        return Err(
+            "config.semantic_tagger.provider/model are hive-wide; configure ai in hive.yaml".into(),
+        );
     }
-    if let Some(model) = config.get("model").and_then(Value::as_str) {
-        let model = model.trim();
-        if model.is_empty() {
-            return Err("config.semantic_tagger.model must not be empty".into());
-        }
-        merged.model = model.to_string();
-    }
+    let mut merged = current.clone();
     if let Some(timeout_ms) = config.get("timeout_ms").and_then(Value::as_u64) {
         if timeout_ms == 0 {
             return Err("config.semantic_tagger.timeout_ms must be > 0".into());

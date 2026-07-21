@@ -3,7 +3,6 @@ use fluxbee_sdk::{managed_node_config_path, FLUXBEE_NODE_NAME_ENV};
 use io_common::io_control_plane_store::default_state_dir;
 use io_common::relay::RelayPolicy;
 use io_common::router_message::DEFAULT_TTL;
-use io_common::text_v1_blob::IoBlobRuntimeConfig;
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -11,219 +10,78 @@ use crate::{ApiRelayConfig, Config, SpawnConfig};
 
 impl Config {
     pub(crate) fn from_env() -> Result<Self> {
-        let resolved_node_name = env(FLUXBEE_NODE_NAME_ENV).ok_or_else(|| {
+        let node_name = env(FLUXBEE_NODE_NAME_ENV).ok_or_else(|| {
             anyhow::anyhow!("missing required env {FLUXBEE_NODE_NAME_ENV} for managed spawn")
         })?;
-        let resolved_island_id = hive_from_node_name(&resolved_node_name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "invalid {FLUXBEE_NODE_NAME_ENV}='{resolved_node_name}': expected <name>@<hive>"
-            )
+        let hive_id = hive_from_node_name(&node_name).ok_or_else(|| {
+            anyhow::anyhow!("invalid {FLUXBEE_NODE_NAME_ENV}='{node_name}': expected <name>@<hive>")
         })?;
-        let spawn_cfg = load_spawn_config(&resolved_node_name)?;
-        tracing::info!(path = %spawn_cfg.path.display(), "io-api loaded spawn config");
-        let spawn_doc = Some(&spawn_cfg.doc);
-
-        let listen_address = env("IO_API_LISTEN_ADDRESS")
-            .or_else(|| {
-                json_get_string_opt(
-                    spawn_doc,
-                    &[
-                        "config.listen.address",
-                        "listen.address",
-                        "node.listen.address",
-                    ],
-                )
-            })
-            .unwrap_or_else(|| "127.0.0.1".to_string());
-        let listen_port = env("IO_API_LISTEN_PORT")
-            .and_then(|value| value.parse::<u16>().ok())
-            .or_else(|| {
-                json_get_u16_opt(
-                    spawn_doc,
-                    &["config.listen.port", "listen.port", "node.listen.port"],
-                )
-            })
-            .unwrap_or(8080);
+        let spawn_cfg = load_spawn_config(&node_name)?;
+        tracing::info!(path = %spawn_cfg.path.display(), "io-api loaded managed spawn config");
+        let spawn_doc = &spawn_cfg.doc;
 
         Ok(Self {
-            node_name: resolved_node_name.clone(),
-            island_id: resolved_island_id.clone(),
+            node_name,
+            hive_id: hive_id.clone(),
             node_version: env("NODE_VERSION")
-                .or_else(|| {
-                    json_get_string_opt(
-                        spawn_doc,
-                        &["_system.runtime_version", "runtime.version", "node.version"],
-                    )
-                })
-                .unwrap_or_else(|| "0.1".to_string()),
-            listen_addr: format!("{listen_address}:{listen_port}"),
-            api_channel_id: env("IO_API_CHANNEL_ID").or_else(|| {
-                json_get_string_opt(
-                    spawn_doc,
-                    &[
-                        "config.io.api_channel_id",
-                        "io.api_channel_id",
-                        "api_channel_id",
-                    ],
-                )
-            }),
+                .or_else(|| json_get_string(spawn_doc, "_system.runtime_version"))
+                .unwrap_or_else(|| "1.0.0".to_string()),
             router_socket: PathBuf::from(
                 env("ROUTER_SOCKET")
-                    .or_else(|| {
-                        json_get_string_opt(spawn_doc, &["node.router_socket", "router_socket"])
-                    })
+                    .or_else(|| json_get_string(spawn_doc, "node.router_socket"))
                     .unwrap_or_else(|| "/var/run/fluxbee/routers".to_string()),
             ),
             uuid_persistence_dir: PathBuf::from(
                 env("UUID_PERSISTENCE_DIR")
-                    .or_else(|| {
-                        json_get_string_opt(
-                            spawn_doc,
-                            &["node.uuid_persistence_dir", "uuid_persistence_dir"],
-                        )
-                    })
+                    .or_else(|| json_get_string(spawn_doc, "node.uuid_persistence_dir"))
                     .unwrap_or_else(|| "/var/lib/fluxbee/state/nodes".to_string()),
             ),
             config_dir: PathBuf::from(
                 env("CONFIG_DIR")
-                    .or_else(|| json_get_string_opt(spawn_doc, &["node.config_dir", "config_dir"]))
+                    .or_else(|| json_get_string(spawn_doc, "node.config_dir"))
                     .unwrap_or_else(|| "/etc/fluxbee".to_string()),
             ),
             state_dir: PathBuf::from(
                 env("STATE_DIR")
-                    .or_else(|| json_get_string_opt(spawn_doc, &["node.state_dir", "state_dir"]))
+                    .or_else(|| json_get_string(spawn_doc, "node.state_dir"))
                     .unwrap_or_else(|| default_state_dir().display().to_string()),
             ),
             spawn_config_path: spawn_cfg.path,
-            identity_target: env("IDENTITY_TARGET")
-                .or_else(|| {
-                    json_get_string_opt(
-                        spawn_doc,
-                        &[
-                            "config.identity.target",
-                            "identity.target",
-                            "identity_target",
-                        ],
-                    )
-                })
-                .unwrap_or_else(|| format!("SY.identity@{resolved_island_id}")),
-            identity_timeout_ms: env("IDENTITY_TIMEOUT_MS")
-                .and_then(|value| value.parse().ok())
-                .or_else(|| {
-                    json_get_u64_opt(
-                        spawn_doc,
-                        &[
-                            "config.identity.timeout_ms",
-                            "identity.timeout_ms",
-                            "identity_timeout_ms",
-                        ],
-                    )
-                })
+            identity_target: env("IO_API_IDENTITY_TARGET")
+                .or_else(|| json_get_string(spawn_doc, "node.identity_target"))
+                .unwrap_or_else(|| "SY.identity@motherbee".to_string()),
+            frontdesk_target: env("IO_API_FRONTDESK_TARGET")
+                .or_else(|| json_get_string(spawn_doc, "node.frontdesk_target"))
+                .unwrap_or_else(|| "SY.frontdesk.gov@motherbee".to_string()),
+            admin_target: env("IO_API_ADMIN_TARGET")
+                .or_else(|| json_get_string(spawn_doc, "node.admin_target"))
+                .unwrap_or_else(|| "SY.admin@motherbee".to_string()),
+            orchestrator_target: env("IO_API_ORCHESTRATOR_TARGET")
+                .or_else(|| json_get_string(spawn_doc, "node.orchestrator_target"))
+                .unwrap_or_else(|| format!("SY.orchestrator@{hive_id}")),
+            identity_timeout_ms: env_u64("IO_API_IDENTITY_TIMEOUT_MS")
+                .or_else(|| json_get_u64(spawn_doc, "node.identity_timeout_ms"))
                 .unwrap_or(10_000),
-            ttl: env("TTL")
-                .and_then(|value| value.parse().ok())
-                .or_else(|| {
-                    json_get_u64_opt(spawn_doc, &["node.ttl", "ttl"])
-                        .and_then(|v| u32::try_from(v).ok())
-                })
+            reconcile_interval_secs: env_u64("IO_API_RECONCILE_SECONDS")
+                .or_else(|| json_get_u64(spawn_doc, "node.reconcile_interval_secs"))
+                .filter(|value| *value > 0)
+                .unwrap_or(30),
+            ttl: env_u64("IO_API_TTL")
+                .or_else(|| json_get_u64(spawn_doc, "node.ttl"))
+                .and_then(|value| u32::try_from(value).ok())
                 .unwrap_or(DEFAULT_TTL),
-            dedup_ttl_ms: env("DEDUP_TTL_MS")
-                .and_then(|value| value.parse().ok())
-                .or_else(|| {
-                    json_get_u64_opt(
-                        spawn_doc,
-                        &[
-                            "config.runtime.dedup_ttl_ms",
-                            "runtime.dedup_ttl_ms",
-                            "dedup_ttl_ms",
-                        ],
-                    )
-                })
+            dedup_ttl_ms: env_u64("IO_API_DEDUP_TTL_MS")
+                .or_else(|| json_get_u64(spawn_doc, "runtime.dedup_ttl_ms"))
                 .unwrap_or(600_000),
-            dedup_max_entries: env("DEDUP_MAX_ENTRIES")
-                .and_then(|value| value.parse().ok())
-                .or_else(|| {
-                    json_get_usize_opt(
-                        spawn_doc,
-                        &[
-                            "config.runtime.dedup_max_entries",
-                            "runtime.dedup_max_entries",
-                            "dedup_max_entries",
-                        ],
-                    )
-                })
+            dedup_max_entries: env_u64("IO_API_DEDUP_MAX_ENTRIES")
+                .or_else(|| json_get_u64(spawn_doc, "runtime.dedup_max_entries"))
+                .and_then(|value| usize::try_from(value).ok())
                 .unwrap_or(50_000),
             relay: ApiRelayConfig {
-                window_ms: env("IO_API_RELAY_WINDOW_MS")
-                    .and_then(|value| value.parse().ok())
-                    .or_else(|| {
-                        json_get_u64_opt(
-                            spawn_doc,
-                            &[
-                                "config.io.relay.window_ms",
-                                "io.relay.window_ms",
-                                "relay.window_ms",
-                            ],
-                        )
-                    })
-                    .unwrap_or(0),
-                max_open_sessions: env("IO_API_RELAY_MAX_OPEN_SESSIONS")
-                    .and_then(|value| value.parse().ok())
-                    .or_else(|| {
-                        json_get_usize_opt(
-                            spawn_doc,
-                            &[
-                                "config.io.relay.max_open_sessions",
-                                "io.relay.max_open_sessions",
-                                "relay.max_open_sessions",
-                            ],
-                        )
-                    })
-                    .unwrap_or(10_000),
-                max_fragments_per_session: env("IO_API_RELAY_MAX_FRAGMENTS")
-                    .and_then(|value| value.parse().ok())
-                    .or_else(|| {
-                        json_get_usize_opt(
-                            spawn_doc,
-                            &[
-                                "config.io.relay.max_fragments_per_session",
-                                "io.relay.max_fragments_per_session",
-                                "relay.max_fragments_per_session",
-                            ],
-                        )
-                    })
-                    .unwrap_or(8),
-                max_bytes_per_session: env("IO_API_RELAY_MAX_BYTES")
-                    .and_then(|value| value.parse().ok())
-                    .or_else(|| {
-                        json_get_usize_opt(
-                            spawn_doc,
-                            &[
-                                "config.io.relay.max_bytes_per_session",
-                                "io.relay.max_bytes_per_session",
-                                "relay.max_bytes_per_session",
-                            ],
-                        )
-                    })
-                    .unwrap_or(256 * 1024),
-            },
-            blob_runtime: IoBlobRuntimeConfig {
-                blob_root: PathBuf::from(
-                    env("BLOB_ROOT")
-                        .or_else(|| json_get_string_opt(spawn_doc, &["blob.path", "io.blob.path"]))
-                        .unwrap_or_else(|| "/var/lib/fluxbee/blob".to_string()),
-                ),
-                max_blob_bytes: env("BLOB_MAX_BYTES")
-                    .and_then(|value| value.parse().ok())
-                    .or_else(|| {
-                        json_get_u64_opt(
-                            spawn_doc,
-                            &["blob.max_blob_bytes", "io.blob.max_blob_bytes"],
-                        )
-                    })
-                    .or(IoBlobRuntimeConfig::default().max_blob_bytes),
-                text_v1: IoBlobRuntimeConfig::default().text_v1,
-                resolve_retry: IoBlobRuntimeConfig::default().resolve_retry,
+                window_ms: 0,
+                max_open_sessions: 10_000,
+                max_fragments_per_session: 8,
+                max_bytes_per_session: 256 * 1024,
             },
         })
     }
@@ -246,15 +104,15 @@ pub(crate) fn api_relay_policy_from_config(relay_cfg: &ApiRelayConfig) -> Result
         max_bytes_per_session: relay_cfg.max_bytes_per_session,
         ..RelayPolicy::default()
     };
-    if policy.relay_window_ms == 0 {
+    policy.stale_session_ttl_ms = if policy.relay_window_ms == 0 {
         policy.enabled = false;
-        policy.stale_session_ttl_ms = 0;
+        0
     } else {
-        policy.stale_session_ttl_ms = policy
+        policy
             .relay_window_ms
             .saturating_mul(4)
-            .max(policy.relay_window_ms);
-    }
+            .max(policy.relay_window_ms)
+    };
     policy.validate().map_err(|err| anyhow::anyhow!(err))?;
     Ok(policy)
 }
@@ -267,71 +125,6 @@ pub(crate) fn extract_runtime_dst_node(effective_config: Option<&Value>) -> Opti
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
-}
-
-pub(crate) fn extract_runtime_api_channel_id(
-    effective_config: Option<&Value>,
-    default_api_channel_id: Option<&str>,
-) -> Option<String> {
-    effective_config
-        .and_then(|cfg| cfg.get("io"))
-        .and_then(|io| io.get("api_channel_id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| {
-            default_api_channel_id
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string)
-        })
-}
-
-pub(crate) fn extract_runtime_listen_addr(
-    effective_config: Option<&Value>,
-    default_listen_addr: &str,
-) -> String {
-    let Some(listen) = effective_config
-        .and_then(|cfg| cfg.get("listen"))
-        .and_then(Value::as_object)
-    else {
-        return default_listen_addr.to_string();
-    };
-
-    let address = listen
-        .get("address")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let port = listen.get("port").and_then(|value| match value {
-        Value::Number(number) => number.as_u64().and_then(|raw| u16::try_from(raw).ok()),
-        Value::String(text) => text.parse::<u16>().ok(),
-        _ => None,
-    });
-
-    match (address, port) {
-        (Some(address), Some(port)) => format!("{address}:{port}"),
-        _ => default_listen_addr.to_string(),
-    }
-}
-
-pub(crate) fn load_spawn_config(node_name: &str) -> Result<SpawnConfig> {
-    let path = managed_node_config_path(node_name)
-        .map_err(|err| anyhow::anyhow!("failed to resolve managed config path: {err}"))?;
-    let raw = std::fs::read_to_string(&path).map_err(|err| {
-        anyhow::anyhow!(
-            "failed to read managed config file {}: {err}",
-            path.display()
-        )
-    })?;
-    let doc = serde_json::from_str::<Value>(&raw).map_err(|err| {
-        anyhow::anyhow!(
-            "failed to parse managed config JSON {}: {err}",
-            path.display()
-        )
-    })?;
-    Ok(SpawnConfig { path, doc })
 }
 
 pub(crate) fn extract_runtime_relay_config(
@@ -368,6 +161,24 @@ pub(crate) fn extract_runtime_relay_config(
     })
 }
 
+pub(crate) fn load_spawn_config(node_name: &str) -> Result<SpawnConfig> {
+    let path = managed_node_config_path(node_name)
+        .map_err(|err| anyhow::anyhow!("failed to resolve managed config path: {err}"))?;
+    let raw = std::fs::read_to_string(&path).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to read managed config file {}: {err}",
+            path.display()
+        )
+    })?;
+    let doc = serde_json::from_str::<Value>(&raw).map_err(|err| {
+        anyhow::anyhow!(
+            "failed to parse managed config JSON {}: {err}",
+            path.display()
+        )
+    })?;
+    Ok(SpawnConfig { path, doc })
+}
+
 fn hive_from_node_name(node_name: &str) -> Option<String> {
     node_name
         .split_once('@')
@@ -377,45 +188,30 @@ fn hive_from_node_name(node_name: &str) -> Option<String> {
 }
 
 fn env(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|value| !value.is_empty())
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
-fn json_get_string_opt(doc: Option<&Value>, dotted_paths: &[&str]) -> Option<String> {
-    let doc = doc?;
-    for path in dotted_paths {
-        if let Some(value) = json_get_path(doc, path).and_then(Value::as_str) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
+fn env_u64(key: &str) -> Option<u64> {
+    env(key).and_then(|value| value.parse().ok())
 }
 
-fn json_get_u64_opt(doc: Option<&Value>, dotted_paths: &[&str]) -> Option<u64> {
-    let doc = doc?;
-    for path in dotted_paths {
-        if let Some(value) = json_get_path(doc, path) {
-            if let Some(number) = value.as_u64() {
-                return Some(number);
-            }
-            if let Some(text) = value.as_str() {
-                if let Ok(number) = text.parse::<u64>() {
-                    return Some(number);
-                }
-            }
-        }
-    }
-    None
+fn json_get_string(root: &Value, dotted_path: &str) -> Option<String> {
+    json_get_path(root, dotted_path)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
-fn json_get_u16_opt(doc: Option<&Value>, dotted_paths: &[&str]) -> Option<u16> {
-    json_get_u64_opt(doc, dotted_paths).and_then(|value| u16::try_from(value).ok())
-}
-
-fn json_get_usize_opt(doc: Option<&Value>, dotted_paths: &[&str]) -> Option<usize> {
-    json_get_u64_opt(doc, dotted_paths).and_then(|value| usize::try_from(value).ok())
+fn json_get_u64(root: &Value, dotted_path: &str) -> Option<u64> {
+    json_get_path(root, dotted_path).and_then(|value| match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
+    })
 }
 
 fn json_get_path<'a>(root: &'a Value, dotted_path: &str) -> Option<&'a Value> {
@@ -428,55 +224,36 @@ fn json_get_path<'a>(root: &'a Value, dotted_path: &str) -> Option<&'a Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_runtime_api_channel_id;
-    use super::extract_runtime_listen_addr;
+    use super::*;
 
     #[test]
-    fn extract_runtime_listen_addr_prefers_effective_config() {
-        let effective = serde_json::json!({
-            "listen": {
-                "address": "127.0.0.1",
-                "port": 18081
-            }
-        });
-
-        let addr = extract_runtime_listen_addr(Some(&effective), "127.0.0.1:8080");
-
-        assert_eq!(addr, "127.0.0.1:18081");
+    fn relay_defaults_to_passthrough() {
+        let defaults = ApiRelayConfig::default();
+        let extracted = extract_runtime_relay_config(Some(&serde_json::json!({})), &defaults)
+            .expect("relay config");
+        assert_eq!(extracted, defaults);
+        assert!(
+            !api_relay_policy_from_config(&extracted)
+                .expect("relay policy")
+                .enabled
+        );
     }
 
     #[test]
-    fn extract_runtime_listen_addr_falls_back_when_incomplete() {
-        let effective = serde_json::json!({
-            "listen": {
-                "address": "127.0.0.1"
-            }
-        });
-
-        let addr = extract_runtime_listen_addr(Some(&effective), "127.0.0.1:8080");
-
-        assert_eq!(addr, "127.0.0.1:8080");
-    }
-
-    #[test]
-    fn extract_runtime_api_channel_id_prefers_effective_config() {
+    fn extracts_configured_destination_and_relay() {
         let effective = serde_json::json!({
             "io": {
-                "api_channel_id": "acme_orders"
+                "dst_node":"AI.orders@worker",
+                "relay": {"window_ms":250, "max_open_sessions":20}
             }
         });
-
-        let value = extract_runtime_api_channel_id(Some(&effective), Some("fallback"));
-
-        assert_eq!(value.as_deref(), Some("acme_orders"));
-    }
-
-    #[test]
-    fn extract_runtime_api_channel_id_falls_back_to_default() {
-        let effective = serde_json::json!({});
-
-        let value = extract_runtime_api_channel_id(Some(&effective), Some("fallback"));
-
-        assert_eq!(value.as_deref(), Some("fallback"));
+        assert_eq!(
+            extract_runtime_dst_node(Some(&effective)).as_deref(),
+            Some("AI.orders@worker")
+        );
+        let relay = extract_runtime_relay_config(Some(&effective), &ApiRelayConfig::default())
+            .expect("relay");
+        assert_eq!(relay.window_ms, 250);
+        assert_eq!(relay.max_open_sessions, 20);
     }
 }

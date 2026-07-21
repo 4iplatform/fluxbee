@@ -153,13 +153,13 @@ Lectura actual:
   - `address`
   - `src_l2_name = sender.full_name()` como base para `owner_l2_name` en identity
 - [x] Definir estrategia canónica del `address` por nodo:
-  - `IO.api`: entrypoint/listener local
+  - `IO.api`: `api_channel_id` estable de la instancia; nunca puerto o listener
   - `IO.slack`: workspace/app local
   - `IO.linkedhelper`: adapter/profile channel local según modelo vigente
 - [x] Agregar bootstrap/check en cada nodo IO para verificar si su `ICH` propio ya existe
 - [x] Si no existe, solicitar alta explícita del canal propio
-- [ ] Persistir o reconstruir en runtime el `ich_id` propio resuelto de la instancia cuando haga falta para otras capas
-- [ ] Definir cuándo corresponde `ICH_SET_ENABLED` para nodos IO con canal propio
+- [x] Persistir o reconstruir en runtime el `ich_id` propio resuelto de la instancia cuando haga falta para otras capas
+- [x] Definir cuándo corresponde `ICH_SET_ENABLED` para IO.api: habilitar al publicar y deshabilitar al reemplazar/cerrar el canal
 
 ### Dependencias mínimas de core para habilitar ese camino
 

@@ -1,223 +1,443 @@
-# AI engine selection — evaluation + design (NOT yet implemented)
+# OpenAI + Anthropic engine selection — relevamiento y tareas
 
-Status: **design note only.** Captures the current state and the agreed target so
-the change can be made later without re-discovering the codebase. No code changed.
+**Estado:** implementación principal terminada; validación integral y documentación
+operativa en curso.
 
-## Goal (operator's framing)
+**Relevado contra:** `main` local al 2026-07-21 (`4ebb28c`).
 
-> No quiero tener configuraciones por SY. Todos los `SY.*` correrían con **un motor
-> elegido por `hive.yaml`** (default del hive), y el **nodo AI que corra elige su
-> motor cuando se instancia**. Las dos opciones: **OpenAI** y **Anthropic**.
+**Alcance:** SDK AI en Rust, consumidores AI dentro de nodos `SY.*`, nodos dinámicos
+`AI.*`, selección de credenciales en `SY.vault`, contratos de configuración y pruebas.
 
-So a two-tier model:
+## 1. Pedido operativo
 
-- **Tier 1 — hive default (in `hive.yaml`):** one provider+model for the whole hive.
-  Every `SY.*` node that uses AI (today: `SY.cognition`'s semantic-tagger and
-  narrative-summarizer) inherits it. No per-SY config.
-- **Tier 2 — AI-node instance choice:** a spun-up AI node (`ai-generic` /
-  `ai-frontdesk-gov`) can pick its own provider+model in its node config, overriding
-  the hive default for that node.
+El comportamiento buscado tiene dos caminos distintos:
 
-## Current state (as of 2026-06-30)
+1. Los nodos `SY.*` que usan AI toman un proveedor por defecto del `hive.yaml`.
+   Si el campo no existe, deben continuar usando OpenAI, como hoy. No debe haber una
+   selección de proveedor ni modelo independiente por cada `SY.*`. El modelo de cada
+   proveedor también se configura en `hive.yaml`.
+2. Un nodo dinámico `AI.*` selecciona su proveedor mediante la key de Vault indicada
+   en su comando/configuración. La key ya tiene `metadata.resource_type=openai` o
+   `anthropic`; el nodo no debe pedir además otro selector de proveedor que pueda
+   contradecir esa metadata. El modelo se configura en el mismo `CONFIG_SET`, no en
+   la key.
+3. Las credenciales continúan viviendo exclusivamente en `SY.vault`.
+4. OpenAI y Anthropic deben implementarse dentro de `fluxbee-ai-sdk`, en Rust. No se
+   agrega otro runtime, sidecar ni SDK en otro lenguaje.
 
-### Provider abstraction — trait exists, only OpenAI implemented
-- `crates/fluxbee_ai_sdk/src/llm.rs`: `pub trait LlmClient` (≈148–159) is
-  provider-agnostic (`generate` / `generate_stream`). The **only** production impl is
-  `OpenAiResponsesClient` (≈232–340), `base_url` hardcoded to
-  `https://api.openai.com/v1/responses` (≈243, overridable via `with_base_url`).
-  Function-calling path: `OpenAiFunctionCallingModel` (≈560–747), OpenAI Responses-API
-  specific. **No Anthropic client, no `Provider` enum, no factory.**
+Fuera de alcance de este cambio: nuevos proveedores además de OpenAI/Anthropic,
+balanceo de keys, cambios al routing, cambios cognitivos y rediseño general de Vault.
 
-### Keys — already reproducible, via SY.vault (Model D')
-- Keys are resolved from **SY.vault**, not env/files: `ResourceType::Openai`
-  (and **`ResourceType::Anthropic` already exists** in `crates/fluxbee_sdk/src/vault.rs`
-  ≈40–160, but unused).
-- `SY.cognition` `resolve_cognition_openai_api_key()` (`src/bin/sy_cognition.rs`
-  ≈1591–1634) → `vault.resolve_resource(ResourceType::Openai, root_tenant, 5s)`.
-- AI nodes `resolve_openai_api_key_with_source()`
-  (`nodes/ai/ai-generic/src/bin/ai_node_runner.rs` ≈1589–1632) → same, tenant-scoped.
-  **Caveat (the "reproducible" gap):** resolution needs `FLUXBEE_NODE_TENANT_ID`
-  (orchestrator-injected); a node started by hand without it falls back to `Missing`.
+## 2. Baseline relevado antes de implementar
 
-### Model/provider selection — scattered, "openai"-only
-- Hardcoded default model `"gpt-4.1-mini"`:
-  `nodes/ai/ai-generic/.../ai_node_runner.rs` `default_model()` (≈369–370);
-  `SY.cognition` constants `COGNITION_DEFAULT_SEMANTIC_TAGGER_{PROVIDER,MODEL}`
-  (`src/bin/sy_cognition.rs` ≈64–65, = `"openai"` / `"gpt-4.1-mini"`).
-- Per-AI-node config: `OpenAiChatSection.model` (`ai_node_runner.rs` ≈149–161).
-- **Hard "openai"-only gates** that reject any other provider string:
-  `src/bin/sy_cognition/semantic_tagger_ai.rs:37` and
-  `narrative_summarizer_ai.rs:47` (`!eq_ignore_ascii_case("openai")` → error).
+Al iniciar esta tarea, el soporte Anthropic **no estaba implementado**. Había buenas abstracciones iniciales,
+pero los wire formats de OpenAI todavía atraviesan el SDK y los consumidores.
 
-### hive.yaml — no AI config at all
-- `config/hive.yaml`, `packaging/hive.yaml.example`, and the `HiveFile` struct
-  (`src/config/mod.rs` ≈76–127) have **no** `ai`/`engine`/`model`/`provider` section.
-  So there is no single source of truth for the hive's engine today.
+| Área | Estado actual | Brecha |
+| --- | --- | --- |
+| AI SDK | `LlmClient` y `FunctionCallingModel` son traits; sólo existen `OpenAiResponsesClient` y `OpenAiFunctionCallingModel` | Falta provider enum/factory, cliente Anthropic y neutralizar historia, tools y attachments |
+| Vault SDK | `ResourceType::Anthropic` ya existe | Los consumidores resuelven sólo `ResourceType::Openai`; `resolve_resource` elige por tipo, no por key explícita |
+| `hive.yaml` | No tiene un default AI canónico | Hay que agregarlo y mantener fallback OpenAI |
+| `SY.admin` | Executor OpenAI directo, modelo default `gpt-5.4-mini` | Debe usar el default del hive y el SDK común |
+| `SY.architect` | OpenAI directo, tools y multimodal; además lee el legacy `ai_providers.openai` | Debe migrar al default único del hive |
+| `SY.cognition` | OpenAI directo para semantic tagger y narrative summarizer; default `gpt-4.1-mini` | Tiene gates OpenAI-only y config por-SY que contradice el objetivo |
+| `SY.frontdesk.gov` | Es un system node, aunque su binario deriva del runner AI | Debe heredar el default de `SY.*`; no pertenece al mecanismo de selección de los `AI.*` dinámicos |
+| `AI.*` dinámicos | `behavior.provider` existe en el JSON efectivo pero se ignora; sólo `kind=openai_chat` funciona | Deben recibir una key de Vault, derivar proveedor de su metadata y construir el runtime adecuado |
 
-## Target design
+## 2.1 Estado implementado al 2026-07-21
 
-### 1. `hive.yaml` — one hive-level default (Tier 1)
+- El SDK Rust expone `AiProvider`, `HiveAiConfig`, factories neutrales y adapters
+  OpenAI Responses + Anthropic Messages.
+- El contenido multimodal y la historia de function calling son neutrales; cada
+  adapter produce su propio wire format.
+- Anthropic implementa texto, JSON schema, imágenes/documentos, tools multi-turn,
+  errores con request id y retries acotados para transporte/408/409/429/5xx.
+- `AI.*` acepta solamente `behavior.kind=ai_chat` con `vault_key` y `model`; lee la
+  key exacta y deriva el provider de `metadata.resource_type`.
+- `SY.admin`, `SY.architect`, `SY.cognition` y `SY.frontdesk.gov` usan el provider y
+  model del hive. Sin sección `ai`, el efectivo es OpenAI + `gpt-5.5`.
+- Los overrides provider/model por `CONFIG_SET` en consumidores SY se rechazan.
+- Los ejemplos canónicos de `hive.yaml` incluyen el default OpenAI y el orchestrator
+  lo propaga al hive generado para workers.
+
+## 3. Evidencia por componente
+
+### 3.1 SDK AI en Rust
+
+`crates/fluxbee_ai_sdk/src/llm.rs` contiene:
+
+- `LlmClient::generate/generate_stream`, que sí es agnóstico;
+- `OpenAiResponsesClient`, fijado a `/v1/responses`;
+- `OpenAiFunctionCallingModel`, acoplado a `previous_response_id`,
+  `function_call` y `function_call_output` de OpenAI;
+- `LlmRequest.input_parts: Option<Vec<Value>>`, cuyo tipo parece neutral pero recibe
+  bloques OpenAI (`input_text`, `input_image`, `input_file`).
+
+`crates/fluxbee_ai_sdk/src/text_payload.rs` expone
+`build_openai_user_content_parts*`. Los tres caminos con attachments
+(`SY.architect`, `AI.*` y `SY.frontdesk.gov`) lo llaman antes de entrar al modelo.
+
+La abstracción de tools tampoco alcanza todavía para Anthropic. El runner persiste
+el `response_id` de OpenAI dentro de `FunctionToolResult`; Anthropic exige reconstruir
+la conversación con un bloque assistant `tool_use` seguido por un bloque user
+`tool_result`. Hoy `FunctionLoopItem` no conserva el bloque assistant tool-use.
+
+Conclusión: no alcanza con agregar un segundo `impl LlmClient`. Primero hay que hacer
+provider-neutral el modelo interno de input y continuación de tools; después cada
+adapter serializa su propio wire format.
+
+Referencias externas verificadas para implementar el adapter:
+
+- Anthropic Messages usa `POST /v1/messages`, `x-api-key`, `anthropic-version`,
+  `system` top-level y mensajes user/assistant.
+- Tools usan `input_schema`, respuestas `tool_use` y continuación `tool_result`.
+- Structured output actual usa `output_config.format` con `type=json_schema` en los
+  modelos que declaran esa capability.
+
+Documentación oficial:
+
+- <https://platform.claude.com/docs/en/api/messages/create>
+- <https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls>
+- <https://platform.claude.com/docs/en/build-with-claude/structured-outputs>
+
+#### SDKs Anthropic disponibles y criterio de port
+
+Anthropic no publica actualmente un SDK oficial para Rust. Sus SDKs oficiales son
+Python, TypeScript, C#, Go, Java, PHP y Ruby. Existen crates Rust comunitarios, pero
+los relevados son incompletos, work-in-progress o no demuestran cobertura mantenida
+de Messages + structured output + tools + multimodal. No conviene incorporar uno
+como dependencia central de Fluxbee.
+
+El código de los SDKs oficiales es público y fue revisado sin copiarlo al repo. La
+revisión quedó fijada a estas revisiones para no diseñar contra una referencia móvil:
+
+- `anthropics/anthropic-sdk-go@0ce94bd` (v1.58.0): referencia principal para tipos
+  Messages, headers, errores, request id y política de retries;
+- `anthropics/anthropic-sdk-typescript@3e9a2e1`: referencia principal para el tool
+  runner y armado de `tool_result` paralelo.
+
+Funciones/comportamientos concretos a portar al SDK Rust de Fluxbee, adaptados a sus
+traits existentes:
+
+- headers `anthropic-version`, `x-api-key`, `content-type` y `accept`;
+- request/response types mínimos de Messages, content blocks y usage;
+- envelope de error + `request-id` sin incluir la key o payload sensible;
+- clasificación retryable: error de conexión, 408, 409, 429 y 5xx, respetando
+  `x-should-retry`;
+- `retry-after-ms` / `retry-after`, backoff exponencial acotado y jitter;
+- conservación del assistant message completo que contiene `tool_use`;
+- ejecución paralela de tool calls y respuesta user con todos los `tool_result`,
+  incluido `is_error`;
+- `output_config.format` para JSON schema;
+- mappings de texto, imagen y documento que Fluxbee realmente usa.
+
+No se debe portar el SDK generado completo, sus APIs beta, Bedrock/Vertex, batches,
+managed agents ni su capa de environment credentials. Fluxbee ya tiene `reqwest`,
+timeouts, Vault y abstracciones propias; el port debe ser angosto y auditable.
+
+### 3.2 Vault y selección de key
+
+`crates/fluxbee_sdk/src/vault.rs` ya conoce `openai` y `anthropic`. La metadata de
+una entrada contiene:
+
+- `resource_type` (identifica el proveedor);
+- `tenant_id`;
+- `ilk` opcional;
+- descripción y tags.
+
+No contiene un campo canónico de modelo.
+
+El método usado hoy por los consumidores es
+`VaultClient::resolve_resource(resource_type, tenant, timeout)`. Aplica la precedencia
+dedicated ILK -> pool del tenant -> pool root, toma el recurso más reciente y devuelve
+sólo el `value`; descarta key, metadata y versión.
+
+Esto sirve para los `SY.*`: el default del hive determina `ResourceType` y luego se
+descubre la credencial correspondiente. No sirve para el nuevo contrato de `AI.*`,
+porque allí el operador debe seleccionar una **key concreta**. Para ese caso hay que
+usar/encapsular `VaultClient::get(key)` y validar que la metadata recuperada:
+
+- sea visible para el tenant/ILK según las reglas de Vault;
+- tenga `resource_type` exactamente `openai` o `anthropic`;
+- tenga un value con `api_key` no vacío;
+- sea la misma key que se muestra, redacted, en status/`CONFIG_GET`.
+
+Este cambio es una excepción intencional al Model D' actual: el documento
+`sy_vault_model_d.md` dice que los consumidores no guardan refs y descubren por tipo.
+La credencial sigue en Vault, pero `AI.*` sí necesita persistir el identificador no
+secreto de la key seleccionada. Hay que actualizar esa documentación.
+
+### 3.3 Configuración del hive
+
+No existe una sección AI canónica en `config/hive.yaml` ni en
+`packaging/hive.yaml.example`. Tampoco existe en el `HiveFile` compartido de
+`src/config/mod.rs`.
+
+Además, los binarios declaran varios `HiveFile` privados. Los consumidores afectados
+parsean el YAML por separado (`SY.admin`, `SY.architect`, `SY.cognition`), por lo que
+agregar el campo sólo al router config no lo propaga automáticamente.
+
+Contrato canónico cerrado:
+
 ```yaml
-# Default AI engine for the whole hive. All SY.* AI usage inherits this unless a
-# specific AI node overrides it at instantiation. The matching key lives in the
-# vault (ResourceType::Openai / ::Anthropic); flipping provider switches both.
 ai:
-  provider: openai          # openai | anthropic
-  model: gpt-4.1-mini       # provider-appropriate model
+  default_provider: anthropic # openai | anthropic
+  providers:
+    openai:
+      model: "gpt-5.5"
+    anthropic:
+      model: "<anthropic-model-id>"
 ```
-- Parse into `HiveFile` (`src/config/mod.rs`): `ai: Option<AiSection { provider, model }>`.
-- A helper `hive_ai_default(&hive) -> (provider, model)` (mirrors how
-  `identity_sync_auth_required` reads the hive) with a built-in fallback
-  (`openai` / `gpt-4.1-mini`) so an omitted section keeps today's behavior.
 
-### 2. SDK — make the trait actually polymorphic (both providers)
-- Add `pub enum LlmProvider { OpenAi, Anthropic }` (+ `FromStr` for the config string).
-- Add `AnthropicClient` implementing `LlmClient` (Anthropic Messages API:
-  `https://api.anthropic.com/v1/messages`, `x-api-key` + `anthropic-version` headers,
-  the `messages`/`content-blocks` request shape, and a tool-use mapping for the
-  function-calling path → `AnthropicFunctionCallingModel`).
-- A factory `create_client(provider, api_key, base_url_override) -> Arc<dyn LlmClient>`
-  and `create_function_model(provider, ...)`. Everything downstream already speaks the
-  `LlmClient` / function-model traits, so call sites become provider-agnostic.
+Reglas:
 
-### 3. Key loading — pick the resolver by provider (stays reproducible)
-- Add `resolve_anthropic_api_key()` mirroring the OpenAI resolver
-  (`vault.resolve_resource(ResourceType::Anthropic, tenant, 5s)`).
-- The node resolves the key for **the selected provider** (hive default or node
-  override). Still vault-only / deterministic. (Optionally also fix the
-  `FLUXBEE_NODE_TENANT_ID`-missing fallback so a hand-started node degrades clearly.)
+- sección ausente -> provider `openai` y model `gpt-5.5`;
+- `default_provider` ausente -> `openai`;
+- con sección `ai` presente, el provider seleccionado debe tener `model` no vacío;
+- cambiar `default_provider` selecciona el bloque y modelo de ese provider;
+- valor vacío o desconocido -> error de configuración, sin fallback silencioso;
+- no contiene secrets ni una key de Vault;
+- es la única fuente de provider y model para los consumidores `SY.*`;
+- `max_tokens`, timeouts y límites funcionales pueden seguir siendo propios de cada
+  operación; no son selectores de provider/model.
 
-### 4. SY.* nodes — inherit the hive default (Tier 1), drop per-SY config
-- `SY.cognition`: replace the `COGNITION_DEFAULT_*` constants + the `"openai"`-only
-  gates (`semantic_tagger_ai.rs:37`, `narrative_summarizer_ai.rs:47`) with: read
-  `(provider, model)` from the hive default, build the client via the factory,
-  dispatch on `LlmProvider`. No per-cognition engine config.
+Conviene definir `AiProvider` y `HiveAiConfig` en un crate compartido y hacer que los
+parsers locales reutilicen esa forma, evitando strings y defaults duplicados.
 
-### 5. AI node — choose at instantiation (Tier 2)
-- Extend the AI-node config so a spun-up node can set `provider` + `model` (e.g. an
-  `anthropic_chat` behavior kind alongside `openai_chat`, or a `provider` field on the
-  existing chat section). When unset, it falls back to the hive default.
+### 3.4 Consumidores `SY.*`
 
-## Decisions still open (for when we build it)
-- **Per-provider default model in hive.yaml?** i.e. keep a `model` per provider so
-  flipping `provider` alone picks a sane model — vs. a single `model` the operator must
-  change in tandem. (Leaning: single `provider`+`model` pair for simplicity, per "no
-  complicar"; revisit if switching becomes frequent.)
-- **Where the hive default reaches the nodes:** push it into each AI/cognition node's
-  config at orchestrator bootstrap (like other hive-derived config), vs. each node
-  reading `hive.yaml` directly. (Leaning: bootstrap push, consistent with how SY nodes
-  already get hive-derived settings.)
-- **Anthropic model pinning:** which default model id (e.g. a current Claude Sonnet).
+El inventario actual es:
 
-## Why this is documented, not coded
-The operator wants the *option* (both engines, hive-default + per-AI-node choice),
-not a switch flipped now. This note is the actionable plan; implementing it is a
-contained follow-up: SDK (`AnthropicClient` + factory) → vault resolver → `hive.yaml`
-`ai:` section + `HiveFile` → swap the `SY.cognition` constants/gates for the factory →
-AI-node override. See also the audit/lab state in
-`.../memory/fluxbee-audit-lab-state.md`.
+- `SY.admin`: executor con function calling. Resuelve OpenAI del pool root, cachea
+  `OpenAiResponsesClient` y refresca sólo ante broadcast `resource_type=openai`.
+- `SY.architect`: chat y varios subagentes con function calling, structured output y
+  attachments. Resuelve OpenAI del pool root y refresca sólo OpenAI. Mezcla config de
+  nodo con el legacy `hive.ai_providers.openai`.
+- `SY.cognition`: semantic tagger y narrative summarizer de texto. Resuelve OpenAI
+  del pool root. Expone `config.semantic_tagger.provider/model` y rechaza proveedores
+  distintos de OpenAI.
+- `SY.frontdesk.gov`: system node listado en `hive.yaml`; usa OpenAI, tools,
+  attachments y resolución desde el root tenant. Por semántica debe seguir el default
+  `SY.*`, no el selector por instancia de `AI.*`.
 
-## Code-review findings to fold into implementation
+Los cuatro deben derivar provider y credencial del default del hive. Sus listeners
+`VAULT_SECRET_CHANGED`, readiness, status, errores y contratos deben interesarse por
+el provider efectivo, no quedar hardcoded a `openai`.
 
-Added 2026-06-30 after reviewing this design against the current code. These do not
-invalidate the two-tier target, but they should be handled before treating this note
-as implementation-ready.
+La configuración no secreta específica de la función puede permanecer (timeouts,
+thresholds, catálogo, límites). Deben eliminarse del código y de los contratos los
+overrides por-SY de provider y model (`ai_providers.openai`,
+`semantic_tagger.provider/model` y equivalentes).
 
-### 1. `SY.architect` is missing from the Tier 1 scope
+### 3.5 Nodos dinámicos `AI.*`
 
-The current note says the only `SY.*` AI consumer is `SY.cognition`, but
-`SY.architect` already runs AI directly:
+`ai-generic` tiene hoy dos formas de config (YAML legacy y documento efectivo), pero
+el camino administrado relevante es `CONFIG_SET` + JSON persistido. Su contrato real:
 
-- It has its own `HiveFile` and `ArchitectNodeConfigFile` with
-  `ai_providers.openai` (`src/bin/sy_architect.rs:200-241`).
-- `build_architect_ai_runtime()` resolves the OpenAI key from Vault, picks a model
-  from merged config/hive settings, and constructs `OpenAiResponsesClient`
-  (`src/bin/sy_architect.rs:6121-6164`).
-- Multiple architect flows build OpenAI function-calling models directly from that
-  runtime (`src/bin/sy_architect.rs:2044-2048`, `src/bin/sy_architect.rs:10202-10206`).
+- sólo permite `behavior.kind=echo|openai_chat`;
+- materializa `behavior.provider=openai`, pero el dispatcher no lee ese campo;
+- exige `behavior.model`;
+- resuelve OpenAI por `resource_type`, no por key;
+- no escucha cambios de Vault: resuelve la key en cada llamada;
+- rechaza secretos inline, correctamente.
 
-Implementation implication: Tier 1 must explicitly include `SY.architect`, otherwise
-the hive-level provider switch would leave a core `SY.*` node pinned to OpenAI.
+El nuevo contrato no debe aceptar dos fuentes de verdad (`provider` + key). La key
+seleccionada es configuración no secreta y su metadata decide el provider.
 
-### 2. Existing per-SY AI config needs a migration/deprecation plan
+Contrato nuevo cerrado:
 
-The target says "no per-SY config", but current code exposes per-SY AI settings:
+```json
+{
+  "behavior": {
+    "kind": "ai_chat",
+    "vault_key": "tenant-support-claude",
+    "model": "<model-id>"
+  }
+}
+```
 
-- `SY.cognition` accepts `config.semantic_tagger.provider/model` and rejects anything
-  except `openai` today (`src/bin/sy_cognition.rs:2728-2750`).
-- `SY.architect` exposes `config.ai_providers.openai.default_model/max_tokens/
-  temperature/top_p` in its local config contract (`src/bin/sy_architect.rs:11345-11368`).
+Reglas estrictas, sin compatibilidad alpha:
 
-Implementation implication: define whether these fields are removed, ignored, migrated
-to the hive default, or kept as temporary compatibility aliases. If they stay, they
-conflict with the operator goal of a single hive-level `SY.*` default.
+- el único behavior LLM nuevo es `ai_chat`; `openai_chat` se elimina;
+- `vault_key` y `model` son obligatorios para `ai_chat`;
+- `behavior.provider` se elimina y se rechaza si aparece; la metadata de la key es
+  autoritativa;
+- persistir sólo `vault_key`, nunca el valor secreto;
+- `CONFIG_GET` devuelve key, provider derivado, modelo efectivo y disponibilidad,
+  sin devolver la credencial;
+- cambiar key o model requiere otro `CONFIG_SET` con `config_version` mayor;
+- configs persistidas con el contrato anterior no se migran ni se aceptan: quedan en
+  `FAILED_CONFIG` hasta recibir un `CONFIG_SET` nuevo válido.
 
-### 3. `hive.yaml` has no canonical AI config, but there is legacy local parsing
+## 4. Diseño de implementación propuesto
 
-The global `config/hive.yaml`, `packaging/hive.yaml.example`, and the shared
-`src/config/mod.rs::HiveFile` still have no canonical `ai:` section. However,
-`SY.architect` has a separate local `HiveFile` that already reads
-`ai_providers.openai` from hive config and merges it with node config
-(`src/bin/sy_architect.rs:200-229`, `src/bin/sy_architect.rs:6167-6189`).
+### 4.1 Tipos compartidos
 
-Implementation implication: the new `ai: { provider, model }` section should either
-replace or explicitly supersede the older `ai_providers.openai` shape. Update any
-architect docs/contracts that still mention the legacy shape so operators do not have
-two competing hive-level AI config formats.
+Crear en el SDK Rust:
 
-### 4. Tier 2 should distinguish dynamic `AI.*` nodes from `SY.frontdesk.gov`
+- `AiProvider::{OpenAi, Anthropic}` con parseo estricto y mapeo a `ResourceType`;
+- `AiCredential { provider, api_key, vault_key?, version? }` sólo en memoria;
+- factory de cliente de generación y factory de function-calling;
+- errores provider-neutral (`missing_ai_api_key`, auth, rate limit, timeout,
+  unsupported capability), conservando detalle del provider.
 
-The note groups `ai-generic` and `ai-frontdesk-gov` as "AI-node instance choice".
-The current code treats them differently:
+### 4.2 Input y tools provider-neutral
 
-- `ai-generic` is the dynamic AI runner; its effective config contains an optional
-  `behavior.provider`, but the runtime dispatch still keys only on
-  `behavior.kind == "openai_chat"` (`nodes/ai/ai-generic/src/bin/ai_node_runner.rs:248-266`,
-  `nodes/ai/ai-generic/src/bin/ai_node_runner.rs:4963-5008`).
-- `ai-frontdesk-gov` documents itself as `SY.frontdesk.gov`, a system node listed in
-  `hive.yaml`, not a dynamic spawn using `FLUXBEE_NODE_ILK_ID`
-  (`nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs:456-465`).
-- `ai-frontdesk-gov` resolves OpenAI from the root/system tenant, not a dynamic
-  per-node tenant (`nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs:1613-1630`).
+Reemplazar `Vec<Value>` como contrato interno por tipos propios, por ejemplo:
 
-Implementation implication: Tier 2 should apply to dynamic `AI.*` instances. If
-`SY.frontdesk.gov` remains a system node, it should inherit Tier 1 unless/until there
-is an explicit decision to make it a configurable AI runtime instance.
+- texto;
+- imagen con MIME + bytes/data source;
+- documento con MIME, nombre y bytes/texto;
+- historial assistant con texto y tool calls;
+- resultados de tools con `call_id`, contenido e `is_error`.
 
-### 5. Anthropic support is not just `LlmClient`; multimodal/input parts are OpenAI-specific
+Los adapters OpenAI/Anthropic convierten esos tipos a su JSON. Esto evita que cada
+consumer tenga ramas provider-specific y permite probar el mapping sin red.
 
-The SDK has a provider-agnostic `LlmClient` trait and `FunctionCallingModel` trait,
-but current input shaping and call sites still use OpenAI wire shapes:
+El estado de continuación debe dejar de depender de `previous_response_id`. OpenAI
+puede seguir aprovechándolo internamente, pero el runner necesita conservar una
+historia neutral suficiente para Anthropic.
 
-- `build_openai_user_content_parts()` emits `input_text`, `input_image`, and
-  `input_file` parts for OpenAI Responses (`crates/fluxbee_ai_sdk/src/text_payload.rs:93-172`).
-- `SY.architect`, `ai-generic`, and `ai-frontdesk-gov` call that helper before sending
-  multimodal turns (`src/bin/sy_architect.rs:10236-10240`,
-  `nodes/ai/ai-generic/src/bin/ai_node_runner.rs:1138-1159`,
-  `nodes/gov/ai-frontdesk-gov/src/bin/ai_node_runner.rs:948-966`).
-- `OpenAiFunctionCallingModel` maps tool calls to OpenAI Responses-specific fields
-  (`crates/fluxbee_ai_sdk/src/llm.rs:560-690`).
+### 4.3 Resolución de credenciales
 
-Implementation implication: add provider-neutral content/input abstractions, or a
-provider-specific builder behind the same factory. Otherwise Anthropic text-only may
-work while attachments/tool paths still fail or silently use OpenAI payload shapes.
+- `SY.*`: `hive.ai.default_provider` -> provider config/model -> `ResourceType` ->
+  `resolve_resource`.
+- `AI.*`: `behavior.vault_key` -> `get(key)` -> metadata `resource_type` -> provider;
+  `behavior.model` permanece independiente de la key.
+- Ambos extraen `api_key` según el contrato vigente de valores AI en Vault (object o
+  bare string); esto no habilita compatibilidad de configuración de nodos.
+- Status y broadcast usan el provider efectivo.
 
-### 6. Status, config contracts, and Vault refresh must become provider-aware
+### 4.4 Sin duplicar lógica en consumidores
 
-`ResourceType::Anthropic` already exists in the vault SDK
-(`crates/fluxbee_sdk/src/vault.rs:89-105`, `crates/fluxbee_sdk/src/vault.rs:140-155`),
-but current consumers and contracts report/listen for OpenAI-specific resources:
+La resolución provider + key + cliente debería vivir en helpers compartidos. No se
+deben crear cuatro copias nuevas de `resolve_anthropic_api_key` junto a las copias
+OpenAI actuales.
 
-- `SY.cognition` listens for `VAULT_SECRET_CHANGED` with `resource_type=openai` and
-  reports OpenAI-specific status/contract fields.
-- `SY.architect` reports `resource_type=openai` in local config get and refreshes
-  OpenAI-specific runtime state.
-- AI node contracts still document allowed behavior as `echo` / `openai_chat` and
-  required resource `openai` (`docs/node-config-control-plane-spec.md:171-245`).
+## 5. Backlog de implementación
 
-Implementation implication: the selected effective provider must drive:
+Las decisiones de contrato y el fallback OpenAI están cerrados en §6. El model de
+Anthropic se declara explícitamente en `hive.yaml` cuando ese provider se selecciona.
 
-- Vault resource type (`openai` vs `anthropic`).
-- `CONFIG_GET` resource lists and health/readiness.
-- `VAULT_SECRET_CHANGED` interests.
-- Runtime error parsing and user-facing missing-key/provider-error payloads.
+### Fase A — contratos y configuración
+
+- [x] `AIENG-A1` Cerrar provider/model/key y política de compatibilidad (§6).
+- [x] `AIENG-A2` Agregar `AiProvider` compartido, parseo, serde y mapping a
+  `ResourceType`; tests de valores válidos/inválidos.
+- [x] `AIENG-A3` Agregar `HiveAiConfig { default_provider, providers }`, validación
+  del model seleccionado y fallback `openai` + `gpt-5.5` cuando la sección completa
+  no existe.
+- [x] `AIENG-A4` Integrar la sección en todos los parsers afectados y en
+  `config/hive.yaml` / `packaging/hive.yaml.example`.
+- [x] `AIENG-A5` Eliminar `ai_providers.openai`,
+  `semantic_tagger.provider/model`, `behavior.provider`, `openai_chat` y sus caminos
+  muertos; rechazar configs viejas sin aliases de compatibilidad.
+
+### Fase B — SDK Anthropic en Rust
+
+- [x] `AIENG-B1` Crear tipos provider-neutral para content parts y attachments.
+- [x] `AIENG-B2` Adaptar OpenAI a esos tipos sin regresiones.
+- [x] `AIENG-B3` Hacer provider-neutral la historia del loop de tools.
+- [x] `AIENG-B4` Implementar `AnthropicMessagesClient` con headers, body, error
+  parsing, usage, request id y respuesta text; portar la política de retry relevante
+  del SDK oficial Go.
+- [x] `AIENG-B5` Implementar structured output Anthropic o fallback explícito por
+  capability; validar con el mismo `OutputSchemaSpec` local.
+- [x] `AIENG-B6` Implementar tool-use Anthropic, incluidos parallel tool calls,
+  `tool_result`, `is_error` y orden de bloques.
+- [x] `AIENG-B7` Implementar attachments Anthropic (texto, imágenes y documentos
+  soportados) con errores explícitos para MIME/capability no soportados.
+- [x] `AIENG-B8` Exponer factories provider-neutral y eliminar imports OpenAI de los
+  consumidores.
+- [ ] `AIENG-B9` Tests HTTP con servidor mock para payloads, headers, parsing,
+  structured output, tools, errores y attachments de ambos providers.
+
+### Fase C — Vault y selección de key
+
+- [x] `AIENG-C1` Crear helper de credencial por provider para `SY.*` usando
+  `resolve_resource`.
+- [x] `AIENG-C2` Crear helper de credencial por key para `AI.*` usando `get`, con
+  validación de metadata y autorización.
+- [ ] `AIENG-C3` Exponer diagnóstico redacted (`vault_key`, provider, version,
+  resolved/source) sin plaintext.
+- [ ] `AIENG-C4` Cubrir key inexistente, tipo no AI, metadata ausente, credencial
+  vacía, acceso denegado y rotación.
+
+### Fase D — consumidores `SY.*`
+
+- [x] `AIENG-D1` Migrar `SY.admin` al runtime/factory común.
+- [x] `AIENG-D2` Migrar `SY.architect`, incluidos todos sus subagentes, tools,
+  structured output y attachments.
+- [x] `AIENG-D3` Migrar ambos pipelines de `SY.cognition` y retirar gates
+  OpenAI-only.
+- [x] `AIENG-D4` Migrar `SY.frontdesk.gov` como system node que hereda el hive.
+- [x] `AIENG-D5` Hacer provider-aware `VAULT_SECRET_CHANGED`, refresh, readiness,
+  status, `CONFIG_GET`, métricas y mensajes de error.
+- [ ] `AIENG-D6` Tests de sección ausente -> OpenAI y sección Anthropic -> Anthropic
+  para cada consumidor.
+
+### Fase E — nodos dinámicos `AI.*`
+
+- [x] `AIENG-E1` Agregar el selector de key al schema efectivo y persistencia de
+  `CONFIG_SET`.
+- [x] `AIENG-E2` Derivar provider exclusivamente de metadata Vault y construir el
+  runtime con la factory.
+- [x] `AIENG-E3` Reemplazar `openai_chat` por el contrato estricto `ai_chat`;
+  actualizar contrato live, errores y redacción, y borrar ramas legacy.
+- [x] `AIENG-E4` Mantener resolución por request o agregar refresh seguro; en ambos
+  casos probar rotación/cambio de key sin filtrar secretos.
+- [ ] `AIENG-E5` Probar chat simple, memoria inmediata, tools, outputs tipados y
+  attachments con OpenAI y Anthropic.
+
+### Fase F — documentación, operaciones y gate final
+
+- [ ] `AIENG-F1` Actualizar `AI_nodes_spec.md`, `AI_Nodes_SDK_Spec_v1.md`,
+  `node-config-control-plane-spec.md`, runbook, ejemplos y Model D'.
+- [ ] `AIENG-F2` Actualizar ayuda/ejemplos de `SY.admin` y Archi para crear la key y
+  asignarla al `AI.*`.
+- [ ] `AIENG-F3` E2E: hive sin sección (OpenAI), hive Anthropic, cambio de key de un
+  AI OpenAI->Anthropic, provider mismatch, key faltante y restore/rotation.
+- [ ] `AIENG-F4` Ejecutar fmt, clippy/tests de crates afectados y el gate del repo.
+
+## 6. Decisiones cerradas
+
+### D1. Provider y model son conceptos separados
+
+- La key de Vault determina acceso y proveedor mediante `metadata.resource_type`.
+- La key no contiene ni determina el model.
+- Para `SY.*`, provider y model viven en la configuración AI del `hive.yaml`.
+- Para `AI.*`, `vault_key` y `model` viven en `behavior` y cambian por `CONFIG_SET`.
+- Si la sección `ai` no existe, el fallback cerrado es provider `openai` y model
+  `gpt-5.5`.
+
+### D2. Selección de key en `AI.*`
+
+Se reutiliza `CONFIG_SET` con `config.behavior.vault_key`. No se agrega un verbo de
+control nuevo. Otro `CONFIG_SET` con versión mayor cambia key y/o model.
+
+### D3. Sin backward compatibility
+
+Fluxbee está en alpha. Se reemplazan los contratos y se elimina el código anterior:
+
+- no alias de `openai_chat`;
+- no discovery implícito por `resource_type` para `AI.*` sin `vault_key`;
+- no `behavior.provider`;
+- no overrides provider/model por nodo `SY.*`;
+- no migración silenciosa de config persistida vieja.
+
+El sistema debe quedar en un solo estado coherente, sin tareas de deprecación ni ramas
+muertas pendientes.
+
+## 7. Criterio de terminado
+
+El trabajo estará completo cuando:
+
+- omitir `ai` en `hive.yaml` conserve OpenAI en todos los consumidores `SY.*`;
+- elegir Anthropic en el hive migre juntos a admin, architect, cognition y frontdesk;
+- un `AI.*` derive OpenAI/Anthropic de la metadata de su key, sin secreto inline;
+- ambos providers soporten los caminos realmente usados: texto, structured output,
+  tools multi-turn, memoria inmediata y attachments;
+- status/config/errores no digan OpenAI cuando el provider efectivo sea Anthropic;
+- no queden payloads OpenAI construidos fuera del adapter OpenAI del SDK Rust;
+- tests unitarios, integración HTTP y E2E cubran fallback, selección, rotación y
+  degradación.

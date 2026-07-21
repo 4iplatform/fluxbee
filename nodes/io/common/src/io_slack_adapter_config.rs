@@ -308,7 +308,7 @@ mod tests {
                     "app_token_ref": "env:SLACK_APP_TOKEN",
                     "bot_token_ref": "env:SLACK_BOT_TOKEN"
                 },
-                "io": {}
+                "io": {"workspace_id":"T123", "conversation_id":"C456"}
             }))
             .expect("must pass");
         assert_eq!(
@@ -372,6 +372,8 @@ mod tests {
                     "bot_token_ref": "env:SLACK_BOT_TOKEN"
                 },
                 "io": {
+                    "workspace_id": "T123",
+                    "conversation_id": "C456",
                     "relay": {
                         "window_ms": 2500,
                         "max_open_sessions": 2000,
@@ -402,6 +404,8 @@ mod tests {
                     "bot_token_ref": "env:SLACK_BOT_TOKEN"
                 },
                 "io": {
+                    "workspace_id": "T123",
+                    "conversation_id": "C456",
                     "relay": {
                         "max_open_sessions": 0
                     }

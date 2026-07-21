@@ -1,5 +1,5 @@
+use crate::text_payload::ModelContentPart;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -80,7 +80,7 @@ pub struct ImmediateOperation {
 pub struct FunctionRunInput {
     pub current_user_message: String,
     #[serde(default)]
-    pub current_user_parts: Option<Vec<Value>>,
+    pub current_user_parts: Option<Vec<ModelContentPart>>,
     #[serde(default)]
     pub immediate_memory: Option<ImmediateConversationMemory>,
 }

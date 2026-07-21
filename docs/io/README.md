@@ -1,13 +1,12 @@
-# IO Specs (Imported from `slack-node`)
+# IO Specifications
 
-This folder contains IO-related specifications imported from `D:\repos\slack-node`, curated for this repo.
+This folder contains the active IO contracts used by this repository.
 
 ## Files
 
 - `nodos_io_spec.md`
 - `io-common.md`
 - `io-api-node-spec.md`
-- `io-api-http-contract-examples.md`
 - `io-slack.md`
 - `io-slack-tasks.md`
 
@@ -17,13 +16,13 @@ This folder contains IO-related specifications imported from `D:\repos\slack-nod
 - `IO.api`
 - shared `io-common`
 
-## Adaptation note (important)
+## Canonical rules
 
-When these docs conflict with the current Fluxbee v1.16/v1.17 direction in this repo, use these rules:
+When an imported/historical note conflicts with these specs, the current runtime and these rules win:
 
 1. Identity:
 - IO uses shared `io-common` pipeline: `lookup -> provision_on_miss -> forward`.
-- IO must not block waiting for identity before acking inbound provider traffic.
+- An IO adapter may wait for identity when its public contract requires a synchronous result.
 - On provision failure/timeout, IO forwards with `meta.src_ilk = null` (degraded fallback), and Router/OPA handles onboarding.
 - On provision, the IO node declares `ilk_type` (`"human"` or `"agent"`) when it can identify the external counterpart's nature. This is constructive of the IO node — set in `IdentityLookupInput.ilk_type` at the call site. When omitted, the server defaults to `"human"`. `"system"` is rejected for IO-originated provisioning.
 
@@ -35,7 +34,9 @@ When these docs conflict with the current Fluxbee v1.16/v1.17 direction in this 
 
 3. Transport:
 - Production node-to-router integration in this repo uses `fluxbee_sdk` + Unix sockets.
-- Any TCP/shim client in imported code is transitional and outside the active workspace/runtime path.
+- `IO.api` never binds a TCP listener. Public HTTP terminates at `SY.edge` and reaches the instance
+  as an authenticated Edge message over the router socket.
+- Provider-specific outbound transports remain adapter-owned only when their active spec says so.
 
 ## Known Issue / Troubleshooting
 

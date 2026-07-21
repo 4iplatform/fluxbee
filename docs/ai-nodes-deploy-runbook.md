@@ -217,16 +217,18 @@ Para `ai.common`, los prompts/config obligatorias pueden versionarse en el `conf
 
 Para `sy.frontdesk.gov`, la dirección vigente es distinta:
 - el prompt funcional base pertenece al runtime frontdesk,
-- `CONFIG_SET` queda para modelo, timeouts y flags operativos no secretos,
+- provider y modelo pertenecen al `ai` hive-wide de `hive.yaml`,
+- `CONFIG_SET` queda para timeouts y flags operativos no secretos,
 - no para transportar obligatoriamente todo el prompt funcional del nodo.
 
-Ejemplo base para `openai_chat`:
+Ejemplo base para un nodo dinámico `ai_chat`:
 
 ```json
 {
   "behavior": {
-    "kind": "openai_chat",
-    "model": "gpt-4.1-mini",
+    "kind": "ai_chat",
+    "vault_key": "ai/common",
+    "model": "gpt-5.5",
     "instructions": {
       "source": "inline",
       "value": "Prompt obligatorio del nodo...",

@@ -9,7 +9,7 @@ use tokio::time;
 use tracing_subscriber::EnvFilter;
 
 use fluxbee_sdk::nats::resolve_local_nats_endpoint;
-use fluxbee_sdk::protocol::{Message, SYSTEM_KIND};
+use fluxbee_sdk::protocol::{is_system_kind, Message, SYSTEM_KIND};
 use fluxbee_sdk::{
     action_class_requires_result, managed_node_name, try_handle_default_node_status, ActionResult,
     NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile, RouteMatch, RouteTarget,
@@ -266,7 +266,7 @@ async fn process_router_message(sender: &NodeSender, msg: &Message) -> Result<()
     if try_handle_default_node_status(sender, msg).await? {
         return Ok(());
     }
-    if msg.meta.msg_type != SYSTEM_KIND {
+    if !is_system_kind(&msg.meta.msg_type) {
         return Ok(());
     }
     Ok(())

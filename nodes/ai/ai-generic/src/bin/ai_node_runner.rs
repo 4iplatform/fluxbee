@@ -10,15 +10,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use base64::Engine;
 use fluxbee_ai_sdk::{
-    build_ai_behavior_response, build_openai_user_content_parts,
-    build_output_schema_fallback_instruction, build_reply_message_runtime_src, extract_text,
+    build_ai_behavior_response, build_model_user_content_parts,
+    build_output_schema_fallback_instruction, build_reply_message_runtime_src,
+    create_function_calling_model, create_llm_client, extract_text,
     resolve_model_input_from_payload_with_options, resolve_response_envelope_output_schema,
-    AiBehaviorOutput, AiFinalOutput, AiNode, AiUserArtifact, FunctionCallingConfig,
+    AiBehaviorOutput, AiFinalOutput, AiNode, AiProvider, AiUserArtifact, FunctionCallingConfig,
     FunctionCallingRunner, FunctionLoopItem, FunctionLoopRunResult, FunctionRunInput, FunctionTool,
     FunctionToolDefinition, FunctionToolProvider, FunctionToolRegistry,
     ImmediateConversationMemory, LanceDbThreadStateStore, Message, ModelInputOptions,
-    ModelSettings, NodeRuntime, OpenAiResponsesClient, ResolvedModelInput, RetryPolicy,
-    RuntimeConfig, ThreadStateStore, ThreadStateToolsProvider,
+    ModelSettings, NodeRuntime, ResolvedModelInput, RetryPolicy, RuntimeConfig, ThreadStateStore,
+    ThreadStateToolsProvider,
 };
 use fluxbee_sdk::identity::{find_ilk_by_handler_node_from_hive_config, IdentityIlkOption};
 use fluxbee_sdk::protocol::{
@@ -62,14 +63,12 @@ Do not interpret messages beyond confirming receipt.
 Do not perform any action."#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OpenAiApiKeySource {
-    /// Model D' — secret resolved via `fluxbee_sdk::resolve_resource(Openai)`
-    /// (pool match against SY.vault). This is the only supported source.
+enum AiApiKeySource {
     Vault,
     Missing,
 }
 
-impl OpenAiApiKeySource {
+impl AiApiKeySource {
     fn as_str(self) -> &'static str {
         match self {
             Self::Vault => "vault",
@@ -143,13 +142,14 @@ struct CognitiveDefinitionSection {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum BehaviorSection {
     Echo,
-    OpenaiChat(OpenAiChatSection),
+    AiChat(AiChatSection),
 }
 
 #[derive(Debug, Deserialize)]
-struct OpenAiChatSection {
-    #[serde(default = "default_model")]
+#[serde(deny_unknown_fields)]
+struct AiChatSection {
     model: String,
+    vault_key: String,
     #[serde(default)]
     instructions: Option<InstructionsSourceConfig>,
     #[serde(default)]
@@ -246,13 +246,14 @@ struct EffectiveNodeSection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct EffectiveBehaviorSection {
     #[serde(default)]
     kind: String,
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
-    provider: Option<String>,
+    vault_key: Option<String>,
     #[serde(default)]
     params: Option<EffectiveBehaviorParams>,
     #[serde(default)]
@@ -267,8 +268,6 @@ struct EffectiveBehaviorSection {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct EffectiveBehaviorParams {
-    #[serde(default)]
-    model: Option<String>,
     #[serde(default)]
     system_prompt: Option<String>,
     #[serde(default)]
@@ -366,10 +365,6 @@ fn default_dynamic_config_dir() -> String {
     "/var/lib/fluxbee/state/ai-nodes".to_string()
 }
 
-fn default_model() -> String {
-    "gpt-4.1-mini".to_string()
-}
-
 fn default_multimodal_for_runtime() -> bool {
     true
 }
@@ -381,17 +376,26 @@ fn default_trim_true() -> bool {
 #[derive(Debug, Clone)]
 enum NodeBehavior {
     Echo,
-    OpenAiChat(OpenAiChatRuntime),
+    AiChat(AiChatRuntime),
 }
 
 #[derive(Debug, Clone)]
-struct OpenAiChatRuntime {
+struct AiChatRuntime {
     model: String,
+    vault_key: String,
     instructions: Option<String>,
     model_settings: ModelSettings,
     base_url: Option<String>,
     immediate_memory: ImmediateMemorySection,
     multimodal: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedAiCredential {
+    provider: AiProvider,
+    api_key: String,
+    vault_key: String,
+    version: Option<i64>,
 }
 
 struct GenericAiNode {
@@ -1090,27 +1094,24 @@ impl AiNode for GenericAiNode {
             return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
         };
 
-        let (input, resolved_user_input): (String, Option<ResolvedModelInput>) = if msg
-            .meta
-            .msg_type
-            .eq_ignore_ascii_case("user")
-        {
-            let options = ModelInputOptions {
-                multimodal: matches!(&behavior, NodeBehavior::OpenAiChat(openai) if openai.multimodal),
-                ..ModelInputOptions::default()
-            };
-            match resolve_model_input_from_payload_with_options(&msg.payload, &options).await {
-                Ok(value) => (value.prompt_text.clone(), Some(value)),
-                Err(err) => {
-                    return Ok(Some(build_reply_message_runtime_src(
-                        &msg,
-                        err.to_error_payload(),
-                    )))
+        let (input, resolved_user_input): (String, Option<ResolvedModelInput>) =
+            if msg.meta.msg_type.eq_ignore_ascii_case("user") {
+                let options = ModelInputOptions {
+                    multimodal: matches!(&behavior, NodeBehavior::AiChat(ai) if ai.multimodal),
+                    ..ModelInputOptions::default()
+                };
+                match resolve_model_input_from_payload_with_options(&msg.payload, &options).await {
+                    Ok(value) => (value.prompt_text.clone(), Some(value)),
+                    Err(err) => {
+                        return Ok(Some(build_reply_message_runtime_src(
+                            &msg,
+                            err.to_error_payload(),
+                        )))
+                    }
                 }
-            }
-        } else {
-            (extract_text(&msg.payload).unwrap_or_default(), None)
-        };
+            } else {
+                (extract_text(&msg.payload).unwrap_or_default(), None)
+            };
         let cognition_block = render_memory_package_prompt_block(msg.meta.memory_package.as_ref());
         let input = inject_memory_package_into_text_input(&input, cognition_block.as_deref());
         if msg.meta.msg_type.eq_ignore_ascii_case("user") {
@@ -1128,10 +1129,10 @@ impl AiNode for GenericAiNode {
         }
         let output = match &behavior {
             NodeBehavior::Echo => AiBehaviorOutput::text(format!("Echo: {input}")),
-            NodeBehavior::OpenAiChat(openai) => {
-                let input_parts = if openai.multimodal {
+            NodeBehavior::AiChat(ai) => {
+                let input_parts = if ai.multimodal {
                     if let Some(resolved) = resolved_user_input.as_ref() {
-                        match build_openai_user_content_parts(resolved).await {
+                        match build_model_user_content_parts(resolved).await {
                             Ok(parts) => Some(inject_memory_package_into_input_parts(
                                 parts,
                                 cognition_block.as_deref(),
@@ -1156,18 +1157,18 @@ impl AiNode for GenericAiNode {
                     None
                 };
                 match self
-                    .run_openai_chat(openai, input, input_parts, &behavior_ctx, &msg.meta)
+                    .run_ai_chat(ai, input, input_parts, &behavior_ctx, &msg.meta)
                     .await
                 {
                     Ok(output) => output,
-                    Err(err) if err.to_string().contains("missing OpenAI api key") => {
+                    Err(err) if err.to_string().contains("missing AI api key") => {
                         tracing::warn!(
                             node_name = %self.node_name,
                             trace_id = %msg.routing.trace_id,
                             error = %err,
-                            "openai runtime missing api key; replying with runtime-not-ready payload"
+                            "AI runtime missing api key; replying with runtime-not-ready payload"
                         );
-                        let payload = missing_openai_api_key_payload();
+                        let payload = missing_ai_api_key_payload(&ai.vault_key);
                         return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
                     }
                     Err(err) => {
@@ -1178,7 +1179,7 @@ impl AiNode for GenericAiNode {
                                 tracing::warn!(
                                     node_name = %self.node_name,
                                     trace_id = %msg.routing.trace_id,
-                                    model = %openai.model,
+                                    model = %ai.model,
                                     provider_status = status,
                                     provider_param = ?extract_openai_error_param(&detail),
                                     provider_detail = %trim_chars(&detail, 280),
@@ -1186,33 +1187,33 @@ impl AiNode for GenericAiNode {
                                     attachment_total_bytes = attachment_summary.total_bytes,
                                     attachment_mimes = ?attachment_summary.mimes,
                                     error = %err,
-                                    "openai runtime request failed with structured provider status; replying with provider error payload"
+                                    "AI runtime request failed with structured provider status; replying with provider error payload"
                                 );
                             } else {
                                 tracing::warn!(
                                     node_name = %self.node_name,
                                     trace_id = %msg.routing.trace_id,
-                                    model = %openai.model,
+                                    model = %ai.model,
                                     attachment_count = attachment_summary.count,
                                     attachment_total_bytes = attachment_summary.total_bytes,
                                     attachment_mimes = ?attachment_summary.mimes,
                                     error = %err,
-                                    "openai runtime request failed; replying with provider error payload"
+                                    "AI runtime request failed; replying with provider error payload"
                                 );
                             }
                         } else {
                             tracing::warn!(
                                 node_name = %self.node_name,
                                 trace_id = %msg.routing.trace_id,
-                                model = %openai.model,
+                                model = %ai.model,
                                 attachment_count = attachment_summary.count,
                                 attachment_total_bytes = attachment_summary.total_bytes,
                                 attachment_mimes = ?attachment_summary.mimes,
                                 error = %err,
-                                "openai runtime request failed; replying with provider error payload"
+                                "AI runtime request failed; replying with provider error payload"
                             );
                         }
-                        let payload = openai_runtime_error_payload(&err);
+                        let payload = ai_runtime_error_payload(&err);
                         return Ok(Some(build_reply_message_runtime_src(&msg, payload)));
                     }
                 }
@@ -1236,23 +1237,25 @@ impl AiNode for GenericAiNode {
 }
 
 impl GenericAiNode {
-    async fn run_openai_chat(
+    async fn run_ai_chat(
         &self,
-        openai: &OpenAiChatRuntime,
+        ai: &AiChatRuntime,
         input: String,
-        input_parts: Option<Vec<Value>>,
+        input_parts: Option<Vec<fluxbee_ai_sdk::ModelContentPart>>,
         ctx: &BehaviorContext,
         meta: &Meta,
     ) -> fluxbee_ai_sdk::Result<AiBehaviorOutput> {
-        let api_key = self.resolve_openai_api_key(openai).await.ok_or_else(|| {
-            fluxbee_ai_sdk::errors::AiSdkError::Protocol(
-                "missing OpenAI api key in SY.vault resource_type=openai".to_string(),
-            )
+        let credential = self.resolve_ai_credential(ai).await.ok_or_else(|| {
+            fluxbee_ai_sdk::errors::AiSdkError::Protocol(format!(
+                "missing AI api key in SY.vault key={}",
+                ai.vault_key
+            ))
         })?;
-        let mut client = OpenAiResponsesClient::new(api_key);
-        if let Some(base_url) = &openai.base_url {
-            client = client.with_base_url(base_url.clone());
-        }
+        let client = create_llm_client(
+            credential.provider,
+            credential.api_key.clone(),
+            ai.base_url.clone(),
+        );
         let output_schema = resolve_response_envelope_output_schema(meta)?;
         let tool_registry = self.build_tool_registry(ctx)?;
         let tool_count = tool_registry.definitions().len();
@@ -1268,10 +1271,13 @@ impl GenericAiNode {
             tool_count,
             output_contract_mode,
             output_schema_name = ?output_schema.as_ref().map(|schema| schema.name()),
-            "openai chat request prepared"
+            provider = %credential.provider,
+            vault_key = %credential.vault_key,
+            vault_version = ?credential.version,
+            "AI chat request prepared"
         );
         if !tool_registry.definitions().is_empty() {
-            let base_instructions = self.effective_openai_instructions(openai).await;
+            let base_instructions = self.effective_ai_instructions(ai).await;
             let system = match (&base_instructions, &output_schema) {
                 (Some(base), Some(schema)) => Some(format!(
                     "{base}\n\n{}",
@@ -1280,22 +1286,25 @@ impl GenericAiNode {
                 (None, Some(schema)) => Some(build_output_schema_fallback_instruction(schema)?),
                 (base, None) => base.clone(),
             };
-            let model = client.clone().function_model(
-                openai.model.clone(),
+            let model = create_function_calling_model(
+                credential.provider,
+                credential.api_key.clone(),
+                ai.base_url.clone(),
+                ai.model.clone(),
                 system,
-                openai.model_settings.clone(),
+                ai.model_settings.clone(),
             );
             let runner = FunctionCallingRunner::new(FunctionCallingConfig::default());
-            let immediate_memory = self.load_immediate_memory_for_input(openai, ctx).await;
+            let immediate_memory = self.load_immediate_memory_for_input(ai, ctx).await;
             let run_input = self.build_function_run_input(
                 input.clone(),
                 input_parts.clone(),
                 ctx,
-                openai,
+                ai,
                 immediate_memory,
             );
             let result = runner
-                .run_with_input(&model, &tool_registry, run_input)
+                .run_with_input(model.as_ref(), &tool_registry, run_input)
                 .await?;
             if let Some(output) = extract_final_output_from_tool_results(&result)? {
                 tracing::info!(
@@ -1306,51 +1315,50 @@ impl GenericAiNode {
                     "tool run produced explicit final_output with user-facing artifacts"
                 );
                 let summary_text = summarize_behavior_output(&output);
-                self.persist_immediate_turn(openai, ctx, &input, &summary_text)
+                self.persist_immediate_turn(ai, ctx, &input, &summary_text)
                     .await;
                 return Ok(output);
             }
             if let Some(text) = result.final_assistant_text {
-                self.persist_immediate_turn(openai, ctx, &input, &text)
-                    .await;
+                self.persist_immediate_turn(ai, ctx, &input, &text).await;
                 return Ok(AiBehaviorOutput::text(text));
             }
         }
 
         let current_user_input = input.clone();
-        let system = self.effective_openai_instructions(openai).await;
+        let system = self.effective_ai_instructions(ai).await;
         let req = fluxbee_ai_sdk::llm::LlmRequest {
-            model: openai.model.clone(),
+            model: ai.model.clone(),
             system,
             input,
             input_parts,
             output_schema,
             max_output_tokens: None,
-            model_settings: Some(openai.model_settings.clone()),
+            model_settings: Some(ai.model_settings.clone()),
         };
-        let response = fluxbee_ai_sdk::llm::LlmClient::generate(&client, req).await?;
-        self.persist_immediate_turn(openai, ctx, &current_user_input, &response.content)
+        let response = fluxbee_ai_sdk::llm::LlmClient::generate(client.as_ref(), req).await?;
+        self.persist_immediate_turn(ai, ctx, &current_user_input, &response.content)
             .await;
         Ok(AiBehaviorOutput::text(response.content))
     }
 
-    async fn effective_openai_instructions(&self, openai: &OpenAiChatRuntime) -> Option<String> {
+    async fn effective_ai_instructions(&self, ai: &AiChatRuntime) -> Option<String> {
         let state = self.cognitive_definition.read().await;
         state
             .active_prompt
             .clone()
-            .or_else(|| openai.instructions.clone())
+            .or_else(|| ai.instructions.clone())
     }
 
     fn build_function_run_input(
         &self,
         input: String,
-        input_parts: Option<Vec<Value>>,
+        input_parts: Option<Vec<fluxbee_ai_sdk::ModelContentPart>>,
         ctx: &BehaviorContext,
-        openai: &OpenAiChatRuntime,
+        ai: &AiChatRuntime,
         immediate_memory: Option<ImmediateConversationMemory>,
     ) -> FunctionRunInput {
-        if !openai.immediate_memory.enabled {
+        if !ai.immediate_memory.enabled {
             return FunctionRunInput {
                 current_user_message: input,
                 current_user_parts: input_parts,
@@ -1374,10 +1382,10 @@ impl GenericAiNode {
 
     async fn load_immediate_memory_for_input(
         &self,
-        openai: &OpenAiChatRuntime,
+        ai: &AiChatRuntime,
         ctx: &BehaviorContext,
     ) -> Option<ImmediateConversationMemory> {
-        if !openai.immediate_memory.enabled {
+        if !ai.immediate_memory.enabled {
             return None;
         }
         let src_ilk = ctx.src_ilk.as_deref()?;
@@ -1399,10 +1407,10 @@ impl GenericAiNode {
         let (summary, recent_interactions) = if let Some(mut record) = record {
             record.summary = record
                 .summary
-                .map(|summary| trim_summary(summary, openai.immediate_memory.summary_max_chars));
+                .map(|summary| trim_summary(summary, ai.immediate_memory.summary_max_chars));
             record.recent_interactions = prune_recent_interactions(
                 record.recent_interactions,
-                openai.immediate_memory.recent_interactions_max,
+                ai.immediate_memory.recent_interactions_max,
             );
             tracing::debug!(
                 node_name = %self.node_name,
@@ -1410,9 +1418,9 @@ impl GenericAiNode {
                 thread_id = ?ctx.thread_id,
                 memory_hit = true,
                 recent_interactions = record.recent_interactions.len(),
-                recent_interactions_max = openai.immediate_memory.recent_interactions_max,
-                active_operations_max = openai.immediate_memory.active_operations_max,
-                summary_max_chars = openai.immediate_memory.summary_max_chars,
+                recent_interactions_max = ai.immediate_memory.recent_interactions_max,
+                active_operations_max = ai.immediate_memory.active_operations_max,
+                summary_max_chars = ai.immediate_memory.summary_max_chars,
                 summary_refresh_status = "not_implemented_v1",
                 "immediate memory loaded"
             );
@@ -1423,9 +1431,9 @@ impl GenericAiNode {
                 src_ilk = %src_ilk,
                 thread_id = ?ctx.thread_id,
                 memory_hit = false,
-                recent_interactions_max = openai.immediate_memory.recent_interactions_max,
-                active_operations_max = openai.immediate_memory.active_operations_max,
-                summary_max_chars = openai.immediate_memory.summary_max_chars,
+                recent_interactions_max = ai.immediate_memory.recent_interactions_max,
+                active_operations_max = ai.immediate_memory.active_operations_max,
+                summary_max_chars = ai.immediate_memory.summary_max_chars,
                 summary_refresh_status = "not_implemented_v1",
                 "immediate memory loaded"
             );
@@ -1443,12 +1451,12 @@ impl GenericAiNode {
 
     async fn persist_immediate_turn(
         &self,
-        openai: &OpenAiChatRuntime,
+        ai: &AiChatRuntime,
         ctx: &BehaviorContext,
         user_input: &str,
         assistant_output: &str,
     ) {
-        if !openai.immediate_memory.enabled {
+        if !ai.immediate_memory.enabled {
             return;
         }
         let Some(src_ilk) = ctx.src_ilk.as_deref() else {
@@ -1474,7 +1482,7 @@ impl GenericAiNode {
         };
         record.summary = record
             .summary
-            .map(|summary| trim_summary(summary, openai.immediate_memory.summary_max_chars));
+            .map(|summary| trim_summary(summary, ai.immediate_memory.summary_max_chars));
         record
             .recent_interactions
             .push(fluxbee_ai_sdk::ImmediateInteraction {
@@ -1491,7 +1499,7 @@ impl GenericAiNode {
             });
         record.recent_interactions = prune_recent_interactions(
             record.recent_interactions,
-            openai.immediate_memory.recent_interactions_max,
+            ai.immediate_memory.recent_interactions_max,
         );
         record.updated_at = chrono::Utc::now().to_rfc3339();
 
@@ -1509,7 +1517,7 @@ impl GenericAiNode {
                 src_ilk = %src_ilk,
                 thread_id = ?ctx.thread_id,
                 persisted_recent_interactions = record.recent_interactions.len(),
-                recent_interactions_max = openai.immediate_memory.recent_interactions_max,
+                recent_interactions_max = ai.immediate_memory.recent_interactions_max,
                 summary_refresh_status = "not_implemented_v1",
                 "immediate memory persisted"
             );
@@ -1571,63 +1579,48 @@ impl GenericAiNode {
         Ok(())
     }
 
-    async fn resolve_openai_api_key(&self, openai: &OpenAiChatRuntime) -> Option<String> {
-        self.resolve_openai_api_key_with_source(openai).await.0
-    }
-
-    /// Model D' — resolve the OpenAI api_key by discovering the `openai`
-    /// resource in SY.vault (pool match: dedicated to caller ILK → caller
-    /// tenant pool → root tenant pool, i.e.
-    /// `tnt:00000000-0000-0000-0000-000000000001`). This is the **only**
-    /// supported source. Plaintext config fields, env-var references, YAML
-    /// inline secrets, and local `secrets.json` persistence are not accepted.
-    ///
-    /// Requires `self_ilk_id` and `self_tenant_id` to be present (set by
-    /// the orchestrator via FLUXBEE_NODE_ILK_ID + FLUXBEE_NODE_TENANT_ID
-    /// envs). If either is missing the node runs degraded and replies
-    /// with a runtime-not-ready payload on chat requests.
-    async fn resolve_openai_api_key_with_source(
-        &self,
-        _openai: &OpenAiChatRuntime,
-    ) -> (Option<String>, OpenAiApiKeySource) {
-        let Some(self_tenant_id) = self.self_tenant_id.as_deref().filter(|v| !v.is_empty()) else {
-            tracing::warn!(
-                node_name = %self.node_name,
-                "FLUXBEE_NODE_TENANT_ID not set; vault lookup skipped (node running degraded)"
-            );
-            return (None, OpenAiApiKeySource::Missing);
-        };
+    /// Resolves exactly the configured Vault key. Its `resource_type`
+    /// metadata selects the provider; the secret never selects the model.
+    async fn resolve_ai_credential(&self, ai: &AiChatRuntime) -> Option<ResolvedAiCredential> {
         let Some(vault) = self.vault.as_ref() else {
             tracing::warn!(
                 node_name = %self.node_name,
                 "vault client unavailable (missing self_ilk_id / hive suffix); lookup skipped"
             );
-            return (None, OpenAiApiKeySource::Missing);
+            return None;
         };
-        let result = vault
-            .resolve_resource(
-                fluxbee_sdk::ResourceType::Openai,
-                self_tenant_id,
-                Duration::from_secs(5),
-            )
-            .await;
-        match result {
-            Ok(Some(value)) => {
-                let api_key = extract_openai_api_key_from_value(&value);
-                if api_key.is_some() {
-                    (api_key, OpenAiApiKeySource::Vault)
-                } else {
-                    tracing::warn!(
-                        node_name = %self.node_name,
-                        "vault openai secret did not carry a usable api_key"
-                    );
-                    (None, OpenAiApiKeySource::Missing)
+        match vault.get(&ai.vault_key, Duration::from_secs(5)).await {
+            Ok(response) => {
+                let resource_type = response
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.resource_type.as_deref());
+                let provider = resource_type.and_then(|value| value.parse::<AiProvider>().ok());
+                let api_key = response
+                    .value
+                    .as_ref()
+                    .and_then(extract_ai_api_key_from_value);
+                match (provider, api_key) {
+                    (Some(provider), Some(api_key)) => Some(ResolvedAiCredential {
+                        provider,
+                        api_key,
+                        vault_key: response.key,
+                        version: response.version,
+                    }),
+                    _ => {
+                        tracing::warn!(
+                            node_name = %self.node_name,
+                            vault_key = %ai.vault_key,
+                            resource_type = ?resource_type,
+                            "vault key must contain api_key and resource_type openai|anthropic"
+                        );
+                        None
+                    }
                 }
             }
-            Ok(None) => (None, OpenAiApiKeySource::Missing),
             Err(err) => {
-                tracing::warn!(error = %err, "ai-generic vault resource lookup failed");
-                (None, OpenAiApiKeySource::Missing)
+                tracing::warn!(error = %err, vault_key = %ai.vault_key, "AI vault key lookup failed");
+                None
             }
         }
     }
@@ -1794,7 +1787,7 @@ impl GenericAiNode {
                 );
             }
         };
-        if let Some(field) = find_openai_secret_contract_field(&config) {
+        if let Some(field) = find_ai_secret_contract_field(&config) {
             return self.invalid_config_response(
                 Some(schema_version),
                 Some(config_version),
@@ -1985,25 +1978,17 @@ impl GenericAiNode {
         } else {
             (false, "none")
         };
-        // Model D' — the only source is vault. Reports `vault` when the
-        // node has both `self_ilk_id` and `self_tenant_id` available
-        // (orchestrator-spawned with FLUXBEE_NODE_ILK_ID +
-        // FLUXBEE_NODE_TENANT_ID); reports `missing` otherwise. Live vault
-        // presence is verified on each chat resolve call.
+        // Live key/provider validation occurs on every AI request.
         let api_key_source = if self
             .self_ilk_id
             .as_deref()
             .filter(|v| !v.is_empty())
             .is_some()
-            && self
-                .self_tenant_id
-                .as_deref()
-                .filter(|v| !v.is_empty())
-                .is_some()
+            && self.vault.is_some()
         {
-            OpenAiApiKeySource::Vault
+            AiApiKeySource::Vault
         } else {
-            OpenAiApiKeySource::Missing
+            AiApiKeySource::Missing
         };
         let error = if ok {
             Value::Null
@@ -2025,15 +2010,18 @@ impl GenericAiNode {
                 "supports": ["CONFIG_GET", "CONFIG_SET"],
                 "required_fields": [
                     "config.behavior.kind",
-                    "config.behavior.model"
+                    "config.behavior.model",
+                    "config.behavior.vault_key"
                 ],
                 "field_values": {
                     "config.behavior.kind": {
-                        "allowed": ["echo", "openai_chat"],
-                        "notes": ["Use openai_chat for OpenAI-backed chat. Do not use openai."]
+                        "allowed": ["echo", "ai_chat"]
                     },
                     "config.behavior.model": {
-                        "examples": ["gpt-4.1-mini"]
+                        "examples": ["gpt-5.5", "claude-sonnet-4-5"]
+                    },
+                    "config.behavior.vault_key": {
+                        "notes": ["The key metadata resource_type selects openai or anthropic; the key never selects the model."]
                     }
                 },
                 "optional_fields": [
@@ -2044,17 +2032,17 @@ impl GenericAiNode {
                 ],
                 "resources": [
                     {
-                        "resource_type": "openai",
+                        "resource_type": "openai|anthropic",
                         "required": true,
                         "source": api_key_source.as_str(),
-                        "configured": api_key_source != OpenAiApiKeySource::Missing,
+                        "configured": api_key_source != AiApiKeySource::Missing,
                         "provider": "SY.vault"
                     }
                 ],
                 "notes": [
                     "Cognitive assets are not part of CONFIG_SET. Apply role_hash, skill_hashes, handbook_hashes, and personality_hash with set_ilk_definition against the agent ILK.",
-                    "OpenAI credentials are resolved only from SY.vault using resource_type=openai.",
-                    "For OpenAI behavior set config.behavior.kind=openai_chat, not openai.",
+                    "AI credentials are read from the exact config.behavior.vault_key on each request.",
+                    "Vault metadata resource_type selects openai or anthropic.",
                     "CONFIG_SET rejects secret-bearing fields such as config.secrets.openai.api_key, config.behavior.openai.api_key, config.behavior.api_key, and config.behavior.api_key_env.",
                     "ai.generic defaults behavior.capabilities.multimodal=true unless explicitly overridden.",
                     "Cognitive role/skill/handbook prompt definition is loaded from identity SHM and blob://agent-assets/<hash>.json."
@@ -4344,7 +4332,7 @@ impl NodeBehavior {
     fn kind(&self) -> &'static str {
         match self {
             Self::Echo => "echo",
-            Self::OpenAiChat(_) => "openai_chat",
+            Self::AiChat(_) => "ai_chat",
         }
     }
 }
@@ -4930,9 +4918,11 @@ fn build_behavior(
 ) -> Result<NodeBehavior, Box<dyn std::error::Error + Send + Sync>> {
     let behavior = match &cfg.behavior {
         BehaviorSection::Echo => NodeBehavior::Echo,
-        BehaviorSection::OpenaiChat(openai) => {
-            let instructions = resolve_instructions(&openai.instructions)?;
-            let model_settings = openai
+        BehaviorSection::AiChat(ai) => {
+            require_nonempty("behavior.model", &ai.model)?;
+            require_nonempty("behavior.vault_key", &ai.vault_key)?;
+            let instructions = resolve_instructions(&ai.instructions)?;
+            let model_settings = ai
                 .model_settings
                 .as_ref()
                 .map(|v| ModelSettings {
@@ -4941,22 +4931,33 @@ fn build_behavior(
                     max_output_tokens: v.max_output_tokens,
                 })
                 .unwrap_or_default();
-            let multimodal = openai
+            let multimodal = ai
                 .capabilities
                 .as_ref()
                 .and_then(|caps| caps.multimodal)
                 .unwrap_or_else(default_multimodal_for_runtime);
-            NodeBehavior::OpenAiChat(OpenAiChatRuntime {
-                model: openai.model.clone(),
+            NodeBehavior::AiChat(AiChatRuntime {
+                model: ai.model.clone(),
+                vault_key: ai.vault_key.clone(),
                 instructions,
                 model_settings,
-                base_url: openai.base_url.clone(),
+                base_url: ai.base_url.clone(),
                 immediate_memory: cfg.runtime.immediate_memory.clone(),
                 multimodal,
             })
         }
     };
     Ok(behavior)
+}
+
+fn require_nonempty(
+    field: &str,
+    value: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if value.trim().is_empty() {
+        return Err(format!("{field} must not be empty").into());
+    }
+    Ok(())
 }
 
 fn build_behavior_from_effective_config(
@@ -4972,13 +4973,17 @@ fn build_behavior_from_effective_config(
 
     match kind {
         "echo" => Ok(NodeBehavior::Echo),
-        "openai_chat" => {
+        "ai_chat" => {
             let model = behavior
                 .model
                 .clone()
-                .or_else(|| behavior.params.as_ref().and_then(|p| p.model.clone()))
-                .ok_or_else(|| "missing behavior.model for openai_chat".to_string())?
-                .to_string();
+                .ok_or_else(|| "missing behavior.model for ai_chat".to_string())?;
+            require_nonempty("behavior.model", &model)?;
+            let vault_key = behavior
+                .vault_key
+                .clone()
+                .ok_or_else(|| "missing behavior.vault_key for ai_chat".to_string())?;
+            require_nonempty("behavior.vault_key", &vault_key)?;
 
             let instructions = extract_instructions_from_effective_config(behavior);
             let model_settings = extract_model_settings_from_effective_config(behavior);
@@ -4994,8 +4999,9 @@ fn build_behavior_from_effective_config(
                 .and_then(|caps| caps.multimodal)
                 .unwrap_or_else(default_multimodal_for_runtime);
 
-            Ok(NodeBehavior::OpenAiChat(OpenAiChatRuntime {
+            Ok(NodeBehavior::AiChat(AiChatRuntime {
                 model,
+                vault_key,
                 instructions,
                 model_settings,
                 base_url,
@@ -5062,16 +5068,16 @@ fn build_startup_effective_config_doc(cfg: &RunnerConfig) -> EffectiveConfigDocu
             kind: "echo".to_string(),
             ..EffectiveBehaviorSection::default()
         },
-        BehaviorSection::OpenaiChat(openai) => EffectiveBehaviorSection {
-            kind: "openai_chat".to_string(),
-            model: Some(openai.model.clone()),
-            instructions: Some(format_instructions_snapshot(&openai.instructions)),
-            model_settings: openai.model_settings.clone(),
-            base_url: openai.base_url.clone(),
+        BehaviorSection::AiChat(ai) => EffectiveBehaviorSection {
+            kind: "ai_chat".to_string(),
+            model: Some(ai.model.clone()),
+            vault_key: Some(ai.vault_key.clone()),
+            instructions: Some(format_instructions_snapshot(&ai.instructions)),
+            model_settings: ai.model_settings.clone(),
+            base_url: ai.base_url.clone(),
             capabilities: Some(BehaviorCapabilities {
                 multimodal: Some(
-                    openai
-                        .capabilities
+                    ai.capabilities
                         .as_ref()
                         .and_then(|caps| caps.multimodal)
                         .unwrap_or_else(default_multimodal_for_runtime),
@@ -5120,10 +5126,7 @@ fn load_persisted_dynamic_config(
     let path = dynamic_config_path(base_dir, node_name);
     let raw = fs::read_to_string(path).ok()?;
     let root: Value = serde_json::from_str(&raw).ok()?;
-    if let Some(field) = root
-        .get("config")
-        .and_then(find_openai_secret_contract_field)
-    {
+    if let Some(field) = root.get("config").and_then(find_ai_secret_contract_field) {
         tracing::warn!(
             node_name = %node_name,
             field,
@@ -5212,10 +5215,10 @@ fn format_instructions_snapshot(cfg: &Option<InstructionsSourceConfig>) -> Value
     }
 }
 
-/// Model D' — extract the openai api_key from a vault `value`. Vault may
+/// Extract an AI provider api_key from a vault `value`. Vault may
 /// return either a bare string or an object with `api_key` field; both are
 /// accepted (matches what SY consumers do).
-fn extract_openai_api_key_from_value(value: &Value) -> Option<String> {
+fn extract_ai_api_key_from_value(value: &Value) -> Option<String> {
     if let Some(s) = value.as_str().map(str::trim).filter(|v| !v.is_empty()) {
         return Some(s.to_string());
     }
@@ -5227,7 +5230,7 @@ fn extract_openai_api_key_from_value(value: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn find_openai_secret_contract_field(config: &Value) -> Option<&'static str> {
+fn find_ai_secret_contract_field(config: &Value) -> Option<&'static str> {
     let behavior = config.get("behavior");
     if config.get("secrets").is_some() {
         return Some("config.secrets");
@@ -5254,9 +5257,9 @@ fn find_unsupported_ai_config_field(config: &Value) -> Option<&'static str> {
 fn parse_effective_config_doc(
     config: &Value,
 ) -> Result<EffectiveConfigDocument, Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(field) = find_openai_secret_contract_field(config) {
+    if let Some(field) = find_ai_secret_contract_field(config) {
         return Err(format!(
-            "secret-bearing field '{field}' is not accepted by ai.generic; use SY.vault resource_type=openai"
+            "secret-bearing field '{field}' is not accepted by ai.generic; use a Vault key with resource_type=openai|anthropic"
         )
         .into());
     }
@@ -5407,7 +5410,7 @@ fn materialize_effective_defaults(
     if let Some(runtime) = config.runtime.as_mut() {
         materialize_runtime_defaults(runtime);
     }
-    if config.behavior.kind.eq_ignore_ascii_case("openai_chat") {
+    if config.behavior.kind.eq_ignore_ascii_case("ai_chat") {
         if config.behavior.capabilities.is_none() {
             config.behavior.capabilities = Some(BehaviorCapabilities {
                 multimodal: Some(default_multimodal_for_runtime()),
@@ -5416,9 +5419,6 @@ fn materialize_effective_defaults(
             if caps.multimodal.is_none() {
                 caps.multimodal = Some(default_multimodal_for_runtime());
             }
-        }
-        if config.behavior.provider.is_none() {
-            config.behavior.provider = Some("openai".to_string());
         }
     }
     config
@@ -5551,16 +5551,17 @@ fn node_runtime_not_ready_payload() -> Value {
     })
 }
 
-fn missing_openai_api_key_payload() -> Value {
+fn missing_ai_api_key_payload(vault_key: &str) -> Value {
     json!({
         "type": "error",
-        "code": "missing_openai_api_key",
-        "message": "Missing OpenAI API key in SY.vault resource_type=openai.",
-        "retryable": true
+        "code": "missing_ai_api_key",
+        "message": "The configured Vault key is missing, inaccessible, or is not an OpenAI/Anthropic credential.",
+        "retryable": true,
+        "details": { "vault_key": vault_key }
     })
 }
 
-fn openai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
+fn ai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
     match err {
         fluxbee_ai_sdk::errors::AiSdkError::Http(http_err)
             if http_err.is_timeout() || http_err.is_connect() =>
@@ -6014,17 +6015,16 @@ fn inject_memory_package_into_text_input(input: &str, cognition_block: Option<&s
 }
 
 fn inject_memory_package_into_input_parts(
-    mut parts: Vec<Value>,
+    mut parts: Vec<fluxbee_ai_sdk::ModelContentPart>,
     cognition_block: Option<&str>,
-) -> Vec<Value> {
+) -> Vec<fluxbee_ai_sdk::ModelContentPart> {
     let Some(block) = cognition_block.filter(|value| !value.trim().is_empty()) else {
         return parts;
     };
     let mut enriched = Vec::with_capacity(parts.len() + 1);
-    enriched.push(json!({
-        "type": "input_text",
-        "text": block,
-    }));
+    enriched.push(fluxbee_ai_sdk::ModelContentPart::Text {
+        text: block.to_string(),
+    });
     enriched.append(&mut parts);
     enriched
 }
@@ -6595,7 +6595,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_chat_missing_api_key_returns_error_payload_instead_of_fatal() {
+    async fn ai_chat_missing_api_key_returns_error_payload_instead_of_fatal() {
         let _guard = env_lock().lock().expect("env lock");
         std::env::remove_var("OPENAI_API_KEY_MISSING_FOR_TEST");
         let node = test_node();
@@ -6605,8 +6605,9 @@ mod tests {
         }
         {
             let mut behavior = node.behavior.write().await;
-            *behavior = Some(NodeBehavior::OpenAiChat(OpenAiChatRuntime {
-                model: "gpt-4.1-mini".to_string(),
+            *behavior = Some(NodeBehavior::AiChat(AiChatRuntime {
+                model: "gpt-5.5".to_string(),
+                vault_key: "ai/test".to_string(),
                 instructions: Some("Test instructions".to_string()),
                 model_settings: ModelSettings::default(),
                 base_url: None,
@@ -6628,7 +6629,7 @@ mod tests {
 
         assert_eq!(
             response.payload.get("code").and_then(Value::as_str),
-            Some("missing_openai_api_key")
+            Some("missing_ai_api_key")
         );
         assert_eq!(
             response.payload.get("retryable").and_then(Value::as_bool),
@@ -6721,18 +6722,20 @@ mod tests {
         let block = render_memory_package_prompt_block(Some(&sample_memory_package()))
             .expect("memory block");
         let enriched = inject_memory_package_into_input_parts(
-            vec![json!({"type":"input_text","text":"hello"})],
+            vec![fluxbee_ai_sdk::ModelContentPart::Text {
+                text: "hello".to_string(),
+            }],
             Some(&block),
         );
         assert_eq!(enriched.len(), 2);
-        assert_eq!(
-            enriched[0].get("text").and_then(Value::as_str),
-            Some(block.as_str())
-        );
-        assert_eq!(
-            enriched[1].get("text").and_then(Value::as_str),
-            Some("hello")
-        );
+        assert!(matches!(
+            &enriched[0],
+            fluxbee_ai_sdk::ModelContentPart::Text { text } if text == &block
+        ));
+        assert!(matches!(
+            &enriched[1],
+            fluxbee_ai_sdk::ModelContentPart::Text { text } if text == "hello"
+        ));
     }
 
     #[test]
@@ -7112,11 +7115,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_effective_config_rejects_openai_secret_contract_fields() {
+    fn parse_effective_config_rejects_ai_secret_contract_fields() {
         let cases = [
             (
                 json!({
-                    "behavior": {"kind": "openai_chat", "model": "gpt-4.1-mini"},
+                    "behavior": {"kind": "ai_chat", "model": "gpt-5.5", "vault_key": "ai/test"},
                     "secrets": {"openai": {"api_key": "sk-test"}}
                 }),
                 "config.secrets",
@@ -7124,8 +7127,9 @@ mod tests {
             (
                 json!({
                     "behavior": {
-                        "kind": "openai_chat",
-                        "model": "gpt-4.1-mini",
+                        "kind": "ai_chat",
+                        "model": "gpt-5.5",
+                        "vault_key": "ai/test",
                         "api_key": "sk-test"
                     }
                 }),
@@ -7134,8 +7138,9 @@ mod tests {
             (
                 json!({
                     "behavior": {
-                        "kind": "openai_chat",
-                        "model": "gpt-4.1-mini",
+                        "kind": "ai_chat",
+                        "model": "gpt-5.5",
+                        "vault_key": "ai/test",
                         "api_key_env": "OPENAI_API_KEY"
                     }
                 }),
@@ -7144,8 +7149,9 @@ mod tests {
             (
                 json!({
                     "behavior": {
-                        "kind": "openai_chat",
-                        "model": "gpt-4.1-mini",
+                        "kind": "ai_chat",
+                        "model": "gpt-5.5",
+                        "vault_key": "ai/test",
                         "openai": {"api_key": "sk-test"}
                     }
                 }),
@@ -7153,7 +7159,7 @@ mod tests {
             ),
             (
                 json!({
-                    "behavior": {"kind": "openai_chat", "model": "gpt-4.1-mini"},
+                    "behavior": {"kind": "ai_chat", "model": "gpt-5.5", "vault_key": "ai/test"},
                     "assets": {"role_hash": "abc"}
                 }),
                 "config.assets",
@@ -7161,11 +7167,38 @@ mod tests {
         ];
 
         for (config, field) in cases {
-            assert_eq!(find_openai_secret_contract_field(&config), Some(field));
+            let rejected_field = find_ai_secret_contract_field(&config)
+                .or_else(|| find_unsupported_ai_config_field(&config));
+            assert_eq!(rejected_field, Some(field));
             let err = parse_effective_config_doc(&config)
                 .expect_err("secret-bearing AI config should be rejected");
             assert!(err.to_string().contains(field));
         }
+    }
+
+    #[test]
+    fn ai_chat_contract_requires_key_and_rejects_provider_selector() {
+        let with_provider = json!({
+            "behavior": {
+                "kind": "ai_chat",
+                "vault_key": "ai/test",
+                "model": "gpt-5.5",
+                "provider": "openai"
+            }
+        });
+        assert!(parse_effective_config_doc(&with_provider).is_err());
+
+        let missing_key = parse_effective_config_doc(&json!({
+            "behavior": {"kind": "ai_chat", "model": "gpt-5.5"}
+        }))
+        .expect("document shape parses");
+        assert!(build_behavior_from_effective_config(&missing_key).is_err());
+
+        let legacy = parse_effective_config_doc(&json!({
+            "behavior": {"kind": "openai_chat", "model": "gpt-4.1-mini"}
+        }))
+        .expect("document shape parses");
+        assert!(build_behavior_from_effective_config(&legacy).is_err());
     }
 
     #[test]

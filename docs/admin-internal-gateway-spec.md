@@ -1,8 +1,4 @@
-
-
-
-
-||AQ# SY.admin Internal Command Gateway (Unified Spec)
+# SY.admin Internal Command Gateway (Unified Spec)
 
 **Status:** v1.2-draft  
 **Date:** 2026-03-14  
@@ -185,7 +181,7 @@ struct ActionSpec {
 Implementación actual:
 - `src/bin/sy_admin.rs`
 - `INTERNAL_ACTION_REGISTRY` (catálogo único)
-- `INTERNAL_ACTION_REGISTRY_VERSION = "1"` (versionado explícito del catálogo)
+- `INTERNAL_ACTION_REGISTRY_VERSION = "9"` (versionado explícito del catálogo)
 
 `handler_kind` referencia wrappers a código existente:
 - `handle_admin_query`
@@ -230,7 +226,7 @@ Implementación actual:
 | `GET /hives/{id}/identity/ilks/{ilk_id}` | `get_ilk` | `handle_admin_command` -> `SY.identity` (`ILK_GET`) |
 | `POST /hives/{id}/identity/ilks/{ilk_id}/definition` | `set_ilk_definition` | `handle_admin_command` -> `SY.identity` (`ILK_SET_DEFINITION`) |
 
-### 7.1.1 Planned node config control-plane wrappers (non-`SY`)
+### 7.1.1 Node config control-plane wrappers (non-`SY`) — BUILT
 
 The platform already has the generic transport needed to send node-level control-plane messages:
 
@@ -238,7 +234,7 @@ The platform already has the generic transport needed to send node-level control
 
 That path is sufficient for raw/debug unicast messages, but it is not the preferred public surface for `archi`.
 
-Planned wrappers for non-`SY` node config control-plane:
+The wrappers for non-`SY` node config control-plane are IMPLEMENTED (live routes in `src/bin/sy_admin.rs`):
 
 | Endpoint | Intent | Transport |
 |---|---|---|
@@ -250,6 +246,8 @@ Notes:
 - `PUT .../config` remains orchestrator-owned infra/bootstrap config.
 - `CONFIG_GET` / `CONFIG_SET` are node-owned runtime/business config contracts.
 - Node-specific `payload.config` remains opaque to admin; admin validates only common envelope metadata.
+
+The registry has also grown the vault relay actions (`vault_put`, `vault_get`, `vault_rotate`, …) and the edge externalization actions (`externalize`, `unexternalize`, `list_externalized`) — all live in `INTERNAL_ACTION_REGISTRY` (`src/bin/sy_admin.rs`).
 
 ### 7.2 Routes, VPN, storage, rollout/drift
 

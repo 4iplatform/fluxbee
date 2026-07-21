@@ -277,7 +277,7 @@ Active rule: consumers do not receive `vault://...` refs through CONFIG_SET. A n
 - [ ] VA-I6. Add examples for common secrets:
   - OpenAI API key;
   - Slack bot token;
-  - IO.api webhook secret;
+  - Edge channel bearer minted by Admin during `externalize`;
   - Postgres URL for system services.
 
 ## 12. Historical Phase J - removed from active plan
@@ -425,20 +425,23 @@ Para cada nodo consumer, el patrón es:
 - [ ] VA-J'-IO-slack-4. CONFIG_SET: hoy todavía acepta tokens vía adapter contract (path legacy de Phase J). Deprecar / rechazar en el siguiente ciclo cuando linkedhelper + io-api se migren juntos (multi-tenant). **Pendiente.**
 - [ ] VA-J'-IO-slack-5. E2E en VM: `vault_put` con `resource_type=slack` + restart → io-slack se conecta y manda un mensaje. **Pendiente test en VM.**
 
-### J'-IO-linkedhelper + J'-IO-api. Multi-tenant — postergado para charla de diseño
+### J'-IO-linkedhelper + J'-IO-api. Resolucion posterior
 
-Ambos nodos son multi-tenant (`adapters[]` en linkedhelper, `api_keys[]` en io-api con `tenant_id` + `integration_id` por entry). El patrón single-resource pool de Model D' no aplica directo: cada entry tiene su propio secret y el match por `(resource_type, tenant_id)` no es único.
+Linkedhelper conserva su problema multi-adapter y requiere una decisión separada. IO.api ya no es
+multi-tenant dentro de un proceso: cada instancia pertenece al tenant inyectado por Orchestrator y
+posee un único `api_channel_id`/ICH.
 
-Antes de codear hay que decidir:
+Para IO.api se cerró el contrato:
 
-- Cómo se identifica cada adapter/integration en vault — ¿por `ilk` deterministico derivado del `adapter_id` / `integration_id`? ¿O `resource_type` con sub-key?
-- Cómo cambia el contrato HTTP de `io-api`: hoy `api_keys[]` se envía en CONFIG_SET con `token_ref`; Model D' lo movería completamente a vault, pero el cliente externo todavía necesita el plaintext.
-- Cómo se enumeran los adapters/integrations sin un CONFIG_SET con la lista — ¿por discovery via `vault_list(resource_type=...)`?
+- no hay listener, `api_keys[]`, webhooks ni secreto en `CONFIG_SET`;
+- Admin genera el bearer al ejecutar `externalize`, lo guarda dedicado al Edge y entrega el valor
+  una sola vez en la respuesta autorizada de `CONFIG_SET`;
+- el runtime recibe exclusivamente mensajes desde el Edge/ICH configurado.
 
-**Tareas posponidas hasta la charla:**
+Estado:
 
 - [ ] VA-J'-IO-linkedhelper-*. Migración multi-tenant.
-- [ ] VA-J'-IO-api-*. Migración multi-tenant + bearer auth contract.
+- [x] VA-J'-IO-api-*. Contrato instanciado + bearer de ingreso administrado por Edge/Admin.
 
 ### J'-10. Sy_vault tests
 
@@ -448,7 +451,7 @@ Antes de codear hay que decidir:
 
 ### J'-11. SDK cleanup
 
-- [ ] VA-J'-11a. Borrar paths del SDK que se quedaron sin callers: `build_node_secret_record`, `save_node_secret_record_with_root`, `NodeSecretWriteOptions`, `redacted_node_secret_record` si ya nadie los usa. **Bloqueado**: `io-api/auth.rs` todavía los usa para el flujo multi-tenant; sale cuando se cierre VA-J'-IO-api.
+- [ ] VA-J'-11a. Borrar paths del SDK que se quedaron sin callers: `build_node_secret_record`, `save_node_secret_record_with_root`, `NodeSecretWriteOptions`, `redacted_node_secret_record` si ya nadie los usa. El bloqueo de `io-api/auth.rs` fue eliminado junto con ese módulo; resta verificar los demás callers.
 - [ ] VA-J'-11b. Renombrar `VaultCaller` si hace falta para reflejar el modelo D' (`src_ilk` + `src_l2_name` siguen siendo lo que pasa al wire). **Decisión pendiente** — el nombre actual es claro, no urgente cambiarlo.
 - [x] VA-J'-11c. Borrar `NODE_SECRET_REDACTION_TOKEN` si dejan de usarse en payloads de responses HTTP. **Mantenido** — sigue siendo el token de redacción en respuestas de admin/architect/io-common para campos secretos en logs y payloads, eso NO es legacy de Phase J. Lo que sí se borró: `parse_vault_ref` y `resolve_vault_ref` legacy del SDK (ver VA-J'-1e).
 

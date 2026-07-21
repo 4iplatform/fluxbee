@@ -9,6 +9,7 @@ use crate::immediate_memory::{
     ConversationSummary, FunctionRunInput, ImmediateConversationMemory, ImmediateInteraction,
     ImmediateInteractionKind, ImmediateOperation, ImmediateRole,
 };
+use crate::text_payload::ModelContentPart;
 use crate::{AiSdkError, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,11 +43,26 @@ pub struct FunctionToolResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FunctionLoopItem {
-    SystemText { content: String },
-    UserText { content: String },
-    UserContentParts { content: Vec<Value> },
-    AssistantText { content: String },
-    ToolResult { result: FunctionToolResult },
+    SystemText {
+        content: String,
+    },
+    UserText {
+        content: String,
+    },
+    UserContentParts {
+        content: Vec<ModelContentPart>,
+    },
+    AssistantText {
+        content: String,
+    },
+    AssistantToolCalls {
+        #[serde(default)]
+        content: Option<String>,
+        calls: Vec<FunctionToolCall>,
+    },
+    ToolResult {
+        result: FunctionToolResult,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,7 +208,12 @@ impl FunctionCallingRunner {
                 });
             }
 
-            let results = dispatch_tool_calls(tools, response.tool_calls).await;
+            let tool_calls = response.tool_calls;
+            items.push(FunctionLoopItem::AssistantToolCalls {
+                content: response.assistant_text,
+                calls: tool_calls.clone(),
+            });
+            let results = dispatch_tool_calls(tools, tool_calls).await;
             for result in results {
                 items.push(FunctionLoopItem::ToolResult { result });
             }
@@ -627,8 +648,14 @@ mod tests {
         let input = FunctionRunInput {
             current_user_message: "fallback".to_string(),
             current_user_parts: Some(vec![
-                json!({"type":"input_text","text":"hola"}),
-                json!({"type":"input_image","image_url":"data:image/png;base64,AAA"}),
+                ModelContentPart::Text {
+                    text: "hola".to_string(),
+                },
+                ModelContentPart::Image {
+                    media_type: "image/png".to_string(),
+                    data_base64: "AAA".to_string(),
+                    detail: None,
+                },
             ]),
             immediate_memory: None,
         };

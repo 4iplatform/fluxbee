@@ -334,7 +334,7 @@ mod tests {
         };
         assert_eq!(msg.meta.src_ilk, None);
         assert_no_legacy_context_src_ilk(&msg);
-        assert_eq!(msg.meta.ich.as_deref(), Some("slack://T"));
+        assert_eq!(msg.meta.ich.as_deref(), Some("slack://T:C"));
         assert_no_legacy_context_ich(&msg);
         let stats = p.stats();
         assert_eq!(stats.identity_lookup_misses, 1);
@@ -363,7 +363,7 @@ mod tests {
             panic!("unexpected outcome: {o:?}");
         };
         assert_eq!(msg.meta.thread_id, expected_thread_id);
-        assert_eq!(msg.meta.ich.as_deref(), Some("slack://T"));
+        assert_eq!(msg.meta.ich.as_deref(), Some("slack://T:C"));
         let legacy_context_thread_id = msg
             .meta
             .context
@@ -396,7 +396,7 @@ mod tests {
             panic!("unexpected outcome: {o:?}");
         };
         assert_eq!(msg.meta.thread_id, expected_thread_id);
-        assert_eq!(msg.meta.ich.as_deref(), Some("slack://T"));
+        assert_eq!(msg.meta.ich.as_deref(), Some("slack://T:C123"));
         let legacy_context_thread_id = msg
             .meta
             .context
@@ -434,7 +434,7 @@ mod tests {
             .as_deref()
             .is_some_and(|value| value.starts_with("ilk:mock:")));
         assert_no_legacy_context_src_ilk(&msg);
-        assert_eq!(msg.meta.ich.as_deref(), Some("slack://T123"));
+        assert_eq!(msg.meta.ich.as_deref(), Some("slack://T123:C789"));
         assert_no_legacy_context_ich(&msg);
 
         let rt = msg
@@ -538,7 +538,7 @@ mod tests {
         };
         assert_eq!(msg.meta.src_ilk.as_deref(), Some("ilk:provisional:test"));
         assert_no_legacy_context_src_ilk(&msg);
-        assert_eq!(msg.meta.ich.as_deref(), Some("slack://T"));
+        assert_eq!(msg.meta.ich.as_deref(), Some("slack://T:C"));
         assert_no_legacy_context_ich(&msg);
         let stats = p.stats();
         assert_eq!(stats.identity_lookup_misses, 1);
@@ -571,7 +571,7 @@ mod tests {
         };
         assert_eq!(msg.meta.src_ilk, None);
         assert_no_legacy_context_src_ilk(&msg);
-        assert_eq!(msg.meta.ich.as_deref(), Some("slack://T"));
+        assert_eq!(msg.meta.ich.as_deref(), Some("slack://T:C"));
         assert_no_legacy_context_ich(&msg);
         let stats = p.stats();
         assert_eq!(stats.identity_lookup_misses, 1);
@@ -607,7 +607,7 @@ mod tests {
         };
         assert_eq!(msg.meta.src_ilk.as_deref(), Some("ilk:hit:test"));
         assert_no_legacy_context_src_ilk(&msg);
-        assert_eq!(msg.meta.ich.as_deref(), Some("slack://T"));
+        assert_eq!(msg.meta.ich.as_deref(), Some("slack://T:C"));
         assert_no_legacy_context_ich(&msg);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let stats = p.stats();

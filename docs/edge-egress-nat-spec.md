@@ -1,7 +1,14 @@
 # Fluxbee — Edge Egress NAT Specification
 
-**Status:** v1.0 — implementation-ready
+**Status:** v1.0 — IMPLEMENTED (was "implementation-ready")
 **Date:** 2026-06-08
+
+> **Actualización 2026-07-21:** the Mode A egress role is BUILT in `src/bin/sy_orchestrator.rs`:
+> `HiveRole::{Motherbee,Worker,Egress}`, the `add_egress_hive_flow` provisioning path, and the
+> self-contained `table inet fluxbee_egress` NAT/forward reconciliation (sysctl + nftables, applied
+> and drift-reconciled) all exist. A single-NIC guard also shipped: `resolve_egress_nat_config`
+> rejects `wan_iface == lan_iface`. The design-tense wording below (§6 "currently binary", §6.5
+> "does not exist today", the §12 unchecked checklist) predates this and no longer reflects the code.
 **Audience:** `SY.orchestrator` developer, deployment tooling, Ops/SRE
 **Supersedes:** `edge-egress-nat-spec.md` v0.1 (2026-05-27)
 **Related:** `edge-control-protocol.md`, `01-arquitectura.md`, `05-conectividad.md`, `07-operaciones.md`, `sy_orchestrator.rs`
@@ -242,7 +249,7 @@ struct SystemNodesSection {
 
 ## 6. `SY.orchestrator` Changes
 
-The orchestrator is currently **binary** (`motherbee` | `worker`). Lines 503–509 reject anything else. Supporting `egress` extends it to ternary plus a new network-reconciliation step. This section maps every required change against the current code.
+The orchestrator now recognizes four roles (`motherbee` | `worker` | `egress` | `ingress`) via `HiveRole`; anything else is rejected at the startup gate. This section originally mapped the change from the earlier binary (`motherbee` | `worker`) orchestrator; that work is now implemented.
 
 ### 6.1 Role recognition
 
