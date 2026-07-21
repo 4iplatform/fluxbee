@@ -23,7 +23,15 @@ pub const DEFAULT_HIVE_OPENAI_MODEL: &str = "gpt-5.5";
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AiProvider {
+    // Canonical wire form is "openai" — it MUST match as_str()/Display/FromStr, the
+    // `providers.openai` config key, and the spoke hive.yaml the orchestrator GENERATES
+    // (sy_orchestrator writes `default_provider: openai` via Display). The bare
+    // rename_all=snake_case would expect "open_ai", which broke fresh installs (the
+    // packaged hive.yaml.example says `openai`) and would break every generated spoke
+    // yaml. Caught by the vault cold-boot VM E2E on 2026-07-21. "open_ai" stays as a
+    // read-only alias for anything written during the brief window it was the wire form.
     #[default]
+    #[serde(rename = "openai", alias = "open_ai")]
     OpenAi,
     Anthropic,
 }
@@ -1470,6 +1478,36 @@ mod tests {
 
     use super::*;
     use crate::function_calling::FunctionToolResult;
+
+    #[test]
+    fn ai_provider_wire_form_is_openai_and_matches_display() {
+        // Contract: the serde wire form MUST be "openai" — the same string as
+        // as_str()/Display/FromStr, the `providers.openai` key, and the spoke
+        // hive.yaml the orchestrator generates via Display. A bare
+        // rename_all=snake_case ("open_ai") broke fresh installs (packaged
+        // hive.yaml.example says `openai`) and every generated spoke yaml —
+        // caught by the vault cold-boot VM E2E 2026-07-21.
+        let cfg: HiveAiConfig =
+            serde_yaml::from_str("default_provider: openai\n").expect("parse openai");
+        assert_eq!(cfg.default_provider, AiProvider::OpenAi);
+        // Read-only alias for anything written while "open_ai" was the wire form.
+        let cfg: HiveAiConfig =
+            serde_yaml::from_str("default_provider: open_ai\n").expect("parse open_ai alias");
+        assert_eq!(cfg.default_provider, AiProvider::OpenAi);
+        let cfg: HiveAiConfig =
+            serde_yaml::from_str("default_provider: anthropic\n").expect("parse anthropic");
+        assert_eq!(cfg.default_provider, AiProvider::Anthropic);
+        // Serialize == Display == as_str for both variants (roundtrip stability).
+        for provider in [AiProvider::OpenAi, AiProvider::Anthropic] {
+            let wire = serde_json::to_value(provider).expect("serialize");
+            assert_eq!(wire, json!(provider.as_str()));
+            assert_eq!(provider.to_string(), provider.as_str());
+            assert_eq!(
+                provider.as_str().parse::<AiProvider>().expect("FromStr"),
+                provider
+            );
+        }
+    }
 
     fn spawn_single_response_server(
         response_body: Value,
