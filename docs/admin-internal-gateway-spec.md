@@ -1,8 +1,4 @@
-
-
-
-
-||AQ# SY.admin Internal Command Gateway (Unified Spec)
+# SY.admin Internal Command Gateway (Unified Spec)
 
 **Status:** v1.2-draft  
 **Date:** 2026-03-14  
