@@ -19557,13 +19557,16 @@ async fn vault_put_spoke_ssh_key(
 ) -> Result<String, OrchestratorError> {
     let admin_target = teardown_admin_target();
     let key = format!("ssh:{hive_id}");
+    // Pool secret (NO owner_node): the root-tenant pool is readable by SY system callers and by
+    // the admin, so an operator can retrieve the recovery key via the admin API during a
+    // break-glass. Scoping it to owner_node=SY.orchestrator makes it orchestrator-ILK-only —
+    // even the admin/operator gets UNAUTHORIZED — which defeats the whole recovery purpose.
     let params = serde_json::json!({
         "key": key,
         "value": { "private_key": priv_pem, "format": "openssh" },
         "metadata": {
             "resource_type": "ssh",
             "tenant_id": fluxbee_sdk::DEFAULT_ROOT_TENANT_ID,
-            "owner_node": "SY.orchestrator",
             "description": format!("per-spoke recovery ssh key for {hive_id}"),
         }
     });

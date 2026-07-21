@@ -66,7 +66,9 @@ Default (`ssh_access:"revoke"`, or field absent) = **exactly today's behavior** 
    the same `cfg(test)`/`cfg(not(test))` split so unit tests never hit the mesh. Real impl:
    `orchestrator_admin_command(action="vault_put", target=Some(PRIMARY_HIVE_ID),
    params={key:"ssh:<hive_id>", value:{private_key:priv_pem}, metadata:{resource_type:"ssh",
-   tenant_id:DEFAULT_ROOT_TENANT_ID, owner_node:"SY.orchestrator", description:...}})`.
+   tenant_id:DEFAULT_ROOT_TENANT_ID, description:...}})` — a POOL secret (NO owner_node) so the
+   admin/operator can retrieve it; owner_node=SY.orchestrator scopes it orchestrator-ILK-only
+   (even admin gets UNAUTHORIZED). Key MUST be `ssh:<hive_id>` (colon) — validate_key rejects `/`.
    **NEVER `tracing` the params** (private key).
 4. New helper `finalize_spoke_key_persist(address, mb_key_path, mb_pub, user, hive_id, state)`
    used by all three flows, invoked **in place of** the plain controls+revoke when the flag is
@@ -91,9 +93,10 @@ Default (`ssh_access:"revoke"`, or field absent) = **exactly today's behavior** 
 
 ## Open sub-decisions (confirm before build)
 
-- **owner_node scoping**: `SY.orchestrator` (least-priv; only the orchestrator ILK + the admin
-  can read it) vs. omit (root-tenant pool like `storage_postgres_url`, any SY caller reads it).
-  Recommend `SY.orchestrator` unless a non-orchestrator recovery reader is intended.
+- **owner_node scoping**: RESOLVED — omit owner_node (root-tenant POOL secret, like
+  `storage_postgres_url`). Lab-verified that owner_node=SY.orchestrator makes the secret
+  orchestrator-ILK-only (admin/operator read = UNAUTHORIZED), which defeats recovery; a pool
+  secret is readable by SY system callers + the admin, so an operator can break-glass it.
 - **Wire `reconcile_hive_tls_material` to use the per-spoke key** (read `ssh:<hive_id>` from the
   vault instead of `motherbee.key`) as a **fast-follow** — that closes the latent contradiction
   and makes standing key access actually usable by the orchestrator. Separate change.
