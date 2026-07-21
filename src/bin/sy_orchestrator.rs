@@ -2329,6 +2329,23 @@ async fn handle_admin(
                                             serde_json::json!(revoke.sudoers_removed),
                                         );
                                     }
+                                } else if result.get("status").and_then(|v| v.as_str())
+                                    != Some("ok")
+                                    && ssh_access != SshAccess::KeyOnlyPersist
+                                {
+                                    // Transient failure: the B-2 revoke was skipped so the retry
+                                    // stays key-first — but the motherbee key + sudoers remain on
+                                    // the box. Surface it so an abandoned box is not silently open.
+                                    if let Some(obj) = result.as_object_mut() {
+                                        obj.insert(
+                                            "ssh_bootstrap_open".to_string(),
+                                            serde_json::json!(true),
+                                        );
+                                        obj.insert(
+                                            "revoke_skipped_transient".to_string(),
+                                            serde_json::json!(true),
+                                        );
+                                    }
                                 }
                                 result
                             }
@@ -2377,6 +2394,22 @@ async fn handle_admin(
                                             obj.insert(
                                                 "sudoers_removed".to_string(),
                                                 serde_json::json!(revoke.sudoers_removed),
+                                            );
+                                        }
+                                    } else if result.get("status").and_then(|v| v.as_str())
+                                        != Some("ok")
+                                        && ssh_access != SshAccess::KeyOnlyPersist
+                                    {
+                                        // Transient failure: revoke skipped so the retry stays
+                                        // key-first; motherbee key + sudoers remain on the box.
+                                        if let Some(obj) = result.as_object_mut() {
+                                            obj.insert(
+                                                "ssh_bootstrap_open".to_string(),
+                                                serde_json::json!(true),
+                                            );
+                                            obj.insert(
+                                                "revoke_skipped_transient".to_string(),
+                                                serde_json::json!(true),
                                             );
                                         }
                                     }
@@ -2428,6 +2461,21 @@ async fn handle_admin(
                                     obj.insert(
                                         "sudoers_removed".to_string(),
                                         serde_json::json!(revoke.sudoers_removed),
+                                    );
+                                }
+                            } else if result.get("status").and_then(|v| v.as_str()) != Some("ok")
+                                && ssh_access != SshAccess::KeyOnlyPersist
+                            {
+                                // Transient failure: revoke skipped so the retry stays key-first;
+                                // motherbee key + sudoers remain on the box. Surface it.
+                                if let Some(obj) = result.as_object_mut() {
+                                    obj.insert(
+                                        "ssh_bootstrap_open".to_string(),
+                                        serde_json::json!(true),
+                                    );
+                                    obj.insert(
+                                        "revoke_skipped_transient".to_string(),
+                                        serde_json::json!(true),
                                     );
                                 }
                             }
@@ -19380,6 +19428,14 @@ fn resolve_add_hive_ssh_creds(
                     .into(),
             );
         }
+        // Reject passphrase-protected keys: the non-interactive bootstrap has no way to supply a
+        // passphrase, so an encrypted key would hang/fail opaquely mid-bootstrap. Fail here.
+        if key.contains("ENCRYPTED") {
+            return Err(
+                "add_hive: 'ssh_key' must be an UNENCRYPTED private key (a passphrase cannot be supplied during non-interactive bootstrap)"
+                    .into(),
+            );
+        }
     }
     Ok(BootstrapCreds {
         user,
@@ -20173,8 +20229,15 @@ fn seed_motherbee_key_over_operator_key(
         format!("{operator_priv_pem}\n")
     };
     let result = (|| -> Result<(), OrchestratorError> {
-        fs::write(&key_path, &pem)?;
-        let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
+        // Create the key file 0600 atomically (no umask window), mirroring askpass_script.
+        {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&key_path)?;
+            f.write_all(pem.as_bytes())?;
+        }
         apply_remote_unrestricted_authorized_key_with_key(address, &key_path, mb_pub_key, user)
     })();
     let _ = fs::remove_dir_all(&dir);
@@ -20540,6 +20603,7 @@ fn is_transient_ssh_error(message: &str) -> bool {
     lower.contains("connection refused")
         || lower.contains("connection reset")
         || lower.contains("connection closed")
+        || lower.contains("lost connection") // scp/ssh mid-transfer drop
         || lower.contains("connect to host") // "ssh: connect to host <h> port 22: ..."
         || lower.contains("connection timed out")
         || lower.contains("operation timed out")
@@ -20562,7 +20626,8 @@ fn retry_transient_ssh<T>(
                 if attempt >= SSH_TRANSIENT_RETRIES || !is_transient_ssh_error(&msg) {
                     return Err(err);
                 }
-                let delay = SSH_TRANSIENT_BASE_DELAY_MS.saturating_mul(1u64 << (attempt - 1));
+                let delay =
+                    SSH_TRANSIENT_BASE_DELAY_MS.saturating_mul(1u64 << (attempt - 1).min(16));
                 tracing::warn!(op = %label, attempt, delay_ms = delay, error = %msg, "transient ssh failure; retrying");
                 std::thread::sleep(Duration::from_millis(delay));
                 attempt += 1;
@@ -20606,6 +20671,8 @@ fn ssh_with_key(
             .arg("-o")
             .arg("IdentitiesOnly=yes")
             .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
             .arg("PreferredAuthentications=publickey")
             .arg("-o")
             .arg("PasswordAuthentication=no")
@@ -20635,6 +20702,8 @@ fn ssh_with_key_output(
             .arg(key_path)
             .arg("-o")
             .arg("IdentitiesOnly=yes")
+            .arg("-o")
+            .arg("BatchMode=yes")
             .arg("-o")
             .arg("PreferredAuthentications=publickey")
             .arg("-o")
@@ -20666,6 +20735,8 @@ fn scp_with_key(
             .arg(key_path)
             .arg("-o")
             .arg("IdentitiesOnly=yes")
+            .arg("-o")
+            .arg("BatchMode=yes")
             .arg("-o")
             .arg("PreferredAuthentications=publickey")
             .arg("-o")
@@ -20723,6 +20794,8 @@ fn write_remote_file(
             .arg(key_path)
             .arg("-o")
             .arg("IdentitiesOnly=yes")
+            .arg("-o")
+            .arg("BatchMode=yes")
             .arg("-o")
             .arg("PreferredAuthentications=publickey")
             .arg("-o")
