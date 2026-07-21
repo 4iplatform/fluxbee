@@ -5017,6 +5017,13 @@ fn authorize_cloud_relay(
     if caller == expected {
         return Ok(());
     }
+    // The primary orchestrator persists per-spoke recovery SSH keys during add_hive
+    // (ssh_access=key_only_persist) via vault_put. It is a trusted system singleton on the
+    // primary hive, co-resident with admin — allow it, but ONLY for vault_put (never the other
+    // Fluxbee Cloud provisioning relay actions create_tenant / run_node).
+    if action == "vault_put" && caller == format!("SY.orchestrator@{admin_hive}") {
+        return Ok(());
+    }
     Err(format!(
         "only {expected} may relay '{action}' over the mesh (Fluxbee Cloud provisioning gate); caller={caller}"
     ))
@@ -13698,9 +13705,22 @@ mod tests {
             assert!(
                 authorize_cloud_relay(Some("AI.worker@motherbee"), action, "motherbee").is_err()
             );
+            // The primary orchestrator may relay ONLY vault_put (per-spoke recovery key during
+            // add_hive); it is denied the other exposed actions (create_tenant / run_node).
+            if *action == "vault_put" {
+                assert!(
+                    authorize_cloud_relay(Some("SY.orchestrator@motherbee"), action, "motherbee")
+                        .is_ok()
+                );
+            } else {
+                assert!(
+                    authorize_cloud_relay(Some("SY.orchestrator@motherbee"), action, "motherbee")
+                        .is_err()
+                );
+            }
+            // A spoke orchestrator is never allowed, even for vault_put.
             assert!(
-                authorize_cloud_relay(Some("SY.orchestrator@motherbee"), action, "motherbee")
-                    .is_err()
+                authorize_cloud_relay(Some("SY.orchestrator@worker1"), action, "motherbee").is_err()
             );
         }
     }
