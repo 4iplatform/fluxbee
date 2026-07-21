@@ -51,7 +51,7 @@ use fluxbee_sdk::blob::{BlobConfig, BlobRef, BlobToolkit};
 use fluxbee_sdk::payload::TextV1Payload;
 use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest,
-    MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
+    is_system_kind, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::rpc::{AdminCommandRequest, OperationalRouteProfile, RouterDispatcher};
 use fluxbee_sdk::{
@@ -6757,7 +6757,7 @@ async fn handle_architect_system_message(
     let sender = state.rpc.sender_snapshot();
 
     // Section E gate — protected actions must come from the allowlist.
-    if msg.meta.msg_type == SYSTEM_KIND {
+    if is_system_kind(&msg.meta.msg_type) {
         if let Some(action) = msg.meta.msg.as_deref() {
             if let Some(response_msg) = protected_architect_system_action_response(action) {
                 if !architect_origin_authorized(&state.hive_id, msg.routing.src_l2_name.as_deref())
@@ -6780,7 +6780,7 @@ async fn handle_architect_system_message(
     if try_handle_default_node_status(&sender, msg).await? {
         return Ok(true);
     }
-    if msg.meta.msg_type != SYSTEM_KIND {
+    if !is_system_kind(&msg.meta.msg_type) {
         return Ok(false);
     }
 

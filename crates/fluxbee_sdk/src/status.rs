@@ -2,8 +2,8 @@ use serde_json::json;
 
 use crate::node_client::NodeError;
 use crate::protocol::{
-    Destination, Message, Meta, Routing, MSG_NODE_STATUS_GET, MSG_NODE_STATUS_GET_RESPONSE,
-    SYSTEM_KIND,
+    is_system_kind, Destination, Message, Meta, Routing, MSG_NODE_STATUS_GET,
+    MSG_NODE_STATUS_GET_RESPONSE, SYSTEM_KIND,
 };
 use crate::split::NodeSender;
 
@@ -32,7 +32,7 @@ pub async fn try_handle_default_node_status(
     sender: &NodeSender,
     incoming: &Message,
 ) -> Result<bool, NodeError> {
-    if incoming.meta.msg_type != SYSTEM_KIND
+    if !is_system_kind(&incoming.meta.msg_type)
         || incoming.meta.msg.as_deref() != Some(MSG_NODE_STATUS_GET)
     {
         return Ok(false);

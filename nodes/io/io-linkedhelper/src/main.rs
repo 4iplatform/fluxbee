@@ -11,7 +11,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND};
+use fluxbee_sdk::protocol::{
+    is_system_kind, Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND,
+};
 use fluxbee_sdk::{
     compute_thread_id, resolve_identity_option_from_hive_id, try_handle_default_node_status,
     NodeConfig, NodeUuidMode, OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher,
@@ -834,7 +836,7 @@ async fn handle_io_control_plane_message(
     self_tenant_id: Option<&str>,
 ) -> Option<WireMessage> {
     let command = msg.meta.msg.as_deref().unwrap_or_default();
-    if msg.meta.msg_type != SYSTEM_KIND {
+    if !is_system_kind(&msg.meta.msg_type) {
         return None;
     }
 

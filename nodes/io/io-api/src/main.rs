@@ -129,7 +129,7 @@ struct PublicationSnapshot {
     updated_at_ms: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct PublicationRuntime {
     snapshot: PublicationSnapshot,
     active_channel_id: Option<String>,
@@ -137,6 +137,22 @@ struct PublicationRuntime {
     active_edge_node: Option<String>,
     active_entry_token: Option<String>,
     pending_entry_token: Option<String>,
+}
+
+// Manual Debug so the entry-token (a live bearer credential) is NEVER emitted in plaintext
+// via a `{:?}` log/format — only its presence is shown. (io.api hardening: latent log-leak.)
+impl std::fmt::Debug for PublicationRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |t: &Option<String>| if t.is_some() { "<redacted>" } else { "<none>" };
+        f.debug_struct("PublicationRuntime")
+            .field("snapshot", &self.snapshot)
+            .field("active_channel_id", &self.active_channel_id)
+            .field("active_ich", &self.active_ich)
+            .field("active_edge_node", &self.active_edge_node)
+            .field("active_entry_token", &redact(&self.active_entry_token))
+            .field("pending_entry_token", &redact(&self.pending_entry_token))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1180,7 +1196,7 @@ async fn handle_edge_request(state: &Arc<RuntimeState>, message: &Message) -> Va
             .and_then(|ingress| ingress.get("caller_identity"))
             .cloned(),
     };
-    let parsed = match parse_api_message_request(&message.payload, effective, &principal) {
+    let mut parsed = match parse_api_message_request(&message.payload, effective, &principal) {
         Ok(value) => value,
         Err(err) => return api_error(err.code, err.detail),
     };
@@ -1202,6 +1218,16 @@ async fn handle_edge_request(state: &Arc<RuntimeState>, message: &Message) -> Va
         }
         None => None,
     };
+    // #4 fail-closed for explicit subjects: resolve_explicit_subject / by_ilk validation above
+    // already fail CLOSED (an unresolvable subject returns api_error, never continues). Pin the
+    // resolved ILK onto identity_input.src_ilk_override so a BUFFERED turn is dispatched with the
+    // SAME ILK instead of being re-resolved by the relay-flush provisioner, which fails OPEN to a
+    // null src_ilk (provision.rs FluxbeeIdentityProvisioner::provision -> Ok(None)). Result: an
+    // explicit-subject turn can never reach a downstream node with a null subject. A message with
+    // NO explicit subject (resolved_subject == None) intentionally keeps the anonymous path.
+    if let Some(subject) = resolved_subject.as_ref() {
+        parsed.identity_input.src_ilk_override = Some(subject.src_ilk.clone());
+    }
     let dst_node = config::extract_runtime_dst_node(Some(effective));
     let response_ilk = resolved_subject
         .as_ref()
@@ -1346,6 +1372,17 @@ fn api_error(code: &str, detail: impl Into<String>) -> Value {
     })
 }
 
+/// Validate a by_ilk explicit subject: the supplied ILK must exist and belong to THIS
+/// IO.api instance's tenant. Cross-tenant subjects are rejected here.
+///
+/// DESIGN DECISION (audit residual #2, ratified 2026-07-21): there is intentionally NO
+/// `ilk_type` gate — a bearer holder may present ANY same-tenant ILK as the subject,
+/// including an agent/system ILK (the by_data path forces ilk_type=human, by_ilk does not).
+/// This is safe ONLY under the standing constraint that NO downstream consumer treats the
+/// forwarded `src_ilk` as an authenticated principal (it is a routing/attribution hint, and
+/// is inert as an authority today). If a downstream node ever begins trusting `src_ilk` as a
+/// principal (e.g. for vault/memory authorization), this gate MUST be revisited (add an
+/// ilk_type allowlist) BEFORE that lands. Tenant isolation is the load-bearing boundary here.
 fn validate_explicit_subject_ilk(
     hive_id: &str,
     tenant_id: &str,
@@ -1389,7 +1426,27 @@ async fn resolve_explicit_subject(
                 registration_status: Some(resolved.ilk.registration_status),
             });
         }
-        Ok(None) => {}
+        Ok(None) => {
+            // #3 replica-lag guard: the identity SHM snapshot on a REPLICA hive can
+            // transiently MISS a subject this process already resolved+provisioned. Before
+            // re-provisioning, consult the local resolver cache: a hit means this is a
+            // stale-SHM false-miss, not a genuine first contact, so reuse the known ILK
+            // instead of firing a fresh ILK_PROVISION RPC on every repeat. Downstream
+            // behavior is deliberately identical to the fresh-provision path below
+            // (registration_status = "temporary" so the by_data multi-turn Frontdesk handoff
+            // still fires); ILK_REGISTER is idempotent (sy_identity: same-tenant re-register
+            // rewrites to the same "complete" state, deterministic canonical_ilk_id, no
+            // duplicate ILK), so any resulting re-handoff is a no-op at the identity layer.
+            // The io-api router loop is sequential (single recv().await consumer), so there
+            // is no in-process concurrency to single-flight; and EDGE-H4 keeps public IO.api
+            // instances off replica workers, so this path is a defensive backstop.
+            if let Ok(Some(cached_ilk)) = state.identity.lookup(input) {
+                return Ok(ResolvedExplicitSubject {
+                    src_ilk: cached_ilk,
+                    registration_status: Some("temporary".to_string()),
+                });
+            }
+        }
         Err(err) => {
             return Err(ApiIngressError::new(
                 "identity_unavailable",

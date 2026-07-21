@@ -18,7 +18,8 @@ use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE,
     MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
     MSG_EDGE_PUBLISH_BLOB, MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB,
-    MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
+    is_system_kind, MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_TTL_EXCEEDED, MSG_UNREACHABLE,
+    SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, is_node_config_get_message, is_node_config_set_message,
@@ -439,10 +440,22 @@ async fn apply_open_url(
         let row: EndpointRow = serde_json::from_value(msg.payload.clone())
             .map_err(|err| format!("invalid EDGE_OPEN_URL payload: {err}"))?;
         validate_endpoint_row_for_open(&row)?;
-        let (ich, entry) = row_to_entry(row);
+        let (ich, mut entry) = row_to_entry(row);
         let mut guard = registry
             .write()
             .map_err(|_| "registry lock poisoned".to_string())?;
+        // Grace-window bearer rotation (io.api residual #1): if this ich already had a live
+        // shared secret, keep it valid for a grace period so a mid-flight external client is
+        // NOT 401'd the instant the token rotates. The incoming entry arrives with secret=None
+        // (admin ships only secret_ref; resolve_secrets fetches the NEW value right after this),
+        // so we stash the OUTGOING value as the previous/grace secret here. If the new value
+        // turns out identical (idempotent re-open), previous==current and the grace is a no-op.
+        if entry.auth_mode == AuthMode::SharedSecret {
+            if let Some(old_secret) = guard.get(&ich).and_then(|old| old.secret.clone()) {
+                entry.previous_secret = Some(old_secret);
+                entry.previous_secret_expires_at_ms = Some(now_epoch_ms() + SHARED_SECRET_GRACE_MS);
+            }
+        }
         guard.insert(ich.clone(), entry);
         let count = guard.len();
         Ok((ich, count))
@@ -1240,6 +1253,14 @@ struct EndpointEntry {
     secret: Option<String>,
     /// Vault key to (re-)fetch `secret` from — the durable, disk-safe form.
     secret_ref: Option<String>,
+    /// Grace-window bearer rotation (io.api edge-publication residual #1): when a channel's
+    /// shared secret is rotated (a re-`EDGE_OPEN_URL` for an existing ich lands a DIFFERENT
+    /// value from vault), the PREVIOUS secret stays valid until `previous_secret_expires_at_ms`
+    /// so a live external client is not hard-cut with a 401 the instant the token rotates. It
+    /// is a credential: RAM-only, NEVER persisted (like `secret`); the grace is simply lost on
+    /// an edge restart (rare, and the client re-auths with the current token then).
+    previous_secret: Option<String>,
+    previous_secret_expires_at_ms: Option<u64>,
     methods: Option<Vec<String>>,
     #[allow(dead_code)]
     tenant_id: Option<String>,
@@ -1261,6 +1282,10 @@ fn row_to_entry(row: EndpointRow) -> (String, EndpointEntry) {
                 .secret_ref
                 .map(|secret_ref| secret_ref.trim().to_string())
                 .filter(|secret_ref| !secret_ref.is_empty()),
+            // A freshly-parsed row has no grace secret; apply_open_url carries the outgoing
+            // one forward when it replaces a live entry.
+            previous_secret: None,
+            previous_secret_expires_at_ms: None,
             methods: row.methods,
             tenant_id: row
                 .tenant_id
@@ -1856,12 +1881,8 @@ async fn invoke(state: Arc<FrontendState>, ich: String, extra: String, req: Requ
     match entry.auth_mode {
         AuthMode::Public => {}
         AuthMode::SharedSecret => {
-            let ok = entry
-                .secret
-                .as_deref()
-                .map(|expected| bearer_matches(&headers, expected))
-                .unwrap_or(false);
-            if !ok {
+            // Accept the current secret, or a not-yet-expired previous one (rotation grace).
+            if !shared_secret_bearer_ok(&entry, &headers, now_epoch_ms()) {
                 return http_error(
                     StatusCode::UNAUTHORIZED,
                     "UNAUTHORIZED",
@@ -1961,7 +1982,7 @@ async fn invoke(state: Arc<FrontendState>, ich: String, extra: String, req: Requ
             // the router's own SYSTEM_KIND UNREACHABLE/TTL frames on this trace_id,
             // so they arrive as Ok(reply). Detect them before treating the reply as
             // a handler response.
-            if reply.meta.msg_type == SYSTEM_KIND
+            if is_system_kind(&reply.meta.msg_type)
                 && matches!(
                     reply.meta.msg.as_deref(),
                     Some(MSG_UNREACHABLE) | Some(MSG_TTL_EXCEEDED)
@@ -2039,6 +2060,44 @@ fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
         })
         .map(|token| token.trim() == expected)
         .unwrap_or(false)
+}
+
+/// How long a rotated shared-secret bearer stays accepted after a NEW secret lands, so a
+/// live external client is not hard-cut with a 401 the instant the channel token rotates
+/// (io.api edge-publication residual #1 — bearer rotation). RAM-only, best-effort.
+const SHARED_SECRET_GRACE_MS: u64 = 10 * 60 * 1000; // 10 minutes
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// A shared-secret entry authorizes the request iff its bearer matches the CURRENT secret,
+/// or a not-yet-expired PREVIOUS secret (the rotation grace window). The previous secret is
+/// only ever set for a brief window right after a rotation, so this widens acceptance for
+/// minutes, not indefinitely — and only to the immediately-prior token, never an arbitrary one.
+fn shared_secret_bearer_ok(entry: &EndpointEntry, headers: &HeaderMap, now_ms: u64) -> bool {
+    // Reject empty secrets outright: an empty configured/rotated secret must NEVER authorize an
+    // empty bearer (defensive — a vault value of {"secret":""} would otherwise open the channel
+    // to `Authorization: Bearer `). Applies to both the current and the grace (previous) secret.
+    if entry
+        .secret
+        .as_deref()
+        .filter(|current| !current.is_empty())
+        .is_some_and(|current| bearer_matches(headers, current))
+    {
+        return true;
+    }
+    matches!(
+        (
+            entry.previous_secret.as_deref(),
+            entry.previous_secret_expires_at_ms,
+        ),
+        (Some(prev), Some(expiry))
+            if !prev.is_empty() && now_ms < expiry && bearer_matches(headers, prev)
+    )
 }
 
 /// Forward ONLY allowlisted request headers inward (§7.5/M2, fail-closed). Any header not
@@ -2124,6 +2183,8 @@ mod tests {
                 auth_mode: AuthMode::Public,
                 secret: None,
                 secret_ref: None,
+                previous_secret: None,
+                previous_secret_expires_at_ms: None,
                 methods: None,
                 tenant_id: None,
             },
@@ -2136,6 +2197,8 @@ mod tests {
                 auth_mode: AuthMode::SharedSecret,
                 secret: Some("s3cr3t".into()),
                 secret_ref: Some("edge_channel_secret:ich:sec".into()),
+                previous_secret: None,
+                previous_secret_expires_at_ms: None,
                 methods: None,
                 tenant_id: None,
             },
@@ -2342,6 +2405,58 @@ mod tests {
         lower.insert("authorization", "bearer s3cr3t".parse().unwrap());
         assert!(bearer_matches(&lower, "s3cr3t"));
         assert!(!bearer_matches(&HeaderMap::new(), "s3cr3t"));
+    }
+
+    #[test]
+    fn shared_secret_grace_window_accepts_previous_until_expiry() {
+        // io.api residual #1: after a bearer rotation the PREVIOUS secret stays valid until
+        // its expiry, so a live client is not hard-cut; after expiry only the current works.
+        let entry = EndpointEntry {
+            owner_l2_name: "IO.b@h".into(),
+            inbound_family: "user".into(),
+            auth_mode: AuthMode::SharedSecret,
+            secret: Some("new-token".into()),
+            secret_ref: Some("edge_channel_secret:ich:sec".into()),
+            previous_secret: Some("old-token".into()),
+            previous_secret_expires_at_ms: Some(1_000),
+            methods: None,
+            tenant_id: None,
+        };
+        let with = |bearer: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("authorization", format!("Bearer {bearer}").parse().unwrap());
+            h
+        };
+
+        // Current token: always accepted (before and after the grace expiry).
+        assert!(shared_secret_bearer_ok(&entry, &with("new-token"), 500));
+        assert!(shared_secret_bearer_ok(&entry, &with("new-token"), 5_000));
+        // Previous token: accepted while now < expiry, rejected once expired.
+        assert!(shared_secret_bearer_ok(&entry, &with("old-token"), 999));
+        assert!(!shared_secret_bearer_ok(&entry, &with("old-token"), 1_000));
+        assert!(!shared_secret_bearer_ok(&entry, &with("old-token"), 5_000));
+        // An unrelated token is never accepted.
+        assert!(!shared_secret_bearer_ok(&entry, &with("bogus"), 500));
+
+        // With no previous secret, only the current one authorizes.
+        let no_prev = EndpointEntry {
+            previous_secret: None,
+            previous_secret_expires_at_ms: None,
+            ..entry.clone()
+        };
+        assert!(shared_secret_bearer_ok(&no_prev, &with("new-token"), 500));
+        assert!(!shared_secret_bearer_ok(&no_prev, &with("old-token"), 500));
+
+        // An EMPTY secret (current or previous) never authorizes an empty bearer.
+        let empty = EndpointEntry {
+            secret: Some(String::new()),
+            previous_secret: Some(String::new()),
+            previous_secret_expires_at_ms: Some(1_000),
+            ..entry.clone()
+        };
+        let mut empty_bearer = HeaderMap::new();
+        empty_bearer.insert("authorization", "Bearer ".parse().unwrap());
+        assert!(!shared_secret_bearer_ok(&empty, &empty_bearer, 500));
     }
 
     #[test]

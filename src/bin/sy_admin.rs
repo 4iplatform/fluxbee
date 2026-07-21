@@ -34,7 +34,7 @@ use fluxbee_sdk::protocol::{
     MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
     MSG_EDGE_PUBLISH_BLOB, MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB,
     MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_NODE_STATUS_GET, MSG_TTL_EXCEEDED, MSG_UNREACHABLE,
-    MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL, SYSTEM_KIND,
+    is_system_kind, MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, classify_admin_action, classify_system_message,
@@ -2734,7 +2734,7 @@ async fn handle_system_command(
     client: &Arc<RouterDispatcher>,
     msg: &Message,
 ) -> Result<(), AdminError> {
-    if msg.meta.msg_type != SYSTEM_KIND {
+    if !is_system_kind(&msg.meta.msg_type) {
         return Ok(());
     }
     let Some(command) = msg.meta.msg.as_deref() else {
@@ -12917,7 +12917,7 @@ async fn send_system_request_with_meta(
         )
         .await?;
 
-    if msg.meta.msg_type != SYSTEM_KIND {
+    if !is_system_kind(&msg.meta.msg_type) {
         return Err(format!(
             "invalid response type: expected={} got={}",
             SYSTEM_KIND, msg.meta.msg_type

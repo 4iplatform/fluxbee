@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest,
-    MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
+    is_system_kind, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, managed_node_config_path, try_handle_default_node_status,
@@ -3417,7 +3417,7 @@ async fn main() -> Result<(), IdentityError> {
                 };
                 let sender = dispatcher.sender_snapshot();
 
-                if msg.meta.msg_type != SYSTEM_KIND {
+                if !is_system_kind(&msg.meta.msg_type) {
                     continue;
                 }
 

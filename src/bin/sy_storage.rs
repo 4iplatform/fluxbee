@@ -19,7 +19,7 @@ use fluxbee_sdk::nats::{
 };
 use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretInterest,
-    MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
+    is_system_kind, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, managed_node_config_path, managed_node_name,
@@ -2967,7 +2967,7 @@ async fn process_router_message(
     if try_handle_default_node_status(sender, msg).await? {
         return Ok(());
     }
-    if msg.meta.msg_type != SYSTEM_KIND {
+    if !is_system_kind(&msg.meta.msg_type) {
         return Ok(());
     }
     let Some(command) = msg.meta.msg.as_deref() else {

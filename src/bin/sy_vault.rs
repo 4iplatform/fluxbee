@@ -12,7 +12,7 @@ use chrono::Utc;
 use fluxbee_sdk::identity::list_ilks_from_hive_config;
 use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretOp,
-    MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL, SYSTEM_KIND,
+    is_system_kind, MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
@@ -271,7 +271,7 @@ async fn main() -> Result<(), VaultError> {
         if try_handle_default_node_status(&sender, &msg).await? {
             continue;
         }
-        if msg.meta.msg_type != SYSTEM_KIND {
+        if !is_system_kind(&msg.meta.msg_type) {
             continue;
         }
         let action = msg.meta.msg.as_deref().unwrap_or_default();
@@ -1046,11 +1046,21 @@ impl VaultStore {
 
     fn list(&self, filter: VaultFilter, caller: &Caller) -> VaultResult<Vec<VaultSecretSummary>> {
         let limit = filter.limit.unwrap_or(200).clamp(1, 1000) as usize;
+        // Order most-recently-WRITTEN first so the consumer-resolution path (VaultClient
+        // ::resolve_resource -> list_then_get_first, which takes the FIRST match) selects
+        // the freshest secret when several share the same (resource_type, tenant, ilk) — the
+        // VA-J'-2e "most-recent-pool-wins" contract (resolve_resource's doc-comment promises
+        // "most recent"). The prior `ORDER BY key` returned the alphabetically-first key.
+        // We sort by `updated_at` (not `created_at`): `created_at` is frozen at INSERT and is
+        // NOT bumped by a same-key re-put/rotate, so ordering by it would let a just-rewritten
+        // key lose to an older-created sibling; `updated_at` is set on every write, giving true
+        // last-write-wins. `created_at` then `key` are deterministic tiebreaks. Both columns are
+        // NOT NULL and RFC3339, so lexical DESC == chronological DESC.
         let mut stmt = self.conn.prepare(
             r#"
             SELECT key, metadata_json, version, access_count, last_accessed_at
               FROM secrets
-             ORDER BY key
+             ORDER BY updated_at DESC, created_at DESC, key ASC
             "#,
         )?;
         let mut rows = stmt.query([])?;
@@ -1750,5 +1760,265 @@ mod tests {
 
         let err = validate_metadata(&metadata).expect_err("sys is not a tenant id");
         assert!(matches!(err, VaultError::InvalidRequest(_)));
+    }
+
+    // ---- VA-H storage/crypto suite (VA-H1..H7 + VA-J'-10c) ------------------
+    // Deterministic unit coverage for the on-disk VaultStore: key validation,
+    // encrypt/decrypt, wrong-key isolation, put/get, rotation, rollback, audit
+    // rows, and the most-recent-pool-wins ordering. (VA-H8 is a diag binary/script,
+    // not a unit test.) Each test uses a fresh temp SQLite DB and a fixed 32-byte
+    // master key so results never depend on the machine key or wall clock.
+
+    fn open_test_store(master: [u8; 32]) -> (VaultStore, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("fluxbee-vault-h-{}", Uuid::new_v4().simple()));
+        let db = dir.join("vault.db");
+        let store = VaultStore::open(&db, &master).expect("open vault store");
+        (store, dir)
+    }
+
+    fn cleanup(dir: PathBuf) {
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn admin_caller() -> Caller {
+        caller(Some("ilk:admin"), Some(fluxbee_sdk::DEFAULT_ROOT_TENANT_ID), Some("system"))
+    }
+
+    #[test]
+    fn va_h1_validate_key_accepts_valid_rejects_invalid() {
+        for k in [
+            "pg:root:pool",
+            "openai:tnt-1:pool",
+            "ssh:worker-1",
+            "a",
+            "abc_123-x:y",
+        ] {
+            assert!(validate_key(k).is_ok(), "{k} should be valid");
+        }
+        for bad in [
+            "",            // empty
+            "Key",         // uppercase prefix
+            ":leading",    // symbol prefix
+            "-leading",    // symbol prefix
+            "has space",   // space
+            "UPPER",       // uppercase
+            "slash/here",  // '/' not allowed (this is why ssh:<id> is used, not ssh/<id>)
+            "dot.here",    // '.' not allowed
+        ] {
+            assert!(
+                matches!(validate_key(bad), Err(VaultError::InvalidRequest(_))),
+                "{bad:?} should be rejected"
+            );
+        }
+        assert!(validate_key(&"a".repeat(257)).is_err(), "over-256 key rejected");
+    }
+
+    #[test]
+    fn va_h2_encrypt_decrypt_roundtrip() {
+        let (store, dir) = open_test_store([7u8; 32]);
+        let value = json!({"url":"postgres://u:p@h:5432","n":42,"nested":{"a":[1,2,3]}});
+        let (nonce, ciphertext) = store.encrypt_value(&value).expect("encrypt");
+        assert_eq!(nonce.len(), 12, "GCM nonce is 12 bytes");
+        assert_ne!(
+            ciphertext,
+            serde_json::to_vec(&value).unwrap(),
+            "ciphertext must not equal plaintext"
+        );
+        let back = store.decrypt_value(&nonce, &ciphertext).expect("decrypt");
+        assert_eq!(back, value);
+        cleanup(dir);
+    }
+
+    #[test]
+    fn va_h3_wrong_master_key_cannot_decrypt() {
+        let (store_a, dir_a) = open_test_store([1u8; 32]);
+        let value = json!({"secret":"do-not-leak"});
+        let (nonce, ciphertext) = store_a.encrypt_value(&value).expect("encrypt with key A");
+        let (store_b, dir_b) = open_test_store([2u8; 32]);
+        assert!(
+            matches!(
+                store_b.decrypt_value(&nonce, &ciphertext),
+                Err(VaultError::Encryption)
+            ),
+            "a store with a different master key must NOT decrypt (AEAD auth fails)"
+        );
+        cleanup(dir_a);
+        cleanup(dir_b);
+    }
+
+    #[test]
+    fn va_h4_put_get_roundtrip_and_idempotent_noop() {
+        let (mut store, dir) = open_test_store([9u8; 32]);
+        let c = admin_caller();
+        let value = json!({"api_key":"sk-test"});
+        let (version, changed) = store
+            .put("pg:root:pool", value.clone(), metadata("tnt:root", None), &c)
+            .expect("put");
+        assert_eq!(version, 1);
+        assert!(changed, "first put is a change");
+        let rec = store.get_record("pg:root:pool").expect("get").expect("row");
+        let stored = store
+            .decrypt_value(&rec.current_nonce, &rec.current_ciphertext)
+            .expect("decrypt stored");
+        assert_eq!(stored, value);
+        // Identical re-put is a no-op: version unchanged, changed=false.
+        let (v2, changed2) = store
+            .put("pg:root:pool", value, metadata("tnt:root", None), &c)
+            .expect("re-put");
+        assert_eq!(v2, 1);
+        assert!(!changed2, "identical re-put must be a no-op");
+        cleanup(dir);
+    }
+
+    #[test]
+    fn va_h5_rotate_keeps_previous_and_bumps_version() {
+        let (mut store, dir) = open_test_store([3u8; 32]);
+        let c = admin_caller();
+        store
+            .put("pg:root:pool", json!({"v":1}), metadata("tnt:root", None), &c)
+            .expect("put v1");
+        let res = store
+            .rotate("pg:root:pool", json!({"v":2}), &c)
+            .expect("rotate");
+        assert_eq!(res.current_version, 2);
+        assert_eq!(res.previous_version, 1);
+        let rec = store.get_record("pg:root:pool").unwrap().unwrap();
+        assert_eq!(
+            store
+                .decrypt_value(&rec.current_nonce, &rec.current_ciphertext)
+                .unwrap(),
+            json!({"v":2}),
+            "current is the rotated value"
+        );
+        let pn = rec.previous_nonce.expect("previous nonce retained");
+        let pc = rec.previous_ciphertext.expect("previous ciphertext retained");
+        assert_eq!(
+            store.decrypt_value(&pn, &pc).unwrap(),
+            json!({"v":1}),
+            "previous version is recoverable"
+        );
+        cleanup(dir);
+    }
+
+    #[test]
+    fn va_h6_rollback_restores_previous_and_errors_without_previous() {
+        let (mut store, dir) = open_test_store([4u8; 32]);
+        let c = admin_caller();
+        store
+            .put("pg:root:pool", json!({"v":1}), metadata("tnt:root", None), &c)
+            .expect("put v1");
+        // No previous version yet -> rollback is rejected, not a silent no-op.
+        assert!(matches!(
+            store.rollback("pg:root:pool", &c),
+            Err(VaultError::NoPreviousVersion)
+        ));
+        store
+            .rotate("pg:root:pool", json!({"v":2}), &c)
+            .expect("rotate to v2");
+        let rb = store.rollback("pg:root:pool", &c).expect("rollback");
+        assert_eq!(rb.current_version, 1, "rollback restores the previous version number");
+        let rec = store.get_record("pg:root:pool").unwrap().unwrap();
+        assert_eq!(
+            store
+                .decrypt_value(&rec.current_nonce, &rec.current_ciphertext)
+                .unwrap(),
+            json!({"v":1}),
+            "rollback restores the previous value"
+        );
+        cleanup(dir);
+    }
+
+    #[test]
+    fn va_h7_audit_log_records_operations_and_caller() {
+        let (mut store, dir) = open_test_store([5u8; 32]);
+        let c = admin_caller();
+        store
+            .put("pg:root:pool", json!({"v":1}), metadata("tnt:root", None), &c)
+            .expect("put");
+        store
+            .rotate("pg:root:pool", json!({"v":2}), &c)
+            .expect("rotate");
+        let success_rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE operation IN (?1, ?2) AND result = 'success'",
+                params![MSG_VAULT_PUT, MSG_VAULT_ROTATE],
+                |row| row.get(0),
+            )
+            .expect("count audit rows");
+        assert_eq!(success_rows, 2, "put + rotate each write a success audit row");
+        let recorded_ilk: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT caller_ilk FROM audit_log WHERE operation = ?1 LIMIT 1",
+                params![MSG_VAULT_PUT],
+                |row| row.get(0),
+            )
+            .expect("read audit caller");
+        assert_eq!(recorded_ilk.as_deref(), Some("ilk:admin"));
+        cleanup(dir);
+    }
+
+    #[test]
+    fn va_j10c_list_returns_most_recently_written_pool_secret_first() {
+        // The consumer-resolution contract (VaultClient::resolve_resource takes the FIRST
+        // list match) requires list() to return the most-recently-WRITTEN secret first when
+        // several share (resource_type, tenant, ilk=null). Guards ORDER BY updated_at DESC:
+        // ordering by created_at alone would let a re-put/rotated key lose to an older-created
+        // sibling (created_at is frozen at INSERT); ordering by key returns the wrong one too.
+        let (mut store, dir) = open_test_store([6u8; 32]);
+        let c = admin_caller();
+        let set_times = |store: &VaultStore, key: &str, created: &str, updated: &str| {
+            store
+                .conn
+                .execute(
+                    "UPDATE secrets SET created_at = ?2, updated_at = ?3 WHERE key = ?1",
+                    params![key, created, updated],
+                )
+                .unwrap();
+        };
+        let pool_filter = || VaultFilter {
+            resource_type: Some("postgres".to_string()),
+            tenant_id: Some("tnt:root".to_string()),
+            ilk: Some(String::new()), // pool only (no owner ILK)
+            ..Default::default()
+        };
+        let first_key = |store: &VaultStore| {
+            store
+                .list(pool_filter(), &c)
+                .expect("list")
+                .first()
+                .map(|s| s.key.clone())
+        };
+
+        store
+            .put("pg:root:pool-a", json!({"which":"a"}), metadata("tnt:root", None), &c)
+            .expect("put a");
+        store
+            .put("pg:root:pool-b", json!({"which":"b"}), metadata("tnt:root", None), &c)
+            .expect("put b");
+        // pool-a created+written older, pool-b newer. pool-b is alphabetically AFTER pool-a,
+        // so ORDER BY key would wrongly return pool-a.
+        set_times(&store, "pg:root:pool-a", "2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00");
+        set_times(&store, "pg:root:pool-b", "2026-07-21T00:00:00+00:00", "2026-07-21T00:00:00+00:00");
+        assert_eq!(
+            first_key(&store).as_deref(),
+            Some("pg:root:pool-b"),
+            "the newer sibling must win"
+        );
+
+        // Re-put pool-a with a NEW value: created_at stays 2020 but the write bumps updated_at.
+        // Pin it explicitly to the newest time; most-recently-WRITTEN (pool-a) must now win even
+        // though it was created FIRST — this is the created_at-vs-updated_at distinction.
+        store
+            .put("pg:root:pool-a", json!({"which":"a2"}), metadata("tnt:root", None), &c)
+            .expect("re-put a");
+        set_times(&store, "pg:root:pool-a", "2020-01-01T00:00:00+00:00", "2027-01-01T00:00:00+00:00");
+        assert_eq!(
+            first_key(&store).as_deref(),
+            Some("pg:root:pool-a"),
+            "the most-recently-WRITTEN secret must win, not the most-recently-created"
+        );
+        cleanup(dir);
     }
 }

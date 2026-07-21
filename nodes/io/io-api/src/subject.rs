@@ -173,6 +173,15 @@ pub(crate) fn parse_api_message_request(
         attributes.insert("request_metadata".to_string(), metadata);
     }
 
+    // Hardening: re-assert the node-controlled api_channel_id AFTER merging the caller-supplied
+    // subject.attributes, so a `subject.attributes.api_channel_id` can never clobber the routing/
+    // thread identity (copy_optional_subject_fields merges extra keys unfiltered). request_metadata
+    // is already node-last (inserted above, after the merge), so it needs no re-assert.
+    attributes.insert(
+        "api_channel_id".to_string(),
+        Value::String(api_channel_id.to_string()),
+    );
+
     let text_payload = TextV1Payload::new(text, vec![]).to_value().map_err(|err| {
         ApiIngressError::new(
             "invalid_payload",

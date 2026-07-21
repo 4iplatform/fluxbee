@@ -467,6 +467,20 @@ impl Message {
 
 pub const SYSTEM_KIND: &str = "system";
 
+/// Case-insensitive check that a message-kind string is the SYSTEM kind.
+///
+/// The router classifies control-plane traffic case-insensitively
+/// (`eq_ignore_ascii_case`, router `is_system_kind`), so nodes MUST agree:
+/// a case-sensitive `== SYSTEM_KIND` on the node side would silently drop an
+/// authorized "System"/"SYSTEM" frame that the router already authorized and
+/// forwarded (edge/ingress audit item #14 — a consistency/availability
+/// divergence, not an authz bypass; the router remains the authority gate).
+/// Every node-side system-kind classification MUST go through this helper.
+#[inline]
+pub fn is_system_kind(msg_type: &str) -> bool {
+    msg_type.eq_ignore_ascii_case(SYSTEM_KIND)
+}
+
 pub const MSG_HELLO: &str = "HELLO";
 pub const MSG_ANNOUNCE: &str = "ANNOUNCE";
 pub const MSG_UNREACHABLE: &str = "UNREACHABLE";

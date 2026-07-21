@@ -482,6 +482,47 @@ mod tests {
     }
 
     #[test]
+    fn config_control_denies_non_sy_origins_and_admits_orchestrator() {
+        // Lock-in for the CONFIG_SET/CONFIG_GET origin-authz gate (the io.api revamp
+        // moved these into node_control_actions). Only the singleton motherbee Admin and
+        // an SY.orchestrator may drive node config; any non-SY origin (a compromised or
+        // rogue application node on the same VPN) MUST be denied at the delivery gate,
+        // and the router remains the authority regardless of msg_type letter-case.
+        let hive = "worker-220";
+        for action in ["CONFIG_GET", "CONFIG_SET"] {
+            // Admitted authorities.
+            assert!(
+                authority(action, Some("SY.admin@motherbee"), hive),
+                "{action}: SY.admin@motherbee must be admitted"
+            );
+            assert!(
+                authority(action, Some("SY.orchestrator@worker-220"), hive),
+                "{action}: SY.orchestrator@<hive> must be admitted"
+            );
+            // Denied: non-SY application origins on the same VPN.
+            for rogue in [
+                Some("IO.api@worker-220"),
+                Some("AI.evil@motherbee"),
+                Some("IO.slack@worker-220"),
+                Some("WF.orch.diag@worker-220"),
+                Some("SY.admin@worker-220"), // non-motherbee Admin is NOT node_control authority
+                None,                        // unstamped / transitively-vouched origin
+            ] {
+                assert!(
+                    !authority(action, rogue, hive),
+                    "{action}: origin {rogue:?} must be denied"
+                );
+                // The OPA-backed production gate must agree with the Rust table.
+                assert_eq!(
+                    authorize_system(action, rogue, hive),
+                    authority(action, rogue, hive),
+                    "{action}: authorize_system disagrees with authority for {rogue:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn protected_set_is_the_25_actions() {
         for action in [
             "SYSTEM_UPDATE",

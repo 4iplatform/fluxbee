@@ -63,8 +63,8 @@ use tokio::time::Instant as TokioInstant;
 use uuid::Uuid;
 
 use crate::protocol::{
-    build_system_message, Destination, Message, TtlExceededPayload, UnreachablePayload,
-    MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
+    build_system_message, is_system_kind, Destination, Message, TtlExceededPayload,
+    UnreachablePayload, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
 #[cfg(test)]
 use crate::protocol::{Meta, Routing};
@@ -1329,7 +1329,7 @@ pub fn build_timer_system_request_with_target(
 }
 
 pub fn is_timer_response_message(msg: &Message) -> bool {
-    msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_TIMER_RESPONSE)
+    is_system_kind(&msg.meta.msg_type) && msg.meta.msg.as_deref() == Some(MSG_TIMER_RESPONSE)
 }
 
 pub fn parse_timer_response(msg: &Message) -> Result<TimerResponse, TimerClientError> {
@@ -1369,7 +1369,7 @@ pub fn parse_timer_help_response(msg: &Message) -> Result<TimerHelpDescriptor, T
 }
 
 pub fn parse_timer_fired_event(msg: &Message) -> Result<FiredEvent, TimerClientError> {
-    if msg.meta.msg_type != SYSTEM_KIND || msg.meta.msg.as_deref() != Some(MSG_TIMER_FIRED) {
+    if !is_system_kind(&msg.meta.msg_type) || msg.meta.msg.as_deref() != Some(MSG_TIMER_FIRED) {
         return Err(TimerClientError::InvalidResponse(
             "message is not TIMER_FIRED".to_string(),
         ));
@@ -1394,7 +1394,7 @@ pub fn timer_response_service_error(response: &TimerResponse) -> Option<TimerCli
 }
 
 pub fn map_timer_transport_message(msg: &Message) -> Option<TimerClientError> {
-    if msg.meta.msg_type != SYSTEM_KIND {
+    if !is_system_kind(&msg.meta.msg_type) {
         return None;
     }
     match msg.meta.msg.as_deref() {

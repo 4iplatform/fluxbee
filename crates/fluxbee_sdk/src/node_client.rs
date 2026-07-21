@@ -10,7 +10,7 @@ use tokio::time::{self, Duration};
 use uuid::Uuid;
 
 use crate::protocol::{
-    build_hello, Message, NodeAnnouncePayload, NodeHelloPayload, MSG_ANNOUNCE, SYSTEM_KIND,
+    build_hello, is_system_kind, Message, NodeAnnouncePayload, NodeHelloPayload, MSG_ANNOUNCE,
 };
 use crate::socket::connection::{read_frame, write_frame};
 use crate::split::{ConnectionInfo, ConnectionState, NodeReceiver, NodeSender};
@@ -243,7 +243,7 @@ async fn perform_handshake(
         .await?
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "announce"))?;
     let msg: Message = serde_json::from_slice(&announce)?;
-    if msg.meta.msg_type != SYSTEM_KIND || msg.meta.msg.as_deref() != Some(MSG_ANNOUNCE) {
+    if !is_system_kind(&msg.meta.msg_type) || msg.meta.msg.as_deref() != Some(MSG_ANNOUNCE) {
         return Err(NodeError::HandshakeFailed("expected ANNOUNCE".to_string()));
     }
     Ok(serde_json::from_value(msg.payload)?)

@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use fluxbee_sdk::protocol::{
     ConfigChangedPayload, Destination, Message, Meta, Routing, MSG_CONFIG_CHANGED, MSG_CONFIG_GET,
-    MSG_CONFIG_SET, SYSTEM_KIND,
+    is_system_kind, MSG_CONFIG_SET, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, parse_node_config_request, try_handle_default_node_status,
@@ -197,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     continue;
                 }
-                if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_CONFIG_GET) {
+                if is_system_kind(&msg.meta.msg_type) && msg.meta.msg.as_deref() == Some(MSG_CONFIG_GET) {
                     if let Err(err) = handle_node_config_get(
                         &sender,
                         &msg,
@@ -209,7 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     continue;
                 }
-                if msg.meta.msg_type == SYSTEM_KIND && msg.meta.msg.as_deref() == Some(MSG_CONFIG_SET) {
+                if is_system_kind(&msg.meta.msg_type) && msg.meta.msg.as_deref() == Some(MSG_CONFIG_SET) {
                     if let Err(err) = handle_node_config_set(
                         &sender,
                         &msg,
@@ -223,7 +223,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     continue;
                 }
-                if msg.meta.msg_type != SYSTEM_KIND || msg.meta.msg.as_deref() != Some(MSG_CONFIG_CHANGED) {
+                if !is_system_kind(&msg.meta.msg_type) || msg.meta.msg.as_deref() != Some(MSG_CONFIG_CHANGED) {
                     continue;
                 }
                 let payload_value = msg.payload.clone();
