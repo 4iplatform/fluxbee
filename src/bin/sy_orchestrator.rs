@@ -801,6 +801,14 @@ async fn main() -> Result<(), OrchestratorError> {
 
     bootstrap_local(&state, &socket_dir).await?;
 
+    // Off the boot path: catch up mesh TLS material on existing hives (legacy pre-mTLS, or a
+    // partial add_hive). key_only_persist hives are reached via their per-spoke recovery key in
+    // the vault; this needs the Arc<State>, so it is spawned here rather than inside bootstrap_local.
+    if state.is_motherbee {
+        let reconcile_state = Arc::clone(&state);
+        tokio::spawn(async move { reconcile_hive_tls_material(reconcile_state).await });
+    }
+
     let node_config = NodeConfig {
         name: "SY.orchestrator".to_string(),
         router_socket: socket_dir.clone(),
@@ -1215,13 +1223,80 @@ fn distribute_hive_identity_key_inner(
 /// a manual cert step). Idempotent (skips hives that already hold a cert; a CA
 /// rotation is a separate forced op) and best-effort (logged). Runs blocking, so
 /// the caller should spawn it off the boot path.
-fn reconcile_hive_tls_material() {
+/// A per-spoke recovery private key materialized to a 0600 scratch file for the duration of a
+/// reconcile probe. The scratch dir is removed on drop.
+struct SpokeRecoveryKey {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl Drop for SpokeRecoveryKey {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Read a hive's per-spoke recovery SSH private key (`ssh:<hive_id>`, a root-tenant POOL secret
+/// written by `add_hive ssh_access=key_only_persist`) from SY.vault and materialize it to a
+/// 0600 scratch file. Returns None when the hive has no such key (revoke-mode / legacy hive) or
+/// the vault read fails — the caller then falls back to the motherbee bootstrap key.
+#[cfg(not(test))]
+async fn read_spoke_recovery_key_to_temp(
+    state: &OrchestratorState,
+    hive_id: &str,
+) -> Option<SpokeRecoveryKey> {
+    let admin_target = teardown_admin_target();
+    let resp = orchestrator_admin_command(
+        state,
+        AdminCommandRequest {
+            admin_target: &admin_target,
+            action: "vault_get",
+            target: Some(PRIMARY_HIVE_ID),
+            params: serde_json::json!({ "key": format!("ssh:{hive_id}") }),
+            request_id: None,
+            timeout: Duration::from_secs(15),
+        },
+    )
+    .await
+    .ok()?;
+    if resp.status != "ok" {
+        return None;
+    }
+    let priv_pem = resp
+        .payload
+        .get("value")
+        .and_then(|v| v.get("private_key"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let dir = spoke_key_scratch_dir("recover");
+    fs::create_dir_all(&dir).ok()?;
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    let path = dir.join("id");
+    fs::write(&path, &priv_pem).ok()?;
+    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    Some(SpokeRecoveryKey { dir, path })
+}
+
+#[cfg(test)]
+async fn read_spoke_recovery_key_to_temp(
+    _state: &OrchestratorState,
+    _hive_id: &str,
+) -> Option<SpokeRecoveryKey> {
+    None
+}
+
+/// Off-boot-path catch-up of mesh TLS material on existing hives (legacy pre-mTLS, or a hive
+/// whose add_hive TLS push was partial). The motherbee bootstrap key is revoked on every joined
+/// hive, so for a `key_only_persist` hive this reads that hive's per-spoke recovery key from the
+/// vault to reach it (closing the reconcile↔revoke contradiction); revoke-mode / legacy hives
+/// fall back to the motherbee key (which only still works for a pre-revoke/legacy hive). A hive
+/// we cannot reach is left alone, and only an actual successful distribution is counted.
+async fn reconcile_hive_tls_material(state: Arc<OrchestratorState>) {
     let root = hives_root();
-    let entries = match fs::read_dir(&root) {
-        Ok(e) => e,
-        Err(_) => return,
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
     };
-    let key_path = PathBuf::from(MOTHERBEE_SSH_KEY_PATH);
     let mut filled = 0u32;
     for entry in entries.flatten() {
         let hive_id = entry.file_name().to_string_lossy().to_string();
@@ -1234,26 +1309,59 @@ fn reconcile_hive_tls_material() {
         if info.get("status").and_then(|v| v.as_str()) != Some("connected") {
             continue;
         }
-        let address = info.get("address").and_then(|v| v.as_str()).unwrap_or("");
-        let user = info.get("ssh_user").and_then(|v| v.as_str()).unwrap_or("");
+        let address = info
+            .get("address")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let user = info
+            .get("ssh_user")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if address.is_empty() || user.is_empty() {
             continue;
         }
-        // Idempotent: skip a hive that already holds a cert.
-        if ssh_with_key(
-            address,
-            &key_path,
-            &sudo_wrap(&format!(
-                "test -f '/var/lib/fluxbee/tls/{hive_id}/cert.crt'"
-            )),
-            user,
-        )
-        .is_ok()
-        {
-            continue;
+        let recovery = read_spoke_recovery_key_to_temp(&state, &hive_id).await;
+        if recovery.is_some() {
+            tracing::info!(
+                hive_id = %hive_id,
+                "reconcile: reaching key_only_persist hive via its per-spoke recovery key from the vault"
+            );
         }
-        distribute_hive_tls(address, &key_path, user, &hive_id);
-        filled += 1;
+        let key_path = recovery
+            .as_ref()
+            .map(|r| r.path.clone())
+            .unwrap_or_else(|| PathBuf::from(MOTHERBEE_SSH_KEY_PATH));
+        let hive_c = hive_id.clone();
+        // The SSH calls are blocking; run them off the async worker.
+        let distributed = tokio::task::spawn_blocking(move || {
+            // Idempotent + reachability probe: a hive that already holds a cert (or that we
+            // cannot ssh into at all) is left alone rather than pushed blindly.
+            if ssh_with_key(
+                &address,
+                &key_path,
+                &sudo_wrap(&format!("test -f '/var/lib/fluxbee/tls/{hive_c}/cert.crt'")),
+                &user,
+            )
+            .is_ok()
+            {
+                return false;
+            }
+            match distribute_hive_tls_inner(&address, &key_path, &user, &hive_c) {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!(hive_id = %hive_c, error = %err, "reconcile: failed to distribute mesh TLS material");
+                    false
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        drop(recovery); // remove the scratch private key
+        if distributed {
+            filled += 1;
+        }
     }
     if filled > 0 {
         tracing::info!(
@@ -1286,13 +1394,13 @@ async fn bootstrap_local(
         }
     }
 
-    // Motherbee is the mesh CA: ensure the CA + its own WAN-mTLS material exist
-    // before rt-gateway starts (the router loads certs at startup). Then, off the
-    // boot path, catch up TLS material for hives provisioned before mTLS existed.
+    // Motherbee is the mesh CA: ensure the CA + its own WAN-mTLS material exist before
+    // rt-gateway starts (the router loads certs at startup). The off-boot-path TLS catch-up for
+    // existing hives is spawned by the caller — it needs the Arc<State> to read per-spoke
+    // recovery keys from the vault.
     if state.is_motherbee {
         ensure_motherbee_ssh_key();
         ensure_motherbee_mesh_tls(&state.hive_id);
-        tokio::task::spawn_blocking(reconcile_hive_tls_material);
     }
 
     tracing::info!("starting rt-gateway");
@@ -4711,6 +4819,12 @@ fn resolve_egress_nat_config(eg: &EgressSection) -> Result<EgressNatConfig, Orch
     let lan_iface = require_field(eg.lan_iface.as_ref(), "egress.lan_iface")?.to_string();
     validate_iface_name(&wan_iface, "egress.wan_iface")?;
     validate_iface_name(&lan_iface, "egress.lan_iface")?;
+    if wan_iface == lan_iface {
+        return Err(format!(
+            "egress.wan_iface and egress.lan_iface must differ (both '{wan_iface}'): a single-NIC egress cannot NAT — the WAN egress and the LAN it masquerades would share one interface and never route. Provision a second interface (a separate vNIC/bridge) for the internal side."
+        )
+        .into());
+    }
     let edge_ip = match eg
         .edge_ip
         .as_ref()
@@ -20973,6 +21087,20 @@ mod tests {
     }
 
     #[test]
+    fn resolve_egress_nat_config_rejects_same_wan_and_lan_iface() {
+        // A single-NIC egress (wan_iface == lan_iface) passes iface-name validation but cannot
+        // NAT — reject it at request time instead of provisioning a silently dead egress.
+        let mut same = egress_section(true);
+        same.wan_iface = Some("eth0".to_string());
+        same.lan_iface = Some("eth0".to_string());
+        let err = resolve_egress_nat_config(&same)
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("must differ"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn resolve_egress_nat_config_requires_fields_and_blocks_ipv6() {
         let mut missing = egress_section(true);
         missing.lan_cidr = None;
@@ -21034,12 +21162,14 @@ mod tests {
         ] {
             let mut w = egress_section(true);
             w.wan_iface = Some(name.to_string());
+            w.lan_iface = Some("zz9".to_string()); // keep lan != wan (guarded separately)
             assert!(
                 resolve_egress_nat_config(&w).is_ok(),
                 "wan_iface should accept {name:?}"
             );
             let mut l = egress_section(true);
             l.lan_iface = Some(name.to_string());
+            l.wan_iface = Some("zz8".to_string()); // keep wan != lan (guarded separately)
             assert!(
                 resolve_egress_nat_config(&l).is_ok(),
                 "lan_iface should accept {name:?}"
