@@ -1,6 +1,6 @@
 # Node Config Control Plane Spec
 
-Status: draft  
+Status: implemented (the admin `control/config-get|config-set` wrappers are live routes in `src/bin/sy_admin.rs`)  
 Scope: non-`SY` nodes only (`AI.*`, `IO.*`, `WF.*`, future families outside core)
 
 ## 1. Goal
@@ -336,7 +336,7 @@ The existing generic transport path is:
 
 That path is enough for debug/manual use, but it is not the best public contract for `archi`.
 
-Recommended admin-facing wrappers:
+Admin-facing wrappers (BUILT — live routes in `src/bin/sy_admin.rs`):
 
 - `POST /hives/{hive}/nodes/{node_name}/control/config-get`
 - `POST /hives/{hive}/nodes/{node_name}/control/config-set`

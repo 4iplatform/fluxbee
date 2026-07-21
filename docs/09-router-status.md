@@ -3,6 +3,17 @@
 Checklist de cobertura **según spec v1.13**.  
 Objetivo: revisar punto por punto y marcar pendientes.
 
+> **Actualización 2026-07-21:** este checklist está congelado en la spec v1.13 y NO refleja tres
+> capas que ya están construidas en el router. Ver el código y las specs correspondientes:
+>
+> - **Capa SYSTEM de autoridad** OPA-backed: `authorize_system()` evalúa el `policy/system.wasm`
+>   baked, con la tabla Rust `authority()` como fallback shadow-verified (`src/router/system_policy.rs`;
+>   ver `04-routing.md` §8.7).
+> - **Publicación en el edge**: acciones protegidas `EDGE_OPEN_URL`/`EDGE_CLOSE_URL`/`EDGE_LIST_URLS`/
+>   `EDGE_PUBLISH_BLOB`/`EDGE_UNPUBLISH_BLOB` (autoridad `SY.admin@motherbee`).
+> - **WAN multi-hop (Option B)**: plano de reachability + `WAN_REACHABILITY_VOUCH` (autoridad
+>   `RT.gateway@motherbee`), commits `65a3ff0`/`101f2c3` (ver `edge-multihop-reachability-spec-v1.md`).
+
 ---
 
 ## 1. Routing local (intra‑isla)

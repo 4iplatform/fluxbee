@@ -435,12 +435,13 @@ smoke de producto ejecutar publish/expiry/unpublish desde un AI/IO real.
    semaphore in `invoke`, sheds fast at capacity), return-leg `UNREACHABLE` handling (**M4 — DONE**:
    fast 502, not a blocked timeout), scope down edge reachability (**M3 — partial**: router
    `vpn_allows_between` edge gate; per-handler owner-scope deferred to EDGE-05 Phase 2).
-7. Declare the cross-hive topology limit (H4): **adjacent-hub-or-same-hive only** (LSA is one WAN
-   hop); multi-hop relay deferred.
+7. Cross-hive topology (H4): **CLOSED** — multi-hop cross-hive relay is now built (`65a3ff0`, the
+   WAN reachability plane / Option B), so a spoke reaches a non-adjacent hive via the hub; the old
+   adjacent-hub-or-same-hive limit no longer applies.
 
 **Deferred by design:** the durable-binding shape decision (§12); edge-asks-vault token check;
 `IO.cloud` end-user-ilk subject authz (el bearer Cloud es autoridad alpha); validacion tenant por cada
-GET de artefacto (v1 empieza con link-capability); multi-hop cross-hive; JWT/ACME + public-zone
+GET de artefacto (v1 empieza con link-capability); ~~multi-hop cross-hive~~ (BUILT, `65a3ff0`); JWT/ACME + public-zone
 DNS (wildcard sidesteps); WS/SSE upgrade (501 stub only); the edge `config` subsystem (thread B) if
 not needed for the first proof.
 

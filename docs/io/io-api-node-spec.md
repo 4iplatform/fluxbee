@@ -332,10 +332,10 @@ The canonical helper is `scripts/deploy-io-api.sh`. It performs:
 
 No local `/schema` or HTTP port probe is valid for this runtime.
 
-Current Edge v6 placement is constrained by `EDGE-H4`: ingress forwarding resolves one WAN hop.
-An IO.api instance must therefore run in a hive directly adjacent to its configured ingress Edge.
-Publishing a worker instance behind motherbee is valid control-plane state, but requests return
-`HANDLER_UNREACHABLE` until that worker has direct ingress adjacency or WAN multihop is implemented.
+`EDGE-H4` is CLOSED: WAN multi-hop is implemented (`65a3ff0`, the WAN reachability plane / Option B),
+so ingress forwarding is no longer limited to one WAN hop. An IO.api instance need not be adjacent to
+its configured ingress Edge. Publishing a worker instance behind motherbee is valid and reachable —
+`POST /e/<ich>` returns HTTP 200 (was `HANDLER_UNREACHABLE`), the hub relaying via next-hop forwarding.
 
 Permanent removal is an ordered operation: apply `edge.publish=false`, stop the managed node with
 `DELETE /hives/{hive}/nodes/{node}`, wait until it is no longer router-visible, then call

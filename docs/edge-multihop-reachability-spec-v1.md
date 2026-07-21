@@ -1,6 +1,6 @@
 # WAN multi-hop reachability plane (Option B) — spec v1
 
-**Status:** design LOCKED (user-approved 2026-07-20), not yet built.
+**Status:** BUILT + tested + committed (`65a3ff0`, 2026-07-20); the OPA vouch follow-step is closed (`101f2c3`).
 **Closes:** EDGE-H4 (ingress→worker single WAN hop) for the star topology.
 **Related:** `edge-ingress-spec-v6.md` (H4), `docs/onworking COA/opa-dual.md`, `src/router/system_policy.rs`, `policy/system.rego`.
 
@@ -73,9 +73,9 @@ Separate three things that are conflated today: **data** (which node lives on wh
   for the data plane.
 
 Rust `system_policy` gains twin fallback fns (byte-identical, shadow-verified like `authority()`).
-The wasm recompile (`sy-opa-rules compile-file policy/system.rego <entrypoint> policy/system.wasm`,
-Linux-only Go tool on the build box) is a follow step; the Rust fallback is the immediate source of
-truth per OPA-dual.
+The wasm recompile is DONE (`101f2c3`): the vouch rule now lives in the baked `policy/system.wasm`
+and `wan_reachability_voucher_allowed` evaluates it via `authorize_system`, with the Rust fallback
+shadow-verified per OPA-dual.
 
 ### 2.3 The security invariant (non-negotiable)
 
