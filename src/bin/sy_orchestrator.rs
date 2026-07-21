@@ -2305,8 +2305,10 @@ async fn handle_admin(
                                 // key_only_persist: on any of its error paths we KEEP the
                                 // motherbee key as the recovery channel (the per-spoke private
                                 // key may have been discarded), so a failed join is never a strand.
+                                // Also skipped on a transient/retryable failure so the retry stays key-first.
                                 if result.get("status").and_then(|v| v.as_str()) != Some("ok")
                                     && ssh_access != SshAccess::KeyOnlyPersist
+                                    && !add_hive_result_is_transient(&result)
                                 {
                                     let revoke = best_effort_revoke_bootstrap(
                                         &address,
@@ -2352,9 +2354,11 @@ async fn handle_admin(
                                     .await;
                                     // Same failure tail as worker/egress: on a failed
                                     // ingress join, best-effort revoke the seeded key. Skipped for
-                                    // key_only_persist (keep the motherbee key as recovery).
+                                    // key_only_persist (keep the motherbee key as recovery), and on
+                                    // a transient/retryable failure so the retry stays key-first.
                                     if result.get("status").and_then(|v| v.as_str()) != Some("ok")
                                         && ssh_access != SshAccess::KeyOnlyPersist
+                                        && !add_hive_result_is_transient(&result)
                                     {
                                         let revoke = best_effort_revoke_bootstrap(
                                             &address,
@@ -2401,9 +2405,11 @@ async fn handle_admin(
                             // B-2: on a failed join, best-effort revoke the (possibly
                             // already-seeded) bootstrap SSH access and surface whether it
                             // may still be open (a retry re-seeds via the password channel).
-                            // Skipped for key_only_persist (keep the motherbee key as recovery).
+                            // Skipped for key_only_persist (keep the motherbee key as recovery), and
+                            // on a transient/retryable failure so the retry stays key-first.
                             if result.get("status").and_then(|v| v.as_str()) != Some("ok")
                                 && ssh_access != SshAccess::KeyOnlyPersist
+                                && !add_hive_result_is_transient(&result)
                             {
                                 let revoke = best_effort_revoke_bootstrap(
                                     &address,
@@ -17032,30 +17038,41 @@ async fn add_hive_flow(
             );
         }
         Err(key_err) => {
-            let password = match creds.password.as_deref() {
-                Some(p) => p,
-                None => {
-                    return ssh_bootstrap_error_payload(&format!(
-                        "key probe failed and no ssh_password supplied for password bootstrap: {key_err}"
-                    ));
+            // Seed the motherbee key so the rest of the bootstrap is key-first. Prefer an
+            // operator-supplied bootstrap KEY (cloud-image key-first — works even when the server
+            // ships PasswordAuthentication=no); else the ssh_password channel; else give up.
+            if let Some(seed_key) = creds.ssh_key.as_deref() {
+                tracing::warn!(target = address, error = %key_err, "key bootstrap channel unavailable; seeding motherbee key via operator ssh_key");
+                if let Err(err) = seed_motherbee_key_over_operator_key(
+                    address,
+                    seed_key,
+                    &pub_key,
+                    creds.user.as_str(),
+                ) {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "SSH_KEY_FAILED",
+                        "message": format!("failed to seed bootstrap key via operator ssh_key: {err}"),
+                    });
                 }
-            };
-            tracing::warn!(
-                target = address,
-                error = %key_err,
-                "key bootstrap channel unavailable; seeding key via password channel"
-            );
-            if let Err(err) = apply_remote_unrestricted_authorized_key_with_pass(
-                address,
-                &pub_key,
-                creds.user.as_str(),
-                password,
-            ) {
-                return serde_json::json!({
-                    "status": "error",
-                    "error_code": "SSH_KEY_FAILED",
-                    "message": format!("failed to seed bootstrap key via password channel: {err}"),
-                });
+            } else if let Some(password) = creds.password.as_deref() {
+                tracing::warn!(target = address, error = %key_err, "key bootstrap channel unavailable; seeding motherbee key via password channel");
+                if let Err(err) = apply_remote_unrestricted_authorized_key_with_pass(
+                    address,
+                    &pub_key,
+                    creds.user.as_str(),
+                    password,
+                ) {
+                    return serde_json::json!({
+                        "status": "error",
+                        "error_code": "SSH_KEY_FAILED",
+                        "message": format!("failed to seed bootstrap key via password channel: {err}"),
+                    });
+                }
+            } else {
+                return ssh_bootstrap_error_payload(&format!(
+                    "key probe failed and neither ssh_key nor ssh_password supplied for bootstrap: {key_err}"
+                ));
             }
         }
     }
@@ -17911,24 +17928,36 @@ async fn add_egress_hive_flow(
     match ssh_with_key(address, &key_path, "true", creds.user.as_str()) {
         Ok(()) => {}
         Err(key_err) => {
-            let password = match creds.password.as_deref() {
-                Some(p) => p,
-                None => {
-                    return ssh_bootstrap_error_payload(&format!(
-                        "key probe failed and no ssh_password supplied for password bootstrap: {key_err}"
-                    ));
+            // Prefer an operator-supplied bootstrap KEY (cloud-image key-first); else password;
+            // else give up.
+            if let Some(seed_key) = creds.ssh_key.as_deref() {
+                if let Err(err) = seed_motherbee_key_over_operator_key(
+                    address,
+                    seed_key,
+                    &pub_key,
+                    creds.user.as_str(),
+                ) {
+                    return err_payload(
+                        "SSH_KEY_FAILED",
+                        format!("failed to seed bootstrap key via operator ssh_key: {err}"),
+                    );
                 }
-            };
-            if let Err(err) = apply_remote_unrestricted_authorized_key_with_pass(
-                address,
-                &pub_key,
-                creds.user.as_str(),
-                password,
-            ) {
-                return err_payload(
-                    "SSH_KEY_FAILED",
-                    format!("failed to seed bootstrap key: {err}"),
-                );
+            } else if let Some(password) = creds.password.as_deref() {
+                if let Err(err) = apply_remote_unrestricted_authorized_key_with_pass(
+                    address,
+                    &pub_key,
+                    creds.user.as_str(),
+                    password,
+                ) {
+                    return err_payload(
+                        "SSH_KEY_FAILED",
+                        format!("failed to seed bootstrap key: {err}"),
+                    );
+                }
+            } else {
+                return ssh_bootstrap_error_payload(&format!(
+                    "key probe failed and neither ssh_key nor ssh_password supplied for bootstrap: {key_err}"
+                ));
             }
         }
     }
@@ -18488,21 +18517,32 @@ async fn add_ingress_hive_flow(
     match ssh_with_key(address, &key_path, "true", creds.user.as_str()) {
         Ok(()) => {}
         Err(key_err) => {
-            let password = match creds.password.as_deref() {
-                Some(p) => p,
-                None => {
+            // Prefer an operator-supplied bootstrap KEY (cloud-image key-first); else password;
+            // else give up.
+            if let Some(seed_key) = creds.ssh_key.as_deref() {
+                if let Err(err) = seed_motherbee_key_over_operator_key(
+                    address,
+                    seed_key,
+                    &pub_key,
+                    creds.user.as_str(),
+                ) {
                     return ssh_bootstrap_error_payload(&format!(
-                        "key probe failed and no ssh_password supplied for password bootstrap: {key_err}"
+                        "failed to seed bootstrap key via operator ssh_key: {err}"
                     ));
                 }
-            };
-            if let Err(err) = apply_remote_unrestricted_authorized_key_with_pass(
-                address,
-                &pub_key,
-                creds.user.as_str(),
-                password,
-            ) {
-                return ssh_bootstrap_error_payload(&err.to_string());
+            } else if let Some(password) = creds.password.as_deref() {
+                if let Err(err) = apply_remote_unrestricted_authorized_key_with_pass(
+                    address,
+                    &pub_key,
+                    creds.user.as_str(),
+                    password,
+                ) {
+                    return ssh_bootstrap_error_payload(&err.to_string());
+                }
+            } else {
+                return ssh_bootstrap_error_payload(&format!(
+                    "key probe failed and neither ssh_key nor ssh_password supplied for bootstrap: {key_err}"
+                ));
             }
         }
     }
@@ -19269,6 +19309,11 @@ fn resolve_add_hive_role(payload: &serde_json::Value) -> Result<HiveRole, Orches
 struct BootstrapCreds {
     user: String,
     password: Option<String>,
+    /// Optional operator-supplied bootstrap SSH PRIVATE key (PEM). When the motherbee key is not
+    /// yet seeded on the target, this key-first channel seeds it — so a stock cloud image (which
+    /// ships an authorized key via cloud-init and server password auth OFF) bootstraps without
+    /// requiring PasswordAuthentication=yes. Never logged or persisted.
+    ssh_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19320,7 +19365,27 @@ fn resolve_add_hive_ssh_creds(
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.to_string());
-    Ok(BootstrapCreds { user, password })
+    // ssh_key: an optional bootstrap PRIVATE key (PEM), kept verbatim (a key body must not be
+    // trimmed); only a whitespace-only value is treated as omitted. Sanity-check it looks like a
+    // PEM so a malformed blob fails here, not mid-bootstrap.
+    let ssh_key = payload
+        .get("ssh_key")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string());
+    if let Some(key) = ssh_key.as_deref() {
+        if !key.contains("-----BEGIN") || !key.contains("PRIVATE KEY") {
+            return Err(
+                "add_hive: 'ssh_key' must be a PEM private key (-----BEGIN ... PRIVATE KEY-----)"
+                    .into(),
+            );
+        }
+    }
+    Ok(BootstrapCreds {
+        user,
+        password,
+        ssh_key,
+    })
 }
 
 /// Parse the host-specific egress params from the `add_hive` payload. The
@@ -20041,12 +20106,11 @@ chmod 600 \"$auth_keys\"\n",
     Ok(())
 }
 
-fn apply_remote_unrestricted_authorized_key_with_pass(
-    address: &str,
-    pub_key: &str,
-    user: &str,
-    password: &str,
-) -> Result<(), OrchestratorError> {
+/// Build the remote `bash -lc` command that seeds `pub_key` (unrestricted) into the target
+/// user's authorized_keys (dedup by gate-path + key material, then append). Shared by the
+/// password and key seed channels so the seed stays byte-identical (the revoke greps this
+/// material back out, so drift between channels would break revoke).
+fn unrestricted_authorized_key_seed_cmd(pub_key: &str) -> Result<String, OrchestratorError> {
     let key_material = pub_key
         .split_whitespace()
         .nth(1)
@@ -20064,9 +20128,57 @@ chmod 600 ~/.ssh/authorized_keys\n",
         key_material = shell_single_quote(key_material),
         entry = shell_single_quote(pub_key),
     );
-    let cmd = format!("bash -lc '{}'", shell_single_quote(&script));
+    Ok(format!("bash -lc '{}'", shell_single_quote(&script)))
+}
+
+fn apply_remote_unrestricted_authorized_key_with_pass(
+    address: &str,
+    pub_key: &str,
+    user: &str,
+    password: &str,
+) -> Result<(), OrchestratorError> {
+    let cmd = unrestricted_authorized_key_seed_cmd(pub_key)?;
     ssh_with_pass_any(address, &cmd, user, password)?;
     Ok(())
+}
+
+fn apply_remote_unrestricted_authorized_key_with_key(
+    address: &str,
+    seed_key_path: &Path,
+    pub_key: &str,
+    user: &str,
+) -> Result<(), OrchestratorError> {
+    let cmd = unrestricted_authorized_key_seed_cmd(pub_key)?;
+    ssh_with_key(address, seed_key_path, &cmd, user)?;
+    Ok(())
+}
+
+/// (c) Seed the motherbee bootstrap pubkey onto a fresh target over an operator-supplied
+/// bootstrap PRIVATE key — the cloud-image key-first path (stock images ship an authorized key
+/// via cloud-init with server password auth OFF). Materializes the operator key to a 0600
+/// scratch, seeds, and ALWAYS removes the scratch (even on error).
+fn seed_motherbee_key_over_operator_key(
+    address: &str,
+    operator_priv_pem: &str,
+    mb_pub_key: &str,
+    user: &str,
+) -> Result<(), OrchestratorError> {
+    let dir = spoke_key_scratch_dir("bootstrap");
+    fs::create_dir_all(&dir)?;
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    let key_path = dir.join("id");
+    let pem = if operator_priv_pem.ends_with('\n') {
+        operator_priv_pem.to_string()
+    } else {
+        format!("{operator_priv_pem}\n")
+    };
+    let result = (|| -> Result<(), OrchestratorError> {
+        fs::write(&key_path, &pem)?;
+        let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
+        apply_remote_unrestricted_authorized_key_with_key(address, &key_path, mb_pub_key, user)
+    })();
+    let _ = fs::remove_dir_all(&dir);
+    result
 }
 
 /// SO-02: revoke the bootstrap SSH access at the end of a successful add_hive.
@@ -20331,27 +20443,29 @@ fn ssh_with_pass(
     user: &str,
     password: &str,
 ) -> Result<(), OrchestratorError> {
-    let askpass = askpass_script(password)?;
-    let mut cmd = Command::new("setsid");
-    cmd.arg("ssh")
-        .arg("-o")
-        .arg("PreferredAuthentications=password")
-        .arg("-o")
-        .arg("PubkeyAuthentication=no")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg(format!("{user}@{address}"))
-        .arg(command)
-        .env("SSH_ASKPASS", &askpass)
-        .env("SSH_ASKPASS_REQUIRE", "force")
-        .env("DISPLAY", "jsr");
-    let result = run_cmd(cmd, "ssh");
-    let _ = fs::remove_file(&askpass);
-    result
+    retry_transient_ssh("ssh(pass)", || {
+        let askpass = askpass_script(password)?;
+        let mut cmd = Command::new("setsid");
+        cmd.arg("ssh")
+            .arg("-o")
+            .arg("PreferredAuthentications=password")
+            .arg("-o")
+            .arg("PubkeyAuthentication=no")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg(format!("{user}@{address}"))
+            .arg(command)
+            .env("SSH_ASKPASS", &askpass)
+            .env("SSH_ASKPASS_REQUIRE", "force")
+            .env("DISPLAY", "jsr");
+        let result = run_cmd(cmd, "ssh");
+        let _ = fs::remove_file(&askpass);
+        result
+    })
 }
 
 fn ssh_with_pass_kbd(
@@ -20360,31 +20474,33 @@ fn ssh_with_pass_kbd(
     user: &str,
     password: &str,
 ) -> Result<(), OrchestratorError> {
-    let askpass = askpass_script(password)?;
-    let mut cmd = Command::new("setsid");
-    cmd.arg("ssh")
-        .arg("-o")
-        .arg("PreferredAuthentications=keyboard-interactive,password")
-        .arg("-o")
-        .arg("KbdInteractiveAuthentication=yes")
-        .arg("-o")
-        .arg("PasswordAuthentication=yes")
-        .arg("-o")
-        .arg("PubkeyAuthentication=no")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg(format!("{user}@{address}"))
-        .arg(command)
-        .env("SSH_ASKPASS", &askpass)
-        .env("SSH_ASKPASS_REQUIRE", "force")
-        .env("DISPLAY", "jsr");
-    let result = run_cmd(cmd, "ssh");
-    let _ = fs::remove_file(&askpass);
-    result
+    retry_transient_ssh("ssh(kbd)", || {
+        let askpass = askpass_script(password)?;
+        let mut cmd = Command::new("setsid");
+        cmd.arg("ssh")
+            .arg("-o")
+            .arg("PreferredAuthentications=keyboard-interactive,password")
+            .arg("-o")
+            .arg("KbdInteractiveAuthentication=yes")
+            .arg("-o")
+            .arg("PasswordAuthentication=yes")
+            .arg("-o")
+            .arg("PubkeyAuthentication=no")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg(format!("{user}@{address}"))
+            .arg(command)
+            .env("SSH_ASKPASS", &askpass)
+            .env("SSH_ASKPASS_REQUIRE", "force")
+            .env("DISPLAY", "jsr");
+        let result = run_cmd(cmd, "ssh");
+        let _ = fs::remove_file(&askpass);
+        result
+    })
 }
 
 fn ssh_with_pass_any(
@@ -20411,32 +20527,100 @@ fn ssh_with_pass_any(
     }
 }
 
+/// Bounded transient-retry for the bootstrap SSH primitives. A fresh box early in boot — or an
+/// Ubuntu 24.04 socket-activated sshd — can momentarily refuse/drop a connection mid-bootstrap;
+/// every bootstrap SSH op is idempotent, so we retry transport-level blips with backoff. We do
+/// NOT retry auth/permission failures (those are permanent and must fail fast so the caller can
+/// fall back to another channel / surface a real error).
+const SSH_TRANSIENT_RETRIES: usize = 4;
+const SSH_TRANSIENT_BASE_DELAY_MS: u64 = 800;
+
+fn is_transient_ssh_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("connection closed")
+        || lower.contains("connect to host") // "ssh: connect to host <h> port 22: ..."
+        || lower.contains("connection timed out")
+        || lower.contains("operation timed out")
+        || lower.contains("no route to host")
+        || lower.contains("kex_exchange")
+        || lower.contains("broken pipe")
+        || lower.contains("reset by peer")
+}
+
+fn retry_transient_ssh<T>(
+    label: &str,
+    mut op: impl FnMut() -> Result<T, OrchestratorError>,
+) -> Result<T, OrchestratorError> {
+    let mut attempt = 1usize;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                let msg = err.to_string();
+                if attempt >= SSH_TRANSIENT_RETRIES || !is_transient_ssh_error(&msg) {
+                    return Err(err);
+                }
+                let delay = SSH_TRANSIENT_BASE_DELAY_MS.saturating_mul(1u64 << (attempt - 1));
+                tracing::warn!(op = %label, attempt, delay_ms = delay, error = %msg, "transient ssh failure; retrying");
+                std::thread::sleep(Duration::from_millis(delay));
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// True when an add_hive failure was a transient/retryable transport condition (an SSH blip that
+/// survived the primitive-level retries, or a retryable mesh timeout) rather than a genuine
+/// error. On such failures the B-2 on-failure revoke is SKIPPED so the just-seeded motherbee key
+/// stays put and the operator's retry remains key-first instead of being forced back onto a
+/// (possibly-off) password channel.
+fn add_hive_result_is_transient(result: &serde_json::Value) -> bool {
+    if result.get("retryable").and_then(|v| v.as_bool()) == Some(true) {
+        return true;
+    }
+    for field in ["message", "error_detail"] {
+        if result
+            .get(field)
+            .and_then(|v| v.as_str())
+            .map(is_transient_ssh_error)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn ssh_with_key(
     address: &str,
     key_path: &Path,
     command: &str,
     user: &str,
 ) -> Result<(), OrchestratorError> {
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-i")
-        .arg(key_path)
-        .arg("-o")
-        .arg("IdentitiesOnly=yes")
-        .arg("-o")
-        .arg("PreferredAuthentications=publickey")
-        .arg("-o")
-        .arg("PasswordAuthentication=no")
-        .arg("-o")
-        .arg("LogLevel=ERROR")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg(format!("{user}@{address}"))
-        .arg(command);
-    run_cmd(cmd, "ssh")
+    retry_transient_ssh("ssh", || {
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-i")
+            .arg(key_path)
+            .arg("-o")
+            .arg("IdentitiesOnly=yes")
+            .arg("-o")
+            .arg("PreferredAuthentications=publickey")
+            .arg("-o")
+            .arg("PasswordAuthentication=no")
+            .arg("-o")
+            .arg("LogLevel=ERROR")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg(format!("{user}@{address}"))
+            .arg(command);
+        run_cmd(cmd, "ssh")
+    })
 }
 
 fn ssh_with_key_output(
@@ -20445,26 +20629,28 @@ fn ssh_with_key_output(
     command: &str,
     user: &str,
 ) -> Result<String, OrchestratorError> {
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-i")
-        .arg(key_path)
-        .arg("-o")
-        .arg("IdentitiesOnly=yes")
-        .arg("-o")
-        .arg("PreferredAuthentications=publickey")
-        .arg("-o")
-        .arg("PasswordAuthentication=no")
-        .arg("-o")
-        .arg("LogLevel=ERROR")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg(format!("{user}@{address}"))
-        .arg(command);
-    run_cmd_output(cmd, "ssh")
+    retry_transient_ssh("ssh", || {
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-i")
+            .arg(key_path)
+            .arg("-o")
+            .arg("IdentitiesOnly=yes")
+            .arg("-o")
+            .arg("PreferredAuthentications=publickey")
+            .arg("-o")
+            .arg("PasswordAuthentication=no")
+            .arg("-o")
+            .arg("LogLevel=ERROR")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg(format!("{user}@{address}"))
+            .arg(command);
+        run_cmd_output(cmd, "ssh")
+    })
 }
 
 fn scp_with_key(
@@ -20474,28 +20660,30 @@ fn scp_with_key(
     dest: &str,
     user: &str,
 ) -> Result<(), OrchestratorError> {
-    let mut cmd = Command::new("scp");
-    cmd.arg("-i")
-        .arg(key_path)
-        .arg("-o")
-        .arg("IdentitiesOnly=yes")
-        .arg("-o")
-        .arg("PreferredAuthentications=publickey")
-        .arg("-o")
-        .arg("PasswordAuthentication=no")
-        .arg("-o")
-        .arg("LogLevel=ERROR")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("ConnectTimeout=10");
-    for src in sources {
-        cmd.arg(src);
-    }
-    cmd.arg(format!("{user}@{address}:{dest}"));
-    run_cmd(cmd, "scp")
+    retry_transient_ssh("scp", || {
+        let mut cmd = Command::new("scp");
+        cmd.arg("-i")
+            .arg(key_path)
+            .arg("-o")
+            .arg("IdentitiesOnly=yes")
+            .arg("-o")
+            .arg("PreferredAuthentications=publickey")
+            .arg("-o")
+            .arg("PasswordAuthentication=no")
+            .arg("-o")
+            .arg("LogLevel=ERROR")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
+            .arg("-o")
+            .arg("ConnectTimeout=10");
+        for src in sources {
+            cmd.arg(src);
+        }
+        cmd.arg(format!("{user}@{address}:{dest}"));
+        run_cmd(cmd, "scp")
+    })
 }
 
 fn public_key_from_private_key(key_path: &Path) -> Result<String, OrchestratorError> {
@@ -20529,54 +20717,56 @@ fn write_remote_file(
         "sudo -n tee '{}' >/dev/null",
         shell_single_quote(remote_path)
     );
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-i")
-        .arg(key_path)
-        .arg("-o")
-        .arg("IdentitiesOnly=yes")
-        .arg("-o")
-        .arg("PreferredAuthentications=publickey")
-        .arg("-o")
-        .arg("PasswordAuthentication=no")
-        .arg("-o")
-        .arg("LogLevel=ERROR")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg(format!("{user}@{address}"))
-        .arg(&remote_cmd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| -> OrchestratorError { "failed to open ssh stdin".into() })?;
-        // A BrokenPipe here means ssh / `sudo -n` exited before draining stdin
-        // (e.g. "sudo: a password is required", or the connection dropped). Don't
-        // propagate the bare pipe error — fall through to wait_with_output so the
-        // real remote exit code + stderr win. stdin is closed on scope exit (EOF).
-        if let Err(err) = stdin.write_all(contents.as_bytes()) {
-            if err.kind() != std::io::ErrorKind::BrokenPipe {
-                return Err(err.into());
+    retry_transient_ssh("write_remote_file", || {
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-i")
+            .arg(key_path)
+            .arg("-o")
+            .arg("IdentitiesOnly=yes")
+            .arg("-o")
+            .arg("PreferredAuthentications=publickey")
+            .arg("-o")
+            .arg("PasswordAuthentication=no")
+            .arg("-o")
+            .arg("LogLevel=ERROR")
+            .arg("-o")
+            .arg("StrictHostKeyChecking=no")
+            .arg("-o")
+            .arg("UserKnownHostsFile=/dev/null")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg(format!("{user}@{address}"))
+            .arg(&remote_cmd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn()?;
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| -> OrchestratorError { "failed to open ssh stdin".into() })?;
+            // A BrokenPipe here means ssh / `sudo -n` exited before draining stdin
+            // (e.g. "sudo: a password is required", or the connection dropped). Don't
+            // propagate the bare pipe error — fall through to wait_with_output so the
+            // real remote exit code + stderr win. stdin is closed on scope exit (EOF).
+            if let Err(err) = stdin.write_all(contents.as_bytes()) {
+                if err.kind() != std::io::ErrorKind::BrokenPipe {
+                    return Err(err.into());
+                }
             }
         }
-    }
-    let output = child.wait_with_output()?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let code = output
-        .status
-        .code()
-        .map_or("signal".to_string(), |c| c.to_string());
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    Err(format!("write_remote_file via ssh+tee failed (exit={code}): stderr={stderr}").into())
+        let output = child.wait_with_output()?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let code = output
+            .status
+            .code()
+            .map_or("signal".to_string(), |c| c.to_string());
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!("write_remote_file via ssh+tee failed (exit={code}): stderr={stderr}").into())
+    })
 }
 
 fn wait_for_wan(
@@ -21628,6 +21818,54 @@ mod tests {
         assert!(resolve_add_hive_ssh_creds(&serde_json::json!({})).is_err());
         assert!(resolve_add_hive_ssh_creds(&serde_json::json!({"ssh_user": ""})).is_err());
         assert!(resolve_add_hive_ssh_creds(&serde_json::json!({"ssh_user": "   "})).is_err());
+    }
+
+    #[test]
+    fn resolve_add_hive_ssh_creds_accepts_and_validates_ssh_key() {
+        // A PEM private key is kept VERBATIM (newlines preserved — never trimmed).
+        let pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAAB3Nz\n-----END OPENSSH PRIVATE KEY-----\n";
+        let creds =
+            resolve_add_hive_ssh_creds(&serde_json::json!({"ssh_user": "ubuntu", "ssh_key": pem}))
+                .unwrap();
+        assert_eq!(creds.ssh_key.as_deref(), Some(pem));
+        // No ssh_key -> None.
+        let creds = resolve_add_hive_ssh_creds(&serde_json::json!({"ssh_user": "ubuntu"})).unwrap();
+        assert!(creds.ssh_key.is_none());
+        // A non-PEM blob is rejected up front (fails here, not mid-bootstrap).
+        assert!(resolve_add_hive_ssh_creds(
+            &serde_json::json!({"ssh_user": "ubuntu", "ssh_key": "not-a-key"})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn transient_ssh_errors_are_classified_but_auth_failures_are_not() {
+        for t in [
+            "ssh: connect to host 10.0.0.2 port 22: Connection refused",
+            "Connection reset by peer",
+            "client_loop: send disconnect: Broken pipe",
+            "ssh: connect to host x port 22: Connection timed out",
+        ] {
+            assert!(is_transient_ssh_error(t), "should be transient: {t}");
+        }
+        for permanent in [
+            "Permission denied (publickey,password).",
+            "sudo: a password is required",
+            "write_remote_file via ssh+tee failed (exit=1): stderr=some app error",
+        ] {
+            assert!(
+                !is_transient_ssh_error(permanent),
+                "should NOT be transient: {permanent}"
+            );
+        }
+        // add_hive_result_is_transient reads message/error_detail/retryable.
+        assert!(add_hive_result_is_transient(&serde_json::json!({
+            "message": "ssh: connect to host h port 22: Connection refused"
+        })));
+        assert!(add_hive_result_is_transient(&serde_json::json!({ "retryable": true })));
+        assert!(!add_hive_result_is_transient(&serde_json::json!({
+            "message": "Permission denied (publickey)"
+        })));
     }
 
     #[test]

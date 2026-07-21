@@ -9071,7 +9071,17 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             admin_action_body_field(
                 "ssh_password",
                 "string",
-                "Admin SSH password for the initial bootstrap of an empty box. Optional: only needed when the bootstrap key is not yet seeded (fresh box). Never logged, never stored — redacted at rest.",
+                "Admin SSH password for the initial bootstrap of an empty box. Optional: only needed when the bootstrap key is not yet seeded (fresh box) and no ssh_key is supplied. Never logged, never stored — redacted at rest.",
+            ),
+            admin_action_body_field(
+                "ssh_key",
+                "string",
+                "Optional bootstrap SSH PRIVATE key (PEM). Key-first channel for a fresh box: on a stock cloud image (authorized key injected by cloud-init, server PasswordAuthentication OFF) this seeds the mesh bootstrap key without needing server-side password auth. Assumes ssh_user has passwordless sudo (cloud-init default) or that ssh_password is also supplied for sudo escalation. Never logged, never stored.",
+            ),
+            admin_action_body_field(
+                "ssh_access",
+                "string",
+                "Post-join SSH posture. Default \"revoke\" (SSH is bootstrap-only: the motherbee key + sudoers grant are stripped after join). \"key_only_persist\" instead leaves SSH open key-only (password off) via a per-spoke recovery key stored in SY.vault under ssh:<hive_id>.",
             ),
             admin_action_body_field(
                 "role",
