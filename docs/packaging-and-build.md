@@ -123,6 +123,43 @@ necesita acceso a GitHub y el toolchain — nada más.
 > Caja de referencia en el lab: la VM **fb-build** (Proxmox `PC-004-165`, VM 210) ya tiene el
 > toolchain y `/opt/fluxbee`. `scripts/make-deb.sh` reproduce ese setup en cualquier máquina.
 
+### 4.3 Repo apt interno (instalar por red, sin copiar el `.deb`) — recomendado
+
+En vez de copiar el `.deb` a cada box, dejá la máquina de build como **repo apt interno**: sirve el
+`.deb` por HTTP y cualquier box de la red hace `apt install fluxbee`. apt resuelve `postgresql` (y
+demás Depends) del archive de Ubuntu automáticamente — los clones quedan como Ubuntu pelado.
+
+En el build+repo box (tras `make-deb.sh`):
+
+```bash
+scripts/apt-repo-publish.sh --serve          # publica el .deb en un repo flat + lo sirve en :8900
+```
+
+`apt-repo-publish.sh` arma un repo flat (`dpkg-scanpackages` + `apt-ftparchive release`) y lo sirve.
+Es **sin firmar** + `[trusted=yes]` (uso interno). Para un repo **público/internet**, firmá el
+`Release` con GPG (`InRelease`) y sacá `[trusted=yes]` — el `.deb` en sí no cambia. Volvé a correr
+el script tras cada build nuevo para regenerar el índice.
+
+En cualquier cliente (Ubuntu limpio):
+
+```bash
+echo 'deb [trusted=yes] http://<build-host>:8900 ./' | sudo tee /etc/apt/sources.list.d/fluxbee.list
+sudo apt-get update && sudo apt-get install -y fluxbee
+sudo nano /etc/fluxbee/hive.yaml && sudo fluxbee-firstboot
+```
+
+### 4.4 Layout de 3 servers (lab Proxmox `PC-004-165/157/156`)
+
+| Server | Rol | Qué corre |
+|--------|-----|-----------|
+| PC-004-165 | build+repo + dev | fb-build (toolchain + `make-deb` + repo apt `:8900`) + VMs de prueba destruibles |
+| PC-004-156 | stable | backend fluxbee instalado por el repo, mantenido entre majors |
+| PC-004-157 | dev/spare | VMs destruibles |
+
+> Un build box **dedicado en 157** solo requiere una **deploy key de GitHub** para clonar el repo
+> privado (el cloud image de Ubuntu no trae `qemu-guest-agent`, así que las VMs del lab se crean
+> clonando el template base ya provisto y migrándolo entre nodos). Follow-up cuando haya key.
+
 ---
 
 ## 5. Instalar el backend (motherbee)
