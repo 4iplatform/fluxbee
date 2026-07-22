@@ -140,10 +140,12 @@ Es **sin firmar** + `[trusted=yes]` (uso interno). Para un repo **público/inter
 `Release` con GPG (`InRelease`) y sacá `[trusted=yes]` — el `.deb` en sí no cambia. Volvé a correr
 el script tras cada build nuevo para regenerar el índice.
 
-> **Fijá la IP del repo box.** La URL del repo (`http://<host>:8900`) queda escrita en cada cliente;
-> si el build box está por DHCP y su IP drifta, todos los `apt update` fallan con *no route to host*.
-> Dale IP estática (netplan `dhcp4:false` + `addresses`, y `network:{config:disabled}` en
-> `/etc/cloud/cloud.cfg.d/` si es cloud-init) o una reserva DHCP en el router.
+> **Fijá la IP del repo box — FUERA del pool DHCP.** La URL del repo (`http://<host>:8900`) queda
+> escrita en cada cliente; si el build box está por DHCP y su IP drifta, todos los `apt update`
+> fallan con *no route to host*. Dale IP estática (netplan `dhcp4:false` + `addresses`, y
+> `network:{config:disabled}` en `/etc/cloud/cloud.cfg.d/` si es cloud-init) **por encima del rango
+> DHCP del router** (si no, el router puede reasignar esa IP y colisiona). En el lab: pool DHCP
+> `192.168.4.20–.150`, repo fijado en `192.168.4.200`.
 
 En cualquier cliente (Ubuntu limpio):
 
