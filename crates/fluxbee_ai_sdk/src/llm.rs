@@ -23,7 +23,15 @@ pub const DEFAULT_HIVE_OPENAI_MODEL: &str = "gpt-5.5";
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AiProvider {
+    // Canonical wire form is "openai" — it MUST match as_str()/Display/FromStr, the
+    // `providers.openai` config key, and the spoke hive.yaml the orchestrator GENERATES
+    // (sy_orchestrator writes `default_provider: openai` via Display). The bare
+    // rename_all=snake_case would expect "open_ai", which broke fresh installs (the
+    // packaged hive.yaml.example says `openai`) and would break every generated spoke
+    // yaml. Caught by the vault cold-boot VM E2E on 2026-07-21. "open_ai" stays as a
+    // read-only alias for anything written during the brief window it was the wire form.
     #[default]
+    #[serde(rename = "openai", alias = "open_ai")]
     OpenAi,
     Anthropic,
 }
@@ -416,11 +424,9 @@ impl LlmClient for OpenAiResponsesClient {
         let status = response.status();
         let value: serde_json::Value = response.json().await?;
         if !status.is_success() {
-            return Err(AiSdkError::Protocol(format!(
-                "openai error status={} body={}",
-                status, value
-            )));
+            return Err(openai_status_error(status.as_u16(), &value));
         }
+        openai_check_truncation(&value)?;
 
         // Responses API returns output_text for text generations.
         let text = value
@@ -812,10 +818,9 @@ impl FunctionCallingModel for OpenAiFunctionCallingModel {
         let status = response.status();
         let value: Value = response.json().await?;
         if !status.is_success() {
-            return Err(AiSdkError::Protocol(format!(
-                "openai function calling error status={} body={}",
-                status, value
-            )));
+            // Same clean format as the Responses path (audit B6/M3): no raw body (key echo), and
+            // it carries type/param/message so the consumer can classify + scrub.
+            return Err(openai_status_error(status.as_u16(), &value));
         }
 
         let response_id = value
@@ -970,7 +975,12 @@ fn loop_item_to_openai_input(item: FunctionLoopItem) -> Value {
 
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 1024;
+// Anthropic requires max_tokens on every request (unlike OpenAI, which treats an absent
+// max_output_tokens as "model default"). The old 1024 default silently truncated every
+// admin/architect turn that left ModelSettings at default (audit A2); 4096 is a safe general
+// ceiling, and truncation is now detected loudly (anthropic_check_truncation) so a caller that
+// still needs more gets an explicit error instead of a corrupted/short completion.
+const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 4096;
 const ANTHROPIC_MAX_ATTEMPTS: usize = 3;
 
 #[derive(Clone)]
@@ -1039,11 +1049,12 @@ impl AnthropicMessagesClient {
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
                 .to_string();
-            let value: Value = response.json().await?;
-            if status.is_success() {
-                return Ok(value);
-            }
-            if attempt + 1 < ANTHROPIC_MAX_ATTEMPTS
+            // Decide retry from STATUS + headers BEFORE touching the body (audit M1): a
+            // proxy/LB 5xx or 429 often carries an HTML or empty body, and parsing it first
+            // (`response.json().await?`) aborted the whole retry loop on a decode error exactly
+            // when a retry was warranted.
+            if !status.is_success()
+                && attempt + 1 < ANTHROPIC_MAX_ATTEMPTS
                 && anthropic_should_retry(status.as_u16(), &headers)
             {
                 let retry_after = anthropic_retry_after(&headers);
@@ -1051,6 +1062,13 @@ impl AnthropicMessagesClient {
                 tracing::warn!(attempt = attempt + 1, status = %status, request_id = %request_id, "retrying Anthropic response");
                 continue;
             }
+            if status.is_success() {
+                let value: Value = response.json().await?;
+                return Ok(value);
+            }
+            // Non-retryable (or last attempt): parse tolerantly so a non-JSON error body
+            // surfaces the status/request-id instead of a masking decode error.
+            let value: Value = response.json().await.unwrap_or(Value::Null);
             let error_type = value
                 .pointer("/error/type")
                 .and_then(Value::as_str)
@@ -1111,6 +1129,110 @@ fn anthropic_retry_delay(attempt: usize, server_delay: Option<Duration>) -> Dura
     Duration::from_millis(base_ms.saturating_mul(jitter_percent) / 100)
 }
 
+/// Build an OpenAI error WITHOUT embedding the raw response body (audit B6): OpenAI's own 401
+/// body echoes a partially-masked form of the api key ("Incorrect API key provided: sk-…"),
+/// which the old `body={value}` leaked into logs and the mesh error envelope. We keep the
+/// `openai error status=` prefix so the consumer classifier still recognizes it, but carry only
+/// the extracted error type/message.
+fn openai_status_error(status: u16, body: &Value) -> AiSdkError {
+    let error_type = body
+        .pointer("/error/type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown_error");
+    // `param` identifies the offending request field on a 400 (e.g. an attachment path); the
+    // consumer classifier reads it to raise provider_attachment_invalid_request, so carry it
+    // explicitly (before message=) now that the raw JSON body no longer travels.
+    let param = body
+        .pointer("/error/param")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let message = body
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or("OpenAI request failed");
+    // OpenAI's 401 message itself echoes a masked key ("Incorrect API key provided: sk-…"),
+    // so extracting the message is not enough (audit B6) — scrub any sk- token before it reaches
+    // logs / the mesh error envelope.
+    AiSdkError::Protocol(format!(
+        "openai error status={status} type={error_type} param={param} message={}",
+        scrub_secret_like(message)
+    ))
+}
+
+/// Redact OpenAI-style key tokens (`sk-…`) that provider error messages can echo, so a key
+/// fragment never lands in a log line or the mesh error envelope (audit B6). Replaces each
+/// `sk-` run of non-whitespace characters with `sk-<redacted>`.
+fn scrub_secret_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(pos) = rest.find("sk-") {
+        // Only redact when "sk-" BEGINS a token (start of string, or preceded by a non-alphanumeric
+        // char). Otherwise ordinary words that merely contain the sequence — "task-id", "risk-",
+        // "disk-" — would be corrupted (audit review).
+        let at_token_boundary = rest[..pos]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        if at_token_boundary {
+            out.push_str(&rest[..pos]);
+            out.push_str("sk-<redacted>");
+            let after = &rest[pos + 3..];
+            let end = after.find(char::is_whitespace).unwrap_or(after.len());
+            rest = &after[end..];
+        } else {
+            out.push_str(&rest[..pos + 3]);
+            rest = &rest[pos + 3..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Detect a silently-truncated OpenAI Responses completion (audit A2): the API returns
+/// status="incomplete" with incomplete_details.reason="max_output_tokens". Surface it as a loud
+/// error instead of returning a short/invalid body that downstream parses as an unrelated failure.
+fn openai_check_truncation(body: &Value) -> Result<()> {
+    if body.get("status").and_then(Value::as_str) == Some("incomplete")
+        && body
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+            == Some("max_output_tokens")
+    {
+        return Err(AiSdkError::Protocol(
+            "openai response truncated: hit max_output_tokens (raise model_settings.max_output_tokens)"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Heuristic: an Anthropic 400 that indicates the model does not support the `output_config`
+/// structured-outputs feature (audit M4), so `generate` can retry once with a prompt-instruction
+/// fallback instead of surfacing the raw 400. Conservative — only a 400 that names the feature.
+fn anthropic_output_config_unsupported(err: &AiSdkError) -> bool {
+    let AiSdkError::Protocol(msg) = err else {
+        return false;
+    };
+    if !msg.contains("anthropic error status=400") {
+        return false;
+    }
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("output_config") || lower.contains("json_schema") || lower.contains("structured")
+}
+
+/// Detect a silently-truncated Anthropic completion (audit A2): stop_reason="max_tokens" means
+/// the output was cut at the (now 4096) cap. Fail loudly so a caller needing more raises
+/// model_settings.max_output_tokens rather than parsing a truncated tool_use/structured output.
+fn anthropic_check_truncation(value: &Value) -> Result<()> {
+    if value.get("stop_reason").and_then(Value::as_str) == Some("max_tokens") {
+        return Err(AiSdkError::Protocol(
+            "anthropic response truncated: hit max_tokens (raise model_settings.max_output_tokens)"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl LlmClient for AnthropicMessagesClient {
     async fn generate(&self, request: LlmRequest) -> Result<LlmResponse> {
@@ -1163,7 +1285,37 @@ impl LlmClient for AnthropicMessagesClient {
                 }),
             );
         }
-        let value = self.send(&Value::Object(body)).await?;
+        // Capability fallback (audit B5/M4): output_config is sent optimistically; a model that
+        // does not support structured outputs answers 400. Instead of surfacing that raw 400,
+        // retry ONCE without output_config, steering the schema via a system instruction — the
+        // local validate_structured_output below still enforces the contract on the result.
+        let value = match self.send(&Value::Object(body.clone())).await {
+            Ok(value) => value,
+            Err(err)
+                if request.output_schema.is_some()
+                    && anthropic_output_config_unsupported(&err) =>
+            {
+                let output_schema = request
+                    .output_schema
+                    .as_ref()
+                    .expect("output_schema present in fallback arm");
+                let instruction = build_output_schema_fallback_instruction(output_schema)?;
+                body.remove("output_config");
+                let system = match body.get("system").and_then(Value::as_str) {
+                    Some(existing) if !existing.trim().is_empty() => {
+                        format!("{existing}\n\n{instruction}")
+                    }
+                    _ => instruction,
+                };
+                body.insert("system".to_string(), Value::String(system));
+                tracing::warn!(
+                    "anthropic model rejected output_config; retrying with prompt-instruction structured-output fallback"
+                );
+                self.send(&Value::Object(body)).await?
+            }
+            Err(err) => return Err(err),
+        };
+        anthropic_check_truncation(&value)?;
         let text = anthropic_response_text(&value)?;
         let text = match &request.output_schema {
             Some(output_schema) => validate_structured_output(&text, output_schema)?,
@@ -1282,6 +1434,7 @@ impl FunctionCallingModel for AnthropicFunctionCallingModel {
             body.insert("top_p".to_string(), Value::from(top_p));
         }
         let value = self.client.send(&Value::Object(body)).await?;
+        anthropic_check_truncation(&value)?;
         let mut assistant_text = Vec::new();
         let mut tool_calls = Vec::new();
         if let Some(content) = value.get("content").and_then(Value::as_array) {
@@ -1404,6 +1557,27 @@ fn build_anthropic_function_messages(
         }
         index += 1;
     }
+    // Anthropic requires messages[0] to be role=user (audit M5). A truncated immediate-memory
+    // window can begin with an assistant turn; drop leading assistant messages and any leading
+    // tool_result user block they leave orphaned, so the first message is always a real user turn.
+    while let Some(first) = messages.first() {
+        let role = first.get("role").and_then(Value::as_str);
+        let orphan_tool_result = role == Some("user")
+            && first
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| {
+                    !blocks.is_empty()
+                        && blocks.iter().all(|b| {
+                            b.get("type").and_then(Value::as_str) == Some("tool_result")
+                        })
+                });
+        if role == Some("assistant") || orphan_tool_result {
+            messages.remove(0);
+        } else {
+            break;
+        }
+    }
     Ok((system_parts.join("\n\n"), messages))
 }
 
@@ -1469,7 +1643,99 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn openai_status_error_omits_raw_body_and_key_echo() {
+        // B6: the error must carry only the extracted type/message, never the raw body (OpenAI's
+        // 401 body echoes a masked key), and must keep the "openai error status=" prefix the
+        // consumer classifier matches.
+        let body = json!({"error": {"type": "invalid_request_error", "message": "Incorrect API key provided: sk-abc...xyz"}});
+        let err = openai_status_error(401, &body);
+        let AiSdkError::Protocol(msg) = err else {
+            panic!("expected Protocol error");
+        };
+        assert!(msg.starts_with("openai error status=401"));
+        assert!(msg.contains("type=invalid_request_error"));
+        assert!(msg.contains("Incorrect API key"));
+        assert!(!msg.contains("sk-abc...xyz")); // the masked-key echo must NOT be present
+        assert!(!msg.contains("body="));
+    }
+
+    #[test]
+    fn scrub_secret_like_redacts_keys_but_not_ordinary_words() {
+        assert_eq!(
+            scrub_secret_like("Incorrect API key provided: sk-abc...xyz please"),
+            "Incorrect API key provided: sk-<redacted> please"
+        );
+        assert_eq!(scrub_secret_like("token sk-live-REALKEY"), "token sk-<redacted>");
+        // "sk-" inside ordinary words must be preserved (task-id contains s,k,-).
+        assert_eq!(
+            scrub_secret_like("Invalid value for task-id parameter"),
+            "Invalid value for task-id parameter"
+        );
+        assert_eq!(scrub_secret_like("risk-averse disk-full"), "risk-averse disk-full");
+        // key=sk-... (preceded by '=') is a token boundary and IS redacted.
+        assert_eq!(scrub_secret_like("key=sk-abc def"), "key=sk-<redacted> def");
+    }
+
+    #[test]
+    fn truncation_detectors_flag_max_tokens() {
+        // A2: both providers' "hit the cap" signals surface as an explicit error.
+        assert!(openai_check_truncation(
+            &json!({"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}})
+        )
+        .is_err());
+        assert!(openai_check_truncation(&json!({"status": "completed"})).is_ok());
+        assert!(
+            anthropic_check_truncation(&json!({"stop_reason": "max_tokens"})).is_err()
+        );
+        assert!(anthropic_check_truncation(&json!({"stop_reason": "end_turn"})).is_ok());
+    }
+
+    #[test]
+    fn output_config_unsupported_only_on_capability_400() {
+        // M4: the capability-fallback heuristic fires only on a 400 that names the feature.
+        assert!(anthropic_output_config_unsupported(&AiSdkError::Protocol(
+            "anthropic error status=400 type=invalid_request_error message=output_config not supported".into()
+        )));
+        assert!(!anthropic_output_config_unsupported(&AiSdkError::Protocol(
+            "anthropic error status=429 type=rate_limit_error message=slow down".into()
+        )));
+        assert!(!anthropic_output_config_unsupported(&AiSdkError::Protocol(
+            "anthropic error status=400 type=invalid_request_error message=bad max_tokens".into()
+        )));
+    }
     use crate::function_calling::FunctionToolResult;
+
+    #[test]
+    fn ai_provider_wire_form_is_openai_and_matches_display() {
+        // Contract: the serde wire form MUST be "openai" — the same string as
+        // as_str()/Display/FromStr, the `providers.openai` key, and the spoke
+        // hive.yaml the orchestrator generates via Display. A bare
+        // rename_all=snake_case ("open_ai") broke fresh installs (packaged
+        // hive.yaml.example says `openai`) and every generated spoke yaml —
+        // caught by the vault cold-boot VM E2E 2026-07-21.
+        let cfg: HiveAiConfig =
+            serde_yaml::from_str("default_provider: openai\n").expect("parse openai");
+        assert_eq!(cfg.default_provider, AiProvider::OpenAi);
+        // Read-only alias for anything written while "open_ai" was the wire form.
+        let cfg: HiveAiConfig =
+            serde_yaml::from_str("default_provider: open_ai\n").expect("parse open_ai alias");
+        assert_eq!(cfg.default_provider, AiProvider::OpenAi);
+        let cfg: HiveAiConfig =
+            serde_yaml::from_str("default_provider: anthropic\n").expect("parse anthropic");
+        assert_eq!(cfg.default_provider, AiProvider::Anthropic);
+        // Serialize == Display == as_str for both variants (roundtrip stability).
+        for provider in [AiProvider::OpenAi, AiProvider::Anthropic] {
+            let wire = serde_json::to_value(provider).expect("serialize");
+            assert_eq!(wire, json!(provider.as_str()));
+            assert_eq!(provider.to_string(), provider.as_str());
+            assert_eq!(
+                provider.as_str().parse::<AiProvider>().expect("FromStr"),
+                provider
+            );
+        }
+    }
 
     fn spawn_single_response_server(
         response_body: Value,

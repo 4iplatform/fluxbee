@@ -43,6 +43,14 @@ Runtime/update options:
   --sudo                       Use sudo for local publish/restart operations
   --skip-build                 Reuse an existing io-api release binary
   --log-file <path>            Deployment log path
+  --edge-base <url>            Public SY.edge base (e.g. https://203.0.113.10:8443). When set,
+                               the deploy ends with a REAL data-path probe: POST <edge-base>/e/<ich>
+                               must answer from the IO.api node (any structured reply), not a
+                               transport error — closes the "published-but-unreachable reports
+                               green" gap (admin-side publication.status never touches the data path)
+  --probe-bearer <token>       Bearer for the data-path probe (defaults to the just-issued
+                               entry token when one was minted this run)
+  --probe-insecure             Pass -k to curl for the probe (lab/self-signed TLS)
   -h, --help                   Show help
 
 The runtime exposes no local HTTP port. Readiness is checked through
@@ -87,6 +95,9 @@ ALLOW_SYNC_PENDING=0
 DIST_ROOT=""
 USE_SUDO=0
 SKIP_BUILD=0
+EDGE_BASE=""
+PROBE_BEARER=""
+PROBE_INSECURE=0
 LOG_FILE="/tmp/deploy-io-api-$(date +%Y%m%d-%H%M%S).log"
 
 while [[ $# -gt 0 ]]; do
@@ -119,6 +130,9 @@ while [[ $# -gt 0 ]]; do
     --dist-root) DIST_ROOT="${2:-}"; shift 2 ;;
     --sudo) USE_SUDO=1; shift ;;
     --skip-build) SKIP_BUILD=1; shift ;;
+    --edge-base) EDGE_BASE="${2:-}"; shift 2 ;;
+    --probe-bearer) PROBE_BEARER="${2:-}"; shift 2 ;;
+    --probe-insecure) PROBE_INSECURE=1; shift ;;
     --log-file) LOG_FILE="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Error: unknown option: $1" >&2; usage; exit 1 ;;
@@ -262,6 +276,51 @@ derive_unit_name() {
   echo "fluxbee-node-${base}-${hive}.service"
 }
 
+# Real data-path probe (closes the "published-but-unreachable reports green" audit gap):
+# publication.status is ADMIN's view and never touches the public path, so a row whose
+# owner is unreachable still polls "published". POST the actual public URL and require an
+# answer from the IO.api node itself — a transport-layer 404/401-with-bearer/5xx or a curl
+# failure means the endpoint is NOT actually serving, and the deploy must not report green.
+# $1 = full public URL, $2 = bearer ("" = none available)
+probe_data_path() {
+  local url="$1" bearer="$2"
+  local curl_args=(-sS -o /tmp/deploy-io-api-probe-$$.json -w '%{http_code}' -X POST
+    -H 'Content-Type: application/json' --max-time 20
+    -d "{\"request_id\":\"deploy-probe-$(date +%s)\",\"content\":\"__fluxbee_deploy_probe__\"}")
+  [[ "$PROBE_INSECURE" == "1" ]] && curl_args+=(-k)
+  [[ -n "$bearer" ]] && curl_args+=(-H "Authorization: Bearer $bearer")
+  local http_code
+  if ! http_code="$(curl "${curl_args[@]}" "$url")"; then
+    log "data-path probe FAILED: no HTTP answer from $url (transport error)"
+    return 1
+  fi
+  local body
+  body="$(cat "/tmp/deploy-io-api-probe-$$.json" 2>/dev/null || true)"
+  rm -f "/tmp/deploy-io-api-probe-$$.json"
+  case "$http_code" in
+    2*|400|422)
+      # 2xx = full path answered; 400/422 = IO.api itself rejected the minimal probe body
+      # (invalid_payload & co.) — either way the reply traversed edge -> mesh -> IO.api.
+      log "data-path probe OK: $url answered http=$http_code"
+      return 0
+      ;;
+    401|403)
+      if [[ -n "$bearer" ]]; then
+        log "data-path probe FAILED: $url rejected the bearer (http=$http_code) — credential mismatch"
+        return 1
+      fi
+      # No bearer available: the auth gate answering proves the edge row is LIVE on the
+      # public listener; the mesh leg stays unverified. Partial signal, not a failure.
+      log "data-path probe PARTIAL: edge row live at $url (http=$http_code); no bearer available to verify the full path — pass --probe-bearer to complete it"
+      return 0
+      ;;
+    *)
+      log "data-path probe FAILED: $url http=$http_code body=${body:0:200}"
+      return 1
+      ;;
+  esac
+}
+
 restart_existing() {
   local unit
   unit="$(derive_unit_name "$NODE_NAME")"
@@ -376,6 +435,16 @@ for attempt in $(seq 1 30); do
   if [[ "$publication" == "$expected" ]]; then
     publication_url="$(publication_field "$response" url)"
     log "deploy complete node=$NODE_NAME publication=$publication url=$publication_url"
+    if [[ -n "$EDGE_BASE" && "$expected" == "published" ]]; then
+      if [[ -z "$publication_url" ]]; then
+        log "data-path probe FAILED: publication reported no url to probe"
+        exit 1
+      fi
+      probe_bearer="${PROBE_BEARER:-$entry_token}"
+      probe_data_path "${EDGE_BASE%/}${publication_url}" "$probe_bearer" || exit 1
+    elif [[ "$expected" == "published" ]]; then
+      log "data-path probe skipped (pass --edge-base to verify the public URL end-to-end)"
+    fi
     if [[ -n "$entry_token" ]]; then
       printf 'entry_token=%s\n' "$entry_token"
       printf 'entry_token_one_time=true\n'

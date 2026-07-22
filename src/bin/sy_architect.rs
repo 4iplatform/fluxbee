@@ -6775,18 +6775,23 @@ async fn handle_vault_secret_changed_architect(state: &ArchitectState, msg: &Mes
             return;
         }
     };
-    let provider = load_hive(&state.config_dir)
-        .ok()
-        .and_then(|hive| {
-            hive.ai
-                .as_ref()
-                .map(HiveAiConfig::effective)
-                .transpose()
-                .ok()
-                .flatten()
-        })
-        .unwrap_or_else(HiveAiConfig::fallback)
-        .provider;
+    // Audit B1: do NOT swallow a hive.yaml load/parse error into a silent openai fallback
+    // (§3.3). A missing ai section is the documented openai default and stays quiet; only a
+    // genuine error warns.
+    let provider = match load_hive(&state.config_dir) {
+        Ok(hive) => match hive.ai.as_ref().map(HiveAiConfig::effective).transpose() {
+            Ok(Some(engine)) => engine.provider,
+            Ok(None) => HiveAiConfig::fallback().provider,
+            Err(err) => {
+                tracing::warn!(error = %err, "hive.yaml ai section is invalid; VAULT_SECRET_CHANGED interest defaulting to openai");
+                HiveAiConfig::fallback().provider
+            }
+        },
+        Err(err) => {
+            tracing::warn!(error = %err, "hive.yaml unreadable; VAULT_SECRET_CHANGED interest defaulting to openai");
+            HiveAiConfig::fallback().provider
+        }
+    };
     let ai_resource_type = provider.to_string();
     let interest_ai = VaultSecretInterest {
         resource_type: &ai_resource_type,
@@ -10292,7 +10297,7 @@ async fn handle_ai_chat(
 
     Ok(json!({
         "message": message,
-        "provider": "openai",
+        "provider": runtime.provider.to_string(),
         "model": runtime.model,
         "tool_results": tool_results,
         "plan_compile_trace": plan_compile_trace,

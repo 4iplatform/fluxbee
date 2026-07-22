@@ -886,6 +886,26 @@ impl VaultStore {
         }
         let conn = Connection::open(db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // VA-F9b: lock the at-rest DB to 0600 (SQLite creates it 0644 by default). The rows
+        // are AES-256-GCM ciphertext so 0644 leaks no plaintext without the (already-0600)
+        // master key, but defense-in-depth keeps the encrypted blobs owner-only too. The WAL
+        // journal_mode above has already materialized the -wal/-shm sidecars (which carry the
+        // same ciphertext), so tighten all three; best-effort — a chmod failure must not stop
+        // the vault from serving.
+        for suffix in ["", "-wal", "-shm"] {
+            let path = if suffix.is_empty() {
+                db_path.to_path_buf()
+            } else {
+                let mut name = db_path.as_os_str().to_os_string();
+                name.push(suffix);
+                std::path::PathBuf::from(name)
+            };
+            if path.exists() {
+                if let Err(err) = fs::set_permissions(&path, fs::Permissions::from_mode(0o600)) {
+                    tracing::warn!(path = %path.display(), error = %err, "sy-vault could not tighten DB file permissions to 0600");
+                }
+            }
+        }
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS schema_version (
@@ -1956,6 +1976,25 @@ mod tests {
             )
             .expect("read audit caller");
         assert_eq!(recorded_ilk.as_deref(), Some("ilk:admin"));
+        cleanup(dir);
+    }
+
+    #[test]
+    fn va_f9b_db_file_is_owner_only_0600() {
+        // The at-rest vault DB (and its WAL sidecars) must be 0600, not SQLite's default
+        // 0644 — even though the rows are ciphertext, the encrypted blobs stay owner-only.
+        let (mut store, dir) = open_test_store([8u8; 32]);
+        // Force a write so the -wal/-shm sidecars exist and get tightened too.
+        store
+            .put("pg:root:pool", json!({"v":1}), metadata("tnt:root", None), &admin_caller())
+            .expect("put");
+        for suffix in ["", "-wal", "-shm"] {
+            let path = dir.join(format!("vault.db{suffix}"));
+            if path.exists() {
+                let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{} must be 0600, got {:o}", path.display(), mode);
+            }
+        }
         cleanup(dir);
     }
 

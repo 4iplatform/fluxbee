@@ -119,7 +119,9 @@ llave de bootstrap de la motherbee si no existe:
 ```
 
 > `scripts/install.sh` es la ruta build-from-source (build determinista + install + restart en el
-> orden Model D'); el `.deb` es la ruta empaquetada. Ambos convergen al mismo layout.
+> orden Model D'); el `.deb` es la ruta empaquetada. El set de nodos base (core + IO/AI) que
+> ambos siembran en `dist/` se define en `packaging/base-nodes.json` (fuente única de verdad);
+> ver [packaging-and-build.md](packaging-and-build.md).
 
 ---
 

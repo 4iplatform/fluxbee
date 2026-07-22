@@ -2467,7 +2467,9 @@ async fn execute_admin_executor_plan(
         .await
         .clone()
         .ok_or_else(|| -> AdminError {
-            "SY.admin executor is not configured with a valid OpenAI key".into()
+            // Provider-neutral (audit B2): the executor derives its provider from the hive, so
+            // this must not name OpenAI under an Anthropic hive.
+            "SY.admin executor is not configured with a valid AI provider key (load it into SY.vault for the hive's configured provider)".into()
         })?;
     let mut all_events = Vec::<AdminExecutorStepEvent>::new();
     let mut completed_steps = 0usize;
@@ -2780,18 +2782,23 @@ async fn handle_vault_secret_changed_admin(ctx: &AdminContext, msg: &Message) {
             return;
         }
     };
-    let provider = load_hive(&ctx.config_dir)
-        .ok()
-        .and_then(|hive| {
-            hive.ai
-                .as_ref()
-                .map(HiveAiConfig::effective)
-                .transpose()
-                .ok()
-                .flatten()
-        })
-        .unwrap_or_else(HiveAiConfig::fallback)
-        .provider;
+    // Audit B1: derive the interest provider from hive.yaml, but do NOT swallow a load/parse
+    // error into a silent openai fallback (§3.3 forbids silent fallback). A missing ai section
+    // is the documented openai default and stays quiet; only a genuine error warns.
+    let provider = match load_hive(&ctx.config_dir) {
+        Ok(hive) => match hive.ai.as_ref().map(HiveAiConfig::effective).transpose() {
+            Ok(Some(engine)) => engine.provider,
+            Ok(None) => HiveAiConfig::fallback().provider,
+            Err(err) => {
+                tracing::warn!(error = %err, "hive.yaml ai section is invalid; VAULT_SECRET_CHANGED interest defaulting to openai");
+                HiveAiConfig::fallback().provider
+            }
+        },
+        Err(err) => {
+            tracing::warn!(error = %err, "hive.yaml unreadable; VAULT_SECRET_CHANGED interest defaulting to openai");
+            HiveAiConfig::fallback().provider
+        }
+    };
     let resource_type = provider.to_string();
     let interest = VaultSecretInterest {
         resource_type: &resource_type,
