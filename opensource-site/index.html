@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="es" data-lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f7f9fd">
+  <meta name="description" content="Fluxbee is the open-source runtime for coordinated AI agents, workflows, humans, and tools.">
+  <title>Fluxbee Open Source — AI systems that work as one</title>
+  <link rel="icon" href="assets/fluxbee-mark.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&amp;family=Inter:wght@400;500;600;700;800;900&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main" data-es="Ir al contenido" data-en="Skip to content">Ir al contenido</a>
+
+  <header class="site-header">
+    <div class="nav-wrap">
+      <a class="brand" href="#top" aria-label="Fluxbee Open Source">
+        <img src="assets/fluxbee-mark.svg" alt="" width="31" height="27">
+        <span>flux<span>bee</span></span>
+        <em>open source</em>
+      </a>
+
+      <nav class="desktop-nav" aria-label="Principal">
+        <a href="#possibilities" data-es="Qué podés crear" data-en="What you can build">Qué podés crear</a>
+        <a href="#how" data-es="Cómo funciona" data-en="How it works">Cómo funciona</a>
+        <a href="#start" data-es="Empezar" data-en="Get started">Empezar</a>
+        <a href="#build" data-es="Crear un nodo" data-en="Build a node">Crear un nodo</a>
+      </nav>
+
+      <div class="nav-actions">
+        <div class="language" role="group" aria-label="Language">
+          <button type="button" data-set-lang="es" aria-pressed="true">ES</button>
+          <button type="button" data-set-lang="en" aria-pressed="false">EN</button>
+        </div>
+        <a class="button button-dark desktop-github" href="https://github.com/4iplatform/fluxbee" target="_blank" rel="noreferrer">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 .7a11.5 11.5 0 0 0-3.6 22.4c.6.1.8-.3.8-.6v-2.2c-3.3.7-4-1.4-4-1.4-.5-1.4-1.3-1.8-1.3-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.6-.3-5.4-1.3-5.4-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.2 1.2a11 11 0 0 1 5.8 0C16.8 4.8 18 5.1 18 5.1c.6 1.6.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.4-2.7 5.4-5.4 5.7.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A11.5 11.5 0 0 0 12 .7Z"/></svg>
+          <span>GitHub</span>
+        </a>
+        <button class="menu-button" type="button" aria-expanded="false" aria-controls="mobile-menu" aria-label="Open menu">
+          <span></span><span></span>
+        </button>
+      </div>
+    </div>
+    <nav class="mobile-menu" id="mobile-menu" aria-label="Mobile">
+      <a href="#possibilities" data-es="Qué podés crear" data-en="What you can build">Qué podés crear</a>
+      <a href="#how" data-es="Cómo funciona" data-en="How it works">Cómo funciona</a>
+      <a href="#start" data-es="Empezar" data-en="Get started">Empezar</a>
+      <a href="#build" data-es="Crear un nodo" data-en="Build a node">Crear un nodo</a>
+      <a href="https://github.com/4iplatform/fluxbee" target="_blank" rel="noreferrer">GitHub ↗</a>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero" id="top">
+      <div class="hero-glow glow-one"></div>
+      <div class="hero-glow glow-two"></div>
+      <div class="container hero-grid">
+        <div class="hero-copy reveal">
+          <div class="eyebrow"><span></span><b data-es="Infraestructura abierta para sistemas de IA" data-en="Open infrastructure for AI systems">Infraestructura abierta para sistemas de IA</b></div>
+          <h1 data-es="Agentes, workflows y personas. Un solo sistema." data-en="Agents, workflows, and people. One system.">Agentes, workflows y personas. Un solo sistema.</h1>
+          <p data-es="Fluxbee conecta cada conversación con la identidad, el conocimiento y las herramientas correctas. Así, un conjunto de agentes deja de ser una colección de bots y empieza a trabajar como un equipo." data-en="Fluxbee connects every conversation to the right identity, knowledge, and tools. A collection of agents stops behaving like isolated bots and starts working as a team.">Fluxbee conecta cada conversación con la identidad, el conocimiento y las herramientas correctas. Así, un conjunto de agentes deja de ser una colección de bots y empieza a trabajar como un equipo.</p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#start"><span data-es="Probar el lab" data-en="Try the lab">Probar el lab</span><span aria-hidden="true">↓</span></a>
+            <a class="button button-light" href="https://github.com/4iplatform/fluxbee" target="_blank" rel="noreferrer"><span data-es="Ver el código" data-en="View source">Ver el código</span><span aria-hidden="true">↗</span></a>
+          </div>
+          <p class="hero-note"><span class="pulse"></span><span data-es="MIT · Rust + Go · desarrollo activo" data-en="MIT · Rust + Go · active development">MIT · Rust + Go · desarrollo activo</span></p>
+        </div>
+
+        <div class="system-demo reveal" aria-label="Fluxbee message flow">
+          <div class="demo-topbar">
+            <div class="window-dots"><span></span><span></span><span></span></div>
+            <span>live thread · ilk:lucia</span>
+            <b>● routed</b>
+          </div>
+          <div class="demo-body">
+            <div class="message customer">
+              <div class="avatar">LM</div>
+              <div><small>Lucía · WhatsApp</small><p data-es="¿Tienen una opción antimanchas? Quiero coordinar una llamada." data-en="Do you have a stain-resistant option? I'd like to schedule a call.">¿Tienen una opción antimanchas? Quiero coordinar una llamada.</p></div>
+            </div>
+            <div class="route-line"><span></span><code>identity → policy → AI.sales</code></div>
+            <div class="message agent">
+              <div class="avatar bee-avatar"><img src="assets/fluxbee-mark.svg" alt=""></div>
+              <div><small>AI.sales · degree verified</small><p data-es="Sí. Te envié el catálogo y agendé una llamada para mañana a las 11:30." data-en="Yes. I sent the catalog and scheduled a call for tomorrow at 11:30.">Sí. Te envié el catálogo y agendé una llamada para mañana a las 11:30.</p></div>
+            </div>
+            <div class="actions-label" data-es="Acciones completadas" data-en="Completed actions">Acciones completadas</div>
+            <div class="action-grid">
+              <div><i class="icon mail">↗</i><span><b>Email</b><small data-es="Catálogo enviado" data-en="Catalog sent">Catálogo enviado</small></span><em>done</em></div>
+              <div><i class="icon calendar">24</i><span><b>Calendar</b><small>11:30 · tomorrow</small></span><em>done</em></div>
+              <div><i class="icon crm">HS</i><span><b>CRM</b><small data-es="Lead actualizado" data-en="Lead updated">Lead actualizado</small></span><em>done</em></div>
+              <div><i class="icon human">#</i><span><b>Human</b><small data-es="Resumen visible" data-en="Summary visible">Resumen visible</small></span><em>ready</em></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="idea-strip" aria-label="From isolated tools to one system">
+      <div class="container idea-grid reveal">
+        <div><small data-es="Sin Fluxbee" data-en="Without Fluxbee">Sin Fluxbee</small><strong data-es="Cada agente vive aislado." data-en="Every agent lives in isolation.">Cada agente vive aislado.</strong><p data-es="Integraciones punto a punto, contexto fragmentado y handoffs manuales." data-en="Point-to-point integrations, fragmented context, and manual handoffs.">Integraciones punto a punto, contexto fragmentado y handoffs manuales.</p></div>
+        <div class="idea-arrow">→</div>
+        <div><small data-es="Con Fluxbee" data-en="With Fluxbee">Con Fluxbee</small><strong data-es="El trabajo fluye de punta a punta." data-en="Work flows end to end.">El trabajo fluye de punta a punta.</strong><p data-es="Identidad, routing, memoria y políticas compartidas por todo el sistema." data-en="Identity, routing, memory, and policies shared across the whole system.">Identidad, routing, memoria y políticas compartidas por todo el sistema.</p></div>
+      </div>
+    </section>
+
+    <section class="section" id="possibilities">
+      <div class="container">
+        <div class="section-head reveal">
+          <span class="section-label" data-es="Qué podés crear" data-en="What you can build">Qué podés crear</span>
+          <h2 data-es="Sistemas de IA que hacen más que responder." data-en="AI systems that do more than reply.">Sistemas de IA que hacen más que responder.</h2>
+          <p data-es="Fluxbee es la capa de coordinación. Vos definís los agentes, las herramientas y las reglas para convertir conversaciones en resultados verificables." data-en="Fluxbee is the coordination layer. You define the agents, tools, and rules that turn conversations into verifiable outcomes.">Fluxbee es la capa de coordinación. Vos definís los agentes, las herramientas y las reglas para convertir conversaciones en resultados verificables.</p>
+        </div>
+        <div class="use-grid">
+          <article class="use-card featured reveal">
+            <div class="card-icon">↗</div><span class="card-tag">Sales</span>
+            <h3 data-es="Un equipo comercial siempre activo" data-en="An always-on sales team">Un equipo comercial siempre activo</h3>
+            <p data-es="Califica leads, comparte material, agenda reuniones y actualiza el CRM sin perder el hilo de la conversación." data-en="Qualify leads, share collateral, schedule meetings, and update the CRM without losing conversation context.">Califica leads, comparte material, agenda reuniones y actualiza el CRM sin perder el hilo de la conversación.</p>
+            <div class="mini-flow"><span>Lead</span><i>→</i><span>AI.qualifier</span><i>→</i><span>Human closer</span></div>
+          </article>
+          <article class="use-card reveal">
+            <div class="card-icon">☏</div><span class="card-tag">Support</span>
+            <h3 data-es="Soporte multicanal con contexto" data-en="Context-aware multichannel support">Soporte multicanal con contexto</h3>
+            <p data-es="La misma identidad y memoria acompañan al usuario entre canales, agentes especializados y escalaciones humanas." data-en="The same identity and memory follow a user across channels, specialized agents, and human escalations.">La misma identidad y memoria acompañan al usuario entre canales, agentes especializados y escalaciones humanas.</p>
+          </article>
+          <article class="use-card reveal">
+            <div class="card-icon">⌁</div><span class="card-tag">Operations</span>
+            <h3 data-es="Workflows que coordinan sistemas" data-en="Workflows that coordinate systems">Workflows que coordinan sistemas</h3>
+            <p data-es="Combiná pasos determinísticos con decisiones de IA, permisos y trazabilidad en una misma red de trabajo." data-en="Combine deterministic steps with AI decisions, permissions, and traceability in one operating network.">Combiná pasos determinísticos con decisiones de IA, permisos y trazabilidad en una misma red de trabajo.</p>
+          </article>
+          <article class="use-card reveal">
+            <div class="card-icon">◎</div><span class="card-tag">SaaS</span>
+            <h3 data-es="Plataformas multi-tenant" data-en="Multi-tenant platforms">Plataformas multi-tenant</h3>
+            <p data-es="Separá identidades, capacidades, datos y políticas por organización sobre una infraestructura compartida." data-en="Separate identities, capabilities, data, and policies by organization on shared infrastructure.">Separá identidades, capacidades, datos y políticas por organización sobre una infraestructura compartida.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section how-section" id="how">
+      <div class="container">
+        <div class="section-head centered reveal">
+          <span class="section-label" data-es="Cómo funciona" data-en="How it works">Cómo funciona</span>
+          <h2 data-es="Un mensaje entra. Todo el sistema sabe qué hacer." data-en="A message comes in. The whole system knows what to do.">Un mensaje entra. Todo el sistema sabe qué hacer.</h2>
+          <p data-es="Cinco tipos de nodos cooperan dentro de hives locales y entre hives distribuidos." data-en="Five node types cooperate inside local hives and across distributed hives.">Cinco tipos de nodos cooperan dentro de hives locales y entre hives distribuidos.</p>
+        </div>
+        <div class="journey reveal">
+          <div class="journey-line"></div>
+          <article><b>01</b><div class="node-badge io">IO</div><h3 data-es="Entra por cualquier canal" data-en="Arrives from any channel">Entra por cualquier canal</h3><p data-es="Un nodo de entrada convierte cada interacción al protocolo común." data-en="An edge node turns every interaction into the common protocol.">Un nodo de entrada convierte cada interacción al protocolo común.</p></article>
+          <article><b>02</b><div class="node-badge rt">RT</div><h3 data-es="Encuentra el destino" data-en="Finds its destination">Encuentra el destino</h3><p data-es="El router combina identidad, capacidad y política para decidir la ruta." data-en="The router combines identity, capability, and policy to choose a route.">El router combina identidad, capacidad y política para decidir la ruta.</p></article>
+          <article><b>03</b><div class="node-badge ai">AI</div><h3 data-es="Un agente resuelve" data-en="An agent resolves it">Un agente resuelve</h3><p data-es="El agente correcto recibe contexto y herramientas para completar su tarea." data-en="The right agent receives context and tools to complete its task.">El agente correcto recibe contexto y herramientas para completar su tarea.</p></article>
+          <article><b>04</b><div class="node-badge wf">WF</div><h3 data-es="El workflow ejecuta" data-en="The workflow executes">El workflow ejecuta</h3><p data-es="Acciones, validaciones y handoffs avanzan hasta un resultado verificable." data-en="Actions, validations, and handoffs advance to a verifiable outcome.">Acciones, validaciones y handoffs avanzan hasta un resultado verificable.</p></article>
+          <article><b>05</b><div class="node-badge sy">SY</div><h3 data-es="El sistema mantiene control" data-en="The system keeps control">El sistema mantiene control</h3><p data-es="Identidad, memoria, configuración y auditoría permanecen disponibles." data-en="Identity, memory, configuration, and audit data stay available.">Identidad, memoria, configuración y auditoría permanecen disponibles.</p></article>
+        </div>
+
+        <div class="principles">
+          <article class="reveal"><span>01</span><h3 data-es="Identidad persistente" data-en="Persistent identity">Identidad persistente</h3><p data-es="Cada humano, agente y tenant tiene una ILK que lo acompaña por toda la red." data-en="Every human, agent, and tenant has an ILK that follows it across the network.">Cada humano, agente y tenant tiene una ILK que lo acompaña por toda la red.</p><code>ilk:550e8400-e29b…</code></article>
+          <article class="reveal"><span>02</span><h3 data-es="Routing por capacidad" data-en="Capability routing">Routing por capacidad</h3><p data-es="Los mensajes llegan a quien puede resolverlos, no sólo a una dirección fija." data-en="Messages reach whoever can resolve them, not merely a fixed address.">Los mensajes llegan a quien puede resolverlos, no sólo a una dirección fija.</p><code>requires: support.billing</code></article>
+          <article class="reveal"><span>03</span><h3 data-es="Políticas verificables" data-en="Verifiable policies">Políticas verificables</h3><p data-es="OPA separa las reglas de acceso y routing de la lógica de cada agente." data-en="OPA separates access and routing rules from each agent's logic.">OPA separa las reglas de acceso y routing de la lógica de cada agente.</p><code>policy: allow + target</code></article>
+          <article class="reveal"><span>04</span><h3 data-es="Local y distribuido" data-en="Local and distributed">Local y distribuido</h3><p data-es="Memoria compartida dentro de un hive; replicación y gateways entre hives." data-en="Shared memory inside a hive; replication and gateways between hives.">Memoria compartida dentro de un hive; replicación y gateways entre hives.</p><code>motherbee ⇄ worker</code></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="architecture-section">
+      <div class="container architecture-grid">
+        <div class="architecture-copy reveal">
+          <span class="section-label" data-es="Arquitectura, sin el ruido" data-en="Architecture, without the noise">Arquitectura, sin el ruido</span>
+          <h2 data-es="Pensalo como una organización conectada." data-en="Think of it as a connected organization.">Pensalo como una organización conectada.</h2>
+          <p data-es="Un hive reúne nodos que trabajan cerca y comparten estado. Podés sumar otros hives para distribuir equipos, regiones o cargas, mientras motherbee coordina el plano de control." data-en="A hive groups nearby nodes that share state. Add more hives to distribute teams, regions, or workloads while motherbee coordinates the control plane.">Un hive reúne nodos que trabajan cerca y comparten estado. Podés sumar otros hives para distribuir equipos, regiones o cargas, mientras motherbee coordina el plano de control.</p>
+          <a class="text-link" href="https://github.com/4iplatform/fluxbee/blob/main/docs/01-arquitectura.md" target="_blank" rel="noreferrer"><span data-es="Leer la arquitectura completa" data-en="Read the full architecture">Leer la arquitectura completa</span> ↗</a>
+          <div class="legend">
+            <div><i class="io"></i><span><b>IO</b><small data-es="Canales" data-en="Channels">Canales</small></span></div>
+            <div><i class="ai"></i><span><b>AI</b><small data-es="Agentes" data-en="Agents">Agentes</small></span></div>
+            <div><i class="wf"></i><span><b>WF</b><small>Workflows</small></span></div>
+            <div><i class="sy"></i><span><b>SY</b><small data-es="Sistema" data-en="System">Sistema</small></span></div>
+          </div>
+        </div>
+        <div class="hive-map reveal" aria-label="Fluxbee hive architecture">
+          <div class="hive mother">
+            <header><span class="hive-dot"></span><b>motherbee</b><small>control plane</small></header>
+            <div class="hive-nodes"><span class="sy">SY.identity</span><span class="sy">SY.admin</span><span class="rt">RT.gateway</span></div>
+          </div>
+          <div class="wan"><span></span><code>secure mesh · replicated state</code><span></span></div>
+          <div class="worker-row">
+            <div class="hive worker"><header><span class="hive-dot"></span><b>sales-hive</b></header><div class="hive-nodes"><span class="io">IO.channel</span><span class="ai">AI.sales</span><span class="wf">WF.crm</span></div></div>
+            <div class="hive worker"><header><span class="hive-dot"></span><b>support-hive</b></header><div class="hive-nodes"><span class="io">IO.channel</span><span class="ai">AI.support</span><span class="wf">WF.ticket</span></div></div>
+          </div>
+          <div class="map-note"><span class="pulse"></span><span data-es="Cada hive enruta localmente y sigue operando como unidad." data-en="Each hive routes locally and keeps operating as a unit.">Cada hive enruta localmente y sigue operando como unidad.</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section start-section" id="start">
+      <div class="container">
+        <div class="section-head reveal">
+          <span class="section-label" data-es="Probalo localmente" data-en="Try it locally">Probalo localmente</span>
+          <h2 data-es="Una malla real, en dos comandos." data-en="A real mesh, in two commands.">Una malla real, en dos comandos.</h2>
+          <p data-es="El lab levanta motherbee y un worker en Docker usando el mismo instalador y ciclo de servicios del sistema real." data-en="The lab runs motherbee and one worker in Docker using the same installer and service lifecycle as the real system.">El lab levanta motherbee y un worker en Docker usando el mismo instalador y ciclo de servicios del sistema real.</p>
+        </div>
+        <div class="terminal-wrap reveal">
+          <div class="terminal">
+            <div class="terminal-bar"><div class="window-dots"><span></span><span></span><span></span></div><span>fluxbee / quickstart</span><button class="copy-button" type="button" data-copy-target="quickstart"><span data-es="Copiar" data-en="Copy">Copiar</span></button></div>
+            <pre id="quickstart"><code><span class="comment"># 1. Clone the repository</span>
+git clone https://github.com/4iplatform/fluxbee.git
+cd fluxbee
+
+<span class="comment"># 2. Start motherbee + worker</span>
+docker compose -f lab/docker-compose.yml pull
+docker compose -f lab/docker-compose.yml up -d
+
+<span class="comment"># 3. Ask the control plane what is alive</span>
+curl -s localhost:8080/hives | jq .</code></pre>
+          </div>
+          <aside class="requirements">
+            <h3 data-es="Antes de empezar" data-en="Before you start">Antes de empezar</h3>
+            <ul>
+              <li><span>✓</span><p><b>Docker</b><small data-es="Desktop o Engine con cgroup v2" data-en="Desktop or Engine with cgroup v2">Desktop o Engine con cgroup v2</small></p></li>
+              <li><span>✓</span><p><b>linux/amd64</b><small data-es="Arquitectura soportada por el lab actual" data-en="Architecture supported by the current lab">Arquitectura soportada por el lab actual</small></p></li>
+              <li><span>✓</span><p><b>10–12 GB RAM</b><small data-es="Asignados a Docker" data-en="Allocated to Docker">Asignados a Docker</small></p></li>
+            </ul>
+            <div class="notice"><b data-es="Estado del lab" data-en="Lab status">Estado del lab</b><p data-es="Motherbee + worker están disponibles. Egress/NAT requiere una VM Linux para validación completa." data-en="Motherbee + worker are available. Egress/NAT requires a Linux VM for full validation.">Motherbee + worker están disponibles. Egress/NAT requiere una VM Linux para validación completa.</p></div>
+            <a class="text-link" href="https://github.com/4iplatform/fluxbee/blob/main/lab/README.md" target="_blank" rel="noreferrer"><span data-es="Guía completa del lab" data-en="Full lab guide">Guía completa del lab</span> ↗</a>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <section class="section build-section" id="build">
+      <div class="container">
+        <div class="build-intro reveal">
+          <div><span class="section-label" data-es="Extendé Fluxbee" data-en="Extend Fluxbee">Extendé Fluxbee</span><h2 data-es="Creá una nueva unidad de trabajo." data-en="Create a new unit of work.">Creá una nueva unidad de trabajo.</h2></div>
+          <p data-es="Empezá con una configuración, un workflow o tu propio runtime. El empaquetado mantiene código, prompts, assets y defaults como una unidad versionada." data-en="Start with configuration, a workflow, or your own runtime. Packaging keeps code, prompts, assets, and defaults together as a versioned unit.">Empezá con una configuración, un workflow o tu propio runtime. El empaquetado mantiene código, prompts, assets y defaults como una unidad versionada.</p>
+        </div>
+        <div class="package-types reveal">
+          <article class="selected"><div><code>config_only</code><span data-es="Recomendado para empezar" data-en="Recommended first step">Recomendado para empezar</span></div><h3 data-es="Una nueva persona de agente" data-en="A new agent persona">Una nueva persona de agente</h3><p data-es="Prompt, modelo y parámetros sobre un runtime existente. No requiere compilar." data-en="Prompt, model, and parameters on an existing runtime. No compilation required.">Prompt, modelo y parámetros sobre un runtime existente. No requiere compilar.</p></article>
+          <article><div><code>workflow</code></div><h3 data-es="Un proceso coordinado" data-en="A coordinated process">Un proceso coordinado</h3><p data-es="Pasos, timeout y escalación sobre el motor de workflows." data-en="Steps, timeout, and escalation on the workflow engine.">Pasos, timeout y escalación sobre el motor de workflows.</p></article>
+          <article><div><code>full_runtime</code></div><h3 data-es="Un nodo completamente propio" data-en="A fully custom node">Un nodo completamente propio</h3><p data-es="Tu binario en Rust, Go u otro lenguaje, ejecutado como proceso independiente." data-en="Your Rust, Go, or other binary running as an independent process.">Tu binario en Rust, Go u otro lenguaje, ejecutado como proceso independiente.</p></article>
+        </div>
+        <div class="build-steps reveal">
+          <article><b>01</b><div><h3 data-es="Scaffold" data-en="Scaffold">Scaffold</h3><code>fluxbee-scaffold --name ai.soporte.billing<br>  --type config_only --base ai.generic</code></div></article>
+          <article><b>02</b><div><h3 data-es="Personalizá" data-en="Customize">Personalizá</h3><p data-es="Editá el prompt y los defaults generados en el directorio del paquete." data-en="Edit the generated prompt and defaults in the package directory.">Editá el prompt y los defaults generados en el directorio del paquete.</p></div></article>
+          <article><b>03</b><div><h3 data-es="Empaquetá" data-en="Package">Empaquetá</h3><code>fluxbee-scaffold pack ./ai.soporte.billing</code></div></article>
+          <article><b>04</b><div><h3 data-es="Publicá y ejecutá" data-en="Publish and run">Publicá y ejecutá</h3><p data-es="Publicalo desde Archi o la CLI, sincronizalo a un hive y creá el nodo." data-en="Publish through Archi or the CLI, sync it to a hive, and spawn the node.">Publicalo desde Archi o la CLI, sincronizalo a un hive y creá el nodo.</p></div></article>
+        </div>
+        <a class="button button-light build-link" href="https://github.com/4iplatform/fluxbee#creating-a-node-from-scratch" target="_blank" rel="noreferrer"><span data-es="Seguir el tutorial completo" data-en="Follow the full tutorial">Seguir el tutorial completo</span> <span>↗</span></a>
+      </div>
+    </section>
+
+    <section class="status-section">
+      <div class="container status-grid">
+        <div class="status-copy reveal">
+          <span class="section-label" data-es="Estado del proyecto" data-en="Project status">Estado del proyecto</span>
+          <h2 data-es="Funcional, abierto y todavía en construcción." data-en="Working, open, and still being built.">Funcional, abierto y todavía en construcción.</h2>
+          <p data-es="El núcleo corre en pruebas end-to-end multi-hive. La plataforma evoluciona rápido y todavía no es un producto de instalación trivial para producción." data-en="The core runs in multi-hive end-to-end tests. The platform evolves quickly and is not yet a trivial production install.">El núcleo corre en pruebas end-to-end multi-hive. La plataforma evoluciona rápido y todavía no es un producto de instalación trivial para producción.</p>
+          <div class="status-pill"><span class="pulse"></span><span data-es="Desarrollo activo" data-en="Active development">Desarrollo activo</span></div>
+        </div>
+        <div class="status-lists reveal">
+          <div><h3><span>✓</span><span data-es="Disponible hoy" data-en="Available today">Disponible hoy</span></h3><ul><li data-es="Router, FIB y memoria compartida" data-en="Router, FIB, and shared memory">Router, FIB y memoria compartida</li><li data-es="Comunicación entre nodos y hives" data-en="Node and inter-hive communication">Comunicación entre nodos y hives</li><li data-es="Identidad v2 y replicación" data-en="Identity v2 and replication">Identidad v2 y replicación</li><li data-es="Políticas OPA y configuración distribuida" data-en="OPA policies and distributed configuration">Políticas OPA y configuración distribuida</li></ul></div>
+          <div><h3><span>→</span><span data-es="En progreso" data-en="In progress">En progreso</span></h3><ul><li data-es="Ciclo completo de degrees y graduations" data-en="Full degree and graduation lifecycle">Ciclo completo de degrees y graduations</li><li data-es="Más runtimes de canales y agentes" data-en="More channel and agent runtimes">Más runtimes de canales y agentes</li><li data-es="Catálogo más amplio de workflows" data-en="A broader workflow catalog">Catálogo más amplio de workflows</li><li data-es="Experiencia de instalación simplificada" data-en="A simpler installation experience">Experiencia de instalación simplificada</li></ul></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="cta-section">
+      <div class="container cta reveal">
+        <img src="assets/fluxbee-mark.svg" alt="" width="56" height="48">
+        <span class="section-label" data-es="La malla está abierta" data-en="The mesh is open">La malla está abierta</span>
+        <h2 data-es="Explorá el sistema. Creá un nodo. Sumate." data-en="Explore the system. Build a node. Join in.">Explorá el sistema. Creá un nodo. Sumate.</h2>
+        <p data-es="Leé el código, levantá el lab y abrí una discusión con la comunidad." data-en="Read the code, run the lab, and start a discussion with the community.">Leé el código, levantá el lab y abrí una discusión con la comunidad.</p>
+        <div><a class="button button-primary" href="https://github.com/4iplatform/fluxbee" target="_blank" rel="noreferrer"><span data-es="Abrir en GitHub" data-en="Open on GitHub">Abrir en GitHub</span> ↗</a><a class="button button-light" href="https://github.com/4iplatform/fluxbee/tree/main/docs" target="_blank" rel="noreferrer"><span data-es="Leer la documentación" data-en="Read the docs">Leer la documentación</span></a></div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container footer-inner">
+      <a class="brand" href="#top"><img src="assets/fluxbee-mark.svg" alt="" width="28" height="24"><span>flux<span>bee</span></span></a>
+      <p data-es="El sistema operativo para clusters autónomos de agentes de IA." data-en="The OS for autonomous AI agent clusters.">El sistema operativo para clusters autónomos de agentes de IA.</p>
+      <nav aria-label="Footer"><a href="https://fluxbee.ai" target="_blank" rel="noreferrer">fluxbee.ai ↗</a><a href="https://github.com/4iplatform/fluxbee/blob/main/LICENSE" target="_blank" rel="noreferrer">MIT License</a><a href="https://github.com/4iplatform/fluxbee" target="_blank" rel="noreferrer">GitHub</a></nav>
+      <small>© 2026 4i Platform Inc.</small>
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
