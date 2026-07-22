@@ -172,3 +172,30 @@ y al empaquetado:
 
 Build verde; tests: sy_admin 85/85, sy_orchestrator 132/132 + 1 nuevo (ssh_bootstrap_error).
 Cambios de código adversarialmente revisados antes de commitear.
+
+---
+
+## Re-test clean-slate (2026-07-22) — fixes VALIDADOS EN VIVO, deploy de cero end-to-end
+
+Se **rompió y recreó todo** con los fixes puestos: `.deb` reconstruido (64117d3) + template arreglado
+con `lab/template-prep.sh` (VM 250) + hive integrado recreado de cero en PC-004-157 (MB + worker +
+ingress dual-NIC + egress NAT), **sin ningún workaround manual**.
+
+| Finding | Antes (1er deploy) | Ahora (template/binarios arreglados) |
+|---------|--------------------|--------------------------------------|
+| **F-1** machine-id | los 4 clones colisionaban en `.74` | **IPs únicas por DHCP** (`.25/.97/.77/.47`) — resuelto |
+| **F-2** dpkg | `apt install` roto (`dpkg was interrupted`) | **install OK sin `dpkg --configure -a`** |
+| **F-3** clean box | sin sshd ni usuario → setup manual | **sshd+administrator+PasswordAuth del template**; add_hive bootstrapeó limpio |
+| **G1** deps | firstboot no-opeaba | curl+python3 presentes; firstboot `first-boot done` |
+| **F-4b** cli | `sy-admin --help` colgaba | **responde exit 0** con el help |
+| **F-5** role | `worker1 role=None` | **`worker1 role=worker`** en `/hives` |
+| **F4a** externalize | inaccesible en backend instalado | **`GET/POST /channels/*` funcionan**: `list_externalized` via REST = ok; externalize público via REST = ok |
+| **Edge request-flow** | nunca cerrado | **`curl POST :8443/e/<ich>` = HTTP 200** con respuesta estructurada del io.api (edge→cross-hive→MB io.api→reply) |
+
+Mesh final: motherbee(alive, 18 nodos) + worker1 + ingress1(dual-NIC, edge :8443) + egress1(NAT).
+Bug adicional encontrado + arreglado en el camino: `scripts/apt-repo-publish.sh` + `lab/template-prep.sh`
+sin bit +x (commit 5be0ae5). Commits: 64117d3 (fixes) + 5be0ae5 (+x).
+
+**Observación menor (io.api, fuera de scope instalador):** el inbound del io.api responde
+`field 'message' is required` aun enviando `{"message":...}` top-level → el campo se espera anidado
+(envelope). Da HTTP 200 + reply estructurada (edge OK); es ergonomía del contrato de payload del io.api.
