@@ -1,5 +1,7 @@
 # Auditoría — AI engine selection (OpenAI + Anthropic)
 
+> **✅ RESUELTO (2026-07-22).** Todos los hallazgos accionables (2 ALTAS + 6 MEDIAS + BAJAS) fueron implementados, adversarialmente re-revisados (el review de los fixes encontró 3 defectos nuevos — un **bypass del validador A1** vía userinfo, un **leak de secreto en M2**, y una **regresión de clasificación de attachment en M3** — todos corregidos) y cubiertos por unit tests. Ver la sección **Resolución** al final. B4 (retry-after HTTP-date) aceptado con el fallback seguro actual; los ítems INFO/known-open quedan con los checkboxes abiertos del spec (C3/C4/D6/F1-F4).
+
 **Fecha:** 2026-07-21
 **Objeto:** el trabajo de `docs/onworking COA/ai-engine-selection.md`, implementado en el commit `a8a9c54` ("feat(ai): add Anthropic provider support"), auditado contra HEAD `429a197`.
 **Metodología:** 5 auditores independientes por dimensión (spec-conformance, adapter Anthropic, seguridad de credenciales, migración de consumidores SY, contrato ai-generic) + verificación adversarial de cada hallazgo (35 verificadores que intentan refutarlo). 33 hallazgos confirmados, 2 refutados.
@@ -109,3 +111,30 @@ Los checkboxes abiertos (B9 mock-HTTP tests, C3 diagnóstico redacted, C4 edge c
 5. **M2** (FAILED_CONFIG en upgrade) + **M6** (provider hardcodeado) + **B1/B2** (mentiras bajo Anthropic).
 6. **M4** (fallback por capability) — o des-marcar B5 y decidir si se quiere.
 7. El resto (BAJA/INFO) puede viajar con los checkboxes abiertos C3/C4/D6/F1-F3.
+
+## Resolución (2026-07-22)
+
+Implementado + unit-tested + adversarialmente re-revisado. El review de los fixes (3 revisores) encontró **3 defectos nuevos** en la propia implementación, todos corregidos antes de cerrar:
+- **A1 bypass**: el extractor de host spliteaba en `:`, dejando pasar `https://api.openai.com:x@evil.com` (host real = evil.com) → **exfil igual**. Corregido: se rechaza cualquier userinfo (`@`) y se extrae host antes del `:port`.
+- **M2 leak**: el doc rechazado se surfaceaba crudo en `effective_config`, y `redact_secrets` solo enmascara la key `api_key` → un secreto inline con otro nombre filtraba por CONFIG_GET. Corregido: se retiene (withhold) el body si contiene campo secreto; + se eliminó un doble-read TOCTOU que podía panickear el boot.
+- **M3 regresión**: cambiar el error OpenAI de `body=` a `type/message` rompió `extract_openai_error_param` (parseaba el body JSON) → la clasificación `provider_attachment_invalid_request` quedaba muerta. Corregido: el error ahora lleva `param=` explícito y el extractor lo lee del string; aplicado también al path function-calling.
+
+| Hallazgo | Estado | Fix |
+|----------|--------|-----|
+| A1 base_url exfil | ✅ | `validate_managed_base_url`: https + allowlist de host provider + rechazo de userinfo; override solo por env `FLUXBEE_ALLOW_INSECURE_BASE_URL` (no config-plane). Ambos build-paths. |
+| A2 truncamiento silencioso | ✅ | Default Anthropic 1024→4096 + `anthropic_check_truncation`(`stop_reason`) y `openai_check_truncation`(`incomplete_details`) en generate + function-calling. |
+| M1 retry roto por body no-JSON | ✅ | El retry decide por status+headers antes de parsear; body tolerante en el path no-retry. |
+| M2 FAILED_CONFIG en upgrade | ✅ | `persisted_config_rejected` distingue doc-rechazado de ausente → FAILED_CONFIG con config_version (body redactado si tiene secreto). |
+| M3 errores Anthropic sin clasificar | ✅ | `parse_openai_status_error` entiende ambos markers (openai/anthropic) + `param=`; en ai-generic y frontdesk. |
+| M4 fallback structured-output por capability | ✅ | `generate` reintenta 1× sin `output_config` con instrucción de prompt ante un 400 de capability. |
+| M5 first-message ≠ user | ✅ | `build_anthropic_function_messages` dropea assistant iniciales + tool_result huérfanos. |
+| M6 architect provider hardcodeado | ✅ | Devuelve `runtime.provider.to_string()`. |
+| B1 fallback silencioso | ✅ | Interest handlers admin/architect: warn en error, quiet solo en "sin sección ai". |
+| B3 gif como Document | ✅ | `is_supported_image_mime` provider-neutral (incluye gif). |
+| B5 Debug con key | ✅ | `ResolvedAiCredential` Debug manual redactado. |
+| B6 body-echo de key OpenAI | ✅ | Error OpenAI sin body crudo + `scrub_secret_like` (redacta `sk-…` en boundary de token). |
+| B2 strings "OpenAI" bajo Anthropic | ⚠️ parcial | Corregido el error not-configured del executor de admin (el más engañoso); el resto de strings cosméticas quedan con el pass de docs F1/F2. |
+| B4 retry-after HTTP-date | ⏸️ aceptado | El fallback (backoff exponencial acotado) es seguro; un parser de fecha a mano es más frágil. |
+| INFO / known-open (I1-I7, B7-B9) | ⏸️ | Diagnóstico/cosméticos que restan de los checkboxes abiertos del spec (C3/C4/D6/F1-F4). |
+
+Commits: (ver el commit `fix(ai)` que referencia este doc). Tests nuevos: SDK (`openai_status_error` sin key-echo, `scrub_secret_like`, detectores de truncamiento, `output_config_unsupported`), ai-generic (`validate_managed_base_url` incl. bypass de userinfo, `parse_provider_status_error` ambos providers, `extract_openai_error_param` + attachment). Suites: SDK 65, ai-generic 39, frontdesk 26 — todas verdes.

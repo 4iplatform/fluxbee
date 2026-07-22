@@ -142,7 +142,7 @@ pub async fn build_model_user_content_parts_with_options(
             continue;
         }
 
-        if is_openai_image_mime(&attachment.blob_ref.mime) {
+        if is_supported_image_mime(&attachment.blob_ref.mime) {
             let bytes = tokio_fs::read(&attachment.path).await.map_err(|err| {
                 if err.kind() == std::io::ErrorKind::NotFound {
                     ModelInputPayloadError::BlobNotFound(format!(
@@ -463,8 +463,15 @@ fn is_textual_mime(mime: &str) -> bool {
     matches!(mime, "text/plain" | "text/markdown" | "application/json")
 }
 
-fn is_openai_image_mime(mime: &str) -> bool {
-    matches!(mime, "image/png" | "image/jpeg" | "image/webp")
+/// Image MIMEs both providers' vision APIs accept (audit B3): the OpenAI-only png/jpeg/webp set
+/// misrouted image/gif to a Document part, which the Anthropic adapter then rejected with a
+/// misleading "unsupported document" error even though its image arm accepts gif. Keep this the
+/// single provider-neutral gate — both OpenAI vision and Anthropic Messages accept these four.
+fn is_supported_image_mime(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    )
 }
 
 fn canonical_attachment_filename(attachment: &ResolvedModelAttachment) -> String {

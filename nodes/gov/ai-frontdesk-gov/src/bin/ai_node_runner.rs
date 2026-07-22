@@ -990,7 +990,7 @@ impl AiNode for GenericAiNode {
                                     trace_id = %msg.routing.trace_id,
                                     model = %openai.model,
                                     provider_status = status,
-                                    provider_param = ?extract_openai_error_param(&detail),
+                                    provider_param = ?extract_openai_error_param(msg_text),
                                     provider_detail = %trim_chars(&detail, 280),
                                     attachment_count = attachment_summary.count,
                                     attachment_total_bytes = attachment_summary.total_bytes,
@@ -3620,7 +3620,7 @@ fn ai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
         fluxbee_ai_sdk::errors::AiSdkError::Protocol(msg) => {
             if let Some((status, detail)) = parse_openai_status_error(msg) {
                 if status == 400 || status == 404 || status == 422 {
-                    if extract_openai_error_param(&detail)
+                    if extract_openai_error_param(msg)
                         .as_deref()
                         .is_some_and(is_openai_attachment_param)
                     {
@@ -3898,15 +3898,27 @@ fn build_frontdesk_result_from_register_response(
     payload
 }
 
+/// Extract (status, detail) from a provider HTTP error. Matches BOTH the OpenAI and Anthropic
+/// adapter formats (audit M3): "<provider> error status={code} type={t} [request_id=..] message={m}".
+/// The old parser matched only the OpenAI marker + a now-removed " body=" tail, so Anthropic errors
+/// (401/429/5xx/400) all collapsed to a generic unclassified payload under an Anthropic hive.
 fn parse_openai_status_error(message: &str) -> Option<(u16, String)> {
-    let marker = "openai error status=";
-    let idx = message.find(marker)?;
-    let after = &message[idx + marker.len()..];
-    let mut parts = after.splitn(2, ' ');
-    let status = parts.next()?.trim().parse::<u16>().ok()?;
+    let idx = message.find("error status=")?;
+    let after = &message[idx + "error status=".len()..];
+    let status = after
+        .split([' ', ','])
+        .next()?
+        .trim()
+        .parse::<u16>()
+        .ok()?;
     let detail = after
-        .split_once(" body=")
-        .map(|(_, body)| body.trim().to_string())
+        .split_once("message=")
+        .map(|(_, msg)| msg.trim().to_string())
+        .or_else(|| {
+            after
+                .split_once(" body=")
+                .map(|(_, body)| body.trim().to_string())
+        })
         .unwrap_or_default();
     Some((status, detail))
 }
@@ -3942,13 +3954,16 @@ fn attachment_summary_for_observability(
     }
 }
 
-fn extract_openai_error_param(detail: &str) -> Option<String> {
-    let parsed = serde_json::from_str::<Value>(detail).ok()?;
-    parsed
-        .get("error")
-        .and_then(|error| error.get("param"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
+/// Extract the OpenAI error `param` from a provider error string "openai error status=N type=T
+/// param=P message=M" (audit B6/M3: the raw JSON body no longer travels). Empty/absent -> None.
+fn extract_openai_error_param(error_str: &str) -> Option<String> {
+    let after = error_str.split_once("param=")?.1;
+    let param = after
+        .split_once(" message=")
+        .map(|(param, _)| param)
+        .unwrap_or(after)
+        .trim();
+    (!param.is_empty()).then(|| param.to_string())
 }
 
 fn is_openai_attachment_param(param: &str) -> bool {

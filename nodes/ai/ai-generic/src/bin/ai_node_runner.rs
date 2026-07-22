@@ -390,12 +390,25 @@ struct AiChatRuntime {
     multimodal: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ResolvedAiCredential {
     provider: AiProvider,
     api_key: String,
     vault_key: String,
     version: Option<i64>,
+}
+
+// Manual Debug so a future `{:?}` on this struct can never leak the live provider api_key
+// (audit B5 — the derived Debug printed it verbatim; mirrors io-api's PublicationRuntime).
+impl std::fmt::Debug for ResolvedAiCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedAiCredential")
+            .field("provider", &self.provider)
+            .field("api_key", &"<redacted>")
+            .field("vault_key", &self.vault_key)
+            .field("version", &self.version)
+            .finish()
+    }
 }
 
 struct GenericAiNode {
@@ -1181,7 +1194,7 @@ impl AiNode for GenericAiNode {
                                     trace_id = %msg.routing.trace_id,
                                     model = %ai.model,
                                     provider_status = status,
-                                    provider_param = ?extract_openai_error_param(&detail),
+                                    provider_param = ?extract_openai_error_param(msg_text),
                                     provider_detail = %trim_chars(&detail, 280),
                                     attachment_count = attachment_summary.count,
                                     attachment_total_bytes = attachment_summary.total_bytes,
@@ -4556,7 +4569,15 @@ async fn run_unconfigured_bootstrap(
         cognitive_definition_config.enabled,
     )));
     let persisted_dynamic = load_persisted_dynamic_config(&dynamic_dir, &node_name);
-    let spawn_effective = if persisted_dynamic.is_none() {
+    // Audit M2 (+ single-read to avoid a boot-time TOCTOU panic): resolve the "persisted config
+    // exists but the strict contract rejects it" case ONCE. That case goes FAILED_CONFIG; a
+    // genuinely absent config still falls to the spawn file / Unconfigured below.
+    let rejected_persisted = if persisted_dynamic.is_none() {
+        persisted_config_rejected(&dynamic_dir, &node_name)
+    } else {
+        None
+    };
+    let spawn_effective = if persisted_dynamic.is_none() && rejected_persisted.is_none() {
         load_effective_config_from_spawn(&node_name)
     } else {
         None
@@ -4606,7 +4627,27 @@ async fn run_unconfigured_bootstrap(
             }
         }
         None => {
-            if let Some(spawn_cfg) = spawn_effective {
+            if let Some((schema_version, config_version, effective_config)) = rejected_persisted {
+                // Audit M2: a persisted config exists but the current strict contract rejects it
+                // (the old-contract upgrade case). Surface FAILED_CONFIG so the operator sees it
+                // and can recover with a new CONFIG_SET — do NOT fall back to spawn/Unconfigured.
+                // effective_config is already secret-redacted by persisted_config_rejected.
+                tracing::warn!(
+                    node_name = %node_name,
+                    config_version,
+                    "persisted config is incompatible with the current contract; booting FAILED_CONFIG (send a valid CONFIG_SET to recover)"
+                );
+                (
+                    None,
+                    ControlPlaneState {
+                        current_state: NodeLifecycleState::FailedConfig,
+                        config_source: "persisted",
+                        effective_config: Some(effective_config),
+                        schema_version,
+                        config_version,
+                    },
+                )
+            } else if let Some(spawn_cfg) = spawn_effective {
                 let spawn_config = spawn_cfg.config.clone();
                 match build_behavior_from_effective_config(&spawn_config) {
                     Ok(behavior) => {
@@ -4921,6 +4962,7 @@ fn build_behavior(
         BehaviorSection::AiChat(ai) => {
             require_nonempty("behavior.model", &ai.model)?;
             require_nonempty("behavior.vault_key", &ai.vault_key)?;
+            validate_managed_base_url(&ai.base_url)?;
             let instructions = resolve_instructions(&ai.instructions)?;
             let model_settings = ai
                 .model_settings
@@ -4960,6 +5002,55 @@ fn require_nonempty(
     Ok(())
 }
 
+/// Audit A1 (credential exfiltration): `behavior.base_url` arrives on the NON-secret
+/// CONFIG_SET plane but the vault-resolved provider api_key is then sent to it in the clear.
+/// An unvalidated base_url turns config-write access into plaintext key exfiltration and
+/// defeats Model D's plaintext confinement. A managed base_url may therefore ONLY be https
+/// pointing at a provider's canonical API host. An operator can deliberately relax this for a
+/// proxy/gateway via the process env `FLUXBEE_AI_ALLOW_INSECURE_BASE_URL` — env is set by
+/// whoever launches the node, NOT by a CONFIG_SET writer, so it is not reachable from the
+/// config plane.
+fn validate_managed_base_url(
+    base_url: &Option<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    const ALLOWED_HOSTS: &[&str] = &["api.openai.com", "api.anthropic.com"];
+    let Some(raw) = base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(()); // no override -> provider default endpoint, always safe
+    };
+    if std::env::var_os("FLUXBEE_AI_ALLOW_INSECURE_BASE_URL").is_some() {
+        return Ok(());
+    }
+    let rest = raw
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("behavior.base_url must use https:// (got '{raw}')"))?;
+    // Authority = everything before the first path/query/fragment delimiter.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Reject ANY userinfo: "https://api.openai.com:x@evil.com" would otherwise extract the
+    // userinfo as the "host" while reqwest's URL parser connects to evil.com and ships the key
+    // there (audit review — A1 host-extraction bypass). No provider endpoint uses userinfo.
+    if authority.contains('@') {
+        return Err(
+            "behavior.base_url must not contain userinfo ('@'); only a bare provider host is allowed"
+                .to_string()
+                .into(),
+        );
+    }
+    // Strip an optional :port to get the real host.
+    let host = authority.split(':').next().unwrap_or("");
+    if !ALLOWED_HOSTS
+        .iter()
+        .any(|allowed| host.eq_ignore_ascii_case(allowed))
+    {
+        return Err(format!(
+            "behavior.base_url host '{host}' is not an allowed provider endpoint \
+             (allowed: api.openai.com, api.anthropic.com); set FLUXBEE_AI_ALLOW_INSECURE_BASE_URL \
+             in the node process env to override for a trusted gateway"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn build_behavior_from_effective_config(
     config: &EffectiveConfigDocument,
 ) -> Result<NodeBehavior, Box<dyn std::error::Error + Send + Sync>> {
@@ -4988,6 +5079,7 @@ fn build_behavior_from_effective_config(
             let instructions = extract_instructions_from_effective_config(behavior);
             let model_settings = extract_model_settings_from_effective_config(behavior);
             let base_url = behavior.base_url.clone();
+            validate_managed_base_url(&base_url)?;
             let immediate_memory = config
                 .runtime
                 .as_ref()
@@ -5135,6 +5227,41 @@ fn load_persisted_dynamic_config(
         return None;
     }
     serde_json::from_str::<EffectiveStateFile>(&raw).ok()
+}
+
+/// Audit M2: distinguish "no persisted config" from "persisted config that the CURRENT strict
+/// contract REJECTS". A real upgrade leaves an old-contract doc on disk (the pre-a8a9c54 runner
+/// materialized `behavior.provider`, which the new deny_unknown_fields parse rejects); collapsing
+/// that to "absent" silently booted the node UNCONFIGURED (or re-adopted the spawn file), losing
+/// the operator's FAILED_CONFIG signal and config_version. Returns the raw rejected doc's
+/// (schema_version, config_version, config) so boot can enter FAILED_CONFIG instead — recoverable
+/// with a new valid CONFIG_SET. Returns None when the file is absent, unreadable, not JSON, or
+/// parses cleanly under the strict contract (the happy loader owns that case).
+fn persisted_config_rejected(base_dir: &std::path::Path, node_name: &str) -> Option<(u32, u64, Value)> {
+    let path = dynamic_config_path(base_dir, node_name);
+    let raw = fs::read_to_string(path).ok()?;
+    if serde_json::from_str::<EffectiveStateFile>(&raw).is_ok() {
+        return None; // valid under the strict contract -> load_persisted_dynamic_config handles it
+    }
+    // Valid JSON that fails the strict parse = the rejected upgrade case. Non-JSON -> None (nothing
+    // to recover; treat as absent).
+    let root: Value = serde_json::from_str(&raw).ok()?;
+    let schema_version = root
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
+    let config_version = root.get("config_version").and_then(Value::as_u64).unwrap_or(0);
+    let mut config = root.get("config").cloned().unwrap_or(Value::Null);
+    // Do NOT surface a secret-bearing rejected config: CONFIG_GET's redact_secrets only masks a key
+    // literally named "api_key", so an inline secret under any other name would leak through the
+    // FAILED_CONFIG effective_config. Withhold the whole body when a secret field is present (the
+    // schema/config_version still identify which config was rejected).
+    if find_ai_secret_contract_field(&config).is_some() {
+        config = serde_json::json!({
+            "_redacted": "rejected persisted config contained a secret-bearing field and was withheld"
+        });
+    }
+    Some((schema_version, config_version, config))
 }
 
 fn persist_dynamic_config(
@@ -5583,7 +5710,7 @@ fn ai_runtime_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Value {
         fluxbee_ai_sdk::errors::AiSdkError::Protocol(msg) => {
             if let Some((status, detail)) = parse_openai_status_error(msg) {
                 if status == 400 || status == 404 || status == 422 {
-                    if extract_openai_error_param(&detail)
+                    if extract_openai_error_param(msg)
                         .as_deref()
                         .is_some_and(is_openai_attachment_param)
                     {
@@ -5688,15 +5815,28 @@ fn ai_final_output_error_payload(err: &fluxbee_ai_sdk::errors::AiSdkError) -> Va
     }
 }
 
+/// Extract (status, detail) from a provider HTTP error. Matches BOTH the OpenAI and Anthropic
+/// adapter formats (audit M3): the SDK emits "<provider> error status={code} type={t} message={m}"
+/// (Anthropic also carries request_id=). The old parser matched only "openai error status=" + a
+/// now-removed " body=" tail, so every Anthropic error collapsed to a generic unclassified payload
+/// and (after the B6 body-scrub) OpenAI details were lost too.
 fn parse_openai_status_error(message: &str) -> Option<(u16, String)> {
-    let marker = "openai error status=";
-    let idx = message.find(marker)?;
-    let after = &message[idx + marker.len()..];
-    let mut parts = after.splitn(2, ' ');
-    let status = parts.next()?.trim().parse::<u16>().ok()?;
+    let idx = message.find("error status=")?;
+    let after = &message[idx + "error status=".len()..];
+    let status = after
+        .split([' ', ','])
+        .next()?
+        .trim()
+        .parse::<u16>()
+        .ok()?;
     let detail = after
-        .split_once(" body=")
-        .map(|(_, body)| body.trim().to_string())
+        .split_once("message=")
+        .map(|(_, msg)| msg.trim().to_string())
+        .or_else(|| {
+            after
+                .split_once(" body=")
+                .map(|(_, body)| body.trim().to_string())
+        })
         .unwrap_or_default();
     Some((status, detail))
 }
@@ -5732,13 +5872,17 @@ fn attachment_summary_for_observability(
     }
 }
 
-fn extract_openai_error_param(detail: &str) -> Option<String> {
-    let parsed = serde_json::from_str::<Value>(detail).ok()?;
-    parsed
-        .get("error")
-        .and_then(|error| error.get("param"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
+/// Extract the OpenAI error `param` (the offending request field) from a provider error string
+/// "openai error status=N type=T param=P message=M". The raw JSON body no longer travels (audit
+/// B6), so param is now a named token bounded by " message="; empty/absent yields None.
+fn extract_openai_error_param(error_str: &str) -> Option<String> {
+    let after = error_str.split_once("param=")?.1;
+    let param = after
+        .split_once(" message=")
+        .map(|(param, _)| param)
+        .unwrap_or(after)
+        .trim();
+    (!param.is_empty()).then(|| param.to_string())
 }
 
 fn is_openai_attachment_param(param: &str) -> bool {
@@ -6046,6 +6190,52 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn validate_managed_base_url_allows_provider_hosts_rejects_arbitrary() {
+        // A1: only https provider hosts pass; an arbitrary/http host is rejected (credential exfil).
+        assert!(validate_managed_base_url(&None).is_ok());
+        assert!(validate_managed_base_url(&Some(String::new())).is_ok());
+        assert!(validate_managed_base_url(&Some("https://api.openai.com/v1".into())).is_ok());
+        assert!(validate_managed_base_url(&Some("https://api.anthropic.com".into())).is_ok());
+        assert!(validate_managed_base_url(&Some("http://api.openai.com".into())).is_err()); // not https
+        assert!(validate_managed_base_url(&Some("https://attacker.example/v1".into())).is_err());
+        assert!(validate_managed_base_url(&Some("https://api.openai.com.evil.com".into())).is_err());
+        // userinfo bypass attempts (the real host is the attacker) MUST be rejected:
+        assert!(validate_managed_base_url(&Some("https://api.openai.com:x@evil.com/v1".into())).is_err());
+        assert!(validate_managed_base_url(&Some("https://api.openai.com@evil.com".into())).is_err());
+        assert!(validate_managed_base_url(&Some("https://api.openai.com:443".into())).is_ok()); // explicit port OK
+    }
+
+    #[test]
+    fn parse_provider_status_error_handles_both_providers() {
+        // M3: status extracted from BOTH adapter formats; detail is the message (no raw body).
+        let (s, d) = parse_openai_status_error(
+            "openai error status=401 type=invalid_request_error message=Incorrect API key",
+        )
+        .expect("openai parsed");
+        assert_eq!(s, 401);
+        assert_eq!(d, "Incorrect API key");
+        let (s, d) = parse_openai_status_error(
+            "anthropic error status=429 type=rate_limit_error request_id=req_1 message=slow down",
+        )
+        .expect("anthropic parsed");
+        assert_eq!(s, 429);
+        assert_eq!(d, "slow down");
+        assert!(parse_openai_status_error("some unrelated error").is_none());
+    }
+
+    #[test]
+    fn extract_openai_error_param_reads_named_token_and_classifies_attachment() {
+        // M3: attachment classification must survive the body->param=/message= format change.
+        let err = "openai error status=400 type=invalid_request_error param=input[0].content[1].file_data message=Invalid value";
+        let param = extract_openai_error_param(err).expect("param extracted");
+        assert_eq!(param, "input[0].content[1].file_data");
+        assert!(is_openai_attachment_param(&param));
+        // Empty param -> None; no param field -> None.
+        assert!(extract_openai_error_param("openai error status=401 type=x param= message=nope").is_none());
+        assert!(extract_openai_error_param("anthropic error status=429 message=slow").is_none());
+    }
     use tokio::sync::RwLock;
 
     fn env_lock() -> &'static Mutex<()> {
