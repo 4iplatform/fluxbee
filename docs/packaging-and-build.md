@@ -54,7 +54,7 @@ Definido en `packaging/base-nodes.json`:
 | io.api | runtime | instancia default `IO.api@motherbee` corriendo + spawnable |
 | io.slack | runtime | instancia default `IO.slack@motherbee` corriendo + spawnable |
 | ai.generic | runtime | instancia default `AI.chat@motherbee` corriendo + spawnable |
-| wf.engine | runtime | instancia default `WF.engine@motherbee` corriendo + spawnable |
+| wf.engine | runtime | horneado, NO al boot — los nodos WF.* se spawnean desde un **workflow package** que corre sobre este runtime, no por `run_node` sobre el runtime pelado (da `WF_RUNTIME_PACKAGE_REQUIRED`) |
 | io.linkedhelper | runtime | horneado, NO al boot (spawnable a demanda) |
 
 Los nodos base arrancan **corriendo pero degradados** hasta que el operador cargue su

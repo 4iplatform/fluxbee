@@ -64,13 +64,13 @@
       "instance": "AI.chat@motherbee"
     },
     {
+      "_note": "wf.engine (wf-generic) is the WF engine runtime; WF.* nodes are spawned from a WORKFLOW PACKAGE that runs on it, not by run_node on the bare runtime (run_node returns WF_RUNTIME_PACKAGE_REQUIRED). So it ships baked+available but boot=false — publish a workflow package and spawn the WF node when needed.",
       "runtime": "wf.engine",
       "crate": "wf-generic",
       "bin": "wf-generic",
       "workspace": "go",
       "lang": "go",
-      "boot": true,
-      "instance": "WF.engine@motherbee"
+      "boot": false
     },
     {
       "runtime": "io.linkedhelper",
