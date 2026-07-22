@@ -15,6 +15,24 @@ PG_PASS="${FLUXBEE_DB_PASSWORD:-fluxbee}"
 PG_URL="postgresql://${PG_USER}:${PG_PASS}@127.0.0.1:5432"
 ROOT_TENANT="tnt:00000000-0000-0000-0000-000000000001"
 HIVE_ID="$(awk -F': ' '/^hive_id:/{gsub(/"/,"",$2);print $2;exit}' /etc/fluxbee/hive.yaml 2>/dev/null || echo motherbee)"
+# Declarative base-node set (packaging/base-nodes.json, installed by the .deb). Drives which
+# singletons to start and which runtimes to auto-spawn at boot — keeps this in lock-step with
+# build-deb.sh. mf() reads a view; falls back to the hardcoded singletons if the file is absent.
+MANIFEST="${FLUXBEE_BASE_NODES:-/usr/share/fluxbee/base-nodes.json}"
+mf() { # singleton_units -> unit names ; boot_runtimes -> "<runtime>\t<instance>" for boot=true
+  [ -f "$MANIFEST" ] || return 0
+  python3 - "$MANIFEST" "$1" <<'PY' 2>/dev/null || true
+import json, sys
+m = json.load(open(sys.argv[1])); what = sys.argv[2]
+if what == "singleton_units":
+    for e in m.get("singletons", []):
+        print(e.get("unit") or e["node"])
+elif what == "boot_runtimes":
+    for e in m.get("runtimes", []):
+        if e.get("boot"):
+            print("%s\t%s" % (e.get("runtime", ""), e.get("instance", "")))
+PY
+}
 
 wait_hive_ready() {
   local attempts="${1:-60}"
@@ -75,7 +93,7 @@ for attempt in $(seq 1 6); do
   echo "  DB reconnect attempt $attempt did not reach hive ready; retrying"
 done
 
-echo "== [5/5] wait hive ready + start motherbee singleton nodes =="
+echo "== [5/6] wait hive ready + start motherbee singleton nodes =="
 if [ "$HIVE_READY" != "1" ] && wait_hive_ready 60; then
   HIVE_READY=1
 fi
@@ -84,5 +102,42 @@ if [ "$HIVE_READY" != "1" ]; then
   echo "first-boot failed: hive did not become ready." >&2
   exit 1
 fi
-systemctl start io-cloud io-blob 2>/dev/null || true
+# Start the singleton infra nodes (IO.blob, IO.cloud) from the manifest; fall back to the known
+# two if the manifest is missing.
+SINGLETON_UNITS="$(mf singleton_units)"
+[ -n "$SINGLETON_UNITS" ] || SINGLETON_UNITS=$'io-cloud\nio-blob'
+for u in $SINGLETON_UNITS; do systemctl start "$u" 2>/dev/null || true; done
+
+echo "== [6/6] spawn base node instances (running, degraded until configured) =="
+# Auto-spawn one default instance of each boot=true runtime at the root tenant. They come up
+# RUNNING but degraded/unconfigured (no secret/config yet) — deliberate, so a fresh backend has
+# basic nodes alive out of the box; the operator loads secrets into SY.vault to make them work.
+while IFS=$'\t' read -r rt inst; do
+  [ -n "$rt" ] && [ -n "$inst" ] || continue
+  body="{\"node_name\":\"$inst\",\"runtime\":\"$rt\",\"runtime_version\":\"current\",\"tenant_id\":\"$ROOT_TENANT\"}"
+  r="$(curl -s -m20 -X POST "$ADMIN/hives/$HIVE_ID/nodes" -H 'content-type: application/json' -d "$body" 2>/dev/null || true)"
+  case "$r" in
+    *'"status":"ok"'*) echo "  spawned $inst ($rt)" ;;
+    *) echo "  WARN could not spawn $inst ($rt): ${r:0:140}" ;;
+  esac
+done < <(mf boot_runtimes)
+
+cat <<EOF
+
+============================================================
+ Fluxbee backend is UP. Core (SY.*) + base nodes are RUNNING.
+ Some nodes are DEGRADED until you load their secret into SY.vault:
+
+  - AI (ai.generic / architect / admin / cognition) needs a provider key.
+    Load an OpenAI (or "anthropic") key:
+      curl -sS -X POST $ADMIN/hives/$HIVE_ID/vault/secrets -H 'content-type: application/json' \\
+        -d '{"key":"openai_root_pool","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"$ROOT_TENANT","resource_type":"openai"}}'
+
+  - IO.slack needs its tokens (resource_type "slack", value {app_token, bot_token}).
+
+  Any other node secret is loaded into SY.vault the same way (POST .../vault/secrets).
+
+ Architect (Archi): http://<this-host>:3000    Admin API: $ADMIN
+============================================================
+EOF
 echo "first-boot done."

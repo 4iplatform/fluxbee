@@ -16,6 +16,31 @@ BUILD_ID="$(date -u +%Y%m%d%H%M%S)"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 
+# Declarative base-node set (packaging/base-nodes.json) — the single source of truth for which
+# IO/AI nodes ship in a from-scratch install, shared with scripts/install.sh. Adding a node is a
+# one-line edit there. mf <section> emits TSV rows; node_bin_src resolves a built binary path.
+MANIFEST="$ROOT_DIR/packaging/base-nodes.json"
+mf() { # singletons -> node\tcrate\tbin\tworkspace\tunit\trole_gate ; runtimes -> runtime\tcrate\tbin\tworkspace\tlang\tboot\tinstance
+  python3 - "$MANIFEST" "$1" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1])); sec = sys.argv[2]
+for e in m.get(sec, []):
+    if sec == "singletons":
+        print("\t".join([e["node"], e["crate"], e["bin"], e["workspace"], e.get("unit", ""), e.get("role_gate", "")]))
+    else:
+        print("\t".join([e.get("runtime", ""), e["crate"], e["bin"], e["workspace"],
+                         e.get("lang", "rust"), str(e.get("boot", False)).lower(), e.get("instance", "")]))
+PY
+}
+node_bin_src() { # <workspace> <bin> -> path to the built binary
+  case "$1" in
+    nodes/io) echo "nodes/io/target/release/$2" ;;
+    nodes/ai) echo "target/release/$2" ;;            # nodes/ai is a ROOT workspace member (built by --bins)
+    go) echo "go/nodes/wf/wf-generic/$2" ;;
+    *) echo "target/release/$2" ;;
+  esac
+}
+
 # core service binaries: <installed-name>=<cargo --bin or go marker>
 RUST_BINS=(rt-gateway:json-router sy-admin:sy_admin sy-config-routes:sy_config_routes
   sy-architect:sy_architect sy-vault:sy_vault sy-orchestrator:sy_orchestrator
@@ -31,9 +56,11 @@ UNITS=(rt-gateway sy-config-routes sy-opa-rules sy-admin sy-architect sy-vault
 echo "== [1/5] build rust =="
 cargo build --release --bins
 cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
-# IO.cloud/IO.blob are motherbee singletons. IO.api is an instanced runtime bundled
-# into dist/runtimes so a clean install can spawn it through Orchestrator like ai.generic.
-cargo build --release --manifest-path nodes/io/Cargo.toml -p io-api -p io-cloud -p io-blob
+# Build every nodes/io crate the base-node manifest references (singleton infra nodes +
+# io.* runtimes). ai.generic (nodes/ai) is a root workspace member already built by --bins;
+# wf-generic (go) is built in the go step below.
+IO_PKGS="$( { mf singletons; mf runtimes; } | awk -F'\t' '$4=="nodes/io"{print $2}' | sort -u )"
+[ -n "$IO_PKGS" ] && cargo build --release --manifest-path nodes/io/Cargo.toml $(printf -- '-p %s ' $IO_PKGS)
 echo "== [2/5] build go =="
 (cd go/sy-opa-rules && go build -o sy-opa-rules .)
 (cd go/sy-timer && go build -o sy-timer .)
@@ -56,21 +83,28 @@ stage_bin sy-frontdesk-gov "target/release/sy-frontdesk-gov"
 for pair in "${GO_BINS[@]}"; do
   stage_bin "${pair%%:*}" "${pair##*:}/$(basename "${pair##*:}")"
 done
-# io-cloud and io-blob install to /usr/bin ONLY (not dist/core/bin): they are
-# motherbee-only singletons, not role-synced core components, so they must not
-# enter the core manifest that the orchestrator ships to workers.
-install -m0755 nodes/io/target/release/io-cloud "$DEST/usr/bin/io-cloud"
-install -m0755 nodes/io/target/release/io-blob "$DEST/usr/bin/io-blob"
+# Singletons (motherbee-only infra nodes, e.g. IO.blob/IO.cloud) install to /usr/bin ONLY
+# (not dist/core/bin): they are not role-synced core components, so they must not enter the
+# core manifest the orchestrator ships to workers. Their systemd units are defined below.
+# Driven by packaging/base-nodes.json.
+while IFS=$'\t' read -r node crate bin ws unit role; do
+  [ -n "${bin:-}" ] || continue
+  install -m0755 "$(node_bin_src "$ws" "$bin")" "$DEST/usr/bin/$bin"
+done < <(mf singletons)
 
-# Seed the instanced IO.api runtime in the package. It deliberately has no systemd unit and no
-# /usr/bin singleton: Orchestrator launches named instances from this signed/synced runtime tree.
-bash scripts/publish-io-api-runtime.sh \
-  --runtime io.api \
-  --version "$VERSION" \
-  --binary nodes/io/target/release/io-api \
-  --dist-root "$DEST/var/lib/fluxbee/dist" \
-  --set-current \
-  --skip-build
+# Runtimes: seed each into dist/runtimes/<runtime>/<version>/ (instanced, orchestrator-spawned;
+# no unit and no /usr/bin copy — Orchestrator launches named instances from this synced tree).
+# Driven by the manifest, so adding an IO/AI runtime to the install is a one-line edit there;
+# both this .deb path and scripts/install.sh consume the same list (they must not diverge).
+while IFS=$'\t' read -r rt crate bin ws lang boot inst; do
+  [ -n "${rt:-}" ] || continue
+  bash scripts/publish-runtime.sh \
+    --runtime "$rt" \
+    --version "$VERSION" \
+    --binary "$(node_bin_src "$ws" "$bin")" \
+    --dist-root "$DEST/var/lib/fluxbee/dist" \
+    --set-current
+done < <(mf runtimes)
 
 # dist/core manifest with the staged binaries' real hashes (baked in).
 python3 - "$DEST/var/lib/fluxbee/dist/core" "$VERSION" "$BUILD_ID" <<'PY'
@@ -217,6 +251,9 @@ install -m0600 packaging/io-cloud.env.example "$DEST/etc/fluxbee/io-cloud.env.ex
 install -m0600 packaging/io-blob.env.example "$DEST/etc/fluxbee/io-blob.env.example"
 install -m0755 packaging/fluxbee-firstboot "$DEST/usr/share/fluxbee/fluxbee-firstboot"
 ln -sf ../share/fluxbee/fluxbee-firstboot "$DEST/usr/bin/fluxbee-firstboot"
+# The base-node manifest travels to the target too: fluxbee-firstboot reads it to know which
+# runtimes to auto-spawn as default instances at boot (boot=true) and under which names.
+install -m0644 packaging/base-nodes.json "$DEST/usr/share/fluxbee/base-nodes.json"
 
 echo "== [4/5] debian metadata =="
 INSTALLED_KB="$(du -sk "$DEST" | awk '{print $1}')"
@@ -232,8 +269,9 @@ Maintainer: 4i Platform <ops@4iplatform.com>
 Description: Fluxbee internal-network orchestration mesh
  Core services (router, orchestrator, identity, vault, storage, admin,
  architect, cognition, policy, timer, wf-rules, opa-rules, frontdesk, edge)
- plus the singleton IO.cloud adapter, IO.blob public artifact curator (motherbee),
- and the instanced io.api runtime seeded under dist/runtimes.
+ plus the singleton IO.cloud adapter and IO.blob public artifact curator (motherbee),
+ and the instanced IO/AI runtimes (io.api, io.slack, ai.generic, wf.engine,
+ io.linkedhelper) seeded under dist/runtimes per packaging/base-nodes.json.
  Binaries + dist/core manifest (hashes baked at build), systemd units, and a
  first-boot helper. Run 'sudo fluxbee-firstboot' after install.
 EOF
