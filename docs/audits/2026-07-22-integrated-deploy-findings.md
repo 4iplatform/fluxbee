@@ -144,3 +144,31 @@ orchestrator, rt.gateway, edge (listen+reachable), ingress dual-homed, egress NA
 dpkg interrumpido), F-3 (clean box sin sshd/usuario de bootstrap + cloud-init pisa PasswordAuth),
 F-4 (no hay vía operativa para externalizar/probar el edge en un backend instalado), F-5 (role del
 worker no se estampa). F-1/F-2/F-3 son **arreglos de template/prep** → los scripts van al user.
+
+---
+
+## Resolución (2026-07-22) — fixes implementados
+
+Triage verificado contra el código (workflow 6-lentes) → 11 fixes mecánicos + 2 decisiones. Los
+findings F-1/F-2 y parte de F-3 son **artefactos del template del lab** (una imagen cloud limpia de
+Ubuntu no los tiene) → cubiertos por `lab/template-prep.sh`, no son bugs de fluxbee. Fixes al código
+y al empaquetado:
+
+| Fix | Qué se hizo | Dónde |
+|-----|-------------|-------|
+| **G1** | `curl` + `python3` a Depends (firstboot los requiere; sin ellos el first boot no-opeaba en silencio) | build-deb.sh |
+| **G2** | firstboot: error explícito + exit 1 si `vault_put` del secreto de postgres se agota (antes fallaba silencioso) | fluxbee-firstboot |
+| **G3** | build-deb fail-closed si falta syncthing vendored (opt-out `FLUXBEE_ALLOW_NO_SYNCTHING=1`) | build-deb.sh |
+| **G4** | nota provider Anthropic (default es openai) en banner firstboot + docs | firstboot, packaging-and-build.md |
+| **G5/G6** | docs: wf.engine no va al boot; solo sy-orchestrator queda enabled (levanta el resto) | packaging-and-build.md, 07-operaciones.md |
+| **F5** | estampar `role:"worker"` en los 3 info_payload del worker (antes `/hives` mostraba role=None) | sy_orchestrator.rs |
+| **F4b** | guard `--help`/`--version` antes del runtime init (antes `sy-admin --help` colgaba para siempre) | sy_admin.rs |
+| **F3** | fallo del canal password → clasificado `SSH_AUTH_FAILED` + `hint` de cloud-init (antes `SSH_KEY_FAILED` mudo) | sy_orchestrator.rs |
+| **F3-docs** | §8.0 contrato del clean box + §8.1 nota cloud-init PasswordAuth first-match | 07-operaciones.md |
+| **F4a** | REST ops `/channels/externalize|unexternalize` + `GET /channels/externalized` (localhost, caller=None trusted-internal como add_hive/vault_put) | sy_admin.rs |
+
+**Decisiones (bajo riesgo, sin bloquear):** model-id `gpt-5.5` en hive.yaml.example → **dejado**
+(elección del user, no verificable desde código). syncthing → **fail-closed** (matchea install.sh).
+
+Build verde; tests: sy_admin 85/85, sy_orchestrator 132/132 + 1 nuevo (ssh_bootstrap_error).
+Cambios de código adversarialmente revisados antes de commitear.

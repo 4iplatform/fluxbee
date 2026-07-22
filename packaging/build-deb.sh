@@ -154,8 +154,15 @@ json.dump({"schema_version": 1, "version": int(build_id), "components": comps},
           open(os.path.join(vroot, "manifest.json"), "w"), indent=2, sort_keys=True)
 print("vendor manifest: syncthing %s (%d components)" % (ver, len(comps)))
 PY
+elif [ "${FLUXBEE_ALLOW_NO_SYNCTHING:-0}" = "1" ]; then
+  echo "WARN: no vendored syncthing under vendor/ (FLUXBEE_ALLOW_NO_SYNCTHING=1) — blob/dist sync will be non-operational; add_hive with require_dist_sync will FAIL far from this cause"
 else
-  echo "WARN: no vendored syncthing under vendor/ — blob sync will be non-operational"
+  # Fail-closed (mirrors scripts/install.sh): a .deb without syncthing ships an
+  # orchestrator whose blob/dist-sync is dead, and a later add_hive with
+  # require_dist_sync fails far from the cause. Opt out with FLUXBEE_ALLOW_NO_SYNCTHING=1.
+  echo "ERROR: no vendored syncthing under vendor/ (expected vendor/syncthing/syncthing or vendor/<bundle>/syncthing)." >&2
+  echo "       Set FLUXBEE_ALLOW_NO_SYNCTHING=1 to build anyway (blob/dist sync will be non-operational)." >&2
+  exit 1
 fi
 
 # systemd units (mirrors scripts/install.sh install_unit). Not enabled here; the
@@ -263,7 +270,7 @@ Version: ${VERSION}
 Section: net
 Priority: optional
 Architecture: ${ARCH}
-Depends: adduser, openssl, libc6 (>= 2.39), postgresql
+Depends: adduser, openssl, libc6 (>= 2.39), postgresql, curl, python3
 Installed-Size: ${INSTALLED_KB}
 Maintainer: 4i Platform <ops@4iplatform.com>
 Description: Fluxbee internal-network orchestration mesh

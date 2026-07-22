@@ -341,9 +341,10 @@ Categorías de update: `runtime`, `core`, `vendor`. El único contrato de update
 
 ### 6.3 Recuperación por reboot (sin re-firstboot)
 
-- **Motherbee:** los units están `enabled`; al bootear, `sy-orchestrator` arranca solo, levanta
-  el core en orden Model D', el vault ya tiene el secreto de postgres persistido, storage/identity
-  hacen pull. **No** hace falta re-correr `fluxbee-firstboot`.
+- **Motherbee:** el postinst deja `enabled` **solo** `sy-orchestrator` (+ los singletons
+  `io-cloud`/`io-blob`); al bootear, `sy-orchestrator` arranca solo y **levanta el resto del core**
+  (`systemctl start`) en orden Model D'. El vault ya tiene el secreto de postgres persistido,
+  storage/identity hacen pull. **No** hace falta re-correr `fluxbee-firstboot`.
 - **Spoke:** `sy-orchestrator` está `enabled`; al bootear reconecta por WAN a la motherbee
   (~15 s típico) y re-sincroniza identity/config/opa. Sin estado que reconstruir salvo caches
   locales (LanceDB/jsr-memory) que se regeneran.
@@ -424,6 +425,26 @@ curl -sS "$BASE/versions?hive=worker-1" | jq .      # core/runtime/vendor
 - `ssh_key` debe ser PEM **sin cifrar** (un key con passphrase se rechaza: el bootstrap no
   interactivo no puede aportar la passphrase).
 - Fallo transitorio de socket: el flujo reintenta (4x, base 800 ms) manteniéndose key-first.
+- **`ssh_password` "no anda" en imagen cloud:** Ubuntu cloud-image trae
+  `/etc/ssh/sshd_config.d/50-cloud-init.conf` con `PasswordAuthentication no`, y sshd es
+  *first-match*: un drop-in `99-*.conf` **no** lo pisa. Preferí `ssh_key` (la llave que cloud-init
+  ya inyectó); si insistís con password, poné un drop-in de número **menor** (`00-*.conf`). El
+  bootstrap ahora reporta `SSH_AUTH_FAILED` con este hint (antes decía `SSH_KEY_FAILED` aun usando
+  password).
+
+### 8.0 Contrato del clean box (spoke) — prerequisitos
+
+Un spoke es una **caja Linux limpia con SOLO SSH**, bootstrapeada por la motherbee. Antes del
+`add_hive` la caja debe tener:
+- **sshd activo** y alcanzable desde la motherbee en el `address` indicado.
+- **un usuario sudo** (`ssh_user`) con sudo passwordless.
+- **acceso (elegí uno):** *(recomendado)* la **pubkey del operador/cloud-init en
+  `authorized_keys`** → bootstrap **key-first** (ejemplo worker-2 arriba), independiente de
+  `PasswordAuthentication`; **o** `PasswordAuthentication yes` (drop-in `00-*.conf` que gane al
+  `50-cloud-init.conf`) + `ssh_password`.
+- Una **imagen cloud estándar de Ubuntu** ya cumple esto (sshd on + usuario `ubuntu` + llave
+  inyectada). Una imagen/plantilla propia debe habilitar sshd + crear el usuario (ver
+  `lab/template-prep.sh` para el patrón del lab).
 
 ### 8.2 Recuperar un spoke `key_only_persist`
 La llave per-spoke de recuperación está en `SY.vault` bajo `ssh:<hive_id>`. La reconciliación del

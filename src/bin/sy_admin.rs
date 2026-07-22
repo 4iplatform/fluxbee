@@ -488,6 +488,31 @@ struct DebugNodeMessageRequest {
 
 #[tokio::main]
 async fn main() -> Result<(), AdminError> {
+    // Answer --help/--version BEFORE any runtime init. sy_admin is the SY.admin daemon, not an
+    // interactive CLI: past this point it connects to the router (connect_with_retry loops), so
+    // without this guard `sy-admin --help` hangs forever waiting for a socket that only exists
+    // when the mesh is up. (F4b: from-scratch-installer surprise.)
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!(
+                    "sy_admin — SY.admin daemon (motherbee-only; NOT an interactive CLI).\n\
+                     Serves the admin HTTP API (default 127.0.0.1:8080) and the admin.sock action set.\n\
+                     Started by systemd (sy-admin.service); the operator uses the HTTP API, e.g.:\n  \
+                       curl -sS http://127.0.0.1:8080/hives\n\n\
+                     Env: JSR_ADMIN_LISTEN (HTTP listen addr), JSR_LOG_LEVEL (info|debug|...),\n     \
+                     SY_ADMIN_PUBLIC_EDGE_NODE, SY_ADMIN_PUBLIC_BASE_URL.\n\
+                     See docs/07-operaciones.md."
+                );
+                return Ok(());
+            }
+            "-V" | "--version" => {
+                println!("sy_admin {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     if cfg!(not(target_os = "linux")) {
         eprintln!("sy_admin supports only Linux targets.");
         std::process::exit(1);
@@ -5204,7 +5229,10 @@ async fn handle_http(
     stream: &mut tokio::net::TcpStream,
     tx: &mpsc::UnboundedSender<BroadcastRequest>,
     ctx: &AdminContext,
-    client: &RouterDispatcher,
+    // &Arc so the localhost REST layer can call dispatch_internal_admin_command directly (F4a:
+    // /channels/* verbs). handle_admin_command/handle_admin_query calls below still work via Deref
+    // coercion (&Arc<RouterDispatcher> -> &RouterDispatcher).
+    client: &Arc<RouterDispatcher>,
 ) -> Result<(), AdminError> {
     let (method, path, headers, body) = read_http_request(stream).await?;
     let (path, query) = split_path_query(&path);
@@ -5324,6 +5352,35 @@ async fn handle_http(
             let (status, resp) =
                 handle_admin_command(ctx, client, "publish_runtime_package", payload, None).await?;
             respond_json(stream, status, &resp).await?;
+        }
+        // F4a: operator surface for the edge-channel (externalize) family. Localhost-only, and
+        // caller_l2_name=None is the established trusted-internal operator semantics — the SAME
+        // 127.0.0.1 surface already exposes stronger None-privileged mutations (add_hive, run_node,
+        // vault_put). MUST go through dispatch_internal_admin_command directly: handle_admin_command
+        // would ship these to SY.config.routes (which does not implement them) and time out silently.
+        ("POST", "/channels/externalize") => {
+            let payload: serde_json::Value =
+                if body.is_empty() { serde_json::json!({}) } else { serde_json::from_slice(&body)? };
+            let internal =
+                dispatch_internal_admin_command(ctx, client, "externalize", None, payload, None).await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
+        }
+        ("POST", "/channels/unexternalize") => {
+            let payload: serde_json::Value =
+                if body.is_empty() { serde_json::json!({}) } else { serde_json::from_slice(&body)? };
+            let internal =
+                dispatch_internal_admin_command(ctx, client, "unexternalize", None, payload, None).await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
+        }
+        ("GET", "/channels/externalized") => {
+            // edge_node comes from ?edge_node=SY.edge@<hive> (the edge to query).
+            let payload = match query.get("edge_node") {
+                Some(edge_node) => serde_json::json!({ "edge_node": edge_node }),
+                None => serde_json::json!({}),
+            };
+            let internal =
+                dispatch_internal_admin_command(ctx, client, "list_externalized", None, payload, None).await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
         }
         ("GET", path) if path.starts_with("/admin/actions/") => {
             let Some(action_name) = path.strip_prefix("/admin/actions/") else {
@@ -6913,6 +6970,7 @@ fn http_status_line(status: u16) -> &'static str {
         200 => "HTTP/1.1 200 OK",
         202 => "HTTP/1.1 202 Accepted",
         400 => "HTTP/1.1 400 Bad Request",
+        403 => "HTTP/1.1 403 Forbidden",
         404 => "HTTP/1.1 404 Not Found",
         409 => "HTTP/1.1 409 Conflict",
         422 => "HTTP/1.1 422 Unprocessable Entity",

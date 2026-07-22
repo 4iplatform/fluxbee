@@ -182,12 +182,13 @@ sudo fluxbee-firstboot
 `fluxbee-firstboot` (idempotente): bootea PostgreSQL + crea rol/DBs, arranca el orchestrator,
 hace el `vault_put` del secreto de postgres (la **conexión a la DB queda resuelta sola en el
 vault**), reconecta los consumidores, arranca los singletons (IO.blob/IO.cloud), y **auto-spawnea
-las instancias default de los boot-runtimes** (io.api/io.slack/ai.generic/wf.engine). Al terminar
+las instancias default de los boot-runtimes** (io.api/io.slack/ai.generic). Al terminar
 imprime los **próximos pasos**.
 
 Después del firstboot quedan **corriendo**: el core `SY.*` + IO.blob + IO.cloud +
-`AI.chat@motherbee` + `IO.api@motherbee` + `IO.slack@motherbee` + `WF.engine@motherbee` — varios
-**degradados** hasta cargar sus secretos.
+`AI.chat@motherbee` + `IO.api@motherbee` + `IO.slack@motherbee` — varios
+**degradados** hasta cargar sus secretos. (`wf.engine` queda **horneado pero NO al boot** —
+`boot:false` en `base-nodes.json`; se spawnea a demanda desde un workflow package.)
 
 ### 5.1 Lo que pone el usuario (secretos en el vault)
 
@@ -198,7 +199,9 @@ Postgres ya está resuelto por el firstboot. Lo demás es del operador:
 curl -sS -X POST http://127.0.0.1:8080/hives/motherbee/vault/secrets \
   -H 'content-type: application/json' \
   -d '{"key":"openai_root_pool","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"tnt:00000000-0000-0000-0000-000000000001","resource_type":"openai"}}'
-# (resource_type "anthropic" para una key de Anthropic.)
+# (resource_type "anthropic" para una key de Anthropic. OJO: el default_provider es "openai";
+#  si cargás una key de Anthropic, poné además `ai.default_provider: anthropic` en
+#  /etc/fluxbee/hive.yaml y reiniciá los nodos AI, o siguen resolviendo el pool de openai.)
 
 # Tokens de Slack para IO.slack: resource_type "slack", value {app_token, bot_token}.
 ```
