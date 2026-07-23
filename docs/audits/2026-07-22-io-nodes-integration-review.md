@@ -99,3 +99,35 @@ sy_edge 16 / sy_orchestrator 133 verdes) + revisión adversarial:
 | **FIX-6** | `load_public_registry` dropea filas con `expires_at <= now` (antes re-residentaba expirados en cada restart). **Follow-up (parte 2):** reaper activo que borre los bytes de `public/` + prune del ledger vía unpublish/MSG_BLOB_RELEASE | sy_edge.rs |
 
 **Pendiente (consensuado):** FIX-7..16 (LOW + decisiones de diseño de io.blob) — se encaran después.
+
+---
+
+## Resolución — LOW closeout (2026-07-23)
+
+Cerrados + commiteados (batch 1 `8715e7d`, reaper `a047b40`):
+- **FIX-4** — documentado como residual aceptado (vault no tiene no-clobber put; "No admin bypass"
+  es invariante deliberado → admin no puede reusar el token del edge; el grace-window cubre la
+  rotación viva). Cerrarlo = decisión de diseño (token co-owned admin/edge).
+- **FIX-6 parte 2** — reaper activo en el edge (sweep periódico + persist del ledger podado).
+- **FIX-7** — bearer constant-time compare en el frontier DMZ.
+- **FIX-14** — TimeoutStopSec=15 en los units io-cloud/io-blob de install.sh.
+- **FIX-15** — DX del envelope inbound de io.api (errores autodescriptivos + hoist attachments).
+- **FIX-16** — family-gate en el inbound de io.cloud.
+
+**Diferidos con razón (todos LOW/hardening, NINGUNO es bug activo — apurarlos arriesga regresión en
+código compartido/load-bearing):**
+- **FIX-8/9/10 (io.blob)** — content-type desde bytes / binding tenant↔blob / GC refcount-aware.
+  Cambios de modelo de datos en el subsistema blob (parte en el crate compartido `fluxbee_sdk/blob`).
+  Exploit acotado (read-only + hash-addressed + nosniff + sandbox-on-html). Merecen un pase enfocado.
+- **FIX-11 (io.blob B1)** — B1 YA se sostiene (el add-only de `reconcile_syncthing_peer_xml` con
+  `public_only` nunca comparte `active/`/`dist` con el ingress; validado end-to-end). El self-enforce
+  (prune de defs sueltas) NO va en `reconcile_syncthing_peer_xml` (ahí prunear rompería a la motherbee,
+  que necesita su `fluxbee-blob`) — va en el build del config del lado ingress. DiD; requiere cuidado.
+- **FIX-12 (io.cloud)** — colapsar los 3 vocabularios a `io-common`. Refactor que toca el const de
+  seguridad `IO_CLOUD_EXPOSED_ACTIONS` (recién endurecido en FIX-1/2). Los 3 vocabularios HOY coinciden;
+  es prevención de drift, no bug. Mejor como refactor dedicado.
+- **FIX-13 (install.sh)** — que parsee base-nodes.json. install.sh es el path dev-checkout (el `.deb`
+  vía build-deb.sh YA lee el manifest); divergencia acotada. Refactor de shell, dev-only.
+
+Recomendación: los diferidos son un pase enfocado y revisado, no un edit apurado al final de una
+sesión larga. Ninguno bloquea el uso de los 3 nodos.
