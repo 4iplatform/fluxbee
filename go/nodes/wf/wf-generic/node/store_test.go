@@ -442,3 +442,29 @@ func TestStoreCommitInstanceMutationConsumesAndEnqueuesInternalEventsAtomically(
 		t.Fatalf("expected only NEW internal event after commit, got %#v", gotEvents)
 	}
 }
+
+// G7: an integer state variable must survive a JSON round-trip through SQLite as int64, not degrade
+// to float64 — otherwise a cel-go `%` guard (no double overload) breaks after a wf.engine restart.
+func TestUnmarshalJSONPreservesIntegers(t *testing.T) {
+	m, err := unmarshalJSON(`{"count": 3, "ratio": 1.5, "nested": {"n": 7}, "arr": [1, 2]}`)
+	if err != nil {
+		t.Fatalf("unmarshalJSON: %v", err)
+	}
+	if _, ok := m["count"].(int64); !ok {
+		t.Fatalf("count: want int64, got %T (%v)", m["count"], m["count"])
+	}
+	if m["count"].(int64) != 3 {
+		t.Fatalf("count: want 3, got %v", m["count"])
+	}
+	if _, ok := m["ratio"].(float64); !ok {
+		t.Fatalf("ratio: want float64, got %T", m["ratio"])
+	}
+	nested := m["nested"].(map[string]any)
+	if _, ok := nested["n"].(int64); !ok {
+		t.Fatalf("nested.n: want int64, got %T", nested["n"])
+	}
+	arr := m["arr"].([]any)
+	if _, ok := arr[0].(int64); !ok {
+		t.Fatalf("arr[0]: want int64, got %T", arr[0])
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -650,15 +651,56 @@ func marshalJSON(v any) (string, error) {
 }
 
 // unmarshalJSON is a convenience wrapper used by callers that need to restore maps.
+//
+// G7: it decodes with UseNumber() and then normalizes json.Number to int64 (integral) or float64,
+// matching the types cel-go/set_variable produce when a value is computed fresh. Without this,
+// json.Unmarshal decodes every JSON number as float64, so an integer state variable (e.g. a cycle
+// counter) silently degrades to float64 after a wf.engine restart — and cel-go has no modulo (%)
+// overload for double, so a guard like `state.count % 2 == 0` breaks the moment the instance is
+// restored. Restoring integers as int64 keeps int arithmetic/guards working across restarts.
 func unmarshalJSON(s string) (map[string]any, error) {
 	if s == "" || s == "{}" {
 		return map[string]any{}, nil
 	}
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()
 	var m map[string]any
-	if err := json.Unmarshal([]byte(s), &m); err != nil {
+	if err := dec.Decode(&m); err != nil {
 		return nil, err
 	}
+	normalizeJSONNumbers(m)
 	return m, nil
+}
+
+// normalizeJSONNumbers recursively rewrites json.Number values to int64 (when integral) or float64,
+// so a JSON round-trip through SQLite preserves int-ness (see unmarshalJSON / G7).
+func normalizeJSONNumbers(m map[string]any) {
+	for k, v := range m {
+		m[k] = normalizeJSONNumberValue(v)
+	}
+}
+
+func normalizeJSONNumberValue(v any) any {
+	switch x := v.(type) {
+	case json.Number:
+		if i, err := x.Int64(); err == nil {
+			return i
+		}
+		if f, err := x.Float64(); err == nil {
+			return f
+		}
+		return x.String()
+	case map[string]any:
+		normalizeJSONNumbers(x)
+		return x
+	case []any:
+		for i := range x {
+			x[i] = normalizeJSONNumberValue(x[i])
+		}
+		return x
+	default:
+		return v
+	}
 }
 
 // nowMS returns the current time in Unix milliseconds using the given clock.
