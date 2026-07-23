@@ -5039,16 +5039,31 @@ fn authorize_cloud_relay(
     action: &str,
     admin_hive: &str,
 ) -> Result<(), String> {
+    let expected = format!("IO.cloud@{admin_hive}");
+    // FIX-1 (HIGH): IO.cloud is the internet-facing provisioning relay and the node this gate exists
+    // to CONTAIN. It may relay ONLY the exposed provisioning actions — DEFAULT-DENY everything else,
+    // so a compromised IO.cloud cannot become a confused deputy for vault_get / vault_list /
+    // delete_ilk / add_route / kill_node / add_hive / … (all of which the generic dispatch would
+    // otherwise run under admin's own privileged ilk). Previously the gate only guarded the 3
+    // exposed actions and let IO.cloud relay ANY OTHER action unchecked.
+    if caller_l2_name == Some(expected.as_str()) {
+        return if IO_CLOUD_EXPOSED_ACTIONS.contains(&action) {
+            Ok(())
+        } else {
+            Err(format!(
+                "IO.cloud may relay only {IO_CLOUD_EXPOSED_ACTIONS:?} over the mesh, not '{action}' (Fluxbee Cloud provisioning gate)"
+            ))
+        };
+    }
+    // All OTHER callers: a non-exposed action is not this gate's concern (other per-action gates /
+    // trusted internal paths apply). The exposed provisioning actions may originate over the mesh
+    // ONLY from IO.cloud (handled above) or, for vault_put, the co-resident primary orchestrator.
     if !IO_CLOUD_EXPOSED_ACTIONS.contains(&action) {
         return Ok(());
     }
     let Some(caller) = caller_l2_name else {
         return Ok(());
     };
-    let expected = format!("IO.cloud@{admin_hive}");
-    if caller == expected {
-        return Ok(());
-    }
     // The primary orchestrator persists per-spoke recovery SSH keys during add_hive
     // (ssh_access=key_only_persist) via vault_put. It is a trusted system singleton on the
     // primary hive, co-resident with admin — allow it, but ONLY for vault_put (never the other
@@ -13716,10 +13731,28 @@ mod tests {
 
     #[test]
     fn cloud_relay_gate_allows_only_iocloud_over_mesh() {
-        // A non-exposed action is untouched regardless of caller.
+        // A non-exposed action is untouched for a NON-io.cloud caller.
         assert!(
             authorize_cloud_relay(Some("AI.worker@motherbee"), "list_nodes", "motherbee").is_ok()
         );
+        // FIX-1 (HIGH): IO.cloud is DEFAULT-DENY beyond the exposed 3 — a compromised relay cannot
+        // be a confused deputy for these privileged actions.
+        for evil in [
+            "vault_get",
+            "vault_list",
+            "delete_ilk",
+            "add_route",
+            "add_vpn",
+            "kill_node",
+            "add_hive",
+            "set_node_config",
+            "list_nodes",
+        ] {
+            assert!(
+                authorize_cloud_relay(Some("IO.cloud@motherbee"), evil, "motherbee").is_err(),
+                "IO.cloud must be denied non-exposed action '{evil}'"
+            );
+        }
         for action in IO_CLOUD_EXPOSED_ACTIONS {
             // Trusted internal path (caller==None: HTTP operator / executor) — allowed.
             assert!(authorize_cloud_relay(None, action, "motherbee").is_ok());
