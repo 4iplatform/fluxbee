@@ -315,6 +315,42 @@ async fn main() -> Result<(), SyEdgeError> {
         }
     }
 
+    // FIX-6 (part 2): active reaper. Part 1 drops expired public-artifact rows at LOAD; this
+    // periodically prunes them from the live registry AND persists the pruned ledger, so a
+    // long-lived edge doesn't accumulate expired rows (bounds the served set + on-disk ledger).
+    // On a non-ingress edge the registry is empty, so this is a cheap no-op.
+    {
+        let reaper_registry = Arc::clone(&public_registry);
+        let reaper_path = config.publications_path.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(600));
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let snapshot = {
+                    let mut guard = match reaper_registry.write() {
+                        Ok(guard) => guard,
+                        Err(_) => continue,
+                    };
+                    let before = guard.len();
+                    guard.retain(|_, row| row.expires_at > now);
+                    if guard.len() == before {
+                        continue; // nothing expired
+                    }
+                    tracing::info!(removed = before - guard.len(), "sy-edge reaper: dropped expired public artifacts");
+                    guard.clone()
+                };
+                if let Err(err) = persist_public_registry(&reaper_path, &snapshot) {
+                    tracing::warn!(error = %err, "sy-edge reaper: persist pruned ledger failed");
+                }
+            }
+        });
+    }
+
     // System channel: default node status + the URL-service command plane. Opening or
     // closing a public URL is a VERIFIED SERVICE DIRECTIVE from SY.admin, delivered as an
     // addressed request/response (`EDGE_OPEN_URL` / `EDGE_CLOSE_URL`, §7) — NOT a config
