@@ -1151,6 +1151,7 @@ ExecCondition=/bin/sh -c 'grep -qE "^role:[[:space:]]*motherbee" /etc/fluxbee/hi
 ExecStart=/usr/bin/io-cloud
 Restart=always
 RestartSec=5
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target
@@ -1172,6 +1173,7 @@ UMask=0027
 ExecStart=/usr/bin/io-blob
 Restart=always
 RestartSec=5
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target

@@ -2101,6 +2101,18 @@ fn rpc_error_code(err: &RpcError) -> &'static str {
     }
 }
 
+/// Constant-time byte equality (length-independent) — FIX-7: the shared-secret bearer is compared
+/// at the public DMZ frontier, where a short-circuiting `==` leaks the token prefix via timing.
+/// No external crate: fold any length mismatch into the accumulator, then OR every byte diff.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff: u8 = if a.len() == b.len() { 0 } else { 1 };
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+    }
+    diff == 0
+}
+
 fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
     headers
         .get("authorization")
@@ -2110,7 +2122,7 @@ fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
                 .strip_prefix("Bearer ")
                 .or_else(|| value.strip_prefix("bearer "))
         })
-        .map(|token| token.trim() == expected)
+        .map(|token| constant_time_eq(token.trim().as_bytes(), expected.as_bytes()))
         .unwrap_or(false)
 }
 

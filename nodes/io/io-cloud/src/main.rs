@@ -123,8 +123,9 @@ async fn main() -> Result<(), DynError> {
     let admin_hive = env_or("IO_CLOUD_ADMIN_HIVE", &hive_id);
     let admin_target = format!("SY.admin@{admin_hive}");
     let cloud_edge_node = env("IO_CLOUD_EDGE_NODE");
+    // Hoisted so run_loop can family-gate the inbound (FIX-16).
+    let inbound_family = env_or("IO_CLOUD_INBOUND_FAMILY", "user");
     if let Some(edge_node) = cloud_edge_node.as_deref() {
-        let inbound_family = env_or("IO_CLOUD_INBOUND_FAMILY", "user");
         // The configured Cloud service token is the alpha trust anchor: edge verifies it before
         // forwarding and strips Authorization at the frontier. There is intentionally no public
         // fallback for this mutation endpoint.
@@ -159,6 +160,7 @@ async fn main() -> Result<(), DynError> {
         cloud_edge_node.as_deref(),
         &dispatcher,
         &admin_target,
+        &inbound_family,
         &mut incoming,
     )
     .await
@@ -383,6 +385,7 @@ async fn run_loop(
     cloud_edge_node: Option<&str>,
     dispatcher: &Arc<RouterDispatcher>,
     admin_target: &str,
+    inbound_family: &str,
     incoming: &mut RpcCommandReceiver,
 ) -> Result<(), DynError> {
     loop {
@@ -403,6 +406,20 @@ async fn run_loop(
                 trace_id = %msg.routing.trace_id,
                 src_l2_name = ?msg.routing.src_l2_name,
                 "IO.cloud ignored a non-edge mesh message"
+            );
+            continue;
+        }
+
+        // FIX-16: family gate (mirrors io.api main.rs:386). The channel is registered under
+        // `inbound_family`; the edge forwards legitimate requests stamped with that family, so a
+        // frame of any other msg_type is not a Cloud request — skip it. Defense-in-depth on the
+        // inbound, on top of the src_l2_name + ich checks above.
+        if !msg.meta.msg_type.eq_ignore_ascii_case(inbound_family) {
+            tracing::debug!(
+                trace_id = %msg.routing.trace_id,
+                msg_type = %msg.meta.msg_type,
+                expected = %inbound_family,
+                "IO.cloud skipped a frame whose msg_type != configured inbound_family"
             );
             continue;
         }
