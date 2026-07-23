@@ -4280,6 +4280,14 @@ async fn handle_externalize(
             Some(supplied) => supplied.clone(),
             None => mint_entry_token(), // §8: admin-minted strong token
         };
+        // FIX-4 residual (deferred): a re-externalize after io.api restart + edge ROW-LOSS mints a
+        // fresh token here, stranding clients holding the old bearer. Admin CANNOT reuse the stored
+        // token: edge_channel_secret:{ich} is a dedicated secret owned by SY.edge's ilk, and
+        // authorize_read has "No admin bypass" by design (sy_vault.rs:1391) — admin can neither read
+        // the value nor its metadata. Closing this needs a design call (admin/edge co-owned token,
+        // or a scoped admin read-back for edge_channel_secret:*), NOT a silent security downgrade.
+        // The edge's grace-window (SHARED_SECRET_GRACE_MS) already covers LIVE rotation — the common
+        // case; the row-loss residual is a rare reimage/vault-purge event.
         let secret_ref = format!("edge_channel_secret:{ich}");
         let (status, body) = handle_vault_command(
             ctx,
@@ -4611,6 +4619,11 @@ async fn dispatch_internal_admin_command(
     // exposed behind an internet token via io.cloud, so over the MESH they may only originate from
     // IO.cloud. The operator HTTP path + the internal executor are caller==None and stay trusted.
     if let Err(detail) = authorize_cloud_relay(caller_l2_name, action, &ctx.hive_id) {
+        return Ok(internal_unauthorized(action, &detail));
+    }
+    // FIX-2: server-side re-enforcement of io.cloud's translate content restrictions (do not trust
+    // the bypassable relay to have sanitized its own payload).
+    if let Err(detail) = enforce_cloud_relay_content(caller_l2_name, action, &ctx.hive_id, &params) {
         return Ok(internal_unauthorized(action, &detail));
     }
     match action {
@@ -5074,6 +5087,59 @@ fn authorize_cloud_relay(
     Err(format!(
         "only {expected} may relay '{action}' over the mesh (Fluxbee Cloud provisioning gate); caller={caller}"
     ))
+}
+
+/// FIX-2: re-enforce io.cloud's `translate_cloud_op` content restrictions SERVER-SIDE. Those checks
+/// (run_node → IO.* only; vault_put → no caller-set ownership-authority fields, owner_node IO.*)
+/// today live ONLY inside io.cloud, which a compromised relay bypasses. Admin must not trust the
+/// relay to have sanitized its own payload. Applies ONLY to the IO.cloud@hive mesh origin — operator
+/// (caller=None) and every other caller are unaffected. Runs right after `authorize_cloud_relay`
+/// (so it only ever sees the exposed 3 actions from this origin).
+fn enforce_cloud_relay_content(
+    caller_l2_name: Option<&str>,
+    action: &str,
+    admin_hive: &str,
+    params: &serde_json::Value,
+) -> Result<(), String> {
+    if caller_l2_name != Some(format!("IO.cloud@{admin_hive}").as_str()) {
+        return Ok(());
+    }
+    let owner_node_ok = |v: Option<&serde_json::Value>| -> Result<(), String> {
+        if let Some(owner_node) = v.and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+            if !owner_node.starts_with("IO.") {
+                return Err("IO.cloud vault_put owner_node must be an IO.* node".to_string());
+            }
+        }
+        Ok(())
+    };
+    match action {
+        "run_node" => {
+            let node_name = params.get("node_name").and_then(|v| v.as_str()).unwrap_or("");
+            if !node_name.starts_with("IO.") {
+                return Err(format!(
+                    "IO.cloud may provision only IO.* nodes, not '{node_name}'"
+                ));
+            }
+        }
+        "vault_put" => {
+            // Ownership-authority fields io.cloud must NEVER set (translate strips them); reject so a
+            // compromised relay cannot plant a secret under a victim's ilk/owner.
+            if let Some(md) = params.get("metadata").and_then(|v| v.as_object()) {
+                for authority in ["ilk", "owner_ilk", "owner_l2"] {
+                    if md.contains_key(authority) {
+                        return Err(format!(
+                            "IO.cloud vault_put must not set the authority field metadata.{authority}"
+                        ));
+                    }
+                }
+                owner_node_ok(md.get("owner_node"))?;
+            }
+            // translate reads owner_node from params OR metadata — check the top-level too.
+            owner_node_ok(params.get("owner_node"))?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -13789,6 +13855,35 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn cloud_relay_content_reenforced_server_side() {
+        let io = Some("IO.cloud@motherbee");
+        // run_node: IO.* only.
+        assert!(enforce_cloud_relay_content(io, "run_node", "motherbee",
+            &serde_json::json!({"node_name":"IO.api.x@motherbee"})).is_ok());
+        assert!(enforce_cloud_relay_content(io, "run_node", "motherbee",
+            &serde_json::json!({"node_name":"AI.worker@motherbee"})).is_err());
+        // vault_put: no caller-set ownership-authority fields.
+        for bad in ["ilk", "owner_ilk", "owner_l2"] {
+            assert!(enforce_cloud_relay_content(io, "vault_put", "motherbee",
+                &serde_json::json!({"key":"k","metadata":{bad:"x"}})).is_err(),
+                "vault_put must reject metadata.{bad} from io.cloud");
+        }
+        // owner_node must be IO.* (top-level or in metadata).
+        assert!(enforce_cloud_relay_content(io, "vault_put", "motherbee",
+            &serde_json::json!({"key":"k","metadata":{"owner_node":"SY.identity@motherbee"}})).is_err());
+        assert!(enforce_cloud_relay_content(io, "vault_put", "motherbee",
+            &serde_json::json!({"key":"k","owner_node":"AI.x@motherbee"})).is_err());
+        // Legit: clean metadata + IO.* owner_node + tenant_id (translate sets tenant_id) is fine.
+        assert!(enforce_cloud_relay_content(io, "vault_put", "motherbee",
+            &serde_json::json!({"key":"k","metadata":{"resource_type":"openai","tenant_id":"tnt:x","owner_node":"IO.api.x@motherbee"}})).is_ok());
+        // Not enforced for the operator path or other callers.
+        assert!(enforce_cloud_relay_content(None, "run_node", "motherbee",
+            &serde_json::json!({"node_name":"AI.worker@motherbee"})).is_ok());
+        assert!(enforce_cloud_relay_content(Some("SY.orchestrator@motherbee"), "vault_put", "motherbee",
+            &serde_json::json!({"metadata":{"ilk":"x"}})).is_ok());
     }
 
     #[test]

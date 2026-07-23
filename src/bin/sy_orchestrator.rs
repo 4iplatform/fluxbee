@@ -1698,6 +1698,34 @@ async fn reconcile_persisted_custom_nodes(
 
         let (persisted_ilk, persisted_tenant) =
             load_persisted_node_identity(state, &node.node_name);
+        // FIX-5: if the on-disk node->ilk map is empty (a persist failed at spawn), do NOT relaunch
+        // blind — recover the identity from SY.identity's SHM by handler node and re-persist, so
+        // io.api comes up WITH its tenant/ilk instead of node_not_configured on every request.
+        let (persisted_ilk, persisted_tenant) =
+            if persisted_ilk.is_none() && persisted_tenant.is_none() {
+                match fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_id(
+                    &state.hive_id,
+                    &node.node_name,
+                ) {
+                    Ok(Some((_, ilk))) => {
+                        tracing::warn!(
+                            node_name = %node.node_name,
+                            ilk_id = %ilk.ilk_id,
+                            "reconcile: node->ilk map missing; recovered identity from SY.identity SHM and re-persisting"
+                        );
+                        let _ = persist_node_ilk_mapping(
+                            state,
+                            &node.node_name,
+                            &ilk.ilk_id,
+                            &ilk.tenant_id,
+                        );
+                        (Some(ilk.ilk_id), Some(ilk.tenant_id))
+                    }
+                    _ => (persisted_ilk, persisted_tenant),
+                }
+            } else {
+                (persisted_ilk, persisted_tenant)
+            };
         let cmd = build_managed_node_run_command(
             &unit,
             &node.node_name,
@@ -12316,15 +12344,23 @@ async fn ensure_node_identity_registered(
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| requested_ilk_id.clone());
-    if let Err(err) = persist_node_ilk_mapping(state, node_name, &resolved_ilk_id, &tenant_id) {
-        tracing::warn!(
-            node_name = node_name,
-            ilk_id = resolved_ilk_id,
-            tenant_id = tenant_id,
-            error = %err,
-            "failed to persist node->ilk mapping"
-        );
-    }
+    // FIX-5: a swallowed persist failure silently bricks this node on the NEXT host reboot —
+    // reconcile relaunches it from the on-disk map only, so it comes up with no tenant/ilk and every
+    // request 404s node_not_configured. Escalate to error AND surface it in the ok-response so the
+    // spawn caller can react (reconcile also has an identity-SHM fallback now, but re-persist here).
+    let identity_persist_failed =
+        if let Err(err) = persist_node_ilk_mapping(state, node_name, &resolved_ilk_id, &tenant_id) {
+            tracing::error!(
+                node_name = node_name,
+                ilk_id = resolved_ilk_id,
+                tenant_id = tenant_id,
+                error = %err,
+                "FAILED to persist node->ilk mapping — node loses its identity on reboot until re-spawned"
+            );
+            true
+        } else {
+            false
+        };
 
     Ok(Some(serde_json::json!({
         "status": "ok",
@@ -12332,6 +12368,7 @@ async fn ensure_node_identity_registered(
         "requested_ilk_id": requested_ilk_id,
         "ilk_type": ilk_type,
         "target": identity_target,
+        "identity_persist_failed": identity_persist_failed,
     })))
 }
 

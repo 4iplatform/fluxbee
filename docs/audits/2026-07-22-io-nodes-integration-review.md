@@ -82,3 +82,20 @@ deputy.) **← fixing now.**
 
 ## Refuted (1)
 One candidate was refuted on verification (the code already handles it) — not carried forward.
+
+---
+
+## Resolución — MEDIUMs (2026-07-22)
+
+FIX-1 (HIGH) cerrado en commit 375cddc. Los 5 MEDIUM implementados + testeados (sy_admin 86 /
+sy_edge 16 / sy_orchestrator 133 verdes) + revisión adversarial:
+
+| Fix | Qué se hizo | Dónde |
+|-----|-------------|-------|
+| **FIX-2** | `enforce_cloud_relay_content` server-side tras `authorize_cloud_relay`: para el origen `IO.cloud@hive`, `run_node`→IO.* y `vault_put` sin `metadata.ilk/owner_ilk/owner_l2` + `owner_node` IO.* (translate es bypassable) | sy_admin.rs + test |
+| **FIX-4** | **DEFERIDO** (revisión adversarial: mi intento era un no-op). El edge YA tiene grace-window para la rotación viva (el caso común — verificado a pedido del user). El residual (restart + edge row-loss → re-mint) NO se puede cerrar del lado admin: `edge_channel_secret:{ich}` es dedicated owned-by-`SY.edge` y `authorize_read` tiene "No admin bypass" por diseño (sy_vault.rs:1391) → admin no puede leer ni reusar el token. Cerrarlo = **decisión de diseño** (token co-owned admin/edge, o read-back scoped) — no un downgrade silencioso. Documentado en el código | sy_admin.rs |
+| **FIX-3** | arm `MSG_VAULT_SECRET_CHANGED` en el loop del edge que re-corre `resolve_secrets` (antes se dropeaba) → boot con vault degradado ya no deja `/e/<ich>` en 401 permanente. Origin-check fail-closed contra `SY.vault@<config.vault_hive>` (**corregido en review**: era `<own_hive>` del edge → inerte en la topología DMZ multi-hive real, porque el vault vive en motherbee, no en el ingress) | sy_edge.rs |
+| **FIX-5** | (a) fallo de persist node→ilk escala a error + `identity_persist_failed` en la respuesta de run_node; (b) reconcile recupera identidad de SY.identity (`find_ilk_by_handler_node_from_hive_id`) + re-persiste cuando el mapa on-disk está vacío → io.api no arranca sin identidad tras reboot | sy_orchestrator.rs |
+| **FIX-6** | `load_public_registry` dropea filas con `expires_at <= now` (antes re-residentaba expirados en cada restart). **Follow-up (parte 2):** reaper activo que borre los bytes de `public/` + prune del ledger vía unpublish/MSG_BLOB_RELEASE | sy_edge.rs |
+
+**Pendiente (consensuado):** FIX-7..16 (LOW + decisiones de diseño de io.blob) — se encaran después.

@@ -19,7 +19,7 @@ use fluxbee_sdk::protocol::{
     MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
     MSG_EDGE_PUBLISH_BLOB, MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB,
     is_system_kind, MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_TTL_EXCEEDED, MSG_UNREACHABLE,
-    SYSTEM_KIND,
+    MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, is_node_config_get_message, is_node_config_set_message,
@@ -380,6 +380,40 @@ async fn main() -> Result<(), SyEdgeError> {
                     config.ttl,
                 )
                 .await;
+                continue;
+            }
+            Some(MSG_VAULT_SECRET_CHANGED) => {
+                // FIX-3: a degraded-vault edge boot leaves shared-secret channels with secret=None;
+                // resolve_secrets runs only at boot + post-EDGE_OPEN_URL, so when the vault later
+                // publishes the secret the edge never re-resolved and /e/<ich> 401'd indefinitely
+                // while io.api still reported "published". Re-resolve on the broadcast (previously
+                // dropped as unhandled). Fail-closed origin check: only THE VAULT THIS EDGE USES may
+                // trigger it — src_l2_name is router-stamped. The edge's vault lives at
+                // `config.vault_hive` (typically motherbee), NOT the edge's own (ingress) hive; the
+                // vault broadcasts with src=None so the router stamps it `SY.vault@<vault_hive>`.
+                // Comparing against the edge's OWN hive would reject it in the real multi-hive DMZ.
+                let vault_hive = config.vault_hive.trim();
+                let expected = format!("SY.vault@{vault_hive}");
+                match msg.routing.src_l2_name.as_deref().map(str::trim) {
+                    Some(origin) if !vault_hive.is_empty() && origin == expected => {
+                        tracing::info!(origin = %origin, "sy-edge: VAULT_SECRET_CHANGED — re-resolving channel secrets");
+                        resolve_secrets(
+                            &dispatcher,
+                            &self_ilk,
+                            &self_name,
+                            &config.vault_hive,
+                            &registry,
+                        )
+                        .await;
+                    }
+                    other => {
+                        tracing::warn!(
+                            src_l2_name = %other.unwrap_or("<none>"),
+                            expected = %expected,
+                            "sy-edge: VAULT_SECRET_CHANGED from a non-vault / cross-hive origin; ignoring"
+                        );
+                    }
+                }
                 continue;
             }
             _ => {}
@@ -851,10 +885,28 @@ fn load_public_registry(path: &std::path::Path) -> HashMap<String, PublicArtifac
             return HashMap::new();
         }
     };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     parsed
         .publications
         .into_iter()
         .filter(|row| validate_public_artifact_row(row).is_ok())
+        .filter(|row| {
+            // FIX-6: drop already-expired rows at load. They are un-servable (the serve path
+            // rejects expires_at <= now) but were previously re-residented into the registry on
+            // EVERY restart, growing it unbounded and pinning the referenced public/ bytes. NOTE:
+            // this bounds the in-memory registry; an active reaper that also deletes the public/
+            // bytes + prunes the on-disk ledger via the unpublish/MSG_BLOB_RELEASE path is the
+            // complementary follow-up (part 2).
+            if row.expires_at <= now {
+                tracing::info!(key = %row.key, "sy-edge: dropping expired public artifact row at load");
+                false
+            } else {
+                true
+            }
+        })
         .map(|row| (row.key.clone(), row))
         .collect()
 }
