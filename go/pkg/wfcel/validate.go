@@ -225,6 +225,10 @@ func validateActions(path string, actions []ActionDefinition, clock ClockFunc) V
 
 func validateAction(path string, action ActionDefinition, clock ClockFunc) ValidationErrors {
 	var errs ValidationErrors
+	// gap-2: on_error, when present, must be a known policy.
+	if action.OnError != "" && action.OnError != OnErrorContinue && action.OnError != OnErrorFail {
+		errs = append(errs, ValidationError{Path: path + ".on_error", Message: `must be "continue" or "fail" when present`})
+	}
 	switch action.Type {
 	case "send_message":
 		// Exactly one of target (static literal) / target_ref (dynamic $ref dot-path). A WF may NOT

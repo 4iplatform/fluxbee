@@ -173,7 +173,11 @@ func createAndDispatch(ctx context.Context, msg sdk.Message, reg *InstanceRegist
 	var emitted []InternalEventRow
 	if initialState != nil {
 		log.Printf("wf: create running entry_actions instance_id=%s state=%s actions=%d", instanceID, initialState.Name, len(initialState.EntryActions))
-		inst.executeActions(ctx, initialState.EntryActions, msg, actx, &emitted)
+		if err := inst.executeActions(ctx, initialState.EntryActions, msg, actx, &emitted); err != nil {
+			// gap-2: a fatal entry-action failure at creation lands the new instance in failed rather
+			// than a half-initialized running state.
+			return inst.routeToFailed(ctx, msg, actx, err, nil)
+		}
 		if inst.isTerminalState(initialState.Name) {
 			now := nowMS(actx.Clock)
 			inst.Status = terminalStatus(initialState.Name, inst.def.TerminalStates)

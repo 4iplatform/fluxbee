@@ -80,8 +80,34 @@ type ActionDefinition struct {
 	FireAt         string      `json:"fire_at,omitempty"`
 	MissedPolicy   string      `json:"missed_policy,omitempty"`
 	MissedWithinMS *int64      `json:"missed_within_ms,omitempty"`
-	Name           string      `json:"name,omitempty"`
-	Value          any         `json:"value,omitempty"`
+	Name  string `json:"name,omitempty"`
+	Value any    `json:"value,omitempty"`
+	// OnError is the failure policy for this action (gap-2): "continue" logs the error and proceeds
+	// (legacy behavior), "fail" halts the transition and routes the instance to a loud terminal
+	// failure. Empty = the per-type default: send_message and set_variable default to "fail" (a lost
+	// message or an unset variable leaves the instance inconsistent), everything else to "continue".
+	OnError string `json:"on_error,omitempty"`
+}
+
+// Action failure policies (gap-2).
+const (
+	OnErrorContinue = "continue"
+	OnErrorFail     = "fail"
+)
+
+// EffectiveOnError returns the failure policy actually in force for an action: the explicit OnError
+// if set, else the per-type default (send_message / set_variable fail loudly; others continue).
+func (a ActionDefinition) EffectiveOnError() string {
+	switch a.OnError {
+	case OnErrorContinue, OnErrorFail:
+		return a.OnError
+	}
+	switch a.Type {
+	case "send_message", "set_variable":
+		return OnErrorFail
+	default:
+		return OnErrorContinue
+	}
 }
 
 type ValidationError struct {

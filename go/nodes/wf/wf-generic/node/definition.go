@@ -9,6 +9,8 @@ import (
 const (
 	workflowSchemaVersion = wfcel.WorkflowSchemaVersion
 	minTimerDuration      = wfcel.MinTimerDuration
+	OnErrorContinue       = wfcel.OnErrorContinue
+	OnErrorFail           = wfcel.OnErrorFail
 )
 
 type WorkflowDefinition = wfcel.WorkflowDefinition
