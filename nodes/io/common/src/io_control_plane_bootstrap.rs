@@ -1,218 +1,185 @@
+//! IO control-plane bootstrap — now a thin bridge over the SDK's canonical single-config control
+//! plane (`fluxbee_sdk::managed_control_plane`). The old two-location model (a dynamic-state file
+//! under `/var/lib/fluxbee/state/io-nodes/` that boot PREFERRED over the orchestrator-written
+//! `config.json`) is gone: because that file lived outside the node instance dir, a kill + re-run_node
+//! left it behind and the respawn booted the STALE config (BUG-4, same class ai.generic had). Now the
+//! node-dir `config.json` is the ONLY source and the IO adapter plugs in via `IoAdapterConfigContract`.
+
+use crate::io_adapter_config::{IoAdapterConfigContract, IoAdapterConfigError, IO_NODE_FAMILY};
 use crate::io_control_plane::{
     IoConfigSource, IoControlPlaneErrorInfo, IoControlPlaneState, IoNodeLifecycleState,
 };
-use crate::io_control_plane_store::{
-    load_io_control_plane_state, IoControlPlaneStateFile, IoControlPlaneStoreError,
+use fluxbee_sdk::managed_control_plane::{
+    bootstrap_managed_control_plane_with_root, ContractError, ManagedControlPlaneState,
+    ManagedNodeConfigContract, ManagedNodeLifecycleState, DEFAULT_MANAGED_NODES_ROOT,
 };
-use fluxbee_sdk::{managed_node_config_path, managed_node_config_path_with_root, ManagedNodeError};
+use fluxbee_sdk::node_secret::NodeSecretDescriptor;
+use fluxbee_sdk::ManagedNodeError;
 use serde_json::Value;
-use std::fs;
-use std::path::{Path, PathBuf};
-
-pub const DEFAULT_ORCHESTRATOR_NODES_ROOT: &str = "/var/lib/fluxbee/nodes";
+use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IoControlPlaneBootstrapError {
-    #[error("state store error: {0}")]
-    Store(#[from] IoControlPlaneStoreError),
+    #[error("control-plane error: {0}")]
+    ControlPlane(String),
     #[error("managed node path error: {0}")]
     ManagedNode(#[from] ManagedNodeError),
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("json error: {0}")]
-    Json(#[from] serde_json::Error),
 }
 
+/// Bridges an IO adapter's `IoAdapterConfigContract` to the SDK's generic `ManagedNodeConfigContract`
+/// so all IO adapters ride the one canonical control-plane. The IO family is fixed ("IO").
+struct IoContractBridge<'a>(&'a dyn IoAdapterConfigContract);
+
+impl ManagedNodeConfigContract for IoContractBridge<'_> {
+    fn node_family(&self) -> &'static str {
+        IO_NODE_FAMILY
+    }
+    fn node_kind(&self) -> &'static str {
+        self.0.node_kind()
+    }
+    fn required_fields(&self) -> &'static [&'static str] {
+        self.0.required_fields()
+    }
+    fn optional_fields(&self) -> &'static [&'static str] {
+        self.0.optional_fields()
+    }
+    fn notes(&self) -> &'static [&'static str] {
+        self.0.notes()
+    }
+    fn validate_and_materialize(&self, candidate: &Value) -> Result<Value, ContractError> {
+        self.0.validate_and_materialize(candidate).map_err(|e| match e {
+            IoAdapterConfigError::InvalidConfig(m) => ContractError::InvalidConfig(m),
+            IoAdapterConfigError::Internal(m) => ContractError::Internal(m),
+        })
+    }
+    fn redact_effective_config(&self, effective: &Value) -> Value {
+        self.0.redact_effective_config(effective)
+    }
+    fn secret_descriptors(&self, effective: Option<&Value>) -> Vec<NodeSecretDescriptor> {
+        self.0.secret_descriptors(effective)
+    }
+}
+
+fn io_state_from_managed(cp: ManagedControlPlaneState) -> IoControlPlaneState {
+    let current_state = match cp.current_state {
+        ManagedNodeLifecycleState::Unconfigured => IoNodeLifecycleState::Unconfigured,
+        ManagedNodeLifecycleState::Configured => IoNodeLifecycleState::Configured,
+        ManagedNodeLifecycleState::FailedConfig => IoNodeLifecycleState::FailedConfig,
+    };
+    // Single-config model: there is exactly one source, the node-dir config.json.
+    let config_source = match cp.current_state {
+        ManagedNodeLifecycleState::Unconfigured => IoConfigSource::None,
+        _ => IoConfigSource::OrchestratorFallback,
+    };
+    IoControlPlaneState {
+        current_state,
+        config_source,
+        schema_version: cp.schema_version,
+        config_version: cp.config_version,
+        effective_config: cp.effective_config,
+        last_error: cp.last_error.map(|e| IoControlPlaneErrorInfo {
+            code: e.code,
+            message: e.message,
+        }),
+    }
+}
+
+/// Boot the IO node control plane from the single source of truth (`config.json`) via the SDK.
 pub fn bootstrap_io_control_plane_state(
-    state_dir: &Path,
     node_name: &str,
+    contract: &dyn IoAdapterConfigContract,
 ) -> Result<IoControlPlaneState, IoControlPlaneBootstrapError> {
-    bootstrap_io_control_plane_state_with_nodes_root(
-        state_dir,
+    bootstrap_io_control_plane_state_with_root(
         node_name,
-        Path::new(DEFAULT_ORCHESTRATOR_NODES_ROOT),
+        contract,
+        Path::new(DEFAULT_MANAGED_NODES_ROOT),
     )
 }
 
-pub fn bootstrap_io_control_plane_state_with_nodes_root(
-    state_dir: &Path,
+/// [`bootstrap_io_control_plane_state`] with an explicit nodes root (for tests).
+pub fn bootstrap_io_control_plane_state_with_root(
     node_name: &str,
+    contract: &dyn IoAdapterConfigContract,
     nodes_root: &Path,
 ) -> Result<IoControlPlaneState, IoControlPlaneBootstrapError> {
-    if let Some(dynamic) = load_io_control_plane_state(state_dir, node_name)? {
-        return Ok(state_from_dynamic_file(dynamic));
-    }
-
-    if let Some(orchestrator_cfg) = load_effective_config_from_orchestrator(node_name, nodes_root)?
-    {
-        return Ok(orchestrator_cfg);
-    }
-
-    Ok(IoControlPlaneState::default())
-}
-
-fn state_from_dynamic_file(file: IoControlPlaneStateFile) -> IoControlPlaneState {
-    let mut state = file.state;
-    state.config_source = IoConfigSource::Dynamic;
-    state
-}
-
-fn load_effective_config_from_orchestrator(
-    node_name: &str,
-    nodes_root: &Path,
-) -> Result<Option<IoControlPlaneState>, IoControlPlaneBootstrapError> {
-    let path = orchestrator_config_path(node_name, nodes_root)?;
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let raw = fs::read_to_string(&path)?;
-    let root: Value = serde_json::from_str(&raw)?;
-    let effective = extract_effective_config(&root);
-    if !effective.is_object() {
-        return Ok(Some(IoControlPlaneState {
-            current_state: IoNodeLifecycleState::FailedConfig,
-            config_source: IoConfigSource::OrchestratorFallback,
-            schema_version: 1,
-            config_version: 0,
-            effective_config: None,
-            last_error: Some(IoControlPlaneErrorInfo {
-                code: "invalid_config".to_string(),
-                message: format!(
-                    "orchestrator fallback config is not an object: {}",
-                    path.display()
-                ),
-            }),
-        }));
-    }
-
-    let config_version = root
-        .get("_system")
-        .and_then(|v| v.get("config_version"))
-        .and_then(Value::as_u64)
-        .unwrap_or(1);
-
-    Ok(Some(IoControlPlaneState {
-        current_state: IoNodeLifecycleState::Configured,
-        config_source: IoConfigSource::OrchestratorFallback,
-        schema_version: 1,
-        config_version,
-        effective_config: Some(effective),
-        last_error: None,
-    }))
-}
-
-fn extract_effective_config(root: &Value) -> Value {
-    let mut candidate = root.get("config").cloned().unwrap_or_else(|| root.clone());
-    if let Some(obj) = candidate.as_object_mut() {
-        obj.remove("_system");
-    }
-    candidate
-}
-
-fn orchestrator_config_path(
-    node_name: &str,
-    nodes_root: &Path,
-) -> Result<PathBuf, IoControlPlaneBootstrapError> {
-    if nodes_root == Path::new(DEFAULT_ORCHESTRATOR_NODES_ROOT) {
-        return Ok(managed_node_config_path(node_name)?);
-    }
-    Ok(managed_node_config_path_with_root(node_name, nodes_root)?)
+    let bridge = IoContractBridge(contract);
+    let cp = bootstrap_managed_control_plane_with_root(node_name, &bridge, nodes_root)
+        .map_err(|e| IoControlPlaneBootstrapError::ControlPlane(e.to_string()))?;
+    Ok(io_state_from_managed(cp))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io_control_plane::{IoConfigSource, IoNodeLifecycleState};
-    use crate::io_control_plane_store::persist_io_control_plane_state;
+    use fluxbee_sdk::managed_node_config_path_with_root;
+    use serde_json::json;
+    use std::path::PathBuf;
 
-    fn temp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "io-bootstrap-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
-        ));
-        fs::create_dir_all(&dir).expect("create temp dir");
+    struct FakeAdapter;
+    impl IoAdapterConfigContract for FakeAdapter {
+        fn node_kind(&self) -> &'static str {
+            "IO.fake"
+        }
+        fn required_fields(&self) -> &'static [&'static str] {
+            &["io.dst_node"]
+        }
+        fn validate_and_materialize(&self, c: &Value) -> Result<Value, IoAdapterConfigError> {
+            if c.get("io").and_then(|v| v.get("dst_node")).is_some() {
+                Ok(c.clone())
+            } else {
+                Err(IoAdapterConfigError::InvalidConfig("missing io.dst_node".into()))
+            }
+        }
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("io-cp-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    #[test]
-    fn bootstrap_prefers_dynamic_state_over_orchestrator_fallback() {
-        let state_dir = temp_dir("dynamic-first-state");
-        let nodes_root = temp_dir("dynamic-first-nodes");
-        let node_name = "IO.slack.T123@motherbee";
-
-        let dynamic_state = IoControlPlaneState {
-            current_state: IoNodeLifecycleState::Configured,
-            config_source: IoConfigSource::Dynamic,
-            schema_version: 1,
-            config_version: 9,
-            effective_config: Some(serde_json::json!({"io":{"dst_node":"resolve"}})),
-            last_error: None,
-        };
-        persist_io_control_plane_state(&state_dir, node_name, &dynamic_state).expect("persist");
-
-        let orchestrator_cfg_path =
-            managed_node_config_path_with_root(node_name, &nodes_root).expect("managed path");
-        fs::create_dir_all(orchestrator_cfg_path.parent().expect("parent")).expect("mkdir");
-        fs::write(
-            &orchestrator_cfg_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "_system": {"config_version": 3},
-                "config": {"io":{"dst_node":"SY.frontdesk.gov@motherbee"}}
-            }))
-            .expect("json"),
-        )
-        .expect("write orchestrator cfg");
-
-        let boot =
-            bootstrap_io_control_plane_state_with_nodes_root(&state_dir, node_name, &nodes_root)
-                .expect("bootstrap");
-        assert_eq!(boot.config_source, IoConfigSource::Dynamic);
-        assert_eq!(boot.config_version, 9);
+    fn write_config(root: &Path, node: &str, body: &Value) {
+        let p = managed_node_config_path_with_root(node, root).unwrap();
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, serde_json::to_string_pretty(body).unwrap()).unwrap();
     }
 
     #[test]
-    fn bootstrap_uses_orchestrator_fallback_when_dynamic_missing() {
-        let state_dir = temp_dir("fallback-state");
-        let nodes_root = temp_dir("fallback-nodes");
-        let node_name = "IO.slack.T123@motherbee";
-
-        let orchestrator_cfg_path =
-            managed_node_config_path_with_root(node_name, &nodes_root).expect("managed path");
-        fs::create_dir_all(orchestrator_cfg_path.parent().expect("parent")).expect("mkdir");
-        fs::write(
-            &orchestrator_cfg_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "_system": {"config_version": 4},
-                "config": {"io":{"dst_node":"SY.frontdesk.gov@motherbee"}}
-            }))
-            .expect("json"),
-        )
-        .expect("write orchestrator cfg");
-
-        let boot =
-            bootstrap_io_control_plane_state_with_nodes_root(&state_dir, node_name, &nodes_root)
-                .expect("bootstrap");
-        assert_eq!(boot.config_source, IoConfigSource::OrchestratorFallback);
-        assert_eq!(boot.current_state, IoNodeLifecycleState::Configured);
-        assert_eq!(boot.config_version, 4);
+    fn boot_reads_only_node_dir_config_no_dynamic_shadow() {
+        let root = temp_root("single");
+        write_config(
+            &root,
+            "IO.fake@motherbee",
+            &json!({"_system":{"config_version":3},"io":{"dst_node":"AI.x@motherbee"}}),
+        );
+        let st = bootstrap_io_control_plane_state_with_root("IO.fake@motherbee", &FakeAdapter, &root)
+            .expect("boot");
+        assert_eq!(st.current_state, IoNodeLifecycleState::Configured);
+        assert_eq!(st.config_version, 3);
+        assert!(st.effective_config.is_some());
     }
 
     #[test]
-    fn bootstrap_returns_default_when_no_sources_exist() {
-        let state_dir = temp_dir("none-state");
-        let nodes_root = temp_dir("none-nodes");
-        let node_name = "IO.slack.T123@motherbee";
+    fn boot_absent_config_is_unconfigured() {
+        let root = temp_root("absent");
+        let st = bootstrap_io_control_plane_state_with_root("IO.fake@motherbee", &FakeAdapter, &root)
+            .expect("boot");
+        assert_eq!(st.current_state, IoNodeLifecycleState::Unconfigured);
+    }
 
-        let boot =
-            bootstrap_io_control_plane_state_with_nodes_root(&state_dir, node_name, &nodes_root)
-                .expect("bootstrap");
-        assert_eq!(boot.current_state, IoNodeLifecycleState::Unconfigured);
-        assert_eq!(boot.config_source, IoConfigSource::None);
-        assert_eq!(boot.config_version, 0);
+    #[test]
+    fn boot_rejected_config_is_failed_config() {
+        let root = temp_root("rejected");
+        write_config(
+            &root,
+            "IO.fake@motherbee",
+            &json!({"_system":{"config_version":4},"io":{"wrong":"x"}}),
+        );
+        let st = bootstrap_io_control_plane_state_with_root("IO.fake@motherbee", &FakeAdapter, &root)
+            .expect("boot");
+        assert_eq!(st.current_state, IoNodeLifecycleState::FailedConfig);
+        assert_eq!(st.config_version, 4);
+        assert!(st.effective_config.is_none());
     }
 }

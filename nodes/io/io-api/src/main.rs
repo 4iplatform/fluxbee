@@ -211,7 +211,9 @@ async fn main() -> Result<()> {
         .init();
 
     let adapter_contract: Arc<dyn IoAdapterConfigContract> = Arc::new(IoApiAdapterConfigContract);
-    let mut boot_state = bootstrap_io_control_plane_state(&config.state_dir, &config.node_name)
+    // Single-config model: boot reads ONLY the node-dir config.json and validates it through the
+    // adapter contract via the SDK — no state/io-nodes dynamic file to shadow a respawn (BUG-4).
+    let mut boot_state = bootstrap_io_control_plane_state(&config.node_name, adapter_contract.as_ref())
         .unwrap_or_else(|err| IoControlPlaneState {
             current_state: IoNodeLifecycleState::FailedConfig,
             config_source: IoConfigSource::None,
@@ -549,9 +551,7 @@ async fn apply_config_set(
         effective_config: Some(effective.clone()),
         last_error: None,
     };
-    if let Err(err) =
-        persist_io_control_plane_state(&state.config.state_dir, &state.config.node_name, &next)
-    {
+    if let Err(err) = persist_io_control_plane_state(&state.config.node_name, &next) {
         log_config_set_persist_error(
             &state.config.node_name,
             payload.schema_version,

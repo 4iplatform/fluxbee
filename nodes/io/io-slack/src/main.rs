@@ -135,8 +135,9 @@ async fn main() -> Result<()> {
             .map_err(|err| anyhow::anyhow!("invalid blob runtime config: {err}"))?,
     );
     let blob_payload_cfg = config.blob_runtime.text_v1.clone();
-    let mut boot_state = bootstrap_io_control_plane_state(&config.state_dir, &config.node_name)
-        .unwrap_or_else(|err| {
+    let mut boot_state =
+        bootstrap_io_control_plane_state(&config.node_name, &IoSlackAdapterConfigContract)
+            .unwrap_or_else(|err| {
             tracing::warn!(
                 error = %err,
                 state_dir = %config.state_dir.display(),
@@ -2465,7 +2466,8 @@ fn is_control_plane_msg_type(msg_type: &str) -> bool {
 async fn apply_io_config_set(
     payload: &fluxbee_sdk::node_config::NodeConfigSetPayload,
     node_name: &str,
-    state_dir: &Path,
+    // Vestigial: single-config persist no longer needs a state dir. Remove with the state_dir field.
+    _state_dir: &Path,
     control_plane: Arc<RwLock<IoControlPlaneState>>,
     control_metrics: Arc<IoControlPlaneMetrics>,
     adapter_contract: &dyn IoAdapterConfigContract,
@@ -2572,7 +2574,7 @@ async fn apply_io_config_set(
     state.effective_config = Some(effective.clone());
     state.last_error = None;
 
-    if let Err(err) = persist_io_control_plane_state(state_dir, node_name, &state) {
+    if let Err(err) = persist_io_control_plane_state(node_name, &state) {
         let err_text = err.to_string();
         log_config_set_persist_error(
             node_name,

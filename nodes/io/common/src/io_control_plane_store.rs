@@ -1,172 +1,116 @@
+//! IO control-plane persistence — now a thin wrapper over the SDK's single-config persist. The old
+//! dynamic-state file under `/var/lib/fluxbee/state/io-nodes/` is gone (it was the two-location model
+//! that caused the stale-config shadow on respawn, BUG-4). CONFIG_SET now writes back to the node-dir
+//! `config.json`, preserving the orchestrator-owned `_system` block.
+
 use crate::io_control_plane::IoControlPlaneState;
-use serde::{Deserialize, Serialize};
-use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use fluxbee_sdk::managed_control_plane::{persist_effective_config_with_root, DEFAULT_MANAGED_NODES_ROOT};
+use std::path::Path;
 
-pub const DEFAULT_STATE_DIR: &str = "/var/lib/fluxbee/state";
-pub const IO_NODES_STATE_SUBDIR: &str = "io-nodes";
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct IoControlPlaneStateFile {
-    pub node_name: String,
-    pub updated_at_ms: u64,
-    #[serde(flatten)]
-    pub state: IoControlPlaneState,
+/// DEPRECATED vestigial helper: returns the legacy `/var/lib/fluxbee/state` base. Nothing is stored
+/// there anymore (single-config model persists to the node-dir config.json). Kept only so adapters
+/// that still carry a now-unused `state_dir` field compile; remove with that field.
+pub fn default_state_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from("/var/lib/fluxbee/state")
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum IoControlPlaneStoreError {
-    #[error("invalid node_name")]
-    InvalidNodeName,
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("json error: {0}")]
-    Json(#[from] serde_json::Error),
+    #[error("no effective config to persist")]
+    NoEffectiveConfig,
+    #[error("control-plane error: {0}")]
+    ControlPlane(String),
 }
 
-pub fn default_state_dir() -> PathBuf {
-    PathBuf::from(DEFAULT_STATE_DIR)
-}
-
-pub fn io_nodes_state_dir(base_state_dir: &Path) -> PathBuf {
-    base_state_dir.join(IO_NODES_STATE_SUBDIR)
-}
-
-pub fn io_dynamic_state_path(
-    base_state_dir: &Path,
-    node_name: &str,
-) -> Result<PathBuf, IoControlPlaneStoreError> {
-    let normalized = normalize_node_name_for_filename(node_name)?;
-    Ok(io_nodes_state_dir(base_state_dir).join(format!("{normalized}.json")))
-}
-
-pub fn load_io_control_plane_state(
-    base_state_dir: &Path,
-    node_name: &str,
-) -> Result<Option<IoControlPlaneStateFile>, IoControlPlaneStoreError> {
-    let path = io_dynamic_state_path(base_state_dir, node_name)?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = fs::read_to_string(path)?;
-    let parsed = serde_json::from_str::<IoControlPlaneStateFile>(&raw)?;
-    Ok(Some(parsed))
-}
-
+/// Persist the current effective config back to the node-dir `config.json` (SDK single-config model,
+/// preserving `_system`). No-op-safe: if there is no effective config (Unconfigured / FAILED_CONFIG)
+/// there is nothing operator-authored to persist.
 pub fn persist_io_control_plane_state(
-    base_state_dir: &Path,
     node_name: &str,
     state: &IoControlPlaneState,
-) -> Result<PathBuf, IoControlPlaneStoreError> {
-    let path = io_dynamic_state_path(base_state_dir, node_name)?;
-    let payload = IoControlPlaneStateFile {
-        node_name: node_name.trim().to_string(),
-        updated_at_ms: now_epoch_ms(),
-        state: state.clone(),
-    };
-    write_json_atomic(&path, &payload)?;
-    Ok(path)
-}
-
-fn write_json_atomic(
-    path: &Path,
-    payload: &IoControlPlaneStateFile,
 ) -> Result<(), IoControlPlaneStoreError> {
-    let parent = path
-        .parent()
-        .ok_or(IoControlPlaneStoreError::InvalidNodeName)?;
-    fs::create_dir_all(parent)?;
-
-    let tmp_name = format!(
-        ".{}.tmp.{}.{}",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("state"),
-        std::process::id(),
-        now_epoch_ms()
-    );
-    let tmp_path = parent.join(tmp_name);
-
-    let json = serde_json::to_vec_pretty(payload)?;
-    let mut file = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp_path)?;
-    file.write_all(&json)?;
-    file.flush()?;
-    file.sync_all()?;
-    drop(file);
-
-    fs::rename(&tmp_path, path)?;
-    Ok(())
+    persist_io_control_plane_state_with_root(
+        node_name,
+        state,
+        Path::new(DEFAULT_MANAGED_NODES_ROOT),
+    )
 }
 
-fn normalize_node_name_for_filename(node_name: &str) -> Result<String, IoControlPlaneStoreError> {
-    let trimmed = node_name.trim();
-    if trimmed.is_empty() {
-        return Err(IoControlPlaneStoreError::InvalidNodeName);
-    }
-    Ok(trimmed.replace(['/', '\\'], "_"))
-}
-
-fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+/// [`persist_io_control_plane_state`] with an explicit nodes root (for tests).
+pub fn persist_io_control_plane_state_with_root(
+    node_name: &str,
+    state: &IoControlPlaneState,
+    nodes_root: &Path,
+) -> Result<(), IoControlPlaneStoreError> {
+    let effective = state
+        .effective_config
+        .as_ref()
+        .ok_or(IoControlPlaneStoreError::NoEffectiveConfig)?;
+    persist_effective_config_with_root(node_name, state.config_version, effective, nodes_root)
+        .map_err(|e| IoControlPlaneStoreError::ControlPlane(e.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::io_control_plane::{IoConfigSource, IoNodeLifecycleState};
+    use fluxbee_sdk::managed_node_config_path_with_root;
+    use serde_json::{json, Value};
+    use std::path::PathBuf;
 
-    fn temp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "io-control-plane-store-{label}-{}-{}",
-            std::process::id(),
-            now_epoch_ms()
-        ));
-        fs::create_dir_all(&dir).expect("create temp dir");
+    fn temp_root(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("io-store-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
     #[test]
-    fn dynamic_state_path_uses_io_nodes_subdir_and_sanitized_node_name() {
-        let base = PathBuf::from("/tmp/fluxbee-state");
-        let path = io_dynamic_state_path(&base, "IO.slack/T123@motherbee").expect("path");
+    fn persist_writes_node_dir_config_preserving_system() {
+        let root = temp_root("persist");
+        let node = "IO.fake@motherbee";
+        let path = managed_node_config_path_with_root(node, &root).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({"_system":{"config_version":1,"ilk_id":"ilk:x"},"io":{"dst_node":"a"}}))
+                .unwrap(),
+        )
+        .unwrap();
+
+        let state = IoControlPlaneState {
+            current_state: IoNodeLifecycleState::Configured,
+            config_source: IoConfigSource::OrchestratorFallback,
+            schema_version: 1,
+            config_version: 2,
+            effective_config: Some(json!({"io":{"dst_node":"AI.x@motherbee"}})),
+            last_error: None,
+        };
+        persist_io_control_plane_state_with_root(node, &state, &root).expect("persist");
+
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // _system preserved (ilk_id kept, version bumped); the new effective config written.
         assert_eq!(
-            path,
-            PathBuf::from("/tmp/fluxbee-state/io-nodes/IO.slack_T123@motherbee.json")
+            saved.get("_system").and_then(|s| s.get("ilk_id")),
+            Some(&json!("ilk:x"))
+        );
+        assert_eq!(
+            saved.get("_system").and_then(|s| s.get("config_version")),
+            Some(&json!(2))
+        );
+        assert_eq!(
+            saved.get("io").and_then(|i| i.get("dst_node")),
+            Some(&json!("AI.x@motherbee"))
         );
     }
 
     #[test]
-    fn persist_and_load_roundtrip() {
-        let base = temp_dir("roundtrip");
-        let state = IoControlPlaneState {
-            current_state: IoNodeLifecycleState::Configured,
-            config_source: IoConfigSource::Dynamic,
-            schema_version: 1,
-            config_version: 7,
-            effective_config: Some(serde_json::json!({"io":{"dst_node":"resolve"}})),
-            last_error: None,
-        };
-
-        let path =
-            persist_io_control_plane_state(&base, "IO.slack.T123@motherbee", &state).expect("save");
-        assert!(path.exists());
-
-        let loaded = load_io_control_plane_state(&base, "IO.slack.T123@motherbee")
-            .expect("load")
-            .expect("state exists");
-        assert_eq!(loaded.node_name, "IO.slack.T123@motherbee");
-        assert_eq!(loaded.state, state);
-    }
-
-    #[test]
-    fn load_returns_none_when_missing() {
-        let base = temp_dir("missing");
-        let loaded = load_io_control_plane_state(&base, "IO.slack.T123@motherbee").expect("load");
-        assert!(loaded.is_none());
+    fn persist_without_effective_config_is_rejected() {
+        let root = temp_root("noeff");
+        let state = IoControlPlaneState::default();
+        let err = persist_io_control_plane_state_with_root("IO.fake@motherbee", &state, &root)
+            .expect_err("no effective config");
+        assert!(matches!(err, IoControlPlaneStoreError::NoEffectiveConfig));
     }
 }
