@@ -95,57 +95,76 @@ config with real operator content is validated (SDK `managed_control_plane.rs:20
 `resolve_wapp_credentials_from_vault(vault, key)` → 3-state `{Found(creds), Absent, Transient}`
 (delete→clear, timeout→keep), refresh loop + broadcast wake — copied verbatim from io.slack.
 
-## 5. Inbound — **the central architectural DECISION (D1)**
+## 5. Inbound — the **fanout** model (DECIDED)
 
-WhatsApp needs a public HTTPS endpoint. Two options; both are real in the codebase.
+The hard constraint: **one Meta app = ONE webhook URL** (configured at the App level; Meta delivers
+ALL numbers'/WABAs' events to that single URL, tagged with `metadata.phone_number_id` + the WABA id).
+There is no per-number webhook. So the public entry is necessarily singular, and inbound must be
+demultiplexed by `phone_number_id`.
 
-### Option A (RECOMMENDED) — SY.edge `/e/<ich>` + a small, reusable edge enhancement
+**Chosen topology (user, 2026-07-24): fanout + per-number self-select.** The single public endpoint
+fans out to ALL `IO.wapp` nodes; there is **one io.wapp per number**, and each node processes only the
+events for ITS configured `phone_number_id` (self-select). This gives per-number nodes (each a normal
+single-number node, like io.slack is single-workspace) sharing the one mandatory webhook — no
+front-demux, no multi-number config. It leverages fluxbee's existing router **tap/echo fanout**
+primitive (`router-tap`), and it fits WhatsApp's best practice: **ack the webhook 200 immediately and
+process async** (the reply goes out-of-band via the Graph API, §7 — so the edge NEVER waits for a node
+reply on the POST).
 
-Reuse io.api's model: io.wapp self-externalizes an ICH (`ensure_own_ich` `provision.rs:130`; admin
-`"externalize"` `sy_admin.rs:4218`, owner-only gate `authorize_channel_command:5031`), Meta webhooks
-to `https://<edge>/e/<ich>`, the edge forwards to `IO.wapp` as `msg_type=io.wapp.inbound.v1` with the
-HTTP `{method,path,query,headers}` in `meta.context` and the JSON body as `payload`
-(`sy_edge.rs:2007-2051`). Reply correlates by `trace_id`.
+### Separation of concerns (thin edge)
 
-- **Pros**: no open port on the node; SY.edge is the single TLS/DMZ frontier; bearer auth + method
-  allowlist + backpressure + owner-only externalize enforced at the edge; cross-hive by name; matches
-  the B1 DMZ invariant and the io.api precedent. It's "the fluxbee way".
-- **The gap (must be resolved)**: the edge ALWAYS returns **HTTP 200 + `application/json`** wrapping
-  `reply.payload` (`sy_edge.rs:2086-2092`) — a node cannot set status/content-type/raw body. Meta's
-  GET verification needs the **raw `hub.challenge`** as `text/plain`, and a JSON-quoted `"12345"` will
-  not satisfy it.
-- **Proposed enhancement (small, general, reusable by io.api/io.blob too)**: teach the edge to honor
-  an OPTIONAL response envelope in the node reply, e.g.
-  `reply.payload = { "__edge_response": { "status": 200, "content_type": "text/plain", "body": "12345" } }`.
-  When present, the edge emits exactly that; when absent, it keeps today's 200/JSON wrapping (fully
-  backward compatible). io.wapp uses it only for the GET challenge (and to always 200 the POST fast).
-  Also: io.wapp's externalize row must allow **GET+POST** (io.api hardcodes POST-only; we relax
-  `methods` + the `validate_edge_http_context` path/method check on our side).
+- **Connection handshake → the EDGE.** Meta's one-time **GET verification** (`hub.mode`,
+  `hub.verify_token`, `hub.challenge`) is connection-level setup, not app processing. The edge stores
+  the `verify_token` on the fanout endpoint registration (as it already stores io.api's bearer secret)
+  and answers the challenge itself: on match, reply `200 text/plain` with the raw `hub.challenge`; on
+  mismatch, `403`. No fanout for the GET.
+- **Per-message app auth → the NODE.** The `X-Hub-Signature-256` HMAC (with the app-level `app_secret`)
+  is verified by EACH io.wapp using its own `app_secret` from vault. The edge does NOT know
+  `app_secret`, numbers, or the WhatsApp signature scheme — it stays a dumb transport/DMZ frontier.
 
-### Option B — own HTTP listener (io.linkedhelper model)
+### POST flow (events)
 
-io.wapp runs its own axum listener (`config.listen.{address,port}`, `io-linkedhelper/src/main.rs:713-756`).
+1. Meta `POST /e/<ich>` (signed). Endpoint `auth_mode=public` (Meta sends no bearer; the real auth is
+   the HMAC, verified downstream).
+2. Edge **acks Meta `200` immediately** (fire-and-forget; no waiting for node replies — avoids Meta
+   retries), then **fans out** the event to the `IO.wapp` family via the tap/echo primitive, preserving
+   the **raw body** and the `X-Hub-Signature-256` header (needed for HMAC over exact bytes).
+3. Each io.wapp verifies the HMAC (`app_secret` from vault) → default-deny on mismatch; filters by its
+   `phone_number_id` (only the matching node continues); dedups by WhatsApp `message id` (Meta may
+   retry) — reusing io.slack's dedup infra; relays the message as `text/v1` to `io.dst_node`; replies
+   out-of-band via the Graph API (§7).
 
-- **Pros**: full control of verbs/status/content-type/raw body — Meta's challenge is trivial; no edge
-  change.
-- **Cons**: you must provision external ingress/TLS/reverse-proxy to reach the node's port (outside
-  the edge's DMZ model), and you re-implement auth/backpressure/webhook-signature at the node — exactly
-  the things SY.edge centralizes. Diverges from the io.api/io.slack security posture.
+### New edge capability required: **externalize-as-fanout**
 
-**Recommendation**: **Option A + the edge response-envelope enhancement.** It keeps io.wapp behind the
-single hardened frontier and the enhancement is a net win for every edge-served node. Option B is the
-lower-friction *only if* we refuse to touch the edge. → **User's call.**
+Today's edge endpoint is unicast-to-owner and reply-correlated (io.api). io.wapp needs a new endpoint
+**mode**:
+- **fanout target** (the `IO.wapp` family / a tap group) instead of a single `owner_l2_name`, wired via
+  the router tap primitive.
+- **ack-fast, no-reply** POST semantics (edge 200s Meta immediately; does not block on a node reply).
+- **verify_token challenge**: the edge answers the GET from the stored token; `GET` is allowed on the
+  endpoint (io.api hardcodes POST-only).
+- **raw-body forwarding**: the fanned-out message carries the exact bytes + the signature header.
 
-## 6. Webhook verification & signature (in the node)
+The fanout endpoint is created **once** (not per-node): a designated io.wapp (or the admin) externalizes
+it as fanout with the app-level `verify_token`; the other io.wapp nodes just subscribe to the fanout.
+This capability is reusable by any future family-fanned public ingress. **Security note**: because the
+edge does not verify the HMAC, it fans every public POST to N nodes, each rejecting on cheap HMAC —
+amplified ×N but bounded by the edge's existing border rate-limit/backpressure. **Isolation note**:
+every node transiently sees every number's inbound before filtering — fine for one company's own
+numbers; if numbers ever map to mutually-distrusting tenants, a front-demux (a routing io.wapp that
+forwards only the matching event) is the fallback.
 
-- **GET challenge**: compare `context.query["hub.verify_token"]` to the vault `verify_token`
-  (constant-time); on match reply the `hub.challenge` via the edge response-envelope (Option A) or
-  raw (Option B); on mismatch → 403. Default-deny.
-- **POST signature**: recompute `HMAC-SHA256(app_secret, raw_body)` and constant-time compare to
-  `X-Hub-Signature-256`. **Caveat (D2)**: the edge currently forwards the *parsed* JSON `payload`, not
-  the exact raw bytes — HMAC needs the RAW body. So Option A also needs the edge to pass the raw body
-  (e.g. keep `body_base64`/a raw field alongside the parsed payload) OR io.wapp re-serializes
-  canonically (fragile). **DECISION D2**: forward raw body for signed webhooks.
+## 6. Webhook verification & signature (split by layer)
+
+- **GET challenge → the EDGE** (connection handshake). The edge holds the `verify_token` on the fanout
+  endpoint registration; it compares `query["hub.verify_token"]` to it (constant-time) and, on match,
+  replies `200 text/plain` with the raw `query["hub.challenge"]`; on mismatch → `403`. The node is not
+  involved.
+- **POST signature → each NODE** (app auth). Each io.wapp recomputes `HMAC-SHA256(app_secret, RAW body)`
+  and constant-time-compares to `X-Hub-Signature-256`; default-deny on mismatch. `app_secret` comes
+  from the node's vault secret; the edge never sees it. Requires the edge to forward the **raw body**
+  + the signature header on the fanned-out message (the node hashes the exact bytes, not a re-serialized
+  JSON). The node then filters by `phone_number_id` and dedups by `message id`.
 
 ## 7. Outbound (Graph API) & the 24h window
 
@@ -172,12 +191,15 @@ Mirror io.slack: inbound → fetch media via Graph media URL (bearer) → `BlobT
   user's steer; per-tenant instances still spawnable via run_node.
 - Publish via `scripts/publish-io-runtime.sh` (+ a `wapp)` case) or the generic `publish-runtime.sh`.
 
-## 10. Open DECISIONS (need your call)
+## 10. DECISIONS (locked 2026-07-24)
 
-- **D1**: Inbound model — **Option A (edge + response-envelope enhancement)** [recommended] vs Option B
-  (own listener).
-- **D2**: If Option A — extend the edge to forward the **raw body** (for HMAC signature verification).
-- **D3**: `boot=true` degraded (io.slack scheme) [recommended] vs `boot=false`.
+- **D1**: Inbound = **fanout** (§5): one mandatory webhook fanned out to all `IO.wapp` nodes, one node
+  per number, each self-selects by `phone_number_id`. Edge stays thin (connection handshake only). This
+  supersedes the earlier "response-envelope" idea — the POST is ack-fast/no-reply, so the edge never
+  needs to return a node-supplied HTTP body for events.
+- **D2**: Edge forwards the **raw body** + `X-Hub-Signature-256` header on the fanned-out message; each
+  node verifies the HMAC with its own `app_secret` (the edge does NOT verify signatures).
+- **D3**: `boot=true` degraded (io.slack scheme).
 - **D4**: Vault secret `resource_type` = `"whatsapp"` (new canonical) vs reuse `"bearer_token"`
   (io-cloud test uses `wapp_token`/`bearer_token`). Recommend a dedicated `"whatsapp"` type.
 - **D5**: Default inbound target `io.dst_node` = `AI.generic@motherbee` (matches the io.slack decision).
@@ -187,10 +209,14 @@ Mirror io.slack: inbound → fetch media via Graph media URL (bearer) → `BlobT
 
 1. **Contract + skeleton** — `io_wapp_adapter_config.rs` + `io-wapp` crate booting degraded (control
    plane, CONFIG_GET/SET, vault_ref resolve + refresh + broadcast). Unit-tested; boots UNCONFIGURED.
-2. **Edge enhancement (if D1=A)** — optional response-envelope + raw-body forwarding in `sy_edge.rs`
-   (backward compatible), with tests; io.api/io.blob unaffected.
-3. **Inbound** — self-externalize (GET+POST), verify challenge + signature, parse messages → text/v1
-   relay to dst_node; media in.
+2. **Edge fanout capability** — a new endpoint mode in `sy_edge.rs` (+ the externalize admin flow):
+   fanout target (tap group / `IO.wapp` family) instead of unicast owner; GET verify_token challenge
+   answered at the edge; **ack-fast** POST (200 Meta immediately, no reply-wait) + fanout of the RAW
+   body + signature header. Backward compatible — io.api/io.blob (unicast reply-correlated) unaffected.
+   Tests. Security-sensitive; reviewed.
+3. **Node inbound** — subscribe to the fanout; verify `X-Hub-Signature-256` (app_secret from vault);
+   filter by `phone_number_id`; dedup by message id; parse messages → text/v1 relay to dst_node; media
+   in. One io.wapp per number (single-number contract, unchanged).
 4. **Outbound** — Graph messages + 429 retries; media out.
 5. **Packaging** — base-nodes.json + Cargo.toml + publish; firstboot degraded boot.
 6. **Live validation** — deploy to the dev hive; boots UNCONFIGURED; then a real webhook round-trip
