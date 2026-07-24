@@ -253,11 +253,21 @@ func validateAction(path string, action ActionDefinition, clock ClockFunc) Valid
 				errs = append(errs, ValidationError{Path: path + ".meta.type", Message: `must be "user" when target_ref (dynamic target) is set`})
 			}
 		}
+		// gap-5: thread_id_ref, when set, must be a well-formed $ref dot-path (resolved at send time to
+		// the external caller's thread_id for a terminal reply).
+		if strings.TrimSpace(action.ThreadIDRef) != "" && !isValidRefPath(action.ThreadIDRef) {
+			errs = append(errs, ValidationError{Path: path + ".thread_id_ref", Message: `must be a $ref dot-path rooted at state/input/event (e.g. "event.payload.thread_id")`})
+		}
 		if action.Meta == nil || strings.TrimSpace(action.Meta.Msg) == "" {
 			errs = append(errs, ValidationError{Path: path + ".meta.msg", Message: "must not be empty"})
 		}
 		if action.Meta != nil && action.Meta.Type != "" && action.Meta.Type != "system" && action.Meta.Type != "user" {
 			errs = append(errs, ValidationError{Path: path + ".meta.type", Message: `must be "system" or "user" when present`})
+		}
+		// gap-3: meta.context (used for response_envelope) is resolved like a payload — validate its
+		// $ref shape the same way so a bad ref is caught at publish, not silently dropped at send.
+		if action.Meta != nil && action.Meta.Context != nil {
+			errs = append(errs, validateRefPayload(path+".meta.context", action.Meta.Context)...)
 		}
 		errs = append(errs, validateRefPayload(path+".payload", action.Payload)...)
 	case "emit_internal_event":

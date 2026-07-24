@@ -50,6 +50,11 @@ type EventMatch struct {
 type ActionMeta struct {
 	Msg  string `json:"msg"`
 	Type string `json:"type,omitempty"`
+	// Context is an arbitrary object placed on the outbound frame's meta.context, resolved with the
+	// same $ref/${...} rules as payload. Its primary use is requesting AI structured output via
+	// meta.context.response_envelope (gap-3) — ai-generic reads that to shape its reply. Nil = no
+	// context is set (unchanged behavior).
+	Context any `json:"context,omitempty"`
 }
 
 type ActionDefinition struct {
@@ -59,8 +64,15 @@ type ActionDefinition struct {
 	// state/input/event whose resolved string value is the destination. Exactly one of Target /
 	// TargetRef must be set on a send_message action. Either way the (resolved) name is re-validated
 	// and SY.*/RT.* system nodes are refused at send time.
-	Target         string      `json:"target,omitempty"`
-	TargetRef      string      `json:"target_ref,omitempty"`
+	Target    string `json:"target,omitempty"`
+	TargetRef string `json:"target_ref,omitempty"`
+	// ThreadIDRef overrides the outbound thread_id with a $ref-resolved value (a dot-path rooted at
+	// state/input/event). By DEFAULT a send_message uses the WF instance_id as thread_id so replies
+	// correlate back to this instance (see correlate.go). Set ThreadIDRef ONLY for a terminal reply
+	// to an EXTERNAL ingress caller — e.g. answering an IO.api conversation on the caller's own
+	// thread_id — where no correlation-back to the instance is expected. Overriding it for a message
+	// you still expect a reply to WILL break correlation. (gap-5)
+	ThreadIDRef    string      `json:"thread_id_ref,omitempty"`
 	Meta           *ActionMeta `json:"meta,omitempty"`
 	Payload        any         `json:"payload,omitempty"`
 	TimerKey       string      `json:"timer_key,omitempty"`

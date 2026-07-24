@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -124,6 +125,39 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 
 	// thread_id = instance_id (enables response correlation)
 	threadID := inst.InstanceID
+	// gap-5: an explicit thread_id_ref overrides instance_id for a TERMINAL reply to an external
+	// ingress caller (answer on the caller's own thread; no reply-back to this instance is expected).
+	// Resolved the same way as target_ref.
+	if threadRef := strings.TrimSpace(action.ThreadIDRef); threadRef != "" {
+		resolved, err := lookupRef(threadRef, inst.Input, inst.StateVars, eventMap)
+		if err != nil {
+			return fmt.Errorf("send_message: resolve thread_id_ref %q: %w", threadRef, err)
+		}
+		s, ok := resolved.(string)
+		if !ok {
+			return fmt.Errorf("send_message: thread_id_ref %q resolved to non-string %T", threadRef, resolved)
+		}
+		if strings.TrimSpace(s) == "" {
+			return fmt.Errorf("send_message: thread_id_ref %q resolved to an empty string", threadRef)
+		}
+		threadID = s
+	}
+
+	// gap-3: resolve an optional meta.context (e.g. {response_envelope: {...}} to request AI
+	// structured output) with the same $ref rules as the payload, and carry it on the frame's
+	// meta.context so ai-generic can read it.
+	var contextRaw json.RawMessage
+	if action.Meta != nil && action.Meta.Context != nil {
+		resolvedCtx, err := Resolve(action.Meta.Context, inst.Input, inst.StateVars, eventMap)
+		if err != nil {
+			return fmt.Errorf("send_message: resolve meta.context: %w", err)
+		}
+		ctxBytes, err := json.Marshal(resolvedCtx)
+		if err != nil {
+			return fmt.Errorf("send_message: marshal meta.context: %w", err)
+		}
+		contextRaw = ctxBytes
+	}
 	// trace_id = original event trace_id (idempotency on re-execution)
 	traceID := inst.CurrentTraceID
 	if traceID == "" {
@@ -176,6 +210,7 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 			MsgType:  msgType,
 			Msg:      &msgNameCopy,
 			ThreadID: &threadIDCopy,
+			Context:  contextRaw,
 		},
 		Payload: raw,
 	}
