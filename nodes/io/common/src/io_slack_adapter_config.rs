@@ -1,5 +1,5 @@
 use crate::io_adapter_config::{IoAdapterConfigContract, IoAdapterConfigError};
-use fluxbee_sdk::node_secret::{NodeSecretDescriptor, NODE_SECRET_REDACTION_TOKEN};
+use fluxbee_sdk::node_secret::NodeSecretDescriptor;
 use serde_json::{Map, Value};
 
 pub struct IoSlackAdapterConfigContract;
@@ -10,9 +10,12 @@ impl IoAdapterConfigContract for IoSlackAdapterConfigContract {
     }
 
     fn required_fields(&self) -> &'static [&'static str] {
+        // Family pattern (mirrors io.linkedhelper): the Slack credentials are NEVER in config — config
+        // carries only a vault-key REFERENCE, resolved from SY.vault at runtime via vault.get(key).
         &[
-            "config.slack.app_token | config.slack.app_token_ref",
-            "config.slack.bot_token | config.slack.bot_token_ref",
+            "config.slack.auth.type",
+            "config.slack.auth.resource_type",
+            "config.slack.auth.key",
             "config.io.workspace_id",
             "config.io.conversation_id",
         ]
@@ -35,10 +38,12 @@ impl IoAdapterConfigContract for IoSlackAdapterConfigContract {
 
     fn notes(&self) -> &'static [&'static str] {
         &[
-            "For each Slack token, either inline token or *_ref is accepted.",
-            "Secrets must be redacted in responses and logs.",
+            "Slack credentials use slack.auth.type=vault_ref; inline tokens are not accepted. The \
+             secret (an object {app_token, bot_token}) is resolved from SY.vault at runtime using \
+             slack.auth.key, validating metadata.resource_type == slack.",
             "MVP apply mode is replace only.",
-            "workspace_id + conversation_id identify the stable local Slack binding used for own-ICH registration.",
+            "workspace_id + conversation_id identify the stable local Slack binding used for own-ICH \
+             registration.",
         ]
     }
 
@@ -55,32 +60,26 @@ impl IoAdapterConfigContract for IoSlackAdapterConfigContract {
 
         {
             let slack = cfg.get("slack").and_then(Value::as_object).ok_or_else(|| {
-                IoAdapterConfigError::Internal(
-                    "slack object missing after normalization".to_string(),
-                )
+                IoAdapterConfigError::Internal("slack object missing after normalization".to_string())
             })?;
-
-            let has_app = has_non_empty_string(slack, "app_token")
-                || has_non_empty_string(slack, "slack_app_token")
-                || has_non_empty_string(slack, "app_token_ref")
-                || has_non_empty_string(slack, "slack_app_token_ref");
-            if !has_app {
+            let auth = slack
+                .get("auth")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    IoAdapterConfigError::InvalidConfig(
+                        "slack.auth is required (a vault reference: {type:\"vault_ref\", \
+                         resource_type:\"slack\", key:\"<vault key>\"})"
+                            .to_string(),
+                    )
+                })?;
+            let auth_type = auth.get("type").and_then(Value::as_str).map(str::trim);
+            if auth_type != Some("vault_ref") {
                 return Err(IoAdapterConfigError::InvalidConfig(
-                    "missing required Slack app credential: slack.app_token or slack.app_token_ref"
-                        .to_string(),
+                    "slack.auth.type must be \"vault_ref\"".to_string(),
                 ));
             }
-
-            let has_bot = has_non_empty_string(slack, "bot_token")
-                || has_non_empty_string(slack, "slack_bot_token")
-                || has_non_empty_string(slack, "bot_token_ref")
-                || has_non_empty_string(slack, "slack_bot_token_ref");
-            if !has_bot {
-                return Err(IoAdapterConfigError::InvalidConfig(
-                    "missing required Slack bot credential: slack.bot_token or slack.bot_token_ref"
-                        .to_string(),
-                ));
-            }
+            require_non_empty_string(auth, "resource_type", "slack.auth.resource_type")?;
+            require_non_empty_string(auth, "key", "slack.auth.key")?;
         }
 
         let io_obj = cfg
@@ -89,9 +88,8 @@ impl IoAdapterConfigContract for IoSlackAdapterConfigContract {
             .ok_or_else(|| IoAdapterConfigError::Internal("io missing".to_string()))?;
         require_non_empty_string(io_obj, "workspace_id", "io.workspace_id")?;
         require_non_empty_string(io_obj, "conversation_id", "io.conversation_id")?;
-        io_obj
-            .entry("dst_node".to_string())
-            .or_insert(Value::String("resolve".to_string()));
+        // NO dst_node default: absence means "let the router resolve" (None -> Destination::Resolve),
+        // like io-api. A literal "resolve" string is a bogus unicast target, so it is never injected.
         ensure_optional_object_member(io_obj, "relay", "io.relay")?;
         if let Some(relay) = io_obj.get("relay").and_then(Value::as_object) {
             validate_optional_non_negative_integer(relay, "window_ms", "io.relay.window_ms")?;
@@ -116,42 +114,25 @@ impl IoAdapterConfigContract for IoSlackAdapterConfigContract {
     }
 
     fn redact_effective_config(&self, effective: &Value) -> Value {
-        let mut redacted = effective.clone();
-        let Some(root) = redacted.as_object_mut() else {
-            return redacted;
-        };
-        let Some(slack) = root.get_mut("slack").and_then(Value::as_object_mut) else {
-            return redacted;
-        };
-
-        redact_secret_field(slack, "app_token");
-        redact_secret_field(slack, "slack_app_token");
-        redact_secret_field(slack, "bot_token");
-        redact_secret_field(slack, "slack_bot_token");
-        redacted
+        // Credentials never live in config anymore — slack.auth.key is a vault REFERENCE, not a
+        // secret (mirrors io.linkedhelper value_redacted=false). Nothing to redact.
+        effective.clone()
     }
 
     fn secret_descriptors(&self, effective: Option<&Value>) -> Vec<NodeSecretDescriptor> {
-        let app_configured = effective
+        let key_configured = effective
             .and_then(|v| v.get("slack"))
+            .and_then(|s| s.get("auth"))
             .and_then(Value::as_object)
-            .map(has_slack_app_secret)
-            .unwrap_or(false);
-        let bot_configured = effective
-            .and_then(|v| v.get("slack"))
-            .and_then(Value::as_object)
-            .map(has_slack_bot_secret)
+            .map(|auth| has_non_empty_string(auth, "key"))
             .unwrap_or(false);
 
-        let mut app = NodeSecretDescriptor::new("config.slack.app_token", "slack_app_token");
-        app.required = true;
-        app.configured = app_configured;
-
-        let mut bot = NodeSecretDescriptor::new("config.slack.bot_token", "slack_bot_token");
-        bot.required = true;
-        bot.configured = bot_configured;
-
-        vec![app, bot]
+        let mut cred = NodeSecretDescriptor::new("config.slack.auth.key", "slack_credentials");
+        cred.required = true;
+        cred.configured = key_configured;
+        cred.value_redacted = false; // the field is a vault key reference, not the secret itself
+        cred.persistence = "vault".to_string();
+        vec![cred]
     }
 }
 
@@ -260,106 +241,66 @@ fn validate_optional_positive_integer(
     Ok(())
 }
 
-fn redact_secret_field(map: &mut Map<String, Value>, key: &str) {
-    if map.get(key).and_then(Value::as_str).is_some() {
-        map.insert(
-            key.to_string(),
-            Value::String(NODE_SECRET_REDACTION_TOKEN.to_string()),
-        );
-    }
-}
-
-fn has_slack_app_secret(slack: &Map<String, Value>) -> bool {
-    has_non_empty_string(slack, "app_token")
-        || has_non_empty_string(slack, "slack_app_token")
-        || has_non_empty_string(slack, "app_token_ref")
-        || has_non_empty_string(slack, "slack_app_token_ref")
-}
-
-fn has_slack_bot_secret(slack: &Map<String, Value>) -> bool {
-    has_non_empty_string(slack, "bot_token")
-        || has_non_empty_string(slack, "slack_bot_token")
-        || has_non_empty_string(slack, "bot_token_ref")
-        || has_non_empty_string(slack, "slack_bot_token_ref")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
+    fn valid_auth() -> Value {
+        json!({"type":"vault_ref","resource_type":"slack","key":"slack/IO.slack@motherbee"})
+    }
+
     #[test]
-    fn validate_materialize_requires_slack_credentials_and_sets_dst_default() {
+    fn validate_materialize_requires_vault_ref_auth_and_binding() {
         let contract = IoSlackAdapterConfigContract;
+        // missing auth
         let err = contract
-            .validate_and_materialize(&json!({"slack":{}}))
-            .expect_err("must fail missing secrets");
+            .validate_and_materialize(&json!({"slack":{}, "io":{"workspace_id":"T1","conversation_id":"C1"}}))
+            .expect_err("must fail missing auth");
+        assert!(matches!(err, IoAdapterConfigError::InvalidConfig(m) if m.contains("slack.auth is required")));
+
+        // wrong auth type
+        let err = contract
+            .validate_and_materialize(&json!({
+                "slack":{"auth":{"type":"inline","resource_type":"slack","key":"k"}},
+                "io":{"workspace_id":"T1","conversation_id":"C1"}
+            }))
+            .expect_err("must reject non vault_ref");
         assert_eq!(
             err,
-            IoAdapterConfigError::InvalidConfig(
-                "missing required Slack app credential: slack.app_token or slack.app_token_ref"
-                    .to_string()
-            )
+            IoAdapterConfigError::InvalidConfig("slack.auth.type must be \"vault_ref\"".to_string())
         );
 
+        // valid, and NO dst_node is injected
         let out = contract
             .validate_and_materialize(&json!({
-                "slack": {
-                    "app_token_ref": "env:SLACK_APP_TOKEN",
-                    "bot_token_ref": "env:SLACK_BOT_TOKEN"
-                },
-                "io": {"workspace_id":"T123", "conversation_id":"C456"}
+                "slack":{"auth": valid_auth()},
+                "io":{"workspace_id":"T123","conversation_id":"C456"}
             }))
             .expect("must pass");
-        assert_eq!(
-            out.get("io")
-                .and_then(Value::as_object)
-                .and_then(|io| io.get("dst_node"))
-                .and_then(Value::as_str),
-            Some("resolve")
-        );
+        assert!(out
+            .get("io")
+            .and_then(Value::as_object)
+            .and_then(|io| io.get("dst_node"))
+            .is_none());
     }
 
     #[test]
-    fn redact_effective_config_masks_inline_tokens() {
+    fn redact_effective_config_is_noop_for_vault_ref() {
         let contract = IoSlackAdapterConfigContract;
-        let redacted = contract.redact_effective_config(&json!({
-            "slack": {
-                "app_token": "xapp-123",
-                "bot_token": "xoxb-123",
-                "app_token_ref": "env:SLACK_APP_TOKEN"
-            }
-        }));
-        assert_eq!(
-            redacted
-                .get("slack")
-                .and_then(Value::as_object)
-                .and_then(|s| s.get("app_token"))
-                .and_then(Value::as_str),
-            Some(NODE_SECRET_REDACTION_TOKEN)
-        );
-        assert_eq!(
-            redacted
-                .get("slack")
-                .and_then(Value::as_object)
-                .and_then(|s| s.get("bot_token"))
-                .and_then(Value::as_str),
-            Some(NODE_SECRET_REDACTION_TOKEN)
-        );
+        let cfg = json!({"slack":{"auth": valid_auth()}, "io":{"workspace_id":"T1"}});
+        assert_eq!(contract.redact_effective_config(&cfg), cfg);
     }
 
     #[test]
-    fn secret_descriptors_mark_configured_when_refs_present() {
+    fn secret_descriptor_is_vault_key_ref() {
         let contract = IoSlackAdapterConfigContract;
-        let descriptors = contract.secret_descriptors(Some(&json!({
-            "slack": {
-                "app_token_ref": "env:SLACK_APP_TOKEN",
-                "bot_token_ref": "env:SLACK_BOT_TOKEN"
-            }
-        })));
-        assert_eq!(descriptors.len(), 2);
-        assert!(descriptors[0].configured);
-        assert!(descriptors[1].configured);
+        let d = contract.secret_descriptors(Some(&json!({"slack":{"auth": valid_auth()}})));
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].field, "config.slack.auth.key");
+        assert!(d[0].configured);
+        assert!(!d[0].value_redacted);
+        assert_eq!(d[0].persistence, "vault");
     }
 
     #[test]
@@ -367,19 +308,11 @@ mod tests {
         let contract = IoSlackAdapterConfigContract;
         let out = contract
             .validate_and_materialize(&json!({
-                "slack": {
-                    "app_token_ref": "env:SLACK_APP_TOKEN",
-                    "bot_token_ref": "env:SLACK_BOT_TOKEN"
-                },
+                "slack":{"auth": valid_auth()},
                 "io": {
                     "workspace_id": "T123",
                     "conversation_id": "C456",
-                    "relay": {
-                        "window_ms": 2500,
-                        "max_open_sessions": 2000,
-                        "max_fragments_per_session": 6,
-                        "max_bytes_per_session": 131072
-                    }
+                    "relay": {"window_ms": 2500, "max_open_sessions": 2000, "max_fragments_per_session": 6, "max_bytes_per_session": 131072}
                 }
             }))
             .expect("must accept relay config");
@@ -399,17 +332,8 @@ mod tests {
         let contract = IoSlackAdapterConfigContract;
         let err = contract
             .validate_and_materialize(&json!({
-                "slack": {
-                    "app_token_ref": "env:SLACK_APP_TOKEN",
-                    "bot_token_ref": "env:SLACK_BOT_TOKEN"
-                },
-                "io": {
-                    "workspace_id": "T123",
-                    "conversation_id": "C456",
-                    "relay": {
-                        "max_open_sessions": 0
-                    }
-                }
+                "slack":{"auth": valid_auth()},
+                "io": {"workspace_id": "T123", "conversation_id": "C456", "relay": {"max_open_sessions": 0}}
             }))
             .expect_err("must reject zero max_open_sessions");
         assert_eq!(

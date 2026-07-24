@@ -26,9 +26,8 @@ use io_common::io_control_plane::{
 };
 use io_common::io_control_plane_bootstrap::bootstrap_io_control_plane_state;
 use io_common::io_control_plane_logging::{
-    log_config_get_served, log_config_set_applied, log_config_set_invalid_runtime_credentials,
-    log_config_set_persist_error, log_config_set_stale_rejected,
-    log_control_plane_request_rejected,
+    log_config_get_served, log_config_set_applied, log_config_set_persist_error,
+    log_config_set_stale_rejected, log_control_plane_request_rejected,
 };
 use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
 use io_common::io_control_plane_store::persist_io_control_plane_state;
@@ -78,7 +77,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         node_name = %config.node_name,
         router_socket = %config.router_socket.display(),
-        dst_node = %config.dst_node.clone().unwrap_or_else(|| "resolve".to_string()),
+        dst_node = %config.dst_node.clone().unwrap_or_else(|| "(router-resolve)".to_string()),
         dev_mode = %config.dev_mode,
         workspace_id = ?config.workspace_id,
         conversation_id = ?config.conversation_id,
@@ -106,7 +105,7 @@ async fn main() -> Result<()> {
         "connected to router"
     );
 
-    let slack = Arc::new(SlackClients::new(&config)?);
+    let slack = Arc::new(SlackClients::new()?);
     let identity: Arc<dyn IdentityResolver> = Arc::new(ShmIdentityResolver::new(&config.island_id));
     let provisioner: Arc<dyn IdentityProvisioner> = Arc::new(FluxbeeIdentityProvisioner::new(
         dispatcher.clone(),
@@ -121,7 +120,7 @@ async fn main() -> Result<()> {
             ttl: config.ttl,
             dedup_ttl: Duration::from_millis(config.dedup_ttl_ms),
             dedup_max_entries: config.dedup_max_entries,
-            dst_node: config.dst_node.clone(),
+            dst_node: None,
             provision_on_miss: true,
             blob_runtime: Some(config.blob_runtime.clone()),
         },
@@ -133,7 +132,7 @@ async fn main() -> Result<()> {
             .map_err(|err| anyhow::anyhow!("invalid blob runtime config: {err}"))?,
     );
     let blob_payload_cfg = config.blob_runtime.text_v1.clone();
-    let mut boot_state =
+    let boot_state =
         bootstrap_io_control_plane_state(&config.node_name, &IoSlackAdapterConfigContract)
             .unwrap_or_else(|err| {
             tracing::warn!(
@@ -143,34 +142,17 @@ async fn main() -> Result<()> {
             );
             IoControlPlaneState::default()
         });
-    if let Some(effective) = boot_state.effective_config.as_ref() {
-        match (
-            extract_runtime_slack_credentials(effective),
-            extract_runtime_slack_binding(Some(effective), &config),
-        ) {
-            (Ok((app_token, bot_token)), Ok(_binding)) => {
-                slack.reload_credentials(app_token, bot_token).await;
-            }
-            (Err(err), _) | (_, Err(err)) => {
-                boot_state.current_state = IoNodeLifecycleState::FailedConfig;
-                boot_state.last_error = Some(IoControlPlaneErrorInfo {
-                    code: "invalid_config".to_string(),
-                    message: err.to_string(),
-                });
-                tracing::warn!(
-                    node_name = %config.node_name,
-                    error = %err,
-                    "boot effective config is missing/invalid slack binding or credentials; starting in FAILED_CONFIG"
-                );
-            }
-        }
-    }
+    // dst_node from the VALIDATED effective config (io-api pattern); absence -> None ->
+    // Destination::Resolve. No "resolve" literal (a bogus unicast target).
+    inbound
+        .lock()
+        .await
+        .set_dst_node(extract_runtime_dst_node(boot_state.effective_config.as_ref()));
 
-    // Model D' — try to resolve slack credentials from vault on every boot.
-    // If vault has the secret it overrides whatever was in the persisted
-    // effective_config (which is the legacy path; will be deprecated). If
-    // vault doesn't have the secret yet, the node runs degraded and the
-    // refresh loop below will pick it up once the operator runs vault_put.
+    // Credentials live in SY.vault (family vault_ref pattern); config carries only slack.auth.key, so
+    // Configured/FAILED_CONFIG is a pure function of config STRUCTURAL validity (already decided by the
+    // contract at bootstrap). A not-yet-present vault secret is a DEGRADED runtime signal, NOT
+    // FAILED_CONFIG -- the refresh loop picks it up after vault_put / rotation without a restart.
     let vault_client_opt: Option<VaultClient> = match (
         self_ilk_id.as_deref().filter(|v| !v.is_empty()),
         config.node_name.split('@').nth(1).filter(|v| !v.is_empty()),
@@ -182,45 +164,19 @@ async fn main() -> Result<()> {
         )),
         _ => None,
     };
-    if let (Some(vault_client), Some(self_tenant_id_ref)) = (
-        vault_client_opt.as_ref(),
-        self_tenant_id.as_deref().filter(|v| !v.is_empty()),
-    ) {
-        match resolve_slack_credentials_from_vault(vault_client, self_tenant_id_ref).await {
-            Some((app_token, bot_token)) => {
-                slack.reload_credentials(app_token, bot_token).await;
-                tracing::info!(
-                    node_name = %config.node_name,
-                    "io-slack credentials loaded from vault (resource_type=slack)"
-                );
-            }
-            None => {
-                tracing::warn!(
-                    node_name = %config.node_name,
-                    "io-slack vault lookup for slack credentials returned None; running degraded (refresh loop will retry)"
-                );
-            }
+    if let Some(vault_client) = vault_client_opt.as_ref() {
+        match slack_vault_key(boot_state.effective_config.as_ref()) {
+            Some(key) => match resolve_slack_credentials_from_vault(vault_client, &key).await {
+                Some((app_token, bot_token)) => {
+                    slack.reload_credentials(app_token, bot_token).await;
+                    tracing::info!(node_name = %config.node_name, vault_key = %key, "io-slack credentials loaded from vault");
+                }
+                None => tracing::warn!(node_name = %config.node_name, vault_key = %key, "io-slack vault credentials not ready; running degraded (refresh loop will retry)"),
+            },
+            None => tracing::warn!(node_name = %config.node_name, "no slack.auth.key in effective config; running degraded until configured"),
         }
     } else {
-        tracing::warn!(
-            node_name = %config.node_name,
-            "FLUXBEE_NODE_ILK_ID / FLUXBEE_NODE_TENANT_ID / hive suffix missing; vault lookup skipped"
-        );
-    }
-    // Periodic vault refresh — picks up vault_put after boot or rotations.
-    if let Some(vault_client) = vault_client_opt {
-        let refresh_node_name = config.node_name.clone();
-        let refresh_slack = slack.clone();
-        let self_tenant_id_clone = self_tenant_id.clone();
-        tokio::spawn(async move {
-            run_slack_vault_refresh_loop(
-                refresh_node_name,
-                vault_client,
-                refresh_slack,
-                self_tenant_id_clone,
-            )
-            .await;
-        });
+        tracing::warn!(node_name = %config.node_name, "FLUXBEE_NODE_ILK_ID / hive suffix missing; vault lookup skipped");
     }
     let relay_policy = slack_relay_policy(&config, boot_state.effective_config.as_ref())
         .map_err(|err| anyhow::anyhow!("invalid relay policy from node config: {err}"))?;
@@ -248,6 +204,18 @@ async fn main() -> Result<()> {
         boot_state.config_version,
     ));
     let adapter_contract: Arc<dyn IoAdapterConfigContract> = Arc::new(IoSlackAdapterConfigContract);
+
+    // Vault refresh loop (family vault_ref pattern): re-reads slack.auth.key from the LIVE control
+    // plane each tick and hot-swaps credentials on first-appearance / rotation / CONFIG_SET — no
+    // restart. Owns vault_client_opt from here on.
+    if let Some(vault_client) = vault_client_opt {
+        tokio::spawn(run_slack_vault_refresh_loop(
+            config.node_name.clone(),
+            vault_client,
+            slack.clone(),
+            control_plane.clone(),
+        ));
+    }
 
     if let Some(effective) = boot_state.effective_config.as_ref() {
         if let Ok(binding) = extract_runtime_slack_binding(Some(effective), &config) {
@@ -350,8 +318,6 @@ fn build_io_slack_rpc_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::
 
 #[derive(Clone)]
 struct Config {
-    slack_app_token: Option<String>,
-    slack_bot_token: Option<String>,
     workspace_id: Option<String>,
     conversation_id: Option<String>,
     node_name: String,
@@ -415,10 +381,8 @@ impl Config {
         // Model D' — Slack credentials live entirely in SY.vault under
         // `resource_type=slack`. Local plaintext / spawn-doc / env var
         // fallbacks were removed in Phase J' / VA-K2. The boot path here
-        // leaves credentials empty; the actual lookup happens in main()
-        // after the SDK router is up, via `resolve_resource(Slack, ...)`.
-        let slack_app_token: Option<String> = None;
-        let slack_bot_token: Option<String> = None;
+        // Credentials never come from env/config: they are resolved from SY.vault in main() after the
+        // router is up (boot resolution + refresh loop), via slack.auth.key (family vault_ref pattern).
         let workspace_id = env("IO_SLACK_WORKSPACE_ID").or_else(|| {
             json_get_string_opt(
                 spawn_doc,
@@ -558,8 +522,6 @@ impl Config {
         };
 
         Ok(Self {
-            slack_app_token,
-            slack_bot_token,
             workspace_id,
             conversation_id,
             node_name: resolved_node_name,
@@ -731,25 +693,50 @@ const IO_SLACK_VAULT_REFRESH_INTERVAL_SECS: u64 = 60;
 ///
 /// Vault site #7-of-9: now routed through the canonical `Arc<RouterDispatcher>`
 /// via `VaultClient` (no per-call ephemeral connection).
+/// Resolve `(app_token, bot_token)` from SY.vault by the explicit vault KEY declared in config
+/// (`slack.auth.key`). This is the family pattern (mirrors io.linkedhelper / ai.generic's vault_key),
+/// replacing the old resolve-by-resource_type. The secret's `metadata.resource_type` must be "slack".
 async fn resolve_slack_credentials_from_vault(
     vault: &VaultClient,
-    self_tenant_id: &str,
+    key: &str,
 ) -> Option<(String, String)> {
-    let result = vault
-        .resolve_resource(
-            fluxbee_sdk::ResourceType::Slack,
-            self_tenant_id,
-            Duration::from_secs(5),
-        )
-        .await;
-    match result {
-        Ok(Some(value)) => extract_slack_tokens_from_vault_value(&value),
-        Ok(None) => None,
+    match vault.get(key, Duration::from_secs(5)).await {
+        Ok(response) => {
+            let resource_type = response
+                .metadata
+                .as_ref()
+                .and_then(|m| m.resource_type.as_deref());
+            if resource_type != Some("slack") {
+                tracing::warn!(
+                    vault_key = %key,
+                    resource_type = ?resource_type,
+                    "vault key is not resource_type=slack; ignoring"
+                );
+                return None;
+            }
+            response
+                .value
+                .as_ref()
+                .and_then(extract_slack_tokens_from_vault_value)
+        }
         Err(err) => {
-            tracing::warn!(error = %err, "io-slack vault resource lookup failed");
+            tracing::warn!(vault_key = %key, error = %err, "io-slack vault get failed");
             None
         }
     }
+}
+
+/// The vault key that holds this node's Slack credentials, read from `slack.auth.key` in the effective
+/// config (the family vault_ref pattern). `None` while unconfigured.
+fn slack_vault_key(effective: Option<&Value>) -> Option<String> {
+    effective
+        .and_then(|c| c.get("slack"))
+        .and_then(|s| s.get("auth"))
+        .and_then(|a| a.get("key"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
 }
 
 /// Extract `(app_token, bot_token)` from a vault `value`. The value must
@@ -779,25 +766,26 @@ async fn run_slack_vault_refresh_loop(
     node_name: String,
     vault: VaultClient,
     slack: Arc<SlackClients>,
-    self_tenant_id: Option<String>,
+    control_plane: Arc<RwLock<IoControlPlaneState>>,
 ) {
-    let Some(self_tenant_id) = self_tenant_id.filter(|v| !v.is_empty()) else {
-        tracing::warn!(
-            node_name = %node_name,
-            "self_tenant_id missing; vault refresh loop disabled"
-        );
-        return;
-    };
     let mut ticker = tokio::time::interval(Duration::from_secs(IO_SLACK_VAULT_REFRESH_INTERVAL_SECS));
     ticker.tick().await; // skip first immediate tick
     loop {
         ticker.tick().await;
+        // Read the CURRENT vault key from the live control plane, so a CONFIG_SET that changes
+        // slack.auth.key is honored without a restart, and post-boot vault_put / rotations flow in.
+        let Some(key) = slack_vault_key(control_plane.read().await.effective_config.as_ref()) else {
+            tracing::debug!(
+                node_name = %node_name,
+                "no slack.auth.key in effective config; vault refresh skipped"
+            );
+            continue;
+        };
         if let Some((app_token, bot_token)) =
-            resolve_slack_credentials_from_vault(&vault, &self_tenant_id).await
+            resolve_slack_credentials_from_vault(&vault, &key).await
         {
-            // reload_credentials is cheap and idempotent: it overwrites
-            // the runtime tokens. If they didn't change, the next API
-            // call simply re-authenticates with the same value.
+            // Cheap + idempotent: overwrites the runtime tokens (a no-op if unchanged; a generation
+            // bump + WS reconnect if they changed).
             slack.reload_credentials(app_token, bot_token).await;
         }
     }
@@ -817,20 +805,40 @@ struct SlackClients {
     runtime: Arc<RwLock<SlackRuntimeState>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct SlackRuntimeState {
     slack_app_token: Option<String>,
     slack_bot_token: Option<String>,
     config_generation: u64,
 }
 
+// Manual Debug that never prints the live tokens (mirrors io-api PublicationRuntime): a leaked
+// xapp-/xoxb- token in a log line is a workspace compromise. Only presence + generation surface.
+impl std::fmt::Debug for SlackRuntimeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlackRuntimeState")
+            .field(
+                "slack_app_token",
+                &self.slack_app_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "slack_bot_token",
+                &self.slack_bot_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("config_generation", &self.config_generation)
+            .finish()
+    }
+}
+
 impl SlackClients {
-    fn new(config: &Config) -> Result<Self> {
+    fn new() -> Result<Self> {
         Ok(Self {
             http: reqwest::Client::new(),
             runtime: Arc::new(RwLock::new(SlackRuntimeState {
-                slack_app_token: config.slack_app_token.clone(),
-                slack_bot_token: config.slack_bot_token.clone(),
+                // Credentials are resolved from SY.vault post-construction (boot resolution + refresh
+                // loop, family vault_ref pattern) — never seeded from config.
+                slack_app_token: None,
+                slack_bot_token: None,
                 config_generation: 0,
             })),
         })
@@ -1929,11 +1937,67 @@ async fn collect_slack_blob_attachments(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_system_reply, default_slack_allowed_mimes, extract_runtime_relay_config,
-        slack_relay_policy_from_config, SlackRelayConfig,
+        build_system_reply, default_slack_allowed_mimes, extract_slack_tokens_from_vault_value,
+        extract_runtime_relay_config, slack_relay_policy_from_config, slack_vault_key,
+        SlackRelayConfig, SlackRuntimeState,
     };
     use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing};
     use serde_json::json;
+
+    #[test]
+    fn slack_vault_key_reads_auth_key_and_ignores_blanks() {
+        // Family vault_ref pattern: config carries only slack.auth.key (a vault reference).
+        let cfg = json!({"slack":{"auth":{"type":"vault_ref","resource_type":"slack","key":"slack/IO.slack@motherbee"}}});
+        assert_eq!(
+            slack_vault_key(Some(&cfg)).as_deref(),
+            Some("slack/IO.slack@motherbee")
+        );
+        assert_eq!(slack_vault_key(None), None);
+        assert_eq!(slack_vault_key(Some(&json!({"slack":{"auth":{}}}))), None);
+        assert_eq!(
+            slack_vault_key(Some(&json!({"slack":{"auth":{"key":"   "}}}))),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_slack_tokens_requires_object_with_both_fields() {
+        let ok = extract_slack_tokens_from_vault_value(&json!({"app_token":"xapp-1","bot_token":"xoxb-2"}));
+        assert_eq!(ok, Some(("xapp-1".to_string(), "xoxb-2".to_string())));
+        // bare strings are ambiguous -> rejected
+        assert_eq!(extract_slack_tokens_from_vault_value(&json!("xapp-1")), None);
+        // a missing / blank half is not usable
+        assert_eq!(
+            extract_slack_tokens_from_vault_value(&json!({"app_token":"xapp-1"})),
+            None
+        );
+        assert_eq!(
+            extract_slack_tokens_from_vault_value(&json!({"app_token":"xapp-1","bot_token":"  "})),
+            None
+        );
+    }
+
+    #[test]
+    fn slack_runtime_state_debug_never_leaks_tokens() {
+        // A leaked xapp-/xoxb- token in a log line is a workspace compromise: Debug must redact.
+        let state = SlackRuntimeState {
+            slack_app_token: Some("xapp-super-secret".to_string()),
+            slack_bot_token: Some("xoxb-super-secret".to_string()),
+            config_generation: 3,
+        };
+        let rendered = format!("{state:?}");
+        assert!(!rendered.contains("xapp-super-secret"), "{rendered}");
+        assert!(!rendered.contains("xoxb-super-secret"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("config_generation: 3"), "{rendered}");
+        // absence renders as None, not <redacted>
+        let empty = SlackRuntimeState {
+            slack_app_token: None,
+            slack_bot_token: None,
+            config_generation: 0,
+        };
+        assert!(format!("{empty:?}").contains("None"));
+    }
 
     #[test]
     fn default_slack_allowed_mimes_include_office_common_types() {
@@ -2176,7 +2240,6 @@ async fn run_outbound_loop(
             control_metrics.clone(),
             adapter_contract.as_ref(),
             inbound.clone(),
-            slack.clone(),
             relay.clone(),
             dispatcher.clone(),
             identity_provision_cfg.clone(),
@@ -2382,7 +2445,6 @@ async fn handle_io_control_plane_message(
     control_metrics: Arc<IoControlPlaneMetrics>,
     adapter_contract: &dyn IoAdapterConfigContract,
     inbound: Arc<Mutex<InboundProcessor>>,
-    slack: Arc<SlackClients>,
     relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
     dispatcher: Arc<RouterDispatcher>,
     identity_provision_cfg: IdentityProvisionConfig,
@@ -2460,7 +2522,6 @@ async fn handle_io_control_plane_message(
                 control_metrics,
                 adapter_contract,
                 inbound,
-                slack,
                 relay,
                 dispatcher,
                 identity_provision_cfg,
@@ -2500,7 +2561,6 @@ async fn apply_io_config_set(
     control_metrics: Arc<IoControlPlaneMetrics>,
     adapter_contract: &dyn IoAdapterConfigContract,
     inbound: Arc<Mutex<InboundProcessor>>,
-    slack: Arc<SlackClients>,
     relay: Arc<Mutex<RelayBuffer<InMemoryRelayStore>>>,
     dispatcher: Arc<RouterDispatcher>,
     identity_provision_cfg: IdentityProvisionConfig,
@@ -2561,39 +2621,6 @@ async fn apply_io_config_set(
     if section_changed(previous_effective.as_ref(), &effective, &["runtime"]) {
         apply_restart_required.push("runtime.*".to_string());
     }
-
-    let app_and_bot = if slack_credentials_changed(previous_effective.as_ref(), &effective) {
-        match extract_runtime_slack_credentials(&effective) {
-            Ok(pair) => Some(pair),
-            Err(err) => {
-                let err_text = err.to_string();
-                log_config_set_invalid_runtime_credentials(
-                    node_name,
-                    payload.config_version,
-                    err_text.as_str(),
-                );
-                state.current_state = IoNodeLifecycleState::FailedConfig;
-                state.last_error = Some(IoControlPlaneErrorInfo {
-                    code: "invalid_config".to_string(),
-                    message: err_text.clone(),
-                });
-                control_metrics.record_config_set_error(
-                    state.current_state.as_str(),
-                    payload.config_version,
-                    "invalid_config",
-                );
-                let redacted = redact_state(&state, adapter_contract);
-                return build_io_config_set_error_payload(
-                    node_name,
-                    &redacted,
-                    "invalid_config",
-                    err_text,
-                );
-            }
-        }
-    } else {
-        None
-    };
 
     state.current_state = IoNodeLifecycleState::Configured;
     state.config_source = IoConfigSource::Dynamic;
@@ -2704,11 +2731,6 @@ async fn apply_io_config_set(
                 err_text,
             );
         }
-    }
-
-    if let Some((app_token, bot_token)) = app_and_bot {
-        slack.reload_credentials(app_token, bot_token).await;
-        apply_reinit.push("slack.credentials".to_string());
     }
 
     let binding = match extract_slack_binding_from_io_section(effective.get("io")) {
@@ -2863,96 +2885,6 @@ fn value_at_path<'a>(root: Option<&'a Value>, path: &[&str]) -> Option<&'a Value
         current = current.get(*segment)?;
     }
     Some(current)
-}
-
-fn slack_credentials_changed(
-    previous_effective: Option<&Value>,
-    current_effective: &Value,
-) -> bool {
-    let app_prev = extract_slack_credential_marker(previous_effective, true);
-    let app_curr = extract_slack_credential_marker(Some(current_effective), true);
-    let bot_prev = extract_slack_credential_marker(previous_effective, false);
-    let bot_curr = extract_slack_credential_marker(Some(current_effective), false);
-    app_prev != app_curr || bot_prev != bot_curr
-}
-
-fn extract_slack_credential_marker(effective_config: Option<&Value>, app: bool) -> Option<String> {
-    let slack = effective_config
-        .and_then(|cfg| cfg.get("slack"))
-        .and_then(Value::as_object)?;
-    let (inline_keys, ref_keys) = if app {
-        (
-            ["app_token", "slack_app_token"],
-            ["app_token_ref", "slack_app_token_ref"],
-        )
-    } else {
-        (
-            ["bot_token", "slack_bot_token"],
-            ["bot_token_ref", "slack_bot_token_ref"],
-        )
-    };
-    for key in inline_keys {
-        let Some(value) = slack.get(key).and_then(Value::as_str).map(str::trim) else {
-            continue;
-        };
-        if !value.is_empty() {
-            return Some(format!("inline:{value}"));
-        }
-    }
-    for key in ref_keys {
-        let Some(value) = slack.get(key).and_then(Value::as_str).map(str::trim) else {
-            continue;
-        };
-        if !value.is_empty() {
-            return Some(format!("ref:{value}"));
-        }
-    }
-    None
-}
-
-fn extract_runtime_slack_credentials(effective_config: &Value) -> Result<(String, String)> {
-    let slack = effective_config
-        .get("slack")
-        .ok_or_else(|| anyhow::anyhow!("missing config.slack object"))?;
-    let app_token = resolve_secret_from_config_value(
-        slack,
-        &["app_token", "slack_app_token"],
-        &["app_token_ref", "slack_app_token_ref"],
-    )
-    .ok_or_else(|| anyhow::anyhow!("missing usable Slack app credential in config.slack"))?;
-    let bot_token = resolve_secret_from_config_value(
-        slack,
-        &["bot_token", "slack_bot_token"],
-        &["bot_token_ref", "slack_bot_token_ref"],
-    )
-    .ok_or_else(|| anyhow::anyhow!("missing usable Slack bot credential in config.slack"))?;
-    Ok((app_token, bot_token))
-}
-
-fn resolve_secret_from_config_value(
-    root: &Value,
-    value_keys: &[&str],
-    ref_keys: &[&str],
-) -> Option<String> {
-    for key in value_keys {
-        let Some(value) = root.get(*key).and_then(Value::as_str).map(str::trim) else {
-            continue;
-        };
-        if !value.is_empty() {
-            return Some(value.to_string());
-        }
-    }
-    for key in ref_keys {
-        let Some(reference) = root.get(*key).and_then(Value::as_str).map(str::trim) else {
-            continue;
-        };
-        if let Some(var) = reference.strip_prefix("env:") {
-            if let Some(resolved) = env(var) {
-                return Some(resolved);
-            }
-        }
-    }
-    None
 }
 
 fn redact_state(
