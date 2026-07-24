@@ -43,3 +43,21 @@ Add a runtime destination gate that does not exist today; do NOT rely on the rou
 - Cross-tenant question: do WF and its candidate AI specialists share a VPN? If tenant==VPN and they are co-located, VPN membership gives essentially no restriction; if cross-tenant routing is intended, we need an explicit same-tenant/VPN check on the resolved target since neither the router authority gate nor publish validation constrains a user-typed target's tenant.
 - Note the naming/identity adjacency: authorize_system grants broad SYSTEM authority to role WF.orch.diag (system_policy.rs:134). Ensure no dynamic-target wf-generic instance is ever named into an authorized SY./WF.orch.diag role, or it would additionally gain protected-action authority.
 - Also note execSendMessage DEFAULTS msgType to 'system' (actions.go:116). A dynamic-target WF that leaves type unset and sets scope=global can emit system-kind+global frames that bypass VPN (mod.rs:5693) — decide whether to force meta.type='user' for the AI-host routing action.
+---
+
+## Decisión (user, 2026-07-24)
+
+**A (ahora, wf-generic runtime):** target dinámico + al resolver: re-validar IsValidL2Name, prohibir
+`SY.*`/`RT.*`, forzar `meta.type=user`, allowlist opcional por-definición (enumerabilidad).
+
+**B (FOLLOW-UP OBLIGATORIO — no olvidar — en el Rego de OPA system del router):**
+1. **Denegar `WF.*` → `SY.vault` (y SY.* system nodes)** — cierra el hueco pre-existente (hoy un WF,
+   estático o dinámico, puede targetear SY.vault; solo lo frena la autz del propio vault por src_ilk).
+   El user confirmó: va en el CER/Rego de OPA system.
+2. **Enforce same-tenant para sends del WF**: permitido si `dst.tenant == wf.tenant` **O** si
+   `wf.tenant == ROOT/DEFAULT SYSTEM TENANT` (excepción para WF de sistema — secundario). VPN ≠ tenant:
+   esto se enforcea por TENANT (identity), no por VPN co-membership.
+
+Ubicación de B: el gate OPA "user_allow" del router (la mitad no cableada de `final_allow` en
+system_policy.rs:18), keyed en src_l2_name autoritativo (=el WF) + dst resuelto + sus tenants.
+Análogo al fix del confused-deputy de io.cloud.
