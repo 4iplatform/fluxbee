@@ -1,6 +1,5 @@
 use anyhow::Result;
 use fluxbee_sdk::{managed_node_config_path, FLUXBEE_NODE_NAME_ENV};
-use io_common::io_control_plane_store::default_state_dir;
 use io_common::relay::RelayPolicy;
 use io_common::router_message::DEFAULT_TTL;
 use serde_json::Value;
@@ -40,11 +39,6 @@ impl Config {
                 env("CONFIG_DIR")
                     .or_else(|| json_get_string(spawn_doc, "node.config_dir"))
                     .unwrap_or_else(|| "/etc/fluxbee".to_string()),
-            ),
-            state_dir: PathBuf::from(
-                env("STATE_DIR")
-                    .or_else(|| json_get_string(spawn_doc, "node.state_dir"))
-                    .unwrap_or_else(|| default_state_dir().display().to_string()),
             ),
             spawn_config_path: spawn_cfg.path,
             identity_target: env("IO_API_IDENTITY_TARGET")
