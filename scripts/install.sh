@@ -245,7 +245,25 @@ cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
 echo "Building ai.generic runtime binary..."
 cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner
 echo "Building IO runtime binaries and motherbee singletons..."
-cargo build --release --manifest-path nodes/io/Cargo.toml -p io-api -p io-slack -p io-linkedhelper -p io-cloud -p io-blob
+# FIX-13: build exactly the nodes/io crates that packaging/base-nodes.json declares (the same single
+# source of truth build-deb.sh uses), so a node added to the manifest is built by BOTH the .deb path
+# and this source-install path — no drift. (Currently: io-api io-blob io-cloud io-linkedhelper io-slack.)
+IO_PKGS="$(python3 - "$ROOT_DIR/packaging/base-nodes.json" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+pkgs = sorted({e["crate"] for sec in ("singletons", "runtimes")
+               for e in m.get(sec, []) if e.get("workspace") == "nodes/io"})
+print(" ".join(pkgs))
+PY
+)"
+if [[ -z "${IO_PKGS// }" ]]; then
+  echo "ERROR: no nodes/io crates found in packaging/base-nodes.json" >&2
+  exit 1
+fi
+echo "  base-nodes.json nodes/io crates: $IO_PKGS"
+io_pkg_args=()
+for p in $IO_PKGS; do io_pkg_args+=(-p "$p"); done
+cargo build --release --manifest-path nodes/io/Cargo.toml "${io_pkg_args[@]}"
 
 go_required=0
 for go_dir in "go/sy-opa-rules" "go/sy-timer" "go/sy-wf-rules" "go/nodes/wf/wf-generic"; do
