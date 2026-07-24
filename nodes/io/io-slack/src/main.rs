@@ -1710,8 +1710,17 @@ async fn dispatch_inbound_outcome(sender: NodeSender, outcome: InboundOutcome, s
         InboundOutcome::SendNow(msg) => {
             let trace_id = msg.routing.trace_id.clone();
             let has_src_ilk = msg.meta.src_ilk.as_deref().is_some_and(|v| !v.is_empty());
+            // M1: Socket Mode mandates ACKing the Slack envelope within ~3s, so we ack BEFORE this
+            // handoff — Slack will not redeliver. NodeSender::send buffers through a transient router
+            // reconnect (no loss there), so the only way this errors is a terminal disconnect. That is
+            // a genuine, unrecoverable message LOSS, so log it at error with the trace_id (never
+            // silently): a durable inbound queue would be the design-level remedy if we need more.
             if let Err(e) = sender.send(msg).await {
-                tracing::warn!(error=?e, %trace_id, context = send_context, "failed to send to router");
+                tracing::error!(
+                    error=?e, %trace_id, context = send_context,
+                    "LOST inbound message: already ACKed to Slack (no redelivery) but router send \
+                     failed on a terminal disconnect"
+                );
             } else {
                 tracing::debug!(%trace_id, has_src_ilk, context = send_context, "sent to router");
             }
