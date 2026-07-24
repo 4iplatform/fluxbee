@@ -44,7 +44,7 @@ func TestRollbackWorkflowRestoresBackupAndPublishesPackage(t *testing.T) {
 	if currentMeta.Version != 1 {
 		t.Fatalf("unexpected current version %d", currentMeta.Version)
 	}
-	if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "1", "package.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "0.0.1", "package.json")); err != nil {
 		t.Fatalf("missing restored package: %v", err)
 	}
 }

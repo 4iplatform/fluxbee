@@ -79,7 +79,7 @@ func TestApplyWorkflowAndDeployAutoSpawnFirstDeploy(t *testing.T) {
 		if nodeName != "WF.invoice@motherbee" {
 			t.Fatalf("unexpected nodeName %q", nodeName)
 		}
-		if runtimeName != "wf.invoice" || version != "1" {
+		if runtimeName != "wf.invoice" || version != "0.0.1" {
 			t.Fatalf("unexpected runtime bind %q %q", runtimeName, version)
 		}
 		if config["sy_timer_l2_name"] != "SY.timer@motherbee" {
@@ -246,8 +246,8 @@ func TestApplyWorkflowAndDeployExistingNodeLeavesDeploymentDeferred(t *testing.T
 				"gc_interval_seconds": 900,
 				"_system": map[string]any{
 					"runtime":         "wf.invoice",
-					"runtime_version": "1",
-					"package_path":    "/var/lib/fluxbee/dist/runtimes/wf.invoice/1",
+					"runtime_version": "0.0.1",
+					"package_path":    "/var/lib/fluxbee/dist/runtimes/wf.invoice/0.0.1",
 				},
 			},
 		}, nil
@@ -306,13 +306,13 @@ func TestApplyWorkflowAndDeployExistingNodeLeavesDeploymentDeferred(t *testing.T
 	if gotBinding == nil {
 		t.Fatalf("expected runtime binding")
 	}
-	if gotBinding.Runtime != "wf.invoice" || gotBinding.RuntimeVersion != "1" {
+	if gotBinding.Runtime != "wf.invoice" || gotBinding.RuntimeVersion != "0.0.1" {
 		t.Fatalf("unexpected runtime binding %#v", gotBinding)
 	}
 	if gotBinding.RuntimeBase != workflowRuntimeBase {
 		t.Fatalf("unexpected runtime base %#v", gotBinding.RuntimeBase)
 	}
-	if gotBinding.RequestedRuntimeVersion != "1" || gotBinding.PackagePath == "" {
+	if gotBinding.RequestedRuntimeVersion != "0.0.1" || gotBinding.PackagePath == "" {
 		t.Fatalf("unexpected runtime binding details %#v", gotBinding)
 	}
 }
@@ -359,7 +359,7 @@ func TestApplyWorkflowAndDeployExistingNodeRestartFailureIsPartial(t *testing.T)
 			"config": map[string]any{
 				"_system": map[string]any{
 					"runtime":         "wf.invoice",
-					"runtime_version": "1",
+					"runtime_version": "0.0.1",
 				},
 			},
 		}, nil
@@ -466,7 +466,7 @@ func TestExistingNodeApplyBindsConcretePackagePath(t *testing.T) {
 	if gotBinding == nil {
 		t.Fatal("expected runtime binding to be set")
 	}
-	version := fmt.Sprintf("%d", result.Current.Version)
+	version := workflowRuntimeVersion(result.Current.Version)
 	expectedPath := filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", version)
 	if gotBinding.PackagePath != expectedPath {
 		t.Fatalf("package_path = %q, want %q", gotBinding.PackagePath, expectedPath)
@@ -514,7 +514,7 @@ func TestRestartFailedCurrentAndPackageStillPresent(t *testing.T) {
 	}
 
 	// Package must be published in dist — a subsequent rollout retry can use it.
-	version := fmt.Sprintf("%d", result.Current.Version)
+	version := workflowRuntimeVersion(result.Current.Version)
 	pkgPath := filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", version)
 	if _, err := os.Stat(filepath.Join(pkgPath, "flow", "definition.json")); err != nil {
 		t.Fatalf("dist package flow/definition.json missing after restart_failed: %v", err)

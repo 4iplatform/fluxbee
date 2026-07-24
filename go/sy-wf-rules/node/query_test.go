@@ -78,8 +78,8 @@ func TestGetWorkflowStatusReturnsNodeState(t *testing.T) {
 				"config": map[string]any{
 					"_system": map[string]any{
 						"runtime":         "wf.invoice",
-						"runtime_version": "1",
-						"package_path":    "/var/lib/fluxbee/dist/runtimes/wf.invoice/1",
+						"runtime_version": "0.0.1",
+						"package_path":    "/var/lib/fluxbee/dist/runtimes/wf.invoice/0.0.1",
 					},
 				},
 			}, nil
@@ -110,7 +110,7 @@ func TestGetWorkflowStatusReturnsNodeState(t *testing.T) {
 	if status.WFNode.ActiveInstances == nil || *status.WFNode.ActiveInstances != 12 {
 		t.Fatalf("unexpected active instances %#v", status.WFNode.ActiveInstances)
 	}
-	if !status.WFNode.Running || !status.WFNode.StatusReachable || status.WFNode.HealthState != "HEALTHY" || status.WFNode.RuntimeVersion != "1" {
+	if !status.WFNode.Running || !status.WFNode.StatusReachable || status.WFNode.HealthState != "HEALTHY" || status.WFNode.RuntimeVersion != "0.0.1" {
 		t.Fatalf("unexpected wf node snapshot %#v", status.WFNode)
 	}
 }
@@ -126,7 +126,7 @@ func TestGetWorkflowStatusTreatsInstanceQueryTimeoutAsNonFatal(t *testing.T) {
 				"status": "ok",
 				"config": map[string]any{
 					"_system": map[string]any{
-						"runtime_version": "1",
+						"runtime_version": "0.0.1",
 					},
 				},
 			}, nil
@@ -161,7 +161,7 @@ func TestGetWorkflowStatusTreatsNodeStatusTimeoutAsNonFatal(t *testing.T) {
 				"status": "ok",
 				"config": map[string]any{
 					"_system": map[string]any{
-						"runtime_version": "1",
+						"runtime_version": "0.0.1",
 					},
 				},
 			}, nil
@@ -193,7 +193,7 @@ func TestGetWorkflowStatusUsesNodeStatusForRunningEvenWhenInstanceQueryTimesOut(
 				"status": "ok",
 				"config": map[string]any{
 					"_system": map[string]any{
-						"runtime_version": "1",
+						"runtime_version": "0.0.1",
 					},
 				},
 			}, nil
@@ -260,7 +260,7 @@ func TestListWorkflowStatusesReturnsStructuredItems(t *testing.T) {
 				"status": "ok",
 				"config": map[string]any{
 					"_system": map[string]any{
-						"runtime_version": "1",
+						"runtime_version": "0.0.1",
 					},
 				},
 			}, nil
