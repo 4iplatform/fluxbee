@@ -9944,10 +9944,27 @@ fn run_blob_gc_housekeeping(
         name_max_chars: BLOB_NAME_MAX_CHARS,
         max_blob_bytes: None,
     })?;
+    // FIX-10: pin active blobs still referenced by io.blob's publication ledger so the mtime-based GC
+    // never reaps a source a live publication needs for verify/repair. The ledger lives outside
+    // blob_root; honor io.blob's IO_BLOB_LEDGER_PATH override, else derive the standard layout
+    // (<root>/state/io-blob/publications.json, sibling of <root>/blob). A missing/unreadable ledger
+    // yields an empty pin set (GC degrades to legacy behavior).
+    let ledger_path = std::env::var("IO_BLOB_LEDGER_PATH")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            blob.path
+                .parent()
+                .unwrap_or(&blob.path)
+                .join("state/io-blob/publications.json")
+        });
+    let pinned_blob_names = fluxbee_sdk::blob::published_blob_names(&ledger_path);
     let report = toolkit.run_gc(BlobGcOptions {
         staging_ttl_hours: blob.gc_staging_ttl_hours,
         active_retain_days: blob.gc_active_retain_days,
         apply: blob.gc_apply,
+        pinned_blob_names,
     })?;
 
     if report.staging.candidate_files > 0 || report.active.candidate_files > 0 {
