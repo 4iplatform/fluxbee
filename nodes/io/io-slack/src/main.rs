@@ -944,6 +944,38 @@ impl SlackClients {
             })
     }
 
+    /// Send a Slack Web API request with bounded 429 (rate-limit) retries honoring `Retry-After`
+    /// (M3). Slack returns HTTP 429 with a `Retry-After: <secs>` header when a method is
+    /// rate-limited; a bare `.json()` on that body fails, so every tier-limited Web API call goes
+    /// through here. `build` is re-invoked per attempt so the request (token + body) is rebuilt fresh.
+    async fn slack_send_with_retry<F>(&self, api: &str, build: F) -> Result<reqwest::Response>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        const MAX_RETRIES: u32 = 5;
+        let mut attempt: u32 = 0;
+        loop {
+            let response = build().send().await?;
+            if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Ok(response);
+            }
+            attempt += 1;
+            if attempt > MAX_RETRIES {
+                return Err(anyhow::anyhow!(
+                    "{api}: slack rate-limited (429) after {MAX_RETRIES} retries"
+                ));
+            }
+            let retry_after = parse_retry_after(response.headers());
+            tracing::warn!(
+                api = %api,
+                attempt,
+                retry_after_secs = retry_after.as_secs(),
+                "slack API rate-limited (429); backing off"
+            );
+            tokio::time::sleep(retry_after).await;
+        }
+    }
+
     async fn socket_mode_url(&self) -> Result<Url> {
         #[derive(Deserialize)]
         struct OpenResp {
@@ -954,10 +986,11 @@ impl SlackClients {
         let slack_app_token = self.slack_app_token().await?;
 
         let resp: OpenResp = self
-            .http
-            .post("https://slack.com/api/apps.connections.open")
-            .bearer_auth(slack_app_token)
-            .send()
+            .slack_send_with_retry("apps.connections.open", || {
+                self.http
+                    .post("https://slack.com/api/apps.connections.open")
+                    .bearer_auth(&slack_app_token)
+            })
             .await?
             .json()
             .await?;
@@ -1001,11 +1034,12 @@ impl SlackClients {
         let slack_bot_token = self.slack_bot_token().await?;
 
         let resp: PostResp = self
-            .http
-            .post("https://slack.com/api/chat.postMessage")
-            .bearer_auth(slack_bot_token)
-            .json(&body)
-            .send()
+            .slack_send_with_retry("chat.postMessage", || {
+                self.http
+                    .post("https://slack.com/api/chat.postMessage")
+                    .bearer_auth(&slack_bot_token)
+                    .json(&body)
+            })
             .await?
             .json()
             .await?;
@@ -1068,11 +1102,12 @@ impl SlackClients {
 
         let length = bytes.len().to_string();
         let get_resp: GetUploadUrlResp = self
-            .http
-            .post("https://slack.com/api/files.getUploadURLExternal")
-            .bearer_auth(&slack_bot_token)
-            .form(&[("filename", filename), ("length", length.as_str())])
-            .send()
+            .slack_send_with_retry("files.getUploadURLExternal", || {
+                self.http
+                    .post("https://slack.com/api/files.getUploadURLExternal")
+                    .bearer_auth(&slack_bot_token)
+                    .form(&[("filename", filename), ("length", length.as_str())])
+            })
             .await?
             .json()
             .await?;
@@ -1120,11 +1155,12 @@ impl SlackClients {
         }
 
         let complete_resp: CompleteUploadResp = self
-            .http
-            .post("https://slack.com/api/files.completeUploadExternal")
-            .bearer_auth(slack_bot_token)
-            .json(&complete_payload)
-            .send()
+            .slack_send_with_retry("files.completeUploadExternal", || {
+                self.http
+                    .post("https://slack.com/api/files.completeUploadExternal")
+                    .bearer_auth(&slack_bot_token)
+                    .json(&complete_payload)
+            })
             .await?
             .json()
             .await?;
@@ -1142,6 +1178,21 @@ impl SlackClients {
 
         Ok(())
     }
+}
+
+/// Parse a Slack `Retry-After` header (integer seconds) into a bounded backoff, clamped to
+/// [1s, 30s]. Used by [`SlackClients::slack_send_with_retry`] on HTTP 429; a missing/garbage
+/// header falls back to 1s.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
+    const DEFAULT: Duration = Duration::from_secs(1);
+    const MAX: Duration = Duration::from_secs(30);
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT)
+        .clamp(DEFAULT, MAX)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2001,9 +2052,10 @@ async fn collect_slack_blob_attachments(
 mod tests {
     use super::{
         build_system_reply, default_slack_allowed_mimes, extract_slack_tokens_from_vault_value,
-        extract_runtime_relay_config, slack_relay_policy_from_config, slack_vault_key, SlackClients,
-        SlackRelayConfig, SlackRuntimeState,
+        extract_runtime_relay_config, parse_retry_after, slack_relay_policy_from_config,
+        slack_vault_key, SlackClients, SlackRelayConfig, SlackRuntimeState,
     };
+    use std::time::Duration;
     use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing};
     use serde_json::json;
 
@@ -2038,6 +2090,25 @@ mod tests {
             extract_slack_tokens_from_vault_value(&json!({"app_token":"xapp-1","bot_token":"  "})),
             None
         );
+    }
+
+    #[test]
+    fn parse_retry_after_reads_header_and_clamps() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        // absent header -> 1s floor
+        assert_eq!(parse_retry_after(&HeaderMap::new()), Duration::from_secs(1));
+        // honored within range
+        let mut h = HeaderMap::new();
+        h.insert(RETRY_AFTER, HeaderValue::from_static("7"));
+        assert_eq!(parse_retry_after(&h), Duration::from_secs(7));
+        // clamped to 30s ceiling
+        let mut h = HeaderMap::new();
+        h.insert(RETRY_AFTER, HeaderValue::from_static("600"));
+        assert_eq!(parse_retry_after(&h), Duration::from_secs(30));
+        // garbage / HTTP-date form -> 1s floor (we only accept integer seconds)
+        let mut h = HeaderMap::new();
+        h.insert(RETRY_AFTER, HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"));
+        assert_eq!(parse_retry_after(&h), Duration::from_secs(1));
     }
 
     #[tokio::test]
@@ -2424,12 +2495,22 @@ async fn run_outbound_loop(
         .await
         {
             Ok(resolved) => {
-                if !resolved.text.trim().is_empty() {
-                    let blocks = msg.payload.get("blocks").cloned();
+                // M4: a Block Kit message legitimately carries its content in `blocks` with an empty
+                // top-level `text` (text is only the notification fallback). Post when EITHER is
+                // present, else a blocks-only reply was silently dropped into the "sin contenido"
+                // fallback below.
+                let blocks = msg.payload.get("blocks").cloned();
+                let has_text = !resolved.text.trim().is_empty();
+                let has_blocks = blocks
+                    .as_ref()
+                    .and_then(Value::as_array)
+                    .is_some_and(|arr| !arr.is_empty());
+                if has_text || has_blocks {
                     tracing::debug!(
                         slack_channel = binding.conversation_id,
                         slack_thread_ts = target.thread_ts.as_deref().unwrap_or(""),
                         text_len = resolved.text.len(),
+                        has_blocks,
                         text_preview = %truncate(&resolved.text, 120),
                         "sending slack message"
                     );
