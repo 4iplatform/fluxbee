@@ -190,6 +190,26 @@ fn config_version_from_root(root: &Value) -> u64 {
         .unwrap_or(1)
 }
 
+/// Top-level keys the ORCHESTRATOR injects into every managed node's `config.json` at spawn,
+/// independent of whether an operator has configured the node. `_system` is already removed by
+/// [`extract_effective_config`]; `tenant_id` is stamped by the orchestrator's spawn seed (see
+/// sy_orchestrator `assemble_spawn_config_map`). Their presence must NOT be read as "the operator
+/// supplied a config".
+const ORCHESTRATOR_RESERVED_KEYS: &[&str] = &["tenant_id"];
+
+/// Whether the effective config (already `_system`-stripped) carries any OPERATOR-supplied content,
+/// i.e. at least one key beyond the orchestrator's spawn boilerplate. A freshly-spawned but
+/// unconfigured node has `{tenant_id}` (or `{}`) here — that is Unconfigured, not a rejected config.
+fn effective_config_has_operator_content(effective: &Value) -> bool {
+    effective
+        .as_object()
+        .map(|obj| {
+            obj.keys()
+                .any(|key| !ORCHESTRATOR_RESERVED_KEYS.contains(&key.as_str()))
+        })
+        .unwrap_or(false)
+}
+
 /// Boot the control plane from the single source of truth (`config.json`). No separate dynamic-state
 /// file, so a stale one can never shadow a fresh `run_node`.
 pub fn bootstrap_managed_control_plane(
@@ -234,6 +254,23 @@ pub fn bootstrap_managed_control_plane_with_root(
             "invalid_config",
             format!("config is not an object: {}", path.display()),
         ));
+    }
+    // A node the orchestrator has spawned but the operator has NOT configured yet carries only spawn
+    // boilerplate here (`{tenant_id}` after `_system` is stripped). That is UNCONFIGURED — degraded,
+    // awaiting config — NOT a rejected config. Validating it would fail every contract's
+    // required_fields and wrongly report FAILED_CONFIG at first boot (family-wide: io.api, io.slack,
+    // ai.generic all have required_fields the empty seed can't satisfy). Reserve validate_and_
+    // materialize (→ FAILED_CONFIG) for a config that actually carries operator content, so
+    // FAILED_CONFIG keeps meaning "the operator supplied a config and it is invalid". config_version
+    // is preserved (as in the FAILED_CONFIG path) so CONFIG_SET staleness stays monotonic.
+    if !effective_config_has_operator_content(&effective) {
+        return Ok(ManagedControlPlaneState {
+            current_state: ManagedNodeLifecycleState::Unconfigured,
+            schema_version: 1,
+            config_version,
+            effective_config: None,
+            last_error: None,
+        });
     }
     match contract.validate_and_materialize(&effective) {
         Ok(materialized) => Ok(ManagedControlPlaneState {
@@ -488,6 +525,43 @@ mod tests {
         assert_eq!(st.config_version, 9); // identifies which version was rejected
         assert!(st.effective_config.is_none()); // never surface a rejected (maybe secret-bearing) config
         assert_eq!(managed_health_state(&st), "DEGRADED");
+    }
+
+    #[test]
+    fn boot_orchestrator_seed_only_is_unconfigured_not_failed() {
+        // The real firstboot shape: orchestrator wrote {tenant_id, _system} with NO operator config.
+        // Every contract has required_fields the empty seed can't meet, so validating it would wrongly
+        // report FAILED_CONFIG; it must be Unconfigured (degraded, awaiting config) instead.
+        let root = temp_root("seed-only");
+        write_config(
+            &root,
+            "AI.fake@motherbee",
+            &json!({"_system":{"config_version":3},"tenant_id":"tnt:00000000-0000-0000-0000-000000000001"}),
+        );
+        let st =
+            bootstrap_managed_control_plane_with_root("AI.fake@motherbee", &FakeContract, &root)
+                .expect("boot");
+        assert_eq!(st.current_state, ManagedNodeLifecycleState::Unconfigured);
+        assert!(st.effective_config.is_none());
+        assert!(st.last_error.is_none()); // no scary "missing behavior.model" for an unconfigured node
+        assert_eq!(st.config_version, 3); // preserved for CONFIG_SET staleness
+        assert_eq!(managed_health_state(&st), "DEGRADED");
+    }
+
+    #[test]
+    fn boot_only_system_block_is_unconfigured() {
+        // A config.json with ONLY the orchestrator _system block -> effective {} -> Unconfigured.
+        let root = temp_root("system-only");
+        write_config(
+            &root,
+            "AI.fake@motherbee",
+            &json!({"_system":{"config_version":1,"ilk_id":"ilk:x"}}),
+        );
+        let st =
+            bootstrap_managed_control_plane_with_root("AI.fake@motherbee", &FakeContract, &root)
+                .expect("boot");
+        assert_eq!(st.current_state, ManagedNodeLifecycleState::Unconfigured);
+        assert!(st.last_error.is_none());
     }
 
     #[test]
