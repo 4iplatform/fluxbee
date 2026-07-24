@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 use anyhow::Result;
-use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND};
+use fluxbee_sdk::protocol::{
+    Destination, Message as WireMessage, Meta, Routing, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
+};
 use fluxbee_sdk::{
     managed_node_config_path, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
     RouteMatch, RouteTarget, RouterDispatcher, VaultCallerOwned, VaultClient, VaultError,
@@ -50,7 +52,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use url::Url;
 
@@ -205,15 +207,22 @@ async fn main() -> Result<()> {
     ));
     let adapter_contract: Arc<dyn IoAdapterConfigContract> = Arc::new(IoSlackAdapterConfigContract);
 
+    // Woken by the SY.vault `VAULT_SECRET_CHANGED` broadcast (handled in run_outbound_loop) so a
+    // Cloud-side token update (put/rotate/delete) reloads credentials IMMEDIATELY instead of waiting
+    // for the next poll tick — this is the primary path now that Slack token rotation is disabled and
+    // tokens flow Fluxbee Cloud -> vault -> broadcast.
+    let vault_change_notify = Arc::new(Notify::new());
+
     // Vault refresh loop (family vault_ref pattern): re-reads slack.auth.key from the LIVE control
-    // plane each tick and hot-swaps credentials on first-appearance / rotation / CONFIG_SET — no
-    // restart. Owns vault_client_opt from here on.
+    // plane on each tick OR on a VAULT_SECRET_CHANGED wake, and hot-swaps credentials on
+    // first-appearance / rotation / CONFIG_SET — no restart. Owns vault_client_opt from here on.
     if let Some(vault_client) = vault_client_opt {
         tokio::spawn(run_slack_vault_refresh_loop(
             config.node_name.clone(),
             vault_client,
             slack.clone(),
             control_plane.clone(),
+            vault_change_notify.clone(),
         ));
     }
 
@@ -269,6 +278,7 @@ async fn main() -> Result<()> {
         ensured_bindings.clone(),
         blob_toolkit.clone(),
         blob_payload_cfg.clone(),
+        vault_change_notify.clone(),
     ));
 
     let inbound_task = tokio::spawn(run_inbound_socket_mode(
@@ -759,6 +769,16 @@ async fn resolve_slack_credentials_from_vault(
     }
 }
 
+/// True when a `VAULT_SECRET_CHANGED` broadcast payload concerns the slack resource — the fast-path
+/// signal to reload credentials (Fluxbee Cloud -> vault -> broadcast). Matched by `resource_type`
+/// because the vault key is opaque and may differ across hives (broadcast contract).
+fn vault_change_is_slack(payload: &Value) -> bool {
+    payload
+        .get("resource_type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|rt| rt.eq_ignore_ascii_case("slack"))
+}
+
 /// The vault key that holds this node's Slack credentials, read from `slack.auth.key` in the effective
 /// config (the family vault_ref pattern). `None` while unconfigured.
 fn slack_vault_key(effective: Option<&Value>) -> Option<String> {
@@ -792,19 +812,27 @@ fn extract_slack_tokens_from_vault_value(value: &Value) -> Option<(String, Strin
     Some((app_token, bot_token))
 }
 
-/// Polls vault for the slack resource every IO_SLACK_VAULT_REFRESH_INTERVAL_SECS
-/// so credentials picked up post-boot (vault_put after the node started)
-/// or rotated credentials flow into the runtime without restart.
+/// Reloads the slack credentials from vault whenever either (a) the poll interval elapses
+/// (IO_SLACK_VAULT_REFRESH_INTERVAL_SECS — the slow-path safety net) or (b) a `VAULT_SECRET_CHANGED`
+/// broadcast wakes `vault_change_notify` (the fast path: a Cloud-side put/rotate/delete flows in
+/// within a round-trip, no restart). Both cases run the same resolve+swap so post-boot vault_put and
+/// rotations converge regardless of which signal fires.
 async fn run_slack_vault_refresh_loop(
     node_name: String,
     vault: VaultClient,
     slack: Arc<SlackClients>,
     control_plane: Arc<RwLock<IoControlPlaneState>>,
+    vault_change_notify: Arc<Notify>,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_secs(IO_SLACK_VAULT_REFRESH_INTERVAL_SECS));
     ticker.tick().await; // skip first immediate tick
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = vault_change_notify.notified() => {
+                tracing::debug!(node_name = %node_name, "vault secret changed; refreshing slack credentials now");
+            }
+        }
         // Read the CURRENT vault key from the live control plane, so a CONFIG_SET that changes
         // slack.auth.key is honored without a restart, and post-boot vault_put / rotations flow in.
         let Some(key) = slack_vault_key(control_plane.read().await.effective_config.as_ref()) else {
@@ -2062,9 +2090,17 @@ mod tests {
     use super::{
         build_system_reply, default_slack_allowed_mimes, extract_slack_tokens_from_vault_value,
         extract_runtime_relay_config, parse_retry_after, slack_relay_policy_from_config,
-        slack_vault_key, SlackClients, SlackRelayConfig, SlackRuntimeState,
+        slack_vault_key, vault_change_is_slack, SlackClients, SlackRelayConfig, SlackRuntimeState,
     };
     use std::time::Duration;
+
+    #[test]
+    fn vault_change_is_slack_matches_only_the_slack_resource() {
+        assert!(vault_change_is_slack(&json!({"resource_type":"slack","op":"put"})));
+        assert!(vault_change_is_slack(&json!({"resource_type":"Slack"}))); // case-insensitive
+        assert!(!vault_change_is_slack(&json!({"resource_type":"openai"})));
+        assert!(!vault_change_is_slack(&json!({"op":"put"}))); // no resource_type
+    }
     use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing};
     use serde_json::json;
 
@@ -2384,6 +2420,7 @@ async fn run_outbound_loop(
     ensured_bindings: Arc<Mutex<HashSet<String>>>,
     blob_toolkit: Arc<fluxbee_sdk::blob::BlobToolkit>,
     blob_payload_cfg: IoTextBlobConfig,
+    vault_change_notify: Arc<Notify>,
 ) -> Result<()> {
     let mut incoming_rx = dispatcher
         .take_command_receiver(RPC_CH_INCOMING)
@@ -2448,6 +2485,34 @@ async fn run_outbound_loop(
                 trace_id = %msg.routing.trace_id,
                 "received CONFIG_CHANGED (informative); runtime apply remains CONFIG_SET-owned"
             );
+            continue;
+        }
+
+        // Fast path for the "tokens flow Fluxbee Cloud -> vault -> broadcast" model (Slack token
+        // rotation disabled): a VAULT_SECRET_CHANGED for the slack resource wakes the refresh loop to
+        // reload THIS node's slack.auth.key immediately, instead of waiting for the poll tick. Filter
+        // by resource_type (payload doc: match by resource_type, the key is opaque) so unrelated
+        // secret churn (openai, postgres, ...) never triggers a vault round-trip.
+        if is_control_plane_msg_type(&msg.meta.msg_type)
+            && msg
+                .meta
+                .msg
+                .as_deref()
+                .is_some_and(|m| m.eq_ignore_ascii_case(MSG_VAULT_SECRET_CHANGED))
+        {
+            if vault_change_is_slack(&msg.payload) {
+                let op = msg
+                    .payload
+                    .get("op")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                tracing::info!(
+                    trace_id = %msg.routing.trace_id,
+                    op = %op,
+                    "VAULT_SECRET_CHANGED (slack); waking credential refresh"
+                );
+                vault_change_notify.notify_one();
+            }
             continue;
         }
 
