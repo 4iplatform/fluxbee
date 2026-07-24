@@ -4,7 +4,7 @@ use anyhow::Result;
 use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::{
     managed_node_config_path, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
-    RouteMatch, RouteTarget, RouterDispatcher, VaultCallerOwned, VaultClient,
+    RouteMatch, RouteTarget, RouterDispatcher, VaultCallerOwned, VaultClient, VaultError,
     FLUXBEE_NODE_NAME_ENV,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -167,11 +167,11 @@ async fn main() -> Result<()> {
     if let Some(vault_client) = vault_client_opt.as_ref() {
         match slack_vault_key(boot_state.effective_config.as_ref()) {
             Some(key) => match resolve_slack_credentials_from_vault(vault_client, &key).await {
-                Some((app_token, bot_token)) => {
+                SlackVaultResolution::Found(app_token, bot_token) => {
                     slack.reload_credentials(app_token, bot_token).await;
                     tracing::info!(node_name = %config.node_name, vault_key = %key, "io-slack credentials loaded from vault");
                 }
-                None => tracing::warn!(node_name = %config.node_name, vault_key = %key, "io-slack vault credentials not ready; running degraded (refresh loop will retry)"),
+                SlackVaultResolution::Absent | SlackVaultResolution::Transient => tracing::warn!(node_name = %config.node_name, vault_key = %key, "io-slack vault credentials not ready; running degraded (refresh loop will retry)"),
             },
             None => tracing::warn!(node_name = %config.node_name, "no slack.auth.key in effective config; running degraded until configured"),
         }
@@ -689,17 +689,24 @@ const IO_SLACK_VAULT_REFRESH_INTERVAL_SECS: u64 = 60;
 /// pool → root tenant pool, i.e. `tnt:00000000-0000-0000-0000-000000000001`).
 /// The vault value is expected to be an object with both `app_token` and
 /// `bot_token` fields. Returns `Some((app_token, bot_token))` when both are
-/// present and non-empty, else `None` (degraded).
-///
-/// Vault site #7-of-9: now routed through the canonical `Arc<RouterDispatcher>`
-/// via `VaultClient` (no per-call ephemeral connection).
+/// Outcome of resolving Slack credentials from SY.vault. Distinguishes a DETERMINISTIC absence (key
+/// deleted, wrong resource_type, or malformed value) from a TRANSIENT failure (timeout / node error):
+/// the refresh loop clears the live credentials on `Absent` but keeps them on `Transient`, so a vault
+/// blip never knocks a healthy long-lived socket offline (M7).
+enum SlackVaultResolution {
+    Found(String, String),
+    Absent,
+    Transient,
+}
+
 /// Resolve `(app_token, bot_token)` from SY.vault by the explicit vault KEY declared in config
-/// (`slack.auth.key`). This is the family pattern (mirrors io.linkedhelper / ai.generic's vault_key),
-/// replacing the old resolve-by-resource_type. The secret's `metadata.resource_type` must be "slack".
+/// (`slack.auth.key`). Family pattern (mirrors io.linkedhelper / ai.generic's vault_key), routed
+/// through the canonical `Arc<RouterDispatcher>` via `VaultClient`. The secret's
+/// `metadata.resource_type` must be "slack" and its value an object `{app_token, bot_token}`.
 async fn resolve_slack_credentials_from_vault(
     vault: &VaultClient,
     key: &str,
-) -> Option<(String, String)> {
+) -> SlackVaultResolution {
     match vault.get(key, Duration::from_secs(5)).await {
         Ok(response) => {
             let resource_type = response
@@ -710,18 +717,44 @@ async fn resolve_slack_credentials_from_vault(
                 tracing::warn!(
                     vault_key = %key,
                     resource_type = ?resource_type,
-                    "vault key is not resource_type=slack; ignoring"
+                    "vault key is not resource_type=slack; treating as absent"
                 );
-                return None;
+                return SlackVaultResolution::Absent;
             }
-            response
+            match response
                 .value
                 .as_ref()
                 .and_then(extract_slack_tokens_from_vault_value)
+            {
+                Some((app_token, bot_token)) => {
+                    SlackVaultResolution::Found(app_token, bot_token)
+                }
+                None => {
+                    tracing::warn!(
+                        vault_key = %key,
+                        "vault slack secret has no usable {{app_token, bot_token}}; treating as absent"
+                    );
+                    SlackVaultResolution::Absent
+                }
+            }
         }
+        // A deleted / never-present key is DETERMINISTIC absence -> clear live creds.
+        Err(VaultError::Service { code, message }) if code == "KEY_NOT_FOUND" => {
+            tracing::info!(
+                vault_key = %key,
+                message = %message,
+                "vault slack secret not found (deleted); clearing credentials"
+            );
+            SlackVaultResolution::Absent
+        }
+        // Anything else (timeout, node error, other service code) is TRANSIENT -> keep current creds.
         Err(err) => {
-            tracing::warn!(vault_key = %key, error = %err, "io-slack vault get failed");
-            None
+            tracing::warn!(
+                vault_key = %key,
+                error = %err,
+                "io-slack vault get failed (transient); keeping current credentials"
+            );
+            SlackVaultResolution::Transient
         }
     }
 }
@@ -781,12 +814,20 @@ async fn run_slack_vault_refresh_loop(
             );
             continue;
         };
-        if let Some((app_token, bot_token)) =
-            resolve_slack_credentials_from_vault(&vault, &key).await
-        {
-            // Cheap + idempotent: overwrites the runtime tokens (a no-op if unchanged; a generation
-            // bump + WS reconnect if they changed).
-            slack.reload_credentials(app_token, bot_token).await;
+        match resolve_slack_credentials_from_vault(&vault, &key).await {
+            SlackVaultResolution::Found(app_token, bot_token) => {
+                // Idempotent: reload_credentials only bumps the generation (WS reconnect) when a
+                // token actually changed, so unchanged secrets never churn the socket.
+                slack.reload_credentials(app_token, bot_token).await;
+            }
+            SlackVaultResolution::Absent => {
+                // Deterministic delete / unusable secret: drop the stale token so it is never reused;
+                // the inbound socket then parks waiting for the secret to reappear (M7).
+                slack.clear_credentials().await;
+            }
+            SlackVaultResolution::Transient => {
+                // Vault blip: keep whatever credentials we already have and retry next tick.
+            }
         }
     }
 }
@@ -848,10 +889,30 @@ impl SlackClients {
         self.runtime.read().await.config_generation
     }
 
+    /// Install credentials resolved from SY.vault. Only bumps `config_generation` (which forces the
+    /// inbound WebSocket to reconnect) when a token actually CHANGED — so the periodic vault refresh
+    /// is a true no-op on unchanged secrets and never churns a healthy long-lived socket.
     async fn reload_credentials(&self, slack_app_token: String, slack_bot_token: String) {
         let mut guard = self.runtime.write().await;
+        let changed = guard.slack_app_token.as_deref() != Some(slack_app_token.as_str())
+            || guard.slack_bot_token.as_deref() != Some(slack_bot_token.as_str());
         guard.slack_app_token = Some(slack_app_token);
         guard.slack_bot_token = Some(slack_bot_token);
+        if changed {
+            guard.config_generation = guard.config_generation.wrapping_add(1);
+        }
+    }
+
+    /// Drop the live credentials (vault secret deleted / no longer resolvable). Bumps the generation
+    /// so the inbound socket reconnects and then parks in "waiting for valid slack credentials" until
+    /// the secret reappears — the stale token is never reused (M7).
+    async fn clear_credentials(&self) {
+        let mut guard = self.runtime.write().await;
+        if guard.slack_app_token.is_none() && guard.slack_bot_token.is_none() {
+            return; // already cleared; don't churn the generation
+        }
+        guard.slack_app_token = None;
+        guard.slack_bot_token = None;
         guard.config_generation = guard.config_generation.wrapping_add(1);
     }
 
@@ -863,7 +924,8 @@ impl SlackClients {
             .clone()
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "missing Slack app token (set via CONFIG_SET slack.app_token/slack.app_token_ref)"
+                    "missing Slack app token; expected an object {{app_token, bot_token}} at the \
+                     vault key named by slack.auth.key (resource_type=slack)"
                 )
             })
     }
@@ -876,7 +938,8 @@ impl SlackClients {
             .clone()
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "missing Slack bot token (set via CONFIG_SET slack.bot_token/slack.bot_token_ref)"
+                    "missing Slack bot token; expected an object {{app_token, bot_token}} at the \
+                     vault key named by slack.auth.key (resource_type=slack)"
                 )
             })
     }
@@ -1938,7 +2001,7 @@ async fn collect_slack_blob_attachments(
 mod tests {
     use super::{
         build_system_reply, default_slack_allowed_mimes, extract_slack_tokens_from_vault_value,
-        extract_runtime_relay_config, slack_relay_policy_from_config, slack_vault_key,
+        extract_runtime_relay_config, slack_relay_policy_from_config, slack_vault_key, SlackClients,
         SlackRelayConfig, SlackRuntimeState,
     };
     use fluxbee_sdk::protocol::{Destination, Message as WireMessage, Meta, Routing};
@@ -1975,6 +2038,41 @@ mod tests {
             extract_slack_tokens_from_vault_value(&json!({"app_token":"xapp-1","bot_token":"  "})),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn credential_generation_is_change_driven_and_delete_aware() {
+        let slack = SlackClients::new().expect("client");
+        assert_eq!(slack.config_generation().await, 0);
+
+        // First install bumps (0 -> 1).
+        slack
+            .reload_credentials("xapp-1".into(), "xoxb-1".into())
+            .await;
+        assert_eq!(slack.config_generation().await, 1);
+
+        // An identical reload (the periodic vault refresh on an UNCHANGED secret) must NOT churn the
+        // generation — otherwise the inbound WebSocket would needlessly reconnect every tick.
+        slack
+            .reload_credentials("xapp-1".into(), "xoxb-1".into())
+            .await;
+        assert_eq!(slack.config_generation().await, 1);
+
+        // A real rotation bumps (1 -> 2) so the socket reconnects with the new token.
+        slack
+            .reload_credentials("xapp-2".into(), "xoxb-1".into())
+            .await;
+        assert_eq!(slack.config_generation().await, 2);
+
+        // Vault delete: clear drops the live tokens and bumps so the socket stops using the stale one.
+        slack.clear_credentials().await;
+        assert_eq!(slack.config_generation().await, 3);
+        assert!(slack.slack_app_token().await.is_err());
+        assert!(slack.slack_bot_token().await.is_err());
+
+        // Clearing again is a no-op (already empty) — no generation churn.
+        slack.clear_credentials().await;
+        assert_eq!(slack.config_generation().await, 3);
     }
 
     #[test]
