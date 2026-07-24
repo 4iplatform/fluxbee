@@ -1,5 +1,6 @@
 pub mod blob;
 pub mod client_config;
+pub mod cloud;
 pub mod cognition;
 pub mod comm;
 pub mod identity;

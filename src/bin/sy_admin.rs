@@ -120,7 +120,10 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
 /// advertised" == "what is permitted"; they cannot drift). Tier-1 provisioning set
 /// (io-cloud-spec-v1 §3.2): create the tenant, store provider tokens in vault and spawn the IO node.
 /// A subset of ADMIN_EXECUTOR_PILOT_ACTIONS.
-const IO_CLOUD_EXPOSED_ACTIONS: &[&str] = &["create_tenant", "vault_put", "run_node"];
+// Single source of truth in fluxbee_sdk::cloud (shared with IO.cloud, which lives in a separate
+// cargo workspace); a test there pins it to the CLOUD_OP_ACTIONS map so the relay gate and Cloud's
+// op translation can never drift (FIX-12).
+use fluxbee_sdk::cloud::CLOUD_EXPOSED_ACTIONS as IO_CLOUD_EXPOSED_ACTIONS;
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -480,6 +483,11 @@ struct DebugNodeMessageRequest {
     priority: Option<String>,
     #[serde(default)]
     context: Option<serde_json::Value>,
+    // Optional thread correlation id. Without it a send_node_message can START a WF instance (no
+    // thread_id → new instance) but cannot DRIVE a thread-scoped node (e.g. an AI node round-trip),
+    // which keys replies by thread_id. (gap-6)
+    #[serde(default)]
+    thread_id: Option<String>,
     #[serde(default = "default_debug_payload")]
     payload: serde_json::Value,
     #[serde(default)]
@@ -12013,6 +12021,10 @@ async fn handle_send_node_message(
             action: req.meta_action,
             priority: req.priority,
             context: req.context,
+            thread_id: req.thread_id.and_then(|value| {
+                let trimmed = value.trim().to_string();
+                (!trimmed.is_empty()).then_some(trimmed)
+            }),
             ..Meta::default()
         },
         payload: req.payload,
