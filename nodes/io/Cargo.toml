@@ -8,6 +8,7 @@ members = [
   "io-linkedhelper",
   "io-sim",
   "io-slack",
+  "io-wapp",
 ]
 
 [workspace.package]
