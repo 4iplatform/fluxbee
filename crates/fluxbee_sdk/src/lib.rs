@@ -4,6 +4,7 @@ pub mod cognition;
 pub mod comm;
 pub mod identity;
 pub mod managed_node;
+pub mod managed_control_plane;
 pub mod nats;
 pub mod node_client;
 pub mod node_config;
