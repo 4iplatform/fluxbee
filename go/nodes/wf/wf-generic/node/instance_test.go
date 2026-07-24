@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -1155,4 +1156,53 @@ func workflowJSONWithTargetEntryInternalEvent() string {
     }
   ]
 }`
+}
+
+// A (dynamic target): execSendMessage resolves target_ref from state, sends to the resolved node, and
+// REFUSES a resolved SY.*/RT.* system node (VPN-bypass guard) or a non-string resolution.
+func TestExecSendMessageDynamicTargetAndSystemBlock(t *testing.T) {
+	disp := &mockDispatcher{l2name: "WF.router@motherbee", uuid: "wf-1"}
+	actx := makeActx(t, disp, &mockTimerSender{})
+	act := ActionDefinition{
+		Type:      "send_message",
+		TargetRef: "state.chosen_target",
+		Meta:      &ActionMeta{Type: "user", Msg: "AI_TICK"},
+		Payload:   map[string]any{"text": "hi"},
+	}
+	// (1) resolves to an app node -> sent.
+	inst := &WFInstance{InstanceID: "i1", Input: map[string]any{}, StateVars: map[string]any{"chosen_target": "AI.specialist@motherbee"}}
+	if err := execSendMessage(context.Background(), act, inst, msgWithName("KICK"), actx); err != nil {
+		t.Fatalf("dynamic send should succeed: %v", err)
+	}
+	if len(disp.sent) != 1 {
+		t.Fatalf("expected 1 sent message, got %d", len(disp.sent))
+	}
+	// (2) resolves to a system node -> blocked.
+	inst.StateVars["chosen_target"] = "SY.vault@motherbee"
+	if err := execSendMessage(context.Background(), act, inst, msgWithName("KICK"), actx); err == nil || !strings.Contains(err.Error(), "SY.") {
+		t.Fatalf("expected system-target block, got %v", err)
+	}
+	// (3) resolves to a non-string -> error.
+	inst.StateVars["chosen_target"] = 123
+	if err := execSendMessage(context.Background(), act, inst, msgWithName("KICK"), actx); err == nil || !strings.Contains(err.Error(), "non-string") {
+		t.Fatalf("expected non-string target error, got %v", err)
+	}
+	if len(disp.sent) != 1 {
+		t.Fatalf("blocked sends must not dispatch; got %d total", len(disp.sent))
+	}
+}
+
+// F1: runtime re-enforces meta.type=user for a dynamic target (defense-in-depth beyond publish).
+func TestExecSendMessageDynamicTargetRequiresUserTypeAtRuntime(t *testing.T) {
+	disp := &mockDispatcher{l2name: "WF.router@motherbee", uuid: "wf-1"}
+	actx := makeActx(t, disp, &mockTimerSender{})
+	act := ActionDefinition{Type: "send_message", TargetRef: "state.chosen_target",
+		Meta: &ActionMeta{Type: "system", Msg: "AI_TICK"}, Payload: map[string]any{}}
+	inst := &WFInstance{InstanceID: "i1", Input: map[string]any{}, StateVars: map[string]any{"chosen_target": "AI.x@motherbee"}}
+	if err := execSendMessage(context.Background(), act, inst, msgWithName("KICK"), actx); err == nil || !strings.Contains(err.Error(), "meta.type=user") {
+		t.Fatalf("expected runtime type=user enforcement, got %v", err)
+	}
+	if len(disp.sent) != 0 {
+		t.Fatalf("must not dispatch, got %d", len(disp.sent))
+	}
 }

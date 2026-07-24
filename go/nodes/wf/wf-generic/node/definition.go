@@ -45,3 +45,7 @@ func parseWorkflowDuration(value string) (time.Duration, error) {
 func isValidL2Name(value string) bool {
 	return wfcel.IsValidL2Name(value)
 }
+
+func isForbiddenSystemTarget(value string) bool {
+	return wfcel.IsForbiddenSystemTarget(value)
+}

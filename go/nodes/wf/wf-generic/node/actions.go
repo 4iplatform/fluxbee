@@ -132,12 +132,43 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 
 	src := actx.Dispatcher.NodeUUID()
 
+	// Resolve the destination. A dynamic target (target_ref) is a $ref dot-path over state/input/event
+	// — the "AI host routes to a computed specialist" case. The (resolved) name is re-validated,
+	// SY./RT.-blocked, AND required to be user-kind again here at send time — publish-time validation
+	// is not the only line of defense (a tampered/downgraded package could otherwise slip through).
+	target := action.Target
+	if targetRef := strings.TrimSpace(action.TargetRef); targetRef != "" {
+		// F1 defense-in-depth: a runtime-computed destination must never emit a system-kind frame
+		// (that path can bypass VPN isolation). Publish forces meta.type=user; re-enforce it here.
+		if msgType != "user" {
+			return fmt.Errorf("send_message: target_ref (dynamic target) requires meta.type=user, got %q", msgType)
+		}
+		resolved, err := lookupRef(targetRef, inst.Input, inst.StateVars, eventMap)
+		if err != nil {
+			return fmt.Errorf("send_message: resolve target_ref %q: %w", targetRef, err)
+		}
+		s, ok := resolved.(string)
+		if !ok {
+			return fmt.Errorf("send_message: target_ref %q resolved to non-string %T", targetRef, resolved)
+		}
+		target = s
+	}
+	// Runtime destination guard (esp. for a runtime-computed target): the resolved name MUST be a
+	// valid L2 name and MUST NOT be a SY.*/RT.* system node — those bypass VPN isolation in the router,
+	// so a computed target could otherwise reach a system node (e.g. SY.vault) cross-VPN.
+	if !isValidL2Name(target) {
+		return fmt.Errorf("send_message: resolved target %q is not a valid L2 name", target)
+	}
+	if isForbiddenSystemTarget(target) {
+		return fmt.Errorf("send_message: resolved target %q must not be a SY.*/RT.* system node", target)
+	}
+
 	msgNameCopy := msgName
 	threadIDCopy := threadID
 	msg := sdk.Message{
 		Routing: sdk.Routing{
 			Src:     src,
-			Dst:     sdk.UnicastDestination(action.Target),
+			Dst:     sdk.UnicastDestination(target),
 			TTL:     16,
 			TraceID: traceID,
 		},

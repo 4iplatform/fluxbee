@@ -201,3 +201,59 @@ func validWorkflowJSON() string {
   ]
 }`
 }
+
+// A (dynamic target): a WF send_message must never target a SY.*/RT.* system node (those bypass VPN
+// isolation in the router). Static targets are blocked at publish; dynamic ones are re-checked at send.
+func TestValidateDefinitionRejectsSystemNodeTarget(t *testing.T) {
+	data := strings.Replace(validWorkflowJSON(), `"target": "IO.quickbooks@motherbee"`, `"target": "SY.vault@motherbee"`, 1)
+	_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+	assertErrorContains(t, err, "SY.* / RT.*")
+}
+
+// A dynamic target (target_ref) demands meta.type="user" so a runtime-computed destination can't emit
+// a VPN-bypassing system frame.
+func TestValidateDefinitionRejectsDynamicTargetWithoutUserType(t *testing.T) {
+	data := strings.Replace(validWorkflowJSON(), `"target": "IO.quickbooks@motherbee",`, `"target_ref": "state.chosen_target",`, 1)
+	_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+	assertErrorContains(t, err, `must be "user" when target_ref`)
+}
+
+func TestValidateDefinitionRejectsBothTargetAndTargetRef(t *testing.T) {
+	data := strings.Replace(validWorkflowJSON(), `"target": "IO.quickbooks@motherbee",`, `"target": "IO.quickbooks@motherbee", "target_ref": "state.x",`, 1)
+	_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+	assertErrorContains(t, err, "exactly one of target or target_ref")
+}
+
+func TestValidateDefinitionAcceptsDynamicTargetWithUserType(t *testing.T) {
+	data := strings.Replace(validWorkflowJSON(),
+		`"target": "IO.quickbooks@motherbee",
+          "meta": { "msg": "INVOICE_CREATE_REQUEST" },`,
+		`"target_ref": "state.chosen_target",
+          "meta": { "msg": "INVOICE_CREATE_REQUEST", "type": "user" },`, 1)
+	if _, err := LoadDefinitionBytes([]byte(data), "", fixedClock); err != nil {
+		t.Fatalf("valid dynamic target_ref should load, got: %v", err)
+	}
+}
+
+func TestForbiddenSystemTargetAndRefPathHelpers(t *testing.T) {
+	for _, n := range []string{"SY.vault@motherbee", "SY.admin@motherbee", "RT.gateway@motherbee", "sy.vault@motherbee", "rt.gateway@motherbee", "  SY.vault@x"} {
+		if !IsForbiddenSystemTarget(n) {
+			t.Fatalf("%q should be forbidden", n)
+		}
+	}
+	for _, n := range []string{"AI.host@motherbee", "IO.api@motherbee", "WF.router@motherbee"} {
+		if IsForbiddenSystemTarget(n) {
+			t.Fatalf("%q should be allowed", n)
+		}
+	}
+	for _, p := range []string{"state.x", "input.a.b", "event.payload.node"} {
+		if !isValidRefPath(p) {
+			t.Fatalf("%q should be a valid ref path", p)
+		}
+	}
+	for _, p := range []string{"foo.bar", "state", "state.", ".x", ""} {
+		if isValidRefPath(p) {
+			t.Fatalf("%q should be an invalid ref path", p)
+		}
+	}
+}

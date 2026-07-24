@@ -53,8 +53,14 @@ type ActionMeta struct {
 }
 
 type ActionDefinition struct {
-	Type           string      `json:"type"`
+	Type string `json:"type"`
+	// Target is a STATIC destination L2 name (e.g. "AI.specialist@motherbee"). For a DYNAMIC target
+	// (routing to a node computed at runtime) set TargetRef instead — a $ref dot-path rooted at
+	// state/input/event whose resolved string value is the destination. Exactly one of Target /
+	// TargetRef must be set on a send_message action. Either way the (resolved) name is re-validated
+	// and SY.*/RT.* system nodes are refused at send time.
 	Target         string      `json:"target,omitempty"`
+	TargetRef      string      `json:"target_ref,omitempty"`
 	Meta           *ActionMeta `json:"meta,omitempty"`
 	Payload        any         `json:"payload,omitempty"`
 	TimerKey       string      `json:"timer_key,omitempty"`

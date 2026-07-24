@@ -169,6 +169,36 @@ func IsValidL2Name(value string) bool {
 	return l2NamePattern.MatchString(strings.TrimSpace(value))
 }
 
+// IsForbiddenSystemTarget reports whether an L2 name is a SY.* / RT.* system/router node — which a WF
+// send_message must never target (those names bypass VPN isolation at the router). Exported so the
+// runtime send path can re-block a dynamically-resolved target, not just publish-time validation.
+func IsForbiddenSystemTarget(name string) bool {
+	// Case-INSENSITIVE: block "sy.vault" / "rt.gateway" evasion attempts too. (Node-name casing is not
+	// a reliable isolation boundary, so do not let a lowercased system name slip through.)
+	n := strings.ToUpper(strings.TrimSpace(name))
+	return strings.HasPrefix(n, "SY.") || strings.HasPrefix(n, "RT.")
+}
+
+// isValidRefPath reports whether s is a well-formed $ref dot-path rooted at state/input/event with at
+// least one field (e.g. "state.chosen_target") — the form a dynamic target_ref is resolved against.
+func isValidRefPath(s string) bool {
+	parts := strings.Split(strings.TrimSpace(s), ".")
+	if len(parts) < 2 {
+		return false
+	}
+	switch parts[0] {
+	case "state", "input", "event":
+	default:
+		return false
+	}
+	for _, p := range parts {
+		if strings.TrimSpace(p) == "" {
+			return false
+		}
+	}
+	return true
+}
+
 func compileJSONSchema(schema map[string]any) (*jsonschema.Schema, error) {
 	data, err := json.Marshal(schema)
 	if err != nil {
@@ -197,8 +227,31 @@ func validateAction(path string, action ActionDefinition, clock ClockFunc) Valid
 	var errs ValidationErrors
 	switch action.Type {
 	case "send_message":
-		if !IsValidL2Name(action.Target) {
-			errs = append(errs, ValidationError{Path: path + ".target", Message: "must be a valid L2 name"})
+		// Exactly one of target (static literal) / target_ref (dynamic $ref dot-path). A WF may NOT
+		// message SY.*/RT.* system nodes via send_message (that path bypasses VPN isolation in the
+		// router; timers use schedule_timer, not send_message). For a dynamic target the meta.type
+		// must be "user" so a runtime-computed destination can never emit a VPN-bypassing system frame;
+		// the resolved value is re-validated + SY./RT.-blocked again at send time (execSendMessage).
+		hasTarget := strings.TrimSpace(action.Target) != ""
+		hasTargetRef := strings.TrimSpace(action.TargetRef) != ""
+		switch {
+		case hasTarget && hasTargetRef:
+			errs = append(errs, ValidationError{Path: path + ".target", Message: "set exactly one of target or target_ref, not both"})
+		case !hasTarget && !hasTargetRef:
+			errs = append(errs, ValidationError{Path: path + ".target", Message: "must set target (static) or target_ref (dynamic)"})
+		case hasTarget:
+			if !IsValidL2Name(action.Target) {
+				errs = append(errs, ValidationError{Path: path + ".target", Message: "must be a valid L2 name"})
+			} else if IsForbiddenSystemTarget(action.Target) {
+				errs = append(errs, ValidationError{Path: path + ".target", Message: "must not target a SY.* / RT.* system node"})
+			}
+		case hasTargetRef:
+			if !isValidRefPath(action.TargetRef) {
+				errs = append(errs, ValidationError{Path: path + ".target_ref", Message: `must be a $ref dot-path rooted at state/input/event (e.g. "state.chosen_target")`})
+			}
+			if action.Meta == nil || action.Meta.Type != "user" {
+				errs = append(errs, ValidationError{Path: path + ".meta.type", Message: `must be "user" when target_ref (dynamic target) is set`})
+			}
 		}
 		if action.Meta == nil || strings.TrimSpace(action.Meta.Msg) == "" {
 			errs = append(errs, ValidationError{Path: path + ".meta.msg", Message: "must not be empty"})
