@@ -103,7 +103,10 @@ func (a ActionDefinition) EffectiveOnError() string {
 		return a.OnError
 	}
 	switch a.Type {
-	case "send_message", "set_variable":
+	// State-driving actions default to fail-loud: a lost message, an unset variable, or a dropped
+	// internal event (which was meant to trigger the next transition) all leave the instance
+	// inconsistent — exactly what gap-2 eliminates. Timer ops stay best-effort by default.
+	case "send_message", "set_variable", "emit_internal_event":
 		return OnErrorFail
 	default:
 		return OnErrorContinue

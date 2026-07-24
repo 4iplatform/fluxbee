@@ -58,12 +58,12 @@ fn apply_error_reply_msg_suffix(meta: &mut Meta, payload: &Value) {
     if payload.get("type").and_then(Value::as_str) != Some("error") {
         return;
     }
-    match meta.msg.as_deref() {
-        Some(name) if !name.ends_with(AI_ERROR_MSG_SUFFIX) => {
+    // Only suffix a request that HAD a msg-name. A no-name request is already unroutable by msg-name,
+    // so fabricating a generic, collision-prone "error" marker is worse than leaving it None.
+    if let Some(name) = meta.msg.as_deref() {
+        if !name.ends_with(AI_ERROR_MSG_SUFFIX) {
             meta.msg = Some(format!("{name}{AI_ERROR_MSG_SUFFIX}"));
         }
-        None => meta.msg = Some(AI_ERROR_MSG_SUFFIX.trim_start_matches('.').to_string()),
-        _ => {}
     }
 }
 
