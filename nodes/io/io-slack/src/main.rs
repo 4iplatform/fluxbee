@@ -1080,6 +1080,13 @@ struct SocketEnvelope {
     payload: serde_json::Value,
 }
 
+/// Read-idle timeout for the Socket Mode WS. Slack pings the client ~every 30s and rotates the socket
+/// every ~30-60min; if no frame arrives within this window the socket is treated as dead and we
+/// reconnect (a bare `read.next().await` would otherwise wedge forever on a half-open TCP).
+const SOCKET_READ_IDLE: Duration = Duration::from_secs(90);
+/// Ceiling for the exponential reconnect backoff.
+const SOCKET_RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
 async fn run_inbound_socket_mode(
     config: Config,
     dispatcher: Arc<RouterDispatcher>,
@@ -1099,6 +1106,9 @@ async fn run_inbound_socket_mode(
     let sender = dispatcher.sender_snapshot();
     let mention_re = Regex::new(r"^<@[^>]+>\s*")?;
 
+    // Reconnect backoff (exponential, capped). Reset to the floor after a successful connect so a
+    // long-lived socket never inherits a stale large backoff.
+    let mut backoff = Duration::from_secs(1);
     loop {
         let socket_generation = slack.config_generation().await;
         let url = match slack.socket_mode_url().await {
@@ -1107,9 +1117,11 @@ async fn run_inbound_socket_mode(
                 tracing::warn!(
                     error = %err,
                     config_generation = socket_generation,
+                    backoff_secs = backoff.as_secs(),
                     "socket mode not ready; waiting for valid slack credentials"
                 );
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(SOCKET_RECONNECT_MAX_BACKOFF);
                 continue;
             }
         };
@@ -1120,10 +1132,41 @@ async fn run_inbound_socket_mode(
             "socket mode connected"
         );
 
-        let (ws, _) = tokio_tungstenite::connect_async(url).await?;
+        // C1: a bare `?` here killed the whole (spawned) inbound task on ANY transient dial failure —
+        // the process stayed alive and "healthy" while inbound was silently dead forever, and Slack
+        // rotates the socket every ~30-60min so it was effectively inevitable. Retry with backoff so
+        // the reconnect loop is actually resilient.
+        let (ws, _) = match tokio_tungstenite::connect_async(url).await {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    backoff_secs = backoff.as_secs(),
+                    "socket mode dial failed; retrying (inbound stays alive)"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(SOCKET_RECONNECT_MAX_BACKOFF);
+                continue;
+            }
+        };
+        // Connected: reset the reconnect backoff.
+        backoff = Duration::from_secs(1);
         let (mut write, mut read) = ws.split();
 
-        while let Some(item) = read.next().await {
+        loop {
+            // H2: a bare read.next() wedges forever on a half-open TCP; a read-idle timeout turns a
+            // dead socket into a reconnect and re-checks the config generation on idle too.
+            let item = match tokio::time::timeout(SOCKET_READ_IDLE, read.next()).await {
+                Ok(Some(item)) => item,
+                Ok(None) => {
+                    tracing::warn!("socket mode stream ended; reconnecting");
+                    break;
+                }
+                Err(_) => {
+                    tracing::warn!("socket mode read idle timeout; reconnecting");
+                    break;
+                }
+            };
             let current_generation = slack.config_generation().await;
             if current_generation != socket_generation {
                 tracing::info!(
