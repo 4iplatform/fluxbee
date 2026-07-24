@@ -2100,14 +2100,27 @@ impl GenericAiNode {
     }
 
     async fn build_node_status_get_response(&self) -> Value {
-        let health_state = std::env::var(NODE_STATUS_DEFAULT_HEALTH_STATE)
-            .ok()
-            .as_deref()
-            .map(normalize_health_state)
-            .unwrap_or("HEALTHY");
+        let lifecycle = self.control_plane.read().await.current_state;
+        // A node that failed to load its config (FAILED_CONFIG) or was never configured refuses every
+        // completion — it is NOT healthy. Previously health_state was hardcoded to "HEALTHY", so a
+        // broken node reported healthy to the orchestrator while silently rejecting all work, which
+        // hid the real failure. Derive health from the lifecycle and surface lifecycle_state so the
+        // operator sees WHY. DEGRADED is a soft signal (does not trigger an orchestrator restart loop,
+        // which would not fix a bad config anyway). The env override only applies to a Configured node
+        // so it can never force a broken node back to HEALTHY.
+        let health_state = if lifecycle == NodeLifecycleState::Configured {
+            std::env::var(NODE_STATUS_DEFAULT_HEALTH_STATE)
+                .ok()
+                .as_deref()
+                .map(normalize_health_state)
+                .unwrap_or("HEALTHY")
+        } else {
+            "DEGRADED"
+        };
         json!({
             "status": "ok",
-            "health_state": health_state
+            "health_state": health_state,
+            "lifecycle_state": lifecycle.as_str(),
         })
     }
 }
@@ -4352,8 +4365,15 @@ impl NodeBehavior {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Managed runtime nodes are launched by the orchestrator via transient systemd units that do
+    // NOT set RUST_LOG, and EnvFilter::from_default_env() with an unset RUST_LOG emits NOTHING — so
+    // ai.generic was silent in journald (no config-rejection reason, no completions, no errors),
+    // which turned every misconfiguration into a blind debug. Default to INFO like the sibling nodes
+    // (io-api / sy-admin / sy-orchestrator); RUST_LOG still overrides when set.
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let args = parse_runner_args()?;
@@ -4556,6 +4576,22 @@ fn vault_client_for(
     ))
 }
 
+/// Resolve the effective `runtime.cognitive_definition` section for the managed bootstrap path from
+/// the config source that will actually provide the behavior: the persisted dynamic config (latest
+/// applied CONFIG_SET) if present, else the spawn config. Absent -> Default (enabled=true), so a node
+/// that never sets the field keeps the historical default. Extracted as a pure fn so the
+/// config-honoring contract (BUG-3) is unit-testable without a live filesystem/dispatcher.
+fn effective_cognitive_section(
+    persisted: Option<&EffectiveConfigDocument>,
+    spawn: Option<&EffectiveConfigDocument>,
+) -> CognitiveDefinitionSection {
+    persisted
+        .or(spawn)
+        .and_then(|cfg| cfg.runtime.as_ref())
+        .and_then(|runtime| runtime.cognitive_definition.clone())
+        .unwrap_or_default()
+}
+
 async fn run_unconfigured_bootstrap(
     node: NodeSection,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -4563,11 +4599,6 @@ async fn run_unconfigured_bootstrap(
     let dynamic_dir = PathBuf::from(node.dynamic_config_dir.clone());
     let thread_state_store = init_thread_state_store(&node_name, &dynamic_dir).await;
     let immediate_memory_store = init_immediate_memory_store(&node_name, &dynamic_dir).await;
-    let cognitive_definition_config =
-        CognitiveDefinitionRuntimeConfig::from(CognitiveDefinitionSection::default());
-    let cognitive_definition = Arc::new(RwLock::new(CognitiveDefinitionRuntimeState::unresolved(
-        cognitive_definition_config.enabled,
-    )));
     let persisted_dynamic = load_persisted_dynamic_config(&dynamic_dir, &node_name);
     // Audit M2 (+ single-read to avoid a boot-time TOCTOU panic): resolve the "persisted config
     // exists but the strict contract rejects it" case ONCE. That case goes FAILED_CONFIG; a
@@ -4582,6 +4613,21 @@ async fn run_unconfigured_bootstrap(
     } else {
         None
     };
+    // BUG-3: honor runtime.cognitive_definition from the effective config instead of hardcoding
+    // CognitiveDefinitionSection::default() (enabled=true). The field existed in the config schema but
+    // was silently ignored, so a node could never disable the cognitive layer — and with no ilk
+    // definition assigned, its DEFAULT_UNCONFIGURED prompt always overrode behavior.instructions,
+    // making behavior.instructions dead config. Derived from the same source that provides the behavior
+    // (persisted dynamic config first, else the spawn config); the static path run_one_config already
+    // reads cfg.runtime.cognitive_definition — this aligns the managed path with it.
+    let cognitive_section = effective_cognitive_section(
+        persisted_dynamic.as_ref().map(|s| &s.config),
+        spawn_effective.as_ref().map(|s| &s.config),
+    );
+    let cognitive_definition_config = CognitiveDefinitionRuntimeConfig::from(cognitive_section);
+    let cognitive_definition = Arc::new(RwLock::new(CognitiveDefinitionRuntimeState::unresolved(
+        cognitive_definition_config.enabled,
+    )));
     let (behavior, state) = match persisted_dynamic.as_ref() {
         Some(stored) => {
             let materialized = materialize_effective_defaults(&node_name, stored.config.clone());
@@ -6361,6 +6407,32 @@ mod tests {
             handbook_hashes: Vec::new(),
             personality_hash: None,
         }
+    }
+
+    #[test]
+    fn effective_cognitive_section_honors_config_and_defaults() {
+        // BUG-3: the managed bootstrap must honor runtime.cognitive_definition (previously ignored).
+        let disabled = EffectiveConfigDocument {
+            runtime: Some(EffectiveRuntimeSection {
+                cognitive_definition: Some(CognitiveDefinitionSection {
+                    enabled: false,
+                    poll_interval_secs: 10,
+                    blob_root: None,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Explicit enabled=false is honored, from the persisted source...
+        assert!(!effective_cognitive_section(Some(&disabled), None).enabled);
+        // ...and from the spawn source when there is no persisted config.
+        assert!(!effective_cognitive_section(None, Some(&disabled)).enabled);
+        // Persisted wins over spawn.
+        let enabled = EffectiveConfigDocument::default();
+        assert!(!effective_cognitive_section(Some(&disabled), Some(&enabled)).enabled);
+        // Absent field -> Default (enabled=true), so unset config keeps the historical default.
+        assert!(effective_cognitive_section(None, None).enabled);
+        assert!(effective_cognitive_section(Some(&EffectiveConfigDocument::default()), None).enabled);
     }
 
     #[test]
