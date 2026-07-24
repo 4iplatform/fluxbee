@@ -31,7 +31,7 @@ use io_common::io_control_plane_logging::{
     log_control_plane_request_rejected,
 };
 use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
-use io_common::io_control_plane_store::{default_state_dir, persist_io_control_plane_state};
+use io_common::io_control_plane_store::persist_io_control_plane_state;
 use io_common::io_slack_adapter_config::IoSlackAdapterConfigContract;
 use io_common::provision::{
     ensure_own_ich, FluxbeeIdentityProvisioner, IdentityProvisionConfig,
@@ -48,7 +48,6 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,7 +78,6 @@ async fn main() -> Result<()> {
     tracing::info!(
         node_name = %config.node_name,
         router_socket = %config.router_socket.display(),
-        state_dir = %config.state_dir.display(),
         dst_node = %config.dst_node.clone().unwrap_or_else(|| "resolve".to_string()),
         dev_mode = %config.dev_mode,
         workspace_id = ?config.workspace_id,
@@ -140,7 +138,6 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|err| {
             tracing::warn!(
                 error = %err,
-                state_dir = %config.state_dir.display(),
                 node_name = %config.node_name,
                 "failed to bootstrap IO control-plane state; using UNCONFIGURED"
             );
@@ -289,7 +286,6 @@ async fn main() -> Result<()> {
         dispatcher.clone(),
         config.clone(),
         config.node_name.clone(),
-        config.state_dir.clone(),
         control_plane.clone(),
         control_metrics.clone(),
         adapter_contract.clone(),
@@ -364,7 +360,6 @@ struct Config {
     router_socket: PathBuf,
     uuid_persistence_dir: PathBuf,
     config_dir: PathBuf,
-    state_dir: PathBuf,
     dev_mode: bool,
     ttl: u32,
     dedup_ttl_ms: u64,
@@ -599,10 +594,6 @@ impl Config {
                     .or_else(|| json_get_string_opt(spawn_doc, &["node.config_dir", "config_dir"]))
                     .unwrap_or_else(|| env_config_dir.display().to_string()),
             ),
-            state_dir: env("STATE_DIR")
-                .or_else(|| json_get_string_opt(spawn_doc, &["node.state_dir", "state_dir"]))
-                .map(PathBuf::from)
-                .unwrap_or_else(default_state_dir),
             dev_mode: env_bool("DEV_MODE").unwrap_or(false),
             ttl: env("TTL")
                 .and_then(|v| v.parse().ok())
@@ -2096,7 +2087,6 @@ async fn run_outbound_loop(
     dispatcher: Arc<RouterDispatcher>,
     config: Config,
     node_name: String,
-    state_dir: PathBuf,
     control_plane: Arc<RwLock<IoControlPlaneState>>,
     control_metrics: Arc<IoControlPlaneMetrics>,
     adapter_contract: Arc<dyn IoAdapterConfigContract>,
@@ -2139,7 +2129,6 @@ async fn run_outbound_loop(
             &msg,
             &node_name,
             sender.uuid(),
-            &state_dir,
             control_plane.clone(),
             control_metrics.clone(),
             adapter_contract.as_ref(),
@@ -2346,7 +2335,6 @@ async fn handle_io_control_plane_message(
     msg: &WireMessage,
     node_name: &str,
     control_src: &str,
-    state_dir: &Path,
     control_plane: Arc<RwLock<IoControlPlaneState>>,
     control_metrics: Arc<IoControlPlaneMetrics>,
     adapter_contract: &dyn IoAdapterConfigContract,
@@ -2425,7 +2413,6 @@ async fn handle_io_control_plane_message(
             apply_io_config_set(
                 &set_payload,
                 node_name,
-                state_dir,
                 control_plane.clone(),
                 control_metrics,
                 adapter_contract,
@@ -2466,8 +2453,6 @@ fn is_control_plane_msg_type(msg_type: &str) -> bool {
 async fn apply_io_config_set(
     payload: &fluxbee_sdk::node_config::NodeConfigSetPayload,
     node_name: &str,
-    // Vestigial: single-config persist no longer needs a state dir. Remove with the state_dir field.
-    _state_dir: &Path,
     control_plane: Arc<RwLock<IoControlPlaneState>>,
     control_metrics: Arc<IoControlPlaneMetrics>,
     adapter_contract: &dyn IoAdapterConfigContract,

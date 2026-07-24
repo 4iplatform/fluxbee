@@ -7,12 +7,6 @@ use crate::io_control_plane::IoControlPlaneState;
 use fluxbee_sdk::managed_control_plane::{persist_effective_config_with_root, DEFAULT_MANAGED_NODES_ROOT};
 use std::path::Path;
 
-/// DEPRECATED vestigial helper: returns the legacy `/var/lib/fluxbee/state` base. Nothing is stored
-/// there anymore (single-config model persists to the node-dir config.json). Kept only so adapters
-/// that still carry a now-unused `state_dir` field compile; remove with that field.
-pub fn default_state_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from("/var/lib/fluxbee/state")
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum IoControlPlaneStoreError {
