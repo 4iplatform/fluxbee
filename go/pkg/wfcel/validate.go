@@ -112,13 +112,24 @@ func ValidateDefinition(def *WorkflowDefinition, clock ClockFunc) ValidationErro
 	if _, ok := stateIndex[def.InitialState]; !ok {
 		errs = append(errs, ValidationError{Path: "initial_state", Message: "must reference an existing state"})
 	}
+	terminalSet := make(map[string]bool, len(def.TerminalStates))
 	for i, name := range def.TerminalStates {
+		terminalSet[name] = true
 		if _, ok := stateIndex[name]; !ok {
 			errs = append(errs, ValidationError{
 				Path:    fmt.Sprintf("terminal_states[%d]", i),
 				Message: "must reference an existing state",
 			})
 		}
+	}
+	// gap-2: "failed" is the reserved error-sink state name routeToFailed drives an instance into on a
+	// fatal action failure (terminating it). If a definition declares a state named "failed" it MUST be
+	// terminal, so the reservation can never silently hijack an author's non-terminal "failed" state.
+	if _, ok := stateIndex["failed"]; ok && !terminalSet["failed"] {
+		errs = append(errs, ValidationError{
+			Path:    "states",
+			Message: `a state named "failed" is reserved as the fatal-error sink and must be listed in terminal_states`,
+		})
 	}
 	for i, state := range def.States {
 		for j, transition := range state.Transitions {

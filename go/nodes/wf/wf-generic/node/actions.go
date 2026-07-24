@@ -215,8 +215,31 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 		Payload: raw,
 	}
 
-	return actx.Dispatcher.SendMsg(msg)
+	// A transient backpressure/reconnect makes NodeSender.Send return "sender queue full" (a
+	// non-blocking channel send). With send_message defaulting to on_error=fail (gap-2), a single such
+	// blip would needlessly route a healthy instance to terminal failure. Retry a few times with a
+	// short, ctx-aware backoff so a momentarily full queue drains before the error is treated as fatal;
+	// a permanent condition (dead connection) still fails after the attempts.
+	var sendErr error
+	for attempt := 0; attempt < sendMaxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("send_message: cancelled during send retry: %w", ctx.Err())
+			case <-time.After(sendRetryBackoff):
+			}
+		}
+		if sendErr = actx.Dispatcher.SendMsg(msg); sendErr == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("send_message: dispatch failed after %d attempts: %w", sendMaxAttempts, sendErr)
 }
+
+const (
+	sendMaxAttempts  = 4
+	sendRetryBackoff = 50 * time.Millisecond
+)
 
 func execScheduleTimer(ctx context.Context, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) error {
 	if actx.Timer == nil {

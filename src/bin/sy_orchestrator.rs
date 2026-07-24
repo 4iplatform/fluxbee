@@ -9945,20 +9945,24 @@ fn run_blob_gc_housekeeping(
         max_blob_bytes: None,
     })?;
     // FIX-10: pin active blobs still referenced by io.blob's publication ledger so the mtime-based GC
-    // never reaps a source a live publication needs for verify/repair. The ledger lives outside
-    // blob_root; honor io.blob's IO_BLOB_LEDGER_PATH override, else derive the standard layout
-    // (<root>/state/io-blob/publications.json, sibling of <root>/blob). A missing/unreadable ledger
-    // yields an empty pin set (GC degrades to legacy behavior).
+    // never reaps a source a live publication needs for verify/repair. The ledger lives OUTSIDE
+    // blob_root, so resolve it EXACTLY as io.blob does (IO_BLOB_LEDGER_PATH env, else the absolute
+    // DEFAULT_IO_BLOB_LEDGER_PATH) rather than deriving from blob.path — a custom blob_root must not
+    // silently point the pin lookup at a nonexistent ledger and let the GC reap live sources. A
+    // missing ledger still degrades to legacy mtime-only GC, but is now logged so it is observable.
+    const DEFAULT_IO_BLOB_LEDGER_PATH: &str = "/var/lib/fluxbee/state/io-blob/publications.json";
     let ledger_path = std::env::var("IO_BLOB_LEDGER_PATH")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            blob.path
-                .parent()
-                .unwrap_or(&blob.path)
-                .join("state/io-blob/publications.json")
-        });
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_IO_BLOB_LEDGER_PATH));
+    if !ledger_path.exists() {
+        tracing::warn!(
+            ledger_path = %ledger_path.display(),
+            "io.blob publication ledger not found; blob GC runs without publication pins (set \
+             IO_BLOB_LEDGER_PATH on sy-orchestrator to match io.blob if it is relocated)"
+        );
+    }
     let pinned_blob_names = fluxbee_sdk::blob::published_blob_names(&ledger_path);
     let report = toolkit.run_gc(BlobGcOptions {
         staging_ttl_hours: blob.gc_staging_ttl_hours,

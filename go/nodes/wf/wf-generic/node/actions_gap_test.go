@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"testing"
+
+	sdk "github.com/4iplatform/json-router/fluxbee-go-sdk"
 )
 
 // gap-2: a failing send_message (default on_error=fail) is fatal — executeActions returns the error
@@ -27,6 +29,42 @@ func TestExecuteActionsFailFastPolicy(t *testing.T) {
 	}
 	actions[0].OnError = "" // back to default fail
 	inst.executeActionsBestEffort(context.Background(), actions, msgWithName("GO"), actx, &emitted) // must not be fatal
+}
+
+// flakyDispatcher fails its first failFirst SendMsg calls (transient backpressure) then succeeds.
+type flakyDispatcher struct {
+	failFirst int
+	calls     int
+	sent      []sdk.Message
+}
+
+func (m *flakyDispatcher) SendMsg(msg sdk.Message) error {
+	m.calls++
+	if m.calls <= m.failFirst {
+		return fmt.Errorf("sender queue full")
+	}
+	m.sent = append(m.sent, msg)
+	return nil
+}
+func (m *flakyDispatcher) NodeL2Name() string { return "WF.invoice@motherbee" }
+func (m *flakyDispatcher) NodeUUID() string   { return "u" }
+
+// FIX-R2: a transient "sender queue full" is retried, so a momentary blip does NOT fail the instance.
+func TestSendMessageRetriesTransientQueueFull(t *testing.T) {
+	disp := &flakyDispatcher{failFirst: sendMaxAttempts - 1} // fail all but the last attempt
+	s := openTestStore(t)
+	actx := ActionContext{Store: s, Dispatcher: disp, Timer: &mockTimerSender{}, Clock: fixedClock}
+	inst := &WFInstance{InstanceID: "wfi:r2", Input: map[string]any{}, StateVars: map[string]any{}}
+	action := ActionDefinition{Type: "send_message", Target: "AI.host@motherbee", Meta: &ActionMeta{Msg: "ask", Type: "system"}, Payload: map[string]any{}}
+	if err := execSendMessage(context.Background(), action, inst, msgWithName("GO"), actx); err != nil {
+		t.Fatalf("transient queue-full should be retried, not fatal: %v", err)
+	}
+	if len(disp.sent) != 1 {
+		t.Fatalf("expected the message to eventually send, got %d", len(disp.sent))
+	}
+	if disp.calls != sendMaxAttempts {
+		t.Fatalf("expected %d attempts, got %d", sendMaxAttempts, disp.calls)
+	}
 }
 
 // gap-2: routeToFailed terminates the instance loudly in the failed status.

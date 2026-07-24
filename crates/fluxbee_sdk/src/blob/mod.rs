@@ -1349,10 +1349,11 @@ fn mime_is_active(mime: &str) -> bool {
 
 /// Sniff the leading bytes for browser-ACTIVE content (HTML / SVG) regardless of the producer's
 /// declared type. Returns the canonical active MIME to force, or `None` when the bytes do not look
-/// like active markup. Deliberately conservative-broad on the HTML side (browsers sniff aggressively):
-/// over-labeling an inert `.txt` that literally begins with `<html>` as `text/html` only causes it to
-/// be served sandboxed, which is safe. Non-markup binaries (png, pdf, docx=zip, ...) return `None` and
-/// keep their declared type.
+/// like active markup. Matching is START-ANCHORED (after a BOM + leading whitespace): a real HTML/SVG
+/// document served as an inert type opens with its tag and is caught, but a legitimate JSON / RSS /
+/// CSV / log that merely CONTAINS a `<script>`/`<html>` substring mid-content is NOT reclassified —
+/// only truly document-shaped active content is over-sandboxed (which is safe). Non-markup binaries
+/// (png, pdf, docx=zip, ...) return `None` and keep their declared type.
 fn sniff_active_content(data: &[u8]) -> Option<&'static str> {
     // Skip a leading UTF-8 BOM and ASCII whitespace, then look only at a bounded window.
     let start = if data.starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
@@ -1374,7 +1375,9 @@ fn sniff_active_content(data: &[u8]) -> Option<&'static str> {
         "<script",
         "<iframe",
     ];
-    if HTML_MARKERS.iter().any(|marker| head.contains(marker)) {
+    // Start-anchored: only content whose first non-whitespace bytes ARE an active-markup tag is
+    // reclassified, so incidental HTML fragments inside legitimate JSON/XML/text are left untouched.
+    if HTML_MARKERS.iter().any(|marker| trimmed.starts_with(marker)) {
         return Some("text/html");
     }
     None
@@ -1437,6 +1440,16 @@ mod tests {
         assert_eq!(sniff_active_content(b"just some plain text"), None);
         assert_eq!(sniff_active_content(b"\x89PNG\r\n\x1a\n"), None);
         assert_eq!(sniff_active_content(b"PK\x03\x04docx-is-a-zip"), None);
+        // R6: legitimate structured text that merely CONTAINS an HTML tag mid-content is NOT flipped
+        // (start-anchored) — its declared type (application/json, rss, ...) is preserved.
+        assert_eq!(
+            sniff_active_content(br#"{"tmpl":"<html><body>{{x}}</body>"}"#),
+            None
+        );
+        assert_eq!(
+            sniff_active_content(b"<?xml version='1.0'?><rss><item><description><script>x</script></description></item></rss>"),
+            None
+        );
     }
 
     #[test]

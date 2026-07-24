@@ -10,6 +10,10 @@ import (
 	"github.com/google/cel-go/ext"
 )
 
+// maxJSONParseBytes bounds json_parse input: a guard runs on the full external inbound payload and the
+// guard timeout does not interrupt a running eval, so cap the parse work an ingress caller can drive.
+const maxJSONParseBytes = 64 * 1024
+
 func DefaultClock() time.Time {
 	return time.Now().UTC()
 }
@@ -51,6 +55,13 @@ func NewGuardEnv(clock ClockFunc) (*cel.Env, error) {
 					raw, ok := arg.Value().(string)
 					if !ok {
 						return types.NewErr("json_parse expects a string argument")
+					}
+					// The GuardEvalTimeout does not actually interrupt a running eval (cel-go only
+					// interrupts via ContextEval), so bound the work explicitly: a guard reads the full
+					// external inbound payload, so refuse an oversized input rather than letting an
+					// ingress caller drive an unbounded/deep parse per message.
+					if len(raw) > maxJSONParseBytes {
+						return types.NewErr("json_parse: input exceeds %d bytes", maxJSONParseBytes)
 					}
 					var parsed interface{}
 					if err := json.Unmarshal([]byte(raw), &parsed); err != nil {

@@ -257,3 +257,21 @@ func TestForbiddenSystemTargetAndRefPathHelpers(t *testing.T) {
 		}
 	}
 }
+
+// FIX-R3: "failed" is the reserved fatal-error sink; a state named "failed" that is not terminal is
+// rejected at publish so it can never be silently hijacked/terminated by routeToFailed.
+func TestValidateDefinitionRejectsNonTerminalFailedState(t *testing.T) {
+	data := strings.Replace(
+		validWorkflowJSON(),
+		`"terminal_states": ["completed", "failed", "cancelled"]`,
+		`"terminal_states": ["completed", "cancelled"]`,
+		1,
+	)
+	_, err := LoadDefinitionBytes([]byte(data), "", fixedClock)
+	if err == nil {
+		t.Fatal("expected a non-terminal state named \"failed\" to be rejected")
+	}
+	if !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("expected a reservation error, got: %v", err)
+	}
+}
