@@ -146,6 +146,12 @@ cat <<EOF
 
   - IO.slack needs its tokens (resource_type "slack", value {app_token, bot_token}).
 
+  - IO.wapp (WhatsApp Cloud API) needs its secret (resource_type "whatsapp",
+    value {access_token, app_secret, verify_token}) AND the public webhook wired
+    as a fanout: externalize ONE edge endpoint for the Meta app with the family
+    glob "IO.wapp.*@$HIVE_ID" and the app-level verify_token, then set each node's
+    io.phone_number_id via CONFIG_SET. One IO.wapp.<label> node per number.
+
   Any other node secret is loaded into SY.vault the same way (POST .../vault/secrets).
 
  Architect (Archi): http://<this-host>:3000    Admin API: $ADMIN

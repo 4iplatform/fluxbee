@@ -277,8 +277,8 @@ Description: Fluxbee internal-network orchestration mesh
  Core services (router, orchestrator, identity, vault, storage, admin,
  architect, cognition, policy, timer, wf-rules, opa-rules, frontdesk, edge)
  plus the singleton IO.cloud adapter and IO.blob public artifact curator (motherbee),
- and the instanced IO/AI runtimes (io.api, io.slack, ai.generic, wf.engine,
- io.linkedhelper) seeded under dist/runtimes per packaging/base-nodes.json.
+ and the instanced IO/AI runtimes (io.api, io.slack, io.wapp, ai.generic,
+ wf.engine, io.linkedhelper) seeded under dist/runtimes per packaging/base-nodes.json.
  Binaries + dist/core manifest (hashes baked at build), systemd units, and a
  first-boot helper. Run 'sudo fluxbee-firstboot' after install.
 EOF

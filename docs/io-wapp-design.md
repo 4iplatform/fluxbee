@@ -226,7 +226,13 @@ Mirror io.slack: inbound → fetch media via Graph media URL (bearer) → `BlobT
    `[unsupported message type: …]` marker (no silent drop) — extracting the tapped button/reply title is
    a §4 follow-up. Empty-text bodies are dropped (never relay a blank turn), mirroring the io.slack peer.
 4. **Outbound** — Graph messages + 429 retries; media out.
-5. **Packaging** — base-nodes.json + Cargo.toml + publish; firstboot degraded boot.
+5. **Packaging** — base-nodes.json + Cargo.toml + publish; firstboot degraded boot. ✅ DONE: io.wapp
+   is a `boot: true` runtime in `packaging/base-nodes.json`; firstboot auto-spawns the default instance
+   **`IO.wapp.default@motherbee`** (dotted so it matches the fanout family glob `IO.wapp.*@<hive>`; the
+   bare `IO.wapp` would not) at the root tenant, degraded until its `whatsapp` vault secret is loaded AND
+   the operator externalizes the fanout webhook. Additional numbers = more `IO.wapp.<label>` nodes via
+   `run_node` (no new .deb). build-deb picks up the crate automatically (`workspace: nodes/io`); firstboot
+   post-boot hint documents the `whatsapp` secret + externalize-as-fanout step.
 6. **Live validation** — deploy to the dev hive; boots UNCONFIGURED; then a real webhook round-trip
    once a WABA + token are available.
 

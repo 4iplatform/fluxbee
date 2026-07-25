@@ -56,6 +56,15 @@
       "instance": "IO.slack@motherbee"
     },
     {
+      "_note": "io.wapp is fanout (one node per WhatsApp number; all share ONE Meta webhook). The boot instance uses the DOTTED name IO.wapp.default so it matches the externalize-as-fanout family glob 'IO.wapp.*@<hive>' (the bare 'IO.wapp' would NOT match that glob). Additional per-number nodes are spawned as IO.wapp.<label>@<hive> via run_node. Degraded until BOTH its vault secret (resource_type 'whatsapp') is loaded AND the operator externalizes the fanout webhook.",
+      "runtime": "io.wapp",
+      "crate": "io-wapp",
+      "bin": "io-wapp",
+      "workspace": "nodes/io",
+      "boot": true,
+      "instance": "IO.wapp.default@motherbee"
+    },
+    {
       "runtime": "ai.generic",
       "crate": "ai-generic",
       "bin": "ai_node_runner",
