@@ -204,6 +204,35 @@ Mirror io.slack: inbound → fetch media via Graph media URL (bearer) → `BlobT
   (io-cloud test uses `wapp_token`/`bearer_token`). Recommend a dedicated `"whatsapp"` type.
 - **D5**: Default inbound target `io.dst_node` = `AI.generic@motherbee` (matches the io.slack decision).
 - **D6**: Template outbound (outside-24h) — defer to v2? (recommended defer).
+- **D7** (decided 2026-07-25, ICH / channel model): "internally each phone is a separate channel" is a
+  correct principle — and it is **already upheld** without any per-phone edge ICH. There are TWO ICH
+  layers: (a) the **edge/identity ICH** `ich:<uuid-v5("{tenant}:{channel_type}:{address}")>`
+  ([identity.rs:397](../crates/fluxbee_sdk/src/identity.rs)) which is the `/e/<ich>` URL key — in
+  fanout there is exactly **one**, the external door for Meta's single webhook; and (b) the **downstream
+  per-channel ich** `"{channel}://{entrypoint_id}"` = `whatsapp://<phone_number_id>`, derived per message
+  in `build_user_message` ([router_message.rs:79](../nodes/io/common/src/router_message.rs)) from the
+  `io_context.entrypoint`. The **router never reads `meta.ich`** (grep 0); the edge's single fanout ich
+  is **discarded at the node**, which stamps a fresh per-phone `whatsapp://<pnid>` and resolves identity
+  by `(channel, external_id, tenant)` with `phone_number_id` baked into `external_id`/`tenant_hint`. So
+  every phone is a fully distinct channel/thread/identity downstream despite one edge ich.
+  - **The external wapp channel belongs to the EDGE** (operator decision): whether it is modeled as an
+    ICH is not relevant now. Meta needs one webhook; the edge owns that single external endpoint.
+  - **Decision: keep D1 (fanout), do NOT add an edge-side per-phone demux.** Edge demux (externalize the
+    edge's own handle + a `{phone_number_id → owner}` table) was weighed and rejected: it would (i) push
+    WhatsApp-envelope parsing into the DMZ, (ii) route on an **unverified** `phone_number_id` (the edge
+    holds no `app_secret`) — contradicting the "edge does the connection OK, not tokens/numbers" split
+    (D2), and (iii) not even remove the node's phone filter (the HMAC covers the whole body and Meta may
+    batch multiple numbers per POST, so the edge cannot split without breaking the signature).
+  - **Scale path (documented, not built): Option D — a front-demux node INSIDE the frontier.** If numbers
+    ever map to mutually-distrusting tenants (isolation) or there are very many numbers (anti ×N
+    amplification), introduce a routing `IO.wapp` node that HMAC-verifies once (it may hold the
+    `app_secret`, being inside the frontier) and forwards each event to the per-phone node — giving
+    isolation + anti-amplification without putting provider knowledge or the `app_secret` in the DMZ edge.
+  - **Deferred (Option C): `ensure_own_ich(whatsapp, phone_number_id)` per node** to register the
+    phone-channel in identity SHM against the node's ilk (as io.api/io.cloud do). Deferred — no consumer
+    today resolves `phone → ilk` via identity; it would be ceremony. Revisit when **Fluxbee Cloud** needs
+    to identify/enumerate the external wapp channel from the website (a separate conversation at
+    integration time).
 
 ## 11. Phased plan (after design OK)
 
