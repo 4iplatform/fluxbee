@@ -1092,7 +1092,7 @@ async fn apply_wapp_config_set(
 ) -> Value {
     let mut state = control_plane.write().await;
 
-    if let Err(err) = ensure_config_version_advances(state.config_version, payload.config_version) {
+    if let Err(err) = ensure_config_version_advances(payload.config_version, state.config_version) {
         log_config_set_stale_rejected(node_name, payload.config_version, state.config_version);
         control_metrics.record_config_set_error(
             state.current_state.as_str(),
@@ -1464,6 +1464,42 @@ mod tests {
         assert_eq!(with("0"), Duration::from_secs(1));
         // garbage (HTTP-date form we don't parse) => 1s default
         assert_eq!(with("Wed, 21 Oct 2026 07:28:00 GMT"), Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn config_set_advances_from_current_version_not_rejected_as_stale() {
+        // Regression: apply_wapp_config_set must pass (payload_version, current_version) to
+        // ensure_config_version_advances (io.slack/io.api order). A swapped call rejected EVERY
+        // config_set as stale, so io.wapp could never be configured. A payload at version 2 over a
+        // node at version 1 must be ACCEPTED (config_version strictly advances).
+        let control_plane = Arc::new(RwLock::new(IoControlPlaneState::default())); // config_version = 0
+        let metrics = IoControlPlaneMetrics::with_initial_state("UNCONFIGURED", 0);
+        let contract = IoWappAdapterConfigContract;
+        let payload = fluxbee_sdk::node_config::NodeConfigSetPayload {
+            node_name: "IO.wapp.default@motherbee".to_string(),
+            schema_version: 1,
+            config_version: 2,
+            apply_mode: "replace".to_string(),
+            config: serde_json::json!({
+                "wapp": { "auth": { "type": "vault_ref", "resource_type": "whatsapp", "key": "wapp_test" } },
+                "io": { "phone_number_id": "111", "waba_id": "WABA" }
+            }),
+            ..Default::default()
+        };
+        let resp = apply_wapp_config_set(
+            &payload,
+            "IO.wapp.default@motherbee",
+            control_plane.clone(),
+            &metrics,
+            &contract,
+        )
+        .await;
+        assert_ne!(
+            resp.get("error_code").and_then(|v| v.as_str()),
+            Some("stale_config"),
+            "config_version 2 over 0 must not be stale: {resp}"
+        );
+        assert_eq!(control_plane.read().await.config_version, 2, "version must advance to 2");
     }
 
     #[tokio::test]
