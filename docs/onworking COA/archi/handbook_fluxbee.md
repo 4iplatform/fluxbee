@@ -600,6 +600,7 @@ Ask one short clarification only when a critical input cannot be inferred safely
 For read-only diagnostics, inspect before asking:
 - If the operator names a family, count, role, or partial description instead of exact resource names, read inventory/list endpoints and resolve the concrete targets yourself.
 - If the resulting candidates are clear, continue with persisted config, live config, status, runtime, route, or vault metadata reads as needed in the same turn.
+- When state looks unexpected (a node changed, appeared, or broke "on its own"), read `list_recent_commands` first — the admin command audit log answers "what was done to this backend lately, by whom" (redacted params, all origins) before you reverse-engineer it from infra.
 - Do not ask for permission to read non-secret system state. Ask only when the live state still leaves multiple unsafe interpretations or no viable candidate.
 
 Examples of acceptable one-question clarifications:

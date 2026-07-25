@@ -78,6 +78,7 @@ const ADMIN_EXECUTOR_SCHEMA_OVERRIDE_ACTIONS: &[&str] = &["get_admin_action_help
 const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "list_admin_actions",
     "get_admin_action_help",
+    "list_recent_commands",
     "get_runtime",
     "list_nodes",
     "list_tenants",
@@ -299,6 +300,8 @@ struct AdminContext {
     public_base_url: Option<String>,
     publication_ledger_path: PathBuf,
     publication_lock: Arc<Mutex<()>>,
+    /// Serializes rotate+append on the command audit log (see `append_admin_command_log_locked`).
+    command_log_lock: Arc<std::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -645,6 +648,7 @@ async fn main() -> Result<(), AdminError> {
         public_base_url,
         publication_ledger_path: state_dir.join("sy-admin/publications.json"),
         publication_lock: Arc::new(Mutex::new(())),
+        command_log_lock: Arc::new(std::sync::Mutex::new(())),
     };
     let internal_ctx = http_ctx.clone();
     let system_ctx = http_ctx.clone();
@@ -882,6 +886,186 @@ fn admin_executor_log_dir(state_dir: &Path, hive_id: &str) -> PathBuf {
         .join("admin-executor")
         .join(hive_id)
         .join("executions")
+}
+
+// --- Admin command audit log ---------------------------------------------------------------
+//
+// Admin commands (HTTP/curl, internal L2 — architect etc. — and executor-plan steps) flow through
+// `handle_admin_command`, so one append there gives a "what was done to this backend lately" audit
+// trail, queryable via `list_recent_commands` (GET /hives/{hive}/commands). Storage is an append-only
+// JSONL ring (`commands.jsonl` + rotations) — greppable on disk, size-bounded, params redacted with
+// the shared `redact_executor_log_value` (secret-like field names + vault values NEVER written).
+// NOT captured (separate code paths, documented in list_recent_commands help): runtime rollout
+// `update`/`sync_hint`, and orchestrator-AUTONOMOUS actions (respawn/reconcile) that never pass
+// through admin.
+
+/// Rotate by COMMAND COUNT (operator-decided): the active file holds up to this many entries, then
+/// rotates. With the rotations kept, the queryable window is up to 4x this (still tiny on disk).
+const ADMIN_COMMAND_LOG_ROTATE_ENTRIES: usize = 100;
+const ADMIN_COMMAND_LOG_ROTATIONS: u32 = 3;
+/// Cap the redacted params blob per entry so one giant CONFIG_SET can't bloat the log.
+const ADMIN_COMMAND_LOG_PARAMS_MAX_BYTES: usize = 2048;
+const ADMIN_COMMAND_LOG_DEFAULT_LIMIT: usize = 50;
+const ADMIN_COMMAND_LOG_MAX_LIMIT: usize = 500;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AdminCommandLogEntry {
+    ts_ms: u64,
+    /// RFC3339 copy of ts_ms so the log reads on sight (auditoría humana).
+    ts: String,
+    action: String,
+    /// Target hive of the command (`None` = hive-less action, e.g. add_hive/inventory).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hive: Option<String>,
+    /// Who issued it: "http" (operator curl/UI), "l2:<src_l2_name>" (internal mesh caller such as
+    /// SY.architect), or "executor" (an admin executor-plan step).
+    origin: String,
+    /// Redacted, size-capped copy of the request params — enough to see WHAT was done, never a secret.
+    params: serde_json::Value,
+    /// "ok" | "error" parsed from the response envelope.
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    http_status: u16,
+    duration_ms: u64,
+}
+
+fn admin_command_log_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("sy-admin").join("command-log")
+}
+
+fn admin_command_log_path(state_dir: &Path) -> PathBuf {
+    admin_command_log_dir(state_dir).join("commands.jsonl")
+}
+
+/// Redact + size-cap the params for the audit entry. Reuses the executor-log redactor (secret-like
+/// fields + vault payload `value`s become "<redacted>"); anything still huge is truncated to a
+/// preview so the entry stays audit-sized.
+fn admin_command_log_params(params: &serde_json::Value) -> serde_json::Value {
+    let redacted = redact_executor_log_value(params);
+    let serialized = redacted.to_string();
+    if serialized.len() <= ADMIN_COMMAND_LOG_PARAMS_MAX_BYTES {
+        return redacted;
+    }
+    let mut cut = ADMIN_COMMAND_LOG_PARAMS_MAX_BYTES;
+    while cut > 0 && !serialized.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    serde_json::json!({
+        "_truncated": true,
+        "bytes": serialized.len(),
+        "preview": &serialized[..cut],
+    })
+}
+
+/// Append one entry, rotating `commands.jsonl -> .1 -> .2 -> ...` at the size cap. The caller holds
+/// `ctx.command_log_lock`, so rotate+append is atomic against concurrent commands. Failures are
+/// logged and swallowed: the audit log must never fail the command itself.
+fn append_admin_command_log_locked(state_dir: &Path, entry: &AdminCommandLogEntry) {
+    let dir = admin_command_log_dir(state_dir);
+    if let Err(err) = fs::create_dir_all(&dir) {
+        tracing::warn!(error = %err, "command-log: cannot create dir; entry dropped");
+        return;
+    }
+    let path = admin_command_log_path(state_dir);
+    // Count-based rotation: ~100 entries per file. The file is tiny (≤ ~200KB), so counting lines
+    // per append is negligible next to the admin command it trails.
+    let needs_rotate = fs::read_to_string(&path)
+        .map(|raw| raw.lines().count() >= ADMIN_COMMAND_LOG_ROTATE_ENTRIES)
+        .unwrap_or(false);
+    if needs_rotate {
+        for idx in (1..=ADMIN_COMMAND_LOG_ROTATIONS).rev() {
+            let from = if idx == 1 {
+                path.clone()
+            } else {
+                dir.join(format!("commands.jsonl.{}", idx - 1))
+            };
+            let to = dir.join(format!("commands.jsonl.{idx}"));
+            if from.exists() {
+                let _ = fs::rename(&from, &to);
+            }
+        }
+    }
+    let line = match serde_json::to_string(entry) {
+        Ok(line) => line,
+        Err(err) => {
+            tracing::warn!(error = %err, "command-log: serialize failed; entry dropped");
+            return;
+        }
+    };
+    let result = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| writeln!(file, "{line}"));
+    if let Err(err) = result {
+        tracing::warn!(error = %err, "command-log: append failed; entry dropped");
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct AdminCommandLogQuery {
+    limit: usize,
+    action: Option<String>,
+    status: Option<String>,
+    hive: Option<String>,
+    since_ms: Option<u64>,
+}
+
+/// Read the most recent entries (newest first), walking the current file then rotations until the
+/// limit fills. Filters: exact action, status ok|error, target hive, since_ms.
+fn read_recent_admin_commands(
+    state_dir: &Path,
+    query: &AdminCommandLogQuery,
+) -> Vec<serde_json::Value> {
+    let dir = admin_command_log_dir(state_dir);
+    let limit = query.limit.clamp(1, ADMIN_COMMAND_LOG_MAX_LIMIT);
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut files = vec![admin_command_log_path(state_dir)];
+    for idx in 1..=ADMIN_COMMAND_LOG_ROTATIONS {
+        files.push(dir.join(format!("commands.jsonl.{idx}")));
+    }
+    for file in files {
+        if out.len() >= limit {
+            break;
+        }
+        let Ok(raw) = fs::read_to_string(&file) else {
+            continue;
+        };
+        for line in raw.lines().rev() {
+            if out.len() >= limit {
+                break;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let matches = query
+                .action
+                .as_deref()
+                .is_none_or(|a| value.get("action").and_then(|v| v.as_str()) == Some(a))
+                && query
+                    .status
+                    .as_deref()
+                    .is_none_or(|s| value.get("status").and_then(|v| v.as_str()) == Some(s))
+                && query.hive.as_deref().is_none_or(|h| {
+                    // Hive-less commands (add_hive/remove_hive/inventory — hive: None) are GLOBAL:
+                    // always shown, even under a hive-scoped query, so they are never hidden.
+                    match value.get("hive").and_then(|v| v.as_str()) {
+                        Some(entry_hive) => entry_hive == h,
+                        None => true,
+                    }
+                })
+                && query
+                    .since_ms
+                    .is_none_or(|since| {
+                        value.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0) >= since
+                    });
+            if matches {
+                out.push(value);
+            }
+        }
+    }
+    out
 }
 
 fn load_admin_executor_node_config(
@@ -1191,33 +1375,44 @@ fn build_admin_executor_function_catalog(
         .collect()
 }
 
+/// True if a (lowercased) field name names a secret whose VALUE must never be persisted to a log.
+/// Mirrors the SY.architect `key_looks_secret` peer (single de-diverged policy) and additionally
+/// covers the bootstrap-credential field names the add_hive contract promises never to log
+/// (`ssh_password` via `_password`; `ssh_key`/`private_key` via the explicit names + `_key`).
+fn redaction_field_is_secret(lower: &str) -> bool {
+    matches!(
+        lower,
+        "api_key"
+            | "apikey"
+            | "token"
+            | "access_token"
+            | "client_secret"
+            | "secret"
+            | "password"
+            | "authorization"
+            | "ssh_key"
+            | "ssh_password"
+            | "private_key"
+    ) || lower.ends_with("_api_key")
+        || lower.ends_with("_token")
+        || lower.ends_with("_secret")
+        || lower.ends_with("_password")
+        || lower.ends_with("_private_key")
+}
+
 fn redact_executor_log_value(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
             let mut redacted = serde_json::Map::new();
-            let looks_like_vault_payload = map.contains_key("key")
-                && map.contains_key("value")
-                && (map.contains_key("metadata")
-                    || map.contains_key("version")
-                    || map.get("action").and_then(serde_json::Value::as_str) == Some("vault_get")
-                    || map.get("action").and_then(serde_json::Value::as_str) == Some("vault_put")
-                    || map
-                        .get("key")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|key| {
-                            key.contains(':')
-                                && key.bytes().all(|b| {
-                                    b.is_ascii_lowercase()
-                                        || b.is_ascii_digit()
-                                        || matches!(b, b':' | b'_' | b'-')
-                                })
-                        }));
+            // A vault-shaped `{key, value, ...}` object: redact `value` unconditionally. (Previously
+            // this required metadata/version/an embedded action/a colon-key heuristic — a colon-less
+            // valid key like `slack-tokens` defeated it and leaked the value. `key`+`value` together
+            // is vault-specific enough; over-redacting a benign pair in an audit log is acceptable.)
+            let looks_like_vault_payload = map.contains_key("key") && map.contains_key("value");
             for (key, entry) in map {
                 let lower = key.to_ascii_lowercase();
-                if matches!(
-                    lower.as_str(),
-                    "api_key" | "token" | "secret" | "password" | "authorization"
-                ) || (looks_like_vault_payload && lower == "value")
+                if redaction_field_is_secret(&lower)
+                    || (looks_like_vault_payload && lower == "value")
                 {
                     redacted.insert(
                         key.clone(),
@@ -2376,7 +2571,9 @@ async fn execute_admin_executor_step_fallback(
         }
     };
     let (_http_status, body) =
-        match handle_admin_command(ctx, client, &step.action, params, target).await {
+        match handle_admin_command_with_origin(ctx, client, &step.action, params, target, "executor")
+            .await
+        {
             Ok(values) => values,
             Err(err) => {
                 let failure = failure_from_detail(err.to_string(), "admin_action_failure");
@@ -3312,6 +3509,13 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         action: "send_node_message",
         route: InternalActionRoute::Command("send_node_message"),
         requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "list_recent_commands",
+        route: InternalActionRoute::Command("list_recent_commands"),
+        // The log lives on THIS admin; target (hive) is only a filter, so it is optional.
+        requires_target: false,
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
@@ -4899,7 +5103,15 @@ async fn dispatch_internal_admin_command(
                     "missing target (payload.target required for this action)",
                 ));
             }
-            handle_admin_command(ctx, client, canonical, params, hive).await?
+            {
+                // Audit origin: the router-stamped caller when the command came over L2 (e.g.
+                // SY.architect), else the trusted internal path.
+                let origin = caller_l2_name
+                    .map(|src| format!("l2:{src}"))
+                    .unwrap_or_else(|| "internal".to_string());
+                handle_admin_command_with_origin(ctx, client, canonical, params, hive, &origin)
+                    .await?
+            }
         }
         InternalActionRoute::Update => {
             let hive = resolve_internal_action_hive("update", target, &params);
@@ -6156,6 +6368,32 @@ async fn handle_hive_paths(
         }
         ("GET", ["taps"]) => {
             let (status, resp) = handle_admin_query(ctx, client, "list_taps", Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["commands"]) => {
+            // Command audit log: what was done to this backend lately (redacted). Filters via query
+            // string; `hive` in the path narrows to commands targeting that hive.
+            let mut payload = serde_json::Map::new();
+            if let Some(limit) = query.get("limit").and_then(|v| v.parse::<u64>().ok()) {
+                payload.insert("limit".to_string(), serde_json::json!(limit));
+            }
+            if let Some(action) = query.get("action") {
+                payload.insert("action".to_string(), serde_json::json!(action));
+            }
+            if let Some(status) = query.get("status") {
+                payload.insert("status".to_string(), serde_json::json!(status));
+            }
+            if let Some(since) = query.get("since_ms").and_then(|v| v.parse::<u64>().ok()) {
+                payload.insert("since_ms".to_string(), serde_json::json!(since));
+            }
+            let (status, resp) = handle_admin_command(
+                ctx,
+                client,
+                "list_recent_commands",
+                serde_json::Value::Object(payload),
+                Some(hive),
+            )
+            .await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["taps"]) => {
@@ -8700,6 +8938,11 @@ fn admin_action_summary(action: &str) -> &'static str {
         "add_vpn" => "Add a VPN pattern to a hive.",
         "delete_vpn" => "Delete a VPN pattern from a hive.",
         "list_taps" => "List router-level taps installed on a hive. Read-only.",
+        "list_recent_commands" => {
+            "Audit log: list the most recent admin commands executed on this backend (all origins — \
+             operator HTTP, internal L2 callers like SY.architect, and executor-plan steps), with \
+             redacted params, result status and duration. Read-only."
+        }
         "add_tap" => "Add a router-level tap on a hive. When a unicast message matches (match_src, match_dst), the router enqueues a fire-and-forget secondary copy to `target` with `meta.via_tap=true`. mode defaults to `best_effort` when omitted. enabled defaults to true. Exact L2 name match.",
         "delete_tap" => "Delete an installed router-level tap by its (match_src, match_dst, target) natural key.",
         "update" => "Run hive update workflow.",
@@ -8804,6 +9047,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "delete_route" => vec!["DELETE /hives/{hive}/routes/{prefix}"],
         "add_vpn" => vec!["POST /hives/{hive}/vpns"],
         "list_taps" => vec!["GET /hives/{hive}/taps"],
+        "list_recent_commands" => vec!["GET /hives/{hive}/commands"],
         "add_tap" => vec!["POST /hives/{hive}/taps"],
         "delete_tap" => vec!["DELETE /hives/{hive}/taps?match_src=...&match_dst=...&target=..."],
         "delete_vpn" => vec!["DELETE /hives/{hive}/vpns/{pattern}"],
@@ -9536,6 +9780,12 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             ),
             admin_action_body_field("ttl", "u16", "Optional TTL, default 16."),
         ],
+        "list_recent_commands" => vec![
+            admin_action_body_field("limit", "u32", "Max entries returned (default 50, max 500)."),
+            admin_action_body_field("action", "string", "Filter: exact admin action name."),
+            admin_action_body_field("status", "string", "Filter: 'ok' or 'error'."),
+            admin_action_body_field("since_ms", "u64", "Filter: only entries at/after this epoch-ms."),
+        ],
         "send_node_message" => vec![
             admin_action_body_field("msg", "string", "Optional message name."),
             admin_action_body_field("ttl", "u16", "Optional TTL, default 16."),
@@ -9830,6 +10080,10 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "layout": "2006-01-02 15:04 MST",
             "tz": "America/Argentina/Buenos_Aires"
         }),
+        "list_recent_commands" => serde_json::json!({
+            "limit": 20,
+            "status": "error"
+        }),
         "send_node_message" => serde_json::json!({
             "msg_type": "PING",
             "payload": {
@@ -10039,6 +10293,9 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "remove_node_instance" => {
             "curl -X DELETE /hives/motherbee/nodes/AI.chat@motherbee/instance"
         }
+        "list_recent_commands" => {
+            "curl -X GET '/hives/motherbee/commands?limit=20&status=error'"
+        }
         "send_node_message" => {
             r#"curl -X POST /hives/motherbee/nodes/SY.admin@motherbee/messages -d '{"msg_type":"PING","payload":{"ping":true}}'"#
         }
@@ -10193,6 +10450,13 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The returned payload includes publication_id, url, optional public_url, expires_at, edge_node, content_type and presentation.",
             "A /public/<key> URL is a bearer capability: anyone with the link can read it until expiry or unpublish.",
             "Inline HTML may contain self-contained JavaScript, but edge applies sandboxed-html-v1 with network access disabled.",
+        ],
+        "list_recent_commands" => vec![
+            "Reads the local admin command audit log (state/sy-admin/command-log/, JSONL, rotates every ~100 entries; oldest rotations are dropped).",
+            "Records every admin command that flows through the admin command handler — creates/mutations/queries (run_node, vault_*, config, taps, routes, hives, nodes, ...) — with `origin` = 'http' (operator), 'l2:<src_l2_name>' (router-stamped mesh caller, e.g. SY.architect), 'executor' (executor-plan step) or 'internal'.",
+            "Entry params are REDACTED (secret-like field names + vault values are never written) and size-capped; entries also carry status, error_code, http_status and duration_ms.",
+            "The {hive} path segment FILTERS by target hive; hive-less commands (add_hive/remove_hive/inventory) are global and always shown.",
+            "NOT captured (separate paths): runtime rollout `update`/`sync_hint` (their own admin routes, not the command handler), and orchestrator-AUTONOMOUS actions (respawn/reconcile) which never pass through admin.",
         ],
         "unpublish_artifact" => vec![
             "Mesh-only producer operation; there is no HTTP, SCMD or admin-executor unpublish endpoint.",
@@ -11985,7 +12249,121 @@ async fn handle_remove_runtime_version(
     ))
 }
 
+/// The single choke-point for admin commands. All entry paths land here — HTTP handlers call it
+/// directly (origin "http"); the internal L2 dispatch and the executor call
+/// `handle_admin_command_with_origin` with their identity. Every call is appended to the command
+/// audit log (redacted) so `list_recent_commands` can answer "what was done to this backend lately".
 async fn handle_admin_command(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    action: &str,
+    payload: serde_json::Value,
+    hive: Option<String>,
+) -> Result<(u16, String), AdminError> {
+    handle_admin_command_with_origin(ctx, client, action, payload, hive, "http").await
+}
+
+async fn handle_admin_command_with_origin(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    action: &str,
+    payload: serde_json::Value,
+    hive: Option<String>,
+    origin: &str,
+) -> Result<(u16, String), AdminError> {
+    // The audit-log reader is handled locally (the log lives on THIS admin; every hive's commands
+    // flow through it) — `hive` acts as a filter, not routing.
+    if matches!(action, "list_recent_commands") {
+        let query = AdminCommandLogQuery {
+            limit: payload
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(ADMIN_COMMAND_LOG_DEFAULT_LIMIT),
+            action: payload
+                .get("action")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToString::to_string),
+            status: payload
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToString::to_string),
+            hive: hive.clone().filter(|v| !v.is_empty()),
+            since_ms: payload.get("since_ms").and_then(|v| v.as_u64()),
+        };
+        // Read under the same lock as rotate+append so a concurrent rotation can't make one response
+        // miss or duplicate an entry across the file/rotation boundary.
+        let commands = {
+            let _guard = ctx
+                .command_log_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            read_recent_admin_commands(&ctx.state_dir, &query)
+        };
+        return Ok((
+            200u16,
+            serde_json::json!({
+                "status": "ok",
+                "action": "list_recent_commands",
+                "error_code": serde_json::Value::Null,
+                "error_detail": serde_json::Value::Null,
+                "payload": { "count": commands.len(), "commands": commands },
+            })
+            .to_string(),
+        ));
+    }
+
+    let started = Instant::now();
+    let logged_params = admin_command_log_params(&payload);
+    let result = handle_admin_command_inner(ctx, client, action, payload, hive.clone()).await;
+
+    // Audit append — never fails the command; a hard AdminError is logged as status=error too.
+    let (http_status, status, error_code) = match &result {
+        Ok((code, body)) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+            (
+                *code,
+                parsed
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(if *code < 400 { "ok" } else { "error" })
+                    .to_string(),
+                parsed
+                    .get("error_code")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
+            )
+        }
+        Err(err) => (500u16, "error".to_string(), Some(err.to_string())),
+    };
+    let entry = AdminCommandLogEntry {
+        ts_ms: now_epoch_ms(),
+        ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        action: action.to_string(),
+        hive,
+        origin: origin.to_string(),
+        params: logged_params,
+        status,
+        error_code,
+        http_status,
+        duration_ms: started.elapsed().as_millis() as u64,
+    };
+    {
+        let _guard = ctx
+            .command_log_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        append_admin_command_log_locked(&ctx.state_dir, &entry);
+    }
+    result
+}
+
+async fn handle_admin_command_inner(
     ctx: &AdminContext,
     client: &RouterDispatcher,
     action: &str,
@@ -14798,6 +15176,168 @@ mod tests {
             json!(NODE_SECRET_REDACTION_TOKEN)
         );
         assert_eq!(redacted["payload"]["key"], json!("infra:openai-api-key"));
+    }
+
+    fn command_log_test_state_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("sy-admin-cmdlog-{tag}-{nanos}"))
+    }
+
+    fn command_log_entry(action: &str, hive: Option<&str>, status: &str, ts_ms: u64) -> AdminCommandLogEntry {
+        AdminCommandLogEntry {
+            ts_ms,
+            ts: format!("t{ts_ms}"),
+            action: action.to_string(),
+            hive: hive.map(ToString::to_string),
+            origin: "http".to_string(),
+            params: json!({}),
+            status: status.to_string(),
+            error_code: (status == "error").then(|| "SOME_ERROR".to_string()),
+            http_status: if status == "ok" { 200 } else { 500 },
+            duration_ms: 1,
+        }
+    }
+
+    #[test]
+    fn command_log_appends_and_reads_newest_first() {
+        let dir = command_log_test_state_dir("basic");
+        for i in 0..5u64 {
+            append_admin_command_log_locked(&dir, &command_log_entry("run_node", Some("motherbee"), "ok", i));
+        }
+        let out = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 3, ..Default::default() },
+        );
+        assert_eq!(out.len(), 3);
+        // newest first
+        assert_eq!(out[0]["ts_ms"], json!(4));
+        assert_eq!(out[2]["ts_ms"], json!(2));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_log_rotates_by_entry_count_and_reads_across_rotations() {
+        let dir = command_log_test_state_dir("rotate");
+        let total = ADMIN_COMMAND_LOG_ROTATE_ENTRIES as u64 + 10;
+        for i in 0..total {
+            append_admin_command_log_locked(&dir, &command_log_entry("update", None, "ok", i));
+        }
+        // the active file rotated once: commands.jsonl.1 exists and the active file is small
+        assert!(admin_command_log_dir(&dir).join("commands.jsonl.1").exists());
+        let active = fs::read_to_string(admin_command_log_path(&dir)).expect("active log");
+        assert_eq!(active.lines().count(), 10);
+        // reading spans the rotation: ask for more than the active file holds
+        let out = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 20, ..Default::default() },
+        );
+        assert_eq!(out.len(), 20);
+        assert_eq!(out[0]["ts_ms"], json!(total - 1));
+        assert_eq!(out[19]["ts_ms"], json!(total - 20));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_log_query_filters_by_action_status_hive_and_since() {
+        let dir = command_log_test_state_dir("filters");
+        append_admin_command_log_locked(&dir, &command_log_entry("run_node", Some("motherbee"), "ok", 10));
+        append_admin_command_log_locked(&dir, &command_log_entry("run_node", Some("worker-220"), "error", 20));
+        append_admin_command_log_locked(&dir, &command_log_entry("vault_put", Some("motherbee"), "ok", 30));
+        let by_action = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 10, action: Some("run_node".into()), ..Default::default() },
+        );
+        assert_eq!(by_action.len(), 2);
+        let by_status = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 10, status: Some("error".into()), ..Default::default() },
+        );
+        assert_eq!(by_status.len(), 1);
+        assert_eq!(by_status[0]["action"], json!("run_node"));
+        let by_hive = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 10, hive: Some("motherbee".into()), ..Default::default() },
+        );
+        assert_eq!(by_hive.len(), 2);
+        let by_since = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 10, since_ms: Some(21), ..Default::default() },
+        );
+        assert_eq!(by_since.len(), 1);
+        assert_eq!(by_since[0]["action"], json!("vault_put"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_log_params_redact_vault_value_and_truncate_huge_payloads() {
+        // a vault_put must never log its value
+        let vault = json!({
+            "action": "vault_put",
+            "key": "infra:slack-tokens",
+            "value": { "app_token": "xapp-secret" },
+            "metadata": { "tenant_id": "tnt:x" }
+        });
+        let redacted = admin_command_log_params(&vault);
+        assert_eq!(redacted["value"], json!(NODE_SECRET_REDACTION_TOKEN));
+        assert_eq!(redacted["key"], json!("infra:slack-tokens"));
+        // a huge CONFIG_SET payload gets truncated to a preview, never stored whole
+        let huge = json!({ "config": { "blob": "x".repeat(3 * ADMIN_COMMAND_LOG_PARAMS_MAX_BYTES) } });
+        let capped = admin_command_log_params(&huge);
+        assert_eq!(capped["_truncated"], json!(true));
+        let preview = capped["preview"].as_str().expect("preview string");
+        assert!(preview.len() <= ADMIN_COMMAND_LOG_PARAMS_MAX_BYTES);
+    }
+
+    #[test]
+    fn command_log_redacts_ssh_and_colonless_vault_secrets() {
+        // add_hive bootstrap creds (the contract promises these are never logged)
+        let add_hive = json!({
+            "hive_id": "worker-220",
+            "ssh_user": "administrator",
+            "ssh_password": "Hunter2!",
+            "ssh_key": "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END-----"
+        });
+        let r = admin_command_log_params(&add_hive);
+        assert_eq!(r["ssh_password"], json!(NODE_SECRET_REDACTION_TOKEN));
+        assert_eq!(r["ssh_key"], json!(NODE_SECRET_REDACTION_TOKEN));
+        assert_eq!(r["ssh_user"], json!("administrator")); // non-secret kept for audit
+        assert_eq!(r["hive_id"], json!("worker-220"));
+        // vault_rotate on a colon-less (but valid) key: value must still be redacted
+        let rotate = json!({ "key": "slack-tokens", "value": { "app_token": "xapp-secret" } });
+        let rr = admin_command_log_params(&rotate);
+        assert_eq!(rr["value"], json!(NODE_SECRET_REDACTION_TOKEN));
+        assert_eq!(rr["key"], json!("slack-tokens")); // the key NAME is not a secret
+    }
+
+    #[test]
+    fn command_log_hive_filter_keeps_hive_less_commands_visible() {
+        let dir = command_log_test_state_dir("hiveless");
+        append_admin_command_log_locked(&dir, &command_log_entry("run_node", Some("motherbee"), "ok", 10));
+        append_admin_command_log_locked(&dir, &command_log_entry("add_hive", None, "ok", 20));
+        // querying a specific hive must STILL surface hive-less (global) commands like add_hive
+        let out = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 10, hive: Some("motherbee".into()), ..Default::default() },
+        );
+        let actions: Vec<&str> = out.iter().filter_map(|c| c["action"].as_str()).collect();
+        assert!(actions.contains(&"add_hive"), "hive-less add_hive must be visible: {actions:?}");
+        assert!(actions.contains(&"run_node"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_recent_commands_is_a_registered_admin_action() {
+        let spec = resolve_internal_action_spec("list_recent_commands")
+            .expect("list_recent_commands registered");
+        assert!(!spec.requires_target);
+        assert_eq!(
+            admin_action_path_patterns("list_recent_commands"),
+            vec!["GET /hives/{hive}/commands"]
+        );
+        assert!(!admin_action_summary("list_recent_commands").is_empty());
     }
 
     #[test]
