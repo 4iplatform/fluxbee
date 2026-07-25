@@ -209,14 +209,22 @@ Mirror io.slack: inbound → fetch media via Graph media URL (bearer) → `BlobT
 
 1. **Contract + skeleton** — `io_wapp_adapter_config.rs` + `io-wapp` crate booting degraded (control
    plane, CONFIG_GET/SET, vault_ref resolve + refresh + broadcast). Unit-tested; boots UNCONFIGURED.
+   ✅ DONE (426b597).
 2. **Edge fanout capability** — a new endpoint mode in `sy_edge.rs` (+ the externalize admin flow):
    fanout target (tap group / `IO.wapp` family) instead of unicast owner; GET verify_token challenge
    answered at the edge; **ack-fast** POST (200 Meta immediately, no reply-wait) + fanout of the RAW
    body + signature header. Backward compatible — io.api/io.blob (unicast reply-correlated) unaffected.
-   Tests. Security-sensitive; reviewed.
+   Tests. Security-sensitive; reviewed. ✅ DONE (ac08c8c edge, 9e6f97b admin).
 3. **Node inbound** — subscribe to the fanout; verify `X-Hub-Signature-256` (app_secret from vault);
    filter by `phone_number_id`; dedup by message id; parse messages → text/v1 relay to dst_node; media
-   in. One io.wapp per number (single-number contract, unchanged).
+   in. One io.wapp per number (single-number contract, unchanged). ✅ DONE (implemented + 16 unit
+   tests + adversarial review): `webhook.rs` pure parser + constant-time HMAC verify (default-deny);
+   `io_context.rs` `wapp_inbound_io_context` + `extract_wapp_post_target`; `run_wapp_inbound_loop`
+   (verify → self-select by `phone_number_id` → dedup → identity resolve/provision → text/v1 relay).
+   Media relays a text marker + stashes `media_id` in the `raw.wapp` stub (actual download deferred to §4).
+   Interactive replies (`button`/`interactive` list/quick-reply) currently relay as an explicit
+   `[unsupported message type: …]` marker (no silent drop) — extracting the tapped button/reply title is
+   a §4 follow-up. Empty-text bodies are dropped (never relay a blank turn), mirroring the io.slack peer.
 4. **Outbound** — Graph messages + 429 retries; media out.
 5. **Packaging** — base-nodes.json + Cargo.toml + publish; firstboot degraded boot.
 6. **Live validation** — deploy to the dev hive; boots UNCONFIGURED; then a real webhook round-trip

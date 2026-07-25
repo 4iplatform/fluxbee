@@ -7,9 +7,11 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 fluxbee-sdk.workspace = true
+hmac.workspace = true
 io-common = { path = "../common" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -6,18 +6,27 @@
 //! VAULT_SECRET_CHANGED fast-path wake. Webhook inbound (SY.edge) and Graph API outbound land in later
 //! phases — see docs/io-wapp-design.md.
 
+mod webhook;
+
 use anyhow::Result;
 use fluxbee_sdk::protocol::{
     is_system_kind, Destination, Message as WireMessage, Meta, Routing, MSG_VAULT_SECRET_CHANGED,
     SYSTEM_KIND,
 };
 use fluxbee_sdk::{
-    try_handle_default_node_status, NodeConfig, NodeUuidMode, OperationalRouteProfile, RouteMatch,
-    RouteTarget, RouterDispatcher, VaultCallerOwned, VaultClient, VaultError, FLUXBEE_NODE_NAME_ENV,
+    try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
+    RouteMatch, RouteTarget, RouterDispatcher, VaultCallerOwned, VaultClient, VaultError,
+    FLUXBEE_NODE_NAME_ENV,
 };
+use io_common::identity::{
+    IdentityProvisioner, IdentityResolver, ResolveOrCreateInput, ShmIdentityResolver,
+};
+use io_common::inbound::{InboundConfig, InboundOutcome, InboundProcessor};
 use io_common::io_adapter_config::{
     apply_adapter_config_replace, build_io_adapter_contract_payload, IoAdapterConfigContract,
 };
+use io_common::io_context::wapp_inbound_io_context;
+use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig};
 use io_common::io_control_plane::{
     build_io_config_get_response_payload, build_io_config_response_message,
     build_io_config_set_error_payload, build_io_config_set_ok_payload,
@@ -32,16 +41,25 @@ use io_common::io_control_plane_logging::{
 use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
 use io_common::io_control_plane_store::persist_io_control_plane_state;
 use io_common::io_wapp_adapter_config::IoWappAdapterConfigContract;
+use fluxbee_sdk::payload::TextV1Payload;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
+use webhook::{
+    base64_decode, extract_inbound_messages, verify_webhook_signature, WappInboundMessage,
+    WappMessageKind,
+};
 
 const RPC_CH_SYSTEM: &str = "system";
+const RPC_CH_INBOUND: &str = "inbound";
 const IO_WAPP_VAULT_REFRESH_INTERVAL_SECS: u64 = 60;
 /// Canonical resource_type for the WhatsApp secret in SY.vault (design D4).
 const WAPP_RESOURCE_TYPE: &str = "whatsapp";
+/// The msg_type the edge stamps on fanned-out webhooks (the externalize row's `inbound_family` must
+/// match). Every IO.wapp node subscribes to this family; each self-selects by phone_number_id.
+const IO_WAPP_INBOUND_FAMILY: &str = "io.wapp.inbound.v1";
 
 struct Config {
     node_name: String,
@@ -49,12 +67,24 @@ struct Config {
     router_socket: PathBuf,
     uuid_persistence_dir: PathBuf,
     config_dir: PathBuf,
+    /// Hive of this node (from `<name>@<hive>`) — the SHM identity island.
+    island_id: String,
+    ttl: u32,
+    dedup_ttl_ms: u64,
+    dedup_max_entries: usize,
+    identity_target: String,
+    identity_timeout_ms: u64,
 }
 
 impl Config {
     fn from_env() -> Self {
+        let node_name = env(FLUXBEE_NODE_NAME_ENV).unwrap_or_else(|| "IO.wapp.local".to_string());
+        let island_id = node_name
+            .split_once('@')
+            .map(|(_, hive)| hive.trim().to_string())
+            .filter(|hive| !hive.is_empty())
+            .unwrap_or_else(|| "motherbee".to_string());
         Self {
-            node_name: env(FLUXBEE_NODE_NAME_ENV).unwrap_or_else(|| "IO.wapp.local".to_string()),
             node_version: env("NODE_VERSION").unwrap_or_else(|| "0.1".to_string()),
             router_socket: PathBuf::from(
                 env("ROUTER_SOCKET").unwrap_or_else(|| "/var/run/fluxbee/routers".to_string()),
@@ -64,6 +94,20 @@ impl Config {
                     .unwrap_or_else(|| "/var/lib/fluxbee/state/nodes".to_string()),
             ),
             config_dir: PathBuf::from(env("CONFIG_DIR").unwrap_or_else(|| "/etc/fluxbee".to_string())),
+            ttl: env("IO_WAPP_TTL").and_then(|v| v.parse().ok()).unwrap_or(16),
+            dedup_ttl_ms: env("IO_WAPP_DEDUP_TTL_MS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(600_000),
+            dedup_max_entries: env("IO_WAPP_DEDUP_MAX_ENTRIES")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50_000),
+            identity_target: env("IO_WAPP_IDENTITY_TARGET")
+                .unwrap_or_else(|| format!("SY.identity@{island_id}")),
+            identity_timeout_ms: env("IO_WAPP_IDENTITY_TIMEOUT_MS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10_000),
+            island_id,
+            node_name,
         }
     }
 }
@@ -124,6 +168,11 @@ impl WappClients {
 
     async fn credentials_configured(&self) -> bool {
         self.runtime.read().await.credentials.is_some()
+    }
+
+    /// Snapshot the live credentials (for inbound HMAC verification / outbound). `None` = degraded.
+    async fn credentials(&self) -> Option<WappCredentials> {
+        self.runtime.read().await.credentials.clone()
     }
 
     /// Install credentials; only bumps the generation when they actually CHANGED, so the periodic
@@ -335,6 +384,36 @@ async fn main() -> Result<()> {
         ));
     }
 
+    // Fanout inbound plane (webhooks fanned out by SY.edge). Identity + provisioning mirror io.slack;
+    // media download is deferred (Phase 3 is text + explicit non-text markers), so no blob runtime yet.
+    let identity: Arc<dyn IdentityResolver> = Arc::new(ShmIdentityResolver::new(&config.island_id));
+    let provisioner: Arc<dyn IdentityProvisioner> = Arc::new(FluxbeeIdentityProvisioner::new(
+        dispatcher.clone(),
+        IdentityProvisionConfig {
+            target: config.identity_target.clone(),
+            timeout: Duration::from_millis(config.identity_timeout_ms),
+        },
+    ));
+    let inbound = Arc::new(Mutex::new(InboundProcessor::new(
+        dispatcher.sender_snapshot().uuid().to_string(),
+        InboundConfig {
+            ttl: config.ttl,
+            dedup_ttl: Duration::from_millis(config.dedup_ttl_ms),
+            dedup_max_entries: config.dedup_max_entries,
+            dst_node: None,
+            provision_on_miss: true,
+            blob_runtime: None,
+        },
+    )));
+    tokio::spawn(run_wapp_inbound_loop(
+        dispatcher.clone(),
+        control_plane.clone(),
+        clients.clone(),
+        identity,
+        provisioner,
+        inbound,
+    ));
+
     run_router_control_loop(
         dispatcher,
         config.node_name.clone(),
@@ -350,11 +429,42 @@ async fn main() -> Result<()> {
 fn build_io_wapp_rpc_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::RpcError> {
     OperationalRouteProfile::builder()
         .command_channel(RPC_CH_SYSTEM)
+        .command_channel(RPC_CH_INBOUND)
+        // Control-plane / system traffic.
         .post_pending_rule(
             RouteMatch::any_msg_type(SYSTEM_KIND),
             RouteTarget::Command(RPC_CH_SYSTEM),
         )
+        // Fanned-out webhooks (delivery mode is invisible to the dispatcher — a Broadcast with
+        // meta.target matches on msg_type like any message). meta.msg is None, so match by type.
+        .post_pending_rule(
+            RouteMatch::any_msg_type(IO_WAPP_INBOUND_FAMILY),
+            RouteTarget::Command(RPC_CH_INBOUND),
+        )
         .build()
+}
+
+/// This node's configured business number (`io.phone_number_id`) — the self-select key. `None` while
+/// unconfigured, which parks inbound (nothing to match against).
+fn wapp_phone_number_id(effective: Option<&Value>) -> Option<String> {
+    effective
+        .and_then(|c| c.get("io"))
+        .and_then(|io| io.get("phone_number_id"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+}
+
+/// Where inbound relays (`io.dst_node`); absence → `None` → router resolve (like io.slack / io.api).
+fn extract_runtime_dst_node(effective: Option<&Value>) -> Option<String> {
+    effective
+        .and_then(|c| c.get("io"))
+        .and_then(|io| io.get("dst_node"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -412,6 +522,227 @@ async fn run_router_control_loop(
             sender.send(response).await?;
         }
     }
+}
+
+/// Namespace the WhatsApp customer number by the business number that received the message: two
+/// distinct IO.wapp nodes (two business numbers) messaged by the same customer must resolve to
+/// distinct identities, mirroring io.slack's per-node external_id namespacing (`tenant_hint` is the
+/// same `phone_number_id`, so identity stays bound to its business context).
+fn wapp_external_id(phone_number_id: &str, from_wa_id: &str) -> String {
+    format!("{phone_number_id}:{from_wa_id}")
+}
+
+/// Render an inbound message to relay text. Non-text kinds are relayed as an explicit marker (or their
+/// caption) — NEVER silently dropped; actual media download lands in the media sub-phase.
+fn wapp_message_to_content(kind: &WappMessageKind) -> String {
+    match kind {
+        WappMessageKind::Text { body } => body.clone(),
+        WappMessageKind::Media {
+            media_type,
+            caption,
+            ..
+        } => match caption.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            Some(caption) => format!("{caption}\n[{media_type} attachment]"),
+            None => format!("[{media_type} attachment]"),
+        },
+        WappMessageKind::Other { message_type } => {
+            format!("[unsupported message type: {message_type}]")
+        }
+    }
+}
+
+/// Attach a `raw.wapp` provenance stub (mirrors io.slack's raw stub): the fields downstream needs to
+/// reply and — for media — the `media_id` the media sub-phase will fetch.
+fn attach_wapp_raw_stub(payload: &mut Value, msg: &WappInboundMessage) {
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+    let mut wapp = serde_json::json!({
+        "phone_number_id": msg.phone_number_id,
+        "waba_id": msg.waba_id,
+        "from_wa_id": msg.from_wa_id,
+        "message_id": msg.message_id,
+        "timestamp": msg.timestamp,
+        "profile_name": msg.profile_name,
+    });
+    if let (Some(wapp_obj), WappMessageKind::Media { media_type, media_id, mime_type, .. }) =
+        (wapp.as_object_mut(), &msg.kind)
+    {
+        wapp_obj.insert(
+            "media".to_string(),
+            serde_json::json!({
+                "media_type": media_type,
+                "media_id": media_id,
+                "mime_type": mime_type,
+            }),
+        );
+    }
+    obj.insert("raw".to_string(), serde_json::json!({ "wapp": wapp }));
+}
+
+/// Build the `text/v1` inbound payload for one WhatsApp message. `None` if the content is empty (a text
+/// with a blank body — Meta shouldn't send it, but never hand a downstream AI node an empty turn; this
+/// mirrors io.slack's `build_slack_inbound_payload_from_parts` empty guard) or if serialization fails.
+/// Non-text kinds always render a non-empty marker, so this guard only ever trips on empty text.
+fn build_wapp_inbound_payload(msg: &WappInboundMessage) -> Option<Value> {
+    let content = wapp_message_to_content(&msg.kind);
+    if content.trim().is_empty() {
+        return None;
+    }
+    match TextV1Payload::new(&content, vec![]).to_value() {
+        Ok(mut payload) => {
+            attach_wapp_raw_stub(&mut payload, msg);
+            Some(payload)
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to build base text/v1 inbound payload");
+            None
+        }
+    }
+}
+
+/// Ship (or dedup-drop) one resolved inbound message. Mirrors io.slack: the edge already ACKed Meta
+/// with a fast 200 (Meta will not redeliver), so a router send failure here is a genuine, unrecoverable
+/// LOSS — log it loud with the trace_id, never silently.
+async fn dispatch_inbound_outcome(sender: &NodeSender, outcome: InboundOutcome) {
+    match outcome {
+        InboundOutcome::SendNow(msg) => {
+            let trace_id = msg.routing.trace_id.clone();
+            if let Err(e) = sender.send(msg).await {
+                tracing::error!(
+                    error = ?e, %trace_id,
+                    "LOST inbound message: edge already ACKed Meta (no redelivery) but router send \
+                     failed on a terminal disconnect"
+                );
+            } else {
+                tracing::debug!(%trace_id, "inbound relayed to router");
+            }
+        }
+        InboundOutcome::DroppedDuplicate => {
+            tracing::debug!("dedup hit; dropping inbound");
+        }
+    }
+}
+
+/// The fanout inbound loop. Every IO.wapp node subscribes to the same `IO_WAPP_INBOUND_FAMILY`; the
+/// edge Broadcasts each webhook to all of them. Per message this node: (1) verifies the Meta HMAC with
+/// ITS OWN `app_secret` (default-deny — a degraded node or bad signature drops), (2) self-selects by
+/// `phone_number_id` (the copy for another node's business number is silently skipped — that's the
+/// fanout design, not a drop), then (3) dedup + relay via the shared InboundProcessor.
+async fn run_wapp_inbound_loop(
+    dispatcher: Arc<RouterDispatcher>,
+    control_plane: Arc<RwLock<IoControlPlaneState>>,
+    clients: WappClients,
+    identity: Arc<dyn IdentityResolver>,
+    provisioner: Arc<dyn IdentityProvisioner>,
+    inbound: Arc<Mutex<InboundProcessor>>,
+) -> Result<()> {
+    let mut inbound_rx = dispatcher
+        .take_command_receiver(RPC_CH_INBOUND)
+        .await
+        .map_err(|err| anyhow::anyhow!("io-wapp inbound receiver: {err}"))?;
+
+    while let Some(msg) = inbound_rx.recv().await {
+        let trace_id = msg.routing.trace_id.clone();
+
+        // (1) Live credentials — a degraded node CANNOT verify the HMAC, so it must drop (default-deny).
+        let Some(creds) = clients.credentials().await else {
+            tracing::warn!(%trace_id, "inbound webhook dropped: node degraded (no credentials to verify signature)");
+            continue;
+        };
+
+        // Self-select key + relay target from the VALIDATED effective config.
+        let (my_phone_number_id, dst_node) = {
+            let state = control_plane.read().await;
+            (
+                wapp_phone_number_id(state.effective_config.as_ref()),
+                extract_runtime_dst_node(state.effective_config.as_ref()),
+            )
+        };
+        let Some(my_phone_number_id) = my_phone_number_id else {
+            tracing::warn!(%trace_id, "inbound webhook dropped: no io.phone_number_id configured");
+            continue;
+        };
+
+        // (2) Verify the Meta signature over the EXACT raw bytes, then parse THOSE bytes (never a
+        // re-serialization — the signature covers the wire body verbatim).
+        let raw_b64 = msg.payload.get("raw_body_base64").and_then(|v| v.as_str());
+        let signature = msg.payload.get("signature").and_then(|v| v.as_str());
+        let (Some(raw_b64), Some(signature)) = (raw_b64, signature) else {
+            tracing::warn!(%trace_id, "inbound webhook dropped: missing raw_body_base64 or signature");
+            continue;
+        };
+        let Some(raw_body) = base64_decode(raw_b64) else {
+            tracing::warn!(%trace_id, "inbound webhook dropped: raw_body_base64 not valid base64");
+            continue;
+        };
+        if !verify_webhook_signature(&creds.app_secret, &raw_body, signature) {
+            tracing::warn!(%trace_id, "inbound webhook dropped: signature verification failed (forged, tampered, or wrong app_secret)");
+            continue;
+        }
+        let envelope: Value = match serde_json::from_slice(&raw_body) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%trace_id, error = %error, "inbound webhook dropped: signed body is not valid JSON");
+                continue;
+            }
+        };
+
+        // (3) Self-select + dedup + relay each message addressed to THIS business number.
+        let sender = dispatcher.sender_snapshot();
+        for wapp_msg in extract_inbound_messages(&envelope) {
+            if wapp_msg.phone_number_id != my_phone_number_id {
+                // Not our number — normally a sibling io.wapp node owns this copy (fanout design, not a
+                // drop). But the SAME path also swallows a message whose number matches NO node (an
+                // operator typo in io.phone_number_id, or a Meta-subscribed number with no node yet), so
+                // log at debug — like the io.slack binding-mismatch peer — carrying both ids so raising
+                // the level surfaces the off-by-one instead of black-holing inbound invisibly.
+                tracing::debug!(
+                    %trace_id,
+                    configured_phone_number_id = %my_phone_number_id,
+                    event_phone_number_id = %wapp_msg.phone_number_id,
+                    "dropping inbound WhatsApp message outside this node's phone_number_id"
+                );
+                continue;
+            }
+            let Some(payload) = build_wapp_inbound_payload(&wapp_msg) else {
+                continue;
+            };
+            let io_ctx = wapp_inbound_io_context(
+                &wapp_msg.phone_number_id,
+                &wapp_msg.from_wa_id,
+                &wapp_msg.message_id,
+                wapp_msg.timestamp.as_deref(),
+            );
+            let outcome = inbound
+                .lock()
+                .await
+                .process_inbound(
+                    identity.as_ref(),
+                    Some(provisioner.as_ref()),
+                    ResolveOrCreateInput {
+                        channel: "whatsapp".to_string(),
+                        external_id: wapp_external_id(&wapp_msg.phone_number_id, &wapp_msg.from_wa_id),
+                        src_ilk_override: None,
+                        tenant_id: None,
+                        tenant_hint: Some(wapp_msg.phone_number_id.clone()),
+                        attributes: serde_json::json!({
+                            "phone_number_id": wapp_msg.phone_number_id,
+                            "waba_id": wapp_msg.waba_id,
+                            "profile_name": wapp_msg.profile_name,
+                        }),
+                        ilk_type: Some("human".to_string()),
+                    },
+                    dst_node.clone(),
+                    io_ctx,
+                    payload,
+                )
+                .await;
+            dispatch_inbound_outcome(&sender, outcome).await;
+        }
+    }
+    tracing::warn!("io-wapp inbound channel closed; exiting inbound loop");
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -702,5 +1033,154 @@ mod tests {
         assert!(!c.credentials_configured().await);
         c.clear_credentials().await;
         assert_eq!(c.config_generation().await, 3);
+    }
+
+    #[test]
+    fn phone_number_id_and_dst_node_read_io_block() {
+        let cfg = json!({"io":{"phone_number_id":" 1555 ","dst_node":" WF.router@motherbee "}});
+        assert_eq!(wapp_phone_number_id(Some(&cfg)).as_deref(), Some("1555"));
+        assert_eq!(
+            extract_runtime_dst_node(Some(&cfg)).as_deref(),
+            Some("WF.router@motherbee")
+        );
+        // absence / blank => None (router-resolve for dst_node; parks inbound for phone_number_id)
+        assert_eq!(wapp_phone_number_id(None), None);
+        assert_eq!(extract_runtime_dst_node(Some(&json!({"io":{}}))), None);
+        assert_eq!(wapp_phone_number_id(Some(&json!({"io":{"phone_number_id":"  "}}))), None);
+    }
+
+    #[test]
+    fn external_id_namespaces_customer_by_business_number() {
+        // same customer, two business numbers => two distinct identities
+        assert_eq!(wapp_external_id("111", "573001112222"), "111:573001112222");
+        assert_ne!(
+            wapp_external_id("111", "573001112222"),
+            wapp_external_id("222", "573001112222")
+        );
+    }
+
+    #[test]
+    fn message_to_content_never_drops_non_text() {
+        assert_eq!(
+            wapp_message_to_content(&WappMessageKind::Text { body: "hola".into() }),
+            "hola"
+        );
+        // media with caption => caption + marker; without => marker only
+        assert_eq!(
+            wapp_message_to_content(&WappMessageKind::Media {
+                media_type: "image".into(),
+                media_id: "MID".into(),
+                caption: Some("mira".into()),
+                mime_type: Some("image/jpeg".into()),
+            }),
+            "mira\n[image attachment]"
+        );
+        assert_eq!(
+            wapp_message_to_content(&WappMessageKind::Media {
+                media_type: "document".into(),
+                media_id: "MID".into(),
+                caption: None,
+                mime_type: None,
+            }),
+            "[document attachment]"
+        );
+        // blank caption falls back to the marker (no empty-content relay)
+        assert_eq!(
+            wapp_message_to_content(&WappMessageKind::Media {
+                media_type: "audio".into(),
+                media_id: "MID".into(),
+                caption: Some("   ".into()),
+                mime_type: None,
+            }),
+            "[audio attachment]"
+        );
+        assert_eq!(
+            wapp_message_to_content(&WappMessageKind::Other { message_type: "location".into() }),
+            "[unsupported message type: location]"
+        );
+    }
+
+    #[test]
+    fn inbound_payload_carries_text_and_raw_stub() {
+        let msg = WappInboundMessage {
+            phone_number_id: "111".into(),
+            waba_id: "WABA".into(),
+            from_wa_id: "573001112222".into(),
+            profile_name: Some("Ada".into()),
+            message_id: "wamid.X".into(),
+            timestamp: Some("1700000000".into()),
+            kind: WappMessageKind::Text { body: "hola".into() },
+        };
+        let payload = build_wapp_inbound_payload(&msg).expect("payload");
+        // base text/v1 content preserved
+        assert_eq!(payload["content"], json!("hola"));
+        // provenance stub present with reply fields
+        let wapp = &payload["raw"]["wapp"];
+        assert_eq!(wapp["phone_number_id"], json!("111"));
+        assert_eq!(wapp["from_wa_id"], json!("573001112222"));
+        assert_eq!(wapp["message_id"], json!("wamid.X"));
+        assert_eq!(wapp["profile_name"], json!("Ada"));
+        // text message => no media sub-object
+        assert!(wapp.get("media").is_none());
+    }
+
+    #[test]
+    fn inbound_payload_media_stub_carries_media_id_for_fetch() {
+        let msg = WappInboundMessage {
+            phone_number_id: "111".into(),
+            waba_id: "WABA".into(),
+            from_wa_id: "573001112222".into(),
+            profile_name: None,
+            message_id: "wamid.Y".into(),
+            timestamp: None,
+            kind: WappMessageKind::Media {
+                media_type: "image".into(),
+                media_id: "MID-42".into(),
+                caption: Some("foto".into()),
+                mime_type: Some("image/png".into()),
+            },
+        };
+        let payload = build_wapp_inbound_payload(&msg).expect("payload");
+        assert_eq!(payload["content"], json!("foto\n[image attachment]"));
+        let media = &payload["raw"]["wapp"]["media"];
+        assert_eq!(media["media_id"], json!("MID-42"));
+        assert_eq!(media["media_type"], json!("image"));
+        assert_eq!(media["mime_type"], json!("image/png"));
+    }
+
+    #[test]
+    fn inbound_payload_drops_empty_text_but_keeps_non_text_markers() {
+        let base = |kind| WappInboundMessage {
+            phone_number_id: "111".into(),
+            waba_id: "WABA".into(),
+            from_wa_id: "573001".into(),
+            profile_name: None,
+            message_id: "wamid.Z".into(),
+            timestamp: None,
+            kind,
+        };
+        // empty / whitespace text => no relay (mirrors io.slack empty guard)
+        assert!(build_wapp_inbound_payload(&base(WappMessageKind::Text { body: "".into() })).is_none());
+        assert!(build_wapp_inbound_payload(&base(WappMessageKind::Text { body: "  ".into() })).is_none());
+        // a non-text kind always renders a marker, so it is never dropped by the empty guard
+        assert!(build_wapp_inbound_payload(&base(WappMessageKind::Other {
+            message_type: "location".into()
+        }))
+        .is_some());
+    }
+
+    #[tokio::test]
+    async fn credentials_snapshot_reflects_live_state() {
+        let c = WappClients::new();
+        assert!(c.credentials().await.is_none());
+        let creds = WappCredentials {
+            access_token: "A".into(),
+            app_secret: "S".into(),
+            verify_token: "V".into(),
+        };
+        c.reload_credentials(creds.clone()).await;
+        assert_eq!(c.credentials().await, Some(creds));
+        c.clear_credentials().await;
+        assert!(c.credentials().await.is_none());
     }
 }

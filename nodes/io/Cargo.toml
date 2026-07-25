@@ -21,6 +21,7 @@ async-trait = "0.1"
 axum = { version = "0.7", features = ["multipart"] }
 fluxbee-sdk = { path = "../../crates/fluxbee_sdk" }
 futures-util = "0.3"
+hmac = "0.12"
 nix = { version = "0.28", features = ["fs"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
