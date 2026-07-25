@@ -1,0 +1,141 @@
+{
+  "wf_schema_version": "1",
+  "workflow_type": "router",
+  "description": "Ingress host/specialist router (v0.0.4). Triggered by a text/v1 relay from an IO node (io.wapp/io.api): captures the inbound reply context (meta.context.io) + the originating IO node (meta src) via the engine's event.context/event.src exposure, asks a HOST AI to triage, dynamically escalates to a SPECIALIST AI when the host emits ROUTE_SPECIALIST, and replies the final answer back to the originating IO node (meta.context.io.reply_target round-tripped) so it can deliver to the external customer. Slack echo of every leg is out-of-band via router taps.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "content": { "type": "string", "minLength": 1 }
+    },
+    "required": ["content"]
+  },
+  "initial_state": "asking_host",
+  "terminal_states": ["answered", "escalated_answer", "failed"],
+  "states": [
+    {
+      "name": "asking_host",
+      "description": "Capture the ingress reply context + origin node, send the question to the HOST AI, and await its triage decision.",
+      "entry_actions": [
+        { "type": "set_variable", "name": "reply_ctx", "value": "event.context.io" },
+        { "type": "set_variable", "name": "origin", "value": "event.src" },
+        {
+          "type": "send_message",
+          "target": "AI.host@motherbee",
+          "meta": { "msg": "HOST_TURN", "type": "user" },
+          "payload": { "type": "text", "content": { "$ref": "input.content" } }
+        },
+        { "type": "schedule_timer", "timer_key": "host_timeout", "fire_in": "120s", "missed_policy": "fire" }
+      ],
+      "exit_actions": [ { "type": "cancel_timer", "timer_key": "host_timeout" } ],
+      "transitions": [
+        {
+          "event_match": { "msg": "HOST_TURN" },
+          "guard": "event.payload.type == 'error'",
+          "target_state": "failed",
+          "actions": [ { "type": "set_variable", "name": "failure_reason", "value": "'host_error:' + event.payload.code" } ]
+        },
+        {
+          "event_match": { "msg": "HOST_TURN" },
+          "guard": "event.payload.type == 'text' && event.payload.content.contains('ROUTE_SPECIALIST')",
+          "target_state": "asking_specialist",
+          "actions": [ { "type": "set_variable", "name": "host_reply", "value": "event.payload.content" } ]
+        },
+        {
+          "event_match": { "msg": "HOST_TURN" },
+          "guard": "event.payload.type == 'text'",
+          "target_state": "answered",
+          "actions": [
+            { "type": "set_variable", "name": "final_answer", "value": "event.payload.content" },
+            { "type": "set_variable", "name": "answered_by", "value": "'host'" }
+          ]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.payload.timer_key == 'host_timeout'",
+          "target_state": "failed",
+          "actions": [ { "type": "set_variable", "name": "failure_reason", "value": "'host_timeout'" } ]
+        }
+      ]
+    },
+    {
+      "name": "asking_specialist",
+      "description": "Host escalated (ROUTE_SPECIALIST): route the same question to the SPECIALIST AI and await its answer.",
+      "entry_actions": [
+        {
+          "type": "send_message",
+          "target": "AI.specialist@motherbee",
+          "meta": { "msg": "SPECIALIST_TURN", "type": "user" },
+          "payload": { "type": "text", "content": { "$ref": "input.content" } }
+        },
+        { "type": "schedule_timer", "timer_key": "specialist_timeout", "fire_in": "120s", "missed_policy": "fire" }
+      ],
+      "exit_actions": [ { "type": "cancel_timer", "timer_key": "specialist_timeout" } ],
+      "transitions": [
+        {
+          "event_match": { "msg": "SPECIALIST_TURN" },
+          "guard": "event.payload.type == 'error'",
+          "target_state": "failed",
+          "actions": [ { "type": "set_variable", "name": "failure_reason", "value": "'specialist_error:' + event.payload.code" } ]
+        },
+        {
+          "event_match": { "msg": "SPECIALIST_TURN" },
+          "guard": "event.payload.type == 'text'",
+          "target_state": "escalated_answer",
+          "actions": [
+            { "type": "set_variable", "name": "final_answer", "value": "event.payload.content" },
+            { "type": "set_variable", "name": "answered_by", "value": "'specialist'" }
+          ]
+        },
+        {
+          "event_match": { "msg": "TIMER_FIRED" },
+          "guard": "event.payload.timer_key == 'specialist_timeout'",
+          "target_state": "failed",
+          "actions": [ { "type": "set_variable", "name": "failure_reason", "value": "'specialist_timeout'" } ]
+        }
+      ]
+    },
+    {
+      "name": "answered",
+      "description": "Host answered directly: reply the answer back to the originating IO node so it delivers to the external customer.",
+      "entry_actions": [
+        {
+          "type": "send_message",
+          "target_ref": "state.origin",
+          "meta": {
+            "msg": "CUSTOMER_REPLY",
+            "type": "user",
+            "context": { "io": { "$ref": "state.reply_ctx" } }
+          },
+          "payload": { "type": "text", "content": { "$ref": "state.final_answer" } }
+        }
+      ],
+      "exit_actions": [],
+      "transitions": []
+    },
+    {
+      "name": "escalated_answer",
+      "description": "Specialist answered after host escalation: reply the answer back to the originating IO node.",
+      "entry_actions": [
+        {
+          "type": "send_message",
+          "target_ref": "state.origin",
+          "meta": {
+            "msg": "CUSTOMER_REPLY",
+            "type": "user",
+            "context": { "io": { "$ref": "state.reply_ctx" } }
+          },
+          "payload": { "type": "text", "content": { "$ref": "state.final_answer" } }
+        }
+      ],
+      "exit_actions": [],
+      "transitions": []
+    },
+    {
+      "name": "failed",
+      "description": "A turn errored or timed out.",
+      "entry_actions": [],
+      "exit_actions": [],
+      "transitions": []
+    }
+  ]
+}

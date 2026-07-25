@@ -1206,3 +1206,36 @@ func TestExecSendMessageDynamicTargetRequiresUserTypeAtRuntime(t *testing.T) {
 		t.Fatalf("must not dispatch, got %d", len(disp.sent))
 	}
 }
+
+func TestMessageToMapExposesContextAndSrc(t *testing.T) {
+	src := "IO.wapp.default@motherbee"
+	msg := sdk.Message{
+		Routing: sdk.Routing{TraceID: "trace-x", SrcL2Name: &src},
+		Meta: sdk.Meta{
+			MsgType: "user",
+			Context: json.RawMessage(`{"io":{"reply_target":{"kind":"wapp_post","address":"573001","params":{"phone_number_id":"111"}}}}`),
+		},
+		Payload: json.RawMessage(`{"type":"text","content":"hola"}`),
+	}
+	m := messageToMap(msg)
+	if m["src"] != src {
+		t.Fatalf("src not exposed: %v", m["src"])
+	}
+	ctx, ok := m["context"].(map[string]any)
+	if !ok {
+		t.Fatalf("context not a map: %T", m["context"])
+	}
+	io, _ := ctx["io"].(map[string]any)
+	rt, _ := io["reply_target"].(map[string]any)
+	if rt["kind"] != "wapp_post" {
+		t.Fatalf("reply_target.kind = %v, want wapp_post", rt["kind"])
+	}
+	// Absent src/context => keys omitted (control frames / locally-built messages).
+	bare := messageToMap(sdk.Message{Meta: sdk.Meta{MsgType: "user"}})
+	if _, present := bare["src"]; present {
+		t.Fatalf("src must be omitted when absent")
+	}
+	if _, present := bare["context"]; present {
+		t.Fatalf("context must be omitted when absent")
+	}
+}

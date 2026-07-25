@@ -446,7 +446,15 @@ func matchesEvent(match EventMatch, msg sdk.Message) bool {
 }
 
 // messageToMap converts an sdk.Message to a plain map for use in CEL evaluation
-// and $ref resolution. The map has keys: "msg", "type", "thread_id", "trace_id", "payload".
+// and $ref resolution. The map has keys: "msg", "type", "thread_id", "trace_id",
+// "payload", and — for messages that carry them — "src" (the router-stamped source
+// L2 name) and "context" (the parsed meta.context object).
+//
+// "src" + "context" let a workflow read WHO sent an ingress message and its
+// io_context (channel/conversation/reply_target...) so it can decide routing and
+// reply back to the originating IO node. Both are exposed under the single "event"
+// root (there is no dedicated $ref root for them), and because this one map is what
+// both $ref resolution and CEL evaluation consume, they light up in both at once.
 func messageToMap(msg sdk.Message) map[string]any {
 	m := map[string]any{
 		"trace_id": msg.Routing.TraceID,
@@ -457,6 +465,15 @@ func messageToMap(msg sdk.Message) map[string]any {
 	m["type"] = msg.Meta.MsgType
 	if msg.Meta.ThreadID != nil {
 		m["thread_id"] = *msg.Meta.ThreadID
+	}
+	if src := msg.SourceL2Name(); src != "" {
+		m["src"] = src
+	}
+	if len(msg.Meta.Context) > 0 {
+		var context map[string]any
+		if err := json.Unmarshal(msg.Meta.Context, &context); err == nil {
+			m["context"] = context
+		}
 	}
 	if len(msg.Payload) > 0 {
 		var payload map[string]any
