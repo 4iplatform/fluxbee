@@ -25,8 +25,10 @@ use io_common::inbound::{InboundConfig, InboundOutcome, InboundProcessor};
 use io_common::io_adapter_config::{
     apply_adapter_config_replace, build_io_adapter_contract_payload, IoAdapterConfigContract,
 };
-use io_common::io_context::wapp_inbound_io_context;
+use io_common::io_context::{extract_wapp_post_target, wapp_inbound_io_context};
 use io_common::provision::{FluxbeeIdentityProvisioner, IdentityProvisionConfig};
+use io_common::text_v1_blob::{resolve_text_v1_text_only_for_outbound, IoBlobRuntimeConfig};
+use fluxbee_sdk::blob::BlobToolkit;
 use io_common::io_control_plane::{
     build_io_config_get_response_payload, build_io_config_response_message,
     build_io_config_set_error_payload, build_io_config_set_ok_payload,
@@ -54,9 +56,16 @@ use webhook::{
 
 const RPC_CH_SYSTEM: &str = "system";
 const RPC_CH_INBOUND: &str = "inbound";
+const RPC_CH_OUTBOUND: &str = "outbound";
 const IO_WAPP_VAULT_REFRESH_INTERVAL_SECS: u64 = 60;
 /// Canonical resource_type for the WhatsApp secret in SY.vault (design D4).
 const WAPP_RESOURCE_TYPE: &str = "whatsapp";
+/// Graph API host + default version (design §2/§4). The version is overridable per node via
+/// `io.graph_api_version`; the host is fixed (Meta's only Cloud API endpoint).
+const WAPP_GRAPH_BASE_URL: &str = "https://graph.facebook.com";
+const WAPP_GRAPH_DEFAULT_VERSION: &str = "v20.0";
+/// Outbound HTTP timeout — a hung Graph call must not wedge the outbound loop.
+const WAPP_GRAPH_HTTP_TIMEOUT_SECS: u64 = 30;
 /// The msg_type the edge stamps on fanned-out webhooks (the externalize row's `inbound_family` must
 /// match). Every IO.wapp node subscribes to this family; each self-selects by phone_number_id.
 const IO_WAPP_INBOUND_FAMILY: &str = "io.wapp.inbound.v1";
@@ -150,16 +159,22 @@ struct WappRuntimeState {
 #[derive(Clone)]
 struct WappClients {
     runtime: Arc<RwLock<WappRuntimeState>>,
+    http: reqwest::Client,
 }
 
 impl WappClients {
-    fn new() -> Self {
-        Self {
+    fn new() -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(WAPP_GRAPH_HTTP_TIMEOUT_SECS))
+            .build()
+            .map_err(|err| anyhow::anyhow!("io-wapp HTTP client build failed: {err}"))?;
+        Ok(Self {
             runtime: Arc::new(RwLock::new(WappRuntimeState {
                 credentials: None,
                 config_generation: 0,
             })),
-        }
+            http,
+        })
     }
 
     async fn config_generation(&self) -> u64 {
@@ -196,6 +211,114 @@ impl WappClients {
         guard.credentials = None;
         guard.config_generation = guard.config_generation.wrapping_add(1);
     }
+
+    /// Send a Graph API request with bounded 429 (rate-limit) retries honoring `Retry-After` (mirrors
+    /// io.slack's `slack_send_with_retry`). `build` is re-invoked per attempt so the request (token +
+    /// body) is rebuilt fresh. Only 429 is retried — any other status returns immediately for the caller
+    /// to classify.
+    async fn graph_send_with_retry<F>(&self, api: &str, build: F) -> Result<reqwest::Response>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        const MAX_RETRIES: u32 = 5;
+        let mut attempt: u32 = 0;
+        loop {
+            let response = build().send().await?;
+            if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Ok(response);
+            }
+            attempt += 1;
+            if attempt > MAX_RETRIES {
+                return Err(anyhow::anyhow!(
+                    "{api}: Graph API rate-limited (429) after {MAX_RETRIES} retries"
+                ));
+            }
+            let retry_after = parse_retry_after(response.headers());
+            tracing::warn!(
+                api = %api, attempt, retry_after_secs = retry_after.as_secs(),
+                "Graph API rate-limited (429); backing off"
+            );
+            tokio::time::sleep(retry_after).await;
+        }
+    }
+
+    /// POST a free-form text reply to `graph.facebook.com/<version>/<phone_number_id>/messages` as the
+    /// WhatsApp business number, addressed to the customer `to_wa_id`. Returns the Graph message id on
+    /// success. Degraded (no credentials) or a non-2xx Graph response is an error the caller logs; the
+    /// access_token rides only in the bearer header (never the URL/logs). 24h-window / template handling
+    /// is deferred (D6) — an out-of-window free-form send is rejected by Meta and surfaces as the error.
+    async fn post_text(
+        &self,
+        version: &str,
+        phone_number_id: &str,
+        to_wa_id: &str,
+        text: &str,
+    ) -> Result<String> {
+        let creds = self
+            .credentials()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("io-wapp degraded: no credentials for outbound send"))?;
+        let url = format!("{WAPP_GRAPH_BASE_URL}/{version}/{phone_number_id}/messages");
+        let body = build_wapp_text_message_body(to_wa_id, text);
+        let response = self
+            .graph_send_with_retry("messages", || {
+                self.http
+                    .post(&url)
+                    .bearer_auth(&creds.access_token)
+                    .json(&body)
+            })
+            .await?;
+        let status = response.status();
+        let value: Value = response.json().await.unwrap_or(Value::Null);
+        if !status.is_success() {
+            // Surface Meta's error code + message (no secrets in Graph error bodies), never the request.
+            let err = value.get("error");
+            let code = err.and_then(|e| e.get("code")).cloned().unwrap_or(Value::Null);
+            let message = err
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("<no message>");
+            return Err(anyhow::anyhow!(
+                "Graph send failed: status={status} code={code} message={message}"
+            ));
+        }
+        // Success envelope: { messages: [ { id: "wamid...." } ], ... }
+        let message_id = value
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|m| m.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        Ok(message_id)
+    }
+}
+
+/// Parse a Graph `Retry-After` header (integer seconds) into a bounded backoff, clamped to [1s, 30s];
+/// a missing/garbage header falls back to 1s (mirrors io.slack's `parse_retry_after`).
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Duration {
+    const DEFAULT: Duration = Duration::from_secs(1);
+    const MAX: Duration = Duration::from_secs(30);
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT)
+        .clamp(DEFAULT, MAX)
+}
+
+/// The Graph Cloud API free-form text message body (design §7). `messaging_product:"whatsapp"` +
+/// `recipient_type:"individual"` are required by Meta; `preview_url:false` keeps link previews off.
+fn build_wapp_text_message_body(to_wa_id: &str, text: &str) -> Value {
+    serde_json::json!({
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to_wa_id,
+        "type": "text",
+        "text": { "preview_url": false, "body": text },
+    })
 }
 
 // --- Vault resolution (mirrors io.slack) ---
@@ -344,7 +467,7 @@ async fn main() -> Result<()> {
             IoControlPlaneState::default()
         });
 
-    let clients = WappClients::new();
+    let clients = WappClients::new()?;
 
     // Boot credential resolution: a missing/not-yet-present secret is DEGRADED (a runtime signal), not
     // FAILED_CONFIG — structural config validity was already decided at bootstrap.
@@ -414,6 +537,25 @@ async fn main() -> Result<()> {
         inbound,
     ));
 
+    // Outbound plane (Graph API). Text replies may carry blob-backed content (`content_ref`) resolved
+    // from the shared blob root — honor the family `BLOB_ROOT` env (same var + default as io.slack) so
+    // an operator override applies here too. Media send is deferred, so the toolkit resolves text only.
+    let mut blob_runtime = IoBlobRuntimeConfig::default();
+    if let Some(root) = env("BLOB_ROOT") {
+        blob_runtime.blob_root = PathBuf::from(root);
+    }
+    let blob_toolkit = Arc::new(
+        blob_runtime
+            .build_toolkit()
+            .map_err(|err| anyhow::anyhow!("io-wapp blob toolkit build failed: {err}"))?,
+    );
+    tokio::spawn(run_wapp_outbound_loop(
+        dispatcher.clone(),
+        control_plane.clone(),
+        clients.clone(),
+        blob_toolkit,
+    ));
+
     run_router_control_loop(
         dispatcher,
         config.node_name.clone(),
@@ -430,7 +572,8 @@ fn build_io_wapp_rpc_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::R
     OperationalRouteProfile::builder()
         .command_channel(RPC_CH_SYSTEM)
         .command_channel(RPC_CH_INBOUND)
-        // Control-plane / system traffic.
+        .command_channel(RPC_CH_OUTBOUND)
+        // Control-plane / system traffic (matched first).
         .post_pending_rule(
             RouteMatch::any_msg_type(SYSTEM_KIND),
             RouteTarget::Command(RPC_CH_SYSTEM),
@@ -441,6 +584,10 @@ fn build_io_wapp_rpc_profile() -> Result<OperationalRouteProfile, fluxbee_sdk::R
             RouteMatch::any_msg_type(IO_WAPP_INBOUND_FAMILY),
             RouteTarget::Command(RPC_CH_INBOUND),
         )
+        // Everything else routed back to this node is a reply to relay outbound (msg_type "user",
+        // and any other reply kind). Rules are checked in order, so this catch-all only ever sees
+        // non-system, non-inbound-family traffic — i.e. replies. Mirrors io.slack's catch-all.
+        .post_pending_rule(RouteMatch::Any, RouteTarget::Command(RPC_CH_OUTBOUND))
         .build()
 }
 
@@ -454,6 +601,18 @@ fn wapp_phone_number_id(effective: Option<&Value>) -> Option<String> {
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(ToString::to_string)
+}
+
+/// The Graph API version this node targets (`io.graph_api_version`), pinned-default when unset.
+fn wapp_graph_api_version(effective: Option<&Value>) -> String {
+    effective
+        .and_then(|c| c.get("io"))
+        .and_then(|io| io.get("graph_api_version"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(WAPP_GRAPH_DEFAULT_VERSION)
+        .to_string()
 }
 
 /// Where inbound relays (`io.dst_node`); absence → `None` → router resolve (like io.slack / io.api).
@@ -745,6 +904,99 @@ async fn run_wapp_inbound_loop(
     Ok(())
 }
 
+/// The outbound loop. A reply relayed back to this node (msg_type "user", carrying the round-tripped
+/// `meta.context.io.reply_target` of kind `wapp_post`) is turned into a Graph API text send: address
+/// the customer `to_wa_id` FROM the reply target's `phone_number_id` (falling back to this node's
+/// configured `io.phone_number_id`).
+///
+/// Media send is deferred (phase 4-media), so we resolve ONLY the text (`resolve_text_v1_text_only_*`)
+/// and never resolve/hard-fail on attachment blobs the node would not upload anyway — an unsendable
+/// attachment must not sink a deliverable text reply. A media-ONLY reply (attachments, no text) can't
+/// be delivered yet, so it is surfaced at WARN (not silently dropped).
+async fn run_wapp_outbound_loop(
+    dispatcher: Arc<RouterDispatcher>,
+    control_plane: Arc<RwLock<IoControlPlaneState>>,
+    clients: WappClients,
+    blob_toolkit: Arc<BlobToolkit>,
+) -> Result<()> {
+    let mut outbound_rx = dispatcher
+        .take_command_receiver(RPC_CH_OUTBOUND)
+        .await
+        .map_err(|err| anyhow::anyhow!("io-wapp outbound receiver: {err}"))?;
+
+    while let Some(msg) = outbound_rx.recv().await {
+        let trace_id = msg.routing.trace_id.clone();
+
+        // The reply target (customer wa_id + optional business number) rides in meta.context.
+        let Some(target) = msg.meta.context.as_ref().and_then(extract_wapp_post_target) else {
+            tracing::debug!(%trace_id, "outbound: no wapp_post reply target in meta.context; dropping");
+            continue;
+        };
+
+        // Business number + Graph version from the reply target, falling back to the node's config.
+        let (fallback_pnid, version) = {
+            let state = control_plane.read().await;
+            (
+                wapp_phone_number_id(state.effective_config.as_ref()),
+                wapp_graph_api_version(state.effective_config.as_ref()),
+            )
+        };
+        let Some(phone_number_id) = target.phone_number_id.clone().or(fallback_pnid) else {
+            tracing::warn!(%trace_id, "outbound: no phone_number_id (reply target absent + node unconfigured); dropping");
+            continue;
+        };
+
+        // Resolve ONLY the text (media deferred; attachment blobs are counted, never resolved).
+        let resolved = match resolve_text_v1_text_only_for_outbound(blob_toolkit.as_ref(), &msg.payload, true)
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                tracing::warn!(
+                    %trace_id, code = %err.canonical_code(),
+                    "outbound: failed to resolve text/v1 payload; dropping"
+                );
+                continue;
+            }
+        };
+
+        if resolved.text.trim().is_empty() {
+            if resolved.attachment_count > 0 {
+                // A media-only reply the bot intended to send — we can't yet (media out deferred). Surface
+                // it (WARN, not a silent debug drop) so the gap is visible; do not spam the customer.
+                tracing::warn!(
+                    %trace_id, attachments = resolved.attachment_count,
+                    "outbound: media-only reply not delivered (WhatsApp media send deferred, phase 4-media)"
+                );
+            } else {
+                tracing::debug!(%trace_id, "outbound: empty reply; nothing to send");
+            }
+            continue;
+        }
+
+        if resolved.attachment_count > 0 {
+            tracing::warn!(
+                %trace_id, attachments = resolved.attachment_count,
+                "outbound: WhatsApp media send deferred (phase 4-media); sending text only"
+            );
+        }
+
+        match clients
+            .post_text(&version, &phone_number_id, &target.to_wa_id, &resolved.text)
+            .await
+        {
+            Ok(message_id) => {
+                tracing::debug!(%trace_id, wa_message_id = %message_id, "outbound: WhatsApp message sent")
+            }
+            Err(err) => {
+                tracing::error!(%trace_id, error = %err, "outbound: WhatsApp Graph send failed")
+            }
+        }
+    }
+    tracing::warn!("io-wapp outbound channel closed; exiting outbound loop");
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_io_control_plane_message(
     msg: &WireMessage,
@@ -1014,7 +1266,7 @@ mod tests {
 
     #[tokio::test]
     async fn credentials_generation_is_change_driven_and_delete_aware() {
-        let c = WappClients::new();
+        let c = WappClients::new().expect("http client");
         assert_eq!(c.config_generation().await, 0);
         assert!(!c.credentials_configured().await);
         let creds = WappCredentials { access_token: "A".into(), app_secret: "S".into(), verify_token: "V".into() };
@@ -1169,9 +1421,54 @@ mod tests {
         .is_some());
     }
 
+    #[test]
+    fn graph_api_version_defaults_and_overrides() {
+        assert_eq!(wapp_graph_api_version(None), WAPP_GRAPH_DEFAULT_VERSION);
+        assert_eq!(
+            wapp_graph_api_version(Some(&json!({"io":{"graph_api_version":" v21.0 "}}))),
+            "v21.0"
+        );
+        // blank => pinned default
+        assert_eq!(
+            wapp_graph_api_version(Some(&json!({"io":{"graph_api_version":"  "}}))),
+            WAPP_GRAPH_DEFAULT_VERSION
+        );
+    }
+
+    #[test]
+    fn graph_text_body_matches_meta_contract() {
+        let body = build_wapp_text_message_body("573001112222", "hola mundo");
+        assert_eq!(body["messaging_product"], json!("whatsapp"));
+        assert_eq!(body["recipient_type"], json!("individual"));
+        assert_eq!(body["to"], json!("573001112222"));
+        assert_eq!(body["type"], json!("text"));
+        assert_eq!(body["text"]["body"], json!("hola mundo"));
+        assert_eq!(body["text"]["preview_url"], json!(false));
+    }
+
+    #[test]
+    fn retry_after_parses_clamps_and_defaults() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        let with = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(RETRY_AFTER, HeaderValue::from_str(v).unwrap());
+            parse_retry_after(&h)
+        };
+        // missing header => 1s default
+        assert_eq!(parse_retry_after(&HeaderMap::new()), Duration::from_secs(1));
+        // valid integer seconds
+        assert_eq!(with("5"), Duration::from_secs(5));
+        // clamp high to 30s
+        assert_eq!(with("9000"), Duration::from_secs(30));
+        // clamp low (0) up to 1s
+        assert_eq!(with("0"), Duration::from_secs(1));
+        // garbage (HTTP-date form we don't parse) => 1s default
+        assert_eq!(with("Wed, 21 Oct 2026 07:28:00 GMT"), Duration::from_secs(1));
+    }
+
     #[tokio::test]
     async fn credentials_snapshot_reflects_live_state() {
-        let c = WappClients::new();
+        let c = WappClients::new().expect("http client");
         assert!(c.credentials().await.is_none());
         let creds = WappCredentials {
             access_token: "A".into(),

@@ -225,7 +225,19 @@ Mirror io.slack: inbound → fetch media via Graph media URL (bearer) → `BlobT
    Interactive replies (`button`/`interactive` list/quick-reply) currently relay as an explicit
    `[unsupported message type: …]` marker (no silent drop) — extracting the tapped button/reply title is
    a §4 follow-up. Empty-text bodies are dropped (never relay a blank turn), mirroring the io.slack peer.
-4. **Outbound** — Graph messages + 429 retries; media out.
+4. **Outbound** — Graph messages + 429 retries; media out. ✅ DONE (text; media out deferred):
+   `run_wapp_outbound_loop` consumes replies routed back (msg_type `user`, catch-all route rule →
+   `RPC_CH_OUTBOUND`), reads the round-tripped `meta.context.io.reply_target` (`kind:wapp_post` →
+   `to_wa_id` + `phone_number_id`, falling back to the node's `io.phone_number_id`), resolves ONLY the
+   text (`resolve_text_v1_text_only_for_outbound` over the shared `BLOB_ROOT`; attachment blobs are
+   counted, NOT resolved — a media-deferring node must never let an unsendable attachment sink a
+   deliverable text reply), and POSTs
+   `graph.facebook.com/<io.graph_api_version|v20.0>/<phone_number_id>/messages` with the customer's
+   `access_token` as bearer (never logged/in-URL). 429s retry honoring `Retry-After` (max 5, clamped
+   1–30s), mirroring io.slack. Outbound media is deferred: a text+attachments reply still sends the
+   text; a media-ONLY reply is surfaced at WARN (not silently delivered/dropped). Out-of-24h-window
+   template sends = D6, deferred (Meta rejects → logged). Adversarially reviewed (secret-safety clean;
+   3 findings — text-drop-on-attachment, hardcoded blob_root, media-only log — all fixed at source).
 5. **Packaging** — base-nodes.json + Cargo.toml + publish; firstboot degraded boot. ✅ DONE: io.wapp
    is a `boot: true` runtime in `packaging/base-nodes.json`; firstboot auto-spawns the default instance
    **`IO.wapp.default@motherbee`** (dotted so it matches the fanout family glob `IO.wapp.*@<hive>`; the

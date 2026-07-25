@@ -311,22 +311,7 @@ pub async fn resolve_text_v1_for_outbound(
 
     let text = match (parsed.content.clone(), parsed.content_ref.clone()) {
         (Some(content), None) => content,
-        (None, Some(content_ref)) => {
-            content_ref.validate()?;
-            let path = if use_retry {
-                blob.resolve_with_retry(&content_ref, ResolveRetryConfig::default())
-                    .await?
-            } else {
-                blob.resolve(&content_ref)
-            };
-            let bytes = std::fs::read(&path)
-                .map_err(|err| BlobError::Io(format!("read content_ref file: {err}")))?;
-            String::from_utf8(bytes).map_err(|_| {
-                IoBlobContractError::InvalidTextPayload(
-                    "content_ref is not valid UTF-8 text".to_string(),
-                )
-            })?
-        }
+        (None, Some(content_ref)) => resolve_content_ref_text(blob, &content_ref, use_retry).await?,
         _ => {
             return Err(IoBlobContractError::InvalidTextPayload(
                 "invalid text/v1 payload (content/content_ref)".to_string(),
@@ -351,6 +336,63 @@ pub async fn resolve_text_v1_for_outbound(
     }
 
     Ok(ResolvedTextV1Payload { text, attachments })
+}
+
+/// Resolve a `content_ref` blob to its UTF-8 text (shared by the full and text-only outbound resolvers).
+async fn resolve_content_ref_text(
+    blob: &BlobToolkit,
+    content_ref: &BlobRef,
+    use_retry: bool,
+) -> Result<String, IoBlobContractError> {
+    content_ref.validate()?;
+    let path = if use_retry {
+        blob.resolve_with_retry(content_ref, ResolveRetryConfig::default())
+            .await?
+    } else {
+        blob.resolve(content_ref)
+    };
+    let bytes = std::fs::read(&path)
+        .map_err(|err| BlobError::Io(format!("read content_ref file: {err}")))?;
+    String::from_utf8(bytes).map_err(|_| {
+        IoBlobContractError::InvalidTextPayload("content_ref is not valid UTF-8 text".to_string())
+    })
+}
+
+/// The text-only resolution of a `text/v1` outbound payload: the resolved text plus the COUNT of
+/// attachments (their blobs are deliberately NOT resolved).
+#[derive(Debug, Clone)]
+pub struct ResolvedTextOnlyPayload {
+    pub text: String,
+    pub attachment_count: usize,
+}
+
+/// Resolve ONLY the text of a `text/v1` payload for outbound (inline `content` or a `content_ref`
+/// blob), returning the attachment COUNT without resolving — or hard-failing on — the attachment blobs.
+///
+/// For nodes that DEFER media send (e.g. io.wapp text-only outbound): the full resolver validates
+/// attachment mime/size limits and resolves every attachment blob, so one unsupported-mime or
+/// not-yet-synced attachment makes the whole call fail and sinks a perfectly deliverable text reply.
+/// A media-deferring node never uploads those blobs, so it must not gate its text on them. An empty
+/// inline `content` with attachments yields empty text + a non-zero `attachment_count` (a media-only
+/// reply — the caller decides what to do with it), never an error over the attachments.
+pub async fn resolve_text_v1_text_only_for_outbound(
+    blob: &BlobToolkit,
+    payload: &Value,
+    use_retry: bool,
+) -> Result<ResolvedTextOnlyPayload, IoBlobContractError> {
+    // `from_value` validates content XOR content_ref, so exactly one is Some here.
+    let parsed = TextV1Payload::from_value(payload)?;
+    let text = if let Some(content) = parsed.content.clone() {
+        content
+    } else if let Some(content_ref) = parsed.content_ref.clone() {
+        resolve_content_ref_text(blob, &content_ref, use_retry).await?
+    } else {
+        String::new() // unreachable post-validation; defensive
+    };
+    Ok(ResolvedTextOnlyPayload {
+        text,
+        attachment_count: parsed.attachments.len(),
+    })
 }
 
 fn normalize_mime(value: &str) -> String {
@@ -678,5 +720,44 @@ mod tests {
             .await
             .expect_err("must reject unsupported mime");
         assert!(matches!(err, IoBlobContractError::UnsupportedMime { .. }));
+    }
+
+    #[tokio::test]
+    async fn text_only_preserves_text_despite_unresolvable_attachment() {
+        let (toolkit, _root) = test_toolkit();
+        // content + an attachment whose blob is NOT on disk: the FULL resolver hard-fails
+        // (BLOB_NOT_FOUND), but the text-only resolver must still return the text + the count.
+        let payload = TextV1Payload::new("hola", vec![sample_blob_ref()])
+            .to_value()
+            .expect("payload value");
+        // sanity: the full resolver DOES fail on the missing attachment
+        assert!(resolve_text_v1_for_outbound(
+            &toolkit,
+            &IoTextBlobConfig::default(),
+            &payload,
+            false
+        )
+        .await
+        .is_err());
+        // the text-only resolver does not
+        let resolved = resolve_text_v1_text_only_for_outbound(&toolkit, &payload, false)
+            .await
+            .expect("text-only must not fail on an unresolved attachment");
+        assert_eq!(resolved.text, "hola");
+        assert_eq!(resolved.attachment_count, 1);
+    }
+
+    #[tokio::test]
+    async fn text_only_media_only_yields_empty_text_and_count() {
+        let (toolkit, _root) = test_toolkit();
+        // empty inline content + an attachment = a "media-only" reply: empty text, non-zero count, no error.
+        let payload = TextV1Payload::new("", vec![sample_blob_ref()])
+            .to_value()
+            .expect("payload value");
+        let resolved = resolve_text_v1_text_only_for_outbound(&toolkit, &payload, false)
+            .await
+            .expect("media-only must resolve to empty text, not error");
+        assert!(resolved.text.is_empty());
+        assert_eq!(resolved.attachment_count, 1);
     }
 }

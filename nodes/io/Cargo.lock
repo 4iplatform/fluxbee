@@ -801,6 +801,7 @@ dependencies = [
  "fluxbee-sdk",
  "hmac",
  "io-common",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
