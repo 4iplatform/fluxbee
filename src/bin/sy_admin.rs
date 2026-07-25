@@ -4250,6 +4250,114 @@ async fn handle_externalize(
             .collect::<Vec<String>>()
     });
 
+    // FANOUT variant (IO.wapp, docs/io-wapp-design.md §5): a provider whose single mandatory webhook
+    // must reach a FAMILY of nodes (glob), each verifying + self-selecting. No single channel owner
+    // exists, so the owner-only gate (I8) cannot authorize it — RESTRICTED to the trusted operator
+    // path (caller == None), and created ONCE per provider app. The `ich` is an operator-chosen
+    // opaque URL key (no identity ICH resolve: there is no owning channel to look up).
+    if let Some(fanout_family) = get_str("fanout_family") {
+        if caller_l2_name.is_some() {
+            return Ok(internal_unauthorized(
+                "externalize",
+                "externalize-as-fanout is operator-only (a family has no single channel owner)",
+            ));
+        }
+        if let Err(detail) = validate_fanout_family_glob(&fanout_family) {
+            return Ok(internal_invalid_request("externalize", &detail));
+        }
+        // The provider connection-handshake token (Meta `hub.verify_token`): operator-supplied (the
+        // value they configured in the provider dashboard) or admin-minted (returned so they can paste
+        // it there). Stored in vault OWNED BY THE EDGE; only the ref ships to the edge, which
+        // re-fetches the value at boot/open (mirrors the shared-secret path — never on the edge disk).
+        let verify_token = get_str("verify_token").unwrap_or_else(mint_entry_token);
+        let verify_token_ref = format!("edge_fanout_verify:{ich}");
+        let (status, body) = handle_vault_command(
+            ctx,
+            client,
+            "vault_put",
+            serde_json::json!({
+                "key": verify_token_ref,
+                "value": { "secret": verify_token },
+                "metadata": { "resource_type": "bearer_token", "owner_node": edge_node },
+            }),
+            Some(ctx.hive_id.clone()),
+        )
+        .await?;
+        if status != 200 {
+            return Ok(internal_invalid_request(
+                "externalize",
+                &format!("failed to store fanout verify-token in vault (owner {edge_node}): {body}"),
+            ));
+        }
+        let row = serde_json::json!({
+            "ich": ich,
+            // A fanout row has no single owner; the edge's fanout validation branch ignores this.
+            "owner_l2_name": "",
+            "inbound_family": inbound_family,
+            "auth_mode": "public",
+            "fanout_family": fanout_family,
+            "verify_token_ref": verify_token_ref,
+            // Default: the provider's verification GET + its event POSTs.
+            "methods": methods.clone().unwrap_or_else(|| vec!["GET".to_string(), "POST".to_string()]),
+        });
+        return match send_system_request_with_meta(
+            client,
+            &edge_node,
+            MSG_EDGE_OPEN_URL,
+            MSG_EDGE_OPEN_URL_RESPONSE,
+            row,
+            16,
+            None,
+            None,
+            Some(edge_node.clone()),
+            None,
+            None,
+            Duration::from_secs(15),
+        )
+        .await
+        {
+            Ok(payload) if payload.get("status").and_then(|v| v.as_str()) == Some("ok") => {
+                tracing::info!(
+                    ich = %ich,
+                    fanout_family = %fanout_family,
+                    edge = %edge_node,
+                    "externalize-as-fanout: edge opened URL (ACKed)"
+                );
+                Ok(InternalAdminDispatchResult {
+                    http_status: 200,
+                    envelope: serde_json::json!({
+                        "status": "ok",
+                        "action": "externalize",
+                        "payload": {
+                            "url": format!("/e/{ich}"),
+                            "ich": ich,
+                            "fanout_family": fanout_family,
+                            "edge_node": edge_node,
+                            // The webhook verify-token: the operator configures this exact value in
+                            // the provider dashboard (Meta: hub.verify_token). Minted by admin unless
+                            // supplied.
+                            "verify_token": verify_token,
+                        }
+                    }),
+                })
+            }
+            Ok(payload) => {
+                let err = payload
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("edge rejected open_url");
+                Ok(internal_invalid_request(
+                    "externalize",
+                    &format!("edge did not open fanout URL '{ich}': {err}"),
+                ))
+            }
+            Err(err) => Ok(internal_invalid_request(
+                "externalize",
+                &format!("edge unreachable / open_url failed for fanout '{ich}': {err}"),
+            )),
+        };
+    }
+
     // Resolve ICH -> owner_l2_name from identity SHM, and require the channel to
     // be enabled before it can become public.
     let owner_l2_name =
@@ -5026,6 +5134,29 @@ fn internal_service_error(
 /// URL-safe hex (two v4 UUIDs). Stronger than a caller-chosen secret and safe in a Bearer header.
 fn mint_entry_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+/// A fanout target must be a fully-qualified IO.* L2 GLOB (e.g. `IO.wapp.*@motherbee`): IO.-prefixed
+/// (the frontier only fans to IO nodes, mirroring I1), hive-qualified, and actually a pattern — a
+/// glob-free literal would be a unicast in disguise (use plain externalize for that).
+fn validate_fanout_family_glob(fanout_family: &str) -> Result<(), String> {
+    let value = fanout_family.trim();
+    if !value.starts_with("IO.") {
+        return Err(format!(
+            "fanout_family must target IO.* nodes, got '{value}'"
+        ));
+    }
+    if !value.contains('@') {
+        return Err(format!(
+            "fanout_family must be hive-qualified (e.g. IO.wapp.*@motherbee), got '{value}'"
+        ));
+    }
+    if !value.contains('*') {
+        return Err(format!(
+            "fanout_family must be a glob (contain '*'); for a single node use plain externalize, got '{value}'"
+        ));
+    }
+    Ok(())
 }
 
 fn authorize_channel_command(
@@ -13802,6 +13933,19 @@ fn build_opa_query_response(
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn fanout_family_glob_validation() {
+        // valid: IO.-prefixed, hive-qualified, an actual glob
+        assert!(validate_fanout_family_glob("IO.wapp.*@motherbee").is_ok());
+        assert!(validate_fanout_family_glob(" IO.wapp.*@motherbee ").is_ok());
+        // not IO.* -> rejected (frontier only fans to IO nodes)
+        assert!(validate_fanout_family_glob("AI.wapp.*@motherbee").is_err());
+        // not hive-qualified -> rejected
+        assert!(validate_fanout_family_glob("IO.wapp.*").is_err());
+        // glob-free literal -> rejected (that's a unicast in disguise; use plain externalize)
+        assert!(validate_fanout_family_glob("IO.wapp@motherbee").is_err());
+    }
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::broadcast;
