@@ -290,6 +290,31 @@ install -m0755 packaging/deb-prerm "$DEST/DEBIAN/prerm"
 echo "== [5/5] dpkg-deb =="
 install -d "$ROOT_DIR/dist"
 OUT="$ROOT_DIR/dist/fluxbee_${VERSION}_${ARCH}.deb"
+
+# Preflight: dpkg-deb needs room for the compressed .deb PLUS xz working space next to the ~1GB
+# staged tree. On a full disk it can exit 0 while writing a truncated (data-less) .deb — so refuse
+# to build unless there is comfortable headroom, and fail LOUD (a silent 1806-byte .deb once shipped
+# a "successful" build that could never install). Threshold: staged size + 1 GiB margin.
+DEST_KB="$(du -sk "$DEST" | awk '{print $1}')"
+NEED_KB=$(( DEST_KB + 1048576 ))
+FREE_KB="$(df -Pk "$ROOT_DIR/dist" | awk 'NR==2{print $4}')"
+if [ "$FREE_KB" -lt "$NEED_KB" ]; then
+  echo "ERROR: insufficient disk to build the .deb: need ~$((NEED_KB/1024)) MB free on $(dirname "$OUT"), have $((FREE_KB/1024)) MB." >&2
+  echo "       Free space (old .debs in dist/, cargo target/, /tmp) and retry." >&2
+  exit 1
+fi
+
 dpkg-deb --root-owner-group --build "$DEST" "$OUT"
-echo "built: $OUT"
+
+# Post-build integrity: a healthy fluxbee .deb is ~250 MB with a listable data archive. A tiny .deb
+# (only control.tar, no data.tar) means dpkg-deb was truncated (e.g. ENOSPC swallowed by xz). Catch
+# it here instead of "publishing" a package that installs to nothing.
+OUT_BYTES="$(stat -c %s "$OUT" 2>/dev/null || echo 0)"
+if [ "$OUT_BYTES" -lt $((50 * 1024 * 1024)) ] || ! dpkg-deb -c "$OUT" >/dev/null 2>&1; then
+  echo "ERROR: built .deb is broken (size=${OUT_BYTES} bytes, data archive unreadable) — likely a" >&2
+  echo "       truncated dpkg-deb write (disk full during xz). Removing it; NOT a usable package." >&2
+  rm -f "$OUT"
+  exit 1
+fi
+echo "built: $OUT ($((OUT_BYTES/1024/1024)) MB)"
 dpkg-deb --info "$OUT" | sed -n '1,12p'
