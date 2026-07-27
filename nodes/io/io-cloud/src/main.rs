@@ -123,8 +123,9 @@ async fn main() -> Result<(), DynError> {
     let admin_hive = env_or("IO_CLOUD_ADMIN_HIVE", &hive_id);
     let admin_target = format!("SY.admin@{admin_hive}");
     let cloud_edge_node = env("IO_CLOUD_EDGE_NODE");
+    // Hoisted so run_loop can family-gate the inbound (FIX-16).
+    let inbound_family = env_or("IO_CLOUD_INBOUND_FAMILY", "user");
     if let Some(edge_node) = cloud_edge_node.as_deref() {
-        let inbound_family = env_or("IO_CLOUD_INBOUND_FAMILY", "user");
         // The configured Cloud service token is the alpha trust anchor: edge verifies it before
         // forwarding and strips Authorization at the frontier. There is intentionally no public
         // fallback for this mutation endpoint.
@@ -159,6 +160,7 @@ async fn main() -> Result<(), DynError> {
         cloud_edge_node.as_deref(),
         &dispatcher,
         &admin_target,
+        &inbound_family,
         &mut incoming,
     )
     .await
@@ -383,6 +385,7 @@ async fn run_loop(
     cloud_edge_node: Option<&str>,
     dispatcher: &Arc<RouterDispatcher>,
     admin_target: &str,
+    inbound_family: &str,
     incoming: &mut RpcCommandReceiver,
 ) -> Result<(), DynError> {
     loop {
@@ -403,6 +406,20 @@ async fn run_loop(
                 trace_id = %msg.routing.trace_id,
                 src_l2_name = ?msg.routing.src_l2_name,
                 "IO.cloud ignored a non-edge mesh message"
+            );
+            continue;
+        }
+
+        // FIX-16: family gate (mirrors io.api main.rs:386). The channel is registered under
+        // `inbound_family`; the edge forwards legitimate requests stamped with that family, so a
+        // frame of any other msg_type is not a Cloud request — skip it. Defense-in-depth on the
+        // inbound, on top of the src_l2_name + ich checks above.
+        if !msg.meta.msg_type.eq_ignore_ascii_case(inbound_family) {
+            tracing::debug!(
+                trace_id = %msg.routing.trace_id,
+                msg_type = %msg.meta.msg_type,
+                expected = %inbound_family,
+                "IO.cloud skipped a frame whose msg_type != configured inbound_family"
             );
             continue;
         }
@@ -557,7 +574,9 @@ fn copy_optional_field(
 
 /// Pure translation of a Cloud op into the admin `(action, params)`, injecting the tenant claim.
 /// Returns `Err(error_payload)` for a missing/unknown op or a missing tenant. Kept pure (no admin
-/// call) so it is unit-testable; the ops mirror IO_CLOUD_EXPOSED_ACTIONS (admin's single source).
+/// call) so it is unit-testable; the op→action pairs are pinned to the shared source
+/// `fluxbee_sdk::cloud::CLOUD_OP_ACTIONS` (which SY.admin's relay allowlist also derives from) by
+/// `translate_cloud_op_actions_match_the_shared_sdk_vocabulary`.
 fn translate_cloud_op(
     op: &str,
     tenant_id: Option<&str>,
@@ -673,6 +692,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn translate_cloud_op_actions_match_the_shared_sdk_vocabulary() {
+        // FIX-12: io.cloud's op→action translation must agree with the single source in
+        // fluxbee_sdk::cloud (which SY.admin's relay gate also derives from). Every exposed op maps
+        // to its shared action, and every produced action is in the enforced allowlist.
+        use fluxbee_sdk::cloud::{
+            admin_action_for_cloud_op, cloud_exposed_actions, CLOUD_OP_ACTIONS,
+        };
+        let tenant = "tnt:11111111-1111-4111-8111-111111111111";
+        // Superset of every exposed op's required params, so one loop body drives all three.
+        let params = json!({
+            "name": "acme",
+            "key": "k", "value": {"t": "1"}, "resource_type": "bearer_token",
+            "node_name": "IO.wapp@motherbee",
+        });
+        for (op, expected_action) in CLOUD_OP_ACTIONS {
+            let (action, _) = translate_cloud_op(op, Some(tenant), &params)
+                .unwrap_or_else(|e| panic!("op {op} should translate: {e:?}"));
+            assert_eq!(&action, expected_action, "op {op} action drift");
+            assert_eq!(admin_action_for_cloud_op(op), Some(action));
+            assert!(cloud_exposed_actions().contains(&action), "action {action} not exposed");
+        }
+        // An op outside the vocabulary is rejected, not silently relayed.
+        assert!(translate_cloud_op("kill_node", Some(tenant), &params).is_err());
+    }
+
+    #[test]
     fn translate_put_token_injects_tenant_and_builds_vault_put() {
         let params = json!({
             "key": "wapp_token:acme",
@@ -784,8 +829,8 @@ mod tests {
 /// Translate a Cloud request (`{op, tenant_id, params}`) into the matching ADMIN_COMMAND and
 /// return the response payload. IO.cloud is the internal Fluxbee Cloud relay (spec §3): it injects
 /// the (trusted for the MVP — §1.2) tenant claim into each admin call and relays over the same
-/// `send_admin_rpc` seam it already uses for externalize. The ops mirror IO_CLOUD_EXPOSED_ACTIONS
-/// (SY.admin's single source):
+/// `send_admin_rpc` seam it already uses for externalize. The op→action pairs come from the shared
+/// `fluxbee_sdk::cloud::CLOUD_OP_ACTIONS` (SY.admin's relay allowlist derives from the same table):
 ///   create_tenant   -> create_tenant (Cloud-created tenants default to active)
 ///   put_token       -> vault_put     (store a provider token in the tenant pool or for one IO node)
 ///   provision_node  -> run_node      (spawn IO.<provider>@<tenant>; requires tenant_id)

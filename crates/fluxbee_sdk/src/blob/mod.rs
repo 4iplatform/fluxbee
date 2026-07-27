@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -119,11 +120,16 @@ pub struct BlobStat {
     pub path: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BlobGcOptions {
     pub staging_ttl_hours: u64,
     pub active_retain_days: u64,
     pub apply: bool,
+    /// Active blob_names that a live publication still references and must NOT be reaped, even past
+    /// the mtime cutoff (FIX-10). The GC is blind to the io.blob publication ledger — it lives in a
+    /// different subtree — so the caller supplies the pin set (see [`published_blob_names`]). Empty =
+    /// legacy mtime-only behavior.
+    pub pinned_blob_names: HashSet<String>,
 }
 
 impl Default for BlobGcOptions {
@@ -132,6 +138,7 @@ impl Default for BlobGcOptions {
             staging_ttl_hours: BLOB_STAGING_TTL_HOURS,
             active_retain_days: BLOB_ACTIVE_RETAIN_DAYS,
             apply: false,
+            pinned_blob_names: HashSet::new(),
         }
     }
 }
@@ -144,6 +151,9 @@ pub struct BlobGcPassReport {
     pub deleted_files: u64,
     pub deleted_bytes: u64,
     pub skipped_non_blob_files: u64,
+    /// Active blobs left in place because a live publication pins them (FIX-10).
+    #[serde(default)]
+    pub pinned_skipped_files: u64,
     pub errors: Vec<String>,
 }
 
@@ -688,6 +698,7 @@ impl BlobToolkit {
                 options.active_retain_days,
                 options.apply,
                 now,
+                &options.pinned_blob_names,
             )?;
             Ok(BlobGcReport {
                 apply: options.apply,
@@ -717,7 +728,12 @@ impl BlobToolkit {
         retain_days: u64,
         apply: bool,
     ) -> Result<BlobGcPassReport, BlobError> {
-        self.gc_active_by_spool_day_with_now(retain_days, apply, std::time::SystemTime::now())
+        self.gc_active_by_spool_day_with_now(
+            retain_days,
+            apply,
+            std::time::SystemTime::now(),
+            &HashSet::new(),
+        )
     }
 
     fn cleanup_staging_orphans_with_now(
@@ -828,6 +844,7 @@ impl BlobToolkit {
         retain_days: u64,
         apply: bool,
         now: std::time::SystemTime,
+        pinned_blob_names: &HashSet<String>,
     ) -> Result<BlobGcPassReport, BlobError> {
         let mut report = BlobGcPassReport {
             apply,
@@ -877,6 +894,13 @@ impl BlobToolkit {
                 };
                 if validate_blob_name(filename).is_err() {
                     report.skipped_non_blob_files = report.skipped_non_blob_files.saturating_add(1);
+                    continue;
+                }
+
+                // FIX-10: never reap a blob a live publication still references (needed for
+                // verify_or_repair), regardless of mtime.
+                if pinned_blob_names.contains(filename) {
+                    report.pinned_skipped_files = report.pinned_skipped_files.saturating_add(1);
                     continue;
                 }
 
@@ -970,9 +994,27 @@ impl BlobToolkit {
         ensure_dir_mode_0750(&staging_dir)?;
         let staging_path = staging_dir.join(&blob_name);
 
-        let mime = mime_override
+        // FIX-8: io.blob is the integrity authority, so it must not blindly trust the producer's
+        // declared type for the case that actually matters when a blob is served to the public web —
+        // ACTIVE content (HTML/SVG/JS) mislabeled as something inert, which would dodge the serve-time
+        // HTML sandbox. Sniff the bytes: if they are active content but the declared type is inert,
+        // the sniffed (dangerous) type wins so the serve layer sandboxes it. Non-active types keep
+        // their specific declaration (e.g. docx, which is a zip container — never downgraded here).
+        let declared_mime = mime_override
             .map(str::to_string)
             .unwrap_or_else(|| guess_mime(&filename_original, &ext));
+        let mime = match sniff_active_content(data) {
+            Some(active) if !mime_is_active(&declared_mime) => {
+                tracing::warn!(
+                    declared = %declared_mime,
+                    sniffed = %active,
+                    blob = %blob_name,
+                    "blob bytes are active content mislabeled as inert; overriding content-type so it is served sandboxed"
+                );
+                active.to_string()
+            }
+            _ => declared_mime,
+        };
         let spool_day = Utc::now().format("%F").to_string();
         let blob_ref = BlobRef {
             ref_type: "blob_ref".to_string(),
@@ -1294,6 +1336,80 @@ fn guess_mime(filename_original: &str, ext: &str) -> String {
         })
 }
 
+/// Whether a declared MIME already denotes browser-active content (would be sandboxed at serve time),
+/// so byte-sniffing has nothing to correct.
+fn mime_is_active(mime: &str) -> bool {
+    let m = mime.trim().to_ascii_lowercase();
+    m.starts_with("text/html")
+        || m.starts_with("application/xhtml")
+        || m.starts_with("image/svg")
+        || m == "application/xml"
+        || m == "text/xml"
+}
+
+/// Sniff the leading bytes for browser-ACTIVE content (HTML / SVG) regardless of the producer's
+/// declared type. Returns the canonical active MIME to force, or `None` when the bytes do not look
+/// like active markup. Matching is START-ANCHORED (after a BOM + leading whitespace): a real HTML/SVG
+/// document served as an inert type opens with its tag and is caught, but a legitimate JSON / RSS /
+/// CSV / log that merely CONTAINS a `<script>`/`<html>` substring mid-content is NOT reclassified —
+/// only truly document-shaped active content is over-sandboxed (which is safe). Non-markup binaries
+/// (png, pdf, docx=zip, ...) return `None` and keep their declared type.
+fn sniff_active_content(data: &[u8]) -> Option<&'static str> {
+    // Skip a leading UTF-8 BOM and ASCII whitespace, then look only at a bounded window.
+    let start = if data.starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
+    let window = &data[start..data.len().min(start + 512)];
+    let head: String = window
+        .iter()
+        .map(|&b| b as char)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let trimmed = head.trim_start();
+    if trimmed.starts_with("<svg") || (trimmed.starts_with("<?xml") && head.contains("<svg")) {
+        return Some("image/svg+xml");
+    }
+    const HTML_MARKERS: &[&str] = &[
+        "<!doctype html",
+        "<html",
+        "<head",
+        "<body",
+        "<script",
+        "<iframe",
+    ];
+    // Start-anchored: only content whose first non-whitespace bytes ARE an active-markup tag is
+    // reclassified, so incidental HTML fragments inside legitimate JSON/XML/text are left untouched.
+    if HTML_MARKERS.iter().any(|marker| trimmed.starts_with(marker)) {
+        return Some("text/html");
+    }
+    None
+}
+
+/// Read the set of active `blob_name`s referenced by io.blob's publication ledger (a JSON file at
+/// `ledger_path`), for use as [`BlobGcOptions::pinned_blob_names`] so active GC never reaps a blob a
+/// live publication still needs (FIX-10). Tolerant by design: a missing or malformed ledger yields an
+/// empty set (GC degrades to legacy mtime-only, never crashes). Parsed generically (not against
+/// io.blob's private structs) so the SDK stays decoupled from io.blob's ledger type.
+pub fn published_blob_names(ledger_path: &Path) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let Ok(raw) = std::fs::read(ledger_path) else {
+        return names;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+        return names;
+    };
+    if let Some(publications) = value.get("publications").and_then(|v| v.as_object()) {
+        for record in publications.values() {
+            if let Some(name) = record
+                .get("blob_ref")
+                .and_then(|blob_ref| blob_ref.get("blob_name"))
+                .and_then(|n| n.as_str())
+            {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1302,6 +1418,76 @@ mod tests {
     use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
     static TEST_SEQ: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn sniff_detects_active_content_and_ignores_inert_binaries() {
+        assert_eq!(sniff_active_content(b"<!DOCTYPE html><html>"), Some("text/html"));
+        assert_eq!(sniff_active_content(b"   \n<html><body>hi"), Some("text/html"));
+        assert_eq!(
+            sniff_active_content(b"<script>alert(1)</script>"),
+            Some("text/html")
+        );
+        assert_eq!(
+            sniff_active_content(b"<svg xmlns='...'><script/></svg>"),
+            Some("image/svg+xml")
+        );
+        // BOM-prefixed html is still caught.
+        assert_eq!(
+            sniff_active_content(b"\xEF\xBB\xBF<html>"),
+            Some("text/html")
+        );
+        // Inert / binary content is left alone.
+        assert_eq!(sniff_active_content(b"just some plain text"), None);
+        assert_eq!(sniff_active_content(b"\x89PNG\r\n\x1a\n"), None);
+        assert_eq!(sniff_active_content(b"PK\x03\x04docx-is-a-zip"), None);
+        // R6: legitimate structured text that merely CONTAINS an HTML tag mid-content is NOT flipped
+        // (start-anchored) — its declared type (application/json, rss, ...) is preserved.
+        assert_eq!(
+            sniff_active_content(br#"{"tmpl":"<html><body>{{x}}</body>"}"#),
+            None
+        );
+        assert_eq!(
+            sniff_active_content(b"<?xml version='1.0'?><rss><item><description><script>x</script></description></item></rss>"),
+            None
+        );
+    }
+
+    #[test]
+    fn published_blob_names_reads_ledger_and_tolerates_garbage() {
+        let dir = std::env::temp_dir().join(format!(
+            "blob-ledger-test-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger = dir.join("publications.json");
+        // Missing ledger -> empty (GC degrades to mtime-only), never panics.
+        assert!(published_blob_names(&ledger).is_empty());
+        std::fs::write(
+            &ledger,
+            r#"{"schema_version":1,"publications":{
+                "p1":{"blob_ref":{"blob_name":"doc_abcd1234.pdf"}},
+                "p2":{"blob_ref":{"blob_name":"img_ef567890.png"}}
+            }}"#,
+        )
+        .unwrap();
+        let names = published_blob_names(&ledger);
+        assert_eq!(names.len(), 2);
+        assert!(names.contains("doc_abcd1234.pdf"));
+        assert!(names.contains("img_ef567890.png"));
+        // Malformed JSON -> empty, no crash.
+        std::fs::write(&ledger, b"not json{{").unwrap();
+        assert!(published_blob_names(&ledger).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mime_is_active_recognizes_sandboxed_types() {
+        assert!(mime_is_active("text/html; charset=utf-8"));
+        assert!(mime_is_active("image/svg+xml"));
+        assert!(!mime_is_active("text/plain"));
+        assert!(!mime_is_active("application/pdf"));
+    }
 
     struct TestRoot {
         path: PathBuf,
@@ -1726,14 +1912,23 @@ mod tests {
             .checked_add(Duration::from_secs(1))
             .expect("advance now");
         let dry_run = toolkit
-            .gc_active_by_spool_day_with_now(0, false, now)
+            .gc_active_by_spool_day_with_now(0, false, now, &HashSet::new())
             .expect("active gc dry-run");
         assert_eq!(dry_run.candidate_files, 1);
         assert_eq!(dry_run.deleted_files, 0);
         assert!(active_file.exists());
 
+        // FIX-10: pinning the blob keeps it even past the mtime cutoff.
+        let pinned: HashSet<String> = std::iter::once(blob_ref.blob_name.clone()).collect();
+        let pinned_run = toolkit
+            .gc_active_by_spool_day_with_now(0, true, now, &pinned)
+            .expect("active gc pinned");
+        assert_eq!(pinned_run.candidate_files, 0);
+        assert_eq!(pinned_run.pinned_skipped_files, 1);
+        assert!(active_file.exists(), "a pinned blob must not be reaped");
+
         let apply = toolkit
-            .gc_active_by_spool_day_with_now(0, true, now)
+            .gc_active_by_spool_day_with_now(0, true, now, &HashSet::new())
             .expect("active gc apply");
         assert_eq!(apply.candidate_files, 1);
         assert_eq!(apply.deleted_files, 1);

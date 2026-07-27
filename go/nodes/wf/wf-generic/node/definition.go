@@ -9,6 +9,8 @@ import (
 const (
 	workflowSchemaVersion = wfcel.WorkflowSchemaVersion
 	minTimerDuration      = wfcel.MinTimerDuration
+	OnErrorContinue       = wfcel.OnErrorContinue
+	OnErrorFail           = wfcel.OnErrorFail
 )
 
 type WorkflowDefinition = wfcel.WorkflowDefinition
@@ -44,4 +46,8 @@ func parseWorkflowDuration(value string) (time.Duration, error) {
 
 func isValidL2Name(value string) bool {
 	return wfcel.IsValidL2Name(value)
+}
+
+func isForbiddenSystemTarget(value string) bool {
+	return wfcel.IsForbiddenSystemTarget(value)
 }

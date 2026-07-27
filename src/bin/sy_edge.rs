@@ -19,7 +19,7 @@ use fluxbee_sdk::protocol::{
     MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
     MSG_EDGE_PUBLISH_BLOB, MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB,
     is_system_kind, MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_TTL_EXCEEDED, MSG_UNREACHABLE,
-    SYSTEM_KIND,
+    MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, is_node_config_get_message, is_node_config_set_message,
@@ -315,6 +315,42 @@ async fn main() -> Result<(), SyEdgeError> {
         }
     }
 
+    // FIX-6 (part 2): active reaper. Part 1 drops expired public-artifact rows at LOAD; this
+    // periodically prunes them from the live registry AND persists the pruned ledger, so a
+    // long-lived edge doesn't accumulate expired rows (bounds the served set + on-disk ledger).
+    // On a non-ingress edge the registry is empty, so this is a cheap no-op.
+    {
+        let reaper_registry = Arc::clone(&public_registry);
+        let reaper_path = config.publications_path.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(600));
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let snapshot = {
+                    let mut guard = match reaper_registry.write() {
+                        Ok(guard) => guard,
+                        Err(_) => continue,
+                    };
+                    let before = guard.len();
+                    guard.retain(|_, row| row.expires_at > now);
+                    if guard.len() == before {
+                        continue; // nothing expired
+                    }
+                    tracing::info!(removed = before - guard.len(), "sy-edge reaper: dropped expired public artifacts");
+                    guard.clone()
+                };
+                if let Err(err) = persist_public_registry(&reaper_path, &snapshot) {
+                    tracing::warn!(error = %err, "sy-edge reaper: persist pruned ledger failed");
+                }
+            }
+        });
+    }
+
     // System channel: default node status + the URL-service command plane. Opening or
     // closing a public URL is a VERIFIED SERVICE DIRECTIVE from SY.admin, delivered as an
     // addressed request/response (`EDGE_OPEN_URL` / `EDGE_CLOSE_URL`, §7) — NOT a config
@@ -380,6 +416,40 @@ async fn main() -> Result<(), SyEdgeError> {
                     config.ttl,
                 )
                 .await;
+                continue;
+            }
+            Some(MSG_VAULT_SECRET_CHANGED) => {
+                // FIX-3: a degraded-vault edge boot leaves shared-secret channels with secret=None;
+                // resolve_secrets runs only at boot + post-EDGE_OPEN_URL, so when the vault later
+                // publishes the secret the edge never re-resolved and /e/<ich> 401'd indefinitely
+                // while io.api still reported "published". Re-resolve on the broadcast (previously
+                // dropped as unhandled). Fail-closed origin check: only THE VAULT THIS EDGE USES may
+                // trigger it — src_l2_name is router-stamped. The edge's vault lives at
+                // `config.vault_hive` (typically motherbee), NOT the edge's own (ingress) hive; the
+                // vault broadcasts with src=None so the router stamps it `SY.vault@<vault_hive>`.
+                // Comparing against the edge's OWN hive would reject it in the real multi-hive DMZ.
+                let vault_hive = config.vault_hive.trim();
+                let expected = format!("SY.vault@{vault_hive}");
+                match msg.routing.src_l2_name.as_deref().map(str::trim) {
+                    Some(origin) if !vault_hive.is_empty() && origin == expected => {
+                        tracing::info!(origin = %origin, "sy-edge: VAULT_SECRET_CHANGED — re-resolving channel secrets");
+                        resolve_secrets(
+                            &dispatcher,
+                            &self_ilk,
+                            &self_name,
+                            &config.vault_hive,
+                            &registry,
+                        )
+                        .await;
+                    }
+                    other => {
+                        tracing::warn!(
+                            src_l2_name = %other.unwrap_or("<none>"),
+                            expected = %expected,
+                            "sy-edge: VAULT_SECRET_CHANGED from a non-vault / cross-hive origin; ignoring"
+                        );
+                    }
+                }
                 continue;
             }
             _ => {}
@@ -851,10 +921,28 @@ fn load_public_registry(path: &std::path::Path) -> HashMap<String, PublicArtifac
             return HashMap::new();
         }
     };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     parsed
         .publications
         .into_iter()
         .filter(|row| validate_public_artifact_row(row).is_ok())
+        .filter(|row| {
+            // FIX-6: drop already-expired rows at load. They are un-servable (the serve path
+            // rejects expires_at <= now) but were previously re-residented into the registry on
+            // EVERY restart, growing it unbounded and pinning the referenced public/ bytes. NOTE:
+            // this bounds the in-memory registry; an active reaper that also deletes the public/
+            // bytes + prunes the on-disk ledger via the unpublish/MSG_BLOB_RELEASE path is the
+            // complementary follow-up (part 2).
+            if row.expires_at <= now {
+                tracing::info!(key = %row.key, "sy-edge: dropping expired public artifact row at load");
+                false
+            } else {
+                true
+            }
+        })
         .map(|row| (row.key.clone(), row))
         .collect()
 }
@@ -899,18 +987,40 @@ fn validate_endpoint_row_for_open(row: &EndpointRow) -> Result<(), String> {
     if row.ich.trim().is_empty() {
         return Err("ich must not be empty".to_string());
     }
-    let owner = row.owner_l2_name.trim();
-    if owner.is_empty() || !owner.starts_with("IO.") || !owner.contains('@') {
-        return Err(format!(
-            "owner_l2_name must be a fully-qualified IO.* node, got '{owner}'"
-        ));
-    }
     let family = row.inbound_family.trim();
     if family.is_empty() {
         return Err("inbound_family must not be empty".to_string());
     }
     if family.eq_ignore_ascii_case(SYSTEM_KIND) {
         return Err("inbound_family must not be system".to_string());
+    }
+    // A FANOUT row targets an IO.* family GLOB (no single owner); it needs a verify-token for the
+    // connection-handshake challenge (or a ref to fetch it). auth is Public (the provider sends no
+    // bearer; per-message auth is the downstream HMAC), so there is no secret requirement here.
+    if let Some(fanout) = row
+        .fanout_family
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !fanout.starts_with("IO.") || !fanout.contains('@') {
+            return Err(format!(
+                "fanout_family must be a fully-qualified IO.* glob, got '{fanout}'"
+            ));
+        }
+        if !non_empty_str(row.verify_token.as_deref())
+            && !non_empty_str(row.verify_token_ref.as_deref())
+        {
+            return Err("fanout endpoints require verify_token or verify_token_ref".to_string());
+        }
+        return Ok(());
+    }
+    // Ordinary unicast row: a single fully-qualified IO.* owner.
+    let owner = row.owner_l2_name.trim();
+    if owner.is_empty() || !owner.starts_with("IO.") || !owner.contains('@') {
+        return Err(format!(
+            "owner_l2_name must be a fully-qualified IO.* node, got '{owner}'"
+        ));
     }
     if row.auth_mode == AuthMode::SharedSecret
         && !non_empty_str(row.secret.as_deref())
@@ -1235,6 +1345,19 @@ struct EndpointRow {
     methods: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tenant_id: Option<String>,
+    /// FANOUT endpoint (IO.wapp): instead of forwarding to a single `owner_l2_name`, the edge acks the
+    /// external caller immediately and BROADCASTs the request to every node matching this L2 glob
+    /// (e.g. `IO.wapp.*@motherbee`), which each verify + self-select. `None` = ordinary unicast row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fanout_family: Option<String>,
+    /// The resolved webhook verify-token VALUE (RAM only, NEVER persisted — like `secret`). Used to
+    /// answer a provider's connection-handshake challenge (WhatsApp GET `hub.challenge`) AT the edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verify_token: Option<String>,
+    /// Vault key of the verify-token (persisted — just a name). At boot/open the edge re-fetches the
+    /// VALUE into `verify_token`, so it never touches disk (mirrors `secret_ref`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verify_token_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1264,6 +1387,12 @@ struct EndpointEntry {
     methods: Option<Vec<String>>,
     #[allow(dead_code)]
     tenant_id: Option<String>,
+    /// Fanout L2 glob (e.g. `IO.wapp.*@motherbee`); `Some` = this is a fanout endpoint.
+    fanout_family: Option<String>,
+    /// Resolved verify-token VALUE (RAM only) for the connection-handshake challenge.
+    verify_token: Option<String>,
+    /// Vault key to (re-)fetch `verify_token` from — the durable, disk-safe form.
+    verify_token_ref: Option<String>,
 }
 
 /// Index the rows by `ICH` (the URL key). No `ilk` anywhere — the edge is outside
@@ -1291,6 +1420,15 @@ fn row_to_entry(row: EndpointRow) -> (String, EndpointEntry) {
                 .tenant_id
                 .map(|tenant_id| tenant_id.trim().to_string())
                 .filter(|tenant_id| !tenant_id.is_empty()),
+            fanout_family: row
+                .fanout_family
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            verify_token: row.verify_token,
+            verify_token_ref: row
+                .verify_token_ref
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
         },
     )
 }
@@ -1343,6 +1481,9 @@ fn registry_to_persisted_rows(reg: &HashMap<String, EndpointEntry>) -> Vec<Endpo
             secret_ref: e.secret_ref.clone(), // persist the vault REF (just a name)
             methods: e.methods.clone(),
             tenant_id: e.tenant_id.clone(),
+            fanout_family: e.fanout_family.clone(),
+            verify_token: None, // NEVER persist the verify-token VALUE (RAM only, like secret)
+            verify_token_ref: e.verify_token_ref.clone(), // persist just the vault ref
         })
         .collect();
     // Stable order so the file diffs cleanly and the write is deterministic.
@@ -1530,7 +1671,17 @@ async fn resolve_secrets(
             .collect(),
         Err(_) => return,
     };
-    if pending.is_empty() {
+    // Fanout endpoints carry a verify_token_ref (and usually no secret_ref), resolved the same way.
+    let pending_verify: Vec<(String, String)> = match registry.read() {
+        Ok(guard) => guard
+            .iter()
+            .filter(|(_, e)| e.verify_token.is_none() && e.verify_token_ref.is_some())
+            .map(|(ich, e)| (ich.clone(), e.verify_token_ref.clone().unwrap_or_default()))
+            .filter(|(_, r)| !r.is_empty())
+            .collect(),
+        Err(_) => return,
+    };
+    if pending.is_empty() && pending_verify.is_empty() {
         return;
     }
     let client = fluxbee_sdk::VaultClient::new(
@@ -1563,6 +1714,34 @@ async fn resolve_secrets(
             }
             Err(err) => {
                 tracing::warn!(ich = %ich, secret_ref = %secret_ref, error = %err, "sy-edge could not fetch channel secret from vault (channel rejects until resolved)")
+            }
+        }
+    }
+    for (ich, verify_ref) in pending_verify {
+        match client.get(&verify_ref, Duration::from_secs(15)).await {
+            Ok(resp) => {
+                let token = resp
+                    .value
+                    .as_ref()
+                    .and_then(|v| v.get("secret"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                match token {
+                    Some(token) => {
+                        if let Ok(mut guard) = registry.write() {
+                            if let Some(entry) = guard.get_mut(&ich) {
+                                entry.verify_token = Some(token);
+                            }
+                        }
+                        tracing::info!(ich = %ich, verify_token_ref = %verify_ref, "sy-edge resolved fanout verify-token from vault");
+                    }
+                    None => {
+                        tracing::warn!(ich = %ich, verify_token_ref = %verify_ref, "vault verify-token has no 'secret' field; the webhook challenge will fail")
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(ich = %ich, verify_token_ref = %verify_ref, error = %err, "sy-edge could not fetch fanout verify-token from vault")
             }
         }
     }
@@ -1863,6 +2042,33 @@ async fn invoke(state: Arc<FrontendState>, ich: String, extra: String, req: Requ
         }
     };
 
+    // 1b. FANOUT endpoint (IO.wapp): answer the provider's connection-handshake challenge AT the edge,
+    //     BEFORE the method allowlist + auth — a provider's verification GET (Meta: hub.mode/
+    //     hub.verify_token/hub.challenge) carries no bearer and the row may be POST-only. On a
+    //     constant-time verify-token match, echo the raw hub.challenge as text/plain 200; else 403.
+    //     This is the ONLY synchronous edge response for a fanout row; POST events are fire-and-forget.
+    if entry.fanout_family.is_some() && method == Method::GET {
+        if let Some(query) = uri.query() {
+            let params = parse_query_params(query);
+            if params.get("hub.mode").map(String::as_str) == Some("subscribe") {
+                let want = entry.verify_token.as_deref().unwrap_or("");
+                let got = params.get("hub.verify_token").map(String::as_str).unwrap_or("");
+                let challenge = params.get("hub.challenge").cloned().unwrap_or_default();
+                if !want.is_empty() && constant_time_eq(want.as_bytes(), got.as_bytes()) {
+                    return (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                        challenge,
+                    )
+                        .into_response();
+                }
+                tracing::warn!(ich = %ich, "fanout webhook verify-token mismatch; rejecting challenge");
+                return http_error(StatusCode::FORBIDDEN, "FORBIDDEN", "webhook verify token mismatch");
+            }
+        }
+        // A GET that is not a verification challenge falls through to the method allowlist.
+    }
+
     // 2. Method allowlist (if the row constrains methods).
     if let Some(allowed) = &entry.methods {
         if !allowed
@@ -1912,6 +2118,56 @@ async fn invoke(state: Arc<FrontendState>, ich: String, extra: String, req: Requ
             Err(_) => (Some(base64_encode(&body)), Some(HttpBodyEncoding::Base64)),
         }
     };
+
+    // 4b. FANOUT endpoint (IO.wapp events): ack the caller 200 IMMEDIATELY and BROADCAST the request to
+    //     every node matching the family glob (they each verify the signature + self-select by
+    //     phone_number_id). Fire-and-forget — the reply goes out-of-band via the provider API, so the
+    //     edge never waits for a node reply (avoids provider retries). The RAW body + the
+    //     X-Hub-Signature-256 header (stripped by filter_request_headers) ride in the payload so each
+    //     node verifies the HMAC over the exact bytes. The edge holds NO app_secret — a thin frontier.
+    if let Some(family_glob) = entry.fanout_family.clone() {
+        let signature = headers
+            .get("x-hub-signature-256")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let mut fanout_ctx = serde_json::Map::new();
+        fanout_ctx.insert("method".to_string(), json!(method.as_str()));
+        fanout_ctx.insert("path".to_string(), json!(normalize_extra_path(&extra)));
+        if let Some(query) = uri.query() {
+            fanout_ctx.insert("query".to_string(), json!(query));
+        }
+        let message = Message {
+            routing: Routing {
+                src: state.sender.uuid().to_string(),
+                src_l2_name: Some(state.sender.full_name().to_string()),
+                dst: Destination::Broadcast,
+                ttl: state.ttl,
+                trace_id: Uuid::new_v4().to_string(),
+            },
+            meta: Meta {
+                msg_type: entry.inbound_family.clone(),
+                ich: Some(ich.clone()),
+                // Narrow the broadcast to the IO.wapp family glob (else it would hit every node).
+                target: Some(family_glob),
+                context: Some(Value::Object(fanout_ctx)),
+                ..Meta::default()
+            },
+            payload: json!({
+                "raw_body_base64": base64_encode(&body),
+                "signature": signature,
+            }),
+        };
+        if let Err(err) = state.sender.send(message).await {
+            tracing::warn!(ich = %ich, error = %err, "sy-edge fanout broadcast failed to enqueue");
+            return http_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "FANOUT_SEND_FAILED",
+                "could not fan out webhook",
+            );
+        }
+        // Ack the provider immediately (WhatsApp best practice: 200 fast, process async).
+        return (StatusCode::OK, "").into_response();
+    }
 
     // 5. Forward UNDER THE TARGET'S DECLARED FAMILY, BY NAME (Option A + Z, §3).
     //    No request-time resolution: the handler name was resolved at publish
@@ -2049,6 +2305,67 @@ fn rpc_error_code(err: &RpcError) -> &'static str {
     }
 }
 
+/// Constant-time byte equality (length-independent) — FIX-7: the shared-secret bearer is compared
+/// at the public DMZ frontier, where a short-circuiting `==` leaks the token prefix via timing.
+/// No external crate: fold any length mismatch into the accumulator, then OR every byte diff.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff: u8 = if a.len() == b.len() { 0 } else { 1 };
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+    }
+    diff == 0
+}
+
+/// Parse a URL query string into decoded key→value pairs (for a fanout endpoint's webhook-verification
+/// GET: `hub.mode`, `hub.verify_token`, `hub.challenge`). No `url` crate dependency here.
+fn parse_query_params(query: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let mut it = pair.splitn(2, '=');
+        let key = it.next().unwrap_or("");
+        let value = it.next().unwrap_or("");
+        if !key.is_empty() {
+            map.insert(percent_decode(key), percent_decode(value));
+        }
+    }
+    map
+}
+
+/// Minimal `application/x-www-form-urlencoded` decode (`%XX` escapes + `+` → space).
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push((hi * 16 + lo) as u8);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
     headers
         .get("authorization")
@@ -2058,7 +2375,7 @@ fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
                 .strip_prefix("Bearer ")
                 .or_else(|| value.strip_prefix("bearer "))
         })
-        .map(|token| token.trim() == expected)
+        .map(|token| constant_time_eq(token.trim().as_bytes(), expected.as_bytes()))
         .unwrap_or(false)
 }
 
@@ -2170,6 +2487,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_query_params_decodes_webhook_challenge() {
+        let m = parse_query_params(
+            "hub.mode=subscribe&hub.verify_token=my%20token&hub.challenge=12345",
+        );
+        assert_eq!(m.get("hub.mode").map(String::as_str), Some("subscribe"));
+        assert_eq!(m.get("hub.verify_token").map(String::as_str), Some("my token"));
+        assert_eq!(m.get("hub.challenge").map(String::as_str), Some("12345"));
+    }
+
+    #[test]
+    fn percent_decode_handles_escapes_and_plus() {
+        assert_eq!(percent_decode("a%2Bb"), "a+b");
+        assert_eq!(percent_decode("a+b"), "a b");
+        assert_eq!(percent_decode("plain"), "plain");
+        assert_eq!(percent_decode("bad%zz"), "bad%zz"); // invalid escape passes through
+    }
+
+    #[test]
+    fn validate_accepts_fanout_row_and_enforces_verify_token_and_glob() {
+        let base = EndpointRow {
+            ich: "ich:wapp".into(),
+            owner_l2_name: String::new(), // fanout rows have no single owner
+            inbound_family: "io.wapp.inbound.v1".into(),
+            auth_mode: AuthMode::Public,
+            secret: None,
+            secret_ref: None,
+            methods: Some(vec!["GET".into(), "POST".into()]),
+            tenant_id: None,
+            fanout_family: Some("IO.wapp.*@motherbee".into()),
+            verify_token: None,
+            verify_token_ref: Some("edge_wapp_verify:ich:wapp".into()),
+        };
+        assert!(validate_endpoint_row_for_open(&base).is_ok());
+        // missing both verify_token and ref => rejected
+        let mut no_vt = base.clone();
+        no_vt.verify_token_ref = None;
+        assert!(validate_endpoint_row_for_open(&no_vt).is_err());
+        // a fanout_family that is not a fully-qualified IO.* glob => rejected
+        let mut bad_glob = base.clone();
+        bad_glob.fanout_family = Some("wapp".into());
+        assert!(validate_endpoint_row_for_open(&bad_glob).is_err());
+    }
+
+    #[test]
     fn persisted_routes_round_trip_and_never_leak_the_secret() {
         let path =
             std::env::temp_dir().join(format!("sy-edge-persist-{}.json", std::process::id()));
@@ -2187,6 +2548,9 @@ mod tests {
                 previous_secret_expires_at_ms: None,
                 methods: None,
                 tenant_id: None,
+                fanout_family: None,
+                verify_token: None,
+                verify_token_ref: None,
             },
         );
         reg.insert(
@@ -2201,6 +2565,9 @@ mod tests {
                 previous_secret_expires_at_ms: None,
                 methods: None,
                 tenant_id: None,
+                fanout_family: None,
+                verify_token: None,
+                verify_token_ref: None,
             },
         );
         persist_registry(&path, &reg);
@@ -2421,6 +2788,9 @@ mod tests {
             previous_secret_expires_at_ms: Some(1_000),
             methods: None,
             tenant_id: None,
+            fanout_family: None,
+            verify_token: None,
+            verify_token_ref: None,
         };
         let with = |bearer: &str| {
             let mut h = HeaderMap::new();

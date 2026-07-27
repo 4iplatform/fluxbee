@@ -78,6 +78,7 @@ const ADMIN_EXECUTOR_SCHEMA_OVERRIDE_ACTIONS: &[&str] = &["get_admin_action_help
 const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "list_admin_actions",
     "get_admin_action_help",
+    "list_recent_commands",
     "get_runtime",
     "list_nodes",
     "list_tenants",
@@ -120,7 +121,10 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
 /// advertised" == "what is permitted"; they cannot drift). Tier-1 provisioning set
 /// (io-cloud-spec-v1 §3.2): create the tenant, store provider tokens in vault and spawn the IO node.
 /// A subset of ADMIN_EXECUTOR_PILOT_ACTIONS.
-const IO_CLOUD_EXPOSED_ACTIONS: &[&str] = &["create_tenant", "vault_put", "run_node"];
+// Single source of truth in fluxbee_sdk::cloud (shared with IO.cloud, which lives in a separate
+// cargo workspace); a test there pins it to the CLOUD_OP_ACTIONS map so the relay gate and Cloud's
+// op translation can never drift (FIX-12).
+use fluxbee_sdk::cloud::CLOUD_EXPOSED_ACTIONS as IO_CLOUD_EXPOSED_ACTIONS;
 
 #[derive(Debug, Deserialize)]
 struct HiveFile {
@@ -296,6 +300,8 @@ struct AdminContext {
     public_base_url: Option<String>,
     publication_ledger_path: PathBuf,
     publication_lock: Arc<Mutex<()>>,
+    /// Serializes rotate+append on the command audit log (see `append_admin_command_log_locked`).
+    command_log_lock: Arc<std::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -480,6 +486,11 @@ struct DebugNodeMessageRequest {
     priority: Option<String>,
     #[serde(default)]
     context: Option<serde_json::Value>,
+    // Optional thread correlation id. Without it a send_node_message can START a WF instance (no
+    // thread_id → new instance) but cannot DRIVE a thread-scoped node (e.g. an AI node round-trip),
+    // which keys replies by thread_id. (gap-6)
+    #[serde(default)]
+    thread_id: Option<String>,
     #[serde(default = "default_debug_payload")]
     payload: serde_json::Value,
     #[serde(default)]
@@ -488,6 +499,31 @@ struct DebugNodeMessageRequest {
 
 #[tokio::main]
 async fn main() -> Result<(), AdminError> {
+    // Answer --help/--version BEFORE any runtime init. sy_admin is the SY.admin daemon, not an
+    // interactive CLI: past this point it connects to the router (connect_with_retry loops), so
+    // without this guard `sy-admin --help` hangs forever waiting for a socket that only exists
+    // when the mesh is up. (F4b: from-scratch-installer surprise.)
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!(
+                    "sy_admin — SY.admin daemon (motherbee-only; NOT an interactive CLI).\n\
+                     Serves the admin HTTP API (default 127.0.0.1:8080) and the admin.sock action set.\n\
+                     Started by systemd (sy-admin.service); the operator uses the HTTP API, e.g.:\n  \
+                       curl -sS http://127.0.0.1:8080/hives\n\n\
+                     Env: JSR_ADMIN_LISTEN (HTTP listen addr), JSR_LOG_LEVEL (info|debug|...),\n     \
+                     SY_ADMIN_PUBLIC_EDGE_NODE, SY_ADMIN_PUBLIC_BASE_URL.\n\
+                     See docs/07-operaciones.md."
+                );
+                return Ok(());
+            }
+            "-V" | "--version" => {
+                println!("sy_admin {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     if cfg!(not(target_os = "linux")) {
         eprintln!("sy_admin supports only Linux targets.");
         std::process::exit(1);
@@ -612,6 +648,7 @@ async fn main() -> Result<(), AdminError> {
         public_base_url,
         publication_ledger_path: state_dir.join("sy-admin/publications.json"),
         publication_lock: Arc::new(Mutex::new(())),
+        command_log_lock: Arc::new(std::sync::Mutex::new(())),
     };
     let internal_ctx = http_ctx.clone();
     let system_ctx = http_ctx.clone();
@@ -849,6 +886,186 @@ fn admin_executor_log_dir(state_dir: &Path, hive_id: &str) -> PathBuf {
         .join("admin-executor")
         .join(hive_id)
         .join("executions")
+}
+
+// --- Admin command audit log ---------------------------------------------------------------
+//
+// Admin commands (HTTP/curl, internal L2 — architect etc. — and executor-plan steps) flow through
+// `handle_admin_command`, so one append there gives a "what was done to this backend lately" audit
+// trail, queryable via `list_recent_commands` (GET /hives/{hive}/commands). Storage is an append-only
+// JSONL ring (`commands.jsonl` + rotations) — greppable on disk, size-bounded, params redacted with
+// the shared `redact_executor_log_value` (secret-like field names + vault values NEVER written).
+// NOT captured (separate code paths, documented in list_recent_commands help): runtime rollout
+// `update`/`sync_hint`, and orchestrator-AUTONOMOUS actions (respawn/reconcile) that never pass
+// through admin.
+
+/// Rotate by COMMAND COUNT (operator-decided): the active file holds up to this many entries, then
+/// rotates. With the rotations kept, the queryable window is up to 4x this (still tiny on disk).
+const ADMIN_COMMAND_LOG_ROTATE_ENTRIES: usize = 100;
+const ADMIN_COMMAND_LOG_ROTATIONS: u32 = 3;
+/// Cap the redacted params blob per entry so one giant CONFIG_SET can't bloat the log.
+const ADMIN_COMMAND_LOG_PARAMS_MAX_BYTES: usize = 2048;
+const ADMIN_COMMAND_LOG_DEFAULT_LIMIT: usize = 50;
+const ADMIN_COMMAND_LOG_MAX_LIMIT: usize = 500;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AdminCommandLogEntry {
+    ts_ms: u64,
+    /// RFC3339 copy of ts_ms so the log reads on sight (auditoría humana).
+    ts: String,
+    action: String,
+    /// Target hive of the command (`None` = hive-less action, e.g. add_hive/inventory).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hive: Option<String>,
+    /// Who issued it: "http" (operator curl/UI), "l2:<src_l2_name>" (internal mesh caller such as
+    /// SY.architect), or "executor" (an admin executor-plan step).
+    origin: String,
+    /// Redacted, size-capped copy of the request params — enough to see WHAT was done, never a secret.
+    params: serde_json::Value,
+    /// "ok" | "error" parsed from the response envelope.
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
+    http_status: u16,
+    duration_ms: u64,
+}
+
+fn admin_command_log_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("sy-admin").join("command-log")
+}
+
+fn admin_command_log_path(state_dir: &Path) -> PathBuf {
+    admin_command_log_dir(state_dir).join("commands.jsonl")
+}
+
+/// Redact + size-cap the params for the audit entry. Reuses the executor-log redactor (secret-like
+/// fields + vault payload `value`s become "<redacted>"); anything still huge is truncated to a
+/// preview so the entry stays audit-sized.
+fn admin_command_log_params(params: &serde_json::Value) -> serde_json::Value {
+    let redacted = redact_executor_log_value(params);
+    let serialized = redacted.to_string();
+    if serialized.len() <= ADMIN_COMMAND_LOG_PARAMS_MAX_BYTES {
+        return redacted;
+    }
+    let mut cut = ADMIN_COMMAND_LOG_PARAMS_MAX_BYTES;
+    while cut > 0 && !serialized.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    serde_json::json!({
+        "_truncated": true,
+        "bytes": serialized.len(),
+        "preview": &serialized[..cut],
+    })
+}
+
+/// Append one entry, rotating `commands.jsonl -> .1 -> .2 -> ...` at the size cap. The caller holds
+/// `ctx.command_log_lock`, so rotate+append is atomic against concurrent commands. Failures are
+/// logged and swallowed: the audit log must never fail the command itself.
+fn append_admin_command_log_locked(state_dir: &Path, entry: &AdminCommandLogEntry) {
+    let dir = admin_command_log_dir(state_dir);
+    if let Err(err) = fs::create_dir_all(&dir) {
+        tracing::warn!(error = %err, "command-log: cannot create dir; entry dropped");
+        return;
+    }
+    let path = admin_command_log_path(state_dir);
+    // Count-based rotation: ~100 entries per file. The file is tiny (≤ ~200KB), so counting lines
+    // per append is negligible next to the admin command it trails.
+    let needs_rotate = fs::read_to_string(&path)
+        .map(|raw| raw.lines().count() >= ADMIN_COMMAND_LOG_ROTATE_ENTRIES)
+        .unwrap_or(false);
+    if needs_rotate {
+        for idx in (1..=ADMIN_COMMAND_LOG_ROTATIONS).rev() {
+            let from = if idx == 1 {
+                path.clone()
+            } else {
+                dir.join(format!("commands.jsonl.{}", idx - 1))
+            };
+            let to = dir.join(format!("commands.jsonl.{idx}"));
+            if from.exists() {
+                let _ = fs::rename(&from, &to);
+            }
+        }
+    }
+    let line = match serde_json::to_string(entry) {
+        Ok(line) => line,
+        Err(err) => {
+            tracing::warn!(error = %err, "command-log: serialize failed; entry dropped");
+            return;
+        }
+    };
+    let result = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| writeln!(file, "{line}"));
+    if let Err(err) = result {
+        tracing::warn!(error = %err, "command-log: append failed; entry dropped");
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct AdminCommandLogQuery {
+    limit: usize,
+    action: Option<String>,
+    status: Option<String>,
+    hive: Option<String>,
+    since_ms: Option<u64>,
+}
+
+/// Read the most recent entries (newest first), walking the current file then rotations until the
+/// limit fills. Filters: exact action, status ok|error, target hive, since_ms.
+fn read_recent_admin_commands(
+    state_dir: &Path,
+    query: &AdminCommandLogQuery,
+) -> Vec<serde_json::Value> {
+    let dir = admin_command_log_dir(state_dir);
+    let limit = query.limit.clamp(1, ADMIN_COMMAND_LOG_MAX_LIMIT);
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut files = vec![admin_command_log_path(state_dir)];
+    for idx in 1..=ADMIN_COMMAND_LOG_ROTATIONS {
+        files.push(dir.join(format!("commands.jsonl.{idx}")));
+    }
+    for file in files {
+        if out.len() >= limit {
+            break;
+        }
+        let Ok(raw) = fs::read_to_string(&file) else {
+            continue;
+        };
+        for line in raw.lines().rev() {
+            if out.len() >= limit {
+                break;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let matches = query
+                .action
+                .as_deref()
+                .is_none_or(|a| value.get("action").and_then(|v| v.as_str()) == Some(a))
+                && query
+                    .status
+                    .as_deref()
+                    .is_none_or(|s| value.get("status").and_then(|v| v.as_str()) == Some(s))
+                && query.hive.as_deref().is_none_or(|h| {
+                    // Hive-less commands (add_hive/remove_hive/inventory — hive: None) are GLOBAL:
+                    // always shown, even under a hive-scoped query, so they are never hidden.
+                    match value.get("hive").and_then(|v| v.as_str()) {
+                        Some(entry_hive) => entry_hive == h,
+                        None => true,
+                    }
+                })
+                && query
+                    .since_ms
+                    .is_none_or(|since| {
+                        value.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0) >= since
+                    });
+            if matches {
+                out.push(value);
+            }
+        }
+    }
+    out
 }
 
 fn load_admin_executor_node_config(
@@ -1158,33 +1375,44 @@ fn build_admin_executor_function_catalog(
         .collect()
 }
 
+/// True if a (lowercased) field name names a secret whose VALUE must never be persisted to a log.
+/// Mirrors the SY.architect `key_looks_secret` peer (single de-diverged policy) and additionally
+/// covers the bootstrap-credential field names the add_hive contract promises never to log
+/// (`ssh_password` via `_password`; `ssh_key`/`private_key` via the explicit names + `_key`).
+fn redaction_field_is_secret(lower: &str) -> bool {
+    matches!(
+        lower,
+        "api_key"
+            | "apikey"
+            | "token"
+            | "access_token"
+            | "client_secret"
+            | "secret"
+            | "password"
+            | "authorization"
+            | "ssh_key"
+            | "ssh_password"
+            | "private_key"
+    ) || lower.ends_with("_api_key")
+        || lower.ends_with("_token")
+        || lower.ends_with("_secret")
+        || lower.ends_with("_password")
+        || lower.ends_with("_private_key")
+}
+
 fn redact_executor_log_value(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
             let mut redacted = serde_json::Map::new();
-            let looks_like_vault_payload = map.contains_key("key")
-                && map.contains_key("value")
-                && (map.contains_key("metadata")
-                    || map.contains_key("version")
-                    || map.get("action").and_then(serde_json::Value::as_str) == Some("vault_get")
-                    || map.get("action").and_then(serde_json::Value::as_str) == Some("vault_put")
-                    || map
-                        .get("key")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|key| {
-                            key.contains(':')
-                                && key.bytes().all(|b| {
-                                    b.is_ascii_lowercase()
-                                        || b.is_ascii_digit()
-                                        || matches!(b, b':' | b'_' | b'-')
-                                })
-                        }));
+            // A vault-shaped `{key, value, ...}` object: redact `value` unconditionally. (Previously
+            // this required metadata/version/an embedded action/a colon-key heuristic — a colon-less
+            // valid key like `slack-tokens` defeated it and leaked the value. `key`+`value` together
+            // is vault-specific enough; over-redacting a benign pair in an audit log is acceptable.)
+            let looks_like_vault_payload = map.contains_key("key") && map.contains_key("value");
             for (key, entry) in map {
                 let lower = key.to_ascii_lowercase();
-                if matches!(
-                    lower.as_str(),
-                    "api_key" | "token" | "secret" | "password" | "authorization"
-                ) || (looks_like_vault_payload && lower == "value")
+                if redaction_field_is_secret(&lower)
+                    || (looks_like_vault_payload && lower == "value")
                 {
                     redacted.insert(
                         key.clone(),
@@ -2343,7 +2571,9 @@ async fn execute_admin_executor_step_fallback(
         }
     };
     let (_http_status, body) =
-        match handle_admin_command(ctx, client, &step.action, params, target).await {
+        match handle_admin_command_with_origin(ctx, client, &step.action, params, target, "executor")
+            .await
+        {
             Ok(values) => values,
             Err(err) => {
                 let failure = failure_from_detail(err.to_string(), "admin_action_failure");
@@ -3282,6 +3512,13 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
+        action: "list_recent_commands",
+        route: InternalActionRoute::Command("list_recent_commands"),
+        // The log lives on THIS admin; target (hive) is only a filter, so it is optional.
+        requires_target: false,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
         action: "node_control_config_get",
         route: InternalActionRoute::Command("node_control_config_get"),
         requires_target: true,
@@ -4217,6 +4454,114 @@ async fn handle_externalize(
             .collect::<Vec<String>>()
     });
 
+    // FANOUT variant (IO.wapp, docs/io-wapp-design.md §5): a provider whose single mandatory webhook
+    // must reach a FAMILY of nodes (glob), each verifying + self-selecting. No single channel owner
+    // exists, so the owner-only gate (I8) cannot authorize it — RESTRICTED to the trusted operator
+    // path (caller == None), and created ONCE per provider app. The `ich` is an operator-chosen
+    // opaque URL key (no identity ICH resolve: there is no owning channel to look up).
+    if let Some(fanout_family) = get_str("fanout_family") {
+        if caller_l2_name.is_some() {
+            return Ok(internal_unauthorized(
+                "externalize",
+                "externalize-as-fanout is operator-only (a family has no single channel owner)",
+            ));
+        }
+        if let Err(detail) = validate_fanout_family_glob(&fanout_family) {
+            return Ok(internal_invalid_request("externalize", &detail));
+        }
+        // The provider connection-handshake token (Meta `hub.verify_token`): operator-supplied (the
+        // value they configured in the provider dashboard) or admin-minted (returned so they can paste
+        // it there). Stored in vault OWNED BY THE EDGE; only the ref ships to the edge, which
+        // re-fetches the value at boot/open (mirrors the shared-secret path — never on the edge disk).
+        let verify_token = get_str("verify_token").unwrap_or_else(mint_entry_token);
+        let verify_token_ref = format!("edge_fanout_verify:{ich}");
+        let (status, body) = handle_vault_command(
+            ctx,
+            client,
+            "vault_put",
+            serde_json::json!({
+                "key": verify_token_ref,
+                "value": { "secret": verify_token },
+                "metadata": { "resource_type": "bearer_token", "owner_node": edge_node },
+            }),
+            Some(ctx.hive_id.clone()),
+        )
+        .await?;
+        if status != 200 {
+            return Ok(internal_invalid_request(
+                "externalize",
+                &format!("failed to store fanout verify-token in vault (owner {edge_node}): {body}"),
+            ));
+        }
+        let row = serde_json::json!({
+            "ich": ich,
+            // A fanout row has no single owner; the edge's fanout validation branch ignores this.
+            "owner_l2_name": "",
+            "inbound_family": inbound_family,
+            "auth_mode": "public",
+            "fanout_family": fanout_family,
+            "verify_token_ref": verify_token_ref,
+            // Default: the provider's verification GET + its event POSTs.
+            "methods": methods.clone().unwrap_or_else(|| vec!["GET".to_string(), "POST".to_string()]),
+        });
+        return match send_system_request_with_meta(
+            client,
+            &edge_node,
+            MSG_EDGE_OPEN_URL,
+            MSG_EDGE_OPEN_URL_RESPONSE,
+            row,
+            16,
+            None,
+            None,
+            Some(edge_node.clone()),
+            None,
+            None,
+            Duration::from_secs(15),
+        )
+        .await
+        {
+            Ok(payload) if payload.get("status").and_then(|v| v.as_str()) == Some("ok") => {
+                tracing::info!(
+                    ich = %ich,
+                    fanout_family = %fanout_family,
+                    edge = %edge_node,
+                    "externalize-as-fanout: edge opened URL (ACKed)"
+                );
+                Ok(InternalAdminDispatchResult {
+                    http_status: 200,
+                    envelope: serde_json::json!({
+                        "status": "ok",
+                        "action": "externalize",
+                        "payload": {
+                            "url": format!("/e/{ich}"),
+                            "ich": ich,
+                            "fanout_family": fanout_family,
+                            "edge_node": edge_node,
+                            // The webhook verify-token: the operator configures this exact value in
+                            // the provider dashboard (Meta: hub.verify_token). Minted by admin unless
+                            // supplied.
+                            "verify_token": verify_token,
+                        }
+                    }),
+                })
+            }
+            Ok(payload) => {
+                let err = payload
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("edge rejected open_url");
+                Ok(internal_invalid_request(
+                    "externalize",
+                    &format!("edge did not open fanout URL '{ich}': {err}"),
+                ))
+            }
+            Err(err) => Ok(internal_invalid_request(
+                "externalize",
+                &format!("edge unreachable / open_url failed for fanout '{ich}': {err}"),
+            )),
+        };
+    }
+
     // Resolve ICH -> owner_l2_name from identity SHM, and require the channel to
     // be enabled before it can become public.
     let owner_l2_name =
@@ -4255,6 +4600,14 @@ async fn handle_externalize(
             Some(supplied) => supplied.clone(),
             None => mint_entry_token(), // §8: admin-minted strong token
         };
+        // FIX-4 residual (deferred): a re-externalize after io.api restart + edge ROW-LOSS mints a
+        // fresh token here, stranding clients holding the old bearer. Admin CANNOT reuse the stored
+        // token: edge_channel_secret:{ich} is a dedicated secret owned by SY.edge's ilk, and
+        // authorize_read has "No admin bypass" by design (sy_vault.rs:1391) — admin can neither read
+        // the value nor its metadata. Closing this needs a design call (admin/edge co-owned token,
+        // or a scoped admin read-back for edge_channel_secret:*), NOT a silent security downgrade.
+        // The edge's grace-window (SHARED_SECRET_GRACE_MS) already covers LIVE rotation — the common
+        // case; the row-loss residual is a rare reimage/vault-purge event.
         let secret_ref = format!("edge_channel_secret:{ich}");
         let (status, body) = handle_vault_command(
             ctx,
@@ -4588,6 +4941,11 @@ async fn dispatch_internal_admin_command(
     if let Err(detail) = authorize_cloud_relay(caller_l2_name, action, &ctx.hive_id) {
         return Ok(internal_unauthorized(action, &detail));
     }
+    // FIX-2: server-side re-enforcement of io.cloud's translate content restrictions (do not trust
+    // the bypassable relay to have sanitized its own payload).
+    if let Err(detail) = enforce_cloud_relay_content(caller_l2_name, action, &ctx.hive_id, &params) {
+        return Ok(internal_unauthorized(action, &detail));
+    }
     match action {
         "publish_artifact" => {
             if target.is_some() {
@@ -4745,7 +5103,15 @@ async fn dispatch_internal_admin_command(
                     "missing target (payload.target required for this action)",
                 ));
             }
-            handle_admin_command(ctx, client, canonical, params, hive).await?
+            {
+                // Audit origin: the router-stamped caller when the command came over L2 (e.g.
+                // SY.architect), else the trusted internal path.
+                let origin = caller_l2_name
+                    .map(|src| format!("l2:{src}"))
+                    .unwrap_or_else(|| "internal".to_string());
+                handle_admin_command_with_origin(ctx, client, canonical, params, hive, &origin)
+                    .await?
+            }
         }
         InternalActionRoute::Update => {
             let hive = resolve_internal_action_hive("update", target, &params);
@@ -4982,6 +5348,29 @@ fn mint_entry_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
+/// A fanout target must be a fully-qualified IO.* L2 GLOB (e.g. `IO.wapp.*@motherbee`): IO.-prefixed
+/// (the frontier only fans to IO nodes, mirroring I1), hive-qualified, and actually a pattern — a
+/// glob-free literal would be a unicast in disguise (use plain externalize for that).
+fn validate_fanout_family_glob(fanout_family: &str) -> Result<(), String> {
+    let value = fanout_family.trim();
+    if !value.starts_with("IO.") {
+        return Err(format!(
+            "fanout_family must target IO.* nodes, got '{value}'"
+        ));
+    }
+    if !value.contains('@') {
+        return Err(format!(
+            "fanout_family must be hive-qualified (e.g. IO.wapp.*@motherbee), got '{value}'"
+        ));
+    }
+    if !value.contains('*') {
+        return Err(format!(
+            "fanout_family must be a glob (contain '*'); for a single node use plain externalize, got '{value}'"
+        ));
+    }
+    Ok(())
+}
+
 fn authorize_channel_command(
     caller_l2_name: Option<&str>,
     owner_l2_name: &str,
@@ -5014,16 +5403,31 @@ fn authorize_cloud_relay(
     action: &str,
     admin_hive: &str,
 ) -> Result<(), String> {
+    let expected = format!("IO.cloud@{admin_hive}");
+    // FIX-1 (HIGH): IO.cloud is the internet-facing provisioning relay and the node this gate exists
+    // to CONTAIN. It may relay ONLY the exposed provisioning actions — DEFAULT-DENY everything else,
+    // so a compromised IO.cloud cannot become a confused deputy for vault_get / vault_list /
+    // delete_ilk / add_route / kill_node / add_hive / … (all of which the generic dispatch would
+    // otherwise run under admin's own privileged ilk). Previously the gate only guarded the 3
+    // exposed actions and let IO.cloud relay ANY OTHER action unchecked.
+    if caller_l2_name == Some(expected.as_str()) {
+        return if IO_CLOUD_EXPOSED_ACTIONS.contains(&action) {
+            Ok(())
+        } else {
+            Err(format!(
+                "IO.cloud may relay only {IO_CLOUD_EXPOSED_ACTIONS:?} over the mesh, not '{action}' (Fluxbee Cloud provisioning gate)"
+            ))
+        };
+    }
+    // All OTHER callers: a non-exposed action is not this gate's concern (other per-action gates /
+    // trusted internal paths apply). The exposed provisioning actions may originate over the mesh
+    // ONLY from IO.cloud (handled above) or, for vault_put, the co-resident primary orchestrator.
     if !IO_CLOUD_EXPOSED_ACTIONS.contains(&action) {
         return Ok(());
     }
     let Some(caller) = caller_l2_name else {
         return Ok(());
     };
-    let expected = format!("IO.cloud@{admin_hive}");
-    if caller == expected {
-        return Ok(());
-    }
     // The primary orchestrator persists per-spoke recovery SSH keys during add_hive
     // (ssh_access=key_only_persist) via vault_put. It is a trusted system singleton on the
     // primary hive, co-resident with admin — allow it, but ONLY for vault_put (never the other
@@ -5034,6 +5438,59 @@ fn authorize_cloud_relay(
     Err(format!(
         "only {expected} may relay '{action}' over the mesh (Fluxbee Cloud provisioning gate); caller={caller}"
     ))
+}
+
+/// FIX-2: re-enforce io.cloud's `translate_cloud_op` content restrictions SERVER-SIDE. Those checks
+/// (run_node → IO.* only; vault_put → no caller-set ownership-authority fields, owner_node IO.*)
+/// today live ONLY inside io.cloud, which a compromised relay bypasses. Admin must not trust the
+/// relay to have sanitized its own payload. Applies ONLY to the IO.cloud@hive mesh origin — operator
+/// (caller=None) and every other caller are unaffected. Runs right after `authorize_cloud_relay`
+/// (so it only ever sees the exposed 3 actions from this origin).
+fn enforce_cloud_relay_content(
+    caller_l2_name: Option<&str>,
+    action: &str,
+    admin_hive: &str,
+    params: &serde_json::Value,
+) -> Result<(), String> {
+    if caller_l2_name != Some(format!("IO.cloud@{admin_hive}").as_str()) {
+        return Ok(());
+    }
+    let owner_node_ok = |v: Option<&serde_json::Value>| -> Result<(), String> {
+        if let Some(owner_node) = v.and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+            if !owner_node.starts_with("IO.") {
+                return Err("IO.cloud vault_put owner_node must be an IO.* node".to_string());
+            }
+        }
+        Ok(())
+    };
+    match action {
+        "run_node" => {
+            let node_name = params.get("node_name").and_then(|v| v.as_str()).unwrap_or("");
+            if !node_name.starts_with("IO.") {
+                return Err(format!(
+                    "IO.cloud may provision only IO.* nodes, not '{node_name}'"
+                ));
+            }
+        }
+        "vault_put" => {
+            // Ownership-authority fields io.cloud must NEVER set (translate strips them); reject so a
+            // compromised relay cannot plant a secret under a victim's ilk/owner.
+            if let Some(md) = params.get("metadata").and_then(|v| v.as_object()) {
+                for authority in ["ilk", "owner_ilk", "owner_l2"] {
+                    if md.contains_key(authority) {
+                        return Err(format!(
+                            "IO.cloud vault_put must not set the authority field metadata.{authority}"
+                        ));
+                    }
+                }
+                owner_node_ok(md.get("owner_node"))?;
+            }
+            // translate reads owner_node from params OR metadata — check the top-level too.
+            owner_node_ok(params.get("owner_node"))?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -5204,7 +5661,10 @@ async fn handle_http(
     stream: &mut tokio::net::TcpStream,
     tx: &mpsc::UnboundedSender<BroadcastRequest>,
     ctx: &AdminContext,
-    client: &RouterDispatcher,
+    // &Arc so the localhost REST layer can call dispatch_internal_admin_command directly (F4a:
+    // /channels/* verbs). handle_admin_command/handle_admin_query calls below still work via Deref
+    // coercion (&Arc<RouterDispatcher> -> &RouterDispatcher).
+    client: &Arc<RouterDispatcher>,
 ) -> Result<(), AdminError> {
     let (method, path, headers, body) = read_http_request(stream).await?;
     let (path, query) = split_path_query(&path);
@@ -5324,6 +5784,35 @@ async fn handle_http(
             let (status, resp) =
                 handle_admin_command(ctx, client, "publish_runtime_package", payload, None).await?;
             respond_json(stream, status, &resp).await?;
+        }
+        // F4a: operator surface for the edge-channel (externalize) family. Localhost-only, and
+        // caller_l2_name=None is the established trusted-internal operator semantics — the SAME
+        // 127.0.0.1 surface already exposes stronger None-privileged mutations (add_hive, run_node,
+        // vault_put). MUST go through dispatch_internal_admin_command directly: handle_admin_command
+        // would ship these to SY.config.routes (which does not implement them) and time out silently.
+        ("POST", "/channels/externalize") => {
+            let payload: serde_json::Value =
+                if body.is_empty() { serde_json::json!({}) } else { serde_json::from_slice(&body)? };
+            let internal =
+                dispatch_internal_admin_command(ctx, client, "externalize", None, payload, None).await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
+        }
+        ("POST", "/channels/unexternalize") => {
+            let payload: serde_json::Value =
+                if body.is_empty() { serde_json::json!({}) } else { serde_json::from_slice(&body)? };
+            let internal =
+                dispatch_internal_admin_command(ctx, client, "unexternalize", None, payload, None).await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
+        }
+        ("GET", "/channels/externalized") => {
+            // edge_node comes from ?edge_node=SY.edge@<hive> (the edge to query).
+            let payload = match query.get("edge_node") {
+                Some(edge_node) => serde_json::json!({ "edge_node": edge_node }),
+                None => serde_json::json!({}),
+            };
+            let internal =
+                dispatch_internal_admin_command(ctx, client, "list_externalized", None, payload, None).await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
         }
         ("GET", path) if path.starts_with("/admin/actions/") => {
             let Some(action_name) = path.strip_prefix("/admin/actions/") else {
@@ -5879,6 +6368,32 @@ async fn handle_hive_paths(
         }
         ("GET", ["taps"]) => {
             let (status, resp) = handle_admin_query(ctx, client, "list_taps", Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
+        ("GET", ["commands"]) => {
+            // Command audit log: what was done to this backend lately (redacted). Filters via query
+            // string; `hive` in the path narrows to commands targeting that hive.
+            let mut payload = serde_json::Map::new();
+            if let Some(limit) = query.get("limit").and_then(|v| v.parse::<u64>().ok()) {
+                payload.insert("limit".to_string(), serde_json::json!(limit));
+            }
+            if let Some(action) = query.get("action") {
+                payload.insert("action".to_string(), serde_json::json!(action));
+            }
+            if let Some(status) = query.get("status") {
+                payload.insert("status".to_string(), serde_json::json!(status));
+            }
+            if let Some(since) = query.get("since_ms").and_then(|v| v.parse::<u64>().ok()) {
+                payload.insert("since_ms".to_string(), serde_json::json!(since));
+            }
+            let (status, resp) = handle_admin_command(
+                ctx,
+                client,
+                "list_recent_commands",
+                serde_json::Value::Object(payload),
+                Some(hive),
+            )
+            .await?;
             Ok(Some((status, resp)))
         }
         ("POST", ["taps"]) => {
@@ -6913,6 +7428,7 @@ fn http_status_line(status: u16) -> &'static str {
         200 => "HTTP/1.1 200 OK",
         202 => "HTTP/1.1 202 Accepted",
         400 => "HTTP/1.1 400 Bad Request",
+        403 => "HTTP/1.1 403 Forbidden",
         404 => "HTTP/1.1 404 Not Found",
         409 => "HTTP/1.1 409 Conflict",
         422 => "HTTP/1.1 422 Unprocessable Entity",
@@ -8422,6 +8938,11 @@ fn admin_action_summary(action: &str) -> &'static str {
         "add_vpn" => "Add a VPN pattern to a hive.",
         "delete_vpn" => "Delete a VPN pattern from a hive.",
         "list_taps" => "List router-level taps installed on a hive. Read-only.",
+        "list_recent_commands" => {
+            "Audit log: list the most recent admin commands executed on this backend (all origins — \
+             operator HTTP, internal L2 callers like SY.architect, and executor-plan steps), with \
+             redacted params, result status and duration. Read-only."
+        }
         "add_tap" => "Add a router-level tap on a hive. When a unicast message matches (match_src, match_dst), the router enqueues a fire-and-forget secondary copy to `target` with `meta.via_tap=true`. mode defaults to `best_effort` when omitted. enabled defaults to true. Exact L2 name match.",
         "delete_tap" => "Delete an installed router-level tap by its (match_src, match_dst, target) natural key.",
         "update" => "Run hive update workflow.",
@@ -8526,6 +9047,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "delete_route" => vec!["DELETE /hives/{hive}/routes/{prefix}"],
         "add_vpn" => vec!["POST /hives/{hive}/vpns"],
         "list_taps" => vec!["GET /hives/{hive}/taps"],
+        "list_recent_commands" => vec!["GET /hives/{hive}/commands"],
         "add_tap" => vec!["POST /hives/{hive}/taps"],
         "delete_tap" => vec!["DELETE /hives/{hive}/taps?match_src=...&match_dst=...&target=..."],
         "delete_vpn" => vec!["DELETE /hives/{hive}/vpns/{pattern}"],
@@ -9258,6 +9780,12 @@ fn admin_action_body_optional_fields(action: &str) -> Vec<serde_json::Value> {
             ),
             admin_action_body_field("ttl", "u16", "Optional TTL, default 16."),
         ],
+        "list_recent_commands" => vec![
+            admin_action_body_field("limit", "u32", "Max entries returned (default 50, max 500)."),
+            admin_action_body_field("action", "string", "Filter: exact admin action name."),
+            admin_action_body_field("status", "string", "Filter: 'ok' or 'error'."),
+            admin_action_body_field("since_ms", "u64", "Filter: only entries at/after this epoch-ms."),
+        ],
         "send_node_message" => vec![
             admin_action_body_field("msg", "string", "Optional message name."),
             admin_action_body_field("ttl", "u16", "Optional TTL, default 16."),
@@ -9552,6 +10080,10 @@ fn admin_action_example_payload(action: &str) -> serde_json::Value {
             "layout": "2006-01-02 15:04 MST",
             "tz": "America/Argentina/Buenos_Aires"
         }),
+        "list_recent_commands" => serde_json::json!({
+            "limit": 20,
+            "status": "error"
+        }),
         "send_node_message" => serde_json::json!({
             "msg_type": "PING",
             "payload": {
@@ -9761,6 +10293,9 @@ fn admin_action_example_scmd(action: &str) -> Option<String> {
         "remove_node_instance" => {
             "curl -X DELETE /hives/motherbee/nodes/AI.chat@motherbee/instance"
         }
+        "list_recent_commands" => {
+            "curl -X GET '/hives/motherbee/commands?limit=20&status=error'"
+        }
         "send_node_message" => {
             r#"curl -X POST /hives/motherbee/nodes/SY.admin@motherbee/messages -d '{"msg_type":"PING","payload":{"ping":true}}'"#
         }
@@ -9915,6 +10450,13 @@ fn admin_action_request_notes(action: &str) -> Vec<&'static str> {
             "The returned payload includes publication_id, url, optional public_url, expires_at, edge_node, content_type and presentation.",
             "A /public/<key> URL is a bearer capability: anyone with the link can read it until expiry or unpublish.",
             "Inline HTML may contain self-contained JavaScript, but edge applies sandboxed-html-v1 with network access disabled.",
+        ],
+        "list_recent_commands" => vec![
+            "Reads the local admin command audit log (state/sy-admin/command-log/, JSONL, rotates every ~100 entries; oldest rotations are dropped).",
+            "Records every admin command that flows through the admin command handler — creates/mutations/queries (run_node, vault_*, config, taps, routes, hives, nodes, ...) — with `origin` = 'http' (operator), 'l2:<src_l2_name>' (router-stamped mesh caller, e.g. SY.architect), 'executor' (executor-plan step) or 'internal'.",
+            "Entry params are REDACTED (secret-like field names + vault values are never written) and size-capped; entries also carry status, error_code, http_status and duration_ms.",
+            "The {hive} path segment FILTERS by target hive; hive-less commands (add_hive/remove_hive/inventory) are global and always shown.",
+            "NOT captured (separate paths): runtime rollout `update`/`sync_hint` (their own admin routes, not the command handler), and orchestrator-AUTONOMOUS actions (respawn/reconcile) which never pass through admin.",
         ],
         "unpublish_artifact" => vec![
             "Mesh-only producer operation; there is no HTTP, SCMD or admin-executor unpublish endpoint.",
@@ -11707,7 +12249,121 @@ async fn handle_remove_runtime_version(
     ))
 }
 
+/// The single choke-point for admin commands. All entry paths land here — HTTP handlers call it
+/// directly (origin "http"); the internal L2 dispatch and the executor call
+/// `handle_admin_command_with_origin` with their identity. Every call is appended to the command
+/// audit log (redacted) so `list_recent_commands` can answer "what was done to this backend lately".
 async fn handle_admin_command(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    action: &str,
+    payload: serde_json::Value,
+    hive: Option<String>,
+) -> Result<(u16, String), AdminError> {
+    handle_admin_command_with_origin(ctx, client, action, payload, hive, "http").await
+}
+
+async fn handle_admin_command_with_origin(
+    ctx: &AdminContext,
+    client: &RouterDispatcher,
+    action: &str,
+    payload: serde_json::Value,
+    hive: Option<String>,
+    origin: &str,
+) -> Result<(u16, String), AdminError> {
+    // The audit-log reader is handled locally (the log lives on THIS admin; every hive's commands
+    // flow through it) — `hive` acts as a filter, not routing.
+    if matches!(action, "list_recent_commands") {
+        let query = AdminCommandLogQuery {
+            limit: payload
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(ADMIN_COMMAND_LOG_DEFAULT_LIMIT),
+            action: payload
+                .get("action")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToString::to_string),
+            status: payload
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(ToString::to_string),
+            hive: hive.clone().filter(|v| !v.is_empty()),
+            since_ms: payload.get("since_ms").and_then(|v| v.as_u64()),
+        };
+        // Read under the same lock as rotate+append so a concurrent rotation can't make one response
+        // miss or duplicate an entry across the file/rotation boundary.
+        let commands = {
+            let _guard = ctx
+                .command_log_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            read_recent_admin_commands(&ctx.state_dir, &query)
+        };
+        return Ok((
+            200u16,
+            serde_json::json!({
+                "status": "ok",
+                "action": "list_recent_commands",
+                "error_code": serde_json::Value::Null,
+                "error_detail": serde_json::Value::Null,
+                "payload": { "count": commands.len(), "commands": commands },
+            })
+            .to_string(),
+        ));
+    }
+
+    let started = Instant::now();
+    let logged_params = admin_command_log_params(&payload);
+    let result = handle_admin_command_inner(ctx, client, action, payload, hive.clone()).await;
+
+    // Audit append — never fails the command; a hard AdminError is logged as status=error too.
+    let (http_status, status, error_code) = match &result {
+        Ok((code, body)) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+            (
+                *code,
+                parsed
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(if *code < 400 { "ok" } else { "error" })
+                    .to_string(),
+                parsed
+                    .get("error_code")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
+            )
+        }
+        Err(err) => (500u16, "error".to_string(), Some(err.to_string())),
+    };
+    let entry = AdminCommandLogEntry {
+        ts_ms: now_epoch_ms(),
+        ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        action: action.to_string(),
+        hive,
+        origin: origin.to_string(),
+        params: logged_params,
+        status,
+        error_code,
+        http_status,
+        duration_ms: started.elapsed().as_millis() as u64,
+    };
+    {
+        let _guard = ctx
+            .command_log_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        append_admin_command_log_locked(&ctx.state_dir, &entry);
+    }
+    result
+}
+
+async fn handle_admin_command_inner(
     ctx: &AdminContext,
     client: &RouterDispatcher,
     action: &str,
@@ -11874,6 +12530,10 @@ async fn handle_send_node_message(
             action: req.meta_action,
             priority: req.priority,
             context: req.context,
+            thread_id: req.thread_id.and_then(|value| {
+                let trimmed = value.trim().to_string();
+                (!trimmed.is_empty()).then_some(trimmed)
+            }),
             ..Meta::default()
         },
         payload: req.payload,
@@ -13651,6 +14311,19 @@ fn build_opa_query_response(
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn fanout_family_glob_validation() {
+        // valid: IO.-prefixed, hive-qualified, an actual glob
+        assert!(validate_fanout_family_glob("IO.wapp.*@motherbee").is_ok());
+        assert!(validate_fanout_family_glob(" IO.wapp.*@motherbee ").is_ok());
+        // not IO.* -> rejected (frontier only fans to IO nodes)
+        assert!(validate_fanout_family_glob("AI.wapp.*@motherbee").is_err());
+        // not hive-qualified -> rejected
+        assert!(validate_fanout_family_glob("IO.wapp.*").is_err());
+        // glob-free literal -> rejected (that's a unicast in disguise; use plain externalize)
+        assert!(validate_fanout_family_glob("IO.wapp@motherbee").is_err());
+    }
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::broadcast;
@@ -13658,10 +14331,28 @@ mod tests {
 
     #[test]
     fn cloud_relay_gate_allows_only_iocloud_over_mesh() {
-        // A non-exposed action is untouched regardless of caller.
+        // A non-exposed action is untouched for a NON-io.cloud caller.
         assert!(
             authorize_cloud_relay(Some("AI.worker@motherbee"), "list_nodes", "motherbee").is_ok()
         );
+        // FIX-1 (HIGH): IO.cloud is DEFAULT-DENY beyond the exposed 3 — a compromised relay cannot
+        // be a confused deputy for these privileged actions.
+        for evil in [
+            "vault_get",
+            "vault_list",
+            "delete_ilk",
+            "add_route",
+            "add_vpn",
+            "kill_node",
+            "add_hive",
+            "set_node_config",
+            "list_nodes",
+        ] {
+            assert!(
+                authorize_cloud_relay(Some("IO.cloud@motherbee"), evil, "motherbee").is_err(),
+                "IO.cloud must be denied non-exposed action '{evil}'"
+            );
+        }
         for action in IO_CLOUD_EXPOSED_ACTIONS {
             // Trusted internal path (caller==None: HTTP operator / executor) — allowed.
             assert!(authorize_cloud_relay(None, action, "motherbee").is_ok());
@@ -13698,6 +14389,35 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn cloud_relay_content_reenforced_server_side() {
+        let io = Some("IO.cloud@motherbee");
+        // run_node: IO.* only.
+        assert!(enforce_cloud_relay_content(io, "run_node", "motherbee",
+            &serde_json::json!({"node_name":"IO.api.x@motherbee"})).is_ok());
+        assert!(enforce_cloud_relay_content(io, "run_node", "motherbee",
+            &serde_json::json!({"node_name":"AI.worker@motherbee"})).is_err());
+        // vault_put: no caller-set ownership-authority fields.
+        for bad in ["ilk", "owner_ilk", "owner_l2"] {
+            assert!(enforce_cloud_relay_content(io, "vault_put", "motherbee",
+                &serde_json::json!({"key":"k","metadata":{bad:"x"}})).is_err(),
+                "vault_put must reject metadata.{bad} from io.cloud");
+        }
+        // owner_node must be IO.* (top-level or in metadata).
+        assert!(enforce_cloud_relay_content(io, "vault_put", "motherbee",
+            &serde_json::json!({"key":"k","metadata":{"owner_node":"SY.identity@motherbee"}})).is_err());
+        assert!(enforce_cloud_relay_content(io, "vault_put", "motherbee",
+            &serde_json::json!({"key":"k","owner_node":"AI.x@motherbee"})).is_err());
+        // Legit: clean metadata + IO.* owner_node + tenant_id (translate sets tenant_id) is fine.
+        assert!(enforce_cloud_relay_content(io, "vault_put", "motherbee",
+            &serde_json::json!({"key":"k","metadata":{"resource_type":"openai","tenant_id":"tnt:x","owner_node":"IO.api.x@motherbee"}})).is_ok());
+        // Not enforced for the operator path or other callers.
+        assert!(enforce_cloud_relay_content(None, "run_node", "motherbee",
+            &serde_json::json!({"node_name":"AI.worker@motherbee"})).is_ok());
+        assert!(enforce_cloud_relay_content(Some("SY.orchestrator@motherbee"), "vault_put", "motherbee",
+            &serde_json::json!({"metadata":{"ilk":"x"}})).is_ok());
     }
 
     #[test]
@@ -14456,6 +15176,168 @@ mod tests {
             json!(NODE_SECRET_REDACTION_TOKEN)
         );
         assert_eq!(redacted["payload"]["key"], json!("infra:openai-api-key"));
+    }
+
+    fn command_log_test_state_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("sy-admin-cmdlog-{tag}-{nanos}"))
+    }
+
+    fn command_log_entry(action: &str, hive: Option<&str>, status: &str, ts_ms: u64) -> AdminCommandLogEntry {
+        AdminCommandLogEntry {
+            ts_ms,
+            ts: format!("t{ts_ms}"),
+            action: action.to_string(),
+            hive: hive.map(ToString::to_string),
+            origin: "http".to_string(),
+            params: json!({}),
+            status: status.to_string(),
+            error_code: (status == "error").then(|| "SOME_ERROR".to_string()),
+            http_status: if status == "ok" { 200 } else { 500 },
+            duration_ms: 1,
+        }
+    }
+
+    #[test]
+    fn command_log_appends_and_reads_newest_first() {
+        let dir = command_log_test_state_dir("basic");
+        for i in 0..5u64 {
+            append_admin_command_log_locked(&dir, &command_log_entry("run_node", Some("motherbee"), "ok", i));
+        }
+        let out = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 3, ..Default::default() },
+        );
+        assert_eq!(out.len(), 3);
+        // newest first
+        assert_eq!(out[0]["ts_ms"], json!(4));
+        assert_eq!(out[2]["ts_ms"], json!(2));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_log_rotates_by_entry_count_and_reads_across_rotations() {
+        let dir = command_log_test_state_dir("rotate");
+        let total = ADMIN_COMMAND_LOG_ROTATE_ENTRIES as u64 + 10;
+        for i in 0..total {
+            append_admin_command_log_locked(&dir, &command_log_entry("update", None, "ok", i));
+        }
+        // the active file rotated once: commands.jsonl.1 exists and the active file is small
+        assert!(admin_command_log_dir(&dir).join("commands.jsonl.1").exists());
+        let active = fs::read_to_string(admin_command_log_path(&dir)).expect("active log");
+        assert_eq!(active.lines().count(), 10);
+        // reading spans the rotation: ask for more than the active file holds
+        let out = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 20, ..Default::default() },
+        );
+        assert_eq!(out.len(), 20);
+        assert_eq!(out[0]["ts_ms"], json!(total - 1));
+        assert_eq!(out[19]["ts_ms"], json!(total - 20));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_log_query_filters_by_action_status_hive_and_since() {
+        let dir = command_log_test_state_dir("filters");
+        append_admin_command_log_locked(&dir, &command_log_entry("run_node", Some("motherbee"), "ok", 10));
+        append_admin_command_log_locked(&dir, &command_log_entry("run_node", Some("worker-220"), "error", 20));
+        append_admin_command_log_locked(&dir, &command_log_entry("vault_put", Some("motherbee"), "ok", 30));
+        let by_action = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 10, action: Some("run_node".into()), ..Default::default() },
+        );
+        assert_eq!(by_action.len(), 2);
+        let by_status = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 10, status: Some("error".into()), ..Default::default() },
+        );
+        assert_eq!(by_status.len(), 1);
+        assert_eq!(by_status[0]["action"], json!("run_node"));
+        let by_hive = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 10, hive: Some("motherbee".into()), ..Default::default() },
+        );
+        assert_eq!(by_hive.len(), 2);
+        let by_since = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 10, since_ms: Some(21), ..Default::default() },
+        );
+        assert_eq!(by_since.len(), 1);
+        assert_eq!(by_since[0]["action"], json!("vault_put"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_log_params_redact_vault_value_and_truncate_huge_payloads() {
+        // a vault_put must never log its value
+        let vault = json!({
+            "action": "vault_put",
+            "key": "infra:slack-tokens",
+            "value": { "app_token": "xapp-secret" },
+            "metadata": { "tenant_id": "tnt:x" }
+        });
+        let redacted = admin_command_log_params(&vault);
+        assert_eq!(redacted["value"], json!(NODE_SECRET_REDACTION_TOKEN));
+        assert_eq!(redacted["key"], json!("infra:slack-tokens"));
+        // a huge CONFIG_SET payload gets truncated to a preview, never stored whole
+        let huge = json!({ "config": { "blob": "x".repeat(3 * ADMIN_COMMAND_LOG_PARAMS_MAX_BYTES) } });
+        let capped = admin_command_log_params(&huge);
+        assert_eq!(capped["_truncated"], json!(true));
+        let preview = capped["preview"].as_str().expect("preview string");
+        assert!(preview.len() <= ADMIN_COMMAND_LOG_PARAMS_MAX_BYTES);
+    }
+
+    #[test]
+    fn command_log_redacts_ssh_and_colonless_vault_secrets() {
+        // add_hive bootstrap creds (the contract promises these are never logged)
+        let add_hive = json!({
+            "hive_id": "worker-220",
+            "ssh_user": "administrator",
+            "ssh_password": "Hunter2!",
+            "ssh_key": "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END-----"
+        });
+        let r = admin_command_log_params(&add_hive);
+        assert_eq!(r["ssh_password"], json!(NODE_SECRET_REDACTION_TOKEN));
+        assert_eq!(r["ssh_key"], json!(NODE_SECRET_REDACTION_TOKEN));
+        assert_eq!(r["ssh_user"], json!("administrator")); // non-secret kept for audit
+        assert_eq!(r["hive_id"], json!("worker-220"));
+        // vault_rotate on a colon-less (but valid) key: value must still be redacted
+        let rotate = json!({ "key": "slack-tokens", "value": { "app_token": "xapp-secret" } });
+        let rr = admin_command_log_params(&rotate);
+        assert_eq!(rr["value"], json!(NODE_SECRET_REDACTION_TOKEN));
+        assert_eq!(rr["key"], json!("slack-tokens")); // the key NAME is not a secret
+    }
+
+    #[test]
+    fn command_log_hive_filter_keeps_hive_less_commands_visible() {
+        let dir = command_log_test_state_dir("hiveless");
+        append_admin_command_log_locked(&dir, &command_log_entry("run_node", Some("motherbee"), "ok", 10));
+        append_admin_command_log_locked(&dir, &command_log_entry("add_hive", None, "ok", 20));
+        // querying a specific hive must STILL surface hive-less (global) commands like add_hive
+        let out = read_recent_admin_commands(
+            &dir,
+            &AdminCommandLogQuery { limit: 10, hive: Some("motherbee".into()), ..Default::default() },
+        );
+        let actions: Vec<&str> = out.iter().filter_map(|c| c["action"].as_str()).collect();
+        assert!(actions.contains(&"add_hive"), "hive-less add_hive must be visible: {actions:?}");
+        assert!(actions.contains(&"run_node"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_recent_commands_is_a_registered_admin_action() {
+        let spec = resolve_internal_action_spec("list_recent_commands")
+            .expect("list_recent_commands registered");
+        assert!(!spec.requires_target);
+        assert_eq!(
+            admin_action_path_patterns("list_recent_commands"),
+            vec!["GET /hives/{hive}/commands"]
+        );
+        assert!(!admin_action_summary("list_recent_commands").is_empty());
     }
 
     #[test]

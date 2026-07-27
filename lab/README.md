@@ -1,5 +1,8 @@
 # Fluxbee lab (containerized)
 
+> **¿Buscás el lab de VMs (Proxmox: fb-build, hive 240-243, `pve.py`)?** → [`lab/PROXMOX.md`](PROXMOX.md).
+> Este README cubre el lab **Docker** (containers, sin VMs).
+
 A self-contained, reproducible way to run a real fluxbee mesh in Docker for
 testing — no VMs required. `systemd` runs as PID 1 inside each container, so the
 canonical `scripts/install.sh` and the orchestrator's service lifecycle work

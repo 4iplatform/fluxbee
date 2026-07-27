@@ -41,7 +41,7 @@ func TestPublishWorkflowPackageWritesDefaultConfigTemplate(t *testing.T) {
 			return &PackagePublishResult{
 				RuntimeName: fmt.Sprintf("%v", packageMeta["name"]),
 				Version:     fmt.Sprintf("%v", packageMeta["version"]),
-				PackagePath: filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "1"),
+				PackagePath: filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "0.0.1"),
 			}, nil
 		},
 	}
@@ -66,7 +66,7 @@ func TestPublishWorkflowPackageWritesDefaultConfigTemplate(t *testing.T) {
 	if fakeAdmin.publishCalls != 1 {
 		t.Fatalf("expected one admin publish call, got %d", fakeAdmin.publishCalls)
 	}
-	if publish.RuntimeName != "wf.invoice" || publish.Version != "1" {
+	if publish.RuntimeName != "wf.invoice" || publish.Version != "0.0.1" {
 		t.Fatalf("unexpected publish result %#v", publish)
 	}
 }
@@ -116,7 +116,7 @@ func TestPurgeWorkflowPackagesKeepsCurrentBackupAndBoundVersion(t *testing.T) {
 				"status": "ok",
 				"config": map[string]any{
 					"_system": map[string]any{
-						"runtime_version": "1",
+						"runtime_version": "0.0.1",
 					},
 				},
 			}, nil
@@ -127,12 +127,12 @@ func TestPurgeWorkflowPackagesKeepsCurrentBackupAndBoundVersion(t *testing.T) {
 		t.Fatalf("PurgeWorkflowPackages: %v", err)
 	}
 
-	for _, version := range []string{"1", "3", "4"} {
+	for _, version := range []string{"0.0.1", "0.0.3", "0.0.4"} {
 		if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", version)); err != nil {
 			t.Fatalf("expected version %s kept: %v", version, err)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "2")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "0.0.2")); !os.IsNotExist(err) {
 		t.Fatalf("expected version 2 purged, err=%v", err)
 	}
 }

@@ -154,8 +154,15 @@ json.dump({"schema_version": 1, "version": int(build_id), "components": comps},
           open(os.path.join(vroot, "manifest.json"), "w"), indent=2, sort_keys=True)
 print("vendor manifest: syncthing %s (%d components)" % (ver, len(comps)))
 PY
+elif [ "${FLUXBEE_ALLOW_NO_SYNCTHING:-0}" = "1" ]; then
+  echo "WARN: no vendored syncthing under vendor/ (FLUXBEE_ALLOW_NO_SYNCTHING=1) — blob/dist sync will be non-operational; add_hive with require_dist_sync will FAIL far from this cause"
 else
-  echo "WARN: no vendored syncthing under vendor/ — blob sync will be non-operational"
+  # Fail-closed (mirrors scripts/install.sh): a .deb without syncthing ships an
+  # orchestrator whose blob/dist-sync is dead, and a later add_hive with
+  # require_dist_sync fails far from the cause. Opt out with FLUXBEE_ALLOW_NO_SYNCTHING=1.
+  echo "ERROR: no vendored syncthing under vendor/ (expected vendor/syncthing/syncthing or vendor/<bundle>/syncthing)." >&2
+  echo "       Set FLUXBEE_ALLOW_NO_SYNCTHING=1 to build anyway (blob/dist sync will be non-operational)." >&2
+  exit 1
 fi
 
 # systemd units (mirrors scripts/install.sh install_unit). Not enabled here; the
@@ -263,15 +270,15 @@ Version: ${VERSION}
 Section: net
 Priority: optional
 Architecture: ${ARCH}
-Depends: adduser, openssl, libc6 (>= 2.39), postgresql
+Depends: adduser, openssl, libc6 (>= 2.39), postgresql, curl, python3
 Installed-Size: ${INSTALLED_KB}
 Maintainer: 4i Platform <ops@4iplatform.com>
 Description: Fluxbee internal-network orchestration mesh
  Core services (router, orchestrator, identity, vault, storage, admin,
  architect, cognition, policy, timer, wf-rules, opa-rules, frontdesk, edge)
  plus the singleton IO.cloud adapter and IO.blob public artifact curator (motherbee),
- and the instanced IO/AI runtimes (io.api, io.slack, ai.generic, wf.engine,
- io.linkedhelper) seeded under dist/runtimes per packaging/base-nodes.json.
+ and the instanced IO/AI runtimes (io.api, io.slack, io.wapp, ai.generic,
+ wf.engine, io.linkedhelper) seeded under dist/runtimes per packaging/base-nodes.json.
  Binaries + dist/core manifest (hashes baked at build), systemd units, and a
  first-boot helper. Run 'sudo fluxbee-firstboot' after install.
 EOF
@@ -283,6 +290,31 @@ install -m0755 packaging/deb-prerm "$DEST/DEBIAN/prerm"
 echo "== [5/5] dpkg-deb =="
 install -d "$ROOT_DIR/dist"
 OUT="$ROOT_DIR/dist/fluxbee_${VERSION}_${ARCH}.deb"
+
+# Preflight: dpkg-deb needs room for the compressed .deb PLUS xz working space next to the ~1GB
+# staged tree. On a full disk it can exit 0 while writing a truncated (data-less) .deb — so refuse
+# to build unless there is comfortable headroom, and fail LOUD (a silent 1806-byte .deb once shipped
+# a "successful" build that could never install). Threshold: staged size + 1 GiB margin.
+DEST_KB="$(du -sk "$DEST" | awk '{print $1}')"
+NEED_KB=$(( DEST_KB + 1048576 ))
+FREE_KB="$(df -Pk "$ROOT_DIR/dist" | awk 'NR==2{print $4}')"
+if [ "$FREE_KB" -lt "$NEED_KB" ]; then
+  echo "ERROR: insufficient disk to build the .deb: need ~$((NEED_KB/1024)) MB free on $(dirname "$OUT"), have $((FREE_KB/1024)) MB." >&2
+  echo "       Free space (old .debs in dist/, cargo target/, /tmp) and retry." >&2
+  exit 1
+fi
+
 dpkg-deb --root-owner-group --build "$DEST" "$OUT"
-echo "built: $OUT"
+
+# Post-build integrity: a healthy fluxbee .deb is ~250 MB with a listable data archive. A tiny .deb
+# (only control.tar, no data.tar) means dpkg-deb was truncated (e.g. ENOSPC swallowed by xz). Catch
+# it here instead of "publishing" a package that installs to nothing.
+OUT_BYTES="$(stat -c %s "$OUT" 2>/dev/null || echo 0)"
+if [ "$OUT_BYTES" -lt $((50 * 1024 * 1024)) ] || ! dpkg-deb -c "$OUT" >/dev/null 2>&1; then
+  echo "ERROR: built .deb is broken (size=${OUT_BYTES} bytes, data archive unreadable) — likely a" >&2
+  echo "       truncated dpkg-deb write (disk full during xz). Removing it; NOT a usable package." >&2
+  rm -f "$OUT"
+  exit 1
+fi
+echo "built: $OUT ($((OUT_BYTES/1024/1024)) MB)"
 dpkg-deb --info "$OUT" | sed -n '1,12p'

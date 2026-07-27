@@ -123,6 +123,50 @@ necesita acceso a GitHub y el toolchain — nada más.
 > Caja de referencia en el lab: la VM **fb-build** (Proxmox `PC-004-165`, VM 210) ya tiene el
 > toolchain y `/opt/fluxbee`. `scripts/make-deb.sh` reproduce ese setup en cualquier máquina.
 
+### 4.3 Repo apt interno (instalar por red, sin copiar el `.deb`) — recomendado
+
+En vez de copiar el `.deb` a cada box, dejá la máquina de build como **repo apt interno**: sirve el
+`.deb` por HTTP y cualquier box de la red hace `apt install fluxbee`. apt resuelve `postgresql` (y
+demás Depends) del archive de Ubuntu automáticamente — los clones quedan como Ubuntu pelado.
+
+En el build+repo box (tras `make-deb.sh`):
+
+```bash
+scripts/apt-repo-publish.sh --serve          # publica el .deb en un repo flat + lo sirve en :8900
+```
+
+`apt-repo-publish.sh` arma un repo flat (`dpkg-scanpackages` + `apt-ftparchive release`) y lo sirve.
+Es **sin firmar** + `[trusted=yes]` (uso interno). Para un repo **público/internet**, firmá el
+`Release` con GPG (`InRelease`) y sacá `[trusted=yes]` — el `.deb` en sí no cambia. Volvé a correr
+el script tras cada build nuevo para regenerar el índice.
+
+> **Fijá la IP del repo box — FUERA del pool DHCP.** La URL del repo (`http://<host>:8900`) queda
+> escrita en cada cliente; si el build box está por DHCP y su IP drifta, todos los `apt update`
+> fallan con *no route to host*. Dale IP estática (netplan `dhcp4:false` + `addresses`, y
+> `network:{config:disabled}` en `/etc/cloud/cloud.cfg.d/` si es cloud-init) **por encima del rango
+> DHCP del router** (si no, el router puede reasignar esa IP y colisiona). En el lab: pool DHCP
+> `192.168.4.20–.150`, repo fijado en `192.168.4.200`.
+
+En cualquier cliente (Ubuntu limpio):
+
+```bash
+echo 'deb [trusted=yes] http://<build-host>:8900 ./' | sudo tee /etc/apt/sources.list.d/fluxbee.list
+sudo apt-get update && sudo apt-get install -y fluxbee
+sudo nano /etc/fluxbee/hive.yaml && sudo fluxbee-firstboot
+```
+
+### 4.4 Layout de 3 servers (lab Proxmox `PC-004-165/157/156`)
+
+| Server | Rol | Qué corre |
+|--------|-----|-----------|
+| PC-004-165 | build+repo + dev | fb-build (toolchain + `make-deb` + repo apt `:8900`) + VMs de prueba destruibles |
+| PC-004-156 | stable | backend fluxbee instalado por el repo, mantenido entre majors |
+| PC-004-157 | dev/spare | VMs destruibles |
+
+> Un build box **dedicado en 157** solo requiere una **deploy key de GitHub** para clonar el repo
+> privado (el cloud image de Ubuntu no trae `qemu-guest-agent`, así que las VMs del lab se crean
+> clonando el template base ya provisto y migrándolo entre nodos). Follow-up cuando haya key.
+
 ---
 
 ## 5. Instalar el backend (motherbee)
@@ -138,12 +182,13 @@ sudo fluxbee-firstboot
 `fluxbee-firstboot` (idempotente): bootea PostgreSQL + crea rol/DBs, arranca el orchestrator,
 hace el `vault_put` del secreto de postgres (la **conexión a la DB queda resuelta sola en el
 vault**), reconecta los consumidores, arranca los singletons (IO.blob/IO.cloud), y **auto-spawnea
-las instancias default de los boot-runtimes** (io.api/io.slack/ai.generic/wf.engine). Al terminar
+las instancias default de los boot-runtimes** (io.api/io.slack/ai.generic). Al terminar
 imprime los **próximos pasos**.
 
 Después del firstboot quedan **corriendo**: el core `SY.*` + IO.blob + IO.cloud +
-`AI.chat@motherbee` + `IO.api@motherbee` + `IO.slack@motherbee` + `WF.engine@motherbee` — varios
-**degradados** hasta cargar sus secretos.
+`AI.chat@motherbee` + `IO.api@motherbee` + `IO.slack@motherbee` — varios
+**degradados** hasta cargar sus secretos. (`wf.engine` queda **horneado pero NO al boot** —
+`boot:false` en `base-nodes.json`; se spawnea a demanda desde un workflow package.)
 
 ### 5.1 Lo que pone el usuario (secretos en el vault)
 
@@ -154,7 +199,9 @@ Postgres ya está resuelto por el firstboot. Lo demás es del operador:
 curl -sS -X POST http://127.0.0.1:8080/hives/motherbee/vault/secrets \
   -H 'content-type: application/json' \
   -d '{"key":"openai_root_pool","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"tnt:00000000-0000-0000-0000-000000000001","resource_type":"openai"}}'
-# (resource_type "anthropic" para una key de Anthropic.)
+# (resource_type "anthropic" para una key de Anthropic. OJO: el default_provider es "openai";
+#  si cargás una key de Anthropic, poné además `ai.default_provider: anthropic` en
+#  /etc/fluxbee/hive.yaml y reiniciá los nodos AI, o siguen resolviendo el pool de openai.)
 
 # Tokens de Slack para IO.slack: resource_type "slack", value {app_token, bot_token}.
 ```

@@ -110,10 +110,10 @@ func TestApplyWorkflowRotatesAndPublishesPackage(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(svc.store.Root(), "invoice", "current", "metadata.json")); err != nil {
 		t.Fatalf("missing current metadata: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "1", "package.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "0.0.1", "package.json")); err != nil {
 		t.Fatalf("missing package.json: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "1", "flow", "definition.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(svc.cfg.DistRuntimeRoot, "wf.invoice", "0.0.1", "flow", "definition.json")); err != nil {
 		t.Fatalf("missing flow/definition.json: %v", err)
 	}
 	manifestPath := filepath.Join(svc.cfg.DistRuntimeRoot, "manifest.json")

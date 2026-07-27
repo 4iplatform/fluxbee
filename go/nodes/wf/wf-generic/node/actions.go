@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -124,6 +125,39 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 
 	// thread_id = instance_id (enables response correlation)
 	threadID := inst.InstanceID
+	// gap-5: an explicit thread_id_ref overrides instance_id for a TERMINAL reply to an external
+	// ingress caller (answer on the caller's own thread; no reply-back to this instance is expected).
+	// Resolved the same way as target_ref.
+	if threadRef := strings.TrimSpace(action.ThreadIDRef); threadRef != "" {
+		resolved, err := lookupRef(threadRef, inst.Input, inst.StateVars, eventMap)
+		if err != nil {
+			return fmt.Errorf("send_message: resolve thread_id_ref %q: %w", threadRef, err)
+		}
+		s, ok := resolved.(string)
+		if !ok {
+			return fmt.Errorf("send_message: thread_id_ref %q resolved to non-string %T", threadRef, resolved)
+		}
+		if strings.TrimSpace(s) == "" {
+			return fmt.Errorf("send_message: thread_id_ref %q resolved to an empty string", threadRef)
+		}
+		threadID = s
+	}
+
+	// gap-3: resolve an optional meta.context (e.g. {response_envelope: {...}} to request AI
+	// structured output) with the same $ref rules as the payload, and carry it on the frame's
+	// meta.context so ai-generic can read it.
+	var contextRaw json.RawMessage
+	if action.Meta != nil && action.Meta.Context != nil {
+		resolvedCtx, err := Resolve(action.Meta.Context, inst.Input, inst.StateVars, eventMap)
+		if err != nil {
+			return fmt.Errorf("send_message: resolve meta.context: %w", err)
+		}
+		ctxBytes, err := json.Marshal(resolvedCtx)
+		if err != nil {
+			return fmt.Errorf("send_message: marshal meta.context: %w", err)
+		}
+		contextRaw = ctxBytes
+	}
 	// trace_id = original event trace_id (idempotency on re-execution)
 	traceID := inst.CurrentTraceID
 	if traceID == "" {
@@ -132,12 +166,43 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 
 	src := actx.Dispatcher.NodeUUID()
 
+	// Resolve the destination. A dynamic target (target_ref) is a $ref dot-path over state/input/event
+	// — the "AI host routes to a computed specialist" case. The (resolved) name is re-validated,
+	// SY./RT.-blocked, AND required to be user-kind again here at send time — publish-time validation
+	// is not the only line of defense (a tampered/downgraded package could otherwise slip through).
+	target := action.Target
+	if targetRef := strings.TrimSpace(action.TargetRef); targetRef != "" {
+		// F1 defense-in-depth: a runtime-computed destination must never emit a system-kind frame
+		// (that path can bypass VPN isolation). Publish forces meta.type=user; re-enforce it here.
+		if msgType != "user" {
+			return fmt.Errorf("send_message: target_ref (dynamic target) requires meta.type=user, got %q", msgType)
+		}
+		resolved, err := lookupRef(targetRef, inst.Input, inst.StateVars, eventMap)
+		if err != nil {
+			return fmt.Errorf("send_message: resolve target_ref %q: %w", targetRef, err)
+		}
+		s, ok := resolved.(string)
+		if !ok {
+			return fmt.Errorf("send_message: target_ref %q resolved to non-string %T", targetRef, resolved)
+		}
+		target = s
+	}
+	// Runtime destination guard (esp. for a runtime-computed target): the resolved name MUST be a
+	// valid L2 name and MUST NOT be a SY.*/RT.* system node — those bypass VPN isolation in the router,
+	// so a computed target could otherwise reach a system node (e.g. SY.vault) cross-VPN.
+	if !isValidL2Name(target) {
+		return fmt.Errorf("send_message: resolved target %q is not a valid L2 name", target)
+	}
+	if isForbiddenSystemTarget(target) {
+		return fmt.Errorf("send_message: resolved target %q must not be a SY.*/RT.* system node", target)
+	}
+
 	msgNameCopy := msgName
 	threadIDCopy := threadID
 	msg := sdk.Message{
 		Routing: sdk.Routing{
 			Src:     src,
-			Dst:     sdk.UnicastDestination(action.Target),
+			Dst:     sdk.UnicastDestination(target),
 			TTL:     16,
 			TraceID: traceID,
 		},
@@ -145,12 +210,36 @@ func execSendMessage(ctx context.Context, action ActionDefinition, inst *WFInsta
 			MsgType:  msgType,
 			Msg:      &msgNameCopy,
 			ThreadID: &threadIDCopy,
+			Context:  contextRaw,
 		},
 		Payload: raw,
 	}
 
-	return actx.Dispatcher.SendMsg(msg)
+	// A transient backpressure/reconnect makes NodeSender.Send return "sender queue full" (a
+	// non-blocking channel send). With send_message defaulting to on_error=fail (gap-2), a single such
+	// blip would needlessly route a healthy instance to terminal failure. Retry a few times with a
+	// short, ctx-aware backoff so a momentarily full queue drains before the error is treated as fatal;
+	// a permanent condition (dead connection) still fails after the attempts.
+	var sendErr error
+	for attempt := 0; attempt < sendMaxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("send_message: cancelled during send retry: %w", ctx.Err())
+			case <-time.After(sendRetryBackoff):
+			}
+		}
+		if sendErr = actx.Dispatcher.SendMsg(msg); sendErr == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("send_message: dispatch failed after %d attempts: %w", sendMaxAttempts, sendErr)
 }
+
+const (
+	sendMaxAttempts  = 4
+	sendRetryBackoff = 50 * time.Millisecond
+)
 
 func execScheduleTimer(ctx context.Context, action ActionDefinition, inst *WFInstance, event sdk.Message, actx ActionContext) error {
 	if actx.Timer == nil {

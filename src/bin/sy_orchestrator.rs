@@ -1698,6 +1698,34 @@ async fn reconcile_persisted_custom_nodes(
 
         let (persisted_ilk, persisted_tenant) =
             load_persisted_node_identity(state, &node.node_name);
+        // FIX-5: if the on-disk node->ilk map is empty (a persist failed at spawn), do NOT relaunch
+        // blind — recover the identity from SY.identity's SHM by handler node and re-persist, so
+        // io.api comes up WITH its tenant/ilk instead of node_not_configured on every request.
+        let (persisted_ilk, persisted_tenant) =
+            if persisted_ilk.is_none() && persisted_tenant.is_none() {
+                match fluxbee_sdk::identity::find_ilk_by_handler_node_from_hive_id(
+                    &state.hive_id,
+                    &node.node_name,
+                ) {
+                    Ok(Some((_, ilk))) => {
+                        tracing::warn!(
+                            node_name = %node.node_name,
+                            ilk_id = %ilk.ilk_id,
+                            "reconcile: node->ilk map missing; recovered identity from SY.identity SHM and re-persisting"
+                        );
+                        let _ = persist_node_ilk_mapping(
+                            state,
+                            &node.node_name,
+                            &ilk.ilk_id,
+                            &ilk.tenant_id,
+                        );
+                        (Some(ilk.ilk_id), Some(ilk.tenant_id))
+                    }
+                    _ => (persisted_ilk, persisted_tenant),
+                }
+            } else {
+                (persisted_ilk, persisted_tenant)
+            };
         let cmd = build_managed_node_run_command(
             &unit,
             &node.node_name,
@@ -9916,10 +9944,31 @@ fn run_blob_gc_housekeeping(
         name_max_chars: BLOB_NAME_MAX_CHARS,
         max_blob_bytes: None,
     })?;
+    // FIX-10: pin active blobs still referenced by io.blob's publication ledger so the mtime-based GC
+    // never reaps a source a live publication needs for verify/repair. The ledger lives OUTSIDE
+    // blob_root, so resolve it EXACTLY as io.blob does (IO_BLOB_LEDGER_PATH env, else the absolute
+    // DEFAULT_IO_BLOB_LEDGER_PATH) rather than deriving from blob.path — a custom blob_root must not
+    // silently point the pin lookup at a nonexistent ledger and let the GC reap live sources. A
+    // missing ledger still degrades to legacy mtime-only GC, but is now logged so it is observable.
+    const DEFAULT_IO_BLOB_LEDGER_PATH: &str = "/var/lib/fluxbee/state/io-blob/publications.json";
+    let ledger_path = std::env::var("IO_BLOB_LEDGER_PATH")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_IO_BLOB_LEDGER_PATH));
+    if !ledger_path.exists() {
+        tracing::warn!(
+            ledger_path = %ledger_path.display(),
+            "io.blob publication ledger not found; blob GC runs without publication pins (set \
+             IO_BLOB_LEDGER_PATH on sy-orchestrator to match io.blob if it is relocated)"
+        );
+    }
+    let pinned_blob_names = fluxbee_sdk::blob::published_blob_names(&ledger_path);
     let report = toolkit.run_gc(BlobGcOptions {
         staging_ttl_hours: blob.gc_staging_ttl_hours,
         active_retain_days: blob.gc_active_retain_days,
         apply: blob.gc_apply,
+        pinned_blob_names,
     })?;
 
     if report.staging.candidate_files > 0 || report.active.candidate_files > 0 {
@@ -12316,15 +12365,23 @@ async fn ensure_node_identity_registered(
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .unwrap_or_else(|| requested_ilk_id.clone());
-    if let Err(err) = persist_node_ilk_mapping(state, node_name, &resolved_ilk_id, &tenant_id) {
-        tracing::warn!(
-            node_name = node_name,
-            ilk_id = resolved_ilk_id,
-            tenant_id = tenant_id,
-            error = %err,
-            "failed to persist node->ilk mapping"
-        );
-    }
+    // FIX-5: a swallowed persist failure silently bricks this node on the NEXT host reboot —
+    // reconcile relaunches it from the on-disk map only, so it comes up with no tenant/ilk and every
+    // request 404s node_not_configured. Escalate to error AND surface it in the ok-response so the
+    // spawn caller can react (reconcile also has an identity-SHM fallback now, but re-persist here).
+    let identity_persist_failed =
+        if let Err(err) = persist_node_ilk_mapping(state, node_name, &resolved_ilk_id, &tenant_id) {
+            tracing::error!(
+                node_name = node_name,
+                ilk_id = resolved_ilk_id,
+                tenant_id = tenant_id,
+                error = %err,
+                "FAILED to persist node->ilk mapping — node loses its identity on reboot until re-spawned"
+            );
+            true
+        } else {
+            false
+        };
 
     Ok(Some(serde_json::json!({
         "status": "ok",
@@ -12332,6 +12389,7 @@ async fn ensure_node_identity_registered(
         "requested_ilk_id": requested_ilk_id,
         "ilk_type": ilk_type,
         "target": identity_target,
+        "identity_persist_failed": identity_persist_failed,
     })))
 }
 
@@ -17005,6 +17063,7 @@ async fn add_hive_flow(
                     "address": address,
                     "created_at": now_epoch_ms().to_string(),
                     "status": "connected",
+                    "role": "worker",
                     "ssh_user": creds.user,
                 });
                 if let Some(device_id) = worker_syncthing_device_id.clone() {
@@ -17124,11 +17183,12 @@ async fn add_hive_flow(
                     creds.user.as_str(),
                     password,
                 ) {
-                    return serde_json::json!({
-                        "status": "error",
-                        "error_code": "SSH_KEY_FAILED",
-                        "message": format!("failed to seed bootstrap key via password channel: {err}"),
-                    });
+                    // F3-errnorm: a PASSWORD-channel failure is not a key failure — classify it
+                    // (SSH_AUTH_FAILED / SSH_TIMEOUT / SSH_CONNECTION_REFUSED) so a rejected password
+                    // (the cloud-init PasswordAuthentication=no trap) surfaces the right code + hint.
+                    return ssh_bootstrap_error_payload(&format!(
+                        "failed to seed bootstrap key via password channel: {err}"
+                    ));
                 }
             } else {
                 return ssh_bootstrap_error_payload(&format!(
@@ -17585,6 +17645,7 @@ async fn add_hive_flow(
         "address": address,
         "created_at": now_epoch_ms().to_string(),
         "status": if wan_connected && orchestrator_connected { "connected" } else { "pending" },
+        "role": "worker",
         "ssh_user": creds.user,
     });
     if let Err(err) = write_hive_info(&root, hive_id, &info_payload) {
@@ -17821,6 +17882,7 @@ async fn add_hive_flow(
         "address": address,
         "created_at": now_epoch_ms().to_string(),
         "status": "connected",
+        "role": "worker",
         "syncthing_peer_linked": syncthing_peer_linked,
         "ssh_user": creds.user,
     });
@@ -18013,10 +18075,11 @@ async fn add_egress_hive_flow(
                     creds.user.as_str(),
                     password,
                 ) {
-                    return err_payload(
-                        "SSH_KEY_FAILED",
-                        format!("failed to seed bootstrap key: {err}"),
-                    );
+                    // F3-errnorm: password-channel failure -> classify (SSH_AUTH_FAILED + hint),
+                    // not a blanket SSH_KEY_FAILED.
+                    return ssh_bootstrap_error_payload(&format!(
+                        "failed to seed bootstrap key via password channel: {err}"
+                    ));
                 }
             } else {
                 return ssh_bootstrap_error_payload(&format!(
@@ -19230,11 +19293,25 @@ fn ssh_bootstrap_error_payload(error: &str) -> serde_json::Value {
     } else {
         "SSH_AUTH_FAILED"
     };
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "status": "error",
         "error_code": code,
         "message": error,
-    })
+    });
+    // F3-hint: the #1 clean-Ubuntu add_hive failure. A stock cloud image ships
+    // /etc/ssh/sshd_config.d/50-cloud-init.conf with PasswordAuthentication no, and sshd is
+    // first-match so a 99-*.conf drop-in cannot override it — password bootstrap then fails with
+    // "permission denied". Point the operator at the key-first channel (the cloud-init-injected key)
+    // or a low-numbered 00-*.conf drop-in.
+    if code == "SSH_AUTH_FAILED" && lower.contains("permission denied") {
+        payload["hint"] = serde_json::json!(
+            "auth rejected. On a stock Ubuntu cloud image PasswordAuthentication is 'no' \
+             (/etc/ssh/sshd_config.d/50-cloud-init.conf, first-match — a 99- drop-in will NOT \
+             override it). Use ssh_key (the cloud-init-injected key) instead of ssh_password, or \
+             add a 00-*.conf drop-in with PasswordAuthentication yes. See docs/07-operaciones.md §8.0/§8.1."
+        );
+    }
+    payload
 }
 
 fn hive_exists(state_dir: &Path, hive_id: &str) -> bool {
@@ -21219,6 +21296,33 @@ fn is_ingress_role(role: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // F3: SSH bootstrap failures must classify by cause. A password-channel "permission denied"
+    // (the #1 clean-Ubuntu trap: cloud-init 50-*.conf sets PasswordAuthentication no) must surface
+    // SSH_AUTH_FAILED WITH the actionable hint — not a blanket SSH_KEY_FAILED with no guidance.
+    #[test]
+    fn ssh_bootstrap_error_classifies_and_hints() {
+        let denied = ssh_bootstrap_error_payload(
+            "failed to seed bootstrap key via password channel: Permission denied (publickey,password).",
+        );
+        assert_eq!(denied["error_code"], "SSH_AUTH_FAILED");
+        assert!(
+            denied["hint"].as_str().unwrap_or("").contains("PasswordAuthentication"),
+            "permission-denied auth failure must carry the cloud-init hint: {denied}"
+        );
+
+        let refused = ssh_bootstrap_error_payload("ssh: connect to host x: Connection refused");
+        assert_eq!(refused["error_code"], "SSH_CONNECTION_REFUSED");
+        assert!(refused.get("hint").is_none(), "no hint on non-auth failures");
+
+        let timeout = ssh_bootstrap_error_payload("ssh: connect to host x: Connection timed out");
+        assert_eq!(timeout["error_code"], "SSH_TIMEOUT");
+
+        // An auth failure that is NOT permission-denied stays AUTH_FAILED but carries no hint.
+        let other = ssh_bootstrap_error_payload("host key verification failed");
+        assert_eq!(other["error_code"], "SSH_AUTH_FAILED");
+        assert!(other.get("hint").is_none());
+    }
 
     const LOCAL_DEVICE_ID: &str = "V7TZE22-7TDF4XG-KXILPOJ-NXFPHYF-HPXR2AH-YCZKW5G-XAOGXS3-AKHUFAC";
     const PEER_DEVICE_ID: &str = "I7MM32M-LYH7OVN-TCPA6G4-MIFHRC6-T7RKRVN-Q35OZRX-MGZMVA3-X7Y24QF";

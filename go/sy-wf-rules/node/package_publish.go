@@ -7,12 +7,23 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 )
 
 const workflowRuntimeBase = "wf.engine"
+
+// workflowRuntimeVersion encodes the monotonic uint64 workflow version as a
+// semver-valid string. Runtime packages (including type=workflow) are validated
+// against strict MAJOR.MINOR.PATCH by the runtime-package publisher
+// (src/runtime_package.rs), so the raw integer ("1") is rejected. The uint64
+// counter stays the source of truth; only its string encoding changes. It is the
+// SINGLE place the version string is derived, so the package.json version, the
+// dist directory name, the manifest entry, the purge keep-set, and the spawned
+// node's runtime_version all agree byte-for-byte.
+func workflowRuntimeVersion(v uint64) string {
+	return fmt.Sprintf("0.0.%d", v)
+}
 
 type PackagePublishResult struct {
 	RuntimeName string
@@ -50,7 +61,7 @@ func (s *Service) PublishWorkflowPackage(workflowName string, meta WfRulesMetada
 
 func buildWorkflowPackageFiles(hiveID, workflowName string, meta WfRulesMetadata, definitionBytes []byte) (map[string]string, error) {
 	runtimeName := "wf." + workflowName
-	version := strconv.FormatUint(meta.Version, 10)
+	version := workflowRuntimeVersion(meta.Version)
 
 	packageJSON := map[string]any{
 		"name":         runtimeName,
@@ -83,7 +94,7 @@ func buildWorkflowPackageFiles(hiveID, workflowName string, meta WfRulesMetadata
 
 func (s *Service) publishWorkflowPackageLocal(workflowName string, meta WfRulesMetadata, definitionBytes []byte) (*PackagePublishResult, error) {
 	runtimeName := workflowRuntimeName(workflowName)
-	version := strconv.FormatUint(meta.Version, 10)
+	version := workflowRuntimeVersion(meta.Version)
 	packageFiles, err := buildWorkflowPackageFiles(s.cfg.HiveID, workflowName, meta, definitionBytes)
 	if err != nil {
 		return nil, err
@@ -122,10 +133,10 @@ func (s *Service) PurgeWorkflowPackages(workflowName string, preserveBoundVersio
 
 	keep := map[string]struct{}{}
 	if meta, err := s.store.ReadCurrentMetadata(workflowName); err == nil {
-		keep[strconv.FormatUint(meta.Version, 10)] = struct{}{}
+		keep[workflowRuntimeVersion(meta.Version)] = struct{}{}
 	}
 	if meta, err := s.store.ReadBackupMetadata(workflowName); err == nil {
-		keep[strconv.FormatUint(meta.Version, 10)] = struct{}{}
+		keep[workflowRuntimeVersion(meta.Version)] = struct{}{}
 	}
 	if preserveBoundVersion {
 		boundVersion, err := s.boundRuntimeVersionForWorkflow(workflowName)

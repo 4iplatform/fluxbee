@@ -25,8 +25,13 @@ use fluxbee_sdk::identity::{find_ilk_by_handler_node_from_hive_config, IdentityI
 use fluxbee_sdk::protocol::{
     Destination, MemoryPackage, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
 };
+use fluxbee_sdk::managed_control_plane::{
+    bootstrap_managed_control_plane, persist_effective_config_with_root, ContractError,
+    ManagedControlPlaneState, ManagedNodeConfigContract, ManagedNodeLifecycleState,
+    DEFAULT_MANAGED_NODES_ROOT,
+};
 use fluxbee_sdk::{
-    managed_node_config_path, managed_node_name, NodeConfig, NodeUuidMode, OperationalRouteProfile,
+    managed_node_instance_dir, managed_node_name, NodeConfig, NodeUuidMode, OperationalRouteProfile,
     RouteMatch, RouteTarget, RouterDispatcher, VaultCallerOwned, VaultClient,
 };
 use fluxbee_sdk::{MSG_ILK_REGISTER, MSG_TNT_CREATE};
@@ -208,14 +213,6 @@ enum InstructionsSourceKind {
     None,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct EffectiveStateFile {
-    schema_version: u32,
-    config_version: u64,
-    node_name: String,
-    config: EffectiveConfigDocument,
-    updated_at: String,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct EffectiveConfigDocument {
@@ -424,7 +421,6 @@ struct GenericAiNode {
     self_tenant_id: Option<String>,
     behavior: Arc<RwLock<Option<NodeBehavior>>>,
     config_dir: PathBuf,
-    dynamic_config_dir: PathBuf,
     /// Router socket directory — kept for tracing/debug purposes only.
     router_socket: PathBuf,
     /// UUID persistence root — kept for tracing/debug purposes only.
@@ -904,22 +900,9 @@ impl ImmediateMemoryStore {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NodeLifecycleState {
-    Unconfigured,
-    Configured,
-    FailedConfig,
-}
-
-impl NodeLifecycleState {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Unconfigured => "UNCONFIGURED",
-            Self::Configured => "CONFIGURED",
-            Self::FailedConfig => "FAILED_CONFIG",
-        }
-    }
-}
+/// ai.generic's config-plane lifecycle IS the SDK's canonical one — no local re-definition, so it
+/// cannot drift from the shared control-plane.
+type NodeLifecycleState = ManagedNodeLifecycleState;
 
 #[derive(Debug)]
 struct ControlPlaneState {
@@ -1884,12 +1867,17 @@ impl GenericAiNode {
         state.effective_config = Some(materialized_config);
         state.schema_version = schema_version;
         state.config_version = config_version;
-        if let Err(err) = persist_dynamic_config(
-            &self.dynamic_config_dir,
+        // Single-config model: persist back to the node-dir config.json (SDK-owned, preserves the
+        // orchestrator's _system). No state/ai-nodes file, so a kill/respawn can't leave a stale one
+        // to shadow the fresh config.
+        if let Err(err) = persist_effective_config_with_root(
             &self.node_name,
-            state.schema_version,
             state.config_version,
-            &config_doc,
+            state
+                .effective_config
+                .as_ref()
+                .expect("effective_config was just set to Some above"),
+            std::path::Path::new(DEFAULT_MANAGED_NODES_ROOT),
         ) {
             state.current_state = prev_state;
             state.config_source = prev_source;
@@ -1898,7 +1886,7 @@ impl GenericAiNode {
             state.config_version = prev_version;
             return self.error_response(
                 "config_persist_error",
-                format!("Failed to persist dynamic config: {err}"),
+                format!("Failed to persist config: {err}"),
                 prev_schema,
                 prev_version,
                 prev_state.as_str(),
@@ -2100,14 +2088,27 @@ impl GenericAiNode {
     }
 
     async fn build_node_status_get_response(&self) -> Value {
-        let health_state = std::env::var(NODE_STATUS_DEFAULT_HEALTH_STATE)
-            .ok()
-            .as_deref()
-            .map(normalize_health_state)
-            .unwrap_or("HEALTHY");
+        let lifecycle = self.control_plane.read().await.current_state;
+        // A node that failed to load its config (FAILED_CONFIG) or was never configured refuses every
+        // completion — it is NOT healthy. Previously health_state was hardcoded to "HEALTHY", so a
+        // broken node reported healthy to the orchestrator while silently rejecting all work, which
+        // hid the real failure. Derive health from the lifecycle and surface lifecycle_state so the
+        // operator sees WHY. DEGRADED is a soft signal (does not trigger an orchestrator restart loop,
+        // which would not fix a bad config anyway). The env override only applies to a Configured node
+        // so it can never force a broken node back to HEALTHY.
+        let health_state = if lifecycle == NodeLifecycleState::Configured {
+            std::env::var(NODE_STATUS_DEFAULT_HEALTH_STATE)
+                .ok()
+                .as_deref()
+                .map(normalize_health_state)
+                .unwrap_or("HEALTHY")
+        } else {
+            "DEGRADED"
+        };
         json!({
             "status": "ok",
-            "health_state": health_state
+            "health_state": health_state,
+            "lifecycle_state": lifecycle.as_str(),
         })
     }
 }
@@ -4352,8 +4353,15 @@ impl NodeBehavior {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Managed runtime nodes are launched by the orchestrator via transient systemd units that do
+    // NOT set RUST_LOG, and EnvFilter::from_default_env() with an unset RUST_LOG emits NOTHING — so
+    // ai.generic was silent in journald (no config-rejection reason, no completions, no errors),
+    // which turned every misconfiguration into a blind debug. Default to INFO like the sibling nodes
+    // (io-api / sy-admin / sy-orchestrator); RUST_LOG still overrides when set.
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let args = parse_runner_args()?;
@@ -4414,8 +4422,6 @@ async fn run_one_config(
     let startup_effective_doc =
         materialize_effective_defaults(&cfg.node.name, startup_effective_doc);
     let startup_effective_config = serde_json::to_value(&startup_effective_doc)?;
-    let persisted_dynamic =
-        load_persisted_dynamic_config(&PathBuf::from(&cfg.node.dynamic_config_dir), &cfg.node.name);
     let behavior = build_behavior(&cfg)?;
     let node_config_dir = cfg.node.config_dir.clone();
     let runner_node_name = cfg.node.name.clone();
@@ -4453,10 +4459,19 @@ async fn run_one_config(
 
     let node_name = runner_node_name.clone();
     let gov_identity = gov_identity_config_from_env();
-    let thread_state_store =
-        init_thread_state_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
-    let immediate_memory_store =
-        init_immediate_memory_store(&node_name, &PathBuf::from(&cfg.node.dynamic_config_dir)).await;
+    // Static/dev path: keep the per-node store layout under the YAML-configured dynamic dir.
+    let static_state_dir =
+        infer_state_dir_from_dynamic(&PathBuf::from(&cfg.node.dynamic_config_dir));
+    let thread_state_store = init_thread_state_store(
+        &node_name,
+        LanceDbThreadStateStore::path_for_node(&static_state_dir, &node_name),
+    )
+    .await;
+    let immediate_memory_store = init_immediate_memory_store(
+        &node_name,
+        ImmediateMemoryStore::path_for_node(&static_state_dir, &node_name),
+    )
+    .await;
     let cognitive_definition_config =
         CognitiveDefinitionRuntimeConfig::from(cfg.runtime.cognitive_definition.clone());
     let cognitive_definition = Arc::new(RwLock::new(CognitiveDefinitionRuntimeState::unresolved(
@@ -4497,7 +4512,6 @@ async fn run_one_config(
         self_tenant_id,
         behavior: Arc::new(RwLock::new(Some(behavior))),
         config_dir: PathBuf::from(node_config_dir),
-        dynamic_config_dir: PathBuf::from(cfg.node.dynamic_config_dir),
         router_socket: runner_router_socket,
         state_dir: runner_uuid_persistence_dir,
         thread_state_store,
@@ -4508,14 +4522,8 @@ async fn run_one_config(
             current_state: NodeLifecycleState::Configured,
             config_source: "yaml",
             effective_config: Some(startup_effective_config),
-            schema_version: persisted_dynamic
-                .as_ref()
-                .map(|v| v.schema_version)
-                .unwrap_or(1),
-            config_version: persisted_dynamic
-                .as_ref()
-                .map(|v| v.config_version)
-                .unwrap_or(1),
+            schema_version: 1,
+            config_version: 1,
             ..ControlPlaneState::default()
         })),
         cognitive_definition: cognitive_definition.clone(),
@@ -4556,167 +4564,136 @@ fn vault_client_for(
     ))
 }
 
+/// ai.generic's plug-in to the SDK's canonical managed control-plane. It supplies ONLY how to
+/// validate + materialize an AI node config; the SDK owns the single-config boot/persist/lifecycle so
+/// this node can no longer diverge (the two-location shadow bug is structurally impossible now).
+struct AiGenericContract {
+    node_name: String,
+}
+
+impl ManagedNodeConfigContract for AiGenericContract {
+    fn node_family(&self) -> &'static str {
+        "AI"
+    }
+    fn node_kind(&self) -> &'static str {
+        "AI.generic"
+    }
+    fn required_fields(&self) -> &'static [&'static str] {
+        &["behavior.kind", "behavior.model", "behavior.vault_key"]
+    }
+    fn optional_fields(&self) -> &'static [&'static str] {
+        &[
+            "behavior.instructions",
+            "behavior.model_settings",
+            "behavior.base_url",
+            "behavior.capabilities",
+            "runtime.cognitive_definition",
+        ]
+    }
+    fn notes(&self) -> &'static [&'static str] {
+        &[
+            "The OpenAI/Anthropic credential is NOT config: reference it by behavior.vault_key (a \
+             Vault key with metadata.resource_type=openai|anthropic).",
+            "Cognitive assets (role/skill/handbook/personality) are applied to the agent ILK with \
+             set_ilk_definition, not through CONFIG_SET.",
+        ]
+    }
+    fn validate_and_materialize(&self, candidate: &Value) -> Result<Value, ContractError> {
+        // parse_effective_config_doc already rejects secret-bearing / unsupported fields under the
+        // strict contract; materialize fills defaults; build_behavior validates it is runnable.
+        let doc = parse_effective_config_doc(candidate)
+            .map_err(|err| ContractError::InvalidConfig(err.to_string()))?;
+        let doc = materialize_effective_defaults(&self.node_name, doc);
+        build_behavior_from_effective_config(&doc)
+            .map_err(|err| ContractError::InvalidConfig(err.to_string()))?;
+        serde_json::to_value(&doc).map_err(|err| ContractError::Internal(err.to_string()))
+    }
+    fn redact_effective_config(&self, effective: &Value) -> Value {
+        redact_secrets(effective)
+    }
+}
+
+/// Adapt the SDK's canonical control-plane state to ai.generic's local view (which the AI-specific
+/// CONFIG_GET/status responses read). `config_source` is informational only now: with the
+/// single-config model there is exactly one source — the node-dir `config.json`.
+fn control_plane_state_from_managed(cp: ManagedControlPlaneState) -> ControlPlaneState {
+    let config_source = match cp.current_state {
+        ManagedNodeLifecycleState::Unconfigured => "none",
+        _ => "config",
+    };
+    ControlPlaneState {
+        current_state: cp.current_state,
+        config_source,
+        effective_config: cp.effective_config,
+        schema_version: cp.schema_version,
+        config_version: cp.config_version,
+    }
+}
+
+/// Resolve the effective `runtime.cognitive_definition` section for the managed bootstrap path from
+/// the config source that will actually provide the behavior: the persisted dynamic config (latest
+/// applied CONFIG_SET) if present, else the spawn config. Absent -> Default (enabled=true), so a node
+/// that never sets the field keeps the historical default. Extracted as a pure fn so the
+/// config-honoring contract (BUG-3) is unit-testable without a live filesystem/dispatcher.
+fn effective_cognitive_section(
+    persisted: Option<&EffectiveConfigDocument>,
+    spawn: Option<&EffectiveConfigDocument>,
+) -> CognitiveDefinitionSection {
+    persisted
+        .or(spawn)
+        .and_then(|cfg| cfg.runtime.as_ref())
+        .and_then(|runtime| runtime.cognitive_definition.clone())
+        .unwrap_or_default()
+}
+
 async fn run_unconfigured_bootstrap(
     node: NodeSection,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let node_name = node.name.clone();
-    let dynamic_dir = PathBuf::from(node.dynamic_config_dir.clone());
-    let thread_state_store = init_thread_state_store(&node_name, &dynamic_dir).await;
-    let immediate_memory_store = init_immediate_memory_store(&node_name, &dynamic_dir).await;
-    let cognitive_definition_config =
-        CognitiveDefinitionRuntimeConfig::from(CognitiveDefinitionSection::default());
+    // Single-config control-plane: the node-dir config.json is the ONLY source of truth (SDK-owned,
+    // WF model). No state/ai-nodes dynamic file, so a stale one can never shadow a fresh run_node.
+    let contract = AiGenericContract {
+        node_name: node_name.clone(),
+    };
+    let cp = bootstrap_managed_control_plane(&node_name, &contract).unwrap_or_else(|err| {
+        tracing::warn!(node_name = %node_name, error = %err, "control-plane bootstrap failed; booting Unconfigured");
+        ManagedControlPlaneState::default()
+    });
+    match cp.current_state {
+        ManagedNodeLifecycleState::Configured => {
+            tracing::info!(node_name = %node_name, config_version = cp.config_version, "loaded config at bootstrap")
+        }
+        ManagedNodeLifecycleState::FailedConfig => {
+            tracing::warn!(node_name = %node_name, config_version = cp.config_version, error = ?cp.last_error, "config.json rejected; booting FAILED_CONFIG (send a valid CONFIG_SET to recover)")
+        }
+        ManagedNodeLifecycleState::Unconfigured => {
+            tracing::info!(node_name = %node_name, "no config.json; booting UNCONFIGURED")
+        }
+    }
+    // Stores live in a per-node subdir UNDER the node instance dir (like WF's wf_instances.db) so the
+    // generic purge (remove_dir_all of the instance dir) removes them on kill/respawn — nothing
+    // survives to shadow config or bleed conversation state/memory into a fresh spawn.
+    let instance_dir = managed_node_instance_dir(&node_name)
+        .unwrap_or_else(|_| PathBuf::from(node.dynamic_config_dir.clone()));
+    let thread_state_store =
+        init_thread_state_store(&node_name, instance_dir.join("thread-state")).await;
+    let immediate_memory_store =
+        init_immediate_memory_store(&node_name, instance_dir.join("immediate-memory")).await;
+    // The effective config drives both the cognitive layer (BUG-3: honor runtime.cognitive_definition)
+    // and the behavior; deserialize it once.
+    let effective_doc: Option<EffectiveConfigDocument> = cp
+        .effective_config
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let cognitive_section = effective_cognitive_section(effective_doc.as_ref(), None);
+    let cognitive_definition_config = CognitiveDefinitionRuntimeConfig::from(cognitive_section);
     let cognitive_definition = Arc::new(RwLock::new(CognitiveDefinitionRuntimeState::unresolved(
         cognitive_definition_config.enabled,
     )));
-    let persisted_dynamic = load_persisted_dynamic_config(&dynamic_dir, &node_name);
-    // Audit M2 (+ single-read to avoid a boot-time TOCTOU panic): resolve the "persisted config
-    // exists but the strict contract rejects it" case ONCE. That case goes FAILED_CONFIG; a
-    // genuinely absent config still falls to the spawn file / Unconfigured below.
-    let rejected_persisted = if persisted_dynamic.is_none() {
-        persisted_config_rejected(&dynamic_dir, &node_name)
-    } else {
-        None
-    };
-    let spawn_effective = if persisted_dynamic.is_none() && rejected_persisted.is_none() {
-        load_effective_config_from_spawn(&node_name)
-    } else {
-        None
-    };
-    let (behavior, state) = match persisted_dynamic.as_ref() {
-        Some(stored) => {
-            let materialized = materialize_effective_defaults(&node_name, stored.config.clone());
-            match build_behavior_from_effective_config(&materialized) {
-                Ok(behavior) => {
-                    tracing::info!(
-                        node_name = %node_name,
-                        config_version = stored.config_version,
-                        "loaded effective JSON config at bootstrap"
-                    );
-                    (
-                        Some(behavior),
-                        ControlPlaneState {
-                            current_state: NodeLifecycleState::Configured,
-                            config_source: "persisted",
-                            effective_config: Some(
-                                serde_json::to_value(materialized).unwrap_or(Value::Null),
-                            ),
-                            schema_version: stored.schema_version,
-                            config_version: stored.config_version,
-                        },
-                    )
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        node_name = %node_name,
-                        error = %err,
-                        "persisted JSON config is invalid; booting FAILED_CONFIG"
-                    );
-                    (
-                        None,
-                        ControlPlaneState {
-                            current_state: NodeLifecycleState::FailedConfig,
-                            config_source: "persisted",
-                            effective_config: Some(
-                                serde_json::to_value(materialized).unwrap_or(Value::Null),
-                            ),
-                            schema_version: stored.schema_version,
-                            config_version: stored.config_version,
-                        },
-                    )
-                }
-            }
-        }
-        None => {
-            if let Some((schema_version, config_version, effective_config)) = rejected_persisted {
-                // Audit M2: a persisted config exists but the current strict contract rejects it
-                // (the old-contract upgrade case). Surface FAILED_CONFIG so the operator sees it
-                // and can recover with a new CONFIG_SET — do NOT fall back to spawn/Unconfigured.
-                // effective_config is already secret-redacted by persisted_config_rejected.
-                tracing::warn!(
-                    node_name = %node_name,
-                    config_version,
-                    "persisted config is incompatible with the current contract; booting FAILED_CONFIG (send a valid CONFIG_SET to recover)"
-                );
-                (
-                    None,
-                    ControlPlaneState {
-                        current_state: NodeLifecycleState::FailedConfig,
-                        config_source: "persisted",
-                        effective_config: Some(effective_config),
-                        schema_version,
-                        config_version,
-                    },
-                )
-            } else if let Some(spawn_cfg) = spawn_effective {
-                let spawn_config = spawn_cfg.config.clone();
-                match build_behavior_from_effective_config(&spawn_config) {
-                    Ok(behavior) => {
-                        tracing::info!(
-                            node_name = %node_name,
-                            path = %spawn_cfg.path.display(),
-                            "loaded spawn config at bootstrap"
-                        );
-                        if let Err(err) = persist_dynamic_config(
-                            &dynamic_dir,
-                            &node_name,
-                            spawn_cfg.schema_version,
-                            spawn_cfg.config_version,
-                            &spawn_config,
-                        ) {
-                            tracing::warn!(
-                                node_name = %node_name,
-                                error = %err,
-                                "failed to persist bootstrap config from spawn file"
-                            );
-                        }
-                        (
-                            Some(behavior),
-                            ControlPlaneState {
-                                current_state: NodeLifecycleState::Configured,
-                                config_source: "spawn",
-                                effective_config: Some(
-                                    serde_json::to_value(spawn_config).unwrap_or(Value::Null),
-                                ),
-                                schema_version: spawn_cfg.schema_version,
-                                config_version: spawn_cfg.config_version,
-                            },
-                        )
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            node_name = %node_name,
-                            path = %spawn_cfg.path.display(),
-                            error = %err,
-                            "spawn config exists but is invalid for AI effective config"
-                        );
-                        (
-                            None,
-                            ControlPlaneState {
-                                current_state: NodeLifecycleState::FailedConfig,
-                                config_source: "spawn",
-                                effective_config: Some(
-                                    serde_json::to_value(spawn_config).unwrap_or(Value::Null),
-                                ),
-                                schema_version: spawn_cfg.schema_version,
-                                config_version: spawn_cfg.config_version,
-                            },
-                        )
-                    }
-                }
-            } else {
-                (
-                    None,
-                    ControlPlaneState {
-                        current_state: NodeLifecycleState::Unconfigured,
-                        config_source: "none",
-                        effective_config: None,
-                        schema_version: 0,
-                        config_version: 0,
-                    },
-                )
-            }
-        }
-    };
+    let behavior = effective_doc
+        .as_ref()
+        .and_then(|doc| build_behavior_from_effective_config(doc).ok());
+    let state = control_plane_state_from_managed(cp);
 
     let node_config_dir = node.config_dir.clone();
     let runner_node_name = node.name.clone();
@@ -4751,7 +4728,6 @@ async fn run_unconfigured_bootstrap(
         self_tenant_id,
         behavior: Arc::new(RwLock::new(behavior)),
         config_dir: PathBuf::from(node_config_dir),
-        dynamic_config_dir: dynamic_dir,
         router_socket: runner_router_socket,
         state_dir: runner_uuid_persistence_dir,
         thread_state_store,
@@ -5206,84 +5182,9 @@ fn build_startup_effective_config_doc(cfg: &RunnerConfig) -> EffectiveConfigDocu
     }
 }
 
-fn dynamic_config_path(base_dir: &std::path::Path, node_name: &str) -> PathBuf {
-    let safe_name = node_name.replace(['/', '\\'], "_");
-    base_dir.join(format!("{safe_name}.json"))
-}
 
-fn load_persisted_dynamic_config(
-    base_dir: &std::path::Path,
-    node_name: &str,
-) -> Option<EffectiveStateFile> {
-    let path = dynamic_config_path(base_dir, node_name);
-    let raw = fs::read_to_string(path).ok()?;
-    let root: Value = serde_json::from_str(&raw).ok()?;
-    if let Some(field) = root.get("config").and_then(find_ai_secret_contract_field) {
-        tracing::warn!(
-            node_name = %node_name,
-            field,
-            "persisted AI config contains unsupported secret-bearing field; ignoring persisted config"
-        );
-        return None;
-    }
-    serde_json::from_str::<EffectiveStateFile>(&raw).ok()
-}
 
-/// Audit M2: distinguish "no persisted config" from "persisted config that the CURRENT strict
-/// contract REJECTS". A real upgrade leaves an old-contract doc on disk (the pre-a8a9c54 runner
-/// materialized `behavior.provider`, which the new deny_unknown_fields parse rejects); collapsing
-/// that to "absent" silently booted the node UNCONFIGURED (or re-adopted the spawn file), losing
-/// the operator's FAILED_CONFIG signal and config_version. Returns the raw rejected doc's
-/// (schema_version, config_version, config) so boot can enter FAILED_CONFIG instead — recoverable
-/// with a new valid CONFIG_SET. Returns None when the file is absent, unreadable, not JSON, or
-/// parses cleanly under the strict contract (the happy loader owns that case).
-fn persisted_config_rejected(base_dir: &std::path::Path, node_name: &str) -> Option<(u32, u64, Value)> {
-    let path = dynamic_config_path(base_dir, node_name);
-    let raw = fs::read_to_string(path).ok()?;
-    if serde_json::from_str::<EffectiveStateFile>(&raw).is_ok() {
-        return None; // valid under the strict contract -> load_persisted_dynamic_config handles it
-    }
-    // Valid JSON that fails the strict parse = the rejected upgrade case. Non-JSON -> None (nothing
-    // to recover; treat as absent).
-    let root: Value = serde_json::from_str(&raw).ok()?;
-    let schema_version = root
-        .get("schema_version")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
-    let config_version = root.get("config_version").and_then(Value::as_u64).unwrap_or(0);
-    let mut config = root.get("config").cloned().unwrap_or(Value::Null);
-    // Do NOT surface a secret-bearing rejected config: CONFIG_GET's redact_secrets only masks a key
-    // literally named "api_key", so an inline secret under any other name would leak through the
-    // FAILED_CONFIG effective_config. Withhold the whole body when a secret field is present (the
-    // schema/config_version still identify which config was rejected).
-    if find_ai_secret_contract_field(&config).is_some() {
-        config = serde_json::json!({
-            "_redacted": "rejected persisted config contained a secret-bearing field and was withheld"
-        });
-    }
-    Some((schema_version, config_version, config))
-}
 
-fn persist_dynamic_config(
-    base_dir: &std::path::Path,
-    node_name: &str,
-    schema_version: u32,
-    config_version: u64,
-    config: &EffectiveConfigDocument,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    fs::create_dir_all(base_dir)?;
-    let path = dynamic_config_path(base_dir, node_name);
-    let payload = EffectiveStateFile {
-        schema_version,
-        config_version,
-        node_name: node_name.to_string(),
-        config: config.clone(),
-        updated_at: chrono::Utc::now().to_rfc3339(),
-    };
-    let json = serde_json::to_string_pretty(&payload)?;
-    write_json_atomic(&path, &json)?;
-    Ok(())
-}
 
 fn write_json_atomic(
     path: &std::path::Path,
@@ -5401,42 +5302,7 @@ fn parse_effective_config_doc(
     )?)
 }
 
-#[derive(Debug)]
-struct SpawnEffectiveConfig {
-    path: PathBuf,
-    schema_version: u32,
-    config_version: u64,
-    config: EffectiveConfigDocument,
-}
 
-fn load_effective_config_from_spawn(node_name: &str) -> Option<SpawnEffectiveConfig> {
-    let path = managed_node_config_path(node_name).ok()?;
-    let raw = fs::read_to_string(&path).ok()?;
-    let root: Value = serde_json::from_str(&raw).ok()?;
-    let schema_version = root
-        .get("_system")
-        .and_then(|v| v.get("config_version"))
-        .and_then(Value::as_u64)
-        .and_then(|v| u32::try_from(v).ok())
-        .unwrap_or(1);
-    let config_version = root
-        .get("_system")
-        .and_then(|v| v.get("updated_at_ms"))
-        .and_then(Value::as_u64)
-        .unwrap_or(1);
-    let mut candidate = root.get("config").cloned().unwrap_or(root);
-    if let Some(obj) = candidate.as_object_mut() {
-        obj.remove("_system");
-    }
-    let parsed = parse_effective_config_doc(&candidate).ok()?;
-    let config = materialize_effective_defaults(node_name, parsed);
-    Some(SpawnEffectiveConfig {
-        path,
-        schema_version,
-        config_version,
-        config,
-    })
-}
 
 fn looks_like_tenant_id(raw: &str) -> bool {
     let Some(rest) = raw.strip_prefix("tnt:") else {
@@ -5919,10 +5785,8 @@ fn sanitize_storage_key(value: &str) -> String {
 
 async fn init_thread_state_store(
     node_name: &str,
-    dynamic_config_dir: &std::path::Path,
+    store_root: PathBuf,
 ) -> Option<Arc<dyn ThreadStateStore>> {
-    let state_dir = infer_state_dir_from_dynamic(dynamic_config_dir);
-    let store_root = LanceDbThreadStateStore::path_for_node(&state_dir, node_name);
     let store = LanceDbThreadStateStore::new(store_root);
     match store.ensure_ready().await {
         Ok(()) => {
@@ -5946,10 +5810,8 @@ async fn init_thread_state_store(
 
 async fn init_immediate_memory_store(
     node_name: &str,
-    dynamic_config_dir: &std::path::Path,
+    store_root: PathBuf,
 ) -> Option<Arc<ImmediateMemoryStore>> {
-    let state_dir = infer_state_dir_from_dynamic(dynamic_config_dir);
-    let store_root = ImmediateMemoryStore::path_for_node(&state_dir, node_name);
     let store = ImmediateMemoryStore::new(store_root);
     match store.ensure_ready().await {
         Ok(()) => {
@@ -6303,7 +6165,6 @@ mod tests {
             self_tenant_id: None,
             behavior: Arc::new(RwLock::new(None)),
             config_dir: PathBuf::from("/tmp"),
-            dynamic_config_dir: PathBuf::from("/tmp"),
             router_socket: PathBuf::from("/tmp"),
             state_dir: PathBuf::from("/tmp"),
             thread_state_store: None,
@@ -6361,6 +6222,32 @@ mod tests {
             handbook_hashes: Vec::new(),
             personality_hash: None,
         }
+    }
+
+    #[test]
+    fn effective_cognitive_section_honors_config_and_defaults() {
+        // BUG-3: the managed bootstrap must honor runtime.cognitive_definition (previously ignored).
+        let disabled = EffectiveConfigDocument {
+            runtime: Some(EffectiveRuntimeSection {
+                cognitive_definition: Some(CognitiveDefinitionSection {
+                    enabled: false,
+                    poll_interval_secs: 10,
+                    blob_root: None,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Explicit enabled=false is honored, from the persisted source...
+        assert!(!effective_cognitive_section(Some(&disabled), None).enabled);
+        // ...and from the spawn source when there is no persisted config.
+        assert!(!effective_cognitive_section(None, Some(&disabled)).enabled);
+        // Persisted wins over spawn.
+        let enabled = EffectiveConfigDocument::default();
+        assert!(!effective_cognitive_section(Some(&disabled), Some(&enabled)).enabled);
+        // Absent field -> Default (enabled=true), so unset config keeps the historical default.
+        assert!(effective_cognitive_section(None, None).enabled);
+        assert!(effective_cognitive_section(Some(&EffectiveConfigDocument::default()), None).enabled);
     }
 
     #[test]
@@ -6752,32 +6639,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_status_get_uses_env_health_state_and_falls_back_to_healthy() {
+    async fn node_status_get_health_reflects_lifecycle_and_env_override_only_when_configured() {
+        // BUG-2: health_state is derived from the config-plane lifecycle. A node that is not
+        // Configured (Unconfigured / FAILED_CONFIG) reports DEGRADED and the env override CANNOT force
+        // it back to HEALTHY (so a broken node can never masquerade as healthy). The override applies
+        // only to a genuinely Configured node.
         let _guard = env_lock().lock().expect("env lock");
         std::env::set_var(NODE_STATUS_DEFAULT_HANDLER_ENABLED, "true");
         let node = test_node();
         let req = sample_request();
 
-        std::env::set_var(NODE_STATUS_DEFAULT_HEALTH_STATE, "DEGRADED");
-        let degraded = node
+        // Unconfigured (default): DEGRADED even when the env asks for HEALTHY.
+        std::env::set_var(NODE_STATUS_DEFAULT_HEALTH_STATE, "HEALTHY");
+        let unconfigured = node
             .handle_control_plane(req.clone())
             .await
             .expect("control-plane should not fail")
             .expect("status response should exist");
         assert_eq!(
-            degraded.payload.get("health_state").and_then(Value::as_str),
+            unconfigured
+                .payload
+                .get("health_state")
+                .and_then(Value::as_str),
             Some("DEGRADED")
         );
 
-        std::env::set_var(NODE_STATUS_DEFAULT_HEALTH_STATE, "not-a-valid-state");
-        let fallback = node
+        // Configured: HEALTHY by default (no override).
+        {
+            let mut state = node.control_plane.write().await;
+            state.current_state = NodeLifecycleState::Configured;
+            state.effective_config = Some(json!({}));
+        }
+        std::env::remove_var(NODE_STATUS_DEFAULT_HEALTH_STATE);
+        let healthy = node
+            .handle_control_plane(req.clone())
+            .await
+            .expect("control-plane should not fail")
+            .expect("status response should exist");
+        assert_eq!(
+            healthy.payload.get("health_state").and_then(Value::as_str),
+            Some("HEALTHY")
+        );
+
+        // Configured + env override: the override applies.
+        std::env::set_var(NODE_STATUS_DEFAULT_HEALTH_STATE, "DEGRADED");
+        let overridden = node
             .handle_control_plane(req)
             .await
             .expect("control-plane should not fail")
             .expect("status response should exist");
         assert_eq!(
-            fallback.payload.get("health_state").and_then(Value::as_str),
-            Some("HEALTHY")
+            overridden
+                .payload
+                .get("health_state")
+                .and_then(Value::as_str),
+            Some("DEGRADED")
         );
 
         std::env::remove_var(NODE_STATUS_DEFAULT_HEALTH_STATE);

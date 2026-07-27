@@ -35,10 +35,35 @@ pub fn build_reply_message_with_options(
     payload: Value,
     options: ReplyContextOptions,
 ) -> Message {
+    let mut meta = build_reply_meta(&msg.meta, options);
+    apply_error_reply_msg_suffix(&mut meta, &payload);
     Message {
         routing: build_reply_routing(msg, src_uuid),
-        meta: build_reply_meta(&msg.meta, options),
+        meta,
         payload,
+    }
+}
+
+/// Suffix (gap-1) appended to a reply's msg-name when the reply payload is an error, so the reply is
+/// distinguishable from a successful answer at the msg-name level.
+pub const AI_ERROR_MSG_SUFFIX: &str = ".error";
+
+/// gap-1: when a reply payload is an error (`type == "error"`), stamp a distinct `.error` suffix onto
+/// the reply's msg-name. Success and error replies otherwise share the request's msg-name, so a WF
+/// event_match awaiting the answer would consume the error AS the answer and complete "successfully"
+/// with missing data. With the suffix a WF can event_match `<msg>.error` (or the bare marker) to route
+/// AI failures to a failed state. Callers that correlate by thread_id (io.api/io.slack) are unaffected;
+/// error detection there still uses payload.type.
+fn apply_error_reply_msg_suffix(meta: &mut Meta, payload: &Value) {
+    if payload.get("type").and_then(Value::as_str) != Some("error") {
+        return;
+    }
+    // Only suffix a request that HAD a msg-name. A no-name request is already unroutable by msg-name,
+    // so fabricating a generic, collision-prone "error" marker is worse than leaving it None.
+    if let Some(name) = meta.msg.as_deref() {
+        if !name.ends_with(AI_ERROR_MSG_SUFFIX) {
+            meta.msg = Some(format!("{name}{AI_ERROR_MSG_SUFFIX}"));
+        }
     }
 }
 
@@ -53,9 +78,11 @@ pub fn build_reply_message_runtime_src_with_options(
     payload: Value,
     options: ReplyContextOptions,
 ) -> Message {
+    let mut meta = build_reply_meta(&msg.meta, options);
+    apply_error_reply_msg_suffix(&mut meta, &payload);
     Message {
         routing: build_reply_routing(msg, ""),
-        meta: build_reply_meta(&msg.meta, options),
+        meta,
         payload,
     }
 }
@@ -269,6 +296,34 @@ mod tests {
     fn extract_response_envelope_returns_none_when_context_missing() {
         let meta = Meta::default();
         assert_eq!(extract_response_envelope(&meta).expect("ok"), None);
+    }
+
+    #[test]
+    fn error_reply_gets_distinct_msg_suffix_success_unchanged() {
+        let request = Message {
+            routing: Routing {
+                src: "caller".to_string(),
+                src_l2_name: None,
+                dst: Destination::Resolve,
+                ttl: 8,
+                trace_id: "t1".to_string(),
+            },
+            meta: Meta {
+                msg: Some("ask".to_string()),
+                ..Meta::default()
+            },
+            payload: json!({}),
+        };
+        // gap-1: an error reply is distinguishable at the msg-name level.
+        let err_reply = build_reply_message(&request, "uuid", json!({"type":"error","error":{"code":"x"}}));
+        assert_eq!(err_reply.meta.msg.as_deref(), Some("ask.error"));
+        // a successful reply keeps the request msg-name so the WF's await still matches it.
+        let ok_reply = build_reply_message(&request, "uuid", json!({"type":"text","text":"hi"}));
+        assert_eq!(ok_reply.meta.msg.as_deref(), Some("ask"));
+        // idempotent: re-replying an already-suffixed name does not double it.
+        let mut m = err_reply.meta.clone();
+        apply_error_reply_msg_suffix(&mut m, &json!({"type":"error"}));
+        assert_eq!(m.msg.as_deref(), Some("ask.error"));
     }
 
     #[test]

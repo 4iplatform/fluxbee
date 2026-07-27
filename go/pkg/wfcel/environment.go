@@ -1,12 +1,18 @@
 package wfcel
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
+	"github.com/google/cel-go/ext"
 )
+
+// maxJSONParseBytes bounds json_parse input: a guard runs on the full external inbound payload and the
+// guard timeout does not interrupt a running eval, so cap the parse work an ingress caller can drive.
+const maxJSONParseBytes = 64 * 1024
 
 func DefaultClock() time.Time {
 	return time.Now().UTC()
@@ -28,6 +34,40 @@ func NewGuardEnv(clock ClockFunc) (*cel.Env, error) {
 				cel.IntType,
 				cel.FunctionBinding(func(args ...ref.Val) ref.Val {
 					return types.Int(clock().UnixMilli())
+				}),
+			),
+		),
+		// gap-4: base cel-go already has contains/startsWith/endsWith/matches(regex)/size;
+		// ext.Strings() adds split/substring/join/replace/etc. so a guard can extract fields from AI
+		// free text without a sentinel-token workaround. The 10ms GuardEvalTimeout (see types.go)
+		// stays the DoS bound on the added surface.
+		ext.Strings(),
+		// json_parse(str) -> dyn: decode a JSON string (e.g. an AI structured-output reply) into a
+		// CEL value so guards can branch on real fields. Invalid JSON yields a CEL error, which makes
+		// the guard evaluate to a non-true result rather than crashing the engine.
+		cel.Function(
+			"json_parse",
+			cel.Overload(
+				"wf_json_parse_string",
+				[]*cel.Type{cel.StringType},
+				cel.DynType,
+				cel.UnaryBinding(func(arg ref.Val) ref.Val {
+					raw, ok := arg.Value().(string)
+					if !ok {
+						return types.NewErr("json_parse expects a string argument")
+					}
+					// The GuardEvalTimeout does not actually interrupt a running eval (cel-go only
+					// interrupts via ContextEval), so bound the work explicitly: a guard reads the full
+					// external inbound payload, so refuse an oversized input rather than letting an
+					// ingress caller drive an unbounded/deep parse per message.
+					if len(raw) > maxJSONParseBytes {
+						return types.NewErr("json_parse: input exceeds %d bytes", maxJSONParseBytes)
+					}
+					var parsed interface{}
+					if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+						return types.NewErr("json_parse: invalid JSON: %v", err)
+					}
+					return types.DefaultTypeAdapter.NativeToValue(parsed)
 				}),
 			),
 		),

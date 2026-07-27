@@ -64,10 +64,18 @@ systemctl restart sy-orchestrator
 echo "== [3/5] wait admin + vault_put postgres secret =="
 for _ in $(seq 1 60); do curl -s -m3 "$ADMIN/hives" >/dev/null 2>&1 && break; sleep 2; done
 body="{\"key\":\"storage_postgres_url\",\"value\":{\"postgres_url\":\"$PG_URL\"},\"metadata\":{\"tenant_id\":\"$ROOT_TENANT\",\"resource_type\":\"postgres\"}}"
+vault_ok=0
 for _ in $(seq 1 20); do
   r="$(curl -s -m10 -X POST "$ADMIN/hives/$HIVE_ID/vault/secrets" -H 'content-type: application/json' -d "$body" 2>/dev/null || true)"
-  case "$r" in *'"status":"ok"'*) echo "  vault_put OK"; break;; *) sleep 3;; esac
+  case "$r" in *'"status":"ok"'*) echo "  vault_put OK"; vault_ok=1; break;; *) sleep 3;; esac
 done
+if [ "$vault_ok" != 1 ]; then
+  # Do NOT echo $body (it carries the postgres URL); the response $r is safe (no secret).
+  echo "ERROR: vault_put storage_postgres_url failed after 20 tries — postgres secret NOT stored." >&2
+  echo "       DB consumers (storage/identity) will stay 'not initialized' and the hive will not become ready." >&2
+  echo "       Last admin response: ${r:-<no response / admin unreachable>}" >&2
+  exit 1
+fi
 
 # The DB consumers (storage/identity) connect to postgres at startup; if they
 # came up before the secret was in the vault they stay "not initialized". The
@@ -132,8 +140,17 @@ cat <<EOF
     Load an OpenAI (or "anthropic") key:
       curl -sS -X POST $ADMIN/hives/$HIVE_ID/vault/secrets -H 'content-type: application/json' \\
         -d '{"key":"openai_root_pool","value":{"api_key":"sk-..."},"metadata":{"tenant_id":"$ROOT_TENANT","resource_type":"openai"}}'
+    NOTE: the default provider is 'openai'. For an Anthropic key (resource_type "anthropic"),
+    also set 'ai.default_provider: anthropic' in /etc/fluxbee/hive.yaml and restart the AI nodes,
+    or the AI nodes keep resolving the openai pool and stay degraded.
 
   - IO.slack needs its tokens (resource_type "slack", value {app_token, bot_token}).
+
+  - IO.wapp (WhatsApp Cloud API) needs its secret (resource_type "whatsapp",
+    value {access_token, app_secret, verify_token}) AND the public webhook wired
+    as a fanout: externalize ONE edge endpoint for the Meta app with the family
+    glob "IO.wapp.*@$HIVE_ID" and the app-level verify_token, then set each node's
+    io.phone_number_id via CONFIG_SET. One IO.wapp.<label> node per number.
 
   Any other node secret is loaded into SY.vault the same way (POST .../vault/secrets).
 

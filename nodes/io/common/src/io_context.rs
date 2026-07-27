@@ -266,6 +266,30 @@ pub fn build_webhook_post_reply_target(
     }
 }
 
+/// Where an IO.wapp outbound reply goes: the customer's wa_id, sent FROM the business number
+/// (`phone_number_id`). Extracted from the relayed `meta.context.io.reply_target` on the way back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WappPostTarget {
+    pub to_wa_id: String,
+    pub phone_number_id: Option<String>,
+}
+
+pub fn extract_wapp_post_target(meta_context: &Value) -> Option<WappPostTarget> {
+    let rt = extract_reply_target(meta_context)?;
+    if rt.kind != "wapp_post" {
+        return None;
+    }
+    let phone_number_id = rt
+        .params
+        .get("phone_number_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    Some(WappPostTarget {
+        to_wa_id: rt.address,
+        phone_number_id,
+    })
+}
+
 pub fn extract_slack_post_target(meta_context: &Value) -> Option<SlackPostTarget> {
     let rt = extract_reply_target(meta_context)?;
     if rt.kind != "slack_post" {
@@ -532,11 +556,80 @@ pub fn slack_inbound_io_context(
     }
 }
 
+/// Inbound IoContext for a WhatsApp Cloud API message (IO.wapp). The binding is the business number
+/// (`phone_number_id` — the self-select key of the fanout model); the conversation is the 1:1 chat
+/// with the customer (`from_wa_id`). WhatsApp has no native threads, so the thread id is always the
+/// PersistentChannel form. The reply target carries what the outbound side needs: post to the
+/// customer's wa_id FROM this phone_number_id.
+pub fn wapp_inbound_io_context(
+    phone_number_id: &str,
+    from_wa_id: &str,
+    message_id: &str,
+    timestamp: Option<&str>,
+) -> IoContext {
+    let thread_id = Some(
+        compute_thread_id(ThreadIdInput::PersistentChannel {
+            channel_type: "whatsapp",
+            entrypoint_id: Some(phone_number_id),
+            conversation_id: from_wa_id,
+        })
+        .expect("valid whatsapp thread input"),
+    );
+    IoContext {
+        channel: "whatsapp".to_string(),
+        entrypoint: PartyRef {
+            kind: "wapp_binding".to_string(),
+            id: phone_number_id.to_string(),
+        },
+        sender: PartyRef {
+            kind: "wapp_user".to_string(),
+            id: from_wa_id.to_string(),
+        },
+        conversation: ConversationRef {
+            kind: "wapp_chat".to_string(),
+            id: from_wa_id.to_string(),
+            thread_id,
+        },
+        message: MessageRef {
+            id: message_id.to_string(),
+            timestamp: timestamp.map(ToString::to_string),
+        },
+        reply_target: ReplyTarget {
+            kind: "wapp_post".to_string(),
+            address: from_wa_id.to_string(),
+            params: serde_json::json!({ "phone_number_id": phone_number_id }),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fluxbee_sdk::{compute_thread_id, ThreadIdInput};
     use serde_json::json;
+
+    #[test]
+    fn wapp_io_context_round_trips_reply_target_and_dedups_by_message() {
+        let ctx = wapp_inbound_io_context("111", "5491100000000", "wamid.AAA==", Some("1700000000"));
+        assert_eq!(ctx.channel, "whatsapp");
+        assert_eq!(ctx.entrypoint.id, "111"); // meta.ich derives from channel + entrypoint.id
+        assert_eq!(ctx.conversation.id, "5491100000000");
+        assert!(ctx.conversation.thread_id.is_some()); // stable: same chat => same thread
+        assert_eq!(
+            ctx.conversation.thread_id,
+            wapp_inbound_io_context("111", "5491100000000", "wamid.OTHER==", None)
+                .conversation
+                .thread_id
+        );
+        // The outbound side recovers the post target from the wrapped meta context.
+        let wrapped = wrap_in_meta_context(&ctx);
+        let target = extract_wapp_post_target(&wrapped).expect("wapp_post target");
+        assert_eq!(target.to_wa_id, "5491100000000");
+        assert_eq!(target.phone_number_id.as_deref(), Some("111"));
+        // A slack context does not parse as a wapp target.
+        let slack = wrap_in_meta_context(&slack_inbound_io_context("T1", "U1", "C1", None, "m1"));
+        assert!(extract_wapp_post_target(&slack).is_none());
+    }
 
     #[test]
     fn extract_reply_target_roundtrip() {

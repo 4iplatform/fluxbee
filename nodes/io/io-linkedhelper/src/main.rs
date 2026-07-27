@@ -528,8 +528,9 @@ async fn main() -> Result<()> {
 
     let adapter_contract: Arc<dyn IoAdapterConfigContract> =
         Arc::new(IoLinkedHelperAdapterConfigContract);
-    let mut boot_state = bootstrap_io_control_plane_state(&config.state_dir, &config.node_name)
-        .unwrap_or_else(|err| {
+    let mut boot_state =
+        bootstrap_io_control_plane_state(&config.node_name, adapter_contract.as_ref())
+            .unwrap_or_else(|err| {
             tracing::warn!(
                 error = %err,
                 state_dir = %config.state_dir.display(),
@@ -1111,7 +1112,7 @@ async fn apply_linkedhelper_config_set(
     state.effective_config = Some(candidate);
     state.last_error = None;
 
-    if let Err(err) = persist_io_control_plane_state(state_dir, node_name, &state) {
+    if let Err(err) = persist_io_control_plane_state(node_name, &state) {
         let code = "persist_failed";
         let message = err.to_string();
         state.last_error = Some(IoControlPlaneErrorInfo {
