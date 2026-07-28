@@ -56,6 +56,10 @@ mecanismo de acceso.
 ## 3. Reglas de oro
 
 ### Prod
+0. **ALCANCE DE ACCESO (regla del operador, 2026-07-28):** el agente opera **únicamente sobre las
+   máquinas que él mismo creó**, más el host Proxmox que administra. La red de administración
+   `192.168.8.0/24` es **compartida y plana**: hay equipos de terceros ahí. **No se escanea la red,
+   no se accede a ninguna IP que no corresponda a una VM propia.** Ante una IP desconocida: no se toca.
 1. **Snapshot antes de todo cambio destructivo o dudoso.** Nombre: `pre-<accion>-YYYYMMDD`.
 2. **Un cambio por vez**, verificado antes del siguiente. Nada de lotes a ciegas.
 3. **Todo cambio va a la bitácora** del día (§5), incluido el que sale mal.
