@@ -8,6 +8,9 @@ Guía operativa del lab de VMs. Complementa (no duplica):
   para publicar/actualizar/spawnear un runtime en un backend YA instalado (publish → manifest →
   `/update` → `/nodes`). No inventar rutas alternativas: es este.
 - [`lab/README.md`](README.md) — el lab **Docker** (otra cosa; sin VMs).
+- [`lab/logbook/METHOD.md`](logbook/METHOD.md) — **método de trabajo sobre infra + PROD**
+  (capacidades del agente, reglas, clasificación de cambios, protocolo de bitácora).
+  **Si el trabajo toca producción, ese doc manda**; la bitácora del día va en `lab/logbook/YYYY-MM-DD.md`.
 
 ## Mapa (quién es quién)
 
