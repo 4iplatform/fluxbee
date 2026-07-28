@@ -60,6 +60,14 @@ mecanismo de acceso.
    máquinas que él mismo creó**, más el host Proxmox que administra. La red de administración
    `192.168.8.0/24` es **compartida y plana**: hay equipos de terceros ahí. **No se escanea la red,
    no se accede a ninguna IP que no corresponda a una VM propia.** Ante una IP desconocida: no se toca.
+0b. **EL AGENTE ES USUARIO DE INFRA, NO TOCA CÓDIGO** (regla del operador, 2026-07-28): en el trabajo
+   de infraestructura **no se modifica código del producto**. Si algo del código impide avanzar o
+   parece mal, **se plantea y se revisa junto al operador ANTES de cambiar nada**. Leer el código para
+   entender: siempre. Cambiarlo por cuenta propia: nunca.
+0c. **No inventar mecanismos paralelos a los que el producto ya provee.** Si `add_hive` (o cualquier
+   flujo de fluxbee) resuelve algo, se usa **ese** camino, aunque exista un atajo desde la posición
+   privilegiada del agente. Motivo: las recetas deben ser **portables** (el próximo prod puede ser
+   bare-metal, sin Proxmox ni guest-agent) y deben ejercitar **el camino que está testeado**.
 1. **Snapshot antes de todo cambio destructivo o dudoso.** Nombre: `pre-<accion>-YYYYMMDD`.
 2. **Un cambio por vez**, verificado antes del siguiente. Nada de lotes a ciegas.
 3. **Todo cambio va a la bitácora** del día (§5), incluido el que sale mal.
