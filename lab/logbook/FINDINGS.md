@@ -125,6 +125,26 @@
 - **Regla para el handbook:** el canal guest-agent **no es una shell de login normal** — definí
   `HOME` explícitamente, y **nunca parsees números de una salida que puede traer stderr**.
 
+### B-8 🟢 Clonar como un usuario y compilar como otro rompe el build de Go (`buildvcs`)
+
+- **Qué pasó:** el repo se clonó como `fluxops` (para usar la deploy key) pero `build-deb.sh` corre
+  como `root`. Git rechaza el repo ajeno (`fatal: detected dubious ownership in repository`) y el paso
+  Go falla al estampar la información de VCS:
+  ```
+  error obtaining VCS status: exit status 128
+      Use -buildvcs=false to disable VCS stamping.
+  ```
+  El build llegó hasta `[2/5] build go` y salió con `rc=1` **sin producir `.deb`** — después de ~55 min
+  de compilación Rust ya exitosa.
+- **Causa:** error propio de setup (dos usuarios distintos para clonar y compilar), **no** un problema
+  de fluxbee.
+- **Solución aplicada (la estándar de git, no un atajo):**
+  `git config --global --add safe.directory /opt/fluxbee` para root.
+  *(La alternativa `-buildvcs=false` habría ocultado el problema y perdido el estampado de versión en
+  los binarios Go: se descartó.)*
+- **Regla para el handbook:** **el mismo usuario que clona debe compilar**, o declarar el repo como
+  `safe.directory`. Verificarlo **antes** de lanzar un build largo.
+
 ### B-6 🟢 `build-deb.sh` podía producir un `.deb` truncado sin fallar
 
 - Con el disco lleno, `dpkg-deb` salía con código 0 pero escribía un paquete de ~1.8 KB sin
