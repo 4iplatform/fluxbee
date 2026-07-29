@@ -114,6 +114,17 @@
 - **Regla:** encadenar operaciones por **estado de task** (`/tasks/<UPID>/status` → `stopped OK`),
   nunca por `sleep`.
 
+### B-7 🟢 El guest-agent de Proxmox ejecuta **sin `HOME`** definido
+
+- **Qué pasa:** `agent/exec` corre el comando sin `HOME` en el entorno. Con `bash -lc`, eso hace que
+  `/root/.profile` evalúe `. "$HOME/.cargo/env"` como `. "/.cargo/env"` → error en **cada** comando.
+- **Impacto real (no cosmético):** ese ruido en `stderr` **contaminó la salida de todos los comandos**
+  y **rompió dos pollers propios** que extraían números de la salida (el mensaje contiene `line 10`).
+  Dos falsos positivos: el problema **no era la VM, era el helper**.
+- **Solución:** invocar `/usr/bin/env HOME=/root /bin/bash -lc '<cmd>'` en el helper de guest-agent.
+- **Regla para el handbook:** el canal guest-agent **no es una shell de login normal** — definí
+  `HOME` explícitamente, y **nunca parsees números de una salida que puede traer stderr**.
+
 ### B-6 🟢 `build-deb.sh` podía producir un `.deb` truncado sin fallar
 
 - Con el disco lleno, `dpkg-deb` salía con código 0 pero escribía un paquete de ~1.8 KB sin
