@@ -1,7 +1,14 @@
 # METHOD — cómo se trabaja la infraestructura Fluxbee
 
 > Documento de método. Define **cómo** se opera la infra (lab y prod), **qué puede hacer el agente**,
-> y **cómo se registra cada cambio**. La bitácora vive al lado: `lab/logbook/YYYY-MM-DD.md`.
+> y **cómo se registra cada cambio**.
+>
+> Documentos hermanos en este directorio:
+> - `YYYY-MM-DD.md` — **la bitácora**: el viaje, cambio por cambio, con fecha/hora/evidencia.
+> - `FINDINGS.md` — **los hallazgos acumulados** del despliegue integrado; de ahí sale el
+>   **plan de cambios de código** al terminar. Durante el despliegue se **agregan**, no se arreglan.
+> - `HANDBOOK.md` — **las recetas validadas** (portables, listas para el próximo prod). Una receta
+>   se escribe **recién después** de haberla ejecutado con éxito acá.
 >
 > Complementa —no reemplaza— a [`lab/PROXMOX.md`](../PROXMOX.md) (operación diaria del lab) y
 > `docs/packaging-and-build.md` (build/paquetes). Este doc es el que manda cuando hay prod de por medio.
