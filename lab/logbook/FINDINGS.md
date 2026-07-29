@@ -77,6 +77,36 @@
 - **Estado:** observado en este despliegue. **A discutir:** ¿`add_hive` debería tener un *readiness
   gate* explícito (esperar a que la caja esté quieta) o alcanza con documentarlo en la receta?
 
+### A-6 🔴 `build-deb.sh` **nunca compila `ai_node_runner`** — el `.deb` no se puede construir en una caja limpia
+
+- **Qué pasa:** el paso `[1/5] build rust` de `packaging/build-deb.sh` hace:
+  ```bash
+  cargo build --release --bins
+  cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
+  cargo build --release --manifest-path nodes/io/Cargo.toml -p <io crates>
+  ```
+  y un comentario afirma: *"ai.generic (nodes/ai) is a root workspace member already built by
+  `--bins`"*. **Eso es falso.**
+- **Por qué:** el `Cargo.toml` raíz tiene **`[package]` (json-router) Y `[workspace]`**. Con un
+  paquete raíz presente, `cargo build --bins` **sin `--workspace`** compila **solo los bins del
+  paquete raíz**. `nodes/ai/ai-generic` (paquete `fluxbee-ai-nodes`, bin `ai_node_runner`) es un
+  **miembro** → **nunca se compila**. Nótese que `sy-frontdesk-gov` —otro miembro— **sí** tiene su
+  línea explícita: el patrón correcto ya está aplicado ahí, a `ai-generic` se le pasó.
+- **Síntoma:** el build llega a `[3/5] stage files` y aborta:
+  `Error: binary does not exist: target/release/ai_node_runner` → **no se produce `.deb`**.
+- **Por qué nunca se notó:** en el build box del **lab** el binario ya existía en `target/release/`
+  porque un `build2.sh` manual previo **sí** lo compila explícitamente
+  (`cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner`). `build-deb.sh` lo encontraba
+  y seguía. **En una caja limpia —como prod— falla.**
+- **Impacto:** el camino de build **canónico** no es autosuficiente. Cualquier build box nuevo
+  (o un `cargo clean`) rompe la construcción del `.deb`.
+- **Arreglo propuesto (una línea, a aprobar):** agregar junto a la de `sy-frontdesk-gov`:
+  ```bash
+  cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner
+  ```
+- **Estado:** **detectado en PROD alpha**, con evidencia. **Pendiente de aprobación** — no se tocó
+  código (`METHOD.md` §3 regla 0b).
+
 ---
 
 ## B. Infraestructura y herramientas — no requieren cambio de código del producto
