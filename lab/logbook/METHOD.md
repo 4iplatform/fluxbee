@@ -67,10 +67,15 @@ mecanismo de acceso.
    máquinas que él mismo creó**, más el host Proxmox que administra. La red de administración
    `192.168.8.0/24` es **compartida y plana**: hay equipos de terceros ahí. **No se escanea la red,
    no se accede a ninguna IP que no corresponda a una VM propia.** Ante una IP desconocida: no se toca.
-0b. **EL AGENTE ES USUARIO DE INFRA, NO TOCA CÓDIGO** (regla del operador, 2026-07-28): en el trabajo
-   de infraestructura **no se modifica código del producto**. Si algo del código impide avanzar o
-   parece mal, **se plantea y se revisa junto al operador ANTES de cambiar nada**. Leer el código para
-   entender: siempre. Cambiarlo por cuenta propia: nunca.
+0b. **CÓDIGO: SE ARREGLAN LOS BUGS, BIEN** (regla del operador, actualizada 2026-07-29): el agente
+   **sí resuelve los bugs que encuentra**, con la condición de que se resuelvan **correctamente** —
+   nunca un parche para "que ande". La versión original de esta regla (2026-07-28) prohibía tocar
+   código; el operador la amplió tras el hallazgo **A-6**.
+   En la práctica: (a) **diagnosticar la causa raíz**, no el síntoma; (b) **chequear los pares** —una
+   divergencia respecto de un script/nodo hermano suele *ser* el bug, y el hermano correcto es la
+   referencia; (c) **rechazar el atajo** aunque el error lo sugiera (ej.: `-buildvcs=false`);
+   (d) **registrar** el arreglo en `FINDINGS.md` con su evidencia; (e) ante un cambio **de diseño**
+   (no un bug), sigue rigiendo: **se charla antes**.
 0c. **No inventar mecanismos paralelos a los que el producto ya provee.** Si `add_hive` (o cualquier
    flujo de fluxbee) resuelve algo, se usa **ese** camino, aunque exista un atajo desde la posición
    privilegiada del agente. Motivo: las recetas deben ser **portables** (el próximo prod puede ser

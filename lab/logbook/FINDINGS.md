@@ -77,7 +77,7 @@
 - **Estado:** observado en este despliegue. **A discutir:** ¿`add_hive` debería tener un *readiness
   gate* explícito (esperar a que la caja esté quieta) o alcanza con documentarlo en la receta?
 
-### A-6 🔴 `build-deb.sh` **nunca compila `ai_node_runner`** — el `.deb` no se puede construir en una caja limpia
+### A-6 ✅ RESUELTO — `build-deb.sh` **nunca compilaba `ai_node_runner`** (divergencia con `install.sh`)
 
 - **Qué pasa:** el paso `[1/5] build rust` de `packaging/build-deb.sh` hace:
   ```bash
@@ -104,8 +104,18 @@
   ```bash
   cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner
   ```
-- **Estado:** **detectado en PROD alpha**, con evidencia. **Pendiente de aprobación** — no se tocó
-  código (`METHOD.md` §3 regla 0b).
+- **Lo que lo convierte en divergencia (no en decisión de diseño):** **`scripts/install.sh` línea 246
+  SÍ tiene** `cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner`. Y `base-nodes.json`
+  declara explícitamente que es *"the single source of truth read by BOTH packaging/build-deb.sh and
+  scripts/install.sh (**they must not diverge**)"*. O sea: `install.sh` estaba bien y `build-deb.sh`
+  era el outlier → **de-divergir, no inventar**.
+- **✅ RESUELTO** (aprobado por el operador): se agregó a `build-deb.sh` la **misma línea** que ya
+  tenía `install.sh`, y se **corrigieron los dos comentarios falsos** que afirmaban que `--bins` lo
+  construía (esos comentarios son la razón por la que el bug sobrevivió). **Los dos scripts quedaron
+  con paridad exacta** en los tres builds explícitos.
+- **Atajo rechazado:** el propio error sugiere `-buildvcs=false` para B-8 y aquí habría bastado
+  compilar el binario a mano — ambas cosas habrían hecho pasar el build **ocultando el problema** y
+  dejando la próxima caja limpia rota igual.
 
 ---
 

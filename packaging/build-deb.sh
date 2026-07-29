@@ -35,7 +35,7 @@ PY
 node_bin_src() { # <workspace> <bin> -> path to the built binary
   case "$1" in
     nodes/io) echo "nodes/io/target/release/$2" ;;
-    nodes/ai) echo "target/release/$2" ;;            # nodes/ai is a ROOT workspace member (built by --bins)
+    nodes/ai) echo "target/release/$2" ;;            # nodes/ai member -> root target/; built explicitly in [1/5]
     go) echo "go/nodes/wf/wf-generic/$2" ;;
     *) echo "target/release/$2" ;;
   esac
@@ -56,9 +56,16 @@ UNITS=(rt-gateway sy-config-routes sy-opa-rules sy-admin sy-architect sy-vault
 echo "== [1/5] build rust =="
 cargo build --release --bins
 cargo build --release -p sy-frontdesk-gov --bin sy-frontdesk-gov
+# ai.generic: `cargo build --bins` does NOT build this. The root Cargo.toml has BOTH a [package]
+# (json-router) and a [workspace], and without --workspace `--bins` only builds the ROOT package's
+# bins — workspace MEMBERS are skipped. That is why sy-frontdesk-gov above (also a member) needs its
+# own line, and ai-generic needs one too. scripts/install.sh already builds it; this line closes the
+# divergence base-nodes.json requires ("read by BOTH ... they must not diverge").
+# Without it the .deb build dies at [3/5] with "binary does not exist: target/release/ai_node_runner"
+# on any clean box — it only ever "worked" where a previous manual build had left the binary behind.
+cargo build --release -p fluxbee-ai-nodes --bin ai_node_runner
 # Build every nodes/io crate the base-node manifest references (singleton infra nodes +
-# io.* runtimes). ai.generic (nodes/ai) is a root workspace member already built by --bins;
-# wf-generic (go) is built in the go step below.
+# io.* runtimes). wf-generic (go) is built in the go step below.
 IO_PKGS="$( { mf singletons; mf runtimes; } | awk -F'\t' '$4=="nodes/io"{print $2}' | sort -u )"
 [ -n "$IO_PKGS" ] && cargo build --release --manifest-path nodes/io/Cargo.toml $(printf -- '-p %s ' $IO_PKGS)
 echo "== [2/5] build go =="
