@@ -699,9 +699,27 @@ struct PersistedManagedNode {
     node_name: String,
     kind: String,
     runtime: String,
+    /// The version this node is CURRENTLY bound to (a concrete version string).
     runtime_version: String,
+    /// What the caller ASKED FOR, verbatim — `"current"` when they wanted to follow the
+    /// manifest pointer, or a concrete version when they pinned deliberately.
+    ///
+    /// Keeping the intent separate from its resolution is the whole point: `run_node` used to
+    /// resolve `"current"` once and persist only the answer, so a `.deb` upgrade that replaced
+    /// the runtime directory left every node pointing at a version that no longer existed
+    /// (203/EXEC, and `restart_node` answering RUNTIME_NOT_AVAILABLE). The operator had asked
+    /// to follow the pointer and silently got a pin. See U-10.
+    requested_runtime_version: String,
     config_path: PathBuf,
     relaunch_on_boot: bool,
+}
+
+impl PersistedManagedNode {
+    /// True when this node asked to track the manifest's `current` pointer rather than pin.
+    fn follows_current(&self) -> bool {
+        let requested = self.requested_runtime_version.trim();
+        requested.is_empty() || requested.eq_ignore_ascii_case("current")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1677,8 +1695,23 @@ async fn reconcile_persisted_custom_nodes(
                 continue;
             }
         };
-        let version = match resolve_runtime_version(&manifest, &runtime_key, &node.runtime_version)
-        {
+        // Resolve against what the caller ASKED FOR, not against the answer they got last time.
+        //
+        // A node spawned with `runtime_version: "current"` must keep following the pointer, which
+        // is exactly what makes it survive a `.deb` upgrade: the upgrade installs the new runtime
+        // directory and removes the old one, so re-resolving the stored answer ("0.1.1") fails
+        // with `version not available` and the node is abandoned mid-crash-loop — observed in
+        // production on the 0.1.1 → 0.1.2 upgrade, on all four runtime nodes at once (U-10).
+        // Re-resolving the INTENT lands on the new version and this boot pass repairs them.
+        //
+        // A node pinned to an explicit version still resolves to that version, and still fails
+        // loudly if it is gone — which is the correct outcome for a deliberate pin.
+        let requested_version = if node.follows_current() {
+            "current"
+        } else {
+            node.runtime_version.as_str()
+        };
+        let version = match resolve_runtime_version(&manifest, &runtime_key, requested_version) {
             Ok(value) => value,
             Err(err) => {
                 failed = failed.saturating_add(1);
@@ -1686,12 +1719,34 @@ async fn reconcile_persisted_custom_nodes(
                     node_name = node.node_name,
                     runtime = runtime_key,
                     runtime_version = node.runtime_version,
+                    requested_runtime_version = node.requested_runtime_version,
                     error = %err,
                     "unable to resolve runtime version for persisted custom node reconcile"
                 );
                 continue;
             }
         };
+        if version != node.runtime_version {
+            // The pointer moved under a `current` node — say so plainly. This is the visible
+            // sign that an upgrade propagated, and it is the line an operator should find when
+            // they wonder why a node restarted.
+            tracing::info!(
+                node_name = node.node_name,
+                runtime = runtime_key,
+                from = node.runtime_version,
+                to = version,
+                "runtime 'current' pointer moved; rebinding node to the new version"
+            );
+            if let Err(err) =
+                persist_node_runtime_version(&node.config_path, &version)
+            {
+                tracing::warn!(
+                    node_name = node.node_name,
+                    error = %err,
+                    "failed to persist the rebound runtime version; the node still starts on the new one"
+                );
+            }
+        }
         let entrypoint = match resolve_runtime_spawn_entrypoint(&manifest, &runtime_key, &version) {
             Ok(value) => value,
             Err(err) => {
@@ -7434,12 +7489,23 @@ fn persisted_managed_node_from_config_value(
     if require_relaunch_on_boot && !relaunch_on_boot {
         return Ok(None);
     }
+    // Absent on nodes spawned before U-10: default to "current". That is the right default
+    // because `fluxbee-firstboot` — which spawns every boot=true node — always asks for
+    // "current", so a config without the field was almost certainly one of those.
+    let requested_runtime_version = system
+        .get("requested_runtime_version")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("current")
+        .to_string();
 
     Ok(Some(PersistedManagedNode {
         node_name: node_name.to_string(),
         kind: kind.to_string(),
         runtime: runtime.to_string(),
         runtime_version: runtime_version.to_string(),
+        requested_runtime_version,
         config_path,
         relaunch_on_boot,
     }))
@@ -10810,11 +10876,45 @@ fn config_version_from_value(value: &serde_json::Value) -> u64 {
         .unwrap_or(1)
 }
 
+/// `requested_runtime_version` is the caller's words, `runtime_version` is what they resolved
+/// to. Persisting only the latter is what made a `.deb` upgrade orphan every node: the caller
+/// asked to follow `current`, the answer was frozen into the unit path, and when the upgrade
+/// replaced the runtime directory the path dangled (U-10).
+/// Rewrite `_system.runtime_version` in a node's persisted config, leaving everything else —
+/// including `requested_runtime_version`, the intent — untouched.
+///
+/// Used when a `current`-following node is rebound after the manifest pointer moved, so the
+/// config on disk reflects what is actually running.
+fn persist_node_runtime_version(
+    config_path: &Path,
+    version: &str,
+) -> Result<(), OrchestratorError> {
+    let raw = fs::read_to_string(config_path)?;
+    let mut config: serde_json::Value = serde_json::from_str(&raw)?;
+    let Some(system) = config
+        .get_mut("_system")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return Err(format!("node config '{}' has no _system block", config_path.display()).into());
+    };
+    system.insert(
+        "runtime_version".to_string(),
+        serde_json::Value::String(version.to_string()),
+    );
+    system.insert(
+        "updated_at_ms".to_string(),
+        serde_json::Value::from(now_epoch_ms()),
+    );
+    write_json_atomic(config_path, &config)?;
+    Ok(())
+}
+
 fn build_node_system_block(
     node_name: &str,
     hive_id: &str,
     runtime: Option<&str>,
     runtime_version: Option<&str>,
+    requested_runtime_version: Option<&str>,
     runtime_base: Option<&str>,
     package_path: Option<&str>,
     ilk_id: Option<&str>,
@@ -10836,6 +10936,13 @@ fn build_node_system_block(
     if let Some(runtime_version) = runtime_version.filter(|v| !v.trim().is_empty()) {
         out["runtime_version"] = serde_json::Value::String(runtime_version.to_string());
     }
+    // Default to "current": a caller who named no version wanted whatever is current, and every
+    // node `fluxbee-firstboot` spawns asks for exactly that.
+    let requested = requested_runtime_version
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("current");
+    out["requested_runtime_version"] = serde_json::Value::String(requested.to_string());
     if let Some(runtime_base) = runtime_base.filter(|v| !v.trim().is_empty()) {
         out["runtime_base"] = serde_json::Value::String(runtime_base.to_string());
     }
@@ -10899,11 +11006,18 @@ fn ensure_node_effective_config_on_spawn_with_roots(
     let request_patch = parse_config_patch(payload, "config")?;
     let resolved_tenant_id = resolve_tenant_id_for_node(payload);
     let mut config = assemble_spawn_config_map(template, request_patch, resolved_tenant_id, None);
+    // The caller's own words, before resolution.
+    let requested_runtime_version = payload
+        .get("runtime_version")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
     let system_block = build_node_system_block(
         node_name,
         target_hive,
         Some(runtime),
         Some(runtime_version),
+        requested_runtime_version,
         runtime_base,
         package_path,
         ilk_id,
@@ -23722,6 +23836,7 @@ blob:
     fn managed_node_restart_command_uses_systemd_restart_with_systemd_run_fallback() {
         let plan = ManagedNodeLaunchPlan {
             node: PersistedManagedNode {
+                requested_runtime_version: "current".to_string(),
                 node_name: "WF.invoice@motherbee".to_string(),
                 kind: "WF".to_string(),
                 runtime: "wf.invoice".to_string(),
@@ -26069,12 +26184,110 @@ blob:
         assert!(out.get("_system").is_none());
     }
 
+    /// U-10: la INTENCION se persiste aparte de su resolucion.
+    ///
+    /// `fluxbee-firstboot` spawnea todo nodo boot=true con `runtime_version: "current"`. Antes,
+    /// esa palabra se resolvia una vez y se tiraba: solo quedaba la version concreta, horneada
+    /// en la ruta de la unit. Cuando un upgrade del .deb reemplazaba el directorio del runtime,
+    /// la ruta quedaba colgada (203/EXEC) y `restart_node` respondia RUNTIME_NOT_AVAILABLE.
+    #[test]
+    fn system_block_keeps_the_requested_version_apart_from_the_resolved_one() {
+        let system = build_node_system_block(
+            "IO.api@motherbee",
+            "motherbee",
+            Some("io.api"),
+            Some("0.1.2"),     // a lo que resolvio
+            Some("current"),   // lo que se pidio
+            None,
+            None,
+            None,
+            None,
+            1,
+        );
+        assert_eq!(system["runtime_version"], serde_json::json!("0.1.2"));
+        assert_eq!(
+            system["requested_runtime_version"],
+            serde_json::json!("current"),
+            "la palabra del que pidio no se puede perder"
+        );
+    }
+
+    /// Quien no nombra version quiso la current — y es lo que hace firstboot.
+    #[test]
+    fn an_unnamed_version_defaults_to_current() {
+        let system = build_node_system_block(
+            "AI.chat@motherbee",
+            "motherbee",
+            Some("ai.generic"),
+            Some("0.1.2"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            1,
+        );
+        assert_eq!(
+            system["requested_runtime_version"],
+            serde_json::json!("current")
+        );
+    }
+
+    /// Un pin explicito se respeta: ese nodo NO sigue al puntero.
+    #[test]
+    fn an_explicit_pin_does_not_follow_the_pointer() {
+        let pinned = PersistedManagedNode {
+            node_name: "IO.api@motherbee".to_string(),
+            kind: "IO".to_string(),
+            runtime: "io.api".to_string(),
+            runtime_version: "0.1.1".to_string(),
+            requested_runtime_version: "0.1.1".to_string(),
+            config_path: PathBuf::from("/tmp/x/config.json"),
+            relaunch_on_boot: true,
+        };
+        assert!(!pinned.follows_current());
+
+        let following = PersistedManagedNode {
+            requested_runtime_version: "current".to_string(),
+            ..pinned.clone()
+        };
+        assert!(following.follows_current());
+    }
+
+    /// Un config viejo (anterior a U-10) no trae el campo. Debe leerse como "current", porque
+    /// esos nodos son justamente los que spawneo firstboot pidiendo current.
+    #[test]
+    fn a_config_without_the_field_is_read_as_following_current() {
+        let config = serde_json::json!({
+            "_system": {
+                "runtime": "io.api",
+                "runtime_version": "0.1.1",
+                "relaunch_on_boot": true,
+            }
+        });
+        let node = persisted_managed_node_from_config_value(
+            "IO.api@motherbee",
+            "IO",
+            PathBuf::from("/tmp/x/config.json"),
+            &config,
+            true,
+        )
+        .expect("parse must succeed")
+        .expect("node must be produced");
+        assert_eq!(node.runtime_version, "0.1.1");
+        assert!(
+            node.follows_current(),
+            "un nodo pre-U-10 debe volver a seguir el puntero, no quedar clavado en una version borrada"
+        );
+    }
+
     #[test]
     fn build_node_system_block_includes_runtime_base_and_package_path_when_provided() {
         let system = build_node_system_block(
             "AI.billing@worker-220",
             "worker-220",
             Some("ai.billing"),
+            Some("2.1.0"),
             Some("2.1.0"),
             Some("ai.generic"),
             Some("/var/lib/fluxbee/dist/runtimes/ai.billing/2.1.0"),
@@ -26095,6 +26308,7 @@ blob:
             "WF.demo.l1@worker-220",
             "worker-220",
             Some("wf.orch.diag"),
+            Some("current"),
             Some("current"),
             None,
             None,
@@ -26142,6 +26356,7 @@ blob:
             "AI.core@worker-220",
             "worker-220",
             Some("ai.core"),
+            Some("1.0.0"),
             Some("1.0.0"),
             None,
             None,

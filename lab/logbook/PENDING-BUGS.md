@@ -33,7 +33,7 @@ infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambi
 | [U-7](#u-7) | ✅ **cerrado** | El watchdog reiniciaba syncthing cada ~7 s por una carpeta inexistente | — |
 | [U-8](#u-8) | 🔴 abierto | `add_hive` no tiene forma de consultar su progreso (tarda >6 min) | no |
 | [U-9](#u-9) | 🔴 abierto | Las rutas desconocidas devuelven `{"error":"not_found"}` pelado | no |
-| [U-10](#u-10) | 🔴 abierto | **Un upgrade del `.deb` deja huérfano a TODO nodo runtime, y no hay recuperación por HTTP** | **SÍ** |
+| [U-10](#u-10) | 🟡 **arreglado, falta validar** | Un upgrade del `.deb` dejaba huérfano a todo nodo runtime | — |
 
 ---
 
@@ -631,10 +631,43 @@ Dos trampas encontradas por el camino: el orden `kill` → `remove_instance` es 
 del nodo**, lo cual en prod (nodos `UNCONFIGURED`) no costó nada, pero en un despliegue con tokens
 cargados sería una pérdida real.
 
-### Arreglos a discutir
+### Arreglo aplicado — decisión del operador: **que `current` signifique current**
 
-- **Que `current` signifique current.** Que la unit apunte a un path estable (un symlink
-  `runtimes/<rt>/current/`) en vez de a la versión resuelta, o que el orquestador regenere las units
-  de nodo en el boot igual que `regen_local_core_units` ya hace para el core.
-- **Que el rebind por HTTP funcione o falle fuerte.** Hoy acepta `runtime_version` y no hace nada.
-- **Que el upgrade no borre la versión en uso**, o que migre a los nodos que la usan.
+*"Que siga al puntero"*: al arrancar tras un upgrade, el nodo se rebindea a la versión nueva y
+reinicia solo. Es lo que el operador pidió al spawnear, y es lo que hace que un *minor update*
+efectivamente llegue.
+
+Se apoya en un patrón que **ya existía para el core** — `regen_local_core_units`, con el comentario
+*"Spoke self-heal: re-render them from THIS binary's templates on every boot"*. Estaba aplicado a
+los servicios del core y no a los nodos.
+
+**Dos mitades:**
+
+1. **Persistir la intención, no solo su resolución.** `build_node_system_block` ahora guarda
+   `requested_runtime_version` junto a `runtime_version`. (El campo ya existía como parcheable en el
+   código; lo que faltaba era que `run_node` lo escribiera.) Un config sin el campo —todos los
+   anteriores— se lee como `current`, que es correcto porque son justamente los que spawneó
+   `fluxbee-firstboot` pidiendo `current`.
+2. **Resolver por la intención al boot.** `reconcile_persisted_custom_nodes` resolvía contra
+   `node.runtime_version` —la respuesta vieja— y por eso moría con *"version not available"* y
+   abandonaba el nodo en pleno crash-loop. Ahora resuelve contra lo pedido: un nodo `current`
+   aterriza en la versión nueva y **ese mismo paso de boot lo repara**. Un pin explícito sigue
+   pinneado y **falla fuerte** si su versión desapareció, que es lo correcto para un pin deliberado.
+
+Cuando el puntero se mueve se registra en claro (`runtime 'current' pointer moved; rebinding node
+from X to Y`) y se persiste la nueva resolución — así el config en disco refleja lo que corre.
+
+**4 tests de regresión**, incluido el del config viejo sin el campo. 147 en verde.
+
+⚠️ **Falta validarlo en vivo**: el arreglo está en el repo, no en el binario que corre. Se prueba en
+el próximo upgrade, y ese es justamente un buen caso de prueba — si funciona, los nodos sobreviven
+solos sin el `kill → remove_instance → run_node` de la recuperación manual.
+
+### Lo que queda abierto de este hallazgo
+
+- **El rebind por HTTP sigue mintiendo**: `PUT /nodes/{n}/config {"runtime_version":"…"}` devuelve
+  `ok` y no rebindea. Debería funcionar o rechazar.
+- **`tenant_id` obligatorio y no documentado en el error** hasta que falla con
+  `IDENTITY_REGISTER_FAILED`.
+- **El orden `kill` → `remove_instance`** es obligatorio y no está dicho en ningún lado
+  (`NODE_ALREADY_EXISTS` si se saltea).
