@@ -34,6 +34,7 @@ infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambi
 | [U-8](#u-8) | 🔴 abierto | Operaciones largas sin progreso consultable · **`update category=core` también da TIMEOUT a los 60 s** | no |
 | [U-9](#u-9) | 🔴 abierto | Las rutas desconocidas devuelven `{"error":"not_found"}` pelado | no |
 | [U-10](#u-10) | ✅ **cerrado y VALIDADO en vivo** | Un upgrade del `.deb` dejaba huérfano a todo nodo runtime | — |
+| [U-11](#u-11) | 🔴 abierto | **IO.cloud no puede auto-publicar su canal**: el gate anti-relay le bloquea `externalize` | sí, sin workaround del operador |
 
 ---
 
@@ -729,3 +730,69 @@ mensaje sería otro.
   nodes require root-level tenant_id on first spawn"*). Mi error fue no leerlo.
 - 🔴 **Queda uno**: el orden `kill` → `remove_instance` es obligatorio y no está dicho en ningún
   lado (`NODE_ALREADY_EXISTS` si se saltea). Va al HANDBOOK.
+
+
+---
+
+<a id="u-11"></a>
+## U-11 🔴 — `IO.cloud` no puede auto-publicar su propio canal
+
+**Encontrado el 2026-07-30** al configurar IO.cloud en producción para conectar Fluxbee Cloud.
+
+Al arrancar con `IO_CLOUD_EDGE_NODE` seteado, el nodo crea su ICH y pide publicarlo. El hive lo
+rechaza:
+
+```text
+INFO  IO.cloud own ICH ensured  ich_id=ich:14b66389-…  owner=IO.cloud@motherbee  enabled=true
+WARN  IO.cloud -> SY.admin externalize REJECTED  error_code=UNAUTHORIZED
+      IO.cloud may relay only ["create_tenant","vault_put","run_node"] over the mesh,
+      not 'externalize' (Fluxbee Cloud provisioning gate)
+```
+
+### Es un choque entre dos controles que por separado están bien
+
+**`authorize_cloud_relay`** (`sy_admin.rs:5401`) es *default-deny* para `IO.cloud@<hive>`: solo
+puede relayar las tres acciones de `CLOUD_EXPOSED_ACTIONS`. Eso es FIX-1 y es deliberado — el
+comentario explica que existe para que un IO.cloud comprometido no se vuelva *confused deputy*.
+Correcto.
+
+**`authorize_channel_command`** (`sy_admin.rs:5374`) es el gate hecho **específicamente** para esto:
+solo nodos `IO.*`, y **solo sobre su propia channel** (`owner == caller`). Habría autorizado esta
+llamada sin problema: caller `IO.cloud@motherbee`, owner `IO.cloud@motherbee`.
+
+**El problema es que el primero se traga el caso antes de que el segundo pueda opinar.** El
+default-deny no distingue dos cosas distintas:
+
+- **relayar** — actuar *en nombre de Cloud*. Es lo que hay que contener, y las tres acciones
+  permitidas son exactamente eso.
+- **actuar sobre su propia channel** — el nodo actuando *por sí mismo*, sobre un recurso del que
+  es dueño. No es un relay, y ya tiene su gate con la restricción de propiedad.
+
+El propio código de IO.cloud dice que esperaba lo segundo
+(`nodes/io/io-cloud/src/main.rs:118-123`): *"the same node→admin ADMIN_COMMAND path a real deploy
+uses; it is self-service (requester owns the ICH). SY.admin authorizes this by router-stamped IO.*
+origin plus `requester == ICH owner`"*.
+
+### Impacto
+
+`IO.cloud` **no es alcanzable desde internet** hasta que un operador publique el canal a mano. Y
+hay que repetirlo en cada reinstalación del hive. Documentado como paso obligatorio en
+[`docs/io-cloud-api.md`](../../docs/io-cloud-api.md) §5.
+
+**Workaround verificado en producción** (`POST /channels/externalize` desde el admin, donde
+`caller=None` es camino interno confiable):
+
+```json
+{"ich":"<el del log>","edge_node":"SY.edge@ingress1","inbound_family":"user",
+ "auth_mode":"shared-secret","secret":"<IO_CLOUD_SECRET>","methods":["POST"]}
+```
+
+### Arreglo propuesto — a charlar
+
+Que `authorize_cloud_relay` **delegue los comandos de channel** a `authorize_channel_command` en vez
+de negarlos de plano. Mantiene intacto el default-deny para el relay (que es lo que contiene a un
+IO.cloud comprometido) y devuelve la decisión sobre canales propios al gate que ya la sabe tomar,
+con su restricción `owner == caller`.
+
+**No lo hago sin tu visto bueno**: tocar un gate de seguridad marcado como FIX-1 (HIGH) merece
+acuerdo explícito, aunque la separación conceptual parezca clara.
