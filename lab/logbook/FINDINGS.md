@@ -185,6 +185,36 @@
 - **Regla para el handbook:** **el mismo usuario que clona debe compilar**, o declarar el repo como
   `safe.directory`. Verificarlo **antes** de lanzar un build largo.
 
+### B-9 🟢 Proxmox sobre VMware: **la seguridad del portgroup rompe TODA red bridgeada de las VMs anidadas**
+
+- **Síntoma:** las VMs con placa en `vmbr0`/`vmbr1` **no podían ni hacer ARP** a su gateway
+  (`ARP INCOMPLETE`, 100 % packet loss), aunque el **host** Proxmox funcionaba perfecto en el
+  **mismo bridge**, con IP/ruteo/carrier correctos del lado de la VM.
+- **Causa:** el Proxmox es una VM de VMware. Los portgroups traen por defecto
+  **`Forged transmits: Reject`** (+ `MAC address changes: Reject`, `Promiscuous mode: Reject`), lo que
+  **descarta toda trama cuya MAC origen no sea la asignada a la vNIC del Proxmox**. Las VMs anidadas
+  emiten con **su propia** MAC (`BC:24:11:…`) → VMware las tira.
+- **Lo que hizo el diagnóstico concluyente** (y descartó fluxbee, firewall y configuración):
+
+  | Observación | Explicación |
+  |---|---|
+  | ✅ el host Proxmox anda | usa **su** MAC asignada |
+  | ✅ el worker sale a internet por `fbint`+SNAT | tráfico **ruteado** → sale con la **MAC del host** |
+  | ❌ una VM en `vmbr0` no hace ni ARP | tráfico **bridgeado** → **MAC de la VM** → descartado |
+
+  Es decir: **la red SDN interna funcionaba justamente porque es routing con NAT, no bridging.**
+  Esa asimetría fue la pista que cerró el caso.
+- **Solución (operador, en ESXi, en caliente y por portgroup):**
+  `Promiscuous mode: Accept` · `MAC address changes: Accept` · **`Forged transmits: Accept`** ← la que
+  habilita **enviar**.
+- **Detalle operativo caro:** hay **un portgroup por placa física**. Al aplicarlo solo al de `nic0`,
+  `vmbr0` empezó a andar y `vmbr1` **siguió roto** — mismo síntoma, otra placa. **Hay que aplicarlo a
+  TODOS los portgroups** de las NICs del hipervisor anidado.
+- **Verificado después del cambio:** ingress con **IP pública propia `71.182.182.80` visible desde
+  internet** + pata interna al mesh, simultáneas. Egress con salida por su pata WAN.
+- **Para el handbook:** en cualquier prod sobre VMware, **esto se configura ANTES de desplegar**; si no,
+  se pierden horas diagnosticando una red que del lado del guest está impecable.
+
 ### B-6 🟢 `build-deb.sh` podía producir un `.deb` truncado sin fallar
 
 - Con el disco lleno, `dpkg-deb` salía con código 0 pero escribía un paquete de ~1.8 KB sin
