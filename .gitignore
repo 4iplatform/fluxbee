@@ -18,3 +18,7 @@ nodes/io/target
 
 # Real *.fluxbee.ai TLS cert + private key — deployed via vault/out-of-band, never committed
 sslcert/
+
+# Python bytecode cache (lab/pve.py y utilidades)
+__pycache__/
+*.pyc

@@ -227,5 +227,6 @@
 
 1. Durante el despliegue: **se agregan hallazgos, no se arreglan**.
 2. Al terminar: se revisa la sección **A** con el operador y sale el **plan de cambios de código**
-   (qué se cambia, por qué, en qué orden, y qué queda como decisión de diseño).
+   (qué se cambia, por qué, en qué orden, y qué queda como decisión de diseño). Ese plan se lleva a
+   [`PENDING-BUGS.md`](PENDING-BUGS.md), que es donde se sigue el estado de cada tarea.
 3. La sección **B** alimenta el `HANDBOOK.md` (recetas) y, donde corresponda, los scripts de infra.

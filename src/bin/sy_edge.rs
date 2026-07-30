@@ -19,7 +19,7 @@ use fluxbee_sdk::protocol::{
     MSG_EDGE_LIST_URLS, MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
     MSG_EDGE_PUBLISH_BLOB, MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB,
     is_system_kind, MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_TTL_EXCEEDED, MSG_UNREACHABLE,
-    MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
+    MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND, VaultSecretChangedPayload, VaultSecretOp,
 };
 use fluxbee_sdk::{
     build_node_config_response_message, is_node_config_get_message, is_node_config_set_message,
@@ -441,6 +441,52 @@ async fn main() -> Result<(), SyEdgeError> {
                             &registry,
                         )
                         .await;
+                        // TLS material is NOT covered by resolve_secrets: it is read exactly once
+                        // at boot into an immutable `Arc<rustls::ServerConfig>` already moved into
+                        // the running listener, so a rotated cert stayed invisible until someone
+                        // restarted the unit by hand (observed in prod: vault at version 2 with the
+                        // full chain while the edge still served the chainless version 1).
+                        // React with exit(0) and let systemd restart us — the same contract
+                        // sy.identity and sy.storage use for boot-only vault material
+                        // (Model D' VA-J'-13). Hot-swapping via a rustls cert resolver would avoid
+                        // the brief public-listener gap and is the better end state; it is tracked
+                        // as PB-1 in lab/logbook/PENDING-BUGS.md.
+                        //
+                        // Matching is BY KEY here, deliberately diverging from the
+                        // `(resource_type, tenant_id, ilk)` guidance on VaultSecretChangedPayload:
+                        // that guidance is for consumers who resolve a secret by interest, whereas
+                        // the edge is configured with one explicit `tls_vault_key` and fetches by
+                        // that exact key. Key equality is precisely the condition that invalidates
+                        // what we loaded.
+                        match tls_secret_change_action(
+                            &msg.payload,
+                            config.tls_vault_key.as_deref(),
+                        ) {
+                            TlsSecretChange::ReloadRequired { key, op, version } => {
+                                tracing::warn!(
+                                    key = %key,
+                                    op = %op,
+                                    version = version,
+                                    "sy-edge: TLS cert changed in vault; exiting(0) for systemd restart to load it (cannot hot-swap a live listener)"
+                                );
+                                // Flush before the process goes away.
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                std::process::exit(0);
+                            }
+                            TlsSecretChange::DeletedKeepServing { key } => {
+                                tracing::error!(
+                                    key = %key,
+                                    "sy-edge: TLS cert DELETED from vault; still serving the previously loaded cert. A restart would leave this edge with no HTTPS frontend — restore the secret."
+                                );
+                            }
+                            TlsSecretChange::Malformed { error } => {
+                                tracing::warn!(
+                                    error = %error,
+                                    "sy-edge: malformed VAULT_SECRET_CHANGED payload; cannot tell whether the TLS cert changed"
+                                );
+                            }
+                            TlsSecretChange::Unrelated => {}
+                        }
                     }
                     other => {
                         tracing::warn!(
@@ -1617,6 +1663,57 @@ fn load_tls_config(
     tls_config_from_pem(&cert_pem, &key_pem)
 }
 
+/// What a `VAULT_SECRET_CHANGED` broadcast means for this edge's TLS material.
+#[derive(Debug, PartialEq, Eq)]
+enum TlsSecretChange {
+    /// New TLS material exists for our key; the running listener cannot pick it
+    /// up, so the process must restart.
+    ReloadRequired {
+        key: String,
+        op: &'static str,
+        version: i64,
+    },
+    /// Our TLS key was deleted. Deliberately NOT a reload: restarting would fail
+    /// closed with no cert and take the public HTTPS door down.
+    DeletedKeepServing { key: String },
+    /// The broadcast is about some other secret (or TLS-from-vault is not in use).
+    Unrelated,
+    /// The payload could not be parsed, so we cannot tell.
+    Malformed { error: String },
+}
+
+/// Decide how to react to a `VAULT_SECRET_CHANGED` broadcast, given the vault key
+/// this edge loaded its TLS material from (`None` when TLS is off or disk-sourced).
+///
+/// Split out from the message loop purely so the decision is testable — the caller
+/// turns `ReloadRequired` into `exit(0)`.
+fn tls_secret_change_action(payload: &serde_json::Value, tls_key: Option<&str>) -> TlsSecretChange {
+    let Some(tls_key) = tls_key else {
+        return TlsSecretChange::Unrelated;
+    };
+    let parsed: VaultSecretChangedPayload = match serde_json::from_value(payload.clone()) {
+        Ok(p) => p,
+        Err(err) => {
+            return TlsSecretChange::Malformed {
+                error: err.to_string(),
+            }
+        }
+    };
+    if parsed.key != tls_key {
+        return TlsSecretChange::Unrelated;
+    }
+    match parsed.op {
+        VaultSecretOp::Put | VaultSecretOp::Rotate | VaultSecretOp::Rollback => {
+            TlsSecretChange::ReloadRequired {
+                key: parsed.key,
+                op: parsed.op.as_str(),
+                version: parsed.version,
+            }
+        }
+        VaultSecretOp::Delete => TlsSecretChange::DeletedKeepServing { key: parsed.key },
+    }
+}
+
 /// Fetch the edge's TLS material from `SY.vault@<vault_hive>` (secret value
 /// `{ "cert": "<PEM>", "key": "<PEM>" }`). Authorized by the dedicated-owner match
 /// against the edge's deterministic ilk — no identity SHM needed on the edge hive.
@@ -2494,6 +2591,78 @@ mod tests {
         assert_eq!(m.get("hub.mode").map(String::as_str), Some("subscribe"));
         assert_eq!(m.get("hub.verify_token").map(String::as_str), Some("my token"));
         assert_eq!(m.get("hub.challenge").map(String::as_str), Some("12345"));
+    }
+
+    /// Build a VAULT_SECRET_CHANGED payload the way SY.vault emits it.
+    fn vault_changed(key: &str, op: &str, version: i64) -> serde_json::Value {
+        serde_json::json!({
+            "op": op,
+            "resource_type": "tls",
+            "tenant_id": "tnt:00000000-0000-0000-0000-000000000000",
+            "version": version,
+            "key": key,
+            "hive_id": "motherbee",
+            "at_ms": 1_753_800_000_000i64,
+        })
+    }
+
+    /// Regression: a rotated TLS cert used to be invisible to a running edge —
+    /// resolve_secrets only refreshed channel secrets, so the vault could sit at
+    /// version 2 with a full chain while the edge kept serving version 1. The
+    /// broadcast must now demand a restart (sy.identity's Model D' VA-J'-13 contract).
+    #[test]
+    fn tls_cert_change_in_vault_demands_restart() {
+        assert_eq!(
+            tls_secret_change_action(&vault_changed("edge_tls", "put", 2), Some("edge_tls")),
+            TlsSecretChange::ReloadRequired {
+                key: "edge_tls".into(),
+                op: "put",
+                version: 2,
+            }
+        );
+        for op in ["rotate", "rollback"] {
+            assert!(matches!(
+                tls_secret_change_action(&vault_changed("edge_tls", op, 3), Some("edge_tls")),
+                TlsSecretChange::ReloadRequired { .. }
+            ));
+        }
+    }
+
+    /// A delete must NOT restart the edge: it would fail closed with no cert and
+    /// turn one bad vault call into a public HTTPS outage.
+    #[test]
+    fn tls_cert_delete_never_restarts_the_public_door() {
+        assert_eq!(
+            tls_secret_change_action(&vault_changed("edge_tls", "delete", 0), Some("edge_tls")),
+            TlsSecretChange::DeletedKeepServing {
+                key: "edge_tls".into()
+            }
+        );
+    }
+
+    /// Other secrets rotating (postgres, slack, …) must never bounce the edge,
+    /// and an edge not sourcing TLS from the vault ignores the broadcast entirely.
+    #[test]
+    fn unrelated_secret_changes_leave_the_edge_alone() {
+        assert_eq!(
+            tls_secret_change_action(&vault_changed("pg_main", "put", 7), Some("edge_tls")),
+            TlsSecretChange::Unrelated
+        );
+        // TLS off, or cert loaded from disk: nothing to invalidate.
+        assert_eq!(
+            tls_secret_change_action(&vault_changed("edge_tls", "put", 2), None),
+            TlsSecretChange::Unrelated
+        );
+    }
+
+    /// An unparseable payload must be reported, never silently treated as
+    /// "not my key" — that would resurrect the original stale-cert bug.
+    #[test]
+    fn malformed_payload_is_reported_not_swallowed() {
+        assert!(matches!(
+            tls_secret_change_action(&serde_json::json!({"op": "put"}), Some("edge_tls")),
+            TlsSecretChange::Malformed { .. }
+        ));
     }
 
     #[test]
