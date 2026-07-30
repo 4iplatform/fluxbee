@@ -3246,7 +3246,12 @@ async fn restart_local_core_services_with_health_gate() -> Result<Vec<String>, O
         if !systemd_unit_exists(&service) {
             continue;
         }
-        systemd_start(&service)?;
+        // MUST be restart, not start: this runs AFTER the binaries were swapped in place
+        // while the services stayed up, so `start` would be a silent no-op and the unit
+        // would keep running the old inode. The rollback path calls this same function
+        // expecting the services to come back on the restored binary — that only works
+        // with a real restart either. See U-1.
+        systemd_restart(&service)?;
         wait_for_service_active(
             &service,
             Duration::from_secs(CORE_SERVICE_HEALTH_TIMEOUT_SECS),
@@ -19741,6 +19746,18 @@ fn systemd_start(service: &str) -> Result<(), OrchestratorError> {
     let mut cmd = Command::new("systemctl");
     cmd.arg("start").arg(service);
     run_cmd(cmd, "systemctl start")
+}
+
+/// `systemctl restart` — the only way to make an already-running service pick up a
+/// swapped binary. `systemd_start` is a NO-OP on a live unit (systemd reports success
+/// and the process keeps executing the old, now-unlinked inode), so a `category=core`
+/// update that used it reported `status: ok` with a full `restarted` list while nothing
+/// had actually changed. The remote/SSH core-sync path always used `systemctl restart`;
+/// the local path was the divergent one. See U-1 in lab/logbook/PENDING-BUGS.md.
+fn systemd_restart(service: &str) -> Result<(), OrchestratorError> {
+    let mut cmd = Command::new("systemctl");
+    cmd.arg("restart").arg(service);
+    run_cmd(cmd, "systemctl restart")
 }
 
 fn systemd_stop(service: &str) -> Result<(), OrchestratorError> {

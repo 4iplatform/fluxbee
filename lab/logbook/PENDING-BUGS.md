@@ -24,8 +24,8 @@ infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambi
 
 | id | estado | tema | bloquea |
 |---|---|---|---|
-| [U-1](#u-1) | 🔴 abierto | **El update del core reporta éxito sin reiniciar nada** | **SÍ** |
-| [U-2](#u-2) | 🔴 abierto | **Ingress y egress no tienen canal de core** (`enabled: false` hardcodeado) | **SÍ** para esos roles |
+| [U-1](#u-1) | ✅ **cerrado** | **El update del core reportaba éxito sin reiniciar nada** | — |
+| [U-2](#u-2) | 🔴 abierto | **Ingress y egress no tienen canal de core** · diseño acordado: carpeta de dist **por rol** | **SÍ** para esos roles |
 | [U-3](#u-3) | 🔴 abierto | El `.deb` pisa `dist/runtimes/manifest.json` y borra lo publicado en caliente | no (hoy) |
 | [U-4](#u-4) | 🔴 abierto | Cero verificación de compatibilidad de versión entre motherbee y spokes | no |
 | [U-5](#u-5) | 🔴 abierto | No hay rollback de core como comando | no |
@@ -215,7 +215,7 @@ dónde sale el tráfico.
 > falte maquinaria: son **dos defectos puntuales que la vuelven inoperable**, y ambos son silenciosos.
 
 <a id="u-1"></a>
-## U-1 🔴 — El update del core reporta éxito **sin reiniciar nada** · BLOQUEANTE
+## U-1 ✅ CERRADO — El update del core reportaba éxito **sin reiniciar nada**
 
 La función que corre después de intercambiar los binarios se llama
 `restart_local_core_services_with_health_gate`… y llama a **`systemctl start`**:
@@ -239,8 +239,20 @@ de mirar a los pares es justo la señal de dónde está el bug.
 entonces "funciona"… en el próximo reboot. Alguien puede correr el update, ver `ok`, reiniciar la
 máquina por otra razón días después, y concluir que el mecanismo anda bien.
 
-**Arreglo:** `systemd_start` → un `systemd_restart` nuevo, alineando con la ruta remota. Es una línea.
-**A charlar antes:** `restart` vs `stop`+`start` cambia la ventana de indisponibilidad del spoke.
+### Se descartó la explicación inocente
+
+Antes de tocar nada verifiqué si el flujo **detenía** los servicios antes de intercambiar los
+binarios — en ese caso `start` habría sido correcto. **No los detiene:** los binarios se cambian en
+caliente y el propio comentario del código dice la intención,
+*"re-render units and daemon-reload BEFORE the restart, so the new binaries start under the new
+units"*. Además el camino de rollback vuelve a llamar la misma función esperando que los servicios
+levanten con el binario restaurado — que con `start` tampoco ocurriría.
+
+### Arreglo aplicado
+
+`systemd_start` → `systemd_restart` (función nueva, alineada con la ruta remota). `systemd_start`
+**se conserva** porque sigue siendo correcto en los 5 lugares donde se arranca algo que no está
+corriendo. Compila limpio, **133/133 tests del orchestrator en verde**.
 
 **Test que falta** (hoy tiene que fallar, y esa es la prueba):
 
@@ -296,12 +308,64 @@ específicas de **blob**: *"DMZ never receives `active/`… nunca agregar ingres
 lo alcanza. (Una auditoría automática de este hallazgo confundió las dos carpetas y puso una salvedad
 que no aplica — queda anotado para que no se propague.)
 
-**Arreglo:** parametrizar `dist.sync.enabled` en los `format!` de ingress y egress igual que ya está
-en el de worker (línea 17440), y agregar la carpeta al peering de esos roles en `add_hive`.
+### La causa raíz real: `public_only` hace dos trabajos
 
-**A charlar igual:** si el default para ingress/egress debe ser `true`, o quedar explícito en el
-`add_hive`. Y para las cajas **ya unidas** (las de prod ahora) hace falta decidir cómo se les agrega
-la carpeta sin re-hacer el join, dado que SSH está revocado por diseño.
+El `hive.yaml` era la mitad visible. La compuerta de verdad está en `reconcile_syncthing_peer_xml`:
+
+```rust
+if !public_only && dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
+    // crea fluxbee-dist + agrega el device
+}
+```
+
+Para el ingress `public_only = true`, así que **la carpeta se saltea sin importar `sync_enabled`**, y
+hay un test que fija ese comportamiento en la punta de motherbee
+(`ingress_public_peer_profile_never_attaches_private_folders`).
+
+O sea que la bandera agrupa dos cosas: **(1)** no compartir `blob/active` — invariante P5, correcto —
+y **(2)** no compartir `dist/`, que es lo que deja al ingress sin camino de update. La invariante
+solo exige la primera.
+
+### Por qué no alcanza con quitar el gate
+
+`dist/` no son solo los binarios del core: contiene `core/` (389 M), **`runtimes/` (64 M)** y
+`vendor/` (35 M). `runtimes/` es donde `SY.wf-rules` publica los paquetes de workflow — o sea,
+potencialmente contenido de clientes. Compartir `dist/` entero con una caja del DMZ le deja copia de
+**todos** los runtimes, incluidos los que ese nodo nunca va a ejecutar.
+
+### Diseño acordado con el operador (2026-07-30): **carpeta de dist por rol**
+
+> *"me parece perfecto que sea carpeta dedicada por role de hive… así se sincroniza solo esa carpeta
+> según el role y minimizamos el tema de seguridad"*
+
+Cada rol recibe **solo lo que ese rol ejecuta**. Se apoya en dos cosas que **ya existen**:
+
+1. **`core_component_names_for_role(&manifest, role)`** ya calcula el set de binarios por rol, desde
+   `system_nodes.<role>` del `hive.yaml`.
+2. **El bootstrap por SSH ya hace exactamente esto:** `sync_core_to_worker` usa ese mismo set en modo
+   `worker-bootstrap-minimal`. ⇒ **el scoping por rol ya está implementado en un camino y falta en el
+   otro** — otra vez la divergencia entre pares señalando la respuesta.
+
+Y el patrón de carpeta acotada también existe: `fluxbee-blob` (privada, completa) vs
+`fluxbee-blob-public` (one-way, acotada a un subdirectorio).
+
+**Forma propuesta:**
+
+```text
+MOTHERBEE                                   SPOKE
+dist/roles/<role>/core/bin/<set del rol>  ->  dist/core/bin/...     (mismo folder id,
+dist/roles/<role>/core/manifest.json      ->  dist/core/manifest.json  path distinto por device)
+dist/roles/worker/runtimes/               ->  dist/runtimes/        (solo roles que spawnean)
+```
+
+**Lo verificado que hace esto barato:** `local_core_bin_source_path` es fijo y
+`validate_core_manifest_for_bins` valida **solo los binarios que se le pasan** (los del rol), no
+exige que todo el manifest exista en disco. ⇒ si a cada spoke le llega su carpeta montada en `dist/`,
+ve `dist/core/bin/…` como siempre y **el camino de aplicación del update no se toca**.
+
+**Pendiente de implementar.** Es un cambio grande (materialización por rol en MB, folder ids por rol,
+migración de hives ya unidos, tests). El fix parcial del `hive.yaml` se revirtió a propósito: sin las
+carpetas, declarar `enabled: true` produciría avisos de salud falsos.
 
 ---
 
