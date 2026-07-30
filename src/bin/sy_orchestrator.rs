@@ -20439,21 +20439,25 @@ fn systemd_start(service: &str) -> Result<(), OrchestratorError> {
 /// exist at all), and none of them should stop a relaunch. `stop` unloads a loaded-but-inactive
 /// transient unit; `reset-failed` clears the name when it is stuck in a failed state.
 fn clear_stale_transient_unit(unit: &str) {
-    let service = if unit.ends_with(".service") {
-        unit.to_string()
-    } else {
-        format!("{unit}.service")
-    };
-    if !systemd_unit_exists(&service) {
+    // `unit` is the BARE name (no `.service`) — `systemd_unit_exists` appends the suffix itself,
+    // and systemctl accepts either form. Passing an already-suffixed name here asks systemd about
+    // `<unit>.service.service`, which is always "not-found", so the guard returns early and the
+    // cleanup silently never runs.
+    let unit = unit.strip_suffix(".service").unwrap_or(unit);
+    if !systemd_unit_exists(unit) {
         return;
     }
-    for (verb, label) in [("stop", "systemctl stop"), ("reset-failed", "systemctl reset-failed")] {
+    for (verb, label) in [
+        ("stop", "systemctl stop"),
+        ("reset-failed", "systemctl reset-failed"),
+    ] {
         let mut cmd = Command::new("systemctl");
-        cmd.arg(verb).arg(&service);
+        cmd.arg(verb).arg(unit);
         if let Err(err) = run_cmd(cmd, label) {
-            tracing::debug!(unit = %service, verb = verb, error = %err, "clearing stale transient unit: step did not apply");
+            tracing::debug!(unit = %unit, verb = verb, error = %err, "clearing stale transient unit: step did not apply");
         }
     }
+    tracing::info!(unit = %unit, "freed stale transient unit name before relaunch");
 }
 
 fn systemd_restart(service: &str) -> Result<(), OrchestratorError> {
@@ -26247,6 +26251,23 @@ blob:
             Some(&serde_json::json!("tnt:resolved"))
         );
         assert!(out.get("_system").is_none());
+    }
+
+    /// REGRESION: `systemd_unit_exists` le agrega `.service` al nombre, asi que pasarle uno que
+    /// YA lo tiene pregunta por `<unit>.service.service` — siempre "not-found". Ese doble sufijo
+    /// hizo que `clear_stale_transient_unit` saliera por el guard sin limpiar nada, y el relanzamiento
+    /// siguio muriendo con "Unit ... was already loaded" en el upgrade 0.1.3 -> 0.1.4.
+    #[test]
+    fn unit_names_are_not_double_suffixed() {
+        // La forma que produce el codigo real, sin sufijo.
+        let bare = unit_from_node_name("IO.api@motherbee");
+        assert!(
+            !bare.ends_with(".service"),
+            "unit_from_node_name debe devolver el nombre pelado, obtuvo {bare}"
+        );
+        // Y si alguien igual pasa la forma con sufijo, debe normalizarse a una sola.
+        let suffixed = format!("{bare}.service");
+        assert_eq!(suffixed.strip_suffix(".service").unwrap_or(&suffixed), bare);
     }
 
     /// U-10: la INTENCION se persiste aparte de su resolucion.
