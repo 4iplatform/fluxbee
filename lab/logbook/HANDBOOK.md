@@ -553,15 +553,78 @@ máquina le da igual.
 
 ---
 
-## 12. Lo que este handbook todavía NO cubre
+## 12. Actualizar un despliegue existente
+
+**Validado el 2026-07-30** con cinco upgrades encadenados en producción. Los tres bloqueantes que
+la auditoría previa había encontrado están cerrados; detalle en [`PENDING-BUGS.md`](PENDING-BUGS.md).
+
+### El ciclo
+
+```bash
+# 1. en la build box
+git pull && bash packaging/build-deb.sh 0.1.N
+bash scripts/apt-repo-publish.sh --serve      # publica y CONSERVA las anteriores
+
+# 2. en motherbee
+apt-get update && apt-get install -y fluxbee  # nunca dpkg -i
+
+# 3. a cada spoke (opcional; el .deb solo actualiza motherbee)
+POST /hives/{spoke}/update  {"category":"core","manifest_version":0,"manifest_hash":"<el de motherbee>"}
+#    el hash sale de: GET /hives/motherbee/versions  ->  payload.hive.core.manifest_hash
+```
+
+**Tiempo real:** ~6 min de build con la caché tibia, ~1 min el `apt install`, y el sistema se
+acomoda solo en ~25 s.
+
+### Cómo saber si el update fue REAL y no fantasma
+
+No alcanza con el `status: ok`. El chequeo que distingue un update genuino de uno que no hizo nada:
+
+```bash
+p=$(systemctl show -p MainPID --value sy-orchestrator)
+readlink /proc/$p/exe        # si dice "(deleted)" -> corre el binario VIEJO
+systemctl show -p ActiveEnterTimestamp --value sy-orchestrator   # debe ser POSTERIOR al update
+sha256sum /usr/bin/sy-orchestrator /var/lib/fluxbee/dist/core/bin/sy-orchestrator   # deben coincidir
+```
+
+### ⚠️ `update category=core` devuelve TIMEOUT aunque funcione
+
+La llamada corta a los 60 s con `error_code: TIMEOUT` **incluso cuando el update se completó**: el
+update reinicia al propio `sy-orchestrator` del destino, que es justamente quien debía responder.
+**No lo reintentes ciegamente** — verificá con el chequeo de arriba antes de concluir nada.
+
+### ⚠️ Los nodos runtime y el orden de recuperación
+
+Un upgrade reemplaza `dist/runtimes/<rt>/<version>/` y borra la anterior. Los nodos que siguen a
+`current` se **rebindean y reinician solos** al arrancar el orquestador nuevo (buscá
+`runtime 'current' pointer moved` en el journal). Si alguno queda colgado, la recuperación manual
+tiene un **orden obligatorio**:
+
+```bash
+DELETE /hives/{h}/nodes/{n}             # kill_node
+DELETE /hives/{h}/nodes/{n}/instance    # SIN esto: NODE_ALREADY_EXISTS
+POST   /hives/{h}/nodes                 # run_node — tenant_id es OBLIGATORIO
+  {"node_name":"IO.api","runtime":"io.api","runtime_version":"current",
+   "tenant_id":"tnt:00000000-0000-0000-0000-000000000001"}
+```
+
+⚠️ **Esta recuperación pierde la configuración del nodo.** Con nodos `UNCONFIGURED` no cuesta nada;
+con tokens cargados es una pérdida real.
+
+### El rollback
+
+No existe rollback de core como comando ([U-5](PENDING-BUGS.md#u-5)). Los dos caminos reales:
+
+1. **Snapshot en frío de las VMs** — ver §1 sobre por qué en frío.
+2. **Conservar el `.deb` anterior publicado** en el repo apt y bajar de versión con `apt`.
+
+---
+
+## 13. Lo que este handbook todavía NO cubre
 
 Honestidad sobre el alcance — nada de esto se probó:
-
-- **Actualizar** un fluxbee ya desplegado (`.deb` nuevo, `update category=core`, paquetes de nodo).
-  **Es lo siguiente que hay que probar** — plan y hallazgos en [`UPDATE-PLAN.md`](UPDATE-PLAN.md).
-  Auditado el 2026-07-30 antes de usarlo: hay **dos bloqueantes verificados**
-  ([U-1](PENDING-BUGS.md#u-1): el update reporta éxito sin reiniciar nada · [U-2](PENDING-BUGS.md#u-2):
-  ingress y egress no tienen carpeta de dist). **No corras un `update category=core` sin leer eso.**
+- **Publicar y actualizar paquetes de nodo en caliente** (`publish_runtime_package`), distinto del
+  `.deb`. Solo se probó el camino del `.deb`.
 - Segundo hive de trabajo, o multi-hive sobre WAN en esta infraestructura.
 - Backup y restore de motherbee (Postgres + vault).
 - Renovación de certificado end-to-end.
