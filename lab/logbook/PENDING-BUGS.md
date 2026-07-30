@@ -24,14 +24,14 @@ infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambi
 
 | id | estado | tema | bloquea |
 |---|---|---|---|
-| [U-1](#u-1) | ✅ **cerrado** | **El update del core reportaba éxito sin reiniciar nada** | — |
+| [U-1](#u-1) | ✅ **cerrado y VALIDADO en vivo** | El update del core reportaba éxito sin reiniciar nada | — |
 | [U-2](#u-2) | ✅ **cerrado** | Ingress y egress no tenían canal de core · resuelto partiendo `dist` por contenido + core por rol | — |
 | [U-3](#u-3) | 🔴 abierto | El `.deb` pisa `dist/runtimes/manifest.json` y borra lo publicado en caliente | no (hoy) |
 | [U-4](#u-4) | 🔴 abierto | Cero verificación de compatibilidad de versión entre motherbee y spokes | no |
 | [U-5](#u-5) | 🔴 abierto | No hay rollback de core como comando | no |
 | [U-6](#u-6) | 🟡 mitigado | La carrera era **el orquestador contra sí mismo**: escritura no atómica de 35 MB | — |
 | [U-7](#u-7) | ✅ **cerrado** | El watchdog reiniciaba syncthing cada ~7 s por una carpeta inexistente | — |
-| [U-8](#u-8) | 🔴 abierto | `add_hive` no tiene forma de consultar su progreso (tarda >6 min) | no |
+| [U-8](#u-8) | 🔴 abierto | Operaciones largas sin progreso consultable · **`update category=core` también da TIMEOUT a los 60 s** | no |
 | [U-9](#u-9) | 🔴 abierto | Las rutas desconocidas devuelven `{"error":"not_found"}` pelado | no |
 | [U-10](#u-10) | ✅ **cerrado y VALIDADO en vivo** | Un upgrade del `.deb` dejaba huérfano a todo nodo runtime | — |
 
@@ -257,7 +257,31 @@ levanten con el binario restaurado — que con `start` tampoco ocurriría.
 
 `systemd_start` → `systemd_restart` (función nueva, alineada con la ruta remota). `systemd_start`
 **se conserva** porque sigue siendo correcto en los 5 lugares donde se arranca algo que no está
-corriendo. Compila limpio, **133/133 tests del orchestrator en verde**.
+corriendo.
+
+### ✅ VALIDADO EN VIVO — `update category=core` contra el worker de producción
+
+Escenario ideal, y se dio solo: el worker corría `sy-orchestrator` del join original (17:11)
+mientras syncthing ya le había entregado el binario nuevo en `dist/core/bin`. O sea, exactamente
+el estado que U-1 dejaba congelado.
+
+```text
+ANTES   pid=4027   desde 17:11:10   /usr/bin/sy-orchestrator = 0716f1f1…
+        dist/core/bin/sy-orchestrator = 1e2726ed…            <- delta real
+
+DESPUES pid=54775  desde 22:25:27   exe=/usr/bin/sy-orchestrator   (SIN "(deleted)")
+        /usr/bin = 1e2726ed… = dist                          <- promovido
+```
+
+**El assert de `/proc/PID/exe` pasa en los tres servicios probados.** Antes del arreglo, el update
+habría contestado `ok` con los servicios intactos y `exe` apuntando a un inode borrado.
+
+El worker quedó con 10 servicios corriendo, 0 fallidas, y `connected` en el mesh.
+
+**Lo que el mismo test destapó**: la llamada devolvió `TIMEOUT` a los 60 s aunque la operación
+**sí se completó**. Es esperable —el update reinicia al propio `sy-orchestrator` del destino, que
+es quien debía responder— pero le da al operador un `error` sobre una operación exitosa. Se suma a
+[U-8](#u-8).
 
 **Test que falta** (hoy tiene que fallar, y esa es la prueba):
 
