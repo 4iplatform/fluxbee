@@ -1147,6 +1147,19 @@ fn ensure_motherbee_ssh_key() {
 /// the remote node's `/var/lib/fluxbee/tls/<hive_id>/` over the authenticated SSH
 /// channel. Best-effort (logged): the WAN degrades to plaintext without certs, so
 /// a distribution hiccup must not fail the whole add_hive.
+/// True when an SSH failure is authentication/transport, not a remote command that ran and
+/// returned non-zero.
+///
+/// `ssh` exits 255 for its own failures (auth, connect, host key); anything else is the remote
+/// command's own exit code. Used to tell "this hive deliberately has no SSH channel" apart from
+/// "the command failed", so hardened spokes stop being reported as errors.
+fn ssh_error_is_auth_failure(err: &OrchestratorError) -> bool {
+    let text = err.to_string();
+    text.contains("exit=255")
+        || text.contains("Permission denied")
+        || text.contains("Too many authentication failures")
+}
+
 fn distribute_hive_tls(address: &str, key_path: &Path, user: &str, hive_id: &str) {
     if let Err(err) = distribute_hive_tls_inner(address, key_path, user, hive_id) {
         tracing::warn!(hive_id = hive_id, error = %err, "failed to distribute mesh TLS material");
@@ -1385,24 +1398,44 @@ async fn reconcile_hive_tls_material(state: Arc<OrchestratorState>) {
             .map(|r| r.path.clone())
             .unwrap_or_else(|| PathBuf::from(MOTHERBEE_SSH_KEY_PATH));
         let hive_c = hive_id.clone();
+        // A hive joined with the default `ssh_access=revoke` has no recovery key in the vault and
+        // motherbee's own key was removed from it by `harden_ssh` — on purpose. Every SSH attempt
+        // against it will fail authentication, forever. That is the hardening working, not a
+        // fault, so it must not be reported as one: this loop was emitting
+        // "failed to distribute mesh TLS material ... Permission denied (publickey)" for every
+        // hardened spoke on every pass, which is noise that trains an operator to ignore the log.
+        let ssh_intentionally_closed = recovery.is_none();
         // The SSH calls are blocking; run them off the async worker.
         let distributed = tokio::task::spawn_blocking(move || {
             // Idempotent + reachability probe: a hive that already holds a cert (or that we
             // cannot ssh into at all) is left alone rather than pushed blindly.
-            if ssh_with_key(
+            match ssh_with_key(
                 &address,
                 &key_path,
                 &sudo_wrap(&format!("test -f '/var/lib/fluxbee/tls/{hive_c}/cert.crt'")),
                 &user,
-            )
-            .is_ok()
-            {
-                return false;
+            ) {
+                Ok(_) => return false,
+                Err(err) if ssh_intentionally_closed && ssh_error_is_auth_failure(&err) => {
+                    tracing::debug!(
+                        hive_id = %hive_c,
+                        "reconcile: hive has no SSH channel (ssh_access=revoke); skipping TLS catch-up"
+                    );
+                    return false;
+                }
+                Err(_) => {}
             }
             match distribute_hive_tls_inner(&address, &key_path, &user, &hive_c) {
                 Ok(()) => true,
                 Err(err) => {
-                    tracing::warn!(hive_id = %hive_c, error = %err, "reconcile: failed to distribute mesh TLS material");
+                    if ssh_intentionally_closed && ssh_error_is_auth_failure(&err) {
+                        tracing::debug!(
+                            hive_id = %hive_c,
+                            "reconcile: hive has no SSH channel (ssh_access=revoke); skipping TLS catch-up"
+                        );
+                    } else {
+                        tracing::warn!(hive_id = %hive_c, error = %err, "reconcile: failed to distribute mesh TLS material");
+                    }
                     false
                 }
             }

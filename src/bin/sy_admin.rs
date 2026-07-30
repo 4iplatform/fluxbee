@@ -6520,12 +6520,46 @@ async fn handle_hive_paths(
                 .get("notify")
                 .map(|value| !(value == "0" || value.eq_ignore_ascii_case("false")))
                 .unwrap_or(true);
-            let payload = serde_json::json!({
+            // Lift the `_system` binding fields out of the body.
+            //
+            // The body is otherwise the node's config patch, and `set_node_config` reads these
+            // five at the TOP level of the payload — so wrapping the whole body under "config"
+            // meant a caller sending {"runtime_version":"0.1.3"} got `status: ok` and a bumped
+            // config_version while nothing rebound, and the next restart_node still failed with
+            // RUNTIME_NOT_AVAILABLE. Silently storing a binding request as an inert config key is
+            // worse than refusing it: it is the only recovery path after a `.deb` upgrade moves a
+            // runtime version, and it was answering "done" without doing anything (U-10).
+            let mut config_payload = config_payload;
+            let mut payload = serde_json::json!({
                 "node_name": decode_percent(name),
-                "config": config_payload,
                 "replace": replace,
                 "notify": notify,
             });
+            let mut lifted: Vec<&str> = Vec::new();
+            if let (Some(config_obj), Some(payload_obj)) =
+                (config_payload.as_object_mut(), payload.as_object_mut())
+            {
+                for field in [
+                    "runtime",
+                    "runtime_version",
+                    "requested_runtime_version",
+                    "runtime_base",
+                    "package_path",
+                ] {
+                    if let Some(value) = config_obj.remove(field) {
+                        payload_obj.insert(field.to_string(), value);
+                        lifted.push(field);
+                    }
+                }
+            }
+            if !lifted.is_empty() {
+                tracing::info!(
+                    node = %decode_percent(name),
+                    fields = ?lifted,
+                    "set_node_config: treating reserved fields as _system bindings, not config keys"
+                );
+            }
+            payload["config"] = config_payload;
             let (status, resp) =
                 handle_admin_command(ctx, client, "set_node_config", payload, Some(hive)).await?;
             Ok(Some((status, resp)))
