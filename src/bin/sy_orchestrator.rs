@@ -5573,19 +5573,38 @@ fn ensure_local_syncthing_vendor_layout(service_user: &str) -> Result<(), Orches
     if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut install = Command::new("install");
-    install
-        .arg("-m")
-        .arg("0755")
-        .arg(SYNCTHING_INSTALL_PATH)
-        .arg(DIST_SYNCTHING_VENDOR_SOURCE_PATH);
-    run_cmd(
-        install,
-        &format!(
-            "install local syncthing vendor source ({})",
-            DIST_SYNCTHING_VENDOR_SOURCE_PATH
-        ),
-    )?;
+
+    // Skip when the target already matches. This used to rewrite ~35 MB unconditionally on
+    // EVERY call, and `ensure_blob_sync_runtime` is called from the health watchdog — so any
+    // condition that keeps `folders_healthy=false` turns this into a 35 MB rewrite every five
+    // seconds. Comparing first makes the steady state a no-op.
+    let source_meta = fs::metadata(SYNCTHING_INSTALL_PATH)?;
+    let already_current = match fs::metadata(target_path) {
+        Ok(target_meta) => {
+            target_meta.len() == source_meta.len()
+                && sha256_file(Path::new(SYNCTHING_INSTALL_PATH))
+                    .ok()
+                    .zip(sha256_file(target_path).ok())
+                    .is_some_and(|(a, b)| a.eq_ignore_ascii_case(&b))
+        }
+        Err(_) => false,
+    };
+    if already_current {
+        return Ok(());
+    }
+
+    // Atomic: temp sibling + rename, never `install` in place.
+    //
+    // `install` unlinks and recreates, so a concurrent reader sees a partially written file.
+    // That is not hypothetical: on 2026-07-30 an `add_hive role=ingress` failed with
+    // "vendor manifest size mismatch: expected=35806960 actual=22364160" — 62 %, an exact
+    // multiple of the filesystem block size, i.e. a copy caught in flight. The tell was that
+    // the HASH check (which runs first, on a `sha256sum` that had already pinned the old
+    // complete inode) passed while the SIZE check, re-resolving the PATH, landed on the new
+    // half-written one. `ensure_blob_sync_runtime` contains both the reader
+    // (`ensure_syncthing_installed`) and this writer, and nothing serialises it against the
+    // watchdog running concurrently.
+    copy_exec_file(Path::new(SYNCTHING_INSTALL_PATH), target_path)?;
     ensure_owned_file(target_path, service_user)?;
     Ok(())
 }
@@ -6374,6 +6393,36 @@ fn dist_sync_folders_for_role(
     out
 }
 
+/// Every dist folder THIS hive carries, deduplicated.
+///
+/// Motherbee serves one core folder per spoke role plus the shared vendor and runtimes folders;
+/// a spoke carries only its own. Declaration, `.stfolder` markers and health checks must all
+/// agree on this set — when they did not, the health watchdog polled
+/// `fluxbee-dist-core-motherbee`, a folder motherbee never declares (it does not sync to
+/// itself), and logged a 404 every five seconds forever. Deriving all three from one function
+/// makes that class of drift impossible rather than merely fixed once.
+fn dist_sync_folders_for_hive(
+    dist: &DistRuntimeConfig,
+    role: HiveRole,
+    is_motherbee: bool,
+) -> Vec<DistSyncFolder> {
+    let roles: &[HiveRole] = if is_motherbee {
+        &ROLE_CORE_DIST_ROLES
+    } else {
+        std::slice::from_ref(&role)
+    };
+    let mut out: Vec<DistSyncFolder> = Vec::new();
+    for r in roles {
+        for folder in dist_sync_folders_for_role(dist, *r, is_motherbee) {
+            // vendor (and runtimes) are shared across roles — declare each id once.
+            if !out.iter().any(|f| f.id == folder.id) {
+                out.push(folder);
+            }
+        }
+    }
+    out
+}
+
 fn reconcile_syncthing_peer_xml(
     config_xml: &str,
     blob: &BlobRuntimeConfig,
@@ -6806,16 +6855,8 @@ fn reconcile_syncthing_folders_xml(
         // Motherbee declares the serving side for every spoke role it may host; a spoke
         // declares only its own. Same ids on both ends, different local paths — that is what
         // lets motherbee serve `dist/core/<role>` onto each spoke's own `dist/core`.
-        let roles: Vec<HiveRole> = if is_motherbee {
-            ROLE_CORE_DIST_ROLES.to_vec()
-        } else {
-            vec![role]
-        };
-        for r in roles {
-            for folder in dist_sync_folders_for_role(dist, r, is_motherbee) {
-                if changed_folders.contains(&folder.id) {
-                    continue; // vendor is shared across roles; declare it once
-                }
+        for folder in dist_sync_folders_for_hive(dist, role, is_motherbee) {
+            {
                 let (next, changed) = ensure_isolated_syncthing_folder_in_config_xml(
                     &updated,
                     &folder.id,
@@ -6892,19 +6933,9 @@ fn ensure_syncthing_folder_markers(
     if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
         // One marker per dist folder, not one on the `dist/` root: after the per-content split
         // each folder owns its own subtree, and syncthing needs `.stfolder` inside each of them.
-        let roles: Vec<HiveRole> = if is_motherbee {
-            ROLE_CORE_DIST_ROLES.to_vec()
-        } else {
-            vec![role]
-        };
-        for r in roles {
-            for folder in dist_sync_folders_for_role(dist, r, is_motherbee) {
-                if repaired.contains(&folder.id) {
-                    continue;
-                }
-                if ensure_syncthing_folder_marker(&folder.path)? {
-                    repaired.push(folder.id.clone());
-                }
+        for folder in dist_sync_folders_for_hive(dist, role, is_motherbee) {
+            if ensure_syncthing_folder_marker(&folder.path)? {
+                repaired.push(folder.id.clone());
             }
         }
     }
@@ -7089,7 +7120,8 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
             }
         }
         if desired_dist.sync_enabled && dist_sync_tool_is_syncthing(&desired_dist) {
-            for folder in dist_sync_folders_for_role(&desired_dist, state.role, state.is_motherbee)
+            for folder in
+                dist_sync_folders_for_hive(&desired_dist, state.role, state.is_motherbee)
             {
                 match syncthing_folder_healthy(&desired_sync, &folder.id) {
                     Ok(true) => {}
@@ -23283,6 +23315,80 @@ blob:
             PathBuf::from("/var/lib/fluxbee/dist/core/ingress")
         );
         assert_eq!(on_spoke[0].path, PathBuf::from("/var/lib/fluxbee/dist/core"));
+    }
+
+    /// REGRESION (U-7): motherbee no se sincroniza consigo misma, asi que NUNCA declara
+    /// `fluxbee-dist-core-motherbee`. El watchdog de salud lo consultaba igual —porque derivaba el
+    /// set con el rol propio en vez de con la misma regla que la declaracion— y tiraba un 404 cada
+    /// cinco segundos, para siempre. Declaracion, marcadores `.stfolder` y chequeo de salud deben
+    /// salir todos de `dist_sync_folders_for_hive`.
+    #[test]
+    fn motherbee_never_polls_a_core_folder_for_itself() {
+        let dist = sample_dist_config();
+        let ids: Vec<String> = dist_sync_folders_for_hive(&dist, HiveRole::Motherbee, true)
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        assert!(
+            !ids.iter().any(|id| id.ends_with("motherbee")),
+            "motherbee no debe declarar ni consultar una carpeta de core propia; obtuvo {ids:?}"
+        );
+        // Si sirve a los tres roles de spoke, mas vendor y runtimes.
+        for role in ["worker", "ingress", "egress"] {
+            assert!(ids.contains(&format!("{SYNCTHING_FOLDER_DIST_CORE_PREFIX}{role}")));
+        }
+        assert!(ids.contains(&SYNCTHING_FOLDER_DIST_VENDOR_ID.to_string()));
+        assert!(ids.contains(&SYNCTHING_FOLDER_DIST_RUNTIMES_ID.to_string()));
+    }
+
+    /// El id compartido (vendor) se declara UNA vez aunque lo usen los tres roles.
+    #[test]
+    fn shared_dist_folders_are_declared_once() {
+        let dist = sample_dist_config();
+        let ids: Vec<String> = dist_sync_folders_for_hive(&dist, HiveRole::Motherbee, true)
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len(), "ids duplicados en {ids:?}");
+    }
+
+    /// Un spoke solo carga lo suyo: su core, vendor, y runtimes unicamente si es worker.
+    #[test]
+    fn a_spoke_carries_only_its_own_dist_folders() {
+        let dist = sample_dist_config();
+        for (role, wants_runtimes) in [
+            (HiveRole::Worker, true),
+            (HiveRole::Ingress, false),
+            (HiveRole::Egress, false),
+        ] {
+            let ids: Vec<String> = dist_sync_folders_for_hive(&dist, role, false)
+                .into_iter()
+                .map(|f| f.id)
+                .collect();
+            assert!(ids.contains(&format!(
+                "{SYNCTHING_FOLDER_DIST_CORE_PREFIX}{}",
+                role.as_str()
+            )));
+            // y de ningun otro rol
+            for other in ["worker", "ingress", "egress"] {
+                if other != role.as_str() {
+                    assert!(
+                        !ids.contains(&format!("{SYNCTHING_FOLDER_DIST_CORE_PREFIX}{other}")),
+                        "{} no debe cargar la carpeta de {other}",
+                        role.as_str()
+                    );
+                }
+            }
+            assert_eq!(
+                ids.contains(&SYNCTHING_FOLDER_DIST_RUNTIMES_ID.to_string()),
+                wants_runtimes,
+                "runtimes para {}",
+                role.as_str()
+            );
+        }
     }
 
     /// Every dist folder must own a disjoint subtree. Two syncthing folders over one tree are
