@@ -29,6 +29,10 @@ infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambi
 | [U-3](#u-3) | 🔴 abierto | El `.deb` pisa `dist/runtimes/manifest.json` y borra lo publicado en caliente | no (hoy) |
 | [U-4](#u-4) | 🔴 abierto | Cero verificación de compatibilidad de versión entre motherbee y spokes | no |
 | [U-5](#u-5) | 🔴 abierto | No hay rollback de core como comando | no |
+| [U-6](#u-6) | 🔴 abierto | **`add_hive` corre una carrera** entre el push de vendor por SSH y la carpeta syncthing | **SÍ** para ingress/egress |
+| [U-7](#u-7) | 🔴 abierto | El watchdog busca `fluxbee-dist-core-motherbee`, que nunca se declara | no |
+| [U-8](#u-8) | 🔴 abierto | `add_hive` no tiene forma de consultar su progreso (tarda >6 min) | no |
+| [U-9](#u-9) | 🔴 abierto | Las rutas desconocidas devuelven `{"error":"not_found"}` pelado | no |
 
 ---
 
@@ -480,3 +484,91 @@ se detecten.
 
 **Mientras no exista, el rollback real es externo:** snapshot de las VMs + conservar el `.deb` anterior
 publicado en el repo apt para poder bajar de versión.
+
+
+---
+
+<a id="u-6"></a>
+## U-6 🔴 — `add_hive` corre una carrera entre el push de vendor por SSH y la carpeta de syncthing
+
+**Encontrado en vivo** al reconstruir prod (2026-07-30), en el primer `add_hive role=ingress`:
+
+```text
+status: error
+SYNC_SETUP_FAILED  motherbee public Syncthing setup failed:
+  vendor manifest size mismatch for syncthing: expected=35806960 actual=22364160
+```
+
+**22364160 / 35806960 = 62 %** — un archivo a mitad de escritura.
+
+**Causa, y es consecuencia de [U-2](#u-2):** hasta ahora el ingress no tenía canal de dist, así que
+`sync_vendor_to_worker` (push por SSH) era el **único escritor** de `dist/vendor` en el hive que se
+unía. Con la carpeta `fluxbee-dist-vendor` agregada, **syncthing escribe el mismo archivo al mismo
+tiempo**, y la validación de tamaño —que es fail-closed, y está bien que lo sea— cae sobre el estado
+intermedio.
+
+**Verificado que era transitorio:** al inspeccionar después, motherbee y el ingress tenían ambos
+`35806960` exacto, y el reintento del join pasó sin tocar nada. Pero **el primer intento falla**, y
+eso no es aceptable en un `add_hive`.
+
+**Arreglo propuesto (ordenar, no reintentar):** sembrar vendor por SSH **y recién después** agregar
+el device a `fluxbee-dist-vendor`. El orden importa además por una razón de fondo: syncthing necesita
+su propio binario para arrancar, así que el push por SSH tiene que venir primero de todos modos —
+hoy simplemente no se espera a que termine antes de habilitar la carpeta.
+
+**A charlar:** si además conviene que la validación distinga "todavía convergiendo" de "corrupto",
+igual que hace el gate de staleness del update.
+
+---
+
+<a id="u-7"></a>
+## U-7 🔴 — El watchdog busca una carpeta que nunca se declara
+
+En motherbee, cada 5 segundos:
+
+```text
+WARN failed to verify syncthing folder health; scheduling runtime reconcile
+     folder=fluxbee-dist-core-motherbee
+     error=syncthing db status ... 404
+```
+
+**Bug mío, introducido con [U-2](#u-2).** El watchdog llama
+`dist_sync_folders_for_role(dist, state.role, is_motherbee)` con el rol **propio**; en motherbee eso
+produce `fluxbee-dist-core-motherbee`. Pero motherbee **no declara esa carpeta** — declara las de
+worker/ingress/egress (`ROLE_CORE_DIST_ROLES`), porque no se sincroniza consigo misma.
+
+**Daño real medido antes de alarmarse: ninguno.** `NRestarts=0`; `ensure_blob_sync_runtime` solo
+reinicia ante un cambio real de config, así que es un warn ruidoso, no un loop destructivo. Pero
+**enmascara problemas reales** — que es exactamente lo que un warn cada 5 s hace.
+
+**Arreglo:** que el watchdog use el mismo criterio que la declaración — si es motherbee, iterar
+`ROLE_CORE_DIST_ROLES`; si no, su propio rol.
+
+---
+
+<a id="u-8"></a>
+## U-8 🔴 — `add_hive` no tiene forma de consultar su progreso
+
+Un `add_hive` tarda **más de 6 minutos** y no hay manera de preguntarle en qué paso está. El
+[command audit log](#) registra el comando **al terminar**, así que durante la ventana no hay nada:
+hubo que poleá el proceso de `curl` con `pgrep` para saber si seguía vivo.
+
+Para una operación de esa duración —y que además es la más frágil del sistema, porque toca SSH, red,
+systemd y syncthing— es un hueco de operabilidad real. Y empeora con [A-3](FINDINGS.md): el timeout
+del admin son 180 s, o sea menos de la mitad de lo que la operación tarda.
+
+---
+
+<a id="u-9"></a>
+## U-9 🔴 — Las rutas desconocidas devuelven un `not_found` pelado
+
+`POST /hives/motherbee/hives` (mi error: la ruta correcta es `POST /hives`) devolvió exactamente:
+
+```json
+{"error":"not_found"}
+```
+
+Sin decir qué ruta, ni qué acción, ni que existe `GET /admin/actions` para averiguarlo. **Contrasta
+fuerte con la calidad del resto**: cuando mandé mal el payload del egress, el error fue
+*"add_hive role=egress requires an 'egress' object (lan_cidr, wan_iface, lan_iface)"* — perfecto,
+accionable. La autodocumentación existe y es excelente; solo falta que el 404 apunte a ella.
