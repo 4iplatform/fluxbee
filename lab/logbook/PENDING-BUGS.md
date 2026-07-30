@@ -29,10 +29,11 @@ infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambi
 | [U-3](#u-3) | 🔴 abierto | El `.deb` pisa `dist/runtimes/manifest.json` y borra lo publicado en caliente | no (hoy) |
 | [U-4](#u-4) | 🔴 abierto | Cero verificación de compatibilidad de versión entre motherbee y spokes | no |
 | [U-5](#u-5) | 🔴 abierto | No hay rollback de core como comando | no |
-| [U-6](#u-6) | 🔴 abierto | **`add_hive` corre una carrera** entre el push de vendor por SSH y la carpeta syncthing | **SÍ** para ingress/egress |
-| [U-7](#u-7) | 🔴 abierto | El watchdog busca `fluxbee-dist-core-motherbee`, que nunca se declara | no |
+| [U-6](#u-6) | 🟡 mitigado | La carrera era **el orquestador contra sí mismo**: escritura no atómica de 35 MB | — |
+| [U-7](#u-7) | ✅ **cerrado** | El watchdog reiniciaba syncthing cada ~7 s por una carpeta inexistente | — |
 | [U-8](#u-8) | 🔴 abierto | `add_hive` no tiene forma de consultar su progreso (tarda >6 min) | no |
 | [U-9](#u-9) | 🔴 abierto | Las rutas desconocidas devuelven `{"error":"not_found"}` pelado | no |
+| [U-10](#u-10) | 🔴 abierto | **Un upgrade del `.deb` deja huérfano a TODO nodo runtime, y no hay recuperación por HTTP** | **SÍ** |
 
 ---
 
@@ -572,3 +573,68 @@ Sin decir qué ruta, ni qué acción, ni que existe `GET /admin/actions` para av
 fuerte con la calidad del resto**: cuando mandé mal el payload del egress, el error fue
 *"add_hive role=egress requires an 'egress' object (lan_cidr, wan_iface, lan_iface)"* — perfecto,
 accionable. La autodocumentación existe y es excelente; solo falta que el 404 apunte a ella.
+
+
+---
+
+<a id="u-10"></a>
+## U-10 🔴 — Un upgrade del `.deb` deja huérfano a todo nodo runtime · BLOQUEANTE
+
+**Reproducido en producción el 2026-07-30**, en el primer upgrade real (`0.1.1 → 0.1.2`), que era
+justamente el camino que este test venía a validar. El `.deb` se instaló limpio
+(`Unpacking fluxbee (0.1.2) over (0.1.1)`, 0 unidades fallidas)… y **los cuatro nodos runtime
+quedaron en crash-loop**:
+
+```text
+fluxbee-node-IO.api-motherbee.service  activating auto-restart
+  ExecStart=/var/lib/fluxbee/dist/runtimes/io.api/0.1.1/bin/start.sh
+  Main process exited, code=exited, status=203/EXEC
+```
+
+### La secuencia exacta
+
+1. Los directorios de runtime están versionados por la versión del paquete. El upgrade
+   **instala `0.1.2` y borra `0.1.1`** — en disco solo queda `0.1.2`, y el manifest dice
+   `current=0.1.2`.
+2. Pero la **unit de systemd** guarda la **ruta absoluta con la versión vieja**, y nadie la
+   regenera. `203/EXEC`: el ejecutable ya no existe.
+3. **`restart_node` no recupera:** `RUNTIME_NOT_AVAILABLE: version '0.1.1' not available for
+   runtime 'io.api'`. La config persistida del nodo también quedó fijada.
+4. **`PUT /nodes/{n}/config {"runtime_version":"0.1.2"}` devuelve `ok`** (`config_version: 2`)
+   **pero NO rebindea** — lo guarda como una clave de config cualquiera. El `restart_node`
+   siguiente falla idéntico. Esto es [U-8 del análisis previo], confirmado: **el `ok` es mentiroso**,
+   y eso es peor que rechazar.
+
+⇒ **Por HTTP no hay ninguna forma de recuperar un nodo runtime después de un upgrade.**
+
+### El detalle que lo vuelve más grave
+
+`fluxbee-firstboot` spawnea los nodos con **`"runtime_version":"current"`** — es decir, el operador
+pide explícitamente *"seguí al puntero actual"*. El sistema **resuelve `current` una sola vez** y
+hornea la versión concreta en la ruta de la unit. No es que el operador haya pinneado: **pidió
+seguimiento y recibió un pin silencioso.**
+
+### Recuperación que sí funciona (para el HANDBOOK, mientras no se arregle)
+
+```bash
+DELETE /hives/{h}/nodes/{n}            # kill_node — mata el proceso
+DELETE /hives/{h}/nodes/{n}/instance   # remove_node_instance — sin esto: NODE_ALREADY_EXISTS
+POST   /hives/{h}/nodes                # run_node
+  {"node_name":"IO.api","runtime":"io.api",
+   "runtime_version":"current",
+   "tenant_id":"tnt:00000000-0000-0000-0000-000000000001"}
+```
+
+Dos trampas encontradas por el camino: el orden `kill` → `remove_instance` es obligatorio, y
+**`tenant_id` es obligatorio** aunque el error no lo diga hasta que falla
+(`IDENTITY_REGISTER_FAILED: tenant_id is missing`). **Y esta recuperación pierde la configuración
+del nodo**, lo cual en prod (nodos `UNCONFIGURED`) no costó nada, pero en un despliegue con tokens
+cargados sería una pérdida real.
+
+### Arreglos a discutir
+
+- **Que `current` signifique current.** Que la unit apunte a un path estable (un symlink
+  `runtimes/<rt>/current/`) en vez de a la versión resuelta, o que el orquestador regenere las units
+  de nodo en el boot igual que `regen_local_core_units` ya hace para el core.
+- **Que el rebind por HTTP funcione o falle fuerte.** Hoy acepta `runtime_version` y no hace nada.
+- **Que el upgrade no borre la versión en uso**, o que migre a los nodos que la usan.
