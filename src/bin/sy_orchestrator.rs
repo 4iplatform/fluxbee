@@ -14038,6 +14038,42 @@ async fn set_node_config_flow(
         system.insert("runtime".to_string(), serde_json::json!(runtime));
     }
     if let Some(runtime_version) = runtime_version_patch {
+        // Refuse to bind a version that is not installed.
+        //
+        // Without this the call answers `ok` and bumps config_version while pointing the node at
+        // something that does not exist, and the failure only surfaces at the next restart as
+        // RUNTIME_NOT_AVAILABLE — far from the request that caused it. Rebinding is the recovery
+        // path after a `.deb` upgrade moves a runtime version, so it has to be honest about
+        // whether it worked (U-10).
+        let effective_runtime = system
+            .get("runtime")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+        if let Some(runtime_name) = effective_runtime {
+            match load_runtime_manifest_result() {
+                Ok(Some(manifest)) => {
+                    let resolved = resolve_runtime_key(&manifest, &runtime_name).and_then(|key| {
+                        resolve_runtime_version(&manifest, &key, &runtime_version)
+                    });
+                    if let Err(err) = resolved {
+                        return serde_json::json!({
+                            "status": "error",
+                            "error_code": "RUNTIME_NOT_AVAILABLE",
+                            "message": err.to_string(),
+                            "target": target_hive,
+                            "node_name": node_name,
+                            "runtime": runtime_name,
+                            "runtime_version": runtime_version,
+                        });
+                    }
+                }
+                // No manifest to check against: bind and let the spawn path be the gate, rather
+                // than blocking a legitimate rebind on a missing manifest.
+                Ok(None) | Err(_) => {}
+            }
+        }
         system.insert(
             "runtime_version".to_string(),
             serde_json::json!(runtime_version),

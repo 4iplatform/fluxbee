@@ -33,7 +33,7 @@ infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambi
 | [U-7](#u-7) | ✅ **cerrado** | El watchdog reiniciaba syncthing cada ~7 s por una carpeta inexistente | — |
 | [U-8](#u-8) | 🔴 abierto | `add_hive` no tiene forma de consultar su progreso (tarda >6 min) | no |
 | [U-9](#u-9) | 🔴 abierto | Las rutas desconocidas devuelven `{"error":"not_found"}` pelado | no |
-| [U-10](#u-10) | 🟡 **arreglado, falta validar** | Un upgrade del `.deb` dejaba huérfano a todo nodo runtime | — |
+| [U-10](#u-10) | ✅ **cerrado y VALIDADO en vivo** | Un upgrade del `.deb` dejaba huérfano a todo nodo runtime | — |
 
 ---
 
@@ -659,15 +659,49 @@ from X to Y`) y se persiste la nueva resolución — así el config en disco ref
 
 **4 tests de regresión**, incluido el del config viejo sin el campo. 147 en verde.
 
-⚠️ **Falta validarlo en vivo**: el arreglo está en el repo, no en el binario que corre. Se prueba en
-el próximo upgrade, y ese es justamente un buen caso de prueba — si funciona, los nodos sobreviven
-solos sin el `kill → remove_instance → run_node` de la recuperación manual.
+### ✅ VALIDADO EN VIVO — y hicieron falta tres vueltas
 
-### Lo que queda abierto de este hallazgo
+Se probó con upgrades reales encadenados en producción. **Cada intento falló distinto, y eso es lo
+que permitió llegar al fondo:**
 
-- **El rebind por HTTP sigue mintiendo**: `PUT /nodes/{n}/config {"runtime_version":"…"}` devuelve
-  `ok` y no rebindea. Debería funcionar o rechazar.
-- **`tenant_id` obligatorio y no documentado en el error** hasta que falla con
-  `IDENTITY_REGISTER_FAILED`.
-- **El orden `kill` → `remove_instance`** es obligatorio y no está dicho en ningún lado
-  (`NODE_ALREADY_EXISTS` si se saltea).
+| upgrade | resultado | lo que enseñó |
+|---|---|---|
+| 0.1.2 → 0.1.3 | ❌ `failed=4` | La re-resolución por intención **sí funcionó** (`pointer moved from=0.1.2 to=0.1.3`), pero el relanzamiento murió: *"Unit … was already loaded or has a fragment file"*. Los nodos son units **transitorias** y systemd no reusa un nombre todavía cargado — y un nodo en crash-loop está en `auto-restart`: no activo, pero cargado, reteniendo su nombre con el `ExecStart` viejo. |
+| 0.1.3 → 0.1.4 | ❌ **error idéntico** | Esa identidad era la pista: si la limpieza hubiera corrido y fallado, el mensaje habría cambiado. `systemd_unit_exists()` **agrega `.service` al nombre**, y se le pasaba uno que ya lo tenía → preguntaba por `…service.service` → siempre "not-found" → el guard salía temprano y **no limpiaba nada**. |
+| 0.1.4 → 0.1.5 | ✅ **`started=4`** | Los cuatro nodos se repararon **solos, en ~25 s, sin ninguna intervención**. |
+
+La secuencia completa en el log del último:
+
+```text
+21:26:10  reconcile completed  started=0  skipped=0  failed=4      <- el upgrade anterior
+21:43:28  runtime 'current' pointer moved   from=0.1.4  to=0.1.5
+21:43:28  freed stale transient unit name before relaunch
+   (×4)
+21:43:30  reconcile completed  started=4  skipped=0  failed=0      <- TODOS
+```
+
+Units apuntando a `runtimes/<rt>/0.1.5`, configs con `rv=0.1.5 requested=current`.
+
+**Lección de método:** un error que se repite **idéntico** tras un arreglo casi nunca significa "el
+arreglo no alcanzó" — significa que **el arreglo no corrió**. Si hubiera corrido y fallado, el
+mensaje sería otro.
+
+### Los residuales, resueltos
+
+- ✅ **El rebind por HTTP ya no miente.** La ruta envolvía **todo el cuerpo** bajo `"config"`,
+  mientras `set_node_config` lee los cinco campos de binding en el **nivel superior** — así que
+  `{"runtime_version":"…"}` aterrizaba como una clave de config inerte y la llamada contestaba
+  `ok` sin rebindear. Ahora la ruta los levanta y lo registra.
+  **Y además valida**: probándolo en vivo aceptó `9.9.9`, una versión inexistente, con `ok` — el
+  mismo pecado con otra cara. Ahora un rebind a una versión no instalada devuelve
+  `RUNTIME_NOT_AVAILABLE` en el momento del pedido, no en el próximo restart.
+- ✅ **El ruido de SSH se calló.** El reconcile de TLS emitía
+  *"failed to distribute mesh TLS material … Permission denied (publickey)"* para cada spoke
+  endurecido, en cada pasada. Un hive unido con `ssh_access=revoke` **no tiene** canal SSH a
+  propósito: eso es el endurecimiento funcionando, y reportarlo como warn entrena a ignorar el log.
+  Ahora, cuando no hay clave de recuperación y el fallo es de autenticación, baja a `debug` con un
+  mensaje que dice por qué. **Verificado: 0 warns desde el arranque nuevo.**
+- ⚪ **`tenant_id`: descartado.** SÍ está documentado (`sy_admin.rs:10520`, *"AI.* and IO.* managed
+  nodes require root-level tenant_id on first spawn"*). Mi error fue no leerlo.
+- 🔴 **Queda uno**: el orden `kill` → `remove_instance` es obligatorio y no está dicho en ningún
+  lado (`NODE_ALREADY_EXISTS` si se saltea). Va al HANDBOOK.
