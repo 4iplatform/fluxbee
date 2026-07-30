@@ -25,7 +25,7 @@ infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambi
 | id | estado | tema | bloquea |
 |---|---|---|---|
 | [U-1](#u-1) | ✅ **cerrado** | **El update del core reportaba éxito sin reiniciar nada** | — |
-| [U-2](#u-2) | 🔴 abierto | **Ingress y egress no tienen canal de core** · diseño acordado: carpeta de dist **por rol** | **SÍ** para esos roles |
+| [U-2](#u-2) | ✅ **cerrado** | Ingress y egress no tenían canal de core · resuelto partiendo `dist` por contenido + core por rol | — |
 | [U-3](#u-3) | 🔴 abierto | El `.deb` pisa `dist/runtimes/manifest.json` y borra lo publicado en caliente | no (hoy) |
 | [U-4](#u-4) | 🔴 abierto | Cero verificación de compatibilidad de versión entre motherbee y spokes | no |
 | [U-5](#u-5) | 🔴 abierto | No hay rollback de core como comando | no |
@@ -265,7 +265,7 @@ systemctl show -p ActiveEnterTimestamp --value sy-config-routes   # anterior al 
 ---
 
 <a id="u-2"></a>
-## U-2 🔴 — Ingress y egress no tienen canal de core · BLOQUEANTE para esos roles
+## U-2 ✅ CERRADO — Ingress y egress no tenían canal de core
 
 El `hive.yaml` que motherbee escribe para esos dos roles trae el canal **apagado a mano**, sin
 parámetro:
@@ -363,9 +363,77 @@ dist/roles/worker/runtimes/               ->  dist/runtimes/        (solo roles 
 exige que todo el manifest exista en disco. ⇒ si a cada spoke le llega su carpeta montada en `dist/`,
 ve `dist/core/bin/…` como siempre y **el camino de aplicación del update no se toca**.
 
-**Pendiente de implementar.** Es un cambio grande (materialización por rol en MB, folder ids por rol,
-migración de hives ya unidos, tests). El fix parcial del `hive.yaml` se revirtió a propósito: sin las
-carpetas, declarar `enabled: true` produciría avisos de salud falsos.
+### Implementado — la forma final, y por qué difiere de la primera idea
+
+Antes de escribir código se mapeó toda la superficie y se atacó el diseño de forma adversarial.
+**Tres objeciones resultaron correctas y fatales para el diseño tal como estaba enunciado**, cada
+una verificada a mano en el código:
+
+1. **Scopear "solo los binarios del rol" rompía al worker.** No existe `sync_runtime_to_worker`:
+   `runtimes/` viaja **únicamente** por syncthing, y es el único camino de entrega de paquetes
+   publicados. Un árbol con solo `core/bin` dejaba `publish --sync_to worker` roto para siempre.
+2. **Sacar `vendor/` congelaba syncthing en todos lados.** `update category=vendor` saca el hash
+   del binario de syncthing de ahí; sin eso, `MANIFEST_INVALID` permanente.
+3. **Un manifest recortado por rol rompía el gate de staleness.** El gate compara el sha256 del
+   `manifest.json` entre motherbee y el destino; un manifest por rol difiere por construcción, así
+   que **todo update quedaría rechazado como stale para siempre.**
+
+**La forma final** parte `dist` por **contenido** (los tres subdirectorios ya existían en disco y son
+hermanos, sin anidamiento) y scopea **por rol solo los binarios**:
+
+| folder | motherbee | spoke | quién |
+|---|---|---|---|
+| `fluxbee-dist-core-<rol>` | `dist/core/<rol>` | `dist/core` | los hives de ese rol |
+| `fluxbee-dist-vendor` | `dist/vendor` | `dist/vendor` | todo hive con syncthing |
+| `fluxbee-dist-runtimes` | `dist/runtimes` | `dist/runtimes` | **solo worker** |
+
+**El manifest viaja completo**, byte a byte igual al de motherbee, para que el gate de hash siga
+funcionando. Es metadata (nombres, versiones, hashes) — no ejecutables — así que la caja del DMZ
+sigue teniendo en disco **solo los binarios que corre**: el ingress recibe 4 en vez de 17, sin los
+181 MB de `sy_architect`, que es exclusivo de motherbee.
+
+**La asimetría de rutas es lo que evita tocar nada del lado del spoke:** motherbee sirve
+`dist/core/<rol>` y el spoke lo recibe como su propio `dist/core`, así que sigue leyendo
+`dist/core/bin/…` y `dist/core/manifest.json` con las mismas constantes de siempre.
+
+### Detalles que salieron del análisis y quedaron en el código
+
+- **El folder legado `fluxbee-dist` se REMUEVE, nunca se re-apunta.** `ensure_syncthing_folder_in_config_xml`
+  reescribe la ruta de un id que coincide, y un spoke `receiveonly` aplica los borrados remotos —
+  el mecanismo exacto del incidente ya registrado en este repo
+  (`CORE_DIAG_runtime_deletion_by_fluxbee_syncthing.md`, syncthing borró `runtimes/ai.common/0.1.2/**`).
+  Hubo que **escribir la primitiva de borrado de folder, que no existía**: todo el reconcile era aditivo.
+- **Carpetas creadas en modo aislado** (`ensure_isolated_...`), para que una carpeta nueva no herede
+  la lista de peers de otra y termine compartiéndose con hives que no corresponden.
+- **Copias, nunca hardlinks:** `build-deb.sh` e `install.sh` escriben con `install -m0755`, que hace
+  unlink+create — un hardlink quedaría apuntando al inode viejo mientras el manifest anuncia el nuevo.
+- **Escritura atómica** (temp + rename) del manifest y de cada binario: un lector no puede observar
+  un archivo a medio escribir.
+- **Poda:** un rol que deja de correr un servicio deja de recibir su binario.
+- **Pre-flight en motherbee:** si un rol reclama un componente que el build no trae, falla ahí, fuerte
+  y visible, en vez de producir un árbol corto que en el spoke sería un crash-loop.
+- **El `sync-hint` lo resuelve el hive destino.** El que pide nombra el *canal*, no el layout;
+  motherbee y los scripts e2e siguen mandando `folder_id: "fluxbee-dist"` sin cambios y el destino lo
+  expande a las carpetas que su rol realmente tiene, esperando **todas** (un canal parcialmente
+  convergido no está convergido).
+- **El egress entra a la malla.** Tenía syncthing apagado por rol en dos lugares duros; ahora lo
+  decide la config como todos. Fundamento del operador, correcto: syncthing no es un puerto plano —
+  el device ID **es** el hash del certificado TLS del peer y solo conectan devices explícitamente
+  emparejados.
+
+**Tests:** 8 nuevos, incluida la reescritura del guardián de la invariante del DMZ, que ahora afirma
+algo más filoso: el ingress sigue **fuera** de `blob/active` (P5) pero **dentro** de su core y de
+vendor, y **fuera** de runtimes. Más uno que prueba que ninguna carpeta de dist se superpone en disco
+con otra. **140/140 en verde.**
+
+### Residual conocido
+
+Motherbee materializa el set desde su `system_nodes.<rol>`, y el spoke valida contra la copia que
+motherbee le escribió en el join. Coinciden por construcción salvo que se edite el `hive.yaml` de
+motherbee **después** del join — que es [U-6](#u-4) (el `hive.yaml` nunca se re-emite a los spokes).
+Antes ese drift era inofensivo porque el árbol traía todo; ahora sería un crash-loop al boot del
+spoke. Bajo el modelo del operador ese cambio es un **major** (reinstalar desde cero), así que queda
+acotado — pero es la razón por la que U-6 sube de prioridad.
 
 ---
 

@@ -91,7 +91,28 @@ const SSH_HARDEN_VERIFY_RETRIES: usize = 6;
 const SSH_HARDEN_VERIFY_DELAY_MS: u64 = 1000;
 const SYNCTHING_FOLDER_BLOB_ID: &str = "fluxbee-blob";
 const SYNCTHING_FOLDER_BLOB_PUBLIC_ID: &str = "fluxbee-blob-public";
-const SYNCTHING_FOLDER_DIST_ID: &str = "fluxbee-dist";
+/// LEGACY. One folder over the whole of `dist/`, shared with workers only. Superseded by the
+/// per-content / per-role folders below, which is what lets ingress and egress receive core
+/// updates at all without also receiving `runtimes/`. Kept solely so migration can REMOVE it:
+/// never re-point it, because `ensure_syncthing_folder_in_config_xml` rewrites a matching id's
+/// path in place, and a receive-only spoke then applies remote deletes — this repo already has
+/// an incident of syncthing deleting `runtimes/ai.common/0.1.2/**` through exactly that path
+/// (`docs/onworking NOE/CORE_DIAG_runtime_deletion_by_fluxbee_syncthing.md`).
+const SYNCTHING_FOLDER_DIST_LEGACY_ID: &str = "fluxbee-dist";
+/// Per-role core binaries: `fluxbee-dist-core-<role>`. Motherbee serves
+/// `dist/core/<role>` (materialized by `materialize_role_core_trees`); the spoke receives it
+/// onto its own `dist/core`, so `dist/core/bin/<c>` and `dist/core/manifest.json` stay put.
+const SYNCTHING_FOLDER_DIST_CORE_PREFIX: &str = "fluxbee-dist-core-";
+/// The vendored syncthing binary + its manifest. Every hive that runs syncthing needs it:
+/// `update category=vendor` reads the vendor manifest and hashes the syncthing binary, and
+/// returns MANIFEST_INVALID without them — i.e. a hive with no vendor channel can never
+/// upgrade its own syncthing.
+const SYNCTHING_FOLDER_DIST_VENDOR_ID: &str = "fluxbee-dist-vendor";
+/// Published runtime packages. WORKER ONLY — this is the subtree that carries tenant workflow
+/// packages, and the reason the DMZ must not receive all of `dist/`. It is also the ONLY
+/// delivery path for them: there is no `sync_runtime_to_worker` SSH push, so a worker without
+/// this folder can never receive a published package.
+const SYNCTHING_FOLDER_DIST_RUNTIMES_ID: &str = "fluxbee-dist-runtimes";
 const SYNCTHING_FOLDER_TYPE_SEND_RECEIVE: &str = "sendreceive";
 const SYNCTHING_FOLDER_TYPE_SEND_ONLY: &str = "sendonly";
 const SYNCTHING_FOLDER_TYPE_RECEIVE_ONLY: &str = "receiveonly";
@@ -102,6 +123,7 @@ const SYNCTHING_INSTALL_PATH: &str = "/var/lib/fluxbee/vendor/bin/syncthing";
 const DIST_ROOT_DIR: &str = "/var/lib/fluxbee/dist";
 const DIST_RUNTIME_ROOT_DIR: &str = "/var/lib/fluxbee/dist/runtimes";
 const DIST_RUNTIME_MANIFEST_PATH: &str = "/var/lib/fluxbee/dist/runtimes/manifest.json";
+const DIST_CORE_ROOT_DIR: &str = "/var/lib/fluxbee/dist/core";
 const DIST_CORE_BIN_SOURCE_DIR: &str = "/var/lib/fluxbee/dist/core/bin";
 const DIST_CORE_MANIFEST_PATH: &str = "/var/lib/fluxbee/dist/core/manifest.json";
 const DIST_VENDOR_ROOT_DIR: &str = "/var/lib/fluxbee/dist/vendor";
@@ -1414,6 +1436,22 @@ async fn bootstrap_local(
     if state.is_motherbee {
         ensure_motherbee_ssh_key();
         ensure_motherbee_mesh_tls(&state.hive_id);
+        // Refresh the per-role core subtrees the spokes sync from. Boot is the right trigger:
+        // a `.deb` upgrade stops every core unit in `prerm` and `postinst` starts the
+        // orchestrator again, so this runs exactly once per new package, before any spoke can
+        // ask for an update. Non-fatal — motherbee itself runs from `dist/core`, so a
+        // materialization failure must not take the whole hive down; it makes spoke updates
+        // stale, which the loud log plus the update path's own hash gate will surface.
+        match materialize_role_core_trees(&core_manifest) {
+            Ok(roles) if !roles.is_empty() => {
+                tracing::info!(roles = ?roles, "refreshed per-role core distribution subtrees")
+            }
+            Ok(_) => {}
+            Err(err) => tracing::error!(
+                error = %err,
+                "failed to materialize per-role core distribution subtrees; spokes will not see this build"
+            ),
+        }
     }
 
     tracing::info!("starting rt-gateway");
@@ -1438,12 +1476,19 @@ async fn bootstrap_local(
         // usable on the LAN and the watchdog re-applies the route.
         tracing::error!(error = %err, "worker egress route reconciliation failed; continuing");
     }
+    // The egress used to have syncthing hard-disabled by role. That predates it having any
+    // core channel at all: with dist split by content it receives `core/<role>` + `vendor` and
+    // nothing else — no blob, no runtimes. Syncthing is not a plain open port either: device
+    // IDs are the hash of each peer's TLS certificate and only explicitly paired devices can
+    // connect, so this is an authenticated, encrypted, pinned channel rather than new exposed
+    // surface. Enablement now comes from config like every other role (an egress carries
+    // blob.enabled=false, so `effective_syncthing_runtime_config` turns it on off dist alone).
     let startup_sync = effective_syncthing_runtime_config(&state.blob, &state.dist);
-    if state.role == HiveRole::Egress {
+    if !startup_sync.sync_enabled {
         disable_blob_sync_runtime_local()?;
     } else if startup_sync.sync_enabled {
         if let Err(err) =
-            ensure_blob_sync_runtime(&state.blob, &state.dist, state.is_motherbee).await
+            ensure_blob_sync_runtime(&state.blob, &state.dist, state.is_motherbee, state.role).await
         {
             tracing::warn!(
                 error = %err,
@@ -2881,10 +2926,17 @@ struct SystemSyncHintRequest {
     timeout_ms: u64,
 }
 
+/// Default folder for a channel when the caller does not name one.
+///
+/// `dist` deliberately resolves to the LEGACY id: it is no longer a single folder, and
+/// `handle_system_sync_hint_message` expands any non-existent dist folder id (this one
+/// included) into the per-content folders the hive actually has. Keeping the historical value
+/// here means every existing caller — sy_admin, fluxbee-publish, the e2e scripts — keeps
+/// working unchanged and gets the whole channel settled.
 fn default_folder_id_for_sync_channel(channel: &str) -> Option<&'static str> {
     match channel {
         "blob" => Some(SYNCTHING_FOLDER_BLOB_ID),
-        "dist" => Some(SYNCTHING_FOLDER_DIST_ID),
+        "dist" => Some(SYNCTHING_FOLDER_DIST_LEGACY_ID),
         _ => None,
     }
 }
@@ -3003,7 +3055,7 @@ async fn wait_for_syncthing_folder_convergence(
     };
 
     if !service_active || !api_healthy {
-        ensure_blob_sync_runtime(desired_blob, desired_dist, state.is_motherbee).await?;
+        ensure_blob_sync_runtime(desired_blob, desired_dist, state.is_motherbee, state.role).await?;
         service_active = systemd_is_active(SYNCTHING_SERVICE_NAME);
         api_healthy = if service_active {
             syncthing_api_healthy(desired_sync.sync_api_port).await
@@ -3070,6 +3122,19 @@ async fn wait_for_syncthing_folder_convergence(
     }
 }
 
+/// The `dist` syncthing folders THIS hive actually has, given its role.
+///
+/// A caller asking to settle the "dist" channel names the channel, not the layout: motherbee
+/// and the e2e scripts still send the historical `folder_id: "fluxbee-dist"`, and they should
+/// not have to know that the target now holds `fluxbee-dist-core-<role>` plus `-vendor`, plus
+/// `-runtimes` only on a worker. The hive knows its own role, so it resolves the request here.
+fn dist_sync_hint_folder_ids(state: &OrchestratorState, dist: &DistRuntimeConfig) -> Vec<String> {
+    dist_sync_folders_for_role(dist, state.role, state.is_motherbee)
+        .into_iter()
+        .map(|f| f.id)
+        .collect()
+}
+
 async fn handle_system_sync_hint_message(
     state: &OrchestratorState,
     msg: &Message,
@@ -3084,6 +3149,40 @@ async fn handle_system_sync_hint_message(
             });
         }
     };
+
+    // "dist" is a channel, not a folder. Settle every dist folder this role carries, so an
+    // `update category=core` that waits on the channel is not satisfied by, say, vendor having
+    // converged while the core binaries are still in flight. A caller naming a folder that
+    // exists here (a specific `fluxbee-dist-*`) is honoured verbatim.
+    if request.channel == "dist" {
+        let dist = current_dist_runtime_config(state);
+        let ids = dist_sync_hint_folder_ids(state, &dist);
+        if !ids.iter().any(|id| id == &request.folder_id) {
+            let mut last = serde_json::Value::Null;
+            for id in ids {
+                let scoped = SystemSyncHintRequest {
+                    channel: request.channel.clone(),
+                    folder_id: id,
+                    wait_for_idle: request.wait_for_idle,
+                    timeout_ms: request.timeout_ms,
+                };
+                let value = handle_system_sync_hint_for_folder(state, scoped).await;
+                // First non-ok wins: a partially converged dist channel is not converged.
+                if value.get("status").and_then(|v| v.as_str()) != Some("ok") {
+                    return value;
+                }
+                last = value;
+            }
+            return last;
+        }
+    }
+    handle_system_sync_hint_for_folder(state, request).await
+}
+
+async fn handle_system_sync_hint_for_folder(
+    state: &OrchestratorState,
+    request: SystemSyncHintRequest,
+) -> serde_json::Value {
 
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
@@ -3533,7 +3632,8 @@ async fn apply_system_update_local(
                 && (blob_sync_tool_is_syncthing(&desired_sync)
                     || dist_sync_tool_is_syncthing(&desired_dist))
             {
-                ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee).await?;
+                ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee, state.role)
+            .await?;
                 Ok(SystemUpdateApplyResult {
                     status: "ok".to_string(),
                     updated: Vec::new(),
@@ -6221,6 +6321,59 @@ fn ensure_syncthing_folder_has_device(
     Ok((config_xml.to_string(), false))
 }
 
+/// One syncthing folder to declare on this side of a motherbee<->spoke link.
+struct DistSyncFolder {
+    id: String,
+    path: PathBuf,
+    label: &'static str,
+}
+
+/// The `dist` folders a link with a spoke of `spoke_role` must carry, resolved for whichever
+/// side is calling (`is_motherbee`).
+///
+/// This is where "each hive gets only what it runs" is actually decided, and the split is by
+/// CONTENT, deliberately:
+///   * core    — per role. The ingress runs 4 of the 17 core binaries; shipping it all of
+///               `dist/core` would hand the DMZ box the 181 MB motherbee-only `sy_architect`
+///               for nothing.
+///   * vendor  — everyone. Without it `update category=vendor` is permanently unsatisfiable.
+///   * runtimes— worker only. Tenant workflow packages live here; this is the subtree that
+///               must never reach the DMZ.
+///
+/// Paths are asymmetric by design: motherbee serves `dist/core/<role>`, the spoke receives it
+/// as its own `dist/core`. Syncthing resolves a folder id to a local path per device, so both
+/// ends agree on the id while each keeps the layout its own code expects.
+fn dist_sync_folders_for_role(
+    dist: &DistRuntimeConfig,
+    spoke_role: HiveRole,
+    is_motherbee: bool,
+) -> Vec<DistSyncFolder> {
+    let mut out = Vec::new();
+    let core_path = if is_motherbee {
+        role_core_dist_dir(spoke_role)
+    } else {
+        dist.path.join("core")
+    };
+    out.push(DistSyncFolder {
+        id: format!("{}{}", SYNCTHING_FOLDER_DIST_CORE_PREFIX, spoke_role.as_str()),
+        path: core_path,
+        label: "Fluxbee Dist Core",
+    });
+    out.push(DistSyncFolder {
+        id: SYNCTHING_FOLDER_DIST_VENDOR_ID.to_string(),
+        path: dist.path.join("vendor"),
+        label: "Fluxbee Dist Vendor",
+    });
+    if spoke_role == HiveRole::Worker {
+        out.push(DistSyncFolder {
+            id: SYNCTHING_FOLDER_DIST_RUNTIMES_ID.to_string(),
+            path: dist.path.join("runtimes"),
+            label: "Fluxbee Dist Runtimes",
+        });
+    }
+    out
+}
+
 fn reconcile_syncthing_peer_xml(
     config_xml: &str,
     blob: &BlobRuntimeConfig,
@@ -6229,8 +6382,13 @@ fn reconcile_syncthing_peer_xml(
     peer_name: &str,
     peer_address: Option<&str>,
     is_motherbee: bool,
-    public_only: bool,
+    spoke_role: HiveRole,
 ) -> Result<(String, bool), OrchestratorError> {
+    // The non-motherbee end of the link. On motherbee this is the peer's role; on a spoke it is
+    // the spoke's own. Previously a `public_only: bool`, which conflated "this is an ingress"
+    // with "share no dist at all" — that conflation is what left ingress and egress with no
+    // core channel while only the blob invariant actually required it.
+    let public_only = spoke_role == HiveRole::Ingress;
     let mut updated = config_xml.to_string();
     let mut changed = false;
 
@@ -6280,23 +6438,77 @@ fn reconcile_syncthing_peer_xml(
         changed |= device_changed;
     }
 
-    if !public_only && dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
-        let (next, folder_changed) = ensure_syncthing_folder_in_config_xml(
-            &updated,
-            SYNCTHING_FOLDER_DIST_ID,
-            &dist.path.display().to_string(),
-            "Fluxbee Dist",
-            dist_syncthing_folder_type(is_motherbee),
-        )?;
+    // dist: no longer gated on `public_only`. The DMZ invariant (io-blob-spec-v1 P5) is about
+    // `blob/active`, handled above; software distribution is a separate concern and is scoped
+    // by content instead — see `dist_sync_folders_for_role`.
+    if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
+        for folder in dist_sync_folders_for_role(dist, spoke_role, is_motherbee) {
+            // Isolated: each dist folder owns a disjoint subtree (core/, vendor/, runtimes/ are
+            // siblings under dist/), so no two of them may ever converge on one path. Overlapping
+            // syncthing folders are accepted silently by the daemon and then fight over one
+            // index — the failure mode behind the runtime-deletion incident.
+            let (next, folder_changed) = ensure_isolated_syncthing_folder_in_config_xml(
+                &updated,
+                &folder.id,
+                &folder.path.display().to_string(),
+                folder.label,
+                dist_syncthing_folder_type(is_motherbee),
+            )?;
+            updated = next;
+            changed |= folder_changed;
+            let (next, device_changed) =
+                ensure_syncthing_folder_has_device(&updated, &folder.id, peer_device_id)?;
+            updated = next;
+            changed |= device_changed;
+        }
+
+        // Retire the legacy whole-`dist/` folder. Removing it (rather than re-pointing it) is
+        // the only safe move: the id must never be reused with a different path, and leaving it
+        // in place would keep shipping `runtimes/` to every hive that already had it, silently
+        // defeating the split.
+        let (next, legacy_removed) =
+            remove_syncthing_folder_from_config_xml(&updated, SYNCTHING_FOLDER_DIST_LEGACY_ID)?;
+        if legacy_removed {
+            tracing::info!(
+                folder = SYNCTHING_FOLDER_DIST_LEGACY_ID,
+                "removed legacy whole-dist syncthing folder in favour of per-content folders"
+            );
+        }
         updated = next;
-        changed |= folder_changed;
-        let (next, device_changed) =
-            ensure_syncthing_folder_has_device(&updated, SYNCTHING_FOLDER_DIST_ID, peer_device_id)?;
-        updated = next;
-        changed |= device_changed;
+        changed |= legacy_removed;
     }
 
     Ok((updated, changed))
+}
+
+/// Remove a `<folder>` block entirely from a syncthing config.
+///
+/// Every other `reconcile_*`/`ensure_*` helper here is additive; there was no way to retire a
+/// folder at all, which is why the legacy whole-`dist/` folder could not simply be replaced.
+fn remove_syncthing_folder_from_config_xml(
+    config_xml: &str,
+    folder_id: &str,
+) -> Result<(String, bool), OrchestratorError> {
+    let pattern = format!(
+        r#"(?s)[ \t]*<folder\b[^>]*\bid="{}"[^>]*>.*?</folder>\s*\n?"#,
+        regex::escape(folder_id)
+    );
+    let re = Regex::new(&pattern)
+        .map_err(|err| format!("invalid folder-removal regex for '{folder_id}': {err}"))?;
+    if !re.is_match(config_xml) {
+        // Also handle the self-closing form some syncthing versions emit.
+        let self_closing = format!(
+            r#"(?s)[ \t]*<folder\b[^>]*\bid="{}"[^>]*/>\s*\n?"#,
+            regex::escape(folder_id)
+        );
+        let re_sc = Regex::new(&self_closing)
+            .map_err(|err| format!("invalid folder-removal regex for '{folder_id}': {err}"))?;
+        if !re_sc.is_match(config_xml) {
+            return Ok((config_xml.to_string(), false));
+        }
+        return Ok((re_sc.replace(config_xml, "").to_string(), true));
+    }
+    Ok((re.replace(config_xml, "").to_string(), true))
 }
 
 fn ensure_local_syncthing_peer_link(
@@ -6307,7 +6519,7 @@ fn ensure_local_syncthing_peer_link(
     peer_name: &str,
     peer_address: Option<&str>,
     is_motherbee: bool,
-    public_only: bool,
+    spoke_role: HiveRole,
 ) -> Result<bool, OrchestratorError> {
     let config_path = sync.sync_data_dir.join("config.xml");
     let current = fs::read_to_string(&config_path)?;
@@ -6319,7 +6531,7 @@ fn ensure_local_syncthing_peer_link(
         peer_name,
         peer_address,
         is_motherbee,
-        public_only,
+        spoke_role,
     )?;
     if changed {
         fs::write(&config_path, updated)?;
@@ -6335,7 +6547,7 @@ async fn ensure_syncthing_peer_link_runtime(
     peer_name: &str,
     peer_address: Option<&str>,
     is_motherbee: bool,
-    public_only: bool,
+    spoke_role: HiveRole,
 ) -> Result<(), OrchestratorError> {
     if !sync.sync_enabled {
         return Ok(());
@@ -6351,7 +6563,7 @@ async fn ensure_syncthing_peer_link_runtime(
         peer_name,
         peer_address,
         is_motherbee,
-        public_only,
+        spoke_role,
     )?;
     if !changed {
         return Ok(());
@@ -6460,10 +6672,17 @@ fn reconcile_syncthing_peer_removal_xml(
     }
 
     if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
-        let (next, folder_changed) =
-            remove_syncthing_folder_device(&updated, SYNCTHING_FOLDER_DIST_ID, peer_device_id)?;
-        updated = next;
-        changed |= folder_changed;
+        // Every dist folder PRESENT in the config, not a fixed id: the removed hive's role is
+        // not known here, and after the per-content split a hive may be attached to any of
+        // `fluxbee-dist-core-<role>`, `-vendor`, `-runtimes` (plus the legacy whole-dist folder
+        // on a config that has not been migrated yet). Leaving a stale device on any of them
+        // would keep shipping bytes to a hive that was removed.
+        for folder_id in dist_folder_ids_present_in_config(&updated) {
+            let (next, folder_changed) =
+                remove_syncthing_folder_device(&updated, &folder_id, peer_device_id)?;
+            updated = next;
+            changed |= folder_changed;
+        }
     }
 
     let (next, top_changed) =
@@ -6524,11 +6743,31 @@ async fn ensure_syncthing_peer_unlink_runtime(
     Ok(true)
 }
 
+/// Every `fluxbee-dist*` folder id declared in a syncthing config, in document order.
+///
+/// Used where the role is unknown (peer removal) or where the legacy folder may still be
+/// present alongside the new per-content ones.
+fn dist_folder_ids_present_in_config(config_xml: &str) -> Vec<String> {
+    let re = match Regex::new(r#"<folder\b[^>]*\bid="(fluxbee-dist[^"]*)""#) {
+        Ok(re) => re,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for caps in re.captures_iter(config_xml) {
+        let id = caps[1].to_string();
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
 fn reconcile_syncthing_folders_xml(
     config_xml: &str,
     blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
     is_motherbee: bool,
+    role: HiveRole,
 ) -> Result<(String, Vec<String>), OrchestratorError> {
     let mut updated = config_xml.to_string();
     let mut changed_folders = Vec::new();
@@ -6564,15 +6803,36 @@ fn reconcile_syncthing_folders_xml(
     }
 
     if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
-        let (next, changed) = ensure_syncthing_folder_in_config_xml(
-            &updated,
-            SYNCTHING_FOLDER_DIST_ID,
-            &dist.path.display().to_string(),
-            "Fluxbee Dist",
-            dist_syncthing_folder_type(is_motherbee),
-        )?;
-        if changed {
-            changed_folders.push(SYNCTHING_FOLDER_DIST_ID.to_string());
+        // Motherbee declares the serving side for every spoke role it may host; a spoke
+        // declares only its own. Same ids on both ends, different local paths — that is what
+        // lets motherbee serve `dist/core/<role>` onto each spoke's own `dist/core`.
+        let roles: Vec<HiveRole> = if is_motherbee {
+            ROLE_CORE_DIST_ROLES.to_vec()
+        } else {
+            vec![role]
+        };
+        for r in roles {
+            for folder in dist_sync_folders_for_role(dist, r, is_motherbee) {
+                if changed_folders.contains(&folder.id) {
+                    continue; // vendor is shared across roles; declare it once
+                }
+                let (next, changed) = ensure_isolated_syncthing_folder_in_config_xml(
+                    &updated,
+                    &folder.id,
+                    &folder.path.display().to_string(),
+                    folder.label,
+                    dist_syncthing_folder_type(is_motherbee),
+                )?;
+                if changed {
+                    changed_folders.push(folder.id.clone());
+                }
+                updated = next;
+            }
+        }
+        let (next, legacy_removed) =
+            remove_syncthing_folder_from_config_xml(&updated, SYNCTHING_FOLDER_DIST_LEGACY_ID)?;
+        if legacy_removed {
+            changed_folders.push(SYNCTHING_FOLDER_DIST_LEGACY_ID.to_string());
         }
         updated = next;
     }
@@ -6585,11 +6845,12 @@ fn reconcile_local_syncthing_folders(
     blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
     is_motherbee: bool,
+    role: HiveRole,
 ) -> Result<Vec<String>, OrchestratorError> {
     let config_path = sync.sync_data_dir.join("config.xml");
     let current = fs::read_to_string(&config_path)?;
     let (updated, changed_folders) =
-        reconcile_syncthing_folders_xml(&current, blob, dist, is_motherbee)?;
+        reconcile_syncthing_folders_xml(&current, blob, dist, is_motherbee, role)?;
     if !changed_folders.is_empty() {
         fs::write(&config_path, updated)?;
     }
@@ -6609,6 +6870,8 @@ fn ensure_syncthing_folder_marker(path: &Path) -> Result<bool, OrchestratorError
 fn ensure_syncthing_folder_markers(
     blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
+    is_motherbee: bool,
+    role: HiveRole,
 ) -> Result<Vec<String>, OrchestratorError> {
     let mut repaired = Vec::new();
 
@@ -6627,8 +6890,22 @@ fn ensure_syncthing_folder_markers(
     }
 
     if dist.sync_enabled && dist_sync_tool_is_syncthing(dist) {
-        if ensure_syncthing_folder_marker(&dist.path)? {
-            repaired.push(SYNCTHING_FOLDER_DIST_ID.to_string());
+        // One marker per dist folder, not one on the `dist/` root: after the per-content split
+        // each folder owns its own subtree, and syncthing needs `.stfolder` inside each of them.
+        let roles: Vec<HiveRole> = if is_motherbee {
+            ROLE_CORE_DIST_ROLES.to_vec()
+        } else {
+            vec![role]
+        };
+        for r in roles {
+            for folder in dist_sync_folders_for_role(dist, r, is_motherbee) {
+                if repaired.contains(&folder.id) {
+                    continue;
+                }
+                if ensure_syncthing_folder_marker(&folder.path)? {
+                    repaired.push(folder.id.clone());
+                }
+            }
         }
     }
 
@@ -6639,6 +6916,7 @@ async fn ensure_blob_sync_runtime(
     blob: &BlobRuntimeConfig,
     dist: &DistRuntimeConfig,
     is_motherbee: bool,
+    role: HiveRole,
 ) -> Result<(), OrchestratorError> {
     let sync = effective_syncthing_runtime_config(blob, dist);
     if !sync.sync_enabled {
@@ -6652,7 +6930,7 @@ async fn ensure_blob_sync_runtime(
         .into());
     }
 
-    let repaired_markers = ensure_syncthing_folder_markers(blob, dist)?;
+    let repaired_markers = ensure_syncthing_folder_markers(blob, dist, is_motherbee, role)?;
 
     ensure_syncthing_installed()?;
     let service_user = resolve_syncthing_service_user(&sync)?;
@@ -6670,7 +6948,8 @@ async fn ensure_blob_sync_runtime(
     )
     .await?;
     wait_for_syncthing_health(&sync).await?;
-    let changed_folders = reconcile_local_syncthing_folders(&sync, blob, dist, is_motherbee)?;
+    let changed_folders =
+        reconcile_local_syncthing_folders(&sync, blob, dist, is_motherbee, role)?;
     if !changed_folders.is_empty() || !repaired_markers.is_empty() {
         tracing::info!(
             service = SYNCTHING_SERVICE_NAME,
@@ -6727,9 +7006,6 @@ fn disable_blob_sync_runtime_local() -> Result<(), OrchestratorError> {
 }
 
 async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), OrchestratorError> {
-    if state.role == HiveRole::Egress {
-        return Ok(());
-    }
     let desired_blob = current_blob_runtime_config(state);
     let desired_dist = current_dist_runtime_config(state);
     let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
@@ -6760,7 +7036,8 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
 
     if changed {
         tracing::info!("blob/dist sync config changed in hive.yaml; reconciling syncthing runtime");
-        ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee).await?;
+        ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee, state.role)
+            .await?;
         return Ok(());
     }
 
@@ -6812,22 +7089,25 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
             }
         }
         if desired_dist.sync_enabled && dist_sync_tool_is_syncthing(&desired_dist) {
-            match syncthing_folder_healthy(&desired_sync, SYNCTHING_FOLDER_DIST_ID) {
-                Ok(true) => {}
-                Ok(false) => {
-                    folders_healthy = false;
-                    tracing::warn!(
-                        folder = SYNCTHING_FOLDER_DIST_ID,
-                        "syncthing folder unhealthy; scheduling runtime reconcile"
-                    );
-                }
-                Err(err) => {
-                    folders_healthy = false;
-                    tracing::warn!(
-                        folder = SYNCTHING_FOLDER_DIST_ID,
-                        error = %err,
-                        "failed to verify syncthing folder health; scheduling runtime reconcile"
-                    );
+            for folder in dist_sync_folders_for_role(&desired_dist, state.role, state.is_motherbee)
+            {
+                match syncthing_folder_healthy(&desired_sync, &folder.id) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        folders_healthy = false;
+                        tracing::warn!(
+                            folder = %folder.id,
+                            "syncthing folder unhealthy; scheduling runtime reconcile"
+                        );
+                    }
+                    Err(err) => {
+                        folders_healthy = false;
+                        tracing::warn!(
+                            folder = %folder.id,
+                            error = %err,
+                            "failed to verify syncthing folder health; scheduling runtime reconcile"
+                        );
+                    }
                 }
             }
         }
@@ -6843,7 +7123,8 @@ async fn watchdog_blob_sync(state: &OrchestratorState) -> Result<(), Orchestrato
         folders_healthy = folders_healthy,
         "syncthing unhealthy; restarting"
     );
-    ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee).await?;
+    ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee, state.role)
+            .await?;
     Ok(())
 }
 
@@ -15629,6 +15910,199 @@ fn core_bin_paths_for_role(
         .collect())
 }
 
+/// Motherbee-side per-role core distribution root: `dist/core/<role>/`.
+///
+/// Motherbee keeps its own full set in `dist/core/{bin,manifest.json}` and materializes
+/// one scoped subtree per spoke role beside it. Syncthing shares `dist/core/<role>` to the
+/// hives of that role, mapped onto their own `dist/core` — so a spoke still sees exactly
+/// `dist/core/bin/<c>` and `dist/core/manifest.json`, and no path constant changes.
+fn role_core_dist_dir(role: HiveRole) -> PathBuf {
+    Path::new(DIST_CORE_ROOT_DIR).join(role.as_str())
+}
+
+/// The spoke roles motherbee materializes a scoped core subtree for. Motherbee itself is
+/// excluded: it consumes `dist/core` directly and never syncs core to itself.
+const ROLE_CORE_DIST_ROLES: [HiveRole; 3] = [HiveRole::Worker, HiveRole::Ingress, HiveRole::Egress];
+
+/// Narrow a core manifest to one role's components.
+///
+/// NOT used for the manifest that ships — see `materialize_role_core_trees` for why that one
+/// stays whole. This exists to validate, on motherbee and before anything is copied, that every
+/// component a role claims actually exists in the build: a role asking for a binary the package
+/// does not contain must fail here, loudly, rather than produce a short tree that turns into a
+/// spoke crash-loop later.
+fn scope_core_manifest_to_components(
+    manifest: &CoreManifest,
+    components: &[String],
+) -> Result<CoreManifest, OrchestratorError> {
+    let mut scoped = std::collections::BTreeMap::new();
+    for name in components {
+        let entry = manifest.components.get(name).ok_or_else(|| {
+            format!("core manifest missing component '{name}' required by its role")
+        })?;
+        scoped.insert(name.clone(), entry.clone());
+    }
+    Ok(CoreManifest {
+        schema_version: manifest.schema_version,
+        components: scoped,
+    })
+}
+
+/// Motherbee: (re)materialize `dist/core/<role>/` for every spoke role.
+///
+/// WHY per-role and not one shared `dist/core`: a hive must only hold the executables it
+/// actually runs. The ingress — the DMZ door — otherwise receives all 17 core binaries
+/// (389 MB, including the 181 MB motherbee-only `sy_architect`) to run four of them, plus
+/// `runtimes/`, which is where tenant workflow packages live.
+///
+/// WHY the manifest ships WHOLE while the binaries are scoped: the `category=core` staleness
+/// gate compares the sha256 of `dist/core/manifest.json` between motherbee and the target hive
+/// (`local_core_manifest_hash`). A per-role manifest would differ from motherbee's by
+/// construction, so every update would be rejected as stale forever — the exact failure this
+/// work exists to remove. The manifest is metadata (component names, versions, hashes), not
+/// executables, so shipping it whole does not put anything on a DMZ box that it could run.
+///
+/// The spoke stays safe with a whole manifest because `validate_core_manifest_for_bins` only
+/// validates the paths it is GIVEN — its own role's set — and extra manifest entries are
+/// inert. What it does NOT tolerate is a binary it expects being absent: that check runs at
+/// BOOT (`bootstrap_local` → `core_bin_paths_for_role` → `validate_core_manifest_for_bins`,
+/// sha256ing each file) and `main` propagates it with `?`, so a short tree is not an update
+/// failure but an orchestrator crash-loop with no channel left to repair it. Both sides derive
+/// the role's set from the same `system_nodes.<role>` — motherbee's template, which it wrote
+/// into the spoke's hive.yaml at add_hive — so they agree unless that template is edited after
+/// the join. That residual is tracked with U-6 (hive.yaml is never re-emitted to spokes).
+///
+/// Copies, never hardlinks: `build-deb.sh` and `install.sh` write with `install -m0755`,
+/// which unlinks and recreates, so a hardlink would silently keep pointing at the previous
+/// inode while the manifest advertised the new hash.
+///
+/// Idempotent: a component is re-copied only when its bytes differ from the source, and the
+/// scoped manifest is rewritten only on a real diff — so syncthing sees no spurious churn.
+fn materialize_role_core_trees(
+    manifest: &CoreManifest,
+) -> Result<Vec<String>, OrchestratorError> {
+    let hive = load_hive(&json_router::paths::config_dir())?;
+    let mut changed_roles = Vec::new();
+
+    for role in ROLE_CORE_DIST_ROLES {
+        // A role with no `system_nodes.<role>` section in motherbee's hive.yaml is simply not
+        // deployable here; skip it rather than failing motherbee's boot over a role nobody uses.
+        let section = match system_nodes_for_role(&hive, role) {
+            Ok(section) => section,
+            Err(err) => {
+                tracing::debug!(role = %role.as_str(), error = %err, "no system_nodes section; skipping role core tree");
+                continue;
+            }
+        };
+        let components = core_component_names_from_section(&section, manifest)?;
+        // Validate up-front that the build actually contains everything this role claims.
+        // Failing here is cheap and visible; failing on the spoke is a crash-loop.
+        scope_core_manifest_to_components(manifest, &components)?;
+
+        let root = role_core_dist_dir(role);
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir)?;
+
+        let mut role_changed = false;
+        for name in &components {
+            let src = local_core_bin_source_path(name);
+            let dst = bin_dir.join(name);
+            if !src.exists() {
+                return Err(format!(
+                    "core binary '{}' missing from '{}' — the installed package is incomplete",
+                    name,
+                    src.display()
+                )
+                .into());
+            }
+            // Compare against the manifest's sha rather than re-hashing the source twice: the
+            // manifest is authoritative and `validate_core_manifest_for_bins` will hold us to it.
+            let expected = &manifest
+                .components
+                .get(name)
+                .expect("component presence was validated above")
+                .sha256;
+            let dst_matches = dst.exists()
+                && sha256_file(&dst)
+                    .map(|h| h.eq_ignore_ascii_case(expected.trim()))
+                    .unwrap_or(false);
+            if dst_matches {
+                continue;
+            }
+            copy_exec_file(&src, &dst)?;
+            role_changed = true;
+        }
+
+        // Prune components this role no longer runs. Without this, a role that drops a service
+        // keeps shipping its binary forever, and the spoke would hold an executable it does not
+        // run — exactly what this whole subtree exists to prevent.
+        if let Ok(entries) = fs::read_dir(&bin_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !components.iter().any(|c| c == &name) {
+                    fs::remove_file(entry.path())?;
+                    role_changed = true;
+                }
+            }
+        }
+
+        // The WHOLE manifest, byte-for-byte what motherbee serves itself, so the staleness gate
+        // sees identical hashes on both ends. Copied rather than re-serialized for exactly that
+        // reason: a re-render could differ by key order or whitespace and silently wedge the gate.
+        let manifest_path = root.join("manifest.json");
+        let rendered = fs::read_to_string(local_core_manifest_path().ok_or_else(|| {
+            format!("core manifest missing at '{DIST_CORE_MANIFEST_PATH}'")
+        })?)?;
+        let manifest_changed = match fs::read_to_string(&manifest_path) {
+            Ok(existing) => existing != rendered,
+            Err(_) => true,
+        };
+        if manifest_changed {
+            // Atomic: syncthing must never observe a half-written manifest, because a spoke
+            // that reads one fails `validate_core_manifest_for_bins` at boot.
+            write_file_atomic(&manifest_path, rendered.as_bytes())?;
+            role_changed = true;
+        }
+
+        if role_changed {
+            tracing::info!(
+                role = %role.as_str(),
+                components = components.len(),
+                "materialized per-role core distribution subtree"
+            );
+            changed_roles.push(role.as_str().to_string());
+        }
+    }
+
+    Ok(changed_roles)
+}
+
+/// Copy an executable, preserving 0755, via a temp file + rename so a reader (syncthing, or a
+/// spoke mid-scan) never sees a partial binary.
+fn copy_exec_file(src: &Path, dst: &Path) -> Result<(), OrchestratorError> {
+    let bytes = fs::read(src)?;
+    write_file_atomic(dst, &bytes)?;
+    set_exec_0755(dst)?;
+    Ok(())
+}
+
+/// Write `bytes` to `path` atomically (temp sibling + rename).
+fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), OrchestratorError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("path '{}' has no parent directory", path.display()))?;
+    fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(
+        ".{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("fluxbee-write")
+    ));
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// add_hive: push the motherbee's vendor runtime (syncthing binary + manifest +
 /// optional config template) to the worker, so the worker's blob/dist-sync setup
 /// finds the vendored syncthing during finalize. Mirrors `sync_core_to_worker`.
@@ -16464,7 +16938,8 @@ async fn add_hive_finalize_local_flow(
             &syncthing_peer_name,
             syncthing_peer_address.as_deref(),
             state.is_motherbee,
-            state.role == HiveRole::Ingress,
+            // This link is the local hive's own; on a spoke that is its own role.
+            state.role,
         )
         .await
         {
@@ -16499,8 +16974,15 @@ async fn add_hive_finalize_local_flow(
     let public_probe_enabled = state.role == HiveRole::Ingress
         && desired_blob.public_sync_enabled
         && blob_sync_tool_is_syncthing(&desired_sync);
+    // The folder that answers "did this hive's core arrive?" is its own core folder; vendor and
+    // runtimes converge independently and must not stand in for it.
+    let dist_core_folder_id = format!(
+        "{}{}",
+        SYNCTHING_FOLDER_DIST_CORE_PREFIX,
+        state.role.as_str()
+    );
     let probe_folder_id = if dist_probe_enabled {
-        Some(SYNCTHING_FOLDER_DIST_ID)
+        Some(dist_core_folder_id.as_str())
     } else if public_probe_enabled {
         Some(SYNCTHING_FOLDER_BLOB_PUBLIC_ID)
     } else {
@@ -17020,7 +17502,7 @@ async fn add_hive_flow(
                         hive_id,
                         None,
                         state.is_motherbee,
-                        false,
+                        HiveRole::Worker,
                     )
                     .await
                     {
@@ -17772,7 +18254,7 @@ async fn add_hive_flow(
             hive_id,
             None,
             state.is_motherbee,
-            false,
+            HiveRole::Worker,
         )
         .await
         {
@@ -18207,17 +18689,23 @@ async fn add_egress_hive_flow(
         (worker_uplink.as_str(), "wan uplink address"),
         (storage_path.as_str(), "storage.path"),
         (dist_path_str.as_str(), "dist.path"),
+        (state.dist.sync_tool.as_str(), "dist.sync.tool"),
     ] {
         if let Err(err) = validate_yaml_scalar(val, label) {
             return err_payload("CONFIG_FAILED", err.to_string());
         }
     }
+    // U-2: this was hardcoded `enabled: false`, which left the egress with no core channel and
+    // an `update category=core` that sat at 202 sync_pending forever without ever saying the
+    // folder did not exist. It now follows motherbee's dist config like the worker's writer.
     let hive_yaml = format!(
-        "hive_id: {hive_id}\nrole: egress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  sync:\n    enabled: false\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: false\negress:\n  enabled: true\n  lan_cidr: \"{lan_cidr}\"\n  edge_ip: \"{edge_ip}\"\n  wan_iface: \"{wan_iface}\"\n  lan_iface: \"{lan_iface}\"\n  ipv6: \"blocked\"\n{system_nodes}",
+        "hive_id: {hive_id}\nrole: egress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  sync:\n    enabled: false\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: {dist_sync_enabled}\n    tool: \"{dist_sync_tool}\"\negress:\n  enabled: true\n  lan_cidr: \"{lan_cidr}\"\n  edge_ip: \"{edge_ip}\"\n  wan_iface: \"{wan_iface}\"\n  lan_iface: \"{lan_iface}\"\n  ipv6: \"blocked\"\n{system_nodes}",
         hive_id = hive_id,
         uplink = worker_uplink,
         storage = storage_path,
         dist_path = state.dist.path.display(),
+        dist_sync_enabled = state.dist.sync_enabled,
+        dist_sync_tool = state.dist.sync_tool,
         lan_cidr = nat.lan_cidr,
         edge_ip = nat.edge_ip,
         wan_iface = nat.wan_iface,
@@ -18834,6 +19322,7 @@ async fn add_ingress_hive_flow(
         (blob_path_str.as_str(), "blob.path"),
         (blob_sync_data_dir_str.as_str(), "blob.sync.data_dir"),
         (blob_sync_tool.as_str(), "blob.sync.tool"),
+        (state.dist.sync_tool.as_str(), "dist.sync.tool"),
         (edge_listen.as_str(), "edge.listen"),
     ] {
         if let Err(err) = validate_yaml_scalar(val, label) {
@@ -18841,11 +19330,13 @@ async fn add_ingress_hive_flow(
         }
     }
     let hive_yaml = format!(
-        "hive_id: {hive_id}\nrole: ingress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  path: \"{blob_path}\"\n  sync:\n    enabled: true\n    public_enabled: true\n    tool: \"{blob_sync_tool}\"\n    api_port: {blob_sync_api_port}\n    data_dir: \"{blob_sync_data_dir}\"\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: false\nedge:\n  listen: \"{edge_listen}\"\n  endpoints_path: \"/etc/fluxbee/edge.endpoints.json\"\n  publications_path: \"/var/lib/fluxbee/state/sy-edge/publications.json\"\n  blob_public_root: \"{blob_path}/public\"\n{edge_tls}{system_nodes}",
+        "hive_id: {hive_id}\nrole: ingress\nwan:\n  gateway_name: RT.gateway\n  mtls: required\n  uplinks:\n    - address: \"{uplink}\"\nnats:\n  mode: embedded\n  port: 4222\nstorage:\n  path: \"{storage}\"\nblob:\n  enabled: false\n  path: \"{blob_path}\"\n  sync:\n    enabled: true\n    public_enabled: true\n    tool: \"{blob_sync_tool}\"\n    api_port: {blob_sync_api_port}\n    data_dir: \"{blob_sync_data_dir}\"\ndist:\n  path: \"{dist_path}\"\n  sync:\n    enabled: {dist_sync_enabled}\n    tool: \"{dist_sync_tool}\"\nedge:\n  listen: \"{edge_listen}\"\n  endpoints_path: \"/etc/fluxbee/edge.endpoints.json\"\n  publications_path: \"/var/lib/fluxbee/state/sy-edge/publications.json\"\n  blob_public_root: \"{blob_path}/public\"\n{edge_tls}{system_nodes}",
         hive_id = hive_id,
         uplink = worker_uplink,
         storage = storage_path,
         dist_path = state.dist.path.display(),
+        dist_sync_enabled = state.dist.sync_enabled,
+        dist_sync_tool = state.dist.sync_tool,
         blob_path = state.blob.path.display(),
         blob_sync_tool = blob_sync_tool,
         blob_sync_api_port = state.blob.sync_api_port,
@@ -19057,7 +19548,7 @@ async fn add_ingress_hive_flow(
     let desired_dist = current_dist_runtime_config(state);
     let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
     if let Err(err) =
-        ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee).await
+        ensure_blob_sync_runtime(&desired_blob, &desired_dist, state.is_motherbee, state.role).await
     {
         return err_payload(
             "SYNC_SETUP_FAILED",
@@ -19110,7 +19601,7 @@ async fn add_ingress_hive_flow(
         hive_id,
         Some(&ingress_syncthing_address),
         state.is_motherbee,
-        true,
+        HiveRole::Ingress,
     )
     .await
     {
@@ -22217,7 +22708,7 @@ mod tests {
             local = LOCAL_DEVICE_ID,
             peer = PEER_DEVICE_ID,
             blob_id = SYNCTHING_FOLDER_BLOB_ID,
-            dist_id = SYNCTHING_FOLDER_DIST_ID
+            dist_id = SYNCTHING_FOLDER_DIST_LEGACY_ID
         )
     }
 
@@ -22240,8 +22731,16 @@ mod tests {
         }
     }
 
+    /// The DMZ invariant, restated precisely after the dist split.
+    ///
+    /// P5 (docs/io-blob-spec-v1.md:53) constrains BLOB content: the ingress receives only
+    /// `blob/public`, never `blob/active`. It says nothing about software distribution, and the
+    /// old code conflated the two — leaving the public door with no core channel at all. So the
+    /// invariant this test now guards is sharper: the ingress must still be absent from the
+    /// private BLOB folder, while being present on its own core folder and on vendor, and
+    /// absent from runtimes (where tenant workflow packages live).
     #[test]
-    fn ingress_public_peer_profile_never_attaches_private_folders() {
+    fn ingress_peer_profile_gets_core_and_vendor_but_no_private_blob_or_runtimes() {
         const INGRESS_DEVICE_ID: &str = "INGRESS-DEVICE-ID-1234567890";
         let base = sample_syncthing_config_with_peer();
         let blob = sample_blob_config();
@@ -22254,39 +22753,59 @@ mod tests {
             "ingress-1",
             Some("tcp://192.0.2.10:22000"),
             true,
-            true,
+            HiveRole::Ingress,
         )
         .unwrap();
         assert!(changed);
         assert!(mother.contains("<address>tcp://192.0.2.10:22000</address>"));
         assert!(mother.contains(&format!("id=\"{}\"", SYNCTHING_FOLDER_BLOB_PUBLIC_ID)));
-        assert!(mother.contains("type=\"sendonly\""));
-        let public_folder = Regex::new(&format!(
-            r#"(?s)<folder\b[^>]*\bid=\"{}\"[^>]*>.*?</folder>"#,
-            SYNCTHING_FOLDER_BLOB_PUBLIC_ID
-        ))
-        .unwrap()
-        .find(&mother)
-        .unwrap()
-        .as_str();
-        assert!(public_folder.contains(INGRESS_DEVICE_ID));
-        assert!(!public_folder.contains(PEER_DEVICE_ID));
-        for private_id in [SYNCTHING_FOLDER_BLOB_ID, SYNCTHING_FOLDER_DIST_ID] {
-            let private_folder = Regex::new(&format!(
+
+        let folder_block = |xml: &str, id: &str| -> Option<String> {
+            Regex::new(&format!(
                 r#"(?s)<folder\b[^>]*\bid=\"{}\"[^>]*>.*?</folder>"#,
-                private_id
+                regex::escape(id)
             ))
             .unwrap()
-            .find(&mother)
-            .unwrap()
-            .as_str();
-            assert!(!private_folder.contains(INGRESS_DEVICE_ID));
+            .find(xml)
+            .map(|m| m.as_str().to_string())
+        };
+
+        // Public blob: the ingress is on it, the ordinary worker peer is not.
+        let public_folder = folder_block(&mother, SYNCTHING_FOLDER_BLOB_PUBLIC_ID).unwrap();
+        assert!(public_folder.contains(INGRESS_DEVICE_ID));
+        assert!(!public_folder.contains(PEER_DEVICE_ID));
+
+        // Private blob (`blob/active`): the ingress must NEVER appear. This is P5 and it is
+        // non-negotiable.
+        let private_blob = folder_block(&mother, SYNCTHING_FOLDER_BLOB_ID).unwrap();
+        assert!(
+            !private_blob.contains(INGRESS_DEVICE_ID),
+            "P5: the DMZ ingress must never peer blob/active"
+        );
+
+        // Core: the ingress IS attached now — that is the whole fix.
+        let core_id = format!("{SYNCTHING_FOLDER_DIST_CORE_PREFIX}ingress");
+        let core_folder = folder_block(&mother, &core_id)
+            .expect("motherbee must declare the ingress core folder");
+        assert!(core_folder.contains(INGRESS_DEVICE_ID));
+        assert!(core_folder.contains("path=\"/var/lib/fluxbee/dist/core/ingress\""));
+
+        // Vendor: attached, so the ingress can upgrade its own syncthing.
+        let vendor_folder = folder_block(&mother, SYNCTHING_FOLDER_DIST_VENDOR_ID)
+            .expect("motherbee must declare the vendor folder");
+        assert!(vendor_folder.contains(INGRESS_DEVICE_ID));
+
+        // Runtimes: NOT attached, and not even declared for an ingress-only link.
+        if let Some(runtimes) = folder_block(&mother, SYNCTHING_FOLDER_DIST_RUNTIMES_ID) {
+            assert!(
+                !runtimes.contains(INGRESS_DEVICE_ID),
+                "tenant workflow packages must never reach the DMZ"
+            );
         }
 
+        // Now the ingress's own side of the link.
         let mut ingress_blob = blob.clone();
         ingress_blob.enabled = false;
-        let mut ingress_dist = dist.clone();
-        ingress_dist.sync_enabled = false;
         let ingress_base = format!(
             "<configuration version=\"37\">\n  <device id=\"{local}\" name=\"ingress-1\"></device>\n</configuration>",
             local = LOCAL_DEVICE_ID,
@@ -22294,17 +22813,20 @@ mod tests {
         let (ingress, _) = reconcile_syncthing_peer_xml(
             &ingress_base,
             &ingress_blob,
-            &ingress_dist,
+            &dist,
             INGRESS_DEVICE_ID,
             "motherbee",
             Some("tcp://192.0.2.1:22000"),
             false,
-            true,
+            HiveRole::Ingress,
         )
         .unwrap();
         assert!(ingress.contains("type=\"receiveonly\""));
         assert!(!ingress.contains(&format!("id=\"{}\"", SYNCTHING_FOLDER_BLOB_ID)));
-        assert!(!ingress.contains(&format!("id=\"{}\"", SYNCTHING_FOLDER_DIST_ID)));
+        assert!(!ingress.contains(&format!("id=\"{}\"", SYNCTHING_FOLDER_DIST_RUNTIMES_ID)));
+        // Its core folder maps onto the plain `dist/core` path its own code reads.
+        assert!(ingress.contains(&format!("id=\"{core_id}\"")));
+        assert!(ingress.contains("path=\"/var/lib/fluxbee/dist/core\""));
     }
 
     #[test]
@@ -22517,7 +23039,10 @@ blob:
         assert!(!updated.contains(PEER_DEVICE_ID));
         assert!(updated.contains(LOCAL_DEVICE_ID));
         assert!(updated.contains(SYNCTHING_FOLDER_BLOB_ID));
-        assert!(updated.contains(SYNCTHING_FOLDER_DIST_ID));
+        // The legacy whole-dist folder is still declared here (this fixture models a hive that
+        // has not been migrated); removal must strip the peer from it too, not just from the
+        // per-content folders — otherwise a removed hive keeps receiving bytes.
+        assert!(updated.contains(SYNCTHING_FOLDER_DIST_LEGACY_ID));
     }
 
     #[test]
@@ -22582,36 +23107,226 @@ blob:
         assert_eq!(updated, config);
     }
 
+    /// Motherbee serves every spoke role: one core folder per role, pointing at the
+    /// materialized per-role subtree, plus the shared vendor folder and the worker-only
+    /// runtimes folder. All sendonly — motherbee publishes, it never accepts remote edits.
     #[test]
-    fn reconcile_syncthing_folders_sets_dist_sendonly_on_motherbee() {
+    fn reconcile_syncthing_folders_declares_per_role_dist_on_motherbee() {
         let config = sample_syncthing_config_with_peer();
         let blob = sample_blob_config();
         let dist = sample_dist_config();
 
         let (updated, changed_folders) =
-            reconcile_syncthing_folders_xml(&config, &blob, &dist, true)
+            reconcile_syncthing_folders_xml(&config, &blob, &dist, true, HiveRole::Motherbee)
                 .expect("folder reconcile must succeed");
 
-        assert!(changed_folders.contains(&SYNCTHING_FOLDER_DIST_ID.to_string()));
+        for role in ["worker", "ingress", "egress"] {
+            let id = format!("{SYNCTHING_FOLDER_DIST_CORE_PREFIX}{role}");
+            assert!(
+                changed_folders.contains(&id),
+                "motherbee must declare the core folder for role {role}"
+            );
+            assert!(updated.contains(&format!(
+                "<folder id=\"{id}\" label=\"Fluxbee Dist Core\" path=\"/var/lib/fluxbee/dist/core/{role}\" type=\"sendonly\""
+            )));
+        }
+        assert!(changed_folders.contains(&SYNCTHING_FOLDER_DIST_VENDOR_ID.to_string()));
+        assert!(changed_folders.contains(&SYNCTHING_FOLDER_DIST_RUNTIMES_ID.to_string()));
+    }
+
+    /// A spoke declares only its own role's core folder, mapped onto its plain `dist/core` —
+    /// which is why no path constant had to change on the receiving side.
+    #[test]
+    fn reconcile_syncthing_folders_declares_only_own_role_on_spoke() {
+        let config = sample_syncthing_config_with_peer();
+        let blob = sample_blob_config();
+        let dist = sample_dist_config();
+
+        let (updated, changed_folders) =
+            reconcile_syncthing_folders_xml(&config, &blob, &dist, false, HiveRole::Ingress)
+                .expect("folder reconcile must succeed");
+
         assert!(updated.contains(
-            "<folder id=\"fluxbee-dist\" label=\"Fluxbee Dist\" path=\"/var/lib/fluxbee/dist\" type=\"sendonly\""
+            "<folder id=\"fluxbee-dist-core-ingress\" label=\"Fluxbee Dist Core\" path=\"/var/lib/fluxbee/dist/core\" type=\"receiveonly\""
         ));
+        assert!(!changed_folders
+            .iter()
+            .any(|f| f == "fluxbee-dist-core-worker"));
+    }
+
+    /// The whole point of the split: tenant workflow packages live in `runtimes/`, and the DMZ
+    /// door must never receive them. Vendor, by contrast, is mandatory everywhere — without it
+    /// `update category=vendor` can never be satisfied and the hive's syncthing freezes.
+    #[test]
+    fn ingress_and_egress_get_core_and_vendor_but_never_runtimes() {
+        let dist = sample_dist_config();
+        for role in [HiveRole::Ingress, HiveRole::Egress] {
+            let ids: Vec<String> = dist_sync_folders_for_role(&dist, role, true)
+                .into_iter()
+                .map(|f| f.id)
+                .collect();
+            assert!(ids.contains(&format!(
+                "{SYNCTHING_FOLDER_DIST_CORE_PREFIX}{}",
+                role.as_str()
+            )));
+            assert!(ids.contains(&SYNCTHING_FOLDER_DIST_VENDOR_ID.to_string()));
+            assert!(
+                !ids.contains(&SYNCTHING_FOLDER_DIST_RUNTIMES_ID.to_string()),
+                "{} must never peer the runtimes subtree",
+                role.as_str()
+            );
+        }
+        // The worker does get it — it is the ONLY delivery path for published packages
+        // (there is no sync_runtime_to_worker SSH push).
+        let worker_ids: Vec<String> = dist_sync_folders_for_role(&dist, HiveRole::Worker, true)
+            .into_iter()
+            .map(|f| f.id)
+            .collect();
+        assert!(worker_ids.contains(&SYNCTHING_FOLDER_DIST_RUNTIMES_ID.to_string()));
+    }
+
+    /// Migration: the legacy whole-`dist/` folder must be REMOVED, never re-pointed. Re-pointing
+    /// it would rewrite the path of a live id, and a receive-only spoke then applies remote
+    /// deletes — the mechanism behind the recorded runtimes deletion incident.
+    #[test]
+    fn legacy_whole_dist_folder_is_removed_not_repointed() {
+        let config = sample_syncthing_config_with_peer();
+        assert!(config.contains(SYNCTHING_FOLDER_DIST_LEGACY_ID));
+        let blob = sample_blob_config();
+        let dist = sample_dist_config();
+
+        let (updated, _) =
+            reconcile_syncthing_folders_xml(&config, &blob, &dist, false, HiveRole::Worker)
+                .expect("folder reconcile must succeed");
+
+        assert!(
+            !updated.contains(&format!("id=\"{SYNCTHING_FOLDER_DIST_LEGACY_ID}\"")),
+            "the legacy folder must be gone, not renamed or re-pointed"
+        );
+    }
+
+    fn sample_core_manifest() -> CoreManifest {
+        let mut components = std::collections::BTreeMap::new();
+        for (name, sha, size) in [
+            ("rt-gateway", "aa11", 10u64),
+            ("sy-config-routes", "bb22", 20),
+            ("sy-orchestrator", "cc33", 30),
+            ("sy-edge", "dd44", 40),
+            ("sy-architect", "ee55", 181_123_776),
+        ] {
+            components.insert(
+                name.to_string(),
+                CoreManifestComponent {
+                    service: name.to_string(),
+                    version: "0.1.0".to_string(),
+                    build_id: "build-1".to_string(),
+                    sha256: sha.to_string(),
+                    size: Some(size),
+                },
+            );
+        }
+        CoreManifest {
+            schema_version: 1,
+            components,
+        }
+    }
+
+    /// Scoping copies entries verbatim — same sha256, size, version, build_id.
+    ///
+    /// This runs on motherbee as a PRE-FLIGHT: it proves every component a role claims exists
+    /// in the build before any file is copied. (The manifest that actually ships is the whole
+    /// one — see `materialize_role_core_trees` — because the staleness gate compares its sha
+    /// between motherbee and the spoke.)
+    #[test]
+    fn scoped_core_manifest_copies_entries_verbatim() {
+        let full = sample_core_manifest();
+        let wanted = vec!["rt-gateway".to_string(), "sy-edge".to_string()];
+        let scoped = scope_core_manifest_to_components(&full, &wanted).unwrap();
+
+        assert_eq!(scoped.schema_version, full.schema_version);
+        assert_eq!(scoped.components.len(), 2);
+        for name in &wanted {
+            let a = full.components.get(name).unwrap();
+            let b = scoped.components.get(name).unwrap();
+            assert_eq!(a.sha256, b.sha256);
+            assert_eq!(a.size, b.size);
+            assert_eq!(a.version, b.version);
+            assert_eq!(a.build_id, b.build_id);
+        }
+        // The 181 MB motherbee-only component is exactly what an ingress must not receive.
+        assert!(!scoped.components.contains_key("sy-architect"));
+    }
+
+    /// A role asking for a component the build does not contain must fail loudly at
+    /// materialization time, on motherbee — not silently ship an incomplete tree that turns
+    /// into a spoke crash-loop later.
+    #[test]
+    fn scoping_a_missing_component_fails_loudly() {
+        let full = sample_core_manifest();
+        let err = scope_core_manifest_to_components(&full, &["sy-nonexistent".to_string()])
+            .expect_err("must reject a component absent from the manifest");
+        assert!(err.to_string().contains("sy-nonexistent"));
+    }
+
+    /// The path asymmetry is the trick that keeps every spoke-side constant untouched:
+    /// motherbee serves `dist/core/<role>`, the spoke receives it as its own `dist/core`, and
+    /// both ends agree on the folder id.
+    #[test]
+    fn core_folder_path_is_role_scoped_on_motherbee_and_plain_on_the_spoke() {
+        let dist = sample_dist_config();
+        let on_mb = dist_sync_folders_for_role(&dist, HiveRole::Ingress, true);
+        let on_spoke = dist_sync_folders_for_role(&dist, HiveRole::Ingress, false);
+
+        assert_eq!(on_mb[0].id, on_spoke[0].id);
+        assert_eq!(
+            on_mb[0].path,
+            PathBuf::from("/var/lib/fluxbee/dist/core/ingress")
+        );
+        assert_eq!(on_spoke[0].path, PathBuf::from("/var/lib/fluxbee/dist/core"));
+    }
+
+    /// Every dist folder must own a disjoint subtree. Two syncthing folders over one tree are
+    /// accepted silently by the daemon and then fight over a single index — the mechanism
+    /// behind the recorded `runtimes/ai.common/0.1.2` deletion.
+    #[test]
+    fn dist_folders_never_overlap() {
+        let dist = sample_dist_config();
+        for role in [HiveRole::Worker, HiveRole::Ingress, HiveRole::Egress] {
+            for is_mb in [true, false] {
+                let folders = dist_sync_folders_for_role(&dist, role, is_mb);
+                for (i, a) in folders.iter().enumerate() {
+                    for b in folders.iter().skip(i + 1) {
+                        assert_ne!(a.id, b.id, "duplicate folder id for {:?}", role);
+                        assert!(
+                            !a.path.starts_with(&b.path) && !b.path.starts_with(&a.path),
+                            "folders {} and {} overlap on disk ({} vs {})",
+                            a.id,
+                            b.id,
+                            a.path.display(),
+                            b.path.display()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
-    fn reconcile_syncthing_folders_sets_dist_receiveonly_on_worker() {
+    fn removing_a_syncthing_folder_is_idempotent_and_scoped() {
         let config = sample_syncthing_config_with_peer();
-        let blob = sample_blob_config();
-        let dist = sample_dist_config();
-
-        let (updated, changed_folders) =
-            reconcile_syncthing_folders_xml(&config, &blob, &dist, false)
-                .expect("folder reconcile must succeed");
-
-        assert!(changed_folders.contains(&SYNCTHING_FOLDER_DIST_ID.to_string()));
-        assert!(updated.contains(
-            "<folder id=\"fluxbee-dist\" label=\"Fluxbee Dist\" path=\"/var/lib/fluxbee/dist\" type=\"receiveonly\""
-        ));
+        let (once, removed) =
+            remove_syncthing_folder_from_config_xml(&config, SYNCTHING_FOLDER_DIST_LEGACY_ID)
+                .expect("removal must succeed");
+        assert!(removed);
+        assert!(!once.contains(&format!("id=\"{SYNCTHING_FOLDER_DIST_LEGACY_ID}\"")));
+        // Untouched neighbours.
+        assert!(once.contains(SYNCTHING_FOLDER_BLOB_ID));
+        // Second call is a no-op rather than an error.
+        let (twice, removed_again) =
+            remove_syncthing_folder_from_config_xml(&once, SYNCTHING_FOLDER_DIST_LEGACY_ID)
+                .expect("removal must succeed");
+        assert!(!removed_again);
+        assert_eq!(twice, once);
     }
 
     #[test]
