@@ -20,6 +20,16 @@ infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambi
 | [PB-7](#pb-7) | 🔴 abierto | Timeout del admin (180 s) vs. las esperas internas de `add_hive` (`A-3`) | no |
 | [PB-8](#pb-8) | 🔴 abierto | `egress.gateway_ip` no se propaga a motherbee (`A-4`) | no |
 
+### Serie U — el sistema de update (auditado 2026-07-30, antes de usarlo)
+
+| id | estado | tema | bloquea |
+|---|---|---|---|
+| [U-1](#u-1) | 🔴 abierto | **El update del core reporta éxito sin reiniciar nada** | **SÍ** |
+| [U-2](#u-2) | 🔴 abierto | **Ingress y egress no tienen canal de core** (`enabled: false` hardcodeado) | **SÍ** para esos roles |
+| [U-3](#u-3) | 🔴 abierto | El `.deb` pisa `dist/runtimes/manifest.json` y borra lo publicado en caliente | no (hoy) |
+| [U-4](#u-4) | 🔴 abierto | Cero verificación de compatibilidad de versión entre motherbee y spokes | no |
+| [U-5](#u-5) | 🔴 abierto | No hay rollback de core como comando | no |
+
 ---
 
 <a id="pb-1"></a>
@@ -188,3 +198,153 @@ Detalle en [FINDINGS.md → A-4](FINDINGS.md).
 declara a los workers pero no a motherbee — y motherbee es justo quien llama a OpenAI, Slack y Meta.
 La prueba está pendiente: declarar `egress.gateway_ip: 10.10.10.40` en el hive.yaml de MB y ver por
 dónde sale el tráfico.
+
+
+---
+---
+
+# Serie U — el sistema de update
+
+> Auditado el **2026-07-30**, antes de usarlo, con verificación adversarial y comprobación en las
+> máquinas de producción. El disparador fue la decisión del operador: *"para resolver los problemas en
+> prod sería mejor tener el update andando bien, y después ir por los bugs"*.
+>
+> **Lo que hay construido funciona más de lo que uno esperaría** — hay manifest con sha256, copia
+> atómica con `rename()`, backup de los binarios previos, rollback local ante fallo, gate de
+> staleness por hash, y para *runtimes* hasta fanout con `sync_to`/`update_to`. El problema no es que
+> falte maquinaria: son **dos defectos puntuales que la vuelven inoperable**, y ambos son silenciosos.
+
+<a id="u-1"></a>
+## U-1 🔴 — El update del core reporta éxito **sin reiniciar nada** · BLOQUEANTE
+
+La función que corre después de intercambiar los binarios se llama
+`restart_local_core_services_with_health_gate`… y llama a **`systemctl start`**:
+
+```rust
+// src/bin/sy_orchestrator.rs:3248
+systemd_start(&service)?;          // fn systemd_start -> Command::new("systemctl").arg("start")
+wait_for_service_active(&service, …).await?;
+restarted.push(service);           // <-- y lo reporta como "restarted"
+```
+
+`systemctl start` sobre un servicio **que ya está corriendo** es un no-op: systemd devuelve éxito y no
+hace nada. El proceso sigue ejecutando el binario viejo (el inode anterior, todavía mapeado). Pero el
+nombre se apila en `restarted` y la API responde `status: ok` con la lista completa.
+
+**No existe ningún `systemd_restart` en el archivo.** Las rutas remotas (por SSH, líneas 6361/6512/6678
+y 16168) sí usan `systemctl restart` — o sea que **la ruta local es la divergente**, que por la regla
+de mirar a los pares es justo la señal de dónde está el bug.
+
+**Por qué es el peor tipo de fallo:** los binarios *sí* quedan cambiados en `/usr/bin`. El update
+entonces "funciona"… en el próximo reboot. Alguien puede correr el update, ver `ok`, reiniciar la
+máquina por otra razón días después, y concluir que el mecanismo anda bien.
+
+**Arreglo:** `systemd_start` → un `systemd_restart` nuevo, alineando con la ruta remota. Es una línea.
+**A charlar antes:** `restart` vs `stop`+`start` cambia la ventana de indisponibilidad del spoke.
+
+**Test que falta** (hoy tiene que fallar, y esa es la prueba):
+
+```bash
+p=$(systemctl show -p MainPID --value sy-config-routes)
+readlink /proc/$p/exe        # si dice "(deleted)" -> corre el binario viejo
+systemctl show -p ActiveEnterTimestamp --value sy-config-routes   # anterior al update
+```
+
+---
+
+<a id="u-2"></a>
+## U-2 🔴 — Ingress y egress no tienen canal de core · BLOQUEANTE para esos roles
+
+El `hive.yaml` que motherbee escribe para esos dos roles trae el canal **apagado a mano**, sin
+parámetro:
+
+```
+src/bin/sy_orchestrator.rs:18211  (egress)   dist:\n  path: "…"\n  sync:\n    enabled: false
+src/bin/sy_orchestrator.rs:18839  (ingress)  dist:\n  path: "…"\n  sync:\n    enabled: false
+```
+
+El **worker** lo tiene parametrizado (línea 17440) y en prod está en `true`. **Verificado en las
+máquinas de producción:**
+
+```text
+ingress1  dist.sync.enabled: false      worker1  dist.sync.enabled: true
+```
+
+`POST /hives/ingress1/update {category:"core"}` se queda en `202 sync_pending` para siempre, y el
+mensaje no dice que el canal **no existe**.
+
+### La maquinaria ya está ahí — falta compartir la carpeta
+
+**El canal de software de fluxbee es syncthing, no SSH.** SSH existe solo para el bootstrap del
+`add_hive`; que se revoque al cerrar el join es el comportamiento correcto y deseado, no un segundo
+problema. Verificado en las máquinas de producción:
+
+| carpeta syncthing | worker1 | ingress1 |
+|---|---|---|
+| `fluxbee-blob` → `blob/active` | `sendreceive` | **ausente** ← correcto, invariante P5 |
+| `fluxbee-blob-public` → `blob/public` | — | `receiveonly` |
+| **`fluxbee-dist` → `dist/`** | **`receiveonly`** | **AUSENTE** ← *esto* es el bug |
+| devices emparejados | 8 | 6 |
+
+O sea: **syncthing ya corre en el ingress, ya está emparejado con motherbee, y ya recibe una carpeta
+en receive-only.** No hay que montar infraestructura nueva ni reabrir ningún canal: falta compartirle
+`fluxbee-dist`, con exactamente la misma postura `receiveonly` que ya tiene el worker.
+
+**Y no choca con la invariante del DMZ.** `docs/io-blob-spec-v1.md:53` (P5) y la línea 278 son
+específicas de **blob**: *"DMZ never receives `active/`… nunca agregar ingress como device del folder
+`fluxbee-blob`"*. `fluxbee-dist` es distribución de software, no contenido de blobs; la invariante no
+lo alcanza. (Una auditoría automática de este hallazgo confundió las dos carpetas y puso una salvedad
+que no aplica — queda anotado para que no se propague.)
+
+**Arreglo:** parametrizar `dist.sync.enabled` en los `format!` de ingress y egress igual que ya está
+en el de worker (línea 17440), y agregar la carpeta al peering de esos roles en `add_hive`.
+
+**A charlar igual:** si el default para ingress/egress debe ser `true`, o quedar explícito en el
+`add_hive`. Y para las cajas **ya unidas** (las de prod ahora) hace falta decidir cómo se les agrega
+la carpeta sin re-hacer el join, dado que SSH está revocado por diseño.
+
+---
+
+<a id="u-3"></a>
+## U-3 🔴 — El upgrade del `.deb` borra los runtimes publicados en caliente
+
+`dist/runtimes/manifest.json` es un **archivo del paquete** (`dpkg -L fluxbee` lo lista), y el único
+`conffile` declarado es `/etc/fluxbee/hive.yaml.example`. Entonces un upgrade **lo pisa**: los
+directorios de versión sobreviven, pero desaparecen del manifest → `run_node`/`restart_node` pasan a
+`RUNTIME_NOT_AVAILABLE`, y el siguiente `update category=runtime` los recolecta como basura.
+
+Contradice de frente la decisión de packaging: *"Growth = publish + update, no new .deb"*.
+
+**Hoy el daño sería nulo:** los 6 runtimes de prod vinieron del `.deb`, ninguno se publicó en
+caliente. Pero apenas `SY.wf-rules` publique un `wf.*` o se despliegue un nodo propio, cada upgrade
+los borra. **Es un argumento a favor de probar el update ahora, mientras prod todavía es virgen.**
+
+**Opciones a charlar:** sacar el manifest del paquete · declararlo `conffile` · o hacer *merge* en el
+`postinst` en vez de reemplazo.
+
+---
+
+<a id="u-4"></a>
+## U-4 🔴 — Cero verificación de compatibilidad entre motherbee y spokes
+
+`GET /hives/{h}/versions` y las alertas de drift son **informativas**: nada rechaza un peer con
+versión incompatible. Durante la ventana en que motherbee ya está en `0.1.1` y los spokes siguen en
+`0.1.0` no hay ninguna red de seguridad; si un cambio toca protocolo, la malla rompe en silencio.
+
+Mitigación mientras no exista: **mantener el payload de cada update en cambios que no toquen
+protocolo**, y no dejar la ventana abierta más de lo necesario.
+
+---
+
+<a id="u-5"></a>
+## U-5 🔴 — No hay rollback de core como comando
+
+Existe rollback **automático** (local, ante fallo detectado) y hay backup de los binarios previos en
+`state/orchestrator/core-bin.prev.local/update-<ms>/`. Pero **no hay una acción de rollback de core**
+— las únicas `*_rollback` son de vault, opa y wf_rules. Y el directorio de backups nunca se limpia.
+
+Peor: el rollback automático depende de **detectar** el fallo, y [U-1](#u-1) hace que muchos fallos no
+se detecten.
+
+**Mientras no exista, el rollback real es externo:** snapshot de las VMs + conservar el `.deb` anterior
+publicado en el repo apt para poder bajar de versión.

@@ -557,8 +557,11 @@ máquina le da igual.
 
 Honestidad sobre el alcance — nada de esto se probó:
 
-- **Actualizar** un fluxbee ya desplegado (`.deb` nuevo, `core-update`, paquetes de nodo). **Es lo
-  siguiente que hay que probar**, y hasta que funcione no hay forma sana de llevar arreglos a prod.
+- **Actualizar** un fluxbee ya desplegado (`.deb` nuevo, `update category=core`, paquetes de nodo).
+  **Es lo siguiente que hay que probar** — plan y hallazgos en [`UPDATE-PLAN.md`](UPDATE-PLAN.md).
+  Auditado el 2026-07-30 antes de usarlo: hay **dos bloqueantes verificados**
+  ([U-1](PENDING-BUGS.md#u-1): el update reporta éxito sin reiniciar nada · [U-2](PENDING-BUGS.md#u-2):
+  ingress y egress no tienen carpeta de dist). **No corras un `update category=core` sin leer eso.**
 - Segundo hive de trabajo, o multi-hive sobre WAN en esta infraestructura.
 - Backup y restore de motherbee (Postgres + vault).
 - Renovación de certificado end-to-end.
