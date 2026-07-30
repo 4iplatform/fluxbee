@@ -1826,6 +1826,15 @@ async fn reconcile_persisted_custom_nodes(
             } else {
                 (persisted_ilk, persisted_tenant)
             };
+        // Free the unit name before relaunching.
+        //
+        // Managed nodes run as TRANSIENT units (`systemd-run`), and systemd refuses to create a
+        // transient unit whose name is still loaded — "Unit ... was already loaded or has a
+        // fragment file". A node left crash-looping by an upgrade sits in `auto-restart`, which
+        // is exactly that state: not active, but still loaded, holding its name hostage with the
+        // OLD ExecStart path. Without this the rebind above resolves correctly and then the
+        // relaunch fails on every boot, which is what happened on the 0.1.2 → 0.1.3 upgrade.
+        clear_stale_transient_unit(&unit);
         let cmd = build_managed_node_run_command(
             &unit,
             &node.node_name,
@@ -20391,6 +20400,29 @@ fn systemd_start(service: &str) -> Result<(), OrchestratorError> {
 /// update that used it reported `status: ok` with a full `restarted` list while nothing
 /// had actually changed. The remote/SSH core-sync path always used `systemctl restart`;
 /// the local path was the divergent one. See U-1 in lab/logbook/PENDING-BUGS.md.
+/// Unload a transient unit so its name can be reused by a fresh `systemd-run`.
+///
+/// Best-effort by design: every failure here is expected in the normal case (the unit may not
+/// exist at all), and none of them should stop a relaunch. `stop` unloads a loaded-but-inactive
+/// transient unit; `reset-failed` clears the name when it is stuck in a failed state.
+fn clear_stale_transient_unit(unit: &str) {
+    let service = if unit.ends_with(".service") {
+        unit.to_string()
+    } else {
+        format!("{unit}.service")
+    };
+    if !systemd_unit_exists(&service) {
+        return;
+    }
+    for (verb, label) in [("stop", "systemctl stop"), ("reset-failed", "systemctl reset-failed")] {
+        let mut cmd = Command::new("systemctl");
+        cmd.arg(verb).arg(&service);
+        if let Err(err) = run_cmd(cmd, label) {
+            tracing::debug!(unit = %service, verb = verb, error = %err, "clearing stale transient unit: step did not apply");
+        }
+    }
+}
+
 fn systemd_restart(service: &str) -> Result<(), OrchestratorError> {
     let mut cmd = Command::new("systemctl");
     cmd.arg("restart").arg(service);
