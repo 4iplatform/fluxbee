@@ -5371,6 +5371,11 @@ fn validate_fanout_family_glob(fanout_family: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Channel commands a node may issue for ITSELF. Gated by `authorize_channel_command`, which
+/// enforces `IO.*` origin and `channel owner == router-stamped caller` — so this list widens WHO
+/// may ask, never WHAT they may reach: a node still cannot act on someone else's channel.
+const CHANNEL_SELF_SERVICE_ACTIONS: &[&str] = &["externalize", "unexternalize"];
+
 fn authorize_channel_command(
     caller_l2_name: Option<&str>,
     owner_l2_name: &str,
@@ -5411,13 +5416,34 @@ fn authorize_cloud_relay(
     // otherwise run under admin's own privileged ilk). Previously the gate only guarded the 3
     // exposed actions and let IO.cloud relay ANY OTHER action unchecked.
     if caller_l2_name == Some(expected.as_str()) {
-        return if IO_CLOUD_EXPOSED_ACTIONS.contains(&action) {
-            Ok(())
-        } else {
-            Err(format!(
-                "IO.cloud may relay only {IO_CLOUD_EXPOSED_ACTIONS:?} over the mesh, not '{action}' (Fluxbee Cloud provisioning gate)"
-            ))
-        };
+        if IO_CLOUD_EXPOSED_ACTIONS.contains(&action) {
+            return Ok(());
+        }
+        // RELAYING is not the same as ACTING ON ONE'S OWN CHANNEL, and this gate must only
+        // contain the first.
+        //
+        // The allowlist above bounds what IO.cloud may relay ON BEHALF OF Fluxbee Cloud — that is
+        // the confused-deputy this gate exists to prevent. A channel command is a different thing:
+        // the node acting for ITSELF, on a resource it owns. It has its own gate,
+        // `authorize_channel_command`, which requires the caller to be an `IO.*` node (I1) AND the
+        // channel's owner to equal the caller (I8) — with the owner read from IDENTITY and the
+        // caller stamped by the ROUTER, so neither is forgeable from params.
+        //
+        // Denying these here was blocking IO.cloud from publishing its OWN endpoint at boot, which
+        // is the documented self-service path (io-cloud/src/main.rs:118-123, spec v6 §11.1). The
+        // node created its ICH, asked to externalize it, and was refused by the very gate meant to
+        // contain its relaying — leaving Fluxbee Cloud unreachable until an operator published the
+        // channel by hand on every install (U-11).
+        //
+        // Letting them through does NOT widen the relay: `authorize_channel_command` still runs in
+        // the handler, and a compromised IO.cloud still cannot touch a channel it does not own,
+        // nor relay anything outside the allowlist.
+        if CHANNEL_SELF_SERVICE_ACTIONS.contains(&action) {
+            return Ok(());
+        }
+        return Err(format!(
+            "IO.cloud may relay only {IO_CLOUD_EXPOSED_ACTIONS:?} over the mesh, not '{action}' (Fluxbee Cloud provisioning gate)"
+        ));
     }
     // All OTHER callers: a non-exposed action is not this gate's concern (other per-action gates /
     // trusted internal paths apply). The exposed provisioning actions may originate over the mesh
@@ -14387,6 +14413,33 @@ mod tests {
                 "IO.cloud must be denied non-exposed action '{evil}'"
             );
         }
+        // U-11: a channel command is NOT a relay — it is the node acting for ITSELF. The gate
+        // must let it reach `authorize_channel_command`, which enforces owner == caller. Without
+        // this, IO.cloud could not publish its own endpoint at boot and Fluxbee Cloud stayed
+        // unreachable until an operator externalized the channel by hand on every install.
+        for self_service in CHANNEL_SELF_SERVICE_ACTIONS {
+            assert!(
+                authorize_cloud_relay(Some("IO.cloud@motherbee"), self_service, "motherbee")
+                    .is_ok(),
+                "IO.cloud must reach the channel gate for its own '{self_service}'"
+            );
+        }
+        // …and letting them through must NOT have widened the relay: everything outside the
+        // allowlist plus the two channel commands is still denied. `list_nodes` above already
+        // covers a privileged read; these pin the boundary itself.
+        for still_denied in ["add_hive", "vault_get", "publish_artifact", "sync_hint"] {
+            assert!(
+                authorize_cloud_relay(Some("IO.cloud@motherbee"), still_denied, "motherbee")
+                    .is_err(),
+                "the channel exception must not open '{still_denied}'"
+            );
+        }
+        // A channel command from a NON-IO caller is not this gate's business (it has no relay
+        // privilege to contain) — `authorize_channel_command` rejects it downstream on the I1 rule.
+        assert!(
+            authorize_cloud_relay(Some("AI.worker@motherbee"), "externalize", "motherbee").is_ok()
+        );
+
         for action in IO_CLOUD_EXPOSED_ACTIONS {
             // Trusted internal path (caller==None: HTTP operator / executor) — allowed.
             assert!(authorize_cloud_relay(None, action, "motherbee").is_ok());

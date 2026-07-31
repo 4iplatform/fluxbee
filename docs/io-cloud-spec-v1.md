@@ -1,5 +1,9 @@
 # IO.cloud — spec v1 (el representante interno de Fluxbee Cloud)
 
+> **Para el equipo de Fluxbee Cloud, la referencia operativa es
+> [`io-cloud-api.md`](io-cloud-api.md)** — probada contra producción y con la procedencia de cada
+> dato. Este documento es la especificación de diseño interna.
+
 Estado: **alpha implementada para provisioning**. Fecha de actualización: 2026-07-17. Branch:
 `daily_onworking_coa`.
 Alcance: define QUÉ es `IO.cloud`, su rol de provisioning, el seam `IO.cloud → SY.admin`, el
@@ -17,7 +21,7 @@ todavía, se marca explícito.
 ## 1. Rol y posición
 
 `IO.cloud` es **el representante interno de Fluxbee Cloud dentro de la malla**: un nodo IO que vive
-en un worker, recibe lo que el edge le reenvía desde internet, y **provisiona recursos de backend**
+en **motherbee** (singleton), recibe lo que el edge le reenvía desde internet, y **provisiona recursos de backend**
 (tenant, ilk, secretos, spawn de nodos IO, externalize) en nombre de Cloud, hablándole a `SY.admin`.
 Cada nodo IO que provisiona (p.ej. `IO.wapp@<tenant>`) después **tiene su propia vida** — su propio
 adaptador, canal y seguridad.
@@ -29,7 +33,7 @@ adaptador, canal y seguridad.
 ### 1.1 El EDGE es la puerta, no la autoridad
 - Diseño invariante: **el edge es la única puerta de entrada**. Está en un hive `ingress`
   (red física separada), resuelve el **perímetro** (TLS, verificación del token/código, límites,
-  filtrado de headers). `IO.cloud` vive en un worker y **nunca sale directo a internet**.
+  filtrado de headers). `IO.cloud` vive en **motherbee** —es un singleton con `ExecCondition` de rol, no un nodo instanciable en un worker— y **nunca sale directo a internet**.
 - El edge es un **firewall**, no una autoridad: autentica *que el caller es válido* y transporta,
   pero **no** decide *qué puede hacer* (no conoce tenants ni acciones). La **autorización por-tenant**
   vive downstream (`IO.cloud`/`SY.admin`). Esto **no implica tocar el edge** — ya está endurecido
@@ -95,7 +99,7 @@ Fluxbee Cloud (OAuth Google)                INTERNET
       ▼
   ┌─────────┐   HTTPS      ┌──────────────┐  malla (Unicast user-family)  ┌──────────┐
   │  Cliente│─────────────▶│  SY.edge     │──────────────────────────────▶│ IO.cloud │
-  │  Cloud  │◀─────────────│  (ingress)   │◀──────────────────────────────│ (worker) │
+  │  Cloud  │◀─────────────│  (ingress)   │◀──────────────────────────────│(motherbee)│
   └─────────┘   response   │  = firewall  │        response (mismo trace)  └────┬─────┘
                            └──────────────┘                                     │ ADMIN_COMMAND
                                                                                 ▼
