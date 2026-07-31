@@ -34,7 +34,7 @@ infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambi
 | [U-8](#u-8) | 🔴 abierto | Operaciones largas sin progreso consultable · **`update category=core` también da TIMEOUT a los 60 s** | no |
 | [U-9](#u-9) | 🔴 abierto | Las rutas desconocidas devuelven `{"error":"not_found"}` pelado | no |
 | [U-10](#u-10) | ✅ **cerrado y VALIDADO en vivo** | Un upgrade del `.deb` dejaba huérfano a todo nodo runtime | — |
-| [U-11](#u-11) | 🔴 abierto | **IO.cloud no puede auto-publicar su canal**: el gate anti-relay le bloquea `externalize` | sí, sin workaround del operador |
+| [U-11](#u-11) | ✅ **cerrado y VALIDADO en vivo** | IO.cloud no podía auto-publicar su canal | — |
 
 ---
 
@@ -794,5 +794,30 @@ de negarlos de plano. Mantiene intacto el default-deny para el relay (que es lo 
 IO.cloud comprometido) y devuelve la decisión sobre canales propios al gate que ya la sabe tomar,
 con su restricción `owner == caller`.
 
-**No lo hago sin tu visto bueno**: tocar un gate de seguridad marcado como FIX-1 (HIGH) merece
-acuerdo explícito, aunque la separación conceptual parezca clara.
+### ✅ Arreglado y VALIDADO en vivo
+
+Se aplicó la delegación: `authorize_cloud_relay` deja pasar `externalize`/`unexternalize`
+(`CHANNEL_SELF_SERVICE_ACTIONS`) hacia el handler, donde `authorize_channel_command` sigue
+exigiendo `owner == caller`. **No ensancha el relay**: un IO.cloud comprometido sigue sin poder
+tocar una channel ajena ni relayar nada fuera del allowlist.
+
+**Tests que fijan el límite, no el caso feliz:** los dos comandos de channel pasan; `add_hive`,
+`vault_get`, `publish_artifact` y `sync_hint` siguen denegados; y un comando de channel desde un
+caller **no-IO** pasa este gate —no tiene privilegio de relay que contener— para que lo rechace el
+de channel por la regla I1.
+
+**Validación en producción** (0.1.6): se desexternalizó el canal a mano y se reinició el nodo, sin
+tocar nada más.
+
+```text
+INFO  IO.cloud own channel ICH enabled — ready to externalize on SY.edge
+WARN  externalize rejected by a retryable edge condition; retrying        attempts=1
+INFO  externalize OK (authenticated Cloud URL published on the edge)      attempts=2
+```
+
+Ya no hay `UNAUTHORIZED`. El primer intento pegó contra un edge momentáneamente no resoluble y **el
+reintento propio del nodo lo resolvió** — la lógica de retry funcionando como se diseñó. Después,
+desde internet: sin credencial `401`, con bearer un `create_tenant` completo con `tenant_id` nuevo.
+
+⇒ **El operador ya no tiene que publicar el canal a mano.** El paso 2 del checklist de
+[`docs/io-cloud-api.md`](../../docs/io-cloud-api.md) §5 queda obsoleto a partir de 0.1.6.
