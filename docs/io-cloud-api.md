@@ -99,6 +99,41 @@ URL       https://hive-k3m9x7q2.fluxbee.ai/e/ich:14b66389-d425-531c-a140-a591d25
 Bearer    lo entrega el operador del hive — no se publica acá
 ```
 
+### 2.1 De dónde sale el bearer, y qué implica
+
+Conviene saberlo porque determina qué pasa cuando hay que rotarlo. 🔵 código, 🟢 confirmado en vivo.
+
+```text
+1. ORIGEN      /etc/fluxbee/io-cloud.env  →  IO_CLOUD_SECRET     lo escribe el operador
+2. PUBLICACIÓN IO.cloud se lo pasa a SY.admin UNA vez, al publicar el canal
+3. GUARDADO    SY.admin lo escribe en el vault del hive bajo `edge_channel_secret:<ich>`
+               (resource_type: bearer_token, propiedad del nodo de borde)
+4. LA PUERTA   guarda solo el NOMBRE de esa clave en su tabla de rutas.
+               El valor vive en memoria y NUNCA se escribe en el disco de la zona expuesta.
+5. REINICIO    la puerta vuelve a leer el valor del vault por ese nombre
+```
+
+**El archivo de entorno es la semilla, no el almacenamiento.** El registro de verdad es el vault
+del hive.
+
+Tres consecuencias prácticas:
+
+- **Sobrevive reinicios.** 🟢 Se reinició el servicio de borde en producción y el endpoint siguió
+  respondiendo `200` sin intervención: el valor se re-leyó del vault.
+- **Nadie puede recuperarlo.** Una vez guardado, **ni el administrador del hive puede leerlo** — el
+  vault no tiene bypass para ese secreto. Si lo pierden, no se recupera: **se rota**.
+- **Al rotar hay 10 minutos de gracia.** El secreto anterior sigue siendo aceptado durante ese rato,
+  así que un cliente en vuelo no recibe un `401` en el instante del cambio. Pero **no confíen en eso
+  como estrategia**: es una red de seguridad para el corte, no una ventana de migración.
+
+> ⚠️ **Cuidado al re-publicar el canal.** Si el operador lo re-externaliza **sin** pasar el mismo
+> secreto, el hive **acuña uno nuevo** y el bearer que ustedes tienen deja de servir. Es un residual
+> conocido del lado del hive (no pueden detectarlo desde afuera salvo por el `401`). Si les empieza
+> a fallar la autenticación de golpe y sin cambios de su lado, **pregunten si alguien re-publicó el
+> canal**.
+
+---
+
 ---
 
 ## 3. ⚠️ El modelo de errores — leer antes de escribir el cliente
