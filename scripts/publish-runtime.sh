@@ -14,6 +14,9 @@ Required:
 Options:
   --dist-root <path>       Dist root path (default: /var/lib/fluxbee/dist)
   --set-current            Set this version as manifest.runtimes.<runtime>.current
+  --prune-missing          Drop `available` versions of THIS runtime whose directory is gone
+                           (requires --set-current). Used by the .deb install-time seed to
+                           retire the base version dpkg just removed during unpack.
   --sudo                   Use sudo for writes to dist paths
   -h, --help               Show this help
 
@@ -36,6 +39,7 @@ VERSION=""
 BINARY=""
 DIST_ROOT="/var/lib/fluxbee/dist"
 SET_CURRENT=0
+PRUNE_MISSING=0
 USE_SUDO=0
 
 while [[ $# -gt 0 ]]; do
@@ -55,6 +59,10 @@ while [[ $# -gt 0 ]]; do
     --dist-root)
       DIST_ROOT="${2:-}"
       shift 2
+      ;;
+    --prune-missing)
+      PRUNE_MISSING=1
+      shift
       ;;
     --set-current)
       SET_CURRENT=1
@@ -82,6 +90,11 @@ if [[ -z "$RUNTIME" || -z "$VERSION" || -z "$BINARY" ]]; then
   exit 1
 fi
 
+if [[ "$PRUNE_MISSING" == "1" && "$SET_CURRENT" != "1" ]]; then
+  echo "Error: --prune-missing requires --set-current" >&2
+  exit 1
+fi
+
 if [[ ! -f "$BINARY" ]]; then
   echo "Error: binary does not exist: $BINARY" >&2
   exit 1
@@ -103,7 +116,12 @@ BINARY_NAME="$(basename "$BINARY")"
 START_SH="$BIN_DIR/start.sh"
 
 $SUDO install -d "$BIN_DIR"
-$SUDO install -m 0755 "$BINARY" "$BIN_DIR/$BINARY_NAME"
+# `--binary` may already BE the destination: the .deb ships the artifact tree and then
+# registers it in place at install time (packaging/fluxbee-seed-runtimes). GNU install
+# refuses src==dest with "are the same file", which would fail every postinst.
+if [[ ! "$BINARY" -ef "$BIN_DIR/$BINARY_NAME" ]]; then
+  $SUDO install -m 0755 "$BINARY" "$BIN_DIR/$BINARY_NAME"
+fi
 
 tmp_start="$(mktemp)"
 cat >"$tmp_start" <<EOF
@@ -116,7 +134,7 @@ $SUDO install -m 0755 "$tmp_start" "$START_SH"
 rm -f "$tmp_start"
 
 tmp_manifest="$(mktemp)"
-python3 - "$MANIFEST_PATH" "$RUNTIME" "$VERSION" "$SET_CURRENT" >"$tmp_manifest" <<'PY'
+python3 - "$MANIFEST_PATH" "$RUNTIME" "$VERSION" "$SET_CURRENT" "$RUNTIMES_ROOT" "$PRUNE_MISSING" >"$tmp_manifest" <<'PY'
 import datetime
 import json
 import pathlib
@@ -165,6 +183,17 @@ if not isinstance(available, list):
 available = [str(v) for v in available if str(v).strip()]
 if version not in available:
     available.append(version)
+
+# --prune-missing: retire versions of THIS runtime whose artifact directory is gone. Scoped to
+# the runtime being published, so a hot-published entry is never touched. The version being
+# published is always kept (its bin dir was just created).
+if len(sys.argv) > 6 and sys.argv[6] == "1":
+    runtimes_root = pathlib.Path(sys.argv[5])
+    available = [
+        v for v in available
+        if v == version or (runtimes_root / runtime / v).is_dir()
+    ]
+
 entry["available"] = sorted(set(available))
 
 if set_current or not isinstance(entry.get("current"), str) or not entry.get("current"):

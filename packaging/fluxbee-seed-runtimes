@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# Register the .deb's base runtimes into the LIVE dist manifest (idempotent).
+#
+# WHY THIS EXISTS (U-3). The package used to ship dist/runtimes/manifest.json as payload, so
+# every upgrade replaced operator state wholesale and orphaned hot-published runtimes. The
+# manifest is operator state, not payload: the .deb now ships only the artifact tree
+# (dist/runtimes/<runtime>/<version>/bin/) and REGISTERS it here, at install time, against the
+# live root — merging instead of replacing.
+#
+# It does not merge anything itself. It calls scripts/publish-runtime.sh, the merger that
+# already existed and that scripts/install.sh has always used this way; the .deb was the
+# outlier, running that same loop at BUILD time against the staged tree (where there is never
+# anything to merge with). There are already two mergers in this tree — do not write a third.
+#
+#   sudo fluxbee-seed-runtimes        # also the operator's repair/re-run surface
+#
+# Env (all default-with-override, same idiom as fluxbee-firstboot):
+#   FLUXBEE_BASE_NODES, FLUXBEE_DIST_ROOT, FLUXBEE_PUBLISH_RUNTIME,
+#   FLUXBEE_BASE_RUNTIME_VERSION, FLUXBEE_MANIFEST_SNAPSHOT
+set -uo pipefail
+
+MANIFEST="${FLUXBEE_BASE_NODES:-/usr/share/fluxbee/base-nodes.json}"
+DIST_ROOT="${FLUXBEE_DIST_ROOT:-/var/lib/fluxbee/dist}"
+PUBLISH="${FLUXBEE_PUBLISH_RUNTIME:-/usr/share/fluxbee/publish-runtime.sh}"
+VERSION_FILE="${FLUXBEE_BASE_RUNTIME_VERSION_FILE:-/usr/share/fluxbee/base-runtime-version}"
+SNAPSHOT="${FLUXBEE_MANIFEST_SNAPSHOT:-/var/lib/fluxbee/state/runtime-manifest.preupgrade.json}"
+
+RUNTIMES_ROOT="$DIST_ROOT/runtimes"
+LIVE_MANIFEST="$RUNTIMES_ROOT/manifest.json"
+
+VER="${FLUXBEE_BASE_RUNTIME_VERSION:-}"
+[ -n "$VER" ] || VER="$(cat "$VERSION_FILE" 2>/dev/null || true)"
+if [ -z "$VER" ]; then
+  echo "fluxbee-seed-runtimes: cannot determine the base runtime version (no \$FLUXBEE_BASE_RUNTIME_VERSION, no $VERSION_FILE)" >&2
+  exit 1
+fi
+if [ ! -f "$MANIFEST" ]; then
+  echo "fluxbee-seed-runtimes: base node manifest not found: $MANIFEST" >&2
+  exit 1
+fi
+if [ ! -f "$PUBLISH" ]; then
+  echo "fluxbee-seed-runtimes: runtime publisher not found: $PUBLISH" >&2
+  exit 1
+fi
+
+# Same view-reader shape as fluxbee-firstboot:22-35.
+mf() { # runtimes -> "<runtime>\t<bin>" for every entry that names a runtime
+  python3 - "$MANIFEST" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+for e in m.get("runtimes", []):
+    rt = e.get("runtime") or ""
+    if rt:
+        print("%s\t%s" % (rt, e.get("bin", "")))
+PY
+}
+
+# Read one runtime's currently-recorded `current`, so a demotion can be reported.
+current_of() {
+  python3 - "$LIVE_MANIFEST" "$1" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+entry = (doc.get("runtimes") or {}).get(sys.argv[2]) or {}
+print(entry.get("current") or "")
+PY
+}
+
+install -d "$RUNTIMES_ROOT" 2>/dev/null || true
+
+# (1) Restore the pre-upgrade snapshot ONLY when dpkg removed the manifest as an obsolete
+#     file. Never overwrite a manifest that is present — that would be the clobber again.
+if [ ! -f "$LIVE_MANIFEST" ] && [ -f "$SNAPSHOT" ]; then
+  install -m 0644 "$SNAPSHOT" "$LIVE_MANIFEST"
+  echo "fluxbee-seed-runtimes: restored the pre-upgrade runtimes manifest from $SNAPSHOT"
+fi
+
+rc=0
+demotions=""
+published=0
+
+while IFS=$'\t' read -r rt bin; do
+  [ -n "${rt:-}" ] && [ -n "${bin:-}" ] || continue
+  bin_path="$RUNTIMES_ROOT/$rt/$VER/bin/$bin"
+  if [ ! -f "$bin_path" ]; then
+    echo "fluxbee-seed-runtimes: ERROR missing artifact for $rt $VER: $bin_path" >&2
+    rc=1
+    continue
+  fi
+
+  was="$(current_of "$rt")"
+
+  # --set-current is REQUIRED, not optional: dpkg just deleted the previous base version's
+  # directory during unpack, so leaving `current` pointing at it makes every base node
+  # unstartable — U-10 for the whole base set.
+  if bash "$PUBLISH" \
+      --runtime "$rt" \
+      --version "$VER" \
+      --binary "$bin_path" \
+      --dist-root "$DIST_ROOT" \
+      --set-current \
+      --prune-missing >/dev/null; then
+    published=$((published + 1))
+    if [ -n "$was" ] && [ "$was" != "$VER" ]; then
+      demotions="$demotions  NOTE: base runtime $rt 'current' moved $was -> $VER (package authority)"$'\n'
+    fi
+  else
+    echo "fluxbee-seed-runtimes: ERROR publish failed for $rt $VER" >&2
+    rc=1
+  fi
+done < <(mf runtimes)
+
+[ -n "$demotions" ] && printf '%s' "$demotions"
+echo "fluxbee-seed-runtimes: registered $published base runtime(s) at $VER into $LIVE_MANIFEST"
+
+# Keep the snapshot on failure so the run stays retryable with the pre-upgrade state intact.
+if [ "$rc" -eq 0 ]; then
+  rm -f "$SNAPSHOT"
+else
+  echo "fluxbee-seed-runtimes: FAILED (rc=$rc). Snapshot kept at $SNAPSHOT." >&2
+  echo "  repair:  sudo fluxbee-seed-runtimes && sudo systemctl restart sy-orchestrator" >&2
+fi
+exit "$rc"

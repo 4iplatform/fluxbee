@@ -18,6 +18,19 @@ for d in state/nodes state/cookbook state/sy-admin state/sy-edge hives opa/curre
          dist/runtimes dist/vendor; do
     install -d "/var/lib/fluxbee/$d"
 done
+
+# U-3: register this package's base runtimes into the LIVE dist manifest (merge, never replace).
+# Runs BEFORE the chown below so ownership covers what it writes, and BEFORE any service starts
+# so the orchestrator never observes a manifest without its base runtimes. There is no race:
+# the old prerm already stopped every unit, so nothing can read or write the manifest right now.
+seed_rc=0
+if [ -x /usr/share/fluxbee/fluxbee-seed-runtimes ]; then
+    /usr/share/fluxbee/fluxbee-seed-runtimes || seed_rc=$?
+else
+    echo "fluxbee: ERROR /usr/share/fluxbee/fluxbee-seed-runtimes missing; base runtimes are NOT registered" >&2
+    seed_rc=1
+fi
+
 install -d /run/fluxbee/routers
 chown -R fluxbee:fluxbee \
     /var/lib/fluxbee/syncthing \
@@ -45,4 +58,15 @@ if [ -d /run/systemd/system ]; then
 fi
 
 echo "fluxbee installed. Edit /etc/fluxbee/hive.yaml, then run:  sudo fluxbee-firstboot"
+
+# Report the seed failure LAST. The box must still come up (never leave it half-installed and
+# stopped), so the services above were enabled and started regardless; exiting non-zero here
+# makes `dpkg --configure -a` retry the idempotent seed.
+if [ "$seed_rc" -ne 0 ]; then
+    echo "fluxbee: base runtime registration FAILED — base nodes will report RUNTIME_NOT_AVAILABLE." >&2
+    echo "  repair:  sudo fluxbee-seed-runtimes && sudo systemctl restart sy-orchestrator" >&2
+    echo "  or:      sudo dpkg --configure -a" >&2
+    exit "$seed_rc"
+fi
+
 exit 0

@@ -113,6 +113,13 @@ while IFS=$'\t' read -r rt crate bin ws lang boot inst; do
     --set-current
 done < <(mf runtimes)
 
+# U-3: the runtimes manifest is OPERATOR STATE, never payload. Shipping it made every upgrade
+# replace the live manifest, orphaning hot-published runtimes (and the U-10 fix does not rescue
+# them: reconcile resolves the runtime KEY before the version). The .deb ships only the artifact
+# tree above; packaging/fluxbee-seed-runtimes registers it into the LIVE manifest at install
+# time, via the same merger scripts/install.sh has always used.
+rm -f "$DEST/var/lib/fluxbee/dist/runtimes/manifest.json"
+
 # dist/core manifest with the staged binaries' real hashes (baked in).
 python3 - "$DEST/var/lib/fluxbee/dist/core" "$VERSION" "$BUILD_ID" <<'PY'
 import json, hashlib, os, sys
@@ -268,6 +275,14 @@ ln -sf ../share/fluxbee/fluxbee-firstboot "$DEST/usr/bin/fluxbee-firstboot"
 # The base-node manifest travels to the target too: fluxbee-firstboot reads it to know which
 # runtimes to auto-spawn as default instances at boot (boot=true) and under which names.
 install -m0644 packaging/base-nodes.json "$DEST/usr/share/fluxbee/base-nodes.json"
+# U-3: the install-time runtime registrar and the merger it calls. Same shape as
+# fluxbee-firstboot above (shipped under /usr/share/fluxbee with a /usr/bin symlink) — it is
+# also the operator's repair surface: `sudo fluxbee-seed-runtimes`.
+install -m0755 scripts/publish-runtime.sh "$DEST/usr/share/fluxbee/publish-runtime.sh"
+install -m0755 packaging/fluxbee-seed-runtimes "$DEST/usr/share/fluxbee/fluxbee-seed-runtimes"
+ln -sf ../share/fluxbee/fluxbee-seed-runtimes "$DEST/usr/bin/fluxbee-seed-runtimes"
+printf '%s\n' "$VERSION" > "$DEST/usr/share/fluxbee/base-runtime-version"
+chmod 0644 "$DEST/usr/share/fluxbee/base-runtime-version"
 
 echo "== [4/5] debian metadata =="
 INSTALLED_KB="$(du -sk "$DEST" | awk '{print $1}')"
@@ -291,6 +306,7 @@ Description: Fluxbee internal-network orchestration mesh
 EOF
 # /etc/fluxbee/* is config — track example as conffile so upgrades don't clobber.
 echo "/etc/fluxbee/hive.yaml.example" > "$DEST/DEBIAN/conffiles"
+install -m0755 packaging/deb-preinst "$DEST/DEBIAN/preinst"
 install -m0755 packaging/deb-postinst "$DEST/DEBIAN/postinst"
 install -m0755 packaging/deb-prerm "$DEST/DEBIAN/prerm"
 
@@ -323,5 +339,18 @@ if [ "$OUT_BYTES" -lt $((50 * 1024 * 1024)) ] || ! dpkg-deb -c "$OUT" >/dev/null
   rm -f "$OUT"
   exit 1
 fi
+# U-3 guard: the runtimes manifest must NEVER be payload again (that is exactly how it got
+# there in 23c4175). Capture instead of piping into grep -q: under `set -o pipefail` a SIGPIPE
+# to dpkg-deb would make the pipeline non-zero even on a HIT, silently disarming the check.
+payload_manifest="$(dpkg-deb -c "$OUT" | awk '{print $NF}' | grep -x './var/lib/fluxbee/dist/runtimes/manifest.json' || true)"
+if [ -n "$payload_manifest" ]; then
+  echo "ERROR: dist/runtimes/manifest.json is in the package payload (U-3)." >&2
+  echo "       It is operator state: shipping it clobbers hot-published runtimes on upgrade." >&2
+  echo "       The artifact tree ships; the manifest is merged at install time by" >&2
+  echo "       packaging/fluxbee-seed-runtimes. Removing the package; NOT usable." >&2
+  rm -f "$OUT"
+  exit 1
+fi
+
 echo "built: $OUT ($((OUT_BYTES/1024/1024)) MB)"
 dpkg-deb --info "$OUT" | sed -n '1,12p'

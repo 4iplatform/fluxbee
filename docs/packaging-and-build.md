@@ -79,8 +79,21 @@ Requisitos:
    unit systemd, y sumarlo al allowlist `MOTHERBEE_PACKAGED_NON_SYSTEM_NODES` en
    `src/bin/sy_orchestrator.rs` + a `system_nodes` de `packaging/hive.yaml.example`.
 
-`build-deb.sh` compila el crate, lo hornea/publica según su clase, e instala el manifest al
-target; `fluxbee-firstboot` lo arranca/spawnea. **No hay que tocar el script de build.**
+`build-deb.sh` compila el crate y lo hornea/publica según su clase; `fluxbee-firstboot` lo
+arranca/spawnea. **No hay que tocar el script de build.**
+
+> **Invariante (U-3): `dist/runtimes/manifest.json` es ESTADO DEL OPERADOR, nunca payload del
+> paquete.** El `.deb` envía solo el árbol de artefactos (`dist/runtimes/<runtime>/<versión>/`) y
+> lo **registra en tiempo de instalación** con `fluxbee-seed-runtimes`, que **mergea** contra el
+> manifest vivo llamando al único merger (`scripts/publish-runtime.sh`) — el mismo camino que
+> `scripts/install.sh` ya usaba. Empaquetarlo lo **reemplazaba** en cada upgrade y dejaba
+> huérfano todo runtime publicado en caliente. `build-deb.sh` tiene un guard post-build que
+> rechaza el paquete si el manifest vuelve a colarse en el payload.
+>
+> `packaging/deb-preinst` saca una copia del manifest vivo **antes** del unpack. No es opcional:
+> al dejar de ser payload, dpkg lo trata como *obsolete file* y lo **borra** en el primer upgrade
+> al paquete arreglado; y solo el `preinst` del paquete NUEVO corre a tiempo, porque los scripts
+> del que ya está instalado no se pueden cambiar retroactivamente.
 
 Un nodo que NO esté en el set base igual se puede sumar a un backend ya instalado por el canal
 de runtimes (`scripts/publish-runtime.sh` + `POST /hives/{id}/update category=runtime`), sin
@@ -218,6 +231,10 @@ problema de quien conecte una Cloud, no del backend.
 - [`packaging/base-nodes.json`](../packaging/base-nodes.json) — el set base declarativo.
 - [`packaging/build-deb.sh`](../packaging/build-deb.sh) — build del `.deb` (lee el manifest).
 - [`packaging/fluxbee-firstboot`](../packaging/fluxbee-firstboot) — bootstrap + auto-spawn.
+- [`packaging/fluxbee-seed-runtimes`](../packaging/fluxbee-seed-runtimes) — registra los runtimes
+  base en el manifest **vivo** en tiempo de instalación (merge, no reemplazo). También es la
+  superficie de reparación del operador: `sudo fluxbee-seed-runtimes`.
+- [`packaging/deb-preinst`](../packaging/deb-preinst) — copia el manifest vivo antes del unpack.
 - [`scripts/make-deb.sh`](../scripts/make-deb.sh) — entrypoint de build para devs.
 - [07-operaciones.md](07-operaciones.md) — deploy y ciclo de vida (add_hive, update, roles).
 - [14-runtime-rollout-motherbee.md](14-runtime-rollout-motherbee.md) — canal de update de runtimes.
