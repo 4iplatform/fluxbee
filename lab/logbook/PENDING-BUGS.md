@@ -9,16 +9,29 @@ infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambi
 
 **Estados:** 🔴 abierto · 🟡 mitigado (anda, pero el arreglo correcto está pendiente) · ✅ cerrado
 
+> **⚠️ Auditoría adversarial del 2026-08-03**
+>
+> Los 12 hallazgos abiertos se sometieron a un intento sistemático de **refutación** (regla 0d de
+> [METHOD.md](METHOD.md)). Resultado: **solo 2 sobrevivieron intactos** (U-3, U-9); los otros 10
+> tenían algo cierto adentro pero el **encuadre, la causa o el arreglo mal** — y **tres de los
+> arreglos propuestos eran peligrosos de implementar** (PB-6, PB-8, U-4).
+>
+> Patrón: *en 6 de 12, el bug real estaba en el mismo archivo, a pocas líneas — y no se vio porque
+> ya estaba la hipótesis escrita.* Las entradas de abajo son las **reescritas**; cada una dice qué
+> se borró y por qué.
+
 | id | estado | tema | bloquea |
 |---|---|---|---|
 | [PB-1](#pb-1) | 🟡 mitigado | SY.edge no recarga el cert TLS al rotar en el vault | no |
-| [PB-2](#pb-2) | 🔴 abierto | `vault_put` no valida el material TLS que acepta | no |
-| [PB-3](#pb-3) | 🔴 abierto | `tls` no es un `resource_type` de primera clase | no |
-| [PB-4](#pb-4) | 🔴 abierto | `sy-edge` crash-loopea en el arranque en frío esperando al vault | no |
-| [PB-5](#pb-5) | 🔴 abierto | El orchestrator no configura placas de red secundarias (`A-1`) | no |
-| [PB-6](#pb-6) | 🔴 abierto | `harden_ssh` viene en `false` por defecto (`A-2`) | no |
-| [PB-7](#pb-7) | 🔴 abierto | Timeout del admin (180 s) vs. las esperas internas de `add_hive` (`A-3`) | no |
-| [PB-8](#pb-8) | 🔴 abierto | `egress.gateway_ip` no se propaga a motherbee (`A-4`) | no |
+| [PB-2](#pb-2) | 🟡 reescrito | Nadie verifica la **completitud** de la cadena TLS (el validador propuesto no la atajaba) | no |
+| [PB-3](#pb-3) | 🟢 cosmético | El enum `ResourceType` derivó · **sin impacto funcional** | no |
+| [PB-4](#pb-4) | ✅ **CERRADO** | El arranque en frío **se veía** como falla: el edge culpaba al vault sin motivo | — |
+| [PB-5](#pb-5) | 🟡 reescrito | El egress reporta `nat_applied: true` sin verificar su pata LAN | no |
+| [PB-6](#pb-6) | 🟡 reescrito | `ssh_password` no se cierra solo · **⛔ invertir el default deja cajas sin acceso** | no |
+| [PB-6b](#pb-6b) | ✅ **CERRADO** | `harden_ssh_applied` era un eco del request: reportaba `false` con el password auth ya apagado | — |
+| [PB-7](#pb-7) | 🔴 abierto | `add_hive` (>6 min) desborda la ventana del admin (180 s) **y bloquea el canal** | no |
+| [PB-8](#pb-8) | 🟡 reescrito | El egress no tiene historia para motherbee · **⛔ propagarle la ruta = lockout** | no |
+| [PB-9](#pb-9) | 🔴 abierto | Todo restart de `sy-vault` recicla un edge sano → bache en el HTTPS público | no |
 
 ### Serie U — el sistema de update (auditado 2026-07-30, antes de usarlo)
 
@@ -26,13 +39,17 @@ infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambi
 |---|---|---|---|
 | [U-1](#u-1) | ✅ **cerrado y VALIDADO en vivo** | El update del core reportaba éxito sin reiniciar nada | — |
 | [U-2](#u-2) | ✅ **cerrado** | Ingress y egress no tenían canal de core · resuelto partiendo `dist` por contenido + core por rol | — |
-| [U-3](#u-3) | 🔴 abierto | El `.deb` pisa `dist/runtimes/manifest.json` y borra lo publicado en caliente | no (hoy) |
-| [U-4](#u-4) | 🔴 abierto | Cero verificación de compatibilidad de versión entre motherbee y spokes | no |
-| [U-5](#u-5) | 🔴 abierto | No hay rollback de core como comando | no |
+| [U-3](#u-3) | 🔴 **sobrevive** | El `.deb` pisa `dist/runtimes/manifest.json` · **el arreglo de U-10 NO lo cubre** · toca packaging | **sí**, apenas exista un runtime publicado en caliente |
+| [U-4a](#u-4a) | 🟢 reescrito | El HELLO lleva `protocol` y nadie lo mira · **⛔ rechazar el peer = self-fencing** | no |
+| [U-4b](#u-4b) | 🔴 abierto | **Las drift-alerts no se escriben nunca**: `GET /drift-alerts` devuelve un snapshot disfrazado de historial | no |
+| [U-5](#u-5) | 🟡 gap | No hay rollback de core como comando · **⛔ "restaurar el último backup" repetiría U-1** | no |
+| [U-5b](#u-5b) | ✅ **CERRADO** | Los backups de core se acumulaban sin GC **y se creaban vacíos en cada no-op** | — |
 | [U-6](#u-6) | 🟡 mitigado | La carrera era **el orquestador contra sí mismo**: escritura no atómica de 35 MB | — |
 | [U-7](#u-7) | ✅ **cerrado** | El watchdog reiniciaba syncthing cada ~7 s por una carpeta inexistente | — |
-| [U-8](#u-8) | 🔴 abierto | Operaciones largas sin progreso consultable · **`update category=core` también da TIMEOUT a los 60 s** | no |
-| [U-9](#u-9) | 🔴 abierto | Las rutas desconocidas devuelven `{"error":"not_found"}` pelado | no |
+| [U-8a](#u-8a) | 🟡 abierto | La API de admin no tiene contrato para operaciones largas · se cierra con [PB-7](#pb-7) | no |
+| [U-8b](#u-8b) | 🟡 reescrito | `update category=core` da TIMEOUT a los 60 s · **la causa que estaba escrita era falsa** | no |
+| [U-8c](#u-8c) | ✅ **CERRADO** | El `timeout_unknown` del architect estaba **muerto** por un substring imposible | — |
+| [U-9](#u-9) | ✅ **CERRADO** | El catch-all rompía el envelope **y daba 404 donde correspondía 405** | — |
 | [U-10](#u-10) | ✅ **cerrado y VALIDADO en vivo** | Un upgrade del `.deb` dejaba huérfano a todo nodo runtime | — |
 | [U-11](#u-11) | ✅ **cerrado y VALIDADO en vivo** | IO.cloud no podía auto-publicar su canal | — |
 | [U-12](#u-12) | 🟡 corregido | La carrera existe, pero **hay una llamada atómica que la evita** y yo no la encontré | no |
@@ -109,102 +126,308 @@ casa no bloquea. La rotación del cert es anual (Sectigo), así que el reinicio 
 ---
 
 <a id="pb-2"></a>
-## PB-2 🔴 — `vault_put` acepta material TLS sin validarlo
+## PB-2 🟡 — Nadie verifica la **completitud** de la cadena TLS: una cadena truncada entra al vault y el edge la sirve sin quejarse
+
+> **Reescrito el 2026-08-03 tras auditoría adversarial.** El hallazgo original (*"`vault_put` acepta
+> material TLS sin validarlo"*) proponía un validador que **no habría atajado el archivo roto del
+> operador**. Se verificó ejecutando el caso real.
 
 **Cómo apareció.** El `.crt` de cadena completa que entregó el operador venía **mal formado**: el
-`-----END CERTIFICATE-----` del leaf y el `-----BEGIN CERTIFICATE-----` del intermedio estaban
-**pegados en el mismo renglón**, más CRLF mezclado. Con eso `openssl` lee **cero** certificados del
-archivo. (Se normalizó antes de cargarlo; la cadena en sí era correcta.)
+`END CERTIFICATE` del leaf y el `BEGIN CERTIFICATE` del intermedio estaban **pegados en el mismo
+renglón**, más CRLF mezclado. `openssl` lee **cero** certificados de ese archivo.
 
-**El problema de producto.** `vault_put` con `resource_type=tls` acepta cualquier string. Si ese
-archivo roto se cargaba tal cual, el `put` respondía `ok` y el fallo aparecía **mucho después**, al
-próximo boot del edge, con un síntoma que no menciona al vault para nada: *"el edge no levanta
-HTTPS"*. Y como el edge es *fail-closed*, eso es directamente la puerta pública caída.
+**Lo que es cierto.** `vault_put` no inspecciona `value` (`sy_vault.rs:752-798`).
 
-**Arreglo propuesto.** Que `vault_put` valide según `resource_type` antes de escribir: para `tls`,
-que `value.cert` parsee como una cadena PEM no vacía, que `value.key` parsee como clave privada, y
-que **el modulus coincida**. Rechazar con un error claro. Es el mismo espíritu *fail-loud* que ya
-tiene el resto del sistema — mover el fallo al momento del `put`, donde el operador lo puede
-corregir, en vez de al boot del edge.
+**Lo que era falso y se borró:**
 
-Vale la pena mirarlo como un seam general (`validate_secret_value(resource_type, value)`) para que
-sirva también a `postgres` (la regla de "credenciales + host, sin dbname" hoy vive solo en la
-documentación de la acción, no en un validador).
+- *"El material TLS no se valida."* Sí se valida, al resolver: cadena no vacía, key parseable y
+  coincidencia key/cert por SPKI, vía `CertifiedKey::from_der` (`sy_edge.rs:1642-1652`). La familia
+  entera valida **al resolver, no al escribir** — es el contrato deliberado del vault (*"The vault
+  does not interpret it"*, `docs/sy-vault-spec.md:177`).
+- *"El fallo aparece mucho después."* Post-PB-1 el `put` dispara `exit(0)` y el material se valida a
+  los segundos (`sy_edge.rs:461-475`).
+- *"El síntoma no menciona al vault."* `sy_edge.rs:276/288` lo nombran.
+- *"A `postgres` también le falta validador."* Existe (`sy_storage.rs:2463-2467`).
+
+**Por qué el arreglo propuesto no servía — probado, no razonado.** Con `END`/`BEGIN` pegados,
+`rustls_pemfile::certs` devuelve **`Ok` con 1 certificado y sin error** (openssl: 0). O sea "cadena
+no vacía + key parsea + modulus coincide" da **OK sobre el archivo roto**, y el edge levanta HTTPS
+sirviendo **solo el leaf**. No es la puerta caída: es una falla **silenciosa** que rompe a los
+clientes estrictos.
+
+**El arreglo que sí vale:**
+
+- **(a)** En `sy_edge.rs::tls_config_from_pem`: contar los marcadores `BEGIN CERTIFICATE` del PEM y
+  compararlos con los certificados que devolvió el parser. Si no coinciden → fallar fuerte (el PEM
+  se truncó en silencio). Si la cadena tiene un solo cert → WARN explícito *"leaf sin intermedios:
+  los clientes estrictos van a fallar"*. Ataja el caso real, y vale tanto para el vault como para el
+  disco.
+- **(b)** *Opcional, decisión del operador* — el mismo chequeo como pre-flight del `put`, o mejor un
+  seam en el SDK que llamen los dos para que no puedan divergir. **Rompe la opacidad declarada del
+  vault**, por eso no se hace sin OK.
+- **(c)** Anotar la **asimetría fail-closed**: un `delete` está deliberadamente protegido de tirar la
+  puerta pública (`sy_edge.rs:476-481`), pero un `put` inválido **sí la tira**, y post-PB-1 de
+  inmediato: `exit(0)` → boot → `Err` en main → crash loop. O el boot degrada como el `delete`
+  (conservar el último material bueno), o se documenta que la recuperación es `vault_rollback`.
 
 ---
 
 <a id="pb-3"></a>
-## PB-3 🔴 — `tls` no es un `resource_type` conocido por el SDK
+## PB-3 🟢 — El enum `ResourceType` derivó respecto de lo que el propio producto escribe
 
-La ayuda de `vault_put` lista los tipos canónicos (`postgres`, `openai`, `slack`, `bearer_token`, …)
-y aclara que los strings desconocidos *"se permiten solo como escape hatch"*. **`tls` no está en la
-lista** — pero es el tipo que consume `SY.edge`, un componente del core, para la puerta pública.
+> **Degradado de 🔴 a cosmético/documental el 2026-08-03.** No tiene impacto funcional.
 
-Está funcionando como escape hatch. Debería ser de primera clase: es un recurso del propio producto,
-no una integración de terceros. Se relaciona con PB-2: sin tipo canónico no hay dónde colgar el
-validador.
+**Hecho.** Al menos cuatro tipos que produce o consume el propio producto no están en `ResourceType`
+(`crates/fluxbee_sdk/src/vault.rs:40-87`) ni en la ayuda de `vault_put`: `tls`, `ssh`
+(`sy_orchestrator.rs:20649`), `whatsapp` (`io-wapp/src/main.rs:62`) y `linkedhelper_adapter`. La
+ayuda los llama *"escape hatch"* mientras la casa los usa como camino normal.
+
+**Lo que NO es.** No hay impacto funcional: `known_wire_values()` **no tiene llamadores**, el vault
+filtra por igualdad de string normalizado (`sy_vault.rs:1102-1110`), y un `Custom` se comporta
+idéntico a una variante nombrada. En particular **`tls` no lo consume nadie**: SY.edge se enlaza por
+`tls_vault_key` y matchea **por key**, no por `resource_type` — la decisión deliberada que ya
+documenta PB-1.
+
+**Se borró el link a PB-2:** el validador de PB-2 cuelga del string normalizado y se puede
+implementar hoy con `Custom("tls")`. Que `tls` no esté en el enum **no bloquea nada**.
+
+**Arreglo (elegir uno).** (a) Promover las cuatro a variantes y que `known_wire_values()` deje de ser
+código muerto — p.ej. WARN cuando admin cae en `Custom`; o (b) reescribir la ayuda para que "custom
+normalizado" sea un camino de primera clase y documentar la *value-shape* de cada tipo (a `tls` le
+falta la fila `{cert, key}`).
 
 ---
 
 <a id="pb-4"></a>
-## PB-4 🔴 — `sy-edge` crash-loopea en el arranque en frío esperando al vault
+## PB-4 🟡 — El arranque en frío del ingress **se ve** como una falla: el edge dice "arreglá el vault" cuando no hay nada que arreglar
 
-**Observado** tras el reboot del host del 2026-07-30 (las 4 VMs arrancaron en frío a la vez):
+> **Reescrito el 2026-08-03.** Se le sacó el título causal: lo que el hallazgo pedía revisar **ya
+> existe y es deliberado**.
 
-```text
-sy-edge.service: Failed with result 'exit-code'.
-sy-edge.service: Scheduled restart job, restart counter is at 9.
-```
+**Observado** tras el reboot del host del 2026-07-30: `restart counter is at 9`, y terminó levantando
+solo, sin intervención.
 
-Terminó levantando bien y el mesh reconectó solo — **no hubo intervención manual**. Pero nueve
-reinicios para llegar ahí es mucho ruido para un arranque normal, y confunde el diagnóstico: si
-alguien mira el journal en ese momento, ve un servicio "fallando".
+**Lo que NO es.** No falta esperar al vault: la espera **es** el reintento. `Restart=always` +
+`RestartSec=5` se eligió porque el hive ingress no tiene `sy-vault` local y systemd no puede ordenar
+una dependencia cross-hive (`docs/edge-ingress-spec-v6.md:381-386`). Tampoco falta backoff:
+`RestartSec=5` es justo lo que mantiene la unit **bajo el rate-limit** de systemd (5 arranques/10 s),
+por eso 9 reinicios se curan solos y nunca latchean en `failed`. Ventana total ~45 s.
 
-**A revisar:** si hay backoff, si el edge debería esperar al vault en vez de morir, y si el
-`exit(0)` de PB-1 se distingue con claridad de estos fallos en el log y en el contador de restarts
-de systemd.
+**El defecto real, chico y concreto.** `sy_edge.rs:304-307` imprime la misma frase — *"Fix the vault
+secret / cert files and restart."* — tanto cuando el vault todavía no es alcanzable (transitorio, se
+cura solo) como cuando el cert está roto de verdad (hace falta el operador). En el arranque en frío
+esa instrucción **es falsa**, y es la única fuente del ruido.
+
+**✅ Arreglado (2026-08-03).** `fetch_tls_config_from_vault` ya no aplana el error a string en el punto
+donde todavía conoce el tipo: devuelve `TlsFetchFailure`, que parte el fallo en **`VaultUnavailable`**
+(`VaultError::Node` / `ActionTimeout` — no llegó respuesta, systemd reintenta) y
+**`MaterialInvalid`** (el vault contestó, o el PEM no sirve — hace falta un humano). El arranque loguea
+`warn!` con *"vault no alcanzable todavía; systemd reintenta en ~5 s (normal en arranque en frío)"* en
+el primer caso, y el `error!` con la instrucción al operador solo en el segundo. El mensaje
+fail-closed final se bifurca igual. 23/23 tests de `sy_edge` verdes.
+
+**No hecho, opcional:** reintentar in-process ~15 s antes del primer `exit`, copiando el patrón de
+`sy_identity.rs:6626-6651` — bajaría 9 reinicios a 1-2. Es cosmética sobre un camino que ya se cura
+solo; no la hice para no tocar el contrato de arranque sin necesidad.
+
+**Lo que el hallazgo no vio (y es peor).** Después de 98adab7 el contador de restarts **mezcla
+`exit(0)` con `exit(1)`**. `sy_vault` emite `VAULT_SECRET_CHANGED op=put` por **cada** secreto en su
+propio arranque (`sy_vault.rs:246-260`) y `tls_secret_change_action` no mira `action="bootstrap"`
+(`sy_edge.rs:1690-1715`): **todo restart de `sy-vault` reinicia un edge sano** → bache de ~5 s en el
+HTTPS público. → ver **PB-9**.
+
+**Rigor.** La causa *"esperando al vault"* se **infirió del código**, no de una línea de journal del
+edge, y se propagó como hecho a `HANDBOOK.md:515`. La inferencia se sostiene, pero la próxima vez hay
+que capturar el `journalctl -u sy-edge` del arranque en frío antes de escribirla como hecho.
 
 ---
 
 <a id="pb-5"></a>
-## PB-5 🔴 — El orchestrator no configura placas de red secundarias
+## PB-5 🟡 — El egress reporta `nat_applied: true` sin verificar su pata LAN
 
-Detalle completo y evidencia en [FINDINGS.md → A-1](FINDINGS.md).
+> **Reescrito el 2026-08-03.** El título anterior (*"el orchestrator no configura placas
+> secundarias"*) pedía algo que es **contra-contrato explícito**.
 
-Los roles `ingress` y `egress` **requieren** una segunda placa por definición, pero `add_hive` no
-tiene forma de declararla: hubo que configurarla a mano en las VMs antes de unirlas. Eso rompe la
-promesa de *"corré un comando contra una máquina Linux vacía"* justo en los dos roles que más la
-necesitan, y en un prod de verdad (bare-metal, otro hipervisor) no hay una API de Proxmox a la que
-recurrir.
+**Alcance corregido: solo `role=egress`.** Ingress sale del hallazgo — `add_hive` no le pide ni le
+puede pedir nombres de interfaz (`IngressSection:210-221`); sus dos placas son una decisión de
+topología del spec v6, no un hueco. *(Corregir también `HANDBOOK.md:403-408`, que hoy dice "pasarle
+los nombres de interfaz" para ingress y es falso.)*
+
+**Se sacó el encuadre "rompe la promesa de la máquina vacía":** el contrato del *clean box*
+(`07-operaciones.md:435-447`) ya pone la red del lado del operador **para todos los roles**, y el
+producto tampoco direcciona la placa primaria de nadie. No hay divergencia entre hermanos: hay un
+prerequisito uniforme.
+
+**No se pide "que el orchestrator configure las placas".** Es contra-contrato
+(`edge-egress-nat-spec.md:378` decide **no** escribir netplan/NM) y desde adentro del guest no se
+puede crear una vNIC. Si el operador igual lo quiere, es una **feature nueva a discutir**.
+
+**El bug real (fail-loud, chico, estilo de la casa).** `reconcile_egress_nat` debe hacer preflight
+antes de dar por bueno el NAT: que `lan_iface` y `wan_iface` **existan**, y que `cfg.edge_ip` esté
+efectivamente asignada a `lan_iface`. Si no → error fatal en el bootstrap con mensaje accionable, y
+WARN persistente en cada drift tick, igual que se hace con `internet_reachable`. Agregar `lan_leg_ok`
+a `EgressVerification` y **dejar de emitir `egress_nat_applied: true` sin él** — hoy el comentario en
+`:19194-19199` declara ese campo *"trustworthy"* y no lo es.
+
+**Por qué el fallo es silencioso (dato técnico que faltaba):** `iifname`/`oifname` matchean por
+nombre **en runtime**, así que la ausencia de la placa **no** hace fallar el `nft -f` — a diferencia
+de `iif`/`oif`.
 
 ---
 
 <a id="pb-6"></a>
-## PB-6 🔴 — `harden_ssh` viene en `false` por defecto
+## PB-6 🟡 — El canal de bootstrap por `ssh_password` no se cierra solo — y `harden_ssh` a secas **no** es la respuesta
 
-Detalle en [FINDINGS.md → A-2](FINDINGS.md).
+> **Reescrito el 2026-08-03.** La remediación original (*"invertir el default"*) **dejaría cajas sin
+> ninguna vía de acceso**. Duplicado parcial de SO-2026-06-30-02.
 
-El endurecimiento funciona muy bien cuando se pide (verificado nodo por nodo en este despliegue),
-pero hay que **acordarse** de pedirlo. Un default inseguro en el camino feliz.
+**Lo que es cierto.** `resolve_add_hive_harden_ssh` default `false` (`sy_orchestrator.rs:20113-20118`),
+sin fallback por env, igual en los tres flujos (worker/egress/ingress) — o sea **contrato de familia,
+no divergencia**. Con canal `ssh_password`, al terminar el join la caja conserva
+`PasswordAuthentication yes`.
+
+**La evidencia original estaba mal.** El hardening tiene **dos** callers:
+`apply_add_hive_ssh_controls_after_finalize` (gated por `harden_ssh`, `:20820`) y
+`finalize_spoke_key_persist` (**incondicional**, rama `ssh_access=key_only_persist`, `:20711`).
+
+**Impacto reencuadrado.** `add_hive` **nunca enciende** password auth; el canal previo al join es
+prerequisito del operador. En el camino recomendado (`ssh_key` sobre imagen cloud) el server ya viene
+con password OFF y el default `false` no deja nada abierto. El agujero solo aparece cuando el
+operador abrió password a mano — el caso que la doc ya cubre pasando `harden_ssh:true`.
+
+**Se retiró "invertir el default".** `harden_ssh=true` + el default `ssh_access=revoke` = caja **sin
+password, sin key de MB y sin sudoers** → recuperable solo por consola del hipervisor. Choca de
+frente con el invariante que el propio código declara: *"verify-before-revoke that never strands a
+spoke"* (`:20121-20132`).
+
+**Dos opciones sanas, a decidir por el operador:**
+
+- **(a)** Que `ssh_password` implique `ssh_access=key_only_persist` — hardena **y** deja llave
+  per-spoke verificada en el vault. Cierra el agujero **sin riesgo de lockout**, y no inventa nada:
+  es maquinaria que ya existe.
+- **(b)** Devolver `warnings: ["bootstrapped via ssh_password and PasswordAuthentication left
+  enabled"]`. El estado **ya es consultable**; lo que falta es el warning.
+
+**Corregir el HANDBOOK:** el slogan *"Entra abierta, sale cerrada"* (`:524`) y la trampa 10 (`:532`)
+**inducen el error** — en combinación con el revoke por default es justo lo que dejó las cajas del
+despliegue del 2026-07-29 sin ninguna vía SSH.
+
+<a id="pb-6b"></a>
+### PB-6b ✅ **CERRADO** — `harden_ssh_applied` era un eco del request, no un hecho medido
+
+Defecto real **en la dirección opuesta** al hallazgo, encontrado al refutarlo. Los tres flujos
+(`worker`/`egress`/`ingress`) devolvían literalmente `"harden_ssh_applied": harden_ssh` — el flag
+pedido, no lo ocurrido. Con `ssh_access=key_only_persist`, que **hardena incondicionalmente**, un join
+con `harden_ssh:false` dejaba la caja **con password auth apagado y verificado** mientras le informaba
+al operador que seguía encendido. Un dato de seguridad, mal.
+
+**Arreglado:** `harden_ssh_applied` es ahora un campo medido que viaja en
+`AddHiveSshControlsResult` / `SpokeKeyPersistResult` desde donde el trabajo efectivamente ocurre — en
+la rama gated, tras propagar con `?` el `disable` + `verify`; en la rama persist, `true` en **los dos**
+caminos de retorno, porque el harden ya sucedió antes del punto de decisión del verify-before-revoke.
+*(El camino `socket_only` sigue reportando `false`, que ahí es lo correcto: no toca SSH.)*
+
+**Falta la comprobación en vivo:** confirmarlo de punta a punta exige un `add_hive` nuevo. Compila y
+el cambio es local al reporte, pero **todavía no lo vi contra una caja real.**
 
 ---
 
 <a id="pb-7"></a>
-## PB-7 🔴 — El timeout del admin puede quedar corto para `add_hive`
+## PB-7 🔴 — El `add_hive` real dura más que la ventana de respuesta del admin (180 s) — y en ese rato el plano de control del hive queda **bloqueado**
 
-Detalle en [FINDINGS.md → A-3](FINDINGS.md).
+**Qué pasa.** `JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS` default 180 s (`sy_admin.rs:13648-13653`) contra un
+`add_hive` **medido en >6 min**. El cliente recibe `{"error_code":"TIMEOUT"}` sobre una operación que
+sigue corriendo y suele terminar bien.
+
+**Dónde se va el tiempo (corregido).** **No** en los gates: topean en ~150 s en cualquier camino de
+falla, porque el gate de LSA solo corre si el WAN salió bien. El costo dominante es la **fase SSH
+previa**: `sync_core_to_worker` + `sync_vendor_to_worker` (~35 MB) + decenas de `ssh` con
+`ConnectTimeout=10` pero **sin timeout total** y con reintentos. **Esa fase no tiene techo.**
+
+**Lo que NO es.** No es divergencia ni olvido: el 180 es deliberado, es la ventana **más larga** de la
+familia (update 60 / sync_hint 45 / genérico 30). Es un contrato que la realidad desbordó.
+
+**La mitigación que estaba escrita es falsa a medias.** *"Queda pending y el reintento es
+idempotente"* vale **solo** si el corte cae después de `write_hive_info` (`:18362`). Durante la fase
+SSH **no hay `info.yaml`**: el reintento **borra el directorio y re-bootstrapea de cero**.
+
+**Y "reintentá para ver el estado" es imposible durante el join.** Todo `ADMIN_COMMAND` va a un
+**único canal serial** que `add_hive` ocupa entero, además **bloqueando el thread con
+`std::thread::sleep` en código async** (`:21726`). `get_hive`/`list_hives`/`hive_status` se encolan,
+vencen a los 30 s del lado del cliente, y **después se ejecutan tarde**.
+
+**Opciones (ninguna es "subir el default a 240"):**
+
+1. Subir el default es **placebo**: para cubrir el caso medido harían falta ~600 s de ventana HTTP.
+2. **Lo correcto:** partir `add_hive` en **aceptación + trabajo en background** — responder `202` con
+   el hive en estado `joining`, correr el flujo en una tarea propia (lo que además saca el
+   `std::thread::sleep` del executor) y **dejar el canal admin libre**. Cierra PB-7 y U-8a juntos:
+   son el mismo hueco visto por dos puntas.
+3. **Barato y honesto mientras tanto:** escribir `info.yaml` con `status: joining` **al principio**
+   del flujo, y que el TIMEOUT devuelva un cuerpo que lo diga. Sin (2) igual no se puede consultar
+   hasta que el worker se libere — decirlo explícito.
+4. Documentar en el HANDBOOK que **un TIMEOUT de `add_hive` no significa fracaso**.
 
 ---
 
 <a id="pb-8"></a>
-## PB-8 🔴 — `egress.gateway_ip` no se propaga a motherbee
+## PB-8 🟡 — El modelo de egress **no tiene historia para motherbee** — y motherbee es donde corren los nodos que llaman a internet
 
-Detalle en [FINDINGS.md → A-4](FINDINGS.md).
+> **Reescrito el 2026-08-03.** El arreglo que sugería el título anterior (*"propagar `gateway_ip` a
+> MB"*) **es un lockout del plano de control**.
 
-**Sin validar empíricamente todavía.** La lectura del código dice que la ruta por el egress se
-declara a los workers pero no a motherbee — y motherbee es justo quien llama a OpenAI, Slack y Meta.
-La prueba está pendiente: declarar `egress.gateway_ip: 10.10.10.40` en el hive.yaml de MB y ver por
-dónde sale el tráfico.
+**Qué es (no lo que decía).** `egress.gateway_ip` en el hive.yaml de MB significa, por contrato
+explícito y documentado, *"por dónde salen los **workers**"* (`sy_orchestrator.rs:181-184`). No es un
+valor que "no se propaga": **nunca fue para MB**. La exclusión es un brazo explícito junto a Ingress
+(`:5604`), no un olvido.
+
+**El hueco real.** `base-nodes.json` bootea `IO.slack.default@motherbee`, `IO.wapp.default@motherbee`
+y `AI.chat@motherbee`. O sea: el único hive que el modelo de egress **no** rutea es justo el que
+hostea a todos los que llaman a OpenAI/Slack/Meta. *(Y `handbook:156` dice "internal hives can reach
+the internet through it" cuando el código solo cubre workers → corregir a "workers".)*
+
+**Consecuencia correcta** (reemplaza a *"saldría por la red de admin"*): MB sale hoy por el SNAT del
+hipervisor, **una excepción temporal marcada para cerrarse**. Cuando se cierre, MB pierde internet y
+no hay mecanismo gestionado para devolvérsela. La red de admin está en **los dos** caminos — la pata
+WAN del propio egress es `192.168.8.240` — así que el problema no es "sale por admin", es **"sale por
+fuera del chokepoint gestionado"**, donde el spec §11 reserva allow-list y logging.
+
+**⛔ Arreglo prohibido:** agregar `HiveRole::Motherbee` al brazo `Worker` de `reconcile_egress`.
+Pondría al **plano de control** a reescribirse su default route en cada boot y cada tick de watchdog,
+desde un campo de yaml, sin rollback, en la caja que provisiona el egress. Para un worker el fallo es
+no-fatal **por diseño**; en MB es **lockout**.
+
+**Opciones (ninguna se implementa sin OK):** (a) la ruta de MB la configura el operador a nivel
+SO/netplan y Fluxbee solo la **verifica** y grita si no coincide (read-only, sin riesgo); (b) campo
+separado y explícito `egress.motherbee_route: true` (opt-in, **nunca** por herencia del campo de
+workers), con gate de alcanzabilidad y sin re-aplicación en watchdog; (c) mover los nodos que llaman
+a internet a un worker — la única opción que ya funciona hoy.
+
+**La trampa más inmediata, que faltaba:** hoy **no rutea nadie** por el egress — MB aún no declara la
+sección y worker1 se unió antes, y la inyección solo alcanza a workers provisionados **después**.
+Y `packaging/hive.yaml.example` **ni siquiera tiene la sección `egress:`** de nivel raíz, así que
+declararla es una edición a mano no documentada.
+
+---
+
+<a id="pb-9"></a>
+## PB-9 🔴 — Todo restart de `sy-vault` reinicia un `SY.edge` **sano** → bache en el HTTPS público
+
+> Descubierto por la auditoría adversarial del 2026-08-03, mientras se refutaba PB-4. No estaba en
+> ningún hallazgo.
+
+`sy_vault` emite `VAULT_SECRET_CHANGED op=put` por **cada secreto que tiene** durante su propio
+arranque (`sy_vault.rs:246-260`, `530-596`) — es su bootstrap, no un cambio real. Y
+`tls_secret_change_action` (`sy_edge.rs:1690-1715`) **no mira `action="bootstrap"`**: si la key
+coincide con `tls_vault_key`, dispara el `exit(0)` de recarga.
+
+**Consecuencia:** cada vez que `sy-vault` reinicia (upgrade del `.deb`, reboot, restart manual), el
+edge — que estaba perfecto — se recicla. En el HTTPS público eso es un bache de ~5 s.
+
+**Arreglo:** que `tls_secret_change_action` devuelva `NoAction` cuando el evento viene marcado como
+bootstrap, o que `sy_vault` no emita `op=put` por secretos preexistentes en su arranque. Lo primero
+es más chico y local; lo segundo arregla también a cualquier otro suscriptor. Hay que mirar quién más
+reacciona a `VAULT_SECRET_CHANGED` (io.slack lo hace) antes de elegir.
 
 
 ---
@@ -469,48 +692,160 @@ acotado — pero es la razón por la que U-6 sube de prioridad.
 ---
 
 <a id="u-3"></a>
-## U-3 🔴 — El upgrade del `.deb` borra los runtimes publicados en caliente
+## U-3 🔴 — El upgrade del `.deb` borra los runtimes publicados en caliente · **SOBREVIVE (y es peor)**
 
-`dist/runtimes/manifest.json` es un **archivo del paquete** (`dpkg -L fluxbee` lo lista), y el único
-`conffile` declarado es `/etc/fluxbee/hive.yaml.example`. Entonces un upgrade **lo pisa**: los
-directorios de versión sobreviven, pero desaparecen del manifest → `run_node`/`restart_node` pasan a
-`RUNTIME_NOT_AVAILABLE`, y el siguiente `update category=runtime` los recolecta como basura.
+> **Sobrevivió la auditoría intacto en su núcleo**, pero estaba **mal calibrado en tres cosas y
+> subestimaba el daño en dos.** Reescrito el 2026-08-03.
 
-Contradice de frente la decisión de packaging: *"Growth = publish + update, no new .deb"*.
+`dist/runtimes/manifest.json` es un **archivo del paquete** (`dpkg -L fluxbee` lo lista **desde
+23c4175 / 2026-07-22**; los `.deb` anteriores no traen `dist/runtimes` en absoluto), y el único
+`conffile` declarado es `/etc/fluxbee/hive.yaml.example`. Un upgrade **lo pisa**.
 
-**Hoy el daño sería nulo:** los 6 runtimes de prod vinieron del `.deb`, ninguno se publicó en
-caliente. Pero apenas `SY.wf-rules` publique un `wf.*` o se despliegue un nodo propio, cada upgrade
-los borra. **Es un argumento a favor de probar el update ahora, mientras prod todavía es virgen.**
+**Corrección 1 — el GC no espera a nadie.** El texto decía *"el siguiente `update category=runtime`
+los recolecta"*. **No hace falta ninguna acción del operador:** la retención corre sola en el watchdog
+cada 300 s (`RUNTIME_VERIFY_INTERVAL_SECS`), y como el `postinst` reinicia `sy-orchestrator`, la
+pasada ocurre **a los pocos minutos del upgrade**.
 
-**Opciones a charlar:** sacar el manifest del paquete · declararlo `conffile` · o hacer *merge* en el
-`postinst` en vez de reemplazo.
+**Corrección 2 — el borrado se parte en dos casos.** La retención también conserva lo que referencian
+los configs persistidos (`persisted_runtime_keep_versions_with_root`):
+
+- **con instancia persistida** → el directorio sobrevive al GC y el proceso sigue corriendo, pero
+  queda **inarrancable**: cualquier `restart_node`/`run_node`/reboot da `RUNTIME_NOT_AVAILABLE`;
+- **sin instancia** (paquete de workflow recién publicado, runtime precargado) → **se borra el
+  directorio entero**.
+
+En los dos casos el manifest miente.
+
+**Corrección 3 — y esta es la grave: el arreglo de [U-10](#u-10) NO cubre esto.**
+`reconcile_persisted_custom_nodes` resuelve primero la **clave** del runtime contra el manifest y
+recién después la versión. Con la clave borrada, el *"que `current` signifique current"* **nunca
+llega a correr** y el nodo queda abandonado. O sea: tras el upgrade, **todo nodo montado sobre un
+runtime publicado en caliente queda huérfano igual que en U-10, y sin self-heal**.
+
+**Eso lo sube de "no bloquea (hoy)" a "bloquea el día que exista el primer runtime publicado en
+caliente" — y ese día ya llegó en el lab (`wf.router 0.0.4` en la hive 240).**
+
+**Corrección 4 — el merge NO hay que construirlo, ya existe.** `scripts/publish-runtime.sh` mergea
+(lee el manifest previo) y el instalador hermano ya lo usa así contra el root vivo
+(`install.sh:895-960`, `--dist-root /var/lib/fluxbee/dist`). **La divergencia es que el `.deb` lo
+ejecuta en BUILD-time contra el árbol staged en vez de en INSTALL-time contra el árbol vivo.** El
+encuadre correcto es *"de-divergir los dos instaladores llamando al merger que ya existe desde el
+postinst"*, no *"tres opciones abiertas"*. **Se descarta el camino `conffile`:** en un JSON generado
+deja `.dpkg-dist`/prompts y no mergea nada.
+
+**→ Toca packaging. A charlar con el operador antes de tocarlo.**
 
 ---
 
 <a id="u-4"></a>
-## U-4 🔴 — Cero verificación de compatibilidad entre motherbee y spokes
+## U-4 — Verificación de compatibilidad entre motherbee y spokes · **partido en dos**
 
-`GET /hives/{h}/versions` y las alertas de drift son **informativas**: nada rechaza un peer con
-versión incompatible. Durante la ventana en que motherbee ya está en `0.1.1` y los spokes siguen en
-`0.1.0` no hay ninguna red de seguridad; si un cambio toca protocolo, la malla rompe en silencio.
+> **El absoluto "cero verificación" es falso** y la remediación obvia (rechazar el peer por versión)
+> **se auto-cerca la malla**. Reescrito el 2026-08-03.
 
-Mitigación mientras no exista: **mantener el payload de cada update en cambios que no toquen
-protocolo**, y no dejar la ventana abierta más de lo necesario.
+**Lo que SÍ existe, y el hallazgo original negaba:** el spoke rechaza el `SYSTEM_UPDATE` con
+`VERSION_MISMATCH`/`sync_pending` (ejercitado en `orchestrator_system_update_stale_e2e.sh`);
+motherbee verifica el sha del manifest y de cada binario tras el push; y el runtime manifest tiene un
+contrato de compatibilidad cross-hive real, con rango soportado `1..=2` y gate de escritura
+`FLUXBEE_RUNTIME_MANIFEST_WRITE_V2`.
+
+**Y la consecuencia estaba mal:** una rotura **dura** de protocolo **no es silenciosa** — el peer
+queda `stale` y toda acción hacia ese hive falla con *"target hive not reachable in LSA"*. Lo que sí
+degrada callado es un cambio **semántico**, porque serde tolera campos default/desconocidos. La
+mitigación (payload sin cambios de protocolo, ventana corta) sigue siendo la correcta, pero **por ese
+motivo**, no por "no hay ninguna red".
+
+**Contrato de la casa, para que no se relea como omisión:** en fluxbee **el hash es la compuerta y la
+versión es telemetría**. Se ve igual en el reload de OPA: versión distinta → warn, hash distinto →
+rechazo.
+
+<a id="u-4a"></a>
+### U-4a 🟢 — El HELLO lleva versión de protocolo y nadie la mira
+
+`WanHelloPayload` transporta `protocol: "fluxbee/1.16"` y existe `WanRejectPayload` (se usa para
+`HIVE_NOT_AUTHORIZED`), pero **`peer_hello.protocol` no se compara nunca**, y el
+`negotiated.protocol` que se devuelve es la constante local reescrita. Igual en los hermanos
+(`NodeHelloPayload.version`, `RouterHelloPayload.version`). **El campo existe y está muerto.**
+
+**⛔ Ojo con el arreglo obvio:** rechazar el peer sería **self-fencing** — el `SYSTEM_UPDATE`
+cross-hive viaja por la malla y exige visibilidad LSA del target, así que **cortar el peer viejo corta
+el único canal capaz de arreglarlo**. Corresponde (a) usar el campo solo para **reportar skew**, o
+(b) **borrarlo del contrato** para que no simule una garantía que no da. **Decisión de diseño → hablarlo.**
+
+<a id="u-4b"></a>
+### U-4b 🔴 — Las drift-alerts **no se escriben nunca**
+
+No son "informativas": `drift_alerts_path()` (→ `orchestrator/drift-alerts.jsonl`) **solo aparece en
+la ruta de lectura**. No hay un solo escritor en todo el repo — lo verifiqué por nombre de función y
+por nombre de archivo.
+
+Lo que devuelve `GET /drift-alerts` son **entradas sintéticas** (`local_current_state`,
+`severity=info`) que `enrich_drift_alert_history_entries` fabrica **a partir del snapshot actual**
+cuando el hive local no tiene entradas en el archivo — o sea, **siempre**. El endpoint que el README
+documenta como *"Historical drift alert entries"* devuelve **un snapshot vivo disfrazado de
+historial**, que es peor que devolver vacío.
+
+Es el bug real detrás de U-4, **y es independiente de versiones**. Falta además: `GET /versions`
+agrega snapshots **sin emitir veredicto** (debería marcar qué hives difieren del de motherbee), y los
+contadores de reject del WAN son un `HashMap` privado sin superficie de consulta.
+
+**→ Escribir el emisor es diseño** (cuándo se emite, con qué severidad, cómo se deduplica, retención).
+**A charlar.** Lo que sí se puede cerrar solo es la mentira: o el endpoint declara que lo que devuelve
+es un snapshot, o deja de sintetizar.
 
 ---
 
 <a id="u-5"></a>
-## U-5 🔴 — No hay rollback de core como comando
+## U-5 🟡 — No hay rollback de core como comando · **gap, no bug**
+
+> Bajado de 🔴 el 2026-08-03: **"automático-solo" es el contrato de la familia** — vendor tampoco
+> tiene comando, y runtime no lo necesita porque está versionado.
 
 Existe rollback **automático** (local, ante fallo detectado) y hay backup de los binarios previos en
-`state/orchestrator/core-bin.prev.local/update-<ms>/`. Pero **no hay una acción de rollback de core**
-— las únicas `*_rollback` son de vault, opa y wf_rules. Y el directorio de backups nunca se limpia.
+`/var/lib/fluxbee/orchestrator/core-bin.prev.local/update-<ms>/` *(ruta corregida)*. No hay acción de
+rollback de core: las únicas `*_rollback` son de vault, opa y wf_rules.
 
-Peor: el rollback automático depende de **detectar** el fallo, y [U-1](#u-1) hace que muchos fallos no
-se detecten.
+**Se borró la frase sobre U-1** (está cerrado). Lo que sí se sostiene: el rollback automático se
+dispara **solo si la unit no queda `active` en 30 s** — no detecta una regresión **funcional** (mesh
+roto, incompatibilidad con spokes) — **y además excluye a `sy-orchestrator`**, que se auto-reinicia
+sin verificación: si el binario nuevo del orchestrator crash-loopea, **no hay gate ni rollback**.
 
-**Mientras no exista, el rollback real es externo:** snapshot de las VMs + conservar el `.deb` anterior
-publicado en el repo apt para poder bajar de versión.
+**Ya existe media máquina:** `rollback_remote_core_to_prev` restaura la generación previa completa por
+SSH. Si se construye el comando, se construye **sobre eso** para spokes, no de cero.
+
+**Y el downgrade de spokes ya es un flujo soportado:** `.deb` anterior en motherbee → dist →
+`update category=core`, porque el camino core es **por hash** y no tiene gate de monotonía. Lo único
+externo es conservar el `.deb`.
+
+**⛔ Advertencia obligatoria contra el arreglo obvio.** Un `core_rollback` que *"restaure el backup más
+reciente"* es **inseguro con el store actual**: (a) los directorios se crean **aunque no haya
+cambios**, así que el más reciente suele estar **vacío**; (b) `rollback_local_core_binaries` devuelve
+`Ok()` cuando **no encuentra** el backup — o sea, el comando contestaría `ok` sin restaurar nada,
+**exactamente el modo de falla de U-1**; (c) los directorios no llevan `manifest_hash` ni versión, así
+que *"rollback a la versión X"* **ni siquiera es expresable**.
+*Prerrequisitos:* etiquetar el backup con el `manifest_hash` que reemplazó · no crear directorio en el
+no-op · fallar fuerte si el backup no tiene los binarios · retención (reusar el patrón de runtimes).
+
+**Límite estructural, no carencia:** una acción in-band se enruta a `SY.orchestrator@{hive}`; **no
+puede rescatar al hive cuyo orchestrator es el componente roto.** Para ese caso el camino externo
+(snapshot / downgrade por apt) **es la respuesta correcta**.
+
+<a id="u-5b"></a>
+### U-5b ✅ **CERRADO** — Los backups de core se acumulaban sin GC, y se creaban vacíos
+
+Dos defectos, los dos prerrequisitos de cualquier `core_rollback` futuro:
+
+1. **Se creaba el directorio antes de saber si había algo que respaldar** — `fs::create_dir_all` corría
+   incondicionalmente, así que **cada update no-op dejaba un `update-<ms>/` vacío**. Justamente por eso
+   *"restaurar el backup más reciente"* habría restaurado **nada**. Ahora la creación es **perezosa**:
+   ocurre recién ante el primer binario que efectivamente se copia.
+2. **Nunca se limpiaba.** Ahora hay retención (`CORE_BACKUP_GENERATIONS_KEPT = 3`), aplicada **solo en
+   el camino de éxito** — un rollback todavía necesita su generación en disco. Es *best-effort*: si
+   falla la limpieza, loguea `warn!` y no convierte un update bueno en un fallo reportado.
+
+`prune_core_backup_generations_in(root, keep)` toma el root por parámetro para ser testeable sin tocar
+el state dir real. Dos tests: que conserva las más nuevas y respeta lo que no es una generación, y que
+**nunca vacía el store** (por debajo del umbral no toca nada, y un root inexistente no es error).
 
 
 ---
@@ -574,32 +909,107 @@ reinicia ante un cambio real de config, así que es un warn ruidoso, no un loop 
 ---
 
 <a id="u-8"></a>
-## U-8 🔴 — `add_hive` no tiene forma de consultar su progreso
+## U-8 — Operaciones largas sin progreso consultable · **partido en tres**
 
-Un `add_hive` tarda **más de 6 minutos** y no hay manera de preguntarle en qué paso está. El
-[command audit log](#) registra el comando **al terminar**, así que durante la ventana no hay nada:
-hubo que poleá el proceso de `curl` con `pgrep` para saber si seguía vivo.
+> Reescrito el 2026-08-03. El diagnóstico de U-8b señalaba una causa **falsa**, y la auditoría
+> destapó en U-8c el mejor hallazgo del lote: **la maquinaria que U-8 pedía construir ya existe y
+> está muerta por un bug de una línea.**
 
-Para una operación de esa duración —y que además es la más frágil del sistema, porque toca SSH, red,
-systemd y syncthing— es un hueco de operabilidad real. Y empeora con [A-3](FINDINGS.md): el timeout
-del admin son 180 s, o sea menos de la mitad de lo que la operación tarda.
+<a id="u-8a"></a>
+### U-8a 🟡 — La API de admin no tiene contrato para operaciones largas
+
+Un `add_hive` tarda **más de 6 minutos** y no hay manera de preguntarle en qué paso está: el audit log
+se escribe **al terminar**, no hay acción de estado-de-operación en el registro, y el `info.yaml` del
+hive nuevo (`status: pending`) se escribe **recién tras los gates de 60 s + 60 s**, así que durante la
+ventana `GET /hives` no muestra nada.
+
+**Mitigaciones que YA existen y hay que documentar en el HANDBOOK antes de codear nada:** (i) los
+timeouts son perillas — `JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS` / `JSR_ADMIN_UPDATE_TIMEOUT_SECS`, **no
+seteadas en `packaging/`**; (ii) el hive queda `pending` y reintentar `add_hive` es idempotente
+*(con el matiz de [PB-7](#pb-7): solo vale si el corte cayó después de `write_hive_info`)*.
+
+Se cierra junto con [PB-7](#pb-7) opción 2 — son el mismo hueco visto por dos puntas.
+
+<a id="u-8b"></a>
+### U-8b 🟡 — `update category=core` da TIMEOUT a los 60 s sobre una operación exitosa
+
+**La causa que estaba escrita es falsa.** *No* es que el orquestador del destino se reinicie a sí
+mismo: el código **lo evita explícitamente** — se auto-excluye y **difiere su restart a un timer de
+2 s justamente para no matar su propia respuesta**.
+
+**Las causas reales, ambas en código:** (1) el destino reinicia **primero** su propio bus
+`rt-gateway`, que es por donde la respuesta debe volver, **y el fallo de envío se traga** (`let _ =`);
+(2) el restart **en serie** con health-gate de 30 s por servicio sobre 8 servicios puede exceder los
+60 s por sí solo. *(Aparte: si el target es motherbee, el que se reinicia a mitad del request es
+`sy-admin`.)*
+
+<a id="u-8c"></a>
+### U-8c ✅ **CERRADO** — El `timeout_unknown` del architect estaba muerto por un substring imposible
+
+> **El hallazgo de mayor valor del lote, y no estaba en ningún findings.** Lo destapó el intento de
+> refutar U-8.
+
+La semántica de *"en progreso / puede haber terminado bien / andá a verificar"* **ya existía** en
+SY.architect: estado `timeout_unknown`, y `reconcile_timeout_unknown_operation`, que para `add_hive`
+consulta `get_hive` y marca `succeeded_after_timeout`.
+
+**Estaba muerta.** El clasificador matcheaba el substring `"timeout waiting ADMIN_COMMAND_RESPONSE"`
+contra un `Display` que **desde d04cce8** dice:
+
+```text
+timeout waiting response trace_id=… target=… request_msg=… response_msg=ADMIN_COMMAND_RESPONSE …
+```
+
+Las palabras `waiting` y `ADMIN_COMMAND_RESPONSE` **nunca son adyacentes**. El predicado era
+**permanentemente falso**: toda operación vencida se persistía como `failed` (terminal), la
+reconciliación **jamás corría**, y el operador veía un `error` sobre una operación probablemente
+exitosa — **exactamente el daño que U-8 describe**.
+
+**Arreglado:** `RpcError::is_timeout()` / `timeout_response_msg()` en el SDK, y el architect matchea
+la **variante tipada** vía `downcast_ref` recorriendo la cadena de `source()`, en vez de olfatear
+strings. Tres tests nuevos, incluido el que faltaba: **uno que afirma que el `Display` real no
+contiene el substring viejo**, para que no pueda volver a pasar en silencio.
+
+**Nota de método:** el hermano de `sy_orchestrator` **ya lo tenía bien** —comentario que documenta la
+forma del `Display`, el substring correcto y un test—. El architect era el outlier. Otra vez la regla
+*"revisá los hermanos"*.
 
 ---
 
 <a id="u-9"></a>
-## U-9 🔴 — Las rutas desconocidas devuelven un `not_found` pelado
+## U-9 ✅ **CERRADO** — Las rutas desconocidas devolvían un `not_found` pelado
 
-`POST /hives/motherbee/hives` (mi error: la ruta correcta es `POST /hives`) devolvió exactamente:
+`POST /hives/motherbee/hives` (mi error: la ruta correcta es `POST /hives`) devolvía exactamente
+`{"error":"not_found"}`.
 
-```json
-{"error":"not_found"}
-```
+**El defecto primario era de ENVELOPE, no de amabilidad.** Toda otra respuesta del admin es
+`{status, action, payload, error_code, error_detail}`; el catch-all emitía `{"error": …}`, **la única
+clave así en toda la superficie** — un cliente que lee `error_code` recibía `null`.
 
-Sin decir qué ruta, ni qué acción, ni que existe `GET /admin/actions` para averiguarlo. **Contrasta
-fuerte con la calidad del resto**: cuando mandé mal el payload del egress, el error fue
-*"add_hive role=egress requires an 'egress' object (lan_cidr, wan_iface, lan_iface)"* — perfecto,
-accionable. La autodocumentación existe y es excelente; solo falta que el 404 apunte a ella.
+**Y el caso peor, que el hallazgo no vio:** el mismo catch-all se tragaba **el método equivocado sobre
+una ruta que SÍ existe** (`PUT /hives`), devolviendo *"no existe"* sobre algo que existe. Más dañino
+que la falta de pistas.
 
+**Arreglado, como reuso y no como sistema nuevo:**
+
+- envelope de la familia + `error_code: UNKNOWN_ROUTE`;
+- **405 `METHOD_NOT_ALLOWED`** con `allowed_methods` cuando la ruta existe con otro verbo, derivando
+  la tabla de `admin_action_path_patterns` sobre `INTERNAL_ACTION_REGISTRY` para que no pueda
+  divergir del catálogo;
+- puntero `see: "GET /admin/actions"` — **un puntero, no un volcado**: el bind default es loopback
+  pero es overrideable y hay reverse-proxy público documentado, y ese endpoint ya tiene su propia
+  decisión de exposición;
+- el path ecoado se **trunca a 256 y se limpia de caracteres de control** (viene del cliente).
+
+Alcance exacto: el catch-all de SY.admin. **No** incluye `/modules/*`, `sy_edge` ni `io.api`, que ya
+responden tipado. **El gemelo de SY.architect se dejó como está a propósito:** ahí `{"error": …}` es
+lo que usan sus vecinos, así que **no es el outlier** — de-divergirlo sería romper su propia familia.
+
+**Residual anotado, no arreglado:** `externalize` / `unexternalize` / `list_externalized` tienen rutas
+REST reales pero **no están en `INTERNAL_ACTION_REGISTRY`**, así que `GET /admin/actions` no las
+lista y el puntero miente para la familia `/channels/*`. Se las incluyó a mano en la tabla de
+diagnóstico (`ADMIN_ROUTES_OUTSIDE_ACTION_REGISTRY`) para que el 405 funcione, pero **meterlas en el
+registry toca dispatch y authz → decisión del operador.**
 
 ---
 

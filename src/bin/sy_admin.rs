@@ -5841,8 +5841,11 @@ async fn handle_http(
             respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
         }
         ("GET", path) if path.starts_with("/admin/actions/") => {
+            // Unreachable: the arm guard already established the prefix. Kept in the
+            // family envelope anyway so no bare `{"error": ...}` survives on the surface.
             let Some(action_name) = path.strip_prefix("/admin/actions/") else {
-                respond_json(stream, 404, r#"{"error":"not_found"}"#).await?;
+                let (status, body) = admin_unknown_route_response(method.as_str(), path);
+                respond_json(stream, status, &body).await?;
                 return Ok(());
             };
             let payload = serde_json::json!({ "action_name": decode_percent(action_name) });
@@ -6262,7 +6265,8 @@ async fn handle_http(
         }
         _ => {
             let _ = headers;
-            respond_json(stream, 404, r#"{"error":"not_found"}"#).await?;
+            let (status, body) = admin_unknown_route_response(method.as_str(), path);
+            respond_json(stream, status, &body).await?;
         }
     }
     Ok(())
@@ -9018,6 +9022,112 @@ fn admin_action_summary(action: &str) -> &'static str {
         "wf_rules_delete" => "Delete a managed workflow through SY.wf-rules.",
         _ => "Admin action.",
     }
+}
+
+/// Routes that exist on the HTTP surface but have no entry in
+/// `INTERNAL_ACTION_REGISTRY`, so deriving the route table from the action catalog
+/// alone cannot see them.
+///
+/// Keeping them here is deliberate: adding the three channel actions to the registry
+/// would change dispatch and authz, which is a separate decision. This table is used
+/// ONLY for 404-vs-405 diagnostics.
+const ADMIN_ROUTES_OUTSIDE_ACTION_REGISTRY: &[&str] = &[
+    "POST /channels/externalize",
+    "POST /channels/unexternalize",
+    "GET /channels/externalized",
+];
+
+/// Does a concrete request path match a `{placeholder}`-style route pattern?
+fn admin_route_pattern_matches(pattern_path: &str, request_path: &str) -> bool {
+    let pattern: Vec<&str> = pattern_path.trim_matches('/').split('/').collect();
+    let actual: Vec<&str> = request_path.trim_matches('/').split('/').collect();
+    if pattern.len() != actual.len() {
+        return false;
+    }
+    pattern.iter().zip(actual.iter()).all(|(p, a)| {
+        if p.starts_with('{') && p.ends_with('}') {
+            !a.is_empty()
+        } else {
+            p == a
+        }
+    })
+}
+
+/// Methods some route accepts on `request_path`. Non-empty means the caller reached a
+/// real endpoint with the wrong verb — a 405, not a 404.
+///
+/// Advisory only: never consulted for dispatch or authz. If this drifts from the real
+/// match arms the worst case is that a 405 degrades back to a plain 404, which is
+/// exactly the behaviour that preceded it.
+fn admin_methods_allowed_for_path(request_path: &str) -> Vec<&'static str> {
+    fn consider(methods: &mut Vec<&'static str>, entry: &'static str, request_path: &str) {
+        let Some((method, pattern_path)) = entry.split_once(' ') else {
+            return;
+        };
+        if admin_route_pattern_matches(pattern_path, request_path) && !methods.contains(&method) {
+            methods.push(method);
+        }
+    }
+
+    let mut methods = Vec::new();
+    for spec in INTERNAL_ACTION_REGISTRY {
+        for entry in admin_action_path_patterns(spec.action) {
+            consider(&mut methods, entry, request_path);
+        }
+    }
+    for entry in ADMIN_ROUTES_OUTSIDE_ACTION_REGISTRY {
+        consider(&mut methods, entry, request_path);
+    }
+    methods.sort_unstable();
+    methods
+}
+
+/// Body for a request that matched no route.
+///
+/// Two defects fixed here. First the envelope: every other admin response is
+/// `{status, action, payload, error_code, error_detail}`, and this was the one shape on
+/// the surface emitting a bare `{"error": ...}` — a client reading `error_code` got
+/// `null`. Second, and worse, the same arm swallowed a wrong METHOD on a route that
+/// does exist (`PUT /hives`), answering "not found" about something that is very much
+/// there.
+///
+/// The hint is a pointer, not a dump: the listener defaults to loopback but is
+/// overrideable and reverse-proxied in some deployments, and `GET /admin/actions` has
+/// its own exposure decision already.
+fn admin_unknown_route_response(method: &str, path: &str) -> (u16, String) {
+    // Echoed back to the caller, so bound the length and drop control characters.
+    let safe_path: String = path.chars().filter(|c| !c.is_control()).take(256).collect();
+    let allowed = admin_methods_allowed_for_path(path);
+    let (status, error_code, error_detail) = if allowed.is_empty() {
+        (
+            404,
+            "UNKNOWN_ROUTE",
+            format!("no admin route matches {method} {safe_path}"),
+        )
+    } else {
+        (
+            405,
+            "METHOD_NOT_ALLOWED",
+            format!(
+                "{safe_path} exists but does not accept {method}; allowed: {}",
+                allowed.join(", ")
+            ),
+        )
+    };
+
+    (
+        status,
+        serde_json::json!({
+            "status": "error",
+            "action": serde_json::Value::Null,
+            "payload": serde_json::Value::Null,
+            "error_code": error_code,
+            "error_detail": error_detail,
+            "allowed_methods": allowed,
+            "see": "GET /admin/actions",
+        })
+        .to_string(),
+    )
 }
 
 fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
@@ -14371,6 +14481,71 @@ fn build_opa_query_response(
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn unknown_route_uses_the_family_envelope() {
+        let (status, body) = admin_unknown_route_response("GET", "/nope");
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, 404);
+        assert_eq!(parsed["error_code"], "UNKNOWN_ROUTE");
+        assert_eq!(parsed["status"], "error");
+        // The whole point: a client reading error_code no longer gets null.
+        assert!(parsed.get("error_code").is_some_and(|v| !v.is_null()));
+        assert_eq!(parsed["see"], "GET /admin/actions");
+        // And the old bare shape is gone.
+        assert!(parsed.get("error").is_none());
+    }
+
+    #[test]
+    fn wrong_method_on_a_real_route_is_405_not_404() {
+        // `/hives` exists for GET (list_hives) and POST (add_hive); PUT does not.
+        // Answering "not found" here told the operator a route that exists does not.
+        let (status, body) = admin_unknown_route_response("PUT", "/hives");
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, 405);
+        assert_eq!(parsed["error_code"], "METHOD_NOT_ALLOWED");
+        assert_eq!(parsed["allowed_methods"], json!(["GET", "POST"]));
+
+        // A path with a placeholder segment resolves too: GET is list_nodes and POST is
+        // run_node, so DELETE is the only verb missing.
+        let (status, body) = admin_unknown_route_response("DELETE", "/hives/motherbee/nodes");
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, 405);
+        assert_eq!(parsed["allowed_methods"], json!(["GET", "POST"]));
+    }
+
+    #[test]
+    fn placeholder_segments_match_and_do_not_over_match() {
+        assert!(admin_route_pattern_matches("/hives/{hive}", "/hives/motherbee"));
+        assert!(!admin_route_pattern_matches("/hives/{hive}", "/hives"));
+        assert!(!admin_route_pattern_matches(
+            "/hives/{hive}",
+            "/hives/motherbee/nodes"
+        ));
+        // A concrete segment must still match exactly.
+        assert!(!admin_route_pattern_matches("/hive/status", "/hive/health"));
+    }
+
+    #[test]
+    fn channel_routes_missing_from_the_registry_are_still_known() {
+        // These have REST routes but no INTERNAL_ACTION_REGISTRY entry, so deriving the
+        // table from the catalog alone would miss them.
+        let (status, _) = admin_unknown_route_response("GET", "/channels/externalize");
+        assert_eq!(status, 405);
+    }
+
+    #[test]
+    fn echoed_path_is_bounded_and_stripped_of_control_characters() {
+        let (_, body) = admin_unknown_route_response("GET", "/a\nb\u{0}c");
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        let detail = parsed["error_detail"].as_str().unwrap();
+        assert!(!detail.contains('\n') && !detail.contains('\u{0}'));
+
+        let long_path = format!("/{}", "x".repeat(4000));
+        let (_, body) = admin_unknown_route_response("GET", &long_path);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed["error_detail"].as_str().unwrap().len() < 400);
+    }
 
     #[test]
     fn fanout_family_glob_validation() {

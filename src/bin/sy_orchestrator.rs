@@ -3508,6 +3508,55 @@ fn compute_local_core_update_sets(
     Ok((updated, unchanged))
 }
 
+/// How many `update-<ms>/` generations of previous core binaries to keep.
+///
+/// Mirrors the retention already applied to runtimes. Before this, the directory grew
+/// without bound — one generation per core update, forever.
+const CORE_BACKUP_GENERATIONS_KEPT: usize = 3;
+
+fn core_backup_root_dir() -> PathBuf {
+    orchestrator_runtime_dir().join("core-bin.prev.local")
+}
+
+fn prune_core_backup_generations(keep: usize) {
+    prune_core_backup_generations_in(&core_backup_root_dir(), keep)
+}
+
+/// Drop all but the newest `keep` backup generations under `root`.
+///
+/// Best-effort on purpose: this runs after a core update has already succeeded, and failing
+/// to tidy up must never turn a good update into a reported failure. Ordering is by
+/// directory name, which sorts chronologically because the suffix is a fixed-width epoch
+/// in milliseconds.
+///
+/// Takes the root as a parameter so it is testable without touching the real state dir.
+fn prune_core_backup_generations_in(root: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let mut generations: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("update-"))
+        })
+        .collect();
+    if generations.len() <= keep {
+        return;
+    }
+    generations.sort();
+    let doomed = generations.len() - keep;
+    for path in generations.into_iter().take(doomed) {
+        if let Err(err) = fs::remove_dir_all(&path) {
+            tracing::warn!(path = %path.display(), error = %err, "core backup retention: could not remove old generation");
+        }
+    }
+}
+
 fn rollback_local_core_binaries(
     updated: &[String],
     backup_dir: &Path,
@@ -3618,16 +3667,21 @@ async fn apply_system_update_local(
         "core" => {
             let manifest = load_core_manifest()?;
             let (updated, unchanged) = compute_local_core_update_sets(&manifest, state.role)?;
-            let backup_dir = orchestrator_runtime_dir()
-                .join("core-bin.prev.local")
-                .join(format!("update-{}", now_epoch_ms()));
-            fs::create_dir_all(&backup_dir)?;
+            let backup_dir = core_backup_root_dir().join(format!("update-{}", now_epoch_ms()));
+            // Created LAZILY, on the first binary we actually back up. It used to be created
+            // unconditionally, which left an empty `update-<ms>/` behind on every no-op update —
+            // so "restore the most recent backup" would have restored nothing.
+            let mut backup_dir_created = false;
             let mut created_without_backup = HashSet::new();
             let mut installed = Vec::new();
             for name in &updated {
                 let source_path = local_core_bin_source_path(name);
                 let target_path = Path::new("/usr/bin").join(name);
                 if target_path.exists() {
+                    if !backup_dir_created {
+                        fs::create_dir_all(&backup_dir)?;
+                        backup_dir_created = true;
+                    }
                     fs::copy(&target_path, backup_dir.join(name))?;
                 } else {
                     created_without_backup.insert(name.clone());
@@ -3689,6 +3743,8 @@ async fn apply_system_update_local(
                     if updated.iter().any(|n| n == "sy-orchestrator") {
                         schedule_orchestrator_self_restart();
                     }
+                    // Only on the success path: a rollback still needs its generation on disk.
+                    prune_core_backup_generations(CORE_BACKUP_GENERATIONS_KEPT);
                     Ok(SystemUpdateApplyResult {
                         status: "ok".to_string(),
                         updated,
@@ -18540,6 +18596,7 @@ async fn add_hive_flow(
                 AddHiveSshControlsResult {
                     restrict_ssh_applied: r.restrict_ssh_applied,
                     restrict_ssh_mode: r.restrict_ssh_mode,
+                    harden_ssh_applied: r.harden_ssh_applied,
                 },
                 r.ssh_access,
                 r.spoke_key_vault_ref,
@@ -18587,6 +18644,7 @@ async fn add_hive_flow(
         };
     restrict_ssh_applied = ssh_controls.restrict_ssh_applied;
     let restrict_ssh_mode = ssh_controls.restrict_ssh_mode;
+    let harden_ssh_applied = ssh_controls.harden_ssh_applied;
 
     let mut final_info_payload = serde_json::json!({
         "hive_id": hive_id,
@@ -18632,7 +18690,7 @@ async fn add_hive_flow(
         "hive_id": hive_id,
         "address": address,
         "harden_ssh": harden_ssh,
-        "harden_ssh_applied": harden_ssh,
+        "harden_ssh_applied": harden_ssh_applied,
         "restrict_ssh": restrict_ssh_applied,
         "restrict_ssh_mode": restrict_ssh_mode,
         "restrict_ssh_requested": restrict_ssh,
@@ -19119,6 +19177,7 @@ async fn add_egress_hive_flow(
                 AddHiveSshControlsResult {
                     restrict_ssh_applied: r.restrict_ssh_applied,
                     restrict_ssh_mode: r.restrict_ssh_mode,
+                    harden_ssh_applied: r.harden_ssh_applied,
                 },
                 r.ssh_access,
                 r.spoke_key_vault_ref,
@@ -19165,6 +19224,7 @@ async fn add_egress_hive_flow(
         };
     let restrict_ssh_applied = ssh_controls.restrict_ssh_applied;
     let restrict_ssh_mode = ssh_controls.restrict_ssh_mode;
+    let harden_ssh_applied = ssh_controls.harden_ssh_applied;
 
     // Hardening succeeded — the node is closed. Promote the hive to `connected`
     // (D3), mirroring the worker's post-hardening write. Preserve `role: egress`
@@ -19229,7 +19289,7 @@ async fn add_egress_hive_flow(
         "egress_nat_applied": true,
         "egress_internet_reachable": serde_json::Value::Null,
         "harden_ssh": harden_ssh,
-        "harden_ssh_applied": harden_ssh,
+        "harden_ssh_applied": harden_ssh_applied,
         "restrict_ssh": restrict_ssh_applied,
         "restrict_ssh_mode": restrict_ssh_mode,
         "restrict_ssh_requested": restrict_ssh,
@@ -19893,6 +19953,7 @@ async fn add_ingress_hive_flow(
                 AddHiveSshControlsResult {
                     restrict_ssh_applied: r.restrict_ssh_applied,
                     restrict_ssh_mode: r.restrict_ssh_mode,
+                    harden_ssh_applied: r.harden_ssh_applied,
                 },
                 r.ssh_access,
                 r.spoke_key_vault_ref,
@@ -19940,6 +20001,7 @@ async fn add_ingress_hive_flow(
         };
     let restrict_ssh_applied = ssh_controls.restrict_ssh_applied;
     let restrict_ssh_mode = ssh_controls.restrict_ssh_mode;
+    let harden_ssh_applied = ssh_controls.harden_ssh_applied;
 
     let connected_info = serde_json::json!({
         "hive_id": hive_id,
@@ -19985,7 +20047,7 @@ async fn add_ingress_hive_flow(
         "ingress_role": "ingress",
         "ingress_listen": edge_listen,
         "harden_ssh": harden_ssh,
-        "harden_ssh_applied": harden_ssh,
+        "harden_ssh_applied": harden_ssh_applied,
         "restrict_ssh": restrict_ssh_applied,
         "restrict_ssh_mode": restrict_ssh_mode,
         "restrict_ssh_requested": restrict_ssh,
@@ -20517,6 +20579,12 @@ fn systemd_disable(service: &str) -> Result<(), OrchestratorError> {
 struct AddHiveSshControlsResult {
     restrict_ssh_applied: bool,
     restrict_ssh_mode: String,
+    /// Measured, not requested. `add_hive` used to report `"harden_ssh_applied": harden_ssh`
+    /// — a literal echo of the flag — which was wrong in BOTH directions once
+    /// `ssh_access=key_only_persist` landed: that path hardens unconditionally, so a join
+    /// with `harden_ssh:false` left the box with password auth OFF while telling the
+    /// operator it was still on.
+    harden_ssh_applied: bool,
 }
 
 /// Comment stamped on every per-spoke recovery key. Doubles as the authorized_keys dedup
@@ -20685,6 +20753,10 @@ async fn vault_put_spoke_ssh_key(
 struct SpokeKeyPersistResult {
     restrict_ssh_applied: bool,
     restrict_ssh_mode: String,
+    /// Whether password auth was actually turned off AND verified — a measured fact,
+    /// not an echo of the request. This path hardens unconditionally, so it reports
+    /// `true` even when the caller never passed `harden_ssh`.
+    harden_ssh_applied: bool,
     ssh_bootstrap_revoked: bool,
     ssh_access: String,
     spoke_key_vault_ref: Option<String>,
@@ -20736,6 +20808,9 @@ async fn finalize_spoke_key_persist(
         return Ok(SpokeKeyPersistResult {
             restrict_ssh_applied: false,
             restrict_ssh_mode: "key_only_persist".to_string(),
+            // The harden above already succeeded and verified before we got here:
+            // this degraded path is about the per-spoke key, not about password auth.
+            harden_ssh_applied: true,
             ssh_bootstrap_revoked: false,
             ssh_access: "degraded_kept_bootstrap".to_string(),
             spoke_key_vault_ref: None,
@@ -20766,6 +20841,7 @@ async fn finalize_spoke_key_persist(
     Ok(SpokeKeyPersistResult {
         restrict_ssh_applied: false,
         restrict_ssh_mode: "key_only_persist".to_string(),
+        harden_ssh_applied: true,
         ssh_bootstrap_revoked,
         ssh_access: "key_only".to_string(),
         spoke_key_vault_ref,
@@ -20827,6 +20903,9 @@ fn apply_add_hive_ssh_controls_after_finalize(
     Ok(AddHiveSshControlsResult {
         restrict_ssh_applied,
         restrict_ssh_mode,
+        // Both calls above propagate with `?`, so reaching here with the flag set means
+        // password auth is off AND was verified off.
+        harden_ssh_applied: harden_ssh,
     })
 }
 
@@ -22055,6 +22134,46 @@ fn is_ingress_role(role: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_backup_retention_keeps_the_newest_generations() {
+        let root = std::env::temp_dir().join(format!("fluxbee-core-backup-{}", now_epoch_ms()));
+        // Fixed-width epoch suffixes, so lexical order IS chronological order.
+        for stamp in [
+            "update-1700000000001",
+            "update-1700000000002",
+            "update-1700000000003",
+        ] {
+            fs::create_dir_all(root.join(stamp)).unwrap();
+        }
+        // Anything that is not a generation must be left alone.
+        fs::create_dir_all(root.join("scratch")).unwrap();
+
+        prune_core_backup_generations_in(&root, 2);
+
+        assert!(!root.join("update-1700000000001").exists());
+        assert!(root.join("update-1700000000002").exists());
+        assert!(root.join("update-1700000000003").exists());
+        assert!(root.join("scratch").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn core_backup_retention_never_empties_the_store() {
+        let root = std::env::temp_dir().join(format!("fluxbee-core-backup-nb-{}", now_epoch_ms()));
+        fs::create_dir_all(root.join("update-1700000000001")).unwrap();
+
+        // At or below the threshold nothing is touched — a rollback still needs its generation.
+        prune_core_backup_generations_in(&root, CORE_BACKUP_GENERATIONS_KEPT);
+        assert!(root.join("update-1700000000001").exists());
+
+        // A missing root is not an error: the pruner runs after a SUCCESSFUL update and must
+        // never turn tidying into a failure.
+        prune_core_backup_generations_in(&root.join("does-not-exist"), 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
 
     // F3: SSH bootstrap failures must classify by cause. A password-channel "permission denied"
     // (the #1 clean-Ubuntu trap: cloud-init 50-*.conf sets PasswordAuthentication no) must surface

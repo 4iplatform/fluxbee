@@ -270,6 +270,9 @@ async fn main() -> Result<(), SyEdgeError> {
         // on the public listener; skip the frontend entirely.
         let tls_requested = config.tls_vault_key.is_some()
             || (config.tls_cert.is_some() && config.tls_key.is_some());
+        // Set when the failure is a transient "vault not up yet", so the fail-closed
+        // message below does not blame the operator for a cold boot.
+        let mut tls_failure_is_transient = false;
         let tls: Option<Arc<rustls::ServerConfig>> = if let Some(vault_key) =
             config.tls_vault_key.clone()
         {
@@ -285,7 +288,15 @@ async fn main() -> Result<(), SyEdgeError> {
             {
                 Ok(cfg) => Some(Arc::new(cfg)),
                 Err(err) => {
-                    tracing::error!(error = %err, "sy-edge: TLS cert fetch from vault failed");
+                    tls_failure_is_transient = err.is_transient();
+                    if tls_failure_is_transient {
+                        tracing::warn!(
+                            error = %err.detail(),
+                            "sy-edge: vault not reachable yet; systemd retries in ~5s (normal on cold boot)"
+                        );
+                    } else {
+                        tracing::error!(error = %err.detail(), "sy-edge: TLS cert fetch from vault failed");
+                    }
                     None
                 }
             }
@@ -301,10 +312,20 @@ async fn main() -> Result<(), SyEdgeError> {
             None
         };
         if tls_requested && tls.is_none() {
-            tracing::error!(
-                "sy-edge: TLS requested but no valid cert loaded; refusing to bind the public \
-                 listener in plaintext (fail-closed). Fix the vault secret / cert files and restart."
-            );
+            if tls_failure_is_transient {
+                // Same fail-closed exit, but do not send the operator hunting for a broken
+                // secret: the material simply is not reachable yet.
+                tracing::warn!(
+                    "sy-edge: TLS material not available yet; refusing to bind the public listener \
+                     in plaintext (fail-closed). systemd restarts in ~5s — expected during a cold \
+                     boot, no operator action needed."
+                );
+            } else {
+                tracing::error!(
+                    "sy-edge: TLS requested but no valid cert loaded; refusing to bind the public \
+                     listener in plaintext (fail-closed). Fix the vault secret / cert files and restart."
+                );
+            }
             return Err("TLS requested but no valid cert loaded".into());
         } else {
             tokio::spawn(async move {
@@ -1717,13 +1738,59 @@ fn tls_secret_change_action(payload: &serde_json::Value, tls_key: Option<&str>) 
 /// Fetch the edge's TLS material from `SY.vault@<vault_hive>` (secret value
 /// `{ "cert": "<PEM>", "key": "<PEM>" }`). Authorized by the dedicated-owner match
 /// against the edge's deterministic ilk — no identity SHM needed on the edge hive.
+/// Why the edge could not build its TLS material from the vault.
+///
+/// The distinction is the entire point. On an ingress hive there is no local `sy-vault`,
+/// and systemd cannot order a cross-hive dependency — so `Restart=always` + `RestartSec=5`
+/// IS the retry loop, deliberately (docs/edge-ingress-spec-v6.md §381-386). During a cold
+/// boot the edge legitimately loses this race a few times before the mesh is up. Telling
+/// the operator to "fix the vault secret" in those seconds is simply false: nothing is
+/// broken, and the next restart resolves it. That false instruction was the only real
+/// defect behind the "sy-edge crash-loops at cold boot" report.
+enum TlsFetchFailure {
+    /// No answer came back. Transient; systemd's restart is the retry.
+    VaultUnavailable(String),
+    /// The vault answered, and the material is missing or unusable. Needs a human.
+    MaterialInvalid(String),
+}
+
+impl TlsFetchFailure {
+    fn material(detail: impl Into<String>) -> Self {
+        TlsFetchFailure::MaterialInvalid(detail.into())
+    }
+
+    fn from_vault_error(secret_key: &str, err: fluxbee_sdk::VaultError) -> Self {
+        let detail = format!("vault get '{secret_key}' failed: {err}");
+        match err {
+            // Nothing came back: unreachable peer, or the request expired waiting.
+            fluxbee_sdk::VaultError::Node(_) | fluxbee_sdk::VaultError::ActionTimeout { .. } => {
+                TlsFetchFailure::VaultUnavailable(detail)
+            }
+            // The vault DID reach a verdict (or the answer was unusable). A restart
+            // will reproduce this exactly — it needs the operator.
+            _ => TlsFetchFailure::MaterialInvalid(detail),
+        }
+    }
+
+    fn is_transient(&self) -> bool {
+        matches!(self, TlsFetchFailure::VaultUnavailable(_))
+    }
+
+    fn detail(&self) -> &str {
+        match self {
+            TlsFetchFailure::VaultUnavailable(detail)
+            | TlsFetchFailure::MaterialInvalid(detail) => detail,
+        }
+    }
+}
+
 async fn fetch_tls_config_from_vault(
     dispatcher: Arc<RouterDispatcher>,
     self_ilk: String,
     self_name: String,
     vault_hive: String,
     secret_key: &str,
-) -> Result<rustls::ServerConfig, SyEdgeError> {
+) -> Result<rustls::ServerConfig, TlsFetchFailure> {
     let client = fluxbee_sdk::VaultClient::new(
         dispatcher,
         vault_hive,
@@ -1732,19 +1799,20 @@ async fn fetch_tls_config_from_vault(
     let resp = client
         .get(secret_key, Duration::from_secs(15))
         .await
-        .map_err(|err| format!("vault get '{secret_key}' failed: {err}"))?;
-    let value = resp
-        .value
-        .ok_or("vault returned no value for the edge tls secret")?;
+        .map_err(|err| TlsFetchFailure::from_vault_error(secret_key, err))?;
+    let value = resp.value.ok_or_else(|| {
+        TlsFetchFailure::material("vault returned no value for the edge tls secret")
+    })?;
     let cert = value
         .get("cert")
         .and_then(|v| v.as_str())
-        .ok_or("edge tls secret is missing a 'cert' PEM field")?;
+        .ok_or_else(|| TlsFetchFailure::material("edge tls secret is missing a 'cert' PEM field"))?;
     let key = value
         .get("key")
         .and_then(|v| v.as_str())
-        .ok_or("edge tls secret is missing a 'key' PEM field")?;
+        .ok_or_else(|| TlsFetchFailure::material("edge tls secret is missing a 'key' PEM field"))?;
     tls_config_from_pem(cert.as_bytes(), key.as_bytes())
+        .map_err(|err| TlsFetchFailure::material(err.to_string()))
 }
 
 /// Resolve any registry entries that carry a `secret_ref` but not yet the secret VALUE by

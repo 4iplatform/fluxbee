@@ -53,7 +53,10 @@ use fluxbee_sdk::protocol::{
     is_system_kind, Destination, Message, Meta, Routing, VaultSecretChangedPayload,
     VaultSecretInterest, MSG_VAULT_SECRET_CHANGED, SYSTEM_KIND,
 };
-use fluxbee_sdk::rpc::{AdminCommandRequest, OperationalRouteProfile, RouterDispatcher};
+use fluxbee_sdk::rpc::{
+    AdminCommandRequest, OperationalRouteProfile, RouterDispatcher, RpcError,
+    MSG_ADMIN_COMMAND_RESPONSE,
+};
 use fluxbee_sdk::{
     build_node_config_response_message, list_ich_options_from_hive_id,
     try_handle_default_node_status, IdentityIchOption, NodeConfig, RouteMatch, RouteTarget,
@@ -12776,6 +12779,37 @@ async fn execute_admin_translation(
         .await
 }
 
+/// Did this admin call expire without a verdict?
+///
+/// The distinction is the whole point of `timeout_unknown`: an expired
+/// `ADMIN_COMMAND` is **unknown**, not failed. The hive very likely finished the
+/// work anyway — a real `add_hive` runs well past the 180 s admin window — so the
+/// operation must stay non-terminal for `reconcile_timeout_unknown_operation` to
+/// resolve it against reality later.
+///
+/// Matched on the TYPE, never on the Display. The previous string sniff looked for
+/// `"timeout waiting ADMIN_COMMAND_RESPONSE"`, a substring `RpcError::Timeout` has
+/// never rendered — it reads `timeout waiting response … request_msg=… \
+/// response_msg=ADMIN_COMMAND_RESPONSE …`. So the predicate was permanently false:
+/// every timed-out operation was persisted as terminally `failed`, and the entire
+/// reconciliation path was unreachable code.
+///
+/// Walks the source chain because the executor boxes the `RpcError` as
+/// `Box<dyn Error>` (`execute_admin_action_with_context`), and a future layer may
+/// wrap rather than propagate it.
+fn admin_error_is_admin_timeout(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(cause) = current {
+        if let Some(rpc) = cause.downcast_ref::<RpcError>() {
+            return rpc
+                .timeout_response_msg()
+                .is_some_and(|msg| msg.eq_ignore_ascii_case(MSG_ADMIN_COMMAND_RESPONSE));
+        }
+        current = cause.source();
+    }
+    false
+}
+
 async fn execute_tracked_admin_translation(
     state: &ArchitectState,
     session_id: &str,
@@ -12882,7 +12916,7 @@ async fn execute_tracked_admin_translation(
         }
         Err(err) => {
             let err_text = err.to_string();
-            operation.status = if err_text.contains("timeout waiting ADMIN_COMMAND_RESPONSE") {
+            operation.status = if admin_error_is_admin_timeout(err.as_ref()) {
                 "timeout_unknown".to_string()
             } else {
                 "failed".to_string()
@@ -24048,6 +24082,58 @@ mod tests {
     };
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn admin_timeout_error(response_msg: &str) -> RpcError {
+        RpcError::Timeout {
+            trace_id: "trace-1".to_string(),
+            target: "SY.admin@motherbee".to_string(),
+            request_msg: "ADMIN_COMMAND".to_string(),
+            response_msg: response_msg.to_string(),
+            timeout_ms: 180_000,
+        }
+    }
+
+    /// THE regression guard. This assertion is what was missing: the classifier
+    /// used to sniff for a substring the Display cannot produce, so every expired
+    /// admin operation was recorded as terminally `failed` and the whole
+    /// `timeout_unknown` reconciliation path never ran.
+    #[test]
+    fn admin_timeout_display_never_contained_the_substring_we_used_to_match() {
+        let rendered = admin_timeout_error(MSG_ADMIN_COMMAND_RESPONSE).to_string();
+        assert!(
+            !rendered.contains("timeout waiting ADMIN_COMMAND_RESPONSE"),
+            "the old predicate would silently start matching again: {rendered}"
+        );
+        assert!(rendered.contains("timeout waiting response"));
+        assert!(rendered.contains("response_msg=ADMIN_COMMAND_RESPONSE"));
+    }
+
+    #[test]
+    fn admin_command_timeout_classifies_as_timeout_unknown() {
+        let err = admin_timeout_error(MSG_ADMIN_COMMAND_RESPONSE);
+        assert!(admin_error_is_admin_timeout(&err));
+
+        // ...and it survives the boxing the executor actually does.
+        let boxed: ArchitectError = Box::new(admin_timeout_error(MSG_ADMIN_COMMAND_RESPONSE));
+        assert!(admin_error_is_admin_timeout(boxed.as_ref()));
+    }
+
+    #[test]
+    fn non_admin_timeouts_and_other_failures_stay_failed() {
+        // A timeout on a different exchange is not an unknown ADMIN_COMMAND.
+        assert!(!admin_error_is_admin_timeout(&admin_timeout_error(
+            "ILK_PROVISION_RESPONSE"
+        )));
+        // A genuine rejection is terminal: reconciling it would be wrong.
+        assert!(!admin_error_is_admin_timeout(&RpcError::Rejected {
+            action: "add_hive".to_string(),
+            error_code: "HIVE_EXISTS".to_string(),
+            message: "already joined".to_string(),
+        }));
+        // And a plain stringly error must not be promoted to "unknown".
+        let flattened: ArchitectError = "timeout waiting response for something".into();
+        assert!(!admin_error_is_admin_timeout(flattened.as_ref()));
+    }
 
     fn sample_blob_ref(filename: &str, mime: &str, size: u64) -> BlobRef {
         BlobRef {

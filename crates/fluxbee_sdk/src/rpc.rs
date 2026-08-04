@@ -136,6 +136,31 @@ pub enum RpcError {
     },
 }
 
+impl RpcError {
+    /// True when the call expired without a response — i.e. the outcome is
+    /// **unknown**, not failed: the peer may well have completed the work.
+    ///
+    /// Exists so callers stop reconstructing this from `to_string()`. Sniffing
+    /// the Display is how `sy_architect` silently lost its whole
+    /// `timeout_unknown` reconciliation path: it matched
+    /// `"timeout waiting ADMIN_COMMAND_RESPONSE"`, a substring this Display has
+    /// never produced (the message reads `timeout waiting response …
+    /// response_msg=ADMIN_COMMAND_RESPONSE …`), so every expired operation was
+    /// recorded as terminally `failed`.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, RpcError::Timeout { .. })
+    }
+
+    /// For a [`RpcError::Timeout`], the message that was awaited
+    /// (e.g. `ADMIN_COMMAND_RESPONSE`). `None` for every other variant.
+    pub fn timeout_response_msg(&self) -> Option<&str> {
+        match self {
+            RpcError::Timeout { response_msg, .. } => Some(response_msg.as_str()),
+            _ => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pending matcher
 // ---------------------------------------------------------------------------
