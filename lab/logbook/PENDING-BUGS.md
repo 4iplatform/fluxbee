@@ -35,6 +35,7 @@ infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambi
 | [U-9](#u-9) | 🔴 abierto | Las rutas desconocidas devuelven `{"error":"not_found"}` pelado | no |
 | [U-10](#u-10) | ✅ **cerrado y VALIDADO en vivo** | Un upgrade del `.deb` dejaba huérfano a todo nodo runtime | — |
 | [U-11](#u-11) | ✅ **cerrado y VALIDADO en vivo** | IO.cloud no podía auto-publicar su canal | — |
+| [U-12](#u-12) | 🔴 abierto | `kill_node` → `remove_node_instance` es una carrera; si falla, el nodo **reaparece solo** | no |
 
 ---
 
@@ -821,3 +822,36 @@ desde internet: sin credencial `401`, con bearer un `create_tenant` completo con
 
 ⇒ **El operador ya no tiene que publicar el canal a mano.** El paso 2 del checklist de
 [`docs/io-cloud-api.md`](../../docs/io-cloud-api.md) §5 queda obsoleto a partir de 0.1.6.
+
+---
+
+<a id="u-12"></a>
+## U-12 🔴 — `kill_node` → `remove_node_instance` es una carrera, y la guía no lo dice
+
+**Encontrado el 2026-08-04** limpiando nodos de prueba en producción.
+
+`kill_node` responde `status: ok` **antes** de que systemd haya terminado de bajar la unit. Un
+`remove_node_instance` inmediatamente después falla:
+
+```text
+kill=ok    remove_instance=error NODE_INSTANCE_RUNNING
+```
+
+Hay que **esperar a que la unit quede inactiva** entre las dos llamadas. Con una espera de por
+medio, las dos dan `ok` a la primera.
+
+**Por qué importa más de lo que parece:** `remove_node_instance` es lo único que borra
+`/var/lib/fluxbee/nodes/<KIND>/<node>/` (`remove_node_instance_dir_with_root` →
+`fs::remove_dir_all`). Si falla y el operador no mira la respuesta, **el config queda**, y en el
+próximo arranque del orchestrator `reconcile_persisted_custom_nodes` **relanza el nodo**. El nodo
+"eliminado" reaparece solo.
+
+Me pasó exactamente eso: di por limpios dos nodos de prueba, y reaparecieron tras el siguiente
+upgrade. **Error propio de método** —mandé la salida a `/dev/null` y no verifiqué— pero la API
+ayuda poco: el `ok` del kill no significa que se pueda continuar.
+
+**Arreglos posibles, a charlar:** que `kill_node` no responda hasta que la unit esté abajo; o que
+`remove_node_instance` espere/reintente en vez de rechazar; o un `purge` atómico que haga las dos.
+
+**Mientras tanto**, la secuencia correcta está documentada en el HANDBOOK: `kill` → **esperar
+`systemctl is-active` en falso** → `remove_instance`, y **mirar las dos respuestas**.
