@@ -12,7 +12,7 @@ use chrono::Utc;
 use fluxbee_sdk::identity::list_ilks_from_hive_config;
 use fluxbee_sdk::protocol::{
     Destination, Message, Meta, Routing, VaultSecretChangedPayload, VaultSecretOp,
-    is_system_kind, MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL, SYSTEM_KIND,
+    is_system_kind, MSG_VAULT_SECRET_CHANGED, SCOPE_GLOBAL, SYSTEM_KIND, VAULT_BOOTSTRAP_ACTION,
 };
 use fluxbee_sdk::{
     try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode, OperationalRouteProfile,
@@ -573,7 +573,9 @@ async fn emit_bootstrap_secret_broadcasts(
                 src_ilk: None,
                 scope: Some(SCOPE_GLOBAL.to_string()),
                 target: None,
-                action: Some("bootstrap".to_string()),
+                // Marks this as a boot re-announcement so destructive consumers can tell it
+                // apart from a real change (SY.edge restarts on a TLS change — see PB-9).
+                action: Some(VAULT_BOOTSTRAP_ACTION.to_string()),
                 priority: None,
                 context: None,
                 ..Meta::default()

@@ -500,6 +500,15 @@ pub const MSG_TIME_SYNC: &str = "TIME_SYNC";
 pub const MSG_WITHDRAW: &str = "WITHDRAW";
 pub const MSG_CONFIG_CHANGED: &str = "CONFIG_CHANGED";
 pub const MSG_VAULT_SECRET_CHANGED: &str = "VAULT_SECRET_CHANGED";
+
+/// Stamped in `Meta.action` (NOT in the payload) on the `VAULT_SECRET_CHANGED` broadcasts
+/// `SY.vault` emits for every secret it already holds during ITS OWN startup.
+///
+/// These are a re-announcement, not a change — they exist to rescue consumers that raced ahead
+/// of the vault at boot. Any consumer whose reaction is DESTRUCTIVE must check this: `SY.edge`
+/// reacts to a TLS change by exiting for a systemd restart, so before this was honoured every
+/// `sy-vault` bounce recycled a perfectly healthy public HTTPS listener (PB-9).
+pub const VAULT_BOOTSTRAP_ACTION: &str = "bootstrap";
 pub const MSG_CONFIG_GET: &str = "CONFIG_GET";
 pub const MSG_CONFIG_SET: &str = "CONFIG_SET";
 pub const MSG_CONFIG_RESPONSE: &str = "CONFIG_RESPONSE";
