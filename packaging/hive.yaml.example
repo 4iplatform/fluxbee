@@ -156,3 +156,23 @@ system_nodes:
 #   tls_vault_key: "edge_tls_fluxbee_ai"
 #   vault_hive: "motherbee"
 #   endpoints_path: "/etc/fluxbee/edge.endpoints.json"
+
+# --- egress (root-level section; NOT the `system_nodes.egress` list above) ------------
+# The managed internet chokepoint. `gateway_ip` means, BY CONTRACT, "where the WORKERS
+# egress": add_hive injects that default route into workers provisioned AFTER it is set.
+#
+# It does NOT route motherbee. That is deliberate — Fluxbee never rewrites the control
+# plane's own default route (doing it from a yaml field, on every boot and every watchdog
+# tick, with no rollback, on the box that provisions the egress, is a lockout). But
+# motherbee is where the nodes that call the internet run (IO.slack.*, IO.wapp.*, AI.*),
+# so the orchestrator VERIFIES motherbee's route against this value and logs
+# EGRESS_MOTHERBEE_BYPASS when they differ. Put motherbee on the egress path at the
+# host/network level if you want it there — or accept the bypass knowingly (PB-8).
+#
+# egress:
+#   enabled: true
+#   gateway_ip: "10.10.10.40"     # the egress hive's LAN address
+#   lan_cidr: "10.10.10.0/24"
+#   lan_iface: "ens19"            # the egress box's INTERNAL nic
+#   wan_iface: "ens18"            # the egress box's UPLINK nic
+#   ipv6: "block"

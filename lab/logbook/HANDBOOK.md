@@ -420,12 +420,21 @@ ruta a esa red** → se quedó sin DNS. **Los nodos con pata pública necesitan 
 El egress hace NAT, pero **los nodos tienen que usarlo como gateway** para que sirva de algo. Eso se
 declara en el `hive.yaml`.
 
-⚠️ **Según el código, se propaga a los workers pero NO a motherbee** — y motherbee es justo quien
-llama a OpenAI, Slack y Meta. → [PB-8](PENDING-BUGS.md#pb-8).
+⚠️ **El campo es, por diseño, la ruta de los WORKERS.** Motherbee **no entra en el modelo de
+egress** — y no es un olvido: Fluxbee nunca reescribe la ruta por defecto del propio plano de
+control (hacerlo desde un campo de yaml, en cada boot y cada tick de watchdog, sin rollback, en la
+caja que provisiona el egress, es un lockout). → [PB-8](PENDING-BUGS.md#pb-8).
 
-**Sin validar empíricamente todavía.** Está pendiente declarar `egress.gateway_ip` en el hive.yaml de
-MB y ver por dónde sale realmente su tráfico. **No des por hecho que tu motherbee sale por el
-egress** sin comprobarlo:
+Pero motherbee **es** donde corren los nodos que llaman a internet (`IO.slack.*`, `IO.wapp.*`,
+`AI.*`), así que el orchestrator **verifica** su ruta contra `gateway_ip` y loguea
+`EGRESS_MOTHERBEE_BYPASS` cuando no coinciden. Es observación, no corrección: si querés a motherbee
+sobre el egress, ponelo a nivel SO/red.
+
+⚠️ **Y la trampa más inmediata: hoy puede no rutear NADIE por el egress.** La inyección solo alcanza
+a los workers provisionados **después** de declarar el campo — un worker que se unió antes sigue con
+su gateway original.
+
+**No des por hecho que tu motherbee sale por el egress** sin comprobarlo:
 
 ```bash
 curl -s https://ifconfig.me      # desde motherbee: sale por la IP del egress?

@@ -2206,7 +2206,24 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
                 }
             }
         }
-        _ => {}
+        HiveRole::Motherbee => {
+            // PB-8: re-assert the OBSERVATION on the periodic tick (no internet probe here —
+            // the watchdog runs often and the probe costs a network round-trip). Read-only.
+            if periodic {
+                if let Some(gateway_ip) = eg
+                    .gateway_ip
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|g| !g.is_empty())
+                {
+                    let _ = verify_motherbee_egress(gateway_ip, false);
+                }
+            }
+        }
+        // Explicit, not `_`: an `enabled: false` egress hive used to fall into the catch-all
+        // by accident, because the arm above is guarded.
+        HiveRole::Egress => {}
+        HiveRole::Ingress => {}
     }
 }
 
@@ -5064,6 +5081,10 @@ struct EgressVerification {
     conntrack_tuned: bool,
     route_applied: bool,
     internet_reachable: bool,
+    /// Motherbee only (PB-8): its observed IPv4 default route equals the declared
+    /// `egress.gateway_ip`. Purely observational — on that path `route_applied` is
+    /// always `false` by contract, because Fluxbee never touches the control plane's route.
+    gateway_matches: bool,
 }
 
 /// First usable host of a CIDR: `(network & mask) + 1`. Uses std bit-math; no
@@ -5477,15 +5498,103 @@ fn ensure_egress_nft_boot_unit() -> Result<(), OrchestratorError> {
 /// Whether the current IPv4 default route already points at `gateway_ip`.
 /// Used by the watchdog to skip a no-op `ip route replace`. On any error
 /// reading the route table, returns false so the caller re-applies (safe).
-fn default_route_via(gateway_ip: &str) -> bool {
+/// The gateway of the first IPv4 default route, i.e. the token after `via`.
+///
+/// Pure, so the parsing is testable without a host. Mirrors how the validating
+/// `resolve_egress_nat_config` sits under the I/O shell `reconcile_egress_nat`.
+fn parse_default_gateway(route_output: &str) -> Option<String> {
+    route_output.lines().find_map(|line| {
+        let mut tokens = line.split_whitespace();
+        if tokens.next() != Some("default") {
+            return None;
+        }
+        let mut tokens = tokens.skip_while(|tok| *tok != "via");
+        tokens.next()?; // the literal "via"
+        tokens.next().map(str::to_string)
+    })
+}
+
+fn observed_default_gateway() -> Option<String> {
     let mut cmd = Command::new("ip");
     cmd.arg("-4").arg("route").arg("show").arg("default");
-    match run_cmd_output(cmd, "ip route show default") {
-        Ok(out) => out
-            .lines()
-            .any(|line| line.split_whitespace().any(|tok| tok == gateway_ip)),
-        Err(_) => false,
+    run_cmd_output(cmd, "ip route show default")
+        .ok()
+        .and_then(|out| parse_default_gateway(&out))
+}
+
+fn default_route_via(gateway_ip: &str) -> bool {
+    observed_default_gateway().is_some_and(|observed| observed == gateway_ip)
+}
+
+/// Is motherbee's own egress path the one the operator declared?
+#[derive(Debug, PartialEq, Eq)]
+enum MotherbeeEgressVerdict {
+    Match,
+    Bypass { observed: String },
+    Unknown,
+}
+
+fn motherbee_egress_verdict(declared: &str, observed: Option<&str>) -> MotherbeeEgressVerdict {
+    match observed.map(str::trim).filter(|o| !o.is_empty()) {
+        Some(o) if o == declared.trim() => MotherbeeEgressVerdict::Match,
+        Some(o) => MotherbeeEgressVerdict::Bypass {
+            observed: o.to_string(),
+        },
+        None => MotherbeeEgressVerdict::Unknown,
     }
+}
+
+/// PB-8: check — and ONLY check — whether motherbee egresses through the declared gateway.
+///
+/// `egress.gateway_ip` means, by documented contract, "where the WORKERS egress"; motherbee was
+/// never in the model. But motherbee is where `base-nodes.json` boots the nodes that actually
+/// call the internet (`IO.slack.*`, `IO.wapp.*`, `AI.*`), so an operator reading that field can
+/// reasonably believe those calls go through the managed chokepoint. Often they do not.
+///
+/// ⛔ THE FORBIDDEN FIX, so nobody "completes" this later: do NOT add `HiveRole::Motherbee` to the
+/// Worker arm of `reconcile_egress`. That would put the CONTROL PLANE rewriting its own default
+/// route on every boot and every watchdog tick, from a yaml field, with no rollback, on the very
+/// box that provisions the egress. On a worker that failure is non-fatal by design; on motherbee
+/// it is a lockout. Fluxbee reports the mismatch and leaves the route to the operator.
+fn verify_motherbee_egress(gateway_ip: &str, probe_internet: bool) -> EgressVerification {
+    // `route_applied` stays false on purpose: nothing was applied, and saying otherwise is the
+    // class of lie this whole change exists to remove.
+    let mut verification = EgressVerification::default();
+    let observed = observed_default_gateway();
+    let verdict = motherbee_egress_verdict(gateway_ip, observed.as_deref());
+    verification.gateway_matches = verdict == MotherbeeEgressVerdict::Match;
+
+    let probed = probe_internet && (command_exists("ping") || command_exists("curl"));
+    if probed {
+        verification.internet_reachable = check_internet_reachable();
+    }
+
+    match &verdict {
+        MotherbeeEgressVerdict::Match => tracing::info!(
+            declared_gateway = gateway_ip,
+            gateway_matches = true,
+            probed = probed,
+            internet_reachable = verification.internet_reachable,
+            "motherbee egress path matches the declared gateway (read-only; Fluxbee does not manage this route)"
+        ),
+        MotherbeeEgressVerdict::Bypass { observed } => tracing::warn!(
+            declared_gateway = gateway_ip,
+            observed_gateway = %observed,
+            probed = probed,
+            internet_reachable = verification.internet_reachable,
+            "EGRESS_MOTHERBEE_BYPASS: this hive's IPv4 default route is not the declared egress gateway; \
+             the nodes that run here reach the internet through the observed gateway, outside the managed \
+             chokepoint. Fluxbee does NOT rewrite the control plane's route — put motherbee on the egress \
+             path at the host/network level, or accept the bypass"
+        ),
+        MotherbeeEgressVerdict::Unknown => tracing::warn!(
+            declared_gateway = gateway_ip,
+            "EGRESS_MOTHERBEE_UNVERIFIED: no readable IPv4 default route on this hive; cannot confirm \
+             whether motherbee egresses through the declared gateway"
+        ),
+    }
+
+    verification
 }
 
 /// Smoke-test that the egress path reaches the internet. Tries ICMP first
@@ -5653,11 +5762,30 @@ fn reconcile_egress(state: &OrchestratorState) -> Result<(), OrchestratorError> 
             tracing::warn!("role=egress but egress.enabled=false; skipping NAT reconciliation");
         }
         HiveRole::Worker => {
-            if let Some(gateway_ip) = eg.gateway_ip.as_deref() {
+            if let Some(gateway_ip) = eg
+                .gateway_ip
+                .as_deref()
+                .map(str::trim)
+                .filter(|g| !g.is_empty())
+            {
                 reconcile_worker_egress(gateway_ip, &eg.ipv6)?;
             }
         }
-        HiveRole::Motherbee | HiveRole::Ingress => {}
+        HiveRole::Motherbee => {
+            // PB-8: VERIFY ONLY. `gateway_ip` is the workers' route by contract, but motherbee
+            // hosts the nodes that call the internet, so a mismatch is worth saying out loud.
+            // Fluxbee must never rewrite the control plane's own route — see
+            // `verify_motherbee_egress` for why that would be a lockout.
+            if let Some(gateway_ip) = eg
+                .gateway_ip
+                .as_deref()
+                .map(str::trim)
+                .filter(|g| !g.is_empty())
+            {
+                let _ = verify_motherbee_egress(gateway_ip, true);
+            }
+        }
+        HiveRole::Ingress => {}
     }
     Ok(())
 }
@@ -22134,6 +22262,71 @@ fn is_ingress_role(role: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_gateway_is_the_token_after_via() {
+        assert_eq!(
+            parse_default_gateway("default via 10.10.10.1 dev eth0 proto static metric 100\n")
+                .as_deref(),
+            Some("10.10.10.1")
+        );
+        // Several routes: the first default wins, and non-default lines are skipped.
+        assert_eq!(
+            parse_default_gateway(
+                "10.10.10.0/24 dev eth0 proto kernel scope link src 10.10.10.10\n\
+                 default via 192.168.8.1 dev eth1\n\
+                 default via 10.10.10.40 dev eth0 metric 200\n"
+            )
+            .as_deref(),
+            Some("192.168.8.1")
+        );
+        // A default route with no `via` (directly-connected) has no gateway to report.
+        assert_eq!(parse_default_gateway("default dev tun0 scope link\n"), None);
+        assert_eq!(parse_default_gateway(""), None);
+        // Must not match a line that merely mentions the word.
+        assert_eq!(parse_default_gateway("10.0.0.0/8 via 10.0.0.1 dev eth0\n"), None);
+    }
+
+    /// PB-8: motherbee is where the nodes that call the internet run, but the egress model
+    /// never covered it. Fluxbee reports the mismatch; it must NEVER rewrite the control
+    /// plane's own route (that would be a lockout).
+    #[test]
+    fn motherbee_egress_verdict_reports_without_touching_anything() {
+        assert_eq!(
+            motherbee_egress_verdict("10.10.10.40", Some("10.10.10.40")),
+            MotherbeeEgressVerdict::Match
+        );
+        // Whitespace on either side must not read as a bypass.
+        assert_eq!(
+            motherbee_egress_verdict(" 10.10.10.40 ", Some("10.10.10.40\n")),
+            MotherbeeEgressVerdict::Match
+        );
+        // The real prod condition: declared egress, actually leaving via the hypervisor SNAT.
+        assert_eq!(
+            motherbee_egress_verdict("10.10.10.40", Some("10.10.10.1")),
+            MotherbeeEgressVerdict::Bypass {
+                observed: "10.10.10.1".to_string()
+            }
+        );
+        // Unreadable route table is "unknown", never a silent match.
+        assert_eq!(
+            motherbee_egress_verdict("10.10.10.40", None),
+            MotherbeeEgressVerdict::Unknown
+        );
+        assert_eq!(
+            motherbee_egress_verdict("10.10.10.40", Some("   ")),
+            MotherbeeEgressVerdict::Unknown
+        );
+    }
+
+    /// `route_applied` must stay false on the motherbee path: nothing was applied, and
+    /// claiming otherwise is exactly the class of lie this change removes.
+    #[test]
+    fn motherbee_verification_never_claims_a_route_was_applied() {
+        let verification = EgressVerification::default();
+        assert!(!verification.route_applied);
+        assert!(!verification.gateway_matches);
+    }
 
     #[test]
     fn core_backup_retention_keeps_the_newest_generations() {
