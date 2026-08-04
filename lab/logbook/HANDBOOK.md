@@ -601,12 +601,19 @@ Un upgrade reemplaza `dist/runtimes/<rt>/<version>/` y borra la anterior. Los no
 tiene un **orden obligatorio**:
 
 ```bash
-DELETE /hives/{h}/nodes/{n}             # kill_node
-DELETE /hives/{h}/nodes/{n}/instance    # SIN esto: NODE_ALREADY_EXISTS
+# UNA sola llamada: baja el nodo Y borra su directorio persistido.
+DELETE /hives/{h}/nodes/{n}@{h}   -d '{"purge_instance":true}'
+
 POST   /hives/{h}/nodes                 # run_node — tenant_id es OBLIGATORIO
   {"node_name":"IO.api","runtime":"io.api","runtime_version":"current",
    "tenant_id":"tnt:00000000-0000-0000-0000-000000000001"}
 ```
+
+⚠️ **Usá `purge_instance`, no dos llamadas.** Encadenar `kill_node` y después
+`remove_node_instance` es una **carrera**: el kill responde `ok` antes de que systemd baje la unit
+y el remove falla con `NODE_INSTANCE_RUNNING`. Y si eso pasa sin que nadie mire la respuesta, el
+config **queda** y el nodo **reaparece solo** en el próximo arranque, porque la reconciliación lo
+relanza desde el config persistido. El nombre va **calificado** (`<node>@<hive>`).
 
 ⚠️ **Esta recuperación pierde la configuración del nodo.** Con nodos `UNCONFIGURED` no cuesta nada;
 con tokens cargados es una pérdida real.

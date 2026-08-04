@@ -35,7 +35,7 @@ infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambi
 | [U-9](#u-9) | 🔴 abierto | Las rutas desconocidas devuelven `{"error":"not_found"}` pelado | no |
 | [U-10](#u-10) | ✅ **cerrado y VALIDADO en vivo** | Un upgrade del `.deb` dejaba huérfano a todo nodo runtime | — |
 | [U-11](#u-11) | ✅ **cerrado y VALIDADO en vivo** | IO.cloud no podía auto-publicar su canal | — |
-| [U-12](#u-12) | 🔴 abierto | `kill_node` → `remove_node_instance` es una carrera; si falla, el nodo **reaparece solo** | no |
+| [U-12](#u-12) | 🟡 corregido | La carrera existe, pero **hay una llamada atómica que la evita** y yo no la encontré | no |
 
 ---
 
@@ -826,32 +826,54 @@ desde internet: sin credencial `401`, con bearer un `create_tenant` completo con
 ---
 
 <a id="u-12"></a>
-## U-12 🔴 — `kill_node` → `remove_node_instance` es una carrera, y la guía no lo dice
+## U-12 🟡 — La carrera existe, pero la operación atómica YA ESTÁ HECHA
 
-**Encontrado el 2026-08-04** limpiando nodos de prueba en producción.
+**Corregido el 2026-08-04, el mismo día que lo reporté.** Lo planteé mal.
 
-`kill_node` responde `status: ok` **antes** de que systemd haya terminado de bajar la unit. Un
-`remove_node_instance` inmediatamente después falla:
+### Lo que es cierto
 
-```text
-kill=ok    remove_instance=error NODE_INSTANCE_RUNNING
+Encadenar `kill_node` y después `remove_node_instance` **sí** es una carrera: el kill responde
+`status: ok` **antes** de que systemd baje la unit, y el remove inmediato falla con
+`NODE_INSTANCE_RUNNING`.
+
+Y la consecuencia también: `remove_node_instance` es lo único que borra
+`/var/lib/fluxbee/nodes/<KIND>/<node>/`, así que si falla y nadie mira la respuesta, el config
+queda y `reconcile_persisted_custom_nodes` **relanza el nodo** en el próximo arranque. Me pasó: di
+por limpios dos nodos de prueba y reaparecieron tras el upgrade siguiente.
+
+### Lo que estaba mal
+
+Propuse como arreglo *"un purge atómico que haga las dos"*. **Ya existe.** `kill_node` acepta
+`purge_instance`, y la propia autodocumentación lo dice:
+
+> *"Stop a node in a hive. Optional **purge_instance** also removes its persisted instance directory."*
+
+con el ejemplo incluido:
+
+```bash
+curl -X DELETE /hives/<hive>/nodes/<node>@<hive> -d '{"purge_instance":true}'
 ```
 
-Hay que **esperar a que la unit quede inactiva** entre las dos llamadas. Con una espera de por
-medio, las dos dan `ok` a la primera.
+**Probado en producción**, una sola llamada:
 
-**Por qué importa más de lo que parece:** `remove_node_instance` es lo único que borra
-`/var/lib/fluxbee/nodes/<KIND>/<node>/` (`remove_node_instance_dir_with_root` →
-`fs::remove_dir_all`). Si falla y el operador no mira la respuesta, **el config queda**, y en el
-próximo arranque del orchestrator `reconcile_persisted_custom_nodes` **relanza el nodo**. El nodo
-"eliminado" reaparece solo.
+```text
+antes:    unit active    · config existe
+DELETE {"purge_instance": true}  ->  status: ok
+después:  unit inactive  · config BORRADO
+```
 
-Me pasó exactamente eso: di por limpios dos nodos de prueba, y reaparecieron tras el siguiente
-upgrade. **Error propio de método** —mandé la salida a `/dev/null` y no verifiqué— pero la API
-ayuda poco: el `ok` del kill no significa que se pueda continuar.
+Sin carrera, sin segunda llamada, sin espera.
 
-**Arreglos posibles, a charlar:** que `kill_node` no responda hasta que la unit esté abajo; o que
-`remove_node_instance` espere/reintente en vez de rechazar; o un `purge` atómico que haga las dos.
+### Lo que queda como hallazgo real
 
-**Mientras tanto**, la secuencia correcta está documentada en el HANDBOOK: `kill` → **esperar
-`systemctl is-active` en falso** → `remove_instance`, y **mirar las dos respuestas**.
+1. **La secuencia de dos llamadas sigue siendo una trampa** para quien la use — y yo la había
+   escrito en el HANDBOOK como la receta de recuperación. **Corregido allí**: ahora usa
+   `purge_instance`.
+2. **`instance_removed` vuelve `null`** aunque el borrado ocurra. El campo está en la respuesta y
+   no se completa, así que un cliente que lo chequee no puede confirmar el purgado.
+
+### La lección, que es la tercera vez en esta sesión
+
+Antes de proponer construir algo, **preguntarle al sistema si ya lo tiene**
+(`GET /admin/actions/<accion>`). Me habría ahorrado un hallazgo mal planteado y una receta
+equivocada en el handbook.
