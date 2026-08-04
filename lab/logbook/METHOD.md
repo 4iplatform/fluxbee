@@ -76,6 +76,35 @@ mecanismo de acceso.
    referencia; (c) **rechazar el atajo** aunque el error lo sugiera (ej.: `-buildvcs=false`);
    (d) **registrar** el arreglo en `FINDINGS.md` con su evidencia; (e) ante un cambio **de diseño**
    (no un bug), sigue rigiendo: **se charla antes**.
+0d. **NINGÚN HALLAZGO SE REPORTA SIN UN INTENTO DE REFUTARLO** (regla del operador, 2026-08-04).
+   Nace de un error concreto: se reportó U-12 proponiendo construir una operación atómica de
+   "bajar nodo + purgar su directorio" que **ya existía** (`kill_node` con `purge_instance`, con
+   ejemplo en la autodocumentación) — y la secuencia inferior había quedado escrita en el
+   `HANDBOOK` como *la* receta. El operador no puede verificar cada detalle; **el adversario tiene
+   que ser el agente**.
+
+   El patrón del fallo, medido sobre los errores de esa sesión: **los hallazgos producidos en
+   solitario no tuvieron refutador; los que pasaron por revisión adversarial fueron corregidos a
+   tiempo.** No es cuestión de leer más rápido, es de tener un contradictor.
+
+   Antes de escribir "falta X" / "hay que construir Y", **es obligatorio**:
+   1. **Preguntarle al sistema.** `GET /admin/actions` y `GET /admin/actions/<accion>` exponen
+      rutas, esquema completo y ejemplos — incluidos **parámetros opcionales que no se ven leyendo
+      la firma de la función**. Ahí estaba `purge_instance`.
+   2. **Buscar con otros nombres.** El repo usa sinónimos: purge/remove/delete/kill,
+      ref/reference/key, glob/family/fanout, hot/reload/refresh/reconcile.
+   3. **Comparar con los hermanos.** Si los tres nodos de la familia hacen lo mismo, **no es un bug
+      de uno: es el contrato de la familia**, y llamarlo bug es el error. (Pasó con `configured`.)
+   4. **Revisar tests y `docs/`.** Hay capacidades que solo están ejercitadas ahí.
+
+   Y al reportar, **separar lo verificado de lo inferido**: qué se leyó en el código (con
+   `file:line`), qué se probó en vivo, y qué es suposición. Un hallazgo sin esa distinción no está
+   terminado.
+
+   **Corolario para el HANDBOOK:** una receta escrita ahí se va a seguir sin cuestionar. Nada entra
+   al handbook sin haberse ejecutado, y si se corrige un hallazgo hay que **revisar si contaminó
+   una receta**.
+
 0c. **No inventar mecanismos paralelos a los que el producto ya provee.** Si `add_hive` (o cualquier
    flujo de fluxbee) resuelve algo, se usa **ese** camino, aunque exista un atajo desde la posición
    privilegiada del agente. Motivo: las recetas deben ser **portables** (el próximo prod puede ser
