@@ -263,7 +263,7 @@ Three-layer example: messages arrive via API, a WF orchestrates the flow determi
                 "entry_actions": [
                   {
                     "type": "send_message",
-                    "target": "IO.slack@motherbee",
+                    "target": "IO.slack.default@motherbee",
                     "meta": { "msg": "SLACK_MIRROR" },
                     "payload": {
                       "direction": "inbound",
@@ -321,7 +321,7 @@ Three-layer example: messages arrive via API, a WF orchestrates the flow determi
                 "entry_actions": [
                   {
                     "type": "send_message",
-                    "target": "IO.slack@motherbee",
+                    "target": "IO.slack.default@motherbee",
                     "meta": { "msg": "SLACK_MIRROR" },
                     "payload": {
                       "direction": "outbound",
@@ -382,7 +382,7 @@ Three-layer example: messages arrive via API, a WF orchestrates the flow determi
                   },
                   {
                     "type": "send_message",
-                    "target": "IO.slack@motherbee",
+                    "target": "IO.slack.default@motherbee",
                     "meta": { "msg": "SLACK_MIRROR" },
                     "payload": {
                       "direction": "error",
@@ -407,7 +407,7 @@ Three-layer example: messages arrive via API, a WF orchestrates the flow determi
         "id": "s7",
         "action": "opa_compile_apply",
         "args": {
-          "rego": "package fluxbee.routing\n\n# API support messages enter via WF.support-mirror\nallow {\n    input.routing.dst == \"WF.support-mirror@motherbee\"\n    input.meta.msg == \"SUPPORT_REQUEST\"\n    input.routing.src_l2_name == \"IO.api.support@motherbee\"\n}\n\n# WF sends analysis requests to AI.support\nallow {\n    input.routing.dst == \"AI.support@motherbee\"\n    input.meta.msg == \"ANALYZE_SUPPORT\"\n    input.routing.src_l2_name == \"WF.support-mirror@motherbee\"\n}\n\n# WF mirrors to IO.slack\nallow {\n    input.routing.dst == \"IO.slack@motherbee\"\n    input.meta.msg == \"SLACK_MIRROR\"\n    input.routing.src_l2_name == \"WF.support-mirror@motherbee\"\n}\n\n# WF responds back to IO.api.support\nallow {\n    input.routing.dst == \"IO.api.support@motherbee\"\n    input.meta.msg == \"SUPPORT_RESPONSE\"\n    input.routing.src_l2_name == \"WF.support-mirror@motherbee\"\n}",
+          "rego": "package fluxbee.routing\n\n# API support messages enter via WF.support-mirror\nallow {\n    input.routing.dst == \"WF.support-mirror@motherbee\"\n    input.meta.msg == \"SUPPORT_REQUEST\"\n    input.routing.src_l2_name == \"IO.api.support@motherbee\"\n}\n\n# WF sends analysis requests to AI.support\nallow {\n    input.routing.dst == \"AI.support@motherbee\"\n    input.meta.msg == \"ANALYZE_SUPPORT\"\n    input.routing.src_l2_name == \"WF.support-mirror@motherbee\"\n}\n\n# WF mirrors to IO.slack\nallow {\n    input.routing.dst == \"IO.slack.default@motherbee\"\n    input.meta.msg == \"SLACK_MIRROR\"\n    input.routing.src_l2_name == \"WF.support-mirror@motherbee\"\n}\n\n# WF responds back to IO.api.support\nallow {\n    input.routing.dst == \"IO.api.support@motherbee\"\n    input.meta.msg == \"SUPPORT_RESPONSE\"\n    input.routing.src_l2_name == \"WF.support-mirror@motherbee\"\n}",
           "entrypoint": "fluxbee/routing/allow"
         },
         "executor_fill": ["hive"],

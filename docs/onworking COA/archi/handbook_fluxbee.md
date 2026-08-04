@@ -553,7 +553,7 @@ Rules:
 ### 8.2 IO tenant naming
 
 Single-tenant IO node:
-- `IO.slack@motherbee`
+- `IO.slack.default@motherbee`
 
 One IO node per tenant:
 - `IO.slack.T126@motherbee`

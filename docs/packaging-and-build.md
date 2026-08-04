@@ -52,7 +52,7 @@ Definido en `packaging/base-nodes.json`:
 | IO.blob | singleton | corriendo |
 | IO.cloud | singleton (role: motherbee) | corriendo (degradado si no hay Fluxbee Cloud — la Cloud es otro repo) |
 | io.api | runtime | instancia default `IO.api@motherbee` corriendo + spawnable |
-| io.slack | runtime | instancia default `IO.slack@motherbee` corriendo + spawnable |
+| io.slack | runtime | instancia default `IO.slack.default@motherbee` corriendo + spawnable |
 | ai.generic | runtime | instancia default `AI.chat@motherbee` corriendo + spawnable |
 | wf.engine | runtime | horneado, NO al boot — los nodos WF.* se spawnean desde un **workflow package** que corre sobre este runtime, no por `run_node` sobre el runtime pelado (da `WF_RUNTIME_PACKAGE_REQUIRED`) |
 | io.linkedhelper | runtime | horneado, NO al boot (spawnable a demanda) |
@@ -186,7 +186,7 @@ las instancias default de los boot-runtimes** (io.api/io.slack/ai.generic). Al t
 imprime los **próximos pasos**.
 
 Después del firstboot quedan **corriendo**: el core `SY.*` + IO.blob + IO.cloud +
-`AI.chat@motherbee` + `IO.api@motherbee` + `IO.slack@motherbee` — varios
+`AI.chat@motherbee` + `IO.api@motherbee` + `IO.slack.default@motherbee` — varios
 **degradados** hasta cargar sus secretos. (`wf.engine` queda **horneado pero NO al boot** —
 `boot:false` en `base-nodes.json`; se spawnea a demanda desde un workflow package.)
 

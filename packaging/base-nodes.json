@@ -53,7 +53,8 @@
       "bin": "io-slack",
       "workspace": "nodes/io",
       "boot": true,
-      "instance": "IO.slack@motherbee"
+      "instance": "IO.slack.default@motherbee",
+      "_note": "io.slack is instanced (one node per Slack workspace+channel binding; the ICH is derived from (workspace_id, conversation_id)). The boot instance uses the DOTTED name IO.slack.default for the same reason io.wapp does: a family glob 'IO.slack.*@<hive>' would NOT match a bare 'IO.slack'. Additional bindings are spawned per-tenant via run_node (Fluxbee Cloud does it through IO.cloud's provision_node). Inbound is Socket Mode (outbound WebSocket to slack.com), so this node needs NO edge endpoint — only egress to the internet."
     },
     {
       "_note": "io.wapp is fanout (one node per WhatsApp number; all share ONE Meta webhook). The boot instance uses the DOTTED name IO.wapp.default so it matches the externalize-as-fanout family glob 'IO.wapp.*@<hive>' (the bare 'IO.wapp' would NOT match that glob). Additional per-number nodes are spawned as IO.wapp.<label>@<hive> via run_node. Degraded until BOTH its vault secret (resource_type 'whatsapp') is loaded AND the operator externalizes the fanout webhook.",
