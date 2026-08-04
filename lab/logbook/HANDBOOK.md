@@ -335,7 +335,7 @@ Los nodos base (`IO.api`, `IO.slack`, `IO.wapp.default`, `AI.chat`) arrancan en 
 **Un comando contra una máquina Linux vacía.** Entra abierta, sale cerrada.
 
 ```jsonc
-POST /hives/motherbee/hives          // accion: add_hive
+POST /hives                          // accion: add_hive  (NO /hives/<hive>/hives)
 {
   "hive_id": "worker1",
   "role": "worker",                  // worker | ingress | egress
