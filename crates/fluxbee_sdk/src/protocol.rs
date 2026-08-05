@@ -499,6 +499,16 @@ pub const MSG_WAN_REJECT: &str = "WAN_REJECT";
 pub const MSG_TIME_SYNC: &str = "TIME_SYNC";
 pub const MSG_WITHDRAW: &str = "WITHDRAW";
 pub const MSG_CONFIG_CHANGED: &str = "CONFIG_CHANGED";
+/// Protocol version advertised in the WAN `HELLO` between hives.
+///
+/// TELEMETRY, NOT A GATE. In fluxbee the HASH is the gate and the VERSION is a report — the same
+/// split the OPA reload uses (different version → warn, different hash → reject).
+///
+/// ⛔ Do NOT start rejecting peers whose version differs. That is self-fencing: the cross-hive
+/// `SYSTEM_UPDATE` travels over the mesh and needs LSA visibility of its target, so cutting off
+/// the outdated peer severs the only channel capable of updating it (U-4a).
+pub const MESH_PROTOCOL_VERSION: &str = "fluxbee/1.16";
+
 pub const MSG_VAULT_SECRET_CHANGED: &str = "VAULT_SECRET_CHANGED";
 
 /// Stamped in `Meta.action` (NOT in the payload) on the `VAULT_SECRET_CHANGED` broadcasts

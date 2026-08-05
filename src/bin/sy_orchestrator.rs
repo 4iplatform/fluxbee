@@ -8381,9 +8381,100 @@ async fn list_versions_flow(state: &OrchestratorState) -> serde_json::Value {
             }));
         }
     }
+    let comparison = versions_comparison(&state.hive_id, &hives);
     serde_json::json!({
         "status": "ok",
         "hives": hives,
+        "comparison": comparison,
+    })
+}
+
+/// Compare every hive's snapshot against motherbee's and emit a VERDICT.
+///
+/// U-4a: `/versions` used to aggregate snapshots and leave the diffing to the reader — which
+/// means the one endpoint an operator opens mid-incident answered "here are some numbers"
+/// instead of "these two hives disagree".
+///
+/// A hive whose snapshot could not be fetched is `unknown`, never `differs`: not knowing is not
+/// the same as knowing they are different, and conflating them turns an unreachable spoke into
+/// a phantom drift report.
+fn versions_comparison(reference_hive: &str, hives: &[serde_json::Value]) -> serde_json::Value {
+    let dimension = |snapshot: &serde_json::Value, section: &str| -> Option<String> {
+        snapshot
+            .get(section)
+            .and_then(|s| s.get("manifest_hash"))
+            .and_then(|h| h.as_str())
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+    };
+
+    let reference = hives
+        .iter()
+        .find(|h| h.get("hive_id").and_then(|v| v.as_str()) == Some(reference_hive));
+    let Some(reference) = reference else {
+        return serde_json::json!({
+            "reference_hive": reference_hive,
+            "verdict": "unknown",
+            "detail": "no snapshot for the reference hive",
+        });
+    };
+
+    const SECTIONS: [&str; 3] = ["core", "vendor", "runtime"];
+    let mut entries = Vec::new();
+    let mut any_differs = false;
+    let mut any_unknown = false;
+
+    for snapshot in hives {
+        let hive_id = snapshot
+            .get("hive_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>");
+        if hive_id == reference_hive {
+            continue;
+        }
+        let unreachable = snapshot.get("status").and_then(|v| v.as_str()) == Some("error");
+        let mut per_section = serde_json::Map::new();
+        let mut hive_verdict = "match";
+        for section in SECTIONS {
+            let verdict = if unreachable {
+                "unknown"
+            } else {
+                match (dimension(reference, section), dimension(snapshot, section)) {
+                    (Some(a), Some(b)) if a == b => "match",
+                    (Some(_), Some(_)) => "differs",
+                    _ => "unknown",
+                }
+            };
+            if verdict == "differs" {
+                hive_verdict = "differs";
+            } else if verdict == "unknown" && hive_verdict == "match" {
+                hive_verdict = "unknown";
+            }
+            per_section.insert(section.to_string(), serde_json::json!(verdict));
+        }
+        match hive_verdict {
+            "differs" => any_differs = true,
+            "unknown" => any_unknown = true,
+            _ => {}
+        }
+        entries.push(serde_json::json!({
+            "hive_id": hive_id,
+            "verdict": hive_verdict,
+            "sections": per_section,
+        }));
+    }
+
+    let verdict = if any_differs {
+        "differs"
+    } else if any_unknown {
+        "unknown"
+    } else {
+        "match"
+    };
+    serde_json::json!({
+        "reference_hive": reference_hive,
+        "verdict": verdict,
+        "hives": entries,
     })
 }
 
@@ -22468,6 +22559,79 @@ fn is_ingress_role(role: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// U-4a: `/versions` must emit a VERDICT, not just a pile of hashes — and "unreachable"
+    /// must never be reported as "differs".
+    #[test]
+    fn versions_comparison_emits_a_verdict_and_never_guesses() {
+        let snap = |hive: &str, core: &str, vendor: &str, runtime: &str| {
+            serde_json::json!({
+                "hive_id": hive,
+                "core": { "manifest_hash": core },
+                "vendor": { "manifest_hash": vendor },
+                "runtime": { "manifest_hash": runtime },
+            })
+        };
+
+        // Everything in step.
+        let out = versions_comparison(
+            "motherbee",
+            &[snap("motherbee", "aa", "bb", "cc"), snap("w1", "aa", "bb", "cc")],
+        );
+        assert_eq!(out["verdict"], "match");
+        assert_eq!(out["hives"][0]["verdict"], "match");
+
+        // One dimension drifted: the hive AND the fleet must say so.
+        let out = versions_comparison(
+            "motherbee",
+            &[snap("motherbee", "aa", "bb", "cc"), snap("w1", "ZZ", "bb", "cc")],
+        );
+        assert_eq!(out["verdict"], "differs");
+        assert_eq!(out["hives"][0]["sections"]["core"], "differs");
+        assert_eq!(out["hives"][0]["sections"]["vendor"], "match");
+
+        // Hash comparison is case/whitespace insensitive — a formatting difference is not drift.
+        let out = versions_comparison(
+            "motherbee",
+            &[snap("motherbee", "AA", "bb", "cc"), snap("w1", " aa ", "bb", "cc")],
+        );
+        assert_eq!(out["verdict"], "match");
+
+        // An unreachable hive is UNKNOWN, never differs — otherwise a spoke that is merely down
+        // reads as a version incident.
+        let out = versions_comparison(
+            "motherbee",
+            &[
+                snap("motherbee", "aa", "bb", "cc"),
+                serde_json::json!({"hive_id": "w1", "status": "error", "message": "unreachable"}),
+            ],
+        );
+        assert_eq!(out["verdict"], "unknown");
+        assert_eq!(out["hives"][0]["verdict"], "unknown");
+        assert_eq!(out["hives"][0]["sections"]["core"], "unknown");
+
+        // A real difference outranks an unknown: the fleet verdict must not be softened.
+        let out = versions_comparison(
+            "motherbee",
+            &[
+                snap("motherbee", "aa", "bb", "cc"),
+                snap("w1", "ZZ", "bb", "cc"),
+                serde_json::json!({"hive_id": "w2", "status": "error"}),
+            ],
+        );
+        assert_eq!(out["verdict"], "differs");
+
+        // No reference snapshot at all -> unknown, never a false match.
+        let out = versions_comparison("motherbee", &[snap("w1", "aa", "bb", "cc")]);
+        assert_eq!(out["verdict"], "unknown");
+    }
+
+    /// The mesh protocol version must live in exactly one place, and it must be telemetry.
+    #[test]
+    fn mesh_protocol_version_is_a_single_constant() {
+        assert!(!fluxbee_sdk::protocol::MESH_PROTOCOL_VERSION.is_empty());
+        assert!(fluxbee_sdk::protocol::MESH_PROTOCOL_VERSION.starts_with("fluxbee/"));
+    }
 
     /// PB-7: which recorded states a re-POST of `add_hive` may resume from.
     ///

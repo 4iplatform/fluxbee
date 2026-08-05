@@ -35,7 +35,7 @@ use fluxbee_sdk::protocol::{
     LsaNode, LsaPayload, LsaRoute, LsaTap, LsaVpn, Message, Meta, NodeAnnouncePayload,
     NodeHelloPayload, OpaReloadPayload, RouterHelloPayload, WanAcceptPayload, WanHelloPayload,
     WanNegotiated, WanReachabilityEntry, WanReachabilityPayload, WanRejectPayload, WanTimers,
-    MSG_CONFIG_CHANGED, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE, MSG_EDGE_LIST_URLS,
+    MESH_PROTOCOL_VERSION, MSG_CONFIG_CHANGED, MSG_EDGE_CLOSE_URL, MSG_EDGE_CLOSE_URL_RESPONSE, MSG_EDGE_LIST_URLS,
     MSG_EDGE_LIST_URLS_RESPONSE, MSG_EDGE_OPEN_URL, MSG_EDGE_OPEN_URL_RESPONSE,
     MSG_EDGE_PUBLISH_BLOB, MSG_EDGE_PUBLISH_BLOB_RESPONSE, MSG_EDGE_UNPUBLISH_BLOB,
     MSG_EDGE_UNPUBLISH_BLOB_RESPONSE, MSG_HELLO, MSG_LSA, MSG_OPA_RELOAD, MSG_TTL_EXCEEDED,
@@ -2809,7 +2809,7 @@ where
     });
 
     let hello_payload = WanHelloPayload {
-        protocol: "fluxbee/1.16".to_string(),
+        protocol: MESH_PROTOCOL_VERSION.to_string(),
         router_id: ctx.router_uuid.to_string(),
         router_name: ctx.router_name.clone(),
         hive_id: ctx.hive_id.clone(),
@@ -2884,6 +2884,21 @@ where
         let _ = tx.send(serde_json::to_vec(&hello)?);
     }
 
+    // U-4a: the HELLO has always carried a protocol version and nobody ever looked at it — the
+    // field existed and was dead, which is worse than absent because it reads like a guarantee.
+    // REPORT ONLY. Rejecting the peer would be self-fencing: the cross-hive SYSTEM_UPDATE rides
+    // this mesh and needs LSA visibility of its target, so cutting off an outdated hive severs
+    // the very channel that could update it. Hash gates, version reports.
+    if peer_hello.protocol != MESH_PROTOCOL_VERSION {
+        tracing::warn!(
+            peer_hive = %peer_hello.hive_id,
+            peer_protocol = %peer_hello.protocol,
+            local_protocol = %MESH_PROTOCOL_VERSION,
+            "MESH_PROTOCOL_SKEW: peer advertises a different mesh protocol; accepting the session \
+             anyway (a version difference is telemetry, not a gate). Bring the fleet to one build."
+        );
+    }
+
     let peer_uuid = Uuid::parse_str(&peer_hello.router_id)?;
     let session_epoch = {
         let mut guard = ctx.wan_session_epochs.lock().await;
@@ -2902,7 +2917,7 @@ where
         WanAcceptPayload {
             peer_router_id: peer_hello.router_id.clone(),
             negotiated: WanNegotiated {
-                protocol: "fluxbee/1.16".to_string(),
+                protocol: MESH_PROTOCOL_VERSION.to_string(),
                 hello_interval_ms: ctx.hello_interval_ms,
                 dead_interval_ms: ctx.dead_interval_ms,
             },
