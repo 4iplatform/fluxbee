@@ -782,8 +782,18 @@ por nombre de archivo.
 Lo que devuelve `GET /drift-alerts` son **entradas sintéticas** (`local_current_state`,
 `severity=info`) que `enrich_drift_alert_history_entries` fabrica **a partir del snapshot actual**
 cuando el hive local no tiene entradas en el archivo — o sea, **siempre**. El endpoint que el README
-documenta como *"Historical drift alert entries"* devuelve **un snapshot vivo disfrazado de
-historial**, que es peor que devolver vacío.
+documenta como *"Historical drift alert entries"* devuelve, en la práctica, **siempre** ese
+snapshot.
+
+> **Corrección mía (2026-08-05).** Acá había escrito *"un snapshot vivo disfrazado de historial,
+> peor que devolver vacío"*. **Es injusto con el código y lo retiro.** Las filas sintéticas dicen
+> literalmente *"No historical drift alert entry was recorded for this category"*, y viajan con
+> `severity: info`, `kind: local_current_state` y `synthetic: true` — un marcador documentado en
+> `README.md:1002`. No engañan: avisan. Además la síntesis **solo dispara si el hive local no
+> tiene filas reales**, así que se retira sola en cuanto exista un escritor.
+>
+> O sea: la síntesis **no se toca**, no hay cambio de esquema y no hay decisión de producto
+> pendiente. El bug es **solo** el escritor que falta.
 
 Es el bug real detrás de U-4, **y es independiente de versiones**. Falta además: `GET /versions`
 agrega snapshots **sin emitir veredicto** (debería marcar qué hives difieren del de motherbee), y los
