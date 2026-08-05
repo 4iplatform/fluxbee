@@ -291,9 +291,12 @@ async fn main() -> Result<(), SyEdgeError> {
             )
             .await
             {
-                Ok((cfg, version, diagnosis)) => {
+                Ok((cfg, version, diagnosis, fingerprint)) => {
                     log_tls_chain_diagnosis("vault", diagnosis);
-                    live_tls = LiveTlsMaterial::FromVault { version };
+                    live_tls = LiveTlsMaterial::FromVault {
+                        version,
+                        fingerprint: Some(fingerprint),
+                    };
                     Some(Arc::new(cfg))
                 }
                 Err(err) => {
@@ -496,7 +499,7 @@ async fn main() -> Result<(), SyEdgeError> {
                         match tls_secret_change_action(
                             &msg.payload,
                             config.tls_vault_key.as_deref(),
-                            live_tls,
+                            live_tls.clone(),
                             is_bootstrap,
                         ) {
                             TlsSecretChange::ReloadRequired { key, op, version } => {
@@ -522,7 +525,7 @@ async fn main() -> Result<(), SyEdgeError> {
                                         &key,
                                     )
                                     .await
-                                    .map(|(_, _, diagnosis)| diagnosis);
+                                    .map(|(_, _, diagnosis, _)| diagnosis);
                                     // Only a transient failure is worth retrying: bad material
                                     // will be just as bad next time.
                                     match &probe {
@@ -570,12 +573,54 @@ async fn main() -> Result<(), SyEdgeError> {
                                     }
                                 }
                             }
-                            TlsSecretChange::BootstrapAlreadyLoaded { key, version } => {
-                                tracing::info!(
-                                    key = %key,
-                                    version = version,
-                                    "sy-edge: sy-vault re-announced at its own boot the cert version already live; not restarting"
-                                );
+                            TlsSecretChange::BootstrapAlreadyLoaded {
+                                key,
+                                version,
+                                live_fingerprint,
+                            } => {
+                                // CONFIRM before suppressing. A vault rollback sets
+                                // `current_version = previous_version` and the next put re-mints
+                                // that same number, so a matching version can denote DIFFERENT
+                                // material — and suppressing on it would leave the edge serving
+                                // a cert the operator already replaced.
+                                match fetch_tls_config_from_vault(
+                                    Arc::clone(&dispatcher),
+                                    self_ilk.clone(),
+                                    self_name.clone(),
+                                    config.vault_hive.clone(),
+                                    &key,
+                                )
+                                .await
+                                {
+                                    Ok((_, _, _, fingerprint))
+                                        if live_fingerprint.as_deref() == Some(&fingerprint) =>
+                                    {
+                                        tracing::info!(
+                                            key = %key,
+                                            version = version,
+                                            "sy-edge: sy-vault re-announced at its own boot the material already live; not restarting"
+                                        );
+                                    }
+                                    Ok(_) => {
+                                        tracing::warn!(
+                                            key = %key,
+                                            version = version,
+                                            "sy-edge: bootstrap announced the live version number but DIFFERENT material (a vault rollback reuses numbers); restarting to load it"
+                                        );
+                                        tokio::time::sleep(std::time::Duration::from_millis(250))
+                                            .await;
+                                        std::process::exit(0);
+                                    }
+                                    Err(failure) => {
+                                        // Cannot confirm: keep serving. A bootstrap re-announce
+                                        // is not urgent, and the next one will retry.
+                                        tracing::warn!(
+                                            key = %key,
+                                            detail = %failure.detail(),
+                                            "sy-edge: could not confirm the bootstrap-announced material; keeping the current cert"
+                                        );
+                                    }
+                                }
                             }
                             TlsSecretChange::DeletedKeepServing { key } => {
                                 tracing::error!(
@@ -1870,14 +1915,25 @@ fn load_tls_config(
 /// `version` is what the vault reported on the BOOT fetch and must never be updated by a
 /// reload probe: if a probe wrote its version back here, an edge that refused to load bad
 /// material would silently claim to serve it, and the complaint would go quiet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum LiveTlsMaterial {
     /// Not serving vault-sourced TLS — no public frontend on this role, or the cert came from
     /// disk. Nothing a vault event can invalidate.
     NotFromVault,
-    /// Serving vault-sourced TLS. `None` means the vault reported no version, so we cannot
-    /// compare and must treat every event as invalidating.
-    FromVault { version: Option<i64> },
+    /// Serving vault-sourced TLS. `version` is what the vault reported on the boot fetch;
+    /// `None` means it reported none, so we cannot compare and must treat every event as
+    /// invalidating.
+    ///
+    /// `fingerprint` is a sha256 of the cert material actually loaded, and it is what the
+    /// bootstrap check really compares. Version numbers alone are NOT a safe identity: a vault
+    /// rollback sets `current_version = previous_version` (sy_vault.rs:1253) and the next put
+    /// re-mints it, so within one vault.db a given number can denote different material at
+    /// different times — and suppressing on a stale number would leave the edge serving a cert
+    /// the operator already replaced.
+    FromVault {
+        version: Option<i64>,
+        fingerprint: Option<String>,
+    },
 }
 
 /// What a `VAULT_SECRET_CHANGED` broadcast means for this edge's TLS material.
@@ -1901,7 +1957,13 @@ enum TlsSecretChange {
     /// already serve. Not a change. Reacting here recycled a perfectly healthy public listener
     /// every single time `sy-vault` bounced — an upgrade, a reboot, a manual restart — for a
     /// ~5 s gap in public HTTPS each time (PB-9).
-    BootstrapAlreadyLoaded { key: String, version: i64 },
+    BootstrapAlreadyLoaded {
+        key: String,
+        version: i64,
+        /// Of the material we currently serve. The caller re-fetches and compares before
+        /// suppressing, because vault version numbers are reused across a rollback.
+        live_fingerprint: Option<String>,
+    },
 }
 
 /// Decide how to react to a `VAULT_SECRET_CHANGED` broadcast, given the vault key
@@ -1942,16 +2004,22 @@ fn tls_secret_change_action(
         return TlsSecretChange::Unrelated;
     }
     // `!=`, never `>`: a vault rollback legitimately moves the version DOWN.
-    if is_bootstrap
-        && live
-            == (LiveTlsMaterial::FromVault {
-                version: Some(parsed.version),
-            })
-    {
-        return TlsSecretChange::BootstrapAlreadyLoaded {
-            key: parsed.key,
-            version: parsed.version,
-        };
+    if is_bootstrap {
+        if let LiveTlsMaterial::FromVault {
+            version: Some(live_version),
+            fingerprint,
+        } = live
+        {
+            if live_version == parsed.version {
+                // A version match is NECESSARY but not sufficient: the caller confirms the
+                // material is byte-identical before suppressing the reload.
+                return TlsSecretChange::BootstrapAlreadyLoaded {
+                    key: parsed.key,
+                    version: parsed.version,
+                    live_fingerprint: fingerprint,
+                };
+            }
+        }
     }
     TlsSecretChange::ReloadRequired {
         key: parsed.key,
@@ -2040,7 +2108,7 @@ async fn fetch_tls_config_from_vault(
     self_name: String,
     vault_hive: String,
     secret_key: &str,
-) -> Result<(rustls::ServerConfig, Option<i64>, TlsChainDiagnosis), TlsFetchFailure> {
+) -> Result<(rustls::ServerConfig, Option<i64>, TlsChainDiagnosis, String), TlsFetchFailure> {
     let client = fluxbee_sdk::VaultClient::new(
         dispatcher,
         vault_hive,
@@ -2064,7 +2132,15 @@ async fn fetch_tls_config_from_vault(
         .ok_or_else(|| TlsFetchFailure::material("edge tls secret is missing a 'key' PEM field"))?;
     let (config, diagnosis) = tls_config_from_pem(cert.as_bytes(), key.as_bytes())
         .map_err(|err| TlsFetchFailure::material(err.to_string()))?;
-    Ok((config, version, diagnosis))
+    // Identity of the MATERIAL, not of the version number the vault happens to have assigned
+    // it. The number is reusable; the bytes are not.
+    let fingerprint = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(cert.as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
+    Ok((config, version, diagnosis, fingerprint))
 }
 
 /// Resolve any registry entries that carry a `secret_ref` but not yet the secret VALUE by
@@ -2936,7 +3012,7 @@ mod tests {
             tls_secret_change_action(
                 &vault_changed("edge_tls", "put", 2),
                 Some("edge_tls"),
-                LiveTlsMaterial::FromVault { version: Some(1) },
+                LiveTlsMaterial::FromVault { version: Some(1), fingerprint: Some("fp1".into()) },
                 false,
             ),
             TlsSecretChange::ReloadRequired {
@@ -2950,7 +3026,7 @@ mod tests {
                 tls_secret_change_action(
                     &vault_changed("edge_tls", op, 3),
                     Some("edge_tls"),
-                    LiveTlsMaterial::FromVault { version: Some(1) },
+                    LiveTlsMaterial::FromVault { version: Some(1), fingerprint: Some("fp1".into()) },
                     false,
                 ),
                 TlsSecretChange::ReloadRequired { .. }
@@ -2966,7 +3042,7 @@ mod tests {
             tls_secret_change_action(
                 &vault_changed("edge_tls", "delete", 0),
                 Some("edge_tls"),
-                LiveTlsMaterial::FromVault { version: Some(1) },
+                LiveTlsMaterial::FromVault { version: Some(1), fingerprint: Some("fp1".into()) },
                 false,
             ),
             TlsSecretChange::DeletedKeepServing {
@@ -2983,7 +3059,7 @@ mod tests {
             tls_secret_change_action(
                 &vault_changed("pg_main", "put", 7),
                 Some("edge_tls"),
-                LiveTlsMaterial::FromVault { version: Some(1) },
+                LiveTlsMaterial::FromVault { version: Some(1), fingerprint: Some("fp1".into()) },
                 false,
             ),
             TlsSecretChange::Unrelated
@@ -3009,12 +3085,16 @@ mod tests {
             tls_secret_change_action(
                 &vault_changed("edge_tls", "put", 4),
                 Some("edge_tls"),
-                LiveTlsMaterial::FromVault { version: Some(4) },
+                LiveTlsMaterial::FromVault {
+                    version: Some(4),
+                    fingerprint: Some("fp".into()),
+                },
                 true,
             ),
             TlsSecretChange::BootstrapAlreadyLoaded {
                 key: "edge_tls".into(),
                 version: 4,
+                live_fingerprint: Some("fp".into()),
             }
         );
     }
@@ -3029,7 +3109,10 @@ mod tests {
                     tls_secret_change_action(
                         &vault_changed("edge_tls", "put", 4),
                         Some("edge_tls"),
-                        LiveTlsMaterial::FromVault { version: live },
+                        LiveTlsMaterial::FromVault {
+                            version: live,
+                            fingerprint: Some("fp".into()),
+                        },
                         true,
                     ),
                     TlsSecretChange::ReloadRequired { .. }
@@ -3196,7 +3279,7 @@ mod tests {
             tls_secret_change_action(
                 &serde_json::json!({"op": "put"}),
                 Some("edge_tls"),
-                LiveTlsMaterial::FromVault { version: Some(1) },
+                LiveTlsMaterial::FromVault { version: Some(1), fingerprint: Some("fp1".into()) },
                 false,
             ),
             TlsSecretChange::Malformed { .. }

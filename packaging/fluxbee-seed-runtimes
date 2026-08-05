@@ -109,6 +109,7 @@ published=0
 
 while IFS=$'\t' read -r rt bin; do
   [ -n "${rt:-}" ] && [ -n "${bin:-}" ] || continue
+  was="$(current_of "$rt")"
   bin_path="$RUNTIMES_ROOT/$rt/$VER/bin/$bin"
   if [ ! -f "$bin_path" ]; then
     echo "fluxbee-seed-runtimes: ERROR missing artifact for $rt $VER: $bin_path" >&2
@@ -116,18 +117,23 @@ while IFS=$'\t' read -r rt bin; do
     continue
   fi
 
-  was="$(current_of "$rt")"
-
-  # --set-current is REQUIRED, not optional: dpkg just deleted the previous base version's
-  # directory during unpack, so leaving `current` pointing at it makes every base node
-  # unstartable — U-10 for the whole base set.
+  # `current` is only FORCED when what it points at is gone. The reason to force it is that
+  # dpkg deleted the previous PACKAGE version during unpack, leaving `current` dangling and
+  # every base node unstartable (U-10 for the whole base set). That reason does not apply to a
+  # version the operator hot-published and that is still on disk — snapping it back to the
+  # package build would silently undo their deployment on every upgrade.
+  set_current_args="--set-current --prune-missing"
+  if [ -n "$was" ] && [ "$was" != "$VER" ] && [ -d "$RUNTIMES_ROOT/$rt/$was" ]; then
+    set_current_args=""
+    echo "  NOTE: base runtime $rt keeps its hot-published current $was (its directory is intact);" \
+         "publishing $VER as available only"
+  fi
   if bash "$PUBLISH" \
       --runtime "$rt" \
       --version "$VER" \
       --binary "$bin_path" \
       --dist-root "$DIST_ROOT" \
-      --set-current \
-      --prune-missing >/dev/null; then
+      $set_current_args >/dev/null; then
     published=$((published + 1))
     if [ -n "$was" ] && [ "$was" != "$VER" ]; then
       demotions="$demotions  NOTE: base runtime $rt 'current' moved $was -> $VER (package authority)"$'\n'

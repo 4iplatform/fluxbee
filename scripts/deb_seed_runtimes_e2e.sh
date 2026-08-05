@@ -74,8 +74,10 @@ check "ai.generic current" "$(q "$M1" "d['runtimes']['ai.generic']['current']")"
 
 echo "== T2: THE U-3 CASE — dpkg deleted the manifest, a hot runtime must survive =="
 D2="$WORK/t2"; seed_artifacts "$D2" "$VER"
-# A hot-published runtime the operator created, plus the previous base version.
-mkdir -p "$D2/runtimes/wf.router/0.0.4/bin" "$D2/runtimes/io.api/0.1.2/bin"
+# A hot-published runtime the operator created. NOTE: the previous base version 0.1.2 gets NO
+# directory on purpose — dpkg owns those files and removes them during the unpack. Surviving the
+# unpack is precisely what marks a version as operator-published rather than package-shipped.
+mkdir -p "$D2/runtimes/wf.router/0.0.4/bin"
 SNAP2="$WORK/t2-snapshot.json"
 cat >"$SNAP2" <<JSON
 {"schema_version":1,"version":1,"updated_at":null,"runtimes":{
@@ -89,7 +91,7 @@ M2="$D2/runtimes/manifest.json"
 check "hot runtime survived" "$(q "$M2" "d['runtimes']['wf.router']['current']")" "0.0.4"
 check "hot runtime dir intact" "$([ -d "$D2/runtimes/wf.router/0.0.4" ] && echo yes || echo no)" "yes"
 check "base runtime advanced" "$(q "$M2" "d['runtimes']['io.api']['current']")" "$VER"
-check "old base version kept (dir present)" "$(q "$M2" "'0.1.2' in d['runtimes']['io.api']['available']")" "True"
+check "the version dpkg removed is pruned" "$(q "$M2" "'0.1.2' in d['runtimes']['io.api']['available']")" "False"
 check "manifest version advanced" "$(q "$M2" "d['version'] > 1")" "True"
 check "snapshot consumed on success" "$([ -f "$SNAP2" ] && echo yes || echo no)" "no"
 
@@ -105,6 +107,20 @@ run_seed "$D2b" >/dev/null
 M2b="$D2b/runtimes/manifest.json"
 check "dangling base version pruned" "$(q "$M2b" "'0.1.2' in d['runtimes']['io.api']['available']")" "False"
 check "prune did NOT touch the hot runtime" "$(q "$M2b" "d['runtimes']['wf.router']['available']")" "['0.0.4']"
+
+echo "== T2c: an upgrade must NOT demote a hot-published version of a BASE runtime =="
+D2c="$WORK/t2c"; seed_artifacts "$D2c" "$VER"
+# The operator published io.api 9.9.9 themselves and made it current. Its directory survives the
+# unpack because dpkg does not own it — so the upgrade must leave `current` alone.
+mkdir -p "$D2c/runtimes/io.api/9.9.9/bin"
+cat >"$D2c/runtimes/manifest.json" <<JSON
+{"schema_version":1,"version":1,"updated_at":null,"runtimes":{
+ "io.api":{"available":["9.9.9"],"current":"9.9.9"}}}
+JSON
+run_seed "$D2c" >/dev/null
+M2c="$D2c/runtimes/manifest.json"
+check "hot-published current preserved" "$(q "$M2c" "d['runtimes']['io.api']['current']")" "9.9.9"
+check "the package version is still offered" "$(q "$M2c" "'$VER' in d['runtimes']['io.api']['available']")" "True"
 
 echo "== T3: steady state — manifest present, no snapshot =="
 D3="$WORK/t3"; seed_artifacts "$D3" "$VER"

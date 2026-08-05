@@ -3451,7 +3451,7 @@ fn normalize_hash(value: &str) -> String {
 fn select_core_backup_generation(
     root: &Path,
     selector: &CoreRollbackSelector,
-) -> Result<CoreBackupGeneration, (&'static str, String)> {
+) -> Result<(PathBuf, CoreBackupGeneration), (&'static str, String)> {
     let mut generations: Vec<(PathBuf, CoreBackupGeneration)> = fs::read_dir(root)
         .into_iter()
         .flatten()
@@ -3568,7 +3568,10 @@ fn select_core_backup_generation(
         }
     }
 
-    Ok(generation)
+    // Return the directory we actually hashed. Recomputing it downstream from the stamp's
+    // `generation` FIELD would let a renamed or hand-copied directory verify one tree and
+    // restore from another.
+    Ok((dir, generation))
 }
 
 fn prune_core_backup_generations(keep: usize) {
@@ -3598,6 +3601,22 @@ fn prune_core_backup_generations_in(root: &Path, keep: usize) {
                     .is_some_and(|name| name.starts_with("update-"))
         })
         .collect();
+
+    // A generation with no stamp cannot be rolled back to, so it must never count against the
+    // retention budget: Phase A/B abort with `?` on a disk-full or EIO and leave the partial
+    // directory behind, and three of those in a row would otherwise evict every usable
+    // generation. Drop them eagerly, then apply `keep` to what is actually restorable.
+    let (usable, junk): (Vec<PathBuf>, Vec<PathBuf>) = generations
+        .into_iter()
+        .partition(|path| path.join(CORE_GENERATION_MANIFEST_NAME).is_file());
+    for path in junk {
+        tracing::warn!(
+            path = %path.display(),
+            "core backup retention: removing an unstamped generation (a core update failed partway)"
+        );
+        let _ = fs::remove_dir_all(&path);
+    }
+    let mut generations = usable;
     if generations.len() <= keep {
         return;
     }
@@ -3715,11 +3734,10 @@ async fn core_rollback_local(
     let _lifecycle_guard = state.runtime_lifecycle_lock.lock().await;
 
     let root = core_backup_root_dir();
-    let generation = match select_core_backup_generation(&root, &selector) {
-        Ok(generation) => generation,
+    let (backup_dir, generation) = match select_core_backup_generation(&root, &selector) {
+        Ok(selected) => selected,
         Err((code, message)) => return err(code, message),
     };
-    let backup_dir = root.join(&generation.generation);
     let restored: Vec<String> = generation
         .components
         .iter()
@@ -3742,16 +3760,26 @@ async fn core_rollback_local(
     // Byte-identical staging to the update path: tmp sibling + rename, which is what makes the
     // swap atomic against a running unit.
     let mut errors = Vec::new();
+    // Tracked per component: a partial failure leaves /usr/bin mixed, and the operator needs to
+    // know WHICH side each binary landed on.
+    let mut restored_ok: Vec<String> = Vec::new();
+    let mut restore_failed: Vec<String> = Vec::new();
     for component in &generation.components {
         let target = Path::new("/usr/bin").join(&component.name);
         let stage = Path::new("/usr/bin").join(format!(".{}.fluxbee.tmp", component.name));
-        if let Err(e) = (|| -> Result<(), OrchestratorError> {
+        match (|| -> Result<(), OrchestratorError> {
             fs::copy(backup_dir.join(&component.name), &stage)?;
             set_exec_0755(&stage)?;
             fs::rename(&stage, &target)?;
             Ok(())
         })() {
-            errors.push(format!("restore {} failed: {e}", component.name));
+            Ok(()) => restored_ok.push(component.name.clone()),
+            Err(e) => {
+                // Leave no staging file behind to be mistaken for a binary.
+                let _ = fs::remove_file(&stage);
+                restore_failed.push(component.name.clone());
+                errors.push(format!("restore {} failed: {e}", component.name));
+            }
         }
     }
     // Components the update CREATED have nothing to restore to: remove them.
@@ -3774,10 +3802,37 @@ async fn core_rollback_local(
             Some("ROLLBACK_FAILED".to_string()),
             generation.replaced_manifest_hash.clone(),
         );
-        return err(
-            "ROLLBACK_FAILED",
-            format!("core rollback errors: {}", errors.join("; ")),
+        // /usr/bin is now MIXED: some components are the old build, some are still the new one.
+        // Say so, and make the installed record say so too — leaving it claiming the new
+        // manifest would be a lie the next `versions` call would repeat, and the operator would
+        // have no way to know the box is inconsistent.
+        write_core_installed_record(
+            None,
+            "core_rollback_partial",
+            serde_json::json!({
+                "generation": generation.generation,
+                "inconsistent": true,
+                "restored": restored_ok,
+                "still_on_new_build": restore_failed,
+            }),
         );
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "ROLLBACK_FAILED",
+            "message": format!(
+                "core rollback left /usr/bin INCONSISTENT: restored {:?} but {:?} are still the \
+                 new build. Re-run the rollback, or `update category=core` to return to a \
+                 uniform build. Errors: {}",
+                restored_ok,
+                restore_failed,
+                errors.join("; ")
+            ),
+            "hive": state.hive_id,
+            "generation": generation.generation,
+            "inconsistent": true,
+            "restored": restored_ok,
+            "still_on_new_build": restore_failed,
+        });
     }
 
     // The hive is now DELIBERATELY off-manifest, and says so.
@@ -8961,20 +9016,32 @@ fn versions_comparison(reference_hive: &str, hives: &[serde_json::Value]) -> ser
     // `core_rollback` a hive is deliberately off-manifest, and comparing dist hashes would
     // report `match` for two hives running different binaries — a false "in sync" on the exact
     // endpoint an operator opens mid-incident.
-    let dimension = |snapshot: &serde_json::Value, section: &str| -> Option<String> {
-        let section_value = snapshot.get(section)?;
-        let installed = if section == "core" {
-            section_value
-                .get("installed")
-                .and_then(|i| i.get("manifest_hash"))
-                .and_then(|h| h.as_str())
-        } else {
-            None
+    // Returns Err(()) for "installed, but we cannot name what" — which must read as UNKNOWN, not
+    // fall back to the dist hash. Rolling back the FIRST update of a build records
+    // `manifest_hash: null` (there was no prior record to name), and falling back there would
+    // report the dist hash and call a rolled-back hive `match`.
+    let dimension = |snapshot: &serde_json::Value, section: &str| -> Result<Option<String>, ()> {
+        let Some(section_value) = snapshot.get(section) else {
+            return Ok(None);
         };
-        installed
-            .or_else(|| section_value.get("manifest_hash").and_then(|h| h.as_str()))
+        if section == "core" {
+            if let Some(installed) = section_value.get("installed") {
+                if !installed.is_null() {
+                    return match installed.get("manifest_hash").and_then(|h| h.as_str()) {
+                        Some(h) if !h.trim().is_empty() => {
+                            Ok(Some(h.trim().to_ascii_lowercase()))
+                        }
+                        // Installed something it cannot name: off-manifest, unknown which way.
+                        _ => Err(()),
+                    };
+                }
+            }
+        }
+        Ok(section_value
+            .get("manifest_hash")
+            .and_then(|h| h.as_str())
             .map(|h| h.trim().to_ascii_lowercase())
-            .filter(|h| !h.is_empty())
+            .filter(|h| !h.is_empty()))
     };
 
     let reference = hives
@@ -9009,8 +9076,8 @@ fn versions_comparison(reference_hive: &str, hives: &[serde_json::Value]) -> ser
                 "unknown"
             } else {
                 match (dimension(reference, section), dimension(snapshot, section)) {
-                    (Some(a), Some(b)) if a == b => "match",
-                    (Some(_), Some(_)) => "differs",
+                    (Ok(Some(a)), Ok(Some(b))) if a == b => "match",
+                    (Ok(Some(_)), Ok(Some(_))) => "differs",
                     _ => "unknown",
                 }
             };
@@ -23257,7 +23324,7 @@ mod tests {
         stamp_generation(&root, "update-1700000000002", Some("hashB"), &[("sy-admin", "B")]);
 
         // Latest is chronological, which lexical order gives us for a fixed-width epoch.
-        let g = select_core_backup_generation(&root, &CoreRollbackSelector::Latest).expect("latest");
+        let (_, g) = select_core_backup_generation(&root, &CoreRollbackSelector::Latest).expect("latest");
         assert_eq!(g.generation, "update-1700000000002");
         assert_eq!(g.replaced_manifest_hash.as_deref(), Some("hashB"));
 
@@ -23268,6 +23335,7 @@ mod tests {
                 &CoreRollbackSelector::Generation("update-1700000000001".into())
             )
             .expect("by name")
+            .1
             .replaced_manifest_hash
             .as_deref(),
             Some("hashA")
@@ -23278,6 +23346,7 @@ mod tests {
                 &CoreRollbackSelector::ToManifestHash("  HASHA  ".into())
             )
             .expect("by hash, normalized")
+            .1
             .generation,
             "update-1700000000001"
         );
@@ -23646,19 +23715,27 @@ mod tests {
     #[test]
     fn core_backup_retention_keeps_the_newest_generations() {
         let root = std::env::temp_dir().join(format!("fluxbee-core-backup-{}", now_epoch_ms()));
-        // Fixed-width epoch suffixes, so lexical order IS chronological order.
-        for stamp in [
+        // Fixed-width epoch suffixes, so lexical order IS chronological order. STAMPED: an
+        // unstamped generation cannot be rolled back to, so retention collects it as junk.
+        for id in [
             "update-1700000000001",
             "update-1700000000002",
             "update-1700000000003",
         ] {
-            fs::create_dir_all(root.join(stamp)).unwrap();
+            stamp_generation(&root, id, Some("h"), &[("sy-admin", "x")]);
         }
         // Anything that is not a generation must be left alone.
         fs::create_dir_all(root.join("scratch")).unwrap();
+        // An unstamped `update-*` (a core update that died in Phase A/B) must NOT count against
+        // the budget — three of those would otherwise evict every usable generation.
+        fs::create_dir_all(root.join("update-1700000000009")).unwrap();
 
         prune_core_backup_generations_in(&root, 2);
 
+        assert!(
+            !root.join("update-1700000000009").exists(),
+            "an unstamped generation is junk and must be collected"
+        );
         assert!(!root.join("update-1700000000001").exists());
         assert!(root.join("update-1700000000002").exists());
         assert!(root.join("update-1700000000003").exists());
@@ -23670,7 +23747,7 @@ mod tests {
     #[test]
     fn core_backup_retention_never_empties_the_store() {
         let root = std::env::temp_dir().join(format!("fluxbee-core-backup-nb-{}", now_epoch_ms()));
-        fs::create_dir_all(root.join("update-1700000000001")).unwrap();
+        stamp_generation(&root, "update-1700000000001", Some("h"), &[("sy-admin", "x")]);
 
         // At or below the threshold nothing is touched — a rollback still needs its generation.
         prune_core_backup_generations_in(&root, CORE_BACKUP_GENERATIONS_KEPT);
