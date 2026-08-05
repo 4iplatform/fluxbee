@@ -11464,7 +11464,13 @@ async fn reconcile_timeout_unknown_operation(
     state: &ArchitectState,
     record: &mut ChatOperationRecord,
 ) -> Result<bool, ArchitectError> {
-    if record.status != "timeout_unknown" {
+    // Two non-terminal states resolve the same way — by asking the hive what actually
+    // happened. `timeout_unknown`: the reply expired, outcome genuinely unknown.
+    // `accepted` (PB-7): add_hive now returns immediately and joins in the background, so the
+    // operation is open BY DESIGN. Without this arm the record never closes, and
+    // `find_equivalent_operation` then rejects every identical retry with
+    // OPERATION_ALREADY_TRACKED — forever.
+    if record.status != "timeout_unknown" && record.status != "accepted" {
         return Ok(false);
     }
 
@@ -11488,10 +11494,32 @@ async fn reconcile_timeout_unknown_operation(
                 .map(|value| value.eq_ignore_ascii_case("ok"))
                 .unwrap_or(false)
             {
-                record.status = "succeeded_after_timeout".to_string();
+                // The hive's own recorded status is the source of truth for a background join.
+                let hive_status = output
+                    .get("payload")
+                    .and_then(|p| p.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                match hive_status {
+                    // Still running: leave the record open and check again later.
+                    "joining" => return Ok(false),
+                    "failed" | "interrupted" => {
+                        record.status = "failed".to_string();
+                        record.error_summary = output
+                            .get("payload")
+                            .and_then(|p| p.get("join"))
+                            .and_then(|j| j.get("error_detail"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("the background join did not complete")
+                            .to_string();
+                    }
+                    _ => {
+                        record.status = "succeeded_after_timeout".to_string();
+                        record.error_summary.clear();
+                    }
+                }
                 record.updated_at_ms = now_epoch_ms();
                 record.completed_at_ms = record.updated_at_ms;
-                record.error_summary.clear();
                 save_operation(state, record).await?;
                 return Ok(true);
             }

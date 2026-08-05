@@ -122,8 +122,20 @@ add_hive_expect_ok() {
   print_http "$status" "$body_file"
   local top_status
   top_status="$(json_get "status" "$body_file")"
-  if [[ "$status" != "200" || "$top_status" != "ok" ]]; then
-    echo "FAIL: add_hive did not return ok" >&2
+  # PB-7: 202/accepted, then poll info.yaml for the terminal state.
+  if [[ "$status" != "202" || "$top_status" != "accepted" ]]; then
+    echo "FAIL: add_hive was not accepted" >&2
+    exit 1
+  fi
+  local join_status=""
+  for _ in $(seq 1 120); do
+    http_call "GET" "$BASE/hives/$HIVE_ID" "$body_file" >/dev/null
+    join_status="$(json_get "payload.status" "$body_file")"
+    case "$join_status" in connected|failed|interrupted) break ;; esac
+    sleep 5
+  done
+  if [[ "$join_status" != "connected" ]]; then
+    echo "FAIL: background join ended as '$join_status'" >&2
     exit 1
   fi
 }

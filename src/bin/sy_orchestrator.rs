@@ -18184,6 +18184,17 @@ fn update_join_state_in(
     phase: &str,
     mutate: impl FnOnce(&mut serde_json::Value),
 ) {
+    // NEVER resurrect a hive that is gone. `write_hive_info` -> `write_file_atomic` calls
+    // `create_dir_all`, so without this guard the join's tail — which runs AFTER the flow
+    // released the topology lock — would recreate a directory `remove_hive` just deleted,
+    // leaving a zombie that answers HIVE_EXISTS forever and that nothing owns.
+    if !root.join(hive_id).is_dir() {
+        tracing::warn!(
+            hive_id = hive_id,
+            "hive directory is gone (removed mid-join?); not recording join state"
+        );
+        return;
+    }
     let mut info = read_hive_info(root, hive_id).unwrap_or_else(|_| serde_json::json!({}));
     info["status"] = serde_json::json!(status);
     if !info["join"].is_object() {
@@ -18261,6 +18272,39 @@ async fn accept_add_hive(
             "status": "error",
             "error_code": "INVALID_HIVE_ID",
             "message": "hive_id must be 1-64 chars of [a-z0-9-_] (no '/', '.', '..')",
+        });
+    }
+    // These three used to be checked only INSIDE the flow — i.e. after acceptance had already
+    // created hives/<id>/ and published `joining`. A typo'd address or an unauthorized hive
+    // therefore left a permanent phantom directory that `list_versions` then fanned out to on
+    // every call. They are pure and cheap, so they belong here, where the operator learns about
+    // them synchronously.
+    if !valid_address(&address) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_ADDRESS",
+            "message": "invalid address",
+        });
+    }
+    if state.wan_listen.as_deref().unwrap_or("").is_empty() {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "MISSING_WAN_LISTEN",
+            "message": "wan.listen missing in hive.yaml",
+        });
+    }
+    if !state.wan_authorized_hives.is_empty()
+        && !state
+            .wan_authorized_hives
+            .iter()
+            .any(|allowed| allowed.trim() == hive_id)
+    {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "WAN_NOT_AUTHORIZED",
+            "message": format!(
+                "hive '{hive_id}' not present in wan.authorized_hives; update /etc/fluxbee/hive.yaml or leave authorized_hives empty"
+            ),
         });
     }
 
@@ -18471,7 +18515,13 @@ async fn run_background_join(state: &Arc<OrchestratorState>, params: JoinParams)
                 serde_json::json!(sudoers_removed),
             );
         }
-    } else if !ok && add_hive_result_is_transient(&result) {
+    // The `ssh_access != KeyOnlyPersist` guard belongs here too: that path keeps the motherbee
+    // key deliberately, as the recovery channel, so labelling it `ssh_bootstrap_open` /
+    // `revoke_skipped_transient` would misreport WHY the key is still on the box.
+    } else if !ok
+        && ssh_access != SshAccess::KeyOnlyPersist
+        && add_hive_result_is_transient(&result)
+    {
         if let Some(obj) = result.as_object_mut() {
             obj.insert("ssh_bootstrap_open".to_string(), serde_json::json!(true));
             obj.insert(

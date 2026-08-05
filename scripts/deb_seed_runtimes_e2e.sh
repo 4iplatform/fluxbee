@@ -137,6 +137,43 @@ check "seed exits non-zero" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
 check "snapshot KEPT on failure" "$([ -f "$SNAP5" ] && echo yes || echo no)" "yes"
 check "the healthy runtime still published" "$(q "$D5/runtimes/manifest.json" "d['runtimes']['io.api']['current']")" "$VER"
 
+echo "== T8: a CORRUPT live manifest must not silently erase hot-published runtimes =="
+D8="$WORK/t8"; seed_artifacts "$D8" "$VER"
+mkdir -p "$D8/runtimes/wf.router/0.0.4/bin"
+SNAP8="$WORK/t8-snapshot.json"
+cat >"$SNAP8" <<JSON
+{"schema_version":1,"version":1,"updated_at":null,"runtimes":{
+ "wf.router":{"available":["0.0.4"],"current":"0.0.4"}}}
+JSON
+# Present, but not valid JSON — the merger would swallow this and start from a blank document.
+printf 'this is not json {{{' >"$D8/runtimes/manifest.json"
+run_seed "$D8" "$SNAP8" >/dev/null 2>&1
+check "hot runtime recovered from the snapshot" \
+  "$(q "$D8/runtimes/manifest.json" "d['runtimes']['wf.router']['current']")" "0.0.4"
+check "the corrupt file was kept for inspection" \
+  "$(ls "$D8/runtimes/" | grep -c 'manifest.json.corrupt.' || true)" "1"
+
+echo "== T9: corrupt manifest AND no snapshot -> refuse, never merge over it =="
+D9="$WORK/t9"; seed_artifacts "$D9" "$VER"
+printf 'not json either' >"$D9/runtimes/manifest.json"
+rc=0; run_seed "$D9" "$WORK/absent-snapshot.json" >/dev/null 2>&1 || rc=$?
+check "seed refuses" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+check "the operator's file is untouched" \
+  "$(cat "$D9/runtimes/manifest.json")" "not json either"
+
+echo "== T10: registering ZERO runtimes is never success =="
+D10="$WORK/t10"; seed_artifacts "$D10" "$VER"
+EMPTY_NODES="$WORK/empty-nodes.json"
+echo '{"schema_version":1,"singletons":[],"runtimes":[]}' >"$EMPTY_NODES"
+SNAP10="$WORK/t10-snapshot.json"
+echo '{"schema_version":1,"version":1,"runtimes":{}}' >"$SNAP10"
+rc=0
+FLUXBEE_BASE_NODES="$EMPTY_NODES" FLUXBEE_DIST_ROOT="$D10" \
+  FLUXBEE_PUBLISH_RUNTIME="$PUBLISH" FLUXBEE_BASE_RUNTIME_VERSION="$VER" \
+  FLUXBEE_MANIFEST_SNAPSHOT="$SNAP10" bash "$SEED" >/dev/null 2>&1 || rc=$?
+check "seed exits non-zero on zero runtimes" "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+check "snapshot NOT consumed" "$([ -f "$SNAP10" ] && echo yes || echo no)" "yes"
+
 echo "== T6: --binary already AT the destination (GNU install src==dest) =="
 D6="$WORK/t6"; seed_artifacts "$D6" "$VER"
 rc=0

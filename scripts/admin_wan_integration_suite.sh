@@ -220,11 +220,26 @@ add_body="$tmpdir/add.json"
 add_payload="{\"hive_id\":\"$HIVE_ID\",\"address\":\"$HIVE_ADDR\",\"ssh_user\":\"$SSH_USER\",\"ssh_password\":\"$SSH_PASSWORD\"}"
 status="$(http_call "POST" "$BASE/hives" "$add_body" "$add_payload")"
 log_http_response "$status" "$add_body"
-assert_eq "$status" "200" "POST /hives/http"
-assert_eq "$(json_get "status" "$add_body")" "ok" "POST /hives/status"
-assert_eq "$(json_get "payload.wan_connected" "$add_body")" "true" "POST /hives/payload.wan_connected"
-assert_eq "$(json_get "payload.dist_sync_ready" "$add_body")" "true" "POST /hives/payload.dist_sync_ready"
-assert_eq "$(json_get "payload.restrict_ssh" "$add_body")" "true" "POST /hives/payload.restrict_ssh"
+# PB-7: add_hive ACCEPTS (202) and runs the join in the background, so the join's own result is
+# no longer in this response — it lands in the hive's info.yaml. Accept, then poll.
+assert_eq "$status" "202" "POST /hives/http"
+assert_eq "$(json_get "status" "$add_body")" "accepted" "POST /hives/status"
+
+join_body="$(mktemp)"
+join_status=""
+for _ in $(seq 1 120); do
+  http_call "GET" "$BASE/hives/$HIVE_ID" "$join_body" >/dev/null
+  join_status="$(json_get "payload.status" "$join_body")"
+  case "$join_status" in
+    connected|failed|interrupted) break ;;
+  esac
+  sleep 5
+done
+log_http_response "200" "$join_body"
+assert_eq "$join_status" "connected" "join terminal status"
+assert_eq "$(json_get "payload.join.result.wan_connected" "$join_body")" "true" "join wan_connected"
+assert_eq "$(json_get "payload.join.result.dist_sync_ready" "$join_body")" "true" "join dist_sync_ready"
+assert_eq "$(json_get "payload.join.result.restrict_ssh" "$join_body")" "true" "join restrict_ssh"
 echo "OK: add_hive passed with WAN freshness (wan_connected=true)"
 
 if [[ "$CHECK_OPA_NODE" == "1" ]]; then

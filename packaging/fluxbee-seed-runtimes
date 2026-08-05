@@ -72,9 +72,35 @@ install -d "$RUNTIMES_ROOT" 2>/dev/null || true
 
 # (1) Restore the pre-upgrade snapshot ONLY when dpkg removed the manifest as an obsolete
 #     file. Never overwrite a manifest that is present — that would be the clobber again.
-if [ ! -f "$LIVE_MANIFEST" ] && [ -f "$SNAPSHOT" ]; then
+manifest_is_usable() { # a manifest that does not PARSE is worse than one that is missing
+  [ -f "$1" ] || return 1
+  python3 -c "
+import json,sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if isinstance(d, dict) else 1)
+" "$1" 2>/dev/null
+}
+
+# Decide on VALIDITY, not existence. The merger swallows a parse error and starts from a blank
+# document, so a corrupt-but-present manifest would silently erase every hot-published runtime —
+# and then the snapshot would be deleted on the way out, taking the only copy with it.
+if ! manifest_is_usable "$LIVE_MANIFEST" && [ -f "$SNAPSHOT" ]; then
+  if [ -f "$LIVE_MANIFEST" ]; then
+    cp -p "$LIVE_MANIFEST" "$LIVE_MANIFEST.corrupt.$(date +%s)" 2>/dev/null || true
+    echo "fluxbee-seed-runtimes: the live runtimes manifest does not parse; kept a .corrupt copy" >&2
+  fi
   install -m 0644 "$SNAPSHOT" "$LIVE_MANIFEST"
   echo "fluxbee-seed-runtimes: restored the pre-upgrade runtimes manifest from $SNAPSHOT"
+elif ! manifest_is_usable "$LIVE_MANIFEST" && [ -f "$LIVE_MANIFEST" ]; then
+  # Present, unparseable, and no snapshot to fall back on. Refuse: merging would silently drop
+  # whatever it holds.
+  echo "fluxbee-seed-runtimes: ERROR $LIVE_MANIFEST does not parse and there is no snapshot to" >&2
+  echo "  restore from. Refusing to merge over it (that would erase hot-published runtimes)." >&2
+  echo "  Inspect it, fix or move it aside, then re-run: sudo fluxbee-seed-runtimes" >&2
+  exit 1
 fi
 
 rc=0
@@ -113,6 +139,16 @@ while IFS=$'\t' read -r rt bin; do
 done < <(mf runtimes)
 
 [ -n "$demotions" ] && printf '%s' "$demotions"
+
+# Registering ZERO runtimes is never success. `rc` only moves inside the loop, so an unreadable
+# base-nodes.json (whose `mf` failure is invisible through `done < <(...)`) or a manifest with no
+# runtime entries would otherwise print a cheerful success line, exit 0, and DELETE the snapshot.
+if [ "$published" -eq 0 ]; then
+  echo "fluxbee-seed-runtimes: ERROR registered 0 base runtimes — refusing to report success." >&2
+  echo "  Check that $MANIFEST parses and lists runtimes[] entries." >&2
+  rc=1
+fi
+
 echo "fluxbee-seed-runtimes: registered $published base runtime(s) at $VER into $LIVE_MANIFEST"
 
 # Keep the snapshot on failure so the run stays retryable with the pre-upgrade state intact.

@@ -504,15 +504,47 @@ async fn main() -> Result<(), SyEdgeError> {
                                 // Exiting first and discovering the problem on the way back up
                                 // would turn one bad `vault_put` into a public HTTPS outage —
                                 // the same asymmetry DeletedKeepServing already encodes.
-                                let probe = fetch_tls_config_from_vault(
-                                    Arc::clone(&dispatcher),
-                                    self_ilk.clone(),
-                                    self_name.clone(),
-                                    config.vault_hive.clone(),
-                                    &key,
-                                )
-                                .await
-                                .map(|(_, _, diagnosis)| diagnosis);
+                                //
+                                // RETRIED on a transient failure. A single blip on the link to
+                                // the vault would otherwise abandon a legitimate rotation
+                                // outright: nothing re-fires this decision, so the edge would
+                                // keep serving the old cert until it expired. The material
+                                // itself is almost certainly fine — it is the fetch that failed.
+                                let mut probe = Err(TlsFetchFailure::VaultUnavailable(
+                                    "not attempted".to_string(),
+                                ));
+                                for attempt in 1..=TLS_RELOAD_PROBE_ATTEMPTS {
+                                    probe = fetch_tls_config_from_vault(
+                                        Arc::clone(&dispatcher),
+                                        self_ilk.clone(),
+                                        self_name.clone(),
+                                        config.vault_hive.clone(),
+                                        &key,
+                                    )
+                                    .await
+                                    .map(|(_, _, diagnosis)| diagnosis);
+                                    // Only a transient failure is worth retrying: bad material
+                                    // will be just as bad next time.
+                                    match &probe {
+                                        Err(failure) if failure.is_transient() => {
+                                            if attempt < TLS_RELOAD_PROBE_ATTEMPTS {
+                                                tracing::warn!(
+                                                    key = %key,
+                                                    attempt = attempt,
+                                                    detail = %failure.detail(),
+                                                    "sy-edge: TLS reload probe could not reach the vault; retrying"
+                                                );
+                                                tokio::time::sleep(
+                                                    std::time::Duration::from_secs(
+                                                        TLS_RELOAD_PROBE_BACKOFF_SECS,
+                                                    ),
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                        _ => break,
+                                    }
+                                }
                                 match tls_reload_verdict(probe) {
                                     TlsReloadVerdict::RestartToLoad => {
                                         tracing::warn!(
@@ -1704,6 +1736,13 @@ async fn run_frontend(
 
 /// Build a rustls server config from in-memory PEM cert chain + private key.
 const BEGIN_CERTIFICATE_MARKER: &[u8] = b"-----BEGIN CERTIFICATE-----";
+
+/// How many times to re-probe the vault before giving up on a reload.
+///
+/// Nothing re-fires the reload decision, so abandoning it on the first transient error would
+/// strand a legitimate cert rotation until the certificate expired.
+const TLS_RELOAD_PROBE_ATTEMPTS: u32 = 3;
+const TLS_RELOAD_PROBE_BACKOFF_SECS: u64 = 5;
 
 /// What the PEM parse revealed about the certificate chain.
 ///

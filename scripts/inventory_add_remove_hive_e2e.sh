@@ -325,8 +325,23 @@ add_hive_expect_ok() {
   payload="$(printf '{"hive_id":"%s","address":"%s","ssh_user":"%s","ssh_password":"%s"}' "$hive_id" "$hive_addr" "$SSH_USER" "$SSH_PASSWORD")"
   local http
   http="$(http_call "POST" "$BASE/hives" "$add_body" "$payload")"
-  if [[ "$http" != "200" || "$(json_get_file "status" "$add_body")" != "ok" ]]; then
-    echo "FAIL: add_hive failed http=$http" >&2
+  # PB-7: add_hive returns 202/accepted and joins in the background; poll for the outcome.
+  if [[ "$http" != "202" || "$(json_get_file "status" "$add_body")" != "accepted" ]]; then
+    echo "FAIL: add_hive was not accepted http=$http" >&2
+    cat "$add_body" >&2 || true
+    exit 1
+  fi
+  local join_status=""
+  for _ in $(seq 1 120); do
+    http_call "GET" "$BASE/hives/$HIVE_ID" "$add_body" >/dev/null
+    join_status="$(json_get_file "payload.status" "$add_body")"
+    case "$join_status" in
+      connected|failed|interrupted) break ;;
+    esac
+    sleep 5
+  done
+  if [[ "$join_status" != "connected" ]]; then
+    echo "FAIL: background join ended as '$join_status'" >&2
     cat "$add_body" >&2 || true
     exit 1
   fi

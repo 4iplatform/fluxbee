@@ -46,6 +46,11 @@ pub enum ActionResult {
     Blocked,
     Applied,
     Failed,
+    /// Taken, but not finished — the work runs in the background and the caller polls for the
+    /// outcome (a backgrounded `add_hive`, PB-7). Distinct from `Applied`: nothing has been
+    /// applied yet. Without this, `derive_action_outcome`'s catch-all stamped every successful
+    /// acceptance as `Failed`.
+    Accepted,
 }
 
 impl ActionResult {
@@ -54,6 +59,7 @@ impl ActionResult {
             Self::Blocked => "blocked",
             Self::Applied => "applied",
             Self::Failed => "failed",
+            Self::Accepted => "accepted",
         }
     }
 }
@@ -156,6 +162,10 @@ pub fn derive_action_outcome(
 
     if status.is_some_and(|value| value.eq_ignore_ascii_case("ok")) {
         return (Some(ActionResult::Applied), None);
+    }
+
+    if status.is_some_and(|value| value.eq_ignore_ascii_case("accepted")) {
+        return (Some(ActionResult::Accepted), None);
     }
 
     if status.is_some_and(|value| value.eq_ignore_ascii_case("blocked"))
