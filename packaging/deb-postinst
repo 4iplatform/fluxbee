@@ -23,6 +23,13 @@ done
 # Runs BEFORE the chown below so ownership covers what it writes, and BEFORE any service starts
 # so the orchestrator never observes a manifest without its base runtimes. There is no race:
 # the old prerm already stopped every unit, so nothing can read or write the manifest right now.
+# dpkg just replaced the core binaries in /usr/bin, so any core-installed.json left over from a
+# mesh `update` or a `core_rollback` now describes a build that is no longer there. Drop it:
+# absent means "whatever dist says", which is exactly true right after a package install, and a
+# stale record would make /versions report drift that does not exist (versions_comparison
+# deliberately prefers `installed` over the dist hash).
+rm -f /var/lib/fluxbee/orchestrator/core-installed.json
+
 seed_rc=0
 if [ -x /usr/share/fluxbee/fluxbee-seed-runtimes ]; then
     /usr/share/fluxbee/fluxbee-seed-runtimes || seed_rc=$?

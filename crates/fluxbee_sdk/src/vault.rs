@@ -500,6 +500,23 @@ pub enum VaultError {
         target: String,
         timeout_ms: u64,
     },
+    /// The request never reached the vault: no route, no gateway, peer down.
+    ///
+    /// Distinct from [`VaultError::Service`] on purpose. Collapsing transport failures into
+    /// `Service` told every consumer "the vault reached a verdict" when in fact nothing came
+    /// back — and SY.edge, reading that, refused to retry a cert reload that a one-second WAN
+    /// blip had interrupted, abandoning a legitimate rotation until the certificate expired.
+    #[error("vault unreachable: reason={reason} original_dst={original_dst}")]
+    Unreachable {
+        reason: String,
+        original_dst: String,
+    },
+    /// The request expired in the mesh before arriving. Also transport, also not a verdict.
+    #[error("vault ttl exceeded: original_dst={original_dst} last_hop={last_hop}")]
+    TtlExceeded {
+        original_dst: String,
+        last_hop: String,
+    },
     #[error("vault returned error code={code} message={message}")]
     Service { code: String, message: String },
     #[error("invalid vault ref")]
@@ -822,6 +839,20 @@ fn map_rpc_error(err: RpcError) -> VaultError {
             trace_id,
             target,
             timeout_ms,
+        },
+        RpcError::Unreachable {
+            reason,
+            original_dst,
+        } => VaultError::Unreachable {
+            reason,
+            original_dst,
+        },
+        RpcError::TtlExceeded {
+            original_dst,
+            last_hop,
+        } => VaultError::TtlExceeded {
+            original_dst,
+            last_hop,
         },
         other => VaultError::Service {
             code: "VAULT_RPC_ERROR".to_string(),

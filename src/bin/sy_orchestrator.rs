@@ -3639,16 +3639,21 @@ fn rollback_local_core_binaries(
         let target_path = Path::new("/usr/bin").join(name);
         let backup_path = backup_dir.join(name);
         if backup_path.exists() {
-            if let Err(err) = fs::copy(&backup_path, &target_path) {
+            // STAGE + RENAME, never `fs::copy` onto the target. Writing directly into a binary
+            // whose process is running fails with ETXTBSY — and this primitive's whole job is to
+            // undo an update whose services were just restarted, so the target is running by
+            // definition. A rename swaps the directory entry instead of the file, which the
+            // update path (and `core_rollback_local`) already do for exactly this reason.
+            let stage_path = Path::new("/usr/bin").join(format!(".{name}.fluxbee.rollback"));
+            if let Err(err) = (|| -> Result<(), OrchestratorError> {
+                fs::copy(&backup_path, &stage_path)?;
+                set_exec_0755(&stage_path)?;
+                fs::rename(&stage_path, &target_path)?;
+                Ok(())
+            })() {
+                let _ = fs::remove_file(&stage_path);
                 rollback_errors.push(format!("restore {} failed: {}", target_path.display(), err));
                 continue;
-            }
-            if let Err(err) = set_exec_0755(&target_path) {
-                rollback_errors.push(format!(
-                    "restore chmod {} failed: {}",
-                    target_path.display(),
-                    err
-                ));
             }
             continue;
         }
@@ -8501,6 +8506,10 @@ fn local_versions_snapshot(state: &OrchestratorState) -> serde_json::Value {
 
     serde_json::json!({
         "hive_id": state.hive_id,
+        // Which sections this hive is even supposed to carry depends on its role: only workers
+        // (and motherbee, the source) get the runtimes tree. Without this the comparison reads
+        // a deliberately-absent section as drift.
+        "role": state.role.as_str(),
         "core": core,
         "runtimes": runtimes,
         "vendor": vendor,
@@ -9029,6 +9038,19 @@ async fn list_versions_flow(state: &OrchestratorState) -> serde_json::Value {
 /// now build themselves from this constant so the two cannot drift apart again.
 const VERSION_COMPARISON_SECTIONS: [&str; 3] = ["core", "vendor", "runtimes"];
 
+/// Does a hive of this role receive this dist section at all?
+///
+/// `runtimes` is deliberately worker-only (`dist_sync_folders_for_role`): the DMZ contract keeps
+/// the runtime tree away from ingress and egress. Comparing a section a role never receives
+/// yielded `unknown` for those two hives, which pinned the FLEET verdict at `unknown` on a
+/// perfectly healthy four-role deployment — making /versions useless as an instrument.
+fn role_carries_section(role: &str, section: &str) -> bool {
+    match section {
+        "runtimes" => matches!(role, "worker" | "motherbee"),
+        _ => true,
+    }
+}
+
 fn versions_comparison(reference_hive: &str, hives: &[serde_json::Value]) -> serde_json::Value {
     // X1: for `core`, prefer what is INSTALLED over what dist delivered. After a
     // `core_rollback` a hive is deliberately off-manifest, and comparing dist hashes would
@@ -9089,8 +9111,12 @@ fn versions_comparison(reference_hive: &str, hives: &[serde_json::Value]) -> ser
         let mut per_section = serde_json::Map::new();
         let mut hive_verdict = "match";
         for section in VERSION_COMPARISON_SECTIONS {
+            let hive_role = snapshot.get("role").and_then(|v| v.as_str());
             let verdict = if unreachable {
                 "unknown"
+            } else if hive_role.is_some_and(|role| !role_carries_section(role, section)) {
+                // Not drift and not unknown: this role never receives this section.
+                "n/a"
             } else {
                 match (dimension(reference, section), dimension(snapshot, section)) {
                     (Ok(Some(a)), Ok(Some(b))) if a == b => "match",
@@ -9103,6 +9129,7 @@ fn versions_comparison(reference_hive: &str, hives: &[serde_json::Value]) -> ser
             } else if verdict == "unknown" && hive_verdict == "match" {
                 hive_verdict = "unknown";
             }
+            // "n/a" deliberately moves nothing.
             per_section.insert(section.to_string(), serde_json::json!(verdict));
         }
         match hive_verdict {
@@ -18443,6 +18470,13 @@ async fn accept_add_hive(
     // cleanup unreachable for a live join: that path only triggers when the directory exists
     // WITHOUT an info.yaml.
     update_join_state(&hive_id, "joining", "accepted", |info| {
+        // Clear the PREVIOUS attempt's terminal fields. Without this a retry shows a running
+        // join decorated with the old failure — the operator reads a stale error as current.
+        for stale in ["error_code", "error_detail", "finished_at_ms", "result"] {
+            if let Some(join) = info["join"].as_object_mut() {
+                join.remove(stale);
+            }
+        }
         info["hive_id"] = serde_json::json!(hive_id);
         info["address"] = serde_json::json!(address);
         info["role"] = serde_json::json!(role.as_str());
@@ -23568,6 +23602,29 @@ mod tests {
         // No reference snapshot at all -> unknown, never a false match.
         let out = versions_comparison("motherbee", &[snap("w1", "aa", "bb", "cc")]);
         assert_eq!(out["verdict"], "unknown");
+
+        // A role that never RECEIVES a section must read n/a, not unknown — ingress and egress
+        // deliberately do not get the runtimes tree, and calling that drift pinned the whole
+        // fleet verdict at `unknown` on a perfectly healthy deployment.
+        let mut reference = snap("motherbee", "aa", "bb", "cc");
+        reference["role"] = serde_json::json!("motherbee");
+        let mut ingress = serde_json::json!({
+            "hive_id": "ingress1",
+            "role": "ingress",
+            "core": { "manifest_hash": "aa" },
+            "vendor": { "manifest_hash": "bb" },
+            "runtimes": { "status": "missing" },
+        });
+        let out = versions_comparison("motherbee", &[reference.clone(), ingress.clone()]);
+        assert_eq!(out["hives"][0]["sections"]["runtimes"], "n/a");
+        assert_eq!(out["hives"][0]["verdict"], "match");
+        assert_eq!(out["verdict"], "match", "a healthy four-role fleet must read match");
+
+        // ...but a WORKER missing its runtimes really is drift.
+        ingress["role"] = serde_json::json!("worker");
+        ingress["hive_id"] = serde_json::json!("w1");
+        let out = versions_comparison("motherbee", &[reference, ingress]);
+        assert_eq!(out["hives"][0]["sections"]["runtimes"], "unknown");
     }
 
     /// The mesh protocol version must live in exactly one place, and it must be telemetry.

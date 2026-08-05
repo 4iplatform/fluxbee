@@ -135,7 +135,10 @@ while IFS=$'\t' read -r rt bin; do
       --dist-root "$DIST_ROOT" \
       $set_current_args >/dev/null; then
     published=$((published + 1))
-    if [ -n "$was" ] && [ "$was" != "$VER" ]; then
+    # ONLY when current was actually moved. Guarded by the same condition as the decision
+    # above, otherwise the run prints "current moved" immediately after printing that it was
+    # deliberately kept — two contradictory lines about the same runtime.
+    if [ -n "$was" ] && [ "$was" != "$VER" ] && [ -n "$set_current_args" ]; then
       demotions="$demotions  NOTE: base runtime $rt 'current' moved $was -> $VER (package authority)"$'\n'
     fi
   else

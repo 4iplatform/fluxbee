@@ -11488,6 +11488,26 @@ async fn reconcile_timeout_unknown_operation(
                 },
             )
             .await?;
+            // The hive is GONE (removed, or the join never created it). Nothing will ever
+            // resolve this record, and leaving it open blocks every identical retry with
+            // OPERATION_ALREADY_TRACKED forever. Close it as failed.
+            if output
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|v| v.eq_ignore_ascii_case("not_found"))
+                || output
+                    .get("error_code")
+                    .and_then(Value::as_str)
+                    .is_some_and(|v| v.eq_ignore_ascii_case("NOT_FOUND"))
+            {
+                record.status = "failed".to_string();
+                record.error_summary =
+                    format!("hive '{hive_id}' no longer exists; the operation cannot be resolved");
+                record.updated_at_ms = now_epoch_ms();
+                record.completed_at_ms = record.updated_at_ms;
+                save_operation(state, record).await?;
+                return Ok(true);
+            }
             if output
                 .get("status")
                 .and_then(Value::as_str)
@@ -11506,24 +11526,35 @@ async fn reconcile_timeout_unknown_operation(
                     .and_then(|h| h.get("status"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                match hive_status {
-                    // Still running: leave the record open and check again later.
-                    "joining" => return Ok(false),
-                    "failed" | "interrupted" => {
-                        record.status = "failed".to_string();
-                        record.error_summary = output
-                            .get("payload")
-                            .and_then(|p| p.get("hive"))
-                            .and_then(|h| h.get("join"))
-                            .and_then(|j| j.get("error_detail"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("the background join did not complete")
-                            .to_string();
-                    }
-                    _ => {
-                        record.status = "succeeded_after_timeout".to_string();
-                        record.error_summary.clear();
-                    }
+                let join_phase = output
+                    .get("payload")
+                    .and_then(|p| p.get("hive"))
+                    .and_then(|h| h.get("join"))
+                    .and_then(|j| j.get("phase"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+
+                // POSITIVE test for success, never a catch-all. A catch-all here recorded a
+                // `pending` hive — one whose join failed during finalize or SSH hardening — as
+                // `succeeded_after_timeout` with the error summary CLEARED. And `connected` is
+                // written well before the flow ends, so it alone does not mean done.
+                if hive_status == "connected" && join_phase == "done" {
+                    record.status = "succeeded_after_timeout".to_string();
+                    record.error_summary.clear();
+                } else if matches!(hive_status, "failed" | "interrupted") {
+                    record.status = "failed".to_string();
+                    record.error_summary = output
+                        .get("payload")
+                        .and_then(|p| p.get("hive"))
+                        .and_then(|h| h.get("join"))
+                        .and_then(|j| j.get("error_detail"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("the background join did not complete")
+                        .to_string();
+                } else {
+                    // joining, pending, connected-but-not-done, or an unrecognised state: still
+                    // open. Leave the record alone and look again next time.
+                    return Ok(false);
                 }
                 record.updated_at_ms = now_epoch_ms();
                 record.completed_at_ms = record.updated_at_ms;
@@ -11545,6 +11576,12 @@ fn operation_status_from_output(output: &Value) -> String {
         Some(status) if status == "ok" => "succeeded".to_string(),
         Some(status) if status == "not_found" => "not_found".to_string(),
         Some(status) if status == "error" => "failed".to_string(),
+        // `sync_pending` is a SUCCESS on the wire (the target correctly refused a stale update),
+        // but persisted verbatim it became a non-terminal status nothing could ever resolve —
+        // the record stayed open and blocked identical retries forever.
+        Some(status) if status == "sync_pending" => "succeeded".to_string(),
+        // `accepted` stays verbatim ON PURPOSE: it is genuinely non-terminal and
+        // `reconcile_timeout_unknown_operation` closes it against the hive's real state.
         Some(status) => status,
         None => "succeeded".to_string(),
     }

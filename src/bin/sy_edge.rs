@@ -2081,7 +2081,13 @@ impl TlsFetchFailure {
         let detail = format!("vault get '{secret_key}' failed: {err}");
         match err {
             // Nothing came back: unreachable peer, or the request expired waiting.
-            fluxbee_sdk::VaultError::Node(_) | fluxbee_sdk::VaultError::ActionTimeout { .. } => {
+            // Unreachable/TtlExceeded are TRANSPORT, not a verdict: the router answers them
+            // SYNCHRONOUSLY (no timeout elapses), so without them here a single WAN blip during
+            // a rotation exhausted zero retries and abandoned the reload for good.
+            fluxbee_sdk::VaultError::Node(_)
+            | fluxbee_sdk::VaultError::ActionTimeout { .. }
+            | fluxbee_sdk::VaultError::Unreachable { .. }
+            | fluxbee_sdk::VaultError::TtlExceeded { .. } => {
                 TlsFetchFailure::VaultUnavailable(detail)
             }
             // The vault DID reach a verdict (or the answer was unusable). A restart
@@ -3269,6 +3275,33 @@ mod tests {
                 ..
             }
         ));
+
+        // The edge's vault is cross-hive by default, so a WAN blip makes the ROUTER answer
+        // UNREACHABLE synchronously — no timeout elapses. Classifying that as bad material
+        // burned zero retries and abandoned a legitimate rotation until the cert expired.
+        for transport in [
+            fluxbee_sdk::VaultError::Unreachable {
+                reason: "GATEWAY_UNAVAILABLE".into(),
+                original_dst: "SY.vault@motherbee".into(),
+            },
+            fluxbee_sdk::VaultError::TtlExceeded {
+                original_dst: "SY.vault@motherbee".into(),
+                last_hop: "ingress1".into(),
+            },
+        ] {
+            let failure = TlsFetchFailure::from_vault_error("edge_tls", transport);
+            assert!(
+                failure.is_transient(),
+                "transport failures must be retried, not reported as broken material"
+            );
+            assert!(matches!(
+                tls_reload_verdict(Err(failure)),
+                TlsReloadVerdict::KeepServing {
+                    transient: true,
+                    ..
+                }
+            ));
+        }
     }
 
     /// An unparseable payload must be reported, never silently treated as
