@@ -130,7 +130,7 @@ add_hive_expect_ok() {
   local join_status=""
   for _ in $(seq 1 120); do
     http_call "GET" "$BASE/hives/$HIVE_ID" "$body_file" >/dev/null
-    join_status="$(json_get "payload.status" "$body_file")"
+    join_status="$(json_get "payload.hive.status" "$body_file")"
     case "$join_status" in connected|failed|interrupted) break ;; esac
     sleep 5
   done

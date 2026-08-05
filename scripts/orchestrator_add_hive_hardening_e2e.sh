@@ -213,7 +213,7 @@ fi
 join_status=""
 for _ in $(seq 1 120); do
   http_call "GET" "$BASE/hives/$HIVE_ID" "$tmpdir/add.json" >/dev/null
-  join_status="$(json_get "payload.status" "$tmpdir/add.json")"
+  join_status="$(json_get "payload.hive.status" "$tmpdir/add.json")"
   case "$join_status" in connected|failed|interrupted) break ;; esac
   sleep 5
 done
@@ -223,13 +223,13 @@ if [[ "$join_status" != "connected" ]]; then
   exit 1
 fi
 # The join's own payload now hangs off join.result rather than the RPC reply.
-if [[ "$(json_get "payload.join.result.harden_ssh" "$tmpdir/add.json")" != "true" ]]; then
+if [[ "$(json_get "payload.hive.join.result.harden_ssh" "$tmpdir/add.json")" != "true" ]]; then
   echo "FAIL: payload.harden_ssh is not true" >&2
   exit 1
 fi
 if [[ "$REQUIRE_RESTRICT_SSH_APPLIED" == "1" ]]; then
-  requested="$(json_get "payload.restrict_ssh_requested" "$tmpdir/add.json")"
-  applied="$(json_get "payload.join.result.restrict_ssh" "$tmpdir/add.json")"
+  requested="$(json_get "payload.hive.join.result.restrict_ssh_requested" "$tmpdir/add.json")"
+  applied="$(json_get "payload.hive.join.result.restrict_ssh" "$tmpdir/add.json")"
   if [[ "$requested" != "true" ]]; then
     echo "FAIL: payload.restrict_ssh_requested is not true" >&2
     exit 1

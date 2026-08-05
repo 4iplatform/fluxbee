@@ -8956,8 +8956,17 @@ async fn get_versions_flow(
 async fn list_versions_flow(state: &OrchestratorState) -> serde_json::Value {
     let mut hives = Vec::new();
     hives.push(local_versions_snapshot(state));
+    let root = hives_root();
     for hive_id in list_managed_hive_ids() {
         if hive_id == state.hive_id {
+            continue;
+        }
+        // Only hives that actually joined. `list_managed_hive_ids` filters on `is_dir` alone, so
+        // a hive whose join failed leaves a directory behind forever — and fanning out to it
+        // yields `unknown`, which pins the FLEET verdict at `unknown` permanently and makes
+        // /versions useless as an instrument. Same `status == "connected"` gate that
+        // `reconcile_hive_tls_material` and the public-edge selection already apply.
+        if hive_status(&root, &hive_id).as_deref() != Some("connected") {
             continue;
         }
         let response = get_versions_flow(
@@ -9011,6 +9020,15 @@ async fn list_versions_flow(state: &OrchestratorState) -> serde_json::Value {
 /// A hive whose snapshot could not be fetched is `unknown`, never `differs`: not knowing is not
 /// the same as knowing they are different, and conflating them turns an unreachable spoke into
 /// a phantom drift report.
+/// The sections of a versions snapshot that carry a comparable `manifest_hash`.
+///
+/// These MUST be the literal keys `local_versions_snapshot` emits. They diverged once — the
+/// constant said `"runtime"` while the snapshot emits `"runtimes"` — and `/versions` could then
+/// never report `match` on an in-sync fleet, because the missing section folded to `unknown`.
+/// The unit fixtures hand-wrote the same wrong name, so they stayed green against the bug; they
+/// now build themselves from this constant so the two cannot drift apart again.
+const VERSION_COMPARISON_SECTIONS: [&str; 3] = ["core", "vendor", "runtimes"];
+
 fn versions_comparison(reference_hive: &str, hives: &[serde_json::Value]) -> serde_json::Value {
     // X1: for `core`, prefer what is INSTALLED over what dist delivered. After a
     // `core_rollback` a hive is deliberately off-manifest, and comparing dist hashes would
@@ -9055,7 +9073,6 @@ fn versions_comparison(reference_hive: &str, hives: &[serde_json::Value]) -> ser
         });
     };
 
-    const SECTIONS: [&str; 3] = ["core", "vendor", "runtime"];
     let mut entries = Vec::new();
     let mut any_differs = false;
     let mut any_unknown = false;
@@ -9071,7 +9088,7 @@ fn versions_comparison(reference_hive: &str, hives: &[serde_json::Value]) -> ser
         let unreachable = snapshot.get("status").and_then(|v| v.as_str()) == Some("error");
         let mut per_section = serde_json::Map::new();
         let mut hive_verdict = "match";
-        for section in SECTIONS {
+        for section in VERSION_COMPARISON_SECTIONS {
             let verdict = if unreachable {
                 "unknown"
             } else {
@@ -23449,13 +23466,13 @@ mod tests {
             "hive_id": "w1",
             "core": { "manifest_hash": "aa", "installed": { "manifest_hash": "OLD" } },
             "vendor": { "manifest_hash": "bb" },
-            "runtime": { "manifest_hash": "cc" },
+            "runtimes": { "manifest_hash": "cc" },
         });
         let normal = serde_json::json!({
             "hive_id": "motherbee",
             "core": { "manifest_hash": "aa", "installed": { "manifest_hash": "aa" } },
             "vendor": { "manifest_hash": "bb" },
-            "runtime": { "manifest_hash": "cc" },
+            "runtimes": { "manifest_hash": "cc" },
         });
         let out = versions_comparison("motherbee", &[normal, rolled_back]);
         assert_eq!(
@@ -23470,13 +23487,13 @@ mod tests {
             "hive_id": "w2",
             "core": { "manifest_hash": "aa" },
             "vendor": { "manifest_hash": "bb" },
-            "runtime": { "manifest_hash": "cc" },
+            "runtimes": { "manifest_hash": "cc" },
         });
         let reference = serde_json::json!({
             "hive_id": "motherbee",
             "core": { "manifest_hash": "aa", "installed": { "manifest_hash": "aa" } },
             "vendor": { "manifest_hash": "bb" },
-            "runtime": { "manifest_hash": "cc" },
+            "runtimes": { "manifest_hash": "cc" },
         });
         let out = versions_comparison("motherbee", &[reference, legacy]);
         assert_eq!(out["verdict"], "match");
@@ -23486,13 +23503,18 @@ mod tests {
     /// must never be reported as "differs".
     #[test]
     fn versions_comparison_emits_a_verdict_and_never_guesses() {
+        // Built FROM the constant on purpose: hand-writing the section names is how the
+        // `runtime`/`runtimes` divergence stayed green.
         let snap = |hive: &str, core: &str, vendor: &str, runtime: &str| {
-            serde_json::json!({
-                "hive_id": hive,
-                "core": { "manifest_hash": core },
-                "vendor": { "manifest_hash": vendor },
-                "runtime": { "manifest_hash": runtime },
-            })
+            let mut o = serde_json::Map::new();
+            o.insert("hive_id".into(), serde_json::json!(hive));
+            for (section, hash) in VERSION_COMPARISON_SECTIONS.iter().zip([core, vendor, runtime]) {
+                o.insert(
+                    (*section).to_string(),
+                    serde_json::json!({ "manifest_hash": hash }),
+                );
+            }
+            serde_json::Value::Object(o)
         };
 
         // Everything in step.

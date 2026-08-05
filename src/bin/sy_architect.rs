@@ -11495,9 +11495,15 @@ async fn reconcile_timeout_unknown_operation(
                 .unwrap_or(false)
             {
                 // The hive's own recorded status is the source of truth for a background join.
+                // `payload.hive.status`, NOT `payload.status`. get_hive answers
+                // {"status":"ok","hive":<info.yaml>} and the admin nests that whole object under
+                // "payload", so `payload.status` is the literal envelope "ok" on every call —
+                // reading it sent a failed or still-running join straight to the catch-all and
+                // recorded it as succeeded, with the error summary cleared.
                 let hive_status = output
                     .get("payload")
-                    .and_then(|p| p.get("status"))
+                    .and_then(|p| p.get("hive"))
+                    .and_then(|h| h.get("status"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 match hive_status {
@@ -11507,7 +11513,8 @@ async fn reconcile_timeout_unknown_operation(
                         record.status = "failed".to_string();
                         record.error_summary = output
                             .get("payload")
-                            .and_then(|p| p.get("join"))
+                            .and_then(|p| p.get("hive"))
+                            .and_then(|h| h.get("join"))
                             .and_then(|j| j.get("error_detail"))
                             .and_then(Value::as_str)
                             .unwrap_or("the background join did not complete")
@@ -12859,7 +12866,11 @@ async fn execute_tracked_admin_translation(
         let existing_id = existing.operation_id.clone();
         let current_id = existing_operation_id.as_deref();
         if current_id != Some(existing_id.as_str()) {
-            if existing.status == "timeout_unknown" {
+            // Both non-terminal states resolve by asking the hive. Gating on
+            // `timeout_unknown` alone left the `accepted` arm unreachable from production, so a
+            // backgrounded add_hive stayed open forever and every identical retry bounced with
+            // OPERATION_ALREADY_TRACKED.
+            if existing.status == "timeout_unknown" || existing.status == "accepted" {
                 let _ = reconcile_timeout_unknown_operation(state, &mut existing).await;
             }
             if !is_terminal_operation_status(&existing.status) {

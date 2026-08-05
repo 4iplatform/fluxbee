@@ -229,7 +229,7 @@ join_body="$(mktemp)"
 join_status=""
 for _ in $(seq 1 120); do
   http_call "GET" "$BASE/hives/$HIVE_ID" "$join_body" >/dev/null
-  join_status="$(json_get "payload.status" "$join_body")"
+  join_status="$(json_get "payload.hive.status" "$join_body")"
   case "$join_status" in
     connected|failed|interrupted) break ;;
   esac
@@ -237,9 +237,9 @@ for _ in $(seq 1 120); do
 done
 log_http_response "200" "$join_body"
 assert_eq "$join_status" "connected" "join terminal status"
-assert_eq "$(json_get "payload.join.result.wan_connected" "$join_body")" "true" "join wan_connected"
-assert_eq "$(json_get "payload.join.result.dist_sync_ready" "$join_body")" "true" "join dist_sync_ready"
-assert_eq "$(json_get "payload.join.result.restrict_ssh" "$join_body")" "true" "join restrict_ssh"
+assert_eq "$(json_get "payload.hive.join.result.wan_connected" "$join_body")" "true" "join wan_connected"
+assert_eq "$(json_get "payload.hive.join.result.dist_sync_ready" "$join_body")" "true" "join dist_sync_ready"
+assert_eq "$(json_get "payload.hive.join.result.restrict_ssh" "$join_body")" "true" "join restrict_ssh"
 echo "OK: add_hive passed with WAN freshness (wan_connected=true)"
 
 if [[ "$CHECK_OPA_NODE" == "1" ]]; then
