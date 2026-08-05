@@ -3286,7 +3286,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "9";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "10";
 
 const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
@@ -3623,6 +3623,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
         action: "vault_rollback",
         route: InternalActionRoute::Command("vault_rollback"),
+        requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "core_rollback",
+        route: InternalActionRoute::Command("core_rollback"),
         requires_target: true,
         allow_legacy_hive_id: false,
     },
@@ -7026,6 +7032,16 @@ async fn handle_hive_paths(
             let (status, resp) = handle_opa_http(ctx, client, req, OpaAction::Apply).await?;
             Ok(Some((status, resp)))
         }
+        ("POST", ["core", "rollback"]) => {
+            let payload: serde_json::Value = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            let (status, resp) =
+                handle_admin_command(ctx, client, "core_rollback", payload, Some(hive)).await?;
+            Ok(Some((status, resp)))
+        }
         ("POST", ["opa", "policy", "rollback"]) => {
             let req: OpaRequest = serde_json::from_slice(body)?;
             let mut req = req;
@@ -7552,7 +7568,9 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "INVALID_CONFIG"
         | "INVALID_PACKAGE_LAYOUT"
         | "UNSUPPORTED_APPLY_MODE"
-        | "PACKAGE_PUBLISH_FAILED" => 422,
+        | "PACKAGE_PUBLISH_FAILED"
+        // the stamped backup does not match its bytes: refuse rather than restore garbage
+        | "BACKUP_CORRUPT" => 422,
         "INVALID_WORKFLOW_NAME" | "INVALID_CONFIG_SET" | "UNSUPPORTED_OPERATION" => 400,
         "WORKFLOW_NOT_FOUND" => 404,
         "NOT_IMPLEMENTED" => 501,
@@ -8793,6 +8811,7 @@ fn admin_action_executor_contract(spec: &InternalActionSpec) -> serde_json::Valu
             | "vault_delete"
             | "vault_rotate"
             | "vault_rollback"
+            | "core_rollback"
     ) {
         vec![
             "Executor plans must put path params and JSON body fields directly under step.args.",
@@ -8872,6 +8891,7 @@ fn admin_action_is_read_only(action: &str) -> bool {
             | "vault_delete"
             | "vault_rotate"
             | "vault_rollback"
+            | "core_rollback"
             | "update"
             | "sync_hint"
             | "opa_compile_apply"
@@ -8910,6 +8930,7 @@ fn admin_action_requires_confirmation(action: &str) -> bool {
             | "vault_delete"
             | "vault_rotate"
             | "vault_rollback"
+            | "core_rollback"
             | "update"
             | "sync_hint"
             | "opa_compile_apply"
@@ -8970,6 +8991,9 @@ fn admin_action_summary(action: &str) -> &'static str {
         "vault_delete" => "Delete one encrypted secret from SY.vault.",
         "vault_rotate" => "Rotate one encrypted secret value while keeping the previous version for rollback.",
         "vault_rollback" => "Rollback one encrypted secret to its previous version.",
+        "core_rollback" => {
+            "Restore this hive's core binaries from a stamped backup generation (undo a core update)."
+        }
         "inventory" => "Read global or per-hive inventory, including system-wide node visibility.",
         "list_versions" => "List core and runtime versions across hives.",
         "get_versions" => "Read core and runtime versions for one hive.",
@@ -9180,6 +9204,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "vault_delete" => vec!["DELETE /hives/{hive}/vault/secrets/{key}"],
         "vault_rotate" => vec!["POST /hives/{hive}/vault/secrets/{key}/rotate"],
         "vault_rollback" => vec!["POST /hives/{hive}/vault/secrets/{key}/rollback"],
+        "core_rollback" => vec!["POST /hives/{hive}/core/rollback"],
         "inventory" => vec![
             "GET /inventory",
             "GET /inventory/summary",
@@ -12596,6 +12621,7 @@ async fn handle_admin_command_inner(
             | "vault_delete"
             | "vault_rotate"
             | "vault_rollback"
+            | "core_rollback"
     ) {
         return handle_vault_command(ctx, client, action, payload, hive).await;
     }
@@ -13783,6 +13809,12 @@ fn admin_action_timeout(action: &str) -> Duration {
         "sync_hint" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_SYNC_HINT_TIMEOUT_SECS").unwrap_or(45))
         }
+        // Restores binaries and then restarts up to 8 services behind a 30 s health gate each.
+        // Deliberately generous: if this window is shorter than the work, the caller gets an
+        // outer TIMEOUT instead of the inner layer's real error (the U-8b shape).
+        "core_rollback" => Duration::from_secs(
+            env_timeout_secs("JSR_ADMIN_CORE_ROLLBACK_TIMEOUT_SECS").unwrap_or(300),
+        ),
         "list_admin_actions"
         | "get_admin_action_help"
         | "hive_status"
@@ -13882,6 +13914,7 @@ fn action_routes_via_local_orchestrator(action: &str) -> bool {
             | "get_hive"
             | "list_versions"
             | "get_versions"
+            | "core_rollback"
             | "list_runtimes"
             | "get_runtime"
             | "remove_runtime_version"
@@ -16956,7 +16989,7 @@ mod tests {
         let (status, body) = build_admin_action_help_response("unpublish_artifact");
         assert_eq!(status, 200);
         let body: Value = serde_json::from_str(&body).expect("valid action help response");
-        assert_eq!(body["payload"]["registry_version"], json!("9"));
+        assert_eq!(body["payload"]["registry_version"], json!("10"));
         assert_eq!(
             body["payload"]["entry"]["request_contract"]["admin_rpc"]["action"],
             json!("unpublish_artifact")
