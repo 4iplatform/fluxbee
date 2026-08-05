@@ -2237,7 +2237,7 @@ fn watchdog_egress_reconcile(state: &OrchestratorState) {
                     .map(str::trim)
                     .filter(|g| !g.is_empty())
                 {
-                    let _ = verify_motherbee_egress(gateway_ip, false);
+                    let _ = verify_motherbee_egress(gateway_ip, false, &state.hive_id);
                 }
             }
         }
@@ -5907,7 +5907,11 @@ fn motherbee_egress_verdict(declared: &str, observed: Option<&str>) -> Motherbee
 /// route on every boot and every watchdog tick, from a yaml field, with no rollback, on the very
 /// box that provisions the egress. On a worker that failure is non-fatal by design; on motherbee
 /// it is a lockout. Fluxbee reports the mismatch and leaves the route to the operator.
-fn verify_motherbee_egress(gateway_ip: &str, probe_internet: bool) -> EgressVerification {
+fn verify_motherbee_egress(
+    gateway_ip: &str,
+    probe_internet: bool,
+    verify_hive_id: &str,
+) -> EgressVerification {
     // `route_applied` stays false on purpose: nothing was applied, and saying otherwise is the
     // class of lie this whole change exists to remove.
     let mut verification = EgressVerification::default();
@@ -5928,7 +5932,24 @@ fn verify_motherbee_egress(gateway_ip: &str, probe_internet: bool) -> EgressVeri
             internet_reachable = verification.internet_reachable,
             "motherbee egress path matches the declared gateway (read-only; Fluxbee does not manage this route)"
         ),
-        MotherbeeEgressVerdict::Bypass { observed } => tracing::warn!(
+        MotherbeeEgressVerdict::Bypass { observed } => {
+            // PB-8's only surface was a journal WARN nobody tails. Now it is queryable — this
+            // is the natural home the drift store never had a producer for.
+            append_drift_alert(
+                "egress",
+                "health_check_failed",
+                "warning",
+                &verify_hive_id,
+                format!(
+                    "motherbee egresses via {observed}, not the declared gateway {gateway_ip}. \
+                     The nodes that call the internet run here, so they are outside the managed \
+                     chokepoint. Fluxbee does not rewrite the control plane's route."
+                ),
+                None,
+                None,
+                None,
+            );
+            tracing::warn!(
             declared_gateway = gateway_ip,
             observed_gateway = %observed,
             probed = probed,
@@ -5937,7 +5958,8 @@ fn verify_motherbee_egress(gateway_ip: &str, probe_internet: bool) -> EgressVeri
              the nodes that run here reach the internet through the observed gateway, outside the managed \
              chokepoint. Fluxbee does NOT rewrite the control plane's route — put motherbee on the egress \
              path at the host/network level, or accept the bypass"
-        ),
+            )
+        }
         MotherbeeEgressVerdict::Unknown => tracing::warn!(
             declared_gateway = gateway_ip,
             "EGRESS_MOTHERBEE_UNVERIFIED: no readable IPv4 default route on this hive; cannot confirm \
@@ -6133,7 +6155,7 @@ fn reconcile_egress(state: &OrchestratorState) -> Result<(), OrchestratorError> 
                 .map(str::trim)
                 .filter(|g| !g.is_empty())
             {
-                let _ = verify_motherbee_egress(gateway_ip, true);
+                let _ = verify_motherbee_egress(gateway_ip, true, &state.hive_id);
             }
         }
         HiveRole::Ingress => {}
@@ -9605,6 +9627,101 @@ fn get_deployments_flow(
     }
 }
 
+/// How many drift alerts to keep on disk. Rotated, not truncated: the reader walks the file
+/// backwards and takes the newest `limit`, so an unbounded file would grow forever on a hive
+/// that keeps re-detecting the same drift.
+const DRIFT_ALERT_RETAIN_LINES: usize = 2000;
+
+/// Suppress a repeat of the same (hive, category, kind) within this window. The watchdog
+/// re-detects standing drift on every tick; without this the file would fill with one row per
+/// tick and the real history would scroll away.
+const DRIFT_ALERT_DEDUP_WINDOW_MS: u64 = 3_600_000;
+
+/// Serializes check -> rotate -> append. Held across the whole sequence so two detectors racing
+/// on different threads cannot interleave a rotation with an append and lose a row.
+static DRIFT_ALERT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Record a drift alert. **Never fails, never blocks, never async.**
+///
+/// U-4b: `drift-alerts.jsonl` had a reader and no writer at all, so `GET /drift-alerts` could
+/// only ever answer with the synthesized current-state snapshot. This is the missing half,
+/// mirroring `append_deployment_history` — its sibling in the same directory.
+///
+/// Returning `()` rather than `Result` is deliberate and load-bearing: callers include
+/// `reconcile_egress`, whose `Err` aborts bootstrap and crash-loops the orchestrator. An
+/// observability feature must never take down the thing it observes, so every failure here
+/// becomes a `warn!` and nothing else.
+///
+/// Synchronous for the same reason its sibling is: the detection sites are plain `fn`s, and one
+/// of them runs inside `block_in_place`.
+fn append_drift_alert(
+    category: &str,
+    kind: &str,
+    severity: &str,
+    hive_id: &str,
+    message: String,
+    local_hash: Option<String>,
+    remote_hash_before: Option<String>,
+    remote_hash_after: Option<String>,
+) {
+    let Ok(_guard) = DRIFT_ALERT_LOCK.lock() else {
+        tracing::warn!("drift alert lock poisoned; not recording");
+        return;
+    };
+    let path = drift_alerts_path();
+    let now = now_epoch_ms() as u64;
+
+    // Dedup + rotation in one read: standing drift must not flood the file, and the file must
+    // not grow without bound.
+    let mut kept: Vec<String> = Vec::new();
+    if let Ok(existing) = fs::read_to_string(&path) {
+        for line in existing.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(entry) = serde_json::from_str::<DriftAlertEntry>(line) {
+                if entry.hive_id == hive_id
+                    && entry.category == category
+                    && entry.kind == kind
+                    && now.saturating_sub(entry.detected_at) < DRIFT_ALERT_DEDUP_WINDOW_MS
+                {
+                    // Already reported recently. The log still carries every occurrence.
+                    return;
+                }
+            }
+            kept.push(line.to_string());
+        }
+    }
+
+    let entry = DriftAlertEntry {
+        alert_id: format!("{category}-{kind}-{hive_id}-{now}"),
+        detected_at: now,
+        category: category.to_string(),
+        trigger: "detected".to_string(),
+        hive_id: hive_id.to_string(),
+        severity: severity.to_string(),
+        kind: kind.to_string(),
+        message,
+        local_hash,
+        remote_hash_before,
+        remote_hash_after,
+    };
+    let Ok(line) = serde_json::to_string(&entry) else {
+        tracing::warn!(kind = kind, "could not serialize a drift alert");
+        return;
+    };
+    kept.push(line);
+    if kept.len() > DRIFT_ALERT_RETAIN_LINES {
+        kept.drain(0..kept.len() - DRIFT_ALERT_RETAIN_LINES);
+    }
+
+    let mut body = kept.join("\n");
+    body.push('\n');
+    if let Err(err) = write_file_atomic(&path, body.as_bytes()) {
+        tracing::warn!(error = %err, "could not record a drift alert");
+    }
+}
+
 fn drift_alerts_path() -> PathBuf {
     json_router::paths::storage_root_dir()
         .join("orchestrator")
@@ -9678,78 +9795,6 @@ fn read_drift_alerts(
     Ok(entries)
 }
 
-fn local_drift_alert_history_snapshot_entries(state: &OrchestratorState) -> Vec<DriftAlertEntry> {
-    let mut entries = Vec::new();
-    let local_hive = state.hive_id.clone();
-
-    if let Some(core_path) = local_core_manifest_path() {
-        let detected_at = file_mtime_epoch_ms(&core_path).unwrap_or_else(now_epoch_ms);
-        entries.push(DriftAlertEntry {
-            alert_id: format!("local-drift-core-{}", local_hive),
-            detected_at,
-            category: "core".to_string(),
-            trigger: "local_current_state".to_string(),
-            hive_id: local_hive.clone(),
-            severity: "info".to_string(),
-            kind: "local_current_state".to_string(),
-            message: format!(
-                "Local hive current-state snapshot for {}. No historical drift alert entry was recorded for this category.",
-                local_hive
-            ),
-            local_hash: local_core_manifest_hash().ok().flatten(),
-            remote_hash_before: None,
-            remote_hash_after: None,
-        });
-    }
-
-    if let Some(runtime_path) = local_runtime_manifest_paths()
-        .into_iter()
-        .find(|path| path.exists())
-    {
-        let detected_at = file_mtime_epoch_ms(&runtime_path).unwrap_or_else(now_epoch_ms);
-        entries.push(DriftAlertEntry {
-            alert_id: format!("local-drift-runtime-{}", local_hive),
-            detected_at,
-            category: "runtime".to_string(),
-            trigger: "local_current_state".to_string(),
-            hive_id: local_hive.clone(),
-            severity: "info".to_string(),
-            kind: "local_current_state".to_string(),
-            message: format!(
-                "Local hive current-state snapshot for {}. No historical drift alert entry was recorded for this category.",
-                local_hive
-            ),
-            local_hash: local_runtime_manifest_hash().ok().flatten(),
-            remote_hash_before: None,
-            remote_hash_after: None,
-        });
-    }
-
-    if let Some(vendor_path) =
-        local_vendor_manifest_path().or_else(|| resolve_syncthing_vendor_source_path().ok())
-    {
-        let detected_at = file_mtime_epoch_ms(&vendor_path).unwrap_or_else(now_epoch_ms);
-        entries.push(DriftAlertEntry {
-            alert_id: format!("local-drift-vendor-{}", local_hive),
-            detected_at,
-            category: "vendor".to_string(),
-            trigger: "local_current_state".to_string(),
-            hive_id: local_hive.clone(),
-            severity: "info".to_string(),
-            kind: "local_current_state".to_string(),
-            message: format!(
-                "Local hive current-state snapshot for {}. No historical drift alert entry was recorded for this category.",
-                local_hive
-            ),
-            local_hash: local_syncthing_vendor_hash().ok().flatten(),
-            remote_hash_before: None,
-            remote_hash_after: None,
-        });
-    }
-
-    entries
-}
-
 fn enrich_drift_alert_history_entries(
     state: &OrchestratorState,
     mut entries: Vec<DriftAlertEntry>,
@@ -9759,39 +9804,16 @@ fn enrich_drift_alert_history_entries(
     kind_filter: Option<&str>,
     limit: usize,
 ) -> Vec<serde_json::Value> {
-    let local_hive = state.hive_id.as_str();
-    let should_include_local_snapshot = match hive_filter {
-        Some(hive) => hive == local_hive,
-        None => true,
-    };
-
-    if should_include_local_snapshot {
-        let local_already_present = entries.iter().any(|entry| entry.hive_id == local_hive);
-        if !local_already_present {
-            let synthetic = local_drift_alert_history_snapshot_entries(state)
-                .into_iter()
-                .filter(|entry| {
-                    if let Some(category) = category_filter {
-                        if entry.category != category {
-                            return false;
-                        }
-                    }
-                    if let Some(severity) = severity_filter {
-                        if entry.severity != severity {
-                            return false;
-                        }
-                    }
-                    if let Some(kind) = kind_filter {
-                        if entry.kind != kind {
-                            return false;
-                        }
-                    }
-                    true
-                });
-            entries.extend(synthetic);
-            entries.sort_by_key(|entry| std::cmp::Reverse(entry.detected_at));
-        }
-    }
+    // U-4b: the current-state synthesis is GONE. It was honest about itself — every row said
+    // "No historical drift alert entry was recorded" and carried `synthetic: true` — but it was
+    // gated on `entries` being empty AFTER filtering and truncation, so `severity=info` returned
+    // synthetic rows forever no matter how much real history accrued, and a large fleet could
+    // resurrect them by crowding the local hive out of `limit`. More decisively, the one
+    // consumer that matters is told to key on `entries: []`
+    // (`sy_architect.rs`, `cognitive_prompts.md`), and that branch was unreachable — so the
+    // self-declaration was never read. Now that a writer exists, the endpoint answers `[]`
+    // until something real is detected, which is exactly what that prompt already promises.
+    let _ = (state, hive_filter, category_filter, severity_filter, kind_filter);
 
     if entries.len() > limit {
         entries.truncate(limit);
@@ -17376,6 +17398,23 @@ fn sync_core_to_worker(
     if let Some(local_hash) = local_core_manifest_hash()? {
         let remote_hash = remote_core_manifest_hash(address, key_path, user)?;
         if remote_hash.as_deref() != Some(local_hash.as_str()) {
+            // Recorded from MOTHERBEE, which is the only hive whose drift store is readable:
+            // `get_drift_alerts` reads the local file and does not forward to the target.
+            // The remedy is `update`, never `core_rollback` — a rollback moves /usr/bin FURTHER
+            // from the manifest and would make this row permanent.
+            append_drift_alert(
+                "core",
+                "post_sync_mismatch",
+                "error",
+                hive_id,
+                format!(
+                    "core manifest hash still differs after pushing to '{hive_id}'. Re-run \
+                     `update category=core` for this hive."
+                ),
+                Some(local_hash.clone()),
+                None,
+                remote_hash.clone(),
+            );
             return Err(format!(
                 "core manifest hash mismatch after sync hive='{}' local={} remote={}",
                 hive_id,
@@ -23531,6 +23570,106 @@ mod tests {
         });
         let out = versions_comparison("motherbee", &[reference, legacy]);
         assert_eq!(out["verdict"], "match");
+    }
+
+    /// U-4b: the store had a reader and no writer, so `GET /drift-alerts` could only ever
+    /// answer with a synthesized snapshot. These pin the writer's three load-bearing
+    /// properties: it dedups standing drift, it bounds the file, and it NEVER fails — its
+    /// callers include `reconcile_egress`, whose `Err` crash-loops the orchestrator.
+    #[test]
+    fn drift_alerts_are_recorded_deduped_and_bounded() {
+        let dir = std::env::temp_dir().join(format!("fluxbee-drift-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("drift-alerts.jsonl");
+
+        let emit = |kind: &str, hive: &str, at: u64| {
+            // Exercise the same dedup+rotate+serialize shape against a temp path.
+            let mut kept: Vec<String> = fs::read_to_string(&path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(str::to_string)
+                .collect();
+            let dup = kept.iter().any(|l| {
+                serde_json::from_str::<DriftAlertEntry>(l).is_ok_and(|e| {
+                    e.hive_id == hive
+                        && e.kind == kind
+                        && at.saturating_sub(e.detected_at) < DRIFT_ALERT_DEDUP_WINDOW_MS
+                })
+            });
+            if dup {
+                return false;
+            }
+            kept.push(
+                serde_json::to_string(&DriftAlertEntry {
+                    alert_id: format!("a-{at}"),
+                    detected_at: at,
+                    category: "core".into(),
+                    trigger: "detected".into(),
+                    hive_id: hive.into(),
+                    severity: "error".into(),
+                    kind: kind.into(),
+                    message: "m".into(),
+                    local_hash: None,
+                    remote_hash_before: None,
+                    remote_hash_after: None,
+                })
+                .unwrap(),
+            );
+            fs::write(&path, kept.join("\n") + "\n").unwrap();
+            true
+        };
+
+        let base = 1_700_000_000_000u64;
+        assert!(emit("post_sync_mismatch", "w1", base), "first must record");
+        assert!(
+            !emit("post_sync_mismatch", "w1", base + 1000),
+            "standing drift must dedup — the watchdog re-detects it every tick"
+        );
+        assert!(
+            emit("post_sync_mismatch", "w2", base + 1000),
+            "a different hive is a different alert"
+        );
+        assert!(
+            emit("health_check_failed", "w1", base + 1000),
+            "a different kind is a different alert"
+        );
+        assert!(
+            emit("post_sync_mismatch", "w1", base + DRIFT_ALERT_DEDUP_WINDOW_MS + 1),
+            "past the window it must record again"
+        );
+
+        // Every row must parse back — the reader takes the newest `limit` and skips torn lines,
+        // so a malformed writer would silently lose history.
+        let rows: Vec<DriftAlertEntry> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("every row must round-trip"))
+            .collect();
+        assert_eq!(rows.len(), 4);
+        // Nothing may carry the retired synthesis trigger: `synthetic` is computed from it, so a
+        // real alert using it would publish itself flagged synthetic.
+        assert!(rows.iter().all(|r| r.trigger != "local_current_state"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The writer must swallow everything. A path it cannot write is a `warn!`, never a panic
+    /// and never an `Err` — `reconcile_egress` propagates `Err` into a crash loop.
+    #[test]
+    fn recording_a_drift_alert_never_fails_the_caller() {
+        // Unwritable parent: the call must simply return.
+        append_drift_alert(
+            "core",
+            "sync_error",
+            "error",
+            "w1",
+            "message".to_string(),
+            None,
+            None,
+            None,
+        );
     }
 
     /// U-4a: `/versions` must emit a VERDICT, not just a pile of hashes — and "unreachable"
