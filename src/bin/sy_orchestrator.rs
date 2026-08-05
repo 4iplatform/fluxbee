@@ -653,6 +653,26 @@ impl OrchestratorState {
         lock.lock_owned().await
     }
 
+    /// Non-blocking variant, for callers that run ON THE SERIAL ADMIN WORKER.
+    ///
+    /// `add_hive` now holds the per-hive lock for the whole multi-minute background join, so a
+    /// caller that `.await`s it would park the single admin channel for exactly as long as the
+    /// join takes — reintroducing the blockage PB-7 exists to remove, and making the
+    /// `JOIN_IN_PROGRESS` answer unreachable because the check would never get to run.
+    fn try_lock_hive_topology(&self, hive_id: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let lock = {
+            let mut registry = self
+                .hive_topology_locks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            registry
+                .entry(hive_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        lock.try_lock_owned().ok()
+    }
+
     /// SO-04: acquire the per-node lifecycle lock, held for the whole
     /// run/kill/start/restart/remove/config_set flow so concurrent ops on the
     /// same node don't drift identity/config/systemd. Keyed by the (validated,
@@ -3794,6 +3814,35 @@ async fn core_rollback_local(
             schedule_orchestrator_self_restart();
             self_restart = true;
         }
+    }
+
+    // The health gate `?`-returns on the FIRST unit that does not come up, so a non-empty
+    // `errors` here means services are down and the operator must intervene. Reporting `ok`
+    // anyway would be U-1's shape all over again — success on work that did not complete.
+    if !errors.is_empty() {
+        append_single_deployment_history(
+            state,
+            "core",
+            "core_rollback",
+            &state.hive_id,
+            "error",
+            Some("ROLLBACK_RESTART_FAILED".to_string()),
+            generation.replaced_manifest_hash.clone(),
+        );
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "ROLLBACK_RESTART_FAILED",
+            "message": format!(
+                "binaries were restored from generation '{}' but the core did not come back up: {}",
+                generation.generation,
+                errors.join("; ")
+            ),
+            "hive": state.hive_id,
+            "generation": generation.generation,
+            "restored": restored,
+            "restarted": restarted,
+            "orchestrator_self_restart_scheduled": self_restart,
+        });
     }
 
     serde_json::json!({
@@ -10068,7 +10117,19 @@ async fn remove_hive_flow(state: &OrchestratorState, hive_id: &str) -> serde_jso
     }
     // F18: per-hive topology lock — serialize against a concurrent add_hive or a
     // second remove_hive on the same hive_id (closes the exists/remove TOCTOU).
-    let _topology_guard = state.lock_hive_topology(hive_id).await;
+    //
+    // TRY-lock: this runs on the serial admin worker, and a background join now holds this lock
+    // for minutes. Awaiting it would freeze the hive's whole control plane behind a join — the
+    // blockage PB-7 removed, sneaking back in through remove_hive.
+    let Some(_topology_guard) = state.try_lock_hive_topology(hive_id) else {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "JOIN_IN_PROGRESS",
+            "retryable": true,
+            "hive_id": hive_id,
+            "message": "a join or another topology operation for this hive is running; retry once it finishes",
+        });
+    };
     let root = hives_root();
     let dir = root.join(hive_id);
     if !dir.exists() {
@@ -18205,8 +18266,21 @@ async fn accept_add_hive(
 
     // In-flight protection lives HERE, not in the flows: hold the topology lock across the
     // read-then-write so two concurrent accepts cannot both decide the hive is free.
+    //
+    // TRY-lock, never await. The background join holds this same lock for its whole ~6-minute
+    // run, so awaiting it here would park the single serial admin worker for that entire time —
+    // the exact blockage this change removes — and the JOIN_IN_PROGRESS answer below would be
+    // unreachable, because we would never get far enough to return it.
     let root = hives_root();
-    let guard = state.lock_hive_topology(&hive_id).await;
+    let Some(guard) = state.try_lock_hive_topology(&hive_id) else {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "JOIN_IN_PROGRESS",
+            "retryable": true,
+            "hive_id": hive_id,
+            "message": "another topology operation for this hive is running; poll GET /hives/<hive_id>",
+        });
+    };
     match hive_status(&root, &hive_id).as_deref() {
         Some("connected") => {
             return serde_json::json!({
@@ -23360,6 +23434,36 @@ mod tests {
     fn mesh_protocol_version_is_a_single_constant() {
         assert!(!fluxbee_sdk::protocol::MESH_PROTOCOL_VERSION.is_empty());
         assert!(fluxbee_sdk::protocol::MESH_PROTOCOL_VERSION.starts_with("fluxbee/"));
+    }
+
+    /// THE regression guard for the panel's worst finding. `accept_add_hive` and
+    /// `remove_hive_flow` both run ON the single serial admin worker, while a background join
+    /// holds the per-hive topology lock for ~6 minutes. If either of them AWAITS that lock, the
+    /// hive's whole control plane freezes behind the join — the exact blockage PB-7 exists to
+    /// remove — and `JOIN_IN_PROGRESS` becomes unreachable, because the check never runs.
+    #[tokio::test]
+    async fn admin_worker_paths_never_await_a_lock_a_background_join_holds() {
+        let state = sample_orchestrator_state_for_tests();
+
+        // A join is running: it owns the lock for its whole duration.
+        let join_guard = state.lock_hive_topology("worker1").await;
+
+        // Both admin-worker paths must come back IMMEDIATELY rather than parking.
+        assert!(
+            state.try_lock_hive_topology("worker1").is_none(),
+            "must report contention, not wait for it"
+        );
+        // ...and must not be confused by an unrelated hive.
+        assert!(
+            state.try_lock_hive_topology("worker2").is_some(),
+            "a different hive must still be lockable"
+        );
+
+        drop(join_guard);
+        assert!(
+            state.try_lock_hive_topology("worker1").is_some(),
+            "the lock must be reusable once the join releases it"
+        );
     }
 
     /// PB-7: which recorded states a re-POST of `add_hive` may resume from.

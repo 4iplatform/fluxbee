@@ -12621,7 +12621,6 @@ async fn handle_admin_command_inner(
             | "vault_delete"
             | "vault_rotate"
             | "vault_rollback"
-            | "core_rollback"
     ) {
         return handle_vault_command(ctx, client, action, payload, hive).await;
     }
@@ -13588,6 +13587,7 @@ fn build_admin_request(
         | "get_node_state"
         | "get_node_status"
         | "remove_hive"
+        | "core_rollback"
         | "add_hive" => "SY.orchestrator",
         _ => "SY.config.routes",
     };
