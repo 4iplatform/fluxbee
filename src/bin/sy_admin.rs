@@ -7529,6 +7529,9 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "RUNTIME_NOT_FOUND"
         | "RUNTIME_VERSION_NOT_FOUND" => 404,
         "HIVE_EXISTS"
+        // A join for this hive is already running in the background (PB-7): a conflict with
+        // current state, and retryable once it finishes.
+        | "JOIN_IN_PROGRESS"
         | "MODULE_EXISTS"
         | "VERSION_MISMATCH"
         | "VERSION_CONFLICT"
@@ -7900,6 +7903,14 @@ async fn handle_storage_metrics_http(ctx: &AdminContext) -> (u16, String) {
     }
 }
 
+/// The statuses that count as SUCCESS on the wire, i.e. not an error envelope.
+///
+/// Three are not literally `"ok"`, and each is deliberate:
+/// - `not_found`: a well-formed query whose answer is "nothing here".
+/// - `sync_pending`: the target correctly refused a stale update; the caller must re-sync.
+/// - `accepted`: the work was taken but is NOT finished — `add_hive` runs in the background
+///   (PB-7) and the caller polls `GET /hives/<id>`. Anything else answering `accepted` inherits
+///   the same 202 contract, so add it here only if that is what you mean.
 fn is_ok_status(status: Option<&str>) -> bool {
     matches!(
         status,
@@ -7907,6 +7918,7 @@ fn is_ok_status(status: Option<&str>) -> bool {
             if value.eq_ignore_ascii_case("ok")
                 || value.eq_ignore_ascii_case("not_found")
                 || value.eq_ignore_ascii_case("sync_pending")
+                || value.eq_ignore_ascii_case("accepted")
     )
 }
 
@@ -13757,9 +13769,13 @@ fn env_timeout_secs(name: &str) -> Option<u64> {
 
 fn admin_action_timeout(action: &str) -> Duration {
     match action {
-        // add_hive runs remote bootstrap + WAN wait and is expected to be long.
+        // add_hive now ACCEPTS and returns (PB-7): the join runs in the orchestrator's
+        // background, so this window covers only validation + the accept write, not the
+        // multi-minute bootstrap. The old 180 s was a contract the real join always blew
+        // through — it produced TIMEOUT on operations that were still running and usually
+        // succeeded. `JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS` still overrides, for a loaded box.
         "add_hive" => {
-            Duration::from_secs(env_timeout_secs("JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS").unwrap_or(180))
+            Duration::from_secs(env_timeout_secs("JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS").unwrap_or(30))
         }
         "update" => {
             Duration::from_secs(env_timeout_secs("JSR_ADMIN_UPDATE_TIMEOUT_SECS").unwrap_or(60))
@@ -13793,15 +13809,15 @@ fn build_admin_http_response(
                 .and_then(|value| value.as_str())
                 .unwrap_or("ok");
             if payload_is_ok(&payload) {
-                let http_status = if status.eq_ignore_ascii_case("sync_pending") {
-                    202
-                } else {
-                    200
-                };
+                // 202 = taken but not finished. `sync_pending` and `accepted` (a backgrounded
+                // add_hive, PB-7) are both "come back and check", not "done".
+                let deferred = status.eq_ignore_ascii_case("sync_pending")
+                    || status.eq_ignore_ascii_case("accepted");
+                let http_status = if deferred { 202 } else { 200 };
                 return (
                     http_status,
                     serde_json::json!({
-                        "status": if status.eq_ignore_ascii_case("sync_pending") { "sync_pending" } else { "ok" },
+                        "status": if deferred { status } else { "ok" },
                         "action": action,
                         "payload": payload,
                         "error_code": serde_json::Value::Null,

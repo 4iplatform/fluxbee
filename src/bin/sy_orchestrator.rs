@@ -1503,6 +1503,7 @@ async fn bootstrap_local(
                 "failed to materialize per-role core distribution subtrees; spokes will not see this build"
             ),
         }
+        sweep_interrupted_joins();
     }
 
     tracing::info!("starting rt-gateway");
@@ -2272,8 +2273,11 @@ async fn send_admin_forbidden(
 async fn handle_admin(
     sender: &NodeSender,
     msg: &Message,
-    state: &OrchestratorState,
+    state_arc: &Arc<OrchestratorState>,
 ) -> Result<(), OrchestratorError> {
+    // Only the add_hive arm needs the Arc (it hands a clone to a background join). Everything
+    // else in this 400-line body keeps working against the plain reference.
+    let state: &OrchestratorState = state_arc.as_ref();
     let action = msg.meta.action.as_deref().unwrap_or("");
 
     // F8: gate state-mutating admin actions on an authorized origin. The SY.admin
@@ -2459,242 +2463,9 @@ async fn handle_admin(
                 )
                 .await;
             }
-            let hive_id = msg
-                .payload
-                .get("hive_id")
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string());
-            let address = msg
-                .payload
-                .get("address")
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string());
-            if let Some(hive_id) = hive_id {
-                let address = address.unwrap_or_default();
-                let harden_ssh = resolve_add_hive_harden_ssh(&msg.payload);
-                let restrict_ssh = resolve_add_hive_restrict_ssh(&msg.payload, harden_ssh);
-                let ssh_access = resolve_add_hive_ssh_access(&msg.payload);
-                let require_dist_sync = resolve_add_hive_require_dist_sync(&msg.payload);
-                let dist_sync_probe_timeout_secs =
-                    resolve_add_hive_dist_sync_probe_timeout_secs(&msg.payload);
-                // SSH bootstrap login flows from the caller-supplied payload; the
-                // password is optional (key-first probe, see add_*_hive_flow).
-                match resolve_add_hive_ssh_creds(&msg.payload) {
-                    Err(err) => serde_json::json!({
-                        "status": "error",
-                        "error_code": "INVALID_REQUEST",
-                        "message": err.to_string(),
-                    }),
-                    Ok(creds) => match resolve_add_hive_role(&msg.payload) {
-                        Ok(HiveRole::Egress) => match resolve_add_hive_egress_section(&msg.payload)
-                        {
-                            Ok(egress) => {
-                                let mut result = add_egress_hive_flow(
-                                    state,
-                                    &hive_id,
-                                    &address,
-                                    harden_ssh,
-                                    restrict_ssh,
-                                    ssh_access,
-                                    egress,
-                                    &creds,
-                                )
-                                .await;
-                                // B-2: same as the worker path — on a failed egress join,
-                                // best-effort revoke the (possibly seeded) bootstrap key. NOT for
-                                // key_only_persist: on any of its error paths we KEEP the
-                                // motherbee key as the recovery channel (the per-spoke private
-                                // key may have been discarded), so a failed join is never a strand.
-                                // Also skipped on a transient/retryable failure so the retry stays key-first.
-                                if result.get("status").and_then(|v| v.as_str()) != Some("ok")
-                                    && ssh_access != SshAccess::KeyOnlyPersist
-                                    && !add_hive_result_is_transient(&result)
-                                {
-                                    let revoke = best_effort_revoke_bootstrap(
-                                        &address,
-                                        creds.user.as_str(),
-                                        creds.password.as_deref(),
-                                    );
-                                    if let Some(obj) = result.as_object_mut() {
-                                        obj.insert(
-                                            "ssh_bootstrap_open".to_string(),
-                                            serde_json::json!(!revoke.closed()),
-                                        );
-                                        obj.insert(
-                                            "ssh_key_removed".to_string(),
-                                            serde_json::json!(revoke.ssh_key_removed),
-                                        );
-                                        obj.insert(
-                                            "sudoers_removed".to_string(),
-                                            serde_json::json!(revoke.sudoers_removed),
-                                        );
-                                    }
-                                } else if result.get("status").and_then(|v| v.as_str())
-                                    != Some("ok")
-                                    && ssh_access != SshAccess::KeyOnlyPersist
-                                {
-                                    // Transient failure: the B-2 revoke was skipped so the retry
-                                    // stays key-first — but the motherbee key + sudoers remain on
-                                    // the box. Surface it so an abandoned box is not silently open.
-                                    if let Some(obj) = result.as_object_mut() {
-                                        obj.insert(
-                                            "ssh_bootstrap_open".to_string(),
-                                            serde_json::json!(true),
-                                        );
-                                        obj.insert(
-                                            "revoke_skipped_transient".to_string(),
-                                            serde_json::json!(true),
-                                        );
-                                    }
-                                }
-                                result
-                            }
-                            Err(err) => serde_json::json!({
-                                "status": "error",
-                                "error_code": "INVALID_REQUEST",
-                                "message": err.to_string(),
-                            }),
-                        },
-                        Ok(HiveRole::Ingress) => {
-                            match resolve_add_hive_ingress_section(&msg.payload) {
-                                Ok(ingress) => {
-                                    let mut result = add_ingress_hive_flow(
-                                        state,
-                                        &hive_id,
-                                        &address,
-                                        harden_ssh,
-                                        restrict_ssh,
-                                        ssh_access,
-                                        ingress,
-                                        &creds,
-                                    )
-                                    .await;
-                                    // Same failure tail as worker/egress: on a failed
-                                    // ingress join, best-effort revoke the seeded key. Skipped for
-                                    // key_only_persist (keep the motherbee key as recovery), and on
-                                    // a transient/retryable failure so the retry stays key-first.
-                                    if result.get("status").and_then(|v| v.as_str()) != Some("ok")
-                                        && ssh_access != SshAccess::KeyOnlyPersist
-                                        && !add_hive_result_is_transient(&result)
-                                    {
-                                        let revoke = best_effort_revoke_bootstrap(
-                                            &address,
-                                            creds.user.as_str(),
-                                            creds.password.as_deref(),
-                                        );
-                                        if let Some(obj) = result.as_object_mut() {
-                                            obj.insert(
-                                                "ssh_bootstrap_open".to_string(),
-                                                serde_json::json!(!revoke.closed()),
-                                            );
-                                            obj.insert(
-                                                "ssh_key_removed".to_string(),
-                                                serde_json::json!(revoke.ssh_key_removed),
-                                            );
-                                            obj.insert(
-                                                "sudoers_removed".to_string(),
-                                                serde_json::json!(revoke.sudoers_removed),
-                                            );
-                                        }
-                                    } else if result.get("status").and_then(|v| v.as_str())
-                                        != Some("ok")
-                                        && ssh_access != SshAccess::KeyOnlyPersist
-                                    {
-                                        // Transient failure: revoke skipped so the retry stays
-                                        // key-first; motherbee key + sudoers remain on the box.
-                                        if let Some(obj) = result.as_object_mut() {
-                                            obj.insert(
-                                                "ssh_bootstrap_open".to_string(),
-                                                serde_json::json!(true),
-                                            );
-                                            obj.insert(
-                                                "revoke_skipped_transient".to_string(),
-                                                serde_json::json!(true),
-                                            );
-                                        }
-                                    }
-                                    result
-                                }
-                                Err(err) => serde_json::json!({
-                                    "status": "error",
-                                    "error_code": "INVALID_REQUEST",
-                                    "message": err.to_string(),
-                                }),
-                            }
-                        }
-                        Ok(_) => {
-                            let mut result = add_hive_flow(
-                                state,
-                                &hive_id,
-                                &address,
-                                harden_ssh,
-                                restrict_ssh,
-                                ssh_access,
-                                require_dist_sync,
-                                dist_sync_probe_timeout_secs,
-                                &creds,
-                            )
-                            .await;
-                            // B-2: on a failed join, best-effort revoke the (possibly
-                            // already-seeded) bootstrap SSH access and surface whether it
-                            // may still be open (a retry re-seeds via the password channel).
-                            // Skipped for key_only_persist (keep the motherbee key as recovery), and
-                            // on a transient/retryable failure so the retry stays key-first.
-                            if result.get("status").and_then(|v| v.as_str()) != Some("ok")
-                                && ssh_access != SshAccess::KeyOnlyPersist
-                                && !add_hive_result_is_transient(&result)
-                            {
-                                let revoke = best_effort_revoke_bootstrap(
-                                    &address,
-                                    creds.user.as_str(),
-                                    creds.password.as_deref(),
-                                );
-                                if let Some(obj) = result.as_object_mut() {
-                                    obj.insert(
-                                        "ssh_bootstrap_open".to_string(),
-                                        serde_json::json!(!revoke.closed()),
-                                    );
-                                    obj.insert(
-                                        "ssh_key_removed".to_string(),
-                                        serde_json::json!(revoke.ssh_key_removed),
-                                    );
-                                    obj.insert(
-                                        "sudoers_removed".to_string(),
-                                        serde_json::json!(revoke.sudoers_removed),
-                                    );
-                                }
-                            } else if result.get("status").and_then(|v| v.as_str()) != Some("ok")
-                                && ssh_access != SshAccess::KeyOnlyPersist
-                            {
-                                // Transient failure: revoke skipped so the retry stays key-first;
-                                // motherbee key + sudoers remain on the box. Surface it.
-                                if let Some(obj) = result.as_object_mut() {
-                                    obj.insert(
-                                        "ssh_bootstrap_open".to_string(),
-                                        serde_json::json!(true),
-                                    );
-                                    obj.insert(
-                                        "revoke_skipped_transient".to_string(),
-                                        serde_json::json!(true),
-                                    );
-                                }
-                            }
-                            result
-                        }
-                        Err(err) => serde_json::json!({
-                            "status": "error",
-                            "error_code": "INVALID_REQUEST",
-                            "message": err.to_string(),
-                        }),
-                    },
-                }
-            } else {
-                serde_json::json!({
-                    "status": "error",
-                    "error_code": "INVALID_REQUEST",
-                    "message": "missing hive_id",
-                })
-            }
+            // PB-7: accept and return; the join runs in the background so the serial admin
+            // channel stays free. The B-2 revoke tails moved INTO the background task.
+            accept_add_hive(state_arc, &msg.payload).await
         }
         _ => serde_json::json!({
             "status": "error",
@@ -9903,7 +9674,12 @@ fn write_hive_info(
 ) -> Result<(), OrchestratorError> {
     let path = root.join(hive_id).join("info.yaml");
     let yaml = serde_yaml::to_string(info)?;
-    fs::write(path, yaml)?;
+    // ATOMIC (tmp sibling + rename), not a bare `fs::write`. A background join rewrites this
+    // file several times to publish its phase, and a torn write is a dead end: `hive_exists`
+    // only checks that the file is there, `hive_status` returns None on a parse error, and the
+    // add_hive entry guard treats None as non-resumable — i.e. a permanent HIVE_EXISTS on a
+    // hive that never finished joining.
+    write_file_atomic(&path, yaml.as_bytes())?;
     Ok(())
 }
 
@@ -17647,6 +17423,420 @@ fn syncthing_device_id_from_finalize_payload(finalize: &serde_json::Value) -> Op
         .map(str::to_string)
 }
 
+/// Any hive left at `joining` at boot is by definition orphaned: `write_pid` guarantees one
+/// orchestrator per box, so nothing else can still be driving it.
+///
+/// A join is deliberately NOT auto-resumed. It needs the bootstrap credentials, and the contract
+/// is that those are never persisted — resuming across a restart would mean storing them. The
+/// operator re-POSTs instead, and the retry is key-first anyway, so in practice it resumes
+/// without the password.
+fn sweep_interrupted_joins() {
+    sweep_interrupted_joins_in(&hives_root())
+}
+
+fn sweep_interrupted_joins_in(root: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(hive_id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if hive_status(root, &hive_id).as_deref() != Some("joining") {
+            continue;
+        }
+        tracing::warn!(
+            hive_id = %hive_id,
+            "hive was joining when the orchestrator stopped; marking it interrupted (re-POST add_hive to resume)"
+        );
+        update_join_state_in(root, &hive_id, "interrupted", "done", |info| {
+            info["join"]["error_code"] = serde_json::json!("JOIN_INTERRUPTED");
+            info["join"]["error_detail"] =
+                serde_json::json!("orchestrator restarted while the join was running");
+            info["join"]["finished_at_ms"] = serde_json::json!(now_epoch_ms().to_string());
+        });
+    }
+}
+
+/// Everything a background join needs, owned — nothing borrowed from the admin message.
+struct JoinParams {
+    hive_id: String,
+    address: String,
+    harden_ssh: bool,
+    restrict_ssh: bool,
+    ssh_access: SshAccess,
+    require_dist_sync: bool,
+    dist_sync_probe_timeout_secs: u64,
+    /// Held in memory for the life of the join and never written anywhere: the contract is
+    /// that the bootstrap password / key is never logged nor persisted. That is also why a
+    /// join cannot be auto-resumed across an orchestrator restart.
+    creds: BootstrapCreds,
+    role: JoinRole,
+}
+
+enum JoinRole {
+    Worker,
+    Egress(EgressSection),
+    Ingress(IngressSection),
+}
+
+impl JoinRole {
+    fn as_str(&self) -> &'static str {
+        match self {
+            JoinRole::Worker => "worker",
+            JoinRole::Egress(_) => "egress",
+            JoinRole::Ingress(_) => "ingress",
+        }
+    }
+}
+
+/// Publish a join phase into `info.yaml` so `GET /hives/<id>` is a real progress surface.
+///
+/// Best-effort by design: failing to record a phase must never abort a join that is otherwise
+/// going fine.
+fn update_join_state(
+    hive_id: &str,
+    status: &str,
+    phase: &str,
+    mutate: impl FnOnce(&mut serde_json::Value),
+) {
+    update_join_state_in(&hives_root(), hive_id, status, phase, mutate)
+}
+
+/// Takes the root so it is testable without the real state dir (same seam as
+/// `prune_core_backup_generations_in`).
+fn update_join_state_in(
+    root: &Path,
+    hive_id: &str,
+    status: &str,
+    phase: &str,
+    mutate: impl FnOnce(&mut serde_json::Value),
+) {
+    let mut info = read_hive_info(root, hive_id).unwrap_or_else(|_| serde_json::json!({}));
+    info["status"] = serde_json::json!(status);
+    if !info["join"].is_object() {
+        info["join"] = serde_json::json!({});
+    }
+    info["join"]["phase"] = serde_json::json!(phase);
+    info["join"]["updated_at_ms"] = serde_json::json!(now_epoch_ms().to_string());
+    mutate(&mut info);
+    if let Err(err) = write_hive_info(root, hive_id, &info) {
+        tracing::warn!(hive_id = hive_id, error = %err, "could not record join phase");
+    }
+}
+
+/// Accept an `add_hive` and run it in the background.
+///
+/// PB-7/U-8a. A real join takes >6 minutes against a 180 s admin response window, so the caller
+/// used to get `TIMEOUT` on an operation that was still running and usually succeeded. Worse,
+/// every `ADMIN_COMMAND` goes to ONE serial channel that the join occupied end to end — so
+/// `get_hive`/`list_hives`/`hive_status` queued behind it, expired client-side at 30 s, and then
+/// executed late. The hive's whole control plane was blocked for the duration.
+///
+/// Now: validate synchronously (the operator still learns about a bad payload immediately),
+/// publish `status: joining`, hand the work to a blocking thread, and answer `accepted` at once.
+async fn accept_add_hive(
+    state: &Arc<OrchestratorState>,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    let invalid = |message: String| {
+        serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_REQUEST",
+            "message": message,
+        })
+    };
+
+    let Some(hive_id) = payload
+        .get("hive_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+    else {
+        return invalid("missing hive_id".to_string());
+    };
+    let address = payload
+        .get("address")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    // Everything below is pure resolution of the request: it must stay synchronous so a
+    // malformed payload is still an immediate, actionable error rather than a background failure.
+    let harden_ssh = resolve_add_hive_harden_ssh(payload);
+    let restrict_ssh = resolve_add_hive_restrict_ssh(payload, harden_ssh);
+    let ssh_access = resolve_add_hive_ssh_access(payload);
+    let require_dist_sync = resolve_add_hive_require_dist_sync(payload);
+    let dist_sync_probe_timeout_secs = resolve_add_hive_dist_sync_probe_timeout_secs(payload);
+    let creds = match resolve_add_hive_ssh_creds(payload) {
+        Ok(creds) => creds,
+        Err(err) => return invalid(err.to_string()),
+    };
+    let role = match resolve_add_hive_role(payload) {
+        Ok(HiveRole::Egress) => match resolve_add_hive_egress_section(payload) {
+            Ok(section) => JoinRole::Egress(section),
+            Err(err) => return invalid(err.to_string()),
+        },
+        Ok(HiveRole::Ingress) => match resolve_add_hive_ingress_section(payload) {
+            Ok(section) => JoinRole::Ingress(section),
+            Err(err) => return invalid(err.to_string()),
+        },
+        Ok(_) => JoinRole::Worker,
+        Err(err) => return invalid(err.to_string()),
+    };
+
+    if !valid_hive_id(&hive_id) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "INVALID_HIVE_ID",
+            "message": "hive_id must be 1-64 chars of [a-z0-9-_] (no '/', '.', '..')",
+        });
+    }
+
+    // In-flight protection lives HERE, not in the flows: hold the topology lock across the
+    // read-then-write so two concurrent accepts cannot both decide the hive is free.
+    let root = hives_root();
+    let guard = state.lock_hive_topology(&hive_id).await;
+    match hive_status(&root, &hive_id).as_deref() {
+        Some("connected") => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "HIVE_EXISTS",
+                "message": "hive already exists",
+            })
+        }
+        Some("joining") => {
+            return serde_json::json!({
+                "status": "error",
+                "error_code": "JOIN_IN_PROGRESS",
+                "retryable": true,
+                "hive_id": hive_id,
+                "message": "a join for this hive is already running; poll GET /hives/<hive_id>",
+            })
+        }
+        _ => {}
+    }
+
+    let join_id = Uuid::new_v4().to_string();
+    let now = now_epoch_ms().to_string();
+    let resumed = hive_exists(&state.state_dir, &hive_id);
+    if let Err(err) = fs::create_dir_all(root.join(&hive_id)) {
+        return serde_json::json!({
+            "status": "error",
+            "error_code": "IO_ERROR",
+            "message": err.to_string(),
+        });
+    }
+    // Published BEFORE the work starts, which is also what makes the flows' `remove_dir_all`
+    // cleanup unreachable for a live join: that path only triggers when the directory exists
+    // WITHOUT an info.yaml.
+    update_join_state(&hive_id, "joining", "accepted", |info| {
+        info["hive_id"] = serde_json::json!(hive_id);
+        info["address"] = serde_json::json!(address);
+        info["role"] = serde_json::json!(role.as_str());
+        info["ssh_user"] = serde_json::json!(creds.user);
+        if info["created_at"].is_null() {
+            info["created_at"] = serde_json::json!(now);
+        }
+        info["join"]["join_id"] = serde_json::json!(join_id);
+        info["join"]["owner_pid"] = serde_json::json!(std::process::id());
+        info["join"]["started_at_ms"] = serde_json::json!(now);
+        info["join"]["resumed"] = serde_json::json!(resumed);
+    });
+    drop(guard);
+
+    let params = JoinParams {
+        hive_id: hive_id.clone(),
+        address: address.clone(),
+        harden_ssh,
+        restrict_ssh,
+        ssh_access,
+        require_dist_sync,
+        dist_sync_probe_timeout_secs,
+        creds,
+        role,
+    };
+    spawn_background_join(Arc::clone(state), params);
+
+    serde_json::json!({
+        "status": "accepted",
+        "hive_id": hive_id,
+        "address": address,
+        "join_id": join_id,
+        "resumed": resumed,
+        "poll": format!("GET /hives/{hive_id}"),
+        "message": "join accepted; running in background (a real join takes several minutes)",
+    })
+}
+
+/// Run the join off the admin worker.
+///
+/// `spawn_blocking` + its own `block_on`, rather than `tokio::spawn`: the add_hive path is full
+/// of genuinely blocking work — dozens of `ssh`/`scp` invocations, a ~35 MB vendor push, and
+/// several `std::thread::sleep`s. On a runtime worker thread those starve the executor; on a
+/// blocking thread they are exactly what that pool is for. It also means the flows keep their
+/// current shape instead of being cut into a dozen blocking regions.
+fn spawn_background_join(state: Arc<OrchestratorState>, params: JoinParams) {
+    tokio::task::spawn_blocking(move || {
+        let handle = tokio::runtime::Handle::current();
+        let hive_id = params.hive_id.clone();
+        // A panicking join must not leave the hive stuck at `joining` forever.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle.block_on(run_background_join(&state, params))
+        }));
+        if outcome.is_err() {
+            tracing::error!(hive_id = %hive_id, "background join PANICKED");
+            update_join_state(&hive_id, "failed", "done", |info| {
+                info["join"]["error_code"] = serde_json::json!("JOIN_PANICKED");
+                info["join"]["error_detail"] = serde_json::json!("the join task panicked");
+                info["join"]["finished_at_ms"] = serde_json::json!(now_epoch_ms().to_string());
+            });
+        }
+    });
+}
+
+async fn run_background_join(state: &Arc<OrchestratorState>, params: JoinParams) {
+    let JoinParams {
+        hive_id,
+        address,
+        harden_ssh,
+        restrict_ssh,
+        ssh_access,
+        require_dist_sync,
+        dist_sync_probe_timeout_secs,
+        creds,
+        role,
+    } = params;
+
+    update_join_state(&hive_id, "joining", "running", |_| {});
+
+    let mut result = match &role {
+        JoinRole::Egress(section) => {
+            add_egress_hive_flow(
+                state,
+                &hive_id,
+                &address,
+                harden_ssh,
+                restrict_ssh,
+                ssh_access,
+                section.clone(),
+                &creds,
+            )
+            .await
+        }
+        JoinRole::Ingress(section) => {
+            add_ingress_hive_flow(
+                state,
+                &hive_id,
+                &address,
+                harden_ssh,
+                restrict_ssh,
+                ssh_access,
+                section.clone(),
+                &creds,
+            )
+            .await
+        }
+        JoinRole::Worker => {
+            add_hive_flow(
+                state,
+                &hive_id,
+                &address,
+                harden_ssh,
+                restrict_ssh,
+                ssh_access,
+                require_dist_sync,
+                dist_sync_probe_timeout_secs,
+                &creds,
+            )
+            .await
+        }
+    };
+
+    // B-2 — moved here WITH the join, not left behind in handle_admin. If this is ever
+    // separated from the flow again, a failed background join silently leaves the motherbee
+    // key and the NOPASSWD sudoers on the box forever.
+    //
+    // Skipped for key_only_persist (its error paths deliberately KEEP the motherbee key as the
+    // recovery channel, so a failed join never strands the spoke) and on a transient failure
+    // (so the retry stays key-first).
+    let ok = result.get("status").and_then(|v| v.as_str()) == Some("ok");
+    if !ok && ssh_access != SshAccess::KeyOnlyPersist && !add_hive_result_is_transient(&result) {
+        let revoke =
+            best_effort_revoke_bootstrap(&address, creds.user.as_str(), creds.password.as_deref());
+        let ssh_key_removed = revoke.ssh_key_removed;
+        let sudoers_removed = revoke.sudoers_removed;
+        let still_open = !revoke.closed();
+        if still_open {
+            tracing::warn!(
+                hive_id = %hive_id,
+                "failed join: could NOT remove the motherbee bootstrap key — it is still on the box"
+            );
+        }
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert(
+                "ssh_bootstrap_open".to_string(),
+                serde_json::json!(still_open),
+            );
+            obj.insert(
+                "ssh_key_removed".to_string(),
+                serde_json::json!(ssh_key_removed),
+            );
+            obj.insert(
+                "sudoers_removed".to_string(),
+                serde_json::json!(sudoers_removed),
+            );
+        }
+    } else if !ok && add_hive_result_is_transient(&result) {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("ssh_bootstrap_open".to_string(), serde_json::json!(true));
+            obj.insert(
+                "revoke_skipped_transient".to_string(),
+                serde_json::json!(true),
+            );
+        }
+    }
+
+    let error_code = result
+        .get("error_code")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let error_detail = result
+        .get("message")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    // The outcome used to live only in the RPC reply, which no longer exists — record it where
+    // `list_deployments` can find it.
+    append_single_deployment_history(
+        state,
+        "core",
+        "add_hive",
+        &hive_id,
+        if ok { "ok" } else { "error" },
+        error_code.clone(),
+        local_core_manifest_hash().ok().flatten(),
+    );
+
+    // The flow itself sets `connected` on success; only stamp the terminal join record.
+    let status = if ok {
+        hive_status(&hives_root(), &hive_id).unwrap_or_else(|| "connected".to_string())
+    } else {
+        "failed".to_string()
+    };
+    update_join_state(&hive_id, &status, "done", |info| {
+        info["join"]["finished_at_ms"] = serde_json::json!(now_epoch_ms().to_string());
+        info["join"]["error_code"] = serde_json::json!(error_code);
+        info["join"]["error_detail"] = serde_json::json!(error_detail);
+        info["join"]["result"] = result.clone();
+    });
+
+    if ok {
+        tracing::info!(hive_id = %hive_id, "background join finished OK");
+    } else {
+        tracing::warn!(hive_id = %hive_id, error_code = ?error_code, "background join FAILED");
+    }
+}
+
 async fn add_hive_flow(
     state: &OrchestratorState,
     hive_id: &str,
@@ -17715,7 +17905,7 @@ async fn add_hive_flow(
         // completed (peer-link / SSH controls / status=connected). Resume it via
         // the idempotent socket-first fast path below rather than dead-ending at
         // HIVE_EXISTS, which would leave the hive permanently half-provisioned (F9).
-        if hive_status(&root, hive_id).as_deref() == Some("pending") {
+        if hive_status_is_resumable(hive_status(&root, hive_id).as_deref()) {
             tracing::warn!(
                 hive_id = hive_id,
                 "hive is pending; resuming add_hive to complete finalize (idempotent)"
@@ -18882,7 +19072,7 @@ async fn add_egress_hive_flow(
         // The egress flow has no socket fast path, so resuming re-runs the
         // bootstrap, which is idempotent (sudoers from template, dedup keys,
         // restart) and applies the SSH controls the pending state never reached.
-        if hive_status(&root, hive_id).as_deref() == Some("pending") {
+        if hive_status_is_resumable(hive_status(&root, hive_id).as_deref()) {
             tracing::warn!(
                 hive_id = hive_id,
                 "egress hive is pending; resuming add_hive to complete finalize (idempotent)"
@@ -19480,7 +19670,7 @@ async fn add_ingress_hive_flow(
     let root = hives_root();
     let hive_dir = root.join(hive_id);
     if hive_exists(&state.state_dir, hive_id) {
-        if hive_status(&root, hive_id).as_deref() == Some("pending") {
+        if hive_status_is_resumable(hive_status(&root, hive_id).as_deref()) {
             tracing::warn!(
                 hive_id = hive_id,
                 "ingress hive is pending; resuming add_hive to complete finalize (idempotent)"
@@ -20245,6 +20435,22 @@ fn hive_status(root: &Path, hive_id: &str) -> Option<String> {
             .and_then(|s| s.as_str())
             .map(|s| s.to_string())
     })
+}
+
+/// Hive states from which a re-run of `add_hive` may resume instead of dead-ending at
+/// `HIVE_EXISTS`.
+///
+/// - `pending`: the worker bootstrapped but finalize did not complete (F9).
+/// - `joining`: the accept path wrote this immediately before dispatching the background join,
+///   so the flow itself always finds it. In-flight protection lives in the ACCEPT (it answers
+///   `JOIN_IN_PROGRESS`), not here — by the time a flow runs, the join is ours.
+/// - `interrupted`: the orchestrator restarted mid-join; the boot sweep marked it.
+/// - `failed`: a terminal failure the operator is retrying.
+fn hive_status_is_resumable(status: Option<&str>) -> bool {
+    matches!(
+        status,
+        Some("pending") | Some("joining") | Some("interrupted") | Some("failed")
+    )
 }
 
 fn valid_hive_id(value: &str) -> bool {
@@ -22262,6 +22468,68 @@ fn is_ingress_role(role: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PB-7: which recorded states a re-POST of `add_hive` may resume from.
+    ///
+    /// `joining` MUST be resumable: the accept path writes it immediately before dispatching,
+    /// so the flow itself always finds it. If this rejected `joining`, every backgrounded join
+    /// would dead-end at HIVE_EXISTS the moment it started. In-flight protection lives in the
+    /// accept (JOIN_IN_PROGRESS), not here.
+    #[test]
+    fn resumable_hive_states_include_the_ones_a_background_join_leaves_behind() {
+        for state in ["pending", "joining", "interrupted", "failed"] {
+            assert!(
+                hive_status_is_resumable(Some(state)),
+                "{state} must be resumable"
+            );
+        }
+        // A finished hive is not a resume target — that is a genuine HIVE_EXISTS.
+        assert!(!hive_status_is_resumable(Some("connected")));
+        // An unreadable/absent info.yaml is not a resume signal either.
+        assert!(!hive_status_is_resumable(None));
+        assert!(!hive_status_is_resumable(Some("")));
+    }
+
+    /// The join record must survive a read-modify-write cycle, because the background join
+    /// rewrites it several times to publish its phase.
+    #[test]
+    fn join_state_round_trips_and_write_hive_info_is_atomic() {
+        let root = std::env::temp_dir().join(format!("fluxbee-join-{}", Uuid::new_v4()));
+        let hive_id = "spoke1".to_string();
+        fs::create_dir_all(root.join(&hive_id)).expect("hive dir");
+
+        update_join_state_in(&root, &hive_id, "joining", "accepted", |info| {
+            info["hive_id"] = serde_json::json!(hive_id);
+            info["join"]["join_id"] = serde_json::json!("j-1");
+        });
+        assert_eq!(hive_status(&root, &hive_id).as_deref(), Some("joining"));
+
+        // A later phase write must preserve what the accept recorded.
+        update_join_state_in(&root, &hive_id, "joining", "running", |_| {});
+        let info = read_hive_info(&root, &hive_id).expect("info");
+        assert_eq!(info["join"]["join_id"], "j-1");
+        assert_eq!(info["join"]["phase"], "running");
+        assert_eq!(info["hive_id"], serde_json::json!(hive_id));
+
+        // The sweep must move an orphaned join off `joining` — otherwise a crash leaves the
+        // hive unretryable forever.
+        sweep_interrupted_joins_in(&root);
+        let info = read_hive_info(&root, &hive_id).expect("info");
+        assert_eq!(info["status"], "interrupted");
+        assert_eq!(info["join"]["error_code"], "JOIN_INTERRUPTED");
+        assert!(hive_status_is_resumable(Some("interrupted")));
+
+        // ...and it must leave a finished hive alone.
+        update_join_state_in(&root, &hive_id, "connected", "done", |_| {});
+        sweep_interrupted_joins_in(&root);
+        assert_eq!(
+            hive_status(&root, &hive_id).as_deref(),
+            Some("connected"),
+            "the sweep must only touch hives stuck at `joining`"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn default_gateway_is_the_token_after_via() {
