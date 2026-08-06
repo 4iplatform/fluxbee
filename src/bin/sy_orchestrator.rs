@@ -1765,7 +1765,7 @@ async fn reconcile_persisted_custom_nodes(
         } else {
             node.runtime_version.as_str()
         };
-        let version = match resolve_runtime_version(&manifest, &runtime_key, requested_version) {
+        let version = match resolve_runtime_version(&manifest, &runtime_key, &requested_version) {
             Ok(value) => value,
             Err(err) => {
                 failed = failed.saturating_add(1);
@@ -15131,7 +15131,7 @@ async fn run_node_flow(
         }
     };
 
-    let version = match resolve_runtime_version(&manifest, &runtime_key, requested_version) {
+    let version = match resolve_runtime_version(&manifest, &runtime_key, &requested_version) {
         Ok(version) => version,
         Err(err) => {
             return serde_json::json!({
@@ -15413,6 +15413,10 @@ struct ManagedNodeLaunchPlan {
     unit: String,
     runtime_key: String,
     resolved_version: String,
+    /// What the node ASKED for ("current" or an explicit pin) — not the version it last ran.
+    /// Reported back to the operator so the answer distinguishes "you follow current, which is
+    /// now X" from "you are pinned to X".
+    requested_version: String,
     entrypoint: RuntimeSpawnEntrypoint,
 }
 
@@ -15519,8 +15523,21 @@ fn managed_node_launch_plan(
             }));
         }
     };
+    // Resolve the INTENT, not the stored answer — the same rule the boot pass applies (U-10).
+    // A node whose `_system.requested_runtime_version` is "current" is declaring "whatever the
+    // manifest says now"; re-resolving its last CONCRETE answer pins it to a version the operator
+    // already moved past. That silently broke the whole "growth = publish + update, no new .deb"
+    // model for a node that is already running: publishing a new runtime and restarting the node
+    // relaunched it on the old version, and the response even reported the stale value back as
+    // `requested_version`. A node pinned to an explicit version still resolves to that version,
+    // and still fails loudly if it is gone — which is correct for a deliberate pin.
+    let requested_version: String = if node.follows_current() {
+        "current".to_string()
+    } else {
+        node.runtime_version.clone()
+    };
     let resolved_version =
-        match resolve_runtime_version(&manifest, &runtime_key, &node.runtime_version) {
+        match resolve_runtime_version(&manifest, &runtime_key, &requested_version) {
             Ok(value) => value,
             Err(err) => {
                 return Err(serde_json::json!({
@@ -15585,6 +15602,7 @@ fn managed_node_launch_plan(
         node,
         runtime_key,
         resolved_version,
+        requested_version,
         entrypoint,
     })
 }
@@ -15717,7 +15735,7 @@ async fn start_or_restart_node_flow(
             "node_name": plan.node.node_name,
             "runtime": plan.runtime_key,
             "version": plan.resolved_version,
-            "requested_version": plan.node.runtime_version,
+            "requested_version": plan.requested_version.clone(),
             "unit": plan.unit,
             "visible_in_router": visible_in_router,
         });
@@ -15742,7 +15760,7 @@ async fn start_or_restart_node_flow(
             "node_name": plan.node.node_name,
             "runtime": plan.runtime_key,
             "version": plan.resolved_version,
-            "requested_version": plan.node.runtime_version,
+            "requested_version": plan.requested_version.clone(),
             "unit": plan.unit,
             "visible_in_router": visible_in_router,
         }),
@@ -15754,7 +15772,7 @@ async fn start_or_restart_node_flow(
             "node_name": plan.node.node_name,
             "runtime": plan.runtime_key,
             "version": plan.resolved_version,
-            "requested_version": plan.node.runtime_version,
+            "requested_version": plan.requested_version.clone(),
             "unit": plan.unit,
         }),
     }
@@ -25702,6 +25720,43 @@ blob:
         );
     }
 
+    /// Arrancar/reiniciar un nodo tiene que resolver la INTENCION, no la respuesta guardada.
+    ///
+    /// Es la misma regla que U-10 puso en el arranque del orquestador, y que este camino no
+    /// tenia: un nodo con `_system.requested_runtime_version = "current"` volvia a lanzarse sobre
+    /// su ultima version CONCRETA. Efecto real: publicar un runtime nuevo y reiniciar el nodo no
+    /// lo tomaba nunca — o sea que el modelo "crecer = publish + update, sin .deb nuevo" no
+    /// funcionaba para un nodo ya corriendo, y la respuesta encima devolvia la version vieja como
+    /// `requested_version`.
+    ///
+    /// Se fija leyendo la fuente porque la propiedad es de ORDEN: el calculo de la intencion tiene
+    /// que estar ANTES de la resolucion, y la resolucion tiene que usarlo a el.
+    #[test]
+    fn arrancar_un_nodo_resuelve_la_intencion_no_la_version_guardada() {
+        let src = include_str!("sy_orchestrator.rs");
+        let start = src
+            .find("fn managed_node_launch_plan(")
+            .expect("managed_node_launch_plan");
+        let body = &src[start..];
+        let end = body.find("\n}").expect("su cierre");
+        let body = &body[..end];
+
+        let intent = body
+            .find("node.follows_current()")
+            .expect("tiene que consultar la INTENCION del nodo");
+        let resolve = body
+            .find("resolve_runtime_version(&manifest, &runtime_key, &requested_version)")
+            .expect("la resolucion tiene que usar la intencion, no node.runtime_version");
+        assert!(
+            intent < resolve,
+            "la intencion se calcula antes de resolver, no despues"
+        );
+        assert!(
+            !body.contains("resolve_runtime_version(&manifest, &runtime_key, &node.runtime_version)"),
+            "resolver la version CONCRETA guardada re-pinnea un nodo que sigue a current"
+        );
+    }
+
     /// U-7, and the residual that outlived its fix.
     ///
     /// Motherbee does not sync to itself, so it never declares `fluxbee-dist-core-motherbee`.
@@ -26170,6 +26225,7 @@ blob:
                 config_path: PathBuf::from("/tmp/config.json"),
                 relaunch_on_boot: true,
             },
+            requested_version: "current".to_string(),
             unit: unit_from_node_name("WF.invoice@motherbee"),
             runtime_key: "wf.invoice".to_string(),
             resolved_version: "4".to_string(),
