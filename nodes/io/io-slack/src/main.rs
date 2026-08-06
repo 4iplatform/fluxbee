@@ -2118,6 +2118,7 @@ async fn collect_slack_blob_attachments(
 mod tests {
     use super::{
         build_system_reply, default_slack_allowed_mimes, extract_slack_tokens_from_vault_value,
+        is_control_plane_msg_type,
         extract_runtime_relay_config, parse_retry_after, slack_relay_policy_from_config,
         slack_vault_key, vault_change_is_slack, SlackClients, SlackRelayConfig, SlackRuntimeState,
     };
@@ -2394,6 +2395,54 @@ mod tests {
             Some("C123")
         );
     }
+
+    /// El trafico de control del mesh nunca puede llegar al codigo que postea en Slack.
+    ///
+    /// Se fija leyendo la fuente porque la propiedad es de ORDEN: el guard tiene que estar entre
+    /// los handlers de control por nombre y el lookup de binding que abre el camino de salida. Un
+    /// test sobre `is_control_plane_msg_type` solo pasa igual de contento con el guard borrado —
+    /// que es como un rebote UNREACHABLE termino posteando "Error (invalid_text_payload)" en el
+    /// canal de un cliente.
+    ///
+    /// Los literales van partidos con `concat!`: si estuvieran enteros, este test se encontraria
+    /// A SI MISMO (el modulo de tests va antes en el archivo) y mediria su propio texto.
+    #[test]
+    fn el_trafico_de_control_nunca_llega_al_camino_de_salida_de_slack() {
+        let src = include_str!("main.rs");
+        let guard_if = concat!("if is_control_plane_msg_type(&msg.meta.", "msg_type) {");
+        let outbound = concat!("let binding = match extract_runtime_slack", "_binding(");
+        let unreachable_warn = concat!("inbound Slack message came back ", "UNREACHABLE");
+
+        let warn_at = src
+            .find(unreachable_warn)
+            .expect("el guard tiene que seguir avisando del rebote UNREACHABLE");
+
+        // El camino de SALIDA es el lookup de binding POSTERIOR al guard (hay otro antes, en el
+        // camino de entrada).
+        let outbound_at = warn_at
+            + src[warn_at..]
+                .find(outbound)
+                .expect("despues del guard tiene que venir el camino de salida");
+
+        // El corte por msg_type tiene que estar antes del warn, y su `continue` antes de la salida.
+        let guard_at = src[..warn_at]
+            .rfind(guard_if)
+            .expect("el corte por msg_type tiene que preceder al warn");
+        assert!(
+            guard_at < warn_at && warn_at < outbound_at,
+            "orden roto: guard={guard_at} warn={warn_at} salida={outbound_at}"
+        );
+        assert!(
+            src[guard_at..outbound_at].contains("continue;"),
+            "el guard tiene que CORTAR (continue) antes de llegar a postear en Slack"
+        );
+
+        assert!(is_control_plane_msg_type("system"));
+        assert!(is_control_plane_msg_type("SYSTEM"));
+        assert!(is_control_plane_msg_type("admin"));
+        assert!(!is_control_plane_msg_type("data"));
+    }
+
 }
 
 fn attach_slack_raw_stub(
@@ -2541,6 +2590,39 @@ async fn run_outbound_loop(
                     "VAULT_SECRET_CHANGED (slack); waking credential refresh"
                 );
                 vault_change_notify.notify_one();
+            }
+            continue;
+        }
+
+        // Everything below this line POSTS TO A CUSTOMER'S SLACK CHANNEL. Mesh control traffic is
+        // not user content and must never get there.
+        //
+        // Without this guard, any system message the loop does not handle by name fell straight
+        // into the text/v1 resolver, failed to parse (it has no `type` field), and the failure
+        // path posted io-slack's own internal error INTO the channel. Observed live: an operator
+        // mentioned the bot, the router bounced the message back UNREACHABLE because no handler
+        // was configured, and two seconds later the bot answered the operator with
+        // "Error (invalid_text_payload) al procesar contenido/adjuntos." Every routing failure
+        // became noise in the customer's Slack.
+        if is_control_plane_msg_type(&msg.meta.msg_type) {
+            // UNREACHABLE is worth its own line: it means inbound Slack traffic is being accepted
+            // and then dropped by the mesh, which looks like "the bot ignores me" from Slack and
+            // like nothing at all from here.
+            if meta_msg.eq_ignore_ascii_case("UNREACHABLE") {
+                tracing::warn!(
+                    trace_id = %msg.routing.trace_id,
+                    node_name = %config.node_name,
+                    "inbound Slack message came back UNREACHABLE: nothing in the mesh is handling \
+                     it. Set config.io.dst_node (or route the binding ICH) so relayed messages \
+                     have a destination."
+                );
+            } else {
+                tracing::debug!(
+                    trace_id = %msg.routing.trace_id,
+                    msg_type = %msg.meta.msg_type,
+                    msg = %meta_msg,
+                    "ignoring mesh control message on the outbound path (never posted to Slack)"
+                );
             }
             continue;
         }
