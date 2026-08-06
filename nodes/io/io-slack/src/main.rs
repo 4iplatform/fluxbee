@@ -788,6 +788,38 @@ async fn resolve_slack_credentials_from_vault(
     }
 }
 
+/// Why an inbound Slack event is not relayed to the mesh, or `Ok(())` to relay it.
+///
+/// Pure on purpose: the anti-echo guards are the part that cannot be wrong, and inline in the
+/// socket loop they were untestable. `me` is our own bot user id, `None` when unknown.
+fn classify_slack_inbound(
+    event: &Value,
+    event_type: &str,
+    me: Option<&str>,
+) -> Result<(), &'static str> {
+    match event_type {
+        "app_mention" => Ok(()),
+        "message" => {
+            if event.get("subtype").and_then(|v| v.as_str()).is_some() {
+                // bot_message, channel_join, message_changed, message_deleted, thread_broadcast...
+                return Err("not a plain user message (has a subtype)");
+            }
+            if event.get("bot_id").is_some() {
+                return Err("posted by a bot");
+            }
+            let author = event.get("user").and_then(|v| v.as_str()).unwrap_or("");
+            match me {
+                Some(me) if author == me => Err("our own post"),
+                Some(_) => Ok(()),
+                // FAIL CLOSED. Relaying while we cannot tell our own messages apart is exactly the
+                // echo loop these guards exist to prevent.
+                None => Err("cannot resolve our own bot user id, so a self-post cannot be ruled out"),
+            }
+        }
+        _ => Err("not a message or a mention"),
+    }
+}
+
 /// True when a `VAULT_SECRET_CHANGED` broadcast payload concerns the slack resource — the fast-path
 /// signal to reload credentials (Fluxbee Cloud -> vault -> broadcast). Matched by `resource_type`
 /// because the vault key is opaque and may differ across hives (broadcast contract).
@@ -898,6 +930,14 @@ struct SlackRuntimeState {
     slack_app_token: Option<String>,
     slack_bot_token: Option<String>,
     config_generation: u64,
+    /// Our OWN bot user id, resolved from `auth.test` when credentials load.
+    ///
+    /// Needed only since the node stopped being mention-only: once plain channel messages are
+    /// processed, the bot's own posts come back as inbound events, and relaying them would feed
+    /// whatever answers back into the channel — an echo loop in a customer's Slack. `bot_id` and
+    /// `subtype` already catch that, but this is the one check that cannot be defeated by an
+    /// unusual posting path, so it is worth the single API call.
+    bot_user_id: Option<String>,
 }
 
 // Manual Debug that never prints the live tokens (mirrors io-api PublicationRuntime): a leaked
@@ -928,6 +968,7 @@ impl SlackClients {
                 slack_app_token: None,
                 slack_bot_token: None,
                 config_generation: 0,
+                bot_user_id: None,
             })),
         })
     }
@@ -947,7 +988,48 @@ impl SlackClients {
         guard.slack_bot_token = Some(slack_bot_token);
         if changed {
             guard.config_generation = guard.config_generation.wrapping_add(1);
+            // Identity belongs to the token: a new bot token can be a different bot.
+            guard.bot_user_id = None;
         }
+    }
+
+    /// Who are we, per Slack. Cached; resolved once per credential generation.
+    ///
+    /// Returns `None` when `auth.test` cannot answer. Callers must treat that as "unknown", never
+    /// as "not us" — the self-filter has to fail CLOSED or the echo loop it prevents comes back.
+    async fn bot_user_id(&self) -> Option<String> {
+        if let Some(known) = self.runtime.read().await.bot_user_id.clone() {
+            return Some(known);
+        }
+        let slack_bot_token = self.slack_bot_token().await.ok()?;
+        #[derive(Deserialize)]
+        struct AuthTestResp {
+            ok: bool,
+            user_id: Option<String>,
+            error: Option<String>,
+        }
+        let resp: AuthTestResp = self
+            .slack_send_with_retry("auth.test", || {
+                self.http
+                    .post("https://slack.com/api/auth.test")
+                    .bearer_auth(&slack_bot_token)
+            })
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        if !resp.ok {
+            tracing::warn!(
+                error = %resp.error.unwrap_or_else(|| "unknown".to_string()),
+                "auth.test failed; cannot resolve our own bot user id"
+            );
+            return None;
+        }
+        let user_id = resp.user_id?;
+        self.runtime.write().await.bot_user_id = Some(user_id.clone());
+        tracing::info!(bot_user_id = %user_id, "resolved our own Slack bot user id");
+        Some(user_id)
     }
 
     /// Drop the live credentials (vault secret deleted / no longer resolvable). Bumps the generation
@@ -1469,7 +1551,24 @@ async fn run_inbound_socket_mode(
                 .unwrap_or("unknown")
                 .to_string();
             let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if event_type != "app_mention" {
+            // `app_mention` plus ordinary messages in the BOUND channel. The binding was already
+            // checked above, so a `message` here is by definition in the configured conversation.
+            //
+            // Anything the node echoes back is posted BY the node, and Slack delivers that post
+            // straight back as a `message` event. Relaying it would hand the mesh its own output
+            // and whatever it answers gets posted again — an echo loop inside a customer's Slack.
+            // Three independent guards, because one bad frame is a live incident:
+            //   * `subtype` present  -> not a plain human message (bot_message, joins, edits,
+            //                           deletions, thread broadcasts...).
+            //   * `bot_id` present   -> posted by some bot, ours included.
+            //   * author == us       -> the airtight one; see `bot_user_id`.
+            // The third FAILS CLOSED: if we cannot establish who we are, we do not relay.
+            let me = if event_type == "message" {
+                slack.bot_user_id().await
+            } else {
+                None
+            };
+            if let Err(reason) = classify_slack_inbound(&event, event_type, me.as_deref()) {
                 // Say so. A bare `continue` here is invisible at EVERY level, which makes the two
                 // explanations for "nothing happens" indistinguishable from the outside: Slack
                 // delivering no events at all (app not subscribed) versus us dropping what it
@@ -1477,7 +1576,8 @@ async fn run_inbound_socket_mode(
                 tracing::debug!(
                     node_name = %config.node_name,
                     event_type = %event_type,
-                    "ignoring inbound Slack event: only app_mention is processed"
+                    reason = %reason,
+                    "ignoring inbound Slack event"
                 );
                 continue;
             }
@@ -1500,7 +1600,8 @@ async fn run_inbound_socket_mode(
                 message_id = %message_id,
                 content_len = content.len(),
                 content_preview = %truncate(&content, 120),
-                "inbound app_mention"
+                event_type = %event_type,
+                "inbound Slack message"
             );
 
             let io_ctx = slack_inbound_io_context(
@@ -2112,13 +2213,14 @@ async fn collect_slack_blob_attachments(
     }
 
     out
+
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_system_reply, default_slack_allowed_mimes, extract_slack_tokens_from_vault_value,
-        is_control_plane_msg_type,
+        build_system_reply, classify_slack_inbound, default_slack_allowed_mimes,
+        extract_slack_tokens_from_vault_value, is_control_plane_msg_type,
         extract_runtime_relay_config, parse_retry_after, slack_relay_policy_from_config,
         slack_vault_key, vault_change_is_slack, SlackClients, SlackRelayConfig, SlackRuntimeState,
     };
@@ -2228,6 +2330,7 @@ mod tests {
             slack_app_token: Some("xapp-super-secret".to_string()),
             slack_bot_token: Some("xoxb-super-secret".to_string()),
             config_generation: 3,
+            bot_user_id: Some("U0BOT".to_string()),
         };
         let rendered = format!("{state:?}");
         assert!(!rendered.contains("xapp-super-secret"), "{rendered}");
@@ -2236,6 +2339,7 @@ mod tests {
         assert!(rendered.contains("config_generation: 3"), "{rendered}");
         // absence renders as None, not <redacted>
         let empty = SlackRuntimeState {
+            bot_user_id: None,
             slack_app_token: None,
             slack_bot_token: None,
             config_generation: 0,
@@ -2441,6 +2545,41 @@ mod tests {
         assert!(is_control_plane_msg_type("SYSTEM"));
         assert!(is_control_plane_msg_type("admin"));
         assert!(!is_control_plane_msg_type("data"));
+    }
+
+
+    /// Las guardas anti-eco. Es la parte que no puede estar mal: si el nodo relaya sus propios
+    /// posts, lo que el mesh conteste se vuelve a postear, y eso es un bucle dentro del Slack de
+    /// un cliente.
+    #[test]
+    fn no_relayamos_nunca_nuestros_propios_mensajes() {
+        let me = "U0BOT";
+
+        let humano = serde_json::json!({"type":"message","user":"U0HUMANO","text":"hola"});
+        assert!(classify_slack_inbound(&humano, "message", Some(me)).is_ok());
+
+        let propio = serde_json::json!({"type":"message","user":me,"text":"respuesta del bot"});
+        assert!(classify_slack_inbound(&propio, "message", Some(me)).is_err());
+
+        let con_bot_id =
+            serde_json::json!({"type":"message","user":"U0OTRO","bot_id":"B123","text":"x"});
+        assert!(classify_slack_inbound(&con_bot_id, "message", Some(me)).is_err());
+
+        let con_subtype = serde_json::json!({"type":"message","subtype":"bot_message","text":"x"});
+        assert!(classify_slack_inbound(&con_subtype, "message", Some(me)).is_err());
+
+        // FALLA CERRADO: sin saber quienes somos, no se relaya nada.
+        assert!(
+            classify_slack_inbound(&humano, "message", None).is_err(),
+            "sin bot_user_id no se puede descartar un self-post: no se relaya"
+        );
+
+        let mencion =
+            serde_json::json!({"type":"app_mention","user":"U0HUMANO","text":"<@U0BOT> hola"});
+        assert!(classify_slack_inbound(&mencion, "app_mention", None).is_ok());
+
+        let otro = serde_json::json!({"type":"reaction_added"});
+        assert!(classify_slack_inbound(&otro, "reaction_added", Some(me)).is_err());
     }
 
 }
