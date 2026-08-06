@@ -29,6 +29,7 @@ use crate::opa::OpaResolver;
 /// delivery time.
 pub const PROTECTED_SYSTEM_ACTIONS: &[&str] = &[
     "SYSTEM_UPDATE",
+    "SYSTEM_CORE_ROLLBACK",
     "SYSTEM_SYNC_HINT",
     "EDGE_OPEN_URL",
     "EDGE_CLOSE_URL",
@@ -523,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_set_is_the_25_actions() {
+    fn protected_set_is_the_26_actions() {
         for action in [
             "SYSTEM_UPDATE",
             "SYSTEM_SYNC_HINT",
@@ -550,13 +551,15 @@ mod tests {
             "INVENTORY_REQUEST",
             "ADD_HIVE_FINALIZE",
             "REMOVE_HIVE_CLEANUP",
+            // Swaps /usr/bin binaries and restarts the core on the TARGET hive.
+            "SYSTEM_CORE_ROLLBACK",
         ] {
             assert!(
                 is_protected_system_action(action),
                 "{action} must be protected"
             );
         }
-        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 25);
+        assert_eq!(PROTECTED_SYSTEM_ACTIONS.len(), 26);
         for action in ["RUNTIME_UPDATE", "HELLO", "LSA", "", "TOTALLY_UNKNOWN"] {
             assert!(!is_protected_system_action(action));
         }

@@ -138,7 +138,7 @@ pub fn classify_system_message(msg: &str) -> Option<ActionClass> {
         | "NODE_STATUS_GET" | "GET_VERSIONS" | "GET_RUNTIMES" | "LIST_NODES" | "GET_RUNTIME"
         | "INVENTORY_REQUEST" | "ILK_LIST" | "ILK_GET" => Some(ActionClass::Read),
         MSG_CONFIG_SET | "NODE_CONFIG_SET" => Some(ActionClass::Write),
-        "RUNTIME_UPDATE" | "SYSTEM_UPDATE" | "SYSTEM_SYNC_HINT" | "OPA_APPLY"
+        "RUNTIME_UPDATE" | "SYSTEM_UPDATE" | "SYSTEM_CORE_ROLLBACK" | "SYSTEM_SYNC_HINT" | "OPA_APPLY"
         | "OPA_COMPILE_APPLY" | "OPA_ROLLBACK" => Some(ActionClass::SystemConfig),
         "ADD_HIVE_FINALIZE" | "REMOVE_HIVE_CLEANUP" => Some(ActionClass::TopologyChange),
         "SPAWN_NODE" | "KILL_NODE" | "REMOVE_NODE_INSTANCE" => Some(ActionClass::NodeLifecycle),

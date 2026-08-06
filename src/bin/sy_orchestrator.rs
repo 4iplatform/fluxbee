@@ -2476,19 +2476,35 @@ async fn handle_admin(
         "core_rollback" => {
             let target = target_hive_from_payload(&msg.payload, &state.hive_id);
             if target != state.hive_id {
-                // Cross-hive rollback needs a SYSTEM_CORE_ROLLBACK forward (and, for the case
-                // that actually matters — a spoke whose own orchestrator is the broken binary —
-                // an SSH transport, since the mesh path cannot reach a dead orchestrator).
-                // Deliberately not built yet: it is a separate decision.
-                serde_json::json!({
-                    "status": "error",
-                    "error_code": "NOT_IMPLEMENTED",
-                    "message": format!(
-                        "core_rollback is local-only for now; run it against '{target}' itself. \
-                         A spoke whose orchestrator is the broken binary cannot be rescued in-band \
-                         at all — use the VM snapshot or an apt downgrade."
-                    ),
-                })
+                // Forwarded over the mesh, exactly like SYSTEM_UPDATE. Without this the action
+                // was unreachable in practice: motherbee owns the admin API but never has a
+                // stamped generation (dpkg manages its core, not the mesh update path), while
+                // the spokes that DO have generations expose no admin API of their own.
+                //
+                // STRUCTURAL LIMIT that this does not fix: a spoke whose ORCHESTRATOR is the
+                // broken binary cannot answer the forward at all. For that case the external
+                // path — VM snapshot, or an apt downgrade — is the correct answer.
+                match forward_system_action_to_hive_with_timeout(
+                    state,
+                    &target,
+                    "SYSTEM_CORE_ROLLBACK",
+                    "SYSTEM_CORE_ROLLBACK_RESPONSE",
+                    msg.payload.clone(),
+                    core_rollback_forward_timeout(),
+                )
+                .await
+                {
+                    Ok(payload) => payload,
+                    Err(err) => serde_json::json!({
+                        "status": "error",
+                        "error_code": "FORWARD_FAILED",
+                        "message": format!(
+                            "core_rollback could not reach '{target}': {err}. If its orchestrator \
+                             is the broken binary it cannot be rescued in-band — use the VM \
+                             snapshot or an apt downgrade."
+                        ),
+                    }),
+                }
             } else {
                 core_rollback_local(state, &msg.payload).await
             }
@@ -2603,6 +2619,16 @@ async fn handle_system_message(
             let result = handle_system_update_message(state, msg).await;
             let _ =
                 send_system_action_response(sender, msg, "SYSTEM_UPDATE_RESPONSE", result).await;
+        }
+        Some("SYSTEM_CORE_ROLLBACK") => {
+            let result = core_rollback_local(state, &msg.payload).await;
+            let _ = send_system_action_response(
+                sender,
+                msg,
+                "SYSTEM_CORE_ROLLBACK_RESPONSE",
+                result,
+            )
+            .await;
         }
         Some("SYSTEM_SYNC_HINT") => {
             let result = handle_system_sync_hint_message(state, msg).await;
@@ -13314,6 +13340,19 @@ async fn forward_system_action_to_hive(
         system_forward_timeout(),
     )
     .await
+}
+
+/// Window for a forwarded `core_rollback`. It restores binaries and then restarts up to eight
+/// services behind a 30 s health gate each, so the default `system_forward_timeout` cannot cover
+/// it — and a too-short window would surface an outer TIMEOUT instead of the inner layer's real
+/// error (the U-8b shape).
+fn core_rollback_forward_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("JSR_ORCH_CORE_ROLLBACK_FORWARD_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(240),
+    )
 }
 
 async fn forward_system_action_to_hive_with_timeout(
