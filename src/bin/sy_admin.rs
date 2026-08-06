@@ -7544,7 +7544,10 @@ fn error_code_to_http_status(error_code: &str) -> u16 {
         | "RUNTIME_NOT_AVAILABLE"
         | "RUNTIME_NOT_FOUND"
         | "RUNTIME_VERSION_NOT_FOUND" => 404,
-        "HIVE_EXISTS"
+        // The work probably succeeded but the reply was lost — a conflict-with-current-state
+        // answer, retryable once the operator has verified.
+        "FORWARD_UNKNOWN"
+        | "HIVE_EXISTS"
         // A join for this hive is already running in the background (PB-7): a conflict with
         // current state, and retryable once it finishes.
         | "JOIN_IN_PROGRESS"

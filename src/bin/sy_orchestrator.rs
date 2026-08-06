@@ -2495,13 +2495,24 @@ async fn handle_admin(
                 .await
                 {
                     Ok(payload) => payload,
+                    // A TIMEOUT here usually does NOT mean the rollback failed. When the
+                    // restored set includes `sy-orchestrator` — the common case, since a core
+                    // rollback restores the whole component set — the target restarts the very
+                    // process that owes the answer, so the reply is lost BY CONSTRUCTION. Saying
+                    // "its orchestrator is the broken binary" would send the operator hunting a
+                    // failure that did not happen. Point at the two places that hold the truth.
                     Err(err) => serde_json::json!({
                         "status": "error",
-                        "error_code": "FORWARD_FAILED",
+                        "error_code": "FORWARD_UNKNOWN",
+                        "retryable": true,
                         "message": format!(
-                            "core_rollback could not reach '{target}': {err}. If its orchestrator \
-                             is the broken binary it cannot be rescued in-band — use the VM \
-                             snapshot or an apt downgrade."
+                            "core_rollback: no reply from '{target}' ({err}). This is EXPECTED \
+                             when the restore includes sy-orchestrator: the target restarts the \
+                             process that owed the answer. The rollback has very likely applied — \
+                             verify with `GET /hives/{target}/versions` (core.installed.source \
+                             should read core_rollback) before retrying. If the hive is genuinely \
+                             unreachable, its orchestrator cannot be rescued in-band at all: use \
+                             the VM snapshot or an apt downgrade."
                         ),
                     }),
                 }
