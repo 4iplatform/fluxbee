@@ -311,12 +311,17 @@ impl IdentityProvisioner for FluxbeeIdentityProvisioner {
     ) -> Result<Option<String>, IdentityError> {
         match self.call_provision_target(&self.config.target, input).await {
             Ok(src_ilk) => Ok(Some(src_ilk)),
-            Err(IdentityError::Unavailable) | Err(IdentityError::Other(_)) => {
+            // The error itself used to be dropped here, so the only trace of a failed
+            // provisioning was the word "unavailable" — which covers a disconnected router, a
+            // missing node, an authorization refusal and a malformed response alike. Every
+            // external user then entered the mesh with a null src_ilk and nothing said why.
+            Err(error @ (IdentityError::Unavailable | IdentityError::Other(_))) => {
                 tracing::warn!(
                     target = %self.config.target,
                     channel = %input.channel,
                     external_id = %input.external_id,
-                    "identity provision unavailable; falling back to null src_ilk"
+                    error = %error,
+                    "identity provision failed; falling back to null src_ilk"
                 );
                 Ok(None)
             }
