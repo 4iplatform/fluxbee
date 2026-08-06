@@ -236,6 +236,48 @@ considerarla operativa. Confirmá con: cloud-init `done`, agente `active`, `dpkg
 
 Esto importa **directamente** para `add_hive`, que tiene un timeout de 180 s.
 
+### 3.5 Operar por guest-agent — lo que hay que saber antes, no después
+
+Si trabajás contra las VMs por la API de Proxmox (`agent/exec`), esto te va a pasar:
+
+**El agente se muere bajo carga de I/O.** Un upgrade del `.deb`, un arranque en frío, una
+compilación: el `qemu-guest-agent` deja de responder y la API contesta
+`QEMU guest agent is not running` con la VM **perfectamente viva**. No es la VM: es el agente.
+
+```bash
+# 1. antes de asustarte, confirmá que la VM esta viva DESDE OTRA VM tuya
+#    (misma red interna; no hace falta el agente)
+ping -c2 10.10.10.10
+for p in 9000 9100; do timeout 3 bash -c "echo > /dev/tcp/10.10.10.10/$p" && echo "$p ok"; done
+
+# 2. recuperar el agente: reboot ACPI primero
+POST /nodes/pve/qemu/<id>/status/reboot
+# vuelve en ~70s... y si la VM sigue con carga se puede volver a morir.
+# 3. si se muere de nuevo: reset duro. Ahi aguanta.
+POST /nodes/pve/qemu/<id>/status/reset
+```
+
+> Un reboot/reset de motherbee **no es gratis pero tampoco es grave**: los 4 hives vuelven solos.
+> Es, de hecho, la prueba más dura del arranque en frío. Pero decidilo a propósito, no por pánico.
+
+**Todo lo que dure más de unos segundos va con `setsid nohup` a un log.** Si el agente se muere a
+mitad, el comando sobrevive y leés el log después. Sin esto, perdés el trabajo Y no sabés si corrió:
+
+```bash
+setsid nohup /root/loquesea.sh > /root/loquesea.log 2>&1 < /dev/null &
+```
+
+Corolario que aprendí a la mala: si el agente muere durante la llamada que **crea** el script, el
+script nunca existió. Antes de asumir que corrió y quedó a mitad, mirá si el log está.
+
+**Secretos por stdin, nunca por argv.** `agent/exec` acepta `input-data` (base64). Todo lo que pase
+por `command=` queda en el **log de tasks de Proxmox**:
+
+```bash
+# lab/qga_stdin.sh — pasa el payload por stdin, no por la linea de comandos
+POST agent/exec  command=/bin/bash  command=-lc  command="<script que lee stdin>"  input-data=<b64>
+```
+
 ### ⚠️ Después de generalizar, el primer `apt` necesita `update` COMPLETO
 
 La generalización borra `/var/lib/apt/lists/*`. Si hacés un `apt update` filtrado a un solo repo (por
@@ -307,6 +349,42 @@ scripts/apt-repo-publish.sh --serve     # sirve en :8900 (unit fluxbee-apt)
 
 **Instalá siempre por `apt`, nunca con `dpkg -i`** — el paquete depende de `postgresql` y `apt` es el
 camino documentado que resuelve dependencias.
+
+#### ⚠️ Usá el script. No rehagas el índice a mano.
+
+El script hace **tres** cosas en una línea, y las tres importan:
+
+```bash
+dpkg-scanpackages -m . > Packages  &&  gzip -kf Packages  &&  apt-ftparchive release . > Release
+```
+
+Copiar un `.deb` nuevo a la carpeta **no alcanza**. Si lo hacés a mano, hay dos maneras de que
+salga mal y ninguna avisa:
+
+| omisión | síntoma | por qué engaña |
+|---|---|---|
+| no regenerar `Release` | `apt` dice **`fluxbee is already the newest version`** con el paquete nuevo ahí | `apt` ve `Hit:` en `Release` y ni mira `Packages` |
+| `dpkg-scanpackages` **sin `-m`** | el índice queda con **una sola** versión | sin `-m` publica sólo la más nueva por paquete, y te quedás **sin rollback por apt** |
+
+La segunda es la peligrosa: no rompe nada hoy, te saca el camino de vuelta. Se nota comparando el
+tamaño de `Packages` — 13 versiones son ~13 KB, una sola son ~1 KB.
+
+> Esto está escrito porque lo pisé: hice el índice a mano, me comí las dos, y perdí dos ciclos.
+> El script existía desde el principio.
+
+#### ⚠️ `dpkg-deb` parece colgado y no lo está
+
+El último paso comprime con `xz`. Durante **varios minutos** el `.deb` se queda en ~3 KB, y si lo
+mirás en ese momento `dpkg-deb -c` te dice `unexpected end of file in archive member header`.
+
+No está truncado: está comprimiendo. Confirmalo antes de alarmarte:
+
+```bash
+ps aux | grep dpkg-deb        # 300-400% de CPU = está trabajando
+```
+
+El paquete terminado pesa **~240 MB**. La línea `=== BUILD END rc=0 ===` es la única señal de que
+terminó; el tamaño del archivo a mitad de camino no dice nada.
 
 ---
 
@@ -564,6 +642,15 @@ solo**, sin intervención. Dos advertencias:
 | 13 | Cadena TLS incompleta | Anda en el navegador, falla en los webhooks | Servir leaf + intermedios; probar sin AIA |
 | 14 | Cert rotado en el vault | El edge sigue sirviendo el viejo | Reiniciar `sy-edge` (ver PB-1) |
 | 15 | Placas secundarias | `add_hive` no las configura | Dejarlas listas antes del join |
+| 16 | Repo apt hecho a mano | `apt` dice *already the newest version* con el `.deb` nuevo ahí | Usar `scripts/apt-repo-publish.sh`: regenera **`Release`**, no sólo `Packages` |
+| 17 | `dpkg-scanpackages` sin `-m` | El índice queda con una sola versión · **te quedás sin rollback** | El script ya trae `-m`. No lo rehagas a mano |
+| 18 | `dpkg-deb` "colgado" | El `.deb` sigue en 3 KB y `dpkg-deb -c` dice *unexpected end of file* | Está comprimiendo con `xz`. Esperá el `BUILD END`; termina en ~240 MB |
+| 19 | Toolchain y `$HOME` | `rustup` dice *no installed toolchains* con la toolchain ahí | `rustup` lee `$HOME/.rustup`: en `fb-build` compilá con `HOME=/root` |
+| 20 | Guest-agent muerto | `QEMU guest agent is not running` con la VM viva | Sondear desde otra VM tuya; recuperar con reboot y si no, `reset` |
+| 21 | Comando largo por agente | El agente muere a mitad y perdés el trabajo | `setsid nohup ... > log` y leer el log |
+| 22 | Puerto/unit equivocados | "se cayó el edge / el router / el admin" | `SY.edge` va en **:443**; en un spoke no hay `sy-router`; el admin es **loopback** |
+| 23 | `payload` de la API | Un `while` que gira sobre una operación exitosa | El `status` de arriba es el del sobre; lo real está bajo `payload.` |
+| 24 | `verify=19` en TLS local | "la cadena está rota" | Es falta de SNI. Probá con `--resolve` y un host que matchee el wildcard |
 
 ---
 
@@ -615,6 +702,50 @@ readlink /proc/$p/exe        # si dice "(deleted)" -> corre el binario VIEJO
 systemctl show -p ActiveEnterTimestamp --value sy-orchestrator   # debe ser POSTERIOR al update
 sha256sum /usr/bin/sy-orchestrator /var/lib/fluxbee/dist/core/bin/sy-orchestrator   # deben coincidir
 ```
+
+### ⚠️ Cómo NO leer una falla donde no la hay
+
+Tres veces en una jornada leí un sistema sano como roto. Las tres son de sondeo, no de producto —
+y las tres se evitan sabiendo dónde mira cada cosa:
+
+| lo que probé | lo que vi | lo que pasaba de verdad |
+|---|---|---|
+| `curl https://127.0.0.1:8443/` en el ingress | conexión rechazada, "el edge se cayó" | **`SY.edge` escucha en `:443`.** El `8443` es de otra época |
+| `systemctl is-active sy-router` en un worker | `inactive`, "el worker perdió el router" | **En un spoke esa unit no existe.** Listá con `systemctl list-units "sy-*"` antes de preguntar por una |
+| `curl :8080/hives` desde el worker | sin respuesta, "el admin murió" | **La API de admin escucha en loopback.** Se consulta desde motherbee, no desde un spoke |
+
+Y una cuarta, de TLS: contra `127.0.0.1` vas a ver `ssl_verify_result=19`
+(*self-signed in chain*) aunque la cadena esté perfecta — es que no hay SNI ni hostname que
+validar. Verificá con un nombre concreto que matchee el wildcard del cert:
+
+```bash
+# el CN es *.fluxbee.ai — un literal "*.fluxbee.ai" NO sirve como host
+H=hive-test.fluxbee.ai
+curl -s -o /dev/null -w "http=%{http_code} verify=%{ssl_verify_result} certs=%{num_certs}\n" \
+     "https://$H/" --resolve "$H:443:127.0.0.1"
+# esperado: http=404 verify=0 certs=4
+```
+
+### ⚠️ La respuesta de la API vive bajo `payload`
+
+Todo lo que devuelve la API de admin viene envuelto:
+
+```json
+{"action":"...", "status":"...", "error_code":null, "payload":{ ...lo que te importa... }}
+```
+
+El `status` de arriba es el del **sobre**, y dice `ok` aunque la operación de adentro haya fallado.
+Rutas reales que hacen falta seguido:
+
+```text
+GET /hives                     ->  payload.hives[]           (NO payload.hives[].status para el join: es payload.hives[].join.phase)
+GET /hives/<h>/versions        ->  payload.hive.core.manifest_hash
+GET /versions                  ->  payload.comparison.verdict   y   payload.comparison.hives[]
+```
+
+> Esto ya causó un bug real: cuatro loops de e2e leían `payload.status` —siempre `"ok"`— y habrían
+> girado 600 s sobre un join **exitoso**. Si estás por escribir un `while` sobre una respuesta de
+> esta API, chequeá primero en qué campo estás mirando.
 
 ### ⚠️ `update category=core` devuelve TIMEOUT aunque funcione
 
