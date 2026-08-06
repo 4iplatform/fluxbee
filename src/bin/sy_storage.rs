@@ -2410,16 +2410,23 @@ async fn load_hive(config_dir: &Path) -> Result<HiveFile, StorageError> {
 /// vault's bootstrap broadcast. By reusing the persistent connection that
 /// is already announced in the router, any subsequent broadcast lands in
 /// our receive loop (or the rescue handler in handle_vault_secret_changed).
+///
+/// That rescue is PUSH, though, and the vault's bootstrap broadcast is a one-shot event: a
+/// storage that was not listening yet never sees it and stays degraded until a human restarts
+/// it. So this also PULLS — see `resolve_resource_awaiting_vault`, shared with SY.identity,
+/// which had the retry all along. Storage was the outlier.
 async fn resolve_database_url(
     vault: &VaultClient,
     node_name: &str,
     my_tenant: &str,
 ) -> (Option<String>, StorageDbSecretSource, Option<String>) {
     let result = vault
-        .resolve_resource(
+        .resolve_resource_awaiting_vault(
             fluxbee_sdk::ResourceType::Postgres,
             my_tenant,
             Duration::from_secs(5),
+            fluxbee_sdk::VAULT_BOOT_WAIT,
+            node_name,
         )
         .await;
     let _ = node_name; // silence unused when feature flags trim logging
@@ -2440,6 +2447,7 @@ async fn resolve_database_url(
         ),
     }
 }
+
 
 fn extract_postgres_url_from_vault_value(value: &Value) -> Option<String> {
     if let Some(s) = value.as_str().map(str::trim).filter(|v| !v.is_empty()) {

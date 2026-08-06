@@ -6624,33 +6624,19 @@ async fn resolve_database_url(
     // before calling this, so that if vault boots after us its bootstrap
     // VAULT_SECRET_CHANGED broadcast lands in the dispatcher's system
     // channel (rescued by `handle_vault_secret_changed`).
-    let mut last_error = None;
-    let started_at = Instant::now();
-    let result = loop {
-        match vault
-            .resolve_resource(
-                fluxbee_sdk::ResourceType::Postgres,
-                my_tenant,
-                Duration::from_secs(5),
-            )
-            .await
-        {
-            Ok(value) => break Ok(value),
-            Err(err) => {
-                let err_text = err.to_string();
-                last_error = Some(err_text.clone());
-                if started_at.elapsed() >= Duration::from_secs(15) {
-                    break Err(err_text);
-                }
-                tracing::warn!(
-                    node_name = %node_name,
-                    error = %err_text,
-                    "identity vault postgres lookup failed during boot; retrying"
-                );
-                time::sleep(Duration::from_millis(750)).await;
-            }
-        }
-    };
+    // The retry itself lives in the SDK (`resolve_resource_awaiting_vault`) so identity and
+    // SY.storage wait for the vault the same way — storage used not to wait at all, and a lost
+    // boot race left the hive's admin plane down behind STORAGE_NOT_READY.
+    let result = vault
+        .resolve_resource_awaiting_vault(
+            fluxbee_sdk::ResourceType::Postgres,
+            my_tenant,
+            Duration::from_secs(5),
+            fluxbee_sdk::VAULT_BOOT_WAIT,
+            node_name,
+        )
+        .await
+        .map_err(|err| err.to_string());
     match result {
         Ok(Some(value)) => match extract_postgres_url_from_vault_value(&value) {
             Some(url) => (Some(url), IdentityDbSecretSource::LocalFile, None),
@@ -6665,8 +6651,7 @@ async fn resolve_database_url(
             None,
             IdentityDbSecretSource::Missing,
             Some(format!(
-                "vault resource lookup for postgres failed after boot retries: {}",
-                last_error.unwrap_or(err)
+                "vault resource lookup for postgres failed after boot retries: {err}"
             )),
         ),
     }

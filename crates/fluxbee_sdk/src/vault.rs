@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -525,6 +525,30 @@ pub enum VaultError {
     EmptyValue { key: String },
 }
 
+/// How long a boot-time consumer waits for the vault to become REACHABLE before starting
+/// degraded. Generous on purpose: the cost of waiting is a slower boot, while the cost of
+/// giving up too early is a node that stays broken until someone notices and restarts it.
+pub const VAULT_BOOT_WAIT: Duration = Duration::from_secs(60);
+/// Gap between reachability attempts while inside [`VAULT_BOOT_WAIT`].
+pub const VAULT_BOOT_RETRY_INTERVAL: Duration = Duration::from_millis(750);
+
+/// True when nothing came back, as opposed to the vault answering.
+///
+/// Only these are worth retrying. Keep this the single definition of that split: SY.edge's TLS
+/// reload and the boot-time DB lookups all depend on "no verdict" meaning the same thing.
+pub fn vault_failure_is_transport(err: &VaultError) -> bool {
+    match err {
+        VaultError::Node(_)
+        | VaultError::ActionTimeout { .. }
+        | VaultError::Unreachable { .. }
+        | VaultError::TtlExceeded { .. } => true,
+        VaultError::Json(_)
+        | VaultError::Service { .. }
+        | VaultError::InvalidVaultRef
+        | VaultError::EmptyValue { .. } => false,
+    }
+}
+
 /// Identity of the caller of a vault L2 action.
 ///
 /// Both fields are mandatory:
@@ -752,6 +776,59 @@ impl VaultClient {
     /// 1. Dedicated secret for the caller's ILK (skipped when no ILK).
     /// 2. Pool secret for the caller's tenant.
     /// 3. Root-tenant pool secret (skipped when caller is already root).
+    /// [`Self::resolve_resource`], but waiting out a vault that is not up YET.
+    ///
+    /// Boot-time consumers (SY.storage, SY.identity) need a secret before they can serve
+    /// anything, and on a `.deb` upgrade systemd restarts the whole hive at once — so losing the
+    /// race against `sy-vault` is normal, not exceptional. The push-based rescue those consumers
+    /// already have (react to a later `VAULT_SECRET_CHANGED`) does not cover it: the vault's
+    /// bootstrap announcements are a ONE-SHOT event, and a consumer that was not yet listening
+    /// never gets a second one. It then sits degraded until a human restarts it — which is
+    /// exactly how a hive's admin plane stayed down behind `STORAGE_NOT_READY`.
+    ///
+    /// So: PULL until the vault actually answers, and only then let the caller judge the answer.
+    ///
+    /// Retries transport failures only. A vault that reached a verdict — "no such secret",
+    /// "denied", an unusable payload — will reach the same one on the next attempt, and spinning
+    /// on it would only delay an honest degraded start.
+    pub async fn resolve_resource_awaiting_vault(
+        &self,
+        resource: ResourceType,
+        my_tenant: &str,
+        timeout: Duration,
+        budget: Duration,
+        who: &str,
+    ) -> Result<Option<Value>, VaultError> {
+        let started_at = Instant::now();
+        loop {
+            let attempt = self
+                .resolve_resource(resource.clone(), my_tenant, timeout)
+                .await;
+            let err = match attempt {
+                Err(err) if vault_failure_is_transport(&err) => err,
+                other => return other,
+            };
+            let waited = started_at.elapsed();
+            if waited >= budget {
+                tracing::warn!(
+                    who = %who,
+                    waited_secs = waited.as_secs(),
+                    error = %err,
+                    "vault never became reachable within the boot budget; giving up"
+                );
+                return Err(err);
+            }
+            tracing::warn!(
+                who = %who,
+                waited_secs = waited.as_secs(),
+                budget_secs = budget.as_secs(),
+                error = %err,
+                "vault not reachable yet; retrying"
+            );
+            tokio::time::sleep(VAULT_BOOT_RETRY_INTERVAL).await;
+        }
+    }
+
     pub async fn resolve_resource(
         &self,
         resource: ResourceType,
@@ -1101,5 +1178,79 @@ mod tests {
         assert_eq!(response.error_code.as_deref(), Some("UNAUTHORIZED"));
         assert_eq!(response.message.as_deref(), Some("denied"));
         assert!(response.secrets.is_empty());
+    }
+
+    /// The two failures SY.storage ACTUALLY hit on the live motherbee, verbatim from its
+    /// journal, on a `.deb` upgrade that restarted vault and storage at the same instant:
+    ///
+    ///   vault resource lookup for postgres failed: vault unreachable:
+    ///     reason=NODE_NOT_FOUND original_dst=SY.vault@motherbee
+    ///   vault resource lookup for postgres failed: node error: disconnected
+    ///
+    /// Both mean "the vault had not announced yet", and both must be retryable. Six occurrences
+    /// in one journal — losing this race is the NORMAL outcome of a simultaneous restart, not a
+    /// rare one, and each left the hive's admin plane down behind STORAGE_NOT_READY until a
+    /// human intervened.
+    #[test]
+    fn the_boot_race_failures_observed_in_production_are_retryable() {
+        let node_not_found = VaultError::Unreachable {
+            reason: "NODE_NOT_FOUND".to_string(),
+            original_dst: "SY.vault@motherbee".to_string(),
+        };
+        assert!(
+            vault_failure_is_transport(&node_not_found),
+            "NODE_NOT_FOUND is the router saying the vault has not announced yet, not a verdict"
+        );
+        assert!(
+            node_not_found.to_string().contains("NODE_NOT_FOUND"),
+            "the journal line this test is pinned to must stay recognizable"
+        );
+
+        let disconnected = VaultError::Node(NodeError::Disconnected);
+        assert!(
+            vault_failure_is_transport(&disconnected),
+            "a dropped connection carries no verdict either"
+        );
+    }
+
+    /// The other half: a vault that ANSWERED must not be retried. Spinning on a settled verdict
+    /// would only delay an honest degraded start, and would turn "there is no secret" — a real
+    /// operator condition — into a node that hangs for the whole boot budget on every start.
+    #[test]
+    fn a_vault_that_answered_is_never_retried() {
+        for settled in [
+            VaultError::Service {
+                code: "FORBIDDEN".to_string(),
+                message: "denied".to_string(),
+            },
+            VaultError::InvalidVaultRef,
+            VaultError::EmptyValue {
+                key: "postgres".to_string(),
+            },
+        ] {
+            assert!(
+                !vault_failure_is_transport(&settled),
+                "{settled} is a verdict; retrying it would just stall the boot"
+            );
+        }
+    }
+
+    /// Waiting must be bounded. A vault that never comes up has to end in a degraded start, not
+    /// a process that hangs forever holding the hive's admin plane hostage.
+    #[test]
+    fn the_boot_wait_is_bounded_and_polls_more_than_once() {
+        assert!(
+            VAULT_BOOT_WAIT >= Duration::from_secs(30),
+            "too short a budget re-creates the bug on a slow boot"
+        );
+        assert!(
+            VAULT_BOOT_WAIT <= Duration::from_secs(300),
+            "the wait must stay bounded so a vaultless hive still finishes booting"
+        );
+        assert!(
+            VAULT_BOOT_RETRY_INTERVAL > Duration::ZERO
+                && VAULT_BOOT_RETRY_INTERVAL * 10 <= VAULT_BOOT_WAIT,
+            "the budget must allow many attempts, not one or two"
+        );
     }
 }
