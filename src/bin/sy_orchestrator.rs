@@ -15636,9 +15636,26 @@ fn managed_node_restart_command(
         tenant_id.as_deref(),
     );
     if unit_active {
+        // `systemctl restart` re-runs the unit's EXISTING ExecStart. The unit is created by
+        // `systemd-run` with the runtime version baked into the entrypoint path, so restarting a
+        // node after publishing a new runtime version relaunches the OLD binary — while this
+        // function's caller happily reports the newly resolved version back to the operator. That
+        // is a version claimed and not applied (the U-1 shape), and it is the second half of why
+        // "publish + restart" did not pick up a new runtime: resolving the right version is not
+        // enough if the unit still points at the old one.
+        //
+        // So: restart in place only when the live ExecStart already points at the planned
+        // entrypoint. Otherwise tear the unit down and re-create it at the new path.
         format!(
-            "systemctl restart {unit} || (systemctl reset-failed {unit} || true; sleep 1; {run_cmd})",
+            "if systemctl show -p ExecStart --value {unit} 2>/dev/null | grep -qF {script}; then \
+                systemctl restart {unit} || (systemctl reset-failed {unit} || true; sleep 1; {run_cmd}); \
+             else \
+                systemctl stop {unit} >/dev/null 2>&1 || true; \
+                systemctl reset-failed {unit} >/dev/null 2>&1 || true; \
+                {run_cmd}; \
+             fi",
             unit = shell_single_quote(&plan.unit),
+            script = shell_single_quote(&plan.entrypoint.script_path),
             run_cmd = run_cmd,
         )
     } else {
@@ -25717,6 +25734,56 @@ blob:
             !body.contains("dist_sync_folders_for_role("),
             "dist_sync_folders_for_role da fluxbee-dist-core-motherbee en motherbee: 404, y el \
              primer no-ok hace fallar el hint entero"
+        );
+    }
+
+    /// Reiniciar tiene que RECREAR la unit cuando cambio la ruta del entrypoint.
+    ///
+    /// `systemctl restart` re-ejecuta el ExecStart que ya tiene la unit, y esa ruta lleva la
+    /// version del runtime adentro. Asi que reiniciar despues de publicar una version nueva
+    /// relanzaba el binario VIEJO — mientras la respuesta le informaba al operador la version
+    /// nueva. Version prometida y no aplicada: la forma de U-1.
+    ///
+    /// Medido en vivo: `restart_node` devolvio `version: 0.1.14` y el proceso siguio siendo
+    /// `/var/lib/fluxbee/dist/runtimes/io.slack/0.1.13/bin/io-slack`.
+    #[test]
+    fn reiniciar_recrea_la_unit_si_cambio_la_ruta_del_entrypoint() {
+        let plan = ManagedNodeLaunchPlan {
+            node: PersistedManagedNode {
+                requested_runtime_version: "current".to_string(),
+                node_name: "IO.slack.default@motherbee".to_string(),
+                kind: "IO".to_string(),
+                runtime: "io.slack".to_string(),
+                runtime_version: "0.1.14".to_string(),
+                config_path: PathBuf::from("/tmp/config.json"),
+                relaunch_on_boot: true,
+            },
+            unit: unit_from_node_name("IO.slack.default@motherbee"),
+            runtime_key: "io.slack".to_string(),
+            resolved_version: "0.1.14".to_string(),
+            requested_version: "current".to_string(),
+            entrypoint: RuntimeSpawnEntrypoint {
+                script_runtime: "io.slack".to_string(),
+                script_version: "0.1.14".to_string(),
+                script_path: "/var/lib/fluxbee/dist/runtimes/io.slack/0.1.14/bin/start.sh"
+                    .to_string(),
+                runtime_base: None,
+            },
+        };
+        let state = sample_orchestrator_state_for_tests();
+        let cmd = managed_node_restart_command(&state, &plan, true);
+
+        assert!(
+            cmd.contains("ExecStart") && cmd.contains("0.1.14/bin/start.sh"),
+            "tiene que comparar el ExecStart vivo contra la ruta planificada: {cmd}"
+        );
+        assert!(
+            cmd.contains("systemctl stop") && cmd.contains("systemd-run"),
+            "si no coincide, tiene que bajar la unit y recrearla: {cmd}"
+        );
+        assert!(
+            cmd.contains("systemctl restart"),
+            "si ya coincide, alcanza con reiniciar en el lugar: {cmd}"
         );
     }
 
