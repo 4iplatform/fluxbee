@@ -250,8 +250,14 @@ async fn main() -> Result<(), VaultError> {
     // VAULT_UNAVAILABLE can react now. Without this, vault.db with
     // pre-existing secrets + a boot race leaves consumers stuck in
     // `secret_source = Missing` because no future mutation will fire to
-    // wake them up. The broadcast is idempotent for consumers already
-    // configured (they just re-resolve the same value and continue).
+    // wake them up.
+    //
+    // The OUTCOME is idempotent for consumers already configured — they end up on the same
+    // value — but the mechanism is not free: their handler exits(0) unconditionally once origin
+    // and interest match, so systemd restarts them. Measured on a cold boot: SY.storage and
+    // SY.identity each resolve via their own retry, then restart ~7 s later when this broadcast
+    // lands. Harmless (Restart=always, back in ~5 s) and still REQUIRED for a real rotation,
+    // where the pool must be rebuilt. Do not read this comment as "nothing happens".
     {
         let sender = dispatcher.sender_snapshot();
         if let Err(err) = emit_bootstrap_secret_broadcasts(&sender, &store, &hive_id).await {

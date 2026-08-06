@@ -23,15 +23,15 @@ infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambi
 | id | estado | tema | bloquea |
 |---|---|---|---|
 | [PB-1](#pb-1) | 🟡 mitigado | SY.edge no recarga el cert TLS al rotar en el vault | no |
-| [PB-2](#pb-2) | 🟡 reescrito | Nadie verifica la **completitud** de la cadena TLS (el validador propuesto no la atajaba) | no |
+| [PB-2](#pb-2) | ✅ **cerrado y VALIDADO en vivo** | Completitud de la cadena TLS · `chain_len=4` servido, `verify=0` desde internet | — |
 | [PB-3](#pb-3) | 🟢 cosmético | El enum `ResourceType` derivó · **sin impacto funcional** | no |
 | [PB-4](#pb-4) | ✅ **CERRADO** | El arranque en frío **se veía** como falla: el edge culpaba al vault sin motivo | — |
 | [PB-5](#pb-5) | 🟡 reescrito | El egress reporta `nat_applied: true` sin verificar su pata LAN | no |
 | [PB-6](#pb-6) | 🟡 reescrito | `ssh_password` no se cierra solo · **⛔ invertir el default deja cajas sin acceso** | no |
 | [PB-6b](#pb-6b) | ✅ **CERRADO** | `harden_ssh_applied` era un eco del request: reportaba `false` con el password auth ya apagado | — |
-| [PB-7](#pb-7) | 🔴 abierto | `add_hive` (>6 min) desborda la ventana del admin (180 s) **y bloquea el canal** | no |
-| [PB-8](#pb-8) | 🟡 reescrito | El egress no tiene historia para motherbee · **⛔ propagarle la ruta = lockout** | no |
-| [PB-9](#pb-9) | 🔴 abierto | Todo restart de `sy-vault` recicla un edge sano → bache en el HTTPS público | no |
+| [PB-7](#pb-7) | ✅ **CERRADO** | `add_hive` (>6 min) desborda la ventana del admin (180 s) **y bloquea el canal** | no |
+| [PB-8](#pb-8) | ✅ **cerrado y VALIDADO en vivo** | Egress para motherbee · **sólo reporta**, no toca la ruta (`EGRESS_MOTHERBEE_BYPASS`) | — |
+| [PB-9](#pb-9) | ✅ **CERRADO** | Todo restart de `sy-vault` recicla un edge sano → bache en el HTTPS público | no |
 
 ### Serie U — el sistema de update (auditado 2026-07-30, antes de usarlo)
 
@@ -39,10 +39,10 @@ infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambi
 |---|---|---|---|
 | [U-1](#u-1) | ✅ **cerrado y VALIDADO en vivo** | El update del core reportaba éxito sin reiniciar nada | — |
 | [U-2](#u-2) | ✅ **cerrado** | Ingress y egress no tenían canal de core · resuelto partiendo `dist` por contenido + core por rol | — |
-| [U-3](#u-3) | 🔴 **sobrevive** | El `.deb` pisa `dist/runtimes/manifest.json` · **el arreglo de U-10 NO lo cubre** · toca packaging | **sí**, apenas exista un runtime publicado en caliente |
-| [U-4a](#u-4a) | 🟢 reescrito | El HELLO lleva `protocol` y nadie lo mira · **⛔ rechazar el peer = self-fencing** | no |
-| [U-4b](#u-4b) | 🔴 abierto | **Las drift-alerts no se escriben nunca**: `GET /drift-alerts` devuelve un snapshot disfrazado de historial | no |
-| [U-5](#u-5) | 🟡 gap | No hay rollback de core como comando · **⛔ "restaurar el último backup" repetiría U-1** | no |
+| [U-3](#u-3) | ✅ **cerrado y VALIDADO en vivo** | El `.deb` pisaba `dist/runtimes/manifest.json` · snapshot en `preinst` + seed que restaura | — |
+| [U-4a](#u-4a) | ✅ **cerrado y VALIDADO en vivo** | El veredicto de `/versions` funciona, con `runtimes: n/a` en ingress y egress | — |
+| [U-4b](#u-4b) | ✅ **cerrado y VALIDADO en vivo** | Las drift-alerts no se escribían nunca · ahora hay escritor, y la síntesis se borró | — |
+| [U-5](#u-5) | ✅ **cerrado y VALIDADO en vivo** | `core_rollback` con generaciones selladas, gate de salud y forward cross-hive | — |
 | [U-5b](#u-5b) | ✅ **CERRADO** | Los backups de core se acumulaban sin GC **y se creaban vacíos en cada no-op** | — |
 | [U-6](#u-6) | 🟡 mitigado | La carrera era **el orquestador contra sí mismo**: escritura no atómica de 35 MB | — |
 | [U-7](#u-7) | ✅ **cerrado** | El watchdog reiniciaba syncthing cada ~7 s por una carpeta inexistente | — |
@@ -53,6 +53,7 @@ infraestructura (serie `B-*` de FINDINGS) no entran salvo que impliquen un cambi
 | [U-10](#u-10) | ✅ **cerrado y VALIDADO en vivo** | Un upgrade del `.deb` dejaba huérfano a todo nodo runtime | — |
 | [U-11](#u-11) | ✅ **cerrado y VALIDADO en vivo** | IO.cloud no podía auto-publicar su canal | — |
 | [U-12](#u-12) | 🟡 corregido | La carrera existe, pero **hay una llamada atómica que la evita** y yo no la encontré | no |
+| [U-13](#u-13) | ✅ **cerrado y VALIDADO en vivo** | `sy-storage` perdía la carrera de arranque contra el vault y **no reintentaba** | — |
 
 ---
 
@@ -333,7 +334,7 @@ el cambio es local al reporte, pero **todavía no lo vi contra una caja real.**
 ---
 
 <a id="pb-7"></a>
-## PB-7 🔴 — El `add_hive` real dura más que la ventana de respuesta del admin (180 s) — y en ese rato el plano de control del hive queda **bloqueado**
+## PB-7 ✅ **CERRADO** — El `add_hive` real dura más que la ventana de respuesta del admin (180 s) — y en ese rato el plano de control del hive queda **bloqueado**
 
 **Qué pasa.** `JSR_ADMIN_ADD_HIVE_TIMEOUT_SECS` default 180 s (`sy_admin.rs:13648-13653`) contra un
 `add_hive` **medido en >6 min**. El cliente recibe `{"error_code":"TIMEOUT"}` sobre una operación que
@@ -411,7 +412,7 @@ declararla es una edición a mano no documentada.
 ---
 
 <a id="pb-9"></a>
-## PB-9 🔴 — Todo restart de `sy-vault` reinicia un `SY.edge` **sano** → bache en el HTTPS público
+## PB-9 ✅ **CERRADO** — Todo restart de `sy-vault` reinicia un `SY.edge` **sano** → bache en el HTTPS público
 
 > Descubierto por la auditoría adversarial del 2026-08-03, mientras se refutaba PB-4. No estaba en
 > ningún hallazgo.
@@ -692,7 +693,7 @@ acotado — pero es la razón por la que U-6 sube de prioridad.
 ---
 
 <a id="u-3"></a>
-## U-3 🔴 — El upgrade del `.deb` borra los runtimes publicados en caliente · **SOBREVIVE (y es peor)**
+## U-3 ✅ **CERRADO** — El upgrade del `.deb` borra los runtimes publicados en caliente · **SOBREVIVE (y es peor)**
 
 > **Sobrevivió la auditoría intacto en su núcleo**, pero estaba **mal calibrado en tres cosas y
 > subestimaba el daño en dos.** Reescrito el 2026-08-03.
@@ -894,7 +895,7 @@ igual que hace el gate de staleness del update.
 ---
 
 <a id="u-7"></a>
-## U-7 🔴 — El watchdog busca una carpeta que nunca se declara
+## U-7 ✅ **CERRADO** — El watchdog busca una carpeta que nunca se declara
 
 En motherbee, cada 5 segundos:
 
@@ -1024,7 +1025,7 @@ registry toca dispatch y authz → decisión del operador.**
 ---
 
 <a id="u-10"></a>
-## U-10 🔴 — Un upgrade del `.deb` deja huérfano a todo nodo runtime · BLOQUEANTE
+## U-10 ✅ **CERRADO** — Un upgrade del `.deb` deja huérfano a todo nodo runtime · BLOQUEANTE
 
 **Reproducido en producción el 2026-07-30**, en el primer upgrade real (`0.1.1 → 0.1.2`), que era
 justamente el camino que este test venía a validar. El `.deb` se instaló limpio
@@ -1297,3 +1298,56 @@ Sin carrera, sin segunda llamada, sin espera.
 Antes de proponer construir algo, **preguntarle al sistema si ya lo tiene**
 (`GET /admin/actions/<accion>`). Me habría ahorrado un hallazgo mal planteado y una receta
 equivocada en el handbook.
+
+---
+
+<a id="u-13"></a>
+## U-13 ✅ **CERRADO** — `sy-storage` perdía la carrera de arranque contra el vault y no reintentaba
+
+**Observado en producción**, seis veces en un mismo journal, en dos formas:
+
+```text
+SY.storage vault lookup for postgres_url_ref failed; starting degraded
+  error="... vault unreachable: reason=NODE_NOT_FOUND original_dst=SY.vault@motherbee"
+  error="... node error: disconnected"
+```
+
+Perder la carrera **no es raro**: es el resultado normal de que systemd reinicie todo junto en un
+upgrade del `.deb`. Y no era un veredicto del vault ("no tengo ese secreto") — era que `sy-vault`
+todavía no se había anunciado al router. Nadie contestó.
+
+**Por qué el rescate existente no alcanzaba.** Es **push**: reaccionar a un `VAULT_SECRET_CHANGED`
+posterior. El broadcast de bootstrap del vault es un evento de **una sola vez**, y un storage que
+todavía no escuchaba no recibe un segundo aviso. Queda degradado hasta que una persona lo reinicia,
+con el plano de admin del hive caído atrás detrás de `STORAGE_NOT_READY`.
+
+Ordenar las units no lo arregla: `sy-storage` y `sy-vault` son las dos `Type=simple`, donde
+"arrancó" significa "se ejecutó el proceso", no "se anunció al bus". `After=` sería decoración.
+
+**El arreglo: falta el pull.** Va en el SDK (`resolve_resource_awaiting_vault`), no en cada binario,
+porque `sy-identity` **ya reintentaba** — storage era el outlier. Una sola definición del corte:
+`Unreachable`/`TtlExceeded`/`Node`/`ActionTimeout` se reintentan; `Service`/`EmptyValue`/
+`InvalidVaultRef` no, porque el vault ya dio veredicto y lo va a repetir.
+
+**Validado en vivo tres veces**, en el modo de falla exacto:
+
+| evento | error observado | desenlace |
+|---|---|---|
+| upgrade 0.1.11→0.1.12 | `node error: disconnected` | reintentó, `storage_ready=true` en **1 s** |
+| reboot ACPI | `NODE_NOT_FOUND` ×3 | reintentó ~3 s → resolvió |
+| reset duro | `NODE_NOT_FOUND` ×2 | reintentó ~4 s → resolvió |
+
+`STORAGE_NOT_READY` en el orquestador: **0** en ambos arranques. Antes: 70+.
+
+### Residual anotado, no arreglado — para charlar
+
+El rescate por push dispara igual **aunque el consumidor ya haya resuelto por el pull**. El
+`exit(0)` es incondicional una vez que pasan origen e interés: no compara el secreto que llega
+contra el que ya está corriendo. Medido en el arranque en frío: storage e identity resuelven solos
+y ~7 s después se reinician cuando llega el broadcast.
+
+No es un bug que haya introducido este arreglo, y es **inofensivo** (`Restart=always`, vuelven en
+~5 s). Pero el comentario en `sy_vault.rs` decía que era idempotente "re-resolviendo el mismo valor
+y continuando", que no es lo que pasa — eso ya está corregido. Afinarlo de verdad (salir sólo si el
+secreto **cambió**) toca un mecanismo de seguridad que sigue siendo necesario para una rotación
+real, así que queda para decidir con el operador.
