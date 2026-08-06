@@ -11,6 +11,21 @@
 #
 # NOTA LAB: hornea el usuario administrator con password 'magicAI' (default de los
 # scripts de add_hive). Cambialo para cualquier cosa fuera del lab.
+#
+# ⚠️ LO QUE add_hive NECESITA DE VERDAD, y no coincide automaticamente con lo de arriba:
+# el join autentica contra el `ssh_user` QUE VOS LE PASES, y ese usuario suele venir del
+# `ciuser` de cloud-init (en este lab: fluxops), NO del `administrator` que crea este script.
+# Para ese usuario hace falta UNA de las dos:
+#
+#   (a) RECOMENDADO — su ~/.ssh/authorized_keys con la clave publica de motherbee
+#       (/var/lib/fluxbee/ssh/motherbee.key.pub). add_hive sondea key-first y no necesita
+#       password. Es lo que significa "la imagen cloud trae una authorized key".
+#   (b) un password, que le pasas como ssh_password.
+#
+# Si no hay ninguna de las dos, el join falla con SSH_AUTH_FAILED y el mensaje lo dice:
+# "key probe failed and neither ssh_key nor ssh_password supplied for bootstrap".
+# Costo dos joins fallidos en la regeneracion del 2026-08-05 por asumir que el password
+# documentado aca aplicaba al usuario del template.
 set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "corré como root" >&2; exit 1; }
 
