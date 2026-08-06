@@ -1462,6 +1462,10 @@ fn audit_result_for_error(err: &VaultError) -> &'static str {
 }
 
 fn validate_key(key: &str) -> VaultResult<()> {
+    // The charset itself lives in the SDK (`vault_key_is_valid`) so the consumers that have to
+    // NAME a key in their config can check it too — they ship in a different cargo workspace and
+    // used to carry example keys this function rejects. The specific messages stay here: they are
+    // what an operator sees, and "prefix" vs "format" tells them which rule they broke.
     let bytes = key.as_bytes();
     if bytes.is_empty() || bytes.len() > 256 {
         return Err(VaultError::InvalidRequest("invalid key length".to_string()));
@@ -1469,10 +1473,7 @@ fn validate_key(key: &str) -> VaultResult<()> {
     if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
         return Err(VaultError::InvalidRequest("invalid key prefix".to_string()));
     }
-    if !bytes
-        .iter()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(*b, b':' | b'_' | b'-'))
-    {
+    if !fluxbee_sdk::vault_key_is_valid(key) {
         return Err(VaultError::InvalidRequest("invalid key format".to_string()));
     }
     Ok(())

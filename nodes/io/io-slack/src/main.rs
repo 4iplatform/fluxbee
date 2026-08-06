@@ -757,6 +757,25 @@ async fn resolve_slack_credentials_from_vault(
             );
             SlackVaultResolution::Absent
         }
+        // The vault REJECTED the request itself. Also deterministic: the key we were configured
+        // with is malformed (the vault charset is [a-z0-9:_-], so an operator who copies a key
+        // with dots, slashes, uppercase or `@` lands here), or we are not allowed to read it.
+        // Retrying cannot fix either. Without this arm both fell into the catch-all below and
+        // were reported as "transient" forever — telling the operator to look at the network
+        // when the actual problem is one character in their config.
+        Err(VaultError::Service { code, message })
+            if code == "INVALID_REQUEST" || code == "UNAUTHORIZED" =>
+        {
+            tracing::error!(
+                vault_key = %key,
+                code = %code,
+                message = %message,
+                "vault REJECTED the slack secret lookup; this is a CONFIG error, not a blip — \
+                 fix slack.auth.key (vault keys allow only [a-z0-9:_-], first char [a-z0-9]) \
+                 or the node's authorization, then CONFIG_SET again"
+            );
+            SlackVaultResolution::Absent
+        }
         // Anything else (timeout, node error, other service code) is TRANSIENT -> keep current creds.
         Err(err) => {
             tracing::warn!(
@@ -1449,7 +1468,17 @@ async fn run_inbound_socket_mode(
                 .or_else(|| event.get("ts").and_then(|v| v.as_str()))
                 .unwrap_or("unknown")
                 .to_string();
-            if event.get("type").and_then(|v| v.as_str()) != Some("app_mention") {
+            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if event_type != "app_mention" {
+                // Say so. A bare `continue` here is invisible at EVERY level, which makes the two
+                // explanations for "nothing happens" indistinguishable from the outside: Slack
+                // delivering no events at all (app not subscribed) versus us dropping what it
+                // does deliver. Diagnosing that cost a live session.
+                tracing::debug!(
+                    node_name = %config.node_name,
+                    event_type = %event_type,
+                    "ignoring inbound Slack event: only app_mention is processed"
+                );
                 continue;
             }
             let user = match event.get("user").and_then(|v| v.as_str()) {
@@ -2107,10 +2136,10 @@ mod tests {
     #[test]
     fn slack_vault_key_reads_auth_key_and_ignores_blanks() {
         // Family vault_ref pattern: config carries only slack.auth.key (a vault reference).
-        let cfg = json!({"slack":{"auth":{"type":"vault_ref","resource_type":"slack","key":"slack/IO.slack@motherbee"}}});
+        let cfg = json!({"slack":{"auth":{"type":"vault_ref","resource_type":"slack","key":"slack:io-slack:motherbee"}}});
         assert_eq!(
             slack_vault_key(Some(&cfg)).as_deref(),
-            Some("slack/IO.slack@motherbee")
+            Some("slack:io-slack:motherbee")
         );
         assert_eq!(slack_vault_key(None), None);
         assert_eq!(slack_vault_key(Some(&json!({"slack":{"auth":{}}}))), None);

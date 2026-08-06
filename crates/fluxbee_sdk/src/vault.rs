@@ -532,6 +532,28 @@ pub const VAULT_BOOT_WAIT: Duration = Duration::from_secs(60);
 /// Gap between reachability attempts while inside [`VAULT_BOOT_WAIT`].
 pub const VAULT_BOOT_RETRY_INTERVAL: Duration = Duration::from_millis(750);
 
+/// The charset SY.vault accepts for a secret key: `[a-z0-9:_-]`, first char `[a-z0-9]`, 1..=256
+/// bytes.
+///
+/// Lives here because the rule has TWO sides that ship in different cargo workspaces: SY.vault
+/// enforces it, and every consumer that names a key in config (IO.slack's `slack.auth.key`, and
+/// anything that follows the vault_ref family pattern) has to respect it. When only one side knew
+/// the rule, the io.slack test fixtures modelled `slack/IO.slack@motherbee` — four illegal
+/// characters — and stayed green forever because a unit test never calls the vault. Copying that
+/// example into a real hive gets `INVALID_REQUEST: invalid key format`.
+pub fn vault_key_is_valid(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    if bytes.is_empty() || bytes.len() > 256 {
+        return false;
+    }
+    if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(*b, b':' | b'_' | b'-'))
+}
+
 /// True when nothing came back, as opposed to the vault answering.
 ///
 /// Only these are worth retrying. Keep this the single definition of that split: SY.edge's TLS

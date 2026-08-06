@@ -106,7 +106,7 @@ pub use timer::{
     TIMER_LIST_MAX_LIMIT, TIMER_MIN_DURATION_MS, TIMER_NODE_FAMILY, TIMER_NODE_KIND,
 };
 pub use vault::{
-    normalize_resource_type, vault_failure_is_transport, ResourceType, VaultCaller, VaultCallerOwned, VaultClient,
+    normalize_resource_type, vault_failure_is_transport, vault_key_is_valid, ResourceType, VaultCaller, VaultCallerOwned, VaultClient,
     VaultDeleteResponse, VaultError, VaultFilter, VaultGetMetadataRequest,
     VaultGetMetadataResponse, VaultGetRequest, VaultGetResponse, VaultKeyRequest, VaultListRequest,
     VaultListResponse, VaultMetadata, VaultPutRequest, VaultPutResponse, VaultRetryPolicy,
