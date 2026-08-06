@@ -72,6 +72,7 @@ async fn main() -> Result<()> {
             dst_node: config.dst_node.clone(),
             provision_on_miss: true,
             blob_runtime: Some(io_common::text_v1_blob::IoBlobRuntimeConfig::default()),
+            self_tenant_id: None,
         },
     )));
 

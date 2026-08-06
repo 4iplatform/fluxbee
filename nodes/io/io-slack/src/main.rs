@@ -125,6 +125,7 @@ async fn main() -> Result<()> {
             dst_node: None,
             provision_on_miss: true,
             blob_runtime: Some(config.blob_runtime.clone()),
+            self_tenant_id: self_tenant_id.clone(),
         },
     )));
     let blob_toolkit = Arc::new(

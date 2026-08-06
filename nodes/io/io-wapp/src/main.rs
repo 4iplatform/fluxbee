@@ -526,6 +526,7 @@ async fn main() -> Result<()> {
             dst_node: None,
             provision_on_miss: true,
             blob_runtime: None,
+            self_tenant_id: self_tenant_id.clone(),
         },
     )));
     tokio::spawn(run_wapp_inbound_loop(

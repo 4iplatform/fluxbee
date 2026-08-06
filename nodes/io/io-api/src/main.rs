@@ -292,6 +292,9 @@ async fn main() -> Result<()> {
             dst_node: initial_dst,
             provision_on_miss: true,
             blob_runtime: None,
+            // io.api authenticates a principal and puts ITS tenant on each input, so this is only
+            // the fallback for a request that somehow carries none.
+            self_tenant_id: self_tenant_id.clone(),
         },
     )));
     let relay_policy = config::api_relay_policy(&config, boot_state.effective_config.as_ref())?;
