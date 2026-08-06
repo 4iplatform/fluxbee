@@ -20143,6 +20143,24 @@ async fn add_egress_hive_flow(
         return err_payload("CORE_SYNC_FAILED", err.to_string());
     }
 
+    // The egress was the ONLY one of the three join flows that never pushed the vendor bundle —
+    // worker and ingress both do. Without it the box never receives the syncthing binary, and
+    // since the vendor arrives THROUGH syncthing, nothing can ever repair it: the watchdog just
+    // restarts `fluxbee-syncthing` every few seconds forever and `/versions` reports the hive's
+    // vendor as unknown. De-divergence, mirroring add_ingress_hive_flow verbatim.
+    if let Err(err) = sync_vendor_to_worker(hive_id, address, &key_path, creds.user.as_str()) {
+        append_single_deployment_history(
+            state,
+            "vendor",
+            "add_hive",
+            hive_id,
+            "error",
+            Some("VENDOR_SYNC_FAILED".to_string()),
+            local_syncthing_vendor_hash().ok().flatten(),
+        );
+        return err_payload("VENDOR_SYNC_FAILED", err.to_string());
+    }
+
     if let Err(err) = ssh_with_key(
         address,
         &key_path,
@@ -23570,6 +23588,40 @@ mod tests {
         });
         let out = versions_comparison("motherbee", &[reference, legacy]);
         assert_eq!(out["verdict"], "match");
+    }
+
+    /// Found by regenerating a hive from scratch, not by any test: `add_egress_hive_flow` was
+    /// the only one of the three join flows that never pushed the vendor bundle. The egress
+    /// therefore never received the syncthing binary — and since the vendor arrives THROUGH
+    /// syncthing, nothing could ever repair it: the watchdog restarted `fluxbee-syncthing` every
+    /// few seconds forever and `/versions` reported that hive's vendor as `unknown`.
+    ///
+    /// This pins the symmetry by reading the source, because the three flows are ~1000 lines
+    /// apart and a divergence between them is invisible at a glance.
+    #[test]
+    fn every_join_flow_pushes_both_core_and_vendor() {
+        let src = include_str!("sy_orchestrator.rs");
+        for (flow, next) in [
+            ("async fn add_hive_flow", "async fn add_egress_hive_flow"),
+            ("async fn add_egress_hive_flow", "async fn add_ingress_hive_flow"),
+            ("async fn add_ingress_hive_flow", "fn resolve_add_hive_role"),
+        ] {
+            let start = src.find(flow).unwrap_or_else(|| panic!("no encontre {flow}"));
+            let end = src[start..]
+                .find(next)
+                .map(|o| start + o)
+                .unwrap_or(src.len());
+            let body = &src[start..end];
+            assert!(
+                body.contains("sync_core_to_worker("),
+                "{flow} must push core"
+            );
+            assert!(
+                body.contains("sync_vendor_to_worker("),
+                "{flow} must push vendor — without it the hive never gets syncthing, and the \
+                 vendor arrives THROUGH syncthing, so it can never self-repair"
+            );
+        }
     }
 
     /// U-4b: the store had a reader and no writer, so `GET /drift-alerts` could only ever
