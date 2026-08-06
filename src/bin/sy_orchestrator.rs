@@ -20374,6 +20374,86 @@ async fn add_egress_hive_flow(
         );
     }
 
+    // SYNCTHING PEER LINK — the egress flow was the only one of the three that never did this.
+    //
+    // Worker and ingress both finalize over the socket, take the spoke's device ID out of the
+    // reply, and link it into their per-role dist folders. Without it motherbee's
+    // `fluxbee-dist-core-egress` folder lists only motherbee, so syncthing has nobody to deliver
+    // to: the egress joins fine and then can NEVER be updated — `update category=core` finds its
+    // dist unchanged and does nothing, silently, forever. Verified on a live hive: that folder
+    // had 1 device while the worker's and ingress's had 2.
+    let desired_blob = current_blob_runtime_config(state);
+    let desired_dist = current_dist_runtime_config(state);
+    let desired_sync = effective_syncthing_runtime_config(&desired_blob, &desired_dist);
+    let mut syncthing_peer_linked = false;
+    if desired_dist.sync_enabled && dist_sync_tool_is_syncthing(&desired_dist) {
+        match (
+            parse_host_port(&worker_uplink).and_then(|(host, _)| syncthing_tcp_address_for_host(&host)),
+            local_syncthing_device_id(&desired_sync),
+        ) {
+            (Ok(mother_syncthing_address), Ok(mother_device_id)) => {
+                match add_hive_finalize_via_socket(
+                    state,
+                    hive_id,
+                    address,
+                    false,
+                    DIST_SYNC_PROBE_TIMEOUT_SECS,
+                    Some(&mother_device_id),
+                    Some(&state.hive_id),
+                    Some(&mother_syncthing_address),
+                )
+                .await
+                {
+                    Ok(finalize) => {
+                        match syncthing_device_id_from_finalize_payload(&finalize) {
+                            Some(device_id) => {
+                                if let Err(err) = ensure_syncthing_peer_link_runtime(
+                                    &desired_sync,
+                                    &desired_blob,
+                                    &desired_dist,
+                                    &device_id,
+                                    hive_id,
+                                    None,
+                                    state.is_motherbee,
+                                    HiveRole::Egress,
+                                )
+                                .await
+                                {
+                                    // Loud, not fatal: the hive is otherwise usable and the
+                                    // operator can re-run the join. Silence here is what let this
+                                    // go unnoticed in the first place.
+                                    tracing::error!(
+                                        hive_id = hive_id,
+                                        error = %err,
+                                        "egress joined but its Syncthing peer link FAILED — it will not receive core or vendor updates"
+                                    );
+                                } else {
+                                    syncthing_peer_linked = true;
+                                }
+                            }
+                            None => tracing::error!(
+                                hive_id = hive_id,
+                                "egress finalize returned no Syncthing device ID — it will not receive updates"
+                            ),
+                        }
+                    }
+                    Err(err) => tracing::error!(
+                        hive_id = hive_id,
+                        error = %err,
+                        "egress Syncthing finalize failed — it will not receive updates"
+                    ),
+                }
+            }
+            (mother_addr, device) => tracing::error!(
+                hive_id = hive_id,
+                addr_err = ?mother_addr.err().map(|e| e.to_string()),
+                device_err = ?device.err().map(|e| e.to_string()),
+                "could not resolve motherbee Syncthing identity for the egress peer link"
+            ),
+        }
+    }
+    let _ = syncthing_peer_linked;
+
     // Connectivity gates: WAN to motherbee + orchestrator visible in LSA.
     let mut wan_connected = true;
     if let Err(err) = wait_for_wan(&state.hive_id, hive_id, Duration::from_secs(60)) {
@@ -23686,7 +23766,7 @@ mod tests {
     /// This pins the symmetry by reading the source, because the three flows are ~1000 lines
     /// apart and a divergence between them is invisible at a glance.
     #[test]
-    fn every_join_flow_pushes_both_core_and_vendor() {
+    fn every_join_flow_pushes_core_vendor_and_links_its_syncthing_peer() {
         let src = include_str!("sy_orchestrator.rs");
         for (flow, next) in [
             ("async fn add_hive_flow", "async fn add_egress_hive_flow"),
@@ -23707,6 +23787,13 @@ mod tests {
                 body.contains("sync_vendor_to_worker("),
                 "{flow} must push vendor — without it the hive never gets syncthing, and the \
                  vendor arrives THROUGH syncthing, so it can never self-repair"
+            );
+            assert!(
+                body.contains("ensure_syncthing_peer_link_runtime("),
+                "{flow} must link the spoke's Syncthing device — without it motherbee's \
+                 per-role dist folder lists only motherbee, so the hive joins fine and can then \
+                 NEVER be updated: `update category=core` finds its dist unchanged and silently \
+                 does nothing, forever"
             );
         }
     }
