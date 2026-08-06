@@ -4901,7 +4901,14 @@ fn ensure_dirs(
         ensure_dir_permissions_0750(&blob.path)?;
         ensure_dir_permissions_0750(&blob.path.join("public"))?;
     }
-    if blob.sync_enabled {
+    // The syncthing HOME must exist whenever syncthing will RUN — and it runs for BLOB sync or
+    // DIST sync (`ensure_blob_sync_runtime` takes both configs and starts the service if either
+    // needs it). Gating this on `blob.sync_enabled` alone broke the one role that has dist sync
+    // ON and blob sync OFF: the egress. Its unit was started with
+    // `WorkingDirectory=/var/lib/fluxbee/syncthing`, systemd could not chdir there, and the
+    // service failed 200/CHDIR in a restart loop forever — so the egress could never receive
+    // core or vendor at all.
+    if blob.sync_enabled || (dist.sync_enabled && dist_sync_tool_is_syncthing(dist)) {
         ensure_dir_permissions_0750(&blob.sync_data_dir)?;
     }
     if blob.sync_enabled && blob_sync_tool_is_syncthing(blob) {
@@ -23588,6 +23595,36 @@ mod tests {
         });
         let out = versions_comparison("motherbee", &[reference, legacy]);
         assert_eq!(out["verdict"], "match");
+    }
+
+    /// The syncthing HOME is created whenever syncthing will RUN, not only when BLOB sync is on.
+    ///
+    /// `ensure_blob_sync_runtime` starts the service if EITHER blob sync or dist sync needs it,
+    /// so gating the directory on `blob.sync_enabled` alone left exactly one role broken: the
+    /// egress, the only one with dist sync ON and blob sync OFF. Its unit was started with a
+    /// WorkingDirectory that did not exist and failed 200/CHDIR forever, so the box could never
+    /// receive core or vendor. Found on a real egress, invisible to every test.
+    #[test]
+    fn the_syncthing_home_is_created_for_dist_sync_not_just_blob_sync() {
+        let src = include_str!("sy_orchestrator.rs");
+        let start = src.find("fn ensure_dirs(").expect("ensure_dirs");
+        let end = src[start..]
+            .find("\nfn blob_sync_folder_path")
+            .map(|o| start + o)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        let gate = body
+            .find("ensure_dir_permissions_0750(&blob.sync_data_dir)")
+            .expect("la creacion del home de syncthing");
+        // Walk back to the `if` that guards it and assert dist is part of the condition.
+        let guard_start = body[..gate].rfind("if ").expect("su guard");
+        let guard = &body[guard_start..gate];
+        assert!(
+            guard.contains("dist.sync_enabled"),
+            "el home de syncthing debe crearse tambien cuando lo unico que lo necesita es el \
+             sync de DIST — si no, el egress arranca el servicio sin su WorkingDirectory. \
+             guard actual: {guard}"
+        );
     }
 
     /// Found by regenerating a hive from scratch, not by any test: `add_egress_hive_flow` was
