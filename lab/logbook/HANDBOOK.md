@@ -271,6 +271,26 @@ git config --global --add safe.directory /opt/fluxbee
 > El propio error sugiere `-buildvcs=false`. **No lo uses**: apaga el estampado de versión en los
 > binarios para tapar un problema de permisos. Arreglá la causa.
 
+### El toolchain vive en el `HOME` de quien compila
+
+`rustup` busca su metadata en `$HOME/.rustup`. Si ejecutás por guest-agent con un `HOME` que no es
+el del dueño del toolchain, te dice **"no installed toolchains"** con el directorio de la toolchain
+ahí mismo, presente y completo:
+
+```
+error: rustup could not choose a version of cargo to run, because one wasn't
+       specified explicitly, and no default is configured
+```
+
+No es que falte Rust: es que estás mirando el `.rustup` equivocado. En `fb-build` el toolchain es de
+`root`, así que el script de build empieza con `export HOME=/root` — y el `git fetch`, en cambio, va
+como `fluxops`, que es quien tiene la deploy key. Los dos usuarios son necesarios, cada uno en su
+paso.
+
+> Y si ya corriste git como `root` por error, devolvé los objetos antes de seguir, o el próximo
+> fetch como `fluxops` muere con `insufficient permission`:
+> `find /opt/fluxbee/.git -user root -exec chown fluxops:fluxops {} +`
+
 ### Verificá el `.deb` antes de confiar en él
 
 ```bash

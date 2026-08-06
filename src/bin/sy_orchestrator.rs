@@ -3090,8 +3090,14 @@ async fn wait_for_syncthing_folder_convergence(
 /// and the e2e scripts still send the historical `folder_id: "fluxbee-dist"`, and they should
 /// not have to know that the target now holds `fluxbee-dist-core-<role>` plus `-vendor`, plus
 /// `-runtimes` only on a worker. The hive knows its own role, so it resolves the request here.
+///
+/// Resolves through `dist_sync_folders_for_hive`, NOT `dist_sync_folders_for_role`. On motherbee
+/// the per-role variant answers `fluxbee-dist-core-motherbee` — a folder motherbee never declares,
+/// because it does not sync to itself. That is the U-7 drift, and this caller was still on the
+/// wrong side of it after the watchdog was fixed: since a `dist` hint fans out over these ids and
+/// the first non-ok wins, the undeclared folder's 404 failed the WHOLE hint on motherbee.
 fn dist_sync_hint_folder_ids(state: &OrchestratorState, dist: &DistRuntimeConfig) -> Vec<String> {
-    dist_sync_folders_for_role(dist, state.role, state.is_motherbee)
+    dist_sync_folders_for_hive(dist, state.role, state.is_motherbee)
         .into_iter()
         .map(|f| f.id)
         .collect()
@@ -25665,6 +25671,73 @@ blob:
         let err = scope_core_manifest_to_components(&full, &["sy-nonexistent".to_string()])
             .expect_err("must reject a component absent from the manifest");
         assert!(err.to_string().contains("sy-nonexistent"));
+    }
+
+    /// Pins the CALLER, not the helper.
+    ///
+    /// The helper was always right; the defect was that this resolver called the other one. A
+    /// test that only checks `dist_sync_folders_for_hive` passes just as happily with the bug in
+    /// place — so read the source and assert which one the resolver actually reaches for, the
+    /// same way the join-flow symmetry test does.
+    #[test]
+    fn the_dist_sync_hint_resolves_through_the_hive_aware_helper() {
+        let src = include_str!("sy_orchestrator.rs");
+        let start = src
+            .find("fn dist_sync_hint_folder_ids(")
+            .expect("dist_sync_hint_folder_ids");
+        let end = src[start..]
+            .find("\n}")
+            .map(|o| start + o)
+            .expect("su cierre");
+        let body = &src[start..end];
+
+        assert!(
+            body.contains("dist_sync_folders_for_hive("),
+            "el hint tiene que resolver por el helper que sabe de motherbee"
+        );
+        assert!(
+            !body.contains("dist_sync_folders_for_role("),
+            "dist_sync_folders_for_role da fluxbee-dist-core-motherbee en motherbee: 404, y el \
+             primer no-ok hace fallar el hint entero"
+        );
+    }
+
+    /// U-7, and the residual that outlived its fix.
+    ///
+    /// Motherbee does not sync to itself, so it never declares `fluxbee-dist-core-motherbee`.
+    /// Asking syncthing about it returns 404 — which is how the watchdog logged a warn every five
+    /// seconds forever. The watchdog was fixed by routing it through `dist_sync_folders_for_hive`,
+    /// but the `dist` sync-hint resolver was still on `dist_sync_folders_for_role`, and there the
+    /// same 404 is worse than noisy: a hint fans out over these ids and the first non-ok wins, so
+    /// the undeclared folder failed the whole hint — the exact thing `update category=core` waits
+    /// on.
+    #[test]
+    fn motherbee_never_resolves_a_dist_folder_it_does_not_declare() {
+        let dist = sample_dist_config();
+        let carried = dist_sync_folders_for_hive(&dist, HiveRole::Motherbee, true);
+        let ids: Vec<&str> = carried.iter().map(|f| f.id.as_str()).collect();
+
+        assert!(
+            !ids.iter().any(|id| id.contains("motherbee")),
+            "motherbee does not sync to itself; asking syncthing for its own core folder is a 404: {ids:?}"
+        );
+        for role in ROLE_CORE_DIST_ROLES {
+            let expected = format!("{SYNCTHING_FOLDER_DIST_CORE_PREFIX}{}", role.as_str());
+            assert!(
+                ids.contains(&expected.as_str()),
+                "motherbee serves one core folder per spoke role; {expected} missing from {ids:?}"
+            );
+        }
+
+        // A spoke carries only its own, and must NOT be handed its siblings' folders.
+        let spoke = dist_sync_folders_for_hive(&dist, HiveRole::Ingress, false);
+        let spoke_ids: Vec<&str> = spoke.iter().map(|f| f.id.as_str()).collect();
+        assert!(spoke_ids
+            .contains(&format!("{SYNCTHING_FOLDER_DIST_CORE_PREFIX}ingress").as_str()));
+        assert!(
+            !spoke_ids.iter().any(|id| id.ends_with("worker") || id.ends_with("egress")),
+            "a spoke must not be asked to settle another role's folder: {spoke_ids:?}"
+        );
     }
 
     /// The path asymmetry is the trick that keeps every spoke-side constant untouched:
