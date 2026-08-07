@@ -1717,6 +1717,26 @@ async fn run_inbound_socket_mode(
                 )
                 .await;
 
+            // Compuerta de primer contacto (APAGADA por defecto, patron gate-then-forward de
+            // io.api): si el emisor todavia no esta registrado, se lo presenta al frontdesk y el
+            // mensaje sigue igual a su destino. Ver io_common::frontdesk_gate.
+            if let InboundOutcome::SendNow(ref relayed) = outcome {
+                let gate = io_common::frontdesk_gate::FrontdeskGateConfig::from_effective_config(
+                    control_plane.read().await.effective_config.as_ref(),
+                );
+                io_common::frontdesk_gate::gate_then_forward(
+                    &sender,
+                    &gate,
+                    &config.island_id,
+                    "slack",
+                    &slack_external_id(&config.node_name, &user),
+                    self_tenant_id.as_deref(),
+                    relayed.meta.src_ilk.as_deref(),
+                    relayed.routing.trace_id.as_str(),
+                )
+                .await;
+            }
+
             dispatch_inbound_outcome(sender.clone(), outcome, "direct inbound").await;
         }
     }

@@ -536,6 +536,8 @@ async fn main() -> Result<()> {
         identity,
         provisioner,
         inbound,
+        config.island_id.clone(),
+        self_tenant_id.clone(),
     ));
 
     // Outbound plane (Graph API). Text replies may carry blob-backed content (`content_ref`) resolved
@@ -796,6 +798,10 @@ async fn run_wapp_inbound_loop(
     identity: Arc<dyn IdentityResolver>,
     provisioner: Arc<dyn IdentityProvisioner>,
     inbound: Arc<Mutex<InboundProcessor>>,
+    // Para la compuerta de primer contacto (io_common::frontdesk_gate): el SHM de identidad se
+    // consulta por hive, y el tenant es el del nodo (el usuario externo pertenece a el).
+    hive_id: String,
+    self_tenant_id: Option<String>,
 ) -> Result<()> {
     let mut inbound_rx = dispatcher
         .take_command_receiver(RPC_CH_INBOUND)
@@ -898,6 +904,26 @@ async fn run_wapp_inbound_loop(
                     payload,
                 )
                 .await;
+            // Compuerta de primer contacto (APAGADA por defecto, patron gate-then-forward de
+            // io.api): si el emisor todavia no esta registrado, se lo presenta al frontdesk y el
+            // mensaje sigue igual a su destino. Ver io_common::frontdesk_gate.
+            if let InboundOutcome::SendNow(ref relayed) = outcome {
+                let gate = io_common::frontdesk_gate::FrontdeskGateConfig::from_effective_config(
+                    control_plane.read().await.effective_config.as_ref(),
+                );
+                io_common::frontdesk_gate::gate_then_forward(
+                    &sender,
+                    &gate,
+                    &hive_id,
+                    "whatsapp",
+                    &wapp_external_id(&wapp_msg.phone_number_id, &wapp_msg.from_wa_id),
+                    self_tenant_id.as_deref(),
+                    relayed.meta.src_ilk.as_deref(),
+                    relayed.routing.trace_id.as_str(),
+                )
+                .await;
+            }
+
             dispatch_inbound_outcome(&sender, outcome).await;
         }
     }

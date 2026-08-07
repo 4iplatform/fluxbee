@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod frontdesk_contract;
+pub mod frontdesk_gate;
 pub mod identity;
 pub mod inbound;
 pub mod io_adapter_config;
