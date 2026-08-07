@@ -651,6 +651,7 @@ solo**, sin intervención. Dos advertencias:
 | 22 | Puerto/unit equivocados | "se cayó el edge / el router / el admin" | `SY.edge` va en **:443**; en un spoke no hay `sy-router`; el admin es **loopback** |
 | 23 | `payload` de la API | Un `while` que gira sobre una operación exitosa | El `status` de arriba es el del sobre; lo real está bajo `payload.` |
 | 24 | `verify=19` en TLS local | "la cadena está rota" | Es falta de SNI. Probá con `--resolve` y un host que matchee el wildcard |
+| 25 | Runtime hot-publicado | El `.deb` sube y ese nodo queda en la versión vieja, **sin aviso** | El seed respeta tu `current` a propósito. Promovelo con `publish-runtime.sh --set-current` |
 
 ---
 
@@ -702,6 +703,45 @@ readlink /proc/$p/exe        # si dice "(deleted)" -> corre el binario VIEJO
 systemctl show -p ActiveEnterTimestamp --value sy-orchestrator   # debe ser POSTERIOR al update
 sha256sum /usr/bin/sy-orchestrator /var/lib/fluxbee/dist/core/bin/sy-orchestrator   # deben coincidir
 ```
+
+### ⚠️ Un runtime publicado en caliente NO avanza con el `.deb`
+
+El seed del paquete mueve `current` de cada runtime base a la versión nueva… **salvo el de un
+runtime que vos hayas publicado en caliente y cuyo directorio siga en disco**. Ahí lo respeta y
+publica la del paquete como *available* nada más:
+
+```text
+NOTE: base runtime io.api     'current' moved 0.1.13 -> 0.1.15 (package authority)
+NOTE: base runtime ai.generic 'current' moved 0.1.13 -> 0.1.15 (package authority)
+   ...y io.slack NO aparece en la lista
+```
+
+Es deliberado y correcto: si pisara tu `current`, cada upgrade te desharía el despliegue en
+silencio. Pero el efecto colateral es igual de silencioso al revés — **ese nodo se queda atrás y
+nada te avisa**. El paquete sube, todo lo demás avanza, y ese runtime sigue en la versión vieja.
+
+Verificá siempre después de un upgrade:
+
+```bash
+python3 -c "
+import json; m=json.load(open('/var/lib/fluxbee/dist/runtimes/manifest.json'))
+for k,v in m['runtimes'].items(): print(k, v['current'], v['available'])"
+```
+
+Para aceptar la del paquete, promovela con la misma herramienta que usa el seed, y reiniciá el
+nodo **por admin**:
+
+```bash
+sudo /usr/share/fluxbee/publish-runtime.sh --runtime io.slack --version 0.1.15 \
+     --binary /var/lib/fluxbee/dist/runtimes/io.slack/0.1.15/bin/io-slack \
+     --dist-root /var/lib/fluxbee/dist --set-current
+curl -sS -X POST "$ADMIN/hives/$HIVE/nodes/$NODE_ENC/restart" -d '{"confirm":true}'
+```
+
+> El `restart` por admin **sí** te lleva a `current` — pero recién desde 0.1.15. Antes resolvía la
+> última versión concreta guardada en vez de la intención (`requested_runtime_version: "current"`),
+> y encima reiniciaba la unit sin regenerarla: reportaba la versión nueva **corriendo el binario
+> viejo**.
 
 ### ⚠️ Cómo NO leer una falla donde no la hay
 
