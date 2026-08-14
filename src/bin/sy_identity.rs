@@ -109,7 +109,6 @@ const SHM_REG_STATUS_COMPLETE: u8 = 2;
 const SHM_TENANT_STATUS_PENDING: u8 = 0;
 const SHM_TENANT_STATUS_ACTIVE: u8 = 1;
 const SHM_TENANT_STATUS_SUSPENDED: u8 = 2;
-const MOTHERBEE_PACKAGED_NON_SYSTEM_NODES: &[&str] = &["IO.blob"];
 
 const MSG_ILK_PROVISION: &str = "ILK_PROVISION";
 const MSG_ILK_PROVISION_RESPONSE: &str = "ILK_PROVISION_RESPONSE";
@@ -5150,7 +5149,7 @@ fn system_nodes_for_hive(hive: &HiveFile) -> Result<Vec<String>, String> {
             return Err(format!("duplicate system node '{name}'"));
         }
         if !name.starts_with("SY.") {
-            if is_primary && MOTHERBEE_PACKAGED_NON_SYSTEM_NODES.contains(&name) {
+            if is_primary && fluxbee_sdk::is_allowed_non_sy_lifecycle_node(name) {
                 continue;
             }
             return Err(format!(

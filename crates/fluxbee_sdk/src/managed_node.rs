@@ -42,6 +42,47 @@ pub fn managed_node_instance_dir_with_root(
     Ok(root.into().join(kind).join(node_name))
 }
 
+/// Singletons que arranca el PAQUETE con su propia unit de systemd.
+///
+/// `base-nodes.json` los declara con `unit` y `role_gate`; systemd es el dueño de su ciclo de vida.
+/// Eso los distingue de los runtimes, que nacen por `run_node` y a los que el orquestador relanza.
+///
+/// Sirve para UNA sola cosa: que el barrido que relanza nodos persistidos **nunca los adopte**. Si
+/// lo hiciera habria dos duenos del mismo proceso y dos procesos con el mismo nombre L2 — y el
+/// router entrega al primero que matchea en el FIB, asi que un CONFIG_SET caeria en uno u otro sin
+/// determinismo.
+///
+/// OJO, no confundir con [`HIVE_YAML_NON_SY_LIFECYCLE_NODES`]: ser singleton empaquetado NO
+/// habilita a declararse como nodo de ciclo de vida en `hive.yaml`. Son dos permisos distintos y
+/// fusionarlos rompe un test que lo fija a proposito.
+pub const PACKAGED_SINGLETON_NODES: &[&str] = &["IO.blob", "IO.cloud"];
+
+/// Los unicos nodos NO-`SY.*` que `hive.yaml` acepta en su lista de nodos de ciclo de vida.
+///
+/// Mas restrictivo que [`PACKAGED_SINGLETON_NODES`] a proposito: `IO.cloud` es un singleton
+/// empaquetado pero NO participa del orden de arranque del hive, y declararlo ahi seria darle una
+/// responsabilidad que no tiene.
+pub const HIVE_YAML_NON_SY_LIFECYCLE_NODES: &[&str] = &["IO.blob"];
+
+/// True cuando el nombre L2 (con o sin `@hive`) es un singleton empaquetado.
+pub fn is_packaged_singleton(node_name: &str) -> bool {
+    node_matches(node_name, PACKAGED_SINGLETON_NODES)
+}
+
+/// True cuando `hive.yaml` puede listarlo como nodo de ciclo de vida sin ser `SY.*`.
+pub fn is_allowed_non_sy_lifecycle_node(node_name: &str) -> bool {
+    node_matches(node_name, HIVE_YAML_NON_SY_LIFECYCLE_NODES)
+}
+
+fn node_matches(node_name: &str, known: &[&str]) -> bool {
+    let local = node_name
+        .split_once('@')
+        .map(|(local, _)| local)
+        .unwrap_or(node_name)
+        .trim();
+    known.iter().any(|k| k.eq_ignore_ascii_case(local))
+}
+
 pub fn managed_node_config_path(node_name: &str) -> Result<PathBuf, ManagedNodeError> {
     Ok(managed_node_instance_dir(node_name)?.join("config.json"))
 }

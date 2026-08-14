@@ -76,7 +76,6 @@ const MSG_ILK_REGISTER: &str = "ILK_REGISTER";
 const MSG_ILK_UPDATE: &str = "ILK_UPDATE";
 const MSG_ILK_DELETE: &str = "ILK_DELETE";
 const LIFECYCLE_NODES_BOOTSTRAP_TIMEOUT_SECS: u64 = 60;
-const MOTHERBEE_PACKAGED_NON_SYSTEM_NODES: &[&str] = &["IO.blob"];
 const ADD_HIVE_SOCKET_READY_PROBE_TIMEOUT_SECS: u64 = 10;
 const SYNCTHING_SERVICE_NAME: &str = "fluxbee-syncthing";
 const SYNCTHING_BOOTSTRAP_TIMEOUT_SECS: u64 = 30;
@@ -4734,7 +4733,7 @@ fn validate_system_nodes(
         let name = raw_name.trim();
         let is_sy_node = name.starts_with("SY.");
         let is_packaged_non_system_node =
-            is_motherbee && MOTHERBEE_PACKAGED_NON_SYSTEM_NODES.contains(&name);
+            is_motherbee && fluxbee_sdk::is_allowed_non_sy_lifecycle_node(name);
         if !is_sy_node && !is_packaged_non_system_node {
             return Err(format!(
                 "invalid hive.yaml: lifecycle node '{}' must use SY.* naming or be an allowlisted motherbee packaged node",
@@ -9985,6 +9984,23 @@ fn node_kind_from_name(name: &str) -> String {
 
 fn managed_spawn_disallowed_reason(node_name: &str) -> Option<&'static str> {
     let local = node_name.split('@').next().unwrap_or(node_name).trim();
+    // Un singleton empaquetado ya tiene dueño de ciclo de vida: su unit de systemd. Adoptarlo como
+    // instancia gestionada crearia DOS duenos del mismo proceso.
+    //
+    // Y los guards que deberian frenar eso no alcanzan: el antidoble-arranque pregunta por una unit
+    // `fluxbee-node-<nombre>` que para un singleton no existe (siempre false), y el otro es la
+    // visibilidad en el LSA del router, que es una carrera y no una regla. El resultado seria dos
+    // procesos con el mismo nombre L2 — y el router entrega al primero que matchea en el FIB, asi
+    // que un CONFIG_SET caeria en uno u otro de forma no determinista.
+    //
+    // Hasta ahora esto no explotaba solo porque ningun singleton tenia config.json: nada que
+    // barrer. Eso es una proteccion accidental, no un contrato — y se cae en cuanto uno gana plano
+    // de control, que es justo lo que hace io.cloud.
+    if fluxbee_sdk::is_packaged_singleton(local) {
+        return Some(
+            "managed spawn does not support packaged singletons; systemd owns their lifecycle",
+        );
+    }
     let kind = node_kind_from_name(node_name);
     match kind.as_str() {
         "SY" => Some("managed spawn does not support SY.* nodes"),
@@ -25822,6 +25838,39 @@ blob:
             !body.contains("resolve_runtime_version(&manifest, &runtime_key, &node.runtime_version)"),
             "resolver la version CONCRETA guardada re-pinnea un nodo que sigue a current"
         );
+    }
+
+    /// Un singleton empaquetado NUNCA puede ser adoptado como instancia gestionada.
+    ///
+    /// Systemd ya es dueño de su ciclo de vida. Si el barrido que relanza nodos persistidos lo
+    /// adoptara habria dos duenos del mismo proceso y dos procesos con el mismo nombre L2 — y el
+    /// router entrega al primero que matchea en el FIB, asi que un CONFIG_SET caeria en uno u otro
+    /// sin determinismo.
+    ///
+    /// Hasta ahora no explotaba porque ningun singleton tenia config.json: no habia nada que
+    /// barrer. Proteccion accidental, no contrato. Se cae en cuanto uno gana plano de control.
+    #[test]
+    fn un_singleton_empaquetado_nunca_se_adopta_como_instancia_gestionada() {
+        for nombre in [
+            "IO.cloud@motherbee",
+            "IO.blob@motherbee",
+            "io.cloud@motherbee",
+            "IO.cloud",
+        ] {
+            assert!(
+                managed_spawn_disallowed_reason(nombre).is_some(),
+                "{nombre} tiene unit propia: el orquestador no puede ser su segundo dueño"
+            );
+            assert!(!managed_reconcile_candidate_allowed(nombre));
+        }
+
+        // Los runtimes de verdad siguen siendo adoptables — es su unico camino de arranque.
+        for nombre in ["IO.slack.default@motherbee", "AI.chat@motherbee", "WF.router@motherbee"] {
+            assert!(
+                managed_spawn_disallowed_reason(nombre).is_none(),
+                "{nombre} es un runtime: el boot pass TIENE que relanzarlo"
+            );
+        }
     }
 
     /// U-7, and the residual that outlived its fix.

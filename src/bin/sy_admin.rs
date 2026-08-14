@@ -9694,6 +9694,18 @@ fn admin_action_body_required_fields(action: &str) -> Vec<serde_json::Value> {
                 "Admin SSH login on the empty target box for the initial bootstrap. Required (no default). The orchestrator uses it key-first, falling back to the password channel (ssh_password) only on a fresh box; it is never stored.",
             ),
         ],
+        "publish_cloud_endpoint" => vec![
+            admin_action_body_field(
+                "edge_node",
+                "string",
+                "Required. The SY.edge L2 name to publish on (e.g. SY.edge@ingress1).",
+            ),
+            admin_action_body_field(
+                "cloud_node",
+                "string",
+                "Optional. The IO.cloud instance to publish; defaults to IO.cloud@<hive>.",
+            ),
+        ],
         "publish_runtime_package" => vec![admin_action_body_field(
             "source",
             "object",
