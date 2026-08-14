@@ -4454,7 +4454,7 @@ async fn unpublish_edge_blob(
 /// documentado en `handle_externalize`, y esta accion deliberadamente no lo ofrece.
 async fn handle_publish_cloud_endpoint(
     ctx: &AdminContext,
-    client: &Arc<RouterDispatcher>,
+    client: &RouterDispatcher,
     params: serde_json::Value,
 ) -> Result<InternalAdminDispatchResult, AdminError> {
     let get_str = |key: &str| {
@@ -4518,7 +4518,7 @@ async fn handle_publish_cloud_endpoint(
 
 async fn handle_externalize(
     ctx: &AdminContext,
-    client: &Arc<RouterDispatcher>,
+    client: &RouterDispatcher,
     params: serde_json::Value,
     caller_l2_name: Option<&str>,
 ) -> Result<InternalAdminDispatchResult, AdminError> {
@@ -7127,6 +7127,15 @@ async fn handle_hive_paths(
             };
             let (status, resp) = handle_hive_update_command(ctx, client, hive, payload).await?;
             Ok(Some((status, resp)))
+        }
+        ("POST", ["cloud", "endpoint"]) => {
+            let payload = if body.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_slice(body)?
+            };
+            let result = handle_publish_cloud_endpoint(ctx, client, payload).await?;
+            Ok(Some((result.http_status, result.envelope.to_string())))
         }
         ("POST", ["sync-hint"]) => {
             let payload = if body.is_empty() {
