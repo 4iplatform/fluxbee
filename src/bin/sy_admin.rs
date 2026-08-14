@@ -96,6 +96,7 @@ const ADMIN_EXECUTOR_PILOT_ACTIONS: &[&str] = &[
     "set_ilk_definition",
     "delete_ilk",
     "publish_runtime_package",
+    "publish_cloud_endpoint",
     "sync_hint",
     "update",
     "add_route",
@@ -3286,7 +3287,7 @@ struct InternalActionSpec {
     allow_legacy_hive_id: bool,
 }
 
-const INTERNAL_ACTION_REGISTRY_VERSION: &str = "10";
+const INTERNAL_ACTION_REGISTRY_VERSION: &str = "11";
 
 const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
     InternalActionSpec {
@@ -3666,6 +3667,12 @@ const INTERNAL_ACTION_REGISTRY: &[InternalActionSpec] = &[
         action: "update",
         route: InternalActionRoute::Update,
         requires_target: true,
+        allow_legacy_hive_id: false,
+    },
+    InternalActionSpec {
+        action: "publish_cloud_endpoint",
+        route: InternalActionRoute::Command("publish_cloud_endpoint"),
+        requires_target: false,
         allow_legacy_hive_id: false,
     },
     InternalActionSpec {
@@ -4425,6 +4432,90 @@ async fn unpublish_edge_blob(
 /// Still deferred (v6 §12): the durable `ICH` "externalized" attribute in `SY.identity`
 /// for reconstruction after an Edge reimage. Shared-secret token minting and Edge-owned Vault
 /// persistence are implemented below.
+/// Abre la puerta publica de Fluxbee Cloud y devuelve el token UNA sola vez.
+///
+/// `IO.cloud` es el relay de aprovisionamiento de Fluxbee Cloud: su endpoint expone
+/// `create_tenant`, `vault_put` y `run_node`, protegidos por un unico bearer. Esta accion es el
+/// bootstrap de esa puerta, y esta acotada a eso a proposito — no es un externalize generico.
+///
+/// # Por que devuelve el token en vez de dejarlo leer despues
+///
+/// El secreto del canal se guarda en el vault bajo `edge_channel_secret:{ich}`, DEDICADO al ILK de
+/// SY.edge, y `authorize_read` no tiene bypass de admin: eso esta escrito a proposito y no se toca.
+/// Asi que el operador no LEE el token — lo ACUÑA y se lo lleva en el momento, que es el mismo
+/// camino que el codigo ya bendice para cualquier llamador del mint.
+///
+/// Consecuencia asumida y explicita: **el token se ve una sola vez**. Si se pierde, se vuelve a
+/// publicar y rota (la ventana de gracia del edge cubre a los clientes en vuelo). Que un secreto no
+/// se pueda releer y solo se pueda rotar es sano, no una limitacion.
+///
+/// No manda `secret`: dejar que admin lo acuñe es el camino por defecto, y el unico que garantiza
+/// que el valor nazca fuerte y viva solo en el vault. Pasar uno propio es el "explicit opt-out"
+/// documentado en `handle_externalize`, y esta accion deliberadamente no lo ofrece.
+async fn handle_publish_cloud_endpoint(
+    ctx: &AdminContext,
+    client: &Arc<RouterDispatcher>,
+    params: serde_json::Value,
+) -> Result<InternalAdminDispatchResult, AdminError> {
+    let get_str = |key: &str| {
+        params
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string)
+    };
+
+    let cloud_node = get_str("cloud_node")
+        .unwrap_or_else(|| format!("IO.cloud@{}", ctx.hive_id));
+    let Some(edge_node) = get_str("edge_node") else {
+        return Ok(internal_invalid_request(
+            "publish_cloud_endpoint",
+            "missing edge_node (the SY.edge L2 name to publish on, e.g. SY.edge@ingress1)",
+        ));
+    };
+
+    // El operador nombra el NODO; el ICH lo resolvemos nosotros.
+    let ich = match fluxbee_sdk::identity::list_ich_options_from_hive_config(&ctx.config_dir) {
+        Ok(options) => match resolve_ich_owned_by(options, &cloud_node) {
+            Ok(value) => value,
+            Err(detail) => {
+                return Ok(internal_invalid_request("publish_cloud_endpoint", &detail))
+            }
+        },
+        Err(err) => {
+            return Ok(internal_invalid_request(
+                "publish_cloud_endpoint",
+                &format!("identity SHM unavailable for channel resolve: {err}"),
+            ))
+        }
+    };
+
+    tracing::info!(
+        cloud_node = %cloud_node,
+        edge_node = %edge_node,
+        ich = %ich,
+        "publish_cloud_endpoint: abriendo la puerta publica de Fluxbee Cloud"
+    );
+
+    // Reusa el camino real (acuña -> guarda en vault -> manda solo el secret_ref al edge). El
+    // `caller_l2_name: None` es el camino interno confiable del servidor HTTP del operador, ya
+    // contemplado por authorize_channel_command.
+    handle_externalize(
+        ctx,
+        client,
+        serde_json::json!({
+            "ich": ich,
+            "edge_node": edge_node,
+            "auth_mode": "shared-secret",
+            "inbound_family": "user",
+            "methods": ["POST"],
+        }),
+        None,
+    )
+    .await
+}
+
 async fn handle_externalize(
     ctx: &AdminContext,
     client: &Arc<RouterDispatcher>,
@@ -4707,6 +4798,36 @@ async fn handle_externalize(
             &format!("edge unreachable / open_url failed for '{ich}': {err}"),
         )),
     }
+}
+
+/// El ICH que posee un nodo, buscando por dueño (el inverso de `resolve_externalize_owner`).
+///
+/// Existe para `publish_cloud_endpoint`: el operador abre la puerta de Fluxbee Cloud nombrando el
+/// NODO, no un `ich:<uuid>` que no tiene por que conocer. Aplica el mismo requisito de canal
+/// habilitado, para que la puerta publica nunca se abra sobre un canal deshabilitado.
+fn resolve_ich_owned_by(
+    options: Vec<fluxbee_sdk::identity::IdentityIchOption>,
+    owner_l2_name: &str,
+) -> Result<String, String> {
+    let mut seen_disabled = false;
+    for option in options {
+        if option.owner_l2_name.as_deref() != Some(owner_l2_name) {
+            continue;
+        }
+        if !option.enabled {
+            seen_disabled = true;
+            continue;
+        }
+        return Ok(option.ich_id);
+    }
+    if seen_disabled {
+        return Err(format!(
+            "'{owner_l2_name}' has a channel but it is disabled; enable it before publishing"
+        ));
+    }
+    Err(format!(
+        "'{owner_l2_name}' has no registered channel in identity — is the node running?"
+    ))
 }
 
 fn resolve_externalize_owner(
@@ -5008,6 +5129,11 @@ async fn dispatch_internal_admin_command(
         // (v6 §7). Authz gate CLOSED (v6 §11.1): IO.* + owner==caller, enforced in the handler.
         "externalize" => {
             return handle_externalize(ctx, client, params, caller_l2_name).await;
+        }
+        // publish_cloud_endpoint — el bootstrap de la puerta publica de Fluxbee Cloud. Vive al lado
+        // de externalize porque lo reusa; acotado a IO.cloud y devuelve el token UNA vez.
+        "publish_cloud_endpoint" => {
+            return handle_publish_cloud_endpoint(ctx, client, params).await;
         }
         "unexternalize" => {
             return handle_unexternalize(ctx, client, params, caller_l2_name).await;
@@ -8951,6 +9077,7 @@ fn admin_action_summary(action: &str) -> &'static str {
         }
         "get_admin_action_help" => "Return help metadata for one admin action.",
         "publish_runtime_package" => "Publish one runtime package into dist/manifest on motherbee.",
+        "publish_cloud_endpoint" => "Open IO.cloud's public Fluxbee Cloud endpoint on an edge and return its bearer token ONCE (admin mints it, the vault stores it, the edge only ever gets a reference). The token cannot be read back afterwards: if it is lost, publish again to rotate.",
         "publish_artifact" => {
             "Publish an existing BlobRef through SY.edge. Mesh-only: the router-stamped AI.*, IO.* or WF.* caller becomes the publication owner."
         }
@@ -9174,6 +9301,7 @@ fn admin_action_path_patterns(action: &str) -> Vec<&'static str> {
         "list_admin_actions" => vec!["GET /admin/actions"],
         "get_admin_action_help" => vec!["GET /admin/actions/{action}"],
         "publish_runtime_package" => vec!["POST /admin/runtime-packages/publish"],
+        "publish_cloud_endpoint" => vec!["POST /hives/{hive}/cloud/endpoint"],
         "hive_status" => vec!["GET /hive/status"],
         "list_hives" => vec!["GET /hives"],
         "get_hive" => vec!["GET /hives/{hive}"],
@@ -16992,7 +17120,11 @@ mod tests {
         let (status, body) = build_admin_action_help_response("unpublish_artifact");
         assert_eq!(status, 200);
         let body: Value = serde_json::from_str(&body).expect("valid action help response");
-        assert_eq!(body["payload"]["registry_version"], json!("10"));
+        assert_eq!(
+            body["payload"]["registry_version"],
+            json!(INTERNAL_ACTION_REGISTRY_VERSION),
+            "el help tiene que reportar la version viva del registry"
+        );
         assert_eq!(
             body["payload"]["entry"]["request_contract"]["admin_rpc"]["action"],
             json!("unpublish_artifact")

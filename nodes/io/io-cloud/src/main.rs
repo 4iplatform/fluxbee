@@ -126,20 +126,34 @@ async fn main() -> Result<(), DynError> {
     // Hoisted so run_loop can family-gate the inbound (FIX-16).
     let inbound_family = env_or("IO_CLOUD_INBOUND_FAMILY", "user");
     if let Some(edge_node) = cloud_edge_node.as_deref() {
-        // The configured Cloud service token is the alpha trust anchor: edge verifies it before
+        // The Cloud service token is the alpha trust anchor: the edge verifies it before
         // forwarding and strips Authorization at the frontier. There is intentionally no public
         // fallback for this mutation endpoint.
-        let service_token = env("IO_CLOUD_SECRET").ok_or(
-            "IO_CLOUD_SECRET is required when IO_CLOUD_EDGE_NODE is set (Cloud endpoint is shared-secret only)",
-        )?;
-        let params = json!({
+        //
+        // Por defecto NO se manda `secret`: SY.admin lo acuña fuerte, lo guarda en el vault bajo
+        // `edge_channel_secret:{ich}` (propiedad del ILK del edge) y al edge le manda SOLO el
+        // `secret_ref` — el valor nunca viaja ni se persiste afuera del vault. Es el camino por
+        // defecto del propio admin; pasar uno es lo que su comentario llama "an explicit opt-out".
+        //
+        // Exigirlo era un defecto: obligaba al operador a inventar un secreto y dejarlo en el
+        // entorno del proceso o en un archivo en disco, que es justo lo que el vault existe para
+        // evitar. `IO_CLOUD_SECRET` sigue disponible para fijar un token concreto (migraciones,
+        // un valor que un cliente externo ya tiene), pero ya no es obligatorio.
+        let service_token = env("IO_CLOUD_SECRET");
+        let mut params = json!({
             "ich": own_ich,
             "edge_node": edge_node,
             "inbound_family": inbound_family,
             "auth_mode": "shared-secret",
-            "secret": service_token,
             "methods": ["POST"],
         });
+        if let Some(token) = service_token {
+            tracing::warn!(
+                "IO_CLOUD_SECRET set: pinning a caller-supplied token instead of letting SY.admin \
+                 mint one into the vault (explicit opt-out)"
+            );
+            params["secret"] = json!(token);
+        }
         tokio::spawn(publish_channel_on_edge_with_retry(
             dispatcher.clone(),
             admin_target.clone(),
