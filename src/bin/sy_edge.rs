@@ -354,7 +354,11 @@ async fn main() -> Result<(), SyEdgeError> {
     // FIX-6 (part 2): active reaper. Part 1 drops expired public-artifact rows at LOAD; this
     // periodically prunes them from the live registry AND persists the pruned ledger, so a
     // long-lived edge doesn't accumulate expired rows (bounds the served set + on-disk ledger).
-    // On a non-ingress edge the registry is empty, so this is a cheap no-op.
+    // Scope: the EDGE's own state only — reclaiming the public/ bytes and retiring the
+    // authoritative admin ledger is SY.admin's expiry sweep (run_publication_expiry_sweep), which
+    // drives MSG_EDGE_UNPUBLISH_BLOB (idempotent here — a row this reaper already dropped just
+    // replies removed:false) + MSG_BLOB_RELEASE. On a non-ingress edge the registry is empty, so
+    // this is a cheap no-op.
     {
         let reaper_registry = Arc::clone(&public_registry);
         let reaper_path = config.publications_path.clone();
@@ -1127,10 +1131,11 @@ fn load_public_registry(path: &std::path::Path) -> HashMap<String, PublicArtifac
         .filter(|row| {
             // FIX-6: drop already-expired rows at load. They are un-servable (the serve path
             // rejects expires_at <= now) but were previously re-residented into the registry on
-            // EVERY restart, growing it unbounded and pinning the referenced public/ bytes. NOTE:
-            // this bounds the in-memory registry; an active reaper that also deletes the public/
-            // bytes + prunes the on-disk ledger via the unpublish/MSG_BLOB_RELEASE path is the
-            // complementary follow-up (part 2).
+            // EVERY restart, growing it unbounded and pinning the referenced public/ bytes. This
+            // bounds the edge's in-memory registry; the active reaper (part 2, below) also prunes
+            // the on-disk ledger on a live edge. Reclaiming the public/ BYTES + retiring the
+            // authoritative admin ledger is SY.admin's job — its expiry sweep drives the same
+            // MSG_EDGE_UNPUBLISH_BLOB + MSG_BLOB_RELEASE path at TTL (run_publication_expiry_sweep).
             if row.expires_at <= now {
                 tracing::info!(key = %row.key, "sy-edge: dropping expired public artifact row at load");
                 false

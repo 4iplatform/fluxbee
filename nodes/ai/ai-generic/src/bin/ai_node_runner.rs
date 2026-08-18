@@ -31,8 +31,8 @@ use fluxbee_sdk::managed_control_plane::{
     DEFAULT_MANAGED_NODES_ROOT,
 };
 use fluxbee_sdk::{
-    managed_node_instance_dir, managed_node_name, NodeConfig, NodeUuidMode, OperationalRouteProfile,
-    RouteMatch, RouteTarget, RouterDispatcher, VaultCallerOwned, VaultClient,
+    managed_node_instance_dir, managed_node_name, AdminCommandRequest, NodeConfig, NodeUuidMode,
+    OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, VaultCallerOwned, VaultClient,
 };
 use fluxbee_sdk::{MSG_ILK_REGISTER, MSG_TNT_CREATE};
 use serde::{Deserialize, Serialize};
@@ -657,6 +657,15 @@ struct GenerateMarkdownArtifactTool;
 
 #[derive(Clone)]
 struct GenerateHtmlArtifactTool;
+
+/// Publishes an HTML page as a public, read-only URL. Unlike the `generate_*` tools (which
+/// only produce a downloadable artifact), this one ACTS: it writes the bytes to the blob
+/// store and drives `SY.admin`'s `publish_artifact` over the mesh socket, returning the
+/// capability URL. Only registered when the node has a resolved identity (`vault` present),
+/// because publishing is tenant-scoped by the producer's router-stamped identity (admin-side).
+struct PublishHtmlTool {
+    vault: VaultClient,
+}
 
 #[derive(Clone)]
 struct GeneratePdfArtifactTool;
@@ -1555,6 +1564,15 @@ impl GenericAiNode {
         registry.register(Arc::new(GenerateDocxArtifactTool))?;
         registry.register(Arc::new(GeneratePngArtifactTool))?;
         registry.register(Arc::new(GenerateJpegArtifactTool))?;
+        // Publishing ACTION: expose it only when the node has a resolved identity (vault).
+        // Publishing is tenant-scoped by the producer's router-stamped identity (resolved
+        // admin-side), and vault is Some exactly when that identity is present — so a node
+        // without identity simply has no publish tool (no dead/unreachable action).
+        if let Some(vault) = self.vault.as_ref() {
+            registry.register(Arc::new(PublishHtmlTool {
+                vault: vault.clone(),
+            }))?;
+        }
         Ok(())
     }
 
@@ -3834,6 +3852,147 @@ impl FunctionTool for GenerateHtmlArtifactTool {
                 .or_else(|| Some(format!("Aca esta el archivo solicitado: {}", filename))),
             vec![artifact],
         )
+    }
+}
+
+/// Soft tool error (returned as an `Ok(Value)` tool result so the model can react, never a
+/// hard failure). Mirrors `invalid_tool_artifact_error`'s shape.
+fn publish_tool_error(message: &str, retryable: bool) -> Value {
+    json!({
+        "status": "error",
+        "error_code": "publish_failed",
+        "message": format!("publish_html_page: {message}"),
+        "retryable": retryable
+    })
+}
+
+#[async_trait]
+impl FunctionTool for PublishHtmlTool {
+    fn definition(&self) -> FunctionToolDefinition {
+        FunctionToolDefinition {
+            name: "publish_html_page".to_string(),
+            description: "Publish a self-contained HTML page as a public, read-only URL and \
+                return the link. Use ONLY when the user explicitly asks to publish or share a \
+                page publicly. The HTML must be self-contained (no external network); the \
+                returned URL is a capability link you should give back to the user."
+                .to_string(),
+            parameters_json_schema: json!({
+                "type": "object",
+                "properties": {
+                    "filename": { "type": "string", "minLength": 1 },
+                    "content": {
+                        "type": "string",
+                        "description": "the full self-contained HTML document"
+                    }
+                },
+                "required": ["filename", "content"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn call(&self, arguments: Value) -> fluxbee_ai_sdk::Result<Value> {
+        let args: GenerateHtmlArtifactArgs = serde_json::from_value(arguments)
+            .map_err(|err| invalid_tool_args_error("publish_html_page", err))?;
+        let filename = args.filename.trim();
+        // Validate with the same gate as generate_html_artifact (mime / extension / traversal).
+        let artifact = match AiUserArtifact::from_html(filename, args.content) {
+            Ok(artifact) => artifact,
+            Err(err) => return Ok(invalid_tool_artifact_error("publish_html_page", err)),
+        };
+        // Write bytes into the local blob store (staging -> active), mirroring
+        // materialize_user_artifacts exactly so there is no divergence. Backend errors can carry
+        // filesystem paths, so they are LOGGED, never handed to the model — it gets a coarse reason.
+        let blob = match fluxbee_sdk::blob::BlobToolkit::new(fluxbee_sdk::blob::BlobConfig::default())
+        {
+            Ok(blob) => blob,
+            Err(err) => {
+                tracing::warn!(tool = "publish_html_page", error = %err, "blob store unavailable");
+                return Ok(publish_tool_error("could not open the local blob store", true));
+            }
+        };
+        let blob_ref = match blob.put_bytes(&artifact.bytes, &artifact.filename, &artifact.mime) {
+            Ok(blob_ref) => blob_ref,
+            Err(err) => {
+                tracing::warn!(tool = "publish_html_page", error = %err, "blob write failed");
+                return Ok(publish_tool_error("could not store the page for publishing", true));
+            }
+        };
+        if let Err(err) = blob.promote(&blob_ref) {
+            tracing::warn!(tool = "publish_html_page", error = %err, "blob promote failed");
+            return Ok(publish_tool_error("could not store the page for publishing", true));
+        }
+        // Publish via SY.admin over the mesh socket. Admin resolves THIS node's tenant from its
+        // router-stamped identity (never asserted here), curates the bytes, and pushes the edge row.
+        // SY.admin + the io.blob curator are a motherbee singleton, so the target defaults to
+        // SY.admin@motherbee (overridable via AI_ADMIN_TARGET) — NOT this node's own hive, which may
+        // be a spoke with no admin/curator (mirrors io-api's admin_target default).
+        let admin_target = std::env::var("AI_ADMIN_TARGET")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "SY.admin@motherbee".to_string());
+        match self
+            .vault
+            .dispatcher()
+            .send_admin_rpc(AdminCommandRequest {
+                admin_target: &admin_target,
+                action: "publish_artifact",
+                target: None,
+                params: json!({ "blob_ref": blob_ref }),
+                request_id: None,
+                timeout: std::time::Duration::from_secs(120),
+            })
+            .await
+        {
+            Ok(result) if result.status == "ok" => {
+                // The capability link MUST be an absolute public_url. If admin has no public base URL
+                // configured it returns only a host-less relative path — unusable as a link — so we
+                // fail soft rather than hand the model a broken URL to give the user.
+                let url = result
+                    .payload
+                    .get("public_url")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let Some(url) = url else {
+                    tracing::warn!(
+                        tool = "publish_html_page",
+                        "admin returned no absolute public_url (public_base_url unset); page stored but unreachable"
+                    );
+                    return Ok(publish_tool_error(
+                        "publishing is not fully configured on this hive (no public URL); the page was not published",
+                        false,
+                    ));
+                };
+                tracing::info!(tool = "publish_html_page", url = %url, "published HTML page");
+                Ok(json!({
+                    "status": "ok",
+                    "url": url,
+                    "publication_id": result.payload.get("publication_id"),
+                    "expires_at": result.payload.get("expires_at"),
+                    "note": "Page published. Give this URL to the user in your reply."
+                }))
+            }
+            Ok(result) => {
+                // Log the free-form error_detail (it may name internal nodes/paths); hand the model
+                // only the coarse, non-sensitive error_code (e.g. UNAUTHORIZED, BLOB_CURATE_FAILED).
+                if let Some(detail) = result.error_detail.as_ref() {
+                    tracing::warn!(tool = "publish_html_page", detail = %detail, "publish rejected");
+                }
+                let reason = result
+                    .error_code
+                    .clone()
+                    .filter(|code| !code.is_empty())
+                    .map(|code| format!("publish rejected ({code})"))
+                    .unwrap_or_else(|| "publish rejected".to_string());
+                Ok(publish_tool_error(&reason, false))
+            }
+            Err(err) => {
+                tracing::warn!(tool = "publish_html_page", error = %err, target = %admin_target, "publish request failed");
+                Ok(publish_tool_error("could not reach the publishing service", true))
+            }
+        }
     }
 }
 

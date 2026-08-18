@@ -5,8 +5,13 @@ Run this in your NORMAL Mac terminal (the one that CAN reach the Proxmox host).
 Claude Code's sandboxed Bash only shares 127.0.0.1 with your shell and cannot
 see the VMware host-only network, so this bridges them:
 
-    python3 lab/pve-forward.py                       # 127.0.0.1:8006 -> 192.168.4.165:8006
-    python3 lab/pve-forward.py 8006 192.168.4.165 8006
+    python3 lab/pve-forward.py                       # PROD: 127.0.0.1:8006 -> 192.168.8.207:8006 (default)
+    python3 lab/pve-forward.py 8006 192.168.4.165 8006   # DEV/lab: PC-004-165
+    python3 lab/pve-forward.py 8006 192.168.4.157 8006   # DEV/lab: PC-004-157 (hives 240-243)
+
+Environments (see lab/logbook/METHOD.md §1): PROD = 192.168.8.207 (node `pve`, token
+`ai-agent@pve!vscode`); DEV/lab = 192.168.4.165 / .157 (token `dev_coa@pve!claude-token`).
+Default target below is PROD; pass the DEV IP as arg 2 to bridge the lab instead.
 
 Leave it running (Ctrl-C to stop). Raw TCP passthrough — Proxmox's TLS
 terminates at the real host, so `curl -k` / pve.py (PVE_HOST=127.0.0.1) work
@@ -15,7 +20,7 @@ unchanged. Bind extra ports the same way if you ever want a second path.
 import sys, socket, threading
 
 LPORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8006
-RHOST = sys.argv[2] if len(sys.argv) > 2 else "192.168.4.165"
+RHOST = sys.argv[2] if len(sys.argv) > 2 else "192.168.8.207"
 RPORT = int(sys.argv[3]) if len(sys.argv) > 3 else 8006
 
 

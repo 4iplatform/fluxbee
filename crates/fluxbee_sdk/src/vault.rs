@@ -693,6 +693,13 @@ impl VaultClient {
         &self.hive_id
     }
 
+    /// The canonical router dispatcher this client rides on. Exposed so in-mesh tools
+    /// (e.g. the AI publish action) can send an `ADMIN_COMMAND` to `SY.admin` over the
+    /// same socket without the node threading a second dispatcher handle.
+    pub fn dispatcher(&self) -> &std::sync::Arc<RouterDispatcher> {
+        &self.dispatcher
+    }
+
     /// Vault target node for this client's hive: `SY.vault@<hive>`.
     fn vault_target(&self) -> String {
         format!("SY.vault@{}", self.hive_id)

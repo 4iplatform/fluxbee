@@ -68,6 +68,10 @@ const PUBLICATION_LEDGER_SCHEMA_VERSION: u32 = 1;
 const PUBLICATION_DEFAULT_EXPIRES_SECS: u64 = 86_400;
 const PUBLICATION_MAX_EXPIRES_SECS: u64 = 30 * 86_400;
 const PUBLICATION_MIN_EXPIRES_SECS: u64 = 60;
+/// How often the admin-side expiry reaper (`run_publication_expiry_sweep`) wakes to retire
+/// publications whose `expires_at` has passed. 10 min — coarse on purpose: TTLs are ≥60s but
+/// measured in hours/days, so a late reap is harmless and a tight loop would only add churn.
+const PUBLICATION_EXPIRY_SWEEP_SECS: u64 = 600;
 const MSG_ADMIN_COMMAND: &str = "ADMIN_COMMAND";
 const MSG_ADMIN_COMMAND_RESPONSE: &str = "ADMIN_COMMAND_RESPONSE";
 const ADMIN_EXECUTOR_CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -653,6 +657,7 @@ async fn main() -> Result<(), AdminError> {
     };
     let internal_ctx = http_ctx.clone();
     let system_ctx = http_ctx.clone();
+    let sweep_ctx = http_ctx.clone();
     let http_client = router_client.clone();
     tokio::spawn(async move {
         if let Err(err) = run_http_server(&admin_listen, &http_tx, http_ctx, http_client).await {
@@ -692,6 +697,11 @@ async fn main() -> Result<(), AdminError> {
     // Vault changes arrive via VAULT_SECRET_CHANGED broadcasts handled in
     // `handle_system_command` (`handle_vault_secret_changed_admin`). No
     // polling loop.
+
+    let sweep_client = router_client.clone();
+    tokio::spawn(async move {
+        run_publication_expiry_sweep(sweep_ctx, sweep_client).await;
+    });
 
     future::pending::<()>().await;
     Ok(())
@@ -896,6 +906,10 @@ fn admin_executor_log_dir(state_dir: &Path, hive_id: &str) -> PathBuf {
 // trail, queryable via `list_recent_commands` (GET /hives/{hive}/commands). Storage is an append-only
 // JSONL ring (`commands.jsonl` + rotations) — greppable on disk, size-bounded, params redacted with
 // the shared `redact_executor_log_value` (secret-like field names + vault values NEVER written).
+// SECOND seam (`append_internal_dispatch_log`): publish/unpublish/externalize/unexternalize
+// deliberately bypass `handle_admin_command` (they route straight through
+// `dispatch_internal_admin_command` or they'd time out at SY.config.routes), so they append
+// there instead — same entry shape, same lock, so the trail stays uniform and single-per-command.
 // NOT captured (separate code paths, documented in list_recent_commands help): runtime rollout
 // `update`/`sync_hint`, and orchestrator-AUTONOMOUS actions (respawn/reconcile) that never pass
 // through admin.
@@ -1002,6 +1016,65 @@ fn append_admin_command_log_locked(state_dir: &Path, entry: &AdminCommandLogEntr
     if let Err(err) = result {
         tracing::warn!(error = %err, "command-log: append failed; entry dropped");
     }
+}
+
+/// Audit origin string for the command log: the router-stamped caller when the command arrived over
+/// L2 (`l2:<src>`), else the trusted internal path (operator HTTP / executor). Single source for both
+/// the `InternalActionRoute::Command` seam and the direct-dispatch actions below.
+fn command_log_origin(caller_l2_name: Option<&str>) -> String {
+    caller_l2_name
+        .map(|src| format!("l2:{src}"))
+        .unwrap_or_else(|| "internal".to_string())
+}
+
+/// Command-log append for an action that bypasses `handle_admin_command` — publish/unpublish/
+/// externalize/unexternalize go STRAIGHT through `dispatch_internal_admin_command` (they would time
+/// out if shipped to SY.config.routes), so the single append point in `handle_admin_command` never
+/// sees them. This is their audit hook: same entry shape, same lock, same swallow-on-error contract
+/// as the main seam, so the trail stays uniform. Reads `status`/`error_code` off the dispatch
+/// envelope (top-level on every `internal_*` helper) exactly like the `handle_admin_command` tail.
+fn append_internal_dispatch_log(
+    ctx: &AdminContext,
+    action: &str,
+    caller_l2_name: Option<&str>,
+    logged_params: serde_json::Value,
+    started: Instant,
+    result: &Result<InternalAdminDispatchResult, AdminError>,
+) {
+    let (http_status, status, error_code) = match result {
+        Ok(dispatch) => {
+            let status = dispatch
+                .envelope
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or(if dispatch.http_status < 400 { "ok" } else { "error" })
+                .to_string();
+            let error_code = dispatch
+                .envelope
+                .get("error_code")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            (dispatch.http_status, status, error_code)
+        }
+        Err(err) => (500u16, "error".to_string(), Some(err.to_string())),
+    };
+    let entry = AdminCommandLogEntry {
+        ts_ms: now_epoch_ms(),
+        ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        action: action.to_string(),
+        hive: Some(ctx.hive_id.clone()),
+        origin: command_log_origin(caller_l2_name),
+        params: logged_params,
+        status,
+        error_code,
+        http_status,
+        duration_ms: started.elapsed().as_millis() as u64,
+    };
+    let _guard = ctx
+        .command_log_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    append_admin_command_log_locked(&ctx.state_dir, &entry);
 }
 
 #[derive(Debug, Default, Clone)]
@@ -4067,9 +4140,17 @@ async fn handle_unpublish_artifact(
     caller_l2_name: Option<&str>,
 ) -> Result<InternalAdminDispatchResult, AdminError> {
     let action = "unpublish_artifact";
-    let caller = match authorize_artifact_publisher(caller_l2_name) {
-        Ok(caller) => caller,
-        Err(detail) => return Ok(internal_unauthorized(action, &detail)),
+    // Producer path (mesh, caller_l2_name = Some): gated to an IO./AI./WF. node and
+    // owner-checked below. Operator path (caller_l2_name = None, the trusted localhost HTTP
+    // server): may unpublish ANY publication (D2 — a deliberate operator escape hatch so a
+    // retired/renamed producer's publication can still be revoked; mirrors the None-bypass of
+    // the channel/externalize seams).
+    let caller: Option<String> = match caller_l2_name {
+        Some(_) => match authorize_artifact_publisher(caller_l2_name) {
+            Ok(caller) => Some(caller),
+            Err(detail) => return Ok(internal_unauthorized(action, &detail)),
+        },
+        None => None,
     };
     let request: UnpublishArtifactParams = match serde_json::from_value(params) {
         Ok(request) => request,
@@ -4089,13 +4170,19 @@ async fn handle_unpublish_artifact(
     let Some(mut record) = ledger.publications.get(&request.publication_id).cloned() else {
         return Ok(internal_invalid_request(action, "publication not found"));
     };
-    if record.publisher_l2_name != caller {
-        return Ok(internal_unauthorized(
-            action,
-            "a node may unpublish only its own publication",
-        ));
+    if let Some(caller) = &caller {
+        if record.publisher_l2_name != *caller {
+            return Ok(internal_unauthorized(
+                action,
+                "a node may unpublish only its own publication",
+            ));
+        }
     }
-    if record.status == "unpublished" {
+    // Both retired states are terminal no-ops: "unpublished" (explicit revoke) AND "expired" (the
+    // TTL sweep already reclaimed edge row + blob). Re-running the edge/blob RPCs on an expired
+    // record would be wasteful and would overwrite its terminal "expired" audit status with
+    // "unpublished".
+    if record.status == "unpublished" || record.status == "expired" {
         return Ok(InternalAdminDispatchResult {
             http_status: 200,
             envelope: serde_json::json!({
@@ -4417,6 +4504,121 @@ async fn unpublish_edge_blob(
     } else {
         Err(format!("edge unpublish rejected: {payload}"))
     }
+}
+
+/// Publication expiry GC (D4). Every publication carries a finite `expires_at` (always set —
+/// clamped `MIN..MAX` at publish, there is no "never" case), so this background reaper is what
+/// actually retires them. On a fixed interval it retires every publication whose deadline has
+/// passed, driving the SAME `edge_removed -> released` transition as an operator
+/// `unpublish_artifact` so both the edge allowlist row and the curated `public/` blob are
+/// reclaimed. It NEVER deletes ledger rows: a reaped publication settles at status `"expired"`
+/// (vs `"unpublished"` for an explicit revoke) so the audit trail survives.
+async fn run_publication_expiry_sweep(ctx: AdminContext, client: Arc<RouterDispatcher>) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(PUBLICATION_EXPIRY_SWEEP_SECS));
+    // A stalled tick (io.blob/edge transiently down) must not stack up a burst of catch-up
+    // sweeps — one late run covers the same backlog.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        if let Err(err) = sweep_expired_publications_once(&ctx, &client).await {
+            tracing::warn!("publication expiry sweep failed: {err}");
+        }
+    }
+}
+
+/// One reaper pass. Idempotent + crash-safe: each retirement mirrors `handle_unpublish_artifact`
+/// (edge unpublish -> persist `edge_removed` -> blob release -> persist `expired`), the ledger is
+/// written after every state change, and a row already at `unpublished`/`expired` — or already at
+/// `edge_removed` from a prior crash — resumes from where it stopped. A single record failing to
+/// retire (edge/io.blob transiently down) is logged and left for the next tick; it never blocks
+/// the rest of the batch. Returns `Err` only for a ledger load/persist failure (whole pass aborts).
+async fn sweep_expired_publications_once(
+    ctx: &AdminContext,
+    client: &Arc<RouterDispatcher>,
+) -> Result<(), String> {
+    // Snapshot the due set under a SHORT lock, then RELEASE it — never hold publication_lock across
+    // the network RPCs. The serial internal-admin loop (run_internal_admin_loop) and
+    // handle_publish/unpublish_artifact all contend on this lock; holding it across an unbounded
+    // batch of 30s edge/blob RPCs would head-of-line-block the whole admin control plane (a mesh
+    // publish issued mid-sweep would stall and blow its 120s RPC timeout). Each retirement below
+    // re-acquires the lock for ONE op only (bounded like handle_unpublish_artifact) and re-checks
+    // the record against the freshly-loaded ledger.
+    let due: Vec<String> = {
+        let _publication_guard = ctx.publication_lock.lock().await;
+        let ledger = load_admin_publication_ledger(&ctx.publication_ledger_path)?;
+        let now = Utc::now().timestamp().max(0) as u64;
+        ledger
+            .publications
+            .values()
+            .filter(|record| {
+                record.expires_at <= now
+                    && record.status != "unpublished"
+                    && record.status != "expired"
+            })
+            .map(|record| record.publication_id.clone())
+            .collect()
+    };
+    if due.is_empty() {
+        return Ok(());
+    }
+    let mut retired = 0usize;
+    for publication_id in due {
+        match retire_expired_publication(ctx, client, &publication_id).await {
+            Ok(true) => retired += 1,
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!("expiry sweep: retire deferred for {publication_id}: {err}")
+            }
+        }
+    }
+    if retired > 0 {
+        tracing::info!("publication expiry sweep retired {retired} publication(s)");
+    }
+    Ok(())
+}
+
+/// Retire ONE expired publication, holding `publication_lock` for only this single retirement
+/// (edge unpublish -> persist `edge_removed` -> blob release -> persist `expired`) — the same
+/// per-op hold as `handle_unpublish_artifact`, so the sweep never monopolizes the lock across the
+/// whole batch. The ledger is re-loaded UNDER the lock and the record re-checked, so a publication
+/// that a concurrent operator/producer unpublish already retired (status `unpublished`), that the
+/// previous sweep already expired, or that is no longer due, is skipped — never clobbered. Returns
+/// `Ok(true)` if it advanced the record to `expired`, `Ok(false)` if there was nothing to do.
+async fn retire_expired_publication(
+    ctx: &AdminContext,
+    client: &Arc<RouterDispatcher>,
+    publication_id: &str,
+) -> Result<bool, String> {
+    let _publication_guard = ctx.publication_lock.lock().await;
+    let mut ledger = load_admin_publication_ledger(&ctx.publication_ledger_path)?;
+    let now = Utc::now().timestamp().max(0) as u64;
+    let Some(mut record) = ledger.publications.get(publication_id).cloned() else {
+        return Ok(false);
+    };
+    // Re-check under the lock: a concurrent unpublish may have retired it, a prior tick may have
+    // expired it, or its TTL may no longer be due (defensive — the snapshot filter already screened).
+    if record.status == "unpublished" || record.status == "expired" || record.expires_at > now {
+        return Ok(false);
+    }
+    // Edge allowlist row first — skip if a prior crash already got past it (idempotent: the edge
+    // replies removed:false for a row it already reaped, which unpublish_edge_blob treats as ok).
+    if record.status != "edge_removed" {
+        unpublish_edge_blob(client, &record.edge_node, publication_id).await?;
+        record.status = "edge_removed".to_string();
+        ledger
+            .publications
+            .insert(publication_id.to_string(), record.clone());
+        persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger)?;
+    }
+    // Curated public/ blob refcount release (idempotent on io.blob's side by publication_id).
+    release_curated_blob(client, ctx, publication_id).await?;
+    record.status = "expired".to_string();
+    record.released_at = Some(now);
+    ledger
+        .publications
+        .insert(publication_id.to_string(), record.clone());
+    persist_admin_publication_ledger(&ctx.publication_ledger_path, &ledger)?;
+    Ok(true)
 }
 
 /// `externalize` — an IO node self-exposes one of its channels (`ICH`) as a public
@@ -5081,7 +5283,11 @@ async fn dispatch_internal_admin_command(
                     "payload.target is not accepted for publish_artifact",
                 ));
             }
-            return handle_publish_artifact(ctx, client, params, caller_l2_name).await;
+            let logged_params = admin_command_log_params(&params);
+            let started = Instant::now();
+            let result = handle_publish_artifact(ctx, client, params, caller_l2_name).await;
+            append_internal_dispatch_log(ctx, action, caller_l2_name, logged_params, started, &result);
+            return result;
         }
         "unpublish_artifact" => {
             if target.is_some() {
@@ -5090,7 +5296,11 @@ async fn dispatch_internal_admin_command(
                     "payload.target is not accepted for unpublish_artifact",
                 ));
             }
-            return handle_unpublish_artifact(ctx, client, params, caller_l2_name).await;
+            let logged_params = admin_command_log_params(&params);
+            let started = Instant::now();
+            let result = handle_unpublish_artifact(ctx, client, params, caller_l2_name).await;
+            append_internal_dispatch_log(ctx, action, caller_l2_name, logged_params, started, &result);
+            return result;
         }
         "executor_validate_plan" => {
             let plan = match parse_executor_plan(params) {
@@ -5128,15 +5338,29 @@ async fn dispatch_internal_admin_command(
         // externalize — an IO node self-exposes its own channel (ICH) on the edge
         // (v6 §7). Authz gate CLOSED (v6 §11.1): IO.* + owner==caller, enforced in the handler.
         "externalize" => {
-            return handle_externalize(ctx, client, params, caller_l2_name).await;
+            let logged_params = admin_command_log_params(&params);
+            let started = Instant::now();
+            let result = handle_externalize(ctx, client, params, caller_l2_name).await;
+            append_internal_dispatch_log(ctx, action, caller_l2_name, logged_params, started, &result);
+            return result;
         }
         // publish_cloud_endpoint — el bootstrap de la puerta publica de Fluxbee Cloud. Vive al lado
-        // de externalize porque lo reusa; acotado a IO.cloud y devuelve el token UNA vez.
+        // de externalize porque lo reusa; acotado a IO.cloud y devuelve el token UNA vez. Se audita
+        // igual que sus hermanas bypass (el token minteado NO viaja en params, solo en la respuesta,
+        // y admin_command_log_params redacta igual campos secret-like).
         "publish_cloud_endpoint" => {
-            return handle_publish_cloud_endpoint(ctx, client, params).await;
+            let logged_params = admin_command_log_params(&params);
+            let started = Instant::now();
+            let result = handle_publish_cloud_endpoint(ctx, client, params).await;
+            append_internal_dispatch_log(ctx, action, caller_l2_name, logged_params, started, &result);
+            return result;
         }
         "unexternalize" => {
-            return handle_unexternalize(ctx, client, params, caller_l2_name).await;
+            let logged_params = admin_command_log_params(&params);
+            let started = Instant::now();
+            let result = handle_unexternalize(ctx, client, params, caller_l2_name).await;
+            append_internal_dispatch_log(ctx, action, caller_l2_name, logged_params, started, &result);
+            return result;
         }
         "list_externalized" => {
             return handle_list_externalized(client, params, caller_l2_name).await;
@@ -5238,9 +5462,7 @@ async fn dispatch_internal_admin_command(
             {
                 // Audit origin: the router-stamped caller when the command came over L2 (e.g.
                 // SY.architect), else the trusted internal path.
-                let origin = caller_l2_name
-                    .map(|src| format!("l2:{src}"))
-                    .unwrap_or_else(|| "internal".to_string());
+                let origin = command_log_origin(caller_l2_name);
                 handle_admin_command_with_origin(ctx, client, canonical, params, hive, &origin)
                     .await?
             }
@@ -5960,6 +6182,17 @@ async fn handle_http(
                 if body.is_empty() { serde_json::json!({}) } else { serde_json::from_slice(&body)? };
             let internal =
                 dispatch_internal_admin_command(ctx, client, "unexternalize", None, payload, None).await?;
+            respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
+        }
+        // Operator revoke of a public artifact (D2). caller_l2_name = None routes to
+        // handle_unpublish_artifact's operator escape hatch: the localhost HTTP path may
+        // unpublish ANY tenant's publication (a retired/renamed producer can't be asked to).
+        // Body: {"publication_id":"pub:<uuid>"}.
+        ("POST", "/artifacts/unpublish") => {
+            let payload: serde_json::Value =
+                if body.is_empty() { serde_json::json!({}) } else { serde_json::from_slice(&body)? };
+            let internal =
+                dispatch_internal_admin_command(ctx, client, "unpublish_artifact", None, payload, None).await?;
             respond_json(stream, internal.http_status, &internal.envelope.to_string()).await?;
         }
         ("GET", "/channels/externalized") => {
@@ -7134,7 +7367,14 @@ async fn handle_hive_paths(
             } else {
                 serde_json::from_slice(body)?
             };
-            let result = handle_publish_cloud_endpoint(ctx, client, payload).await?;
+            // Operator path (caller=None). This route calls the handler directly (it does NOT go
+            // through dispatch_internal_admin_command), so it carries its own audit append to match
+            // the mesh arm — a token mint must always leave a command-log entry.
+            let logged_params = admin_command_log_params(&payload);
+            let started = Instant::now();
+            let result = handle_publish_cloud_endpoint(ctx, client, payload).await;
+            append_internal_dispatch_log(ctx, "publish_cloud_endpoint", None, logged_params, started, &result);
+            let result = result?;
             Ok(Some((result.http_status, result.envelope.to_string())))
         }
         ("POST", ["sync-hint"]) => {
