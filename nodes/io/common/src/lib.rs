@@ -6,6 +6,7 @@ pub mod identity;
 pub mod inbound;
 pub mod io_adapter_config;
 pub mod io_api_adapter_config;
+pub mod io_blob_adapter_config;
 pub mod io_cloud_adapter_config;
 pub mod io_context;
 pub mod io_control_plane;

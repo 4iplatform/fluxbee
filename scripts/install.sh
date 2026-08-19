@@ -25,6 +25,10 @@ IO_SLACK_RUNTIME_NAME="${IO_SLACK_RUNTIME_NAME:-io.slack}"
 IO_SLACK_RUNTIME_VERSION="${IO_SLACK_RUNTIME_VERSION:-1.0.0}"
 IO_LINKEDHELPER_RUNTIME_NAME="${IO_LINKEDHELPER_RUNTIME_NAME:-io.linkedhelper}"
 IO_LINKEDHELPER_RUNTIME_VERSION="${IO_LINKEDHELPER_RUNTIME_VERSION:-1.0.0}"
+IO_BLOB_RUNTIME_NAME="${IO_BLOB_RUNTIME_NAME:-io.blob}"
+IO_BLOB_RUNTIME_VERSION="${IO_BLOB_RUNTIME_VERSION:-1.0.0}"
+IO_CLOUD_RUNTIME_NAME="${IO_CLOUD_RUNTIME_NAME:-io.cloud}"
+IO_CLOUD_RUNTIME_VERSION="${IO_CLOUD_RUNTIME_VERSION:-1.0.0}"
 REQUESTED_BIN_DIR="${BIN_DIR:-}"
 BIN_DIR="$ROOT_DIR/target/release"
 STATE_ROOT_DIR="$STATE_DIR/state"
@@ -203,7 +207,9 @@ INSTALL_RESTART_SERVICES=(
   "sy-vault"
   "fluxbee-syncthing"
 )
-INSTALL_SINGLETON_SERVICES=("io-cloud" "io-blob")
+# Empty: IO.cloud and IO.blob are managed runtimes now (no systemd unit). Kept as an array so the
+# stop/restart loops that reference it stay valid no-ops.
+INSTALL_SINGLETON_SERVICES=()
 
 # SY.frontdesk.gov depends on the router and then on SY.identity for registration
 # handoffs. During install we tear down volatile router/SHM state, so restoring
@@ -470,12 +476,9 @@ sudo install -m 0755 "$sy_opa_rules_bin" /usr/bin/sy-opa-rules
 sudo install -m 0755 "$sy_timer_bin" /usr/bin/sy-timer
 sudo install -m 0755 "$sy_wf_rules_bin" /usr/bin/sy-wf-rules
 sudo install -m 0755 "$sy_frontdesk_gov_bin" /usr/bin/sy-frontdesk-gov
-# io-cloud: the singleton in-mesh Fluxbee Cloud adapter (motherbee only), baked like a
-# SY node — NOT published as a runtime package (unlike io-api/io-slack above).
-sudo install -m 0755 "$ROOT_DIR/nodes/io/target/release/io-cloud" /usr/bin/io-cloud
-sudo install -m 0600 "$ROOT_DIR/packaging/io-cloud.env.example" /etc/fluxbee/io-cloud.env.example
-sudo install -m 0755 "$ROOT_DIR/nodes/io/target/release/io-blob" /usr/bin/io-blob
-sudo install -m 0600 "$ROOT_DIR/packaging/io-blob.env.example" /etc/fluxbee/io-blob.env.example
+# io-cloud + io-blob are managed runtimes now (like io-api/io-slack): published into
+# dist/runtimes below (see the io.blob/io.cloud publish blocks), NOT copied to /usr/bin and
+# NOT given a .env — they configure via CONFIG_SET and enforce motherbee via a binary self-check.
 sudo install -m 0755 "$wf_generic_bin" /usr/bin/wf-generic
 
 echo "Updating core source repo in $STATE_DIR/dist/core/bin..."
@@ -966,6 +969,36 @@ bash "$ROOT_DIR/scripts/publish-io-linkedhelper-runtime.sh" \
   --sudo \
   --skip-build
 
+# io.blob + io.cloud: managed runtimes now (promoted from systemd singletons). Published with the
+# generic publisher (auto-generates start.sh), same as the manifest-driven build-deb.sh path.
+io_blob_bin="$ROOT_DIR/nodes/io/target/release/io-blob"
+if [[ ! -f "$io_blob_bin" ]]; then
+  echo "Error: io.blob build completed but binary is missing: $io_blob_bin" >&2
+  exit 1
+fi
+echo "Publishing base runtime $IO_BLOB_RUNTIME_NAME@$IO_BLOB_RUNTIME_VERSION into $STATE_DIR/dist/runtimes..."
+bash "$ROOT_DIR/scripts/publish-runtime.sh" \
+  --runtime "$IO_BLOB_RUNTIME_NAME" \
+  --version "$IO_BLOB_RUNTIME_VERSION" \
+  --binary "$io_blob_bin" \
+  --dist-root "$STATE_DIR/dist" \
+  --set-current \
+  --sudo
+
+io_cloud_bin="$ROOT_DIR/nodes/io/target/release/io-cloud"
+if [[ ! -f "$io_cloud_bin" ]]; then
+  echo "Error: io.cloud build completed but binary is missing: $io_cloud_bin" >&2
+  exit 1
+fi
+echo "Publishing base runtime $IO_CLOUD_RUNTIME_NAME@$IO_CLOUD_RUNTIME_VERSION into $STATE_DIR/dist/runtimes..."
+bash "$ROOT_DIR/scripts/publish-runtime.sh" \
+  --runtime "$IO_CLOUD_RUNTIME_NAME" \
+  --version "$IO_CLOUD_RUNTIME_VERSION" \
+  --binary "$io_cloud_bin" \
+  --dist-root "$STATE_DIR/dist" \
+  --set-current \
+  --sudo
+
 if [[ "$SEED_RUNTIME_FIXTURE" == "1" ]]; then
   echo "Seeding runtime fixture in $STATE_DIR/dist/runtimes: $RUNTIME_FIXTURE_NAME@$RUNTIME_FIXTURE_VERSION"
   runtime_fixture_dir="$STATE_DIR/dist/runtimes/$RUNTIME_FIXTURE_NAME/$RUNTIME_FIXTURE_VERSION"
@@ -1154,51 +1187,9 @@ install_unit \
   "/usr/bin/sy-edge" \
   "network.target rt-gateway.service" \
   "rt-gateway.service"
-# io-cloud: custom unit (install_unit can't express ExecCondition/EnvironmentFile). Singleton,
-# gated to role: motherbee so it only runs on the motherbee even though enabled everywhere.
-cat <<'IOUNIT' | sudo tee /etc/systemd/system/io-cloud.service >/dev/null
-[Unit]
-Description=Fluxbee IO.cloud (singleton in-mesh Fluxbee Cloud adapter, motherbee only)
-After=network.target rt-gateway.service sy-identity.service sy-admin.service
-Wants=rt-gateway.service sy-identity.service sy-admin.service
-
-[Service]
-Type=simple
-EnvironmentFile=-/etc/fluxbee/io-cloud.env
-ExecCondition=/bin/sh -c 'grep -qE "^role:[[:space:]]*motherbee" /etc/fluxbee/hive.yaml'
-ExecStart=/usr/bin/io-cloud
-Restart=always
-RestartSec=5
-TimeoutStopSec=15
-
-[Install]
-WantedBy=multi-user.target
-IOUNIT
-# io-blob: no ICH and no public listener. It accepts only router-stamped worker
-# commands from SY.admin in the configured motherbee hive.
-cat <<'IOUNIT' | sudo tee /etc/systemd/system/io-blob.service >/dev/null
-[Unit]
-Description=Fluxbee IO.blob (public artifact curator, motherbee only)
-After=network.target rt-gateway.service sy-admin.service
-Wants=rt-gateway.service sy-admin.service
-
-[Service]
-Type=simple
-EnvironmentFile=-/etc/fluxbee/io-blob.env
-ExecCondition=/bin/sh -c 'grep -qE "^role:[[:space:]]*motherbee" /etc/fluxbee/hive.yaml'
-Group=fluxbee
-UMask=0027
-ExecStart=/usr/bin/io-blob
-Restart=always
-RestartSec=5
-TimeoutStopSec=15
-
-[Install]
-WantedBy=multi-user.target
-IOUNIT
+# IO.cloud and IO.blob are managed runtimes now (baked into dist/runtimes above, spawned by the
+# orchestrator, configured via CONFIG_SET) — no systemd unit, no .env. Nothing to install here.
 sudo systemctl daemon-reload
-sudo systemctl enable io-cloud.service >/dev/null 2>&1 || true
-sudo systemctl enable io-blob.service >/dev/null 2>&1 || true
 
 for svc in "${INSTALL_SINGLETON_SERVICES[@]}"; do
   if [[ "${INSTALL_WAS_ACTIVE[$svc]:-0}" == "1" ]] && install_service_exists "$svc"; then

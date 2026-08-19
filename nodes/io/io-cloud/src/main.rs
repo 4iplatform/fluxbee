@@ -1,37 +1,67 @@
 #![forbid(unsafe_code)]
 
 //! `IO.cloud` — the in-mesh adapter for the external system that is Fluxbee Cloud
-//! (same species as `IO.linkedhelper`/`io-api`). It is the FIRST node to externalize
-//! a channel on `SY.edge` (spec `edge-ingress-spec-v6.md` §10): it lives inside the
-//! mesh, talks to `SY.admin` for scoped commands (its `externalize`/`unexternalize`
-//! set), and is the only inbound path from Fluxbee Cloud into the mesh (I2).
+//! (same species as `IO.linkedhelper`/`io-api`). It lives inside the mesh, talks to
+//! `SY.admin` for scoped commands (its relay set), and is the only inbound path from
+//! Fluxbee Cloud into the mesh (I2).
 //!
 //! The Cloud control-plane surface is deliberately small:
 //! - it CONNECTS to the mesh as `IO.cloud`;
-//! - it externalizes exactly one shared-secret, POST-only ICH on `SY.edge`;
-//! - it accepts Cloud operations only when the router-stamped source is the configured `SY.edge`
-//!   and the request targets that exact ICH;
+//! - it registers its OWN shared-secret, POST-only ICH on `SY.identity` (so a later,
+//!   admin-driven `publish_cloud_endpoint` can resolve and externalize it on `SY.edge`);
+//! - it accepts Cloud operations only when the router-stamped source is the CURRENTLY
+//!   configured `SY.edge` (`config.io.edge_node`) and the request targets that exact ICH;
 //! - it relays the bounded provisioning set (`create_tenant`, `put_token`,
 //!   `provision_node`) to `SY.admin`.
 //!
-//! Env: `IO_CLOUD_NODE_NAME` (default `IO.cloud`), `IO_CLOUD_ROUTER_SOCKET_DIR`,
-//! `IO_CLOUD_UUID_PERSISTENCE_DIR`, `IO_CLOUD_CONFIG_DIR`, `IO_CLOUD_NODE_VERSION`,
-//! `IO_CLOUD_ADMIN_HIVE` (default: the edge's own hive).
+//! # Configuration: managed CONFIG plane, NOT env
+//!
+//! io.cloud is a FIRST-CLASS MANAGED IO node (like io.api / io.slack). Its single operator
+//! field — `config.io.edge_node`, the `SY.edge` it trusts for inbound traffic — is read from
+//! the managed CONFIG_SET/GET control plane (`IoCloudAdapterConfigContract`), never from an env
+//! var. `publish_cloud_endpoint` (an admin action) normally records the edge into this node's
+//! config as part of publishing; `CONFIG_SET` is the manual override. There is deliberately NO
+//! secret field: the endpoint token is minted by `SY.admin` into the vault.
+//!
+//! Two decisions that separate io.cloud from io.api:
+//! - **Motherbee-only, fail-closed in the binary.** io.cloud used to be a packaged systemd
+//!   singleton gated by an `ExecCondition`; as a managed runtime that gate is gone, so the binary
+//!   itself refuses to start on a non-motherbee hive.
+//! - **Externalize is admin-driven.** io.cloud registers its own ICH at boot but does NOT
+//!   self-externalize — `publish_cloud_endpoint` owns opening the public door on `SY.edge`.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use std::sync::Arc;
-
-use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing};
+use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
 use fluxbee_sdk::rpc::AdminCommandRequest;
 use fluxbee_sdk::{
-    managed_node_name, try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode,
+    managed_node_config_path, try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode,
     OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, RpcCommandReceiver,
+    FLUXBEE_NODE_NAME_ENV,
 };
 use io_common::identity::ResolveOrCreateInput;
+use io_common::io_adapter_config::{
+    apply_adapter_config_replace, build_io_adapter_contract_payload, IoAdapterConfigContract,
+};
+use io_common::io_cloud_adapter_config::{trusted_edge_node, IoCloudAdapterConfigContract};
+use io_common::io_control_plane::{
+    build_io_config_get_response_payload, build_io_config_response_message,
+    build_io_config_set_error_payload, build_io_config_set_ok_payload, ensure_config_version_advances,
+    parse_and_validate_io_control_plane_request, IoConfigSource, IoControlPlaneErrorInfo,
+    IoControlPlaneRequest, IoControlPlaneState, IoNodeLifecycleState,
+};
+use io_common::io_control_plane_bootstrap::bootstrap_io_control_plane_state;
+use io_common::io_control_plane_logging::{
+    log_config_get_served, log_config_set_applied, log_config_set_persist_error,
+    log_config_set_stale_rejected, log_control_plane_request_rejected,
+};
+use io_common::io_control_plane_metrics::IoControlPlaneMetrics;
+use io_common::io_control_plane_store::persist_io_control_plane_state;
 use io_common::provision::{ensure_own_ich, strict_provision_ilk, IdentityProvisionConfig};
-use serde_json::json;
+use serde_json::{json, Value};
+use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -40,61 +70,152 @@ type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 const RPC_CH_INCOMING: &str = "incoming";
 
+/// io.cloud is motherbee-only. As a managed runtime there is no systemd `ExecCondition` gate
+/// anymore, so the binary enforces it (fail-closed self-check at boot).
+const MOTHERBEE_HIVE: &str = "motherbee";
+
+/// FROZEN channel identity, NOT operator config (the contract deliberately omits it): the family
+/// under which the edge forwards inbound Cloud requests, mirrored by the family gate in `run_loop`.
+const CLOUD_INBOUND_FAMILY: &str = "user";
+
+/// FROZEN channel identity: the `(channel_type, channel_address)` io.cloud registers its own ICH
+/// under. These are the identity of the public URL, not something an operator tunes.
+const CLOUD_CHANNEL_TYPE: &str = "cloud";
+const CLOUD_CHANNEL_ADDRESS: &str = "demo";
+
+/// Fallback tenant for the self-provisioned ICH when the orchestrator did not inject one.
+const DEFAULT_SELF_TENANT: &str = "tnt:00000000-0000-0000-0000-000000000001";
+
+/// Boot configuration — infra + wiring only. The one OPERATOR field (`io.edge_node`) lives in the
+/// managed CONFIG plane, never here. Mirrors `io-api`'s `Config`, dropping the `IO_CLOUD_*` config
+/// envs: infra comes from the managed spawn config (with the generic env overrides io.api also
+/// honours), and the admin/orchestrator/identity targets are derived from the hive.
+#[derive(Clone)]
+struct Config {
+    node_name: String,
+    hive_id: String,
+    node_version: String,
+    router_socket: PathBuf,
+    uuid_persistence_dir: PathBuf,
+    config_dir: PathBuf,
+    spawn_config_path: PathBuf,
+    identity_target: String,
+    admin_target: String,
+    orchestrator_target: String,
+}
+
+struct SpawnConfig {
+    path: PathBuf,
+    doc: Value,
+}
+
+/// Shared runtime state, mirroring io-api's `RuntimeState`: the live control plane behind an
+/// `RwLock` so a `CONFIG_SET` hot-applies (the trusted edge is read from here on every request).
+struct RuntimeState {
+    config: Config,
+    own_ich: String,
+    control_plane: Arc<RwLock<IoControlPlaneState>>,
+    control_metrics: Arc<IoControlPlaneMetrics>,
+    adapter_contract: Arc<dyn IoAdapterConfigContract>,
+    dispatcher: Arc<RouterDispatcher>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
+    let config = Config::from_env()?;
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(env_or(
-            "JSR_LOG_LEVEL",
-            "info,io_cloud=debug,fluxbee_sdk=info",
-        )))
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            EnvFilter::new("info,io_cloud=debug,io_common=info,fluxbee_sdk=info")
+        }))
         .init();
 
-    let cfg = build_node_config();
-    tracing::info!(node = %cfg.name, "IO.cloud starting (in-mesh Fluxbee Cloud adapter)");
+    // Motherbee-only backstop (fail-closed). io.cloud used to be a packaged systemd singleton gated
+    // by an ExecCondition; as a managed runtime that gate is gone, so the binary refuses to run on
+    // any other hive rather than trusting the deploy to place it correctly.
+    if config.hive_id != MOTHERBEE_HIVE {
+        tracing::error!(
+            node_name = %config.node_name,
+            hive_id = %config.hive_id,
+            "IO.cloud is motherbee-only; refusing to start on a non-motherbee hive"
+        );
+        return Err(format!(
+            "IO.cloud must run on '{MOTHERBEE_HIVE}' (resolved hive '{}')",
+            config.hive_id
+        )
+        .into());
+    }
 
-    // Broad catch-all: unsolicited traffic (edge-forwarded requests under any family,
-    // plus system messages) lands on `incoming`. Admin responses to our own outbound
-    // RPCs are correlated by trace_id in the pending map first, so they never leak here.
+    // Single-config model: boot reads ONLY the node-dir config.json and validates it through the
+    // adapter contract via the SDK (mirrors io.api). An io.cloud with no edge is a VALID node —
+    // it serves the mesh and trusts no edge yet — so an empty config is CONFIGURED, not FAILED.
+    let adapter_contract: Arc<dyn IoAdapterConfigContract> = Arc::new(IoCloudAdapterConfigContract);
+    let mut boot_state =
+        bootstrap_io_control_plane_state(&config.node_name, adapter_contract.as_ref())
+            .unwrap_or_else(|err| IoControlPlaneState {
+                current_state: IoNodeLifecycleState::FailedConfig,
+                config_source: IoConfigSource::None,
+                schema_version: 1,
+                config_version: 0,
+                effective_config: None,
+                last_error: Some(IoControlPlaneErrorInfo {
+                    code: "config_bootstrap_failed".to_string(),
+                    message: err.to_string(),
+                }),
+            });
+    validate_boot_effective_config(&mut boot_state, adapter_contract.as_ref());
+
+    tracing::info!(
+        node_name = %config.node_name,
+        runtime_version = %config.node_version,
+        hive_id = %config.hive_id,
+        router_socket = %config.router_socket.display(),
+        spawn_config_path = %config.spawn_config_path.display(),
+        identity_target = %config.identity_target,
+        admin_target = %config.admin_target,
+        orchestrator_target = %config.orchestrator_target,
+        lifecycle_state = %boot_state.current_state.as_str(),
+        trusted_edge = ?trusted_edge_node(boot_state.effective_config.as_ref()),
+        "IO.cloud starting (managed in-mesh Fluxbee Cloud adapter)"
+    );
+
+    // Broad catch-all: unsolicited traffic (edge-forwarded requests under any family, plus system
+    // messages incl. CONFIG_GET/SET) lands on `incoming`. Admin responses to our own outbound RPCs
+    // are correlated by trace_id in the pending map first, so they never leak here.
     let profile = OperationalRouteProfile::builder()
         .command_channel(RPC_CH_INCOMING)
         .post_pending_rule(RouteMatch::Any, RouteTarget::Command(RPC_CH_INCOMING))
         .build()?;
-    let dispatcher =
-        RouterDispatcher::connect_with_retry(cfg, Duration::from_secs(1), profile).await?;
+    let dispatcher = RouterDispatcher::connect_with_retry(
+        NodeConfig {
+            name: config.node_name.clone(),
+            router_socket: config.router_socket.clone(),
+            uuid_persistence_dir: config.uuid_persistence_dir.clone(),
+            uuid_mode: NodeUuidMode::Persistent,
+            config_dir: config.config_dir.clone(),
+            version: config.node_version.clone(),
+        },
+        Duration::from_secs(1),
+        profile,
+    )
+    .await?;
     let sender = dispatcher.sender_snapshot();
     let full_name = sender.full_name().to_string();
-    let hive_id = full_name
-        .rsplit_once('@')
-        .map(|(_, hive)| hive.to_string())
-        .unwrap_or_else(|| "motherbee".to_string());
     tracing::info!(full_name = %full_name, "IO.cloud connected to router");
 
-    // Register IO.cloud's own channel (ICH) in SY.identity so it becomes the durable,
-    // externalize-able identity of the public URL (spec §4: the URL *is* an ICH; §7:
-    // externalize resolves `ICH -> owner_l2_name`). The ICH is owned by us because the
-    // identity handler stamps `owner_l2_name` from the router-verified `src_l2_name`
-    // (sy_identity.rs add_channel), so only a request that genuinely came from IO.cloud
-    // can register a channel owned by IO.cloud. `ILK_ADD_CHANNEL`/`ILK_PROVISION` are
-    // both authorized for the `IO.` prefix (sy_identity.rs allowed_prefixes).
-    let identity_hive = env_or("IO_CLOUD_IDENTITY_HIVE", &hive_id);
-    let identity_target = format!("SY.identity@{identity_hive}");
-    let self_tenant = fluxbee_sdk::read_self_tenant_from_env().unwrap_or_else(|| {
-        env_or(
-            "IO_CLOUD_TENANT_ID",
-            "tnt:00000000-0000-0000-0000-000000000001",
-        )
-    });
-    let channel_type = env_or("IO_CLOUD_CHANNEL_TYPE", "cloud");
-    let channel_address = env_or("IO_CLOUD_CHANNEL_ADDRESS", "demo");
-    // As an enabled boot unit, IO.cloud may come up before the mesh (SY.identity/SY.admin)
-    // is fully ready. Retry the channel registration; if it can't land, exit non-zero so
-    // systemd restarts us for a fresh attempt (a singleton with no ICH is useless anyway).
+    // ICH self-provision (KEPT). io.cloud still needs its OWN durable channel/ICH so that the
+    // admin-driven `publish_cloud_endpoint` can resolve it later and externalize it on SY.edge.
+    // Boot self-externalize is intentionally GONE — publishing is now an admin action, not a boot
+    // side effect. As an enabled boot node, io.cloud may come up before the mesh (SY.identity) is
+    // ready, so the registration retries; if it can't land, exit non-zero so the orchestrator
+    // restarts us for a fresh attempt (a singleton with no ICH is useless anyway).
+    let self_tenant =
+        fluxbee_sdk::read_self_tenant_from_env().unwrap_or_else(|| DEFAULT_SELF_TENANT.to_string());
     let own_ich = match ensure_own_channel_with_retry(
         &dispatcher,
-        &identity_target,
+        &config.identity_target,
         &self_tenant,
-        &channel_type,
-        &channel_address,
+        CLOUD_CHANNEL_TYPE,
+        CLOUD_CHANNEL_ADDRESS,
     )
     .await
     {
@@ -102,202 +223,405 @@ async fn main() -> Result<(), DynError> {
             tracing::info!(
                 ich_id = %ich_id,
                 tenant = %self_tenant,
-                channel_type = %channel_type,
-                address = %channel_address,
-                "IO.cloud own channel ICH enabled — ready to externalize on SY.edge"
+                channel_type = %CLOUD_CHANNEL_TYPE,
+                address = %CLOUD_CHANNEL_ADDRESS,
+                "IO.cloud own channel ICH enabled — ready for admin-driven externalize on SY.edge"
             );
             ich_id
         }
         Err(err) => {
-            tracing::error!(error = %err, "IO.cloud channel registration exhausted retries; exiting for systemd to restart");
+            tracing::error!(error = %err, "IO.cloud channel registration exhausted retries; exiting for restart");
             return Err(err.into());
         }
     };
 
-    // Self-externalize (spec §7): IO.cloud asks SY.admin to publish its own channel as a
-    // shared-secret URL on the edge. This is the same node→admin ADMIN_COMMAND path a real deploy
-    // uses; it is self-service (requester owns the ICH). Opt-in via `IO_CLOUD_EDGE_NODE`
-    // (the `SY.edge` L2 name to publish on) so an unconfigured IO.cloud just registers its
-    // channel and waits. SY.admin authorizes this by router-stamped IO.* origin plus
-    // `requester == ICH owner`.
-    let admin_hive = env_or("IO_CLOUD_ADMIN_HIVE", &hive_id);
-    let admin_target = format!("SY.admin@{admin_hive}");
-    let cloud_edge_node = env("IO_CLOUD_EDGE_NODE");
-    // Hoisted so run_loop can family-gate the inbound (FIX-16).
-    let inbound_family = env_or("IO_CLOUD_INBOUND_FAMILY", "user");
-    if let Some(edge_node) = cloud_edge_node.as_deref() {
-        // The Cloud service token is the alpha trust anchor: the edge verifies it before
-        // forwarding and strips Authorization at the frontier. There is intentionally no public
-        // fallback for this mutation endpoint.
-        //
-        // Por defecto NO se manda `secret`: SY.admin lo acuña fuerte, lo guarda en el vault bajo
-        // `edge_channel_secret:{ich}` (propiedad del ILK del edge) y al edge le manda SOLO el
-        // `secret_ref` — el valor nunca viaja ni se persiste afuera del vault. Es el camino por
-        // defecto del propio admin; pasar uno es lo que su comentario llama "an explicit opt-out".
-        //
-        // Exigirlo era un defecto: obligaba al operador a inventar un secreto y dejarlo en el
-        // entorno del proceso o en un archivo en disco, que es justo lo que el vault existe para
-        // evitar. `IO_CLOUD_SECRET` sigue disponible para fijar un token concreto (migraciones,
-        // un valor que un cliente externo ya tiene), pero ya no es obligatorio.
-        let service_token = env("IO_CLOUD_SECRET");
-        let mut params = json!({
-            "ich": own_ich,
-            "edge_node": edge_node,
-            "inbound_family": inbound_family,
-            "auth_mode": "shared-secret",
-            "methods": ["POST"],
-        });
-        if let Some(token) = service_token {
-            tracing::warn!(
-                "IO_CLOUD_SECRET set: pinning a caller-supplied token instead of letting SY.admin \
-                 mint one into the vault (explicit opt-out)"
-            );
-            params["secret"] = json!(token);
+    let state = Arc::new(RuntimeState {
+        config,
+        own_ich,
+        control_plane: Arc::new(RwLock::new(boot_state.clone())),
+        control_metrics: Arc::new(IoControlPlaneMetrics::with_initial_state(
+            boot_state.current_state.as_str(),
+            boot_state.config_version,
+        )),
+        adapter_contract,
+        dispatcher,
+    });
+
+    let mut incoming = state
+        .dispatcher
+        .take_command_receiver(RPC_CH_INCOMING)
+        .await?;
+    run_loop(&sender, &full_name, &state, &mut incoming).await
+}
+
+/// Validate the boot effective config through the adapter contract (mirrors io.api). A candidate
+/// that the contract rejects lands the node in FAILED_CONFIG with the contract's error.
+fn validate_boot_effective_config(
+    state: &mut IoControlPlaneState,
+    contract: &dyn IoAdapterConfigContract,
+) {
+    let Some(candidate) = state.effective_config.as_ref() else {
+        return;
+    };
+    match contract.validate_and_materialize(candidate) {
+        Ok(effective) => {
+            state.effective_config = Some(effective);
+            state.current_state = IoNodeLifecycleState::Configured;
+            state.last_error = None;
         }
-        tokio::spawn(publish_channel_on_edge_with_retry(
-            dispatcher.clone(),
-            admin_target.clone(),
-            edge_node.to_string(),
-            params,
-        ));
-    } else {
+        Err(err) => {
+            state.current_state = IoNodeLifecycleState::FailedConfig;
+            state.last_error = Some(IoControlPlaneErrorInfo {
+                code: err.code().to_string(),
+                message: err.to_string(),
+            });
+        }
+    }
+}
+
+async fn run_loop(
+    sender: &NodeSender,
+    full_name: &str,
+    state: &Arc<RuntimeState>,
+    incoming: &mut RpcCommandReceiver,
+) -> Result<(), DynError> {
+    loop {
+        let msg = match timeout(Duration::from_secs(300), incoming.recv()).await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => return Ok(()),
+            Err(_) => continue,
+        };
+
+        if try_handle_default_node_status(sender, &msg).await? {
+            continue;
+        }
+
+        // Control-plane branch FIRST (mirror io.api run_router_loop), BEFORE the edge gate: a
+        // CONFIG_GET/SET from the configured Admin or Orchestrator is answered here and hot-applies
+        // without a restart. It must precede the edge gate because it comes from SY.admin /
+        // SY.orchestrator, not from the edge — the edge gate would otherwise drop it.
+        if is_config_command(&msg) {
+            let response = handle_control_message(state, &msg).await;
+            sender.send(response).await?;
+            continue;
+        }
+
+        // Trusted edge is read LIVE from the control plane on EVERY request (hot-apply): a
+        // CONFIG_SET that changes `io.edge_node` takes effect on the very next message, no restart.
+        let effective = state.control_plane.read().await.effective_config.clone();
+        let cloud_edge_node = trusted_edge_node(effective.as_ref());
+        let cloud_edge_node = cloud_edge_node.as_deref();
+
+        // RouteMatch::Any also receives unsolicited mesh notifications (for example VAULT changes).
+        // They are not Cloud requests and must not get a reply from IO.cloud.
+        if !message_from_configured_edge(&msg, cloud_edge_node) {
+            tracing::debug!(
+                trace_id = %msg.routing.trace_id,
+                src_l2_name = ?msg.routing.src_l2_name,
+                "IO.cloud ignored a non-edge mesh message"
+            );
+            continue;
+        }
+
+        // FIX-16: family gate (mirrors io.api). The channel is registered under `inbound_family`;
+        // the edge forwards legitimate requests stamped with that family, so a frame of any other
+        // msg_type is not a Cloud request — skip it. Defense-in-depth on top of src_l2_name + ich.
+        if !msg.meta.msg_type.eq_ignore_ascii_case(CLOUD_INBOUND_FAMILY) {
+            tracing::debug!(
+                trace_id = %msg.routing.trace_id,
+                msg_type = %msg.meta.msg_type,
+                expected = %CLOUD_INBOUND_FAMILY,
+                "IO.cloud skipped a frame whose msg_type != configured inbound_family"
+            );
+            continue;
+        }
+
+        // A request the edge forwarded under our channel. `meta.ich` = which channel (§4/§7.5).
+        // IO.cloud is the internal Fluxbee Cloud relay (spec §3): the body is `{op, tenant_id,
+        // params}` and we translate it into the matching ADMIN_COMMAND(s), returning the result.
+        let ich = msg.meta.ich.clone().unwrap_or_default();
+        let op = msg
+            .payload
+            .get("op")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         tracing::info!(
-            "IO.cloud not externalizing (set IO_CLOUD_EDGE_NODE to publish); handling inbound only"
+            trace_id = %msg.routing.trace_id,
+            ich = %ich,
+            op = %op,
+            routed_from = %msg.routing.src,
+            "IO.cloud received a Cloud request"
+        );
+
+        let mut response = match authorize_cloud_message(&msg, &state.own_ich, cloud_edge_node) {
+            Ok(()) => dispatch_cloud_op(&state.dispatcher, &state.config.admin_target, &msg.payload).await,
+            Err(detail) => {
+                tracing::warn!(
+                    trace_id = %msg.routing.trace_id,
+                    src_l2_name = ?msg.routing.src_l2_name,
+                    ich = ?msg.meta.ich,
+                    "IO.cloud rejected request outside the authenticated edge channel"
+                );
+                cloud_error_code("UNAUTHORIZED", detail)
+            }
+        };
+        if let Some(obj) = response.as_object_mut() {
+            if obj
+                .get("request_id")
+                .map(|value| value.is_null())
+                .unwrap_or(true)
+            {
+                if let Some(request_id) = msg
+                    .payload
+                    .get("request_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    obj.insert("request_id".to_string(), json!(request_id));
+                }
+            }
+            obj.insert("handled_by".to_string(), json!(full_name));
+            obj.insert("ich".to_string(), json!(ich));
+        }
+
+        let reply = Message {
+            routing: Routing {
+                src: sender.uuid().to_string(),
+                src_l2_name: None,
+                dst: Destination::Unicast(msg.routing.src.clone()),
+                ttl: 16,
+                trace_id: msg.routing.trace_id.clone(),
+            },
+            meta: Meta {
+                // reply in the same family, carry the channel back
+                msg_type: msg.meta.msg_type.clone(),
+                ich: msg.meta.ich.clone(),
+                ..Meta::default()
+            },
+            payload: response,
+        };
+        sender.send(reply).await?;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Managed control plane (CONFIG_GET/SET). Mirrors io-api, REUSING io_common helpers.
+// ---------------------------------------------------------------------------
+
+fn is_config_command(message: &Message) -> bool {
+    message.meta.msg_type.eq_ignore_ascii_case(SYSTEM_KIND)
+        && matches!(
+            message.meta.msg.as_deref(),
+            Some(command)
+                if command.eq_ignore_ascii_case("CONFIG_GET")
+                    || command.eq_ignore_ascii_case("CONFIG_SET")
+        )
+}
+
+fn control_caller_authorized(state: &RuntimeState, message: &Message) -> bool {
+    let caller = message.routing.src_l2_name.as_deref().map(str::trim);
+    caller == Some(state.config.admin_target.as_str())
+        || caller == Some(state.config.orchestrator_target.as_str())
+}
+
+async fn handle_control_message(state: &Arc<RuntimeState>, message: &Message) -> Message {
+    let payload = if !control_caller_authorized(state, message) {
+        tracing::warn!(
+            trace_id = %message.routing.trace_id,
+            source = ?message.routing.src_l2_name,
+            command = ?message.meta.msg,
+            "IO.cloud rejected configuration command from non-authority"
+        );
+        let snapshot = state.control_plane.read().await.clone();
+        build_io_config_set_error_payload(
+            &state.config.node_name,
+            &snapshot,
+            "unauthorized",
+            "CONFIG_GET/SET requires the configured Admin or Orchestrator origin",
+        )
+    } else {
+        match parse_and_validate_io_control_plane_request(message, &state.config.node_name) {
+            Ok(IoControlPlaneRequest::Get(_)) => build_config_get_payload(state, message).await,
+            Ok(IoControlPlaneRequest::Set(set)) => apply_config_set(state, &set).await,
+            Err(err) => {
+                log_control_plane_request_rejected(
+                    &message.routing.trace_id,
+                    &state.config.node_name,
+                    err.code(),
+                    &err.to_string(),
+                );
+                let snapshot = state.control_plane.read().await.clone();
+                build_io_config_set_error_payload(
+                    &state.config.node_name,
+                    &snapshot,
+                    err.code(),
+                    err.to_string(),
+                )
+            }
+        }
+    };
+    let mut response = build_io_config_response_message(message, payload);
+    response.routing.src = state.dispatcher.sender_snapshot().uuid().to_string();
+    response
+}
+
+async fn build_config_get_payload(state: &RuntimeState, message: &Message) -> Value {
+    let snapshot = state.control_plane.read().await.clone();
+    log_config_get_served(&message.routing.trace_id, &state.config.node_name, &snapshot);
+    let mut payload = build_io_config_get_response_payload(
+        &state.config.node_name,
+        &snapshot,
+        build_io_adapter_contract_payload(
+            state.adapter_contract.as_ref(),
+            snapshot.effective_config.as_ref(),
+        ),
+    );
+    inject_runtime_status(&mut payload, state).await;
+    payload
+}
+
+async fn apply_config_set(
+    state: &Arc<RuntimeState>,
+    payload: &fluxbee_sdk::node_config::NodeConfigSetPayload,
+) -> Value {
+    let current = state.control_plane.read().await.clone();
+    if let Err(err) = ensure_config_version_advances(payload.config_version, current.config_version)
+    {
+        log_config_set_stale_rejected(
+            &state.config.node_name,
+            payload.config_version,
+            current.config_version,
+        );
+        state.control_metrics.record_config_set_error(
+            current.current_state.as_str(),
+            current.config_version,
+            err.code(),
+        );
+        return build_io_config_set_error_payload(
+            &state.config.node_name,
+            &current,
+            err.code(),
+            err.to_string(),
         );
     }
+    let effective =
+        match apply_adapter_config_replace(state.adapter_contract.as_ref(), &payload.config) {
+            Ok(value) => value,
+            Err(err) => {
+                state.control_metrics.record_config_set_error(
+                    current.current_state.as_str(),
+                    current.config_version,
+                    err.code(),
+                );
+                return build_io_config_set_error_payload(
+                    &state.config.node_name,
+                    &current,
+                    err.code(),
+                    err.to_string(),
+                );
+            }
+        };
+    let next = IoControlPlaneState {
+        current_state: IoNodeLifecycleState::Configured,
+        config_source: IoConfigSource::Dynamic,
+        schema_version: payload.schema_version,
+        config_version: payload.config_version,
+        effective_config: Some(effective.clone()),
+        last_error: None,
+    };
+    if let Err(err) = persist_io_control_plane_state(&state.config.node_name, &next) {
+        log_config_set_persist_error(
+            &state.config.node_name,
+            payload.schema_version,
+            payload.config_version,
+            &err.to_string(),
+        );
+        return build_io_config_set_error_payload(
+            &state.config.node_name,
+            &current,
+            "config_persist_error",
+            err.to_string(),
+        );
+    }
+    // Hot-apply: swap the live control plane. `run_loop` reads the trusted edge from here on every
+    // request, so the new `io.edge_node` is authoritative on the next message with no restart.
+    *state.control_plane.write().await = next.clone();
+    state
+        .control_metrics
+        .record_config_set_ok(next.current_state.as_str(), next.config_version);
 
-    let mut incoming = dispatcher.take_command_receiver(RPC_CH_INCOMING).await?;
-    run_loop(
-        &sender,
-        &full_name,
-        &own_ich,
-        cloud_edge_node.as_deref(),
-        &dispatcher,
-        &admin_target,
-        &inbound_family,
-        &mut incoming,
-    )
-    .await
+    let mut hot_applied = Vec::new();
+    if section_changed(
+        current.effective_config.as_ref(),
+        &effective,
+        &["io", "edge_node"],
+    ) {
+        hot_applied.push("io.edge_node".to_string());
+    }
+    log_config_set_applied(
+        &state.config.node_name,
+        payload.schema_version,
+        payload.config_version,
+        &hot_applied,
+        &[],
+        &[],
+    );
+
+    let mut response = build_io_config_set_ok_payload(&state.config.node_name, &next);
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "apply".to_string(),
+            json!({
+                "mode":"hot_reload",
+                "hot_applied":hot_applied,
+                "reinit_performed":[],
+                "restart_required":[],
+            }),
+        );
+    }
+    inject_runtime_status(&mut response, state).await;
+    response
 }
 
-/// Keep IO.cloud running while the ingress hive is still converging. A boot race where
-/// SY.admin is ready before SY.edge should not require manually restarting IO.cloud.
-async fn publish_channel_on_edge_with_retry(
-    dispatcher: Arc<RouterDispatcher>,
-    admin_target: String,
-    edge_node: String,
-    params: serde_json::Value,
-) {
-    let max_attempts: u64 = env("IO_CLOUD_EXTERNALIZE_ATTEMPTS")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let retry_delay_secs: u64 = env("IO_CLOUD_EXTERNALIZE_RETRY_SECONDS")
-        .and_then(|v| v.parse().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(5);
-    let mut attempt = 0_u64;
-
-    loop {
-        attempt = attempt.saturating_add(1);
-        match dispatcher
-            .send_admin_rpc(AdminCommandRequest {
-                admin_target: &admin_target,
-                action: "externalize",
-                target: None,
-                params: params.clone(),
-                request_id: None,
-                timeout: Duration::from_secs(15),
-            })
-            .await
-        {
-            Ok(res) if res.status.eq_ignore_ascii_case("ok") => {
-                let url = res.payload.get("url").and_then(|v| v.as_str());
-                let ich = res.payload.get("ich").and_then(|v| v.as_str());
-                tracing::info!(
-                    target = %admin_target,
-                    edge_node = %edge_node,
-                    url = ?url,
-                    ich = ?ich,
-                    attempts = attempt,
-                    "IO.cloud -> SY.admin externalize OK (authenticated Cloud URL published on the edge)"
-                );
-                return;
-            }
-            // The RPC round-tripped but admin refused. Authz/schema errors are terminal; edge
-            // reachability races keep retrying.
-            Ok(res) => {
-                let detail = res
-                    .error_detail
-                    .as_ref()
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| res.payload.to_string());
-                let code = res.error_code.clone().unwrap_or_default();
-                if !externalize_rejection_is_retryable(&code, &detail)
-                    || externalize_attempts_exhausted(attempt, max_attempts)
-                {
-                    tracing::warn!(
-                        target = %admin_target,
-                        edge_node = %edge_node,
-                        status = %res.status,
-                        error_code = ?res.error_code,
-                        error_detail = ?res.error_detail,
-                        attempts = attempt,
-                        "IO.cloud -> SY.admin externalize REJECTED"
-                    );
-                    return;
-                }
-                tracing::warn!(
-                    target = %admin_target,
-                    edge_node = %edge_node,
-                    status = %res.status,
-                    error_code = ?res.error_code,
-                    error_detail = ?res.error_detail,
-                    attempts = attempt,
-                    "IO.cloud -> SY.admin externalize rejected by a retryable edge condition; retrying"
-                );
-            }
-            Err(err) => {
-                if externalize_attempts_exhausted(attempt, max_attempts) {
-                    tracing::warn!(
-                        target = %admin_target,
-                        edge_node = %edge_node,
-                        error = %err,
-                        attempts = attempt,
-                        "IO.cloud -> SY.admin externalize failed (transport); retries exhausted"
-                    );
-                    return;
-                }
-                tracing::warn!(
-                    target = %admin_target,
-                    edge_node = %edge_node,
-                    error = %err,
-                    attempts = attempt,
-                    "IO.cloud -> SY.admin externalize failed (transport); retrying"
-                );
-            }
-        }
-
-        tokio::time::sleep(Duration::from_secs(retry_delay_secs)).await;
+/// Attach a small runtime block to CONFIG responses (mirrors io.api's `inject_runtime_status`,
+/// minus the publication/credential machinery io.cloud no longer owns): the trusted edge read from
+/// the live config, the node's own ICH, that externalize is admin-driven, and the control metrics.
+async fn inject_runtime_status(payload: &mut Value, state: &RuntimeState) {
+    let control = state.control_plane.read().await.clone();
+    let trusted_edge = trusted_edge_node(control.effective_config.as_ref());
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "runtime".to_string(),
+            json!({
+                "transport":"router_socket",
+                "public_frontier":"SY.edge",
+                "inbound_family":CLOUD_INBOUND_FAMILY,
+                "own_ich":state.own_ich,
+                "trusted_edge":trusted_edge,
+                "externalize":"admin_driven",
+                "control_plane_metrics":state.control_metrics.snapshot(),
+            }),
+        );
     }
 }
 
-fn externalize_attempts_exhausted(attempt: u64, max_attempts: u64) -> bool {
-    max_attempts != 0 && attempt >= max_attempts
+fn section_changed(previous: Option<&Value>, current: &Value, path: &[&str]) -> bool {
+    value_at_path(previous, path) != value_at_path(Some(current), path)
 }
 
-fn externalize_rejection_is_retryable(error_code: &str, detail: &str) -> bool {
-    let combined = format!("{error_code} {detail}").to_ascii_lowercase();
-    combined.contains("edge unreachable")
-        || combined.contains("open_url failed")
-        || combined.contains("node_not_found")
-        || combined.contains("timed out")
-        || combined.contains("timeout")
-        || combined.contains("unreachable")
+fn value_at_path<'a>(root: Option<&'a Value>, path: &[&str]) -> Option<&'a Value> {
+    let mut value = root?;
+    for segment in path {
+        value = value.get(*segment)?;
+    }
+    Some(value)
 }
 
-/// Retry `ensure_own_channel` while the mesh is still starting (SY.identity/SY.admin not yet
-/// reachable). Bounded so a genuinely broken deploy exits (systemd restarts) rather than
-/// hanging forever. Tunable via `IO_CLOUD_REGISTER_ATTEMPTS` (default 30) at 2s apart.
+/// Retry `ensure_own_channel` while the mesh is still starting (SY.identity not yet reachable).
+/// Bounded so a genuinely broken deploy exits (orchestrator restarts) rather than hanging forever.
+/// Tunable via `IO_CLOUD_REGISTER_ATTEMPTS` (default 30) at 2s apart.
 async fn ensure_own_channel_with_retry(
     dispatcher: &Arc<RouterDispatcher>,
     identity_target: &str,
@@ -335,7 +659,7 @@ async fn ensure_own_channel_with_retry(
 
 /// Ensure IO.cloud owns a channel/ICH in SY.identity, self-provisioning its ilk when the
 /// orchestrator did not inject one (`FLUXBEE_NODE_ILK_ID`). Returns the ICH id — the stable
-/// identity of the public URL that `externalize` will bind to an edge endpoint.
+/// identity of the public URL that `publish_cloud_endpoint` will bind to an edge endpoint.
 async fn ensure_own_channel(
     dispatcher: &Arc<RouterDispatcher>,
     identity_target: &str,
@@ -390,122 +714,6 @@ async fn ensure_own_channel(
         "IO.cloud own ICH ensured"
     );
     Ok(result.ich_id)
-}
-
-async fn run_loop(
-    sender: &NodeSender,
-    full_name: &str,
-    own_ich: &str,
-    cloud_edge_node: Option<&str>,
-    dispatcher: &Arc<RouterDispatcher>,
-    admin_target: &str,
-    inbound_family: &str,
-    incoming: &mut RpcCommandReceiver,
-) -> Result<(), DynError> {
-    loop {
-        let msg = match timeout(Duration::from_secs(300), incoming.recv()).await {
-            Ok(Some(msg)) => msg,
-            Ok(None) => return Ok(()),
-            Err(_) => continue,
-        };
-
-        if try_handle_default_node_status(sender, &msg).await? {
-            continue;
-        }
-
-        // RouteMatch::Any also receives unsolicited mesh notifications (for example VAULT
-        // changes). They are not Cloud requests and must not get a reply from IO.cloud.
-        if !message_from_configured_edge(&msg, cloud_edge_node) {
-            tracing::debug!(
-                trace_id = %msg.routing.trace_id,
-                src_l2_name = ?msg.routing.src_l2_name,
-                "IO.cloud ignored a non-edge mesh message"
-            );
-            continue;
-        }
-
-        // FIX-16: family gate (mirrors io.api main.rs:386). The channel is registered under
-        // `inbound_family`; the edge forwards legitimate requests stamped with that family, so a
-        // frame of any other msg_type is not a Cloud request — skip it. Defense-in-depth on the
-        // inbound, on top of the src_l2_name + ich checks above.
-        if !msg.meta.msg_type.eq_ignore_ascii_case(inbound_family) {
-            tracing::debug!(
-                trace_id = %msg.routing.trace_id,
-                msg_type = %msg.meta.msg_type,
-                expected = %inbound_family,
-                "IO.cloud skipped a frame whose msg_type != configured inbound_family"
-            );
-            continue;
-        }
-
-        // A request the edge forwarded under our channel. `meta.ich` = which channel (§4/§7.5).
-        // IO.cloud is the internal Fluxbee Cloud relay (spec §3): the body is `{op, tenant_id,
-        // params}` and we translate it into the matching ADMIN_COMMAND(s), returning the result.
-        let ich = msg.meta.ich.clone().unwrap_or_default();
-        let op = msg
-            .payload
-            .get("op")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        tracing::info!(
-            trace_id = %msg.routing.trace_id,
-            ich = %ich,
-            op = %op,
-            routed_from = %msg.routing.src,
-            "IO.cloud received a Cloud request"
-        );
-
-        let mut response = match authorize_cloud_message(&msg, own_ich, cloud_edge_node) {
-            Ok(()) => dispatch_cloud_op(dispatcher, admin_target, &msg.payload).await,
-            Err(detail) => {
-                tracing::warn!(
-                    trace_id = %msg.routing.trace_id,
-                    src_l2_name = ?msg.routing.src_l2_name,
-                    ich = ?msg.meta.ich,
-                    "IO.cloud rejected request outside the authenticated edge channel"
-                );
-                cloud_error_code("UNAUTHORIZED", detail)
-            }
-        };
-        if let Some(obj) = response.as_object_mut() {
-            if obj
-                .get("request_id")
-                .map(|value| value.is_null())
-                .unwrap_or(true)
-            {
-                if let Some(request_id) = msg
-                    .payload
-                    .get("request_id")
-                    .and_then(|value| value.as_str())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    obj.insert("request_id".to_string(), json!(request_id));
-                }
-            }
-            obj.insert("handled_by".to_string(), json!(full_name));
-            obj.insert("ich".to_string(), json!(ich));
-        }
-
-        let reply = Message {
-            routing: Routing {
-                src: sender.uuid().to_string(),
-                src_l2_name: None,
-                dst: Destination::Unicast(msg.routing.src.clone()),
-                ttl: 16,
-                trace_id: msg.routing.trace_id.clone(),
-            },
-            meta: Meta {
-                // reply in the same family, carry the channel back
-                msg_type: msg.meta.msg_type.clone(),
-                ich: msg.meta.ich.clone(),
-                ..Meta::default()
-            },
-            payload: response,
-        };
-        sender.send(reply).await?;
-    }
 }
 
 /// The bearer is verified by SY.edge, so the exact configured edge origin and ICH are the internal
@@ -701,6 +909,164 @@ fn translate_cloud_op(
     }
 }
 
+/// Translate a Cloud request (`{op, tenant_id, params}`) into the matching ADMIN_COMMAND and
+/// return the response payload. IO.cloud is the internal Fluxbee Cloud relay (spec §3): it injects
+/// the (trusted for the MVP — §1.2) tenant claim into each admin call and relays over the same
+/// `send_admin_rpc` seam it already uses. The op→action pairs come from the shared
+/// `fluxbee_sdk::cloud::CLOUD_OP_ACTIONS` (SY.admin's relay allowlist derives from the same table):
+///   create_tenant   -> create_tenant (Cloud-created tenants default to active)
+///   put_token       -> vault_put     (store a provider token in the tenant pool or for one IO node)
+///   provision_node  -> run_node      (spawn IO.<provider>@<tenant>; requires tenant_id)
+/// For an owner-scoped token the caller must provision_node BEFORE put_token (Caveat B: the
+/// `owner_node -> ilk` resolution needs the target node registered in identity SHM first). Tokens
+/// needed during first boot must be stored in the tenant pool by omitting owner_node.
+async fn dispatch_cloud_op(
+    dispatcher: &Arc<RouterDispatcher>,
+    admin_target: &str,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    let op = request.get("op").and_then(|v| v.as_str()).unwrap_or("");
+    let tenant_id = request.get("tenant_id").and_then(|v| v.as_str());
+    let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+    let request_id = request
+        .get("request_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    // The hive the admin action targets (MVP: the admin's own hive, e.g. motherbee).
+    let hive = admin_target.split_once('@').map(|(_, h)| h.to_string());
+
+    let (action, admin_params) = match translate_cloud_op(op, tenant_id, &params) {
+        Ok(pair) => pair,
+        Err(error_payload) => return error_payload,
+    };
+
+    match dispatcher
+        .send_admin_rpc(AdminCommandRequest {
+            admin_target,
+            action,
+            target: hive.as_deref(),
+            params: admin_params,
+            request_id,
+            timeout: Duration::from_secs(if action == "run_node" { 25 } else { 20 }),
+        })
+        .await
+    {
+        Ok(res) if res.status.eq_ignore_ascii_case("ok") => {
+            json!({
+                "status": "ok",
+                "op": op,
+                "request_id": res.request_id,
+                "result": res.payload,
+            })
+        }
+        Ok(res) => json!({
+            "status": "error",
+            "op": op,
+            "request_id": res.request_id,
+            "error_code": res.error_code,
+            "error_detail": res.error_detail.unwrap_or(res.payload),
+        }),
+        Err(e) => cloud_error(&format!("admin call failed: {e}")),
+    }
+}
+
+impl Config {
+    /// Build the boot config the io.api way: node_name + identity from the managed spawn, infra from
+    /// the managed spawn config (with the generic env overrides io.api also honours), and the
+    /// admin/orchestrator/identity targets derived from the hive. NO `IO_CLOUD_*` config envs.
+    fn from_env() -> Result<Self, DynError> {
+        let node_name = env(FLUXBEE_NODE_NAME_ENV).ok_or_else(|| {
+            format!("missing required env {FLUXBEE_NODE_NAME_ENV} for managed spawn")
+        })?;
+        let hive_id = hive_from_node_name(&node_name).ok_or_else(|| {
+            format!("invalid {FLUXBEE_NODE_NAME_ENV}='{node_name}': expected <name>@<hive>")
+        })?;
+        let spawn_cfg = load_spawn_config(&node_name)?;
+        tracing::info!(path = %spawn_cfg.path.display(), "io-cloud loaded managed spawn config");
+        let spawn_doc = &spawn_cfg.doc;
+
+        Ok(Self {
+            node_name,
+            hive_id: hive_id.clone(),
+            node_version: env("NODE_VERSION")
+                .or_else(|| json_get_string(spawn_doc, "_system.runtime_version"))
+                .unwrap_or_else(|| "0.1.0".to_string()),
+            router_socket: PathBuf::from(
+                env("ROUTER_SOCKET")
+                    .or_else(|| json_get_string(spawn_doc, "node.router_socket"))
+                    .unwrap_or_else(|| "/var/run/fluxbee/routers".to_string()),
+            ),
+            uuid_persistence_dir: PathBuf::from(
+                env("UUID_PERSISTENCE_DIR")
+                    .or_else(|| json_get_string(spawn_doc, "node.uuid_persistence_dir"))
+                    .unwrap_or_else(|| "/var/lib/fluxbee/state/nodes".to_string()),
+            ),
+            config_dir: PathBuf::from(
+                env("CONFIG_DIR")
+                    .or_else(|| json_get_string(spawn_doc, "node.config_dir"))
+                    .unwrap_or_else(|| "/etc/fluxbee".to_string()),
+            ),
+            spawn_config_path: spawn_cfg.path,
+            identity_target: json_get_string(spawn_doc, "node.identity_target")
+                .unwrap_or_else(|| format!("SY.identity@{hive_id}")),
+            admin_target: json_get_string(spawn_doc, "node.admin_target")
+                .unwrap_or_else(|| format!("SY.admin@{hive_id}")),
+            orchestrator_target: json_get_string(spawn_doc, "node.orchestrator_target")
+                .unwrap_or_else(|| format!("SY.orchestrator@{hive_id}")),
+        })
+    }
+}
+
+fn load_spawn_config(node_name: &str) -> Result<SpawnConfig, DynError> {
+    let path = managed_node_config_path(node_name)
+        .map_err(|err| format!("failed to resolve managed config path: {err}"))?;
+    let raw = std::fs::read_to_string(&path).map_err(|err| {
+        format!(
+            "failed to read managed config file {}: {err}",
+            path.display()
+        )
+    })?;
+    let doc = serde_json::from_str::<Value>(&raw).map_err(|err| {
+        format!(
+            "failed to parse managed config JSON {}: {err}",
+            path.display()
+        )
+    })?;
+    Ok(SpawnConfig { path, doc })
+}
+
+fn hive_from_node_name(node_name: &str) -> Option<String> {
+    node_name
+        .split_once('@')
+        .map(|(_, hive)| hive.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn json_get_string(root: &Value, dotted_path: &str) -> Option<String> {
+    json_get_path(root, dotted_path)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn json_get_path<'a>(root: &'a Value, dotted_path: &str) -> Option<&'a Value> {
+    let mut current = root;
+    for segment in dotted_path.split('.') {
+        current = current.get(segment)?;
+    }
+    Some(current)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,98 +1204,4 @@ mod tests {
         let err = translate_cloud_op("frobnicate", None, &json!({})).unwrap_err();
         assert_eq!(err["status"], "error");
     }
-}
-
-/// Translate a Cloud request (`{op, tenant_id, params}`) into the matching ADMIN_COMMAND and
-/// return the response payload. IO.cloud is the internal Fluxbee Cloud relay (spec §3): it injects
-/// the (trusted for the MVP — §1.2) tenant claim into each admin call and relays over the same
-/// `send_admin_rpc` seam it already uses for externalize. The op→action pairs come from the shared
-/// `fluxbee_sdk::cloud::CLOUD_OP_ACTIONS` (SY.admin's relay allowlist derives from the same table):
-///   create_tenant   -> create_tenant (Cloud-created tenants default to active)
-///   put_token       -> vault_put     (store a provider token in the tenant pool or for one IO node)
-///   provision_node  -> run_node      (spawn IO.<provider>@<tenant>; requires tenant_id)
-/// For an owner-scoped token the caller must provision_node BEFORE put_token (Caveat B: the
-/// `owner_node -> ilk` resolution needs the target node registered in identity SHM first). Tokens
-/// needed during first boot must be stored in the tenant pool by omitting owner_node.
-async fn dispatch_cloud_op(
-    dispatcher: &Arc<RouterDispatcher>,
-    admin_target: &str,
-    request: &serde_json::Value,
-) -> serde_json::Value {
-    let op = request.get("op").and_then(|v| v.as_str()).unwrap_or("");
-    let tenant_id = request.get("tenant_id").and_then(|v| v.as_str());
-    let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
-    let request_id = request
-        .get("request_id")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    // The hive the admin action targets (MVP: the admin's own hive, e.g. motherbee).
-    let hive = admin_target.split_once('@').map(|(_, h)| h.to_string());
-
-    let (action, admin_params) = match translate_cloud_op(op, tenant_id, &params) {
-        Ok(pair) => pair,
-        Err(error_payload) => return error_payload,
-    };
-
-    match dispatcher
-        .send_admin_rpc(AdminCommandRequest {
-            admin_target,
-            action,
-            target: hive.as_deref(),
-            params: admin_params,
-            request_id,
-            timeout: Duration::from_secs(if action == "run_node" { 25 } else { 20 }),
-        })
-        .await
-    {
-        Ok(res) if res.status.eq_ignore_ascii_case("ok") => {
-            json!({
-                "status": "ok",
-                "op": op,
-                "request_id": res.request_id,
-                "result": res.payload,
-            })
-        }
-        Ok(res) => json!({
-            "status": "error",
-            "op": op,
-            "request_id": res.request_id,
-            "error_code": res.error_code,
-            "error_detail": res.error_detail.unwrap_or(res.payload),
-        }),
-        Err(e) => cloud_error(&format!("admin call failed: {e}")),
-    }
-}
-
-fn build_node_config() -> NodeConfig {
-    NodeConfig {
-        name: managed_node_name("IO.cloud", &["IO_CLOUD_NODE_NAME"]),
-        router_socket: PathBuf::from(env_or(
-            "IO_CLOUD_ROUTER_SOCKET_DIR",
-            "/var/run/fluxbee/routers",
-        )),
-        uuid_persistence_dir: PathBuf::from(env_or(
-            "IO_CLOUD_UUID_PERSISTENCE_DIR",
-            "/var/lib/fluxbee/state/nodes",
-        )),
-        uuid_mode: NodeUuidMode::Persistent,
-        config_dir: PathBuf::from(env_or("IO_CLOUD_CONFIG_DIR", "/etc/fluxbee")),
-        version: env_or("IO_CLOUD_NODE_VERSION", "0.1.0"),
-    }
-}
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| default.to_string())
-}
-
-fn env(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
 }

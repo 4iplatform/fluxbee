@@ -217,59 +217,16 @@ gen_unit sy-frontdesk-gov "network.target rt-gateway.service sy-identity.service
 gen_unit sy-edge "network.target rt-gateway.service" \
   "rt-gateway.service"
 
-# io-cloud: the singleton in-mesh Fluxbee Cloud adapter — one per SYSTEM, on motherbee.
-# Custom unit (not gen_unit): it needs SY.identity (register its own ICH) + SY.admin
-# (externalize) up first, an optional EnvironmentFile for deployment overrides (e.g.
-# IO_CLOUD_EDGE_NODE to publish a URL), and an ExecCondition that gates it to
-# `role: motherbee` — so even though the unit is enabled, it only runs on the motherbee.
-cat > "$DEST/lib/systemd/system/io-cloud.service" <<'UNIT'
-[Unit]
-Description=Fluxbee IO.cloud (singleton in-mesh Fluxbee Cloud adapter, motherbee only)
-After=network.target rt-gateway.service sy-identity.service sy-admin.service
-Wants=rt-gateway.service sy-identity.service sy-admin.service
-
-[Service]
-Type=simple
-EnvironmentFile=-/etc/fluxbee/io-cloud.env
-ExecCondition=/bin/sh -c 'grep -qE "^role:[[:space:]]*motherbee" /etc/fluxbee/hive.yaml'
-ExecStart=/usr/bin/io-cloud
-Restart=always
-RestartSec=5
-TimeoutStopSec=15
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-# io-blob: the motherbee-local public artifact curator. SY.admin is the only
-# accepted mesh caller; the node has no ICH and exposes no network listener.
-cat > "$DEST/lib/systemd/system/io-blob.service" <<'UNIT'
-[Unit]
-Description=Fluxbee IO.blob (public artifact curator, motherbee only)
-After=network.target rt-gateway.service sy-admin.service
-Wants=rt-gateway.service sy-admin.service
-
-[Service]
-Type=simple
-EnvironmentFile=-/etc/fluxbee/io-blob.env
-ExecCondition=/bin/sh -c 'grep -qE "^role:[[:space:]]*motherbee" /etc/fluxbee/hive.yaml'
-Group=fluxbee
-UMask=0027
-ExecStart=/usr/bin/io-blob
-Restart=always
-RestartSec=5
-TimeoutStopSec=15
-
-[Install]
-WantedBy=multi-user.target
-UNIT
+# IO.cloud and IO.blob are NOT singletons anymore: they are first-class MANAGED runtimes
+# (base-nodes.json runtimes[], boot=true), baked into dist/runtimes and spawned by the
+# orchestrator like io.api. They configure via CONFIG_SET/GET (no env, no EnvironmentFile)
+# and enforce motherbee-only with a fail-closed self-check in the binary — so there is NO
+# packaged systemd unit and NO .env for them here.
 
 # config template + first-boot helper. The packaging template is a clean
 # fresh-motherbee config (no lab uplink; wan.mtls set) — distinct from the dev
 # config/hive.yaml the lab uses.
 install -m0644 packaging/hive.yaml.example "$DEST/etc/fluxbee/hive.yaml.example"
-install -m0600 packaging/io-cloud.env.example "$DEST/etc/fluxbee/io-cloud.env.example"
-install -m0600 packaging/io-blob.env.example "$DEST/etc/fluxbee/io-blob.env.example"
 install -m0755 packaging/fluxbee-firstboot "$DEST/usr/share/fluxbee/fluxbee-firstboot"
 ln -sf ../share/fluxbee/fluxbee-firstboot "$DEST/usr/bin/fluxbee-firstboot"
 # The base-node manifest travels to the target too: fluxbee-firstboot reads it to know which
@@ -298,9 +255,9 @@ Maintainer: 4i Platform <ops@4iplatform.com>
 Description: Fluxbee internal-network orchestration mesh
  Core services (router, orchestrator, identity, vault, storage, admin,
  architect, cognition, policy, timer, wf-rules, opa-rules, frontdesk, edge)
- plus the singleton IO.cloud adapter and IO.blob public artifact curator (motherbee),
- and the instanced IO/AI runtimes (io.api, io.slack, io.wapp, ai.generic,
- wf.engine, io.linkedhelper) seeded under dist/runtimes per packaging/base-nodes.json.
+ plus the managed IO/AI runtimes (io.api, io.blob, io.cloud, io.slack, io.wapp,
+ ai.generic, wf.engine, io.linkedhelper) seeded under dist/runtimes per
+ packaging/base-nodes.json (io.blob + io.cloud are motherbee-only managed nodes).
  Binaries + dist/core manifest (hashes baked at build), systemd units, and a
  first-boot helper. Run 'sudo fluxbee-firstboot' after install.
 EOF

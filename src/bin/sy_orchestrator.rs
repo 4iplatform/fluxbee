@@ -4788,12 +4788,11 @@ fn validate_system_nodes(
     Ok(())
 }
 
-/// Map an allowlisted declarative node to its packaged systemd service.
+/// Map an allowlisted declarative node to its packaged systemd service. Only SY.* system
+/// authorities reach here now — IO.blob/IO.cloud are managed runtimes (no packaged unit), not
+/// lifecycle nodes, so they never pass through validate_system_nodes -> name_to_service.
 fn name_to_service(node_name: &str) -> String {
     let trimmed = node_name.trim();
-    if trimmed == "IO.blob" {
-        return "io-blob".to_string();
-    }
     let base = trimmed.strip_prefix("SY.").unwrap_or(trimmed);
     format!("sy-{}", base.to_ascii_lowercase().replace('.', "-"))
 }
@@ -9984,18 +9983,12 @@ fn node_kind_from_name(name: &str) -> String {
 
 fn managed_spawn_disallowed_reason(node_name: &str) -> Option<&'static str> {
     let local = node_name.split('@').next().unwrap_or(node_name).trim();
-    // Un singleton empaquetado ya tiene dueño de ciclo de vida: su unit de systemd. Adoptarlo como
-    // instancia gestionada crearia DOS duenos del mismo proceso.
-    //
-    // Y los guards que deberian frenar eso no alcanzan: el antidoble-arranque pregunta por una unit
-    // `fluxbee-node-<nombre>` que para un singleton no existe (siempre false), y el otro es la
-    // visibilidad en el LSA del router, que es una carrera y no una regla. El resultado seria dos
-    // procesos con el mismo nombre L2 — y el router entrega al primero que matchea en el FIB, asi
-    // que un CONFIG_SET caeria en uno u otro de forma no determinista.
-    //
-    // Hasta ahora esto no explotaba solo porque ningun singleton tenia config.json: nada que
-    // barrer. Eso es una proteccion accidental, no un contrato — y se cae en cuanto uno gana plano
-    // de control, que es justo lo que hace io.cloud.
+    // Guard de doble-dueño para singletons empaquetados: un nodo con unit propia de systemd no puede
+    // ser adoptado ademas como instancia gestionada (serian dos duenos del mismo proceso, dos L2 con
+    // el mismo nombre, y un CONFIG_SET caeria en uno u otro sin determinismo). El mecanismo se
+    // conserva, pero `PACKAGED_SINGLETON_NODES` quedo VACIO: io.blob e io.cloud —los ultimos
+    // singletons— pasaron a runtimes managed, asi que hoy este branch nunca se toma (no hay ninguna
+    // unit que pueda competir). Queda listo por si algun dia vuelve a existir un singleton.
     if fluxbee_sdk::is_packaged_singleton(local) {
         return Some(
             "managed spawn does not support packaged singletons; systemd owns their lifecycle",
@@ -24757,7 +24750,9 @@ mod tests {
     }
 
     #[test]
-    fn motherbee_role_accepts_packaged_io_blob_worker() {
+    fn motherbee_role_rejects_io_blob_as_lifecycle_node() {
+        // IO.blob is a MANAGED runtime now (the orchestrator spawns it via run_node), NOT a
+        // hive.yaml lifecycle node — validate_system_nodes must reject it even on the motherbee.
         let section = RoleSystemNodes {
             nodes: vec![
                 "SY.config.routes".to_string(),
@@ -24765,21 +24760,23 @@ mod tests {
                 "IO.blob".to_string(),
                 "SY.vault".to_string(),
             ],
-            wait_for: vec!["IO.blob".to_string()],
+            wait_for: vec![],
         };
-        assert!(validate_system_nodes(&section, HiveRole::Motherbee).is_ok());
-        assert_eq!(name_to_service("IO.blob"), "io-blob");
+        assert!(validate_system_nodes(&section, HiveRole::Motherbee).is_err());
     }
 
     #[test]
-    fn packaged_io_blob_worker_is_motherbee_only_and_allowlist_is_exact() {
-        let worker = RoleSystemNodes {
+    fn io_runtimes_are_never_hive_yaml_lifecycle_nodes() {
+        // Neither IO.blob nor IO.cloud may appear in hive.yaml system_nodes on ANY role: they are
+        // managed runtimes, not lifecycle authorities (the old singleton allowlist is now empty).
+        let blob_mb = RoleSystemNodes {
             nodes: vec!["SY.config.routes".to_string(), "IO.blob".to_string()],
             wait_for: vec![],
         };
-        assert!(validate_system_nodes(&worker, HiveRole::Worker).is_err());
+        assert!(validate_system_nodes(&blob_mb, HiveRole::Motherbee).is_err());
+        assert!(validate_system_nodes(&blob_mb, HiveRole::Worker).is_err());
 
-        let unknown_io = RoleSystemNodes {
+        let cloud_mb = RoleSystemNodes {
             nodes: vec![
                 "SY.config.routes".to_string(),
                 "IO.cloud".to_string(),
@@ -24787,7 +24784,7 @@ mod tests {
             ],
             wait_for: vec![],
         };
-        assert!(validate_system_nodes(&unknown_io, HiveRole::Motherbee).is_err());
+        assert!(validate_system_nodes(&cloud_mb, HiveRole::Motherbee).is_err());
     }
 
     #[test]
@@ -25840,36 +25837,29 @@ blob:
         );
     }
 
-    /// Un singleton empaquetado NUNCA puede ser adoptado como instancia gestionada.
+    /// IO.blob e IO.cloud fueron promovidos de singletons empaquetados a runtimes MANAGED.
     ///
-    /// Systemd ya es dueño de su ciclo de vida. Si el barrido que relanza nodos persistidos lo
-    /// adoptara habria dos duenos del mismo proceso y dos procesos con el mismo nombre L2 — y el
-    /// router entrega al primero que matchea en el FIB, asi que un CONFIG_SET caeria en uno u otro
-    /// sin determinismo.
-    ///
-    /// Hasta ahora no explotaba porque ningun singleton tenia config.json: no habia nada que
-    /// barrer. Proteccion accidental, no contrato. Se cae en cuanto uno gana plano de control.
+    /// Ya no tienen unit propia de systemd: el orquestador es su unico dueño (los instancia por
+    /// `run_node` y los relanza en `reconcile`), y se configuran por CONFIG_SET/GET. Por eso el
+    /// barrido de adopcion TIENE que relanzarlos — es su unico camino de arranque, como cualquier
+    /// runtime. El guard de doble-dueño (`managed_spawn_disallowed_reason` +
+    /// `PACKAGED_SINGLETON_NODES`) sigue existiendo, pero su lista quedo vacia: ya no hay ninguna
+    /// unit de systemd que pueda competir por el proceso.
     #[test]
-    fn un_singleton_empaquetado_nunca_se_adopta_como_instancia_gestionada() {
+    fn io_blob_y_io_cloud_ahora_se_adoptan_como_runtimes_gestionados() {
         for nombre in [
             "IO.cloud@motherbee",
             "IO.blob@motherbee",
             "io.cloud@motherbee",
-            "IO.cloud",
+            "IO.slack.default@motherbee",
+            "AI.chat@motherbee",
+            "WF.router@motherbee",
         ] {
             assert!(
-                managed_spawn_disallowed_reason(nombre).is_some(),
-                "{nombre} tiene unit propia: el orquestador no puede ser su segundo dueño"
-            );
-            assert!(!managed_reconcile_candidate_allowed(nombre));
-        }
-
-        // Los runtimes de verdad siguen siendo adoptables — es su unico camino de arranque.
-        for nombre in ["IO.slack.default@motherbee", "AI.chat@motherbee", "WF.router@motherbee"] {
-            assert!(
                 managed_spawn_disallowed_reason(nombre).is_none(),
-                "{nombre} es un runtime: el boot pass TIENE que relanzarlo"
+                "{nombre} es un runtime managed: el boot pass TIENE que relanzarlo"
             );
+            assert!(managed_reconcile_candidate_allowed(nombre));
         }
     }
 

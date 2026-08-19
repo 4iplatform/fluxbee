@@ -704,6 +704,7 @@ name = "io-blob"
 version = "0.1.0"
 dependencies = [
  "fluxbee-sdk",
+ "io-common",
  "nix",
  "serde",
  "serde_json",

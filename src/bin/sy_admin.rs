@@ -4703,19 +4703,70 @@ async fn handle_publish_cloud_endpoint(
     // Reusa el camino real (acuña -> guarda en vault -> manda solo el secret_ref al edge). El
     // `caller_l2_name: None` es el camino interno confiable del servidor HTTP del operador, ya
     // contemplado por authorize_channel_command.
-    handle_externalize(
+    let externalize = handle_externalize(
         ctx,
         client,
         serde_json::json!({
             "ich": ich,
-            "edge_node": edge_node,
+            "edge_node": edge_node.clone(),
             "auth_mode": "shared-secret",
             "inbound_family": "user",
             "methods": ["POST"],
         }),
         None,
     )
-    .await
+    .await?;
+
+    // Record the edge into IO.cloud's MANAGED config so the node trusts it for inbound traffic —
+    // the contract's happy path ("publish_cloud_endpoint publica el endpoint Y deja asentado el
+    // edge_node"). io.cloud reads config.io.edge_node LIVE from its control plane, so this takes
+    // effect with no restart and no token rotation. Only when the externalize actually succeeded:
+    // there is nothing to trust otherwise. This replaces the old poison IO_CLOUD_EDGE_NODE env.
+    let externalized_ok =
+        externalize.envelope.get("status").and_then(|v| v.as_str()) == Some("ok");
+    if externalized_ok {
+        let record = handle_admin_command(
+            ctx,
+            client,
+            "set_node_config",
+            serde_json::json!({
+                "node_name": cloud_node.clone(),
+                "config": { "io": { "edge_node": edge_node.clone() } },
+            }),
+            Some(ctx.hive_id.clone()),
+        )
+        .await;
+        match record {
+            Ok((status, _)) if status < 400 => {
+                tracing::info!(
+                    cloud_node = %cloud_node,
+                    edge_node = %edge_node,
+                    "publish_cloud_endpoint: edge_node asentado en el config de IO.cloud"
+                );
+            }
+            Ok((status, body)) => {
+                return Ok(internal_service_error(
+                    "publish_cloud_endpoint",
+                    "CONFIG_RECORD_FAILED",
+                    &format!(
+                        "endpoint published but recording edge_node into {cloud_node} config failed \
+                         (HTTP {status}): {body}. Re-run publish_cloud_endpoint to re-record."
+                    ),
+                ));
+            }
+            Err(err) => {
+                return Ok(internal_service_error(
+                    "publish_cloud_endpoint",
+                    "CONFIG_RECORD_FAILED",
+                    &format!(
+                        "endpoint published but recording edge_node into {cloud_node} config failed: \
+                         {err}. Re-run publish_cloud_endpoint to re-record."
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(externalize)
 }
 
 async fn handle_externalize(

@@ -8,8 +8,10 @@
     "",
     "TO ADD A NODE TO THE INSTALL: add one entry below (and make sure its crate builds).",
     "",
-    "singletons: motherbee-only infra nodes that RUN AT BOOT via a packaged systemd unit",
-    "  (one per hive; e.g. IO.blob, IO.cloud). 'role_gate' restricts the unit to that role.",
+    "singletons: motherbee-only infra nodes run by a packaged systemd unit. NOW EMPTY: IO.blob and",
+    "  IO.cloud were promoted to first-class MANAGED runtimes (below) so they configure via",
+    "  CONFIG_SET/GET like every other IO node instead of ENV. They enforce motherbee-only via a",
+    "  fail-closed self-check in the binary (no systemd ExecCondition anymore).",
     "runtimes: instanced nodes baked into dist/runtimes/<runtime>/<version>, spawnable",
     "  per-tenant on demand via run_node. When 'boot': true, fluxbee-firstboot auto-spawns",
     "  one default instance ('instance') at the root tenant so it is RUNNING at boot",
@@ -20,24 +22,7 @@
     "Growth BEYOND this base set does NOT need a new .deb: publish the runtime and push a",
     "SYSTEM_UPDATE category=runtime over the existing dist-sync/manifest channel."
   ],
-  "singletons": [
-    {
-      "node": "IO.blob",
-      "crate": "io-blob",
-      "bin": "io-blob",
-      "workspace": "nodes/io",
-      "unit": "io-blob",
-      "role_gate": "motherbee"
-    },
-    {
-      "node": "IO.cloud",
-      "crate": "io-cloud",
-      "bin": "io-cloud",
-      "workspace": "nodes/io",
-      "unit": "io-cloud",
-      "role_gate": "motherbee"
-    }
-  ],
+  "singletons": [],
   "runtimes": [
     {
       "runtime": "io.api",
@@ -46,6 +31,24 @@
       "workspace": "nodes/io",
       "boot": true,
       "instance": "IO.api@motherbee"
+    },
+    {
+      "_note": "io.blob is the motherbee-local public-artifact curator. Promoted from a systemd singleton to a first-class MANAGED runtime: it boots DEGRADED (a curator with default paths + default max_bytes is a valid unconfigured node) and takes config (io.max_bytes / io.admin_hive) via CONFIG_SET/GET, NO env. Motherbee-only is enforced by a fail-closed self-check in the binary. Bare instance name (not .default) because it is a true singleton, not a fanout family.",
+      "runtime": "io.blob",
+      "crate": "io-blob",
+      "bin": "io-blob",
+      "workspace": "nodes/io",
+      "boot": true,
+      "instance": "IO.blob@motherbee"
+    },
+    {
+      "_note": "io.cloud is the in-mesh Fluxbee Cloud provisioning relay. Promoted from a systemd singleton to a first-class MANAGED runtime: it boots DEGRADED (an io.cloud with no trusted edge is valid — it serves the mesh and trusts no edge yet) and takes its single config field io.edge_node via CONFIG_SET/GET, NO env. publish_cloud_endpoint records the edge into this node's config as part of publishing. Motherbee-only via a fail-closed self-check; externalize is admin-driven (io.cloud does NOT self-externalize at boot). Bare instance name (true singleton).",
+      "runtime": "io.cloud",
+      "crate": "io-cloud",
+      "bin": "io-cloud",
+      "workspace": "nodes/io",
+      "boot": true,
+      "instance": "IO.cloud@motherbee"
     },
     {
       "runtime": "io.slack",

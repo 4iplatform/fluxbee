@@ -7314,7 +7314,9 @@ mod tests {
     }
 
     #[test]
-    fn packaged_io_blob_is_lifecycle_managed_without_system_ilk() {
+    fn io_blob_is_no_longer_an_allowlisted_hive_yaml_lifecycle_node() {
+        // IO.blob was promoted from a packaged singleton to a managed runtime, so it is no longer
+        // allowed in hive.yaml system_nodes — Identity rejects the hive config, same as io.cloud.
         let mut hive = test_hive(Some("SY.frontdesk.gov@motherbee"));
         hive.system_nodes
             .as_mut()
@@ -7323,20 +7325,7 @@ mod tests {
             .nodes
             .push("IO.blob".to_string());
 
-        let system_nodes = system_nodes_for_hive(&hive).expect("read system authorities");
-        assert_eq!(system_nodes, vec!["SY.identity", "SY.architect"]);
-
-        let mut store = IdentityStore::default();
-        let changed = store
-            .ensure_system_ilks_from_hive(&hive)
-            .expect("seed only system authorities");
-        assert_eq!(changed.len(), 2);
-        assert!(!store.ilks.values().any(|ilk| {
-            ilk.identification
-                .get("system_node")
-                .and_then(Value::as_str)
-                == Some("IO.blob")
-        }));
+        assert!(system_nodes_for_hive(&hive).is_err());
     }
 
     #[test]

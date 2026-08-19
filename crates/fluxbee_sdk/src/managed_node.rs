@@ -44,25 +44,22 @@ pub fn managed_node_instance_dir_with_root(
 
 /// Singletons que arranca el PAQUETE con su propia unit de systemd.
 ///
-/// `base-nodes.json` los declara con `unit` y `role_gate`; systemd es el dueño de su ciclo de vida.
-/// Eso los distingue de los runtimes, que nacen por `run_node` y a los que el orquestador relanza.
+/// **VACÍO a proposito.** `IO.blob` e `IO.cloud` — los ultimos dos singletons — fueron promovidos a
+/// runtimes MANAGED (`base-nodes.json` runtimes[], boot=true): el orquestador los instancia por
+/// `run_node` y los relanza en `reconcile`, y se configuran por CONFIG_SET/GET en vez de ENV, como
+/// todos los nodos IO. Ya no hay ningun nodo cuyo ciclo de vida sea de systemd en vez del
+/// orquestador, asi que el barrido de adopcion los adopta sin peligro de doble-dueno: no queda unit
+/// de systemd que compita por el proceso.
 ///
-/// Sirve para UNA sola cosa: que el barrido que relanza nodos persistidos **nunca los adopte**. Si
-/// lo hiciera habria dos duenos del mismo proceso y dos procesos con el mismo nombre L2 — y el
-/// router entrega al primero que matchea en el FIB, asi que un CONFIG_SET caeria en uno u otro sin
-/// determinismo.
-///
-/// OJO, no confundir con [`HIVE_YAML_NON_SY_LIFECYCLE_NODES`]: ser singleton empaquetado NO
-/// habilita a declararse como nodo de ciclo de vida en `hive.yaml`. Son dos permisos distintos y
-/// fusionarlos rompe un test que lo fija a proposito.
-pub const PACKAGED_SINGLETON_NODES: &[&str] = &["IO.blob", "IO.cloud"];
+/// Se conserva el mecanismo (`is_packaged_singleton` + el gate de adopcion) por si en el futuro
+/// volviera a existir un singleton empaquetado.
+pub const PACKAGED_SINGLETON_NODES: &[&str] = &[];
 
 /// Los unicos nodos NO-`SY.*` que `hive.yaml` acepta en su lista de nodos de ciclo de vida.
 ///
-/// Mas restrictivo que [`PACKAGED_SINGLETON_NODES`] a proposito: `IO.cloud` es un singleton
-/// empaquetado pero NO participa del orden de arranque del hive, y declararlo ahi seria darle una
-/// responsabilidad que no tiene.
-pub const HIVE_YAML_NON_SY_LIFECYCLE_NODES: &[&str] = &["IO.blob"];
+/// **VACÍO a proposito.** Los runtimes managed (io.api, io.blob, io.cloud, io.slack, ...) NO se
+/// declaran en `hive.yaml` `system_nodes`: nacen por `run_node` y el orquestador los reconcilia.
+pub const HIVE_YAML_NON_SY_LIFECYCLE_NODES: &[&str] = &[];
 
 /// True cuando el nombre L2 (con o sin `@hive`) es un singleton empaquetado.
 pub fn is_packaged_singleton(node_name: &str) -> bool {

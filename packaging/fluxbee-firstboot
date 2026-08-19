@@ -110,11 +110,9 @@ if [ "$HIVE_READY" != "1" ]; then
   echo "first-boot failed: hive did not become ready." >&2
   exit 1
 fi
-# Start the singleton infra nodes (IO.blob, IO.cloud) from the manifest; fall back to the known
-# two if the manifest is missing.
-SINGLETON_UNITS="$(mf singleton_units)"
-[ -n "$SINGLETON_UNITS" ] || SINGLETON_UNITS=$'io-cloud\nio-blob'
-for u in $SINGLETON_UNITS; do systemctl start "$u" 2>/dev/null || true; done
+# IO.blob and IO.cloud are no longer systemd singletons: they are boot=true managed runtimes,
+# spawned below by the same boot_runtimes loop as io.api/io.slack/ai.chat (they come up degraded
+# until configured via CONFIG_SET). Nothing to start here anymore.
 
 echo "== [6/6] spawn base node instances (running, degraded until configured) =="
 # Auto-spawn one default instance of each boot=true runtime at the root tenant. They come up
