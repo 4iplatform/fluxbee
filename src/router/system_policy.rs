@@ -9,11 +9,18 @@
 //! Rego in `policy/system.rego`, compiled to the baked `policy/system.wasm` (build-time, with
 //! the SAME OPA compiler the user path uses — the `sy-opa-rules compile-file` mode — so it is
 //! non-user-editable and structurally unreachable from the `/opa/policy*` authoring endpoints).
-//! `authorize_system()` evaluates that policy at the delivery gate; `authority()` — the
-//! byte-identical Rust table, SHADOW-VERIFIED against the Rego in tests — is the load-failure
-//! FALLBACK and the sync spec. A future runtime-editable backing (a second SHM region +
-//! privileged writer, "OPA-dual Phase 4") only changes how the resolver is FED — not the call
-//! sites nor `authorize_system()`'s contract.
+//! `authorize_system()` evaluates that policy at the delivery gate. There is NO Rust fallback
+//! table: the Rego is the SINGLE SOURCE OF TRUTH. If the baked wasm fails to load, the router
+//! FAILS CLOSED — `ensure_system_policy_loaded()` (called at `Router::run` startup) refuses to
+//! start rather than silently degrade. Behavioral tests load the baked wasm and assert the
+//! expected truth table. A future runtime-editable backing (a second SHM region + privileged
+//! writer, "OPA-dual Phase 4") only changes how the resolver is FED — not the call sites nor
+//! `authorize_system()`'s contract.
+//!
+//! This file also hosts the SYSTEM routing-SELECTION entrypoint `frontdesk_route`
+//! (`route_to_frontdesk()`): whether an unidentified (no ilk) or `temporary` sender is force-
+//! routed to the identity frontdesk — the decision that used to be a hardcoded `if` in the router
+//! (`apply_identity_pre_resolve`). Same baked-wasm / single-source / fail-closed model as `allow`.
 //!
 //! Composition contract: `final_allow = system_allow AND user_allow`, and a SYSTEM deny is
 //! FINAL — the user layer may only narrow, never broaden, and can never sever the cross-hive
@@ -63,7 +70,7 @@ pub const PRIMARY_HIVE_ID: &str = "motherbee";
 /// The single node authorized to COMMAND an edge (open/close/list URLs) and to receive its
 /// control responses: `SY.admin` on the primary hive. Canonical name — the router's
 /// edge-control reachability gates and the edge's own service-command check all reference
-/// THIS constant so the copies of the literal cannot drift. (`authority()`'s edge branch
+/// THIS constant so the copies of the literal cannot drift. (`policy/system.rego` rule (1)
 /// composes the same decision from role + PRIMARY_HIVE_ID.)
 pub const EDGE_CONTROL_AUTHORITY: &str = "SY.admin@motherbee";
 
@@ -84,69 +91,14 @@ pub fn is_protected_system_action(action: &str) -> bool {
     PROTECTED_SYSTEM_ACTIONS.contains(&action)
 }
 
-/// SYSTEM authority decision for a protected SYSTEM `action`, keyed on the
-/// router-resolved (authoritative) `src_l2_name`. `hive_id` is THIS router's hive.
-/// Returns `true` to ALLOW.
-///
-/// - `SY.orchestrator@<any hive>`: cross-hive forwards (a peer orchestrator
-///   relays SPAWN_NODE/etc. into this hive). Authorized from ANY hive — this is
-///   the cross-hive control plane and must never be denied by a user layer.
-/// - `SY.admin` / `SY.wf-rules` / `WF.orch.diag`: same-hive control plane, all
-///   protected actions.
-/// - `SY.admin@motherbee`: cross-hive `CONFIG_GET` / `CONFIG_SET` and runtime distribution,
-///   because the global Admin forwards those requests directly to managed nodes/orchestrators.
-/// - `SY.config-routes` / `SY.vault`: same-hive, ONLY for `NODE_STATUS_GET` — a
-///   read-only health probe that SY.architect intentionally opens to these nodes;
-///   honoring it here keeps one consistent probe policy across every receiver.
-///
-/// `src_l2_name` is router-authoritative (resolved from the source UUID against
-/// the node registry, overwriting any sender-supplied value), so this is a real
-/// boundary, not a self-asserted one. The `SY.` patterns are also surfaced as
-/// frozen SHM route entries for observability (see `crate::shm::FLAG_FROZEN`).
-pub fn authority(action: &str, src_l2_name: Option<&str>, hive_id: &str) -> bool {
-    let Some(name) = src_l2_name.map(str::trim).filter(|value| !value.is_empty()) else {
-        return false;
-    };
-    let Some((role, hive)) = name.split_once('@') else {
-        return false;
-    };
-    if is_edge_service_action(action) {
-        return role == "SY.admin" && hive == PRIMARY_HIVE_ID;
-    }
-    // Option B (WAN multi-hop reachability): only the primary hub's gateway router may vouch
-    // transitive reachability. Byte-identical to system.rego rule (6); shadow-verified.
-    if action == "WAN_REACHABILITY_VOUCH" {
-        return role == "RT.gateway" && hive == PRIMARY_HIVE_ID;
-    }
-    if matches!(
-        action,
-        "CONFIG_GET" | "CONFIG_SET" | "SYSTEM_UPDATE" | "SYSTEM_SYNC_HINT"
-    ) {
-        return role == "SY.admin" && hive == PRIMARY_HIVE_ID
-            || role == "SY.orchestrator" && !hive.is_empty();
-    }
-    if role == "SY.orchestrator" {
-        // Any hive, but the hive label must be non-empty (rejects "SY.orchestrator@").
-        return !hive.is_empty();
-    }
-    if hive != hive_id {
-        return false; // every remaining role is same-hive only
-    }
-    if matches!(role, "SY.admin" | "SY.wf-rules" | "WF.orch.diag") {
-        return true;
-    }
-    // Read-only health probe opened to the config/vault nodes (never mutations).
-    action == "NODE_STATUS_GET" && matches!(role, "SY.config-routes" | "SY.vault")
-}
-
 /// Option B (WAN multi-hop reachability, edge-multihop-reachability-spec-v1): may the mTLS-
 /// authenticated `voucher_hive` VOUCH transitive reachability of other hives' nodes to a spoke?
 /// Only the primary hub may — it is the star's single relay.
 ///
 /// OPA-BACKED, exactly like the rest of the SYSTEM authority surface: it evaluates the baked
 /// `system.wasm` (`policy/system.rego` rule (6), action `WAN_REACHABILITY_VOUCH`) through
-/// `authorize_system`, with the byte-identical Rust `authority()` table as the load-failure
-/// fallback (shadow-verified). The voucher is identified by its gateway router name
+/// `authorize_system` (single source of truth; no Rust fallback — the router fails closed at
+/// startup if the wasm cannot load). The voucher is identified by its gateway router name
 /// `RT.gateway@<voucher_hive>`; `hive_id` is irrelevant to this rule so the primary hive is passed.
 ///
 /// A vouched node is admitted for DATA delivery ONLY; SYSTEM authority stays strict and is denied
@@ -161,10 +113,11 @@ pub fn wan_reachability_voucher_allowed(voucher_hive: &str) -> bool {
     )
 }
 
-/// The BAKED system policy resolver: `policy/system.wasm` (compiled from `policy/system.rego`).
-/// Hive-agnostic — `hive_id` is an INPUT, not baked — so ONE resolver serves every hive. Lazily
-/// loaded once; on load failure it stays unloaded and `authorize_system` falls back to the
-/// byte-identical Rust `authority()` table (fail-safe).
+/// The BAKED system AUTHORITY resolver: `policy/system.wasm` (entrypoint `fluxbee/system/allow`,
+/// compiled from `policy/system.rego`). Hive-agnostic — `hive_id` is an INPUT, not baked — so ONE
+/// resolver serves every hive. Lazily loaded once; a load failure is a corrupt/incompatible baked
+/// artifact and is caught at startup by `ensure_system_policy_loaded()`, which fails the router
+/// closed (there is NO Rust fallback — the Rego is the single source of truth).
 static SYSTEM_POLICY_OPA: OnceLock<Mutex<OpaResolver>> = OnceLock::new();
 
 fn system_policy_opa() -> &'static Mutex<OpaResolver> {
@@ -173,32 +126,118 @@ fn system_policy_opa() -> &'static Mutex<OpaResolver> {
         let mut resolver = OpaResolver::new();
         if let Err(err) = resolver.reload(1, Some("fluxbee/system/allow".to_string()), WASM, None)
         {
-            tracing::warn!(error = %err, "system-policy OPA failed to load; using the Rust authority() fallback");
+            tracing::error!(error = %err, "baked system.wasm (fluxbee/system/allow) failed to load; the router will fail closed at startup");
         }
         Mutex::new(resolver)
     })
 }
 
+/// The BAKED system SELECTION resolver: `policy/system_route.wasm` (entrypoint
+/// `fluxbee/system/frontdesk_route`, compiled from the SAME `policy/system.rego`). Same baked /
+/// single-source / fail-closed model as `SYSTEM_POLICY_OPA`.
+static SYSTEM_ROUTE_OPA: OnceLock<Mutex<OpaResolver>> = OnceLock::new();
+
+fn system_route_opa() -> &'static Mutex<OpaResolver> {
+    SYSTEM_ROUTE_OPA.get_or_init(|| {
+        const WASM: &[u8] = include_bytes!("../../policy/system_route.wasm");
+        let mut resolver = OpaResolver::new();
+        if let Err(err) = resolver.reload(
+            1,
+            Some("fluxbee/system/frontdesk_route".to_string()),
+            WASM,
+            None,
+        ) {
+            tracing::error!(error = %err, "baked system_route.wasm (fluxbee/system/frontdesk_route) failed to load; the router will fail closed at startup");
+        }
+        Mutex::new(resolver)
+    })
+}
+
+/// Force-load BOTH baked SYSTEM policy resolvers and prove they evaluate. Called once at
+/// `Router::run` startup: the wasms are baked into the binary via `include_bytes!`, so a load
+/// failure means a corrupt/incompatible build artifact — the router has no business running
+/// without its authority + routing policy, so it FAILS CLOSED (returns `Err`, refusing to start)
+/// rather than silently degrading. This is the ONE place the "if the Rego doesn't load, don't
+/// run" contract is enforced; there is deliberately no Rust fallback table anywhere.
+pub fn ensure_system_policy_loaded() -> Result<(), String> {
+    {
+        let mut resolver = system_policy_opa()
+            .lock()
+            .map_err(|_| "system authority policy mutex poisoned".to_string())?;
+        let probe = serde_json::json!({
+            "action": "NODE_STATUS_GET",
+            "src_l2_name": "SY.vault@motherbee",
+            "hive_id": "motherbee",
+        });
+        resolver
+            .evaluate_allow(&probe, None)
+            .map_err(|err| format!("baked system.wasm (fluxbee/system/allow) unusable: {err}"))?;
+    }
+    {
+        let mut resolver = system_route_opa()
+            .lock()
+            .map_err(|_| "system route policy mutex poisoned".to_string())?;
+        let probe = serde_json::json!({
+            "src_ilk_present": true,
+            "registration_status": "complete",
+        });
+        resolver.evaluate_allow(&probe, None).map_err(|err| {
+            format!("baked system_route.wasm (fluxbee/system/frontdesk_route) unusable: {err}")
+        })?;
+    }
+    Ok(())
+}
+
 /// SYSTEM authority decision, OPA-BACKED — this is what the router's delivery gate calls.
 /// Evaluates the baked Rego policy (entrypoint `fluxbee/system/allow`) with input
-/// `{action, src_l2_name, hive_id}`, and FALLS BACK to the byte-identical Rust `authority()` if
-/// the policy is not loaded or errs (so a wasm load failure never opens or closes the gate
-/// wrongly). The Rego and the fallback are kept in lock-step by the shadow-verify test.
+/// `{action, src_l2_name, hive_id}`. FAIL-CLOSED: a poisoned lock or eval error DENIES (there is
+/// no Rust fallback). In practice unreachable — `ensure_system_policy_loaded()` proved the wasm
+/// evaluates at startup or the router never got here.
 ///
 /// NOTE: locks a Mutex + runs a wasm eval per protected-action delivery — control-plane path
 /// only (protected SYSTEM actions), and the policy is a tiny fixed program.
 pub fn authorize_system(action: &str, src_l2_name: Option<&str>, hive_id: &str) -> bool {
-    if let Ok(mut resolver) = system_policy_opa().lock() {
-        let input = serde_json::json!({
-            "action": action,
-            "src_l2_name": src_l2_name,
-            "hive_id": hive_id,
-        });
-        if let Ok(allow) = resolver.evaluate_allow(&input, None) {
-            return allow;
+    let Ok(mut resolver) = system_policy_opa().lock() else {
+        tracing::error!(action, "system authority policy mutex poisoned; failing closed (deny)");
+        return false;
+    };
+    let input = serde_json::json!({
+        "action": action,
+        "src_l2_name": src_l2_name,
+        "hive_id": hive_id,
+    });
+    match resolver.evaluate_allow(&input, None) {
+        Ok(allow) => allow,
+        Err(err) => {
+            tracing::error!(action, error = %err, "system authority policy eval failed; failing closed (deny)");
+            false
         }
     }
-    authority(action, src_l2_name, hive_id)
+}
+
+/// SYSTEM routing-SELECTION decision: should this sender be force-routed to the identity
+/// frontdesk? OPA-BACKED (entrypoint `fluxbee/system/frontdesk_route`), input
+/// `{src_ilk_present, registration_status}`. Returns only the yes/no — the frontdesk NODE NAME is
+/// per-hive Rust config, substituted by the router caller. Single source of truth = the Rego (no
+/// fallback). On a poisoned lock or eval error (unreachable post-startup) it returns `false` (do
+/// NOT force), preserving normal routing rather than mass-redirecting; startup already guaranteed
+/// the wasm evaluates.
+pub fn route_to_frontdesk(registration_status: Option<&str>, src_ilk_present: bool) -> bool {
+    let Ok(mut resolver) = system_route_opa().lock() else {
+        tracing::error!("system route policy mutex poisoned; not forcing frontdesk");
+        return false;
+    };
+    let input = serde_json::json!({
+        "src_ilk_present": src_ilk_present,
+        "registration_status": registration_status,
+    });
+    match resolver.evaluate_allow(&input, None) {
+        Ok(route) => route,
+        Err(err) => {
+            tracing::error!(error = %err, "system route policy eval failed; not forcing frontdesk");
+            false
+        }
+    }
 }
 
 /// Shared "same-hive origin allowlist" primitive — the ONE place the per-subsystem origin
@@ -226,7 +265,7 @@ pub fn same_hive_role_allowed(
 
 /// Prefix-based origin allowlist with a same-hive constraint on privileged prefixes — the
 /// identity-style authority shape, shared so its same-hive scoping can't drift from the
-/// router's `authority()` rule (F-07). `name` is allowed iff it starts with one of
+/// router's `authorize_system()` rule (F-07). `name` is allowed iff it starts with one of
 /// `allowed_prefixes` AND — if that matched prefix is in `same_hive_only` — the `@<hive>`
 /// suffix equals `hive_id` (fail-closed on a missing/malformed suffix). Prefixes NOT in
 /// `same_hive_only` (e.g. `IO.`, `SY.orchestrator@`) are legitimately cross-hive. The
@@ -252,59 +291,6 @@ pub fn prefix_allowed_same_hive_scoped(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn authorize_system_matches_authority_via_baked_wasm() {
-        // The production gate entry (authorize_system, OPA-backed by the lazily-loaded baked
-        // system.wasm) must agree with the Rust authority() fallback across the matrix — proving
-        // the wired-in Rego policy is byte-identical and the gate's behavior is unchanged.
-        let actions = [
-            "EDGE_OPEN_URL",
-            "EDGE_CLOSE_URL",
-            "EDGE_LIST_URLS",
-            "EDGE_PUBLISH_BLOB",
-            "EDGE_UNPUBLISH_BLOB",
-            "SPAWN_NODE",
-            "KILL_NODE",
-            "NODE_STATUS_GET",
-            "NODE_CONFIG_SET",
-            "CONFIG_SET",
-            "CONFIG_GET",
-            "SYSTEM_SYNC_HINT",
-            "ADD_HIVE_FINALIZE",
-            "SYSTEM_UPDATE",
-            "WAN_REACHABILITY_VOUCH",
-        ];
-        let names: [Option<&str>; 16] = [
-            Some("SY.admin@motherbee"),
-            Some("SY.admin@worker1"),
-            Some("SY.admin@edge-1"),
-            Some("SY.orchestrator@motherbee"),
-            Some("SY.orchestrator@worker1"),
-            Some("SY.orchestrator@"),
-            Some("SY.wf-rules@motherbee"),
-            Some("WF.orch.diag@motherbee"),
-            Some("SY.config-routes@motherbee"),
-            Some("SY.vault@motherbee"),
-            Some("IO.cloud@motherbee"),
-            Some("RT.gateway@motherbee"),
-            Some("RT.gateway@worker1"),
-            Some("RT.gateway@ingress1"),
-            Some(""),
-            None,
-        ];
-        for action in actions {
-            for name in names {
-                for hive in ["motherbee", "ingress1"] {
-                    assert_eq!(
-                        authorize_system(action, name, hive),
-                        authority(action, name, hive),
-                        "authorize_system != authority for action={action} name={name:?} hive={hive}"
-                    );
-                }
-            }
-        }
-    }
 
     #[test]
     fn prefix_allowed_same_hive_scoped_enforces_scope() {
@@ -395,24 +381,24 @@ mod tests {
     }
 
     #[test]
-    fn authority_enforces_role_and_hive_scope() {
+    fn authorize_system_enforces_role_and_hive_scope() {
         let hive = "motherbee";
         let act = "SPAWN_NODE"; // a mutation, strict scope
                                 // SY.orchestrator: any hive (cross-hive forwards).
-        assert!(authority(act, Some("SY.orchestrator@motherbee"), hive));
-        assert!(authority(act, Some("SY.orchestrator@worker1"), hive));
-        assert!(authority(act, Some("  SY.orchestrator@worker1  "), hive));
+        assert!(authorize_system(act, Some("SY.orchestrator@motherbee"), hive));
+        assert!(authorize_system(act, Some("SY.orchestrator@worker1"), hive));
+        assert!(authorize_system(act, Some("  SY.orchestrator@worker1  "), hive));
         // Exact role label (rejects relay/sub-name spoof) + non-empty hive.
-        assert!(!authority(
+        assert!(!authorize_system(
             act,
             Some("SY.orchestrator.relay.123@motherbee"),
             hive
         ));
-        assert!(!authority(act, Some("SY.orchestrator@"), hive));
+        assert!(!authorize_system(act, Some("SY.orchestrator@"), hive));
         // same-hive control plane.
         for role in ["SY.admin", "SY.wf-rules", "WF.orch.diag"] {
-            assert!(authority(act, Some(&format!("{role}@motherbee")), hive));
-            assert!(!authority(act, Some(&format!("{role}@worker1")), hive));
+            assert!(authorize_system(act, Some(&format!("{role}@motherbee")), hive));
+            assert!(!authorize_system(act, Some(&format!("{role}@worker1")), hive));
         }
         // Rejected for a mutation.
         for bad in [
@@ -427,32 +413,32 @@ mod tests {
             Some("SY.identity@motherbee"),
         ] {
             assert!(
-                !authority(act, bad, hive),
+                !authorize_system(act, bad, hive),
                 "{bad:?} must be rejected for {act}"
             );
         }
         // NODE_STATUS_GET read-probe opens to config-routes/vault same-hive only.
-        assert!(authority(
+        assert!(authorize_system(
             "NODE_STATUS_GET",
             Some("SY.config-routes@motherbee"),
             hive
         ));
-        assert!(authority(
+        assert!(authorize_system(
             "NODE_STATUS_GET",
             Some("SY.vault@motherbee"),
             hive
         ));
-        assert!(!authority(
+        assert!(!authorize_system(
             "NODE_STATUS_GET",
             Some("SY.config-routes@worker1"),
             hive
         ));
-        assert!(!authority(
+        assert!(!authorize_system(
             "SPAWN_NODE",
             Some("SY.config-routes@motherbee"),
             hive
         ));
-        assert!(!authority(
+        assert!(!authorize_system(
             "NODE_STATUS_GET",
             Some("AI.evil@motherbee"),
             hive
@@ -467,15 +453,15 @@ mod tests {
             "SYSTEM_UPDATE",
             "SYSTEM_SYNC_HINT",
         ] {
-            assert!(authority(action, Some("SY.admin@motherbee"), "worker-220"));
-            assert!(!authority(
+            assert!(authorize_system(action, Some("SY.admin@motherbee"), "worker-220"));
+            assert!(!authorize_system(
                 action,
                 Some("SY.admin@worker-220"),
                 "worker-220"
             ));
-            assert!(!authority(action, Some("SY.admin@other"), "worker-220"));
+            assert!(!authorize_system(action, Some("SY.admin@other"), "worker-220"));
         }
-        assert!(!authority(
+        assert!(!authorize_system(
             "SPAWN_NODE",
             Some("SY.admin@motherbee"),
             "worker-220"
@@ -493,11 +479,11 @@ mod tests {
         for action in ["CONFIG_GET", "CONFIG_SET"] {
             // Admitted authorities.
             assert!(
-                authority(action, Some("SY.admin@motherbee"), hive),
+                authorize_system(action, Some("SY.admin@motherbee"), hive),
                 "{action}: SY.admin@motherbee must be admitted"
             );
             assert!(
-                authority(action, Some("SY.orchestrator@worker-220"), hive),
+                authorize_system(action, Some("SY.orchestrator@worker-220"), hive),
                 "{action}: SY.orchestrator@<hive> must be admitted"
             );
             // Denied: non-SY application origins on the same VPN.
@@ -510,14 +496,8 @@ mod tests {
                 None,                        // unstamped / transitively-vouched origin
             ] {
                 assert!(
-                    !authority(action, rogue, hive),
+                    !authorize_system(action, rogue, hive),
                     "{action}: origin {rogue:?} must be denied"
-                );
-                // The OPA-backed production gate must agree with the Rust table.
-                assert_eq!(
-                    authorize_system(action, rogue, hive),
-                    authority(action, rogue, hive),
-                    "{action}: authorize_system disagrees with authority for {rogue:?}"
                 );
             }
         }
@@ -575,15 +555,44 @@ mod tests {
             "EDGE_PUBLISH_BLOB",
             "EDGE_UNPUBLISH_BLOB",
         ] {
-            assert!(authority(action, Some("SY.admin@motherbee"), ingress_hive));
-            assert!(!authority(action, Some("SY.admin@edge-1"), ingress_hive));
-            assert!(!authority(
+            assert!(authorize_system(action, Some("SY.admin@motherbee"), ingress_hive));
+            assert!(!authorize_system(action, Some("SY.admin@edge-1"), ingress_hive));
+            assert!(!authorize_system(
                 action,
                 Some("SY.orchestrator@motherbee"),
                 ingress_hive
             ));
-            assert!(!authority(action, Some("IO.cloud@motherbee"), ingress_hive));
-            assert!(!authority(action, None, ingress_hive));
+            assert!(!authorize_system(action, Some("IO.cloud@motherbee"), ingress_hive));
+            assert!(!authorize_system(action, None, ingress_hive));
         }
+    }
+
+    #[test]
+    fn ensure_system_policy_loaded_ok_for_baked_wasms() {
+        // The baked system.wasm + system_route.wasm must load & evaluate, or the router fails
+        // closed at startup. This is the single guard that the committed wasms are usable.
+        ensure_system_policy_loaded().expect("baked SYSTEM policy wasms must load");
+    }
+
+    #[test]
+    fn route_to_frontdesk_forces_none_and_temporary_only() {
+        // The moved routing decision, now OPA-backed (policy/system_route.wasm). Truth table:
+        //   no src_ilk at all              -> frontdesk (the NEW None case)
+        //   present + "temporary"          -> frontdesk (the moved `if`)
+        //   present + partial/complete/etc -> NOT forced (flow to operator OPA)
+        //   present + null status (edge self_ilk) -> NOT forced
+
+        // (a) No ilk on the message -> always force, regardless of status value.
+        assert!(route_to_frontdesk(None, false));
+        assert!(route_to_frontdesk(Some("temporary"), false));
+        assert!(route_to_frontdesk(Some("complete"), false));
+
+        // (b) Present ilk: only "temporary" forces.
+        assert!(route_to_frontdesk(Some("temporary"), true));
+        assert!(!route_to_frontdesk(Some("partial"), true));
+        assert!(!route_to_frontdesk(Some("complete"), true));
+        assert!(!route_to_frontdesk(Some("unknown"), true));
+        // Present-but-unresolved (edge-stamped system self_ilk): status null, src_ilk PRESENT.
+        assert!(!route_to_frontdesk(None, true));
     }
 }

@@ -2865,7 +2865,7 @@ impl IdentityRuntime {
         // Same-hive-only roles: a privileged SY control-plane identity from ANOTHER hive must
         // not administer THIS hive's identity authority (F-07). The same-hive scoping LOGIC now
         // lives in system_policy::prefix_allowed_same_hive_scoped — shared with the router's
-        // authority() rule so the two can't drift; only the per-message allowlist DATA stays
+        // authorize_system rule so the two can't drift; only the per-message allowlist DATA stays
         // here. IO.* (worker IO provisioning against the sole motherbee authority) and
         // SY.orchestrator@ (cross-hive control plane) are legitimately cross-hive.
         const SAME_HIVE_ONLY_PREFIXES: [&str; 3] =

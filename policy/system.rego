@@ -1,28 +1,35 @@
-# Fluxbee SYSTEM origin-authority policy (OPA-dual, capa SYSTEM).
+# Fluxbee SYSTEM policy (OPA-dual, capa SYSTEM) — the NON-user-editable, baked half of the
+# two-layer policy model, and the SINGLE SOURCE OF TRUTH for the SYSTEM decisions below. There is
+# NO Rust fallback table: if a baked wasm fails to load, the router FAILS CLOSED (refuses to run)
+# — see `src/router/system_policy.rs::ensure_system_policy_loaded()`. Behavioral tests load the
+# baked wasm and assert the expected truth table (they fail if a wasm diverges from intent).
 #
-# This is the Rego backing for `src/router/system_policy.rs :: authority()`. It is the
-# NON-user-editable half of the two-layer policy model. Authoring/loading TODAY (baked stage):
-#   1. a developer edits THIS file, then recompiles it to `policy/system.wasm` with the same OPA
-#      compiler the user path uses: `sy-opa-rules compile-file policy/system.rego fluxbee/system/allow policy/system.wasm`
-#      (build in the fxbuild Linux container; the Go tool is Linux-only). Commit both files.
-#   2. the router BAKES that wasm into the binary via `include_bytes!` and evaluates it through
-#      `authorize_system()` (a lazy singleton) — there is NO SHM region and NO runtime writer for
-#      the system layer (that is the future "OPA-dual Phase 4": a privileged `/jsr-opa-sys-<hive>`
-#      region + writer, which only changes HOW the resolver is fed, not this policy).
-# So the system rules are non-user-editable by construction (unreachable from `/opa/policy*`) and
-# only change on a rebuild+redeploy. Keeping this `.rego` and `system.wasm` in sync is a MANUAL
-# dev step, guarded by the shadow-verify tests (they fail if the baked wasm diverges from authority()).
+# Authoring (baked stage): a developer edits THIS file, recompiles it to BOTH wasm artifacts (one
+# per entrypoint), and commits all three files:
+#   sy-opa-rules compile-file policy/system.rego fluxbee/system/allow           policy/system.wasm
+#   sy-opa-rules compile-file policy/system.rego fluxbee/system/frontdesk_route policy/system_route.wasm
+# (The Go tool is Linux-only, but the OPA v0.68.0 compile path is pure Go and reproducible on any
+# host — only an embedded source-path annotation, never the code section, is host-specific.)
+# The router BAKES each wasm via `include_bytes!` and evaluates it through a lazy singleton
+# resolver. There is NO SHM region / runtime writer for the system layer (the future "OPA-dual
+# Phase 4" would add one, changing only HOW the resolver is fed, not this policy). Non-user-editable
+# by construction (unreachable from `/opa/policy*`); changes only on rebuild+redeploy.
 #
-# Contract (must stay BYTE-IDENTICAL to authority() — shadow-verified in tests):
+# ── Entrypoint (1): fluxbee/system/allow — AUTHORITY (may this origin perform a protected action)
 #   input  = { "action": <verb>, "src_l2_name": <router-stamped name>, "hive_id": <this hive> }
-#   output = allow (boolean)   ; entrypoint: fluxbee/system/allow
+#   output = allow (boolean)
+#   Only consulted for PROTECTED_SYSTEM_ACTIONS; is_protected_system_action() stays in Rust (the
+#   "is this gated at all" check). `hive_id` is the local router hive. This entrypoint answers only
+#   "may this origin perform this protected action".
 #
-# NOTE: `hive_id` is NEW in the OPA input — authority() takes the local router hive as a
-# parameter, so build_opa_input must be enriched with it for this entrypoint (additive).
-#
-# authority() is only consulted for PROTECTED_SYSTEM_ACTIONS; is_protected_system_action()
-# stays in Rust (the "is this gated at all" check). This policy answers only "may this origin
-# perform this protected action".
+# ── Entrypoint (2): fluxbee/system/frontdesk_route — SELECTION (force-route to the identity
+#   frontdesk). This is the routing decision that used to be a hardcoded `if` in the router
+#   (apply_identity_pre_resolve); it now lives HERE, visible as policy.
+#   input  = { "src_ilk_present": <bool>, "registration_status": <"temporary"|"partial"|"complete"|null> }
+#   output = frontdesk_route (boolean)
+#   The frontdesk NODE NAME is NOT here — it is per-hive Rust config (SY.frontdesk.gov@<hive>,
+#   hive.yaml-overridable); the router substitutes it when this rule yields true. A hive-agnostic
+#   wasm cannot carry a per-hive name, so the DECISION is policy and the NAME stays config.
 
 package fluxbee.system
 
@@ -111,3 +118,21 @@ allow if {
 	parsed.role == "RT.gateway"
 	parsed.hive == "motherbee"
 }
+
+# ── SELECTION: fluxbee/system/frontdesk_route ────────────────────────────────────────────────
+# Force an as-yet-unidentified sender to the identity frontdesk (the registrar). This replaces the
+# router's old hardcoded `if registration_status == "temporary"` detour (apply_identity_pre_resolve)
+# and additionally covers the no-ilk case. Two clauses, both "the sender has no usable identity yet":
+default frontdesk_route := false
+
+# (a) No ilk at all on the message — provisioning never happened / failed (identity SHM down, an
+#     anonymous ingress path, a rejected seed). Contain it at the frontdesk rather than let it flow
+#     onward to a specialist. Keys on ABSENCE of src_ilk, NOT on "status resolved to null": an
+#     edge-stamped system self_ilk is present-but-unresolved (status null, src_ilk PRESENT) and is
+#     correctly NOT caught here.
+frontdesk_route if not input.src_ilk_present
+
+# (b) A provisioned-but-unascended ilk (registration_status "temporary") — a first-contact handle;
+#     send it to the frontdesk to complete registration. partial/complete ilks are NOT force-routed
+#     (they flow to the operator routing policy).
+frontdesk_route if input.registration_status == "temporary"

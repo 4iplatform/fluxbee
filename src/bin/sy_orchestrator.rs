@@ -2578,7 +2578,7 @@ async fn handle_system_message(
     state: &OrchestratorState,
 ) -> Result<(), OrchestratorError> {
     // SYSTEM origin-authority is enforced centrally by the router at delivery time
-    // (system_policy::authority); an unauthorized protected SYSTEM action should
+    // (system_policy::authorize_system); an unauthorized protected SYSTEM action should
     // never reach this node (F4/F15).
     //
     // SO-05 (defense in depth): re-check protected actions locally against the
@@ -2589,7 +2589,7 @@ async fn handle_system_message(
     // this is a no-op (the message already passed the identical router check).
     if let Some(action) = msg.meta.msg.as_deref() {
         if json_router::router::system_policy::is_protected_system_action(action)
-            && !json_router::router::system_policy::authority(
+            && !json_router::router::system_policy::authorize_system(
                 action,
                 msg.routing.src_l2_name.as_deref(),
                 &state.hive_id,

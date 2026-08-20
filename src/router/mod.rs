@@ -167,6 +167,12 @@ impl Router {
     }
 
     pub async fn run(&self) -> Result<(), RouterError> {
+        // Fail closed: the SYSTEM authority + routing policies are baked into the binary
+        // (policy/system.wasm + policy/system_route.wasm). If either cannot load/evaluate, the
+        // router has no business running — there is no Rust fallback table, the Rego is the single
+        // source of truth. Refuse to start rather than silently degrade.
+        system_policy::ensure_system_policy_loaded().map_err(RouterError::Startup)?;
+
         prepare_nats_runtime(&self.cfg).await?;
         wait_for_nats_ready(&self.cfg, Duration::from_secs(NATS_READY_TIMEOUT_SECS)).await?;
         if self.cfg.nats_mode == "embedded" {
@@ -3092,7 +3098,7 @@ async fn handle_wan_message(
     // and apply_lsa_payload only lets a peer write nodes into its OWN (cert-bound) bucket,
     // so a hive authenticated as P can only assert identities of the form `role@P`. Rewrite
     // any name whose `@hive` suffix disagrees with the bucket: a forged "SY.admin@motherbee"
-    // advertised by an attacker hive becomes "SY.admin@<attacker>", which authority() denies.
+    // advertised by an attacker hive becomes "SY.admin@<attacker>", which authorize_system denies.
     // Legitimate names (suffix already == bucket) are unchanged. Correct-and-continue + warn
     // (availability over fail-closed; the origin gate still denies the forged identity).
     let canonical_src_name = canonical_wan_src_name(&src_info.name, &src_info.hive_id);
@@ -5009,6 +5015,20 @@ async fn resolve_target_with_identity(
         identity_frontdesk_node_name = %identity_frontdesk_node_name,
         "router starting identity-aware resolve"
     );
+    // SYSTEM route (selection), OPA-backed (policy/system.rego frontdesk_route) — short-circuits
+    // before the USER OPA policy. Case A: NO src_ilk at all. Decided here, WITHOUT the identity
+    // snapshot, because it needs no identity data and must still force the frontdesk even when the
+    // identity SHM is unavailable (the common cause of a missing ilk is a provisioning failure with
+    // identity down). The present-ilk case (B) is handled below after canonicalization.
+    if src_ilk.is_none() && system_policy::route_to_frontdesk(None, false) {
+        tracing::info!(
+            trace_id = %msg.routing.trace_id,
+            forced_target = %identity_frontdesk_node_name,
+            elapsed_us = resolve_started.elapsed().as_micros() as u64,
+            "identity pre-resolve forced frontdesk target (no src_ilk)"
+        );
+        return Ok(Some(identity_frontdesk_node_name.to_string()));
+    }
     let mut dynamic_opa_data: Option<serde_json::Value> = None;
     match read_identity_snapshot(hive_id) {
         Ok(snapshot) => {
@@ -5073,7 +5093,10 @@ fn apply_identity_pre_resolve(
         if canonical != src_ilk {
             set_src_ilk_in_meta(&mut msg.meta, &canonical);
         }
-        if registration_status.as_deref() == Some("temporary") {
+        // Case B: a PRESENT src_ilk. The routing DECISION lives in policy (system.rego
+        // frontdesk_route); the router only substitutes the per-hive frontdesk NODE NAME here.
+        // Present ilk => src_ilk_present = true, so only registration_status == "temporary" forces.
+        if system_policy::route_to_frontdesk(registration_status.as_deref(), true) {
             return Some(identity_frontdesk_node_name.to_string());
         }
     }
@@ -6134,15 +6157,15 @@ async fn serialize_for_local_delivery(
 ) -> Result<Option<Vec<u8>>, RouterError> {
     if is_system_kind(&msg.meta.msg_type) {
         // OPA-dual SYSTEM (authority) layer: the baked, non-user-editable Rego policy
-        // (policy/system.rego -> system.wasm), evaluated via authorize_system() with the Rust
-        // authority() table as the byte-identical load-failure fallback. System DENY is final.
-        // (The user/OPA layer handles routing and, in future, may only narrow this — never
-        // broaden it.)
+        // (policy/system.rego -> system.wasm), evaluated via authorize_system() — the SINGLE
+        // source of truth, no Rust fallback (the router fails closed at startup if the wasm cannot
+        // load). System DENY is final. (The user/OPA layer handles routing and, in future, may
+        // only narrow this — never broaden it.)
         let action = msg.meta.msg.as_deref().unwrap_or_default();
         if system_policy::is_protected_system_action(action) {
             // Option B security invariant: a src learned TRANSITIVELY via the hub's reachability
             // vouch (`src_via_hub`) is admitted for DATA delivery but NEVER granted SYSTEM
-            // authority — it is denied here WITHOUT consulting authority()/the allow policy, so a
+            // authority — it is denied here WITHOUT consulting the allow policy at all, so a
             // compromised hub cannot fabricate cross-hive control-plane authority between spokes.
             // A directly-authenticated src still goes through the normal authority gate.
             let authorized = !src_via_hub
@@ -6838,17 +6861,17 @@ mod tests {
 
     #[test]
     fn edge01_wan_canonicalization_defeats_cross_hive_name_forgery() {
-        use system_policy::authority;
+        use system_policy::authorize_system;
         let receiving_hive = "ingress1";
 
         // ATTACK: a hive authenticated as "attacker" advertises a node NAMED
         // "SY.admin@motherbee" in its OWN LSA bucket. Pre-fix the WAN handler stamped the
-        // raw name and authority() authorized EDGE_OPEN_URL; post-fix the name is rebound to
+        // raw name and authorize_system() authorized EDGE_OPEN_URL; post-fix the name is rebound to
         // the authenticated bucket, so the forged motherbee attribution is destroyed.
         let forged_admin = canonical_wan_src_name("SY.admin@motherbee", "attacker");
         assert_eq!(forged_admin, "SY.admin@attacker");
         assert!(
-            !authority("EDGE_OPEN_URL", Some(&forged_admin), receiving_hive),
+            !authorize_system("EDGE_OPEN_URL", Some(&forged_admin), receiving_hive),
             "forged SY.admin@motherbee from an attacker bucket must be denied"
         );
 
@@ -6864,7 +6887,7 @@ mod tests {
         // bucket over the direct motherbee<->ingress session) is unchanged and still allowed.
         let legit_admin = canonical_wan_src_name("SY.admin@motherbee", "motherbee");
         assert_eq!(legit_admin, "SY.admin@motherbee");
-        assert!(authority(
+        assert!(authorize_system(
             "EDGE_OPEN_URL",
             Some(&legit_admin),
             receiving_hive
@@ -6874,7 +6897,7 @@ mod tests {
         // still authorized for a protected action.
         let legit_orch = canonical_wan_src_name("SY.orchestrator@worker1", "worker1");
         assert_eq!(legit_orch, "SY.orchestrator@worker1");
-        assert!(authority("SPAWN_NODE", Some(&legit_orch), receiving_hive));
+        assert!(authorize_system("SPAWN_NODE", Some(&legit_orch), receiving_hive));
     }
 
     #[test]
