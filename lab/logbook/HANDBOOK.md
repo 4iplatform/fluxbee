@@ -693,6 +693,25 @@ POST /hives/{spoke}/update  {"category":"core","manifest_version":0,"manifest_ha
 **Tiempo real:** ~6 min de build con la caché tibia, ~1 min el `apt install`, y el sistema se
 acomoda solo en ~25 s.
 
+### Registrá el deploy — SIEMPRE (auditoría) · regla del operador (2026-08-20)
+
+**Cada versión que toca PROD se registra en [`../DEPLOYMENTS.md`](../DEPLOYMENTS.md)** — el ledger de
+auditoría. Aplica al `apt install` en motherbee **y** a cada core-update de un spoke. **Sin entrada,
+el deploy no está hecho.** Flujo:
+
+```bash
+# ANTES del apt install: snapshoteá motherbee (el nombre va en la fila del ledger)
+python3 lab/pve.py snapshot 100 pre-<algo>-<version>
+# ... build + publish + apt install ...
+# DESPUÉS: agregá al ledger una fila en la tabla + una entrada con:
+#   versión · versión anterior · COMMIT · alcance (motherbee/spokes) · qué cambió (impacto) ·
+#   verificación (evidencia real, no "status ok") · rollback (snapshot + apt install fluxbee=<anterior>)
+```
+
+La entrada de auditoría **no** reemplaza a la bitácora (`YYYY-MM-DD.md`, el viaje) ni a
+`FINDINGS.md` (los bugs): el ledger es sólo "qué versión quedó en prod y por qué se puede confiar
+en ella". Hay una plantilla lista al final de `DEPLOYMENTS.md`.
+
 ### Cómo saber si el update fue REAL y no fantasma
 
 No alcanza con el `status: ok`. El chequeo que distingue un update genuino de uno que no hizo nada:

@@ -9,6 +9,9 @@
 >   **plan de cambios de código** al terminar. Durante el despliegue se **agregan**, no se arreglan.
 > - `HANDBOOK.md` — **las recetas validadas** (portables, listas para el próximo prod). Una receta
 >   se escribe **recién después** de haberla ejecutado con éxito acá.
+> - [`../DEPLOYMENTS.md`](../DEPLOYMENTS.md) — **el ledger de auditoría** de versiones en PROD: qué
+>   versión quedó instalada, cuándo, qué commit, qué cambió y cómo se verificó. Se escribe en CADA
+>   deploy a prod (regla en HANDBOOK §12) — sin entrada, el deploy no está hecho.
 >
 > Complementa —no reemplaza— a [`lab/PROXMOX.md`](../PROXMOX.md) (operación diaria del lab) y
 > `docs/packaging-and-build.md` (build/paquetes). Este doc es el que manda cuando hay prod de por medio.
