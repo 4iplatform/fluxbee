@@ -33,8 +33,13 @@ nats:
 # Local admin HTTP API.
 admin:
   listen: "127.0.0.1:8080"
-  # Optional absolute content origin returned alongside /public/<key>.
-  # public_base_url: "https://content.example.com"
+  # The SY.edge this hive publishes public artifacts / Cloud endpoints on.
+  # public_edge_node: "SY.edge@<ingress-hive>"
+  # Absolute public origin for /public/<key> URLs and the base external clients use.
+  # MUST be a DNS HOSTNAME that the edge TLS cert covers (e.g. this hive's opaque
+  # hive-<hash>.<domain> name), NEVER a bare IP — an IP fails cert validation and TLS
+  # aborts (handshake eof) for any client that verifies the cert. One per hive.
+  # public_base_url: "https://hive-<hash>.example.com"
 
 # Local architect HTTP UI/API (typically exposed through reverse proxy).
 architect:
