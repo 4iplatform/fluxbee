@@ -26,6 +26,7 @@ use io_common::frontdesk_contract::{
     FrontdeskHandoffPayload, FrontdeskHandoffSubject, FRONTDESK_HANDOFF_PAYLOAD_TYPE,
     FRONTDESK_SCHEMA_VERSION_V1,
 };
+use io_common::frontdesk_gate::frontdesk_response_contract;
 use io_common::identity::{
     IdentityProvisioner, IdentityResolver, ResolveOrCreateInput, ShmIdentityResolver,
 };
@@ -1635,18 +1636,6 @@ fn parse_frontdesk_reply_payload(
         .map_err(|err| ApiIngressError::new("invalid_frontdesk_response", err.to_string()))?;
     serde_json::from_value(Value::Object(structured))
         .map_err(|err| ApiIngressError::new("invalid_frontdesk_response", err.to_string()))
-}
-
-fn frontdesk_response_contract() -> Value {
-    json!({
-        "kind":"json_object_v1",
-        "required":["success", "human_message"],
-        "properties":{
-            "success":{"type":"boolean"},
-            "human_message":{"type":"string"},
-            "error_code":{"type":"string"}
-        }
-    })
 }
 
 async fn route_api_message(

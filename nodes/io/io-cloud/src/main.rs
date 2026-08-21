@@ -34,14 +34,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fluxbee_sdk::protocol::{Destination, Message, Meta, Routing, SYSTEM_KIND};
+use fluxbee_sdk::protocol::{
+    Destination, Message, Meta, Routing, MSG_TTL_EXCEEDED, MSG_UNREACHABLE, SYSTEM_KIND,
+};
 use fluxbee_sdk::rpc::AdminCommandRequest;
 use fluxbee_sdk::{
     managed_node_config_path, try_handle_default_node_status, NodeConfig, NodeSender, NodeUuidMode,
-    OperationalRouteProfile, RouteMatch, RouteTarget, RouterDispatcher, RpcCommandReceiver,
-    FLUXBEE_NODE_NAME_ENV,
+    OperationalRouteProfile, PendingMatcher, RouteMatch, RouteTarget, RouterDispatcher,
+    RpcCommandReceiver, RpcRequestLabels, FLUXBEE_NODE_NAME_ENV,
+};
+use io_common::frontdesk_contract::{FRONTDESK_HANDOFF_PAYLOAD_TYPE, FRONTDESK_SCHEMA_VERSION_V1};
+use io_common::frontdesk_gate::{
+    frontdesk_response_contract, DEFAULT_FRONTDESK_TARGET, FRONTDESK_OPERATION_REGISTER,
 };
 use io_common::identity::ResolveOrCreateInput;
+use io_common::io_context::{parse_structured_response_payload, set_response_envelope};
+use io_common::router_message::{build_user_message, new_trace_id, DEFAULT_TTL};
 use io_common::io_adapter_config::{
     apply_adapter_config_replace, build_io_adapter_contract_payload, IoAdapterConfigContract,
 };
@@ -77,6 +85,11 @@ const MOTHERBEE_HIVE: &str = "motherbee";
 /// FROZEN channel identity, NOT operator config (the contract deliberately omits it): the family
 /// under which the edge forwards inbound Cloud requests, mirrored by the family gate in `run_loop`.
 const CLOUD_INBOUND_FAMILY: &str = "user";
+
+/// The msg_type of a mesh USER message — the kind the frontdesk replies in. Kept SEPARATE from
+/// `CLOUD_INBOUND_FAMILY` (which happens to share the value today) so the frontdesk-reply matcher is
+/// decoupled from the inbound-family gate. Mirrors io.api's `USER_KIND`.
+const USER_KIND: &str = "user";
 
 /// FROZEN channel identity: the `(channel_type, channel_address)` io.cloud registers its own ICH
 /// under. These are the identity of the public URL, not something an operator tunes.
@@ -355,6 +368,10 @@ async fn run_loop(
         );
 
         let mut response = match authorize_cloud_message(&msg, &state.own_ich, cloud_edge_node) {
+            // `register_human` is NOT an admin relay: io.cloud mints a temporary human ilk and
+            // Unicasts the Cloud handoff to the configured frontdesk, then relays the verdict. Every
+            // other op is the bounded SY.admin relay set.
+            Ok(()) if op == "register_human" => handle_register_human(sender, state, &msg).await,
             Ok(()) => dispatch_cloud_op(&state.dispatcher, &state.config.admin_target, &msg.payload).await,
             Err(detail) => {
                 tracing::warn!(
@@ -971,6 +988,247 @@ async fn dispatch_cloud_op(
     }
 }
 
+/// The two fields io.cloud must read off the Cloud request to relay a human registration: the
+/// verbatim `frontdesk_handoff` payload it forwards, plus the tenant + email it provisions on.
+#[derive(Debug)]
+struct RegisterHumanRequest {
+    handoff: Value,
+    tenant_id: String,
+    email: String,
+    request_id: Option<String>,
+}
+
+/// Validate a `register_human` Cloud request and extract what io.cloud needs. io.cloud owns NO
+/// format decision: it only checks the payload will reach the deterministic frontdesk path
+/// (`type == frontdesk_handoff`) and carries the tenant + email required to provision. On failure it
+/// returns the JSON error to relay straight back to Cloud (the flow dies there).
+fn parse_register_human_request(payload: &Value) -> Result<RegisterHumanRequest, Value> {
+    let Some(handoff) = payload.get("params").filter(|v| v.is_object()).cloned() else {
+        return Err(cloud_error_code(
+            "INVALID_REQUEST",
+            "register_human requires an object 'params' (the frontdesk_handoff payload)",
+        ));
+    };
+    // The gate MUST match EVERYTHING the deterministic frontdesk path requires. FrontdeskHandoffPayload
+    // has no serde defaults for type / schema_version / operation, so a payload missing any of them
+    // would pass a laxer gate, mint a temporary ilk, then FAIL to deserialize at the frontdesk and
+    // fall silently to the conversational path (stranding the ilk). Reject up front instead.
+    if handoff.get("type").and_then(Value::as_str) != Some(FRONTDESK_HANDOFF_PAYLOAD_TYPE) {
+        return Err(cloud_error_code(
+            "INVALID_REQUEST",
+            "params.type must be \"frontdesk_handoff\"",
+        ));
+    }
+    if handoff.get("schema_version").and_then(Value::as_u64)
+        != Some(u64::from(FRONTDESK_SCHEMA_VERSION_V1))
+    {
+        return Err(cloud_error_code(
+            "INVALID_REQUEST",
+            "params.schema_version must be 1",
+        ));
+    }
+    if handoff.get("operation").and_then(Value::as_str) != Some(FRONTDESK_OPERATION_REGISTER) {
+        return Err(cloud_error_code(
+            "INVALID_REQUEST",
+            "params.operation must be \"complete_registration\"",
+        ));
+    }
+    // tenant_id: canonical tnt:<uuid>, validated BEFORE any provisioning (like put_token/provision_node)
+    // so a malformed/unknown tenant never mints an orphan ilk.
+    let tenant_id = require_tenant_id(
+        handoff.get("tenant_id").and_then(Value::as_str),
+        "register_human",
+    )?;
+    // Email is the human's stable unique key; identity owns idempotency on (cloud, email, tenant).
+    // Require a real address so a bare token can never collide with io.cloud's own channel keys.
+    let Some(email) = handoff
+        .get("subject")
+        .and_then(|s| s.get("email"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| v.contains('@') && v.len() >= 3)
+        .map(ToString::to_string)
+    else {
+        return Err(cloud_error_code(
+            "INVALID_REQUEST",
+            "params.subject.email is required and must be an email address",
+        ));
+    };
+    let request_id = payload
+        .get("request_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    Ok(RegisterHumanRequest {
+        handoff,
+        tenant_id,
+        email,
+        request_id,
+    })
+}
+
+/// Matcher for the frontdesk's reply: a `user`-kind FrontdeskResultPayload is success; the router's
+/// UNREACHABLE / TTL_EXCEEDED (a genuinely-unreachable frontdesk) is a terminal transport error,
+/// surfaced as `Err`.
+fn frontdesk_reply_matcher() -> PendingMatcher {
+    PendingMatcher::new(
+        vec![RouteMatch::any_msg_type(USER_KIND)],
+        vec![
+            RouteMatch::exact(SYSTEM_KIND, MSG_UNREACHABLE),
+            RouteMatch::exact(SYSTEM_KIND, MSG_TTL_EXCEEDED),
+        ],
+        Vec::new(),
+    )
+}
+
+/// Op `register_human` — the automatic Fluxbee Cloud -> frontdesk human-registration relay. UNLIKE
+/// the admin-relay ops (create_tenant / put_token / provision_node), this NEVER touches SY.admin:
+///   1. io.cloud mints a TEMPORARY human ilk (ILK_PROVISION — IO nodes are authorized for it), then
+///   2. hands the Cloud `frontdesk_handoff` payload (VERBATIM) to the frontdesk via UNICAST to the
+///      CONFIGURED registrar (`DEFAULT_FRONTDESK_TARGET` = `government.identity_frontdesk`). Unicast —
+///      not the router's temporary-only Resolve force — because an explicit handoff must reach the
+///      frontdesk for ANY ilk status: a repeat/idempotent registration of an already-`complete` human
+///      still lands, and `ILK_REGISTER` no-ops to success. io.cloud has no target discretion (it uses
+///      the one configured frontdesk); the force rule stays the safety net for IMPLICIT first-contact
+///      senders (io.slack/io.wapp). The `response_envelope` makes the frontdesk emit its STRUCTURED
+///      `{success, human_message, error_code}` verdict instead of plain text; a synthetic thread_id
+///      satisfies the frontdesk's user-message pre-gate (there is no conversation).
+/// io.cloud CONSTRUCTS no handoff — the JSON is a Cloud<->frontdesk contract; it reads only the tenant
+/// and email it provisions on, and stamps the verdict it relays with the ilk_id it minted.
+async fn handle_register_human(sender: &NodeSender, state: &Arc<RuntimeState>, msg: &Message) -> Value {
+    // Validate the request (fail -> JSON error straight back to Cloud, flow dies) and extract the
+    // fields io.cloud needs. Cloud owns the format.
+    let RegisterHumanRequest {
+        handoff,
+        tenant_id,
+        email,
+        request_id,
+    } = match parse_register_human_request(&msg.payload) {
+        Ok(req) => req,
+        Err(error) => return error,
+    };
+
+    // (1) Provision a temporary HUMAN ilk — the same primitive every IO node uses for first contact.
+    let cfg = IdentityProvisionConfig {
+        target: state.config.identity_target.clone(),
+        timeout: Duration::from_secs(10),
+    };
+    let input = ResolveOrCreateInput {
+        channel: CLOUD_CHANNEL_TYPE.to_string(),
+        external_id: email,
+        src_ilk_override: None,
+        tenant_id: Some(tenant_id),
+        tenant_hint: None,
+        attributes: json!({ "source": "io.cloud", "role": "human" }),
+        ilk_type: Some("human".to_string()),
+    };
+    let temp_ilk =
+        match strict_provision_ilk(&state.dispatcher, &cfg, &state.config.identity_target, &input)
+            .await
+        {
+            Ok(ilk) => ilk,
+            Err(err) => {
+                return cloud_error_code(
+                    "IDENTITY_UNAVAILABLE",
+                    &format!("could not provision the human ilk: {err}"),
+                )
+            }
+        };
+
+    // (2) Unicast the handoff to the configured frontdesk, asking for its structured verdict.
+    let thread_id = format!(
+        "thread:cloud:{}",
+        request_id.as_deref().unwrap_or(temp_ilk.as_str())
+    );
+    let context = match set_response_envelope(
+        Some(json!({ "io": { "conversation": { "thread_id": thread_id } } })),
+        frontdesk_response_contract(),
+    ) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            return cloud_error_code("INTERNAL", &format!("could not build response envelope: {err}"))
+        }
+    };
+    let message = build_user_message(
+        sender.uuid(),
+        Some(DEFAULT_FRONTDESK_TARGET.to_string()),
+        DEFAULT_TTL,
+        new_trace_id(),
+        Some(temp_ilk.clone()),
+        None,
+        context,
+        handoff,
+    );
+    let reply = match state
+        .dispatcher
+        .send_with_matcher(
+            message,
+            frontdesk_reply_matcher(),
+            RpcRequestLabels::new(DEFAULT_FRONTDESK_TARGET, "FRONTDESK_HANDOFF", "FRONTDESK_REPLY"),
+            Duration::from_secs(20),
+        )
+        .await
+    {
+        Ok(reply) => reply,
+        Err(err) => {
+            return cloud_error_code(
+                "FRONTDESK_UNAVAILABLE",
+                &format!("frontdesk handoff failed: {err}"),
+            )
+        }
+    };
+
+    // (3) Parse the frontdesk's structured verdict and relay it to Cloud, stamped with the ilk_id
+    // io.cloud minted (the frontdesk's minimal contract omits it, but io.cloud knows it).
+    if reply.payload.get("type").and_then(Value::as_str) == Some("error") {
+        let detail = reply
+            .payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("frontdesk rejected the request");
+        return json!({
+            "status": "error",
+            "op": "register_human",
+            "ilk_id": temp_ilk,
+            "error_code": "FRONTDESK_REJECTED",
+            "error_detail": detail,
+        });
+    }
+    let structured =
+        match parse_structured_response_payload(&reply.payload, &frontdesk_response_contract()) {
+            Ok(map) => map,
+            Err(err) => {
+                return cloud_error_code(
+                    "INVALID_FRONTDESK_RESPONSE",
+                    &format!("could not parse frontdesk reply: {err}"),
+                )
+            }
+        };
+    let success = structured
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let human_message = structured
+        .get("human_message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let error_code = structured
+        .get("error_code")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    json!({
+        "status": if success { "ok" } else { "error" },
+        "op": "register_human",
+        "ilk_id": temp_ilk,
+        "registration_status": if success { "complete" } else { "temporary" },
+        "success": success,
+        "human_message": human_message,
+        "error_code": error_code,
+    })
+}
+
 impl Config {
     /// Build the boot config the io.api way: node_name + identity from the managed spawn, infra from
     /// the managed spawn config (with the generic env overrides io.api also honours), and the
@@ -1095,6 +1353,61 @@ mod tests {
         }
         // An op outside the vocabulary is rejected, not silently relayed.
         assert!(translate_cloud_op("kill_node", Some(tenant), &params).is_err());
+    }
+
+    #[test]
+    fn register_human_gate_matches_the_full_frontdesk_contract() {
+        let tnt = "tnt:11111111-1111-4111-8111-111111111111";
+        let subject = json!({"display_name": "Juan Perez", "email": "juan@acme.com"});
+        // Every field the deterministic frontdesk path needs must be present, or io.cloud rejects up
+        // front (rather than minting an ilk that then strands on the conversational path).
+        let full = |extra: Value| {
+            let mut params = serde_json::Map::new();
+            params.insert("type".into(), json!("frontdesk_handoff"));
+            params.insert("schema_version".into(), json!(1));
+            params.insert("operation".into(), json!("complete_registration"));
+            params.insert("tenant_id".into(), json!(tnt));
+            params.insert("subject".into(), subject.clone());
+            if let Value::Object(o) = extra {
+                for (k, v) in o {
+                    params.insert(k, v);
+                }
+            }
+            json!({"op": "register_human", "params": Value::Object(params)})
+        };
+
+        // Non-object params.
+        assert!(parse_register_human_request(&json!({"op": "register_human"})).is_err());
+        // Wrong type would fall to the conversational path.
+        assert!(parse_register_human_request(&full(json!({"type": "text"}))).is_err());
+        // Missing / wrong schema_version + operation (no serde defaults at the frontdesk).
+        assert!(parse_register_human_request(&full(json!({"schema_version": 2}))).is_err());
+        assert!(parse_register_human_request(&full(json!({"operation": "other"}))).is_err());
+        // Non-canonical tenant (must be tnt:<uuid>, validated before provisioning).
+        assert!(parse_register_human_request(&full(json!({"tenant_id": "tnt:acme"}))).is_err());
+        // subject.email must be a real address (a bare token could collide with io.cloud's channel).
+        assert!(parse_register_human_request(&full(json!({"subject": {"email": "demo"}}))).is_err());
+
+        // Well-formed: extracts what io.cloud provisions on, forwards the handoff verbatim.
+        let ok = parse_register_human_request(&json!({
+            "op": "register_human",
+            "request_id": "req-1",
+            "params": {
+                "type": "frontdesk_handoff",
+                "schema_version": 1,
+                "operation": "complete_registration",
+                "tenant_id": tnt,
+                "subject": {"display_name": "Juan Perez", "email": "  juan@acme.com  "}
+            }
+        }))
+        .expect("well-formed register_human parses");
+        assert_eq!(ok.tenant_id, tnt);
+        assert_eq!(ok.email, "juan@acme.com"); // trimmed
+        assert_eq!(ok.request_id.as_deref(), Some("req-1"));
+        assert_eq!(
+            ok.handoff.get("operation").and_then(Value::as_str),
+            Some("complete_registration")
+        );
     }
 
     #[test]

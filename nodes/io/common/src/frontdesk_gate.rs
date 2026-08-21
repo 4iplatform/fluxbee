@@ -49,6 +49,22 @@ pub const DEFAULT_FRONTDESK_TARGET: &str = "SY.frontdesk.gov@motherbee";
 pub const FRONTDESK_HANDOFF_TYPE: &str = "frontdesk_handoff";
 pub const FRONTDESK_OPERATION_REGISTER: &str = "complete_registration";
 
+/// El contrato de respuesta que un productor (io.api / io.cloud) pone en el `response_envelope`
+/// del mensaje para que el frontdesk emita su veredicto ESTRUCTURADO (`{success, human_message,
+/// error_code?}`) en vez de texto plano (`build_frontdesk_result_reply`). Fuente unica compartida
+/// por los productores — antes vivia privada en io.api.
+pub fn frontdesk_response_contract() -> serde_json::Value {
+    serde_json::json!({
+        "kind": "json_object_v1",
+        "required": ["success", "human_message"],
+        "properties": {
+            "success": {"type": "boolean"},
+            "human_message": {"type": "string"},
+            "error_code": {"type": "string"}
+        }
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrontdeskGateConfig {
     /// APAGADA por defecto. Encenderla cambia el comportamiento de un hive vivo.
