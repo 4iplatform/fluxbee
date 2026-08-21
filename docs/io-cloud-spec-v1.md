@@ -144,6 +144,64 @@ Fuera del catálogo día-1 (NO exponer al token público): `add_hive` (toma `ssh
 `vault_get`/lectura cruda de secretos, `executor_execute_plan` (LLM → acciones = prompt-injection→root),
 `set_node_config`, rutas/VPNs. Se agregan solo si el log muestra que Cloud los necesita, y con gate.
 
+### 3.3 Dos categorías de acción Cloud: relay-a-admin + io.cloud-local (2026-08-21, DISEÑO)
+
+> **Estado: diseño acordado, pendiente de implementar.** La acción `register_human` YA está deployada
+> (0.1.21/0.1.22) pero como una **rama ad-hoc**; esta sección define cómo volverla de **primera clase**
+> siguiendo el camino ya marcado. Se implementa **después de charlarlo**, luego prod.
+
+El catálogo §3.2 asume UN modelo: **acción Cloud = relay a `SY.admin`** (`translate_cloud_op` mapea el
+`op` a una acción admin, `dispatch_cloud_op` la manda por `ADMIN_COMMAND`, y
+`SY.admin::authorize_cloud_relay` la autoriza sobre el mismo allowlist `CLOUD_EXPOSED_ACTIONS`;
+contrato EDGE-06 **advertised == enforced**, `fluxbee_sdk::cloud::CLOUD_OP_ACTIONS` es la fuente única).
+Las tres de día-1 encajan porque el "trabajo" lo hace admin (crear tenant, vault_put, run_node).
+
+**Pero hay acciones que admin NO puede hacer**, y que por diseño le tocan al nodo IO. La primera es
+**`register_human`** (onboarding humano Cloud→frontdesk):
+- El trabajo es **provisionar un ilk humano `temporary`** (`ILK_PROVISION`, autorizado SOLO para prefijo
+  `IO.`) + **entregárselo al frontdesk** (Unicast a `SY.frontdesk.gov`, que hace `ILK_REGISTER`).
+  **`SY.admin` no puede** ni provisionar (IO-only) ni registrar (frontdesk/orch-only) → el relay-a-admin
+  **no aplica**.
+- **Generar el ilk es responsabilidad del nodo IO** —como en cualquier IO (io.slack/io.wapp/io.api
+  provisionan en primer contacto)—; io.cloud lo hace con el mismo `strict_provision_ilk` compartido.
+  El identity ya está resuelto (0.1.21/0.1.22), no se re-abre.
+
+⇒ **Hay DOS categorías de acción Cloud:**
+
+| Categoría | Ejemplos | Quién hace el trabajo | Authz | Terminus |
+|---|---|---|---|---|
+| **relay-a-admin** | create_tenant, put_token, provision_node | `SY.admin` | `authorize_cloud_relay` (allowlist `CLOUD_EXPOSED_ACTIONS`) | `ADMIN_COMMAND` |
+| **io.cloud-local** | `register_human` | **io.cloud** (provisiona + relaya al frontdesk) | el gate edge-origin+ich de io.cloud | mesh (Unicast al frontdesk) |
+
+**El "algo raro" a corregir (hoy):** `register_human` funciona en prod pero como **rama ad-hoc**
+(`op == "register_human"` en `run_loop`), NO declarada: no está en `CLOUD_OP_ACTIONS`, no la advertisa
+`list_cloud_actions`, y su `tenant_id` viaja **dentro de `params`** en vez de en la raíz (contra la
+convención de las otras tres, `io-cloud-api.md` §4). ⇒ Cloud no la puede **descubrir** y rompe la
+simetría del sobre.
+
+**Diseño de primera clase (a implementar tras la charla → prod):**
+1. **Declarar las ops locales en el SDK** — un const nuevo (p.ej. `CLOUD_LOCAL_OPS`) al lado de
+   `CLOUD_OP_ACTIONS` (`crates/fluxbee_sdk/src/cloud.rs`), fuente única compartida. El dispatch de
+   io.cloud ramifica **por el set declarado**, no por un string mágico.
+2. **`list_cloud_actions` alcanzable desde Cloud, estilo-admin con `help`** — que advertise AMBAS
+   categorías (relay + local) con su ayuda, para que Cloud **descubra** su superficie
+   programáticamente (hoy `io-cloud-api.md` §7.2: "este documento ES el catálogo", no hay
+   descubrimiento). El contrato **advertised == enforced** se mantiene: lo advertisado como *local* =
+   lo que io.cloud maneja local (gate edge+ich); lo advertisado como *relay* = lo que
+   `authorize_cloud_relay` enforcea.
+3. **Alinear el sobre** — `register_human` usa `{op, tenant_id (raíz), params, request_id}` como las
+   otras tres; io.cloud inyecta el `tenant_id` de la raíz en el handoff antes de relayar (hoy lo lee de
+   `params`).
+
+**Mecanismo para crecer:**
+- **Más acciones locales** se agregan igual (una fila en `CLOUD_LOCAL_OPS` + su handler en io.cloud),
+  sin tocar admin.
+- **A futuro (idea del operador, "lo más normal"):** un **relay genérico/directo a `SY.admin`** — que
+  io.cloud **herede** las acciones admin como pasamanos, sin trabajo por-acción (hoy cada op de relay
+  necesita su fila en `CLOUD_OP_ACTIONS` + su traducción de params). Achicaría el mantenimiento del
+  lado relay; requiere resolver el allowlist/authz genérico **sin abrir el dispatcher admin entero**
+  (EDGE-06 sigue vigente). Charla aparte.
+
 ---
 
 ## 4. Modelo de vault (lector designado ≠ escritor) — grounded
