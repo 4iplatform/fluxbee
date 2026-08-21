@@ -93,9 +93,10 @@ STRICT NO-LOOP RULE:
   - If register_attempted==false:
     a) Call ilk_register with:
        - src_ilk (from context)
-       - identity_candidate {name,email,phone}
+       - identity_candidate {name,email,phone,company_name}
     b) If tool returns status=ok:
-       - call thread_state_delete
+       - set status=completed
+       - call thread_state_put
        - send final success message
        - stop (do not ask confirmation again)
     c) If tool returns status=error:
@@ -632,6 +633,12 @@ struct IlkRegisterIdentityCandidate {
     #[serde(default)]
     phone: Option<String>,
     #[serde(default)]
+    company_name: Option<String>,
+    /// Free-form extras (structured data Cloud supplies for a human). Stored verbatim into the
+    /// ilk's free-form JSONB `identification.attributes` — future ad-hoc fields go here.
+    #[serde(default)]
+    attributes: Option<Value>,
+    #[serde(default)]
     tenant_hint: Option<String>,
 }
 
@@ -685,6 +692,8 @@ struct FrontdeskCollectedState {
     phone: Option<String>,
     #[serde(default)]
     company_name: Option<String>,
+    #[serde(default)]
+    attributes: Option<serde_json::Map<String, Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1461,6 +1470,14 @@ impl GenericAiNode {
                     .and_then(|state| state.tenant_id.clone())
             });
 
+        // Merge free-form attributes across turns, symmetric with company_name: current handoff
+        // wins, else recover from the partial state collected on an earlier (incomplete) turn.
+        let attributes = handoff.subject.attributes.clone().or_else(|| {
+            previous_state
+                .as_ref()
+                .and_then(|state| state.collected.attributes.clone())
+        });
+
         let missing_fields = frontdesk_missing_fields(name.as_deref(), email.as_deref());
         if !missing_fields.is_empty() {
             let state = FrontdeskThreadState {
@@ -1470,6 +1487,7 @@ impl GenericAiNode {
                     email: email.take(),
                     phone,
                     company_name,
+                    attributes,
                 },
                 tenant_id: tenant_id.clone(),
                 registration_status: previous_state
@@ -1510,6 +1528,8 @@ impl GenericAiNode {
                 "name": registered_name,
                 "email": registered_email,
                 "phone": phone,
+                "company_name": company_name,
+                "attributes": attributes,
                 "tenant_hint": Value::Null
             },
             "tenant_id": tenant_id,
@@ -1528,6 +1548,7 @@ impl GenericAiNode {
                     email,
                     phone,
                     company_name,
+                    attributes,
                 },
                 tenant_id: result.tenant_id.clone(),
                 registration_status: result.registration_status.clone(),
@@ -1596,10 +1617,16 @@ impl GenericAiNode {
             return Ok(payload);
         }
 
-        let mut payload = frontdesk_result_payload("ok", "REGISTERED", human_message);
+        // No thread_state was written this turn: the LLM chatted (greeting / asked for a field) but
+        // NO registration happened. Report the TRUTH — a non-terminal in-conversation turn — NOT a
+        // phantom REGISTERED. A genuine success persists status="completed" (prompt: put, not delete)
+        // and is caught by the Some(state)=="completed" branch above, so None here unambiguously
+        // means "no registration this turn". frontdesk_structured_response_payload maps any non-"ok"
+        // status to success:false, so no consumer can read this as a completed registration.
+        let mut payload = frontdesk_result_payload("needs_input", "IN_CONVERSATION", human_message);
         payload.ilk_id = ctx.src_ilk.clone();
         payload.tenant_id = prior_state.and_then(|state| state.tenant_id);
-        payload.registration_status = Some("complete".to_string());
+        payload.registration_status = Some("temporary".to_string());
         Ok(payload)
     }
 
@@ -2217,6 +2244,8 @@ impl FunctionTool for IlkRegisterTool {
                             "name": { "type": "string", "minLength": 1 },
                             "email": { "type": "string", "minLength": 3 },
                             "phone": { "type": "string" },
+                            "company_name": { "type": "string" },
+                            "attributes": { "type": "object" },
                             "tenant_hint": { "type": "string" }
                         },
                         "required": ["name", "email"],
@@ -2383,6 +2412,8 @@ impl FunctionTool for IlkRegisterTool {
                 "display_name": args.identity_candidate.name,
                 "email": args.identity_candidate.email,
                 "phone": args.identity_candidate.phone,
+                "company_name": args.identity_candidate.company_name,
+                "attributes": args.identity_candidate.attributes,
                 "tenant_hint": args.identity_candidate.tenant_hint,
             }
         });
@@ -3801,6 +3832,7 @@ fn frontdesk_structured_response_payload(payload: &FrontdeskResultPayload) -> Va
     } else {
         Some(match payload.result_code.as_str() {
             "MISSING_REQUIRED_FIELDS" => "missing_required_fields",
+            "IN_CONVERSATION" => "in_conversation",
             "INVALID_REQUEST" => "invalid_request",
             "IDENTITY_UNAVAILABLE" => "identity_unavailable",
             "REGISTER_FAILED" => "register_failed",
@@ -4517,15 +4549,21 @@ mod tests {
         );
         let content = extract_text(&response.payload).expect("structured text");
         let structured: Value = serde_json::from_str(&content).expect("valid structured json");
+        // A plain conversational turn (Echo: no tool call, no thread_state written) must NOT be
+        // reported as a completed registration — that was the false-REGISTERED bug. The response is
+        // structured (envelope present) but success=false with error_code=in_conversation.
         assert_eq!(
             structured.get("success").and_then(Value::as_bool),
-            Some(true)
+            Some(false)
         );
         assert_eq!(
             structured.get("human_message").and_then(Value::as_str),
             Some("Echo: hola")
         );
-        assert!(structured.get("error_code").is_none());
+        assert_eq!(
+            structured.get("error_code").and_then(Value::as_str),
+            Some("in_conversation")
+        );
     }
 
     #[tokio::test]

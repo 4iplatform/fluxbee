@@ -16,9 +16,13 @@
 //! el mismo que ya corre en produccion— y si eso sale bien, el mensaje original **sigue viaje a su
 //! destino real**. El mensaje del usuario no se pierde ni se lo obliga a reescribirlo.
 //!
-//! Deliberadamente NO usa el camino conversacional por LLM del frontdesk: hoy es codigo muerto y
-//! ademas defectuoso (sin `thread_state` responde `REGISTERED`/`complete` sin haber llamado a
-//! `ILK_REGISTER`). Encenderlo es una decision aparte.
+//! Deliberadamente usa el camino ESTRUCTURADO (determinista) del frontdesk, no el conversacional
+//! por LLM. El conversacional NO esta muerto —es alcanzable cuando el router (force rule
+//! temporary/None->frontdesk, 0.1.20) desvia a un humano de primer contacto con su mensaje plano—;
+//! para ESTE gate el estructurado es el correcto porque los datos ya vienen estructurados. El bug
+//! historico del conversacional (respondia `REGISTERED`/`complete` sin haber llamado a
+//! `ILK_REGISTER`) fue arreglado 2026-08 (el exito persiste `status=completed`; `None` significa
+//! ahora "no hubo registro este turno" -> `needs_input`).
 //!
 //! # Apagado por defecto
 //!
