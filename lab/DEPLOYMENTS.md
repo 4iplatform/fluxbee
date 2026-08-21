@@ -16,6 +16,7 @@
 
 | Versión | Fecha (ART) | Commit | Alcance | Estado | Rollback |
 |---|---|---|---|---|---|
+| **0.1.22** | 2026-08-20 | `15fc77f` | motherbee | ✅ live | snap `pre-frontdesk-0-1-22` · `apt install fluxbee=0.1.21` |
 | **0.1.21** | 2026-08-20 | `2f60403` | motherbee | ✅ live | snap `pre-register-human-0-1-21` · `apt install fluxbee=0.1.20` |
 | **0.1.20** | 2026-08-20 | `1297ba7` | motherbee | ✅ live | snap `pre-router-0-1-20` · `apt install fluxbee=0.1.19` |
 | ≤ 0.1.19 | (pre-ledger) | — | motherbee | histórico, sin registrar | repo apt conserva 0.1.0 … 0.1.19 |
@@ -25,6 +26,32 @@
 > (`dpkg-scanpackages -m`) para rollback, pero su detalle vive en la bitácora, no acá.
 
 ---
+
+## 0.1.22 — frontdesk: fix del bug conversacional + extensión de datos del ilk humano
+
+- **Fecha:** 2026-08-20 (ART) · **Versión anterior:** 0.1.21 · **Commit:** `15fc77f` (branch `daily_onworking_coa`)
+- **Alcance:** **motherbee** (VM100). Toca el nodo core `sy-frontdesk-gov` (systemd) + `io_common` (comentario).
+- **Qué cambió (impacto operativo):**
+  - **BUG arreglado:** el camino conversacional del frontdesk (alcanzable — el force rule 0.1.20 manda el
+    mensaje plano de un humano de primer contacto al frontdesk) reportaba `REGISTERED`/`complete`
+    **sin haber registrado** cuando el turno del LLM no escribía `thread_state` (turno de charla, o
+    registro-y-borrado, ambiguos). Ahora: `None` → `needs_input`/`IN_CONVERSATION` (no falso REGISTERED),
+    y el prompt persiste `status=completed` en el éxito (en vez de borrar) para desambiguar. El camino
+    determinista (io.cloud `register_human`) **no se toca** (devuelve el resultado del registro directo).
+  - **Schema del ilk humano extendido (aditivo, CERO cambio en identity — `identification` es JSONB
+    libre guardado verbatim):** `company_name` (typed) + `attributes` (libre) fluyen end-to-end a
+    `ILK_REGISTER` por la tool compartida → sirve a los dos caminos. `handle_frontdesk_handoff` antes
+    **tiraba** `company_name`; ahora lo reenvía + mergea `attributes` multi-turno (simétrico con company_name).
+- **Build:** fb-build (VM110), `build-deb.sh 0.1.22` → 245 MB, 118 entradas.
+- **Publish:** `apt-repo-publish.sh` → repo :8900 (22 versiones).
+- **Verificación en vivo:** `fluxbee 0.1.22` instalado; **`sy-frontdesk-gov` reiniciado + `running`**
+  (02:31 UTC, con el fix+schema); rt-gateway + los 13 `sy-*` `active`; io.cloud `active`; **0 nodos `failed`**.
+  Pre-deploy: `sy-frontdesk-gov` tests verdes (26/0, incluye el test que codificaba el bug, corregido) +
+  revisión adversarial (bug-fix limpio; 1 LOW de simetría de `attributes` multi-turno, arreglado).
+- **Rollback:** snapshot VM100 `pre-frontdesk-0-1-22`, o `apt-get install -y fluxbee=0.1.21`.
+- **Pendiente / known:** el camino conversacional depende de que el LLM siga el prompt (misma
+  confiabilidad que todo el flujo); un `attributes` libre sin cota de tamaño podría meter blobs grandes
+  en el JSONB (validación de tamaño = mejora futura si hace falta). Cierra los dos follow-ups del 0.1.21.
 
 ## 0.1.21 — io.cloud `register_human`: registro automático de humanos Cloud→frontdesk
 
