@@ -560,6 +560,86 @@ registro) para que un reintento no choque con `NODE_ALREADY_EXISTS`. 🟡 No ver
 
 ---
 
+### 4.4 `register_human` — dar de alta un humano (crear su ilk)
+
+🔵 código, **NUEVO (0.1.23), no re-ejecutado en vivo** (no se dispone del bearer). Es la primera
+acción **local**: IO.cloud la resuelve él mismo (no relaya a `SY.admin`). Provisiona un ilk humano
+`temporary`, se lo entrega al **frontdesk** (que valida y registra), y devuelve el veredicto + el
+`ilk_id` que creó.
+
+**El sobre:** `tenant_id` en la **raíz** (como put_token/provision_node), y **`params` ES un
+`frontdesk_handoff`** con la data del humano.
+
+| campo | obligatorio | notas |
+|---|---|---|
+| `tenant_id` (raíz) | ✅ **sí**, canónico `tnt:<uuid>` **existente y no-pending** | |
+| `params.type` | ✅ `"frontdesk_handoff"` | fijo |
+| `params.schema_version` | ✅ `1` (número) | fijo |
+| `params.operation` | ✅ `"complete_registration"` | fijo |
+| `params.subject.display_name` | ✅ **sí** | nombre |
+| `params.subject.email` | ✅ **sí**, email real (con `@`) | **clave única del humano** (dedup por cloud+email+tenant) |
+| `params.subject.phone` | opcional | se guarda en el ilk |
+| `params.subject.company_name` | opcional | se guarda en el ilk |
+| `params.subject.attributes` | opcional, objeto JSON libre | extras, se guardan verbatim en el ilk |
+
+```bash
+post '{"op":"register_human","tenant_id":"tnt:94cd37b8-…",
+       "request_id":"44444444-4444-4444-4444-444444444444",
+       "params":{"type":"frontdesk_handoff","schema_version":1,"operation":"complete_registration",
+                 "subject":{"display_name":"Juan Perez","email":"juan@acme.com",
+                            "phone":"+54…","company_name":"ACME","attributes":{"crm_id":"x"}}}}'
+```
+
+```json
+{"status":"ok","op":"register_human","request_id":"44444444-…",
+ "handled_by":"IO.cloud@motherbee","ich":"ich:14b66389-…",
+ "ilk_id":"ilk:<el ilk humano creado>","registration_status":"complete",
+ "success":true,"human_message":"…"}
+```
+
+Si el frontdesk no puede registrar → `status:"error"`, `success:false`, `error_code` + `human_message`,
+y el ilk queda `temporary`. **Es idempotente:** repetir el mismo `register_human` de un humano ya
+registrado vuelve a dar éxito (no duplica el ilk).
+
+**Errores — `register_human`:**
+
+| condición | respuesta |
+|---|---|
+| falta `tenant_id` en la raíz / no canónico | `"register_human requires tenant_id"` / `"…canonical tenant_id tnt:<uuid>"` |
+| `params` no es objeto | `"register_human requires an object 'params' (the frontdesk_handoff payload)"` |
+| `params.type` ≠ `frontdesk_handoff` | `"params.type must be \"frontdesk_handoff\""` |
+| `params.schema_version` ≠ 1 | `"params.schema_version must be 1"` |
+| `params.operation` ≠ `complete_registration` | `"params.operation must be \"complete_registration\""` |
+| `params.subject.email` ausente / sin `@` | `"params.subject.email is required and must be an email address"` |
+| falla la provisión del ilk | `error_code:"IDENTITY_UNAVAILABLE"` |
+| el frontdesk no responde | `error_code:"FRONTDESK_UNAVAILABLE"` |
+
+### 4.5 `list_cloud_actions` — descubrir qué ofrece IO.cloud
+
+🔵 código, **NUEVO (0.1.23).** Acción **local**. Devuelve el catálogo de acciones que IO.cloud ofrece
+(relay + locales) con una descripción de cada una — para descubrir la superficie sin depender de este
+documento.
+
+```bash
+post '{"op":"list_cloud_actions","request_id":"55555555-…"}'
+```
+
+```json
+{"status":"ok","op":"list_cloud_actions","request_id":"55555555-…",
+ "handled_by":"IO.cloud@motherbee","ich":"ich:14b66389-…",
+ "result":{"actions":[
+   {"op":"create_tenant","category":"relay","summary":"…"},
+   {"op":"put_token","category":"relay","summary":"…"},
+   {"op":"provision_node","category":"relay","summary":"…"},
+   {"op":"register_human","category":"local","summary":"…"},
+   {"op":"list_cloud_actions","category":"local","summary":"…"}]}}
+```
+
+- `category:"relay"` = IO.cloud la traduce a una acción de `SY.admin`.
+- `category:"local"` = IO.cloud la resuelve él mismo (no toca `SY.admin`).
+
+---
+
 ## 5. Errores comunes y qué significan
 
 ### 5.1 De la puerta (SY.edge) — HTTP real, forma `{"ok":false,…}`
